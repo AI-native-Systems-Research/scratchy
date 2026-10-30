@@ -1430,6 +1430,72 @@ pub const PAGE_SLOTS: u32 = 64;
 /// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
 pub const INT32_STICK: u32 = 32;
 
+/// ⭐ WHAT A PAGED BUNDLE'S ROWS ARE — the fact spyre-inference's dispatch reads besides the query
+/// width: one sequence's query rows, or one decode row of each sequence of a batch
+/// (`SPYRE_BATCHED_DECODE=1`, their default). The bake knows it (a decode rung baked wider than one
+/// row carries one token of each running request); the graph does not, so it is handed in, typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PagedRows {
+    /// One sequence's rows: `page_attn_head_major_decode` at one row, `_prefill` past it.
+    Sequence,
+    /// One decode row per sequence: `batched_decode_head_major`.
+    Batch,
+}
+
+impl PagedRows {
+    /// The bake's `rows_are_requests`: a decode rung whose rows are separate requests is a batch.
+    pub const fn of_requests(rows_are_requests: bool) -> PagedRows {
+        if rows_are_requests {
+            PagedRows::Batch
+        } else {
+            PagedRows::Sequence
+        }
+    }
+}
+
+/// ⭐ A DECODE BATCH'S CHUNKING — spyre-inference's `batched_decode_chunking`
+/// (`spyre_attn_bucketer.py`, 297fc48) over a batch of `seqs` sequences walking `blocks` blocks:
+/// `blocks_per_chunk` block slots per chunk, so a chunk gathers `entries = blocks_per_chunk · seqs`
+/// pages (their target: one per core), and `num_chunks` chunks cover the walk.
+///
+/// One difference, Triton's: its gather takes at least 8 indices (`semantic.py`'s
+/// `descriptor_gather`), so a chunk is at least `ceil(8 / seqs)` block slots; the slots past a
+/// sequence's blocks gather page 0 under a fully masked tile, their own padding law ("padding
+/// columns gather page 0 under an all -inf mask and contribute zero").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchChunking {
+    pub seqs: u32,
+    pub blocks_per_chunk: u32,
+    pub num_chunks: u32,
+}
+
+impl BatchChunking {
+    /// `spyre_attn_bucketer._SPYRE_CORE_COUNT`: the cores a chunk's entries are sized to.
+    pub const CORES: u32 = 32;
+    /// Triton's gather floor.
+    pub const GATHER_FLOOR: u32 = 8;
+
+    pub const fn of(seqs: u32, blocks: u32) -> BatchChunking {
+        let theirs = {
+            let j = Self::CORES / seqs;
+            let j = if j < blocks { j } else { blocks };
+            if j < 1 { 1 } else { j }
+        };
+        let floor = Self::GATHER_FLOOR.div_ceil(seqs);
+        let blocks_per_chunk = if theirs < floor { floor } else { theirs };
+        BatchChunking {
+            seqs,
+            blocks_per_chunk,
+            num_chunks: blocks.div_ceil(blocks_per_chunk),
+        }
+    }
+
+    /// Pages one chunk gathers.
+    pub const fn entries(self) -> u32 {
+        self.blocks_per_chunk * self.seqs
+    }
+}
+
 /// ⭐⭐⭐ THE PAGED STEP'S HOST SOURCES — the buffers a paged forward's attention and KV write read
 /// besides the pools, at their RESERVED tids (`ktir_superdsc::reserved_tids::PAGED_STEP_BASE`): one
 /// session holds every bundle's programs, so a source numbered past ONE graph can be a real tensor of
@@ -1450,6 +1516,15 @@ pub struct PagedStepTids {
     /// `kv_row_pool` `[num_pages, num_kv_heads, 1]` int32: every page's folded-cache rows
     /// `page * num_kv_heads + kv` (the decode kernel's).
     pub kv_row_pool: u32,
+    /// A decode batch's `rep_row_ids` `[entries]` int32: entry `j · seqs + s` holds sequence `s`'s
+    /// query row.
+    pub rep_rows: u32,
+    /// A decode batch's `chunk_page_ids` `[num_chunks, entries, 1]` int32: chunk `c`'s entry
+    /// `j · seqs + s` holds the page of block slot `j` of sequence `s`.
+    pub chunk_pages: u32,
+    /// A decode batch's `mask_by_chunk` `[num_chunks, blocks_per_chunk, seqs, num_kv_heads, 1,
+    /// block_size]`.
+    pub chunk_masks: u32,
 }
 
 impl PagedStepTids {
@@ -1459,6 +1534,9 @@ impl PagedStepTids {
         write_rows: ktir_superdsc::reserved_tids::PAGED_WRITE_ROWS_TID,
         query_rows: ktir_superdsc::reserved_tids::PAGED_QUERY_ROWS_TID,
         kv_row_pool: ktir_superdsc::reserved_tids::PAGED_KV_ROW_POOL_TID,
+        rep_rows: ktir_superdsc::reserved_tids::PAGED_REP_ROWS_TID,
+        chunk_pages: ktir_superdsc::reserved_tids::PAGED_CHUNK_PAGES_TID,
+        chunk_masks: ktir_superdsc::reserved_tids::PAGED_CHUNK_MASKS_TID,
     };
 }
 
@@ -1481,6 +1559,17 @@ pub fn attn_decode_row() -> TritonKernelRow {
         src: include_str!("../../../targets/spyre/kernels/page_attn_head_major_decode.py"),
         file: "page_attn_head_major_decode.py",
         entry: "page_attn_head_major_decode_kernel",
+        program: Program::PagedAttn,
+    }
+}
+
+/// THE ATTENTION FAMILY's batched decode kernel — `batched_decode_head_major.py`, spyre-inference's
+/// `batched_decode_head_major_kernel`, for a decode rung whose rows are separate sequences.
+pub fn batched_decode_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/batched_decode_head_major.py"),
+        file: "batched_decode_head_major.py",
+        entry: "batched_decode_head_major_kernel",
         program: Program::PagedAttn,
     }
 }
@@ -1585,17 +1674,23 @@ pub fn walk_buckets(pages: u32) -> Vec<u32> {
     buckets
 }
 
-/// THE ATTENTION SPLICE — compile spyre-inference's kernel for this node's query width (the decode
-/// kernel at one row, the prefill kernel past it) at its geometry and the rung's walk
-/// ([`walk_pages`]), and mint the `Program::PagedAttn` node over their operands, in their order:
-/// `[query, query_row_index, k_pages, v_pages, page_index_table, (kv_row_pool,) mask_stack, out]`.
+/// THE ATTENTION SPLICE — compile spyre-inference's kernel for this node's rows (one sequence's:
+/// the decode kernel at one row, the prefill kernel past it; a decode batch's: the batched decode
+/// kernel) at its geometry and the rung's walk ([`walk_pages`]), and mint the `Program::PagedAttn`
+/// node over their operands, in their order: `[query, query_row_index, k_pages, v_pages,
+/// page_index_table, (kv_row_pool,) mask_stack, out]`, or the batch's `[query, rep_row_ids, k_pages,
+/// v_pages, chunk_page_ids, mask_by_chunk, out]`.
 pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     active_cap: ktir_superdsc::ktir_node::ActiveCap,
+    paged_rows: PagedRows,
 ) -> Result<EmittedOp, String> {
-    let decode = node.output.region.rows.len == 1;
-    let row = if decode {
+    let batch = paged_rows == PagedRows::Batch;
+    let decode = !batch && node.output.region.rows.len == 1;
+    let row = if batch {
+        batched_decode_row()
+    } else if decode {
         attn_decode_row()
     } else {
         attn_row()
@@ -1656,6 +1751,78 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     let tids = PagedStepTids::RESERVED;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
+    let t =
+        |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    if batch {
+        // spyre-inference's eligibility (`_batched_decode_preconditions_met`): a chunk gathering as
+        // many pages as the pool holds faults their device, and their per-sequence loop serves it.
+        let chunking = BatchChunking::of(mq, blocks);
+        if chunking.entries() >= pages {
+            return Err(format!(
+                "triton splice: AttnDecode t{}: a {mq}-sequence batch walking {blocks} block(s) \
+                 gathers {} pages a chunk, and the pool holds {pages} — spyre-inference serves \
+                 that batch one sequence at a time",
+                node.output.tensor.index(),
+                chunking.entries()
+            ));
+        }
+        for (p, ty) in [
+            ("query", "*fp16"),
+            ("rep_row_ids", "*i32"),
+            ("k_pages", "*fp16"),
+            ("v_pages", "*fp16"),
+            ("chunk_page_ids", "*i32"),
+            ("mask_by_chunk", "*fp16"),
+            ("out", "*fp16"),
+        ] {
+            signature.insert(
+                p.to_string(),
+                ArgSpec::parse(ty).map_err(|e| e.to_string())?,
+            );
+        }
+        for (k, v) in [
+            ("NUM_TOKENS", mq),
+            ("NUM_SEQS", chunking.seqs),
+            ("BLOCKS_PER_CHUNK", chunking.blocks_per_chunk),
+            ("NUM_CHUNKS", chunking.num_chunks),
+            ("NUM_KV_HEADS", nkvh),
+            ("NUM_QUERIES_PER_KV", nqh / nkvh),
+            ("BLOCK_SIZE", PAGE_SLOTS),
+            ("HEAD_SIZE", hd),
+            ("NUM_PAGES", pages),
+        ] {
+            signature.insert(k.to_string(), ArgSpec::Constexpr);
+            constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
+        }
+        signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
+        constexprs.insert("SCALE".to_string(), Val::Float(f64::from(*scale)));
+        let spec = KernelSpec {
+            kernel: entry.to_string(),
+            signature,
+            constexprs,
+            file: file.to_string(),
+        };
+        let module = compile_kernel(src, &spec, &[1])?;
+        let positional = triton_ktir_superdsc::node_for(&module, program)
+            .map_err(|e| format!("triton splice: node_for: {e}"))?;
+        let k = rebind(
+            positional,
+            format!("attn_s{}", node.id.index()),
+            vec![
+                t(&node.inputs[0]),
+                BufferId::new(tids.rep_rows),
+                t(&node.inputs[1]),
+                t(&node.inputs[2]),
+                BufferId::new(tids.chunk_pages),
+                BufferId::new(tids.chunk_masks),
+                t(&node.output),
+            ],
+            Some(BufferId::new(tids.chunk_masks)),
+        )?;
+        let mut e = EmittedOp::bare(format!("attn_s{}", node.id.index()));
+        e.ktir = Some(k);
+        return Ok(e);
+    }
     let mut pointers = vec![
         ("query", "*fp16"),
         ("query_row_index", "*i32"),
@@ -1700,8 +1867,6 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     let module = compile_kernel(src, &spec, &[1])?;
     let positional = triton_ktir_superdsc::node_for(&module, program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
-    let t =
-        |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
     let mut bindings = vec![
         t(&node.inputs[0]),
         BufferId::new(tids.query_rows),
@@ -3113,6 +3278,8 @@ mod production_ktir_dump {
         include_str!("../../../targets/spyre/kernels/page_attn_head_major_prefill.py");
     const PAGED_KV_WRITE: &str =
         include_str!("../../../targets/spyre/kernels/reshape_and_cache_head_major.py");
+    const BATCHED_DECODE: &str =
+        include_str!("../../../targets/spyre/kernels/batched_decode_head_major.py");
     const ELEMENTWISE: &str = include_str!("../../../targets/spyre/kernels/elementwise.py");
     const LMLAST: &str = include_str!("../../../targets/spyre/kernels/lmlast.py");
     const MATMUL: &str = include_str!("../../../targets/spyre/kernels/matmul.py");
@@ -3555,6 +3722,47 @@ mod production_ktir_dump {
             };
             v.push((name, src, spec(file, entry, &ptrs, &ces), vec![1]));
         }
+        // ...and `batched_decode_head_major` over that pool, the chunkings a decode batch rung
+        // states (`BatchChunking::of`): 4 sequences on the 4-page rung (one chunk), on the 64-page
+        // rung (8 chunks, each block slot its own softmax), and 2 sequences on the 2-page rung (a
+        // chunk under the gather floor).
+        for (name, seqs, walk) in [
+            ("batched_decode", 4u32, 4u32),
+            ("batched_decode_chunks", 4, 64),
+            ("batched_decode_floor", 2, 2),
+        ] {
+            let c = BatchChunking::of(seqs, walk);
+            v.push((
+                name,
+                BATCHED_DECODE,
+                spec(
+                    "batched_decode_head_major.py",
+                    "batched_decode_head_major_kernel",
+                    &[
+                        ("query", "*fp16"),
+                        ("rep_row_ids", "*i32"),
+                        ("k_pages", "*fp16"),
+                        ("v_pages", "*fp16"),
+                        ("chunk_page_ids", "*i32"),
+                        ("mask_by_chunk", "*fp16"),
+                        ("out", "*fp16"),
+                    ],
+                    &[
+                        ("NUM_TOKENS", Val::Int(i128::from(seqs))),
+                        ("NUM_SEQS", Val::Int(i128::from(c.seqs))),
+                        ("BLOCKS_PER_CHUNK", Val::Int(i128::from(c.blocks_per_chunk))),
+                        ("NUM_CHUNKS", Val::Int(i128::from(c.num_chunks))),
+                        ("NUM_KV_HEADS", Val::Int(8)),
+                        ("NUM_QUERIES_PER_KV", Val::Int(4)),
+                        ("BLOCK_SIZE", Val::Int(i128::from(PAGE_SLOTS))),
+                        ("HEAD_SIZE", Val::Int(64)),
+                        ("NUM_PAGES", Val::Int(2048)),
+                        ("SCALE", Val::Float(0.125)),
+                    ],
+                ),
+                vec![1],
+            ));
+        }
         for (name, nkvh) in [("paged_kv_write", 8i128), ("paged_kv_write_rows", 2)] {
             v.push((
                 name,
@@ -3738,7 +3946,10 @@ mod production_ktir_dump {
             "paged_attn_decode"
             | "paged_attn_prefill"
             | "paged_attn_decode_pool"
-            | "paged_attn_prefill_walk" => Program::PagedAttn,
+            | "paged_attn_prefill_walk"
+            | "batched_decode"
+            | "batched_decode_chunks"
+            | "batched_decode_floor" => Program::PagedAttn,
             "paged_kv_write" | "paged_kv_write_rows" => Program::PagedKvWrite,
             other => panic!(
                 "`{other}` is in the dump table but `program_of` states no Program for it — \
@@ -4035,6 +4246,115 @@ mod walk_on_the_card {
         };
         let module = compile_kernel(src, &spec, &[1]).expect("the walk compiles");
         triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints")
+    }
+
+    /// `batched_decode_head_major` at granite's geometry over its 2048-page pool: `seqs` sequences
+    /// walking `walk` blocks, at the chunking a decode batch rung states.
+    fn batched_walk(seqs: u32, walk: u32) -> (KtirNode, BatchChunking) {
+        let TritonKernelRow::Spliced {
+            src, file, entry, ..
+        } = batched_decode_row()
+        else {
+            panic!("the batched decode row is spliced");
+        };
+        let c = BatchChunking::of(seqs, walk);
+        let mut signature = HashMap::new();
+        let mut constexprs = HashMap::new();
+        for p in ["query", "k_pages", "v_pages", "mask_by_chunk", "out"] {
+            signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("spec"));
+        }
+        for p in ["rep_row_ids", "chunk_page_ids"] {
+            signature.insert(p.to_string(), ArgSpec::parse("*i32").expect("spec"));
+        }
+        for (k, v) in [
+            ("NUM_TOKENS", seqs),
+            ("NUM_SEQS", c.seqs),
+            ("BLOCKS_PER_CHUNK", c.blocks_per_chunk),
+            ("NUM_CHUNKS", c.num_chunks),
+            ("NUM_KV_HEADS", 8),
+            ("NUM_QUERIES_PER_KV", 4),
+            ("BLOCK_SIZE", PAGE_SLOTS),
+            ("HEAD_SIZE", 64),
+            ("NUM_PAGES", 2048),
+        ] {
+            signature.insert(k.to_string(), ArgSpec::Constexpr);
+            constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
+        }
+        signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
+        constexprs.insert("SCALE".to_string(), Val::Float(0.125));
+        let spec = KernelSpec {
+            kernel: entry.to_string(),
+            signature,
+            constexprs,
+            file: file.to_string(),
+        };
+        let module = compile_kernel(src, &spec, &[1]).expect("the batched walk compiles");
+        let node =
+            triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints");
+        (node, c)
+    }
+
+    /// A decode batch's walk relaunches its chunk body once per chunk: its trips are the
+    /// chunks, and ONE trip moves the chunk's mask tile — `entries · kv heads` one-stick rows of the
+    /// stick-major stack — which is the one shift a relaunch applies (the chunk's page ids pitched
+    /// to it). The body is one contiguous run of descriptors, one launch group.
+    #[test]
+    fn a_decode_batch_relaunches_its_chunk_body_once_per_chunk() {
+        let (node, c) = batched_walk(4, 64);
+        assert_eq!(
+            (c.blocks_per_chunk, c.num_chunks),
+            (8, 8),
+            "4 sequences over 64 blocks"
+        );
+        let flat = flatten(&node)
+            .expect("the walk flattens")
+            .expect("a multi-chunk walk states its loop");
+        assert_eq!(flat.fold.trips, c.num_chunks);
+        assert_eq!(flat.fold.step_bytes, c.entries() * 8 * 128);
+        assert_eq!(
+            flat.fold.carried.len(),
+            3,
+            "each block slot's running max, sum and output"
+        );
+        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+        let mut sym = 0i64;
+        let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+            .unwrap_or_else(|e| panic!("the batched walk lowers: {}", e.message));
+        let marked: Vec<usize> = (0..ops.len()).filter(|&i| ops[i].walk.is_some()).collect();
+        let (first, last) = (marked[0], *marked.last().expect("a body"));
+        assert_eq!(
+            marked.len(),
+            last - first + 1,
+            "the body's descriptors are one contiguous run — one launch group"
+        );
+        for e in &ops[first..=last] {
+            assert_eq!(
+                e.walk,
+                Some(WalkTrips {
+                    trips: c.num_chunks,
+                    step_bytes: c.entries() * 8 * 128
+                }),
+                "{}",
+                e.op_name
+            );
+            assert!(e.kv_page_fold && e.kv_gathered, "{}", e.op_name);
+        }
+    }
+
+    /// One chunk is straight-line: no loop to relaunch, every descriptor once.
+    #[test]
+    fn a_one_chunk_decode_batch_is_straight_line() {
+        let (node, c) = batched_walk(4, 4);
+        assert_eq!(c.num_chunks, 1);
+        assert!(
+            flatten(&node).expect("the walk flattens").is_none(),
+            "a single chunk states no loop"
+        );
+        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+        let mut sym = 0i64;
+        let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+            .unwrap_or_else(|e| panic!("the one-chunk batch lowers: {}", e.message));
+        assert!(ops.iter().all(|e| e.walk.is_none()));
     }
 
     /// The walk's trips are its blocks, and ONE trip moves the mask tile `[P, block]` — `P` stick rows

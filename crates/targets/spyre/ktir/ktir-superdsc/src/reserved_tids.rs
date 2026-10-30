@@ -401,7 +401,8 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 }
 
 /// ⭐⭐⭐ THE PAGED STEP's HOST SOURCES — spyre-inference's own attention operands besides the pools:
-/// the mask stack, the page index table, the KV write index, the query row index and `kv_row_pool`.
+/// the mask stack, the page index table, the KV write index, the query row index and `kv_row_pool`,
+/// and a decode batch's `rep_row_ids`, `chunk_page_ids` and `mask_by_chunk`.
 ///
 /// ⛔ RESERVED, NOT NUMBERED PAST THE GRAPH. They were `ir.tensors.len() + k`, the attention mask's
 /// old law — and a resident session holds the decode AND the prefill programs, whose graphs differ in
@@ -424,6 +425,12 @@ pub const PAGED_WRITE_ROWS_TID: u32 = reserved_region("paged_step").at(2);
 pub const PAGED_QUERY_ROWS_TID: u32 = reserved_region("paged_step").at(3);
 /// The paged step's `kv_row_pool` — see [`PAGED_STEP_BASE`].
 pub const PAGED_KV_ROW_POOL_TID: u32 = reserved_region("paged_step").at(4);
+/// A decode batch's `rep_row_ids` — see [`PAGED_STEP_BASE`].
+pub const PAGED_REP_ROWS_TID: u32 = reserved_region("paged_step").at(5);
+/// A decode batch's `chunk_page_ids` — see [`PAGED_STEP_BASE`].
+pub const PAGED_CHUNK_PAGES_TID: u32 = reserved_region("paged_step").at(6);
+/// A decode batch's `mask_by_chunk` — see [`PAGED_STEP_BASE`].
+pub const PAGED_CHUNK_MASKS_TID: u32 = reserved_region("paged_step").at(7);
 
 /// Every reserved region, in one place. Order is high tid → low.
 pub const RESERVED_REGIONS: [TidRegion; 8] = [
@@ -489,7 +496,7 @@ pub const RESERVED_REGIONS: [TidRegion; 8] = [
     TidRegion {
         name: "paged_step",
         base: PAGED_STEP_BASE,
-        slots: 5,
+        slots: 8,
     },
 ];
 

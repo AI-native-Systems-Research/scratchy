@@ -1918,12 +1918,62 @@ pub enum BcastAxis {
     Col,
     /// `[1, n]` → `[m, n]`: a row vector (an rmsnorm gain) sprayed down the rows. `n1[None, :]`.
     Mb,
-    /// `[mb, out]` → `[y, mb, out]`: a MULTI-row source sprayed down a new LEADING dim — the
-    /// row-split form, the batched paged-decode kernel's J-slot merge (`[64, 4] -> [4, 64, 4]`,
-    /// `Dimensions=[0]` over a source the walk-back proved to be `y·mb` rows). The count is the
-    /// broadcast's own stated leading extent; the consumer checks it against the source region's
-    /// frame ([`crate::sdsc_abstract::RegionFrame::split_rows`]) before building the operand.
-    Y(u32),
+    /// `[mb, out]` → `[y, mb, out]` or `[mb, y, out]`: a MULTI-row source sprayed `y` times along
+    /// the rows — the row-split form. OUTER: down a new LEADING dim, the batched paged-decode
+    /// kernel's J-slot merge (`[64, 4] -> [4, 64, 4]`, `Dimensions=[0]` over a source the walk-back
+    /// proved to be `y·mb` rows). INNER: down the dim just before the stick, each source row
+    /// repeated `y` times in a row (a decode batch's mask over its query-head group). The count is
+    /// the broadcast's own stated extent; the consumer checks it against the source region's frame
+    /// ([`crate::sdsc_abstract::RegionFrame::split_rows`]) before building the operand.
+    Y(Spray),
+}
+
+/// A row spray: `count` copies of a multi-row source, at `order` among the op's rows
+/// ([`crate::emit::SprayOrder`]), of the source's whole rows or of one value per source row
+/// ([`SprayOf`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spray {
+    pub count: u32,
+    pub order: crate::emit::SprayOrder,
+    pub of: SprayOf,
+}
+
+/// What a row spray copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SprayOf {
+    /// The source's whole `[mb, out]` rows.
+    Tile,
+    /// One value per source row, sprayed along the stick as well — a per-row scalar (`Col`)
+    /// sprayed down a leading axis too: `[B, KV, G] -> [J, B, KV, G, block]`, a decode batch's
+    /// one-chunk running max against its scores. The source is the reduction's `[rows, 1]`
+    /// column at one stick per row, read at `out`'s stride-0 stick and `y`'s stride-0 dim.
+    RowScalars,
+}
+
+impl Spray {
+    pub const fn outer(count: u32) -> Spray {
+        Spray {
+            count,
+            order: crate::emit::SprayOrder::Outer,
+            of: SprayOf::Tile,
+        }
+    }
+
+    pub const fn inner(count: u32) -> Spray {
+        Spray {
+            count,
+            order: crate::emit::SprayOrder::Inner,
+            of: SprayOf::Tile,
+        }
+    }
+
+    pub const fn outer_row_scalars(count: u32) -> Spray {
+        Spray {
+            count,
+            order: crate::emit::SprayOrder::Outer,
+            of: SprayOf::RowScalars,
+        }
+    }
 }
 
 /// main's `lower_elementwise_node` (main 8362-8432). Its door: the [`Elementwise`] kind is stated by
@@ -2800,7 +2850,7 @@ fn elementwise_broadcast(
         let as_rows: Vec<Option<BcastAxis>> = bcast
             .iter()
             .map(|b| match b {
-                Some(BcastAxis::Mb) => Some(BcastAxis::Y(rows)),
+                Some(BcastAxis::Mb) => Some(BcastAxis::Y(Spray::outer(rows))),
                 other => *other,
             })
             .collect();
@@ -2820,7 +2870,7 @@ fn elementwise_broadcast(
         );
     }
     if let Some(y) = bcast.iter().find_map(|b| match b {
-        Some(BcastAxis::Y(y)) => Some(*y),
+        Some(BcastAxis::Y(sp)) => Some(sp.count),
         _ => None,
     }) && (out.c_len > lanes
         || ins.iter().zip(bcast).any(|(x, b)| {
@@ -2850,7 +2900,7 @@ fn elementwise_broadcast(
     // `[mb, out, y]` facts; its `Err` is the refusal, so a row-split the bytes do not support is
     // a build failure here, not a wrong-byte bake (the mb re-row's own defect class).
     let ymode: Option<u32> = bcast.iter().find_map(|b| match b {
-        Some(BcastAxis::Y(y)) => Some(*y),
+        Some(BcastAxis::Y(sp)) => Some(sp.count),
         _ => None,
     });
     let split = match ymode {
@@ -2871,7 +2921,13 @@ fn elementwise_broadcast(
             // ⭐ THE ROW-SPLIT SOURCE IS THE `[mb, out]` TILE — one spray's worth of the output's
             // rows, at the output's own column extent. The divisibility that makes `rows/y`
             // honest is the frame law above, already proven.
-            Some(BcastAxis::Y(y)) => (rows / y, out.c_len),
+            Some(BcastAxis::Y(sp)) => (
+                rows / sp.count,
+                match sp.of {
+                    SprayOf::Tile => out.c_len,
+                    SprayOf::RowScalars => 1,
+                },
+            ),
         };
         if (x.v_rows, x.c_len) != want {
             return err(format!(
@@ -2921,7 +2977,11 @@ fn elementwise_broadcast(
             // mint checks that swept window against the handle's declaration, so the annotation
             // now states the footprint the storage always had — `rb(name, rows, stick)` at the
             // op's own `df`, the same handle `rmsnorm.rs` mints for `rinv`.
-            Some(BcastAxis::Col) => rb(n, x.v_rows, df.elems_per_stick()),
+            Some(BcastAxis::Col)
+            | Some(BcastAxis::Y(Spray {
+                of: SprayOf::RowScalars,
+                ..
+            })) => rb(n, x.v_rows, df.elems_per_stick()),
             // ⭐⭐⭐ AND IN THE Y MODE EVERY OPERAND IS STICK-WIDE for the same reason: the op's
             // `out` dim IS the one stick the frame law allows, so the dense operand's storage is
             // `[v_rows, 64]` — the footprint its `(v_rows, c_len < 64)` mint already reserved —
@@ -2937,7 +2997,7 @@ fn elementwise_broadcast(
             None => In::full(h).ew(),
             Some(BcastAxis::Col) => In::col(h).ew(),
             Some(BcastAxis::Mb) => In::mb(h).ew(),
-            Some(BcastAxis::Y(y)) => In::y_broadcast(h, *y).ew(),
+            Some(BcastAxis::Y(sp)) => In::y_broadcast(h, *sp).ew(),
         })
         .collect();
     // The SAME `TileOp` the dense arm builds, so the two arms share one LX-tiling contract and a
@@ -3040,7 +3100,7 @@ fn elementwise_y_by_column(
             .zip(ins)
             .zip(bcast)
             .map(|((h, x), b)| match b {
-                Some(BcastAxis::Y(y)) => In::y_broadcast_at(h, *y, at(x, j)).ew(),
+                Some(BcastAxis::Y(sp)) => In::y_broadcast_at(h, *sp, at(x, j)).ew(),
                 _ => In::sliced(h, at(x, j)).ew(),
             })
             .collect();
@@ -7271,7 +7331,7 @@ mod elementwise_tests {
             "sub_s3",
             Elementwise::Sub,
             &r,
-            &[None, Some(BcastAxis::Y(4))],
+            &[None, Some(BcastAxis::Y(Spray::outer(4)))],
             &mut sym,
             None,
         )
@@ -7296,7 +7356,7 @@ mod elementwise_tests {
         let dense_h = rb("t5", 256, 64);
         let merged_h = rb("t6", 64, 64);
         let dense = In::full(&dense_h).ew();
-        let merged = In::y_broadcast(&merged_h, 4).ew();
+        let merged = In::y_broadcast(&merged_h, Spray::outer(4)).ew();
         let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
             &pointwise_tile_op(64, 64, 4, 3),
             256,
@@ -7338,6 +7398,79 @@ mod elementwise_tests {
         );
     }
 
+    /// ⭐ THE INNER SPRAY'S DESCRIPTOR STATES THE `[mb, y, out]` FRAME — the same op as the outer
+    /// spray's above, every tensor laid out `["mb", "y", "out"]` so flat row `b·y + j` is
+    /// `(b, j)`: the sprayed source `[mb, out]` reads `source[b, c]` at `result[b·4 + j, c]` —
+    /// each of its 64 rows repeated 4 times in a row (a decode batch's mask over its group). The
+    /// source's scale is the same stride-0 read, in the frame's own order.
+    #[test]
+    fn the_inner_row_spray_op_states_the_mb_y_out_frame() {
+        use crate::superdsc_opspec::Scale;
+        let dense_h = rb("t5", 256, 64);
+        let mask_h = rb("t6", 64, 64);
+        let dense = In::full(&dense_h).ew();
+        let mask = In::y_broadcast(&mask_h, Spray::inner(4)).ew();
+        let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(64, 64, 4, 3),
+            256,
+            64,
+            op_func_from_str("add"),
+            &[dense, mask],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            crate::work::CoreDivision::Ew(EwDivision::Law),
+        )
+        .expect("the inner row-spray op emits");
+        assert_eq!(op.iter.extent("mb"), 64, "mb is the source's rows");
+        assert_eq!(op.iter.extent("y"), 4, "y is the spray count");
+        for a in &op.args {
+            assert_eq!(
+                a.view().layout,
+                &["mb", "y", "out"] as &[&'static str],
+                "every tensor presents the inner frame: {}",
+                a.view().name
+            );
+        }
+        let mask_view = op
+            .args
+            .iter()
+            .find(|a| a.view().name == "t6")
+            .expect("the sprayed source's arg")
+            .view();
+        assert_eq!(
+            mask_view.scale,
+            &[Scale::Active, Scale::RedNonStick, Scale::Active] as &[Scale],
+            "the spray dim is the stride-0 read, in the `[mb, y, out]` order"
+        );
+    }
+
+    /// ⛔ ONE OP SPRAYS AT ONE ORDER — an outer and an inner spray of the same count under one op
+    /// would lay its tensors out two ways at once. Refused by name.
+    #[test]
+    fn an_op_mixing_spray_orders_is_refused() {
+        let a_h = rb("t5", 64, 64);
+        let b_h = rb("t6", 64, 64);
+        let err = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(64, 64, 4, 3),
+            256,
+            64,
+            op_func_from_str("add"),
+            &[
+                In::y_broadcast(&a_h, Spray::outer(4)).ew(),
+                In::y_broadcast(&b_h, Spray::inner(4)).ew(),
+            ],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            crate::work::CoreDivision::Ew(EwDivision::Law),
+        )
+        .expect_err("two orders under one op");
+        assert!(err.contains("one order"), "{err}");
+    }
+
     /// ⛔ THE TILE AND THE OPERANDS MUST AGREE ON THE SPRAY COUNT — a `TileOp` whose `y` dim
     /// states a different count than the y-broadcast operands spray is a caller that built its
     /// tile from a different shape than its operands, and the tiler's iteration space and the
@@ -7347,7 +7480,7 @@ mod elementwise_tests {
         let dense_h = rb("t5", 256, 64);
         let merged_h = rb("t6", 64, 64);
         let dense = In::full(&dense_h).ew();
-        let merged = In::y_broadcast(&merged_h, 4).ew();
+        let merged = In::y_broadcast(&merged_h, Spray::outer(4)).ew();
         let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
             &pointwise_tile_op(64, 64, 2, 3),
             256,
@@ -7376,7 +7509,7 @@ mod elementwise_tests {
         let dense_h = rb("t5", 256, 128);
         let merged_h = rb("t6", 64, 128);
         let dense = In::full(&dense_h).ew();
-        let merged = In::y_broadcast(&merged_h, 4).ew();
+        let merged = In::y_broadcast(&merged_h, Spray::outer(4)).ew();
         let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
             &pointwise_tile_op(64, 128, 4, 3),
             256,
@@ -7413,7 +7546,7 @@ mod elementwise_tests {
             "sub_s3",
             Elementwise::Sub,
             &r,
-            &[None, Some(BcastAxis::Y(4))],
+            &[None, Some(BcastAxis::Y(Spray::outer(4)))],
             &mut sym,
             None,
         ) else {
@@ -7444,7 +7577,7 @@ mod elementwise_tests {
             "sub_s3",
             Elementwise::Sub,
             &r,
-            &[None, Some(BcastAxis::Y(4))],
+            &[None, Some(BcastAxis::Y(Spray::outer(4)))],
             &mut sym,
             None,
         )
@@ -7487,7 +7620,7 @@ mod elementwise_tests {
             "sub_s3",
             Elementwise::Sub,
             &r,
-            &[Some(BcastAxis::Col), Some(BcastAxis::Y(4))],
+            &[Some(BcastAxis::Col), Some(BcastAxis::Y(Spray::outer(4)))],
             &mut sym,
             None,
         ) else {
@@ -7725,7 +7858,7 @@ mod elementwise_tests {
             "add_s3",
             IntBinary::Add,
             &r,
-            &[None, Some(BcastAxis::Y(4))],
+            &[None, Some(BcastAxis::Y(Spray::outer(4)))],
             &mut sym,
             None,
         ) else {

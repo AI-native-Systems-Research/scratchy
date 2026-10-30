@@ -1803,6 +1803,10 @@ impl RegionFrame {
     /// max `[64, 4]` (the J-reduce's output) sprayed down a leading axis to `[4, 64, 4]`, read
     /// by its consumer as the op `[mb = 64, out = 64, y = 4]` with the source at
     /// `[mb, out, y = 1]` (scale `y = -1`, the vendor's own reduced-dim law).
+    ///
+    /// The INNER spray (`crate::emit::SprayOrder::Inner`) reads the same frame in the `[mb, y, out]`
+    /// order — flat element `(b, j)` at `b·(y·out) + j·out + c`, at `out = lanes` the source's
+    /// `(b·y + j)·lanes + c`, row `b·y + j` — so the law's two conditions are the same.
     pub(crate) fn split_rows(&self, y: usize, mb: usize) -> Result<RowSplitFrame, String> {
         if y < 2 {
             return Err(format!(

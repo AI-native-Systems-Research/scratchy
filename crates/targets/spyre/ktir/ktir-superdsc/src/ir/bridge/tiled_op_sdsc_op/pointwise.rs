@@ -741,6 +741,115 @@ pub fn assemble_page_gather_copy(
         .map_err(|e| format!("assemble_page_gather_copy {op_name}: {e}"))
 }
 
+/// ⭐ A STICK PERMUTE'S DIRECTION — between the two card frames of `R` rows of `C` sticks:
+/// STICK-MAJOR `[R, C·stick]` (stick column `c`'s `R` rows contiguous: bytes `[C][R][stick]`) and
+/// ROW-MAJOR `[R·C, stick]` (row `r`'s `C` sticks contiguous: bytes `[R][C][stick]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StickPermute {
+    /// Stick-major to row-major: a gathered `[R, H·D]` query block read as `[R·H, D]` rows.
+    StickToRow,
+    /// Row-major to stick-major: `[R·H, D]` rows stored as the `[R, H·D]` output block.
+    RowToStick,
+}
+
+/// ⭐ THE STICK PERMUTE — an `identity` over `[mb = rows, out = stick, y = sticks]` whose input and
+/// output present the SAME iteration in the two row-split orders: `["y", "mb", "out"]` (flat row
+/// `y·rows + mb`, the stick-major frame — stick column `y`, row `mb`) and `["mb", "y", "out"]` (flat
+/// row `mb·sticks + y`, the row-major frame). So element `(mb, y, c)` moves from one frame's byte to
+/// the other's and nothing else changes: the relayout a reshape between the two frames is on the
+/// card. Every operand is Active on every dim; the addressing is the row-split mode's own scale-
+/// driven rule (`build_coordinates`/`per_core_addr`), only the two layout orders differ.
+pub fn stick_permute_opspec(
+    src: &str,
+    dst: &str,
+    rows: u32,
+    sticks: u32,
+    df: Df,
+    direction: StickPermute,
+) -> Result<OpSpec, String> {
+    use crate::emit::SprayOrder;
+    let stick = df.elems_per_stick();
+    if rows == 0 || sticks < 2 {
+        return Err(format!(
+            "stick_permute('{src}' -> '{dst}'): {rows} row(s) of {sticks} stick(s) — a permute \
+             needs rows and at least two sticks a row, or the two frames are the same bytes"
+        ));
+    }
+    let (from, to) = match direction {
+        StickPermute::StickToRow => (SprayOrder::Outer, SprayOrder::Inner),
+        StickPermute::RowToStick => (SprayOrder::Inner, SprayOrder::Outer),
+    };
+    let tile_op =
+        crate::emit::lower_ktir_to_superdsc::pointwise_tile_op_df(rows, stick, sticks, 2, df);
+    let tiled = tile_op
+        .tile(
+            MaxCores::<MAX_CORES>,
+            EwDivision::Law.resolve(false, false).splitter(),
+            "out",
+        )
+        .map_err(|e| e.0)?;
+    let (plan, time_tile) = (tiled.plan, tiled.time_tile);
+    let arg = |is_input: bool, name: &str, order: SprayOrder| -> Result<AnyTensorArg, String> {
+        Ok(AnyTensorArg::R3(
+            TensorArg::<3>::new(
+                is_input,
+                name.to_string(),
+                Role::Output,
+                [Scale::Active, Scale::Active, Scale::Active],
+                plan.iter_syms(order.layout()),
+                order.layout(),
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_df(df)
+            .with_row_blocked(matches!(df, Df::Fp32)),
+        ))
+    };
+    let args = vec![arg(true, src, from)?, arg(false, dst, to)?];
+    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
+    Ok(OpSpec {
+        op: OpFunc::Identity,
+        is_reduction: false,
+        iter: plan,
+        args,
+        op_info: OpInfo::None,
+        tiled_symbols,
+        time_tile,
+        indirect: None,
+        coordinate_mask: None,
+    })
+}
+
+/// One stick permute's extents: `rows` rows of `sticks` sticks of `df`, in `direction`.
+#[derive(Clone, Copy, Debug)]
+pub struct StickPermuteSpec {
+    pub rows: u32,
+    pub sticks: u32,
+    pub df: Df,
+    pub direction: StickPermute,
+}
+
+/// [`stick_permute_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_stick_permute(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    StickPermuteSpec {
+        rows,
+        sticks,
+        df,
+        direction,
+    }: StickPermuteSpec,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = stick_permute_opspec(src, dst, rows, sticks, df, direction)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_stick_permute {op_name}: {e}"))
+}
+
 /// One scattered copy's extents: `rows` one-stick sub-rows of `cols` (one stick) elements of `df`,
 /// read from the source starting `src_elems` elements in, written through the index from the
 /// destination's base plus `dst_elems`.
@@ -1003,20 +1112,21 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // reserved. Everything below is cross-checks; the addressing itself is the ordinary
     // scale-driven rule (`build_coordinates`/`per_core_addr`), which is why the form needs no
     // new addressing code — only the layout order and the operand scales stated honestly.
-    let stated_ys: Vec<u32> = inputs
+    let stated_ys: Vec<(u32, crate::emit::SprayOrder)> = inputs
         .iter()
-        .map(|i| i.y_broadcast())
-        .filter(|&y| y > 1)
+        .filter(|i| i.y_broadcast() > 1)
+        .map(|i| (i.y_broadcast(), i.y_order()))
         .collect();
-    let ymajor = !stated_ys.is_empty();
-    if ymajor {
-        // ONE spray count per op: every y-broadcast operand of one op sprays the broadcast's own
-        // leading extent, so a disagreement is two ops fused under one name.
-        let y = stated_ys[0];
-        if !stated_ys.iter().all(|&s| s == y) {
+    // The row-split mode's order — `Some` exactly when an operand is a y-broadcast.
+    let spray = stated_ys.first().map(|&(_, order)| order);
+    if let Some(order) = spray {
+        // ONE spray per op: every y-broadcast operand of one op sprays the broadcast's own extent,
+        // at its own order, so a disagreement is two ops fused under one name.
+        let y = stated_ys[0].0;
+        if !stated_ys.iter().all(|&s| s == (y, order)) {
             return Err(format!(
-                "{o_name}: the op's y-broadcast operands state different spray counts \
-                 ({stated_ys:?}) — one op has ONE leading extent"
+                "{o_name}: the op's y-broadcast operands state different sprays \
+                 ({stated_ys:?}) — one op has ONE sprayed extent at one order"
             ));
         }
         // The TileOp must state the same count on its own `y` dim: the tiler's iteration space
@@ -1031,7 +1141,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
         }
         // THE SINGLE-STICK LAW — the frame law's own `cols ≤ lanes` half, restated at the
         // emission: the spray's source is single-stick, so an op wider than one stick did not
-        // come through the Y admission. This is also what keeps `ymajor` and `stickmajor` below
+        // come through the Y admission. This is also what keeps the row-split mode and `stickmajor` below
         // disjoint (stickmajor requires `cols >` one stick).
         if cols > Fp16::ELEMS_PER_STICK {
             return Err(format!(
@@ -1078,13 +1188,12 @@ pub fn pointwise_broadcast_opspec_from_tile(
             .map_err(|e| e.0)?,
     };
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
-    // Y-MAJOR in the row-split mode (`ymajor` above): the syms are picked by NAME in the order
-    // the layout states them, so the plan's own `y`/`mb`/`out` syms feed the `["y", "mb", "out"]`
-    // TensorArgs directly — the same plan, walked head-outermost.
-    let device_dims = if ymajor {
-        plan.iter_syms(["y", "mb", "out"])
-    } else {
-        plan.iter_syms(["mb", "out", "y"])
+    // THE ROW-SPLIT MODE's ORDER (`spray` above): the syms are picked by NAME in the order the
+    // layout states them (`SprayOrder::layout`), so the plan's own `y`/`mb`/`out` syms feed the
+    // TensorArgs directly — the same plan, walked in the spray's order.
+    let device_dims = match spray {
+        Some(order) => plan.iter_syms(order.layout()),
+        None => plan.iter_syms(["mb", "out", "y"]),
     };
     // ── STICK-MAJOR RESIDUAL + PER-HEAD ATTN ── The m>1 seam fix: a residual whole-tensor
     // pointwise op writes FLAT (rank-3 [mb,out,y=1]) but the consuming matmul reads STICK-MAJOR
@@ -1128,8 +1237,9 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // is pinned by `time_tiled_broadcast_operand_is_address_stable` in `emit/mod.rs`.
 
     // Build a rank-2 stick-major (`stickmajor`), the legacy rank-3 flat operand, or — in the
-    // row-split mode — the Y-MAJOR rank-3 operand (`["y", "mb", "out"]`, the caller passing the
-    // scale in the same order via [`EwOperand::scale_ymajor`]). rank-2 drops the size-1 `y` dim +
+    // row-split mode — the rank-3 operand in the spray's order (`["y", "mb", "out"]` or
+    // `["mb", "y", "out"]`, the caller passing the scale in the same order via
+    // [`EwOperand::scale_sprayed`]). rank-2 drops the size-1 `y` dim +
     // its scale so `for_view_df` classifies it RowBlocked (stick-major), matching the matmul I/O.
     let mk =
         |is_input: bool, name: &str, scale: [Scale; 3], off: u32| -> Result<AnyTensorArg, String> {
@@ -1158,10 +1268,9 @@ pub fn pointwise_broadcast_opspec_from_tile(
                         Role::Output,
                         scale,
                         device_dims,
-                        if ymajor {
-                            ["y", "mb", "out"]
-                        } else {
-                            ["mb", "out", "y"]
+                        match spray {
+                            Some(order) => order.layout(),
+                            None => ["mb", "out", "y"],
                         },
                         "out",
                         Allocation::Hbm,
@@ -1178,10 +1287,9 @@ pub fn pointwise_broadcast_opspec_from_tile(
         args.push(mk(
             true,
             inp.name(),
-            if ymajor {
-                inp.scale_ymajor()
-            } else {
-                inp.scale()
+            match spray {
+                Some(order) => inp.scale_sprayed(order),
+                None => inp.scale(),
             },
             inp.col_offset(),
         )?);

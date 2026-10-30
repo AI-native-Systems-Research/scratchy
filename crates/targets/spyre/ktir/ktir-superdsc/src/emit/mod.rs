@@ -497,6 +497,30 @@ fn pointwise_opspec(
 /// ([`In::y_broadcast`]): a `[mb, out]` source sprayed down the op's leading `y` dim carries
 /// `y = RedNonStick` there — the vendor's own reduced-dim law (`superdsc.py`'s
 /// `reduced_dims → scale = -1`), the same scale the on-card-proven pmask fusion uses.
+/// ⭐ WHERE A ROW SPRAY'S COPIES SIT AMONG THE OP'S ROWS — the order of the `y` dim in the op's
+/// row frame. `Outer`: the `[y, mb, out]` frame, `y` sprays of the `mb`-row source one after another
+/// (a LEADING-axis broadcast, the J-slot merge). `Inner`: the `[mb, y, out]` frame, each of the
+/// source's `mb` rows repeated `y` times in a row (a broadcast of the axis just before the stick —
+/// a decode batch's mask over its query-head group, `[J, B, KV, 1, block] -> [J, B, KV, G, block]`).
+/// One descriptor either way: the operand's `y` scale is the vendor's reduced-dim `-1`, and the
+/// order is the op's tensors' layout order (`["y", "mb", "out"]` or `["mb", "y", "out"]`), so the
+/// flat row `j·mb + b` or `b·y + j` is the stick-blocked row the mints reserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SprayOrder {
+    Outer,
+    Inner,
+}
+
+impl SprayOrder {
+    /// The op's tensors' layout order, outermost first.
+    pub(crate) const fn layout(self) -> [&'static str; 3] {
+        match self {
+            SprayOrder::Outer => ["y", "mb", "out"],
+            SprayOrder::Inner => ["mb", "y", "out"],
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct EwOperand<'a> {
     // Fields are PRIVATE and there are NO raw ctors: the ONLY way to build an EwOperand is `In::ew()`,
@@ -518,6 +542,8 @@ pub struct EwOperand<'a> {
     /// leading-axis `linalg.broadcast` over a multi-row source whose result is `[y, mb, ..]`),
     /// so the count is the broadcast's OWN stated leading extent — not a caller's pick.
     y_broadcast: u32,
+    /// Where the spray's copies sit ([`SprayOrder`]); read only when `y_broadcast > 1`.
+    y_order: SprayOrder,
     col_offset: u32,
     /// The [`crate::addr::ColWindow`] `col_offset` came from — set only by [`In::col_window`], so a
     /// stick-major presentation of a column window is admitted by type, never by testing the integer.
@@ -544,14 +570,17 @@ impl<'a> EwOperand<'a> {
         ]
     }
 
-    /// The SAME scales in Y-MAJOR order `[y, mb, out]` — the layout order the row-split mode's
-    /// op presents its tensors in (the `TensorArg` layout of the y-major frame, the same
-    /// `["y", "mb", "out"]` head-outermost spelling the batched matmul's walks use). A rotation
-    /// of [`scale`](Self::scale)'s `[mb, out, y]`, so the y-major builder reads one ordered
-    /// triple per operand instead of re-deriving it at its own call site.
-    pub(crate) fn scale_ymajor(&self) -> [Scale; 3] {
+    /// The SAME scales in the row-split mode's layout order ([`SprayOrder::layout`]): `[y, mb, out]`
+    /// for an outer spray (the same `["y", "mb", "out"]` head-outermost spelling the batched
+    /// matmul's walks use), `[mb, y, out]` for an inner one. A permutation of
+    /// [`scale`](Self::scale)'s `[mb, out, y]`, so the row-split builder reads one ordered triple
+    /// per operand instead of re-deriving it at its own call site.
+    pub(crate) fn scale_sprayed(&self, order: SprayOrder) -> [Scale; 3] {
         let s = self.scale();
-        [s[2], s[0], s[1]]
+        match order {
+            SprayOrder::Outer => [s[2], s[0], s[1]],
+            SprayOrder::Inner => [s[0], s[2], s[1]],
+        }
     }
 
     // Read-only accessors, `pub(crate)` so the TileIR→SdscOp bridge functions that read these
@@ -571,6 +600,10 @@ impl<'a> EwOperand<'a> {
     /// The row-split spray count — 0 when this operand is not a y-broadcast.
     pub(crate) fn y_broadcast(&self) -> u32 {
         self.y_broadcast
+    }
+    /// The row-split spray's order — meaningful only when [`Self::y_broadcast`] is above 1.
+    pub(crate) fn y_order(&self) -> SprayOrder {
+        self.y_order
     }
     pub(crate) fn col_offset(&self) -> u32 {
         self.col_offset
@@ -603,7 +636,14 @@ impl<'a> EwOperand<'a> {
         stick_lanes: u32,
     ) -> (u32, u32) {
         if self.y_broadcast > 1 {
-            return (rows / self.y_broadcast, stick_elems);
+            return (
+                rows / self.y_broadcast,
+                if self.out_broadcast {
+                    stick_lanes
+                } else {
+                    stick_elems
+                },
+            );
         }
         match (self.mb_broadcast, self.out_broadcast) {
             (true, true) => (1, stick_lanes),
@@ -4308,6 +4348,7 @@ pub struct In<'a, K: KindTag> {
     mb_broadcast: bool,
     out_broadcast: bool,
     y_broadcast: u32,
+    y_order: SprayOrder,
     col_offset: u32,
     col_window: Option<crate::addr::ColWindow>,
 }
@@ -4319,6 +4360,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
         }
@@ -4329,6 +4371,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: true,
             out_broadcast: true,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
         }
@@ -4339,6 +4382,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: true,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
         }
@@ -4349,6 +4393,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
         }
@@ -4363,6 +4408,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: w.dev().into_raw_elems(),
             col_window: Some(w),
         }
@@ -4375,6 +4421,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: true,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
         }
@@ -4386,6 +4433,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: true,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
         }
@@ -4398,6 +4446,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: true,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
         }
@@ -4412,17 +4461,20 @@ impl<'a, K: KindTag> In<'a, K> {
     /// before this operand is built: `rows == y·mb`, the source single-stick. `y`
     /// must be ≥ 2 — a spray of one is a reshape, not a broadcast, and is refused by the
     /// admission upstream.
-    pub fn y_broadcast(h: &'a Stk<K>, y: u32) -> Self {
+    pub fn y_broadcast(h: &'a Stk<K>, spray: crate::emit::lower_ktir_to_superdsc::Spray) -> Self {
+        let y = spray.count;
         assert!(
             y > 1,
-            "In::y_broadcast: a spray count of {y} is not a broadcast — the leading dim must \
+            "In::y_broadcast: a spray count of {y} is not a broadcast — the sprayed dim must \
              spray a real count (the walk's Y admission refuses y == 1 upstream)"
         );
         In {
             h,
             mb_broadcast: false,
-            out_broadcast: false,
+            // A spray of per-row scalars reads one value per row: the stick's stride-0 read too.
+            out_broadcast: spray.of == crate::emit::lower_ktir_to_superdsc::SprayOf::RowScalars,
             y_broadcast: y,
+            y_order: spray.order,
             col_offset: 0,
             col_window: None,
         }
@@ -4430,10 +4482,14 @@ impl<'a, K: KindTag> In<'a, K> {
     /// [`y_broadcast`](Self::y_broadcast) PLUS a base `col_offset` — the spray's `[mb, out]` source
     /// at an element base inside a larger buffer (one stick column of a multi-stick source, the
     /// window a walk's trip takes of its mask stack).
-    pub fn y_broadcast_at(h: &'a Stk<K>, y: u32, col_offset: crate::addr::DevOff) -> Self {
+    pub fn y_broadcast_at(
+        h: &'a Stk<K>,
+        spray: crate::emit::lower_ktir_to_superdsc::Spray,
+        col_offset: crate::addr::DevOff,
+    ) -> Self {
         In {
             col_offset: col_offset.into_raw_elems(),
-            ..Self::y_broadcast(h, y)
+            ..Self::y_broadcast(h, spray)
         }
     }
     pub fn ew(&self) -> EwOperand<'a> {
@@ -4443,6 +4499,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: self.mb_broadcast,
             out_broadcast: self.out_broadcast,
             y_broadcast: self.y_broadcast,
+            y_order: self.y_order,
             col_offset: self.col_offset,
             col_window: self.col_window,
         }

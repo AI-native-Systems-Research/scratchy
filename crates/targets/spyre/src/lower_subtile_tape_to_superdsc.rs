@@ -681,6 +681,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // [`per_layer_external_tids`], a pre-pass over the re-rolled tape; EMPTY for an unrolled
     // bundle, which has no layer boundary and therefore cannot bank. A uniform model is one class,
     // so a one-element slice is exactly the pre-class single map.
+    // ⭐ WHAT THE ROWS ARE — one sequence's, or a decode batch's: the paged step's sources differ.
+    paged_rows: scratchy_triton_splice::PagedRows,
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
 ) -> Result<BundleLayout, SuperDscError> {
     // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are `input[1]` of any arity-3 MatmulTile.
@@ -1425,32 +1427,47 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    (`crate::paged_step`): the page index table, the mask stack, the KV write index and the
     //    query row index, at their reserved tids in the ACTIVATION segment like every per-step
     //    binding (the reserved-tid law above). Sized for the pool's WHOLE walk — a bundle whose rung
-    //    walks fewer blocks stages and reads a prefix — and the page table at its card pitch
-    //    (`PagedStep::card_page_table_pitch`). The decode kernel's `kv_row_pool` is every page's run
-    //    of folded-cache rows, the same for every step: it sits beside the pools in the KV segment,
-    //    which a walk's relaunch does not shift, at its card run pitch.
-    if let Some(step) = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(ir, ActiveCap::FULL)? {
+    //    walks fewer blocks stages and reads a prefix — and the page ids at the walk's card step
+    //    (`PagedStep::card_walk_step`). A decode batch's are `rep_row_ids`, `chunk_page_ids` and
+    //    `mask_by_chunk` in place of the query rows, the page table and the mask stack. The decode
+    //    kernel's `kv_row_pool` is every page's run of folded-cache rows, the same for every step: it
+    //    sits beside the pools in the KV segment, which a walk's relaunch does not shift, at its card
+    //    run pitch.
+    if let Some(step) =
+        crate::lower_subtile_tape_to_ktir::paged_step_of_ir(ir, ActiveCap::FULL, paged_rows)?
+    {
         let int32_stick = u64::from(scratchy_triton_splice::INT32_STICK);
         let sticks = |words: u64| words.div_ceil(int32_stick) * int32_stick * 4;
         let act = SegRole::Activation;
-        let mut sources = vec![
-            (
-                step.page_table,
-                act,
-                u64::from(step.pages) * step.card_page_table_pitch(),
-            ),
-            (
-                step.mask,
-                act,
-                u64::from(step.pages) * u64::from(step.rows) * u64::from(step.page_slots) * 2,
-            ),
-            (
-                step.write_rows,
-                act,
-                sticks(u64::from(step.rows * step.nkvh)),
-            ),
-            (step.query_rows, act, sticks(u64::from(step.rows))),
-        ];
+        let (slots, nkvh) = (u64::from(step.page_slots), u64::from(step.nkvh));
+        let mut sources = vec![(
+            step.write_rows,
+            act,
+            sticks(u64::from(step.rows * step.nkvh)),
+        )];
+        match step.batch() {
+            Some(c) => {
+                let (chunks, entries) = (u64::from(c.num_chunks), u64::from(c.entries()));
+                sources.extend([
+                    (step.rep_rows, act, sticks(entries)),
+                    (step.chunk_pages, act, chunks * step.card_walk_step()),
+                    (step.chunk_masks, act, chunks * entries * nkvh * slots * 2),
+                ]);
+            }
+            None => sources.extend([
+                (
+                    step.page_table,
+                    act,
+                    u64::from(step.pages) * step.card_walk_step(),
+                ),
+                (
+                    step.mask,
+                    act,
+                    u64::from(step.pages) * u64::from(step.rows) * slots * 2,
+                ),
+                (step.query_rows, act, sticks(u64::from(step.rows))),
+            ]),
+        }
         if step.reads_kv_row_pool() {
             sources.push((step.kv_row_pool, SegRole::Kv, step.card_kv_row_pool_bytes()));
         }
@@ -3923,8 +3940,14 @@ pub fn numeric_gate<F: RopeForm>(
     // table rather than at its block's own index. The reference attends the cache's token-major
     // rows; the pools the paged walk reads are those SAME values laid into their pages
     // (`pool_of_rows`), so the two read one set of keys.
-    let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(ir, rung.active_cap)
-        .map_err(|e| e.0)?;
+    // One sequence's step: the gate runs in an emulator bake, whose decode rungs are one request
+    // wide (the batch rungs, `PagedKvPool::BATCH_RUNGS`, bake for the card alone).
+    let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
+        ir,
+        rung.active_cap,
+        scratchy_triton_splice::PagedRows::Sequence,
+    )
+    .map_err(|e| e.0)?;
     let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
         SubOp::AttnDecode { geom, .. } => Some(geom.hd().get() as usize),
         _ => None,
@@ -7367,11 +7390,20 @@ fn ktir_groups_via_superdsc(
                     continue;
                 };
                 let in_act = l.placements.get(&tid).is_some_and(|p| p.segment == act);
-                if in_act && tid != step_tids.page_table && tid != step_tids.mask {
+                // The sources a trip walks: one sequence's page table and mask stack, or a decode
+                // batch's chunk page ids and chunk masks.
+                let walked = [
+                    step_tids.page_table,
+                    step_tids.mask,
+                    step_tids.chunk_pages,
+                    step_tids.chunk_masks,
+                ];
+                if in_act && !walked.contains(&tid) {
                     return Err(SuperDscError(format!(
                         "[spyre-superdsc] walk body op '{}' reads t{tid} from the activation \
                          segment, which its relaunch shifts one step per trip — only the step's \
-                         page table and mask stack move with the trip",
+                         page ids and masks (a sequence's page table and mask stack, a decode \
+                         batch's chunk page ids and chunk masks) move with the trip",
                         e.op_name
                     )));
                 }
@@ -8095,8 +8127,13 @@ mod tests {
             op_output: Vec::new(),
         };
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, &[])
-            .expect("a layout for a plain matmul bundle");
+        let layout = compute_bundle_layout(
+            &ir,
+            &weight_ids,
+            scratchy_triton_splice::PagedRows::Sequence,
+            &[],
+        )
+        .expect("a layout for a plain matmul bundle");
 
         // ⭐ ROLES AND PACKING, ASSERTED AS THE RULES — not as magic numbers. This test pinned
         // `(Activation, seg 0, off 0, 64 B)` and both of those had since changed BY DESIGN, silently,
@@ -8207,9 +8244,20 @@ mod tests {
         let plain = lower_region(&input, nz);
         let mut minted = lower_region(&input, nz);
         mint_sample(&mut minted, SampleRows::All);
-        let l_plain = compute_bundle_layout(&plain, &weight_ids, &[]).expect("plain lays out");
-        let l_minted =
-            compute_bundle_layout(&minted, &weight_ids, &[]).expect("the minted graph lays out");
+        let l_plain = compute_bundle_layout(
+            &plain,
+            &weight_ids,
+            scratchy_triton_splice::PagedRows::Sequence,
+            &[],
+        )
+        .expect("plain lays out");
+        let l_minted = compute_bundle_layout(
+            &minted,
+            &weight_ids,
+            scratchy_triton_splice::PagedRows::Sequence,
+            &[],
+        )
+        .expect("the minted graph lays out");
 
         // Each stamp names ITS OWN graph's count — the whole point of the fix.
         assert_eq!(l_plain.num_sources, plain.num_sources);
@@ -8299,8 +8347,13 @@ mod tests {
         let plain = lower_region(&input, nz);
         let mut minted = lower_region(&input, nz);
         mint_sample(&mut minted, SampleRows::All);
-        let layout =
-            compute_bundle_layout(&minted, &weight_ids, &[]).expect("the minted graph lays out");
+        let layout = compute_bundle_layout(
+            &minted,
+            &weight_ids,
+            scratchy_triton_splice::PagedRows::Sequence,
+            &[],
+        )
+        .expect("the minted graph lays out");
 
         // inv_t is the mint's fifth staged source (the seed quadruple's four word
         // tables first, at n_src), so its tid is four past the PRE-mint source
@@ -8658,7 +8711,13 @@ mod tests {
         // the extraction program and the door must Err naming it.
         let (node, ir) = build(mq);
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, &[]).expect("the tail's layout mints");
+        let layout = compute_bundle_layout(
+            &ir,
+            &weight_ids,
+            scratchy_triton_splice::PagedRows::Sequence,
+            &[],
+        )
+        .expect("the tail's layout mints");
         let mut programs = scratchy_triton_splice::lower_all(&node, &ir, false)
             .expect("the splice's fold mints the tail");
         let extract = programs
@@ -8735,7 +8794,13 @@ mod tests {
         // fp8 (arity-3): the placement reserves the PADDED extent — 2176·2816·1 B, the exact
         // bytes the matmul's tile read addresses (the refusal's access side).
         let ir = build(GemmWeight::Fp8Dynamic);
-        let layout = compute_bundle_layout(&ir, &weight_ids, &[]).expect("the fp8 layout mints");
+        let layout = compute_bundle_layout(
+            &ir,
+            &weight_ids,
+            scratchy_triton_splice::PagedRows::Sequence,
+            &[],
+        )
+        .expect("the fp8 layout mints");
         let p = layout.placements.get(&1).expect("the fp8 weight is placed");
         assert_eq!(
             p.size, 6_127_616,
@@ -8743,7 +8808,13 @@ mod tests {
         );
         // fp16 (arity-2), SAME shape: raw rows — 2112 = 33 whole fp16 sticks, no pad.
         let ir = build(GemmWeight::Dense);
-        let layout = compute_bundle_layout(&ir, &weight_ids, &[]).expect("the fp16 layout mints");
+        let layout = compute_bundle_layout(
+            &ir,
+            &weight_ids,
+            scratchy_triton_splice::PagedRows::Sequence,
+            &[],
+        )
+        .expect("the fp16 layout mints");
         let p = layout
             .placements
             .get(&1)
@@ -9456,17 +9527,26 @@ mod tests {
         let weight_ids: std::collections::HashSet<u32> = [0u32].into_iter().collect();
         // The budget pass refuses the same fixture the wiring accepts — on the UNROLLED graph,
         // with no layer classes, an over-cap weight segment is un-bankable and un-spillable.
-        let err = compute_bundle_layout(&ir, &weight_ids, &[])
-            .expect_err("the placement pass is the budget law and must refuse 32 GiB in seg1");
+        let err = compute_bundle_layout(
+            &ir,
+            &weight_ids,
+            scratchy_triton_splice::PagedRows::Sequence,
+            &[],
+        )
+        .expect_err("the placement pass is the budget law and must refuse 32 GiB in seg1");
         assert!(
             err.0.contains("one device region can hold"),
             "the refusal is the region-cap law, not some other defect: {err:?}"
         );
         // The wiring builds NO placement — it reads only the registries — so the same fixture
         // wires, and the scalar registry it carries is the pure walk's content.
-        let wiring =
-            crate::lower_subtile_tape_to_ktir::graph_wiring(&ir, &weight_ids, ActiveCap::FULL)
-                .expect("the wiring is a registry and never runs the budget pass");
+        let wiring = crate::lower_subtile_tape_to_ktir::graph_wiring(
+            &ir,
+            &weight_ids,
+            ActiveCap::FULL,
+            scratchy_triton_splice::PagedRows::Sequence,
+        )
+        .expect("the wiring is a registry and never runs the budget pass");
         assert_eq!(
             wiring.scalarmul_scales,
             vec![2.0],

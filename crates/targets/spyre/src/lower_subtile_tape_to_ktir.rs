@@ -896,7 +896,12 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             } else {
                 node
             };
-            match scratchy_triton_splice::lower_attn(node_ref, ir, active_cap) {
+            match scratchy_triton_splice::lower_attn(
+                node_ref,
+                ir,
+                active_cap,
+                scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
+            ) {
                 Ok(e) => Ops(vec![e]),
                 Err(reason) => Unhandled(reason),
             }
@@ -945,7 +950,12 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // layer boundary to split the weight segment on. An empty map is what tells the layout that
     // banking is not expressible here, leaving the tail spill as the only lever (`&Default::default()`
     // rather than a bool, so there is one spelling of "the layer structure" and not two).
-    let bundle_layout = compute_bundle_layout(ir, weight_ids, &[])?;
+    let bundle_layout = compute_bundle_layout(
+        ir,
+        weight_ids,
+        scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
+        &[],
+    )?;
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
     // Collect EVERY distinct unhandled op kind (the full worklist) in one pass —
     // reconnaissance, not a silent skip: a non-empty set is a HARD error so a
@@ -1291,10 +1301,12 @@ pub(crate) fn tensor_shapes_of_ir<F: RopeForm>(
 /// pool, rows or kv heads is refused rather than served one layer's tables.
 ///
 /// `active_cap` is the rung the bundle is baked at: its walk ([`scratchy_triton_splice::walk_pages`],
-/// the splice's own law) is the one fact of the step that depends on it.
+/// the splice's own law) is the one fact of the step that depends on it. `paged_rows` says whether
+/// the rows are a decode batch, whose chunking of that walk the batched kernel reads.
 pub fn paged_step_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
     active_cap: ActiveCap,
+    paged_rows: scratchy_triton_splice::PagedRows,
 ) -> Result<Option<crate::wiring::PagedStep>, SuperDscError> {
     let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
     let slots = scratchy_triton_splice::PAGE_SLOTS;
@@ -1318,17 +1330,22 @@ pub fn paged_step_of_ir<F: RopeForm>(
             )));
         }
         let (pages, mq) = (rows / slots, n.output.region.rows.len);
+        let walk = scratchy_triton_splice::walk_pages(pages, mq, active_cap);
         let step = crate::wiring::PagedStep {
             mask: tids.mask,
             page_table: tids.page_table,
             write_rows: tids.write_rows,
             query_rows: tids.query_rows,
             kv_row_pool: tids.kv_row_pool,
+            rep_rows: tids.rep_rows,
+            chunk_pages: tids.chunk_pages,
+            chunk_masks: tids.chunk_masks,
             pages,
             page_slots: slots,
             rows: mq,
             nkvh: geom.nkvh().get(),
-            walk: scratchy_triton_splice::walk_pages(pages, mq, active_cap),
+            walk,
+            paged_rows,
         };
         match out {
             Some(prev) if prev != step => {
@@ -1357,6 +1374,7 @@ pub fn graph_wiring<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
+    paged_rows: scratchy_triton_splice::PagedRows,
 ) -> Result<BundleWiring, SuperDscError> {
     // ⛔ A REGISTRY, NOT A PLACEMENT — the wiring reads ONE kind of thing off the layout: the
     // registries ([`WiringRegistries`]). The placement pass [`compute_bundle_layout`] computed
@@ -1503,7 +1521,7 @@ pub fn graph_wiring<F: RopeForm>(
     // union of its matmul consumers' view regions (the widen keeps the tied embed
     // weight's STATED cols at the pad while the host stages the real vocab region).
     let tensor_shapes: Vec<(u32, u32)> = tensor_shapes_of_ir(ir)?;
-    let paged = paged_step_of_ir(ir, active_cap)?;
+    let paged = paged_step_of_ir(ir, active_cap, paged_rows)?;
     let attn_mask = match (mask, paged) {
         (Some((mid, cap)), Some(p)) => {
             // The step's three sources are RESERVED tids (their shapes are the paged step's own
@@ -2078,7 +2096,12 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // The layout's budget passes (spill/bank) take the per-loop maps directly: the spill reasons
     // over WHICH tids are per-layer at all (flattened internally), and the BANK needs the class
     // boundaries to know which (class, iteration) launches must stay in one bank.
-    let mut bundle_layout = compute_bundle_layout(ir, weight_ids, &per_layer_ext)?;
+    let mut bundle_layout = compute_bundle_layout(
+        ir,
+        weight_ids,
+        scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
+        &per_layer_ext,
+    )?;
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
     // The rolled tape is `prefix; [OpenLoop(body₀) CloseLoop]…[OpenLoop(bodyₙ) CloseLoop]; suffix`
     // — sibling loops, never nested (the TapeBuilder typestate forbids nesting). One `(range,

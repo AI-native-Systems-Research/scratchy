@@ -1771,18 +1771,19 @@ fn program_broadcast_chains(
         // source is ONE flat row; anything else on a leading or middle axis is ROW-REPLICATION —
         // each flat row of the source repeating down the merged row axis — and is refused by name
         // below, because no operand mode addresses it (see that refusal).
-        let rank = bc
+        let res_dims: Option<Vec<i64>> = bc
             .attributes
             .iter()
             .find_map(|(k, v)| match (k, v) {
-                (AttrKey::Shape, Attr::IntList(d)) => Some(d.len()),
+                (AttrKey::Shape, Attr::IntList(d)) => Some(d.to_vec()),
                 _ => None,
             })
             .or_else(|| {
                 bc.result_type
                     .as_ref()
-                    .and_then(|t| t.dims().map(|d| d.len()))
+                    .and_then(|t| t.dims().map(|d| d.to_vec()))
             });
+        let rank = res_dims.as_ref().map(Vec::len);
         let Some(rank) = rank else {
             return err(format!(
                 "{}: `linalg.broadcast` states no shaped result, so its rank — the frame the \
@@ -1806,19 +1807,73 @@ fn program_broadcast_chains(
             (_, [0]) if rank <= 2 => (BcastAxis::Mb, false),
             (r, [d]) if r > 2 && *d as usize == r - 1 => (BcastAxis::Col, true),
             _ if leading => (BcastAxis::Mb, true),
+            // ⭐ A LEADING RUN PLUS THE STICK AXIS IS A PER-ROW SCALAR SPRAYED DOWN THE LEADING
+            // AXES: `[B, KV, G] -> [J, B, KV, G, block]` (`Dimensions=[0, 4]`, a decode batch's
+            // one-chunk running max against its scores) — the `Col` read and the outer row spray at
+            // once. The count is the leading run's extent; the cover (the source's values ARE the
+            // result's rows after the run) is proved after the walk-back.
+            (r, ds)
+                if r > 2
+                    && ds.len() >= 2
+                    && ds.last() == Some(&(r as i64 - 1))
+                    && ds[..ds.len() - 1]
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &d)| d == i as i64) =>
+            {
+                let k = ds.len() - 1;
+                let count: i64 = res_dims
+                    .as_ref()
+                    .map(|s| s[..k].iter().product())
+                    .unwrap_or(0);
+                if count <= 1 {
+                    return err(format!(
+                        "{}: `linalg.broadcast` adds the leading run {:?} and the stick axis of a \
+                         rank-{r} tensor, to a leading extent of {count} — no spray",
+                        f.name,
+                        &ds[..k]
+                    ));
+                }
+                (
+                    BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::outer_row_scalars(
+                        count as u32,
+                    )),
+                    false,
+                )
+            }
+            // ⭐ THE AXIS JUST BEFORE THE STICK IS THE INNER ROW SPRAY: each of the source's flat
+            // rows repeated `y` times in a row (`[J, B, KV, 1, block] -> [J, B, KV, G, block]`, a
+            // decode batch's mask over its query-head group) — the row-split mode in its
+            // `[mb, y, out]` order. The count is the result's own extent on the axis; the cover
+            // (the source's rows ARE the result's rows before it) is proved after the walk-back,
+            // as the outer spray's is.
+            (r, [d]) if r > 2 && *d as usize == r - 2 && *d > 0 => {
+                match res_dims.as_ref().and_then(|s| s.get(*d as usize)) {
+                    Some(&y) if y > 1 => (
+                        BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::inner(y as u32)),
+                        false,
+                    ),
+                    other => {
+                        return err(format!(
+                            "{}: `linalg.broadcast` adds dim {d} of a rank-{r} tensor — the axis \
+                             just before the stick — to an extent of {other:?}; a spray of one is \
+                             no broadcast, and an unstated extent is no spray count",
+                            f.name
+                        ));
+                    }
+                }
+            }
             (r, [d]) if r > 2 => {
                 return err(format!(
                     "{}: `linalg.broadcast` adds dim {d} of a rank-{r} tensor — a MIDDLE axis of \
-                     the flat frame. Row-major that is ROW-REPLICATION: the source's extent on \
-                     that axis is 1 by the broadcast's own law, so each of the source's flat rows \
-                     repeats down the merged row axis (the batched paged-decode kernel's mask add \
-                     is exactly this shape, `[B, 1, PS] -> [B, G, PS]`). The device's pointwise \
-                     operand modes state a per-row scalar (`In::col`, one address per row) and a \
-                     row vector (`In::mb`, one row addressed once); neither states an address that \
-                     advances every k rows, and no descriptor in this door's vocabulary does, so \
-                     this is named rather than half-addressed. The door-proven statement of the \
-                     same math is `attn.py`'s own mask law: the host stages the mask at the score \
-                     tile's own rows and the kernel adds it at base — no broadcast at all",
+                     the flat frame with more than the stick after it. Row-major that is \
+                     ROW-REPLICATION AT A STRIDE: each of the source's flat rows repeats down the \
+                     merged row axis with the axes after the sprayed one interleaved between the \
+                     copies. The device's pointwise operand modes state a per-row scalar \
+                     (`In::col`), a row vector (`In::mb`) and a row spray of a whole source either \
+                     outermost or innermost of the rows (`Y`, `[y, mb, out]` or `[mb, y, out]`); \
+                     none states an address that advances every k rows with a stride between the \
+                     copies, so this is named rather than half-addressed",
                     f.name
                 ));
             }
@@ -1878,9 +1933,25 @@ fn program_broadcast_chains(
                     };
                     let want = match axis {
                         BcastAxis::Col => target.len().checked_sub(1),
-                        // `Mb` and the (later-assigned) `Y` both spray a LEADING axis: the
+                        // A per-row scalar's spray inserts two degenerate dims, one expand each:
+                        // the leading one and the stick's — this expand is either.
+                        BcastAxis::Y(super::lower_ktir_to_superdsc::Spray {
+                            of: super::lower_ktir_to_superdsc::SprayOf::RowScalars,
+                            ..
+                        }) => {
+                            if target.first() == Some(&1) {
+                                Some(0)
+                            } else {
+                                target.len().checked_sub(1)
+                            }
+                        }
+                        // The inner spray's axis is the one just before the stick.
+                        BcastAxis::Y(sp) if sp.order == crate::emit::SprayOrder::Inner => {
+                            target.len().checked_sub(2)
+                        }
+                        // `Mb` and the (later-assigned) outer `Y` both spray a LEADING axis: the
                         // relay's insert must be the leading `1` either way — at classification
-                        // time the axis is still `Mb` (the `Y` admission runs after the
+                        // time the axis is still `Mb` (the outer `Y` admission runs after the
                         // walk-back, on the resolved source's own row count), and a chain the
                         // admission flips to `Y` passed the same leading-`1` check here.
                         BcastAxis::Mb | BcastAxis::Y(_) => Some(0),
@@ -1899,8 +1970,15 @@ fn program_broadcast_chains(
                             f.name,
                             match axis {
                                 BcastAxis::Col => "trailing",
-                                // `Mb` and the post-walk-back `Y` both spray the LEADING axis —
-                                // the same word names it for the reader either way.
+                                BcastAxis::Y(super::lower_ktir_to_superdsc::Spray {
+                                    of: super::lower_ktir_to_superdsc::SprayOf::RowScalars,
+                                    ..
+                                }) => "leading or trailing",
+                                BcastAxis::Y(sp) if sp.order == crate::emit::SprayOrder::Inner => {
+                                    "second-to-last"
+                                }
+                                // `Mb` and the post-walk-back outer `Y` both spray the LEADING
+                                // axis — the same word names it for the reader either way.
                                 BcastAxis::Mb | BcastAxis::Y(_) => "leading",
                             }
                         ));
@@ -2148,7 +2226,7 @@ fn program_broadcast_chains(
                         ));
                     }
                     Some(rows) if mb as u32 == rows => {
-                        axis = BcastAxis::Y(y as u32);
+                        axis = BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::outer(y as u32));
                         flat = false;
                         y_admitted = true;
                     }
@@ -2172,6 +2250,52 @@ fn program_broadcast_chains(
                     }
                 }
             }
+        }
+        // ⭐ THE INNER SPRAY'S COVER: the source's flat rows must BE the result's rows before the
+        // sprayed axis — `[J·B·KV, block]` under `[J, B, KV, G, block]` — or the copies would read
+        // rows the source does not have. Proved on the resolved source's own shape, independently
+        // of the count the classification read off the result.
+        if let BcastAxis::Y(sp) = axis
+            && sp.order == crate::emit::SprayOrder::Inner
+        {
+            let source_rows = def_of(cursor)
+                .and_then(super::lower_ktir_to_superdsc::shape_2d)
+                .map(|(r, _)| r as i64);
+            let before: Option<i64> = res_dims
+                .as_ref()
+                .map(|s| s[..s.len().saturating_sub(2)].iter().product());
+            if source_rows.is_none() || source_rows != before {
+                return err(format!(
+                    "{}: `linalg.broadcast` sprays its second-to-last axis {} times over a source \
+                     of {source_rows:?} flat rows, but the result's rows before that axis are \
+                     {before:?} — the inner row spray repeats each SOURCE row in place, so the \
+                     two must be the same rows, or the copies read rows the source does not have",
+                    f.name, sp.count
+                ));
+            }
+            y_admitted = true;
+        }
+        // ⭐ THE PER-ROW SCALARS' COVER: the source holds one value per result row after the
+        // sprayed run — `B·KV·G` values under `[J, B, KV, G, block]` — proved on the resolved
+        // source's own element count.
+        if let BcastAxis::Y(sp) = axis
+            && sp.of == super::lower_ktir_to_superdsc::SprayOf::RowScalars
+        {
+            let numel = def_of(cursor)
+                .and_then(super::lower_ktir_to_superdsc::shape_2d)
+                .map(|(r, c)| i64::from(r) * i64::from(c));
+            let rows: Option<i64> = res_dims.as_ref().map(|s| {
+                s[..s.len().saturating_sub(1)].iter().product::<i64>() / i64::from(sp.count)
+            });
+            if numel.is_none() || numel != rows {
+                return err(format!(
+                    "{}: `linalg.broadcast` sprays {numel:?} per-row values down {} leading \
+                     copies of {rows:?} rows each — one value per row is the cover, or the read \
+                     reaches values the source does not have",
+                    f.name, sp.count
+                ));
+            }
+            y_admitted = true;
         }
         if !saw_degenerate_expand && !y_admitted {
             // ⭐ THE SOURCE'S OWN LOAD IS A SECOND PROOF OF THE SAME FACT. An fp8 weight-scale chain
@@ -3827,6 +3951,102 @@ fn lower_function_folded(
                 head_major_skip.insert(t_res);
                 continue;
             }
+            // ⭐ ROW-MAJOR ROWS READ STICK-MAJOR — `[R·C, stick]` (a batched dot's per-head rows,
+            // `[B, KV, G, D]`) reshaped to `[R, C·stick]` (the `[B, H·D]` output block): the stick
+            // permute back, into the parameter the reshape's result is stored to when it is stored
+            // whole, else into a minted buffer.
+            if !gathered_loads.contains_key(&src)
+                && !same_card_bytes(&from, &to)
+                && let Some((rows, sticks)) = stick_major_split(&to, &from)
+            {
+                let Some(layout) = layout else {
+                    return err(format!(
+                        "{}: a stick permute needs a `BundleLayout` to hold its result",
+                        f.name
+                    ));
+                };
+                let Some(source) = region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
+                else {
+                    return err(format!(
+                        "{}: `{:?}` permutes a value this walk holds no buffer for",
+                        f.name, op.op_type
+                    ));
+                };
+                let stored_to = f.operations.iter().find(|s| {
+                    s.op_type == OpKind::KtdpStore
+                        && s.operands.first() == Some(&res)
+                        && !indirect_tile_of(f, s.operands.get(1).copied())
+                });
+                let dst = match stored_to {
+                    Some(store) => {
+                        let tile = f.operations.iter().find(|o| {
+                            o.op_type == OpKind::KtdpConstructAccessTile
+                                && Some(o.result) == Some(store.operands.get(1).copied())
+                        });
+                        let o = match tile {
+                            Some(t) => region_of_view_operand(k, t, 0)?
+                                .map(|o| windowed_region(k, o, t))
+                                .transpose()?,
+                            None => None,
+                        };
+                        match o {
+                            Some(o)
+                                if (o.r_start, o.c_start, o.r_len, o.c_len)
+                                    == (0, 0, rows, sticks * stick as u32) =>
+                            {
+                                Region { is_out: true, ..o }
+                            }
+                            _ => {
+                                return err(format!(
+                                    "{}: the permuted `[{rows}, {}]` block is stored somewhere \
+                                     other than a whole `[{rows}, {}]` parameter window",
+                                    f.name,
+                                    sticks * stick as u32,
+                                    sticks * stick as u32
+                                ));
+                            }
+                        }
+                    }
+                    None => {
+                        let tid = mint_inter(k, layout, floor, res);
+                        layout.synth(
+                            crate::place::PlaceId::Act(tid),
+                            &[rows, sticks * stick as u32],
+                        );
+                        Region {
+                            tid,
+                            v_rows: rows,
+                            v_cols: sticks * stick as u32,
+                            r_start: 0,
+                            c_start: 0,
+                            r_len: rows,
+                            c_len: sticks * stick as u32,
+                            r_cover: (0, rows),
+                            c_cover: (0, sticks * stick as u32),
+                            is_out: true,
+                            is_fp8: false,
+                            band: None,
+                        }
+                    }
+                };
+                out.push(permute(
+                    f.name,
+                    &source,
+                    &dst,
+                    (rows, sticks),
+                    crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                    sym_id_base,
+                    Some(layout),
+                )?);
+                inter.insert(
+                    res,
+                    Region {
+                        is_out: false,
+                        ..dst
+                    },
+                );
+                continue;
+            }
             if !same_card_bytes(&from, &to)
                 && !gathered_loads.get(&src).is_some_and(|&gi| !pooled(gi))
             {
@@ -3883,12 +4103,40 @@ fn lower_function_folded(
                             head_major_skip.insert(t_res);
                         } else if same_card_bytes(&from, &to) {
                             inter.insert(res, reframed(r, flat_frame(&to)));
+                        } else if let Some((rows, sticks)) = stick_major_split(&from, &to) {
+                            // ⭐ THE GATHERED ROWS' ROW-MAJOR SPLIT — spyre-inference's
+                            // `query.index_select(0, rep_row_ids).reshape(entries, KV, G, D)`: the
+                            // gathered `[R, C·stick]` block lands stick-major, and the reshape
+                            // reads its `R·C` sticks row by row, so the card permutes the sticks
+                            // once into a row-major `[R·C, stick]` buffer.
+                            let tid = mint_inter(k, layout, floor, res);
+                            let dst = row_major_region(tid, rows * sticks, layout);
+                            out.push(permute(
+                                f.name,
+                                &r,
+                                &dst,
+                                (rows, sticks),
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            inter.insert(
+                                res,
+                                reframed(
+                                    Region {
+                                        is_out: false,
+                                        ..dst
+                                    },
+                                    flat_frame(&to),
+                                ),
+                            );
                         } else {
                             return err(format!(
                                 "{}: `{:?}` re-frames a gathered {from:?} as {to:?}, which moves \
                                  bytes on the card — a relayout this door does not state. A \
                                  stick-major row is its heads in stick order only while a head is \
-                                 ONE {stick}-element stick",
+                                 ONE {stick}-element stick, and its row-major split is the rows' \
+                                 sticks in order",
                                 f.name, op.op_type
                             ));
                         }
@@ -4048,6 +4296,122 @@ fn lower_function_folded(
         let reduce = (op.op_type == OpKind::LinalgReduce)
             .then(|| reduce_kind_of(op))
             .flatten();
+        // ⭐ A REDUCTION OVER THE LEADING AXIS IS A CHAIN OF COMBINES — the card's reduce folds
+        // along the stick, and `Dimensions=[0]` folds the `J` blocks of rows a rank-N value's flat
+        // frame holds one after another (a decode batch's `J` block slots: `torch.amax(..., dim=0)`,
+        // `torch.sum(..., dim=0)`). So the `J` row windows of `R` rows each combine pairwise into
+        // the `[R, ·]` result: `acc = win₀ ∘ win₁`, then `acc = acc ∘ winⱼ`. A per-row column (one
+        // value per stick row, the row reductions' own form) is combined as its one-stick rows —
+        // its storage is stick-wide, and the pad lanes the combine writes are never read.
+        if let Some(kind) = reduce
+            && op.attributes.iter().any(
+                |(k, v)| matches!((k, v), (AttrKey::Dimensions, Attr::IntList(d)) if *d == [0]),
+            )
+            && let (Some(res), Some(&data)) = (op.result, op.operands.first())
+        {
+            let Some(layout) = layout else {
+                return err(format!(
+                    "{}: a leading-axis reduction needs a `BundleLayout` to hold its result",
+                    f.name
+                ));
+            };
+            let Some(src) = region_for_operand(k, data)?.or_else(|| inter.get(&data).copied())
+            else {
+                return err(format!(
+                    "{}: a leading-axis reduction reads a value this walk holds no buffer for",
+                    f.name
+                ));
+            };
+            // The blocks folded: the source's elements over the result's.
+            let result_numel: i64 = op
+                .result_type
+                .and_then(|t| t.dims())
+                .map_or(0, |d| d.iter().product());
+            let src_numel = i64::from(src.v_rows) * i64::from(src.c_len);
+            let blocks = if result_numel > 0 && src_numel % result_numel == 0 {
+                (src_numel / result_numel) as u32
+            } else {
+                0
+            };
+            if blocks < 2 || !src.v_rows.is_multiple_of(blocks) || src.r_len != src.v_rows {
+                return err(format!(
+                    "{}: a leading-axis reduction over {blocks} block(s) of t{}'s {} rows — the \
+                     combine folds whole equal row blocks of a whole view",
+                    f.name, src.tid, src.v_rows
+                ));
+            }
+            let rows = src.v_rows / blocks;
+            let stick = crate::work::FP16_ELEMS_PER_STICK;
+            let column = src.c_len == 1;
+            let tid = mint_inter(k, layout, floor, res);
+            layout.synth(crate::place::PlaceId::Act(tid), &[rows, src.v_cols]);
+            let acc = Region {
+                tid,
+                v_rows: rows,
+                v_cols: src.v_cols,
+                r_start: 0,
+                c_start: 0,
+                r_len: rows,
+                c_len: src.c_len,
+                r_cover: (0, rows),
+                c_cover: (0, src.v_cols),
+                is_out: true,
+                is_fp8: false,
+                band: None,
+            };
+            // A column's one-stick rows, as the dense arm combines them.
+            let sticks = |r: Region| {
+                if column {
+                    Region {
+                        v_cols: stick,
+                        c_len: stick,
+                        c_cover: (0, stick),
+                        ..r
+                    }
+                } else {
+                    r
+                }
+            };
+            let window = |j: u32| {
+                sticks(Region {
+                    r_start: j * rows,
+                    r_len: rows,
+                    r_cover: (j * rows, (j + 1) * rows),
+                    is_out: false,
+                    ..src
+                })
+            };
+            let combine = match kind {
+                ReduceKind::Max => Elementwise::Maximum,
+                ReduceKind::Sum => Elementwise::Add,
+            };
+            for j in 1..blocks {
+                let lhs = if j == 1 {
+                    window(0)
+                } else {
+                    sticks(Region {
+                        is_out: false,
+                        ..acc
+                    })
+                };
+                out.extend(super::lower_ktir_to_superdsc::elementwise(
+                    f.name,
+                    combine,
+                    &[lhs, window(j), sticks(acc)],
+                    &[],
+                    sym_id_base,
+                    Some(layout),
+                )?);
+            }
+            inter.insert(
+                res,
+                Region {
+                    is_out: false,
+                    ..acc
+                },
+            );
+            continue;
+        }
         // `arith.mulf` by a SPLATTED CONSTANT is a scalar multiply, not an `Elementwise(Mul)` — the
         // tiebreak `Program`'s own doc names. Read per-op, because one decoder layer states four
         // different multipliers. Checked BEFORE the 1:1 map, which would otherwise route it to
@@ -4718,6 +5082,15 @@ fn lower_function_folded(
                     OpKind::TensorReshape | OpKind::TensorCollapseShape | OpKind::TensorExpandShape
                 ) && o.operands.first() == Some(&res)
             })?;
+            // Only through a shape op that moves no byte: one that does is a stick permute, which
+            // the shape op's own arm lowers into the stored parameter.
+            let dims = |o: &Operation<'_>| -> Vec<i64> {
+                o.result_type
+                    .and_then(|t| t.dims())
+                    .map(<[i64]>::to_vec)
+                    .unwrap_or_default()
+            };
+            same_card_bytes(&dims(op), &dims(shape)).then_some(())?;
             stores_of(shape.result)
         });
         // ⭐⭐⭐ THE fp8 WEIGHT-SCALE EPILOGUE, ABSORBED AT THE DOT. `matmul_fp8.py` spells the W8A8
@@ -5231,17 +5604,50 @@ fn lower_function_folded(
 /// `linalg.reduce` result of this function, the running max and sum — is the `[numel, 1]` column the
 /// reduction writes; anything else is its flat frame.
 fn value_frame(f: &IRFunction<'static>, dims: &[i64]) -> [u32; 2] {
-    let per_row = f
-        .operations
+    // The shapes a per-row column takes: a stick fold's result, and a leading fold of a per-row
+    // column (a decode batch's `J` block slots' running max, folded) — to a fixed point.
+    let deep = f.ops_deep();
+    let dims_of = |o: &Operation<'_>| o.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec);
+    let mut columns: Vec<Vec<i64>> = deep
         .iter()
-        .filter(|o| o.op_type == OpKind::LinalgReduce)
-        .filter_map(|o| o.result_type.and_then(|t| t.dims()))
-        .any(|d| d == dims);
+        .filter(|o| o.op_type == OpKind::LinalgReduce && folds_the_stick(o))
+        .filter_map(|o| dims_of(o))
+        .collect();
+    loop {
+        let more: Vec<Vec<i64>> = deep
+            .iter()
+            .filter(|o| o.op_type == OpKind::LinalgReduce && !folds_the_stick(o))
+            .filter(|o| {
+                o.operands
+                    .first()
+                    .and_then(|&v| deep.iter().find(|d| d.result == Some(v)))
+                    .and_then(|d| dims_of(d))
+                    .is_some_and(|d| columns.contains(&d))
+            })
+            .filter_map(|o| dims_of(o))
+            .filter(|d| !columns.contains(d))
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        columns.extend(more);
+    }
+    let per_row = columns.iter().any(|d| d == dims);
     if per_row {
         [dims.iter().product::<i64>() as u32, 1]
     } else {
         flat_frame(dims)
     }
+}
+
+/// Whether a `linalg.reduce` folds its input's LAST axis — the stick, one value per row of the
+/// flat frame, the per-row column a row reduction writes. A fold of any other axis (the leading
+/// `J` of a decode batch's block slots) writes a tile of the input's own rows.
+fn folds_the_stick(o: &Operation<'_>) -> bool {
+    let rank = o.result_type.and_then(|t| t.dims()).map_or(0, <[i64]>::len);
+    o.attributes.iter().any(
+        |(k, v)| matches!((k, v), (AttrKey::Dimensions, Attr::IntList(d)) if *d == [rank as i64]),
+    )
 }
 
 /// The values of the splatted constants the walk MATERIALIZES — a splat read as a dense operand of a
@@ -5447,6 +5853,72 @@ fn flat_frame(dims: &[i64]) -> [u32; 2] {
 /// in both stick-major flat frames (`(c / stick)·(rows·stick) + r·stick + c % stick`, a row padded to
 /// whole sticks). True for equal frames, and for a re-framing that keeps every row one stick wide or
 /// moves rows within one row of sticks; false — a relayout — otherwise.
+/// ⭐ THE ROW-MAJOR SPLIT OF A STICK-MAJOR BLOCK — `(R, C)` when `stick_major` is a rank-2
+/// `[R, C·stick]` block of `R ≥ 2` rows of `C ≥ 2` sticks and `row_major`'s flat frame is
+/// `[R·C, stick]`: the same elements, row `r`'s sticks in order, which on the card are different
+/// bytes (`[C][R][stick]` vs `[R][C][stick]`) — the pair a stick permute moves between. One row is
+/// the same bytes in both frames, and no permute.
+fn stick_major_split(stick_major: &[i64], row_major: &[i64]) -> Option<(u32, u32)> {
+    let stick = i64::from(crate::work::FP16_ELEMS_PER_STICK);
+    let [rows, cols] = <[i64; 2]>::try_from(stick_major).ok()?;
+    let sticks = cols / stick;
+    let [split_rows, split_cols] = flat_frame(row_major);
+    (cols % stick == 0
+        && rows >= 2
+        && sticks >= 2
+        && i64::from(split_cols) == stick
+        && i64::from(split_rows) == rows * sticks)
+        .then_some((rows as u32, sticks as u32))
+}
+
+/// A minted row-major `[rows, stick]` buffer's region.
+fn row_major_region(tid: u32, rows: u32, layout: &BundleLayout) -> Region {
+    let stick = crate::work::FP16_ELEMS_PER_STICK;
+    layout.synth(crate::place::PlaceId::Act(tid), &[rows, stick]);
+    Region {
+        tid,
+        v_rows: rows,
+        v_cols: stick,
+        r_start: 0,
+        c_start: 0,
+        r_len: rows,
+        c_len: stick,
+        r_cover: (0, rows),
+        c_cover: (0, stick),
+        is_out: true,
+        is_fp8: false,
+        band: None,
+    }
+}
+
+/// One stick permute between `src` and `dst` ([`crate::ir::bridge::tiled_op_sdsc_op::StickPermute`]).
+fn permute(
+    name: &str,
+    src: &Region,
+    dst: &Region,
+    (rows, sticks): (u32, u32),
+    direction: crate::ir::bridge::tiled_op_sdsc_op::StickPermute,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<super::EmittedOp, Error> {
+    crate::ir::bridge::tiled_op_sdsc_op::assemble_stick_permute(
+        &format!("permute_o{}", dst.tid),
+        &src.name(),
+        &dst.name(),
+        crate::ir::bridge::tiled_op_sdsc_op::StickPermuteSpec {
+            rows,
+            sticks,
+            df: crate::superdsc_opspec::Df::Fp16,
+            direction,
+        },
+        sym_id_base,
+        layout,
+    )
+    .map_err(|message| Error {
+        message: format!("{name}: {message}"),
+    })
+}
+
 fn same_card_bytes(from: &[i64], to: &[i64]) -> bool {
     if from.iter().product::<i64>() != to.iter().product::<i64>() {
         return false;
@@ -6304,21 +6776,62 @@ mod broadcast_chain_tests {
         assert_eq!(b.src, Ssa(0), "the consumer reads the rank-2 SOURCE");
     }
 
-    /// ⛔⛔ THE RANK-3 MIDDLE AXIS — THE MASK ADD, `[256, 256] -> [256, 1, 256] -> [256, 4, 256]`
-    /// with `Dimensions=[1]`, spelled `reshape -> collapse -> broadcast` with no expand at all.
-    /// Row-major, spraying the middle axis repeats each of the source's flat rows down the
-    /// merged row axis (`result[b, g, j] = source[b, 0, j]`: flat row `b·4 + g` reads flat row
-    /// `b` — the row index ADVANCES every G rows), and no operand mode in this door's vocabulary
-    /// addresses that. The refusal must NAME the shape and `attn.py`'s door-proven restatement —
-    /// the host stages the mask at the score tile's own rows and the kernel adds it at base —
-    /// because that restatement is the kernel's move, not a lowering fix.
+    /// ⭐⭐⭐ THE AXIS JUST BEFORE THE STICK — THE MASK ADD, `[256, 256] -> [256, 1, 256] ->
+    /// [256, 4, 256]` with `Dimensions=[1]`, spelled `reshape -> collapse -> broadcast` with no
+    /// expand at all — ADMITTED as the INNER row spray: `result[b, g, j] = source[b, j]`, flat row
+    /// `b·4 + g` reading flat row `b`, which the `[mb, y, out]` row-split frame addresses byte for
+    /// byte (each of the source's 256 rows repeated 4 times in a row). The cover is proved on the
+    /// source's own shape: its 256 flat rows are the result's rows before the sprayed axis.
     #[test]
-    fn the_rank3_middle_axis_is_row_replication_and_refused() {
-        let m = refusal3(
+    fn the_axis_before_the_stick_over_a_multirow_source_is_the_inner_row_spray() {
+        let f = chain3(
             &[256, 256],
             Relay::Reshape(&[256, 1, 256]),
             &[256, 256],
             &[256, 4, 256],
+            &[1],
+        );
+        let (map, _) = program_broadcast_chains(&f).expect("the mask add's own chain");
+        let b = map
+            .get(&Ssa(4))
+            .expect("the broadcast's result is what a consumer names");
+        assert_eq!(
+            b.axis,
+            BcastAxis::Y(super::super::lower_ktir_to_superdsc::Spray::inner(4)),
+            "each source row repeated 4 times in a row is the inner row spray"
+        );
+        assert!(!b.flat, "the spray's source is the `[mb, out]` tile itself");
+        assert_eq!(b.src, Ssa(0), "the walk-back reaches the rank-2 SOURCE");
+    }
+
+    /// ⛔ AN INNER SPRAY WHOSE SOURCE IS NOT THE RESULT'S LEADING ROWS — a 128-row source under a
+    /// result whose rows before the sprayed axis are 256: the copies would read rows the source
+    /// does not have, so the cover proof refuses it by name.
+    #[test]
+    fn an_inner_spray_over_the_wrong_rows_is_refused() {
+        let m = refusal3(
+            &[128, 256],
+            Relay::Reshape(&[128, 1, 256]),
+            &[128, 256],
+            &[256, 4, 256],
+            &[1],
+        );
+        assert!(
+            m.contains("second-to-last axis") && m.contains("rows the source does not have"),
+            "names the cover the spray needs: {m}"
+        );
+    }
+
+    /// ⛔⛔ A MIDDLE AXIS WITH MORE THAN THE STICK AFTER IT — `[64, 8, 64] -> [64, 4, 8, 64]` over
+    /// `Dimensions=[1]`: each source row's copies are interleaved with the axes after the sprayed
+    /// one, a replication at a stride no operand mode addresses, so it is refused by name.
+    #[test]
+    fn a_middle_axis_with_axes_after_it_is_row_replication_and_refused() {
+        let m = refusal3(
+            &[512, 64],
+            Relay::Reshape(&[64, 1, 8, 64]),
+            &[512, 64],
+            &[64, 4, 8, 64],
             &[1],
         );
         assert!(
@@ -6326,12 +6839,8 @@ mod broadcast_chain_tests {
             "names the axis class, not just the index: {m}"
         );
         assert!(
-            m.contains("ROW-REPLICATION"),
+            m.contains("ROW-REPLICATION AT A STRIDE"),
             "names the data movement the device cannot address: {m}"
-        );
-        assert!(
-            m.contains("attn.py"),
-            "names the door-proven restatement so the kernel side knows the move: {m}"
         );
     }
 
@@ -6359,7 +6868,7 @@ mod broadcast_chain_tests {
             .expect("the broadcast's result is what a consumer names");
         assert_eq!(
             b.axis,
-            BcastAxis::Y(4),
+            BcastAxis::Y(super::super::lower_ktir_to_superdsc::Spray::outer(4)),
             "a multi-row source sprayed down a NEW leading dim is the row-split form"
         );
         assert!(
@@ -6675,7 +7184,11 @@ mod presented_flat_tests {
     /// the `y`-broadcast scale owns the addressing, so the presentation is the identity.
     #[test]
     fn the_row_split_mode_presents_nothing() {
-        let p = presented_flat(&reg(64, 4), BcastAxis::Y(4)).expect("the identity");
+        let p = presented_flat(
+            &reg(64, 4),
+            BcastAxis::Y(super::super::lower_ktir_to_superdsc::Spray::outer(4)),
+        )
+        .expect("the identity");
         assert_eq!((p.v_rows, p.v_cols), (64, 4));
     }
 }

@@ -9690,12 +9690,23 @@ fn emit_superdsc_wiring(
         Some(p) => {
             let (m, t, w) = (u32l(p.mask), u32l(p.page_table), u32l(p.write_rows));
             let (q, kvp) = (u32l(p.query_rows), u32l(p.kv_row_pool));
+            let (rr, cp, cm) = (u32l(p.rep_rows), u32l(p.chunk_pages), u32l(p.chunk_masks));
             let (pages, slots) = (u32l(p.pages), u32l(p.page_slots));
             let (rows, nkvh, walk) = (u32l(p.rows), u32l(p.nkvh), u32l(p.walk));
+            let paged_rows = match p.paged_rows {
+                scratchy_target_spyre::paged_step::PagedRows::Batch => {
+                    quote! { ::scratchy_target_spyre::paged_step::PagedRows::Batch }
+                }
+                scratchy_target_spyre::paged_step::PagedRows::Sequence => {
+                    quote! { ::scratchy_target_spyre::paged_step::PagedRows::Sequence }
+                }
+            };
             quote! {
                 ::core::option::Option::Some(::scratchy_target_spyre::wiring::PagedStep {
                     mask: #m, page_table: #t, write_rows: #w, query_rows: #q, kv_row_pool: #kvp,
+                    rep_rows: #rr, chunk_pages: #cp, chunk_masks: #cm,
                     pages: #pages, page_slots: #slots, rows: #rows, nkvh: #nkvh, walk: #walk,
+                    paged_rows: #paged_rows,
                 })
             }
         }
@@ -11306,6 +11317,9 @@ fn dump_wavefront_mega(
              -> (BakeOut, Vec<BakeEffect>) {
                 let mut fx: Vec<BakeEffect> = Vec::new();
                 let is_prefill = prefill_mq.is_some();
+                // A prefill chunk's rows are one prompt's positions; the decode bundle's are one
+                // token each of the running requests once it is baked wider than a single row.
+                let rows_are_requests = !is_prefill && decode_rows > 1;
                 // ⛔ THE WIRING MUST NOT DESCRIBE A PROGRAM THAT DID NOT SHIP. A prefill
                 // rung whose reroll fails PANICS (no rung may fail to lower), but this
                 // closure's KTIR emission and wiring stamp run AFTER the reroll and
@@ -11519,6 +11533,7 @@ fn dump_wavefront_mega(
                     &krg,
                     &weight_ids,
                     active_cap,
+                    scratchy_target_spyre::paged_step::PagedRows::of_requests(rows_are_requests),
                 ) {
                     Ok(w) => w,
                     Err(e) => panic!("[spyre] {base}: wiring not lowerable — {}", e.0),
@@ -11594,10 +11609,7 @@ fn dump_wavefront_mega(
                                 &weight_ids,
                                 active_cap, // decode: FULL (sk_bucket rungs land below). prefill: NONE for a
                                 // start==0 chunk, FULL for the continuation bundle.
-                                // A prefill chunk's rows are one prompt's positions; the decode bundle's
-                                // are one token each of the running requests once it is baked wider than
-                                // a single row.
-                                !is_prefill && decode_rows > 1,
+                                rows_are_requests,
                             ) {
                                 Ok(rolled) => {
                                     // ⭐ AND THE PARITY LEDGER'S ENTRY FOR THIS BUNDLE — the
@@ -11949,7 +11961,7 @@ fn dump_wavefront_mega(
                                                         &krg,
                                                         &weight_ids,
                                                         rung,
-                                                        !is_prefill && decode_rows > 1,
+                                                        rows_are_requests,
                                                     ) {
                                                         // Same device split as the ceiling rung above: the
                                                         // card bakes the ROLLED body, the emulator the

@@ -781,8 +781,10 @@ impl RotaryKind {
 /// step (`crate::paged_step` builds each as their metadata builder does): the PAGE INDEX TABLE
 /// (`[walk, 32]` int32, block `i`'s page at column 0), the MASK STACK (`[walk, rows, page_slots]`
 /// additive, one tile per walked block), the KV WRITE INDEX (`nkvh` `[rows]` int32 indices, one per
-/// kv head), the QUERY ROW INDEX (`[rows]` int32) and `kv_row_pool` (`[pages, nkvh, 1]` int32). The
-/// pools themselves are never re-staged: the device writes them and they persist across steps.
+/// kv head), the QUERY ROW INDEX (`[rows]` int32) and `kv_row_pool` (`[pages, nkvh, 1]` int32); a
+/// DECODE BATCH's attention reads `rep_row_ids`, `chunk_page_ids` and `mask_by_chunk` instead
+/// ([`Self::paged_rows`], [`Self::batch`]). The pools themselves are never re-staged: the device writes them and they
+/// persist across steps.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PagedStep {
     pub mask: u32,
@@ -790,6 +792,9 @@ pub struct PagedStep {
     pub write_rows: u32,
     pub query_rows: u32,
     pub kv_row_pool: u32,
+    pub rep_rows: u32,
+    pub chunk_pages: u32,
+    pub chunk_masks: u32,
     /// Pages in each layer's pools — the scheduler's block count.
     pub pages: u32,
     /// Token slots per page — the scheduler's block size.
@@ -801,6 +806,9 @@ pub struct PagedStep {
     /// Blocks of the page table this bundle's attention walks — the bake's
     /// `scratchy_triton_splice::walk_pages` for the rung, so at most [`Self::pages`].
     pub walk: u32,
+    /// What the rows are: one sequence's, or a decode batch's — one token of each of `rows`
+    /// sequences, read by `batched_decode_head_major` ([`Self::batch`]).
+    pub paged_rows: crate::paged_step::PagedRows,
 }
 
 impl PagedStep {
@@ -817,19 +825,38 @@ impl PagedStep {
         self.walk as usize * self.page_slots as usize
     }
 
-    /// Whether this bundle's attention reads `kv_row_pool` — spyre-inference's dispatch: the decode
-    /// kernel at one query row does, the prefill kernel past it does not.
-    pub const fn reads_kv_row_pool(self) -> bool {
-        self.rows == 1
+    /// A decode batch's chunking of this bundle's walk (`batched_decode_chunking`), derived from the
+    /// rows and the walk so a rung's walk cannot leave a stale chunking behind; `None` for one
+    /// sequence's rows.
+    pub const fn batch(self) -> Option<crate::paged_step::BatchChunking> {
+        match self.paged_rows {
+            crate::paged_step::PagedRows::Batch => {
+                Some(crate::paged_step::BatchChunking::of(self.rows, self.walk))
+            }
+            crate::paged_step::PagedRows::Sequence => None,
+        }
     }
 
-    /// ⭐ THE PAGE TABLE'S PITCH ON THE CARD — bytes from one page table row to the next: the walk's
-    /// relaunch shift. A trip moves the mask tile `[rows, page_slots]`, `rows` rows of the
-    /// stick-major stack one 128-B stick apart, and the relaunch shifts every step source in the
-    /// activation segment by that one step (`loop_fold`'s pitched index table), so the card holds
-    /// row `i` at `i · rows · 128` B. One int32 stick at decode.
-    pub const fn card_page_table_pitch(self) -> u64 {
-        self.rows as u64 * Df::Fp16.elems_per_stick() as u64 * 2
+    /// Whether this bundle's attention reads `kv_row_pool` — spyre-inference's dispatch: the decode
+    /// kernel at one query row of one sequence does; the prefill kernel past it and the batched
+    /// decode kernel do not.
+    pub const fn reads_kv_row_pool(self) -> bool {
+        self.rows == 1 && self.batch().is_none()
+    }
+
+    /// ⭐ THE WALK'S STEP ON THE CARD — the bytes one trip moves the mask tile, and so the pitch the
+    /// card holds the trip's page ids at: the relaunch shifts every step source in the activation
+    /// segment by that one step (`loop_fold`'s pitched index table). The tile is one-stick rows of
+    /// the stick-major stack, 128 B apart: `rows` of them for one sequence (`[rows, page_slots]`),
+    /// so page table row `i` sits at `i · rows · 128` B (one int32 stick at decode), and
+    /// `entries · nkvh` of them for a decode batch (`[J, B, nkvh, 1, page_slots]`), so chunk `c`'s
+    /// ids sit at `c · entries · nkvh · 128` B.
+    pub const fn card_walk_step(self) -> u64 {
+        let rows = match self.batch() {
+            Some(c) => c.entries() * self.nkvh,
+            None => self.rows,
+        };
+        rows as u64 * Df::Fp16.elems_per_stick() as u64 * 2
     }
 
     /// `kv_row_pool` on the card: each page's run of `nkvh` rows held at

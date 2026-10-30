@@ -40,10 +40,11 @@
 //! 4. [`hoist_constants`] -- constants to the top of the function's entry block.
 //! 5. [`symbol_dce`] -- the private helpers, once nothing calls them.
 //!
-//! `ttir-combine` and `reorder-broadcast` are NOT ported, and that is a measurement
+//! `ttir-combine` and `reorder-broadcast` are NOT ported whole, and that is a measurement
 //! rather than an omission: `tests/make_ttir.rs` diffs all thirteen configurations
-//! field by field and neither pass changes any of them. If a fixture ever needs one,
-//! that test is what will say so.
+//! field by field and neither pass changes any of them. The two `ttir-combine` patterns a
+//! kernel has needed are ported one by one, each with the kernel that needed it:
+//! [`rank_reduce_descriptor_loads`] and [`combine_add_ptrs`].
 //!
 //! # WHAT THIS DELIBERATELY DOES NOT REPRODUCE, AND WHY IT CANNOT MATTER
 //!
@@ -64,7 +65,7 @@
 
 use std::collections::HashMap;
 
-use crate::ttir::{Attr, Block, Func, Module, Op, Region, Type, ValueId, Visibility};
+use crate::ttir::{Attr, Block, Func, Module, Op, Region, Type, ValueId, ValueInfo, Visibility};
 use crate::{Error, Result};
 
 /// Run the `make_ttir` pipeline, in `make_ttir`'s order, on a ttir value.
@@ -85,6 +86,7 @@ pub fn make_ttir(m: &mut Module) -> Result<()> {
         changed |= fold_constant_int_to_float(m);
         changed |= fold_splat_of_constant(m);
         changed |= rank_reduce_descriptor_loads(m);
+        changed |= combine_add_ptrs(m);
         changed |= sort_commutative_operands(m);
         changed |= promote_single_trip_loops(m);
         changed |= cse(m);
@@ -260,6 +262,127 @@ pub fn rank_reduce_descriptor_loads(m: &mut Module) -> bool {
     // The reshapes are now unused; `dce` in the same fixed point removes them.
     substitute(m, &subst);
     true
+}
+
+//===----------------------------------------------------------------------===//
+// 3d. ttir-combine's pointer chain
+//===----------------------------------------------------------------------===//
+
+/// `tt.addptr (tt.addptr %p, %a), %b` -> `tt.addptr %p, (arith.addi %a, %b)` —
+/// `CombineAddPtrPattern` (upstream `lib/Dialect/Triton/Transforms/Combine.td`), under its
+/// constraint `isAddPtrOffsetCombinable` (`Combine.cpp`): the two offsets are one type, and that
+/// type is 64 bits wide or both offsets are constants whose sum does not overflow it. The `addi` is
+/// left to [`fold_int_identities`], as upstream leaves it to the arith canonicalizer. (Upstream's
+/// constant reader also sees through a splat; every chain a kernel here has needed is scalar.)
+///
+/// MEASURED: `reshape_and_cache_head_major.py`'s under-the-floor write reads
+/// `row_index + h * T + t`, which Python groups `(row_index + h * T) + t` — past one token a
+/// chain, whose outer pointer the ladder's scalar read cannot trace to its argument ("the slab
+/// id's pointer is computed"). At one token `+ 0` folds the chain away (`tt.addptr %p, 0` ->
+/// `%p`), which is why a decode step never showed it and a decode batch does.
+pub fn combine_add_ptrs(m: &mut Module) -> bool {
+    let ints = int_constants(m);
+    let mut defs: HashMap<ValueId, (ValueId, ValueId)> = HashMap::new();
+    for f in &m.funcs {
+        for b in &f.body.blocks {
+            collect_add_ptrs(&b.ops, &mut defs);
+        }
+    }
+    let tys: Vec<Type> = m.values.iter().map(|v| v.ty.clone()).collect();
+    let mut fresh: Vec<ValueInfo> = Vec::new();
+    let base = m.values.len() as u32;
+    let mut changed = false;
+    for f in &mut m.funcs {
+        for b in &mut f.body.blocks {
+            changed |= combine_add_ptrs_in(&mut b.ops, &defs, &ints, &tys, base, &mut fresh);
+        }
+    }
+    m.values.extend(fresh);
+    changed
+}
+
+/// Every `tt.addptr`'s `(ptr, offset)`, by its result.
+fn collect_add_ptrs(ops: &[Op], defs: &mut HashMap<ValueId, (ValueId, ValueId)>) {
+    for op in ops {
+        if op.name == "tt.addptr" && op.operands.len() == 2 && op.results.len() == 1 {
+            defs.insert(op.results[0], (op.operands[0], op.operands[1]));
+        }
+        for r in &op.regions {
+            for b in &r.blocks {
+                collect_add_ptrs(&b.ops, defs);
+            }
+        }
+    }
+}
+
+/// `isAddPtrOffsetCombinable`: one type, and 64 bits wide or two constants whose sum fits it.
+fn add_ptr_offsets_combine(
+    a: ValueId,
+    b: ValueId,
+    ints: &HashMap<ValueId, i128>,
+    tys: &[Type],
+) -> bool {
+    let (ta, tb) = (&tys[a.0 as usize], &tys[b.0 as usize]);
+    if ta != tb {
+        return false;
+    }
+    let Type::Int(bits, _) = ta.scalar() else {
+        return false;
+    };
+    if *bits == 64 {
+        return true;
+    }
+    match (ints.get(&a), ints.get(&b)) {
+        (Some(x), Some(y)) if (1..=64).contains(bits) => {
+            let sum = x + y;
+            let half = 1i128 << (bits - 1);
+            (-half..half).contains(&sum)
+        }
+        _ => false,
+    }
+}
+
+fn combine_add_ptrs_in(
+    ops: &mut Vec<Op>,
+    defs: &HashMap<ValueId, (ValueId, ValueId)>,
+    ints: &HashMap<ValueId, i128>,
+    tys: &[Type],
+    base: u32,
+    fresh: &mut Vec<ValueInfo>,
+) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < ops.len() {
+        for r in &mut ops[i].regions {
+            for b in &mut r.blocks {
+                changed |= combine_add_ptrs_in(&mut b.ops, defs, ints, tys, base, fresh);
+            }
+        }
+        let op = &ops[i];
+        let chained = (op.name == "tt.addptr" && op.operands.len() == 2)
+            .then(|| {
+                defs.get(&op.operands[0])
+                    .map(|&(p, a)| (p, a, op.operands[1]))
+            })
+            .flatten()
+            .filter(|&(_, a, b)| add_ptr_offsets_combine(a, b, ints, tys));
+        if let Some((p, a, b)) = chained {
+            let sum = ValueId(base + fresh.len() as u32);
+            fresh.push(ValueInfo {
+                ty: tys[a.0 as usize].clone(),
+                loc: op.loc.clone(),
+            });
+            let mut add = Op::new("arith.addi", op.loc.clone());
+            add.operands = vec![a, b];
+            add.results = vec![sum];
+            ops[i].operands = vec![p, sum];
+            ops.insert(i, add);
+            changed = true;
+            i += 1;
+        }
+        i += 1;
+    }
+    changed
 }
 
 fn count_uses(ops: &[Op], uses: &mut HashMap<ValueId, usize>) {

@@ -21,6 +21,10 @@
 //! * `kv_row_pool` `[pages, nkvh, 1]` int32 — `_kv_row_pool`: every page's folded-cache rows
 //!   `page · nkvh + kv`, read by the decode kernel alone.
 //!
+//! A DECODE BATCH — one token of each of several sequences, `batched_decode_head_major` — reads its
+//! own operands instead, built as the builder's decode-batch precomputes (`spyre_attn.py:892-967`)
+//! in the tiled walk's layout (`_mirror_batched_decode_indices`): [`batch_sources`].
+//!
 //! ONE statement with two readers — the worker every step, and the bake's numeric gate once per
 //! gated bundle — so the gate checks exactly the bytes the worker stages.
 
@@ -28,7 +32,7 @@ use crate::wiring::PagedStep;
 
 /// The page walk's laws, where the bake and the worker that state a bundle's walk reach them: the
 /// page size, a rung's walk ([`walk_pages`]) and the rungs a pool is walked by ([`walk_buckets`]).
-pub use scratchy_triton_splice::{PAGE_SLOTS, walk_buckets, walk_pages};
+pub use scratchy_triton_splice::{BatchChunking, PAGE_SLOTS, PagedRows, walk_buckets, walk_pages};
 
 /// `finfo(float16).min` — spyre-inference's masked additive value: finite, so a fully-masked tile's
 /// row maximum stays finite and its weights vanish under the running maximum.
@@ -229,6 +233,121 @@ pub fn step_sources(
     })
 }
 
+/// One sequence of a decode batch: its KV blocks, and the position of the one token this step
+/// decodes (its context before the step).
+#[derive(Clone, Copy, Debug)]
+pub struct BatchSeq<'a> {
+    pub blocks: &'a [u32],
+    pub pos: usize,
+}
+
+/// A decode batch's sources: `rep_row_ids` `[E]`, `chunk_page_ids` `[C, E, 1]` and `mask_by_chunk`
+/// `[C, J, B, nkvh, 1, page_slots]` (`E = J · B`), and the KV write index of each sequence's token —
+/// `SpyreAttentionMetadataBuilder.build`'s decode-batch precomputes:
+///
+/// * the query rows are the sequences' own, `0..n`, a padded sequence's row 0, repeated once per block
+///   slot (`query_row_ids.repeat(blocks_per_chunk)`);
+/// * the page ids are each sequence's blocks down the block-slot axis, zero past them;
+/// * the mask is 0 where a sequence's key is at or before its position and `finfo(f16).min` past
+///   it, `-inf` on the block slots past its blocks, and a padded sequence's block 0 `finfo.min` (so
+///   its softmax stays finite); the kv head axis materialized, as the tiled walk reads it.
+///
+/// Pad rows of the forward repeat the last real sequence's token (the worker's pad law), so their
+/// write lands where that token's does.
+pub fn batch_sources(
+    step: &PagedStep,
+    seqs: &[BatchSeq<'_>],
+) -> Result<StepSources, PagedStepError> {
+    let chunking = step.batch().ok_or_else(|| {
+        PagedStepError("batch_sources: this bundle's rows are one sequence's, not a batch".into())
+    })?;
+    let (b, n) = (step.rows as usize, seqs.len());
+    if n == 0 || n > b {
+        return Err(PagedStepError(format!(
+            "a decode batch of {n} sequence(s) in a {b}-sequence bundle"
+        )));
+    }
+    let (slots, nkvh) = (step.page_slots as usize, step.nkvh as usize);
+    let (j, c) = (
+        chunking.blocks_per_chunk as usize,
+        chunking.num_chunks as usize,
+    );
+    let padded = c * j;
+    for (s, q) in seqs.iter().enumerate() {
+        let need = (q.pos + 1).div_ceil(slots);
+        if need > step.walk as usize || q.blocks.len() < need {
+            return Err(PagedStepError(format!(
+                "sequence {s} at position {} needs {need} block(s); it holds {} and the bundle \
+                 walks {}",
+                q.pos,
+                q.blocks.len(),
+                step.walk
+            )));
+        }
+        if let Some(&p) = q.blocks[..need].iter().find(|&&p| p >= step.pages) {
+            return Err(PagedStepError(format!(
+                "sequence {s}: block page {p} is past the pool's {} page(s)",
+                step.pages
+            )));
+        }
+    }
+    let words = |w: Vec<i32>| -> Vec<u8> { w.into_iter().flat_map(i32::to_le_bytes).collect() };
+    // query_row_ids, repeated once per block slot: entry `j · B + s`.
+    let rep: Vec<i32> = (0..j)
+        .flat_map(|_| (0..b).map(|s| if s < n { s as i32 } else { 0 }))
+        .collect();
+    // block_ids_padded `[C·J, B]`: row `i`, column `s` = sequence `s`'s block `i`.
+    let mut pages = vec![0i32; padded * b];
+    // mask_bs_bb `[B, C·J, slots]`.
+    let mut mask_bs = vec![f32::NEG_INFINITY; b * padded * slots];
+    for (s, q) in seqs.iter().enumerate() {
+        let need = (q.pos + 1).div_ceil(slots);
+        for i in 0..need {
+            pages[i * b + s] = q.blocks[i] as i32;
+            for col in 0..slots {
+                mask_bs[(s * padded + i) * slots + col] = if i * slots + col <= q.pos {
+                    0.0
+                } else {
+                    MASKED
+                };
+            }
+        }
+    }
+    for s in n..b {
+        for col in 0..slots {
+            mask_bs[(s * padded) * slots + col] = MASKED;
+        }
+    }
+    // `[C·J, B, nkvh, slots]`: row `i`, sequence `s`, every kv head reads mask_bs_bb[s, i].
+    let mut chunk_masks = Vec::with_capacity(padded * b * nkvh * slots);
+    for i in 0..padded {
+        for s in 0..b {
+            let row = &mask_bs[(s * padded + i) * slots..(s * padded + i + 1) * slots];
+            for _ in 0..nkvh {
+                chunk_masks.extend_from_slice(row);
+            }
+        }
+    }
+    // One token per row: row `r` is sequence `min(r, n - 1)`'s, at its position.
+    let mut write = Vec::with_capacity(nkvh * b);
+    for h in 0..nkvh {
+        for r in 0..b {
+            let q = &seqs[r.min(n - 1)];
+            let page = q.blocks[q.pos / slots] as usize;
+            write.push(((page * nkvh + h) * slots + q.pos % slots) as i32);
+        }
+    }
+    let e = j * b;
+    Ok(StepSources {
+        mask: (step.chunk_masks, chunk_masks, vec![c * e * nkvh, slots]),
+        int32: vec![
+            (step.rep_rows, words(rep), vec![e]),
+            (step.chunk_pages, words(pages), vec![c * e]),
+            (step.write_rows, words(write), vec![nkvh * b]),
+        ],
+    })
+}
+
 /// A pool holding token-major cache rows: row `t` of `cache` (`[·, nkvh · hd]`) laid into its page —
 /// head `h` at pool row `(blocks[t / page_slots] · nkvh + h) · page_slots + t % page_slots` — for
 /// every `t < valid`; every other row zero. Returned as the pool's PREFIX through the last page a
@@ -293,12 +412,93 @@ mod tests {
             write_rows: 12,
             query_rows: 13,
             kv_row_pool: 14,
+            rep_rows: 15,
+            chunk_pages: 16,
+            chunk_masks: 17,
             pages: 4,
             page_slots: 4,
             rows: 3,
             nkvh: 2,
             walk: 4,
+            paged_rows: PagedRows::Sequence,
         }
+    }
+
+    /// A 4-sequence batch rung over a 16-page pool of 4-slot pages, walking 2 blocks: two real
+    /// sequences (positions 5 and 2) and two padded rows, at the chunking `of(4, 2)` = J 2, C 1.
+    fn batch() -> PagedStep {
+        PagedStep {
+            pages: 16,
+            rows: 4,
+            walk: 2,
+            paged_rows: PagedRows::Batch,
+            ..step()
+        }
+    }
+
+    /// The batch's operands are spyre-inference's: query rows `0..n` (a pad sequence's 0) repeated
+    /// per block slot, page ids down the block-slot axis, and the mask -inf past a sequence's blocks,
+    /// finfo.min past its position, a pad sequence's block 0 finfo.min.
+    #[test]
+    fn a_decode_batch_stages_spyre_inferences_metadata() {
+        let s = batch();
+        assert_eq!(
+            s.batch(),
+            Some(BatchChunking {
+                seqs: 4,
+                blocks_per_chunk: 2,
+                num_chunks: 1
+            })
+        );
+        let (a, b) = ([7u32, 3], [9u32]);
+        let src = batch_sources(
+            &s,
+            &[
+                BatchSeq { blocks: &a, pos: 5 },
+                BatchSeq { blocks: &b, pos: 2 },
+            ],
+        )
+        .expect("stages");
+        let words = |t: u32| -> Vec<i32> {
+            let (_, w, _) = src
+                .int32
+                .iter()
+                .find(|(tid, ..)| *tid == t)
+                .expect("staged");
+            w.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|x| i32::from_le_bytes(*x))
+                .collect()
+        };
+        assert_eq!(words(s.rep_rows), vec![0, 1, 0, 0, 0, 1, 0, 0]);
+        // `[C·J, B]`: slot 0 = (7, 9, 0, 0), slot 1 = (3, 0, 0, 0).
+        assert_eq!(words(s.chunk_pages), vec![7, 9, 0, 0, 3, 0, 0, 0]);
+        // Row r's token: sequence min(r, 1); head h at ((page · 2 + h) · 4 + slot).
+        let w = words(s.write_rows);
+        assert_eq!(&w[..4], &[3 * 8 + 1, 9 * 8 + 2, 9 * 8 + 2, 9 * 8 + 2]);
+        assert_eq!(
+            &w[4..],
+            &[3 * 8 + 4 + 1, 9 * 8 + 4 + 2, 9 * 8 + 4 + 2, 9 * 8 + 4 + 2]
+        );
+        let (tid, m, shape) = &src.mask;
+        assert_eq!((*tid, shape.clone()), (s.chunk_masks, vec![2 * 4 * 2, 4]));
+        // Element (slot i, sequence q, head h, column c) at ((i · 4 + q) · 2 + h) · 4 + c.
+        let at = |i: usize, q: usize, h: usize| &m[((i * 4 + q) * 2 + h) * 4..][..4];
+        assert_eq!(at(0, 0, 1), &[0.0; 4]);
+        assert_eq!(at(1, 0, 0), &[0.0, 0.0, MASKED, MASKED]);
+        assert_eq!(at(0, 1, 0), &[0.0, 0.0, 0.0, MASKED]);
+        assert_eq!(at(1, 1, 1), &[f32::NEG_INFINITY; 4]);
+        assert_eq!(at(0, 2, 0), &[MASKED; 4]);
+        assert_eq!(at(1, 3, 0), &[f32::NEG_INFINITY; 4]);
+    }
+
+    /// A sequence whose position is past the rung's walk cannot run on it.
+    #[test]
+    fn a_batch_sequence_past_the_walk_is_refused() {
+        let s = batch();
+        let a = [1u32, 2, 3];
+        assert!(batch_sources(&s, &[BatchSeq { blocks: &a, pos: 8 }]).is_err());
     }
 
     /// A 3-row chunk at positions 5, 6 and a pad row repeating 6, over blocks `[2, 0]`.
