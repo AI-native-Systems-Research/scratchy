@@ -795,6 +795,8 @@ pub struct PagedStep {
     pub rep_rows: u32,
     pub chunk_pages: u32,
     pub chunk_masks: u32,
+    /// The int32 zero stick staged beside `kv_row_pool` ([`Self::card_int32_zero_bytes`]).
+    pub int32_zero: u32,
     /// Pages in each layer's pools — the scheduler's block count.
     pub pages: u32,
     /// Token slots per page — the scheduler's block size.
@@ -864,6 +866,13 @@ impl PagedStep {
     /// words, the run the decode walk's chained index copies per page.
     pub const fn card_kv_row_pool_bytes(self) -> u64 {
         self.pages as u64 * ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64 * 4
+    }
+
+    /// The int32 zero stick on the card: one run of
+    /// [`INDEX_RUN_WORDS`](ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS) i32 zeros,
+    /// the add identity the decode walk's chained index copies each run against.
+    pub const fn card_int32_zero_bytes(self) -> u64 {
+        ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64 * 4
     }
 }
 

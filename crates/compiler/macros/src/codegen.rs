@@ -9689,6 +9689,7 @@ fn emit_superdsc_wiring(
             let (m, t, w) = (u32l(p.mask), u32l(p.page_table), u32l(p.write_rows));
             let (q, kvp) = (u32l(p.query_rows), u32l(p.kv_row_pool));
             let (rr, cp, cm) = (u32l(p.rep_rows), u32l(p.chunk_pages), u32l(p.chunk_masks));
+            let zero = u32l(p.int32_zero);
             let (pages, slots) = (u32l(p.pages), u32l(p.page_slots));
             let (rows, nkvh, walk) = (u32l(p.rows), u32l(p.nkvh), u32l(p.walk));
             let paged_rows = match p.paged_rows {
@@ -9702,7 +9703,7 @@ fn emit_superdsc_wiring(
             quote! {
                 ::core::option::Option::Some(::scratchy_target_spyre::wiring::PagedStep {
                     mask: #m, page_table: #t, write_rows: #w, query_rows: #q, kv_row_pool: #kvp,
-                    rep_rows: #rr, chunk_pages: #cp, chunk_masks: #cm,
+                    rep_rows: #rr, chunk_pages: #cp, chunk_masks: #cm, int32_zero: #zero,
                     pages: #pages, page_slots: #slots, rows: #rows, nkvh: #nkvh, walk: #walk,
                     paged_rows: #paged_rows,
                 })

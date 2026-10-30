@@ -3969,9 +3969,7 @@ fn lower_function_folded(
                 if let Some(layout) = layout
                     && gathers.iter().any(|g| g.via.is_some())
                 {
-                    let (tid, ops) = int_zero_run(f.name, layout, floor, sym_id_base)?;
-                    out.extend(ops);
-                    int_zero = Some(tid);
+                    int_zero = Some(int_zero_run(f.name, layout)?);
                 }
                 body_out.0 = out.len();
             }
@@ -4415,9 +4413,7 @@ fn lower_function_folded(
                             let zero = match int_zero {
                                 Some(z) => z,
                                 None => {
-                                    let (z, ops) =
-                                        int_zero_run(f.name, layout, floor, sym_id_base)?;
-                                    out.extend(ops);
+                                    let z = int_zero_run(f.name, layout)?;
                                     int_zero = Some(z);
                                     z
                                 }
@@ -6298,58 +6294,23 @@ fn splat_buffer(
 }
 
 /// ⭐ THE INT32 ZERO a chained index's run is copied against
-/// ([`super::lower_ktir_to_superdsc::index_run_gather`]): [`INDEX_RUN_WORDS`] SENUINT32 zeros. The
-/// card writes int32 words from a constant only through its converts, so the zero is an fp16 0.0
-/// fill widened (`dl16tofp32`) and converted (`fp32toint32`) — the sampler's own fp32 island, at the
-/// converts' 64-element device width. A walk makes it before its body, beside the splat buffers,
-/// since the fill reads a registry constant a relaunch would shift.
+/// ([`super::lower_ktir_to_superdsc::index_run_gather`], `addi32toi32(zero, run)` — the int32 copy dxp
+/// binds): the decode step's host-staged zero stick (`PAGED_INT32_ZERO_TID`), [`INDEX_RUN_WORDS`] i32
+/// zeros — staged by the host as every int32 the attention reads is, never made on the card. Refused
+/// by name when the bundle does not place it, or places it short of a run.
 ///
 /// [`INDEX_RUN_WORDS`]: super::lower_ktir_to_superdsc::INDEX_RUN_WORDS
-fn int_zero_run(
-    name: &str,
-    layout: &BundleLayout,
-    floor: u32,
-    sym_id_base: &mut i64,
-) -> Result<(u32, Vec<super::EmittedOp>), Error> {
-    use super::lower_ktir_to_superdsc::{ConvertKind, INDEX_RUN_WORDS, convert, fill};
-    use crate::superdsc_opspec::Df;
-    let words = INDEX_RUN_WORDS;
-    let buffer = |df: Df| {
-        let tid = layout.take_inter_tid(floor);
-        layout.synth_df(crate::place::PlaceId::Act(tid), &[1, words], df);
-        Region {
-            tid,
-            v_rows: 1,
-            v_cols: words,
-            r_start: 0,
-            c_start: 0,
-            r_len: 1,
-            c_len: words,
-            r_cover: (0, 1),
-            c_cover: (0, words),
-            is_out: true,
-            is_fp8: false,
-            band: None,
-        }
-    };
-    let read = |r: Region| Region { is_out: false, ..r };
-    let (z16, z32, zero) = (buffer(Df::Fp16), buffer(Df::Fp32), buffer(Df::SenUint32));
-    let mut ops = fill(name, 0.0, &z16, sym_id_base, Some(layout))?;
-    ops.extend(convert(
-        name,
-        ConvertKind::Dl16ToFp32,
-        &[read(z16), z32],
-        sym_id_base,
-        Some(layout),
-    )?);
-    ops.extend(convert(
-        name,
-        ConvertKind::Fp32ToInt32,
-        &[read(z32), zero],
-        sym_id_base,
-        Some(layout),
-    )?);
-    Ok((zero.tid, ops))
+fn int_zero_run(name: &str, layout: &BundleLayout) -> Result<u32, Error> {
+    let tid = crate::reserved_tids::PAGED_INT32_ZERO_TID;
+    let words = super::lower_ktir_to_superdsc::INDEX_RUN_WORDS;
+    match layout.placements.get(&tid) {
+        Some(p) if p.size >= u64::from(words) * 4 => Ok(tid),
+        placed => err(format!(
+            "{name}: a chained index copies its run against the host-staged int32 zero t{tid}, which \
+             this bundle places in {} bytes — a run is {words} words",
+            placed.map_or(0, |p| p.size)
+        )),
+    }
 }
 
 /// Whether `tid` holds batch blocks wider than one stick — bytes no flat frame names

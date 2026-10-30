@@ -1525,6 +1525,9 @@ pub struct PagedStepTids {
     /// A decode batch's `mask_by_chunk` `[num_chunks, blocks_per_chunk, seqs, num_kv_heads, 1,
     /// block_size]`.
     pub chunk_masks: u32,
+    /// The decode step's int32 zero stick, staged beside `kv_row_pool`: the add identity the chained
+    /// index's run copy reads on the card.
+    pub int32_zero: u32,
 }
 
 impl PagedStepTids {
@@ -1537,6 +1540,7 @@ impl PagedStepTids {
         rep_rows: ktir_superdsc::reserved_tids::PAGED_REP_ROWS_TID,
         chunk_pages: ktir_superdsc::reserved_tids::PAGED_CHUNK_PAGES_TID,
         chunk_masks: ktir_superdsc::reserved_tids::PAGED_CHUNK_MASKS_TID,
+        int32_zero: ktir_superdsc::reserved_tids::PAGED_INT32_ZERO_TID,
     };
 }
 
@@ -4446,25 +4450,23 @@ mod walk_on_the_card {
             }
             // The carried buffers are seeded, and the body's constants filled, BEFORE the body (a
             // relaunch shifts the segment the registry constants live in) — beside the query's own
-            // `index_select`, which spyre-inference runs before its walk. The decode walk's
-            // constants include the int32 zero its `kv_row_pool` run is copied against, a fill
-            // converted to int32.
-            let int_zero = ["dl16tofp32", "fp32toint32"];
+            // `index_select`, which spyre-inference runs before its walk.
             assert!(
-                ops[..first].iter().all(|e| {
-                    e.op_name.starts_with("fill")
-                        || e.op_name.starts_with("gather")
-                        || int_zero.iter().any(|c| e.op_name.starts_with(c))
-                }),
-                "mq={mq}: only fills, the int32 zero's converts and the query's gather precede the \
-                 body"
-            );
-            assert_eq!(
-                int_zero
+                ops[..first]
                     .iter()
-                    .all(|c| ops[..first].iter().any(|e| e.op_name.starts_with(c))),
+                    .all(|e| e.op_name.starts_with("fill") || e.op_name.starts_with("gather")),
+                "mq={mq}: only fills and the query's gather precede the body"
+            );
+            // The decode walk copies its `kv_row_pool` run against the int32 zero the host stages
+            // beside the pool, as it stages every int32 the attention reads — nothing makes it on
+            // the card.
+            let zero = ktir_superdsc::place::act_name(PagedStepTids::RESERVED.int32_zero);
+            assert_eq!(
+                ops[first..=last]
+                    .iter()
+                    .any(|e| e.arg_bindings.iter().any(|a| a.buffer == zero)),
                 mq == 1,
-                "mq={mq}: the int32 zero is made before the body exactly when the walk chains \
+                "mq={mq}: the body reads the host-staged int32 zero exactly when the walk chains \
                  `kv_row_pool`"
             );
             assert!(
