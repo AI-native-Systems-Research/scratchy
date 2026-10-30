@@ -1337,7 +1337,8 @@ pub fn hal_r5_section_encode(
     let mut word = 0u64;
     // SAFETY: `word` is a valid out-pointer for the duration of the call;
     // every argument is a plain scalar.
-    let rc = unsafe { flex_hal_r5_section_encode(mode, core_mask, segment, offset_bytes, &mut word) };
+    let rc =
+        unsafe { flex_hal_r5_section_encode(mode, core_mask, segment, offset_bytes, &mut word) };
     if rc == 0 {
         Ok(word)
     } else {

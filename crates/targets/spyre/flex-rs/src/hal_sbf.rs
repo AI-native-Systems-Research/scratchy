@@ -71,12 +71,8 @@ pub fn r5_section(
     segment: u64,
     offset_bytes: u64,
 ) -> Result<[u64; 1], String> {
-    let word = senlib_ffi::hal_r5_section_encode(
-        mode.shim_ordinal(),
-        core_mask,
-        segment,
-        offset_bytes,
-    )?;
+    let word =
+        senlib_ffi::hal_r5_section_encode(mode.shim_ordinal(), core_mask, segment, offset_bytes)?;
     Ok([word])
 }
 
@@ -281,8 +277,8 @@ mod tests {
     /// pending); the receiver host-programs the table via write_xseg.
     #[test]
     fn rdma12_send_refuses_the_t_send_preamble() {
-        let err = rdma12_unicast_send(&send_params(&[3], true))
-            .expect_err("xsegv=true must refuse");
+        let err =
+            rdma12_unicast_send(&send_params(&[3], true)).expect_err("xsegv=true must refuse");
         assert!(
             err.contains("T-send preamble is un-ported"),
             "the refusal must name the law, got: {err}"
