@@ -3755,12 +3755,14 @@ mod production_ktir_dump {
         }
         // ...and `batched_decode_head_major` over that pool, the chunkings a decode batch rung
         // states (`BatchChunking::of`): 4 sequences on the 4-page rung (one chunk), on the 64-page
-        // rung (8 chunks, each block slot its own softmax), and 2 sequences on the 2-page rung (a
-        // chunk under the gather floor).
+        // rung (8 chunks, each block slot its own softmax), 2 sequences on the 2-page rung (a
+        // chunk under the gather floor), and 32 on the 4-page rung (4 chunks of ONE block slot —
+        // the widest batch rung, where the slots' merge folds one).
         for (name, seqs, walk) in [
             ("batched_decode", 4u32, 4u32),
             ("batched_decode_chunks", 4, 64),
             ("batched_decode_floor", 2, 2),
+            ("batched_decode_one_slot", 32, 4),
         ] {
             let c = BatchChunking::of(seqs, walk);
             v.push((
@@ -3982,7 +3984,8 @@ mod production_ktir_dump {
             | "paged_attn_prefill_hd128"
             | "batched_decode"
             | "batched_decode_chunks"
-            | "batched_decode_floor" => Program::PagedAttn,
+            | "batched_decode_floor"
+            | "batched_decode_one_slot" => Program::PagedAttn,
             "paged_kv_write" | "paged_kv_write_rows" => Program::PagedKvWrite,
             other => panic!(
                 "`{other}` is in the dump table but `program_of` states no Program for it — \

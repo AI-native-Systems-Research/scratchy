@@ -4626,13 +4626,23 @@ fn lower_function_folded(
                 );
                 continue;
             }
-            // The same bytes, in the frame the result is typed in — the frame its consumers read
-            // (a `[1, 2048]` gathered query row is the `[8, 4, 64]` batched dot's `[32, 64]`).
-            let [rr, rc] = flat_frame(&to);
+            // The same bytes, in the frame the result is held in — the frame its consumers read
+            // (a `[1, 2048]` gathered query row is the `[8, 4, 64]` batched dot's `[32, 64]`; a
+            // per-row column stays one value per stick row, [`value_frame`]).
+            let [rr, rc] = value_frame(f, &to);
             let whole = source.r_start == 0
                 && source.c_start == 0
                 && source.r_len == source.v_rows
                 && source.c_len == source.v_cols;
+            let column = |[r, c]: [u32; 2]| c == 1 && r > 1;
+            if whole && column([source.v_rows, source.v_cols]) != column([rr, rc]) {
+                return err(format!(
+                    "{}: `{:?}` reads t{} `[{}, {}]` as `[{rr}, {rc}]` — a per-row column holds one \
+                     value per stick row, and a dense frame packs a row's values into its sticks: \
+                     different bytes",
+                    f.name, op.op_type, source.tid, source.v_rows, source.v_cols
+                ));
+            }
             let source = if whole && source.v_rows * source.v_cols == rr * rc {
                 reframed(source, [rr, rc])
             } else {
@@ -4758,6 +4768,18 @@ fn lower_function_folded(
             } else {
                 0
             };
+            // ONE block folds nothing: the result is the source's own bytes (a decode batch whose
+            // chunk holds one block slot, `J = 1`), as a shape op that moves no byte names its source.
+            if blocks == 1 && src.r_len == src.v_rows {
+                inter.insert(
+                    res,
+                    Region {
+                        is_out: false,
+                        ..src
+                    },
+                );
+                continue;
+            }
             if blocks < 2 || !src.v_rows.is_multiple_of(blocks) || src.r_len != src.v_rows {
                 return err(format!(
                     "{}: a leading-axis reduction over {blocks} block(s) of t{}'s {} rows — the \
@@ -6082,8 +6104,10 @@ fn lower_function_folded(
 /// `linalg.reduce` result of this function, the running max and sum — is the `[numel, 1]` column the
 /// reduction writes; anything else is its flat frame.
 fn value_frame(f: &IRFunction<'static>, dims: &[i64]) -> [u32; 2] {
-    // The shapes a per-row column takes: a stick fold's result, and a leading fold of a per-row
-    // column (a decode batch's `J` block slots' running max, folded) — to a fixed point.
+    // The shapes a per-row column takes: a stick fold's result, a leading fold of a per-row
+    // column (a decode batch's `J` block slots' running max, folded), and a shape op over one (the
+    // folded max expanded back over the slots: one value per stick row in either shape) — to a
+    // fixed point.
     let deep = f.ops_deep();
     let dims_of = |o: &Operation<'_>| o.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec);
     let mut columns: Vec<Vec<i64>> = deep
@@ -6094,7 +6118,15 @@ fn value_frame(f: &IRFunction<'static>, dims: &[i64]) -> [u32; 2] {
     loop {
         let more: Vec<Vec<i64>> = deep
             .iter()
-            .filter(|o| o.op_type == OpKind::LinalgReduce && !folds_the_stick(o))
+            .filter(|o| {
+                (o.op_type == OpKind::LinalgReduce && !folds_the_stick(o))
+                    || matches!(
+                        o.op_type,
+                        OpKind::TensorReshape
+                            | OpKind::TensorExpandShape
+                            | OpKind::TensorCollapseShape
+                    )
+            })
             .filter(|o| {
                 o.operands
                     .first()

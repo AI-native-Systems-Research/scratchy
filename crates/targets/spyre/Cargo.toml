@@ -48,6 +48,9 @@ scratchy-spyre-bundle = { path = "bundle" }
 # for a SubtileNode. UNCONDITIONAL (see [features]): it is the only producer for the
 # spliced op kinds, and the ladder is dependency-free offline.
 scratchy-triton-splice = { path = "../../triton/splice" }
+# The registry constants a spliced program reads (`layout::registry_constants`) — the bundle
+# registry holds them (`bundle_registry`); the splice already depends on it.
+triton-ktir-superdsc = { path = "../../triton/triton-ktir-superdsc" }
 scratchy-tensors = { path = "../../tensors" }
 # `kill(-pid, SIGKILL)` on a `dxp_standalone` process group — see `superdsc_bake`'s worker pool.
 libc = { workspace = true }
@@ -100,10 +103,6 @@ scratchy-subtile = { path = "../../compiler/subtile", features = ["spyre"] }
 # uses, so a fixture cannot encode a relationship production can't.
 [dev-dependencies]
 scratchy-subtile = { path = "../../compiler/subtile", features = ["spyre"] }
-# The splice golden lowers the page walk through the door under the layout that places every one of a
-# program's own parameters (`layout::for_node`) — the walk's pools are placed in the bundle layout on a
-# card build only, and the golden runs on the emulator's.
-triton-ktir-superdsc = { path = "../../triton/triton-ktir-superdsc" }
 # EXAMPLES ONLY. `bundle_run_dev` installs a subscriber so flex's completion thread has somewhere to
 # write its CB-error lines — the `hmi_syndrome` / `qgi_syndrome` / `job_count` that say why a launch was
 # rejected. Without one, a rejected launch is a bare `sync rc=-1`.

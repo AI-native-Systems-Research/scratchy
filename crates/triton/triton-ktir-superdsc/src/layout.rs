@@ -68,6 +68,33 @@ const GRANULE: u64 = 128;
 /// up to, not what the tensor is.
 const SCALE_BYTES: u64 = 2;
 
+/// ⭐ THE REGISTRY CONSTANTS A PROGRAM READS — every value its lowering looks up in
+/// `BundleLayout::scalarmul_scales` (a bound `[1,1]` const): the program's own scalars
+/// ([`scales_for_program_shape`]) and, for a walk, its carried buffers' seeds. What a one-kernel
+/// layout's registry holds ([`for_regions`]), and what a bundle's registry must hold for every
+/// program it bakes.
+pub fn registry_constants(node: &KtirNode) -> Result<Vec<f32>, Error> {
+    let flat = ktir_superdsc::emit::loop_fold::flatten(node).map_err(|e| Error {
+        stage: "layout",
+        message: format!("{e:?}"),
+    })?;
+    registry_at_trip0(flat.as_ref().map_or(node, |f| &f.node), flat.as_ref())
+}
+
+/// [`registry_constants`] of the program at trip 0, its walk `flat` when it walks.
+fn registry_at_trip0(
+    node: &KtirNode,
+    flat: Option<&ktir_superdsc::emit::loop_fold::Flattened>,
+) -> Result<Vec<f32>, Error> {
+    let mut out = scales_for_program_shape(node.program, &node.func)?;
+    for v in flat.iter().flat_map(|f| f.fold.seeds()) {
+        if !out.iter().any(|x| x.to_bits() == v.to_bits()) {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
 /// The layout for one node, and the refusal when the program cannot have one.
 ///
 /// Calls [`regions`] itself so the driver needs nothing but the node. A `regions` failure is
@@ -135,12 +162,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         });
     }
 
-    let mut scalarmul_scales = scales_for_program_shape(node.program, &node.func)?;
-    for v in flat.iter().flat_map(|f| f.fold.seeds()) {
-        if !scalarmul_scales.iter().any(|x| x.to_bits() == v.to_bits()) {
-            scalarmul_scales.push(v);
-        }
-    }
+    let scalarmul_scales = registry_at_trip0(node, flat.as_ref())?;
 
     // WHICH PARAMETERS ARE GATHER INDEX VECTORS, read off the program by the SAME function family
     // the lowering body reads them with — so the placement and the descriptor cannot disagree about

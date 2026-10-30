@@ -594,6 +594,52 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
     scalarmul_scales
 }
 
+/// ⭐⭐⭐ THE BUNDLE'S SCALAR REGISTRY — the graph's own multipliers ([`scalar_registry`]), then
+/// every constant a WALKING program of this rung reads through the registry that the graph does not
+/// state (`triton_ktir_superdsc::layout::registry_constants`), in node order, each once. A walk
+/// states constants of its own — the batched decode's `finfo(f16).min` clamp — that no node's
+/// config names, and the door looks every one up by value ("registry desync" otherwise).
+///
+/// WALKING, because that is the program whose lowering the walk is, whatever it computes (the
+/// door's own dispatch, `loop_fold::walks`): its registry reads are its program's constants. Every
+/// other program reads the constants its node states — the per-`Program` bodies by their node's
+/// config, which the graph's list holds — and the program-side reading is the whole-function
+/// walk's, which a per-`Program` body's program need not satisfy.
+///
+/// ONE derivation for the two lists that must agree index for index: the placement's
+/// ([`compute_bundle_layout`], which the door looks values up in) and the wiring's
+/// ([`crate::lower_subtile_tape_to_ktir::graph_wiring`], which the worker binds). Both are taken
+/// at the bundle's own rung, the programs it bakes. Appended, never interleaved: a bundle whose
+/// programs read only graph constants keeps every index it had.
+pub fn bundle_registry<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    active_cap: ActiveCap,
+    paged_rows: scratchy_triton_splice::PagedRows,
+) -> Result<Vec<f32>, SuperDscError> {
+    use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
+    let mut registry = scalar_registry(ir);
+    let rows_are_requests = paged_rows == scratchy_triton_splice::PagedRows::Batch;
+    for node in &ir.nodes {
+        let NodeLowering::Ops(ops) = lower_one_node(node, ir, active_cap, rows_are_requests) else {
+            continue;
+        };
+        for k in ops
+            .iter()
+            .filter_map(|e| e.ktir.as_ref())
+            .filter(|k| ktir_superdsc::emit::loop_fold::walks(k))
+        {
+            let values = triton_ktir_superdsc::layout::registry_constants(k)
+                .map_err(|e| SuperDscError(format!("{}: {}", k.func.name, e.message)))?;
+            for v in values {
+                if !registry.iter().any(|x| x.to_bits() == v.to_bits()) {
+                    registry.push(v);
+                }
+            }
+        }
+    }
+    Ok(registry)
+}
+
 /// ⭐⭐ THE CENSUS'S STAGING TWIN — the golden's statement of the registry's own
 /// binding fact, arm-for-arm with the census above. Every scalar the census routes
 /// to the worker-bound `[1,1]` registry is bound as ONE IEEE fp16 per slot
@@ -693,6 +739,9 @@ pub fn kv_pool_tids<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<u32> {
 pub fn compute_bundle_layout<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
+    // ⭐ THE RUNG — the programs the bundle bakes, whose constants its registry holds
+    // ([`bundle_registry`]).
+    active_cap: ActiveCap,
     // ⭐ THE LAYER STRUCTURE, so the weight segment can be split into BANKS at a LAYER boundary —
     // see [`bank_weight_segment`]. ONE MAP PER ATTENTION CLASS (a hybrid model's classes have
     // different layer counts, and banking needs the class boundaries), from
@@ -1414,7 +1463,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    only the placement: a `[1,1]` worker-bound const per scale in seg0 (ACTIVATION,
     //    exactly like ATTN_SCALE). The pointwise `mul` the door lowers reads the index here →
     //    the const TID it multiplies by; the worker binds each `t{tid}=[scale]`.
-    let scalarmul_scales = scalar_registry(ir);
+    let scalarmul_scales = bundle_registry(ir, active_cap, paged_rows)?;
     for i in 0..scalarmul_scales.len() {
         let a = SegRole::Activation.segment();
         let off = seg_bytes[a];
@@ -8146,6 +8195,7 @@ mod tests {
         let layout = compute_bundle_layout(
             &ir,
             &weight_ids,
+            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -8263,6 +8313,7 @@ mod tests {
         let l_plain = compute_bundle_layout(
             &plain,
             &weight_ids,
+            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -8270,6 +8321,7 @@ mod tests {
         let l_minted = compute_bundle_layout(
             &minted,
             &weight_ids,
+            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -8366,6 +8418,7 @@ mod tests {
         let layout = compute_bundle_layout(
             &minted,
             &weight_ids,
+            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -8730,6 +8783,7 @@ mod tests {
         let layout = compute_bundle_layout(
             &ir,
             &weight_ids,
+            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -8813,6 +8867,7 @@ mod tests {
         let layout = compute_bundle_layout(
             &ir,
             &weight_ids,
+            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -8827,6 +8882,7 @@ mod tests {
         let layout = compute_bundle_layout(
             &ir,
             &weight_ids,
+            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -9546,6 +9602,7 @@ mod tests {
         let err = compute_bundle_layout(
             &ir,
             &weight_ids,
+            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
