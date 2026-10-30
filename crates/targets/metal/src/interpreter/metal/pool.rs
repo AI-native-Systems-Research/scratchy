@@ -1092,7 +1092,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     pub fn pick_bucket_for(&self, inputs: &ForwardInputs<'_>) -> Result<usize, ForwardError> {
         let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
         let spec = self.bucket_specs[bucket_idx];
-        if !spec.plays_result && inputs.reads != ForwardReads::CacheWrites {
+        if !spec.plays_result && !inputs.reads.within_cache_writes() {
             return Err(ForwardError::CacheWritesOnly {
                 num_tokens: inputs.num_tokens,
                 bucket_m: spec.bucket_m,

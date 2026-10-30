@@ -540,6 +540,118 @@ impl DraftOutput {
     }
 }
 
+/// The values a context window's group quantizes together (`dflash2.metal` `DRAFT_CONTEXT_GROUP`,
+/// Splash prefill/draft_context.metal).
+pub const WINDOW_GROUP: u32 = 64;
+
+/// A slot's context window's bytes (`dflash2.metal` `DRAFT_WINDOW_*`; Splash
+/// abi/DraftAttention.h:88-100): its `window` positions' 4-bit codes, `hidden / 2` bytes a
+/// position, then each position's groups' fp16 scale and minimum, 4 bytes a group of
+/// [`WINDOW_GROUP`] values. A position's codes and groups sit at its ring slot,
+/// `position % window`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowLayout {
+    window: u32,
+    hidden: u32,
+}
+
+impl WindowLayout {
+    /// The window of `window` positions of rows `hidden` values wide: `None` unless `hidden` is a
+    /// whole number of groups, as the kernels quantize it.
+    pub fn new(window: u32, hidden: u32) -> Option<Self> {
+        (window > 0 && hidden > 0 && hidden.is_multiple_of(WINDOW_GROUP))
+            .then_some(Self { window, hidden })
+    }
+
+    pub fn window(self) -> u32 {
+        self.window
+    }
+
+    fn codes(self) -> u64 {
+        u64::from(self.window) * self.code_bytes()
+    }
+
+    fn code_bytes(self) -> u64 {
+        u64::from(self.hidden / 2)
+    }
+
+    fn group_bytes(self) -> u64 {
+        u64::from(self.hidden / WINDOW_GROUP) * 4
+    }
+
+    /// A slot's whole window.
+    pub fn bytes(self) -> u64 {
+        self.codes() + u64::from(self.window) * self.group_bytes()
+    }
+
+    /// The byte ranges within a slot's window that hold positions `[from, to)`, at most a window
+    /// of them: their codes and their groups, a run of each on either side of the ring's wrap.
+    pub fn positions(self, from: u32, to: u32) -> Vec<std::ops::Range<u64>> {
+        debug_assert!(
+            from <= to && to - from <= self.window,
+            "{from}..{to} in {self:?}"
+        );
+        let (start, len) = (from % self.window, to - from);
+        let first = len.min(self.window - start);
+        let slot_runs = [(start, first), (0, len - first)];
+        let mut out = Vec::new();
+        for (bytes, at) in [(self.code_bytes(), 0), (self.group_bytes(), self.codes())] {
+            for &(slot, n) in slot_runs.iter().filter(|&&(_, n)| n > 0) {
+                let begin = at + u64::from(slot) * bytes;
+                out.push(begin..begin + u64::from(n) * bytes);
+            }
+        }
+        out
+    }
+}
+
+/// A copy between two context windows' bytes: `len` bytes from `from` at `from_at` to `to` at
+/// `to_at` — a lane's window and a prefix-cache snapshot's, either way.
+pub struct WindowCopy<'a> {
+    pub from: &'a objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    pub from_at: u64,
+    pub to: &'a objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    pub to_at: u64,
+    pub len: u64,
+}
+
+/// Encode `copies` on `encoder` between what comes before and after them: each copy waits for
+/// every dispatch and copy before it, and every dispatch and copy after them waits for the copies.
+pub fn encode_window_copies(
+    encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    copies: &[WindowCopy<'_>],
+) {
+    use objc2_metal::{
+        MTL4CommandEncoder as _, MTL4ComputeCommandEncoder as _, MTL4VisibilityOptions, MTLStages,
+    };
+    if copies.is_empty() {
+        return;
+    }
+    let work = MTLStages::Dispatch | MTLStages::Blit;
+    encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+        work,
+        MTLStages::Blit,
+        MTL4VisibilityOptions::Device,
+    );
+    for c in copies {
+        // SAFETY: every range lies inside its buffer: a slot's window, laid out by `WindowLayout`.
+        unsafe {
+            encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                c.from,
+                c.from_at as usize,
+                c.to,
+                c.to_at as usize,
+                c.len as usize,
+            );
+        }
+    }
+    encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+        MTLStages::Blit,
+        work,
+        MTL4VisibilityOptions::Device,
+    );
+}
+
 /// A DFlash2 drafter's rings (Splash `DFlashDraftRing`, runtime/model/DFlashDraft.hpp): every
 /// layer's keys `[slot][kv head][window][head dim]` and values `[slot][kv head][head dim][window]`
 /// in the model dtype, one slot a concurrently-resident sequence (the target's state slot), kept
@@ -550,6 +662,7 @@ pub struct DraftRingPool {
     /// Every slot's context window (`dflash2.metal` `DRAFT_WINDOW_BYTES` a slot): what a
     /// prefix-cache hit rebuilds the slot's rings from (Splash `DFlashContextWindow`).
     windows: crate::PoolMem,
+    window: WindowLayout,
     pub num_slots: usize,
 }
 
@@ -560,22 +673,14 @@ impl DraftRingPool {
         kv_heads * window * head_dim * elem_bytes
     }
 
-    /// One slot's context window, in bytes: its `window` positions' context rows of `hidden`
-    /// values, 4-bit over 64-value groups with each group's fp16 scale and minimum (Splash
-    /// abi/DraftAttention.h:88-100 `draft_context_window_bytes`; `dflash2.metal`
-    /// `DRAFT_WINDOW_BYTES`).
-    pub fn window_bytes(window: usize, hidden: usize) -> usize {
-        window * (hidden / 2) + window * hidden.div_ceil(64) * 4
-    }
-
     /// Allocate `num_layers` layers' keys and values of `num_slots` slots, each `slot_bytes`, and
-    /// their context windows, each `window_bytes`, by `alloc_buffer` (the device's pool
+    /// their context windows, each laid out as `window`, by `alloc_buffer` (the device's pool
     /// allocator, which pins what it hands out).
     pub fn new(
         num_layers: usize,
         num_slots: usize,
         slot_bytes: usize,
-        window_bytes: usize,
+        window: WindowLayout,
         mut alloc_buffer: impl FnMut(usize) -> anyhow::Result<crate::PoolMem>,
     ) -> anyhow::Result<Self> {
         let bytes = num_slots * slot_bytes;
@@ -584,11 +689,12 @@ impl DraftRingPool {
         };
         let keys = alloc()?;
         let values = alloc()?;
-        let windows = alloc_buffer(num_slots * window_bytes)?;
+        let windows = alloc_buffer(num_slots * window.bytes() as usize)?;
         Ok(Self {
             keys,
             values,
             windows,
+            window,
             num_slots,
         })
     }
@@ -598,6 +704,11 @@ impl DraftRingPool {
         &self.windows
     }
 
+    /// A slot's window's layout.
+    pub fn window(&self) -> WindowLayout {
+        self.window
+    }
+
     /// Layer `layer`'s keys and values.
     pub fn layer(&self, layer: usize) -> (&crate::PoolMem, &crate::PoolMem) {
         (&self.keys[layer], &self.values[layer])
@@ -605,5 +716,48 @@ impl DraftRingPool {
 
     pub fn num_layers(&self) -> usize {
         self.keys.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A window of 2048 positions of 2048-value rows: 1024 code bytes and 32 groups of 4 bytes a
+    /// position, codes first. Positions 10..14 are four slots' codes and groups; positions
+    /// 2046..2050 wrap, two slots at the window's end and two at its start, each side's codes and
+    /// groups; a whole window starting anywhere is every byte once.
+    #[test]
+    fn a_windows_positions_are_their_slots_bytes() {
+        let w = WindowLayout::new(2048, 2048).expect("a layout");
+        let codes = 2048 * 1024;
+        assert_eq!(w.bytes(), codes + 2048 * 128);
+        assert_eq!(
+            w.positions(10, 14),
+            [10 * 1024..14 * 1024, codes + 10 * 128..codes + 14 * 128]
+        );
+        assert_eq!(
+            w.positions(2046, 2050),
+            [
+                2046 * 1024..2048 * 1024,
+                0..2 * 1024,
+                codes + 2046 * 128..codes + 2048 * 128,
+                codes..codes + 2 * 128,
+            ]
+        );
+        for from in [0, 5, 4096 + 700] {
+            let total: u64 = w
+                .positions(from, from + 2048)
+                .iter()
+                .map(|r| r.end - r.start)
+                .sum();
+            assert_eq!(total, w.bytes(), "a whole window from {from}");
+        }
+        assert!(w.positions(7, 7).is_empty());
+        assert_eq!(
+            WindowLayout::new(2048, 2000),
+            None,
+            "2000 is no whole number of groups"
+        );
     }
 }

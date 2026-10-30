@@ -127,3 +127,28 @@ fn buckets_past_its_block_play_its_commit_alone() {
         );
     }
 }
+
+/// A rebuild plays nothing its cache writes are not computed from: every command it plays is one
+/// the cache-writes play runs, or the window load that play cuts, whose rows its ring writers read.
+/// So a bucket that plays its cache writes alone holds what a rebuild writes
+/// (`ForwardReads::within_cache_writes`).
+#[test]
+fn a_rebuild_plays_within_its_cache_writes() {
+    use scratchy_models::dflash2::qwen3_6_35b_a3b_dflash2_mlx_affine_b4_g64_qembed as drafter;
+    for spec in drafter::METAL_BUCKETS {
+        for classed in spec.tapes {
+            let tape = &classed.tape;
+            let (commands, live) = (tape.commands_expanded(), tape.live_expanded());
+            for (c, l) in commands.iter().zip(&live) {
+                let kernel = c.command.kernel;
+                if l.plays(ForwardReads::Rebuild) {
+                    assert!(
+                        l.plays(ForwardReads::CacheWrites) || kernel == K::DraftWindowLoad,
+                        "m={}: {kernel:?} plays in a rebuild alone",
+                        spec.bucket_m
+                    );
+                }
+            }
+        }
+    }
+}

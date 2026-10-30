@@ -1687,14 +1687,15 @@ impl MetalWorker {
         );
         let hidden =
             (config.hidden_size()).ok_or_else(|| init("its config names no hidden_size"))?;
-        let window_bytes =
-            scratchy_target_metal::dflash2::DraftRingPool::window_bytes(window as usize, hidden);
+        let window_layout =
+            scratchy_target_metal::dflash2::WindowLayout::new(window as u32, hidden as u32)
+                .ok_or_else(|| init("its hidden size is no whole number of window groups"))?;
         let (device, residency) = (&gpu_device.device, gpu_device.allocator.residency());
         let rings = scratchy_target_metal::dflash2::DraftRingPool::new(
             layers,
             slots,
             slot_bytes,
-            window_bytes,
+            window_layout,
             |bytes| Ok(MetalMem::new_pinned(device, residency, bytes)),
         )
         .map_err(|e| init(&format!("rings: {e}")))?;
@@ -1702,7 +1703,7 @@ impl MetalWorker {
         info!(
             "ScratchyWorker(metal): DFlash2 drafter — {layers} layers' rings of {window} positions \
              for {slots} sequences, and their context windows ({} MiB)",
-            (2 * layers * slots * slot_bytes + slots * window_bytes) >> 20
+            (2 * layers * slots * slot_bytes + slots * window_layout.bytes() as usize) >> 20
         );
         let target_kernels =
             scratchy_target_metal::off_tape::OffTapeKernels::of(target.metal_off_tape())
@@ -1724,7 +1725,11 @@ impl MetalWorker {
             rings,
             slots: RingSlots::new(slots as u32),
             cycles: HashMap::new(),
-            contexts: HashMap::new(),
+            snapshot_windows: None,
+            snapshot_window_keys: Vec::new(),
+            contexts: ::scratchy_serving_engine::spec_decode::draft_context::DraftContexts::new(
+                window as u32,
+            ),
             captured_row_bytes: taps * target.hidden_size() as usize * elem_bytes,
             cycle_buffer: None,
         })
@@ -2851,14 +2856,25 @@ impl MetalWorker {
         }
         let gdn = self.gdn_state_stores.as_mut();
         let gdn = gdn.ok_or_else(|| bad("no GDN state stores".into()))?;
+        // A DFlash2 drafter's snapshot windows, a slot each: the units' slots, from the first.
+        let mut windows = (self.dflash2.as_mut()).and_then(|d| d.snapshot_windows.as_mut());
+        let slots_of = |run: &std::ops::Range<usize>| run.start - from..run.end - from;
         for (u, run) in &release_units {
             (gdn.release(run.clone(), mapper)).map_err(|e| bad(format!("releasing {u:?}: {e}")))?;
+            if let Some(w) = windows.as_mut() {
+                (w.release(slots_of(run), mapper))
+                    .map_err(|e| bad(format!("releasing {u:?}'s windows: {e}")))?;
+            }
         }
         for (g, run) in &map_kv {
             each_kv_store(run, true).map_err(|e| bad(format!("mapping {g:?}: {e}")))?;
         }
         for (u, run) in &map_units {
             (gdn.map_apart(run.clone(), mapper)).map_err(|e| bad(format!("mapping {u:?}: {e}")))?;
+            if let Some(w) = windows.as_mut() {
+                (w.map_apart(slots_of(run), mapper))
+                    .map_err(|e| bad(format!("mapping {u:?}'s windows: {e}")))?;
+            }
         }
         let shared = self.shared_kv.as_mut().expect("checked above");
         for (g, _) in &release_kv {
@@ -2872,6 +2888,11 @@ impl MetalWorker {
             // A released slot holds no prefix's state: a restore naming it is refused.
             for slot in shared.slots(*u) {
                 self.gdn_snapshot_keys[slot] = None;
+                if let Some(key) =
+                    (self.dflash2.as_mut()).and_then(|d| d.snapshot_window_keys.get_mut(slot))
+                {
+                    *key = None;
+                }
             }
         }
         for (u, _) in &map_units {
@@ -3037,8 +3058,12 @@ impl MetalWorker {
             scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE,
         );
         let (conv, ssm) = dims.slot_bytes(scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE);
-        let unit = scratchy_target_metal::sparse_kv::whole_tile_blocks(&dev.device, [conv, ssm]);
-        (bytes > 0).then_some((bytes, unit))
+        // A DFlash2 drafter's snapshot keeps its context window beside the target's state
+        // (Splash's composite state: `QwenStateStorage`, the window its rings are rebuilt from).
+        let window = (self.dflash2.as_ref()).map_or(0, |d| d.rings.window().bytes() as usize);
+        let unit =
+            scratchy_target_metal::sparse_kv::whole_tile_blocks(&dev.device, [conv, ssm, window]);
+        (bytes > 0).then_some((bytes + window, unit))
     }
 
     /// ⭐ HOW A POOL OF `num_gpu_blocks` BLOCKS SHARES ITS BUDGET WITH THE SNAPSHOTS: a block costs
@@ -5140,6 +5165,78 @@ struct BlockStep {
     q_probs: Vec<f32>,
     /// Each lane's policy for its next block's selection.
     lane_params: Vec<scratchy_target_metal::dflash2::DraftLaneParams>,
+    /// The lanes' windows the step restores from prefix-cache snapshots (Splash `beginRestore`
+    /// with `restoreDraftState`), and the plays that rebuild their rings from them
+    /// (`addDraftRebuild`).
+    restores: Vec<WindowRestore>,
+    rebuilds: Vec<Rebuild>,
+    /// The snapshots the step saves its lanes' windows into.
+    saves: Vec<WindowSave>,
+}
+
+/// A lane's window copied from a prefix-cache snapshot's.
+#[cfg(feature = "metal")]
+struct WindowRestore {
+    ring_slot: u32,
+    snapshot: usize,
+}
+
+/// A rebuild play's host inputs: a restored lane's positions before its replay, whose context rows
+/// its window holds, through its layers' commits into its rings.
+#[cfg(feature = "metal")]
+struct Rebuild {
+    input_ids: Vec<u32>,
+    positions: Vec<u32>,
+    slot_mapping: Vec<u32>,
+    cu_seqlens_q: Vec<u32>,
+    seqused_k: Vec<u32>,
+    ring_slots: Vec<u32>,
+}
+
+#[cfg(feature = "metal")]
+impl Rebuild {
+    /// The play over positions `positions` of the lane at `ring_slot`.
+    fn of(ring_slot: u32, positions: std::ops::Range<u32>) -> Self {
+        let n = positions.len();
+        Self {
+            input_ids: vec![0; n],
+            slot_mapping: vec![u32::MAX; n],
+            cu_seqlens_q: vec![0, n as u32],
+            seqused_k: vec![positions.end],
+            positions: positions.collect(),
+            ring_slots: vec![ring_slot],
+        }
+    }
+
+    fn request(&self) -> ::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_> {
+        ::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest {
+            input_ids: &self.input_ids,
+            positions: &self.positions,
+            slot_mapping: &self.slot_mapping,
+            cu_seqlens_q: &self.cu_seqlens_q,
+            seqused_k: &self.seqused_k,
+            block_table: &[],
+            span_ids: None,
+            sliding_slot_mappings: &[],
+            sliding_block_tables: &[],
+            block_table_stride: 0,
+            max_seqlen_q: self.positions.len(),
+            max_seqlen_k: self.seqused_k[0] as usize,
+            num_tokens: self.positions.len(),
+            sampled_rows: None,
+            target_hidden: None,
+        }
+    }
+}
+
+/// A snapshot a step saves a lane's window into: the lane's window before the step, then the
+/// step's positions `[from, to)`, below the snapshot's boundary `to`, once the commit wrote them.
+#[cfg(feature = "metal")]
+struct WindowSave {
+    ring_slot: u32,
+    snapshot: usize,
+    from: u32,
+    to: u32,
 }
 
 /// A lane's cycle between the step that drafts its block and the one that verifies it (Splash's
@@ -5197,10 +5294,15 @@ struct Dflash2 {
     slots: RingSlots,
     /// Each request's cycle: drafted by one step, verified by the next.
     cycles: HashMap<String, Cycle>,
-    /// Each request's draft context plan (Splash's `planDraftContext`): which of its prompt's rows
-    /// the drafter captures, for its snapshots' windows and its end's.
-    contexts:
-        HashMap<String, ::scratchy_serving_engine::spec_decode::draft_context::DraftContextPlan>,
+    /// Each prefix-cache snapshot slot's context window (Splash's composite state keeps its
+    /// drafter's), and the prefix it holds: a restore reads only one a drafting save wrote for its
+    /// prefix.
+    snapshot_windows: Option<scratchy_target_metal::sparse_kv::SparseStores>,
+    snapshot_window_keys: Vec<Option<u64>>,
+    /// Each request's draft context: its plan (Splash's `planDraftContext`) — which of its
+    /// prompt's rows the drafter captures, for its snapshots' windows and its end's — and whether
+    /// its rings wait for a rebuild from a restored window.
+    contexts: ::scratchy_serving_engine::spec_decode::draft_context::DraftContexts,
     /// A captured row's bytes: the target's hidden state at each layer the drafter reads.
     captured_row_bytes: usize,
     /// The cycle's buffer ([`CycleLayout`](scratchy_target_metal::dflash2::CycleLayout)), grown to
@@ -5225,27 +5327,23 @@ impl Dflash2 {
     fn release(&mut self, req_id: &str) {
         self.slots.release(req_id);
         self.cycles.remove(req_id);
-        self.contexts.remove(req_id);
+        self.contexts.release(req_id);
     }
 
     /// `request`'s draft context plan: its prompt's replay from the tokens it resumes past, and
     /// the snapshots it saves on the way.
     fn plan(&mut self, request: &NewRequestData) -> ExecutorResult<()> {
-        use ::scratchy_serving_engine::spec_decode::draft_context::plan_draft_context;
         let end = (request.prompt_token_ids.as_ref()).map_or(0, |p| p.len() as u32);
         let begin = request.num_computed_tokens;
-        let saves: Vec<u32> = (request.state_save_points.iter().copied())
-            .filter(|&p| p > begin && p <= end)
-            .collect();
-        let plan =
-            plan_draft_context(begin, end, &saves, self.drafter.window as u32).map_err(|e| {
-                ExecutorError::WorkerExecution(format!(
-                    "{}: its draft context plan: {e:?}",
-                    request.req_id
-                ))
-            })?;
-        self.contexts.insert(request.req_id.clone(), plan);
-        Ok(())
+        (self
+            .contexts
+            .plan(&request.req_id, begin, end, &request.state_save_points))
+        .map_err(|e| {
+            ExecutorError::WorkerExecution(format!(
+                "{}: its draft context plan: {e:?}",
+                request.req_id
+            ))
+        })
     }
 }
 
@@ -5347,7 +5445,84 @@ impl<'a> BlockPassesEncoder<'a> {
                 tokens.gpuAddress(),
             )?;
         }
-        // 2. The commit over the step's rows: the target's captured rows, and a cycle's retained
+        // The drafter's pool is built at its first forward, in the target's arena.
+        let hosted = hosted_by(self.target).map_err(|e| e.to_string())?;
+        self.device.host = Some(Box::new(hosted));
+        // 2. Each restored lane's window, copied from its snapshot, and its rings rebuilt from it
+        // (Splash `beginRestore`, `addDraftRebuild`); then each saving lane's window copied into
+        // its snapshot, before the commit writes the step's rows over it.
+        let dflash2 = self.dflash2;
+        let window = dflash2.rings.window();
+        let lanes_windows = dflash2.rings.windows();
+        let lane_at =
+            |slot: u32| lanes_windows.metal_offset() as u64 + u64::from(slot) * window.bytes();
+        let snapshot_at = |snapshot: usize| snapshot as u64 * window.bytes();
+        let snapshots = (dflash2.snapshot_windows.as_ref()).map(|s| s.buffer(0));
+        let snapshots = match (
+            &snapshots,
+            step.restores.is_empty() && step.saves.is_empty(),
+        ) {
+            (Some(s), _) => Some(&**s),
+            (None, true) => None,
+            (None, false) => {
+                return Err("a DFlash2 step saves or restores no snapshot window".into());
+            }
+        };
+        let lanes_buffer = &**lanes_windows.buffer();
+        if let Some(snapshots) = snapshots {
+            let restored: Vec<_> = (step.restores.iter())
+                .map(|r| scratchy_target_metal::dflash2::WindowCopy {
+                    from: snapshots,
+                    from_at: snapshot_at(r.snapshot),
+                    to: lanes_buffer,
+                    to_at: lane_at(r.ring_slot),
+                    len: window.bytes(),
+                })
+                .collect();
+            scratchy_target_metal::dflash2::encode_window_copies(enc, &restored);
+        }
+        let mut onto: Option<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>> = None;
+        for rebuild in &step.rebuilds {
+            let req = rebuild.request();
+            let draft = DraftInputs {
+                ring_slots: &rebuild.ring_slots,
+                lane_params: &[],
+                cycle: false,
+            };
+            let mut ctx = head_ctx(self.kv_cache, &req, &[], Reads::Rebuild);
+            ctx.draft_ring = Some(&dflash2.rings);
+            ctx.draft = Some(draft);
+            let n = req.num_tokens as u64;
+            // SAFETY: as the commit's below.
+            match onto.as_mut() {
+                Some(o) => {
+                    unsafe { o.then(scratchy_target_metal::ForwardCtxHandle::new(&ctx), n, enc) }?
+                }
+                None => {
+                    onto = Some(unsafe {
+                        self.model.metal_forward_onto(
+                            scratchy_target_metal::ForwardCtxHandle::new(&ctx),
+                            scratchy_target_metal::ForwardDeviceHandle::new(&mut self.device),
+                            n,
+                            enc,
+                        )
+                    }?);
+                }
+            }
+        }
+        if let Some(snapshots) = snapshots {
+            let before: Vec<_> = (step.saves.iter())
+                .map(|s| scratchy_target_metal::dflash2::WindowCopy {
+                    from: lanes_buffer,
+                    from_at: lane_at(s.ring_slot),
+                    to: snapshots,
+                    to_at: snapshot_at(s.snapshot),
+                    len: window.bytes(),
+                })
+                .collect();
+            scratchy_target_metal::dflash2::encode_window_copies(enc, &before);
+        }
+        // 3. The commit over the step's rows: the target's captured rows, and a cycle's retained
         // counts.
         let commit = &step.passes.commit;
         let row_bytes = self.dflash2.captured_row_bytes;
@@ -5374,22 +5549,44 @@ impl<'a> BlockPassesEncoder<'a> {
             cycle: commit.cycle,
         };
         let mut ctx = head_ctx(self.kv_cache, &req, &inputs, Reads::CacheWrites);
-        ctx.draft_ring = Some(&self.dflash2.rings);
+        ctx.draft_ring = Some(&dflash2.rings);
         ctx.draft = Some(draft);
-        // The drafter's pool is built at its first forward, in the target's arena.
-        let hosted = hosted_by(self.target).map_err(|e| e.to_string())?;
-        self.device.host = Some(Box::new(hosted));
+        let n = req.num_tokens as u64;
         // SAFETY: every view points at the step's vectors, alive for the call; the forward is
         // encoded onto `enc`, which the target's command buffer outlives.
-        let mut onto = unsafe {
-            self.model.metal_forward_onto(
-                scratchy_target_metal::ForwardCtxHandle::new(&ctx),
-                scratchy_target_metal::ForwardDeviceHandle::new(&mut self.device),
-                req.num_tokens as u64,
-                enc,
-            )
-        }?;
-        // 3. The block draft over each lane's next block, its tokens and positions the device's.
+        let mut onto = match onto {
+            Some(mut o) => {
+                unsafe { o.then(scratchy_target_metal::ForwardCtxHandle::new(&ctx), n, enc) }?;
+                o
+            }
+            None => unsafe {
+                self.model.metal_forward_onto(
+                    scratchy_target_metal::ForwardCtxHandle::new(&ctx),
+                    scratchy_target_metal::ForwardDeviceHandle::new(&mut self.device),
+                    n,
+                    enc,
+                )
+            }?,
+        };
+        // Each saving lane's step rows below its snapshot's boundary, now that the commit wrote
+        // them.
+        if let Some(snapshots) = snapshots {
+            let rows: Vec<_> = (step.saves.iter())
+                .flat_map(|s| {
+                    (window.positions(s.from, s.to).into_iter()).map(move |r| {
+                        scratchy_target_metal::dflash2::WindowCopy {
+                            from: lanes_buffer,
+                            from_at: lane_at(s.ring_slot) + r.start,
+                            to: snapshots,
+                            to_at: snapshot_at(s.snapshot) + r.start,
+                            len: r.end - r.start,
+                        }
+                    })
+                })
+                .collect();
+            scratchy_target_metal::dflash2::encode_window_copies(enc, &rows);
+        }
+        // 4. The block draft over each lane's next block, its tokens and positions the device's.
         if let Some(block) = block.filter(|b| b.drafts) {
             let bytes = lanes * rows * size_of::<u32>();
             let at = |section: u64| section as usize;
@@ -6130,8 +6327,16 @@ impl Worker for MetalWorker {
 
     fn prefill_bucket_max_m(&self) -> Option<u32> {
         // Set by `determine_available_memory` from the target-reactive bucket
-        // selection; the engine clamps `max_num_batched_tokens` to it.
-        self.metal_prefill_bucket_max_m
+        // selection; the engine clamps `max_num_batched_tokens` to it. A DFlash2 drafter's step
+        // runs at most its window's rows (Splash's prefill token budget, one draft window:
+        // DFlashDraft.cpp `static_assert(draftContextTokens <= prefillTokenBudget)`), so no two
+        // rows of one sequence's step share a ring slot, and a snapshot's window is its lane's
+        // before the step and the step's rows below it.
+        let window = (self.dflash2.as_ref()).map(|d| d.drafter.window as u32);
+        match (self.metal_prefill_bucket_max_m, window) {
+            (Some(bucket), Some(window)) => Some(bucket.min(window)),
+            (bucket, window) => bucket.or(window),
+        }
     }
 
     fn snapshot_budget(&self) -> Option<SnapshotBudget> {
@@ -6932,6 +7137,21 @@ impl Worker for MetalWorker {
             self.gdn_snapshots_from = snapshots_from;
             self.gdn_snapshot_keys = vec![None; self.gdn_snapshot_cap];
             self.gdn_slot_allocator = Some(GdnSlotAllocator::new(live, lanes));
+            // A DFlash2 drafter's snapshots keep its context windows, one a snapshot slot, mapped
+            // and released with the slots' units (`apply_shared_memory`).
+            let cap = self.gdn_snapshot_cap;
+            if let Some(d) = self.dflash2.as_mut().filter(|_| cap > 0) {
+                let bytes = d.rings.window().bytes() as usize;
+                let windows = scratchy_target_metal::sparse_kv::SparseStores::apart(
+                    &mtl_device,
+                    &residency,
+                    cap,
+                    &[(bytes, false)],
+                )
+                .map_err(|e| ExecutorError::WorkerInit(format!("DFlash2 snapshot windows: {e}")))?;
+                d.snapshot_windows = Some(windows);
+                d.snapshot_window_keys = vec![None; cap];
+            }
         }
         if self.gdn_state.is_some() && self.gdn_snapshot_cap > 0 {
             let shared = self.shared_kv_layout(num_gpu_blocks, &layout)?;
@@ -8050,8 +8270,33 @@ impl Worker for MetalWorker {
         // A block drafter's passes over the step, with each request's ring slot, each lane's verify
         // of the block it drafted last — its policy and that block's selection — and its next
         // block's policy.
+        // A rebuild plays at most the rows a step does.
+        let rebuild_rows = self.prefill_bucket_max_m();
         let block_step = match self.dflash2.as_mut() {
             Some(d) if !scheduler_output.draft_req_ids.is_empty() => {
+                // A restored window's rings, rebuilt in its sequence's first step past its prompt,
+                // before that step's commit and block draft (`DraftContexts::take_rebuild`).
+                let pass = rebuild_rows.unwrap_or(d.drafter.window as u32).max(1);
+                let mut rebuilds = Vec::new();
+                for (i, req_id) in step_rows.req_ids.iter().enumerate() {
+                    if !scheduler_output.draft_req_ids.contains(req_id) {
+                        continue;
+                    }
+                    let rows =
+                        step_rows.cu_seqlens_q[i] as usize..step_rows.cu_seqlens_q[i + 1] as usize;
+                    let (first, last) = (
+                        step_rows.positions[rows.start],
+                        step_rows.positions[rows.end - 1] + 1,
+                    );
+                    let Some(positions) = d.contexts.take_rebuild(req_id, first, last) else {
+                        continue;
+                    };
+                    let ring_slot = d.slots.of(req_id).map_err(ExecutorError::WorkerExecution)?;
+                    for begin in positions.clone().step_by(pass as usize) {
+                        let end = (begin + pass).min(positions.end);
+                        rebuilds.push(Rebuild::of(ring_slot, begin..end));
+                    }
+                }
                 let passes = (d.drafter)
                     .passes(&step_rows, &scheduler_output.draft_req_ids, &d.contexts)
                     .map_err(|e| {
@@ -8068,6 +8313,53 @@ impl Worker for MetalWorker {
                             .map(|l| d.slots.of(&req_ids_in_order[l.step]))
                             .collect::<Result<Vec<u32>, String>>()
                             .map_err(ExecutorError::WorkerExecution)?;
+                        // The snapshots the step restores its committing lanes' windows from and
+                        // saves them into (Splash's composite state: the drafter's window beside
+                        // the target's state), each lane by its ring slot and its first position
+                        // in the step.
+                        let mut committing: HashMap<&str, (u32, u32)> = HashMap::new();
+                        for (&i, &slot) in passes.commit.steps.iter().zip(&commit_slots) {
+                            let first = step_rows.positions[step_rows.cu_seqlens_q[i] as usize];
+                            committing
+                                .entry(req_ids_in_order[i].as_str())
+                                .or_insert((slot, first));
+                        }
+                        let ops = &scheduler_output.recurrent_state;
+                        let mut restores = Vec::new();
+                        for op in &ops.restores {
+                            let Some(&(ring_slot, _)) = committing.get(op.req_id.as_str()) else {
+                                continue;
+                            };
+                            // Its plan continues the window it restores, which a drafting save
+                            // of its prefix wrote; its rings wait for a rebuild from it.
+                            let continues = d
+                                .contexts
+                                .continues_restored_window(&op.req_id, op.position);
+                            let saved = d.snapshot_window_keys.get(op.slot) == Some(&Some(op.key));
+                            if !(continues && saved) {
+                                continue;
+                            }
+                            d.contexts.restore(&op.req_id, op.position);
+                            restores.push(WindowRestore {
+                                ring_slot,
+                                snapshot: op.slot,
+                            });
+                        }
+                        let mut saves = Vec::new();
+                        for op in &ops.saves {
+                            let lane = committing.get(op.req_id.as_str()).copied();
+                            if let Some(key) = d.snapshot_window_keys.get_mut(op.slot) {
+                                *key = lane.map(|_| op.key);
+                            }
+                            if let Some((ring_slot, from)) = lane {
+                                saves.push(WindowSave {
+                                    ring_slot,
+                                    snapshot: op.slot,
+                                    from,
+                                    to: op.position,
+                                });
+                            }
+                        }
                         let rows = d.drafter.budget.drafts as u32 + 1;
                         let candidates_a_lane = d.drafter.budget.drafts
                             * scratchy_target_metal::dflash2::CANDIDATES as usize;
@@ -8082,6 +8374,9 @@ impl Worker for MetalWorker {
                             candidates: Vec::new(),
                             q_probs: Vec::new(),
                             lane_params: Vec::new(),
+                            restores,
+                            rebuilds,
+                            saves,
                         };
                         for lane in lanes {
                             let req_id = &req_ids_in_order[lane.step];

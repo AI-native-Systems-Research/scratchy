@@ -3128,15 +3128,14 @@ fn a_context_window_reads_back_what_splash_stores() {
         batch.commit(true);
     }
     let got: Vec<u16> = read(&loaded, rows * h);
-    for row in 0..rows {
+    for (row, position) in positions.iter().enumerate() {
         for g in 0..h / group {
             let at = row * h + g * group;
             let values: Vec<f32> = context[at..at + group].iter().map(|&b| value(b)).collect();
             assert_eq!(
                 got[at..at + group],
                 window_round_trip(&values)[..],
-                "row {row} group {g} at position {}",
-                positions[row]
+                "row {row} group {g} at position {position}"
             );
         }
     }

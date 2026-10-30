@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::backend::ForwardArgmaxRequest;
 use super::draft_context::{
-    DraftContextError, DraftContextPlan, capture_spans_for_dispatch, plan_draft_context,
+    DraftContextError, DraftContexts, capture_spans_for_dispatch, plan_draft_context,
 };
 use super::mtp::{DraftBudget, StepRows};
 
@@ -171,12 +171,13 @@ fn request<'a>(
 
 impl BlockDrafter {
     /// The drafter's passes over the rows of `step` that the requests in `plan` run, a prompt's
-    /// rows those its draft context plan (`contexts`) captures. `None` when none is planned.
+    /// rows those its draft context plan (`contexts`) captures, a sequence whose rings wait for a
+    /// rebuild drafting nothing. `None` when none is planned.
     pub fn passes(
         &self,
         step: &StepRows<'_>,
         plan: &HashSet<String>,
-        contexts: &HashMap<String, DraftContextPlan>,
+        contexts: &DraftContexts,
     ) -> Result<Option<BlockPasses>, DraftContextError> {
         let seqs: Vec<usize> = (0..step.req_ids.len())
             .filter(|&i| plan.contains(&step.req_ids[i]))
@@ -245,7 +246,8 @@ impl BlockDrafter {
                 true => rows.start,
                 false => rows.end - 1,
             };
-            if let Some(at) = sampled(first).filter(|_| reaches_end) {
+            let drafts = contexts.drafts(&step.req_ids[i]);
+            if let Some(at) = sampled(first).filter(|_| reaches_end && drafts) {
                 lanes.push(BlockLane {
                     step: i,
                     sampled: at as u32,
@@ -389,7 +391,7 @@ mod tests {
             sampled: SampledRows::of(&[0, 8], |_| true).expect("rows"),
         };
         let passes = DRAFTER
-            .passes(&step.rows(), &plan(&["a"]), &HashMap::new())
+            .passes(&step.rows(), &plan(&["a"]), &DraftContexts::new(2048))
             .expect("a plan")
             .expect("planned");
         assert!(passes.commit.cycle);
@@ -447,12 +449,20 @@ mod tests {
         };
         assert_eq!(
             drafter
-                .passes(&chunk(0, 16).rows(), &plan(&["a"]), &HashMap::new())
+                .passes(
+                    &chunk(0, 16).rows(),
+                    &plan(&["a"]),
+                    &DraftContexts::new(2048)
+                )
                 .expect("a plan"),
             None
         );
         let middle = (drafter
-            .passes(&chunk(16, 32).rows(), &plan(&["a"]), &HashMap::new())
+            .passes(
+                &chunk(16, 32).rows(),
+                &plan(&["a"]),
+                &DraftContexts::new(2048),
+            )
             .expect("a plan"))
         .expect("commits");
         assert_eq!(middle.commit.positions, (24..32).collect::<Vec<_>>());
@@ -463,7 +473,11 @@ mod tests {
             "a chunk short of its end drafts nothing"
         );
         let last = (drafter
-            .passes(&chunk(32, 40).rows(), &plan(&["a"]), &HashMap::new())
+            .passes(
+                &chunk(32, 40).rows(),
+                &plan(&["a"]),
+                &DraftContexts::new(2048),
+            )
             .expect("a plan"))
         .expect("commits");
         assert_eq!(last.commit.positions, (32..40).collect::<Vec<_>>());
@@ -481,10 +495,8 @@ mod tests {
             window: 16,
             ..DRAFTER
         };
-        let contexts = HashMap::from([(
-            "a".to_string(),
-            plan_draft_context(0, 64, &[24], 16).expect("a plan"),
-        )]);
+        let mut contexts = DraftContexts::new(16);
+        contexts.plan("a", 0, 64, &[24]).expect("a plan");
         let chunk = |from: u32, to: u32| Step {
             req_ids: vec!["a".into()],
             input_ids: (from + 100..to + 100).collect(),
@@ -512,9 +524,9 @@ mod tests {
             window: 16,
             ..DRAFTER
         };
-        let context = plan_draft_context(32, 40, &[], 16).expect("a plan");
-        assert!(context.restores_draft_state);
-        let contexts = HashMap::from([("a".to_string(), context)]);
+        let mut contexts = DraftContexts::new(16);
+        contexts.plan("a", 32, 40, &[]).expect("a plan");
+        assert!(contexts.continues_restored_window("a", 32));
         let step = Step {
             req_ids: vec!["a".into()],
             input_ids: (132..140).collect(),
@@ -530,6 +542,53 @@ mod tests {
         assert!(passes.block.is_some(), "it drafts at its end");
     }
 
+    /// A sequence whose window was restored at 32 drafts nothing at its prompt's end (its first
+    /// token does not wait for its rings), and its first step past the prompt rebuilds its rings
+    /// over the restored positions still in the window, then drafts.
+    #[test]
+    fn a_restored_window_s_rings_are_rebuilt_past_the_prompt_then_draft() {
+        let drafter = BlockDrafter {
+            window: 16,
+            ..DRAFTER
+        };
+        let mut contexts = DraftContexts::new(16);
+        contexts.plan("a", 32, 40, &[]).expect("a plan");
+        contexts.restore("a", 32);
+        let end = Step {
+            req_ids: vec!["a".into()],
+            input_ids: (132..140).collect(),
+            positions: (32..40).collect(),
+            cu: vec![0, 8],
+            history: vec![40],
+            sampled: SampledRows::of(&[0, 8], |_| false).expect("rows"),
+        };
+        assert_eq!(
+            contexts.take_rebuild("a", 32, 40),
+            None,
+            "not in its prompt"
+        );
+        let passes = (drafter.passes(&end.rows(), &plan(&["a"]), &contexts))
+            .expect("a plan")
+            .expect("commits");
+        assert_eq!(passes.commit.positions, (32..40).collect::<Vec<_>>());
+        assert_eq!(passes.block, None, "its prompt's end drafts nothing");
+
+        let decode = Step {
+            req_ids: vec!["a".into()],
+            input_ids: vec![7],
+            positions: vec![40],
+            cu: vec![0, 1],
+            history: vec![41],
+            sampled: SampledRows::of(&[0, 1], |_| false).expect("rows"),
+        };
+        assert_eq!(contexts.take_rebuild("a", 40, 41), Some(25..32));
+        assert_eq!(contexts.take_rebuild("a", 40, 41), None, "rebuilt once");
+        let passes = (drafter.passes(&decode.rows(), &plan(&["a"]), &contexts))
+            .expect("a plan")
+            .expect("commits");
+        assert!(passes.block.expect("drafts").drafts);
+    }
+
     /// A sequence verifying the 3 rows of its block its budget chose (its anchor 500, drafts 501
     /// and 502) commits as a cycle's lane all the same.
     #[test]
@@ -543,7 +602,7 @@ mod tests {
             sampled: SampledRows::of(&[0, 3], |_| true).expect("rows"),
         };
         let passes = DRAFTER
-            .passes(&step.rows(), &plan(&["a"]), &HashMap::new())
+            .passes(&step.rows(), &plan(&["a"]), &DraftContexts::new(2048))
             .expect("a plan")
             .expect("planned");
         assert!(passes.commit.cycle);
@@ -566,7 +625,7 @@ mod tests {
             sampled: SampledRows::of(&[0, 5], |_| false).expect("rows"),
         };
         let passes = DRAFTER
-            .passes(&last.rows(), &plan(&["a"]), &HashMap::new())
+            .passes(&last.rows(), &plan(&["a"]), &DraftContexts::new(2048))
             .expect("a plan")
             .expect("planned");
         assert!(!passes.commit.cycle);
@@ -589,7 +648,11 @@ mod tests {
             sampled: SampledRows::of(&[0, 1, 2], |_| false).expect("rows"),
         };
         let passes = (DRAFTER
-            .passes(&decoding.rows(), &plan(&["a", "b"]), &HashMap::new())
+            .passes(
+                &decoding.rows(),
+                &plan(&["a", "b"]),
+                &DraftContexts::new(2048),
+            )
             .expect("a plan"))
         .expect("planned");
         assert!(!passes.commit.cycle, "a decode step commits every row");
@@ -600,7 +663,7 @@ mod tests {
         );
         assert_eq!(
             DRAFTER
-                .passes(&decoding.rows(), &plan(&[]), &HashMap::new())
+                .passes(&decoding.rows(), &plan(&[]), &DraftContexts::new(2048))
                 .expect("a plan"),
             None
         );

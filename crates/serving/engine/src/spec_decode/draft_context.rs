@@ -14,9 +14,12 @@
 //! window afresh. `restores_draft_state` says whether the first boundary continues the restored
 //! state's window, which the worker then rebuilds the rings from.
 //!
-//! Scratchy's one difference: a step's rows are not bounded by Splash's prefill token budget (one
+//! Scratchy's differences: a restored window's rings are rebuilt a step later
+//! ([`DraftContexts`]); and a step's rows are not bounded by Splash's prefill token budget (one
 //! window), so a step may cross more than two capture spans, and Splash's two-span array is a
 //! vector.
+
+use std::ops::Range;
 
 /// Why a boundary has the drafter's context of the rows before it (Splash `DraftBoundaryPurpose`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,6 +207,93 @@ pub fn capture_spans_for_dispatch(
         compact_row += to - from;
     }
     Ok(out)
+}
+
+/// Each sequence's draft context, as its worker keeps it: its plan, made at its admission and again
+/// at each resume after a preemption (a replay is planned from where it resumes, as Splash plans
+/// one from its restored state), and whether its rings wait for a rebuild from a restored window.
+///
+/// Splash rebuilds a restored lane's rings in its first prefill command (Runtime.cpp:1696-1701), so
+/// its first token waits on them. Here the first token does not: a sequence whose window was
+/// restored drafts nothing until its first step past its prompt, which rebuilds its rings first
+/// ([`DraftContexts::take_rebuild`]) — the rebuild's work moved off the prompt's last step, the
+/// prefix-cache hit's time to first token.
+#[derive(Debug)]
+pub struct DraftContexts {
+    window: u32,
+    plans: std::collections::HashMap<String, DraftContextPlan>,
+    /// Each sequence whose window was restored, the position it resumed at, until its rings are
+    /// rebuilt.
+    restored: std::collections::HashMap<String, u32>,
+}
+
+impl DraftContexts {
+    /// No sequence's context yet, for a drafter whose rings hold `window` positions.
+    pub fn new(window: u32) -> Self {
+        Self {
+            window,
+            plans: Default::default(),
+            restored: Default::default(),
+        }
+    }
+
+    /// Plan `request`'s replay of `[begin, end)`, its state saving snapshots at `save_points`
+    /// (those within the replay count), over any plan it had.
+    pub fn plan(
+        &mut self,
+        request: &str,
+        begin: u32,
+        end: u32,
+        save_points: &[u32],
+    ) -> Result<(), DraftContextError> {
+        let saves: Vec<u32> = (save_points.iter().copied())
+            .filter(|&p| p > begin && p <= end)
+            .collect();
+        let plan = plan_draft_context(begin, end, &saves, self.window)?;
+        self.plans.insert(request.to_owned(), plan);
+        self.restored.remove(request);
+        Ok(())
+    }
+
+    /// `request`'s plan.
+    pub fn get(&self, request: &str) -> Option<&DraftContextPlan> {
+        self.plans.get(request)
+    }
+
+    /// Whether `request` resuming at `position` continues the window it restores there.
+    pub fn continues_restored_window(&self, request: &str, position: u32) -> bool {
+        (self.plans.get(request))
+            .is_some_and(|p| p.restores_draft_state && p.replay_begin == position)
+    }
+
+    /// `request`'s window was restored at `position`: its rings wait for their rebuild.
+    pub fn restore(&mut self, request: &str, position: u32) {
+        self.restored.insert(request.to_owned(), position);
+    }
+
+    /// Whether `request` may draft: its rings hold its context (none waits for a rebuild).
+    pub fn drafts(&self, request: &str) -> bool {
+        !self.restored.contains_key(request)
+    }
+
+    /// The positions `request`'s rings are rebuilt over in a step of its rows `[first, last)`: the
+    /// restored ones still inside the window at the step's end, in its first step past its
+    /// prompt; `None` in any other step, or once rebuilt.
+    pub fn take_rebuild(&mut self, request: &str, first: u32, last: u32) -> Option<Range<u32>> {
+        let end = self.plans.get(request)?.replay_end;
+        let &resumed = self.restored.get(request)?;
+        if first < end {
+            return None;
+        }
+        self.restored.remove(request);
+        Some(last.saturating_sub(self.window)..resumed).filter(|positions| !positions.is_empty())
+    }
+
+    /// What `request` holds: its plan, and any rebuild it waits for.
+    pub fn release(&mut self, request: &str) {
+        self.plans.remove(request);
+        self.restored.remove(request);
+    }
 }
 
 #[cfg(test)]

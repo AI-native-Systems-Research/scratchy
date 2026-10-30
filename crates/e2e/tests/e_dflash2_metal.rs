@@ -130,9 +130,14 @@ async fn server(args: &[&str]) -> TestServer {
 
 /// The draft tokens the server at `base_url` has proposed (`vllm_spec_decode_num_draft_tokens`).
 async fn draft_tokens(base_url: &str) -> u64 {
+    counter(base_url, "vllm_spec_decode_num_draft_tokens").await
+}
+
+/// The server's counter `name`.
+async fn counter(base_url: &str, name: &str) -> u64 {
     let metrics = Client::new(base_url).metrics().await.expect("metrics");
     (metrics.lines())
-        .find_map(|line| line.strip_prefix("vllm_spec_decode_num_draft_tokens "))
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
         .map_or(0, |n| n.trim().parse::<f64>().expect("a count") as u64)
 }
 
@@ -280,5 +285,83 @@ async fn drafted_sampling_is_the_targets() {
         p >= P_FLOOR,
         "the drafter's sampled continuations are not the target's: chi-square {chi:.2} at {df} \
          df, p = {p:.2e}"
+    );
+}
+
+// ── Prefix-cache hits ─────────────────────────────────────────────────────────────────────────
+
+/// The characters of a document a hit's prompt takes: some 1,500 tokens.
+const DOCUMENT_CHARS: usize = 6000;
+
+/// A request for a summary of the head of `document`.
+fn summary_prompt(document: &str) -> String {
+    let head: String = document.chars().take(DOCUMENT_CHARS).collect();
+    format!("{head}\n\nSummarize the document above in one paragraph.")
+}
+
+/// One request's text, its prompt tokens the prefix cache served, and the draft tokens the server
+/// proposed and accepted while it ran.
+#[derive(Debug)]
+struct Run {
+    text: String,
+    cached: u32,
+    proposed: u64,
+    accepted: u64,
+}
+
+async fn run(base_url: &str, prompt: &str) -> Run {
+    let accepted = "vllm_spec_decode_num_accepted_tokens";
+    let (proposed_before, accepted_before) = (
+        draft_tokens(base_url).await,
+        counter(base_url, accepted).await,
+    );
+    // The chat endpoint reports the prompt tokens the prefix cache served.
+    let body = serde_json::json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": TOKENS,
+        "temperature": 0.0,
+        "chat_template_kwargs": {"enable_thinking": false},
+    });
+    let response = (Client::new(base_url).chat_completion_raw(&body).await).expect("a reply");
+    let response: serde_json::Value = response.json().await.expect("a JSON reply");
+    let cached = &response["usage"]["prompt_tokens_details"]["cached_tokens"];
+    Run {
+        text: (response["choices"][0]["message"]["content"].as_str())
+            .expect("its text")
+            .to_string(),
+        cached: cached.as_u64().unwrap_or(0) as u32,
+        proposed: draft_tokens(base_url).await - proposed_before,
+        accepted: counter(base_url, accepted).await - accepted_before,
+    }
+}
+
+/// A prefix-cache hit drafts from the drafter's context of its cached prefix, which the snapshot it
+/// resumes from kept (Splash's composite state: the window the hit rebuilds its rings from), not
+/// from whatever its ring slot last held. A prompt hit right after its own prefill, and hit again
+/// after another long prompt took its ring slot, says the same and keeps as many drafts. Without
+/// the restore the second hit drafts from the other prompt's rows: it kept 71 drafts to the first
+/// hit's 109, and its text differed. (The drafts each run proposes are left out: one run proposed
+/// one draft more than the other, 220 to 219, with the same text and the same drafts kept.)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn a_hit_drafts_from_the_context_its_snapshot_kept() {
+    scratchy_e2e::skip_if_no_gpu!();
+    let server = server(&["--enable-metrics"]).await;
+    let url = server.base_url();
+    let prompt = summary_prompt(include_str!("../../../README.md"));
+    let other = summary_prompt(include_str!("../../../docs/BUILD.md"));
+    let cold = run(&url, &prompt).await;
+    let hit = run(&url, &prompt).await;
+    run(&url, &other).await;
+    let hit_after_other = run(&url, &prompt).await;
+    eprintln!("HIT cold {cold:?}\nHIT hit {hit:?}\nHIT after another prompt {hit_after_other:?}");
+    assert_eq!(cold.cached, 0, "the first run is cold");
+    assert!(hit.cached > 0, "the second run hits");
+    assert!(hit.proposed > 0, "the hit drafts");
+    assert_eq!(hit.text, hit_after_other.text, "a hit says the same");
+    assert_eq!(
+        hit.accepted, hit_after_other.accepted,
+        "a hit keeps as many drafts, from its snapshot's context"
     );
 }

@@ -202,6 +202,14 @@ pub enum ForwardReads {
     Rebuild,
 }
 
+impl ForwardReads {
+    /// It plays only what its cache writes are computed from: a bucket that plays its cache writes
+    /// alone ([`super::MetalBucketSpec::plays_result`]) holds every tile it writes.
+    pub fn within_cache_writes(self) -> bool {
+        matches!(self, Self::CacheWrites | Self::Rebuild)
+    }
+}
+
 /// A forward the host commits without waiting for it, so the next one is queued while it runs. Its
 /// runtime-input writes are made on the device at the head of its command buffer — the forward
 /// before it may still be reading those buffers — and it starts once that forward is done.
@@ -539,7 +547,7 @@ pub enum ForwardError {
         sampled: crate::tape::ids::SampledRowCount,
         overflow: crate::tape::lowered::LogitsOverflow,
     },
-    /// A forward that reads more than its cache writes, of `num_tokens` rows, whose bucket
+    /// A forward that plays more than its cache writes, of `num_tokens` rows, whose bucket
     /// (`bucket_m`) plays its cache writes alone ([`super::MetalBucketSpec::plays_result`]): its
     /// arena holds none of what the rest of its tape writes.
     CacheWritesOnly {
