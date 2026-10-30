@@ -12257,64 +12257,71 @@ fn dump_wavefront_mega(
                                                         kv_off: 0,
                                                     }]
                                                 };
-                                            superdsc::attach_reroll(
-                                                &bfp,
-                                                superdsc::bundle::RerollMeta {
-                                                    prefix: sib(Some(pfp.clone())),
-                                                    suffix: sib(Some(sfp.clone())),
-                                                    // ⭐ THE ONE BODY = the ANCHOR (`bfp`, the
-                                                    // bundle this meta attaches to). The
-                                                    // emulator's unrolled bundle has no siblings —
-                                                    // one row, one body, run once.
-                                                    bodies: std::borrow::Cow::Owned(
-                                                        (if card {
-                                                            body_fps.clone()
-                                                        } else {
-                                                            vec![bfp.clone()]
-                                                        })
-                                                        .iter()
-                                                        .map(|fp| sib(Some(fp.clone())))
-                                                        .collect(),
-                                                    ),
-                                                    bodies_fused: std::borrow::Cow::Owned(
-                                                        if card {
-                                                            bodies_fused.clone()
-                                                        } else {
-                                                            vec![superdsc::bundle::SiblingFp::none()]
-                                                        },
-                                                    ),
-                                                    // ⛔ `rungs` IS KEYED BY ACTIVE_CAP — the columns one
-                                                    // fold pass sweeps — NOT by the batch width. Two other
-                                                    // lists of `(u32, fingerprint)` in this file are keyed
-                                                    // by `seqs`, and reading the wrong one selects a body
-                                                    // baked for a 64-column sweep because four requests are
-                                                    // live.
-                                                    rungs: std::borrow::Cow::Owned(decode_rungs),
-                                                    fallback_rung,
-                                                    launches: std::borrow::Cow::Owned(
-                                                        baked_launches,
-                                                    ),
-                                                    kv_page_stride: if card {
-                                                        // One pool page = EVERY layer of EVERY
-                                                        // class — the walk's own max-end over the
-                                                        // per-class last-layer KV placements (0
-                                                        // when the bundle has no paged KV).
-                                                        rolled.kv_page_stride
+                                            let meta = superdsc::bundle::RerollMeta {
+                                                prefix: sib(Some(pfp.clone())),
+                                                suffix: sib(Some(sfp.clone())),
+                                                // ⭐ THE ONE BODY = the ANCHOR (`bfp`, the
+                                                // bundle this meta attaches to). The
+                                                // emulator's unrolled bundle has no siblings —
+                                                // one row, one body, run once.
+                                                bodies: std::borrow::Cow::Owned(
+                                                    (if card {
+                                                        body_fps.clone()
                                                     } else {
-                                                        0
-                                                    },
-                                                    prefix_weight_bank: if card {
-                                                        rolled.prefix_weight_bank
-                                                    } else {
-                                                        0
-                                                    },
-                                                    suffix_weight_bank: if card {
-                                                        rolled.suffix_weight_bank
-                                                    } else {
-                                                        0
-                                                    },
+                                                        vec![bfp.clone()]
+                                                    })
+                                                    .iter()
+                                                    .map(|fp| sib(Some(fp.clone())))
+                                                    .collect(),
+                                                ),
+                                                bodies_fused: std::borrow::Cow::Owned(if card {
+                                                    bodies_fused.clone()
+                                                } else {
+                                                    vec![superdsc::bundle::SiblingFp::none()]
+                                                }),
+                                                // ⛔ `rungs` IS KEYED BY ACTIVE_CAP — the columns one
+                                                // fold pass sweeps — NOT by the batch width. Two other
+                                                // lists of `(u32, fingerprint)` in this file are keyed
+                                                // by `seqs`, and reading the wrong one selects a body
+                                                // baked for a 64-column sweep because four requests are
+                                                // live.
+                                                rungs: std::borrow::Cow::Owned(decode_rungs),
+                                                fallback_rung,
+                                                launches: std::borrow::Cow::Owned(baked_launches),
+                                                kv_page_stride: if card {
+                                                    // One pool page = EVERY layer of EVERY
+                                                    // class — the walk's own max-end over the
+                                                    // per-class last-layer KV placements (0
+                                                    // when the bundle has no paged KV).
+                                                    rolled.kv_page_stride
+                                                } else {
+                                                    0
                                                 },
-                                            );
+                                                prefix_weight_bank: if card {
+                                                    rolled.prefix_weight_bank
+                                                } else {
+                                                    0
+                                                },
+                                                suffix_weight_bank: if card {
+                                                    rolled.suffix_weight_bank
+                                                } else {
+                                                    0
+                                                },
+                                            };
+                                            // ⛔⛔ AND EVERY POSITION THE CARD SERVES ON IT STAGES A WALK
+                                            // — proven over the ladder the executor reads and the
+                                            // selection it runs (`paged_step::prove_ladder_walks`),
+                                            // so a ladder read as no walk fails here, not on a card.
+                                            if card
+                                                && let Some(step) = gk.paged
+                                                && let Err(e) =
+                                                    scratchy_target_spyre::paged_step::prove_ladder_walks(
+                                                        &meta, step,
+                                                    )
+                                            {
+                                                panic!("[spyre-superdsc] {base}: {e}");
+                                            }
+                                            superdsc::attach_reroll(&bfp, meta);
                                             // ⛔ AND THE SESSION THIS BODY OPENS ALLOCATES FOR EVERY
                                             // SIBLING IT LAUNCHES, not for itself alone: a rung whose
                                             // scratch outgrows the ceiling's addresses past its segment.
