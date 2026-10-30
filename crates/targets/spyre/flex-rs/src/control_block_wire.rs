@@ -216,17 +216,6 @@ impl HostPhysicalAddress {
         Self(iova.0 as u64)
     }
 
-    /// A PEER CARD's mapped window, `offset` bytes in — the device-visible address the cross-port
-    /// IOMMU mapping ([`crate::multi_device::RdmaUnit::attach_peer`]) made of the peer's memory, so
-    /// this card's DMA engine writes there card-to-card with no host memory between. `None` past the
-    /// window: an offset the mapping does not cover names no peer byte.
-    pub fn of_peer_window(
-        window: &crate::multi_device::PeerTransferWindow,
-        offset: u64,
-    ) -> Option<Self> {
-        (offset < window.len_bytes).then_some(Self(window.address + offset))
-    }
-
     /// The address of a buffer that has not been mapped yet — the value a
     /// freshly constructed `DmaBuf` holds before `setup_dma_buf` establishes a
     /// real one. Never written into a control block: every CB-building path
