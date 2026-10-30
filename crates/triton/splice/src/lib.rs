@@ -4563,9 +4563,25 @@ mod walk_on_the_card {
     /// heads' stick-major blocks one after another — the frame a batched transpose and a batched
     /// contraction's kernel take a block of at its base, and not the flat frame any other op reads.
     /// An elementwise op over two such pages is refused by name, not lowered at the flat frame's
-    /// addresses.
+    /// addresses — and so is a shape op naming one in any frame.
     #[test]
     fn an_elementwise_read_of_a_page_in_blocks_is_refused() {
+        // (what the program stores, the refusal's own words)
+        for (stored, says) in [
+            (
+                "tl.reshape(k + v, [8 * 64, 128])",
+                "only a batched transpose's input or a batched contraction's kernel reads",
+            ),
+            (
+                "tl.reshape(k, [8 * 64, 128]) + tl.reshape(v, [8 * 64, 128])",
+                "every frame a shape op names is the flat frame's",
+            ),
+        ] {
+            refused_over_pages_in_blocks(stored, says);
+        }
+    }
+
+    fn refused_over_pages_in_blocks(stored: &str, says: &str) {
         const SRC: &str = r#"
 import triton
 import triton.language as tl
@@ -4581,8 +4597,9 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
                                      block_shape=[8 * 64, 128])
     k = tl.reshape(k_desc.load([tl.load(k_index), 0]), [8, 64, 128])
     v = tl.reshape(v_desc.load([tl.load(v_index), 0]), [8, 64, 128])
-    rows.store([0, 0], tl.reshape(k + v, [8 * 64, 128]))
+    rows.store([0, 0], STORED)
 "#;
+        let src = SRC.replace("STORED", stored);
         let mut signature = HashMap::new();
         let mut constexprs = HashMap::new();
         for (p, ty) in [
@@ -4602,7 +4619,7 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
             constexprs,
             file: "two_pages.py".to_string(),
         };
-        let module = compile_kernel(SRC, &spec, &[1]).expect("the kernel compiles");
+        let module = compile_kernel(&src, &spec, &[1]).expect("the kernel compiles");
         let node =
             triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the program mints");
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the program places");
@@ -4614,13 +4631,9 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
             &mut sym,
             None,
         ) else {
-            panic!("an elementwise add over two pages in blocks lowered");
+            panic!("{stored}: an add over two pages in blocks lowered");
         };
-        assert!(
-            e.message.contains("batch blocks one after another"),
-            "{}",
-            e.message
-        );
+        assert!(e.message.contains(says), "{stored}: {}", e.message);
     }
 
     /// A one-block walk states no loop — the front end promotes a one-trip `scf.for` to its body —
