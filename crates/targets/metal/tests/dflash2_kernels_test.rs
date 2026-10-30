@@ -3059,3 +3059,85 @@ fn target_policy_never_draws_an_excluded_stop_token() {
         }
     }
 }
+
+/// Splash's 4-bit context window (prefill/draft_context.metal `prefill_draft_context_store`,
+/// `prefill_draft_context_load`): a group of 64 values keeps its fp16 minimum and its range over
+/// 15 as its scale, and each value the nearest code, so a load reads back `minimum + code · scale`.
+/// The values each group's store and load make, from the group's values.
+fn window_round_trip(values: &[f32]) -> Vec<u16> {
+    let low = values.iter().copied().fold(f32::INFINITY, f32::min);
+    let high = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let scale = half::f16::from_f32((high - low) / 15.0);
+    let minimum = half::f16::from_f32(low).to_f32();
+    let code = |x: f32| match scale > half::f16::ZERO {
+        true => ((x - minimum) / scale.to_f32())
+            .round_ties_even()
+            .clamp(0.0, 15.0),
+        false => 0.0,
+    };
+    (values.iter())
+        .map(|&x| bits(code(x).mul_add(scale.to_f32(), minimum)))
+        .collect()
+}
+
+/// A prompt's commit stores each row's context into its sequence's window at its position, and a
+/// rebuild loads back exactly what Splash's window reads: for two sequences in ring slots 2 and 0,
+/// one at positions that wrap past the window's end, every value is the round trip of its group.
+#[test]
+fn a_context_window_reads_back_what_splash_stores() {
+    let Some(gpu) = Gpu::new() else { return };
+    let mut random = Random(0x51ab);
+    let (h, group) = (HIDDEN as usize, 64usize);
+    let cu: [u32; 3] = [0, 3, 7];
+    let positions: Vec<u32> = (0..3)
+        .map(|r| WINDOW * 2 + 2046 + r)
+        .chain(10..14)
+        .collect();
+    let slots: [u32; 2] = [2, 0];
+    let rows = positions.len();
+    let context = random.bf16s(rows * h, 1.5);
+    let window_bytes = (WINDOW as usize) * (h / 2) + (WINDOW as usize) * (h / group) * 4;
+    let windows = gpu.buffer(&vec![0u8; 3 * window_bytes]);
+    let (b_positions, b_slots) = (gpu.buffer(&positions), gpu.buffer(&slots));
+    let (b_cu, b_n) = (gpu.buffer(&cu), gpu.buffer(&[rows as u32]));
+    let b_context = gpu.buffer(&context);
+    let loaded = gpu.buffer(&vec![0u16; rows * h]);
+    let threadgroups = (rows * (h / group)).div_ceil(8);
+    for (symbol, rows_buffer) in [
+        ("prefill_draft_window_store_bf16", &b_context),
+        ("draft_window_load_bf16", &loaded),
+    ] {
+        let pso = gpu.pipeline("dflash2", symbol, draft_constants(true));
+        let mut batch = gpu.batch();
+        batch.encode(
+            &pso,
+            &[
+                (rows_buffer, 0),
+                (&windows, 1),
+                (&b_positions, 2),
+                (&b_slots, 3),
+                (&b_cu, 4),
+                (&b_n, 5),
+            ],
+            &[],
+            &[],
+            &[],
+            tg(threadgroups, 1, 1),
+            tg(256, 1, 1),
+        );
+        batch.commit(true);
+    }
+    let got: Vec<u16> = read(&loaded, rows * h);
+    for row in 0..rows {
+        for g in 0..h / group {
+            let at = row * h + g * group;
+            let values: Vec<f32> = context[at..at + group].iter().map(|&b| value(b)).collect();
+            assert_eq!(
+                got[at..at + group],
+                window_round_trip(&values)[..],
+                "row {row} group {g} at position {}",
+                positions[row]
+            );
+        }
+    }
+}

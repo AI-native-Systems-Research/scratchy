@@ -8224,6 +8224,8 @@ fn kv_offset_of(fuf: &Fuf, tile: TileId) -> scratchy_forward_compiler::KvOffset 
         | OpKind::PosEmbed
         | OpKind::CaptureHidden
         | OpKind::DraftContextKv
+        | OpKind::DraftWindowStore
+        | OpKind::DraftWindowLoad
         | OpKind::DraftConv
         | OpKind::DraftAttention
         | OpKind::DraftSelect => panic!(
