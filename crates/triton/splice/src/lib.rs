@@ -3706,11 +3706,14 @@ mod production_ktir_dump {
         // ...plus the walk at granite-3.1-2b's own pool — `max_position_embeddings` 131072 in 2048
         // pages — decoding over the whole of it and a prompt chunk walking four pages, so the card
         // compile is checked at the extents a bake states, not only at a toy pool.
-        for (name, mq, blocks, pages) in [
-            ("paged_attn_decode", 1i128, 4i128, 4i128),
-            ("paged_attn_prefill", 64, 1, 4),
-            ("paged_attn_decode_pool", 1, 2048, 2048),
-            ("paged_attn_prefill_walk", 64, 4, 2048),
+        for (name, mq, blocks, pages, hd) in [
+            ("paged_attn_decode", 1i128, 4i128, 4i128, 64i128),
+            ("paged_attn_prefill", 64, 1, 4, 64),
+            ("paged_attn_decode_pool", 1, 2048, 2048, 64),
+            ("paged_attn_prefill_walk", 64, 4, 2048, 64),
+            // granite-3.1-8b's head dim: a kv-head slab is two sticks wide.
+            ("paged_attn_decode_hd128", 1, 4, 4, 128),
+            ("paged_attn_prefill_hd128", 64, 4, 4, 128),
         ] {
             let decode = mq == 1;
             let mut ptrs: Vec<(&str, &str)> = vec![
@@ -3728,7 +3731,7 @@ mod production_ktir_dump {
                 ("NUM_TOKENS", Val::Int(mq)),
                 ("NUM_HEADS", Val::Int(32)),
                 ("NUM_KV_HEADS", Val::Int(8)),
-                ("HEAD_SIZE", Val::Int(64)),
+                ("HEAD_SIZE", Val::Int(hd)),
                 ("BLOCK_SIZE", Val::Int(i128::from(PAGE_SLOTS))),
                 ("NUM_PAGES", Val::Int(pages)),
                 ("NUM_BLOCKS", Val::Int(blocks)),
@@ -3975,6 +3978,8 @@ mod production_ktir_dump {
             | "paged_attn_prefill"
             | "paged_attn_decode_pool"
             | "paged_attn_prefill_walk"
+            | "paged_attn_decode_hd128"
+            | "paged_attn_prefill_hd128"
             | "batched_decode"
             | "batched_decode_chunks"
             | "batched_decode_floor" => Program::PagedAttn,
@@ -4226,6 +4231,11 @@ mod walk_on_the_card {
     use ktir_superdsc::emit::loop_fold::{WalkTrips, flatten};
 
     fn walk(mq: i128, blocks: i128) -> KtirNode {
+        walk_at(mq, blocks, 64)
+    }
+
+    /// [`walk`] at head dim `hd`.
+    fn walk_at(mq: i128, blocks: i128, hd: i128) -> KtirNode {
         let decode = mq == 1;
         let row = if decode {
             attn_decode_row()
@@ -4254,7 +4264,7 @@ mod walk_on_the_card {
             ("NUM_TOKENS", mq),
             ("NUM_HEADS", 32),
             ("NUM_KV_HEADS", 8),
-            ("HEAD_SIZE", 64),
+            ("HEAD_SIZE", hd),
             ("BLOCK_SIZE", i128::from(PAGE_SLOTS)),
             ("NUM_PAGES", 2048),
             ("NUM_BLOCKS", blocks),
@@ -4481,6 +4491,136 @@ mod walk_on_the_card {
                 "mq={mq}: the epilogue runs once"
             );
         }
+    }
+
+    /// ⭐ A HEAD TWO STICKS WIDE (granite-3.1-8b's 128): a gathered page read `[KV, BLOCK, 128]` is
+    /// permuted per kv head, inside the relaunched body — block `b` read and written at its own base
+    /// `b · BLOCK · 128` — into the blocks the batched transpose and the PV contraction read one at a
+    /// time. The query row is permuted once into the stick-major `[KV·G, 128]` before the walk, and
+    /// the output back to its `[1, H·128]` row after it, which the scatter then writes.
+    #[test]
+    fn a_two_stick_head_permutes_each_kv_heads_page() {
+        let node = walk_at(1, 4, 128);
+        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+        allocate_paged_cache(&node, &layout).expect("the cache allocates");
+        let mut sym = 0i64;
+        let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+            .unwrap_or_else(|e| panic!("the hd128 walk lowers: {}", e.message));
+        let block = PAGE_SLOTS * 128;
+        let mut paged: Vec<(String, u32)> = Vec::new();
+        for e in &ops {
+            let Some(rest) = e.op_name.strip_prefix("permute") else {
+                continue;
+            };
+            match rest.split_once("_o") {
+                Some(("", _)) => assert!(
+                    e.walk.is_none(),
+                    "{}: a whole-buffer permute is the query's or the output's, outside the body",
+                    e.op_name
+                ),
+                Some((b, dst)) => {
+                    let b: u32 = b.parse().expect("a block index");
+                    assert!(
+                        e.walk.is_some(),
+                        "{}: a page permute is in the body",
+                        e.op_name
+                    );
+                    for a in &e.arg_bindings {
+                        assert_eq!(a.offset_elems, b * block, "{}: {}", e.op_name, a.buffer);
+                    }
+                    paged.push((dst.to_string(), b));
+                }
+                None => panic!("{}: not a permute's name", e.op_name),
+            }
+        }
+        let mut dsts: Vec<&str> = paged.iter().map(|(d, _)| d.as_str()).collect();
+        dsts.sort_unstable();
+        dsts.dedup();
+        assert_eq!(dsts.len(), 2, "the K page and the V page: {paged:?}");
+        for d in dsts {
+            let mut blocks: Vec<u32> = paged
+                .iter()
+                .filter(|(x, _)| x == d)
+                .map(|&(_, b)| b)
+                .collect();
+            blocks.sort_unstable();
+            assert_eq!(blocks, (0..8).collect::<Vec<_>>(), "one per kv head: t{d}");
+        }
+        assert_eq!(
+            ops.iter()
+                .filter(|e| e.op_name.starts_with("permute_o"))
+                .count(),
+            2,
+            "the query row in, the output row out"
+        );
+        assert!(
+            ops.iter().any(|e| e.op_name.starts_with("scatter")),
+            "the output row is scattered to its query row"
+        );
+    }
+
+    /// ⛔ A PAGE IN BLOCKS IS READ ONLY AS BLOCKS. Read `[KV, BLOCK, 128]`, a page lands as its kv
+    /// heads' stick-major blocks one after another — the frame a batched transpose and a batched
+    /// contraction's kernel take a block of at its base, and not the flat frame any other op reads.
+    /// An elementwise op over two such pages is refused by name, not lowered at the flat frame's
+    /// addresses.
+    #[test]
+    fn an_elementwise_read_of_a_page_in_blocks_is_refused() {
+        const SRC: &str = r#"
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
+    k_desc = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES, 8 * 64 * 128],
+                                       strides=[8 * 64 * 128, 1], block_shape=[1, 8 * 64 * 128])
+    v_desc = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES, 8 * 64 * 128],
+                                       strides=[8 * 64 * 128, 1], block_shape=[1, 8 * 64 * 128])
+    rows = tl.make_tensor_descriptor(out, shape=[8 * 64, 128], strides=[128, 1],
+                                     block_shape=[8 * 64, 128])
+    k = tl.reshape(k_desc.load([tl.load(k_index), 0]), [8, 64, 128])
+    v = tl.reshape(v_desc.load([tl.load(v_index), 0]), [8, 64, 128])
+    rows.store([0, 0], tl.reshape(k + v, [8 * 64, 128]))
+"#;
+        let mut signature = HashMap::new();
+        let mut constexprs = HashMap::new();
+        for (p, ty) in [
+            ("k_index", "*i32"),
+            ("v_index", "*i32"),
+            ("k_pages", "*fp16"),
+            ("v_pages", "*fp16"),
+            ("out", "*fp16"),
+        ] {
+            signature.insert(p.to_string(), ArgSpec::parse(ty).expect("spec"));
+        }
+        signature.insert("NUM_PAGES".to_string(), ArgSpec::Constexpr);
+        constexprs.insert("NUM_PAGES".to_string(), Val::Int(4));
+        let spec = KernelSpec {
+            kernel: "two_pages".to_string(),
+            signature,
+            constexprs,
+            file: "two_pages.py".to_string(),
+        };
+        let module = compile_kernel(SRC, &spec, &[1]).expect("the kernel compiles");
+        let node =
+            triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the program mints");
+        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the program places");
+        allocate_paged_cache(&node, &layout).expect("the cache allocates");
+        let mut sym = 0i64;
+        let Err(e) = ktir_superdsc::emit::whole_function::lower_function(
+            &node,
+            Some(&layout),
+            &mut sym,
+            None,
+        ) else {
+            panic!("an elementwise add over two pages in blocks lowered");
+        };
+        assert!(
+            e.message.contains("batch blocks one after another"),
+            "{}",
+            e.message
+        );
     }
 
     /// A one-block walk states no loop — the front end promotes a one-trip `scf.for` to its body —

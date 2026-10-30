@@ -803,7 +803,12 @@ pub fn stick_permute_opspec(
             )
             .map_err(|e| e.0)?
             .with_df(df)
-            .with_row_blocked(matches!(df, Df::Fp32)),
+            .with_row_blocked(matches!(df, Df::Fp32))
+            // The stick-major side is iterated by its stick columns (`y` outermost).
+            .with_frame(match order {
+                SprayOrder::Outer => crate::superdsc_opspec::ViewFrame::StickColumns,
+                SprayOrder::Inner => crate::superdsc_opspec::ViewFrame::Own,
+            }),
         ))
     };
     let args = vec![arg(true, src, from)?, arg(false, dst, to)?];
@@ -821,13 +826,16 @@ pub fn stick_permute_opspec(
     })
 }
 
-/// One stick permute's extents: `rows` rows of `sticks` sticks of `df`, in `direction`.
+/// One stick permute's extents: `rows` rows of `sticks` sticks of `df`, in `direction`, read from
+/// `src_elems` elements into the source and written from `dst_elems` into the destination.
 #[derive(Clone, Copy, Debug)]
 pub struct StickPermuteSpec {
     pub rows: u32,
     pub sticks: u32,
     pub df: Df,
     pub direction: StickPermute,
+    pub src_elems: u32,
+    pub dst_elems: u32,
 }
 
 /// [`stick_permute_opspec`] + `emit_sdsc_tiled`.
@@ -840,11 +848,19 @@ pub fn assemble_stick_permute(
         sticks,
         df,
         direction,
+        src_elems,
+        dst_elems,
     }: StickPermuteSpec,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp, String> {
-    let op = stick_permute_opspec(src, dst, rows, sticks, df, direction)?;
+    let mut op = stick_permute_opspec(src, dst, rows, sticks, df, direction)?;
+    if src_elems > 0 {
+        op.args[0].set_offset_elems(src_elems);
+    }
+    if dst_elems > 0 {
+        op.args[1].set_offset_elems(dst_elems);
+    }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .map_err(|e| format!("assemble_stick_permute {op_name}: {e}"))
@@ -1473,5 +1489,81 @@ mod scatter_tests {
         )
         .expect_err("33 entries do not fit one index stick");
         assert!(e.contains("ONE 32-entry stick"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod stick_permute_tests {
+    use super::*;
+    use crate::place::{PlaceId, act_name};
+    use crate::sdsc_abstract::StickLayout;
+
+    fn layout() -> BundleLayout {
+        let l = BundleLayout::default();
+        l.synth(PlaceId::Act(1), &[32, 128]);
+        l.synth(PlaceId::Act(2), &[64, 64]);
+        l
+    }
+
+    fn spec(direction: StickPermute) -> StickPermuteSpec {
+        StickPermuteSpec {
+            rows: 32,
+            sticks: 2,
+            df: Df::Fp16,
+            direction,
+            src_elems: 0,
+            dst_elems: 0,
+        }
+    }
+
+    /// ⭐ THE STICK-MAJOR SIDE SPEAKS IN ITS TENSOR'S FRAME. A `[32, 128]` value its producer declared
+    /// stick-major is read by its stick columns, `[2, 32, 64]` — a view the authority would class
+    /// as the row-major `[2, 2048]`, the scramble it exists to refuse — so the permute derives the
+    /// tensor's own frame from that view, and the authority holds it to the producer's.
+    #[test]
+    fn the_stick_major_side_declares_its_tensors_frame() {
+        let l = layout();
+        let (src, dst) = (act_name(1), act_name(2));
+        l.declare_arrangement(&src, StickLayout::row_blocked(32, 128))
+            .expect("the producer's stick-major [32, 128]");
+        let mut sym = 0i64;
+        assemble_stick_permute(
+            "permute_o2",
+            &src,
+            &dst,
+            spec(StickPermute::StickToRow),
+            &mut sym,
+            Some(&l),
+        )
+        .expect("the permute reads the producer's frame");
+        assert!(
+            l.arrangements.borrow()[&dst].addr_eq(&StickLayout::row_blocked(64, 64)),
+            "the row-major side is its own frame, one-stick rows"
+        );
+        // The control: the view's own frame, stated for the same tensor, is the scramble.
+        assert!(
+            l.declare_arrangement(&src, StickLayout::flat(2, 2048))
+                .is_err(),
+            "the stick-column view in its own frame conflicts with the producer's"
+        );
+    }
+
+    /// A permute's stick-major OUTPUT states the frame its consumers read: stick-major `[32, 128]`.
+    #[test]
+    fn the_stick_major_output_is_declared_stick_major() {
+        let l = layout();
+        let (rows, out) = (act_name(2), act_name(1));
+        let mut sym = 0i64;
+        assemble_stick_permute(
+            "permute_o1",
+            &rows,
+            &out,
+            spec(StickPermute::RowToStick),
+            &mut sym,
+            Some(&l),
+        )
+        .expect("the permute writes the stick-major block");
+        l.declare_arrangement(&out, StickLayout::row_blocked(32, 128))
+            .expect("a consumer reading [32, 128] stick-major agrees");
     }
 }
