@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE TWENTY-THREE CONFIGURATIONS, STATED ONCE.
+//! THE TWENTY-FOUR CONFIGURATIONS, STATED ONCE.
 //!
 //! A "configuration" is a `.py` fixture plus the `tl.constexpr` values and the launch grid it is
 //! compiled at. Three consumers need that tuple: `examples/bake_py` (the dxp bake),
@@ -1183,7 +1183,7 @@ mod tests {
         }
         assert_eq!(
             super::ALL.len(),
-            23,
+            24,
             "a configuration was added or removed: update ALL (and the module title) deliberately"
         );
     }
