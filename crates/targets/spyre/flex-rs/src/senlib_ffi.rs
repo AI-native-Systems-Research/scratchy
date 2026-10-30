@@ -1085,3 +1085,376 @@ pub fn get_dmabuf(bar: i32, offset: u64, size: u64) -> Result<i32, String> {
         Err(last_shim_error())
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+//  The XSEG / wdone register doors + the hal SBF wire doors (r5-wire port)
+// ════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Two new door families behind the same sealed pattern (externs
+// module-private, `Result`-returning wrappers the only way in):
+//
+//   - the PfInterface register doors of the A.2 extension
+//     (`cxx-shim/senlib_ffi.cpp`'s `flex_senlib_{write,read}_xseg`/
+//     `read_wdone`/`check_and_clear_rdma_status`) — the on-device XSEG[SID]
+//     translation table and wdone counters;
+//   - the hal SBF wire doors of `cxx-shim/hal_sbf.cpp` (A.1) — the R5
+//     control-block section, the Rdma12 unicast-send DMO section, the
+//     Rdma10 wdone-wait DMI section, and the R5 appdata decode.
+//
+// The semantic face over the hal doors lives in `crate::hal_sbf` (the
+// control_blocks family): THIS module carries only the raw C-ABI-shaped
+// wrappers. The proprietary line (see both shim files' own headers): no hal
+// field map, bit range, or packing logic appears in this file — the wrappers
+// hand the shim semantic scalars and read back finished words.
+
+/// The semantic mirror of the shim's `FlexHalR5AppData` — the R5 appdata arm
+/// of a response block decoded to plain fields, no bit layout. Field order,
+/// names, and meanings are the C struct's own contract
+/// (`cxx-shim/hal_sbf.cpp`); the Rust mirror must stay `#[repr(C)]`-identical
+/// to it, and a size-assert test pins that.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HalR5AppData {
+    /// Header: the R5 section's CB type, by the header's own meaning.
+    pub cb_type: u64,
+    /// Header: the completing worker core.
+    pub wcore_compl: u64,
+    /// Header: the worker mask.
+    pub worker_mask: u64,
+    /// Header: the reporting core id.
+    pub core_id: u64,
+    /// Header: the completion message.
+    pub completion_msg: u64,
+    /// Header: the error type (BEU / EXCEPTION), by value.
+    pub error_type: u64,
+    /// Header: the job condition code.
+    pub job_cc: u64,
+    /// Branch target data (kills and BEU).
+    pub branch_target_data: u64,
+    /// BEU error: the value.
+    pub beu_value: u64,
+    /// BEU error: the cause.
+    pub beu_cause: u64,
+    /// BEU error: the accrued status.
+    pub beu_accrued: u64,
+    /// R5 exception: the interrupt flag.
+    pub interrupt_flag: u64,
+    /// R5 exception: the mcause code.
+    pub mcause_code: u64,
+    /// R5 exception: the mip register.
+    pub mip: u64,
+    /// R5 exception: the mepc register.
+    pub mepc: u64,
+    /// R5 exception: the mtval register.
+    pub mtval: u64,
+    /// Raw dwords, verbatim as the response block carried them — the door's
+    /// own echo for diagnostics.
+    pub dw0: u64,
+    /// Raw dword 1.
+    pub dw1: u64,
+    /// Raw dword 2.
+    pub dw2: u64,
+    /// Raw dword 3.
+    pub dw3: u64,
+}
+
+unsafe extern "C" {
+    /// `cxx-shim/senlib_ffi.cpp`: programs the on-device XSEG[SID]
+    /// translation-table entry for `sid`. Returns 0 on success, -1 if the
+    /// write did not reach senlib. The value it takes is the composed xseg
+    /// word the hal_sbf send encoder produces — the SAME word the vendor's
+    /// T-send preamble delivers to the table (one compose, two destinations;
+    /// submitP2PRdma.cpp:41-50), which is why the door is 32 bits wide.
+    fn flex_senlib_write_xseg(sid: u8, xseg: u32) -> i32;
+
+    /// `cxx-shim/senlib_ffi.cpp`: reads back the XSEG[SID] entry for `sid`
+    /// (pf_interface.hpp:123 `uint32_t read_xseg(uint8_t)`). Returns 0 on
+    /// success, -1 on shim failure.
+    fn flex_senlib_read_xseg(sid: u8, out_xseg: *mut u32) -> i32;
+
+    /// `cxx-shim/senlib_ffi.cpp`: reads the on-device write-done counter for
+    /// `sid` (pf_interface.hpp:121 `uint32_t read_wdone(uint8_t, bool)`).
+    /// Returns 0 on success, -1 on shim failure.
+    fn flex_senlib_read_wdone(sid: u8, out_val: *mut u32) -> i32;
+
+    /// `cxx-shim/senlib_ffi.cpp`: checks and clears the RDMA error status
+    /// (pf_interface.hpp:118 `int check_and_clear_rdma_status()`). Returns
+    /// the senlib status pass-through; -1 doubles as the shim's own failure
+    /// sentinel (told apart below by whether the shim recorded an error).
+    fn flex_senlib_check_and_clear_rdma_status() -> i32;
+
+    /// `cxx-shim/hal_sbf.cpp`: the calling thread's most recent hal_sbf
+    /// error (`""` if none). Thread-local, owned by the shim, valid until
+    /// this thread's next failed hal_sbf call.
+    fn flex_hal_last_error() -> *const c_char;
+
+    /// `cxx-shim/hal_sbf.cpp`: the R5 control-block section (1 word) from
+    /// semantic scalars — `mode` is the shim's own ordinal protocol (see
+    /// `crate::hal_sbf::R5SectionMode`), `core_mask` the shim door's own
+    /// core-selection mask, the address `(segment, offset_bytes)`. Returns 0
+    /// on success, -1 on refusal (reason via `flex_hal_last_error`).
+    fn flex_hal_r5_section_encode(
+        mode: u32,
+        core_mask: u64,
+        segment: u64,
+        offset_bytes: u64,
+        out_word: *mut u64,
+    ) -> i32;
+
+    /// `cxx-shim/hal_sbf.cpp`: the Rdma12 RDMA_SINGLECAST send DMO section
+    /// (2 words) — the vendor scheduler's ten-setter unicast shape from
+    /// semantic scalars. Returns 0 on success, -1 on refusal.
+    fn flex_hal_rdma12_unicast_send_encode(
+        sid: u64,
+        tid: u64,
+        length_bytes: u64,
+        src_segment: u64,
+        src_offset_bytes: u64,
+        dest_remote_base_bytes: u64,
+        first: u8,
+        last: u8,
+        sync: u8,
+        xsegv: u8,
+        out_words: *mut u64,
+    ) -> i32;
+
+    /// `cxx-shim/hal_sbf.cpp`: the Rdma10 RDMA_WDONE_BARRIER wait DMI
+    /// section (2 words) from the wdone sid list. Returns 0 on success, -1
+    /// on refusal.
+    fn flex_hal_rdma10_wdone_wait_encode(
+        sids: *const u64,
+        sid_count: u32,
+        sync: u8,
+        out_words: *mut u64,
+    ) -> i32;
+
+    /// `cxx-shim/hal_sbf.cpp`: decodes the R5 appdata arm (the four APP
+    /// section words of a response block) into the semantic mirror above.
+    /// Returns 0 on success, -1 on refusal.
+    fn flex_hal_r5_appdata_decode(app_words: *const u64, out: *mut HalR5AppData) -> i32;
+}
+
+/// The calling thread's most recent hal_sbf error message, for attaching to
+/// a Rust-side error. Empty if the shim has not recorded one. The hal doors
+/// keep their own channel (separate from `last_shim_error`) so a senlib
+/// failure never masquerades as a hal-door refusal.
+pub fn last_hal_error() -> String {
+    // SAFETY: the shim returns a NUL-terminated, thread-local buffer that
+    // stays valid until this thread's next failed hal_sbf call; we copy it
+    // immediately.
+    unsafe {
+        let p = flex_hal_last_error();
+        if p.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// Safe wrapper: program the on-device XSEG[SID] translation-table entry for
+/// `sid` with `xseg` — the composed xseg word the hal_sbf send encoder
+/// produces (the same word the vendor's T-send preamble delivers to the
+/// table). THE host door for the receiver-side table this crate's F-sends
+/// land through.
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the write did not reach senlib.
+pub fn write_xseg(sid: u8, xseg: u32) -> Result<(), String> {
+    // SAFETY: plain integer arguments; the shim checks its own runtime
+    // state before touching senlib.
+    let rc = unsafe { flex_senlib_write_xseg(sid, xseg) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper: read back the XSEG[SID] translation-table entry for `sid`.
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the read did not reach senlib.
+pub fn read_xseg(sid: u8) -> Result<u32, String> {
+    let mut xseg = 0u32;
+    // SAFETY: `xseg` is a valid out-pointer for the duration of the call.
+    let rc = unsafe { flex_senlib_read_xseg(sid, &mut xseg) };
+    if rc == 0 {
+        Ok(xseg)
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper: read the on-device write-done counter for `sid`.
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the read did not reach senlib.
+pub fn read_wdone(sid: u8) -> Result<u32, String> {
+    let mut val = 0u32;
+    // SAFETY: `val` is a valid out-pointer for the duration of the call.
+    let rc = unsafe { flex_senlib_read_wdone(sid, &mut val) };
+    if rc == 0 {
+        Ok(val)
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper: check and clear the RDMA error status. The returned value
+/// is senlib's own status, passed through — except that the shim's failure
+/// sentinel (-1, with an error recorded on the shim's channel) is reported
+/// as `Err` instead, so a real -1 status and a failed call cannot be
+/// conflated by a caller that only inspects the number.
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the call did not reach senlib.
+pub fn check_and_clear_rdma_status() -> Result<i32, String> {
+    // SAFETY: no arguments; the shim checks its own runtime state.
+    let rc = unsafe { flex_senlib_check_and_clear_rdma_status() };
+    if rc == -1 {
+        let err = last_shim_error();
+        if !err.is_empty() {
+            return Err(err);
+        }
+    }
+    Ok(rc)
+}
+
+/// Safe wrapper: the R5 control-block section word from semantic scalars.
+/// The mode/core-mask semantics are the shim door's own protocol — see
+/// `crate::hal_sbf::r5_section`, the semantic face over this door.
+///
+/// # Errors
+/// Returns `Err` with the shim's message on any refused input (the shim
+/// never clamps and never invents a value).
+pub fn hal_r5_section_encode(
+    mode: u32,
+    core_mask: u64,
+    segment: u64,
+    offset_bytes: u64,
+) -> Result<u64, String> {
+    let mut word = 0u64;
+    // SAFETY: `word` is a valid out-pointer for the duration of the call;
+    // every argument is a plain scalar.
+    let rc = unsafe { flex_hal_r5_section_encode(mode, core_mask, segment, offset_bytes, &mut word) };
+    if rc == 0 {
+        Ok(word)
+    } else {
+        Err(last_hal_error())
+    }
+}
+
+/// Safe wrapper: the Rdma12 RDMA_SINGLECAST send DMO section (2 words) from
+/// semantic scalars — the vendor scheduler's ten-setter unicast shape, all
+/// bit packing inside the shim. The protocol bits (`first`/`last`/`sync`/
+/// `xsegv`) are the caller's; the F-send law that governs them is Rust's and
+/// lives at the semantic face (`crate::hal_sbf::rdma12_unicast_send`).
+///
+/// # Errors
+/// Returns `Err` with the shim's message on any refused input.
+pub fn hal_rdma12_unicast_send_encode(
+    sid: u64,
+    tid: u64,
+    length_bytes: u64,
+    src_segment: u64,
+    src_offset_bytes: u64,
+    dest_remote_base_bytes: u64,
+    first: bool,
+    last: bool,
+    sync: bool,
+    xsegv: bool,
+) -> Result<[u64; 2], String> {
+    let mut words = [0u64; 2];
+    // SAFETY: `words` is a valid out-pointer for the duration of the call;
+    // every argument is a plain scalar.
+    let rc = unsafe {
+        flex_hal_rdma12_unicast_send_encode(
+            sid,
+            tid,
+            length_bytes,
+            src_segment,
+            src_offset_bytes,
+            dest_remote_base_bytes,
+            first as u8,
+            last as u8,
+            sync as u8,
+            xsegv as u8,
+            words.as_mut_ptr(),
+        )
+    };
+    if rc == 0 {
+        Ok(words)
+    } else {
+        Err(last_hal_error())
+    }
+}
+
+/// Safe wrapper: the Rdma10 RDMA_WDONE_BARRIER wait DMI section (2 words)
+/// from the wdone sid list — the bitmask is composed inside the shim.
+///
+/// # Errors
+/// Returns `Err` with the shim's message on any refused input.
+pub fn hal_rdma10_wdone_wait_encode(sids: &[u64], sync: bool) -> Result<[u64; 2], String> {
+    let mut words = [0u64; 2];
+    // SAFETY: `sids` is a valid slice for the duration of the call (its
+    // length is passed alongside, so the shim cannot read past it);
+    // `words` is a valid out-pointer.
+    let rc = unsafe {
+        flex_hal_rdma10_wdone_wait_encode(
+            sids.as_ptr(),
+            sids.len() as u32,
+            sync as u8,
+            words.as_mut_ptr(),
+        )
+    };
+    if rc == 0 {
+        Ok(words)
+    } else {
+        Err(last_hal_error())
+    }
+}
+
+/// Safe wrapper: decode the R5 appdata arm of a response block (the four
+/// APP section words, exactly as the response block carries them) into the
+/// semantic mirror. The arm is only meaningful when the return section says
+/// RB_ERROR with a QGI/QGI_NO_DIAG locator — that gating stays with the
+/// caller (`control_block_wire::ResponseBlockWire` already decodes the
+/// return section); this door only translates the four words into
+/// semantics.
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the decode refused its input.
+pub fn hal_r5_appdata_decode(app_words: &[u64; 4]) -> Result<HalR5AppData, String> {
+    let mut out = HalR5AppData {
+        cb_type: 0,
+        wcore_compl: 0,
+        worker_mask: 0,
+        core_id: 0,
+        completion_msg: 0,
+        error_type: 0,
+        job_cc: 0,
+        branch_target_data: 0,
+        beu_value: 0,
+        beu_cause: 0,
+        beu_accrued: 0,
+        interrupt_flag: 0,
+        mcause_code: 0,
+        mip: 0,
+        mepc: 0,
+        mtval: 0,
+        dw0: 0,
+        dw1: 0,
+        dw2: 0,
+        dw3: 0,
+    };
+    // SAFETY: `app_words` is a valid 4-word array for the duration of the
+    // call; `out` is a valid out-pointer of the shim's own #[repr(C)]
+    // mirror type.
+    let rc = unsafe { flex_hal_r5_appdata_decode(app_words.as_ptr(), &mut out) };
+    if rc == 0 {
+        Ok(out)
+    } else {
+        Err(last_hal_error())
+    }
+}
