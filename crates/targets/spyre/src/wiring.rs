@@ -1772,6 +1772,28 @@ pub struct Wirings {
     pub prefill: Option<Wiring>,
 }
 
+/// How each rank loads a source — the shared analysis's slice law, re-exported so the tokens
+/// `#[forward]` emits name one path and a loader slices through
+/// `scratchy_subtile::tensor_parallel::slice_source`, the one implementation of it.
+pub use scratchy_subtile::tensor_parallel::SourceShard;
+
+/// ⭐ ONE SHARDED WORLD'S FORWARD, AS `#[forward]` BAKED IT — what a session running as one rank
+/// of `world` loads instead of the one-rank wiring.
+///
+/// ⛔ THE WORLD TRAVELS WITH ITS BUNDLE. A session constructed for one world must not run a bundle
+/// baked for another: the shapes it stages, the window its consumes read and the peer it sends to
+/// are all the world's. Selecting a forward is matching `world` against the session's
+/// `TpIdentity::world`, never an index or a flag.
+pub struct TpForward {
+    pub world: crate::bundle_code::collective::TpWorld,
+    /// The rank-local decode bundle — the same on every rank (one bake serves the world).
+    pub decode: crate::manifest::KtirBundleData,
+    /// Its launch wiring, numbered by the rank-local forward's own tensor ids.
+    pub wiring: Wiring,
+    /// Per source of the one-rank forward (same indices): the slice each rank loads.
+    pub sources: &'static [SourceShard],
+}
+
 impl Wiring {
     /// Element count of tensor `id`.
     #[inline]

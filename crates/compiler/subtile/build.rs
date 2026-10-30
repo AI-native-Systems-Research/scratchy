@@ -31,6 +31,12 @@ fn main() {
 /// One model's attention geometry as its config declares it: query heads, kv heads, head dim.
 type Geometry = (u64, u64, u64);
 
+/// The tensor-parallel worlds spyre bakes — `ktir_superdsc::collective::SPYRE_TP_WORLDS`, stated
+/// here because a build script cannot name a spyre crate without making every metal and cuda build
+/// compile one. It is written into the generated file, and `model_geometry.rs` const-asserts it
+/// equal to the authority under `spyre`, so the two cannot drift.
+const SPYRE_TP_WORLDS: &[u32] = &[1, 2];
+
 /// Write `$OUT_DIR/config_geometry.rs` — the literal geometries `src/model_geometry.rs` turns into
 /// const-generic instantiations.
 fn emit_config_geometry() {
@@ -142,6 +148,20 @@ fn emit_config_geometry() {
             }
         }
     }
+    // ⭐ AND EACH ONE AS A TENSOR-PARALLEL RANK RUNS IT. Sharded `W` ways, an attention whose query
+    // and kv heads both divide by `W` runs on every rank at `(nqh / W, nkvh / W, head_dim)` —
+    // exactly the geometry `tensor_parallel::shard` mints for the rank-local forward, under the same
+    // divisibility test — and the device layout is monomorphised over THAT geometry, which no config
+    // states. A sharded attention whose rank geometry had no arm would be refused at the door.
+    let declared = geometries.clone();
+    for &(nqh, nkvh, hd) in &declared {
+        for &w in SPYRE_TP_WORLDS.iter().filter(|&&w| w > 1) {
+            let w = u64::from(w);
+            if nqh % w == 0 && nkvh % w == 0 && (nqh / w) % (nkvh / w) == 0 {
+                geometries.push((nqh / w, nkvh / w, hd));
+            }
+        }
+    }
     geometries.sort_unstable();
     geometries.dedup();
     head_dims.sort_unstable();
@@ -164,6 +184,14 @@ fn emit_config_geometry() {
     // ungated macro would be `unused_macros` on a metal/cuda build and fail `-D warnings`. The
     // attribute is written into the generated file rather than decided here, so the gate is the
     // crate's own `cfg(feature = "spyre")`, read where the file is compiled.
+    out.push_str(
+        "/// The tensor-parallel worlds the rank geometries below were derived for (pinned equal to\n\
+         /// `ktir_superdsc::collective::SPYRE_TP_WORLDS` in `model_geometry.rs`).\n",
+    );
+    out.push_str("#[cfg(feature = \"spyre\")]\n");
+    out.push_str(&format!(
+        "pub const SPYRE_TP_WORLDS_SEEN: &[u32] = &{SPYRE_TP_WORLDS:?};\n\n"
+    ));
     out.push_str("#[cfg(feature = \"spyre\")]\n");
     out.push_str("macro_rules! for_each_config_attn_geometry {\n");
     out.push_str("    ($emit:ident) => {\n        $emit! {\n");
