@@ -600,8 +600,9 @@ pub fn indirect_load(
         ));
     }
 
-    let (idx_values, idx_unique_sticks) = resolve_idx_reads(ctx, iat)?;
-    let coords = build_indirect_coords(iat, &idx_values)?;
+    let points = enumerate_in_vso_order(iat);
+    let (idx_values, idx_unique_sticks) = resolve_idx_reads(ctx, iat, &points)?;
+    let coords = build_indirect_coords(iat, &idx_values, &points)?;
 
     let out_shape = result_shape.unwrap_or_else(|| iat.shape.clone());
     let tile_ref = iat.parent_ref.to_tile_ref();
@@ -633,8 +634,9 @@ pub fn indirect_store(
         ));
     }
 
-    let (idx_values, idx_unique_sticks) = resolve_idx_reads(ctx, iat)?;
-    let coords = build_indirect_coords(iat, &idx_values)?;
+    let points = enumerate_in_vso_order(iat);
+    let (idx_values, idx_unique_sticks) = resolve_idx_reads(ctx, iat, &points)?;
+    let coords = build_indirect_coords(iat, &idx_values, &points)?;
     let tile_ref = iat.parent_ref.to_tile_ref();
     let data_sticks = store_data(ctx, tile, &tile_ref, Some(&coords))?;
     Ok(data_sticks + idx_unique_sticks)
@@ -670,12 +672,15 @@ fn enumerate_in_vso_order(iat: &IndirectAccessTile) -> Vec<Vec<i64>> {
 /// Legacy / structural callers may leave `idx_exprs` empty (the identity case
 /// the `port_indirect_access` tests exercise): then the point itself addresses
 /// the view via `Σ pt[d] * stride[d]`, the prior behaviour.
+///
+/// Each distinct index address is READ ONCE: a slab gather's every point reads the same table entry
+/// (its indirect dim has extent 1), so the per-point reads were one memory lookup per element of
+/// the slab for a single value.
 fn resolve_idx_reads(
     ctx: &CoreContext,
     iat: &IndirectAccessTile,
+    points: &[Vec<i64>],
 ) -> Result<(std::collections::HashMap<usize, Vec<i64>>, usize), String> {
-    let points = enumerate_in_vso_order(iat);
-
     // The distinct index views used by indirect dims, in first-seen order.
     let mut view_idxs: Vec<usize> = Vec::new();
     for sub in &iat.dim_subscripts {
@@ -705,12 +710,13 @@ fn resolve_idx_reads(
             None
         };
         let mut sticks: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut read_at: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
 
         // For every enumerated point (and every indirect dim that uses this
         // view), read one index value. Indirect dims sharing a view append in
         // pt-major, dim-minor order — matching build_indirect_coords.
         let mut values: Vec<i64> = Vec::new();
-        for pt in &points {
+        for pt in points {
             for sub in &iat.dim_subscripts {
                 if let DimSubscript::Indirect { view, idx_exprs } = sub {
                     if *view != iv_idx {
@@ -735,9 +741,11 @@ fn resolve_idx_reads(
                     if let Some(sb) = stick_bytes {
                         sticks.insert(byte_addr / sb);
                     }
-                    let raw = read_raw(ctx, space, byte_addr, bpe);
-                    let v = decode(&raw, iv.dtype, 1)[0];
-                    values.push(v as i64);
+                    let v = *read_at.entry(byte_addr).or_insert_with(|| {
+                        let raw = read_raw(ctx, space, byte_addr, bpe);
+                        decode(&raw, iv.dtype, 1)[0] as i64
+                    });
+                    values.push(v);
                 }
             }
         }
@@ -758,13 +766,13 @@ fn resolve_idx_reads(
 fn build_indirect_coords(
     iat: &IndirectAccessTile,
     idx_values: &std::collections::HashMap<usize, Vec<i64>>,
+    points: &[Vec<i64>],
 ) -> Result<Vec<Vec<i64>>, String> {
-    let points = enumerate_in_vso_order(iat);
     // Per-view consumption cursors (positional, in lockstep with resolve_idx_reads).
     let mut cursors: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
 
     let mut coords: Vec<Vec<i64>> = Vec::with_capacity(points.len());
-    for pt in &points {
+    for pt in points {
         let mut coord: Vec<i64> = Vec::with_capacity(iat.dim_subscripts.len());
         for sub in &iat.dim_subscripts {
             match sub {
@@ -981,11 +989,16 @@ pub fn load_data(
         coords,
         stick_bytes,
     );
-    let span = offsets.iter().copied().max().map(|m| m + 1).unwrap_or(1) as usize;
-    let raw = read_raw(ctx, space, tile_ref.base_ptr, span * bpe);
+    let (lo, span) = touched_span(ctx, space, tile_ref.base_ptr, &offsets, bpe);
+    let raw = read_raw(ctx, space, tile_ref.base_ptr + lo * bpe as i64, span * bpe);
     // Decode only the selected offsets — not the whole span (which can be ~18×
     // larger for strided accesses).
-    let gathered = decode_gather(&raw, &offsets, dtype);
+    let gathered = if lo == 0 {
+        decode_gather(&raw, &offsets, dtype)
+    } else {
+        let rebased: Vec<i64> = offsets.iter().map(|o| o - lo).collect();
+        decode_gather(&raw, &rebased, dtype)
+    };
 
     let out_shape = result_shape.unwrap_or_else(|| tile_ref.shape.clone());
     write_to_lx(ctx, &gathered, dtype);
@@ -1152,17 +1165,49 @@ pub fn store_data(
             offsets.len()
         ));
     }
-    let span = offsets.iter().copied().max().map(|m| m + 1).unwrap_or(1) as usize;
-    let raw = read_raw(ctx, space, tile_ref.base_ptr, span * bpe);
+    let (lo, span) = touched_span(ctx, space, tile_ref.base_ptr, &offsets, bpe);
+    let at = tile_ref.base_ptr + lo * bpe as i64;
+    let raw = read_raw(ctx, space, at, span * bpe);
     let mut flat = decode(&raw, dtype, span);
     // Scatter the C-order tile data into the span; last-writer-wins on coord
     // collisions (matches NumPy assignment).
     for (i, &o) in offsets.iter().enumerate() {
-        flat[o as usize] = tile_data[i];
+        flat[(o - lo) as usize] = tile_data[i];
     }
     let new_raw = encode(&flat, dtype);
-    write_raw(ctx, space, tile_ref.base_ptr, &new_raw);
+    write_raw(ctx, space, at, &new_raw);
     Ok(unique_sticks.unwrap_or(0))
+}
+
+/// The element span a slow-path access touches: `(first offset, element count)`. It starts at the
+/// FIRST offset the tile addresses, not at the view's base, whenever that whole span lies inside
+/// the view's own HBM allocation — a gather of page `p` of a paged KV pool, or a scatter into it,
+/// touches that page alone, and reading from the pool's base read every page below it. Anywhere
+/// else the span keeps its base at the view's (the read's zero-padding past an allocation is a
+/// property of the view's own allocation, so a span starting elsewhere could resolve a different
+/// one). The guard covers the WHOLE shifted span, not just its first byte: a grown allocation can
+/// swallow the base of the one placed after it ([`HBMSimulator::write_bytes`] resizes in place),
+/// and an address at or past that base resolves to the swallowed allocation — so a span reaching
+/// it must not shift.
+fn touched_span(
+    ctx: &CoreContext,
+    space: MemorySpace,
+    base_ptr: i64,
+    offsets: &[i64],
+    bpe: usize,
+) -> (i64, usize) {
+    let hi = offsets.iter().copied().max().unwrap_or(0);
+    let lo = offsets.iter().copied().min().unwrap_or(0);
+    let inside = lo > 0 && matches!(space, MemorySpace::Hbm) && {
+        let hbm = ctx.hbm.borrow();
+        hbm.allocation_len_at_base(base_ptr)
+            .is_some_and(|len| ((hi + 1) as usize) * bpe <= len)
+            // No other allocation base inside (base_ptr, base_ptr + (hi+1)·bpe): the shifted
+            // span's last byte, not just its first, must stay clear of a swallowed base.
+            && hbm.resolves_to_base(base_ptr, base_ptr + ((hi + 1) * bpe as i64) - 1)
+    };
+    let lo = if inside { lo } else { 0 };
+    (lo, (hi - lo + 1) as usize)
 }
 
 // ===========================================================================
@@ -1692,6 +1737,48 @@ mod tests {
         let coords = vec![vec![0, 0], vec![1, 1], vec![2, 2], vec![3, 3]];
         let tile = load_data(&mut ctx, &tr, Some(&coords), Some(vec![4])).unwrap();
         assert_eq!(tile.as_f32().to_vec(), vec![0.0, 5.0, 10.0, 15.0]);
+    }
+
+    #[test]
+    fn slow_paths_hit_the_grown_allocation_when_a_later_base_is_swallowed() {
+        let mut ctx = single_core_context();
+        // A (one stick), then B (the next stick).
+        let a_stick = ctx.hbm.borrow_mut().allocate(STICK_BYTES);
+        let b_stick = ctx.hbm.borrow_mut().allocate(STICK_BYTES);
+        let a = a_stick * STICK_BYTES;
+        let b = b_stick * STICK_BYTES;
+        // Grow A in place until its buffer covers B's whole stick: any address at
+        // or past B's base now resolves to B, not A (see `resolves_to_base`).
+        let grown_elems = ((b - a + STICK_BYTES) / 4) as usize;
+        let payload: Vec<u8> = (0..grown_elems)
+            .flat_map(|i| (1000.0 + i as f32).to_le_bytes())
+            .collect();
+        ctx.hbm.borrow_mut().write_bytes(a, &payload);
+
+        // A view based at A whose gather offsets start AT B's base: an unguarded
+        // span shift would read/write at B and resolve to B's buffer.
+        let b_elem = (b - a) / 4; // element offset of B's base within A's buffer
+        let m = hbm_memref(a_stick, vec![grown_elems], vec![1], DType::F32);
+        let tr = m.to_tile_ref();
+        let coords = vec![vec![b_elem], vec![b_elem + 1]];
+
+        let tile = load_data(&mut ctx, &tr, Some(&coords), Some(vec![2])).unwrap();
+        assert_eq!(
+            tile.as_f32().to_vec(),
+            vec![1000.0 + b_elem as f32, 1001.0 + b_elem as f32],
+            "the gather must read A's grown buffer, not B"
+        );
+
+        let tile = Tile::compute(vec![7.0, 8.0], DType::F32, vec![2]);
+        store_data(&mut ctx, &tile, &tr, Some(&coords)).unwrap();
+        let back = load_data(&mut ctx, &tr, Some(&coords), Some(vec![2])).unwrap();
+        assert_eq!(back.as_f32().to_vec(), vec![7.0, 8.0]);
+        // B's own allocation still holds its original zero bytes.
+        let (b_buf, _) = ctx.hbm.borrow().allocation_at(b).unwrap();
+        assert!(
+            b_buf.iter().all(|&x| x == 0),
+            "the scatter must not touch B"
+        );
     }
 
     // ---- store round trips ----
