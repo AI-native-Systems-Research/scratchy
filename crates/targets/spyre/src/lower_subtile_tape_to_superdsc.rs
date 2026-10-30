@@ -913,8 +913,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    emulator runs the paged step as KTIR over the cache tensors bound by tid, and a model whose
     //    pools outgrow one device region (`max_position_embeddings` pages of every layer) is refused
     //    by the address audit on the card it cannot fit, not on an emulator that never places them.
+    let mut pools: Vec<u32> = Vec::new();
     if cfg!(feature = "spyre-hw") {
-        let mut pools: Vec<u32> = Vec::new();
         for n in &ir.nodes {
             if let SubOp::AttnDecode { layout: kv, .. } = &n.op {
                 for t in [kv.cache_tensor(), kv.v_cache_tensor()] {
@@ -925,7 +925,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 }
             }
         }
-        for tid in pools {
+        for &tid in &pools {
             pack(tid, SegRole::Kv, &mut seg_bytes, &mut placements);
         }
     }
@@ -1508,7 +1508,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
             })
             .collect::<std::collections::BTreeMap<_, _>>(),
     );
-    Ok(BundleLayout {
+    let layout = BundleLayout {
         placements,
         ids,
         // The intermediate-tid cursor seeds LAZILY, on the first mint, above the highest
@@ -1585,7 +1585,13 @@ pub fn compute_bundle_layout<F: RopeForm>(
             );
             tids
         },
-    })
+    };
+    // ⭐ THE CACHE IS ALLOCATED ROW-OUTERMOST, as spyre-inference's `allocate_pages` allocates it
+    // (`head_major_kv_layout`) — before any op addresses it.
+    for &tid in &pools {
+        layout.allocate_row_outermost(tid)?;
+    }
+    Ok(layout)
 }
 
 /// ⭐ THE SEGMENT BUDGET: give the weight segment's TRAILING placements to [`WEIGHT_SPILL_SEGS`]

@@ -752,14 +752,6 @@ pub fn program_silu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<SiluMulCha
     Ok(out)
 }
 
-/// Whether `tid` is one of the program's paged KV pools ([`crate::ktir_node::Program::paged_pool_params`]).
-fn pool_param(k: &KtirNode, tid: u32) -> bool {
-    k.program
-        .paged_pool_params()
-        .iter()
-        .any(|&i| k.bindings.get(i).is_some_and(|b| b.get() == tid))
-}
-
 /// A gathered table's `[rows, cols]` — the gather's tile's data view.
 fn gather_table_dims(f: &IRFunction<'static>, g: &Gather) -> Result<(u32, u32), Error> {
     let tile = f.operations.iter().find(|o| o.result == Some(g.tile));
@@ -3918,12 +3910,15 @@ fn lower_function_folded(
                     .unwrap_or_default()
             };
             let (mut from, to) = (def_dims(src), def_dims(res));
-            // A GATHERED POOL is held as the page gather lands it — one-stick sub-rows, its slabs'
-            // own row-major bytes — whatever shape the load states. Any other gathered table lands
-            // stick-major at the load's own shape ([`super::lower_ktir_to_superdsc::row_gather`]).
+            // A GATHER FROM A ROW-OUTERMOST BUFFER (the paged cache's allocation,
+            // [`BundleLayout::allocate_row_outermost`]) is held as the page gather lands it —
+            // one-stick sub-rows, its slabs' own row-major bytes — whatever shape the load states.
+            // A gather from a tiled buffer lands stick-major at the load's own shape
+            // ([`super::lower_ktir_to_superdsc::row_gather`]).
             let stick = i64::from(crate::work::FP16_ELEMS_PER_STICK);
             let numel: i64 = from.iter().product();
-            let pooled = |gi: usize| pool_param(k, gathers[gi].value_tid);
+            let pooled =
+                |gi: usize| layout.is_some_and(|l| l.is_row_outermost(gathers[gi].value_tid));
             if gathered_loads.get(&src).is_some_and(|&gi| pooled(gi)) && numel % stick == 0 {
                 from = vec![numel / stick, stick];
             }
@@ -4065,7 +4060,7 @@ fn lower_function_folded(
                             f.name
                         ));
                     };
-                    if !pool_param(k, gathers[gi].value_tid) {
+                    if !pooled(gi) {
                         let g = gathers[gi];
                         let (table_rows, cols) = gather_table_dims(f, &g)?;
                         let tid = mint_inter(k, layout, floor, src);
@@ -5531,6 +5526,33 @@ fn lower_function_folded(
         lowered += 1;
     }
 
+    // ⭐ A PARAMETER'S ROWS SCATTERED — a `ktdp.store` of a `ktdp.load` through an indirect access
+    // tile, in any program: the card's scatter copy ([`super::lower_ktir_to_superdsc::load_scatters`]).
+    // The rows are a parameter's, so they move once the compute is done — which is program order
+    // only while nothing the program reads is a destination they land in, so that is refused.
+    let scattered = super::lower_ktir_to_superdsc::load_scatters(f.name, k, sym_id_base, layout)?;
+    for sc in super::lower_ktir_to_superdsc::scatters_of(k)? {
+        let read = gathers.iter().any(|g| g.value_tid == sc.value_tid)
+            || f.ops_deep().iter().any(|o| {
+                o.op_type == OpKind::KtdpLoad
+                    && o.result.is_some_and(|v| {
+                        region_for_operand(k, v)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|r| r.tid == sc.value_tid)
+                    })
+            });
+        if read {
+            return err(format!(
+                "{}: the program scatters rows into t{} and also reads it — the scatter runs after \
+                 the compute, so a read of its destination would see the rows before they land",
+                f.name, sc.value_tid
+            ));
+        }
+    }
+    let scatters = !scattered.is_empty();
+    out.extend(scattered);
+
     // ⭐ THE PURE-COPY ARM. A copy program states no compute op at all — its ops are loads and
     // stores, every one of them plumbing this walk skips — so `lowered == 0` is not a refusal for
     // it but the expected shape, and the one production copy is the LmLast last-row extraction
@@ -5551,8 +5573,11 @@ fn lower_function_folded(
         let r = regions(k)?;
         return super::lower_ktir_to_superdsc::lmlast(f.name, k, &r, sym_id_base, layout);
     }
-    if lowered == 0 {
-        return err(format!("{}: no compute op in the function", f.name));
+    if lowered == 0 && !scatters {
+        return err(format!(
+            "{}: no compute op and no scatter in the function",
+            f.name
+        ));
     }
     // ⛔⛔⛔ A GATHER THE PROGRAM STATES AND NO DESCRIPTOR CARRIES IS A SILENTLY DIRECT READ.
     //

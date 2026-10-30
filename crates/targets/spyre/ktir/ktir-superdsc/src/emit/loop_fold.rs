@@ -132,6 +132,15 @@ fn indirect_anchor_var(tile: &Operation<'_>) -> Option<usize> {
     }
 }
 
+/// Whether `k` walks — states a top-level `scf.for` — whatever it computes. A walk's windows are
+/// read at trip 0 ([`flatten`]); a straight-line program's at the top level.
+pub fn walks(k: &KtirNode) -> bool {
+    k.func
+        .operations
+        .iter()
+        .any(|o| o.op_type == OpKind::ScfFor)
+}
+
 /// The walk, or `None` for a program with no top-level `scf.for`.
 pub fn flatten(k: &KtirNode) -> Result<Option<Flattened>, Error> {
     let f = &k.func;

@@ -1674,6 +1674,34 @@ pub fn walk_buckets(pages: u32) -> Vec<u32> {
     buckets
 }
 
+/// Where spyre-inference's paged kernels take the KV cache: `k_pages`/`v_pages` (the write's
+/// `k_rows`/`v_rows`) are parameters 2 and 3 of every one, the positions [`lower_attn`] and
+/// [`lower_kv_write`] bind the model's cache at.
+const PAGED_CACHE_PARAMS: [usize; 2] = [2, 3];
+
+/// ⭐ THE KV CACHE'S ALLOCATION IN A ONE-KERNEL BUNDLE — spyre-inference's `allocate_pages`: the
+/// cache a paged kernel reads or writes is allocated row-outermost (`head_major_kv_layout`,
+/// [`ktir_superdsc::placement::BundleLayout::allocate_row_outermost`]). A model bundle's cache is
+/// allocated where the bake places it (`compute_bundle_layout`).
+pub fn allocate_paged_cache(
+    node: &KtirNode,
+    layout: &ktir_superdsc::placement::BundleLayout,
+) -> Result<(), String> {
+    for i in PAGED_CACHE_PARAMS {
+        let Some(b) = node.bindings.get(i) else {
+            return Err(format!(
+                "{}: a paged kernel binds {} buffers, so no cache at parameter {i}",
+                node.func.name,
+                node.bindings.len()
+            ));
+        };
+        layout
+            .allocate_row_outermost(b.get())
+            .map_err(|e| format!("{}: {}", node.func.name, e.0))?;
+    }
+    Ok(())
+}
+
 /// THE ATTENTION SPLICE — compile spyre-inference's kernel for this node's rows (one sequence's:
 /// the decode kernel at one row, the prefill kernel past it; a decode batch's: the batched decode
 /// kernel) at its geometry and the rung's walk ([`walk_pages`]), and mint the `Program::PagedAttn`
@@ -4038,6 +4066,9 @@ mod production_ktir_dump {
         let regions = lk::regions(at_trip0).map_err(|e| format!("{name}: regions: {e:?}"))?;
         let layout = triton_ktir_superdsc::layout::for_regions(node, &regions)
             .map_err(|e| format!("{name}: layout: {e}"))?;
+        if matches!(program_of(name), Program::PagedAttn | Program::PagedKvWrite) {
+            allocate_paged_cache(node, &layout)?;
+        }
         let windowed = |ops: Result<Vec<ktir_superdsc::emit::EmittedOp>, lk::Error>| {
             let ops = ops.map_err(|e| format!("{name}: {e:?}"))?;
             lk::column_windows_are_honoured(lk_name, &regions, &ops)
@@ -4046,24 +4077,23 @@ mod production_ktir_dump {
         };
         let mut sym = 0i64;
         let ops = match program_of(name) {
-            // The door's `windowed(...)`-wrapped whole-function kinds.
-            Program::Elementwise(_)
-            | Program::SiluMul
-            | Program::RmsNorm
-            | Program::ScalarMul
-            | Program::Sample => windowed(lower_function(node, Some(&layout), &mut sym, None)),
-            // The door's walk: the page walk's body at trip 0, marked for the card's relaunch.
-            Program::PagedAttn => {
+            // The door's walk, whatever the program computes: the body at trip 0, marked for the
+            // card's relaunch.
+            _ if flat.is_some() => {
                 Ok(
                     ktir_superdsc::emit::whole_function::lower_walk(node, Some(&layout), &mut sym)
                         .map_err(|e| format!("{name}: {e:?}"))?,
                 )
             }
-            Program::PagedKvWrite => {
-                Ok(
-                    lk::paged_kv_write(lk_name, node, &regions, &mut sym, Some(&layout))
-                        .map_err(|e| format!("{name}: {e:?}"))?,
-                )
+            // The door's `windowed(...)`-wrapped whole-function kinds.
+            Program::Elementwise(_)
+            | Program::SiluMul
+            | Program::RmsNorm
+            | Program::ScalarMul
+            | Program::Sample
+            | Program::PagedAttn
+            | Program::PagedKvWrite => {
+                windowed(lower_function(node, Some(&layout), &mut sym, None))
             }
             // The door's unwrapped whole-function kinds.
             Program::Matmul | Program::LmLast => {
@@ -4317,6 +4347,7 @@ mod walk_on_the_card {
             "each block slot's running max, sum and output"
         );
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+        allocate_paged_cache(&node, &layout).expect("the cache allocates");
         let mut sym = 0i64;
         let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
             .unwrap_or_else(|e| panic!("the batched walk lowers: {}", e.message));
@@ -4351,6 +4382,7 @@ mod walk_on_the_card {
             "a single chunk states no loop"
         );
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+        allocate_paged_cache(&node, &layout).expect("the cache allocates");
         let mut sym = 0i64;
         let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
             .unwrap_or_else(|e| panic!("the one-chunk batch lowers: {}", e.message));
@@ -4375,6 +4407,7 @@ mod walk_on_the_card {
                 "the running max, sum and output (mq={mq})"
             );
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
             let ops =
                 ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
@@ -4457,6 +4490,7 @@ mod walk_on_the_card {
         let node = walk(1, 1);
         assert!(flatten(&node).expect("flattens").is_none());
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("places");
+        allocate_paged_cache(&node, &layout).expect("the cache allocates");
         let mut sym = 0i64;
         let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
             .unwrap_or_else(|e| panic!("the one-block walk lowers: {}", e.message));

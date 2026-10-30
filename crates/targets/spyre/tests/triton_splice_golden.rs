@@ -2060,6 +2060,8 @@ fn the_paged_attention_splices_with_its_contract() {
         // name, rather than lowered at addresses its frames do not have.
         let layout = triton_ktir_superdsc::layout::for_node(k)
             .unwrap_or_else(|e| panic!("{at}: layout: {e:?}"));
+        scratchy_triton_splice::allocate_paged_cache(k, &layout)
+            .unwrap_or_else(|e| panic!("{at}: {e}"));
         let mut sym = 0i64;
         let lowered = door_lower(k, &mut sym, Some(&layout), None);
         if s.geom.2 == 64 {
