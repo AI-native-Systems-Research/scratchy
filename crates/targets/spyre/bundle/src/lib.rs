@@ -37,6 +37,10 @@
 /// The DeepTools `processComputeOnHostCommand` port, run at BUILD time — see [`correction`].
 pub mod correction;
 
+/// Tensor parallelism's control-block pipeline as baked data: the world, the rank, the receive
+/// window, the sids and the send → wait → consume ring — see [`collective`].
+pub mod collective;
+
 /// Re-exported so the `inventory::submit!` the macro emits into each arch crate resolves through the
 /// same path as the types it submits — the arch crate need not depend on `inventory` itself.
 pub use inventory;
@@ -393,6 +397,11 @@ pub struct KvShifts {
     pub gathered: bool,
     /// What one fold pass covers — see [`FoldRows`]. Meaningful only when [`Self::page_fold`].
     pub fold_rows: FoldRows,
+    /// ⭐ `Some` iff this group is a COLLECTIVE'S CONSUME. Its launch is preceded by this rank's send
+    /// of the operand fragment and the wait for the peer's ([`collective::cb_pipeline`]), and it reads
+    /// the receive window — a weight-segment placement no per-layer weight shift or bank may move.
+    /// Always `None` in a world of one.
+    pub tp: Option<collective::TpConsume>,
 }
 
 impl KvShifts {

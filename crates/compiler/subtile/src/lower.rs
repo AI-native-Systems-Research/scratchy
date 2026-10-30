@@ -219,6 +219,8 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::ScalarMul { .. }
             | O::SiluMul
             | O::Mean
+            | O::AllReduce
+            | O::AllGather { .. }
             | O::RopeRotate { .. }
             | O::RopeAppend { .. }
             | O::KvAppend { .. }

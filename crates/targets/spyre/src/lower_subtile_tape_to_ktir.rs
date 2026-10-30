@@ -1046,6 +1046,86 @@ fn ktir_only(k: ktir_superdsc::ktir_node::KtirNode) -> EmittedOp {
 /// that grain. KTIR does not: a node's whole computation is one `func`, with its inputs loaded from
 /// HBM and its output stored back, and the work division stated INSIDE it as the grid and its
 /// loops. So this walk yields one [`EmittedOp`] per node, carrying that program.
+/// The all-reduce's consume launches: per stick-column fragment of the operand
+/// ([`crate::tp_plan::consume_fragments`], the same cut the window is sized over), the `Add` splice
+/// over this rank's fragment and the receive window, each marked with the [`TpConsume`] its launch
+/// group carries into the CB pipeline.
+///
+/// The window holds ONE fragment at a time, laid out from its first byte as the `[rows, cols]`
+/// tensor that fragment is — a run of whole stick columns is byte-identical to such a tensor — so
+/// every fragment's window view is columns `[0, cols)` of [`TP_RECV_TID`].
+///
+/// [`TpConsume`]: ktir_superdsc::collective::TpConsume
+/// [`TP_RECV_TID`]: ktir_superdsc::reserved_tids::TP_RECV_TID
+fn all_reduce_consumes<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    rows_are_requests: bool,
+) -> NodeLowering {
+    use ktir_superdsc::collective::{CollectiveKind, TpConsume};
+    use scratchy_subtile::subtile_ir::{EwKind, Range, Region, TensorRegion};
+    let x = node.inputs[0];
+    let (rows, cols) = (x.region.rows.len, x.region.cols.len);
+    let frags = match crate::tp_plan::consume_fragments(rows, cols) {
+        Ok(f) => f,
+        Err(why) => {
+            return NodeLowering::Unhandled(format!(
+                "the all-reduce operand [{rows}, {cols}] cannot be cut into p2p fragments: {why:?}"
+            ));
+        }
+    };
+    let window = TensorId::from_index(ktir_superdsc::reserved_tids::TP_RECV_TID as usize);
+    let mut ops = Vec::with_capacity(frags.len());
+    for (k, f) in frags.into_iter().enumerate() {
+        let cols_at = |start: u32| Range::new(start + f.first_col(), f.cols());
+        let consume = SubtileNode {
+            id: node.id,
+            op: SubOp::Elementwise(EwKind::Add),
+            inputs: vec![
+                TensorRegion {
+                    tensor: x.tensor,
+                    region: Region {
+                        rows: x.region.rows,
+                        cols: cols_at(x.region.cols.start),
+                    },
+                },
+                TensorRegion {
+                    tensor: window,
+                    region: Region {
+                        rows: Range::new(0, rows),
+                        cols: Range::new(0, f.cols()),
+                    },
+                },
+            ],
+            output: TensorRegion {
+                tensor: node.output.tensor,
+                region: Region {
+                    rows: node.output.region.rows,
+                    cols: cols_at(node.output.region.cols.start),
+                },
+            },
+        };
+        let mut e = match scratchy_triton_splice::lower(&consume, ir, rows_are_requests) {
+            Ok(e) => e,
+            Err(reason) => return NodeLowering::Unhandled(reason),
+        };
+        // One name per fragment: the fragments share the node's id, and a launch's name is its
+        // program's identity.
+        let name = format!("tpconsume_s{}_f{k}", node.id.index());
+        if let Some(kt) = e.ktir.as_mut() {
+            kt.func.name = ktir_core::arena::Arena::global().str(name.clone());
+        }
+        e.op_name = name;
+        e.tp_consume = Some(TpConsume {
+            kind: CollectiveKind::AllReduce,
+            operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
+            fragment: f,
+        });
+        ops.push(e);
+    }
+    NodeLowering::Ops(ops)
+}
+
 pub(crate) fn lower_one_node<F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -1113,6 +1193,21 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::KvAppend { .. }
         | SubOp::ExpertAct { .. }
         | SubOp::Mean => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
+        // ⭐ THE ALL-REDUCE'S CONSUME. The exchange itself is not a program — the bundle's CB
+        // pipeline sends this rank's operand fragment into the peer's window and waits for the
+        // peer's before the consume launches (`bundle::collective::cb_pipeline`). What IS a program
+        // is the sum: per fragment, the ordinary `Add` splice over (this rank's fragment, the
+        // window), writing the output's same columns. Two operands, because spyre bakes worlds of
+        // one and two (`SPYRE_TP_WORLDS`) and a world of one has no collective; fp16 addition is
+        // commutative, so both ranks compute bit-identical sums.
+        SubOp::AllReduce => all_reduce_consumes(node, ir, rows_are_requests),
+        // ⛔ THE GATHER'S CONSUME IS RANK-SELECTED (this rank's block and the peer's land at
+        // columns that depend on which rank is which), so it is copies chosen at the session's
+        // rank, not one program. Not yet lowered — refused by name.
+        SubOp::AllGather { .. } => Unhandled(
+            "the all-gather's consume is rank-selected copies, which spyre does not lower yet"
+                .to_string(),
+        ),
         // ⛔ THE 2b EXPANSION KINDS, named here instead of `expansion_ops!()`: the 2a
         // routing below made the macro's patterns for THOSE kinds unreachable
         // (`unreachable_patterns` is `-D warnings`), and the remaining members are a
@@ -1450,16 +1545,16 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
     let mut sym_id_base: i64 = 0;
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(programs.len());
     for e in &programs {
-        let k = e.ktir.as_ref().ok_or_else(|| {
-            SuperDscError(format!(
+        if e.ktir.is_none() {
+            return Err(SuperDscError(format!(
                 "{}: no KTIR program — the node lowering declined this op, and a bundle short a \
                  program computes something else",
                 e.op_name
-            ))
-        })?;
+            )));
+        }
         ops.extend(
-            crate::ktir_superdsc_door::lower(
-                k,
+            crate::ktir_superdsc_door::lower_op(
+                e,
                 &mut sym_id_base,
                 Some(&bundle_layout),
                 attn_params,

@@ -70,6 +70,9 @@ pub mod tape_colouring;
 pub mod tape_folding;
 /// The unrolled tape read as steps over the source ops they compute.
 pub mod tape_steps;
+/// Tensor parallelism by analysis: the per-rank forward, each source's slice law, and the
+/// collectives the dataflow demands — derived from the op registry's sharding rules alone.
+pub mod tensor_parallel;
 
 /// THE HOST TAPE — the program as data: the ordered host-side sequence of
 /// kernel launches, transfers and CPU steps that a compiled bundle's kernels

@@ -259,6 +259,30 @@ pub fn lower(
     }
 }
 
+/// THE PRODUCER'S OP THROUGH THE DOOR — [`lower`] over `e`'s program, with every per-op fact the
+/// producer stated and the program does not carried onto EVERY descriptor op it yields.
+///
+/// ⛔ ONE STAMP SITE. The door mints fresh ops from the program, so a fact the producer put on its
+/// op (today: the collective consume marker) is dropped unless something copies it, and a program
+/// can lower to several descriptor ops — each must carry it, or the ones that don't fuse into an
+/// ordinary group that takes the per-layer weight shift and reads the receive window somewhere
+/// else. The callers that keep the door's output call this, so none of them can forget the copy.
+pub fn lower_op(
+    e: &EmittedOp,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+    attn_params: Option<BundleAttnParams>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let k = e.ktir.as_ref().ok_or_else(|| Error {
+        message: format!("{}: no KTIR program to lower", e.op_name),
+    })?;
+    let mut ops = lower(k, sym_id_base, layout, attn_params)?;
+    for o in &mut ops {
+        o.tp_consume = e.tp_consume;
+    }
+    Ok(ops)
+}
+
 /// A column-tiled body's ops, held to the windows its program states
 /// ([`lk::column_windows_are_honoured`]): the bake fails naming the op rather than baking a piece
 /// that writes another piece's columns.

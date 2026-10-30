@@ -401,7 +401,7 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 }
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 7] = [
+pub const RESERVED_REGIONS: [TidRegion; 8] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -460,7 +460,24 @@ pub const RESERVED_REGIONS: [TidRegion; 7] = [
         base: u32::MAX - 1_000_171,
         slots: 1_000_000,
     },
+    // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW — see [`TP_RECV_TID`]. Below `kct_resident`'s floor,
+    // in tids no artifact has ever carried.
+    TidRegion {
+        name: "tp_recv",
+        base: TP_RECV_TID,
+        slots: 1,
+    },
 ];
+
+/// ⭐ RESERVED tid for the TENSOR-PARALLEL RECEIVE WINDOW — the one synthetic every collective's
+/// consume reads its peer's bytes from (`scratchy_spyre_bundle::collective::RecvWindow`). One tid
+/// for every collective of every bundle: the window is one `(segment, offset, size)` triple per
+/// card, and a second tid would be a second placement that could disagree with it.
+///
+/// ⛔ NOT IN THE ROUTER-CONST HOLE (MAX-137 .. MAX-146) — those slots are BURNED (see the note
+/// above the region table): a stale artifact still naming one would alias the window. It takes the
+/// first tid below `kct_resident`'s floor instead, which nothing has been baked against.
+pub const TP_RECV_TID: u32 = u32::MAX - 2_000_171;
 
 /// Is `tid` one of the reserved synthetics — a sentinel, a slot of any region, or `LAST_HIDDEN_TID`
 /// (which sits at `u32::MAX`, one ABOVE the sentinels region's base, so a region scan alone misses

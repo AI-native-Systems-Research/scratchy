@@ -1045,6 +1045,49 @@ pub fn compute_bundle_layout<F: RopeForm>(
             WeightTail::InPlace,
         )
     };
+    // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW — placed iff the forward carries a collective, in the
+    // weight segment's base region (bank 0) directly above the packed weights, one message wide.
+    //
+    // ⛔ UNIFORM BY CONSTRUCTION, NOT BY COORDINATION. Every bundle of a forward (prefix, rolled
+    // body, suffix) is baked over THIS one layout, and `weight_segment_parity` holds every layout
+    // of a session to one weight extent — so `(seg1, align128(extent), cap)` is the same triple
+    // wherever a send is baked and wherever its consume reads. Sizing it at the message cap rather
+    // than this forward's widest fragment is what keeps a decode layout and a prefill layout equal;
+    // no fragment can exceed it (`consume_fragments` cuts at the cap).
+    if ir
+        .nodes
+        .iter()
+        .any(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
+    {
+        let w = SegRole::Weight.segment();
+        let window = ktir_superdsc::collective::RecvWindow::new(
+            align128(seg_bytes[w]),
+            ktir_superdsc::collective::WireBytes::CAP,
+        )
+        .ok_or_else(|| SuperDscError("an align128 offset is flit-aligned".to_string()))?;
+        if window.end() > bundle::MAX_SEGMENT_BYTES {
+            return Err(SuperDscError(format!(
+                "the tensor-parallel receive window [{}, {}) does not fit the weight segment's \
+                 {}-byte base region above the packed weights",
+                window.offset(),
+                window.end(),
+                bundle::MAX_SEGMENT_BYTES,
+            )));
+        }
+        let tid = ktir_superdsc::reserved_tids::TP_RECV_TID;
+        placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                role: SegRole::Weight,
+                segment: w,
+                bank: 0,
+                offset: window.offset(),
+                size: window.size().get(),
+            },
+        );
+        seg_bytes[w] = window.end();
+    }
     // ── ROPE permutation matrix P [hd,hd] (task: in-bundle RoPE) ── If the tape has
     // any RopeRotate/RopeAppend, main's `lower_rope_node` emits `rot = matmul(x, P)` (the
     // rotate-half as a 64-stick-aligned matmul, avoiding the 32-half sub-stick). P is
@@ -5093,6 +5136,13 @@ pub enum GroupKind {
     /// needs its index staged, so a `Pure` op swept in would lose its page base, and a copy swept into
     /// a `Pure` group would gain one.
     Gathered,
+    /// A COLLECTIVE'S CONSUME ([`EmittedOp::tp_consume`]) — ONE launch group per consume, holding
+    /// every descriptor op its program lowered to and nothing else. The bundle's CB pipeline puts
+    /// this rank's send and the wait for the peer's in front of exactly this launch: a neighbour
+    /// fused in would run before its operand's exchange, and a consume split across two groups
+    /// would send twice. So trips fuse iff they carry the SAME consume, and the run is never
+    /// chunked by the group size ([`GroupKind::run_may_be_chunked`]).
+    TpConsume(ktir_superdsc::collective::TpConsume),
 }
 
 /// WHICH REQUEST A TRIP'S ADDRESSING BELONGS TO.
@@ -5146,6 +5196,8 @@ impl GroupKind {
             // half the other's cap. Breaking at that boundary can only cost a launch.
             (GroupKind::PageFold { gathered: a }, GroupKind::PageFold { gathered: b }) => a == b,
             (GroupKind::Slot { req: a }, GroupKind::Slot { req: b }) => a == b,
+            // One consume's descriptor ops are one launch; two consumes never share one.
+            (GroupKind::TpConsume(a), GroupKind::TpConsume(b)) => a == b,
             // SlotSolo: distinct baked slot per entry — one per-group shift cannot express two.
             // HostKv: the shim's `oi += skip` must land on this exact entry.
             _ => false,
@@ -5215,7 +5267,13 @@ impl GroupKind {
     /// ungathered pass rebases the KV segment instead and holds no state between groups — the online
     /// softmax is accumulate-only — so it needs no exemption and is not given one.
     fn run_may_be_chunked(self) -> bool {
-        !matches!(self, GroupKind::PageFold { gathered: true })
+        // ⭐ A CONSUME IS NEVER CHUNKED EITHER: each group of a chunked run would be a launch the CB
+        // pipeline puts a send and a wait in front of — two sends of one fragment, and a wait for a
+        // second peer send that never comes.
+        !matches!(
+            self,
+            GroupKind::PageFold { gathered: true } | GroupKind::TpConsume(_)
+        )
     }
 }
 
@@ -5592,7 +5650,9 @@ fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
     for (oi, e) in ops.iter().enumerate() {
         let nt = (e.time.max(1)) as usize; // == concrete_trips(e).len()
         for ti in 0..nt {
-            let k = if e.host_kv_write && ti == 0 {
+            let k = if let Some(consume) = e.tp_consume {
+                GroupKind::TpConsume(consume)
+            } else if e.host_kv_write && ti == 0 {
                 GroupKind::HostKv {
                     skip: e.kv_n_skip as usize,
                 }
@@ -5999,6 +6059,11 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
                 scratchy_subtile::sdsc_abstract::FoldRowRegime::WholeBatch => {
                     bundle::FoldRows::WholeBatch
                 }
+            },
+            // A consume group holds exactly one consume's trips, so its kind names it.
+            tp: match kinds[r.start].kind {
+                GroupKind::TpConsume(consume) => Some(consume),
+                _ => None,
             },
         });
     }
@@ -7643,7 +7708,11 @@ pub fn ktir_groups(
             .map(|((ssa, _), b)| (*ssa, bundle::PlaceId::Act(b.get())))
             .collect();
         out.push(bundle::LaunchGroup {
-            kv: bundle::KvShifts::default(),
+            // One group per op here, so a consume op is its own group and carries its marker.
+            kv: bundle::KvShifts {
+                tp: e.tp_consume,
+                ..bundle::KvShifts::default()
+            },
             programs: std::borrow::Cow::Owned(vec![bundle::LaunchProgram {
                 func: k.func,
                 program: k.program,
@@ -7708,15 +7777,15 @@ fn ktir_groups_via_superdsc(
                 e.op_name
             )));
         }
-        let k = e.ktir.as_ref().ok_or_else(|| {
-            SuperDscError(format!(
+        if e.ktir.is_none() {
+            return Err(SuperDscError(format!(
                 "{}: no KTIR program — the node lowering declined this op, and a bundle short a \
                  program computes something else",
                 e.op_name
-            ))
-        })?;
+            )));
+        }
         let _pc_cls = crate::pc::Pc::start(crate::pc::mint_class(&e.op_name));
-        let lowered = crate::ktir_superdsc_door::lower(k, &mut sym_id_base, layout, attn_params)
+        let lowered = crate::ktir_superdsc_door::lower_op(e, &mut sym_id_base, layout, attn_params)
             .map_err(|err| {
                 SuperDscError(format!("{}: KTIR -> SuperDSC: {}", e.op_name, err.message))
             })?;

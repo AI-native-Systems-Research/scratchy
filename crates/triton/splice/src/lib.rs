@@ -358,6 +358,14 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::ExpertMatmul { .. } => TritonKernelRow::Refused(
             "the MoE lowers only from kernels/moe.py through KTIR — no per-op MoE row exists",
         ),
+        // ⛔ A COLLECTIVE IS NOT ONE KERNEL. It is a control-block sequence in the compute
+        // stream — p2p sends to the peers' receive windows, a write-done wait, then the
+        // consume — and its only kernel (the consume's add) is the `Add` row's. The spyre
+        // emitter's collective arm owns it; no Triton program states a card-to-card transfer.
+        SubOp::AllReduce | SubOp::AllGather { .. } => TritonKernelRow::Refused(
+            "a collective lowers as a CB sequence by the spyre emitter's collective arm, \
+             never as one spliced kernel",
+        ),
         SubOp::TanhSoftCap { .. } => TritonKernelRow::Spliced {
             src: include_str!("../../../targets/spyre/kernels/tanhsoftcap.py"),
             file: "tanhsoftcap.py",
@@ -2579,7 +2587,14 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     // The operands must window the SAME slice of the SAME storage — the builder's
     // own law (`load_region` per operand, one chunk per node).
     for tr in &node.inputs {
-        let in_total = ir.tensors[tr.tensor.index()].cols;
+        // A SYNTHETIC BEYOND THE GRAPH (the tensor-parallel receive window) has no storage in the
+        // graph: its storage IS its region, from its first byte — `matmul_window_of`'s law for the
+        // LAST_HIDDEN staging. So it joins the node's one storage window only when that region is
+        // exactly the window the output states; anything else is the disagreement refused below.
+        let in_total = ir
+            .tensors
+            .get(tr.tensor.index())
+            .map_or(tr.region.cols.len, |s| s.cols);
         if tr.region.rows.start != r || tr.region.cols.start != c_start || in_total != n_total {
             return Err(format!(
                 "triton splice: t{}'s operands disagree about the window (output [{r}, \

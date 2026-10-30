@@ -235,6 +235,59 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
     }
 }
 
+/// One decode MLP sublayer, `x + down(silu(gate(n)) · up(n))` with `n = rmsnorm(x)` — hidden `h`,
+/// intermediate `i`. Sources: `0` x `[1, h]`, `1` the norm gain, `2` gate, `3` up (`[h, i]`), `4` down
+/// (`[i, h]`), every weight `[K, N]`.
+///
+/// The smallest forward tensor parallelism has a collective in: sharded two ways, gate/up split by
+/// columns, down by rows, and ONE all-reduce lands between down and the residual add. No attention,
+/// so it lowers on a target whose rotary kernels want a full-width table the attention fixture's
+/// `[1, hd]` one is not.
+pub fn mlp_sublayer(h: u32, i: u32) -> LoweringInput {
+    let gemm = |n: u32, act: usize, w: usize| OpDesc {
+        op: SubOp::MatmulTile {
+            n,
+            weight: crate::lower::GemmWeight::Dense,
+        },
+        m: 1,
+        inputs: vec![InputRef::Op(act), InputRef::Ext(w)],
+    };
+    LoweringInput {
+        sources: vec![
+            SourceShape { rows: 1, cols: h },
+            SourceShape { rows: 1, cols: h },
+            SourceShape { rows: h, cols: i },
+            SourceShape { rows: h, cols: i },
+            SourceShape { rows: i, cols: h },
+        ],
+        ops: vec![
+            OpDesc {
+                op: SubOp::RmsNorm {
+                    eps: 1e-5,
+                    gain: GainConvention::Scale,
+                },
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            },
+            gemm(i, 0, 2),
+            gemm(i, 0, 3),
+            OpDesc {
+                op: SubOp::SiluMul,
+                m: 1,
+                inputs: vec![InputRef::Op(1), InputRef::Op(2)],
+            },
+            gemm(h, 3, 4),
+            OpDesc {
+                op: SubOp::Elementwise(EwKind::Add),
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Op(4)],
+            },
+        ],
+        result: 5,
+        exported: None,
+    }
+}
+
 /// A minimal NON-ATTENTION chain: `n` layers of `RmsNorm -> Gemm ->
 /// Add(residual)` with DISTINCT per-layer weights, parameterized by the row
 /// count `m`. Isolates the m-AGNOSTIC re-roll + strided-store path (RmsNorm /

@@ -78,6 +78,9 @@ pub mod place;
 /// ⛔ A STRUCT, NOT A TRAIT — it is a DEVICE memory plan, not scratchy's; the module header carries
 /// the evidence and what a trait would have cost.
 pub mod placement;
+/// TENSOR PARALLELISM'S BAKED VALUES — the world, the rank, the p2p payload and its stick-column
+/// fragments, the receive window, the sids, and the consume marker an [`emit::EmittedOp`] carries.
+pub mod collective;
 /// THE RESERVED TID SPACE — the tensor ids no model produces (RoPE `P`, the attention
 /// scale/mask/causal constants, the rmsnorm Newton constants, the fp8 clamp bounds, the head-major
 /// selectors), with the region table and both of its compile-time disjointness proofs. The
