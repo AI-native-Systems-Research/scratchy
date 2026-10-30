@@ -104,6 +104,17 @@ int32_t flex_hal_r5_section_encode(uint32_t mode, uint64_t core_mask,
                              "segment exceeds the 3-bit segment id");
             return -1;
         }
+        // The VA form is (segment << 27) | flits: an offset at or past the
+        // 16 GiB segment cannot be encoded, and a non-flit-aligned offset
+        // would be silently truncated by bytes_to_flits — both refuse (the
+        // wire module's Flits::from_bytes law, not a silent floor).
+        constexpr uint64_t kSegmentBytes = 1ULL << 34;
+        if (offset_bytes >= kSegmentBytes || (offset_bytes % 128) != 0) {
+            hal_record_error("flex_hal_r5_section_encode",
+                             "offset_bytes must be 128-aligned and inside the "
+                             "16 GiB segment");
+            return -1;
+        }
         hal::snt1p0::R5ControlBlockSectionSBF r5;
         if (mode == 0) {
             if (core_mask != 0 || segment != 0 || offset_bytes != 0) {
@@ -172,13 +183,36 @@ int32_t flex_hal_rdma12_unicast_send_encode(
                              "src_segment exceeds the 3-bit segment id");
             return -1;
         }
+        // bytes_to_flits TRUNCATES (§0 D5): a non-flit-aligned length or
+        // address would be silently mis-encoded — e.g. a sub-128-byte length
+        // stores flits 0, the zero-means-max sentinel, and sends 4 MiB. The
+        // wire module's Flits::from_bytes law applies at this door too:
+        // misaligned inputs refuse, never floor.
+        if ((length_bytes % 128) != 0 || (src_offset_bytes % 128) != 0 ||
+            (dest_remote_base_bytes % 128) != 0) {
+            hal_record_error("flex_hal_rdma12_unicast_send_encode",
+                             "length_bytes, src_offset_bytes and dest_remote_base_bytes "
+                             "must all be 128-aligned (bytes_to_flits truncates)");
+            return -1;
+        }
         // 4 MiB == the vendor's P2P_RDMA_WINDOW_SIZE == the zero-means-max
-        // sentinel: every other length must fit the 15-bit flit field.
+        // sentinel: every other length must fit the 15-bit flit field. The
+        // never-zero chunk law (refuse the stored-0 form itself) is the tp
+        // builders' door, not this shim's — this door refuses only what the
+        // wire cannot encode.
         constexpr uint64_t kWindowBytes = 1ULL << 22;
         if (length_bytes == 0 || length_bytes > kWindowBytes) {
             hal_record_error("flex_hal_rdma12_unicast_send_encode",
                              "length_bytes must be in (0, 4 MiB] (15-bit flit field, "
                              "zero-means-max)");
+            return -1;
+        }
+        // The source VA form is (segment << 27) | flits: an offset at or
+        // past the 16 GiB segment cannot be encoded.
+        constexpr uint64_t kSegmentBytes = 1ULL << 34;
+        if (src_offset_bytes >= kSegmentBytes) {
+            hal_record_error("flex_hal_rdma12_unicast_send_encode",
+                             "src_offset_bytes exceeds the 16 GiB segment");
             return -1;
         }
         // The xseg word's flits must leave bits 30 (valid) and 31 (parity)
