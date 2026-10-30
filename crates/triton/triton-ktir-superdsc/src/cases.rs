@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE TWENTY-FOUR CONFIGURATIONS, STATED ONCE.
+//! THE TWENTY-FIVE CONFIGURATIONS, STATED ONCE.
 //!
 //! A "configuration" is a `.py` fixture plus the `tl.constexpr` values and the launch grid it is
 //! compiled at. Three consumers need that tuple: `examples/bake_py` (the dxp bake),
@@ -79,6 +79,9 @@ pub const ALL: &[&str] = &[
     // ⭐ THE PROMPT CHUNK'S KV WRITE, from the card's own kernel (`kernels/` — see the row): a
     // 20-token prompt's 160 index entries, five scatter ops of 32, the first card runs' lead.
     "paged_kv_write_prompt",
+    // ⭐ THE PROMPT CHUNK'S ATTENTION, from the card's own kernel: the same 20-token chunk's walk
+    // over its one page (see the row).
+    "paged_attn_prefill_prompt",
 ];
 
 pub fn root() -> PathBuf {
@@ -635,6 +638,39 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             vec![1],
             Program::PagedKvWrite,
         ),
+        // ⭐ spyre-inference's `page_attn_head_major_prefill_kernel` over the same 20-token prompt
+        // chunk at granite-3.1-2b's heads (32 query heads over 8 kv heads at head dim 64): its rows
+        // gathered by `query_row_index`, its one page read through the page table, the mask
+        // stack's causal tile, and the output scattered back by `query_row_index`. One block, so the
+        // walk is straight-line.
+        "paged_attn_prefill_prompt" => (
+            kernel_spec(
+                "page_attn_head_major_prefill",
+                "page_attn_head_major_prefill_kernel",
+                &[
+                    ("query", "*fp16"),
+                    ("query_row_index", "*i32"),
+                    ("k_pages", "*fp16"),
+                    ("v_pages", "*fp16"),
+                    ("page_index_table", "*i32"),
+                    ("mask_stack", "*fp16"),
+                    ("out", "*fp16"),
+                ],
+                &[
+                    ("NUM_TOKENS", Val::Int(20)),
+                    ("NUM_HEADS", Val::Int(32)),
+                    ("NUM_KV_HEADS", Val::Int(8)),
+                    ("HEAD_SIZE", Val::Int(64)),
+                    ("BLOCK_SIZE", Val::Int(64)),
+                    ("NUM_PAGES", Val::Int(4)),
+                    ("NUM_BLOCKS", Val::Int(1)),
+                    ("PADDED_QUERY_LEN", Val::Int(20)),
+                    ("SCALE", Val::Float(0.125)),
+                ],
+            ),
+            vec![1],
+            Program::PagedAttn,
+        ),
         "hash_noise" => (
             spec(
                 "hash_noise_probe",
@@ -1183,7 +1219,7 @@ mod tests {
         }
         assert_eq!(
             super::ALL.len(),
-            24,
+            25,
             "a configuration was added or removed: update ALL (and the module title) deliberately"
         );
     }
