@@ -126,11 +126,13 @@ mod tests {
 
     /// ⭐ THE EMISSION, END TO END ON THE HOST: the analysis's two-rank decode layer, lowered to
     /// SubtileIR, through the producer's own node lowering and the launch index. Each all-reduce
-    /// becomes ONE consume program (one fragment at decode) that reads the receive window and sends
-    /// the projection it reduces; each is its own launch group, and that group's shifts carry the
-    /// marker the CB pipeline turns into `send, wait, launch`.
+    /// becomes TWO device programs (one fragment at decode): the SEND, a block copy of the partial
+    /// it reduces into the receive window (launched against the PEER's weight segment — device
+    /// p2p), then the CONSUME, the sum over the partial and the window. Each is its own launch
+    /// group, and the groups' shifts carry the markers the CB pipeline turns into
+    /// `send, wait, launch`.
     #[test]
-    fn an_all_reduce_lowers_to_a_singleton_consume_group_reading_the_window() {
+    fn an_all_reduce_lowers_to_a_send_group_then_a_consume_group() {
         use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
         use crate::lower_subtile_tape_to_superdsc::{FoldGrouping, launch_index};
         use ktir_superdsc::collective::CollectiveKind;
@@ -141,30 +143,37 @@ mod tests {
 
         let b = tp_bake(&one_layer_input(), SpyreWorld::of::<2>()).unwrap();
         let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
-        let mut consumes = Vec::new();
+        let mut ops = Vec::new();
         let mut operands = Vec::new();
         for node in ir.nodes.iter().filter(|n| matches!(n.op, SubOp::AllReduce)) {
             operands.push(PlaceId::Act(node.inputs[0].tensor.index() as u32));
             match lower_one_node(node, &ir, ActiveCap::FULL, false) {
-                NodeLowering::Ops(ops) => consumes.extend(ops),
-                NodeLowering::Unhandled(why) => panic!("the consume did not lower: {why}"),
-                NodeLowering::HostRouted(k) => panic!("the consume was host-routed: {k}"),
+                NodeLowering::Ops(v) => ops.extend(v),
+                NodeLowering::Unhandled(why) => panic!("the collective did not lower: {why}"),
+                NodeLowering::HostRouted(k) => panic!("the collective was host-routed: {k}"),
             }
         }
-        assert_eq!(consumes.len(), 2, "one consume per all-reduce at decode");
-        for (e, operand) in consumes.iter().zip(&operands) {
-            let tp = e.tp_consume.expect("a consume carries its marker");
-            assert_eq!(tp.kind, CollectiveKind::AllReduce);
-            assert_eq!(tp.operand, *operand, "it sends the tensor it reduces");
-            let k = e.ktir.as_ref().expect("a consume is a program");
-            assert!(
-                k.bindings.iter().any(|b| b.get() == TP_RECV_TID),
-                "the consume reads the receive window"
-            );
+        assert_eq!(ops.len(), 4, "a send and a consume per all-reduce at decode");
+        for (pair, operand) in ops.chunks(2).zip(&operands) {
+            let [send, consume] = pair else { unreachable!() };
+            let s = send.tp_send.expect("the first program is the send");
+            assert_eq!((s.kind, s.operand), (CollectiveKind::AllReduce, *operand));
+            assert!(send.tp_consume.is_none());
+            let c = consume.tp_consume.expect("the second program is the consume");
+            assert_eq!((c.kind, c.operand), (CollectiveKind::AllReduce, *operand));
+            for (e, what) in [(send, "the send writes"), (consume, "the consume reads")] {
+                let k = e.ktir.as_ref().expect("a program");
+                assert!(
+                    k.bindings.iter().any(|b| b.get() == TP_RECV_TID),
+                    "{what} the receive window"
+                );
+            }
         }
-        let shifts = launch_index(&consumes, FoldGrouping::Split);
-        assert_eq!(shifts.len(), 2, "each consume is its own launch group");
-        assert!(shifts.iter().zip(&consumes).all(|(s, e)| s.tp == e.tp_consume));
+        let shifts = launch_index(&ops, FoldGrouping::Split);
+        assert_eq!(shifts.len(), 4, "each send and each consume is its own launch group");
+        for (s, e) in shifts.iter().zip(&ops) {
+            assert_eq!((s.send, s.tp), (e.tp_send, e.tp_consume));
+        }
     }
 
     /// ⭐ THROUGH THE DOOR, AS A BAKE LOWERS IT — the case the producer-side test cannot see. The
@@ -224,7 +233,7 @@ mod tests {
         let (ops, layout) =
             lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
         let window = layout.placements[&TP_RECV_TID];
-        let want = SEGMENT_OFFSETS[window.segment as usize] + window.offset;
+        let want = SEGMENT_OFFSETS[window.segment] + window.offset;
         let consumes: Vec<_> = ops
             .iter()
             .filter(|e| e.tp_consume.is_some())
@@ -275,7 +284,7 @@ mod tests {
             lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
         let at = |tid: u32| {
             let p = layout.placements[&tid];
-            SEGMENT_OFFSETS[p.segment as usize] + p.offset
+            SEGMENT_OFFSETS[p.segment] + p.offset
         };
         let (out, window) = (at(ir.result.index() as u32), at(TP_RECV_TID));
         for rank in 0..2u64 {
@@ -316,6 +325,60 @@ mod tests {
                  window, at the peer's"
             );
         }
+    }
+
+    /// ⭐ THE SEND'S STATIC AUDIT: in the input dxp compiles, the send is ONE copy from the partial's
+    /// own placement to the receive window's — `SEGMENT_OFFSETS[1] + window offset` — the address the
+    /// send's launch translates to the PEER's weight segment, so the store lands in the peer's
+    /// window. Read as the descriptor's (source, destination) pair.
+    #[test]
+    fn the_send_copies_the_partial_to_the_window() {
+        use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
+        use crate::lower_subtile_tape_to_superdsc::{FoldGrouping, render_dxp_input};
+        use ktir_superdsc::ktir_node::ActiveCap;
+        use ktir_superdsc::reserved_tids::TP_RECV_TID;
+        use ktir_superdsc::wire::SEGMENT_OFFSETS;
+        use scratchy_subtile::fixtures::mlp_sublayer;
+        use scratchy_subtile::subtile_ir::{SubOp, lower_region};
+
+        let b = tp_bake(&mlp_sublayer(2048, 8192), SpyreWorld::of::<2>()).unwrap();
+        let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
+        let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
+        let (ops, layout) =
+            lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+        let at = |tid: u32| {
+            let p = layout.placements[&tid];
+            SEGMENT_OFFSETS[p.segment] + p.offset
+        };
+        let partial = ir
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, SubOp::AllReduce))
+            .unwrap()
+            .inputs[0]
+            .tensor
+            .index() as u32;
+        let sends: Vec<_> = ops
+            .iter()
+            .filter(|e| e.tp_send.is_some())
+            .map(|e| e.shallow_copy())
+            .collect();
+        assert_eq!(sends.len(), 1, "one send per all-reduce");
+        let rendered = render_dxp_input(&sends, FoldGrouping::Split).unwrap();
+        let mut copies = Vec::new();
+        for g in &rendered {
+            for (name, body) in &g.files {
+                if name.ends_with(".json") {
+                    let mut firsts = Vec::new();
+                    core0_starts(&serde_json::from_str(body).unwrap(), &mut firsts);
+                    if let [src, dst] = firsts[..] {
+                        copies.push((src, dst));
+                    }
+                }
+            }
+        }
+        assert_eq!(copies, vec![(at(partial), at(TP_RECV_TID))]);
+        assert_eq!(layout.placements[&TP_RECV_TID].segment, 1, "the window is in segment 1");
     }
 
     /// Core 0's start address of every tensor a descriptor states, in its `scheduleTree_` order.
@@ -398,7 +461,9 @@ mod tests {
             let sends = steps.iter().filter(|s| matches!(s, CbStep::Send { .. })).count();
             let waits = steps.iter().filter(|s| matches!(s, CbStep::Wait { .. })).count();
             assert_eq!((sends, waits), (1, 1), "rank {} sends once and waits once", id.rank());
-            assert_eq!(steps.len(), groups.len() - 1 + 2, "the other rank's consume is skipped");
+            // One step per group it plays (the other rank's consume skipped), plus its consume's
+            // wait.
+            assert_eq!(steps.len(), groups.len() - 1 + 1, "the other rank's consume is skipped");
         }
     }
 

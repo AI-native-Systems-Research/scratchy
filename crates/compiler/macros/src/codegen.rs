@@ -10455,7 +10455,36 @@ fn launch_tokens(
         gathered,
         fold_rows,
         tp,
+        send,
     } = kv;
+    // A collective's send: its kind, operand and fragment, re-minted through the same const
+    // `Fragment::baked` the consume's is.
+    let send = match send {
+        None => quote! { ::core::option::Option::None },
+        Some(s) => {
+            use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::collective::CollectiveKind as K;
+            let kind = match s.kind {
+                K::AllReduce => {
+                    quote! { ::scratchy_target_spyre::bundle_code::collective::CollectiveKind::AllReduce }
+                }
+                K::AllGather => {
+                    quote! { ::scratchy_target_spyre::bundle_code::collective::CollectiveKind::AllGather }
+                }
+            };
+            let operand = place_id_tokens(&s.operand);
+            let [first, sticks, rows] = [s.fragment.first_stick(), s.fragment.sticks(), s.fragment.rows()]
+                .map(proc_macro2::Literal::u32_unsuffixed);
+            quote! {
+                ::core::option::Option::Some(::scratchy_target_spyre::bundle_code::collective::TpSend {
+                    kind: #kind,
+                    operand: #operand,
+                    fragment: ::scratchy_target_spyre::bundle_code::collective::Fragment::baked(
+                        #first, #sticks, #rows,
+                    ),
+                })
+            }
+        }
+    };
     // A collective's consume: its kind, the operand it sends, and the fragment — re-minted through
     // `Fragment::baked`, a `const fn`, so the static this lands in re-proves the fragment's law.
     let tp = match tp {
@@ -10549,6 +10578,7 @@ fn launch_tokens(
                 gathered: #gathered,
                 fold_rows: #fold_rows,
                 tp: #tp,
+                send: #send,
             },
             programs: ::std::borrow::Cow::Borrowed(&[#(#progs),*]),
             init_binary: #image,

@@ -1046,6 +1046,57 @@ fn ktir_only(k: ktir_superdsc::ktir_node::KtirNode) -> EmittedOp {
 /// that grain. KTIR does not: a node's whole computation is one `func`, with its inputs loaded from
 /// HBM and its output stored back, and the work division stated INSIDE it as the grid and its
 /// loops. So this walk yields one [`EmittedOp`] per node, carrying that program.
+/// ⭐ A COLLECTIVE'S SEND — device p2p. ONE block copy (`scratchy_triton_splice::lower_block_copy`,
+/// the identity program dxp compiles) from this rank's whole operand `x` into the receive window,
+/// marked with the [`TpSend`] its launch group carries: the CB pipeline launches it with the
+/// weight segment translated to the PEER's region, so the copy's store lands in the peer's window
+/// through this card's own store path. The program is the same on every rank.
+///
+/// ⛔ ONE FRAGMENT: a block copy moves a WHOLE source, so an operand wider than one p2p message is
+/// refused by name — every collective the analysis weaves at decode, and at prefill up to a
+/// message, fits one.
+///
+/// [`TpSend`]: ktir_superdsc::collective::TpSend
+fn collective_send<F: RopeForm>(
+    node: &SubtileNode<F>,
+    kind: ktir_superdsc::collective::CollectiveKind,
+) -> Result<(EmittedOp, ktir_superdsc::collective::Fragment), NodeLowering> {
+    use scratchy_subtile::subtile_ir::{Range, Region, TensorRegion};
+    let x = node.inputs[0];
+    let (rows, cols) = (x.region.rows.len, x.region.cols.len);
+    let fragment = match crate::tp_plan::consume_fragments(rows, cols).as_deref() {
+        Ok([f]) => *f,
+        Ok(more) => {
+            return Err(NodeLowering::Unhandled(format!(
+                "the {kind:?} operand [{rows}, {cols}] is {} p2p fragments — a send moves a whole \
+                 operand, so a collective wider than one message is not lowered",
+                more.len()
+            )));
+        }
+        Err(why) => {
+            return Err(NodeLowering::Unhandled(format!(
+                "the {kind:?} operand [{rows}, {cols}] cannot be cut into p2p fragments: {why:?}"
+            )));
+        }
+    };
+    let window = TensorRegion {
+        tensor: TensorId::from_index(ktir_superdsc::reserved_tids::TP_RECV_TID as usize),
+        region: Region {
+            rows: Range::new(0, rows),
+            cols: Range::new(0, cols),
+        },
+    };
+    let name = format!("tpsend_s{}", node.id.index());
+    let mut e = scratchy_triton_splice::lower_block_copy(node, x, window, cols, &name)
+        .map_err(NodeLowering::Unhandled)?;
+    e.tp_send = Some(ktir_superdsc::collective::TpSend {
+        kind,
+        operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
+        fragment,
+    });
+    Ok((e, fragment))
+}
+
 /// The all-reduce's consume launches: per stick-column fragment of the operand
 /// ([`crate::tp_plan::consume_fragments`], the same cut the window is sized over), the `Add` splice
 /// over this rank's fragment and the receive window, each marked with the [`TpConsume`] its launch
@@ -1065,17 +1116,16 @@ fn all_reduce_consumes<F: RopeForm>(
     use ktir_superdsc::collective::{CollectiveKind, TpConsume};
     use scratchy_subtile::subtile_ir::{EwKind, Range, Region, TensorRegion};
     let x = node.inputs[0];
-    let (rows, cols) = (x.region.rows.len, x.region.cols.len);
-    let frags = match crate::tp_plan::consume_fragments(rows, cols) {
-        Ok(f) => f,
-        Err(why) => {
-            return NodeLowering::Unhandled(format!(
-                "the all-reduce operand [{rows}, {cols}] cannot be cut into p2p fragments: {why:?}"
-            ));
-        }
+    let rows = x.region.rows.len;
+    // The send first — this rank's partial into the peer's window — then the consume.
+    let (send, fragment) = match collective_send(node, CollectiveKind::AllReduce) {
+        Ok(s) => s,
+        Err(refusal) => return refusal,
     };
+    let frags = [fragment];
     let window = TensorId::from_index(ktir_superdsc::reserved_tids::TP_RECV_TID as usize);
-    let mut ops = Vec::with_capacity(frags.len());
+    let mut ops = Vec::with_capacity(1 + frags.len());
+    ops.push(send);
     for (k, f) in frags.into_iter().enumerate() {
         let cols_at = |start: u32| Range::new(start + f.first_col(), f.cols());
         let consume = SubtileNode {
@@ -1151,20 +1201,10 @@ fn all_gather_consumes<F: RopeForm>(node: &SubtileNode<F>, cols: u32) -> NodeLow
             world.get()
         ));
     }
-    let fragment = match crate::tp_plan::consume_fragments(rows, lc).as_deref() {
-        Ok([f]) => *f,
-        Ok(more) => {
-            return NodeLowering::Unhandled(format!(
-                "the all-gather's [{rows}, {lc}] block is {} p2p fragments — a block copy moves a \
-                 whole source, so a gather wider than one message is not lowered",
-                more.len()
-            ));
-        }
-        Err(why) => {
-            return NodeLowering::Unhandled(format!(
-                "the all-gather operand [{rows}, {lc}] cannot be cut into p2p fragments: {why:?}"
-            ));
-        }
+    // The send first — this rank's block into the peer's window — then the rank-selected consumes.
+    let (send, fragment) = match collective_send(node, CollectiveKind::AllGather) {
+        Ok(s) => s,
+        Err(refusal) => return refusal,
     };
     let window = TensorRegion {
         tensor: TensorId::from_index(ktir_superdsc::reserved_tids::TP_RECV_TID as usize),
@@ -1180,7 +1220,8 @@ fn all_gather_consumes<F: RopeForm>(node: &SubtileNode<F>, cols: u32) -> NodeLow
             cols: Range::new(node.output.region.cols.start + rank * lc, lc),
         },
     };
-    let mut ops = Vec::with_capacity(2 * world.get() as usize);
+    let mut ops = Vec::with_capacity(1 + 2 * world.get() as usize);
+    ops.push(send);
     for id in world.ranks() {
         let Some(peer) = id.peer() else {
             return NodeLowering::Unhandled("a two-rank world's rank has no peer".to_string());
