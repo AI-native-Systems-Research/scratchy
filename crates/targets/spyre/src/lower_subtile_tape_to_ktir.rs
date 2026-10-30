@@ -2615,6 +2615,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     let attn_params = attn_bundle_params(ir, rows_are_requests);
     // The declare pass walks prefix → EVERY body → suffix, the same order the tape walk
     // declared them in, so every synthetic's first-one-wins offset is fixed identically.
+    let pools = crate::lower_subtile_tape_to_superdsc::kv_pool_tids(ir);
     let body_op_lists: Vec<&Vec<EmittedOp>> = bodies.iter().map(|b| &b.ops).collect();
     for ops in std::iter::once(&prefix)
         .chain(body_op_lists.iter().copied())
@@ -2623,9 +2624,11 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         let mut declare_syms: i64 = 0;
         for e in ops.iter() {
             let Some(k) = e.ktir.as_ref() else { continue };
-            // The paged step declares into the card's plan on a card build only: the emulator
-            // runs it as KTIR over its sources bound by tid (`Program::declares_on_emulator`).
-            if !cfg!(feature = "spyre-hw") && !k.program.declares_on_emulator() {
+            // An emulator bake leaves the KV cache to the emulator — the KTIR's own buffers
+            // ([`crate::lower_subtile_tape_to_superdsc::kv_pool_tids`], placed on a card bake
+            // only) — so a program binding it has no card plan to declare into there. A card
+            // bake declares every program.
+            if !cfg!(feature = "spyre-hw") && k.bindings.iter().any(|b| pools.contains(&b.get())) {
                 continue;
             }
             crate::ktir_superdsc_door::lower(

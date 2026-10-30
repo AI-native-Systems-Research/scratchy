@@ -672,6 +672,24 @@ fn stage_registry_scalars<F: RopeForm>(op: &mut SubOp<F>) -> bool {
 /// All sizes are f16 bytes (`rows*cols*2`), 128 B aligned. A build-time disjointness
 /// guard ([`bundle_layout_aliases`]) asserts no two SIMULTANEOUSLY-LIVE tensors in a
 /// segment overlap — a silent on-card aliasing write is a `cargo build` Err.
+/// THE KV POOLS — every attention's K and V cache tensors, each once, in layer order: what a card
+/// bake places in the KV segment ([`compute_bundle_layout`]) and an emulator bake leaves to the
+/// emulator, which holds them as the KTIR's own buffers.
+pub fn kv_pool_tids<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<u32> {
+    let mut pools: Vec<u32> = Vec::new();
+    for n in &ir.nodes {
+        if let SubOp::AttnDecode { layout: kv, .. } = &n.op {
+            for t in [kv.cache_tensor(), kv.v_cache_tensor()] {
+                let tid = t.index() as u32;
+                if !pools.contains(&tid) {
+                    pools.push(tid);
+                }
+            }
+        }
+    }
+    pools
+}
+
 pub fn compute_bundle_layout<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
@@ -913,21 +931,13 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    emulator runs the paged step as KTIR over the cache tensors bound by tid, and a model whose
     //    pools outgrow one device region (`max_position_embeddings` pages of every layer) is refused
     //    by the address audit on the card it cannot fit, not on an emulator that never places them.
-    let mut pools: Vec<u32> = Vec::new();
-    if cfg!(feature = "spyre-hw") {
-        for n in &ir.nodes {
-            if let SubOp::AttnDecode { layout: kv, .. } = &n.op {
-                for t in [kv.cache_tensor(), kv.v_cache_tensor()] {
-                    let tid = t.index() as u32;
-                    if !pools.contains(&tid) {
-                        pools.push(tid);
-                    }
-                }
-            }
-        }
-        for &tid in &pools {
-            pack(tid, SegRole::Kv, &mut seg_bytes, &mut placements);
-        }
+    let pools = if cfg!(feature = "spyre-hw") {
+        kv_pool_tids(ir)
+    } else {
+        Vec::new()
+    };
+    for &tid in &pools {
+        pack(tid, SegRole::Kv, &mut seg_bytes, &mut placements);
     }
     // Logits (seg4) — the graph result (it is also produced by an op, but its role
     // is OUTPUT; classify it before intermediates so it is not pool-coalesced).
