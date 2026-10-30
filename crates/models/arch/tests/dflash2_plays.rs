@@ -67,18 +67,21 @@ fn its_context_rows_and_verify_rows_are_its_targets() {
     }
 }
 
-/// Its block draft runs a step's lanes' blocks, at most its target's verify rows (8 here): every
-/// bucket past the one holding them plays its context commit alone, and its arena holds none of
-/// the block's tiles — the lm_head's logits, a vocabulary a row, above all (Splash's two draft
-/// graphs, runtime/model/DFlashDraft.cpp, size their buffers apart).
+/// Its block draft runs a step's lanes' blocks, at most its target's verify rows (32 here: Splash's
+/// four lanes of eight, SPLASH_MAXIMUM_BATCH_WIDTH): every bucket past the one holding them plays
+/// its context commit alone, and its arena holds none of the block's tiles — the lm_head's logits,
+/// a vocabulary a row, above all (Splash's two draft graphs, runtime/model/DFlashDraft.cpp, size
+/// their buffers apart).
 #[test]
 fn buckets_past_its_block_play_its_commit_alone() {
     use scratchy_models::dflash2::qwen3_6_35b_a3b_dflash2_mlx_affine_b4_g64_qembed as drafter;
+    let buckets = drafter::METAL_BUCKETS.iter().map(|spec| spec.bucket_m);
+    let holding = (buckets.filter(|&m| m >= 32).min()).expect("a bucket holding the verify rows");
     for spec in drafter::METAL_BUCKETS {
         let m = spec.bucket_m;
         assert_eq!(
             spec.plays_result,
-            m <= 8,
+            m <= holding,
             "m={m}: whether it plays its block draft"
         );
         let logits = u64::from(m) * 248_320 * 2;
