@@ -5312,15 +5312,32 @@ fn trip_kinds_for(ops: &[EmittedOp], fold: FoldGrouping) -> (Vec<Trip>, Vec<usiz
     let (mut kinds, owner) = trip_kinds_and_owner(ops);
     if fold == FoldGrouping::Fused {
         for (t, &o) in kinds.iter_mut().zip(&owner) {
-            // ⛔ A WALK'S BODY IS NEVER FUSED AWAY: its relaunch count is the walk's own, baked with
-            // the rung, and running it once would attend one block.
-            if matches!(t.kind, GroupKind::PageFold { .. }) && ops[o].walk.is_none() {
+            if fuses_away(t, &ops[o]) {
                 // Reclassified, but it KEEPS ITS REQUEST — so it still cannot fuse across requests.
                 t.kind = GroupKind::Pure;
             }
         }
     }
     (kinds, owner)
+}
+
+/// The one trip [`FoldGrouping::Fused`] regroups: a per-page fold. ⛔ A WALK'S BODY IS NEVER FUSED
+/// AWAY: its relaunch count is the walk's own, baked with the rung, and running it once would attend
+/// one block.
+fn fuses_away(t: &Trip, op: &EmittedOp) -> bool {
+    matches!(t.kind, GroupKind::PageFold { .. }) && op.walk.is_none()
+}
+
+/// ⭐ WHETHER `ops` HAS A FOLD-FUSED TWIN TO BAKE — whether [`FoldGrouping::Fused`] groups them
+/// differently from [`FoldGrouping::Split`] at all. Where no trip fuses away, the "twin" is the split
+/// bundle's program again under a second fingerprint: a second dxp compile and a second copy in the
+/// image, which the selector would then prefer over the split body it equals.
+pub fn has_fused_twin(ops: &[EmittedOp]) -> bool {
+    let (kinds, owner) = trip_kinds_and_owner(ops);
+    kinds
+        .iter()
+        .zip(&owner)
+        .any(|(t, &o)| fuses_away(t, &ops[o]))
 }
 
 /// This op's own single `Dsc` (every `EmittedOp` wraps exactly one `dscs_` entry — `emit_sdsc`/
