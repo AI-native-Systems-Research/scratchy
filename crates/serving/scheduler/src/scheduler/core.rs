@@ -3019,8 +3019,10 @@ impl Scheduler {
         resumed_reqs: &[usize],
         num_scheduled_tokens: &HashMap<String, usize>,
         req_to_new_blocks: &HashMap<String, Vec<Vec<usize>>>,
+        state_saves: &[StateSnapshotOp],
     ) -> CachedRequestData {
         let mut req_ids = Vec::new();
+        let mut state_save_points = Vec::new();
         let mut resumed_req_ids = HashSet::new();
         let mut new_token_ids = Vec::new();
         let mut new_block_ids = Vec::new();
@@ -3041,6 +3043,16 @@ impl Scheduler {
             if is_resumed {
                 resumed_req_ids.insert(req_id.clone());
             }
+            // A resumed request's save points, as a new request's: those this step passes and
+            // saves at, then those ahead.
+            state_save_points.push(match is_resumed {
+                true => (state_saves.iter())
+                    .filter(|op| op.req_id == req_id)
+                    .map(|op| op.position)
+                    .chain(self.kv_cache.state_save_points(&req_id))
+                    .collect(),
+                false => Vec::new(),
+            });
 
             if send_pp_tokens {
                 let num_tokens = num_scheduled_tokens.get(&req_id).copied().unwrap_or(0);
@@ -3068,6 +3080,7 @@ impl Scheduler {
             new_block_ids,
             num_computed_tokens: num_computed_tokens_vec,
             num_output_tokens: num_output_tokens_vec,
+            state_save_points,
         }
     }
 
@@ -3848,6 +3861,7 @@ impl SchedulerInterface for Scheduler {
             &scheduled_resumed_reqs,
             &num_scheduled_tokens,
             &req_to_new_blocks,
+            &state_saves,
         );
 
         let preempted_req_ids: HashSet<String> =
@@ -9094,6 +9108,9 @@ mod tests {
             out.recurrent_state.saves.is_empty(),
             "its prompt end is already snapshotted"
         );
+        let points = &out.scheduled_cached_reqs.state_save_points;
+        assert_eq!(points.len(), out.scheduled_cached_reqs.req_ids.len());
+        assert!(points[i].is_empty(), "nor does it save one ahead");
     }
 
     #[test]

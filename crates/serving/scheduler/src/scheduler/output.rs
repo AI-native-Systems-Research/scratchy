@@ -123,6 +123,11 @@ pub struct CachedRequestData {
 
     /// Number of output tokens for each request.
     pub num_output_tokens: Vec<u32>,
+
+    /// For each resumed request, the points its recurrent state saves prefix-cache snapshots at,
+    /// as [`NewRequestData::state_save_points`]; empty for every other.
+    #[serde(default)]
+    pub state_save_points: Vec<Vec<u32>>,
 }
 
 impl CachedRequestData {
@@ -135,6 +140,7 @@ impl CachedRequestData {
             new_block_ids: Vec::new(),
             num_computed_tokens: Vec::new(),
             num_output_tokens: Vec::new(),
+            state_save_points: Vec::new(),
         }
     }
 
@@ -405,6 +411,7 @@ mod tests {
             new_block_ids: vec![None, Some(vec![vec![5, 6]])],
             num_computed_tokens: vec![100, 50],
             num_output_tokens: vec![10, 5],
+            state_save_points: vec![Vec::new(), vec![48]],
         };
         assert_eq!(crd.num_reqs(), 2);
         assert!(crd.resumed_req_ids.contains("r2"));
@@ -458,6 +465,7 @@ mod tests {
                 new_block_ids: vec![None],
                 num_computed_tokens: vec![50],
                 num_output_tokens: vec![10],
+                state_save_points: vec![Vec::new()],
             },
             num_scheduled_tokens: num_scheduled,
             total_num_scheduled_tokens: 150,

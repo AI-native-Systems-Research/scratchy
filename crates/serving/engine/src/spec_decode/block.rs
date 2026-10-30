@@ -589,6 +589,41 @@ mod tests {
         assert!(passes.block.expect("drafts").drafts);
     }
 
+    /// A sequence admitted at a hit at 32, preempted, and resumed from 0 over its prompt and reply
+    /// (44 tokens) replays from where it resumes: its first plan refuses rows before its own
+    /// replay, and planned again on resuming, it commits the window before its new end.
+    #[test]
+    fn a_resumed_sequence_replays_from_where_it_resumes() {
+        let drafter = BlockDrafter {
+            window: 16,
+            ..DRAFTER
+        };
+        let mut contexts = DraftContexts::new(16);
+        contexts.plan("a", 32, 40, &[]).expect("a plan");
+        let chunk = |from: u32, to: u32| Step {
+            req_ids: vec!["a".into()],
+            input_ids: (from + 100..to + 100).collect(),
+            positions: (from..to).collect(),
+            cu: vec![0, to - from],
+            history: vec![44],
+            sampled: SampledRows::of(&[0, to - from], |_| false).expect("rows"),
+        };
+        let replay = |contexts: &DraftContexts, from, to| {
+            (drafter.passes(&chunk(from, to).rows(), &plan(&["a"]), contexts))
+                .map(|p| p.map(|p| p.commit.positions))
+        };
+        assert_eq!(
+            replay(&contexts, 0, 16),
+            Err(DraftContextError::DispatchOutsideReplay),
+            "the plan of its first replay refuses its second"
+        );
+        contexts.release("a");
+        contexts.plan("a", 0, 44, &[]).expect("a plan");
+        assert_eq!(replay(&contexts, 0, 16), Ok(None));
+        assert_eq!(replay(&contexts, 16, 32), Ok(Some((28..32).collect())));
+        assert_eq!(replay(&contexts, 32, 44), Ok(Some((32..44).collect())));
+    }
+
     /// A sequence verifying the 3 rows of its block its budget chose (its anchor 500, drafts 501
     /// and 502) commits as a cycle's lane all the same.
     #[test]

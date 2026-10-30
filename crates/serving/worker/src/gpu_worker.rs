@@ -7626,7 +7626,35 @@ impl Worker for MetalWorker {
                 self.kv_cached_through.remove(req_id);
             }
         }
+        // So must its drafter's: its ring slot, its cycle and its draft context plan, all for a
+        // replay it no longer runs.
+        if let (Some(d), Some(preempted)) =
+            (self.dflash2.as_mut(), &scheduler_output.preempted_req_ids)
+        {
+            for req_id in preempted {
+                d.release(req_id);
+            }
+        }
         self.input_batch.update_states(scheduler_output);
+        // A resumed request replays its prompt and reply from where it resumes, planned as a new
+        // request's prompt is.
+        if let Some(d) = self.dflash2.as_mut() {
+            let cached = &scheduler_output.scheduled_cached_reqs;
+            for (i, req_id) in cached.req_ids.iter().enumerate() {
+                if !cached.resumed_req_ids.contains(req_id) {
+                    continue;
+                }
+                let end = self.input_batch.token_count(req_id) as u32;
+                let saves = cached.state_save_points.get(i).map_or(&[][..], |s| &s[..]);
+                (d.contexts
+                    .plan(req_id, cached.num_computed_tokens[i], end, saves))
+                .map_err(|e| {
+                    ExecutorError::WorkerExecution(format!(
+                        "{req_id}: its draft context plan on resuming: {e:?}"
+                    ))
+                })?;
+            }
+        }
         // A recompute over cached KV, from the request's (re)admission on.
         for op in &scheduler_output.recurrent_state.cached_kv {
             (self.kv_cached_through).insert(op.req_id.clone(), op.through as usize);
