@@ -250,6 +250,8 @@ pub fn lower(
         // arm keys on the stated `Program` and refuses a copy that grew a compute op rather than
         // half-lowering it.
         Program::LmLast => lower_function(k, layout, sym_id_base, None),
+        // An all-gather consume's block copy — the same pure-copy arm of the walk.
+        Program::BlockCopy => lower_function(k, layout, sym_id_base, None),
         Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
         Program::Attn => attn(name, k, &r, sym_id_base, layout, attn_params),
         // ⭐ NO DOOR TO CROSS. A transpose's descriptor is parameterised by the two extents its own

@@ -285,6 +285,18 @@ pub fn lmlast_row() -> TritonKernelRow {
     }
 }
 
+/// THE BLOCK COPY — an all-gather consume's leg (`blockcopy.py`), placed by
+/// [`lower_block_copy`], which the spyre emitter's collective arm calls; no `SubOp` reaches it
+/// through [`row`].
+pub fn blockcopy_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/blockcopy.py"),
+        file: "blockcopy.py",
+        entry: "blockcopy_fwd",
+        program: Program::BlockCopy,
+    }
+}
+
 /// THE ATTENTION FAMILY — one row, one kernel, every shape: `attn.py`'s own three
 /// constexpr-selected arms (the causal one-pass, decode, prefill continuation) are the
 /// builder's own three arms restated, so the row does not branch on shape at all.
@@ -1402,6 +1414,68 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
     let matmul = lower_one(&at_m1, ir, false)?;
 
     Ok(vec![extract, matmul])
+}
+
+/// THE BLOCK COPY'S PRODUCER — `dst = src` for a whole source (a graph tensor, or the receive
+/// window beyond the graph) and a destination region that is a column window `[0, R) × [off,
+/// off + C_SRC)` of a `dst_cols`-wide tensor: one spliced `blockcopy.py` program named `name`.
+/// `node` is the collective the copy realizes — its id and op key the program like every other.
+pub fn lower_block_copy<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    src: scratchy_subtile::subtile_ir::TensorRegion,
+    dst: scratchy_subtile::subtile_ir::TensorRegion,
+    dst_cols: u32,
+    name: &str,
+) -> Result<EmittedOp, String> {
+    let (rows, c_src) = (src.region.rows.len, src.region.cols.len);
+    let off = dst.region.cols.start;
+    let stk = 64u32; // Fp16::ELEMS_PER_STICK — the stick the door's block copy checks
+    if !c_src.is_multiple_of(stk) || !dst_cols.is_multiple_of(stk) || !off.is_multiple_of(stk) {
+        return Err(format!(
+            "triton splice: {name}: a block of {c_src} columns at column {off} of a {dst_cols}-wide \
+             destination is not a run of whole {stk}-fp16 sticks"
+        ));
+    }
+    let src_py = match blockcopy_row() {
+        TritonKernelRow::Spliced { src, .. } => src,
+        TritonKernelRow::Refused(why) => return Err(why.to_string()),
+    };
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for p in ["desc_src", "desc_dst"] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+        );
+    }
+    for (k, v) in [
+        ("R", rows),
+        ("C_SRC", c_src),
+        ("C_DST", dst_cols),
+        ("COL_OFF", off),
+        ("N_STICKS", rows * (c_src / stk)),
+    ] {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
+    }
+    let spec = KernelSpec {
+        file: "blockcopy.py".to_string(),
+        kernel: "blockcopy_fwd".to_string(),
+        signature,
+        constexprs,
+    };
+    let module = compile_kernel(src_py, &spec, &[1])?;
+    let copy = SubtileNode {
+        id: node.id,
+        op: node.op,
+        inputs: vec![src],
+        output: dst,
+    };
+    let mut k = mint(&copy, module, &Program::BlockCopy, default_bindings(&copy))?;
+    k.func.name = Arena::global().str(name.to_string());
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(e)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -3142,6 +3216,7 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::TanhSoftCap => "tanhsoftcap",
         Program::ScalarWeightMul => "scalarwmul",
         Program::Reshape => "reshape",
+        Program::BlockCopy => "blockcopy",
         // ⭐ THE SAMPLER'S OWN STEM — #813's argmax law: a spliced whole-function kernel
         // keeps its own name (`argmax_s{id}`), never the generic `triton`, so a bake log
         // names the draw's descriptors for what they are.

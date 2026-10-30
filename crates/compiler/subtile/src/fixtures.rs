@@ -288,6 +288,42 @@ pub fn mlp_sublayer(h: u32, i: u32) -> LoweringInput {
     }
 }
 
+/// A decode VOCABULARY PROJECTION: `rmsnorm(x) · W`, `W: [h, v]`, as the forward's result.
+/// Sources: `0` x `[1, h]`, `1` the norm gain, `2` W.
+///
+/// The smallest forward tensor parallelism weaves an ALL-GATHER into: sharded two ways, W splits
+/// by columns (each rank projects onto its half of the vocabulary) and the result — read whole by
+/// the host — needs the halves gathered.
+pub fn vocab_projection(h: u32, v: u32) -> LoweringInput {
+    LoweringInput {
+        sources: vec![
+            SourceShape { rows: 1, cols: h },
+            SourceShape { rows: 1, cols: h },
+            SourceShape { rows: h, cols: v },
+        ],
+        ops: vec![
+            OpDesc {
+                op: SubOp::RmsNorm {
+                    eps: 1e-5,
+                    gain: GainConvention::Scale,
+                },
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            },
+            OpDesc {
+                op: SubOp::MatmulTile {
+                    n: v,
+                    weight: crate::lower::GemmWeight::Dense,
+                },
+                m: 1,
+                inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
+            },
+        ],
+        result: 1,
+        exported: None,
+    }
+}
+
 /// A minimal NON-ATTENTION chain: `n` layers of `RmsNorm -> Gemm ->
 /// Add(residual)` with DISTINCT per-layer weights, parameterized by the row
 /// count `m`. Isolates the m-AGNOSTIC re-roll + strided-store path (RmsNorm /
