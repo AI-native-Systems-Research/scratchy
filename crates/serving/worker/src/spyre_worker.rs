@@ -54,7 +54,7 @@ pub(crate) struct InFlightDecode {
     /// Which rung's session owns this step's executor — every rung is its own session/stream,
     /// and only the submitting session can finish the read. `Owner` = the W=1 decode session.
     pub(crate) rung: crate::spyre_types::RungId,
-    /// Per live row, in `decode_ids` order: `(request id, pool start, launch slot)`.
+    /// Per live row, in `decode_ids` order: `(request id, position, launch slot)`.
     pub(crate) rows: Vec<(String, usize, usize)>,
 }
 
@@ -95,30 +95,10 @@ pub struct SpyreWorker {
     /// appends)"*. This path used to keep its own `Vec<usize>` per request (and before that, pages the
     /// worker ALLOCATED ITSELF from a free list, which is what made a prefix-cache hit meaningless).
     ///
-    /// ⛔ ONLY THE BLOCK TABLE, FOR NOW. The rest of `ReqState` — tokens, `n_computed`, the KV row, and
-    /// `KvHistory` — is not migrated: the first three duplicate `InputBatch` fields and SHOULD move, and
-    /// `KvHistory` is genuinely this backend's (a pool whose batched write appends every row at one slot
-    /// has no counterpart on cuda/metal). Migrating the rest is mechanical and belongs in its own change,
-    /// not bundled with a correctness fix.
+    /// The tokens and the token count live here too; `ReqState` keeps only a request's draw.
     pub(crate) input_batch: scratchy_serving_engine::input_batch::InputBatch,
-    /// HOW MANY REQUESTS THIS RUN MAY ADMIT AT ONCE — `--max-num-seqs`, as the scheduler was configured.
-    ///
-    /// ⛔ IT IS HERE BECAUSE THE POOL'S HOLE RESERVE IS CHARGED AGAINST IT. `PoolPartition` holds back
-    /// `rows * HOLE_PAGES_PER_ROW + 1` pages for the masked holes a LAUNCH's rows write into, and `rows`
-    /// used to be the widest rung the ladder bakes (32) regardless of what the run would admit — 65 of a
-    /// 136-page pool, against launches a `--max-num-seqs 4` run cannot perform. This is the decided value
-    /// that replaces the guess; [`PoolRows::for_admission`] rounds it UP to a ladder rung.
-    ///
-    /// `None` when the cap is unusable (zero), in which case the pool falls back to the widest rung — a
-    /// pool cut for FEWER rows than a launch binds would address slots it never seated, so the fallback
-    /// direction is the safe one.
-    pub(crate) admitted: Option<scratchy_subtile::sdsc_abstract::AdmittedRequests>,
     /// HOW DEEP ONE REQUEST MAY GO — `--max-model-len`, as the CLI gave it. `None` falls back to the
-    /// model's own `max_position_embeddings`.
-    ///
-    /// ⛔ THE OTHER HALF OF WHAT SIZES THE POOL, and it did not exist here until the pool stopped being
-    /// sized by a constant. See [`SpyreWorker::declare_workload`] and
-    /// [`scratchy_subtile::sdsc_abstract::PoolDemand`].
+    /// model's own `max_position_embeddings`. The bake's KV pool must hold it, or the load refuses.
     pub(crate) declared_context: Option<usize>,
     /// WHAT FRACTION OF THE CARD THIS RUN MAY SPEND — `--gpu-memory-utilization`, as the CLI gave it.
     ///
@@ -143,7 +123,6 @@ impl SpyreWorker {
             #[cfg(feature = "spyre-hw")]
             seating: None,
             input_batch: scratchy_serving_engine::input_batch::InputBatch::new(),
-            admitted: None,
             declared_context: None,
             // Matches the CLI's own `--gpu-memory-utilization` default; `declare_workload` overwrites
             // it with what the run actually asked for.
@@ -151,32 +130,10 @@ impl SpyreWorker {
         }
     }
 
-    /// Tell this worker THE WHOLE DECLARED WORKLOAD — `--max-num-seqs` and `--max-model-len` — before
-    /// `load_model` sizes the pool from it.
-    ///
-    /// Separate from `new` because `WorkerConfig` is the engine's shared struct and these are scheduler
-    /// numbers that only this backend's pool arithmetic consumes — adding them there would put fields on
-    /// cuda's and metal's config that neither reads. The factory calls this immediately after `new`.
-    ///
-    /// ⛔ ONE SETTER FOR BOTH, BECAUSE THE POOL NEEDS BOTH AND NEITHER IS RECOVERABLE FROM THE OTHER.
-    /// `PoolDemand` is `depth × width`: with only the width (which is all this used to take) the depth
-    /// fell back to a constant, and a constant depth is what made the pool's size unanswerable against
-    /// what the caller asked for. Two setters would let a future caller set one and leave the other at a
-    /// default, silently restoring exactly that.
-    ///
-    /// `max_num_seqs` is the REQUEST (`Option`): `None` (unset `--max-num-seqs`) leaves `admitted` unset,
-    /// which sizes the pool at the WIDEST rung the bake can express — the same width
-    /// `Worker::max_num_seqs_override` then reports to the scheduler, so a bare `scr serve` runs at the
-    /// widest batched decode this bake can do. `Some(n)` declares `n` and the pool is cut for it (the
-    /// budget still refuses a declaration it cannot hold).
-    pub fn declare_workload(
-        &mut self,
-        max_num_seqs: Option<usize>,
-        max_model_len: Option<usize>,
-        gpu_memory_utilization: f64,
-    ) {
-        self.admitted =
-            max_num_seqs.and_then(scratchy_subtile::sdsc_abstract::AdmittedRequests::new);
+    /// Tell this worker its declared workload — `--max-model-len`, which the bake's KV pool must hold,
+    /// and `--gpu-memory-utilization`, the card fraction the sessions may spend — before `load_model`
+    /// checks both. The concurrency is the decode ladder's to state (`Worker::max_num_seqs_override`).
+    pub fn declare_workload(&mut self, max_model_len: Option<usize>, gpu_memory_utilization: f64) {
         self.declared_context = max_model_len;
         self.gpu_memory_utilization = gpu_memory_utilization;
     }
@@ -214,29 +171,14 @@ impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFacto
         device == "spyre" || device == "auto"
     }
 
-    /// ⭐ TRUE, AND THE THREE THINGS THAT MAKE IT TRUE.
+    /// ⭐ TRUE, AND THE TWO THINGS THAT MAKE IT TRUE. What a cache hit needs is that the reusing
+    /// request's keys for the shared prefix ARE the earlier request's keys:
     ///
-    /// It was `false` for a year, with a comment saying the pool "cannot support it BY CONSTRUCTION"
-    /// because `PageRun::physical(lp) = row * pages_per_row + lp` gave every row an exclusive page
-    /// stripe. The striping was real; "by construction" was not — it described a layout WE chose so one
-    /// launch could stride the batch, and the device's actual limit is that it has no indirect
-    /// addressing. The refusal was a feature switched off so a batch test would pass.
-    ///
-    /// What a cache hit needs is that the reusing request's keys for the shared prefix ARE the earlier
-    /// request's keys. That now holds because:
-    ///
-    /// 1. **A REQUEST'S PAGES ARE THE SCHEDULER'S BLOCKS.** `install_host_blocks` installs
-    ///    `block_ids` / `new_block_ids` through [`BlockTable`], whose only constructor takes host ids —
-    ///    so the free-list search that used to fill the map (a second allocator over the scheduler's own
-    ///    pool) cannot be written again, and a hit hands both requests the same physical page.
-    /// 2. **THE POOL AND THE ALLOCATOR AGREE ON THE PAGE SPACE.** `required_block_size` is the pool's
-    ///    page and `kv_cache_num_blocks_override` is the pool's page count, so `block_id` IS a
-    ///    page and no id can name one the pool lacks.
-    /// 3. **THE HOST CACHES ONLY WHAT IS TOKEN-ADDRESSED.** A batched step appends every row at ONE slot,
-    ///    so a request shorter than its batch-mates spreads its keys over more slots than it has tokens.
-    ///    `ReqState::kv_extent` reports both the span (blocks are allocated for it) and the leading
-    ///    contiguous run (only that may be hashed) — see `KvHistory::cacheable_prefix`. Without the
-    ///    second half a block covering a hole would promise a later request keys for the wrong tokens.
+    /// 1. **A REQUEST'S PAGES ARE THE SCHEDULER'S BLOCKS.** Every launch stages its paged step from
+    ///    the block table in `InputBatch` (`paged_step::page_of_block`), so a hit hands both requests
+    ///    the same physical page, and nothing on this side allocates one.
+    /// 2. **EVERY KEY IS TOKEN-ADDRESSED.** A row writes its key at its own token position, so a block
+    ///    the host hashed over tokens holds those tokens' keys.
     ///
     /// ⛔ THE GATE IS A CACHING-ON RUN DIFFED AGAINST CACHING-OFF, not a run that fails to crash: the
     /// original symptom was fluent WRONG output from rows attending an incomplete prefix.
@@ -269,13 +211,9 @@ impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFacto
             gguf_file: cfg.gguf_file.clone(),
         };
         let mut worker = SpyreWorker::new(worker_config, cfg.model_path.clone());
-        // BEFORE `load_model`, which is where the pool is sized and split: the declared depth × width IS
-        // the pool's size, and the admission cap also decides how many pages are reserved for launch holes.
-        worker.declare_workload(
-            cfg.max_num_seqs,
-            cfg.max_model_len,
-            cfg.gpu_memory_utilization,
-        );
+        // BEFORE `load_model`, which checks the declared context against the baked pool and the
+        // sessions against the card fraction.
+        worker.declare_workload(cfg.max_model_len, cfg.gpu_memory_utilization);
         worker.init_device().context("spyre init_device")?;
         worker.load_model().context("spyre load_model")?;
         let hf_config = worker
