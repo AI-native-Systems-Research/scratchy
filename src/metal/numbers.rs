@@ -217,6 +217,9 @@ impl Startup {
 pub enum Metric {
     Ttft,
     Tpot,
+    /// Send to last token: once the GPU is saturated, scheduling only moves a request's wait
+    /// between its TTFT and its TPOT, and this is their sum.
+    E2el,
     Throughput,
     /// The server's peak memory footprint during the cell.
     PeakMem,
@@ -232,6 +235,7 @@ impl Metric {
         match self {
             Metric::Ttft => c.median_ttft_ms,
             Metric::Tpot => c.median_tpot_ms,
+            Metric::E2el => c.e2el_ms(),
             Metric::Throughput => c.output_throughput,
             Metric::PeakMem => c.server_mem_peak_mib.filter(|_| !c.mem_below_weights),
         }
@@ -240,7 +244,7 @@ impl Metric {
     /// Decimals it is written with.
     pub fn decimals(self) -> usize {
         match self {
-            Metric::Ttft | Metric::PeakMem => 0,
+            Metric::Ttft | Metric::E2el | Metric::PeakMem => 0,
             Metric::Tpot | Metric::Throughput => 1,
         }
     }
@@ -248,7 +252,7 @@ impl Metric {
     pub fn unit(self) -> &'static str {
         match self {
             Metric::Throughput => "tok/s",
-            Metric::Ttft | Metric::Tpot => "ms",
+            Metric::Ttft | Metric::Tpot | Metric::E2el => "ms",
             Metric::PeakMem => "MiB",
         }
     }
@@ -257,7 +261,7 @@ impl Metric {
     pub fn better(self) -> Better {
         match self {
             Metric::Throughput => Better::Higher,
-            Metric::Ttft | Metric::Tpot | Metric::PeakMem => Better::Lower,
+            Metric::Ttft | Metric::Tpot | Metric::E2el | Metric::PeakMem => Better::Lower,
         }
     }
 

@@ -33,7 +33,7 @@ pub enum Module {
 
 /// Which module defines each `cds-*` tag family: the tag itself and every
 /// `<family>-...` tag.
-const FAMILIES: [(&str, Module); 25] = [
+const FAMILIES: [(&str, Module); 26] = [
     ("cds-accordion", Module::Accordion),
     ("cds-button", Module::Button),
     ("cds-clickable-tile", Module::Tile),
@@ -58,6 +58,7 @@ const FAMILIES: [(&str, Module); 25] = [
     ("cds-tag", Module::Tag),
     ("cds-tile", Module::Tile),
     ("cds-toggletip", Module::ToggleTip),
+    ("cds-tooltip", Module::Tooltip),
     ("cds-unordered-list", Module::List),
 ];
 
@@ -244,6 +245,8 @@ pub fn CodeSnippet(#[props(into)] id: Option<String>, children: Element) -> Elem
 #[derive(Clone, Copy, PartialEq)]
 pub enum Alignment {
     Bottom,
+    /// Below, reaching right from the term: for a term near a page's left edge.
+    BottomLeft,
     Left,
 }
 
@@ -251,6 +254,7 @@ impl Alignment {
     fn as_str(self) -> &'static str {
         match self {
             Alignment::Bottom => "bottom",
+            Alignment::BottomLeft => "bottom-left",
             Alignment::Left => "left",
         }
     }
@@ -415,19 +419,34 @@ pub fn Layer(level: u8, children: Element) -> Element {
 }
 
 /// A `cds-definition-tooltip`: a term, dotted-underlined, whose definition
-/// opens on hover, click or keyboard focus.
+/// opens on hover, click or keyboard focus; under a `heading`, set off from it
+/// by a gap, where it has one.
 #[component]
 pub fn Definition(
     #[props(into)] definition: String,
     alignment: Alignment,
+    heading: Option<String>,
     children: Element,
 ) -> Element {
     rsx! {
         cds-definition-tooltip { "open-on-hover": "", "align": alignment.as_str(),
             {children}
-            span { "slot": "definition", "{definition}" }
+            // A block, left-aligned: the tooltip inherits the term's own alignment through
+            // Carbon's shadow DOM, and text-align takes hold only on a block.
+            span { "slot": "definition", style: "display: block; text-align: left",
+                if let Some(heading) = heading {
+                    TipHeading { heading }
+                }
+                "{definition}"
+            }
         }
     }
+}
+
+/// A tooltip's heading: on a line of its own, set off from what it heads by a gap.
+#[component]
+pub fn TipHeading(#[props(into)] heading: String) -> Element {
+    rsx! { strong { style: "display: block; margin-bottom: 0.5rem", "{heading}" } }
 }
 
 /// A small `cds-table` with one header row.
@@ -552,6 +571,6 @@ mod tests {
 
     #[test]
     fn an_unknown_tag_fails_the_build() {
-        assert!(Module::used_by("<cds-tooltip>").is_err());
+        assert!(Module::used_by("<cds-slider>").is_err());
     }
 }
