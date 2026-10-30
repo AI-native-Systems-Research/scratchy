@@ -3813,11 +3813,12 @@ fn lower_function_folded(
     let last_read = |arg: Ssa| -> Option<usize> {
         f.operations.iter().rposition(|o| o.operands.contains(&arg))
     };
-    // THE BATCH-BLOCKED BUFFERS — `[r, c]` stick-major blocks one after another: a batched
-    // transpose's output (the `[k, n]` kernels a batched contraction reads), and a page read
-    // `[kv, block, 128]`, permuted per kv head. One stick wide a block run is the flat frame's own
-    // bytes; wider it is not, and only the readers that address a block at its base take one.
-    let mut batch_blocks: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // THE BATCH-BLOCKED BUFFERS, by their blocks' width `c` — `[r, c]` stick-major blocks one after
+    // another: a batched transpose's output (the `[k, n]` kernels a batched contraction reads), and
+    // a page read `[kv, block, 128]`, permuted per kv head. One stick wide a block run is the flat
+    // frame's own bytes; wider it is not, and only the readers that address a block at its base
+    // take one ([`wide_blocks`]).
+    let mut batch_blocks: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
 
     for (oi, op) in f.operations.iter().enumerate() {
         if let Some((start, end)) = body_at {
@@ -3917,6 +3918,15 @@ fn lower_function_folded(
             OpKind::TensorReshape | OpKind::TensorCollapseShape | OpKind::TensorExpandShape
         ) && let (Some(res), Some(&src)) = (op.result, op.operands.first())
         {
+            if let Some(r) = inter.get(&src)
+                && wide_blocks(&batch_blocks, r.tid)
+            {
+                return err(format!(
+                    "{}: `{:?}` reads t{}, whose bytes are batch blocks one after another — every \
+                     frame a shape op names is the flat frame's, which those bytes are not",
+                    f.name, op.op_type, r.tid
+                ));
+            }
             let def_dims = |v: Ssa| -> Vec<i64> {
                 f.operations
                     .iter()
@@ -4084,13 +4094,6 @@ fn lower_function_folded(
                         f.name, op.op_type
                     ));
                 };
-                if batch_blocks.contains(&source.tid) {
-                    return err(format!(
-                        "{}: `{:?}` reads t{} as stick-major rows, and its bytes are batch blocks \
-                         one after another",
-                        f.name, op.op_type, source.tid
-                    ));
-                }
                 let tid = mint_inter(k, layout, floor, res);
                 let dst = row_major_region(tid, rows * sticks, layout);
                 out.push(permute(
@@ -4372,7 +4375,7 @@ fn lower_function_folded(
                             Some(layout),
                         )?);
                     }
-                    batch_blocks.insert(tid);
+                    batch_blocks.insert(tid, sticks * crate::work::FP16_ELEMS_PER_STICK);
                 } else {
                     out.push(permute(
                         f.name,
@@ -4431,6 +4434,13 @@ fn lower_function_folded(
                         f.name
                     ));
                 };
+                if wide_blocks(&batch_blocks, source.tid) {
+                    return err(format!(
+                        "{}: the head-major transpose reads t{}, whose bytes are batch blocks one \
+                         after another, as a stick-major frame",
+                        f.name, source.tid
+                    ));
+                }
                 let r = reframed(source, frame);
                 inter.insert(res, r);
                 inter.insert(r_res, r);
@@ -4681,7 +4691,7 @@ fn lower_function_folded(
                 }
                 // Its input in blocks when a permute laid it so ([`batch_blocks`]).
                 let input = match op.operands.first().and_then(|v| inter.get(v)) {
-                    Some(r) if batch_blocks.contains(&r.tid) => {
+                    Some(r) if batch_blocks.contains_key(&r.tid) => {
                         super::lower_ktir_to_superdsc::BatchFrame::Blocks
                     }
                     _ => super::lower_ktir_to_superdsc::BatchFrame::Flat,
@@ -5231,10 +5241,7 @@ fn lower_function_folded(
                 (&program, i),
                 (Lowering::BatchTranspose { .. }, 0) | (Lowering::BatchMatmul { .. }, 1)
             );
-            if batch_blocks.contains(&x.tid)
-                && x.v_cols > crate::work::FP16_ELEMS_PER_STICK
-                && !reads_blocks
-            {
+            if wide_blocks(&batch_blocks, x.tid) && !reads_blocks {
                 return err(format!(
                     "{}: input {i} t{} `[{}, {}]` holds batch blocks one after another, which only \
                      a batched transpose's input or a batched contraction's kernel reads",
@@ -5244,7 +5251,7 @@ fn lower_function_folded(
         }
         if let Lowering::BatchMatmul { .. } = program
             && let Some(w) = per_op.get(1)
-            && !(batch_blocks.contains(&w.tid) || w.c_len == crate::work::FP16_ELEMS_PER_STICK)
+            && !(batch_blocks.contains_key(&w.tid) || w.c_len == crate::work::FP16_ELEMS_PER_STICK)
         {
             return err(format!(
                 "{}: a batched contraction's kernel t{} is a `[{}, {}]` flat frame no batched \
@@ -5638,7 +5645,7 @@ fn lower_function_folded(
             )?;
             out.append(&mut emitted);
             if let Lowering::BatchTranspose { .. } = program {
-                batch_blocks.insert(r.tid);
+                batch_blocks.insert(r.tid, r.v_cols);
             }
             // ⭐ AND WHERE THE PROGRAM STORES THE VALUE THROUGH AN INDEX, THE ROWS GO THERE NOW.
             if let Some(sc) = indirect_store_of(k, res)? {
@@ -6059,6 +6066,14 @@ fn int_zero_run(
         Some(layout),
     )?);
     Ok((zero.tid, ops))
+}
+
+/// Whether `tid` holds batch blocks wider than one stick — bytes no flat frame names
+/// ([`lower_function_folded`]'s `batch_blocks`).
+fn wide_blocks(blocks: &std::collections::HashMap<u32, u32>, tid: u32) -> bool {
+    blocks
+        .get(&tid)
+        .is_some_and(|&w| w > crate::work::FP16_ELEMS_PER_STICK)
 }
 
 /// A value's FLAT FRAME — every axis but the last folded into rows ([`shape_2d`]'s reading).
