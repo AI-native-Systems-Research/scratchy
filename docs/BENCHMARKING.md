@@ -298,8 +298,10 @@ These favour one side or the other and must travel with any published number.
   its `model_settings.json`) is the like-for-like rival for a default
   scratchy build, and **oMLX** as shipped (FP16 KV) the like-for-like one for
   mlx-lm.
-- **oMLX is the Metal matrix's default rival, run as it ships** (from a branch
-  that lets it answer to length: see "Not every engine answers to length"). Its own
+- **oMLX is the Metal matrix's default rival, at its own defaults.** Until a
+  release takes `ignore_eos`, it runs from starpit/omlx's `feat/api-ignore-eos`
+  (oMLX main plus jundot/omlx#4978), not a release: see "Not every engine
+  answers to length". Its own
   caching stays on (the SSD cache kept in the run's output, a fresh one per
   variant, so nothing carries between runs), because `--no-cache` drops it to
   plain mlx-lm batching. Its memory guard stays at its default tier and

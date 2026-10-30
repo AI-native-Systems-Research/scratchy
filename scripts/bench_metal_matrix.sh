@@ -518,11 +518,19 @@ engine_version() { # key
                         || { local -a py; read -r -a py <<<"$(head -1 "${VLLM_BIN}" | sed 's/^#!//')"
                              "${py[@]}" -c 'import importlib.metadata as m; print(m.version("vllm-metal"))'; } ;;
         omlx)       # a source checkout (the Metal bench skill's install) by its commit, which
-                    # tells a branch from the release it was cut after; else the release it prints
+                    # tells a branch from the release it was cut after, -dirty when it has local
+                    # changes (no pin matches that); else the release it prints. Only a launcher
+                    # run by a python, and a checkout whose top is the package's own source: git -C
+                    # "" is the cwd (scratchy), and git -C walks up to any repo around a site-packages.
                     local -a py; read -r -a py <<<"$(head -1 "${OMLX_BIN}" | sed 's/^#!//')"
-                    local src; src="$("${py[@]}" -c 'import omlx, os; print(os.path.dirname(os.path.dirname(omlx.__file__)))')"
-                    git -C "${src}" rev-parse HEAD \
-                        || "${OMLX_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 ;;
+                    local src=""
+                    [[ "${py[${#py[@]}-1]##*/}" == python* ]] && src="$("${py[@]}" -c \
+                        'import omlx, os; print(os.path.dirname(os.path.dirname(os.path.realpath(omlx.__file__))))' 2>/dev/null)"
+                    if [[ -n "${src}" && "$(git -C "${src}" rev-parse --show-toplevel 2>/dev/null)" == "${src}" ]]; then
+                        echo "$(git -C "${src}" rev-parse HEAD)$(git -C "${src}" diff --quiet HEAD || echo -dirty)"
+                    else
+                        "${OMLX_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1
+                    fi ;;
         mistralrs)  "${MISTRALRS_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 ;;
         splash)     # the Homebrew formula's version, else what the binary prints
                     local v; v="$(brew list --versions splash 2>/dev/null | awk '{print $2}')"
