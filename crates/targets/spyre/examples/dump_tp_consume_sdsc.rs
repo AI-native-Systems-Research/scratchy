@@ -52,6 +52,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window.size
     );
     write_dxp_input(&dir, &consumes, FoldGrouping::Split)?;
-    eprintln!("wrote the consumes' dxp input under {}", dir.display());
+    eprintln!("wrote the all-reduce consume's dxp input under {}", dir.display());
+
+    // And the ALL-GATHER's consumes — one group per rank, from a two-rank vocabulary projection.
+    let gather = tp_bake(
+        &scratchy_subtile::fixtures::vocab_projection(2048, 8192),
+        SpyreWorld::of::<2>(),
+    )
+    .map_err(|e| format!("the two-rank projection does not shard: {e:?}"))?;
+    let ir = lower_region(&gather.sharded.local, NonZeroU32::new(128).ok_or("128 != 0")?);
+    let weight_ids: std::collections::HashSet<u32> = [2u32].into_iter().collect();
+    let (ops, _) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
+        .map_err(|e| format!("the two-rank projection does not lower: {e:?}"))?;
+    let consumes: Vec<_> = ops
+        .iter()
+        .filter(|e| e.tp_consume.is_some())
+        .map(|e| e.shallow_copy())
+        .collect();
+    let gather_dir = dir.join("all_gather");
+    write_dxp_input(&gather_dir, &consumes, FoldGrouping::Split)?;
+    eprintln!(
+        "wrote the all-gather's {} consume op(s) under {}",
+        consumes.len(),
+        gather_dir.display()
+    );
     Ok(())
 }

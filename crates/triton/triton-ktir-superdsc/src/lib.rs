@@ -163,6 +163,9 @@ fn emit_regions(
         Program::LmLast => {
             emit::lower_ktir_to_superdsc::lmlast(name, node, regions, &mut sym, layout)
         }
+        Program::BlockCopy => {
+            emit::lower_ktir_to_superdsc::block_copy(name, regions, &mut sym, layout)
+        }
         Program::Transpose => {
             emit::lower_ktir_to_superdsc::transpose(name, regions, &mut sym, layout)
         }

@@ -10475,6 +10475,26 @@ fn launch_tokens(
             let operand = place_id_tokens(&c.operand);
             let [first, sticks, rows] = [c.fragment.first_stick(), c.fragment.sticks(), c.fragment.rows()]
                 .map(proc_macro2::Literal::u32_unsuffixed);
+            // A rank-selected consume's rank, re-minted against its world through the const fn that
+            // refuses a rank the world does not have.
+            let plays_at = match c.plays_at {
+                None => quote! { ::core::option::Option::None },
+                Some(p) => {
+                    let id = p.rank();
+                    let (w, r) = (
+                        proc_macro2::Literal::u32_unsuffixed(id.world().get()),
+                        proc_macro2::Literal::u32_unsuffixed(id.rank()),
+                    );
+                    quote! {
+                        ::core::option::Option::Some(
+                            ::scratchy_target_spyre::bundle_code::collective::PlaysAt::baked(
+                                ::scratchy_target_spyre::bundle_code::collective::TpWorld::of::<#w>(),
+                                #r,
+                            )
+                        )
+                    }
+                }
+            };
             quote! {
                 ::core::option::Option::Some(::scratchy_target_spyre::bundle_code::collective::TpConsume {
                     kind: #kind,
@@ -10482,6 +10502,7 @@ fn launch_tokens(
                     fragment: ::scratchy_target_spyre::bundle_code::collective::Fragment::baked(
                         #first, #sticks, #rows,
                     ),
+                    plays_at: #plays_at,
                 })
             }
         }
@@ -13223,13 +13244,17 @@ fn dump_wavefront_mega(
                 tp_lwd.input.ops.len(),
                 sf.collectives.len() - gathers,
             );
-            if gathers > 0 {
-                // ⛔ A VISIBLE SKIP, NOT A SILENT ONE: the all-gather's consume (rank-selected
-                // copies) has no lowering yet, and the lowering refuses it by name. This model
-                // ships its one-rank world only until it does.
+            if gathers > 0 && tie_word_embeddings(model) {
+                // ⛔ A VISIBLE SKIP, NAMING ITS ONE CAUSE: the decode rung's chained head gathers
+                // the drawn token's embedding row on device from the TIED table — the lm head's
+                // own staged weight — and here the analysis split that weight by vocabulary, so
+                // each rank holds half the rows a draw can name. The rank-aware chain (each rank
+                // gathers its half, a non-owner's row zero, the two summed) is not built yet, and
+                // the chain is the only decode path, so this model ships its one-rank world.
                 println!(
-                    "cargo:warning=[spyre-tp] {stem}: no tp=2 bundle — its forward needs {gathers} \
-                     all-gather(s), and spyre does not lower the all-gather's consume yet"
+                    "cargo:warning=[spyre-tp] {stem}: no tp=2 bundle — its lm head splits by \
+                     vocabulary ({gathers} all-gather), and the decode chained head reads that \
+                     tied table whole; the rank-aware chained head is not built yet"
                 );
                 None
             } else {
@@ -14277,7 +14302,7 @@ fn dump_wavefront_mega(
             }
         }
         // ⭐ THE SHARDED WORLDS this model baked — one `TpForward` per world whose bake committed a
-        // decode bundle and its wiring; empty when none did (a world skipped visibly above).
+        // decode bundle and its wiring.
         {
             use scratchy_subtile::tensor_parallel::SourceShard as S;
             let tp_forwards: Vec<proc_macro2::TokenStream> = match (

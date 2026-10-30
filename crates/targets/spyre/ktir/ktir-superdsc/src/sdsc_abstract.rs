@@ -4629,6 +4629,12 @@ impl RowCount {
     pub const fn of_zero_pad_rows(rows: u32) -> RowCount {
         RowCount(rows)
     }
+    /// A run of `sticks` whole stick columns of a `rows`-row tensor, read as the tall-narrow
+    /// `[sticks · rows, stick]` tensor it IS in memory (stick-major: each stick column is `rows`
+    /// contiguous sticks) — a block copy's one sweep.
+    pub const fn of_stick_column_rows(sticks: u32, rows: u32) -> RowCount {
+        RowCount(sticks * rows)
+    }
     /// Residual-stream token rows — outside the attention row-and-width run.
     pub const fn of_token_rows(rows: u32) -> RowCount {
         RowCount(rows)

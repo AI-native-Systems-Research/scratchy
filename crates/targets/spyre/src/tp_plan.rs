@@ -252,6 +252,96 @@ mod tests {
         assert_eq!(window_reads.len(), 32, "the window's 32 sticks, one per core");
     }
 
+    /// ⭐ THE GATHER'S STATIC AUDIT: in the input dxp compiles, rank `r`'s consume group writes its
+    /// own block at the output's columns `r · lc` and the peer's block — read from the receive
+    /// window's first byte — at columns `peer · lc`, every address at its typed placement
+    /// (`SEGMENT_OFFSETS[segment] + offset`, in bytes; a column block of a one-row fp16 tensor
+    /// starts `col · 2` bytes in).
+    #[test]
+    fn each_ranks_gather_writes_its_blocks_at_their_columns() {
+        use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
+        use crate::lower_subtile_tape_to_superdsc::{FoldGrouping, render_dxp_input};
+        use ktir_superdsc::ktir_node::ActiveCap;
+        use ktir_superdsc::reserved_tids::TP_RECV_TID;
+        use ktir_superdsc::wire::SEGMENT_OFFSETS;
+        use scratchy_subtile::fixtures::vocab_projection;
+        use scratchy_subtile::subtile_ir::lower_region;
+
+        let (v, lc) = (8192u64, 4096u64);
+        let b = tp_bake(&vocab_projection(2048, v as u32), SpyreWorld::of::<2>()).unwrap();
+        let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
+        let weight_ids: std::collections::HashSet<u32> = [2u32].into_iter().collect();
+        let (ops, layout) =
+            lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+        let at = |tid: u32| {
+            let p = layout.placements[&tid];
+            SEGMENT_OFFSETS[p.segment as usize] + p.offset
+        };
+        let (out, window) = (at(ir.result.index() as u32), at(TP_RECV_TID));
+        for rank in 0..2u64 {
+            let peer = 1 - rank;
+            let group: Vec<_> = ops
+                .iter()
+                .filter(|e| {
+                    e.tp_consume
+                        .and_then(|c| c.plays_at)
+                        .is_some_and(|p| u64::from(p.rank().rank()) == rank)
+                })
+                .map(|e| e.shallow_copy())
+                .collect();
+            assert_eq!(group.len(), 2, "rank {rank}'s consume is two block copies");
+            let rendered = render_dxp_input(&group, FoldGrouping::Split).unwrap();
+            // Each copy as its (source, destination) pair: core 0's start of each tensor, in the
+            // descriptor's tensor order — the input, then the output.
+            let mut copies: Vec<(u64, u64)> = Vec::new();
+            for g in &rendered {
+                for (name, body) in &g.files {
+                    if !name.ends_with(".json") {
+                        continue;
+                    }
+                    let mut firsts = Vec::new();
+                    core0_starts(&serde_json::from_str(body).unwrap(), &mut firsts);
+                    if let [src, dst] = firsts[..] {
+                        copies.push((src, dst));
+                    }
+                }
+            }
+            copies.sort_unstable();
+            let local = at(ir.nodes.iter().find(|n| matches!(n.op, scratchy_subtile::subtile_ir::SubOp::AllGather { .. })).unwrap().inputs[0].tensor.index() as u32);
+            let mut want = vec![(local, out + rank * lc * 2), (window, out + peer * lc * 2)];
+            want.sort_unstable();
+            assert_eq!(
+                copies, want,
+                "rank {rank}: its own block must land at its columns and the peer's, out of the \
+                 window, at the peer's"
+            );
+        }
+    }
+
+    /// Core 0's start address of every tensor a descriptor states, in its `scheduleTree_` order.
+    fn core0_starts(v: &serde_json::Value, out: &mut Vec<u64>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                for (k, x) in m {
+                    if k == "startAddressCoreCorelet_" {
+                        if let Some(s) = x
+                            .get("data_")
+                            .and_then(|d| d.get("[0, 0, 0]"))
+                            .and_then(|s| s.as_str())
+                            .and_then(|s| s.parse::<u64>().ok())
+                        {
+                            out.push(s);
+                        }
+                    } else {
+                        core0_starts(x, out);
+                    }
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| core0_starts(x, out)),
+            _ => {}
+        }
+    }
+
     /// Every `startAddressCoreCorelet_.data_` value under `v`.
     fn collect_starts(v: &serde_json::Value, out: &mut Vec<u64>) {
         match v {
@@ -268,6 +358,47 @@ mod tests {
             }
             serde_json::Value::Array(a) => a.iter().for_each(|x| collect_starts(x, out)),
             _ => {}
+        }
+    }
+
+    /// ⭐ THE ALL-GATHER, THROUGH THE DOOR: a two-rank vocabulary projection gathers its result, and
+    /// the gather lowers to ONE consume group PER RANK — this rank's block and the peer's, as two
+    /// block copies — and each rank's pipeline plays its own group alone, with one send and one
+    /// wait. The copies place rank `r`'s block at columns `r · v/2` on rank `r`'s own consume and
+    /// at the same columns of the peer's, so both ranks assemble the same `[1, v]` row.
+    #[test]
+    fn an_all_gather_is_one_consume_group_per_rank() {
+        use crate::bundle_code::collective::{CbStep, CollectiveKind, TpWorld, cb_pipeline};
+        use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
+        use crate::lower_subtile_tape_to_superdsc::{FoldGrouping, launch_index};
+        use ktir_superdsc::ktir_node::ActiveCap;
+        use scratchy_subtile::fixtures::vocab_projection;
+        use scratchy_subtile::subtile_ir::lower_region;
+        use scratchy_subtile::tensor_parallel::CollectiveKind as Shared;
+
+        let b = tp_bake(&vocab_projection(2048, 8192), SpyreWorld::of::<2>()).unwrap();
+        let kinds: Vec<Shared> = b.sharded.collectives.iter().map(|c| c.kind).collect();
+        assert_eq!(kinds, vec![Shared::AllGather], "the projection's result is gathered");
+        let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
+        let weight_ids: std::collections::HashSet<u32> = [2u32].into_iter().collect();
+        let (ops, _) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+        let shifts = launch_index(&ops, FoldGrouping::Split);
+        let consumes: Vec<_> = shifts.iter().filter_map(|s| s.tp).collect();
+        assert_eq!(consumes.len(), 2, "one consume group per rank");
+        assert!(consumes.iter().all(|c| c.kind == CollectiveKind::AllGather));
+        let groups: Vec<crate::bundle_code::LaunchGroup<'static>> = shifts
+            .iter()
+            .map(|kv| crate::bundle_code::LaunchGroup {
+                kv: *kv,
+                ..Default::default()
+            })
+            .collect();
+        for id in TpWorld::of::<2>().ranks() {
+            let steps: Vec<CbStep> = cb_pipeline(&groups, id).collect();
+            let sends = steps.iter().filter(|s| matches!(s, CbStep::Send { .. })).count();
+            let waits = steps.iter().filter(|s| matches!(s, CbStep::Wait { .. })).count();
+            assert_eq!((sends, waits), (1, 1), "rank {} sends once and waits once", id.rank());
+            assert_eq!(steps.len(), groups.len() - 1 + 2, "the other rank's consume is skipped");
         }
     }
 

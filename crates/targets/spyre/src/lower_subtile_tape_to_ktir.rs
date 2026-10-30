@@ -1120,8 +1120,90 @@ fn all_reduce_consumes<F: RopeForm>(
             kind: CollectiveKind::AllReduce,
             operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
             fragment: f,
+            plays_at: None,
         });
         ops.push(e);
+    }
+    NodeLowering::Ops(ops)
+}
+
+/// The all-gather's consumes: per rank `r` of the two-rank world, two block copies
+/// (`scratchy_triton_splice::lower_block_copy`) — this rank's `[rows, lc]` block to columns
+/// `r · lc` of the gathered output, and the peer's block, out of the receive window, to columns
+/// `peer · lc` — both marked with ONE [`TpConsume`] that plays at `r`, so they fuse into that rank's
+/// consume group and every other rank skips it whole.
+///
+/// ⛔ ONE FRAGMENT. A block copy moves a WHOLE source, and the window holds one fragment at a
+/// time, so a block wider than one message is refused by name; the gathers the analysis weaves (a
+/// vocabulary projection's row, at decode and at the prefill tail's one row) fit one.
+///
+/// [`TpConsume`]: ktir_superdsc::collective::TpConsume
+fn all_gather_consumes<F: RopeForm>(node: &SubtileNode<F>, cols: u32) -> NodeLowering {
+    use ktir_superdsc::collective::{CollectiveKind, PlaysAt, TpConsume, TpWorld};
+    use scratchy_subtile::subtile_ir::{Range, Region, TensorRegion};
+    let x = node.inputs[0];
+    let (rows, lc) = (x.region.rows.len, x.region.cols.len);
+    // Spyre's one sharded world (`SPYRE_TP_WORLDS = [1, 2]`); a gather in any forward is its.
+    let world = TpWorld::of::<2>();
+    if cols != world.get() * lc {
+        return NodeLowering::Unhandled(format!(
+            "the all-gather restores {cols} columns from a {lc}-column block — not {} blocks",
+            world.get()
+        ));
+    }
+    let fragment = match crate::tp_plan::consume_fragments(rows, lc).as_deref() {
+        Ok([f]) => *f,
+        Ok(more) => {
+            return NodeLowering::Unhandled(format!(
+                "the all-gather's [{rows}, {lc}] block is {} p2p fragments — a block copy moves a \
+                 whole source, so a gather wider than one message is not lowered",
+                more.len()
+            ));
+        }
+        Err(why) => {
+            return NodeLowering::Unhandled(format!(
+                "the all-gather operand [{rows}, {lc}] cannot be cut into p2p fragments: {why:?}"
+            ));
+        }
+    };
+    let window = TensorRegion {
+        tensor: TensorId::from_index(ktir_superdsc::reserved_tids::TP_RECV_TID as usize),
+        region: Region {
+            rows: Range::new(0, rows),
+            cols: Range::new(0, lc),
+        },
+    };
+    let block_at = |rank: u32| TensorRegion {
+        tensor: node.output.tensor,
+        region: Region {
+            rows: node.output.region.rows,
+            cols: Range::new(node.output.region.cols.start + rank * lc, lc),
+        },
+    };
+    let mut ops = Vec::with_capacity(2 * world.get() as usize);
+    for id in world.ranks() {
+        let Some(peer) = id.peer() else {
+            return NodeLowering::Unhandled("a two-rank world's rank has no peer".to_string());
+        };
+        let consume = TpConsume {
+            kind: CollectiveKind::AllGather,
+            operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
+            fragment,
+            plays_at: Some(PlaysAt::of(id)),
+        };
+        for (src, dst, leg) in [
+            (x, block_at(id.rank()), "own"),
+            (window, block_at(peer.rank()), "peer"),
+        ] {
+            let name = format!("tpgather_s{}_r{}_{leg}", node.id.index(), id.rank());
+            match scratchy_triton_splice::lower_block_copy(node, src, dst, cols, &name) {
+                Ok(mut e) => {
+                    e.tp_consume = Some(consume);
+                    ops.push(e);
+                }
+                Err(reason) => return NodeLowering::Unhandled(reason),
+            }
+        }
     }
     NodeLowering::Ops(ops)
 }
@@ -1201,13 +1283,10 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // one and two (`SPYRE_TP_WORLDS`) and a world of one has no collective; fp16 addition is
         // commutative, so both ranks compute bit-identical sums.
         SubOp::AllReduce => all_reduce_consumes(node, ir, rows_are_requests),
-        // ⛔ THE GATHER'S CONSUME IS RANK-SELECTED (this rank's block and the peer's land at
-        // columns that depend on which rank is which), so it is copies chosen at the session's
-        // rank, not one program. Not yet lowered — refused by name.
-        SubOp::AllGather { .. } => Unhandled(
-            "the all-gather's consume is rank-selected copies, which spyre does not lower yet"
-                .to_string(),
-        ),
+        // ⭐ THE ALL-GATHER'S CONSUME IS RANK-SELECTED: this rank's block and the peer's land at
+        // columns that depend on which rank is which, so the bake carries one consume per rank
+        // and each session plays its own (`bundle::collective::cb_pipeline`).
+        SubOp::AllGather { cols } => all_gather_consumes(node, *cols),
         // ⛔ THE 2b EXPANSION KINDS, named here instead of `expansion_ops!()`: the 2a
         // routing below made the macro's patterns for THOSE kinds unreachable
         // (`unreachable_patterns` is `-D warnings`), and the remaining members are a

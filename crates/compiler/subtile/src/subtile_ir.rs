@@ -1872,10 +1872,16 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
                 t = node.inputs[0].tensor;
             }
             SubOp::MatmulTile { .. } => break,
+            // ⭐ A SHARDED LM HEAD'S GATHER ENDS THE CHAIN. Below it the projection is one RANK'S
+            // block of the vocabulary — `vocab / W` wide, not the vocabulary — so it is not widened:
+            // the draw reads the GATHERED row, whose pad lanes the widening above reserves, and the
+            // gather's block copies address a column block the same way at any total width
+            // (stick-major places a column by its stick and row alone).
+            SubOp::AllGather { .. } => break,
             other => panic!(
                 "the device sampling mint walked a {other:?} result tail — the admission \
-                 gate (an arity-2 Dense lm-head under single-input ScalarMul/TanhSoftCap) \
-                 refuses this graph, so the mint was called outside it"
+                 gate (an arity-2 Dense lm-head under single-input ScalarMul/TanhSoftCap, \
+                 gathered when sharded) refuses this graph, so the mint was called outside it"
             ),
         }
     }

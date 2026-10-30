@@ -247,6 +247,10 @@ pub enum Program {
     Sample,
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].
     LmLast,
+    /// A whole source copied into a column block of a wider destination — an all-gather consume's
+    /// leg. A PURE COPY, like [`Self::LmLast`]; see
+    /// [`block_copy`](crate::emit::lower_ktir_to_superdsc::block_copy).
+    BlockCopy,
     Rope,
     Attn,
     /// A 2-D BLOCK TRANSPOSE of a whole tensor — `[mb, out]` → `[out, mb]`, one

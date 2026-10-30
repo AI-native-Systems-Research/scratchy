@@ -351,6 +351,42 @@ pub struct TpConsume {
     pub operand: crate::place::PlaceId,
     /// Which run of the operand's stick columns this consume covers.
     pub fragment: Fragment,
+    /// `Some(rank)` when only that rank launches this consume — an all-gather's, whose blocks land
+    /// at columns that depend on which rank is which, so the bake carries one consume per rank.
+    /// `None` when every rank launches it (an all-reduce's sum is the same on every rank).
+    pub plays_at: Option<PlaysAt>,
+}
+
+/// The one rank that launches a rank-selected consume. Minted from a [`TpIdentity`], or re-minted
+/// from baked tokens through [`PlaysAt::baked`], which refuses at BUILD a rank its world does not
+/// have — a consume for rank 2 of a two-rank world would never launch, silently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PlaysAt(TpIdentity);
+
+impl PlaysAt {
+    pub const fn of(rank: TpIdentity) -> Self {
+        Self(rank)
+    }
+
+    /// Re-mint from the parts the `#[forward]` macro bakes.
+    ///
+    /// ```compile_fail
+    /// use ktir_superdsc::collective::{PlaysAt, TpWorld};
+    /// const P: PlaysAt = PlaysAt::baked(TpWorld::of::<2>(), 2);
+    /// ```
+    pub const fn baked(world: TpWorld, rank: u32) -> Self {
+        assert!(rank < world.0, "a rank-selected consume names a rank its world does not have");
+        Self(TpIdentity { rank, world })
+    }
+
+    pub const fn rank(self) -> TpIdentity {
+        self.0
+    }
+
+    /// Whether the session running as `session` launches this consume.
+    pub fn launches_on(self, session: TpIdentity) -> bool {
+        self.0 == session
+    }
 }
 
 #[cfg(test)]
