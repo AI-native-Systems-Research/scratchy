@@ -1275,6 +1275,8 @@ SCRATCHY_KERNEL(attention_via_cache_v2_bf16_specialized, attention_via_cache_v2<
 // threadgroup per query head merges the partials its KV head's ATTN_SPLITS threadgroups stored
 // (buffer 16, `[batch, num_q_heads, ATTN_SPLITS, 2 + head_dim]`: max, sum, unnormalized output in
 // the codebook domain) and writes the head's output as `attention_via_cache_v2`'s merge does.
+// Attention sinks (ATTN_SINKS, buffer 17 — the layer's sink logits): the splits store the keys'
+// partials alone, and the sink column joins here, once a head, as the twin's merge carries it.
 // Its ATTN_COMBINE_GROUPS simdgroups each sum their share of every lane's elements over the
 // splits; the first divides and rotates them. Head_dim 64's partials fill two simdgroups'
 // lanes — the head_dim/32 elements each — so the count follows the head dim. Dispatch:
@@ -1287,6 +1289,7 @@ attention_via_cache_v2_combine(
     device const float* tq_signs      [[buffer(11)]],
     device const T*     tq_v_bias     [[buffer(15)]],
     device const float* attn_partials [[buffer(16)]],
+    device const T*     sinks         [[buffer(17)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
@@ -1300,7 +1303,10 @@ attention_via_cache_v2_combine(
     const uint kv_head_idx = q_head_idx / (num_q / ATTN_NUM_KV_HEADS);
     const uint row = head_dim + 2u;
     device const float* p = attn_partials + (seq_idx * num_q + q_head_idx) * ATTN_SPLITS * row;
-    U global_max = -FLT_MAX;
+    // The splits' maxes are of the scaled scores, the domain the twin seeds its max with the
+    // UNSCALED sink in: so here, and the sink's exp below cannot overflow.
+    const U sink = ATTN_SINKS_ON ? U(sinks[q_head_idx]) : 0;
+    U global_max = ATTN_SINKS_ON ? sink : -FLT_MAX;
     for (uint s = 0; s < ATTN_SPLITS; ++s) {
         global_max = max(global_max, U(p[s * row]));
     }
@@ -1326,6 +1332,14 @@ attention_via_cache_v2_combine(
             part[j] += U(p[s * row + 2u + e0 + j0 + j]) * factor;
         }
     }
+    // The sink column: the denominator's alone, no V. Under TurboQuant the epilogue adds vb, the
+    // keys' share of it: the partials hold the keys' V centered, so the output's bias is their
+    // weight sum's — a sink that dominates the softmax must not hand the output a full vb.
+    const U keys_sum = global_sum;
+    if (ATTN_SINKS_ON) {
+        global_sum += metal::fast::exp(sink - global_max);
+    }
+    const U vb_share = ATTN_SINKS_ON ? keys_sum / global_sum : 1;
     for (uint j = 0; j < QG; ++j) {
         sums[simd_lid * (qk_per_thread + 1u) + j0 + j] = part[j];
     }
@@ -1347,7 +1361,7 @@ attention_via_cache_v2_combine(
         tq_wht(o_loc, qk_per_thread, simd_lid);
         for (uint j = 0; j < qk_per_thread; ++j) {
             const U o = o_loc[j] * tq_signs[e0 + j] / U(head_dim);
-            o_row[e0 + j] = T(ATTN_TQ_VB ? o + U(vb[e0 + j]) : o);
+            o_row[e0 + j] = T(ATTN_TQ_VB ? o + vb_share * U(vb[e0 + j]) : o);
         }
     } else {
         for (uint j = 0; j < qk_per_thread; ++j) {
