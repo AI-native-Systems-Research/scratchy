@@ -1369,6 +1369,15 @@ impl StickLayout {
         dev_off_stk(&[self.rows, self.cols], stick_idx, &[r, c], self.lanes())
     }
 
+    /// The stick-major `[R, C·L]` tensor whose STICK COLUMNS, read in order, are this row-major
+    /// `[C, R·L]` view — the same bytes (stick column `c`'s `R` rows are one contiguous run), the
+    /// tensor's own frame. `None` for a view that is not row-major whole sticks.
+    pub fn of_stick_columns(&self) -> Option<StickLayout> {
+        let lanes = self.lanes();
+        (self.kind == StickKind::Flat && self.cols.is_multiple_of(lanes))
+            .then(|| StickLayout::row_blocked_df(self.cols / lanes, self.rows * lanes, self.df))
+    }
+
     /// Do these two layouts place EVERY logical `(r,c)` at the same device byte? This is the invariant
     /// the arrangement authority enforces so a producer and consumer of ONE tensor cannot address it
     /// differently. Analytic (no O(rows·cols) sweep): different `(rows, cols, lanes)` never match;
@@ -1858,6 +1867,18 @@ impl RegionFrame {
 #[cfg(test)]
 mod region_frame_tests {
     use super::*;
+
+    /// A row-major `[C, R·L]` view of whole sticks is the stick columns of the stick-major
+    /// `[R, C·L]`; anything else names no such tensor.
+    #[test]
+    fn a_stick_column_view_names_its_stick_major_tensor() {
+        assert_eq!(
+            StickLayout::flat(2, 2048).of_stick_columns(),
+            Some(StickLayout::row_blocked(32, 128))
+        );
+        assert_eq!(StickLayout::row_blocked(2, 2048).of_stick_columns(), None);
+        assert_eq!(StickLayout::flat(2, 100).of_stick_columns(), None);
+    }
 
     fn frame(rows: usize, cols: usize) -> RegionFrame {
         RegionFrame::stick_blocked(rows, cols, Df::Fp16)

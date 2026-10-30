@@ -1836,6 +1836,7 @@ fn core_local_reads_agree(
             df: v.df,
             row_blocked: v.row_blocked,
             device_extent: v.device_extent,
+            frame: v.frame,
         };
         let dims: Vec<&'static str> = plan.dims().iter().map(|d| d.name).collect();
         let corners = per_core_addr(
@@ -3779,7 +3780,20 @@ pub fn emit_sdsc(
             .or_else(|| l.synth.borrow().sizes.get(v.name).copied());
             let full = full_bytes.is_none_or(|fp| arg_bytes >= fp);
             if active && full && !matches!(v.role, Role::Kernel) && !v.allocation.is_lx() {
-                l.declare_arrangement(v.name, view_stick_layout(v, iter))?;
+                let own = view_stick_layout(v, iter);
+                let arrangement = match v.frame {
+                    crate::superdsc_opspec::ViewFrame::Own => own,
+                    crate::superdsc_opspec::ViewFrame::StickColumns => {
+                        own.of_stick_columns().ok_or_else(|| {
+                            SuperDscError(format!(
+                                "op '{op_name}': tensor '{}' is iterated by its stick columns, but \
+                                 the view arranges it {own:?}, not as row-major whole sticks",
+                                v.name
+                            ))
+                        })?
+                    }
+                };
+                l.declare_arrangement(v.name, arrangement)?;
             }
         }
         let per_core = per_core_addr(seg_base, v, &sl, iter, &wk_slice, intra_base, cores)?;

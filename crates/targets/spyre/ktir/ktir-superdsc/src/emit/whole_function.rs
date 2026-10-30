@@ -870,6 +870,17 @@ fn indirect_store_of(
     res: Ssa,
 ) -> Result<Option<super::lower_ktir_to_superdsc::RowScatter>, Error> {
     let f = &k.func;
+    let dims = |v: Ssa| -> Vec<i64> {
+        f.ops_deep()
+            .into_iter()
+            .find(|o| o.result == Some(v))
+            .and_then(|o| o.result_type)
+            .and_then(|t| t.dims())
+            .map(<[i64]>::to_vec)
+            .unwrap_or_default()
+    };
+    // Through a shape op only when it moves no byte: one that does is a relayout, and the scatter
+    // reads its result (the reshape's own stick permute).
     let reshaped = f
         .operations
         .iter()
@@ -879,7 +890,8 @@ fn indirect_store_of(
                 OpKind::TensorReshape | OpKind::TensorCollapseShape | OpKind::TensorExpandShape
             ) && o.operands.first() == Some(&res)
         })
-        .and_then(|o| o.result);
+        .and_then(|o| o.result)
+        .filter(|&v| same_card_bytes(&dims(res), &dims(v)));
     let Some(store) = f.operations.iter().find(|s| {
         s.op_type == OpKind::KtdpStore
             && (s.operands.first() == Some(&res) || s.operands.first().copied() == reshaped)
@@ -1177,9 +1189,12 @@ enum Lowering {
     /// kernel block. See [`super::lower_ktir_to_superdsc::batch_matmul`].
     BatchMatmul { batch: u32 },
     /// A rank-3 `linalg.transpose` `[b, r, c] → [b, c, r]` — one 2-D transpose per batch, whose
-    /// output blocks are the `[k, n]` kernels a batched contraction reads. See
-    /// [`super::lower_ktir_to_superdsc::batch_transpose`].
-    BatchTranspose { batch: u32 },
+    /// output blocks are the `[k, n]` kernels a batched contraction reads, its input in `input`.
+    /// See [`super::lower_ktir_to_superdsc::batch_transpose`].
+    BatchTranspose {
+        batch: u32,
+        input: super::lower_ktir_to_superdsc::BatchFrame,
+    },
 }
 
 /// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole function.
@@ -3798,9 +3813,11 @@ fn lower_function_folded(
     let last_read = |arg: Ssa| -> Option<usize> {
         f.operations.iter().rposition(|o| o.operands.contains(&arg))
     };
-    // The buffers a batched transpose wrote as `[k, n]` blocks — the kernels a batched contraction
-    // may read as blocks (a one-stick-wide flat frame is the same bytes, and anything else is not).
-    let mut kernel_blocks: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // THE BATCH-BLOCKED BUFFERS — `[r, c]` stick-major blocks one after another: a batched
+    // transpose's output (the `[k, n]` kernels a batched contraction reads), and a page read
+    // `[kv, block, 128]`, permuted per kv head. One stick wide a block run is the flat frame's own
+    // bytes; wider it is not, and only the readers that address a block at its base take one.
+    let mut batch_blocks: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     for (oi, op) in f.operations.iter().enumerate() {
         if let Some((start, end)) = body_at {
@@ -3892,7 +3909,7 @@ fn lower_function_folded(
         // that WOULD move bytes is a relayout this door does not state, and is refused by name.
         //
         // ⭐ A GATHERED LOAD REACHING ONE IS MATERIALIZED FIRST — the page gather: the load's one
-        // index entry selects a whole slab of the paged value (a pool page, every kv head of it), so
+        // index entry selects a whole slab of the paged value (a page of a row-outermost cache, every kv head of it), so
         // its rows reach a consumer only through a contiguous scratch the gathered copy fills
         // ([`super::lower_ktir_to_superdsc::page_gather`]), and the shape op names that scratch.
         if matches!(
@@ -3917,9 +3934,13 @@ fn lower_function_folded(
             // ([`super::lower_ktir_to_superdsc::row_gather`]).
             let stick = i64::from(crate::work::FP16_ELEMS_PER_STICK);
             let numel: i64 = from.iter().product();
-            let pooled =
+            let row_outermost =
                 |gi: usize| layout.is_some_and(|l| l.is_row_outermost(gathers[gi].value_tid));
-            if gathered_loads.get(&src).is_some_and(|&gi| pooled(gi)) && numel % stick == 0 {
+            if gathered_loads
+                .get(&src)
+                .is_some_and(|&gi| row_outermost(gi))
+                && numel % stick == 0
+            {
                 from = vec![numel / stick, stick];
             }
             // ⭐ THE HEAD-MAJOR PAIR — a reshape of a stick-major `[B, A·S]` row block into
@@ -4028,7 +4049,7 @@ fn lower_function_folded(
                     f.name,
                     &source,
                     &dst,
-                    (rows, sticks),
+                    Permuted::whole((rows, sticks)),
                     crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
                     sym_id_base,
                     Some(layout),
@@ -4042,8 +4063,77 @@ fn lower_function_folded(
                 );
                 continue;
             }
+            // ⭐ STICK-MAJOR ROWS READ ROW-MAJOR — `[R, C·stick]` (a batched dot's `[KV, G, 128]`
+            // output, heads two sticks wide) reshaped to `[R·C, stick]` or one row of `R·C` sticks
+            // (spyre-inference's `attn.reshape(1, num_heads, head_size)`): the stick permute into a
+            // minted row-major buffer, and the rows a scatter takes from there.
+            if !gathered_loads.contains_key(&src)
+                && !same_card_bytes(&from, &to)
+                && let Some((rows, sticks)) = stick_major_split(&from, &to)
+            {
+                let Some(layout) = layout else {
+                    return err(format!(
+                        "{}: a stick permute needs a `BundleLayout` to hold its result",
+                        f.name
+                    ));
+                };
+                let Some(source) = region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
+                else {
+                    return err(format!(
+                        "{}: `{:?}` permutes a value this walk holds no buffer for",
+                        f.name, op.op_type
+                    ));
+                };
+                if batch_blocks.contains(&source.tid) {
+                    return err(format!(
+                        "{}: `{:?}` reads t{} as stick-major rows, and its bytes are batch blocks \
+                         one after another",
+                        f.name, op.op_type, source.tid
+                    ));
+                }
+                let tid = mint_inter(k, layout, floor, res);
+                let dst = row_major_region(tid, rows * sticks, layout);
+                out.push(permute(
+                    f.name,
+                    &source,
+                    &dst,
+                    Permuted::whole((rows, sticks)),
+                    crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                    sym_id_base,
+                    Some(layout),
+                )?);
+                let r = reframed(
+                    Region {
+                        is_out: false,
+                        ..dst
+                    },
+                    flat_frame(&to),
+                );
+                inter.insert(res, r);
+                if let Some(sc) = indirect_store_of(k, res)? {
+                    out.extend(super::lower_ktir_to_superdsc::row_scatter(
+                        f.name,
+                        &reframed(r, [sc.entries, sc.cols]),
+                        sc,
+                        sc.value_rows,
+                        sym_id_base,
+                        Some(layout),
+                    )?);
+                }
+                continue;
+            }
+            // A row-outermost page lands as one-stick rows; read in a multi-stick frame, it is permuted
+            // after the landing (below).
+            let page_to_sticks = gathered_loads
+                .get(&src)
+                .is_some_and(|&gi| row_outermost(gi))
+                && !same_card_bytes(&from, &to)
+                && stick_major_split(&to, &from).is_some();
             if !same_card_bytes(&from, &to)
-                && !gathered_loads.get(&src).is_some_and(|&gi| !pooled(gi))
+                && !page_to_sticks
+                && !gathered_loads
+                    .get(&src)
+                    .is_some_and(|&gi| !row_outermost(gi))
             {
                 return err(format!(
                     "{}: `{:?}` re-frames {from:?} as {to:?}, which moves bytes on the card (the \
@@ -4060,7 +4150,7 @@ fn lower_function_folded(
                             f.name
                         ));
                     };
-                    if !pooled(gi) {
+                    if !row_outermost(gi) {
                         let g = gathers[gi];
                         let (table_rows, cols) = gather_table_dims(f, &g)?;
                         let tid = mint_inter(k, layout, floor, src);
@@ -4110,7 +4200,7 @@ fn lower_function_folded(
                                 f.name,
                                 &r,
                                 &dst,
-                                (rows, sticks),
+                                Permuted::whole((rows, sticks)),
                                 crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
                                 sym_id_base,
                                 Some(layout),
@@ -4124,6 +4214,29 @@ fn lower_function_folded(
                                     },
                                     flat_frame(&to),
                                 ),
+                            );
+                        } else if let Some((rows, sticks)) = stick_major_split(&to, &from) {
+                            // ⭐ A GATHERED ROW READ IN A MULTI-STICK FRAME — one query row of
+                            // heads two sticks wide (`[NQH·128]` read as `[KV, G, 128]`): its
+                            // sticks run head by head, and the frame holds each head's sticks a
+                            // row block apart, so the card permutes them once.
+                            let tid = mint_inter(k, layout, floor, res);
+                            let dst = stick_major_region(tid, rows, sticks, layout);
+                            out.push(permute(
+                                f.name,
+                                &r,
+                                &dst,
+                                Permuted::whole((rows, sticks)),
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            inter.insert(
+                                res,
+                                Region {
+                                    is_out: false,
+                                    ..dst
+                                },
                             );
                         } else {
                             return err(format!(
@@ -4223,6 +4336,63 @@ fn lower_function_folded(
                     }
                 },
             };
+            // ⭐ A ROW-OUTERMOST PAGE READ IN A MULTI-STICK FRAME — kv heads two sticks wide: the
+            // page gather lands its slabs as one-stick rows, and the frame holds each row's sticks a
+            // row block apart, so the card permutes the landing (the `restickify` torch-spyre's
+            // stickification inserts where a consumer reads another layout). A rank-3
+            // `[B, R, C·stick]` read is `B` blocks a batched op takes one at a time — a batched
+            // transpose's input, a batched contraction's kernel — so each block is permuted on its
+            // own, into blocks one after another ([`batch_blocks`]).
+            if page_to_sticks && let Some((rows, sticks)) = stick_major_split(&to, &from) {
+                let Some(layout) = layout else {
+                    return err(format!(
+                        "{}: a stick permute needs a `BundleLayout` to hold its result",
+                        f.name
+                    ));
+                };
+                let tid = mint_inter(k, layout, floor, res);
+                let dst = stick_major_region(tid, rows, sticks, layout);
+                let blocks = match to.as_slice() {
+                    [b, _, _] => *b as u32,
+                    _ => 1,
+                };
+                if blocks > 1 {
+                    for b in 0..blocks {
+                        out.push(permute(
+                            f.name,
+                            &source,
+                            &dst,
+                            Permuted {
+                                rows: rows / blocks,
+                                sticks,
+                                block: Some(b),
+                            },
+                            crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                            sym_id_base,
+                            Some(layout),
+                        )?);
+                    }
+                    batch_blocks.insert(tid);
+                } else {
+                    out.push(permute(
+                        f.name,
+                        &source,
+                        &dst,
+                        Permuted::whole((rows, sticks)),
+                        crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                        sym_id_base,
+                        Some(layout),
+                    )?);
+                }
+                inter.insert(
+                    res,
+                    Region {
+                        is_out: false,
+                        ..dst
+                    },
+                );
+                continue;
+            }
             // The same bytes, in the frame the result is typed in — the frame its consumers read
             // (a `[1, 2048]` gathered query row is the `[8, 4, 64]` batched dot's `[32, 64]`).
             let [rr, rc] = flat_frame(&to);
@@ -4509,7 +4679,14 @@ fn lower_function_folded(
                         f.name
                     ));
                 }
-                rank3_batch().map(|batch| Lowering::BatchTranspose { batch })
+                // Its input in blocks when a permute laid it so ([`batch_blocks`]).
+                let input = match op.operands.first().and_then(|v| inter.get(v)) {
+                    Some(r) if batch_blocks.contains(&r.tid) => {
+                        super::lower_ktir_to_superdsc::BatchFrame::Blocks
+                    }
+                    _ => super::lower_ktir_to_superdsc::BatchFrame::Flat,
+                };
+                rank3_batch().map(|batch| Lowering::BatchTranspose { batch, input })
             }
             _ => None,
         };
@@ -5046,9 +5223,28 @@ fn lower_function_folded(
         // ⛔ A BATCHED CONTRACTION READS ITS KERNEL AS PER-BATCH `[k, n]` BLOCKS — written so by a
         // batched transpose, or a one-stick-wide flat frame (the same bytes). Any other kernel's
         // flat frame interleaves the batches stick by stick, and no base offset names one block.
+        // ⛔ AND A BATCH-BLOCKED BUFFER WIDER THAN A STICK IS READ ONLY AS BLOCKS — by a batched
+        // transpose (its input) or a batched contraction (its kernel). Anything else reads the flat
+        // frame, whose stick columns those bytes are not.
+        for (i, x) in per_op.iter().enumerate() {
+            let reads_blocks = matches!(
+                (&program, i),
+                (Lowering::BatchTranspose { .. }, 0) | (Lowering::BatchMatmul { .. }, 1)
+            );
+            if batch_blocks.contains(&x.tid)
+                && x.v_cols > crate::work::FP16_ELEMS_PER_STICK
+                && !reads_blocks
+            {
+                return err(format!(
+                    "{}: input {i} t{} `[{}, {}]` holds batch blocks one after another, which only \
+                     a batched transpose's input or a batched contraction's kernel reads",
+                    f.name, x.tid, x.v_rows, x.v_cols
+                ));
+            }
+        }
         if let Lowering::BatchMatmul { .. } = program
             && let Some(w) = per_op.get(1)
-            && !(kernel_blocks.contains(&w.tid) || w.c_len == crate::work::FP16_ELEMS_PER_STICK)
+            && !(batch_blocks.contains(&w.tid) || w.c_len == crate::work::FP16_ELEMS_PER_STICK)
         {
             return err(format!(
                 "{}: a batched contraction's kernel t{} is a `[{}, {}]` flat frame no batched \
@@ -5442,7 +5638,7 @@ fn lower_function_folded(
             )?;
             out.append(&mut emitted);
             if let Lowering::BatchTranspose { .. } = program {
-                kernel_blocks.insert(r.tid);
+                batch_blocks.insert(r.tid);
             }
             // ⭐ AND WHERE THE PROGRAM STORES THE VALUE THROUGH AN INDEX, THE ROWS GO THERE NOW.
             if let Some(sc) = indirect_store_of(k, res)? {
@@ -5874,26 +6070,22 @@ fn flat_frame(dims: &[i64]) -> [u32; 2] {
     }
 }
 
-/// Whether two shapes of one value are the SAME BYTES on the card: every element at the same address
-/// in both stick-major flat frames (`(c / stick)·(rows·stick) + r·stick + c % stick`, a row padded to
-/// whole sticks). True for equal frames, and for a re-framing that keeps every row one stick wide or
-/// moves rows within one row of sticks; false — a relayout — otherwise.
-/// ⭐ THE ROW-MAJOR SPLIT OF A STICK-MAJOR BLOCK — `(R, C)` when `stick_major` is a rank-2
-/// `[R, C·stick]` block of `R ≥ 2` rows of `C ≥ 2` sticks and `row_major`'s flat frame is
-/// `[R·C, stick]`: the same elements, row `r`'s sticks in order, which on the card are different
-/// bytes (`[C][R][stick]` vs `[R][C][stick]`) — the pair a stick permute moves between. One row is
-/// the same bytes in both frames, and no permute.
+/// ⭐ THE ROW-MAJOR SPLIT OF A STICK-MAJOR BLOCK — `(R, C)` when `stick_major`'s flat frame is
+/// `[R, C·stick]`, `R ≥ 2` rows of `C ≥ 2` sticks, and `row_major` is the same card bytes as
+/// `[R·C, stick]` (its own flat frame, or one row of `R·C` sticks, or a row-outermost page's one-stick
+/// landing): the same elements, row `r`'s sticks in order, which on the card are different bytes
+/// (`[C][R][stick]` vs `[R][C][stick]`) — the pair a stick permute moves between. One row of the
+/// stick-major side is the same bytes in both frames, and no permute. (A head two sticks wide puts
+/// granite-3.1-8b's `[kv, group, 128]` on the stick-major side.)
 fn stick_major_split(stick_major: &[i64], row_major: &[i64]) -> Option<(u32, u32)> {
-    let stick = i64::from(crate::work::FP16_ELEMS_PER_STICK);
-    let [rows, cols] = <[i64; 2]>::try_from(stick_major).ok()?;
+    let stick = crate::work::FP16_ELEMS_PER_STICK;
+    let [rows, cols] = flat_frame(stick_major);
     let sticks = cols / stick;
-    let [split_rows, split_cols] = flat_frame(row_major);
-    (cols % stick == 0
+    (cols.is_multiple_of(stick)
         && rows >= 2
         && sticks >= 2
-        && i64::from(split_cols) == stick
-        && i64::from(split_rows) == rows * sticks)
-        .then_some((rows as u32, sticks as u32))
+        && same_card_bytes(row_major, &[i64::from(rows * sticks), i64::from(stick)]))
+    .then_some((rows, sticks))
 }
 
 /// A minted row-major `[rows, stick]` buffer's region.
@@ -5916,18 +6108,66 @@ fn row_major_region(tid: u32, rows: u32, layout: &BundleLayout) -> Region {
     }
 }
 
+/// A minted stick-major `[rows, sticks · stick]` buffer's region.
+fn stick_major_region(tid: u32, rows: u32, sticks: u32, layout: &BundleLayout) -> Region {
+    let cols = sticks * crate::work::FP16_ELEMS_PER_STICK;
+    layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
+    Region {
+        tid,
+        v_rows: rows,
+        v_cols: cols,
+        r_start: 0,
+        c_start: 0,
+        r_len: rows,
+        c_len: cols,
+        r_cover: (0, rows),
+        c_cover: (0, cols),
+        is_out: true,
+        is_fp8: false,
+        band: None,
+    }
+}
+
+/// What one stick permute moves: `rows` rows of `sticks` sticks — the whole buffers, or `Some(b)`:
+/// block `b` of buffers holding `[rows, sticks · stick]` blocks one after another.
+#[derive(Clone, Copy)]
+struct Permuted {
+    rows: u32,
+    sticks: u32,
+    block: Option<u32>,
+}
+
+impl Permuted {
+    fn whole((rows, sticks): (u32, u32)) -> Self {
+        Self {
+            rows,
+            sticks,
+            block: None,
+        }
+    }
+}
+
 /// One stick permute between `src` and `dst` ([`crate::ir::bridge::tiled_op_sdsc_op::StickPermute`]).
 fn permute(
     name: &str,
     src: &Region,
     dst: &Region,
-    (rows, sticks): (u32, u32),
+    Permuted {
+        rows,
+        sticks,
+        block,
+    }: Permuted,
     direction: crate::ir::bridge::tiled_op_sdsc_op::StickPermute,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<super::EmittedOp, Error> {
+    let base = block.map_or(0, |b| b * rows * sticks * crate::work::FP16_ELEMS_PER_STICK);
+    let op_name = match block {
+        None => format!("permute_o{}", dst.tid),
+        Some(b) => format!("permute{b}_o{}", dst.tid),
+    };
     crate::ir::bridge::tiled_op_sdsc_op::assemble_stick_permute(
-        &format!("permute_o{}", dst.tid),
+        &op_name,
         &src.name(),
         &dst.name(),
         crate::ir::bridge::tiled_op_sdsc_op::StickPermuteSpec {
@@ -5935,6 +6175,8 @@ fn permute(
             sticks,
             df: crate::superdsc_opspec::Df::Fp16,
             direction,
+            src_elems: base,
+            dst_elems: base,
         },
         sym_id_base,
         layout,
@@ -5944,6 +6186,10 @@ fn permute(
     })
 }
 
+/// Whether two shapes of one value are the SAME BYTES on the card: every element at the same address
+/// in both stick-major flat frames (`(c / stick)·(rows·stick) + r·stick + c % stick`, a row padded to
+/// whole sticks). True for equal frames, and for a re-framing that keeps every row one stick wide or
+/// moves rows within one row of sticks; false — a relayout — otherwise.
 fn same_card_bytes(from: &[i64], to: &[i64]) -> bool {
     if from.iter().product::<i64>() != to.iter().product::<i64>() {
         return false;
@@ -6167,10 +6413,11 @@ fn emit_one(
                 layout,
             );
         }
-        Lowering::BatchTranspose { batch } => {
+        Lowering::BatchTranspose { batch, input } => {
             return super::lower_ktir_to_superdsc::batch_transpose(
                 name,
                 batch,
+                input,
                 per_op,
                 sym_id_base,
                 layout,

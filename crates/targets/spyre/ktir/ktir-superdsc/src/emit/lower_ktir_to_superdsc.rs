@@ -5830,6 +5830,17 @@ pub fn batch_matmul(
     Ok(ops)
 }
 
+/// Where a batched operand's `[r, c]` batch blocks sit in its buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchFrame {
+    /// The stick-major flat frame `[b·r, c]`: block `i` is its rows `i·r..`, a contiguous run only
+    /// while `c` is one stick — wider, the blocks interleave stick by stick.
+    Flat,
+    /// The blocks one after another: block `i` the stick-major `[r, c]` run at `i·r·c` (a page read
+    /// `[kv, block, 128]`, permuted per kv head).
+    Blocks,
+}
+
 /// A rank-3 `linalg.transpose` `[b, r, c] → [b, c, r]` — ONE 2-D relayout per batch, through the
 /// restickify door at each batch's element base ([`super::try_assemble_restickify_transpose_2d_at`]).
 ///
@@ -5837,12 +5848,14 @@ pub fn batch_matmul(
 /// batched contraction reads ([`batch_matmul`]) — not as the `[b·c, r]` flat frame: the two are the
 /// same bytes only at `r` one stick wide, and the score leg's `Kᵀ` page is `[hd, page]`.
 ///
-/// ⛔ THE INPUT'S BATCH BLOCKS ARE ITS FLAT FRAME'S ROWS, which is a contiguous `[r, c]` block only
-/// while `c` is one stick: wider, a batch's rows are interleaved stick by stick with every other
-/// batch's, and no base offset names them. Refused by name above one stick.
+/// ⛔ A [`BatchFrame::Flat`] INPUT'S BATCH BLOCKS ARE ITS FLAT FRAME'S ROWS, which is a contiguous
+/// `[r, c]` block only while `c` is one stick: wider, a batch's rows are interleaved stick by stick
+/// with every other batch's, and no base offset names them. Refused by name above one stick; an input
+/// in [`BatchFrame::Blocks`] is read block by block at any width.
 pub fn batch_transpose(
     name: &str,
     batch: u32,
+    input: BatchFrame,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
@@ -5868,7 +5881,7 @@ pub fn batch_transpose(
             batch * cols
         ));
     }
-    if cols != stick {
+    if cols != stick && input == BatchFrame::Flat {
         return err(format!(
             "{name}: a batched transpose of `[{batch}, {rows}, {cols}]` — a batch's `[{rows}, \
              {cols}]` block is a contiguous run of the flat frame only at one {stick}-element stick \
@@ -7121,7 +7134,7 @@ mod elementwise_tests {
 
     /// One whole-buffer operand: the view IS the window, and the store windows tile it — the shape
     /// `regions()` reports for a parameter whose `construct_access_tile` takes all of its view.
-    fn reg(tid: u32, rows: u32, cols: u32, is_out: bool) -> Region {
+    pub(super) fn reg(tid: u32, rows: u32, cols: u32, is_out: bool) -> Region {
         Region {
             tid,
             v_rows: rows,
@@ -8570,6 +8583,42 @@ mod elementwise_tests {
             ops1[0].arg_bindings.iter().all(|b| b.offset_elems != 0),
             "every binding of the chunked piece sits at its window's corner"
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_transpose_tests {
+    use super::elementwise_tests::reg;
+    use super::*;
+
+    /// `[8, 64, 128] → [8, 128, 64]`, the score leg's `Kᵀ` pages at a head two sticks wide.
+    fn pages() -> Vec<Region> {
+        vec![reg(5, 8 * 64, 128, false), reg(6, 8 * 128, 64, true)]
+    }
+
+    /// In the flat frame a batch's `[64, 128]` block is not a contiguous run: refused by name.
+    #[test]
+    fn a_flat_input_two_sticks_wide_is_refused() {
+        let mut sym = 0i64;
+        let Err(e) = batch_transpose("t", 8, BatchFrame::Flat, &pages(), &mut sym, None) else {
+            panic!("a flat [8, 64, 128] transposed per batch");
+        };
+        assert!(e.message.contains("interleave"), "{}", e.message);
+    }
+
+    /// In blocks, batch `i` is read at `i · 64 · 128` and written at `i · 128 · 64`.
+    #[test]
+    fn an_input_in_blocks_is_read_block_by_block() {
+        let mut sym = 0i64;
+        let ops = match batch_transpose("t", 8, BatchFrame::Blocks, &pages(), &mut sym, None) {
+            Ok(ops) => ops,
+            Err(e) => panic!("{}", e.message),
+        };
+        assert_eq!(ops.len(), 8);
+        for (i, e) in ops.iter().enumerate() {
+            let offs: Vec<u32> = e.arg_bindings.iter().map(|a| a.offset_elems).collect();
+            assert_eq!(offs, [i as u32 * 64 * 128; 2], "{}", e.op_name);
+        }
     }
 }
 

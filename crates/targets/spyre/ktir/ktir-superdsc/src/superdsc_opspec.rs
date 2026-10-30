@@ -1993,6 +1993,19 @@ impl ExUnit {
 /// of 64 ⇒ the per-core LX chunk is ALWAYS a multiple of 128, independent of the
 /// other dims' extents. So invalid IR is unconstructible — no emit-time assert and
 /// no grep of generated JSON is needed downstream.
+/// ⭐ HOW AN OP'S VIEW OF A TENSOR PRESENTS THE TENSOR'S OWN FRAME — for the arrangement authority,
+/// which compares every op's arrangement of one tensor in that tensor's frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewFrame {
+    /// The view is the tensor's own frame: its arrangement is the view's ([`StickLayout::for_view_df`]).
+    Own,
+    /// The view iterates the STICK COLUMNS of a stick-major `[R, C·L]` tensor in order —
+    /// `[stick column, row, lane]`, which the view classifies as the row-major `[C, R·L]` of the same
+    /// bytes (a stick permute's stick-major side). The tensor's arrangement is derived from it
+    /// ([`StickLayout::of_stick_columns`]).
+    StickColumns,
+}
+
 #[derive(Clone, Debug)]
 pub struct TensorArg<const D: usize> {
     is_input: bool,
@@ -2034,6 +2047,8 @@ pub struct TensorArg<const D: usize> {
     /// `phys`, not the op's logical extent, mirroring torch-spyre's `strides[dim] = strides[dim] //
     /// dev_dim_size * it_dim_size` rescale exactly. Set via [`TensorArg::with_device_extent`].
     device_extent: [Option<u32>; D],
+    /// How this view presents the tensor's own frame, for the arrangement authority ([`ViewFrame`]).
+    frame: ViewFrame,
 }
 
 impl<const D: usize> TensorArg<D> {
@@ -2081,7 +2096,15 @@ impl<const D: usize> TensorArg<D> {
             df: Df::Fp16,
             row_blocked: false,
             device_extent: [None; D],
+            frame: ViewFrame::Own,
         })
+    }
+
+    /// State how this view presents the tensor's own frame (see [`ViewFrame`]). Chains off
+    /// [`TensorArg::new`].
+    pub fn with_frame(mut self, frame: ViewFrame) -> TensorArg<D> {
+        self.frame = frame;
+        self
     }
 
     /// Set the SLICE offset (elements along the stick axis) — a builder that reads
@@ -2164,6 +2187,8 @@ pub struct ArgView<'a> {
     /// Per-`layout`-dim physical device extent override (torch-spyre `arg.device_size`) — `None` means
     /// "physical extent == this op's own iteration extent for that dim" (see [`TensorArg::device_extent`]).
     pub device_extent: &'a [Option<u32>],
+    /// How the view presents the tensor's own frame ([`ViewFrame`]).
+    pub frame: ViewFrame,
 }
 
 impl AnyTensorArg {
@@ -2363,6 +2388,7 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                frame: t.frame,
             },
             AnyTensorArg::R2(t) => ArgView {
                 is_input: t.is_input,
@@ -2377,6 +2403,7 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                frame: t.frame,
             },
             AnyTensorArg::R3(t) => ArgView {
                 is_input: t.is_input,
@@ -2391,6 +2418,7 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                frame: t.frame,
             },
             AnyTensorArg::R4(t) => ArgView {
                 is_input: t.is_input,
@@ -2405,6 +2433,7 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                frame: t.frame,
             },
         }
     }
