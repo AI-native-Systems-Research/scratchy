@@ -2,12 +2,13 @@
 
 //! PAGED ATTENTION, EXECUTED: spyre-inference's serving step — the KV cache write
 //! (`reshape_and_cache_head_major`) and the head-major page walk (`page_attn_head_major_decode` /
-//! `_prefill`) — as Triton (`kernels/paged_kv_write.py`, `kernels/paged_attn.py`), through the
-//! whole ladder, run by `ktir_emulator`.
+//! `_prefill`) — as Triton, kernel for kernel (`kernels/reshape_and_cache_head_major.py`,
+//! `kernels/page_attn_head_major_decode.py`, `kernels/page_attn_head_major_prefill.py`), through the
+//! whole ladder, run by `ktir_emulator`, on spyre-inference's own operands.
 //!
 //! ```text
-//!   triton_frontend      .py -> TTIR       (desc.scatter, the page-id read, the slab load)
-//!   triton_ktir          TTIR -> KTIR      (indirect access tiles: a store and the page loads)
+//!   triton_frontend      .py -> TTIR       (desc.scatter / gather, the page-id read, the page load)
+//!   triton_ktir          TTIR -> KTIR      (indirect access tiles: the stores and the page loads)
 //!   to_ktir_emit         KTIR -> IRFunction
 //!   ktir_emulator        the executed step
 //! ```
@@ -22,8 +23,11 @@ use triton_frontend::opt;
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
 
-const ATTN: &str = include_str!("../../../targets/spyre/kernels/paged_attn.py");
-const KV_WRITE: &str = include_str!("../../../targets/spyre/kernels/paged_kv_write.py");
+const DECODE: &str = include_str!("../../../targets/spyre/kernels/page_attn_head_major_decode.py");
+const PREFILL: &str =
+    include_str!("../../../targets/spyre/kernels/page_attn_head_major_prefill.py");
+const KV_WRITE: &str =
+    include_str!("../../../targets/spyre/kernels/reshape_and_cache_head_major.py");
 
 /// A kernel through the whole ladder to the emulator's IR.
 fn lower(src: &str, spec: &KernelSpec) -> IRFunction<'static> {
@@ -58,62 +62,82 @@ fn spec(file: &str, kernel: &str, pointers: &[(&str, &str)], ce: &[(&str, i128)]
     }
 }
 
-fn kv_write_spec(t: i128, nkvh: i128, hd: i128, pool_rows: i128) -> KernelSpec {
+fn kv_write_spec(t: i128, nkvh: i128, hd: i128, num_rows: i128) -> KernelSpec {
     spec(
-        "paged_kv_write.py",
-        "paged_kv_write_fwd",
+        "reshape_and_cache_head_major.py",
+        "reshape_and_cache_head_major_kernel",
         &[
-            ("desc_k", "*fp16"),
-            ("desc_v", "*fp16"),
-            ("desc_kp", "*fp16"),
-            ("desc_vp", "*fp16"),
-            ("desc_rows", "*i32"),
+            ("key", "*fp16"),
+            ("value", "*fp16"),
+            ("k_rows", "*fp16"),
+            ("v_rows", "*fp16"),
+            ("row_index", "*i32"),
         ],
         &[
             ("T", t),
-            ("NKVH", nkvh),
-            ("HD", hd),
-            ("POOL_ROWS", pool_rows),
+            ("NUM_KV_HEADS", nkvh),
+            ("HEAD_SIZE", hd),
+            ("NUM_ROWS", num_rows),
         ],
     )
 }
 
+#[derive(Clone, Copy)]
 struct AttnShape {
-    mq: i128,
-    nqh: i128,
-    nkvh: i128,
-    hd: i128,
-    block: i128,
+    padded_query_len: i128,
+    num_heads: i128,
+    num_kv_heads: i128,
+    head_size: i128,
+    block_size: i128,
     num_pages: i128,
     num_blocks: i128,
 }
 
-fn attn_spec(s: &AttnShape) -> KernelSpec {
-    let mut k = spec(
-        "paged_attn.py",
-        "paged_attn_fwd",
-        &[
-            ("desc_q", "*fp16"),
-            ("desc_o", "*fp16"),
-            ("desc_kp", "*fp16"),
-            ("desc_vp", "*fp16"),
-            ("desc_pt", "*i32"),
-            ("desc_mask", "*fp16"),
-        ],
-        &[
-            ("MQ", s.mq),
-            ("NQH", s.nqh),
-            ("NKVH", s.nkvh),
-            ("HD", s.hd),
-            ("BLOCK", s.block),
-            ("NUM_PAGES", s.num_pages),
-            ("NUM_BLOCKS", s.num_blocks),
-        ],
-    );
+/// The kernel a sequence's step runs — spyre-inference's dispatch: the decode kernel at one query
+/// row, the prefill kernel past it.
+fn attn_kernel(s: &AttnShape) -> (&'static str, KernelSpec) {
+    let decode = s.padded_query_len == 1;
+    let mut pointers = vec![
+        ("query", "*fp16"),
+        ("query_row_index", "*i32"),
+        ("k_pages", "*fp16"),
+        ("v_pages", "*fp16"),
+        ("page_index_table", "*i32"),
+    ];
+    if decode {
+        pointers.push(("kv_row_pool", "*i32"));
+    }
+    pointers.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
+    let mut ce = vec![
+        ("NUM_TOKENS", s.padded_query_len),
+        ("NUM_HEADS", s.num_heads),
+        ("NUM_KV_HEADS", s.num_kv_heads),
+        ("HEAD_SIZE", s.head_size),
+        ("BLOCK_SIZE", s.block_size),
+        ("NUM_PAGES", s.num_pages),
+        ("NUM_BLOCKS", s.num_blocks),
+    ];
+    let (src, file, kernel) = if decode {
+        (
+            DECODE,
+            "page_attn_head_major_decode.py",
+            "page_attn_head_major_decode_kernel",
+        )
+    } else {
+        ce.push(("PADDED_QUERY_LEN", s.padded_query_len));
+        (
+            PREFILL,
+            "page_attn_head_major_prefill.py",
+            "page_attn_head_major_prefill_kernel",
+        )
+    };
+    let mut k = spec(file, kernel, &pointers, &ce);
     k.signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-    k.constexprs
-        .insert("SCALE".to_string(), Val::Float(1.0 / (s.hd as f64).sqrt()));
-    k
+    k.constexprs.insert(
+        "SCALE".to_string(),
+        Val::Float(1.0 / (s.head_size as f64).sqrt()),
+    );
+    (src, k)
 }
 
 fn count(f: &IRFunction, kind: OpKind) -> usize {
@@ -128,75 +152,81 @@ fn count(f: &IRFunction, kind: OpKind) -> usize {
 /// computed corner.
 #[test]
 fn the_step_reaches_the_emulator_as_hardware_gathers_and_scatters() {
-    let w = lower(KV_WRITE, &kv_write_spec(1, 8, 64, 8 * 8 * 64));
+    // A prompt chunk's write: one scatter per kv head per cache (their per-head `index_copy_`).
+    let w = lower(KV_WRITE, &kv_write_spec(32, 8, 64, 8 * 8 * 64));
     assert_eq!(
         count(&w, OpKind::KtdpConstructIndirectAccessTile),
-        2,
-        "one scatter tile per pool"
+        2 * 8,
+        "one scatter tile per (kv head, cache)"
     );
-    // Under Triton's scatter floor of 8 rows (one token over 2 kv heads), each row is its own
-    // store at the row the table names — still an indirect tile, one per row per pool.
-    let w2 = lower(KV_WRITE, &kv_write_spec(1, 2, 64, 4 * 2 * 64));
+    // A decode step's one token is under Triton's scatter floor of 8 rows: each row is its own
+    // store at the row its head's index names — still an indirect tile, one per (head, cache).
+    let w1 = lower(KV_WRITE, &kv_write_spec(1, 8, 64, 8 * 8 * 64));
     assert_eq!(
-        count(&w2, OpKind::KtdpConstructIndirectAccessTile),
-        2 * 2,
-        "one indirect store tile per (row, pool)"
+        count(&w1, OpKind::KtdpConstructIndirectAccessTile),
+        2 * 8,
+        "one indirect store tile per (row, kv head, cache)"
     );
     let decode = AttnShape {
-        mq: 1,
-        nqh: 32,
-        nkvh: 8,
-        hd: 64,
-        block: 64,
+        padded_query_len: 1,
+        num_heads: 32,
+        num_kv_heads: 8,
+        head_size: 64,
+        block_size: 64,
         num_pages: 8,
         num_blocks: 3,
     };
-    let a = lower(ATTN, &attn_spec(&decode));
-    // ⭐ THE WALK IS A LOOP — `walk_tiles`' ONE block body, not a copy per block: ONE walk over the
-    // blocks, every kv head in it, whose body gathers one whole K page and one whole V page through
-    // the trip's own page-table row.
+    let (src, k) = attn_kernel(&decode);
+    let a = lower(src, &k);
+    // ⭐ THE WALK IS A LOOP — `walk_tiles`' ONE block body, not a copy per block.
     assert_eq!(
         count(&a, OpKind::ScfFor),
         1,
         "one page walk, standing as a loop"
     );
+    // The query row and the output row (through `query_row_index`) and the block's K and V rows
+    // (through its `kv_row_pool` row, itself a direct tile at the page the table names) — every
+    // one read or written through memory.
     assert_eq!(
         count(&a, OpKind::KtdpConstructIndirectAccessTile),
-        2,
-        "one K and one V page gather in the walk's one block body"
+        4,
+        "query, K, V and out through their indices"
     );
-    // And the program is the same size however long the walk: a 64-block walk is the 3-block
-    // walk's ops with a different trip count.
-    let long = lower(
-        ATTN,
-        &attn_spec(&AttnShape {
-            num_pages: 64,
-            num_blocks: 64,
-            ..decode
-        }),
-    );
+    // And the program is the same size however long the walk.
+    let (src, k) = attn_kernel(&AttnShape {
+        num_pages: 64,
+        num_blocks: 64,
+        ..decode
+    });
     assert_eq!(
-        long.ops_deep().len(),
+        lower(src, &k).ops_deep().len(),
         a.ops_deep().len(),
         "a longer walk grew the program"
     );
-    // The prompt walk gathers each page ONCE too: every query head rides the one walk
-    // (spyre-inference's batched GQA), not one walk each.
-    let prompt = AttnShape { mq: 32, ..decode };
-    let p = lower(ATTN, &attn_spec(&prompt));
+    // The prompt kernel gathers each page ONCE, whole: every query head rides the one walk.
+    let (src, k) = attn_kernel(&AttnShape {
+        padded_query_len: 32,
+        ..decode
+    });
+    let p = lower(src, &k);
+    assert_eq!(
+        count(&p, OpKind::ScfFor),
+        1,
+        "one page walk, standing as a loop"
+    );
     assert_eq!(
         count(&p, OpKind::KtdpConstructIndirectAccessTile),
-        2,
-        "one K and one V page gather in the block body, whatever the query width"
+        4,
+        "the query rows, the K page, the V page and the output rows through their indices"
     );
-    // ⛔ NO WIDEN SURVIVES. The kernel's `exp` islands (`x.to(f32)` → exp → `.to(f16)`) collapse
-    // to the bare f16 op, so neither program carries an f16→f32 `arith.extf` — the convert whose
+    // ⛔ NO WIDEN SURVIVES. The kernels' `exp` islands (`x.to(f32)` → exp → `.to(f16)`) collapse
+    // to the bare f16 op, so no program carries an f16→f32 `arith.extf` — the convert whose
     // card form (`dl16tofp32`) permutes lanes, which a fused forward models.
     for (name, f) in [
-        ("paged_kv_write", &w),
-        ("paged_kv_write (2 rows)", &w2),
-        ("paged_attn", &a),
-        ("paged_attn (prompt)", &p),
+        ("reshape_and_cache_head_major", &w),
+        ("reshape_and_cache_head_major (1 token)", &w1),
+        ("page_attn_head_major_decode", &a),
+        ("page_attn_head_major_prefill", &p),
     ] {
         assert_eq!(
             count(f, OpKind::ArithExtf),
@@ -343,75 +373,73 @@ fn max_abs(a: &[f64], b: &[f64]) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// spyre-inference's `[NUM_BLOCKS, 32]` page table, re-pitched to the kernel's rows — one int32 stick
-/// per score row (`paged_attn.py`'s `PT_PITCH`, `GQA * MQ * 32`) — each row holding the block's page at
-/// column 0, or from 8 kv heads up its `NKVH` folded-cache rows `page * NKVH + kv`
-/// (`kv_row_pool[page]`), after rotating the blocks left by `rotate` (a control's wrong table).
+/// spyre-inference's `[NUM_BLOCKS, 32]` page table as recorded, its rows rotated left by `rotate`
+/// (a control's wrong table).
 fn page_table(s: &Step, rotate: usize) -> Arg {
     let (raw, shape, _) = s.file("page_table");
     let (nb, stick) = (shape[0], shape[1]);
-    let nkvh = s.geom("NKVH");
-    let pitch = (s.mq() * s.geom("NQH") / nkvh * 32) as usize;
-    let mut data = vec![0u8; nb * pitch * 4];
-    for b in 0..nb {
-        let from = (b + rotate) % nb * stick * 4;
-        let page = i32::from_le_bytes(raw[from..from + 4].try_into().expect("one word"));
-        let words: Vec<i32> = if nkvh >= 8 {
-            (0..nkvh as i32).map(|kv| page * nkvh as i32 + kv).collect()
-        } else {
-            vec![page]
-        };
-        for (w, v) in words.iter().enumerate() {
-            let at = (b * pitch + w) * 4;
-            data[at..at + 4].copy_from_slice(&v.to_le_bytes());
-        }
-    }
+    let row = stick * 4;
+    let data: Vec<u8> = (0..nb)
+        .flat_map(|b| {
+            let from = (b + rotate) % nb * row;
+            raw[from..from + row].to_vec()
+        })
+        .collect();
     Arg::TensorBytes {
         data,
-        shape: vec![nb, pitch],
+        shape,
         dtype: DType::I32,
     }
 }
 
-/// The step's attention, on the emulator, over pools `kp`/`vp` with page table `pt`.
+fn i32_arg(words: &[i32], shape: Vec<usize>) -> Arg {
+    Arg::TensorBytes {
+        data: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        shape,
+        dtype: DType::I32,
+    }
+}
+
+/// The step's attention, on the emulator, over pools `kp`/`vp` with page table `pt` — the kernel
+/// spyre-inference dispatches at this query width, on their operands.
 fn attend(s: &Step, kp: &[f64], vp: &[f64], pt: Arg) -> Vec<f64> {
     let (mq, nqh, nkvh, hd) = (s.mq(), s.geom("NQH"), s.geom("NKVH"), s.geom("HD"));
     let (block, pages, nb) = (s.geom("BLOCK"), s.geom("NUM_PAGES"), s.num_blocks());
     let shape = AttnShape {
-        mq,
-        nqh,
-        nkvh,
-        hd,
-        block,
+        padded_query_len: mq,
+        num_heads: nqh,
+        num_kv_heads: nkvh,
+        head_size: hd,
+        block_size: block,
         num_pages: pages,
         num_blocks: nb,
     };
-    let f = lower(ATTN, &attn_spec(&shape));
-    let q_shape = vec![mq as usize, (nqh * hd) as usize];
-    let pool = vec![pages as usize, nkvh as usize, block as usize, hd as usize];
-    // spyre-inference's `[NUM_BLOCKS, MQ, BLOCK]` mask stack, staged at the score rows the way the
-    // worker stages it (`paged_step::mask_stack`): row `g * MQ + m` of each tile is their row `m`.
-    let gqa = (nqh / nkvh) as usize;
-    let theirs = s.values("mask");
-    let (b, rows) = (block as usize, mq as usize);
-    let mask: Vec<f64> = (0..nb as usize * rows * gqa)
-        .flat_map(|r| {
-            let (tile, m) = (r / (rows * gqa), r % rows);
-            theirs[(tile * rows + m) * b..(tile * rows + m + 1) * b].to_vec()
-        })
-        .collect();
-    let out = run(
-        &f,
-        vec![
-            s.arg("q", q_shape.clone()),
-            f16_arg(&vec![0.0; (mq * nqh * hd) as usize], q_shape),
-            f16_arg(kp, pool.clone()),
-            f16_arg(vp, pool),
-            pt,
-            f16_arg(&mask, vec![nb as usize * rows * gqa, b]),
-        ],
-    );
-    out[1].clone()
+    let (src, k) = attn_kernel(&shape);
+    let f = lower(src, &k);
+    let (rows, width) = (mq as usize, (nqh * hd) as usize);
+    let q_shape = vec![rows, width];
+    // The batch is this one sequence: its rows are the query's rows, in order.
+    let row_index: Vec<i32> = (0..mq as i32).collect();
+    let mut bound = vec![s.arg("q", q_shape.clone()), i32_arg(&row_index, vec![rows])];
+    if mq == 1 {
+        // The folded cache `[pages * kv, block, D]`, and `kv_row_pool` `[pages, kv, 1]`.
+        let folded = vec![(pages * nkvh) as usize, (block * hd) as usize];
+        bound.push(f16_arg(kp, folded.clone()));
+        bound.push(f16_arg(vp, folded));
+        bound.push(pt);
+        let pool: Vec<i32> = (0..(pages * nkvh) as i32).collect();
+        bound.push(i32_arg(&pool, vec![pages as usize, nkvh as usize]));
+    } else {
+        let unfolded = vec![pages as usize, (nkvh * block * hd) as usize];
+        bound.push(f16_arg(kp, unfolded.clone()));
+        bound.push(f16_arg(vp, unfolded));
+        bound.push(pt);
+    }
+    // `[num_blocks, padded_query_len, block_size]`, as recorded.
+    bound.push(s.arg("mask", vec![nb as usize * rows, block as usize]));
+    bound.push(f16_arg(&vec![0.0; rows * width], q_shape));
+    let out = run(&f, bound);
+    out.last().expect("the out operand").clone()
 }
 
 /// ⭐ ONE SERVING STEP: our scatter writes this step's K/V into the pools, then our page walk
@@ -423,16 +451,30 @@ fn the_step_matches_spyre_inference(config: &str) {
 
     // THE WRITE — exact: a scatter moves bits.
     let w = lower(KV_WRITE, &kv_write_spec(mq, nkvh, hd, pool_rows));
-    let rows = (mq * nkvh) as usize;
+    let (t, kvh) = (mq as usize, nkvh as usize);
     let pool = vec![pool_rows as usize, hd as usize];
+    // `kv_write_index`'s one `[T]` index per kv head, one after another: the recording holds the
+    // same rows `(token, head)`-major.
+    let (raw, _, _) = s.file("write_rows");
+    let token_major: Vec<i32> = raw
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| i32::from_le_bytes(*w))
+        .collect();
+    let per_head: Vec<i32> = (0..kvh)
+        .flat_map(|h| (0..t).map(move |tok| (h, tok)))
+        .map(|(h, tok)| token_major[tok * kvh + h])
+        .collect();
+    let kv_shape = vec![t, (nkvh * hd) as usize];
     let after = run(
         &w,
         vec![
-            s.arg("k_new", vec![rows, hd as usize]),
-            s.arg("v_new", vec![rows, hd as usize]),
+            s.arg("k_new", kv_shape.clone()),
+            s.arg("v_new", kv_shape),
             s.arg("kp_pre", pool.clone()),
             s.arg("vp_pre", pool),
-            s.arg("write_rows", vec![rows]),
+            i32_arg(&per_head, vec![t * kvh]),
         ],
     );
     let (kp, vp) = (after[2].clone(), after[3].clone());

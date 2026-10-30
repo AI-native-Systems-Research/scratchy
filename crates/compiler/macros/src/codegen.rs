@@ -9687,13 +9687,13 @@ fn emit_superdsc_wiring(
     let paged = match gk.paged {
         Some(p) => {
             let (m, t, w) = (u32l(p.mask), u32l(p.page_table), u32l(p.write_rows));
+            let (q, kvp) = (u32l(p.query_rows), u32l(p.kv_row_pool));
             let (pages, slots) = (u32l(p.pages), u32l(p.page_slots));
-            let (rows, nkvh, gqa, walk) = (u32l(p.rows), u32l(p.nkvh), u32l(p.gqa), u32l(p.walk));
+            let (rows, nkvh, walk) = (u32l(p.rows), u32l(p.nkvh), u32l(p.walk));
             quote! {
                 ::core::option::Option::Some(::scratchy_target_spyre::wiring::PagedStep {
-                    mask: #m, page_table: #t, write_rows: #w,
-                    pages: #pages, page_slots: #slots, rows: #rows, nkvh: #nkvh, gqa: #gqa,
-                    walk: #walk,
+                    mask: #m, page_table: #t, write_rows: #w, query_rows: #q, kv_row_pool: #kvp,
+                    pages: #pages, page_slots: #slots, rows: #rows, nkvh: #nkvh, walk: #walk,
                 })
             }
         }
@@ -10996,11 +10996,11 @@ fn dump_wavefront_mega(
     // before every `lower_decode_to_wavefront` call so decode + prefill can never
     // be baked at diverging capacities.
     //
-    // The page is the Spyre pool's (`sdsc_abstract`, compiled only under `spyre`); a build without
-    // that target has no pool to round to, and never calls this function (its one call is gated on
-    // `cfg!(feature = "spyre")`).
+    // The page is the one the forward's attention walks (`paged_step::PAGE_SLOTS`, compiled only
+    // under `spyre`); a build without that target has no pool to round to, and never calls this
+    // function (its one call is gated on `cfg!(feature = "spyre")`).
     #[cfg(feature = "spyre")]
-    let page_slots = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    let page_slots = scratchy_target_spyre::paged_step::PAGE_SLOTS;
     #[cfg(not(feature = "spyre"))]
     let page_slots = 1u32;
     let prefix_len: std::num::NonZeroU32 = model

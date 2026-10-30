@@ -547,11 +547,12 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
                     push_scale(*scale, &mut scalarmul_scales);
                 }
             }
-            // ⭐ THE PAGE WALK'S CONSTANTS (`kernels/paged_attn.py`) — the three values its program
+            // ⭐ THE PAGE WALK'S CONSTANTS (spyre-inference's `page_attn_head_major_decode` /
+            // `_prefill`, `kernels/page_attn_head_major_*.py`) — the three values their program
             // states as splats, each a `[1,1]` const the card fills a buffer from or sprays as a
-            // scalar: the score multiplier (`scores * SCALE`), the online softmax's seed and clamp
-            // `0.0` (the running sum and output start at it, and `min(·, 0)` clamps the rescale), and
-            // its max seed `-inf`. A weight-folded attention runs at `SCALE = 1.0` (its √scale rides
+            // scalar: the score multiplier (`scores * scale`), the online softmax's seed and `relu`
+            // floor `0.0` (the running sum and output start at it, and `-relu(scores_max -
+            // tile_max)` floors at it), and its max seed `-inf`. A weight-folded attention runs at `SCALE = 1.0` (its √scale rides
             // W_q/W_k) and still states the multiply, so its 1.0 is the value it reads.
             SubOp::AttnDecode { scale, .. } => {
                 let multiplier = if folded_node(node.id) { 1.0 } else { *scale };
@@ -1420,43 +1421,54 @@ pub fn compute_bundle_layout<F: RopeForm>(
         seg_bytes[a] = align128(off + 2);
     }
 
-    // ── THE PAGED STEP'S SOURCES ── the page table, the mask stack and the write rows the host
-    //    stages each step (`crate::paged_step`), at their reserved tids in the ACTIVATION segment
-    //    like every per-step binding (the reserved-tid law above). The page walk's relaunch shifts
-    //    exactly this segment one step per trip, which is why the walk's body reads nothing else
-    //    from it. Sized for the pool's WHOLE walk — a bundle whose rung walks fewer blocks stages
-    //    and reads a prefix.
+    // ── THE PAGED STEP'S SOURCES ── spyre-inference's operands the host stages each step
+    //    (`crate::paged_step`): the page index table, the mask stack, the KV write index and the
+    //    query row index, at their reserved tids in the ACTIVATION segment like every per-step
+    //    binding (the reserved-tid law above). Sized for the pool's WHOLE walk — a bundle whose rung
+    //    walks fewer blocks stages and reads a prefix — and the page table at its card pitch
+    //    (`PagedStep::card_page_table_pitch`). The decode kernel's `kv_row_pool` is every page's run
+    //    of folded-cache rows, the same for every step: it sits beside the pools in the KV segment,
+    //    which a walk's relaunch does not shift, at its card run pitch.
     if let Some(step) = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(ir, ActiveCap::FULL)? {
-        let a = SegRole::Activation.segment();
         let int32_stick = u64::from(scratchy_triton_splice::INT32_STICK);
-        let score_rows = u64::from(step.rows * step.gqa);
-        for (tid, size) in [
+        let sticks = |words: u64| words.div_ceil(int32_stick) * int32_stick * 4;
+        let act = SegRole::Activation;
+        let mut sources = vec![
             (
                 step.page_table,
-                u64::from(step.pages) * u64::from(step.page_table_pitch()) * 4,
+                act,
+                u64::from(step.pages) * step.card_page_table_pitch(),
             ),
             (
                 step.mask,
-                u64::from(step.pages) * score_rows * u64::from(step.page_slots) * 2,
+                act,
+                u64::from(step.pages) * u64::from(step.rows) * u64::from(step.page_slots) * 2,
             ),
             (
                 step.write_rows,
-                u64::from(step.rows * step.nkvh).div_ceil(int32_stick) * int32_stick * 4,
+                act,
+                sticks(u64::from(step.rows * step.nkvh)),
             ),
-        ] {
-            let off = seg_bytes[a];
+            (step.query_rows, act, sticks(u64::from(step.rows))),
+        ];
+        if step.reads_kv_row_pool() {
+            sources.push((step.kv_row_pool, SegRole::Kv, step.card_kv_row_pool_bytes()));
+        }
+        for (tid, role, size) in sources {
+            let seg = role.segment();
+            let off = seg_bytes[seg];
             placements.insert(
                 tid,
                 TensorPlacement {
                     tid,
-                    role: SegRole::Activation,
-                    segment: a,
+                    role,
+                    segment: seg,
                     bank: 0,
                     offset: off,
                     size,
                 },
             );
-            seg_bytes[a] = align128(off + size);
+            seg_bytes[seg] = align128(off + size);
         }
     }
 
@@ -3548,13 +3560,13 @@ pub fn write_eval_golden<F: RopeForm>(
 /// — the reference for those families is the next rung, and a silent skip
 /// would be a hole; a panicking one would break every MoE bake that works
 /// today.
-/// The context the gate's decode step attends: past two page boundaries, ending mid-page — every
-/// page-walk law a decode step reads (a table lookup per page, a fully valid page, a partly valid
-/// one, masked pages past it) at a position a request reaches. See the decode golden's view in
-/// [`numeric_gate`].
+/// The context the gate's decode step attends: past ten page boundaries, ending mid-page — every
+/// page-walk law a decode step reads (a table lookup per page, fully valid pages, a partly valid
+/// one, masked pages past it) at a position a request reaches, and at least the 640 keys the
+/// gate's softmax has always summed. See the decode golden's view in [`numeric_gate`].
 #[cfg(feature = "spyre-emu")]
 pub const GATE_DECODE_CONTEXT: u32 =
-    2 * scratchy_triton_splice::PAGE_SLOTS + scratchy_triton_splice::PAGE_SLOTS / 2;
+    10 * scratchy_triton_splice::PAGE_SLOTS + scratchy_triton_splice::PAGE_SLOTS / 2;
 
 #[cfg(feature = "spyre-emu")]
 pub struct PrefillGate {
@@ -3655,7 +3667,7 @@ pub fn numeric_gate<F: RopeForm>(
     // slot of the pool, which no request reaches before its last token — and which the paged
     // walk's model-dtype softmax state cannot hold anyway when the keys score alike (the
     // denominator passes f16's 65504 past that many keys; spyre-inference's own state is the
-    // model dtype too). The gate's decode step is at [`GATE_DECODE_CONTEXT`] instead — past two
+    // model dtype too). The gate's decode step is at [`GATE_DECODE_CONTEXT`] instead — past ten
     // page boundaries, ending mid-page — the same kind of gate-local VIEW of the IR as the
     // prefill's dead prefix: the prefix regions are re-sliced, and the staging follows.
     let decode_reslice = prefill.is_none()

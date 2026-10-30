@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 
 //! A PROGRAM THAT WALKS — one constant-trip `scf.for` at the top level, its body read once per trip
-//! (`paged_attn.py`'s page walk: `walk_tiles`' one block body) — lowered to the card's FOLD: the
+//! (`page_attn_head_major_*.py`'s page walk: `walk_tiles`' one block body) — lowered to the card's FOLD: the
 //! body's descriptors are built ONCE, at trip 0, and the runtime relaunches them once per trip,
 //! shifting the step's sources by one pitch per relaunch.
 //!
@@ -73,6 +73,11 @@ pub struct LoopFold {
     /// The parameters whose addresses move per trip — the buffers the shift must reach, and the
     /// ONLY ones a trip may read through a moving address.
     pub stepped_params: Vec<Ssa>,
+    /// ⭐ THE INDEX TABLES THE CARD LAYS OUT AT THE WALK'S PITCH — an int32 table read one entry per
+    /// trip (spyre-inference's page index table, `[num_blocks, 32]`) whose own rows sit closer than
+    /// the walk's step: on the card its rows are [`Self::step_bytes`] apart instead, so the one
+    /// shift moves it with the data tiles. `(parameter, its own per-trip bytes)`.
+    pub pitched: Vec<(Ssa, u32)>,
     /// Every value the body defines — the descriptors the card relaunches once per trip.
     pub body: std::collections::HashSet<Ssa>,
     /// The loop-carried values, in `iter_args` order.
@@ -343,7 +348,15 @@ pub fn flatten(k: &KtirNode) -> Result<Option<Flattened>, Error> {
             })?;
         Ok((view, strides, bytes))
     };
-    let mut steps: Vec<(Ssa, i64)> = Vec::new();
+    // `(parameter, per-trip bytes, an int32 index table read one entry per trip)`.
+    let mut steps: Vec<(Ssa, i64, bool)> = Vec::new();
+    let is_index = |view: &Operation<'_>| {
+        matches!(
+            view.result_type,
+            Some(ktir_core::irtype::IrType::MemRef { dims, elem: ktir_core::dtypes::DType::I32 })
+                if dims.len() == 1
+        )
+    };
     for o in body {
         let moved: Vec<usize> = o
             .operands
@@ -403,7 +416,7 @@ pub fn flatten(k: &KtirNode) -> Result<Option<Flattened>, Error> {
                         per_trip * rows_per * i64::from(crate::work::STICK_BYTES)
                     };
                 }
-                steps.push((view.operands[0], step));
+                steps.push((view.operands[0], step, is_index(view)));
             }
             OpKind::KtdpConstructIndirectAccessTile => {
                 // The ANCHOR — the `Sym(i)` of the indirect dim's `Sym(i) + Dim(0)` subscript — is
@@ -443,7 +456,11 @@ pub fn flatten(k: &KtirNode) -> Result<Option<Flattened>, Error> {
                         f.name
                     ));
                 }
-                steps.push((view.operands[0], affine[&vars[*i]].per_trip * bytes as i64));
+                steps.push((
+                    view.operands[0],
+                    affine[&vars[*i]].per_trip * bytes as i64,
+                    is_index(view),
+                ));
             }
             other => {
                 return err(format!(
@@ -455,26 +472,49 @@ pub fn flatten(k: &KtirNode) -> Result<Option<Flattened>, Error> {
             }
         }
     }
-    let step_bytes = match steps.first() {
-        None => 0,
-        Some((_, s)) => {
-            if let Some((_, other)) = steps.iter().find(|(_, x)| x != s) {
-                return err(format!(
-                    "{}: the walk moves its tiles by {s} and {other} bytes per trip — a relaunch \
-                     shifts ONE segment base by ONE step, so every moving address has to advance \
-                     by the same bytes (pitch the step's sources alike)",
-                    f.name
-                ));
-            }
-            u32::try_from(*s).map_err(|_| Error {
-                message: format!(
-                    "{}: the walk's per-trip step {s} is not a forward byte count",
-                    f.name
-                ),
-            })?
+    // THE STEP IS THE DATA TILES' — every moving tile that is not an index table advances by one
+    // number of bytes, or the walk is refused. An index table read one entry per trip advances by its
+    // own row, which on the card is laid out at the walk's step (`LoopFold::pitched`), so it must
+    // divide the step.
+    let data_step = steps
+        .iter()
+        .filter(|(_, _, ix)| !ix)
+        .map(|(_, s, _)| *s)
+        .max();
+    let step = data_step
+        .or_else(|| steps.iter().map(|(_, s, _)| *s).max())
+        .unwrap_or(0);
+    if let Some((_, other, _)) = steps.iter().find(|(_, x, ix)| !ix && *x != step) {
+        return err(format!(
+            "{}: the walk moves its tiles by {step} and {other} bytes per trip — a relaunch shifts \
+             ONE segment base by ONE step, so every moving data tile has to advance by the same bytes",
+            f.name
+        ));
+    }
+    let mut pitched: Vec<(Ssa, u32)> = Vec::new();
+    for &(param, s, ix) in &steps {
+        if !ix || s == step {
+            continue;
         }
-    };
-    let mut stepped_params: Vec<Ssa> = steps.iter().map(|(p, _)| *p).collect();
+        if s <= 0 || step % s != 0 {
+            return err(format!(
+                "{}: the walk reads an index table {s} bytes along per trip and moves its tiles by \
+                 {step} — the card lays the table's rows out at the walk's step, which must be a \
+                 whole number of its rows",
+                f.name
+            ));
+        }
+        if !pitched.iter().any(|(p, _)| *p == param) {
+            pitched.push((param, s as u32));
+        }
+    }
+    let step_bytes = u32::try_from(step).map_err(|_| Error {
+        message: format!(
+            "{}: the walk's per-trip step {step} is not a forward byte count",
+            f.name
+        ),
+    })?;
+    let mut stepped_params: Vec<Ssa> = steps.iter().map(|(p, _, _)| *p).collect();
     stepped_params.sort_by_key(|s| s.0);
     stepped_params.dedup();
 
@@ -522,6 +562,7 @@ pub fn flatten(k: &KtirNode) -> Result<Option<Flattened>, Error> {
             trips,
             step_bytes,
             stepped_params,
+            pitched,
             body: body_values,
             carried,
         },

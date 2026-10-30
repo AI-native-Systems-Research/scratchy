@@ -82,6 +82,9 @@ pub const TL_FUNCTIONS: &[&str] = &[
     "math.exp2",
     "max",
     "maximum",
+    // `standard.min` (`standard.py:236`): the decode kernel's first row of an ascending index,
+    // under Triton's gather floor (`page_attn_head_major_decode.py`).
+    "min",
     // Not in the five-fixture census: the MoE kernel's fp8 clamps (`moe.py`), `arith.minnumf`
     // beside `maximum`'s `arith.maxnumf` (`semantic.py:366`'s PropagateNan.NONE arm).
     "minimum",
@@ -99,7 +102,7 @@ pub const TL_FUNCTIONS: &[&str] = &[
     "sum",
     "tanh",
     "math.tanh",
-    // Not in the five-fixture census: the paged walk's batched score dot (`paged_attn.py`),
+    // Not in the five-fixture census: the paged walk's batched score dot (`page_attn_head_major_*.py`),
     // `tl.dot(q, tl.trans(k_page, (0, 2, 1)))` — spyre-inference's `k_page.permute(0, 2, 1)`
     // over a rank-3 page, which `.T` (every axis reversed) cannot state. `tt.trans` with the
     // permutation as its `order`, the same op `.T` emits.
@@ -115,7 +118,7 @@ pub const TL_FUNCTIONS: &[&str] = &[
 ///
 /// `gather` and `scatter` are NOT in the original five-fixture census: they are the indirect
 /// read (`tt.descriptor_gather`, added with `embedding.py`) and the indirect write
-/// (`tt.descriptor_scatter`, added with `paged_kv_write.py`, the paged KV cache's store).
+/// (`tt.descriptor_scatter`, added with `reshape_and_cache_head_major.py`, the paged KV cache's store).
 pub const VALUE_METHODS: &[&str] = &["load", "store", "to", "gather", "scatter"];
 
 /// Python builtins the kernels call. `float(x)` is a constexpr cast in

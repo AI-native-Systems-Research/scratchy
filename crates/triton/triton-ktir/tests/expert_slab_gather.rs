@@ -115,8 +115,8 @@ fn every_slab_load_is_an_indirect_tile_over_the_ids_view() {
     }
 }
 
-/// Compile an ad-hoc kernel through the ladder and return the refusal text.
-fn refusal(src: &str, sig: &[(&str, &str)]) -> String {
+/// Compile an ad-hoc kernel through the ladder, up to KTDP.
+fn ladder(src: &str, sig: &[(&str, &str)]) -> Result<Module, String> {
     let mut signature = HashMap::new();
     let mut constexprs = HashMap::new();
     for (k, v) in sig {
@@ -134,9 +134,15 @@ fn refusal(src: &str, sig: &[(&str, &str)]) -> String {
     let mut tt = codegen::compile(src, &spec, Target::spyre()).expect("the front end admits it");
     opt::make_ttir(&mut tt).expect("make_ttir");
     let mut m = from_ttir::convert(&tt).expect("from_ttir");
-    match triton_ktir::make_ktir(&mut m, &[1]) {
-        Ok(()) => panic!("the ladder accepted a kernel it must refuse"),
-        Err(e) => e.to_string(),
+    triton_ktir::make_ktir(&mut m, &[1]).map_err(|e| e.to_string())?;
+    Ok(m)
+}
+
+/// Compile an ad-hoc kernel through the ladder and return the refusal text.
+fn refusal(src: &str, sig: &[(&str, &str)]) -> String {
+    match ladder(src, sig) {
+        Ok(_) => panic!("the ladder accepted a kernel it must refuse"),
+        Err(e) => e,
     }
 }
 
@@ -147,10 +153,12 @@ const SIG: &[(&str, &str)] = &[
     ("N", "constexpr"),
 ];
 
-/// A loaded value may select ONE slab; a block several rows tall on the indirect axis would
-/// need one index per row, which is `tt.descriptor_gather`.
+/// A loaded value selects ONE slab of an indirect tile; a block several rows tall at a loaded
+/// offset is the rows that start there (`k_tiles.load([first, 0])`, spyre-inference's page read
+/// under Triton's gather floor of 8 rows): a DIRECT tile whose corner is the read value, the
+/// read lowered to a one-element load and its `tensor.extract`, and no indirect tile.
 #[test]
-fn a_data_offset_on_a_multi_row_block_axis_is_refused_by_name() {
+fn a_data_offset_on_a_multi_row_block_axis_is_a_direct_tile_at_the_read_row() {
     let src = r#"
 import triton
 import triton.language as tl
@@ -161,10 +169,17 @@ def k(ids, w, o, N: tl.constexpr):
     e = tl.load(ids)
     od.store([0, 0], wd.load([e, 0]))
 "#;
-    let msg = refusal(src, SIG);
-    assert!(
-        msg.contains("selects ONE slab"),
-        "refused for the wrong reason: {msg}"
+    let m = ladder(src, SIG).unwrap_or_else(|e| panic!("the read-row block did not lower: {e}"));
+    assert_eq!(
+        count(&m, OpKind::KtdpConstructIndirectAccessTile),
+        0,
+        "the block is the rows at the read offset, not a gather"
+    );
+    assert_eq!(count(&m, OpKind::TtLoad), 0, "the scalar read is lowered");
+    assert_eq!(
+        count(&m, OpKind::Other("tensor.extract".into())),
+        1,
+        "the read value is extracted from its one-element load"
     );
 }
 

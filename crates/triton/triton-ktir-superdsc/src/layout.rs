@@ -180,6 +180,13 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         }
     }
     let index_tids: std::collections::BTreeSet<u32> = gathers.iter().map(|g| g.index_tid).collect();
+    // ⭐ A CHAINED INDEX'S TABLE IS HELD AT THE CARD'S RUN PITCH — each position's run of `scale`
+    // words at `INDEX_RUN_WORDS` words (`index_run_gather` copies that much per position), so the
+    // table is `positions × INDEX_RUN_WORDS` words on the card, not the program's packed run.
+    let chained: std::collections::BTreeMap<u32, u32> = gathers
+        .iter()
+        .filter_map(|g| g.via.map(|c| (g.index_tid, c.scale)))
+        .collect();
 
     // ⭐⭐⭐ THE PARAMETERS A CONVERT DOOR SWEEPS (the β ruling, front-b-noise, auditor
     // 2026-10-27) — reserved at the DEVICE width below, not the logical footprint. The
@@ -332,7 +339,12 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // addresses it at the 64-element device width, so the 2-B `SCALE_BYTES` placement is
         // the measured over-run (256 B against 2 B). Every OTHER `[1,1]` parameter keeps the
         // bound-scale size — its readers are broadcasts, granule-guarded at one 128-B read.
-        let size = if convert_swept.contains(&reg.tid) {
+        let size = if let Some(&scale) = chained.get(&reg.tid) {
+            let words = reg.v_rows as u64 * reg.v_cols as u64;
+            words.div_ceil(scale as u64)
+                * ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64
+                * df.word_length() as u64
+        } else if convert_swept.contains(&reg.tid) {
             reg.v_rows as u64
                 * DeviceWidth::for_convert(reg.v_cols).get() as u64
                 * df.word_length() as u64
