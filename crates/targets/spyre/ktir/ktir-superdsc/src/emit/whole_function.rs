@@ -4348,17 +4348,22 @@ pub fn lower_function(
     // that grew a compute op is a NEW producer form, and lowering its compute while silently not
     // running the copy half would emit a program whose stores are never written — so that case
     // refuses here rather than half-lowering.
-    if k.program == Program::LmLast {
+    if matches!(k.program, Program::LmLast | Program::BlockCopy) {
         if lowered > 0 {
             return err(format!(
-                "{}: an LmLast program with {lowered} compute op(s) — the last-row extraction is a \
-                 PURE COPY (loads and stores only), so a compute op here means the producer's form \
-                 changed and the copy half must be re-derived for it, not skipped",
-                f.name
+                "{}: a {:?} program with {lowered} compute op(s) — a copy is a PURE COPY (loads \
+                 and stores only), so a compute op here means the producer's form changed and the \
+                 copy half must be re-derived for it, not skipped",
+                f.name, k.program
             ));
         }
         let r = regions(k)?;
-        return super::lower_ktir_to_superdsc::lmlast(f.name, k, &r, sym_id_base, layout);
+        return match k.program {
+            Program::BlockCopy => {
+                super::lower_ktir_to_superdsc::block_copy(f.name, &r, sym_id_base, layout)
+            }
+            _ => super::lower_ktir_to_superdsc::lmlast(f.name, k, &r, sym_id_base, layout),
+        };
     }
     if lowered == 0 {
         return err(format!("{}: no compute op in the function", f.name));
