@@ -12,96 +12,45 @@
 //! kernels and the tape are per-model facts, the launcher is per-target I/O.
 
 use crate::bundle_code::PlaceId;
-use crate::lower_subtile_tape_to_superdsc as sd;
 use scratchy_subtile::host_tape::{KernelId, Operand, Site, Step, TensorId, Transfer};
 
 /// What a host kernel produced, in the format it is uploaded in.
 ///
-/// ⛔ THE DTYPE IS THE KERNEL'S, NOT THE CALLER'S. Every activation but one is built as f32 and
-/// narrowed by the bind loop; the batched prefix mask is built as f16 DIRECTLY, because it is
-/// quadratic in the request count and was 93% of every element that loop narrowed. That made it
-/// the one bind the worker had to special-case — a second list (`acts_f16`) threaded through the
-/// whole staging path. As a property of the OUTPUT it is just another kernel.
+/// ⛔ THE DTYPE IS THE KERNEL'S, NOT THE CALLER'S. A value tensor is built as f32 and narrowed by
+/// the bind loop; an index table and the chain's lane words are not values, and each rides the
+/// channel that carries it verbatim.
 pub enum Staged {
     /// ⭐ `Cow`, BECAUSE ONE KERNEL PRODUCES NOTHING. Every other host kernel computes its rows
     /// per forward and genuinely owns them; `Const(i)` hands back a table the macro already put
     /// in the binary, and copying it to satisfy an owned type was `2·hd²` floats per token for
     /// the identity and rope-P kernels alone.
     F32(std::borrow::Cow<'static, [f32]>),
-    /// IEEE-f16 bytes, already in the device's format.
-    F16(Vec<u8>),
-    /// ⭐ SIGNED 32-BIT INTEGERS — an index tensor, never a value tensor.
+    /// ⭐ INT32 INDEX WORDS, LITTLE-ENDIAN — the paged step's page table, write rows and query rows
+    /// (a decode batch's chunk pages and replicated rows), at the card's own layout.
     ///
-    /// ⛔ NOT A NARROWABLE NUMBER. Every other staged kernel output is a magnitude the device is
-    /// free to hold in f16; these are ADDRESSES-IN-WAITING, multiplied by `skip_addr` inside dxp's
-    /// synthesised `idx2addr`. f16 carries integers exactly only to 2048, and this pool's block
-    /// numbers run past that at 8 pages of one layer — so narrowing would not lose precision
-    /// visibly, it would silently gather a DIFFERENT ROW'S KEYS and read as fluent text.
-    /// ⭐ AND THEY ARE [`GatherEntry`]s, NOT `i32`s. The comment above already called them
-    /// "ADDRESSES-IN-WAITING"; the type now says so, so the only way to put one in this buffer is
-    /// [`GatherEntry::of_page_block`] and a hand-written page number does not compile.
-    ///
-    /// ⛔ ONE ENTRY TYPE, BECAUSE THERE IS ONE PIN. A second type (`PageEntry`, counting whole page
-    /// PLANES) existed while the page-granular copy pinned a plane; that pin is refused on card
-    /// (`PagePlaneExtent::entry_elems`), so the unit is one STICK BLOCK for every gather and a second
-    /// type would only be a second derivation of the same factor.
-    ///
-    /// [`GatherEntry`]: scratchy_subtile::sdsc_abstract::GatherEntry
-    /// [`GatherEntry::of_page_block`]: scratchy_subtile::sdsc_abstract::GatherEntry::of_page_block
-    I32(std::borrow::Cow<'static, [scratchy_subtile::sdsc_abstract::GatherEntry]>),
+    /// ⛔ NOT A NARROWABLE NUMBER. These are ADDRESSES-IN-WAITING: the walk gathers the pool rows a
+    /// page id names and the KV write scatters to the rows its index names. f16 carries integers
+    /// exactly only to 2048 and a pool's rows pass that within a few pages, so narrowing would not
+    /// lose precision visibly — it would gather and scatter a DIFFERENT ROW'S KEYS and read as fluent
+    /// text.
+    I32(Vec<u8>),
     /// ⭐ RAW u32 LANE VALUES — the chained head's stick seeds and nothing
     /// else. The sticks carry the decompose's own words (`k·s + (i mod k)`
     /// lane patterns, stick ramps), which an f32 arm would round and an
     /// i32-arm would mistype; they are VALUE words the device's own
     /// ChainStage rewrites every step, never addresses-in-waiting, so they
-    /// get their own variant rather than borrowing [`GatherEntry`].
+    /// get their own variant rather than borrowing the index words'.
     U32(std::borrow::Cow<'static, [u32]>),
-}
-
-/// Where prefix validity comes from — the one genuinely two-regime input.
-///
-/// ⛔ NOT TWO PREDICATES, TWO SHAPES. A prompt chunk and a solo decode want ONE broadcast row over
-/// `cap` columns; a decode BATCH wants one block per fold pass, `[nqh*mq, page_slots]`, because the
-/// fold takes a pass per (request, page) and `fold_delta` steps the mask one block per pass. Same
-/// question, different buffer — which is why this is an enum on the INPUT and not a second tape.
-pub enum PrefixSource<'a, Valid: Fn(usize) -> bool> {
-    /// `cap` additive entries; `holds(col)` carves validity out of `mask_neg`.
-    Broadcast { cap: usize, holds: Valid },
-    /// Fold-pass blocks, staged straight to f16 by the layout law itself.
-    Blocks {
-        shape: scratchy_subtile::sdsc_abstract::PrefixMaskShape<
-            { scratchy_subtile::sdsc_abstract::POOL_STICK },
-            { scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32 },
-        >,
-        fold: scratchy_subtile::sdsc_abstract::DeclaredFold,
-        histories: &'a [scratchy_subtile::sdsc_abstract::KvHistory],
-    },
-    /// A decode batch's split-KV chunk: ONE per-row block every row block reads, staged straight to
-    /// f16 by the batch chunk's own law.
-    Chunk {
-        chunk: scratchy_subtile::sdsc_abstract::BatchChunk,
-        histories: &'a [scratchy_subtile::sdsc_abstract::KvHistory],
-    },
 }
 
 /// A forward's ARGUMENTS — the data its kernels compute FROM.
 ///
-/// ⛔ NOT WHAT THEY PRODUCE. The tokens, the positions and the validity predicates are a
-/// forward's inputs; the embedding rows, the rotary tables and the staged masks are what the
-/// kernels COMPUTE from them. The binders this replaces conflated the two — they computed values
-/// inline and pushed them — so there was nothing to name and nothing to reorder.
-///
-/// `Valid` is a GENERIC BOUND, never `&dyn Fn`: monomorphised, no runtime dispatch.
-pub struct ForwardInputs<'a, Valid: Fn(usize) -> bool> {
+/// ⛔ NOT WHAT THEY PRODUCE. The tokens, the positions and the request's KV blocks are a forward's
+/// inputs; the embedding rows, the rotary tables and the paged step's tables are what the kernels
+/// COMPUTE from them. The binders this replaces conflated the two — they computed values inline
+/// and pushed them — so there was nothing to name and nothing to reorder.
+pub struct ForwardInputs<'a> {
     pub hidden: usize,
-    pub num_q_heads: usize,
-    /// The stick-padded row count the emitter reads the causal mask at (`rows.div_ceil(64)*64`).
-    pub mq_pad: usize,
-    /// Query heads per staged causal-mask block — [`NewBlockForm::mask_heads_per_block`] of the form the
-    /// bundle's new-token block was emitted in, so the host lays the mask out as the emitter reads it.
-    ///
-    /// [`NewBlockForm::mask_heads_per_block`]: scratchy_subtile::sdsc_abstract::NewBlockForm::mask_heads_per_block
-    pub causal_heads_per_block: usize,
     /// The whole embedding table.
     pub embed_tokens: &'a [f32],
     /// Token id per row.
@@ -117,35 +66,19 @@ pub struct ForwardInputs<'a, Valid: Fn(usize) -> bool> {
     /// ABSOLUTE rotary position per row — a row's real position in ITS sequence, which for a
     /// decode batch is not its row index.
     pub positions: &'a [u32],
-    /// ⭐ WHICH new-block causal mask this launch runs — the KEY, not the mask. The mask is
-    /// [`CausalKey::mask`]'s, built from the key alone, so no fact the key leaves out can reach it;
-    /// and a session whose staged mask already has this key re-binds nothing
-    /// ([`ForwardKernel::CausalMask`]'s step is skipped by the launcher).
-    ///
-    /// [`CausalKey::mask`]: scratchy_subtile::sdsc_abstract::CausalKey::mask
-    pub causal: scratchy_subtile::sdsc_abstract::CausalKey,
-    /// Prefix validity. `None` when the bundle placed no mask at all, in which case the shape
-    /// carries no `PrefixMask` step either.
-    pub prefix: Option<PrefixSource<'a, Valid>>,
     /// The baked constants, `(tid, values)`.
     pub consts: &'a [(u32, crate::wiring::ConstValues)],
-    /// fp16-safe attention "-inf".
-    pub mask_neg: f32,
     /// Stage the embedding and rotary tables stick-scattered. UNCONDITIONAL for the device, but
     /// [`stick_scatter`] is the identity at one row, so decode may pass either.
     pub stick_major: bool,
-    /// ⭐⭐⭐ THE GATHER'S INDEX TABLE — global 4096-element block numbers, row-major over
-    /// `[row, page]`, `Some` exactly when the bundle carries a [`ForwardKernel::KvBlockIndex`] step.
+    /// ⭐ THE PAGED STEP'S TABLES ON THE CARD — [`crate::paged_step::card_step_sources`] /
+    /// [`crate::paged_step::card_batch_sources`] of the request's KV blocks at the body that runs.
+    /// `Some` exactly when the bundle states a paged step ([`ForwardShape::paged`]).
     ///
-    /// ⛔ THESE ARE NOT PAGE NUMBERS AND NOT PHYSICAL ADDRESSES. dxp computes
-    /// `addr = idx * skip_addr + base` with `skip_addr` measured in ELEMENTS OF ONE ENTRY, which
-    /// for this pool is one 4096-element stick-group. A host page number would be off by
-    /// `page_stride/4096` — a factor of hundreds — and land inside a different layer.
-    ///
-    /// ⛔ NOT DERIVABLE HERE. Only the pool knows which physical page each row's logical page
-    /// occupies, and that mapping CHURNS as sequences are admitted and evicted. It is therefore an
-    /// INPUT, computed by the caller from the live block table, never recomputed from `positions`.
-    pub kv_blocks: Option<&'a [scratchy_subtile::sdsc_abstract::GatherEntry]>,
+    /// ⛔ NOT DERIVABLE HERE. Which physical page holds a request's block is the scheduler's grant,
+    /// and it CHURNS as requests are admitted, evicted and share a cached prefix — an input, read by
+    /// the caller from the live block table, never recomputed from `positions`.
+    pub paged: Option<&'a crate::paged_step::CardSources>,
 }
 
 /// Run one host kernel and return the values it fills its operand with.
@@ -153,70 +86,43 @@ pub struct ForwardInputs<'a, Valid: Fn(usize) -> bool> {
 /// ⭐ THIS IS THE WHOLE PER-MODEL FORWARD, and it does not touch a session — which is why it
 /// lives in the target crate rather than the worker. The worker's launcher is left with h2d,
 /// launch and readback.
-pub fn kernel_values<Valid: Fn(usize) -> bool>(
+pub fn kernel_values(
     step: &ForwardStep,
     shape: &ForwardShape,
-    inp: &ForwardInputs<'_, Valid>,
+    inp: &ForwardInputs<'_>,
 ) -> Result<Staged, String> {
     // ⭐ NO `head_dim`/`rope_theta` HERE ANY MORE. The rotary kernels read BOTH
     // off each source's own `RotaryKind` — a hybrid-attention arch (gemma-4)
     // has no single head dim or θ, and the model-wide pair this used to read
     // built every table from the WRONG class's facts.
     let (rows, h) = (shape.rows, inp.hidden);
-    // The one kernel whose output is already in the device's format.
-    if let ForwardKernel::PrefixMask = step.kernel {
-        let src = inp
-            .prefix
-            .as_ref()
-            .ok_or_else(|| "PrefixMask step on a bundle with no mask".to_string())?;
-        return Ok(match src {
-            PrefixSource::Broadcast { cap, holds } => Staged::F32(std::borrow::Cow::Owned(
-                broadcast_prefix_mask(*cap, inp.mask_neg, holds),
-            )),
-            PrefixSource::Blocks {
-                shape,
-                fold,
-                histories,
-            } => Staged::F16(
-                scratchy_subtile::sdsc_abstract::decode_batch_prefix_mask_f16(
-                    *shape,
-                    *fold,
-                    histories,
-                    inp.mask_neg,
-                ),
-            ),
-            PrefixSource::Chunk { chunk, histories } => Staged::F16(
-                scratchy_subtile::sdsc_abstract::batch_chunk_mask_f16(
-                    *chunk,
-                    histories,
-                    inp.mask_neg,
-                )
-                .ok_or_else(|| {
-                    format!(
-                        "batch chunk mask: {} histories for a {}-request chunk — one per request row",
-                        histories.len(),
-                        chunk.requests()
-                    )
-                })?,
-            ),
-        });
-    }
-    // ⭐⭐⭐ THE KV BLOCK INDEX, SERVED BEFORE THE f32 TAIL because it is not a float at all: the
-    // entries are int32 block numbers dxp multiplies by `skip_addr`. Routing them through the f32 arms
-    // would round every index through a float and, worse, hand the device the WRONG WIDTH — an index
-    // tensor read at 4 bytes but written as f32 pairs adjacent entries into one garbage address.
+    // ⭐⭐⭐ THE PAGED STEP, SERVED BEFORE THE f32 TAIL because all but one of its tables are not
+    // floats at all.
     //
-    // ⛔ A GATHER STEP WITH NO TABLE IS A REFUSAL, NOT AN EMPTY BUFFER. An unstaged index reads as
-    // ZERO, and zero is a VALID block number — every row would gather block 0, i.e. row 0's keys for
-    // the whole batch. Fluent, wrong, and exactly the corruption this path exists to remove, so the
-    // absence is named here rather than filled in.
-    if let ForwardKernel::KvBlockIndex = step.kernel {
-        let blocks = inp.kv_blocks.ok_or_else(|| {
-            "KvBlockIndex step on a forward with no block table: an unstaged index tensor reads as \
-             ZERO, and block 0 is a VALID address — every row would gather row 0's keys"
-                .to_string()
+    // ⛔ A PAGED STEP WITH NO TABLES IS A REFUSAL, NOT AN EMPTY BUFFER. An unstaged page table reads
+    // as ZERO, and page 0 is a real page: every block of the walk would read page 0's keys, and the
+    // write would scatter this request's keys into it. Fluent, wrong and silent, so the absence is
+    // named here rather than filled in.
+    if let ForwardKernel::Paged = step.kernel {
+        let tid = step.tensor.tid();
+        let card = inp.paged.ok_or_else(|| {
+            format!(
+                "paged step t{tid} on a forward with no KV blocks: an unstaged page table reads as \
+                 ZERO, and page 0 is a REAL page — every block would read page 0's keys"
+            )
         })?;
-        return Ok(Staged::I32(std::borrow::Cow::Owned(blocks.to_vec())));
+        if card.mask.0 == tid {
+            return Ok(Staged::F32(std::borrow::Cow::Owned(card.mask.1.clone())));
+        }
+        return card
+            .words(tid)
+            .map(|w| Staged::I32(w.to_vec()))
+            .ok_or_else(|| {
+                format!(
+                    "paged step t{tid}: the step staged no such table — the forward's step and the \
+                     bundle's are not one step"
+                )
+            });
     }
     // ⭐⭐⭐ THE CHAINED HEAD'S SEED — also raw u32 words served before the f32
     // tail: the sticks carry u32 lane values an f32 arm would round, and the
@@ -334,23 +240,8 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                 col
             }
         }
-        ForwardKernel::CausalMask => {
-            // The key names its own rows; a key for another rung would tile a mask the placement
-            // was not sized for.
-            if inp.causal.rows() != rows || inp.causal.rows_pad() != inp.mq_pad {
-                return Err(format!(
-                    "causal mask keyed {:?} ({} x {}) for a {rows}-row launch read {} wide",
-                    inp.causal,
-                    inp.causal.rows(),
-                    inp.causal.rows_pad(),
-                    inp.mq_pad
-                ));
-            }
-            causal_bind(inp.causal, inp.num_q_heads, inp.causal_heads_per_block)
-        }
-        ForwardKernel::PrefixMask => unreachable!("served above, where its dtype is decided"),
+        ForwardKernel::Paged => unreachable!("served above, where its index words stay INTEGERS"),
         ForwardKernel::Const(_) => unreachable!("served above, where it is borrowed not built"),
-        ForwardKernel::KvBlockIndex => unreachable!("served above, where it stays an INTEGER"),
         ForwardKernel::ChainSeed => unreachable!("served above, where it stays a raw word"),
         ForwardKernel::Decode => {
             return Err("Decode is a device step, not a host call".to_string());
@@ -377,118 +268,6 @@ pub fn stick_scatter(rows: usize, width: usize, row_major: &[f32]) -> Vec<f32> {
         }
     }
     out
-}
-
-/// The BROADCAST prefix-validity mask: `cap` additive entries, 0 where `valid(col)` and
-/// `mask_neg` elsewhere.
-///
-/// ⛔ EVERY SWEPT COLUMN GETS AN EXPLICIT VALUE. The ops sweep the placement's whole width, and an
-/// additive-mask byte the host never wrote reads as ZERO — which means VALID. So the buffer is
-/// filled with `mask_neg` first and validity is carved out of it, never the reverse.
-///
-/// The predicate is the REGIME: a prompt chunk asks `decode_prefix_col_valid(col, start)` (its
-/// resident prefix is contiguous), a decode row asks which slots it ACTUALLY HOLDS — those stop
-/// being the same question the moment a batch writes at a shared slot, because the shorter
-/// requests' history is `[0, len) ∪ [shared, …)` and the hole between holds another request's
-/// keys. [`a_hole_free_history_is_exactly_the_contiguous_prefix_law`] pins that they agree when
-/// there is no hole, which is why one function serves both.
-pub fn broadcast_prefix_mask(cap: usize, mask_neg: f32, valid: impl Fn(usize) -> bool) -> Vec<f32> {
-    let mut m = vec![mask_neg; cap];
-    for (col, slot) in m.iter_mut().enumerate() {
-        if valid(col) {
-            *slot = 0.0;
-        }
-    }
-    m
-}
-
-/// Tile a `[mq, mq_pad]` causal mask into the BLOCK-MAJOR per-head buffer the emitter reads:
-/// `nsub = mq_pad/64` blocks of `[nqh*mq, 64]`, block `j` holding causal columns `[64j, 64j+64)`.
-///
-/// ⛔ THE TILING IS A REAL TILE, NOT A BROADCAST. Causal validity varies per QUERY ROW (row `r`
-/// attends new-block column `c` iff `c <= r`), so one mb-broadcast row would apply query row 0's
-/// pattern to every row once `mq > 1`. And the emitter reads the mask through a FLAT handle whose
-/// row stride IS the block width (64), so a single `[nqh*mq, mq_pad]` row-major buffer would
-/// advance 64 per row where the true pitch is `mq_pad` — wrong columns for every row past the
-/// first as soon as `mq_pad > 64`.
-///
-/// Written once because the decode binder had its own `[nqh, mq_pad]` loop over
-/// `prefill_causal_col_valid(col, 0)`, which is this function at `mq == 1` —
-/// [`the_decode_causal_buffer_is_the_general_tiling_at_one_row`] proves it.
-///
-/// ⭐ IN BLOCKS OF `heads_per_block` HEADS ([`NewBlockForm::mask_heads_per_block`]): `nqh / heads_per_block`
-/// blocks, each `nsub` stick-wide column groups of its `heads_per_block·mq` rows. All `nqh` (one block) is
-/// the sub-blocked form above; the chunk-formed new block reads one row block's whole `[heads·mq, mq_pad]`
-/// block — a kv head's `gqa` heads at one feature slab, one query head above it — and so needs it laid out
-/// at that row count. The total and the bytes at `nsub == 1` are the same either way.
-///
-/// [`NewBlockForm::mask_heads_per_block`]: scratchy_subtile::sdsc_abstract::NewBlockForm::mask_heads_per_block
-pub fn causal_tiled(
-    cmask: &[f32],
-    mq: usize,
-    mq_pad: usize,
-    nqh: usize,
-    heads_per_block: usize,
-) -> Vec<f32> {
-    let nsub = (mq_pad / 64).max(1);
-    let heads_per_block = heads_per_block.clamp(1, nqh.max(1));
-    let mut out = Vec::with_capacity(nsub * nqh * mq * 64);
-    for _block in 0..nqh.div_ceil(heads_per_block) {
-        for j in 0..nsub {
-            for _h in 0..heads_per_block {
-                for r in 0..mq {
-                    let row = r * mq_pad + j * 64;
-                    out.extend_from_slice(&cmask[row..row + 64]);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// ⭐ THE CAUSAL MASK A LAUNCH UNDER `key` BINDS — the key's `[rows, rows_pad]` mask tiled per head as
-/// the emitter reads it. The ONE builder of the bound bytes: the launch's [`ForwardKernel::CausalMask`]
-/// step and a session's load-time staging ([`causal_full_chunk`]) both call it, so the mask a session
-/// stages before any request is, by construction, the mask its first full chunk would have bound.
-pub fn causal_bind(
-    key: scratchy_subtile::sdsc_abstract::CausalKey,
-    nqh: usize,
-    heads_per_block: usize,
-) -> Vec<f32> {
-    causal_tiled(
-        &key.mask(),
-        key.rows(),
-        key.rows_pad(),
-        nqh,
-        heads_per_block,
-    )
-}
-
-/// ⭐ THE CAUSAL MASK A `rows`-ROW SESSION'S FULL LAUNCH BINDS, and the key it binds it under — what a
-/// session can stage at LOAD, before any request, because both are compile-time facts of the rung:
-/// `rows` is the width the session's bundle was baked at (the ladder entry the launch selects the
-/// session by, and runs it at), the key is `Chunk { rows, rows }` (every full chunk of a prompt-chunk
-/// rung; every step of a one-row decode session), and the head count and blocking are the wiring's
-/// baked geometry through [`Wiring::causal_heads_per_block`] — the launch's own law.
-///
-/// [`Wiring::causal_heads_per_block`]: crate::wiring::Wiring::causal_heads_per_block
-pub fn causal_full_chunk(
-    w: &crate::wiring::Wiring,
-    rows: scratchy_subtile::sdsc_abstract::RungWidth,
-) -> (
-    PlaceId,
-    scratchy_subtile::sdsc_abstract::CausalKey,
-    Vec<f32>,
-) {
-    let key = scratchy_subtile::sdsc_abstract::CausalKey::Chunk {
-        rows,
-        real: rows.rows(),
-    };
-    (
-        PlaceId::Act(sd::ATTN_CAUSAL_TID),
-        key,
-        causal_bind(key, w.geometry.nqh as usize, w.causal_heads_per_block(key)),
-    )
 }
 
 /// Tile one rotary row across a source's full column width.
@@ -519,21 +298,12 @@ pub enum ForwardKernel {
     /// Rotary `cos` / `sin` for this position, tiled to source `i`'s width.
     Cos(usize),
     Sin(usize),
-    /// Prefix validity: 0 on slots this request holds, fp16-safe -inf elsewhere.
-    PrefixMask,
-    /// Causal validity for the new token's block.
-    CausalMask,
-    /// ⭐⭐⭐ THE KV BLOCK INDEX — int32 entries a GATHERED KV read is addressed through.
-    ///
-    /// Present only when the bundle declares an indirect KV access. Today the block table is consulted
-    /// HOST-side to compute one page base per launch, which is why `SessionKv::fold_requests` says
-    /// *"ONE LAUNCHED OP HAS ONE PAGE BASE, so B requests cannot share a pass"*; staging it as a TENSOR
-    /// is what lets every row reach its own keys in one launch.
-    ///
-    /// ⛔ ENTRIES ARE GLOBAL 4096-ELEMENT BLOCK INDICES, NOT PAGE NUMBERS — dxp computes
-    /// `addr = idx * skip_addr + base_addr` and `skip_addr` is the score leg's own entry, measured at
-    /// 4096 elements. See [`KV_BLOCK_INDEX_TID`](crate::lower_subtile_tape_to_superdsc::KV_BLOCK_INDEX_TID).
-    KvBlockIndex,
+    /// ⭐ ONE OF THE PAGED STEP'S TABLES ([`crate::paged_step`]), at the step's tensor: the page table
+    /// the walk gathers its pages through, the mask stack it adds to each block's scores, the write
+    /// rows the KV write scatters this step's keys and values to, and the query rows (a decode
+    /// batch's replicated rows, chunk page ids and chunk masks instead). Present exactly when the
+    /// bundle states a paged step ([`ForwardShape::paged`]).
+    Paged,
     /// Baked constant `i` (see [`crate::wiring::synthetic_constants`]).
     Const(usize),
     /// ⭐⭐⭐ THE CHAINED HEAD'S SEED — the decompose of the token this step FEEDS
@@ -583,19 +353,11 @@ pub struct ForwardShape {
     /// duplicated a `&'static` slice the macro put in the binary, once per forward, per token.
     pub cos_srcs: &'static [(u32, u32, crate::wiring::RotaryKind)],
     pub sin_srcs: &'static [(u32, u32, crate::wiring::RotaryKind)],
-    /// `false` when the bundle placed no broadcast prefix mask, so nothing reads one.
-    pub prefix_mask: bool,
-    /// ⭐⭐⭐ THIS BUNDLE READS KV THROUGH AN INDEX, so the tape has a [`ForwardKernel::KvBlockIndex`]
-    /// step and the launch must stage a table.
-    ///
-    /// ⛔ DERIVED FROM THE ARTIFACT, NEVER FROM A CALLER'S FLAG — `BakeFacts::gathers_kv`, which is
-    /// the presence of the `KV_BLOCK_INDEX_TID` placement, exactly as `uses_identity` and
-    /// `uses_ones_reduce` are. The two halves of a gather are the emitted descriptor and the staged
-    /// table, and they fail in OPPOSITE directions: a step with no descriptor binds a tensor nothing
-    /// reads (harmless, invisible), while a descriptor with no step gathers through an unstaged index
-    /// — which reads as ZERO, and block 0 is a VALID address, so every row would attend row 0's keys.
-    /// One artifact-derived question answers both.
-    pub kv_block_index: bool,
+    /// ⭐ THE BUNDLE'S PAGED STEP — its tables' tids. `Some` exactly when the bundle's attention reads
+    /// a paged step, so the tape carries a step per table iff the bundle placed it. A projection of the
+    /// wiring's own field, never a caller's opinion: a walk with no staged table gathers through zeros,
+    /// i.e. page 0.
+    pub paged: Option<crate::wiring::PagedStep>,
     pub n_consts: usize,
     /// ⭐⭐⭐ THE FORWARD'S OWN PHASE — which head the tape opens with, carried
     /// BY TYPE ([`ForwardPhase`]). DECODE opens with the chained head's two
@@ -660,25 +422,18 @@ impl ForwardShape {
                 tensor: PlaceId::Act(t),
             });
         }
-        if self.prefix_mask {
-            v.push(ForwardStep {
-                kernel: ForwardKernel::PrefixMask,
-                tensor: PlaceId::Act(sd::ATTN_MASK_TID),
-            });
-        }
-        v.push(ForwardStep {
-            kernel: ForwardKernel::CausalMask,
-            tensor: PlaceId::Act(sd::ATTN_CAUSAL_TID),
-        });
-        // ⭐⭐⭐⭐⭐ THE GATHER'S INDEX TABLE — a step iff the bundle placed the tensor. See
-        // [`ForwardShape::kv_block_index`] for why the condition is the placement and not a caller's
-        // opinion, and [`kernel_values`] for why the missing-table case is a refusal rather than an
-        // empty buffer.
-        if self.kv_block_index {
-            v.push(ForwardStep {
-                kernel: ForwardKernel::KvBlockIndex,
-                tensor: PlaceId::Act(sd::KV_BLOCK_INDEX_TID),
-            });
+        // ⭐ THE PAGED STEP'S TABLES — a step each, the ones its card placements stage every step.
+        // See [`ForwardShape::paged`] for why the condition is the wiring and not a caller's opinion,
+        // and [`kernel_values`] for why a forward with no KV blocks is a refusal rather than a buffer.
+        if let Some(p) = self.paged {
+            for (tid, seat, _) in p.card_placements() {
+                if seat == crate::wiring::CardSeat::Step {
+                    v.push(ForwardStep {
+                        kernel: ForwardKernel::Paged,
+                        tensor: PlaceId::Act(tid),
+                    });
+                }
+            }
         }
         for i in 0..self.n_consts {
             // The const's own tid is resolved by the launcher from the same
@@ -775,185 +530,124 @@ mod tests {
         theta_bits: 1_232_348_160, // f32::to_bits(1e6), spelled as bits: const-evaluable.
     };
 
+    /// A granite-shaped step: 4 pages of 4 slots, 2 kv heads, a 3-row bundle walking every block.
+    const STEP: crate::wiring::PagedStep = crate::wiring::PagedStep {
+        mask: 9001,
+        page_table: 9002,
+        write_rows: 9003,
+        query_rows: 9004,
+        kv_row_pool: 9005,
+        rep_rows: 9006,
+        chunk_pages: 9007,
+        chunk_masks: 9008,
+        int32_zero: 9009,
+        pages: 4,
+        page_slots: 4,
+        rows: 3,
+        nkvh: 2,
+        walk: 4,
+        paged_rows: crate::paged_step::PagedRows::Sequence,
+    };
+
     fn shape() -> ForwardShape {
         ForwardShape {
-            rows: 1,
+            rows: 3,
             embed_src: 0,
             cos_srcs: &[(5, 64, KIND), (7, 64, KIND)],
             sin_srcs: &[(6, 64, KIND), (8, 64, KIND)],
-            prefix_mask: true,
-            // The shipped non-gathering shape, so the ORDER assertion below stays the order every
-            // existing bundle plays. The gathering variant is asserted separately.
-            kv_block_index: false,
+            paged: Some(STEP),
             n_consts: 3,
             phase: ForwardPhase::Prefill,
         }
     }
 
-    /// ⭐⭐⭐ A GATHERING BUNDLE'S TAPE HAS THE STEP, AND A NON-GATHERING ONE DOES NOT — the two halves
-    /// of the gather, checked against each other at the only place both are visible.
-    ///
-    /// ⛔ AND THE STEP NAMES THE RESERVED TID, not "some activation". The tape binds by identity, and a
-    /// step whose tensor no placement matches is skipped by the launcher's lookup with nothing said —
-    /// which for an index tensor means gathering through zeros, i.e. row 0's keys for the whole batch.
-    #[test]
-    fn the_kv_block_index_step_exists_exactly_when_the_bundle_gathers() {
-        let plain = shape();
-        assert!(
-            !plain
-                .steps()
-                .iter()
-                .any(|s| matches!(s.kernel, ForwardKernel::KvBlockIndex)),
-            "a bundle that placed no index tensor must bind none — otherwise every existing bundle \
-             would stage a table nothing reads, and the one artifact-derived question would have two \
-             answers"
-        );
-
-        let gathering = ForwardShape {
-            kv_block_index: true,
-            ..shape()
-        };
-        let steps = gathering.steps();
-        let idx: Vec<&ForwardStep> = steps
-            .iter()
-            .filter(|s| matches!(s.kernel, ForwardKernel::KvBlockIndex))
-            .collect();
-        assert_eq!(idx.len(), 1, "exactly one index table per forward");
-        assert_eq!(
-            idx[0].tensor,
-            PlaceId::Act(sd::KV_BLOCK_INDEX_TID),
-            "the step must name the RESERVED tid the emitter placed — a step naming anything else is \
-             a bind the launcher silently skips"
-        );
-        // ⛔ AND IT PRECEDES THE DEVICE STEP. Every bind must; an index bound after the launch is an
-        // index the launch did not have.
-        let device = steps
-            .iter()
-            .position(|s| matches!(s.kernel, ForwardKernel::Decode))
-            .expect("the tape reaches its device step");
-        let at = steps
-            .iter()
-            .position(|s| matches!(s.kernel, ForwardKernel::KvBlockIndex))
-            .expect("the index step is present");
-        assert!(at < device, "the index must be staged before the launch");
-        // The rest of the tape is unchanged — the gather ADDS a step, it does not reorder one.
-        let without: Vec<ForwardKernel> = steps
-            .iter()
-            .map(|s| s.kernel)
-            .filter(|k| !matches!(k, ForwardKernel::KvBlockIndex))
-            .collect();
-        assert_eq!(
-            without,
-            plain.steps().iter().map(|s| s.kernel).collect::<Vec<_>>(),
-            "declaring a gather must not move any other step"
-        );
-    }
-
-    /// ⛔⛔⛔ A GATHER STEP WITH NO TABLE IS A REFUSAL — asserted, because the alternative is the exact
-    /// silent corruption this whole path exists to remove.
-    ///
-    /// An unstaged index tensor reads as ZERO on the card, and block 0 is a VALID address (row 0's
-    /// first page). So a missing table does not fault, does not zero the output and does not move a
-    /// counter: every row of the batch attends row 0's keys and the model answers fluently and wrongly.
-    #[test]
-    fn a_gather_step_with_no_table_refuses_rather_than_reading_block_zero() {
-        let shape = ForwardShape {
-            kv_block_index: true,
-            ..shape()
-        };
-        let step = ForwardStep {
-            kernel: ForwardKernel::KvBlockIndex,
-            tensor: PlaceId::Act(sd::KV_BLOCK_INDEX_TID),
-        };
-        let err = match kernel_values(&step, &shape, &inputs_without_table()) {
-            Err(e) => e,
-            Ok(_) => panic!(
-                "a gather step with NO table produced a value — an unstaged index reads as zero, and \
-                 block 0 is a real address, so the whole batch would attend row 0's keys"
-            ),
-        };
-        assert!(
-            err.contains("block 0 is a VALID address"),
-            "the refusal must say WHY an empty buffer is not an option (got: {err})"
-        );
-
-        // And WITH a table the entries arrive as INTEGERS, not as a narrowed float. f16 carries
-        // integers exactly only to 2048, and this pool's block numbers pass that inside one layer.
-        //
-        // ⛔ THE ENTRIES ARE MINTED THROUGH THE REAL DOOR AND THE FACTOR COMES FROM A REAL POOL, so
-        // this checks the COMPOSITION rather than re-asserting literals it chose itself. `per_page`
-        // is `page_stride / PLANE bytes` for an hd=64 pool over 40 layers × 3 planes — the shipped
-        // geometry — so it is 120, and page 100's entry is 12,000: past f16's exact-integer range by ~6×.
-        //
-        // ⛔ THE PAGE NUMBER HAD TO GROW WITH THE GRANULARITY CHANGE, AND THAT IS THE POINT OF THE
-        // ASSERT BELOW. Page-granular entries count PLANES, not stick blocks, so the factor fell from
-        // 3,840 to 120 (`nkvh * PAGE_SLOTS / POOL_STICK` = 32× smaller). Page 17 then yields 2,040 — just
-        // UNDER f16's 2048 — so the old literal would have left this test passing while testing nothing.
-        // The assert is what caught it; do not lower it to match a factor.
-        //
-        // ⭐ AND THE FACTOR IS BACK AT THE STICK BLOCK, which only makes the entries LARGER — the pin the
-        // plane factor served is refused at bake (`PagePlaneExtent::entry_elems`). The assert below is
-        // what keeps this test honest across either factor: it checks the VALUE exceeds f16's exact
-        // range, not which factor produced it.
-        let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(8, 64);
-        let plane = scratchy_subtile::sdsc_abstract::PagePlaneExtent::of_pool(pool)
-            .expect("a stick head dim");
-        let per_page =
-            scratchy_subtile::sdsc_abstract::gather_entries_per_page(40 * 3 * plane.bytes(), pool)
-                .expect("a page that is a whole number of stick blocks");
-        let mint = |phys: i64| {
-            scratchy_subtile::sdsc_abstract::GatherEntry::of_page_block(per_page, phys, 0)
-                .expect("an in-range entry")
-        };
-        let blocks = [mint(0), mint(1), mint(2), mint(100)];
-        assert!(
-            blocks[3].as_i32() > 2048,
-            "the point of this test is a value f16 cannot hold exactly; per_page={} made only {}",
-            per_page.get(),
-            blocks[3].as_i32()
-        );
-        let mut inp = inputs_without_table();
-        inp.kv_blocks = Some(&blocks);
-        match kernel_values(&step, &shape, &inp).expect("a staged table") {
-            Staged::I32(v) => assert_eq!(
-                &v[..],
-                &blocks[..],
-                "the entries must reach the bind loop unmodified"
-            ),
-            Staged::F32(_) | Staged::F16(_) => {
-                panic!("an index table staged as a FLOAT — 65,280 is not representable in f16")
-            }
-            Staged::U32(_) => panic!(
-                "an index table staged as raw u32 lanes — the chain seeds' own variant, not a \
-                 GatherEntry table"
-            ),
-        }
-    }
-
-    /// A `ForwardInputs` with everything the index step needs except the table.
-    fn inputs_without_table() -> ForwardInputs<'static, fn(usize) -> bool> {
+    /// Everything a forward of `shape()` reads, with the step's tables `card`.
+    fn inputs(card: Option<&crate::paged_step::CardSources>) -> ForwardInputs<'_> {
         ForwardInputs {
             hidden: 64,
-            num_q_heads: 1,
-            mq_pad: 64,
-            causal_heads_per_block: 1,
             embed_tokens: &[],
             tokens: &[],
             chain_seeds: None,
             positions: &[],
-            causal: one_row_key(),
-            prefix: None,
             consts: &[],
-            mask_neg: -1.0,
-            stick_major: false,
-            kv_blocks: None,
+            stick_major: true,
+            paged: card,
         }
     }
 
-    /// The one-row, one-real-row chunk key a solo decode step binds.
-    fn one_row_key() -> scratchy_subtile::sdsc_abstract::CausalKey {
-        use scratchy_subtile::sdsc_abstract::{CausalKey, RungWidth};
-        CausalKey::chunk(RungWidth::of_baked_rows(1).expect("a width"), 1).expect("a key")
+    fn staged(kernel: ForwardKernel, tid: u32, inp: &ForwardInputs<'_>) -> Result<Staged, String> {
+        let shape = shape();
+        let step = shape
+            .steps()
+            .into_iter()
+            .find(|s| s.kernel == kernel && s.tensor == PlaceId::Act(tid))
+            .expect("the paged shape carries the step");
+        kernel_values(&step, &shape, inp)
+    }
+
+    /// ⭐⭐⭐ THE TAPE'S TABLES ARE THE CARD STEP'S — `paged_step::card_step_sources`, the bytes the
+    /// card's placements hold. The index tables arrive as INTEGER words, the mask as values.
+    #[test]
+    fn the_paged_steps_are_the_card_steps_tables() {
+        let rows = crate::paged_step::StepRows { start: 9, real: 3 };
+        let card = crate::paged_step::card_step_sources(&STEP, &[3, 1, 0], &rows).expect("staged");
+        let inp = inputs(Some(&card));
+        for t in [STEP.page_table, STEP.write_rows, STEP.query_rows] {
+            match staged(ForwardKernel::Paged, t, &inp).expect("a table") {
+                Staged::I32(w) => assert_eq!(Some(w.as_slice()), card.words(t), "t{t}"),
+                _ => panic!("t{t}: an index table staged as anything but int32 words"),
+            }
+        }
+        match staged(ForwardKernel::Paged, STEP.mask, &inp).expect("a mask stack") {
+            Staged::F32(v) => assert_eq!(&v[..], &card.mask.1[..]),
+            _ => panic!("a mask stack is a value tensor"),
+        }
+        // The pool's statics are staged at load, so the tape has no step for them.
+        assert!(shape().steps().iter().all(|s| {
+            s.tensor != PlaceId::Act(STEP.kv_row_pool) && s.tensor != PlaceId::Act(STEP.int32_zero)
+        }));
+    }
+
+    /// ⛔⛔⛔ A PAGED STEP WITH NO BLOCKS IS A REFUSAL — asserted, because the alternative reads
+    /// page 0 for every block: an unstaged page table is zero, and page 0 is a real page.
+    #[test]
+    fn a_paged_step_with_no_blocks_refuses_rather_than_reading_page_zero() {
+        let inp = inputs(None);
+        for t in [STEP.page_table, STEP.mask, STEP.write_rows, STEP.query_rows] {
+            match staged(ForwardKernel::Paged, t, &inp) {
+                Err(e) => assert!(e.contains("page 0 is a REAL page"), "t{t}: {e}"),
+                Ok(_) => panic!("t{t} staged with no blocks"),
+            }
+        }
+    }
+
+    /// A decode batch's tape stages the batch's own tables, never one sequence's.
+    #[test]
+    fn a_decode_batch_stages_its_own_tables() {
+        let batch = ForwardShape {
+            paged: Some(crate::wiring::PagedStep {
+                paged_rows: crate::paged_step::PagedRows::Batch,
+                ..STEP
+            }),
+            ..shape()
+        };
+        let tids: Vec<PlaceId> = batch
+            .steps()
+            .iter()
+            .filter(|s| s.kernel == ForwardKernel::Paged)
+            .map(|s| s.tensor)
+            .collect();
+        for t in [
+            STEP.rep_rows,
+            STEP.chunk_pages,
+            STEP.chunk_masks,
+            STEP.write_rows,
+        ] {
+            assert!(tids.contains(&PlaceId::Act(t)), "t{t}");
+        }
+        for t in [STEP.page_table, STEP.mask, STEP.query_rows] {
+            assert!(!tids.contains(&PlaceId::Act(t)), "t{t}");
+        }
     }
 
     /// ⭐ THE ORDER IS THE CONTRACT. A forward binds the embedding row, then
@@ -972,8 +666,10 @@ mod tests {
                 ForwardKernel::Cos(1),
                 ForwardKernel::Sin(0),
                 ForwardKernel::Sin(1),
-                ForwardKernel::PrefixMask,
-                ForwardKernel::CausalMask,
+                ForwardKernel::Paged,
+                ForwardKernel::Paged,
+                ForwardKernel::Paged,
+                ForwardKernel::Paged,
                 ForwardKernel::Const(0),
                 ForwardKernel::Const(1),
                 ForwardKernel::Const(2),
@@ -994,16 +690,15 @@ mod tests {
         );
     }
 
-    /// A bundle that placed no broadcast prefix mask does not read one, so the
-    /// step does not exist. That is the shape the runtime `if let Some(..)`
-    /// guard had: a bake fact deciding whether a bind happens. On a tape it
-    /// decides whether a STEP EXISTS.
+    /// A bundle that states no paged step reads none of its tables, so the steps do not exist.
+    /// That is the shape a runtime `if let Some(..)` guard had: a bake fact deciding whether a bind
+    /// happens. On a tape it decides whether a STEP EXISTS.
     #[test]
     fn a_bake_fact_removes_the_step_rather_than_branching() {
         let mut sh = shape();
-        sh.prefix_mask = false;
+        sh.paged = None;
         let kinds: Vec<ForwardKernel> = sh.steps().iter().map(|x| x.kernel).collect();
-        assert!(!kinds.contains(&ForwardKernel::PrefixMask));
+        assert!(!kinds.contains(&ForwardKernel::Paged));
         assert_eq!(kinds.last(), Some(&ForwardKernel::Decode));
     }
 
@@ -1079,8 +774,7 @@ mod tests {
     ///
     /// A decode step fills ONE row. The bundle it launches into is baked to HOLD many — granite's
     /// decode bundle holds 96. Taking `rows` from the bundle ("it already knows") staged 96 rows
-    /// of embedding, 96 rotary rows and a 96-row causal mask on every decode step, into buffers
-    /// one row is read from. The card stopped responding, and no host-side check said anything.
+    /// of embedding and 96 rotary rows on every decode step, into buffers one row is read from. The card stopped responding, and no host-side check said anything.
     ///
     /// `stick_scatter` is why this is silent rather than a length error: it is a PERMUTATION, so
     /// `rows * width` elements go in and `rows * width` come out. Ninety-six times too many of
@@ -1107,53 +801,6 @@ mod tests {
         assert_eq!(stick_scatter(96, 64, &vec![0.0; 96 * 64]).len(), 96 * 64);
     }
 
-    /// ⭐ THE PREFIX MASK IS ONE STEP WITH TWO BUFFER SHAPES, and the kernel — not the caller —
-    /// decides which. A prompt chunk gets an f32 broadcast row; a decode BATCH gets f16 fold-pass
-    /// blocks. Before this, only the f32 form was a tape step and the f16 form was staged by hand
-    /// into a second list the whole prefill path threaded, which is why `owns_prefix` used to
-    /// depend on the RUNTIME regime rather than on what the bake placed.
-    #[test]
-    fn the_prefix_kernel_picks_its_own_transfer_format() {
-        use scratchy_subtile::sdsc_abstract as sa;
-        let sh = ForwardShape { rows: 1, ..shape() };
-        let step = sh
-            .steps()
-            .into_iter()
-            .find(|s| s.kernel == ForwardKernel::PrefixMask)
-            .expect("the shape carries a prefix step");
-        let inp = ForwardInputs {
-            hidden: 64,
-            num_q_heads: 1,
-            mq_pad: 64,
-            causal_heads_per_block: 1,
-            embed_tokens: &[0.0; 64],
-            tokens: &[0],
-            chain_seeds: None,
-            positions: &[0],
-            causal: one_row_key(),
-            prefix: Some(PrefixSource::Broadcast {
-                cap: 8,
-                holds: |c: usize| c < 3,
-            }),
-            consts: &[],
-            mask_neg: -1.0,
-            stick_major: false,
-            kv_blocks: None,
-        };
-        match kernel_values(&step, &sh, &inp).expect("broadcast staged") {
-            Staged::F32(v) => {
-                assert_eq!(v.len(), 8);
-                assert_eq!(&v[..4], &[0.0, 0.0, 0.0, -1.0]);
-            }
-            Staged::F16(_) => panic!("a broadcast row is f32; the bind loop narrows it"),
-            Staged::I32(_) => panic!("a broadcast row is a MASK, not an index tensor"),
-            Staged::U32(_) => {
-                panic!("a broadcast row is f32 — the u32 lanes are the chain seeds' own variant")
-            }
-        }
-        let _ = sa::POOL_STICK; // the Blocks variant's shape params come from here
-    }
-
     /// ⭐ NO TWO STEPS BIND THE SAME TENSOR — which is what makes the play ORDER a free choice.
     /// The two binders pushed their activations in different orders (decode did prefix before
     /// causal, prefill the reverse) and both were correct only because every bind targets a
@@ -1174,178 +821,6 @@ mod tests {
                 st.tensor
             );
         }
-    }
-
-    /// ⭐⭐ THE THIRD LEMMA. The prompt-chunk binder fills prefix validity from
-    /// `decode_prefix_col_valid(col, start)`; the decode binder fills it from "which slots does
-    /// this request hold". This pins that the second SUBSUMES the first — they agree exactly when
-    /// the history has no hole — so the chunk form is not a separate convention.
-    #[test]
-    fn a_hole_free_history_is_exactly_the_contiguous_prefix_law() {
-        use scratchy_subtile::sdsc_abstract::decode_prefix_col_valid;
-        let neg = -7.5f32;
-        for (cap, start) in [(64usize, 0usize), (64, 1), (128, 37), (256, 256)] {
-            let by_law = broadcast_prefix_mask(cap, neg, |c| decode_prefix_col_valid(c, start));
-            let held: std::collections::BTreeSet<usize> = (0..start).collect();
-            let by_history = broadcast_prefix_mask(cap, neg, |c| held.contains(&c));
-            assert_eq!(by_law, by_history, "cap={cap} start={start}");
-        }
-    }
-
-    /// And a history WITH a hole differs — otherwise the batched case would be pointless. The hole
-    /// holds another request's keys, so calling it valid feeds one request another's history.
-    #[test]
-    fn a_history_with_a_hole_is_not_the_contiguous_prefix() {
-        use scratchy_subtile::sdsc_abstract::decode_prefix_col_valid;
-        let neg = -7.5f32;
-        // Holds [0,3) and the shared slot 9 — the hole [3,9) is another request's.
-        let held: std::collections::BTreeSet<usize> = [0, 1, 2, 9].into_iter().collect();
-        let by_history = broadcast_prefix_mask(16, neg, |c| held.contains(&c));
-        let by_len = broadcast_prefix_mask(16, neg, |c| decode_prefix_col_valid(c, 4));
-        assert_ne!(by_history, by_len, "a hole must not read as valid");
-        assert_eq!(by_history[9], 0.0, "the shared slot IS held");
-        assert_eq!(by_history[5], neg, "the hole is NOT");
-    }
-
-    /// ⭐⭐⭐ THE KEY IS THE WHOLE MASK. `CausalKey::mask` replaced both laws' builders — the prompt
-    /// chunk's clamped triangle (`row_logical_pos` composed with `prefill_causal_col_valid`) and
-    /// the decode batch's diagonal with padding at live 0's column — so it must reproduce each, BYTE
-    /// FOR BYTE, at every (rows, real) and (rows, live) a rung runs. Each `want` below is the law as
-    /// it was written before the key existed, inline; equal to it everywhere is what makes "the
-    /// session already holds this key" mean "the device already holds this mask".
-    #[test]
-    fn the_causal_key_reproduces_both_new_block_laws_byte_for_byte() {
-        use scratchy_subtile::sdsc_abstract::{
-            ATTN_MASK_NEG, CausalKey, ChunkRows, RungWidth, decode_batch_causal_col_valid,
-            prefill_causal_col_valid,
-        };
-        let neg = -(half::f16::MAX.to_f32() / 2.0);
-        assert_eq!(
-            ATTN_MASK_NEG.to_bits(),
-            neg.to_bits(),
-            "the const is the staged value"
-        );
-        // Rung widths across both ladders and both sides of a stick, plus the one-row decode key.
-        for rows in [1u32, 7, 35, 63, 64, 65, 128, 192, 256, 512] {
-            let w = RungWidth::of_baked_rows(rows).expect("a width");
-            let (mq, mq_pad) = (rows as usize, (rows as usize).div_ceil(64) * 64);
-            let chunk = ChunkRows::chunk(w.rows());
-            for real in [1usize, mq / 2 + 1, mq.saturating_sub(1).max(1), mq] {
-                let key = CausalKey::chunk(w, real).expect("1 <= real <= rows");
-                let mut want = vec![neg; mq * mq_pad];
-                for r in 0..mq {
-                    let pos = chunk.row_logical_pos(r, real);
-                    for c in 0..mq_pad {
-                        if prefill_causal_col_valid(c, pos) {
-                            want[r * mq_pad + c] = 0.0;
-                        }
-                    }
-                }
-                assert_eq!(key.mask(), want, "chunk rows {rows} real {real}");
-                // A batch over the same rows is the diagonal; padding slots take live 0's column.
-                let live = real;
-                let mut want = vec![neg; mq * mq_pad];
-                for r in 0..mq {
-                    let col = if r < live { r } else { 0 };
-                    for c in 0..mq_pad {
-                        if decode_batch_causal_col_valid(c, col) {
-                            want[r * mq_pad + c] = 0.0;
-                        }
-                    }
-                }
-                let key = CausalKey::Batch {
-                    rows: w,
-                    live: std::num::NonZeroU32::new(live as u32).expect("live >= 1"),
-                };
-                assert_eq!(key.mask(), want, "batch rows {rows} live {live}");
-            }
-            assert!(CausalKey::chunk(w, 0).is_none(), "no real row is no launch");
-            assert!(
-                CausalKey::chunk(w, mq + 1).is_none(),
-                "more real rows than the rung"
-            );
-        }
-    }
-
-    /// ⭐⭐ A HELD KEY STAGES NOTHING, A NEW KEY STAGES ITS MASK. Two keys that differ only in
-    /// `real` are different masks (the last baked row's extent moves), which is why a session keys
-    /// by both facts and never by the rung alone.
-    #[test]
-    fn a_partial_chunk_is_a_different_key_and_a_different_mask() {
-        use scratchy_subtile::sdsc_abstract::{CausalKey, RungWidth};
-        let w = RungWidth::of_baked_rows(512).expect("a width");
-        let full = CausalKey::chunk(w, 512).expect("a key");
-        let partial = CausalKey::chunk(w, 400).expect("a key");
-        assert_ne!(full, partial);
-        assert_ne!(full.mask(), partial.mask());
-        assert_eq!(
-            full,
-            CausalKey::chunk(w, 512).expect("a key"),
-            "keys compare by value"
-        );
-    }
-
-    /// ⭐⭐ THE SECOND LEMMA. The decode binder built its causal mask as its own `[nqh, mq_pad]`
-    /// loop over `prefill_causal_col_valid(col, 0)`; prefill builds a `[mq, mq_pad]` block via
-    /// `CausalKey::mask` and tiles it block-major. This pins that the first is the
-    /// second at one row — so the decode loop is deletable rather than a convention to maintain.
-    #[test]
-    fn the_decode_causal_buffer_is_the_general_tiling_at_one_row() {
-        use scratchy_subtile::sdsc_abstract::prefill_causal_col_valid;
-        let neg = -1234.5f32;
-        for nqh in [1usize, 8, 32] {
-            // What the decode binder wrote, inline.
-            let mut want = vec![neg; nqh * 64];
-            for head in 0..nqh {
-                for col in 0..64 {
-                    if prefill_causal_col_valid(col, 0) {
-                        want[head * 64 + col] = 0.0;
-                    }
-                }
-            }
-            // The general path: one row of the same law, then the shared tiling.
-            let mut row = vec![neg; 64];
-            for (col, v) in row.iter_mut().enumerate() {
-                if prefill_causal_col_valid(col, 0) {
-                    *v = 0.0;
-                }
-            }
-            assert_eq!(causal_tiled(&row, 1, 64, nqh, nqh), want, "nqh={nqh}");
-        }
-    }
-
-    /// Past one row the tiling is block-major and genuinely per-row — so the lemma is not vacuous.
-    #[test]
-    fn the_causal_tiling_is_block_major_and_per_row() {
-        let (mq, mq_pad, nqh) = (2usize, 128usize, 3usize);
-        let cmask: Vec<f32> = (0..mq * mq_pad).map(|i| i as f32).collect();
-        let got = causal_tiled(&cmask, mq, mq_pad, nqh, nqh);
-        assert_eq!(got.len(), (mq_pad / 64) * nqh * mq * 64);
-        // Block 0, head 0, row 1 starts at cmask[1*128 + 0] = 128.
-        assert_eq!(got[64], 128.0);
-        // Block 1 (columns 64..128), head 0, row 0 starts at cmask[0*128 + 64] = 64.
-        assert_eq!(got[nqh * mq * 64], 64.0);
-    }
-
-    /// ⭐ THE CHUNK-FORMED NEW BLOCK'S TILING: one block per kv head, each the stick-major layout of its own
-    /// `[gqa·mq, mq_pad]` rows — kv head `g`'s block at `g·gqa·mq·mq_pad`, its column group `j` at `j·gqa·mq·64`
-    /// inside it. The same total as the one-block tiling, and the same bytes at one stick.
-    #[test]
-    fn the_chunk_form_tiles_the_causal_mask_by_kv_head() {
-        let (mq, mq_pad, nqh, gqa) = (2usize, 128usize, 4usize, 2usize);
-        let cmask: Vec<f32> = (0..mq * mq_pad).map(|i| i as f32).collect();
-        let got = causal_tiled(&cmask, mq, mq_pad, nqh, gqa);
-        assert_eq!(got.len(), causal_tiled(&cmask, mq, mq_pad, nqh, nqh).len());
-        let block = gqa * mq * mq_pad;
-        // kv head 1's block, column group 1 (cols 64..128), head 0 of the group, row 1:
-        // cmask[1*128 + 64] = 192, at block + 1*(gqa*mq*64) + 1*64.
-        assert_eq!(got[block + gqa * mq * 64 + 64], 192.0);
-        // One stick wide, the two tilings are the same bytes.
-        let one: Vec<f32> = (0..mq * 64).map(|i| i as f32).collect();
-        assert_eq!(
-            causal_tiled(&one, mq, 64, nqh, gqa),
-            causal_tiled(&one, mq, 64, nqh, nqh)
-        );
     }
 
     /// ⭐⭐ THE LEMMA THE TWO BINDERS REST ON. Decode stages row-major, prefill stick-scattered;

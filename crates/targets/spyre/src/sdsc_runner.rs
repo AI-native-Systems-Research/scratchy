@@ -41,10 +41,10 @@ pub enum StepLogits {
 /// always read from the same parse and passed together, and separately they pushed `new_inner` past the
 /// argument limit. Typed wrappers (`Vocab`/`KvDim`/`PoolPages`) are minted from these downstream.
 #[derive(Clone, Copy)]
-struct SessionDims {
-    vocab: usize,
-    kv_dim: usize,
-    num_blocks: usize,
+pub struct SessionDims {
+    pub vocab: usize,
+    pub kv_dim: usize,
+    pub num_blocks: usize,
 }
 
 /// LE f16 bytes → f32.
@@ -162,24 +162,24 @@ impl SuperDscSession {
     /// [`new_borrowing_with_consts`](Self::new_borrowing_with_consts) — the
     /// tables sit in the per-session activation segment, which no alias
     /// covers.
+    ///
+    /// `pool_statics` are the KV pool's own int32 tables
+    /// ([`crate::paged_step::card_statics`]) — placed beside the pools, staged VERBATIM once here by
+    /// the session that owns the pool, and read by every session that aliases its KV segment.
     pub fn new(
         code: &'static crate::bundle_code::BundleCode<'static>,
-        vocab: usize,
-        kv_dim: usize,
-        num_blocks: usize,
+        dims: SessionDims,
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
         load_consts: &[(u32, crate::wiring::LoadConst)],
+        pool_statics: &[(u32, Vec<u8>)],
         spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
             code,
-            SessionDims {
-                vocab,
-                kv_dim,
-                num_blocks,
-            },
+            dims,
             weights,
             load_consts,
+            pool_statics,
             &[],
             spilled_tail,
         )
@@ -238,6 +238,7 @@ impl SuperDscSession {
             },
             Vec::new(),
             load_consts,
+            &[],
             borrowed,
             spilled_tail,
         )
@@ -273,6 +274,7 @@ impl SuperDscSession {
             Vec::new(),
             load_consts,
             &[],
+            &[],
             spilled_tail,
         )
     }
@@ -285,6 +287,8 @@ impl SuperDscSession {
         // OWNER only (see [`Self::new`]); borrowers pass none and read the
         // owner's bytes through the alias.
         load_consts: &[(u32, crate::wiring::LoadConst)],
+        // The KV pool's own tables — bound once, verbatim, by the session that owns the pool.
+        pool_statics: &[(u32, Vec<u8>)],
         borrowed: &[i64],
         // The spilled weight tail's tids — the ONE resident slice the layout cannot state: the
         // spill is a load-time copy decision (a weight whose slot also holds an m-dependent
@@ -346,7 +350,12 @@ impl SuperDscSession {
         // step, while the build's own numeric gate passed, because the gate's
         // emulator binds its own sources and never crosses this seat).
         exec.bind_load_consts(load_consts)?;
-        let n_staged = n_bound + load_consts.len();
+        // The pool's int32 tables ride the same verbatim channel as an i32 load constant: their LE
+        // words ARE the device's.
+        for (tid, bytes) in pool_statics {
+            exec.bind_const_fp32(crate::bundle_code::PlaceId::Act(*tid), bytes.clone())?;
+        }
+        let n_staged = n_bound + load_consts.len() + pool_statics.len();
         debug!(
             "[timing] bind weights loop took {:.2}s",
             t_bind.elapsed().as_secs_f64()

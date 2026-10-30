@@ -1488,54 +1488,17 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // ── THE PAGED STEP'S SOURCES ── spyre-inference's operands the host stages each step
     //    (`crate::paged_step`): the page index table, the mask stack, the KV write index and the
     //    query row index, at their reserved tids in the ACTIVATION segment like every per-step
-    //    binding (the reserved-tid law above). Sized for the pool's WHOLE walk — a bundle whose rung
-    //    walks fewer blocks stages and reads a prefix — and the page ids at the walk's card step
-    //    (`PagedStep::card_walk_step`). A decode batch's are `rep_row_ids`, `chunk_page_ids` and
-    //    `mask_by_chunk` in place of the query rows, the page table and the mask stack. The decode
-    //    kernel's `kv_row_pool` is every page's run of folded-cache rows, the same for every step: it
-    //    sits beside the pools in the KV segment, which a walk's relaunch does not shift, at its card
-    //    run pitch.
+    //    binding (the reserved-tid law above), and the decode kernel's `kv_row_pool` beside the pools
+    //    in the KV segment, which a walk's relaunch does not shift. `PagedStep::card_placements` is
+    //    the one statement of what they are and how big — the card stagers stage within it.
     if let Some(step) =
         crate::lower_subtile_tape_to_ktir::paged_step_of_ir(ir, ActiveCap::FULL, paged_rows)?
     {
-        let int32_stick = u64::from(scratchy_triton_splice::INT32_STICK);
-        let sticks = |words: u64| words.div_ceil(int32_stick) * int32_stick * 4;
-        let act = SegRole::Activation;
-        let (slots, nkvh) = (u64::from(step.page_slots), u64::from(step.nkvh));
-        let mut sources = vec![(
-            step.write_rows,
-            act,
-            sticks(u64::from(step.rows * step.nkvh)),
-        )];
-        match step.batch() {
-            Some(c) => {
-                let (chunks, entries) = (u64::from(c.num_chunks), u64::from(c.entries()));
-                sources.extend([
-                    (step.rep_rows, act, sticks(entries)),
-                    (step.chunk_pages, act, chunks * step.card_walk_step()),
-                    (step.chunk_masks, act, chunks * entries * nkvh * slots * 2),
-                ]);
-            }
-            None => sources.extend([
-                (
-                    step.page_table,
-                    act,
-                    u64::from(step.pages) * step.card_walk_step(),
-                ),
-                (
-                    step.mask,
-                    act,
-                    u64::from(step.pages) * u64::from(step.rows) * slots * 2,
-                ),
-                (step.query_rows, act, sticks(u64::from(step.rows))),
-            ]),
-        }
-        if step.reads_kv_row_pool() {
-            sources.push((step.kv_row_pool, SegRole::Kv, step.card_kv_row_pool_bytes()));
-            // Static like the pool, so in the segment a relaunch does not shift.
-            sources.push((step.int32_zero, SegRole::Kv, step.card_int32_zero_bytes()));
-        }
-        for (tid, role, size) in sources {
+        for (tid, seat, size) in step.card_placements() {
+            let role = match seat {
+                crate::wiring::CardSeat::Step => SegRole::Activation,
+                crate::wiring::CardSeat::Pool => SegRole::Kv,
+            };
             let seg = role.segment();
             let off = seg_bytes[seg];
             placements.insert(
