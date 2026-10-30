@@ -1185,7 +1185,10 @@ pub fn store_data(
 /// touches that page alone, and reading from the pool's base read every page below it. Anywhere
 /// else the span keeps its base at the view's (the read's zero-padding past an allocation is a
 /// property of the view's own allocation, so a span starting elsewhere could resolve a different
-/// one).
+/// one). The guard covers the WHOLE shifted span, not just its first byte: a grown allocation can
+/// swallow the base of the one placed after it ([`HBMSimulator::write_bytes`] resizes in place),
+/// and an address at or past that base resolves to the swallowed allocation — so a span reaching
+/// it must not shift.
 fn touched_span(
     ctx: &CoreContext,
     space: MemorySpace,
@@ -1199,7 +1202,9 @@ fn touched_span(
         let hbm = ctx.hbm.borrow();
         hbm.allocation_len_at_base(base_ptr)
             .is_some_and(|len| ((hi + 1) as usize) * bpe <= len)
-            && hbm.resolves_to_base(base_ptr, base_ptr + lo * bpe as i64)
+            // No other allocation base inside (base_ptr, base_ptr + (hi+1)·bpe): the shifted
+            // span's last byte, not just its first, must stay clear of a swallowed base.
+            && hbm.resolves_to_base(base_ptr, base_ptr + ((hi + 1) * bpe as i64) - 1)
     };
     let lo = if inside { lo } else { 0 };
     (lo, (hi - lo + 1) as usize)
@@ -1732,6 +1737,48 @@ mod tests {
         let coords = vec![vec![0, 0], vec![1, 1], vec![2, 2], vec![3, 3]];
         let tile = load_data(&mut ctx, &tr, Some(&coords), Some(vec![4])).unwrap();
         assert_eq!(tile.as_f32().to_vec(), vec![0.0, 5.0, 10.0, 15.0]);
+    }
+
+    #[test]
+    fn slow_paths_hit_the_grown_allocation_when_a_later_base_is_swallowed() {
+        let mut ctx = single_core_context();
+        // A (one stick), then B (the next stick).
+        let a_stick = ctx.hbm.borrow_mut().allocate(STICK_BYTES);
+        let b_stick = ctx.hbm.borrow_mut().allocate(STICK_BYTES);
+        let a = a_stick * STICK_BYTES;
+        let b = b_stick * STICK_BYTES;
+        // Grow A in place until its buffer covers B's whole stick: any address at
+        // or past B's base now resolves to B, not A (see `resolves_to_base`).
+        let grown_elems = ((b - a + STICK_BYTES) / 4) as usize;
+        let payload: Vec<u8> = (0..grown_elems)
+            .flat_map(|i| (1000.0 + i as f32).to_le_bytes())
+            .collect();
+        ctx.hbm.borrow_mut().write_bytes(a, &payload);
+
+        // A view based at A whose gather offsets start AT B's base: an unguarded
+        // span shift would read/write at B and resolve to B's buffer.
+        let b_elem = (b - a) / 4; // element offset of B's base within A's buffer
+        let m = hbm_memref(a_stick, vec![grown_elems], vec![1], DType::F32);
+        let tr = m.to_tile_ref();
+        let coords = vec![vec![b_elem], vec![b_elem + 1]];
+
+        let tile = load_data(&mut ctx, &tr, Some(&coords), Some(vec![2])).unwrap();
+        assert_eq!(
+            tile.as_f32().to_vec(),
+            vec![1000.0 + b_elem as f32, 1001.0 + b_elem as f32],
+            "the gather must read A's grown buffer, not B"
+        );
+
+        let tile = Tile::compute(vec![7.0, 8.0], DType::F32, vec![2]);
+        store_data(&mut ctx, &tile, &tr, Some(&coords)).unwrap();
+        let back = load_data(&mut ctx, &tr, Some(&coords), Some(vec![2])).unwrap();
+        assert_eq!(back.as_f32().to_vec(), vec![7.0, 8.0]);
+        // B's own allocation still holds its original zero bytes.
+        let (b_buf, _) = ctx.hbm.borrow().allocation_at(b).unwrap();
+        assert!(
+            b_buf.iter().all(|&x| x == 0),
+            "the scatter must not touch B"
+        );
     }
 
     // ---- store round trips ----
