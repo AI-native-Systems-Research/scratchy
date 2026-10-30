@@ -10,9 +10,8 @@
 //! itself one at a time the same way: a verify step's rows, like a batch's, run the target's
 //! multi-row kernels.
 //!
-//! The drafter drafts one request at a time (asserted, from the server's draft-token count): its
-//! verify budget's 8 rows hold one request's block, so a step of 4 or 8 requests runs none, and
-//! those runs check the target's batched rows. Splash drafts up to 4 lanes at once.
+//! The drafter drafts at every width (asserted, from the server's draft-token count): a step verifies
+//! up to four requests' blocks, as Splash's lanes.
 //!
 //! Needs a Metal 4 GPU, and `mlx-community/Qwen3.6-35B-A3B-4bit` with
 //! `mlx-community/Qwen3.6-35B-A3B-DFlash2-4bit` in the HF cache. Run against a prebuilt server,
@@ -159,9 +158,7 @@ async fn drafted_output_is_the_targets() {
         let drafted = outputs(url, width).await;
         let proposed = draft_tokens(url).await - before;
         eprintln!("drafting, {width} at once: {proposed} draft tokens proposed");
-        if width == 1 {
-            assert!(proposed > 0, "one request at a time drafts");
-        }
+        assert!(proposed > 0, "{width} at once drafts");
         assert_close(&alone, &drafted, &format!("drafting, {width} at once"));
     }
 }
