@@ -584,6 +584,105 @@ pub fn scatter_copy_opspec(
     Ok(op)
 }
 
+/// THE PAGE GATHER — the scatter's mirror image: an `identity` copy whose INPUT is the paged value,
+/// read through the index one whole entry at a time (`dxp/test/test_gather_1core/sdsc_1.json`'s
+/// shape), into a contiguous scratch. `rows` one-stick sub-rows of the scratch, `gather.page` of them
+/// per index entry, so `skip_addr` — the page times the unpinned extents — is one entry's own size and
+/// the paged value's entries must sit exactly that far apart (a whole page of a pool does).
+pub fn page_gather_copy_opspec(
+    src: &str,
+    dst: &str,
+    gather: crate::superdsc_opspec::GatherIndex,
+    rows: u32,
+    cols: u32,
+    df: Df,
+) -> Result<OpSpec, String> {
+    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
+    if cols != df.elems_per_stick() {
+        return Err(format!(
+            "page_gather_copy_opspec('{src}' -> '{dst}'): `out` is {cols} elements, and a gathered \
+             copy's `out` must be exactly one {stick}-element stick — declare the entry as one-stick \
+             sub-rows with the `page` covering them",
+            stick = df.elems_per_stick(),
+        ));
+    }
+    let page = gather.page.get();
+    if page == 0 || !rows.is_multiple_of(page) {
+        return Err(format!(
+            "page_gather_copy_opspec('{src}' -> '{dst}'): {rows} `mb` positions do not divide into \
+             whole {page}-position entries, so the last index entry would cover a partial page"
+        ));
+    }
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    if rows / page > cap {
+        return Err(format!(
+            "page_gather_copy_opspec('{src}' -> '{dst}'): {} index entries, and one op's index is \
+             ONE {cap}-entry stick — entries past it wrap and gather another core's pages",
+            rows / page
+        ));
+    }
+    let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df,
+    };
+    let tile_op = TileOp {
+        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        dims: vec![
+            dim("mb", rows, false),
+            dim("out", cols, true),
+            dim("y", 1, false),
+        ],
+        df,
+    };
+    let mut op = pointwise_opspec_from_tile_split(
+        &tile_op,
+        OpFunc::Identity,
+        &[src],
+        dst,
+        true,
+        |dims: &[crate::superdsc_opspec::ItDim], max_cores: u32| {
+            gather_copy_cores(dims, max_cores, page)
+        },
+        OutView::at(0),
+    )?;
+    for a in op.args.iter_mut() {
+        a.set_df(df);
+    }
+    op.attach_gather_index(gather, 0).ok_or_else(|| {
+        format!(
+            "page_gather_copy_opspec('{src}' -> '{dst}'): the index declaration does not fit this \
+             op — its dims are [mb, out, y], so the paged axis must be `mb`"
+        )
+    })?;
+    Ok(op)
+}
+
+/// A page gather's extent: `rows` one-stick sub-rows of `df` in the scratch it fills.
+#[derive(Clone, Copy, Debug)]
+pub struct PageGatherRows {
+    pub rows: u32,
+    pub df: Df,
+}
+
+/// [`page_gather_copy_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_page_gather_copy(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    gather: crate::superdsc_opspec::GatherIndex,
+    PageGatherRows { rows, df }: PageGatherRows,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = page_gather_copy_opspec(src, dst, gather, rows, df.elems_per_stick(), df)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_page_gather_copy {op_name}: {e}"))
+}
+
 /// One scattered copy's extents: `rows` one-stick sub-rows of `cols` (one stick) elements of `df`,
 /// read from the source starting `src_elems` elements in.
 #[derive(Clone, Copy, Debug)]

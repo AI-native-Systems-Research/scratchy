@@ -74,7 +74,12 @@ const SCALE_BYTES: u64 = 2;
 /// reported under the SAME stage label [`crate::emit_node`] uses for it, so adding a layout does not
 /// move where a program that never had a readable parameter list is refused.
 pub fn for_node(node: &KtirNode) -> Result<BundleLayout, Error> {
-    let r = regions(node).map_err(|e| Error {
+    // A walking program's windows are its trip-0 windows (`loop_fold::flatten`).
+    let flat = ktir_superdsc::emit::loop_fold::flatten(node).map_err(|e| Error {
+        stage: "regions",
+        message: format!("{e:?}"),
+    })?;
+    let r = regions(flat.as_ref().map_or(node, |f| &f.node)).map_err(|e| Error {
         stage: "regions",
         message: format!("{e:?}"),
     })?;
@@ -85,6 +90,13 @@ pub fn for_node(node: &KtirNode) -> Result<BundleLayout, Error> {
 /// node's `regions` are read ONCE and the layout cannot be built from a different reading than the
 /// body gets.
 pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error> {
+    // ⭐ A WALKING PROGRAM IS PLACED AT TRIP 0 — the reading its lowering takes
+    // (`loop_fold::flatten`) — and its carried buffers' seeds are registry constants too.
+    let flat = ktir_superdsc::emit::loop_fold::flatten(node).map_err(|e| Error {
+        stage: "layout",
+        message: format!("{e:?}"),
+    })?;
+    let node = flat.as_ref().map_or(node, |f| &f.node);
     let name = node.func.name;
     // ⛔ REFUSE BEFORE PLACING ANYTHING, because a body that names a device constant this module
     // did not place does not get a diagnostic — it gets `resolve_seg_base`'s panic.
@@ -123,7 +135,12 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         });
     }
 
-    let scalarmul_scales = scales_for_program_shape(node.program, &node.func)?;
+    let mut scalarmul_scales = scales_for_program_shape(node.program, &node.func)?;
+    for v in flat.iter().flat_map(|f| f.fold.seeds()) {
+        if !scalarmul_scales.iter().any(|x| x.to_bits() == v.to_bits()) {
+            scalarmul_scales.push(v);
+        }
+    }
 
     // WHICH PARAMETERS ARE GATHER INDEX VECTORS, read off the program by the SAME function family
     // the lowering body reads them with — so the placement and the descriptor cannot disagree about
@@ -966,7 +983,26 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
         .iter()
         .flat_map(|c| c.consumed.iter().copied())
         .collect();
+    // (4) the splats the walk materializes as filled buffers — the same rule its operand
+    // resolution applies (`splat_fill_values`).
+    for v in W::splat_fill_values(f).map_err(|e| crate::Error {
+        stage: "layout",
+        message: e.message,
+    })? {
+        push(v, &mut out);
+    }
     for op in f.operations.iter() {
+        // (3) the constant side of a `min`/`max` against a splat — the walk's
+        // `ScalarBinary`, which reads its constant through the registry exactly as a scalar
+        // multiply reads its multiplier.
+        if matches!(
+            op.op_type,
+            ktir_core::opkind::OpKind::ArithMinnumf | ktir_core::opkind::OpKind::ArithMaxnumf
+        ) && let Some((v, _)) = W::splat_scale_of(f, op)
+        {
+            push(v, &mut out);
+            continue;
+        }
         if op.op_type != ktir_core::opkind::OpKind::ArithMulf {
             continue;
         }

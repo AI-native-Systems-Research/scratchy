@@ -547,22 +547,16 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
                     push_scale(*scale, &mut scalarmul_scales);
                 }
             }
-            // torch-spyre `spyre__sdpa_overrideable`: scaling_factor = sqrt(scale), applied to BOTH q and K
-            // (`query * scaling_factor`, `key * scaling_factor`). Register √scale for the door's split: the
-            // decode door emits `qs = Q·√s` / `new_k_scaled = K·√s` reading the `[1,1]` consts, and the weight
-            // fold commutes the same √s into W_q/W_k when it applies. The un-split `scale` is the door's
-            // lookup anchor (it derives √s from the registry's own entry) and the program's `qk · SCALE`
-            // spelling — the emulator runs that mulf; the card's split replaces it.
-            //
-            // ⭐ EXCEPT THE WEIGHT-FOLDED ONES (the same skip the ScalarMul arm takes): an
-            // attention whose √scale commuted into W_q/W_k runs at scale 1.0 and multiplies
-            // NOTHING, so neither it nor its square root may occupy a registry slot — and the
-            // 1.0 itself most of all, which is why the skip is by NODE and not by value (a
-            // pushed identity would shift every scale after it by a slot).
+            // ⭐ THE PAGE WALK'S CONSTANTS (`kernels/paged_attn.py`) — the three values its program
+            // states as splats, each a `[1,1]` const the card fills a buffer from or sprays as a
+            // scalar: the score multiplier (`scores * SCALE`), the online softmax's seed and clamp
+            // `0.0` (the running sum and output start at it, and `min(·, 0)` clamps the rescale), and
+            // its max seed `-inf`. A weight-folded attention runs at `SCALE = 1.0` (its √scale rides
+            // W_q/W_k) and still states the multiply, so its 1.0 is the value it reads.
             SubOp::AttnDecode { scale, .. } => {
-                if !folded_node(node.id) {
-                    push_scale(*scale, &mut scalarmul_scales);
-                    push_scale(scale.sqrt(), &mut scalarmul_scales);
+                let multiplier = if folded_node(node.id) { 1.0 } else { *scale };
+                for v in [multiplier, 0.0, f32::NEG_INFINITY] {
+                    push_scale(v, &mut scalarmul_scales);
                 }
             }
             // RMSNorm epsilon (config `rms_norm_eps`) flows through the SAME registry — a `[1,1]`
@@ -619,16 +613,10 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
 /// ARM-FOR-ARM WITH THE CENSUS, and that is the law: a variant the census
 /// registers is staged here; a variant it does not is left exact. Two omissions
 /// are the census's own: the OnePlusScale offset is 1.0 (f16-exact — staging it is
-/// the identity), and the attention `√scale` is not a node field — it is a
-/// DERIVED registry slot the door reads: the decode door (`attn_at`) multiplies
-/// BOTH Q and the roped new-K by it, so the card's effective decode score scale
-/// is `f16(√s)²` — two f16-slot multiplies — while the emulator's program
-/// (`qk · SCALE` on the f16 dot) and this golden both apply `f16(s)`. That
-/// difference is the KNOWN card-vs-emu attention residual (≈2e-4 relative on the
-/// scores at granite-8b's 2⁻⁷), deliberately NOT modeled here: the gate compares
-/// the golden against the emulator, and staging `f16(√s)²` would separate the
-/// two for nothing. It is the first fact to subtract in any card-vs-emu parity
-/// run. The SPLIT norm pair
+/// the identity), and the page walk's softmax constants `0.0` and `-inf` are
+/// f16-exact too, so its arm stages only the score multiplier — the card's walk
+/// multiplies the score tile by `f16(s)` once, exactly as the emulator's program
+/// (`qk · SCALE` on the f16 dot) does. The SPLIT norm pair
 /// (`RmsNormReduce`/`RmsNormApply`) is absent for the same reason it is absent
 /// from the census: it is host-routed on spyre (metal's `decompose_rmsnorm` is the
 /// only producer), and a host-routed eps never becomes a device scalar — staging
@@ -880,13 +868,11 @@ pub fn compute_bundle_layout<F: RopeForm>(
         seg_bytes[seg] = align128(off + sz);
     };
 
-    // The AttnDecode K/V cache tensors are SOURCES, but they get RE-PLACED into seg2 (SegRole::Kv) at
-    // the batched cache size further below (search "Prefix K/V caches → seg2"). If the source loop ALSO
-    // packs them into the Activation segment at their source size, that Activation slot is never used
-    // (the seg2 placement overrides it) — a DEAD HOLE (80 tensors × [cap,kv_dim]·2 = 335 MB @cap=4096
-    // for granite) that the per-step whole-Activation-segment H2D re-ships every decode step. That dead
-    // re-upload IS the O(cap) decode preamble cliff (measured: 50 ms @cap=4096 vs 8 ms @cap=256). Skip
-    // them here; their only live placement is seg2 (what the worker binds + attention reads).
+    // The AttnDecode K/V cache tensors are SOURCES, but they are the KV POOLS, placed in seg2
+    // (SegRole::Kv) below (search "THE KV POOLS"). If the source loop ALSO packs them into the
+    // Activation segment, that Activation slot is never used — a DEAD HOLE that the per-step
+    // whole-Activation-segment H2D re-ships every decode step (the O(cap) decode preamble cliff,
+    // measured: 50 ms @cap=4096 vs 8 ms @cap=256). Skip them here; their only placement is seg2.
     let prefix_kv_tids: std::collections::HashSet<u32> = ir
         .nodes
         .iter()
@@ -918,6 +904,28 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // GARBAGE logits (on-card-observed: KSPLIT output empty/EOS while the bundle loaded fine). Place each in
     // seg1 (Weight) here — same condition as the emit branch + kernel0 (n_dev>16384 lm_head). Size = the
     // staged `[KB, n_dev]` f16 buffer (KB·n_dev·2, the retiled `[n_dev/64,KB,64]` footprint).
+    // ── THE KV POOLS (seg2) ── every attention's K and V cache tensors, the pools the paged step's KV
+    //    write scatters into and its walk gathers from, resident across steps. Placed in layer order so
+    //    a re-rolled body reaches layer `v`'s pools at one uniform stride. On a CARD build only: the
+    //    emulator runs the paged step as KTIR over the cache tensors bound by tid, and a model whose
+    //    pools outgrow one device region (`max_position_embeddings` pages of every layer) is refused
+    //    by the address audit on the card it cannot fit, not on an emulator that never places them.
+    if cfg!(feature = "spyre-hw") {
+        let mut pools: Vec<u32> = Vec::new();
+        for n in &ir.nodes {
+            if let SubOp::AttnDecode { layout: kv, .. } = &n.op {
+                for t in [kv.cache_tensor(), kv.v_cache_tensor()] {
+                    let tid = t.index() as u32;
+                    if !pools.contains(&tid) {
+                        pools.push(tid);
+                    }
+                }
+            }
+        }
+        for tid in pools {
+            pack(tid, SegRole::Kv, &mut seg_bytes, &mut placements);
+        }
+    }
     // Logits (seg4) — the graph result (it is also produced by an op, but its role
     // is OUTPUT; classify it before intermediates so it is not pool-coalesced).
     let result = ir.result.index() as u32;
@@ -1410,6 +1418,46 @@ pub fn compute_bundle_layout<F: RopeForm>(
             },
         );
         seg_bytes[a] = align128(off + 2);
+    }
+
+    // ── THE PAGED STEP'S SOURCES ── the page table, the mask stack and the write rows the host
+    //    stages each step (`crate::paged_step`), at their reserved tids in the ACTIVATION segment
+    //    like every per-step binding (the reserved-tid law above). The page walk's relaunch shifts
+    //    exactly this segment one step per trip, which is why the walk's body reads nothing else
+    //    from it. Sized for the pool's WHOLE walk — a bundle whose rung walks fewer blocks stages
+    //    and reads a prefix.
+    if let Some(step) = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(ir, ActiveCap::FULL)? {
+        let a = SegRole::Activation.segment();
+        let int32_stick = u64::from(scratchy_triton_splice::INT32_STICK);
+        let score_rows = u64::from(step.rows * step.gqa);
+        for (tid, size) in [
+            (
+                step.page_table,
+                u64::from(step.pages) * u64::from(step.page_table_pitch()) * 4,
+            ),
+            (
+                step.mask,
+                u64::from(step.pages) * score_rows * u64::from(step.page_slots) * 2,
+            ),
+            (
+                step.write_rows,
+                u64::from(step.rows * step.nkvh).div_ceil(int32_stick) * int32_stick * 4,
+            ),
+        ] {
+            let off = seg_bytes[a];
+            placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    role: SegRole::Activation,
+                    segment: a,
+                    bank: 0,
+                    offset: off,
+                    size,
+                },
+            );
+            seg_bytes[a] = align128(off + size);
+        }
     }
 
     // Synthetic intermediates (assigned lazily during lowering) start ABOVE the
@@ -5194,8 +5242,10 @@ pub fn ops_for_grouping(ops: &[EmittedOp], _fold: FoldGrouping) -> Vec<&EmittedO
 fn trip_kinds_for(ops: &[EmittedOp], fold: FoldGrouping) -> (Vec<Trip>, Vec<usize>) {
     let (mut kinds, owner) = trip_kinds_and_owner(ops);
     if fold == FoldGrouping::Fused {
-        for t in kinds.iter_mut() {
-            if matches!(t.kind, GroupKind::PageFold { .. }) {
+        for (t, &o) in kinds.iter_mut().zip(&owner) {
+            // ⛔ A WALK'S BODY IS NEVER FUSED AWAY: its relaunch count is the walk's own, baked with
+            // the rung, and running it once would attend one block.
+            if matches!(t.kind, GroupKind::PageFold { .. }) && ops[o].walk.is_none() {
                 // Reclassified, but it KEEPS ITS REQUEST — so it still cannot fuse across requests.
                 t.kind = GroupKind::Pure;
             }
@@ -5503,6 +5553,20 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
         }
         let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold { .. });
         let _ = gi; // launch order is the slice position now, not a field
+        // ⭐ A WALK'S BODY GROUP relaunches as its walk says — ONE walk per group, since the group is
+        // one launch and one relaunch count. A group mixing a walk's body with anything else (another
+        // walk, or ops run once) would run them all `trips` times or the body once.
+        let walk = e.walk;
+        for t in r.clone() {
+            let o = &ops[owner[t]];
+            assert!(
+                o.walk == walk,
+                "group {gi}: op '{}' relaunches as {:?} but the group as {walk:?} — a group is one \
+                 launch, so a walk's body must not share one with any op outside it",
+                o.op_name,
+                o.walk
+            );
+        }
         shifts.push(bundle::KvShifts {
             slot_stride_bytes: slot,
             slab_stride_bytes: slab,
@@ -5530,6 +5594,10 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
                     bundle::FoldRows::WholeBatch
                 }
             },
+            walk: walk.map(|w| bundle::Walk {
+                trips: w.trips,
+                step_bytes: w.step_bytes,
+            }),
         });
     }
     shifts
@@ -7270,6 +7338,33 @@ fn ktir_groups_via_superdsc(
         }
         per_prog.push((e.op_name.clone(), lowered.len()));
         sdsc_ops.extend(lowered);
+    }
+
+    // ⛔⛔⛔ A WALK'S BODY READS THE SHIFTED SEGMENT ONLY THROUGH THE STEP'S SOURCES. The relaunch moves
+    // the ACTIVATION segment one step per trip (`fold_plan::seg_deltas`' walk arm), so every tensor the
+    // body addresses there is read `trip · step` past its placement: right for the page table and the
+    // mask stack, whose pitch IS the step, and a wrong address for anything else — a registry
+    // constant, a staged input. The walk's lowering fills its constants before the body for exactly
+    // this reason; this is the bake's proof that nothing else slipped in.
+    if let Some(l) = layout {
+        let act = SegRole::Activation.segment();
+        let step_tids = scratchy_triton_splice::PagedStepTids::RESERVED;
+        for e in sdsc_ops.iter().filter(|e| e.walk.is_some()) {
+            for b in &e.arg_bindings {
+                let Some(ktir_superdsc::place::PlaceId::Act(tid)) = l.id_of(&b.buffer) else {
+                    continue;
+                };
+                let in_act = l.placements.get(&tid).is_some_and(|p| p.segment == act);
+                if in_act && tid != step_tids.page_table && tid != step_tids.mask {
+                    return Err(SuperDscError(format!(
+                        "[spyre-superdsc] walk body op '{}' reads t{tid} from the activation \
+                         segment, which its relaunch shifts one step per trip — only the step's \
+                         page table and mask stack move with the trip",
+                        e.op_name
+                    )));
+                }
+            }
+        }
     }
 
     // ⛔⛔⛔ main's FOUR POST-LOWERING GUARDS, AT THE GRAIN WHERE THE DESCRIPTORS NOW EXIST.

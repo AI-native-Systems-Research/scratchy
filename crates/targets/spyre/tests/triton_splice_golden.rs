@@ -2047,17 +2047,39 @@ fn the_paged_attention_splices_with_its_contract() {
             "{at}"
         );
         assert_eq!(k.mask.map(|m| m.get()), Some(tids.mask), "{at}");
-        // ⛔ THE CARD's HALF IS NOT PORTED, AND SAYS SO: the door refuses the paged program by name.
-        // This assertion is the one to replace when the SuperDSC lowering lands.
+        // ⭐ THE CARD'S HALF, through the production door under the bundle's own layout: at a
+        // one-stick head dim the walk lowers — its body at trip 0, marked for the card's per-trip
+        // relaunch exactly when the walk loops (a one-page pool's walk is one trip, which the front
+        // end promotes to straight-line code) — and a wider head is refused by the one-stick law, by
+        // name, rather than lowered at addresses its frames do not have.
+        let layout = triton_ktir_superdsc::layout::for_node(k)
+            .unwrap_or_else(|e| panic!("{at}: layout: {e:?}"));
         let mut sym = 0i64;
-        let Err(refused) = door_lower(k, &mut sym, None, None) else {
-            panic!("{at}: the paged attention has no SuperDSC lowering yet, and must say so");
-        };
-        assert!(
-            refused.message.contains("has no SuperDSC lowering"),
-            "{at}: {}",
-            refused.message
-        );
+        let lowered = door_lower(k, &mut sym, Some(&layout), None);
+        if s.geom.2 == 64 {
+            let ops = lowered.unwrap_or_else(|e| panic!("{at}: the walk lowers: {}", e.message));
+            assert!(!ops.is_empty(), "{at}: the walk emitted nothing");
+            let walking = ktir_superdsc::emit::loop_fold::flatten(k)
+                .expect("the program flattens")
+                .is_some();
+            assert_eq!(
+                ops.iter().any(|e| e.walk.is_some()),
+                walking,
+                "{at}: the body is marked for the relaunch exactly when the walk loops"
+            );
+        } else {
+            let Err(refused) = lowered else {
+                panic!(
+                    "{at}: a {}-wide head lowered past the one-stick law",
+                    s.geom.2
+                );
+            };
+            assert!(
+                refused.message.contains("stick"),
+                "{at}: {}",
+                refused.message
+            );
+        }
     }
 }
 

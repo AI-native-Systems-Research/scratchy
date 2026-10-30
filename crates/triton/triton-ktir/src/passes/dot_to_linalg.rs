@@ -182,28 +182,26 @@ pub fn run(module: &mut Module) -> Result<()> {
         // orientation. The transposed-B fold below is a PRESENTED-WEIGHT law (the host
         // stages the bytes); a batched operand is an in-register computed value (the
         // gathered, reshaped page tile), which has no host to place a transposition, so a
-        // `.T` on a rank-3 operand is not folded -- it is REFUSED, the same law as the
-        // gathered K leg. The fp8 widening is refused for the same reason: the W8A8 door is
-        // the rank-2 standalone contract's own, and no batched form of it is stated.
+        // `tt.trans` on a rank-3 operand is NOT FOLDED: it stays the op it is, and
+        // `to_ktir`'s `convert_trans` lowers it to a real `linalg.transpose`, whose result
+        // the batch matmul reads in the standard orientation (spyre-inference's
+        // `torch.matmul(q, k_page.permute(0, 2, 1))`). The fp8 widening is refused: the
+        // W8A8 door is the rank-2 standalone contract's own, and no batched form of it is
+        // stated.
         if batched {
             let (da, db, dd) = (
                 da.expect("batched implies rank-3 dims"),
                 db.expect("batched implies rank-3 dims"),
                 dd.expect("batched implies rank-3 dims"),
             );
-            let widened = |v: Ssa| {
-                index
-                    .def_of(v)
-                    .is_some_and(|o| o.kind == OpKind::ArithExtf || o.kind == OpKind::TtTrans)
-            };
+            let widened = |v: Ssa| index.def_of(v).is_some_and(|o| o.kind == OpKind::ArithExtf);
             if widened(dot.operands[0]) || widened(dot.operands[1]) {
                 return Err(Refusal::new(
                     PASS,
-                    "a rank-3 tt.dot operand reaches the dot through an `arith.extf` or a \
-                     `tt.trans`: the fp8 W8A8 widening and the transposed-B fold are \
-                     rank-2 presented-weight laws (the host stages those bytes), and no \
-                     batched form of either is stated. Present the batched operands as \
-                     f16 values in the standard [b, M, K] / [b, K, N] orientation",
+                    "a rank-3 tt.dot operand reaches the dot through an `arith.extf`: the \
+                     fp8 W8A8 widening is a rank-2 presented-weight law (the host stages \
+                     those bytes), and no batched form of it is stated. Present the batched \
+                     operands as f16 values",
                 ));
             }
             if da[0] != db[0] || da[0] != dd[0] {

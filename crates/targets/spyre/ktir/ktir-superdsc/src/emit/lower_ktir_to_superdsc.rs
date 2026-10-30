@@ -2402,6 +2402,31 @@ fn elementwise_broadcast(
     // one; comparing a window's inputs against a view's extent is the mismatch that reads rows
     // nobody wrote.
     let rows = pointwise_rows(name, out)?;
+    // ⭐⭐⭐ A ROW-SPLIT SPRAY WIDER THAN ONE STICK GOES ONE STICK COLUMN AT A TIME. The split law
+    // below states the Y mode at ONE stick of `out` — a stick-major tensor's column `j` is the
+    // contiguous `[rows, stick]` block `j·rows·stick` in, and a wider `out` dim would stride past
+    // the rows the source occupies. So a multi-stick spray is its stick columns, each exactly that
+    // one-stick form: the walk's mask tile `[ROWS, BLOCK]`, sprayed over every kv head's rows.
+    if let Some(y) = bcast.iter().find_map(|b| match b {
+        Some(BcastAxis::Y(y)) => Some(*y),
+        _ => None,
+    }) && out.c_len > df.elems_per_stick()
+    {
+        return elementwise_y_by_column(
+            BcastReq {
+                name,
+                what,
+                op_func,
+                ins,
+                out,
+                bcast,
+                df,
+            },
+            (y, rows),
+            sym_id_base,
+            layout,
+        );
+    }
     // ⭐⭐⭐ THE ROW-SPLIT (Y) MODE'S FRAME, DERIVED BEFORE THE WANT LOOP — because the want row
     // for a `Y` operand (`rows/y`) is only honest when `y` DIVIDES `rows`, and that divisibility
     // is itself half of the frame law: the output's own device frame `[rows, c_len]` must split
@@ -2532,6 +2557,92 @@ fn elementwise_broadcast(
         sym_id_base,
         layout,
     )])
+}
+
+/// [`elementwise_broadcast`]'s row-split spray at an `out` wider than one stick: ONE descriptor per
+/// stick column `j`, each the one-stick Y form over the contiguous `[rows, stick]` blocks of its
+/// operands — a stick-major `[R, C]` tensor holds column `j`'s rows `[r0, r0 + rows)` at element
+/// `j·R·stick + r0·stick`, so every operand, its window included, is a base offset per column.
+/// Only dense and `Y` operands ride it; a `Col`/`Mb` operand beside a row split is refused.
+fn elementwise_y_by_column(
+    req: BcastReq<'_>,
+    (y, rows): (u32, u32),
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let BcastReq {
+        name,
+        what,
+        op_func,
+        ins,
+        out,
+        bcast,
+        df,
+    } = req;
+    let stick = df.elems_per_stick();
+    let cols = out.c_len;
+    if y < 2 || !rows.is_multiple_of(y) || !cols.is_multiple_of(stick) || out.c_start != 0 {
+        return err(format!(
+            "{what} {name}: a row split of {y} over the `[{rows}, {cols}]` output t{} — the spray \
+             needs whole sprays of rows and whole {stick}-element stick columns from column 0",
+            out.tid
+        ));
+    }
+    let mb = rows / y;
+    for (i, x) in ins.iter().enumerate() {
+        let want_rows = match bcast[i] {
+            None => rows,
+            Some(BcastAxis::Y(_)) => mb,
+            Some(other) => {
+                return err(format!(
+                    "{what} {name}: input {i} t{} is a {other:?} operand beside a row split — the \
+                     column-wise spray states dense and `Y` operands only",
+                    x.tid
+                ));
+            }
+        };
+        if x.r_len != want_rows || x.c_len != cols || x.c_start != 0 {
+            return err(format!(
+                "{what} {name}: input {i} t{} takes `[{}, {}]` at column {} of its view, and its \
+                 mode wants `[{want_rows}, {cols}]` from column 0",
+                x.tid, x.r_len, x.c_len, x.c_start
+            ));
+        }
+    }
+    let at = |x: &Region, j: u32| -> crate::addr::DevOff {
+        crate::addr::DevOff::from_view_step(j * x.v_rows * stick + x.r_start * stick)
+    };
+    let out_h = rb(&out.name(), out.v_rows, out.v_cols);
+    let handles: Vec<_> = ins
+        .iter()
+        .map(|x| rb(&x.name(), x.v_rows, x.v_cols))
+        .collect();
+    let tile_op = pointwise_tile_op_df(mb, stick, y, ins.len() as u32 + 1, df);
+    let mut ops = Vec::with_capacity((cols / stick) as usize);
+    for j in 0..cols / stick {
+        let ew: Vec<_> = handles
+            .iter()
+            .zip(ins)
+            .zip(bcast)
+            .map(|((h, x), b)| match b {
+                Some(BcastAxis::Y(y)) => In::y_broadcast_at(h, *y, at(x, j)).ew(),
+                _ => In::sliced(h, at(x, j)).ew(),
+            })
+            .collect();
+        ops.push(assemble_pointwise_broadcast_off_from_tile(
+            &format!("{op_func}{j}_o{}", out.tid),
+            &tile_op,
+            op_func,
+            rows,
+            stick,
+            &ew,
+            &out_h,
+            at(out, j),
+            sym_id_base,
+            layout,
+        ));
+    }
+    Ok(ops)
 }
 
 /// A dtype-CONVERT's kind — the device's own convert `OpFunc`s, discriminated by the
@@ -5044,6 +5155,335 @@ pub fn matmul_oriented(
 /// at the block, measured against that golden (it reproduces the fixture's
 /// `numWkSlicesPerDim_ {"out": 8, "mb": 4}` verbatim), so every pair of whole 64-stick extents now
 /// bakes. The stick law below is therefore the ONLY shape this door refuses, deliberately.
+/// The registry slot holding `value` — the bound `[1,1]` const every splatted constant reaches the
+/// card through (`BundleLayout::scalarmul_scales`).
+fn registry_const(name: &str, value: f32, layout: Option<&BundleLayout>) -> Result<String, Error> {
+    let idx = scale_slot(layout, value).ok_or_else(|| Error {
+        message: format!(
+            "{name}: the constant {value}, read off the program, is absent from \
+             `BundleLayout::scalarmul_scales` — the descriptor reads a bound `[1,1]` const, so the \
+             value the program states must have a registry slot (registry desync)"
+        ),
+    })?;
+    Ok(crate::place::act_name(scalarmul_scale_tid(idx)))
+}
+
+/// `x <min|max> c` with `c` a splatted constant — the walk's `min(tile_max - scores_max, 0)` clamp.
+/// The constant is the registry's bound `[1,1]` const sprayed over the tile, exactly as
+/// [`scalarmul_at`] sprays a multiplier.
+pub fn scalar_binary(
+    name: &str,
+    e: Elementwise,
+    value: f32,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let (ins, out) = split_out(name, r, layout, 1)?;
+    let (op_func, _) = elementwise_op_func(name, e)?;
+    let x = ins[0];
+    if x.c_start != 0 || out.c_start != 0 || x.r_start != 0 || out.r_start != 0 {
+        return err(format!(
+            "{name}: a constant-operand `{op_func}` over a windowed operand — it reads and writes \
+             whole buffers"
+        ));
+    }
+    if (x.r_len, x.c_len) != (out.r_len, out.c_len) {
+        return err(format!(
+            "{name}: `{op_func}` reads t{} `[{}, {}]` and writes t{} `[{}, {}]` — a pointwise op \
+             keeps its shape",
+            x.tid, x.r_len, x.c_len, out.tid, out.r_len, out.c_len
+        ));
+    }
+    let rows = out.r_len;
+    let (cols, store_cols) = pointwise_width_the_output_holds(
+        layout,
+        &[&out.name(), &x.name()],
+        rows,
+        out.v_cols,
+        DeviceWidth::for_pointwise(out.c_len).get(),
+    )?;
+    let c_name = registry_const(name, value, layout)?;
+    let (x_h, out_h, c_h) = (
+        rb(&x.name(), rows, store_cols),
+        rb(&out.name(), rows, store_cols),
+        rbo(&c_name),
+    );
+    let inputs = [In::full(&x_h).ew(), In::scalar(&c_h).ew()];
+    let mut tile_op = pointwise_tile_op(rows, cols, 1, 2);
+    tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 2 };
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
+        &format!("{op_func}_o{}", out.tid),
+        &tile_op,
+        op_func,
+        rows,
+        cols,
+        &inputs,
+        &out_h,
+        crate::addr::OutCorner::ZERO,
+        sym_id_base,
+        layout,
+    )])
+}
+
+/// A buffer SEEDED with one value — a walk's carried state at the value the program initialises it
+/// to (`tensor.splat` of a constant): the registry's bound `[1,1]` const, sprayed over the whole
+/// buffer by an `identity`.
+pub fn fill(
+    name: &str,
+    value: f32,
+    out: &Region,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let rows = out.r_len;
+    let (cols, store_cols) = pointwise_width_the_output_holds(
+        layout,
+        &[&out.name()],
+        rows,
+        out.v_cols,
+        DeviceWidth::for_pointwise(out.c_len).get(),
+    )?;
+    let c_name = registry_const(name, value, layout)?;
+    let (out_h, c_h) = (rb(&out.name(), rows, store_cols), rbo(&c_name));
+    let inputs = [In::scalar(&c_h).ew()];
+    let mut tile_op = pointwise_tile_op(rows, cols, 1, 1);
+    tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 1 };
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
+        &format!("fill_o{}", out.tid),
+        &tile_op,
+        "identity",
+        rows,
+        cols,
+        &inputs,
+        &out_h,
+        crate::addr::OutCorner::ZERO,
+        sym_id_base,
+        layout,
+    )])
+}
+
+/// `linalg.batch_matmul` `[b, m, k] × [b, k, n] → [b, m, n]` — ONE 2-D contraction per batch.
+///
+/// The activation and the output are read in the FLAT FRAME every rank-3 value lives in (`[b·m, k]`
+/// and `[b·m, n]`, [`shape_2d`]'s reading), so batch `i` is the row slice `[i·m, (i+1)·m)` of each —
+/// addressed at element base `i·m·stick` with the tensor's own row count as its device extent
+/// ([`assemble_matmul_rows`](crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_rows)). A
+/// slice of a stick-major tensor is contiguous rows only while the tensor is ONE stick wide; wider,
+/// the slice's sticks sit `b·m` rows apart, which is exactly what the device extent states.
+///
+/// The kernel is batch `i`'s own `[k, n]` block, `i·k·n` elements in: the batched transpose writes its
+/// output as those blocks ([`batch_transpose`]), and a one-stick-wide `[b·k, n]` flat frame IS them.
+/// The caller proves which of the two its kernel is; the descriptor here reads blocks.
+///
+/// ⛔ THE BATCH DOES NOT RIDE `y`. A `y`-batched contraction shares ONE kernel across the batch
+/// (`SharedKernelBmmForm`'s own law — a 3-D kernel is dxp garbage), and each batch here has its own:
+/// the score leg's `Kᵀ` page block and the value leg's `V` page block of its kv head.
+pub fn batch_matmul(
+    name: &str,
+    batch: u32,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let (ins, out) = split_out(name, r, layout, 2)?;
+    let (a, w) = (ins[0], ins[1]);
+    for (x, role) in [(&a, "activation"), (&w, "kernel"), (&out, "output")] {
+        if x.r_start != 0 || x.c_start != 0 || x.r_len != x.v_rows || x.c_len != x.v_cols {
+            return err(format!(
+                "{name}: the batched contraction's {role} t{} is a window of its `[{}, {}]` view — \
+                 its per-batch slices are addressed from the buffer base",
+                x.tid, x.v_rows, x.v_cols
+            ));
+        }
+    }
+    let stick = Fp16::ELEMS_PER_STICK;
+    if batch == 0 || !a.v_rows.is_multiple_of(batch) || !w.v_rows.is_multiple_of(batch) {
+        return err(format!(
+            "{name}: a {batch}-batch contraction over t{} `[{}, {}]` and t{} `[{}, {}]` — each \
+             operand's flat frame holds whole batches",
+            a.tid, a.v_rows, a.v_cols, w.tid, w.v_rows, w.v_cols
+        ));
+    }
+    let (m, k, n) = (a.v_rows / batch, a.v_cols, w.v_cols);
+    if w.v_rows / batch != k || (out.v_rows, out.v_cols) != (batch * m, n) {
+        return err(format!(
+            "{name}: the batched contraction does not state `[b, m, k] × [b, k, n] → [b, m, n]` in \
+             its flat frames: A `[{}, {}]`, W `[{}, {}]`, O `[{}, {}]` at batch {batch}",
+            a.v_rows, a.v_cols, w.v_rows, w.v_cols, out.v_rows, out.v_cols
+        ));
+    }
+    if !k.is_multiple_of(stick) || !n.is_multiple_of(stick) {
+        return err(format!(
+            "{name}: the batched contraction's k = {k} and n = {n} must be whole {stick}-element sticks"
+        ));
+    }
+    let rows = batch * m;
+    let (a_h, w_h, o_h) = (
+        rb(&a.name(), rows, k),
+        Stk::<KernelTag>::kernel(k as usize, (batch * n) as usize, w.name()),
+        rb(&out.name(), rows, n),
+    );
+    let mut ops = Vec::with_capacity(batch as usize);
+    for i in 0..batch {
+        use crate::ir::bridge::tiled_op_sdsc_op::{RowsOperand, RowsShape, assemble_matmul_rows};
+        ops.push(
+            assemble_matmul_rows(
+                &format!("bmm{i}_o{}", out.tid),
+                RowsShape {
+                    m: MatM::of_token_rows(m),
+                    n: MatN::of_out_features(n),
+                    k: MatK::of_in_features(k),
+                    rows,
+                },
+                RowsOperand {
+                    h: &a_h,
+                    off: i * m * stick,
+                },
+                RowsOperand {
+                    h: &w_h,
+                    off: i * k * n,
+                },
+                RowsOperand {
+                    h: &o_h,
+                    off: i * m * stick,
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error {
+                message: format!("{name}: {message}"),
+            })?,
+        );
+    }
+    Ok(ops)
+}
+
+/// A rank-3 `linalg.transpose` `[b, r, c] → [b, c, r]` — ONE 2-D relayout per batch, through the
+/// restickify door at each batch's element base ([`super::try_assemble_restickify_transpose_2d_at`]).
+///
+/// Its output is written as `b` `[c, r]` stick-major BLOCKS, block `i` at `i·c·r` — the kernels a
+/// batched contraction reads ([`batch_matmul`]) — not as the `[b·c, r]` flat frame: the two are the
+/// same bytes only at `r` one stick wide, and the score leg's `Kᵀ` page is `[hd, page]`.
+///
+/// ⛔ THE INPUT'S BATCH BLOCKS ARE ITS FLAT FRAME'S ROWS, which is a contiguous `[r, c]` block only
+/// while `c` is one stick: wider, a batch's rows are interleaved stick by stick with every other
+/// batch's, and no base offset names them. Refused by name above one stick.
+pub fn batch_transpose(
+    name: &str,
+    batch: u32,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let (ins, out) = split_out(name, r, layout, 1)?;
+    let a = ins[0];
+    let stick = Fp16::ELEMS_PER_STICK;
+    if batch == 0 || !a.v_rows.is_multiple_of(batch) {
+        return err(format!(
+            "{name}: a {batch}-batch transpose over t{} `[{}, {}]` — the flat frame holds whole \
+             batches",
+            a.tid, a.v_rows, a.v_cols
+        ));
+    }
+    let (rows, cols) = (a.v_rows / batch, a.v_cols);
+    if (out.v_rows, out.v_cols) != (batch * cols, rows) {
+        return err(format!(
+            "{name}: transposes `[{batch}, {rows}, {cols}]` into t{} `[{}, {}]` — a batched \
+             transpose's flat output is `[{}, {rows}]`",
+            out.tid,
+            out.v_rows,
+            out.v_cols,
+            batch * cols
+        ));
+    }
+    if cols != stick {
+        return err(format!(
+            "{name}: a batched transpose of `[{batch}, {rows}, {cols}]` — a batch's `[{rows}, \
+             {cols}]` block is a contiguous run of the flat frame only at one {stick}-element stick \
+             wide; at {cols} its sticks interleave with the other batches' and need a relayout \
+             first"
+        ));
+    }
+    for (x, role) in [(&a, "input"), (&out, "output")] {
+        if x.r_start != 0 || x.c_start != 0 || x.r_len != x.v_rows || x.c_len != x.v_cols {
+            return err(format!(
+                "{name}: the batched transpose's {role} t{} is a window of its view — it moves whole \
+                 buffers",
+                x.tid
+            ));
+        }
+    }
+    let (a_h, o_h) = (
+        rb(&a.name(), a.v_rows, cols),
+        rb(&out.name(), out.v_rows, rows),
+    );
+    let mut ops = Vec::with_capacity(batch as usize);
+    for i in 0..batch {
+        ops.push(
+            super::try_assemble_restickify_transpose_2d_at(
+                &format!("transpose{i}_o{}", out.tid),
+                rows,
+                cols,
+                super::RestickifySide {
+                    h: &a_h,
+                    off: i * rows * cols,
+                },
+                super::RestickifySide {
+                    h: &o_h,
+                    off: i * cols * rows,
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error {
+                message: format!("{name}: {message}"),
+            })?,
+        );
+    }
+    Ok(ops)
+}
+
+/// ⭐ THE PAGE GATHER — a load through an indirect tile whose one index entry selects a whole
+/// contiguous slab (`kp_desc.load([page, 0, 0, 0])`, every kv head of a pool page), copied into the
+/// contiguous scratch `out` its consumers read ([`crate::ir::bridge::tiled_op_sdsc_op::page_gather_copy_opspec`]).
+///
+/// `entries` index words from `first_entry`, `page_sticks` one-stick sub-rows each: the slab is read
+/// as one-stick rows because a gathered entry is a contiguous RUN, which is also what keeps the
+/// scratch's bytes the gathered slab's own row-major bytes. The consumers read the scratch in the flat
+/// frame — the same bytes only while a row is one stick wide; the caller refuses a wider one.
+pub fn page_gather(
+    name: &str,
+    g: &Gather,
+    page_sticks: u32,
+    out: &Region,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::{PageGatherRows, assemble_page_gather_copy};
+    let gather = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+        crate::place::act_name(g.index_tid),
+        crate::superdsc_opspec::PageExtent::of_positions(page_sticks),
+        g.first_entry,
+    );
+    let op = assemble_page_gather_copy(
+        &format!("gather_o{}", out.tid),
+        &crate::place::act_name(g.value_tid),
+        &out.name(),
+        gather,
+        PageGatherRows {
+            rows: g.entries * page_sticks,
+            df: Df::Fp16,
+        },
+        sym_id_base,
+        layout,
+    )
+    .map_err(|message| Error {
+        message: format!("{name}: {message}"),
+    })?;
+    Ok(vec![op])
+}
+
 pub fn transpose(
     name: &str,
     r: &[Region],
@@ -6514,13 +6954,59 @@ mod elementwise_tests {
         );
     }
 
-    /// ⛔ AND THE MULTI-STICK OUTPUT — a `[256, 128]` output under a row-split flag: the
-    /// source would have to be multi-stick, which the split law refuses (the split's `out` dim
-    /// IS the one stick). Refused by name at the same door.
+    /// ⭐ AND THE MULTI-STICK OUTPUT — a `[256, 128]` output under a row-split flag goes ONE
+    /// STICK COLUMN AT A TIME: the split law states the spray at one stick of `out`, and a
+    /// stick-major tensor's column `j` is the contiguous `[rows, stick]` block `j·rows·stick` in —
+    /// so the op is two one-stick sprays, each operand addressed at its own column's base: the
+    /// output and the dense input `j·256·64` in, the `[64, 128]` source `j·64·64` in. The
+    /// offsets are the whole claim, so they are what is pinned.
     #[test]
-    fn a_multi_stick_output_under_a_row_split_flag_is_refused() {
+    fn a_multi_stick_output_under_a_row_split_goes_one_stick_column_at_a_time() {
         let r = node(
             reg(5, 256, 128, false),
+            reg(6, 64, 128, false),
+            reg(7, 256, 128, true),
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[None, Some(BcastAxis::Y(4))],
+            &mut sym,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("the column-wise spray lowers: {}", e.message));
+        assert_eq!(ops.len(), 2, "one descriptor per stick column of `out`");
+        for (j, op) in ops.iter().enumerate() {
+            let off = |buf: &str| -> u32 {
+                op.arg_bindings
+                    .iter()
+                    .find(|b| b.buffer == buf)
+                    .unwrap_or_else(|| panic!("column {j} binds {buf}"))
+                    .offset_elems
+            };
+            let j = j as u32;
+            assert_eq!(off("t7"), j * 256 * 64, "column {j}: the output's base");
+            assert_eq!(
+                off("t5"),
+                j * 256 * 64,
+                "column {j}: the dense input's base"
+            );
+            assert_eq!(
+                off("t6"),
+                j * 64 * 64,
+                "column {j}: the spray source's base"
+            );
+        }
+    }
+
+    /// ⛔ THE COLUMN-WISE SPRAY STATES DENSE AND `Y` OPERANDS ONLY — a per-row `Col` operand beside
+    /// a multi-stick row split is a mode the per-column form does not address, refused by name.
+    #[test]
+    fn a_col_operand_beside_a_multi_stick_row_split_is_refused() {
+        let r = node(
+            reg(5, 256, 1, false),
             reg(6, 64, 128, false),
             reg(7, 256, 128, true),
         );
@@ -6529,15 +7015,15 @@ mod elementwise_tests {
             "sub_s3",
             Elementwise::Sub,
             &r,
-            &[None, Some(BcastAxis::Y(4))],
+            &[Some(BcastAxis::Col), Some(BcastAxis::Y(4))],
             &mut sym,
             None,
         ) else {
-            panic!("a multi-stick row-split source must not emit");
+            panic!("a Col operand beside a multi-stick row split must not emit");
         };
         assert!(
-            e.message.contains("SINGLE stick column"),
-            "names the single-stick law: {}",
+            e.message.contains("dense and `Y` operands only"),
+            "names the column-wise spray's operand law: {}",
             e.message
         );
     }

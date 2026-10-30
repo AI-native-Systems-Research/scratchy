@@ -33,15 +33,16 @@ pub mod reduce;
 pub mod rmsnorm;
 
 pub use matmul::{
-    SharedKernelBmmForm, assemble_matmul, assemble_matmul_batched_off,
+    RowsOperand, RowsShape, SharedKernelBmmForm, assemble_matmul, assemble_matmul_batched_off,
     assemble_matmul_batched_seeded, assemble_matmul_off, assemble_matmul_off_phys_m,
-    assemble_matmul_placed, assemble_matmul_seeded, assemble_matmul_split,
+    assemble_matmul_placed, assemble_matmul_rows, assemble_matmul_seeded, assemble_matmul_split,
     assemble_matmul_windowed, matmul_opspec, matmul_opspec_batched, matmul_opspec_batched_off,
     matmul_opspec_off, matmul_opspec_off_operands, matmul_opspec_split, try_assemble_matmul_seeded,
 };
 pub use pointwise::{
-    ScatterCopySpec, assemble_gather_copy, assemble_pointwise_broadcast_off_from_tile,
-    assemble_pointwise_seeded_from_tile, assemble_scatter_copy, gather_copy_opspec,
+    PageGatherRows, ScatterCopySpec, assemble_gather_copy, assemble_page_gather_copy,
+    assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
+    assemble_scatter_copy, gather_copy_opspec, page_gather_copy_opspec,
     pointwise_broadcast_opspec_from_tile, pointwise_opspec_from_tile, scatter_copy_opspec,
 };
 pub use reduce::{

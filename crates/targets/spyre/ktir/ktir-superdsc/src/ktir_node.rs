@@ -440,11 +440,12 @@ pub enum Program {
 }
 
 impl Program {
-    /// Whether this program has a SuperDSC lowering — the card's half of the ladder. The paged step
-    /// reaches the card WHOLE: its KV write lowers (`lk::paged_kv_write`, the hardware scatter) but
-    /// its page walk does not yet, so neither is placed or lowered into a card plan until both are —
-    /// a card build stops at the walk rather than shipping a bundle short its attention.
-    pub const fn has_card_lowering(self) -> bool {
+    /// Whether an EMULATOR build declares this program into the card's memory plan. Every program
+    /// does but the paged step's two: the emulator runs the KV write and the page walk as KTIR over
+    /// the step's sources bound by tid, so their card lowering (the hardware scatter, the walk's
+    /// trip-0 body) has nothing to declare there — and it states laws an emulator-only geometry need
+    /// not meet (the walk's one-stick head dim). A card build declares them like everything else.
+    pub const fn declares_on_emulator(self) -> bool {
         !matches!(self, Program::PagedAttn | Program::PagedKvWrite)
     }
 }

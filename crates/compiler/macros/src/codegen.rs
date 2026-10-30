@@ -9734,11 +9734,9 @@ fn emit_superdsc_wiring(
     // ⭐ EVERY COMPILE-TIME SCALAR THE KTIR READS, from the bake's own registry — not recomputed
     // here from the config. The programs bake the INDEX into themselves, so the list
     // the worker binds has to be the same list, in the same order, that the lowering indexed.
-    let scalarmul_scale_lits: Vec<proc_macro2::Literal> = gk
-        .scalarmul_scales
-        .iter()
-        .map(|v| proc_macro2::Literal::f32_suffixed(*v))
-        .collect();
+    // ⭐ AS BITS: the registry holds the page walk's `-inf` seed, which no float literal spells.
+    let scalarmul_scale_lits: Vec<proc_macro2::TokenStream> =
+        gk.scalarmul_scales.iter().map(|v| f32_bits(*v)).collect();
     // The ScalarMul weight folds, straight off the bake's recognition — the worker scales these
     // staged weights at load, so the list it reads has to be the one the lowering recognized.
     let weight_scale_fold_lits: Vec<proc_macro2::TokenStream> = gk
@@ -10337,11 +10335,9 @@ fn layout_tokens(
         .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
     let places = places_interner.ident(places);
     let kws = kernel_weights.iter().map(kernel_weight_tokens);
-    // f32 literals: `Literal::f32_suffixed` round-trips the exact value, which matters — these are
-    // the granite ScalarMul multipliers, and a rounded one is a quietly wrong model.
-    let scales = scalarmul_scales
-        .iter()
-        .map(|s| proc_macro2::Literal::f32_suffixed(*s));
+    // The exact value, as its BITS — these are the granite ScalarMul multipliers (a rounded one is a
+    // quietly wrong model) and the page walk's `-inf` seed (which no float literal spells).
+    let scales = scalarmul_scales.iter().map(|s| f32_bits(*s));
     // The fold list, same exact-value rule: a rounded multiplier is a quietly wrong weight scale.
     let folds = weight_scale_folds.iter().map(|(tid, scale)| {
         let tid = proc_macro2::Literal::u32_unsuffixed(*tid);
@@ -10438,7 +10434,26 @@ fn launch_tokens(
         batched_requests,
         gathered,
         fold_rows,
+        walk,
     } = kv;
+    let walk = match walk {
+        Some(scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::Walk {
+            trips,
+            step_bytes,
+        }) => {
+            let (t, s) = (
+                proc_macro2::Literal::u32_unsuffixed(*trips),
+                proc_macro2::Literal::u32_unsuffixed(*step_bytes),
+            );
+            quote! {
+                ::std::option::Option::Some(::scratchy_target_spyre::bundle_code::Walk {
+                    trips: #t,
+                    step_bytes: #s,
+                })
+            }
+        }
+        None => quote! { ::std::option::Option::None },
+    };
     let [slot, slab, slots, req, slot_off] = [
         *slot_stride_bytes,
         *slab_stride_bytes,
@@ -10482,6 +10497,7 @@ fn launch_tokens(
                 batched_requests: #batched_requests,
                 gathered: #gathered,
                 fold_rows: #fold_rows,
+                walk: #walk,
             },
             programs: ::std::borrow::Cow::Borrowed(&[#(#progs),*]),
             init_binary: #image,
@@ -10489,6 +10505,14 @@ fn launch_tokens(
             correction: ::std::borrow::Cow::Borrowed(&[#(#corr),*]),
         }
     }
+}
+
+/// An `f32` as the expression of its exact BITS — `f32::from_bits(0x…)`, a const expression that
+/// spells every value, the infinities included, which `Literal::f32_*` refuses.
+#[cfg(feature = "spyre")]
+fn f32_bits(v: f32) -> proc_macro2::TokenStream {
+    let bits = proc_macro2::Literal::u32_unsuffixed(v.to_bits());
+    quote! { f32::from_bits(#bits) }
 }
 
 /// Write `bytes` under `OUT_DIR` and return the `include_bytes!` that reads them back at compile time.

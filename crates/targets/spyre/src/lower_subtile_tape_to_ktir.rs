@@ -2599,9 +2599,9 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         let mut declare_syms: i64 = 0;
         for e in ops.iter() {
             let Some(k) = e.ktir.as_ref() else { continue };
-            // A program with no card lowering declares nothing into the card's plan: on the
-            // emulator it runs as KTIR, and a card build refuses it at the door's real pass.
-            if !cfg!(feature = "spyre-hw") && !k.program.has_card_lowering() {
+            // The paged step declares into the card's plan on a card build only: the emulator
+            // runs it as KTIR over its sources bound by tid (`Program::declares_on_emulator`).
+            if !cfg!(feature = "spyre-hw") && !k.program.declares_on_emulator() {
                 continue;
             }
             crate::ktir_superdsc_door::lower(
