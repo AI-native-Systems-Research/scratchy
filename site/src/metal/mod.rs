@@ -1970,13 +1970,13 @@ impl<'a> Latency<'a> {
 
 impl Latency<'_> {
     /// One cell's `t` as each engine's empirical CDF: the share of its requests (up) done within
-    /// each time (across), a step at every request, on the cell's own range, each curve run on to
-    /// the range's end. Between scratchy's curve and its rival's, the sparklines' fills: cyan where
-    /// more of scratchy's requests are done by then, red where fewer; across the middle, a line
-    /// from one median to the other, cyan or red as scratchy's is the sooner or later, its factor
-    /// written over it. Time runs on a log axis, so a distance across is a ratio, as the factor
-    /// is. Bare: no axis titles or tick labels, `tag`'s lines in its corner; as wide as its column
-    /// and `height` high.
+    /// each time (across), a step at every request, each curve run on to the range's end. Between
+    /// scratchy's curve and its rival's, the sparklines' fills: cyan where more of scratchy's
+    /// requests are done by then, red where fewer; across the middle, a line from one median to
+    /// the other, cyan or red as scratchy's is the sooner or later, its factor written over it.
+    /// Time runs on a log axis [`ECDF_SPAN`] wide, centred on the engines' medians: a ratio, the
+    /// factor's included, is one width on every chart. Bare: no axis titles or tick labels,
+    /// `tag`'s lines in its corner; as wide as its column and `height` high.
     fn ecdf(&self, k: CellKey, t: RequestTiming, tag: &[&str], label: &str, height: &str) -> Element {
         let curves: Vec<(Engine, Vec<f64>)> = (self.engines.iter())
             .filter_map(|&e| {
@@ -1988,19 +1988,20 @@ impl Latency<'_> {
                 (!vs.is_empty()).then_some((e, vs))
             })
             .collect();
-        let ends = |(_, vs): &(Engine, Vec<f64>)| (vs[0], vs[vs.len() - 1]);
-        let Some((lo, hi)) =
-            (curves.iter().map(ends)).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
-        else {
+        // Centred on the engines' medians (their geometric mean), so the factor between them sits
+        // in the middle; a request past either edge is drawn at it.
+        let medians: Vec<f64> = curves.iter().filter_map(|(_, vs)| quantile(vs, 50.0)).collect();
+        if medians.is_empty() {
             return rsx! {};
-        };
-        // A twentieth of the log range either side; where every request took the same time, 5%,
-        // so the range never closes.
-        let pad = if hi > lo { (hi / lo).powf(1.0 / 20.0) } else { 1.05 };
-        let end = hi * pad;
-        let point = |group, key, value: f64| SparkPoint {
+        }
+        let centre = (medians.iter().map(|m| m.ln()).sum::<f64>() / medians.len() as f64).exp();
+        let half = ECDF_SPAN.sqrt();
+        let (start, end) = (centre / half, centre * half);
+        // Plotted as log10(ms) on a linear axis: Carbon rounds a log axis out to whole decades,
+        // which would undo the common span.
+        let point = |group, key: f64, value: f64| SparkPoint {
             group,
-            key,
+            key: key.clamp(start, end).log10(),
             value: Some(value),
             upper: None,
             lower: None,
@@ -2079,7 +2080,7 @@ impl Latency<'_> {
             options: ChartOptions {
                 title: String::new(),
                 axes: Axes {
-                    bottom: axis("key", "ms", Some("log"), [lo / pad, end]),
+                    bottom: axis("key", "log10 ms", None, [start.log10(), end.log10()]),
                     left: axis("value", "share of requests", None, [0.0, 1.0]),
                 },
                 color: Some(Colour::Scale {
@@ -2208,6 +2209,12 @@ const GLANCE_CHART_HEIGHT: &str = "4.5rem";
 /// The latency tab's ECDFs' height: about 1.8 wide for 1 high in its four prompt columns, so a
 /// quantile reads off the share axis (each of a cell's 50 requests some 3px), not a sparkline's.
 const ECDF_HEIGHT: &str = "9rem";
+
+/// The ratio every latency ECDF spans edge to edge, so a ratio is one width on all of them
+/// ([`Latency::ecdf`]): ×1.8 a little over half. Over the runs published by 2026-10-30, it holds
+/// the middle 90% (p5 to p95) of 90% of the charts' requests and every gap between medians (the
+/// widest ×2.7); the tails of the rest are drawn at the edges.
+const ECDF_SPAN: f64 = 3.0;
 
 /// An ECDF's fills ([`Latency::ecdf`]): where more of scratchy's requests are done than its
 /// rival's, and where fewer.
@@ -2407,7 +2414,8 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
              the switch below. Requests that failed, or whose answer arrived in one piece, have neither \
              timing to plot. With more users, the share of requests (up) done within each end-to-end \
              time (across): once the GPU is busy, scheduling only moves each request's wait between \
-             its first token and the rest, so their sum is what compares."
+             its first token and the rest, so their sum is what compares. Its time axis is a log one \
+             ×3 wide on every chart, centred on the two medians, so a factor is one width everywhere."
         },
         rsx! {
             Stack { gap: 6,
@@ -3240,10 +3248,11 @@ fn latency_panel<'l>(
                         {engine_key(e, class)}
                     }
                     ": in each cell at the heat maps' answer length, users at once down and prompt size \
-                     across, the share of each one's requests (up) done within each time (across), each chart \
-                     on its own range: with 1 user, time to first token over time per output token; with more, \
-                     end-to-end time, since once the GPU is busy scheduling only moves each request's wait \
-                     between those two. Further left is faster; a steeper rise is steadier."
+                     across, the share of each one's requests (up) done within each time (across): with 1 user, \
+                     time to first token over time per output token; with more, end-to-end time, since once the \
+                     GPU is busy scheduling only moves each request's wait between those two. Time runs on a log \
+                     axis ×3 wide on every chart, centred on its two medians, so a factor is one width everywhere; \
+                     a request past an edge is drawn at it. Further left is faster; a steeper rise is steadier."
                 }
                 div {
                     for &chip in rows {
