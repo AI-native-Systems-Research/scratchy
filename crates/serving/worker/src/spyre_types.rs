@@ -311,8 +311,9 @@ pub(crate) struct SuperDscBundle {
     /// programs and activations, not another copy of the model — exactly as the prefill ladder does.
     /// EMPTY ⇒ no ladder; every request runs its own forward, as before.
     pub(crate) decode_rungs: Vec<DecodeRung>,
-    /// The prefill bundles whose walk reaches the whole pool — what a CONTINUATION chunk
-    /// (`start > 0`) must run on, because it has resident KV to attend. See [`PrefixLadder`].
+    /// The prefill bundles whose walk ladder tops at the whole pool — what a CONTINUATION chunk
+    /// (`start > 0`) must run on, because it has resident KV to attend; each launch walks the
+    /// narrowest of its rungs that reaches the chunk's last position. See [`PrefixLadder`].
     ///
     /// Every entry in [`prefill_rungs`](Self::prefill_rungs) walks only its own chunk's pages, so it
     /// serves a chunk at `start == 0` (`PagedStep::reach`).

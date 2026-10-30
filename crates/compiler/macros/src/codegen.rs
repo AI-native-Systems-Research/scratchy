@@ -11905,15 +11905,19 @@ fn dump_wavefront_mega(
                                                         .any(|f| !f.is_none()),
                                                 },
                                             )];
-                                            // The walk rungs: every bucket below a decode body's
-                                            // whole-pool walk, and — off the card, where a prompt chunk
-                                            // past its first page runs on the prefill ladder rather
-                                            // than the card's prefix-capable chunks — every bucket
-                                            // above a prompt chunk's own pages.
+                                            // The walk rungs: every bucket below a whole-pool walk — a
+                                            // decode body's, and a prefix-capable prompt chunk's on the
+                                            // card, which runs every chunk past a prompt's first — and,
+                                            // off the card, where a prompt chunk past its first page
+                                            // runs on the prefill ladder, every bucket above a
+                                            // prefix-free chunk's own pages.
+                                            let prefix_free_chunk = is_prefill
+                                                && active_cap
+                                                    == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE;
                                             let sweep = scratchy_target_spyre::paged_step::walk_buckets(pool_pages)
                                                 .into_iter()
                                                 .filter(|&b| {
-                                                    if is_prefill {
+                                                    if prefix_free_chunk {
                                                         !card && b > ceiling_walk
                                                     } else {
                                                         b < ceiling_walk
@@ -11930,8 +11934,7 @@ fn dump_wavefront_mega(
                                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
                                                 u32,
                                             )> = sweep.collect();
-                                            // A prompt chunk's ladder is its walk rungs, off the card.
-                                            if !is_prefill || !card {
+                                            if !ladder.is_empty() {
                                                 // ⭐ EVERY RUNG IS ITS OWN LOWERING of the same tape at
                                                 // its own sweep/chunk, reading nothing another rung
                                                 // writes — so they lower in parallel and are recorded in
