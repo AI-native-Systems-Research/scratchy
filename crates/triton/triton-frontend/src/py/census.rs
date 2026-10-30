@@ -99,6 +99,11 @@ pub const TL_FUNCTIONS: &[&str] = &[
     "sum",
     "tanh",
     "math.tanh",
+    // Not in the five-fixture census: the paged walk's batched score dot (`paged_attn.py`),
+    // `tl.dot(q, tl.trans(k_page, (0, 2, 1)))` — spyre-inference's `k_page.permute(0, 2, 1)`
+    // over a rank-3 page, which `.T` (every axis reversed) cannot state. `tt.trans` with the
+    // permutation as its `order`, the same op `.T` emits.
+    "trans",
     // Not in the five-fixture census: the router kernels' slot selection,
     // `tl.where(mask, x, y)`. Like `tanh`, it is in the real `triton.language`
     // surface and the semantic layer turns it into `arith.select`.

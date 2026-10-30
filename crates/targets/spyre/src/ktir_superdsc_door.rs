@@ -35,7 +35,7 @@ use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{
     Error, Region, err, regions, rope_at, split_out,
 };
-use ktir_superdsc::emit::whole_function::lower_function;
+use ktir_superdsc::emit::whole_function::{lower_function, lower_walk};
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
 
@@ -113,6 +113,11 @@ pub fn lower(
     // The name is still the program's identity for the emulator (which keys functions by it) and for
     // the descriptor suffixes, so it is READ — but nothing is parsed out of it.
     let name = k.func.name;
+    // ⭐ THE PAGE WALK reads its windows at trip 0 (`loop_fold::flatten`), which the walk itself
+    // does — the top-level `regions` reading below stops at the loop.
+    if k.program == Program::PagedAttn {
+        return lower_walk(k, layout, sym_id_base);
+    }
     let r = regions(k)?;
     // ⭐⭐⭐ ON THE TYPE, NOT ON THE NAME. This was `match name.split('_').next()`, so a program's kind
     // was a substring the producer wrote and this side parsed back out — a typo was a runtime refusal
@@ -136,16 +141,9 @@ pub fn lower(
         // ⭐ THE KV WRITE'S HARDWARE SCATTER — the step's K and V rows written into their pools
         // through the write-rows table (`lk::paged_kv_write`, the vendor's `test_scatter_1core`).
         Program::PagedKvWrite => lk::paged_kv_write(name, k, &r, sym_id_base, layout),
-        // ⛔ NOT PORTED: the paged attention's card lowering (its page gathers in the walk loop) does
-        // not exist yet — see `Program::has_card_lowering`. Refused by name, so a card build stops
-        // here.
-        Program::PagedAttn => Err(Error {
-            message: format!(
-                "{name}: {:?} has no SuperDSC lowering — the paged attention runs as KTIR on the \
-                 emulator; its card lowering (page gathers and the KV scatter) is not ported",
-                k.program
-            ),
-        }),
+        // ⭐ THE PAGE WALK — its block body built once at trip 0 and marked for the card's per-trip
+        // relaunch (`whole_function::lower_walk`). Reached above, before the top-level reading.
+        Program::PagedAttn => lower_walk(k, layout, sym_id_base),
         // ⭐ THE CHAINED HEAD'S ROW PRODUCTION — the same no-door-to-cross shape as the
         // transpose: the three legs (slab gather, restickify transpose, row gather) are
         // parameterised by the extents its own regions state. See [`lk::embed_row_gather`]

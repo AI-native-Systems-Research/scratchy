@@ -1011,6 +1011,18 @@ enum Lowering {
     /// never lowers, exactly as before. See [`int_binary`] for the card form (leg B1) and the
     /// shapes it refuses.
     IntBinary(IntBinary),
+    /// `tile <min|max> <splatted constant>` — `ScalarMul`'s tiebreak for the binaries whose other
+    /// side is a constant (the walk's `min(tile_max - scores_max, 0)` clamp): the constant is the
+    /// registry's bound `[1,1]` const, sprayed over the tile exactly as a scalar multiplier is.
+    ScalarBinary(Elementwise, f32),
+    /// `linalg.batch_matmul` `[b, m, k] × [b, k, n] → [b, m, n]` — one 2-D contraction per batch,
+    /// each over its batch's rows of the flat-frame A and output and its batch's own `[k, n]`
+    /// kernel block. See [`super::lower_ktir_to_superdsc::batch_matmul`].
+    BatchMatmul { batch: u32 },
+    /// A rank-3 `linalg.transpose` `[b, r, c] → [b, c, r]` — one 2-D transpose per batch, whose
+    /// output blocks are the `[k, n]` kernels a batched contraction reads. See
+    /// [`super::lower_ktir_to_superdsc::batch_transpose`].
+    BatchTranspose { batch: u32 },
 }
 
 /// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole function.
@@ -3070,6 +3082,9 @@ pub fn staggered_sources(
             }
             Lowering::Node(Program::Transpose) => 1,
             Lowering::IntBinary(_) => 2,
+            Lowering::ScalarBinary(..) => 1,
+            Lowering::BatchMatmul { .. } => 2,
+            Lowering::BatchTranspose { .. } => 1,
             Lowering::Node(_) => op.operands.len(),
         };
         let raw_in: Vec<Ssa> = match (terminal, scalar, bound_scale) {
@@ -3247,6 +3262,39 @@ pub fn lower_function(
     sym_id_base: &mut i64,
     headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
 ) -> Result<Vec<super::EmittedOp>, Error> {
+    lower_function_folded(k, layout, sym_id_base, headmajor, None)
+}
+
+/// ⭐ A PROGRAM THAT WALKS — one constant-trip `scf.for`, the paged attention's page walk — through
+/// the SAME per-op walk as every straight-line program: [`super::loop_fold::flatten`] states the
+/// body inline at trip 0, the walk lowers it op by op, and the ops the body emitted are marked as the
+/// walk's ([`super::EmittedOp::walk`]) — the descriptors the card relaunches once per trip. The
+/// loop-carried values are buffers seeded before the walk with the values the program initialises
+/// them to and overwritten by each trip's yielded values.
+///
+/// A ONE-TRIP walk states no loop at all — the front end promotes it to its body (MLIR's
+/// `SimplifyTrivialLoops`), the carried values read as their splatted inits — and lowers as the
+/// straight-line program it is.
+pub fn lower_walk(
+    k: &KtirNode,
+    layout: Option<&BundleLayout>,
+    sym_id_base: &mut i64,
+) -> Result<Vec<super::EmittedOp>, Error> {
+    match super::loop_fold::flatten(k)? {
+        Some(flat) => {
+            lower_function_folded(&flat.node, layout, sym_id_base, None, Some(&flat.fold))
+        }
+        None => lower_function_folded(k, layout, sym_id_base, None, None),
+    }
+}
+
+fn lower_function_folded(
+    k: &KtirNode,
+    layout: Option<&BundleLayout>,
+    sym_id_base: &mut i64,
+    headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
+    fold: Option<&super::loop_fold::LoopFold>,
+) -> Result<Vec<super::EmittedOp>, Error> {
     let f = &k.func;
     let mut out = Vec::new();
     let mut lowered = 0usize;
@@ -3360,7 +3408,118 @@ pub fn lower_function(
     // disagree about which integer op is data.
     let int_compute = integer_compute_of(f);
 
-    for op in f.operations.iter() {
+    // ⭐⭐⭐ THE WALK'S CARRIED STATE — one buffer per `iter_args` value, read by every trip and
+    // overwritten by its yielded value (see [`super::loop_fold`]). Minted HERE, before any op, and
+    // SEEDED with the value the program initialises it to; the loop's result names the same buffer,
+    // so the ops after the walk read it directly. A value framed per row of a reduction (the running
+    // max and sum: the shape of a `linalg.reduce` result) is the `[numel, 1]` column the reduction
+    // writes; anything else is its flat frame.
+    let mut yield_target: std::collections::HashMap<Ssa, (Ssa, Region)> =
+        std::collections::HashMap::new();
+    if let Some(fold) = fold {
+        let Some(layout) = layout else {
+            return err(format!(
+                "{}: a walk's carried state needs a `BundleLayout` to hold its buffers",
+                f.name
+            ));
+        };
+        let def_of = |v: Ssa| f.operations.iter().find(|o| o.result == Some(v));
+        for c in &fold.carried {
+            let init = def_of(c.init);
+            let dims: Vec<i64> = init
+                .and_then(|o| o.result_type)
+                .and_then(|t| t.dims())
+                .map(<[i64]>::to_vec)
+                .unwrap_or_default();
+            if dims.is_empty() {
+                return err(format!(
+                    "{}: the walk's carried value %{} states no shaped init",
+                    f.name, c.arg.0
+                ));
+            }
+            let frame = value_frame(f, &dims);
+            let tid = mint_inter(k, layout, floor, c.arg);
+            layout.synth(crate::place::PlaceId::Act(tid), &frame);
+            let r = Region {
+                tid,
+                v_rows: frame[0],
+                v_cols: frame[1],
+                r_start: 0,
+                c_start: 0,
+                r_len: frame[0],
+                c_len: frame[1],
+                r_cover: (0, frame[0]),
+                c_cover: (0, frame[1]),
+                is_out: false,
+                is_fp8: false,
+                band: None,
+            };
+            inter.insert(c.arg, r);
+            inter.insert(c.result, r);
+            yield_target.insert(c.yielded, (c.arg, r));
+            out.extend(super::lower_ktir_to_superdsc::fill(
+                f.name,
+                c.seed,
+                &Region { is_out: true, ..r },
+                sym_id_base,
+                Some(layout),
+            )?);
+        }
+    }
+    // The ops the walk's body stated — a contiguous run of the flattened program — and where the
+    // descriptors they emit start and end.
+    let body_at: Option<(usize, usize)> = fold.and_then(|fd| {
+        let at: Vec<usize> = f
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.result.is_some_and(|r| fd.body.contains(&r)))
+            .map(|(i, _)| i)
+            .collect();
+        Some((*at.first()?, *at.last()? + 1))
+    });
+    let mut body_out: (usize, Option<usize>) = (0, None);
+    // A carried buffer may take its yielded value's write only once nothing later reads the value it
+    // holds: the last op reading each carried arg, by position.
+    let last_read = |arg: Ssa| -> Option<usize> {
+        f.operations.iter().rposition(|o| o.operands.contains(&arg))
+    };
+    // The buffers a batched transpose wrote as `[k, n]` blocks — the kernels a batched contraction
+    // may read as blocks (a one-stick-wide flat frame is the same bytes, and anything else is not).
+    let mut kernel_blocks: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    for (oi, op) in f.operations.iter().enumerate() {
+        if let Some((start, end)) = body_at {
+            if oi == start {
+                // ⭐⭐⭐ THE BODY READS NO REGISTRY CONSTANT. A relaunch shifts the segment the step's
+                // sources live in — the activation segment, where the registry's bound consts live
+                // too — so a scalar read in the body would land a trip's step past its constant. Every
+                // splatted constant the body reads as an operand is a BUFFER instead, filled ONCE
+                // here, before the body's descriptors begin, and read dense on every trip.
+                for o in &f.operations[start..end] {
+                    for v in dense_splat_operands(f, o) {
+                        if inter.contains_key(&v) {
+                            continue;
+                        }
+                        if let Some((r, value)) = splat_buffer(k, layout, floor, v)? {
+                            out.extend(super::lower_ktir_to_superdsc::fill(
+                                f.name,
+                                value,
+                                &r,
+                                sym_id_base,
+                                layout,
+                            )?);
+                            inter.insert(v, Region { is_out: false, ..r });
+                        }
+                    }
+                }
+                body_out.0 = out.len();
+            }
+            if oi == end {
+                body_out.1 = Some(out.len());
+            }
+        }
+        let in_body = body_at.is_some_and(|(start, end)| (start..end).contains(&oi));
         // ⭐ THE ONE `is_plumbing` EXEMPTION: an integer arith op [`integer_compute_of`] classified
         // as COMPUTE is data, not addressing, and lowers through [`Lowering::IntBinary`] below.
         // Every other plumbing op — including every integer op of every kernel that bakes today,
@@ -3393,6 +3552,105 @@ pub fn lower_function(
         }) {
             continue;
         }
+        // ⭐⭐⭐ A SHAPE OP THAT MOVES NO BYTE NAMES ITS SOURCE'S BUFFER — a `tensor.reshape`,
+        // `collapse_shape` or `expand_shape` whose source and result frames are the same card bytes
+        // ([`same_card_bytes`]) lowers to nothing, and its result is its source's region. A shape op
+        // that WOULD move bytes is a relayout this door does not state, and is refused by name.
+        //
+        // ⭐ A GATHERED LOAD REACHING ONE IS MATERIALIZED FIRST — the page gather: the load's one
+        // index entry selects a whole slab of the paged value (a pool page, every kv head of it), so
+        // its rows reach a consumer only through a contiguous scratch the gathered copy fills
+        // ([`super::lower_ktir_to_superdsc::page_gather`]), and the shape op names that scratch.
+        if matches!(
+            op.op_type,
+            OpKind::TensorReshape | OpKind::TensorCollapseShape | OpKind::TensorExpandShape
+        ) && let (Some(res), Some(&src)) = (op.result, op.operands.first())
+        {
+            let def_dims = |v: Ssa| -> Vec<i64> {
+                f.operations
+                    .iter()
+                    .find(|o| o.result == Some(v))
+                    .and_then(|o| o.result_type)
+                    .and_then(|t| t.dims())
+                    .map(<[i64]>::to_vec)
+                    .unwrap_or_default()
+            };
+            let (mut from, to) = (def_dims(src), def_dims(res));
+            // A GATHERED source is held as the page gather lands it — one-stick sub-rows, its
+            // slabs' own row-major bytes — whatever shape the load states.
+            let stick = i64::from(crate::work::FP16_ELEMS_PER_STICK);
+            let numel: i64 = from.iter().product();
+            if gathered_loads.contains_key(&src) && numel % stick == 0 {
+                from = vec![numel / stick, stick];
+            }
+            if !same_card_bytes(&from, &to) {
+                return err(format!(
+                    "{}: `{:?}` re-frames {from:?} as {to:?}, which moves bytes on the card (the \
+                     two stick-major frames place an element at different addresses) — a \
+                     relayout this door does not state",
+                    f.name, op.op_type
+                ));
+            }
+            let source = match gathered_loads.get(&src) {
+                Some(&gi) => {
+                    let Some(layout) = layout else {
+                        return err(format!(
+                            "{}: a page gather needs a `BundleLayout` to hold its scratch",
+                            f.name
+                        ));
+                    };
+                    let (g, page_sticks) = page_gather_of(f, gathers[gi])?;
+                    let [rows, cols] = flat_frame(&from);
+                    if cols != crate::work::FP16_ELEMS_PER_STICK {
+                        return err(format!(
+                            "{}: a page gather's rows are {cols} wide — the gathered copy lands \
+                             a slab as one-stick sub-rows, the stick-major frame its consumers \
+                             read only at one stick",
+                            f.name
+                        ));
+                    }
+                    let tid = mint_inter(k, layout, floor, src);
+                    layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
+                    let r = Region {
+                        tid,
+                        v_rows: rows,
+                        v_cols: cols,
+                        r_start: 0,
+                        c_start: 0,
+                        r_len: rows,
+                        c_len: cols,
+                        r_cover: (0, rows),
+                        c_cover: (0, cols),
+                        is_out: true,
+                        is_fp8: false,
+                        band: None,
+                    };
+                    out.extend(super::lower_ktir_to_superdsc::page_gather(
+                        f.name,
+                        &g,
+                        page_sticks,
+                        &r,
+                        sym_id_base,
+                        Some(layout),
+                    )?);
+                    gather_carried[gi] = true;
+                    let r = Region { is_out: false, ..r };
+                    inter.insert(src, r);
+                    r
+                }
+                None => match region_for_operand(k, src)?.or_else(|| inter.get(&src).copied()) {
+                    Some(r) => Region { is_out: false, ..r },
+                    None => {
+                        return err(format!(
+                            "{}: `{:?}` re-frames a value this walk holds no buffer for",
+                            f.name, op.op_type
+                        ));
+                    }
+                },
+            };
+            inter.insert(res, source);
+            continue;
+        }
         // The terminal — the `up` multiply for the fused form, the divide itself for a bare one —
         // IS the fused program, and its inputs are the chain's gate and up rather than its own
         // operands (which are `silu(gate)` and up). Everything else keeps the 1:1 map exactly as
@@ -3412,7 +3670,10 @@ pub fn lower_function(
         // `Elementwise(Mul)` and then fail on the splat operand having no `Region`.
         let scalar = (op.op_type == OpKind::ArithMulf)
             .then(|| splat_scale_of(f, op))
-            .flatten();
+            .flatten()
+            // A constant beside a BROADCAST operand has no scalar form: the multiply is two sprays,
+            // so the splat is materialized and the op runs as its own elementwise kind.
+            .filter(|(_, t)| !in_body && !bcasts.contains_key(t));
         // ⭐ RUNG 3: a mulf by a splat of a LOADED `[1,1]` PARAMETER is the SAME tiebreak with the
         // multiplier bound at launch rather than baked. `to_ktir`'s `expand_splat_of_scalar_argument`
         // emits the `[1,1]` view/tile/load chain for a scalar argument and re-points its splat at the
@@ -3464,6 +3725,51 @@ pub fn lower_function(
             }
             _ => None,
         };
+        // `x min c` / `x max c` with `c` a splatted constant — the tiebreak `splat_scale_of` states
+        // for a multiply, applied to the two binaries whose constant side the device reads the same
+        // way (a bound `[1,1]` const sprayed over the tile).
+        let scalar_binary = match op.op_type {
+            OpKind::ArithMinnumf => Some(Elementwise::Minimum),
+            OpKind::ArithMaxnumf => Some(Elementwise::Maximum),
+            _ => None,
+        }
+        .and_then(|e| splat_scale_of(f, op).map(|(v, t)| (e, v, t)))
+        .filter(|(_, _, t)| !in_body && !bcasts.contains_key(t));
+        // THE BATCHED KINDS — a rank-3 `linalg.batch_matmul`, and a rank-3 `linalg.transpose` that
+        // swaps the two trailing axes: the batch is the leading extent of the result type.
+        let rank3_batch = || match op.result_type {
+            Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 3 => {
+                u32::try_from(dims[0]).ok()
+            }
+            _ => None,
+        };
+        let batched = match op.op_type {
+            OpKind::LinalgBatchMatmul => {
+                let Some(batch) = rank3_batch() else {
+                    return err(format!(
+                        "{}: a `linalg.batch_matmul` whose result is not a rank-3 `[b, m, n]` tensor",
+                        f.name
+                    ));
+                };
+                Some(Lowering::BatchMatmul { batch })
+            }
+            OpKind::LinalgTranspose if rank3_batch().is_some() => {
+                let perm = op.attributes.iter().find_map(|(k, v)| match (k, v) {
+                    (AttrKey::Permutation, Attr::IntList(p)) => Some(*p),
+                    _ => None,
+                });
+                if perm != Some(&[0, 2, 1][..]) {
+                    return err(format!(
+                        "{}: a rank-3 `linalg.transpose` with permutation {perm:?} — the batched \
+                         transpose this door lowers keeps the batch axis and swaps the two trailing \
+                         ones (`[0, 2, 1]`)",
+                        f.name
+                    ));
+                }
+                rank3_batch().map(|batch| Lowering::BatchTranspose { batch })
+            }
+            _ => None,
+        };
         let Some(program) = terminal
             .map(|c| {
                 if c.up.is_some() {
@@ -3483,6 +3789,8 @@ pub fn lower_function(
             .or(equal.map(|_| Lowering::Node(Program::Elementwise(Elementwise::Equal))))
             .or(convert.map(Lowering::Convert))
             .or(int_binary)
+            .or(scalar_binary.map(|(e, v, _)| Lowering::ScalarBinary(e, v)))
+            .or(batched)
             .or_else(|| program_of(op.op_type).map(Lowering::Node))
         else {
             return err(format!(
@@ -3540,6 +3848,11 @@ pub fn lower_function(
                 }
             }
             Lowering::Node(Program::Transpose) => 1,
+            // The constant side rides the op as a bound `[1,1]` const, like a scalar multiplier's.
+            Lowering::ScalarBinary(..) => 1,
+            // A batched contraction's `outs` init is no input, exactly as the 2-D one's.
+            Lowering::BatchMatmul { .. } => 2,
+            Lowering::BatchTranspose { .. } => 1,
             Lowering::Node(_) => op.operands.len(),
         };
 
@@ -3570,6 +3883,10 @@ pub fn lower_function(
             // RUNG 3: same rule, the splat's other side. The bound scale is a `[1,1]` parameter, not
             // an operand of the descriptor.
             (None, None, Some(b)) => vec![b.tensor],
+            // A splatted-constant binary's tensor side, wherever the splat sits.
+            (None, None, None) if scalar_binary.is_some() => {
+                vec![scalar_binary.expect("just matched").2]
+            }
             (None, None, None) => op.operands.iter().copied().take(n_in).collect(),
         };
 
@@ -3665,16 +3982,35 @@ pub fn lower_function(
                         per_op.push(present(*r)?);
                         from_parameter.push(false);
                     }
-                    None => {
-                        return err(format!(
-                            "{}: `{:?}` input {i} is neither a load of a parameter nor an \
-                             intermediate this function produced — so it is a constant (a \
-                             `tensor.splat`). `Program::ScalarMul` is the door for \"times a stated \
-                             constant\" and choosing it here would pick a node kind for the \
-                             producer, so it is refused instead",
-                            f.name, op.op_type
-                        ));
-                    }
+                    // ⭐ A SPLATTED CONSTANT READ AS A DENSE OPERAND IS A BUFFER OF ITS ONE VALUE —
+                    // `tensor.splat`'s own lowering: minted at the splat's frame and filled from the
+                    // registry's bound const ([`super::lower_ktir_to_superdsc::fill`]). The op that
+                    // reads it keeps its own kind; only a multiply/min/max beside a dense tensor
+                    // reads its constant side as a scalar instead (`ScalarMul`, `ScalarBinary`).
+                    None => match splat_buffer(k, layout, floor, *v)? {
+                        Some((r, value)) => {
+                            out.extend(super::lower_ktir_to_superdsc::fill(
+                                f.name,
+                                value,
+                                &r,
+                                sym_id_base,
+                                layout,
+                            )?);
+                            let r = Region { is_out: false, ..r };
+                            inter.insert(*v, r);
+                            per_op.push(present(r)?);
+                            from_parameter.push(false);
+                        }
+                        None => {
+                            return err(format!(
+                                "{}: `{:?}` input {i} is neither a load of a parameter nor an \
+                                 intermediate this function produced, nor a splatted float \
+                                 constant (a splat of anything else names no one value to \
+                                 fill)",
+                                f.name, op.op_type
+                            ));
+                        }
+                    },
                 },
             }
         }
@@ -3961,11 +4297,37 @@ pub fn lower_function(
             transposed_b_is_placeable(f.name, b, b_from_parameter)?;
         }
 
-        // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result.
-        let mut stored = f
-            .operations
-            .iter()
-            .find(|s| s.op_type == OpKind::KtdpStore && s.operands.first().copied() == op.result);
+        // ⛔ A BATCHED CONTRACTION READS ITS KERNEL AS PER-BATCH `[k, n]` BLOCKS — written so by a
+        // batched transpose, or a one-stick-wide flat frame (the same bytes). Any other kernel's
+        // flat frame interleaves the batches stick by stick, and no base offset names one block.
+        if let Lowering::BatchMatmul { .. } = program
+            && let Some(w) = per_op.get(1)
+            && !(kernel_blocks.contains(&w.tid) || w.c_len == crate::work::FP16_ELEMS_PER_STICK)
+        {
+            return err(format!(
+                "{}: a batched contraction's kernel t{} is a `[{}, {}]` flat frame no batched \
+                 transpose wrote — its batches' `[k, n]` blocks are not contiguous runs of it",
+                f.name, w.tid, w.v_rows, w.v_cols
+            ));
+        }
+        // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result — directly, or
+        // through a shape op that moves no byte (the walk's `[NKVH, ROWS, HD]` result stored as the
+        // `[NQH, MQ, HD]` the output view states).
+        let stores_of = |v: Option<Ssa>| {
+            f.operations
+                .iter()
+                .find(|s| s.op_type == OpKind::KtdpStore && s.operands.first().copied() == v)
+        };
+        let mut stored = stores_of(op.result).or_else(|| {
+            let res = op.result?;
+            let shape = f.operations.iter().find(|o| {
+                matches!(
+                    o.op_type,
+                    OpKind::TensorReshape | OpKind::TensorCollapseShape | OpKind::TensorExpandShape
+                ) && o.operands.first() == Some(&res)
+            })?;
+            stores_of(shape.result)
+        });
         // ⭐⭐⭐ THE fp8 WEIGHT-SCALE EPILOGUE, ABSORBED AT THE DOT. `matmul_fp8.py` spells the W8A8
         // contraction's scale multiply IN THE KERNEL — `p * ws` between the dot and the store — so
         // the dot's result is never stored directly: without this arm the walk would mint it an
@@ -4090,7 +4452,25 @@ pub fn lower_function(
                     f.name, op.op_type
                 ));
             };
+            // ⭐⭐⭐ A PER-ROW SCALAR OF A RANK-N TILE IS A COLUMN — a reduction over a rank-N
+            // tile's last axis writes one value per row of its `[rows, cols]` flat frame, i.e. the
+            // `[rows, 1]` column `assemble_reduce_seeded` writes, whatever rank the program states
+            // it at (`[B, G]` for a `[B, G, PS]` tile); and a pointwise op over such a column (the
+            // running max's `max`, the rescale's `exp`) keeps it one. Framed `[numel, 1]`, not the
+            // stated shape's own `[B, G]`, which would be a different stick per row.
+            let numel: Option<i64> = op
+                .result_type
+                .and_then(|t| t.dims())
+                .filter(|d| d.len() >= 2)
+                .map(|d| d.iter().product());
+            let per_row_scalar = numel.is_some_and(|n| {
+                matches!(program, Lowering::Reduce(_))
+                    || per_op
+                        .iter()
+                        .any(|r| !r.is_out && r.c_len == 1 && i64::from(r.r_len) == n)
+            });
             let dims = match op.result_type {
+                _ if per_row_scalar => [numel.expect("just checked") as u32, 1],
                 Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 2 => {
                     [dims[0] as u32, dims[1] as u32]
                 }
@@ -4150,7 +4530,15 @@ pub fn lower_function(
             // whose every input is a minted band intermediate states no windowed input; its mint
             // stays at the tile and the extents law refuses the sweep mismatch by name — refused
             // at the op that could have extended it, not silently mis-sized.)
-            let dims = [band_rows_of(&per_op, dims[0]), dims[1]];
+            // A BROADCAST operand's window is the vector it sprays, never the op's sweep (the walk's
+            // mask tile, `[ROWS, BLOCK]` of the stack, sprayed over every kv head's rows).
+            let swept: Vec<Region> = per_op
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| bcast_axes.get(*i).is_none_or(Option::is_none))
+                .map(|(_, r)| *r)
+                .collect();
+            let dims = [band_rows_of(&swept, dims[0]), dims[1]];
             let Some(layout) = layout else {
                 return err(format!(
                     "{}: `{:?}`'s result is an intermediate, which needs a `BundleLayout` to hold \
@@ -4158,7 +4546,29 @@ pub fn lower_function(
                     f.name, op.op_type
                 ));
             };
-            let tid = mint_inter(k, layout, floor, res);
+            // ⭐ A WALK'S YIELDED VALUE IS WRITTEN INTO ITS CARRIED BUFFER — the next trip reads it
+            // there — once nothing later in the body reads the value the buffer still holds.
+            let carried = yield_target.get(&res).copied();
+            if let Some((arg, target)) = carried {
+                if [target.v_rows, target.v_cols] != dims {
+                    return err(format!(
+                        "{}: the walk yields a `[{}, {}]` value into a carried `[{}, {}]` buffer",
+                        f.name, dims[0], dims[1], target.v_rows, target.v_cols
+                    ));
+                }
+                if last_read(arg).is_some_and(|last| last > oi) {
+                    return err(format!(
+                        "{}: the walk's carried %{} is read after the op that writes its next \
+                         value — the card holds ONE buffer per carried value, so the program must \
+                         read the old value before it computes the new one",
+                        f.name, arg.0
+                    ));
+                }
+            }
+            let tid = match carried {
+                Some((_, target)) => target.tid,
+                None => mint_inter(k, layout, floor, res),
+            };
             // ⛔⛔⛔ A MATMUL'S INTERMEDIATE IS RESERVED AT ITS **DEVICE** WIDTH, NOT THE LOGICAL
             // SHAPE — everything else keeps the logical dims.
             //
@@ -4229,7 +4639,9 @@ pub fn lower_function(
             // refuse the first over-run, or without it the next intermediate would be aliased.
             // `synth_df` reserves the true width, the same fact `pointwise_broadcast_opspec_df`
             // threads into the descriptors.
-            layout.synth_df(crate::place::PlaceId::Act(tid), &dev_dims, op_df);
+            if carried.is_none() {
+                layout.synth_df(crate::place::PlaceId::Act(tid), &dev_dims, op_df);
+            }
             // ⭐⭐⭐ THE BAND PROPAGATES THROUGH THE MINT — a banded op's intermediate is a
             // banded operand of the NEXT op. The minted region states the band its inputs
             // stated (`band_of` refuses a disagreement), so a chain of ops over a flush band
@@ -4269,6 +4681,9 @@ pub fn lower_function(
                 },
             )?;
             out.append(&mut emitted);
+            if let Lowering::BatchTranspose { .. } = program {
+                kernel_blocks.insert(r.tid);
+            }
             lowered += 1;
             continue;
         };
@@ -4389,7 +4804,255 @@ pub fn lower_function(
             ));
         }
     }
+    // ⭐⭐⭐ THE WALK'S BODY, MARKED — every descriptor the body's ops emitted is relaunched once per
+    // trip ([`super::EmittedOp::walk`]), its gathers resolved through the index the trip's shift
+    // points at (`kv_gathered`) and the run kept whole as one fold (`kv_page_fold`): a fold cut into
+    // two groups would run every trip of the first before the second, reading the scratch the first
+    // left behind.
+    if let (Some(fold), Some(_)) = (fold, body_at) {
+        let end = body_out.1.unwrap_or(out.len());
+        let trips = super::loop_fold::WalkTrips {
+            trips: fold.trips,
+            step_bytes: fold.step_bytes,
+        };
+        for e in &mut out[body_out.0..end] {
+            e.walk = Some(trips);
+            e.kv_page_fold = true;
+            e.kv_gathered = true;
+        }
+    }
     Ok(out)
+}
+
+/// THE FRAME A VALUE OF `dims` IS HELD IN: a per-row scalar of a reduction — a value shaped as a
+/// `linalg.reduce` result of this function, the running max and sum — is the `[numel, 1]` column the
+/// reduction writes; anything else is its flat frame.
+fn value_frame(f: &IRFunction<'static>, dims: &[i64]) -> [u32; 2] {
+    let per_row = f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::LinalgReduce)
+        .filter_map(|o| o.result_type.and_then(|t| t.dims()))
+        .any(|d| d == dims);
+    if per_row {
+        [dims.iter().product::<i64>() as u32, 1]
+    } else {
+        flat_frame(dims)
+    }
+}
+
+/// The values of the splatted constants the walk MATERIALIZES — a splat read as a dense operand of a
+/// binary op ([`splat_buffer`]), the registry constants its fills read. A splat a multiply, `min` or
+/// `max` reads beside a dense tensor is a scalar operand instead (`ScalarMul`, `ScalarBinary`), and a
+/// contraction's or reduction's init is the op's own seed; neither is materialized.
+pub fn splat_fill_values(f: &IRFunction<'static>) -> Result<Vec<f32>, Error> {
+    let (bcasts, _) = program_broadcast_chains(f)?;
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let splat_value = |s: Ssa| -> Option<f32> {
+        let sp = def_of(s).filter(|o| o.op_type == OpKind::TensorSplat)?;
+        let c = def_of(*sp.operands.first()?).filter(|o| o.op_type == OpKind::ArithConstant)?;
+        c.attributes.iter().find_map(|(k, v)| match (k, v) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x as f32),
+            _ => None,
+        })
+    };
+    let mut out: Vec<f32> = Vec::new();
+    for op in f.operations.iter() {
+        let scalar_side = matches!(
+            op.op_type,
+            OpKind::ArithMulf | OpKind::ArithMinnumf | OpKind::ArithMaxnumf
+        );
+        let binary = scalar_side
+            || matches!(
+                op.op_type,
+                OpKind::ArithAddf | OpKind::ArithSubf | OpKind::ArithDivf
+            );
+        let [a, b] = op.operands[..] else { continue };
+        if !binary {
+            continue;
+        }
+        for (x, other) in [(a, b), (b, a)] {
+            let Some(v) = splat_value(x) else { continue };
+            let absorbed =
+                scalar_side && splat_value(other).is_none() && !bcasts.contains_key(&other);
+            if !absorbed && !out.iter().any(|y| y.to_bits() == v.to_bits()) {
+                out.push(v);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The splatted float constants a binary float op reads as OPERANDS — the values the walk's body
+/// materializes before its descriptors begin. A contraction's `outs` and a reduction's init are not
+/// among them: those are the op's own seeds, never read as data.
+fn dense_splat_operands(f: &IRFunction<'static>, o: &Operation<'static>) -> Vec<Ssa> {
+    if !matches!(
+        o.op_type,
+        OpKind::ArithAddf
+            | OpKind::ArithSubf
+            | OpKind::ArithMulf
+            | OpKind::ArithDivf
+            | OpKind::ArithMinnumf
+            | OpKind::ArithMaxnumf
+    ) {
+        return Vec::new();
+    }
+    let def_of = |s: Ssa| f.operations.iter().find(|x| x.result == Some(s));
+    o.operands
+        .iter()
+        .copied()
+        .filter(|v| {
+            def_of(*v).is_some_and(|sp| {
+                sp.op_type == OpKind::TensorSplat
+                    && sp
+                        .operands
+                        .first()
+                        .and_then(|c| def_of(*c))
+                        .is_some_and(|c| {
+                            c.op_type == OpKind::ArithConstant
+                                && c.attributes.iter().any(|(k, a)| {
+                                    *k == AttrKey::Value && matches!(a, Attr::Float(_))
+                                })
+                        })
+            })
+        })
+        .collect()
+}
+
+/// A splatted float constant's BUFFER — minted at its frame ([`value_frame`]) and declared to the
+/// layout, with the value it holds — or `None` when `v` is not a `tensor.splat` of a float constant.
+fn splat_buffer(
+    k: &KtirNode,
+    layout: Option<&BundleLayout>,
+    floor: u32,
+    v: Ssa,
+) -> Result<Option<(Region, f32)>, Error> {
+    let f = &k.func;
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let Some(splat) = def_of(v).filter(|o| o.op_type == OpKind::TensorSplat) else {
+        return Ok(None);
+    };
+    let value = splat
+        .operands
+        .first()
+        .and_then(|c| def_of(*c))
+        .filter(|o| o.op_type == OpKind::ArithConstant)
+        .and_then(|o| {
+            o.attributes.iter().find_map(|(k, a)| match (k, a) {
+                (AttrKey::Value, Attr::Float(x)) => Some(*x as f32),
+                _ => None,
+            })
+        });
+    let (Some(value), Some(dims)) = (value, splat.result_type.and_then(|t| t.dims())) else {
+        return Ok(None);
+    };
+    let Some(layout) = layout else {
+        return err(format!(
+            "{}: a splatted constant read as a dense operand needs a `BundleLayout` to hold its \
+             buffer",
+            f.name
+        ));
+    };
+    let [rows, cols] = value_frame(f, dims);
+    let tid = mint_inter(k, layout, floor, v);
+    layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
+    Ok(Some((
+        Region {
+            tid,
+            v_rows: rows,
+            v_cols: cols,
+            r_start: 0,
+            c_start: 0,
+            r_len: rows,
+            c_len: cols,
+            r_cover: (0, rows),
+            c_cover: (0, cols),
+            is_out: true,
+            is_fp8: false,
+            band: None,
+        },
+        value,
+    )))
+}
+
+/// A value's FLAT FRAME — every axis but the last folded into rows ([`shape_2d`]'s reading).
+fn flat_frame(dims: &[i64]) -> [u32; 2] {
+    match dims {
+        [] => [1, 1],
+        [c] => [1, *c as u32],
+        [lead @ .., c] => [lead.iter().product::<i64>() as u32, *c as u32],
+    }
+}
+
+/// Whether two shapes of one value are the SAME BYTES on the card: every element at the same address
+/// in both stick-major flat frames (`(c / stick)·(rows·stick) + r·stick + c % stick`, a row padded to
+/// whole sticks). True for equal frames, and for a re-framing that keeps every row one stick wide or
+/// moves rows within one row of sticks; false — a relayout — otherwise.
+fn same_card_bytes(from: &[i64], to: &[i64]) -> bool {
+    if from.iter().product::<i64>() != to.iter().product::<i64>() {
+        return false;
+    }
+    let (a, b) = (flat_frame(from), flat_frame(to));
+    if a == b {
+        return true;
+    }
+    let stick = crate::work::FP16_ELEMS_PER_STICK as u64;
+    let addr = |[rows, cols]: [u32; 2], e: u64| -> u64 {
+        let (r, c) = (e / cols as u64, e % cols as u64);
+        (c / stick) * (rows as u64 * stick) + r * stick + c % stick
+    };
+    let numel: u64 = from.iter().product::<i64>() as u64;
+    (0..numel).all(|e| addr(a, e) == addr(b, e))
+}
+
+/// A PAGE gather, read off its indirect tile: the tile's indirect dim enumerates `entries` index
+/// words, and each selects one contiguous slab — the product of the tile's other extents —
+/// `page_sticks` one-stick sub-rows long. [`gathers_of`] reads every gather as one entry per ROW
+/// (the embedding's row gather); a page gather's tile states fewer entries than rows, and its own
+/// shape says how many.
+fn page_gather_of(f: &IRFunction<'static>, g: Gather) -> Result<(Gather, u32), Error> {
+    let Some(tile) = f.operations.iter().find(|o| o.result == Some(g.tile)) else {
+        return err(format!(
+            "{}: the gather's tile states no defining op",
+            f.name
+        ));
+    };
+    let dims: Vec<i64> = tile
+        .attributes
+        .iter()
+        .find_map(|(k, v)| match (k, v) {
+            (AttrKey::Shape, Attr::IntList(d)) => Some(d.to_vec()),
+            _ => None,
+        })
+        .or_else(|| tile.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec))
+        .unwrap_or_default();
+    let d = match tile.attr(AttrKey::DimKinds) {
+        Some(Attr::StrList(kinds)) => kinds.iter().position(|k| *k == "indirect"),
+        _ => None,
+    };
+    let (Some(d), false) = (d, dims.is_empty()) else {
+        return err(format!(
+            "{}: the gather's tile states no shape or no indirect dim",
+            f.name
+        ));
+    };
+    let entries = dims[d] as u32;
+    let slab: i64 = dims
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != d)
+        .map(|(_, x)| *x)
+        .product();
+    let stick = crate::work::FP16_ELEMS_PER_STICK as i64;
+    if d != 0 || slab % stick != 0 {
+        return err(format!(
+            "{}: a page gather selects whole contiguous slabs along its LEADING dim, each a whole \
+             number of sticks — this tile's indirect dim is {d} and its slab {slab} elements",
+            f.name
+        ));
+    }
+    Ok((Gather { entries, ..g }, (slab / stick) as u32))
 }
 
 /// WHAT ONLY THE WALK CAN STATE about one op. Threaded rather than re-derived, because [`emit_one`]
@@ -4526,6 +5189,34 @@ fn emit_one(
                 kind,
                 per_op,
                 bcast,
+                sym_id_base,
+                layout,
+            );
+        }
+        Lowering::ScalarBinary(e, value) => {
+            return super::lower_ktir_to_superdsc::scalar_binary(
+                name,
+                e,
+                value,
+                per_op,
+                sym_id_base,
+                layout,
+            );
+        }
+        Lowering::BatchMatmul { batch } => {
+            return super::lower_ktir_to_superdsc::batch_matmul(
+                name,
+                batch,
+                per_op,
+                sym_id_base,
+                layout,
+            );
+        }
+        Lowering::BatchTranspose { batch } => {
+            return super::lower_ktir_to_superdsc::batch_transpose(
+                name,
+                batch,
+                per_op,
                 sym_id_base,
                 layout,
             );

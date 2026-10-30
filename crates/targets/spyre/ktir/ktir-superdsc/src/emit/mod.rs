@@ -43,9 +43,12 @@ use std::collections::BTreeMap;
 /// main's `lower_matmul_node` arity-3 branch — the W8A8 fp8 matmul descriptors, reached from the
 /// facts the KTIR states. See its own header.
 pub mod ktir_matmul_fp8;
-/// KTIR → SuperDSC: `ibm/main`'s eight `lower_*_node` bodies with their input door changed. The two
-/// that cross a model-geometry const door ([`lower_ktir_to_superdsc::attn_at`],
-/// [`lower_ktir_to_superdsc::rope_at`]) are public generic entry points the CALLER instantiates.
+/// A PROGRAM THAT WALKS: one constant-trip `scf.for`, its body built once at trip 0 and relaunched
+/// per trip by the card (the paged attention's page walk).
+pub mod loop_fold;
+/// KTIR → SuperDSC: `ibm/main`'s `lower_*_node` bodies with their input door changed. The one that
+/// crosses a model-geometry const door ([`lower_ktir_to_superdsc::rope_at`]) is a public generic
+/// entry point the CALLER instantiates.
 pub mod lower_ktir_to_superdsc;
 /// THE WHOLE-FUNCTION DOOR — walk a multi-op KTIR program in program order and dispatch each
 /// compute op to the per-kind entry point that already lowers it. A producer that hands over a
@@ -2346,6 +2349,11 @@ pub struct EmittedOp {
     /// separate loop body and no state to thread, which is why unbounded context costs no
     /// restructuring.
     pub kv_page_fold: bool,
+    /// ⭐ A WALK'S BLOCK BODY — this descriptor is one of the ops the program's `scf.for` runs per
+    /// trip, built at trip 0 ([`loop_fold`]): the card relaunches it [`loop_fold::WalkTrips::trips`]
+    /// times, shifting the step's sources by [`loop_fold::WalkTrips::step_bytes`] per relaunch.
+    /// `None` for every op outside a walk.
+    pub walk: Option<loop_fold::WalkTrips>,
     /// THIS OP'S KERNEL STEPS ONE REQUEST PER UNIT OF ITS BATCH AXIS, so ONE launch computes every row
     /// of the batch and the fold needs a pass per PAGE rather than per (request, page).
     ///
@@ -2496,6 +2504,7 @@ impl EmittedOp {
             slab_stride_bytes: 0,
             slot_no_fuse: false,
             kv_page_fold: false,
+            walk: None,
             kv_batched_requests: false,
             kv_gathered: false,
             kv_fold_rows: Default::default(),
@@ -2527,6 +2536,7 @@ impl EmittedOp {
             affine_strides: self.affine_strides.clone(),
             slot_stride_bytes: self.slot_stride_bytes,
             kv_page_fold: self.kv_page_fold,
+            walk: self.walk,
             kv_batched_requests: self.kv_batched_requests,
             kv_gathered: self.kv_gathered,
             kv_fold_rows: self.kv_fold_rows,
@@ -2605,6 +2615,7 @@ impl EmittedOp {
             affine_strides,
             slot_stride_bytes: 0,
             kv_page_fold: false,
+            walk: None,
             kv_batched_requests: false,
             kv_gathered: false,
             kv_fold_rows: crate::sdsc_abstract::FoldRowRegime::WholeBatch,
@@ -4414,6 +4425,15 @@ impl<'a, K: KindTag> In<'a, K> {
             y_broadcast: y,
             col_offset: 0,
             col_window: None,
+        }
+    }
+    /// [`y_broadcast`](Self::y_broadcast) PLUS a base `col_offset` — the spray's `[mb, out]` source
+    /// at an element base inside a larger buffer (one stick column of a multi-stick source, the
+    /// window a walk's trip takes of its mask stack).
+    pub fn y_broadcast_at(h: &'a Stk<K>, y: u32, col_offset: crate::addr::DevOff) -> Self {
+        In {
+            col_offset: col_offset.into_raw_elems(),
+            ..Self::y_broadcast(h, y)
         }
     }
     pub fn ew(&self) -> EwOperand<'a> {
