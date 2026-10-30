@@ -86,28 +86,49 @@ pub fn r5_section(
 /// and the endian field left at its default, both per that loop.
 ///
 /// - `sid` is the wdone signal index (the signal is from OUR rank);
-/// - `dest_tid` names the destination peer by BAT index (the vendor's
-///   `dest_ranks[0]` — the tp=2 ring is unicast, one peer);
+/// - `dest_tids` names the destination peer(s) by BAT index — the vendor's
+///   own plural shape (`dest_ranks`), carried plural so the multicast
+///   refusal below can name the fan-out it refused rather than silently
+///   dropping peers;
 /// - `length_bytes` is this chunk's byte length;
 /// - `(src_segment, src_offset_bytes)` is the source device address;
 /// - `dest_remote_base_bytes` is the peer's remote base for this transfer,
 ///   compensation already applied by the caller — the −128 landing law is
 ///   the tp builders' door, not this port's;
-/// - `first`/`last`/`sync`/`xsegv` are the caller's protocol bits, forwarded
-///   verbatim (the laws that govern them — the F-send law above all — are
-///   Rust's, at this door).
+/// - `first`/`last`/`sync` are the caller's protocol bits, forwarded
+///   verbatim;
+/// - `xsegv` must be false at this door — the T-send law below.
+///
+/// The laws are ours, at this door (the shim packs, it never decides):
+///
+/// - **The unicast law**: the tp=2 ring is unicast. An empty `dest_tids`
+///   refuses (a send names the peer it lands on), and more than one
+///   destination refuses as un-ported multicast fan-out — the vendor's
+///   multicast shape (`Rdma12` RDMA_MULTICAST behind per-peer XSEG CBs)
+///   gets no encoder here, per the spec's A.3.
+/// - **The F-send law** (fixture spec D1; failure-to-type catalog 6.2/6.4):
+///   `xsegv=true` refuses. It asks the wire to deliver the CB's xseg word
+///   into the peer's XSEG[SID] table as a T-send preamble — measured on
+///   card as a preamble overwrite that fires +1 with no wait pending
+///   (E8b/H10). The receiver host-programs the table instead:
+///   [`senlib_ffi::write_xseg`] with the same composed word this door's
+///   encoder produces.
+///
+/// The numeric capacity caps (a length the wire cannot encode, a
+/// misaligned length or address, a sid/tid/segment past its field) are
+/// refused at the shim door, by name, never clamped — their bounds live
+/// with the field widths on the C++ side and are not re-stated here.
 ///
 /// The shim composes the xseg word exactly as the vendor loop does; the
 /// finished words are the section object's own bytes — the very bytes
 /// `set_dmo` would copy into a control block.
 ///
 /// # Errors
-/// Returns `Err` with the shim's message on any refused input (a length the
-/// wire cannot encode, a misaligned length or address, a sid/tid/segment
-/// past its field — all by name, never clamped).
+/// Returns `Err` naming the refused law (empty destination, multicast
+/// fan-out, T-send preamble), or the shim's message on any refused input.
 pub fn rdma12_unicast_send(
     sid: u64,
-    dest_tid: u64,
+    dest_tids: &[u64],
     length_bytes: u64,
     src_segment: u64,
     src_offset_bytes: u64,
@@ -117,9 +138,27 @@ pub fn rdma12_unicast_send(
     sync: bool,
     xsegv: bool,
 ) -> Result<[u64; 2], String> {
+    if dest_tids.is_empty() {
+        return Err(
+            "the RDMA send has no destination: dest_tids is empty — a send names the peer it lands on by BAT index"
+                .to_string(),
+        );
+    }
+    if dest_tids.len() != 1 {
+        return Err(format!(
+            "multicast fan-out is un-ported: dest_tids names {} peers — the tp=2 ring is unicast, one destination per send",
+            dest_tids.len()
+        ));
+    }
+    if xsegv {
+        return Err(
+            "the T-send preamble is un-ported (the F-send law): xsegv=true asks the wire to deliver the CB's xseg word into the peer's XSEG table ahead of the payload — measured as a preamble overwrite that fires +1 with no wait pending (E8b/H10). The receiver host-programs the table instead: senlib_ffi::write_xseg with the same composed word the send encoder produces"
+                .to_string(),
+        );
+    }
     senlib_ffi::hal_rdma12_unicast_send_encode(
         sid,
-        dest_tid,
+        dest_tids[0],
         length_bytes,
         src_segment,
         src_offset_bytes,
@@ -135,10 +174,25 @@ pub fn rdma12_unicast_send(
 /// packed by the shim from the wdone sid list (the wait bitmask is composed
 /// inside the shim — which sids to wait on is the caller's law).
 ///
+/// The duplicate law is ours, at this door: the wait list is a SET of sids,
+/// not a sequence — a repeated sid refuses rather than counting twice (the
+/// vendor's own `submitP2PRdmaWait` throws `RDMASrcRankAlreadySet` on a
+/// duplicate rank; we refuse by name instead of panicking past the wire).
+/// The empty-list and per-sid range caps are refused at the shim door, by
+/// name — their bounds live with the mask width on the C++ side and are
+/// not re-stated here.
+///
 /// # Errors
-/// Returns `Err` with the shim's message on any refused input (an empty
-/// list, a sid past the wait mask — by name).
+/// Returns `Err` naming the duplicate sid, or the shim's message on any
+/// refused input (an empty list, a sid past the wait mask — by name).
 pub fn rdma10_wdone_wait(sids: &[u64], sync: bool) -> Result<[u64; 2], String> {
+    for (i, &sid) in sids.iter().enumerate() {
+        if sids[..i].contains(&sid) {
+            return Err(format!(
+                "duplicate sid {sid} in the wdone wait list — the wait is a set of sids, not a sequence"
+            ));
+        }
+    }
     senlib_ffi::hal_rdma10_wdone_wait_encode(sids, sync)
 }
 
@@ -187,5 +241,66 @@ mod tests {
                 assert_ne!(ordinals[i], ordinals[j]);
             }
         }
+    }
+
+    // The refusal doors (B.2's laws). Each test drives ONLY the refusal
+    // path — the law fires before any shim call, so these are pure Rust
+    // and assert our own named messages, never golden bytes.
+
+    /// A send with no destination refuses by name — a send names the peer
+    /// it lands on by BAT index.
+    #[test]
+    fn rdma12_send_refuses_an_empty_destination_list() {
+        let err = rdma12_unicast_send(0, &[], 128, 0, 0, 0, true, true, false, false)
+            .expect_err("an empty dest_tids must refuse");
+        assert!(
+            err.contains("no destination"),
+            "the refusal must name the law, got: {err}"
+        );
+    }
+
+    /// More than one destination refuses as un-ported multicast fan-out —
+    /// the tp=2 ring is unicast, and the vendor's multicast shape gets no
+    /// encoder here.
+    #[test]
+    fn rdma12_send_refuses_multicast_fan_out() {
+        let err = rdma12_unicast_send(0, &[3, 7], 128, 0, 0, 0, true, true, false, false)
+            .expect_err("a two-peer dest_tids must refuse");
+        assert!(
+            err.contains("multicast fan-out is un-ported"),
+            "the refusal must name the law, got: {err}"
+        );
+        assert!(
+            err.contains("2 peers"),
+            "the refusal must name the fan-out it refused, got: {err}"
+        );
+    }
+
+    /// The F-send law: xsegv=true refuses. The T-send preamble is un-ported
+    /// (measured as a preamble overwrite that fires +1 with no wait
+    /// pending); the receiver host-programs the table via write_xseg.
+    #[test]
+    fn rdma12_send_refuses_the_t_send_preamble() {
+        let err = rdma12_unicast_send(0, &[3], 128, 0, 0, 0, true, true, false, true)
+            .expect_err("xsegv=true must refuse");
+        assert!(
+            err.contains("T-send preamble is un-ported"),
+            "the refusal must name the law, got: {err}"
+        );
+        assert!(
+            err.contains("write_xseg"),
+            "the refusal must name the replacement door, got: {err}"
+        );
+    }
+
+    /// The wait list is a set of sids, not a sequence — a repeated sid
+    /// refuses by name rather than counting twice.
+    #[test]
+    fn rdma10_wait_refuses_a_duplicate_sid() {
+        let err = rdma10_wdone_wait(&[5, 1, 5], false).expect_err("a duplicate sid must refuse");
+        assert!(
+            err.contains("duplicate sid 5"),
+            "the refusal must name the duplicate, got: {err}"
+        );
     }
 }
