@@ -153,16 +153,6 @@ pub struct BakeFacts {
     pub uses_identity: bool,
     /// granite ScalarMul multipliers; index `i` is const tid `scalarmul_scale_tid(i)`.
     pub scalarmul_scales: &'static [f32],
-    /// ⭐⭐⭐⭐⭐ The bundle placed `KV_BLOCK_INDEX_TID` — it emitted a GATHERED KV read, so the forward
-    /// tape carries a [`ForwardKernel::KvBlockIndex`](crate::forward_tape::ForwardKernel::KvBlockIndex)
-    /// step and the launch must stage a block table.
-    ///
-    /// Same mechanism and the same reason as [`Self::uses_identity`]: the descriptor half and the
-    /// staging half of a feature must be decided by ONE artifact-derived question, because they fail
-    /// asymmetrically. A step this bundle has no gather for binds bytes nothing reads; a gather with no
-    /// step reads an unstaged index, and an unstaged index is ZERO — a VALID block — so every row
-    /// attends row 0's keys, fluently and wrongly.
-    pub gathers_kv: bool,
 }
 
 impl BakeFacts {
@@ -173,7 +163,6 @@ impl BakeFacts {
         ones_reduce_len: 0,
         uses_identity: false,
         scalarmul_scales: &[],
-        gathers_kv: false,
     };
 
     /// Read them off the generated layout.
@@ -184,7 +173,6 @@ impl BakeFacts {
             uses_ones_reduce: ones.is_some(),
             ones_reduce_len: ones.map_or(0, |p| (p.size / 2) as usize),
             uses_identity: layout.place_of_tid(sd::IDENTITY_TID).is_some(),
-            gathers_kv: layout.place_of_tid(sd::KV_BLOCK_INDEX_TID).is_some(),
             scalarmul_scales: match &layout.scalarmul_scales {
                 std::borrow::Cow::Borrowed(v) => v,
                 // A generated layout is always `Cow::Borrowed`; the owned arm exists for the
@@ -339,85 +327,6 @@ impl Wiring {
         Ok(())
     }
 
-    /// ⭐⭐⭐⭐⭐ THE CAUSAL MASK'S ROW EXTENT vs ITS PLACEMENT — ONCE, AT LOAD.
-    ///
-    /// The placement reserves `nqh · mq · mq_pad` fp16 elements for `ATTN_CAUSAL_TID`
-    /// (`lower_subtile_tape_to_superdsc.rs`, the `cmbytes` law), and the host stages exactly
-    /// `causal_tiled(cmask, mq, mq_pad, nqh)` into it. The row count both halves share is the
-    /// head count — which every host staging site used to DERIVE as `hidden / head_dim`. That
-    /// quotient is the head count only for a SQUARE Q projection (`hidden == nqh·hd`): true of
-    /// granite/llama, false of gemma-4 (production hidden 3840 against nqh·hd 4096/8192; the
-    /// tiny-allglobal fixture's hidden 128 against 4·64). A host staging at the quotient binds
-    /// only that many of the baked `nqh·mq` rows, and `refill_activations`' bind guard refuses
-    /// OVER-binds only — the shortfall is silent, and the ops read the unstaged tail of the
-    /// ADDITIVE mask as ZERO, i.e. as "no mask". MEASURED on the tiny fixture: heads 2-3 of
-    /// every layer ran with no causal mask, heads 0-1 exact.
-    ///
-    /// The fix bakes the count ([`Geometry::nqh`], from the same bounds the tape was lowered
-    /// at). This check is its guard: the placement's byte size must be exactly
-    /// `nqh · mq · score_width · 2`, so a staging shape built on any other head count — the
-    /// quotient, a stale wiring, a different model's geometry — is a load-time refusal instead
-    /// of a silent partial mask. Same shape of check as [`Self::verify_class_placements`], for
-    /// the same reason: the emulator executes the KTIR dialect ops and never reads this tid, so
-    /// nothing on its path can see the disagreement.
-    pub fn verify_causal_placement(
-        &self,
-        layout: &bundle::BundleLayout<'_>,
-        mq: u32,
-        score_width: u32,
-    ) -> Result<(), String> {
-        use crate::lower_subtile_tape_to_superdsc as sd;
-        let nqh = self.geometry.nqh as u64;
-        let want = nqh * mq as u64 * score_width as u64 * 2;
-        match layout.place_of_tid(sd::ATTN_CAUSAL_TID) {
-            Some(p) if p.size == want => Ok(()),
-            Some(p) => Err(format!(
-                "the causal mask (t{}) is placed at {} B, but this wiring's geometry bakes \
-                 {nqh} query head(s) × {mq} row(s) × {score_width} score width = {want} B. The \
-                 host stages `nqh·mq` mask rows; a placement that does not match is a \
-                 wiring/layout desync — and a STAGING at any other head count (the old \
-                 `hidden / head_dim` derivation, right only for a square Q projection) binds \
-                 only part of the placement, which the bind guard cannot see because it \
-                 refuses over-binds only. The unstaged tail of an ADDITIVE mask reads as ZERO, \
-                 i.e. as no mask.",
-                sd::ATTN_CAUSAL_TID,
-                p.size,
-            )),
-            None => Err(format!(
-                "the causal mask (t{}) is nowhere in this layout, but every attention bundle \
-                 places it — the wiring and the layout come from different bakes",
-                sd::ATTN_CAUSAL_TID,
-            )),
-        }
-    }
-
-    /// ⭐ QUERY HEADS PER STAGED CAUSAL-MASK BLOCK for a launch under `key` — the emitter's
-    /// [`NewBlockForm`] law on the three facts the bake keyed it on: the rows, the head dim and
-    /// whether the rows are requests. The key carries the first and the third (a
-    /// [`CausalKey::Batch`]'s rows are requests, a [`CausalKey::Chunk`]'s are one prompt's); the head
-    /// dim and the kv-head count are this wiring's baked geometry, the same the head count is. The
-    /// emitter keyed the form on the program's own head dim, and the chunk form's slab ceiling (≤ 2
-    /// slabs, i.e. head dim ≤ 128) is a UNIFORM model's one head dim — a hybrid-attention arch's every
-    /// class exceeds it, so the sub-block count (`nqh`) is what all of its classes read.
-    ///
-    /// The ONE answer for every staging site — a prompt chunk's launch, a decode step's, and a
-    /// session's load-time staging of its full-chunk mask — so a mask staged at load is blocked the
-    /// way the launch that finds it held would have blocked it.
-    ///
-    /// [`NewBlockForm`]: scratchy_subtile::sdsc_abstract::NewBlockForm
-    /// [`CausalKey::Batch`]: scratchy_subtile::sdsc_abstract::CausalKey::Batch
-    /// [`CausalKey::Chunk`]: scratchy_subtile::sdsc_abstract::CausalKey::Chunk
-    pub fn causal_heads_per_block(&self, key: scratchy_subtile::sdsc_abstract::CausalKey) -> usize {
-        use scratchy_subtile::sdsc_abstract::{CausalKey, NewBlockForm};
-        let g = &self.geometry;
-        let rows_are_requests = matches!(key, CausalKey::Batch { .. });
-        NewBlockForm::of(key.rows() as u32, g.head_dim, rows_are_requests).mask_heads_per_block(
-            g.nqh,
-            g.kv_dim / g.head_dim,
-            g.head_dim,
-        ) as usize
-    }
-
     /// The query-row CAPACITY this bundle was baked at — the embedding activation's placement rows.
     ///
     /// ⛔⛔⛔ THIS IS A CAPACITY, NOT THE ROW COUNT OF A LAUNCH, AND IT IS NOT WHAT THE TAPE
@@ -438,38 +347,25 @@ impl Wiring {
     /// ⭐ EVERY FIELD IS GENERATED DATA. The shape used to be assembled in the worker out of a
     /// `BundleMeta` the worker had itself built by scanning the artifact; here it is a projection
     /// of the emitted wiring, so there is nothing for a second opinion to disagree with.
-    ///
-    /// `owns_prefix` remains the caller's because it is the EXECUTOR's placement answer
-    /// (`pmask_slots`), which additionally requires the mask to be a whole number of pages — a
-    /// stricter question than "did the wiring name an attn_mask".
     pub fn forward_shape(
         &self,
         // ⛔ THE ROWS THIS LAUNCH FILLS — 1 for a decode step, `mq` for a prompt chunk. NOT the
         // bundle's capacity: see [`Self::baked_row_capacity`], which this is checked against.
         rows: StagedRows,
-        owns_prefix: bool,
-        gathers: GathersKv,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
-        self.forward_shape_within(
-            self.baked_row_capacity(),
-            rows,
-            owns_prefix,
-            gathers,
-            n_consts,
-        )
+        self.forward_shape_within(self.baked_row_capacity(), rows, self.paged, n_consts)
     }
 
-    /// [`Self::forward_shape`] with the capacity supplied by the CALLER rather than read off this
-    /// wiring.
+    /// [`Self::forward_shape`] with the capacity and the paged step supplied by the CALLER rather
+    /// than read off this wiring.
     ///
     /// ⭐ WHY A CALLER MAY KNOW BETTER. A decode batch rung is the same tape baked at `B` rows and is
     /// addressed by fingerprint, not through a wiring — so `Wirings.decode` carries every rung's
-    /// tensor ids correctly while carrying only the single-request graph's ROW COUNT. A launch on the
-    /// `B`-row rung is legitimate and [`Self::baked_row_capacity`] answers 1 for it, so checking
-    /// against the wiring rejects a correct launch. The rung's width comes from its manifest's own
-    /// `RungSeqs`, which is a stronger authority than an embedding placement belonging to a different
-    /// bundle.
+    /// tensor ids correctly while carrying only the single-request graph's ROW COUNT and step. A
+    /// launch on the `B`-row rung is legitimate and [`Self::baked_row_capacity`] answers 1 for it, so
+    /// checking against the wiring rejects a correct launch; and its step is the batch's, at the walk
+    /// of the body that runs ([`PagedStep::on_body`]).
     ///
     /// ⛔ THE GUARD IS NOT WEAKENED, IT IS POINTED AT THE RIGHT NUMBER. `RowCapacity` still has no
     /// integer door: the only way to obtain one is this wiring's own placement
@@ -483,10 +379,8 @@ impl Wiring {
         cap: RowCapacity,
         // ⛔ THE ROWS THIS LAUNCH FILLS — 1 for a decode step, `mq` for a prompt chunk.
         rows: StagedRows,
-        owns_prefix: bool,
-        // ⛔ A WITNESS, NOT A `bool` — mintable only from a [`BakeFacts`] read off the bundle's own
-        // layout. See [`GathersKv`].
-        gathers: GathersKv,
+        // The step of the body that runs — this wiring's own for its own bundle.
+        paged: Option<PagedStep>,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
         assert!(
@@ -501,8 +395,7 @@ impl Wiring {
             embed_src: self.embed_src,
             cos_srcs: self.cos_srcs,
             sin_srcs: self.sin_srcs,
-            prefix_mask: owns_prefix,
-            kv_block_index: gathers.get(),
+            paged,
             n_consts,
             // The phase projects straight off the wiring's own field — the
             // tip's law: `phase: self.phase`, never a second derivation.
@@ -511,39 +404,12 @@ impl Wiring {
     }
 }
 
-/// ⭐⭐⭐⭐⭐ THE PROOF THAT "THIS BUNDLE GATHERS" CAME FROM THE BUNDLE — a witness with exactly one
-/// door, [`BakeFacts`], which reads the `KV_BLOCK_INDEX_TID` placement off the generated layout.
-///
-/// ⛔ WHY NOT A `bool`. The two halves of a gather are the emitted descriptor and the staged index
-/// table, and their failure modes are not symmetric: a table nobody gathers through is inert, while a
-/// gather with no table reads an UNSTAGED index — which is zero, and block 0 is a real address, so
-/// every row of the batch attends row 0's keys. That is fluent, wrong output from a clean bake with no
-/// counter moved. A `bool` parameter is exactly the arrangement in which a caller can answer that
-/// question from something other than the artifact — a phase, a rung width, an `is_some()` on the
-/// wrong option — and one wrong answer in one direction is silent corruption.
-///
-/// So the only way to obtain one is to hold the bundle's own facts.
+/// ⭐⭐⭐ WHETHER A BODY GATHERS — read off its own launch groups ([`Self::of_launch_groups`]), the
+/// only door: a fact that differs per BODY, never asked of a bundle or a caller.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GathersKv(bool);
 
 impl GathersKv {
-    /// The bundle's own answer.
-    pub fn of(facts: &BakeFacts) -> Self {
-        GathersKv(facts.gathers_kv)
-    }
-
-    /// The same answer straight off a LAYOUT, for callers that hold one but no [`BakeFacts`] — the
-    /// load-time placement check. It is the same lookup [`BakeFacts::of`] performs, spelled once here
-    /// rather than duplicated at the call site, and it takes a plain reference so a non-`'static`
-    /// layout can be asked.
-    pub fn of_layout(layout: &bundle::BundleLayout<'_>) -> Self {
-        GathersKv(
-            layout
-                .place_of_tid(crate::lower_subtile_tape_to_superdsc::KV_BLOCK_INDEX_TID)
-                .is_some(),
-        )
-    }
-
     /// ⭐⭐⭐ THE **PER-BODY** ANSWER, off the body's own LAUNCH GROUPS — each group's
     /// `bundle::KvShifts::gathered`, which the emitter stamps on the fold group it built the gather into.
     ///
@@ -559,13 +425,6 @@ impl GathersKv {
     /// does not carry it.
     pub fn of_launch_groups(gathered: impl IntoIterator<Item = bool>) -> Self {
         GathersKv(gathered.into_iter().any(|g| g))
-    }
-
-    /// ⭐ THE ONE CALLER-SIDE `false` THAT IS SOUND: a launch path with no SuperDSC layout to ask (the
-    /// KTIR emulator). It is spelled as its own named door rather than as `GathersKv(false)` so it
-    /// appears in a grep for who claims a bundle does not gather.
-    pub const fn no_layout_to_ask() -> Self {
-        GathersKv(false)
     }
 
     pub const fn get(self) -> bool {
@@ -814,6 +673,12 @@ pub struct PagedStep {
 }
 
 impl PagedStep {
+    /// The blocks the scheduler may hand out — every page but the null page
+    /// ([`crate::paged_step::page_of_block`]).
+    pub const fn host_blocks(self) -> u32 {
+        self.pages - 1
+    }
+
     /// The pool's token capacity: every page's slots.
     pub const fn capacity(self) -> usize {
         self.pages as usize * self.page_slots as usize
@@ -874,6 +739,105 @@ impl PagedStep {
     pub const fn card_int32_zero_bytes(self) -> u64 {
         ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64 * 4
     }
+
+    /// ⭐ THE STEP'S CARD PLACEMENTS — `(tid, seat, bytes)` for every source this bundle's attention
+    /// reads, sized for the pool's whole walk (a body walking fewer blocks stages and reads a
+    /// prefix). The one statement the bake places by (`compute_bundle_layout`) and the card stagers
+    /// ([`crate::paged_step::card_step_sources`], [`crate::paged_step::card_batch_sources`],
+    /// [`crate::paged_step::card_statics`]) stage within; `self` is the bundle's own step, at its
+    /// whole walk.
+    pub fn card_placements(self) -> Vec<(u32, CardSeat, u64)> {
+        let int32_stick = u64::from(scratchy_triton_splice::INT32_STICK);
+        let sticks = |words: u64| words.div_ceil(int32_stick) * int32_stick * 4;
+        let (slots, nkvh) = (u64::from(self.page_slots), u64::from(self.nkvh));
+        let mut v = vec![(
+            self.write_rows,
+            CardSeat::Step,
+            sticks(u64::from(self.rows * self.nkvh)),
+        )];
+        match self.batch() {
+            Some(c) => {
+                let (chunks, entries) = (u64::from(c.num_chunks), u64::from(c.entries()));
+                v.extend([
+                    (self.rep_rows, CardSeat::Step, sticks(entries)),
+                    (
+                        self.chunk_pages,
+                        CardSeat::Step,
+                        chunks * self.card_walk_step(),
+                    ),
+                    (
+                        self.chunk_masks,
+                        CardSeat::Step,
+                        chunks * entries * nkvh * slots * 2,
+                    ),
+                ]);
+            }
+            None => v.extend([
+                (
+                    self.page_table,
+                    CardSeat::Step,
+                    u64::from(self.pages) * self.card_walk_step(),
+                ),
+                (
+                    self.mask,
+                    CardSeat::Step,
+                    u64::from(self.pages) * u64::from(self.rows) * slots * 2,
+                ),
+                (
+                    self.query_rows,
+                    CardSeat::Step,
+                    sticks(u64::from(self.rows)),
+                ),
+            ]),
+        }
+        // ⛔ THE POOL'S STATICS IN EVERY BUNDLE OF THE POOL, not only the one whose kernel reads them.
+        // Every session of a model shares ONE KV segment by alias, and the alias refuses two
+        // sessions whose placements in it differ (`Executor::alias_seg_from`), so a prompt chunk's
+        // or a decode batch's bundle places `kv_row_pool` beside the pools exactly where the decode
+        // kernel's does.
+        v.extend([
+            (
+                self.kv_row_pool,
+                CardSeat::Pool,
+                self.card_kv_row_pool_bytes(),
+            ),
+            (
+                self.int32_zero,
+                CardSeat::Pool,
+                self.card_int32_zero_bytes(),
+            ),
+        ]);
+        v
+    }
+
+    /// ⭐ THE STEP OF THE BODY THAT RUNS — this bundle's pool and tids at a rung's own rows (a batch or
+    /// prompt-width rung is the same tape baked at `rows` rows), walking the blocks the body sweeps:
+    /// `swept` slots, whole pages for every body (a `walk_buckets` rung, or the ceiling's walk).
+    /// `None` when `swept` is no walk of this pool.
+    pub fn on_body(
+        self,
+        rows: u32,
+        paged_rows: crate::paged_step::PagedRows,
+        swept: u32,
+    ) -> Option<PagedStep> {
+        let walk = swept / self.page_slots;
+        (rows > 0 && walk > 0 && swept.is_multiple_of(self.page_slots) && walk <= self.pages)
+            .then_some(PagedStep {
+                rows,
+                paged_rows,
+                walk,
+                ..self
+            })
+    }
+}
+
+/// Where a paged step's card source sits ([`PagedStep::card_placements`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CardSeat {
+    /// Beside the activations: staged every step, and moved by a walk's relaunch.
+    Step,
+    /// Beside the pools, in the segment a relaunch does not shift: staged once, at load.
+    Pool,
 }
 
 /// Everything the worker needs to launch one baked bundle, emitted whole.
@@ -2520,219 +2484,6 @@ mod constant_tape_tests {
         uniform
             .verify_class_placements(&lay_uniform)
             .expect("a uniform model's single-class pair passes");
-    }
-
-    /// ⭐⭐⭐⭐⭐ THE CAUSAL-MASK HEAD-COUNT DEFECT, PINNED — gemma-4 tiny-allglobal's exact
-    /// geometry (hidden 128, nqh 4, head_dim 64), where `hidden / head_dim` = 2 ≠ 4.
-    ///
-    /// The host used to stage `causal_tiled(cmask, mq, mq_pad, hidden / head_dim)` rows into a
-    /// placement sized `nqh · mq · mq_pad`. The quotient is the head count only for a SQUARE Q
-    /// projection (`hidden == nqh·hd`) — true of granite/llama, false of gemma-4 at production
-    /// scale too (hidden 3840 against nqh·hd 4096/8192). The shortfall was silent: the bind
-    /// guard refuses OVER-binds only, and the unstaged tail of the ADDITIVE mask reads as ZERO,
-    /// i.e. as "no mask". MEASURED on the tiny fixture: heads 2-3 of every layer ran unmasked.
-    ///
-    /// This test pins both halves of the fix: the BAKED count stages the full placement (the
-    /// cross-check passes at `Geometry::nqh`), and the QUOTIENT's staging does not cover the
-    /// placement — which the load-time cross-check refuses, because its `want` is computed from
-    /// the bake's own `nqh` and not from any host arithmetic.
-    #[test]
-    fn the_causal_mask_head_count_is_the_bake_not_the_hidden_quotient() {
-        use crate::lower_subtile_tape_to_superdsc as sd;
-        // The gemma-4 tiny-allglobal geometry: hidden 128, FOUR query heads, head_dim 64.
-        // `hidden / head_dim` = 2 — the wrong count every host staging site used to derive.
-        let wiring = Wiring {
-            geometry: Geometry {
-                hidden: 128,
-                head_dim: 64,
-                nqh: 4,
-                ..uniform_wiring().geometry
-            },
-            ..uniform_wiring()
-        };
-        // The tiny fixture's prefill: mq = 11, mq_pad = 64. The placement law:
-        // `nqh · mq · score_width · 2` bytes.
-        let (mq, width) = (11u32, 64u32);
-        let placed_bytes = 4u64 * mq as u64 * width as u64 * 2;
-        let mut lay = class_layout(&[]);
-        lay.places.to_mut().push(bundle::Placement {
-            id: bundle::PlaceId::Act(sd::ATTN_CAUSAL_TID),
-            segment: 0,
-            bank: 0,
-            offset: 0,
-            size: placed_bytes,
-            is_logits: false,
-        });
-        // The BAKED count's staging covers the placement — the pair agrees.
-        wiring
-            .verify_causal_placement(&lay, mq, width)
-            .expect("the bake's own nqh stages exactly its placement");
-        // THE DEFECT'S SHAPE: a staging at the QUOTIENT covers only `2·mq` of the `4·mq` rows.
-        // The quotient staging itself is silent at bind time (under-binding is allowed), so the
-        // CHECK is what must fire — its `want` comes from the bake's `nqh`, never from host
-        // arithmetic, and the two counts disagree on exactly this geometry.
-        let quotient = wiring.geometry.hidden / wiring.geometry.head_dim;
-        assert_ne!(
-            quotient, wiring.geometry.nqh,
-            "the fixture must be one where the quotient is NOT the head count, or this test \
-             pins nothing"
-        );
-        let quotient_bytes = quotient as u64 * mq as u64 * width as u64 * 2;
-        assert!(
-            quotient_bytes < placed_bytes,
-            "the quotient's staging is a PARTIAL bind, which is the silent direction of the \
-             bind guard"
-        );
-        // And the cross-check fires when the placement does not match the bake's head count —
-        // here simulated from the layout side (a placement sized at the quotient), which is the
-        // same disagreement seen from the other half.
-        let mut lay_quotient = class_layout(&[]);
-        lay_quotient.places.to_mut().push(bundle::Placement {
-            id: bundle::PlaceId::Act(sd::ATTN_CAUSAL_TID),
-            segment: 0,
-            bank: 0,
-            offset: 0,
-            size: quotient_bytes,
-            is_logits: false,
-        });
-        let why = wiring
-            .verify_causal_placement(&lay_quotient, mq, width)
-            .expect_err("a placement sized at the hidden/head_dim quotient must refuse");
-        assert!(
-            why.contains("4 query head"),
-            "the refusal names the bake's head count, got {why:?}"
-        );
-        // And a layout with no causal placement at all refuses — the stale-bake direction.
-        let lay_missing = class_layout(&[]);
-        assert!(
-            wiring
-                .verify_causal_placement(&lay_missing, mq, width)
-                .is_err(),
-            "a wiring whose layout never placed the causal mask must refuse"
-        );
-    }
-
-    /// ⭐⭐⭐ THE MASK A SESSION STAGES AT LOAD IS THE MASK ITS FIRST FULL LAUNCH WOULD HAVE BUILT —
-    /// at every rung either prompt ladder bakes, on both head-blocking forms.
-    ///
-    /// The launch side is played, not restated: the rung's `ForwardShape` from
-    /// [`Wiring::forward_shape_within`] (the prefill launch's own call), its `CausalMask` step, and
-    /// `kernel_values` on the inputs the prefill launch builds — the key `Chunk { rows, rows }` of a
-    /// full chunk, the baked head count, the `div_ceil(64)·64` pad, the wiring's head blocking. The
-    /// staged side is [`causal_full_chunk`] at the rung's width. Equal bytes is what makes "the
-    /// session already holds this key" at the first full chunk mean "the device already holds this
-    /// launch's mask".
-    ///
-    /// And the staged buffer is exactly the placement the load-time cross-check
-    /// ([`Wiring::verify_causal_placement`]) admits, since `stage_keyed` refuses any other size.
-    ///
-    /// Not vacuous: on the chunk-formed rungs (granite's hd 64 and 128 past one stick) the head
-    /// blocking is NOT all heads, and the all-heads tiling is a different buffer — so a staging that
-    /// took the sub-block count, or a launch that did, would fail here.
-    ///
-    /// [`causal_full_chunk`]: crate::forward_tape::causal_full_chunk
-    #[test]
-    fn a_load_staged_causal_mask_is_the_first_full_launchs_mask_at_every_rung() {
-        use crate::forward_tape::{
-            ForwardInputs, ForwardKernel, Staged, causal_full_chunk, causal_tiled, kernel_values,
-        };
-        use crate::lower_subtile_tape_to_superdsc as sd;
-        use scratchy_subtile::sdsc_abstract::{CausalKey, NewBlockForm, RungWidth};
-        // (hidden, head dim, query heads, kv dim): granite-3.1-2b, granite-3.1-8b, a gemma-4 class.
-        let models = [
-            (2048u32, 64u32, 32u32, 512u32),
-            (4096, 128, 32, 1024),
-            (3840, 256, 16, 2048),
-        ];
-        let mut chunk_formed_checked = 0;
-        for (hidden, head_dim, nqh, kv_dim) in models {
-            let w = Wiring {
-                geometry: Geometry {
-                    hidden,
-                    kv_dim,
-                    head_dim,
-                    nqh,
-                    ..uniform_wiring().geometry
-                },
-                ..uniform_wiring()
-            };
-            // Both ladders' widths (the prefix-free ladder's, the prefix ladder's 256/512), both sides
-            // of a stick, and the solo decode session's one row.
-            for rows in [1u32, 7, 35, 63, 64, 65, 128, 192, 256, 384, 512] {
-                let width = RungWidth::of_baked_rows(rows).expect("a width");
-                let (id, key, staged) = causal_full_chunk(&w, width);
-                assert_eq!(id, bundle::PlaceId::Act(sd::ATTN_CAUSAL_TID));
-                // THE LAUNCH, played: the shape the prefill launch asks for at this rung, its causal
-                // step, and the inputs a full chunk of it builds.
-                let shape = w.forward_shape_within(
-                    RowCapacity::of_baked_rung(width),
-                    StagedRows::of_launch(rows as usize).expect("rows > 0"),
-                    false,
-                    GathersKv::of(&BakeFacts::NONE),
-                    0,
-                );
-                let step = shape
-                    .steps()
-                    .into_iter()
-                    .find(|s| s.kernel == ForwardKernel::CausalMask)
-                    .expect("every forward stages the causal mask");
-                let causal = CausalKey::chunk(width, rows as usize).expect("a full chunk");
-                let mq_pad = (rows as usize).div_ceil(64) * 64;
-                let inp = ForwardInputs::<fn(usize) -> bool> {
-                    hidden: hidden as usize,
-                    num_q_heads: nqh as usize,
-                    mq_pad,
-                    causal_heads_per_block: w.causal_heads_per_block(causal),
-                    embed_tokens: &[],
-                    tokens: &[],
-                    chain_seeds: None,
-                    positions: &[],
-                    causal,
-                    prefix: None,
-                    consts: &[],
-                    mask_neg: scratchy_subtile::sdsc_abstract::ATTN_MASK_NEG,
-                    stick_major: true,
-                    kv_blocks: None,
-                };
-                let launched = match kernel_values(&step, &shape, &inp).expect("a causal mask") {
-                    Staged::F32(v) => v.into_owned(),
-                    _ => panic!("the causal mask stages as f32"),
-                };
-                let at = format!("hd {head_dim} nqh {nqh} rows {rows}");
-                assert_eq!(key, causal, "{at}: the staged key is the full chunk's");
-                assert!(staged == launched, "{at}: staged bytes != first launch's");
-                // The placement the load-time cross-check admits is exactly the staged buffer.
-                let mut lay = class_layout(&[]);
-                lay.places.to_mut().push(bundle::Placement {
-                    id,
-                    segment: 3,
-                    bank: 0,
-                    offset: 0,
-                    size: staged.len() as u64 * 2,
-                    is_logits: false,
-                });
-                w.verify_causal_placement(&lay, rows, mq_pad as u32)
-                    .unwrap_or_else(|e| panic!("{at}: {e}"));
-                // Non-vacuity: where the bake chunk-forms the new block past one stick, the blocking
-                // is per kv head (or per query head) and the all-heads tiling is a different buffer.
-                if NewBlockForm::of(rows, head_dim, false) == NewBlockForm::Chunk && mq_pad > 64 {
-                    assert_ne!(w.causal_heads_per_block(causal), nqh as usize, "{at}");
-                    let all_heads = causal_tiled(
-                        &causal.mask(),
-                        rows as usize,
-                        mq_pad,
-                        nqh as usize,
-                        nqh as usize,
-                    );
-                    assert!(staged != all_heads, "{at}: the blocking must matter here");
-                    chunk_formed_checked += 1;
-                }
-            }
-        }
-        assert!(
-            chunk_formed_checked >= 10,
-            "the chunk-formed rungs must be exercised, got {chunk_formed_checked}"
-        );
     }
 
     /// A minimal `Wiring` for the cross-check tests — only the class fields are load-bearing.

@@ -38,6 +38,18 @@ pub use scratchy_triton_splice::{BatchChunking, PAGE_SLOTS, PagedRows, walk_buck
 /// row maximum stays finite and its weights vanish under the running maximum.
 pub const MASKED: f32 = -65504.0;
 
+/// spyre-inference's `_NULL_SLOT` (`attn_layer.py`): where a padded token's KV write lands — slot 0
+/// of the null page, which no request holds (vLLM's block pool keeps block 0 out of every
+/// allocation; [`page_of_block`] keeps it out of the scheduler's here).
+pub const NULL_SLOT: usize = 0;
+
+/// The pool page a scheduler block id names: block `b` is page `b + 1`. Page 0 is the null page
+/// ([`NULL_SLOT`]) — vLLM's block pool reserves its block 0 and this scheduler's does not, so the
+/// worker offers it [`PagedStep::host_blocks`] blocks and keeps page 0 back.
+pub const fn page_of_block(b: u32) -> u32 {
+    b + 1
+}
+
 /// The rows of one forward: `real` tokens at positions `start..start + real`, in a bundle
 /// [`PagedStep::rows`] wide. A row past the real ones repeats the last real token
 /// ([`scratchy_subtile::sdsc_abstract::ChunkRows::row_logical_pos`]'s law), so its forward, its
@@ -255,8 +267,9 @@ pub struct BatchSeq<'a> {
 ///   it, `-inf` on the block slots past its blocks, and a padded sequence's block 0 `finfo.min` (so
 ///   its softmax stays finite); the kv head axis materialized, as the tiled walk reads it.
 ///
-/// Pad rows of the forward repeat the last real sequence's token (the worker's pad law), so their
-/// write lands where that token's does.
+/// A padded row's KV write lands on [`NULL_SLOT`], as spyre-inference's padded tokens' do: its
+/// attention reads page 0 under the padded sequence's mask and answers nothing anyone reads, so what
+/// it writes must reach no request's page.
 pub fn batch_sources(
     step: &PagedStep,
     seqs: &[BatchSeq<'_>],
@@ -331,13 +344,15 @@ pub fn batch_sources(
             }
         }
     }
-    // One token per row: row `r` is sequence `min(r, n - 1)`'s, at its position.
+    // One token per real row, at its position; a padded row at the null slot.
     let mut write = Vec::with_capacity(nkvh * b);
     for h in 0..nkvh {
         for r in 0..b {
-            let q = &seqs[r.min(n - 1)];
-            let page = q.blocks[q.pos / slots] as usize;
-            write.push(((page * nkvh + h) * slots + q.pos % slots) as i32);
+            let (page, slot) = match seqs.get(r) {
+                Some(q) => (q.blocks[q.pos / slots] as usize, q.pos % slots),
+                None => (NULL_SLOT / slots, NULL_SLOT % slots),
+            };
+            write.push(((page * nkvh + h) * slots + slot) as i32);
         }
     }
     let e = j * b;
@@ -349,6 +364,128 @@ pub fn batch_sources(
             (step.write_rows, words(write), vec![nkvh * b]),
         ],
     })
+}
+
+/// ⭐ ONE STEP ON THE CARD — the step's own operands ([`step_sources`], [`batch_sources`]) as the
+/// card's placements hold them ([`PagedStep::card_placements`]): the mask as values the session
+/// narrows to the card's fp16 at bind (its rows are one `page_slots` stick each, so the row-major
+/// stack IS the stick-major one), and the int32 tables as little-endian words, the index table a
+/// walk reads one row per trip laid at the walk's card step ([`PagedStep::card_walk_step`],
+/// `loop_fold`'s pitched index table). `kv_row_pool` and the int32 zero are no step's: they are the
+/// same for every step of a pool, staged once at load ([`card_statics`]).
+pub struct CardSources {
+    pub mask: (u32, Vec<f32>),
+    pub int32: Vec<(u32, Vec<u8>)>,
+}
+
+impl CardSources {
+    /// The int32 table staged at `tid`.
+    pub fn words(&self, tid: u32) -> Option<&[u8]> {
+        self.int32
+            .iter()
+            .find(|(t, _)| *t == tid)
+            .map(|(_, w)| w.as_slice())
+    }
+}
+
+/// `logical`'s rows of `row` bytes with row `i` at byte `i · step` — an index table one row per walk
+/// trip, at the card's walk step.
+fn pitched(logical: &[u8], row: usize, step: usize) -> Vec<u8> {
+    let mut out = vec![0u8; logical.len().div_ceil(row) * step];
+    for (i, r) in logical.chunks(row).enumerate() {
+        out[i * step..i * step + r.len()].copy_from_slice(r);
+    }
+    out
+}
+
+fn le_words(w: Vec<i32>) -> Vec<u8> {
+    w.into_iter().flat_map(i32::to_le_bytes).collect()
+}
+
+/// [`step_sources`] on the card: one sequence's step, its page table one block per trip.
+pub fn card_step_sources(
+    step: &PagedStep,
+    blocks: &[u32],
+    rows: &StepRows,
+) -> Result<CardSources, PagedStepError> {
+    if step.batch().is_some() {
+        return Err(PagedStepError(
+            "card_step_sources: this bundle's rows are a decode batch's — `card_batch_sources`"
+                .into(),
+        ));
+    }
+    let table = le_words(page_table(step, blocks, rows)?);
+    Ok(CardSources {
+        mask: (step.mask, mask_stack(step, rows)),
+        int32: vec![
+            (
+                step.page_table,
+                pitched(
+                    &table,
+                    INT32_ELEMS_PER_STICK * 4,
+                    step.card_walk_step() as usize,
+                ),
+            ),
+            (step.write_rows, le_words(write_rows(step, blocks, rows)?)),
+            (step.query_rows, le_words(query_rows(step))),
+        ],
+    })
+}
+
+/// [`batch_sources`] on the card: a decode batch's step, its chunk page ids one chunk per trip.
+pub fn card_batch_sources(
+    step: &PagedStep,
+    seqs: &[BatchSeq<'_>],
+) -> Result<CardSources, PagedStepError> {
+    let logical = batch_sources(step, seqs)?;
+    let entries = step
+        .batch()
+        .ok_or_else(|| PagedStepError("card_batch_sources: not a decode batch".into()))?
+        .entries() as usize;
+    let int32 = logical
+        .int32
+        .into_iter()
+        .map(|(tid, bytes, _)| {
+            if tid == step.chunk_pages {
+                (
+                    tid,
+                    pitched(&bytes, entries * 4, step.card_walk_step() as usize),
+                )
+            } else {
+                (tid, bytes)
+            }
+        })
+        .collect();
+    let (mask_tid, mask, _) = logical.mask;
+    Ok(CardSources {
+        mask: (mask_tid, mask),
+        int32,
+    })
+}
+
+/// ⭐ THE POOL'S STATICS ON THE CARD — `kv_row_pool` at the card's run pitch (page `p`'s `nkvh` rows
+/// in the first words of its [`INDEX_RUN_WORDS`] run: the run the decode walk's chained index copies
+/// per page) and the int32 zero that copy adds to. The pool's, not a kernel's: the same for every
+/// step and every bundle of the pool ([`PagedStep::card_placements`]), so the session that owns the
+/// pool stages them once, at load, and every session aliasing its KV segment reads them there.
+///
+/// [`INDEX_RUN_WORDS`]: ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS
+pub fn card_statics(step: &PagedStep) -> Result<Vec<(u32, Vec<u8>)>, PagedStepError> {
+    let run = ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as usize;
+    let nkvh = step.nkvh as usize;
+    if nkvh > run {
+        return Err(PagedStepError(format!(
+            "a page's {nkvh} kv-head rows do not fit its {run}-word index run"
+        )));
+    }
+    let mut words = vec![0i32; step.pages as usize * run];
+    for (p, page) in kv_row_pool(step).chunks(nkvh).enumerate() {
+        words[p * run..p * run + nkvh].copy_from_slice(page);
+    }
+    Ok(vec![
+        (step.kv_row_pool, le_words(words)),
+        (step.int32_zero, vec![0u8; run * 4]),
+    ])
 }
 
 /// A pool holding token-major cache rows: row `t` of `cache` (`[·, nkvh · hd]`) laid into its page —
@@ -478,13 +615,11 @@ mod tests {
         assert_eq!(words(s.rep_rows), vec![0, 1, 0, 0, 0, 1, 0, 0]);
         // `[C·J, B]`: slot 0 = (7, 9, 0, 0), slot 1 = (3, 0, 0, 0).
         assert_eq!(words(s.chunk_pages), vec![7, 9, 0, 0, 3, 0, 0, 0]);
-        // Row r's token: sequence min(r, 1); head h at ((page · 2 + h) · 4 + slot).
+        // Row r's token, head h at ((page · 2 + h) · 4 + slot); the two padded rows at the null
+        // slot, page 0.
         let w = words(s.write_rows);
-        assert_eq!(&w[..4], &[3 * 8 + 1, 9 * 8 + 2, 9 * 8 + 2, 9 * 8 + 2]);
-        assert_eq!(
-            &w[4..],
-            &[3 * 8 + 4 + 1, 9 * 8 + 4 + 2, 9 * 8 + 4 + 2, 9 * 8 + 4 + 2]
-        );
+        assert_eq!(&w[..4], &[3 * 8 + 1, 9 * 8 + 2, 0, 0]);
+        assert_eq!(&w[4..], &[3 * 8 + 4 + 1, 9 * 8 + 4 + 2, 4, 4]);
         let (tid, m, shape) = &src.mask;
         assert_eq!((*tid, shape.clone()), (s.chunk_masks, vec![2 * 4 * 2, 4]));
         // Element (slot i, sequence q, head h, column c) at ((i · 4 + q) · 2 + h) · 4 + c.
@@ -573,6 +708,201 @@ mod tests {
             .find(|(t, ..)| *t == decode.int32_zero)
             .expect("a decode step stages the int32 zero beside kv_row_pool");
         assert!(zero.iter().all(|&b| b == 0) && !zero.is_empty());
+    }
+
+    fn ints(b: &[u8]) -> Vec<i32> {
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|x| i32::from_le_bytes(*x))
+            .collect()
+    }
+
+    /// ⭐ THE CARD HOLDS THE PAGE TABLE ONE BLOCK PER TRIP: block `i`'s page at `i · rows · 128` B —
+    /// the bytes one trip moves the mask tile — and nothing else of the step moves.
+    #[test]
+    fn the_card_holds_the_page_table_one_block_per_trip() {
+        let s = step();
+        let rows = StepRows { start: 5, real: 2 };
+        let blocks = [2u32, 3];
+        let card = card_step_sources(&s, &blocks, &rows).unwrap();
+        let pitch = s.card_walk_step() as usize;
+        assert_eq!(pitch, 3 * 128, "one fp16 stick per score row, three rows");
+        let table = ints(card.words(s.page_table).unwrap());
+        assert_eq!(table.len(), s.walk as usize * pitch / 4);
+        for (i, &v) in table.iter().enumerate() {
+            let want = match i * 4 % pitch {
+                0 => [2, 3, 0, 0][i * 4 / pitch],
+                _ => 0,
+            };
+            assert_eq!(v, want, "word {i}");
+        }
+        assert_eq!(
+            ints(card.words(s.write_rows).unwrap()),
+            write_rows(&s, &blocks, &rows).unwrap()
+        );
+        assert_eq!(ints(card.words(s.query_rows).unwrap()), query_rows(&s));
+        assert_eq!(card.mask, (s.mask, mask_stack(&s, &rows)));
+        assert!(
+            card.words(s.kv_row_pool).is_none() && card.words(s.int32_zero).is_none(),
+            "the pool's statics are staged at load, never per step"
+        );
+    }
+
+    /// A decode batch's chunk page ids, one chunk per trip: chunk `c`'s `J · B` ids at
+    /// `c · J · B · nkvh · 128` B.
+    #[test]
+    fn a_decode_batch_holds_its_chunk_pages_one_chunk_per_trip() {
+        let s = PagedStep {
+            walk: 16,
+            ..batch()
+        };
+        let c = s.batch().unwrap();
+        assert_eq!((c.blocks_per_chunk, c.num_chunks), (8, 2));
+        let blocks: Vec<u32> = (0..16).rev().collect();
+        let seqs = [BatchSeq {
+            blocks: &blocks,
+            pos: 61,
+        }];
+        let logical = batch_sources(&s, &seqs).unwrap();
+        let card = card_batch_sources(&s, &seqs).unwrap();
+        let (_, want, _) = logical
+            .int32
+            .iter()
+            .find(|(t, ..)| *t == s.chunk_pages)
+            .unwrap();
+        let (row, pitch) = (c.entries() as usize, s.card_walk_step() as usize / 4);
+        let got = ints(card.words(s.chunk_pages).unwrap());
+        assert_eq!(got.len(), c.num_chunks as usize * pitch);
+        for (k, chunk) in ints(want).chunks(row).enumerate() {
+            assert_eq!(&got[k * pitch..k * pitch + row], chunk, "chunk {k}");
+            assert!(
+                got[k * pitch + row..(k + 1) * pitch]
+                    .iter()
+                    .all(|&v| v == 0)
+            );
+        }
+        for t in [s.rep_rows, s.write_rows] {
+            let (_, w, _) = logical.int32.iter().find(|(x, ..)| *x == t).unwrap();
+            assert_eq!(card.words(t).unwrap(), w.as_slice());
+        }
+        assert_eq!(card.mask.1, logical.mask.1);
+    }
+
+    /// The pool's statics: page `p`'s `nkvh` folded-cache rows in the first words of its run, and
+    /// one run of int32 zeros.
+    #[test]
+    fn the_pool_statics_hold_each_pages_rows_at_the_run_pitch() {
+        let run = ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as usize;
+        let decode = PagedStep { rows: 1, ..step() };
+        let statics = card_statics(&decode).unwrap();
+        let pool = ints(
+            &statics
+                .iter()
+                .find(|(t, _)| *t == decode.kv_row_pool)
+                .unwrap()
+                .1,
+        );
+        assert_eq!(pool.len(), decode.pages as usize * run);
+        for p in 0..decode.pages as usize {
+            assert_eq!(
+                &pool[p * run..p * run + 2],
+                &[2 * p as i32, 2 * p as i32 + 1]
+            );
+            assert!(pool[p * run + 2..(p + 1) * run].iter().all(|&v| v == 0));
+        }
+        let zero = &statics
+            .iter()
+            .find(|(t, _)| *t == decode.int32_zero)
+            .unwrap()
+            .1;
+        assert_eq!(zero.len(), run * 4);
+        assert!(zero.iter().all(|&b| b == 0));
+        // The pool's, so every bundle of it stages the same bytes.
+        assert_eq!(card_statics(&step()).unwrap(), statics);
+        assert_eq!(
+            card_statics(&PagedStep {
+                pages: 4,
+                ..batch()
+            })
+            .unwrap(),
+            statics
+        );
+    }
+
+    /// ⭐ EVERY CARD SOURCE FITS ITS PLACEMENT — at the pool's whole walk the bake places by, and at a
+    /// body walking fewer blocks, whose step stages a prefix of it.
+    #[test]
+    fn every_card_source_fits_its_placement() {
+        let fits = |placed: PagedStep, card: &CardSources, statics: &[(u32, Vec<u8>)]| {
+            let at = placed.card_placements();
+            let size = |tid: u32, seat: crate::wiring::CardSeat| {
+                at.iter()
+                    .find(|(t, s, _)| *t == tid && *s == seat)
+                    .map(|&(.., b)| b)
+                    .unwrap_or_else(|| panic!("t{tid} is staged but not placed"))
+            };
+            let (mask_tid, mask) = &card.mask;
+            assert!(mask.len() as u64 * 2 <= size(*mask_tid, crate::wiring::CardSeat::Step));
+            for (tid, w) in &card.int32 {
+                assert!(
+                    w.len() as u64 <= size(*tid, crate::wiring::CardSeat::Step),
+                    "t{tid}"
+                );
+            }
+            for (tid, w) in statics {
+                assert_eq!(
+                    w.len() as u64,
+                    size(*tid, crate::wiring::CardSeat::Pool),
+                    "t{tid}"
+                );
+            }
+        };
+        for (rows, real) in [(1u32, 1usize), (3, 2)] {
+            let full = PagedStep { rows, ..step() };
+            for walk in [1, 2, 4] {
+                let body = full
+                    .on_body(rows, PagedRows::Sequence, walk * full.page_slots)
+                    .unwrap();
+                let st = StepRows { start: 0, real };
+                let card = card_step_sources(&body, &[3, 2, 1, 0], &st).unwrap();
+                fits(full, &card, &card_statics(&body).unwrap());
+            }
+        }
+        let full = PagedStep {
+            walk: 16,
+            ..batch()
+        };
+        for walk in [1, 2, 3, 8, 16] {
+            let body = full
+                .on_body(4, PagedRows::Batch, walk * full.page_slots)
+                .unwrap();
+            let blocks: Vec<u32> = (0..walk).collect();
+            let seqs = [BatchSeq {
+                blocks: &blocks,
+                pos: walk as usize * 4 - 1,
+            }];
+            fits(full, &card_batch_sources(&body, &seqs).unwrap(), &[]);
+        }
+    }
+
+    /// A body's step walks the whole pages its sweep covers, and a sweep that is no walk of the pool
+    /// names no step.
+    #[test]
+    fn a_body_steps_at_its_own_walk() {
+        let s = step();
+        let body = s.on_body(1, PagedRows::Sequence, 8).unwrap();
+        assert_eq!((body.rows, body.walk, body.reach()), (1, 2, 8));
+        assert!(
+            s.on_body(1, PagedRows::Sequence, 6).is_none(),
+            "not whole pages"
+        );
+        assert!(s.on_body(1, PagedRows::Sequence, 0).is_none());
+        assert!(
+            s.on_body(1, PagedRows::Sequence, 20).is_none(),
+            "past the pool"
+        );
+        assert!(s.on_body(0, PagedRows::Sequence, 8).is_none());
     }
 
     #[test]

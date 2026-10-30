@@ -2,8 +2,8 @@
 //! THE NOUNS — what a loaded Spyre model IS.
 //!
 //! `BundleMeta` (one baked bundle: its wiring, its `BakeFacts`, its capacity), `Loaded` (the
-//! sessions and the rung ladders), `ReqState` (one request's KV pages and history), and the
-//! smaller value types the launch path passes around.
+//! sessions and the rung ladders), `ReqState` (one request's draw), and the smaller value types the
+//! launch path passes around.
 //!
 //! ⛔ EVERY MODEL FACT IN HERE ARRIVED GENERATED. `BundleMeta` carries the `&'static Wiring` the
 //! `#[forward]` macro emitted; nothing in this file inspects a checkpoint, a config, or a manifest.
@@ -11,10 +11,6 @@
 use std::path::PathBuf;
 
 use scratchy_core_model::weight::HfModelConfig;
-// `SlotCount` sizes the resident cache on BOTH paths; the paging vocabulary around it is card-only.
-use scratchy_subtile::sdsc_abstract::SlotCount;
-#[cfg(feature = "spyre-hw")]
-use scratchy_subtile::sdsc_abstract::{BlockTable, PagedKvPool, PoolRows, PoolSplit, RowPages};
 // `--target sendnn` swaps the KTIR emulator runner for the on-silicon sendnn
 // runner; the bundle type + session type are cfg-selected, everything else
 // (weight load, dynamic sources, KV loop, sampling) is shared.
@@ -22,9 +18,6 @@ use scratchy_subtile::sdsc_abstract::{BlockTable, PagedKvPool, PoolRows, PoolSpl
 use scratchy_target_spyre::runner::SpyreSession;
 #[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::sdsc_runner::SuperDscSession;
-
-#[cfg(feature = "spyre-hw")]
-use crate::spyre_pool::*;
 
 /// One layer's KV pools: the K and V cache tensors its paged attention gathers from and its KV
 /// write scatters into. The emulator never stages them — the session's own zeroed allocation is
@@ -195,40 +188,9 @@ pub(crate) struct DecodeRung {
     /// The row count this rung's bundle was BAKED at — every launch on it binds exactly this many
     /// rows, live or padding, and every mask/fold/logits extent below derives from it.
     pub(crate) seqs: scratchy_subtile::sdsc_abstract::RungWidth,
-    // ⛔⛔⛔ WHAT WAS HERE AND WHY IT IS GONE: `swept` — "the columns one fold pass of THIS RUNG'S BODY
-    // sweeps (`active_cap`), plumbed from the manifest". It was the CEILING body's, and it could not be
-    // anything else: the manifest carries one `SweptCols` per BATCH WIDTH, while a rung's bundle holds a
-    // whole sk_bucket ladder of bodies (`nb ∈ {1, 2, 4}`) and which one a step runs is
-    // `select_body_paged`'s answer from the live context length.
-    //
-    // Two host decisions read it — the gather scratch's window count and the unswept-slot guard — and
-    // both were about the body, not the bundle. Both now come from
-    // `SuperDscSession::step_body(start).swept()`, which is the selector's own answer. The field is
-    // DELETED rather than left for "reporting", because a per-bundle number sitting next to a per-body
-    // question is how this defect happened three times.
-    /// ⭐ THE BLOCKS THIS RUNG'S OWN PMASK BAKED ROOM FOR, read from its `bundle_layout.json`. `None` when
-    /// the layout could not be read — the launch then keeps the pre-existing behaviour rather than
-    /// refusing on a number it does not have. Compared against `MaskBlocks::of(grid)` at launch: the
-    /// capacity used to be computed for a `[mask-cap]` eprintln and thrown away, so overrunning it was
-    /// silent, and an unstaged additive-mask byte reads as ZERO = VALID.
-    pub(crate) mask_cap: Option<scratchy_subtile::sdsc_abstract::BakedMaskBlocks>,
-    /// ⭐ THE FOLD-ROW REGIME THIS RUNG'S BUNDLE WAS BAKED WITH, read from its own `op_manifest.json`
-    /// (`manifest_fold_row_regime`). The launch's intermediate-segment rebase stride
-    /// (`set_int_stride`) DERIVES from this: a whole-batch bundle gets stride 0 because its every
-    /// fold pass already sweeps every shared-buffer row, a per-request bundle gets one request's
-    /// row-block distance. It used to be a worker-side `const` hand-mirroring the emitter's choice
-    /// across two crates with no tie.
-    pub(crate) fold_rows: scratchy_subtile::sdsc_abstract::FoldRowRegime,
-    // ⛔⛔⛔ AND `gathers_kv` IS GONE FOR THE SAME REASON, ONE LEVEL FINER. It was this rung's own
-    // layout's `KV_BLOCK_INDEX_TID` placement — which fixed the defect it was introduced for (it had
-    // been `model.decode.last()`, the m=1 bucket, which places no index and answered `false` for every
-    // rung that does: `0xa35e RAS::PCI::BusFence` from two gather copies resolving
-    // `idx * skip_addr + base` over a tensor no step staged) and still answered about the BUNDLE. A
-    // placement is present if ANY body of the bundle gathers, and a bundle holds a ladder of them.
-    //
-    // It now comes from `step_body(start).gathers()`, which reads the SELECTED body's own launch groups
-    // (`bundle::KvShifts::gathered`). Same authority as `latch_paged_geometry`'s `page_slots`: a bake
-    // fact rides on the launch group it describes.
+    /// The rung's own session, aliasing the owner's weights and KV pool. Which body of its walk
+    /// ladder a step runs is the session's own answer (`SuperDscSession::step_body`), and the step
+    /// the host stages is that body's (`PagedStep::on_body`).
     pub(crate) sess: SuperDscSession,
     // ⛔ NO `logits` FIELD ANY MORE — the rung's LogitsGeom served the host per-request
     // readback the submit/collect split deleted (the sampler answers on the card; the idx
@@ -257,8 +219,6 @@ pub(crate) enum RungId {
 #[cfg(feature = "spyre-hw")]
 pub(crate) struct DecodeSeat<'a> {
     pub(crate) seqs: scratchy_subtile::sdsc_abstract::RungWidth,
-    pub(crate) mask_cap: Option<scratchy_subtile::sdsc_abstract::BakedMaskBlocks>,
-    pub(crate) fold_rows: scratchy_subtile::sdsc_abstract::FoldRowRegime,
     pub(crate) sess: &'a mut SuperDscSession,
 }
 
@@ -318,13 +278,9 @@ pub(crate) enum SendnnSession {
 /// `decode` via a raw seg2 copy after the batched-prefill forward.
 #[cfg(feature = "spyre-hw")]
 pub(crate) struct SuperDscBundle {
+    /// The one-request decode session — the OWNER of the resident weights and the KV pool (with
+    /// the pool's statics, `paged_step::card_statics`), which every other session aliases.
     pub(crate) decode: SuperDscSession,
-    /// THE OWNER'S OWN LAUNCH FACTS — the W=1 rung's `mask_cap` and `fold_rows`, read from the
-    /// decode slot's own bundle at load exactly as each ladder rung's are. A single request is a
-    /// batch of ONE on the owner, so the shared decode launch reads these through
-    /// [`Self::decode_seat`] and never re-derives them (or hand-mirrors them as constants).
-    pub(crate) owner_mask_cap: Option<scratchy_subtile::sdsc_abstract::BakedMaskBlocks>,
-    pub(crate) owner_fold_rows: scratchy_subtile::sdsc_abstract::FoldRowRegime,
     /// PREFILL WIDTH LADDER — ASCENDING by baked query-row count `mq`; the last entry is the widest.
     /// EMPTY ⇒ no batched-prefill bundle at all (multi-token prompts fall back to the sequential
     /// mq=1 decode path).
@@ -342,7 +298,7 @@ pub(crate) struct SuperDscBundle {
     /// ladder costs program + activation memory, not another copy of the model. All rungs carry the
     /// SAME tensor ids (verified: identical 1467-key placement set across widths 15/31/47/63 — only
     /// the 611 activation SIZES scale with `mq`), so ONE prefill `BundleMeta` binds any of them, and
-    /// `run_prefill_batch` rebinds every const on each call — so switching rungs between chunks is free.
+    /// `run_card_launch` rebinds every const on each call — so switching rungs between chunks is free.
     pub(crate) prefill_rungs: Vec<(usize, SuperDscSession)>,
     /// DECODE BATCH LADDER `(seqs, session)`, ascending — one session per baked request count.
     ///
@@ -355,44 +311,15 @@ pub(crate) struct SuperDscBundle {
     /// programs and activations, not another copy of the model — exactly as the prefill ladder does.
     /// EMPTY ⇒ no ladder; every request runs its own forward, as before.
     pub(crate) decode_rungs: Vec<DecodeRung>,
-    /// HOW MANY STRIPES THE KV POOL IS CUT INTO — decided once when the pool is sized, and the same
-    /// value the pool was sized BY. Stored rather than derived so that the number multiplied into the
-    /// pool's byte budget and the number divided into its pages cannot be two different numbers; see
-    /// [`PoolRows`] for the pair they used to be.
-    pub(crate) pool_rows: PoolRows,
-    // ⛔⛔⛔ THERE IS NO `prefill_pending`, AND ITS ABSENCE IS THE POINT.
-    //
-    // It held "ladder rungs the bake produced that have NOT been built yet", so a rung could be built the
-    // first time a chunk actually needed it — its doc justified that with a measurement: "building all 21
-    // costs 6.05s of startup (302 ms each)". The field was constructed `Vec::new()` at the ONE site that
-    // makes this struct and nothing ever pushed to it, so the lazy build could not happen and the 6.05 s
-    // was being paid anyway: `prefill ladder: 20 rung(s) ready in 6.19s wall — built in parallel`.
-    //
-    // ⭐ A DEAD PATH IS A LIE ABOUT WHAT THE PROGRAM CAN DO, and this one cost real time: creating a session
-    // mid-run is exactly what `runtime::Stream::create` aborts on under concurrency, so when that abort appeared
-    // the dead build was the first thing I blamed — for an hour, before the log's own zero
-    // `PREFILL_PATH` lines showed the abort was at LOAD. Deleting it removes a state the program cannot
-    // reach and a wrong answer a reader can reach.
-    //
-    // If deferred rung building is ever wanted again, it must be built where the OTHER sessions are (at
-    // load, serialized — see `runtime::Stream::create`), not from inside a forward.
-    /// The prefill bundles baked with a full resident-prefix sweep — what a CONTINUATION chunk
+    /// The prefill bundles whose walk reaches the whole pool — what a CONTINUATION chunk
     /// (`start > 0`) must run on, because it has resident KV to attend. See [`PrefixLadder`].
     ///
-    /// Every entry in [`prefill_rungs`](Self::prefill_rungs) is baked PREFIX-FREE: at `start == 0`
-    /// there is nothing resident, so those 4 prefix blocks would be masked out in full and their 308
-    /// ops/layer (43% of the body, ~12,320 launches per forward) would compute nothing.
+    /// Every entry in [`prefill_rungs`](Self::prefill_rungs) walks only its own chunk's pages, so it
+    /// serves a chunk at `start == 0` (`PagedStep::reach`).
     ///
     /// Empty ⇒ no prefix-capable bundle baked, so a continuation chunk cannot run and is refused
-    /// rather than silently attending an unswept cache.
+    /// rather than attending a cache its walk does not reach.
     pub(crate) prefill_prefix: PrefixLadder,
-    /// PAGED: how many pages the pool has. The pool is SHARED — every session above addresses the
-    /// same seg2 — so a page belongs to at most one request at a time. This is what replaces "one
-    /// cache, one sequence": concurrent requests get DISJOINT pages instead of both writing from
-    /// slot 0 and silently overwriting each other.
-    ///
-    /// Which pages are FREE is derived from the live requests, never stored: see `alloc_pages`.
-    pub(crate) pool_pages: usize,
 }
 
 /// ⭐ THE PREFIX-CAPABLE PREFILL LADDER — the sessions a continuation chunk can run on, ascending by width,
@@ -442,16 +369,15 @@ impl PrefixLadder {
         self.0.iter().map(|(m, _)| *m).collect()
     }
 
-    /// ⭐ THE RUNG A CONTINUATION CHUNK AT SLOT `want` RUNS ON — `PagedKvPool::prefix_rung_for`'s choice
-    /// for the `rows_left` rows the prompt still has, over the widths that built. `None` only for an empty
-    /// ladder.
-    pub(crate) fn rung_for(&self, want: usize, rows_left: usize) -> Option<PrefixRung> {
-        let widths: Vec<u32> = self.0.iter().map(|(m, _)| *m as u32).collect();
-        let index = PagedKvPool::prefix_rung_for(
-            &widths,
-            scratchy_subtile::sdsc_abstract::KvSlot::new(want as u32),
-            rows_left as u32,
-        )?;
+    /// ⭐ THE RUNG A CONTINUATION CHUNK RUNS ON — the narrowest that holds the `rows_left` rows the
+    /// prompt still has, else the widest (the chunk is then capped at its width). `None` only for an
+    /// empty ladder.
+    pub(crate) fn rung_for(&self, rows_left: usize) -> Option<PrefixRung> {
+        let index = self
+            .0
+            .iter()
+            .position(|(m, _)| *m >= rows_left)
+            .or_else(|| self.0.len().checked_sub(1))?;
         Some(PrefixRung {
             index,
             width: self.0[index].0,
@@ -472,22 +398,12 @@ impl PrefixLadder {
 
 #[cfg(feature = "spyre-hw")]
 impl SuperDscBundle {
-    /// The widest baked prefill width = the largest chunk ONE batched forward can take. 0 = no ladder.
-    pub(crate) fn prefill_top_m(&self) -> usize {
-        self.prefill_rungs.last().map(|(m, _)| *m).unwrap_or(0)
-    }
-
     /// THE RUNG A DECODE STEP RUNS ON — [`RungId::Owner`] when one request is live (the W=1
     /// rung IS the owner session, by the loader's `rn <= 1 → continue`), else the index of the
     /// SMALLEST ladder rung that holds `live` requests. `None` when `live` exceeds the widest
     /// rung — the caller then refuses: there is no one-forward-per-request decode arm any more.
     ///
-    /// 🛑 THE LIVE COUNT IS THE ONLY INPUT, and the launch must therefore be laid out from the live
-    /// count too. `SlotMap` hands out slots densely for exactly this reason: any layout that reads a
-    /// request's KV ROW instead makes the width needed depend on which rows are held, and then this
-    /// function — which cannot see them — picks a rung too narrow to express the batch. Widening the
-    /// choice to cover the highest row held would work and is worse: one request on row 31 would drag
-    /// the whole batch onto the 32-row rung and pay 32 rows of launch for it.
+    /// The live count is the only input: live request `i` runs in slot `i`, whatever its pages.
     pub(crate) fn decode_rung_for(
         &self,
         live: scratchy_subtile::sdsc_abstract::LiveRows,
@@ -499,7 +415,7 @@ impl SuperDscBundle {
         }
         self.decode_rungs
             .iter()
-            .position(|r| r.seqs.holds(live))
+            .position(|r| r.seqs.count() >= live.get())
             .map(RungId::Ladder)
     }
 
@@ -512,85 +428,18 @@ impl SuperDscBundle {
                 // The owner is the m=1 bake; 1 is a baked width by `RungWidth`'s own law.
                 seqs: scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
                     .expect("1 is a baked width"),
-                mask_cap: self.owner_mask_cap,
-                fold_rows: self.owner_fold_rows,
                 sess: &mut self.decode,
             },
             RungId::Ladder(i) => {
                 let r = &mut self.decode_rungs[i];
                 DecodeSeat {
                     seqs: r.seqs,
-                    mask_cap: r.mask_cap,
-                    fold_rows: r.fold_rows,
                     sess: &mut r.sess,
                 }
             }
         }
     }
-
-    /// ⭐ THE CONTEXT CEILING EVERY PMASK IN THIS MODEL BAKED — the least of the decode rungs' own
-    /// reservations, read from their placements.
-    ///
-    /// The bake derives the pmask's block count from the device (`MAX_SEGMENT_BYTES` over the
-    /// model's page bytes — see `compute_bundle_layout`'s pmask arm), one expression feeding the
-    /// rung and broadcast arms alike, so every rung answers the same number and the min is the safe
-    /// read for the day one disagrees. `None` when no rung's layout was readable, which the callers
-    /// treat exactly as the per-launch `MaskBlocks::fits` check treats its own `None`: keep the
-    /// prior behaviour rather than refuse on a number we do not have.
-    pub(crate) fn mask_reach(&self) -> Option<scratchy_subtile::sdsc_abstract::BakedMaskBlocks> {
-        self.decode_rungs.iter().filter_map(|r| r.mask_cap).min()
-    }
-
-    /// HOW THE POOL IS DIVIDED: one equal, consecutive run of pages per KV row.
-    ///
-    /// Cut for the WIDEST baked decode rung, not for the requests currently live, so a run does not
-    /// move when the batch narrows or widens. That stability is the whole property being bought — see
-    /// [`ReqState::row`].
-    ///
-    /// `None` when nothing is paged or the pool cannot give every row a page. The latter is a real
-    /// condition to handle (admit fewer, or raise `SUPERDSC_POOL_PAGES`), never something to round
-    /// down: a zero-page run aliases row 0's KV.
-    ///
-    /// 🛑 THE STRIPE COUNT IS READ, NOT RECOMPUTED. This used to be
-    /// `decode_rungs.iter().map(|r| r.seqs).max()` — the widest rung that survived baking — while the
-    /// pool's SIZE was computed from the const `WIDEST_BATCH_RUNG`. Two integers of the same type, from
-    /// different sources, one multiplied into the pool and the other divided into it. They happened to
-    /// agree whenever every rung baked, so the disagreement was invisible exactly until a rung dropped
-    /// out. [`PoolRows`] is now the single value both sides use, decided once at load.
-    pub(crate) fn kv_split(&self) -> Option<PoolSplit> {
-        if !self.decode.is_paged() {
-            return None;
-        }
-        PagedKvPool::split_pool(self.pool_pages as u32, self.pool_rows)
-    }
 }
-
-// ⛔ AND NO `rows_held`: with no rows to assign there is no held-set to derive. It collected every KV row a
-// live request held, as the input to `free_row`.
-
-// ⛔⛔⛔ THERE IS NO `pages_held`, AND ITS ABSENCE IS THE LOCK.
-//
-// It collected "every pool page a live request holds" so that `ensure_pages` could search for one no
-// live request held and push it onto the request's map. That made the WORKER a second allocator of the
-// pool, alongside the scheduler — which owns the same pool, refcounts its blocks, and keeps the prefix
-// cache alive BY those refcounts. The two agreed only because the worker ignored the ids the scheduler
-// handed it, and that is the whole reason prefix caching could not be turned on: a cache HIT is the
-// scheduler saying "these blocks already hold that prefix", and a worker holding pages of its own
-// choosing holds the prefix nowhere.
-//
-// The pages a request holds now come from `NewRequestData::block_ids` / `CachedRequestData::new_block_ids`
-// through [`BlockTable`], whose only constructor takes host ids. With no free-list search left there is
-// nothing to derive a held-set FOR, and a page two requests share stops being unrepresentable and starts
-// being the ordinary case — which is what a block table has always been on metal and cuda.
-
-// ⛔⛔⛔ THERE IS NO `free_row` EITHER, AND ITS ABSENCE IS THE SAME LOCK ONE LEVEL UP.
-//
-// It handed out the lowest KV row no live request held. A row was a per-request reservation of the pages
-// that backed a batched write past the request's own keys — the LAST request concept below the host, and the
-// reason this file had a notion of request identity at all. The scheduler allocates that page now (`own pages
-// + 1`, `KvSlotSpan::blocks_this_step`), so there is nothing to reserve, nothing to hand out, nothing to
-// release, and no "every row is held" refusal capping concurrency. Verified before deleting: 0 hole pages
-// across 30 gate runs on granite-3.1-2b (hd=64) and granite-3.1-8b (hd=128).
 
 /// Model-level state shared by both bundles, borrowed alongside a `&mut Bundle`.
 ///
@@ -621,16 +470,6 @@ pub(crate) struct Loaded {
     /// `embed_tokens.weight` `[vocab, hidden]` kept for the per-token gather.
     pub(crate) embed_tokens: Vec<f32>,
     pub(crate) hidden: usize,
-    /// spyre-hw ONLY (pool-entry sizing and the sendnn prefill/batch paths). The
-    /// KTIR path reads no model-wide head dim: rotary classes are per cos/sin
-    /// source (`RotaryKind`), and each layer's KV pools carry their own baked shapes.
-    #[cfg(feature = "spyre-hw")]
-    pub(crate) head_dim: usize,
-    /// spyre-hw ONLY: the paged-KV pool's per-head group count comes off it. The
-    /// KTIR path's pools are per-layer resident tensors at their own baked shapes (a
-    /// hybrid arch has no single kv width), so it is unread there.
-    #[cfg(feature = "spyre-hw")]
-    pub(crate) kv_dim: usize,
     pub(crate) vocab: usize,
     // ⛔ NO `rope_theta` FIELD. The KTIR path builds every rotary table from the
     // per-source `RotaryKind` the wiring carries; the info! at load time prints
@@ -654,80 +493,33 @@ pub(crate) struct Loaded {
     pub(crate) prefill: Vec<BundleMeta>,
     /// The prefill program meta PRESERVED for the batched-prefill path. `model.prefill` is nulled for
     /// SuperDsc so the PER-FORWARD binding uses the decode graph (the prefill manifest has different
-    /// tensor ids); but `run_prefill_batch` binds this meta to the DISTINCT prefill SESSION (where the ids
+    /// tensor ids); but `run_card_launch` binds this meta to the DISTINCT prefill SESSION (where the ids
     /// match), so it is kept here. Some only for SuperDsc with a baked prefill bundle; None otherwise.
     pub(crate) batched_prefill: Option<BundleMeta>,
-    /// THE KV BYTE BUDGET THE POOL WAS ACTUALLY SIZED AGAINST — the card's real capacity ×
-    /// `--gpu-memory-utilization` − what this bundle's non-KV segments already reserve.
+    /// THE KV POOL'S BYTES — on the card, the KV segment the bake placed (every layer's pools and the
+    /// pool's statics): the number the ENGINE sizes the scheduler's block allocator from
+    /// ([`Worker::determine_available_memory`]), beside [`Self::pool_stride_bytes`].
     ///
-    /// ⛔⛔ ONE QUANTITY, ONE PLACE, BECAUSE TWO SPELLINGS OF IT DISAGREED BY 8 GiB. The pool is sized from
-    /// this while sizing happens; the ENGINE separately sizes the scheduler's block allocator from
-    /// [`Worker::determine_available_memory`], which returned a flat `8 GiB` constant. The engine takes
-    /// `num_gpu_blocks = min(computed_from_that, kv_cache_num_blocks_override)`, so a stale 8 GiB would cap
-    /// a larger real pool at ~273 pages and silently shrink every request's context. Computed once here,
-    /// reported from here.
-    ///
-    /// `None` on the paths that never size a paged pool (KTIR emulator, non-paged sessions).
+    /// `None` on the emulator, which sizes no device pool.
     pub(crate) kv_budget_bytes: Option<u64>,
-    /// THE POOL'S PAGE STRIDE, in bytes — one page = every layer, each layer three planes (Knat, V,
-    /// Kᵀ) of `kv_dim` features across the plane's physical slot extent, at 2 bytes. Set beside
-    /// [`Self::kv_budget_bytes`] at the ONE site both are derived (the pool sizing in `load_model`),
-    /// because the ENGINE's block-count arithmetic divides the budget by this same stride
-    /// ([`Worker::kv_block_bytes`]): `num_gpu_blocks = budget/stride`, clamped to the host range.
-    /// With the real stride the clamp lands exactly on the pool's own host pages, so the scheduler's
-    /// block allocator and the pool are two views of one count — the engine's dense-row estimate
-    /// (no Kᵀ plane) overcounts the page by 4/3 and, the clamp only ever lowering, an
-    /// underestimated block count sailed under it unheard.
+    /// ONE PAGE OF THE POOL, in bytes — the KV segment over its pages, so the engine's
+    /// `budget / kv_block_bytes` arithmetic lands on the pool's own page count, which
+    /// `kv_cache_num_blocks_override` then holds it to.
     ///
-    /// `None` on the paths that never size a paged pool.
+    /// `None` on the emulator.
     pub(crate) pool_stride_bytes: Option<u64>,
-    /// ⭐ THE CONTEXT THIS RUN SERVES, in tokens — the ONE `--max-model-len` law's answer
-    /// ([`scratchy_serving_engine::gpu_budget::resolve_served_context`]), decided once where
-    /// budget, page stride and row count first meet (the pool sizing in `load_model`).
-    ///
-    /// The law has two branches and NO silent third: an explicit declaration the budget cannot
-    /// fund is REFUSED at load — capping a stated ask is not validating it — and an UNSET flag
-    /// resolves to `min(the model's max_position_embeddings, what the budget funds)`, logged at
-    /// info. So this field is either exactly what was declared or exactly the model's default
-    /// cut to the budget, never a clamp of what was asked.
-    ///
-    /// This is the MEMORY side of the context law: the bake's pmask covers every pool any card can
-    /// express (its block count is `MAX_SEGMENT_BYTES / page_bytes`), so what actually binds a run is
-    /// how many pages its own budget buys — `(budget/stride − reserve) / rows` — and this field is
-    /// that answer. `kv_max_addressable_tokens` reports `min(this, the baked mask reach)` so the
-    /// engine's admission cap is exactly what the pool funds, never more and never a hand-picked
-    /// constant. `usize::MAX` on the paths that never size a paged pool (no budget-derived cap).
+    /// ⭐ THE CONTEXT THIS RUN SERVES, in tokens — the `--max-model-len` declared (else the model's
+    /// own limit), which the pool the bake placed must hold: a declaration past the pool is refused at
+    /// load, never clamped. `usize::MAX` on the emulator (no cap).
     pub(crate) served_context: usize,
 }
 
-/// Per-request generation state: token history + the growing host KV cache.
+/// Per-request generation state the worker keeps beside `InputBatch`.
 pub(crate) struct ReqState {
-    // ⛔⛔⛔ THE TOKENS ARE NOT HERE, AND NEITHER IS THE PROMPT LENGTH.
-    //
-    // They were `tokens: Vec<u32>` (prompt ++ generated) and `prompt_len: usize`, and they now live in
-    // `InputBatch` — the engine's backend-neutral per-request store, the same place this worker's block
-    // table went. `InputBatch::prompt_len` is DERIVED from the prompt it stores, so the pair that could
-    // disagree is one value now. The metal worker keeps the identical pair privately
-    // (`token_buffers` + `prompt_lengths`, the second assigned `token_buffers[id].len()` at its only
-    // insert); it can drop both onto the same accessors.
-    //
-    // ⭐ WHAT IS LEFT HERE IS WHAT NO OTHER BACKEND HAS: a KV history of RUNS rather than a length,
-    // because a batched write appends every row of a batch at ONE slot and a shorter row carries a
-    // masked hole. That is the only reason this struct still exists.
-    // ⛔ AND `n_computed` IS NOT HERE EITHER — it is `InputBatch::tokens_in_pool`.
-    //
-    // "Positions already forwarded" is this request's TOKEN count, hence its RoPE position, and the engine's
-    // store has held exactly that number for every backend since before this worker used it — seeded at
-    // admission from the scheduler's `num_computed_tokens` and advanced by `commit_step` on cuda/metal. This
-    // path does not call `commit_step` (it chunks its own prefill and knows how far it got only after the
-    // loop), so it writes through `set_tokens_in_pool` instead. One store, one writer per step.
-    //
-    // ⛔ IT IS NOT WHERE THE NEXT KEY IS WRITTEN. Those were the same number for as long as every request
-    // appended at its own position, which is exactly the arrangement that costs one launch per request.
-    // `kv_hist` below is the SLOTS, and it stays here because no other backend has one.
-    /// WHICH KV SLOTS THIS REQUEST'S KEYS OCCUPY. Its own `[0, prompt)` until it shares a step with a
-    /// longer request, after which it holds a masked hole and its slot count exceeds `n_computed`.
-    pub(crate) kv_hist: scratchy_subtile::sdsc_abstract::KvHistory,
+    // ⛔ THE TOKENS, THE PROMPT LENGTH AND THE TOKEN COUNT ARE NOT HERE: they live in `InputBatch`,
+    // the engine's backend-neutral per-request store, beside the block table. A request's keys sit at
+    // its own positions, in the pages its block table names, so nothing about its KV is this
+    // struct's either.
     /// ⭐ THE REQUEST'S DRAW — the seed and inverse temperature every launch this request's rows
     /// run under, decided ONCE here at admission (nothing re-derives it mid-generation: the seat's
     /// per-step staging is a pure function of this value plus the row's absolute position, the
@@ -745,11 +537,6 @@ pub(crate) struct ReqState {
     /// stages the same law per step (packed, at its views' own dtypes) and reads the same idx
     /// stick back.
     pub(crate) draw: Option<SampledDraw>,
-    // ⛔⛔⛔ THERE IS NO `kv: Option<PagedKv>` ANY MORE, AND THAT IS THE END OF REQUEST IDENTITY BELOW THE
-    // HOST. It held the request's POOL ROW — the pages that backed its batched write past its own keys. The
-    // scheduler allocates that page now, so a request's on-card KV is fully described by two things this
-    // struct already has: `kv_hist` (which slots its keys occupy) and the host's block list in `InputBatch`.
-    // The map one launch binds is derived from those on every bind and stored nowhere.
 }
 
 /// ⭐ ONE REQUEST'S DRAW, in the two numbers the card's noise kernel wants: a
@@ -838,154 +625,5 @@ impl SampledDraw {
                 .unwrap_or_else(|| scratchy_core_common::fnv_seed64(req_id)),
             inv_t: (1.0 / sp.temperature) as f32,
         }))
-    }
-}
-
-#[allow(dead_code)]
-impl ReqState {
-    /// ⭐ THE MAP ONE LAUNCH BINDS, derived here and stored nowhere: the host's blocks (from
-    /// [`InputBatch`], via [`PageMapCtx`]) placed at the logical pages this request holds keys in, and the
-    /// fully-masked pages aliased to the pool's ONE scratch page.
-    ///
-    /// ⛔ IT TOOK A `KvRow` TOO, and that argument was the last per-request address below the host: the write
-    /// page came from a run of pool pages reserved for that row. The scheduler allocates the write page now,
-    /// so this is a function of the request's HISTORY and the HOST'S LIST — nothing else.
-    #[cfg(feature = "spyre-hw")]
-    pub(crate) fn page_map(&self, ctx: PageMapCtx<'_>, want: RowPages) -> Option<BlockTable> {
-        BlockTable::map_row(&self.kv_hist, ctx.host, want, ctx.part)
-    }
-
-    /// ⭐ THE MAP A PREFILL CHUNK BINDS — [`Self::page_map`] with every page the chunk's `write` lands in
-    /// backed by a host block (see [`BlockTable::map_chunk`]): a window wider than a page writes more
-    /// than the one page holding the history's next slot.
-    #[cfg(feature = "spyre-hw")]
-    pub(crate) fn chunk_page_map(
-        &self,
-        ctx: PageMapCtx<'_>,
-        write: scratchy_subtile::sdsc_abstract::ChunkWrite,
-    ) -> Option<BlockTable> {
-        BlockTable::map_chunk(&self.kv_hist, ctx.host, write, ctx.part)
-    }
-
-    /// ⭐ WHAT THE SCHEDULER MUST KNOW ABOUT THIS REQUEST'S KV, both halves at once — the slots to
-    /// allocate blocks for, and the leading tokens a token-indexed prefix cache may claim.
-    ///
-    /// Reported every step (`ModelRunnerOutput::kv_extent`) because both halves are facts about the
-    /// history this worker just wrote, and neither is derivable from the token count:
-    ///
-    /// * the SPAN exceeds the token count for every request that shared a batched step, because a batch
-    ///   appends all its rows at ONE slot and the shorter rows carry a masked hole;
-    /// * the CACHEABLE prefix stops at the first hole, because past it token `t` is no longer at slot
-    ///   `t`, and a host block hashed over it would hand a later request the keys of the wrong tokens.
-    ///
-    /// ⛔ THE SCHEDULER MUST NOT DERIVE EITHER ONE ITSELF. It has the batch composition and could run
-    /// the same recurrence, and that is exactly the two-sources-for-one-quantity shape that has produced
-    /// every defect in this path. The history is here; the report is a read of it.
-    ///
-    /// 🛑 THE SPAN IS THE BATCH'S, NOT THIS REQUEST'S OWN END, and passing it in is what says so. A
-    /// batched step writes EVERY row at [`BatchSlot::of`] over the LIVE set, so the slot a short request
-    /// is next written at is the batch's maximum and not its own — report its own end and the scheduler
-    /// allocates blocks that stop short of the page that write lands in, on exactly the step the request
-    /// joins a deeper batch. That is a per-POOL fact reported per request because allocation is per
-    /// request; every live request gets the same span, and each keeps its own cacheable prefix.
-    ///
-    /// ⛔⛔ AND THE BATCH'S MAXIMUM MUST BE ITS FUTURE ONE, NOT THE ONE THIS STEP ENDED WITH. MEASURED
-    /// 2026-08-13, ragged 6-probe batch, caching ON *and* OFF:
-    /// `request needs 885 slot(s) = 4 page(s), but the scheduler has allocated only 1 block(s)`.
-    /// A report is read by the scheduler BEFORE the next step and acted on for it, so anything that can
-    /// move the maximum WITHIN a step outruns it — and a prefill chunk does exactly that: the prefills of
-    /// a step record before its decode batch computes `BatchSlot::of`, so a request that was 116 slots
-    /// deep at the report and 884 after its chunk drags every decoding row's write slot with it, and the
-    /// rows that were allocated for 116 are one page short mid-forward.
-    /// ⇒ THE BOUND IS `max(end, prompt_len)` OVER THE LIVE SET ([`Self::kv_reach`]): a prefilling
-    /// request's end can only walk up to its own prompt, which is known at ADMISSION and cannot move. No
-    /// step lag, no arbitrary headroom, and no dependence on the chunk schedule — which is the same
-    /// property `PoolRows` and `ChunkKvExtent` exist for.
-    pub(crate) fn kv_extent(
-        &self,
-        pool_reach: SlotCount,
-        prompt: SlotCount,
-    ) -> scratchy_core_common::KvExtent {
-        scratchy_core_common::KvExtent::new(
-            scratchy_core_common::KvSlotSpan::new(
-                pool_reach.get().max(self.kv_reach(prompt).get()),
-            ),
-            scratchy_core_common::CacheableTokens::new(self.kv_hist.cacheable_prefix().get()),
-        )
-    }
-
-    /// ⭐ THE DEEPEST SLOT THIS REQUEST WILL EVER OCCUPY ON ITS OWN ACCOUNT — its history's end, or its
-    /// PROMPT, whichever is further.
-    ///
-    /// The prompt is the part that cannot move: it is fixed at admission, and a prefilling request's end
-    /// walks up to exactly it however the chunks fall. Taking the maximum over the live set therefore
-    /// gives a batch write-slot bound that no in-step prefill can outrun — see [`Self::kv_extent`] for
-    /// the measurement that made this necessary.
-    /// ⛔ THE PROMPT IS PASSED IN, NOT HELD. It lives in `InputBatch` (one store, and the length derived
-    /// from the tokens), so the caller reads it there and hands it over as a [`SlotCount`] — the same
-    /// type the history's end has, because the maximum of the two is the whole point of this function.
-    pub(crate) fn kv_reach(&self, prompt: SlotCount) -> SlotCount {
-        SlotCount::new(self.kv_hist.end().get().max(prompt.get()))
-    }
-
-    /// ⭐ A PREEMPTED REQUEST HAS NO KV LEFT — reset it to what the scheduler says it now holds.
-    ///
-    /// The scheduler frees a preempted request's blocks and re-schedules it with `resumed_req_ids` and a
-    /// fresh `num_computed_tokens` (0, or a prefix-cache hit). Its old pages are another request's keys
-    /// by then, so keeping the old history would have it attend them: `contains` would answer true on
-    /// slots whose page it no longer owns. Nothing in this worker used to notice a resume at all — the
-    /// history simply carried on — which was survivable only because a pool with no prefix caching and a
-    /// worker-side free list rarely produced the block pressure that preempts.
-    /// ⛔ THE TOKEN COUNT IS THE CALLER'S TO RESET, in `InputBatch` — this resets only the SLOTS, which
-    /// is the half no other backend has. Both must move together on a resume, and the call site does them
-    /// adjacently for that reason.
-    pub(crate) fn reset_for_resume(&mut self, computed: usize) {
-        self.kv_hist = scratchy_subtile::sdsc_abstract::KvHistory::contiguous(computed);
-    }
-
-    /// HOW MANY KV SLOTS THIS REQUEST SPANS — one past its last key, which is what the pool has to hold
-    /// pages for. `>= n_computed`, and strictly greater once it has shared a step with a longer request.
-    pub(crate) fn kv_span(&self) -> usize {
-        // The one place a slot becomes a plain count — for messages and for the token arithmetic the
-        // scheduler speaks in. Everything that DIVIDES it by a page takes [`Self::kv_span_slots`].
-        self.kv_hist.end().get() as usize
-    }
-
-    /// The same span as a [`SlotCount`], which is what [`install_host_blocks`] takes: a page count may
-    /// only be derived from this, and only by `RowPages::holding`.
-    pub(crate) fn kv_span_slots(&self, writing: u32) -> SlotCount {
-        SlotCount::new(self.kv_hist.end().get().saturating_add(writing))
-    }
-
-    /// Record the `n` slots a launch just wrote for this request, at the slot the launch used.
-    ///
-    /// The ONLY way the history moves, and it takes a [`BatchSlot`] rather than a number so the slot it
-    /// records is provably the slot the forward was bound at. The mask of the NEXT step is built from
-    /// this, so a recorded slot the card did not write, or a written slot not recorded, is a request
-    /// attending keys that are not its own.
-    pub(crate) fn record_kv(
-        &mut self,
-        at: scratchy_subtile::sdsc_abstract::BatchSlot,
-        n: scratchy_subtile::sdsc_abstract::SlotCount,
-    ) {
-        self.kv_hist.record(at, n);
-    }
-
-    // ⛔⛔⛔ THERE IS NO `record_kv_solo(n)`, AND ITS ABSENCE IS THE LOCK.
-    //
-    // It took a COUNT and DERIVED the slot from this request's own end. That is exactly the shape the
-    // 2026-08-12 defect needed: a prefill chunk that had STEPPED BACK to keep its padded window inside
-    // one page wrote at `placed`, and this function recorded the same count at the UN-stepped-back end,
-    // marking `back` slots valid that no chunk wrote (450-token prompt: history 514 vs position 450).
-    //
-    // With it gone, no API takes a count and guesses where it goes. A prefill chunk records through
-    // `record_chunk`, whose `ChunkWrite` can only be minted by `ChunkStart::wrote` — the start the
-    // placement function actually chose. A decode step must name its `BatchSlot` at the call site, so
-    // "the slot came from somewhere other than the write" is visible in the caller rather than hidden
-    // behind a convenience.
-
-    /// Record the run a prefill chunk WROTE, at the slot [`PagedKvPool::chunk_write_start`] placed it.
-    pub(crate) fn record_chunk(&mut self, w: scratchy_subtile::sdsc_abstract::ChunkWrite) {
-        self.kv_hist.record_chunk(w);
     }
 }
