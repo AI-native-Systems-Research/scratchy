@@ -1012,13 +1012,103 @@ mod tests {
         );
     }
 
+    /// A row of `vocab` logits: tokens 0..1024 strictly descending from 1.0 — the candidates a
+    /// top_k 0 step holds — then `tail`'s `(count, logit)` runs, each below every candidate. Its
+    /// probabilities at T = 1, in f64.
+    fn candidates_then(vocab: usize, tail: &[(usize, f32)]) -> (Vec<f32>, Vec<f64>) {
+        let mut logits: Vec<f32> = (0..1024).map(|i| 1.0 - i as f32 * 1e-3).collect();
+        for &(count, logit) in tail {
+            assert!(
+                logit < logits[1023],
+                "a tail logit {logit} among the candidates"
+            );
+            logits.extend(std::iter::repeat_n(logit, count));
+        }
+        assert_eq!(logits.len(), vocab);
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let exps: Vec<f64> = logits.iter().map(|&l| (l as f64 - max).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        (logits, exps.iter().map(|e| e / sum).collect())
+    }
+
+    /// The uniform inside token `last`'s share of the kept tokens `0..=last`, at its middle.
+    fn uniform_at_last(probs: &[f64], last: usize) -> f32 {
+        let kept: f64 = probs[..=last].iter().sum();
+        (1.0 - 0.5 * probs[last] / kept) as f32
+    }
+
+    #[test]
+    fn top_p_without_top_k_measures_the_whole_row() {
+        let Some(device) = crate::device::detect_device() else {
+            eprintln!("skipping: no metal device");
+            return;
+        };
+        let device = device.device.clone();
+        // The candidates (the top 1024) weigh about half the row, less than top_p. With no top-k,
+        // vLLM's nucleus is 0.95 of the whole row's mass, past every candidate: all 1024 are kept,
+        // and a uniform in the last one's share draws it, token 1023.
+        let (logits, probs) = candidates_then(4096, &[(3072, -0.5)]);
+        let candidates: f64 = probs[..1024].iter().sum();
+        assert!(candidates < 0.9, "the candidates weigh {candidates}");
+        let u = uniform_at_last(&probs, 1023);
+        let Some(got) = run_metal_sample(&device, &logits, 1.0, 0, 0.95, 0.0, u) else {
+            eprintln!("skipping: no MTL4 queue");
+            return;
+        };
+        assert_eq!(got, 1023, "u={u}: every candidate is in the nucleus");
+    }
+
+    #[test]
+    fn min_p_alone_measures_its_survivors_past_the_candidates() {
+        let Some(device) = crate::device::detect_device() else {
+            eprintln!("skipping: no metal device");
+            return;
+        };
+        let device = device.device.clone();
+        // min_p 0.1 keeps the top 1024 and 81 tokens past them (e^-2 of the max), and cuts the
+        // 15279 below (e^-4). vLLM applies min-p, then softmaxes the survivors for top-p: the
+        // nucleus is 0.95 of the 1105 survivors' mass, which the top tokens reach inside the 1024
+        // candidates. Computed here in f64, independently of either kernel reference.
+        let (logits, probs) = candidates_then(16384, &[(81, -1.0), (15279, -3.0)]);
+        let survivors: f64 = probs[..1105].iter().sum();
+        let nucleus = 0.95 * survivors;
+        let mut cumsum = 0.0f64;
+        let last = (0..1105)
+            .find(|&i| {
+                cumsum += probs[i];
+                cumsum > nucleus
+            })
+            .expect("the nucleus ends inside the survivors");
+        assert!(
+            last < 1023,
+            "the nucleus ends at {last}, inside the candidates"
+        );
+        // The crossing is far from both of its tokens' edges next to f32's rounding of the sums.
+        let (over, under) = (cumsum - nucleus, nucleus - (cumsum - probs[last]));
+        assert!(
+            over.min(under) > 1e-4 * survivors,
+            "the crossing is {over} / {under} from its edges"
+        );
+        let u = uniform_at_last(&probs, last);
+        let Some(got) = run_metal_sample(&device, &logits, 1.0, 0, 0.95, 0.1, u) else {
+            eprintln!("skipping: no MTL4 queue");
+            return;
+        };
+        assert_eq!(
+            got as usize, last,
+            "u={u}: the survivors' nucleus ends at {last}"
+        );
+    }
+
     // =======================================================================
     // Parity harness: pure-Rust CPU golden vs the REAL metal sampler pipeline.
     //
-    // The golden mirrors cuda `sample_top_k_top_p_core` (the spec) EXACTLY:
+    // The golden mirrors cuda `sample_top_k_top_p_core`'s pipeline:
     //   softmax(logit/T) -> radix-select top-k threshold -> min-p ->
     //   two-phase compaction -> sort desc -> top-p cutoff -> categorical draw
-    //   with the SAME host uniform (cumsum >= uniform*total).
+    //   with the SAME host uniform (cumsum >= uniform*total) —
+    // its top-p cutoff measured against the mass the top-k and min-p cuts keep, as vLLM's
+    // `apply_top_k_top_p` and Splash's `distribution_end` measure it.
     //
     // Because the GPU sum_exp reduction and Metal's `exp` differ from the
     // host by a few ULP, we only demand an EXACT token match when the draw is
@@ -1151,16 +1241,33 @@ mod tests {
         // Phase 5: sort descending by probability.
         cand.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
 
-        // Phase 6: top-p cutoff (inclusive: first index where cumsum > top_p).
+        // Phase 6: top-p cutoff (inclusive: the first index whose cumsum passes top_p of the mass
+        // the cuts keep — the candidates' when a top-k cut keeps no more tokens than they hold; past
+        // them, the row's above the cut and a top-k's kept ties; with no cut, the whole row's, 1).
+        let top_k_cut = top_k > 0 && (top_k as usize) < vsize;
+        let strict_kept = strict_count_full.min(effective_k);
+        let ties_kept = tied_count.min(effective_k - strict_kept);
+        let kept: f32 = if top_k_cut && strict_kept + ties_kept <= MAX_CANDIDATES {
+            cand.iter().map(|c| c.0).sum()
+        } else if top_k_cut {
+            let above: f32 = probs.iter().filter(|&&p| p > threshold_prob).sum();
+            above + ties_kept as f32 * threshold_prob
+        } else if min_p > 0.0 {
+            let floor = min_p * inv_sum;
+            probs.iter().filter(|&&p| p >= floor).sum()
+        } else {
+            1.0
+        };
+        let nucleus = top_p * kept;
         let mut cumsum = 0.0f32;
         let mut cutoff = num_candidates;
         let mut topp_margin = f32::INFINITY;
-        for (i, c) in cand.iter().enumerate() {
+        for (i, c) in cand.iter().enumerate().take_while(|_| top_p < 1.0) {
             let before = cumsum;
             cumsum += c.0;
-            if cumsum > top_p {
+            if cumsum > nucleus {
                 cutoff = i + 1;
-                topp_margin = (cumsum - top_p).min(top_p - before);
+                topp_margin = (cumsum - nucleus).min(nucleus - before);
                 break;
             }
         }
@@ -1986,8 +2093,8 @@ mod tests {
     /// cuda's selection and draw on the pipeline's probability row: the threshold
     /// (the cap-th largest bits, then the min-p floor over the row's max
     /// probability), the candidates (every strict one, then each slice's share
-    /// of the tied ones, slices in order), the top-p cutoff and the draw with
-    /// the finalize's sequential f32 sums. Returns the threshold, the drawn
+    /// of the tied ones, slices in order), the top-p cutoff against the mass the
+    /// candidates keep, and the draw, with the finalize's sequential f32 sums. Returns the threshold, the drawn
     /// candidate's probability and the tokens that may carry it.
     fn reference_draw(f: &Formed, draw: Draw, uniform: f32) -> (u32, u32, Vec<u32>) {
         let probs = &f.probs;
@@ -2030,11 +2137,36 @@ mod tests {
         }
         cand.sort_unstable_by(|a, b| b.cmp(a));
         let p = |b: u32| f32::from_bits(b);
+        // The mass the cuts keep: a top-k cut's (the reference's cap holds them all) is the
+        // candidates'; min-p alone is the row's at or above its floor, summed as the finalize's
+        // threads stride the row and its block reduction merges them; no cut keeps the whole row.
+        let kept = if draw.top_k > 0 && (draw.top_k as usize) < vocab {
+            cand.iter().fold(0.0f32, |t, &b| t + p(b))
+        } else if draw.min_p > 0.0 {
+            let max_prob = f32::from_bits(*probs.iter().max().expect("a row"));
+            let floor = draw.min_p * max_prob;
+            let threads: Vec<f32> = (0..SAMPLER_TG_SIZE)
+                .map(|t| {
+                    (t..vocab).step_by(SAMPLER_TG_SIZE).fold(0.0f32, |s, i| {
+                        s + if p(probs[i]) >= floor {
+                            p(probs[i])
+                        } else {
+                            0.0
+                        }
+                    })
+                })
+                .collect();
+            let warps: Vec<f32> = threads.chunks(32).map(butterfly_sum).collect();
+            butterfly_sum(&warps)
+        } else {
+            1.0
+        };
+        let nucleus = draw.top_p * kept;
         let mut cumsum = 0.0f32;
         let mut cutoff = cand.len();
-        for (i, &b) in cand.iter().enumerate() {
+        for (i, &b) in cand.iter().enumerate().take_while(|_| draw.top_p < 1.0) {
             cumsum += p(b);
-            if cumsum > draw.top_p {
+            if cumsum > nucleus {
                 cutoff = i + 1;
                 break;
             }
