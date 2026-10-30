@@ -1988,8 +1988,8 @@ impl Latency<'_> {
     /// the other, cyan or red as scratchy's is the sooner or later, its factor written over it.
     /// Time runs on a log axis [`ECDF_SPAN`] wide, centred on the engines' medians: a ratio, the
     /// factor's included, is one width on every chart. Bare: no axis titles or tick labels,
-    /// `tag`'s lines in its corner; as wide as its column and `height` high.
-    fn ecdf(&self, k: CellKey, t: RequestTiming, tag: &[&str], label: &str, height: &str) -> Element {
+    /// `tag`'s lines in its corner; as wide as its column, [`ECDF_ASPECT`] wide for its height.
+    fn ecdf(&self, k: CellKey, t: RequestTiming, tag: &[&str], label: &str) -> Element {
         let curves: Vec<(Engine, Vec<f64>)> = (self.engines.iter())
             .filter_map(|&e| {
                 let rs = self.cell(e, k)?.requests.as_ref()?;
@@ -2108,7 +2108,9 @@ impl Latency<'_> {
                         .collect(),
                 }),
                 heatmap: None,
-                height: height.to_string(),
+                // Its box decides, as the mini heat maps' does: as wide as its column, as tall as
+                // ECDF_ASPECT makes it.
+                height: "100%".to_string(),
                 width: Some("100%".to_string()),
                 legend: Some(Enabled { enabled: false }),
                 locale: None,
@@ -2144,7 +2146,7 @@ impl Latency<'_> {
         };
         rsx! {
             div { style: "position: relative; width: 100%",
-                {chart(&spec, label, "width: 100%", None)}
+                {chart(&spec, label, &format!("width: 100%; aspect-ratio: {ECDF_ASPECT}"), None)}
                 div { style: "position: absolute; top: 0; left: 0; padding: 2px 4px; font-size: 0.625rem; font-weight: 600; pointer-events: none",
                     for line in tag { div { "{line}" } }
                 }
@@ -2218,9 +2220,13 @@ enum UsersNamed {
 /// A glance sparkline's height; each is as wide as its column.
 const GLANCE_CHART_HEIGHT: &str = "4.5rem";
 
-/// The latency tab's ECDFs' height: about 1.8 wide for 1 high in its four prompt columns, so a
-/// quantile reads off the share axis (each of a cell's 50 requests some 3px), not a sparkline's.
-const ECDF_HEIGHT: &str = "9rem";
+/// Every latency ECDF's width for its height, whatever its column's width: wide enough that a
+/// ratio across reads, tall enough that a quantile reads off the share axis, not a sparkline's.
+const ECDF_ASPECT: &str = "9 / 5";
+
+/// The latency tab's prompt columns: at least wide enough that at [`ECDF_ASPECT`] each of a
+/// cell's 50 requests is some 3px up its share axis; the tab's tile widens to hold them.
+const ECDF_COLUMN: &str = "minmax(16rem, 1fr)";
 
 /// The ratio every latency ECDF spans edge to edge, so a ratio is one width on all of them
 /// ([`Latency::ecdf`]): ×1.8 a little over half. Over the runs published by 2026-10-30, it holds
@@ -2382,9 +2388,7 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
                         "{} of every request, {i} in {o} out {u} at once, {mid}",
                         RequestTiming::E2el.title()
                     );
-                    // As wide as the bubble charts, about 1.8 to 1.
-                    let height = Px(PANEL_SIDE.0 * 5 / 9).to_string();
-                    l.ecdf((u, o, i), RequestTiming::E2el, &["E2EL"], &about, &height)
+                    l.ecdf((u, o, i), RequestTiming::E2el, &["E2EL"], &about)
                 }
             },
         )
@@ -3297,7 +3301,9 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                 }
                             }
                             ContentPanel { id: slug(LATENCY), shown: false,
-                                div { style: "contain: inline-size", {latency_panel(machines, &rows, &classes, model_of)} }
+                                // Not contained: its charts' columns (ECDF_COLUMN) widen the tile to
+                                // hold them; its text adds no width of its own.
+                                div { {latency_panel(machines, &rows, &classes, model_of)} }
                             }
                         }
                     }
@@ -3347,10 +3353,10 @@ fn latency_panel<'l>(
         let about = format!("{stem} on {chip}");
         // A 1-user cell its TTFT's and TPOT's distributions, one over the other; a cell under load
         // its end-to-end time's ([`Load`]). Each chart names its own users count, under its timing.
-        l.multiple(o, "minmax(0, 1fr)", &format!("{stem} · {o}-token answers"), UsersNamed::InCells, |(u, o, i)| {
+        l.multiple(o, ECDF_COLUMN, &format!("{stem} · {o}-token answers"), UsersNamed::InCells, |(u, o, i)| {
             let label = |t: RequestTiming| format!("{} of every request, {i} in {o} out {u} at once, {about}", t.title());
             let users = users_at(u);
-            let ecdf = |t: RequestTiming, tag: &str| l.ecdf((u, o, i), t, &[tag, &users], &label(t), ECDF_HEIGHT);
+            let ecdf = |t: RequestTiming, tag: &str| l.ecdf((u, o, i), t, &[tag, &users], &label(t));
             rsx! {
                 Stack { gap: 1,
                     match Load::of(u) {
@@ -3382,8 +3388,9 @@ fn latency_panel<'l>(
         script { dangerous_inner_html: LATENCY_JS }
         div { style: "padding-top: var(--cds-spacing-05)",
             Stack { gap: 5,
-                // The engines' colours keyed in the text itself: "● scratchy versus ● oMLX".
-                p {
+                // The engines' colours keyed in the text itself: "● scratchy versus ● oMLX". It
+                // wraps to the charts' width, adding none of its own.
+                p { style: "contain: inline-size",
                     for (n, (&e, class)) in latency_engines(machines).iter().zip(["s1", "s2"]).enumerate() {
                         if n > 0 { " versus " }
                         {engine_key(e, class)}
