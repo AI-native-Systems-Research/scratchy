@@ -1,123 +1,123 @@
-# Building & verifying scratchy
+# Spyre tensor parallelism — the rules for this worktree
 
-## Architecture invariants
+The job: **CB-pipelined tensor parallelism (TP) for spyre.** Every change on
+this branch answers to the rules below. There is no Spyre card on this
+machine, so everything is checked by compiling: Rust builds and tests, plus
+dxp bakes through
+`/Users/moosevan/tmp/dt_src/build/dxp/dxp_standalone`.
 
-`dsl_math + weights → weight_loader_fn() + forward_fn() + instruction_tape`
+## The TP rules
 
-- `forward_fn()` **plays the tape**, injecting the loaded weights. Nothing else.
-- **Everything is a compile-time constant.** `#[forward]` runs the whole
-  pipeline at expansion — op tape, reroll, layer classes, slot coloring,
-  lifetimes, barriers, arena sizes, kernel selection — and emits per-bucket
-  `static` tapes of each runtime's own types. No runtime lowering, no runtime
-  analysis, no mirror types.
-- **Everything common is shared.** One implementation of every target-neutral
-  pass, consumed by both spyre and metal. Target-ABI facts (in-place kernels,
-  write bindings, symbol pickers, barrier classes) are const tables the shared
-  passes take as *input* — never logic, never scattered match arms.
-- **Per-target surface = opcode lowering only.** A new arch touches
-  metal/spyre only if it introduces a new opcode, and then only one emitter
-  arm per target plus one registry row.
-- **No instruction selection** for spyre or metal — the tape comes straight
-  from the fused forward. ISel (`solver`, `cost`, the `impl Implementation`
-  blocks) is cuda-gated and stays that way.
+1. **CB-pipelined.** A collective is control blocks in the *same* CB
+   stream as the compute CBs that produce and consume its operands:
+   producer compute CB → p2p DMA CBs → write-done wait → reduce compute CB.
+   The host never sits between a producer, its collective and its consumer:
+   no D2H, no host sum, no host barrier, no per-collective submit
+   round-trip.
+2. **AoT as much as possible.** These are all compile-time constants,
+   emitted by `#[forward]`:
+   - each tensor's shard layout,
+   - where every collective sits on the tape,
+   - the inbox buffers and their per-source slots,
+   - the reduction order,
+   - each DMA CB's segment-relative source and destination,
+   - the CB sequence itself.
+
+   The one thing bound at load is which physical peer card sits at each
+   rank, i.e. the p2p window base. That is a load-time constant, never a
+   per-step computation.
+3. **dxp_standalone and runtime errors are Rust type invariants.** Every
+   refusal `dxp_standalone` can raise for a TP shape, and every runtime
+   error the TP path can hit, is unrepresentable in the types or fails the
+   build. That covers:
+   - shard divisibility,
+   - stick and segment alignment,
+   - LX capacity,
+   - message size cap (`MAX_HDMA_MESSAGE_BYTES`),
+   - peer rank out of bounds,
+   - sending to self,
+   - an unattached peer,
+   - a window that is too small,
+   - mismatched world sizes across the bake and the load.
+
+   Use typed constructors, const generics and `const { assert!(..) }`.
+   A runtime check stands in only where the type system genuinely cannot
+   express the fact, and then it comes with a test that triggers it.
+4. **P2P RDMA, never host RDMA.** Cross-card bytes move card-to-card over
+   the cross-port IOMMU mapping (`P2pProtocol::P2pRdma`,
+   `senlib_ffi::p2p_create_mapping`). Never stage through host memory
+   (`HostDma` / HDMA), and never fall back to it: a topology without p2p is
+   a refusal, not a slower path.
+5. **Collectives are woven into the tape by analysis, never by hacking.**
+   Where an AllReduce or AllGather goes falls out of sharding propagation
+   over the dataflow graph:
+   - a contraction over a split axis yields a partial sum;
+   - a partial sum that meets a consumer needing a whole value gets an
+     AllReduce;
+   - a split value that meets a consumer needing the full axis gets an
+     AllGather.
+
+   Shard layouts are derived from the graph too. Banned: matching on weight
+   names (`o_proj`/`down_proj`), per-arch shard tables, and hand-placed
+   collectives.
+
+## The design record: issue #1007
+
+[#1007](https://github.com/AI-native-Systems-Research/scratchy/issues/1007) holds
+the lessons from the earlier attempt. Read it before touching emission or the
+runtime. Its §3 (on-card protocol), §4 (hardware facts) and §5 (proof standard)
+bind this work:
+
+- **Recv window:** one per (card, peer), in seg1, sized at bake; cap 4 MiB
+  (the RDMA length field).
+- **Sends:**
+  - F-send singlecast only;
+  - one sid per rank;
+  - strict per-collective ring order: send → wait → consume;
+  - wdone is a counter.
+- **The send CB needs three facts:** xlat completeness, the compensated xseg
+  word, and the receiver-programmed XSEG register.
+- **Engine compensation:** the engine writes one flit (128 B) below the named
+  destination.
+- **Consumes:**
+  - `TpConsume` is a singleton launch group;
+  - tp consumers launch through `tp_recv_where` (`byte_off[SEG_WEIGHT] = 0`,
+    bank 0);
+  - `TpIdentity { rank, world }` is one fact.
+- **Gates:**
+  - tp=1 byte-identity is the hard gate;
+  - a static audit of every collective operand's address must pass before any
+    card run.
+
+Its §1–2 *sharding mechanism* (a hand-declared bounds list, and name-matching
+inserts in `tp_lowering.rs`) is superseded here by rule 5. Collectives come
+from `scratchy_subtile::tensor_parallel::shard`.
+
+## Architecture invariants (unchanged, still binding)
+
+- `dsl_math + weights → weight_loader_fn() + forward_fn() + instruction_tape`.
+  `forward_fn()` plays the tape; everything is a compile-time constant.
+- **Everything common is shared.** The sharding analysis and collective
+  insertion are target-neutral passes; at world size 1 they are a strict
+  no-op. Target-ABI facts are const tables the shared passes take as input.
+- **Per-target surface = opcode lowering only.** A collective is a new
+  opcode: one registry row (`crates/compiler/subtile/src/ops.rs`) plus one
+  lowering arm per target that runs it.
+- **One bake serves every rank (SPMD).** Rank-dependence lives only in DMA CB
+  destination addresses, bound at load; never in a baked program.
+- **Every rank computes bit-identical replicated values.** Reduction order is
+  canonical, by absolute rank, on every rank.
 - No new env-var behavior toggles; no `#[allow]`; no weakening tests
-  ([`docs/TESTING.md`](docs/TESTING.md) says which tests stay tests, and what weakening one means).
+  ([`docs/TESTING.md`](docs/TESTING.md)).
+- Spyre-specific code is limited to: lowering to SuperDSC, launch, and
+  allocs + d2h + h2d (here: the p2p DMA CBs).
 
-## The model crate
-All model architectures compile into ONE crate, **`scratchy-models`**
-(`crates/models/arch/`); quant presets live on a separate crate,
-**`scratchy-quantizations`** (`crates/models/quantization/`) — two crates
-because Cargo won't alias one crate under two names, and `scratchy-cli`
-needs both `model` and `quant` as short CLI aliases. Speculative-decoding
-drafters are a third alias on a third crate, **`scratchy-spec`**
-(`crates/models/spec/`): `metal` already compiles the MTP head of every
-selected model whose checkpoint carries one, and its default drafter published
-as a model of its own (Gemma 4 26B-A4B's assistant at MLX 4-bit g32, under
-`quant/mlx`) (`mtp-heads`), and `spec/mtp` adds the other published drafters
-(the bf16 and QAT assistants). None has
-a default scope: naming zero models is
-a **build-time panic**, not a silent empty binary. Every checked-in `configs/<arch>/<stem>.json` gets its own `<stem>`
-feature (`model/<stem>` from the CLI, `model/<arch>`/`model/all` to widen);
-every quant preset gets its own `<preset>` feature (`quant/<preset>`,
-`quant/mlx` for every MLX affine preset at once) — a selected preset
-**replaces** a model's dense/bf16 emission, it doesn't add to it. See
-[`docs/BUILD.md`](docs/BUILD.md) for the full mechanics.
+## Build and verify
 
-## Build
-```bash
-# The CLI you run. Pick ONE backend: metal (macOS) or cuda. Add serve for HTTP.
-# Name at least one model — this fails loudly (build-time panic) otherwise.
-cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
-```
-- No default model/quant scope, so every build names its own — no
-  `--no-default-features` dance needed to narrow to one specific model, just
-  name that one model and nothing else. Widen with e.g.
-  `--features metal,model/qwen2.5-7b` or `--features metal,model/all`
-  (CI's scope).
-- **When iterating/verifying a change, scope to exactly the one model you
-  need to keep the build fast**: `-Fmodel/<stem>` (e.g. `-Fmodel/llama-3.2-1b`
-  or `-Fmodel/smollm2-135m` for the smallest/quickest option), plus
-  `-Fquant/<preset>` only if the change is quant-specific. Never build
-  `model/<arch>` or `model/all` just to test one thing — that forward-expands
-  every config in scope (minutes-to-hours, OOM risk on a laptop).
-- `cuda` and `metal` are mutually exclusive.
-- Multimodal (vision arches + the `image`/`scratchy-vision` decode stack) is
-  opt-in via the `multimodal` feature on `scratchy-cli` (on by default
-  there) — a plain `chat`-only build never compiles image/png/zune-jpeg/etc.
-- List cached models with `scr model ls`; run a model in-process with
-  `scr chat -m <model> --device metal -q "..."` (no image arg — images need the
-  HTTP server, i.e. the `serve` feature + `scr serve ... --kv-cache-dtype ...`).
-
-## Verify like CI before opening a build / deps / codegen PR
-`.github/workflows/rust.yml`: the **linux-cuda** job runs
-`cargo clippy --workspace --features cuda,scratchy-models/all,scratchy-models/mtp
---exclude scratchy-target-metal --exclude scratchy-target-metal-compiler
--- -D warnings` (both depend unconditionally on Apple-only `objc2` — the
-compiler crate via its own edge to scratchy-target-metal — and `--workspace`
-builds every member as a root regardless of `--features`, so excluding only
-one of the two still drags `objc2` onto Linux); the **macOS** job
-runs `cargo clippy -p scratchy-models --features metal,all,mtp,turboquant -- -D warnings`
-+ kernel tests (`mtp` adds the multi-token-prediction head of every model whose
-checkpoint carries one: heads have no configs of their own, so `all` alone
-compiles none). It sets `SCRATCHY_GPU=h100`, `CUDA_COMPUTE_CAP=90`,
-`SCRATCHY_SKIP_CUDA_KERNELS=1` (so `scratchy-builder-cuda`'s build script doesn't
-need a GPU/nvcc). Both `all` runs are the full-scope case —
-expect it to be slow (every config, every arch) and RAM-heavy; that's expected
-CI-scale cost, not a regression.
-
-Reproduce the **x86_64** linux-cuda gate in a container (Apple Silicon runs it
-amd64-emulated — slow but faithful; a native aarch64 run is faster but not the
-CI arch):
-```bash
-docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
-  -e SCRATCHY_GPU=h100 -e CUDA_COMPUTE_CAP=90 -e SCRATCHY_SKIP_CUDA_KERNELS=1 \
-  nvidia/cuda:12.9.1-devel-ubuntu22.04 bash -c '
-    apt-get update -qq && apt-get install -y -qq curl git pkg-config libssl-dev ca-certificates >/dev/null 2>&1
-    curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy >/dev/null 2>&1
-    export PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH
-    cargo clippy --workspace --features cuda,scratchy-models/all,scratchy-models/mtp \
-      --exclude scratchy-target-metal \
-      --exclude scratchy-target-metal-compiler -- -D warnings'
-```
-The macOS metal CI job runs locally via `scripts/act-local.sh` when present.
-
-See [`README.md`](README.md) (Building), [`docs/BUILD.md`](docs/BUILD.md), and
-[`docs/MODELS.md`](docs/MODELS.md) for detail.
-
-## Commits & PR titles
-Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for
-both, scoped to the crate or area touched (`fix(metal): ...`).
-
-## Agent skills
-
-### Issue tracker
-
-GitHub Issues on `AI-native-Systems-Research/scratchy`; always pass `gh -R`. Specs and plans are files under `docs/superpowers/`, not issues. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Default five-role vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-`CONTRIBUTING.md`, `docs/*.md`, and specs/plans under `docs/superpowers/`; root `GLOSSARY.md` + `docs/adr/` once `/domain-modeling` creates them. See `docs/agents/domain.md`.
+- Scope every build to one model: `-Fmodel/<stem>` (e.g.
+  `-Fmodel/granite-3.1-8b-instruct` or `-Fmodel/smollm2-135m`). Never
+  `model/all` to test one thing.
+- Commits and PR titles use Conventional Commits scoped to the crate or area
+  (`feat(spyre): ...`).
+- See [`docs/BUILD.md`](docs/BUILD.md) and [`README.md`](README.md) for the
+  general build.
