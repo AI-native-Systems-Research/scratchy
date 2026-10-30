@@ -28,6 +28,7 @@ const PREFILL: &str =
     include_str!("../../../targets/spyre/kernels/page_attn_head_major_prefill.py");
 const KV_WRITE: &str =
     include_str!("../../../targets/spyre/kernels/reshape_and_cache_head_major.py");
+const BATCHED: &str = include_str!("../../../targets/spyre/kernels/batched_decode_head_major.py");
 
 /// A kernel through the whole ladder to the emulator's IR.
 fn lower(src: &str, spec: &KernelSpec) -> IRFunction<'static> {
@@ -564,4 +565,158 @@ fn a_prompt_chunk_over_a_cached_prefix_matches_spyre_inference() {
 #[test]
 fn a_first_prompt_chunk_matches_spyre_inference() {
     the_step_matches_spyre_inference("paged_attn_prefill_first");
+}
+
+/// ⭐ SEVERAL SEQUENCES' DECODE IN ONE LAUNCH — `batched_decode_head_major_kernel` over the pools
+/// and the tiled walk's metadata (`gen_paged_attn_data.py`'s `BATCHED_CONFIGS`), held to
+/// spyre-inference's own kernel at its own chunking.
+struct Batch {
+    step: Step,
+    seqs: i128,
+    blocks_per_chunk: i128,
+    num_chunks: i128,
+}
+
+impl Batch {
+    fn load(config: &str) -> Batch {
+        let step = Step::load(config);
+        let t = &step.meta["derived"]["triton"];
+        let get = |v: &serde_json::Value| v.as_i64().expect("an integer") as i128;
+        Batch {
+            seqs: get(&step.meta["seqs"]),
+            blocks_per_chunk: get(&t["blocks_per_chunk"]),
+            num_chunks: get(&t["num_chunks"]),
+            step,
+        }
+    }
+
+    fn entries(&self) -> i128 {
+        self.blocks_per_chunk * self.seqs
+    }
+
+    /// The kernel's answer for these query rows and page ids (each as recorded unless replaced).
+    fn attend(&self, rep_row_ids: &[i32], page_ids: &[i32]) -> Vec<f64> {
+        let s = &self.step;
+        let (nqh, nkvh, hd) = (s.geom("NQH"), s.geom("NKVH"), s.geom("HD"));
+        let (block, pages) = (s.geom("BLOCK"), s.geom("NUM_PAGES"));
+        let mut k = spec(
+            "batched_decode_head_major.py",
+            "batched_decode_head_major_kernel",
+            &[
+                ("query", "*fp16"),
+                ("rep_row_ids", "*i32"),
+                ("k_pages", "*fp16"),
+                ("v_pages", "*fp16"),
+                ("chunk_page_ids", "*i32"),
+                ("mask_by_chunk", "*fp16"),
+                ("out", "*fp16"),
+            ],
+            &[
+                ("NUM_TOKENS", self.seqs),
+                ("NUM_SEQS", self.seqs),
+                ("BLOCKS_PER_CHUNK", self.blocks_per_chunk),
+                ("NUM_CHUNKS", self.num_chunks),
+                ("NUM_KV_HEADS", nkvh),
+                ("NUM_QUERIES_PER_KV", nqh / nkvh),
+                ("BLOCK_SIZE", block),
+                ("HEAD_SIZE", hd),
+                ("NUM_PAGES", pages),
+            ],
+        );
+        k.signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
+        k.constexprs.insert(
+            "SCALE".to_string(),
+            Val::Float(s.meta["derived"]["scale"].as_f64().expect("scale")),
+        );
+        let f = lower(BATCHED, &k);
+        let (rows, width) = (self.seqs as usize, (nqh * hd) as usize);
+        let e = self.entries() as usize;
+        let page = vec![pages as usize, (nkvh * block * hd) as usize];
+        let out = run(
+            &f,
+            vec![
+                s.arg("q", vec![rows, width]),
+                i32_arg(rep_row_ids, vec![e]),
+                s.arg("kp", page.clone()),
+                s.arg("vp", page),
+                i32_arg(page_ids, vec![self.num_chunks as usize * e]),
+                s.arg(
+                    "mask",
+                    vec![self.num_chunks as usize * e * nkvh as usize, block as usize],
+                ),
+                f16_arg(&vec![0.0; rows * width], vec![rows, width]),
+            ],
+        );
+        out.last().expect("the out operand").clone()
+    }
+
+    fn words(&self, key: &str) -> Vec<i32> {
+        let (raw, _, _) = self.step.file(key);
+        raw.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| i32::from_le_bytes(*w))
+            .collect()
+    }
+}
+
+fn the_batch_matches_spyre_inference(config: &str) {
+    let b = Batch::load(config);
+    let (rep, ids) = (b.words("rep_row_ids"), b.words("chunk_page_ids"));
+    let got = b.attend(&rep, &ids);
+    let (exact, served) = (b.step.values("out_f32"), b.step.values("out_f16"));
+    let err = max_abs(&got, &exact);
+    let theirs = max_abs(&served, &exact);
+    // The gate of `the_step_matches_spyre_inference`: a small multiple of spyre-inference's own
+    // f16-vs-f32 miss.
+    let gate = 4.0 * theirs.max(5e-4);
+    println!(
+        "{config}: B={} J={} C={}: max|ours - f32| {err:.3e}, spyre-inference's own f16 \
+         {theirs:.3e}, max|ours - their f16| {:.3e}, gate {gate:.3e}",
+        b.seqs,
+        b.blocks_per_chunk,
+        b.num_chunks,
+        max_abs(&got, &served)
+    );
+    assert!(
+        err < gate,
+        "{config}: {err:.3e} from spyre-inference's answer, gate {gate:.3e}"
+    );
+
+    // CONTROL 1 — each sequence attends its OWN query: rotating the sequences' query rows must
+    // miss (a kernel reading one row for every entry would not).
+    let rotated_rows: Vec<i32> = rep.iter().map(|&r| (r + 1) % b.seqs as i32).collect();
+    let miss = max_abs(&b.attend(&rotated_rows, &ids), &exact);
+    println!("{config}: rotated query rows miss by {miss:.3e}");
+    assert!(
+        miss > CONTROL_MARGIN * gate,
+        "{config}: rotated query rows still match ({miss:.3e})"
+    );
+    // CONTROL 2 — the pages are read THROUGH the ids: shifting every id by one page must miss.
+    let pages = b.step.geom("NUM_PAGES") as i32;
+    let shifted: Vec<i32> = ids.iter().map(|&p| (p + 1) % pages).collect();
+    let miss = max_abs(&b.attend(&rep, &shifted), &exact);
+    println!("{config}: shifted page ids miss by {miss:.3e}");
+    assert!(
+        miss > CONTROL_MARGIN * gate,
+        "{config}: shifted page ids still match ({miss:.3e})"
+    );
+}
+
+/// Three sequences in the 4-sequence bucket, one chunk: the slots share one maximum per sequence.
+#[test]
+fn a_decode_batch_matches_spyre_inference() {
+    the_batch_matches_spyre_inference("batched_decode");
+}
+
+/// Two chunks: each block slot keeps its own softmax, and the slots merge after the walk.
+#[test]
+fn a_decode_batch_over_two_chunks_matches_spyre_inference() {
+    the_batch_matches_spyre_inference("batched_decode_chunks");
+}
+
+/// A chunk under Triton's gather floor, padded to 8 entries with masked block slots.
+#[test]
+fn a_decode_batch_under_the_gather_floor_matches_spyre_inference() {
+    the_batch_matches_spyre_inference("batched_decode_floor");
 }
