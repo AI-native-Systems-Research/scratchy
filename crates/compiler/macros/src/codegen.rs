@@ -8120,6 +8120,15 @@ fn emit_canonical_params_impl(
     let draft_conv_group = *model.bounds.get("conv_group_size").unwrap_or(&0) as u32;
     let draft_selector_rank = *model.bounds.get("selector_rank").unwrap_or(&0) as u32;
     let draft_mask_token = *model.bounds.get("mask_token_id").unwrap_or(&0) as u32;
+    // Its rotary base: a drafter's ring ops rotate from it, so a drafter without one is a build
+    // error rather than a model that rotates every key by nothing.
+    let draft_rope_theta = match draft_conv_group {
+        0 => 0.0,
+        _ => (model.scalars.get("rope_theta").copied())
+            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+            .filter(|&theta| theta > 0.0)
+            .expect("a DFlash2 drafter's config names its rope_theta") as f32,
+    };
     let draft_capture_slots = (model.layer_sets.get(crate::config::DRAFT_CAPTURE_LAYERS))
         .map_or(0, |s| s.members().len() as u32);
 
@@ -8286,6 +8295,7 @@ fn emit_canonical_params_impl(
     let draft_conv_group_lit = proc_macro2::Literal::u32_unsuffixed(draft_conv_group);
     let draft_selector_rank_lit = proc_macro2::Literal::u32_unsuffixed(draft_selector_rank);
     let draft_mask_token_lit = proc_macro2::Literal::u32_unsuffixed(draft_mask_token);
+    let draft_rope_theta_lit = proc_macro2::Literal::f32_suffixed(draft_rope_theta);
     let draft_capture_slots_lit = proc_macro2::Literal::u32_unsuffixed(draft_capture_slots);
     let norm_weight_offset_lit =
         proc_macro2::Literal::f32_suffixed(norm_weight_runtime_offset(model));
@@ -8627,6 +8637,7 @@ fn emit_canonical_params_impl(
             draft_conv_group,
             draft_selector_rank,
             draft_mask_token,
+            draft_rope_theta,
             draft_capture_slots,
             target_hidden_width,
             target_routes_experts,
@@ -8673,6 +8684,7 @@ fn emit_canonical_params_impl(
             const DRAFT_CONV_GROUP: u32 = #draft_conv_group_lit;
             const DRAFT_SELECTOR_RANK: u32 = #draft_selector_rank_lit;
             const DRAFT_MASK_TOKEN: u32 = #draft_mask_token_lit;
+            const DRAFT_ROPE_THETA: f32 = #draft_rope_theta_lit;
             const TARGET_HIDDEN_WIDTH: usize = #target_hidden_width_lit;
             const TARGET_ROUTES_EXPERTS: bool = #target_routes_experts;
             const DRAFT_CAPTURE_SLOTS: u32 = #draft_capture_slots_lit;

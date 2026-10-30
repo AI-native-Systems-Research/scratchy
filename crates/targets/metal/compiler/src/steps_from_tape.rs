@@ -2342,7 +2342,6 @@ impl Recording<'_> {
                 let (qkv, out, layer) = (self.read(i, 0)?, out()?, LayerId(layer));
                 let mut sites = self.site(i, WeightKind::RmsNorm, self.source_arg(i, 1)?)?;
                 sites.extend(self.site(i, WeightKind::RmsNorm, self.source_arg(i, 2)?)?);
-                sites.push(self.rotary(i));
                 let mut e = em(S::DraftAttention(qkv, out, layer), &[qkv], &[out], sites);
                 // Its grouped queries, block keys and values and split partials.
                 e.sig.op_scratch = Access::Write;
@@ -2351,8 +2350,7 @@ impl Recording<'_> {
             }
             L::DraftContextKv { layer } => {
                 let (kv, layer) = (self.read(i, 0)?, LayerId(layer));
-                let mut sites = self.site(i, WeightKind::RmsNorm, self.source_arg(i, 1)?)?;
-                sites.push(self.rotary(i));
+                let sites = self.site(i, WeightKind::RmsNorm, self.source_arg(i, 1)?)?;
                 let mut e = em(S::DraftContextKv(kv, layer), &[kv], &[], sites);
                 e.sig.kv_w = Some(layer);
                 e

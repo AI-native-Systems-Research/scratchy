@@ -1370,14 +1370,11 @@ pub fn lower_decode_to_wavefront(
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
-            // draft_attention(qkv, q_norm, k_norm, positions, rotary) and
-            // draft_context_kv(kv, k_norm, positions, rotary): the drafter's ring ops at the layer
-            // their norms index.
+            // draft_attention(qkv, q_norm, k_norm, positions) and
+            // draft_context_kv(kv, k_norm, positions): the drafter's ring ops at the layer their
+            // norms index. Their kernels rotate at each row's position from the model's rotary
+            // base.
             OpKind::DraftAttention | OpKind::DraftContextKv => {
-                let head_dim = bx
-                    .geom
-                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?
-                    .hd();
                 let layer = node
                     .inputs
                     .iter()
@@ -1393,7 +1390,6 @@ pub fn lower_decode_to_wavefront(
                         op: node.op,
                         detail: "draft ring op without a layer-indexed norm",
                     })?;
-                let (cos, sin) = bx.cos_sin(head_dim.get(), false);
                 let norms = match node.op {
                     OpKind::DraftAttention => 1..3,
                     _ => 1..2,
@@ -1402,7 +1398,6 @@ pub fn lower_decode_to_wavefront(
                 for i in norms {
                     inputs.push(bx.input_at(tile, i)?);
                 }
-                inputs.extend([InputRef::Ext(cos), InputRef::Ext(sin)]);
                 let op = match node.op {
                     OpKind::DraftAttention => SubOp::DraftAttention {
                         layer,

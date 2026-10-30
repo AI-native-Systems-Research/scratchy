@@ -41,6 +41,8 @@ const CONV_GROUP: u32 = 16;
 const RANK: u32 = 256;
 const RMS_EPS: f32 = 1e-6;
 const SCALE: f32 = 0.088_388_35;
+/// The drafter's rotary base (`rope_parameters.rope_theta`).
+const THETA: f32 = 10_000_000.0;
 const ATTENTION: u32 = QUERY_HEADS * HEAD_DIM;
 const KV_WIDTH: u32 = KV_HEADS * HEAD_DIM;
 const QKV: u32 = ATTENTION + 2 * KV_WIDTH;
@@ -163,16 +165,19 @@ fn draft_constants(finish: bool) -> DraftConstants {
         conv_finish: u32::from(finish),
         rms_eps: RMS_EPS,
         scale: SCALE,
+        rope_theta: THETA,
     }
 }
 
-/// A rotary table of `positions` rows, `[position][cos | sin]` as the model's is laid out, of
-/// angles `(position · 64 + pair) · step`.
-fn rope_table(positions: u32, step: f32) -> Vec<f32> {
+/// The cosine and sine of every pair at `positions` positions, `[position][cos | sin]`, as Splash
+/// computes them in fp32 (RopeScaling.hpp:46 `rotaryInverseFrequencies`, rope.metal:51-54): the
+/// pair's inverse frequency `θ^(−pair / pairs)`, then its angle at the position. The reference
+/// the kernels' own computation is checked against; no kernel reads a table.
+fn rope_table(positions: u32) -> Vec<f32> {
     let mut table = vec![0.0f32; positions as usize * HEAD_DIM as usize];
     for p in 0..positions as usize {
         for d in 0..PAIRS {
-            let angle = (p * PAIRS + d) as f32 * step;
+            let angle = p as f32 * THETA.powf(-(d as f32) / PAIRS as f32);
             table[p * HEAD_DIM as usize + d] = angle.cos();
             table[p * HEAD_DIM as usize + PAIRS + d] = angle.sin();
         }
@@ -259,20 +264,19 @@ fn draft_conv_is_exact_cpu_arithmetic() {
 // ── draft_attention_qkv + draft_attention_reorder (`surroundingPhases`) ───────────────────────
 
 /// Every query and key head RMS-normalized (unit norm weights), rounded to bf16 and rotated by the
-/// table's pair at its row's position — within an ulp of the f64 rotation of the bf16-rounded
-/// norms plus an ulp of the larger input — every value head copied, and the reorder a pure
-/// permutation; the QKV input unwritten.
+/// pair's fp32 angle at its row's position (`rope_table`) — within an ulp of the f64 rotation of
+/// the bf16-rounded norms plus an ulp of the larger input — every value head copied, and the
+/// reorder a pure permutation; the QKV input unwritten.
 #[test]
 fn draft_prepare_and_reorder_match_reference() {
     let Some(gpu) = Gpu::new() else { return };
     let starts = [0u32, 2044, 6130, 77];
-    let rope = rope_table(6200, 0.01);
-    let b_rope = gpu.buffer(&rope);
+    let rope = rope_table(6200);
     let ones = vec![bits(1.0); HEAD_DIM as usize];
     let (q_norm, k_norm) = (gpu.buffer(&ones), gpu.buffer(&ones));
     let prepare = gpu.pipeline(
         "dflash2",
-        "draft_attention_qkv_bf16_rope_f32",
+        "draft_attention_qkv_bf16",
         draft_constants(true),
     );
     let reorder = gpu.pipeline(
@@ -304,7 +308,6 @@ fn draft_prepare_and_reorder_match_reference() {
                 (&queries, 1),
                 (&q_norm, 2),
                 (&k_norm, 3),
-                (&b_rope, 4),
                 (&b_pos, 5),
                 (&query_keys, 6),
                 (&query_values, 7),
@@ -605,8 +608,9 @@ const CONTEXT_ROW: usize = 2 * KV_WIDTH as usize;
 const UNTOUCHED: u16 = 0xC2C2;
 
 /// Checks the ring of pool slot `slot` against `rows` rows of `kv` written at `positions`: a row's
-/// key RMS-normalized, scaled by the key norm and rotated by the table's pair at its position, its
-/// value copied, into slot position % 2048 of each KV head's ring; every other slot keeps its bits.
+/// key RMS-normalized, scaled by the key norm and rotated by its pair's fp32 angle at its position,
+/// its value copied, into slot position % 2048 of each KV head's ring; every other slot keeps its
+/// bits.
 fn check_ring(
     keys: &[u16],
     values: &[u16],
@@ -679,7 +683,7 @@ fn prefill_draft_context_writes_each_sequence_into_its_ring() {
     let Some(gpu) = Gpu::new() else { return };
     let mut random = Random(0xc0de0000 + u64::from(HIDDEN));
     let norm = random.bf16s(HEAD_DIM as usize, 1.0);
-    let rope = rope_table(6200, 0.37);
+    let rope = rope_table(6200);
     let (first, second) = (37u32, 20u32);
     let tokens = first + second;
     let padded = 64u32;
@@ -692,10 +696,10 @@ fn prefill_draft_context_writes_each_sequence_into_its_ring() {
     let (b_keys, b_values) = (gpu.buffer(&pool), gpu.buffer(&pool));
     let pso = gpu.pipeline(
         "dflash2",
-        "prefill_draft_context_kv_bf16_rope_f32",
+        "prefill_draft_context_kv_bf16",
         draft_constants(true),
     );
-    let (b_kv, b_norm, b_rope) = (gpu.buffer(&kv), gpu.buffer(&norm), gpu.buffer(&rope));
+    let (b_kv, b_norm) = (gpu.buffer(&kv), gpu.buffer(&norm));
     let (b_pos, b_slots) = (gpu.buffer(&positions), gpu.buffer(&ring_slots));
     let (b_cu, b_n) = (gpu.buffer(&cu_seqlens), gpu.buffer(&[tokens]));
     let mut batch = gpu.batch();
@@ -704,7 +708,6 @@ fn prefill_draft_context_writes_each_sequence_into_its_ring() {
         &[
             (&b_kv, 0),
             (&b_norm, 1),
-            (&b_rope, 2),
             (&b_pos, 3),
             (&b_keys, 4),
             (&b_values, 5),
@@ -751,7 +754,7 @@ fn draft_context_commit_writes_each_lanes_retained_rows() {
     let Some(gpu) = Gpu::new() else { return };
     let mut random = Random(0xc0de0001 + u64::from(HIDDEN));
     let norm = random.bf16s(HEAD_DIM as usize, 1.0);
-    let rope = rope_table(6200, 0.37);
+    let rope = rope_table(6200);
     let starts = [2044u32, 0, 4101];
     let verify_rows = [8u32, 3, 5];
     let retained = [8u32, 2, 5];
@@ -772,10 +775,10 @@ fn draft_context_commit_writes_each_lanes_retained_rows() {
     let (b_keys, b_values) = (gpu.buffer(&pool), gpu.buffer(&pool));
     let pso = gpu.pipeline(
         "dflash2",
-        "draft_context_kv_commit_bf16_rope_f32",
+        "draft_context_kv_commit_bf16",
         draft_constants(true),
     );
-    let (b_kv, b_norm, b_rope) = (gpu.buffer(&kv), gpu.buffer(&norm), gpu.buffer(&rope));
+    let (b_kv, b_norm) = (gpu.buffer(&kv), gpu.buffer(&norm));
     let (b_pos, b_slots, b_retained) = (
         gpu.buffer(&positions),
         gpu.buffer(&ring_slots),
@@ -788,7 +791,6 @@ fn draft_context_commit_writes_each_lanes_retained_rows() {
         &[
             (&b_kv, 0),
             (&b_norm, 1),
-            (&b_rope, 2),
             (&b_pos, 3),
             (&b_keys, 4),
             (&b_values, 5),

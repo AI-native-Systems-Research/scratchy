@@ -136,11 +136,11 @@ macro_rules! for_each_subop {
             // `[x, dynamic, base]`, plus the residual for the finishing stage.
             DraftConv [SubOp::DraftConv { .. }] arity = (|n| n == 3 || n == 4), cols = [in0],
                 rows = [in0], gemm_w = [none];
-            // `[qkv, q_norm, k_norm, cos, sin]`.
-            DraftAttention [SubOp::DraftAttention { .. }] arity = (|n| n == 5),
+            // `[qkv, q_norm, k_norm]`.
+            DraftAttention [SubOp::DraftAttention { .. }] arity = (|n| n == 3),
                 cols = [field width], rows = [in0], gemm_w = [none];
-            // `[kv, k_norm, cos, sin]`.
-            DraftContextKv [SubOp::DraftContextKv { .. }] arity = (|n| n == 4), cols = [in0],
+            // `[kv, k_norm]`.
+            DraftContextKv [SubOp::DraftContextKv { .. }] arity = (|n| n == 2), cols = [in0],
                 rows = [in0], gemm_w = [none];
             // `[logits, selector, predecessor_codebook, successor_codebook]`.
             DraftSelect [SubOp::DraftSelect] arity = (|n| n == 4), cols = [in0], rows = [in0],

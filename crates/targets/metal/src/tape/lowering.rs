@@ -3335,7 +3335,6 @@ fn lower_one(
                 binding_index,
             };
             let constants = draft_constants(p, true);
-            let rope = w.of(WeightKind::CosSin, 0)?;
             // Splash's prepare dispatch: a group per 256 value elements, at least one per
             // (row, head) norm task.
             let prepare_groups = (g.rows * g.kv_heads * g.head_dim)
@@ -3349,8 +3348,8 @@ fn lower_one(
                     library: "dflash2",
                     function: draft_pick(
                         dtype,
-                        "draft_attention_qkv_f16_rope_f16",
-                        "draft_attention_qkv_bf16_rope_bf16",
+                        "draft_attention_qkv_f16",
+                        "draft_attention_qkv_bf16",
                     ),
                     constants,
                     dispatch: draft_lanes_grid(prepare_groups, g, bucket_m, 1),
@@ -3372,7 +3371,6 @@ fn lower_one(
                             layer,
                             3,
                         ),
-                        source(rope, WeightTensor::Weight, layer, 4),
                         runtime(RuntimeBindingKind::Positions, 5),
                         scratch(s.query_keys, 6),
                         scratch(s.query_values, 7),
@@ -3455,7 +3453,6 @@ fn lower_one(
                     layer,
                     1,
                 ),
-                source(w.of(WeightKind::CosSin, 0)?, WeightTensor::Weight, layer, 2),
                 runtime(RuntimeBindingKind::Positions, 3),
                 runtime(RuntimeBindingKind::DraftRingKeys { layer }, 4),
                 runtime(RuntimeBindingKind::DraftRingValues { layer }, 5),
@@ -3469,8 +3466,8 @@ fn lower_one(
                     library: "dflash2",
                     function: draft_pick(
                         dtype,
-                        "draft_context_kv_commit_f16_rope_f16",
-                        "draft_context_kv_commit_bf16_rope_bf16",
+                        "draft_context_kv_commit_f16",
+                        "draft_context_kv_commit_bf16",
                     ),
                     constants,
                     dispatch: draft_tasks(tasks, bucket_m),
@@ -3490,8 +3487,8 @@ fn lower_one(
                     library: "dflash2",
                     function: draft_pick(
                         dtype,
-                        "prefill_draft_context_kv_f16_rope_f16",
-                        "prefill_draft_context_kv_bf16_rope_bf16",
+                        "prefill_draft_context_kv_f16",
+                        "prefill_draft_context_kv_bf16",
                     ),
                     constants,
                     dispatch: draft_tasks(tasks, bucket_m),
@@ -6448,6 +6445,7 @@ fn draft_constants(p: &MetalModelConsts, finish: bool) -> &'static [ConstantValu
         conv_finish: u32::from(finish),
         rms_eps: p.rms_norm_eps,
         scale: p.attn_scale,
+        rope_theta: p.draft_rope_theta,
     }
     .into_baked()
 }

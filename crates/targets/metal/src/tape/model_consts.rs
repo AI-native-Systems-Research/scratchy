@@ -62,6 +62,8 @@ pub struct MetalModelConsts {
     pub draft_selector_rank: u32,
     /// A DFlash2 drafter's mask token: what its block's proposal rows embed; 0 for other models.
     pub draft_mask_token: u32,
+    /// A DFlash2 drafter's rotary base; 0 for other models.
+    pub draft_rope_theta: f32,
     /// The blocks of the rows a target captures for a drafter; 0 when none reads any.
     pub draft_capture_slots: u32,
     /// The width of a `target_hidden` row a head reads ([`scratchy_ir::CanonicalParams`]).
@@ -120,6 +122,7 @@ impl MetalModelConsts {
             draft_conv_group: W::DRAFT_CONV_GROUP,
             draft_selector_rank: W::DRAFT_SELECTOR_RANK,
             draft_mask_token: W::DRAFT_MASK_TOKEN,
+            draft_rope_theta: W::DRAFT_ROPE_THETA,
             draft_capture_slots: W::DRAFT_CAPTURE_SLOTS,
             target_hidden_width: W::TARGET_HIDDEN_WIDTH,
             target_routes_experts: W::TARGET_ROUTES_EXPERTS,

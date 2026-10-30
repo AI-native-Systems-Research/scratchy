@@ -6,7 +6,9 @@
 # The context commit (`DFlashDraft::addContextCommit`): each row's captured target layer rows
 # (`target_hidden`, the target's `target_layer_ids` outputs side by side) through `fc` and
 # `hidden_norm`, then each layer's key and value rows of its fused QKV projection, normed, roped and
-# written into the layer's ring at the row's position (`draft_context_kv`). A row is in the ring
+# written into the layer's ring at the row's position (`draft_context_kv`). Each ring op rotates
+# its keys (and queries) at the row's position as Splash does, from the model's rotary base, in
+# fp32: no rotary table. A row is in the ring
 # once its target row is: every key a block attends is a committed context row.
 #
 # The block draft (`DFlashDraft::addDecode`): eight rows a lane, its anchor and seven mask tokens,
@@ -26,7 +28,7 @@ def dflash2():
     context = rmsnorm(gemm(target_hidden, fc), hidden_norm)
     for layer in range(num_hidden_layers):
         context_kv = gemm(context, self_attn.kv_proj[layer])
-        committed = draft_context_kv(context_kv, self_attn.k_norm[layer], positions, rotary)
+        committed = draft_context_kv(context_kv, self_attn.k_norm[layer], positions)
 
     hidden_states = embed(input_ids, embed_tokens)
     for layer in range(num_hidden_layers):
@@ -35,7 +37,7 @@ def dflash2():
         convolved = draft_conv(normed, dynamic, attention_conv.base_kernel[layer])
         qkv = gemm(convolved, self_attn.qkv_proj[layer])
         attn = draft_attention(
-            qkv, self_attn.q_norm[layer], self_attn.k_norm[layer], positions, rotary
+            qkv, self_attn.q_norm[layer], self_attn.k_norm[layer], positions
         )
         projected = gemm(attn, self_attn.o_proj[layer])
         residual = draft_conv(projected, dynamic, attention_conv.base_kernel[layer], hidden_states)

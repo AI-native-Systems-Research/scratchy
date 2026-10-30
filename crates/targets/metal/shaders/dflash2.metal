@@ -10,8 +10,11 @@
 //     (`SPLASH_LANE_BINDING`); a batch here holds more lanes, so a lane's ring is the pool's at the
 //     lane's state slot (`ring_slots`). The pool is `[slot][kv head][window][dim]` keys and
 //     `[slot][kv head][dim][window]` values, a layer's own (the binding is the layer's).
-//   - A row's RoPE pair is the model's rotary table's at the row's position (`[pos][cos | sin]`),
-//     where Splash first builds a table of each row's (runtime/metal/kernels/shared/rope.metal).
+//   - A row's RoPE pair is computed where it is used, from the row's position and the baked rotary
+//     base, as Splash's table pass computes it (runtime/model/RopeScaling.hpp:46
+//     `rotaryInverseFrequencies`, runtime/metal/kernels/shared/rope.metal
+//     `rope_build_draft_range_tables`): fp32 throughout, where Splash first writes each row's
+//     into a table.
 //   - A lane's cache length is the position of its block's first row, its anchor: Splash passes
 //     the same value (`item.logicalPosition`) in the kernel's parameters.
 //
@@ -43,6 +46,8 @@ SCRATCHY_CONSTANT(uint, DRAFT_CONV_FINISH, 8);
 // The epsilon of every RMS norm (SPLASH_RMS_EPSILON), and the attention's softmax scale.
 SCRATCHY_CONSTANT(float, DRAFT_RMS_EPS, 9);
 SCRATCHY_CONSTANT(float, DRAFT_SCALE, 10);
+// The rotary base (the drafter's `rope_parameters.rope_theta`).
+SCRATCHY_CONSTANT(float, DRAFT_ROPE_THETA, 11);
 
 constant constexpr uint DRAFT_ATTENTION_WIDTH = DRAFT_QUERY_HEADS * DRAFT_HEAD_DIM;
 constant constexpr uint DRAFT_KV_WIDTH = DRAFT_KV_HEADS * DRAFT_HEAD_DIM;
@@ -76,11 +81,13 @@ inline float draft_rms_inverse_of_sums(float sum, uint width, threadgroup float 
   return reductions[0];
 }
 
-// The cosine and sine of RoPE pair `pair` at `position` from the model's rotary table.
-template <typename R>
-inline float2 draft_rope(device const R *rope, uint position, uint pair) {
-  device const R *row = rope + ulong(position) * DRAFT_HEAD_DIM;
-  return float2(float(row[pair]), float(row[DRAFT_ROPE_PAIRS + pair]));
+// The cosine and sine of RoPE pair `pair` at `position`: the pair's inverse frequency
+// θ^(−pair / pairs) (RopeScaling.hpp:46), its angle at the position, then both
+// (rope.metal:32-35, 51-54), in fp32.
+inline float2 draft_rope(uint position, uint pair) {
+  const float inverse_frequency = pow(DRAFT_ROPE_THETA, -float(pair) / float(DRAFT_ROPE_PAIRS));
+  const float angle = float(position) * inverse_frequency;
+  return float2(cos(angle), sin(angle));
 }
 
 // ── draft_conv (draft.metal draft_conv_phase / draft_conv) ─────────────────────────────────────
@@ -131,10 +138,10 @@ template <typename T>
 
 // ── draft_attention_qkv (draft.metal draft_qkv_prepare_phase / draft_attention_qkv) ────────────
 
-template <typename T, typename R>
+template <typename T>
 inline void draft_qkv_prepare_phase(device const T *proposal_qkv, device T *queries,
                                     device const T *q_norm, device const T *k_norm,
-                                    device const R *rope, device const uint *positions,
+                                    device const uint *positions,
                                     device T *query_keys, device T *query_values,
                                     threadgroup float *reductions, threadgroup T *head, uint group,
                                     uint thread_index, uint lane, uint simd_group) {
@@ -180,7 +187,7 @@ inline void draft_qkv_prepare_phase(device const T *proposal_qkv, device T *quer
     if (thread_index < HeadDim / 2) {
       float first = float(head[thread_index]);
       float second = float(head[thread_index + HeadDim / 2]);
-      const float2 cs = draft_rope(rope, positions[row], thread_index);
+      const float2 cs = draft_rope(positions[row], thread_index);
       destination[thread_index] = T(first * cs.x - second * cs.y);
       destination[thread_index + HeadDim / 2] = T(second * cs.x + first * cs.y);
     }
@@ -190,12 +197,11 @@ inline void draft_qkv_prepare_phase(device const T *proposal_qkv, device T *quer
 
 // Grid {groups, lanes}: `queries` holds the grouped queries, `query_keys` / `query_values` each
 // lane's block keys and values, all in the op scratch.
-template <typename T, typename R>
+template <typename T>
 [[kernel]] void draft_attention_qkv(device const T *proposal_qkv [[buffer(0)]],
                                     device T *queries [[buffer(1)]],
                                     device const T *q_norm [[buffer(2)]],
                                     device const T *k_norm [[buffer(3)]],
-                                    device const R *rope [[buffer(4)]],
                                     device const uint *positions [[buffer(5)]],
                                     device T *query_keys [[buffer(6)]],
                                     device T *query_values [[buffer(7)]],
@@ -209,7 +215,7 @@ template <typename T, typename R>
   threadgroup float reductions[8];
   threadgroup T head[DRAFT_HEAD_DIM];
   draft_qkv_prepare_phase(proposal_qkv + batch * Rows * Packed, queries + batch * Rows * Attention,
-                          q_norm, k_norm, rope, positions + batch * Rows,
+                          q_norm, k_norm, positions + batch * Rows,
                           query_keys + batch * KVHeads * Rows * HeadDim,
                           query_values + batch * KVHeads * HeadDim * Rows, reductions, head,
                           group.x, thread_index, lane, simd_group);
@@ -553,9 +559,9 @@ template <typename T>
 // One KV head of one context row: a row of context_kv holds the row's keys, then its values
 // (KWidth each). The keys are normalized and rotated into the ring slot of the row's position; the
 // values are copied there.
-template <typename T, typename R>
+template <typename T>
 inline void draft_context_kv_phase(device const T *context_kv, device const T *k_norm,
-                                   device const R *rope, device T *keys, device T *values,
+                                   device T *keys, device T *values,
                                    uint position, uint head_index, uint thread_index, uint lane,
                                    uint simd_group, threadgroup float *reductions,
                                    threadgroup T *normalized) {
@@ -577,7 +583,7 @@ inline void draft_context_kv_phase(device const T *context_kv, device const T *k
   if (thread_index < HeadDim / 2) {
     float first = float(normalized[thread_index]);
     float second = float(normalized[thread_index + HeadDim / 2]);
-    const float2 cs = draft_rope(rope, position, thread_index);
+    const float2 cs = draft_rope(position, thread_index);
     key[thread_index] = T(first * cs.x - second * cs.y);
     key[thread_index + HeadDim / 2] = T(second * cs.x + first * cs.y);
   }
@@ -586,10 +592,9 @@ inline void draft_context_kv_phase(device const T *context_kv, device const T *k
 // A cycle's commit (draft.metal draft_context_kv_commit): each lane's verify rows up to the ones
 // it retained (`retained`), one threadgroup per (row, kv head). A lane's verify rows are those of
 // its block its verify budget chose (`cu_seqlens`), where Splash's are its block's every row.
-template <typename T, typename R>
+template <typename T>
 [[kernel]] void draft_context_kv_commit(device const T *context_kv [[buffer(0)]],
                                         device const T *k_norm [[buffer(1)]],
-                                        device const R *rope [[buffer(2)]],
                                         device const uint *positions [[buffer(3)]],
                                         device T *ring_keys [[buffer(4)]],
                                         device T *ring_values [[buffer(5)]],
@@ -615,7 +620,7 @@ template <typename T, typename R>
   const ulong ring = ulong(ring_slots[batch]) * DRAFT_RING_LANE;
   threadgroup float reductions[8];
   threadgroup T normalized[DRAFT_HEAD_DIM];
-  draft_context_kv_phase(context_kv + ulong(r) * RowWidth, k_norm, rope, ring_keys + ring,
+  draft_context_kv_phase(context_kv + ulong(r) * RowWidth, k_norm, ring_keys + ring,
                          ring_values + ring, positions[cu_seqlens[batch]] + row, group % KVHeads,
                          thread_index, lane, simd_group, reductions, normalized);
 }
@@ -623,10 +628,9 @@ template <typename T, typename R>
 // A prompt's commit (draft_context.metal prefill_draft_context_kv): every row of the step, each at
 // its position in its sequence's ring, one threadgroup per (row, kv head). A step's rows of one
 // sequence are at most a window: no two of them share a slot (Splash's DraftContextPlan).
-template <typename T, typename R>
+template <typename T>
 [[kernel]] void prefill_draft_context_kv(device const T *context_kv [[buffer(0)]],
                                          device const T *k_norm [[buffer(1)]],
-                                         device const R *rope [[buffer(2)]],
                                          device const uint *positions [[buffer(3)]],
                                          device T *ring_keys [[buffer(4)]],
                                          device T *ring_values [[buffer(5)]],
@@ -648,24 +652,19 @@ template <typename T, typename R>
   const ulong ring = ulong(ring_slots[sequence]) * DRAFT_RING_LANE;
   threadgroup float reductions[8];
   threadgroup T normalized[DRAFT_HEAD_DIM];
-  draft_context_kv_phase(context_kv + ulong(row) * RowWidth, k_norm, rope, ring_keys + ring,
+  draft_context_kv_phase(context_kv + ulong(row) * RowWidth, k_norm, ring_keys + ring,
                          ring_values + ring, positions[row], task % KVHeads, thread_index, lane,
                          simd_group, reductions, normalized);
 }
-
-#define INST_DRAFT(tag, T, rtag, R)                                                           \
-  SCRATCHY_KERNEL(draft_attention_qkv_##tag##_rope_##rtag, draft_attention_qkv<T, R>)        \
-  SCRATCHY_KERNEL(draft_context_kv_commit_##tag##_rope_##rtag, draft_context_kv_commit<T, R>) \
-  SCRATCHY_KERNEL(prefill_draft_context_kv_##tag##_rope_##rtag, prefill_draft_context_kv<T, R>)
 
 #define INST_DRAFT_ACT(tag, T)                                                     \
   SCRATCHY_KERNEL(draft_conv_##tag, draft_conv<T>)                                 \
   SCRATCHY_KERNEL(draft_attention_split_##tag, draft_attention_split<T>)           \
   SCRATCHY_KERNEL(draft_attention_reduce_##tag, draft_attention_reduce<T>)         \
   SCRATCHY_KERNEL(draft_attention_reorder_##tag, draft_attention_reorder<T>)       \
-  INST_DRAFT(tag, T, f32, float)                                                   \
-  INST_DRAFT(tag, T, f16, half)                                                    \
-  INST_DRAFT(tag, T, bf16, bfloat)
+  SCRATCHY_KERNEL(draft_attention_qkv_##tag, draft_attention_qkv<T>)               \
+  SCRATCHY_KERNEL(draft_context_kv_commit_##tag, draft_context_kv_commit<T>)       \
+  SCRATCHY_KERNEL(prefill_draft_context_kv_##tag, prefill_draft_context_kv<T>)
 
 INST_DRAFT_ACT(f16, half)
 INST_DRAFT_ACT(bf16, bfloat)

@@ -735,12 +735,12 @@ fn draft_last(
     solver.unify(last, dim)
 }
 
-/// `draft_context_kv(kv: [.., draft_kv_size], k_norm: [head_dim], positions, rotary)` → `kv`: a
+/// `draft_context_kv(kv: [.., draft_kv_size], k_norm: [head_dim], positions)` → `kv`: a
 /// context row's keys then values, as Splash's context writers read them
 /// (runtime/metal/kernels/common/draft_context_kv.h).
 fn sig_draft_context_kv(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
     let op = OpKind::DraftContextKv;
-    expect_args(op, inputs, 4)?;
+    expect_args(op, inputs, 3)?;
     draft_last(solver, op, "kv", &inputs[0], &draft_bound("draft_kv_size"))?;
     draft_rank1(solver, op, "k_norm", &inputs[1], &draft_bound("head_dim"))?;
     Ok(OpSig {
@@ -790,11 +790,11 @@ fn sig_draft_conv(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeE
     Ok(OpSig { output: x.clone() })
 }
 
-/// `draft_attention(qkv: [.., draft_qkv_size], q_norm: [head_dim], k_norm: [head_dim], positions,
-/// rotary)` → `[.., draft_attention_size]`: Splash's packed q|k|v row in, an attention row out.
+/// `draft_attention(qkv: [.., draft_qkv_size], q_norm: [head_dim], k_norm: [head_dim], positions)`
+/// → `[.., draft_attention_size]`: Splash's packed q|k|v row in, an attention row out.
 fn sig_draft_attention(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
     let op = OpKind::DraftAttention;
-    expect_args(op, inputs, 5)?;
+    expect_args(op, inputs, 4)?;
     let qkv = &inputs[0];
     draft_last(solver, op, "qkv", qkv, &draft_bound("draft_qkv_size"))?;
     draft_rank1(solver, op, "q_norm", &inputs[1], &draft_bound("head_dim"))?;

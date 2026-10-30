@@ -1538,6 +1538,8 @@ pub struct DraftConstants {
     pub conv_finish: u32,
     pub rms_eps: f32,
     pub scale: f32,
+    /// The rotary base the ring ops' kernels rotate from (slot 11, `DRAFT_ROPE_THETA`).
+    pub rope_theta: f32,
 }
 
 impl From<DraftConstants> for Vec<ConstantValue> {
@@ -1554,6 +1556,7 @@ impl From<DraftConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(8), c.conv_finish),
             ConstantValue::float(ConstSlot(9), c.rms_eps),
             ConstantValue::float(ConstSlot(10), c.scale),
+            ConstantValue::float(ConstSlot(11), c.rope_theta),
         ]
     }
 }

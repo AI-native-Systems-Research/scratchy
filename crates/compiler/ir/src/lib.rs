@@ -1136,6 +1136,9 @@ pub trait CanonicalParams: WeightAccessors {
     const DRAFT_SELECTOR_RANK: u32 = 0;
     /// The token its block's proposal rows embed (`dflash_config.mask_token_id`).
     const DRAFT_MASK_TOKEN: u32 = 0;
+    /// Its rotary base (`rope_parameters.rope_theta`), which its ring ops rotate at each row's
+    /// position from, as Splash computes the angles (RopeScaling.hpp `rotaryInverseFrequencies`).
+    const DRAFT_ROPE_THETA: f32 = 0.0;
     /// The width of a `target_hidden` row a head reads: its target's hidden size, or a DFlash2
     /// drafter's every captured layer's side by side (`backbone_hidden_size`).
     const TARGET_HIDDEN_WIDTH: usize = Self::HIDDEN_SIZE;
