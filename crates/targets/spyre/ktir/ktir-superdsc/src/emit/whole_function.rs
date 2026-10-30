@@ -3401,7 +3401,7 @@ fn row_tiled_family(
 /// holds `act_name(tid)`), so a record carried into a different layout mints fresh instead
 /// of colliding with that layout's placements. `floor` is the node-derived bound from
 /// [`lower_function`] — see its law doc for why the mint is bundle-seeded, not node-seeded.
-fn mint_inter(k: &KtirNode, layout: &BundleLayout, floor: u32, ssa: Ssa) -> u32 {
+pub(super) fn mint_inter(k: &KtirNode, layout: &BundleLayout, floor: u32, ssa: Ssa) -> u32 {
     let mut minted = k.minted.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(&tid) = minted.get(&ssa)
         && layout
@@ -3415,6 +3415,18 @@ fn mint_inter(k: &KtirNode, layout: &BundleLayout, floor: u32, ssa: Ssa) -> u32 
     let tid = layout.take_inter_tid(floor);
     minted.insert(ssa, tid);
     tid
+}
+
+/// The node-derived FLOOR [`mint_inter`] honors: above the highest non-reserved tensor the node
+/// binds (see the law at [`lower_walk`]'s use).
+pub(super) fn mint_floor(k: &KtirNode) -> u32 {
+    k.bindings
+        .iter()
+        .chain(k.mask.iter())
+        .map(|b| b.get())
+        .filter(|t| !crate::reserved_tids::is_reserved(*t))
+        .max()
+        .map_or(0, |m| m + 1)
 }
 
 /// ⭐⭐⭐ THE ARRANGEMENT PROPAGATION — which of a node's PARAMETERS the bake must stage in a
@@ -3774,14 +3786,7 @@ fn lower_function_folded(
     // there. This node-derived value survives as the FLOOR the bundle minter honors — a node
     // lowered into a layout that places its own bindings high still mints clear of its own
     // tensors — and as the replay gate below.
-    let floor: u32 = k
-        .bindings
-        .iter()
-        .chain(k.mask.iter())
-        .map(|b| b.get())
-        .filter(|t| !crate::reserved_tids::is_reserved(*t))
-        .max()
-        .map_or(0, |m| m + 1);
+    let floor = mint_floor(k);
     let mut inter: std::collections::HashMap<Ssa, Region> = std::collections::HashMap::new();
     // THE fp8 SCALE MULFS THE DOT ABSORBED. The walk lowers each op once, and an absorbed epilogue
     // (`p * ws`, see the absorption at the `stored` lookup) already rode into its dot's emission —

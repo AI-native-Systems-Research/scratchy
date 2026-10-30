@@ -885,11 +885,17 @@ pub struct Scatter {
     /// Where this store's run of entries starts in the index buffer, in entries — any entry: a
     /// per-row store writes one row at its own entry, and [`load_scatters`] coalesces the runs.
     pub first_entry: u32,
-    /// Where this store's rows start in the source, in the source's own STICKS: the source is
-    /// stick-major `[rows, cols]`, so the one-stick row at `(r, c)` is stick `(c / stick) · rows + r`
-    /// — spyre-inference's `key[:, h]` row `t` is stick `h · T + t`, which is where their head-major
-    /// `kv_write_index` puts its entry.
-    pub src_stick: u32,
+    /// Sticks in one stored row — the tile's width: one at head dim 64, two at 128.
+    pub sticks: u32,
+    /// Where this store's rows start in the source, counted in rows of [`Self::sticks`] sticks. The
+    /// source is stick-major `[rows, cols]` and its stick columns group into rows `sticks` wide, so
+    /// row `r` of the group at column `c` is `(c / (sticks · stick)) · rows + r` — spyre-inference's
+    /// `key[:, h]` row `t` is `h · T + t`, which is where their head-major `kv_write_index` puts its
+    /// entry. At one stick a row it is the source's own stick.
+    pub src_row: u32,
+    /// The stored value — the rows as loaded, which names the scratch a multi-stick run is relaid
+    /// through ([`load_scatters`]).
+    pub value: Ssa,
 }
 
 /// [`Scatter`] for every `ktdp.store` of a `ktdp.load` the program makes through an indirect access
@@ -993,11 +999,12 @@ pub fn scatters_of(k: &KtirNode) -> Result<Vec<Scatter>, Error> {
             .and_then(|t| t.dims())
             .and_then(|d| d.first().copied())
             .unwrap_or(0) as u32;
-        let tile_cols = shape_2d(src_tile).map(|(_, c)| c);
-        if tile_cols != Some(stick) || !src_col.is_multiple_of(stick) {
+        let width = shape_2d(src_tile).map_or(0, |(_, c)| c);
+        if width == 0 || !width.is_multiple_of(stick) || !src_col.is_multiple_of(width) {
             return err(format!(
-                "{}: the scatter's source rows are {tile_cols:?} wide at column {src_col} — a \
-                 scattered row is ONE {stick}-element stick of the source, its own head",
+                "{}: the scatter's source rows are {width} wide at column {src_col} — a scattered \
+                 row is a whole number of {stick}-element sticks of the source, its own head, at a \
+                 column that is a multiple of its width",
                 f.name
             ));
         }
@@ -1007,7 +1014,9 @@ pub fn scatters_of(k: &KtirNode) -> Result<Vec<Scatter>, Error> {
             src_tid,
             entries,
             first_entry,
-            src_stick: (src_col / stick) * view_rows + src_row,
+            sticks: width / stick,
+            src_row: (src_col / width) * view_rows + src_row,
+            value,
         });
     }
     Ok(out)
@@ -1019,13 +1028,15 @@ pub fn scatters_of(k: &KtirNode) -> Result<Vec<Scatter>, Error> {
 struct RunPiece {
     entry: u32,
     rows: u32,
-    src_stick: u32,
+    src_row: u32,
 }
 
 /// The stores of one `(source, destination, table)` triple — one run of rows [`load_scatters`]
-/// cuts into index-stick ops.
+/// cuts into index-stick ops — with the width of their rows and the first store's value.
 struct ScatterRun {
     key: (u32, u32, u32),
+    sticks: u32,
+    value: Ssa,
     pieces: Vec<RunPiece>,
 }
 
@@ -1034,15 +1045,22 @@ struct ScatterRun {
 /// destination at the row the index names, through the index registers. Empty when the program
 /// states none. (spyre-inference's `reshape_and_cache_head_major` is nothing else.)
 ///
-/// Each stored row is one stick of the stick-major source: at eight rows or more one store per head
-/// (`k_rows.index_copy_(0, idx, key[:, h])`), one per row below Triton's scatter floor, and row `t` of
-/// `key[:, h]` is the source's stick `h · T + t`. When the index puts that row at entry `h · T + t`
-/// (their head-major `kv_write_index`), source stick and index entry advance together across every
-/// store of one (source, destination, table) triple, and the stores COALESCE into one run: sticks
-/// `s0..s0 + n` of the source through entries `e0..e0 + n` of the table, cut into ops of one index
-/// stick each ([`assemble_scatter_copy`], the vendor's `test_scatter_1core` shape). A store that does
-/// not continue the run is refused by name: the copy moves source stick `s0 + j` through entry
-/// `e0 + j`, and nothing else.
+/// Each stored row is one head's row of the stick-major source: at eight rows or more one store per
+/// head (`k_rows.index_copy_(0, idx, key[:, h])`), one per row below Triton's scatter floor, and row
+/// `t` of `key[:, h]` is the source's row `h · T + t` ([`Scatter::src_row`]). When the index puts that
+/// row at entry `h · T + t` (their head-major `kv_write_index`), source row and index entry advance
+/// together across every store of one (source, destination, table) triple, and the stores COALESCE
+/// into one run: rows `s0..s0 + n` of the source through entries `e0..e0 + n` of the table, cut into
+/// ops of one index stick each ([`assemble_scatter_copy`], the vendor's `test_scatter_1core` shape). A
+/// store that does not continue the run is refused by name: the copy moves source row `s0 + j`
+/// through entry `e0 + j`, and nothing else.
+///
+/// ⭐ A ROW OF SEVERAL STICKS (head dim 128) moves whole, as one entry of that many sticks. The
+/// destination is allocated row-outermost (spyre-inference's `head_major_kv_layout`), so an entry's
+/// sticks are contiguous there; in the stick-major source they are `rows` sticks apart. So the run's
+/// rows are first relaid row-major into a scratch, one stick permute per head (the restickify
+/// torch-spyre's stickification inserts ahead of their `index_copy_`), and the scatter reads entry
+/// `j`'s sticks from the scratch's row `s0 + j`.
 pub fn load_scatters(
     name: &str,
     k: &KtirNode,
@@ -1067,12 +1085,20 @@ pub fn load_scatters(
         let piece = RunPiece {
             entry: sc.first_entry,
             rows: sc.entries,
-            src_stick: sc.src_stick,
+            src_row: sc.src_row,
         };
         match runs.iter_mut().find(|r| r.key == key) {
-            Some(r) => r.pieces.push(piece),
+            Some(r) if r.sticks == sc.sticks => r.pieces.push(piece),
+            Some(r) => {
+                return err(format!(
+                    "{name}: stores into t{} write rows of {} and of {} sticks through one table",
+                    sc.value_tid, r.sticks, sc.sticks
+                ));
+            }
             None => runs.push(ScatterRun {
                 key,
+                sticks: sc.sticks,
+                value: sc.value,
                 pieces: vec![piece],
             }),
         }
@@ -1080,26 +1106,28 @@ pub fn load_scatters(
     let mut ops = Vec::new();
     for ScatterRun {
         key: (src_tid, dst_tid, index_tid),
+        sticks,
+        value,
         mut pieces,
     } in runs
     {
         pieces.sort_unstable();
         let (e0, s0) = pieces
             .first()
-            .map(|p| (p.entry, p.src_stick))
+            .map(|p| (p.entry, p.src_row))
             .unwrap_or_default();
         let mut next = e0;
         for &RunPiece {
             entry,
             rows,
-            src_stick,
+            src_row,
         } in &pieces
         {
-            if entry != next || src_stick - s0 != entry - e0 {
+            if entry != next || src_row - s0 != entry - e0 {
                 return err(format!(
-                    "{name}: a store writes source sticks {src_stick}.. through index entries \
+                    "{name}: a store writes source rows {src_row}.. through index entries \
                      {entry}.. where the run so far ends at {next} — the card's scatter copies \
-                     source stick `{s0} + j` through entry `{e0} + j`, so the program's stores must \
+                     source row `{s0} + j` through entry `{e0} + j`, so the program's stores must \
                      tile the run in order"
                 ));
             }
@@ -1107,23 +1135,80 @@ pub fn load_scatters(
         }
         let total = next - e0;
         let (src, dst, index) = (region(src_tid)?, region(dst_tid)?, region(index_tid)?);
-        if dst.v_cols != stick {
+        let width = sticks * stick;
+        if dst.v_cols != width {
             return err(format!(
-                "{name}: t{dst_tid} is written as {}-wide rows — the scatter copies ONE \
-                 {stick}-element stick per index entry",
+                "{name}: t{dst_tid} is written as {}-wide rows by stores of {width}-wide rows — the \
+                 scatter copies one stored row per index entry",
                 dst.v_cols
             ));
         }
-        if s0 + total > src.v_rows * (src.v_cols / stick) {
+        let groups = src.v_cols / width;
+        if s0 + total > src.v_rows * groups {
             return err(format!(
-                "{name}: the stores write sticks {s0}..{} of t{src_tid}, whose view holds {}",
+                "{name}: the stores write rows {s0}..{} of t{src_tid}, whose view holds {}",
                 s0 + total,
-                src.v_rows * (src.v_cols / stick)
+                src.v_rows * groups
             ));
         }
-        let page = crate::superdsc_opspec::PageExtent::of_positions(1);
+        // Where the scatter reads its rows: the source itself at one stick a row, or at one row a
+        // view (a decode step's — stick-major and row-major are then the same bytes), else the
+        // scratch its rows are relaid into, row-major.
+        let from = if sticks == 1 || src.v_rows == 1 {
+            src.name()
+        } else {
+            let Some(layout) = layout else {
+                return err(format!(
+                    "{name}: rows of {sticks} sticks are relaid through a scratch, which needs a \
+                     `BundleLayout` to hold it"
+                ));
+            };
+            if !layout.is_row_outermost(dst_tid) {
+                return err(format!(
+                    "{name}: t{dst_tid} takes rows of {sticks} sticks one entry each, which needs it \
+                     allocated row-outermost (`BundleLayout::allocate_row_outermost`), its rows \
+                     contiguous"
+                ));
+            }
+            let tid = super::whole_function::mint_inter(
+                k,
+                layout,
+                super::whole_function::mint_floor(k),
+                value,
+            );
+            layout.synth(PlaceId::Act(tid), &[src.v_rows * groups, width]);
+            let scratch = crate::place::act_name(tid);
+            // Each head's group of columns, stick-major `[sticks][rows]` in the source, to row-major
+            // `[rows][sticks]` at the same base in the scratch.
+            for g in s0 / src.v_rows..=(s0 + total - 1) / src.v_rows {
+                let base = g * src.v_rows * width;
+                ops.push(
+                    crate::ir::bridge::tiled_op_sdsc_op::assemble_stick_permute(
+                        &format!("scatter_rows{g}_o{dst_tid}"),
+                        &src.name(),
+                        &scratch,
+                        crate::ir::bridge::tiled_op_sdsc_op::StickPermuteSpec {
+                            rows: src.v_rows,
+                            sticks,
+                            df: Df::Fp16,
+                            direction:
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                            src_elems: base,
+                            dst_elems: base,
+                        },
+                        sym_id_base,
+                        Some(layout),
+                    )
+                    .map_err(|message| Error {
+                        message: format!("{name}: {message}"),
+                    })?,
+                );
+            }
+            scratch
+        };
+        let page = crate::superdsc_opspec::PageExtent::of_positions(sticks);
         let per_op = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
-        let (src_name, dst_name, index_name) = (src.name(), dst.name(), index.name());
+        let (dst_name, index_name) = (dst.name(), index.name());
         for (i, first) in (0..total).step_by(per_op as usize).enumerate() {
             let entries = per_op.min(total - first);
             let base =
@@ -1139,14 +1224,14 @@ pub fn load_scatters(
             );
             let op = crate::ir::bridge::tiled_op_sdsc_op::assemble_scatter_copy(
                 &format!("scatter_run{i}_o{dst_tid}"),
-                &src_name,
+                &from,
                 &dst_name,
                 scatter,
                 crate::ir::bridge::tiled_op_sdsc_op::ScatterCopySpec {
-                    rows: entries,
+                    rows: entries * sticks,
                     cols: stick,
                     df: Df::Fp16,
-                    src_elems: (s0 + first) * stick,
+                    src_elems: (s0 + first) * width,
                     dst_elems: 0,
                 },
                 sym_id_base,
