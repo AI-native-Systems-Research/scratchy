@@ -729,11 +729,16 @@ pub fn pcie_address_for_card(card_index: u32) -> String {
 //     names and now implemented in `cxx-shim/senlib_ffi.cpp`;
 //   - the eight mock-RdmaShm declarations are NOT restored. Their roles are
 //     filled by the real cross-port P2P surface: address translation
-//     (`rdma_xseg_*`) is the IOMMU mapping itself (`p2p_create_mapping`
-//     below); the data movement (`rdma_copy_to_remote`) is an ordinary H2D
-//     DMA through the scheduler aimed at the mapped address; the
-//     write-done counters (`rdma_wdone_inc/check`) are the framed VSID
-//     instructions plus the wdone register pokes restored here.
+//     (`rdma_xseg_*`) is the XSEG[SID] register-table entry — the peer-side
+//     segment translation the RDMA engine itself reads — programmed by
+//     `PfInterface::write_xseg`/`read_xseg` (pf_interface.hpp:122-123,
+//     marshalled by `flex_senlib_write_xseg`/`flex_senlib_read_xseg` in
+//     `cxx-shim/senlib_ffi.cpp`); the cross-port IOMMU mapping
+//     (`p2p_create_mapping` below) is a separate, host-side door and never
+//     was the XSEG table write. The data movement (`rdma_copy_to_remote`)
+//     is an ordinary H2D DMA through the scheduler aimed at the mapped
+//     address; the write-done counters (`rdma_wdone_inc/check`) are the
+//     framed VSID instructions plus the wdone register pokes restored here.
 //
 // Peer ENUMERATION was already this module's surface: `sen_pci_card_count()`
 // above is the card count and `pcie_address_for_card(i)` names each peer;
