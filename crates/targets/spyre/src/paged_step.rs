@@ -50,6 +50,20 @@ pub const fn page_of_block(b: u32) -> u32 {
     b + 1
 }
 
+/// ⭐ THE POOL ONE DEVICE REGION HOLDS, in token slots. Every layer's K and V pools are one segment,
+/// one allocation of at most [`scratchy_spyre_bundle::MAX_SEGMENT_BYTES`], at `kv_slot_bytes` a slot
+/// (every layer's K and V row of one token). So the pool is the model's own context,
+/// `context_slots`, where that fits, and otherwise the most whole pages that do — vLLM's `num_blocks`
+/// bounded by memory, with `--max-model-len` checked against the pool it got
+/// ([`PagedStep::capacity`]). granite-3.1-8b's 131072 slots at 163840 B are 20 GiB; its pool is
+/// 1638 pages. `None` when not one page fits.
+pub fn pool_slots(context_slots: u32, kv_slot_bytes: u64) -> Option<std::num::NonZeroU32> {
+    let fit = scratchy_spyre_bundle::MAX_SEGMENT_BYTES / kv_slot_bytes.max(1);
+    let fit_pages = u32::try_from(fit / u64::from(PAGE_SLOTS)).unwrap_or(u32::MAX);
+    let slots = context_slots.min(fit_pages.saturating_mul(PAGE_SLOTS));
+    std::num::NonZeroU32::new(slots)
+}
+
 /// The rows of one forward: `real` tokens at positions `start..start + real`, in a bundle
 /// [`PagedStep::rows`] wide. A row past the real ones repeats the last real token
 /// ([`scratchy_subtile::sdsc_abstract::ChunkRows::row_logical_pos`]'s law), so its forward, its
@@ -579,6 +593,35 @@ mod tests {
             paged_rows: PagedRows::Batch,
             ..step()
         }
+    }
+
+    /// The pool is the model's context where every layer's K and V of it fit one device region,
+    /// else the whole pages that do.
+    #[test]
+    fn the_pool_is_the_context_one_region_holds() {
+        // K and V of every layer, at fp16, for one token.
+        let slot = |layers: u64, nkvh: u64, hd: u64| layers * 2 * nkvh * hd * 2;
+        let ctx = 131_072;
+        // llama-3.2-1b: 16 layers × 8 × 64 — 4 GiB, the whole context.
+        assert_eq!(pool_slots(ctx, slot(16, 8, 64)).map(|s| s.get()), Some(ctx));
+        // granite-3.1-8b: 40 layers × 8 × 128 — 20 GiB, so the 1638 whole pages 16 GiB holds.
+        let p = pool_slots(ctx, slot(40, 8, 128)).expect("a page fits");
+        assert_eq!(p.get(), 1638 * PAGE_SLOTS);
+        assert!(u64::from(p.get()) * slot(40, 8, 128) <= scratchy_spyre_bundle::MAX_SEGMENT_BYTES);
+        assert!(
+            u64::from(p.get() + PAGE_SLOTS) * slot(40, 8, 128)
+                > scratchy_spyre_bundle::MAX_SEGMENT_BYTES
+        );
+        // A context shorter than the pool would hold is the pool.
+        assert_eq!(
+            pool_slots(4096, slot(40, 8, 128)).map(|s| s.get()),
+            Some(4096)
+        );
+        // Not one page fits.
+        assert_eq!(
+            pool_slots(ctx, scratchy_spyre_bundle::MAX_SEGMENT_BYTES / 32),
+            None
+        );
     }
 
     /// The batch's operands are spyre-inference's: query rows `0..n` (a pad sequence's 0) repeated
