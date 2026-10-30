@@ -222,6 +222,9 @@ pub fn step_sources(
             words(kv_row_pool(step)),
             vec![step.pages as usize, nkvh],
         ));
+        // The add identity the chained index's run copy reads on the card.
+        let run = ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as usize;
+        int32.push((step.int32_zero, words(vec![0; run]), vec![1, run]));
     }
     Ok(StepSources {
         mask: (
@@ -415,6 +418,7 @@ mod tests {
             rep_rows: 15,
             chunk_pages: 16,
             chunk_masks: 17,
+            int32_zero: 18,
             pages: 4,
             page_slots: 4,
             rows: 3,
@@ -558,9 +562,17 @@ mod tests {
                 .collect()
         };
         let chunk = step();
-        assert!(!tids(&chunk, StepRows { start: 5, real: 2 }).contains(&chunk.kv_row_pool));
+        let staged = tids(&chunk, StepRows { start: 5, real: 2 });
+        assert!(!staged.contains(&chunk.kv_row_pool) && !staged.contains(&chunk.int32_zero));
         let decode = PagedStep { rows: 1, ..step() };
-        assert!(tids(&decode, StepRows { start: 5, real: 1 }).contains(&decode.kv_row_pool));
+        let srcs = step_sources(&decode, &blocks, &StepRows { start: 5, real: 1 }).unwrap();
+        assert!(srcs.int32.iter().any(|(t, ..)| *t == decode.kv_row_pool));
+        let (_, zero, _) = srcs
+            .int32
+            .iter()
+            .find(|(t, ..)| *t == decode.int32_zero)
+            .expect("a decode step stages the int32 zero beside kv_row_pool");
+        assert!(zero.iter().all(|&b| b == 0) && !zero.is_empty());
     }
 
     #[test]

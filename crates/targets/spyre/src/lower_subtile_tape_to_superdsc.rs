@@ -1529,6 +1529,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
         }
         if step.reads_kv_row_pool() {
             sources.push((step.kv_row_pool, SegRole::Kv, step.card_kv_row_pool_bytes()));
+            // Static like the pool, so in the segment a relaunch does not shift.
+            sources.push((step.int32_zero, SegRole::Kv, step.card_int32_zero_bytes()));
         }
         for (tid, role, size) in sources {
             let seg = role.segment();
