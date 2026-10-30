@@ -372,6 +372,15 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
                 * df.word_length() as u64
         } else if is_bound_scale {
             SCALE_BYTES
+        } else if matches!(node.program, Program::PagedAttn) && index_tids.contains(&reg.tid) {
+            // ⭐ A PAGED PROGRAM'S GATHER INDEX, AT LEAST THE INT32 OPS' DEVICE WIDTH: a page past
+            // dxp's entry bound (head dim 128) is gathered in pieces through its index doubled by
+            // `addi32toi32`, which reads `INDEX_RUN_WORDS` words — within a walk trip's card pitch
+            // where the bake places the table (`PagedStep::card_placements`), and here as wide.
+            synth_footprint_bytes(&[reg.v_rows, reg.v_cols], df).max(
+                u64::from(ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS)
+                    * df.word_length() as u64,
+            )
         } else {
             synth_footprint_bytes(&[reg.v_rows, reg.v_cols], df)
         };
