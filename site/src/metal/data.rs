@@ -565,6 +565,8 @@ pub struct Cell {
     pub at: At,
     pub median_ttft_ms: Option<f64>,
     pub median_tpot_ms: Option<f64>,
+    /// The median request's send-to-last-token time; None in runs from before the run file kept it.
+    pub median_e2el_ms: Option<f64>,
     pub output_throughput: Option<f64>,
     pub completed: Option<u32>,
     /// Requests that arrived in one piece and so were left out of TTFT/TPOT;
@@ -690,6 +692,8 @@ struct RawCell {
     rung: RawRung,
     median_ttft_ms: Option<f64>,
     median_tpot_ms: Option<f64>,
+    #[serde(default)]
+    median_e2el_ms: Option<f64>,
     output_throughput: Option<f64>,
     completed: Option<u32>,
     unstreamed_requests: Option<u32>,
@@ -735,6 +739,7 @@ impl TryFrom<RawCell> for Cell {
             at,
             median_ttft_ms: c.median_ttft_ms,
             median_tpot_ms: c.median_tpot_ms,
+            median_e2el_ms: c.median_e2el_ms,
             output_throughput: c.output_throughput,
             completed: c.completed,
             unstreamed_requests: c.unstreamed_requests,
