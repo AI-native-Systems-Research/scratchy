@@ -45,6 +45,28 @@ fn granites_two_rank_world_carries_its_prefill() {
     );
 }
 
+/// The selection a loading session makes: a world of one runs the one-rank wiring, each rank of
+/// the two-rank world runs the forward baked for it — the same one on both ranks.
+#[test]
+fn each_rank_selects_its_worlds_forward() {
+    use scratchy_target_spyre::bundle_code::collective::TpWorld;
+    use scratchy_target_spyre::wiring::{WorldForward, forward_for};
+    let tp = scratchy_models::granite::granite_3_1_2b_instruct::SUPERDSC_TP;
+    for id in TpWorld::of::<1>().ranks() {
+        assert!(matches!(forward_for(tp, id), Ok(WorldForward::OneRank)));
+    }
+    for id in TpWorld::of::<2>().ranks() {
+        match forward_for(tp, id) {
+            Ok(WorldForward::Sharded(f)) => assert!(std::ptr::eq(f, &tp[0])),
+            _ => panic!("rank {} of the two-rank world found no forward", id.rank()),
+        }
+    }
+    // A model that baked no sharded world refuses a two-rank session by name.
+    let none: &'static [scratchy_target_spyre::wiring::TpForward] = &[];
+    let rank0 = TpWorld::of::<2>().ranks().next().unwrap();
+    assert!(forward_for(none, rank0).is_err());
+}
+
 #[test]
 fn granites_slice_laws_are_megatrons() {
     let tp = &scratchy_models::granite::granite_3_1_2b_instruct::SUPERDSC_TP[0];
