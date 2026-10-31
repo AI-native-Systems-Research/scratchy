@@ -7590,6 +7590,37 @@ mod elementwise_tests {
         );
     }
 
+    /// ⭐⭐ AND ITS CORES TAKE WHOLE SPRAYS — the paged prompt walk's mask add at granite-3.1-2b's
+    /// 21-row rung: the `[21, 64]` mask over `[y = 32, mb = 21]`. The elementwise law split `mb` 21
+    /// ways with all 32 sprays in every core, and the card wrote 52 of the 672 sticks (each core
+    /// stepping its sprays by its one row); the op now holds one spray per core, its 21 rows whole.
+    #[test]
+    fn the_prompt_mask_add_takes_one_spray_per_core() {
+        let scores_h = rb("t5", 672, 64);
+        let mask_h = rb("t6", 21, 64);
+        let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(21, 64, 32, 3),
+            672,
+            64,
+            op_func_from_str("add"),
+            &[
+                In::full(&scores_h).ew(),
+                In::y_broadcast(&mask_h, Spray::outer(32)).ew(),
+            ],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            crate::work::CoreDivision::Ew(EwDivision::Law),
+        )
+        .expect("the prompt walk's mask add emits");
+        assert_eq!(
+            (op.iter.split_of("y"), op.iter.split_of("mb")),
+            (32, 1),
+            "one spray per core, the rows whole"
+        );
+    }
+
     /// ⭐ THE INNER SPRAY'S DESCRIPTOR STATES THE `[mb, y, out]` FRAME — the same op as the outer
     /// spray's above, every tensor laid out `["mb", "y", "out"]` so flat row `b·y + j` is
     /// `(b, j)`: the sprayed source `[mb, out]` reads `source[b, c]` at `result[b·4 + j, c]` —

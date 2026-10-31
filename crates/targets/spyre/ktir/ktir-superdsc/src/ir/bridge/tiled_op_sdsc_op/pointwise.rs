@@ -1227,7 +1227,8 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // bytes and the output's `(y·mb, out)` bytes are the same stick-blocked bytes the mints
     // reserved. Everything below is cross-checks; the addressing itself is the ordinary
     // scale-driven rule (`build_coordinates`/`per_core_addr`), which is why the form needs no
-    // new addressing code — only the layout order and the operand scales stated honestly.
+    // new addressing code — only the layout order and the operand scales stated honestly, and
+    // the cores divided along that layout order (the division below).
     let stated_ys: Vec<(u32, crate::emit::SprayOrder)> = inputs
         .iter()
         .filter(|i| i.y_broadcast() > 1)
@@ -1291,19 +1292,48 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // unpinned dims — a split elsewhere shrinks what one index entry covers. The mint already
     // refused every shape that would have needed one, so the closure hands the tiler the minted
     // map whatever budget it asks with.
-    let tiled = match &division {
-        CoreDivision::Gathered(g) => tile_op
+    // ⭐⭐ A ROW-SPLIT OP'S CORES FOLLOW ITS LAYOUT ([`crate::work::distribute_cores_layout_first`]):
+    // its two row dims in the spray's layout order, the outer split first. The elementwise law
+    // (sticks first, then `mb`) is the wrong-byte division for the `[y, mb, out]` spray — it splits
+    // `mb` under a `y` every core walks, which the card measured as row-mixing — so an op that
+    // sprays takes this division or none.
+    let spray_rows = spray.map(|order| {
+        let [outer, inner, _] = order.layout();
+        [outer, inner]
+    });
+    let tiled = match (&division, spray_rows) {
+        (CoreDivision::Gathered(g), None) => tile_op
             .tile(MaxCores::<MAX_CORES>, |_, _| g.splits().clone(), "out")
             .map_err(|e| e.0)?,
-        CoreDivision::Ew(d) => tile_op
+        (CoreDivision::Ew(EwDivision::Law), Some(rows)) => tile_op
+            .tile(
+                MaxCores::<MAX_CORES>,
+                crate::work::distribute_cores_layout_first(rows),
+                "out",
+            )
+            .map_err(|e| e.0)?,
+        (CoreDivision::Ew(d), None) => tile_op
             .tile(
                 MaxCores::<MAX_CORES>,
                 d.resolve(stickmajor, core_local).splitter(),
                 "out",
             )
             .map_err(|e| e.0)?,
+        (stated, Some(_)) => {
+            return Err(format!(
+                "{o_name}: a row-split (y-broadcast) op states its own core division \
+                 ({}) — its cores follow the spray's layout, so it takes the elementwise law",
+                match stated {
+                    CoreDivision::Gathered(_) => "a gather's".to_string(),
+                    CoreDivision::Ew(d) => format!("{d:?}"),
+                }
+            ));
+        }
     };
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
+    if let Some(rows) = spray_rows {
+        crate::work::layout_walk_is_whole(&plan, rows).map_err(|e| format!("{o_name}: {e}"))?;
+    }
     // THE ROW-SPLIT MODE's ORDER (`spray` above): the syms are picked by NAME in the order the
     // layout states them (`SprayOrder::layout`), so the plan's own `y`/`mb`/`out` syms feed the
     // TensorArgs directly — the same plan, walked in the spray's order.
