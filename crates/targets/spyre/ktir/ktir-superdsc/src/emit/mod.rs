@@ -5802,6 +5802,7 @@ mod transpose_tests {
             mask: None,
             node_out_tid: None,
             minted: Default::default(),
+            lx_plan: Default::default(),
         }
     }
 
@@ -8207,6 +8208,7 @@ mod embed_row_gather_tests {
             mask: None,
             node_out_tid: None,
             minted: Default::default(),
+            lx_plan: Default::default(),
         }
     }
 
@@ -8966,6 +8968,7 @@ mod chain_stage_tests {
             mask: None,
             node_out_tid: None,
             minted: Default::default(),
+            lx_plan: Default::default(),
         }
     }
 

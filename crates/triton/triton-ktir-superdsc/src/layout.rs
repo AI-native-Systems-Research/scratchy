@@ -1347,6 +1347,7 @@ mod tests {
             mask: None,
             node_out_tid: None,
             minted: Default::default(),
+            lx_plan: Default::default(),
         };
 
         let layout = for_node(&node).expect("the two-ids program has a layout");

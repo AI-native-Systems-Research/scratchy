@@ -2039,6 +2039,7 @@ fn rebind(
         mask,
         node_out_tid: None,
         minted: Default::default(),
+        lx_plan: Default::default(),
     })
 }
 
@@ -3221,6 +3222,7 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
         mask: None,
         node_out_tid: None,
         minted: Default::default(),
+        lx_plan: Default::default(),
     })
 }
 
@@ -4781,6 +4783,51 @@ mod walk_on_the_card {
                 outside("scatter"),
                 columns,
                 "mq={mq} hd={hd}: the output rows"
+            );
+        }
+    }
+
+    /// ⭐ A WALK LOWERED TWICE INTO ONE LAYOUT LOWERS THE SAME BOTH TIMES. A card bake lowers each
+    /// program once to declare the bundle's synthetics and again for real, into the same layout; the
+    /// second lowering takes the first's tensors and scratchpad plan, so it neither mints a second
+    /// set of buffers nor plans its LX around the first's pins (which left the real pass of a
+    /// 128-row prompt walk only the window the declaring pass had not taken).
+    #[test]
+    fn a_walk_lowered_twice_into_one_layout_lowers_the_same() {
+        for (mq, hd) in [(1, 64), (128, 64), (128, 128)] {
+            let node = walk_at(mq, 4, hd);
+            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            let lower = || {
+                let mut sym = 0i64;
+                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                    .unwrap_or_else(|e| panic!("mq={mq} hd={hd}: the walk lowers: {}", e.message))
+            };
+            let shape =
+                |ops: &[ktir_superdsc::emit::EmittedOp]| -> Vec<(String, Vec<(String, u32)>)> {
+                    ops.iter()
+                        .map(|e| {
+                            (
+                                e.op_name.clone(),
+                                e.arg_bindings
+                                    .iter()
+                                    .map(|a| (a.buffer.clone(), a.offset_elems))
+                                    .collect(),
+                            )
+                        })
+                        .collect()
+                };
+            let declaring = shape(&lower());
+            let window = layout.lx_window_bytes();
+            let real = shape(&lower());
+            assert_eq!(
+                real, declaring,
+                "mq={mq} hd={hd}: the real pass lowers as the declaring pass did"
+            );
+            assert_eq!(
+                layout.lx_window_bytes(),
+                window,
+                "mq={mq} hd={hd}: and pins nothing more"
             );
         }
     }

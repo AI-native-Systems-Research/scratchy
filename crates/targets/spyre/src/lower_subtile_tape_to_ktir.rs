@@ -513,6 +513,7 @@ fn chain_skeleton<F: RopeForm>(
         mask: None,
         node_out_tid: None,
         minted: Default::default(),
+        lx_plan: Default::default(),
     })
 }
 

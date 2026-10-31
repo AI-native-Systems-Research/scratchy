@@ -3794,6 +3794,16 @@ pub fn lower_walk(
         ));
     }
     super::lx_plan::check(layout, node.func.name)?;
+    // The program keeps what its flattened copy minted and planned, so its next lowering into this
+    // layout (the bake's real pass after its declaring one) takes the same tensors and the same plan.
+    if flat.is_some() {
+        *k.minted.lock().unwrap_or_else(|p| p.into_inner()) = probed;
+        *k.lx_plan.lock().unwrap_or_else(|p| p.into_inner()) = node
+            .lx_plan
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+    }
     Ok(ops)
 }
 
@@ -4582,7 +4592,7 @@ fn lower_function_folded(
                                     z
                                 }
                             };
-                            let run = layout.take_inter_tid(floor);
+                            let run = mint_scratch(k, layout, floor, src, 1);
                             layout.synth_df(
                                 crate::place::PlaceId::Act(run),
                                 &[1, super::lower_ktir_to_superdsc::INDEX_RUN_WORDS],
@@ -4656,8 +4666,8 @@ fn lower_function_folded(
                             ));
                         }
                         let mut scaled = index_stick(g.index_tid, false);
-                        for _ in 0..pieces.trailing_zeros() {
-                            let tid = layout.take_inter_tid(floor);
+                        for halving in 0..pieces.trailing_zeros() {
+                            let tid = mint_scratch(k, layout, floor, src, 2 + halving as u8);
                             layout.synth_df(
                                 crate::place::PlaceId::Act(tid),
                                 &[1, words],
