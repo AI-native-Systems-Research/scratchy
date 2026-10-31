@@ -6855,9 +6855,9 @@ impl EmittedBundle {
 /// Deterministic content fingerprint of a SuperDSC bundle — its identity everywhere downstream, and
 /// the bake queue's cue that a bundle it has already emitted is this one again.
 ///
-/// Stable across builds (`DefaultHasher` has a fixed seed). Hashes the rendered `bundle.mlir` as well
-/// as the per-op json, because the loop structure varies with `time`/strides while the byte-faithful
-/// per-op json does not.
+/// Stable across builds (`DefaultHasher` has a fixed seed). Hashes the launch grouping, and per op its
+/// name, `time`, KTIR program and bindings, and its lowered SuperDSC descriptor: everything dxp is
+/// handed for it.
 pub fn bundle_fingerprint(ops: &[EmittedOp]) -> String {
     bundle_fingerprint_grouped(ops, FoldGrouping::Split)
 }
@@ -6885,12 +6885,22 @@ pub fn bundle_fingerprint_grouped(ops: &[EmittedOp], fold: FoldGrouping) -> Stri
     // while its descriptors happened to agree. `Operation` hashes structurally — kind, operands,
     // attributes, result type, nested regions — so any edit to the emitted program is an edit to
     // the fingerprint, and a bundle can never silently answer for a different one.
+    //
+    // ⛔ AND THE DESCRIPTOR. The same KTIR lowers to different descriptors under a different layout
+    // or scratchpad plan (`emit::lx_plan`): granite-3.1-2b's decode walk kept its fingerprint when its
+    // trip went to one kv head a core in LX. The fingerprint is the bake's dedup key, so a bundle
+    // whose descriptors changed must not answer to the old one's name.
     for e in ops {
         e.op_name.hash(&mut h);
         e.time.hash(&mut h);
         if let Some(k) = e.ktir.as_ref() {
             k.func.hash(&mut h);
             k.bindings.hash(&mut h);
+        }
+        if let Some(op) = e.op.as_ref() {
+            serde_json::to_vec(op)
+                .expect("a lowered descriptor serializes")
+                .hash(&mut h);
         }
     }
     format!("{:016x}", h.finish())
@@ -9915,5 +9925,39 @@ mod tests {
         );
         layout.synth(ktir_superdsc::place::PlaceId::Act(victim), &[1, 64]);
         let _ = bake_layout(&layout);
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use ktir_superdsc::emit::rb;
+    use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
+
+    /// ⭐ A BUNDLE IS ITS DESCRIPTORS. Two ops alike in every field the fingerprint hashed before —
+    /// name, `time`, KTIR program and bindings (here none) — but lowered to different descriptors are
+    /// different bundles, as the same KTIR under a different scratchpad plan is.
+    #[test]
+    fn a_changed_descriptor_changes_the_fingerprint() {
+        let at = |m: u32| {
+            assemble_matmul(
+                "MatMul_0",
+                m,
+                384,
+                64,
+                16,
+                &rb("act", m, 64),
+                &Stk::<KernelTag>::kernel(64, 384, "wt"),
+                &rb("out", m, 384),
+                None,
+            )
+        };
+        let (a, b) = (at(384), at(192));
+        assert_eq!((&a.op_name, a.time), (&b.op_name, b.time));
+        assert_ne!(
+            bundle_fingerprint(&[a]),
+            bundle_fingerprint(&[b]),
+            "the descriptors differ, so the bundles do"
+        );
     }
 }
