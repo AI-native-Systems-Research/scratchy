@@ -1986,21 +1986,44 @@ fn gdn_verify_is_the_conv_scan_norm() {
             &conv_lanes,
             &ssm_lanes,
         ];
-        // A threadgroup a (sequence, key head, value head): `tgid.y` runs over the value heads;
-        // then the q and k channels' state, a threadgroup a (sequence, key head).
+        // A threadgroup a (sequence, key head, value head): `tgid.y` runs over the value heads.
         if !common::dispatch_threadgroups(&device, &verify, &bufs, size(1, nv, 2), size(1024, 1, 1))
-            || !common::dispatch_threadgroups(
-                &device,
-                &qk_state,
-                &bufs,
-                size(1, nk, 2),
-                size(1024, 1, 1),
-            )
         {
             return;
         }
-
+        // Alone, it leaves every q and k channel's conv state as it found it, bitwise: no value
+        // head's threadgroup writes what another reads its seed from (#914 had the first write
+        // it), whatever order the threadgroups run in. Ring and lane checkpoints both lay out a
+        // channel's `kernel - 1` entries at channel `(j / (kernel - 1)) % conv_dim`.
         let geometry = format!("nk {nk} nv {nv} drafts {drafts} start {start:?}");
+        let qk_untouched = |what: &str, got: Vec<f32>, was: &[f32]| {
+            for (j, (g, w)) in got.iter().zip(was).enumerate() {
+                if (j / (kernel - 1)) % conv_dim < 2 * key_dim {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "gdn_verify wrote q/k {what}[{j}], {geometry}"
+                    );
+                }
+            }
+        };
+        qk_untouched("ring", read_f32(&conv_state, conv0.len()), &conv0);
+        qk_untouched(
+            "lane checkpoint",
+            read_f32(&conv_lanes, conv_lanes0.len()),
+            &conv_lanes0,
+        );
+        // Then the q and k channels' state, a threadgroup a (sequence, key head).
+        if !common::dispatch_threadgroups(
+            &device,
+            &qk_state,
+            &bufs,
+            size(1, nk, 2),
+            size(1024, 1, 1),
+        ) {
+            return;
+        }
+
         let close = |what: &str,
                      read: fn(&Buffer, usize) -> Vec<f32>,
                      got: &Buffer,
