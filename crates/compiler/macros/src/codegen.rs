@@ -9152,8 +9152,45 @@ fn emit_superdsc_wiring(
     // `nqh·mq` rows — the shortfall is silent (the bind guard refuses over-binds
     // only) and the unstaged tail of an ADDITIVE mask reads as ZERO, i.e. as no
     // mask. MEASURED on gemma-4 tiny-allglobal: heads 2-3 ran unmasked, every layer.
-    let nqh = u32l(heads as u32);
-    let kv_dim = u32l((b("num_key_value_heads").max(1) * hd) as u32);
+    //
+    // ⭐ AND THE HEADS ARE THE ONES THE TAPE WAS LOWERED AT — read off the graph. A sharded
+    // world's forward is `tensor_parallel::shard`'s, whose attention ops carry each rank's own
+    // heads: query AND kv heads divided by the world when both divide, whole when the analysis
+    // replicated attention. Every attention op of a forward is minted with the model's one
+    // query-head count and divided the same way, so the split is ONE number, and the wiring's
+    // counts are the model's divided by it — the `nq / w`, `nkv / w` the analysis divided by.
+    // The layout places the causal mask and the KV caches at the lowered heads; a geometry
+    // baked at the model's would be refused at load (`verify_causal_placement` — measured, #1009:
+    // 2048 B placed against 32 heads' 4096 B). A world of one reads a split of 1: the model's
+    // own counts, byte-identical.
+    let lowered_nqh: std::collections::BTreeSet<u64> = lwd
+        .input
+        .ops
+        .iter()
+        .filter_map(|o| match o.op {
+            scratchy_subtile::subtile_ir::SubOp::AttnDecode { geom, .. } => {
+                Some(u64::from(geom.nqh().get()))
+            }
+            _ => None,
+        })
+        .collect();
+    let split = match lowered_nqh.iter().copied().collect::<Vec<_>>().as_slice() {
+        [] => 1,
+        [q] if heads.is_multiple_of(*q)
+            && b("num_key_value_heads").max(1).is_multiple_of(heads / q) =>
+        {
+            heads / q
+        }
+        other => panic!(
+            "[superdsc-wiring] {}: the forward's attention ops carry query-head count(s) {other:?} \
+             — not the model's {heads} (kv {}) divided one way, so no single head geometry \
+             describes this bundle",
+            model.source_stem,
+            b("num_key_value_heads"),
+        ),
+    };
+    let nqh = u32l((heads / split) as u32);
+    let kv_dim = u32l((b("num_key_value_heads").max(1) / split * hd) as u32);
     // ⛔ SCALARS FIRST, AND NO DEFAULT. `rope_theta` is a FLOAT, so it lives in
     // `model.scalars`; `bounds` is integer-valued and a bounds-only lookup
     // misses it entirely. With an `unwrap_or(1e4)` behind it that miss is
