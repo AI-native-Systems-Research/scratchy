@@ -348,8 +348,14 @@ fn gather_copy_cores(
         .filter(|_| entry_page > 0)
     {
         // The BASIS is the entry count, and the split of `mb` is that same number — so every core gets a
-        // whole number of entries and `min(per_core, page)` is always the page.
-        let split = crate::work::core_split(mb.size / entry_page, max_cores);
+        // whole number of entries and `min(per_core, page)` is always the page. Past one index stick,
+        // every core's run also lies within one stick of the table (`index_core_split`).
+        let split = crate::work::index_core_split(
+            mb.size / entry_page,
+            max_cores,
+            crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+        )
+        .unwrap_or(1);
         if split > 1 {
             splits.insert(mb.name, split);
         }
@@ -533,11 +539,11 @@ pub fn scatter_copy_opspec(
         ));
     }
     let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-    if rows / page > cap {
+    if crate::work::index_core_split(rows / page, MAX_CORES, cap).is_none() {
         return Err(format!(
-            "scatter_copy_opspec('{src}' -> '{dst}'): {} index entries, and one op's index is ONE \
-             {cap}-entry stick — entries past it wrap and write another core's rows. Cut the write \
-             into one op per stick of entries.",
+            "scatter_copy_opspec('{src}' -> '{dst}'): {} index entries divide over no {MAX_CORES} \
+             cores into runs each core reads from ONE {cap}-entry stick — entries past a core's \
+             stick wrap and write another core's rows",
             rows / page
         ));
     }
@@ -644,10 +650,11 @@ pub fn page_gather_copy_opspec(
         ));
     }
     let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-    if rows / page > cap {
+    if crate::work::index_core_split(rows / page, MAX_CORES, cap).is_none() {
         return Err(format!(
-            "page_gather_copy_opspec('{src}' -> '{dst}'): {} index entries, and one op's index is \
-             ONE {cap}-entry stick — entries past it wrap and gather another core's pages",
+            "page_gather_copy_opspec('{src}' -> '{dst}'): {} index entries divide over no \
+             {MAX_CORES} cores into runs each core reads from ONE {cap}-entry stick — entries past \
+             a core's stick wrap and gather another core's pages",
             rows / page
         ));
     }
@@ -1742,8 +1749,9 @@ mod scatter_tests {
         assert_eq!(ia.index, 1, "the index sits between input and output");
     }
 
-    /// More entries than one 32-entry index stick is refused: dxp loads one stick per op and the
-    /// entries past it wrap onto another core's rows.
+    /// Entries no core division keeps within one 32-entry index stick a core are refused: dxp loads
+    /// each core's index as one stick, and the entries past it wrap onto another core's rows. 33
+    /// entries split only into runs of 3 or 11 (or over 33 cores), each straddling a stick.
     #[test]
     fn a_scatter_past_one_index_stick_is_refused() {
         let e = scatter_copy_opspec(
@@ -2041,5 +2049,85 @@ mod page_gather_blocks_tests {
             panic!("an entry of two positions is two blocks' worth of one");
         };
         assert!(m.contains("one `mb` position"), "{m}");
+    }
+}
+
+#[cfg(test)]
+mod index_stick_tests {
+    use super::*;
+    use crate::superdsc_opspec::{EntryBase, GatherIndex, PageExtent};
+
+    /// Each core's index start, in core order, of a one-stick-sub-row gather of `entries` rows.
+    fn index_starts(entries: u32) -> Vec<u64> {
+        let op = page_gather_copy_opspec(
+            "Tensor0",
+            "Tensor2",
+            GatherIndex::of_scratch_rows(
+                "Tensor1".into(),
+                PageExtent::of_positions(1),
+                EntryBase::ZERO,
+            ),
+            entries,
+            64,
+            GatheredWords::Fp16,
+        )
+        .expect("the gather builds");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let v = serde_json::to_value(
+            crate::emit::emit_sdsc("gather_o2", &op, &folds, None).expect("it emits"),
+        )
+        .expect("json");
+        let dsc = &v["dscs_"][0]["gather_o2"];
+        let index = dsc["scheduleTree_"]
+            .as_array()
+            .expect("a tree")
+            .iter()
+            .find(|n| n["indirectAllocType_"] == "index_tensor")
+            .expect("the index");
+        let data = &index["startAddressCoreCorelet_"]["data_"];
+        (0..op.iter.cores_used().get())
+            .map(|c| {
+                data[format!("[{c}, 0, 0]")]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("a concrete start")
+            })
+            .collect()
+    }
+
+    /// ⭐ torch-spyre's 512-entry query gather: past one index stick, each core's index starts at
+    /// the stick holding its entries — here 16 entries a core over 32 cores, so cores `2s` and
+    /// `2s + 1` share stick `s`, 128 bytes a stick.
+    #[test]
+    fn each_core_reads_the_index_stick_holding_its_entries() {
+        let starts = index_starts(512);
+        assert_eq!(starts.len(), 32, "16 entries a core");
+        for (c, &s) in starts.iter().enumerate() {
+            assert_eq!(s - starts[0], (c as u64 / 2) * 128, "core {c}");
+        }
+    }
+
+    /// One stick of entries keeps ONE start for every core, as every gather before it did: dxp reads
+    /// each core's entries inside that stick.
+    #[test]
+    fn a_one_stick_index_has_one_start() {
+        let starts = index_starts(32);
+        assert_eq!(starts.len(), 32);
+        assert!(starts.iter().all(|&s| s == starts[0]), "{starts:?}");
+    }
+
+    /// The runs one op each serves: up to 32 cores of one stick, cut at a whole stick where no
+    /// division keeps every core within one.
+    #[test]
+    fn the_index_runs_fill_every_core_a_stick() {
+        use crate::emit::lower_ktir_to_superdsc::index_runs;
+        assert_eq!(index_runs(8), vec![(0, 8)]);
+        assert_eq!(index_runs(512), vec![(0, 512)]);
+        assert_eq!(
+            index_runs(4096),
+            vec![(0, 1024), (1024, 1024), (2048, 1024), (3072, 1024)]
+        );
+        assert_eq!(index_runs(33), vec![(0, 32), (32, 1)]);
+        assert_eq!(index_runs(1027), vec![(0, 1024), (1024, 3)]);
     }
 }

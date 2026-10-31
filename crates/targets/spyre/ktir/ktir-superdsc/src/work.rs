@@ -40,6 +40,17 @@ pub fn core_split(size: u32, max_cores: u32) -> u32 {
     1
 }
 
+/// The cores a gather or scatter of `entries` index entries divides over: the most, at most
+/// `max_cores`, that split the entries evenly into runs each dividing `stick` (the entries one index
+/// register holds) — so no core's run straddles two sticks of the table
+/// (`emit::index_stick_starts`). At most `stick` entries it is [`core_split`]: one entry a core.
+/// `None` when no division does (more entries than `max_cores` sticks).
+pub fn index_core_split(entries: u32, max_cores: u32, stick: u32) -> Option<u32> {
+    (1..=max_cores.min(entries.max(1)))
+        .rev()
+        .find(|&c| entries.is_multiple_of(c) && stick.is_multiple_of(entries / c))
+}
+
 /// ⭐⭐⭐ THE ONE-ROW MATMUL'S CORE FILL — `(out, in)` cores for a matmul whose `mb` is one row, both in
 /// WHOLE STICKS of their own axis: the most cores that fit `max_cores`, and among those the widest
 /// `out` (so the reduction fan-in is the smallest that fills the machine).
