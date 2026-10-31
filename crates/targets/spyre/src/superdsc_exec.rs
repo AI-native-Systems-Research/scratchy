@@ -1196,7 +1196,7 @@ impl RankSeat {
                 ktir_superdsc::reserved_tids::TP_RECV_TID,
             ))
             .map(|p| {
-                bundle::collective::WireBytes::new(p.size)
+                bundle::collective::Payload::new(p.size)
                     .and_then(|size| bundle::collective::RecvWindow::new(p.offset, size))
                     .ok_or(SeatRefusal::Misplaced {
                         offset: p.offset,
@@ -6695,8 +6695,8 @@ mod tests {
     /// no link, or the link's window exactly — and every disagreement refuses by name.
     #[test]
     fn a_bundle_runs_only_where_the_process_linked_its_window() {
-        use bundle::collective::{RecvWindow, WireBytes};
-        let at = |offset| RecvWindow::new(offset, WireBytes::CAP).unwrap();
+        use bundle::collective::{Payload, RecvWindow, WireBytes};
+        let at = |offset| RecvWindow::new(offset, Payload::from(WireBytes::CAP)).unwrap();
         assert_eq!(RankSeat::agree(None, None), Ok(()));
         assert_eq!(
             RankSeat::agree(Some(at(1 << 20)), Some(at(1 << 20))),

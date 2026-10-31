@@ -78,7 +78,7 @@ pub struct TpSend {
     pub source_offset: u64,
     /// The window's offset inside [`RecvWindow::SEGMENT`].
     pub window_offset: u64,
-    pub bytes: WireBytes,
+    pub bytes: Payload,
 }
 
 /// Why a consume's send names no baked bytes. The bake refuses every one of these (it resolves
@@ -164,6 +164,33 @@ impl TpSend {
     }
 }
 
+/// ONE F-SEND of a [`TpSend`]: one message of its payload, at the matching offset on both ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TpMessage {
+    pub source_offset: u64,
+    pub window_offset: u64,
+    pub bytes: WireBytes,
+    /// The send section's own protocol bits: this message's place in the run.
+    pub first: bool,
+    pub last: bool,
+}
+
+impl TpSend {
+    /// ⭐ THE CUT: the send as the vendor's windowed P2P loop issues it — one F-send per message
+    /// ([`Payload::messages`]), each advancing the source and the landing together. Every one
+    /// increments the peer's write-done counter once, so a send of N messages is waited for N
+    /// times (a wait consumes exactly one count): the pipeline issues N waits for it.
+    pub fn messages(self) -> impl Iterator<Item = TpMessage> {
+        self.bytes.messages().map(move |m| TpMessage {
+            source_offset: self.source_offset + m.offset,
+            window_offset: self.window_offset + m.offset,
+            bytes: m.bytes,
+            first: m.first,
+            last: m.last,
+        })
+    }
+}
+
 /// One consume group's send, read off its bundle's placements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GroupSend {
@@ -215,7 +242,7 @@ mod tests {
     use super::*;
 
     fn frag() -> Fragment {
-        fragments(1, 2048, WireBytes::CAP).unwrap()[0]
+        fragments(1, 2048, Payload::from(WireBytes::CAP)).unwrap()[0]
     }
 
     fn consume_group(consume: TpConsume) -> crate::LaunchGroup<'static> {
@@ -343,7 +370,7 @@ mod tests {
     /// offset plus the fragment's — and lands at the window's offset.
     #[test]
     fn a_send_reads_its_fragment_at_the_operands_placement() {
-        let fragment = fragments(4, 256, WireBytes::new(1024).unwrap()).unwrap()[1];
+        let fragment = fragments(4, 256, Payload::new(1024).unwrap()).unwrap()[1];
         let consume = TpConsume {
             kind: CollectiveKind::AllReduce,
             operand: crate::PlaceId::Act(7),
@@ -362,6 +389,34 @@ mod tests {
             }
         );
         assert_ne!(fragment.byte_offset(), 0);
+    }
+
+    /// A send wider than one message is the vendor loop's run: each message reads and lands at
+    /// the same offset into the payload, the run tiles it, and only its ends carry first / last.
+    #[test]
+    fn a_wide_send_is_a_run_of_messages_at_matching_offsets() {
+        let cap = WireBytes::CAP.get();
+        let send = TpSend {
+            source_segment: 0,
+            source_offset: 8192,
+            window_offset: 1 << 30,
+            bytes: Payload::new(2 * cap + 256).unwrap(),
+        };
+        let m: Vec<TpMessage> = send.messages().collect();
+        assert_eq!(m.len(), 3);
+        for (k, x) in m.iter().enumerate() {
+            let at = k as u64 * cap;
+            assert_eq!(
+                (x.source_offset, x.window_offset),
+                (8192 + at, (1 << 30) + at)
+            );
+            assert_eq!((x.first, x.last), (k == 0, k == 2));
+        }
+        assert_eq!(m[2].bytes.get(), 256);
+        assert_eq!(
+            m.iter().map(|x| x.bytes.get()).sum::<u64>(),
+            send.bytes.get()
+        );
     }
 
     /// Every way a send can name no baked bytes refuses by name.

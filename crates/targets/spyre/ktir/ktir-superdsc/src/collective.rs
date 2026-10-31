@@ -16,9 +16,9 @@
 //! - the world is a member of [`SPYRE_TP_WORLDS`] or [`TpWorld::of`] does not compile;
 //! - a rank is minted by its world ([`TpWorld::ranks`]), so it is in range and carries the world
 //!   it belongs to ([`TpIdentity`] is one fact, never a rank and a world passed apart);
-//! - a p2p payload is a whole number of flits no wider than the RDMA message cap ([`WireBytes`]),
-//!   and a wider operand is cut at bake into runs of whole stick columns — the only contiguous
-//!   slices of a stick-major tensor ([`fragments`]);
+//! - a send moves a [`Payload`] (a whole number of flits) as a run of messages, each within the
+//!   RDMA message cap ([`WireBytes`], [`Payload::messages`]); an operand is cut at bake into runs
+//!   of whole stick columns — the only contiguous slices of a stick-major tensor ([`fragments`]);
 //! - the receive window is ONE `(segment, offset, size)` triple ([`RecvWindow`]), flit-aligned, in
 //!   the weight segment;
 //! - write-done signals use ONE sid per rank ([`Sid::of`]) — never per collective (a forward holds
@@ -172,9 +172,68 @@ impl TpIdentity {
     }
 }
 
-/// A p2p payload: a whole, non-zero number of flits, no wider than [`RDMA_MESSAGE_CAP_BYTES`].
+/// ONE p2p MESSAGE: a whole, non-zero number of flits, no wider than [`RDMA_MESSAGE_CAP_BYTES`]
+/// (the send section's 15-bit flit length field). A wider [`Payload`] is cut into these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WireBytes(u64);
+
+/// WHAT ONE SEND MOVES: a whole, non-zero number of flits, of any width. On the wire it is a run of
+/// [`Message`]s — the vendor's windowed P2P loop: one F-send per [`RDMA_MESSAGE_CAP_BYTES`] chunk,
+/// `first` on the first, `last` on the last ([`Payload::messages`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Payload(u64);
+
+impl Payload {
+    /// `Some` iff `bytes` is a non-zero flit multiple.
+    pub const fn new(bytes: u64) -> Option<Self> {
+        if bytes == 0 || !bytes.is_multiple_of(FLIT_BYTES) {
+            return None;
+        }
+        Some(Self(bytes))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// How many messages carry it.
+    pub const fn message_count(self) -> u32 {
+        self.0.div_ceil(RDMA_MESSAGE_CAP_BYTES) as u32
+    }
+
+    /// Its messages, in order: whole caps, then the remainder. They tile the payload exactly.
+    pub fn messages(self) -> impl Iterator<Item = Message> {
+        let n = self.message_count();
+        (0..n).map(move |i| {
+            let offset = u64::from(i) * RDMA_MESSAGE_CAP_BYTES;
+            let Some(bytes) = WireBytes::new((self.0 - offset).min(RDMA_MESSAGE_CAP_BYTES)) else {
+                unreachable!("a flit-multiple remainder within the cap is one message")
+            };
+            Message {
+                offset,
+                bytes,
+                first: i == 0,
+                last: i + 1 == n,
+            }
+        })
+    }
+}
+
+impl From<WireBytes> for Payload {
+    fn from(w: WireBytes) -> Self {
+        Self(w.0)
+    }
+}
+
+/// One message of a [`Payload`]: where it starts inside the payload, how much it carries, and its
+/// place in the run (`first` / `last`, the send section's own protocol bits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Message {
+    pub offset: u64,
+    pub bytes: WireBytes,
+    pub first: bool,
+    pub last: bool,
+}
 
 impl WireBytes {
     /// `Some` iff `bytes` is a non-zero flit multiple within the message cap.
@@ -203,7 +262,7 @@ impl WireBytes {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RecvWindow {
     offset: u64,
-    size: WireBytes,
+    size: Payload,
 }
 
 impl RecvWindow {
@@ -211,7 +270,7 @@ impl RecvWindow {
     pub const SEGMENT: u32 = 1;
 
     /// `Some` iff `offset` is flit-aligned.
-    pub const fn new(offset: u64, size: WireBytes) -> Option<Self> {
+    pub const fn new(offset: u64, size: Payload) -> Option<Self> {
         if !offset.is_multiple_of(FLIT_BYTES) {
             return None;
         }
@@ -222,7 +281,7 @@ impl RecvWindow {
         self.offset
     }
 
-    pub const fn size(self) -> WireBytes {
+    pub const fn size(self) -> Payload {
         self.size
     }
 
@@ -267,28 +326,37 @@ pub struct Fragment {
     first_stick: u32,
     sticks: u32,
     rows: u32,
-    bytes: WireBytes,
+    bytes: Payload,
 }
 
 impl Fragment {
     /// Re-mint a fragment from the parts the `#[forward]` macro bakes as tokens. A `const fn` and
-    /// the bundle is a `static`, so parts that are not a whole-flit payload within one message —
-    /// parts no cut could have produced — fail the BUILD of the crate that bakes them:
+    /// the bundle is a `static`, so parts that carry no payload — parts no cut could have produced —
+    /// fail the BUILD of the crate that bakes them:
     ///
     /// ```compile_fail
     /// use ktir_superdsc::collective::Fragment;
-    /// // One stick column of 40 000 rows is 5 MB — past one message.
+    /// // A fragment of no rows moves nothing.
+    /// const F: Fragment = Fragment::baked(0, 1, 0);
+    /// ```
+    ///
+    /// A fragment wider than one message is a payload like any other — its send is several:
+    ///
+    /// ```
+    /// use ktir_superdsc::collective::Fragment;
+    /// // One stick column of 40 000 rows is 5 MB: two messages.
     /// const F: Fragment = Fragment::baked(0, 1, 40_000);
+    /// assert_eq!(F.bytes().message_count(), 2);
     /// ```
     pub const fn baked(first_stick: u32, sticks: u32, rows: u32) -> Self {
-        match WireBytes::new(sticks as u64 * rows as u64 * STICK_BYTES) {
+        match Payload::new(sticks as u64 * rows as u64 * STICK_BYTES) {
             Some(bytes) => Self {
                 first_stick,
                 sticks,
                 rows,
                 bytes,
             },
-            None => panic!("a baked fragment that is not one whole-flit message"),
+            None => panic!("a baked fragment that carries no whole-flit payload"),
         }
     }
 
@@ -323,7 +391,7 @@ impl Fragment {
     }
 
     /// What one send carries.
-    pub const fn bytes(self) -> WireBytes {
+    pub const fn bytes(self) -> Payload {
         self.bytes
     }
 }
@@ -334,20 +402,20 @@ pub enum FragmentRefusal {
     /// The operand's columns are not whole sticks — not a layout a stick-column run can cover. The
     /// shared analysis splits only at whole sticks, so this refuses a shape it never mints.
     RaggedCols { cols: u32 },
-    /// One stick column alone is wider than one message.
-    StickColumnPastCap { rows: u32 },
+    /// One stick column alone is wider than the cut's width.
+    StickColumnPastWidth { rows: u32 },
 }
 
 /// A `[rows, cols]` fp16 operand cut into fragments of whole stick columns, each at most `width`
 /// bytes, tiling it exactly in column order.
-pub fn fragments(rows: u32, cols: u32, width: WireBytes) -> Result<Vec<Fragment>, FragmentRefusal> {
+pub fn fragments(rows: u32, cols: u32, width: Payload) -> Result<Vec<Fragment>, FragmentRefusal> {
     if cols == 0 || !cols.is_multiple_of(STICK_ELEMS) {
         return Err(FragmentRefusal::RaggedCols { cols });
     }
     let column_bytes = u64::from(rows) * STICK_BYTES;
     let per = width.get().checked_div(column_bytes).unwrap_or(0);
     if per == 0 {
-        return Err(FragmentRefusal::StickColumnPastCap { rows });
+        return Err(FragmentRefusal::StickColumnPastWidth { rows });
     }
     let total = cols / STICK_ELEMS;
     let mut out = Vec::new();
@@ -355,7 +423,7 @@ pub fn fragments(rows: u32, cols: u32, width: WireBytes) -> Result<Vec<Fragment>
     while first_stick < total {
         let sticks = per.min(u64::from(total - first_stick)) as u32;
         // Whole stick columns, each a flit multiple, within `width` — always a payload.
-        let Some(bytes) = WireBytes::new(u64::from(sticks) * column_bytes) else {
+        let Some(bytes) = Payload::new(u64::from(sticks) * column_bytes) else {
             unreachable!("whole stick columns within the width are a payload")
         };
         out.push(Fragment {
@@ -461,36 +529,66 @@ mod tests {
         assert_eq!(WireBytes::CAP.get(), RDMA_MESSAGE_CAP_BYTES);
     }
 
-    /// An operand is cut at whole stick columns, each fragment one contiguous run within the cap,
+    /// A payload is cut into the vendor loop's messages: whole caps then the remainder, tiling it
+    /// exactly, `first` on the first alone and `last` on the last alone — one message is both.
+    #[test]
+    fn a_payload_goes_out_as_messages_within_the_cap() {
+        assert!(Payload::new(0).is_none());
+        assert!(Payload::new(FLIT_BYTES + 1).is_none());
+        let cap = RDMA_MESSAGE_CAP_BYTES;
+        // ~12.6 MiB — a prefill gather's fragment: three whole caps and a remainder.
+        let p = Payload::new(3 * cap + 600 * FLIT_BYTES).unwrap();
+        let m: Vec<Message> = p.messages().collect();
+        assert_eq!(m.len(), 4);
+        assert_eq!(p.message_count(), 4);
+        assert_eq!(
+            m.iter().map(|x| x.offset).collect::<Vec<_>>(),
+            [0, cap, 2 * cap, 3 * cap]
+        );
+        assert!(m[..3].iter().all(|x| x.bytes == WireBytes::CAP));
+        assert_eq!(m[3].bytes.get(), 600 * FLIT_BYTES);
+        assert_eq!(
+            m.iter().map(|x| (x.first, x.last)).collect::<Vec<_>>(),
+            [(true, false), (false, false), (false, false), (false, true)]
+        );
+        assert_eq!(m.iter().map(|x| x.bytes.get()).sum::<u64>(), p.get());
+        // Exactly one cap is one message, both first and last.
+        let one: Vec<Message> = Payload::from(WireBytes::CAP).messages().collect();
+        assert_eq!(one.len(), 1);
+        assert!(one[0].first && one[0].last);
+    }
+
+    /// An operand is cut at whole stick columns, each fragment one contiguous run within the width,
     /// tiling the columns exactly; a ragged width and a too-tall column are refusals.
     #[test]
-    fn fragments_are_whole_stick_columns_within_the_cap() {
-        // A 512-row prefill chunk of a 4096-wide hidden: 4 MiB, one fragment at the cap.
-        let one = fragments(512, 4096, WireBytes::CAP).unwrap();
+    fn fragments_are_whole_stick_columns_within_the_width() {
+        let cap = Payload::from(WireBytes::CAP);
+        // A 512-row prefill chunk of a 4096-wide hidden: 4 MiB, one fragment at the width.
+        let one = fragments(512, 4096, cap).unwrap();
         assert_eq!(one.len(), 1);
-        assert_eq!(one[0].bytes(), WireBytes::CAP);
+        assert_eq!(one[0].bytes(), cap);
         // A 1024-row chunk: 8 MiB, two fragments of 32 stick columns each.
-        let f = fragments(1024, 4096, WireBytes::CAP).unwrap();
+        let f = fragments(1024, 4096, cap).unwrap();
         assert_eq!(f.len(), 2);
         assert_eq!((f[0].first_col(), f[0].cols()), (0, 2048));
         assert_eq!((f[1].first_col(), f[1].cols()), (2048, 2048));
         assert_eq!(f[1].byte_offset(), 32 * 1024 * STICK_BYTES);
-        assert!(f.iter().all(|x| x.bytes() == WireBytes::CAP));
+        assert!(f.iter().all(|x| x.bytes() == cap));
         // The baked re-mint reproduces every cut exactly — what the macro's tokens rebuild.
         for x in f.iter().chain(&one) {
             assert_eq!(Fragment::baked(x.first_stick(), x.sticks(), x.rows()), *x);
         }
         // Decode: one row, one fragment.
-        let d = fragments(1, 2048, WireBytes::CAP).unwrap();
+        let d = fragments(1, 2048, cap).unwrap();
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].bytes().get(), 2048 * 2);
         assert_eq!(
-            fragments(1, 100, WireBytes::CAP),
+            fragments(1, 100, cap),
             Err(FragmentRefusal::RaggedCols { cols: 100 })
         );
         assert_eq!(
-            fragments(40_000, 64, WireBytes::CAP),
-            Err(FragmentRefusal::StickColumnPastCap { rows: 40_000 })
+            fragments(40_000, 64, cap),
+            Err(FragmentRefusal::StickColumnPastWidth { rows: 40_000 })
         );
     }
 }

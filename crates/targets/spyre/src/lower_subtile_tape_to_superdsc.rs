@@ -1062,7 +1062,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         let w = SegRole::Weight.segment();
         let window = ktir_superdsc::collective::RecvWindow::new(
             align128(seg_bytes[w]),
-            ktir_superdsc::collective::WireBytes::CAP,
+            ktir_superdsc::collective::Payload::from(ktir_superdsc::collective::WireBytes::CAP),
         )
         .ok_or_else(|| SuperDscError("an align128 offset is flit-aligned".to_string()))?;
         if window.end() > bundle::MAX_SEGMENT_BYTES {

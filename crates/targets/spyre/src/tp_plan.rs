@@ -16,7 +16,9 @@ use scratchy_subtile::tensor_parallel::{
     self, ShardRefusal, ShardedForward, SplitGranule, WorldSize,
 };
 
-use crate::bundle_code::collective::{Fragment, FragmentRefusal, TpWorld, WireBytes, fragments};
+use crate::bundle_code::collective::{
+    Fragment, FragmentRefusal, Payload, TpWorld, WireBytes, fragments,
+};
 
 /// THE WORLD, AS BOTH HALVES NAME IT — the analysis's [`WorldSize`] and the bundle's [`TpWorld`],
 /// minted together from ONE const `W`, so the forward that was sharded and the bundle that runs it
@@ -53,8 +55,13 @@ pub const SPYRE_SPLIT_GRANULE: SplitGranule =
 /// ⭐ THE ONE CUT OF A COLLECTIVE'S OPERAND — the consume launches the emitter mints for a
 /// `[rows, cols]` operand, and the fragments the window is sized over, are this function's output
 /// and nothing else's, so no fragment can be wider than the window it lands in.
+///
+/// ⛔ CUT AT THE WINDOW, which is one message wide (`compute_bundle_layout`), not at the wire: a
+/// send moves any payload as its run of messages (`Payload::messages`), but the window holds one
+/// fragment, and two fragments of one collective cannot share it — the peer's next fragment can
+/// land while this rank still consumes the last (a wdone says "landed", never "read").
 pub fn consume_fragments(rows: u32, cols: u32) -> Result<Vec<Fragment>, FragmentRefusal> {
-    fragments(rows, cols, WireBytes::CAP)
+    fragments(rows, cols, Payload::from(WireBytes::CAP))
 }
 
 /// Why a tensor-parallel bake cannot be planned.
@@ -74,7 +81,7 @@ pub struct TpBake {
     pub sharded: ShardedForward,
     /// The widest fragment any collective of the forward sends — the window's size. `None` exactly
     /// when the forward has no collective (a world of one).
-    pub window_bytes: Option<WireBytes>,
+    pub window_bytes: Option<Payload>,
 }
 
 /// Shard `input` for `world` and size the receive window its collectives need.
@@ -82,7 +89,7 @@ pub fn tp_bake(input: &LoweringInput, world: SpyreWorld) -> Result<TpBake, TpBak
     let sharded = tensor_parallel::shard(input, world.analysis, SPYRE_SPLIT_GRANULE)
         .map_err(TpBakeRefusal::Shard)?;
     let shapes = tensor_parallel::op_shapes(&sharded.local);
-    let mut window_bytes: Option<WireBytes> = None;
+    let mut window_bytes: Option<Payload> = None;
     for (collective, c) in sharded.collectives.iter().enumerate() {
         let (rows, cols) = shapes[c.reads];
         let frags = consume_fragments(rows, cols)
