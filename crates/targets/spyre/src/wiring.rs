@@ -1794,6 +1794,21 @@ pub struct TpForward {
     pub wirings: Wirings,
     /// Per source of the one-rank forward (same indices): the slice each rank loads.
     pub sources: &'static [SourceShard],
+    /// ⭐ THIS WORLD'S THREE LADDERS — the rank-local bundles of the prefill-width ladder, the decode
+    /// batch ladder and the prefix-capable (continuation-chunk) ladder, baked in this world and
+    /// rendered by the one renderer a one-rank manifest group's ladders go through. Same types, same
+    /// rules ([`crate::manifest::SengraphBundleGroup`]): the prefill and decode ladders are empty
+    /// unless more than one width baked; the prefix ladder carries every width that baked. Without
+    /// them a sharded world decodes one request per step and has no bundle for a prompt's
+    /// continuation chunks.
+    pub prefill_rungs: &'static [(u32, &'static str)],
+    pub decode_rungs: &'static [(
+        crate::manifest::RungSeqs,
+        crate::manifest::SweptCols,
+        crate::manifest::BundleSentinel,
+        crate::manifest::RungLoadConsts,
+    )],
+    pub prefill_prefix: &'static [(u32, &'static str)],
 }
 
 /// Why rank `me`'s share of a source could not be cut from its checkpoint bytes.

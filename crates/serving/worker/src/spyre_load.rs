@@ -549,9 +549,11 @@ fn sharded_bundle(
         result_tensor: g0.result_tensor,
         prefill: named(f.prefill.as_ref().map_or(f.decode.fp, |p| p.fp)),
         decode: named(f.decode.fp),
-        prefill_rungs: &[],
-        decode_rungs: &[],
-        prefill_prefix: &[],
+        // The world's own ladders, as its bake rendered them — the same shape the one-rank group
+        // carries, so every ladder path below serves a sharded world unchanged.
+        prefill_rungs: f.prefill_rungs,
+        decode_rungs: f.decode_rungs,
+        prefill_prefix: f.prefill_prefix,
     };
     Ok(Box::leak(Box::new(SengraphBundle {
         groups: Box::leak(Box::new([group])),
