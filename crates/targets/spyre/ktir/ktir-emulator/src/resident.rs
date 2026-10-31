@@ -901,11 +901,13 @@ impl ResidentExecutor {
     /// resident HBM. SIX bound tensors in mint order (the skeleton's operand
     /// list — the node's inputs, then the output): the pick stick, the
     /// persistent s stick, the persistent l stick, the two decompose tables,
-    /// and the fresh s-value stick out. The tables are UNREAD here — the
-    /// golden's own law ("the table operands are unread by the reference: the
-    /// reference states the decompose's RESULT, never its walk"), staged once
-    /// at load for the card's gather doors and carried by the node's bindings
-    /// like every other operand.
+    /// and the fresh s-value stick out. ⭐ THE TABLES ARE THE DECOMPOSE — the
+    /// card's own walk, two table gathers at the pick: row `t` of the s table
+    /// is the pick's lane pattern and row `t` of the l table its lane ramp.
+    /// They are the ONLY place a rank's vocabulary block lives (the node is the
+    /// same on every rank; each rank stages its own block's tables), so a door
+    /// that re-derived the decompose from the pick would answer every rank as
+    /// rank 0.
     ///
     /// ⭐⭐⭐⭐⭐ EVERY ROW IS ITS OWN REQUEST — the decompose is per row at
     /// EVERY decode width: row `r` reads ITS OWN pick (word 0 of the pick
@@ -917,14 +919,13 @@ impl ResidentExecutor {
     /// gate. The width is the s-value OUT's own stated extent
     /// (`[width, CHAIN_IDX_BLOCK]`), never a derivation from the sticks.
     ///
-    /// The ruled table's law, per row: `s = t >> 6` clamped to 0 past
-    /// `pad_vocab`, stated as the LANE PATTERN `k·s + (i mod k)` over the
-    /// stick's lanes — the clamp keeps even the sentinel read on slab 0's
-    /// pattern, and the sentinel ramp's lanes name the transposed placement's
-    /// unwritten zero tail (word 0 = `hidden`, the mark a real pick's word 0
-    /// ≤ 63 never collides with). `table_rows` rides the payload for the
-    /// card's staged tables and is unread here by the same law that leaves
-    /// the table operands unread. `hidden` is the payload's own statement
+    /// The tables' law (`chain_s_row` / `chain_l_row`): the LANE PATTERN
+    /// `k·s + (i mod k)` of the pick's slab within the rank's block, slab 0's
+    /// pattern for a pick the block does not hold, and the sentinel ramp's
+    /// lanes naming the transposed placement's unwritten zero tail (word 0 =
+    /// `hidden`, the mark a real pick's word 0 ≤ 63 never collides with). A
+    /// pick past the tables' rows is refused by name: the sentinel is their
+    /// last row, so no answerable pick is. `hidden` is the payload's own statement
     /// (the paired gather's width, the same single source the staged tables
     /// carry) — the lane ramp's modulus `64·(j mod (hidden/64)) + l` and the
     /// sentinel mark's own value, NEVER derived from the stick's lane count
@@ -938,13 +939,7 @@ impl ResidentExecutor {
     /// entry count `hidden/64`: at a partial last stick the words past the
     /// entries re-bind to the row's own first entries, never past the
     /// placement's sticks.
-    fn run_chain_stage(
-        &self,
-        node: &NodeSpec,
-        pad_vocab: u32,
-        hidden: u32,
-        k: u32,
-    ) -> Result<(), String> {
+    fn run_chain_stage(&self, node: &NodeSpec, hidden: u32, k: u32) -> Result<(), String> {
         let tids: Vec<u64> = node.bindings.iter().map(|b| b.tensor).collect();
         if tids.len() != 6 {
             return Err(format!(
@@ -966,6 +961,7 @@ impl ResidentExecutor {
         // the reference states the decompose's result, never its walk); the
         // fresh s-value out is [5], not [3].
         let (pick_tid, s_tid, l_tid, o_tid) = (tids[0], tids[1], tids[2], tids[5]);
+        let (stab_tid, ltab_tid) = (tids[3], tids[4]);
         if hidden == 0 {
             return Err(
                 "chain_stage: the payload states hidden = 0 — the lane ramp's modulus is the \
@@ -1031,45 +1027,41 @@ impl ResidentExecutor {
             ));
         }
         let l_row_words = l_numel / width;
-        // The ramp's modulus — the payload's own hidden, never the stick's
-        // lane count (`chain_l_stick_ramp`'s own law).
-        let entries = hidden / 64;
+        // The two tables, one row per answerable pick: the s table's rows are one
+        // pattern stick (`lanes` words), the l table's one request's ramp window.
+        let stab = self.read_door_stick(stab_tid)?;
+        let ltab = self.read_door_stick(ltab_tid)?;
+        let table_rows = stab.len() / lanes;
+        if table_rows == 0
+            || stab.len() != table_rows * lanes
+            || ltab.len() != table_rows * l_row_words
+        {
+            return Err(format!(
+                "chain_stage: the decompose tables t{stab_tid}/t{ltab_tid} hold {}/{} words — \
+                 not one {lanes}-word pattern and one {l_row_words}-word ramp per pick row",
+                stab.len(),
+                ltab.len()
+            ));
+        }
         let pick_buf = self.read_door_stick(pick_tid)?;
         let mut s_pat = vec![0.0f32; s_numel];
         let mut l_ramp = vec![0.0f32; l_numel];
         let mut out = vec![0.0f32; width * lanes];
         for r in 0..width {
-            let t = pick_buf[r * pick_cols] as u64;
-            let s = if t < pad_vocab as u64 {
-                (t >> 6) as u32
-            } else {
-                0
-            };
-            let l = t as u32 & 63;
+            let t = pick_buf[r * pick_cols] as usize;
+            if t >= table_rows {
+                return Err(format!(
+                    "chain_stage: row {r}'s pick {t} is past the tables' {table_rows} rows — \
+                     the sentinel is their last row, so no answerable pick is"
+                ));
+            }
             // Row r's OWN pattern words at r·lanes, its OWN ramp words at
             // r·l_row_words — the layouts `chain_s_seed`/`chain_l_seed` state.
-            for i in 0..lanes as u32 {
-                let v = if t < pad_vocab as u64 {
-                    k * s + i % k
-                } else {
-                    // The sentinel leg: slab-0 pattern (bus safety).
-                    i % k
-                };
-                s_pat[r * lanes + i as usize] = v as f32;
-                out[r * lanes + i as usize] = v as f32;
-            }
-            for j in 0..l_row_words as u32 {
-                // The real ramp `64·(j mod entries) + l`; the sentinel ramp
-                // `hidden + (j mod entries)` (the zero tail's own sticks —
-                // the mod wrap is `chain_l_sentinel_ramp`'s whole safety law
-                // at a partial last stick).
-                let v = if t < pad_vocab as u64 {
-                    64 * (j % entries) + l
-                } else {
-                    hidden + j % entries
-                };
-                l_ramp[r * l_row_words + j as usize] = v as f32;
-            }
+            let s_row = &stab[t * lanes..(t + 1) * lanes];
+            s_pat[r * lanes..(r + 1) * lanes].copy_from_slice(s_row);
+            out[r * lanes..(r + 1) * lanes].copy_from_slice(s_row);
+            l_ramp[r * l_row_words..(r + 1) * l_row_words]
+                .copy_from_slice(&ltab[t * l_row_words..(t + 1) * l_row_words]);
         }
         self.write_door_stick(s_tid, &s_pat)?;
         self.write_door_stick(l_tid, &l_ramp)?;
@@ -1523,13 +1515,8 @@ impl ResidentExecutor {
                             self.run_embed_row_gather(node, k)?;
                             true
                         }
-                        Program::ChainStage {
-                            pad_vocab,
-                            hidden,
-                            k,
-                            ..
-                        } => {
-                            self.run_chain_stage(node, pad_vocab, hidden, k)?;
+                        Program::ChainStage { hidden, k, .. } => {
+                            self.run_chain_stage(node, hidden, k)?;
                             true
                         }
                         _ => false,

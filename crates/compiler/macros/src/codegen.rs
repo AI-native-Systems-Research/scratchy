@@ -8960,8 +8960,17 @@ fn refuse_if_sources_cut_apart(
         &[scratchy_subtile::tensor_parallel::SourceShard],
     ),
 ) {
+    use scratchy_subtile::handoff::SourceBinding as B;
     for (binding, cut) in rung.0.iter().zip(rung.1) {
-        if let Some((_, decode_cut)) = decode.0.iter().zip(decode.1).find(|(b, _)| *b == binding)
+        // The one staged copy is the weight segment's. A per-step input — the decode's gathered
+        // row, partial there and the prompt's whole rows in a prefill — is each bundle's own.
+        let staged = matches!(
+            binding,
+            B::Weight { .. } | B::WeightScale { .. } | B::BundleTensor { .. }
+        );
+        if staged
+            && let Some((_, decode_cut)) =
+                decode.0.iter().zip(decode.1).find(|(b, _)| *b == binding)
             && decode_cut != cut
         {
             panic!(
@@ -8969,6 +8978,35 @@ fn refuse_if_sources_cut_apart(
                  it as {decode_cut:?} — one staged copy per rank cannot be both"
             );
         }
+    }
+}
+
+/// ⭐ THE ROW A TIED DECODE STEP GATHERS — the `RowGather` the sharding analysis reads for a
+/// forward whose input row the chained head fills: a tied model's decode, its embedded-hidden
+/// source read on device out of the vocabulary projection's own table at the token the previous
+/// step drew. `mint_embed_chain` builds that gather on the lowered graph; the analysis needs only
+/// the fact, and places the row's all-reduce where it is first read whole when the table splits.
+/// A prefill forward's rows are the prompt's, staged whole by the host, and an untied model's
+/// decode does not chain: both state none. `decode` is the bake's own `prefill_mq.is_none()` — the
+/// predicate the chain's mint runs under, so the two cannot disagree about which bakes chain.
+#[cfg(feature = "spyre")]
+fn chained_row_gathers(
+    lwd: &crate::to_wavefront::LoweredDecode,
+    model: &ModelParams,
+    decode: bool,
+) -> Vec<scratchy_subtile::tensor_parallel::RowGather> {
+    if !(decode && tie_word_embeddings(model)) {
+        return Vec::new();
+    }
+    let row = lwd
+        .bindings
+        .iter()
+        .position(|b| matches!(b, scratchy_subtile::handoff::SourceBinding::EmbeddedHidden));
+    match (row, lwd.input.vocab_table()) {
+        (Some(row), Some(table)) => {
+            vec![scratchy_subtile::tensor_parallel::RowGather { row, table }]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -9140,17 +9178,20 @@ fn load_const_entry_tokens(
             pad_vocab,
             k,
             hidden,
+            block,
             operand,
         } => {
             let pad_vocab = proc_macro2::Literal::u32_unsuffixed(pad_vocab);
             let k = proc_macro2::Literal::u32_unsuffixed(k);
             let hidden = proc_macro2::Literal::u32_unsuffixed(hidden);
+            let block = proc_macro2::Literal::u32_unsuffixed(block);
             let operand = proc_macro2::Literal::u8_unsuffixed(operand);
             quote! {
                 ::scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
                     pad_vocab: #pad_vocab,
                     k: #k,
                     hidden: #hidden,
+                    block: #block,
                     operand: #operand,
                 }
             }
@@ -9944,6 +9985,7 @@ fn emit_superdsc_wiring(
             let k = u32l(chain.k);
             let hidden = u32l(chain.hidden);
             let replaces = u32l(chain.replaces);
+            let block = u32l(chain.block);
             quote! {
                 ::scratchy_target_spyre::forward_tape::ForwardPhase::Decode {
                     chain: ::scratchy_target_spyre::wiring::ChainWiring {
@@ -9952,6 +9994,7 @@ fn emit_superdsc_wiring(
                         k: #k,
                         hidden: #hidden,
                         replaces: #replaces,
+                        block: #block,
                     },
                 }
             }
@@ -11702,6 +11745,23 @@ fn dump_wavefront_mega(
                     // fall to. Every width mints (the solo rung, every batch-ladder
                     // rung, the symbolic CB batch alike): the chain is the decode path,
                     // not a wide-batch extra.
+                    // ⛔ A PARTIAL ROW IS A CHAIN'S, AND A PREFILL HAS NO CHAIN. A source the
+                    // analysis cut as a gathered row's partial sum is filled by the chain's
+                    // per-rank gather; a prefill rung stages its rows whole from the host, so the
+                    // all-reduce would sum the prompt's rows once per rank.
+                    if is_prefill
+                        && let Some(e) = shards.and_then(|s| {
+                            s.iter().position(|c| {
+                                *c == scratchy_subtile::tensor_parallel::SourceShard::Partial
+                            })
+                        })
+                    {
+                        panic!(
+                            "[spyre-tp] {base}: source t{e} is a gathered row's partial sum, but a \
+                             prefill rung mints no chained head to gather it — the forward was \
+                             sharded with a decode's row gather"
+                        );
+                    }
                     if !is_prefill {
                         if !tied {
                             panic!(
@@ -13459,7 +13519,7 @@ fn dump_wavefront_mega(
                 &lowered,
                 world.analysis(),
                 scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
-                &[],
+                &chained_row_gathers(&lowered, model, true),
             )
             .unwrap_or_else(|e| {
                 panic!("[spyre-tp] {stem}: the two-rank forward is malformed — {e:?}")
@@ -13530,17 +13590,40 @@ fn dump_wavefront_mega(
                     weights_of(at).join(", ")
                 );
             }
-            if gathers > 0 && tie_word_embeddings(model) {
-                // ⛔ A VISIBLE SKIP, NAMING ITS ONE CAUSE: the decode rung's chained head gathers
-                // the drawn token's embedding row on device from the TIED table — the lm head's
-                // own staged weight — and here the analysis split that weight by vocabulary, so
-                // each rank holds half the rows a draw can name. The rank-aware chain (each rank
-                // gathers its half, a non-owner's row zero, the two summed) is not built yet, and
-                // the chain is the only decode path, so this model ships its one-rank world.
+            // ⭐ A VOCABULARY-SPLIT HEAD SHIPS ITS WORLD. The decode's chained head gathers the
+            // drawn token's row from the lm head's own table, which the analysis split by columns
+            // with the head; the gather fact (`chained_row_gathers`) made that row a partial sum the
+            // analysis reduces, and each rank's chain gathers its own block (`mint_embed_chain`
+            // over the split tail, the rank's `ChainBlock` in its tables and seeds).
+            for g in &sf.gathered {
+                eprintln!(
+                    "[spyre-tp] {stem}: the decode's input row t{} is gathered from the \
+                     column-split table t{} — each rank gathers its own vocabulary block",
+                    g.row, g.table
+                );
+            }
+            // ⛔ A VISIBLE SKIP, NAMING ITS ONE CAUSE: consecutive collectives land in alternating
+            // cuts of the receive window, and a rolled layer body replays its cuts — so a layer
+            // holding an odd number of collectives (an attention the analysis could not split,
+            // leaving the MLP's one all-reduce) would land layer l+1's first collective in the cut
+            // layer l's last one still reads. Its body needs a per-launch cut, which is not built,
+            // so this model ships its one-rank world.
+            let per_layer = {
+                use scratchy_subtile::subtile_tape::{collectives_per_layer, lower_dag_to_tape};
+                let g = scratchy_subtile::subtile_ir::lower_region(
+                    &scratchy_subtile::lower::fuse_silu_mul(&tp_lwd.input),
+                    knb,
+                );
+                scratchy_subtile::subtile_ir::ValidatedGraph::new(&g)
+                    .ok()
+                    .and_then(|v| collectives_per_layer(&lower_dag_to_tape(&v), &g))
+            };
+            let cuts = scratchy_target_spyre::bundle_code::collective::WINDOW_CUTS;
+            if let Some(c) = per_layer.filter(|c| !c.is_multiple_of(cuts)) {
                 println!(
-                    "cargo:warning=[spyre-tp] {stem}: no tp=2 bundle — its lm head splits by \
-                     vocabulary ({gathers} all-gather), and the decode chained head reads that \
-                     tied table whole; the rank-aware chained head is not built yet"
+                    "cargo:warning=[spyre-tp] {stem}: no tp=2 bundle — each layer holds {c} \
+                     collective(s), not a multiple of the receive window's {cuts} cuts, and a \
+                     rolled layer replays its cuts; the per-launch window cut is not built yet"
                 );
                 None
             } else {
@@ -13580,7 +13663,7 @@ fn dump_wavefront_mega(
                     lwd,
                     scratchy_target_spyre::tp_plan::SpyreWorld::of::<2>().analysis(),
                     scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
-                    &[],
+                    &chained_row_gathers(lwd, model, prefill_mq.is_none()),
                 )
                 .unwrap_or_else(|e| {
                     panic!("[spyre-tp] {stem}: {base} is malformed at two ranks — {e:?}")

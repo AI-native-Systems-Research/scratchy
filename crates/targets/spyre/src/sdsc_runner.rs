@@ -914,6 +914,11 @@ impl SuperDscSession {
         self.exec.point_landing_slots()
     }
 
+    /// The rank this session plays as — `None` at a world of one ([`Executor::tp_identity`]).
+    pub fn tp_identity(&self) -> Option<crate::bundle_code::collective::TpIdentity> {
+        self.exec.tp_identity()
+    }
+
     pub fn alias_seg_from(&mut self, owner: &SuperDscSession, seg: i64) -> Result<()> {
         let s =
             SegIdx::checked(seg).ok_or_else(|| anyhow!("alias_seg: segment {seg} out of range"))?;
