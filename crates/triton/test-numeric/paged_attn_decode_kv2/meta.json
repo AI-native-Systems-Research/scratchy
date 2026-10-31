@@ -1,0 +1,142 @@
+{
+  "config": "paged_attn_decode_kv2",
+  "geometry": {
+    "NQH": 14,
+    "NKVH": 2,
+    "HD": 64,
+    "BLOCK": 64,
+    "NUM_PAGES": 4
+  },
+  "step": {
+    "context": 150,
+    "query": 1,
+    "block_table": [
+      3,
+      0,
+      2
+    ],
+    "geom": {
+      "NQH": 14,
+      "NKVH": 2
+    }
+  },
+  "derived": {
+    "kv_len": 151,
+    "num_blocks": 3,
+    "scale": 0.125,
+    "new_slots": [
+      150
+    ]
+  },
+  "mq": 1,
+  "files": {
+    "q": {
+      "file": "q.bin",
+      "dtype": "f16",
+      "shape": [
+        1,
+        896
+      ]
+    },
+    "k_new": {
+      "file": "k_new.bin",
+      "dtype": "f16",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    "v_new": {
+      "file": "v_new.bin",
+      "dtype": "f16",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    "kp_pre": {
+      "file": "kp_pre.bin",
+      "dtype": "f16",
+      "shape": [
+        4,
+        2,
+        64,
+        64
+      ]
+    },
+    "vp_pre": {
+      "file": "vp_pre.bin",
+      "dtype": "f16",
+      "shape": [
+        4,
+        2,
+        64,
+        64
+      ]
+    },
+    "write_rows": {
+      "file": "write_rows.bin",
+      "dtype": "i32",
+      "shape": [
+        2
+      ]
+    },
+    "page_table": {
+      "file": "page_table.bin",
+      "dtype": "i32",
+      "shape": [
+        3,
+        32
+      ]
+    },
+    "mask": {
+      "file": "mask.bin",
+      "dtype": "f16",
+      "shape": [
+        3,
+        64
+      ]
+    },
+    "kp_post": {
+      "file": "kp_post.bin",
+      "dtype": "f16",
+      "shape": [
+        4,
+        2,
+        64,
+        64
+      ]
+    },
+    "vp_post": {
+      "file": "vp_post.bin",
+      "dtype": "f16",
+      "shape": [
+        4,
+        2,
+        64,
+        64
+      ]
+    },
+    "out_f16": {
+      "file": "out_f16.bin",
+      "dtype": "f16",
+      "shape": [
+        1,
+        896
+      ]
+    },
+    "out_f32": {
+      "file": "out_f32.bin",
+      "dtype": "f32",
+      "shape": [
+        1,
+        896
+      ]
+    }
+  },
+  "seed": 0,
+  "torch": "2.8.0",
+  "spyre_inference": "297fc48a339062e1609a963f9d89854000953baa",
+  "generated_by": "crates/triton/test-numeric/gen_paged_attn_data.py",
+  "reference": "spyre-inference reshape_and_cache_head_major_kernel, then page_attn_head_major_decode_kernel, unmodified, SPYRE_ATTN_FOR_EACH_TILE=0"
+}

@@ -149,21 +149,7 @@ pub fn matmul_opspec_off_operands_phys<DF: DataFormat>(
         // The strides ride ON the batch axis, so they arrive here already paired with the `y` extent
         // they describe — there is no slot for a caller to fill one without the other.
         batch.batch_strides(),
-        // The contraction's own split rides ON the K — see `ContractionSplit` — and the output's ON
-        // the N — see `OutputSplit`. Every door but the chunk's decode value leg and its decode score
-        // parts is `Planned` on both, which is the form's splitter exactly as before.
-        match (k.split(), n.split()) {
-            (crate::sdsc_abstract::ContractionSplit::AcrossCores, _) => {
-                super::dims::matmul_split_map_contraction
-            }
-            (_, crate::sdsc_abstract::OutputSplit::ColumnsAcrossCores) => {
-                super::dims::matmul_split_map_columns
-            }
-            (_, crate::sdsc_abstract::OutputSplit::RowsAcrossCores) => {
-                super::dims::matmul_split_map_rows
-            }
-            _ => matmul_split_map_for(form),
-        },
+        matmul_split_map_for(form),
     )
 }
 
@@ -496,6 +482,16 @@ where
         )
         .map_err(|e| e.0)?
         .with_offset(a_off);
+        // ⭐ THE ACTIVATION'S OWN ROW COUNT, WHEN THIS OP SWEEPS A SLICE OF IT — the same law the
+        // output takes below: a stick-blocked view's stick-group stride comes from its `mb` DEVICE
+        // extent, so a slice of a taller activation (a batched contraction's batch rows, read out of
+        // the flat frame) is addressed with the TENSOR's rows, not the op's.
+        let input = match phys_mb {
+            Some(phys) if phys > plan.extent(MbAxis::NAME) => input
+                .with_device_extent(MbAxis::NAME, phys)
+                .map_err(|e| e.0)?,
+            _ => input,
+        };
         let output_walk = Walk2::output_rows_by_n();
         let output = TensorArg::<2>::new(
             false,

@@ -912,6 +912,10 @@ fn combiner_identity(kind: &OpKind, elem: DType) -> Option<Attr> {
                 Attr::Float(FloatBits::f32(f32::INFINITY))
             }
         }
+        // `standard.min` over an int32 (`_elementwise_min` → `arith.minsi`): the largest int32.
+        OpKind::Other(s) if s == "arith.minsi" && elem == DType::I32 => {
+            Attr::Int(i64::from(i32::MAX))
+        }
         _ => return None,
     })
 }
@@ -948,7 +952,12 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
         .cloned()
         .ok_or_else(|| refuse("tt.reduce has no result type"))?;
     let (src_rank, res_rank) = (src_ty.rank(), res_ty.rank());
-    if src_ty.dims().is_none() || res_ty.dims().is_none() || res_rank + 1 != src_rank {
+    // ⭐ A RANK-1 SOURCE REDUCED TO A SCALAR (`tl.min(kv_rows, 0)`): reduced as `[1, N]` to `[1]`
+    // and its one element extracted, so the generic keeps a ranked output.
+    let to_scalar = src_rank == 1 && matches!(res_ty, IrType::Scalar(_));
+    if !to_scalar
+        && (src_ty.dims().is_none() || res_ty.dims().is_none() || res_rank + 1 != src_rank)
+    {
         return Err(refuse(
             "tt.reduce does not drop exactly one dimension of a ranked tensor",
         ));
@@ -960,12 +969,11 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
     if axis < 0 || axis as usize >= src_rank {
         return Err(refuse(format!("tt.reduce axis {axis} is out of range")));
     }
-    let elem = src_ty.elem().filter(|e| e.is_float()).ok_or_else(|| {
-        refuse(
-            "only a float tt.reduce is supported (an integer reduction needs its own \
-             identity table)",
-        )
-    })?;
+    // An integer reduction is served exactly where its combiner has an identity
+    // ([`combiner_identity`]): the refusal below names any other.
+    let elem = src_ty
+        .elem()
+        .ok_or_else(|| refuse("tt.reduce's operand has no element type"))?;
 
     // The combiner must be ONE recognized associative op plus the terminator.
     let region = op
@@ -1027,8 +1035,39 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
     let ident_op = Op::new(OpKind::ArithConstant)
         .with_result(ident_scalar, IrType::Scalar(elem))
         .with_attr(AttrKey::Value, ident);
+    // The scalar form reduces `[1, N]` over axis 1 into `[1]`.
+    let mut pre: Vec<Op> = Vec::new();
+    let (source, src_rank, axis, out_ty, out) = if to_scalar {
+        let n = src_ty.dims().expect("rank 1")[0];
+        let expanded = module.fresh_named(&hint);
+        pre.push(
+            Op::new(OpKind::TensorExpandShape)
+                .with_result(
+                    expanded,
+                    IrType::Tensor {
+                        dims: vec![1, n],
+                        elem,
+                    },
+                )
+                .with_operands([op.operands[0]])
+                .with_attr(AttrKey::Axis, Attr::Int(0)),
+        );
+        let one = IrType::Tensor {
+            dims: vec![1],
+            elem,
+        };
+        (expanded, 2, 1, one, module.fresh_named(&hint))
+    } else {
+        (
+            op.operands[0],
+            src_rank,
+            axis,
+            res_ty.clone(),
+            op.results[0],
+        )
+    };
     let init_op = Op::new(OpKind::TensorSplat)
-        .with_result(init, res_ty.clone())
+        .with_result(init, out_ty.clone())
         .with_operands([ident_scalar]);
 
     // ins: identity over the source rank; outs: drop the reduced axis.
@@ -1053,8 +1092,8 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
         ],
     };
     let generic = Op::new(OpKind::LinalgGeneric)
-        .with_result(op.results[0], res_ty)
-        .with_operands([op.operands[0], init])
+        .with_result(out, out_ty)
+        .with_operands([source, init])
         .with_attr(
             AttrKey::IndexingMaps,
             Attr::AffineMapList(vec![identity_map(src_rank), projected_map(src_rank, &keep)]),
@@ -1062,11 +1101,26 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
         .with_attr(AttrKey::IteratorTypes, Attr::StrList(iters))
         .with_region(generic_body);
 
+    let mut ops = pre;
+    ops.push(ident_op);
+    ops.push(init_op);
+    ops.push(generic);
+    if to_scalar {
+        let zero = module.fresh_named(&hint);
+        ops.push(
+            Op::new(OpKind::ArithConstant)
+                .with_result(zero, IrType::Index)
+                .with_attr(AttrKey::Value, Attr::Int(0)),
+        );
+        ops.push(
+            Op::new(OpKind::Other("tensor.extract".into()))
+                .with_result(op.results[0], res_ty)
+                .with_operands([out, zero]),
+        );
+    }
     let idx = path.index();
     let block = walk::block_mut(module, path).expect("path");
-    block[idx] = generic;
-    block.insert(idx, init_op);
-    block.insert(idx, ident_op);
+    block.splice(idx..=idx, ops);
     Ok(())
 }
 
@@ -1520,6 +1574,19 @@ fn fold_grid_work_loop(module: &mut Module) -> Result<()> {
 /// configuration -- would turn any future loop-carrying program into a refusal at a stage that has
 /// nothing to say about it.
 ///
+/// # A LOOP THAT READS MEMORY THROUGH ITS OWN TRIP STAYS A LOOP
+///
+/// A body whose INDIRECT access tile depends on the induction variable -- a page walk reading its
+/// page table at `i · 32` and gathering the page that row names -- is the device's own loop over
+/// tiles (torch-spyre's `for_each_tile`, which holds ONE block body however many blocks it walks),
+/// and its trip count is a length, not a tile count: a walk over a long context is hundreds of
+/// trips, each one gather, and unrolled it is hundreds of copies of the body. The window guard
+/// above has nothing to hoist there either -- the gather's address IS the trip's table row -- so
+/// such a loop is LEFT STANDING with its trip count stated by its constant bounds
+/// ([`loop_reads_through_its_trip`]). Its loop-invariant buffer views are stated once, above it
+/// ([`hoist_invariant_views`]) -- the same one-declaration-per-parameter rule the unrolled copies
+/// keep below.
+///
 /// # THE SUBSTITUTION IS THE WHOLE OF IT
 ///
 /// Copy `t` is the body with three sets of names rewritten: the induction variable becomes the
@@ -1546,6 +1613,10 @@ fn unroll_constant_trip_loops(module: &mut Module) -> Result<()> {
     let index = module.def_index();
     for path in paths.into_iter().rev() {
         let loopp = walk::at(module, &path).expect("path").clone();
+        if loop_reads_through_its_trip(&loopp) {
+            hoist_invariant_views(module, &path);
+            continue;
+        }
         let lb = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[0]);
         let ub = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[1]);
         let step = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[2]);
@@ -2200,6 +2271,7 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
     if !materialize.is_empty() {
         let fn_args: BlockArgs = kernel.regions[0].args.clone();
         let mut new_args: BlockArgs = Vec::new();
+        let mut clones: Vec<PartitionClone> = Vec::new();
         let mut flat: Vec<Op> = Vec::new();
         // ptr -> its ONE view's body index. A pointer with several views (none in the
         // fixtures here) has no single extent to clone from, so it is refused by name
@@ -2247,6 +2319,52 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
                 .find(|(v, _)| v == &ptr)
                 .map(|(_, t)| t.clone())
                 .unwrap_or(IrType::Index);
+            // THE STAGING CONTRACT for this clone (`spyre.partition_clones`): which
+            // parameter, and which window of it, the host puts here. Without it the clone
+            // is an argument nobody can bind -- a launcher would have to re-derive every
+            // position's corner from the kernel source.
+            let param_arg = fn_args.iter().position(|(v, _)| v == &ptr).ok_or_else(|| {
+                refuse(format!(
+                    "a grid-partitioned view reads {ptr:?}, which is not a function \
+                     argument, so its clone has no parameter to stage from"
+                ))
+            })?;
+            let dims = o
+                .result_types
+                .first()
+                .and_then(|t| t.dims())
+                .map(|d| d.to_vec())
+                .unwrap_or_default();
+            let col_corner = match o.operands.get(2) {
+                None => 0,
+                Some(s) => {
+                    crate::passes::dot_to_linalg::const_int_index(&index, *s).ok_or_else(|| {
+                        refuse(
+                            "a grid-partitioned tile's column corner did not fold to a \
+                             constant, so its clone's window has no stageable columns",
+                        )
+                    })?
+                }
+            };
+            let (rows, cols) = match dims.as_slice() {
+                [r] => (*r, 1),
+                [r, c] => (*r, *c),
+                other => {
+                    return Err(refuse(format!(
+                        "a grid-partitioned tile of rank {} has no row/column window to \
+                         stage; the clone protocol states rank-1 and rank-2 windows only",
+                        other.len()
+                    )));
+                }
+            };
+            clones.push(PartitionClone {
+                clone_arg: fn_args.len() + new_args.len(),
+                param_arg,
+                row_corner: corner.expect("a nonzero corner reached here"),
+                rows,
+                col_corner,
+                cols,
+            });
             // THE CLONE: fresh argument, view of the ORIGINAL extent over it.
             let arg = module.fresh_named(&module.hint(ptr));
             new_args.push((arg, arg_ty));
@@ -2278,6 +2396,7 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
             let kernel = module.kernel_mut().map_err(|e| refuse(e.to_string()))?;
             kernel.regions[0].ops = flat;
             kernel.regions[0].args.extend(new_args);
+            kernel.set_attr(AttrKey::PartitionClones, PartitionClone::encode(&clones));
         }
     }
     Ok(())
@@ -2926,6 +3045,81 @@ fn sub_feeds_only_exp2(module: &Module, index: &DefIndex, sub: Ssa) -> bool {
 /// `Op::results` is a LIST (see `ir::Op`'s note), so a five-result `scf.for` contributes all
 /// five; and a region's block arguments are definitions too, which is why they are collected
 /// here rather than only at the top level.
+/// Does this `scf.for`'s body read or write memory through an INDIRECT access tile whose operands
+/// depend on the loop's induction variable -- an address taken from memory at a row the trip
+/// chooses? See [`unroll_constant_trip_loops`]'s last section for why such a loop stays a loop.
+fn loop_reads_through_its_trip(loopp: &Op) -> bool {
+    let Some(body) = loopp.regions.first() else {
+        return false;
+    };
+    let Some(&(iv, _)) = body.args.first() else {
+        return false;
+    };
+    // The values the trip reaches: the induction variable, then every result of a body op that
+    // reads one of them (the body is in program order, so one pass closes the set).
+    let mut tripped: HashSet<Ssa> = HashSet::from([iv]);
+    fn reaches(ops: &[Op], tripped: &mut HashSet<Ssa>) -> bool {
+        for o in ops {
+            let reads = o.operands.iter().any(|v| tripped.contains(v));
+            if reads {
+                if o.kind == OpKind::KtdpConstructIndirectAccessTile {
+                    return true;
+                }
+                tripped.extend(o.results.iter().copied());
+            }
+            for r in &o.regions {
+                if reaches(&r.ops, tripped) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    reaches(&body.ops, &mut tripped)
+}
+
+/// Move the buffer views a standing loop's body declares from loop-invariant operands -- a
+/// `ktdp.construct_memory_view` over a kernel pointer, and the cast that turned the pointer into its
+/// base -- to just above the loop. A view declares a buffer's width, and the handoff pairs each
+/// parameter with ONE declaration among the function's top-level ops, so a view left in the body is a
+/// buffer nothing outside it can size. Both ops are pure, so hoisting them moves no effect.
+fn hoist_invariant_views(module: &mut Module, path: &OpPath) {
+    let Some(loopp) = walk::at(module, path).cloned() else {
+        return;
+    };
+    let Some(body) = loopp.regions.first() else {
+        return;
+    };
+    let mut inside: Vec<Ssa> = body.args.iter().map(|(v, _)| *v).collect();
+    defined_values(&body.ops, &mut inside);
+    let mut inside: HashSet<Ssa> = inside.into_iter().collect();
+    let mut hoisted: Vec<Op> = Vec::new();
+    let mut kept: Vec<Op> = Vec::with_capacity(body.ops.len());
+    for o in body.ops.iter() {
+        let pure_view = matches!(
+            o.kind,
+            OpKind::KtdpConstructMemoryView | OpKind::UnrealizedConversionCast
+        );
+        if pure_view && o.regions.is_empty() && o.operands.iter().all(|v| !inside.contains(v)) {
+            for r in &o.results {
+                inside.remove(r);
+            }
+            hoisted.push(o.clone());
+        } else {
+            kept.push(o.clone());
+        }
+    }
+    if hoisted.is_empty() {
+        return;
+    }
+    walk::at_mut(module, path).expect("path").regions[0].ops = kept;
+    let idx = path.index();
+    let block = walk::block_mut(module, path).expect("path");
+    for (k, o) in hoisted.into_iter().enumerate() {
+        block.insert(idx + k, o);
+    }
+}
+
 fn defined_values(ops: &[Op], out: &mut Vec<Ssa>) {
     for o in ops {
         out.extend(o.results.iter().copied());

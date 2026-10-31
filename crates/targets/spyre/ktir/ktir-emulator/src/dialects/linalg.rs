@@ -799,6 +799,10 @@ fn reduce_combiner(op_name: OpKind) -> Option<fn(f32, f32) -> f32> {
         OpKind::ArithMulf => |a, b| a * b,
         OpKind::ArithMaxnumf => f32::max,
         OpKind::ArithMinnumf => f32::min,
+        // A signed integer compare over a tile's decoded values: an integer tile decodes to the
+        // f32 holding it, exactly as far as f32 holds integers, so the compare is the f32 one.
+        OpKind::ArithMaxsi => f32::max,
+        OpKind::ArithMinsi => f32::min,
         // `maxf`/`minf` are the arith dialect's aliases for `maximumf`/`minimumf`
         // (see the registration in `dialects::arith`), so they fold identically.
         OpKind::ArithMaximumf | OpKind::ArithMaxf => |a: f32, b: f32| {

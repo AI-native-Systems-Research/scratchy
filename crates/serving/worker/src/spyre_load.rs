@@ -3,14 +3,11 @@
 //!
 //! ⛔ NOTHING HERE ANALYSES A MODEL. The wiring is a `static` the `#[forward]` macro emitted and
 //! `wiring_to_parsed` reads it; the weights arrive already resolved as `BoundWeight`s from the
-//! generated loader. What is left is device-side: segment sizing, the KV pool cut, and the
-//! sessions the launches go through.
+//! generated loader. What is left is device-side: the budget check, the sessions the launches go
+//! through, and the aliases that make them share one model and one KV pool.
 
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_layers::weights::GpuWeights;
-// The pool/slot vocabulary is CARD-ONLY, so its imports carry the cfg of the blocks that use it.
-#[cfg(feature = "spyre-hw")]
-use scratchy_subtile::sdsc_abstract::{PagedKvPool, PoolPages, PoolPartition, PoolRows};
 use scratchy_target_spyre::SpyreAllocator;
 use scratchy_target_spyre::manifest::bytes_to_f32;
 // `--target sendnn` swaps the KTIR emulator runner for the on-silicon sendnn
@@ -89,36 +86,6 @@ fn adopt_from_owner(
     Ok(())
 }
 
-/// ⭐ STAGE A SESSION'S FULL-CHUNK CAUSAL MASK AT LOAD, so its first full launch finds the key held
-/// and builds, converts and uploads nothing for it.
-///
-/// The mask is a function of its key alone, and a `rows`-row session's full key — `Chunk { rows, rows }`
-/// — is a compile-time fact of the rung: `rows` is the ladder entry the launch selects this session by
-/// and runs it at, and the bytes are [`causal_full_chunk`]'s, i.e. [`causal_bind`] under the wiring's
-/// own head law, the same function the launch's `CausalMask` step calls. MEASURED before this, on
-/// granite-3.1-2b fp16 at ~1k tokens: the first request paid each 512-row session's mask build as
-/// +49.7 ms (prefix-free) and +40.0 ms (prefix) over the warm request.
-///
-/// A launch under any OTHER key (a prompt's partial tail) re-binds over the staged one, as it would
-/// over a key a previous launch left; the next full chunk then re-binds the full key once.
-///
-/// [`causal_full_chunk`]: scratchy_target_spyre::forward_tape::causal_full_chunk
-/// [`causal_bind`]: scratchy_target_spyre::forward_tape::causal_bind
-#[cfg(feature = "spyre-hw")]
-fn stage_full_chunk_causal(
-    sess: &mut SuperDscSession,
-    wiring: &scratchy_target_spyre::wiring::Wiring,
-    rows: usize,
-) -> Result<u64, String> {
-    let width = u32::try_from(rows)
-        .ok()
-        .and_then(scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows)
-        .ok_or_else(|| format!("a {rows}-row session has no rung width"))?;
-    let (id, key, vals) = scratchy_target_spyre::forward_tape::causal_full_chunk(wiring, width);
-    sess.stage_keyed(id, key, &vals)
-        .map_err(|e| format!("the {rows}-row session's full-chunk causal mask: {e}"))
-}
-
 /// The segments this bundle spilled weights into and HOW MANY BYTES of each the spill occupies —
 /// [`adopt_from_owner`]'s work list, empty for every model whose weights fit one segment.
 ///
@@ -146,33 +113,6 @@ fn spilled_weight_spans(
     }
 }
 
-/// ⭐ WHAT A KV BUDGET FUNDS PER REQUEST, IN TOKENS — the pool veto's own advice arithmetic,
-/// hoisted to ONE spelling because the default-context law reads the same number
-/// ([`scratchy_serving_engine::gpu_budget::resolve_served_context`]).
-///
-/// The reserve (one shared scratch page — [`PoolPartition::reserve`]) comes off the top,
-/// the rest splits evenly across the launch rows, and a row spends its pages whole
-/// (`PagedKvPool::PAGE_SLOTS` slots each). ⛔ IT IS THE EXACT INVERSE OF THE POOL DEMAND: a
-/// declaration of exactly this many tokens re-passes the budget veto with zero slack, and one
-/// token more does not — which is what makes an unset flag's resolution veto-proof by
-/// construction instead of by re-checking. Pinned as such by `served_context_tests` below.
-///
-/// Gated to the builds with a caller: the pool veto (`spyre-hw`) and the wiring test
-/// (`test`, so it runs on the emulator build, where the card-only blocks are cfg'd out —
-/// the same cfg artifact the `decode_facts` pair above documents). Pure arithmetic over
-/// the shared pool vocabulary either way.
-#[cfg(any(feature = "spyre-hw", test))]
-pub(crate) fn affordable_context_tokens(
-    budget_bytes: u64,
-    stride_bytes: u64,
-    rows: scratchy_subtile::sdsc_abstract::PoolRows,
-) -> u64 {
-    use scratchy_subtile::sdsc_abstract::{PagedKvPool, PoolPartition};
-    (budget_bytes / stride_bytes).saturating_sub(PoolPartition::reserve() as u64)
-        / rows.get().get() as u64
-        * PagedKvPool::PAGE_SLOTS as u64
-}
-
 use crate::error::ExecutorResult;
 #[cfg(feature = "spyre-hw")]
 use crate::spyre_pool::*;
@@ -189,9 +129,9 @@ pub(crate) struct Parsed {
     // the layers list whose length the load log prints).
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) embed_src: usize,
-    /// The attention length-mask source, when the wiring names one.
+    /// The paged step the wiring states — see `BundleMeta::paged`.
     #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) attn_mask_src: Option<usize>,
+    pub(crate) paged: Option<scratchy_target_spyre::wiring::PagedStep>,
     /// cos / sin runtime sources as `(source id, full column width, rotary class)`.
     /// GQA gives more than one width (Q vs K); a hybrid-attention arch (gemma-4)
     /// gives classes different tables. Each is filled by tiling the class's own
@@ -247,12 +187,6 @@ pub(crate) fn wiring_to_parsed(
             prefix_k_src: _l.prefix_k as usize,
             #[cfg(not(feature = "spyre-hw"))]
             prefix_v_src: _l.prefix_v as usize,
-            #[cfg(not(feature = "spyre-hw"))]
-            new_k_id: _l.new_k as usize,
-            #[cfg(not(feature = "spyre-hw"))]
-            new_v_id: _l.new_v as usize,
-            #[cfg(not(feature = "spyre-hw"))]
-            kv_width: _l.kv_width as usize,
         })
         .collect();
     if layers.is_empty() {
@@ -283,20 +217,12 @@ pub(crate) fn wiring_to_parsed(
         layers,
         #[cfg(not(feature = "spyre-hw"))]
         scalarmul_scales: w.scalarmul_scales,
-        // The tensors the host reads back after a pass: the result, plus each layer's new K/V,
-        // which is how the KV is threaded when the device holds no cache of its own. Carries the
-        // field's own `cfg` for exactly that reason — the card DOES hold a cache of its own, so there
-        // is no per-layer readback to name there.
+        // The tensor the host reads back after a pass: the result. The KV stays on the device — each
+        // layer's write scatters it into the pools its attention gathers from.
         #[cfg(not(feature = "spyre-hw"))]
-        output_ids: std::iter::once(w.result as usize)
-            .chain(
-                w.layers
-                    .iter()
-                    .flat_map(|l| [l.new_k as usize, l.new_v as usize]),
-            )
-            .collect(),
+        output_ids: vec![w.result as usize],
         #[cfg(not(feature = "spyre-hw"))]
-        attn_mask_src: w.attn_mask.map(|m| m as usize),
+        paged: w.paged,
     })
 }
 
@@ -449,53 +375,6 @@ fn apply_weight_scale_folds(
                 )));
             }
         }
-    }
-    Ok(())
-}
-
-/// ⭐ THE RUNTIME HALF OF THE HEAD-MAJOR o_proj RESTRUCTURE — materialize the permuted copies.
-///
-/// The layout minted, at BUILD time, a second, k-shuffled o_proj copy for every layer
-/// (`oproj_headmajor_tid`) wherever the geometry gate applies (multi-slab head dim + fp8 W8A8 o
-/// matmul). The wiring carries the `(companion id, copy id)` list and this is the whole of the
-/// copy at runtime: each listed `to` row is the SAME bytes, dtype and shape as its `from` row.
-/// The PERMUTATION itself is not here — it happens at staging, through the copy's own
-/// `kernel_weights` retile descriptor (the 6-axis walk that enumerates the head-major
-/// contraction order), so this is a source re-read, not a transform.
-///
-/// ⛔ RUNS AFTER THE FOLD PASS, so a folded o_proj's permuted copy carries the same post-fold
-/// bytes its companion stages — the two must agree element-for-element, and the fold is the last
-/// pass that touches the companion.
-/// ⛔ REFUSES WHAT THE MINT DID NOT PREVENT: a copy naming a `from` row the binding did not
-/// stage, or a `to` id the binding already owns — either is a wiring↔mint desync, not an input
-/// to interpret.
-fn materialize_weight_copies(
-    weights: &mut Vec<StagedWeight>,
-    copies: &[(u32, u32)],
-) -> ExecutorResult<()> {
-    for (from, to) in copies {
-        if weights.iter().any(|(id, ..)| *id == *to as usize) {
-            return Err(werr(format!(
-                "head-major weight copy names t{to}, which the generated binding already staged — \
-                 the layout minted a permuted copy for an id the binding owns, so the two \
-                 disagree about the sources"
-            )));
-        }
-        // Cloned out of the borrow before the push — the row is the copy's whole content.
-        let (bytes, dt, shape) = {
-            let (_, bytes, dt, shape) = weights
-                .iter()
-                .find(|(id, ..)| *id == *from as usize)
-                .ok_or_else(|| {
-                    werr(format!(
-                        "head-major weight copy names companion t{from}, which the generated \
-                         binding did not stage — the wiring and the weight binding disagree about \
-                         the sources"
-                    ))
-                })?;
-            (bytes.clone(), *dt, shape.clone())
-        };
-        weights.push((*to as usize, bytes, dt, shape));
     }
     Ok(())
 }
@@ -759,9 +638,6 @@ pub(crate) fn stage_bound_weights(
     //    emulator; the folded ScalarMul has no program on either tier, so the scale enters the run
     //    HERE and nowhere else. ──
     apply_weight_scale_folds(&mut weights, wiring.weight_scale_folds)?;
-    // ── THE HEAD-MAJOR o_proj COPIES' RUNTIME HALF — after the folds, so each permuted copy
-    //    carries the same post-fold bytes its companion stages. ──
-    materialize_weight_copies(&mut weights, wiring.weight_copies)?;
     tracing::debug!(
         "[timing] load_weights ({} tensors) took {:.2}s (of which take/disk {:.2}s; transpose = remainder)",
         weights.len(),
@@ -962,17 +838,79 @@ impl SpyreWorker {
             "[weights] staged {} weight(s) for the session",
             weights.len()
         );
+        // ⭐ THE LOAD CONSTS RIDE IN WITH THE WEIGHTS. The minted draw's twenty staged tables
+        // (and the chained head's decompose tables) are sources the bake states once at load —
+        // `Wiring::load_consts` — staged here at their TRUE dtypes exactly as the numeric gate
+        // stages them (`LoadConst::build`, the memref-faithful form). Without them the draw reads
+        // zero ramps and zero widen tables and answers token 0, every step. Both bundles mint the
+        // draw at the same tids with the same tables; a tid two bundles state DIFFERENTLY cannot
+        // live in one resident session, so it refuses rather than keep either.
+        #[cfg(not(feature = "spyre-hw"))]
+        let weights = {
+            let mut weights = weights;
+            let mut staged: std::collections::HashMap<u32, Vec<u8>> =
+                std::collections::HashMap::new();
+            let consts = wirings
+                .decode
+                .load_consts
+                .iter()
+                .chain(wirings.prefill.iter().flat_map(|p| p.load_consts.iter()));
+            for &(tid, kind) in consts {
+                let (bytes, dt, shape) = kind.build();
+                match staged.get(&tid) {
+                    Some(prev) if *prev != bytes => {
+                        return Err(werr(format!(
+                            "load const t{tid} is stated differently by the decode and prefill \
+                             bundles — one resident session holds one value per tensor id"
+                        )));
+                    }
+                    Some(_) => {}
+                    None => {
+                        staged.insert(tid, bytes.clone());
+                        weights.push((tid as usize, bytes, dt, shape.to_vec()));
+                    }
+                }
+            }
+            tracing::info!(
+                "[weights] staged {} load const(s) for the session",
+                staged.len()
+            );
+            // ⭐ THE KV POOLS ARE NEVER STAGED. Every layer's K and V pool is a resident tensor the
+            // device writes (the paged KV write's scatter) and reads (the page walk's gathers) from
+            // step to step, and a step reads only rows its own request wrote — the mask stack keeps
+            // every other row out — so the session's own zeroed allocation is the pool's starting
+            // state. Staging zeros instead would touch every page of a pool sized to the model's
+            // whole context. The decode and prefill programs share one session and therefore must
+            // name the SAME pools.
+            if let Some(p) = &pparsed {
+                for (d, q) in dparsed.layers.iter().zip(&p.layers) {
+                    if (d.prefix_k_src, d.prefix_v_src) != (q.prefix_k_src, q.prefix_v_src) {
+                        return Err(werr(format!(
+                            "the decode and prefill programs name different KV pools (t{}/t{} vs \
+                             t{}/t{}) — one session holds one pool per layer",
+                            d.prefix_k_src, d.prefix_v_src, q.prefix_k_src, q.prefix_v_src
+                        )));
+                    }
+                }
+            }
+            tracing::info!(
+                "[weights] {} KV pool(s) of {} slots resident in the session",
+                2 * dparsed.layers.len(),
+                dparsed.capacity
+            );
+            weights
+        };
         // NOTE: the RoPE rotate-half permutation P (ROPE_P_TID) is NOT a load-time weight.
         // It is a synthetic seg0 ACTIVATION re-bound per step in `superdsc_forward_chunk`
         // (see the `acts` block there) — a seg1 weight would only be H2D'd at PrepareModel,
         // which binds ONLY the manifest's model weights, leaving a synthetic P at ZERO.
 
-        // KTIR: ONE resident session over [prefill?, decode]. sendnn: N layer-group
+        // KTIR: ONE resident session over [prefill rungs, decode rungs]. sendnn: N layer-group
         // [prefill, decode] sessions (the host threads the hidden state group→group).
-        // Program order: prefill first (index 0) when present, then the decode cap buckets in
-        // ascending-cap order — so a bucket's program index is `decode_prog_base + i`.
+        // Program order: the prefill rungs first, then the decode rungs, each ascending by reach —
+        // so decode rung `j`'s program index is `prefill_rungs.len() + j`.
         #[cfg(not(feature = "spyre-hw"))]
-        let (session, decode_prog_base) = {
+        let (session, decode_rungs, prefill_rungs) = {
             // ⭐ THE PROGRAMS COME OUT OF THE REGISTRY, BY FINGERPRINT. `#[forward]` submitted them
             // as const data; the bundle names which set is this model's. That is the same resolver
             // the ladder rungs and the re-rolled siblings already use, so a program is found in one
@@ -989,21 +927,53 @@ impl SpyreWorker {
                 })?;
                 Ok(&code.groups)
             };
+            // ⭐ THE WALK RUNGS — every body a bundle's ladder names (`RerollMeta::rungs`), with the
+            // positions its page walk reaches: one graph walked over fewer or more pages, so the
+            // rungs share the weights and the pools by tensor id. Ascending by reach. A bundle with
+            // no ladder is its own one rung, at the walk its wiring states (`None`).
+            let rungs = |fp: &'static str| -> ExecutorResult<Vec<(Option<usize>, &'static str)>> {
+                let code = scratchy_target_spyre::bundle_code::bundle(fp)
+                    .ok_or_else(|| werr(format!("no KTIR bundle registered for fp={fp}")))?;
+                let mut v: Vec<(Option<usize>, &'static str)> = match &code.reroll {
+                    Some(meta) if !meta.rungs.is_empty() => meta
+                        .rungs
+                        .iter()
+                        .map(|r| match r.bodies.first() {
+                            Some(b) if !b.is_none() => {
+                                Ok((Some(r.active_cap.get() as usize), b.as_str()))
+                            }
+                            _ => Err(werr(format!(
+                                "bundle {fp}: a ladder rung of {} slots names no body",
+                                r.active_cap.get()
+                            ))),
+                        })
+                        .collect::<ExecutorResult<_>>()?,
+                    _ => vec![(None, fp)],
+                };
+                v.sort_by_key(|&(reach, _)| reach);
+                Ok(v)
+            };
+            let prefill_rungs = match (pparsed.as_ref(), bundle.prefill.as_ref()) {
+                (Some(_), Some(pb)) => rungs(pb.fp)?,
+                _ => Vec::new(),
+            };
+            let decode_rungs = rungs(bundle.decode[0].fp)?;
             let mut programs: Vec<(
                 &[scratchy_target_spyre::bundle_code::LaunchGroup<'static>],
                 Vec<u64>,
             )> = Vec::new();
-            if let (Some(pp), Some(pb)) = (pparsed.as_ref(), bundle.prefill.as_ref()) {
-                programs.push((
-                    groups(pb.fp)?,
-                    pp.output_ids.iter().map(|i| *i as u64).collect(),
-                ));
+            if let Some(pp) = pparsed.as_ref() {
+                for &(_, fp) in &prefill_rungs {
+                    programs.push((
+                        groups(fp)?,
+                        pp.output_ids.iter().map(|i| *i as u64).collect(),
+                    ));
+                }
             }
-            let base = programs.len();
-            for dp in dparsed_all.iter() {
+            for &(_, fp) in &decode_rungs {
                 programs.push((
-                    groups(bundle.decode[0].fp)?,
-                    dp.output_ids.iter().map(|i| *i as u64).collect(),
+                    groups(fp)?,
+                    dparsed.output_ids.iter().map(|i| *i as u64).collect(),
                 ));
             }
             let refs: Vec<(
@@ -1018,36 +988,8 @@ impl SpyreWorker {
                 "[timing] SpyreSession::new_multi took {:.2}s",
                 _t_sess.elapsed().as_secs_f64()
             );
-            (s, base)
+            (s, decode_rungs, prefill_rungs)
         };
-        // ⭐ scratchy_target_spyre::wiring::HAT THE BAKE PLACED, per bundle — one value each, not six locals.
-        //
-        // These were `scalarmul_scales_v`, `prefill_uses_ones`, `prefill_ones_len`,
-        // `prefill_uses_identity`, `decode_uses_identity` and `baked_lm_head_ksplit`: declared
-        // here, assigned ~350 lines below inside a `#[cfg(feature = "spyre-hw")]` branch, and read
-        // ~600 lines below that. Each needed `#[allow(unused_mut, unused_assignments)]` to
-        // compile, and that allow is what let one of them go on being derived for a bind that had
-        // stopped existing. `BakeFacts::of` asks the layout once.
-        //
-        // ⚠️ ONE `allow` SURVIVES, DOWN FROM SIX, and it is a cfg artifact rather than a silenced
-        // problem: a value computed inside `cfg(sendnn)` and consumed outside it must be declared
-        // before the branch, so its initialiser is dead in exactly the build that assigns it.
-        // `None` IS read on the non-sendnn path, and what it feeds is one call away.
-        // ⛔ ON THE CARD, `decode_facts` HAS NO VALUE UNTIL THE DECODE BAKE GIVES IT ONE: the
-        // branch below that bakes the decode bundle assigns it, and every other card path returns
-        // an error first, so the compiler proves it is set before it is read (the
-        // `served_context_v` pattern below). `BakeFacts::NONE` is not a default for the card.
-        // `prefill_facts` is assigned only when a prefill bundle is baked, and is
-        // `BakeFacts::NONE` (a bundle that placed nothing) when there is none. On the emulator
-        // both are `NONE`, read once.
-        #[cfg(feature = "spyre-hw")]
-        let decode_facts: scratchy_target_spyre::wiring::BakeFacts;
-        #[cfg(not(feature = "spyre-hw"))]
-        let decode_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
-        #[cfg(feature = "spyre-hw")]
-        let mut prefill_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
-        #[cfg(not(feature = "spyre-hw"))]
-        let prefill_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
         // The KV byte budget the paged pool gets sized against — the card's real capacity ×
         // `--gpu-memory-utilization` − the bundle's non-KV segments. Declared out here for the same reason
         // `scalarmul_scales_v` is: it is computed in the SuperDsc branch below (sendnn only) but has to
@@ -1134,189 +1076,32 @@ impl SpyreWorker {
                 // the prefix capacity (mask cols) — same block_size the paged path uses.
                 let vocab = dparsed.vocab;
                 let kv_dim = dparsed.kv_dim;
-                // THE DEFAULT POOL IS FLAT — 8 pages, whatever the batch — AND A REQUEST'S CONTEXT DOES
-                // NOT SHRINK WHEN THE BATCH WIDENS.
-                //
-                // ⭐ SO THE DEFAULT SCALES WITH THE LADDER AGAIN: `pages_per_row * WIDEST_BATCH_RUNG`.
-                //
-                // This scaling was removed when the request axis moved INSIDE the page — a page then held
-                // `ROWS` requests' KV per kv head, so every row owned the whole page list and 8 pages was
-                // 2048 positions for EVERY row. That is the design that has just been undone: a page holds
-                // SLOTS now and a row owns its own PAGES, so a pool of 8 cannot seat a 32-wide rung at all
-                // (`split_pool(8, 32)` is zero pages per row, which is the error this fixes).
-                //
-                // And it costs nothing, because it is the same factor the page just SHRANK by: dropping the
-                // request dimension made a page 32x smaller (`page_stride` was ~1 GB), so 32x as many pages
-                // is the memory the pool already had — while giving every row its own pages, which is what
-                // makes one launch able to stride across the batch.
-                //
-                // An explicit SUPERDSC_POOL_PAGES still wins, including downward: a smaller pool is a
-                // legitimate memory-vs-context call. It is read as PAGES PER ROW, so it keeps meaning the
-                // same thing to a caller — the context one sequence gets.
-                // ⛔ AND THE DEFAULT IS A BYTE BUDGET, NOT A PAGE COUNT.
-                //
-                // `pages_per_row * WIDEST_BATCH_RUNG` is a COUNT, and a page's SIZE is the model's: 31.5 MB
-                // for granite-2b (hd=64) but **70.8 MB at hd=128** (double the head dim, and `PLANE_SLOTS`
-                // carries the padded-write slack). So one default asked 7.7 GB of the 2b and **17.3 GB of
-                // granite-3.1-8b**, which the allocator refuses — `RAS::FLEXALLOCATOR::OutOfMemory`,
-                // "all existing regions lack sufficient free space", with 94 GB of the card FREE: no single
-                // REGION serves an 18 GB contiguous request. The 8b loaded before the request axis moved
-                // into the page, when the same default meant 8 pages (~566 MB); giving every batch row its
-                // own stripe multiplied it by `WIDEST_BATCH_RUNG` = 32x, and nothing capped the product.
-                //
-                // A budget in BYTES is the quantity that is actually scarce, so derive the count from it and
-                // the model's own page stride. Every model then gets as much context as its pages allow and
-                // no model is handed a pool that cannot be allocated. `SUPERDSC_POOL_PAGES` still overrides,
-                // in pages PER ROW, so an explicit request is honoured exactly as before.
-                // ⛔⛔ AND THE WIDTH IS A DECISION, NOT `WIDEST_BATCH_RUNG`.
-                // THE ADMISSION WIDTH — how many requests may decode together. Not a capacity decision:
-                // pages come from a free list, so one request can reach the whole pool whatever this is, and
-                // `PoolRows` bounds only how many LAUNCH SLOTS exist.
-                //
-                // ⛔⛔⛔ THERE IS NOTHING TO READ IT FROM, AND THAT IS THE INVARIANT. The width must BE a
-                // ladder rung: `decode_rung_for` picks the smallest rung holding the live count and that
-                // launch strides its slots arithmetically, so any other width has a live count whose rung
-                // addresses slots the pool never seated. A value that must be one of a fixed set is a
-                // decision, not a preference, and the ladder is the only thing entitled to make it — which
-                // is why `SUPERDSC_POOL_ROWS` is deleted rather than clamped or refused.
-                //
-                // ⭐ THE SMALLEST RUNG THAT HOLDS WHAT THIS RUN WILL ADMIT. It used to be the WIDEST rung
-                // unconditionally, which is free for capacity (a free list lets one request reach the whole
-                // pool at any width) and expensive for the RESERVE: `PoolPartition` holds back
-                // `rows * HOLE_PAGES_PER_ROW + 1` pages for the holes a launch's rows write into, so 32 rows
-                // reserved 65 of 136 pages against launches a `--max-num-seqs 4` run cannot perform.
-                // `AdmittedRequests` is the decided value; `for_admission` rounds it UP to a rung, because a
-                // pool cut for fewer rows than a launch binds addresses slots it never seated.
-                // 🛑 AND IT DOES NOT REFUSE AN OVER-WIDE `--max-num-seqs`. It used to, and the reason it
-                // gave had stopped being true: *"a request holds its KV row for its whole life ... the
-                // (WIDEST+1)-th concurrent request would be refused mid-run with `every one of the N KV
-                // row(s) is held by a live request`"*. That refusal, and the `free_row`/`rows_held` scarcity
-                // it came from, were DELETED when the request axis left the pool — see the comment on
-                // `ensure_pages`: *"a request needs no identity in the pool at all ... and so is the refusal
-                // that fired when every row was held — a concurrency limit that existed only because rows
-                // were a scarce per-request resource."* Nothing fails mid-run at WIDEST+1 any more.
-                //
-                // ⭐ WHAT ACTUALLY HAPPENS PAST THE LADDER IS A THROUGHPUT CLIFF, NOT A FAILURE.
-                // `decode_rung_for` returns `None` when no rung holds the live count, `batched` stays empty,
-                // and every request takes the per-request path (~93 µs of launch each) — correct output,
-                // much slower.
-                //
-                // ⭐⭐ SO IT IS REPORTED AS A CAP AND THE SCHEDULER IS HELD TO IT — the cuda rule.
-                // cuda refuses no `max_num_seqs`: it derives its captured-graph ladder FROM it
-                // (`auto_capture_sizes(max_num_seqs)`), so its fast path always covers the configured
-                // concurrency. A BAKED ladder cannot grow to meet the flag, so this backend holds the same
-                // invariant from the other end via `Worker::max_num_seqs_override`. A bare `scr serve` and
-                // an explicit `--max-num-seqs 256` then behave IDENTICALLY (both 32-wide, batched), which
-                // the refusal made incoherent: it rejected the explicit spelling of the very default it
-                // was silently substituting.
-                //
-                let pool_rows = PoolRows::for_admission(self.admitted.unwrap_or_else(|| {
-                    // No usable cap ⇒ assume the widest a launch can express. The unsafe direction is
-                    // too FEW rows, never too many.
-                    scratchy_subtile::sdsc_abstract::AdmittedRequests::new(
-                        PoolRows::WIDEST.get().get() as usize,
-                    )
-                    .expect("WIDEST is nonzero")
-                }));
-                //
-                // ⭐⭐⭐ THE POOL IS SIZED BY WHAT THE RUN DECLARED, AND THE BUDGET ONLY GETS TO REFUSE.
-                //
-                // 🛑 IT USED TO BE SIZED BY A CONSTANT — `DEFAULT_POOL_BUDGET_BYTES = 8 GiB`, divided by the
-                // model's page stride and clamped. That made every capacity question circular: the constant
-                // decided how deep a request could go, so when granite-3.1-8b died mid-generation at
-                // `request needs 769 positions but its share is 3 page(s)`, the only available answer was to
-                // re-cut the same 8 GiB differently (WIDTH or DEPTH, never both) and hope. Nothing in the
-                // program knew what the caller had actually asked for. The user's objection was exactly
-                // this: *"we size the pools based on the command line max-seq-len and other such
-                // parameters."*
-                //
-                // So: `PoolDemand::of_declaration(context, rows)` says what `--max-model-len` ×
-                // `--max-num-seqs` costs in pages, reserve included, and the byte budget is checked
-                // AGAINST that number rather than producing it.
-                //
-                // ⛔ AND IT REFUSES AT LOAD, IT DOES NOT CLAMP. A budget too small for the declaration is a
-                // run that will kill some request mid-generation, hundreds of correct tokens in, at a depth
-                // that depends on which requests happened to share the pool — the worst failure shape there
-                // is. Serving a quietly smaller context leaves the caller's belief in place, which is
-                // `capping-is-not-validating` verbatim. The refusal names both flags and both page counts,
-                // so the fix is arithmetic the caller can do.
-                //
-                // ⛔⛔⛔ AND THE BUDGET IS THE CARD'S, NOT A CONSTANT'S. This was
-                // `const POOL_BUDGET_BYTES: u64 = 8 GiB` — a number with no relationship to the device it
-                // sizes an allocation on, which is how a bare `scr serve` came to refuse itself: 4096 ×
-                // 32 rows needs ~15 GB, the constant said 8, and the arithmetic in the refusal never
-                // mentioned the card at all. On a 128 GB part that refusal is pure fiction.
-                //
-                // 🛑 THE SAME GUESS HAS ALREADY BEEN PAID FOR ONE LAYER DOWN. `runtime::build_runtime`
-                // sized the allocator's domain off a 32 GiB placeholder until a real `FlexAllocator` OOM on
-                // hardware found it; the fix was to ask the card
-                // (`flex_senlib_device_memory_size` → `DeviceHandle::GetDmpaSize`). The KV pool kept its own
-                // placeholder and repeated the bug.
-                //
-                // ⭐ AND THE FORMULA IS THE SHARED ONE, NOT A THIRD SPELLING OF IT.
-                // `scratchy_serving_engine::gpu_budget::compute_available_kv_bytes` is documented
-                // "backend-neutral ... shared by the CUDA and Metal Worker implementations" and lives in a
-                // crate this file already depends on. cuda calls it; metal calls it; spyre had a constant.
-                // Three backends, one law, and the only one that opted out is the one that then could not
-                // start.
-                //
-                // ⭐⭐⭐ THE POOL'S OWN DEMAND, DERIVED ONCE, HERE — above the budget on purpose: the
-                // census below needs it (the prefill anchor's spare includes a SECOND pool exactly
-                // this size, and whether the anchor reserves at all is decided against it), so
-                // deriving it inside `num_blocks` would force a second spelling of the pool law.
-                // `num_blocks` keeps only the budget's veto. A PAGE'S BYTES, from the pool's own
-                // law: a page holds every LAYER, each layer three planes (Knat, V, Kᵀ), each plane
-                // `kv_dim` features across the plane's PHYSICAL slot extent, at 2 bytes. Confirmed
-                // against the runtime's own report — it logs `kvstride=1769472` per layer for
-                // granite-8b, and `3 * 1024 * 288 * 2 = 1769472`, `* 40 layers = 70778880 B` =
-                // the `page_stride` it then prints. Derived here rather than read back because
-                // the pool must be SIZED before the session that would report it.
-                // ⛔ FROM THE LOCAL WIRING, NOT `self.model` — `self.model` is still None here
-                // (this IS `load_model`, it is what fills it), so reading it silently gave
-                // `layers = 1`. That made the stride ONE LAYER's worth and the clamp handed back
-                // the very default the budget was meant to replace: the fix compiled, ran, logged
-                // nothing wrong, and changed nothing. A fallback that is *plausible* (1 layer) is
-                // worse than no fallback.
-                // ⭐ FROM THE BAKE, NOT config.json. The layer count is a fact the tape was
-                // LOWERED at, so reading it from the wiring cannot disagree with the bundle and
-                // has no default to fire.
-                let pool_stride_bytes = {
-                    let layers = (wirings.decode.geometry.layers as usize).max(1);
-                    let plane_slots =
-                        scratchy_subtile::sdsc_abstract::PagedKvPool::PLANE_SLOTS as u64;
-                    (3 * kv_dim as u64 * plane_slots * 2 * layers as u64).max(1)
-                };
-                // THE DECLARED DEPTH, AS DECLARED — `--max-model-len` when the CLI gave one, else
-                // the model's own limit. ⛔ NO MASK CAP, AND ITS ABSENCE IS THE LAW. This was
-                // `min(declared, PagedKvPool::MAX_PAGES_PER_ROW * PAGE_SLOTS)` — a const main
-                // deleted with the derived ceiling (bfe42f56d), and the rebase met its corpse
-                // here as E0599. The prefix mask's block count is DERIVED at bake from the device
-                // (`MAX_SEGMENT_BYTES / page_bytes`, one region of KV), so it covers every pool
-                // any card can budget for, and the pool is ONE allocation capped at that same
-                // region — a budget-funded declaration is therefore always within the mask's
-                // reach, and the binding law for a given run is the budget veto below, which
-                // REFUSES rather than clamps (`capping-is-not-validating`, this block's own law).
-                // The artifact still guards every launch (`MaskBlocks::fits`), every page grant
-                // (`within_mask_reach`), and admission (`kv_max_addressable_tokens` = min(served,
-                // the mask reach)) — a mask cap HERE could only fire on worker arithmetic that
-                // disagrees with the bake's, which is exactly what those per-launch guards exist
-                // to catch.
-                // ⛔ AND IT STAYS THE DECLARED DEPTH THROUGH THE CENSUS, BY DESIGN: the anchor's
-                // reserve policy below needs a pool size to decide against, and what an UNSET
-                // flag should resolve to is only answerable once the budget exists — the
-                // resolution (and the explicit ask's refusal) happen at the budget, in the
-                // context-law block below.
-                let mut declared_ctx = self.declared_context.unwrap_or(max_model_len).max(1);
-                let mut pool_demand = scratchy_subtile::sdsc_abstract::PoolDemand::of_declaration(
-                    scratchy_subtile::sdsc_abstract::SlotCount::new(declared_ctx as u32),
-                    pool_rows,
-                );
-                let mut declared_pages = pool_demand.pages().ok_or_else(|| {
-                    werr(format!(
-                        "--max-model-len {declared_ctx} overflows a page count"
-                    ))
+                // ⭐ THE KV POOL IS THE BAKE'S — every layer's K and V pools, placed in the KV segment of
+                // every bundle at the decode wiring's own page count (the model's context, or as much of
+                // it as one device region holds: `paged_step::pool_slots`). Nothing here sizes it: the
+                // OWNER session allocates the segment once, and every other session aliases it.
+                let step = wirings.decode.paged.ok_or_else(|| {
+                    werr("the decode bundle states no paged step — its attention reads no KV pool")
                 })?;
-                let mut pool_need_bytes = declared_pages.get() as u64 * pool_stride_bytes;
+                let num_blocks = step.pages as usize;
+                let pool_need_bytes =
+                    code.layout.segment_bytes[scratchy_target_spyre::superdsc_exec::SEG_KV.get()];
+                let pool_stride_bytes = pool_need_bytes / u64::from(step.pages).max(1);
+                // ⭐ THE CONTEXT THIS RUN SERVES — the declared `--max-model-len`, which the pool must
+                // hold: a declaration past it is REFUSED, never clamped. An unset flag serves the
+                // model's own limit, up to the pool.
+                let capacity = step.capacity();
+                served_context_v = match self.declared_context {
+                    Some(d) if d > capacity => {
+                        return Err(werr(format!(
+                            "--max-model-len {d} is past the {capacity} positions the bake's KV pool \
+                             holds ({} page(s) of {} slots) — serve a shorter context",
+                            step.pages, step.page_slots
+                        )));
+                    }
+                    Some(d) => d.max(1),
+                    None => max_model_len.min(capacity).max(1),
+                };
                 //
                 // ── THE BATCHED-PREFILL ANCHOR BUNDLE, resolved here because the census below
                 // reads its layout — the anchor session's residency is a budget input now, and
@@ -1581,201 +1366,43 @@ impl SpyreWorker {
                 }
                 // ⛔⛔⛔ THE ALLOCATABLE TENSOR CAPACITY, NOT THE CARD. `FlexAllocator` reserves one
                 // of its seven equal regions for PROGRAM memory, so a tensor allocation is served
-                // from six — and the budget below sizes exactly such an allocation. Spending
-                // `card_bytes.bytes()` here over-stated the pool by a full region: the log said
-                // `KV budget 86491 MB` while the allocator's own OOM for the next allocation
-                // reported `total_capacity_bytes=103079215104` (96 GiB = 6/7 of 112 GiB). See
-                // `CardMemory::tensor_capacity`.
-                let pool_budget_bytes =
-                    scratchy_serving_engine::gpu_budget::compute_available_kv_bytes(
-                        card_bytes.tensor_capacity() as usize,
-                        non_kv_bytes as usize,
-                        // No separate activation profile on this backend: the intermediate segment IS the
-                        // activation footprint and it is already counted in `non_kv_bytes` above. Passing it
-                        // again here would charge it twice.
-                        0,
-                        self.gpu_memory_utilization,
-                    ) as u64;
-                // ⛔ AND THE POOL IS **ONE** ALLOCATION, so it cannot exceed one region however much
-                // tensor capacity is left over. Without this cap the budget can authorise a pool the
-                // allocator will refuse with a self-contradictory OOM (requested < free) — the same
-                // failure mode as an over-sized weight segment, one layer up.
-                let pool_budget_bytes = pool_budget_bytes.min(card_bytes.max_single_allocation());
-                tracing::info!(
-                    "superdsc paged: KV budget {} MB = {} MB allocatable tensor memory (card {} MB \
-                     less the flex program region) × --gpu-memory-utilization {:.2} − {} MB already \
-                     reserved by the sessions (the decode bundle's segments but KV + banks, plus the \
-                     prefill anchor's {} MB live{}{}, incl. {} MB of spilled weight tail copied into \
-                     {} borrowing session(s)) − 150 MB redundancy, capped at the {} MB a single \
-                     allocation can be",
-                    pool_budget_bytes / (1024 * 1024),
-                    card_bytes.tensor_capacity() / (1024 * 1024),
-                    card_bytes.bytes() / (1024 * 1024),
-                    self.gpu_memory_utilization,
-                    non_kv_bytes / (1024 * 1024),
-                    anchor_live_bytes / (1024 * 1024),
-                    if anchor_reserves {
-                        format!(
-                            " + {} MB spare (RESERVED: it places decode's weight region)",
-                            (anchor_spare_bytes + pool_need_bytes) / (1024 * 1024)
-                        )
-                    } else if prefill_code.is_some() {
-                        " (BORROWING: the spare did not fit)".to_string()
-                    } else {
-                        String::new()
-                    },
-                    if prefill_code.is_some() {
-                        ""
-                    } else {
-                        " (no batched-prefill bundle)"
-                    },
-                    (tail_bytes * borrowers) / (1024 * 1024),
-                    borrowers,
-                    card_bytes.max_single_allocation() / (1024 * 1024),
-                );
-                if pool_budget_bytes == 0 {
+                // from six. See `CardMemory::tensor_capacity`.
+                let funded =
+                    (card_bytes.tensor_capacity() as f64 * self.gpu_memory_utilization) as u64;
+                if non_kv_bytes + pool_need_bytes > funded {
                     return Err(werr(format!(
-                        "the Spyre card reports {} MB of memory, but --gpu-memory-utilization {:.2} leaves \
-                         nothing for the KV cache after the {} MB this model's sessions already reserve \
-                         (the decode bundle's segments and banks, the prefill anchor's live segments{}, \
-                         and the spilled weight tail's copies). Raise --gpu-memory-utilization, or use a \
-                         smaller model.",
-                        card_bytes.bytes() / (1024 * 1024),
+                        "the Spyre card's {} MB of tensor memory × --gpu-memory-utilization {:.2} funds \
+                         {} MB, but this model's sessions reserve {} MB beside the bake's {} MB KV \
+                         pool. Raise --gpu-memory-utilization, or use a smaller model.",
+                        card_bytes.tensor_capacity() / (1024 * 1024),
                         self.gpu_memory_utilization,
+                        funded / (1024 * 1024),
                         non_kv_bytes / (1024 * 1024),
-                        if anchor_reserves {
-                            format!(
-                                " + its {} MB reserved spare",
-                                (anchor_spare_bytes + pool_need_bytes) / (1024 * 1024)
-                            )
-                        } else {
-                            String::new()
-                        },
+                        pool_need_bytes / (1024 * 1024),
                     )));
                 }
-                // Carry it to `Loaded` so the engine's own KV sizing reads this number and not a constant.
-                kv_budget_bytes_v = Some(pool_budget_bytes);
-                // And the stride beside it, so the engine's block-count arithmetic
-                // (`kv_block_bytes` → `budget/stride`, clamped to the host range) divides by the
-                // same page the pool was cut from — the two counts are then one count.
-                pool_stride_bytes_v = Some(pool_stride_bytes);
-                let num_blocks = {
-                    // ⭐ THE POOL'S LAW LIVES ABOVE, ONCE — `pool_need_bytes` / `declared_pages` /
-                    // `pool_stride_bytes` / `pool_demand` are the single derivation (hoisted there
-                    // because the census and the anchor's reserve policy need them first). This
-                    // block holds the CONTEXT LAW's one application to the pool:
-                    // [`resolve_served_context`] over (the CLI's `--max-model-len`, the model's
-                    // own limit, what this budget funds per request), the pool re-derived for
-                    // whatever it served, and the log that states what was decided. The law's
-                    // boundary is the old veto's boundary exactly — an explicit `--max-model-len`
-                    // over what the budget funds is REFUSED with the advice below — and the one
-                    // behavior it adds is the unset flag: the model's own limit resolves DOWN to
-                    // what the budget funds instead of refusing, at info, because a default sized
-                    // by the card is a decision, not a broken ask.
-                    let affordable_ctx =
-                        affordable_context_tokens(pool_budget_bytes, pool_stride_bytes, pool_rows);
-                    match scratchy_serving_engine::gpu_budget::resolve_served_context(
-                        self.declared_context,
-                        max_model_len,
-                        affordable_ctx as usize,
-                    ) {
-                        scratchy_serving_engine::gpu_budget::ServedContext::Refused {
-                            declared,
-                            affordable,
-                        } => {
-                            return Err(werr(format!(
-                                "--max-model-len {declared} × --max-num-seqs {} needs {} KV page(s) \
-                                 ({} MB at {} MB per page), but the KV budget is {} MB ({} page(s)). This run \
-                                 would fail a request mid-generation once the pool ran out, so it is refused \
-                                 here instead. Lower --max-model-len to about {affordable} or --max-num-seqs \
-                                 to {}.",
-                                pool_rows.get(),
-                                declared_pages.get(),
-                                pool_need_bytes / (1024 * 1024),
-                                pool_stride_bytes / (1024 * 1024),
-                                pool_budget_bytes / (1024 * 1024),
-                                pool_budget_bytes / pool_stride_bytes,
-                                // What the budget funds as a WIDTH, stated as the flag the caller
-                                // typed: one page per row past the reserve, at the declaration's
-                                // own per-row page count.
-                                (pool_budget_bytes / pool_stride_bytes).saturating_sub(1)
-                                    / pool_demand.per_row().get() as u64,
-                            )));
-                        }
-                        scratchy_serving_engine::gpu_budget::ServedContext::Tokens(served) => {
-                            // ⭐ AN UNSET DEFAULT RESOLVES HERE, NEVER ABOVE: the census and the
-                            // anchor's reserve policy ran against the DECLARED depth (the model's
-                            // own limit when no flag was given), because the budget that funds the
-                            // resolution is only known once they have. The resolved pool is
-                            // veto-proof by construction — `affordable_context_tokens` is the
-                            // exact inverse of the demand arithmetic, so the re-derived
-                            // `pool_need_bytes` fits the budget it was resolved from — and the
-                            // anchor keeps the BORROW decision the bigger declared pool forced,
-                            // which is the conservative direction (borrowing costs the placement
-                            // effect, never the run).
-                            if served < declared_ctx {
-                                info!(
-                                    "max_model_len unset: serving {served} of the model's \
-                                     {declared_ctx} — what the {} MB KV budget funds across {} \
-                                     launch row(s) at {} MB per page",
-                                    pool_budget_bytes / (1024 * 1024),
-                                    pool_rows.get(),
-                                    pool_stride_bytes / (1024 * 1024),
-                                );
-                                declared_ctx = served;
-                                pool_demand =
-                                    scratchy_subtile::sdsc_abstract::PoolDemand::of_declaration(
-                                        scratchy_subtile::sdsc_abstract::SlotCount::new(
-                                            served as u32,
-                                        ),
-                                        pool_rows,
-                                    );
-                                declared_pages = pool_demand.pages().ok_or_else(|| {
-                                    werr(format!("--max-model-len {served} overflows a page count"))
-                                })?;
-                                pool_need_bytes = declared_pages.get() as u64 * pool_stride_bytes;
-                            }
-                            // What the run SERVES, never `usize::MAX` on a sized pool, so
-                            // `kv_max_addressable_tokens` reports this run's own number and the
-                            // engine's admission cap agrees with the pool by construction.
-                            served_context_v = served;
-                            info!(
-                                "superdsc paged: KV pool {} page(s) = --max-model-len {declared_ctx} ({} page(s) per \
-                                 request) × {} launch row(s) + reserve — {} MB of a {} MB budget at {} MB per page",
-                                declared_pages.get(),
-                                pool_demand.per_row().get(),
-                                pool_rows.get(),
-                                pool_need_bytes / (1024 * 1024),
-                                pool_budget_bytes / (1024 * 1024),
-                                pool_stride_bytes / (1024 * 1024),
-                            );
-                            declared_pages.get() as usize
-                        }
-                    }
-                };
-                if let Some(sp) = PagedKvPool::split_pool(num_blocks as u32, pool_rows) {
-                    // ⛔ THIS LINE HAS NOW BEEN WRONG TWICE, AND BOTH TIMES BECAUSE IT DESCRIBED A
-                    // MECHANISM INSTEAD OF PRINTING THE NUMBERS. First it advertised an
-                    // `SUPERDSC_POOL_ROWS` override that had been deleted; then, an hour later, it said the
-                    // width was "fixed by the widest baked decode rung" — which I had just stopped being
-                    // true in the commit above. A log that explains its own derivation goes stale every time
-                    // the derivation moves. So it states the three FACTS a reader needs, and each is read
-                    // from the value that decided it.
-                    let host = PoolPartition::of_pool(
-                        PoolPages::of_pool(num_blocks).expect("a nonzero pool"),
-                        pool_rows,
-                    )
-                    .map_or(0, |p| p.host_blocks());
-                    tracing::info!(
-                        "superdsc paged: KV pool {} page(s) — {} offered to the SCHEDULER's block \
-                         allocator, {} reserved for the masked holes of {} launch row(s). One request may \
-                         use all of the offered pages and two may share one (prefix caching).",
-                        num_blocks,
-                        host,
-                        num_blocks as u32 - host,
-                        sp.rows().get(),
-                    );
+                // ⛔ AND THE POOL IS **ONE** ALLOCATION, so it cannot exceed one region however much
+                // tensor capacity is left over.
+                if pool_need_bytes > card_bytes.max_single_allocation() {
+                    return Err(werr(format!(
+                        "the bake's {} MB KV pool is past the {} MB one device allocation can be",
+                        pool_need_bytes / (1024 * 1024),
+                        card_bytes.max_single_allocation() / (1024 * 1024),
+                    )));
                 }
+                // Carried to `Loaded`, so the engine's block-count arithmetic divides the pool's own
+                // bytes by its own page — the two counts are then one count.
+                kv_budget_bytes_v = Some(pool_need_bytes);
+                pool_stride_bytes_v = Some(pool_stride_bytes);
+                info!(
+                    "superdsc paged: KV pool {} page(s) of {} slot(s) = {capacity} positions ({} MB), \
+                     as the bake placed it; serving {served_context_v} — {} block(s) offered to the \
+                     scheduler, page 0 kept for padded rows' writes",
+                    step.pages,
+                    step.page_slots,
+                    pool_need_bytes / (1024 * 1024),
+                    step.host_blocks(),
+                );
                 // What the DECODE bake placed — one call, and its own refusal.
                 let df = scratchy_target_spyre::wiring::BakeFacts::of(&code.layout);
                 df.require_identity(&code.fp).map_err(werr)?;
@@ -1790,19 +1417,6 @@ impl SpyreWorker {
                     .decode
                     .verify_class_placements(&code.layout)
                     .map_err(werr)?;
-                // ⭐ THE CAUSAL MASK'S ROW EXTENT vs ITS PLACEMENT — the load-time cross-check for
-                // the `nqh` bake. The host stages `causal_tiled(cmask, mq, mq_pad, nqh)` rows into
-                // `ATTN_CAUSAL_TID`'s `nqh·mq·mq_pad`-element placement, and the head count those
-                // two halves share is `Geometry::nqh`. The host used to derive it as
-                // `hidden / head_dim` — right only for a square Q projection, wrong on gemma-4,
-                // and the shortfall was SILENT (the bind guard refuses over-binds only) while the
-                // unstaged tail of the additive mask read as "no mask". This makes any head count
-                // other than the bake's a load-time refusal. At the decode row count `mq = 1`,
-                // where the pad law gives every baked rung the one-stick score width 64.
-                wirings
-                    .decode
-                    .verify_causal_placement(&code.layout, 1, 64)
-                    .map_err(werr)?;
                 // ⭐ AND THE TAPE IS CHECKED AGAINST THE ARTIFACT, ONCE, HERE. Every tensor the
                 // forward would bind must be one this bundle placed. They come from the same bake
                 // and so agree "by construction" — which is exactly what was also true of the
@@ -1815,29 +1429,11 @@ impl SpyreWorker {
                         scratchy_target_spyre::wiring::StagedRows::ONE,
                     ))
                     .len();
+                // One row: the load-time check only asks WHICH tensors the tape names, and that set
+                // does not vary with the row count.
                 let unplaced = wirings
                     .decode
-                    // One row: the load-time check only asks WHICH tensors the tape names, and
-                    // that set does not vary with the row count.
-                    //
-                    // ⭐ `true` IS DELIBERATE AND IS NOT THE LAUNCH'S ANSWER. Every other caller
-                    // derives this from `prefix_src.is_some()` — the step exists iff the source
-                    // does. Here the question is the opposite one: what is the WIDEST set of
-                    // tensors any launch of this bundle could bind, so that a bake missing one is
-                    // caught now rather than on the card. Asking with `false` would let an
-                    // unplaced prefix mask through.
-                    .forward_shape(
-                        scratchy_target_spyre::wiring::StagedRows::ONE,
-                        true,
-                        // ⭐ AND THE GATHER'S ANSWER IS THIS BUNDLE'S OWN, from the layout being checked
-                        // — not `true` like the mask above. The mask's `true` asks for the WIDEST tensor
-                        // set because a launch may or may not stage a mask; a gather is not optional
-                        // that way. The index step exists iff this bake PLACED the index tensor, so
-                        // asking `true` here would report `KV_BLOCK_INDEX_TID` unplaced for every
-                        // non-gathering bundle and refuse to serve every model.
-                        scratchy_target_spyre::wiring::GathersKv::of_layout(&code.layout),
-                        n_consts,
-                    )
+                    .forward_shape(scratchy_target_spyre::wiring::StagedRows::ONE, n_consts)
                     .unplaced(&code.layout);
                 if !unplaced.is_empty() {
                     return Err(werr(format!(
@@ -1853,7 +1449,6 @@ impl SpyreWorker {
                             .join(", "),
                     )));
                 }
-                decode_facts = df;
                 // ── PREFILL-ALL-BUT-LAST: the DISTINCT m=N prefill dxp bundle (C4 stamps its own fp
                 //    in the prefill graph slot; lm_head skipped). Build a SECOND SuperDscSession from
                 //    it (binding the SAME weights again — 2× resident, the spike cost) so the prompt
@@ -1917,10 +1512,6 @@ impl SpyreWorker {
                                 },
                                 |(rm, _)| *rm as usize,
                             );
-                        // What the PREFILL bake placed. From the bundle, never from
-                        // `SCRATCHY_RMS_MATMUL_REDUCE`, so a bundle-vs-env mismatch cannot leave a
-                        // matmul reading an unbound (zero) seg0.
-                        prefill_facts = scratchy_target_spyre::wiring::BakeFacts::of(pl);
                         // The prefill bake's class sets against ITS placements — the same
                         // cross-check the decode bake just passed, for the same reason.
                         wirings
@@ -1928,22 +1519,6 @@ impl SpyreWorker {
                             .as_ref()
                             .unwrap_or(&wirings.decode)
                             .verify_class_placements(pl)
-                            .map_err(werr)?;
-                        // ⭐ AND THE CAUSAL MASK against the PREFILL bake, at its own row count:
-                        // the placement reserves `nqh·prefill_m·pad` elements and the host stages
-                        // that many, so a head count other than the bake's (`Geometry::nqh`) is a
-                        // refusal here. The pad is the same `div_ceil(64)·64` law the emitter and
-                        // `run_prefill_batch` both apply — `PaddedMq::of_bundle` at a prompt
-                        // chunk's width.
-                        wirings
-                            .prefill
-                            .as_ref()
-                            .unwrap_or(&wirings.decode)
-                            .verify_causal_placement(
-                                pl,
-                                prefill_m as u32,
-                                (prefill_m as u32).div_ceil(64) * 64,
-                            )
                             .map_err(werr)?;
                         // OWNS ITS WEIGHTS ON PURPOSE — do NOT switch this to `new_borrowing`.
                         // This session is allocated BEFORE the decode session, so its 2.6 GB seg1
@@ -2012,13 +1587,8 @@ impl SpyreWorker {
                         .map_err(|e| werr(format!("build SuperDSC PREFILL dxp session: {e}")))?;
                         info!(
                             "[spyre-worker] sendnn: SUPERDSC PREFILL session ready (bundle {}, \
-                             m={prefill_m}, cap {} slots, paged={} page_slots={}, pmask reserves \
-                             {:?} column(s), {:.2}s) — batched prompt prefill enabled",
+                             m={prefill_m}, {:.2}s) — batched prompt prefill enabled",
                             pcode.fp,
-                            pss.cap,
-                            pss.paged,
-                            pss.page_slots,
-                            pss.pmask_slots,
                             _t.elapsed().as_secs_f64()
                         );
                         ((prefill_m > 1).then_some(pss), prefill_m)
@@ -2157,13 +1727,20 @@ impl SpyreWorker {
                 // binds and stages them; the batched-prefill session and every ladder rung borrow seg1
                 // from it by alias. So this takes `weights` by MOVE and no copy of that ~2.6 GB host
                 // buffer is ever made.
+                // ⭐ AND THE POOL'S STATICS — `kv_row_pool` and the int32 zero, which the one-request
+                // decode kernel's walk reads; every other session's kernels read none.
+                let pool_statics = scratchy_target_spyre::paged_step::card_statics(&step)
+                    .map_err(|e| werr(format!("the KV pool's statics: {e}")))?;
                 let mut ss = SuperDscSession::new(
                     code,
-                    vocab,
-                    kv_dim,
-                    num_blocks,
+                    scratchy_target_spyre::sdsc_runner::SessionDims {
+                        vocab,
+                        kv_dim,
+                        num_blocks,
+                    },
                     weights,
                     wirings.decode.load_consts,
+                    &pool_statics,
                     &spill_tids,
                 )
                 .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
@@ -2199,30 +1776,7 @@ impl SpyreWorker {
                     spill_images.push((seg, image));
                 }
 
-                // ZERO THE KV POOL ONCE. A page handed to a request holds whatever was in pool
-                // memory, and decode attention computes q·k over the WHOLE page and applies the
-                // validity mask AFTERWARDS — so every uninitialized slot still goes through the
-                // arithmetic. Uninitialized bytes decode as denormals/NaN, which take the slow paths.
-                //
-                // At a 128-token context ~70 of a 256-slot page are real and ~186 are garbage, every
-                // page, every layer, every step. Prefill never sees this (it attends only its own
-                // real tokens), which is why prefill puts 8 rows through the weights in 30.4 ms where
-                // decode takes 47.0 for the same 8.
-                //
-                // Priced accidentally: two changes that left the KV wrong — one writing to bad
-                // addresses, one not writing it at all — BOTH landed at ~4.55 s/it against 3.65
-                // correct. That is ~0.9 s/it for garbage floats, on top of whatever the normally-
-                // uninitialised tail of each page already costs.
-                //
-                // Zeros are the right fill, not merely a safe one: 0.0 is a normal float, and a
-                // masked-off slot contributes exp(-inf)=0 either way, so this changes no result.
-                ss.zero_seg(2).map_err(|e| {
-                    werr(format!(
-                        "zeroing the KV pool (seg2) on-device: {e} — refusing to serve over \
-                         uninitialized KV pages"
-                    ))
-                })?;
-                info!("[spyre-worker] sendnn: KV pool zeroed on-device (no host mirror)");
+                // The pools start zeroed: `prepare` uploads the KV segment's host image.
                 debug!(
                     "[timing] SuperDscSession::new (bind weights + prepare) took {:.2}s",
                     _t_sess.elapsed().as_secs_f64()
@@ -2432,89 +1986,6 @@ impl SpyreWorker {
                     // this rung's `seqs`, so both differ per rung. A rung whose placement does not
                     // describe `rn` whole rows is a LOAD ERROR — a gathered-from guess would read
                     // rows nobody wrote.
-                    // ⭐ THE PREFIX MASK'S REAL CAPACITY, FROM THIS RUNG'S OWN BUNDLE.
-                    //
-                    // `pmask = [nqh*mq, cap]` (`lower_subtile_tape_to_superdsc.rs:2567`), so the fold's
-                    // total swept columns must fit `cap`: one mask block per pass, `passes = pages*width`,
-                    // each block `COLS` wide ⇒ **`pages * width <= cap / PAGE_SLOTS`**. That bound is what
-                    // caps a batched request's context, and it was guessed twice before being read once.
-                    //
-                    // 🛑 BY TID, NOT BY SIZE. `ATTN_MASK_TID = u32::MAX - 3` names pmask. Picking "the
-                    // largest placement in the mask segment" is how I read the PREFILL bundle's pmask and
-                    // spent four theories on a refutation that was about the wrong bundle — and the cache
-                    // holds hundreds of per-group dirs whose seg-3 sizes span 421 KB..17 MB, so size
-                    // identifies nothing. `rdir` here is THIS WIDTH's decode bundle, and `rn` IS its mq.
-                    // ⭐ AND THE KV (seg-2) RESERVATION FROM THE SAME BUNDLE.
-                    //
-                    // What to compare it against: `70,778,880 B` is EXACTLY one 8b page
-                    // (3 planes * kv_dim * PLANE_SLOTS * 2 * layers), so a bundle appears to reserve ONE
-                    // page while the runtime pool is `num_blocks` of them. If seg-2 here is one page, the
-                    // pool must be allocated at prepare instead — and the open question is what then bounds
-                    // the fold at 8 pages x 4 rows when 6 x 4 works.
-                    let seg2 = rcode.layout.segment_bytes[2];
-                    debug!(
-                        "[kv-seg] rung seqs={rn}: seg2={seg2} B ({} MB) — one page is \
-                         3*kv_dim*PLANE_SLOTS*2*layers; compare against num_blocks*page_stride",
-                        seg2 / (1024 * 1024),
-                    );
-                    // ⭐ KEEP THE CAPACITY, do not just print it: it is the bound on a batched request's
-                    // context, so a step needing more blocks than the bundle baked overran the placement in
-                    // silence — and the bytes past it read as ZERO in an additive mask, which means VALID.
-                    // Checked at the launch now.
-                    let mut rung_mask_cap: Option<
-                        scratchy_subtile::sdsc_abstract::BakedMaskBlocks,
-                    > = None;
-                    if let Some(pmask) = rcode.layout.place_of_tid(
-                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_MASK_TID,
-                    ) {
-                        // ⭐ QUERY HEADS FROM THE BAKED GEOMETRY — THE COUNT ITSELF, NOT THE OLD
-                        // `hidden / head_dim` QUOTIENT. The quotient is the head count only for a
-                        // SQUARE Q projection; gemma-4's is not (hidden 3840 against nqh·hd
-                        // 4096/8192), and a mask-capacity derived from the quotient overstates how
-                        // many blocks a rung's placement holds — the tail blocks read unstaged
-                        // zeros, which in an ADDITIVE mask means VALID. `Geometry::nqh` is baked
-                        // from `num_attention_heads` at the same bounds the tape was lowered at.
-                        let g = &wirings.decode.geometry;
-                        let nqh = g.nqh.max(1) as u64;
-                        let bytes = pmask.size;
-                        let per = nqh * rn as u64 * 2;
-                        let cap = bytes.checked_div(per).unwrap_or(0);
-                        let page = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64;
-                        // The block count is the ONE fact; which law binds it is per-BODY (the
-                        // launch's own `gathers` picks the fold form), so state both readings
-                        // instead of printing one of them as if the bundle had picked it.
-                        debug!(
-                            "[mask-cap] rung seqs={rn}: pmask={bytes} B, nqh={nqh} => {} mask \
-                             block(s) — a per-page (gathered) fold bounds pages by it, a \
-                             per-(row,page) fold by blocks/width",
-                            cap / page,
-                        );
-                        rung_mask_cap =
-                            scratchy_subtile::sdsc_abstract::BakedMaskBlocks::of_placement(
-                                bytes,
-                                nqh as u32,
-                                rung_width,
-                                scratchy_subtile::sdsc_abstract::SlotCount::new(
-                                    scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32,
-                                ),
-                            );
-                    }
-                    // THE FOLD-ROW REGIME, from the bundle it will actually run: the launch derives its
-                    // intermediate-segment stride from it (`set_int_stride`). A rung whose fold groups
-                    // DISAGREE is a PANIC like any other rung that fails to load — guessing a
-                    // stride is the silent-wrong-history arm this field exists to close.
-                    let fold_rows = match rcode.fold_rows() {
-                        Ok(scratchy_target_spyre::bundle_code::FoldRows::PerRequest) => {
-                            scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest
-                        }
-                        Ok(scratchy_target_spyre::bundle_code::FoldRows::WholeBatch) => {
-                            scratchy_subtile::sdsc_abstract::FoldRowRegime::WholeBatch
-                        }
-                        Err(e) => panic!(
-                            "decode batch rung seqs={rn}: {e} — every rung the bake shipped must \
-                             load"
-                        ),
-                    };
                     // ⭐ THE LOGITS TID IS THE SEAT'S `row` WHEN THE BAKE MINTED A DRAW. The
                     // token-draw mint re-points the rung's RESULT to the idx stick, so
                     // `dparsed.result_id` names the `[rows, BLOCK]` pick — the placement exists
@@ -2597,159 +2068,43 @@ impl SpyreWorker {
                     );
                     decode_ladder.push(DecodeRung {
                         seqs: rung_width,
-                        mask_cap: rung_mask_cap,
-                        fold_rows,
-                        // ⛔ NO `swept` AND NO `gathers_kv` HERE ANY MORE — both are
-                        // per-BODY and this is per-bundle; see `DecodeRung`. The launch
-                        // asks `sess.step_body(start)`, which is the selector itself.
-                        // And no `logits` — the geometry's only runtime reader was the
-                        // host readback the submit/collect split deleted; the load-time
-                        // refusal above is what stays.
                         sess: rs,
                     });
                 }
                 decode_ladder.sort_by_key(|r| r.seqs);
-                // ── STAGE EVERY CHUNK SESSION'S FULL-CHUNK CAUSAL MASK, ONCE, HERE ── so no request's
-                // first full chunk pays the build (see `stage_full_chunk_causal`). Each session under
-                // the wiring its launches run under: the prefill meta's for both prompt ladders, the
-                // decode meta's for the solo decode session, whose every step is the one-row key. The
-                // decode BATCH rungs key by how many requests are live, which no load-time fact knows,
-                // so they still bind at first use.
-                //
-                // ⭐ AND FAULT THE SAME SESSIONS' ACTIVATION SHADOWS IN FIRST, so a request's first
-                // binds write into pages already mapped (see `materialize_activation_shadow`). The
-                // same set and for the same reason: these are what a first request runs on. A decode
-                // batch rung's activation segment reserves `nqh · rows` prefix-mask rows for every page
-                // a pool can hold (the `pmbytes` law), of which a step writes only its live blocks, so
-                // it keeps faulting in only what it writes rather than committing the reservation.
+                // ⭐ FAULT THE CHUNK SESSIONS' ACTIVATION SHADOWS IN AT LOAD, so a request's first
+                // binds write into pages already mapped (see `materialize_activation_shadow`) — the
+                // sessions a first request runs on.
                 {
                     let _t = std::time::Instant::now();
-                    let pw = wirings.prefill.as_ref().unwrap_or(&wirings.decode);
-                    let mut staged = (0usize, 0u64);
-                    let (mut shadow_bytes, mut shadow_s) = (0u64, 0f64);
-                    let mut stage = |sess: &mut SuperDscSession,
-                                     w: &scratchy_target_spyre::wiring::Wiring,
-                                     rows: usize|
-                     -> ExecutorResult<()> {
-                        let t = std::time::Instant::now();
-                        shadow_bytes += sess.materialize_activation_shadow().map_err(|e| {
-                            werr(format!("the {rows}-row session's activation shadow: {e}"))
-                        })?;
-                        shadow_s += t.elapsed().as_secs_f64();
-                        staged.1 += stage_full_chunk_causal(sess, w, rows).map_err(werr)?;
-                        staged.0 += 1;
-                        Ok(())
-                    };
+                    let mut shadow_bytes = 0u64;
+                    let mut fault =
+                        |sess: &mut SuperDscSession, rows: usize| -> ExecutorResult<()> {
+                            shadow_bytes += sess.materialize_activation_shadow().map_err(|e| {
+                                werr(format!("the {rows}-row session's activation shadow: {e}"))
+                            })?;
+                            Ok(())
+                        };
                     for (rows, sess) in prefill_ladder.iter_mut() {
-                        stage(sess, pw, *rows)?;
+                        fault(sess, *rows)?;
                     }
                     for (rows, sess) in prefill_prefix.rungs_mut() {
-                        stage(sess, pw, rows)?;
+                        fault(sess, rows)?;
                     }
-                    stage(&mut ss, &wirings.decode, 1)?;
+                    fault(&mut ss, 1)?;
                     info!(
-                        "[spyre-worker] sendnn: staged {} session(s)' full-chunk causal mask at load \
-                         ({} KB sent, {:.0} ms in all) — a full chunk's first launch binds nothing \
-                         for it; their activation shadows faulted in first ({} KB, {:.0} ms)",
-                        staged.0,
-                        staged.1 >> 10,
-                        _t.elapsed().as_secs_f64() * 1e3,
+                        "[spyre-worker] sendnn: chunk sessions' activation shadows faulted in at load \
+                         ({} KB, {:.0} ms)",
                         shadow_bytes >> 10,
-                        shadow_s * 1e3,
+                        _t.elapsed().as_secs_f64() * 1e3,
                     );
                 }
-                // ⭐ THE OWNER'S OWN W=1 FACTS — the same two launch facts every ladder rung
-                // reads off ITS bundle (`mask_cap`, `fold_rows`), read here off the DECODE
-                // SLOT'S bundle. The loader's `rn <= 1 → continue` means the W=1 rung IS the
-                // owner session, so a single request is a batch of ONE on it through the same
-                // decode launch — and that launch reads the owner's own facts, never a
-                // hand-mirrored constant and never the CEILING rung's numbers (the owner's
-                // pmask rows are `nqh * 1`, not `nqh * rn`).
-                let owner_mask_cap = code
-                    .layout
-                    .place_of_tid(
-                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_MASK_TID,
-                    )
-                    .and_then(|pmask| {
-                        // ⛔ ONE ROW, NOT `nqh`: the one-request bundle places the BROADCAST mask
-                        // (`compute_bundle_layout`'s `rows_are_requests = false` arm, `[1, max_pages]`)
-                        // and the owner seat stages it broadcast (`BatchPrefix::OneRequest`).
-                        // Dividing by the head count read granite-2b's 545 pages as 17 and refused
-                        // every solo request past ~4,600 tokens.
-                        scratchy_subtile::sdsc_abstract::BakedMaskBlocks::of_placement(
-                            pmask.size,
-                            1,
-                            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
-                                .expect("1 is a baked width"),
-                            scratchy_subtile::sdsc_abstract::SlotCount::new(
-                                scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32,
-                            ),
-                        )
-                    });
-                let owner_fold_rows = match code.fold_rows() {
-                    Ok(scratchy_target_spyre::bundle_code::FoldRows::PerRequest) => {
-                        scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest
-                    }
-                    Ok(scratchy_target_spyre::bundle_code::FoldRows::WholeBatch) => {
-                        scratchy_subtile::sdsc_abstract::FoldRowRegime::WholeBatch
-                    }
-                    Err(e) => panic!(
-                        "decode owner (the W=1 rung): {e} — every bundle the bake shipped \
-                             must load"
-                    ),
-                };
                 let sb = SuperDscBundle {
-                    // Every page starts free: no request holds one yet.
-                    pool_pages: num_blocks,
-                    pool_rows,
                     decode: ss,
-                    owner_mask_cap,
-                    owner_fold_rows,
                     decode_rungs: decode_ladder,
                     prefill_rungs: prefill_ladder,
                     prefill_prefix,
                 };
-                // THE SPLIT, SAID OUT LOUD. It decides the servable context per request AND the
-                // concurrency ceiling, so it is the first thing to look at when a request is refused —
-                // for length or for admission. Printed from `kv_split()`, which reads the ONE stored
-                // stripe count (`pool_rows`) that the pool was also SIZED by.
-                //
-                // 🛑 "row(s) SHARING ALL OF THEM" is what this line used to say, and it was the exact
-                // inverse of the truth — the same rot that survived in `PoolSplit`'s doc. Rows do not
-                // share pages: `physical(lp) = row * pages_per_row + lp` gives each row an EXCLUSIVE
-                // stripe, which is the whole mechanism behind the uniform page stride. A reader
-                // debugging "why did this request run out at N positions" would have been told the pool
-                // was N times bigger than the share it actually gets.
-                if let Some(sp) = sb.kv_split() {
-                    // 🛑 THIS LINE HAS NOW BEEN WRONG TWICE, IN OPPOSITE DIRECTIONS. First it said rows
-                    // "share all of them" while the pool was STRIPED (fixed in 201ab4f7); then it said
-                    // "striped into N exclusive rows of M pages = X positions PER REQUEST" after the free
-                    // list made pages an arbitrary BLOCK TABLE again (f5e26a3e), where a request can draw
-                    // the WHOLE pool and `pages_per_row` bounds nothing. Both times the number it printed
-                    // was the first thing a reader would consult about a length refusal, and both times it
-                    // was off by a factor of `rows`. State only what is still true: the pool's SIZE, the
-                    // context ONE request can reach (all of it), and what `rows` still bounds — ADMISSION,
-                    // because a row is now purely the identity of a launch slot.
-                    let per_page = sb.decode.page_slots.max(1);
-                    // ⛔ NO `.expect()` IN A LOG LINE. This read `PoolPages::of_pool(..).expect("a pool
-                    // with pages")`, so a pool that failed its own construction would abort the process from
-                    // inside an eprintln — killing the run at the exact moment the summary would have said
-                    // why. An instrument must not be able to end the thing it reports on.
-                    let host_pages = PoolPages::of_pool(sb.pool_pages)
-                        .and_then(|pp| PoolPartition::of_pool(pp, sb.pool_rows))
-                        .map_or(0, |p| p.host_blocks() as usize);
-                    info!(
-                        "[spyre-worker] sendnn: KV pool {} page(s) of {per_page} slot(s) = {} positions. \
-                         Pages come from the SCHEDULER's block table (two requests may share one — that is \
-                         what a prefix-cache hit is); the top {} page(s) are reserved for the batched \
-                         write's hole and are never offered to the scheduler. At most {} concurrent \
-                         request(s) (launch slots, not a capacity share)",
-                        sb.pool_pages,
-                        sb.pool_pages * per_page,
-                        sb.pool_pages.saturating_sub(host_pages),
-                        sp.rows().get(),
-                    );
-                }
                 SendnnSession::SuperDsc(sb)
             } else {
                 // ⛔ NOT A SUPERDSC BUNDLE. The sengraph offline_decoder path that used to run these
@@ -2767,46 +2122,36 @@ impl SpyreWorker {
         // forward; keep these for the BundleMeta (decode/prefill phase index).
         #[cfg(feature = "spyre-hw")]
         let (decode_prog_base, prefill_prog) = (1usize, Some(0usize));
-        #[cfg(not(feature = "spyre-hw"))]
-        let prefill_prog = if pparsed.is_some() {
-            Some(0usize)
-        } else {
-            None
-        };
 
         #[allow(unused_variables)]
-        // ⛔ THE FACTS ARE AN ARGUMENT, NOT A PATCH. This built every meta with `false`/`0`
-        // placeholders and the callers then assigned the real values field-by-field — so a phase
-        // whose caller forgot one served a bundle claiming it placed nothing.
         let mk_meta =
-            |p: Parsed,
-             prog: usize,
-             facts: scratchy_target_spyre::wiring::BakeFacts,
-             wiring: &'static scratchy_target_spyre::wiring::Wiring| BundleMeta {
-                #[cfg(not(feature = "spyre-hw"))]
-                prog,
-                #[cfg(not(feature = "spyre-hw"))]
-                attn_mask_src: p.attn_mask_src,
-                capacity: p.capacity,
-                m_cap: p.m_cap,
-                #[cfg(not(feature = "spyre-hw"))]
-                embed_src: p.embed_src,
-                #[cfg(not(feature = "spyre-hw"))]
-                cos_srcs: p.cos_srcs,
-                #[cfg(not(feature = "spyre-hw"))]
-                sin_srcs: p.sin_srcs,
-                result_id: p.result_id,
-                layers: p.layers,
-                #[cfg(not(feature = "spyre-hw"))]
-                output_ids: p.output_ids,
-                #[cfg(not(feature = "spyre-hw"))]
-                scalarmul_scales: p.scalarmul_scales,
-                #[cfg(not(feature = "spyre-hw"))]
-                phase: wiring.phase,
-                #[cfg(feature = "spyre-hw")]
-                facts,
-                #[cfg(feature = "spyre-hw")]
-                wiring,
+            |p: Parsed, prog: usize, wiring: &'static scratchy_target_spyre::wiring::Wiring| {
+                BundleMeta {
+                    #[cfg(not(feature = "spyre-hw"))]
+                    prog,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    paged: p.paged,
+                    capacity: p.capacity,
+                    m_cap: p.m_cap,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    embed_src: p.embed_src,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    cos_srcs: p.cos_srcs,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    sin_srcs: p.sin_srcs,
+                    result_id: p.result_id,
+                    layers: p.layers,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    output_ids: p.output_ids,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    scalarmul_scales: p.scalarmul_scales,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    phase: wiring.phase,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    sample_seat: wiring.sample_seat,
+                    #[cfg(feature = "spyre-hw")]
+                    wiring,
+                }
             };
 
         // Model-level dims (identical across cap buckets) from the first decode parse.
@@ -2815,7 +2160,7 @@ impl SpyreWorker {
         let head_dim = hf_config
             .head_dim()
             .ok_or_else(|| werr("config missing head_dim / num_attention_heads"))?;
-        let kv_dim = dparsed.kv_dim; // the info! below prints it on BOTH paths; the Loaded field is spyre-hw-only
+        let kv_dim = dparsed.kv_dim; // the info! below prints it
         let vocab = dparsed.vocab;
         // ⭐ ROPE θ FROM THE BAKE.
         //
@@ -2833,47 +2178,96 @@ impl SpyreWorker {
         // llama-3.2, whose real θ is 500000. Fluent, subtly-wrong output.
         let rope_theta = wirings.decode.geometry.rope_theta();
 
-        let mut decode: Vec<BundleMeta> = dparsed_all
-            .into_iter()
-            .enumerate()
-            .map(|(i, p)| mk_meta(p, decode_prog_base + i, decode_facts, &wirings.decode))
-            .collect();
-        // Ascending by capacity so `select_decode`'s first-fit picks the smallest.
-        decode.sort_by_key(|b| b.capacity);
-        let prefill = pparsed.map(|p| {
-            mk_meta(
-                p,
-                prefill_prog.unwrap(),
-                prefill_facts,
-                wirings.prefill.as_ref().unwrap_or(&wirings.decode),
-            )
-        });
+        #[cfg(feature = "spyre-hw")]
+        let (decode, prefill) = {
+            let mut decode: Vec<BundleMeta> = dparsed_all
+                .into_iter()
+                .enumerate()
+                .map(|(i, p)| mk_meta(p, decode_prog_base + i, &wirings.decode))
+                .collect();
+            // Ascending by reach so `select_decode`'s first-fit picks the smallest.
+            decode.sort_by_key(|b| b.reach());
+            let prefill: Vec<BundleMeta> = pparsed
+                .map(|p| {
+                    mk_meta(
+                        p,
+                        prefill_prog.unwrap(),
+                        wirings.prefill.as_ref().unwrap_or(&wirings.decode),
+                    )
+                })
+                .into_iter()
+                .collect();
+            (decode, prefill)
+        };
+        // ⭐ ONE META PER RUNG, each at its rung's own walk: the wiring is the graph's (every rung
+        // binds the same tensors), and the walk is the rung's (`PagedStep::walk`, which sizes the
+        // step's page table and mask stack and bounds the positions it may run).
+        #[cfg(not(feature = "spyre-hw"))]
+        let (decode, prefill) = {
+            drop(dparsed_all);
+            drop(pparsed);
+            let page_slots = scratchy_target_spyre::paged_step::PAGE_SLOTS as usize;
+            let at_walk = |mut meta: BundleMeta, reach: Option<usize>| {
+                if let (Some(r), Some(p)) = (reach, meta.paged.as_mut()) {
+                    p.walk = (r / page_slots) as u32;
+                }
+                meta
+            };
+            let decode = decode_rungs
+                .iter()
+                .enumerate()
+                .map(|(j, &(reach, _))| {
+                    Ok(at_walk(
+                        mk_meta(
+                            wiring_to_parsed(&wirings.decode)?,
+                            prefill_rungs.len() + j,
+                            &wirings.decode,
+                        ),
+                        reach,
+                    ))
+                })
+                .collect::<ExecutorResult<Vec<BundleMeta>>>()?;
+            let prefill = match wirings.prefill.as_ref() {
+                Some(pw) => prefill_rungs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(reach, _))| {
+                        Ok(at_walk(mk_meta(wiring_to_parsed(pw)?, i, pw), reach))
+                    })
+                    .collect::<ExecutorResult<Vec<BundleMeta>>>()?,
+                None => Vec::new(),
+            };
+            (decode, prefill)
+        };
         // ⛔ DEFAULT-MODE: the single static-SDPA graph IS the decode graph (prefill slot holds the same
         // graph). Its PrimaryInput ids (`t0`/`t5..t8`/prefix-KV) come from the DECODE manifest. The
         // separately-emitted m=prefill prefill manifest has DIFFERENT tensor ids, so using its BundleMeta for
         // the PER-FORWARD binding would bind the wrong names to the default graph (silent wrong output). So
         // `model.prefill` is nulled for Default/Paged/SuperDsc (every forward drives the decode meta). BUT
         // the batched-prefill path binds the prefill meta to the DISTINCT prefill SESSION (via
-        // run_prefill_batch), where the ids DO match — so preserve it in `batched_prefill` (SuperDsc only).
+        // run_card_launch), where the ids DO match — so preserve it in `batched_prefill` (SuperDsc only).
         #[cfg(feature = "spyre-hw")]
         let (prefill, batched_prefill) = if matches!(session, SendnnSession::SuperDsc(_)) {
-            (None, prefill)
+            (Vec::new(), prefill.into_iter().next())
         } else {
             (prefill, None)
         };
         #[cfg(not(feature = "spyre-hw"))]
         let batched_prefill: Option<BundleMeta> = None;
 
-        let caps: Vec<usize> = decode.iter().map(|b| b.capacity).collect();
+        let reaches =
+            |metas: &[BundleMeta]| -> Vec<usize> { metas.iter().map(|b| b.reach()).collect() };
         info!(
             "[spyre-worker] arch {arch} via try_load (decode m={}) prefill={} | {} layers, \
              hidden {hidden}, head_dim {head_dim}, kv_dim {kv_dim}, vocab {vocab}, \
-             decode caps {caps:?}, theta {rope_theta}",
+             decode reaches {:?}, prefill reaches {:?}, theta {rope_theta}",
             decode[0].m_cap,
             prefill
-                .as_ref()
+                .first()
                 .map_or_else(|| "none".to_string(), |p| format!("m={}", p.m_cap)),
             decode[0].layers.len(),
+            reaches(&decode),
+            reaches(&prefill),
         );
 
         Ok(Loaded {
@@ -2881,10 +2275,6 @@ impl SpyreWorker {
             hf_config,
             embed_tokens,
             hidden,
-            #[cfg(feature = "spyre-hw")]
-            head_dim,
-            #[cfg(feature = "spyre-hw")]
-            kv_dim,
             vocab,
             session,
             decode,
@@ -3020,224 +2410,6 @@ mod weight_scale_fold_tests {
     }
 }
 
-#[cfg(test)]
-mod weight_copy_tests {
-    use super::*;
-    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::oproj_headmajor_tid;
-
-    /// One staged fp8 o_proj-shaped weight as `stage_bound_weights` shapes it:
-    /// `(id, bytes, dtype, dims)`. The values are arbitrary — the copy is byte-for-byte
-    /// and dims-agnostic, which is the law under test.
-    fn oproj_row(id: usize, bytes: &[u8]) -> StagedWeight {
-        (id, bytes.to_vec(), SDType::Fp8E4m3, vec![4096, 4096])
-    }
-
-    /// Each listed copy is the COMPANION'S OWN ROW under the reserved tid — same bytes,
-    /// same dtype, same dims — because the permutation is not here: it happens at staging,
-    /// through the copy's own retile descriptor, so this is a source re-read, not a
-    /// transform. The companions and any neighbor keep their rows; the binding grows by
-    /// exactly the copy count.
-    #[test]
-    fn stages_each_copy_as_the_companions_own_bytes() {
-        let mut weights = vec![
-            oproj_row(9, &[1, 2, 3, 4, 5, 6, 7, 8]),  // layer 0's o_w
-            oproj_row(11, &[0, 0, 0, 0, 0, 0, 0, 0]), // the gate — no copy names it
-            oproj_row(21, &[9, 9, 9, 9]),             // layer 1's o_w (different bytes AND length)
-        ];
-        let copies = vec![
-            (9u32, oproj_headmajor_tid(9)),
-            (21u32, oproj_headmajor_tid(21)),
-        ];
-        materialize_weight_copies(&mut weights, &copies).expect("both copies stage");
-        assert_eq!(
-            weights.len(),
-            5,
-            "the binding grows by exactly the copy count"
-        );
-        for (from, to) in &copies {
-            let row = weights
-                .iter()
-                .find(|(id, ..)| *id == *to as usize)
-                .unwrap_or_else(|| panic!("the copy t{to} is staged"));
-            let companion = weights
-                .iter()
-                .find(|(id, ..)| *id == *from as usize)
-                .unwrap_or_else(|| panic!("the companion t{from} is staged"));
-            assert_eq!(
-                row.1, companion.1,
-                "t{to}: byte-for-byte — the shuffle is at staging, not here"
-            );
-            assert_eq!(row.2, companion.2, "t{to}: same dtype");
-            assert_eq!(row.3, companion.3, "t{to}: same dims");
-        }
-        // Append-only: the three staged rows are exactly what they were.
-        assert_eq!(weights[0], oproj_row(9, &[1, 2, 3, 4, 5, 6, 7, 8]));
-        assert_eq!(weights[1], oproj_row(11, &[0, 0, 0, 0, 0, 0, 0, 0]));
-        assert_eq!(weights[2], oproj_row(21, &[9, 9, 9, 9]));
-    }
-
-    /// A copy naming a companion the binding did not stage is a wiring↔mint desync —
-    /// refused with the tid in the message, never silently skipped, and the staged rows
-    /// are left alone.
-    #[test]
-    fn refuses_a_copy_naming_an_unstaged_companion() {
-        let mut weights = vec![oproj_row(9, &[1, 2, 3, 4])];
-        let err = materialize_weight_copies(&mut weights, &[(7u32, oproj_headmajor_tid(7))])
-            .expect_err("unstaged companion");
-        assert!(
-            err.to_string().contains("t7"),
-            "the refusal names the companion: {err}"
-        );
-        assert_eq!(
-            weights,
-            vec![oproj_row(9, &[1, 2, 3, 4])],
-            "a refusal leaves the staged rows alone"
-        );
-    }
-
-    /// A copy whose id the binding already staged is the mirror desync — the layout minted
-    /// a permuted copy for an id the binding owns. Refused rather than overwriting the
-    /// binding's own row.
-    #[test]
-    fn refuses_a_copy_whose_id_the_binding_already_staged() {
-        let to = oproj_headmajor_tid(9);
-        let mut weights = vec![oproj_row(9, &[1, 2, 3, 4]), oproj_row(to as usize, &[5, 6])];
-        let err = materialize_weight_copies(&mut weights, &[(9u32, to)])
-            .expect_err("copy id the binding owns");
-        assert!(
-            err.to_string().contains("already staged"),
-            "the refusal says what the collision is: {err}"
-        );
-        assert_eq!(
-            weights,
-            vec![oproj_row(9, &[1, 2, 3, 4]), oproj_row(to as usize, &[5, 6])],
-            "a refusal leaves the staged rows alone"
-        );
-    }
-}
-
-/// ⭐ THE DEFAULT-CONTEXT LAW, WIRED AT THE ARITHMETIC THAT DECIDES IT — the granite-3.1-2b
-/// case the law was decided on. The pool veto's site is card-only, but the number it refuses
-/// against and the number an unset flag resolves to are pure arithmetic over the shared pool
-/// vocabulary, so the wiring is pinned HERE: the affordable expression, the ONE predicate, and
-/// the demand the resolution produces, checked against the budget it was resolved from.
-#[cfg(test)]
-mod served_context_tests {
-    use super::*;
-    use scratchy_serving_engine::gpu_budget::{ServedContext, resolve_served_context};
-    use scratchy_subtile::sdsc_abstract::{AdmittedRequests, PoolDemand, PoolRows, SlotCount};
-
-    /// granite-3.1-2b's `max_position_embeddings`, from the checked-in config.
-    const GRANITE_2B_MAX_POS: usize = 131_072;
-    /// One page of granite-3.1-2b KV — the same stride the load derives from the bake's
-    /// `kv_dim`: three planes (Knat, V, Kᵀ) × 8 kv heads × head dim 64 (= kv_dim 512
-    /// features) × 256 plane slots × 2 B × 40 layers. The runtime's own report agrees:
-    /// `kvstride=786432` per layer, `page_stride=31457280`.
-    const GRANITE_2B_PAGE_BYTES: u64 = 3 * (8 * 64) * 256 * 2 * 40;
-    /// The pool is ONE allocation, so the budget that decides the default is a single flex
-    /// region (`bundle::MAX_SEGMENT_BYTES`) — whichever card is under it. This is why the
-    /// 2b's default over-runs: 131,072 tokens at two rows is 1,025 pages ≈ 32.2 GB, two
-    /// regions' worth.
-    const ONE_REGION_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-
-    /// `scr chat` declares `--max-num-seqs 1`; the width rounds UP to the ladder's smallest
-    /// rung, so a chat run's pool is cut for two launch rows.
-    fn chat_rows() -> PoolRows {
-        PoolRows::for_admission(AdmittedRequests::new(1).expect("1 is nonzero"))
-    }
-
-    #[test]
-    fn the_granite_2b_default_resolves_to_the_affordable_number_and_loads() {
-        let rows = chat_rows();
-        let affordable = affordable_context_tokens(ONE_REGION_BYTES, GRANITE_2B_PAGE_BYTES, rows);
-        // (16 GiB / 31,457,280 B − 1 reserve page) / 2 rows × 256 slots = 69,632 — the number
-        // the card prints from the same arithmetic. NOT the model's 131,072.
-        assert_eq!(affordable, 69_632);
-        assert!(
-            affordable < GRANITE_2B_MAX_POS as u64,
-            "the premise: one region cannot buy the 2b's default"
-        );
-        // THE LAW: the unset default resolves to the affordable number…
-        assert_eq!(
-            resolve_served_context(None, GRANITE_2B_MAX_POS, affordable as usize),
-            ServedContext::Tokens(affordable as usize),
-            "granite-2b's default 131072 resolves to what one region funds"
-        );
-        // …and an explicit over-budget ask refuses WITH that number as the computed advice.
-        assert_eq!(
-            resolve_served_context(
-                Some(GRANITE_2B_MAX_POS),
-                GRANITE_2B_MAX_POS,
-                affordable as usize
-            ),
-            ServedContext::Refused {
-                declared: GRANITE_2B_MAX_POS,
-                affordable: affordable as usize
-            }
-        );
-        // ⭐ THE RESOLUTION IS VETO-PROOF BY CONSTRUCTION: the pool demanded for exactly the
-        // affordable number fits the budget it was resolved from…
-        let need = |tokens: u64| {
-            PoolDemand::of_declaration(SlotCount::new(tokens as u32), rows)
-                .pages()
-                .expect("a region-scale declaration overflows no page count")
-                .get() as u64
-                * GRANITE_2B_PAGE_BYTES
-        };
-        assert!(
-            need(affordable) <= ONE_REGION_BYTES,
-            "the resolved pool fits: {} ≤ {}",
-            need(affordable),
-            ONE_REGION_BYTES
-        );
-        // …and one token MORE does not — the boundary is tight, so the resolution is the
-        // LARGEST context that re-passes the veto, never a rounded guess under it.
-        assert!(
-            need(affordable + 1) > ONE_REGION_BYTES,
-            "one token past the resolution busts the budget: {}",
-            need(affordable + 1)
-        );
-    }
-
-    /// The law's boundary IS the old veto's boundary: for every explicit declaration, the
-    /// predicate refuses exactly the declarations whose pool demand exceeds the budget — the
-    /// rewrite changed the unset branch only, never the refusal's edge.
-    #[test]
-    fn the_laws_boundary_is_the_old_vetos_boundary() {
-        let rows = chat_rows();
-        let affordable =
-            affordable_context_tokens(ONE_REGION_BYTES, GRANITE_2B_PAGE_BYTES, rows) as usize;
-        // 256 = one page; 257 crosses into a second; 65,792 = a deep in-budget ask;
-        // 69,632/69,633 straddle the resolution; 131,072 is the two-region ask.
-        for declared in [256_usize, 257, 4096, 65_792, 69_632, 69_633, 131_072] {
-            let demand = PoolDemand::of_declaration(SlotCount::new(declared as u32), rows)
-                .pages()
-                .expect("a region-scale declaration overflows no page count");
-            let need = demand.get() as u64 * GRANITE_2B_PAGE_BYTES;
-            let old_veto_fires = need > ONE_REGION_BYTES;
-            match resolve_served_context(Some(declared), GRANITE_2B_MAX_POS, affordable) {
-                ServedContext::Refused { .. } => {
-                    assert!(old_veto_fires, "{declared}: refused inside the budget");
-                }
-                ServedContext::Tokens(served) => {
-                    assert!(!old_veto_fires, "{declared}: served past the budget");
-                    assert_eq!(served, declared, "{declared}: verbatim inside the budget");
-                }
-            }
-        }
-    }
-}
-
-/// ⭐ THE WEIGHT SETS THIS BINARY CARRIES FIT ONE DEVICE REGION — read off the bundles it baked.
-///
-/// The segment budget's verdict is a field of every baked layout (`WeightTail`), so whether a model's
-/// weights spilled is a property of the binary, not of a serve log. MEASURED on granite-3.1-8b fp16:
-/// padding its gate/up to 224 sticks pushed the weight set past 16 GiB, spilled the 400 MiB tied
-/// embedding into seg6, and put 12,000 MB of per-session copies on the card — memory and load time,
-/// found in a serve log (the decode slowdown that build also had was the pad's own trip count, not
-/// the spill; see `WeightTail`). That model is the one this crate's CI scope bakes
-/// (`scratchy-models/granite-3.1-8b-instruct`), so a width or layout change that pushes it back over
-/// the region fails here, at `cargo test`, instead of on a card.
 #[cfg(test)]
 mod weight_tail_tests {
     use scratchy_target_spyre::bundle_code::{WeightTail, bundle, registered_fps};

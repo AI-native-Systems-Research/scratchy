@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE THIRTY CONFIGURATIONS, STATED ONCE.
+//! THE TWENTY-FIVE CONFIGURATIONS, STATED ONCE.
 //!
 //! A "configuration" is a `.py` fixture plus the `tl.constexpr` values and the launch grid it is
 //! compiled at. Three consumers need that tuple: `examples/bake_py` (the dxp bake),
@@ -41,12 +41,6 @@ pub const ALL: &[&str] = &[
     "decoder_layer_one_flat",
     "decoder_two_layers",
     "decoder_two_layers_flat",
-    // Attention, through `attn_fwd_noncausal` (fixture delta 11 -- the four-pointer entry point;
-    // see the `case` arm for why a five-pointer noncausal launch is a handoff refusal), and the
-    // causal two-stage split through `attn_fwd` itself.
-    "attention_flash_noncausal",
-    "attention_flash_noncausal_1tile",
-    "attention_flash_causal",
     // ⭐ fp8 W8A8, the WEIGHT-QUANTIZED matmul -- scratchy's card-proven chain reached
     // through the arity-3 `matmul_oriented` door (A, W_fp8, w_scale over a view whose
     // `Dtype` is `Fp8E4m3`). `Program::Matmul` is the per-`Program` door, which hands
@@ -66,18 +60,6 @@ pub const ALL: &[&str] = &[
     "matmul_tiled",
     // ⭐ RUNG 4, the gathered CONTRACTION (see the `paged_score_small` case row).
     "paged_score_small",
-    // ⭐ TASK 27: rung 4 AROUND A FULL ONE-BLOCK FLASH STEP (see the `paged_attention_small`
-    // case row).
-    "paged_attention_small",
-    // ⭐ TASK 28: the multi-block sweep — block table on device, flash recurrence carried
-    // across blocks (see the `paged_attention_multiblock` case row).
-    "paged_attention_multiblock",
-    // ⭐ THE DOUBLE-UNROLL COUNT TWIN — the production paged-decode body at two grid
-    // depths over the same kernel (see the `attention_banded_*` case rows): 32
-    // positions is the fold path, 64 crosses the 32-core bound into two trips per
-    // core, where `unroll_grid_positions` must count `n * trips` tiles to see the
-    // partitioned parameters. The `to_ktir.rs` count fix's gate.
-    "attention_banded_fold",
     // ⭐ PROBE-ONLY (front-b-noise, auditor order 2026-10-26): the on-card noise
     // hash STANDALONE — the sampler's noise section verbatim with `u` and `g`
     // stored as outputs instead of consumed by the draw. 2^20 lanes in ONE
@@ -94,7 +76,12 @@ pub const ALL: &[&str] = &[
     // shape; the verdict is a host bit-for-bit compare of the `[1, 512]` sum.
     // NOT a production configuration: delete with the probe.
     "int_bcast",
-    "attention_banded_batch",
+    // ⭐ THE PROMPT CHUNK'S KV WRITE, from the card's own kernel (`kernels/` — see the row): a
+    // 20-token prompt's 160 index entries, five scatter ops of 32, the first card runs' lead.
+    "paged_kv_write_prompt",
+    // ⭐ THE PROMPT CHUNK'S ATTENTION, from the card's own kernel: the same 20-token chunk's walk
+    // over its one page (see the row).
+    "paged_attn_prefill_prompt",
 ];
 
 pub fn root() -> PathBuf {
@@ -128,6 +115,27 @@ pub fn spec(fixture: &str, kernel: &str, ptrs: &[(&str, &str)], ces: &[(&str, Va
             .join(format!("{fixture}.py"))
             .to_string_lossy()
             .to_string(),
+    }
+}
+
+/// [`spec`] for one of the card's own kernels (`crates/targets/spyre/kernels/<kernel_file>.py`):
+/// the paged step's kernels are the production ones, and a fixture copy would be a second
+/// statement of them.
+pub fn kernel_spec(
+    kernel_file: &str,
+    kernel: &str,
+    ptrs: &[(&str, &str)],
+    ces: &[(&str, Val)],
+) -> KernelSpec {
+    KernelSpec {
+        file: root()
+            .parent()
+            .expect("crates/triton sits under crates/")
+            .join("targets/spyre/kernels")
+            .join(format!("{kernel_file}.py"))
+            .to_string_lossy()
+            .to_string(),
+        ..spec(kernel_file, kernel, ptrs, ces)
     }
 }
 
@@ -460,58 +468,6 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             vec![1],
             Program::Matmul,
         ),
-        // ⭐ ATTENTION, THE ONE KERNEL THIS TABLE HAD NO ROW FOR — so no attention descriptor has
-        // ever gone down the from-source ladder (`bake_py`), only the ttir-golden path that
-        // `drive`/`bake` take. The constexprs and grid are `test/experiment1/index.json`'s own for
-        // these two configurations, values included rather than defaulted: `sm_scale` is delta 9
-        // (a `tl.constexpr`, because a runtime scale still refuses by name) and `STAGE` is what
-        // separates them — 1 is non-causal, 3 is the causal two-stage split.
-        //
-        // ⛔ AND THE TWO ROWS NAME DIFFERENT KERNELS, WHICH IS NOT A TIDY-UP. The non-causal
-        // configuration never loads the mask (the inner gets `4 - STAGE == 3`), so a five-pointer
-        // signature leaves parameter 4 addressed by nothing and `every_parameter_states_its_width`
-        // red-stops — correctly, because the consumer numbers buffers BY PARAMETER POSITION and a
-        // trailing hole would silently renumber every buffer after it. `attn_fwd_noncausal` is the
-        // fixture's FOUR-pointer entry point (delta 11): a `@triton.jit` wrapper that `make_ttir`'s
-        // `inline_calls` inlines, so the ops that reach the emitter are `attn_fwd`'s own.
-        "attention_flash_noncausal" => (
-            spec(
-                "attention_flash",
-                "attn_fwd_noncausal",
-                ATTN_NONCAUSAL,
-                &attn_ce(1),
-            ),
-            vec![4, 4],
-            Program::Attn,
-        ),
-        // ⭐ THE ONE-TILE FORM OF THE SAME KERNEL — the whole recurrence at the smallest launch that
-        // states it. `attn_ce(1)` is untouched (N_CTX=256, BLOCK_M=BLOCK_N=64), so this is ONE query
-        // block sweeping ALL FOUR KV blocks: the flash recurrence with real per-trip windows, live
-        // accumulator threading (`decompose_matmul_accumulators`' exact case), and `desc_q`/`desc_o`
-        // windows at the buffer base. The grid is the ONLY difference from the row above.
-        //
-        // ⛔ AND THAT DIFFERENCE IS A MEASURED WALL, NOT A TUNING CHOICE. At grid [4,4]=16 the
-        // Q/O window corners root at `KtdpGetComputeTileId` (`remui(ctid,4)` → `start_m`), and the
-        // whole-function door resolves window corners through `index_constants`, which sees only
-        // `arith.constant` (and casts of one). A grid-derived corner has no descriptor spelling
-        // through this door — that is the next attention item, and it is OURS. This row exists so
-        // everything ELSE attention needs is proven first: it bakes what the 16-tile launch cannot,
-        // and the 16-tile launch is one `vec![4,4]` edit away once the corner wall falls.
-        "attention_flash_noncausal_1tile" => (
-            spec(
-                "attention_flash",
-                "attn_fwd_noncausal",
-                ATTN_NONCAUSAL,
-                &attn_ce(1),
-            ),
-            vec![1, 1],
-            Program::Attn,
-        ),
-        "attention_flash_causal" => (
-            spec("attention_flash", "attn_fwd", ATTN, &attn_ce(3)),
-            vec![4, 4],
-            Program::Attn,
-        ),
         // ⭐ fp8 W8A8 AT THE SMALL TWIN'S SHAPES -- the whole contract is the four
         // buffers (x f16 [M,K], w PACKED fp8 [N,K], ws f16 [1,N], o f16 [M,N]) and the
         // kernel body's spelled dequant (see the fixture's own delta list). The
@@ -644,109 +600,6 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             vec![1],
             Program::Matmul,
         ),
-        // ⭐⭐⭐ TASK 27 — PAGED FLASH ATTENTION, THE ONE-BLOCK STEP: the full flash body
-        // around rung 4's gathered V-leg contraction. The block table (`desc_ids`) picks
-        // the V rows at runtime; the score matmul runs over a HOST-PRESENTED Kt plane
-        // (the shipped attention's third physical plane, because a transposed gather is
-        // arch-refused and two gathers in one program are refused by `gather_of`); both
-        // softmax reductions sit on the tutorial's [M, N] tile at one stick of KV; the
-        // value contraction is `tl.dot(p, v_rows)` verbatim. ONE launch = ONE KV block =
-        // 64 rows, so the block recurrence is the caller's loop. Multi-dot, so
-        // `dot_to_linalg` leaves every dot UNTAGGED (no canonical verifier runs — that
-        // gate is single-dot-only) and the whole-function door (`KTIR_WHOLE=1`) walks the
-        // ops. `Program::Matmul` is stated per the constructor's demand; the walk never
-        // reads it. Geometry: the paged_score floors (K=64 gathered rows, M=8+,
-        // HEAD_DIM=64) plus the attention BLOCK_M floor of 64 (a reduce at rows==1 has
-        // no per-row split to refuse; BLOCK_M=64 keeps the score tile square at one
-        // stick per axis, the smallest shape every floor admits at once).
-        "paged_attention_small" => (
-            spec(
-                "paged_attention",
-                "paged_attn_fwd",
-                &[
-                    ("desc_q", "*fp16"),
-                    ("desc_kt", "*fp16"),
-                    ("desc_v", "*fp16"),
-                    ("desc_ids", "*i32"),
-                    ("desc_o", "*fp16"),
-                ],
-                &[
-                    ("N_CTX", Val::Int(64)),
-                    ("HEAD_DIM", Val::Int(64)),
-                    ("V", Val::Int(1024)),
-                    ("BLOCK_M", Val::Int(64)),
-                ],
-            ),
-            vec![1],
-            Program::Matmul,
-        ),
-        // ⭐ TASK 28: the paged form PROPER — the KV sweep over a DEVICE-RESIDENT block
-        // table with the flash recurrence (m, l, acc) carried across blocks in ONE
-        // program. `unroll_constant_trip_loops` turns the sweep into straight-line
-        // trips (the same mechanism the dense 16-tile form card-verified), each trip
-        // loading its block-table row at a CONSTANT corner (`[b*BLOCK_N]`) and each
-        // carrying its OWN gather of the V rows through those indices — so what is new
-        // relative to the dense form is a gather per unrolled trip, and what is new
-        // relative to `paged_attention_small` is the recurrence and the per-block index
-        // slices. Two blocks of 64: the smallest shape that has an INTERIOR join (trip
-        // 0's yield feeding trip 1's carry), the property the one-block form cannot
-        // test. The Kt plane is `[HEAD_DIM, NUM_BLOCKS*BLOCK_N]`, block t's K^T in
-        // column block t, host-pre-transposed at page fill.
-        "paged_attention_multiblock" => (
-            spec(
-                "paged_attention_multiblock",
-                "paged_attn_multiblock_fwd",
-                &[
-                    ("desc_q", "*fp16"),
-                    ("desc_kt", "*fp16"),
-                    ("desc_v", "*fp16"),
-                    ("desc_table", "*i32"),
-                    ("desc_o", "*fp16"),
-                ],
-                &[
-                    ("NUM_BLOCKS", Val::Int(2)),
-                    ("BLOCK_N", Val::Int(64)),
-                    ("HEAD_DIM", Val::Int(64)),
-                    ("V", Val::Int(1024)),
-                    ("BLOCK_M", Val::Int(64)),
-                ],
-            ),
-            vec![1],
-            Program::Matmul,
-        ),
-        // ⭐ THE DOUBLE-UNROLL COUNT TWIN — `banded_attn_fwd` is the production
-        // paged-decode arm's body at granite-3.1-2b's real decode geometry (GQA=4,
-        // HD=64, a two-page sweep), minus the mask and segment corners the count wall
-        // does not live in. The TWO ROWS are the SAME KERNEL at two `NUM_SEQS`: the
-        // only structural difference is how many grid positions the launch asks for,
-        // which is exactly the knob `fold_grid_work_loop` turns on.
-        //
-        // THE FOLD ROW, `(1, 8, 4)` = 32 positions — exactly the 32-core fold bound.
-        // The whole grid fits in one trip per core: the positions become the loop's
-        // work items and each keeps its own delinearised corners. This row BAKES
-        // before the count fix and must bake IDENTICALLY after it — it is the control
-        // that the fix changes only the multi-trip count, nothing in the fold path.
-        //
-        // ⛔ THE BATCH ROW, `(2, 8, 4)` = 64 positions, IS THE WALL. Two trips per
-        // core: `fold_grid_work_loop`'s unroll arm regrids the launch to
-        // `[num_cores]` while the body carries two copies per landmark value, and
-        // `unroll_grid_positions`' partitioned-parameter count must then expect
-        // `n * trips` tiles at row corners that vary. Before the fix it expects `n`,
-        // sees `2n`, and NOTHING materializes — the door's refusal chain ends at the
-        // epilogue divide's extent check. After the fix this row BAKES at exactly
-        // twice the fold row's op count.
-        //
-        // ⛔ AND THE CORNERS MUST STAY DELINEARISED. A `GQA=1` simplification (a
-        // grid of `(NUM_SEQS, NKVH, 1)` with purely affine corners) would NOT fire
-        // the gate: `uniform_grid_corners` runs BEFORE `unroll_grid_positions` and
-        // claims every corner affine in a grid landmark as a per-core uniform, which
-        // removes the very computed corners this row exists to carry. The pids stay
-        // three, the div/mod stays in the row arithmetic, and the multi-dot body
-        // stays multi-dot so `dot_to_linalg`'s single-dot canonical verifiers (which
-        // refuse a computed A-offset) never gate it — the same exemption the
-        // production kernel rides.
-        "attention_banded_fold" => (banded_attn_spec(1), vec![1, 8, 4], Program::Attn),
-        "attention_banded_batch" => (banded_attn_spec(2), vec![2, 8, 4], Program::Attn),
         // ⭐ PROBE-ONLY (front-b-noise): the noise-hash standalone — see the ALL-list
         // comment. `Program::Sample` rides the sampler's door arm; ONE program, ONE
         // whole row — B=1, PAD_V=2^20 (2^20 lanes in width, not in rows: a B>1 grid
@@ -760,6 +613,64 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // fptosi exits). No selection: the walk's Reduce arm cannot lower a wide
         // f32 reduce (the partials law), and the auditor's statistics are
         // host-side reads of u and g.
+        // ⭐ spyre-inference's `reshape_and_cache_head_major` writing a 20-token prompt chunk of 8
+        // kv heads at head dim 64 into a four-page-per-head pool: 160 index entries, `h · 20 + t`,
+        // cut into five scatter ops of 32 for K and for V — the cut a decode step's 8 entries never
+        // make. Bind `row_index` raw (int32) and read `k_rows` / `v_rows` back.
+        "paged_kv_write_prompt" => (
+            kernel_spec(
+                "reshape_and_cache_head_major",
+                "reshape_and_cache_head_major_kernel",
+                &[
+                    ("key", "*fp16"),
+                    ("value", "*fp16"),
+                    ("k_rows", "*fp16"),
+                    ("v_rows", "*fp16"),
+                    ("row_index", "*i32"),
+                ],
+                &[
+                    ("T", Val::Int(20)),
+                    ("NUM_KV_HEADS", Val::Int(8)),
+                    ("HEAD_SIZE", Val::Int(64)),
+                    ("NUM_ROWS", Val::Int(4 * 8 * 64)),
+                ],
+            ),
+            vec![1],
+            Program::PagedKvWrite,
+        ),
+        // ⭐ spyre-inference's `page_attn_head_major_prefill_kernel` over the same 20-token prompt
+        // chunk at granite-3.1-2b's heads (32 query heads over 8 kv heads at head dim 64): its rows
+        // gathered by `query_row_index`, its one page read through the page table, the mask
+        // stack's causal tile, and the output scattered back by `query_row_index`. One block, so the
+        // walk is straight-line.
+        "paged_attn_prefill_prompt" => (
+            kernel_spec(
+                "page_attn_head_major_prefill",
+                "page_attn_head_major_prefill_kernel",
+                &[
+                    ("query", "*fp16"),
+                    ("query_row_index", "*i32"),
+                    ("k_pages", "*fp16"),
+                    ("v_pages", "*fp16"),
+                    ("page_index_table", "*i32"),
+                    ("mask_stack", "*fp16"),
+                    ("out", "*fp16"),
+                ],
+                &[
+                    ("NUM_TOKENS", Val::Int(20)),
+                    ("NUM_HEADS", Val::Int(32)),
+                    ("NUM_KV_HEADS", Val::Int(8)),
+                    ("HEAD_SIZE", Val::Int(64)),
+                    ("BLOCK_SIZE", Val::Int(64)),
+                    ("NUM_PAGES", Val::Int(4)),
+                    ("NUM_BLOCKS", Val::Int(1)),
+                    ("PADDED_QUERY_LEN", Val::Int(20)),
+                    ("SCALE", Val::Float(0.125)),
+                ],
+            ),
+            vec![1],
+            Program::PagedAttn,
+        ),
         "hash_noise" => (
             spec(
                 "hash_noise_probe",
@@ -1144,80 +1055,6 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
     })
 }
 
-/// Attention's buffers for the CAUSAL configuration. `desc_mask` is delta 10 — the PREPARED
-/// additive causal mask, because there is no lane-wise integer compare on this device.
-const ATTN: &[(&str, &str)] = &[
-    ("desc_q", "*fp16"),
-    ("desc_k", "*fp16"),
-    ("desc_v", "*fp16"),
-    ("desc_o", "*fp16"),
-    ("desc_mask", "*fp16"),
-];
-
-/// Attention's buffers for the NON-CAUSAL configuration — the same four, WITHOUT the mask, because
-/// STAGE 1 never loads it and an unaddressed parameter is a handoff refusal (see the case row).
-const ATTN_NONCAUSAL: &[(&str, &str)] = &[
-    ("desc_q", "*fp16"),
-    ("desc_k", "*fp16"),
-    ("desc_v", "*fp16"),
-    ("desc_o", "*fp16"),
-];
-
-/// Attention's constexprs at `index.json`'s geometry, with `STAGE` the only difference between the
-/// two configurations.
-fn attn_ce(stage: i128) -> Vec<(&'static str, Val)> {
-    vec![
-        ("sm_scale", Val::Float(1.0)),
-        ("Z", Val::Int(1)),
-        ("H", Val::Int(4)),
-        ("N_CTX", Val::Int(256)),
-        ("HEAD_DIM", Val::Int(128)),
-        ("BLOCK_M", Val::Int(64)),
-        ("BLOCK_N", Val::Int(64)),
-        ("GQA", Val::Int(2)),
-        ("STAGE", Val::Int(stage)),
-    ]
-}
-
-/// The double-unroll count twin's buffers, in `banded_attn_fwd`'s parameter order — the
-/// production decode arm's own five: q/o rows, the transposed K plane, the V pool, and
-/// the i32 row-id table the V gather rides. No mask: the twin has no segment corners.
-const BANDED_ATTN: &[(&str, &str)] = &[
-    ("desc_q", "*fp16"),
-    ("desc_o", "*fp16"),
-    ("desc_kt", "*fp16"),
-    ("desc_v", "*fp16"),
-    ("desc_v_ids", "*i32"),
-];
-
-/// `banded_attn_fwd`'s constexprs at granite-3.1-2b's decode geometry — the production
-/// arm's own numbers (NQH=32, NKVH=8, GQA=4, HD=64, PAGES=2, PAGE_SLOTS=256, the 0.125
-/// scale) — with `NUM_SEQS` the parameter the two rows differ on: 1 lands the
-/// `(1, 8, 4)` grid exactly on the 32-core fold bound, 2 crosses it into two trips.
-fn banded_attn_ce(num_seqs: i128) -> Vec<(&'static str, Val)> {
-    vec![
-        ("NUM_SEQS", Val::Int(num_seqs)),
-        ("NQH", Val::Int(32)),
-        ("NKVH", Val::Int(8)),
-        ("HD", Val::Int(64)),
-        ("GQA", Val::Int(4)),
-        ("PAGES", Val::Int(2)),
-        ("PAGE_SLOTS", Val::Int(256)),
-        ("SCALE", Val::Float(0.125)),
-    ]
-}
-
-/// The double-unroll count twin's `KernelSpec` — `banded_attn_fwd` at
-/// [`banded_attn_ce`]'s geometry for the given sequence count.
-fn banded_attn_spec(num_seqs: i128) -> KernelSpec {
-    spec(
-        "banded_attn",
-        "banded_attn_fwd",
-        BANDED_ATTN,
-        &banded_attn_ce(num_seqs),
-    )
-}
-
 const SWIGLU: &[(&str, &str)] = &[
     ("desc_x", "*fp16"),
     ("desc_wg", "*fp16"),
@@ -1382,7 +1219,7 @@ mod tests {
         }
         assert_eq!(
             super::ALL.len(),
-            30,
+            25,
             "a configuration was added or removed: update ALL (and the module title) deliberately"
         );
     }

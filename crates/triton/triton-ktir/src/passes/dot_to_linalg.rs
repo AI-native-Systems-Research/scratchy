@@ -182,28 +182,26 @@ pub fn run(module: &mut Module) -> Result<()> {
         // orientation. The transposed-B fold below is a PRESENTED-WEIGHT law (the host
         // stages the bytes); a batched operand is an in-register computed value (the
         // gathered, reshaped page tile), which has no host to place a transposition, so a
-        // `.T` on a rank-3 operand is not folded -- it is REFUSED, the same law as the
-        // gathered K leg. The fp8 widening is refused for the same reason: the W8A8 door is
-        // the rank-2 standalone contract's own, and no batched form of it is stated.
+        // `tt.trans` on a rank-3 operand is NOT FOLDED: it stays the op it is, and
+        // `to_ktir`'s `convert_trans` lowers it to a real `linalg.transpose`, whose result
+        // the batch matmul reads in the standard orientation (spyre-inference's
+        // `torch.matmul(q, k_page.permute(0, 2, 1))`). The fp8 widening is refused: the
+        // W8A8 door is the rank-2 standalone contract's own, and no batched form of it is
+        // stated.
         if batched {
             let (da, db, dd) = (
                 da.expect("batched implies rank-3 dims"),
                 db.expect("batched implies rank-3 dims"),
                 dd.expect("batched implies rank-3 dims"),
             );
-            let widened = |v: Ssa| {
-                index
-                    .def_of(v)
-                    .is_some_and(|o| o.kind == OpKind::ArithExtf || o.kind == OpKind::TtTrans)
-            };
+            let widened = |v: Ssa| index.def_of(v).is_some_and(|o| o.kind == OpKind::ArithExtf);
             if widened(dot.operands[0]) || widened(dot.operands[1]) {
                 return Err(Refusal::new(
                     PASS,
-                    "a rank-3 tt.dot operand reaches the dot through an `arith.extf` or a \
-                     `tt.trans`: the fp8 W8A8 widening and the transposed-B fold are \
-                     rank-2 presented-weight laws (the host stages those bytes), and no \
-                     batched form of either is stated. Present the batched operands as \
-                     f16 values in the standard [b, M, K] / [b, K, N] orientation",
+                    "a rank-3 tt.dot operand reaches the dot through an `arith.extf`: the \
+                     fp8 W8A8 widening is a rank-2 presented-weight law (the host stages \
+                     those bytes), and no batched form of it is stated. Present the batched \
+                     operands as f16 values",
                 ));
             }
             if da[0] != db[0] || da[0] != dd[0] {
@@ -1960,21 +1958,42 @@ module {
         }
     }
 
-    /// CONTROL — a batched operand through a `tt.trans`: the transposed-B fold is
-    /// a PRESENTED-WEIGHT law (the host stages the bytes), and a batched operand
-    /// is an in-register computed value with no host to place a transposition.
+    /// A batched operand through a `tt.trans` is NOT FOLDED: the transposed-B fold
+    /// is a PRESENTED-WEIGHT law (the host stages the bytes), and a batched operand
+    /// is an in-register computed value with no host to place a transposition. The
+    /// `tt.trans` stays the op it is (`to_ktir` lowers it to a real
+    /// `linalg.transpose`), and the batch matmul reads its result in the standard
+    /// orientation, with no maps of its own.
     #[test]
-    fn a_batched_operand_through_a_trans_is_refused() {
+    fn a_batched_operand_through_a_trans_is_not_folded() {
         let src = BATCHED.replacen(
             "    %o = tt.dot %a, %b, %cst",
             "    %bt = tt.trans %b : tensor<8x64x64xf16> {order = array<i32: 0, 2, 1>}\n    %o = tt.dot %a, %bt, %cst",
             1,
         );
         let mut m = parse::parse(&src).unwrap();
-        let e = run(&mut m).unwrap_err();
+        run(&mut m).expect("the batched dot through a trans must lower, not be refused");
+        let trans: Vec<Ssa> = m
+            .ops_deep()
+            .into_iter()
+            .filter(|op| op.kind == OpKind::TtTrans)
+            .filter_map(|op| op.results.first().copied())
+            .collect();
+        assert_eq!(trans.len(), 1, "the trans survives as its own op");
+        let bmm: Vec<_> = m
+            .ops_deep()
+            .into_iter()
+            .filter(|op| op.kind == OpKind::Other("linalg.batch_matmul".into()))
+            .collect();
+        assert_eq!(bmm.len(), 1, "the dot lowered");
+        assert_eq!(
+            bmm[0].operands.get(1),
+            Some(&trans[0]),
+            "the batch matmul reads the transposed value"
+        );
         assert!(
-            e.message.contains("rank-2 presented-weight laws"),
-            "the trans refusal must name the law; got {e}"
+            bmm[0].attr(&AttrKey::IndexingMaps).is_none(),
+            "no transposed-B map is folded onto a batched operand"
         );
     }
 
@@ -1996,7 +2015,7 @@ module {
         let mut m = parse::parse(&src).unwrap();
         let e = run(&mut m).unwrap_err();
         assert!(
-            e.message.contains("rank-2 presented-weight laws"),
+            e.message.contains("rank-2 presented-weight law"),
             "the extf refusal must name the law; got {e}"
         );
     }

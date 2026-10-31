@@ -248,7 +248,18 @@ pub enum Program {
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].
     LmLast,
     Rope,
-    Attn,
+    /// PAGED ATTENTION — `kernels/page_attn_head_major_decode.py` / `_prefill.py`, spyre-inference's
+    /// head-major online-softmax page walk: each active block's page is read from the page index
+    /// table and its K and V GATHERED from the pools (`ktdp.construct_indirect_access_tile` loads).
+    /// Their parameters, in their order: `query`, `query_row_index`, the K pool, the V pool, the
+    /// page index table, `kv_row_pool` (the decode kernel's), the mask stack, `out`. The paged form's
+    /// SuperDSC lowering is the generic whole-function route.
+    PagedAttn,
+    /// THE PAGED KV CACHE WRITE — `kernels/reshape_and_cache_head_major.py`, spyre-inference's
+    /// `reshape_and_cache_head_major`: this step's K and V rows SCATTERED into the pools
+    /// (`ktdp.store` through an indirect access tile). Their parameters: `key`, `value`, the K pool,
+    /// the V pool, the per-kv-head row index.
+    PagedKvWrite,
     /// A 2-D BLOCK TRANSPOSE of a whole tensor — `[mb, out]` → `[out, mb]`, one
     /// `interslicetranspose_fp16` on the PT unit. See
     /// [`transpose`](crate::emit::lower_ktir_to_superdsc::transpose).
@@ -632,7 +643,17 @@ pub struct KtirNode {
     /// A `Mutex` and not a `RefCell` because the splice's whole-function memo holds
     /// `KtirNode` in a process-wide `static` and requires `Sync`. The clone the memo hands
     /// each rung carries the record BY CONTENTS — see the manual `Clone` below.
-    pub minted: std::sync::Mutex<std::collections::HashMap<ktir_core::ir::Ssa, u32>>,
+    pub minted: std::sync::Mutex<std::collections::HashMap<MintKey, u32>>,
+}
+
+/// What a node's lowering mints an intermediate for ([`KtirNode::minted`]): an SSA value's own
+/// buffer, or the `n`th scratch the lowering of that value takes beside it — a relayout's middle
+/// frame, a gather's landing — which no value of the program names, and which the declare pass and
+/// the real pass must still find under one name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MintKey {
+    Value(ktir_core::ir::Ssa),
+    Scratch(ktir_core::ir::Ssa, u8),
 }
 
 impl Clone for KtirNode {

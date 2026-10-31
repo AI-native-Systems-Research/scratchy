@@ -1993,6 +1993,19 @@ impl ExUnit {
 /// of 64 ⇒ the per-core LX chunk is ALWAYS a multiple of 128, independent of the
 /// other dims' extents. So invalid IR is unconstructible — no emit-time assert and
 /// no grep of generated JSON is needed downstream.
+/// ⭐ HOW AN OP'S VIEW OF A TENSOR PRESENTS THE TENSOR'S OWN FRAME — for the arrangement authority,
+/// which compares every op's arrangement of one tensor in that tensor's frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewFrame {
+    /// The view is the tensor's own frame: its arrangement is the view's ([`StickLayout::for_view_df`]).
+    Own,
+    /// The view iterates the STICK COLUMNS of a stick-major `[R, C·L]` tensor in order —
+    /// `[stick column, row, lane]`, which the view classifies as the row-major `[C, R·L]` of the same
+    /// bytes (a stick permute's stick-major side). The tensor's arrangement is derived from it
+    /// ([`StickLayout::of_stick_columns`]).
+    StickColumns,
+}
+
 #[derive(Clone, Debug)]
 pub struct TensorArg<const D: usize> {
     is_input: bool,
@@ -2034,6 +2047,18 @@ pub struct TensorArg<const D: usize> {
     /// `phys`, not the op's logical extent, mirroring torch-spyre's `strides[dim] = strides[dim] //
     /// dev_dim_size * it_dim_size` rescale exactly. Set via [`TensorArg::with_device_extent`].
     device_extent: [Option<u32>; D],
+    /// How this view presents the tensor's own frame, for the arrangement authority ([`ViewFrame`]).
+    frame: ViewFrame,
+    /// ⭐ THE ORDER dxp READS THIS TENSOR'S DIMS IN, when it is not `layout`'s. dxp takes
+    /// `layoutDimOrder_` INNERMOST-first (entry `i`'s stride is the product of the entries before it,
+    /// `dsc/dsc2.cpp:2971-2979`), while `layout` here is this emitter's own address frame, outermost
+    /// first. A one-row-dim view reads the same either way. A view with TWO row dims, e.g. the stick
+    /// permute's `[y, mb, out]`, has its row dims swapped by dxp unless the order is given reversed.
+    /// MEASURED: the prompt mask add's `["y","mb","out"]` wrote sticks `21c + 32m` on the card, `y`
+    /// walked innermost. `None` = dxp reads `layout` as written. Set via
+    /// [`TensorArg::with_device_order`]; it reaches only the JSON (`layoutDimOrder_`, `maxDimSizes_`),
+    /// never this emitter's start addresses.
+    device_order: Option<[&'static str; D]>,
 }
 
 impl<const D: usize> TensorArg<D> {
@@ -2081,7 +2106,37 @@ impl<const D: usize> TensorArg<D> {
             df: Df::Fp16,
             row_blocked: false,
             device_extent: [None; D],
+            frame: ViewFrame::Own,
+            device_order: None,
         })
+    }
+
+    /// State the order dxp reads this tensor's dims in — innermost first — when it is not `layout`'s
+    /// (see the `device_order` field). `order` must be a permutation of `layout` (a `cargo build`
+    /// `Err` otherwise). Chains off [`TensorArg::new`].
+    pub fn with_device_order(
+        mut self,
+        order: [&'static str; D],
+    ) -> Result<TensorArg<D>, SuperDscError> {
+        let mut sorted = order;
+        let mut want = self.layout;
+        sorted.sort_unstable();
+        want.sort_unstable();
+        if sorted != want {
+            return Err(SuperDscError(format!(
+                "TensorArg '{}': device order {order:?} is not a permutation of layout {:?}",
+                self.name, self.layout
+            )));
+        }
+        self.device_order = Some(order);
+        Ok(self)
+    }
+
+    /// State how this view presents the tensor's own frame (see [`ViewFrame`]). Chains off
+    /// [`TensorArg::new`].
+    pub fn with_frame(mut self, frame: ViewFrame) -> TensorArg<D> {
+        self.frame = frame;
+        self
     }
 
     /// Set the SLICE offset (elements along the stick axis) — a builder that reads
@@ -2164,6 +2219,28 @@ pub struct ArgView<'a> {
     /// Per-`layout`-dim physical device extent override (torch-spyre `arg.device_size`) — `None` means
     /// "physical extent == this op's own iteration extent for that dim" (see [`TensorArg::device_extent`]).
     pub device_extent: &'a [Option<u32>],
+    /// How the view presents the tensor's own frame ([`ViewFrame`]).
+    pub frame: ViewFrame,
+    /// The order dxp reads the dims in, innermost first, when it is not `layout`'s (see
+    /// [`TensorArg`]'s `device_order`).
+    pub device_order: Option<&'a [&'static str]>,
+}
+
+impl ArgView<'_> {
+    /// Where each dim of the stated device order sits in `layout` — entry `i` is the `layout` position
+    /// of the `i`-th dim dxp reads — or `None` when the view states no order of its own. The per-dim
+    /// arrays the JSON carries for this tensor (`layoutDimOrder_`, `maxDimSizes_`, `scale_`) are laid
+    /// in this order, so all three read it from here. (dxp indexes `scale_` by the op's primary
+    /// OUTPUT order; every op that states an order gives its operands the output's, or all-`Active`
+    /// scales, so the tensor's own order is that one.)
+    pub fn device_positions(&self) -> Option<Vec<usize>> {
+        self.device_order.map(|order| {
+            order
+                .iter()
+                .filter_map(|d| self.layout.iter().position(|l| l == d))
+                .collect()
+        })
+    }
 }
 
 impl AnyTensorArg {
@@ -2363,6 +2440,8 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                frame: t.frame,
+                device_order: t.device_order.as_ref().map(|o| o.as_slice()),
             },
             AnyTensorArg::R2(t) => ArgView {
                 is_input: t.is_input,
@@ -2377,6 +2456,8 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                frame: t.frame,
+                device_order: t.device_order.as_ref().map(|o| o.as_slice()),
             },
             AnyTensorArg::R3(t) => ArgView {
                 is_input: t.is_input,
@@ -2391,6 +2472,8 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                frame: t.frame,
+                device_order: t.device_order.as_ref().map(|o| o.as_slice()),
             },
             AnyTensorArg::R4(t) => ArgView {
                 is_input: t.is_input,
@@ -2405,6 +2488,8 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                frame: t.frame,
+                device_order: t.device_order.as_ref().map(|o| o.as_slice()),
             },
         }
     }
@@ -3430,6 +3515,32 @@ impl OpSpec {
         gather: GatherIndex,
         value_idx: usize,
     ) -> Option<IndirectAccess> {
+        let out_idx = self.args.len().saturating_sub(1);
+        if value_idx >= self.args.len() || value_idx == out_idx {
+            return None;
+        }
+        self.attach_index(gather, value_idx)
+    }
+
+    /// ⭐⭐⭐ MAKE THE OUTPUT A SCATTERED WRITE: insert an index operand before the output and declare
+    /// the output the pair's VALUE — the write through an index that [`Self::attach_gather_index`]
+    /// refuses. The vendor's own `dxp/test/test_scatter_1core/sdsc_1.json` is exactly this shape: an
+    /// `identity` whose input is plain, whose index (`Tensor1`, `index_tensor`) sits in the middle,
+    /// and whose output (`Tensor2`, `value_tensor`, `maxDimSizes_ [1, -1, -1]`) is the paged tensor.
+    /// The scheduler turns that output's LX→HBM transfer indirect (`L3DlOpsScheduler.cpp:6880-6945`,
+    /// `convertTransferDirectToIndirect`'s `L3SUIBR` arm), the mirror of the gather's HBM→LX read.
+    ///
+    /// The index is inserted where the gather inserts it, so the output slides one right and stays
+    /// last — and that slid position is the value. Returns `None` on an op with no operands.
+    pub fn attach_scatter_index(&mut self, scatter: GatherIndex) -> Option<IndirectAccess> {
+        let out_idx = self.args.len().checked_sub(1)?;
+        self.attach_index(scatter, out_idx + 1)
+    }
+
+    /// The shared body of [`Self::attach_gather_index`] and [`Self::attach_scatter_index`]: the index
+    /// operand inserted before the output, paired with operand `value_idx` as it stands AFTER that
+    /// insertion (an input keeps its position; the output slides one right).
+    fn attach_index(&mut self, gather: GatherIndex, value_idx: usize) -> Option<IndirectAccess> {
         let GatherIndex {
             name: index_name,
             entry_dim,
@@ -3438,9 +3549,6 @@ impl OpSpec {
             first_entry,
         } = gather;
         let out_idx = self.args.len().saturating_sub(1);
-        if value_idx >= self.args.len() || value_idx == out_idx {
-            return None;
-        }
         // ⭐⭐⭐ THE INDEX IS SHAPED BY THE PAGED DIMS, NOT BY THE VALUE.
         //
         // Both vendor fixtures give the index the value's PINNED dims only, in the value's own order —

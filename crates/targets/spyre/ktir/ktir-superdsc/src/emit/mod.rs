@@ -43,9 +43,12 @@ use std::collections::BTreeMap;
 /// main's `lower_matmul_node` arity-3 branch — the W8A8 fp8 matmul descriptors, reached from the
 /// facts the KTIR states. See its own header.
 pub mod ktir_matmul_fp8;
-/// KTIR → SuperDSC: `ibm/main`'s eight `lower_*_node` bodies with their input door changed. The two
-/// that cross a model-geometry const door ([`lower_ktir_to_superdsc::attn_at`],
-/// [`lower_ktir_to_superdsc::rope_at`]) are public generic entry points the CALLER instantiates.
+/// A PROGRAM THAT WALKS: one constant-trip `scf.for`, its body built once at trip 0 and relaunched
+/// per trip by the card (the paged attention's page walk).
+pub mod loop_fold;
+/// KTIR → SuperDSC: `ibm/main`'s `lower_*_node` bodies with their input door changed. The one that
+/// crosses a model-geometry const door ([`lower_ktir_to_superdsc::rope_at`]) is a public generic
+/// entry point the CALLER instantiates.
 pub mod lower_ktir_to_superdsc;
 /// THE WHOLE-FUNCTION DOOR — walk a multi-op KTIR program in program order and dispatch each
 /// compute op to the per-kind entry point that already lowers it. A producer that hands over a
@@ -494,6 +497,40 @@ fn pointwise_opspec(
 /// ([`In::y_broadcast`]): a `[mb, out]` source sprayed down the op's leading `y` dim carries
 /// `y = RedNonStick` there — the vendor's own reduced-dim law (`superdsc.py`'s
 /// `reduced_dims → scale = -1`), the same scale the on-card-proven pmask fusion uses.
+/// ⭐ WHERE A ROW SPRAY'S COPIES SIT AMONG THE OP'S ROWS — the order of the `y` dim in the op's
+/// row frame. `Outer`: the `[y, mb, out]` frame, `y` sprays of the `mb`-row source one after another
+/// (a LEADING-axis broadcast, the J-slot merge). `Inner`: the `[mb, y, out]` frame, each of the
+/// source's `mb` rows repeated `y` times in a row (a broadcast of the axis just before the stick —
+/// a decode batch's mask over its query-head group, `[J, B, KV, 1, block] -> [J, B, KV, G, block]`).
+/// One descriptor either way: the operand's `y` scale is the vendor's reduced-dim `-1`, and the
+/// order is the op's tensors' layout order (`["y", "mb", "out"]` or `["mb", "y", "out"]`), so the
+/// flat row `j·mb + b` or `b·y + j` is the stick-blocked row the mints reserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SprayOrder {
+    Outer,
+    Inner,
+}
+
+impl SprayOrder {
+    /// The op's tensors' layout order, outermost first — this emitter's own address frame.
+    pub(crate) const fn layout(self) -> [&'static str; 3] {
+        match self {
+            SprayOrder::Outer => ["y", "mb", "out"],
+            SprayOrder::Inner => ["mb", "y", "out"],
+        }
+    }
+
+    /// The same frame in the order dxp reads `layoutDimOrder_`: INNERMOST first, so the two row dims
+    /// swap (`TensorArg::with_device_order`). The stick dim is one stick here, so where it sits does not
+    /// move a byte.
+    pub(crate) const fn device_layout(self) -> [&'static str; 3] {
+        match self {
+            SprayOrder::Outer => ["mb", "y", "out"],
+            SprayOrder::Inner => ["y", "mb", "out"],
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct EwOperand<'a> {
     // Fields are PRIVATE and there are NO raw ctors: the ONLY way to build an EwOperand is `In::ew()`,
@@ -515,6 +552,8 @@ pub struct EwOperand<'a> {
     /// leading-axis `linalg.broadcast` over a multi-row source whose result is `[y, mb, ..]`),
     /// so the count is the broadcast's OWN stated leading extent — not a caller's pick.
     y_broadcast: u32,
+    /// Where the spray's copies sit ([`SprayOrder`]); read only when `y_broadcast > 1`.
+    y_order: SprayOrder,
     col_offset: u32,
     /// The [`crate::addr::ColWindow`] `col_offset` came from — set only by [`In::col_window`], so a
     /// stick-major presentation of a column window is admitted by type, never by testing the integer.
@@ -541,14 +580,17 @@ impl<'a> EwOperand<'a> {
         ]
     }
 
-    /// The SAME scales in Y-MAJOR order `[y, mb, out]` — the layout order the row-split mode's
-    /// op presents its tensors in (the `TensorArg` layout of the y-major frame, the same
-    /// `["y", "mb", "out"]` head-outermost spelling the batched matmul's walks use). A rotation
-    /// of [`scale`](Self::scale)'s `[mb, out, y]`, so the y-major builder reads one ordered
-    /// triple per operand instead of re-deriving it at its own call site.
-    pub(crate) fn scale_ymajor(&self) -> [Scale; 3] {
+    /// The SAME scales in the row-split mode's layout order ([`SprayOrder::layout`]): `[y, mb, out]`
+    /// for an outer spray (the same `["y", "mb", "out"]` head-outermost spelling the batched
+    /// matmul's walks use), `[mb, y, out]` for an inner one. A permutation of
+    /// [`scale`](Self::scale)'s `[mb, out, y]`, so the row-split builder reads one ordered triple
+    /// per operand instead of re-deriving it at its own call site.
+    pub(crate) fn scale_sprayed(&self, order: SprayOrder) -> [Scale; 3] {
         let s = self.scale();
-        [s[2], s[0], s[1]]
+        match order {
+            SprayOrder::Outer => [s[2], s[0], s[1]],
+            SprayOrder::Inner => [s[0], s[2], s[1]],
+        }
     }
 
     // Read-only accessors, `pub(crate)` so the TileIR→SdscOp bridge functions that read these
@@ -568,6 +610,10 @@ impl<'a> EwOperand<'a> {
     /// The row-split spray count — 0 when this operand is not a y-broadcast.
     pub(crate) fn y_broadcast(&self) -> u32 {
         self.y_broadcast
+    }
+    /// The row-split spray's order — meaningful only when [`Self::y_broadcast`] is above 1.
+    pub(crate) fn y_order(&self) -> SprayOrder {
+        self.y_order
     }
     pub(crate) fn col_offset(&self) -> u32 {
         self.col_offset
@@ -600,7 +646,14 @@ impl<'a> EwOperand<'a> {
         stick_lanes: u32,
     ) -> (u32, u32) {
         if self.y_broadcast > 1 {
-            return (rows / self.y_broadcast, stick_elems);
+            return (
+                rows / self.y_broadcast,
+                if self.out_broadcast {
+                    stick_lanes
+                } else {
+                    stick_elems
+                },
+            );
         }
         match (self.mb_broadcast, self.out_broadcast) {
             (true, true) => (1, stick_lanes),
@@ -1793,6 +1846,8 @@ fn core_local_reads_agree(
             df: v.df,
             row_blocked: v.row_blocked,
             device_extent: v.device_extent,
+            frame: v.frame,
+            device_order: v.device_order,
         };
         let dims: Vec<&'static str> = plan.dims().iter().map(|d| d.name).collect();
         let corners = per_core_addr(
@@ -2346,6 +2401,11 @@ pub struct EmittedOp {
     /// separate loop body and no state to thread, which is why unbounded context costs no
     /// restructuring.
     pub kv_page_fold: bool,
+    /// ⭐ A WALK'S BLOCK BODY — this descriptor is one of the ops the program's `scf.for` runs per
+    /// trip, built at trip 0 ([`loop_fold`]): the card relaunches it [`loop_fold::WalkTrips::trips`]
+    /// times, shifting the step's sources by [`loop_fold::WalkTrips::step_bytes`] per relaunch.
+    /// `None` for every op outside a walk.
+    pub walk: Option<loop_fold::WalkTrips>,
     /// THIS OP'S KERNEL STEPS ONE REQUEST PER UNIT OF ITS BATCH AXIS, so ONE launch computes every row
     /// of the batch and the fold needs a pass per PAGE rather than per (request, page).
     ///
@@ -2496,6 +2556,7 @@ impl EmittedOp {
             slab_stride_bytes: 0,
             slot_no_fuse: false,
             kv_page_fold: false,
+            walk: None,
             kv_batched_requests: false,
             kv_gathered: false,
             kv_fold_rows: Default::default(),
@@ -2527,6 +2588,7 @@ impl EmittedOp {
             affine_strides: self.affine_strides.clone(),
             slot_stride_bytes: self.slot_stride_bytes,
             kv_page_fold: self.kv_page_fold,
+            walk: self.walk,
             kv_batched_requests: self.kv_batched_requests,
             kv_gathered: self.kv_gathered,
             kv_fold_rows: self.kv_fold_rows,
@@ -2605,6 +2667,7 @@ impl EmittedOp {
             affine_strides,
             slot_stride_bytes: 0,
             kv_page_fold: false,
+            walk: None,
             kv_batched_requests: false,
             kv_gathered: false,
             kv_fold_rows: crate::sdsc_abstract::FoldRowRegime::WholeBatch,
@@ -3319,7 +3382,13 @@ pub fn emit_sdsc(
             ldsIdx_: i as u32,
             dsName_: format!("Tensor{i}"),
             dsType_: v.role.ds_type(),
-            scale_: v.scale.iter().map(|s| s.to_i64()).collect(),
+            // In the order this tensor's dims go to dxp (`ArgView::device_positions`).
+            scale_: match v.device_positions() {
+                Some(from) if from.len() == v.scale.len() => {
+                    from.iter().map(|&j| v.scale[j].to_i64()).collect()
+                }
+                _ => v.scale.iter().map(|s| s.to_i64()).collect(),
+            },
             wordLength: v.df.word_length(),
             // Per-tensor dtype from the arg's typed `Df` (`v.df`, the SINGLE source of truth) — NOT a name
             // suffix. `Df::Fp32` → IEEE_FP32 (4-byte, the KSPLIT fp32-SFP-merge partials); `Df::Fp8` →
@@ -3370,19 +3439,19 @@ pub fn emit_sdsc(
         primary.entry(v.role.ds_type()).or_insert_with(|| {
             if is_transpose_out {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
                     stickDimOrder_: vec!["out", "mb"],
                     stickSize_: vec![8, 8],
                 }
             } else if is_fp8_kernel {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
                     stickDimOrder_: vec!["in", "out"],
                     stickSize_: vec![2, 64],
                 }
             } else {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
                     stickDimOrder_: vec![v.stick],
                     stickSize_: vec![v.df.elems_per_stick()], // fp16/bf16: 64; fp32: 32; fp8/int8: 128
                 }
@@ -3728,7 +3797,20 @@ pub fn emit_sdsc(
             .or_else(|| l.synth.borrow().sizes.get(v.name).copied());
             let full = full_bytes.is_none_or(|fp| arg_bytes >= fp);
             if active && full && !matches!(v.role, Role::Kernel) && !v.allocation.is_lx() {
-                l.declare_arrangement(v.name, view_stick_layout(v, iter))?;
+                let own = view_stick_layout(v, iter);
+                let arrangement = match v.frame {
+                    crate::superdsc_opspec::ViewFrame::Own => own,
+                    crate::superdsc_opspec::ViewFrame::StickColumns => {
+                        own.of_stick_columns().ok_or_else(|| {
+                            SuperDscError(format!(
+                                "op '{op_name}': tensor '{}' is iterated by its stick columns, but \
+                                 the view arranges it {own:?}, not as row-major whole sticks",
+                                v.name
+                            ))
+                        })?
+                    }
+                };
+                l.declare_arrangement(v.name, arrangement)?;
             }
         }
         let per_core = per_core_addr(seg_base, v, &sl, iter, &wk_slice, intra_base, cores)?;
@@ -3776,6 +3858,19 @@ pub fn emit_sdsc(
             }
         }
         let addr = AddrFold::new(&per_core, folds);
+        // The order dxp reads this view's dims in, innermost first, as positions in `v.layout` — set
+        // only where it is not `v.layout`'s (`TensorArg::with_device_order`).
+        let device_from = v.device_positions();
+        if device_from
+            .as_ref()
+            .is_some_and(|from| from.len() != v.layout.len())
+        {
+            return Err(SuperDscError(format!(
+                "op {op_name}: tensor {i} ('{}') states device order {:?} over layout {:?} — not a \
+                 permutation of it",
+                v.name, v.device_order, v.layout
+            )));
+        }
         tree.push(AllocNode {
             nodeType_: "allocate",
             name_: name,
@@ -3815,7 +3910,9 @@ pub fn emit_sdsc(
             // stick-major tensor — dxp applies `get_generic_stick_layout` INTERNALLY when it reconstructs
             // the stick-blocked `device_size` from `-1`, so the mb-outermost label + `-1` already yields the
             // stick-major walk (`element_torchspyre_parity`). Reordering here DIVERGES from the golden.
-            layoutDimOrder_: v.layout.to_vec(),
+            // A view that states its own device order (two row dims, read innermost-first by dxp) is
+            // the one exception, and states it on the view.
+            layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
             // ── The ON-CARD WALK, DERIVED from the SAME `sl` the per-core START uses (`StickLayout::
             // max_dim_sizes`) so the two cannot disagree. Stick-blocked (`RowBlocked`/`Kernel`) ⇒ `-1` per
             // dim (dxp reconstructs the RowBlocked device_size from N_/layoutDimOrder_/stickSize_ and
@@ -3844,35 +3941,63 @@ pub fn emit_sdsc(
             // `Span::Swept` with NO declaration reproduces `op.iter.extent(d)` exactly, and no
             // operand in any shipped bundle declares one — so every existing bundle is byte-identical.
             maxDimSizes_: {
-                let walk = sl.device_walk(
-                    crate::sdsc_abstract::DeviceExtents::of_view(
-                        &v.layout
-                            .iter()
-                            .map(|&d| iter.extent(d) as usize)
-                            .collect::<Vec<_>>(),
-                        &v.device_extent
-                            .iter()
-                            .map(|o| o.map(|p| p as usize))
-                            .collect::<Vec<_>>(),
-                        v.layout
-                            .iter()
-                            .position(|&d| d == v.stick)
-                            .unwrap_or(usize::MAX),
-                        &vec![true; v.layout.len()],
-                        crate::sdsc_abstract::Span::Swept,
-                    )
-                    .dims()
+                let swept: Vec<usize> = v.layout.iter().map(|&d| iter.extent(d) as usize).collect();
+                let stick_pos = v
+                    .layout
                     .iter()
-                    .map(|&e| e as i64)
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-                );
+                    .position(|&d| d == v.stick)
+                    .unwrap_or(usize::MAX);
+                let device: Vec<i64> = crate::sdsc_abstract::DeviceExtents::of_view(
+                    &swept,
+                    &v.device_extent
+                        .iter()
+                        .map(|o| o.map(|p| p as usize))
+                        .collect::<Vec<_>>(),
+                    stick_pos,
+                    &vec![true; v.layout.len()],
+                    crate::sdsc_abstract::Span::Swept,
+                )
+                .dims()
+                .iter()
+                .map(|&e| e as i64)
+                .collect();
+                let walk = sl.device_walk(&device);
+                // ⭐ A STICK-BLOCKED WINDOW OF A TALLER TENSOR, more than one stick wide, walks the
+                // tensor's own rows (`DeviceWalk::of_window`): left to `-1`, dxp strides its stick
+                // groups by the op's swept rows. MEASURED on granite-3.1-8b: each kv head's score
+                // contraction read its `[84, 128]` query slice of the `[672, 128]` head-major query
+                // with the second stick 84 rows in, the next kv head's first stick. A one-stick view
+                // has no second stick group, so every hd=64 bundle emits byte-identically.
+                let windowed = device
+                    .iter()
+                    .zip(&swept)
+                    .enumerate()
+                    .any(|(i, (&d, &s))| i != stick_pos && d > s as i64);
+                let multi_stick = swept
+                    .get(stick_pos)
+                    .is_some_and(|&e| e > v.df.elems_per_stick() as usize);
+                let walk = if walk.reconstructs() && windowed && multi_stick {
+                    crate::sdsc_abstract::DeviceWalk::of_window(&device)
+                } else {
+                    walk
+                };
                 // Paged only on the gathered value side. Every pin was resolved against this operand's
                 // own layout above, so `paged_at` cannot be the thing that drops one.
-                if paged_dims.is_empty() {
+                let walk = if paged_dims.is_empty() {
                     walk
                 } else {
                     walk.clone().paged_at(&paged_dims).unwrap_or(walk)
+                };
+                // In the order `layoutDimOrder_` states the dims.
+                match &device_from {
+                    None => walk,
+                    Some(from) => walk.reordered(from).ok_or_else(|| {
+                        SuperDscError(format!(
+                            "op {op_name}: tensor {i} ('{}'): its walk does not reorder to its \
+                             device order",
+                            v.name
+                        ))
+                    })?,
                 }
             },
             // ── INDIRECT (GATHERED) HBM ACCESS ──
@@ -4297,6 +4422,7 @@ pub struct In<'a, K: KindTag> {
     mb_broadcast: bool,
     out_broadcast: bool,
     y_broadcast: u32,
+    y_order: SprayOrder,
     col_offset: u32,
     col_window: Option<crate::addr::ColWindow>,
 }
@@ -4308,6 +4434,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
         }
@@ -4318,6 +4445,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: true,
             out_broadcast: true,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
         }
@@ -4328,6 +4456,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: true,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
         }
@@ -4338,6 +4467,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
         }
@@ -4352,6 +4482,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: w.dev().into_raw_elems(),
             col_window: Some(w),
         }
@@ -4364,6 +4495,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: true,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
         }
@@ -4375,6 +4507,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: true,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
         }
@@ -4387,6 +4520,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: true,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
         }
@@ -4401,19 +4535,35 @@ impl<'a, K: KindTag> In<'a, K> {
     /// before this operand is built: `rows == y·mb`, the source single-stick. `y`
     /// must be ≥ 2 — a spray of one is a reshape, not a broadcast, and is refused by the
     /// admission upstream.
-    pub fn y_broadcast(h: &'a Stk<K>, y: u32) -> Self {
+    pub fn y_broadcast(h: &'a Stk<K>, spray: crate::emit::lower_ktir_to_superdsc::Spray) -> Self {
+        let y = spray.count;
         assert!(
             y > 1,
-            "In::y_broadcast: a spray count of {y} is not a broadcast — the leading dim must \
+            "In::y_broadcast: a spray count of {y} is not a broadcast — the sprayed dim must \
              spray a real count (the walk's Y admission refuses y == 1 upstream)"
         );
         In {
             h,
             mb_broadcast: false,
-            out_broadcast: false,
+            // A spray of per-row scalars reads one value per row: the stick's stride-0 read too.
+            out_broadcast: spray.of == crate::emit::lower_ktir_to_superdsc::SprayOf::RowScalars,
             y_broadcast: y,
+            y_order: spray.order,
             col_offset: 0,
             col_window: None,
+        }
+    }
+    /// [`y_broadcast`](Self::y_broadcast) PLUS a base `col_offset` — the spray's `[mb, out]` source
+    /// at an element base inside a larger buffer (one stick column of a multi-stick source, the
+    /// window a walk's trip takes of its mask stack).
+    pub fn y_broadcast_at(
+        h: &'a Stk<K>,
+        spray: crate::emit::lower_ktir_to_superdsc::Spray,
+        col_offset: crate::addr::DevOff,
+    ) -> Self {
+        In {
+            col_offset: col_offset.into_raw_elems(),
+            ..Self::y_broadcast(h, spray)
         }
     }
     pub fn ew(&self) -> EwOperand<'a> {
@@ -4423,6 +4573,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: self.mb_broadcast,
             out_broadcast: self.out_broadcast,
             y_broadcast: self.y_broadcast,
+            y_order: self.y_order,
             col_offset: self.col_offset,
             col_window: self.col_window,
         }
