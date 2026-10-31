@@ -174,6 +174,25 @@ unsafe extern "C" {
     /// (which Spyre card to bring up; 0 for a single-device host).
     pub fn flex_shim_init_runtime(logical_device_id: i32) -> i32;
 
+    /// The rank-scoped bring-up door: selects the card by BDF string through
+    /// `SenPci::pf(const std::string&)` — `logical_device_id` above selects
+    /// nothing (the shim's `init_pfw_once` comments out the parameter and
+    /// takes `SenPci::pf()`'s first available card), so a two-process,
+    /// one-card-per-rank cell needs this door. `pci_addr` is the
+    /// "DDDD:BB:DD.F" form. Returns 0 on success, -3 for the second-init
+    /// refusal (one process inits exactly one card — same BDF is idempotent,
+    /// a different BDF or a BDF after the no-arg door refuses by name).
+    pub fn flex_shim_init_runtime_bdf(pci_addr: *const c_char) -> i32;
+
+    /// The bind proof: writes senlib's own resolved PCI address (read from
+    /// the live `PciDevId` handed to `PfWrapper`, in "DDDD:BB:DD.F" form)
+    /// into `out` (capacity `cap`, NUL-terminated) and returns the length
+    /// written, or -1 if nothing is initialized / the buffer is too small.
+    /// A rank names the BDF it asked for; this is what senlib actually
+    /// resolved — the cell asserts the two are equal, both ranks, before
+    /// any BAT work.
+    pub fn flex_shim_resolved_pci(out: *mut c_char, cap: usize) -> i32;
+
     /// Real device memory capacity in bytes for the currently-open card —
     /// `flex::DeviceHandle::GetDmpaSize()`, the exact call the real C++
     /// allocator bring-up path uses to size its single 1p0 domain
@@ -715,6 +734,46 @@ pub fn pcie_address_for_card(card_index: u32) -> String {
     }
 }
 
+/// Safe wrapper over the rank-scoped bring-up door
+/// (`flex_shim_init_runtime_bdf`): selects the card by BDF string. Same BDF
+/// twice in one process is idempotent; a different BDF, or a BDF init after
+/// the no-arg door already bound a card, is refused by name.
+///
+/// # Errors
+/// Returns `Err` with the shim's refusal/init message on any nonzero rc.
+pub fn init_runtime_bdf(bdf: &str) -> Result<(), String> {
+    // SAFETY: `bdf` is copied into a NUL-terminated CString for the duration
+    // of the call; the shim does not retain the pointer.
+    let c_bdf = std::ffi::CString::new(bdf).map_err(|_| "BDF contains a NUL byte".to_string())?;
+    let rc = unsafe { flex_shim_init_runtime_bdf(c_bdf.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper over the bind-proof getter (`flex_shim_resolved_pci`):
+/// senlib's own resolved PCI address for the initialized runtime, in
+/// "DDDD:BB:DD.F" form. The caller names the BDF it asked for; this returns
+/// what senlib actually bound.
+///
+/// # Errors
+/// Returns `Err` if nothing is initialized yet.
+pub fn resolved_pci() -> Result<String, String> {
+    let mut buf = [0 as c_char; 32];
+    // SAFETY: `buf` is a valid 32-byte writable array; the shim writes at most
+    // a NUL-terminated "DDDD:BB:DD.F" (max 12 chars + NUL) into it.
+    let n = unsafe { flex_shim_resolved_pci(buf.as_mut_ptr(), buf.len()) };
+    if n < 0 {
+        return Err("no initialized runtime to read the resolved PCI address from".to_string());
+    }
+    // SAFETY: the shim NUL-terminated the written prefix on success.
+    Ok(unsafe { CStr::from_ptr(buf.as_ptr()) }
+        .to_string_lossy()
+        .into_owned())
+}
+
 // ════════════════════════════════════════════════════════════════════════════════════════════
 //  Multi-device / cross-port P2P (re-added per issue #550)
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -1183,6 +1242,19 @@ unsafe extern "C" {
     /// sentinel (told apart below by whether the shim recorded an error).
     fn flex_senlib_check_and_clear_rdma_status() -> i32;
 
+    /// `cxx-shim/senlib_ffi.cpp`: programs peer `tid`'s base address in this
+    /// card's RDMA base-address table (pf_interface.hpp:178
+    /// `SetBaseAddrTable(uint8_t, uint64_t)` — the vendor's
+    /// `initialize_p2p_address_table` install). Returns 0 on success, -1 on
+    /// shim failure.
+    fn flex_senlib_set_base_addr_table(tid: u8, pci_addr: u64) -> i32;
+
+    /// `cxx-shim/senlib_ffi.cpp`: the PCI address of `bdf`'s BAR `region`,
+    /// as senlib itself resolves it (senpci.hpp:263
+    /// `pciaddr_for_region(PciDevId, int)` — static, no runtime init
+    /// required). Returns 0 on error (a real BAR base is never 0).
+    fn flex_shim_pci_addr_for_region(bdf: *const c_char, region: u8) -> u64;
+
     /// `cxx-shim/hal_sbf.cpp`: the calling thread's most recent hal_sbf
     /// error (`""` if none). Thread-local, owned by the shim, valid until
     /// this thread's next failed hal_sbf call.
@@ -1296,6 +1368,42 @@ pub fn read_wdone(sid: u8) -> Result<u32, String> {
     let rc = unsafe { flex_senlib_read_wdone(sid, &mut val) };
     if rc == 0 {
         Ok(val)
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper: program peer `tid`'s base address in this card's RDMA
+/// base-address table — the symmetric-BAT install (every rank installs every
+/// peer's BAR2, the vendor's `initialize_p2p_address_table` shape) the
+/// engine's `SetTid(dest BAT index)` resolves through.
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the install did not reach senlib.
+pub fn set_base_addr_table(tid: u8, pci_addr: u64) -> Result<(), String> {
+    // SAFETY: plain integer arguments; the shim checks its own runtime state
+    // before touching senlib.
+    let rc = unsafe { flex_senlib_set_base_addr_table(tid, pci_addr) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper: the PCI address of `bdf`'s BAR `region`, as senlib itself
+/// resolves it — the vendor's own BAT value source. A `region` of 2 is
+/// BAR2, the no-NTB P2P base the BAT installs.
+///
+/// # Errors
+/// Returns `Err` if senlib resolved 0 (a real BAR base is never 0).
+pub fn pci_addr_for_region(bdf: &str, region: u8) -> Result<u64, String> {
+    let c_bdf = std::ffi::CString::new(bdf).map_err(|_| "BDF contains a NUL byte".to_string())?;
+    // SAFETY: `c_bdf` is a NUL-terminated CString valid for the duration of
+    // the static senlib call; the shim does not retain the pointer.
+    let v = unsafe { flex_shim_pci_addr_for_region(c_bdf.as_ptr(), region) };
+    if v != 0 {
+        Ok(v)
     } else {
         Err(last_shim_error())
     }

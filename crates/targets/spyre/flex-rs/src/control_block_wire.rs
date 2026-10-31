@@ -756,6 +756,16 @@ impl DmaSection {
     pub const fn to_words(self) -> [u64; 2] {
         self.words
     }
+
+    /// A DMA section from the #1008 doors' FINISHED WORDS, verbatim — the
+    /// wire doors (`hal_sbf::rdma12_unicast_send` / `rdma10_wdone_wait`)
+    /// return exactly the two words `set_dmo`/`set_dmi` would copy into a
+    /// control block, so the P2P CB builders place them without re-encoding
+    /// a single field. The words are trusted as-is: every field bound and
+    /// law checked at the door, never here.
+    pub const fn from_words(words: [u64; 2]) -> Self {
+        Self { words }
+    }
 }
 
 /// Byte offsets of the 6 CB sections within the 128-byte control block, per
@@ -1069,6 +1079,63 @@ impl ControlBlockWire {
             ComputeSection::skip(),
             xlat,
         ))
+    }
+
+    /// Port of `PfRuntimeScheduler::submitP2PRdmaSend`'s per-chunk CB
+    /// (pf_runtime_scheduler.cpp:289-447, the unicast loop): the DMO slot
+    /// carries the Rdma12 RDMA_SINGLECAST section's FINISHED WORDS from the
+    /// #1008 door — never re-encoded here — and the XLAT entry is the source
+    /// segment's own translation, the loop's per-CB
+    /// `translations()[seg_id].SetPaddrBytes(paddr)` stamp over the
+    /// single-entry `SegmentTable` the vendor builds at
+    /// `xlat_length = seg_offset + dmva_size` (the WHOLE transfer's extent,
+    /// one entry shared by every chunk CB, exactly as the vendor's one
+    /// `SegmentTable::createSingleEntry` is).
+    ///
+    /// The vendor's loop sets `SetXsegv(true)` (the T-send preamble); the
+    /// recorded transport laws override that — L3's F-send law, encoded at
+    /// the door, which refuses `xsegv` — so the words arriving here are
+    /// already the F-send shape and the receiver host-programs its XSEG
+    /// table instead.
+    ///
+    /// # Errors
+    /// Returns `Err` if `xlat_length` exceeds the hardware's max XLAT
+    /// translation size (same `EncodeLength` port as `fill`).
+    pub fn p2p_rdma_send(
+        tag: ResponseTag,
+        dmo_words: [u64; 2],
+        src_segment: u32,
+        region_paddr: DevicePhysicalAddress,
+        xlat_length: SegmentExtent,
+    ) -> Result<Self, XlatLengthTooLarge> {
+        let mut xlat = [XlatEntry::invalid(); 8];
+        xlat[src_segment as usize] =
+            XlatEntry::for_segment_extent(region_paddr, xlat_length, XlatAccessMode::ReadWrite)?;
+        Ok(Self::assemble(
+            CtrlSection::new(tag, false),
+            R5Section::none(),
+            DmaSection::skip(),
+            DmaSection::from_words(dmo_words),
+            ComputeSection::skip(),
+            xlat,
+        ))
+    }
+
+    /// Port of `PfRuntimeScheduler::submitP2PRdmaWait`'s single CB
+    /// (pf_runtime_scheduler.cpp:449-493): the DMI slot carries the Rdma10
+    /// RDMA_WDONE_BARRIER section's finished words from the #1008 door, over
+    /// an EMPTY segment table — "wdone barrier doesn't need segment
+    /// translations" — so every XLAT entry stays invalid. No error path: no
+    /// XLAT length is encoded.
+    pub fn p2p_rdma_wait(tag: ResponseTag, dmi_words: [u64; 2]) -> Self {
+        Self::assemble(
+            CtrlSection::new(tag, false),
+            R5Section::none(),
+            DmaSection::from_words(dmi_words),
+            DmaSection::skip(),
+            ComputeSection::skip(),
+            [XlatEntry::invalid(); 8],
+        )
     }
 
     /// Port of `ControlBlockStream::CreateNullCb`
