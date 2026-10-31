@@ -1308,7 +1308,10 @@ enum Lowering {
     /// `linalg.batch_matmul` `[b, m, k] × [b, k, n] → [b, m, n]` — one 2-D contraction per batch,
     /// each over its batch's rows of the flat-frame A and output and its batch's own `[k, n]`
     /// kernel block. See [`super::lower_ktir_to_superdsc::batch_matmul`].
-    BatchMatmul { batch: u32 },
+    BatchMatmul {
+        batch: u32,
+        activation: super::lower_ktir_to_superdsc::BatchFrame,
+    },
     /// A rank-3 `linalg.transpose` `[b, r, c] → [b, c, r]` — one 2-D transpose per batch, whose
     /// output blocks are the `[k, n]` kernels a batched contraction reads, its input in `input`.
     /// See [`super::lower_ktir_to_superdsc::batch_transpose`].
@@ -5071,7 +5074,10 @@ fn lower_function_folded(
                         f.name
                     ));
                 };
-                Some(Lowering::BatchMatmul { batch })
+                Some(Lowering::BatchMatmul {
+                    batch,
+                    activation: super::lower_ktir_to_superdsc::BatchFrame::Flat,
+                })
             }
             OpKind::LinalgTranspose if rank3_batch().is_some() => {
                 let perm = op.attributes.iter().find_map(|(k, v)| match (k, v) {
@@ -6027,6 +6033,56 @@ fn lower_function_folded(
             };
             inter.insert(res, r);
             per_op.push(r);
+            // ⭐⭐ A BATCHED CONTRACTION'S ACTIVATION WIDER THAN A STICK, READ AS BATCH BLOCKS. In the
+            // flat frame a batch's rows are a slice whose sticks sit the TENSOR's rows apart, and the
+            // card's contraction steps them by its own rows whatever the descriptor states — MEASURED
+            // on granite-3.1-8b: each kv head's `[84, 128]` slice of the `[672, 128]` head-major query
+            // contracted its second stick from the next kv head's first (the card's scores match that
+            // read at rel-rms 0.0012, the intended one at 1.19). So the batches are copied into
+            // standalone stick-major `[m, k]` blocks first — the head-major pair's block side, `[m,
+            // b·k]`, one stick-run copy per stick of a batch ([`HeadMajorCopies::to_block`], the
+            // attention output's own relayout) — and the contraction reads blocks.
+            let program = match program {
+                Lowering::BatchMatmul {
+                    batch,
+                    activation: super::lower_ktir_to_superdsc::BatchFrame::Flat,
+                } if batch > 1
+                    && per_op
+                        .first()
+                        .is_some_and(|a| a.v_cols > crate::work::FP16_ELEMS_PER_STICK) =>
+                {
+                    let a = per_op[0];
+                    let stick = crate::work::FP16_ELEMS_PER_STICK;
+                    if !a.v_rows.is_multiple_of(batch) || !a.v_cols.is_multiple_of(stick) {
+                        return err(format!(
+                            "{}: a {batch}-batch contraction's activation t{} `[{}, {}]` is not \
+                             whole batches of whole sticks",
+                            f.name, a.tid, a.v_rows, a.v_cols
+                        ));
+                    }
+                    let (m, sticks) = (a.v_rows / batch, a.v_cols / stick);
+                    let tid = mint_scratch(k, layout, floor, res, 1);
+                    let blocks = stick_major_region(tid, m, batch * sticks, layout);
+                    out.extend(
+                        HeadMajorCopies::of(&blocks, &a, a.v_rows, sticks)?.to_block(
+                            f.name,
+                            sym_id_base,
+                            layout,
+                        )?,
+                    );
+                    per_op[0] = Region {
+                        tid,
+                        is_out: false,
+                        ..a
+                    };
+                    batch_blocks.insert(tid, a.v_cols);
+                    Lowering::BatchMatmul {
+                        batch,
+                        activation: super::lower_ktir_to_superdsc::BatchFrame::Blocks,
+                    }
+                }
+                other => other,
+            };
             let name = f.name;
             let mut emitted = emit_one(
                 name,
@@ -6827,10 +6883,11 @@ fn emit_one(
                 layout,
             );
         }
-        Lowering::BatchMatmul { batch } => {
+        Lowering::BatchMatmul { batch, activation } => {
             return super::lower_ktir_to_superdsc::batch_matmul(
                 name,
                 batch,
+                activation,
                 per_op,
                 sym_id_base,
                 layout,

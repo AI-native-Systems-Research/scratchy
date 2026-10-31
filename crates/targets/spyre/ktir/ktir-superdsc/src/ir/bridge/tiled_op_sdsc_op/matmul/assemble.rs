@@ -481,14 +481,17 @@ pub struct RowsOperand<'a, T: crate::sdsc_abstract::KindTag> {
     pub off: u32,
 }
 
-/// The extents of a row-sliced contraction: the `[m, k] · [k, n]` it computes, and the row count of
-/// the `[rows, ·]` tensors its activation and output are slices of.
+/// The extents of a row-sliced contraction: the `[m, k] · [k, n]` it computes, the row count of the
+/// `[rows, n]` tensor its output is a slice of, and the row count of the stick-major tensor its
+/// activation is read from (`rows` for a slice of the flat frame, `m` for a batch block standing
+/// alone).
 #[derive(Clone, Copy, Debug)]
 pub struct RowsShape {
     pub m: MatM,
     pub n: MatN,
     pub k: MatK,
     pub rows: u32,
+    pub a_rows: u32,
 }
 
 /// ⭐ ONE BATCH OF A BATCHED CONTRACTION over flat-frame operands — `linalg.batch_matmul`'s per-batch
@@ -507,7 +510,7 @@ pub fn assemble_matmul_rows(
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp, String> {
     let form = SharedKernelBmmForm::batch_inner_proven(super::walk::MatmulWrapperSite::witness());
-    let op = matmul_opspec_split::<Fp16, _>(
+    let mut op = matmul_opspec_split::<Fp16, _>(
         shape.m.get(),
         shape.n.get(),
         shape.k.get(),
@@ -524,6 +527,11 @@ pub fn assemble_matmul_rows(
         None,
         super::dims::matmul_split_map_for(form),
     )?;
+    // The activation's own stick-group pitch, when it is not the output's: a batch block read on
+    // its own (`a_rows == m`) is a standalone stick-major `[m, k]`.
+    if shape.a_rows != shape.rows {
+        op.args[0].set_device_extent("mb", shape.a_rows);
+    }
     Ok(assemble_from_opspec(op_name, op, sym_id_base, layout))
 }
 
