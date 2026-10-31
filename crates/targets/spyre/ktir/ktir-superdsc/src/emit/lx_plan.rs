@@ -53,11 +53,30 @@ struct Candidate {
 /// program's per-head rows held query-row-major and split into chunks (its prompt trip,
 /// [`crate::placement::WalkDivision::HeadsInner`]) — is probed, and the one that keeps the most bytes
 /// in LX wins; a tie keeps the ops' own.
+///
+/// ⭐ ONCE PER PROGRAM. A program already planned into this layout ([`KtirNode::lx_plan`], its
+/// pinned tensors still planned here) lowers under that plan again, with the tensors it minted: a card
+/// bake lowers each program twice into one layout (the pass that declares the bundle's synthetics,
+/// then the real one), and planning the second time would plan around the first time's own pins.
 pub(crate) fn plan(
     node: &KtirNode,
     layout: &BundleLayout,
     probe: impl Fn(&BundleLayout) -> Result<Vec<EmittedOp>, Error>,
 ) -> Result<(), Error> {
+    let done = node
+        .lx_plan
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if let Some(done) = done
+        && done
+            .pinned
+            .iter()
+            .all(|id| layout.lx_planned.borrow().contains_key(id))
+    {
+        layout.lx_division.set(done.division);
+        return Ok(());
+    }
     let minted = || -> BTreeSet<u32> {
         node.minted
             .lock()
@@ -117,11 +136,16 @@ pub(crate) fn plan(
     // probe's, whichever candidate ran last.
     *node.minted.lock().unwrap_or_else(|p| p.into_inner()) = minted_under;
     layout.lx_division.set(groups);
+    let pinned: Vec<PlaceId> = chosen.iter().map(|c| PlaceId::Act(c.tid)).collect();
     layout.lx_planned.borrow_mut().extend(
         chosen
             .into_iter()
             .map(|c| (PlaceId::Act(c.tid), c.per_core)),
     );
+    *node.lx_plan.lock().unwrap_or_else(|p| p.into_inner()) = Some(crate::ktir_node::WalkPlan {
+        division: groups,
+        pinned,
+    });
     Ok(())
 }
 

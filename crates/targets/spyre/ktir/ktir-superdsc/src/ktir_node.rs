@@ -644,6 +644,18 @@ pub struct KtirNode {
     /// `KtirNode` in a process-wide `static` and requires `Sync`. The clone the memo hands
     /// each rung carries the record BY CONTENTS — see the manual `Clone` below.
     pub minted: std::sync::Mutex<std::collections::HashMap<MintKey, u32>>,
+    /// The scratchpad plan this walking program was lowered under ([`WalkPlan`]), once it has been.
+    pub lx_plan: std::sync::Mutex<Option<WalkPlan>>,
+}
+
+/// The scratchpad plan a walking program was lowered under ([`crate::emit::lx_plan`]): the division
+/// it chose and the tensors it pinned. A card bake lowers each program twice into one layout — the
+/// pass that declares the bundle's synthetics, then the real one — and the second lowers under the
+/// first's plan, with the first's tensors, rather than planning again around the first's own pins.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WalkPlan {
+    pub division: Option<crate::placement::WalkDivision>,
+    pub pinned: Vec<crate::place::PlaceId>,
 }
 
 /// What a node's lowering mints an intermediate for ([`KtirNode::minted`]): an SSA value's own
@@ -675,6 +687,12 @@ impl Clone for KtirNode {
             node_out_tid: self.node_out_tid,
             minted: std::sync::Mutex::new(
                 self.minted
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone(),
+            ),
+            lx_plan: std::sync::Mutex::new(
+                self.lx_plan
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .clone(),
