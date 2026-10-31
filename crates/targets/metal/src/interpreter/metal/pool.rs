@@ -141,8 +141,8 @@ pub struct MetalBucketSpec {
     /// compiled with its constants: the model's one table, which each of its buckets names.
     pub kernels: &'static [crate::tape::lowered::BakedKernel],
     /// Whether a forward at this bucket may read more than its cache writes. A DFlash2 drafter's
-    /// buckets past the one its block draft runs at play its context commit alone, and their
-    /// arenas hold only what the commit writes.
+    /// buckets past the one its block draft runs at play its context commit alone (or its rings'
+    /// rebuild, which writes a subset of it), and their arenas hold only what the commit writes.
     pub plays_result: bool,
     /// The weight bytes a forward of the bucket reads, fixed and per row
     /// ([`crate::tape::step::WeightBytes`]).
@@ -1095,7 +1095,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     pub fn pick_bucket_for(&self, inputs: &ForwardInputs<'_>) -> Result<usize, ForwardError> {
         let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
         let spec = self.bucket_specs[bucket_idx];
-        if !spec.plays_result && inputs.reads != ForwardReads::CacheWrites {
+        // A rebuild plays the window's load and the ring writers after it: every tile of it is one
+        // the context commit's arena holds.
+        let commit_only = matches!(
+            inputs.reads,
+            ForwardReads::CacheWrites | ForwardReads::Rebuild
+        );
+        if !spec.plays_result && !commit_only {
             return Err(ForwardError::CacheWritesOnly {
                 num_tokens: inputs.num_tokens,
                 bucket_m: spec.bucket_m,
