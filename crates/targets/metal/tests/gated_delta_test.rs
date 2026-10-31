@@ -1993,12 +1993,13 @@ fn gdn_verify_is_the_conv_scan_norm() {
         }
         // Alone, it leaves every q and k channel's conv state as it found it, bitwise: no value
         // head's threadgroup writes what another reads its seed from (#914 had the first write
-        // it), whatever order the threadgroups run in. Ring and lane checkpoints both lay out a
-        // channel's `kernel - 1` entries at channel `(j / (kernel - 1)) % conv_dim`.
+        // it), whatever order the threadgroups run in. Entry `j` of the ring (`kernel - 1` a
+        // channel) or of a lane's stream areas (`kernel - 1 + rows` a channel) is channel
+        // `(j / per_channel) % conv_dim`'s.
         let geometry = format!("nk {nk} nv {nv} drafts {drafts} start {start:?}");
-        let qk_untouched = |what: &str, got: Vec<f32>, was: &[f32]| {
+        let qk_untouched = |what: &str, per_channel: usize, got: Vec<f32>, was: &[f32]| {
             for (j, (g, w)) in got.iter().zip(was).enumerate() {
-                if (j / (kernel - 1)) % conv_dim < 2 * key_dim {
+                if (j / per_channel) % conv_dim < 2 * key_dim {
                     assert_eq!(
                         g.to_bits(),
                         w.to_bits(),
@@ -2007,9 +2008,15 @@ fn gdn_verify_is_the_conv_scan_norm() {
                 }
             }
         };
-        qk_untouched("ring", read_f32(&conv_state, conv0.len()), &conv0);
         qk_untouched(
-            "lane checkpoint",
+            "ring",
+            kernel - 1,
+            read_f32(&conv_state, conv0.len()),
+            &conv0,
+        );
+        qk_untouched(
+            "lane stream",
+            kernel - 1 + rows.rows(),
             read_f32(&conv_lanes, conv_lanes0.len()),
             &conv_lanes0,
         );
