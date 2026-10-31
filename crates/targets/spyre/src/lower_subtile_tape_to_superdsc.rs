@@ -8120,6 +8120,35 @@ pub struct RolledSuperDsc {
 }
 
 impl RolledSuperDsc {
+    /// ⭐ EVERY COLLECTIVE'S WINDOW CUT, IN THE ORDER THE CARD RUNS THEM — the prefix's, then each
+    /// launch's body's (a body counts once per layer it is replayed for: that is the next layer's
+    /// collective, on the same cut), then the suffix's. Within one bundle, consecutive consume ops
+    /// naming one collective (an all-gather's per-rank legs) count once.
+    pub fn collective_cuts(&self) -> Vec<ktir_superdsc::collective::WindowCut> {
+        fn of(ops: &[EmittedOp]) -> Vec<ktir_superdsc::collective::WindowCut> {
+            let mut out = Vec::new();
+            let mut last: Option<ktir_superdsc::collective::TpConsume> = None;
+            for c in ops.iter().filter_map(|e| e.tp_consume) {
+                let same = last.is_some_and(|p| {
+                    (p.kind, p.operand, p.fragment, p.cut) == (c.kind, c.operand, c.fragment, c.cut)
+                });
+                if !same {
+                    out.push(c.cut);
+                }
+                last = Some(c);
+            }
+            out
+        }
+        let mut cuts = of(&self.prefix);
+        for &(body, _) in &self.launches {
+            if let Some(b) = self.bodies.get(usize::from(body)) {
+                cuts.extend(of(&b.ops));
+            }
+        }
+        cuts.extend(of(&self.suffix));
+        cuts
+    }
+
     /// The total layer count — the sum over classes.
     pub fn iters(&self) -> u32 {
         self.bodies.iter().map(|b| b.iters).sum()
@@ -8845,14 +8874,26 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
     // See [`RungFacts`].
     rung: RungFacts,
 ) -> Result<RolledSuperDsc, SuperDscError> {
-    crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
+    let rolled = crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
         ir,
         weight_ids,
         active_cap,
         rows_are_requests,
         rung,
-    )
+    )?;
+    // ⛔ THE TWO WINDOW CUTS NEED CONSECUTIVE COLLECTIVES IN RUN ORDER TO ALTERNATE. A cut is
+    // assigned by a collective's place in the graph, and a rolled body replays ONE layer's
+    // collectives per layer: a layer with an odd count would hand its last collective and the next
+    // layer's first one cut. A BUILD error, never a send landing in a window still being read.
+    ktir_superdsc::collective::cuts_alternate(rolled.collective_cuts()).map_err(|r| {
+        SuperDscError(format!(
+            "collective {} in run order reuses its predecessor's window cut {:?} — a rolled body \
+             whose layer holds an odd number of collectives breaks the cuts' alternation",
+            r.collective, r.cut
+        ))
+    })?;
+    Ok(rolled)
 }
 
 // NOTE — STILL TO MIRROR FROM THE FIXTURE (the dsc tile-schedule internals, the
