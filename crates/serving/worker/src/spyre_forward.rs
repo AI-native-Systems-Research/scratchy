@@ -3169,16 +3169,12 @@ mod pad_clamp_tests {
         let draws: Vec<Option<&SampledDraw>> = owned.iter().map(Some).collect();
         let laws = batch_seat_laws(&draws, &live, 4).expect("the full laws lay");
         assert_eq!(laws.len(), 4);
-        for s in 0..4 {
-            let law = laws[s].draw.unwrap_or_else(|| {
+        for (s, seat) in laws.iter().enumerate() {
+            let law = seat.draw.unwrap_or_else(|| {
                 panic!("row {s} of a FULL rung staged greedy — no row is a pad")
             });
             assert_eq!(law.seed, 1000 + s as u64, "row {s} runs its OWN draw");
-            assert_eq!(
-                laws[s].step,
-                10 + s as u32,
-                "row {s} keeps its own step salt"
-            );
+            assert_eq!(seat.step, 10 + s as u32, "row {s} keeps its own step salt");
         }
     }
 
