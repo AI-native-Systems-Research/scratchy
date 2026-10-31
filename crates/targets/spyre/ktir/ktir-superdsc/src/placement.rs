@@ -307,12 +307,13 @@ pub struct BundleLayout {
     /// emits. `None` on every real lowering.
     #[serde(skip)]
     pub lx_probe: std::cell::RefCell<Option<Vec<LxTouch>>>,
-    /// ⭐ THE SCRATCHPAD PLAN'S DIVISION — `Some(n)` while a walking program is lowered under the plan
-    /// that divides its elementwise and reduce ops into `n` row groups, one a core
+    /// ⭐ THE SCRATCHPAD PLAN'S DIVISION — `Some` while a walking program is lowered under a plan
+    /// that divides its elementwise and reduce ops into row groups, one a core
     /// ([`crate::work::EwDivision::Groups`]); `None` otherwise. [`Self::ew_law`] and
-    /// [`Self::reduce_rows`] read it where those ops resolve their default division.
+    /// [`Self::reduce_rows`] read it where those ops resolve their default division, and the walk's
+    /// contractions take the form it names.
     #[serde(skip)]
-    pub lx_row_groups: std::cell::Cell<Option<u32>>,
+    pub lx_division: std::cell::Cell<Option<WalkDivision>>,
     /// THE arrangement authority: `tensor name → its ONE device [`StickLayout`]`. The FIRST op to
     /// address a tensor declares its layout; every later op must address it EQUIVALENTLY
     /// ([`StickLayout::addr_eq`]) or `declare_arrangement` returns a build `Err` naming the tensor. A
@@ -461,6 +462,38 @@ impl Default for LxAlloc {
             core_local: std::collections::BTreeSet::new(),
             divisions: std::collections::BTreeMap::new(),
             full_sizes: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// How the scratchpad plan divides a walking program ([`BundleLayout::lx_division`]) — the two
+/// divisions torch-spyre's compiled walks take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkDivision {
+    /// One batch of the walk's batched contractions a core, `n` of them: its decode trip (all-heads
+    /// contractions split by batch, each core's kernel in its LX).
+    Batches(u32),
+    /// The walk's per-head rows held query-row-major (row `p·heads + h`) and split into `chunks`
+    /// contiguous runs, one a core: its prompt trip (contractions split by rows, every core reading
+    /// one shared kernel per query head from HBM).
+    HeadsInner { chunks: u32 },
+}
+
+impl WalkDivision {
+    /// The row groups the walk's elementwise and reduce ops divide into.
+    pub const fn row_groups(self) -> u32 {
+        match self {
+            WalkDivision::Batches(n) => n,
+            WalkDivision::HeadsInner { chunks } => chunks,
+        }
+    }
+
+    /// Whether the walk's batched transposes and contractions over `batch` batches each run as ONE
+    /// op: the decode trip's, one batch a core, and the prompt trip's, every batch on every core.
+    pub const fn one_op_over(self, batch: u32) -> bool {
+        match self {
+            WalkDivision::Batches(n) => n == batch,
+            WalkDivision::HeadsInner { .. } => true,
         }
     }
 }
@@ -830,10 +863,10 @@ impl BundleLayout {
     }
 
     /// The division an elementwise op under the law takes: the scratchpad plan's row groups while it
-    /// is in force ([`Self::lx_row_groups`]), else the law's own resolution.
+    /// is in force ([`Self::lx_division`]), else the law's own resolution.
     pub fn ew_law(&self, stick_major: bool, core_local: bool) -> crate::work::EwDivision {
-        match self.lx_row_groups.get() {
-            Some(n) => crate::work::EwDivision::Groups(n),
+        match self.lx_division.get() {
+            Some(d) => crate::work::EwDivision::Groups(d.row_groups()),
             None => crate::work::EwDivision::Law.resolve(stick_major, core_local),
         }
     }
@@ -842,9 +875,9 @@ impl BundleLayout {
     /// else rows first.
     pub fn reduce_rows(&self) -> crate::ir::bridge::tiled_op_sdsc_op::reduce::ReduceDivision {
         use crate::ir::bridge::tiled_op_sdsc_op::reduce::ReduceDivision;
-        self.lx_row_groups
-            .get()
-            .map_or(ReduceDivision::Rows, ReduceDivision::Groups)
+        self.lx_division.get().map_or(ReduceDivision::Rows, |d| {
+            ReduceDivision::Groups(d.row_groups())
+        })
     }
 
     /// Log one op's touch of one tensor while the planner's probe runs; a no-op otherwise.

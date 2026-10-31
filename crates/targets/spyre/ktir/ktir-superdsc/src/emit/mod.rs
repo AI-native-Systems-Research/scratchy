@@ -1938,14 +1938,23 @@ fn core_local_reads_agree(
 /// (`[planes][per-core rows][stick]`), so the window's plane sits `plane · per-core rows · stick` into
 /// the core's slice. `None` for any other offset view, and for a view whose rows are not split as a
 /// whole tensor's would be.
+///
+/// A view whose STICK dim the op splits is a one-stick buffer read stick-major (an inner spray's
+/// `[y, mb · stick]`, its rows along the stick dim): each core's slice of it is a block of those
+/// rows, so the plane is the whole view, and only an offset of whole views is one — the window's
+/// plane sits that many core slices in.
 fn stick_plane(op: &OpSpec, v: &ArgView<'_>) -> Option<u32> {
     let plan = &op.iter;
     let stick = v.df.elems_per_stick();
     let (mut rows, mut per_core) = (1u32, 1u32);
+    let mut lanes = (stick, stick);
     for (&d, &sc) in v.layout.iter().zip(v.scale.iter()) {
         if d == v.stick {
             if !matches!(sc, Scale::Active) || !plan.extent(d).is_multiple_of(stick) {
                 return None;
+            }
+            if plan.per_core_extent(d) < plan.extent(d) {
+                lanes = (plan.extent(d), plan.per_core_extent(d));
             }
             continue;
         }
@@ -1955,9 +1964,9 @@ fn stick_plane(op: &OpSpec, v: &ArgView<'_>) -> Option<u32> {
         rows *= plan.extent(d);
         per_core *= plan.per_core_extent(d);
     }
-    let plane = rows.checked_mul(stick)?;
+    let plane = rows.checked_mul(lanes.0)?;
     (v.offset_elems > 0 && v.offset_elems.is_multiple_of(plane))
-        .then(|| v.offset_elems / plane * per_core * stick)
+        .then(|| v.offset_elems / plane * per_core * lanes.1)
 }
 
 /// One core's slice of the tensor `v` names, in bytes, and where each core's slice starts in the

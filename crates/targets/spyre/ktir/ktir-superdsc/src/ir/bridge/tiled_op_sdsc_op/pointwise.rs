@@ -875,6 +875,123 @@ pub fn assemble_page_gather_blocks(
         .map_err(|e| format!("assemble_page_gather_blocks {op_name}: {e}"))
 }
 
+/// What a [`expand_blocks_opspec`] copies: `batch` stick-major `[rows, cols]` blocks, each `group`
+/// times.
+#[derive(Clone, Copy, Debug)]
+pub struct ExpandedBlocks {
+    pub batch: u32,
+    pub group: u32,
+    pub rows: u32,
+    pub cols: u32,
+}
+
+/// ⭐ torch-spyre's KERNEL EXPANSION — `batch` stick-major `[rows, cols]` blocks copied `group` times
+/// each, into `batch · group` blocks one after another: block `i·group + j` is block `i`. The
+/// reference's compiled prompt trip contracts each query head against a kernel block of its own, so
+/// it lays Kᵀ and V once per query head of a group (its `ReStickifyOpHBM` and its V relayout, the
+/// group dim broadcast on the read side), and every core of its row-split contraction then reads
+/// one kernel at one start.
+///
+/// An `identity` over `N_ {mb: batch, x: group, y: rows, out: cols}`, one block a core: the source
+/// read with `x` broadcast, both sides stated to dxp innermost-first as stick-major blocks
+/// (`['y','out','x','mb']`).
+pub fn expand_blocks_opspec(
+    src: &str,
+    dst: &str,
+    ExpandedBlocks {
+        batch,
+        group,
+        rows,
+        cols,
+    }: ExpandedBlocks,
+) -> Result<OpSpec, String> {
+    let df = Df::Fp16;
+    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
+    if batch == 0 || group < 2 || rows == 0 {
+        return Err(format!(
+            "expand_blocks_opspec('{src}' -> '{dst}'): {batch} block(s) of {rows} rows, {group} \
+             times each — an expansion copies whole blocks at least twice"
+        ));
+    }
+    let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df,
+    };
+    let dims = [
+        dim("mb", batch, false),
+        dim("x", group, false),
+        dim("y", rows, false),
+        dim("out", cols, true),
+    ];
+    let (mb_cores, x_cores) = {
+        let mb = crate::work::core_split(batch, MAX_CORES);
+        (mb, crate::work::core_split(group, MAX_CORES / mb))
+    };
+    let plan = crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
+        std::collections::BTreeMap::from([("mb", mb_cores), ("x", x_cores)])
+    })?;
+    let layout = ["mb", "x", "y", "out"];
+    let arg = |is_input: bool, name: &str, scale: [Scale; 4]| -> Result<_, String> {
+        Ok(AnyTensorArg::R4(
+            TensorArg::<4>::new(
+                is_input,
+                name.to_string(),
+                Role::Output,
+                scale,
+                plan.iter_syms(layout),
+                layout,
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_device_order(["y", "out", "x", "mb"])
+            .map_err(|e| e.0)?,
+        ))
+    };
+    let args = vec![
+        arg(
+            true,
+            src,
+            [
+                Scale::Active,
+                Scale::RedNonStick,
+                Scale::Active,
+                Scale::Active,
+            ],
+        )?,
+        arg(false, dst, [Scale::Active; 4])?,
+    ];
+    Ok(OpSpec {
+        op: OpFunc::Identity,
+        is_reduction: false,
+        iter: plan,
+        args,
+        op_info: OpInfo::None,
+        tiled_symbols: vec![],
+        time_tile: None,
+        indirect: None,
+        coordinate_mask: None,
+    })
+}
+
+/// [`expand_blocks_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_expand_blocks(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    blocks: ExpandedBlocks,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = expand_blocks_opspec(src, dst, blocks)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_expand_blocks {op_name}: {e}"))
+}
+
 /// ⭐ A STICK PERMUTE'S DIRECTION — between the two card frames of `R` rows of `C` sticks:
 /// STICK-MAJOR `[R, C·stick]` (stick column `c`'s `R` rows contiguous: bytes `[C][R][stick]`) and
 /// ROW-MAJOR `[R·C, stick]` (row `r`'s `C` sticks contiguous: bytes `[R][C][stick]`).
@@ -2049,6 +2166,66 @@ mod page_gather_blocks_tests {
             panic!("an entry of two positions is two blocks' worth of one");
         };
         assert!(m.contains("one `mb` position"), "{m}");
+    }
+}
+
+#[cfg(test)]
+mod expand_blocks_tests {
+    use super::*;
+
+    /// ⭐ granite's Kᵀ for the prompt trip: 8 kv heads' `[64, 128]` blocks, each laid for its 4 query
+    /// heads. Core `kv·4 + g` reads kv head `kv`'s block and writes query head `kv·4 + g`'s.
+    #[test]
+    fn each_query_head_gets_its_kv_heads_block() {
+        let op = expand_blocks_opspec(
+            "Tensor0",
+            "Tensor1",
+            ExpandedBlocks {
+                batch: 8,
+                group: 4,
+                rows: 64,
+                cols: 128,
+            },
+        )
+        .expect("the expansion builds");
+        assert_eq!(op.iter.cores_used().get(), 32, "one block a core");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let v = serde_json::to_value(
+            crate::emit::emit_sdsc("expand_o1", &op, &folds, None).expect("it emits"),
+        )
+        .expect("json");
+        let tree = v["dscs_"][0]["expand_o1"]["scheduleTree_"]
+            .as_array()
+            .expect("a tree")
+            .clone();
+        let starts = |i: usize| -> Vec<u64> {
+            let data = &tree[i]["startAddressCoreCorelet_"]["data_"];
+            let at = |c: u32| -> u64 {
+                data[format!("[{c}, 0, 0]")]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("a concrete start")
+            };
+            (0..32).map(|c| at(c) - at(0)).collect()
+        };
+        let block = 64 * 128 * 2;
+        assert_eq!(
+            starts(0),
+            (0..32u64).map(|c| c / 4 * block).collect::<Vec<_>>(),
+            "kv head c/4's block"
+        );
+        assert_eq!(
+            starts(1),
+            (0..32u64).map(|c| c * block).collect::<Vec<_>>(),
+            "query head c's block"
+        );
+        for n in &tree[..2] {
+            assert_eq!(
+                n["layoutDimOrder_"],
+                serde_json::json!(["y", "out", "x", "mb"]),
+                "stick-major blocks"
+            );
+        }
     }
 }
 

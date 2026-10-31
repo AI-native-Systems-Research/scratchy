@@ -26,7 +26,7 @@ use super::EmittedOp;
 use super::lower_ktir_to_superdsc::{Error, err};
 use crate::ktir_node::KtirNode;
 use crate::place::PlaceId;
-use crate::placement::{BundleLayout, LX_PIN_BASE, LX_PIN_END, LxShare, LxTouch};
+use crate::placement::{BundleLayout, LX_PIN_BASE, LX_PIN_END, LxShare, LxTouch, WalkDivision};
 
 /// The 128-byte pin granularity [`BundleLayout::synth_lx_core_local`] reserves at.
 const PIN_ALIGN: u64 = 128;
@@ -42,16 +42,17 @@ struct Candidate {
     total: u64,
 }
 
-/// Plan `node`'s function into `layout` ([`BundleLayout::lx_planned`], [`BundleLayout::lx_row_groups`]).
+/// Plan `node`'s function into `layout` ([`BundleLayout::lx_planned`], [`BundleLayout::lx_division`]).
 /// `probe` lowers the function into the layout it is handed; it runs on copies of `layout`, once per
 /// candidate division, and its descriptors are thrown away. Run before the real lowering, which
 /// [`check`] then holds to the plan.
 ///
 /// ⭐ THE DIVISION IS PLANNED WITH THE RESIDENCY, as torch-spyre co-optimises them
-/// (`co_optimizing_lx_planning`): each candidate — the ops' own divisions, and one row group per batch
-/// of the program's batched contractions ([`crate::work::EwDivision::Groups`], torch-spyre's decode
-/// trip, one kv head a core) — is probed, and the one that keeps the most bytes in LX wins; a tie keeps
-/// the ops' own.
+/// (`co_optimizing_lx_planning`): each candidate — the ops' own divisions, one row group per batch of
+/// the program's batched contractions (torch-spyre's decode trip, one kv head a core), and the
+/// program's per-head rows held query-row-major and split into chunks (its prompt trip,
+/// [`crate::placement::WalkDivision::HeadsInner`]) — is probed, and the one that keeps the most bytes
+/// in LX wins; a tie keeps the ops' own.
 pub(crate) fn plan(
     node: &KtirNode,
     layout: &BundleLayout,
@@ -72,10 +73,19 @@ pub(crate) fn plan(
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     };
-    let mut best: Option<(u64, Option<u32>, Vec<Candidate>, MintRecord)> = None;
-    for groups in std::iter::once(None).chain(batch_groups(node).into_iter().map(Some)) {
+    let mut best: Option<(u64, Option<WalkDivision>, Vec<Candidate>, MintRecord)> = None;
+    let candidates = batch_groups(node)
+        .into_iter()
+        .map(WalkDivision::Batches)
+        .chain(heads_inner(node));
+    // Every probe mints from the record the plan started with: a division that mints in another
+    // order would otherwise find a key an earlier probe recorded under a tid this probe has since
+    // handed to a different value, and address the two as one tensor.
+    let initial = record();
+    for groups in std::iter::once(None).chain(candidates.map(Some)) {
+        *node.minted.lock().unwrap_or_else(|p| p.into_inner()) = initial.clone();
         let copy = layout.clone();
-        copy.lx_row_groups.set(groups);
+        copy.lx_division.set(groups);
         *copy.lx_probe.borrow_mut() = Some(Vec::new());
         // A division the program cannot take — a form that refuses its shape — is no candidate, as
         // torch-spyre's search drops an illegal split; the ops' own division must lower.
@@ -106,7 +116,7 @@ pub(crate) fn plan(
     // The real lowering mints as the chosen division's probe did, so the record it replays is that
     // probe's, whichever candidate ran last.
     *node.minted.lock().unwrap_or_else(|p| p.into_inner()) = minted_under;
-    layout.lx_row_groups.set(groups);
+    layout.lx_division.set(groups);
     layout.lx_planned.borrow_mut().extend(
         chosen
             .into_iter()
@@ -136,6 +146,31 @@ fn batch_groups(node: &KtirNode) -> Vec<u32> {
         }
     }
     groups
+}
+
+/// The query-row-major division of a program that lays per-head rows head-major — a
+/// `linalg.transpose` `[1, 0, 2]` of `[rows, heads, width]`, spyre-inference's
+/// `q_rows.reshape(P, num_heads, D).transpose(0, 1)` — with more than one row a head: its rows split
+/// into as many whole chunks as the cores take ([`crate::work::core_split`]). `None` for a program
+/// with no such relayout or one row a head (a decode step: its rows are its heads).
+fn heads_inner(node: &KtirNode) -> Option<WalkDivision> {
+    node.func.ops_deep().into_iter().find_map(|op| {
+        let is_102 = op.op_type == ktir_core::opkind::OpKind::LinalgTranspose
+            && op.attributes.iter().any(|(k, v)| {
+                matches!(
+                    (k, v),
+                    (ktir_core::attrkey::AttrKey::Permutation, ktir_core::ir::Attr::IntList(p))
+                        if *p == [1, 0, 2]
+                )
+            });
+        let [_, rows, _] = op.result_type?.dims()? else {
+            return None;
+        };
+        let rows = u32::try_from(*rows).ok()?;
+        (is_102 && rows > 1).then(|| WalkDivision::HeadsInner {
+            chunks: crate::work::core_split(rows, crate::superdsc_opspec::MAX_CORES),
+        })
+    })
 }
 
 /// After the real lowering: every tensor the plan kept in LX was minted and declared there. A plan
