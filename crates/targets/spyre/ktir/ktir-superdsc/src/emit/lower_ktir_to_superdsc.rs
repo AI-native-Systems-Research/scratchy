@@ -6147,12 +6147,19 @@ pub fn fill(
 /// output as those blocks ([`batch_transpose`]), and a one-stick-wide `[b·k, n]` flat frame IS them.
 /// The caller proves which of the two its kernel is; the descriptor here reads blocks.
 ///
+/// An activation in [`BatchFrame::Blocks`] is read the same way, batch `i` the standalone stick-major
+/// `[m, k]` at `i·m·k`. The walk lays a multi-stick activation so before the contraction: a slice of
+/// the flat frame wider than a stick has its sticks `b·m` rows apart, and the card's contraction steps
+/// them by its own `m` rows whatever the descriptor states (MEASURED on granite-3.1-8b's score leg,
+/// the query's second stick read from the next kv head).
+///
 /// ⛔ THE BATCH DOES NOT RIDE `y`. A `y`-batched contraction shares ONE kernel across the batch
 /// (`SharedKernelBmmForm`'s own law — a 3-D kernel is dxp garbage), and each batch here has its own:
 /// the score leg's `Kᵀ` page block and the value leg's `V` page block of its kv head.
 pub fn batch_matmul(
     name: &str,
     batch: u32,
+    activation: BatchFrame,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
@@ -6206,10 +6213,17 @@ pub fn batch_matmul(
                     n: MatN::of_out_features(n),
                     k: MatK::of_in_features(k),
                     rows,
+                    a_rows: match activation {
+                        BatchFrame::Flat => rows,
+                        BatchFrame::Blocks => m,
+                    },
                 },
                 RowsOperand {
                     h: &a_h,
-                    off: i * m * stick,
+                    off: match activation {
+                        BatchFrame::Flat => i * m * stick,
+                        BatchFrame::Blocks => i * m * k,
+                    },
                 },
                 RowsOperand {
                     h: &w_h,
@@ -7864,35 +7878,42 @@ mod elementwise_tests {
         }
     }
 
-    /// ⭐⭐ A HEAD-DIM-128 CONTRACTION'S QUERY SLICE WALKS THE QUERY'S OWN ROWS — granite-3.1-8b's
-    /// score leg: 8 kv heads, each an `[84, 128]` slice of the `[672, 128]` head-major query
-    /// contracted against its `[128, 64]` Kᵀ block. Left to `-1`, dxp strided the slice's second
-    /// stick by the op's 84 rows and read the next kv head's first stick. Pinned, the walk is the
-    /// query's `[672, 128]`. At head dim 64 (one stick) nothing moves: the walk stays `-1`.
+    /// ⭐⭐ A HEAD-DIM-128 CONTRACTION READS ITS QUERY AS BATCH BLOCKS — granite-3.1-8b's score leg:
+    /// 8 kv heads, each an `[84, 128]` query block contracted against its `[128, 64]` Kᵀ block. As a
+    /// slice of the `[672, 128]` flat frame, the card stepped the slice's second stick by the op's 84
+    /// rows (MEASURED: the card's scores match that read at rel-rms 0.0012, pinned walk or not), so
+    /// the walk hands the contraction standalone blocks: kv head `i`'s activation `i·84·128` elements
+    /// in, walked as its own `[84, 128]` (`-1`), its scores still rows `i·84..` of the output.
     #[test]
-    fn a_multi_stick_batch_slice_walks_its_tensors_rows() {
-        let walk = |hd: u32| {
-            let r = node(
-                reg(5, 672, hd, false),
-                reg(6, 8 * hd, 64, false),
-                reg(7, 672, 64, true),
-            );
-            let mut sym = 0i64;
-            let ops = batch_matmul("bmm_s3", 8, &r, &mut sym, None).expect("the score leg lowers");
-            assert_eq!(ops.len(), 8, "one contraction per kv head");
-            let sdsc = ops[1].op.as_ref().expect("an emitted descriptor");
-            let dsc = sdsc.dscs_[0].values().next().expect("one descriptor");
-            serde_json::to_value(&dsc.scheduleTree_[0].maxDimSizes_).expect("the walk serializes")
-        };
-        assert_eq!(
-            walk(128),
-            serde_json::json!([672, 128]),
-            "the query's own rows"
+    fn a_multi_stick_batch_reads_its_activation_as_blocks() {
+        let r = node(
+            reg(5, 672, 128, false),
+            reg(6, 8 * 128, 64, false),
+            reg(7, 672, 64, true),
         );
+        let mut sym = 0i64;
+        let ops = batch_matmul("bmm_s3", 8, BatchFrame::Blocks, &r, &mut sym, None)
+            .expect("the score leg lowers");
+        assert_eq!(ops.len(), 8, "one contraction per kv head");
+        for (i, op) in ops.iter().enumerate() {
+            let i = i as u32;
+            assert_eq!(
+                bound_at(op, "t5"),
+                i * 84 * 128,
+                "kv head {i}: its own query block"
+            );
+            assert_eq!(
+                bound_at(op, "t7"),
+                i * 84 * 64,
+                "kv head {i}: its rows of the scores"
+            );
+        }
+        let sdsc = ops[1].op.as_ref().expect("an emitted descriptor");
+        let dsc = sdsc.dscs_[0].values().next().expect("one descriptor");
         assert_eq!(
-            walk(64),
+            serde_json::to_value(&dsc.scheduleTree_[0].maxDimSizes_).expect("the walk serializes"),
             serde_json::json!([-1, -1]),
-            "one stick: byte-identical"
+            "a standalone block: dxp rebuilds its own [84, 128]"
         );
     }
 
