@@ -313,6 +313,33 @@ impl WindowCut {
     }
 }
 
+/// Two consecutive collectives, in the order the card runs them, that use ONE window cut — the
+/// second's send could land while the first's consume is still reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CutReused {
+    /// The later collective's position in run order.
+    pub collective: usize,
+    pub cut: WindowCut,
+}
+
+/// ⭐ THE LAW THE TWO CUTS STAND ON: consecutive collectives, in the order the card RUNS them, use
+/// different cuts. [`WindowCut`]'s proof needs exactly this — the peer may send `k + 2` into `k`'s
+/// cut only because `k + 1`, in the other cut, sits between them. `cuts` is one entry per
+/// collective, in run order (a rolled body counts once per layer it is replayed for).
+///
+/// # Errors
+/// [`CutReused`]: the first collective whose cut is its predecessor's.
+pub fn cuts_alternate(cuts: impl IntoIterator<Item = WindowCut>) -> Result<(), CutReused> {
+    let mut last = None;
+    for (collective, cut) in cuts.into_iter().enumerate() {
+        if last == Some(cut) {
+            return Err(CutReused { collective, cut });
+        }
+        last = Some(cut);
+    }
+    Ok(())
+}
+
 /// The most messages one window cut holds — the width of a rank's landing-slot budget. A forward
 /// whose widest collective operand needs more refuses at bake ([`RecvWindow::cut_bytes_for`]).
 pub const MAX_CUT_MESSAGES: u32 = 8;
@@ -702,6 +729,29 @@ mod tests {
         assert_eq!(ids[0].peer(), Some(ids[1]));
         assert_eq!(ids[1].peer(), Some(ids[0]));
         assert_eq!(TpWorld::of::<1>().ranks().next().unwrap().peer(), None);
+    }
+
+    /// Consecutive collectives in run order must alternate cuts: an even run per replayed layer
+    /// passes, and a layer with ONE collective replayed twice reuses its cut, refused at the second.
+    #[test]
+    fn consecutive_collectives_alternate_cuts_or_refuse() {
+        let c = WindowCut::of_collective;
+        assert_eq!(cuts_alternate([c(0), c(1), c(0), c(1)]), Ok(()));
+        assert_eq!(cuts_alternate([]), Ok(()));
+        assert_eq!(
+            cuts_alternate([c(0), c(0)]),
+            Err(CutReused {
+                collective: 1,
+                cut: c(0)
+            })
+        );
+        assert_eq!(
+            cuts_alternate([c(0), c(1), c(1)]),
+            Err(CutReused {
+                collective: 2,
+                cut: c(1)
+            })
+        );
     }
 
     /// Every (rank, slot) of a two-rank world signals on a sid of its own, all within the card's.
