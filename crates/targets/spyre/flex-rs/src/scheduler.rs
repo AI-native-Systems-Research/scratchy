@@ -77,8 +77,8 @@ use crate::address::{ByteSize, Chunk, CompositeAddress};
 use crate::compute::{ComputeParams, ComputeWireBatch};
 use crate::control_block_wire::{
     AllocationTotalSize, ControlBlockWire, DevicePhysicalAddress, Flits, HostPhysicalAddress,
-    RdmaEndpoint, RdmaUnicastSend, ResponseTag, SegmentExtent, TransferSize, VirtualAddressSbf,
-    XlatWindow,
+    RdmaEndpoint, RdmaUnicastSend, ResponseTag, RunPlace, SegmentExtent, TransferSize,
+    VirtualAddressSbf, XlatWindow,
 };
 use crate::dma::{DmaDirection, DmaParams, DmaPipelineShape, FillParams, FillPipeline};
 use crate::flex_config::{DeviceKind, RuntimeConfig};
@@ -1342,6 +1342,8 @@ pub struct RdmaSendParams {
     /// This card's own receive window: the card-symmetric layout puts the peer's at the same
     /// address.
     pub window: RdmaOperand,
+    /// This message's place in its send's run.
+    pub place: RunPlace,
 }
 
 /// Build the F-send CB for `send`. Each endpoint's segment translates through ITS BASE exactly as
@@ -1384,6 +1386,7 @@ pub fn build_rdma_send_cb(
         length: send.length,
         source: endpoint("source", &send.source)?,
         window: endpoint("window", &send.window)?,
+        place: send.place,
     };
     ControlBlockWire::rdma_unicast_send(tag, &wire, pipeline_barrier)
         .map_err(|e| mock_error(&format!("build_rdma_send_cb: {e:?}")))
@@ -6248,6 +6251,7 @@ mod resolve_single_chunk_tests {
                 segment: 1,
                 offset: 61440,
             },
+            place: RunPlace::ALONE,
         };
         let why = build_rdma_send_cb(&resolver, &send, ResponseTag(1), true)
             .unwrap_err()

@@ -1739,6 +1739,25 @@ pub struct RdmaUnicastSend {
     pub length: TransferSize,
     pub source: RdmaEndpoint,
     pub window: RdmaEndpoint,
+    /// This message's place in its send's run of messages.
+    pub place: RunPlace,
+}
+
+/// A message's place in its send's run — the send section's own `first` / `last` protocol bits.
+/// The vendor's windowed P2P loop cuts a transfer into chunks of at most one message and sets
+/// `first` on the first chunk and `last` on the final one; a one-message send is both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunPlace {
+    pub first: bool,
+    pub last: bool,
+}
+
+impl RunPlace {
+    /// The only message of its send.
+    pub const ALONE: Self = Self {
+        first: true,
+        last: true,
+    };
 }
 
 /// Why an RDMA control block could not be built.
@@ -1769,8 +1788,9 @@ impl ControlBlockWire {
     /// differs. Two endpoints in one segment must agree on that segment's translation, or the build
     /// refuses ([`RdmaCbError::SegmentTranslationsDisagree`]).
     ///
-    /// The send is one whole message (`first` and `last`), never a T-send (`xsegv` is false; the
-    /// receiver programs its own `XSEG[sid]`, [`window_xseg`]).
+    /// The CB is ONE message of its send's run ([`RunPlace`]); a wider send is a run of these, each
+    /// waited for once. Never a T-send (`xsegv` is false; the receiver programs its own
+    /// `XSEG[sid]`, [`window_xseg`]).
     ///
     /// # Errors
     /// [`RdmaCbError`]: disagreeing translations, an oversized translation, or the shim's refusal
@@ -1786,6 +1806,7 @@ impl ControlBlockWire {
             length,
             source,
             window,
+            place,
         } = *send;
         let mut xlat = [XlatEntry::invalid(); 8];
         let src_segment = source.dmva.segment();
@@ -1816,8 +1837,8 @@ impl ControlBlockWire {
                 src_segment: u64::from(src_segment),
                 src_offset_bytes: source.dmva.offset().to_bytes(),
                 dest_remote_base_bytes: compensated_remote_base(window.dmva),
-                first: true,
-                last: true,
+                first: place.first,
+                last: place.last,
                 sync: false,
                 xsegv: false,
             })
@@ -1837,6 +1858,10 @@ impl ControlBlockWire {
     /// one count of each sid's counter, so a send and its wait balance (#1007 §3: wdone is a
     /// counter).
     ///
+    /// The section's `sync` is SET, as the vendor's `launchOperationP2PRdmaWait` stamps it
+    /// (the shape measured on card). `pipeline_barrier` is the CTRL section's barrier bit, a
+    /// different bit.
+    ///
     /// # Errors
     /// The shim's refusal (an empty list, a sid past the mask) or a duplicate sid, by name.
     pub fn rdma_wdone_wait(
@@ -1845,7 +1870,7 @@ impl ControlBlockWire {
         pipeline_barrier: bool,
     ) -> Result<Self, RdmaCbError> {
         let sids: Vec<u64> = sids.iter().map(|&s| u64::from(s)).collect();
-        let words = crate::hal_sbf::rdma10_wdone_wait(&sids, false).map_err(RdmaCbError::Shim)?;
+        let words = crate::hal_sbf::rdma10_wdone_wait(&sids, true).map_err(RdmaCbError::Shim)?;
         Ok(Self::assemble(
             CtrlSection::new(tag, pipeline_barrier),
             R5Section::none(),
@@ -2932,6 +2957,7 @@ mod tests {
                 dmva: VirtualAddressSbf::new(1, Flits(1024)),
                 xlat: at(0x2_0000_0000),
             },
+            place: RunPlace::ALONE,
         };
         assert_eq!(
             ControlBlockWire::rdma_unicast_send(ResponseTag(1), &send, false),
