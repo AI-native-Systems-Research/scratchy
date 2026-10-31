@@ -962,10 +962,6 @@ impl SpyreWorker {
             "[weights] staged {} weight(s) for the session",
             weights.len()
         );
-        // Startup timing: the stretch from here to the first card call (device_memory_bytes,
-        // below) is pure host work — pool strides, census, bundle resolution — and sits inside
-        // the unlogged gap before "Logical Device ID". Named, not guessed.
-        let staged_to_card_t0 = std::time::Instant::now();
         // NOTE: the RoPE rotate-half permutation P (ROPE_P_TID) is NOT a load-time weight.
         // It is a synthetic seg0 ACTIVATION re-bound per step in `superdsc_forward_chunk`
         // (see the `acts` block there) — a seg1 weight would only be H2D'd at PrepareModel,
@@ -1380,10 +1376,6 @@ impl SpyreWorker {
                 // ⛔ `None` REFUSES, IT DOES NOT FALL BACK. A capacity query that fails and quietly returns
                 // to 8 GiB is the defect restored under a log line, and a *plausible* default is worse than
                 // none — it sizes a real allocation the card may not serve.
-                tracing::info!(
-                    "[startup] host wiring (staged weights → first card call) took {:#?}",
-                    staged_to_card_t0.elapsed()
-                );
                 let card_bytes = scratchy_target_spyre::runtime::device_memory_bytes()
                     .ok_or_else(|| {
                         werr(
@@ -2365,6 +2357,7 @@ impl SpyreWorker {
                 // static bundles; `spill_tids` and the consts are borrowed for the scope's
                 // lifetime. The adoption and every refusal run on THIS thread after the
                 // join, in ladder order.
+                let _t_prefix_fanout = std::time::Instant::now();
                 let prefix_built_sessions: Vec<Result<SuperDscSession, (u32, String)>> =
                     std::thread::scope(|scope| {
                         let prefix_consts = wirings
@@ -2372,42 +2365,54 @@ impl SpyreWorker {
                             .as_ref()
                             .unwrap_or(&wirings.decode)
                             .load_consts;
-                        prefix_jobs
+                        // Spawn EVERY rung first, join in a second pass — a `map` that joins
+                        // inside the closure is lazy, so it would run each build to completion
+                        // before the next thread exists. The prefill ladder's own shape.
+                        let handles: Vec<_> = prefix_jobs
                             .iter()
                             .map(|job| {
                                 let spill = &spill_tids;
-                                scope
-                                    .spawn(move || {
-                                        SuperDscSession::new_borrowing_with_consts(
-                                            job.rcode,
-                                            vocab,
-                                            kv_dim,
-                                            num_blocks,
-                                            &[1, 2],
-                                            // The general mint's nine tables, this bundle's
-                                            // own seg3 copy.
-                                            prefix_consts,
-                                            spill,
+                                scope.spawn(move || {
+                                    SuperDscSession::new_borrowing_with_consts(
+                                        job.rcode,
+                                        vocab,
+                                        kv_dim,
+                                        num_blocks,
+                                        &[1, 2],
+                                        // The general mint's nine tables, this bundle's
+                                        // own seg3 copy.
+                                        prefix_consts,
+                                        spill,
+                                    )
+                                    .map_err(|e| {
+                                        (
+                                            job.pmq,
+                                            format!(
+                                                "prefix-capable prefill m={} session build \
+                                                 failed: {e} — every rung the bake shipped \
+                                                 must load",
+                                                job.pmq
+                                            ),
                                         )
-                                        .map_err(|e| {
-                                            (
-                                                job.pmq,
-                                                format!(
-                                                    "prefix-capable prefill m={} session build \
-                                                     failed: {e} — every rung the bake shipped \
-                                                     must load",
-                                                    job.pmq
-                                                ),
-                                            )
-                                        })
                                     })
-                                    .join()
-                                    .unwrap_or_else(|_| {
-                                        Err((0, "prefix rung build thread panicked".to_string()))
-                                    })
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            // A panicked rung thread re-panics HERE with its own payload —
+                            // the original message and location, not a replacement string.
+                            .map(|h| match h.join() {
+                                Ok(r) => r,
+                                Err(p) => std::panic::resume_unwind(p),
                             })
                             .collect()
                     });
+                info!(
+                    "[spyre-worker] sendnn: prefix rung fan-out: {} rung(s) built in {:.0} ms",
+                    prefix_jobs.len(),
+                    _t_prefix_fanout.elapsed().as_secs_f64() * 1e3
+                );
                 for (job, built) in prefix_jobs.into_iter().zip(prefix_built_sessions) {
                     let mut ps = built.unwrap_or_else(|(_, m)| panic!("{m}"));
                     adopt_from_owner(&mut ps, &ss, &spill_images).unwrap_or_else(|e| {
@@ -2654,42 +2659,55 @@ impl SpyreWorker {
                 // jobs are independent `new_borrowing` builds over static bundles;
                 // `spill_tids` is borrowed for the scope's lifetime. The adoption and every
                 // refusal run on THIS thread after the join, in ladder order.
+                let _t_decode_fanout = std::time::Instant::now();
                 let decode_built_sessions: Vec<Result<SuperDscSession, (usize, String)>> =
                     std::thread::scope(|scope| {
-                        decode_jobs
+                        // Spawn EVERY rung first, join in a second pass — a `map` that joins
+                        // inside the closure is lazy, so it would run each build to completion
+                        // before the next thread exists. The prefill ladder's own shape.
+                        let handles: Vec<_> = decode_jobs
                             .iter()
                             .map(|job| {
                                 let spill = &spill_tids;
-                                scope
-                                    .spawn(move || {
-                                        SuperDscSession::new_borrowing_with_consts(
-                                            job.rcode,
-                                            vocab,
-                                            kv_dim,
-                                            num_blocks,
-                                            &[1, 2],
-                                            job.rung_consts,
-                                            spill,
+                                scope.spawn(move || {
+                                    SuperDscSession::new_borrowing_with_consts(
+                                        job.rcode,
+                                        vocab,
+                                        kv_dim,
+                                        num_blocks,
+                                        &[1, 2],
+                                        job.rung_consts,
+                                        spill,
+                                    )
+                                    .map_err(|e| {
+                                        (
+                                            job.rn,
+                                            format!(
+                                                "decode batch rung seqs={} FAILED to build \
+                                                 ({e}) — every rung the bake shipped must \
+                                                 load",
+                                                job.rn
+                                            ),
                                         )
-                                        .map_err(|e| {
-                                            (
-                                                job.rn,
-                                                format!(
-                                                    "decode batch rung seqs={} FAILED to build \
-                                                     ({e}) — every rung the bake shipped must \
-                                                     load",
-                                                    job.rn
-                                                ),
-                                            )
-                                        })
                                     })
-                                    .join()
-                                    .unwrap_or_else(|_| {
-                                        Err((0, "decode rung build thread panicked".to_string()))
-                                    })
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            // A panicked rung thread re-panics HERE with its own payload —
+                            // the original message and location, not a replacement string.
+                            .map(|h| match h.join() {
+                                Ok(r) => r,
+                                Err(p) => std::panic::resume_unwind(p),
                             })
                             .collect()
                     });
+                info!(
+                    "[spyre-worker] sendnn: decode rung fan-out: {} rung(s) built in {:.0} ms",
+                    decode_jobs.len(),
+                    _t_decode_fanout.elapsed().as_secs_f64() * 1e3
+                );
                 for (job, built) in decode_jobs.into_iter().zip(decode_built_sessions) {
                     let mut rs = built.unwrap_or_else(|(_, m)| panic!("{m}"));
                     adopt_from_owner(&mut rs, &ss, &spill_images).unwrap_or_else(|e| {
