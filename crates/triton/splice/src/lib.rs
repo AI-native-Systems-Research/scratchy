@@ -4295,11 +4295,48 @@ mod walk_on_the_card {
         triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints")
     }
 
+    /// ⭐⭐ THE DECODE TRIP IN torch-spyre's FORM AT HEAD DIM 64 — its compiled program's: one kv head a
+    /// core for every op of the trip, the page's Kᵀ re-laid by ONE all-heads restickify, the scores
+    /// and the value product each ONE all-heads contraction, and the kernels, the scores and the
+    /// probabilities all in each core's LX, beside the carried accumulator.
+    #[test]
+    fn the_decode_trip_runs_one_kv_head_a_core_in_lx() {
+        let node = walk_at(1, 4, 64);
+        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+        allocate_paged_cache(&node, &layout).expect("the cache allocates");
+        let mut sym = 0i64;
+        let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+            .unwrap_or_else(|e| panic!("the walk lowers: {}", e.message));
+        let named = |prefix: &str| -> Vec<&ktir_superdsc::emit::EmittedOp> {
+            ops.iter()
+                .filter(|e| e.op_name.starts_with(prefix))
+                .collect()
+        };
+        let lx = |name: &str| layout.lx_core_local(name);
+        let bmms = named("bmm");
+        assert_eq!(
+            bmms.iter()
+                .map(|e| e.op_name.as_str())
+                .collect::<Vec<_>>()
+                .len(),
+            2,
+            "the scores and the value product, one all-heads contraction each: {:?}",
+            bmms.iter().map(|e| &e.op_name).collect::<Vec<_>>()
+        );
+        assert_eq!(named("transpose").len(), 1, "one all-heads restickify");
+        for e in &bmms {
+            assert!(e.walk.is_some(), "{}: on every trip", e.op_name);
+            let [_, kernel, out] = e.arg_bindings.as_slice() else {
+                panic!("{}: activation, kernel, output", e.op_name);
+            };
+            assert!(lx(&kernel.buffer), "{}: its kernel in LX", e.op_name);
+            assert!(lx(&out.buffer), "{}: its product in LX", e.op_name);
+        }
+    }
+
     /// ⭐ THE SCRATCHPAD PLAN ON THE DECODE WALK — torch-spyre's LX planning: the carried output
     /// accumulator lives in each core's LX across the whole walk (seeded before it, accumulated by
-    /// every trip, divided after it), while every tensor a per-kv-head contraction touches stays in
-    /// HBM, since each core gets a different slice of it there than the elementwise ops around it
-    /// give it.
+    /// every trip, divided after it).
     #[test]
     fn the_decode_walk_keeps_its_accumulator_in_lx() {
         for hd in [64, 128] {
@@ -4331,16 +4368,6 @@ mod walk_on_the_card {
                 touching.iter().any(|e| e.walk.is_some()),
                 "hd {hd}: {acc} is accumulated on every trip"
             );
-            for e in ops.iter().filter(|e| e.op_name.starts_with("bmm")) {
-                for a in &e.arg_bindings {
-                    assert!(
-                        !lx(&a.buffer),
-                        "hd {hd}: {} reads {} — a per-kv-head contraction's tensors stay in HBM",
-                        e.op_name,
-                        a.buffer
-                    );
-                }
-            }
         }
     }
 

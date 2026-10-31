@@ -6198,6 +6198,42 @@ pub fn batch_matmul(
         ));
     }
     let rows = batch * m;
+    // ⭐ THE ALL-HEADS FORM, under the scratchpad plan that divides the walk one batch a core
+    // ([`crate::emit::lx_plan`]): ONE contraction, core `x` on batch `x`, its kernel in that core's
+    // LX — torch-spyre's own decode trip. The plan takes the division only if it keeps the kernel
+    // core-local; the probe says the form needs it, and the real lowering refuses it otherwise.
+    if let Some(l) = layout
+        && l.lx_row_groups.get() == Some(batch)
+        && activation == BatchFrame::Flat
+    {
+        let w_name = w.name();
+        if l.lx_probe.borrow().is_some() {
+            l.note_lx_touch(name, &w_name, crate::placement::LxShare::Required);
+        } else if !l.lx_core_local(&w_name) {
+            return err(format!(
+                "{name}: the all-heads contraction's kernel t{} is not core-local in LX — the plan \
+                 that divides this walk one batch a core keeps it there, and a per-core kernel read \
+                 from HBM faulted on the card",
+                w.tid
+            ));
+        }
+        let op = crate::ir::bridge::tiled_op_sdsc_op::matmul::opspec::matmul_opspec_x_batched(
+            batch,
+            (m, n, k),
+            (&a.name(), &w_name, &out.name()),
+        )
+        .map_err(|message| Error {
+            message: format!("{name}: {message}"),
+        })?;
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+        return Ok(vec![emit_sdsc_tiled(
+            &format!("bmm_o{}", out.tid),
+            &op,
+            &folds,
+            sym_id_base,
+            layout,
+        )?]);
+    }
     let (a_h, w_h, o_h) = (
         rb(&a.name(), rows, k),
         Stk::<KernelTag>::kernel(k as usize, (batch * n) as usize, w.name()),
@@ -6317,6 +6353,24 @@ pub fn batch_transpose(
         rb(&a.name(), a.v_rows, cols),
         rb(&out.name(), out.v_rows, rows),
     );
+    // ⭐ THE ALL-HEADS FORM, under the plan that divides the walk one batch a core: ONE relayout, core
+    // `i` on batch `i` (torch-spyre's decode trip), so each core's block lands where the all-heads
+    // contraction on that core reads its kernel.
+    if layout.is_some_and(|l| l.lx_row_groups.get() == Some(batch)) {
+        return Ok(vec![
+            super::try_assemble_restickify_transpose_batched(
+                &format!("transpose_o{}", out.tid),
+                batch,
+                (rows, cols),
+                (&a_h, &o_h),
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error {
+                message: format!("{name}: {message}"),
+            })?,
+        ]);
+    }
     let mut ops = Vec::with_capacity(batch as usize);
     for i in 0..batch {
         ops.push(

@@ -2004,6 +2004,12 @@ pub enum ViewFrame {
     /// bytes (a stick permute's stick-major side). The tensor's arrangement is derived from it
     /// ([`StickLayout::of_stick_columns`]).
     StickColumns,
+    /// ⭐ The view's non-stick dims fold, OUTERMOST FIRST, into the ROWS of a stick-major
+    /// `[rows, stick]` tensor — the flat frame a walk's rank-3 values live in, which a batched
+    /// contraction iterates as `[x, mb, stick]`. Arranged and addressed as that flat tensor
+    /// ([`StickLayout::row_blocked_df`]): core `(x, mb)`'s slice starts at row `x·MB + mb` of it,
+    /// the row the flat frame's own row-wise ops hand the same core.
+    FoldedRows,
 }
 
 #[derive(Clone, Debug)]

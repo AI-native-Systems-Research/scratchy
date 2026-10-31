@@ -31,6 +31,9 @@ use crate::placement::{BundleLayout, LX_PIN_BASE, LX_PIN_END, LxShare, LxTouch};
 /// The 128-byte pin granularity [`BundleLayout::synth_lx_core_local`] reserves at.
 const PIN_ALIGN: u64 = 128;
 
+/// A node's mint record ([`KtirNode::minted`]), as one candidate's probe left it.
+type MintRecord = std::collections::HashMap<crate::ktir_node::MintKey, u32>;
+
 /// One tensor the plan may keep in LX: its id, one core's slice, and the HBM bytes it saves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Candidate {
@@ -63,20 +66,46 @@ pub(crate) fn plan(
             .collect()
     };
     let free = (LX_PIN_END - LX_PIN_BASE).saturating_sub(layout.lx_window_bytes());
-    let mut best: Option<(u64, Option<u32>, Vec<Candidate>)> = None;
+    let record = || {
+        node.minted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    };
+    let mut best: Option<(u64, Option<u32>, Vec<Candidate>, MintRecord)> = None;
     for groups in std::iter::once(None).chain(batch_groups(node).into_iter().map(Some)) {
         let copy = layout.clone();
         copy.lx_row_groups.set(groups);
         *copy.lx_probe.borrow_mut() = Some(Vec::new());
-        probe(&copy)?;
+        // A division the program cannot take — a form that refuses its shape — is no candidate, as
+        // torch-spyre's search drops an illegal split; the ops' own division must lower.
+        match probe(&copy) {
+            Ok(_) => {}
+            Err(_) if groups.is_some() => continue,
+            Err(e) => return Err(e),
+        }
         let touches = copy.lx_probe.borrow_mut().take().unwrap_or_default();
         let chosen = choose(&touches, &minted(), free);
+        // A form that needs a tensor core-local takes this division only if the plan keeps it there.
+        let kept_names: BTreeSet<String> = chosen
+            .iter()
+            .map(|c| crate::place::act_name(c.tid))
+            .collect();
+        if touches
+            .iter()
+            .any(|t| t.share == LxShare::Required && !kept_names.contains(&t.tensor))
+        {
+            continue;
+        }
         let kept: u64 = chosen.iter().map(|c| c.total).sum();
         if best.as_ref().is_none_or(|(b, ..)| kept > *b) {
-            best = Some((kept, groups, chosen));
+            best = Some((kept, groups, chosen, record()));
         }
     }
-    let (_, groups, chosen) = best.unwrap_or_default();
+    let (_, groups, chosen, minted_under) = best.unwrap_or_default();
+    // The real lowering mints as the chosen division's probe did, so the record it replays is that
+    // probe's, whichever candidate ran last.
+    *node.minted.lock().unwrap_or_else(|p| p.into_inner()) = minted_under;
     layout.lx_row_groups.set(groups);
     layout.lx_planned.borrow_mut().extend(
         chosen
@@ -130,7 +159,7 @@ pub(crate) fn check(layout: &BundleLayout, what: &str) -> Result<(), Error> {
 /// save) while their slices fit `free` bytes of the pin window.
 fn choose(touches: &[LxTouch], minted: &BTreeSet<u32>, free: u64) -> Vec<Candidate> {
     let mut by_tensor: BTreeMap<&str, Vec<&LxShare>> = BTreeMap::new();
-    for t in touches {
+    for t in touches.iter().filter(|t| t.share != LxShare::Required) {
         by_tensor
             .entry(t.tensor.as_str())
             .or_default()
