@@ -7597,6 +7597,17 @@ impl Worker for MetalWorker {
                 self.kv_cached_through.remove(req_id);
             }
         }
+        // So does its drafter's: it gives back its ring slot and its cycle in flight (the scheduler
+        // dropped its drafts). Its re-admission plans its replay, whose commits, from the snapshot
+        // it resumes at, rebuild the rings it had. Held instead, a ring slot a preempted request
+        // waits on is one a full batch's next request finds taken.
+        if let (Some(d), Some(preempted)) =
+            (self.dflash2.as_mut(), &scheduler_output.preempted_req_ids)
+        {
+            for req_id in preempted {
+                d.release(req_id);
+            }
+        }
         self.input_batch.update_states(scheduler_output);
         // A recompute over cached KV, from the request's (re)admission on.
         for op in &scheduler_output.recurrent_state.cached_kv {
