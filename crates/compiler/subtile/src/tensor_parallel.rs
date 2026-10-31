@@ -967,6 +967,51 @@ pub fn slice_source<T: Copy>(
     }
 }
 
+/// ⭐ WHAT A COLLECTIVE MEANS — its value on every rank, given every rank's buffers in ABSOLUTE
+/// RANK ORDER (`ranks[r]` is rank `r`'s). An [`SubOp::AllReduce`] sums its operand over the ranks
+/// in that order; an [`SubOp::AllGather`] concatenates their column blocks in that order. The one
+/// law [`eval_ranks`] and any lockstep reference over a rank's own buffers read.
+///
+/// # Panics
+/// On a node that is not a collective.
+pub fn eval_collective<F: RopeForm>(
+    node: &crate::subtile_ir::SubtileNode<F>,
+    graph: &SubtileIR<F>,
+    ranks: &[&[Vec<f32>]],
+) -> Vec<f32> {
+    use crate::subtile_ir::gather;
+    match node.op {
+        SubOp::AllReduce => {
+            let parts: Vec<Vec<f32>> = ranks
+                .iter()
+                .map(|b| gather(&node.inputs[0], graph, b).0)
+                .collect();
+            let mut sum = parts[0].clone();
+            for p in &parts[1..] {
+                for (a, x) in sum.iter_mut().zip(p) {
+                    *a += *x;
+                }
+            }
+            sum
+        }
+        SubOp::AllGather { .. } => {
+            let parts: Vec<(Vec<f32>, u32, u32)> = ranks
+                .iter()
+                .map(|b| gather(&node.inputs[0], graph, b))
+                .collect();
+            let (rows, lc) = (parts[0].1 as usize, parts[0].2 as usize);
+            let mut all = Vec::with_capacity(rows * lc * ranks.len());
+            for i in 0..rows {
+                for p in &parts {
+                    all.extend_from_slice(&p.0[i * lc..(i + 1) * lc]);
+                }
+            }
+            all
+        }
+        _ => panic!("{} is not a collective", node.op.name()),
+    }
+}
+
 /// Evaluate a sharded forward's local graph on every rank IN LOCKSTEP — the host reference for
 /// what the collectives mean. `sources[r]` is rank `r`'s source buffers (already sliced). Every
 /// non-collective node runs per rank through [`crate::subtile_ir::eval_node`]; an
@@ -978,7 +1023,7 @@ pub fn eval_ranks<F: RopeForm>(
     world: WorldSize,
     sources: &[Vec<Vec<f32>>],
 ) -> Vec<Vec<Vec<f32>>> {
-    use crate::subtile_ir::{eval_node, gather, scatter};
+    use crate::subtile_ir::{eval_node, scatter};
     let w = world.get() as usize;
     assert_eq!(sources.len(), w, "one source set per rank");
     let mut bufs: Vec<Vec<Vec<f32>>> = sources
@@ -998,32 +1043,9 @@ pub fn eval_ranks<F: RopeForm>(
     for node in &graph.nodes {
         let shape: TensorShape = graph.shape(node.output.tensor);
         let outs: Vec<Vec<f32>> = match node.op {
-            SubOp::AllReduce => {
-                let parts: Vec<Vec<f32>> = bufs
-                    .iter()
-                    .map(|b| gather(&node.inputs[0], graph, b).0)
-                    .collect();
-                let mut sum = parts[0].clone();
-                for p in &parts[1..] {
-                    for (a, x) in sum.iter_mut().zip(p) {
-                        *a += *x;
-                    }
-                }
-                vec![sum; w]
-            }
-            SubOp::AllGather { .. } => {
-                let parts: Vec<(Vec<f32>, u32, u32)> = bufs
-                    .iter()
-                    .map(|b| gather(&node.inputs[0], graph, b))
-                    .collect();
-                let (rows, lc) = (parts[0].1 as usize, parts[0].2 as usize);
-                let mut all = Vec::with_capacity(rows * lc * w);
-                for i in 0..rows {
-                    for p in &parts {
-                        all.extend_from_slice(&p.0[i * lc..(i + 1) * lc]);
-                    }
-                }
-                vec![all; w]
+            SubOp::AllReduce | SubOp::AllGather { .. } => {
+                let ranks: Vec<&[Vec<f32>]> = bufs.iter().map(|b| b.as_slice()).collect();
+                vec![eval_collective(node, graph, &ranks); w]
             }
             _ => bufs.iter().map(|b| eval_node(node, graph, b)).collect(),
         };
