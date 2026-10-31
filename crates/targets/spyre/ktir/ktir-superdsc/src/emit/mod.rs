@@ -50,6 +50,7 @@ pub mod loop_fold;
 /// crosses a model-geometry const door ([`lower_ktir_to_superdsc::rope_at`]) is a public generic
 /// entry point the CALLER instantiates.
 pub mod lower_ktir_to_superdsc;
+pub mod lx_plan;
 /// THE WHOLE-FUNCTION DOOR — walk a multi-op KTIR program in program order and dispatch each
 /// compute op to the per-kind entry point that already lowers it. A producer that hands over a
 /// whole kernel (a Triton-derived `IRFunction` holding an MLP's two projections and its silu, or a
@@ -1817,13 +1818,7 @@ fn core_local_reads_agree(
                  walks a different slice per trip, and the pin holds one"
             )));
         }
-        let plan = &op.iter;
-        let slice_bytes = v
-            .layout
-            .iter()
-            .map(|d| u64::from(plan.per_core_extent(d)))
-            .product::<u64>()
-            * u64::from(v.df.word_length());
+        let (slice_bytes, corners) = core_slices(op, v)?;
         let (_, pin_bytes) = l.lx_pin(name).unwrap_or_default();
         if slice_bytes > pin_bytes {
             return Err(SuperDscError(format!(
@@ -1831,37 +1826,85 @@ fn core_local_reads_agree(
                  past its {pin_bytes}-byte pin"
             )));
         }
-        // Where each core's slice starts in the tensor's device layout: the very per-core START an HBM
-        // operand of this view would carry (`per_core_addr` over `view_stick_layout`, at base 0).
-        let as_hbm = ArgView {
-            is_input: v.is_input,
-            name: v.name,
-            role: v.role,
-            scale: v.scale,
-            device_dims: v.device_dims,
-            layout: v.layout,
-            stick: v.stick,
-            allocation: Allocation::Hbm,
-            offset_elems: v.offset_elems,
-            df: v.df,
-            row_blocked: v.row_blocked,
-            device_extent: v.device_extent,
-            frame: v.frame,
-            device_order: v.device_order,
-        };
-        let dims: Vec<&'static str> = plan.dims().iter().map(|d| d.name).collect();
-        let corners = per_core_addr(
-            0,
-            &as_hbm,
-            &view_stick_layout(&as_hbm, plan),
-            plan,
-            &crate::work::core_to_wk_slice(plan, &dims),
-            0,
-            plan.cores_used().get(),
-        )?;
         let signature = format!("each core's {slice_bytes} B slice at {corners:?}");
         l.record_lx_division(name, op_name, signature)
             .map_err(SuperDscError)?;
+    }
+    Ok(())
+}
+
+/// One core's slice of the tensor `v` names, in bytes, and where each core's slice starts in the
+/// tensor's device layout: the very per-core START an HBM operand of this view would carry
+/// (`per_core_addr` over `view_stick_layout`, at base 0). The signature the core-local read law
+/// compares ([`core_local_reads_agree`]) and the planner's probe logs ([`note_lx_touches`]).
+fn core_slices(op: &OpSpec, v: &ArgView<'_>) -> Result<(u64, Vec<u64>), SuperDscError> {
+    let plan = &op.iter;
+    let slice_bytes = v
+        .layout
+        .iter()
+        .map(|d| u64::from(plan.per_core_extent(d)))
+        .product::<u64>()
+        * u64::from(v.df.word_length());
+    let as_hbm = ArgView {
+        is_input: v.is_input,
+        name: v.name,
+        role: v.role,
+        scale: v.scale,
+        device_dims: v.device_dims,
+        layout: v.layout,
+        stick: v.stick,
+        allocation: Allocation::Hbm,
+        offset_elems: v.offset_elems,
+        df: v.df,
+        row_blocked: v.row_blocked,
+        device_extent: v.device_extent,
+        frame: v.frame,
+        device_order: v.device_order,
+    };
+    let dims: Vec<&'static str> = plan.dims().iter().map(|d| d.name).collect();
+    let corners = per_core_addr(
+        0,
+        &as_hbm,
+        &view_stick_layout(&as_hbm, plan),
+        plan,
+        &crate::work::core_to_wk_slice(plan, &dims),
+        0,
+        plan.cores_used().get(),
+    )?;
+    Ok((slice_bytes, corners))
+}
+
+/// The scratchpad planner's probe ([`BundleLayout::lx_probe`]): how this op hands every tensor it
+/// names out to its cores — its slices, or why it cannot share the tensor core-locally (torch-spyre's
+/// `_BufferResidencyChecks`: a tensor read as indices or through them, an op walking it a trip at a
+/// time, and a view of part of it). A no-op outside the probe.
+fn note_lx_touches(
+    op_name: &str,
+    op: &OpSpec,
+    views: &[ArgView<'_>],
+    layout: Option<&BundleLayout>,
+) -> Result<(), SuperDscError> {
+    let Some(l) = layout else { return Ok(()) };
+    if l.lx_probe.borrow().is_none() {
+        return Ok(());
+    }
+    let indirect: Vec<usize> = op
+        .indirect
+        .iter()
+        .flat_map(|i| [i.index, i.value])
+        .collect();
+    for (i, v) in views.iter().enumerate() {
+        let share = if indirect.contains(&i) {
+            crate::placement::LxShare::Indirect
+        } else if op.time_tile.is_some() {
+            crate::placement::LxShare::TimeTiled
+        } else if v.offset_elems != 0 {
+            crate::placement::LxShare::Partial
+        } else {
+            let (bytes, corners) = core_slices(op, v)?;
+            crate::placement::LxShare::Slices { bytes, corners }
+        };
+        l.note_lx_touch(op_name, v.name, share);
     }
     Ok(())
 }
@@ -3293,6 +3336,7 @@ pub fn emit_sdsc(
         }
     }
     core_local_reads_agree(op_name, op, &views, layout)?;
+    note_lx_touches(op_name, op, &views, layout)?;
     // fp8 W8A8 matmul: a matmul/batchmatmul with an fp8 (SEN143_FP8) NON-OUTPUT operand. The DDL
     // `batchmatmulfp8` kernel (bmm.ddl:55) + its dataflow constraint require a DISTINCT operand layout
     // vs the fp16 kernel (verified against IBM's l0_tethering/fp8_32core_nonmx fixture): the fp8 WEIGHT

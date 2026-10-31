@@ -3428,14 +3428,13 @@ pub(super) fn mint_scratch(
 
 fn mint(k: &KtirNode, layout: &BundleLayout, floor: u32, key: crate::ktir_node::MintKey) -> u32 {
     let mut minted = k.minted.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(&tid) = minted.get(&key)
-        && layout
-            .synth
-            .borrow()
-            .map
-            .contains_key(&crate::place::act_name(tid))
-    {
-        return tid;
+    // Declared by this layout either way: an HBM synthetic, or a core-local LX one the scratchpad
+    // plan kept there ([`super::lx_plan`]).
+    if let Some(&tid) = minted.get(&key) {
+        let name = crate::place::act_name(tid);
+        if layout.synth.borrow().map.contains_key(&name) || layout.lx_core_local(&name) {
+            return tid;
+        }
     }
     let tid = layout.take_inter_tid(floor);
     minted.insert(key, tid);
@@ -3763,12 +3762,35 @@ pub fn lower_walk(
     layout: Option<&BundleLayout>,
     sym_id_base: &mut i64,
 ) -> Result<Vec<super::EmittedOp>, Error> {
-    match super::loop_fold::flatten(k)? {
-        Some(flat) => {
-            lower_function_folded(&flat.node, layout, sym_id_base, None, Some(&flat.fold))
-        }
-        None => lower_function_folded(k, layout, sym_id_base, None, None),
+    let flat = super::loop_fold::flatten(k)?;
+    let (node, fold) = match &flat {
+        Some(flat) => (&flat.node, Some(&flat.fold)),
+        None => (k, None),
+    };
+    // ⭐ torch-spyre plans LX before it emits ([`super::lx_plan`]): a probe lowering learns how every
+    // op slices every tensor, and the plan keeps in LX what every op hands out alike.
+    let Some(layout) = layout else {
+        return lower_function_folded(node, None, sym_id_base, None, fold);
+    };
+    super::lx_plan::plan(node, layout, |probe| {
+        let mut sym = *sym_id_base;
+        lower_function_folded(node, Some(probe), &mut sym, None, fold)
+    })?;
+    let probed = node
+        .minted
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let ops = lower_function_folded(node, Some(layout), sym_id_base, None, fold)?;
+    if *node.minted.lock().unwrap_or_else(|p| p.into_inner()) != probed {
+        return err(format!(
+            "{}: the scratchpad plan's probe and the real lowering minted different tensors, so the \
+             plan's ids name other buffers",
+            node.func.name
+        ));
     }
+    super::lx_plan::check(layout, node.func.name)?;
+    Ok(ops)
 }
 
 fn lower_function_folded(

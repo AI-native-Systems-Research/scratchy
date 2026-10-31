@@ -1017,8 +1017,9 @@ pub fn pointwise_opspec_from_tile(
         .unwrap_or(1);
     // The builder's own rank-2 decision (`stickmajor` below) — the division follows it.
     let stick_major = !head_major && rows > 1;
-    let core_local = layout
-        .is_some_and(|l| l.lx_core_local(o_name) || in_names.iter().any(|n| l.lx_core_local(n)));
+    let core_local = layout.is_some_and(|l| {
+        l.pointwise_core_local(std::iter::once(o_name).chain(in_names.iter().copied()))
+    });
     pointwise_opspec_from_tile_split(
         tile_op,
         op,
@@ -1289,7 +1290,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // ⭐ THE DIVISION FOLLOWS THE LAYOUT JUST DECIDED for an ungathered op — the same
     // `stickmajor`, so the operands' rank and the cores' cut are one decision. See `EwDivision`.
     let core_local = layout.is_some_and(|l| {
-        l.lx_core_local(o_name) || inputs.iter().any(|i| l.lx_core_local(i.name()))
+        l.pointwise_core_local(std::iter::once(o_name).chain(inputs.iter().map(|i| i.name())))
     });
     // ⭐⭐⭐ A GATHERED OP'S SPLIT IS ITS `GatherSplit` (`crate::work`), VERBATIM — not resolved from the operand
     // layout (the elementwise law's input) and not consulted for `stickmajor`: only the entry

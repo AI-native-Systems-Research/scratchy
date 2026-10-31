@@ -3950,7 +3950,8 @@ fn pointwise_width_the_output_holds(
                 .placements
                 .get(&tid)
                 .map(|p| p.size)
-                .or_else(|| l.synth.borrow().sizes.get(name).copied()),
+                .or_else(|| l.synth.borrow().sizes.get(name).copied())
+                .or_else(|| l.lx_full_size(name)),
             _ => l.synth.borrow().sizes.get(name).copied(),
         }?;
         // A footprint is `synth_footprint_bytes`: the INNER (column) axis stick-rounded, the outer

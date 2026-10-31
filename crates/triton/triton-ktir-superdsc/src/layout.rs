@@ -714,6 +714,10 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // No pinned-LX intermediates: the triton shim emits no rmsnorm-style scratchpad
         // tensors, so the per-core pin registry starts empty — same role as `synth` above.
         lx: Default::default(),
+        // No scratchpad plan yet, and no probe running: the plan is made per walking program, at
+        // its lowering (`ktir_superdsc::emit::lx_plan`), into the layout this returns.
+        lx_planned: Default::default(),
+        lx_probe: Default::default(),
         // The arrangement authority starts empty and every op declares into it — that is the point:
         // the FIRST op to address a tensor fixes its device layout and a later disagreement is a
         // build error. Pre-seeding it would pre-decide arrangements no descriptor has stated.
