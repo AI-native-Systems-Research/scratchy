@@ -5745,7 +5745,10 @@ impl Executor {
         if total == 0 {
             return Ok(());
         }
-        const CHUNK: NonZeroU64 = NonZeroU64::new(8 << 20).unwrap();
+        // 64 MB windows: with no host buffer in the fill, the window size only sets how many
+        // fill control blocks the walk submits (16384 MB / 64 MB = 256, against 2048 at the
+        // 8 MB the host-push needed). Each CB is a fixed enqueue cost on both host and device.
+        const CHUNK: NonZeroU64 = NonZeroU64::new(64 << 20).unwrap();
         let stream = self.stream_ref()?;
         // DEVICE-SIDE FILL, not host-pushed zeros. The host→device path is the bottleneck:
         // pushing 8 MB windows of zeros measured ~2.25 ms per window (≈3.5 GB/s effective on a
