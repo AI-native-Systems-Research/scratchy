@@ -75,7 +75,9 @@ fn runtime_cell() -> &'static Mutex<Option<RuntimeInit>> {
 /// asked the topology which domain is real, and this module does not invent a multi-domain
 /// topology query that has no call site anywhere else.
 fn build_runtime() -> Result<Arc<RuntimeContext>, BringUpError> {
-    let rc = unsafe { flex_rs::senlib_ffi::flex_shim_init_runtime(0) };
+    // A `CardIndex` is a `u16`, so it always fits the shim's `i32`.
+    let card = driven_card().get() as i32;
+    let rc = unsafe { flex_rs::senlib_ffi::flex_shim_init_runtime(card) };
     if rc != 0 {
         return Err(BringUpError::ShimInit(rc));
     }
@@ -121,6 +123,86 @@ fn build_runtime() -> Result<Arc<RuntimeContext>, BringUpError> {
     .map_err(BringUpError::Scheduler)?;
 
     RuntimeContext::create(None, scheduler, allocator).map_err(BringUpError::Context)
+}
+
+/// A card's PCI enumeration index (`sen_pci_card_count` / `pcie_address_for_card`), which is also
+/// the logical device id `flex_shim_init_runtime` opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CardIndex(u16);
+
+impl CardIndex {
+    /// The card a process drives when nothing chose one.
+    pub const FIRST: Self = Self(0);
+
+    pub const fn new(index: u16) -> Self {
+        Self(index)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0 as u32
+    }
+}
+
+impl fmt::Display for CardIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "card {}", self.0)
+    }
+}
+
+fn card_cell() -> &'static OnceLock<CardIndex> {
+    static CARD: OnceLock<CardIndex> = OnceLock::new();
+    &CARD
+}
+
+/// The card this process's runtime opens: the one [`drive_card`] chose, else [`CardIndex::FIRST`].
+pub fn driven_card() -> CardIndex {
+    card_cell().get().copied().unwrap_or(CardIndex::FIRST)
+}
+
+/// The process already drives another card. A process holds ONE runtime (senlib's PF handle is
+/// process-global), so it drives one card for its life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CardTaken {
+    pub driving: CardIndex,
+    pub asked: CardIndex,
+}
+
+impl fmt::Display for CardTaken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "this process already drives {} and cannot open {} — one runtime per process, one \
+             card per runtime",
+            self.driving, self.asked
+        )
+    }
+}
+
+impl std::error::Error for CardTaken {}
+
+/// Choose the card this process drives, BEFORE anything brings the runtime up (a bring-up with no
+/// choice opens [`CardIndex::FIRST`] and fixes it). Choosing the card already driven is a no-op.
+///
+/// # Errors
+/// [`CardTaken`] when the process already drives (or chose) another card.
+pub fn drive_card(card: CardIndex) -> Result<(), CardTaken> {
+    // Held across the choice: a bring-up reads `driven_card` under this same lock, so none can
+    // start between the check and the choice.
+    let runtime = runtime_cell().lock().unwrap_or_else(|e| e.into_inner());
+    let driving = if runtime.is_some() {
+        driven_card()
+    } else {
+        *card_cell().get_or_init(|| card)
+    };
+    drop(runtime);
+    if driving == card {
+        Ok(())
+    } else {
+        Err(CardTaken {
+            driving,
+            asked: card,
+        })
+    }
 }
 
 fn get_or_init_runtime() -> Result<Arc<RuntimeContext>, Arc<BringUpError>> {
@@ -1263,12 +1345,11 @@ impl DevAddr {
 //  The p2p link — tensor parallelism's one load-time fact
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// The cards a sharded session spans, by PCI enumeration index (`sen_pci_card_count` /
-/// `pcie_address_for_card`): the one this process drives and its peer's.
+/// The cards a sharded session spans: the one this process drives and its peer's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CardPair {
-    pub own: u32,
-    pub peer: u32,
+    pub own: CardIndex,
+    pub peer: CardIndex,
 }
 
 /// The ids a rank's collective control blocks name: its own sid (its sends signal on it), the
@@ -1303,7 +1384,14 @@ pub enum AttachRefusal {
     /// A world of one has no peer.
     NoPeer(TpIdentity),
     /// The peer card is this card.
-    SelfLoop { card: u32 },
+    SelfLoop { card: CardIndex },
+    /// The link names a card this process does not drive.
+    NotDriven(CardTaken),
+    /// The process is already linked, as another rank or for another window.
+    AlreadyLinked {
+        linked: (TpIdentity, RecvWindow),
+        asked: (TpIdentity, RecvWindow),
+    },
     /// The cross-port IOMMU mapping to the peer card was refused.
     Mapping(flex_rs::multi_device::RdmaUnitError),
     /// The runtime this card's side of the link needs did not come up.
@@ -1325,6 +1413,12 @@ impl fmt::Display for AttachRefusal {
                 f,
                 "the peer card is this card ({card}) — a rank cannot send to itself"
             ),
+            Self::NotDriven(e) => write!(f, "the link's own card is not this process's: {e}"),
+            Self::AlreadyLinked { linked, asked } => write!(
+                f,
+                "this process is linked as {linked:?} and cannot link again as {asked:?} — one \
+                 card has one XSEG[peer sid], so every bundle it runs shares one window"
+            ),
             Self::Mapping(e) => write!(
                 f,
                 "the cross-port p2p mapping to the peer card was refused: {e:?} (device p2p RDMA \
@@ -1339,68 +1433,101 @@ impl fmt::Display for AttachRefusal {
 impl std::error::Error for AttachRefusal {}
 
 /// ⭐ THE P2P LINK A SHARDED SESSION SENDS OVER — tensor parallelism's one load-time fact: which
-/// physical card is the peer. Minted only by [`PeerLink::attach`], which maps the peer card over
-/// the cross-port IOMMU (device p2p RDMA, `P2pProtocol::P2pRdma` — never host DMA) and programs this
+/// physical card is the peer. Minted only by [`link_peer`], which maps the peer card over the
+/// cross-port IOMMU (device p2p RDMA, `P2pProtocol::P2pRdma` — never host DMA) and programs this
 /// card's `XSEG[peer sid]` with the receive window's word, the same word every peer send carries.
 /// A session holding one has done both, so its sends have somewhere to land and its waits have
 /// something to count.
+///
+/// ONE PER PROCESS. The process drives one card and the card has one `XSEG[peer sid]`, so every
+/// bundle the process runs (decode, prefill, every rung) lands its peer's sends in the one window
+/// the link programmed — [`crate::superdsc_exec::Executor::load`] refuses a bundle whose window is
+/// elsewhere.
+#[derive(Debug)]
 pub struct PeerLink {
     me: TpIdentity,
     route: PeerRoute,
-    /// Holds the peer's mapping for the session's life.
-    _unit: flex_rs::multi_device::RdmaUnit,
+    window: RecvWindow,
 }
 
 impl PeerLink {
-    /// Link rank `me`, driving `cards.own`, to its peer on `cards.peer`, for sends landing in
-    /// `window`.
-    ///
-    /// # Errors
-    /// [`AttachRefusal`], by name.
-    pub fn attach(
-        me: TpIdentity,
-        cards: CardPair,
-        window: RecvWindow,
-    ) -> Result<Self, AttachRefusal> {
-        let route = PeerRoute::of(me).ok_or(AttachRefusal::NoPeer(me))?;
-        if cards.own == cards.peer {
-            return Err(AttachRefusal::SelfLoop { card: cards.own });
-        }
-        init_runtime().map_err(|e| AttachRefusal::BringUp(e.to_string()))?;
-        let mut unit = flex_rs::multi_device::RdmaUnit::new(
-            flex_rs::multi_device::RankId(me.rank()),
-            me.world().get(),
-            true,
-        );
-        unit.attach_peer(
-            flex_rs::multi_device::RankId(u32::from(route.dest_tid)),
-            cards.peer,
-            window.end(),
-        )
-        .map_err(AttachRefusal::Mapping)?;
-        let landing = flex_rs::control_block_wire::VirtualAddressSbf::new(
-            RecvWindow::SEGMENT as u8,
-            flex_rs::control_block_wire::Flits::from_bytes(window.offset()),
-        );
-        let word =
-            flex_rs::control_block_wire::window_xseg(landing).map_err(AttachRefusal::Xseg)?;
-        flex_rs::senlib_ffi::write_xseg(route.peer_sid, word).map_err(AttachRefusal::Xseg)?;
-        Ok(Self {
-            me,
-            route,
-            _unit: unit,
-        })
-    }
-
-    /// The rank this session runs as.
+    /// The rank this process runs as.
     pub fn identity(&self) -> TpIdentity {
         self.me
     }
 
-    /// The ids this session's sends and waits name.
+    /// The ids this process's sends and waits name.
     pub fn route(&self) -> PeerRoute {
         self.route
     }
+
+    /// Where the peer's sends land on this card.
+    pub fn window(&self) -> RecvWindow {
+        self.window
+    }
+}
+
+fn link_cell() -> &'static Mutex<Option<&'static PeerLink>> {
+    static LINK: Mutex<Option<&'static PeerLink>> = Mutex::new(None);
+    &LINK
+}
+
+/// The link this process made, when it runs one rank of a sharded world.
+pub fn peer_link() -> Option<&'static PeerLink> {
+    *link_cell().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Link this process — rank `me`, driving `cards.own` — to its peer on `cards.peer`, for sends
+/// landing in `window`. Linking again as the same rank for the same window returns the link
+/// already made.
+///
+/// # Errors
+/// [`AttachRefusal`], by name.
+pub fn link_peer(
+    me: TpIdentity,
+    cards: CardPair,
+    window: RecvWindow,
+) -> Result<&'static PeerLink, AttachRefusal> {
+    let route = PeerRoute::of(me).ok_or(AttachRefusal::NoPeer(me))?;
+    if cards.own == cards.peer {
+        return Err(AttachRefusal::SelfLoop { card: cards.own });
+    }
+    let mut cell = link_cell().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(link) = *cell {
+        return if (link.me, link.window) == (me, window) {
+            Ok(link)
+        } else {
+            Err(AttachRefusal::AlreadyLinked {
+                linked: (link.me, link.window),
+                asked: (me, window),
+            })
+        };
+    }
+    drive_card(cards.own).map_err(AttachRefusal::NotDriven)?;
+    init_runtime().map_err(|e| AttachRefusal::BringUp(e.to_string()))?;
+    let mut unit = flex_rs::multi_device::RdmaUnit::new(
+        flex_rs::multi_device::RankId(me.rank()),
+        me.world().get(),
+        true,
+    );
+    unit.attach_peer(
+        flex_rs::multi_device::RankId(u32::from(route.dest_tid)),
+        cards.peer.get(),
+        window.end(),
+    )
+    .map_err(AttachRefusal::Mapping)?;
+    let landing = flex_rs::control_block_wire::VirtualAddressSbf::new(
+        RecvWindow::SEGMENT as u8,
+        flex_rs::control_block_wire::Flits::from_bytes(window.offset()),
+    );
+    let word = flex_rs::control_block_wire::window_xseg(landing).map_err(AttachRefusal::Xseg)?;
+    flex_rs::senlib_ffi::write_xseg(route.peer_sid, word).map_err(AttachRefusal::Xseg)?;
+    // The mapping lives as long as the process: the link is never dropped, so the unit holding it
+    // is leaked rather than kept (its raw segment pointers keep it out of any process-wide value).
+    std::mem::forget(unit);
+    let link: &'static PeerLink = Box::leak(Box::new(PeerLink { me, route, window }));
+    *cell = Some(link);
+    Ok(link)
 }
 
 #[cfg(test)]
@@ -1489,15 +1616,37 @@ mod tests {
         use crate::bundle_code::collective::{TpWorld, WireBytes};
         let window = RecvWindow::new(1 << 20, WireBytes::CAP).unwrap();
         let alone = TpWorld::of::<1>().ranks().next().unwrap();
+        let pair = |own, peer| CardPair {
+            own: CardIndex::new(own),
+            peer: CardIndex::new(peer),
+        };
         assert!(matches!(
-            PeerLink::attach(alone, CardPair { own: 0, peer: 1 }, window),
+            link_peer(alone, pair(0, 1), window),
             Err(AttachRefusal::NoPeer(_))
         ));
         let rank0 = TpWorld::of::<2>().ranks().next().unwrap();
         assert!(matches!(
-            PeerLink::attach(rank0, CardPair { own: 3, peer: 3 }, window),
-            Err(AttachRefusal::SelfLoop { card: 3 })
+            link_peer(rank0, pair(3, 3), window),
+            Err(AttachRefusal::SelfLoop { card }) if card == CardIndex::new(3)
         ));
+        assert!(peer_link().is_none(), "a refused link links nothing");
+    }
+
+    /// A process drives one card: choosing it again is a no-op, choosing another is refused by
+    /// name, before any bring-up.
+    #[test]
+    fn a_process_drives_the_one_card_it_chose() {
+        let first = CardIndex::new(7);
+        drive_card(first).expect("the first choice is the card");
+        drive_card(first).expect("the same card again");
+        assert_eq!(driven_card(), first);
+        assert_eq!(
+            drive_card(CardIndex::new(8)),
+            Err(CardTaken {
+                driving: first,
+                asked: CardIndex::new(8)
+            })
+        );
     }
 
     /// The Bind shape — the only one `alloc` makes today — walks exactly as `zero_seg`'s old

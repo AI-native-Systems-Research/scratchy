@@ -108,6 +108,28 @@ impl TpWorld {
         self.0
     }
 
+    /// The world of `w` ranks when `w` is only known at run time (a launcher's `--tensor-parallel-size`):
+    /// `Some` iff [`TpWorld::of`] would compile for it.
+    pub const fn named(w: u32) -> Option<Self> {
+        if is_spyre_world(w) && w <= MAX_SIDS {
+            Some(Self(w))
+        } else {
+            None
+        }
+    }
+
+    /// Rank `r` of this world, `None` past its last rank.
+    pub const fn rank(self, r: u32) -> Option<TpIdentity> {
+        if r < self.0 {
+            Some(TpIdentity {
+                rank: r,
+                world: self,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Every rank of this world, each carrying the world it belongs to.
     pub fn ranks(self) -> impl Iterator<Item = TpIdentity> {
         (0..self.0).map(move |rank| TpIdentity { rank, world: self })
@@ -406,6 +428,18 @@ impl PlaysAt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run-time world is exactly a compile-time one, and a run-time rank is in range.
+    #[test]
+    fn a_launchers_world_and_rank_are_the_baked_ones_or_nothing() {
+        assert_eq!(TpWorld::named(1), Some(TpWorld::of::<1>()));
+        assert_eq!(TpWorld::named(2), Some(TpWorld::of::<2>()));
+        assert_eq!(TpWorld::named(0), None);
+        assert_eq!(TpWorld::named(3), None);
+        let w = TpWorld::of::<2>();
+        assert_eq!(w.rank(1), w.ranks().nth(1));
+        assert_eq!(w.rank(2), None);
+    }
 
     #[test]
     fn a_rank_carries_its_world_and_its_peer() {

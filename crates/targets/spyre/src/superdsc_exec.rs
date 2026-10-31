@@ -988,9 +988,10 @@ pub struct Executor {
     /// nothing here is consulted (or populated) off the player's own path.
     step_images: StepImageCache,
     /// ⭐ THE PEER THIS SESSION SENDS TO, when it runs one rank of a sharded world — `None` for a
-    /// world of one. Bound once, at load ([`Executor::load_rank`]); every collective's send and wait
-    /// names its route, and every consume group this session binds was chosen by its identity.
-    link: Option<PeerLink>,
+    /// world of one. Bound once, at load ([`Executor::load`] reads the process's link); every
+    /// collective's send and wait names its route, and every consume group this session binds was
+    /// chosen by its identity.
+    link: Option<&'static PeerLink>,
 }
 
 /// Per-session state for the card-side tensordump — see [`Diag::tensordump`].
@@ -1115,6 +1116,118 @@ struct ForwardHalf {
     h2d_bytes: u64,
 }
 
+/// WHICH RANK A SESSION RUNS AS — the bundle's world and the process's link, agreed at load.
+#[derive(Clone, Copy, Debug)]
+pub enum RankSeat {
+    /// A world of one: the bundle places no receive window and the process linked no peer.
+    Alone,
+    /// One rank of a sharded world: the bundle's window is the one the process's link programmed
+    /// into `XSEG[peer sid]`.
+    Linked(&'static PeerLink),
+}
+
+/// Why a bundle cannot run in this process's world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeatRefusal {
+    /// The bundle was baked for a sharded world, and this process linked no peer to send to.
+    Unlinked,
+    /// The process runs one rank of a sharded world, and the bundle was baked for a world of one.
+    UnshardedBundle,
+    /// The bundle's window is not the one the process's link programmed — the peer's sends would
+    /// land where this bundle's consumes do not read.
+    WindowMoved {
+        baked: bundle::collective::RecvWindow,
+        linked: bundle::collective::RecvWindow,
+    },
+    /// The bundle's window placement is not a flit-aligned payload.
+    Misplaced { offset: u64, size: u64 },
+}
+
+impl std::fmt::Display for SeatRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unlinked => write!(
+                f,
+                "baked for a sharded world, but this process linked no peer (`runtime::link_peer`) \
+                 — a world-of-one session cannot run it"
+            ),
+            Self::UnshardedBundle => write!(
+                f,
+                "baked for a world of one, but this process runs one rank of a sharded world"
+            ),
+            Self::WindowMoved { baked, linked } => write!(
+                f,
+                "its receive window {baked:?} is not the {linked:?} this card's XSEG[peer sid] \
+                 holds — every bundle a rank runs must bake the same window"
+            ),
+            Self::Misplaced { offset, size } => write!(
+                f,
+                "its receive window [{offset}, +{size}) is not a flit-aligned payload"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SeatRefusal {}
+
+impl RankSeat {
+    /// The seat a session over `code` takes in a process holding `link`.
+    ///
+    /// # Errors
+    /// [`SeatRefusal`], by name.
+    pub fn of(
+        code: &bundle::BundleCode<'_>,
+        link: Option<&'static PeerLink>,
+    ) -> Result<Self, SeatRefusal> {
+        Self::agree(Self::baked_window(code)?, link.map(PeerLink::window))?;
+        Ok(link.map_or(Self::Alone, Self::Linked))
+    }
+
+    /// The receive window `code` bakes — `None` for a bundle baked for a world of one. What a
+    /// rank's [`crate::runtime::link_peer`] programs, read off the bundle that will run.
+    ///
+    /// # Errors
+    /// [`SeatRefusal::Misplaced`] when the placement is not a flit-aligned payload.
+    pub fn baked_window(
+        code: &bundle::BundleCode<'_>,
+    ) -> Result<Option<bundle::collective::RecvWindow>, SeatRefusal> {
+        code.layout
+            .place(bundle::PlaceId::Act(
+                ktir_superdsc::reserved_tids::TP_RECV_TID,
+            ))
+            .map(|p| {
+                bundle::collective::WireBytes::new(p.size)
+                    .and_then(|size| bundle::collective::RecvWindow::new(p.offset, size))
+                    .ok_or(SeatRefusal::Misplaced {
+                        offset: p.offset,
+                        size: p.size,
+                    })
+            })
+            .transpose()
+    }
+
+    /// The seat law over the two windows: the bundle's and the link's, each present or not.
+    fn agree(
+        baked: Option<bundle::collective::RecvWindow>,
+        linked: Option<bundle::collective::RecvWindow>,
+    ) -> Result<(), SeatRefusal> {
+        match (baked, linked) {
+            (None, None) => Ok(()),
+            (Some(_), None) => Err(SeatRefusal::Unlinked),
+            (None, Some(_)) => Err(SeatRefusal::UnshardedBundle),
+            (Some(baked), Some(linked)) if baked == linked => Ok(()),
+            (Some(baked), Some(linked)) => Err(SeatRefusal::WindowMoved { baked, linked }),
+        }
+    }
+
+    fn link(self) -> Option<&'static PeerLink> {
+        match self {
+            Self::Alone => None,
+            Self::Linked(link) => Some(link),
+        }
+    }
+}
+
 impl Executor {
     // ──────────────────────────────────────────────────────────────────────────────────────────
     //  Create
@@ -1126,55 +1239,20 @@ impl Executor {
     ///
     /// Nothing is read from disk: `code` is `&'static` data in this binary.
     ///
-    /// A world of one: a bundle baked for a sharded world (it carries a collective's consume)
-    /// refuses here — see [`Executor::load_rank`].
+    /// ⭐ ONE LOAD FOR EVERY WORLD. The bundle says whether it was baked sharded (it places a
+    /// receive window); the process says which rank it runs as (its [`crate::runtime::peer_link`]).
+    /// The two must agree — see [`RankSeat::of`] — and a sharded session then binds only the
+    /// launch groups its rank plays.
     pub fn load(
         code: &'static bundle::BundleCode<'static>,
         vocab: Vocab,
         kv_dim: KvDim,
         num_blocks: PoolPages,
     ) -> Result<Executor> {
-        Self::load_linked(code, vocab, kv_dim, num_blocks, None)
-    }
-
-    /// [`Executor::load`] as rank `me` of a sharded world, driving `cards.own` with its peer on
-    /// `cards.peer`: links the peer first ([`PeerLink::attach`] — the p2p mapping and
-    /// `XSEG[peer sid]`, programmed with the receive window THIS bundle baked), then binds only the
-    /// launch groups `me` plays.
-    pub fn load_rank(
-        code: &'static bundle::BundleCode<'static>,
-        vocab: Vocab,
-        kv_dim: KvDim,
-        num_blocks: PoolPages,
-        me: bundle::collective::TpIdentity,
-        cards: crate::runtime::CardPair,
-    ) -> Result<Executor> {
-        let placed = code
-            .layout
-            .place(bundle::PlaceId::Act(
-                ktir_superdsc::reserved_tids::TP_RECV_TID,
-            ))
-            .ok_or_else(|| {
-                anyhow!(
-                    "bundle {} places no receive window, so it was not baked for a sharded world \
-                     — rank {} of a {}-rank world cannot run it",
-                    code.fp,
-                    me.rank(),
-                    me.world().get()
-                )
-            })?;
-        let window = bundle::collective::WireBytes::new(placed.size)
-            .and_then(|size| bundle::collective::RecvWindow::new(placed.offset, size))
-            .ok_or_else(|| {
-                anyhow!(
-                    "bundle {}: the receive window [{}, +{}) is not a flit-aligned payload",
-                    code.fp,
-                    placed.offset,
-                    placed.size
-                )
-            })?;
-        let link = PeerLink::attach(me, cards, window)?;
-        Self::load_linked(code, vocab, kv_dim, num_blocks, Some(link))
+        let link = RankSeat::of(code, crate::runtime::peer_link())
+            .map_err(|e| anyhow!("bundle {}: {e}", code.fp))?
+            .link();
+        Self::load_linked(code, vocab, kv_dim, num_blocks, link)
     }
 
     fn load_linked(
@@ -1182,7 +1260,7 @@ impl Executor {
         vocab: Vocab,
         kv_dim: KvDim,
         num_blocks: PoolPages,
-        link: Option<PeerLink>,
+        link: Option<&'static PeerLink>,
     ) -> Result<Executor> {
         let places: BTreeMap<bundle::PlaceId, &'static Placement> =
             code.layout.places.iter().map(|p| (p.id, p)).collect();
@@ -1330,7 +1408,7 @@ impl Executor {
 
     /// The rank this session runs as, when it runs one rank of a sharded world.
     fn session(&self) -> Option<bundle::collective::TpIdentity> {
-        self.link.as_ref().map(PeerLink::identity)
+        self.link.map(PeerLink::identity)
     }
 
     fn load_rolled(&mut self, m: &'static bundle::RerollMeta<'static>) -> Result<()> {
@@ -6320,8 +6398,8 @@ fn bind_ops(
             else {
                 bail!(
                     "bundle {} group {i} is a collective's consume, so the bundle was baked for a \
-                     sharded world — a world-of-one session cannot run it (load it per rank with \
-                     `Executor::load_rank`)",
+                     sharded world — a world-of-one session cannot run it (link the process's \
+                     peer before loading: `runtime::link_peer`)",
                     code.fp
                 );
             };
@@ -6610,6 +6688,34 @@ fn report_phase_timers(compute_ms: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The seat law: a bundle runs in a process only when both agree on the world — no window and
+    /// no link, or the link's window exactly — and every disagreement refuses by name.
+    #[test]
+    fn a_bundle_runs_only_where_the_process_linked_its_window() {
+        use bundle::collective::{RecvWindow, WireBytes};
+        let at = |offset| RecvWindow::new(offset, WireBytes::CAP).unwrap();
+        assert_eq!(RankSeat::agree(None, None), Ok(()));
+        assert_eq!(
+            RankSeat::agree(Some(at(1 << 20)), Some(at(1 << 20))),
+            Ok(())
+        );
+        assert_eq!(
+            RankSeat::agree(Some(at(1 << 20)), None),
+            Err(SeatRefusal::Unlinked)
+        );
+        assert_eq!(
+            RankSeat::agree(None, Some(at(1 << 20))),
+            Err(SeatRefusal::UnshardedBundle)
+        );
+        assert_eq!(
+            RankSeat::agree(Some(at(2 << 20)), Some(at(1 << 20))),
+            Err(SeatRefusal::WindowMoved {
+                baked: at(2 << 20),
+                linked: at(1 << 20)
+            })
+        );
+    }
 
     /// A compile-time-named segment cannot be out of range, and a runtime one is checked.
     #[test]
