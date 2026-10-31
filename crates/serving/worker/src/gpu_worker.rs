@@ -299,6 +299,14 @@ pub struct MetalWorker {
     argmax_kernels: Option<scratchy_target_metal::argmax::ArgmaxKernels>,
     /// The argmax baked for the draft model's logits (its forwards and chain).
     draft_argmax_kernels: Option<scratchy_target_metal::argmax::ArgmaxKernels>,
+    /// The OpenAI logprobs of emitted tokens, baked for the target's logits.
+    logprobs_kernels: Option<scratchy_target_metal::logprobs::LogprobsKernels>,
+    /// The step's logprobs entries and their scores, grown to the widest step.
+    logprobs_buffer: Option<scratchy_target_metal::residency::Pinned>,
+    /// This step's logprobs entries, set by `execute_model` for the target forward to score.
+    logprobs_step: Option<LogprobsStep>,
+    /// The raw logits rows a grammar-masked step's logprobs score, grown to the widest step.
+    logprobs_raw: Option<scratchy_target_metal::residency::Pinned>,
     /// A multi-token-prediction head drafting over a prefix of its target's vocabulary: the rest
     /// of the target's lm_head, for the steps that draft over all of it ([`vocab_suffix_draft`]).
     draft_vocab_suffix: Option<
@@ -1084,6 +1092,10 @@ impl MetalWorker {
             draft_kv_cache: None,
             argmax_kernels: None,
             draft_argmax_kernels: None,
+            logprobs_kernels: None,
+            logprobs_buffer: None,
+            logprobs_step: None,
+            logprobs_raw: None,
             draft_vocab_suffix: None,
             mtp_drafter: None,
             sampler_kernels: None,
@@ -2103,6 +2115,55 @@ impl MetalWorker {
                             && !self.mm_data_buffers.contains_key(req_id)
                             && !constrained(req_id)
                     }))
+            // A step scoring logprobs reads them back before the next one.
+            && !sched.num_scheduled_tokens.keys().any(|req_id| {
+                (self.sampling_params_map.get(req_id)).is_some_and(|p| p.logprobs.is_some())
+            })
+    }
+
+    /// The step's logprobs, by request index: a request that asked has one a token it emitted
+    /// (`sampled_token_ids`), its `logprobs` top tokens each; any other `None`.
+    fn read_logprobs(
+        &mut self,
+        req_ids: &[String],
+        sampled_token_ids: &[Vec<u32>],
+    ) -> ExecutorResult<Option<Vec<Option<Vec<scratchy_core_common::LogprobsOutput>>>>> {
+        use scratchy_core_common::{LogprobsOutput, TokenLogprob};
+        let (Some(step), Some(buffer)) = (self.logprobs_step.take(), self.logprobs_buffer.as_ref())
+        else {
+            return Ok(None);
+        };
+        let scores = step.layout.read(buffer);
+        let mut out: Vec<Option<Vec<LogprobsOutput>>> = vec![None; req_ids.len()];
+        let token = |t: &scratchy_target_metal::logprobs::TokenScore| TokenLogprob {
+            token_id: t.token,
+            logprob: t.logprob,
+            rank: t.rank,
+        };
+        for (&(i, _), score) in step.entries.iter().zip(&scores) {
+            // At most the kernel's `TOP` (20, OpenAI's `top_logprobs` maximum): a request asking
+            // more gets 20. Refusing it is the API's validation, which no backend runs yet.
+            let top = (self.sampling_params_map.get(&req_ids[i]))
+                .and_then(|p| p.logprobs)
+                .map_or(0, |n| n.max(0) as usize);
+            let emitted = &sampled_token_ids[i];
+            let tokens = out[i].get_or_insert_with(Vec::new);
+            // A verify step scores every row; the request keeps those of the tokens it emitted.
+            if tokens.len() < emitted.len() {
+                let want = emitted[tokens.len()];
+                if score.emitted.token != want {
+                    return Err(ExecutorError::WorkerExecution(format!(
+                        "logprobs of {}: scored token {}, emitted {want}",
+                        req_ids[i], score.emitted.token
+                    )));
+                }
+                tokens.push(LogprobsOutput {
+                    sampled: token(&score.emitted),
+                    top_logprobs: score.top.iter().take(top).map(token).collect(),
+                });
+            }
+        }
+        Ok(Some(out))
     }
 
     /// Wait for the oldest step still on the device and append the tokens it
@@ -3985,6 +4046,17 @@ impl MetalWorker {
         );
         let argmax_out = (*argmax.out).clone();
         let consts_buf = (*argmax.consts).clone();
+        // This step's logprobs: the target's, scored in its command buffer.
+        let logprobs = match model {
+            ModelHandle::TARGET => logprobs_pass(
+                self.logprobs_step.as_ref(),
+                self.logprobs_kernels.as_ref(),
+                &mut self.logprobs_buffer,
+                &mtl_device,
+                &residency,
+            ),
+            _ => None,
+        };
         let head = match (then, head_device) {
             (Some(passes), Some(device)) => {
                 let model = (self.draft_model.as_deref())
@@ -4139,6 +4211,19 @@ impl MetalWorker {
             .as_ref()
             .map(|k| k as *const scratchy_target_metal::sampling::SamplerKernels as usize);
         let (head_cell, head_onto_cell) = (&head, &head_onto);
+        // A grammar mask overwrites the logits in place: the step's logprobs score the raw rows,
+        // set aside before it.
+        #[cfg(feature = "guided-decoding")]
+        let masked = grammar_mask_ctx.is_some();
+        #[cfg(not(feature = "guided-decoding"))]
+        let masked = false;
+        let logprobs = match logprobs {
+            Some(pass) if masked => {
+                Some(pass.with_raw(&mut self.logprobs_raw, &mtl_device, &residency))
+            }
+            pass => pass,
+        };
+        let logprobs_device = mtl_device.clone();
         let followup: scratchy_forward_compiler::MetalForwardFollowup<'_> = Box::new(
             move |enc,
                   logits_buf,
@@ -4170,6 +4255,9 @@ impl MetalWorker {
                 // argmax can only pick a grammar-valid token. The mask emits
                 // its own pre-barrier (forward-write -> mask-read); argmax's
                 // pre-barrier then orders mask-write -> argmax-read.
+                if let Some(pass) = &logprobs {
+                    pass.set_aside(enc, logits_buf);
+                }
                 #[cfg(feature = "guided-decoding")]
                 if let Some(ref gm) = grammar_mask_ctx {
                     // Mask the FULL logits width. The shader treats any slot
@@ -4214,6 +4302,10 @@ impl MetalWorker {
                         &*(addr as *const scratchy_target_metal::sampling::SamplerKernels)
                     };
                     ps.encode_into(enc, logits_addr, &argmax_out_for_closure, kernels_ref);
+                }
+                // The step's logprobs, of the tokens the sampler left.
+                if let Some(pass) = &logprobs {
+                    pass.encode(&logprobs_device, enc, logits_addr, out_addr)?;
                 }
                 // The MTP head's passes, reading the tokens just picked and the hidden states.
                 if let Some(h) = head_cell.borrow_mut().as_mut() {
@@ -4979,6 +5071,117 @@ fn head_ctx<'c>(
     }
 }
 
+/// A step's logprobs entries ([`scratchy_target_metal::logprobs`]): the emitting rows of each
+/// request that asks for logprobs, in request order, each with its request's index.
+#[cfg(feature = "metal")]
+struct LogprobsStep {
+    entries: Vec<(usize, u32)>,
+    layout: scratchy_target_metal::logprobs::LogprobsLayout,
+}
+
+/// The step's logprobs pass (`step`'s entries' rows written into `buffer`, grown to hold them);
+/// `None` when no request of the step asks for logprobs.
+#[cfg(feature = "metal")]
+fn logprobs_pass(
+    step: Option<&LogprobsStep>,
+    kernels: Option<&scratchy_target_metal::logprobs::LogprobsKernels>,
+    buffer: &mut Option<scratchy_target_metal::residency::Pinned>,
+    device: &scratchy_target_metal::mtl4_dispatch::Device,
+    residency: &scratchy_target_metal::residency::MetalResidencySet,
+) -> Option<LogprobsPass> {
+    let step = step?;
+    let kernels = kernels?;
+    let row_bytes = kernels.row_bytes();
+    let kernels = kernels as *const scratchy_target_metal::logprobs::LogprobsKernels as usize;
+    if reserve_pinned(buffer, device, residency, step.layout.total as usize) {
+        residency.commit();
+    }
+    let buffer = (**buffer.as_ref()?).clone();
+    let rows: Vec<u32> = step.entries.iter().map(|&(_, row)| row).collect();
+    step.layout.write_rows(&buffer, &rows);
+    Some(LogprobsPass {
+        kernels,
+        buffer,
+        layout: step.layout,
+        rows,
+        row_bytes,
+        raw: None,
+    })
+}
+
+/// The logprobs pass of a target's command buffer: scores its entries once the step's tokens are
+/// final, after the sampler.
+#[cfg(feature = "metal")]
+#[derive(Clone)]
+struct LogprobsPass {
+    /// The worker's `LogprobsKernels`, alive for the forward (as the argmax kernels' address).
+    kernels: usize,
+    buffer: scratchy_target_metal::mtl4_dispatch::Buffer,
+    layout: scratchy_target_metal::logprobs::LogprobsLayout,
+    /// The logits rows it scores, and their width.
+    rows: Vec<u32>,
+    row_bytes: u64,
+    /// Where its rows' raw logits are set aside, on a step whose grammar mask overwrites the
+    /// logits; `None` scores the logits themselves.
+    raw: Option<scratchy_target_metal::mtl4_dispatch::Buffer>,
+}
+
+#[cfg(feature = "metal")]
+impl LogprobsPass {
+    /// This pass scoring its rows' raw logits, set aside in `raw` (grown to hold them).
+    fn with_raw(
+        mut self,
+        raw: &mut Option<scratchy_target_metal::residency::Pinned>,
+        device: &scratchy_target_metal::mtl4_dispatch::Device,
+        residency: &scratchy_target_metal::residency::MetalResidencySet,
+    ) -> Self {
+        let rows = self.rows.iter().max().map_or(0, |&r| u64::from(r) + 1);
+        if reserve_pinned(raw, device, residency, (rows * self.row_bytes) as usize) {
+            residency.commit();
+        }
+        self.raw = raw.as_ref().map(|r| (**r).clone());
+        self
+    }
+
+    /// Set its rows' raw logits aside from `logits` (with a place to set them aside), before
+    /// anything overwrites them.
+    fn set_aside(
+        &self,
+        enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        logits: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+    ) {
+        if let Some(raw) = &self.raw {
+            scratchy_target_metal::logprobs::encode_raw_copies(
+                enc,
+                logits,
+                raw,
+                &self.rows,
+                self.row_bytes,
+            );
+        }
+    }
+
+    /// Encode the scoring of the logits rows at `logits` and the tokens at `tokens` (one a row).
+    fn encode(
+        &self,
+        device: &scratchy_target_metal::mtl4_dispatch::Device,
+        enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        logits: u64,
+        tokens: u64,
+    ) -> Result<(), String> {
+        use ::objc2_metal::MTLBuffer as _;
+        let base = self.buffer.gpuAddress();
+        let logits = self.raw.as_ref().map_or(logits, |raw| raw.gpuAddress());
+        let table = argument_table_on(device, &self.layout.addresses(base, logits, tokens))?;
+        // SAFETY: `kernels` is the worker's `LogprobsKernels`, borrowed for the forward that runs
+        // this pass.
+        let kernels =
+            unsafe { &*(self.kernels as *const scratchy_target_metal::logprobs::LogprobsKernels) };
+        scratchy_target_metal::logprobs::encode(kernels, enc, &table, self.layout.entries);
+        Ok(())
+    }
+}
+
 /// An argument table binding `addresses`, in order.
 #[cfg(feature = "metal")]
 fn argument_table(
@@ -4988,10 +5191,22 @@ fn argument_table(
     ::objc2::rc::Retained<::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ArgumentTable>>,
     String,
 > {
+    argument_table_on(&device.device, addresses)
+}
+
+/// [`argument_table`] on `device`.
+#[cfg(feature = "metal")]
+fn argument_table_on(
+    device: &scratchy_target_metal::mtl4_dispatch::Device,
+    addresses: &[u64],
+) -> Result<
+    ::objc2::rc::Retained<::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ArgumentTable>>,
+    String,
+> {
     use ::objc2_metal::{MTL4ArgumentTable, MTL4ArgumentTableDescriptor};
     let desc = MTL4ArgumentTableDescriptor::new();
     desc.setMaxBufferBindCount(addresses.len());
-    let table = (device.device)
+    let table = device
         .newArgumentTableWithDescriptor_error(&desc)
         .map_err(|e| format!("argument table: {e:?}"))?;
     for (i, &address) in addresses.iter().enumerate() {
@@ -5267,7 +5482,7 @@ fn sampled(
 /// Grow `slot` to a pinned, zeroed buffer of at least `bytes`, replacing (and
 /// so unpinning) a smaller one. Returns whether it allocated, i.e. whether
 /// `residency` needs a commit before the next command buffer.
-#[cfg(all(feature = "metal", feature = "guided-decoding"))]
+#[cfg(feature = "metal")]
 fn reserve_pinned(
     slot: &mut Option<scratchy_target_metal::residency::Pinned>,
     device: &scratchy_target_metal::mtl4_dispatch::Device,
@@ -5625,6 +5840,9 @@ impl Worker for MetalWorker {
             "ScratchyWorker(metal): ArgmaxKernels::new in {:?}",
             t_argmax.elapsed()
         );
+        let logprobs =
+            scratchy_target_metal::logprobs::LogprobsKernels::new(&gpu_device.device, off_tape)
+                .map_err(|e| ExecutorError::WorkerInit(format!("logprobs kernel: {e:?}")))?;
 
         // On-GPU token sampler (temperature / top-k / top-p / min-p +
         // repetition/frequency/presence penalties). Built once here so the
@@ -5709,6 +5927,7 @@ impl Worker for MetalWorker {
             self.mm = mm;
         }
         self.argmax_kernels = Some(argmax);
+        self.logprobs_kernels = Some(logprobs);
         self.sampler_kernels = Some(sampler);
         self.sampler_arena = Some(sampler_arena);
         self.chain_advance_kernel = Some(chain_advance);
@@ -7295,6 +7514,26 @@ impl Worker for MetalWorker {
                 deferral.selections.extend(uniforms);
             }
         }
+        // The rows whose tokens this step scores for logprobs: a request's sampled row, or each of
+        // its verify rows (it keeps the ones it emits).
+        let logprobs_entries: Vec<(usize, u32)> = (req_ids_in_order.iter().enumerate())
+            .filter(|&(i, req_id)| {
+                prepared.req_inputs[i].emits_token
+                    && (self.sampling_params_map.get(req_id)).is_some_and(|p| p.logprobs.is_some())
+            })
+            .flat_map(
+                |(i, _)| match prepared.req_inputs[i].spec_token_ids.is_empty() {
+                    true => vec![(i, sampled_rows.last_of(i) as u32)],
+                    false => (sampled_rows.of_seq(i))
+                        .map(|row| (i, row as u32))
+                        .collect(),
+                },
+            )
+            .collect();
+        self.logprobs_step = (!logprobs_entries.is_empty()).then(|| LogprobsStep {
+            layout: scratchy_target_metal::logprobs::LogprobsLayout::of(logprobs_entries.len()),
+            entries: logprobs_entries,
+        });
         let argmax_vec: Vec<u32> = {
             use ::scratchy_serving_engine::spec_decode::{
                 ForwardArgmaxRequest, KvPoolHandle, ModelHandle, SpecDecodeBackend,
@@ -8022,11 +8261,12 @@ impl Worker for MetalWorker {
                 None
             };
 
+        let logprobs = self.read_logprobs(&req_ids_in_order, &sampled_token_ids)?;
         Ok(ModelRunnerOutput {
             req_ids: req_ids_in_order,
             req_id_to_index,
             sampled_token_ids,
-            logprobs: None,
+            logprobs,
             prompt_logprobs_dict: std::collections::HashMap::new(),
             // A head's drafts; a draft model's K-step chain runs host-side, its proposer filling
             // `set_spec_token_ids` directly.
@@ -8106,6 +8346,9 @@ impl Worker for MetalWorker {
         self.kv_cache = None; // drops the file-backed store(s) → Drop msyncs their codes
         self.model = None;
         self.argmax_kernels = None;
+        self.logprobs_kernels = None;
+        self.logprobs_buffer = None;
+        self.logprobs_raw = None;
         self.draft_vocab_suffix = None;
         self.argmax_slots.clear();
         #[cfg(feature = "guided-decoding")]

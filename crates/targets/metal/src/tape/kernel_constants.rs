@@ -1389,6 +1389,17 @@ impl From<ArgmaxConstants> for Vec<ConstantValue> {
     }
 }
 
+/// `logprobs.metal` slot 0: the logits per row.
+pub struct LogprobsConstants {
+    pub vocab: crate::tape::ids::LogitsWidth,
+}
+
+impl From<LogprobsConstants> for Vec<ConstantValue> {
+    fn from(c: LogprobsConstants) -> Self {
+        vec![ConstantValue::uint(ConstSlot(0), c.vocab.get())]
+    }
+}
+
 /// `grammar_mask.metal`: slot 0 the logits per row, slot 1 the allow-bitset row stride.
 pub struct GrammarMaskConstants {
     pub vocab: crate::tape::ids::LogitsWidth,
