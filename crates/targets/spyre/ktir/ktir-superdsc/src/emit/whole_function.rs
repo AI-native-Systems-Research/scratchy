@@ -3784,7 +3784,7 @@ pub fn lower_walk(
     let ops = lower_function_folded(node, Some(layout), sym_id_base, None, fold);
     // The plan's division is this program's alone: every other function of the bundle divides as
     // its own ops do.
-    layout.lx_row_groups.set(None);
+    layout.lx_division.set(None);
     let ops = ops?;
     if *node.minted.lock().unwrap_or_else(|p| p.into_inner()) != probed {
         return err(format!(
@@ -3900,6 +3900,15 @@ fn lower_function_folded(
     let mut gather_carried = vec![false; gathers.len()];
     // The second op of every head-major pair ([`head_major_pair`]), lowered with the first.
     let mut head_major_skip: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
+    // Under the prompt trip's division ([`crate::placement::WalkDivision::HeadsInner`]), the rows a
+    // head holds, once the query's head-major pair has laid its rows out query-row-major.
+    let mut heads_rows: Option<u32> = None;
+    let heads_inner = layout.is_some_and(|l| {
+        matches!(
+            l.lx_division.get(),
+            Some(crate::placement::WalkDivision::HeadsInner { .. })
+        )
+    });
     // The row fold's own view of the same analyses — built once here so its helpers read ONE
     // value rather than threading three slices each (see [`FoldAnalyses`]).
     let analyses = FoldAnalyses {
@@ -4147,6 +4156,21 @@ fn lower_function_folded(
                     }
                 };
                 let r = match layout {
+                    // The prompt trip's frame: each query row's heads together.
+                    Some(layout) if heads_inner => {
+                        let rows = from[0] as u32;
+                        let block = HeadBlock {
+                            rows,
+                            heads: frame[0] / rows,
+                            sticks,
+                        };
+                        let m = Minter { k, layout, floor };
+                        let (ops, r) =
+                            heads_inner_pair(m, res, f.name, &source, block, true, sym_id_base)?;
+                        out.extend(ops);
+                        heads_rows = Some(rows);
+                        r
+                    }
                     Some(layout) if sticks > 1 => {
                         let tid = mint_inter(k, layout, floor, res);
                         let dst = stick_major_region(tid, frame[0], sticks, layout);
@@ -4404,7 +4428,21 @@ fn lower_function_folded(
                         let r = Region { is_out: false, ..r };
                         inter.insert(src, r);
                         if let Some((t_res, frame, sticks)) = head_major_pair(f, op, &from, &to) {
-                            let r2 = if sticks > 1 {
+                            let r2 = if heads_inner {
+                                // The prompt trip's frame: each query row's heads together.
+                                let rows = from[0] as u32;
+                                let block = HeadBlock {
+                                    rows,
+                                    heads: frame[0] / rows,
+                                    sticks,
+                                };
+                                let m = Minter { k, layout, floor };
+                                let (ops, r2) =
+                                    heads_inner_pair(m, res, f.name, &r, block, true, sym_id_base)?;
+                                out.extend(ops);
+                                heads_rows = Some(rows);
+                                r2
+                            } else if sticks > 1 {
                                 let tid = mint_inter(k, layout, floor, res);
                                 let dst = stick_major_region(tid, frame[0], sticks, layout);
                                 out.extend(
@@ -4859,27 +4897,44 @@ fn lower_function_folded(
                         f.name, source.tid
                     ));
                 }
-                let r =
-                    match layout {
-                        Some(layout) if sticks > 1 => {
-                            let tid = mint_inter(k, layout, floor, r_res);
-                            let dst = stick_major_region(
-                                tid,
-                                frame[0],
-                                frame[1] / crate::work::FP16_ELEMS_PER_STICK,
+                let r = match layout {
+                    // The prompt trip's frame back: each query row's heads together, into the
+                    // query rows' own block.
+                    Some(layout) if heads_inner => {
+                        let rows = frame[0];
+                        let block = HeadBlock {
+                            rows,
+                            heads: source.v_rows / rows,
+                            sticks,
+                        };
+                        let m = Minter { k, layout, floor };
+                        let (ops, r) =
+                            heads_inner_pair(m, r_res, f.name, &source, block, false, sym_id_base)?;
+                        out.extend(ops);
+                        r
+                    }
+                    Some(layout) if sticks > 1 => {
+                        let tid = mint_inter(k, layout, floor, r_res);
+                        let dst = stick_major_region(
+                            tid,
+                            frame[0],
+                            frame[1] / crate::work::FP16_ELEMS_PER_STICK,
+                            layout,
+                        );
+                        out.extend(
+                            HeadMajorCopies::of(&dst, &source, source.v_rows, sticks)?.to_block(
+                                f.name,
+                                sym_id_base,
                                 layout,
-                            );
-                            out.extend(
-                                HeadMajorCopies::of(&dst, &source, source.v_rows, sticks)?
-                                    .to_block(f.name, sym_id_base, layout)?,
-                            );
-                            Region {
-                                is_out: false,
-                                ..dst
-                            }
+                            )?,
+                        );
+                        Region {
+                            is_out: false,
+                            ..dst
                         }
-                        _ => reframed(source, frame),
-                    };
+                    }
+                    _ => reframed(source, frame),
+                };
                 inter.insert(res, r);
                 inter.insert(r_res, r);
                 head_major_skip.insert(r_res);
@@ -5304,9 +5359,25 @@ fn lower_function_folded(
         // the recogniser proved is then CHECKED against that region's shape below rather than trusted:
         // two independent facts about the same operand, so a chain whose axis and extent disagree
         // cannot address a full tile as a vector.
+        // A walk relaid query-row-major ([`heads_inner_pair`]) holds row `p·H + h` where the
+        // program states `h·P + p`: the program's spray of a `[P, ·]` source down its leading
+        // heads axis is, in the frame the walk runs in, each source row repeated over the heads in
+        // place — an inner spray of the same count.
         let mut bcast_axes: Vec<Option<BcastAxis>> = in_values
             .iter()
             .map(|v| bcasts.get(v).map(|b| b.axis))
+            .map(|axis| match axis {
+                Some(BcastAxis::Y(sp))
+                    if heads_rows.is_some()
+                        && sp.order == crate::emit::SprayOrder::Outer
+                        && sp.of == super::lower_ktir_to_superdsc::SprayOf::Tile =>
+                {
+                    Some(BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::inner(
+                        sp.count,
+                    )))
+                }
+                other => other,
+            })
             .collect();
         // ⭐⭐⭐ THE FLAT FORM'S FLAG RIDES BESIDE THE AXIS, because the two say different things:
         // the axis says which MODE the consumer addresses the operand in, the flag says the
@@ -6119,11 +6190,76 @@ fn lower_function_folded(
             // b·k]`, one stick-run copy per stick of a batch ([`HeadMajorCopies::to_block`], the
             // attention output's own relayout) — and the contraction reads blocks.
             let program = match program {
+                // ⭐ THE PROMPT TRIP'S CONTRACTION ([`crate::placement::WalkDivision::HeadsInner`]): its
+                // activation is query-row-major, `heads` heads of `heads_rows` rows, so the batch is
+                // the query HEAD, and each head contracts against its kv head's kernel block — laid
+                // once per query head of a group first (torch-spyre's own expansion), so every core
+                // reads one kernel at one start.
+                Lowering::BatchMatmul {
+                    batch,
+                    activation: super::lower_ktir_to_superdsc::BatchFrame::Flat,
+                } if heads_inner => {
+                    let (a, w) = (per_op[0], per_op[1]);
+                    let Some(rows) = heads_rows.filter(|&r| r > 0 && a.v_rows.is_multiple_of(r))
+                    else {
+                        return err(format!(
+                            "{}: a contraction of t{} `[{}, {}]` under the query-row-major plan, \
+                             whose query rows were never laid out so",
+                            f.name, a.tid, a.v_rows, a.v_cols
+                        ));
+                    };
+                    let heads = a.v_rows / rows;
+                    if !heads.is_multiple_of(batch) || !w.v_rows.is_multiple_of(batch) {
+                        return err(format!(
+                            "{}: {heads} query heads over a {batch}-batch kernel t{} `[{}, {}]` — \
+                             each kv head serves a whole group of query heads",
+                            f.name, w.tid, w.v_rows, w.v_cols
+                        ));
+                    }
+                    let block_rows = w.v_rows / batch;
+                    let tid = mint_scratch(k, layout, floor, res, 2);
+                    let expanded = stick_major_region(
+                        tid,
+                        heads * block_rows,
+                        w.v_cols / crate::work::FP16_ELEMS_PER_STICK,
+                        layout,
+                    );
+                    out.push(
+                        crate::ir::bridge::tiled_op_sdsc_op::assemble_expand_blocks(
+                            &format!("expand_o{tid}"),
+                            &w.name(),
+                            &expanded.name(),
+                            crate::ir::bridge::tiled_op_sdsc_op::ExpandedBlocks {
+                                batch,
+                                group: heads / batch,
+                                rows: block_rows,
+                                cols: w.v_cols,
+                            },
+                            sym_id_base,
+                            Some(layout),
+                        )
+                        .map_err(|message| Error {
+                            message: format!("{}: {message}", f.name),
+                        })?,
+                    );
+                    batch_blocks.insert(tid, w.v_cols);
+                    per_op[1] = Region {
+                        is_out: false,
+                        ..expanded
+                    };
+                    Lowering::BatchMatmul {
+                        batch: heads,
+                        activation: super::lower_ktir_to_superdsc::BatchFrame::HeadsInner,
+                    }
+                }
                 Lowering::BatchMatmul {
                     batch,
                     activation: super::lower_ktir_to_superdsc::BatchFrame::Flat,
                 } if batch > 1
-                    && layout.lx_row_groups.get() != Some(batch)
+                    && !layout
+                        .lx_division
+                        .get()
+                        .is_some_and(|d| d.one_op_over(batch))
                     && per_op
                         .first()
                         .is_some_and(|a| a.v_cols > crate::work::FP16_ELEMS_PER_STICK) =>
@@ -6756,6 +6892,147 @@ fn permute(
     .map_err(|message| Error {
         message: format!("{name}: {message}"),
     })
+}
+
+/// A block of `rows` rows of `heads` heads, each head `sticks` sticks wide.
+#[derive(Clone, Copy, Debug)]
+struct HeadBlock {
+    rows: u32,
+    heads: u32,
+    sticks: u32,
+}
+
+/// ⭐ THE QUERY-ROW-MAJOR FRAME, torch-spyre's prompt trip's ([`crate::placement::WalkDivision::HeadsInner`])
+/// — the head-major pair's two sides under that division: the stick-major block `[rows, heads ·
+/// sticks · stick]` and its per-head rows `[rows · heads, sticks · stick]`, stick-major, row
+/// `p · heads + h` (each query row's heads together, so a split of the rows hands each core whole query
+/// rows of every head). `into_heads` lays the block out as per-head rows; otherwise the reverse. A
+/// head one stick wide is one stick permute; wider, the per-head rows go row-major through `mid` first
+/// (two permutes, [`HeadRows`]'s two).
+fn heads_inner_relayout(
+    name: &str,
+    (src, dst, mid): (&Region, &Region, Option<&Region>),
+    HeadBlock {
+        rows,
+        heads,
+        sticks,
+    }: HeadBlock,
+    into_heads: bool,
+    sym_id_base: &mut i64,
+    layout: &BundleLayout,
+) -> Result<Vec<super::EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::StickPermute::{RowToStick, StickToRow};
+    let (block, per_head) = (
+        Permuted::whole((rows, heads * sticks)),
+        Permuted::whole((rows * heads, sticks)),
+    );
+    match (sticks, mid) {
+        (1, _) => Ok(vec![permute(
+            name,
+            src,
+            dst,
+            block,
+            if into_heads { StickToRow } else { RowToStick },
+            sym_id_base,
+            Some(layout),
+        )?]),
+        (_, Some(mid)) => {
+            let mid_in = Region {
+                is_out: false,
+                ..*mid
+            };
+            let (first, second) = if into_heads {
+                (
+                    permute(name, src, mid, block, StickToRow, sym_id_base, Some(layout))?,
+                    permute(
+                        name,
+                        &mid_in,
+                        dst,
+                        per_head,
+                        RowToStick,
+                        sym_id_base,
+                        Some(layout),
+                    )?,
+                )
+            } else {
+                (
+                    permute(
+                        name,
+                        src,
+                        mid,
+                        per_head,
+                        StickToRow,
+                        sym_id_base,
+                        Some(layout),
+                    )?,
+                    permute(
+                        name,
+                        &mid_in,
+                        dst,
+                        block,
+                        RowToStick,
+                        sym_id_base,
+                        Some(layout),
+                    )?,
+                )
+            };
+            Ok(vec![first, second])
+        }
+        (_, None) => err(format!(
+            "{name}: heads {sticks} sticks wide go between their frames row-major, and no scratch \
+             holds them"
+        )),
+    }
+}
+
+/// Where a walk mints its intermediates: the node, the layout and the node's floor ([`mint_inter`]).
+#[derive(Clone, Copy)]
+struct Minter<'a> {
+    k: &'a KtirNode,
+    layout: &'a BundleLayout,
+    floor: u32,
+}
+
+/// [`heads_inner_relayout`] into a buffer minted for `key` (and, for heads wider than a stick, the
+/// row-major scratch it goes through): the head-major pair under the prompt trip's division. Returns
+/// the relayout and the result's region.
+fn heads_inner_pair(
+    m: Minter<'_>,
+    key: Ssa,
+    name: &str,
+    source: &Region,
+    block: HeadBlock,
+    into_heads: bool,
+    sym_id_base: &mut i64,
+) -> Result<(Vec<super::EmittedOp>, Region), Error> {
+    let tid = mint_inter(m.k, m.layout, m.floor, key);
+    let dst = if into_heads {
+        stick_major_region(tid, block.rows * block.heads, block.sticks, m.layout)
+    } else {
+        stick_major_region(tid, block.rows, block.heads * block.sticks, m.layout)
+    };
+    let mid = (block.sticks > 1).then(|| {
+        row_major_region(
+            mint_scratch(m.k, m.layout, m.floor, key, 0),
+            block.rows * block.heads * block.sticks,
+            m.layout,
+        )
+    });
+    let ops = heads_inner_relayout(
+        name,
+        (source, &dst, mid.as_ref()),
+        block,
+        into_heads,
+        sym_id_base,
+        m.layout,
+    )?;
+    Ok((
+        ops,
+        Region {
+            is_out: false,
+            ..dst
+        },
+    ))
 }
 
 /// Whether two shapes of one value are the SAME BYTES on the card: every element at the same address

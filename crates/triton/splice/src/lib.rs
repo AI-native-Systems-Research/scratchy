@@ -4617,12 +4617,22 @@ mod walk_on_the_card {
             }
             // The carried buffers are seeded, and the body's constants filled, BEFORE the body (a
             // relaunch shifts the segment the registry constants live in) — beside the query's own
-            // `index_select`, which spyre-inference runs before its walk.
+            // `index_select`, which spyre-inference runs before its walk, and a prompt's relayout of
+            // those rows query-row-major, the frame its trip runs in (one permute at a head one
+            // stick wide).
             assert!(
+                ops[..first].iter().all(|e| ["fill", "gather", "permute"]
+                    .iter()
+                    .any(|p| e.op_name.starts_with(p))),
+                "mq={mq}: only fills, the query's gather and its relayout precede the body"
+            );
+            assert_eq!(
                 ops[..first]
                     .iter()
-                    .all(|e| e.op_name.starts_with("fill") || e.op_name.starts_with("gather")),
-                "mq={mq}: only fills and the query's gather precede the body"
+                    .filter(|e| e.op_name.starts_with("permute"))
+                    .count(),
+                usize::from(mq > 1),
+                "mq={mq}: a prompt's query rows are laid query-row-major once"
             );
             // The decode walk copies its `kv_row_pool` run against the int32 zero the host stages
             // beside the pool, as it stages every int32 the attention reads — nothing makes it on
@@ -4775,12 +4785,142 @@ mod walk_on_the_card {
         }
     }
 
-    /// ⭐ THE PROMPT WALK AT A HEAD TWO STICKS WIDE. The query's head-major relayout is two
-    /// stick-run copies before the walk — head `a`'s stick `s`, the 64 rows at stick column `2a + s`
-    /// of the gathered `[64, 32·128]` block, to `s·32·64 + a·64` of the head-major `[32·64, 128]` —
-    /// and the output's is their inverse after it. A page (8 kv heads × [`PAGE_SLOTS`] slots × 128)
-    /// is past dxp's 64 KB entry bound, so the body gathers it in 64 KB pieces through its page id
-    /// doubled once per halving, piece `p` read and landed `p · 64 KB` in.
+    /// ⭐⭐ THE PROMPT TRIP IN torch-spyre's FORM — its compiled prefill's: the query rows split across
+    /// the cores, each core holding whole query rows of every head (row `p·32 + h`), the scores and
+    /// the value product each ONE contraction over every query head against the kv head's block
+    /// expanded once per query head of its group (read by every core at one start, from HBM), the
+    /// mask added a stick plane at a time sprayed over each query row's heads in place, and the
+    /// scores, the softmax and the carried state all in each core's LX. The trip's ops do not grow
+    /// with the rows: 27 at head dim 64, and 49 at 128, whose pages are still gathered in pieces and
+    /// re-laid on the trip (16 permutes). At 512 rows the pin window no longer holds every value the
+    /// walk computes (each pin is held for the whole walk, not the value's lifetime), so only the
+    /// form is checked there.
+    #[test]
+    fn the_prompt_trip_splits_its_query_rows_across_the_cores_in_lx() {
+        for (mq, hd, trip, all_lx) in [
+            (128, 64, 27, true),
+            (512, 64, 27, false),
+            (128, 128, 49, true),
+        ] {
+            let blocks = 4;
+            let node = walk_at(mq, blocks, hd);
+            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            let mut sym = 0i64;
+            let ops =
+                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                    .unwrap_or_else(|e| panic!("mq={mq} hd={hd}: the walk lowers: {}", e.message));
+            let lx = |name: &str| layout.lx_core_local(name);
+            let body: Vec<_> = ops.iter().filter(|e| e.walk.is_some()).collect();
+            assert_eq!(body.len(), trip, "mq={mq} hd={hd}: the trip's ops");
+            let named = |prefix: &str| -> Vec<&ktir_superdsc::emit::EmittedOp> {
+                body.iter()
+                    .copied()
+                    .filter(|e| e.op_name.starts_with(prefix))
+                    .collect()
+            };
+            let expanded: Vec<&str> = named("expand")
+                .iter()
+                .map(|e| {
+                    e.arg_bindings
+                        .last()
+                        .expect("the expansion")
+                        .buffer
+                        .as_str()
+                })
+                .collect();
+            let bmms = named("bmm");
+            assert_eq!(
+                (expanded.len(), bmms.len()),
+                (2, 2),
+                "mq={mq} hd={hd}: one expansion and one contraction for the scores and for the \
+                 value product"
+            );
+            for (e, kernel) in bmms.iter().zip(&expanded) {
+                let [a, k, out] = e.arg_bindings.as_slice() else {
+                    panic!("{}: activation, kernel, output", e.op_name);
+                };
+                assert_eq!(
+                    k.buffer, *kernel,
+                    "mq={mq} hd={hd} {}: the expanded block",
+                    e.op_name
+                );
+                assert!(
+                    !lx(&k.buffer),
+                    "mq={mq} hd={hd} {}: its kernel read from HBM at one start",
+                    e.op_name
+                );
+                assert!(
+                    !all_lx || lx(&a.buffer) && lx(&out.buffer),
+                    "mq={mq} hd={hd} {}: its rows in each core's LX",
+                    e.op_name
+                );
+                let split = serde_json::to_value(e.op.as_ref().expect("a descriptor"))
+                    .expect("json")["numWkSlicesPerDim_"]
+                    .clone();
+                assert_eq!(
+                    split["mb"], 32,
+                    "mq={mq} hd={hd} {}: the query rows split across 32 cores",
+                    e.op_name
+                );
+            }
+            // The mask, `[P, PAGE_SLOTS]` of the stick-major stack of `blocks` tiles: one add a
+            // stick plane, each reading that plane of the mask.
+            let adds: Vec<_> = (0..PAGE_SLOTS / 64)
+                .map(|c| {
+                    let e = named(&format!("add{c}_o"));
+                    assert_eq!(e.len(), 1, "mq={mq} hd={hd}: plane {c}'s mask add");
+                    e[0]
+                })
+                .collect();
+            for (c, e) in adds.iter().enumerate() {
+                let mask = &e.arg_bindings[1];
+                assert_eq!(
+                    mask.offset_elems,
+                    c as u32 * blocks as u32 * mq as u32 * 64,
+                    "mq={mq} hd={hd} {}: the mask's plane {c}",
+                    e.op_name
+                );
+                assert!(
+                    !all_lx || lx(&e.arg_bindings[0].buffer) && lx(&e.arg_bindings[2].buffer),
+                    "mq={mq} hd={hd} {}: the scores' plane in LX",
+                    e.op_name
+                );
+            }
+            // Every value the trip computes from the scores on is in LX, beside the carried state.
+            for prefix in [
+                "multiply_o",
+                "add_o",
+                "max_o",
+                "sub_o",
+                "maximum_o",
+                "neg_o",
+                "exp_o",
+                "sum_o",
+            ] {
+                let chain = named(prefix);
+                assert!(!chain.is_empty(), "mq={mq} hd={hd}: a {prefix} op");
+                for e in chain {
+                    let out = e.arg_bindings.last().expect("an output");
+                    assert!(
+                        !all_lx || lx(&out.buffer),
+                        "mq={mq} hd={hd} {}: writes {} outside LX",
+                        e.op_name,
+                        out.buffer
+                    );
+                }
+            }
+        }
+    }
+
+    /// ⭐ THE PROMPT WALK AT A HEAD TWO STICKS WIDE, in torch-spyre's prompt trip. The query rows are
+    /// laid query-row-major before the walk — the gathered `[64, 32·128]` block through its row-major
+    /// rows into the stick-major `[64·32, 128]`, row `p·32 + h`, two whole-tensor permutes — and the
+    /// output back after it, so each contraction is ONE op over every query head, its kernel the kv
+    /// head's block expanded once per query head of its group, and nothing re-lays a head on a trip.
+    /// A page (8 kv heads × [`PAGE_SLOTS`] slots × 128) is past dxp's 64 KB entry bound, so the body
+    /// gathers it in 64 KB pieces through its page id doubled once per halving, piece `p` read and
+    /// landed `p · 64 KB` in.
     #[test]
     fn a_two_stick_head_prompt_walk_relays_its_heads_and_gathers_pages_in_pieces() {
         let node = walk_at(64, 4, 128);
@@ -4790,74 +4930,70 @@ mod walk_on_the_card {
         let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
             .unwrap_or_else(|e| panic!("the hd128 prompt walk lowers: {}", e.message));
         let first_body = ops.iter().position(|e| e.walk.is_some()).expect("a body");
+        let last_body = ops.iter().rposition(|e| e.walk.is_some()).expect("a body");
         let named = |prefix: &str| -> Vec<usize> {
             (0..ops.len())
                 .filter(|&i| ops[i].op_name.starts_with(prefix))
                 .collect()
         };
-        // (heads, rows, sticks a head)
-        let (a, b, n) = (32u32, 64u32, 2u32);
         let stick = 64u32;
-        // The score contraction's per-kv-head query blocks: 8 kv heads of 4·64 rows each. The
-        // value contraction reads the probabilities `[8·4·64, PAGE_SLOTS]` the same way, a trip at
-        // a time, once a page is wider than one stick — the same rows, so the same offsets.
-        let (kv, m) = (8u32, a * b / 8);
         assert_eq!(
             PAGE_SLOTS / stick,
-            n,
+            2,
             "a page two sticks wide, as the head is"
         );
-        let heads = named("heads");
-        assert_eq!(
-            heads.len(),
-            8,
-            "two copies in, two into the score contraction's kv-head blocks, two into the value \
-             contraction's per trip, two out"
+        assert!(
+            named("heads").is_empty(),
+            "no head is copied into a block of its own"
         );
-        for (j, &i) in heads.iter().enumerate() {
+        // The whole-tensor relayouts: the query's two before the walk, the output's two after it.
+        let relays = named("permute_o");
+        assert_eq!(
+            relays.iter().map(|&i| i < first_body).collect::<Vec<_>>(),
+            [true, true, false, false],
+            "the query's two permutes precede the walk, the output's two follow it"
+        );
+        for &i in &relays {
             let e = &ops[i];
-            let s = (j as u32) % n;
-            let offs: Vec<u32> = e.arg_bindings.iter().map(|x| x.offset_elems).collect();
-            let (block, head_major) = (s * b * stick, s * a * b * stick);
-            if j < 2 {
-                assert!(
-                    i < first_body,
-                    "{}: the query's copy precedes the walk",
-                    e.op_name
-                );
-                assert_eq!(offs, [block, head_major], "{}", e.op_name);
-            } else if j < 4 {
-                assert!(
-                    e.walk.is_none() && i < first_body,
-                    "{}: the query's kv-head blocks are laid once, before the walk",
-                    e.op_name
-                );
-                assert_eq!(
-                    offs,
-                    [s * kv * m * stick, s * m * stick],
-                    "{}: stick {s} of every kv head's rows, to its block",
-                    e.op_name
-                );
-            } else if j < 6 {
-                assert!(
-                    e.walk.is_some(),
-                    "{}: a trip's probabilities are laid out on the trip",
-                    e.op_name
-                );
-                assert_eq!(
-                    offs,
-                    [s * kv * m * stick, s * m * stick],
-                    "{}: stick {s} of every kv head's probabilities, to its block",
-                    e.op_name
-                );
-            } else {
-                assert!(
-                    e.walk.is_none() && i > first_body,
-                    "{}: after the walk",
-                    e.op_name
-                );
-                assert_eq!(offs, [head_major, block], "{}", e.op_name);
-            }
+            assert!(
+                e.walk.is_none() && (i < first_body || i > last_body),
+                "{}: once, outside the trip",
+                e.op_name
+            );
+            assert!(
+                e.arg_bindings.iter().all(|x| x.offset_elems == 0),
+                "{}: a whole-tensor relayout",
+                e.op_name
+            );
+        }
+        // Each contraction is one op on every trip, its kernel an expansion the trip lays.
+        let expanded: Vec<&str> = named("expand")
+            .into_iter()
+            .map(|i| {
+                assert!(ops[i].walk.is_some(), "{}: on the trip", ops[i].op_name);
+                ops[i]
+                    .arg_bindings
+                    .iter()
+                    .find(|x| !x.is_input)
+                    .expect("the expansion")
+                    .buffer
+                    .as_str()
+            })
+            .collect();
+        let bmms = named("bmm");
+        assert_eq!(
+            (expanded.len(), bmms.len()),
+            (2, 2),
+            "the scores and the value product: one expansion and one contraction each"
+        );
+        for (&i, kernel) in bmms.iter().zip(&expanded) {
+            let e = &ops[i];
+            assert!(e.walk.is_some(), "{}: on the trip", e.op_name);
+            assert_eq!(
+                e.arg_bindings[1].buffer, *kernel,
+                "{}: its kernel is the expanded block",
+                e.op_name
+            );
         }
         let piece = 64 * 1024 / 2;
         let pieces = 8 * PAGE_SLOTS * 128 / piece;

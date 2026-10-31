@@ -1559,7 +1559,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         lx: Default::default(),
         lx_planned: Default::default(),
         lx_probe: Default::default(),
-        lx_row_groups: Default::default(),
+        lx_division: Default::default(),
         arrangements: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         kv_request_stride_bytes,
         // ⛔ THE CLASS REGISTRIES, filled where their tables are placed above — the door resolves
@@ -6132,7 +6132,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // and in the compiled allocates); the plan itself and its probe log are spent at lowering.
         lx_planned: _,
         lx_probe: _,
-        lx_row_groups: _,
+        lx_division: _,
     } = l;
 
     let mut places: Vec<bundle::Placement> = placements

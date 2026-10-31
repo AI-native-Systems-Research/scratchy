@@ -718,7 +718,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // its lowering (`ktir_superdsc::emit::lx_plan`), into the layout this returns.
         lx_planned: Default::default(),
         lx_probe: Default::default(),
-        lx_row_groups: Default::default(),
+        lx_division: Default::default(),
         // The arrangement authority starts empty and every op declares into it — that is the point:
         // the FIRST op to address a tensor fixes its device layout and a later disagreement is a
         // build error. Pre-seeding it would pre-decide arrangements no descriptor has stated.

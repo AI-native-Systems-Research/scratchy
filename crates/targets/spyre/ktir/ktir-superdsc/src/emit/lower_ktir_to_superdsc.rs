@@ -3270,6 +3270,10 @@ fn elementwise_y_by_column(
 /// op with the source an `Mb` row vector sprayed down `y` rows ([`In::mb`], the rmsnorm gain's own
 /// form, card-proven at every prefill). The `[mb, y, out]` op it replaces is the three-axis form
 /// the card mis-addresses with a broadcast operand (see [`elementwise_by_outer_spray`]).
+///
+/// Rows several sticks wide (the prompt trip's scores over a 128-slot page, query-row-major) are
+/// their stick planes one after another, each a one-stick buffer of every row: one such op per
+/// plane, every operand read at its plane.
 fn elementwise_by_inner_spray(
     req: BcastReq<'_>,
     (y, rows): (u32, u32),
@@ -3286,10 +3290,11 @@ fn elementwise_by_inner_spray(
         df,
     } = req;
     let stick = df.elems_per_stick();
-    if y < 2 || !rows.is_multiple_of(y) || out.c_len > stick {
+    let planes = out.c_len.div_ceil(stick).max(1);
+    if y < 2 || !rows.is_multiple_of(y) || (planes > 1 && !out.c_len.is_multiple_of(stick)) {
         return err(format!(
             "{what} {name}: an inner spray of {y} over the `[{rows}, {}]` output t{} — the spray \
-             needs rows == y*mb (whole sprays of rows) and one-stick rows",
+             needs rows == y*mb (whole sprays of rows) and whole sticks",
             out.c_len, out.tid
         ));
     }
@@ -3321,45 +3326,57 @@ fn elementwise_by_inner_spray(
                 ));
             }
         };
-        if !leading(x, want) || x.c_len > stick {
+        if !leading(x, want) || x.c_len.div_ceil(stick).max(1) != planes {
             return err(format!(
                 "{what} {name}: input {i} t{} takes `[{}, {}]` at row {} of its `[{}, {}]` view, \
-                 and its mode wants its first `[{want}, ≤{stick}]` rows",
-                x.tid, x.r_len, x.c_len, x.r_start, x.v_rows, x.v_cols
+                 and its mode wants its first `[{want}, {}]` rows",
+                x.tid, x.r_len, x.c_len, x.r_start, x.v_rows, x.v_cols, out.c_len
             ));
         }
     }
+    // One plane's columns in the stick-major `[y, mb · stick]` frame; every buffer is declared
+    // whole, its planes one after another (`[y, planes · mb · stick]`, the same bytes).
     let cols = mb * stick;
-    let out_h = rb(&out.name(), y, cols);
+    let out_h = rb(&out.name(), y, planes * cols);
     let handles: Vec<_> = ins
         .iter()
         .zip(bcast)
         .map(|(x, b)| match b {
-            Some(BcastAxis::Y(_)) => rb(&x.name(), 1, cols),
-            _ => rb(&x.name(), y, cols),
+            Some(BcastAxis::Y(_)) => rb(&x.name(), 1, planes * x.v_rows * stick),
+            _ => rb(&x.name(), y, planes * cols),
         })
         .collect();
-    let ew: Vec<_> = handles
-        .iter()
-        .zip(bcast)
-        .map(|(h, b)| match b {
-            Some(BcastAxis::Y(_)) => In::mb(h).ew(),
-            _ => In::full(h).ew(),
-        })
-        .collect();
+    // Plane `c` of a stick-major buffer: its `c`-th stick column, every row of it.
+    let at = |x: &Region, c: u32| crate::addr::col_of(x.v_rows, x.v_cols, c * stick, df);
     let tile_op = pointwise_tile_op_df(y, cols, 1, ins.len() as u32 + 1, df);
-    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
-        &format!("{op_func}_o{}", out.tid),
-        &tile_op,
-        op_func,
-        y,
-        cols,
-        &ew,
-        &out_h,
-        crate::addr::OutCorner::ZERO,
-        sym_id_base,
-        layout,
-    )])
+    (0..planes)
+        .map(|c| {
+            let ew: Vec<_> = handles
+                .iter()
+                .zip(ins)
+                .zip(bcast)
+                .map(|((h, x), b)| match b {
+                    Some(BcastAxis::Y(_)) => In::mb_at(h, at(x, c)).ew(),
+                    _ => In::sliced(h, at(x, c)).ew(),
+                })
+                .collect();
+            Ok(assemble_pointwise_broadcast_off_from_tile(
+                &match planes {
+                    1 => format!("{op_func}_o{}", out.tid),
+                    _ => format!("{op_func}{c}_o{}", out.tid),
+                },
+                &tile_op,
+                op_func,
+                y,
+                cols,
+                &ew,
+                &out_h,
+                at(out, c),
+                sym_id_base,
+                layout,
+            ))
+        })
+        .collect()
 }
 
 /// Whether an op's broadcast operands spray a source down the OUTERMOST of its rows
@@ -6218,12 +6235,45 @@ pub fn batch_matmul(
         ));
     }
     let rows = batch * m;
+    // ⭐ THE PROMPT TRIP'S FORM, under the plan that holds the walk query-row-major: ONE contraction,
+    // the rows split into the plan's chunks and every batch on every core, its kernel one block per
+    // batch read from HBM at one start (torch-spyre's prompt QKᵀ and P·V).
+    if activation == BatchFrame::HeadsInner {
+        let Some(crate::placement::WalkDivision::HeadsInner { chunks }) =
+            layout.and_then(|l| l.lx_division.get())
+        else {
+            return err(format!(
+                "{name}: a query-row-major contraction outside the plan that holds the walk so"
+            ));
+        };
+        use crate::ir::bridge::tiled_op_sdsc_op::matmul::opspec::{
+            BatchRows, matmul_opspec_rows_split,
+        };
+        let op = matmul_opspec_rows_split(
+            batch,
+            (m, n, k),
+            chunks,
+            (BatchRows::Inner, BatchRows::Inner),
+            (&a.name(), &w.name(), &out.name()),
+        )
+        .map_err(|message| Error {
+            message: format!("{name}: {message}"),
+        })?;
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+        return Ok(vec![emit_sdsc_tiled(
+            &format!("bmm_o{}", out.tid),
+            &op,
+            &folds,
+            sym_id_base,
+            layout,
+        )?]);
+    }
     // ⭐ THE ALL-HEADS FORM, under the scratchpad plan that divides the walk one batch a core
     // ([`crate::emit::lx_plan`]): ONE contraction, core `x` on batch `x`, its kernel in that core's
     // LX — torch-spyre's own decode trip. The plan takes the division only if it keeps the kernel
     // core-local; the probe says the form needs it, and the real lowering refuses it otherwise.
     if let Some(l) = layout
-        && l.lx_row_groups.get() == Some(batch)
+        && l.lx_division.get() == Some(crate::placement::WalkDivision::Batches(batch))
         && activation == BatchFrame::Flat
     {
         let w_name = w.name();
@@ -6259,6 +6309,16 @@ pub fn batch_matmul(
         Stk::<KernelTag>::kernel(k as usize, (batch * n) as usize, w.name()),
         rb(&out.name(), rows, n),
     );
+    // One contraction per batch, its activation the flat frame's rows or its own block.
+    let flat = match activation {
+        BatchFrame::Flat => true,
+        BatchFrame::Blocks => false,
+        BatchFrame::HeadsInner => {
+            return err(format!(
+                "{name}: a query-row-major activation has no per-batch rows of its own"
+            ));
+        }
+    };
     let mut ops = Vec::with_capacity(batch as usize);
     for i in 0..batch {
         use crate::ir::bridge::tiled_op_sdsc_op::{RowsOperand, RowsShape, assemble_matmul_rows};
@@ -6270,17 +6330,11 @@ pub fn batch_matmul(
                     n: MatN::of_out_features(n),
                     k: MatK::of_in_features(k),
                     rows,
-                    a_rows: match activation {
-                        BatchFrame::Flat => rows,
-                        BatchFrame::Blocks => m,
-                    },
+                    a_rows: if flat { rows } else { m },
                 },
                 RowsOperand {
                     h: &a_h,
-                    off: match activation {
-                        BatchFrame::Flat => i * m * stick,
-                        BatchFrame::Blocks => i * m * k,
-                    },
+                    off: if flat { i * m * stick } else { i * m * k },
                 },
                 RowsOperand {
                     h: &w_h,
@@ -6310,6 +6364,12 @@ pub enum BatchFrame {
     /// The blocks one after another: block `i` the stick-major `[r, c]` run at `i·r·c` (a page read
     /// `[kv, block, 128]`, permuted per kv head).
     Blocks,
+    /// The query-row-major frame of the prompt trip ([`crate::placement::WalkDivision::HeadsInner`]):
+    /// the stick-major flat frame `[r·b, c]` with batch `i`'s row `p` at flat row `p·b + i`, every
+    /// batch's row `p` together — read and written by the row-split contraction
+    /// ([`crate::ir::bridge::tiled_op_sdsc_op::matmul::opspec::matmul_opspec_rows_split`]) against one
+    /// kernel block per batch.
+    HeadsInner,
 }
 
 /// A rank-3 `linalg.transpose` `[b, r, c] → [b, c, r]` — ONE 2-D relayout per batch, through the
@@ -6376,7 +6436,7 @@ pub fn batch_transpose(
     // ⭐ THE ALL-HEADS FORM, under the plan that divides the walk one batch a core: ONE relayout, core
     // `i` on batch `i` (torch-spyre's decode trip), so each core's block lands where the all-heads
     // contraction on that core reads its kernel.
-    if layout.is_some_and(|l| l.lx_row_groups.get() == Some(batch)) {
+    if layout.is_some_and(|l| l.lx_division.get().is_some_and(|d| d.one_op_over(batch))) {
         return Ok(vec![
             super::try_assemble_restickify_transpose_batched(
                 &format!("transpose_o{}", out.tid),
