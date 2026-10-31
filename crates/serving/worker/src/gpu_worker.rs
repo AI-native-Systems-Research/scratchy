@@ -2142,7 +2142,11 @@ impl MetalWorker {
             let tokens = out[i].get_or_insert_with(Vec::new);
             // A verify step scores every row; the request keeps those of the tokens it emitted.
             if tokens.len() < emitted.len() {
-                debug_assert_eq!(score.emitted.token, emitted[tokens.len()], "the token scored");
+                debug_assert_eq!(
+                    score.emitted.token,
+                    emitted[tokens.len()],
+                    "the token scored"
+                );
                 tokens.push(LogprobsOutput {
                     sampled: token(&score.emitted),
                     top_logprobs: score.top.iter().take(top).map(token).collect(),
@@ -7447,10 +7451,14 @@ impl Worker for MetalWorker {
                 prepared.req_inputs[i].emits_token
                     && (self.sampling_params_map.get(req_id)).is_some_and(|p| p.logprobs.is_some())
             })
-            .flat_map(|(i, _)| match prepared.req_inputs[i].spec_token_ids.is_empty() {
-                true => vec![(i, sampled_rows.last_of(i) as u32)],
-                false => (sampled_rows.of_seq(i)).map(|row| (i, row as u32)).collect(),
-            })
+            .flat_map(
+                |(i, _)| match prepared.req_inputs[i].spec_token_ids.is_empty() {
+                    true => vec![(i, sampled_rows.last_of(i) as u32)],
+                    false => (sampled_rows.of_seq(i))
+                        .map(|row| (i, row as u32))
+                        .collect(),
+                },
+            )
             .collect();
         self.logprobs_step = (!logprobs_entries.is_empty()).then(|| LogprobsStep {
             layout: scratchy_target_metal::logprobs::LogprobsLayout::of(logprobs_entries.len()),
