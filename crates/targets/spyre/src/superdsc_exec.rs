@@ -3357,12 +3357,16 @@ impl Executor {
         // pending batch — a drain between ops of an unflushed rung observes nothing — so each of
         // them falls back to this function's per-op submission, bit for bit: `repeat_probe`
         // (double-submits per op), `perop_sync`/`group_time` (drain per op), `prefix_time`
-        // (drains at a rotating MID-RUNG group), `optrace` (drains + D2H after each op).
-        // `prog_verify`/`segaddr`/`launch_mark`/`submit_time` are batch-safe: they read program
-        // memory or host state this rung's compute ops never write, and `submit_time` measures
-        // the flush itself as the enqueue.
-        let collect =
-            !(d.repeat_probe || d.perop_sync || d.group_time || d.prefix_time || d.optrace);
+        // (drains at a rotating MID-RUNG group), `optrace` and `tensordump` (drain + D2H after
+        // each op). `prog_verify`/`segaddr`/`launch_mark`/`submit_time` are batch-safe: they read
+        // program memory or host state this rung's compute ops never write, and `submit_time`
+        // measures the flush itself as the enqueue.
+        let collect = !(d.repeat_probe
+            || d.perop_sync
+            || d.group_time
+            || d.prefix_time
+            || d.optrace
+            || d.tensordump.is_some());
         let mut pending: Vec<PendingLaunch> = Vec::new();
         // The OR of every entry's per-op barrier — one head barrier on the batch is equivalent
         // to per-op barriers for an all-compute list (flex-rs drains the OTHER pipelines'
