@@ -1539,10 +1539,10 @@ impl std::error::Error for AttachRefusal {}
 
 /// ⭐ THE P2P LINK A SHARDED SESSION SENDS OVER — tensor parallelism's one load-time fact: which
 /// physical card is the peer. Minted only by [`link_peer`], which installs the peer card's
-/// region-2 address in this card's base-address table (device p2p RDMA — never host DMA) and
-/// points this card's `XSEG` entry for each of the peer's landing slots at that slot of the receive
-/// window, with the word the peer's send into it carries. A session holding one has done both, so
-/// its sends have somewhere to land and its waits have something to count.
+/// region-2 address in this card's base-address table (device p2p RDMA — never host DMA), so this
+/// card's sends reach the peer. The other half — this card's `XSEG` entry for each of the peer's
+/// landing slots, pointed at that slot of the receive window — is [`point_landing_slots`]'s, once
+/// the session that owns the window has allocated it.
 ///
 /// ONE PER PROCESS. The process drives one card and the card's `XSEG` entries point at one window's
 /// slots, so every bundle the process runs (decode, prefill, every rung) lands its peer's sends in
@@ -1622,27 +1622,55 @@ pub fn link_peer(
             why,
         }
     })?;
-    // ⭐ ONE XSEG ENTRY PER LANDING SLOT, EACH PROGRAMMED ONCE, AS THE tp37 CELL PROGRAMS ITS ONE:
-    // an F-send lands where its sid's entry points and nowhere else (#1009, E8a), so the peer's
-    // message into slot `s` signals `wait_sid(s)` and this card points that entry at the slot —
-    // `hal_sbf::rdma_xseg` of the slot's flat VA plus the one-flit L4 compensation, the same
-    // compensated destination `scheduler::build_rdma_send_cb` hands the send door.
-    for (slot, at) in window.slots() {
-        let va = flex_rs::control_block_wire::Flits(
-            flex_rs::control_block_wire::VirtualAddressSbf::new(
-                RecvWindow::SEGMENT as u8,
-                flex_rs::control_block_wire::Flits::from_bytes(at),
-            )
-            .value(),
-        )
-        .to_bytes();
-        let word = flex_rs::hal_sbf::rdma_xseg(va + flex_rs::control_block_wire::Flits::BYTES)
-            .map_err(AttachRefusal::Xseg)?;
-        flex_rs::senlib_ffi::write_xseg(route.wait_sid(slot), word).map_err(AttachRefusal::Xseg)?;
-    }
     let link: &'static PeerLink = Box::leak(Box::new(PeerLink { me, route, window }));
     *cell = Some(link);
     Ok(link)
+}
+
+/// ⭐ POINT EVERY ONE OF THE PEER'S LANDING SLOTS AT ITS SLOT OF THIS CARD'S WINDOW — one `XSEG`
+/// entry per slot, each programmed once, as the tp37 cell programs its one. An F-send lands where its
+/// sid's entry points and nowhere else (#1009, E8a), so the peer's message into slot `s` signals
+/// `wait_sid(s)` and that entry names the slot: `hal_sbf::rdma_xseg` of the slot's flat VA plus the
+/// one-flit L4 compensation, the VA from [`flex_rs::scheduler::landing_va_bytes`] — the same compose
+/// the send's own word takes.
+///
+/// ⛔ THE VA IS THE ALLOCATOR'S, SO THIS RUNS ONCE THE WINDOW IS ALLOCATED. The window is a placement
+/// in the weight segment, and where that segment's bytes ARE — the region's segment and the
+/// allocation's offset inside it — exists only once a session has allocated it. `window_region` is
+/// that allocation: the weight segment of the session that OWNS it (every other session aliases
+/// it). MEASURED, #1009 run 5: the entries pointed at `(program seg 1, layout offset)`, an address
+/// the allocator gave to something else, and every collective ran clean over a window the peer's
+/// bytes never reached — garbage from token 0.
+///
+/// # Errors
+/// [`AttachRefusal`]: the runtime, a slot past the allocation, or a word that will not compose or
+/// program.
+pub fn point_landing_slots(link: &PeerLink, window_region: &DevAddr) -> Result<(), AttachRefusal> {
+    let rt = get_or_init_runtime().map_err(|e| AttachRefusal::BringUp(e.to_string()))?;
+    let resolver = FlexAllocatorAddressResolver::new(
+        rt.get_allocator()
+            .map_err(|e| AttachRefusal::BringUp(format!("{e:?}")))?,
+    );
+    let cap = crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES;
+    for (slot, at) in link.window.slots() {
+        // The slot's own extent: one message, or the cut's remainder for its last.
+        let len = (link.window.cut().get() - u64::from(slot.message()) * cap).min(cap);
+        let va = flex_rs::scheduler::landing_va_bytes(
+            &resolver,
+            &RdmaOperand {
+                base: window_region.0.clone(),
+                segment: RecvWindow::SEGMENT as u8,
+                offset: at,
+            },
+            len,
+        )
+        .map_err(|e| AttachRefusal::Xseg(e.to_string()))?;
+        let word = flex_rs::hal_sbf::rdma_xseg(va + flex_rs::control_block_wire::Flits::BYTES)
+            .map_err(AttachRefusal::Xseg)?;
+        flex_rs::senlib_ffi::write_xseg(link.route.wait_sid(slot), word)
+            .map_err(AttachRefusal::Xseg)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
