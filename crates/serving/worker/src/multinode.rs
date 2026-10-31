@@ -121,6 +121,34 @@ impl Executor for MultiNodeExecutor {
         self.inner.determine_available_memory()
     }
 
+    // The KV facts the engine builds its block tracker from are the leader's worker's: every rank
+    // runs the same forward over the same pool, so the leader answers for all of them.
+    fn kv_addressing(&self) -> scratchy_core_common::KvAddressing {
+        self.inner.kv_addressing()
+    }
+
+    fn hybrid_kv_stores(&self) -> scratchy_core_common::HybridKvStores {
+        self.inner.hybrid_kv_stores()
+    }
+
+    fn kv_backing(&self) -> scratchy_core_common::KvBacking {
+        self.inner.kv_backing()
+    }
+
+    fn snapshot_budget(&self) -> Option<scratchy_serving_scheduler::scheduler::SnapshotBudget> {
+        self.inner.snapshot_budget()
+    }
+
+    /// To the leader's own executor: its worker is the one whose outputs the engine collects, so
+    /// its deferred steps are the ones a resolver knocks for.
+    fn set_drain_door(&mut self, door: scratchy_serving_engine::core_client::DrainDoor) {
+        self.inner.set_drain_door(door);
+    }
+
+    fn drain_until(&mut self, cell: &std::sync::Arc<scratchy_serving_engine::executor::DrainCell>) {
+        self.inner.drain_until(cell);
+    }
+
     fn check_health(&self) -> EngineResult<()> {
         self.inner.check_health()
     }

@@ -370,13 +370,21 @@ impl Worker for SpyreWorker {
         Ok(())
     }
 
+    /// The pool was cut at load; this only checks the scheduler's block count fits it. A follower
+    /// rank of a sharded world is handed rank 0's count, and every block id the one scheduler names
+    /// must be a page on every rank's card.
     fn initialize_cache(
         &mut self,
         num_gpu_blocks: usize,
         _num_cpu_blocks: usize,
     ) -> ExecutorResult<()> {
-        let _ = num_gpu_blocks;
-        Ok(())
+        match self.kv_cache_num_blocks_override() {
+            Some(pages) if num_gpu_blocks > pages => Err(werr(format!(
+                "the scheduler addresses {num_gpu_blocks} KV blocks, but this card's pool offers \
+                 {pages} pages"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// THE KV BYTE BUDGET, as the pool was actually sized — not a constant.
