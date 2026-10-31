@@ -18,6 +18,7 @@
 
 pub mod backend;
 pub mod block;
+pub mod draft_context;
 pub mod mtp;
 pub mod ngram;
 pub mod proposer;
@@ -28,6 +29,7 @@ pub use backend::{
     SampledRows, SpecDecodeBackend,
 };
 pub use block::{Block, BlockDrafter, BlockLane, BlockPasses, Commit};
+pub use draft_context::{DraftContextError, DraftContextPlan};
 pub use mtp::{
     Chain, DraftBudget, DraftVocab, Drafting, HeadPasses, MtpDrafter, MtpProposer,
     MtpProposerConfig, PassOne, StepRows,

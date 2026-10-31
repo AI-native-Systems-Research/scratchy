@@ -588,12 +588,13 @@ impl DraftRingPool {
         kv_heads * window * head_dim * elem_bytes
     }
 
-    /// One slot's context window, in bytes: its `window` positions' context rows of `hidden`
-    /// values, 4-bit over 64-value groups with each group's fp16 scale and minimum (Splash
-    /// abi/DraftAttention.h:88-100 `draft_context_window_bytes`; `dflash2.metal`
-    /// `DRAFT_WINDOW_BYTES`).
+    /// One slot's context window, in bytes ([`WindowLayout::bytes`]).
     pub fn window_bytes(window: usize, hidden: usize) -> usize {
-        window * (hidden / 2) + window * hidden.div_ceil(64) * 4
+        WindowLayout {
+            window: window as u32,
+            hidden,
+        }
+        .bytes()
     }
 
     /// Allocate `num_layers` layers' keys and values of `num_slots` slots, each `slot_bytes`, and
@@ -633,5 +634,146 @@ impl DraftRingPool {
 
     pub fn num_layers(&self) -> usize {
         self.keys.len()
+    }
+}
+
+/// The values a context window's 4-bit codes share a scale and minimum over
+/// (`dflash2.metal` `DRAFT_CONTEXT_GROUP`).
+pub const CONTEXT_GROUP: usize = 64;
+
+/// A slot's context window as `dflash2.metal` lays it out (`DRAFT_WINDOW_BYTES`; Splash
+/// abi/DraftAttention.h:88-100 `draft_context_window_bytes`): `window` ring positions' context
+/// rows of `hidden` values, every position's 4-bit codes (`hidden / 2` bytes) first, then every
+/// position's groups' fp16 scale and minimum (4 bytes a group of [`CONTEXT_GROUP`] values). A
+/// position's row sits at the position modulo `window`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowLayout {
+    pub window: u32,
+    pub hidden: usize,
+}
+
+impl WindowLayout {
+    fn code_bytes(self) -> usize {
+        self.hidden / 2
+    }
+
+    fn group_bytes(self) -> usize {
+        self.hidden / CONTEXT_GROUP * 4
+    }
+
+    /// A slot's window, in bytes.
+    pub fn bytes(self) -> usize {
+        self.window as usize * (self.code_bytes() + self.group_bytes())
+    }
+
+    /// The byte runs `(offset, len)` of a slot's window holding positions `[from, to)`, at most a
+    /// window of them: in each plane, the ring's run of them, cut where it wraps.
+    pub fn runs(self, from: u32, to: u32) -> Vec<(usize, usize)> {
+        assert!(
+            from <= to && to - from <= self.window,
+            "positions {from}..{to} are more than a window of {}",
+            self.window
+        );
+        let start = from % self.window;
+        let rows = to - from;
+        let head = rows.min(self.window - start);
+        let slots = [(start, head), (0, rows - head)];
+        let codes = self.window as usize * self.code_bytes();
+        (slots.into_iter())
+            .filter(|&(_, n)| n > 0)
+            .flat_map(|(slot, n)| {
+                let (slot, n) = (slot as usize, n as usize);
+                [
+                    (slot * self.code_bytes(), n * self.code_bytes()),
+                    (codes + slot * self.group_bytes(), n * self.group_bytes()),
+                ]
+            })
+            .collect()
+    }
+}
+
+/// One copy between context windows: `len` bytes of `from` at `from_at` to `to` at `to_at`.
+pub struct WindowCopy<'a> {
+    pub from: &'a objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    pub from_at: usize,
+    pub to: &'a objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    pub to_at: usize,
+    pub len: usize,
+}
+
+/// Encode `copies` on `encoder` between barriers: after every dispatch and copy before them, before
+/// every one after. A prefix-cache snapshot takes its context window this way, and a restore gives
+/// it back (Splash `QwenStateStorage::copyWindow`, runtime/model/QwenState.cpp:452-454).
+pub fn encode_window_copies(
+    encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    copies: &[WindowCopy<'_>],
+) {
+    use objc2_metal::{
+        MTL4CommandEncoder as _, MTL4ComputeCommandEncoder as _, MTL4VisibilityOptions,
+        MTLBuffer as _, MTLStages,
+    };
+    if copies.is_empty() {
+        return;
+    }
+    let work = MTLStages::Dispatch | MTLStages::Blit;
+    encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+        work,
+        MTLStages::Blit,
+        MTL4VisibilityOptions::Device,
+    );
+    for c in copies {
+        assert!(
+            c.from_at + c.len <= c.from.length() && c.to_at + c.len <= c.to.length(),
+            "a window copy of {} bytes lies inside both buffers",
+            c.len
+        );
+        // SAFETY: both ranges lie inside their buffers (checked above).
+        unsafe {
+            encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                c.from, c.from_at, c.to, c.to_at, c.len,
+            );
+        }
+    }
+    encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+        MTLStages::Blit,
+        work,
+        MTL4VisibilityOptions::Device,
+    );
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    /// Where `dflash2.metal`'s `draft_window_store_group` writes a position's codes and groups.
+    fn kernel_bytes(layout: WindowLayout, position: u32) -> Vec<usize> {
+        let slot = (position % layout.window) as usize;
+        let (h, groups) = (layout.hidden, layout.hidden / CONTEXT_GROUP);
+        let codes = layout.window as usize * (h / 2);
+        let code = (0..h / 2).map(|b| slot * (h / 2) + b);
+        let group = (0..groups * 4).map(|b| codes + slot * groups * 4 + b);
+        code.chain(group).collect()
+    }
+
+    /// A run of positions' byte runs are exactly the bytes the kernel writes for them, wrapping
+    /// or not, and a whole window's are the whole slot.
+    #[test]
+    fn a_runs_bytes_are_the_kernels_for_its_positions() {
+        let layout = WindowLayout {
+            window: 16,
+            hidden: 128,
+        };
+        for (from, to) in [(0, 16), (3, 9), (12, 20), (40, 56), (47, 48), (5, 5)] {
+            let mut ours: Vec<usize> = (layout.runs(from, to).into_iter())
+                .flat_map(|(at, len)| at..at + len)
+                .collect();
+            let mut theirs: Vec<usize> = (from..to).flat_map(|p| kernel_bytes(layout, p)).collect();
+            ours.sort_unstable();
+            theirs.sort_unstable();
+            assert_eq!(ours, theirs, "positions {from}..{to}");
+        }
+        let whole: usize = layout.runs(16, 32).iter().map(|&(_, len)| len).sum();
+        assert_eq!(whole, layout.bytes());
+        assert_eq!(layout.bytes(), DraftRingPool::window_bytes(16, 128));
     }
 }
