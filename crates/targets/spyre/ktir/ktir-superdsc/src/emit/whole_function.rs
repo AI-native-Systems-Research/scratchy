@@ -6063,13 +6063,29 @@ fn lower_function_folded(
                     let (m, sticks) = (a.v_rows / batch, a.v_cols / stick);
                     let tid = mint_scratch(k, layout, floor, res, 1);
                     let blocks = stick_major_region(tid, m, batch * sticks, layout);
-                    out.extend(
-                        HeadMajorCopies::of(&blocks, &a, a.v_rows, sticks)?.to_block(
-                            f.name,
-                            sym_id_base,
-                            layout,
-                        )?,
-                    );
+                    let copies = HeadMajorCopies::of(&blocks, &a, a.v_rows, sticks)?.to_block(
+                        f.name,
+                        sym_id_base,
+                        layout,
+                    )?;
+                    // ⭐ AN ACTIVATION THE WALK'S BODY DOES NOT DEFINE IS LAID OUT ONCE, BEFORE THE
+                    // WALK. The body relaunches once per page, so the decode query's copies — the
+                    // same bytes on every trip — would run once per page; they go ahead of the
+                    // body's first descriptor instead, into scratch no trip writes (a synthetic
+                    // intermediate's footprint is its own, [`crate::placement::BundleLayout::synth`]).
+                    let invariant = in_body
+                        && fold.is_some_and(|fd| {
+                            in_values.first().is_some_and(|v| {
+                                !fd.body.contains(v) && fd.carried.iter().all(|c| c.arg != *v)
+                            })
+                        });
+                    if invariant {
+                        let n = copies.len();
+                        out.splice(body_out.0..body_out.0, copies);
+                        body_out.0 += n;
+                    } else {
+                        out.extend(copies);
+                    }
                     per_op[0] = Region {
                         tid,
                         is_out: false,

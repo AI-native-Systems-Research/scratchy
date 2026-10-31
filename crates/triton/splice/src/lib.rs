@@ -4591,6 +4591,20 @@ mod walk_on_the_card {
             ops.iter().any(|e| e.op_name.starts_with("scatter")),
             "the output row is scattered to its query row"
         );
+        // The score contraction reads the query as one `[4, 128]` block per kv head: two stick-run
+        // copies, laid once before the walk — the same bytes on every trip.
+        let first_body = ops.iter().position(|e| e.walk.is_some()).expect("a body");
+        let blocks: Vec<usize> = (0..ops.len())
+            .filter(|&i| ops[i].op_name.starts_with("heads"))
+            .collect();
+        assert_eq!(blocks.len(), 2, "one copy per stick of the head");
+        for i in blocks {
+            assert!(
+                ops[i].walk.is_none() && i < first_body,
+                "{}: the query's blocks precede the walk",
+                ops[i].op_name
+            );
+        }
     }
 
     /// ⭐ THE PROMPT WALK AT A HEAD TWO STICKS WIDE. The query's head-major relayout is two
@@ -4616,8 +4630,14 @@ mod walk_on_the_card {
         // (heads, rows, sticks a head)
         let (a, b, n) = (32u32, 64u32, 2u32);
         let stick = 64u32;
+        // The score contraction's per-kv-head query blocks: 8 kv heads of 4·64 rows each.
+        let (kv, m) = (8u32, a * b / 8);
         let heads = named("heads");
-        assert_eq!(heads.len(), 4, "two copies in, two out");
+        assert_eq!(
+            heads.len(),
+            6,
+            "two copies in, two into the score contraction's kv-head blocks, two out"
+        );
         for (j, &i) in heads.iter().enumerate() {
             let e = &ops[i];
             let s = (j as u32) % n;
@@ -4630,6 +4650,18 @@ mod walk_on_the_card {
                     e.op_name
                 );
                 assert_eq!(offs, [block, head_major], "{}", e.op_name);
+            } else if j < 4 {
+                assert!(
+                    e.walk.is_none() && i < first_body,
+                    "{}: the query's kv-head blocks are laid once, before the walk",
+                    e.op_name
+                );
+                assert_eq!(
+                    offs,
+                    [s * kv * m * stick, s * m * stick],
+                    "{}: stick {s} of every kv head's rows, to its block",
+                    e.op_name
+                );
             } else {
                 assert!(
                     e.walk.is_none() && i > first_body,
