@@ -260,6 +260,28 @@ pub fn reduce_opspec_df(
     head_major: bool,
     df: Df,
 ) -> Result<OpSpec, String> {
+    reduce_opspec_df_divided(
+        op,
+        rows,
+        cols,
+        (data_name, accum_name),
+        head_major,
+        df,
+        ReduceDivision::Rows,
+    )
+}
+
+/// [`reduce_opspec_df`] under a STATED row division: [`ReduceDivision::Rows`] is it byte for byte, and
+/// [`ReduceDivision::Groups`] is the scratchpad plan's ([`assemble_reduce_seeded`]).
+pub fn reduce_opspec_df_divided(
+    op: OpFunc,
+    rows: u32,
+    cols: u32,
+    (data_name, accum_name): (&str, &str),
+    head_major: bool,
+    df: Df,
+    division: ReduceDivision,
+) -> Result<OpSpec, String> {
     // LOWER to TileIR: this reduce's iteration domain + kind, ONE `TileOp` declaration instead of
     // the inline `WorkPlan::divide` + hand-picked `pointwise_lx_resident` closure — reached from the
     // REAL `lower_one_node` SubtileTape dispatch (every reduce: rmsnorm's mean, softmax's max/sum,
@@ -274,9 +296,21 @@ pub fn reduce_opspec_df(
         dims: dims.clone(),
         df,
     };
-    let tiled = tile_op
-        .tile(MaxCores::<MAX_CORES>, distribute_cores, "out")
-        .map_err(|e| e.0)?;
+    let tiled = match division {
+        ReduceDivision::Groups(n) => tile_op.tile(
+            MaxCores::<MAX_CORES>,
+            |dims, max_cores| crate::work::row_groups(dims, max_cores, n),
+            "out",
+        ),
+        ReduceDivision::Rows => tile_op.tile(MaxCores::<MAX_CORES>, distribute_cores, "out"),
+        ReduceDivision::ReducedAxis => {
+            return Err(format!(
+                "reduce `{accum_name}`: a split of the reduced axis is `reduce_opspec_off_divided`'s, \
+                 whose operands state their windows"
+            ));
+        }
+    }
+    .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
     let device_dims = plan.iter_syms(["mb", "out", "y"]);
     // ── STICK-MAJOR RESIDUAL ── flip ONLY the DATA input to rank-2
@@ -513,13 +547,15 @@ pub fn assemble_reduce_seeded<D: KindTag, A: KindTag>(
     // `Stk<RowBlockedTag>` callers (fp8 amax, etc.) are UNCHANGED (`RowBlockedTag::kind() !=
     // StickKind::Flat`, so `head_major` still resolves to `false` exactly as before — byte-identical).
     let head_major = D::kind() == StickKind::Flat;
-    let op = reduce_opspec(
+    let division = layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows);
+    let op = reduce_opspec_df_divided(
         op_func_from_str(op_func),
         rows,
         cols,
-        data.name(),
-        accum.name(),
+        (data.name(), accum.name()),
         head_major,
+        Df::Fp16,
+        division,
     )
     .unwrap_or_else(|e| panic!("assemble_reduce {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -598,6 +634,9 @@ pub enum ReduceDivision {
     /// holds the op to). For a stick-major `[rows, cols]` block, core `c` reads ONE contiguous run of
     /// sticks; [`Self::Rows`] hands each core its rows as `cols/64` strided one-row bursts.
     ReducedAxis,
+    /// ⭐ `n` ROW GROUPS, one a core ([`crate::work::row_groups`]) — the scratchpad plan's division for
+    /// a walk whose ops divide as its batched contractions do ([`crate::work::EwDivision::Groups`]).
+    Groups(u32),
 }
 
 /// The parameter list of [`reduce_opspec_off_divided`], carried as a struct. Every field but
@@ -677,6 +716,11 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
     };
     let tiled = match division {
         ReduceDivision::Rows => tile_op.tile(MaxCores::<MAX_CORES>, distribute_cores, "out"),
+        ReduceDivision::Groups(n) => tile_op.tile(
+            MaxCores::<MAX_CORES>,
+            |dims, max_cores| crate::work::row_groups(dims, max_cores, n),
+            "out",
+        ),
         ReduceDivision::ReducedAxis => {
             if !op.template_combines_a_core_split_reduction() {
                 return Err(format!(

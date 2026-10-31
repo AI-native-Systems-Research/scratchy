@@ -534,6 +534,25 @@ pub enum EwDivision {
     /// outright by a decode batch chunk's `esub` and `exp`. Their shared core-local `cesub` is sized under
     /// it, so both ops keep it (`attn`'s `ChunkBufs::sm_division_of`).
     SticksFirst,
+    /// ⭐ `n` ROW GROUPS, one a core ([`row_groups`]) — the division a walk's scratchpad plan chooses
+    /// ([`crate::emit::lx_plan`]) when its ops divide as its batched contractions do: torch-spyre's
+    /// decode trip runs every op on one core per kv head, the head's query rows together, so each
+    /// intermediate stays in that core's LX from the op that writes it to the ops that read it.
+    Groups(u32),
+}
+
+/// [`EwDivision::Groups`]: `mb` split into exactly `n` cores, nothing else — `n` groups of `mb / n`
+/// rows. [`distribute_cores`] for an op whose rows `n` does not divide, or past the core budget.
+pub fn row_groups(dims: &[ItDim], max_cores: u32, n: u32) -> BTreeMap<&'static str, u32> {
+    match dims
+        .iter()
+        .find(|d| d.name == "mb" && !d.is_reduction && !d.is_stick)
+    {
+        Some(mb) if n > 1 && n <= max_cores && mb.size.is_multiple_of(n) => {
+            BTreeMap::from([(mb.name, n)])
+        }
+        _ => distribute_cores(dims, max_cores),
+    }
 }
 
 impl EwDivision {
@@ -556,10 +575,11 @@ impl EwDivision {
     /// The splitter this division names, in the shape [`WorkPlan::divide`] takes. [`Self::Law`] is not a
     /// splitter until it is resolved, so it names the rows-first one — the law's answer when there is
     /// nothing to resolve it on — and every door resolves before asking.
-    pub fn splitter(self) -> fn(&[ItDim], u32) -> BTreeMap<&'static str, u32> {
-        match self {
-            EwDivision::Law | EwDivision::RowsFirst => distribute_cores,
-            EwDivision::SticksFirst => distribute_cores_sticks_first,
+    pub fn splitter(self) -> impl Fn(&[ItDim], u32) -> BTreeMap<&'static str, u32> {
+        move |dims, max_cores| match self {
+            EwDivision::Law | EwDivision::RowsFirst => distribute_cores(dims, max_cores),
+            EwDivision::SticksFirst => distribute_cores_sticks_first(dims, max_cores),
+            EwDivision::Groups(n) => row_groups(dims, max_cores, n),
         }
     }
 }

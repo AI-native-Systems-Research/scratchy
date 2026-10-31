@@ -1020,13 +1020,16 @@ pub fn pointwise_opspec_from_tile(
     let core_local = layout.is_some_and(|l| {
         l.pointwise_core_local(std::iter::once(o_name).chain(in_names.iter().copied()))
     });
+    let division = layout.map_or(EwDivision::Law.resolve(stick_major, core_local), |l| {
+        l.ew_law(stick_major, core_local)
+    });
     pointwise_opspec_from_tile_split(
         tile_op,
         op,
         in_names,
         o_name,
         head_major,
-        EwDivision::Law.resolve(stick_major, core_local).splitter(),
+        division.splitter(),
         // Whole-tensor output — every caller but the gather copy, whose runs land at a base.
         OutView::whole(),
     )
@@ -1318,13 +1321,15 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 "out",
             )
             .map_err(|e| e.0)?,
-        (CoreDivision::Ew(d), None) => tile_op
-            .tile(
-                MaxCores::<MAX_CORES>,
-                d.resolve(stickmajor, core_local).splitter(),
-                "out",
-            )
-            .map_err(|e| e.0)?,
+        (CoreDivision::Ew(d), None) => {
+            let d = match (d, layout) {
+                (EwDivision::Law, Some(l)) => l.ew_law(stickmajor, core_local),
+                (d, _) => d.resolve(stickmajor, core_local),
+            };
+            tile_op
+                .tile(MaxCores::<MAX_CORES>, d.splitter(), "out")
+                .map_err(|e| e.0)?
+        }
         (stated, Some(_)) => {
             return Err(format!(
                 "{o_name}: a row-split (y-broadcast) op states its own core division \
