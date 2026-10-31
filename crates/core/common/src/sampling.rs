@@ -306,8 +306,12 @@ pub struct GpuSampleParams {
     pub any_penalty: bool,
 }
 
-/// Deterministic per-request seed for an UNSEEDED GPU-sampling request:
-/// FNV-1a(req_id bytes, then `position` LE bytes) with a fixed basis. Backend-
+/// Deterministic per-request seed for an UNSEEDED GPU-sampling request: Splash's
+/// `nextUniform` (runtime/model/Runtime.cpp:834), SplitMix64 of the request's
+/// seed plus its draw counter times the golden gamma, with FNV-1a of `req_id`
+/// as the seed and `position + 1` as the counter, so a request's successive
+/// draws are independent (FNV-1a over the position's bytes alone leaves each
+/// draw a fixed shift of the one before it). Backend-
 /// AND TP-rank-independent (no process RNG, no per-rank state) so the cuda and
 /// metal samplers derive the identical seed for the same `(req_id, position)`.
 /// `position` is the request's generated-token count at this step (advances each
@@ -321,11 +325,12 @@ pub fn fnv_seed(req_id: &str, position: u32) -> u32 {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
     }
-    for b in position.to_le_bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    (h >> 32) as u32 // upper 32 bits for maximum entropy
+    let counter = u64::from(position) + 1;
+    let mut v = h.wrapping_add(counter.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    v = (v ^ (v >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    v = (v ^ (v >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    v ^= v >> 31;
+    (v >> 32) as u32 // upper 32 bits for maximum entropy
 }
 
 /// The un-truncated FNV-1a state behind [`fnv_seed`] — a PER-REQUEST seed for a
@@ -531,6 +536,36 @@ pub struct LogprobsOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unseeded request's draw at one position says nothing about its draw at the next: over
+    /// 4096 request ids and four steps each, the (this draw, next draw) pairs fill an 8 x 8 grid
+    /// evenly (chi-square under 103.4, the 63-df p = 0.001 point). Hashing the position's bytes
+    /// into FNV-1a with no finalizer made each draw the one before it shifted by 3/8 or 5/8, so
+    /// the first token's draw chose the second's (chi-square in the tens of thousands).
+    #[test]
+    fn an_unseeded_request_s_successive_draws_are_independent() {
+        const BINS: usize = 8;
+        let mut grid = [[0u32; BINS]; BINS];
+        let bin = |u: f32| ((u * BINS as f32) as usize).min(BINS - 1);
+        for request in 0..4096 {
+            let req_id = format!("cmpl-{request}");
+            for position in 0..4 {
+                let this = seed_to_uniform(fnv_seed(&req_id, position));
+                let next = seed_to_uniform(fnv_seed(&req_id, position + 1));
+                grid[bin(this)][bin(next)] += 1;
+            }
+        }
+        let expected = (4096 * 4) as f64 / (BINS * BINS) as f64;
+        let chi_square: f64 = grid
+            .iter()
+            .flatten()
+            .map(|&n| (f64::from(n) - expected).powi(2) / expected)
+            .sum();
+        assert!(
+            chi_square < 103.4,
+            "chi-square {chi_square:.1} over {grid:?}"
+        );
+    }
 
     /// A prompt opens thinking where its last `<think>` has no `</think>` after it, and closes it
     /// where it ends with a closed think block (whitespace alone after the close). An earlier
