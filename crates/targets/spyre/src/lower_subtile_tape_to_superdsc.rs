@@ -1046,25 +1046,32 @@ pub fn compute_bundle_layout<F: RopeForm>(
         )
     };
     // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW — placed iff the forward carries a collective, in the
-    // weight segment's base region (bank 0) directly above the packed weights, one message wide.
+    // weight segment's base region (bank 0) directly above the packed weights, sized by
+    // `RecvWindow::bytes_for` the forward's widest collective operand.
     //
     // ⛔ UNIFORM BY CONSTRUCTION, NOT BY COORDINATION. Every bundle of a forward (prefix, rolled
     // body, suffix) is baked over THIS one layout, and `weight_segment_parity` holds every layout
-    // of a session to one weight extent — so `(seg1, align128(extent), cap)` is the same triple
-    // wherever a send is baked and wherever its consume reads. Sizing it at the message cap rather
-    // than this forward's widest fragment is what keeps a decode layout and a prefill layout equal;
-    // no fragment can exceed it (`consume_fragments` cuts at the cap).
-    if ir
+    // of a session to one weight extent — so `(seg1, align128(extent), size)` is the same triple
+    // wherever a send is baked and wherever its consume reads. The size reads only the operand's
+    // COLUMNS and the target's row cap (`WINDOW_ROWS`), never this bundle's row count, which is
+    // what keeps a decode layout and every prefill rung's equal; and `consume_fragments` cuts at
+    // the same law, so no fragment can exceed it.
+    let widest_cols = ir
         .nodes
         .iter()
-        .any(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
-    {
+        .filter(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
+        .map(|n| n.inputs[0].region.cols.len)
+        .max();
+    if let Some(widest_cols) = widest_cols {
         let w = SegRole::Weight.segment();
-        let window = ktir_superdsc::collective::RecvWindow::new(
-            align128(seg_bytes[w]),
-            ktir_superdsc::collective::Payload::from(ktir_superdsc::collective::WireBytes::CAP),
-        )
-        .ok_or_else(|| SuperDscError("an align128 offset is flit-aligned".to_string()))?;
+        let size =
+            ktir_superdsc::collective::RecvWindow::bytes_for(widest_cols).ok_or_else(|| {
+                SuperDscError(format!(
+                    "a collective's operand has {widest_cols} columns — no receive window holds it"
+                ))
+            })?;
+        let window = ktir_superdsc::collective::RecvWindow::new(align128(seg_bytes[w]), size)
+            .ok_or_else(|| SuperDscError("an align128 offset is flit-aligned".to_string()))?;
         if window.end() > bundle::MAX_SEGMENT_BYTES {
             return Err(SuperDscError(format!(
                 "the tensor-parallel receive window [{}, {}) does not fit the weight segment's \

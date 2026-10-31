@@ -17,7 +17,7 @@ use scratchy_subtile::tensor_parallel::{
 };
 
 use crate::bundle_code::collective::{
-    Fragment, FragmentRefusal, Payload, TpWorld, WireBytes, fragments,
+    Fragment, FragmentRefusal, Payload, RecvWindow, TpWorld, fragments,
 };
 
 /// THE WORLD, AS BOTH HALVES NAME IT — the analysis's [`WorldSize`] and the bundle's [`TpWorld`],
@@ -56,12 +56,16 @@ pub const SPYRE_SPLIT_GRANULE: SplitGranule =
 /// `[rows, cols]` operand, and the fragments the window is sized over, are this function's output
 /// and nothing else's, so no fragment can be wider than the window it lands in.
 ///
-/// ⛔ CUT AT THE WINDOW, which is one message wide (`compute_bundle_layout`), not at the wire: a
-/// send moves any payload as its run of messages (`Payload::messages`), but the window holds one
-/// fragment, and two fragments of one collective cannot share it — the peer's next fragment can
-/// land while this rank still consumes the last (a wdone says "landed", never "read").
+/// ⛔ CUT AT THE WINDOW (`RecvWindow::bytes_for` — `WINDOW_ROWS` rows of the operand), never at the
+/// wire: a send moves any payload as its run of messages (`Payload::messages`), but two fragments
+/// of one collective cannot share the window — the peer's next fragment can land while this rank
+/// still consumes the last (a wdone says "landed", never "read"). Every operand a bundle hands a
+/// collective has at most `WINDOW_ROWS` rows, so the cut is always ONE fragment.
 pub fn consume_fragments(rows: u32, cols: u32) -> Result<Vec<Fragment>, FragmentRefusal> {
-    fragments(rows, cols, Payload::from(WireBytes::CAP))
+    match RecvWindow::bytes_for(cols) {
+        Some(window) => fragments(rows, cols, window),
+        None => Err(FragmentRefusal::RaggedCols { cols }),
+    }
 }
 
 /// Why a tensor-parallel bake cannot be planned.
@@ -79,8 +83,9 @@ pub enum TpBakeRefusal {
 pub struct TpBake {
     pub world: SpyreWorld,
     pub sharded: ShardedForward,
-    /// The widest fragment any collective of the forward sends — the window's size. `None` exactly
-    /// when the forward has no collective (a world of one).
+    /// The receive window the forward's collectives need — [`RecvWindow::bytes_for`] its widest
+    /// collective operand, the size the layout places. `None` exactly when the forward has no
+    /// collective (a world of one).
     pub window_bytes: Option<Payload>,
 }
 
@@ -89,21 +94,16 @@ pub fn tp_bake(input: &LoweringInput, world: SpyreWorld) -> Result<TpBake, TpBak
     let sharded = tensor_parallel::shard(input, world.analysis, SPYRE_SPLIT_GRANULE)
         .map_err(TpBakeRefusal::Shard)?;
     let shapes = tensor_parallel::op_shapes(&sharded.local);
-    let mut window_bytes: Option<Payload> = None;
+    let mut widest_cols: Option<u32> = None;
     for (collective, c) in sharded.collectives.iter().enumerate() {
         let (rows, cols) = shapes[c.reads];
-        let frags = consume_fragments(rows, cols)
-            .map_err(|why| TpBakeRefusal::Fragment { collective, why })?;
-        for f in frags {
-            if window_bytes.is_none_or(|w| f.bytes().get() > w.get()) {
-                window_bytes = Some(f.bytes());
-            }
-        }
+        consume_fragments(rows, cols).map_err(|why| TpBakeRefusal::Fragment { collective, why })?;
+        widest_cols = Some(widest_cols.map_or(cols, |w| w.max(cols)));
     }
     Ok(TpBake {
         world,
         sharded,
-        window_bytes,
+        window_bytes: widest_cols.and_then(RecvWindow::bytes_for),
     })
 }
 
@@ -121,14 +121,27 @@ mod tests {
     }
 
     /// Two ranks on the decode layer: each all-reduce sends one rank's `[1, hidden]` fp16 partial
-    /// in one fragment, so the window is exactly that wide.
+    /// in one fragment, and the window holds `WINDOW_ROWS` such rows — the widest prompt chunk's
+    /// operand, so the decode bundle and every prefill rung place the same window. A chunk at the
+    /// window's full row count is still one fragment; its send is several messages once it
+    /// passes the cap.
     #[test]
-    fn two_ranks_size_the_window_to_one_hidden_row() {
+    fn two_ranks_size_the_window_to_the_widest_chunk_of_hidden_rows() {
+        use crate::bundle_code::collective::{RDMA_MESSAGE_CAP_BYTES, WINDOW_ROWS};
         let b = tp_bake(&one_layer_input(), SpyreWorld::of::<2>()).unwrap();
         assert_eq!(b.sharded.collectives.len(), 2);
         let hidden_bytes = 2048 * u64::from(<Fp16 as DataFormat>::WORD_LENGTH);
-        assert_eq!(b.window_bytes.unwrap().get(), hidden_bytes);
+        assert_eq!(
+            b.window_bytes.unwrap().get(),
+            hidden_bytes * u64::from(WINDOW_ROWS)
+        );
         assert_eq!(consume_fragments(1, 2048).unwrap().len(), 1);
+        assert_eq!(consume_fragments(WINDOW_ROWS, 2048).unwrap().len(), 1);
+        // An 8192-wide hidden at the full window: 8 MiB, one fragment, sent as two messages.
+        let wide = consume_fragments(WINDOW_ROWS, 8192).unwrap();
+        assert_eq!(wide.len(), 1);
+        assert!(wide[0].bytes().get() > RDMA_MESSAGE_CAP_BYTES);
+        assert_eq!(wide[0].bytes().message_count(), 2);
     }
 
     /// ⭐ THE EMISSION, END TO END ON THE HOST: the analysis's two-rank decode layer, lowered to
@@ -572,10 +585,10 @@ mod tests {
     }
 
     /// The window's placement: a sharded forward's layout carries it in the weight segment's base
-    /// region, one message wide, above every weight; an unsharded forward's layout has none.
+    /// region, sized by the plan's own law (the same bytes `tp_bake` reports), above every weight;
+    /// an unsharded forward's layout has none.
     #[test]
     fn a_sharded_layout_places_the_window_above_the_weights() {
-        use crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES;
         use crate::lower_subtile_tape_to_superdsc::compute_bundle_layout;
         use ktir_superdsc::placement::SegRole;
         use ktir_superdsc::reserved_tids::TP_RECV_TID;
@@ -605,7 +618,8 @@ mod tests {
         let win = two.placements[&TP_RECV_TID];
         assert_eq!(win.segment, SegRole::Weight.segment());
         assert_eq!(win.bank, 0);
-        assert_eq!(win.size, RDMA_MESSAGE_CAP_BYTES);
+        let planned = tp_bake(&one_layer_input(), SpyreWorld::of::<2>()).unwrap();
+        assert_eq!(Some(win.size), planned.window_bytes.map(|w| w.get()));
         assert_eq!(win.offset % 128, 0);
         let weights_end = two
             .placements

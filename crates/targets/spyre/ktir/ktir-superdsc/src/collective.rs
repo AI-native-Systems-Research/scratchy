@@ -252,13 +252,24 @@ impl WireBytes {
     }
 }
 
+/// The rows a receive window holds: the most rows any bundle of a forward hands a collective. The
+/// pool's prompt window (`PagedKvPool::PREFILL_CHUNK_SLOTS`) bounds every prefill chunk, and every
+/// decode batch is narrower (asserted below).
+pub const WINDOW_ROWS: u32 = crate::sdsc_abstract::PagedKvPool::PREFILL_CHUNK_SLOTS as u32;
+
+const _: () = assert!(
+    crate::sdsc_abstract::PagedKvPool::WIDEST_BATCH_RUNG <= WINDOW_ROWS,
+    "a decode batch wider than the prompt window would hand a collective more rows than the \
+     receive window holds"
+);
+
 /// THE RECEIVE WINDOW — one per card, where the peer's sends land. One typed triple, the same in
 /// every bundle of a forward (prefill, decode, every rung), so a send baked into one bundle and the
 /// consume baked into another always name the same bytes.
 ///
 /// It lives in the weight segment ([`RecvWindow::SEGMENT`]), the one process-shared,
-/// placement-stable segment, above the packed weights. Its size is the widest fragment any
-/// collective of the forward sends — never one bundle's own need.
+/// placement-stable segment, above the packed weights. Its size is [`RecvWindow::bytes_for`] the
+/// forward's widest collective operand — never one bundle's own need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RecvWindow {
     offset: u64,
@@ -288,6 +299,18 @@ impl RecvWindow {
     /// One past the window's last byte — the weight segment must reserve up to here.
     pub const fn end(self) -> u64 {
         self.offset + self.size.0
+    }
+
+    /// ⭐ THE WINDOW A FORWARD'S COLLECTIVES NEED: [`WINDOW_ROWS`] rows of its widest collective
+    /// operand (`widest_cols`, stick-rounded fp16). It reads only the operand's COLUMNS (the
+    /// forward's) and the row cap (the target's) — never a bundle's own row count — so every
+    /// bundle of one forward places the same window, as the one `XSEG[peer sid]` and the shared
+    /// weight segment require. Any fragment of any collective of the forward fits it whole, so a
+    /// collective is ONE fragment and its send is a run of messages ([`Payload::messages`]).
+    /// `None` for no columns.
+    pub const fn bytes_for(widest_cols: u32) -> Option<Payload> {
+        let cols = widest_cols.next_multiple_of(STICK_ELEMS) as u64;
+        Payload::new(cols * <Fp16 as DataFormat>::WORD_LENGTH as u64 * WINDOW_ROWS as u64)
     }
 }
 
