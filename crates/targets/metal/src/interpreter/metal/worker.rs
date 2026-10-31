@@ -956,6 +956,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // when W::ROPE_ON_READ, so pinned below like block_tables
                 // (16-byte placeholder + never bound on non-spans arches).
                 block_unrotated_flags,
+                // The live-row count the MoE sort reads by baked gpuAddress — pinned below.
+                num_tokens_u32,
                 // The sampled rows the gather and its undoing read by baked gpuAddress — pinned
                 // below.
                 num_sample_rows_u32,
@@ -998,6 +1000,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // Span labels: bound by dispatch-baked address on rope-on-read
             // arches (slot 8 of the prefill attention), so pin like seq_used_k.
             pin(span_ids);
+            // The forward's num_tokens: the MoE sort binds it by dispatch-baked address, and every
+            // forward's input writes fill it.
+            pin(num_tokens_u32);
             // The rows the forward samples: the lm_head slice's gather and the logits compaction
             // bind them by dispatch-baked address, same lazy-pager hazard as the inputs.
             pin(num_sample_rows_u32);
@@ -2552,6 +2557,7 @@ mod tests {
             kv_cache_v: (0..num_layers).map(|_| alloc_buffer(device, 16)).collect(),
             block_unrotated_flags: (0..num_layers).map(|_| alloc_buffer(device, 16)).collect(),
             tq: None,
+            num_tokens_u32: alloc_buffer(device, 4),
             num_sample_rows_u32: alloc_buffer(device, 4),
             sample_indices: alloc_buffer(device, 16),
             gdn_state_conv: ::std::vec::Vec::new(),

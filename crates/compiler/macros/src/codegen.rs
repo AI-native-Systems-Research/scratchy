@@ -16336,6 +16336,10 @@ pub fn emit_model(
                                 .map(|_| alloc(16))
                                 .collect(),
                             tq: __tq_prov,
+                            // 4 bytes — worker writes the forward's
+                            // `num_tokens` here before dispatch: the MoE
+                            // sort counts the step's live pairs.
+                            num_tokens_u32: alloc(4),
                             // 4 bytes — worker writes the sampled rows'
                             // count here before dispatch so the lm_head
                             // slice's gather / scatter know how many rows

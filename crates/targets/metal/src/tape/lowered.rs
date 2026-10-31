@@ -1358,6 +1358,9 @@ pub enum RuntimeBindingKind {
     BlockUnrotatedFlags {
         layer: LayerId,
     },
+    /// `[1]` u32 — the in-flight forward's `num_tokens`, written by the pool at every forward's
+    /// start: the MoE sort counts the step's live pairs, `num_tokens · top_k`, not the bucket's.
+    NumTokensU32,
     /// `[1]` u32 — the in-flight forward's sampled rows' count (`SampleIndices`' length): the
     /// rows the lm_head slice gathers and puts back, and the logits rows a compaction keeps.
     NumSampleRowsU32,
@@ -1845,6 +1848,7 @@ impl RuntimeBindingKind {
             | Self::CuSeqlensQ
             | Self::SeqUsedK
             | Self::SpanIds
+            | Self::NumTokensU32
             | Self::NumSampleRowsU32
             | Self::SampleIndices
             | Self::GdnStateIndices

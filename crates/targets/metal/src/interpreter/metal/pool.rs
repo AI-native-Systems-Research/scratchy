@@ -2300,6 +2300,13 @@ fn write_runtime_inputs(
             return Err(ForwardError::KvNotMapped { block, mapped });
         }
     }
+    // The forward's actual num_tokens: the MoE sort counts the step's live pairs from it.
+    write(
+        "num_tokens",
+        &runtime.num_tokens_u32,
+        bytes_of(&[inputs.num_tokens]),
+        Padding::Zero,
+    )?;
     // The rows the forward samples: the lm_head slice gathers them and puts them back, a
     // compaction moves their logits to the front.
     let sampled = inputs.sampled_rows;
@@ -2524,6 +2531,7 @@ mod tests {
             kv_cache_v: (0..num_layers).map(|_| alloc(device, 16)).collect(),
             block_unrotated_flags: (0..num_layers).map(|_| alloc(device, 16)).collect(),
             tq: None,
+            num_tokens_u32: alloc(device, 4),
             num_sample_rows_u32: alloc(device, 4),
             sample_indices: alloc(device, 16),
             gdn_state_conv: ::std::vec::Vec::new(),
@@ -2876,6 +2884,7 @@ mod tests {
             kv_cache_v: vec![alloc(d, 16)],
             block_unrotated_flags: vec![alloc(d, 16)],
             tq: None,
+            num_tokens_u32: alloc(d, 4),
             num_sample_rows_u32: alloc(d, 4),
             sample_indices: alloc(d, max_m_bytes),
             gdn_state_conv: ::std::vec::Vec::new(),
@@ -3318,6 +3327,7 @@ mod tests {
             sampled_rows: &EVERY_ROW[..1],
             gdn_state_indices: None,
             gdn_is_fresh: Some(&[0]),
+            draft: None,
             vision_rope_freqs: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
