@@ -57,8 +57,7 @@ fn pattern_bytes(len: usize) -> Vec<u8> {
 fn main() -> Result<()> {
     let stream = Stream::create().context("stream create (brings the runtime up)")?;
     let total = WINDOW + TAIL;
-    let dev = DevAddr::alloc(ByteSize(total), MemoryType::Tensor)
-        .context("device buffer alloc")?;
+    let dev = DevAddr::alloc(ByteSize(total), MemoryType::Tensor).context("device buffer alloc")?;
 
     // --- 1. not-X: the region really holds non-zero bytes before the fill ---
     let poison = pattern_bytes(total as usize);
