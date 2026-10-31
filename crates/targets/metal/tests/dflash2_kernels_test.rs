@@ -3156,17 +3156,26 @@ fn bf16_max() -> f32 {
 }
 
 /// Splash `referencePenalty`, on the target's sampler's counting: the logit of a token the prompt
-/// and the output hold `count` times between them, as the kernel computes it before rounding.
-fn reference_penalty(value: f32, count: u32, entry: &PenalizeEntry) -> f32 {
+/// and the output hold `count` times between them, as the kernel computes it before rounding. The
+/// kernel's `value *= inverse; value -= frequency * count + presence` may be contracted by the
+/// Metal compiler into multiply-adds, so each of its two products is rounded or fused: the four
+/// values it can compute.
+fn reference_penalty(value: f32, count: u32, entry: &PenalizeEntry) -> [f32; 4] {
     if count == 0 {
-        return value;
+        return [value; 4];
     }
-    let value = value
-        * match value > 0.0 {
-            true => entry.repetition_inverse,
-            false => entry.repetition,
-        };
-    (value - (entry.frequency * count as f32 + entry.presence)).clamp(-bf16_max(), bf16_max())
+    let scale = match value > 0.0 {
+        true => entry.repetition_inverse,
+        false => entry.repetition,
+    };
+    let by = [
+        entry.frequency * count as f32 + entry.presence,
+        entry.frequency.mul_add(count as f32, entry.presence),
+    ];
+    let rounded = |t: f32| value * scale - t;
+    let fused = |t: f32| value.mul_add(scale, -t);
+    [rounded(by[0]), rounded(by[1]), fused(by[0]), fused(by[1])]
+        .map(|v| v.clamp(-bf16_max(), bf16_max()))
 }
 
 /// Splash `penaltyTable`: `rows` rows of words, each with small counts at a density of its own,
@@ -3268,11 +3277,15 @@ fn penalized_rows_are_rewritten_from_their_words_and_drafts() {
             let count = word + drafted;
             let expected = reference_penalty(value(before), count, entry);
             // One product rounds alike; a fused subtraction may land a bf16 step either way.
-            let exact = after == bits(expected);
-            let within = (value(after) - expected).abs() <= ulp_bf16(expected);
+            let matches = |expected: f32| {
+                let exact = after == bits(expected);
+                let within = (value(after) - expected).abs() <= ulp_bf16(expected);
+                exact || (count > 0 && within)
+            };
             assert!(
-                exact || (count > 0 && within),
-                "row {row} token {token}: wrote {} for {} (count {count}), expected {expected}",
+                expected.into_iter().any(matches),
+                "row {row} token {token}: wrote {} for {} (count {count}), expected one of \
+                 {expected:?}",
                 value(after),
                 value(before)
             );
