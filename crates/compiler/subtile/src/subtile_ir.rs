@@ -1877,7 +1877,24 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
             // the draw reads the GATHERED row, whose pad lanes the widening above reserves, and the
             // gather's block copies address a column block the same way at any total width
             // (stick-major places a column by its stick and row alone).
-            SubOp::AllGather { .. } => break,
+            //
+            // ⛔ A FOLDED TAIL GATHERS ITS ONE ROW. A prefill rung's projection computes only the
+            // last prompt row (the emitter's fold writes it at row 0), and the draw reads row 0 —
+            // so the gather moves that row and no other: gathering the rung's `mq` rows would send
+            // every rank's whole block of rows nothing computed and nothing reads, across cards,
+            // every prompt chunk.
+            SubOp::AllGather { .. } => {
+                if suffix == SampleRows::Folded {
+                    let gather = graph
+                        .nodes
+                        .iter_mut()
+                        .find(|n| n.output.tensor == t)
+                        .expect("the result tail's writer");
+                    gather.inputs[0].region.rows = Range::new(0, 1);
+                    gather.output.region.rows = Range::new(0, 1);
+                }
+                break;
+            }
             other => panic!(
                 "the device sampling mint walked a {other:?} result tail — the admission \
                  gate (an arity-2 Dense lm-head under single-input ScalarMul/TanhSoftCap, \
@@ -5585,6 +5602,56 @@ mod tests {
     // `t`, feeding the stage's check) and row 0 is the column index
     // (`W[0][j] = j`).
     const FIXTURE_VOCAB: u32 = 2048;
+
+    /// ⭐ A FOLDED TAIL GATHERS ONE ROW. A sharded prompt chunk's projection computes only its
+    /// last row (at row 0, the fold's), and the draw reads row 0 — so the all-gather in its tail
+    /// moves that one row, never the chunk's `mq` rows. A decode rung's every row is a request's,
+    /// and its gather keeps them all. Shown on a 4-row rung both ways.
+    #[test]
+    fn a_folded_tail_gathers_its_one_row() {
+        let nz = |k| std::num::NonZeroU32::new(k).unwrap();
+        let input = crate::lower::LoweringInput {
+            exported: None,
+            sources: vec![
+                SourceShape { rows: 4, cols: 64 },
+                SourceShape {
+                    rows: 64,
+                    cols: 2048,
+                },
+            ],
+            ops: vec![
+                OpDesc {
+                    op: SubOp::MatmulTile {
+                        n: 2048,
+                        weight: crate::lower::GemmWeight::Dense,
+                    },
+                    m: 4,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+                },
+                OpDesc {
+                    op: SubOp::AllGather { cols: 4096 },
+                    m: 4,
+                    inputs: vec![InputRef::Op(0)],
+                },
+            ],
+            result: 1,
+        };
+        let rows_of_gather = |suffix: SampleRows| {
+            let mut g = lower_region(&input, nz(64));
+            mint_sample(&mut g, suffix);
+            let gather = g
+                .nodes
+                .iter()
+                .find(|n| matches!(n.op, SubOp::AllGather { .. }))
+                .expect("the tail's gather");
+            (
+                gather.inputs[0].region.rows.len,
+                gather.output.region.rows.len,
+            )
+        };
+        assert_eq!(rows_of_gather(SampleRows::Folded), (1, 1));
+        assert_eq!(rows_of_gather(SampleRows::All), (4, 4));
+    }
 
     fn chained_head_fixture(width: u32, hidden: u32) -> crate::lower::LoweringInput {
         crate::lower::LoweringInput {
