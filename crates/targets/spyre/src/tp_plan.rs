@@ -7,7 +7,7 @@
 //! ([`SpyreWorld`], from the `SPYRE_TP_WORLDS` row) and the column granule it can split at
 //! ([`SPYRE_SPLIT_GRANULE`], one fp16 stick) — and reads back the sharded forward: each collective
 //! becomes consume launches over stick-column fragments of its operand ([`consume_fragments`]), and
-//! the receive window is as wide as the widest of them ([`TpBake::window_bytes`]). Nothing here
+//! each cut of the receive window is as wide as the widest of them ([`TpBake::window_cut`]). Nothing here
 //! decides a placement.
 
 use scratchy_subtile::lower::LoweringInput;
@@ -56,13 +56,13 @@ pub const SPYRE_SPLIT_GRANULE: SplitGranule =
 /// `[rows, cols]` operand, and the fragments the window is sized over, are this function's output
 /// and nothing else's, so no fragment can be wider than the window it lands in.
 ///
-/// ⛔ CUT AT THE WINDOW (`RecvWindow::bytes_for` — `WINDOW_ROWS` rows of the operand), never at the
-/// wire: a send moves any payload as its run of messages (`Payload::messages`), but two fragments
-/// of one collective cannot share the window — the peer's next fragment can land while this rank
-/// still consumes the last (a wdone says "landed", never "read"). Every operand a bundle hands a
-/// collective has at most `WINDOW_ROWS` rows, so the cut is always ONE fragment.
+/// ⛔ CUT AT ONE WINDOW CUT (`RecvWindow::cut_bytes_for` — `WINDOW_ROWS` rows of the operand),
+/// never at the wire: a send moves any payload as its run of messages (`Payload::messages`), but
+/// two fragments of one collective cannot share its cut — the peer's next fragment can land while
+/// this rank still consumes the last (a wdone says "landed", never "read"). Every operand a bundle
+/// hands a collective has at most `WINDOW_ROWS` rows, so the cut is always ONE fragment.
 pub fn consume_fragments(rows: u32, cols: u32) -> Result<Vec<Fragment>, FragmentRefusal> {
-    match RecvWindow::bytes_for(cols) {
+    match RecvWindow::cut_bytes_for(cols) {
         Some(window) => fragments(rows, cols, window),
         None => Err(FragmentRefusal::RaggedCols { cols }),
     }
@@ -83,10 +83,10 @@ pub enum TpBakeRefusal {
 pub struct TpBake {
     pub world: SpyreWorld,
     pub sharded: ShardedForward,
-    /// The receive window the forward's collectives need — [`RecvWindow::bytes_for`] its widest
-    /// collective operand, the size the layout places. `None` exactly when the forward has no
-    /// collective (a world of one).
-    pub window_bytes: Option<Payload>,
+    /// One cut of the receive window the forward's collectives need —
+    /// [`RecvWindow::cut_bytes_for`] its widest collective operand, the cut the layout places
+    /// `WINDOW_CUTS` of. `None` exactly when the forward has no collective (a world of one).
+    pub window_cut: Option<Payload>,
 }
 
 /// Shard `input` for `world` and size the receive window its collectives need.
@@ -103,7 +103,7 @@ pub fn tp_bake(input: &LoweringInput, world: SpyreWorld) -> Result<TpBake, TpBak
     Ok(TpBake {
         world,
         sharded,
-        window_bytes: widest_cols.and_then(RecvWindow::bytes_for),
+        window_cut: widest_cols.and_then(RecvWindow::cut_bytes_for),
     })
 }
 
@@ -117,7 +117,7 @@ mod tests {
     fn one_rank_needs_no_window() {
         let b = tp_bake(&one_layer_input(), SpyreWorld::of::<1>()).unwrap();
         assert!(b.sharded.collectives.is_empty());
-        assert!(b.window_bytes.is_none());
+        assert!(b.window_cut.is_none());
     }
 
     /// Two ranks on the decode layer: each all-reduce sends one rank's `[1, hidden]` fp16 partial
@@ -132,7 +132,7 @@ mod tests {
         assert_eq!(b.sharded.collectives.len(), 2);
         let hidden_bytes = 2048 * u64::from(<Fp16 as DataFormat>::WORD_LENGTH);
         assert_eq!(
-            b.window_bytes.unwrap().get(),
+            b.window_cut.unwrap().get(),
             hidden_bytes * u64::from(WINDOW_ROWS)
         );
         assert_eq!(consume_fragments(1, 2048).unwrap().len(), 1);
@@ -155,10 +155,9 @@ mod tests {
     fn an_all_reduce_lowers_to_one_consume_group_naming_its_send() {
         use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
         use crate::lower_subtile_tape_to_superdsc::{FoldGrouping, launch_index};
-        use ktir_superdsc::collective::CollectiveKind;
+        use ktir_superdsc::collective::{CollectiveKind, WindowCut};
         use ktir_superdsc::ktir_node::ActiveCap;
         use ktir_superdsc::place::PlaceId;
-        use ktir_superdsc::reserved_tids::TP_RECV_TID;
         use scratchy_subtile::subtile_ir::{SubOp, lower_region};
 
         let b = tp_bake(&one_layer_input(), SpyreWorld::of::<2>()).unwrap();
@@ -178,9 +177,14 @@ mod tests {
             2,
             "one consume per all-reduce at decode, and no send program"
         );
-        for (consume, operand) in ops.iter().zip(&operands) {
+        for (k, (consume, operand)) in ops.iter().zip(&operands).enumerate() {
             let c = consume.tp_consume.expect("the program is the consume");
             assert_eq!((c.kind, c.operand), (CollectiveKind::AllReduce, *operand));
+            assert_eq!(
+                c.cut,
+                WindowCut::of_collective(k),
+                "consecutive collectives alternate cuts"
+            );
             assert_eq!(
                 c.fragment,
                 consume_fragments(1, 2048).unwrap()[0],
@@ -188,8 +192,8 @@ mod tests {
             );
             let k = consume.ktir.as_ref().expect("a program");
             assert!(
-                k.bindings.iter().any(|b| b.get() == TP_RECV_TID),
-                "the consume reads the receive window"
+                k.bindings.iter().any(|b| b.get() == c.cut.tid()),
+                "the consume reads its cut of the receive window"
             );
         }
         let shifts = launch_index(&ops, FoldGrouping::Split);
@@ -245,7 +249,6 @@ mod tests {
         use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
         use crate::lower_subtile_tape_to_superdsc::{FoldGrouping, render_dxp_input};
         use ktir_superdsc::ktir_node::ActiveCap;
-        use ktir_superdsc::reserved_tids::TP_RECV_TID;
         use ktir_superdsc::wire::SEGMENT_OFFSETS;
         use scratchy_subtile::fixtures::mlp_sublayer;
         use scratchy_subtile::subtile_ir::lower_region;
@@ -255,7 +258,8 @@ mod tests {
         let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
         let (ops, layout) =
             lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
-        let window = layout.placements[&TP_RECV_TID];
+        let cut = ops.iter().find_map(|e| e.tp_consume).unwrap().cut;
+        let window = layout.placements[&cut.tid()];
         let want = SEGMENT_OFFSETS[window.segment] + window.offset;
         let consumes: Vec<_> = ops
             .iter()
@@ -301,7 +305,6 @@ mod tests {
         use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
         use crate::lower_subtile_tape_to_superdsc::{FoldGrouping, render_dxp_input};
         use ktir_superdsc::ktir_node::ActiveCap;
-        use ktir_superdsc::reserved_tids::TP_RECV_TID;
         use ktir_superdsc::wire::SEGMENT_OFFSETS;
         use scratchy_subtile::fixtures::vocab_projection;
         use scratchy_subtile::subtile_ir::lower_region;
@@ -316,7 +319,8 @@ mod tests {
             let p = layout.placements[&tid];
             SEGMENT_OFFSETS[p.segment] + p.offset
         };
-        let (out, window) = (at(ir.result.index() as u32), at(TP_RECV_TID));
+        let cut = ops.iter().find_map(|e| e.tp_consume).unwrap().cut;
+        let (out, window) = (at(ir.result.index() as u32), at(cut.tid()));
         for rank in 0..2u64 {
             let peer = 1 - rank;
             let group: Vec<_> = ops
@@ -374,7 +378,6 @@ mod tests {
         use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
         use crate::lower_subtile_tape_to_superdsc::{FoldGrouping, render_dxp_input};
         use ktir_superdsc::ktir_node::ActiveCap;
-        use ktir_superdsc::reserved_tids::TP_RECV_TID;
         use ktir_superdsc::wire::SEGMENT_OFFSETS;
         use scratchy_subtile::fixtures::mlp_sublayer;
         use scratchy_subtile::subtile_ir::{SubOp, lower_region};
@@ -427,11 +430,12 @@ mod tests {
             }
         }
         assert!(
-            firsts.contains(&at(partial)) && firsts.contains(&at(TP_RECV_TID)),
+            firsts.contains(&at(partial)) && firsts.contains(&at(c.cut.tid())),
             "the consume reads the partial and the window at their typed placements: {firsts:?}"
         );
         assert_eq!(
-            layout.placements[&TP_RECV_TID].segment, 1,
+            layout.placements[&c.cut.tid()].segment,
+            1,
             "the window is in segment 1"
         );
     }
@@ -591,7 +595,7 @@ mod tests {
     fn a_sharded_layout_places_the_window_above_the_weights() {
         use crate::lower_subtile_tape_to_superdsc::compute_bundle_layout;
         use ktir_superdsc::placement::SegRole;
-        use ktir_superdsc::reserved_tids::TP_RECV_TID;
+        use ktir_superdsc::reserved_tids::TP_RECV_CUT_TIDS;
         use scratchy_subtile::subtile_ir::lower_region;
 
         // The fixture's gemm weights: q, k, v, o, gate, up, down.
@@ -612,19 +616,28 @@ mod tests {
         assert!(
             !layout_of(SpyreWorld::of::<1>())
                 .placements
-                .contains_key(&TP_RECV_TID)
+                .contains_key(&TP_RECV_CUT_TIDS[0])
         );
         let two = layout_of(SpyreWorld::of::<2>());
-        let win = two.placements[&TP_RECV_TID];
+        let win = two.placements[&TP_RECV_CUT_TIDS[0]];
         assert_eq!(win.segment, SegRole::Weight.segment());
         assert_eq!(win.bank, 0);
         let planned = tp_bake(&one_layer_input(), SpyreWorld::of::<2>()).unwrap();
-        assert_eq!(Some(win.size), planned.window_bytes.map(|w| w.get()));
+        assert_eq!(Some(win.size), planned.window_cut.map(|w| w.get()));
         assert_eq!(win.offset % 128, 0);
+        // The cuts: equal, adjacent, in order — one window.
+        for (i, &tid) in TP_RECV_CUT_TIDS.iter().enumerate() {
+            let cut = two.placements[&tid];
+            assert_eq!(
+                (cut.segment, cut.bank, cut.size),
+                (win.segment, 0, win.size)
+            );
+            assert_eq!(cut.offset, win.offset + i as u64 * win.size, "cut {i}");
+        }
         let weights_end = two
             .placements
             .values()
-            .filter(|p| p.tid != TP_RECV_TID && p.segment == win.segment)
+            .filter(|p| !TP_RECV_CUT_TIDS.contains(&p.tid) && p.segment == win.segment)
             .map(|p| p.offset + p.size)
             .max()
             .unwrap_or(0);

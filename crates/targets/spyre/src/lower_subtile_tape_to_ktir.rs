@@ -1070,17 +1070,35 @@ fn send_fragment<F: RopeForm>(
     }
 }
 
+/// ⭐ THE WINDOW CUT `node`'S COLLECTIVE USES — [`WindowCut::of_collective`] its index in the
+/// forward's own order (how many collectives precede it in `ir`), so consecutive collectives land
+/// in alternate cuts. The same index on every rank and in every bundle that carries the node.
+///
+/// [`WindowCut::of_collective`]: ktir_superdsc::collective::WindowCut::of_collective
+fn window_cut<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> ktir_superdsc::collective::WindowCut {
+    let k = ir
+        .nodes
+        .iter()
+        .take_while(|n| n.id != node.id)
+        .filter(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
+        .count();
+    ktir_superdsc::collective::WindowCut::of_collective(k)
+}
+
 /// The all-reduce's consume launches: per stick-column fragment of the operand
 /// ([`crate::tp_plan::consume_fragments`], the same cut the window is sized over), the `Add` splice
 /// over this rank's fragment and the receive window, each marked with the [`TpConsume`] its launch
 /// group carries into the CB pipeline.
 ///
-/// The window holds ONE fragment at a time, laid out from its first byte as the `[rows, cols]`
+/// A window cut holds ONE fragment at a time, laid out from its first byte as the `[rows, cols]`
 /// tensor that fragment is — a run of whole stick columns is byte-identical to such a tensor — so
-/// every fragment's window view is columns `[0, cols)` of [`TP_RECV_TID`].
+/// every fragment's window view is columns `[0, cols)` of the collective's cut
+/// ([`window_cut_tid`]).
 ///
 /// [`TpConsume`]: ktir_superdsc::collective::TpConsume
-/// [`TP_RECV_TID`]: ktir_superdsc::reserved_tids::TP_RECV_TID
 fn all_reduce_consumes<F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -1096,7 +1114,8 @@ fn all_reduce_consumes<F: RopeForm>(
         Ok(f) => [f],
         Err(refusal) => return refusal,
     };
-    let window = TensorId::from_index(ktir_superdsc::reserved_tids::TP_RECV_TID as usize);
+    let cut = window_cut(node, ir);
+    let window = TensorId::from_index(cut.tid() as usize);
     let mut ops = Vec::with_capacity(frags.len());
     for (k, f) in frags.into_iter().enumerate() {
         let cols_at = |start: u32| Range::new(start + f.first_col(), f.cols());
@@ -1143,6 +1162,7 @@ fn all_reduce_consumes<F: RopeForm>(
             operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
             fragment: f,
             plays_at: None,
+            cut,
         });
         ops.push(e);
     }
@@ -1159,7 +1179,11 @@ fn all_reduce_consumes<F: RopeForm>(
 /// time — `WINDOW_ROWS` rows of the block, which every block a bundle hands a gather fits.
 ///
 /// [`TpConsume`]: ktir_superdsc::collective::TpConsume
-fn all_gather_consumes<F: RopeForm>(node: &SubtileNode<F>, cols: u32) -> NodeLowering {
+fn all_gather_consumes<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    cols: u32,
+) -> NodeLowering {
     use ktir_superdsc::collective::{CollectiveKind, PlaysAt, TpConsume, TpWorld};
     use scratchy_subtile::subtile_ir::{Range, Region, TensorRegion};
     let x = node.inputs[0];
@@ -1178,8 +1202,9 @@ fn all_gather_consumes<F: RopeForm>(node: &SubtileNode<F>, cols: u32) -> NodeLow
         Ok(f) => f,
         Err(refusal) => return refusal,
     };
+    let cut = window_cut(node, ir);
     let window = TensorRegion {
-        tensor: TensorId::from_index(ktir_superdsc::reserved_tids::TP_RECV_TID as usize),
+        tensor: TensorId::from_index(cut.tid() as usize),
         region: Region {
             rows: Range::new(0, rows),
             cols: Range::new(0, lc),
@@ -1202,6 +1227,7 @@ fn all_gather_consumes<F: RopeForm>(node: &SubtileNode<F>, cols: u32) -> NodeLow
             operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
             fragment,
             plays_at: Some(PlaysAt::of(id)),
+            cut,
         };
         for (src, dst, leg) in [
             (x, block_at(id.rank()), "own"),
@@ -1306,7 +1332,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // ⭐ THE ALL-GATHER'S CONSUME IS RANK-SELECTED: this rank's block and the peer's land at
         // columns that depend on which rank is which, so the bake carries one consume per rank
         // and each session plays its own (`bundle::collective::cb_pipeline`).
-        SubOp::AllGather { cols } => all_gather_consumes(node, *cols),
+        SubOp::AllGather { cols } => all_gather_consumes(node, ir, *cols),
         // ⛔ THE 2b EXPANSION KINDS, named here instead of `expansion_ops!()`: the 2a
         // routing below made the macro's patterns for THOSE kinds unreachable
         // (`unreachable_patterns` is `-D warnings`), and the remaining members are a

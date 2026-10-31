@@ -1192,7 +1192,9 @@ pub(crate) fn patch_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle_code::collective::{CollectiveKind, Payload, TpWorld, WireBytes, fragments};
+    use crate::bundle_code::collective::{
+        CollectiveKind, Payload, TpWorld, WindowCut, WireBytes, fragments,
+    };
     use crate::runtime::Chunk0;
     use flex_rs::address::{ByteOffset, RegionId};
     use flex_rs::memory_region::DomainId;
@@ -1220,6 +1222,7 @@ mod tests {
             operand: crate::bundle_code::PlaceId::Act(7),
             fragment: fragments(1, 2048, Payload::from(WireBytes::CAP)).unwrap()[0],
             plays_at: None,
+            cut: WindowCut::of_collective(0),
         }
     }
 

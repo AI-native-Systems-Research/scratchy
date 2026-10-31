@@ -1046,8 +1046,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
         )
     };
     // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW — placed iff the forward carries a collective, in the
-    // weight segment's base region (bank 0) directly above the packed weights, sized by
-    // `RecvWindow::bytes_for` the forward's widest collective operand.
+    // weight segment's base region (bank 0) directly above the packed weights: `WINDOW_CUTS`
+    // adjacent cuts of `RecvWindow::cut_bytes_for` the forward's widest collective operand, one
+    // placement per cut's tid (`WindowCut::tid`) — collective `k` lands in cut
+    // `WindowCut::of_collective(k)`.
     //
     // ⛔ UNIFORM BY CONSTRUCTION, NOT BY COORDINATION. Every bundle of a forward (prefix, rolled
     // body, suffix) is baked over THIS one layout, and `weight_segment_parity` holds every layout
@@ -1064,13 +1066,13 @@ pub fn compute_bundle_layout<F: RopeForm>(
         .max();
     if let Some(widest_cols) = widest_cols {
         let w = SegRole::Weight.segment();
-        let size =
-            ktir_superdsc::collective::RecvWindow::bytes_for(widest_cols).ok_or_else(|| {
+        let cut =
+            ktir_superdsc::collective::RecvWindow::cut_bytes_for(widest_cols).ok_or_else(|| {
                 SuperDscError(format!(
                     "a collective's operand has {widest_cols} columns — no receive window holds it"
                 ))
             })?;
-        let window = ktir_superdsc::collective::RecvWindow::new(align128(seg_bytes[w]), size)
+        let window = ktir_superdsc::collective::RecvWindow::new(align128(seg_bytes[w]), cut)
             .ok_or_else(|| SuperDscError("an align128 offset is flit-aligned".to_string()))?;
         if window.end() > bundle::MAX_SEGMENT_BYTES {
             return Err(SuperDscError(format!(
@@ -1081,18 +1083,22 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 bundle::MAX_SEGMENT_BYTES,
             )));
         }
-        let tid = ktir_superdsc::reserved_tids::TP_RECV_TID;
-        placements.insert(
-            tid,
-            TensorPlacement {
+        for cut in (0..ktir_superdsc::collective::WINDOW_CUTS)
+            .map(ktir_superdsc::collective::WindowCut::of_collective)
+        {
+            let tid = cut.tid();
+            placements.insert(
                 tid,
-                role: SegRole::Weight,
-                segment: w,
-                bank: 0,
-                offset: window.offset(),
-                size: window.size().get(),
-            },
-        );
+                TensorPlacement {
+                    tid,
+                    role: SegRole::Weight,
+                    segment: w,
+                    bank: 0,
+                    offset: window.cut_offset(cut),
+                    size: window.cut().get(),
+                },
+            );
+        }
         seg_bytes[w] = window.end();
     }
     // ── ROPE permutation matrix P [hd,hd] (task: in-bundle RoPE) ── If the tape has
@@ -5387,9 +5393,8 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
         observables.push((0..nseg).map(|k| session.observable_tids(k)).collect());
         sessions.push(session);
     }
-    // ── The lockstep run: segment k on both ranks, then each rank's window gets the peer's
-    //    fragment of the operand its next consume names — what the peer's F-send lands ──
-    let window_tid = u64::from(ktir_superdsc::reserved_tids::TP_RECV_TID);
+    // ── The lockstep run: segment k on both ranks, then the window cut each rank's next consume
+    //    reads gets the peer's fragment of the operand it names — what the peer's F-send lands ──
     // ⛔ THE OPERAND IS THE IR NODE'S, NOT THE BAKED CONSUME'S. A rolled body bakes ONE consume per
     // class and replays it per layer; its `TpConsume::operand` names the class's tid, and the card's
     // send reaches layer `l`'s copy through the launch's layer shift. The gate has no shift to
@@ -5413,16 +5418,18 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
     }
     let mut outs: Vec<std::collections::HashMap<u64, Vec<f32>>> =
         vec![std::collections::HashMap::new(); ranks.len()];
-    let mut windows: Vec<Option<(Vec<f32>, Vec<usize>)>> = vec![None; ranks.len()];
+    // A staged window: `run_step`'s source — the cut's tid, its values, their shape.
+    type StagedWindow = (u64, Vec<f32>, Vec<usize>);
+    let mut windows: Vec<Option<StagedWindow>> = vec![None; ranks.len()];
     for k in 0..nseg {
         for (r, session) in sessions.iter_mut().enumerate() {
             let sources = if k == 0 {
                 std::mem::take(&mut probes[r].sources)
             } else {
-                let (vals, shape) = windows[r]
+                let staged = windows[r]
                     .take()
                     .ok_or_else(|| format!("rank {r} reached segment {k} with no window staged"))?;
-                vec![(window_tid, vals, shape)]
+                vec![staged]
             };
             let mut want: Vec<(u64, usize)> = golden_index
                 .tids
@@ -5477,11 +5484,18 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
                     c0 + fc
                 ));
             }
+            // The cut is the RECEIVER's consume's — the one its programs read.
+            let Some(mine) = segs[r][k + 1].first().and_then(|g| g.kv.tp) else {
+                return Err(format!(
+                    "rank {r}'s segment {} does not open with a consume",
+                    k + 1
+                ));
+            };
             let mut win = Vec::with_capacity(fr * fc);
             for i in r0..r0 + fr {
                 win.extend_from_slice(&v[i * cols + c0..i * cols + c0 + fc]);
             }
-            *window = Some((win, vec![fr, fc]));
+            *window = Some((u64::from(mine.cut.tid()), win, vec![fr, fc]));
         }
     }
     // ── The lockstep reference, to its fixed point ──
@@ -10850,7 +10864,6 @@ mod tests {
         use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
         use crate::tp_plan::{SpyreWorld, tp_bake};
         use ktir_superdsc::ktir_node::ActiveCap;
-        use ktir_superdsc::reserved_tids::TP_RECV_TID;
         use scratchy_subtile::fixtures::mlp_sublayer;
         use scratchy_subtile::subtile_ir::lower_region;
 
@@ -10872,7 +10885,8 @@ mod tests {
         assert_eq!(sends.len(), 1, "one all-reduce, one send");
         let consume = groups[sends[0].group].kv.tp.unwrap();
         let partial = layout.placements[&consume.operand.tid()];
-        let window = layout.placements[&TP_RECV_TID];
+        let window = layout.placements[&consume.cut.tid()];
+        assert_eq!(consume.cut, bundle::collective::WindowCut::of_collective(0));
         assert_eq!(
             sends[0].send,
             bundle::collective::TpSend {
@@ -10886,7 +10900,7 @@ mod tests {
             places: baked
                 .places
                 .iter()
-                .filter(|p| p.id != bundle::PlaceId::Act(TP_RECV_TID))
+                .filter(|p| p.id != bundle::PlaceId::Act(consume.cut.tid()))
                 .cloned()
                 .collect::<Vec<_>>()
                 .into(),

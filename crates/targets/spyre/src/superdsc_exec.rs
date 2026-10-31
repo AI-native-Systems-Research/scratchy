@@ -1139,8 +1139,8 @@ pub enum SeatRefusal {
         baked: bundle::collective::RecvWindow,
         linked: bundle::collective::RecvWindow,
     },
-    /// The bundle's window placement is not a flit-aligned payload.
-    Misplaced { offset: u64, size: u64 },
+    /// The bundle's window cuts are not one flit-aligned window in bank 0 of the weight segment.
+    Misplaced(bundle::collective::SendUnplaced),
 }
 
 impl std::fmt::Display for SeatRefusal {
@@ -1160,9 +1160,9 @@ impl std::fmt::Display for SeatRefusal {
                 "its receive window {baked:?} is not the {linked:?} this card's XSEG[peer sid] \
                  holds — every bundle a rank runs must bake the same window"
             ),
-            Self::Misplaced { offset, size } => write!(
+            Self::Misplaced(why) => write!(
                 f,
-                "its receive window [{offset}, +{size}) is not a flit-aligned payload"
+                "its receive window's cuts are not one flit-aligned window: {why:?}"
             ),
         }
     }
@@ -1187,23 +1187,12 @@ impl RankSeat {
     /// rank's [`crate::runtime::link_peer`] programs, read off the bundle that will run.
     ///
     /// # Errors
-    /// [`SeatRefusal::Misplaced`] when the placement is not a flit-aligned payload.
+    /// [`SeatRefusal::Misplaced`] when the cuts are not one flit-aligned window
+    /// ([`bundle::collective::baked_window`]).
     pub fn baked_window(
         code: &bundle::BundleCode<'_>,
     ) -> Result<Option<bundle::collective::RecvWindow>, SeatRefusal> {
-        code.layout
-            .place(bundle::PlaceId::Act(
-                ktir_superdsc::reserved_tids::TP_RECV_TID,
-            ))
-            .map(|p| {
-                bundle::collective::Payload::new(p.size)
-                    .and_then(|size| bundle::collective::RecvWindow::new(p.offset, size))
-                    .ok_or(SeatRefusal::Misplaced {
-                        offset: p.offset,
-                        size: p.size,
-                    })
-            })
-            .transpose()
+        bundle::collective::baked_window(&code.layout).map_err(SeatRefusal::Misplaced)
     }
 
     /// The seat law over the two windows: the bundle's and the link's, each present or not.
