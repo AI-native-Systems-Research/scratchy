@@ -307,6 +307,12 @@ pub struct BundleLayout {
     /// emits. `None` on every real lowering.
     #[serde(skip)]
     pub lx_probe: std::cell::RefCell<Option<Vec<LxTouch>>>,
+    /// ⭐ THE SCRATCHPAD PLAN'S DIVISION — `Some(n)` while a walking program is lowered under the plan
+    /// that divides its elementwise and reduce ops into `n` row groups, one a core
+    /// ([`crate::work::EwDivision::Groups`]); `None` otherwise. [`Self::ew_law`] and
+    /// [`Self::reduce_rows`] read it where those ops resolve their default division.
+    #[serde(skip)]
+    pub lx_row_groups: std::cell::Cell<Option<u32>>,
     /// THE arrangement authority: `tensor name → its ONE device [`StickLayout`]`. The FIRST op to
     /// address a tensor declares its layout; every later op must address it EQUIVALENTLY
     /// ([`StickLayout::addr_eq`]) or `declare_arrangement` returns a build `Err` naming the tensor. A
@@ -810,6 +816,24 @@ impl BundleLayout {
     /// ([`Self::lx_probe`]), which must see the division the op takes once one is.
     pub fn pointwise_core_local<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> bool {
         self.lx_probe.borrow().is_some() || names.into_iter().any(|n| self.lx_core_local(n))
+    }
+
+    /// The division an elementwise op under the law takes: the scratchpad plan's row groups while it
+    /// is in force ([`Self::lx_row_groups`]), else the law's own resolution.
+    pub fn ew_law(&self, stick_major: bool, core_local: bool) -> crate::work::EwDivision {
+        match self.lx_row_groups.get() {
+            Some(n) => crate::work::EwDivision::Groups(n),
+            None => crate::work::EwDivision::Law.resolve(stick_major, core_local),
+        }
+    }
+
+    /// The division a row-wise reduce takes: the scratchpad plan's row groups while it is in force,
+    /// else rows first.
+    pub fn reduce_rows(&self) -> crate::ir::bridge::tiled_op_sdsc_op::reduce::ReduceDivision {
+        use crate::ir::bridge::tiled_op_sdsc_op::reduce::ReduceDivision;
+        self.lx_row_groups
+            .get()
+            .map_or(ReduceDivision::Rows, ReduceDivision::Groups)
     }
 
     /// Log one op's touch of one tensor while the planner's probe runs; a no-op otherwise.

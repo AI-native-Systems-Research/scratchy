@@ -39,33 +39,74 @@ struct Candidate {
     total: u64,
 }
 
-/// Plan `node`'s function into `layout` ([`BundleLayout::lx_planned`]). `probe` lowers the function
-/// into the layout it is handed; it runs once, on a copy of `layout`, and its descriptors are thrown
-/// away. Run before the real lowering, which [`check`] then holds to the plan.
+/// Plan `node`'s function into `layout` ([`BundleLayout::lx_planned`], [`BundleLayout::lx_row_groups`]).
+/// `probe` lowers the function into the layout it is handed; it runs on copies of `layout`, once per
+/// candidate division, and its descriptors are thrown away. Run before the real lowering, which
+/// [`check`] then holds to the plan.
+///
+/// ⭐ THE DIVISION IS PLANNED WITH THE RESIDENCY, as torch-spyre co-optimises them
+/// (`co_optimizing_lx_planning`): each candidate — the ops' own divisions, and one row group per batch
+/// of the program's batched contractions ([`crate::work::EwDivision::Groups`], torch-spyre's decode
+/// trip, one kv head a core) — is probed, and the one that keeps the most bytes in LX wins; a tie keeps
+/// the ops' own.
 pub(crate) fn plan(
     node: &KtirNode,
     layout: &BundleLayout,
-    probe: impl FnOnce(&BundleLayout) -> Result<Vec<EmittedOp>, Error>,
+    probe: impl Fn(&BundleLayout) -> Result<Vec<EmittedOp>, Error>,
 ) -> Result<(), Error> {
-    let copy = layout.clone();
-    *copy.lx_probe.borrow_mut() = Some(Vec::new());
-    probe(&copy)?;
-    let touches = copy.lx_probe.borrow_mut().take().unwrap_or_default();
-    let minted: BTreeSet<u32> = node
-        .minted
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .values()
-        .copied()
-        .collect();
+    let minted = || -> BTreeSet<u32> {
+        node.minted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .copied()
+            .collect()
+    };
     let free = (LX_PIN_END - LX_PIN_BASE).saturating_sub(layout.lx_window_bytes());
-    let chosen = choose(&touches, &minted, free);
+    let mut best: Option<(u64, Option<u32>, Vec<Candidate>)> = None;
+    for groups in std::iter::once(None).chain(batch_groups(node).into_iter().map(Some)) {
+        let copy = layout.clone();
+        copy.lx_row_groups.set(groups);
+        *copy.lx_probe.borrow_mut() = Some(Vec::new());
+        probe(&copy)?;
+        let touches = copy.lx_probe.borrow_mut().take().unwrap_or_default();
+        let chosen = choose(&touches, &minted(), free);
+        let kept: u64 = chosen.iter().map(|c| c.total).sum();
+        if best.as_ref().is_none_or(|(b, ..)| kept > *b) {
+            best = Some((kept, groups, chosen));
+        }
+    }
+    let (_, groups, chosen) = best.unwrap_or_default();
+    layout.lx_row_groups.set(groups);
     layout.lx_planned.borrow_mut().extend(
         chosen
             .into_iter()
             .map(|c| (PlaceId::Act(c.tid), c.per_core)),
     );
     Ok(())
+}
+
+/// The batches of `node`'s batched contractions — `linalg.batch_matmul`'s `[b, m, n]` leading extent,
+/// distinct and in order: the row-group counts the plan probes.
+fn batch_groups(node: &KtirNode) -> Vec<u32> {
+    let mut groups: Vec<u32> = Vec::new();
+    for op in node.func.ops_deep() {
+        if op.op_type != ktir_core::opkind::OpKind::LinalgBatchMatmul {
+            continue;
+        }
+        if let Some([b, _, _]) = op
+            .result_type
+            .and_then(|t| t.dims())
+            .map(<[i64]>::to_vec)
+            .as_deref()
+            && let Ok(b) = u32::try_from(*b)
+            && b > 1
+            && !groups.contains(&b)
+        {
+            groups.push(b);
+        }
+    }
+    groups
 }
 
 /// After the real lowering: every tensor the plan kept in LX was minted and declared there. A plan

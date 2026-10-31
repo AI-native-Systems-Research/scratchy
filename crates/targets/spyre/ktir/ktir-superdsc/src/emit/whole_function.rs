@@ -3781,7 +3781,11 @@ pub fn lower_walk(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
-    let ops = lower_function_folded(node, Some(layout), sym_id_base, None, fold)?;
+    let ops = lower_function_folded(node, Some(layout), sym_id_base, None, fold);
+    // The plan's division is this program's alone: every other function of the bundle divides as
+    // its own ops do.
+    layout.lx_row_groups.set(None);
+    let ops = ops?;
     if *node.minted.lock().unwrap_or_else(|p| p.into_inner()) != probed {
         return err(format!(
             "{}: the scratchpad plan's probe and the real lowering minted different tensors, so the \
