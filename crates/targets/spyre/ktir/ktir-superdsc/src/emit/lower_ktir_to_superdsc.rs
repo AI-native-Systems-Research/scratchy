@@ -2981,6 +2981,27 @@ fn elementwise_broadcast(
     // single-stick). [`RegionFrame::split_rows`] checks all of it and returns the op's
     // `[mb, out, y]` facts; its `Err` is the refusal, so a row-split the bytes do not support is
     // a build failure here, not a wrong-byte bake (the mb re-row's own defect class).
+    // An OUTER spray is never this one op: it goes out as the card's flat ops
+    // ([`elementwise_by_outer_spray`]), and only an inner spray takes the `[mb, y, out]` op below.
+    if let Some(y) = bcast.iter().find_map(|b| match b {
+        Some(BcastAxis::Y(sp)) if sp.order == crate::emit::SprayOrder::Outer => Some(sp.count),
+        _ => None,
+    }) {
+        return elementwise_by_outer_spray(
+            BcastReq {
+                name,
+                what,
+                op_func,
+                ins,
+                out,
+                bcast,
+                df,
+            },
+            (y, rows),
+            sym_id_base,
+            layout,
+        );
+    }
     let ymode: Option<u32> = bcast.iter().find_map(|b| match b {
         Some(BcastAxis::Y(sp)) => Some(sp.count),
         _ => None,
@@ -3127,6 +3148,9 @@ fn elementwise_y_by_column(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
+    if sprays_outermost(req.bcast) {
+        return elementwise_by_outer_spray(req, (y, rows), sym_id_base, layout);
+    }
     let BcastReq {
         name,
         what,
@@ -3198,6 +3222,180 @@ fn elementwise_y_by_column(
             sym_id_base,
             layout,
         ));
+    }
+    Ok(ops)
+}
+
+/// Whether an op's broadcast operands spray a source down the OUTERMOST of its rows
+/// ([`crate::emit::SprayOrder::Outer`]).
+fn sprays_outermost(bcast: &[Option<BcastAxis>]) -> bool {
+    bcast
+        .iter()
+        .any(|b| matches!(b, Some(BcastAxis::Y(sp)) if sp.order == crate::emit::SprayOrder::Outer))
+}
+
+/// ⭐⭐⭐ AN OUTER ROW SPRAY, AS THE CARD'S OWN FLAT OPS — one dense `[rows, stick]` elementwise op
+/// per spray and stick column, the source read whole at each, never the one `[y, mb, out]` op.
+///
+/// The `[y, mb, out]` form is what the card got wrong. MEASURED on granite-3.1-2b's prompt walk:
+/// the `[21, 64]` mask sprayed over 32 head blocks wrote 52 of 672 sticks with `mb` split over the
+/// cores. With the cores taking whole head blocks instead, it wrote 362: in each block, local row
+/// `m` read mask row `2m` and then `2(m − 11) + 1`, and only a growing prefix of each half was
+/// written at all. The flat `[mb, out]` op is the form every rmsnorm, residual add and scale runs
+/// correctly on the card, so a spray is spent as those:
+///
+/// * a `Tile` source of one row (`mb == 1`) is the row vector it is: one op per stick column, the
+///   source's stick broadcast down all `y` rows ([`In::mb_at`], main's per-block prefix-mask
+///   slice);
+/// * a `Tile` source of `mb` rows: per spray `j`, the dense operands and the output at rows
+///   `j · mb..(j + 1) · mb`, the source's own rows read as a dense operand ([`In::sliced`]);
+/// * a `RowScalars` source: per spray `j`, its one stick per row read as a per-row scalar
+///   ([`In::col_at`], main's per-head-block reduced scalar).
+fn elementwise_by_outer_spray(
+    req: BcastReq<'_>,
+    (y, rows): (u32, u32),
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let BcastReq {
+        name,
+        what,
+        op_func,
+        ins,
+        out,
+        bcast,
+        df,
+    } = req;
+    let stick = df.elems_per_stick();
+    let cols = out.c_len;
+    // A sub-stick row is stored one stick wide (the mint's footprint), and runs as that one stick.
+    let width = if cols < stick { stick } else { cols };
+    if y < 2 || !rows.is_multiple_of(y) || !width.is_multiple_of(stick) || out.c_start != 0 {
+        return err(format!(
+            "{what} {name}: an outer spray of {y} over the `[{rows}, {cols}]` output t{} — the \
+             spray needs rows == y*mb (whole sprays of rows) and whole {stick}-element stick \
+             columns from column 0",
+            out.tid
+        ));
+    }
+    let mb = rows / y;
+    for (i, (x, b)) in ins.iter().zip(bcast).enumerate() {
+        let want = match b {
+            None => (rows, cols),
+            Some(BcastAxis::Y(Spray {
+                order: crate::emit::SprayOrder::Outer,
+                of: SprayOf::Tile,
+                count,
+            })) if *count == y => (mb, cols),
+            Some(BcastAxis::Y(Spray {
+                order: crate::emit::SprayOrder::Outer,
+                of: SprayOf::RowScalars,
+                count,
+            })) if *count == y => (mb, 1),
+            Some(other) => {
+                return err(format!(
+                    "{what} {name}: input {i} t{} is a {other:?} operand beside an outer spray of \
+                     {y} — the spray's flat ops state dense and `Y` operands only",
+                    x.tid
+                ));
+            }
+        };
+        if (x.r_len, x.c_len) != want || x.c_start != 0 {
+            return err(format!(
+                "{what} {name}: input {i} t{} takes `[{}, {}]` at column {} of its view, and its \
+                 mode wants `[{}, {}]` from column 0",
+                x.tid, x.r_len, x.c_len, x.c_start, want.0, want.1
+            ));
+        }
+    }
+    // A stick-major `[v_rows, v_cols]` tensor's stick column `c` is the contiguous block
+    // `c · v_rows · stick` in, its row `r` one stick into that.
+    let at = |x: &Region, c: u32, row: u32| -> crate::addr::DevOff {
+        crate::addr::DevOff::from_view_step(c * x.v_rows * stick + (x.r_start + row) * stick)
+    };
+    // Every handle at its stored width: whole sticks (a sub-stick row, and a row reduction's
+    // `[rows, 1]` result, one stick a row).
+    let out_h = rb(&out.name(), out.v_rows, out.v_cols.next_multiple_of(stick));
+    let handles: Vec<_> = ins
+        .iter()
+        .zip(bcast)
+        .map(|(x, b)| match b {
+            Some(BcastAxis::Y(Spray {
+                of: SprayOf::RowScalars,
+                ..
+            })) => rb(&x.name(), x.v_rows, stick),
+            _ => rb(&x.name(), x.v_rows, x.v_cols.next_multiple_of(stick)),
+        })
+        .collect();
+    let n_in = ins.len() as u32 + 1;
+    let columns = width / stick;
+    let op_name = |j: u32, c: u32| match columns {
+        1 => format!("{op_func}{j}_o{}", out.tid),
+        _ => format!("{op_func}{j}_{c}_o{}", out.tid),
+    };
+    let mut ops = Vec::new();
+    let row_vector = mb == 1
+        && bcast
+            .iter()
+            .all(|b| !matches!(b, Some(BcastAxis::Y(sp)) if sp.of == SprayOf::RowScalars));
+    if row_vector {
+        let tile_op = pointwise_tile_op_df(rows, stick, 1, n_in, df);
+        for c in 0..columns {
+            let ew: Vec<_> = handles
+                .iter()
+                .zip(ins)
+                .zip(bcast)
+                .map(|((h, x), b)| match b {
+                    Some(BcastAxis::Y(_)) => In::mb_at(h, at(x, c, 0)).ew(),
+                    _ => In::sliced(h, at(x, c, 0)).ew(),
+                })
+                .collect();
+            ops.push(assemble_pointwise_broadcast_off_from_tile(
+                &op_name(0, c),
+                &tile_op,
+                op_func,
+                rows,
+                stick,
+                &ew,
+                &out_h,
+                at(out, c, 0),
+                sym_id_base,
+                layout,
+            ));
+        }
+        return Ok(ops);
+    }
+    let tile_op = pointwise_tile_op_df(mb, stick, 1, n_in, df);
+    for j in 0..y {
+        for c in 0..columns {
+            let ew: Vec<_> = handles
+                .iter()
+                .zip(ins)
+                .zip(bcast)
+                .map(|((h, x), b)| match b {
+                    Some(BcastAxis::Y(Spray {
+                        of: SprayOf::Tile, ..
+                    })) => In::sliced(h, at(x, c, 0)).ew(),
+                    Some(BcastAxis::Y(Spray {
+                        of: SprayOf::RowScalars,
+                        ..
+                    })) => In::col_at(h, at(x, 0, 0)).ew(),
+                    _ => In::sliced(h, at(x, c, j * mb)).ew(),
+                })
+                .collect();
+            ops.push(assemble_pointwise_broadcast_off_from_tile(
+                &op_name(j, c),
+                &tile_op,
+                op_func,
+                mb,
+                stick,
+                &ew,
+                &out_h,
+                at(out, c, j * mb),
+                sym_id_base,
+                layout,
+            ));
+        }
     }
     Ok(ops)
 }
@@ -7504,15 +7702,23 @@ mod elementwise_tests {
         assert_eq!(ops[0].op_name, "multiply_o7");
     }
 
-    /// ⭐⭐⭐ THE ROW-SPLIT (Y) MODE NOW EMITS — the J-slot merge's own op at its production
-    /// geometry: the subtract whose operands are the `[256, 4]` score tile (dense) and the
-    /// `[64, 4]` merged max (the J-reduce's output, one spray's worth of rows), under a
-    /// `[256, 4]` output — the exact regions the batched paged-decode kernel's broadcast chain
-    /// resolves to. One op, still `sub_o*`: the operand mode is addressing, not a
-    /// decomposition, and the frame law (`RegionFrame::split_rows`) has already re-proven
-    /// `rows == y*mb` and the single-stick source before any operand was built.
+    /// The offset op `op` binds `buf` at.
+    fn bound_at(op: &EmittedOp, buf: &str) -> u32 {
+        op.arg_bindings
+            .iter()
+            .find(|b| b.buffer == buf)
+            .unwrap_or_else(|| panic!("{} binds {buf}", op.op_name))
+            .offset_elems
+    }
+
+    /// ⭐⭐⭐ AN OUTER SPRAY IS ONE FLAT OP PER SPRAY — the J-slot merge's subtract at its
+    /// production geometry: the `[256, 4]` score tile (dense) and the `[64, 4]` merged max (one
+    /// spray's worth of rows) under a `[256, 4]` output, the regions the batched paged-decode
+    /// kernel's broadcast chain resolves to. It was one `[y, mb, out]` op, the form the card
+    /// mis-addressed (see [`elementwise_by_outer_spray`]); it is now four flat `[64, 64]` ops, spray
+    /// `j`'s score and output rows `j · 64` in and the merged max read whole each time.
     #[test]
-    fn a_stated_y_broadcast_operand_emits_one_op() {
+    fn a_stated_y_broadcast_operand_emits_one_flat_op_per_spray() {
         let r = node(
             reg(5, 256, 4, false),
             reg(6, 64, 4, false),
@@ -7527,13 +7733,57 @@ mod elementwise_tests {
             &mut sym,
             None,
         )
-        .expect("the J-slot merge's subtract is the row-split operand mode");
-        assert_eq!(ops.len(), 1, "an operand mode is not a decomposition");
-        assert_eq!(
-            ops[0].op_name, "sub_o7",
-            "the descriptor NAME must not change with the operand mode — it feeds the bundle \
-             fingerprint, and the row-split arm is the same op",
+        .expect("the J-slot merge's subtract lowers");
+        assert_eq!(ops.len(), 4, "one flat op per spray");
+        for (j, op) in ops.iter().enumerate() {
+            let j = j as u32;
+            assert_eq!(op.op_name, format!("sub{j}_o7"));
+            assert_eq!(
+                bound_at(op, "t7"),
+                j * 64 * 64,
+                "spray {j}: the output's rows"
+            );
+            assert_eq!(bound_at(op, "t5"), j * 64 * 64, "spray {j}: the dense rows");
+            assert_eq!(bound_at(op, "t6"), 0, "spray {j}: the source, read whole");
+        }
+    }
+
+    /// ⭐⭐ THE PROMPT WALK'S MASK ADD — granite-3.1-2b's 21-row rung adds its `[21, 64]` mask over
+    /// 32 head blocks of scores. The card wrote 52, then 362, of its 672 sticks as one `[y, mb, out]`
+    /// op; it is now 32 flat `[21, 64]` adds, head block `j`'s scores and output `j · 21` rows in,
+    /// the mask read whole.
+    #[test]
+    fn the_prompt_mask_add_is_one_flat_add_per_head_block() {
+        let r = node(
+            reg(5, 672, 64, false),
+            reg(6, 21, 64, false),
+            reg(7, 672, 64, true),
         );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "add_s3",
+            Elementwise::Add,
+            &r,
+            &[None, Some(BcastAxis::Y(Spray::outer(32)))],
+            &mut sym,
+            None,
+        )
+        .expect("the prompt mask add lowers");
+        assert_eq!(ops.len(), 32, "one flat add per head block");
+        for (j, op) in ops.iter().enumerate() {
+            let j = j as u32;
+            assert_eq!(
+                bound_at(op, "t7"),
+                j * 21 * 64,
+                "block {j}: the output's rows"
+            );
+            assert_eq!(
+                bound_at(op, "t5"),
+                j * 21 * 64,
+                "block {j}: the scores' rows"
+            );
+            assert_eq!(bound_at(op, "t6"), 0, "block {j}: the mask, read whole");
+        }
     }
 
     /// ⭐ AND THE DESCRIPTOR STATES THE Y-MAJOR FRAME — the same op built directly at the
@@ -7590,12 +7840,13 @@ mod elementwise_tests {
         );
     }
 
-    /// ⭐⭐ AND ITS CORES TAKE WHOLE SPRAYS — the paged prompt walk's mask add at granite-3.1-2b's
-    /// 21-row rung: the `[21, 64]` mask over `[y = 32, mb = 21]`. The elementwise law split `mb` 21
-    /// ways with all 32 sprays in every core, and the card wrote 52 of the 672 sticks (each core
-    /// stepping its sprays by its one row); the op now holds one spray per core, its 21 rows whole.
+    /// ⭐ AND A `[y, mb, out]` OP'S CORES TAKE WHOLE SPRAYS at this door, at the prompt mask add's
+    /// shape (`[21, 64]` over `[y = 32, mb = 21]`): the elementwise law split `mb` under all 32
+    /// sprays, which the card measured as row-mixing (52 of 672 sticks). The elementwise lowering
+    /// no longer sends an outer spray here (it runs as flat ops,
+    /// `the_prompt_mask_add_is_one_flat_add_per_head_block`); this pins the door's own division.
     #[test]
-    fn the_prompt_mask_add_takes_one_spray_per_core() {
+    fn a_y_major_op_takes_one_spray_per_core() {
         let scores_h = rb("t5", 672, 64);
         let mask_h = rb("t6", 21, 64);
         let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
@@ -7782,12 +8033,11 @@ mod elementwise_tests {
         );
     }
 
-    /// ⭐ AND THE MULTI-STICK OUTPUT — a `[256, 128]` output under a row-split flag goes ONE
-    /// STICK COLUMN AT A TIME: the split law states the spray at one stick of `out`, and a
-    /// stick-major tensor's column `j` is the contiguous `[rows, stick]` block `j·rows·stick` in —
-    /// so the op is two one-stick sprays, each operand addressed at its own column's base: the
-    /// output and the dense input `j·256·64` in, the `[64, 128]` source `j·64·64` in. The
-    /// offsets are the whole claim, so they are what is pinned.
+    /// ⭐ AND THE MULTI-STICK OUTPUT — a `[256, 128]` output under an outer spray of 4 goes ONE
+    /// STICK COLUMN AT A TIME as well as one spray at a time: a stick-major tensor's column `c` is
+    /// the contiguous `[rows, stick]` block `c·rows·stick` in, so spray `j`'s op on column `c`
+    /// reads and writes `c·256·64 + j·64·64` in, and the `[64, 128]` source's column `c·64·64` in.
+    /// The offsets are the whole claim, so they are what is pinned.
     #[test]
     fn a_multi_stick_output_under_a_row_split_goes_one_stick_column_at_a_time() {
         let r = node(
@@ -7805,26 +8055,28 @@ mod elementwise_tests {
             None,
         )
         .unwrap_or_else(|e| panic!("the column-wise spray lowers: {}", e.message));
-        assert_eq!(ops.len(), 2, "one descriptor per stick column of `out`");
-        for (j, op) in ops.iter().enumerate() {
-            let off = |buf: &str| -> u32 {
-                op.arg_bindings
-                    .iter()
-                    .find(|b| b.buffer == buf)
-                    .unwrap_or_else(|| panic!("column {j} binds {buf}"))
-                    .offset_elems
-            };
-            let j = j as u32;
-            assert_eq!(off("t7"), j * 256 * 64, "column {j}: the output's base");
+        assert_eq!(
+            ops.len(),
+            4 * 2,
+            "one descriptor per spray and stick column of `out`"
+        );
+        for (k, op) in ops.iter().enumerate() {
+            let (j, c) = (k as u32 / 2, k as u32 % 2);
+            let rows = c * 256 * 64 + j * 64 * 64;
             assert_eq!(
-                off("t5"),
-                j * 256 * 64,
-                "column {j}: the dense input's base"
+                bound_at(op, "t7"),
+                rows,
+                "spray {j} column {c}: the output's rows"
             );
             assert_eq!(
-                off("t6"),
-                j * 64 * 64,
-                "column {j}: the spray source's base"
+                bound_at(op, "t5"),
+                rows,
+                "spray {j} column {c}: the dense rows"
+            );
+            assert_eq!(
+                bound_at(op, "t6"),
+                c * 64 * 64,
+                "spray {j} column {c}: the source's column, read whole"
             );
         }
     }
