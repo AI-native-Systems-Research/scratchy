@@ -31,6 +31,16 @@
 //! — gets the all-reduce. The vocabulary projection N-splits and the forward's result demands a
 //! whole value, so the lm head gets the all-gather.
 //!
+//! # Gathered rows
+//!
+//! A front end may state a source as ROWS GATHERED FROM ANOTHER SOURCE's columns ([`RowGather`]):
+//! an embedding lookup whose indices the forward does not carry (a decode step's input row, read
+//! out of the tied embedding table at the token the previous step drew). A gather is a contraction
+//! with a one-hot vector over the table's columns, so the contraction rule applies to it: when the
+//! table splits by columns, each rank can gather only the columns it holds — zero for an index
+//! outside its block — and the row is a [`Placement::Partial`] sum. Its first consumer that needs
+//! the whole row gets the all-reduce, exactly as a K-split projection's does.
+//!
 //! # Invariants the output carries
 //!
 //! - At `W = 1` [`shard`] is the identity: same ops, same sources, no collective.
@@ -168,6 +178,10 @@ pub enum SourceShard {
     Cols,
     /// Rank `r` loads head block `r` of every token's `heads` rows.
     HeadRows { heads: NonZeroU32 },
+    /// Every rank holds a same-shaped addend and the value is their sum — a [`RowGather`]'s rows
+    /// over a column-split table. Loaded from a whole value, rank 0 holds it and every other rank
+    /// zeros, so the sum is the value.
+    Partial,
 }
 
 impl SourceShard {
@@ -182,7 +196,7 @@ impl SourceShard {
     pub fn local_shape(self, s: SourceShape, w: WorldSize) -> SourceShape {
         let w = w.get();
         match self {
-            Self::Whole => s,
+            Self::Whole | Self::Partial => s,
             Self::Rows | Self::HeadRows { .. } => SourceShape {
                 rows: s.rows / w,
                 cols: s.cols,
@@ -202,17 +216,28 @@ pub enum CollectiveKind {
     AllGather,
 }
 
-/// One collective the analysis wove in: the local op it is, and the local op whose output it
-/// reads.
+/// One collective the analysis wove in: the local op it is, and the value it reads — a local op's
+/// output, or a partial source ([`SourceShard::Partial`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CollectiveSite {
     pub op: usize,
-    pub reads: usize,
+    pub reads: InputRef,
     pub kind: CollectiveKind,
 }
 
-/// The two inputs [`shard`] refuses. Both are defects of the INPUT, not shapes the analysis
-/// could not shard (those are replicated).
+/// ⭐ A SOURCE THAT IS ANOTHER SOURCE'S COLUMNS, GATHERED — stated by the front end, because the
+/// indices are not in the forward: row `i` of `row` (`[m, k]`) is column `idx_i` of `table`
+/// (`[k, n]`), for indices something outside the forward chose (the host's prompt tokens, or the
+/// previous step's device pick). See the module docs: over a column-split table it is a partial
+/// sum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowGather {
+    pub row: usize,
+    pub table: usize,
+}
+
+/// The inputs [`shard`] refuses. All are defects of the INPUT, not shapes the analysis could not
+/// shard (those are replicated).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShardRefusal {
     /// The front end stated a collective. Only the analysis places them; a stated one would be a
@@ -222,6 +247,9 @@ pub enum ShardRefusal {
     /// through its view. Gathering it would need a strided all-gather no target lowers, and no
     /// arch states this shape.
     HeadRowsEscape { op: usize },
+    /// A [`RowGather`] whose sources are not a `[m, k]` row over a `[k, n]` table, or whose row
+    /// is gathered twice.
+    MalformedGather { gather: RowGather },
 }
 
 /// The forward every rank runs, and how each rank loads its sources.
@@ -238,6 +266,9 @@ pub struct ShardedForward {
     pub collectives: Vec<CollectiveSite>,
     /// Per op of the input forward: the placement its local op produces.
     pub placements: Vec<Placement>,
+    /// The stated [`RowGather`]s whose table split by columns — each one's row is
+    /// [`SourceShard::Partial`], and whoever fills it on a rank gathers only that rank's columns.
+    pub gathered: Vec<RowGather>,
 }
 
 /// The analysis's working state. Everything it decides is written exactly once.
@@ -254,6 +285,8 @@ struct Weave<'a> {
     op_map: Vec<usize>,
     /// The whole-placed local op standing for input op `j`, once a collective made one.
     whole_of: Vec<Option<usize>>,
+    /// The same, for a partial source.
+    whole_of_src: Vec<Option<usize>>,
     collectives: Vec<CollectiveSite>,
 }
 
@@ -289,6 +322,16 @@ impl Weave<'_> {
         }
     }
 
+    /// Where operand `r` lives: its producer's placement, or a source's — whole unless it is a
+    /// gathered row's partial sum.
+    fn place_of(&self, r: InputRef) -> Placement {
+        match r {
+            InputRef::Op(j) => self.place[j],
+            InputRef::Ext(e) if self.src[e] == Some(SourceShard::Partial) => Placement::Partial,
+            InputRef::Ext(_) => Placement::Whole,
+        }
+    }
+
     /// Whether `extent` splits into `W` blocks that are each a whole number of granules.
     fn splits(&self, extent: u32) -> bool {
         extent.is_multiple_of(self.w * self.granule)
@@ -304,6 +347,7 @@ impl Weave<'_> {
                 heads.get().is_multiple_of(self.w)
                     && self.input.sources[e].rows.is_multiple_of(heads.get())
             }
+            SourceShard::Partial => true,
         };
         fits && self.src[e].is_none_or(|s| s == want)
     }
@@ -311,38 +355,49 @@ impl Weave<'_> {
     /// The local operand standing for `r` in a WHOLE placement — the edge where the analysis
     /// weaves a collective in, once per value however many consumers demand it.
     fn whole(&mut self, r: InputRef) -> Result<InputRef, ShardRefusal> {
-        let InputRef::Op(j) = r else {
-            return Ok(r);
-        };
-        let (kind, op) = match self.place[j] {
-            Placement::Whole => return Ok(InputRef::Op(self.op_map[j])),
-            Placement::Partial => (CollectiveKind::AllReduce, SubOp::AllReduce),
-            Placement::Split(Axis::Cols) => (
+        let (kind, op) = match (r, self.place_of(r)) {
+            (InputRef::Op(j), Placement::Whole) => return Ok(InputRef::Op(self.op_map[j])),
+            (InputRef::Ext(_), Placement::Whole) => return Ok(r),
+            (_, Placement::Partial) => (CollectiveKind::AllReduce, SubOp::AllReduce),
+            (InputRef::Op(j), Placement::Split(Axis::Cols)) => (
                 CollectiveKind::AllGather,
                 SubOp::AllGather {
                     cols: self.shape[j].1,
                 },
             ),
-            Placement::Split(Axis::HeadRows { .. }) => {
+            (InputRef::Op(j), Placement::Split(Axis::HeadRows { .. })) => {
                 return Err(ShardRefusal::HeadRowsEscape { op: j });
             }
+            (InputRef::Ext(_), Placement::Split(_)) => {
+                unreachable!("a source's placement is whole or partial")
+            }
         };
-        if let Some(k) = self.whole_of[j] {
+        let memo = match r {
+            InputRef::Op(j) => self.whole_of[j],
+            InputRef::Ext(e) => self.whole_of_src[e],
+        };
+        if let Some(k) = memo {
             return Ok(InputRef::Op(k));
         }
-        let reads = self.op_map[j];
+        let (reads, m) = match r {
+            InputRef::Op(j) => (InputRef::Op(self.op_map[j]), self.input.ops[j].m),
+            InputRef::Ext(e) => (r, self.input.sources[e].rows),
+        };
         let at = self.ops.len();
         self.ops.push(OpDesc {
             op,
-            m: self.input.ops[j].m,
-            inputs: vec![InputRef::Op(reads)],
+            m,
+            inputs: vec![reads],
         });
         self.collectives.push(CollectiveSite {
             op: at,
             reads,
             kind,
         });
-        self.whole_of[j] = Some(at);
+        match r {
+            InputRef::Op(j) => self.whole_of[j] = Some(at),
+            InputRef::Ext(e) => self.whole_of_src[e] = Some(at),
+        }
         Ok(InputRef::Op(at))
     }
 
@@ -359,19 +414,28 @@ impl Weave<'_> {
         let desc = &self.input.ops[i];
         let (op, refs) = (desc.op, desc.inputs.clone());
         let mut inputs = Vec::with_capacity(refs.len());
-        let mut adopt = Vec::new();
         for r in refs {
-            if let InputRef::Ext(e) = r {
-                adopt.push((e, SourceShard::Whole));
-            }
             inputs.push(self.whole(r)?);
         }
+        let adopt = Self::whole_sources(&inputs);
         Ok(Decision {
             op,
             out: Placement::Whole,
             inputs,
             adopt,
         })
+    }
+
+    /// The sources a decision reads as they are, loaded whole. A partial source never appears:
+    /// [`Self::whole`] already stood its all-reduce in for it.
+    fn whole_sources(inputs: &[InputRef]) -> Vec<(usize, SourceShard)> {
+        inputs
+            .iter()
+            .filter_map(|r| match r {
+                InputRef::Ext(e) => Some((*e, SourceShard::Whole)),
+                InputRef::Op(_) => None,
+            })
+            .collect()
     }
 
     /// Whole sources adopted by everything but the listed operand positions.
@@ -412,10 +476,7 @@ impl Weave<'_> {
         };
         let scale = desc.inputs.get(2).copied();
         let k = self.operand_shape(act).1;
-        let act_place = match act {
-            InputRef::Op(j) => self.place[j],
-            InputRef::Ext(_) => Placement::Whole,
-        };
+        let act_place = self.place_of(act);
         // The per-channel scale follows N along whichever of its axes is N long.
         let scale_on_n = |me: &Self| -> Option<(usize, SourceShard)> {
             let InputRef::Ext(se) = scale? else {
@@ -491,11 +552,12 @@ impl Weave<'_> {
                         adopt,
                     })
                 } else {
+                    let adopt = Self::whole_sources(&inputs);
                     Ok(Decision {
                         op: desc.op,
                         out: Placement::Whole,
                         inputs,
-                        adopt: self.ext_whole_except(i, &[]),
+                        adopt,
                     })
                 }
             }
@@ -559,6 +621,8 @@ impl Weave<'_> {
             // A narrower op operand (a broadcast row or column) would have to be whole, and no
             // non-whole placement is carried past a whole broadcast operand here.
             InputRef::Op(_) => Follow::Blocks,
+            // A partial source votes for nothing: its whole form is an all-reduce.
+            InputRef::Ext(_) if self.place_of(r) == Placement::Partial => Follow::Blocks,
             InputRef::Ext(e) => {
                 let (rows, cols) = self.src_shape(e);
                 match p {
@@ -791,11 +855,13 @@ pub fn op_shapes(input: &LoweringInput) -> Vec<(u32, u32)> {
 }
 
 /// Weave tensor parallelism into `input`: the forward every rank of `world` runs, each source's
-/// slice law, and every collective the dataflow demands. See the module docs.
+/// slice law, and every collective the dataflow demands. `gathers` are the sources the front end
+/// states as gathered rows ([`RowGather`]). See the module docs.
 pub fn shard(
     input: &LoweringInput,
     world: WorldSize,
     granule: SplitGranule,
+    gathers: &[RowGather],
 ) -> Result<ShardedForward, ShardRefusal> {
     let n = input.ops.len();
     let shape = op_shapes(input);
@@ -810,8 +876,29 @@ pub fn shard(
         ops: Vec::with_capacity(n),
         op_map: Vec::with_capacity(n),
         whole_of: vec![None; n],
+        whole_of_src: vec![None; input.sources.len()],
         collectives: Vec::new(),
     };
+    // ⭐ THE GATHER'S RULE, DECIDED BEFORE ITS ROW IS READ. A row is read by the forward's first
+    // ops, its table by the vocabulary projection at the end; the row's placement is the table's
+    // column split, so that split is taken here, by the same test the projection's N-split uses
+    // ([`Weave::splits`] on the table's columns), and the projection finds its weight already cut
+    // the way it would cut it.
+    let mut gathered = Vec::new();
+    for &g in gathers {
+        let (Some(row), Some(table)) = (input.sources.get(g.row), input.sources.get(g.table))
+        else {
+            return Err(ShardRefusal::MalformedGather { gather: g });
+        };
+        if row.cols != table.rows || g.row == g.table || wv.src[g.row].is_some() {
+            return Err(ShardRefusal::MalformedGather { gather: g });
+        }
+        if wv.w > 1 && wv.splits(table.cols) && wv.can_adopt(g.table, SourceShard::Cols) {
+            wv.src[g.table] = Some(SourceShard::Cols);
+            wv.src[g.row] = Some(SourceShard::Partial);
+            gathered.push(g);
+        }
+    }
     for i in 0..n {
         let d = if wv.w == 1 {
             // ⭐ THE IDENTITY AT W = 1, by construction rather than by every rule happening to
@@ -879,6 +966,7 @@ pub fn shard(
         op_map: wv.op_map,
         collectives: wv.collectives,
         placements: wv.place,
+        gathered,
     })
 }
 
@@ -892,8 +980,9 @@ pub fn shard_lowered(
     lowered: &crate::handoff::LoweredDecode,
     world: WorldSize,
     granule: SplitGranule,
+    gathers: &[RowGather],
 ) -> Result<(crate::handoff::LoweredDecode, ShardedForward), ShardRefusal> {
-    let sharded = shard(&lowered.input, world, granule)?;
+    let sharded = shard(&lowered.input, world, granule, gathers)?;
     let n_local = sharded.local.ops.len();
     let at = |i: usize| sharded.op_map[i];
     let mut op_tiles = vec![None; n_local];
@@ -926,9 +1015,24 @@ pub fn shard_lowered(
     Ok((out, sharded))
 }
 
+/// An element the slice law can cut: a value with a ZERO, for the ranks that hold none of a
+/// [`SourceShard::Partial`] value. The host reference's `f32`, and a loader's raw element bytes
+/// (`[u8; N]`, any width).
+pub trait SliceElement: Copy {
+    const ZERO: Self;
+}
+
+impl SliceElement for f32 {
+    const ZERO: Self = 0.0;
+}
+
+impl<const N: usize> SliceElement for [u8; N] {
+    const ZERO: Self = [0; N];
+}
+
 /// THE SLICE LAW: rank `rank`'s share of a source of `shape` under `shard`. One function, read
 /// by the loader that stages a rank's weights and by [`eval_ranks`]' reference alike.
-pub fn slice_source<T: Copy>(
+pub fn slice_source<T: SliceElement>(
     full: &[T],
     shape: SourceShape,
     shard: SourceShard,
@@ -940,6 +1044,8 @@ pub fn slice_source<T: Copy>(
     debug_assert_eq!(full.len(), rows * cols, "source buffer vs its shape");
     match shard {
         SourceShard::Whole => full.to_vec(),
+        SourceShard::Partial if r == 0 => full.to_vec(),
+        SourceShard::Partial => vec![T::ZERO; full.len()],
         SourceShard::Rows => {
             let lr = rows / w;
             full[r * lr * cols..(r + 1) * lr * cols].to_vec()
@@ -1093,7 +1199,7 @@ mod tests {
     #[test]
     fn one_rank_is_the_identity() {
         let input = one_layer_input();
-        let sf = shard(&input, WorldSize::of::<1>(), SplitGranule::of::<64>()).unwrap();
+        let sf = shard(&input, WorldSize::of::<1>(), SplitGranule::of::<64>(), &[]).unwrap();
         assert!(sf.collectives.is_empty());
         assert!(sf.sources.iter().all(|s| *s == SourceShard::Whole));
         assert_eq!(sf.local.ops.len(), input.ops.len());
@@ -1107,7 +1213,7 @@ mod tests {
     #[test]
     fn a_decode_layer_shards_as_megatron_from_the_dataflow_alone() {
         let input = one_layer_input();
-        let sf = shard(&input, WorldSize::of::<4>(), SplitGranule::of::<64>()).unwrap();
+        let sf = shard(&input, WorldSize::of::<4>(), SplitGranule::of::<64>(), &[]).unwrap();
         use SourceShard::*;
         // Sources: x, rms0, q, k, v, cos, sin, kc, vc, o, rms1, gate, up, down.
         assert_eq!(
@@ -1123,7 +1229,10 @@ mod tests {
         );
         // Each all-reduce reads a K-split projection and feeds a residual add.
         for c in &sf.collectives {
-            assert!(matches!(sf.local.ops[c.reads].op, SubOp::MatmulTile { .. }));
+            let InputRef::Op(reads) = c.reads else {
+                panic!("an all-reduce reading a source in a forward that gathers no row")
+            };
+            assert!(matches!(sf.local.ops[reads].op, SubOp::MatmulTile { .. }));
             let feeds_add = sf.local.ops.iter().any(|o| {
                 matches!(o.op, SubOp::Elementwise(crate::subtile_ir::EwKind::Add))
                     && o.inputs.contains(&InputRef::Op(c.op))
@@ -1149,7 +1258,7 @@ mod tests {
             let bufs = eval_dag(&g, &refs);
             bufs[g.result.index()].clone()
         };
-        let sf = shard(&input, w, SplitGranule::of::<64>()).unwrap();
+        let sf = shard(&input, w, SplitGranule::of::<64>(), &[]).unwrap();
         let g = lower_region(&sf.local, NB);
         let per_rank: Vec<Vec<Vec<f32>>> = w
             .ranks()
@@ -1201,7 +1310,7 @@ mod tests {
     #[test]
     fn an_unsplittable_attention_is_replicated_not_refused() {
         let input = one_layer_input();
-        let sf = shard(&input, WorldSize::of::<16>(), SplitGranule::of::<1>()).unwrap();
+        let sf = shard(&input, WorldSize::of::<16>(), SplitGranule::of::<1>(), &[]).unwrap();
         assert!(kinds(&sf).contains(&CollectiveKind::AllGather));
         sharded_equals_unsharded_at(&input, WorldSize::of::<16>(), SplitGranule::of::<1>());
     }
@@ -1211,7 +1320,7 @@ mod tests {
         let gr = lower_region(input, NB);
         let refs: Vec<&[f32]> = full.iter().map(|v| v.as_slice()).collect();
         let reference = eval_dag(&gr, &refs)[gr.result.index()].clone();
-        let sf = shard(input, w, g).unwrap();
+        let sf = shard(input, w, g, &[]).unwrap();
         let gl = lower_region(&sf.local, NB);
         let per_rank: Vec<Vec<Vec<f32>>> = w
             .ranks()
@@ -1239,12 +1348,22 @@ mod tests {
     fn the_handoff_facts_follow_their_ops() {
         use crate::fixtures::front_end_lowered;
         let lowered = front_end_lowered(one_layer_input());
-        let (one, _) =
-            shard_lowered(&lowered, WorldSize::of::<1>(), SplitGranule::of::<64>()).unwrap();
+        let (one, _) = shard_lowered(
+            &lowered,
+            WorldSize::of::<1>(),
+            SplitGranule::of::<64>(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(format!("{one:?}"), format!("{lowered:?}"));
 
-        let (two, sf) =
-            shard_lowered(&lowered, WorldSize::of::<2>(), SplitGranule::of::<64>()).unwrap();
+        let (two, sf) = shard_lowered(
+            &lowered,
+            WorldSize::of::<2>(),
+            SplitGranule::of::<64>(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(two.op_tiles.len(), two.input.ops.len());
         assert_eq!(two.op_expansion.len(), two.input.ops.len());
         for (i, &k) in sf.op_map.iter().enumerate() {
@@ -1275,8 +1394,169 @@ mod tests {
         });
         input.result = last + 1;
         assert!(matches!(
-            shard(&input, WorldSize::of::<2>(), SplitGranule::of::<64>()),
+            shard(&input, WorldSize::of::<2>(), SplitGranule::of::<64>(), &[]),
             Err(ShardRefusal::StatedCollective { .. })
         ));
+    }
+
+    /// The tied-embedding decode step: a decode layer under a final norm and a vocabulary
+    /// projection whose table is also where the layer's input row came from — `x` (source 0) is
+    /// stated as gathered from the table's columns.
+    fn tied_head_input(vocab: u32) -> (LoweringInput, RowGather) {
+        use crate::subtile_ir::GainConvention;
+        let mut input = crate::fixtures::one_layer_input_shaped(256, 128, 512, 64);
+        let h = input.sources[0].cols;
+        let gain = input.sources.len();
+        input.sources.push(SourceShape { rows: 1, cols: h });
+        let table = input.sources.len();
+        input.sources.push(SourceShape {
+            rows: h,
+            cols: vocab,
+        });
+        let norm = input.ops.len();
+        input.ops.push(OpDesc {
+            op: SubOp::RmsNorm {
+                eps: 1e-5,
+                gain: GainConvention::Scale,
+            },
+            m: 1,
+            inputs: vec![InputRef::Op(input.result), InputRef::Ext(gain)],
+        });
+        input.ops.push(OpDesc {
+            op: SubOp::MatmulTile {
+                n: vocab,
+                weight: GemmWeight::Dense,
+            },
+            m: 1,
+            inputs: vec![InputRef::Op(norm), InputRef::Ext(table)],
+        });
+        input.result = norm + 1;
+        (input, RowGather { row: 0, table })
+    }
+
+    /// ⭐ A GATHER IS A CONTRACTION. With the vocabulary table split by columns, the row gathered
+    /// out of it is a partial sum — the owner's column, zero on every other rank — and the
+    /// analysis reduces it exactly where the forward first reads it whole, as it reduces a
+    /// K-split projection: one all-reduce of the input row, the projection's all-gather at the
+    /// result, and the table cut ONCE, by columns, for both readers.
+    #[test]
+    fn a_row_gathered_from_a_split_table_is_reduced_where_it_is_first_read_whole() {
+        let (input, gather) = tied_head_input(1024);
+        let w = WorldSize::of::<2>();
+        let sf = shard(&input, w, SplitGranule::of::<64>(), &[gather]).unwrap();
+        assert_eq!(sf.gathered, vec![gather]);
+        assert_eq!(sf.sources[gather.row], SourceShard::Partial);
+        assert_eq!(sf.sources[gather.table], SourceShard::Cols);
+        let first = sf.collectives[0];
+        assert_eq!(
+            (first.kind, first.reads),
+            (CollectiveKind::AllReduce, InputRef::Ext(gather.row))
+        );
+        let last = sf.collectives.last().unwrap();
+        assert_eq!(last.kind, CollectiveKind::AllGather);
+        assert_eq!(sf.local.result, last.op);
+        // The row is reduced once, however many ops read it whole.
+        let reduces_row = sf
+            .collectives
+            .iter()
+            .filter(|c| c.reads == InputRef::Ext(gather.row))
+            .count();
+        assert_eq!(reduces_row, 1);
+
+        // Every rank gathers the drawn token's column out of the block it holds — the column
+        // itself on its owner, zero elsewhere — and the forward is the unsharded one.
+        let token = 700;
+        let mut full = sources_of(&input);
+        let (h, vocab) = (input.sources[0].cols as usize, 1024usize);
+        full[gather.row] = (0..h)
+            .map(|k| full[gather.table][k * vocab + token])
+            .collect();
+        let gr = lower_region(&input, NB);
+        let refs: Vec<&[f32]> = full.iter().map(|v| v.as_slice()).collect();
+        let reference = eval_dag(&gr, &refs)[gr.result.index()].clone();
+        let gl = lower_region(&sf.local, NB);
+        let lc = vocab / w.get() as usize;
+        let per_rank: Vec<Vec<Vec<f32>>> = w
+            .ranks()
+            .map(|r| {
+                let mut srcs: Vec<Vec<f32>> = full
+                    .iter()
+                    .zip(&input.sources)
+                    .zip(&sf.sources)
+                    .map(|((buf, shape), shard)| slice_source(buf, *shape, *shard, r, w))
+                    .collect();
+                let origin = r.get() as usize * lc;
+                srcs[gather.row] = if (origin..origin + lc).contains(&token) {
+                    let block = &srcs[gather.table];
+                    (0..h).map(|k| block[k * lc + token - origin]).collect()
+                } else {
+                    vec![0.0; h]
+                };
+                srcs
+            })
+            .collect();
+        let bufs = eval_ranks(&gl, w, &per_rank);
+        for (r, b) in bufs.iter().enumerate() {
+            let worst = b[gl.result.index()]
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(worst < 1e-4, "rank {r}'s logits off by {worst}");
+        }
+        assert_eq!(bufs[0][gl.result.index()], bufs[1][gl.result.index()]);
+    }
+
+    /// At one rank a stated gather changes nothing: the identity is unconditional.
+    #[test]
+    fn one_rank_ignores_a_stated_gather() {
+        let (input, gather) = tied_head_input(1024);
+        let sf = shard(
+            &input,
+            WorldSize::of::<1>(),
+            SplitGranule::of::<64>(),
+            &[gather],
+        )
+        .unwrap();
+        assert!(sf.gathered.is_empty() && sf.collectives.is_empty());
+        assert_eq!(format!("{:?}", sf.local), format!("{input:?}"));
+    }
+
+    /// A table that does not split leaves its row whole on every rank: nothing to reduce.
+    #[test]
+    fn a_row_gathered_from_a_whole_table_stays_whole() {
+        let (input, gather) = tied_head_input(1000);
+        let sf = shard(
+            &input,
+            WorldSize::of::<2>(),
+            SplitGranule::of::<64>(),
+            &[gather],
+        )
+        .unwrap();
+        assert!(sf.gathered.is_empty());
+        assert_eq!(sf.sources[gather.row], SourceShard::Whole);
+        assert!(
+            sf.collectives
+                .iter()
+                .all(|c| c.reads != InputRef::Ext(gather.row))
+        );
+    }
+
+    /// A gather whose row is not as wide as its table is tall names no lookup, and is refused.
+    #[test]
+    fn a_malformed_gather_is_refused() {
+        let (input, _) = tied_head_input(1024);
+        // Source 3 is the k projection `[256, 128]`; source 5 is `cos`, `[1, 64]`.
+        let bad = RowGather { row: 5, table: 3 };
+        assert_eq!(
+            shard(
+                &input,
+                WorldSize::of::<2>(),
+                SplitGranule::of::<64>(),
+                &[bad]
+            )
+            .unwrap_err(),
+            ShardRefusal::MalformedGather { gather: bad }
+        );
     }
 }
