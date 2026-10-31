@@ -1993,7 +1993,10 @@ fn cut_source_bytes(
     }
     let w = me.world().get();
     let divides = match shard {
-        SourceShard::Whole | SourceShard::Partial => true,
+        SourceShard::Whole
+        | SourceShard::Partial
+        | SourceShard::ColBlocks { .. }
+        | SourceShard::RowBlocks { .. } => true,
         SourceShard::Rows => rows.is_multiple_of(w),
         SourceShard::Cols => cols.is_multiple_of(w),
         SourceShard::HeadRows { heads } => {
@@ -2017,6 +2020,8 @@ fn cut_source_bytes(
         match shard {
             SourceShard::Rows => (disk, SourceShard::Cols),
             SourceShard::Cols => (disk, SourceShard::Rows),
+            SourceShard::ColBlocks { block } => (disk, SourceShard::RowBlocks { block }),
+            SourceShard::RowBlocks { block } => (disk, SourceShard::ColBlocks { block }),
             // Rank 0 holds the value and every other rank zeros, in either byte order.
             SourceShard::Whole | SourceShard::Partial => (disk, shard),
             SourceShard::HeadRows { .. } => return Err(SliceRefusal::HeadSplitGemm { id }),
@@ -3052,6 +3057,25 @@ mod tp_slice_tests {
             cut_source_bytes(SourceShard::Cols, r1, 3, row, 2, (1, 4), false),
             Ok(vec![4, 5, 6, 7])
         );
+    }
+
+    /// An uneven vocabulary's padded N-split (`ColBlocks`) is a row block of the disk bytes like
+    /// the even one, the last rank's rows past the vocabulary staged zero — the columns its local
+    /// projection computes and the all-gather crops.
+    #[test]
+    fn a_padded_block_stages_zeros_past_the_source() {
+        let world = TpWorld::of::<2>();
+        let (r0, r1) = (world.rank(0).unwrap(), world.rank(1).unwrap());
+        // Logical [k=2, n=3]; on disk [n=3, k=2], element (n, k) = 10·n + k.
+        let disk: Vec<u8> = (0..3u8)
+            .flat_map(|n| (0..2u8).map(move |k| 10 * n + k))
+            .collect();
+        let block = SourceShard::ColBlocks {
+            block: std::num::NonZeroU32::new(2).unwrap(),
+        };
+        let cut = |me| cut_source_bytes(block, me, 7, disk.clone(), 1, (2, 3), true);
+        assert_eq!(cut(r0), Ok(vec![0, 1, 10, 11]));
+        assert_eq!(cut(r1), Ok(vec![20, 21, 0, 0]));
     }
 
     /// Every cut it cannot make byte-exactly is refused by name.

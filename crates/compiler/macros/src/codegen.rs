@@ -14741,6 +14741,28 @@ fn dump_wavefront_mega(
                         S::Partial => {
                             quote! { ::scratchy_target_spyre::wiring::SourceShard::Partial }
                         }
+                        S::ColBlocks { block } | S::RowBlocks { block } => {
+                            let b = proc_macro2::Literal::u32_unsuffixed(block.get());
+                            let block = quote! {
+                                match ::core::num::NonZeroU32::new(#b) {
+                                    ::core::option::Option::Some(n) => n,
+                                    ::core::option::Option::None => panic!("an empty block"),
+                                }
+                            };
+                            if matches!(s, S::ColBlocks { .. }) {
+                                quote! {
+                                    ::scratchy_target_spyre::wiring::SourceShard::ColBlocks {
+                                        block: #block,
+                                    }
+                                }
+                            } else {
+                                quote! {
+                                    ::scratchy_target_spyre::wiring::SourceShard::RowBlocks {
+                                        block: #block,
+                                    }
+                                }
+                            }
+                        }
                         S::HeadRows { heads } => {
                             let h = proc_macro2::Literal::u32_unsuffixed(heads.get());
                             quote! {
