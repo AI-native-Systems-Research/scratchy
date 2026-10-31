@@ -1418,14 +1418,16 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// Token slots per KV page — the scheduler's block, the block the page walk tiles (`BLOCK_SIZE`) and
 /// the modulus the write's rows step by.
 ///
-/// spyre-inference's block size is any multiple of 64 (`SpyrePlatform._align_block_size`, the
-/// backend's own `block_size % 64` check in `spyre_attn.py`; 128 when the user names none), and the
-/// card fixes which: the prompt kernel gathers a whole page (`k_pages.index_select(0, page_idx)`, all
-/// kv heads) as ONE index entry, and dxp double-buffers the first chunk of a gather in one core's LX.
-/// At granite's 8 kv heads × 64 head dims a 64-slot page is 64 KB and compiles; a 128-slot page
-/// (128 KB) and a 256-slot one (256 KB) fail dxp's "initial chunk parameters must fit in LX"
-/// (`L3DlOpsScheduler.cpp:1537`).
-pub const PAGE_SLOTS: u32 = 64;
+/// ⭐ spyre-inference's OWN block size, 128: `_DEFAULT_BLOCK_SIZE` (`spyre_inference/platform.py:146`),
+/// which `_align_block_size` only ever aligns a user's size up to, and which every torch-spyre serve
+/// runs (its compiled decode walk steps the page table and mask by 128 a trip, `affine_map<(d0)[s0]
+/// -> (s0 + 128*d0)>`). Half the trips of a 64-slot page for the same context.
+///
+/// A whole page gathered as ONE index entry (the prompt kernel's `k_pages.index_select(0,
+/// page_idx)`, every kv head) is 128 KB at 8 kv heads × 64 head dims, past dxp's bound on one
+/// gathered entry ([`ktir_superdsc::emit::lower_ktir_to_superdsc::GATHER_ENTRY_BYTES_MAX`]); the
+/// gather copies such an entry in pieces ([`ktir_superdsc::emit::lower_ktir_to_superdsc::gather_pieces`]).
+pub const PAGE_SLOTS: u32 = 128;
 
 /// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
 pub const INT32_STICK: u32 = 32;
@@ -4592,16 +4594,33 @@ mod walk_on_the_card {
             "the output row is scattered to its query row"
         );
         // The score contraction reads the query as one `[4, 128]` block per kv head: two stick-run
-        // copies, laid once before the walk — the same bytes on every trip.
+        // copies, laid once before the walk — the same bytes on every trip. The value contraction
+        // reads each trip's probabilities `[4, PAGE_SLOTS]` the same way once a page is wider than
+        // a stick: one copy per stick of the page, in the body.
         let first_body = ops.iter().position(|e| e.walk.is_some()).expect("a body");
         let blocks: Vec<usize> = (0..ops.len())
             .filter(|&i| ops[i].op_name.starts_with("heads"))
             .collect();
-        assert_eq!(blocks.len(), 2, "one copy per stick of the head");
-        for i in blocks {
+        let page_sticks = PAGE_SLOTS / 64;
+        let probs_copies = if page_sticks > 1 { page_sticks } else { 0 };
+        assert_eq!(
+            blocks.len() as u32,
+            2 + probs_copies,
+            "one copy per stick of the head, and one per stick of a page"
+        );
+        let (before, inside): (Vec<usize>, Vec<usize>) = blocks
+            .into_iter()
+            .partition(|&i| ops[i].walk.is_none() && i < first_body);
+        assert_eq!(before.len(), 2, "the query's blocks precede the walk");
+        assert_eq!(
+            inside.len() as u32,
+            probs_copies,
+            "the probabilities' blocks"
+        );
+        for i in inside {
             assert!(
-                ops[i].walk.is_none() && i < first_body,
-                "{}: the query's blocks precede the walk",
+                ops[i].walk.is_some(),
+                "{}: a trip's probabilities are laid out on the trip",
                 ops[i].op_name
             );
         }
@@ -4610,9 +4629,9 @@ mod walk_on_the_card {
     /// ⭐ THE PROMPT WALK AT A HEAD TWO STICKS WIDE. The query's head-major relayout is two
     /// stick-run copies before the walk — head `a`'s stick `s`, the 64 rows at stick column `2a + s`
     /// of the gathered `[64, 32·128]` block, to `s·32·64 + a·64` of the head-major `[32·64, 128]` —
-    /// and the output's is their inverse after it. A page (8 kv heads × 64 slots × 128, 128 KB) is
-    /// past dxp's entry bound, so the body gathers it in two 64 KB pieces through its page id
-    /// doubled once, piece `p` read and landed `p · 64 KB` in.
+    /// and the output's is their inverse after it. A page (8 kv heads × [`PAGE_SLOTS`] slots × 128)
+    /// is past dxp's 64 KB entry bound, so the body gathers it in 64 KB pieces through its page id
+    /// doubled once per halving, piece `p` read and landed `p · 64 KB` in.
     #[test]
     fn a_two_stick_head_prompt_walk_relays_its_heads_and_gathers_pages_in_pieces() {
         let node = walk_at(64, 4, 128);
@@ -4630,13 +4649,21 @@ mod walk_on_the_card {
         // (heads, rows, sticks a head)
         let (a, b, n) = (32u32, 64u32, 2u32);
         let stick = 64u32;
-        // The score contraction's per-kv-head query blocks: 8 kv heads of 4·64 rows each.
+        // The score contraction's per-kv-head query blocks: 8 kv heads of 4·64 rows each. The
+        // value contraction reads the probabilities `[8·4·64, PAGE_SLOTS]` the same way, a trip at
+        // a time, once a page is wider than one stick — the same rows, so the same offsets.
         let (kv, m) = (8u32, a * b / 8);
+        assert_eq!(
+            PAGE_SLOTS / stick,
+            n,
+            "a page two sticks wide, as the head is"
+        );
         let heads = named("heads");
         assert_eq!(
             heads.len(),
-            6,
-            "two copies in, two into the score contraction's kv-head blocks, two out"
+            8,
+            "two copies in, two into the score contraction's kv-head blocks, two into the value \
+             contraction's per trip, two out"
         );
         for (j, &i) in heads.iter().enumerate() {
             let e = &ops[i];
@@ -4662,6 +4689,18 @@ mod walk_on_the_card {
                     "{}: stick {s} of every kv head's rows, to its block",
                     e.op_name
                 );
+            } else if j < 6 {
+                assert!(
+                    e.walk.is_some(),
+                    "{}: a trip's probabilities are laid out on the trip",
+                    e.op_name
+                );
+                assert_eq!(
+                    offs,
+                    [s * kv * m * stick, s * m * stick],
+                    "{}: stick {s} of every kv head's probabilities, to its block",
+                    e.op_name
+                );
             } else {
                 assert!(
                     e.walk.is_none() && i > first_body,
@@ -4672,7 +4711,12 @@ mod walk_on_the_card {
             }
         }
         let piece = 64 * 1024 / 2;
-        for d in [named("gather0_o"), named("gather1_o")] {
+        let pieces = 8 * PAGE_SLOTS * 128 / piece;
+        assert!(
+            named(&format!("gather{pieces}_o")).is_empty(),
+            "{pieces} pieces"
+        );
+        for d in (0..pieces).map(|p| named(&format!("gather{p}_o"))) {
             assert_eq!(d.len(), 2, "the K page and the V page");
             for i in d {
                 let e = &ops[i];
@@ -4696,7 +4740,11 @@ mod walk_on_the_card {
             }
         }
         let doubled = named("addi32toi32");
-        assert_eq!(doubled.len(), 2, "each page's id doubled once");
+        assert_eq!(
+            doubled.len() as u32,
+            2 * pieces.trailing_zeros(),
+            "each page's id doubled once per halving"
+        );
         assert!(
             doubled.iter().all(|&i| ops[i].walk.is_some()),
             "per trip, in the body"
