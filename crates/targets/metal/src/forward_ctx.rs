@@ -76,6 +76,10 @@ pub struct ForwardCtx<'a> {
     /// Per-sequence GDN fresh flags, shape `[num_seqs]` u32 — 1 on a
     /// sequence's first (fresh) forward. `None` for non-hybrid arches.
     pub gdn_is_fresh: Option<TensorView<'a>>,
+    /// A DFlash2 drafter's rings, the sibling of `gdn_state`. `None` for every other model.
+    pub draft_ring: Option<&'a crate::dflash2::DraftRingPool>,
+    /// A DFlash2 drafter's per-forward inputs. `None` for every other model's forward.
+    pub draft: Option<crate::interpreter::metal::DraftInputs<'a>>,
     /// Multimodal embed splice. `mm_embeds` carries the projected
     /// vision-encoder output `[total_mm_tokens, hidden]`; `embed_patches`
     /// names the destination ranges in the input-id sequence. Empty

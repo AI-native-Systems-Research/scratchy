@@ -324,6 +324,21 @@ pub enum MetalStep {
     Concat(Slot, Slot, Slot, ActivationWidth),
     /// `(routed, shared, gate, out)`: `routed + shared * sigmoid(gate)`.
     GateScale(Slot, Slot, Slot, Slot),
+    /// `(in, slot)`: `in`'s rows copied into their block of the rows a drafter reads of its
+    /// target (Splash `QwenTarget::addCapture`).
+    CaptureHidden(Slot, CaptureSlot),
+    /// One stage of a DFlash2 drafter's dynamic convolution (Splash `draft_conv`).
+    DraftConv(DraftConv),
+    /// `(qkv, out, layer)`: a DFlash2 drafter's attention over its ring and its block (Splash
+    /// `draft_attention_qkv`, `_split`, `_reduce`, `_reorder`).
+    DraftAttention(Slot, Slot, LayerId),
+    /// `(kv, layer)`: a DFlash2 drafter's context commit into its ring (Splash
+    /// `draft_context_kv_commit` on a cycle's verify rows, `prefill_draft_context_kv` on a
+    /// prompt's).
+    DraftContextKv(Slot, LayerId),
+    /// `(logits, selector)`: a DFlash2 drafter's proposals and verify rows (Splash
+    /// `draft_select_top16_sharded`, `_edges`, `_dflash`, `draft_verify_rows`).
+    DraftSelect(Slot, Slot),
     /// `(qkv, z, a, b, out, layer)`: Gated-DeltaNet linear attention.
     GatedDeltaNet(Slot, Slot, Slot, Slot, Slot, LayerId),
     /// `(zxbcdt, out, layer)`: Mamba-2 selective state-space mixer over the whole in-projection.
@@ -346,6 +361,25 @@ pub enum MetalStep {
     RowProgram(Box<RowProgram>),
     /// A one-row step's decode attention that runs its KV writer (`MetalFusion::RopedAttention`).
     RopedAttention(Box<RopedAttention>),
+}
+
+/// A captured layer's block of the rows a drafter reads: block `slot` of `slots`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureSlot {
+    pub slot: u32,
+    pub slots: u32,
+}
+
+/// One stage of a DFlash2 drafter's dynamic convolution: `input`'s rows and the rows before them
+/// in their block, weighted by the layer's base kernel and the `dynamic` rows, into `output`;
+/// the finishing stage adds `residual`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftConv {
+    pub input: Slot,
+    pub dynamic: Slot,
+    pub residual: Option<Slot>,
+    pub output: Slot,
+    pub layer: LayerId,
 }
 
 /// A decode attention and the KV writer it runs: each as it lowers on its own. The row's first
@@ -707,6 +741,9 @@ impl MetalStep {
             | S::KvAppend(_, _, l, ..)
             | S::GatedDeltaNet(_, _, _, _, _, l)
             | S::Mamba2(_, _, l)
+            | S::DraftConv(DraftConv { layer: l, .. })
+            | S::DraftAttention(_, _, l)
+            | S::DraftContextKv(_, l)
             | S::KvStage(_, l, ..)
             | S::AttnPackedKv(_, _, l, ..)
             | S::SampleRows(
@@ -759,6 +796,8 @@ impl MetalStep {
             | S::GateApply(..)
             | S::Concat(..)
             | S::GateScale(..)
+            | S::CaptureHidden(..)
+            | S::DraftSelect(..)
             | S::RotateRows(..)
             | S::SampleRows(..)
             | S::Moe(..)
@@ -811,10 +850,12 @@ pub struct MetalStepTape {
     pub backbone: Vec<StepRow>,
     pub backbone_barriers: Vec<Fence>,
     pub backbone_sources: Vec<Vec<RowSource>>,
-    /// Per backbone row, whether a forward reading only its cache writes runs it (the metal
-    /// compiler's `cache_live`). The lm_head's rows never do.
-    pub backbone_cache_live: Vec<bool>,
+    /// Per backbone row, the plays short of the whole forward that run it (the metal compiler's
+    /// `play_live`).
+    pub backbone_live: Vec<super::lowered::PlayLive>,
     pub lm_head: Vec<StepRow>,
     pub lm_head_barriers: Vec<Fence>,
     pub lm_head_sources: Vec<Vec<RowSource>>,
+    /// Per lm_head row, likewise: never a play of cache writes alone.
+    pub lm_head_live: Vec<super::lowered::PlayLive>,
 }

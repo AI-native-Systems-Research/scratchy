@@ -550,6 +550,8 @@ mod imp {
                     .as_ref()
                     .map(|_| host_view(&gdn_idx, &[gdn_idx.len()], DType::I32)),
                 gdn_is_fresh: gdn_pool.as_ref().map(|_| host_view(&fresh, &[1], u32t)),
+                draft_ring: None,
+                draft: None,
                 mm_embeds: None,
                 embed_patches: &[],
                 vision_rope_cos: None,
