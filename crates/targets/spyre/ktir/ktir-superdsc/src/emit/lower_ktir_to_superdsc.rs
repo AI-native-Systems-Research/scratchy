@@ -6477,15 +6477,20 @@ pub fn batch_transpose(
     Ok(ops)
 }
 
-/// ⭐ dxp's BOUND ON ONE GATHERED ENTRY, in bytes. A gather's initial chunk is one entry
-/// (`getInitialChunkParams` sets the chunk dims to their minimum), and at double buffering that chunk
-/// must fit LX (`L3DlOpsScheduler.cpp:1537`, "initial chunk parameters must fit in LX"). Measured
-/// through `dxp_standalone` on whole-page gathers at 8 kv heads: a 64 KB entry (64 slots × 64 head
-/// dims) compiles, and 128 KB (128 slots × 64, or 64 slots × 128 head dims) is refused there.
-pub const GATHER_ENTRY_BYTES_MAX: u32 = 64 * 1024;
+/// ⭐ THE BOUND ON ONE ENTRY OF OUR ONE-STICK SUB-ROW GATHER COPY ([`page_gather`]), in bytes. That
+/// copy's initial chunk is one entry (`getInitialChunkParams` sets the chunk dims to their minimum),
+/// and at double buffering that chunk must fit LX (`L3DlOpsScheduler.cpp:1537`, "initial chunk
+/// parameters must fit in LX"). Measured through `dxp_standalone` on that form at 8 kv heads: a 64 KB
+/// entry (64 slots × 64 head dims) compiles, and 128 KB is refused.
+///
+/// It is this form's bound, not dxp's: the same dxp compiles torch-spyre's own whole-page gathers
+/// (its compiled prefill's `sdsc_4` and `sdsc_5`, 256 KB, one entry, one core), and a page of several
+/// blocks is gathered in that form, whole
+/// ([`crate::ir::bridge::tiled_op_sdsc_op::page_gather_page_opspec`]).
+pub const SUB_ROW_GATHER_ENTRY_BYTES_MAX: u32 = 64 * 1024;
 
 /// The pieces a gathered entry of `page_sticks` fp16 sticks is copied in: the fewest, a power of two
-/// (so its index scales by doubling, [`page_gather`]), whose piece fits [`GATHER_ENTRY_BYTES_MAX`]
+/// (so its index scales by doubling, [`page_gather`]), whose piece fits [`SUB_ROW_GATHER_ENTRY_BYTES_MAX`]
 /// and is whole sticks. `None` when no power of two divides the entry so.
 pub fn gather_pieces(page_sticks: u32) -> Option<u32> {
     let stick_bytes = Fp16::ELEMS_PER_STICK * Fp16::WORD_LENGTH;
@@ -6494,7 +6499,7 @@ pub fn gather_pieces(page_sticks: u32) -> Option<u32> {
         if !page_sticks.is_multiple_of(pieces) {
             return None;
         }
-        if (page_sticks / pieces) * stick_bytes <= GATHER_ENTRY_BYTES_MAX {
+        if (page_sticks / pieces) * stick_bytes <= SUB_ROW_GATHER_ENTRY_BYTES_MAX {
             return Some(pieces);
         }
         pieces *= 2;
@@ -6510,7 +6515,7 @@ pub fn gather_pieces(page_sticks: u32) -> Option<u32> {
 /// scratch's bytes the gathered slab's own row-major bytes. The consumers read the scratch in the flat
 /// frame — the same bytes only while a row is one stick wide; the caller refuses a wider one.
 ///
-/// An entry past [`GATHER_ENTRY_BYTES_MAX`] is copied in `pieces` ([`gather_pieces`]): dxp steps a
+/// An entry past [`SUB_ROW_GATHER_ENTRY_BYTES_MAX`] is copied in `pieces` ([`gather_pieces`]): dxp steps a
 /// gather's index by its per-entry extent, so through an index already scaled by `pieces` (the
 /// caller's) a piece's extent steps a whole entry, and piece `p` reads and lands `p` pieces in.
 ///
@@ -9422,22 +9427,23 @@ mod gather_pieces_tests {
         );
     }
 
-    /// ⛔ THE BOUND IS A MEASUREMENT, PINNED. dxp has no one constant for it: the refusal is
-    /// `allocAllMem` failing under double buffering (`L3DlOpsScheduler.cpp:1536`, "initial chunk
-    /// parameters must fit in LX"), whose footprint depends on the copy's form. For this one-stick
-    /// sub-row copy, `dxp_standalone` compiled a 64 KB entry and refused 128 KB. A change to the
-    /// bound must come with a new measurement of that form, so the number is held here.
+    /// ⛔ THE ONE-STICK SUB-ROW COPY's BOUND IS A MEASUREMENT, PINNED. dxp has no one constant for
+    /// it: the refusal is `allocAllMem` failing under double buffering (`L3DlOpsScheduler.cpp:1536`,
+    /// "initial chunk parameters must fit in LX"), whose footprint depends on the copy's form — the
+    /// same dxp compiles torch-spyre's 256 KB whole-page gathers. For this form, `dxp_standalone`
+    /// compiled a 64 KB entry and refused 128 KB. A change to the bound must come with a new
+    /// measurement of this form, so the number is held here.
     #[test]
-    fn the_entry_bound_is_the_measured_64_kb() {
-        assert_eq!(GATHER_ENTRY_BYTES_MAX, 64 * 1024);
+    fn the_sub_row_copys_entry_bound_is_the_measured_64_kb() {
+        assert_eq!(SUB_ROW_GATHER_ENTRY_BYTES_MAX, 64 * 1024);
         let stick_bytes = Fp16::ELEMS_PER_STICK * Fp16::WORD_LENGTH;
         assert_eq!(
-            gather_pieces(GATHER_ENTRY_BYTES_MAX / stick_bytes),
+            gather_pieces(SUB_ROW_GATHER_ENTRY_BYTES_MAX / stick_bytes),
             Some(1),
             "the measured 64 KB compiles whole"
         );
         assert_eq!(
-            gather_pieces(2 * GATHER_ENTRY_BYTES_MAX / stick_bytes),
+            gather_pieces(2 * SUB_ROW_GATHER_ENTRY_BYTES_MAX / stick_bytes),
             Some(2),
             "the measured 128 KB refusal is copied in halves"
         );
