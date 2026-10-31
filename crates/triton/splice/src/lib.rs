@@ -4759,21 +4759,24 @@ mod walk_on_the_card {
     /// around its one gather or scatter — never one op a stick column.
     #[test]
     fn a_prompt_chunks_rows_move_in_one_op_each() {
-        for (mq, hd) in [(64, 64), (512, 64), (64, 128)] {
+        // A chunk of rows no split of the cores reads a stick of the index each (55: past one stick,
+        // and no core count divides it into runs within a stick) moves in one op a run of whole
+        // sticks and one for the rest.
+        for (mq, hd, runs) in [(64, 64, 1), (512, 64, 1), (64, 128, 1), (55, 64, 2)] {
             let node = walk_at(mq, 4, hd);
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
             let ops =
                 ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("the prompt walk lowers: {}", e.message));
+                    .unwrap_or_else(|e| panic!("mq={mq}: the prompt walk lowers: {}", e.message));
             let outside = |prefix: &str| {
                 ops.iter()
                     .filter(|e| e.walk.is_none() && e.op_name.starts_with(prefix))
                     .count()
             };
-            assert_eq!(outside("gather"), 1, "mq={mq} hd={hd}: the query rows");
-            assert_eq!(outside("scatter"), 1, "mq={mq} hd={hd}: the output rows");
+            assert_eq!(outside("gather"), runs, "mq={mq} hd={hd}: the query rows");
+            assert_eq!(outside("scatter"), runs, "mq={mq} hd={hd}: the output rows");
         }
     }
 

@@ -4471,18 +4471,49 @@ fn lower_function_folded(
                                 g.entries * sticks,
                                 layout,
                             );
-                            out.extend(super::lower_ktir_to_superdsc::page_gather(
-                                f.name,
-                                &super::lower_ktir_to_superdsc::Gather {
-                                    value_tid: table_rows_major.tid,
-                                    ..g
-                                },
-                                (sticks, 1),
-                                &gathered,
-                                None,
-                                sym_id_base,
-                                Some(layout),
-                            )?);
+                            // One gather a run of index entries — the runs the cores read a
+                            // stick of the index each ([`index_runs`]), one op up to 32 sticks.
+                            //
+                            // [`index_runs`]: super::lower_ktir_to_superdsc::index_runs
+                            let stick = crate::work::FP16_ELEMS_PER_STICK;
+                            for (i, (first, entries)) in
+                                super::lower_ktir_to_superdsc::index_runs(g.entries)
+                                    .into_iter()
+                                    .enumerate()
+                            {
+                                let base = crate::superdsc_opspec::EntryBase::of_entries(
+                                    g.first_entry.entries() + first,
+                                )
+                                .map_err(|message| Error {
+                                    message: format!("{}: {message}", f.name),
+                                })?;
+                                out.push(
+                                    crate::ir::bridge::tiled_op_sdsc_op::assemble_page_gather_copy(
+                                        &format!("gather{i}_o{}", gathered.tid),
+                                        &table_rows_major.name(),
+                                        &gathered.name(),
+                                        crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                                            crate::place::act_name(g.index_tid),
+                                            crate::superdsc_opspec::PageExtent::of_positions(
+                                                sticks,
+                                            ),
+                                            base,
+                                        ),
+                                        crate::ir::bridge::tiled_op_sdsc_op::PageGatherRows {
+                                            rows: entries * sticks,
+                                            words:
+                                                crate::ir::bridge::tiled_op_sdsc_op::GatheredWords::Fp16,
+                                            src_elems: 0,
+                                            dst_elems: first * sticks * stick,
+                                        },
+                                        sym_id_base,
+                                        Some(layout),
+                                    )
+                                    .map_err(|message| Error {
+                                        message: format!("{}: {message}", f.name),
+                                    })?,
+                                );
+                            }
                             Some(Region {
                                 is_out: false,
                                 ..gathered
