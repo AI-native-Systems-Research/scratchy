@@ -2672,7 +2672,7 @@ mod tests {
             &weights,
             allocator,
             pipelines,
-            &test_buckets(&tapes),
+            &test_buckets(&tapes, |_| true),
             MaxBlocksPerSeq(128),
             arena_layout,
             runtime_factory,
@@ -2857,6 +2857,16 @@ mod tests {
         bucket_ms: &[u32],
         max_workers: usize,
     ) -> Option<MetalWorkerPool<TestWeights>> {
+        build_pool_playing(bucket_ms, max_workers, |_| true)
+    }
+
+    /// [`build_multi_bucket_pool`] whose bucket of `m` rows plays more than its cache writes when
+    /// `plays_result(m)` ([`MetalBucketSpec::plays_result`]).
+    fn build_pool_playing(
+        bucket_ms: &[u32],
+        max_workers: usize,
+        plays_result: impl Fn(u32) -> bool,
+    ) -> Option<MetalWorkerPool<TestWeights>> {
         let device = crate::detect_device().filter(|_| crate::metal4_available())?;
         let device = Arc::new(device.device.clone());
         let (weights, allocator) = build_test_weights(&device);
@@ -2920,7 +2930,7 @@ mod tests {
             &weights,
             allocator,
             pipelines,
-            &test_buckets(&tapes),
+            &test_buckets(&tapes, plays_result),
             MaxBlocksPerSeq(128),
             arena_layout,
             runtime_factory,
@@ -2947,6 +2957,77 @@ mod tests {
         assert_eq!(pool.pick_bucket(8).unwrap(), 1);
         assert_eq!(pool.pick_bucket(9).unwrap(), 2);
         assert_eq!(pool.pick_bucket(32).unwrap(), 2);
+    }
+
+    /// A DFlash2 drafter's bucket past its block draft plays its context commit, or its rings'
+    /// rebuild from a window (a subset of the commit's tiles), and refuses any other play: its
+    /// arena holds the commit's tiles alone. A bucket that plays its result takes every play.
+    #[test]
+    fn a_commit_only_bucket_plays_its_commit_and_its_rebuild_alone() {
+        let Some(pool) = build_pool_playing(&[8, 64], 1, |m| m <= 8) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let rows: Vec<u32> = (0..9).collect();
+        let at = |num_tokens: usize, reads: ForwardReads| {
+            let inputs = ForwardInputs {
+                span_ids: None,
+                num_tokens: num_tokens as u32,
+                input_ids: &rows[..num_tokens],
+                positions: &rows[..num_tokens],
+                slot_mappings: Vec::new(),
+                cu_seqlens_q: None,
+                seq_used_k: None,
+                block_tables: Vec::new(),
+                sampled_rows: &EVERY_ROW[..1],
+                gdn_state_indices: None,
+                gdn_is_fresh: None,
+                draft: None,
+                vision_rope_freqs: None,
+                vision_cu_seqlens_full: None,
+                vision_cu_seqlens_window: None,
+                vision_window_index: None,
+                vision_reverse_indices: None,
+                vision_position_ids: None,
+                pixels: None,
+                pos_embeds: None,
+                mm_embeds: None,
+                mm_dst_rows: None,
+                mrope_cos_sin: None,
+                target_hidden: None,
+                device_inputs: &[],
+                deferred: None,
+                reads,
+            };
+            pool.pick_bucket_for(&inputs)
+        };
+        for reads in [ForwardReads::CacheWrites, ForwardReads::Rebuild] {
+            assert_eq!(
+                at(9, reads).ok(),
+                Some(1),
+                "{reads:?} at the commit-only bucket"
+            );
+        }
+        for reads in [ForwardReads::Result, ForwardReads::Outputs] {
+            assert!(
+                matches!(
+                    at(9, reads),
+                    Err(ForwardError::CacheWritesOnly { bucket_m: 64, .. })
+                ),
+                "{reads:?} refused at the commit-only bucket"
+            );
+        }
+        for reads in [
+            ForwardReads::CacheWrites,
+            ForwardReads::Rebuild,
+            ForwardReads::Result,
+        ] {
+            assert_eq!(
+                at(8, reads).ok(),
+                Some(0),
+                "{reads:?} at the bucket that plays all"
+            );
+        }
     }
 
     #[test]
@@ -3725,6 +3806,7 @@ mod tests {
     /// read no output slot, so each row's are slot 0.
     fn test_buckets(
         tapes: &[LoweredMetalTape],
+        plays_result: impl Fn(u32) -> bool,
     ) -> Vec<(&'static MetalBucketSpec, LoweredMetalTape)> {
         (tapes.iter())
             .map(|&tape| {
@@ -3742,7 +3824,7 @@ mod tests {
                     lm_head_barriers: EMPTY_BARRIERS,
                     tapes: &[],
                     kernels: &[],
-                    plays_result: true,
+                    plays_result: plays_result(tape.bucket_m),
                     weight_bytes: crate::tape::step::WeightBytes::default(),
                 }));
                 (spec, tape)
