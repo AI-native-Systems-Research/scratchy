@@ -1571,8 +1571,8 @@ fn gdn_decode_is_the_conv_scan_norm() {
         let (t, slots) = (2usize, 2usize);
         let rows = CheckpointRows(drafts);
         let (conv_slot, ssm_slot) = (conv_dim * (kernel - 1), nv * hv * hk);
-        // Two lanes of the drafts' conv checkpoints and ssm records.
-        let conv_lanes0 = shifted(2 * rows.rows() * conv_slot, 29);
+        // Two lanes of the drafts' conv streams and ssm records.
+        let conv_lanes0 = shifted(2 * conv_dim * (kernel - 1 + rows.rows()), 29);
         let ssm_lanes0 = shifted(2 * 2 * rows.rows() * (conv_dim + 2 * nv), 31);
         let records = match drafts {
             0 => RecordArea::First,
@@ -1833,7 +1833,7 @@ fn gdn_verify_is_the_conv_scan_norm() {
         let t = verify_rows + 1;
         let (slots, lanes) = (2usize, 2usize);
         let (conv_slot, ssm_slot) = (conv_dim * (kernel - 1), nv * hv * hk);
-        let conv_lanes0 = shifted(lanes * rows.rows() * conv_slot, 29);
+        let conv_lanes0 = shifted(lanes * conv_dim * (kernel - 1 + rows.rows()), 29);
         let ssm_lanes0 = shifted(lanes * 2 * rows.rows() * (conv_dim + 2 * nv), 31);
         let codes = [
             code(
@@ -2047,7 +2047,7 @@ fn gdn_verify_is_the_conv_scan_norm() {
         assert_eq!(
             read_f32(&conv_lanes, conv_lanes0.len()),
             read_f32(&chain_conv_lanes, conv_lanes0.len()),
-            "conv checkpoints, {geometry}"
+            "conv streams, {geometry}"
         );
         close(
             "records",
@@ -2133,7 +2133,8 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
     let entry_len = conv_dim * (kernel - 1);
     let rows = CheckpointRows(3);
     let lane = DraftLanes::new(rows, 2).and_then(|l| l.lanes().nth(1));
-    let lane_entries = rows.rows();
+    // A lane's conv stream a channel: the window a verify step starts from, then its rows' inputs.
+    let lane_len = conv_dim * (kernel - 1 + rows.rows());
     let t_full = 10usize;
     let x_full = fill(t_full * conv_dim);
     let w = fill(conv_dim * kernel);
@@ -2160,7 +2161,7 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
     let w_buf = buf_f32(&device, &w);
     let state_buf = buf_zero_f32(&device, 2 * entry_len);
-    let lanes_buf = buf_zero_f32(&device, 2 * lane_entries * entry_len);
+    let lanes_buf = buf_zero_f32(&device, 2 * lane_len);
     let unread_bias = buf_zero_f32(&device, 1);
     let run = |x: &[f32], start: GdnStart, checkpoint_rows: CheckpointRows| -> Option<Vec<f32>> {
         let num_tokens = x.len() / conv_dim;
@@ -2229,10 +2230,10 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
         slot0.iter().all(|&v| v == 0.0),
         "slot 0's entry was written"
     );
-    let lane0 = read_f32(&lanes_buf, lane_entries * entry_len);
+    let lane0 = read_f32(&lanes_buf, lane_len);
     assert!(
         lane0.iter().all(|&v| v == 0.0),
-        "lane 0's checkpoints were written"
+        "lane 0's stream was written"
     );
 }
 
@@ -2255,7 +2256,8 @@ fn gdn_conv1d_varlen_ring_survives_a_short_replayed_verify() {
     let entry_len = conv_dim * (kernel - 1);
     let rows = CheckpointRows(1);
     let lane = DraftLanes::new(rows, 2).and_then(|l| l.lanes().nth(1));
-    let lane_entries = rows.rows();
+    // A lane's conv stream a channel: the window a verify step starts from, then its rows' inputs.
+    let lane_len = conv_dim * (kernel - 1 + rows.rows());
     // Rows 0..4 the prompt, 4 the verify step's token (its draft rejected), 5..6 the replayed
     // verify (token and draft, both kept), 7 the slot step that reads the ring.
     let t_full = 8usize;
@@ -2279,7 +2281,7 @@ fn gdn_conv1d_varlen_ring_survives_a_short_replayed_verify() {
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
     let w_buf = buf_f32(&device, &w);
     let state_buf = buf_zero_f32(&device, 2 * entry_len);
-    let lanes_buf = buf_zero_f32(&device, 2 * lane_entries * entry_len);
+    let lanes_buf = buf_zero_f32(&device, 2 * lane_len);
     let unread_bias = buf_zero_f32(&device, 1);
     let run = |x: &[f32], start: GdnStart, checkpoint_rows: CheckpointRows| -> Option<Vec<f32>> {
         let num_tokens = x.len() / conv_dim;
@@ -2375,10 +2377,10 @@ fn gdn_conv1d_varlen_ring_survives_a_short_replayed_verify() {
         slot0.iter().all(|&v| v == 0.0),
         "slot 0's entry was written"
     );
-    let lane0 = read_f32(&lanes_buf, lane_entries * entry_len);
+    let lane0 = read_f32(&lanes_buf, lane_len);
     assert!(
         lane0.iter().all(|&v| v == 0.0),
-        "lane 0's checkpoints were written"
+        "lane 0's stream was written"
     );
 }
 

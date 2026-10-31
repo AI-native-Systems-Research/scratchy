@@ -19,9 +19,9 @@
 // greedy output vary run to run).
 //   1. the conv, a thread a channel (the head's q and k, and this threadgroup's value head's v),
 //      walking the sequence's rows: each row's output into threadgroup memory and a verify row's
-//      conv row into the lane's records; a value channel's verify rows' windows into its draft
-//      lane's checkpoints and its ring after the last row into the slot — `gdn_conv1d_varlen`'s
-//      seed, checkpoints, saves and ring;
+//      conv row into the lane's records; a value channel's verify rows' inputs onto its draft
+//      lane's conv stream (after the window the step started from) and its ring after the last
+//      row into the slot — `gdn_conv1d_varlen`'s seed, stream, saves and ring;
 //   2. each row's q and k norms (a simdgroup a row) and each row's value head's gates, a verify
 //      row's into the records; a replayed row's k norm, from its record;
 //   3. the scan, a simdgroup per value dim at a time, BATCH state rows in flight, lanes splitting
@@ -34,9 +34,9 @@
 // and the three agree to f32 rounding, not to the bit.)
 //
 // Its state contract is theirs (`gdn_state.h`, `scratchy_layers::gdn_state`): the slot's conv
-// ring (f32) and ssm entry (`half`, arithmetic f32), a verify step's draft lane — `k + 1` conv
-// checkpoints and two record areas of `k + 1` rows — and the step code's start, drafts, record
-// area and lane. A sequence's rows are at most GDN_VER_ROWS (the bucket's, at most 8).
+// ring (f32) and ssm entry (`half`, arithmetic f32), a verify step's draft lane — a conv stream a
+// channel, the window it started from and its `k + 1` rows' inputs, and two record areas of
+// `k + 1` rows — and the step code's start, drafts, record area and lane. A sequence's rows are at most GDN_VER_ROWS (the bucket's, at most 8).
 //
 // Baked constants: 0-4 the scan's (num_k_heads, num_v_heads, head_k, head_v, scale), 5 the conv
 // kernel width, 6 the norm's eps, 7 the rows a sequence (GDN_VER_ROWS), 8 the model's drafts
@@ -77,6 +77,9 @@ constant constexpr uint THREADS = 1024u;
 constant constexpr uint SIMDGROUPS = THREADS / 32u;
 constant constexpr uint NPT = K / 32u;
 constant constexpr uint STATE_LEN = GDN_VER_CONV_KERNEL - 1u;
+// A channel's conv stream in a draft lane: the window a verify step started from, then its rows'
+// inputs.
+constant constexpr uint STREAM_LEN = STATE_LEN + GDN_VER_DRAFTS + 1u;
 // A slot's ssm elements, as the scan lays them out.
 constant constexpr uint SSM_SLOT_LEN = HV * Vd * K;
 // A lane's record row (the conv row, then each value head's g and beta) and record area.
@@ -110,8 +113,9 @@ inline uint gdn_ver_channel(uint h, uint i, uint c) {
 }
 
 // The conv state channel `c` of sequence `n` leaves after its step's `rows` rows from `t0` on,
-// walked from its `seed`: a verify row's window into the draft lane's checkpoint, each save's
-// window into its snapshot, and the ring after the last row into the slot (`gdn_state.h`).
+// walked from its `seed`: a verify step's stream in the draft lane (its seed, then its rows'
+// inputs), each save's window into its snapshot, and the ring after the last row into the slot
+// (`gdn_state.h`).
 template <typename T>
 inline void gdn_ver_persist_conv(thread const float* seed, uint c, uint rows, uint t0, uint drafts,
                                  int slot, int2 saves_through, GdnSeqSlots seq_slots,
@@ -122,6 +126,9 @@ inline void gdn_ver_persist_conv(thread const float* seed, uint c, uint rows, ui
   for (uint ki = 0; ki < STATE_LEN; ki++) {
     window[ki] = seed[ki];
   }
+  for (uint ki = 0; drafts > 0u && ki < STATE_LEN; ki++) {
+    lane_ptr[ki] = seed[ki];
+  }
   for (uint t = 0; t < rows; t++) {
     for (uint ki = 0; ki + 1 < STATE_LEN; ki++) {
       window[ki] = window[ki + 1];
@@ -130,9 +137,7 @@ inline void gdn_ver_persist_conv(thread const float* seed, uint c, uint rows, ui
       window[STATE_LEN - 1u] = float(qkv[(t0 + t) * CONV_DIM + c]);
     }
     if (drafts > 0u && t <= drafts) {
-      for (uint ki = 0; ki < STATE_LEN; ki++) {
-        lane_ptr[t * CONV_DIM * STATE_LEN + ki] = window[ki];
-      }
+      lane_ptr[STATE_LEN + t] = float(qkv[(t0 + t) * CONV_DIM + c]);
     }
     for (uint sv = 0; sv < GDN_SAVES; sv++) {
       if (gdn_saves_after(saves_through, sv, int(t))) {
@@ -225,12 +230,13 @@ template <typename T>
     for (uint ki = 0; ki <= STATE_LEN; ki++) {
       wlocal[ki] = float(conv_w[c * GDN_VER_CONV_KERNEL + ki]);
     }
-    // This channel's window in slot `s`, and in the lane's checkpoint at row `r`.
+    // This channel's window in slot `s`, and its stream in the lane: a replay starts from the
+    // window after the last kept row, row `start - 2`'s, the next STATE_LEN of the stream past it.
     auto ring = [&](int s) { return conv_state + (uint(s) * CONV_DIM + c) * STATE_LEN; };
-    device float* lane_ptr = conv_lanes + (lane_ix * (GDN_VER_DRAFTS + 1u) * CONV_DIM + c) * STATE_LEN;
-    const device float* start_ptr = replays ? lane_ptr + (start - 2u) * CONV_DIM * STATE_LEN
-                                            : ring(gdn_start_slot(seq_slots, start));
-    // The seed stays in registers: a replay's lives in the checkpoints this step overwrites.
+    device float* lane_ptr = conv_lanes + (lane_ix * CONV_DIM + c) * STREAM_LEN;
+    const device float* start_ptr =
+        replays ? lane_ptr + (start - 1u) : ring(gdn_start_slot(seq_slots, start));
+    // The seed stays in registers: a replay's lives in the stream this step overwrites.
     for (uint ki = 0; ki < STATE_LEN; ki++) {
       seed[ki] = fresh ? 0.0f : start_ptr[ki];
       window[ki] = seed[ki];
@@ -497,10 +503,10 @@ template <typename T>
   const bool replays = GDN_VER_DRAFTS > 0u && start >= 2u;
   const uint lane_ix = code >> 17;
   const uint c = gdn_ver_channel(h, 0u, tid);
-  // The seed gdn_verify read: the slot's ring, a restore's snapshot, or a replay's checkpoint.
-  device float* lane_ptr = conv_lanes + (lane_ix * (GDN_VER_DRAFTS + 1u) * CONV_DIM + c) * STATE_LEN;
+  // The seed gdn_verify read: the slot's ring, a restore's snapshot, or a replay's stream.
+  device float* lane_ptr = conv_lanes + (lane_ix * CONV_DIM + c) * STREAM_LEN;
   const device float* start_ptr =
-      replays ? lane_ptr + (start - 2u) * CONV_DIM * STATE_LEN
+      replays ? lane_ptr + (start - 1u)
               : conv_state + (uint(gdn_start_slot(seq_slots, start)) * CONV_DIM + c) * STATE_LEN;
   float seed[8];
   for (uint ki = 0; ki < STATE_LEN; ki++) {

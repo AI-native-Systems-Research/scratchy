@@ -34,10 +34,12 @@
 // State layout (cuda-symmetric): conv_state[slots, conv_dim, state_len], state_len =
 //   kernel-1, base = (slot*conv_dim + d)*state_len, oldest-first. `state_indices[seq]` is the
 //   sequence's `GdnSeqSlots` (`gdn_state.h`), `gdn_step[seq]`
-//   `scratchy_layers::gdn_state::GdnStep::encode`. A verify step checkpoints the window after each
-//   of its rows (the model's drafts + 1) in its sequence's draft lane (the code's bits 17-31),
-//   `conv_lanes[lanes * (GDN_CONV_DRAFTS + 1), conv_dim, state_len]`; the step after one starts
-//   from the lane's checkpoint at its last kept row. A slot start reads its window from the
+//   `scratchy_layers::gdn_state::GdnStep::encode`. A verify step keeps, in its sequence's draft lane
+//   (the code's bits 17-31), each channel's stream of the window it started from and its rows'
+//   inputs (the model's drafts + 1), `conv_lanes[lanes, conv_dim, state_len + GDN_CONV_DRAFTS + 1]`
+//   (Splash's tape keeps its rows' conv inputs: abi/GDN.h `gdn_tape_*`); the step after one starts
+//   from the window after its last kept row, the next `state_len` of the stream past it. A slot
+//   start reads its window from the
 //   record's source slot when it has one (a prefix-cache restore); a save stores the window after
 //   its row into its snapshot slot.
 //
@@ -125,9 +127,9 @@ template <typename T>
   // A model without drafts (`GDN_CONV_DRAFTS` 0) neither replays nor checkpoints.
   uint drafts = GDN_CONV_DRAFTS == 0u ? 0u : (code >> 8) & 0xffu;
   bool replays = GDN_CONV_DRAFTS > 0u && start >= 2u;
-  // A verify step checkpoints the window after each of its rows.
+  // A verify step keeps its rows' inputs, after the window it started from.
   uint checkpoint_rows = drafts == 0u ? 0u : drafts + 1u;
-  uint entry_len = conv_dim * state_len;
+  uint stream_len = state_len + GDN_CONV_DRAFTS + 1u;
   // This channel's window in slot `s`.
   auto ring = [&](int s) { return conv_state + (uint(s) * conv_dim + d) * state_len; };
   const int2 saves_through = gdn_saves_through(seq_slots);
@@ -139,12 +141,11 @@ template <typename T>
   }
 
   // The seed the sequence's first block walks in from: its slot, a restore's snapshot, or the
-  // lane's checkpoint at the last kept row (zero when fresh).
+  // window after the last kept row of the lane's stream, row `start - 2`'s (zero when fresh).
   device float* state_ptr = ring(seq_slots.slot);
-  device float* lane_ptr =
-      conv_lanes + ((code >> 17) * (GDN_CONV_DRAFTS + 1u) * conv_dim + d) * state_len;
+  device float* lane_ptr = conv_lanes + ((code >> 17) * conv_dim + d) * stream_len;
   const device float* start_ptr =
-      replays ? lane_ptr + (start - 2u) * entry_len : ring(gdn_start_slot(seq_slots, start));
+      replays ? lane_ptr + (start - 1u) : ring(gdn_start_slot(seq_slots, start));
 
   const int t_end = metal::min(t0 + int(GDN_CONV_BLOCK), seqlen);
 
@@ -162,6 +163,10 @@ template <typename T>
       window[ki] = float(x[(uint(base + t0) + ki - uint(state_len)) * GDN_CONV_X_STRIDE
                            + GDN_CONV_IN_OFFSET + d]);
     }
+  }
+  // A verify step's stream starts with its seed, read above before this overwrites it.
+  for (uint ki = 0; t0 == 0 && checkpoint_rows > 0u && ki < state_len; ki++) {
+    lane_ptr[ki] = seed[ki];
   }
 
   // Walk the block's tokens; the window slides through registers, a save storing its snapshot
@@ -181,8 +186,8 @@ template <typename T>
     if (state_len > 0) {
       window[state_len - 1] = x_t;
     }
-    for (uint ki = 0; uint(t) < checkpoint_rows && ki < state_len; ki++) {
-      lane_ptr[uint(t) * entry_len + ki] = window[ki];
+    if (uint(t) < checkpoint_rows) {
+      lane_ptr[state_len + uint(t)] = x_t;
     }
     for (uint j = 0; j < GDN_SAVES; j++) {
       if (gdn_saves_after(saves_through, j, t)) {

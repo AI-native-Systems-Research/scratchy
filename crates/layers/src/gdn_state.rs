@@ -34,8 +34,10 @@
 //! **Checkpoints (speculative decoding).** A verify step runs a sequence's last token and its
 //! drafts as rows of one step, and a rejected draft must not stay in the recurrent state.
 //!
-//! The causal conv's state is small: with `checkpoint_rows = k` a verify step keeps it after each
-//! of its `k + 1` rows, and the next step starts from the one at the last kept row.
+//! The causal conv's state is small: with `checkpoint_rows = k` a verify step keeps, a channel, the
+//! window it started from and its `k + 1` rows' inputs — the stream the window after any of its
+//! rows is the next `conv_kernel - 1` of (Splash's tape keeps its rows' conv inputs, not windows:
+//! abi/GDN.h `gdn_tape_*`) — and the next step starts from the window after the last kept row.
 //!
 //! The recurrent (ssm) state is not — a full state per row would be most of the pool, and the
 //! pool is sized for every resident sequence. A slot keeps ONE state entry, and a verify step
@@ -50,7 +52,7 @@
 //! it drafts in through the step that replays its verify step's kept rows — and a step drafts for
 //! only as many sequences as its head's budget drafts for. So they live apart from the slots, in
 //! [`DraftLanes`]:
-//! per layer a conv buffer of `k + 1` entries a lane and an ssm buffer of two record areas a lane
+//! per layer a conv buffer of a stream a channel a lane and an ssm buffer of two record areas a lane
 //! (`GdnStateDims::ssm_lane_len`). A slot is the same entry with drafts as without, and a step that
 //! replays or records names its sequence's lane in its code ([`GdnStep::lane`]). The host hands
 //! lanes out ([`DraftLane`]): a sequence takes one when it drafts and gives it back after the step
@@ -393,9 +395,15 @@ impl GdnStateDims {
         self.conv_kernel - 1
     }
 
-    /// One conv entry, in f32s: a slot's ring, or a lane's checkpoint after one verify row.
+    /// One conv entry, in f32s: a slot's ring.
     pub fn conv_entry_len(self) -> usize {
         self.conv_dim * self.conv_state_len()
+    }
+
+    /// A lane's conv stream a channel, in f32s: the window a verify step started from, then its
+    /// rows' inputs.
+    pub fn conv_stream_len(self, rows: CheckpointRows) -> usize {
+        self.conv_state_len() + rows.rows()
     }
 
     /// One layer's slot shapes: a conv entry, `[slots, conv_dim, conv_kernel - 1]`, and an ssm
@@ -407,12 +415,12 @@ impl GdnStateDims {
         )
     }
 
-    /// One layer's lane shapes: a conv checkpoint a verify row, `[lanes · (k + 1), conv_dim,
-    /// conv_kernel - 1]`, and a lane's records, `[lanes, ssm_lane_len]`.
+    /// One layer's lane shapes: a conv stream a channel, `[lanes, conv_dim, conv_stream_len]`, and
+    /// a lane's records, `[lanes, ssm_lane_len]`.
     fn lane_shapes(self, lanes: DraftLanes) -> ([usize; 3], [usize; 2]) {
         let (count, rows) = (usize::from(lanes.count()), lanes.rows());
         (
-            [count * rows.rows(), self.conv_dim, self.conv_state_len()],
+            [count, self.conv_dim, self.conv_stream_len(rows)],
             [count, self.ssm_lane_len(rows)],
         )
     }
@@ -726,10 +734,10 @@ mod tests {
         }
     }
 
-    /// A slot costs what it costs without drafts; the drafts' checkpoints and records cost their
+    /// A slot costs what it costs without drafts; the drafts' conv streams and records cost their
     /// lanes alone. Qwen3.6-35B-A3B's geometry: 128 slots and 4 lanes of 2 drafts keep the
-    /// draft state of 4 sequences, where a draft area in every slot kept it for 128 (14.1 MiB a
-    /// slot over its 30 GDN layers).
+    /// draft state of 4 sequences, where a draft area in every slot kept it for 128 (11.3 MiB a
+    /// lane over its 30 GDN layers; 14.1 MiB when the conv kept a window a row).
     #[test]
     fn draft_state_costs_its_lanes_not_its_slots() {
         let dims = GdnStateDims {
@@ -747,10 +755,11 @@ mod tests {
         // A slot's entry: its f32 conv ring, its ssm state at the metal kernels' half width.
         let entry = 4 * dims.conv_entry_len() + 2 * dims.ssm_entry_len();
         assert_eq!(plain, 30 * 128 * entry);
-        // A lane is the draft area every slot used to carry: (k + 1) conv checkpoints and two
-        // record areas, 14.1 MiB over the 30 layers.
-        let lane = 4 * (rows.rows() * dims.conv_entry_len() + dims.ssm_lane_len(rows));
-        assert_eq!(30 * lane, 14_791_680);
+        // A lane is the draft area every slot used to carry: a conv stream a channel (the window
+        // a verify step starts from, then its k + 1 rows' inputs) and two record areas, 11.3 MiB
+        // over the 30 layers.
+        let lane = 4 * (dims.conv_dim * dims.conv_stream_len(rows) + dims.ssm_lane_len(rows));
+        assert_eq!(30 * lane, 11_842_560);
         assert_eq!(pool(128, lanes), plain + 30 * 4 * lane);
         assert_eq!(DraftLanes::new(CheckpointRows::NONE, 4), None);
         assert_eq!(DraftLanes::new(rows, 0), None);
