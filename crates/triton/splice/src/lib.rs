@@ -4295,13 +4295,19 @@ mod walk_on_the_card {
         triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints")
     }
 
-    /// ⭐⭐ THE DECODE TRIP IN torch-spyre's FORM AT HEAD DIM 64 — its compiled program's: one kv head a
-    /// core for every op of the trip, the page's Kᵀ re-laid by ONE all-heads restickify, the scores
-    /// and the value product each ONE all-heads contraction, and the kernels, the scores and the
-    /// probabilities all in each core's LX, beside the carried accumulator.
+    /// ⭐⭐ THE DECODE TRIP IN torch-spyre's FORM — its compiled program's, at head dim 64 and 128: one
+    /// kv head a core for every op of the trip, the page's Kᵀ re-laid by ONE all-heads restickify, the
+    /// scores and the value product each ONE all-heads contraction, and the kernels, the scores and
+    /// the probabilities all in each core's LX, beside the carried accumulator.
     #[test]
     fn the_decode_trip_runs_one_kv_head_a_core_in_lx() {
-        let node = walk_at(1, 4, 64);
+        for hd in [64, 128] {
+            the_decode_trip_runs_one_kv_head_a_core_in_lx_at(hd);
+        }
+    }
+
+    fn the_decode_trip_runs_one_kv_head_a_core_in_lx_at(hd: i128) {
+        let node = walk_at(1, 4, hd);
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
         allocate_paged_cache(&node, &layout).expect("the cache allocates");
         let mut sym = 0i64;
@@ -4320,17 +4326,25 @@ mod walk_on_the_card {
                 .collect::<Vec<_>>()
                 .len(),
             2,
-            "the scores and the value product, one all-heads contraction each: {:?}",
+            "hd={hd}: the scores and the value product, one all-heads contraction each: {:?}",
             bmms.iter().map(|e| &e.op_name).collect::<Vec<_>>()
         );
-        assert_eq!(named("transpose").len(), 1, "one all-heads restickify");
+        assert_eq!(
+            named("transpose").len(),
+            1,
+            "hd={hd}: one all-heads restickify"
+        );
         for e in &bmms {
-            assert!(e.walk.is_some(), "{}: on every trip", e.op_name);
+            assert!(e.walk.is_some(), "hd={hd} {}: on every trip", e.op_name);
             let [_, kernel, out] = e.arg_bindings.as_slice() else {
                 panic!("{}: activation, kernel, output", e.op_name);
             };
-            assert!(lx(&kernel.buffer), "{}: its kernel in LX", e.op_name);
-            assert!(lx(&out.buffer), "{}: its product in LX", e.op_name);
+            assert!(
+                lx(&kernel.buffer),
+                "hd={hd} {}: its kernel in LX",
+                e.op_name
+            );
+            assert!(lx(&out.buffer), "hd={hd} {}: its product in LX", e.op_name);
         }
     }
 
@@ -4605,101 +4619,79 @@ mod walk_on_the_card {
         }
     }
 
-    /// ⭐ A HEAD TWO STICKS WIDE (granite-3.1-8b's 128): a gathered page read `[KV, BLOCK, 128]` is
-    /// permuted per kv head, inside the relaunched body — block `b` read and written at its own base
-    /// `b · BLOCK · 128` — into the blocks the batched transpose and the PV contraction read one at a
-    /// time. The query row is permuted once into the stick-major `[KV·G, 128]` before the walk, and
+    /// ⭐ A HEAD TWO STICKS WIDE (granite-3.1-8b's 128): each trip gathers its K page and its V page in
+    /// ONE op each, `[KV, BLOCK, 128]` one kv head a core, every head's row-major block landed
+    /// stick-major by the gather itself (torch-spyre's compiled page gather: value
+    /// `['out','x','mb','y']`, landing `['x','out','mb','y']`) — so nothing in the body re-lays a
+    /// page. The query row is permuted once into the stick-major `[KV·G, 128]` before the walk, and
     /// the output back to its `[1, H·128]` row after it, which the scatter then writes.
     #[test]
-    fn a_two_stick_head_permutes_each_kv_heads_page() {
+    fn a_two_stick_head_gathers_each_kv_heads_page_stick_major() {
         let node = walk_at(1, 4, 128);
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
         allocate_paged_cache(&node, &layout).expect("the cache allocates");
         let mut sym = 0i64;
         let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
             .unwrap_or_else(|e| panic!("the hd128 walk lowers: {}", e.message));
-        let block = PAGE_SLOTS * 128;
-        let mut paged: Vec<(String, u32)> = Vec::new();
-        for e in &ops {
-            let Some(rest) = e.op_name.strip_prefix("permute") else {
-                continue;
-            };
-            match rest.split_once("_o") {
-                Some(("", _)) => assert!(
-                    e.walk.is_none(),
-                    "{}: a whole-buffer permute is the query's or the output's, outside the body",
-                    e.op_name
-                ),
-                Some((b, dst)) => {
-                    let b: u32 = b.parse().expect("a block index");
-                    assert!(
-                        e.walk.is_some(),
-                        "{}: a page permute is in the body",
-                        e.op_name
-                    );
-                    for a in &e.arg_bindings {
-                        assert_eq!(a.offset_elems, b * block, "{}: {}", e.op_name, a.buffer);
-                    }
-                    paged.push((dst.to_string(), b));
-                }
-                None => panic!("{}: not a permute's name", e.op_name),
-            }
-        }
-        let mut dsts: Vec<&str> = paged.iter().map(|(d, _)| d.as_str()).collect();
-        dsts.sort_unstable();
-        dsts.dedup();
-        assert_eq!(dsts.len(), 2, "the K page and the V page: {paged:?}");
-        for d in dsts {
-            let mut blocks: Vec<u32> = paged
+        let pages: Vec<&ktir_superdsc::emit::EmittedOp> = ops
+            .iter()
+            .filter(|e| e.op_name.starts_with("gather_o"))
+            .collect();
+        assert_eq!(pages.len(), 2, "the K page and the V page, one op each");
+        for e in pages {
+            assert!(e.walk.is_some(), "{}: on every trip", e.op_name);
+            let json = serde_json::to_value(e.op.as_ref().expect("a descriptor")).expect("json");
+            let dsc = json["dscs_"][0]
+                .as_object()
+                .and_then(|m| m.values().next())
+                .expect("one dsc");
+            assert_eq!(
+                dsc["N_"],
+                serde_json::json!({"name_": "n", "mb_": 8, "x_": PAGE_SLOTS, "out_": 128, "y_": 1}),
+                "{}: one [BLOCK, 128] block an entry",
+                e.op_name
+            );
+            assert_eq!(
+                json["numWkSlicesPerDim_"]["mb"], 8,
+                "{}: one kv head a core",
+                e.op_name
+            );
+            let orders: Vec<&serde_json::Value> = dsc["scheduleTree_"]
+                .as_array()
+                .expect("a tree")
                 .iter()
-                .filter(|(x, _)| x == d)
-                .map(|&(_, b)| b)
+                .filter(|n| n["nodeType_"] == "allocate")
+                .map(|n| &n["layoutDimOrder_"])
                 .collect();
-            blocks.sort_unstable();
-            assert_eq!(blocks, (0..8).collect::<Vec<_>>(), "one per kv head: t{d}");
+            assert_eq!(
+                orders,
+                [
+                    &serde_json::json!(["out", "x", "mb", "y"]),
+                    &serde_json::json!(["mb"]),
+                    &serde_json::json!(["x", "out", "mb", "y"]),
+                ],
+                "{}: the page read row-major through its index, landed stick-major",
+                e.op_name
+            );
         }
+        let permutes: Vec<&ktir_superdsc::emit::EmittedOp> = ops
+            .iter()
+            .filter(|e| e.op_name.starts_with("permute"))
+            .collect();
         assert_eq!(
-            ops.iter()
-                .filter(|e| e.op_name.starts_with("permute_o"))
-                .count(),
+            permutes.len(),
             2,
-            "the query row in, the output row out"
+            "the query row in, the output row out: {:?}",
+            permutes.iter().map(|e| &e.op_name).collect::<Vec<_>>()
+        );
+        assert!(
+            permutes.iter().all(|e| e.walk.is_none()),
+            "nothing in the body re-lays a page"
         );
         assert!(
             ops.iter().any(|e| e.op_name.starts_with("scatter")),
             "the output row is scattered to its query row"
         );
-        // The score contraction reads the query as one `[4, 128]` block per kv head: two stick-run
-        // copies, laid once before the walk — the same bytes on every trip. The value contraction
-        // reads each trip's probabilities `[4, PAGE_SLOTS]` the same way once a page is wider than
-        // a stick: one copy per stick of the page, in the body.
-        let first_body = ops.iter().position(|e| e.walk.is_some()).expect("a body");
-        let blocks: Vec<usize> = (0..ops.len())
-            .filter(|&i| ops[i].op_name.starts_with("heads"))
-            .collect();
-        let page_sticks = PAGE_SLOTS / 64;
-        let probs_copies = if page_sticks > 1 { page_sticks } else { 0 };
-        assert_eq!(
-            blocks.len() as u32,
-            2 + probs_copies,
-            "one copy per stick of the head, and one per stick of a page"
-        );
-        let (before, inside): (Vec<usize>, Vec<usize>) = blocks
-            .into_iter()
-            .partition(|&i| ops[i].walk.is_none() && i < first_body);
-        assert_eq!(before.len(), 2, "the query's blocks precede the walk");
-        assert_eq!(
-            inside.len() as u32,
-            probs_copies,
-            "the probabilities' blocks"
-        );
-        for i in inside {
-            assert!(
-                ops[i].walk.is_some(),
-                "{}: a trip's probabilities are laid out on the trip",
-                ops[i].op_name
-            );
-        }
     }
 
     /// ⭐ THE PROMPT WALK AT A HEAD TWO STICKS WIDE. The query's head-major relayout is two

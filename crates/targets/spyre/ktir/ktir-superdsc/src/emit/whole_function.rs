@@ -4642,6 +4642,56 @@ fn lower_function_folded(
                     } else {
                         g
                     };
+                    // ⭐ ONE BLOCK AN ENTRY, READ STICK-MAJOR — a page read as `[B, R, C·stick]`
+                    // whose `B` blocks are its `B` index entries: each entry's row-major block lands
+                    // stick-major as it is gathered, one entry a core (torch-spyre's compiled page
+                    // gather), so no permute follows.
+                    if page_to_sticks
+                        && pieces == 1
+                        && let &[b, r, c] = to.as_slice()
+                        && b == i64::from(g.entries)
+                        && c > stick
+                        && c % stick == 0
+                    {
+                        let (b, r, c) = (b as u32, r as u32, c as u32);
+                        let tid = mint_inter(k, layout, floor, res);
+                        let dst = stick_major_region(tid, b * r, c / stick as u32, layout);
+                        out.push(
+                            crate::ir::bridge::tiled_op_sdsc_op::assemble_page_gather_blocks(
+                                &format!("gather_o{tid}"),
+                                &crate::place::act_name(g.value_tid),
+                                &dst.name(),
+                                crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                                    crate::place::act_name(g.index_tid),
+                                    crate::superdsc_opspec::PageExtent::of_positions(1),
+                                    g.first_entry,
+                                ),
+                                crate::ir::bridge::tiled_op_sdsc_op::PageGatherBlocks {
+                                    entries: b,
+                                    rows: r,
+                                    cols: c,
+                                    dst_elems: 0,
+                                },
+                                sym_id_base,
+                                Some(layout),
+                            )
+                            .map_err(|message| Error {
+                                message: format!("{}: {message}", f.name),
+                            })?,
+                        );
+                        gather_carried[gi] = true;
+                        if b > 1 {
+                            batch_blocks.insert(tid, c);
+                        }
+                        inter.insert(
+                            res,
+                            Region {
+                                is_out: false,
+                                ..dst
+                            },
+                        );
+                        continue;
+                    }
                     let [rows, cols] = flat_frame(&from);
                     if cols != crate::work::FP16_ELEMS_PER_STICK {
                         return err(format!(
