@@ -2049,6 +2049,16 @@ pub struct TensorArg<const D: usize> {
     device_extent: [Option<u32>; D],
     /// How this view presents the tensor's own frame, for the arrangement authority ([`ViewFrame`]).
     frame: ViewFrame,
+    /// ⭐ THE ORDER dxp READS THIS TENSOR'S DIMS IN, when it is not `layout`'s. dxp takes
+    /// `layoutDimOrder_` INNERMOST-first (entry `i`'s stride is the product of the entries before it,
+    /// `dsc/dsc2.cpp:2971-2979`), while `layout` here is this emitter's own address frame, outermost
+    /// first. A one-row-dim view reads the same either way. A view with TWO row dims, e.g. the stick
+    /// permute's `[y, mb, out]`, has its row dims swapped by dxp unless the order is given reversed.
+    /// MEASURED: the prompt mask add's `["y","mb","out"]` wrote sticks `21c + 32m` on the card, `y`
+    /// walked innermost. `None` = dxp reads `layout` as written. Set via
+    /// [`TensorArg::with_device_order`]; it reaches only the JSON (`layoutDimOrder_`, `maxDimSizes_`),
+    /// never this emitter's start addresses.
+    device_order: Option<[&'static str; D]>,
 }
 
 impl<const D: usize> TensorArg<D> {
@@ -2097,7 +2107,29 @@ impl<const D: usize> TensorArg<D> {
             row_blocked: false,
             device_extent: [None; D],
             frame: ViewFrame::Own,
+            device_order: None,
         })
+    }
+
+    /// State the order dxp reads this tensor's dims in — innermost first — when it is not `layout`'s
+    /// (see the `device_order` field). `order` must be a permutation of `layout` (a `cargo build`
+    /// `Err` otherwise). Chains off [`TensorArg::new`].
+    pub fn with_device_order(
+        mut self,
+        order: [&'static str; D],
+    ) -> Result<TensorArg<D>, SuperDscError> {
+        let mut sorted = order;
+        let mut want = self.layout;
+        sorted.sort_unstable();
+        want.sort_unstable();
+        if sorted != want {
+            return Err(SuperDscError(format!(
+                "TensorArg '{}': device order {order:?} is not a permutation of layout {:?}",
+                self.name, self.layout
+            )));
+        }
+        self.device_order = Some(order);
+        Ok(self)
     }
 
     /// State how this view presents the tensor's own frame (see [`ViewFrame`]). Chains off
@@ -2189,6 +2221,9 @@ pub struct ArgView<'a> {
     pub device_extent: &'a [Option<u32>],
     /// How the view presents the tensor's own frame ([`ViewFrame`]).
     pub frame: ViewFrame,
+    /// The order dxp reads the dims in, innermost first, when it is not `layout`'s (see
+    /// [`TensorArg`]'s `device_order`).
+    pub device_order: Option<&'a [&'static str]>,
 }
 
 impl AnyTensorArg {
@@ -2389,6 +2424,7 @@ impl AnyTensorArg {
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
                 frame: t.frame,
+                device_order: t.device_order.as_ref().map(|o| o.as_slice()),
             },
             AnyTensorArg::R2(t) => ArgView {
                 is_input: t.is_input,
@@ -2404,6 +2440,7 @@ impl AnyTensorArg {
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
                 frame: t.frame,
+                device_order: t.device_order.as_ref().map(|o| o.as_slice()),
             },
             AnyTensorArg::R3(t) => ArgView {
                 is_input: t.is_input,
@@ -2419,6 +2456,7 @@ impl AnyTensorArg {
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
                 frame: t.frame,
+                device_order: t.device_order.as_ref().map(|o| o.as_slice()),
             },
             AnyTensorArg::R4(t) => ArgView {
                 is_input: t.is_input,
@@ -2434,6 +2472,7 @@ impl AnyTensorArg {
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
                 frame: t.frame,
+                device_order: t.device_order.as_ref().map(|o| o.as_slice()),
             },
         }
     }
