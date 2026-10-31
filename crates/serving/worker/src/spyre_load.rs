@@ -1245,8 +1245,9 @@ impl SpyreWorker {
                         scratchy_target_spyre::bundle_code::registered_fps(),
                     ))
                 })?;
-                // ⭐ THE PEER LINK, BEFORE THE FIRST SESSION LOADS. A rank maps its peer's card
-                // and programs `XSEG[peer sid]` with the window its world's bundles bake; every
+                // ⭐ THE PEER LINK, BEFORE THE FIRST SESSION LOADS. A rank installs its peer's
+                // card in its BAT and points its `XSEG` entries at the slots of the window its
+                // world's bundles bake; every
                 // session below then loads against that one link (`Executor::load` refuses a
                 // bundle whose window is elsewhere, and a sharded one with no link at all).
                 if let (Some((_, me)), Some(cards)) = (sharded, cards) {

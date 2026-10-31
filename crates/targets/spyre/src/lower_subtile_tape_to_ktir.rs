@@ -1040,7 +1040,7 @@ fn ktir_only(k: ktir_superdsc::ktir_node::KtirNode) -> EmittedOp {
 
 /// ⭐ WHAT A COLLECTIVE'S SEND MOVES — this rank's operand `x` as ONE fragment. The send itself is
 /// not a program: it is an F-send control block (device p2p RDMA, flex-rs
-/// `ControlBlockWire::rdma_unicast_send`) the CB pipeline issues ahead of the consume's wait,
+/// `scheduler::build_rdma_send_cb`) the CB pipeline issues ahead of the consume's wait,
 /// moving the fragment from `x`'s own placement into the peer's receive window on this card's DMA
 /// engine. The consume names the operand and this fragment ([`TpConsume`]), which is all the send
 /// needs.

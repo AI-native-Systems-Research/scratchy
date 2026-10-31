@@ -20,9 +20,11 @@
 //!   RDMA message cap ([`WireBytes`], [`Payload::messages`]); an operand is cut at bake into runs
 //!   of whole stick columns — the only contiguous slices of a stick-major tensor ([`fragments`]);
 //! - the receive window is ONE `(segment, offset, size)` triple ([`RecvWindow`]), flit-aligned, in
-//!   the weight segment;
-//! - write-done signals use ONE sid per rank ([`Sid::of`]) — never per collective (a forward holds
-//!   more collectives than the card has sids);
+//!   the weight segment, tiled by fixed landing slots ([`LandingSlot`]);
+//! - a message lands where its sid's `XSEG` entry points and nowhere else (an F-send's own word
+//!   decides nothing — measured, #1009 E8a), so every landing slot has its OWN sid per sending rank
+//!   ([`Sid::of`]), each entry programmed once at link: a bounded, static budget per rank, never
+//!   one per collective (a forward holds more collectives than the card has sids);
 //! - a bundle's control blocks are derived from its own launch groups by ONE function (the bundle
 //!   crate's `collective::cb_pipeline`, which needs the launch group and so lives above this leaf):
 //!   a consume group is `send, wait, launch`, so a wait can never queue ahead of its own send (the
@@ -97,8 +99,9 @@ impl TpWorld {
                 "spyre bakes only the worlds in SPYRE_TP_WORLDS"
             );
             assert!(
-                W <= MAX_SIDS,
-                "one sid per rank: a world wider than the card's sids"
+                W * LandingSlot::SLOTS <= MAX_SIDS,
+                "every rank's landing slots take a sid of their own: a world wider than the \
+                 card's sids"
             );
         }
         Self(W)
@@ -111,7 +114,7 @@ impl TpWorld {
     /// The world of `w` ranks when `w` is only known at run time (a launcher's `--tensor-parallel-size`):
     /// `Some` iff [`TpWorld::of`] would compile for it.
     pub const fn named(w: u32) -> Option<Self> {
-        if is_spyre_world(w) && w <= MAX_SIDS {
+        if is_spyre_world(w) && w * LandingSlot::SLOTS <= MAX_SIDS {
             Some(Self(w))
         } else {
             None
@@ -275,8 +278,8 @@ pub const WINDOW_CUTS: usize = crate::reserved_tids::TP_RECV_CUT_TIDS.len();
 /// rank's send for collective `k + 1` cannot start until its consume of `k` has completed; the
 /// peer cannot pass its wait on `k + 1` until that send lands; and only past that wait can the
 /// peer issue its send for `k + 2` — the next one into `k`'s cut. So no send lands in a cut its
-/// receiver is still reading, with ONE sid per rank and no reverse signal (#1009 review, item 4:
-/// disjoint cuts of the one window).
+/// receiver is still reading, with no reverse signal (#1009 review, item 4: disjoint cuts of the
+/// one window). Each cut's messages land through sids of their own ([`LandingSlot`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WindowCut(u32);
 
@@ -310,6 +313,81 @@ impl WindowCut {
     }
 }
 
+/// The most messages one window cut holds — the width of a rank's landing-slot budget. A forward
+/// whose widest collective operand needs more refuses at bake ([`RecvWindow::cut_bytes_for`]).
+pub const MAX_CUT_MESSAGES: u32 = 8;
+
+/// ⭐ ONE MESSAGE'S FIXED PLACE IN THE RECEIVE WINDOW: message `message` of a send into cut `cut`,
+/// at the cut's offset plus `message` whole messages ([`RecvWindow::slot_offset`]).
+///
+/// WHY A SLOT IS A SID. An F-send lands where the receiver's `XSEG[sid]` entry points, and the
+/// engine adds nothing — the send's own xseg word decides no landing (measured on card, #1009: E8a;
+/// "one sid plus one static table entry is one landing address"). So two messages that must land
+/// apart must signal on two sids. Each slot's entry is programmed ONCE, at link, to the slot's
+/// address; every send and every wait names its slot's sid; nothing re-points a table entry at run
+/// time (the T-send's re-pointing fires an unpaired write-done count, #1009).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LandingSlot {
+    cut: WindowCut,
+    message: u32,
+}
+
+impl LandingSlot {
+    /// Every slot a rank's sends can land in: each cut's run of messages.
+    pub const SLOTS: u32 = WINDOW_CUTS as u32 * MAX_CUT_MESSAGES;
+
+    /// Message `message` of a send into `cut`; `None` past [`MAX_CUT_MESSAGES`].
+    pub const fn of(cut: WindowCut, message: u32) -> Option<Self> {
+        if message < MAX_CUT_MESSAGES {
+            Some(Self { cut, message })
+        } else {
+            None
+        }
+    }
+
+    pub const fn cut(self) -> WindowCut {
+        self.cut
+    }
+
+    pub const fn message(self) -> u32 {
+        self.message
+    }
+
+    /// The slot's place in a rank's budget, `< SLOTS`.
+    pub const fn index(self) -> u32 {
+        self.cut.0 * MAX_CUT_MESSAGES + self.message
+    }
+}
+
+/// WHAT ONE COLLECTIVE'S SEND MOVES: a [`Payload`] of at most [`MAX_CUT_MESSAGES`] messages — one
+/// cut's worth of slots, so every message it is cut into has a slot to land in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CutPayload(Payload);
+
+impl CutPayload {
+    /// `Some` iff `bytes` is at most [`MAX_CUT_MESSAGES`] messages.
+    pub const fn new(bytes: Payload) -> Option<Self> {
+        if bytes.message_count() <= MAX_CUT_MESSAGES {
+            Some(Self(bytes))
+        } else {
+            None
+        }
+    }
+
+    pub const fn get(self) -> Payload {
+        self.0
+    }
+
+    /// Its messages ([`Payload::messages`]), each with the slot of `cut` it lands in: message `m`
+    /// in slot `(cut, m)`.
+    pub fn landings(self, cut: WindowCut) -> impl Iterator<Item = (LandingSlot, Message)> {
+        // `new` bounds the count by `MAX_CUT_MESSAGES`, so every index is a slot.
+        (0..)
+            .zip(self.0.messages())
+            .map(move |(message, m)| (LandingSlot { cut, message }, m))
+    }
+}
+
 /// THE RECEIVE WINDOW — one per card, where the peer's sends land. One typed triple, the same in
 /// every bundle of a forward (prefill, decode, every rung), so a send baked into one bundle and the
 /// consume baked into another always name the same bytes.
@@ -317,8 +395,8 @@ impl WindowCut {
 /// It lives in the weight segment ([`RecvWindow::SEGMENT`]), the one process-shared,
 /// placement-stable segment, above the packed weights, and it is [`WINDOW_CUTS`] equal, adjacent
 /// cuts of [`RecvWindow::cut_bytes_for`] the forward's widest collective operand — never one
-/// bundle's own need. `XSEG[peer sid]` names the window's base; a send to cut `i` names its true
-/// destination, the base plus the cut.
+/// bundle's own need. Each cut is a run of fixed landing slots ([`RecvWindow::slots`]), one
+/// `XSEG` entry per slot per peer, each pointing at its slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RecvWindow {
     offset: u64,
@@ -330,9 +408,9 @@ impl RecvWindow {
     pub const SEGMENT: u32 = 1;
 
     /// The window at `offset` of [`WINDOW_CUTS`] cuts of `cut` bytes. `Some` iff `offset` is
-    /// flit-aligned.
+    /// flit-aligned and a cut is at most [`MAX_CUT_MESSAGES`] messages — a slot each.
     pub const fn new(offset: u64, cut: Payload) -> Option<Self> {
-        if !offset.is_multiple_of(FLIT_BYTES) {
+        if !offset.is_multiple_of(FLIT_BYTES) || cut.message_count() > MAX_CUT_MESSAGES {
             return None;
         }
         Some(Self { offset, cut })
@@ -352,6 +430,22 @@ impl RecvWindow {
         self.offset + cut.0 as u64 * self.cut.0
     }
 
+    /// Where `slot` starts in the segment: its cut, plus its whole messages before it.
+    pub const fn slot_offset(self, slot: LandingSlot) -> u64 {
+        self.cut_offset(slot.cut) + slot.message as u64 * RDMA_MESSAGE_CAP_BYTES
+    }
+
+    /// ⭐ EVERY SLOT THIS WINDOW HAS, with its offset in the segment — each cut's run of messages.
+    /// What the receiver programs, one `XSEG` entry per slot per peer, at link.
+    pub fn slots(self) -> impl Iterator<Item = (LandingSlot, u64)> {
+        (0..WINDOW_CUTS).flat_map(move |k| {
+            let cut = WindowCut::of_collective(k);
+            (0..self.cut.message_count()).filter_map(move |m| {
+                LandingSlot::of(cut, m).map(|slot| (slot, self.slot_offset(slot)))
+            })
+        })
+    }
+
     /// The whole window's bytes — every cut.
     pub const fn size(self) -> u64 {
         WINDOW_CUTS as u64 * self.cut.0
@@ -365,27 +459,32 @@ impl RecvWindow {
     /// ⭐ ONE CUT A FORWARD'S COLLECTIVES NEED: [`WINDOW_ROWS`] rows of its widest collective
     /// operand (`widest_cols`, stick-rounded fp16). It reads only the operand's COLUMNS (the
     /// forward's) and the row cap (the target's) — never a bundle's own row count — so every
-    /// bundle of one forward places the same window, as the one `XSEG[peer sid]` and the shared
+    /// bundle of one forward places the same window, as the link's `XSEG` entries and the shared
     /// weight segment require. Any fragment of any collective of the forward fits a cut whole, so
-    /// a collective is ONE fragment and its send is a run of messages ([`Payload::messages`]).
-    /// `None` for no columns.
+    /// a collective is ONE fragment and its send is a run of messages ([`Payload::messages`]),
+    /// each landing in a slot of its own. `None` for no columns, or for a cut wider than
+    /// [`MAX_CUT_MESSAGES`] messages — more slots than a rank's sid budget holds.
     pub const fn cut_bytes_for(widest_cols: u32) -> Option<Payload> {
         let cols = widest_cols.next_multiple_of(STICK_ELEMS) as u64;
-        Payload::new(cols * <Fp16 as DataFormat>::WORD_LENGTH as u64 * WINDOW_ROWS as u64)
+        match Payload::new(cols * <Fp16 as DataFormat>::WORD_LENGTH as u64 * WINDOW_ROWS as u64) {
+            Some(cut) if cut.message_count() <= MAX_CUT_MESSAGES => Some(cut),
+            _ => None,
+        }
     }
 }
 
-/// A write-done sid. ONE PER RANK: the receiver's counter for "my peer's send landed" is the
-/// sending rank's, whatever the collective — so the count of collectives in a forward never meets
-/// the card's sid budget.
+/// A write-done sid — and the `XSEG` entry its message lands through. ONE PER (SENDING RANK,
+/// LANDING SLOT): the receiver's counter for "this slot of my peer's landed" and the entry pointing
+/// at that slot, whatever the collective — so the count of collectives in a forward never meets the
+/// card's sid budget, and the budget a world takes is a constant (`TpWorld::of` proves it fits).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Sid(u8);
 
 impl Sid {
-    /// The sid a rank's sends signal on.
-    pub const fn of(sender: TpIdentity) -> Self {
-        // `TpWorld::of` bounds every world by `MAX_SIDS`, so a rank always fits.
-        Self(sender.rank as u8)
+    /// The sid `sender`'s message into `slot` signals on.
+    pub const fn of(sender: TpIdentity, slot: LandingSlot) -> Self {
+        // `TpWorld::of` bounds `world · SLOTS` by `MAX_SIDS`, and `slot.index() < SLOTS`.
+        Self((sender.rank * LandingSlot::SLOTS + slot.index()) as u8)
     }
 
     pub const fn get(self) -> u8 {
@@ -526,7 +625,7 @@ pub fn fragments(rows: u32, cols: u32, width: Payload) -> Result<Vec<Fragment>, 
 /// rolled body replays its collectives per layer exactly as it replays its launches.
 ///
 /// ⭐ AND IT NAMES THE SEND. The send in front of a consume is not a program but an F-send control
-/// block (device p2p RDMA, flex-rs `ControlBlockWire::rdma_unicast_send`): this rank's `fragment`
+/// block (device p2p RDMA, flex-rs `scheduler::build_rdma_send_cb`): this rank's `fragment`
 /// of `operand`, from its own placement, into the peer's receive window. Everything it moves is
 /// named here, so a consume and its send cannot come apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -603,7 +702,57 @@ mod tests {
         assert_eq!(ids[0].peer(), Some(ids[1]));
         assert_eq!(ids[1].peer(), Some(ids[0]));
         assert_eq!(TpWorld::of::<1>().ranks().next().unwrap().peer(), None);
-        assert_ne!(Sid::of(ids[0]), Sid::of(ids[1]));
+    }
+
+    /// Every (rank, slot) of a two-rank world signals on a sid of its own, all within the card's.
+    #[test]
+    fn every_rank_and_slot_has_its_own_sid() {
+        let slots: Vec<LandingSlot> = (0..WINDOW_CUTS)
+            .flat_map(|k| {
+                (0..MAX_CUT_MESSAGES)
+                    .map(move |m| LandingSlot::of(WindowCut::of_collective(k), m).unwrap())
+            })
+            .collect();
+        assert_eq!(slots.len() as u32, LandingSlot::SLOTS);
+        let sids: std::collections::BTreeSet<u8> = TpWorld::of::<2>()
+            .ranks()
+            .flat_map(|r| slots.iter().map(move |&s| Sid::of(r, s).get()))
+            .collect();
+        assert_eq!(sids.len() as u32, 2 * LandingSlot::SLOTS);
+        assert!(sids.iter().all(|&s| u32::from(s) < MAX_SIDS));
+        assert_eq!(
+            LandingSlot::of(WindowCut::of_collective(0), MAX_CUT_MESSAGES),
+            None
+        );
+    }
+
+    /// A window's slots tile each cut message by message, and a cut wider than the slot budget is
+    /// no window at all.
+    #[test]
+    fn a_windows_slots_tile_its_cuts() {
+        let cut = Payload::new(2 * RDMA_MESSAGE_CAP_BYTES + FLIT_BYTES).unwrap();
+        let w = RecvWindow::new(1 << 20, cut).unwrap();
+        let slots: Vec<(u32, u32, u64)> = w
+            .slots()
+            .map(|(s, at)| (s.cut().index() as u32, s.message(), at))
+            .collect();
+        let at = |c: u64, m: u64| (1 << 20) + c * cut.get() + m * RDMA_MESSAGE_CAP_BYTES;
+        assert_eq!(
+            slots,
+            [
+                (0, 0, at(0, 0)),
+                (0, 1, at(0, 1)),
+                (0, 2, at(0, 2)),
+                (1, 0, at(1, 0)),
+                (1, 1, at(1, 1)),
+                (1, 2, at(1, 2)),
+            ]
+        );
+        let widest = Payload::new(u64::from(MAX_CUT_MESSAGES) * RDMA_MESSAGE_CAP_BYTES).unwrap();
+        assert!(RecvWindow::new(0, widest).is_some());
+        let past = Payload::new(widest.get() + FLIT_BYTES).unwrap();
+        assert!(RecvWindow::new(0, past).is_none());
+        assert!(RecvWindow::cut_bytes_for(1 << 20).is_none());
     }
 
     #[test]

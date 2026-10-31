@@ -72,7 +72,10 @@ bind this work:
   (the RDMA length field).
 - **Sends:**
   - F-send singlecast only;
-  - one sid per rank;
+  - one sid per (sending rank, landing slot): an F-send lands only where its
+    sid's `XSEG` entry points (#1009, E8a), so every slot of the window has
+    its own sid and entry, programmed once at link. A fixed budget per rank
+    (`LandingSlot::SLOTS`), never one sid per collective;
   - strict per-collective ring order: send → wait → consume;
   - wdone is a counter.
 - **The send CB needs three facts:** xlat completeness, the compensated xseg

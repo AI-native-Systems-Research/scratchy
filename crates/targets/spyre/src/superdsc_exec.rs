@@ -1121,8 +1121,8 @@ struct ForwardHalf {
 pub enum RankSeat {
     /// A world of one: the bundle places no receive window and the process linked no peer.
     Alone,
-    /// One rank of a sharded world: the bundle's window is the one the process's link programmed
-    /// into `XSEG[peer sid]`.
+    /// One rank of a sharded world: the bundle's window is the one whose slots the process's
+    /// link pointed its `XSEG` entries at.
     Linked(&'static PeerLink),
 }
 
@@ -1157,8 +1157,8 @@ impl std::fmt::Display for SeatRefusal {
             ),
             Self::WindowMoved { baked, linked } => write!(
                 f,
-                "its receive window {baked:?} is not the {linked:?} this card's XSEG[peer sid] \
-                 holds — every bundle a rank runs must bake the same window"
+                "its receive window {baked:?} is not the {linked:?} this card's XSEG entries \
+                 point at — every bundle a rank runs must bake the same window"
             ),
             Self::Misplaced(why) => write!(
                 f,

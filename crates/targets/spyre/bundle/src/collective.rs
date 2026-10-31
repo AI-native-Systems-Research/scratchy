@@ -14,11 +14,11 @@ pub use ktir_superdsc::collective::*;
 pub enum CbStep {
     /// The F-send in front of consume group `group`: this rank's fragment of the consume's operand,
     /// from its own placement into the peer's receive window, on this card's DMA engine — device p2p
-    /// RDMA (flex-rs `ControlBlockWire::rdma_unicast_send`). Its landing increments the peer's
-    /// write-done counter on this rank's sid.
+    /// RDMA (flex-rs `scheduler::build_rdma_send_cb`), one F-send per message. Each message's
+    /// landing increments the peer's write-done counter on this rank's sid for its landing slot.
     Send { group: usize, consume: TpConsume },
-    /// Wait for the peer's fragment to land in this rank's window (consumes one write-done on the
-    /// peer's sid; flex-rs `ControlBlockWire::rdma_wdone_wait`).
+    /// Wait for the peer's fragment to land in this rank's window (consumes one write-done per
+    /// message on the peer's sid for its slot; flex-rs `ControlBlockWire::p2p_rdma_wait`).
     Wait { group: usize, consume: TpConsume },
     /// Launch group `group`'s programs.
     Launch { group: usize },
@@ -76,9 +76,11 @@ pub struct TpSend {
     pub source_segment: u8,
     /// The fragment's first byte inside that segment.
     pub source_offset: u64,
-    /// The window's offset inside [`RecvWindow::SEGMENT`].
+    /// The window cut's offset inside [`RecvWindow::SEGMENT`].
     pub window_offset: u64,
-    pub bytes: Payload,
+    pub bytes: CutPayload,
+    /// The cut it lands in — message `m` lands in slot `(cut, m)`, signalling that slot's sid.
+    pub cut: WindowCut,
 }
 
 /// Why a consume's send names no baked bytes. The bake refuses every one of these (it resolves
@@ -190,7 +192,12 @@ impl TpSend {
             source_segment: operand.segment as u8,
             source_offset,
             window_offset: landing,
-            bytes,
+            // A fragment within one cut is within the cut's slots (`RecvWindow::new`).
+            bytes: CutPayload::new(bytes).ok_or(SendUnplaced::WindowTooSmall {
+                window: window.cut().get(),
+                bytes: bytes.get(),
+            })?,
+            cut: consume.cut,
         })
     }
 }
@@ -204,21 +211,27 @@ pub struct TpMessage {
     /// The send section's own protocol bits: this message's place in the run.
     pub first: bool,
     pub last: bool,
+    /// Where it lands — and so the sid it signals on and the peer waits on.
+    pub slot: LandingSlot,
 }
 
 impl TpSend {
     /// ⭐ THE CUT: the send as the vendor's windowed P2P loop issues it — one F-send per message
-    /// ([`Payload::messages`]), each advancing the source and the landing together. Every one
-    /// increments the peer's write-done counter once, so a send of N messages is waited for N
-    /// times (a wait consumes exactly one count): the pipeline issues N waits for it.
+    /// ([`Payload::messages`]), each advancing the source and the landing together, and each in a
+    /// landing slot of its own ([`CutPayload::landings`]). Every one increments its slot's
+    /// write-done counter on the peer once, so a send of N messages is waited for N times, once
+    /// per slot (a wait consumes exactly one count): the pipeline issues N waits for it.
     pub fn messages(self) -> impl Iterator<Item = TpMessage> {
-        self.bytes.messages().map(move |m| TpMessage {
-            source_offset: self.source_offset + m.offset,
-            window_offset: self.window_offset + m.offset,
-            bytes: m.bytes,
-            first: m.first,
-            last: m.last,
-        })
+        self.bytes
+            .landings(self.cut)
+            .map(move |(slot, m)| TpMessage {
+                source_offset: self.source_offset + m.offset,
+                window_offset: self.window_offset + m.offset,
+                bytes: m.bytes,
+                first: m.first,
+                last: m.last,
+                slot,
+            })
     }
 }
 
@@ -438,7 +451,8 @@ mod tests {
                     source_segment: 0,
                     source_offset: 8192 + fragment.byte_offset(),
                     window_offset: (1 << 20) + k as u64 * WireBytes::CAP.get(),
-                    bytes: fragment.bytes(),
+                    bytes: CutPayload::new(fragment.bytes()).unwrap(),
+                    cut,
                 }
             );
         }
@@ -490,15 +504,18 @@ mod tests {
     }
 
     /// A send wider than one message is the vendor loop's run: each message reads and lands at
-    /// the same offset into the payload, the run tiles it, and only its ends carry first / last.
+    /// the same offset into the payload, in a slot of its own, the run tiles it, and only its ends
+    /// carry first / last.
     #[test]
     fn a_wide_send_is_a_run_of_messages_at_matching_offsets() {
         let cap = WireBytes::CAP.get();
+        let cut = WindowCut::of_collective(1);
         let send = TpSend {
             source_segment: 0,
             source_offset: 8192,
             window_offset: 1 << 30,
-            bytes: Payload::new(2 * cap + 256).unwrap(),
+            bytes: CutPayload::new(Payload::new(2 * cap + 256).unwrap()).unwrap(),
+            cut,
         };
         let m: Vec<TpMessage> = send.messages().collect();
         assert_eq!(m.len(), 3);
@@ -509,11 +526,18 @@ mod tests {
                 (8192 + at, (1 << 30) + at)
             );
             assert_eq!((x.first, x.last), (k == 0, k == 2));
+            assert_eq!(x.slot, LandingSlot::of(cut, k as u32).unwrap());
         }
         assert_eq!(m[2].bytes.get(), 256);
         assert_eq!(
             m.iter().map(|x| x.bytes.get()).sum::<u64>(),
-            send.bytes.get()
+            send.bytes.get().get()
+        );
+        let past = Payload::new(u64::from(MAX_CUT_MESSAGES) * cap + FLIT_BYTES).unwrap();
+        assert_eq!(
+            CutPayload::new(past),
+            None,
+            "more messages than a cut has slots"
         );
     }
 
