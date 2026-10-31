@@ -10893,7 +10893,8 @@ mod tests {
                 source_segment: partial.segment as u8,
                 source_offset: partial.offset,
                 window_offset: window.offset,
-                bytes: consume.fragment.bytes(),
+                bytes: bundle::collective::CutPayload::new(consume.fragment.bytes()).unwrap(),
+                cut: consume.cut,
             }
         );
         let windowless = bundle::BundleLayout {
