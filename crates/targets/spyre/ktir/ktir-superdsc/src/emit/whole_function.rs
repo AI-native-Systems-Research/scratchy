@@ -4674,7 +4674,8 @@ fn lower_function_folded(
                     else {
                         return err(format!(
                             "{}: a gathered entry of {page_sticks} sticks splits into no power of \
-                             two of whole-stick pieces under dxp's {}-byte entry bound",
+                             two of whole-stick pieces under the one-stick sub-row copy's {}-byte \
+                             entry bound",
                             f.name,
                             super::lower_ktir_to_superdsc::SUB_ROW_GATHER_ENTRY_BYTES_MAX
                         ));
