@@ -413,10 +413,11 @@ async fn run(base_url: &str, prompt: &str) -> Run {
 /// A prefix-cache hit drafts from the drafter's context of its cached prefix, which the snapshot it
 /// resumes from kept (Splash's composite state: the window the hit rebuilds its rings from), not
 /// from whatever its ring slot last held. A prompt hit right after its own prefill, and hit again
-/// after another long prompt took its ring slot, says the same and keeps as many drafts. Without
-/// the restore the second hit drafts from the other prompt's rows: it kept 71 drafts to the first
-/// hit's 109, and its text differed. (The drafts each run proposes are left out: one run proposed
-/// one draft more than the other, 220 to 219, with the same text and the same drafts kept.)
+/// after another long prompt took its ring slot, says the same, proposes as many drafts and keeps
+/// as many. Without the restore the second hit drafts from the other prompt's rows: it kept 71
+/// drafts to the first hit's 109, and its text differed. With the restore but the hit's prompt
+/// step drafting a block before its rings were rebuilt, that block came from its slot's last
+/// request: the second hit proposed 220 drafts to the first's 219.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn a_hit_drafts_from_the_context_its_snapshot_kept() {
@@ -434,6 +435,10 @@ async fn a_hit_drafts_from_the_context_its_snapshot_kept() {
     assert!(hit.cached > 0, "the second run hits");
     assert!(hit.proposed > 0, "the hit drafts");
     assert_eq!(hit.text, hit_after_other.text, "a hit says the same");
+    assert_eq!(
+        hit.proposed, hit_after_other.proposed,
+        "a hit proposes as many drafts, none from its ring slot's last request"
+    );
     assert_eq!(
         hit.accepted, hit_after_other.accepted,
         "a hit keeps as many drafts, from its snapshot's context"

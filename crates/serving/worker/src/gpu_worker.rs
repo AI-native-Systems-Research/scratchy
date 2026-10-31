@@ -8501,11 +8501,52 @@ impl Worker for MetalWorker {
                         rebuilds.push(Rebuild::of(ring_slot, begin..end));
                     }
                 }
+                // The snapshots the step restores its lanes' windows from (Splash's composite
+                // state: the drafter's window beside the target's state), each lane by its ring
+                // slot. A restored lane's rings wait for their rebuild, so its step's passes draft
+                // no block from what its slot's last request left in them.
+                let ops = &scheduler_output.recurrent_state;
+                let mut restores = Vec::new();
+                for op in &ops.restores {
+                    let in_step = step_rows.req_ids.iter().any(|r| *r == op.req_id);
+                    if !in_step || !scheduler_output.draft_req_ids.contains(&op.req_id) {
+                        continue;
+                    }
+                    // Its plan continues the window it restores, which a drafting save of its
+                    // prefix wrote.
+                    let continues = d
+                        .contexts
+                        .continues_restored_window(&op.req_id, op.position);
+                    let saved = d.snapshot_window_keys.get(op.slot) == Some(&Some(op.key));
+                    if !(continues && saved) {
+                        continue;
+                    }
+                    d.contexts.restore(&op.req_id, op.position);
+                    let ring_slot =
+                        (d.slots.of(&op.req_id)).map_err(ExecutorError::WorkerExecution)?;
+                    restores.push((op.req_id.as_str(), WindowRestore {
+                        ring_slot,
+                        snapshot: op.slot,
+                    }));
+                }
                 let passes = (d.drafter)
                     .passes(&step_rows, &scheduler_output.draft_req_ids, &d.contexts)
                     .map_err(|e| {
                         ExecutorError::WorkerExecution(format!("DFlash2 draft context: {e:?}"))
                     })?;
+                // A plan that continues its restored window captures from where it resumes: its
+                // step commits the rows the window goes on with.
+                let commits = |req_id: &str| {
+                    (passes.iter()).any(|p| {
+                        (p.commit.steps.iter()).any(|&i| req_ids_in_order[i] == req_id)
+                    })
+                };
+                if let Some((req_id, _)) = restores.iter().find(|(r, _)| !commits(r)) {
+                    return Err(ExecutorError::WorkerExecution(format!(
+                        "DFlash2: {req_id} restores a window its step commits none of"
+                    )));
+                }
+                let restores: Vec<WindowRestore> = restores.into_iter().map(|(_, r)| r).collect();
                 match passes {
                     Some(passes) => {
                         let commit_slots = (passes.commit.steps.iter())
@@ -8517,37 +8558,14 @@ impl Worker for MetalWorker {
                             .map(|l| d.slots.of(&req_ids_in_order[l.step]))
                             .collect::<Result<Vec<u32>, String>>()
                             .map_err(ExecutorError::WorkerExecution)?;
-                        // The snapshots the step restores its committing lanes' windows from and
-                        // saves them into (Splash's composite state: the drafter's window beside
-                        // the target's state), each lane by its ring slot and its first position
-                        // in the step.
+                        // The snapshots the step saves its committing lanes' windows into, each
+                        // lane by its ring slot and its first position in the step.
                         let mut committing: HashMap<&str, (u32, u32)> = HashMap::new();
                         for (&i, &slot) in passes.commit.steps.iter().zip(&commit_slots) {
                             let first = step_rows.positions[step_rows.cu_seqlens_q[i] as usize];
                             committing
                                 .entry(req_ids_in_order[i].as_str())
                                 .or_insert((slot, first));
-                        }
-                        let ops = &scheduler_output.recurrent_state;
-                        let mut restores = Vec::new();
-                        for op in &ops.restores {
-                            let Some(&(ring_slot, _)) = committing.get(op.req_id.as_str()) else {
-                                continue;
-                            };
-                            // Its plan continues the window it restores, which a drafting save
-                            // of its prefix wrote; its rings wait for a rebuild from it.
-                            let continues = d
-                                .contexts
-                                .continues_restored_window(&op.req_id, op.position);
-                            let saved = d.snapshot_window_keys.get(op.slot) == Some(&Some(op.key));
-                            if !(continues && saved) {
-                                continue;
-                            }
-                            d.contexts.restore(&op.req_id, op.position);
-                            restores.push(WindowRestore {
-                                ring_slot,
-                                snapshot: op.slot,
-                            });
                         }
                         let mut saves = Vec::new();
                         for op in &ops.saves {
