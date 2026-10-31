@@ -9361,6 +9361,27 @@ mod gather_pieces_tests {
             "odd and past the bound: no half is whole sticks"
         );
     }
+
+    /// ⛔ THE BOUND IS A MEASUREMENT, PINNED. dxp has no one constant for it: the refusal is
+    /// `allocAllMem` failing under double buffering (`L3DlOpsScheduler.cpp:1536`, "initial chunk
+    /// parameters must fit in LX"), whose footprint depends on the copy's form. For this one-stick
+    /// sub-row copy, `dxp_standalone` compiled a 64 KB entry and refused 128 KB. A change to the
+    /// bound must come with a new measurement of that form, so the number is held here.
+    #[test]
+    fn the_entry_bound_is_the_measured_64_kb() {
+        assert_eq!(GATHER_ENTRY_BYTES_MAX, 64 * 1024);
+        let stick_bytes = Fp16::ELEMS_PER_STICK * Fp16::WORD_LENGTH;
+        assert_eq!(
+            gather_pieces(GATHER_ENTRY_BYTES_MAX / stick_bytes),
+            Some(1),
+            "the measured 64 KB compiles whole"
+        );
+        assert_eq!(
+            gather_pieces(2 * GATHER_ENTRY_BYTES_MAX / stick_bytes),
+            Some(2),
+            "the measured 128 KB refusal is copied in halves"
+        );
+    }
 }
 
 #[cfg(test)]
