@@ -4623,6 +4623,10 @@ fn lower_function_folded(
                         && let &[b, r, c] = to.as_slice()
                         && b > 1
                         && c % stick == 0
+                        // Landed stick-major: the frame a multi-stick page is read in (`page_to_sticks`,
+                        // as the one-block-an-entry gather below requires), and at one stick the
+                        // row-major frame's own bytes.
+                        && (page_to_sticks || c == stick)
                     {
                         let (b, r, c) = (b as u32, r as u32, c as u32);
                         let tid = mint_inter(k, layout, floor, res);
@@ -4672,7 +4676,7 @@ fn lower_function_folded(
                             "{}: a gathered entry of {page_sticks} sticks splits into no power of \
                              two of whole-stick pieces under dxp's {}-byte entry bound",
                             f.name,
-                            super::lower_ktir_to_superdsc::GATHER_ENTRY_BYTES_MAX
+                            super::lower_ktir_to_superdsc::SUB_ROW_GATHER_ENTRY_BYTES_MAX
                         ));
                     };
                     let g = if pieces > 1 {

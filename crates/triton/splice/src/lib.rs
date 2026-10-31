@@ -1424,9 +1424,9 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// -> (s0 + 128*d0)>`). Half the trips of a 64-slot page for the same context.
 ///
 /// A whole page gathered as ONE index entry (the prompt kernel's `k_pages.index_select(0,
-/// page_idx)`, every kv head) is 128 KB at 8 kv heads × 64 head dims, past dxp's bound on one
-/// gathered entry ([`ktir_superdsc::emit::lower_ktir_to_superdsc::GATHER_ENTRY_BYTES_MAX`]); the
-/// gather copies such an entry in pieces ([`ktir_superdsc::emit::lower_ktir_to_superdsc::gather_pieces`]).
+/// page_idx)`, every kv head) — 128 KB at 8 kv heads × 64 head dims, 256 KB at 128 — is gathered in
+/// one op, as torch-spyre's compiled prefill gathers it
+/// ([`ktir_superdsc::ir::bridge::tiled_op_sdsc_op::page_gather_page_opspec`]).
 pub const PAGE_SLOTS: u32 = 128;
 
 /// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
