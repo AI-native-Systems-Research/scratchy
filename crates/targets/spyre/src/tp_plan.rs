@@ -91,12 +91,18 @@ pub struct TpBake {
 
 /// Shard `input` for `world` and size the receive window its collectives need.
 pub fn tp_bake(input: &LoweringInput, world: SpyreWorld) -> Result<TpBake, TpBakeRefusal> {
-    let sharded = tensor_parallel::shard(input, world.analysis, SPYRE_SPLIT_GRANULE)
+    let sharded = tensor_parallel::shard(input, world.analysis, SPYRE_SPLIT_GRANULE, &[])
         .map_err(TpBakeRefusal::Shard)?;
     let shapes = tensor_parallel::op_shapes(&sharded.local);
     let mut widest_cols: Option<u32> = None;
     for (collective, c) in sharded.collectives.iter().enumerate() {
-        let (rows, cols) = shapes[c.reads];
+        let (rows, cols) = match c.reads {
+            scratchy_subtile::lower::InputRef::Op(r) => shapes[r],
+            scratchy_subtile::lower::InputRef::Ext(e) => {
+                let s = sharded.local.sources[e];
+                (s.rows, s.cols)
+            }
+        };
         consume_fragments(rows, cols).map_err(|why| TpBakeRefusal::Fragment { collective, why })?;
         widest_cols = Some(widest_cols.map_or(cols, |w| w.max(cols)));
     }
