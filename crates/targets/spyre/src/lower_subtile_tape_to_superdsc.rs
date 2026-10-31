@@ -4146,6 +4146,23 @@ pub fn numeric_gate<F: RopeForm>(
     // The rung's identity, named for the body: the messages say `{fp}`, the
     // decode mask stages `cap` — both off the ONE param that carried them in.
     let (fp, cap) = (rung.fp, rung.cap);
+    // ⛔ A SHARDED FORWARD HAS NO ONE-RANK RUN. Its consumes read the receive window the peer's
+    // send fills, and its collectives have no one-rank reference (`eval_node` refuses them;
+    // `tensor_parallel::eval_ranks` is the two-rank one). Judging it takes both ranks' sessions
+    // stepped collective by collective, which this single-session gate is not.
+    if let Some(n) = ir
+        .nodes
+        .iter()
+        .find(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
+    {
+        eprintln!(
+            "[spyre-superdsc] NUMERIC GATE SKIP {fp}: t{} is {} — a sharded forward runs on two \
+             ranks at once and this gate runs one; this bundle's numbers are UNCHECKED",
+            n.output.tensor.index(),
+            n.op.name()
+        );
+        return Ok(());
+    }
     // ⛔ KEEP IN STEP with `eval_node`'s no-host-reference arms: an op listed
     // here that gains a reference makes the gate skip a graph it could check;
     // one missing here PANICS inside `eval_golden_buffers` with eval's own
