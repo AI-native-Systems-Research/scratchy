@@ -263,52 +263,113 @@ const _: () = assert!(
      receive window holds"
 );
 
+/// How many disjoint cuts the receive window is — one placement per cut
+/// ([`crate::reserved_tids::TP_RECV_CUT_TIDS`]).
+pub const WINDOW_CUTS: usize = crate::reserved_tids::TP_RECV_CUT_TIDS.len();
+
+/// ⭐ WHICH CUT OF THE RECEIVE WINDOW A COLLECTIVE USES — its send lands there, its consume reads
+/// there. The forward's `k`-th collective takes cut `k mod WINDOW_CUTS`: consecutive collectives
+/// alternate. A baked fact of the consume ([`TpConsume::cut`]), never re-derived at load.
+///
+/// Why two are enough, by the pipeline's own order: a send carries the CTRL barrier, so this
+/// rank's send for collective `k + 1` cannot start until its consume of `k` has completed; the
+/// peer cannot pass its wait on `k + 1` until that send lands; and only past that wait can the
+/// peer issue its send for `k + 2` — the next one into `k`'s cut. So no send lands in a cut its
+/// receiver is still reading, with ONE sid per rank and no reverse signal (#1009 review, item 4:
+/// disjoint cuts of the one window).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WindowCut(u32);
+
+impl WindowCut {
+    /// The cut of the forward's `k`-th collective.
+    pub const fn of_collective(k: usize) -> Self {
+        Self((k % WINDOW_CUTS) as u32)
+    }
+
+    /// Re-mint from the index the `#[forward]` macro bakes.
+    ///
+    /// ```compile_fail
+    /// use ktir_superdsc::collective::WindowCut;
+    /// const C: WindowCut = WindowCut::baked(2);
+    /// ```
+    pub const fn baked(cut: u32) -> Self {
+        assert!(
+            (cut as usize) < WINDOW_CUTS,
+            "a consume names a window cut the window does not have"
+        );
+        Self(cut)
+    }
+
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// The tid the cut's placement carries — what a consume program binds to read it.
+    pub const fn tid(self) -> u32 {
+        crate::reserved_tids::TP_RECV_CUT_TIDS[self.0 as usize]
+    }
+}
+
 /// THE RECEIVE WINDOW — one per card, where the peer's sends land. One typed triple, the same in
 /// every bundle of a forward (prefill, decode, every rung), so a send baked into one bundle and the
 /// consume baked into another always name the same bytes.
 ///
 /// It lives in the weight segment ([`RecvWindow::SEGMENT`]), the one process-shared,
-/// placement-stable segment, above the packed weights. Its size is [`RecvWindow::bytes_for`] the
-/// forward's widest collective operand — never one bundle's own need.
+/// placement-stable segment, above the packed weights, and it is [`WINDOW_CUTS`] equal, adjacent
+/// cuts of [`RecvWindow::cut_bytes_for`] the forward's widest collective operand — never one
+/// bundle's own need. `XSEG[peer sid]` names the window's base; a send to cut `i` names its true
+/// destination, the base plus the cut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RecvWindow {
     offset: u64,
-    size: Payload,
+    cut: Payload,
 }
 
 impl RecvWindow {
     /// The weight segment (seg1).
     pub const SEGMENT: u32 = 1;
 
-    /// `Some` iff `offset` is flit-aligned.
-    pub const fn new(offset: u64, size: Payload) -> Option<Self> {
+    /// The window at `offset` of [`WINDOW_CUTS`] cuts of `cut` bytes. `Some` iff `offset` is
+    /// flit-aligned.
+    pub const fn new(offset: u64, cut: Payload) -> Option<Self> {
         if !offset.is_multiple_of(FLIT_BYTES) {
             return None;
         }
-        Some(Self { offset, size })
+        Some(Self { offset, cut })
     }
 
     pub const fn offset(self) -> u64 {
         self.offset
     }
 
-    pub const fn size(self) -> Payload {
-        self.size
+    /// One cut's bytes.
+    pub const fn cut(self) -> Payload {
+        self.cut
+    }
+
+    /// Where `cut` starts in the segment.
+    pub const fn cut_offset(self, cut: WindowCut) -> u64 {
+        self.offset + cut.0 as u64 * self.cut.0
+    }
+
+    /// The whole window's bytes — every cut.
+    pub const fn size(self) -> u64 {
+        WINDOW_CUTS as u64 * self.cut.0
     }
 
     /// One past the window's last byte — the weight segment must reserve up to here.
     pub const fn end(self) -> u64 {
-        self.offset + self.size.0
+        self.offset + self.size()
     }
 
-    /// ⭐ THE WINDOW A FORWARD'S COLLECTIVES NEED: [`WINDOW_ROWS`] rows of its widest collective
+    /// ⭐ ONE CUT A FORWARD'S COLLECTIVES NEED: [`WINDOW_ROWS`] rows of its widest collective
     /// operand (`widest_cols`, stick-rounded fp16). It reads only the operand's COLUMNS (the
     /// forward's) and the row cap (the target's) — never a bundle's own row count — so every
     /// bundle of one forward places the same window, as the one `XSEG[peer sid]` and the shared
-    /// weight segment require. Any fragment of any collective of the forward fits it whole, so a
-    /// collective is ONE fragment and its send is a run of messages ([`Payload::messages`]).
+    /// weight segment require. Any fragment of any collective of the forward fits a cut whole, so
+    /// a collective is ONE fragment and its send is a run of messages ([`Payload::messages`]).
     /// `None` for no columns.
-    pub const fn bytes_for(widest_cols: u32) -> Option<Payload> {
+    pub const fn cut_bytes_for(widest_cols: u32) -> Option<Payload> {
         let cols = widest_cols.next_multiple_of(STICK_ELEMS) as u64;
         Payload::new(cols * <Fp16 as DataFormat>::WORD_LENGTH as u64 * WINDOW_ROWS as u64)
     }
@@ -479,6 +540,8 @@ pub struct TpConsume {
     /// at columns that depend on which rank is which, so the bake carries one consume per rank.
     /// `None` when every rank launches it (an all-reduce's sum is the same on every rank).
     pub plays_at: Option<PlaysAt>,
+    /// The window cut the send lands in and the consume reads.
+    pub cut: WindowCut,
 }
 
 /// The one rank that launches a rank-selected consume. Minted from a [`TpIdentity`], or re-minted
