@@ -114,6 +114,11 @@ pub struct ForwardInputs<'a, Valid: Fn(usize) -> bool> {
     /// phase: prefill's `EmbedRow` reads `tokens`, decode's `ChainSeed` reads these, and neither
     /// phase's tape carries the other's step.
     pub chain_seeds: Option<&'a [usize]>,
+    /// The rank this launch's session plays as — `None` at a world of one. The chain's seeds
+    /// decompose each token through the rank's block ([`crate::wiring::chain_block`]), the same
+    /// block its staged tables were built for, so a rank seeds a token it does not hold as the
+    /// sentinel's zero row.
+    pub seat: Option<crate::bundle_code::collective::TpIdentity>,
     /// ABSOLUTE rotary position per row — a row's real position in ITS sequence, which for a
     /// decode batch is not its row index.
     pub positions: &'a [u32],
@@ -268,10 +273,11 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
         // the per-row spelling IS the solo one byte-for-byte, so the W=1
         // byte-identity rides the same construction rather than a width branch.
         let toks: Vec<u32> = toks.iter().map(|&t| t as u32).collect();
+        let block = crate::wiring::chain_block(chain.block, inp.seat);
         let words = if is_s {
-            scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks, rows)
+            scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks, rows, block)
         } else {
-            scratchy_subtile::subtile_ir::chain_l_seed(&toks, chain.hidden, rows)
+            scratchy_subtile::subtile_ir::chain_l_seed(&toks, chain.hidden, rows, block)
         };
         return Ok(Staged::U32(std::borrow::Cow::Owned(words)));
     }
@@ -940,6 +946,7 @@ mod tests {
             embed_tokens: &[],
             tokens: &[],
             chain_seeds: None,
+            seat: None,
             positions: &[],
             causal: one_row_key(),
             prefix: None,
@@ -1129,6 +1136,7 @@ mod tests {
             embed_tokens: &[0.0; 64],
             tokens: &[0],
             chain_seeds: None,
+            seat: None,
             positions: &[0],
             causal: one_row_key(),
             prefix: Some(PrefixSource::Broadcast {
