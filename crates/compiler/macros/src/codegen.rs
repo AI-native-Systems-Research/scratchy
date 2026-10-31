@@ -11393,8 +11393,14 @@ fn dump_wavefront_mega(
              // The row count THIS bundle is baked at. Not `primary_m`: a batch-ladder
              // rung is a wider bake of the same tape, and reading the env knob here
              // would tell every rung it was one row.
-             decode_rows: u32|
+             decode_rows: u32,
+             // The slice law of every source when `lwd` is one rank of a sharded world — the
+             // numeric gate runs such a bundle on both ranks at once. `None` for a world of one.
+             shards: Option<&[scratchy_subtile::tensor_parallel::SourceShard]>|
              -> (BakeOut, Vec<BakeEffect>) {
+                // Only the emulator's numeric gate reads the slice laws.
+                #[cfg(not(feature = "spyre-emu"))]
+                let _ = shards;
                 let mut fx: Vec<BakeEffect> = Vec::new();
                 let is_prefill = prefill_mq.is_some();
                 // The decode ladder's ONE-REQUEST rung: a CONCRETE single-row decode. `seq_sym`
@@ -12611,8 +12617,11 @@ fn dump_wavefront_mega(
                                                 );
                                                 // The rung under test, one fact — see
                                                 // `superdsc::GateRung`.
-                                                let gate_rung =
-                                                    superdsc::GateRung { fp: &bfp, cap };
+                                                let gate_rung = superdsc::GateRung {
+                                                    fp: &bfp,
+                                                    cap,
+                                                    shards,
+                                                };
                                                 // ⭐ THE SHIPPED BUNDLE'S OWN PIN WINDOW — read
                                                 // from its emitted layout, so the twin's minted
                                                 // programs carry the SAME `lx_window_fits` budget
@@ -13194,6 +13203,7 @@ fn dump_wavefront_mega(
                     prefill_mq,
                     active_cap,
                     decode_rows,
+                    None,
                 );
                 commit_bake(&one_rank, lwd, fx);
                 r
@@ -13249,6 +13259,48 @@ fn dump_wavefront_mega(
                 tp_lwd.input.ops.len(),
                 sf.collectives.len() - gathers,
             );
+            // ⭐ THE COLLECTIVE LEDGER — every site the analysis wove, with the op whose output it
+            // reads and the weights that op contracts, by their generated field names: what an
+            // independent placement of the same model diffs against, site by site.
+            let weights_of = |op: usize| -> Vec<String> {
+                tp_lwd.input.ops[op]
+                    .inputs
+                    .iter()
+                    .filter_map(|i| match i {
+                        scratchy_subtile::lower::InputRef::Ext(s) => tp_lwd.bindings.get(*s),
+                        scratchy_subtile::lower::InputRef::Op(_) => None,
+                    })
+                    .filter_map(|b| match b {
+                        scratchy_subtile::handoff::SourceBinding::Weight { id, index } => Some(
+                            crate::emit::weight_field_name(program, WeightId(*id), *index)
+                                .to_string(),
+                        ),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            for (k, c) in sf.collectives.iter().enumerate() {
+                // The contraction behind the read: back along the first operand through the
+                // weightless ops between it and the collective (granite's residual multiplier).
+                let mut at = c.reads;
+                while weights_of(at).is_empty() {
+                    match tp_lwd.input.ops[at].inputs.first() {
+                        Some(scratchy_subtile::lower::InputRef::Op(p)) => at = *p,
+                        _ => break,
+                    }
+                }
+                eprintln!(
+                    "[spyre-tp] {stem}: collective {k}: {:?} at op {} reading op {} ({:?}); \
+                     contracted at op {} ({:?}) over [{}]",
+                    c.kind,
+                    c.op,
+                    c.reads,
+                    tp_lwd.input.ops[c.reads].op,
+                    at,
+                    tp_lwd.input.ops[at].op,
+                    weights_of(at).join(", ")
+                );
+            }
             if gathers > 0 && tie_word_embeddings(model) {
                 // ⛔ A VISIBLE SKIP, NAMING ITS ONE CAUSE: the decode rung's chained head gathers
                 // the drawn token's embedding row on device from the TIED table — the lm head's
@@ -13271,6 +13323,7 @@ fn dump_wavefront_mega(
                     None,
                     scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                     primary_m,
+                    Some(&sf.sources),
                 );
                 commit_bake(&two_ranks, &tp_lwd, fx);
                 Some(sf.sources)
@@ -13636,7 +13689,9 @@ fn dump_wavefront_mega(
             match lowered {
                 Ok(lwd_p) => {
                     // One rung's bake, in whichever world `lwd` was lowered for.
-                    let bake_rung = |lwd: &to_wavefront::LoweredDecode, base: String| emit_bundle_deferred(
+                    let bake_rung = |lwd: &to_wavefront::LoweredDecode,
+                                     base: String,
+                                     shards: Option<&[scratchy_subtile::tensor_parallel::SourceShard]>| emit_bundle_deferred(
                         lwd,
                         base,
                         prefix_len.get(),
@@ -13670,12 +13725,13 @@ fn dump_wavefront_mega(
                         // together; that combination is not what this flag selects.
                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE,
                         1, // a prompt chunk is one request however many positions it spans
+                        shards,
                     );
-                    let (r, fx) = bake_rung(&lwd_p, format!("ktir_prefill_{stem_id}"));
+                    let (r, fx) = bake_rung(&lwd_p, format!("ktir_prefill_{stem_id}"), None);
                     // ⭐ AND THE RUNG IN THE TWO-RANK WORLD, iff that world baked its decode — a
                     // world ships whole or not at all.
                     let tp2 = tp2_sources.is_some().then(|| {
-                        let (tp_lwd, _) = scratchy_subtile::tensor_parallel::shard_lowered(
+                        let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered(
                             &lwd_p,
                             scratchy_target_spyre::tp_plan::SpyreWorld::of::<2>().analysis(),
                             scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
@@ -13683,7 +13739,11 @@ fn dump_wavefront_mega(
                         .unwrap_or_else(|e| {
                             panic!("[spyre-tp] {stem}: the two-rank prefill m={pl} is malformed — {e:?}")
                         });
-                        let (_, fx) = bake_rung(&tp_lwd, format!("ktir_prefill_tp2_{stem_id}"));
+                        let (_, fx) = bake_rung(
+                            &tp_lwd,
+                            format!("ktir_prefill_tp2_{stem_id}"),
+                            Some(&sf_p.sources),
+                        );
                         (tp_lwd, fx)
                     });
                     Ok((lwd_p, r, fx, tp2))
