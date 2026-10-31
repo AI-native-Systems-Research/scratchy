@@ -4752,13 +4752,13 @@ mod walk_on_the_card {
         );
     }
 
-    /// ⭐ A PROMPT CHUNK'S ROWS MOVE IN ONE OP A STICK COLUMN. torch-spyre's compiled prefill
-    /// gathers all 512 of a chunk's query rows in one op, each core reading its own stick of the
-    /// row index, and scatters the output the same way. The query here is stick-major, so a gather
-    /// moves one stick column; one op per column serves every row of the chunk, at every chunk
-    /// width up to 32 cores a stick of entries.
+    /// ⭐ A PROMPT CHUNK'S ROWS MOVE IN ONE OP EACH. torch-spyre's compiled prefill gathers all 512
+    /// of a chunk's query rows in one op (`sdsc_0`), each core reading its own stick of the row
+    /// index, and scatters the output the same way (`sdsc_26`). The query and the output are
+    /// stick-major here, and no index entry names a stick-major row whole, so each is laid row-major
+    /// around its one gather or scatter — never one op a stick column.
     #[test]
-    fn a_prompt_chunks_rows_move_in_one_op_a_stick_column() {
+    fn a_prompt_chunks_rows_move_in_one_op_each() {
         for (mq, hd) in [(64, 64), (512, 64), (64, 128)] {
             let node = walk_at(mq, 4, hd);
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
@@ -4772,18 +4772,8 @@ mod walk_on_the_card {
                     .filter(|e| e.walk.is_none() && e.op_name.starts_with(prefix))
                     .count()
             };
-            // 32 heads of `hd`: the query row and the output row are `32·hd/64` stick columns.
-            let columns = 32 * hd as usize / 64;
-            assert_eq!(
-                outside("gather"),
-                columns,
-                "mq={mq} hd={hd}: the query rows"
-            );
-            assert_eq!(
-                outside("scatter"),
-                columns,
-                "mq={mq} hd={hd}: the output rows"
-            );
+            assert_eq!(outside("gather"), 1, "mq={mq} hd={hd}: the query rows");
+            assert_eq!(outside("scatter"), 1, "mq={mq} hd={hd}: the output rows");
         }
     }
 
@@ -5039,9 +5029,10 @@ mod walk_on_the_card {
     }
 
     /// ⭐ THE PROMPT WALK AT A HEAD TWO STICKS WIDE, in torch-spyre's prompt trip. The query rows are
-    /// laid query-row-major before the walk — the gathered `[64, 32·128]` block through its row-major
-    /// rows into the stick-major `[64·32, 128]`, row `p·32 + h`, two whole-tensor permutes — and the
-    /// output back after it, so each contraction is ONE op over every query head, its kernel the kv
+    /// laid query-row-major before the walk — the table laid row-major, its rows gathered there, each
+    /// head's row laid stick-major into `[64·32, 128]`, row `p·32 + h`: two whole-tensor permutes —
+    /// and the output back after it (each head's row laid row-major, scattered into the output laid
+    /// row-major and back: three), so each contraction is ONE op over every query head, its kernel the kv
     /// head's block expanded once per query head of its group, and nothing re-lays a head on a trip.
     /// Each page (8 kv heads × [`PAGE_SLOTS`] slots × 128, 256 KB) is gathered in ONE op, as the
     /// reference's compiled prefill gathers it (`sdsc_4` / `sdsc_5`): its one entry the page, every kv
@@ -5071,12 +5062,12 @@ mod walk_on_the_card {
             named("heads").is_empty(),
             "no head is copied into a block of its own"
         );
-        // The whole-tensor relayouts: the query's two before the walk, the output's two after it.
+        // The whole-tensor relayouts: the query's two before the walk, the output's three after it.
         let relays = named("permute_o");
         assert_eq!(
             relays.iter().map(|&i| i < first_body).collect::<Vec<_>>(),
-            [true, true, false, false],
-            "the query's two permutes precede the walk, the output's two follow it"
+            [true, true, false, false, false],
+            "the query's two permutes precede the walk, the output's three follow it"
         );
         for &i in &relays {
             let e = &ops[i];

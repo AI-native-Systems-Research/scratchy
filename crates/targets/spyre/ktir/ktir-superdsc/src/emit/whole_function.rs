@@ -4409,35 +4409,133 @@ fn lower_function_folded(
                     if !row_outermost(gi) {
                         let g = gathers[gi];
                         let (table_rows, cols) = gather_table_dims(f, &g)?;
-                        let tid = mint_inter(k, layout, floor, src);
-                        layout.synth(crate::place::PlaceId::Act(tid), &[g.entries, cols]);
-                        let r = Region {
-                            tid,
-                            v_rows: g.entries,
-                            v_cols: cols,
-                            r_start: 0,
-                            c_start: 0,
-                            r_len: g.entries,
-                            c_len: cols,
-                            r_cover: (0, g.entries),
-                            c_cover: (0, cols),
-                            is_out: true,
-                            is_fp8: false,
-                            band: None,
+                        let sticks = cols / crate::work::FP16_ELEMS_PER_STICK;
+                        let pair = head_major_pair(f, op, &from, &to);
+                        // The stick-major `[entries, cols]` the gathered rows land in.
+                        let mint_rows = || {
+                            let tid = mint_inter(k, layout, floor, src);
+                            layout.synth(crate::place::PlaceId::Act(tid), &[g.entries, cols]);
+                            Region {
+                                tid,
+                                v_rows: g.entries,
+                                v_cols: cols,
+                                r_start: 0,
+                                c_start: 0,
+                                r_len: g.entries,
+                                c_len: cols,
+                                r_cover: (0, g.entries),
+                                c_cover: (0, cols),
+                                is_out: true,
+                                is_fp8: false,
+                                band: None,
+                            }
                         };
-                        out.extend(super::lower_ktir_to_superdsc::row_gather(
-                            f.name,
-                            &g,
-                            table_rows,
-                            cols,
-                            &r,
-                            sym_id_base,
-                            Some(layout),
-                        )?);
+                        // ⭐ THE ROWS IN ONE GATHER, as torch-spyre gathers a chunk's query rows (its
+                        // compiled prefill's `sdsc_0`: every row's every head in one op, the value
+                        // read row-major). A row of this stick-major table is `sticks` runs
+                        // `table_rows` sticks apart, which no index entry names whole, so the table
+                        // is laid row-major first and the rows gathered from there. The prompt
+                        // trip's query-row-major frame reads them as gathered (below); anything
+                        // else, laid back stick-major.
+                        let rows_major = if table_rows > 1 && sticks > 1 {
+                            let table = Region {
+                                tid: g.value_tid,
+                                v_rows: table_rows,
+                                v_cols: cols,
+                                r_start: 0,
+                                c_start: 0,
+                                r_len: table_rows,
+                                c_len: cols,
+                                r_cover: (0, table_rows),
+                                c_cover: (0, cols),
+                                is_out: false,
+                                is_fp8: false,
+                                band: None,
+                            };
+                            let table_rows_major = row_major_region(
+                                mint_scratch(k, layout, floor, src, 8),
+                                table_rows * sticks,
+                                layout,
+                            );
+                            out.push(permute(
+                                f.name,
+                                &table,
+                                &table_rows_major,
+                                Permuted::whole((table_rows, sticks)),
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            let gathered = row_major_region(
+                                mint_scratch(k, layout, floor, src, 9),
+                                g.entries * sticks,
+                                layout,
+                            );
+                            out.extend(super::lower_ktir_to_superdsc::page_gather(
+                                f.name,
+                                &super::lower_ktir_to_superdsc::Gather {
+                                    value_tid: table_rows_major.tid,
+                                    ..g
+                                },
+                                (sticks, 1),
+                                &gathered,
+                                None,
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            Some(Region {
+                                is_out: false,
+                                ..gathered
+                            })
+                        } else {
+                            None
+                        };
                         gather_carried[gi] = true;
-                        let r = Region { is_out: false, ..r };
-                        inter.insert(src, r);
-                        if let Some((t_res, frame, sticks)) = head_major_pair(f, op, &from, &to) {
+                        let query_row_major = heads_inner && pair.is_some();
+                        let r = match rows_major {
+                            Some(_) if query_row_major => None,
+                            Some(gathered) => {
+                                let r = mint_rows();
+                                out.push(permute(
+                                    f.name,
+                                    &gathered,
+                                    &r,
+                                    Permuted::whole((g.entries, sticks)),
+                                    crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                                    sym_id_base,
+                                    Some(layout),
+                                )?);
+                                Some(r)
+                            }
+                            None => {
+                                let r = mint_rows();
+                                out.extend(super::lower_ktir_to_superdsc::row_gather(
+                                    f.name,
+                                    &g,
+                                    table_rows,
+                                    cols,
+                                    &r,
+                                    sym_id_base,
+                                    Some(layout),
+                                )?);
+                                Some(r)
+                            }
+                        }
+                        .map(|r| Region { is_out: false, ..r });
+                        if let Some(r) = r {
+                            inter.insert(src, r);
+                        }
+                        // Every frame but the prompt trip's query-row-major one reads the rows
+                        // stick-major.
+                        let stick_rows = || {
+                            r.ok_or_else(|| Error {
+                                message: format!(
+                                    "{}: the gathered rows were laid only query-row-major",
+                                    f.name
+                                ),
+                            })
+                        };
+                        if let Some((t_res, frame, sticks)) = pair {
                             let r2 = if heads_inner {
                                 // The prompt trip's frame: each query row's heads together.
                                 let rows = from[0] as u32;
@@ -4446,34 +4544,74 @@ fn lower_function_folded(
                                     heads: frame[0] / rows,
                                     sticks,
                                 };
-                                let m = Minter { k, layout, floor };
-                                let (ops, r2) =
-                                    heads_inner_pair(m, res, f.name, &r, block, true, sym_id_base)?;
-                                out.extend(ops);
                                 heads_rows = Some(rows);
-                                r2
+                                match (rows_major, r) {
+                                    // Gathered row-major, a query row's heads ARE its per-head
+                                    // rows `p·H + h`: one stick a head, that frame's own bytes;
+                                    // wider, each head's row laid stick-major.
+                                    (Some(gathered), _) if sticks == 1 => gathered,
+                                    (Some(gathered), _) => {
+                                        let tid = mint_inter(k, layout, floor, res);
+                                        let dst = stick_major_region(
+                                            tid,
+                                            rows * block.heads,
+                                            sticks,
+                                            layout,
+                                        );
+                                        out.push(permute(
+                                            f.name,
+                                            &gathered,
+                                            &dst,
+                                            Permuted::whole((rows * block.heads, sticks)),
+                                            crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                                            sym_id_base,
+                                            Some(layout),
+                                        )?);
+                                        Region {
+                                            is_out: false,
+                                            ..dst
+                                        }
+                                    }
+                                    (None, Some(r)) => {
+                                        let m = Minter { k, layout, floor };
+                                        let (ops, r2) = heads_inner_pair(
+                                            m,
+                                            res,
+                                            f.name,
+                                            &r,
+                                            block,
+                                            true,
+                                            sym_id_base,
+                                        )?;
+                                        out.extend(ops);
+                                        r2
+                                    }
+                                    (None, None) => {
+                                        return err(format!(
+                                            "{}: the gathered query rows landed in no buffer",
+                                            f.name
+                                        ));
+                                    }
+                                }
                             } else if sticks > 1 {
                                 let tid = mint_inter(k, layout, floor, res);
                                 let dst = stick_major_region(tid, frame[0], sticks, layout);
                                 out.extend(
-                                    HeadMajorCopies::of(&r, &dst, frame[0], sticks)?.to_heads(
-                                        f.name,
-                                        sym_id_base,
-                                        layout,
-                                    )?,
+                                    HeadMajorCopies::of(&stick_rows()?, &dst, frame[0], sticks)?
+                                        .to_heads(f.name, sym_id_base, layout)?,
                                 );
                                 Region {
                                     is_out: false,
                                     ..dst
                                 }
                             } else {
-                                reframed(r, frame)
+                                reframed(stick_rows()?, frame)
                             };
                             inter.insert(res, r2);
                             inter.insert(t_res, r2);
                             head_major_skip.insert(t_res);
                         } else if same_card_bytes(&from, &to) {
-                            inter.insert(res, reframed(r, flat_frame(&to)));
+                            inter.insert(res, reframed(stick_rows()?, flat_frame(&to)));
                         } else if let Some((rows, sticks)) = stick_major_split(&from, &to) {
                             // ⭐ THE GATHERED ROWS' ROW-MAJOR SPLIT — spyre-inference's
                             // `query.index_select(0, rep_row_ids).reshape(entries, KV, G, D)`: the
@@ -4484,7 +4622,7 @@ fn lower_function_folded(
                             let dst = row_major_region(tid, rows * sticks, layout);
                             out.push(permute(
                                 f.name,
-                                &r,
+                                &stick_rows()?,
                                 &dst,
                                 Permuted::whole((rows, sticks)),
                                 crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
@@ -4510,7 +4648,7 @@ fn lower_function_folded(
                             let dst = stick_major_region(tid, rows, sticks, layout);
                             out.push(permute(
                                 f.name,
-                                &r,
+                                &stick_rows()?,
                                 &dst,
                                 Permuted::whole((rows, sticks)),
                                 crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
@@ -4537,7 +4675,7 @@ fn lower_function_folded(
                             );
                             out.push(permute(
                                 f.name,
-                                &r,
+                                &stick_rows()?,
                                 &mid,
                                 Permuted::whole((h.rows, h.row_sticks)),
                                 crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
@@ -4959,6 +5097,127 @@ fn lower_function_folded(
                          after another, as a stick-major frame",
                         f.name, source.tid
                     ));
+                }
+                // ⭐ THE ROWS IN ONE SCATTER, as torch-spyre scatters a chunk's output rows (its
+                // compiled prefill's `sdsc_26`: every row's every head in one op). The prompt trip's
+                // query-row-major rows ARE the output's rows laid row-major — at one stick a head the
+                // same bytes, wider each head's row laid row-major first — while the destination is
+                // stick-major, whose rows no index entry names whole: so the destination is laid
+                // row-major, the rows scattered into it, and it is laid back.
+                if let Some(layout) = layout
+                    && heads_inner
+                    && let Some(sc) = indirect_store_of(k, r_res)?
+                    && sc.value_rows > 1
+                    && sc.cols > crate::work::FP16_ELEMS_PER_STICK
+                {
+                    let stick = crate::work::FP16_ELEMS_PER_STICK;
+                    let col_sticks = sc.cols / stick;
+                    if source.v_rows * sticks != sc.entries * col_sticks {
+                        return err(format!(
+                            "{}: query-row-major rows t{} `[{}, {}]` scattered as {} rows of {}",
+                            f.name, source.tid, source.v_rows, source.v_cols, sc.entries, sc.cols
+                        ));
+                    }
+                    let rows_major = if sticks == 1 {
+                        source
+                    } else {
+                        let tid = mint_scratch(k, layout, floor, r_res, 1);
+                        let mid = row_major_region(tid, source.v_rows * sticks, layout);
+                        out.push(permute(
+                            f.name,
+                            &source,
+                            &mid,
+                            Permuted::whole((source.v_rows, sticks)),
+                            crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                            sym_id_base,
+                            Some(layout),
+                        )?);
+                        Region {
+                            is_out: false,
+                            ..mid
+                        }
+                    };
+                    let dest = Region {
+                        tid: sc.value_tid,
+                        v_rows: sc.value_rows,
+                        v_cols: sc.cols,
+                        r_start: 0,
+                        c_start: 0,
+                        r_len: sc.value_rows,
+                        c_len: sc.cols,
+                        r_cover: (0, sc.value_rows),
+                        c_cover: (0, sc.cols),
+                        is_out: false,
+                        is_fp8: false,
+                        band: None,
+                    };
+                    let dest_rows = row_major_region(
+                        mint_scratch(k, layout, floor, r_res, 2),
+                        sc.value_rows * col_sticks,
+                        layout,
+                    );
+                    out.push(permute(
+                        f.name,
+                        &dest,
+                        &dest_rows,
+                        Permuted::whole((sc.value_rows, col_sticks)),
+                        crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                        sym_id_base,
+                        Some(layout),
+                    )?);
+                    for (i, (first, entries)) in
+                        super::lower_ktir_to_superdsc::index_runs(sc.entries)
+                            .into_iter()
+                            .enumerate()
+                    {
+                        let base = crate::superdsc_opspec::EntryBase::of_entries(
+                            sc.first_entry.entries() + first,
+                        )
+                        .map_err(|message| Error {
+                            message: format!("{}: {message}", f.name),
+                        })?;
+                        out.push(
+                            crate::ir::bridge::tiled_op_sdsc_op::assemble_scatter_copy(
+                                &format!("scatter{i}_o{}", sc.value_tid),
+                                &rows_major.name(),
+                                &dest_rows.name(),
+                                crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                                    crate::place::act_name(sc.index_tid),
+                                    crate::superdsc_opspec::PageExtent::of_positions(col_sticks),
+                                    base,
+                                ),
+                                crate::ir::bridge::tiled_op_sdsc_op::ScatterCopySpec {
+                                    rows: entries * col_sticks,
+                                    cols: stick,
+                                    df: crate::superdsc_opspec::Df::Fp16,
+                                    src_elems: first * col_sticks * stick,
+                                    dst_elems: 0,
+                                },
+                                sym_id_base,
+                                Some(layout),
+                            )
+                            .map_err(|message| Error {
+                                message: format!("{}: {message}", f.name),
+                            })?,
+                        );
+                    }
+                    out.push(permute(
+                        f.name,
+                        &Region {
+                            is_out: false,
+                            ..dest_rows
+                        },
+                        &Region {
+                            is_out: true,
+                            ..dest
+                        },
+                        Permuted::whole((sc.value_rows, col_sticks)),
+                        crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                        sym_id_base,
+                        Some(layout),
+                    )?);
+                    head_major_skip.insert(r_res);
+                    continue;
                 }
                 let r = match layout {
                     // The prompt trip's frame back: each query row's heads together, into the
