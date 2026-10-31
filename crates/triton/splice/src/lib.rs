@@ -4832,6 +4832,88 @@ mod walk_on_the_card {
         }
     }
 
+    /// ⭐ A WALK'S TRIPS UNROLLED INTO ONE LAUNCH, as dxp unrolls torch-spyre's walk. Four trips of a
+    /// 23-op body fit a 128-descriptor launch group: the body four times over, relaunched once, copy `t`
+    /// reading the activation segment (the step's page-table row and mask tile) `t` steps further in
+    /// and every other address where the bake placed it.
+    #[test]
+    fn a_walks_trips_unroll_into_one_launch() {
+        use ktir_superdsc::emit::loop_fold::{WalkTrips, unroll_walk};
+        let addrs = |e: &ktir_superdsc::emit::EmittedOp| -> Vec<u64> {
+            let v = serde_json::to_value(e.op.as_ref().expect("a descriptor")).expect("json");
+            let mut out = Vec::new();
+            for m in v["dscs_"].as_array().expect("dscs") {
+                for dsc in m.as_object().expect("a map").values() {
+                    for n in dsc["scheduleTree_"].as_array().expect("a tree") {
+                        if n["nodeType_"] == "allocate" && n["component_"] == "hbm" {
+                            for a in n["startAddressCoreCorelet_"]["data_"]
+                                .as_object()
+                                .expect("addresses")
+                                .values()
+                            {
+                                out.push(
+                                    a.as_str().expect("an address").parse().expect("a number"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let segment = 0x4_0000_0000u64;
+        let activation = 3 * segment..4 * segment;
+        for mq in [1, 128] {
+            let node = walk_at(mq, 4, 64);
+            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            let mut sym = 0i64;
+            let ops =
+                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                    .unwrap_or_else(|e| panic!("mq={mq}: the walk lowers: {}", e.message));
+            let body: Vec<_> = ops.iter().filter(|e| e.walk.is_some()).cloned().collect();
+            let walk = body[0].walk.expect("a walk");
+            assert_eq!(walk.trips, 4, "mq={mq}: four pages, four trips");
+            let unrolled = unroll_walk(ops.clone(), 128);
+            let copies: Vec<_> = unrolled.iter().filter(|e| e.walk.is_some()).collect();
+            assert_eq!(
+                copies.len(),
+                4 * body.len(),
+                "mq={mq}: the body four times over"
+            );
+            assert_eq!(
+                unrolled.len() - copies.len(),
+                ops.len() - body.len(),
+                "mq={mq}: and nothing else repeated"
+            );
+            for c in &copies {
+                assert_eq!(
+                    c.walk,
+                    Some(WalkTrips {
+                        trips: 1,
+                        step_bytes: 4 * walk.step_bytes
+                    }),
+                    "mq={mq} {}: one launch of four steps",
+                    c.op_name
+                );
+            }
+            let mut stepped = 0;
+            for (i, c) in copies.iter().enumerate() {
+                let (t, e) = (i / body.len(), &body[i % body.len()]);
+                for (a0, at) in addrs(e).into_iter().zip(addrs(c)) {
+                    let expect = if activation.contains(&a0) {
+                        stepped += 1;
+                        a0 + t as u64 * u64::from(walk.step_bytes)
+                    } else {
+                        a0
+                    };
+                    assert_eq!(at, expect, "mq={mq} trip {t} {}", c.op_name);
+                }
+            }
+            assert!(stepped > 0, "mq={mq}: the body reads the step's tables");
+        }
+    }
+
     /// ⭐⭐ THE PROMPT TRIP IN torch-spyre's FORM — its compiled prefill's: the query rows split across
     /// the cores, each core holding whole query rows of every head (row `p·32 + h`), the scores and
     /// the value product each ONE contraction over every query head against the kv head's block

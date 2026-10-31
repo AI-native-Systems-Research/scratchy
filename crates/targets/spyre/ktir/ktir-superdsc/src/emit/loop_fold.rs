@@ -132,6 +132,57 @@ fn indirect_anchor_var(tile: &Operation<'_>) -> Option<usize> {
     }
 }
 
+/// ⭐ A WALK'S BODY UNROLLED INTO ITS LAUNCH, AS dxp UNROLLS torch-spyre's. torch-spyre states its
+/// walk as a device `scf.for` over the trips in one bundle, and dxp unrolls that loop at compile time
+/// (MEASURED on the reference's compiled prefill bundle: its binary grows by one trip's code per
+/// trip of the loop bound — 204 KB at 2 trips, 527 KB at 8), so every trip runs inside ONE launch.
+/// Our walk relaunches its body group once a trip instead. This puts `u` trips in each launch: the
+/// body's descriptors `u` times over, copy `t` reading the activation segment `t · step` further in
+/// (the shift the relaunch applies to it, `fold_plan::seg_deltas`' walk arm — the step's page-table
+/// row and mask tile are the only tensors a body reads there), and the walk relaunched `trips / u`
+/// times at `u` steps a launch. `u` is the largest power of two that divides the trip count and keeps
+/// the unrolled body within `max_descriptors` (a launch group's bound).
+pub fn unroll_walk(ops: Vec<super::EmittedOp>, max_descriptors: usize) -> Vec<super::EmittedOp> {
+    let (Some(first), Some(last)) = (
+        ops.iter().position(|e| e.walk.is_some()),
+        ops.iter().rposition(|e| e.walk.is_some()),
+    ) else {
+        return ops;
+    };
+    let Some(walk) = ops[first].walk else {
+        return ops;
+    };
+    let body_descriptors: usize = ops[first..=last]
+        .iter()
+        .map(|e| e.time.max(1) as usize)
+        .sum();
+    let mut u = 1u32;
+    while walk.trips.is_multiple_of(2 * u) && body_descriptors * 2 * u as usize <= max_descriptors {
+        u *= 2;
+    }
+    if u == 1 {
+        return ops;
+    }
+    let folded = WalkTrips {
+        trips: walk.trips / u,
+        step_bytes: walk.step_bytes * u,
+    };
+    let activation = crate::placement::SegRole::Activation.segment();
+    let mut ops = ops;
+    let tail = ops.split_off(last + 1);
+    let body = ops.split_off(first);
+    for t in 0..u {
+        let shift = u64::from(t) * u64::from(walk.step_bytes);
+        ops.extend(body.iter().map(|e| {
+            let mut c = e.shifted_in_segment(activation, shift);
+            c.walk = Some(folded);
+            c
+        }));
+    }
+    ops.extend(tail);
+    ops
+}
+
 /// Whether `k` walks — states a top-level `scf.for` — whatever it computes. A walk's windows are
 /// read at trip 0 ([`flatten`]); a straight-line program's at the top level.
 pub fn walks(k: &KtirNode) -> bool {

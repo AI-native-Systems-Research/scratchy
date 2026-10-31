@@ -7439,6 +7439,10 @@ fn ktir_groups_via_superdsc(
             .map_err(|err| {
                 SuperDscError(format!("{}: KTIR -> SuperDSC: {}", e.op_name, err.message))
             })?;
+        // A walk's trips, as many as one launch group holds, in each launch (as dxp unrolls
+        // torch-spyre's walk into its one).
+        let lowered =
+            ktir_superdsc::emit::loop_fold::unroll_walk(lowered, GroupSize::PRODUCTION.trips());
         drop(_pc_cls);
         crate::pc::count(crate::pc::mint_class(&e.op_name), lowered.len() as u64);
         // ⭐ PER-PROGRAM ATTRIBUTION, because a TRIP IS NOT A DESCRIPTOR. `render_dxp_input`

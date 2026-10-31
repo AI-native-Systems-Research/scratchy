@@ -2730,6 +2730,40 @@ impl EmittedOp {
             .collect()
     }
 
+    /// This op with every HBM tensor it places in `segment` read `bytes` further in — the shift a
+    /// relaunch of its group applies to that segment's base, made at compile time. LX tensors and
+    /// every other segment keep their addresses.
+    pub fn shifted_in_segment(&self, segment: usize, bytes: u64) -> EmittedOp {
+        let mut e = self.clone();
+        let size = crate::wire::SEGMENT_SIZE;
+        let Some(window) = crate::wire::SEGMENT_OFFSETS
+            .get(segment)
+            .map(|&b| b..b + size)
+        else {
+            return e;
+        };
+        if let Some(op) = e.op.as_mut() {
+            for dsc_map in op.dscs_.iter_mut() {
+                for dsc in dsc_map.values_mut() {
+                    for node in dsc
+                        .scheduleTree_
+                        .iter_mut()
+                        .filter(|n| n.component_ == "hbm")
+                    {
+                        for v in node.startAddressCoreCorelet_.data_.values_mut() {
+                            if let Ok(a) = v.parse::<u64>()
+                                && window.contains(&a)
+                            {
+                                *v = (a + bytes).to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        e
+    }
+
     /// An op that carries ONLY its program.
     ///
     /// ⛔ EVERY OTHER FIELD IS THE SuperDSC DESCRIPTOR'S. `arg_bindings`, `affine_strides`, the
