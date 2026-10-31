@@ -429,6 +429,98 @@ use scratchy_serving_worker::worker_factory::{
     Draft, ProgressCallback, VerifySeqs, WorkerCreationResult, WorkerFactory,
 };
 
+/// ⭐ RANKS AS PROCESSES. A spyre card is driven by one runtime per process, so each rank of a sharded
+/// spyre world is its own process, and `--node-rank` names it: rank 0 serves (the one-process stack,
+/// whose executor steps every follower over the TCP control channel) and every other rank runs
+/// headless ([`initialize_and_run_spyre_follower`]). That channel carries only each step's schedule:
+/// the activations move card to card, in the card's own control-block stream.
+fn spyre_rank_processes(config: &VllmConfig) -> bool {
+    cfg!(feature = "spyre-hw") && config.tensor_parallel_size > 1
+}
+
+/// This process's tensor-parallel `(rank, world)`: its `--node-rank` of a spyre world, else the
+/// one-process world every other path through [`create_worker`] runs.
+fn process_rank(config: &VllmConfig) -> (usize, usize) {
+    if spyre_rank_processes(config) {
+        (config.node_rank, config.tensor_parallel_size)
+    } else {
+        (0, 1)
+    }
+}
+
+/// Rank 0's side of a spyre world's control channel — `None` everywhere else.
+#[cfg(feature = "spyre-hw")]
+type Followers = Option<scratchy_serving_transport::TcpControlChannel>;
+#[cfg(not(feature = "spyre-hw"))]
+type Followers = Option<std::convert::Infallible>;
+
+/// Rank 0 accepts its followers' control connections BEFORE it loads, so the channel is up while
+/// every rank spends its minutes loading.
+fn accept_followers(config: &VllmConfig) -> Result<Followers> {
+    #[cfg(feature = "spyre-hw")]
+    if spyre_rank_processes(config) {
+        info!(
+            "Spyre rank 0 of {}: accepting the followers' control channel on {}:{}",
+            config.tensor_parallel_size, config.master_addr, config.master_port
+        );
+        return scratchy_serving_transport::TcpControlChannel::establish(
+            0,
+            config.tensor_parallel_size,
+            &config.master_addr,
+            config.master_port,
+        )
+        .map(Some)
+        .context("failed to establish the spyre control channel");
+    }
+    let _ = config;
+    Ok(None)
+}
+
+/// Rank 0, loaded and linked, holds its first step until every follower is too: a card's first
+/// collective send must not land in a peer that has not yet programmed its window.
+fn await_followers(followers: &mut Followers) -> Result<()> {
+    #[cfg(feature = "spyre-hw")]
+    if let Some(channel) = followers {
+        channel
+            .await_ready()
+            .context("a spyre follower never reported ready")?;
+        info!("Spyre rank 0: every follower is loaded and linked");
+    }
+    let _ = followers;
+    Ok(())
+}
+
+/// Tell every follower what rank 0 is about to do itself.
+fn tell_followers(
+    followers: &mut Followers,
+    msg: scratchy_serving_worker::multinode::ControlMessage,
+) -> Result<()> {
+    #[cfg(feature = "spyre-hw")]
+    if let Some(channel) = followers {
+        msg.broadcast(channel)
+            .context("failed to broadcast to the spyre followers")?;
+    }
+    let _ = (followers, msg);
+    Ok(())
+}
+
+/// The executor rank 0 serves through: its own, stepping every follower first when it has any.
+fn stepping_followers(
+    executor: UniProcExecutor,
+    followers: Followers,
+) -> Box<dyn scratchy_serving_engine::executor::Executor> {
+    match followers {
+        #[cfg(feature = "spyre-hw")]
+        Some(channel) => Box::new(scratchy_serving_worker::multinode::MultiNodeExecutor::new(
+            Box::new(executor),
+            channel,
+        )),
+        #[cfg(not(feature = "spyre-hw"))]
+        Some(never) => match never {},
+        None => Box::new(executor),
+    }
+}
+
 /// Create the appropriate worker via the `WorkerFactory` inventory registry.
 ///
 /// Builds the shared [`WorkerCreateConfig`] once, then selects the first
@@ -455,6 +547,7 @@ fn create_worker(
     } else {
         0
     };
+    let (tp_rank, tp_world_size) = process_rank(config);
 
     let worker_config = WorkerCreateConfig {
         model_path: model_path.clone(),
@@ -489,8 +582,8 @@ fn create_worker(
         gpu_memory_utilization: config.gpu_memory_utilization,
         pooling_strategy: config.pooling_strategy.clone(),
         is_pooling,
-        tp_rank: 0,
-        tp_world_size: 1,
+        tp_rank,
+        tp_world_size,
         pp_rank: 0,
         pp_size: 1,
         gguf_file: config.gguf_file.clone(),
@@ -1468,9 +1561,11 @@ fn initialize_core(
     let tp_size = config.tensor_parallel_size;
 
     // TP > 1: multi-GPU path with NCCL.
-    if tp_size > 1 {
+    if tp_size > 1 && !spyre_rank_processes(config) {
         return initialize_core_tp(config, speculation);
     }
+    // A spyre world's rank 0 (see `spyre_rank_processes`).
+    let mut followers = accept_followers(config)?;
 
     let model_path = config.model.clone();
     let model_name = extract_model_name(&model_path).into_owned();
@@ -1509,6 +1604,7 @@ fn initialize_core(
 
     let (mut worker, hf_config, model_dir, model_dtype) =
         create_worker(config, speculation, model_path, progress)?;
+    await_followers(&mut followers)?;
 
     if let Some(arch) = worker.architecture() {
         info!("Resolved model architecture: {}", arch);
@@ -1556,6 +1652,14 @@ fn initialize_core(
         config.max_model_len,
         max_model_len,
     )?;
+    // Every follower's pool is cut to rank 0's block count, so one scheduler addresses them all.
+    tell_followers(
+        &mut followers,
+        scratchy_serving_worker::multinode::ControlMessage::InitCache {
+            num_gpu_blocks,
+            num_cpu_blocks: 0,
+        },
+    )?;
     // Capture the target-reactive prefill-bucket cap before `worker` is moved
     // into the engine below — used to clamp the scheduler's batched-token bound.
     let worker_prefill_bucket_max_m = worker.prefill_bucket_max_m();
@@ -1590,11 +1694,16 @@ fn initialize_core(
     if let Some(pb) = progress {
         pb.set_stage("Warming up model");
     }
+    // A warm-up forward runs every collective, so the followers run theirs alongside.
+    tell_followers(
+        &mut followers,
+        scratchy_serving_worker::multinode::ControlMessage::Warmup,
+    )?;
     worker
         .compile_or_warm_up_model()
         .context("failed to compile or warm up model")?;
 
-    let executor = UniProcExecutor::new_pre_initialized(worker);
+    let executor = stepping_followers(UniProcExecutor::new_pre_initialized(worker), followers);
 
     let eos_token_ids: Vec<u32> = resolve_eos_token_ids(
         &hf_config,
@@ -1697,7 +1806,7 @@ fn initialize_core(
         hybrid_kv: swa_hybrid_kv,
     };
 
-    let client = InprocClient::new(engine_config, Box::new(executor));
+    let client = InprocClient::new(engine_config, executor);
 
     let loaded_tokenizer = preloaded_tokenizer.or_else(|| {
         model_dir
@@ -2169,10 +2278,22 @@ pub fn initialize_stack(
         return initialize_stack_external(config, &speculation, model_name, init_start);
     }
 
+    // A spyre rank is a process (see `spyre_rank_processes`): rank 0 serves through the one-process
+    // stack below, which steps its followers itself; every other rank runs headless.
+    if spyre_rank_processes(config) && config.node_rank != 0 {
+        anyhow::bail!(
+            "rank {} of a {}-rank spyre world serves nothing: it runs headless \
+             (`initialize_and_run_spyre_follower`)",
+            config.node_rank,
+            tp_size
+        );
+    }
+
     // Multi-node TP ("mp" backend): leader runs engine+scheduler, followers
     // run headless. TCP for control plane, NCCL for data plane.
     // Followers (node_rank > 0) should use `initialize_and_run_follower` instead.
-    if (config.num_nodes > 1 || config.distributed_executor_backend == "mp")
+    if !spyre_rank_processes(config)
+        && (config.num_nodes > 1 || config.distributed_executor_backend == "mp")
         && config.node_rank == 0
     {
         return initialize_stack_multinode(config, &speculation, model_name, init_start);
@@ -2186,11 +2307,11 @@ pub fn initialize_stack(
     }
 
     // TP > 1: multi-GPU path with NCCL (in-process, thread-per-GPU).
-    if tp_size > 1 {
+    if tp_size > 1 && !spyre_rank_processes(config) {
         return initialize_stack_tp(config, &speculation, model_name, init_start);
     }
 
-    // TP=1: single-GPU path.
+    // TP=1: single-GPU path — and a spyre world's rank 0, whose executor steps its followers.
     progress.set_stage("Initializing backend");
     // Online-server context → keep the (smaller) server batch defaults.
     let core = initialize_core(config, &speculation, Some(&progress), false)?;
@@ -2570,6 +2691,45 @@ fn initialize_stack_multinode(
             max_model_len,
         })
     }
+}
+
+/// Whether this process is a follower rank of a spyre world — see [`spyre_rank_processes`].
+pub fn is_spyre_follower(config: &VllmConfig) -> bool {
+    spyre_rank_processes(config) && config.node_rank > 0
+}
+
+/// ⭐ A FOLLOWER RANK OF A SPYRE WORLD: load this rank's share of the model on its own card, link
+/// the peer card, tell rank 0 it is ready, then run each step rank 0 sends — its collectives meet
+/// rank 0's card to card. Returns when rank 0 shuts the world down or the channel drops.
+#[cfg(feature = "spyre-hw")]
+pub fn initialize_and_run_spyre_follower(config: &VllmConfig) -> Result<()> {
+    let speculation = resolve_speculative_decoding(config)?;
+    if !is_spyre_follower(config) {
+        anyhow::bail!(
+            "rank {} of a {}-rank world is not a spyre follower",
+            config.node_rank,
+            config.tensor_parallel_size
+        );
+    }
+    let (rank, world) = process_rank(config);
+    info!(
+        "Spyre rank {rank} of {world}: connecting to rank 0's control channel at {}:{}",
+        config.master_addr, config.master_port
+    );
+    // The channel first: rank 0 accepts it before loading, so every rank loads at once.
+    let mut channel = scratchy_serving_transport::TcpControlChannel::establish(
+        rank,
+        world,
+        &config.master_addr,
+        config.master_port,
+    )
+    .context("failed to reach rank 0's control channel")?;
+    let (worker, _, _, _) = create_worker(config, &speculation, config.model.clone(), None)?;
+    channel
+        .report_ready()
+        .context("failed to report ready to rank 0")?;
+    info!("Spyre rank {rank} of {world}: loaded and linked; following rank 0");
+    crate::headless::run_headless(UniProcExecutor::new_pre_initialized(worker), channel)
 }
 
 /// Initialize a follower node and run the headless worker loop.

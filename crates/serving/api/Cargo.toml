@@ -27,7 +27,9 @@ spyre = ["scratchy-serving-worker/spyre"]
 # the plain `spyre` above (mirroring the worker's own feature tree, where they are its
 # children): the api-side cfg that keys "a spyre backend" — e.g. init_cache's budget triage —
 # must see BOTH tiers, never only the card.
-spyre-hw = ["spyre", "scratchy-serving-worker/spyre-hw"]
+# The card tier runs one process per rank (one runtime per process), stepped by the leader over the
+# TCP control channel; the activations themselves move card to card.
+spyre-hw = ["spyre", "dep:scratchy-serving-transport", "scratchy-serving-worker/spyre-hw"]
 spyre-emu = ["spyre", "scratchy-serving-worker/spyre-emu"]
 guided-decoding = ["scratchy-serving-worker/guided-decoding"]
 multimodal = ["scratchy-core-model/multimodal", "dep:image", "dep:scratchy-vision", "scratchy-forward-compiler/vision", "scratchy-serving-worker/vision"]

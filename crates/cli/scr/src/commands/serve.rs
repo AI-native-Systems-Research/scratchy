@@ -185,6 +185,20 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         .expect("initialize_and_run_follower panicked");
     }
 
+    // A follower rank of a spyre world: its own card, stepped by rank 0; no engine, no HTTP server.
+    #[cfg(feature = "spyre-hw")]
+    if scratchy_serving_api::init::is_spyre_follower(&config) {
+        info!(
+            "Spyre rank {} of {}: entering headless mode",
+            config.node_rank, config.tensor_parallel_size
+        );
+        return tokio::task::spawn_blocking(move || {
+            scratchy_serving_api::init::initialize_and_run_spyre_follower(&config)
+        })
+        .await
+        .expect("initialize_and_run_spyre_follower panicked");
+    }
+
     // Keep a clone for /server_info (before we move config into the blocking task).
     let scratchy_core_config_snapshot = config.clone();
 
