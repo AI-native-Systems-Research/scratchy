@@ -1576,6 +1576,8 @@ pub struct PeerLink {
     me: TpIdentity,
     route: PeerRoute,
     window: RecvWindow,
+    /// The window's first byte as the allocator places it — set once, by [`point_landing_slots`].
+    landing: OnceLock<u64>,
 }
 
 impl PeerLink {
@@ -1592,6 +1594,55 @@ impl PeerLink {
     /// Where the peer's sends land on this card.
     pub fn window(&self) -> RecvWindow {
         self.window
+    }
+
+    /// The window's first byte as the allocator placed it on this card — `None` until
+    /// [`point_landing_slots`] has pointed the slots at it.
+    pub fn landing(&self) -> Option<u64> {
+        self.landing.get().copied()
+    }
+}
+
+/// The ranks of a world place their receive windows at different device addresses. A send names
+/// its own window's address for its peer's (the two cards allocate one sequence), so this world
+/// would send to addresses its peers do not land at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowsApart {
+    pub own: Option<u64>,
+    pub peers: Vec<Option<u64>>,
+}
+
+impl fmt::Display for WindowsApart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "this rank's receive window lands at {:x?}, but its peers' land at {:x?} — every rank \
+             of a world must place its window at one address, which each send names for its peer's",
+            self.own, self.peers
+        )
+    }
+}
+
+impl std::error::Error for WindowsApart {}
+
+/// ⭐ EVERY RANK'S WINDOW AT ONE ADDRESS — checked, not assumed. A send's xseg word names the
+/// sender's own window address for the peer's (`flex_rs::scheduler::build_rdma_send_cb`), which is right
+/// only while both cards place the window identically; the followers report theirs with their
+/// ready frame, and the leader holds its first step until this passes.
+///
+/// # Errors
+/// [`WindowsApart`]: any peer's landing address that is not this rank's, or a rank with none.
+pub fn refuse_if_windows_apart(
+    own: Option<u64>,
+    peers: &[Option<u64>],
+) -> Result<(), WindowsApart> {
+    if own.is_some() && peers.iter().all(|p| *p == own) {
+        Ok(())
+    } else {
+        Err(WindowsApart {
+            own,
+            peers: peers.to_vec(),
+        })
     }
 }
 
@@ -1645,7 +1696,12 @@ pub fn link_peer(
             why,
         }
     })?;
-    let link: &'static PeerLink = Box::leak(Box::new(PeerLink { me, route, window }));
+    let link: &'static PeerLink = Box::leak(Box::new(PeerLink {
+        me,
+        route,
+        window,
+        landing: OnceLock::new(),
+    }));
     *cell = Some(link);
     Ok(link)
 }
@@ -1675,6 +1731,23 @@ pub fn point_landing_slots(link: &PeerLink, window_region: &DevAddr) -> Result<(
             .map_err(|e| AttachRefusal::BringUp(format!("{e:?}")))?,
     );
     let cap = crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES;
+    let landing = flex_rs::scheduler::landing_va_bytes(
+        &resolver,
+        &RdmaOperand {
+            base: window_region.0.clone(),
+            segment: RecvWindow::SEGMENT as u8,
+            offset: link.window.offset(),
+        },
+        link.window.size(),
+    )
+    .map_err(|e| AttachRefusal::Xseg(e.to_string()))?;
+    if link.landing.get().is_some_and(|l| *l != landing) {
+        return Err(AttachRefusal::Xseg(format!(
+            "the window is pointed at 0x{landing:x}, but this process already pointed it at {:x?}",
+            link.landing.get()
+        )));
+    }
+    let _ = link.landing.set(landing);
     let mut pointed: Vec<String> = Vec::new();
     for (slot, at) in link.window.slots() {
         // The slot's own extent: one message, or the cut's remainder for its last.
@@ -1781,6 +1854,25 @@ mod tests {
         }
         let alone = TpWorld::of::<1>().ranks().next().unwrap();
         assert_eq!(PeerRoute::of(alone), None);
+    }
+
+    /// A world runs only when every rank's window lands at this rank's address: one peer elsewhere,
+    /// or a rank that pointed none, refuses by name with every address.
+    #[test]
+    fn a_world_whose_windows_land_apart_refuses() {
+        let a = Some(0x4_c842_2800_u64);
+        assert_eq!(refuse_if_windows_apart(a, &[a]), Ok(()));
+        assert_eq!(refuse_if_windows_apart(a, &[a, a]), Ok(()));
+        let apart = Some(0x4_c862_2800_u64);
+        assert_eq!(
+            refuse_if_windows_apart(a, &[apart]),
+            Err(WindowsApart {
+                own: a,
+                peers: vec![apart]
+            })
+        );
+        assert!(refuse_if_windows_apart(a, &[None]).is_err());
+        assert!(refuse_if_windows_apart(None, &[None]).is_err());
     }
 
     /// A card is named by its full PCI address, in either case, kept lowercase; anything else is

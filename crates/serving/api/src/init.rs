@@ -486,10 +486,14 @@ fn accept_followers(config: &VllmConfig) -> Result<Followers> {
 fn await_followers(followers: &mut Followers) -> Result<()> {
     #[cfg(feature = "spyre-hw")]
     if let Some(channel) = followers {
-        channel
+        let landings = channel
             .await_ready()
             .context("a spyre follower never reported ready")?;
-        info!("Spyre rank 0: every follower is loaded and linked");
+        // ⭐ AND EVERY RANK'S WINDOW AT RANK 0'S ADDRESS: each send names its own window's address
+        // for its peer's, so a world whose cards placed the window apart refuses here, before a step.
+        scratchy_serving_worker::spyre_worker::refuse_if_tp_windows_apart(&landings)
+            .context("the ranks' receive windows")?;
+        info!("Spyre rank 0: every follower is loaded and linked, every window at one address");
     }
     let _ = followers;
     Ok(())
@@ -2734,7 +2738,7 @@ pub fn initialize_and_run_spyre_follower(config: &VllmConfig) -> Result<()> {
     .context("failed to reach rank 0's control channel")?;
     let (worker, _, _, _) = create_worker(config, &speculation, config.model.clone(), None)?;
     channel
-        .report_ready()
+        .report_ready(scratchy_serving_worker::spyre_worker::tp_window_landing())
         .context("failed to report ready to rank 0")?;
     info!("Spyre rank {rank} of {world}: loaded and linked; following rank 0");
     crate::headless::run_headless(UniProcExecutor::new_pre_initialized(worker), channel)
