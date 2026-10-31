@@ -4346,6 +4346,21 @@ mod walk_on_the_card {
             );
             assert!(lx(&out.buffer), "hd={hd} {}: its product in LX", e.op_name);
         }
+        // The trip's per-row columns — the scores' row max, the carried running max and the row
+        // sum — are in LX too: a reduction writes each core's rows one stick a row, and the ops
+        // reading them broadcast across the page read the same slice.
+        for prefix in ["max_o", "maximum_o", "sum_o"] {
+            let ops = named(prefix);
+            assert!(!ops.is_empty(), "hd={hd}: a {prefix} op");
+            for e in ops {
+                let out = e.arg_bindings.last().expect("an output");
+                assert!(
+                    e.walk.is_none() || lx(&out.buffer),
+                    "hd={hd} {}: its column in LX",
+                    e.op_name
+                );
+            }
+        }
     }
 
     /// ⭐ THE SCRATCHPAD PLAN ON THE DECODE WALK — torch-spyre's LX planning: the carried output

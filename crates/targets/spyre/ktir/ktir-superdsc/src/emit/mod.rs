@@ -1926,10 +1926,18 @@ fn core_local_reads_agree(
 /// compares ([`core_local_reads_agree`]) and the planner's probe logs ([`note_lx_touches`]).
 fn core_slices(op: &OpSpec, v: &ArgView<'_>) -> Result<(u64, Vec<u64>), SuperDscError> {
     let plan = &op.iter;
+    // Each core's MATERIALIZED slice ([`materialized_bytes`]'s law, per core): a reduced or broadcast
+    // stick dim is one stick, any other collapsed dim one row — so a per-row column a reduction
+    // writes and an elementwise op reads broadcast is the same slice to both.
     let slice_bytes = v
         .layout
         .iter()
-        .map(|d| u64::from(plan.per_core_extent(d)))
+        .zip(v.scale.iter())
+        .map(|(&d, &sc)| match sc {
+            Scale::Active => u64::from(plan.per_core_extent(d)),
+            _ if d == v.stick => u64::from(v.df.elems_per_stick()),
+            _ => 1,
+        })
         .product::<u64>()
         * u64::from(v.df.word_length());
     let as_hbm = ArgView {
