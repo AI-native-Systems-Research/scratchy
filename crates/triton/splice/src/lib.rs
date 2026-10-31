@@ -2114,7 +2114,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // stays LOGICAL: its door arm returns early through
             // `matmul_fp8_descriptors(m, k, n)` and is not pad-idempotent.
             let (m_total, _a_total) = matmul_window_of(node, ir)?;
-            let n_dev = ktir_superdsc::work::DeviceWidth::for_matmul(m, *n, k, false).get();
+            let n_dev = matmul_out_width(node, ir, m, *n, k);
             ce("M", Val::Int(i128::from(m)))?;
             ce("K", Val::Int(i128::from(k)))?;
             ce("N", Val::Int(i128::from(n_dev)))?;
@@ -2695,6 +2695,60 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// spells one. The fold's m=1 tail is row 0 of the `[mq, vocab]` logits storage, so
 /// it passes; any other row-windowed matmul is a shape to spell with a kernel, not to
 /// silently mis-address.
+/// ⭐ THE WIDTH A DENSE MATMUL'S PROGRAM STATES FOR ITS OUTPUT — the width its READERS address.
+///
+/// The door's device width (`DeviceWidth::for_matmul`) may pad the output's stick count to fill
+/// the util floor, and the layout reserves the padded width. The program's output view must name
+/// what its readers read, because the program's views are row-major (the emulator runs them as
+/// stated): a reader that states the LOGICAL width over a buffer written at the padded one reads
+/// every row past the first at the wrong stride. So:
+/// - when EVERY reader is a family whose kernel states the logical width — RoPE, the attention,
+///   the norms, the elementwise and gated-activation families, a collective — the output is the
+///   logical width, stick-rounded;
+/// - otherwise the padded width stands: a pad-aware reader (the ScalarMul family, whose window IS
+///   `DeviceWidth::for_pointwise` — the logits scale over the padded lm head) or one this law does
+///   not name (the sampler's widened row) reads the storage the door pads.
+///
+/// The card is unchanged either way: the door re-derives its padded write from the stated width
+/// (`for_matmul` is idempotent at a padded width and pads the logical one alike), and a card
+/// activation is stick-major, so the leading sticks of a padded write are the logical tensor's
+/// bytes. MEASURED (the emulator gates): smollm2's one-rank prefill k/v (`[31, 192]`, 3 sticks)
+/// and granite's two-rank prefill k/v (`[31, 256]`, 4 sticks) were written at 512 and read at
+/// their logical widths — row 0 right, every later row at the wrong stride.
+fn matmul_out_width<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &scratchy_subtile::subtile_ir::SubtileIR<F>,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> u32 {
+    let out = node.output.tensor;
+    let mut readers = ir
+        .nodes
+        .iter()
+        .filter(|r| r.inputs.iter().any(|i| i.tensor == out))
+        .peekable();
+    let logical_readers = readers.peek().is_some()
+        && readers.all(|r| {
+            matches!(
+                r.op,
+                SubOp::RopeRotate { .. }
+                    | SubOp::RopeAppend { .. }
+                    | SubOp::AttnDecode { .. }
+                    | SubOp::RmsNorm { .. }
+                    | SubOp::Elementwise(_)
+                    | SubOp::SiluMul
+                    | SubOp::AllReduce
+                    | SubOp::AllGather { .. }
+            )
+        });
+    if logical_readers {
+        n.next_multiple_of(ktir_superdsc::work::FP16_ELEMS_PER_STICK)
+    } else {
+        ktir_superdsc::work::DeviceWidth::for_matmul(m, n, k, false).get()
+    }
+}
+
 fn matmul_window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,

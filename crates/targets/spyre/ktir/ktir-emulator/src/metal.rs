@@ -767,6 +767,29 @@ pub fn clear_weight_cache() {
     WEIGHT_CACHE.with(|c| c.borrow_mut().clear());
 }
 
+#[cfg(metal)]
+thread_local! {
+    /// The resident executor whose weights [`WEIGHT_CACHE`] holds on this thread.
+    static WEIGHT_CACHE_OWNER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// ⛔ THE CACHE BELONGS TO ONE EXECUTOR AT A TIME. Its key is a weight's HBM address, and
+/// two executors lay their weights out alike — the same tid at the same address — while
+/// a resident pass trusts the key without sampling content ([`set_trusted_weights`]).
+/// So a second executor running on this thread would be served the first one's buffers:
+/// measured, the two ranks of a two-rank gate, each its own session with its own weight
+/// slices, rank 1's matmuls ran on rank 0's weights. An executor claims the cache before
+/// it touches it (`owner` is its own id, never 0), and a claim by a different executor
+/// clears it.
+#[cfg(metal)]
+pub fn claim_weight_cache(owner: u64) {
+    WEIGHT_CACHE_OWNER.with(|o| {
+        if o.replace(owner) != owner {
+            clear_weight_cache();
+        }
+    });
+}
+
 /// Parse a GEMM-operand SSA root (`%t<id>_ptr`, `t<id>`, `%t<id>`) to its tensor id.
 /// Keep ONLY the cached GPU weight buffers that are provably IMMUTABLE — keyed on a
 /// tid that is written by NEITHER the forward pass (`forward_written`) NOR this
