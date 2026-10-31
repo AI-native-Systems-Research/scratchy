@@ -350,3 +350,22 @@ impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFacto
 inventory::submit!(
     &SpyreWorkerFactory as &dyn scratchy_serving_engine::worker_factory::WorkerFactory
 );
+
+/// This process's receive-window landing address, once its landing slots are pointed — what a
+/// follower reports with its ready frame. `None` in a world of one.
+#[cfg(feature = "spyre-hw")]
+pub fn tp_window_landing() -> Option<u64> {
+    scratchy_target_spyre::runtime::peer_link().and_then(|l| l.landing())
+}
+
+/// Rank 0's half of the window-symmetry check: every follower's reported landing address must be
+/// this process's ([`scratchy_target_spyre::runtime::refuse_if_windows_apart`]).
+///
+/// # Errors
+/// [`scratchy_target_spyre::runtime::WindowsApart`], naming every address.
+#[cfg(feature = "spyre-hw")]
+pub fn refuse_if_tp_windows_apart(
+    peers: &[Option<u64>],
+) -> Result<(), scratchy_target_spyre::runtime::WindowsApart> {
+    scratchy_target_spyre::runtime::refuse_if_windows_apart(tp_window_landing(), peers)
+}
