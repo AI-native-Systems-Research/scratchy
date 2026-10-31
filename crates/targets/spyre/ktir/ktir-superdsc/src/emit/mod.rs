@@ -445,6 +445,58 @@ fn folded_rows_off(
     crate::sdsc_abstract::dev_off_stk(&[rows, stick_ext], 1, &[row, stick_corner], lanes)
 }
 
+/// ⭐ AN INDEX OF SEVERAL STICKS — each core's start at the stick holding its own entries. dxp loads
+/// a core's index register (the IBR) as ONE stick from that core's start, and reads the core's
+/// entries at `(slice · per-core entries · 4) % 128` inside it (`L3DlOpsScheduler.cpp`'s IBR
+/// schedule), so a table past one stick is read right only if every core starts at its entries'
+/// stick: torch-spyre's compiled query gather (512 entries, `mb` split 16) starts core `c`'s index
+/// `128·c` bytes in. A one-stick table keeps one start for every core, and a core whose entries
+/// straddle two sticks cannot be read from one: refused.
+fn index_stick_starts(
+    op_name: &str,
+    mut starts: Vec<u64>,
+    plan: &WorkPlan,
+    pins: &[(&'static str, crate::superdsc_opspec::PageExtent)],
+    wk_slice: &BTreeMap<String, BTreeMap<&'static str, crate::superdsc_opspec::SliceIndex>>,
+) -> Result<Vec<u64>, SuperDscError> {
+    let stick = u64::from(<crate::superdsc_opspec::SenUint32 as DataFormat>::ELEMS_PER_STICK);
+    let entries = |positions: u32, page: crate::superdsc_opspec::PageExtent| {
+        u64::from(positions / page.get().max(1))
+    };
+    let total: u64 = pins
+        .iter()
+        .map(|&(d, page)| entries(plan.extent(d), page))
+        .product();
+    if total <= stick {
+        return Ok(starts);
+    }
+    let &[(d, page)] = pins else {
+        return Err(SuperDscError(format!(
+            "op '{op_name}': an index of {total} entries over {} paged dims — past one stick, a \
+             core's entries are found only along one entry dim",
+            pins.len()
+        )));
+    };
+    let per_core = entries(plan.per_core_extent(d), page);
+    if per_core == 0 || per_core > stick || !stick.is_multiple_of(per_core) {
+        return Err(SuperDscError(format!(
+            "op '{op_name}': {total} index entries, {per_core} a core — a core reads its entries \
+             from ONE {stick}-entry stick, so its run must divide the stick"
+        )));
+    }
+    let word = u64::from(<crate::superdsc_opspec::SenUint32 as DataFormat>::WORD_LENGTH);
+    for (c, s) in starts.iter_mut().enumerate() {
+        let idx = wk_slice
+            .get(&c.to_string())
+            .and_then(|m| m.get(d))
+            .copied()
+            .unwrap_or(crate::superdsc_opspec::SliceIndex::UNSPLIT);
+        let first = entries(plan.corner_elems(d, idx), page);
+        *s += first / stick * stick * word;
+    }
+    Ok(starts)
+}
+
 /// The `N_` iteration space for a shape-preserving ELEMENTWISE op over
 /// `[rows, cols]`: mb=rows, out=cols, y=1 (the SAME named dims as a matmul
 /// OUTPUT — verified against the real `sdsc_silu.json`, which uses mb_/out_/y_,
@@ -3894,6 +3946,14 @@ pub fn emit_sdsc(
             }
         }
         let per_core = per_core_addr(seg_base, v, &sl, iter, &wk_slice, intra_base, cores)?;
+        // A gathered or scattered COPY's index past one stick (the token-plane matmul's gathered
+        // kernel keeps its own probe-proven spelling, one start for every core).
+        let per_core = match &indirect_role {
+            Some(IndirectRole::Index { pins, .. }) if !kernel_bearing => {
+                index_stick_starts(op_name, per_core, &op.iter, pins, &wk_slice)?
+            }
+            _ => per_core,
+        };
         // No two cores of an OUTPUT tensor may share a byte address (aliased write) — EXCEPT a K-split
         // matmul, where the `k` cores each contract a K-slice into a PARTIAL product that dxp
         // PSUM-accumulates into the SHARED output tile (torch-spyre's reduction-dim split). That case is

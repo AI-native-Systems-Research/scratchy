@@ -712,6 +712,32 @@ pub fn row_scatter_of(k: &KtirNode, tile: &Operation<'_>) -> Result<RowScatter, 
 /// stick per entry, from each side's own column base. When both sides are ONE row, the row is one
 /// contiguous run on both and moves whole. `(a base, b base, sticks per entry)` per copy, in
 /// elements.
+/// ⭐ THE RUNS OF INDEX ENTRIES ONE GATHER OR SCATTER EACH SERVES — `(first, count)` over `entries`:
+/// as many as one op's cores read, each core one stick of the table
+/// ([`crate::work::index_core_split`]), torch-spyre's own 512-entry query gather. A run starts on a
+/// stick, and a run no split divides is cut at its last whole stick.
+pub fn index_runs(entries: u32) -> Vec<(u32, u32)> {
+    let stick = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    let most = stick * crate::superdsc_opspec::MAX_CORES;
+    let mut runs = Vec::new();
+    let mut first = 0;
+    while first < entries {
+        let left = entries - first;
+        let n = if left >= most {
+            most
+        } else if crate::work::index_core_split(left, crate::superdsc_opspec::MAX_CORES, stick)
+            .is_some()
+        {
+            left
+        } else {
+            left - left % stick
+        };
+        runs.push((first, n));
+        first += n;
+    }
+    runs
+}
+
 fn stick_columns(a_rows: u32, b_rows: u32, cols: u32) -> Vec<(u32, u32, u32)> {
     let stick = Fp16::ELEMS_PER_STICK;
     if a_rows == 1 && b_rows == 1 {
@@ -747,7 +773,6 @@ pub fn row_scatter(
             src.v_rows, src.v_cols, sc.entries, sc.cols
         ));
     }
-    let per_op = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
     let (src_name, dst_name, index_name) = (
         src.name(),
         crate::place::act_name(sc.value_tid),
@@ -759,8 +784,7 @@ pub fn row_scatter(
         .enumerate()
     {
         let page = crate::superdsc_opspec::PageExtent::of_positions(page_sticks);
-        for (i, first) in (0..sc.entries).step_by(per_op as usize).enumerate() {
-            let entries = per_op.min(sc.entries - first);
+        for (i, (first, entries)) in index_runs(sc.entries).into_iter().enumerate() {
             let base =
                 crate::superdsc_opspec::EntryBase::of_entries(sc.first_entry.entries() + first)
                     .map_err(|message| Error {
@@ -817,14 +841,12 @@ pub fn row_gather(
             g.entries, out.tid, out.v_rows, out.v_cols
         ));
     }
-    let per_op = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
     let mut ops = Vec::new();
     for (c, (src_base, dst_base, page_sticks)) in stick_columns(table_rows, g.entries, cols)
         .into_iter()
         .enumerate()
     {
-        for (i, first) in (0..g.entries).step_by(per_op as usize).enumerate() {
-            let entries = per_op.min(g.entries - first);
+        for (i, (first, entries)) in index_runs(g.entries).into_iter().enumerate() {
             let base =
                 crate::superdsc_opspec::EntryBase::of_entries(g.first_entry.entries() + first)
                     .map_err(|message| Error {
@@ -1208,10 +1230,8 @@ pub fn load_scatters(
             scratch
         };
         let page = crate::superdsc_opspec::PageExtent::of_positions(sticks);
-        let per_op = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
         let (dst_name, index_name) = (dst.name(), index.name());
-        for (i, first) in (0..total).step_by(per_op as usize).enumerate() {
-            let entries = per_op.min(total - first);
+        for (i, (first, entries)) in index_runs(total).into_iter().enumerate() {
             let base =
                 crate::superdsc_opspec::EntryBase::of_entries(e0 + first).map_err(|message| {
                     Error {

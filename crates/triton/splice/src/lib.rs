@@ -4694,6 +4694,41 @@ mod walk_on_the_card {
         );
     }
 
+    /// ⭐ A PROMPT CHUNK'S ROWS MOVE IN ONE OP A STICK COLUMN. torch-spyre's compiled prefill
+    /// gathers all 512 of a chunk's query rows in one op, each core reading its own stick of the
+    /// row index, and scatters the output the same way. The query here is stick-major, so a gather
+    /// moves one stick column; one op per column serves every row of the chunk, at every chunk
+    /// width up to 32 cores a stick of entries.
+    #[test]
+    fn a_prompt_chunks_rows_move_in_one_op_a_stick_column() {
+        for (mq, hd) in [(64, 64), (512, 64), (64, 128)] {
+            let node = walk_at(mq, 4, hd);
+            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            let mut sym = 0i64;
+            let ops =
+                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                    .unwrap_or_else(|e| panic!("the prompt walk lowers: {}", e.message));
+            let outside = |prefix: &str| {
+                ops.iter()
+                    .filter(|e| e.walk.is_none() && e.op_name.starts_with(prefix))
+                    .count()
+            };
+            // 32 heads of `hd`: the query row and the output row are `32·hd/64` stick columns.
+            let columns = 32 * hd as usize / 64;
+            assert_eq!(
+                outside("gather"),
+                columns,
+                "mq={mq} hd={hd}: the query rows"
+            );
+            assert_eq!(
+                outside("scatter"),
+                columns,
+                "mq={mq} hd={hd}: the output rows"
+            );
+        }
+    }
+
     /// ⭐ THE PROMPT WALK AT A HEAD TWO STICKS WIDE. The query's head-major relayout is two
     /// stick-run copies before the walk — head `a`'s stick `s`, the 64 rows at stick column `2a + s`
     /// of the gathered `[64, 32·128]` block, to `s·32·64 + a·64` of the head-major `[32·64, 128]` —
@@ -4971,13 +5006,11 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
                 permutes,
                 "t={t} hd={hd}: one relayout per kv head of K and of V, and only at two sticks"
             );
-            // 32 index entries an op, `t · 8` rows each for K and for V.
-            let per_op = 32;
-            assert_eq!(
-                count(&ops, "scatter_run"),
-                2 * (t as usize * 8).div_ceil(per_op),
-                "t={t} hd={hd}"
-            );
+            // `t · 8` rows each for K and for V, one op serving every core a stick of 32 index
+            // entries: one op for the whole write at t=96 (768 entries, 24 cores).
+            let runs = ktir_superdsc::emit::lower_ktir_to_superdsc::index_runs(t as u32 * 8);
+            assert_eq!(runs.len(), 1, "t={t}: {runs:?}");
+            assert_eq!(count(&ops, "scatter_run"), 2 * runs.len(), "t={t} hd={hd}");
             assert_eq!(
                 ops.len(),
                 count(&ops, "scatter_"),
