@@ -1675,6 +1675,7 @@ pub fn point_landing_slots(link: &PeerLink, window_region: &DevAddr) -> Result<(
             .map_err(|e| AttachRefusal::BringUp(format!("{e:?}")))?,
     );
     let cap = crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES;
+    let mut pointed: Vec<String> = Vec::new();
     for (slot, at) in link.window.slots() {
         // The slot's own extent: one message, or the cut's remainder for its last.
         let len = (link.window.cut().get() - u64::from(slot.message()) * cap).min(cap);
@@ -1692,7 +1693,18 @@ pub fn point_landing_slots(link: &PeerLink, window_region: &DevAddr) -> Result<(
             .map_err(AttachRefusal::Xseg)?;
         flex_rs::senlib_ffi::write_xseg(link.route.wait_sid(slot), word)
             .map_err(AttachRefusal::Xseg)?;
+        pointed.push(format!("XSEG[{}]=0x{va:x}", link.route.wait_sid(slot)));
     }
+    // The load-time ordering made observable: this line precedes the rank's ready report, and so
+    // every step's sends.
+    tracing::info!(
+        "[spyre-tp] rank {} of {}: {} landing slot(s) pointed at the receive window ({:?}): {}",
+        link.me.rank(),
+        link.me.world().get(),
+        pointed.len(),
+        link.window,
+        pointed.join(", "),
+    );
     Ok(())
 }
 
