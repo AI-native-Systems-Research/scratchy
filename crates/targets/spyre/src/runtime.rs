@@ -27,7 +27,10 @@ use flex_rs::allocator::{
 };
 use flex_rs::compute::{BootstrapOffset, ComputeParams, KernelName};
 use flex_rs::device_memory_allocator::DeviceMemoryAllocator;
-use flex_rs::dma::{DmaDirection, DmaParams, DmaPipelineShape, DmaShaping, HostVirtualAddress};
+use flex_rs::dma::{
+    DmaDirection, DmaParams, DmaPipelineShape, DmaShaping, FillParams, FillPattern, FillPipeline,
+    HostVirtualAddress,
+};
 use flex_rs::flex_config::DeviceKind;
 use flex_rs::memory_region::{DomainId, MemoryType};
 use flex_rs::runtime::{RuntimeContext, RuntimeContextError};
@@ -613,6 +616,28 @@ impl Stream {
     /// confuse "we refused" with "the card refused".
     pub fn h2d(&self, bytes: &[u8], addr: &DevAddr) -> Result<(), HwError> {
         self.h2d_shaped(bytes, addr, DmaShaping::default(), None)
+    }
+
+    /// ⭐ DEVICE-SIDE ZERO FILL of `addr` — the vendor's `RuntimeOperationFill`
+    /// (`SetHAFill`): the card writes the pattern itself, NO host bytes cross
+    /// the wire. `addr` must be a single-chunk window (the scheduler's fill CB
+    /// resolves one chunk — `DevAddr::windows` yields exactly that shape).
+    /// Zeroing a large region by host-pushed H2D is bandwidth-bound on the
+    /// host→device path: the 16384 MB paged KV pool measured ~4.6 s that way
+    /// (~3.5 GB/s effective) — the whole of the 9 s → 13.5 s startup
+    /// regression — while the card fills its own memory at HBM speed.
+    pub fn fill_zero(&self, addr: &DevAddr) -> Result<(), HwError> {
+        let stream = self.live()?;
+        // `FillParams::new` takes the caller's size verbatim (the C++ member-init
+        // list has no validation), so the window's own extent is the byte count —
+        // the same pairing `h2d` gets from a slice's length.
+        let params = FillParams::new(
+            addr.0.clone(),
+            addr.total_size(),
+            FillPattern(0),
+            FillPipeline::Dmai,
+        );
+        stream.launch_fill(params).map_err(HwError::Stream)
     }
 
     /// ⭐ H2D ON THE COMPUTE PIPELINE — same transfer, same slice-length law, different hardware

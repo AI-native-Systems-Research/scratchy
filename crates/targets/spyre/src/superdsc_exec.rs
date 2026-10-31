@@ -5731,7 +5731,8 @@ impl Executor {
     /// computes q·k over the WHOLE page before the validity mask applies, so uninitialised bytes go
     /// through the arithmetic as denormals and NaN. The old route (read_seg → write_seg) addressed a
     /// host allocation the size of the entire pool: 960 MB, and 3.84 GB at a 1024-slot page. This
-    /// walks the segment with an 8 MB buffer, and the device sees the same zeros.
+    /// walks the segment with 8 MB device-side fill ops (the vendor's `RuntimeOperationFill`),
+    /// so no host bytes cross the wire.
     ///
     /// The walk is [`DevAddr::windows`], so a multi-chunk (interleaved) region is zeroed chunk by
     /// chunk with the same 8 MB windows — every byte the region owns, none it does not.
@@ -5745,20 +5746,18 @@ impl Executor {
             return Ok(());
         }
         const CHUNK: NonZeroU64 = NonZeroU64::new(8 << 20).unwrap();
-        let zeros = vec![0u8; CHUNK.get().min(total) as usize];
         let stream = self.stream_ref()?;
-        // Enqueue the whole walk, synchronize ONCE. A per-chunk synchronize turned the fill
-        // latency-bound: the 16384 MB KV pool is 2048 chunks, and a serialized H2D+sync round
-        // trip per chunk measured ~2.25 ms (≈3.5 GB/s effective — the card moves 149 GB/s),
-        // i.e. ~4.6 s of pure round-trip latency for ~0.1 s of transfer. The zero buffer is a
-        // single host Vec alive across every enqueue, and each window is an address descriptor
-        // the H2D consumes at enqueue time, so nothing the transfers reference is dropped
-        // before the trailing synchronize.
+        // DEVICE-SIDE FILL, not host-pushed zeros. The host→device path is the bottleneck:
+        // pushing 8 MB windows of zeros measured ~2.25 ms per window (≈3.5 GB/s effective on a
+        // card that moves 149 GB/s), so the 16384 MB KV pool cost ~4.6 s of startup — the
+        // whole 9 s → 13.5 s regression — and removing the per-window synchronize changed
+        // nothing, because the transfer itself, not the wait, was the cost. The vendor's
+        // fill op writes the pattern on the card: no host bytes cross the wire. Each window
+        // is a single-chunk DevAddr, which is the one shape the fill CB resolves.
         for win in addr.windows(CHUNK) {
-            let sz = win.total_size().as_u64() as usize;
             stream
-                .h2d(&zeros[..sz], &win)
-                .map_err(|e| anyhow!("zero H2D (seg{i}): {e}"))?;
+                .fill_zero(&win)
+                .map_err(|e| anyhow!("zero fill (seg{i}): {e}"))?;
         }
         stream
             .synchronize()
