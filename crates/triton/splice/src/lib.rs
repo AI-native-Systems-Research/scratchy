@@ -4839,16 +4839,12 @@ mod walk_on_the_card {
     /// mask added a stick plane at a time sprayed over each query row's heads in place, and the
     /// scores, the softmax and the carried state all in each core's LX. The trip's ops do not grow
     /// with the rows: 27 at head dim 64, and 49 at 128, whose pages are still gathered in pieces and
-    /// re-laid on the trip (16 permutes). At 512 rows the pin window no longer holds every value the
-    /// walk computes (each pin is held for the whole walk, not the value's lifetime), so only the
-    /// form is checked there.
+    /// re-laid on the trip (16 permutes). At 512 rows every value still fits, because a pin is held
+    /// for its value's lifetime rather than the walk's (torch-spyre's placement), so values the trip
+    /// is done with hand their bytes to the next.
     #[test]
     fn the_prompt_trip_splits_its_query_rows_across_the_cores_in_lx() {
-        for (mq, hd, trip, all_lx) in [
-            (128, 64, 27, true),
-            (512, 64, 27, false),
-            (128, 128, 49, true),
-        ] {
+        for (mq, hd, trip) in [(128, 64, 27), (512, 64, 27), (128, 128, 49), (512, 128, 49)] {
             let blocks = 4;
             let node = walk_at(mq, blocks, hd);
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
@@ -4898,7 +4894,7 @@ mod walk_on_the_card {
                     e.op_name
                 );
                 assert!(
-                    !all_lx || lx(&a.buffer) && lx(&out.buffer),
+                    lx(&a.buffer) && lx(&out.buffer),
                     "mq={mq} hd={hd} {}: its rows in each core's LX",
                     e.op_name
                 );
@@ -4929,7 +4925,7 @@ mod walk_on_the_card {
                     e.op_name
                 );
                 assert!(
-                    !all_lx || lx(&e.arg_bindings[0].buffer) && lx(&e.arg_bindings[2].buffer),
+                    lx(&e.arg_bindings[0].buffer) && lx(&e.arg_bindings[2].buffer),
                     "mq={mq} hd={hd} {}: the scores' plane in LX",
                     e.op_name
                 );
@@ -4950,7 +4946,7 @@ mod walk_on_the_card {
                 for e in chain {
                     let out = e.arg_bindings.last().expect("an output");
                     assert!(
-                        !all_lx || lx(&out.buffer),
+                        lx(&out.buffer),
                         "mq={mq} hd={hd} {}: writes {} outside LX",
                         e.op_name,
                         out.buffer
