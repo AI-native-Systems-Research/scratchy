@@ -7495,7 +7495,7 @@ pub fn emit_bundle(
     // nothing to do. The ladder's ceiling rung IS the body, so this fires on every rolled model.
     let fp = {
         let _pc = crate::pc::Pc::start("fp");
-        bundle_fp(ops, fold, attn_params)
+        bundle_fp(ops, layout, fold, attn_params)
     };
     if emitted().lock().is_ok_and(|c| c.contains_key(&fp)) {
         return Ok(fp);
@@ -7531,8 +7531,21 @@ pub fn emit_bundle(
 /// [`emit_bundle`] returns the FIRST rung's body for all of them, and a 16-page context runs a 1-page
 /// chunk: clean bake, no fault, every key past slot 256 silently unread. Appended only when present, so
 /// every bundle without a chunk keeps its fingerprint byte for byte.
+///
+/// ⛔⛔⛔ AND IT HASHES A SHARDED WORLD'S WEIGHT PACKING, FOR THE SAME REASON. A rank packs its own
+/// shard of the weights, so a two-rank bundle's resident weight segment is NOT the one-rank one —
+/// yet a program that precedes every collective (the prefill's prefix: the embedding gather) is
+/// bit-identical in both worlds. Hashed without the layout, the two worlds' prefixes fingerprint
+/// alike, the early-out in [`emit_bundle`] hands the two-rank body the ONE-RANK prefix, compiled
+/// against the one-rank weight addresses, and [`cover_ladder_allocation`] grows the two-rank
+/// session's seg1 to the one-rank extent. MEASURED on card (#1009, run 3): the prefill session's
+/// seg1 at 2703347712 B against the decode session's 1532399616, refused at the resident-weights
+/// alias. The receive window sits directly above a world's packed weights, so its placement names
+/// that world's packing; appended only when the layout places one, so every one-rank bundle keeps
+/// its fingerprint byte for byte.
 fn bundle_fp(
     ops: &[EmittedOp],
+    layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
 ) -> String {
@@ -7540,6 +7553,11 @@ fn bundle_fp(
     let base = match attn_params.and_then(|p| p.chunk_pages) {
         Some(pages) => format!("{split}c{pages}"),
         None => split,
+    };
+    let window = ktir_superdsc::reserved_tids::TP_RECV_CUT_TIDS[0];
+    let base = match layout.and_then(|l| l.placements.get(&window)) {
+        Some(w) => format!("{base}r{:x}w{:x}", w.offset, w.size),
+        None => base,
     };
     match fold {
         FoldGrouping::Split => base,
@@ -7765,7 +7783,7 @@ fn emit_bundle_inner(
         )));
     }
 
-    let fp = bundle_fp(ops, fold, attn_params);
+    let fp = bundle_fp(ops, layout, fold, attn_params);
     let kept: Vec<&EmittedOp> = ops_for_grouping(ops, fold);
     let filtered: Vec<EmittedOp>;
     let ops: &[EmittedOp] = if kept.len() == ops.len() {
@@ -10853,6 +10871,56 @@ mod tests {
         assert!(
             baked.places.iter().all(|p| seen.insert(p.id)),
             "two placements share an identity — the exact card refusal this test pins"
+        );
+    }
+
+    /// The SAME programs over two worlds' layouts are two bundles: a two-rank layout's receive
+    /// window (above that world's own weight packing) is in the fingerprint, so the content-addressed
+    /// early-out cannot hand one world's bundle — compiled against its weight addresses — to the
+    /// other (#1009, run 3). A layout with no window fingerprints exactly as the ops alone do, so
+    /// every one-rank bundle keeps its fingerprint.
+    #[test]
+    fn a_two_rank_layout_is_in_the_fingerprint_and_a_one_rank_one_is_not() {
+        use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
+        use crate::tp_plan::{SpyreWorld, tp_bake};
+        use ktir_superdsc::ktir_node::ActiveCap;
+        use scratchy_subtile::fixtures::mlp_sublayer;
+        use scratchy_subtile::subtile_ir::lower_region;
+
+        let b = tp_bake(&mlp_sublayer(2048, 8192), SpyreWorld::of::<2>()).unwrap();
+        let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
+        let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
+        let (ops, sharded) =
+            lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+        let mut unsharded = sharded.clone();
+        for tid in ktir_superdsc::reserved_tids::TP_RECV_CUT_TIDS {
+            assert!(unsharded.placements.remove(&tid).is_some());
+        }
+        let fp = |layout| bundle_fp(&ops, layout, FoldGrouping::Split, None);
+        assert_eq!(
+            fp(Some(&unsharded)),
+            fp(None),
+            "no window: the ops' own fingerprint"
+        );
+        assert_ne!(
+            fp(Some(&sharded)),
+            fp(None),
+            "a window: the world is in the fingerprint"
+        );
+        let mut moved = sharded.clone();
+        let window = ktir_superdsc::reserved_tids::TP_RECV_CUT_TIDS[0];
+        if let Some(p) = moved.placements.get_mut(&window) {
+            p.offset += 128;
+        }
+        assert_ne!(
+            fp(Some(&moved)),
+            fp(Some(&sharded)),
+            "a different weight packing under the window is a different bundle"
+        );
+        assert_eq!(
+            bundle_fp(&ops, Some(&sharded), FoldGrouping::Fused, None),
+            format!("{}f", fp(Some(&sharded))),
+            "the fused twin is still the split fingerprint plus `f`"
         );
     }
 
