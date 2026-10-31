@@ -3335,6 +3335,7 @@ mod tests {
             device_inputs: &[token],
             deferred: None,
             reads: ForwardReads::Outputs,
+            draft: None,
         };
         let writes = begin_step(&guard, &inputs, pool.block_table_stride).expect("inputs fit");
         let reached: Vec<&Buffer> = (writes.ops.iter())
