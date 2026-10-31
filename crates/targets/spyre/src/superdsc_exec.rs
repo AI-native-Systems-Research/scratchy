@@ -5987,6 +5987,31 @@ impl Executor {
     /// Only THIS session's descriptor is replaced; `owner` is untouched, so aliasing prefill onto
     /// decode leaves the decode session bit-for-bit unchanged. MUST be called AFTER both sessions'
     /// prepare (which zero-inits and H2Ds every segment).
+    /// ⭐ POINT THE PEER'S LANDING SLOTS AT THIS SESSION'S RECEIVE WINDOW
+    /// ([`crate::runtime::point_landing_slots`]) — from the session that OWNS the weight segment,
+    /// after its `prepare` allocated it, since the window's device address is that allocation's.
+    /// A world-of-one session has no peer and nothing lands: a no-op.
+    ///
+    /// # Errors
+    /// A session that BORROWS its weight segment (its 128 B placeholder is no window a peer may land
+    /// in — the owner points the slots), one never prepared, or the link's own refusal.
+    pub fn point_landing_slots(&self) -> Result<()> {
+        let Some(link) = self.link else {
+            return Ok(());
+        };
+        let i = SEG_WEIGHT.get();
+        if self.seg_borrowed[i] {
+            bail!(
+                "point_landing_slots: this session borrows the weight segment — the session that \
+                 owns it points the landing slots"
+            );
+        }
+        let region = self.seg_addr[i].as_ref().ok_or_else(|| {
+            anyhow!("point_landing_slots: the weight segment is not allocated yet")
+        })?;
+        crate::runtime::point_landing_slots(link, region).map_err(|e| anyhow!("{e}"))
+    }
+
     pub fn alias_seg_from(&mut self, owner: &Executor, seg: SegIdx) -> Result<()> {
         let i = seg.get();
         let (Some(dst), Some(src)) = (self.seg_addr[i].as_ref(), owner.seg_addr[i].as_ref()) else {
