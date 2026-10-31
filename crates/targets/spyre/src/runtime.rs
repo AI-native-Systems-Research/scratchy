@@ -621,11 +621,11 @@ impl Stream {
     /// ⭐ DEVICE-SIDE ZERO FILL of `addr` — the vendor's `RuntimeOperationFill`
     /// (`SetHAFill`): the card writes the pattern itself, NO host bytes cross
     /// the wire. `addr` must be a single-chunk window (the scheduler's fill CB
-    /// resolves one chunk — `DevAddr::windows` yields exactly that shape).
-    /// Zeroing a large region by host-pushed H2D is bandwidth-bound on the
-    /// host→device path: the 16384 MB paged KV pool measured ~4.6 s that way
-    /// (~3.5 GB/s effective) — the whole of the 9 s → 13.5 s startup
-    /// regression — while the card fills its own memory at HBM speed.
+    /// resolves one chunk — `DevAddr::windows` yields exactly that shape). The
+    /// host→device path is bandwidth-bound (~3.5 GB/s effective), so zeroing a
+    /// large region by host-pushed H2D costs seconds where the card's own fill
+    /// costs a fraction of that — `fill_zero_probe` measures the real rate on
+    /// the card it runs on.
     pub fn fill_zero(&self, addr: &DevAddr) -> Result<(), HwError> {
         let stream = self.live()?;
         // `FillParams::new` takes the caller's size verbatim (the C++ member-init
@@ -1202,10 +1202,11 @@ mod tests {
             .collect()
     }
 
-    /// ⭐ THE ZERO-FILL WALK OVER AN INTERLEAVED REGION (#672). `zero_seg` H2Ds exactly these
-    /// windows, so this is the address half of zeroing a multi-chunk KV pool — the half a card is
-    /// not needed for. Each chunk is cut at the step in its OWN region/offset/domain, a short tail
-    /// stays short, a zero-length chunk sends nothing, and the bytes sum to the region's size.
+    /// ⭐ THE ZERO-FILL WALK OVER AN INTERLEAVED REGION (#672). `zero_seg` fills exactly these
+    /// windows on the card, so this is the address half of zeroing a multi-chunk KV pool — the
+    /// half a card is not needed for. Each chunk is cut at the step in its OWN
+    /// region/offset/domain, a short tail stays short, a zero-length chunk sends nothing, and
+    /// the bytes sum to the region's size.
     #[test]
     fn windows_cover_each_chunk_of_an_interleaved_region_once() {
         let addr = DevAddr(Arc::new(CompositeAddress::from_chunks(vec![

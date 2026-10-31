@@ -5724,18 +5724,20 @@ impl Executor {
         self.seg_host[seg.get()].len()
     }
 
-    /// ZERO a whole tensor segment ON THE DEVICE, in chunks, from a small host buffer.
+    /// ZERO a whole tensor segment ON THE DEVICE, with the vendor's fill op.
     ///
-    /// Exists so zeroing the KV pool does not require a host mirror of it. The pool has to start
-    /// zeroed — a page handed to a request otherwise holds whatever was in device memory, and decode
-    /// computes q·k over the WHOLE page before the validity mask applies, so uninitialised bytes go
-    /// through the arithmetic as denormals and NaN. The old route (read_seg → write_seg) addressed a
-    /// host allocation the size of the entire pool: 960 MB, and 3.84 GB at a 1024-slot page. This
-    /// walks the segment with 8 MB device-side fill ops (the vendor's `RuntimeOperationFill`),
-    /// so no host bytes cross the wire.
+    /// Exists so zeroing the KV pool requires neither a host mirror of it nor host-pushed
+    /// zeros. The pool has to start zeroed — a page handed to a request otherwise holds
+    /// whatever was in device memory, and decode computes q·k over the WHOLE page before the
+    /// validity mask applies, so uninitialised bytes go through the arithmetic as denormals
+    /// and NaN. And the bytes must not ride the host→device path to get there: that path is
+    /// bandwidth-bound (~3.5 GB/s effective), so a host-pushed fill of a 16384 MB pool costs
+    /// seconds, while the card writes its own memory far faster
+    /// ([`Stream::fill_zero`]; measured rate on the card: `fill_zero_probe`).
     ///
-    /// The walk is [`DevAddr::windows`], so a multi-chunk (interleaved) region is zeroed chunk by
-    /// chunk with the same 8 MB windows — every byte the region owns, none it does not.
+    /// The walk is [`DevAddr::windows`] at 64 MB, so a multi-chunk (interleaved) region is
+    /// zeroed chunk by chunk — every byte the region owns, none it does not — and each window
+    /// is the single-chunk shape the fill control block resolves.
     pub fn zero_seg(&mut self, seg: SegIdx) -> Result<()> {
         let i = seg.get();
         let addr = self.seg_addr[i]
@@ -5745,18 +5747,10 @@ impl Executor {
         if total == 0 {
             return Ok(());
         }
-        // 64 MB windows: with no host buffer in the fill, the window size only sets how many
-        // fill control blocks the walk submits (16384 MB / 64 MB = 256, against 2048 at the
-        // 8 MB the host-push needed). Each CB is a fixed enqueue cost on both host and device.
+        // The window size only sets how many fill control blocks the walk submits (each is a
+        // fixed enqueue cost on both host and device); no host buffer rides the fill.
         const CHUNK: NonZeroU64 = NonZeroU64::new(64 << 20).unwrap();
         let stream = self.stream_ref()?;
-        // DEVICE-SIDE FILL, not host-pushed zeros. The host→device path is the bottleneck:
-        // pushing 8 MB windows of zeros measured ~2.25 ms per window (≈3.5 GB/s effective on a
-        // card that moves 149 GB/s), so the 16384 MB KV pool cost ~4.6 s of startup — the
-        // whole 9 s → 13.5 s regression — and removing the per-window synchronize changed
-        // nothing, because the transfer itself, not the wait, was the cost. The vendor's
-        // fill op writes the pattern on the card: no host bytes cross the wire. Each window
-        // is a single-chunk DevAddr, which is the one shape the fill CB resolves.
         for win in addr.windows(CHUNK) {
             stream
                 .fill_zero(&win)
