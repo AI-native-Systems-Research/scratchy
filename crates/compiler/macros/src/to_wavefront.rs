@@ -41,8 +41,9 @@ use scratchy_subtile::lower::{
 };
 use scratchy_subtile::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 use scratchy_subtile::subtile_ir::{
-    AttnMask, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention, GatedAct, NumExperts,
-    RopeFormTag, RouterBundle, RowScale, SharedExpertBound, SourceShape, SubOp, TopK,
+    AttnMask, DraftConvStage, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention,
+    GatedAct, NumExperts, RopeFormTag, RouterBundle, RowScale, SharedExpertBound, SourceShape,
+    SubOp, TopK,
 };
 
 use crate::assignment::Assignment;
@@ -1329,6 +1330,98 @@ pub fn lower_decode_to_wavefront(
                 };
                 bx.produced.insert((tile.0, 0), Producer::Op(j));
                 exported = Some(j);
+            }
+            // capture_hidden(x): x's rows into its layer's block of the rows a drafter reads.
+            // Unroll emits a body's nodes in program order, so the captures' ids ascend with their
+            // layers: a capture's slot is its rank among them, its layer's place in
+            // `draft_capture_layers`.
+            OpKind::CaptureHidden => {
+                let x = bx.input_at(tile, 0)?;
+                let captures: Vec<TileId> = (fuf.nodes.iter())
+                    .filter(|n| n.op == OpKind::CaptureHidden)
+                    .map(|n| n.id)
+                    .collect();
+                let declared = (bx.model.layer_sets.get(crate::config::DRAFT_CAPTURE_LAYERS))
+                    .map_or(0, |s| s.members().len());
+                if captures.len() != declared {
+                    return Err(BridgeError::MalformedOp {
+                        tile,
+                        op: node.op,
+                        detail: "capture_hidden ran at a layer count other than \
+                                 draft_capture_layers'",
+                    });
+                }
+                let slot = captures.iter().filter(|&&c| c.0 < tile.0).count() as u32;
+                let slots = captures.len() as u32;
+                let idx = bx.push_op(SubOp::CaptureHidden { slot, slots }, vec![x]);
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
+            }
+            // draft_conv(x, dynamic, base[, residual]): one stage of Splash's dynamic convolution.
+            OpKind::DraftConv => {
+                let stage = match node.inputs.len() {
+                    3 => DraftConvStage::Prepare,
+                    _ => DraftConvStage::Residual,
+                };
+                let inputs = (0..node.inputs.len())
+                    .map(|i| bx.input_at(tile, i))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let idx = bx.push_op(SubOp::DraftConv { stage }, inputs);
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
+            }
+            // draft_attention(qkv, q_norm, k_norm, positions, rotary) and
+            // draft_context_kv(kv, k_norm, positions, rotary): the drafter's ring ops at the layer
+            // their norms index.
+            OpKind::DraftAttention | OpKind::DraftContextKv => {
+                let head_dim = bx
+                    .geom
+                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?
+                    .hd();
+                let layer = node
+                    .inputs
+                    .iter()
+                    .find_map(|inp| match inp {
+                        FufInput::Weight {
+                            index: Some(UnrollIndex(l)),
+                            ..
+                        } => Some(*l as u32),
+                        _ => None,
+                    })
+                    .ok_or(BridgeError::MalformedOp {
+                        tile,
+                        op: node.op,
+                        detail: "draft ring op without a layer-indexed norm",
+                    })?;
+                let (cos, sin) = bx.cos_sin(head_dim.get(), false);
+                let norms = match node.op {
+                    OpKind::DraftAttention => 1..3,
+                    _ => 1..2,
+                };
+                let mut inputs = vec![bx.input_at(tile, 0)?];
+                for i in norms {
+                    inputs.push(bx.input_at(tile, i)?);
+                }
+                inputs.extend([InputRef::Ext(cos), InputRef::Ext(sin)]);
+                let op = match node.op {
+                    OpKind::DraftAttention => SubOp::DraftAttention {
+                        layer,
+                        width: bx.out_cols(tile, 0, "draft attention cols")?,
+                    },
+                    _ => SubOp::DraftContextKv { layer },
+                };
+                let idx = bx.push_op(op, inputs);
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
+            }
+            // draft_select(logits, selector, predecessor_codebook, successor_codebook).
+            OpKind::DraftSelect => {
+                let inputs = (0..4)
+                    .map(|i| bx.input_at(tile, i))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let idx = bx.push_op(SubOp::DraftSelect, inputs);
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
             }
             OpKind::Silu => {
                 let x = bx.input_at(tile, 0)?;

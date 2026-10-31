@@ -277,6 +277,10 @@ mod green_gate {
             gdn_state_indices: None,
             #[cfg(feature = "metal")]
             gdn_is_fresh: None,
+            #[cfg(feature = "metal")]
+            draft_ring: None,
+            #[cfg(feature = "metal")]
+            draft: None,
             #[cfg(feature = "nccl")]
             tp_group: None,
             device_inputs: &[],

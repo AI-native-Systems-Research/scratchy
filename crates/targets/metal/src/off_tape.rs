@@ -21,7 +21,8 @@ use crate::stream::MetalStreamError;
 use crate::tape::ids::{BitsetWords, BlockSize, KDimI32, LogitsWidth, MDimI32, NDimI32};
 use crate::tape::kernel_constants::{
     AffineCodes, AffineQmvConstants, AffineQmvWideConstants, ArgmaxConstants,
-    ChainAdvanceConstants, GrammarMaskConstants, LogprobsConstants, MtpChainConstants,
+    ChainAdvanceConstants, DraftAcceptConstants, GrammarMaskConstants, LogprobsConstants,
+    MtpChainConstants, TargetSamplingConstants,
 };
 use crate::tape::lowered::{BakedKernel, MetalDtype};
 use crate::tape::quantized::{
@@ -169,6 +170,30 @@ pub struct OffTape<K, L> {
     /// A multi-token-prediction head drafting over a prefix of its target's vocabulary: its
     /// kernels past the prefix; `None` for any other model.
     pub vocab_suffix: Option<SuffixKernels<K, L>>,
+    /// A DFlash2 drafter's acceptance of its target's verify and its pick of its next block's
+    /// inputs ([`crate::dflash2::DraftAcceptKernel`]); `None` for any other model.
+    pub dflash2_accept: Option<K>,
+    /// The target policy over a DFlash2 cycle's sampled verify rows
+    /// ([`crate::dflash2::TargetSamplingKernels`]); `None` for a model no such drafter drafts for.
+    pub dflash2_sampling: Option<TargetSampling<K>>,
+}
+
+/// A model's part in a DFlash2 cycle: the drafter, which accepts its target's verify; the target,
+/// whose policy draws a sampled lane's verify rows over the drafter's block of `block_rows`; or
+/// none.
+#[derive(Clone, Copy, Debug)]
+pub enum Dflash2Role {
+    None,
+    Drafter(DraftAcceptConstants),
+    Target { block_rows: u32 },
+}
+
+/// The stages of a DFlash2 cycle's target policy: a row's mass, its distribution's end, its draw.
+#[derive(Clone, Copy)]
+pub struct TargetSampling<K> {
+    pub mass: K,
+    pub search: K,
+    pub draw: K,
 }
 
 pub type OffTapeKernels = OffTape<BakedKernel, &'static [BakedKernel]>;
@@ -177,7 +202,7 @@ impl OffTape<PipelineKey, Vec<PipelineKey>> {
     /// The keys of the off-tape kernels reading logits `vocab` wide, of activation `dtype`, over a
     /// KV cache paged in blocks of `block_size`; `head`: a multi-token-prediction head's chain;
     /// `drafts`: the model drafts; `vocab_suffix`: a head drafting over a prefix of its target's
-    /// vocabulary, the rest of it.
+    /// vocabulary, the rest of it; `dflash2`: the model's part in a DFlash2 cycle.
     pub fn keys(
         vocab: LogitsWidth,
         dtype: MetalDtype,
@@ -185,7 +210,13 @@ impl OffTape<PipelineKey, Vec<PipelineKey>> {
         head: Option<MtpChainConstants>,
         drafts: bool,
         vocab_suffix: Option<VocabSuffix>,
+        dflash2: Dflash2Role,
     ) -> Self {
+        let (accept, block_rows) = match dflash2 {
+            Dflash2Role::None => (None, None),
+            Dflash2Role::Drafter(accept) => (Some(accept), None),
+            Dflash2Role::Target { block_rows } => (None, Some(block_rows)),
+        };
         let (argmax, dual_write, logprobs, grammar_mask, cast) = match dtype {
             MetalDtype::F16 => (
                 "argmax_f16",
@@ -232,6 +263,23 @@ impl OffTape<PipelineKey, Vec<PipelineKey>> {
             mtp_chain: head.map(|c| PipelineKey::new("mtp_chain", "mtp_chain", c.into())),
             select_rows: drafts.then(|| PipelineKey::new("select_rows", "select_rows", Vec::new())),
             vocab_suffix,
+            dflash2_accept: accept
+                .map(|c| PipelineKey::new("dflash2_accept", "dflash2_accept", c.into())),
+            dflash2_sampling: block_rows.map(|rows| {
+                let key = |f16, bf16| {
+                    let symbol = match dtype {
+                        MetalDtype::F16 => f16,
+                        _ => bf16,
+                    };
+                    let constants = TargetSamplingConstants { vocab, rows };
+                    PipelineKey::new("dflash2_target_sampling", symbol, constants.into())
+                };
+                TargetSampling {
+                    mass: key("dflash2_sample_mass_f16", "dflash2_sample_mass_bf16"),
+                    search: key("dflash2_sample_search_f16", "dflash2_sample_search_bf16"),
+                    draw: key("dflash2_sample_draw_f16", "dflash2_sample_draw_bf16"),
+                }
+            }),
         }
     }
 }
@@ -252,6 +300,12 @@ impl<K> OffTape<K, Vec<K>> {
                 suffix: s.suffix,
                 qmv: s.qmv.map(|rows| rows.into_iter().map(&mut f).collect()),
                 argmax: f(s.argmax),
+            }),
+            dflash2_accept: self.dflash2_accept.map(&mut f),
+            dflash2_sampling: self.dflash2_sampling.map(|s| TargetSampling {
+                mass: f(s.mass),
+                search: f(s.search),
+                draw: f(s.draw),
             }),
         }
     }

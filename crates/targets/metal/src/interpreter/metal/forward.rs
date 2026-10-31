@@ -138,6 +138,8 @@ pub struct ForwardInputs<'a> {
     /// reads it in place of the static cos/sin cache, with identity
     /// positions). `None` for 1D-rope arches.
     pub mrope_cos_sin: Option<&'a [u8]>,
+    /// A DFlash2 drafter's per-forward inputs; `None` for every other model's forward.
+    pub draft: Option<DraftInputs<'a>>,
     /// Bytes earlier forwards wrote on the device, for this one's runtime inputs.
     pub device_inputs: &'a [DeviceInput],
     /// `Some`: the host does not wait for this forward ([`Deferral`]).
@@ -167,15 +169,35 @@ impl ForwardInputs<'_> {
     }
 }
 
-/// What a forward's caller reads of it.
+/// A DFlash2 drafter's per-forward inputs (`crate::dflash2`): its lanes are the forward's
+/// sequences, in order.
+#[derive(Clone, Copy, Debug)]
+pub struct DraftInputs<'a> {
+    /// `[num_seqs]` u32 — each lane's ring slot.
+    pub ring_slots: &'a [u32],
+    /// `[num_seqs]` — each lane's policy for the cycle (a block draft's selection reads it).
+    pub lane_params: &'a [crate::dflash2::DraftLaneParams],
+    /// `[num_seqs * SAMPLING_UNIFORMS]` f32 — the uniforms each lane draws its cycle with.
+    pub uniforms: &'a [f32],
+    /// The forward is a cycle's context commit over its lanes' verify blocks: the rows each
+    /// retained are a device input (`DeviceInputInto::DraftRetained`), its target's acceptance's.
+    pub cycle: bool,
+}
+
+/// What a forward's caller reads of it: which of its tape's commands it plays
+/// ([`crate::tape::lowered::PlayLive`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ForwardReads {
     /// Its outputs — logits, final hidden states — and its cache writes.
     #[default]
     Outputs,
-    /// Its cache writes alone — KV, recurrent state: its tape plays only the commands they need
-    /// ([`crate::tape::lowered::LoweredMetalTape::cache_live`]).
+    /// Its cache writes alone — KV, recurrent state: its tape plays only the commands they need.
     CacheWrites,
+    /// Its result alone: its tape plays only the commands the result needs. A cache it writes
+    /// besides is written only where those commands write it; one only other commands write is
+    /// left as the forward found it (a DFlash2 drafter's block draft reads its rings and leaves
+    /// their commit to the play of its cache writes after its target's verify).
+    Result,
 }
 
 /// A forward the host commits without waiting for it, so the next one is queued while it runs. Its
@@ -289,6 +311,8 @@ pub enum DeviceInputInto {
     RopeRows,
     /// Each sequence's Gated-DeltaNet step code (`gdn_is_fresh`), over the host's.
     GdnSteps,
+    /// A drafter cycle commit's retained counts (`DraftRetained`): its target's acceptance's.
+    DraftRetained,
 }
 
 /// What one command buffer's commit feedback said, once it has said it. The handler sets it once
@@ -513,6 +537,14 @@ pub enum ForwardError {
         sampled: crate::tape::ids::SampledRowCount,
         overflow: crate::tape::lowered::LogitsOverflow,
     },
+    /// A forward that reads more than its cache writes, of `num_tokens` rows, whose bucket
+    /// (`bucket_m`) plays its cache writes alone ([`super::MetalBucketSpec::plays_result`]): its
+    /// arena holds none of what the rest of its tape writes.
+    CacheWritesOnly {
+        num_tokens: u32,
+        bucket_m: u32,
+        reads: ForwardReads,
+    },
     /// A step's sequence of no rows, which has no last row to sample.
     EmptySequence(EmptySequence),
 }
@@ -568,6 +600,15 @@ impl std::fmt::Display for ForwardError {
                 sampled.get(),
                 overflow.writes,
                 overflow.holds
+            ),
+            Self::CacheWritesOnly {
+                num_tokens,
+                bucket_m,
+                reads,
+            } => write!(
+                f,
+                "MetalWorkerPool::forward: a forward of {num_tokens} rows reads {reads:?}, but \
+                 its bucket of {bucket_m} plays its cache writes alone"
             ),
             Self::EmptySequence(e) => write!(f, "MetalWorkerPool::forward: {e}"),
         }

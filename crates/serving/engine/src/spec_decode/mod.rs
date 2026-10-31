@@ -17,6 +17,7 @@
 //! draft-model spec decode works on any backend without per-backend wiring.
 
 pub mod backend;
+pub mod block;
 pub mod mtp;
 pub mod ngram;
 pub mod proposer;
@@ -30,6 +31,7 @@ pub use mtp::{
     Chain, DraftBudget, DraftVocab, Drafting, HeadPasses, MtpDrafter, MtpProposer,
     MtpProposerConfig, PassOne, StepRows,
 };
+pub use block::{Block, BlockDrafter, BlockLane, BlockPasses, Commit};
 pub use ngram::{NgramProposer, NgramProposerConfig};
 pub use proposer::{DraftModelProposer, DraftSeedInputs, Proposer, ProposerStepCtx};
 pub use verify::{RejectionResult, greedy_rejection_sample};

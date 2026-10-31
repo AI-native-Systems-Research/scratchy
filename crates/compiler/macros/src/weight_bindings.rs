@@ -251,6 +251,10 @@ fn kind_of(lowered: &LoweredDecode, op_idx: usize) -> Result<WeightKind, String>
         // main loop), a `ScalarWeightMul` genuinely owns its weight: it does
         // not ride on an upstream gemm's accessor.
         L::ScalarWeightMul => WeightKind::RmsNorm,
+        // A DFlash2 drafter's: its attention's q/k norms and its commit's k norm are per-head
+        // gains; its convolutions' base kernels and its selector's codebooks bare tensors.
+        L::DraftAttention { .. } | L::DraftContextKv { .. } => WeightKind::RmsNorm,
+        L::DraftConv { .. } | L::DraftSelect => WeightKind::Tensor,
         other => {
             return Err(format!(
                 "weight_bindings: op {other:?} binds a weight but this walk has no kind for it — \

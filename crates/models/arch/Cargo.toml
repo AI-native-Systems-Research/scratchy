@@ -52,7 +52,8 @@ arch-qwen3-5 = []
 arch-qwen3-5-moe = []
 arch-qwen3-5-mtp = []
 arch-gemma4-assistant = []
-arch-qwen3-5-vl = ["arch-qwen3-5", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-dflash2 = []
+arch-qwen3-5-vl =["arch-qwen3-5", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-qwen3-moe = []
 
 # Passthrough so the carrier-parity test can cfg-gate its vision arm on the
@@ -91,6 +92,7 @@ all-arches = [
     "arch-qwen3-5-moe",
     "arch-qwen3-5-mtp",
     "arch-gemma4-assistant",
+    "arch-dflash2",
     "arch-qwen3-5-vl",
     "arch-qwen3-moe",
 ]
@@ -328,6 +330,9 @@ all-arches = [
 "gemma-4-26b-a4b-it-assistant" = ["arch-gemma4-assistant"]
 "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant" = ["arch-gemma4-assistant"]
 
+# dflash2 (1 configs)
+"qwen3.6-35b-a3b-dflash2" = ["arch-dflash2"]
+
 # qwen3-5-vl (2 configs)
 "qwen3.5-9b" = ["arch-qwen3-5-vl"]
 "qwen3.5-9b-parity-tiny" = ["arch-qwen3-5-vl"]
@@ -546,6 +551,9 @@ all-arches = [
     "gemma-4-26b-a4b-it-assistant",
     "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant",
 ]
+"dflash2" = [
+    "qwen3.6-35b-a3b-dflash2",
+]
 "qwen3-5-vl" = [
     "qwen3.5-9b",
     "qwen3.5-9b-parity-tiny",
@@ -706,6 +714,7 @@ all = [
     "qwen3.6-35b-a3b",
     "gemma-4-26b-a4b-it-assistant",
     "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant",
+    "qwen3.6-35b-a3b-dflash2",
     "qwen3.5-9b",
     "qwen3.5-9b-parity-tiny",
     "qwen3.6-27b",
@@ -739,7 +748,7 @@ all = [
 # only when `--speculative-model` names them. Reached as `spec/mtp` from
 # scratchy-cli through scratchy-spec (crates/models/spec), which forwards here:
 # like quant scope, it needs its own crate for its own CLI alias.
-mtp-heads = ["arch-qwen3-5-mtp", "arch-nemotron-h-mtp", "arch-gemma4-assistant"]
+mtp-heads = ["arch-qwen3-5-mtp", "arch-nemotron-h-mtp", "arch-gemma4-assistant", "arch-dflash2"]
 mtp = ["mtp-heads"]
 
 # Backends — ONE definition each (this is what kills the per-arch duplication).

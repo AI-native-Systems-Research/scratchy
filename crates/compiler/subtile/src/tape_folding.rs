@@ -1503,7 +1503,20 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
             })
             .min_by_key(|&j| ops.canonical_rank(j));
         let free = self.absorbed[a].is_none() && self.epilogue[a].is_none();
-        if winner == Some(i) && free && self.fusions[a].is_empty() && self.fusions[i].is_empty() {
+        // The fused command adds where the norm runs: a reader of the sum that runs before the
+        // norm (a DFlash2 target's capture of a layer's output) would read it unwritten.
+        let rank = ops.canonical_rank(i);
+        let read_before = (0..ops.slot.len()).any(|j| {
+            j != i
+                && ops.canonical_rank(j) < rank
+                && (ops.args[j].iter()).any(|arg| matches!(arg, Arg::Op(q) if *q == a))
+        });
+        if winner == Some(i)
+            && free
+            && !read_before
+            && self.fusions[a].is_empty()
+            && self.fusions[i].is_empty()
+        {
             self.absorbed[a] = Some(i);
             let add = ops.slot[a];
             self.record(i, kernel, FusedShape::ResidualNorm { add });

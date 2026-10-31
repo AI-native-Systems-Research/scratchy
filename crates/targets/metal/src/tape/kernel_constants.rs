@@ -982,6 +982,9 @@ pub struct AffineCombineQmvConstants {
     /// residual add (`COMBINE_GATE_SCALE` / `COMBINE_RESIDUAL`). Unset when it stores the sum alone.
     pub gate_scale: bool,
     pub residual: bool,
+    /// Whether each pair's down input row is where a sorted bake's sort put it, read through its
+    /// `pos` at buffer 11 (slot 22, `COMBINE_ROWS_SORTED`).
+    pub sorted_rows: bool,
 }
 
 impl From<AffineCombineQmvConstants> for Vec<ConstantValue> {
@@ -995,6 +998,10 @@ impl From<AffineCombineQmvConstants> for Vec<ConstantValue> {
         v.extend(
             c.residual
                 .then(|| ConstantValue::boolean(ConstSlot(19), true)),
+        );
+        v.extend(
+            c.sorted_rows
+                .then(|| ConstantValue::boolean(ConstSlot(22), true)),
         );
         v
     }
@@ -1457,5 +1464,145 @@ pub struct ChainAdvanceConstants {
 impl From<ChainAdvanceConstants> for Vec<ConstantValue> {
     fn from(c: ChainAdvanceConstants) -> Self {
         vec![ConstantValue::uint(ConstSlot(0), c.block_size.get())]
+    }
+}
+
+// ── Splash's DFlash2 drafter (`dflash2.metal`, `dflash2_select.metal`) ─────────────────────────
+
+/// `dflash2_target_sampling.metal`'s constants (`TSAMPLE_*`, slots 0-1): a target's logits width
+/// and its drafter's block.
+pub struct TargetSamplingConstants {
+    pub vocab: crate::tape::ids::LogitsWidth,
+    pub rows: u32,
+}
+
+impl From<TargetSamplingConstants> for Vec<ConstantValue> {
+    fn from(c: TargetSamplingConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.vocab.get()),
+            ConstantValue::uint(ConstSlot(1), c.rows),
+        ]
+    }
+}
+
+/// `dflash2_accept.metal`'s constants (`ACCEPT_*`, slots 0-1): a drafter's block and the token
+/// its proposal rows embed.
+#[derive(Clone, Copy, Debug)]
+pub struct DraftAcceptConstants {
+    pub rows: u32,
+    pub mask: u32,
+}
+
+impl From<DraftAcceptConstants> for Vec<ConstantValue> {
+    fn from(c: DraftAcceptConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.rows),
+            ConstantValue::uint(ConstSlot(1), c.mask),
+        ]
+    }
+}
+
+/// `dflash2_capture.metal`'s constants (`CAPTURE_*`, slots 0-3): a target layer's output rows
+/// into block `slot` of `slots` of the captured rows.
+pub struct CaptureConstants {
+    pub hidden: u32,
+    pub slot: u32,
+    pub slots: u32,
+    /// The bucket's elements: its rows times `hidden`.
+    pub elements: u32,
+}
+
+impl From<CaptureConstants> for Vec<ConstantValue> {
+    fn from(c: CaptureConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.hidden),
+            ConstantValue::uint(ConstSlot(1), c.slot),
+            ConstantValue::uint(ConstSlot(2), c.slots),
+            ConstantValue::uint(ConstSlot(3), c.elements),
+        ]
+    }
+}
+
+/// Every `dflash2.metal` kernel's constants: the drafter's geometry and the convolution stage a
+/// `draft_conv` runs (`DRAFT_*`, slots 0-10; every kernel of the shader sets every slot).
+pub struct DraftConstants {
+    pub rows: u32,
+    pub query_heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub window: u32,
+    pub splits: u32,
+    pub hidden: u32,
+    pub conv_group: u32,
+    /// 0: the convolution's preparing stage; 1: its finishing stage (and every other kernel).
+    pub conv_finish: u32,
+    pub rms_eps: f32,
+    pub scale: f32,
+}
+
+impl From<DraftConstants> for Vec<ConstantValue> {
+    fn from(c: DraftConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.rows),
+            ConstantValue::uint(ConstSlot(1), c.query_heads),
+            ConstantValue::uint(ConstSlot(2), c.kv_heads),
+            ConstantValue::uint(ConstSlot(3), c.head_dim),
+            ConstantValue::uint(ConstSlot(4), c.window),
+            ConstantValue::uint(ConstSlot(5), c.splits),
+            ConstantValue::uint(ConstSlot(6), c.hidden),
+            ConstantValue::uint(ConstSlot(7), c.conv_group),
+            ConstantValue::uint(ConstSlot(8), c.conv_finish),
+            ConstantValue::float(ConstSlot(9), c.rms_eps),
+            ConstantValue::float(ConstSlot(10), c.scale),
+        ]
+    }
+}
+
+/// Every `dflash2_select.metal` kernel's constants (`SELECT_*`, slots 0-31).
+pub struct DraftSelectConstants {
+    pub vocab: u32,
+    pub rows: u32,
+    pub positions: u32,
+    pub candidates: u32,
+    pub rank: u32,
+    pub shards: u32,
+    pub verify: crate::dflash2::VerifyRows,
+    pub lanes: u32,
+}
+
+impl From<DraftSelectConstants> for Vec<ConstantValue> {
+    fn from(c: DraftSelectConstants) -> Self {
+        use crate::dflash2::{PROPOSALS, VERIFY_COST_SEED, VerifyRows};
+        // Every row leaves the budget's slots unread.
+        let (every_row, slope, intercepts, cost) = match c.verify {
+            VerifyRows::EveryRow => (true, 0.0, [0.0; PROPOSALS as usize], VERIFY_COST_SEED),
+            VerifyRows::Budget {
+                slope,
+                intercepts,
+                cost,
+            } => (false, slope, intercepts, cost),
+        };
+        let mut v = vec![
+            ConstantValue::uint(ConstSlot(0), c.vocab),
+            ConstantValue::uint(ConstSlot(1), c.rows),
+            ConstantValue::uint(ConstSlot(2), c.positions),
+            ConstantValue::uint(ConstSlot(3), c.candidates),
+            ConstantValue::uint(ConstSlot(4), c.rank),
+            ConstantValue::uint(ConstSlot(5), c.shards),
+            ConstantValue::float(ConstSlot(6), slope),
+        ];
+        v.extend(
+            (7u16..)
+                .zip(intercepts)
+                .map(|(s, x)| ConstantValue::float(ConstSlot(s), x)),
+        );
+        v.push(ConstantValue::uint(ConstSlot(14), c.lanes));
+        v.push(ConstantValue::boolean(ConstSlot(15), every_row));
+        v.extend(
+            (16u16..)
+                .zip(cost.0.into_iter().flatten())
+                .map(|(s, x)| ConstantValue::float(ConstSlot(s), x)),
+        );
+        v
     }
 }

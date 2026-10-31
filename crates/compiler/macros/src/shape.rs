@@ -423,6 +423,17 @@ pub fn apply_signature_with_geometry(
                 output: inputs[0].clone(),
             })
         }
+        // A captured layer's rows: identity.
+        OpKind::CaptureHidden => {
+            expect_args(op, inputs, 1)?;
+            Ok(OpSig {
+                output: inputs[0].clone(),
+            })
+        }
+        OpKind::DraftContextKv => sig_draft_context_kv(solver, inputs),
+        OpKind::DraftConv => sig_draft_conv(solver, inputs),
+        OpKind::DraftAttention => sig_draft_attention(solver, inputs),
+        OpKind::DraftSelect => sig_draft_select(solver, inputs),
         // Vision varlen attention: q/k/v + cu_seqlens + max_seqlen.
         // No heads-layout anchoring — vision shapes are pinned at
         // the qkv-gemm weight, not at attention. See `sig_varlen_attention`.
@@ -685,6 +696,139 @@ fn sig_rope_append(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, Shap
     // The caller binds the other two targets separately (see
     // `infer::classify_rope_append_tuple`).
     Ok(OpSig { output: q.clone() })
+}
+
+/// A named bound of a DFlash2 drafter's geometry (its arch.json `params`).
+fn draft_bound(name: &str) -> Dim {
+    Dim::Bound(name.into())
+}
+
+/// Unify a drafter op's rank-1 `weight` with `dim`.
+fn draft_rank1(
+    solver: &mut Solver,
+    op: OpKind,
+    what: &str,
+    weight: &Shape,
+    dim: &Dim,
+) -> Result<(), ShapeError> {
+    match weight.as_slice() {
+        [only] => solver.unify(only, dim),
+        _ => Err(ShapeError::BadArgs {
+            op,
+            reason: format!("{what} must have rank 1, got {}", weight.len()),
+        }),
+    }
+}
+
+/// Unify the last dim of a drafter op's activation `x` with `dim`.
+fn draft_last(
+    solver: &mut Solver,
+    op: OpKind,
+    what: &str,
+    x: &Shape,
+    dim: &Dim,
+) -> Result<(), ShapeError> {
+    let last = x.last().ok_or_else(|| ShapeError::BadArgs {
+        op,
+        reason: format!("{what} must have rank >= 1"),
+    })?;
+    solver.unify(last, dim)
+}
+
+/// `draft_context_kv(kv: [.., draft_kv_size], k_norm: [head_dim], positions, rotary)` → `kv`: a
+/// context row's keys then values, as Splash's context writers read them
+/// (runtime/metal/kernels/common/draft_context_kv.h).
+fn sig_draft_context_kv(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    let op = OpKind::DraftContextKv;
+    expect_args(op, inputs, 4)?;
+    draft_last(solver, op, "kv", &inputs[0], &draft_bound("draft_kv_size"))?;
+    draft_rank1(solver, op, "k_norm", &inputs[1], &draft_bound("head_dim"))?;
+    Ok(OpSig {
+        output: inputs[0].clone(),
+    })
+}
+
+/// `draft_conv(x: [.., hidden_size], dynamic: [.., draft_dynamic_size],
+/// base: [draft_conv_base_size])`, with an optional `residual` like `x` (the finishing stage) →
+/// `x`'s shape.
+fn sig_draft_conv(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    let op = OpKind::DraftConv;
+    if inputs.len() != 3 && inputs.len() != 4 {
+        return Err(ShapeError::ArgCount {
+            op,
+            expected: 3,
+            got: inputs.len(),
+        });
+    }
+    let x = &inputs[0];
+    draft_last(solver, op, "x", x, &draft_bound("hidden_size"))?;
+    draft_last(
+        solver,
+        op,
+        "dynamic",
+        &inputs[1],
+        &draft_bound("draft_dynamic_size"),
+    )?;
+    draft_rank1(
+        solver,
+        op,
+        "base kernel",
+        &inputs[2],
+        &draft_bound("draft_conv_base_size"),
+    )?;
+    if let Some(residual) = inputs.get(3) {
+        if residual.len() != x.len() {
+            return Err(ShapeError::BadArgs {
+                op,
+                reason: "residual must be shaped like x".into(),
+            });
+        }
+        for (a, b) in x.iter().zip(residual) {
+            solver.unify(a, b)?;
+        }
+    }
+    Ok(OpSig { output: x.clone() })
+}
+
+/// `draft_attention(qkv: [.., draft_qkv_size], q_norm: [head_dim], k_norm: [head_dim], positions,
+/// rotary)` → `[.., draft_attention_size]`: Splash's packed q|k|v row in, an attention row out.
+fn sig_draft_attention(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    let op = OpKind::DraftAttention;
+    expect_args(op, inputs, 5)?;
+    let qkv = &inputs[0];
+    draft_last(solver, op, "qkv", qkv, &draft_bound("draft_qkv_size"))?;
+    draft_rank1(solver, op, "q_norm", &inputs[1], &draft_bound("head_dim"))?;
+    draft_rank1(solver, op, "k_norm", &inputs[2], &draft_bound("head_dim"))?;
+    let mut output = qkv[..qkv.len() - 1].to_vec();
+    output.push(draft_bound("draft_attention_size"));
+    Ok(OpSig { output })
+}
+
+/// `draft_select(logits: [.., vocab_size], selector: [.., selector_rank],
+/// predecessor_codebook, successor_codebook: [draft_codebook_size])` → `logits`.
+fn sig_draft_select(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    let op = OpKind::DraftSelect;
+    expect_args(op, inputs, 4)?;
+    draft_last(solver, op, "logits", &inputs[0], &draft_bound("vocab_size"))?;
+    draft_last(
+        solver,
+        op,
+        "selector",
+        &inputs[1],
+        &draft_bound("selector_rank"),
+    )?;
+    for book in &inputs[2..4] {
+        draft_rank1(
+            solver,
+            op,
+            "codebook",
+            book,
+            &draft_bound("draft_codebook_size"),
+        )?;
+    }
+    Ok(OpSig {
+        output: inputs[0].clone(),
+    })
 }
 
 /// `kv_append((k, v, kv_cache))` → `(k, v)`, shape-preserving on both.
@@ -1208,6 +1352,15 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::SharedAttention => &[],
         OpKind::SharedSlidingAttention => &[],
         OpKind::ExportHidden => &[],
+        OpKind::CaptureHidden => &[],
+        // The key norm `[head_dim]`.
+        OpKind::DraftContextKv => &[(1, 1)],
+        // The stages' base kernel, flat `[2 · taps · hidden]`.
+        OpKind::DraftConv => &[(2, 1)],
+        // The query and key norms `[head_dim]`.
+        OpKind::DraftAttention => &[(1, 1), (2, 1)],
+        // The predecessor and successor codebooks, flat `[vocab · rank]`.
+        OpKind::DraftSelect => &[(2, 1), (3, 1)],
         OpKind::VarlenAttention => &[],
         OpKind::Silu => &[],
         OpKind::Gelu => &[],

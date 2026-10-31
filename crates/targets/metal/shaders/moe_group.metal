@@ -52,13 +52,20 @@ SCRATCHY_CONSTANT_OPTIONAL(int, MG_BM, 6);
 // gathered matvecs have no such guard, so their bake fills 0 (a real
 // expert's slab — garbage compute on rows nothing reads).
 SCRATCHY_CONSTANT_OPTIONAL(int, MG_SENTINEL, 7);
+// The picks of a row: pair i is row i / MG_TOP_K's.
+SCRATCHY_CONSTANT_OPTIONAL(int, MG_TOP_K, 3);
 
+// The live pairs are the step's rows' (`num_tokens` of them, MG_TOP_K picks each): a bucket's rows
+// past them hold picks no step made, which Splash's grouping leaves out of its tiles as it does a
+// lane's unverified rows (~/git/splash runtime/metal/kernels/shared/moe.metal:128
+// `moe_unverified_route`). Counted, they would claim slots between the live ones.
 #if SCRATCHY_COMPILES(moe_group_offsets)
 kernel void moe_group_offsets(
     const device uint* topk_inds [[buffer(0)]],
     device uint*       count     [[buffer(1)]],
     device uint*       offset    [[buffer(2)]],
     device uint*       total     [[buffer(3)]],
+    const device uint* num_tokens [[buffer(4)]],
     uint tid     [[thread_position_in_threadgroup]],
     uint tgsize  [[threads_per_threadgroup]]) {
   // One bin per expert: the bake compiles this kernel at its block's expert count.
@@ -68,7 +75,8 @@ kernel void moe_group_offsets(
     atomic_store_explicit(&local[i], 0u, memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint i = tid; i < uint(MG_M); i += tgsize) {
+  const uint live = min(uint(MG_M), num_tokens[0] * uint(MG_TOP_K));
+  for (uint i = tid; i < live; i += tgsize) {
     uint e = topk_inds[i];
     if (e < E) {
       atomic_fetch_add_explicit(&local[e], 1u, memory_order_relaxed);
@@ -118,7 +126,6 @@ kernel void moe_group_init(
 // indices_pad[p]=e, and gather the token's x row into x_pad[p].
 // x is [bucket_m, K]; the token of pair i is i / MG_TOP_K. One
 // threadgroup row-block per pair (grid.y = MG_M), threads cover K.
-SCRATCHY_CONSTANT_OPTIONAL(int, MG_TOP_K, 3);
 SCRATCHY_CONSTANT_OPTIONAL(int, MG_K, 4);
 
 template <typename T>

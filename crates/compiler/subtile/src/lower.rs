@@ -215,6 +215,11 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::EncoderAttn { .. }
             | O::GatedDeltaNet
             | O::Mamba2 { .. }
+            | O::CaptureHidden { .. }
+            | O::DraftConv { .. }
+            | O::DraftAttention { .. }
+            | O::DraftContextKv { .. }
+            | O::DraftSelect
             | expansion_ops!()
             | O::ScalarMul { .. }
             | O::SiluMul
