@@ -2295,6 +2295,13 @@ fn write_runtime_inputs(
     }
     // The rows the forward samples: the lm_head slice gathers them and puts them back, a
     // compaction moves their logits to the front.
+    // The forward's actual num_tokens, for a kernel that reads M at runtime.
+    write(
+        "num_tokens",
+        &runtime.num_tokens_u32,
+        bytes_of(&[inputs.num_tokens]),
+        Padding::Zero,
+    )?;
     let sampled = inputs.sampled_rows;
     write(
         "num_sample_rows",
@@ -2518,6 +2525,7 @@ mod tests {
             block_unrotated_flags: (0..num_layers).map(|_| alloc(device, 16)).collect(),
             tq: None,
             num_sample_rows_u32: alloc(device, 4),
+            num_tokens_u32: alloc(device, 4),
             sample_indices: alloc(device, 16),
             gdn_state_conv: ::std::vec::Vec::new(),
             gdn_state_ssm: ::std::vec::Vec::new(),
@@ -2870,6 +2878,7 @@ mod tests {
             block_unrotated_flags: vec![alloc(d, 16)],
             tq: None,
             num_sample_rows_u32: alloc(d, 4),
+            num_tokens_u32: alloc(d, 4),
             sample_indices: alloc(d, max_m_bytes),
             gdn_state_conv: ::std::vec::Vec::new(),
             gdn_state_ssm: ::std::vec::Vec::new(),
@@ -3345,6 +3354,7 @@ mod tests {
                 ("seq_used_k", &runtime.seq_used_k),
                 ("span_ids", &runtime.span_ids),
                 ("num_sample_rows_u32", &runtime.num_sample_rows_u32),
+                ("num_tokens_u32", &runtime.num_tokens_u32),
                 ("sample_indices", &runtime.sample_indices),
                 ("gdn_is_fresh", &runtime.gdn_is_fresh),
             ];

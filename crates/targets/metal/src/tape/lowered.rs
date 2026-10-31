@@ -1327,6 +1327,10 @@ pub enum RuntimeBindingKind {
     BlockUnrotatedFlags {
         layer: LayerId,
     },
+    /// `[1]` u32 — actual `num_tokens` of this forward, written by the worker at `forward()`
+    /// entry, for a kernel that needs M at runtime without a function constant (M varies per
+    /// call): the DFlash2 drafter's.
+    NumTokensU32,
     /// `[1]` u32 — the in-flight forward's sampled rows' count (`SampleIndices`' length): the
     /// rows the lm_head slice gathers and puts back, and the logits rows a compaction keeps.
     NumSampleRowsU32,
@@ -1814,6 +1818,7 @@ impl RuntimeBindingKind {
             | Self::CuSeqlensQ
             | Self::SeqUsedK
             | Self::SpanIds
+            | Self::NumTokensU32
             | Self::NumSampleRowsU32
             | Self::SampleIndices
             | Self::GdnStateIndices

@@ -959,6 +959,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // The sampled rows the gather and its undoing read by baked gpuAddress — pinned
                 // below.
                 num_sample_rows_u32,
+                // Written every forward, read by the DFlash2 drafter's kernels: pinned below.
+                num_tokens_u32,
                 sample_indices,
                 // GDN persistent state pools and draft lanes — pinned by the GdnStatePool owner.
                 gdn_state_conv: _,
@@ -1001,6 +1003,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // The rows the forward samples: the lm_head slice's gather and the logits compaction
             // bind them by dispatch-baked address, same lazy-pager hazard as the inputs.
             pin(num_sample_rows_u32);
+            pin(num_tokens_u32);
             pin(sample_indices);
             // Per-KV-cache-group slot_mappings + block tables (vLLM hybrid
             // layout). One group on uniform models; full + N sliding on gemma4
@@ -2554,6 +2557,7 @@ mod tests {
             block_unrotated_flags: (0..num_layers).map(|_| alloc_buffer(device, 16)).collect(),
             tq: None,
             num_sample_rows_u32: alloc_buffer(device, 4),
+            num_tokens_u32: alloc_buffer(device, 4),
             sample_indices: alloc_buffer(device, 16),
             gdn_state_conv: ::std::vec::Vec::new(),
             gdn_state_ssm: ::std::vec::Vec::new(),

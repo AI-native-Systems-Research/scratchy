@@ -134,6 +134,9 @@ pub struct RuntimeBindings {
     /// ([`super::ForwardInputs::sampled_rows`]). Read by the
     /// `gather_sampled_rows`/`put_sampled_rows_back` kernels.
     pub num_sample_rows_u32: Buffer,
+    /// `[1]` u32 — actual `num_tokens` of the in-flight forward, written at the start of every
+    /// `forward()` for the kernels that read M at runtime (the DFlash2 drafter's).
+    pub num_tokens_u32: Buffer,
     /// `[num_sample_rows]` u32 — the in-flight forward's sampled rows,
     /// ascending: Python vLLM's `logits_indices`. Sized at construction
     /// for the worker's largest bucket's `bucket_m`; the pool writes the
@@ -391,6 +394,7 @@ impl RuntimeBindings {
             RuntimeBindingKind::TqSigns => &self.tq().signs,
             RuntimeBindingKind::TqBoundaries => &self.tq().boundaries,
             RuntimeBindingKind::TqCentroids => &self.tq().centroids,
+            RuntimeBindingKind::NumTokensU32 => &self.num_tokens_u32,
             RuntimeBindingKind::NumSampleRowsU32 => &self.num_sample_rows_u32,
             RuntimeBindingKind::SampleIndices => &self.sample_indices,
             RuntimeBindingKind::GdnConvState { layer } => {

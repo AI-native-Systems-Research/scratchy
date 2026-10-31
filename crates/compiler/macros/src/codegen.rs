@@ -16344,6 +16344,9 @@ pub fn emit_model(
                             // slice's gather / scatter know how many rows
                             // to move.
                             num_sample_rows_u32: alloc(4),
+                            // 4 bytes — the worker writes the current forward()'s `num_tokens`
+                            // here before dispatch, for the kernels that read M at runtime.
+                            num_tokens_u32: alloc(4),
                             // [max_m] u32 — worker writes the sampled
                             // rows here before dispatch.
                             sample_indices: alloc(max_m * 4),
