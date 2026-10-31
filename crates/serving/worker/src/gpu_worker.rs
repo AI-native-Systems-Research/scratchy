@@ -4252,7 +4252,7 @@ impl MetalWorker {
         let block_scores = matches!(then, Some(Then::Block(_)));
         let head = match (then, head_device) {
             (Some(Then::Block(step)), Some(device)) => {
-                Some(HeadEncoder::Block(BlockPassesEncoder {
+                Some(HeadEncoder::Block(Box::new(BlockPassesEncoder {
                     step,
                     model: (self.draft_model.as_deref()).ok_or_else(|| {
                         BackendError::Backend("DFlash2 drafter not loaded".into())
@@ -4266,7 +4266,7 @@ impl MetalWorker {
                     })?,
                     device,
                     logprobs: logprobs.clone(),
-                }))
+                })))
             }
             (Some(Then::Mtp(passes)), Some(device)) => {
                 let model = (self.draft_model.as_deref())
@@ -5400,12 +5400,12 @@ impl Dflash2 {
                     true => scratchy_target_metal::dflash2::BufferCopy {
                         from: logits,
                         from_at: logits_at,
-                        to: &**raw,
+                        to: raw,
                         to_at: raw_at,
                         len,
                     },
                     false => scratchy_target_metal::dflash2::BufferCopy {
-                        from: &**raw,
+                        from: raw,
                         from_at: raw_at,
                         to: logits,
                         to_at: logits_at,
@@ -5860,7 +5860,7 @@ fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
 #[cfg(feature = "metal")]
 enum HeadEncoder<'a> {
     Mtp(Box<HeadPassesEncoder<'a>>),
-    Block(BlockPassesEncoder<'a>),
+    Block(Box<BlockPassesEncoder<'a>>),
 }
 
 /// What a step's passes after its target leave for the host: an MTP head's drafts, or a block
@@ -8508,7 +8508,7 @@ impl Worker for MetalWorker {
                 let ops = &scheduler_output.recurrent_state;
                 let mut restores = Vec::new();
                 for op in &ops.restores {
-                    let in_step = step_rows.req_ids.iter().any(|r| *r == op.req_id);
+                    let in_step = step_rows.req_ids.contains(&op.req_id);
                     if !in_step || !scheduler_output.draft_req_ids.contains(&op.req_id) {
                         continue;
                     }
@@ -8524,10 +8524,13 @@ impl Worker for MetalWorker {
                     d.contexts.restore(&op.req_id, op.position);
                     let ring_slot =
                         (d.slots.of(&op.req_id)).map_err(ExecutorError::WorkerExecution)?;
-                    restores.push((op.req_id.as_str(), WindowRestore {
-                        ring_slot,
-                        snapshot: op.slot,
-                    }));
+                    restores.push((
+                        op.req_id.as_str(),
+                        WindowRestore {
+                            ring_slot,
+                            snapshot: op.slot,
+                        },
+                    ));
                 }
                 let passes = (d.drafter)
                     .passes(&step_rows, &scheduler_output.draft_req_ids, &d.contexts)
@@ -8537,9 +8540,8 @@ impl Worker for MetalWorker {
                 // A plan that continues its restored window captures from where it resumes: its
                 // step commits the rows the window goes on with.
                 let commits = |req_id: &str| {
-                    (passes.iter()).any(|p| {
-                        (p.commit.steps.iter()).any(|&i| req_ids_in_order[i] == req_id)
-                    })
+                    (passes.iter())
+                        .any(|p| (p.commit.steps.iter()).any(|&i| req_ids_in_order[i] == req_id))
                 };
                 if let Some((req_id, _)) = restores.iter().find(|(r, _)| !commits(r)) {
                     return Err(ExecutorError::WorkerExecution(format!(
