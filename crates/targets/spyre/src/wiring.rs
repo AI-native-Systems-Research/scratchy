@@ -1796,6 +1796,190 @@ pub struct TpForward {
     pub sources: &'static [SourceShard],
 }
 
+/// Why rank `me`'s share of a source could not be cut from its checkpoint bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SliceRefusal {
+    /// The sharded forward states no slice law for this source.
+    NotASource { id: u32, sources: usize },
+    /// The whole tensor's bytes are not its one-rank shape's.
+    Size { id: u32, bytes: usize, want: usize },
+    /// The element width has no byte-exact cut here.
+    Element { id: u32, bytes: usize },
+    /// The split axis does not divide by the world.
+    Indivisible {
+        id: u32,
+        shard: SourceShard,
+        rows: u32,
+        cols: u32,
+    },
+    /// A head-block split of a gemm weight — a law the analysis gives caches, not weights.
+    HeadSplitGemm { id: u32 },
+}
+
+impl std::fmt::Display for SliceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotASource { id, sources } => write!(
+                f,
+                "source {id} has no slice law (the sharded forward states {sources})"
+            ),
+            Self::Size { id, bytes, want } => write!(
+                f,
+                "source {id} is {bytes} bytes on disk, but its one-rank shape spans {want}"
+            ),
+            Self::Element { id, bytes } => {
+                write!(f, "source {id}: a {bytes}-byte element has no cut")
+            }
+            Self::Indivisible {
+                id,
+                shard,
+                rows,
+                cols,
+            } => write!(
+                f,
+                "source {id} [{rows}, {cols}] does not split {shard:?} across the world"
+            ),
+            Self::HeadSplitGemm { id } => {
+                write!(f, "source {id} is a gemm weight with a head-block split")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SliceRefusal {}
+
+// The bridge below names every spyre world; a new one must be added there too.
+const _: () = assert!(
+    crate::bundle_code::collective::SPYRE_TP_WORLDS.len() == 2
+        && crate::bundle_code::collective::SPYRE_TP_WORLDS[0] == 1
+        && crate::bundle_code::collective::SPYRE_TP_WORLDS[1] == 2
+);
+
+/// The shared analysis's names for `me`'s rank and world.
+fn analysis_rank(
+    me: crate::bundle_code::collective::TpIdentity,
+) -> (
+    scratchy_subtile::tensor_parallel::RankIndex,
+    scratchy_subtile::tensor_parallel::WorldSize,
+) {
+    use scratchy_subtile::tensor_parallel::WorldSize;
+    let world = match me.world().get() {
+        1 => WorldSize::of::<1>(),
+        _ => WorldSize::of::<2>(),
+    };
+    let rank = world
+        .ranks()
+        .nth(me.rank() as usize)
+        .expect("a TpIdentity's rank is below its world");
+    (rank, world)
+}
+
+impl TpForward {
+    /// ⭐ THE BYTES RANK `me` STAGES FOR SOURCE `id`: its share of the whole checkpoint tensor
+    /// `full`, cut by the slice law the analysis derived for that source ([`Self::sources`]) —
+    /// `scratchy_subtile::tensor_parallel::slice_source`, the one implementation of it.
+    ///
+    /// `whole` is the source's one-rank shape (the one-rank wiring's `tensor_shapes`) and `elem`
+    /// its element width. A gemm weight sits on disk as `[n, k]`, the transpose of its logical
+    /// `[k, n]`, so its row and column laws trade places on the bytes.
+    ///
+    /// # Errors
+    /// [`SliceRefusal`], by name.
+    pub fn slice_source_bytes(
+        &self,
+        me: crate::bundle_code::collective::TpIdentity,
+        id: u32,
+        full: Vec<u8>,
+        elem: usize,
+        whole: (u32, u32),
+        is_gemm: bool,
+    ) -> Result<Vec<u8>, SliceRefusal> {
+        let shard = *self
+            .sources
+            .get(id as usize)
+            .ok_or(SliceRefusal::NotASource {
+                id,
+                sources: self.sources.len(),
+            })?;
+        cut_source_bytes(shard, me, id, full, elem, whole, is_gemm)
+    }
+}
+
+/// [`TpForward::slice_source_bytes`] once the source's law is known.
+fn cut_source_bytes(
+    shard: SourceShard,
+    me: crate::bundle_code::collective::TpIdentity,
+    id: u32,
+    full: Vec<u8>,
+    elem: usize,
+    whole: (u32, u32),
+    is_gemm: bool,
+) -> Result<Vec<u8>, SliceRefusal> {
+    use scratchy_subtile::subtile_ir::SourceShape;
+    use scratchy_subtile::tensor_parallel::slice_source;
+    if shard == SourceShard::Whole {
+        return Ok(full);
+    }
+    let (rows, cols) = whole;
+    let want = rows as usize * cols as usize * elem;
+    if full.len() != want {
+        return Err(SliceRefusal::Size {
+            id,
+            bytes: full.len(),
+            want,
+        });
+    }
+    let w = me.world().get();
+    let divides = match shard {
+        SourceShard::Whole => true,
+        SourceShard::Rows => rows.is_multiple_of(w),
+        SourceShard::Cols => cols.is_multiple_of(w),
+        SourceShard::HeadRows { heads } => {
+            heads.get().is_multiple_of(w) && rows.is_multiple_of(heads.get())
+        }
+    };
+    if !divides {
+        return Err(SliceRefusal::Indivisible {
+            id,
+            shard,
+            rows,
+            cols,
+        });
+    }
+    // The bytes' own layout: a gemm weight's disk order is the transpose of its logical one.
+    let (shape, shard) = if is_gemm {
+        let disk = SourceShape {
+            rows: cols,
+            cols: rows,
+        };
+        match shard {
+            SourceShard::Rows => (disk, SourceShard::Cols),
+            SourceShard::Cols => (disk, SourceShard::Rows),
+            SourceShard::Whole => (disk, SourceShard::Whole),
+            SourceShard::HeadRows { .. } => return Err(SliceRefusal::HeadSplitGemm { id }),
+        }
+    } else {
+        (SourceShape { rows, cols }, shard)
+    };
+    let (rank, world) = analysis_rank(me);
+    fn cut<const N: usize>(
+        full: &[u8],
+        shape: SourceShape,
+        shard: SourceShard,
+        rank: scratchy_subtile::tensor_parallel::RankIndex,
+        world: scratchy_subtile::tensor_parallel::WorldSize,
+    ) -> Vec<u8> {
+        let (elems, _) = full.as_chunks::<N>();
+        slice_source(elems, shape, shard, rank, world).into_flattened()
+    }
+    match elem {
+        1 => Ok(cut::<1>(&full, shape, shard, rank, world)),
+        2 => Ok(cut::<2>(&full, shape, shard, rank, world)),
+        4 => Ok(cut::<4>(&full, shape, shard, rank, world)),
+        bytes => Err(SliceRefusal::Element { id, bytes }),
+    }
+}
+
 /// Which forward a session runs — decided by its rank's world, and nothing else.
 pub enum WorldForward {
     /// A world of one: the model's one-rank wiring.
@@ -2773,5 +2957,70 @@ mod constant_tape_tests {
             ),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tp_slice_tests {
+    use super::*;
+    use crate::bundle_code::collective::TpWorld;
+
+    /// A gemm weight's bytes sit on disk as `[n, k]`: its K-split (`Rows`) takes a column block of
+    /// those bytes and its N-split (`Cols`) a row block, each rank its own, and a `Whole` source
+    /// passes through untouched — a multi-byte element moving as one.
+    #[test]
+    fn a_rank_stages_its_block_of_the_disk_bytes() {
+        let world = TpWorld::of::<2>();
+        let (r0, r1) = (world.rank(0).unwrap(), world.rank(1).unwrap());
+        // Logical [k=2, n=4]; on disk [n=4, k=2], element (n, k) = 10·n + k.
+        let disk: Vec<u8> = (0..4u8)
+            .flat_map(|n| (0..2u8).map(move |k| 10 * n + k))
+            .collect();
+        let cut = |shard, me| cut_source_bytes(shard, me, 7, disk.clone(), 1, (2, 4), true);
+        assert_eq!(cut(SourceShard::Rows, r0), Ok(vec![0, 10, 20, 30]));
+        assert_eq!(cut(SourceShard::Rows, r1), Ok(vec![1, 11, 21, 31]));
+        assert_eq!(cut(SourceShard::Cols, r0), Ok(vec![0, 1, 10, 11]));
+        assert_eq!(cut(SourceShard::Cols, r1), Ok(vec![20, 21, 30, 31]));
+        assert_eq!(cut(SourceShard::Whole, r1), Ok(disk.clone()));
+        // A two-byte element moves as one: a norm row [1, 4] split by columns.
+        let row: Vec<u8> = (0..8).collect();
+        assert_eq!(
+            cut_source_bytes(SourceShard::Cols, r1, 3, row, 2, (1, 4), false),
+            Ok(vec![4, 5, 6, 7])
+        );
+    }
+
+    /// Every cut it cannot make byte-exactly is refused by name.
+    #[test]
+    fn a_cut_it_cannot_make_is_refused() {
+        let r0 = TpWorld::of::<2>().rank(0).unwrap();
+        assert_eq!(
+            cut_source_bytes(SourceShard::Cols, r0, 1, vec![0; 6], 1, (2, 4), false),
+            Err(SliceRefusal::Size {
+                id: 1,
+                bytes: 6,
+                want: 8
+            })
+        );
+        assert_eq!(
+            cut_source_bytes(SourceShard::Cols, r0, 1, vec![0; 3], 1, (1, 3), false),
+            Err(SliceRefusal::Indivisible {
+                id: 1,
+                shard: SourceShard::Cols,
+                rows: 1,
+                cols: 3
+            })
+        );
+        assert_eq!(
+            cut_source_bytes(SourceShard::Rows, r0, 1, vec![0; 24], 3, (2, 4), true),
+            Err(SliceRefusal::Element { id: 1, bytes: 3 })
+        );
+        let heads = SourceShard::HeadRows {
+            heads: std::num::NonZeroU32::new(2).unwrap(),
+        };
+        assert_eq!(
+            cut_source_bytes(heads, r0, 1, vec![0; 8], 1, (2, 4), true),
+            Err(SliceRefusal::HeadSplitGemm { id: 1 })
+        );
     }
 }
