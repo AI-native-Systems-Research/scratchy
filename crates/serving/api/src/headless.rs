@@ -10,23 +10,26 @@
 //!
 //! NCCL collectives in the model forward pass synchronize tensor data
 //! between ranks automatically — no explicit NCCL calls needed here.
+//! On spyre each rank is a process driving one card, and its collectives
+//! are the card's own p2p RDMA control blocks, in the same stream as the
+//! compute — this loop only hands each rank the step to run.
 
-#[cfg(feature = "nccl")]
+#[cfg(any(feature = "nccl", feature = "spyre-hw"))]
 use scratchy_serving_engine::executor::Executor;
-#[cfg(feature = "nccl")]
+#[cfg(any(feature = "nccl", feature = "spyre-hw"))]
 use scratchy_serving_transport::TcpControlChannel;
-#[cfg(feature = "nccl")]
+#[cfg(any(feature = "nccl", feature = "spyre-hw"))]
 use scratchy_serving_worker::multinode::ControlMessage;
-#[cfg(feature = "nccl")]
+#[cfg(any(feature = "nccl", feature = "spyre-hw"))]
 use scratchy_serving_worker::uniproc::UniProcExecutor;
-#[cfg(feature = "nccl")]
+#[cfg(any(feature = "nccl", feature = "spyre-hw"))]
 use tracing::{error, info};
 
 /// Run the headless worker loop. Blocks forever (or until shutdown).
 ///
 /// Loops on TCP control channel: receive `ControlMessage` from rank 0,
 /// dispatch to local executor, discard output, repeat.
-#[cfg(feature = "nccl")]
+#[cfg(any(feature = "nccl", feature = "spyre-hw"))]
 pub fn run_headless(
     mut executor: UniProcExecutor,
     mut channel: TcpControlChannel,

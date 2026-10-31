@@ -263,6 +263,53 @@ impl TcpControlChannel {
     }
 }
 
+/// The one byte a follower sends its leader on [`TcpControlChannel::report_ready`].
+const READY: u8 = 0x52;
+
+impl TcpControlChannel {
+    /// A follower tells its leader it is ready — the one frame that flows follower → leader.
+    ///
+    /// A tensor-parallel rank whose collectives run card to card (spyre's p2p RDMA) must not
+    /// issue its first send before every peer has mapped the link and programmed the window it
+    /// lands in; the leader holds its first step until every follower has said so.
+    pub fn report_ready(&mut self) -> Result<()> {
+        match &mut self.role {
+            ChannelRole::Follower { stream } => stream
+                .write_all(&[READY])
+                .and_then(|()| stream.flush())
+                .context("control channel: failed to report ready"),
+            ChannelRole::Leader { .. } => {
+                anyhow::bail!("report_ready() called on leader (rank 0)")
+            }
+        }
+    }
+
+    /// The leader blocks until every follower has [`report_ready`](Self::report_ready).
+    pub fn await_ready(&mut self) -> Result<()> {
+        match &mut self.role {
+            ChannelRole::Leader { streams } => {
+                for (i, stream) in streams.iter_mut().enumerate() {
+                    let mut byte = [0u8; 1];
+                    stream.read_exact(&mut byte).with_context(|| {
+                        format!("control channel: follower {} never reported ready", i + 1)
+                    })?;
+                    if byte[0] != READY {
+                        anyhow::bail!(
+                            "control channel: follower {} sent {:#04x}, not ready",
+                            i + 1,
+                            byte[0]
+                        );
+                    }
+                }
+                Ok(())
+            }
+            ChannelRole::Follower { .. } => {
+                anyhow::bail!("await_ready() called on follower (rank > 0)")
+            }
+        }
+    }
+}
+
 /// Connect to a TCP address with retry and backoff.
 fn connect_with_retry(addr: &str, max_attempts: usize, delay_ms: u64) -> Result<TcpStream> {
     for attempt in 0..max_attempts {
@@ -300,6 +347,30 @@ fn connect_with_retry(addr: &str, max_attempts: usize, delay_ms: u64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The leader's `await_ready` returns only after every follower reported ready, and a
+    /// broadcast still reaches each follower afterwards.
+    #[test]
+    fn the_leader_waits_for_every_follower_to_report_ready() {
+        let port = master_port_binding(CONTROL_CHANNEL_PORT_OFFSET);
+        let followers: Vec<_> = (1..3)
+            .map(|rank| {
+                std::thread::spawn(move || {
+                    let mut ch = TcpControlChannel::establish(rank, 3, "127.0.0.1", port).unwrap();
+                    ch.report_ready().unwrap();
+                    assert!(ch.await_ready().is_err(), "a follower awaits no one");
+                    ch.recv().unwrap()
+                })
+            })
+            .collect();
+        let mut leader = TcpControlChannel::establish(0, 3, "127.0.0.1", port).unwrap();
+        leader.await_ready().unwrap();
+        assert!(leader.report_ready().is_err(), "a leader reports to no one");
+        leader.broadcast(b"step").unwrap();
+        for f in followers {
+            assert_eq!(f.join().unwrap(), b"step");
+        }
+    }
 
     /// A `master_port` whose `master_port + offset`, the port actually bound,
     /// is free. Probing the base instead collides across parallel tests: the
