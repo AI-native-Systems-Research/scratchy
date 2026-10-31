@@ -808,7 +808,9 @@ pub fn stick_permute_opspec(
             .with_frame(match order {
                 SprayOrder::Outer => crate::superdsc_opspec::ViewFrame::StickColumns,
                 SprayOrder::Inner => crate::superdsc_opspec::ViewFrame::Own,
-            }),
+            })
+            .with_device_order(order.device_layout())
+            .map_err(|e| e.0)?,
         ))
     };
     let args = vec![arg(true, src, from)?, arg(false, dst, to)?];
@@ -925,7 +927,10 @@ pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<O
             )
             .map_err(|e| e.0)?
             .with_df(df)
-            .with_offset(elems);
+            .with_offset(elems)
+            // A run's sticks are its innermost dim, in dxp's innermost-first order.
+            .with_device_order(crate::emit::SprayOrder::Inner.device_layout())
+            .map_err(|e| e.0)?;
             let t = if pitch == run_sticks {
                 t
             } else {
@@ -1695,6 +1700,46 @@ mod stick_permute_tests {
         .expect("the permute writes the stick-major block");
         l.declare_arrangement(&out, StickLayout::row_blocked(32, 128))
             .expect("a consumer reading [32, 128] stick-major agrees");
+    }
+
+    /// ⭐⭐ dxp READS `layoutDimOrder_` INNERMOST FIRST, so each side states its frame that way. At
+    /// head dim 128 a 21-row chunk's StickToRow reads the stick-major `[2 sticks][21 rows]` source —
+    /// rows innermost, `["mb", "y", "out"]`, walk `[21, 2, 64]` — and writes the row-major
+    /// `[21 rows][2 sticks]` scratch — sticks innermost, `["y", "mb", "out"]`, walk `[2, 21, 64]`.
+    /// The emitter's own frames (`["y", "mb", "out"]` for the stick-major side) went to dxp as written
+    /// and the card read every row dim swapped: granite-3.1-8b's KV relay put each head's second stick
+    /// from the wrong rows.
+    #[test]
+    fn each_side_states_its_frame_innermost_first() {
+        let op = stick_permute_opspec(
+            "Tensor0",
+            "Tensor1",
+            21,
+            2,
+            Df::Fp16,
+            StickPermute::StickToRow,
+        )
+        .expect("the 21-row permute builds");
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = crate::emit::emit_sdsc("permute_o1", &op, &folds, None).expect("it emits");
+        let dsc = &sdsc.dscs_[0]["permute_o1"];
+        let side = |i: usize| {
+            let n = &dsc.scheduleTree_[i];
+            (
+                n.layoutDimOrder_.clone(),
+                serde_json::to_value(&n.maxDimSizes_).expect("the walk serializes"),
+            )
+        };
+        assert_eq!(
+            side(0),
+            (vec!["mb", "y", "out"], serde_json::json!([21, 2, 64])),
+            "the stick-major source: rows innermost"
+        );
+        assert_eq!(
+            side(1),
+            (vec!["y", "mb", "out"], serde_json::json!([2, 21, 64])),
+            "the row-major scratch: sticks innermost"
+        );
     }
 }
 

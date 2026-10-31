@@ -1238,6 +1238,31 @@ impl serde::Serialize for DeviceWalk {
 }
 
 impl DeviceWalk {
+    /// The same walk with its dims in another order: entry `i` of the result is entry `from[i]` of
+    /// this one (a paged pin follows its dim). `None` unless `from` is a permutation of `0..rank`.
+    pub(crate) fn reordered(&self, from: &[usize]) -> Option<Self> {
+        let rank = self.rank();
+        let mut seen = vec![false; rank];
+        if from.len() != rank
+            || from
+                .iter()
+                .any(|&j| j >= rank || std::mem::replace(&mut seen[j], true))
+        {
+            return None;
+        }
+        Some(DeviceWalk(match &self.0 {
+            Walk::Reconstruct { rank } => Walk::Reconstruct { rank: *rank },
+            Walk::RowMajor(ext) => Walk::RowMajor(from.iter().map(|&j| ext[j]).collect()),
+            Walk::Paged { rank, pins } => Walk::Paged {
+                rank: *rank,
+                pins: pins
+                    .iter()
+                    .map(|&(d, page)| (from.iter().position(|&j| j == d).unwrap_or(d), page))
+                    .collect(),
+            },
+        }))
+    }
+
     /// This tensor's rank, as the walk will serialize it.
     pub(crate) fn rank(&self) -> usize {
         match &self.0 {
