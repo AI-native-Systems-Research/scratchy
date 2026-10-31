@@ -33,7 +33,7 @@ run_one() {
     "$bin" chat "$MODEL" --system-prompt "" \
         -q "write about the history of france" --bench --max-tokens 64 \
         --max-model-len 69632 2>&1 \
-        | grep -E '^startup|^TTFT' | awk '{print $2, $1}'
+        | grep -E '^startup|^TTFT' | awk '{print $3, $1}'
 }
 
 echo "A=$A"
