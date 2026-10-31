@@ -5309,16 +5309,28 @@ fn lower_one(
                         ConstantValue::uint(7, bucket_m),
                         ConstantValue::uint(8, p.spec_drafts),
                     ];
-                    fused(
+                    let lanes = p.spec_drafts > 0;
+                    // The q and k channels' conv state, written once every value head's
+                    // threadgroup has read their seed: the command after, a barrier apart, a
+                    // threadgroup a (sequence, key head).
+                    let qk_state = fused(
+                        "gdn_verify",
+                        gdn_verify_qk_state_static_name(dtype),
+                        &rows,
+                        lanes,
+                        nk,
+                    );
+                    let verify = fused(
                         "gdn_verify",
                         gdn_verify_static_name(dtype),
                         &rows,
-                        p.spec_drafts > 0,
+                        lanes,
                         nv,
-                    )
+                    );
+                    vec![verify, qk_state]
                 });
             if let Some(verify) = verify {
-                return Ok(vec![verify]);
+                return Ok(verify);
             }
 
             let layout = GdnScratchLayout::compute(bucket_m, conv_dim, nv, value_dim);
@@ -6149,6 +6161,13 @@ fn gdn_verify_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
         DequantDtype::F16 => "gdn_verify_f16",
         DequantDtype::Bf16 => "gdn_verify_bf16",
+    }
+}
+
+fn gdn_verify_qk_state_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "gdn_verify_qk_state_f16",
+        DequantDtype::Bf16 => "gdn_verify_qk_state_bf16",
     }
 }
 

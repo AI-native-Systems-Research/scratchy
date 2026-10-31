@@ -1960,7 +1960,8 @@ fn gdn_verify_is_the_conv_scan_norm() {
             ConstantValue::uint(7, verify_rows as u32),
             ConstantValue::uint(8, u32::from(drafts)),
         ]);
-        let verify = build("gdn_verify", "gdn_verify_f32", consts);
+        let verify = build("gdn_verify", "gdn_verify_f32", consts.clone());
+        let qk_state = build("gdn_verify", "gdn_verify_qk_state_f32", consts);
         let out = buf_zero_f32(&device, t * value_dim);
         let (conv_state, ssm) = (buf_f32(&device, &conv0), buf_ssm(&device, &ssm0));
         let (conv_lanes, ssm_lanes) = (
@@ -1985,8 +1986,16 @@ fn gdn_verify_is_the_conv_scan_norm() {
             &conv_lanes,
             &ssm_lanes,
         ];
-        // A threadgroup a (sequence, key head, value head): `tgid.y` runs over the value heads.
+        // A threadgroup a (sequence, key head, value head): `tgid.y` runs over the value heads;
+        // then the q and k channels' state, a threadgroup a (sequence, key head).
         if !common::dispatch_threadgroups(&device, &verify, &bufs, size(1, nv, 2), size(1024, 1, 1))
+            || !common::dispatch_threadgroups(
+                &device,
+                &qk_state,
+                &bufs,
+                size(1, nk, 2),
+                size(1024, 1, 1),
+            )
         {
             return;
         }
@@ -3624,8 +3633,10 @@ fn gdn_verify_saves_and_restores_snapshots() {
         ConstantValue::uint(7, bucket as u32),
         ConstantValue::uint(8, drafts),
     ];
-    let key = PipelineKey::new("gdn_verify", "gdn_verify_f32", constants);
+    let key = PipelineKey::new("gdn_verify", "gdn_verify_f32", constants.clone());
     let pipeline = baked_build(&cache, &key).expect("gdn_verify pipeline");
+    let key = PipelineKey::new("gdn_verify", "gdn_verify_qk_state_f32", constants);
+    let qk_state = baked_build(&cache, &key).expect("gdn_verify_qk_state pipeline");
     let unread = buf_zero_f32(&device, 1);
     let step = |pools: &[Vec<f32>], r: std::ops::Range<usize>, seq, start| {
         let n = r.len();
@@ -3644,9 +3655,12 @@ fn gdn_verify_saves_and_restores_snapshots() {
             &out, &qkv, &z, &a, &b, &conv_w, &conv, &ssm, &cu, &si, &code, &a_log, &dt_bias,
             &norm_w, &unread, &unread,
         ];
-        // A threadgroup a (sequence, key head, value head): `tgid.y` runs over the value heads.
+        // A threadgroup a (sequence, key head, value head): `tgid.y` runs over the value heads;
+        // then the q and k channels' state, a threadgroup a (sequence, key head).
         let (grid, threads) = (dims(1, nv, 2), dims(1024, 1, 1));
-        common::dispatch_threadgroups(&device, &pipeline, &bufs, grid, threads).then(|| {
+        let ran = common::dispatch_threadgroups(&device, &pipeline, &bufs, grid, threads)
+            && common::dispatch_threadgroups(&device, &qk_state, &bufs, dims(1, nk, 2), threads);
+        ran.then(|| {
             let after = vec![
                 read_f32(&conv, pools[0].len()),
                 read_ssm(&ssm, pools[1].len()),
