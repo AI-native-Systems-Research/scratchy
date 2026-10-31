@@ -51,7 +51,7 @@
 //! two scalars refuses there — loudly, at prepare, never as a wrong token.
 
 use anyhow::{Result, anyhow, bail};
-use flex_rs::control_block_wire::{CB_NUM_BYTES, ControlBlockWire};
+use flex_rs::control_block_wire::{CB_NUM_BYTES, ControlBlockWire, RunPlace};
 
 use crate::bundle_code::NUM_SEGMENTS;
 use crate::bundle_code::collective::{CbStep, RecvWindow, TpConsume, TpSend, group_steps};
@@ -382,39 +382,52 @@ pub(crate) fn site_cbs(tp: SiteTp, launch: BatchedCompute) -> Result<Vec<Batched
     let mut launch = Some(launch);
     let mut out = Vec::with_capacity(3);
     for step in group_steps(index, consume) {
-        out.push(match step {
+        match step {
+            // ⭐ THE CUT: a send is its run of messages (`TpSend::messages`, the vendor's windowed
+            // loop), one F-send each.
             CbStep::Send { .. } => {
                 let (Some(BoundCollective { send, route }), Some(l)) = (bound, launch.as_ref())
                 else {
                     bail!("group {index} sends with no binding or after its launch");
                 };
-                BatchedCb::Send(RdmaSend {
-                    sid: route.own_sid,
-                    dest_tid: route.dest_tid,
-                    bytes: send.bytes.get(),
-                    source: end(l, send.source_segment, send.source_offset)?,
-                    window: end(l, RecvWindow::SEGMENT as u8, send.window_offset)?,
-                })
+                for m in send.messages() {
+                    out.push(BatchedCb::Send(RdmaSend {
+                        sid: route.own_sid,
+                        dest_tid: route.dest_tid,
+                        bytes: m.bytes,
+                        source: end(l, send.source_segment, m.source_offset)?,
+                        window: end(l, RecvWindow::SEGMENT as u8, m.window_offset)?,
+                        place: RunPlace {
+                            first: m.first,
+                            last: m.last,
+                        },
+                    }));
+                }
             }
+            // ⭐ AND THE PAIRING: every one of the peer's messages increments the counter once and
+            // a wait consumes exactly one count, so its run of N messages is waited for N times.
+            // The peer's run is this rank's own — the forward is SPMD and the cut is the payload's.
             CbStep::Wait { .. } => {
-                let Some(BoundCollective { route, .. }) = bound else {
+                let Some(BoundCollective { send, route }) = bound else {
                     bail!("group {index} waits with no binding");
                 };
-                BatchedCb::Wait {
-                    sid: route.peer_sid,
+                for _ in 0..send.bytes.message_count() {
+                    out.push(BatchedCb::Wait {
+                        sid: route.peer_sid,
+                    });
                 }
             }
             CbStep::Launch { .. } => {
                 let Some(l) = launch.take() else {
                     bail!("group {index} launches twice");
                 };
-                if consume.is_some() {
+                out.push(if consume.is_some() {
                     BatchedCb::Consume(l)
                 } else {
                     BatchedCb::Compute(l)
-                }
+                });
             }
-        });
+        }
     }
     Ok(out)
 }
@@ -1179,7 +1192,7 @@ pub(crate) fn patch_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle_code::collective::{CollectiveKind, TpWorld, WireBytes, fragments};
+    use crate::bundle_code::collective::{CollectiveKind, Payload, TpWorld, WireBytes, fragments};
     use crate::runtime::Chunk0;
     use flex_rs::address::{ByteOffset, RegionId};
     use flex_rs::memory_region::DomainId;
@@ -1205,7 +1218,7 @@ mod tests {
         TpConsume {
             kind: CollectiveKind::AllReduce,
             operand: crate::bundle_code::PlaceId::Act(7),
-            fragment: fragments(1, 2048, WireBytes::CAP).unwrap()[0],
+            fragment: fragments(1, 2048, Payload::from(WireBytes::CAP)).unwrap()[0],
             plays_at: None,
         }
     }
@@ -1224,7 +1237,7 @@ mod tests {
             source_segment: 3,
             source_offset: 4096,
             window_offset: 1 << 20,
-            bytes: WireBytes::new(4096).unwrap(),
+            bytes: Payload::new(4096).unwrap(),
         };
         let bound = BoundCollective {
             send,
@@ -1243,7 +1256,8 @@ mod tests {
         let BatchedCb::Send(s) = &cbs[0] else {
             panic!("the send leads");
         };
-        assert_eq!((s.sid, s.dest_tid, s.bytes), (1, 0, 4096));
+        assert_eq!((s.sid, s.dest_tid, s.bytes.get()), (1, 0, 4096));
+        assert_eq!(s.place, RunPlace::ALONE);
         assert_eq!(
             (region(&s.source), s.source.segment, s.source.offset),
             (13, 3, 4096)
@@ -1254,6 +1268,64 @@ mod tests {
         );
         assert!(matches!(cbs[1], BatchedCb::Wait { sid: 0 }));
         assert!(matches!(cbs[2], BatchedCb::Consume(_)));
+    }
+
+    /// A send wider than one message stages as its run — every message an F-send at the matching
+    /// offset, `first` / `last` on its ends — then one wait per message, then the consume: the
+    /// write-done counts it raises on the peer are exactly the counts the peer's waits take.
+    #[test]
+    fn a_wide_send_stages_its_messages_then_as_many_waits() {
+        let rank0 = TpWorld::of::<2>().ranks().next().unwrap();
+        let cap = WireBytes::CAP.get();
+        let send = TpSend {
+            source_segment: 0,
+            source_offset: 0,
+            window_offset: 1 << 20,
+            bytes: Payload::new(cap + 4096).unwrap(),
+        };
+        let cbs = site_cbs(
+            SiteTp {
+                index: 1,
+                consume: Some(consume()),
+                bound: Some(BoundCollective {
+                    send,
+                    route: PeerRoute::of(rank0).unwrap(),
+                }),
+            },
+            launch(),
+        )
+        .unwrap();
+        assert_eq!(cbs.len(), 5);
+        let sends: Vec<&RdmaSend> = cbs[..2]
+            .iter()
+            .map(|c| match c {
+                BatchedCb::Send(s) => s,
+                _ => panic!("the run's sends lead"),
+            })
+            .collect();
+        assert_eq!(
+            sends
+                .iter()
+                .map(|s| (s.source.offset, s.window.offset, s.bytes.get()))
+                .collect::<Vec<_>>(),
+            [(0, 1 << 20, cap), (cap, (1 << 20) + cap, 4096)]
+        );
+        assert_eq!(
+            sends.iter().map(|s| s.place).collect::<Vec<_>>(),
+            [
+                RunPlace {
+                    first: true,
+                    last: false
+                },
+                RunPlace {
+                    first: false,
+                    last: true
+                }
+            ]
+        );
+        assert!(matches!(cbs[2], BatchedCb::Wait { sid: 1 }));
+        assert!(matches!(cbs[3], BatchedCb::Wait { sid: 1 }));
+        assert!(matches!(cbs[4], BatchedCb::Consume(_)));
     }
 
     /// A plain group is its one launch; a consume the session never bound refuses rather than

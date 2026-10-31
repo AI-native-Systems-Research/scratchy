@@ -1206,16 +1206,18 @@ pub struct RdmaEnd {
     pub offset: u64,
 }
 
-/// A collective's F-send, its endpoints still allocations (rendered by
+/// ONE MESSAGE of a collective's F-send, its endpoints still allocations (rendered by
 /// `flex_rs::scheduler::build_rdma_send_cb`).
 pub struct RdmaSend {
     /// The SENDING rank's write-done sid.
     pub sid: u8,
     /// The peer's BAT index.
     pub dest_tid: u8,
-    pub bytes: u64,
+    pub bytes: crate::bundle_code::collective::WireBytes,
     pub source: RdmaEnd,
     pub window: RdmaEnd,
+    /// This message's place in its send's run.
+    pub place: flex_rs::control_block_wire::RunPlace,
 }
 
 impl RdmaSend {
@@ -1228,9 +1230,10 @@ impl RdmaSend {
         RdmaSendParams {
             sid: self.sid,
             dest_tid: self.dest_tid,
-            length: flex_rs::control_block_wire::TransferSize(self.bytes),
+            length: flex_rs::control_block_wire::TransferSize(self.bytes.get()),
             source: end(&self.source),
             window: end(&self.window),
+            place: self.place,
         }
     }
 }
@@ -1639,8 +1642,8 @@ mod tests {
     /// this card is a rank sending to itself.
     #[test]
     fn a_link_refuses_no_peer_and_a_self_loop_before_touching_the_card() {
-        use crate::bundle_code::collective::{TpWorld, WireBytes};
-        let window = RecvWindow::new(1 << 20, WireBytes::CAP).unwrap();
+        use crate::bundle_code::collective::{Payload, TpWorld, WireBytes};
+        let window = RecvWindow::new(1 << 20, Payload::from(WireBytes::CAP)).unwrap();
         let alone = TpWorld::of::<1>().ranks().next().unwrap();
         let pair = |own, peer| CardPair {
             own: CardIndex::new(own),
