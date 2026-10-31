@@ -3382,7 +3382,13 @@ pub fn emit_sdsc(
             ldsIdx_: i as u32,
             dsName_: format!("Tensor{i}"),
             dsType_: v.role.ds_type(),
-            scale_: v.scale.iter().map(|s| s.to_i64()).collect(),
+            // In the order this tensor's dims go to dxp (`ArgView::device_positions`).
+            scale_: match v.device_positions() {
+                Some(from) if from.len() == v.scale.len() => {
+                    from.iter().map(|&j| v.scale[j].to_i64()).collect()
+                }
+                _ => v.scale.iter().map(|s| s.to_i64()).collect(),
+            },
             wordLength: v.df.word_length(),
             // Per-tensor dtype from the arg's typed `Df` (`v.df`, the SINGLE source of truth) — NOT a name
             // suffix. `Df::Fp32` → IEEE_FP32 (4-byte, the KSPLIT fp32-SFP-merge partials); `Df::Fp8` →
@@ -3854,23 +3860,17 @@ pub fn emit_sdsc(
         let addr = AddrFold::new(&per_core, folds);
         // The order dxp reads this view's dims in, innermost first, as positions in `v.layout` — set
         // only where it is not `v.layout`'s (`TensorArg::with_device_order`).
-        let device_from: Option<Vec<usize>> = match v.device_order {
-            None => None,
-            Some(order) => {
-                let from: Vec<usize> = order
-                    .iter()
-                    .filter_map(|d| v.layout.iter().position(|l| l == d))
-                    .collect();
-                if from.len() != v.layout.len() {
-                    return Err(SuperDscError(format!(
-                        "op {op_name}: tensor {i} ('{}') states device order {order:?} over layout \
-                         {:?} — not a permutation of it",
-                        v.name, v.layout
-                    )));
-                }
-                Some(from)
-            }
-        };
+        let device_from = v.device_positions();
+        if device_from
+            .as_ref()
+            .is_some_and(|from| from.len() != v.layout.len())
+        {
+            return Err(SuperDscError(format!(
+                "op {op_name}: tensor {i} ('{}') states device order {:?} over layout {:?} — not a \
+                 permutation of it",
+                v.name, v.device_order, v.layout
+            )));
+        }
         tree.push(AllocNode {
             nodeType_: "allocate",
             name_: name,
