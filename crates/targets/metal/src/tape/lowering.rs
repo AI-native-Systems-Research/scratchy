@@ -8005,8 +8005,7 @@ enum MoeGrouping {
     /// Pure gathered: pair rows in token order, no sort — the projections read the token rows.
     Gathered,
     /// Sorted gathered: the `moe_group` sort at padding 1 — same-expert pairs adjacent, so the
-    /// gathered matvecs' repeat slab reads hit cache; `mpad_max` = pairs, the step's live ones
-    /// first.
+    /// gathered matvecs' repeat slab reads hit cache; `mpad_max` = pairs.
     Sorted,
     /// Grouped: the sort at padding 64 — each 64-row output tile is one expert's, for the
     /// batched per-expert GEMMs.
@@ -8056,7 +8055,7 @@ impl MoeScratch {
         // Sorted at 0.5–1 per expert: the per-pair matvecs stay, sorted by expert so an expert two
         // rows pick is read once from DRAM (Gemma-4 at bucket 8 × top-8: ~52 distinct experts hold
         // 64 pairs, a quarter of the slab reads repeats — 17% of the base-M5 conc-8 step). Anything
-        // else gathers. Either runs the step's live pairs alone.
+        // else gathers: the sorted matvecs run the bucket's every pair, the gathered ones its live.
         use crate::op_abi::{
             METAL_GROUPED_PAIRS_PER_EXPERT, METAL_SORTED_PAIRS, METAL_SORTED_PAIRS_PER_EXPERT,
         };
@@ -8282,8 +8281,8 @@ fn lower_moe_step(
                 GatedAct::SwigluOai => (KernelId::SwigluOaiMul, swiglu_oai_mul_static_name(dtype)),
             };
             let (rows, m_scaling) = match s.grouping {
-                MoeGrouping::Gathered | MoeGrouping::Sorted => (pairs, ms(A::X)),
-                MoeGrouping::Grouped => (s.l.mpad_max, None),
+                MoeGrouping::Gathered => (pairs, ms(A::X)),
+                MoeGrouping::Sorted | MoeGrouping::Grouped => (s.l.mpad_max, None),
             };
             let n = rows * inter;
             let shape = grid((n.div_ceil(256), 1, 1), (256, 1, 1), m_scaling);
@@ -8400,12 +8399,13 @@ fn lower_moe_step(
             bindings.push(s.at(9, R::ExpertUp));
         }
         bindings.extend(gain);
-        // Pairs along X: the live pairs exactly. Gathered — a verify bucket runs an expert's pairs
-        // in its first pair's threadgroup, scanning the live ones; sorted — the sort lays the live
-        // pairs out first, the rows past the step's left out (`moe_group_offsets`).
+        // Pairs along X. Gathered: the live pairs exactly — a verify bucket runs an expert's
+        // pairs in its first pair's threadgroup, scanning the live ones. Sorted: the full static
+        // grid — a short step's live pairs sit past the m-scaled edge, on rows the init
+        // sentinel-filled.
         let scaling = match s.grouping {
-            MoeGrouping::Gathered | MoeGrouping::Sorted => ms(A::X),
-            MoeGrouping::Grouped => None,
+            MoeGrouping::Gathered => ms(A::X),
+            MoeGrouping::Sorted | MoeGrouping::Grouped => None,
         };
         let shape = grid((pairs, inter.div_ceil(8), 1), (32, 4, 1), scaling);
         let gather = AffineGatherQmvConstants {
@@ -8716,7 +8716,6 @@ fn lower_moe_step(
             let offsets = vec![
                 C::int(0, pairs as i32),
                 C::int(1, e as i32),
-                C::int(3, k as i32),
                 C::int(6, pad as i32),
             ];
             let init = vec![C::int(1, e as i32), C::int(2, mpad), C::int(7, sentinel)];
@@ -8773,10 +8772,6 @@ fn lower_moe_step(
                             at(1, l.grp_count),
                             at(2, l.grp_offset),
                             at(3, l.grp_total),
-                            Binding::Runtime {
-                                kind: RuntimeBindingKind::NumTokensU32,
-                                binding_index: 4,
-                            },
                         ],
                     ),
                     cmd(
@@ -8944,10 +8939,11 @@ fn lower_moe_step(
                 let ((x, norm, gain), indices) = (normed_rows(&s, 3, rows)?, gather_indices(&s, 4));
                 bindings.extend([x, indices, s.at(5, out)]);
                 bindings.extend(gain);
-                // The live pairs, which a sorted bake's sort lays out first.
+                // A sorted bake runs the full static grid: a short step's live pairs sit past
+                // the m-scaled edge, on rows the init sentinel-filled.
                 let scaling = match s.grouping {
-                    MoeGrouping::Gathered | MoeGrouping::Sorted => ms(A::Z),
-                    MoeGrouping::Grouped => None,
+                    MoeGrouping::Gathered => ms(A::Z),
+                    MoeGrouping::Sorted | MoeGrouping::Grouped => None,
                 };
                 let shape = grid((1, n_out.div_ceil(8), pairs), (32, 2, 1), scaling);
                 let mut qmv: Vec<ConstantValue> = AffineGatherQmvConstants {
@@ -8998,12 +8994,12 @@ fn lower_moe_step(
         S::UpAct(up, act, routing) => {
             gated_command(up, ExpertBody::Ungated(act), routing, moe_scratch_bytes)?
         }
-        // Gathered or sorted: one command runs the down matvec of each token's pairs, 4 rows at a
-        // time, and combines those rows — a sorted bake's reading each pair's row where its sort
-        // put it (`pos`). A grouped bake runs each step's own commands: its batched GEMMs write
-        // the down rows of a 64-row expert tile.
+        // Gathered: one command runs the down matvec of each token's pairs, 4 rows at a time,
+        // and combines those rows. A sorted bake cannot: the kernel pairs each token's rows by
+        // grid-adjacency (simdgroup k = pair k), which the sort permutes apart — so a sorted or
+        // grouped bake runs each step's own commands.
         S::DownCombine(down, Slot(out), ends)
-            if s.grouping == MoeGrouping::Grouped || matches!(down.rows, MoeRows::Tokens(_)) =>
+            if s.grouping != MoeGrouping::Gathered || matches!(down.rows, MoeRows::Tokens(_)) =>
         {
             // Only the gathered command computes the combine's ends.
             if ends != crate::tape::step::CombineEnds::default() {
@@ -9026,10 +9022,6 @@ fn lower_moe_step(
             if let Some((Slot(shared), Slot(gate))) = ends.gate_scale {
                 bindings.extend([arena_at(8, shared), arena_at(9, gate)]);
             }
-            let sorted_rows = s.grouping == MoeGrouping::Sorted;
-            if sorted_rows {
-                bindings.push(scratch_at(11, s.l.grp_pos));
-            }
             // Tokens fastest, as the gate/up's pairs.
             let shape = grid((bucket_m, hidden.div_ceil(4), 1), (32, k, 1), ms(A::X));
             let mut constants: Vec<ConstantValue> = AffineCombineQmvConstants {
@@ -9037,7 +9029,6 @@ fn lower_moe_step(
                 top_k: b.top_k,
                 gate_scale: ends.gate_scale.is_some(),
                 residual: ends.residual,
-                sorted_rows,
             }
             .into();
             // gpt-oss experts carry a per-expert LINEAR bias on the down projection too — [E,
@@ -9077,8 +9068,8 @@ fn lower_moe_step(
         }
         S::Act(UngatedAct::Relu2) => {
             let (rows, m_scaling) = match s.grouping {
-                MoeGrouping::Gathered | MoeGrouping::Sorted => (pairs, ms(A::X)),
-                MoeGrouping::Grouped => (s.l.mpad_max, None),
+                MoeGrouping::Gathered => (pairs, ms(A::X)),
+                MoeGrouping::Sorted | MoeGrouping::Grouped => (s.l.mpad_max, None),
             };
             let n = rows * inter;
             let symbol = pick_specialized_symbol("relu2_f16", "relu2_bf16", p.metal_dtype);

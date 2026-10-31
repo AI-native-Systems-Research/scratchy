@@ -290,7 +290,6 @@ impl Block {
             top_k: TopK(self.k as u32),
             gate_scale: false,
             residual: false,
-            sorted_rows: false,
         };
         self.fc2.pipeline(d, "affine_gather_qmv_combine", c.into())
     }

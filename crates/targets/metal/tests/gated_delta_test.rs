@@ -1571,8 +1571,8 @@ fn gdn_decode_is_the_conv_scan_norm() {
         let (t, slots) = (2usize, 2usize);
         let rows = CheckpointRows(drafts);
         let (conv_slot, ssm_slot) = (conv_dim * (kernel - 1), nv * hv * hk);
-        // Two lanes of the drafts' conv streams (two areas each) and ssm records.
-        let conv_lanes0 = shifted(2 * 2 * conv_dim * (kernel - 1 + rows.rows()), 29);
+        // Two lanes of the drafts' conv checkpoints and ssm records.
+        let conv_lanes0 = shifted(2 * rows.rows() * conv_slot, 29);
         let ssm_lanes0 = shifted(2 * 2 * rows.rows() * (conv_dim + 2 * nv), 31);
         let records = match drafts {
             0 => RecordArea::First,
@@ -1833,7 +1833,7 @@ fn gdn_verify_is_the_conv_scan_norm() {
         let t = verify_rows + 1;
         let (slots, lanes) = (2usize, 2usize);
         let (conv_slot, ssm_slot) = (conv_dim * (kernel - 1), nv * hv * hk);
-        let conv_lanes0 = shifted(lanes * 2 * conv_dim * (kernel - 1 + rows.rows()), 29);
+        let conv_lanes0 = shifted(lanes * rows.rows() * conv_slot, 29);
         let ssm_lanes0 = shifted(lanes * 2 * rows.rows() * (conv_dim + 2 * nv), 31);
         let codes = [
             code(
@@ -1993,13 +1993,12 @@ fn gdn_verify_is_the_conv_scan_norm() {
         }
         // Alone, it leaves every q and k channel's conv state as it found it, bitwise: no value
         // head's threadgroup writes what another reads its seed from (#914 had the first write
-        // it), whatever order the threadgroups run in. Entry `j` of the ring (`kernel - 1` a
-        // channel) or of a lane's stream areas (`kernel - 1 + rows` a channel) is channel
-        // `(j / per_channel) % conv_dim`'s.
+        // it), whatever order the threadgroups run in. Ring and lane checkpoints both lay out a
+        // channel's `kernel - 1` entries at channel `(j / (kernel - 1)) % conv_dim`.
         let geometry = format!("nk {nk} nv {nv} drafts {drafts} start {start:?}");
-        let qk_untouched = |what: &str, per_channel: usize, got: Vec<f32>, was: &[f32]| {
+        let qk_untouched = |what: &str, got: Vec<f32>, was: &[f32]| {
             for (j, (g, w)) in got.iter().zip(was).enumerate() {
-                if (j / per_channel) % conv_dim < 2 * key_dim {
+                if (j / (kernel - 1)) % conv_dim < 2 * key_dim {
                     assert_eq!(
                         g.to_bits(),
                         w.to_bits(),
@@ -2008,15 +2007,9 @@ fn gdn_verify_is_the_conv_scan_norm() {
                 }
             }
         };
+        qk_untouched("ring", read_f32(&conv_state, conv0.len()), &conv0);
         qk_untouched(
-            "ring",
-            kernel - 1,
-            read_f32(&conv_state, conv0.len()),
-            &conv0,
-        );
-        qk_untouched(
-            "lane stream",
-            kernel - 1 + rows.rows(),
+            "lane checkpoint",
             read_f32(&conv_lanes, conv_lanes0.len()),
             &conv_lanes0,
         );
@@ -2054,7 +2047,7 @@ fn gdn_verify_is_the_conv_scan_norm() {
         assert_eq!(
             read_f32(&conv_lanes, conv_lanes0.len()),
             read_f32(&chain_conv_lanes, conv_lanes0.len()),
-            "conv streams, {geometry}"
+            "conv checkpoints, {geometry}"
         );
         close(
             "records",
@@ -2140,9 +2133,7 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
     let entry_len = conv_dim * (kernel - 1);
     let rows = CheckpointRows(3);
     let lane = DraftLanes::new(rows, 2).and_then(|l| l.lanes().nth(1));
-    // A lane's two conv stream areas a channel (the previous verify step's and this one's): each
-    // the window a verify step starts from, then its rows' inputs.
-    let lane_len = 2 * conv_dim * (kernel - 1 + rows.rows());
+    let lane_entries = rows.rows();
     let t_full = 10usize;
     let x_full = fill(t_full * conv_dim);
     let w = fill(conv_dim * kernel);
@@ -2169,21 +2160,18 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
     let w_buf = buf_f32(&device, &w);
     let state_buf = buf_zero_f32(&device, 2 * entry_len);
-    let lanes_buf = buf_zero_f32(&device, 2 * lane_len);
+    let lanes_buf = buf_zero_f32(&device, 2 * lane_entries * entry_len);
     let unread_bias = buf_zero_f32(&device, 1);
-    // A step's record area names the stream area the verify step before it wrote (the other of
-    // its own): a step resuming from a verify step's kept rows reads its other area.
-    let run = |x: &[f32],
-               start: GdnStart,
-               checkpoint_rows: CheckpointRows,
-               records: RecordArea|
-     -> Option<Vec<f32>> {
+    let run = |x: &[f32], start: GdnStart, checkpoint_rows: CheckpointRows| -> Option<Vec<f32>> {
         let num_tokens = x.len() / conv_dim;
         let out_buf = buf_zero_f32(&device, x.len());
         let x_buf = buf_f32(&device, x);
         let cu = buf_i32(&device, &[0, num_tokens as i32]);
         let si = buf_slots(&device, &[1]);
-        let step = buf_u32(&device, &[code(start, checkpoint_rows, records, lane)]);
+        let step = buf_u32(
+            &device,
+            &[code(start, checkpoint_rows, RecordArea::First, lane)],
+        );
         common::dispatch_threadgroups(
             &device,
             &pipeline,
@@ -2216,11 +2204,10 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
         &x_full[..7 * conv_dim],
         GdnStart::Fresh,
         CheckpointRows::NONE,
-        RecordArea::First,
     ) else {
         return;
     };
-    let Some(verify) = run(&x_verify, GdnStart::Slot, rows, RecordArea::First) else {
+    let Some(verify) = run(&x_verify, GdnStart::Slot, rows) else {
         return;
     };
     assert_close(
@@ -2233,7 +2220,6 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
         &x_full[9 * conv_dim..],
         GdnStart::Checkpoint(1),
         CheckpointRows::NONE,
-        RecordArea::Second,
     ) else {
         return;
     };
@@ -2243,10 +2229,10 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
         slot0.iter().all(|&v| v == 0.0),
         "slot 0's entry was written"
     );
-    let lane0 = read_f32(&lanes_buf, lane_len);
+    let lane0 = read_f32(&lanes_buf, lane_entries * entry_len);
     assert!(
         lane0.iter().all(|&v| v == 0.0),
-        "lane 0's stream was written"
+        "lane 0's checkpoints were written"
     );
 }
 
@@ -2269,9 +2255,7 @@ fn gdn_conv1d_varlen_ring_survives_a_short_replayed_verify() {
     let entry_len = conv_dim * (kernel - 1);
     let rows = CheckpointRows(1);
     let lane = DraftLanes::new(rows, 2).and_then(|l| l.lanes().nth(1));
-    // A lane's two conv stream areas a channel (the previous verify step's and this one's): each
-    // the window a verify step starts from, then its rows' inputs.
-    let lane_len = 2 * conv_dim * (kernel - 1 + rows.rows());
+    let lane_entries = rows.rows();
     // Rows 0..4 the prompt, 4 the verify step's token (its draft rejected), 5..6 the replayed
     // verify (token and draft, both kept), 7 the slot step that reads the ring.
     let t_full = 8usize;
@@ -2295,21 +2279,18 @@ fn gdn_conv1d_varlen_ring_survives_a_short_replayed_verify() {
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
     let w_buf = buf_f32(&device, &w);
     let state_buf = buf_zero_f32(&device, 2 * entry_len);
-    let lanes_buf = buf_zero_f32(&device, 2 * lane_len);
+    let lanes_buf = buf_zero_f32(&device, 2 * lane_entries * entry_len);
     let unread_bias = buf_zero_f32(&device, 1);
-    // A step's record area names the stream area the verify step before it wrote (the other of
-    // its own): a step resuming from a verify step's kept rows reads its other area.
-    let run = |x: &[f32],
-               start: GdnStart,
-               checkpoint_rows: CheckpointRows,
-               records: RecordArea|
-     -> Option<Vec<f32>> {
+    let run = |x: &[f32], start: GdnStart, checkpoint_rows: CheckpointRows| -> Option<Vec<f32>> {
         let num_tokens = x.len() / conv_dim;
         let out_buf = buf_zero_f32(&device, x.len());
         let x_buf = buf_f32(&device, x);
         let cu = buf_i32(&device, &[0, num_tokens as i32]);
         let si = buf_slots(&device, &[1]);
-        let step = buf_u32(&device, &[code(start, checkpoint_rows, records, lane)]);
+        let step = buf_u32(
+            &device,
+            &[code(start, checkpoint_rows, RecordArea::First, lane)],
+        );
         common::dispatch_threadgroups(
             &device,
             &pipeline,
@@ -2343,13 +2324,12 @@ fn gdn_conv1d_varlen_ring_survives_a_short_replayed_verify() {
         &x_full[..4 * conv_dim],
         GdnStart::Fresh,
         CheckpointRows::NONE,
-        RecordArea::First,
     ) else {
         return;
     };
     // A verify step of two rows whose draft is rejected: its token is kept, checkpointed in the
     // lane at row 0 — the row the next step replays from.
-    let Some(verify) = run(&x_rejected, GdnStart::Slot, rows, RecordArea::First) else {
+    let Some(verify) = run(&x_rejected, GdnStart::Slot, rows) else {
         return;
     };
     assert_close(
@@ -2365,7 +2345,6 @@ fn gdn_conv1d_varlen_ring_survives_a_short_replayed_verify() {
         &x_full[5 * conv_dim..7 * conv_dim],
         GdnStart::Checkpoint(0),
         rows,
-        RecordArea::Second,
     ) else {
         return;
     };
@@ -2382,7 +2361,6 @@ fn gdn_conv1d_varlen_ring_survives_a_short_replayed_verify() {
         &x_full[7 * conv_dim..],
         GdnStart::Slot,
         CheckpointRows::NONE,
-        RecordArea::First,
     ) else {
         return;
     };
@@ -2397,10 +2375,10 @@ fn gdn_conv1d_varlen_ring_survives_a_short_replayed_verify() {
         slot0.iter().all(|&v| v == 0.0),
         "slot 0's entry was written"
     );
-    let lane0 = read_f32(&lanes_buf, lane_len);
+    let lane0 = read_f32(&lanes_buf, lane_entries * entry_len);
     assert!(
         lane0.iter().all(|&v| v == 0.0),
-        "lane 0's stream was written"
+        "lane 0's checkpoints were written"
     );
 }
 

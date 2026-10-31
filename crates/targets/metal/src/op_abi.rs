@@ -365,8 +365,9 @@ pub const METAL_GROUPED_PAIRS_PER_EXPERT: f32 = 4.0;
 
 /// The pairs per expert at which a bake sorts the per-pair matvecs' rows by expert, so an expert
 /// two rows pick is read once: where it was measured to win (#232: Gemma-4's 128 experts at
-/// bucket 8, the full conc-8 decode step). Thicker, the sorted matvecs lose to the gathered ones on
-/// a short prompt (Qwen3.6, 2 per expert: 161 ms vs 98 ms).
+/// bucket 8, the full conc-8 decode step). The sorted matvecs run the bucket's every pair, so
+/// thicker, they lose to the gathered ones on a short prompt (Qwen3.6, 2 per expert: 161 ms vs
+/// 98 ms).
 pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.5..1.0;
 
 /// The bucket rows from which a gathered bake's gate/up command runs the pairs that share an

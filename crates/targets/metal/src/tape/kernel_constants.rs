@@ -982,9 +982,6 @@ pub struct AffineCombineQmvConstants {
     /// residual add (`COMBINE_GATE_SCALE` / `COMBINE_RESIDUAL`). Unset when it stores the sum alone.
     pub gate_scale: bool,
     pub residual: bool,
-    /// Whether each pair's down input row is where a sorted bake's sort put it, read through its
-    /// `pos` at buffer 11 (slot 22, `COMBINE_ROWS_SORTED`).
-    pub sorted_rows: bool,
 }
 
 impl From<AffineCombineQmvConstants> for Vec<ConstantValue> {
@@ -998,10 +995,6 @@ impl From<AffineCombineQmvConstants> for Vec<ConstantValue> {
         v.extend(
             c.residual
                 .then(|| ConstantValue::boolean(ConstSlot(19), true)),
-        );
-        v.extend(
-            c.sorted_rows
-                .then(|| ConstantValue::boolean(ConstSlot(22), true)),
         );
         v
     }
