@@ -70,6 +70,9 @@ pub struct WorkerCreateConfig {
     pub tp_rank: usize,
     /// Tensor parallelism world size (1 = no TP).
     pub tp_world_size: usize,
+    /// The world's cards by PCI address, in rank order, for a backend whose ranks each drive one
+    /// card (spyre); empty everywhere else.
+    pub tp_cards: Vec<String>,
     /// Pipeline parallelism rank (0 = first stage).
     pub pp_rank: usize,
     /// Pipeline parallelism size (1 = no PP).

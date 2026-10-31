@@ -842,24 +842,28 @@ impl SpyreWorker {
         // host-side weight load below by kicking it off on a background thread NOW.
         // std::call_once makes prepare's own init block only on the remainder — a pure
         // latency win with no change to the bytes that reach the device.
-        // ⭐ A RANK DRIVES ITS OWN CARD, chosen before that bring-up opens one: rank r drives
-        // card r, and its peer is the other rank's card.
+        // ⭐ A RANK DRIVES ITS OWN CARD, by the PCI address `--tp-cards` names for its rank, chosen
+        // before that bring-up opens one; its peer is the card named for the peer's rank. A world
+        // of one drives the one card named, or the first available when none is.
         #[cfg(feature = "spyre-hw")]
         let cards = self.seat.and_then(|me| {
             let card = |r: scratchy_target_spyre::bundle_code::collective::TpIdentity| {
-                // A spyre world is at most `MAX_SIDS` ranks, so a rank fits the index.
-                scratchy_target_spyre::runtime::CardIndex::new(r.rank() as u16)
+                self.cards.get(r.rank() as usize).cloned()
             };
-            me.peer()
-                .map(|peer| scratchy_target_spyre::runtime::CardPair {
-                    own: card(me),
-                    peer: card(peer),
-                })
+            Some(scratchy_target_spyre::runtime::CardPair {
+                own: card(me)?,
+                peer: card(me.peer()?)?,
+            })
         });
         #[cfg(feature = "spyre-hw")]
-        if let Some(cards) = cards {
-            scratchy_target_spyre::runtime::drive_card(cards.own)
-                .map_err(|e| werr(e.to_string()))?;
+        if self.seat.is_some() && cards.is_none() {
+            return Err(werr(
+                "a sharded rank names its card and its peer's by PCI address (`--tp-cards`)",
+            ));
+        }
+        #[cfg(feature = "spyre-hw")]
+        if let Some(own) = cards.as_ref().map(|c| &c.own).or(self.cards.first()) {
+            scratchy_target_spyre::runtime::drive_card(own).map_err(|e| werr(e.to_string()))?;
         }
         #[cfg(feature = "spyre-hw")]
         SuperDscSession::prewarm_runtime();
@@ -1255,7 +1259,7 @@ impl SpyreWorker {
                                 me.world().get()
                             ))
                         })?;
-                    scratchy_target_spyre::runtime::link_peer(me, cards, window)
+                    scratchy_target_spyre::runtime::link_peer(me, cards.clone(), window)
                         .map_err(|e| werr(e.to_string()))?;
                     info!(
                         "[spyre-worker] rank {} of {}: linked {} to its peer on {} over device \
