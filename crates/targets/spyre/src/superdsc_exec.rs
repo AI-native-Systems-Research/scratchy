@@ -5747,16 +5747,22 @@ impl Executor {
         const CHUNK: NonZeroU64 = NonZeroU64::new(8 << 20).unwrap();
         let zeros = vec![0u8; CHUNK.get().min(total) as usize];
         let stream = self.stream_ref()?;
+        // Enqueue the whole walk, synchronize ONCE. A per-chunk synchronize turned the fill
+        // latency-bound: the 16384 MB KV pool is 2048 chunks, and a serialized H2D+sync round
+        // trip per chunk measured ~2.25 ms (≈3.5 GB/s effective — the card moves 149 GB/s),
+        // i.e. ~4.6 s of pure round-trip latency for ~0.1 s of transfer. The zero buffer is a
+        // single host Vec alive across every enqueue, and each window is an address descriptor
+        // the H2D consumes at enqueue time, so nothing the transfers reference is dropped
+        // before the trailing synchronize.
         for win in addr.windows(CHUNK) {
             let sz = win.total_size().as_u64() as usize;
             stream
                 .h2d(&zeros[..sz], &win)
                 .map_err(|e| anyhow!("zero H2D (seg{i}): {e}"))?;
-            // The window must outlive the transfer.
-            stream
-                .synchronize()
-                .map_err(|e| anyhow!("zero sync (seg{i}): {e}"))?;
         }
+        stream
+            .synchronize()
+            .map_err(|e| anyhow!("zero sync (seg{i}): {e}"))?;
         Ok(())
     }
 
