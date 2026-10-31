@@ -1998,6 +1998,27 @@ fn attn_geometry(
     )
 }
 
+/// spyre-inference's paged kernels attend causally, so a sliding-window attention (gemma's local
+/// layers) is refused by name rather than run as causal.
+#[test]
+fn a_sliding_window_attention_is_refused() {
+    let s = ATTN_SHAPES[0];
+    let mut ir = attn_ir(s, 0.015625);
+    let node = ir.nodes.last_mut().expect("the attention");
+    let scratchy_subtile::subtile_ir::SubOp::AttnDecode { mask, .. } = &mut node.op else {
+        panic!("the last node is the attention");
+    };
+    *mask = scratchy_subtile::subtile_ir::AttnMask::SlidingWindow {
+        window: std::num::NonZeroU32::new(4096).expect("a window"),
+    };
+    let node = ir.nodes.last().expect("the attention");
+    let Err(e) = scratchy_triton_splice::lower_attn(node, &ir, s.active_cap(), PagedRows::Sequence)
+    else {
+        panic!("a sliding window must be refused");
+    };
+    assert!(e.contains("sliding window"), "{e}");
+}
+
 #[test]
 fn the_paged_attention_splices_with_its_contract() {
     for &s in ATTN_SHAPES {

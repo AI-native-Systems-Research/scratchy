@@ -1714,17 +1714,33 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         } => (*src, *file, *entry, *program),
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
     };
+    // ⛔ EVERY FIELD NAMED, NO `..`: spyre-inference's kernels take a soft cap, a float8 cache and the
+    // query's dtype, and this port takes none of them (the state and dots are f16, the cache is in
+    // the model's 16-bit dtype). The op states none of them either, so none reaches here today; a
+    // field added for one is a compile error at this line rather than an attention run without it.
     let SubOp::AttnDecode {
         geom,
         scale,
+        valid_len: _,
+        layout: _,
         producer,
-        ..
+        softmax_state: _,
+        mask,
     } = &node.op
     else {
         return Err(
             "triton splice: lower_attn called on a node that is not an AttnDecode".to_string(),
         );
     };
+    // Their paged kernels attend causally; a sliding window (gemma's local layers) is not theirs.
+    if let scratchy_subtile::subtile_ir::AttnMask::SlidingWindow { window } = mask {
+        return Err(format!(
+            "triton splice: AttnDecode t{}: a {window}-position sliding window — spyre-inference's \
+             paged attention kernels attend every position up to the query's own, and have no \
+             window",
+            node.output.tensor.index()
+        ));
+    }
     if node.inputs.len() < 5 {
         return Err(format!(
             "triton splice: AttnDecode t{} expects 5 inputs [q, k cache, v cache, new k, new v], \
