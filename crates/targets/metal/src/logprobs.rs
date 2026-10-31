@@ -27,14 +27,69 @@ pub const THREADS: usize = 1024;
 
 pub struct LogprobsKernels {
     pipeline: OffTapePipeline,
+    row_bytes: u64,
 }
 
 impl LogprobsKernels {
     pub fn new(device: &Device, kernels: &OffTapeKernels) -> Result<Self, MetalStreamError> {
         Ok(Self {
             pipeline: OffTapePipeline::new(device, &kernels.logprobs)?,
+            // The kernel's logits are the model's 16-bit activations (`logprobs_topk_{f16,bf16}`).
+            row_bytes: u64::from(kernels.vocab.get()) * 2,
         })
     }
+
+    /// The bytes of one logits row the kernel scores.
+    pub fn row_bytes(&self) -> u64 {
+        self.row_bytes
+    }
+}
+
+/// Copy each of `rows`' logits, `row_bytes` a row, from `logits` to `raw` at the same offset: the
+/// raw rows a step's logprobs score, set aside before a grammar mask overwrites the logits in
+/// place, as cuda's worker scores its `raw_logits_for_logprobs` and vLLM its raw logprobs by
+/// default. Barriers on either side: after the forward's writes, before the mask's.
+pub fn encode_raw_copies(
+    encoder: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+    logits: &ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    raw: &ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    rows: &[u32],
+    row_bytes: u64,
+) {
+    let mut rows = rows.to_vec();
+    rows.sort_unstable();
+    rows.dedup();
+    if rows.is_empty() {
+        return;
+    }
+    let work = MTLStages::Dispatch | MTLStages::Blit;
+    encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+        work,
+        MTLStages::Blit,
+        MTL4VisibilityOptions::Device,
+    );
+    for &row in &rows {
+        let at = u64::from(row) * row_bytes;
+        assert!(
+            at + row_bytes <= (logits.length() as u64).min(raw.length() as u64),
+            "row {row} lies inside both buffers"
+        );
+        // SAFETY: the row's range lies inside both buffers (checked above).
+        unsafe {
+            encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                logits,
+                at as usize,
+                raw,
+                at as usize,
+                row_bytes as usize,
+            );
+        }
+    }
+    encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+        MTLStages::Blit,
+        work,
+        MTL4VisibilityOptions::Device,
+    );
 }
 
 /// A step's scored entries in one buffer, as byte offsets: the count, each entry's logits row,

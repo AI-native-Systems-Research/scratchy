@@ -10,7 +10,7 @@ use half::bf16;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::logprobs::{SLOTS, THREADS, TOP};
+use scratchy_target_metal::logprobs::{SLOTS, THREADS, TOP, encode_raw_copies};
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{PipelineKey, SpecializedPipelineCache};
 use scratchy_target_metal::tape::ids::LogitsWidth;
@@ -78,6 +78,56 @@ fn reference(row: &[f32], token: u32) -> ((f64, u32), Vec<(u32, f64)>) {
     ((emitted as f64 - log_sum, rank), top)
 }
 
+/// The kernel's scores of `entries` (logits rows of `logits`, and the tokens emitted from each row):
+/// each entry's log-probabilities, token ids and ranks, its emitted token's then its top's.
+fn score(
+    device: &objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>,
+    pipeline: &scratchy_target_metal::shader_cache::ComputePipelineState,
+    logits: &Buffer,
+    entries: &[u32],
+    tokens: &[u32],
+) -> (Vec<f32>, Vec<u32>, Vec<u32>) {
+    let b_rows = buffer(device, entries);
+    let b_tokens = buffer(device, tokens);
+    let n = entries.len() * SLOTS;
+    let (b_lp, b_tok, b_rank) = (
+        buffer(device, &vec![f32::NAN; n]),
+        buffer(device, &vec![u32::MAX; n]),
+        buffer(device, &vec![u32::MAX; n]),
+    );
+    let mut batch = Mtl4DispatchBatch::begin(device).expect("an MTL4 queue");
+    batch.encode(
+        pipeline,
+        &[
+            (logits, 0),
+            (&b_rows, 1),
+            (&b_tokens, 2),
+            (&b_lp, 4),
+            (&b_tok, 5),
+            (&b_rank, 6),
+        ],
+        &[(entries.len() as u32, 3)],
+        &[],
+        &[],
+        MTLSize {
+            width: entries.len(),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: THREADS,
+            height: 1,
+            depth: 1,
+        },
+    );
+    batch.commit(true);
+    (
+        read::<f32>(&b_lp, n),
+        read::<u32>(&b_tok, n),
+        read::<u32>(&b_rank, n),
+    )
+}
+
 #[test]
 fn logprobs_match_the_log_softmax_rank_and_top_of_each_row() {
     let Some(di) = detect_device() else {
@@ -126,46 +176,7 @@ fn logprobs_match_the_log_softmax_rank_and_top_of_each_row() {
         .map(|&v| bf16::from_f32(v).to_bits())
         .collect();
     let b_logits = buffer(&device, &logits);
-    let b_rows = buffer(&device, &entries);
-    let b_tokens = buffer(&device, &tokens);
-    let n = entries.len() * SLOTS;
-    let (b_lp, b_tok, b_rank) = (
-        buffer(&device, &vec![f32::NAN; n]),
-        buffer(&device, &vec![u32::MAX; n]),
-        buffer(&device, &vec![u32::MAX; n]),
-    );
-    let mut batch = Mtl4DispatchBatch::begin(&device).expect("an MTL4 queue");
-    batch.encode(
-        &pipeline,
-        &[
-            (&b_logits, 0),
-            (&b_rows, 1),
-            (&b_tokens, 2),
-            (&b_lp, 4),
-            (&b_tok, 5),
-            (&b_rank, 6),
-        ],
-        &[(entries.len() as u32, 3)],
-        &[],
-        &[],
-        MTLSize {
-            width: entries.len(),
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: THREADS,
-            height: 1,
-            depth: 1,
-        },
-    );
-    batch.commit(true);
-
-    let (lp, tok, rank) = (
-        read::<f32>(&b_lp, n),
-        read::<u32>(&b_tok, n),
-        read::<u32>(&b_rank, n),
-    );
+    let (lp, tok, rank) = score(&device, &pipeline, &b_logits, &entries, &tokens);
     for (e, &r) in entries.iter().enumerate() {
         let row = &rows[r as usize];
         let ((want_lp, want_rank), want_top) = reference(row, tokens[r as usize]);
@@ -195,4 +206,102 @@ fn logprobs_match_the_log_softmax_rank_and_top_of_each_row() {
         rank[row1], 1,
         "a tied leader's rank counts only the logits strictly above it"
     );
+}
+
+/// A grammar-masked step scores its rows' raw logits, set aside before the mask overwrites the
+/// logits in place (`encode_raw_copies`), as cuda's worker (`raw_logits_for_logprobs`) and vLLM by
+/// default do. Scored from the copy, a row whose disallowed tokens the mask set to -inf keeps its
+/// raw log-softmax, rank and top; scored from the masked logits it does not.
+#[test]
+fn a_masked_row_scores_its_raw_logits() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
+    let key = PipelineKey::new(
+        "logprobs",
+        "logprobs_topk_bf16",
+        LogprobsConstants {
+            vocab: LogitsWidth(VOCAB as u32),
+        }
+        .into(),
+    );
+    let pipeline = baked_build(&cache, &key).expect("logprobs_topk_bf16");
+
+    const MASKED_ROWS: usize = 3;
+    let mut random = Random(0x003a_5ced);
+    let rows: Vec<Vec<f32>> = (0..MASKED_ROWS)
+        .map(|_| {
+            (0..VOCAB)
+                .map(|_| bf16::from_f32(random.unit() * 8.0).to_f32())
+                .collect()
+        })
+        .collect();
+    let tokens: Vec<u32> = vec![7, 123_456, 248_000];
+    // Rows 2 and 0 are scored; row 1 is not, and is never set aside.
+    let entries: Vec<u32> = vec![2, 0];
+    let bits = |rows: &[Vec<f32>]| -> Vec<u16> {
+        (rows.iter().flatten())
+            .map(|&v| bf16::from_f32(v).to_bits())
+            .collect()
+    };
+    let b_logits = buffer(&device, &bits(&rows));
+    let b_raw = buffer(&device, &vec![0u16; MASKED_ROWS * VOCAB]);
+    let row_bytes = (VOCAB * 2) as u64;
+    let batch = Mtl4DispatchBatch::begin(&device).expect("an MTL4 queue");
+    // The copy reads and writes them: resident for the command buffer.
+    let _pinned = (
+        batch.residency().pin(b_logits.clone()),
+        batch.residency().pin(b_raw.clone()),
+    );
+    encode_raw_copies(batch.encoder(), &b_logits, &b_raw, &entries, row_bytes);
+    batch.commit(true);
+
+    // The mask: every token but a thousand-token allowed range and the emitted one goes to -inf,
+    // in place.
+    let mut masked = rows.clone();
+    for (r, row) in masked.iter_mut().enumerate() {
+        for (j, v) in row.iter_mut().enumerate() {
+            if !(1000..2000).contains(&j) && j != tokens[r] as usize {
+                *v = f32::NEG_INFINITY;
+            }
+        }
+    }
+    let b_masked = buffer(&device, &bits(&masked));
+
+    let (raw_lp, raw_tok, raw_rank) = score(&device, &pipeline, &b_raw, &entries, &tokens);
+    let (masked_lp, _, _) = score(&device, &pipeline, &b_masked, &entries, &tokens);
+    for (e, &r) in entries.iter().enumerate() {
+        let ((want_lp, want_rank), want_top) = reference(&rows[r as usize], tokens[r as usize]);
+        let at = e * SLOTS;
+        assert_eq!(
+            raw_tok[at], tokens[r as usize],
+            "entry {e}: the emitted token"
+        );
+        assert_eq!(raw_rank[at], want_rank, "entry {e}: its raw rank");
+        assert!(
+            (raw_lp[at] as f64 - want_lp).abs() < 1e-4,
+            "entry {e}: raw {} vs {want_lp}",
+            raw_lp[at]
+        );
+        for (k, &(id, want)) in want_top.iter().enumerate() {
+            assert_eq!(
+                raw_tok[at + 1 + k],
+                id,
+                "entry {e} top {k}: the raw top's token"
+            );
+            assert!(
+                (raw_lp[at + 1 + k] as f64 - want).abs() < 1e-4,
+                "entry {e} top {k}: raw {} vs {want}",
+                raw_lp[at + 1 + k]
+            );
+        }
+        assert!(
+            (masked_lp[at] as f64 - want_lp).abs() > 1e-2,
+            "entry {e}: the masked logits score differently ({} vs raw {want_lp})",
+            masked_lp[at]
+        );
+    }
 }

@@ -305,6 +305,8 @@ pub struct MetalWorker {
     logprobs_buffer: Option<scratchy_target_metal::residency::Pinned>,
     /// This step's logprobs entries, set by `execute_model` for the target forward to score.
     logprobs_step: Option<LogprobsStep>,
+    /// The raw logits rows a grammar-masked step's logprobs score, grown to the widest step.
+    logprobs_raw: Option<scratchy_target_metal::residency::Pinned>,
     /// A multi-token-prediction head drafting over a prefix of its target's vocabulary: the rest
     /// of the target's lm_head, for the steps that draft over all of it ([`vocab_suffix_draft`]).
     draft_vocab_suffix: Option<
@@ -1093,6 +1095,7 @@ impl MetalWorker {
             logprobs_kernels: None,
             logprobs_buffer: None,
             logprobs_step: None,
+            logprobs_raw: None,
             draft_vocab_suffix: None,
             mtp_drafter: None,
             sampler_kernels: None,
@@ -2124,10 +2127,13 @@ impl MetalWorker {
         &mut self,
         req_ids: &[String],
         sampled_token_ids: &[Vec<u32>],
-    ) -> Option<Vec<Option<Vec<scratchy_core_common::LogprobsOutput>>>> {
+    ) -> ExecutorResult<Option<Vec<Option<Vec<scratchy_core_common::LogprobsOutput>>>>> {
         use scratchy_core_common::{LogprobsOutput, TokenLogprob};
-        let step = self.logprobs_step.take()?;
-        let scores = step.layout.read(self.logprobs_buffer.as_ref()?);
+        let (Some(step), Some(buffer)) = (self.logprobs_step.take(), self.logprobs_buffer.as_ref())
+        else {
+            return Ok(None);
+        };
+        let scores = step.layout.read(buffer);
         let mut out: Vec<Option<Vec<LogprobsOutput>>> = vec![None; req_ids.len()];
         let token = |t: &scratchy_target_metal::logprobs::TokenScore| TokenLogprob {
             token_id: t.token,
@@ -2135,6 +2141,8 @@ impl MetalWorker {
             rank: t.rank,
         };
         for (&(i, _), score) in step.entries.iter().zip(&scores) {
+            // At most the kernel's `TOP` (20, OpenAI's `top_logprobs` maximum): a request asking
+            // more gets 20. Refusing it is the API's validation, which no backend runs yet.
             let top = (self.sampling_params_map.get(&req_ids[i]))
                 .and_then(|p| p.logprobs)
                 .map_or(0, |n| n.max(0) as usize);
@@ -2142,18 +2150,20 @@ impl MetalWorker {
             let tokens = out[i].get_or_insert_with(Vec::new);
             // A verify step scores every row; the request keeps those of the tokens it emitted.
             if tokens.len() < emitted.len() {
-                debug_assert_eq!(
-                    score.emitted.token,
-                    emitted[tokens.len()],
-                    "the token scored"
-                );
+                let want = emitted[tokens.len()];
+                if score.emitted.token != want {
+                    return Err(ExecutorError::WorkerExecution(format!(
+                        "logprobs of {}: scored token {}, emitted {want}",
+                        req_ids[i], score.emitted.token
+                    )));
+                }
                 tokens.push(LogprobsOutput {
                     sampled: token(&score.emitted),
                     top_logprobs: score.top.iter().take(top).map(token).collect(),
                 });
             }
         }
-        Some(out)
+        Ok(Some(out))
     }
 
     /// Wait for the oldest step still on the device and append the tokens it
@@ -4201,6 +4211,18 @@ impl MetalWorker {
             .as_ref()
             .map(|k| k as *const scratchy_target_metal::sampling::SamplerKernels as usize);
         let (head_cell, head_onto_cell) = (&head, &head_onto);
+        // A grammar mask overwrites the logits in place: the step's logprobs score the raw rows,
+        // set aside before it.
+        #[cfg(feature = "guided-decoding")]
+        let masked = grammar_mask_ctx.is_some();
+        #[cfg(not(feature = "guided-decoding"))]
+        let masked = false;
+        let logprobs = match logprobs {
+            Some(pass) if masked => {
+                Some(pass.with_raw(&mut self.logprobs_raw, &mtl_device, &residency))
+            }
+            pass => pass,
+        };
         let logprobs_device = mtl_device.clone();
         let followup: scratchy_forward_compiler::MetalForwardFollowup<'_> = Box::new(
             move |enc,
@@ -4233,6 +4255,9 @@ impl MetalWorker {
                 // argmax can only pick a grammar-valid token. The mask emits
                 // its own pre-barrier (forward-write -> mask-read); argmax's
                 // pre-barrier then orders mask-write -> argmax-read.
+                if let Some(pass) = &logprobs {
+                    pass.set_aside(enc, logits_buf);
+                }
                 #[cfg(feature = "guided-decoding")]
                 if let Some(ref gm) = grammar_mask_ctx {
                     // Mask the FULL logits width. The shader treats any slot
@@ -5065,7 +5090,9 @@ fn logprobs_pass(
     residency: &scratchy_target_metal::residency::MetalResidencySet,
 ) -> Option<LogprobsPass> {
     let step = step?;
-    let kernels = kernels? as *const scratchy_target_metal::logprobs::LogprobsKernels as usize;
+    let kernels = kernels?;
+    let row_bytes = kernels.row_bytes();
+    let kernels = kernels as *const scratchy_target_metal::logprobs::LogprobsKernels as usize;
     if reserve_pinned(buffer, device, residency, step.layout.total as usize) {
         residency.commit();
     }
@@ -5076,6 +5103,9 @@ fn logprobs_pass(
         kernels,
         buffer,
         layout: step.layout,
+        rows,
+        row_bytes,
+        raw: None,
     })
 }
 
@@ -5088,10 +5118,49 @@ struct LogprobsPass {
     kernels: usize,
     buffer: scratchy_target_metal::mtl4_dispatch::Buffer,
     layout: scratchy_target_metal::logprobs::LogprobsLayout,
+    /// The logits rows it scores, and their width.
+    rows: Vec<u32>,
+    row_bytes: u64,
+    /// Where its rows' raw logits are set aside, on a step whose grammar mask overwrites the
+    /// logits; `None` scores the logits themselves.
+    raw: Option<scratchy_target_metal::mtl4_dispatch::Buffer>,
 }
 
 #[cfg(feature = "metal")]
 impl LogprobsPass {
+    /// This pass scoring its rows' raw logits, set aside in `raw` (grown to hold them).
+    fn with_raw(
+        mut self,
+        raw: &mut Option<scratchy_target_metal::residency::Pinned>,
+        device: &scratchy_target_metal::mtl4_dispatch::Device,
+        residency: &scratchy_target_metal::residency::MetalResidencySet,
+    ) -> Self {
+        let rows = self.rows.iter().max().map_or(0, |&r| u64::from(r) + 1);
+        if reserve_pinned(raw, device, residency, (rows * self.row_bytes) as usize) {
+            residency.commit();
+        }
+        self.raw = raw.as_ref().map(|r| (**r).clone());
+        self
+    }
+
+    /// Set its rows' raw logits aside from `logits` (with a place to set them aside), before
+    /// anything overwrites them.
+    fn set_aside(
+        &self,
+        enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        logits: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+    ) {
+        if let Some(raw) = &self.raw {
+            scratchy_target_metal::logprobs::encode_raw_copies(
+                enc,
+                logits,
+                raw,
+                &self.rows,
+                self.row_bytes,
+            );
+        }
+    }
+
     /// Encode the scoring of the logits rows at `logits` and the tokens at `tokens` (one a row).
     fn encode(
         &self,
@@ -5102,6 +5171,7 @@ impl LogprobsPass {
     ) -> Result<(), String> {
         use ::objc2_metal::MTLBuffer as _;
         let base = self.buffer.gpuAddress();
+        let logits = self.raw.as_ref().map_or(logits, |raw| raw.gpuAddress());
         let table = argument_table_on(device, &self.layout.addresses(base, logits, tokens))?;
         // SAFETY: `kernels` is the worker's `LogprobsKernels`, borrowed for the forward that runs
         // this pass.
@@ -5412,7 +5482,7 @@ fn sampled(
 /// Grow `slot` to a pinned, zeroed buffer of at least `bytes`, replacing (and
 /// so unpinning) a smaller one. Returns whether it allocated, i.e. whether
 /// `residency` needs a commit before the next command buffer.
-#[cfg(all(feature = "metal", feature = "guided-decoding"))]
+#[cfg(feature = "metal")]
 fn reserve_pinned(
     slot: &mut Option<scratchy_target_metal::residency::Pinned>,
     device: &scratchy_target_metal::mtl4_dispatch::Device,
@@ -8191,7 +8261,7 @@ impl Worker for MetalWorker {
                 None
             };
 
-        let logprobs = self.read_logprobs(&req_ids_in_order, &sampled_token_ids);
+        let logprobs = self.read_logprobs(&req_ids_in_order, &sampled_token_ids)?;
         Ok(ModelRunnerOutput {
             req_ids: req_ids_in_order,
             req_id_to_index,
@@ -8278,6 +8348,7 @@ impl Worker for MetalWorker {
         self.argmax_kernels = None;
         self.logprobs_kernels = None;
         self.logprobs_buffer = None;
+        self.logprobs_raw = None;
         self.draft_vocab_suffix = None;
         self.argmax_slots.clear();
         #[cfg(feature = "guided-decoding")]
