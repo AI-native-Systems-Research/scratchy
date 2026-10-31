@@ -8013,6 +8013,26 @@ mod elementwise_tests {
             (32, 1),
             "one spray per core, the rows whole"
         );
+        // ⭐ AND dxp IS TOLD THE FRAME INNERMOST FIRST: rows innermost, `["mb", "y", "out"]`, the
+        // walk `[21, 32, 64]` and the sprayed mask's broadcast `y` at position 1. As written
+        // (`["y", "mb", "out"]`) the card walked `y` innermost and wrote sticks `21c + 32m`.
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = crate::emit::emit_sdsc("add_o7", &op, &folds, None).expect("it emits");
+        let dsc = &sdsc.dscs_[0]["add_o7"];
+        for n in &dsc.scheduleTree_ {
+            assert_eq!(n.layoutDimOrder_, vec!["mb", "y", "out"], "{}", n.name_);
+            assert_eq!(
+                serde_json::to_value(&n.maxDimSizes_).expect("the walk serializes"),
+                serde_json::json!([21, 32, 64]),
+                "{}",
+                n.name_
+            );
+        }
+        assert_eq!(
+            dsc.labeledDs_[1].scale_,
+            vec![1, -1, 1],
+            "the mask's broadcast `y`, in dxp's order"
+        );
     }
 
     /// ⭐ THE INNER SPRAY'S DESCRIPTOR STATES THE `[mb, y, out]` FRAME — the same op as the outer

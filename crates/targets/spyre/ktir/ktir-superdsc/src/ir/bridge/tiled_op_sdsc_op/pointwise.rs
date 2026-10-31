@@ -1412,8 +1412,8 @@ pub fn pointwise_broadcast_opspec_from_tile(
                     .with_row_blocked(matches!(df, Df::Fp32)),
                 ))
             } else {
-                Ok(AnyTensorArg::R3(
-                    TensorArg::<3>::new(
+                Ok(AnyTensorArg::R3({
+                    let t = TensorArg::<3>::new(
                         is_input,
                         name.to_string(),
                         Role::Output,
@@ -1429,8 +1429,15 @@ pub fn pointwise_broadcast_opspec_from_tile(
                     .map_err(|e| e.0)?
                     .with_offset(off)
                     .with_df(df)
-                    .with_row_blocked(matches!(df, Df::Fp32)),
-                ))
+                    .with_row_blocked(matches!(df, Df::Fp32));
+                    // A spray's two row dims go to dxp innermost first.
+                    match spray {
+                        Some(order) => t
+                            .with_device_order(order.device_layout())
+                            .map_err(|e| e.0)?,
+                        None => t,
+                    }
+                }))
             }
         };
     let mut args = Vec::with_capacity(inputs.len() + 1);
