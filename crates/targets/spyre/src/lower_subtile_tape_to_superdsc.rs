@@ -7199,6 +7199,15 @@ impl EmittedBundle {
                 out
             }
         };
+        // ⭐ EVERY SEND NAMES BAKED BYTES, OR THE BUNDLE DOES NOT BAKE. A consume's send reads its
+        // operand's placement and lands at the receive window's; the loader reads them through this
+        // same resolution, so a bundle that passes here never meets an unplaced send at load.
+        bundle::collective::sends(&self.layout, &groups).map_err(|u| {
+            format!(
+                "{}: group {}'s collective send names no baked bytes: {:?}",
+                self.fp, u.group, u.why
+            )
+        })?;
         Ok(bundle::BundleCode {
             fp: std::borrow::Cow::Owned(self.fp),
             layout: self.layout,
@@ -10189,6 +10198,65 @@ mod tests {
         assert!(
             baked.places.iter().all(|p| seen.insert(p.id)),
             "two placements share an identity — the exact card refusal this test pins"
+        );
+    }
+
+    /// A sharded bundle's send, as the loader reads it off the BAKED layout, is the partial at its
+    /// own placement into the window at its own — the very bytes the consume reads — and a layout
+    /// that lost the window refuses by name, the bake's gate.
+    #[test]
+    fn a_baked_send_reads_the_partial_into_the_window() {
+        use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
+        use crate::tp_plan::{SpyreWorld, tp_bake};
+        use ktir_superdsc::ktir_node::ActiveCap;
+        use ktir_superdsc::reserved_tids::TP_RECV_TID;
+        use scratchy_subtile::fixtures::mlp_sublayer;
+        use scratchy_subtile::subtile_ir::lower_region;
+
+        let b = tp_bake(&mlp_sublayer(2048, 8192), SpyreWorld::of::<2>()).unwrap();
+        let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
+        let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
+        let (ops, layout) =
+            lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+        // The card path's groups: one per `launch_index` entry, as `into_code` assembles them.
+        let groups: Vec<bundle::LaunchGroup<'static>> = launch_index(&ops, FoldGrouping::Split)
+            .into_iter()
+            .map(|kv| bundle::LaunchGroup {
+                kv,
+                ..Default::default()
+            })
+            .collect();
+        let baked = bake_layout(&layout);
+        let sends = bundle::collective::sends(&baked, &groups).unwrap();
+        assert_eq!(sends.len(), 1, "one all-reduce, one send");
+        let consume = groups[sends[0].group].kv.tp.unwrap();
+        let partial = layout.placements[&consume.operand.tid()];
+        let window = layout.placements[&TP_RECV_TID];
+        assert_eq!(
+            sends[0].send,
+            bundle::collective::TpSend {
+                source_segment: partial.segment as u8,
+                source_offset: partial.offset,
+                window_offset: window.offset,
+                bytes: consume.fragment.bytes(),
+            }
+        );
+        let windowless = bundle::BundleLayout {
+            places: baked
+                .places
+                .iter()
+                .filter(|p| p.id != bundle::PlaceId::Act(TP_RECV_TID))
+                .cloned()
+                .collect::<Vec<_>>()
+                .into(),
+            ..baked.clone()
+        };
+        assert_eq!(
+            bundle::collective::sends(&windowless, &groups),
+            Err(bundle::collective::UnplacedGroup {
+                group: sends[0].group,
+                why: bundle::collective::SendUnplaced::Window
+            })
         );
     }
 

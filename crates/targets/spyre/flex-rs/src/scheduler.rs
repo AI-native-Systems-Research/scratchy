@@ -77,7 +77,8 @@ use crate::address::{ByteSize, Chunk, CompositeAddress};
 use crate::compute::{ComputeParams, ComputeWireBatch};
 use crate::control_block_wire::{
     AllocationTotalSize, ControlBlockWire, DevicePhysicalAddress, Flits, HostPhysicalAddress,
-    ResponseTag, SegmentExtent, TransferSize, VirtualAddressSbf,
+    RdmaEndpoint, RdmaUnicastSend, ResponseTag, SegmentExtent, TransferSize, VirtualAddressSbf,
+    XlatWindow,
 };
 use crate::dma::{DmaDirection, DmaParams, DmaPipelineShape, FillParams, FillPipeline};
 use crate::flex_config::{DeviceKind, RuntimeConfig};
@@ -1319,6 +1320,73 @@ pub fn build_compute_cb(
         bootstrap,
     )
     .map_err(|e| mock_error(&format!("build_compute_cb: {e}")))
+}
+
+/// One end of a device-to-device send, addressed the way a compute launch addresses its operands:
+/// the allocation that backs program segment `segment` for that launch, and the byte offset of the
+/// transfer's first byte in that segment.
+pub struct RdmaOperand {
+    pub base: Arc<CompositeAddress>,
+    pub segment: u8,
+    pub offset: u64,
+}
+
+/// One F-send to render (`ControlBlockWire::rdma_unicast_send`), its endpoints still allocations.
+pub struct RdmaSendParams {
+    /// The SENDING rank's write-done sid.
+    pub sid: u8,
+    /// The peer the payload lands on, by BAT index.
+    pub dest_tid: u8,
+    pub length: TransferSize,
+    pub source: RdmaOperand,
+    /// This card's own receive window: the card-symmetric layout puts the peer's at the same
+    /// address.
+    pub window: RdmaOperand,
+}
+
+/// Build the F-send CB for `send`. Each endpoint's segment translates through ITS BASE exactly as
+/// [`build_compute_cb`] translates a tensor operand (the allocation's absolute address, the
+/// allocation's own size), so a send and the compute launch it is aimed from read one segment
+/// through one translation.
+///
+/// # Errors
+/// An endpoint whose transfer runs past its allocation (a window too small for the payload, or a
+/// fragment past its operand), an interleaved or unresolvable allocation, or the wire's refusal.
+pub fn build_rdma_send_cb(
+    resolver: &dyn DeviceAddressResolver,
+    send: &RdmaSendParams,
+    tag: ResponseTag,
+    pipeline_barrier: bool,
+) -> Result<ControlBlockWire, SchedulerError> {
+    let endpoint = |which: &str, o: &RdmaOperand| -> Result<RdmaEndpoint, SchedulerError> {
+        let resolved = resolve_single_chunk(resolver, &o.base)?;
+        let size = o.base.total_size().as_u64();
+        if o.offset + send.length.0 > size {
+            return Err(mock_error(&format!(
+                "build_rdma_send_cb: the {which} [{}, {}) of segment {} runs past its {size} B \
+                 allocation",
+                o.offset,
+                o.offset + send.length.0,
+                o.segment,
+            )));
+        }
+        Ok(RdmaEndpoint {
+            dmva: VirtualAddressSbf::new(o.segment, Flits::from_bytes(o.offset)),
+            xlat: XlatWindow {
+                region_paddr: resolved.xlat_absolute(),
+                length: SegmentExtent(size),
+            },
+        })
+    };
+    let wire = RdmaUnicastSend {
+        sid: send.sid,
+        dest_tid: send.dest_tid,
+        length: send.length,
+        source: endpoint("source", &send.source)?,
+        window: endpoint("window", &send.window)?,
+    };
+    ControlBlockWire::rdma_unicast_send(tag, &wire, pipeline_barrier)
+        .map_err(|e| mock_error(&format!("build_rdma_send_cb: {e:?}")))
 }
 
 // ---------------------------------------------------------------------
@@ -6148,6 +6216,43 @@ mod resolve_single_chunk_tests {
         fn resolve(&self, _chunk: &Chunk) -> Option<(u8, DevicePhysicalAddress, ByteSize)> {
             Some((self.segment, self.base, self.region_size))
         }
+    }
+
+    /// A send whose payload would run past the window's allocation is refused while it is still
+    /// allocations, naming the endpoint — the window too small is never a CB.
+    #[test]
+    fn a_send_past_its_window_refuses_by_name() {
+        let resolver = FixedResolver {
+            segment: 1,
+            base: DevicePhysicalAddress(0x1_0000_0000),
+            region_size: crate::address::ByteSize(1 << 20),
+        };
+        let alloc = |offset: u64, size: u64| {
+            Arc::new(CompositeAddress::from_chunk(Chunk::new(
+                LogicalAddress::new(RegionId(1), ByteOffset(offset)),
+                crate::address::ByteSize(size),
+                DomainId(0),
+            )))
+        };
+        let send = RdmaSendParams {
+            sid: 0,
+            dest_tid: 1,
+            length: TransferSize(8192),
+            source: RdmaOperand {
+                base: alloc(0, 65536),
+                segment: 0,
+                offset: 0,
+            },
+            window: RdmaOperand {
+                base: alloc(0, 65536),
+                segment: 1,
+                offset: 61440,
+            },
+        };
+        let why = build_rdma_send_cb(&resolver, &send, ResponseTag(1), true)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("the window [61440, 69632)"), "{why}");
     }
 
     /// Port of the real address split: `TranslateDmvaToDmpa`

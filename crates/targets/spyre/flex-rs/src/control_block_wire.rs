@@ -1259,6 +1259,20 @@ impl ControlBlockWire {
         word.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
         BitField::<32, 32>::unpack(u64::from_le_bytes(word)) != 0
     }
+
+    /// The same CB with its CTRL barrier bit SET — `CtrlSectionSBF::SetBarrier` applied to a built
+    /// CB, the way the vendor's `Optimize` (`FLEX_FORCE_CB_BARRIER`) applies it to every CB of a
+    /// stream. A compute CB that consumes what an RDMA wait admitted takes it (#1007 §3: the
+    /// consume carries the barrier bit), so the compute cannot start before the wait retires.
+    /// Everything else in word 0 — the tag, the cancel byte, the EDEP field — is kept.
+    #[must_use]
+    pub fn with_ctrl_barrier(mut self) -> Self {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
+        let word = u64::from_le_bytes(w) | BitField::<32, 32>::pack(1);
+        self.bytes[CTRL_SECTION..CTRL_SECTION + 8].copy_from_slice(&word.to_le_bytes());
+        self
+    }
 }
 
 /// A decoded response block: the real bytes senlib hands back via
@@ -2934,5 +2948,27 @@ mod tests {
             panic!("a duplicate sid must refuse");
         };
         assert!(why.contains("duplicate sid 1"), "{why}");
+    }
+
+    /// Setting the barrier on a built CB changes the barrier bit and nothing else: the tag, the
+    /// EDEP stamp and every section below the CTRL word survive.
+    #[test]
+    fn a_barrier_set_after_the_build_touches_only_its_bit() {
+        let mut plain = ControlBlockWire::null(ResponseTag(0x5A5A), false);
+        plain.set_edep(1);
+        let fenced = plain.with_ctrl_barrier();
+        assert!(!plain.ctrl_barrier());
+        assert!(fenced.ctrl_barrier());
+        assert_eq!(fenced.edep(), 1);
+        let mut expect = plain;
+        let bit = BitField::<32, 32>::pack(1).to_le_bytes();
+        for (b, m) in expect.bytes_mut()[CTRL_SECTION..CTRL_SECTION + 8]
+            .iter_mut()
+            .zip(bit)
+        {
+            *b |= m;
+        }
+        assert_eq!(fenced, expect);
+        assert_eq!(fenced, fenced.with_ctrl_barrier());
     }
 }

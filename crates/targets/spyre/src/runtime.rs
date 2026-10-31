@@ -34,6 +34,7 @@ const _: () = {
     );
 };
 
+use crate::bundle_code::collective::{RecvWindow, Sid, TpIdentity};
 use flex_rs::address::{Chunk, CompositeAddress, LogicalAddress, RegionId};
 use flex_rs::allocator::{
     AllocationDirective, AllocationDirectiveError, FlexAllocator, FlexAllocatorError,
@@ -50,8 +51,9 @@ use flex_rs::memory_region::{DomainId, MemoryType};
 use flex_rs::runtime::{RuntimeContext, RuntimeContextError};
 use flex_rs::scheduler::{
     DeviceAddressResolver, FlexAllocatorAddressResolver, HardwareSubmit, QueueCapacitySource,
-    SchedulerBackendConfig, SchedulerFactoryError, SenlibHardwareSubmit, SenlibQueueCapacity,
-    build_compute_cb, create_scheduler,
+    RdmaOperand, RdmaSendParams, SchedulerBackendConfig, SchedulerFactoryError,
+    SenlibHardwareSubmit, SenlibQueueCapacity, build_compute_cb, build_rdma_send_cb,
+    create_scheduler,
 };
 use flex_rs::shared_host_pool::{SharedHostPool, SharedHostPoolError};
 use flex_rs::stream::{
@@ -319,7 +321,7 @@ pub enum HwError {
     /// `RuntimeContext::reset` refused.
     Reset(RuntimeContextError),
     /// Rendering compute-CB wire images OFF the submit path refused — the CB
-    /// encoder cannot express an operand ([`Stream::render_compute_batch`]).
+    /// encoder cannot express an operand ([`Stream::render_batch`]).
     /// Never a submission: nothing was sent to the device.
     CbRender(SchedulerError),
     /// A #606 pooled copy ([`Stream::pooled_copy_on_compute`]) was refused by the
@@ -942,32 +944,22 @@ impl Stream {
     /// JobPlanStepCompute (the resident binary runs by its bootstrap address; dxp does not
     /// apply `tensor_byte_offsets` to per-op addresses). Widening this to a general batch
     /// door means growing [`BatchedCompute`], not a new method.
-    pub fn compute_batch(
+    fn compute_batch<'l>(
         &self,
-        launches: &[BatchedCompute],
+        launches: impl Iterator<Item = &'l BatchedCompute>,
         pipeline_barrier: bool,
     ) -> Result<(), HwError> {
         let stream = self.live()?;
-        let params: Vec<ComputeParams> = launches
-            .iter()
-            .map(|l| {
-                ComputeParams::new(
-                    l.prog.0.clone(),
-                    l.tensor_allocs.iter().map(|a| a.0.clone()).collect(),
-                    KernelName(String::new()),
-                    BootstrapOffset(l.bootstrap_offset),
-                    Vec::new(),
-                )
-            })
-            .collect();
+        let params: Vec<ComputeParams> = launches.map(BatchedCompute::params).collect();
         stream
             .launch_compute_batch(params, pipeline_barrier, None)
             .map_err(HwError::Stream)
     }
 
-    /// Render the wire bytes of a compute batch WITHOUT submitting it (#603
+    /// Render the wire bytes of a staged batch WITHOUT submitting it (#603
     /// PR2's image-render door): the same `flex_rs::scheduler::build_compute_cb`
-    /// the submit path runs per CB, over the same resolver TYPE the Pf backend
+    /// the submit path runs per compute CB, and `build_rdma_send_cb` for a
+    /// collective's send, over the same resolver TYPE the Pf backend
     /// resolves with (`FlexAllocatorAddressResolver` on the runtime's own
     /// allocator — the very `Arc` `build_runtime` handed the backend, so the
     /// region map both read is one map), at CALLER-chosen tags. Tags only
@@ -980,9 +972,9 @@ impl Stream {
     /// (`superdsc_exec::Executor::prepare`) renders one step's batch both the
     /// walk way and the CbPlan way THROUGH THIS ONE DOOR, so what it compares
     /// is exactly what the device would be handed.
-    pub fn render_compute_batch(
+    pub fn render_batch(
         &self,
-        launches: &[BatchedCompute],
+        items: &[BatchedCb],
         first_tag: u32,
     ) -> Result<Vec<ControlBlockWire>, HwError> {
         let resolver = FlexAllocatorAddressResolver::new(
@@ -990,29 +982,63 @@ impl Stream {
                 .get_allocator()
                 .map_err(|e| HwError::Alloc(AllocError::Context(e)))?,
         );
-        let mut cbs = Vec::with_capacity(launches.len());
-        for (i, l) in launches.iter().enumerate() {
-            let params = ComputeParams::new(
-                l.prog.0.clone(),
-                l.tensor_allocs.iter().map(|a| a.0.clone()).collect(),
-                KernelName(String::new()),
-                BootstrapOffset(l.bootstrap_offset),
-                Vec::new(),
-            );
-            cbs.push(
-                build_compute_cb(&resolver, &params, ResponseTag(first_tag + i as u32))
+        let compute = |l: &BatchedCompute, tag: ResponseTag| {
+            build_compute_cb(&resolver, &l.params(), tag).map_err(HwError::CbRender)
+        };
+        let mut cbs = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let tag = ResponseTag(first_tag + i as u32);
+            cbs.push(match item {
+                BatchedCb::Compute(l) => compute(l, tag)?,
+                BatchedCb::Consume(l) => compute(l, tag)?.with_ctrl_barrier(),
+                // ⭐ THE SEND WAITS FOR ITS PRODUCER: the barrier keeps the DMA engine from
+                // reading the operand before the compute that writes it has retired.
+                BatchedCb::Send(s) => build_rdma_send_cb(&resolver, &s.params(), tag, true)
                     .map_err(HwError::CbRender)?,
-            );
+                BatchedCb::Wait { sid } => {
+                    ControlBlockWire::rdma_wdone_wait(tag, &[*sid], false)
+                        .map_err(|e| HwError::CbRender(format!("rdma_wdone_wait: {e:?}").into()))?
+                }
+            });
         }
         Ok(cbs)
     }
 
+    /// Submit a staged batch as ONE doorbell. A batch of plain compute launches takes
+    /// `Self::compute_batch`, the door it always took; a batch that carries a collective's
+    /// control blocks is rendered through [`Self::render_batch`] and submitted as wires
+    /// ([`Self::compute_wires`]) with the leased tags stamped on, so the sends, waits and consumes
+    /// ride the same FIFO as the compute that produces and consumes their bytes.
+    pub fn submit_batch(&self, items: &[BatchedCb], pipeline_barrier: bool) -> Result<(), HwError> {
+        if items.iter().all(|i| matches!(i, BatchedCb::Compute(_))) {
+            return self.compute_batch(
+                items.iter().filter_map(|i| match i {
+                    BatchedCb::Compute(l) => Some(l),
+                    _ => None,
+                }),
+                pipeline_barrier,
+            );
+        }
+        let canvas = Arc::new(self.render_batch(items, 0)?);
+        self.compute_wires(
+            ComputeWireBatch {
+                canvas,
+                patch: Box::new(|tags, cbs| {
+                    for (cb, tag) in cbs.iter_mut().zip(tags.iter()) {
+                        cb.set_tag(*tag);
+                    }
+                }),
+            },
+            pipeline_barrier,
+        )
+    }
+
     /// #603 PR2's replay submit door — the write side of
-    /// [`Self::render_compute_batch`]'s images: submit a canvas the render
+    /// [`Self::render_batch`]'s images: submit a canvas the render
     /// door produced (and the prepare gates proved) as ONE doorbell, with
     /// the batch's stamp closure applying the step's patches and the
     /// pool-leased tags to the copy the backend takes under the submission
-    /// lock. Same one-operation shape as [`Self::compute_batch`] — one
+    /// lock. Same one-operation shape as `Self::compute_batch` — one
     /// barrier decision (`pipeline_barrier` is the OR of the step's per-op
     /// host fences), one fence, one capacity gate, in-flight accounting per
     /// CB — so the step is ordered on the ring exactly as its per-rung
@@ -1050,7 +1076,7 @@ pub use flex_rs::address::{ByteOffset, ByteSize};
 pub use flex_rs::compute::ComputeWireBatch;
 pub use flex_rs::control_block_wire::{ControlBlockWire, ResponseTag};
 
-/// One entry of a [`Stream::compute_batch`] list — the owned handles one compute launch
+/// One compute launch of a [`Stream::submit_batch`] list — the owned handles one compute launch
 /// needs. The handles are owned (not borrowed) because a batch outlives the loop that
 /// builds it; see `compute_batch`'s ⛔ note. Field semantics match [`Stream::compute`]'s
 /// parameters of the same names.
@@ -1061,6 +1087,70 @@ pub struct BatchedCompute {
     pub tensor_allocs: Vec<DevAddr>,
     /// Offset within the program allocation where kernel execution begins.
     pub bootstrap_offset: u64,
+}
+
+impl BatchedCompute {
+    /// The launch's parameters — `kernel_name=""` and no tensor byte offsets, the one shape every
+    /// batched launch takes (see `Stream::compute_batch`).
+    fn params(&self) -> ComputeParams {
+        ComputeParams::new(
+            self.prog.0.clone(),
+            self.tensor_allocs.iter().map(|a| a.0.clone()).collect(),
+            KernelName(String::new()),
+            BootstrapOffset(self.bootstrap_offset),
+            Vec::new(),
+        )
+    }
+}
+
+/// One control block of a staged batch ([`Stream::submit_batch`], [`Stream::render_batch`]).
+pub enum BatchedCb {
+    /// A compute launch.
+    Compute(BatchedCompute),
+    /// A collective's consume: the compute launch with its CTRL barrier bit set, so it cannot start
+    /// before the write-done wait in front of it retires (#1007 §3).
+    Consume(BatchedCompute),
+    /// A collective's F-send into the peer's receive window.
+    Send(RdmaSend),
+    /// Wait for the peer's send to land: one write-done count on the PEER's sid.
+    Wait { sid: u8 },
+}
+
+/// One end of a send, addressed as the launch it is aimed from addresses it: the allocation backing
+/// program segment `segment` for that launch, and the byte offset inside it.
+pub struct RdmaEnd {
+    pub base: DevAddr,
+    pub segment: u8,
+    pub offset: u64,
+}
+
+/// A collective's F-send, its endpoints still allocations (rendered by
+/// `flex_rs::scheduler::build_rdma_send_cb`).
+pub struct RdmaSend {
+    /// The SENDING rank's write-done sid.
+    pub sid: u8,
+    /// The peer's BAT index.
+    pub dest_tid: u8,
+    pub bytes: u64,
+    pub source: RdmaEnd,
+    pub window: RdmaEnd,
+}
+
+impl RdmaSend {
+    fn params(&self) -> RdmaSendParams {
+        let end = |e: &RdmaEnd| RdmaOperand {
+            base: e.base.0.clone(),
+            segment: e.segment,
+            offset: e.offset,
+        };
+        RdmaSendParams {
+            sid: self.sid,
+            dest_tid: self.dest_tid,
+            length: flex_rs::control_block_wire::TransferSize(self.bytes),
+            source: end(&self.source),
+            window: end(&self.window),
+        }
+    }
 }
 
 /// One chunk's identity — what a shifted or sliced sub-address is built from. The fields are
@@ -1088,7 +1178,7 @@ pub struct Chunk0 {
 ///
 /// `Clone` is a descriptor refcount bump and nothing more: the field is an `Arc`, the
 /// underlying device memory is never freed (see above), so two handles describe the same
-/// allocation exactly as one handle and a borrow do. The batch door ([`Stream::compute_batch`])
+/// allocation exactly as one handle and a borrow do. The batch door ([`Stream::submit_batch`])
 /// needs it — a batch item outlives the loop that built its shifted bases, so it must own its
 /// handles instead of borrowing them.
 #[derive(Clone)]
@@ -1194,6 +1284,150 @@ impl DevAddr {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  The p2p link — tensor parallelism's one load-time fact
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The cards a sharded session spans, by PCI enumeration index (`sen_pci_card_count` /
+/// `pcie_address_for_card`): the one this process drives and its peer's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CardPair {
+    pub own: u32,
+    pub peer: u32,
+}
+
+/// The ids a rank's collective control blocks name: its own sid (its sends signal on it), the
+/// peer's sid (its waits count on it), and the peer's BAT index (where its sends land).
+///
+/// The BAT index is the peer's RANK — the vendor's `dest_rank`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerRoute {
+    pub own_sid: u8,
+    pub peer_sid: u8,
+    pub dest_tid: u8,
+}
+
+impl PeerRoute {
+    /// The route between `me` and its peer. `None` in a world of one.
+    pub fn of(me: TpIdentity) -> Option<Self> {
+        let peer = me.peer()?;
+        Some(Self {
+            own_sid: Sid::of(me).get(),
+            peer_sid: Sid::of(peer).get(),
+            // `Sid::of` already proves a rank fits a byte (`TpWorld::of` bounds every world by
+            // `MAX_SIDS`); the BAT index is that same rank.
+            dest_tid: Sid::of(peer).get(),
+        })
+    }
+}
+
+/// Why a sharded session could not link to its peer. Each is a load refusal: a topology without
+/// device p2p RDMA is refused, never served over the host.
+#[derive(Debug)]
+pub enum AttachRefusal {
+    /// A world of one has no peer.
+    NoPeer(TpIdentity),
+    /// The peer card is this card.
+    SelfLoop { card: u32 },
+    /// The cross-port IOMMU mapping to the peer card was refused.
+    Mapping(flex_rs::multi_device::RdmaUnitError),
+    /// The runtime this card's side of the link needs did not come up.
+    BringUp(String),
+    /// The window's xseg word did not compose, or `XSEG[peer sid]` could not be programmed.
+    Xseg(String),
+}
+
+impl fmt::Display for AttachRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoPeer(me) => write!(
+                f,
+                "rank {} of a {}-rank world has no peer to link",
+                me.rank(),
+                me.world().get()
+            ),
+            Self::SelfLoop { card } => write!(
+                f,
+                "the peer card is this card ({card}) — a rank cannot send to itself"
+            ),
+            Self::Mapping(e) => write!(
+                f,
+                "the cross-port p2p mapping to the peer card was refused: {e:?} (device p2p RDMA \
+                 is the only path; there is no host fallback)"
+            ),
+            Self::BringUp(e) => write!(f, "the card runtime did not come up: {e}"),
+            Self::Xseg(e) => write!(f, "programming XSEG[peer sid] failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AttachRefusal {}
+
+/// ⭐ THE P2P LINK A SHARDED SESSION SENDS OVER — tensor parallelism's one load-time fact: which
+/// physical card is the peer. Minted only by [`PeerLink::attach`], which maps the peer card over
+/// the cross-port IOMMU (device p2p RDMA, `P2pProtocol::P2pRdma` — never host DMA) and programs this
+/// card's `XSEG[peer sid]` with the receive window's word, the same word every peer send carries.
+/// A session holding one has done both, so its sends have somewhere to land and its waits have
+/// something to count.
+pub struct PeerLink {
+    me: TpIdentity,
+    route: PeerRoute,
+    /// Holds the peer's mapping for the session's life.
+    _unit: flex_rs::multi_device::RdmaUnit,
+}
+
+impl PeerLink {
+    /// Link rank `me`, driving `cards.own`, to its peer on `cards.peer`, for sends landing in
+    /// `window`.
+    ///
+    /// # Errors
+    /// [`AttachRefusal`], by name.
+    pub fn attach(
+        me: TpIdentity,
+        cards: CardPair,
+        window: RecvWindow,
+    ) -> Result<Self, AttachRefusal> {
+        let route = PeerRoute::of(me).ok_or(AttachRefusal::NoPeer(me))?;
+        if cards.own == cards.peer {
+            return Err(AttachRefusal::SelfLoop { card: cards.own });
+        }
+        init_runtime().map_err(|e| AttachRefusal::BringUp(e.to_string()))?;
+        let mut unit = flex_rs::multi_device::RdmaUnit::new(
+            flex_rs::multi_device::RankId(me.rank()),
+            me.world().get(),
+            true,
+        );
+        unit.attach_peer(
+            flex_rs::multi_device::RankId(u32::from(route.dest_tid)),
+            cards.peer,
+            window.end(),
+        )
+        .map_err(AttachRefusal::Mapping)?;
+        let landing = flex_rs::control_block_wire::VirtualAddressSbf::new(
+            RecvWindow::SEGMENT as u8,
+            flex_rs::control_block_wire::Flits::from_bytes(window.offset()),
+        );
+        let word =
+            flex_rs::control_block_wire::window_xseg(landing).map_err(AttachRefusal::Xseg)?;
+        flex_rs::senlib_ffi::write_xseg(route.peer_sid, word).map_err(AttachRefusal::Xseg)?;
+        Ok(Self {
+            me,
+            route,
+            _unit: unit,
+        })
+    }
+
+    /// The rank this session runs as.
+    pub fn identity(&self) -> TpIdentity {
+        self.me
+    }
+
+    /// The ids this session's sends and waits name.
+    pub fn route(&self) -> PeerRoute {
+        self.route
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1246,6 +1480,50 @@ mod tests {
             got.iter().map(|w| w.2).sum::<u64>(),
             addr.total_size().as_u64()
         );
+    }
+
+    /// Each rank of a two-rank world signals on its own sid, counts on its peer's, and lands on the
+    /// peer's BAT index; a world of one has no route.
+    #[test]
+    fn a_route_names_its_own_sid_the_peers_sid_and_the_peers_index() {
+        use crate::bundle_code::collective::TpWorld;
+        let ranks: Vec<TpIdentity> = TpWorld::of::<2>().ranks().collect();
+        assert_eq!(
+            PeerRoute::of(ranks[0]),
+            Some(PeerRoute {
+                own_sid: 0,
+                peer_sid: 1,
+                dest_tid: 1
+            })
+        );
+        assert_eq!(
+            PeerRoute::of(ranks[1]),
+            Some(PeerRoute {
+                own_sid: 1,
+                peer_sid: 0,
+                dest_tid: 0
+            })
+        );
+        let alone = TpWorld::of::<1>().ranks().next().unwrap();
+        assert_eq!(PeerRoute::of(alone), None);
+    }
+
+    /// The two refusals that need no card: a world of one has no peer, and a peer card that is
+    /// this card is a rank sending to itself.
+    #[test]
+    fn a_link_refuses_no_peer_and_a_self_loop_before_touching_the_card() {
+        use crate::bundle_code::collective::{TpWorld, WireBytes};
+        let window = RecvWindow::new(1 << 20, WireBytes::CAP).unwrap();
+        let alone = TpWorld::of::<1>().ranks().next().unwrap();
+        assert!(matches!(
+            PeerLink::attach(alone, CardPair { own: 0, peer: 1 }, window),
+            Err(AttachRefusal::NoPeer(_))
+        ));
+        let rank0 = TpWorld::of::<2>().ranks().next().unwrap();
+        assert!(matches!(
+            PeerLink::attach(rank0, CardPair { own: 3, peer: 3 }, window),
+            Err(AttachRefusal::SelfLoop { card: 3 })
+        ));
     }
 
     /// The Bind shape — the only one `alloc` makes today — walks exactly as `zero_seg`'s old
