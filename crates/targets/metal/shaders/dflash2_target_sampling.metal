@@ -904,7 +904,9 @@ template <> inline float largest_finite<bfloat>() { return as_type<float>(0x7f7f
 // sampler applies them (sampling.metal `sample_softmax_reduce`): repetition divides a positive
 // logit and multiplies a negative one, and presence and frequency lower it by the count. The count
 // is the token's occurrences in the prompt and the output. The result saturates, so no rewritten
-// logit is infinite; a NaN or -inf logit (masked) stays as it is.
+// logit is infinite; an unselectable logit stays as it is, since saturating would make it
+// selectable.
+template <typename L>
 inline float penalize_logit(float value, uint count, PenalizeEntry entry) {
   const uint bits = as_type<uint>(value);
   if ((bits & 0x7fffffffu) > 0x7f800000u || bits == 0xff800000u)
