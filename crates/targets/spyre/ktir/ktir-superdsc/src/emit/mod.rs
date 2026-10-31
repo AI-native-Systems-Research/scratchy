@@ -512,11 +512,21 @@ pub enum SprayOrder {
 }
 
 impl SprayOrder {
-    /// The op's tensors' layout order, outermost first.
+    /// The op's tensors' layout order, outermost first — this emitter's own address frame.
     pub(crate) const fn layout(self) -> [&'static str; 3] {
         match self {
             SprayOrder::Outer => ["y", "mb", "out"],
             SprayOrder::Inner => ["mb", "y", "out"],
+        }
+    }
+
+    /// The same frame in the order dxp reads `layoutDimOrder_`: INNERMOST first, so the two row dims
+    /// swap (`TensorArg::with_device_order`). The stick dim is one stick here, so where it sits does not
+    /// move a byte.
+    pub(crate) const fn device_layout(self) -> [&'static str; 3] {
+        match self {
+            SprayOrder::Outer => ["mb", "y", "out"],
+            SprayOrder::Inner => ["y", "mb", "out"],
         }
     }
 }
@@ -1837,6 +1847,7 @@ fn core_local_reads_agree(
             row_blocked: v.row_blocked,
             device_extent: v.device_extent,
             frame: v.frame,
+            device_order: v.device_order,
         };
         let dims: Vec<&'static str> = plan.dims().iter().map(|d| d.name).collect();
         let corners = per_core_addr(
@@ -3422,19 +3433,19 @@ pub fn emit_sdsc(
         primary.entry(v.role.ds_type()).or_insert_with(|| {
             if is_transpose_out {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
                     stickDimOrder_: vec!["out", "mb"],
                     stickSize_: vec![8, 8],
                 }
             } else if is_fp8_kernel {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
                     stickDimOrder_: vec!["in", "out"],
                     stickSize_: vec![2, 64],
                 }
             } else {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
                     stickDimOrder_: vec![v.stick],
                     stickSize_: vec![v.df.elems_per_stick()], // fp16/bf16: 64; fp32: 32; fp8/int8: 128
                 }
@@ -3841,6 +3852,25 @@ pub fn emit_sdsc(
             }
         }
         let addr = AddrFold::new(&per_core, folds);
+        // The order dxp reads this view's dims in, innermost first, as positions in `v.layout` — set
+        // only where it is not `v.layout`'s (`TensorArg::with_device_order`).
+        let device_from: Option<Vec<usize>> = match v.device_order {
+            None => None,
+            Some(order) => {
+                let from: Vec<usize> = order
+                    .iter()
+                    .filter_map(|d| v.layout.iter().position(|l| l == d))
+                    .collect();
+                if from.len() != v.layout.len() {
+                    return Err(SuperDscError(format!(
+                        "op {op_name}: tensor {i} ('{}') states device order {order:?} over layout \
+                         {:?} — not a permutation of it",
+                        v.name, v.layout
+                    )));
+                }
+                Some(from)
+            }
+        };
         tree.push(AllocNode {
             nodeType_: "allocate",
             name_: name,
@@ -3880,7 +3910,9 @@ pub fn emit_sdsc(
             // stick-major tensor — dxp applies `get_generic_stick_layout` INTERNALLY when it reconstructs
             // the stick-blocked `device_size` from `-1`, so the mb-outermost label + `-1` already yields the
             // stick-major walk (`element_torchspyre_parity`). Reordering here DIVERGES from the golden.
-            layoutDimOrder_: v.layout.to_vec(),
+            // A view that states its own device order (two row dims, read innermost-first by dxp) is
+            // the one exception, and states it on the view.
+            layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
             // ── The ON-CARD WALK, DERIVED from the SAME `sl` the per-core START uses (`StickLayout::
             // max_dim_sizes`) so the two cannot disagree. Stick-blocked (`RowBlocked`/`Kernel`) ⇒ `-1` per
             // dim (dxp reconstructs the RowBlocked device_size from N_/layoutDimOrder_/stickSize_ and
@@ -3934,10 +3966,21 @@ pub fn emit_sdsc(
                 );
                 // Paged only on the gathered value side. Every pin was resolved against this operand's
                 // own layout above, so `paged_at` cannot be the thing that drops one.
-                if paged_dims.is_empty() {
+                let walk = if paged_dims.is_empty() {
                     walk
                 } else {
                     walk.clone().paged_at(&paged_dims).unwrap_or(walk)
+                };
+                // In the order `layoutDimOrder_` states the dims.
+                match &device_from {
+                    None => walk,
+                    Some(from) => walk.reordered(from).ok_or_else(|| {
+                        SuperDscError(format!(
+                            "op {op_name}: tensor {i} ('{}'): its walk does not reorder to its \
+                             device order",
+                            v.name
+                        ))
+                    })?,
                 }
             },
             // ── INDIRECT (GATHERED) HBM ACCESS ──
