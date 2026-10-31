@@ -68,8 +68,10 @@ the lessons from the earlier attempt. Read it before touching emission or the
 runtime. Its §3 (on-card protocol), §4 (hardware facts) and §5 (proof standard)
 bind this work:
 
-- **Recv window:** one per (card, peer), in seg1, sized at bake; cap 4 MiB
-  (the RDMA length field).
+- **Recv window:** one per (card, peer), in seg1, sized at bake: two
+  alternating cuts (collective k uses cut k mod 2), each a run of landing
+  slots, at most 8 per cut. The 4 MiB cap (the RDMA length field) is per
+  message, so per slot.
 - **Sends:**
   - F-send singlecast only;
   - one sid per (sending rank, landing slot): an F-send lands only where its
