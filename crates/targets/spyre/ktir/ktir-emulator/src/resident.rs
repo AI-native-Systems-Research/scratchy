@@ -197,6 +197,9 @@ pub struct ResidentExecutor {
     /// Which tensor ids are program SOURCES (weights / mask / input) — written
     /// once via `set_source`, NOT zeroed per pass. Union across all programs.
     sources: std::collections::HashSet<u64>,
+    /// This executor's identity on the thread-local GPU weight cache — see
+    /// `metal::claim_weight_cache`. Unique per executor in the process, never 0.
+    id: u64,
     /// Tensor ids written by some forward NODE (a node output) — MUTABLE across
     /// passes (e.g. the KV-cache prefixes the decode forward grows). A cached GPU
     /// weight buffer keyed on such a tid can go stale, so it is dropped on every
@@ -556,7 +559,9 @@ impl ResidentExecutor {
             )
             .collect();
 
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(ResidentExecutor {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             programs,
             shapes,
             mem,
@@ -1208,6 +1213,8 @@ impl ResidentExecutor {
     /// which is otherwise a second full pass over ~4.7 GB.
     pub fn set_sources_owned(&mut self, args: Vec<(u64, Arg)>) -> Result<(), String> {
         #[cfg(metal)]
+        crate::metal::claim_weight_cache(self.id);
+        #[cfg(metal)]
         let mut just_set: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for (tid, arg) in args {
             if !self.stick.contains_key(&tid) {
@@ -1249,6 +1256,8 @@ impl ResidentExecutor {
     /// for an all-f16 model the weights land in HBM with a single copy each, never
     /// touching `Vec<f32>`. [`Arg::Tensor`] (host f32) still narrows on the way in.
     pub fn set_sources(&mut self, args: &[(u64, Arg)]) -> Result<(), String> {
+        #[cfg(metal)]
+        crate::metal::claim_weight_cache(self.id);
         #[cfg(metal)]
         let mut just_set: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for &(tid, ref arg) in args {
@@ -1361,6 +1370,8 @@ impl ResidentExecutor {
                 self.programs.len()
             ));
         }
+        #[cfg(metal)]
+        crate::metal::claim_weight_cache(self.id);
         self.zero_non_sources();
 
         // Resident weights are uploaded once (and the weight cache is cleared on
