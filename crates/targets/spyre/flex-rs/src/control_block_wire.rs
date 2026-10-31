@@ -757,10 +757,13 @@ impl DmaSection {
         self.words
     }
 
-    /// A DMA section the `hal_sbf` shim packed (`crate::hal_sbf`'s RDMA doors): the section
-    /// object's own bytes, which this crate carries and never reinterprets. Crate-private so the
-    /// only words that reach a control block's DMA slot this way are a shim door's output.
-    const fn from_shim_words(words: [u64; 2]) -> Self {
+    /// A DMA section from the #1008 doors' FINISHED WORDS, verbatim — the
+    /// wire doors (`hal_sbf::rdma12_unicast_send` / `rdma10_wdone_wait`)
+    /// return exactly the two words `set_dmo`/`set_dmi` would copy into a
+    /// control block, so the P2P CB builders place them without re-encoding
+    /// a single field. The words are trusted as-is: every field bound and
+    /// law checked at the door, never here.
+    pub const fn from_words(words: [u64; 2]) -> Self {
         Self { words }
     }
 }
@@ -1078,6 +1081,63 @@ impl ControlBlockWire {
         ))
     }
 
+    /// Port of `PfRuntimeScheduler::submitP2PRdmaSend`'s per-chunk CB
+    /// (pf_runtime_scheduler.cpp:289-447, the unicast loop): the DMO slot
+    /// carries the Rdma12 RDMA_SINGLECAST section's FINISHED WORDS from the
+    /// #1008 door — never re-encoded here — and the XLAT entry is the source
+    /// segment's own translation, the loop's per-CB
+    /// `translations()[seg_id].SetPaddrBytes(paddr)` stamp over the
+    /// single-entry `SegmentTable` the vendor builds at
+    /// `xlat_length = seg_offset + dmva_size` (the WHOLE transfer's extent,
+    /// one entry shared by every chunk CB, exactly as the vendor's one
+    /// `SegmentTable::createSingleEntry` is).
+    ///
+    /// The vendor's loop sets `SetXsegv(true)` (the T-send preamble); the
+    /// recorded transport laws override that — L3's F-send law, encoded at
+    /// the door, which refuses `xsegv` — so the words arriving here are
+    /// already the F-send shape and the receiver host-programs its XSEG
+    /// table instead.
+    ///
+    /// # Errors
+    /// Returns `Err` if `xlat_length` exceeds the hardware's max XLAT
+    /// translation size (same `EncodeLength` port as `fill`).
+    pub fn p2p_rdma_send(
+        tag: ResponseTag,
+        dmo_words: [u64; 2],
+        src_segment: u32,
+        region_paddr: DevicePhysicalAddress,
+        xlat_length: SegmentExtent,
+    ) -> Result<Self, XlatLengthTooLarge> {
+        let mut xlat = [XlatEntry::invalid(); 8];
+        xlat[src_segment as usize] =
+            XlatEntry::for_segment_extent(region_paddr, xlat_length, XlatAccessMode::ReadWrite)?;
+        Ok(Self::assemble(
+            CtrlSection::new(tag, false),
+            R5Section::none(),
+            DmaSection::skip(),
+            DmaSection::from_words(dmo_words),
+            ComputeSection::skip(),
+            xlat,
+        ))
+    }
+
+    /// Port of `PfRuntimeScheduler::submitP2PRdmaWait`'s single CB
+    /// (pf_runtime_scheduler.cpp:449-493): the DMI slot carries the Rdma10
+    /// RDMA_WDONE_BARRIER section's finished words from the #1008 door, over
+    /// an EMPTY segment table — "wdone barrier doesn't need segment
+    /// translations" — so every XLAT entry stays invalid. No error path: no
+    /// XLAT length is encoded.
+    pub fn p2p_rdma_wait(tag: ResponseTag, dmi_words: [u64; 2]) -> Self {
+        Self::assemble(
+            CtrlSection::new(tag, false),
+            R5Section::none(),
+            DmaSection::from_words(dmi_words),
+            DmaSection::skip(),
+            ComputeSection::skip(),
+            [XlatEntry::invalid(); 8],
+        )
+    }
+
     /// Port of `ControlBlockStream::CreateNullCb`
     /// (`flex/src/control_blocks/control_block_stream.cpp:375-388`, declared
     /// at `control_block_stream.hpp:252-257`, pod C++ @65ad807bb): a control
@@ -1262,9 +1322,10 @@ impl ControlBlockWire {
 
     /// The same CB with its CTRL barrier bit SET — `CtrlSectionSBF::SetBarrier` applied to a built
     /// CB, the way the vendor's `Optimize` (`FLEX_FORCE_CB_BARRIER`) applies it to every CB of a
-    /// stream. A compute CB that consumes what an RDMA wait admitted takes it (#1007 §3: the
-    /// consume carries the barrier bit), so the compute cannot start before the wait retires.
-    /// Everything else in word 0 — the tag, the cancel byte, the EDEP field — is kept.
+    /// stream. A CB in one stream with the compute that feeds it takes it — a send behind the
+    /// compute that writes its operand, a consume behind the wait that admits its window — so it
+    /// cannot start before everything ahead of it retires. Everything else in word 0 — the tag,
+    /// the cancel byte, the EDEP field — is kept.
     #[must_use]
     pub fn with_ctrl_barrier(mut self) -> Self {
         let mut w = [0u8; 8];
@@ -1691,200 +1752,6 @@ impl QgiErrorCase {
     /// True for the two cases that mean "the hardware could not translate this address".
     pub const fn is_unmapped_address(self) -> bool {
         matches!(self, Self::RiuUnmpErr | Self::PrepUnmpErr)
-    }
-}
-
-// ---------------------------------------------------------------------
-// Device-to-device RDMA: the F-send and the write-done wait (#1007 §3)
-// ---------------------------------------------------------------------
-
-/// One end of a device-to-device transfer, as the SUBMITTING card sees it: a device address and the
-/// translation its segment resolves through on this card.
-///
-/// The destination end is this card's OWN receive window. The region layout is card-symmetric, so
-/// the window sits at the same address on every card. The engine therefore fetches through the
-/// sender's own translation, and the peer's `XSEG[sid]` register (programmed by the peer with the
-/// same word, [`window_xseg`]) lands the payload. No address is ever exchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RdmaEndpoint {
-    pub dmva: VirtualAddressSbf,
-    pub xlat: XlatWindow,
-}
-
-/// THE ENGINE'S WRITE COMPENSATION, at its one site: the engine writes ONE FLIT BELOW the base the
-/// xseg word names, so a payload that must land at `window` is named one flit above it. The send's
-/// xseg field and the receiver's `XSEG[sid]` register both take this base (through ONE shim
-/// compose), so they agree by construction.
-const fn compensated_remote_base(window: VirtualAddressSbf) -> u64 {
-    Flits(window.value() + 1).to_bytes()
-}
-
-/// The `XSEG[sid]` word a receiver programs for the window its peer's sends land in: the same
-/// composed word every such send carries in its xseg field.
-///
-/// # Errors
-/// Returns the shim's refusal (a base past the word's flit field).
-pub fn window_xseg(window: VirtualAddressSbf) -> Result<u32, String> {
-    crate::senlib_ffi::hal_xseg_compose(compensated_remote_base(window))
-}
-
-/// One F-send (RDMA singlecast, #1007 §3 "Sends"): `length` bytes from `source` on this card into
-/// the peer's copy of `window`, signalling write-done `sid` there on landing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RdmaUnicastSend {
-    /// The write-done signal index — the SENDING rank's (one sid per rank).
-    pub sid: u8,
-    /// The peer the payload lands on, by BAT index (the vendor's `dest_rank`).
-    pub dest_tid: u8,
-    pub length: TransferSize,
-    pub source: RdmaEndpoint,
-    pub window: RdmaEndpoint,
-    /// This message's place in its send's run of messages.
-    pub place: RunPlace,
-}
-
-/// A message's place in its send's run — the send section's own `first` / `last` protocol bits.
-/// The vendor's windowed P2P loop cuts a transfer into chunks of at most one message and sets
-/// `first` on the first chunk and `last` on the final one; a one-message send is both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RunPlace {
-    pub first: bool,
-    pub last: bool,
-}
-
-impl RunPlace {
-    /// The only message of its send.
-    pub const ALONE: Self = Self {
-        first: true,
-        last: true,
-    };
-}
-
-/// Why an RDMA control block could not be built.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RdmaCbError {
-    /// The source and the window share a segment but name different translations. A control block
-    /// carries ONE translation per segment, so one of the two addresses would resolve through the
-    /// other's region.
-    SegmentTranslationsDisagree { segment: u8 },
-    /// A translation length past the hardware's maximum.
-    Xlat(XlatLengthTooLarge),
-    /// The `hal_sbf` shim refused the section (its message, by name).
-    Shim(String),
-}
-
-impl From<XlatLengthTooLarge> for RdmaCbError {
-    fn from(e: XlatLengthTooLarge) -> Self {
-        Self::Xlat(e)
-    }
-}
-
-impl ControlBlockWire {
-    /// THE F-SEND CB: DMO = the Rdma12 singlecast section (`crate::hal_sbf::rdma12_unicast_send`),
-    /// DMI skipped, no compute, no R5 work.
-    ///
-    /// XLAT COMPLETENESS (#1007 §3 fact 1) holds by construction: the CB carries a translation for
-    /// every segment the transfer touches. That is the source's segment, plus the window's when it
-    /// differs. Two endpoints in one segment must agree on that segment's translation, or the build
-    /// refuses ([`RdmaCbError::SegmentTranslationsDisagree`]).
-    ///
-    /// The CB is ONE message of its send's run ([`RunPlace`]); a wider send is a run of these, each
-    /// waited for once. Never a T-send (`xsegv` is false; the receiver programs its own
-    /// `XSEG[sid]`, [`window_xseg`]).
-    ///
-    /// # Errors
-    /// [`RdmaCbError`]: disagreeing translations, an oversized translation, or the shim's refusal
-    /// of a length or address the wire cannot encode.
-    pub fn rdma_unicast_send(
-        tag: ResponseTag,
-        send: &RdmaUnicastSend,
-        pipeline_barrier: bool,
-    ) -> Result<Self, RdmaCbError> {
-        let RdmaUnicastSend {
-            sid,
-            dest_tid,
-            length,
-            source,
-            window,
-            place,
-        } = *send;
-        let mut xlat = [XlatEntry::invalid(); 8];
-        let src_segment = source.dmva.segment();
-        xlat[src_segment as usize] = XlatEntry::for_segment_extent(
-            source.xlat.region_paddr,
-            source.xlat.length,
-            XlatAccessMode::ReadWrite,
-        )?;
-        if window.dmva.segment() == src_segment {
-            if window.xlat != source.xlat {
-                return Err(RdmaCbError::SegmentTranslationsDisagree {
-                    segment: src_segment,
-                });
-            }
-        } else {
-            xlat[window.dmva.segment() as usize] = XlatEntry::for_segment_extent(
-                window.xlat.region_paddr,
-                window.xlat.length,
-                XlatAccessMode::ReadWrite,
-            )?;
-        }
-        let dest_tids = [u64::from(dest_tid)];
-        let words =
-            crate::hal_sbf::rdma12_unicast_send(&crate::senlib_ffi::Rdma12UnicastSendParams {
-                sid: u64::from(sid),
-                dest_tids: &dest_tids,
-                length_bytes: length.0,
-                src_segment: u64::from(src_segment),
-                src_offset_bytes: source.dmva.offset().to_bytes(),
-                dest_remote_base_bytes: compensated_remote_base(window.dmva),
-                first: place.first,
-                last: place.last,
-                // ⛔ EVERY MESSAGE UNSYNCED, AND THAT IS THE PAIRING'S LAW: each F-send increments
-                // the peer's write-done count on landing (measured on card — #1009 review, item
-                // 2), and the pipeline waits once per message (`TpSend::messages`). The order
-                // between a send and its producer is the CTRL barrier's (`pipeline_barrier`), not
-                // this bit. The vendor's windowed loop is not in this tree to read its `SetSync`
-                // from; this is the one site to change if the card says otherwise.
-                sync: false,
-                xsegv: false,
-            })
-            .map_err(RdmaCbError::Shim)?;
-        Ok(Self::assemble(
-            CtrlSection::new(tag, pipeline_barrier),
-            R5Section::none(),
-            DmaSection::skip(),
-            DmaSection::from_shim_words(words),
-            ComputeSection::skip(),
-            xlat,
-        ))
-    }
-
-    /// THE WRITE-DONE WAIT CB: DMI = the Rdma10 wdone-barrier section over `sids`
-    /// (`crate::hal_sbf::rdma10_wdone_wait`), DMO skipped, no compute, no translation. It consumes
-    /// one count of each sid's counter, so a send and its wait balance (#1007 §3: wdone is a
-    /// counter).
-    ///
-    /// The section's `sync` is SET, as the vendor's `launchOperationP2PRdmaWait` stamps it
-    /// (the shape measured on card). `pipeline_barrier` is the CTRL section's barrier bit, a
-    /// different bit.
-    ///
-    /// # Errors
-    /// The shim's refusal (an empty list, a sid past the mask) or a duplicate sid, by name.
-    pub fn rdma_wdone_wait(
-        tag: ResponseTag,
-        sids: &[u8],
-        pipeline_barrier: bool,
-    ) -> Result<Self, RdmaCbError> {
-        let sids: Vec<u64> = sids.iter().map(|&s| u64::from(s)).collect();
-        let words = crate::hal_sbf::rdma10_wdone_wait(&sids, true).map_err(RdmaCbError::Shim)?;
-        Ok(Self::assemble(
-            CtrlSection::new(tag, pipeline_barrier),
-            R5Section::none(),
-            DmaSection::from_shim_words(words),
-            DmaSection::skip(),
-            ComputeSection::skip(),
-            [XlatEntry::invalid(); 8],
-        ))
     }
 }
 
@@ -2931,59 +2798,6 @@ mod tests {
         assert_eq!(qgi.job_count(), 0xABCD);
     }
 
-    /// The engine writes one flit BELOW the named base, so the base a send and the receiver's
-    /// XSEG word name is the window plus exactly one flit — same segment, offset + 128 B.
-    #[test]
-    fn the_remote_base_names_the_window_one_flit_up() {
-        let window = VirtualAddressSbf::new(1, Flits::from_bytes(50_331_648));
-        let named = VirtualAddressSbf::new(1, Flits::from_bytes(50_331_648 + Flits::BYTES));
-        assert_eq!(
-            compensated_remote_base(window),
-            Flits(named.value()).to_bytes()
-        );
-    }
-
-    /// A source and a window in ONE segment carry one translation, so naming two different ones is
-    /// refused before any section is packed.
-    #[test]
-    fn a_send_whose_endpoints_disagree_on_a_segment_refuses() {
-        let at = |paddr: u64| XlatWindow {
-            region_paddr: DevicePhysicalAddress(paddr),
-            length: SegmentExtent(1 << 26),
-        };
-        let send = RdmaUnicastSend {
-            sid: 0,
-            dest_tid: 1,
-            length: TransferSize(4096),
-            source: RdmaEndpoint {
-                dmva: VirtualAddressSbf::new(1, Flits(0)),
-                xlat: at(0x1_0000_0000),
-            },
-            window: RdmaEndpoint {
-                dmva: VirtualAddressSbf::new(1, Flits(1024)),
-                xlat: at(0x2_0000_0000),
-            },
-            place: RunPlace::ALONE,
-        };
-        assert_eq!(
-            ControlBlockWire::rdma_unicast_send(ResponseTag(1), &send, false),
-            Err(RdmaCbError::SegmentTranslationsDisagree { segment: 1 })
-        );
-    }
-
-    /// The wait is over a SET of sids: a repeated one is refused by name before the shim packs.
-    #[test]
-    fn a_wait_naming_a_sid_twice_refuses() {
-        let Err(RdmaCbError::Shim(why)) =
-            ControlBlockWire::rdma_wdone_wait(ResponseTag(1), &[1, 1], false)
-        else {
-            panic!("a duplicate sid must refuse");
-        };
-        assert!(why.contains("duplicate sid 1"), "{why}");
-    }
-
-    /// Setting the barrier on a built CB changes the barrier bit and nothing else: the tag, the
-    /// EDEP stamp and every section below the CTRL word survive.
     #[test]
     fn a_barrier_set_after_the_build_touches_only_its_bit() {
         let mut plain = ControlBlockWire::null(ResponseTag(0x5A5A), false);
