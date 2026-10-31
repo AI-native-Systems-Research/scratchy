@@ -136,6 +136,17 @@ pub(crate) fn view_stick_layout(
         .iter()
         .position(|&d| d == view.stick)
         .unwrap_or(usize::MAX);
+    if view.frame == crate::superdsc_opspec::ViewFrame::FoldedRows
+        && let Some(&stick_ext) = host_size_us.get(stick_idx)
+    {
+        let rows: usize = host_size_us
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != stick_idx)
+            .map(|(_, &e)| e)
+            .product();
+        return crate::sdsc_abstract::StickLayout::row_blocked_df(rows.max(1), stick_ext, view.df);
+    }
     if view.row_blocked && !host_size_us.is_empty() {
         let feat: usize = host_size_us[1..].iter().product::<usize>().max(1);
         return crate::sdsc_abstract::StickLayout::row_blocked_df(host_size_us[0], feat, view.df);
@@ -399,6 +410,8 @@ fn per_core_addr(
                 walk::Corner::fp8_kernel_out(&corner),
                 walk::Fp8KernelKRows::of_device_extents(&host_size),
             )
+        } else if view.frame == crate::superdsc_opspec::ViewFrame::FoldedRows {
+            folded_rows_off(view, &extents, &corner, view_layout.lanes()) as u64
         } else {
             view_layout.off_view(&extents, &corner) as u64
         };
@@ -408,6 +421,28 @@ fn per_core_addr(
         addrs.push(base + off_elems * view.df.word_length() as u64);
     }
     Ok(addrs)
+}
+
+/// A [`crate::superdsc_opspec::ViewFrame::FoldedRows`] view's element offset of `corner`: its non-stick
+/// components folded, outermost first, into one row of the flat `[rows, stick]` tensor, and that
+/// row's stick-blocked address ([`crate::sdsc_abstract::dev_off_stk`]).
+fn folded_rows_off(
+    view: &ArgView<'_>,
+    extents: &crate::sdsc_abstract::DeviceExtents,
+    corner: &[usize],
+    lanes: usize,
+) -> usize {
+    let dims = extents.dims();
+    let stick_idx = view.layout.iter().position(|&d| d == view.stick);
+    let (mut row, mut rows) = (0usize, 1usize);
+    for (i, (&e, &c)) in dims.iter().zip(corner).enumerate() {
+        if Some(i) != stick_idx {
+            row = row * e + c;
+            rows *= e;
+        }
+    }
+    let (stick_ext, stick_corner) = stick_idx.map_or((lanes, 0), |i| (dims[i], corner[i]));
+    crate::sdsc_abstract::dev_off_stk(&[rows, stick_ext], 1, &[row, stick_corner], lanes)
 }
 
 /// The `N_` iteration space for a shape-preserving ELEMENTWISE op over
@@ -3843,7 +3878,8 @@ pub fn emit_sdsc(
             if active && full && !matches!(v.role, Role::Kernel) && !v.allocation.is_lx() {
                 let own = view_stick_layout(v, iter);
                 let arrangement = match v.frame {
-                    crate::superdsc_opspec::ViewFrame::Own => own,
+                    crate::superdsc_opspec::ViewFrame::Own
+                    | crate::superdsc_opspec::ViewFrame::FoldedRows => own,
                     crate::superdsc_opspec::ViewFrame::StickColumns => {
                         own.of_stick_columns().ok_or_else(|| {
                             SuperDscError(format!(
@@ -6426,6 +6462,123 @@ fn restickify_transpose_opspec_2d(
         ));
     }
     Ok(op)
+}
+
+/// ⭐⭐ torch-spyre's ALL-HEADS RESTICKIFY — `[b, rows, cols] → [b, cols, rows]` as ONE `ReStickifyOpHBM`
+/// over `N_ {mb: b, y: rows, out: cols}` split `{mb: b}`: core `i` relays batch `i`'s stick-major
+/// `[rows, cols]` block into its stick-major `[cols, rows]` one. The reference's compiled decode trip
+/// re-lays its gathered K page so (`numWkSlicesPerDim_ {mb: 8, x: 1, out: 1}`), one kv head a core, so
+/// each core's `Kᵀ` block is where the all-heads contraction on that core reads its kernel
+/// ([`crate::ir::bridge::tiled_op_sdsc_op::matmul::opspec::matmul_opspec_x_batched`]).
+///
+/// Both sides are blocks one after another (batch `i` at `i·rows·cols`), stated to dxp innermost-first
+/// (`['y','out','mb']` in, `['out','y','mb']` out): the 2-D door's own two views
+/// ([`restickify_kt_opspec_2d`]) with the batch outermost.
+pub(crate) fn restickify_transpose_opspec_batched(
+    batch: u32,
+    (rows, cols): (u32, u32),
+    (in_name, o_name): (&str, &str),
+) -> Result<OpSpec, String> {
+    let _rows_ext = StickExtent::<Fp16>::new(rows)?;
+    let _cols_ext = StickExtent::<Fp16>::new(cols)?;
+    if batch <= 1 || batch > MAX_CORES {
+        return Err(format!(
+            "restickify transpose '{o_name}': a batch of {batch} is not one batch a core of {MAX_CORES}"
+        ));
+    }
+    let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df: Df::Fp16,
+    };
+    let dims = [
+        dim("mb", batch, false),
+        dim("y", rows, true),
+        dim("out", cols, true),
+    ];
+    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
+        BTreeMap::from([("mb", batch)])
+    })?;
+    let resident = 2 * u64::from(rows) * u64::from(cols) * u64::from(Fp16::WORD_LENGTH);
+    if resident > USABLE_LX_BYTES {
+        return Err(format!(
+            "restickify transpose '{o_name}': one core's [{rows}, {cols}] block in and out is \
+             {resident} B against the {USABLE_LX_BYTES}-B LX scratchpad, and a restickify cannot be \
+             time-tiled (its output stick is the whole `y` extent)"
+        ));
+    }
+    let active = [Scale::Active, Scale::Active, Scale::Active];
+    let input = TensorArg::<3>::new(
+        true,
+        in_name.to_string(),
+        Role::Input,
+        active,
+        plan.iter_syms(["mb", "y", "out"]),
+        ["mb", "y", "out"],
+        "out",
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?
+    .with_device_order(["y", "out", "mb"])
+    .map_err(|e| e.0)?;
+    let output = TensorArg::<3>::new(
+        false,
+        o_name.to_string(),
+        Role::Output,
+        active,
+        plan.iter_syms(["mb", "out", "y"]),
+        ["mb", "out", "y"],
+        "y",
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?
+    .with_device_order(["out", "y", "mb"])
+    .map_err(|e| e.0)?;
+    Ok(OpSpec {
+        op: OpFunc::Restickify,
+        is_reduction: false,
+        iter: plan,
+        args: vec![AnyTensorArg::R3(input), AnyTensorArg::R3(output)],
+        op_info: OpInfo::None,
+        tiled_symbols: vec![],
+        time_tile: None,
+        indirect: None,
+        coordinate_mask: None,
+    })
+}
+
+/// [`restickify_transpose_opspec_batched`] assembled over whole buffers, each side minted at its
+/// `batch` blocks' flat run.
+pub fn try_assemble_restickify_transpose_batched(
+    op_name: &str,
+    batch: u32,
+    (rows, cols): (u32, u32),
+    (in_, o): (&Stk<RowBlockedTag>, &Stk<RowBlockedTag>),
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let run = batch * rows * cols;
+    mint_full_window(
+        &format!("{op_name}: operand '{}'", in_.name()),
+        in_,
+        0,
+        1,
+        run,
+        layout,
+    )?;
+    mint_full_window(
+        &format!("{op_name}: output '{}'", o.name()),
+        o,
+        0,
+        1,
+        run,
+        layout,
+    )?;
+    let op = restickify_transpose_opspec_batched(batch, (rows, cols), (in_.name(), o.name()))?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
 }
 
 /// [`restickify_transpose_opspec_2d`] assembled — the fallible form, because this is reached by a

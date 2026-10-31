@@ -488,6 +488,10 @@ pub enum LxShare {
     /// The op views the tensor from an offset — part of it (torch-spyre's "partial/offset read"). A
     /// core-local tensor's slices all start at its pin, so no view into it has an offset to take.
     Partial,
+    /// The op's form needs the tensor core-local — an all-heads contraction's kernel, which the
+    /// reference keeps in each core's LX and which faults read from HBM per core. A plan that does not
+    /// keep it there cannot take the form ([`crate::emit::lx_plan`]).
+    Required,
 }
 
 /// ⭐⭐ THE ONE PIN-WINDOW BUDGET — the single place the window's arithmetic lives. Both

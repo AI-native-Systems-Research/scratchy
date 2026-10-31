@@ -6073,6 +6073,7 @@ fn lower_function_folded(
                     batch,
                     activation: super::lower_ktir_to_superdsc::BatchFrame::Flat,
                 } if batch > 1
+                    && layout.lx_row_groups.get() != Some(batch)
                     && per_op
                         .first()
                         .is_some_and(|a| a.v_cols > crate::work::FP16_ELEMS_PER_STICK) =>
