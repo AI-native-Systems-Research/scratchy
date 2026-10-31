@@ -4377,6 +4377,21 @@ mod walk_on_the_card {
                 );
             }
         }
+        // ⭐ AND EVERY VALUE THE TRIP COMPUTES, as the reference's trip keeps every one in LX: the mask
+        // add runs a stick plane at a time, and each plane of a core's rows sits in its own slice.
+        // Only the page's index run, gathered through the position table, is read from HBM.
+        for e in ops
+            .iter()
+            .filter(|e| e.walk.is_some() && !e.op_name.starts_with("gather_run"))
+        {
+            let out = e.arg_bindings.last().expect("an output");
+            assert!(
+                lx(&out.buffer),
+                "hd={hd} {}: writes t{} outside LX",
+                e.op_name,
+                out.buffer
+            );
+        }
     }
 
     /// ⭐ THE SCRATCHPAD PLAN ON THE DECODE WALK — torch-spyre's LX planning: the carried output

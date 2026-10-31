@@ -652,10 +652,17 @@ impl BundleLayout {
             // its declared shape may be the full tensor's — the same early return the bake-time
             // guard takes. But it has no addressable offset: every core's slice starts AT the pin.
             if self.lx_core_local(name) {
-                if off_elems != 0 {
+                // A STICK-PLANE window — whole planes of the tensor's own rows — sits at that plane
+                // of every core's slice (`emit::stick_plane`), which the read law bounds by the pin.
+                let plane = u64::from(layout.rows as u32) * layout.df.elems_per_stick() as u64;
+                let plane_window = layout.kind == StickKind::RowBlocked
+                    && rows as usize == layout.rows
+                    && off_elems.is_multiple_of(plane.max(1));
+                if off_elems != 0 && !plane_window {
                     return Err(format!(
                         "{what}: core-local LX tensor '{name}' windowed at element {off_elems} — \
-                         each core's slice sits at the pin, so a view into it has no offset to take"
+                         each core's slice sits at the pin, and only a whole stick plane of its \
+                         rows is a view into it"
                     ));
                 }
                 return Ok(());
