@@ -2981,26 +2981,30 @@ fn elementwise_broadcast(
     // single-stick). [`RegionFrame::split_rows`] checks all of it and returns the op's
     // `[mb, out, y]` facts; its `Err` is the refusal, so a row-split the bytes do not support is
     // a build failure here, not a wrong-byte bake (the mb re-row's own defect class).
-    // An OUTER spray is never this one op: it goes out as the card's flat ops
-    // ([`elementwise_by_outer_spray`]), and only an inner spray takes the `[mb, y, out]` op below.
-    if let Some(y) = bcast.iter().find_map(|b| match b {
-        Some(BcastAxis::Y(sp)) if sp.order == crate::emit::SprayOrder::Outer => Some(sp.count),
+    // A ROW SPRAY IS NEVER THE `[y, mb, out]` OP: an outer one goes out as the card's flat ops
+    // ([`elementwise_by_outer_spray`]), an inner one as one row-vector broadcast
+    // ([`elementwise_by_inner_spray`]).
+    if let Some(sp) = bcast.iter().find_map(|b| match b {
+        Some(BcastAxis::Y(sp)) => Some(*sp),
         _ => None,
     }) {
-        return elementwise_by_outer_spray(
-            BcastReq {
-                name,
-                what,
-                op_func,
-                ins,
-                out,
-                bcast,
-                df,
-            },
-            (y, rows),
-            sym_id_base,
-            layout,
-        );
+        let req = BcastReq {
+            name,
+            what,
+            op_func,
+            ins,
+            out,
+            bcast,
+            df,
+        };
+        return match sp.order {
+            crate::emit::SprayOrder::Outer => {
+                elementwise_by_outer_spray(req, (sp.count, rows), sym_id_base, layout)
+            }
+            crate::emit::SprayOrder::Inner => {
+                elementwise_by_inner_spray(req, (sp.count, rows), sym_id_base, layout)
+            }
+        };
     }
     let ymode: Option<u32> = bcast.iter().find_map(|b| match b {
         Some(BcastAxis::Y(sp)) => Some(sp.count),
@@ -3151,6 +3155,13 @@ fn elementwise_y_by_column(
     if sprays_outermost(req.bcast) {
         return elementwise_by_outer_spray(req, (y, rows), sym_id_base, layout);
     }
+    if req.out.c_len <= req.df.elems_per_stick()
+        && req.bcast.iter().any(
+            |b| matches!(b, Some(BcastAxis::Y(sp)) if sp.order == crate::emit::SprayOrder::Inner),
+        )
+    {
+        return elementwise_by_inner_spray(req, (y, rows), sym_id_base, layout);
+    }
     let BcastReq {
         name,
         what,
@@ -3224,6 +3235,111 @@ fn elementwise_y_by_column(
         ));
     }
     Ok(ops)
+}
+
+/// ⭐⭐⭐ AN INNER ROW SPRAY, AS ONE ROW-VECTOR BROADCAST — each of the source's `mb` one-stick rows
+/// repeated `y` times in a row (a decode batch's mask over its query-head group). The whole
+/// one-stick buffers, read as stick-major tensors, are already the frame the card's row-vector
+/// broadcast runs in:
+///
+/// * the dense operands and the output, `[mb · y, stick]` with row `b·y + j` at stick `b·y + j`,
+///   ARE the stick-major `[y, mb · stick]` whose element `(j, b)` sits at stick `b·y + j`;
+/// * the source, `[mb, stick]` with row `b` at stick `b`, IS the stick-major `[1, mb · stick]`.
+///
+/// So `out[b·y + j] = dense[b·y + j] ∘ src[b]` is `out[j, b] = dense[j, b] ∘ src[0, b]`: one flat
+/// op with the source an `Mb` row vector sprayed down `y` rows ([`In::mb`], the rmsnorm gain's own
+/// form, card-proven at every prefill). The `[mb, y, out]` op it replaces is the three-axis form
+/// the card mis-addresses with a broadcast operand (see [`elementwise_by_outer_spray`]).
+fn elementwise_by_inner_spray(
+    req: BcastReq<'_>,
+    (y, rows): (u32, u32),
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let BcastReq {
+        name,
+        what,
+        op_func,
+        ins,
+        out,
+        bcast,
+        df,
+    } = req;
+    let stick = df.elems_per_stick();
+    if y < 2 || !rows.is_multiple_of(y) || out.c_len > stick {
+        return err(format!(
+            "{what} {name}: an inner spray of {y} over the `[{rows}, {}]` output t{} — the spray \
+             needs rows == y*mb (whole sprays of rows) and one-stick rows",
+            out.c_len, out.tid
+        ));
+    }
+    let mb = rows / y;
+    // Each operand's rows from its view's first: the whole one-stick buffer, or its leading rows (a
+    // walk's first tile, which the relaunch moves trip by trip).
+    let leading =
+        |x: &Region, n: u32| (x.r_start, x.r_len, x.c_start) == (0, n, 0) && n <= x.v_rows;
+    if !leading(out, rows) {
+        return err(format!(
+            "{what} {name}: the output t{} takes rows {}.. of its `[{}, {}]` view — an inner spray \
+             reads its one-stick buffers from their first row as stick-major `[y, mb · stick]` tensors",
+            out.tid, out.r_start, out.v_rows, out.v_cols
+        ));
+    }
+    for (i, (x, b)) in ins.iter().zip(bcast).enumerate() {
+        let want = match b {
+            None => rows,
+            Some(BcastAxis::Y(Spray {
+                order: crate::emit::SprayOrder::Inner,
+                of: SprayOf::Tile,
+                count,
+            })) if *count == y => mb,
+            Some(other) => {
+                return err(format!(
+                    "{what} {name}: input {i} t{} is a {other:?} operand beside an inner spray of \
+                     {y} — the spray's row-vector op states dense and `Y` operands only",
+                    x.tid
+                ));
+            }
+        };
+        if !leading(x, want) || x.c_len > stick {
+            return err(format!(
+                "{what} {name}: input {i} t{} takes `[{}, {}]` at row {} of its `[{}, {}]` view, \
+                 and its mode wants its first `[{want}, ≤{stick}]` rows",
+                x.tid, x.r_len, x.c_len, x.r_start, x.v_rows, x.v_cols
+            ));
+        }
+    }
+    let cols = mb * stick;
+    let out_h = rb(&out.name(), y, cols);
+    let handles: Vec<_> = ins
+        .iter()
+        .zip(bcast)
+        .map(|(x, b)| match b {
+            Some(BcastAxis::Y(_)) => rb(&x.name(), 1, cols),
+            _ => rb(&x.name(), y, cols),
+        })
+        .collect();
+    let ew: Vec<_> = handles
+        .iter()
+        .zip(bcast)
+        .map(|(h, b)| match b {
+            Some(BcastAxis::Y(_)) => In::mb(h).ew(),
+            _ => In::full(h).ew(),
+        })
+        .collect();
+    let tile_op = pointwise_tile_op_df(y, cols, 1, ins.len() as u32 + 1, df);
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
+        &format!("{op_func}_o{}", out.tid),
+        &tile_op,
+        op_func,
+        y,
+        cols,
+        &ew,
+        &out_h,
+        crate::addr::OutCorner::ZERO,
+        sym_id_base,
+        layout,
+    )])
 }
 
 /// Whether an op's broadcast operands spray a source down the OUTERMOST of its rows
@@ -7745,6 +7861,33 @@ mod elementwise_tests {
             );
             assert_eq!(bound_at(op, "t5"), j * 64 * 64, "spray {j}: the dense rows");
             assert_eq!(bound_at(op, "t6"), 0, "spray {j}: the source, read whole");
+        }
+    }
+
+    /// ⭐⭐ AN INNER SPRAY IS ONE ROW-VECTOR BROADCAST — a decode batch's mask over its query-head
+    /// group at granite-3.1-2b's 32-request rung: the walk's first `[256, 64]` chunk tile of a
+    /// `[1024, 64]` mask stack, each row repeated 4 times down a `[1024, 64]` score tile. One flat
+    /// op over the buffers read as stick-major `[4, 256 · 64]`, the tile a row vector, all from
+    /// each buffer's first byte.
+    #[test]
+    fn an_inner_spray_is_one_row_vector_broadcast() {
+        let mut tile = reg(6, 1024, 64, false);
+        tile.r_len = 256;
+        tile.r_cover = (0, 256);
+        let r = node(reg(5, 1024, 64, false), tile, reg(7, 1024, 64, true));
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "add_s3",
+            Elementwise::Add,
+            &r,
+            &[None, Some(BcastAxis::Y(Spray::inner(4)))],
+            &mut sym,
+            None,
+        )
+        .expect("the group mask add lowers");
+        assert_eq!(ops.len(), 1, "one row-vector broadcast");
+        for buf in ["t5", "t6", "t7"] {
+            assert_eq!(bound_at(&ops[0], buf), 0, "{buf} read from its first byte");
         }
     }
 
