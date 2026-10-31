@@ -41,14 +41,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|e| e.tp_consume.is_some())
         .map(|e| e.shallow_copy())
         .collect();
+    let cut = consumes
+        .first()
+        .and_then(|e| e.tp_consume)
+        .ok_or("the two-rank sublayer bakes no consume")?
+        .cut;
     let window = layout
         .placements
-        .get(&ktir_superdsc::reserved_tids::TP_RECV_TID)
-        .ok_or("the sharded layout carries no receive window")?;
+        .get(&cut.tid())
+        .ok_or("the sharded layout carries no receive window cut")?;
     eprintln!(
-        "{} op(s), {} consume op(s); window seg{} @ {} ({} B)",
+        "{} op(s), {} consume op(s); window cut {} seg{} @ {} ({} B)",
         ops.len(),
         consumes.len(),
+        cut.index(),
         window.segment,
         window.offset,
         window.size

@@ -460,24 +460,30 @@ pub const RESERVED_REGIONS: [TidRegion; 8] = [
         base: u32::MAX - 1_000_171,
         slots: 1_000_000,
     },
-    // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW — see [`TP_RECV_TID`]. Below `kct_resident`'s floor,
-    // in tids no artifact has ever carried.
+    // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW'S CUTS — see [`TP_RECV_CUT_TIDS`]. Below
+    // `kct_resident`'s floor, in tids no artifact has ever carried.
     TidRegion {
         name: "tp_recv",
         base: TP_RECV_TID,
-        slots: 1,
+        slots: TP_RECV_CUT_TIDS.len() as u32,
     },
 ];
 
-/// ⭐ RESERVED tid for the TENSOR-PARALLEL RECEIVE WINDOW — the one synthetic every collective's
-/// consume reads its peer's bytes from (`scratchy_spyre_bundle::collective::RecvWindow`). One tid
-/// for every collective of every bundle: the window is one `(segment, offset, size)` triple per
-/// card, and a second tid would be a second placement that could disagree with it.
+/// ⭐ RESERVED tid for the TENSOR-PARALLEL RECEIVE WINDOW — its first cut
+/// ([`TP_RECV_CUT_TIDS`]), and the base of the one `(segment, offset, size)` triple per card
+/// (`scratchy_spyre_bundle::collective::RecvWindow`) whose cuts every collective's consume reads.
 ///
 /// ⛔ NOT IN THE ROUTER-CONST HOLE (MAX-137 .. MAX-146) — those slots are BURNED (see the note
 /// above the region table): a stale artifact still naming one would alias the window. It takes the
 /// first tid below `kct_resident`'s floor instead, which nothing has been baked against.
 pub const TP_RECV_TID: u32 = u32::MAX - 2_000_171;
+
+/// ⭐ THE RECEIVE WINDOW'S CUTS — one tid per disjoint cut of the ONE window, cut `i` placed
+/// `i` cut-widths above the window's base (`compute_bundle_layout`). The forward's `k`-th
+/// collective uses cut `k % 2` (`collective::WindowCut`), so a peer's send for collective `k + 1`
+/// never lands where this rank still reads `k`. Both cuts are placements OF the one window, never
+/// a second window that could disagree with it.
+pub const TP_RECV_CUT_TIDS: [u32; 2] = [TP_RECV_TID, TP_RECV_TID - 1];
 
 /// Is `tid` one of the reserved synthetics — a sentinel, a slot of any region, or `LAST_HIDDEN_TID`
 /// (which sits at `u32::MAX`, one ABOVE the sentinels region's base, so a region scan alone misses

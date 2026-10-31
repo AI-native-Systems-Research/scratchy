@@ -10499,6 +10499,9 @@ fn launch_tokens(
                     }
                 }
             };
+            // The window cut, re-minted through the const fn that refuses a cut the window
+            // does not have.
+            let cut = proc_macro2::Literal::u32_unsuffixed(c.cut.index() as u32);
             quote! {
                 ::core::option::Option::Some(::scratchy_target_spyre::bundle_code::collective::TpConsume {
                     kind: #kind,
@@ -10507,6 +10510,7 @@ fn launch_tokens(
                         #first, #sticks, #rows,
                     ),
                     plays_at: #plays_at,
+                    cut: ::scratchy_target_spyre::bundle_code::collective::WindowCut::baked(#cut),
                 })
             }
         }
