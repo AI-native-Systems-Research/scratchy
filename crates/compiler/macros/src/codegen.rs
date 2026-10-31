@@ -7713,13 +7713,14 @@ fn metal_tq_codebook_tokens(
                 quote!(&[#(f32::from_bits(#words)),*])
             };
             let (signs, centroids) = (table(cb.signs), table(cb.centroids));
-            let (boundaries, bits, packed_dim) = (table(cb.boundaries), bits.get(), cb.packed_dim);
+            let (encode_table, bits, packed_dim) =
+                (table(cb.encode_table), bits.get(), cb.packed_dim);
             quote!(::core::option::Option::Some(::scratchy_target_metal::turboquant::TqCodebook {
                 bits: ::scratchy_forward_compiler::TqBits::new(#bits),
                 packed_dim: #packed_dim,
                 signs: #signs,
                 centroids: #centroids,
-                boundaries: #boundaries,
+                encode_table: #encode_table,
             }))
         }
     };

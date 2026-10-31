@@ -119,14 +119,14 @@ constant constexpr uint ROPE_TQ_CODES = ROPE_TQ_BITS_SET ? 2u * ROPE_HEAD_DIM : 
 // into the packed store at the token's slot (`kv_writer.h`). Threadgroup-uniform.
 template <typename T>
 inline void rope_tq_encode(float k, float v, uint d, uint kv_head, uint slot_raw, uint pos,
-                           device const float* signs, device const float* boundaries,
+                           device const float* signs, device const float* table,
                            device uint* packed_k, device float* norms_k, device uint* packed_v,
                            device float* norms_v, device const T* k_bias, device const T* v_bias,
                            device const T* cos_sin, threadgroup float* scratch,
                            threadgroup uint* codes) {
     kv_row_encode<T>(k, v, d, ROPE_HEAD_DIM, ROPE_NUM_KV_HEADS, kv_head, slot_raw, pos,
                      ROPE_TQ_BITS, ROPE_TQ_VALS_PER_WORD, ROPE_TQ_PACKED_DIM, ROPE_TQ_K_OFFSET,
-                     ROPE_TQ_V_OFFSET, ROPE_ROT_DIM, ROPE_PAIR_OFF, signs, boundaries, packed_k,
+                     ROPE_TQ_V_OFFSET, ROPE_ROT_DIM, ROPE_PAIR_OFF, signs, table, packed_k,
                      norms_k, packed_v, norms_v, k_bias, v_bias, cos_sin, scratch, codes);
 }
 
@@ -243,7 +243,7 @@ kernel void rope_append_f16_specialized(
     k_dst[d] = k_row[d];
     v_dst[d] = v_row[d];
     if (ROPE_TQ_BITS_SET) {
-        rope_tq_encode<half>(float(k_row[d]), float(v_row[d]), d, kv_head, slot, pos, tq_signs, tq_boundaries, tq_packed_k,
+        rope_tq_encode<half>(float(k_row[d]), float(v_row[d]), d, kv_head, slot, pos, tq_signs, tq_encode_table, tq_packed_k,
                               tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias, tq_cos_sin,
                               tq_scratch, tq_codes);
     }
@@ -354,7 +354,7 @@ kernel void rope_append_bf16_specialized(
     k_dst[d] = k_row[d];
     v_dst[d] = v_row[d];
     if (ROPE_TQ_BITS_SET) {
-        rope_tq_encode<bfloat>(float(k_row[d]), float(v_row[d]), d, kv_head, slot, pos, tq_signs, tq_boundaries, tq_packed_k,
+        rope_tq_encode<bfloat>(float(k_row[d]), float(v_row[d]), d, kv_head, slot, pos, tq_signs, tq_encode_table, tq_packed_k,
                               tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias, tq_cos_sin,
                               tq_scratch, tq_codes);
     }
@@ -578,7 +578,7 @@ template <typename T_act, typename T_scale>
     k_dst[d] = k_tg[d];
     v_dst[d] = v_final;
     if (ROPE_TQ_BITS_SET) {
-        rope_tq_encode<T_act>(float(k_tg[d]), float(v_final), d, kv_head, slot, pos, tq_signs, tq_boundaries, tq_packed_k,
+        rope_tq_encode<T_act>(float(k_tg[d]), float(v_final), d, kv_head, slot, pos, tq_signs, tq_encode_table, tq_packed_k,
                               tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias, tq_cos_sin,
                               tq_scratch, tq_codes);
     }
