@@ -368,7 +368,7 @@ impl Wiring {
     ) -> Result<(), String> {
         use crate::lower_subtile_tape_to_superdsc as sd;
         let nqh = self.geometry.nqh as u64;
-        let want = nqh * mq as u64 * score_width as u64 * 2;
+        let want = causal_mask_bytes(nqh, mq, score_width);
         match layout.place_of_tid(sd::ATTN_CAUSAL_TID) {
             Some(p) if p.size == want => Ok(()),
             Some(p) => Err(format!(
@@ -680,6 +680,13 @@ pub struct LayerWiring {
     /// this is the per-layer answer, from the same `tensor_shapes` the tape
     /// was lowered at.
     pub kv_width: u32,
+}
+
+/// The causal mask's bytes at `nqh` query heads, `mq` rows and a `score_width`-column score axis:
+/// the `nqh · mq · score_width` fp16 elements the layout places and the host stages. ONE law, read
+/// by the load's [`Wiring::verify_causal_placement`] and by the bake's check of the same pairing.
+pub const fn causal_mask_bytes(nqh: u64, mq: u32, score_width: u32) -> u64 {
+    nqh * mq as u64 * score_width as u64 * 2
 }
 
 /// Model geometry, baked.

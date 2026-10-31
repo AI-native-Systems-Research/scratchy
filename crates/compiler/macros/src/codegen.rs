@@ -8970,6 +8970,42 @@ fn refuse_if_sources_cut_apart(
     }
 }
 
+/// ⭐ THE HEAD COUNTS A WIRING BAKES — `(query heads, kv heads)` as the tape was lowered at, read
+/// off the graph: the model's counts divided by the one split its attention ops carry (a sharded
+/// world's are each rank's own; a world of one reads a split of 1). ONE derivation, read by the
+/// wiring's geometry and by the bake's check of it against the layout, so the two cannot drift.
+#[cfg(feature = "spyre")]
+fn superdsc_wiring_heads(
+    lwd: &crate::to_wavefront::LoweredDecode,
+    model: &ModelParams,
+) -> (u64, u64) {
+    let b = |k: &str| model.bounds.get(k).copied().unwrap_or(0);
+    let heads = b("num_attention_heads").max(1);
+    let kv = b("num_key_value_heads").max(1);
+    let lowered_nqh: std::collections::BTreeSet<u64> = lwd
+        .input
+        .ops
+        .iter()
+        .filter_map(|o| match o.op {
+            scratchy_subtile::subtile_ir::SubOp::AttnDecode { geom, .. } => {
+                Some(u64::from(geom.nqh().get()))
+            }
+            _ => None,
+        })
+        .collect();
+    let split = match lowered_nqh.iter().copied().collect::<Vec<_>>().as_slice() {
+        [] => 1,
+        [q] if heads.is_multiple_of(*q) && kv.is_multiple_of(heads / q) => heads / q,
+        other => panic!(
+            "[superdsc-wiring] {}: the forward's attention ops carry query-head count(s) {other:?} \
+             — not the model's {heads} (kv {kv}) divided one way, so no single head geometry \
+             describes this bundle",
+            model.source_stem,
+        ),
+    };
+    (heads / split, kv / split)
+}
+
 /// The model's attention head dim by the bounds the tape was lowered at —
 /// `head_dim` where the arch declares it, the `hidden/heads` quotient where it
 /// does not (the same fallback the emitter itself uses).
@@ -9192,34 +9228,9 @@ fn emit_superdsc_wiring(
     // baked at the model's would be refused at load (`verify_causal_placement` — measured, #1009:
     // 2048 B placed against 32 heads' 4096 B). A world of one reads a split of 1: the model's
     // own counts, byte-identical.
-    let lowered_nqh: std::collections::BTreeSet<u64> = lwd
-        .input
-        .ops
-        .iter()
-        .filter_map(|o| match o.op {
-            scratchy_subtile::subtile_ir::SubOp::AttnDecode { geom, .. } => {
-                Some(u64::from(geom.nqh().get()))
-            }
-            _ => None,
-        })
-        .collect();
-    let split = match lowered_nqh.iter().copied().collect::<Vec<_>>().as_slice() {
-        [] => 1,
-        [q] if heads.is_multiple_of(*q)
-            && b("num_key_value_heads").max(1).is_multiple_of(heads / q) =>
-        {
-            heads / q
-        }
-        other => panic!(
-            "[superdsc-wiring] {}: the forward's attention ops carry query-head count(s) {other:?} \
-             — not the model's {heads} (kv {}) divided one way, so no single head geometry \
-             describes this bundle",
-            model.source_stem,
-            b("num_key_value_heads"),
-        ),
-    };
-    let nqh = u32l((heads / split) as u32);
-    let kv_dim = u32l((b("num_key_value_heads").max(1) / split * hd) as u32);
+    let (nqh, kv_heads) = superdsc_wiring_heads(lwd, model);
+    let nqh = u32l(nqh as u32);
+    let kv_dim = u32l((kv_heads * hd) as u32);
     // ⛔ SCALARS FIRST, AND NO DEFAULT. `rope_theta` is a FLOAT, so it lives in
     // `model.scalars`; `bounds` is integer-valued and a bounds-only lookup
     // misses it entirely. With an `unwrap_or(1e4)` behind it that miss is
@@ -11933,6 +11944,41 @@ fn dump_wavefront_mega(
                                 },
                             ) {
                                 Ok(rolled) => {
+                                    // ⭐ THE CAUSAL MASK'S PLACEMENT AGAINST THE WIRING'S HEADS — the
+                                    // check `Executor` load runs (`Wiring::verify_causal_placement`),
+                                    // run HERE, at the rows the worker checks it at: the
+                                    // single-request decode at one row and one stick, and each
+                                    // prefix-free prefill width at its own rows and pad. A wiring
+                                    // whose head count is not the layout's is a BUILD error, never
+                                    // a card that refuses to load (#1009, run 2).
+                                    {
+                                        let at = match prefill_mq {
+                                            Some(m) if active_cap != scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL => {
+                                                Some((m, m.div_ceil(64) * 64))
+                                            }
+                                            None if decode_rows == 1 => Some((1, 64)),
+                                            _ => None,
+                                        };
+                                        if let (Some((mq, width)), Some(placed)) = (
+                                            at,
+                                            rolled.layout.placements.get(
+                                                &scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID,
+                                            ),
+                                        ) {
+                                            let (nqh, _) = superdsc_wiring_heads(lwd, model);
+                                            let want = scratchy_target_spyre::wiring::causal_mask_bytes(
+                                                nqh, mq, width,
+                                            );
+                                            if placed.size != want {
+                                                panic!(
+                                                    "[spyre-superdsc] {base}: the causal mask is placed at {} B, \
+                                                     but the wiring bakes {nqh} query head(s) × {mq} row(s) × \
+                                                     {width} score width = {want} B — the load would refuse it",
+                                                    placed.size
+                                                );
+                                            }
+                                        }
+                                    }
                                     // ⭐ AND THE PARITY LEDGER'S ENTRY FOR THIS BUNDLE — the
                                     // ceiling's packed weight segment, as the runtime's alias
                                     // guard reads it. One entry per baked bundle; the ledger is
