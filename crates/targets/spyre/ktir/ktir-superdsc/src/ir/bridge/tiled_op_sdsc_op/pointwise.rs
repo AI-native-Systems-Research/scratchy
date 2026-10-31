@@ -741,6 +741,133 @@ pub fn assemble_page_gather_copy(
         .map_err(|e| format!("assemble_page_gather_copy {op_name}: {e}"))
 }
 
+/// What a [`page_gather_blocks_opspec`] moves: `entries` index entries, each one `[rows, cols]` block
+/// of the gathered value, landed `dst_elems` into the destination.
+#[derive(Clone, Copy, Debug)]
+pub struct PageGatherBlocks {
+    pub entries: u32,
+    pub rows: u32,
+    pub cols: u32,
+    pub dst_elems: u32,
+}
+
+/// ⭐ torch-spyre's PAGE GATHER INTO STICK-MAJOR BLOCKS — `identity` over `N_ {mb: entries, x: rows,
+/// out: cols, y: 1}`, `mb` split one whole entry a core, each entry one `[rows, cols]` block of the
+/// gathered value. The value is read row-major (`['out','x','mb','y']` innermost-first: a row's
+/// sticks together, the paged cache's row-outermost block) and the block lands stick-major
+/// (`['x','out','mb','y']`: stick column `c`'s `rows` rows together), so a block several sticks wide
+/// is relaid by the gather itself. The reference's compiled decode trip gathers each kv head's page
+/// so, one head a core, straight into the LX its Kᵀ restickify and its value contraction read
+/// (`numWkSlicesPerDim_ {mb: 8}`, `Tensor1 ['out','x','mb','y']`, `Tensor2 ['x','out','mb','y']`).
+///
+/// One entry is one `mb` position ([`GatherIndex::page`] 1), so `skip_addr` is the unpinned `x·out`:
+/// one block. Only `mb` is split ([`gather_copy_cores`]'s law).
+pub fn page_gather_blocks_opspec(
+    src: &str,
+    dst: &str,
+    gather: crate::superdsc_opspec::GatherIndex,
+    PageGatherBlocks {
+        entries,
+        rows,
+        cols,
+        dst_elems,
+    }: PageGatherBlocks,
+) -> Result<OpSpec, String> {
+    let df = Df::Fp16;
+    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
+    if gather.page.get() != 1 {
+        return Err(format!(
+            "page_gather_blocks_opspec('{src}' -> '{dst}'): an entry is one `mb` position — one \
+             [{rows}, {cols}] block — and the index states {} positions an entry",
+            gather.page.get()
+        ));
+    }
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    if entries == 0 || entries > cap || rows == 0 {
+        return Err(format!(
+            "page_gather_blocks_opspec('{src}' -> '{dst}'): {entries} entries of {rows} rows — one \
+             op gathers one to {cap} whole blocks (its index is one stick)"
+        ));
+    }
+    let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df,
+    };
+    let dims = [
+        dim("mb", entries, false),
+        dim("x", rows, false),
+        dim("out", cols, true),
+        dim("y", 1, false),
+    ];
+    let plan = crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |d, max| {
+        gather_copy_cores(d, max, 1)
+    })?;
+    let layout = ["y", "mb", "x", "out"];
+    let arg = |is_input: bool, name: &str, device: [&'static str; 4]| -> Result<_, String> {
+        Ok(AnyTensorArg::R4(
+            TensorArg::<4>::new(
+                is_input,
+                name.to_string(),
+                Role::Output,
+                [Scale::Active; 4],
+                plan.iter_syms(layout),
+                layout,
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_device_order(device)
+            .map_err(|e| e.0)?,
+        ))
+    };
+    let args = vec![
+        arg(true, src, ["out", "x", "mb", "y"])?,
+        arg(false, dst, ["x", "out", "mb", "y"])?,
+    ];
+    let mut op = OpSpec {
+        op: OpFunc::Identity,
+        is_reduction: false,
+        iter: plan,
+        args,
+        op_info: OpInfo::None,
+        tiled_symbols: vec![],
+        time_tile: None,
+        indirect: None,
+        coordinate_mask: None,
+    };
+    op.attach_gather_index(gather, 0).ok_or_else(|| {
+        format!(
+            "page_gather_blocks_opspec('{src}' -> '{dst}'): the index declaration does not fit this \
+             op — its dims are [mb, x, out, y], so the paged axis must be `mb`"
+        )
+    })?;
+    if dst_elems > 0
+        && let Some(o) = op.args.last_mut()
+    {
+        o.set_offset_elems(dst_elems);
+    }
+    Ok(op)
+}
+
+/// [`page_gather_blocks_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_page_gather_blocks(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    gather: crate::superdsc_opspec::GatherIndex,
+    blocks: PageGatherBlocks,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = page_gather_blocks_opspec(src, dst, gather, blocks)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_page_gather_blocks {op_name}: {e}"))
+}
+
 /// ⭐ A STICK PERMUTE'S DIRECTION — between the two card frames of `R` rows of `C` sticks:
 /// STICK-MAJOR `[R, C·stick]` (stick column `c`'s `R` rows contiguous: bytes `[C][R][stick]`) and
 /// ROW-MAJOR `[R·C, stick]` (row `r`'s `C` sticks contiguous: bytes `[R][C][stick]`).
@@ -1798,5 +1925,121 @@ mod stick_runs_tests {
     #[test]
     fn a_pitch_under_a_run_is_refused() {
         assert!(stick_runs_copy_opspec("t1", "t2", runs(32, 64)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod page_gather_blocks_tests {
+    use super::*;
+    use crate::superdsc_opspec::{EntryBase, GatherIndex, PageExtent};
+
+    /// ⭐ THE REFERENCE's K PAGE GATHER (granite-3.1-8b's decode trip, `sdsc_6`): eight kv heads'
+    /// `[128, 128]` blocks, one a core, read row-major and landed stick-major.
+    #[test]
+    fn the_gather_lands_each_entrys_block_stick_major() {
+        let gather = GatherIndex::of_scratch_rows(
+            "Tensor9".into(),
+            PageExtent::of_positions(1),
+            EntryBase::ZERO,
+        );
+        let op = page_gather_blocks_opspec(
+            "Tensor0",
+            "Tensor1",
+            gather,
+            PageGatherBlocks {
+                entries: 8,
+                rows: 128,
+                cols: 128,
+                dst_elems: 0,
+            },
+        )
+        .expect("the block gather builds");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = crate::emit::emit_sdsc("gather_o1", &op, &folds, None).expect("it emits");
+        let v = serde_json::to_value(&sdsc).expect("the op serializes");
+        assert_eq!(
+            v["numWkSlicesPerDim_"],
+            serde_json::json!({"mb": 8, "x": 1, "out": 1, "y": 1}),
+            "one entry a core"
+        );
+        let dsc = &v["dscs_"][0]["gather_o1"];
+        assert_eq!(
+            dsc["N_"],
+            serde_json::json!({"name_": "n", "mb_": 8, "x_": 128, "out_": 128, "y_": 1})
+        );
+        let alloc: Vec<&serde_json::Value> = dsc["scheduleTree_"]
+            .as_array()
+            .expect("a tree")
+            .iter()
+            .filter(|n| n["nodeType_"] == "allocate")
+            .collect();
+        let side = |i: usize| {
+            (
+                alloc[i]["layoutDimOrder_"].clone(),
+                alloc[i]["indirectAllocType_"].clone(),
+            )
+        };
+        assert_eq!(
+            side(0),
+            (
+                serde_json::json!(["out", "x", "mb", "y"]),
+                serde_json::json!("value_tensor")
+            ),
+            "the page read row-major, a row's two sticks together"
+        );
+        assert_eq!(
+            alloc[0]["maxDimSizes_"],
+            serde_json::json!([-1, -1, 1, -1]),
+            "one `mb` position an entry: skip_addr is one block"
+        );
+        assert_eq!(
+            side(1),
+            (serde_json::json!(["mb"]), serde_json::json!("index_tensor"))
+        );
+        assert_eq!(
+            side(2),
+            (
+                serde_json::json!(["x", "out", "mb", "y"]),
+                serde_json::json!("no_indirection")
+            ),
+            "each block landed stick-major, a stick column's rows together"
+        );
+        let block = 128 * 128 * 2;
+        for (i, a) in [&alloc[0], &alloc[2]].into_iter().enumerate() {
+            let starts = &a["startAddressCoreCorelet_"]["data_"];
+            let at = |c: u64| -> u64 {
+                starts[format!("[{c}, 0, 0]")]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("a concrete start")
+            };
+            for c in 1..8 {
+                assert_eq!(
+                    at(c) - at(0),
+                    c * block,
+                    "side {i}: core {c} starts at its block"
+                );
+            }
+        }
+    }
+
+    /// An entry is one block, so an index stating several positions an entry is refused.
+    #[test]
+    fn an_entry_of_several_positions_is_refused() {
+        let gather = GatherIndex::of_scratch_rows(
+            "Tensor9".into(),
+            PageExtent::of_positions(2),
+            EntryBase::ZERO,
+        );
+        let blocks = PageGatherBlocks {
+            entries: 8,
+            rows: 128,
+            cols: 128,
+            dst_elems: 0,
+        };
+        let Err(m) = page_gather_blocks_opspec("Tensor0", "Tensor1", gather, blocks) else {
+            panic!("an entry of two positions is two blocks' worth of one");
+        };
+        assert!(m.contains("one `mb` position"), "{m}");
     }
 }
