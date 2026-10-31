@@ -2880,6 +2880,7 @@ impl StagedWeights {
             gemm: &self.gemm,
             scale_rows: &self.scale_rows,
             load_consts: &[],
+            seat: None,
         }
     }
 }
@@ -2903,6 +2904,9 @@ pub(crate) struct StagedWeightView<'a> {
     /// [`Self::stage_load_consts`] at buffer init instead, never through the
     /// read-time channel.
     pub load_consts: &'a [(u32, crate::wiring::LoadConst)],
+    /// The rank the staged session plays as (`None` at a world of one) — the rank a chained
+    /// head's tables are built for ([`crate::wiring::LoadConst::build`]).
+    pub seat: Option<crate::bundle_code::collective::TpIdentity>,
 }
 
 impl StagedWeightView<'_> {
@@ -2971,7 +2975,7 @@ impl StagedWeightView<'_> {
             if i < floor || i >= bufs.len() || bufs[i].is_empty() {
                 continue;
             }
-            let (bytes, dt, _shape) = kind.build();
+            let (bytes, dt, _shape) = kind.build(self.seat);
             let vals: Vec<f32> = match dt {
                 scratchy_tensors::DType::F16 => bytes
                     .as_chunks::<2>()
@@ -4140,6 +4144,7 @@ struct GateProbe {
     gemm: std::collections::HashSet<u32>,
     scale_rows: std::collections::HashSet<u32>,
     load_consts: Vec<(u32, crate::wiring::LoadConst)>,
+    seat: Option<crate::bundle_code::collective::TpIdentity>,
     staged_rope: std::collections::HashMap<u32, Vec<f32>>,
     sources: Vec<(u64, Vec<f32>, Vec<usize>)>,
 }
@@ -4152,6 +4157,7 @@ fn stage_gate_probe<F: RopeForm>(
     prefill: Option<&PrefillGate>,
     cap: u32,
     seed: &dyn Fn(u32) -> usize,
+    seat: Option<crate::bundle_code::collective::TpIdentity>,
 ) -> Result<GateProbe, String> {
     // ── The fold list the scales manifest's skip set states ──
     let sm_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
@@ -4194,7 +4200,7 @@ fn stage_gate_probe<F: RopeForm>(
         load_consts.iter().map(|&(tid, _)| tid).collect();
     let weights_ref = emu_weights.clone();
     for &(tid, kind) in &load_consts {
-        let (bytes, dt, shape) = kind.build();
+        let (bytes, dt, shape) = kind.build(seat);
         emu_weights.push((tid as usize, bytes, dt, shape.to_vec()));
     }
     // ⭐ THE SEAT'S OWN STAGING, TYPED — the same greedy law the golden
@@ -4355,6 +4361,7 @@ fn stage_gate_probe<F: RopeForm>(
         gemm,
         scale_rows,
         load_consts,
+        seat,
         staged_rope,
         sources,
     })
@@ -4660,14 +4667,24 @@ pub fn numeric_gate<F: RopeForm>(
         gemm,
         scale_rows,
         load_consts,
+        seat,
         staged_rope,
         sources,
-    } = stage_gate_probe(ir, weight_ids, covering, prefill, cap, &|tid| tid as usize)?;
+    } = stage_gate_probe(
+        ir,
+        weight_ids,
+        covering,
+        prefill,
+        cap,
+        &|tid| tid as usize,
+        None,
+    )?;
     let view = StagedWeightView {
         bytes: &view_bytes,
         gemm: &gemm,
         scale_rows: &scale_rows,
         load_consts: &load_consts,
+        seat,
     };
     // ── Run the bundle on the emulator ──
     // The golden tids, in the writer's own first-seen order — each with the
@@ -5328,6 +5345,7 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
             prefill,
             cap,
             &seed(me.rank() as usize),
+            Some(*me),
         )?);
     }
     let golden_index = GoldenIndex::of(ir);
@@ -5506,6 +5524,7 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
             gemm: &p.gemm,
             scale_rows: &p.scale_rows,
             load_consts: &p.load_consts,
+            seat: p.seat,
         })
         .collect();
     let collectives = ir.nodes.iter().filter(|n| is_collective(&n.op)).count();

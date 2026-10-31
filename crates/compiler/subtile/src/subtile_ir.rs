@@ -2203,10 +2203,11 @@ pub fn chain_l_stick_ramp(l: u32, hidden: u32) -> Vec<u32> {
 /// bytes (the #717 class the shared-stick alternative could not avoid).
 /// Word 0 is `hidden`, the sentinel MARK the reference's re-join refuses on
 /// (a real ramp's word 0 is a lane, and `l ≤ 63 < 64 ≤ hidden` at every
-/// lawful hidden, so the mark is unambiguous). The seeds never push this
-/// stick — the host seeds real picks; the sentinel arises only when the
-/// device's own pick answers past the vocab and the stage gathers the
-/// table's sentinel row.
+/// lawful hidden, so the mark is unambiguous). A seed pushes this stick
+/// only on a rank whose [`ChainBlock`] does not hold the token (its zero
+/// addend); otherwise the sentinel arises when the device's own pick
+/// answers past the vocab, or past the rank's block, and the stage gathers
+/// the table's sentinel row.
 ///
 /// ⭐ SELF-SIZED at [`chain_l_sticks`]'s own count, same as the real ramp —
 /// the two fills share one word count and cannot drift.
@@ -2220,6 +2221,66 @@ pub fn chain_l_sentinel_ramp(hidden: u32) -> Vec<u32> {
     let entries = hidden / CHAIN_SLAB_STICK_ELEMS;
     let words = chain_l_sticks(hidden) as usize * CHAIN_IDX_BLOCK as usize;
     (0..words).map(|j| hidden + j as u32 % entries).collect()
+}
+
+// ── The vocabulary block a rank's chained head gathers from ──
+
+/// ⭐ THE COLUMNS OF THE TABLE ONE RANK'S CHAINED HEAD CAN GATHER — `[origin, origin + width)` of
+/// the vocabulary. At one rank it is the whole widened table (`origin` 0, `width` the pick's pad).
+/// When the vocabulary projection splits by columns (`tensor_parallel`'s gathered row), rank `r`
+/// holds block `r` of the table, `width` its local columns, and a pick outside its block gathers
+/// a ZERO row there — the owner's row is the only addend, and the analysis's all-reduce sums it
+/// whole on every rank.
+///
+/// ONE law for every reader of a pick's decompose: the staged tables (`chain_staged_tables`), the
+/// host seeds ([`chain_s_seed`] / [`chain_l_seed`]), and both reference arms read a pick through
+/// [`Self::local`], so a rank's tables and its seeds cannot disagree about which picks it owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainBlock {
+    origin: u32,
+    width: u32,
+}
+
+impl ChainBlock {
+    /// Block `rank` of a table cut into `width`-column blocks — rank 0's is the one-rank table.
+    ///
+    /// # Panics
+    /// When `width` is not a whole number of [`SAMPLE_BLOCK`] slabs: the gather addresses its
+    /// table a slab at a time, so a block boundary inside a slab names no slab.
+    pub fn of_rank(width: u32, rank: u32) -> Self {
+        assert!(
+            width != 0 && width.is_multiple_of(SAMPLE_BLOCK),
+            "a chained head's table block is whole {SAMPLE_BLOCK}-column slabs, not {width} columns"
+        );
+        Self {
+            origin: rank
+                .checked_mul(width)
+                .expect("a rank's block origin fits the pick's u32"),
+            width,
+        }
+    }
+
+    /// The block-local column of pick `t`, when this block holds it.
+    pub fn local(self, t: u32) -> Option<u32> {
+        t.checked_sub(self.origin).filter(|c| *c < self.width)
+    }
+}
+
+/// Row `t` of the s table — and the s seed of token `t`: the lane pattern of `t`'s block-local
+/// slab, or slab 0's pattern when the block does not hold `t` (bus safety: the l row then names
+/// the sentinel's zero row, so the slab's bytes are never read into a value).
+pub fn chain_s_row(k: u32, t: u32, block: ChainBlock) -> Vec<u32> {
+    let slab = block.local(t).map_or(0, |c| c >> 6);
+    chain_s_stick_pattern(k, slab, CHAIN_IDX_BLOCK as usize)
+}
+
+/// Row `t` of the l table — and the l seed of token `t`: the lane ramp of `t`'s column within its
+/// slab, or the SENTINEL RAMP (the zero row) when the block does not hold `t`.
+pub fn chain_l_row(t: u32, hidden: u32, block: ChainBlock) -> Vec<u32> {
+    match block.local(t) {
+        Some(c) => chain_l_stick_ramp(c & 63, hidden),
+        None => chain_l_sentinel_ramp(hidden),
+    }
 }
 
 // ── The seeds at the launch's own width (the ONE per-row spelling) ──
@@ -2240,15 +2301,14 @@ pub fn chain_l_sentinel_ramp(hidden: u32) -> Vec<u32> {
 /// At `rows == 1` this is the solo spelling byte-for-byte (one stick, the one
 /// token's pattern) — the degenerate every W=1 rung rode before the batched rung
 /// existed, kept exact by construction rather than by a width branch.
-pub fn chain_s_seed(k: u32, toks: &[u32], rows: usize) -> Vec<u32> {
+pub fn chain_s_seed(k: u32, toks: &[u32], rows: usize, block: ChainBlock) -> Vec<u32> {
     assert!(
         !toks.is_empty(),
         "chain_s_seed: no token to seed from — a chain with no token names no slab"
     );
-    let lanes = CHAIN_IDX_BLOCK as usize;
     let last = toks.len() - 1;
     (0..rows)
-        .flat_map(|r| chain_s_stick_pattern(k, toks[r.min(last)] >> 6, lanes))
+        .flat_map(|r| chain_s_row(k, toks[r.min(last)], block))
         .collect()
 }
 
@@ -2259,14 +2319,14 @@ pub fn chain_s_seed(k: u32, toks: &[u32], rows: usize) -> Vec<u32> {
 ///
 /// The clamp is the pad-row law [`chain_s_seed`] states; at `rows == 1` this is
 /// the solo spelling byte-for-byte.
-pub fn chain_l_seed(toks: &[u32], hidden: u32, rows: usize) -> Vec<u32> {
+pub fn chain_l_seed(toks: &[u32], hidden: u32, rows: usize, block: ChainBlock) -> Vec<u32> {
     assert!(
         !toks.is_empty(),
         "chain_l_seed: no token to seed from — a chain with no token names no lane"
     );
     let last = toks.len() - 1;
     (0..rows)
-        .flat_map(|r| chain_l_stick_ramp(toks[r.min(last)] & 63, hidden))
+        .flat_map(|r| chain_l_row(toks[r.min(last)], hidden, block))
         .collect()
 }
 
@@ -2393,6 +2453,9 @@ pub struct EmbedChainMint {
     /// stick, the per-stick cut's own addressing — stick `r·l_sticks + b`
     /// of the placement).
     pub l_stick: TensorId,
+    /// The table columns one rank's gather reads — the [`ChainBlock`] width: the widened table's
+    /// pad at one rank, a rank's vocabulary block when the projection is split.
+    pub block: u32,
 }
 
 /// Append the CHAINED HEAD to a decode graph: the persistent s/l stick
@@ -2483,7 +2546,10 @@ pub fn mint_embed_chain<F: RopeForm>(
     //    called outside it). The loop breaks with the WEIGHT TID (a Copy), so
     //    no borrow of the node list outlives the walk the surgery below
     //    mutates.
+    // ⭐ A SPLIT PROJECTION'S ALL-GATHER IS CROSSED, NOT REFUSED: below it the projection reads
+    // one rank's column block of the table, and that block is what this rank's gather reads.
     let mut t = graph.nodes[pick_node].inputs[0].tensor;
+    let mut split = false;
     let weight = loop {
         let node = graph
             .nodes
@@ -2494,11 +2560,15 @@ pub fn mint_embed_chain<F: RopeForm>(
             SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if node.inputs.len() == 1 => {
                 t = node.inputs[0].tensor;
             }
+            SubOp::AllGather { .. } if !split => {
+                split = true;
+                t = node.inputs[0].tensor;
+            }
             SubOp::MatmulTile { .. } => break node.inputs[1].tensor,
             other => panic!(
                 "mint_embed_chain walked a {other:?} result tail — the admission gate \
-                 (an arity-2 Dense lm-head under single-input ScalarMul/TanhSoftCap) \
-                 refuses this graph, so the mint was called outside it"
+                 (an arity-2 Dense lm-head under single-input ScalarMul/TanhSoftCap, \
+                 gathered once when split) refuses this graph, so the mint was called outside it"
             ),
         }
     };
@@ -2519,16 +2589,31 @@ pub fn mint_embed_chain<F: RopeForm>(
     // them. A raw-vocab weight here is a partial slab (the gather door's
     // stick law would refuse it at expansion as an address); a wider one is
     // a pass that ran twice; both fail HERE, at the mint, naming the pass.
-    assert_eq!(
-        w_cols,
-        pad_vocab,
-        "mint_embed_chain: the lm-head weight t{} states {} columns, not the pick's pad \
-         {pad_vocab} — the per-graph widening pass (widen_tied_embed_weight) did not run \
-         before this mint; the chain's tables, sentinel, and s-clamp are all keyed to the \
-         pad, and the gather addresses the weight at that width or not at all",
-        weight.index(),
-        w_cols
-    );
+    //
+    // ⭐ A RANK'S BLOCK IS NOT WIDENED: its pick range is the rank's own columns, every pick
+    // outside it maps to the sentinel's zero row through the rank's tables ([`ChainBlock`]), so
+    // no slab address can leave the block. Its law is the slab law alone — whole 64-column
+    // slabs — and the block is narrower than the vocabulary it is a block of.
+    if split {
+        assert!(
+            w_cols.is_multiple_of(SAMPLE_BLOCK) && w_cols < vocab,
+            "mint_embed_chain: the split lm-head's weight t{} states {w_cols} columns — a \
+             rank's block of a {vocab}-token vocabulary is narrower than it and whole \
+             {SAMPLE_BLOCK}-column slabs",
+            weight.index()
+        );
+    } else {
+        assert_eq!(
+            w_cols,
+            pad_vocab,
+            "mint_embed_chain: the lm-head weight t{} states {} columns, not the pick's pad \
+             {pad_vocab} — the per-graph widening pass (widen_tied_embed_weight) did not run \
+             before this mint; the chain's tables, sentinel, and s-clamp are all keyed to the \
+             pad, and the gather addresses the weight at that width or not at all",
+            weight.index(),
+            w_cols
+        );
+    }
     assert!(
         graph.is_source(embed_row),
         "mint_embed_chain: the embed rows must be a source (the host-bound rows being \
@@ -2694,6 +2779,29 @@ pub fn mint_embed_chain<F: RopeForm>(
     // 5) THE RE-POINT — every WHOLE-TENSOR consumer of the embed rows reads
     //    the gather's output instead. The rows' source survives, placed and
     //    readable by tid; the host simply stops seeding it.
+    //
+    // ⭐ OVER A SPLIT TABLE THE GATHER IS ONE RANK'S ADDEND, so its rows' ONLY reader is the
+    // all-reduce the sharding analysis wove in for them (`tensor_parallel::RowGather`); over a
+    // whole table nothing reduces them. Either disagreement is a forward sharded for a different
+    // chain than this one, and is refused here, by name.
+    for node in graph.nodes.iter().skip(1) {
+        if node.inputs.iter().any(|i| i.tensor == embed_row) {
+            assert_eq!(
+                matches!(node.op, SubOp::AllReduce),
+                split,
+                "mint_embed_chain: the embed rows t{} are read by a {:?} — over {} table the \
+                 gather's rows are read {}",
+                embed_row.index(),
+                node.op,
+                if split { "a split" } else { "a whole" },
+                if split {
+                    "by the analysis's all-reduce alone (a gathered row's partial sum)"
+                } else {
+                    "whole, and nothing reduces them"
+                }
+            );
+        }
+    }
     for node in graph.nodes.iter_mut().skip(1) {
         for inp in &mut node.inputs {
             if inp.tensor == embed_row {
@@ -2769,6 +2877,7 @@ pub fn mint_embed_chain<F: RopeForm>(
         width,
         s_stick,
         l_stick,
+        block: w_cols,
     }
 }
 
@@ -3095,33 +3204,39 @@ pub fn eval_node<F: RopeForm>(
             }
             out
         }
-        SubOp::ChainStage { pad_vocab, k, .. } => {
+        SubOp::ChainStage { .. } => {
             // The persistent s/l writes are GPU-only (KvAppend's law); the
             // reference is the S-VALUE STICK the device's own s-gather
             // writes into this node's fresh output, so the two ends agree on
-            // what the node produced: the ruled table's law, `s = t >> 6`
-            // clamped to 0 past `pad_vocab`, stated as the LANE PATTERN
-            // `k·s + (i mod k)` over the stick's lanes — lane `i` names
-            // entry `i mod k` of slab `s` (the sentinel leg — a degenerate
-            // row answers a pick past `pad_vocab`, and the clamp keeps even
-            // that read on slab 0's pattern `i mod k`, the zero-slab form
-            // the k=1 splat's own zero already was). The pick rides word 0
-            // of each idx-stick row (the whole-stick store law).
-            // `table_rows` is unread here by the same law that leaves the
-            // table OPERANDS unread: the reference states the decompose's
-            // RESULT, never its walk, and the extent is the door's check.
+            // what the node produced: ROW `t` OF THE S TABLE — the device's
+            // own walk. The table is the decompose's law ([`chain_s_row`]:
+            // the LANE PATTERN `k·s + (i mod k)` of the pick's slab within
+            // its rank's [`ChainBlock`], slab 0's pattern for a pick the
+            // block does not hold), and it is the ONLY place a rank's block
+            // lives: the op is the same on every rank, the tables are not.
+            // The pick rides word 0 of each idx-stick row (the whole-stick
+            // store law). `table_rows` is the door's extent check.
             let (pick, _, pick_cols) = gather(&node.inputs[0], graph, bufs);
-            let k = k as usize;
+            let (s_tab, tab_rows, tab_cols) = gather(&node.inputs[3], graph, bufs);
             let width = out_rows as usize;
             assert_eq!(
                 out_cols as usize, CHAIN_IDX_BLOCK as usize,
                 "the stage's fresh output is the s-value stick, [width, CHAIN_IDX_BLOCK]"
             );
+            assert_eq!(
+                tab_cols, CHAIN_IDX_BLOCK,
+                "the s table's row is one s-value stick"
+            );
             let mut out = Vec::with_capacity(width * CHAIN_IDX_BLOCK as usize);
             for r in 0..width {
                 let t = pick[r * pick_cols as usize] as u32;
-                let s = if t < pad_vocab { t >> 6 } else { 0 };
-                out.extend((0..CHAIN_IDX_BLOCK as usize).map(|i| (k * s as usize + i % k) as f32));
+                assert!(
+                    t < tab_rows,
+                    "the pick {t} is past the s table's {tab_rows} rows — the sentinel is its \
+                     last row, so no answerable pick is"
+                );
+                let row = t as usize * CHAIN_IDX_BLOCK as usize;
+                out.extend_from_slice(&s_tab[row..row + CHAIN_IDX_BLOCK as usize]);
             }
             out
         }
@@ -5734,12 +5849,19 @@ mod tests {
                         .map(|x| x as f32)
                 })
                 .collect();
-            // The tables are unread by the reference (the door's check); the
-            // sizes come off the minted graph, never a second derivation.
-            let tab_len = |tid: u32| {
-                (chained.tensors[tid as usize].rows * chained.tensors[tid as usize].cols) as usize
-            };
-            let tabs = vec![vec![0f32; tab_len(4)]; 2];
+            // The tables are the one-rank decompose — its whole widened table, block 0 — staged
+            // at the extent the minted graph states, never a second derivation.
+            let whole = ChainBlock::of_rank(pad as u32, 0);
+            let rows_of = |tid: usize| chained.tensors[tid].rows;
+            let words = |v: Vec<u32>| v.into_iter().map(|x| x as f32);
+            let tabs = [
+                (0..rows_of(4))
+                    .flat_map(|t| words(chain_s_row(1, t, whole)))
+                    .collect::<Vec<f32>>(),
+                (0..rows_of(5))
+                    .flat_map(|t| words(chain_l_row(t, hidden, whole)))
+                    .collect::<Vec<f32>>(),
+            ];
             let bufs_chained = eval_dag(
                 &chained,
                 &[
@@ -5794,13 +5916,16 @@ mod tests {
         let hidden = 128u32;
         let pad = 4096usize;
         let voc = FIXTURE_VOCAB as usize;
+        // Column 0 is the unit row, so the fixture's stand-in pick (logit 0) is each gathered
+        // row's word 0 — an answerable pick for the stage that reads it.
         let w_wide: Vec<f32> = (0..hidden as usize * pad)
             .map(|i| {
                 let (h, c) = (i / pad, i % pad);
-                if c < voc {
-                    h as f32 * 0.5 + c as f32 * 0.25 - 3.0
-                } else {
-                    0.0
+                match (h, c) {
+                    (0, 0) => 1.0,
+                    (_, 0) => 0.0,
+                    _ if c < voc => h as f32 * 0.5 + c as f32 * 0.25 - 3.0,
+                    _ => 0.0,
                 }
             })
             .collect();
@@ -5867,13 +5992,16 @@ mod tests {
             k, 4,
             "granite-3.1-2b's own geometry: the LX law splits k = 4"
         );
+        // Column 0 is the unit row, so the fixture's stand-in pick (logit 0) is each gathered
+        // row's word 0 — an answerable pick for the stage that reads it.
         let w_wide: Vec<f32> = (0..hidden as usize * pad)
             .map(|i| {
                 let (h, c) = (i / pad, i % pad);
-                if c < voc {
-                    h as f32 * 0.125 + c as f32 * 0.0625 - 3.0
-                } else {
-                    0.0
+                match (h, c) {
+                    (0, 0) => 1.0,
+                    (_, 0) => 0.0,
+                    _ if c < voc => h as f32 * 0.125 + c as f32 * 0.0625 - 3.0,
+                    _ => 0.0,
                 }
             })
             .collect();
@@ -5930,8 +6058,9 @@ mod tests {
         let k = 4u32;
         let lanes = CHAIN_IDX_BLOCK as usize;
         let toks = [64u32 * 5 + 33, 64 * 7 + 60, 64 * 9 + 12];
+        let whole = ChainBlock::of_rank(4096, 0);
         // PER-ROW: row r's stick is its own token's pattern/ramp, not row 0's.
-        let s = chain_s_seed(k, &toks, 2);
+        let s = chain_s_seed(k, &toks, 2, whole);
         assert_eq!(
             s,
             [
@@ -5941,7 +6070,7 @@ mod tests {
             .concat(),
             "row 1's s stick carries row 1's token, not row 0's"
         );
-        let l = chain_l_seed(&toks, hidden, 2);
+        let l = chain_l_seed(&toks, hidden, 2, whole);
         assert_eq!(
             l,
             [
@@ -5953,7 +6082,7 @@ mod tests {
         );
         // THE PAD-ROW CLAMP: rows past the real tokens repeat the last real
         // token's seed — the same law the embedding staging pins.
-        let s_pad = chain_s_seed(k, &toks, 5);
+        let s_pad = chain_s_seed(k, &toks, 5, whole);
         assert_eq!(
             s_pad[4 * lanes..],
             chain_s_stick_pattern(k, toks[2] >> 6, lanes),
@@ -5962,16 +6091,131 @@ mod tests {
         // THE SOLO DEGENERATE: at one row the seed IS the one stick, byte for
         // byte — the W=1 rung's own spelling, kept exact by construction.
         assert_eq!(
-            chain_s_seed(k, &toks, 1),
+            chain_s_seed(k, &toks, 1, whole),
             chain_s_stick_pattern(k, toks[0] >> 6, lanes)
         );
         assert_eq!(
-            chain_l_seed(&toks, hidden, 1),
+            chain_l_seed(&toks, hidden, 1, whole),
             chain_l_stick_ramp(toks[0] & 63, hidden)
         );
         // An empty token list is a refusal, never a zero stick (zero is a valid
         // entry and a valid lane).
-        assert!(std::panic::catch_unwind(|| chain_s_seed(k, &[], 1)).is_err());
-        assert!(std::panic::catch_unwind(|| chain_l_seed(&[], hidden, 1)).is_err());
+        assert!(std::panic::catch_unwind(|| chain_s_seed(k, &[], 1, whole)).is_err());
+        assert!(std::panic::catch_unwind(|| chain_l_seed(&[], hidden, 1, whole)).is_err());
+    }
+
+    /// ⭐ EACH RANK GATHERS ITS OWN BLOCK, AND THE BLOCKS SUM TO THE TABLE. With the table cut
+    /// into two column blocks, a token's owner seeds the token's block-local slab and lane and
+    /// every other rank the sentinel's zero row; each rank's gather over its own block then
+    /// stages the token's column on the owner and zeros elsewhere — and the two rows sum to the
+    /// one-rank gather's row over the whole table, which is what the analysis's all-reduce
+    /// makes of them. Shown first at one rank, where the same seeds over the whole table are the
+    /// one-rank chain.
+    #[test]
+    fn a_split_tables_ranks_gather_rows_that_sum_to_the_whole_tables() {
+        let (hidden, vocab) = (128u32, 512u32);
+        let k = chain_slab_entries(u64::from(hidden)) as u32;
+        // The table `[hidden, vocab]`, a distinct value per element.
+        let table: Vec<f32> = (0..hidden * vocab)
+            .map(|i| (i % 977) as f32 * 0.5)
+            .collect();
+        let col = |w: &[f32], cols: u32, t: u32| -> Vec<f32> {
+            (0..hidden).map(|h| w[(h * cols + t) as usize]).collect()
+        };
+        // One rank's chained gather of `toks` over `w` (`cols` wide), seeded by `block`: the
+        // `EmbedRowGather` node alone, over the two seeded sticks and the table.
+        let gather_rows = |w: &[f32], cols: u32, toks: &[u32], block: ChainBlock| -> Vec<f32> {
+            let width = toks.len() as u32;
+            let whole = |t: u32, rows: u32, cols: u32| TensorRegion {
+                tensor: TensorId(t),
+                region: Region {
+                    rows: Range::new(0, rows),
+                    cols: Range::new(0, cols),
+                },
+            };
+            let l_rows = width * chain_l_sticks(hidden);
+            let g: SubtileIR = SubtileIR {
+                tensors: vec![
+                    TensorShape {
+                        rows: width,
+                        cols: CHAIN_IDX_BLOCK,
+                    },
+                    TensorShape {
+                        rows: l_rows,
+                        cols: CHAIN_IDX_BLOCK,
+                    },
+                    TensorShape { rows: hidden, cols },
+                    TensorShape {
+                        rows: width,
+                        cols: hidden,
+                    },
+                ],
+                num_sources: 3,
+                nodes: vec![SubtileNode {
+                    id: SubtileId(0),
+                    op: SubOp::EmbedRowGather {
+                        hidden,
+                        replaces: TensorId(3),
+                    },
+                    inputs: vec![
+                        whole(0, width, CHAIN_IDX_BLOCK),
+                        whole(1, l_rows, CHAIN_IDX_BLOCK),
+                        whole(2, hidden, cols),
+                    ],
+                    output: whole(3, width, hidden),
+                }],
+                result: TensorId(3),
+                op_output: vec![],
+            };
+            let words = |v: Vec<u32>| -> Vec<f32> { v.into_iter().map(|x| x as f32).collect() };
+            let s = words(chain_s_seed(k, toks, width as usize, block));
+            let l = words(chain_l_seed(toks, hidden, width as usize, block));
+            eval_dag(&g, &[&s, &l, w])[3].clone()
+        };
+        let toks = [70u32, 300, 255, 256];
+        // One rank: the whole table, block 0 of width vocab.
+        let whole = gather_rows(&table, vocab, &toks, ChainBlock::of_rank(vocab, 0));
+        let expect: Vec<f32> = toks.iter().flat_map(|&t| col(&table, vocab, t)).collect();
+        assert_eq!(whole, expect, "one rank gathers every token's column");
+        // Two ranks: each its own column block.
+        let lc = vocab / 2;
+        let block_of = |r: u32| -> Vec<f32> {
+            (0..hidden)
+                .flat_map(|h| {
+                    table[(h * vocab + r * lc) as usize..(h * vocab + (r + 1) * lc) as usize]
+                        .to_vec()
+                })
+                .collect()
+        };
+        let ranks: Vec<Vec<f32>> = (0..2)
+            .map(|r| gather_rows(&block_of(r), lc, &toks, ChainBlock::of_rank(lc, r)))
+            .collect();
+        for (i, &t) in toks.iter().enumerate() {
+            let owner = (t / lc) as usize;
+            let row = |r: usize| &ranks[r][i * hidden as usize..(i + 1) * hidden as usize];
+            assert_eq!(
+                row(owner),
+                &col(&table, vocab, t)[..],
+                "token {t}'s owner gathers it"
+            );
+            assert!(
+                row(1 - owner).iter().all(|x| *x == 0.0),
+                "token {t}'s other rank gathers the zero row"
+            );
+        }
+        let sum: Vec<f32> = ranks[0].iter().zip(&ranks[1]).map(|(a, b)| a + b).collect();
+        assert_eq!(sum, whole, "the ranks' rows sum to the one-rank gather");
+    }
+
+    /// The block law: a block holds exactly its own columns, and a block boundary inside a
+    /// 64-column slab names no slab.
+    #[test]
+    fn a_chain_block_holds_its_own_columns() {
+        let b = ChainBlock::of_rank(256, 1);
+        assert_eq!(b.local(255), None);
+        assert_eq!(b.local(256), Some(0));
+        assert_eq!(b.local(511), Some(255));
+        assert_eq!(b.local(512), None);
+        assert!(std::panic::catch_unwind(|| ChainBlock::of_rank(100, 0)).is_err());
     }
 }

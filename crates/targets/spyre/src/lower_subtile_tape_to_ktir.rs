@@ -2325,11 +2325,11 @@ pub fn load_consts_of_ir<F: RopeForm>(
             // beside this stage — the same one statement `chain_of_ir` reads
             // below, so the tables' `hidden` and the wiring's can never
             // disagree about the graph's width.
-            let hidden = ir
+            let (hidden, block) = ir
                 .nodes
                 .iter()
                 .find_map(|n| match n.op {
-                    SubOp::EmbedRowGather { hidden, .. } => Some(hidden),
+                    SubOp::EmbedRowGather { hidden, .. } => Some((hidden, chain_block_cols(n, ir))),
                     _ => None,
                 })
                 .expect(
@@ -2346,6 +2346,7 @@ pub fn load_consts_of_ir<F: RopeForm>(
                             pad_vocab,
                             k,
                             hidden,
+                            block,
                             operand: (i + 1) as u8,
                         },
                     )
@@ -2388,11 +2389,13 @@ pub fn chain_of_ir<F: RopeForm>(ir: &SubtileIR<F>) -> crate::wiring::ChainFact {
         // No stage, no mint — the graph's own state, spelled by name.
         return crate::wiring::ChainFact::Unchained;
     };
-    let (hidden, replaces) = ir
+    let (hidden, replaces, block) = ir
         .nodes
         .iter()
         .find_map(|n| match &n.op {
-            SubOp::EmbedRowGather { hidden, replaces } => Some((*hidden, *replaces)),
+            SubOp::EmbedRowGather { hidden, replaces } => {
+                Some((*hidden, *replaces, chain_block_cols(n, ir)))
+            }
             _ => None,
         })
         .expect(
@@ -2406,8 +2409,16 @@ pub fn chain_of_ir<F: RopeForm>(ir: &SubtileIR<F>) -> crate::wiring::ChainFact {
             k,
             hidden,
             replaces: replaces.index() as u32,
+            block,
         },
     }
+}
+
+/// The table columns a chained head's gather reads — its matrix operand's stated width: the
+/// widened table's pad at a world of one, one rank's vocabulary block when the projection is
+/// split (`mint_embed_chain`'s `block`). Read off the gather the mint spliced, never re-derived.
+fn chain_block_cols<F: RopeForm>(gather: &SubtileNode<F>, ir: &SubtileIR<F>) -> u32 {
+    ir.shape(gather.inputs[2].tensor).cols
 }
 
 /// ⭐ THE ARRANGEMENT FACTS OFF THE MINTED `Sample` NODE ALONE — the gate-side
