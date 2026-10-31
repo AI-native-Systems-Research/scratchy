@@ -393,8 +393,8 @@ pub(crate) fn site_cbs(tp: SiteTp, launch: BatchedCompute) -> Result<Vec<Batched
                 };
                 for m in send.messages() {
                     out.push(BatchedCb::Send(RdmaSend {
-                        sid: route.own_sid,
-                        dest_tid: route.dest_tid,
+                        sid: route.send_sid(m.slot),
+                        dest_tid: route.dest_tid(),
                         bytes: m.bytes,
                         source: end(l, send.source_segment, m.source_offset)?,
                         window: end(l, RecvWindow::SEGMENT as u8, m.window_offset)?,
@@ -405,16 +405,17 @@ pub(crate) fn site_cbs(tp: SiteTp, launch: BatchedCompute) -> Result<Vec<Batched
                     }));
                 }
             }
-            // ⭐ AND THE PAIRING: every one of the peer's messages increments the counter once and
-            // a wait consumes exactly one count, so its run of N messages is waited for N times.
-            // The peer's run is this rank's own — the forward is SPMD and the cut is the payload's.
+            // ⭐ AND THE PAIRING: every one of the peer's messages increments its slot's counter
+            // once and a wait consumes exactly one count, so its run of N messages is waited for N
+            // times, once per slot. The peer's run is this rank's own — the forward is SPMD and the
+            // cut is the payload's — so this rank's messages name the peer's slots too.
             CbStep::Wait { .. } => {
                 let Some(BoundCollective { send, route }) = bound else {
                     bail!("group {index} waits with no binding");
                 };
-                for _ in 0..send.bytes.message_count() {
+                for m in send.messages() {
                     out.push(BatchedCb::Wait {
-                        sid: route.peer_sid,
+                        sid: route.wait_sid(m.slot),
                     });
                 }
             }
@@ -1194,7 +1195,8 @@ pub(crate) fn patch_check(
 mod tests {
     use super::*;
     use crate::bundle_code::collective::{
-        CollectiveKind, Payload, TpWorld, WindowCut, WireBytes, fragments,
+        CollectiveKind, CutPayload, LandingSlot, Payload, Sid, TpWorld, WindowCut, WireBytes,
+        fragments,
     };
     use crate::runtime::Chunk0;
     use flex_rs::address::{ByteOffset, RegionId};
@@ -1233,16 +1235,23 @@ mod tests {
 
     /// A consume site stages send, wait, then the barriered consume; the send reads its operand
     /// through the consume launch's own base for that segment and lands through its weight-segment
-    /// base, signalling on this rank's sid; the wait counts the peer's.
+    /// base, signalling on this rank's sid for its slot; the wait counts the peer's for that slot.
     #[test]
     fn a_consume_site_is_send_wait_consume_through_its_own_bases() {
         let rank1 = TpWorld::of::<2>().ranks().nth(1).unwrap();
+        let cut = WindowCut::of_collective(1);
         let send = TpSend {
             source_segment: 3,
             source_offset: 4096,
             window_offset: 1 << 20,
-            bytes: Payload::new(4096).unwrap(),
+            bytes: CutPayload::new(Payload::new(4096).unwrap()).unwrap(),
+            cut,
         };
+        let slot = LandingSlot::of(cut, 0).unwrap();
+        let (own, peer) = (
+            Sid::of(rank1, slot).get(),
+            Sid::of(rank1.peer().unwrap(), slot).get(),
+        );
         let bound = BoundCollective {
             send,
             route: PeerRoute::of(rank1).unwrap(),
@@ -1260,7 +1269,7 @@ mod tests {
         let BatchedCb::Send(s) = &cbs[0] else {
             panic!("the send leads");
         };
-        assert_eq!((s.sid, s.dest_tid, s.bytes.get()), (1, 0, 4096));
+        assert_eq!((s.sid, s.dest_tid, s.bytes.get()), (own, 0, 4096));
         assert_eq!(s.place, RunPlace::ALONE);
         assert_eq!(
             (region(&s.source), s.source.segment, s.source.offset),
@@ -1270,23 +1279,28 @@ mod tests {
             (region(&s.window), s.window.segment, s.window.offset),
             (11, 1, 1 << 20)
         );
-        assert!(matches!(cbs[1], BatchedCb::Wait { sid: 0 }));
+        assert!(matches!(cbs[1], BatchedCb::Wait { sid } if sid == peer));
         assert!(matches!(cbs[2], BatchedCb::Consume(_)));
     }
 
     /// A send wider than one message stages as its run — every message an F-send at the matching
-    /// offset, `first` / `last` on its ends — then one wait per message, then the consume: the
-    /// write-done counts it raises on the peer are exactly the counts the peer's waits take.
+    /// offset into a slot of its own, `first` / `last` on its ends — then one wait per message on
+    /// that slot's sid, then the consume: the write-done counts it raises on the peer are exactly
+    /// the counts the peer's waits take, slot by slot.
     #[test]
     fn a_wide_send_stages_its_messages_then_as_many_waits() {
         let rank0 = TpWorld::of::<2>().ranks().next().unwrap();
         let cap = WireBytes::CAP.get();
+        let cut = WindowCut::of_collective(0);
         let send = TpSend {
             source_segment: 0,
             source_offset: 0,
             window_offset: 1 << 20,
-            bytes: Payload::new(cap + 4096).unwrap(),
+            bytes: CutPayload::new(Payload::new(cap + 4096).unwrap()).unwrap(),
+            cut,
         };
+        let slot = |m| LandingSlot::of(cut, m).unwrap();
+        let peer = rank0.peer().unwrap();
         let cbs = site_cbs(
             SiteTp {
                 index: 1,
@@ -1327,8 +1341,14 @@ mod tests {
                 }
             ]
         );
-        assert!(matches!(cbs[2], BatchedCb::Wait { sid: 1 }));
-        assert!(matches!(cbs[3], BatchedCb::Wait { sid: 1 }));
+        assert_eq!(
+            sends.iter().map(|s| s.sid).collect::<Vec<_>>(),
+            [Sid::of(rank0, slot(0)).get(), Sid::of(rank0, slot(1)).get()]
+        );
+        for (i, m) in [0, 1].into_iter().enumerate() {
+            let want = Sid::of(peer, slot(m)).get();
+            assert!(matches!(cbs[2 + i], BatchedCb::Wait { sid } if sid == want));
+        }
         assert!(matches!(cbs[4], BatchedCb::Consume(_)));
     }
 
