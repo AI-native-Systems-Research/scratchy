@@ -170,18 +170,25 @@ fn choose(touches: &[LxTouch], minted: &BTreeSet<u32>, free: u64) -> Vec<Candida
         .filter_map(|&tid| {
             let name = crate::place::act_name(tid);
             let shares = by_tensor.get(name.as_str())?;
-            let LxShare::Slices { bytes, corners } = shares.first()? else {
+            let LxShare::Slices { corners, .. } = shares.first()? else {
                 return None;
             };
+            // Every op starts each core's slice alike; the slice reaches as far as any op reads it
+            // (a stick-plane window reaches its plane, `emit::stick_plane`).
+            let mut per_core = 0u64;
             shares
                 .iter()
-                .all(|s| {
-                    matches!(s, LxShare::Slices { bytes: b, corners: c } if b == bytes && c == corners)
+                .all(|s| match s {
+                    LxShare::Slices { bytes, corners: c } if c == corners => {
+                        per_core = per_core.max(*bytes);
+                        true
+                    }
+                    _ => false,
                 })
                 .then(|| Candidate {
                     tid,
-                    per_core: *bytes,
-                    total: bytes * corners.len() as u64,
+                    per_core,
+                    total: per_core * corners.len() as u64,
                 })
         })
         .collect();
@@ -219,15 +226,16 @@ mod tests {
         }
     }
 
-    /// ⭐ torch-spyre's verdicts, one tensor each: kept when every op hands each core the same bytes;
-    /// spilled on a division mismatch, an indirect read, a trip-at-a-time walk, or when this function
-    /// did not mint it.
+    /// ⭐ torch-spyre's verdicts, one tensor each: kept when every op starts each core's slice alike
+    /// (one op reading only a stick plane of it reaches less far, and the slice is sized by the
+    /// furthest reach); spilled on a division mismatch, an indirect read, a trip-at-a-time walk, or
+    /// when this function did not mint it.
     #[test]
     fn a_tensor_stays_in_lx_only_when_every_op_slices_it_alike() {
         let even = slices(128, &[0, 64, 128, 192]);
         let log = [
             touch("mul", "t10", even.clone()),
-            touch("exp", "t10", even.clone()),
+            touch("exp", "t10", slices(64, &[0, 64, 128, 192])),
             touch("mul", "t11", even.clone()),
             touch("bmm0", "t11", slices(128, &[0, 0, 0, 0])),
             touch("gather", "t12", even.clone()),
@@ -237,14 +245,11 @@ mod tests {
             touch("add", "t14", even.clone()),
         ];
         let minted: BTreeSet<u32> = [10, 11, 12, 13].into();
-        let kept: Vec<u32> = choose(&log, &minted, 1 << 20)
-            .iter()
-            .map(|c| c.tid)
-            .collect();
+        let kept = choose(&log, &minted, 1 << 20);
         assert_eq!(
-            kept,
-            [10],
-            "t11 mismatched, t12 indirect, t13 tiled, t14 not minted here"
+            kept.iter().map(|c| (c.tid, c.per_core)).collect::<Vec<_>>(),
+            [(10, 128)],
+            "t10 at its furthest reach; t11 mismatched, t12 indirect, t13 tiled, t14 not minted here"
         );
     }
 

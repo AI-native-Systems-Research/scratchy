@@ -1907,17 +1907,57 @@ fn core_local_reads_agree(
         }
         let (slice_bytes, corners) = core_slices(op, v)?;
         let (_, pin_bytes) = l.lx_pin(name).unwrap_or_default();
-        if slice_bytes > pin_bytes {
+        let plane_bytes = match (v.offset_elems, stick_plane(op, v)) {
+            (0, _) => 0,
+            (_, Some(elems)) => u64::from(elems) * u64::from(v.df.word_length()),
+            (off, None) => {
+                return Err(SuperDscError(format!(
+                    "op '{op_name}' reads core-local LX tensor '{name}' at offset {off} elements, \
+                     which is no stick plane of it — each core holds whole planes of its own rows"
+                )));
+            }
+        };
+        if plane_bytes + slice_bytes > pin_bytes {
             return Err(SuperDscError(format!(
-                "op '{op_name}': one core's slice of core-local LX tensor '{name}' is {slice_bytes} B, \
-                 past its {pin_bytes}-byte pin"
+                "op '{op_name}': one core's slice of core-local LX tensor '{name}' is {slice_bytes} B \
+                 at {plane_bytes} B in, past its {pin_bytes}-byte pin"
             )));
         }
-        let signature = format!("each core's {slice_bytes} B slice at {corners:?}");
+        // The slices' starts: every op dividing the tensor alike, whichever of its stick planes it
+        // reads ([`stick_plane`]); each one's size is bounded by the pin above.
+        let signature = format!("each core's slice at {corners:?}");
         l.record_lx_division(name, op_name, signature)
             .map_err(SuperDscError)?;
     }
     Ok(())
+}
+
+/// ⭐ A STICK-PLANE WINDOW — a view one or more sticks wide at offset `plane · rows · stick` of a
+/// stick-major tensor of `rows` rows (an elementwise op run one stick column at a time). Each core
+/// holding the tensor's rows in its LX holds every plane of them, its own `per-core rows` rows a plane
+/// (`[planes][per-core rows][stick]`), so the window's plane sits `plane · per-core rows · stick` into
+/// the core's slice. `None` for any other offset view, and for a view whose rows are not split as a
+/// whole tensor's would be.
+fn stick_plane(op: &OpSpec, v: &ArgView<'_>) -> Option<u32> {
+    let plan = &op.iter;
+    let stick = v.df.elems_per_stick();
+    let (mut rows, mut per_core) = (1u32, 1u32);
+    for (&d, &sc) in v.layout.iter().zip(v.scale.iter()) {
+        if d == v.stick {
+            if !matches!(sc, Scale::Active) || !plan.extent(d).is_multiple_of(stick) {
+                return None;
+            }
+            continue;
+        }
+        if !matches!(sc, Scale::Active) {
+            return None;
+        }
+        rows *= plan.extent(d);
+        per_core *= plan.per_core_extent(d);
+    }
+    let plane = rows.checked_mul(stick)?;
+    (v.offset_elems > 0 && v.offset_elems.is_multiple_of(plane))
+        .then(|| v.offset_elems / plane * per_core * stick)
 }
 
 /// One core's slice of the tensor `v` names, in bytes, and where each core's slice starts in the
@@ -1993,11 +2033,16 @@ fn note_lx_touches(
             crate::placement::LxShare::Indirect
         } else if op.time_tile.is_some() {
             crate::placement::LxShare::TimeTiled
-        } else if v.offset_elems != 0 {
+        } else if v.offset_elems != 0 && stick_plane(op, v).is_none() {
             crate::placement::LxShare::Partial
         } else {
+            // A stick-plane window reaches its plane's end of each core's slice.
             let (bytes, corners) = core_slices(op, v)?;
-            crate::placement::LxShare::Slices { bytes, corners }
+            let plane = u64::from(stick_plane(op, v).unwrap_or(0)) * u64::from(v.df.word_length());
+            crate::placement::LxShare::Slices {
+                bytes: plane + bytes,
+                corners,
+            }
         };
         l.note_lx_touch(op_name, v.name, share);
     }
@@ -3235,15 +3280,27 @@ fn set_iter_dim_i(it: &mut IterSpace, name: &str, v: i64) {
 /// so every op references a shared tensor at the SAME address (task #55). Without a
 /// layout (unit tests / single-op fixtures) it falls back to the per-op
 /// `segment_base(arg_index)` (arg 0→seg0, …) — correct for a one-op bundle.
+/// Where an operand's view starts, in elements: into its tensor, or — a core-local tensor's stick
+/// plane ([`stick_plane`]) — already into each core's own slice.
+#[derive(Clone, Copy, Debug)]
+enum ViewOffset {
+    Tensor(u32),
+    CorePlane(u32),
+}
+
 fn resolve_seg_base(
     layout: Option<&BundleLayout>,
     name: &str,
     arg_index: usize,
-    offset_elems: u32,
+    offset: ViewOffset,
     arg_bytes: u64,
     df: Df,
     lane_read: bool,
 ) -> Result<(u64, u64), SuperDscError> {
+    let (offset_elems, core_plane) = match offset {
+        ViewOffset::Tensor(e) => (e, false),
+        ViewOffset::CorePlane(e) => (e, true),
+    };
     let slice = offset_elems as u64 * df.word_length() as u64; // 4 B for fp32, 1 B fp8/int8, else 2 B fp16
     // The footprint guard's WINDOW END — the last byte this access can touch.
     //
@@ -3284,6 +3341,9 @@ fn resolve_seg_base(
             // bound — `core_local_reads_agree` checks the per-core slice against it. And it has no
             // addressable offset: every core's slice starts AT the pin.
             if l.lx_core_local(name) {
+                if core_plane {
+                    return Ok((0, pin + slice));
+                }
                 if slice != 0 {
                     return Err(SuperDscError(format!(
                         "core-local LX tensor '{name}' addressed at offset {slice}B — each core's slice \
@@ -3894,8 +3954,18 @@ pub fn emit_sdsc(
             }
             clamped * v.df.word_length() as u64
         };
-        let (seg_base, intra_base) =
-            resolve_seg_base(layout, v.name, i, v.offset_elems, arg_bytes, v.df, {
+        // A core-local tensor's stick-plane window sits at that plane of each core's own slice.
+        let core_plane = layout
+            .filter(|l| l.lx_core_local(v.name))
+            .and_then(|_| stick_plane(op, v));
+        let (seg_base, intra_base) = resolve_seg_base(
+            layout,
+            v.name,
+            i,
+            core_plane.map_or(ViewOffset::Tensor(v.offset_elems), ViewOffset::CorePlane),
+            arg_bytes,
+            v.df,
+            {
                 // ⭐ A SUB-STICK OFFSET ON A COLLAPSED STICK DIM IS A LANE READ — the RedStick
                 // stride-0 fold reads ONE element per materialized row at `row_base + offset`
                 // (exx2's E[x²] pair slot at element 8, read by rmsnorm's `rmxn`), so the offset
@@ -3912,7 +3982,8 @@ pub fn emit_sdsc(
                 stick_collapsed
                     && v.offset_elems > 0
                     && !(v.offset_elems as u64).is_multiple_of(v.df.elems_per_stick() as u64)
-            })?;
+            },
+        )?;
         // ── arrangement authority ── record THIS view's device layout for its tensor. If an earlier op
         // addressed the same tensor NON-equivalently (a producer/consumer Dense-vs-stick disagreement, the
         // M>1 scramble), this is a build Err naming the tensor — not silent garbage on-card. Declare only

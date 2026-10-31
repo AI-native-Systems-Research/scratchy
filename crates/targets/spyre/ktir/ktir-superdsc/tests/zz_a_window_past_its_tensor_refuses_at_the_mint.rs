@@ -220,16 +220,27 @@ fn a_declared_synth_window_is_bounded_by_its_declaration() {
 #[test]
 fn a_core_local_lx_window_refuses_an_offset_and_op_local_is_bounded() {
     let layout = BundleLayout::default();
-    // CORE-LOCAL: every core's slice starts AT the pin, so a view into it has no offset to take.
+    // CORE-LOCAL: every core's slice starts AT the pin. The one view into it is a whole stick plane
+    // of its rows, which sits at that plane of every core's slice; any other offset — here one row of
+    // two — has no place in a core's slice.
     let core_id = PlaceId::Synth {
         of: 7,
         role: SynthRole::Qs,
     };
     layout.synth_lx_core_local(core_id, 256);
     let core_stk =
-        Stk::<RowBlockedTag>::new(core_id.to_string(), StickLayout::row_blocked(1, 128)).unwrap();
+        Stk::<RowBlockedTag>::new(core_id.to_string(), StickLayout::row_blocked(2, 128)).unwrap();
     layout
-        .win(&core_stk, DevOff::ZERO, 1, 128, "test: core-local at pin")
+        .win(&core_stk, DevOff::ZERO, 2, 128, "test: core-local at pin")
+        .unwrap();
+    layout
+        .win(
+            &core_stk,
+            DevOff::from_view_step(2 * 64),
+            2,
+            64,
+            "test: core-local second plane",
+        )
         .unwrap();
     let err = layout
         .win(
@@ -237,11 +248,11 @@ fn a_core_local_lx_window_refuses_an_offset_and_op_local_is_bounded() {
             DevOff::from_view_step(64),
             1,
             64,
-            "test: core-local offset",
+            "test: core-local row offset",
         )
         .unwrap_err();
-    assert!(err.contains("test: core-local offset"), "{err}");
-    assert!(err.contains("no offset to take"), "{err}");
+    assert!(err.contains("test: core-local row offset"), "{err}");
+    assert!(err.contains("only a whole stick plane"), "{err}");
     // OP-LOCAL: a pin that does not cover the handle's declared shape is the disagreement.
     let op_id = PlaceId::Synth {
         of: 7,
