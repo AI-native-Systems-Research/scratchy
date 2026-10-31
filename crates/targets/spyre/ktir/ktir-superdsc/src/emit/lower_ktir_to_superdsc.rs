@@ -7864,6 +7864,38 @@ mod elementwise_tests {
         }
     }
 
+    /// ⭐⭐ A HEAD-DIM-128 CONTRACTION'S QUERY SLICE WALKS THE QUERY'S OWN ROWS — granite-3.1-8b's
+    /// score leg: 8 kv heads, each an `[84, 128]` slice of the `[672, 128]` head-major query
+    /// contracted against its `[128, 64]` Kᵀ block. Left to `-1`, dxp strided the slice's second
+    /// stick by the op's 84 rows and read the next kv head's first stick. Pinned, the walk is the
+    /// query's `[672, 128]`. At head dim 64 (one stick) nothing moves: the walk stays `-1`.
+    #[test]
+    fn a_multi_stick_batch_slice_walks_its_tensors_rows() {
+        let walk = |hd: u32| {
+            let r = node(
+                reg(5, 672, hd, false),
+                reg(6, 8 * hd, 64, false),
+                reg(7, 672, 64, true),
+            );
+            let mut sym = 0i64;
+            let ops = batch_matmul("bmm_s3", 8, &r, &mut sym, None).expect("the score leg lowers");
+            assert_eq!(ops.len(), 8, "one contraction per kv head");
+            let sdsc = ops[1].op.as_ref().expect("an emitted descriptor");
+            let dsc = sdsc.dscs_[0].values().next().expect("one descriptor");
+            serde_json::to_value(&dsc.scheduleTree_[0].maxDimSizes_).expect("the walk serializes")
+        };
+        assert_eq!(
+            walk(128),
+            serde_json::json!([672, 128]),
+            "the query's own rows"
+        );
+        assert_eq!(
+            walk(64),
+            serde_json::json!([-1, -1]),
+            "one stick: byte-identical"
+        );
+    }
+
     /// ⭐⭐ AN INNER SPRAY IS ONE ROW-VECTOR BROADCAST — a decode batch's mask over its query-head
     /// group at granite-3.1-2b's 32-request rung: the walk's first `[256, 64]` chunk tile of a
     /// `[1024, 64]` mask stack, each row repeated 4 times down a `[1024, 64]` score tile. One flat
