@@ -4295,6 +4295,55 @@ mod walk_on_the_card {
         triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints")
     }
 
+    /// ⭐ THE SCRATCHPAD PLAN ON THE DECODE WALK — torch-spyre's LX planning: the carried output
+    /// accumulator lives in each core's LX across the whole walk (seeded before it, accumulated by
+    /// every trip, divided after it), while every tensor a per-kv-head contraction touches stays in
+    /// HBM, since each core gets a different slice of it there than the elementwise ops around it
+    /// give it.
+    #[test]
+    fn the_decode_walk_keeps_its_accumulator_in_lx() {
+        for hd in [64, 128] {
+            let node = walk_at(1, 4, hd);
+            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            let mut sym = 0i64;
+            let ops =
+                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                    .unwrap_or_else(|e| panic!("hd {hd}: the walk lowers: {}", e.message));
+            let lx = |name: &str| layout.lx_core_local(name);
+            let div = ops
+                .iter()
+                .find(|e| e.op_name.starts_with("realdiv"))
+                .expect("the output's division");
+            let acc = div.arg_bindings[0].buffer.as_str();
+            assert!(lx(acc), "hd {hd}: the accumulator {acc} is core-local");
+            let touching: Vec<_> = ops
+                .iter()
+                .filter(|e| e.arg_bindings.iter().any(|a| a.buffer == acc))
+                .collect();
+            assert!(
+                touching
+                    .iter()
+                    .any(|e| e.walk.is_none() && e.op_name.starts_with("fill")),
+                "hd {hd}: {acc} is seeded before the walk"
+            );
+            assert!(
+                touching.iter().any(|e| e.walk.is_some()),
+                "hd {hd}: {acc} is accumulated on every trip"
+            );
+            for e in ops.iter().filter(|e| e.op_name.starts_with("bmm")) {
+                for a in &e.arg_bindings {
+                    assert!(
+                        !lx(&a.buffer),
+                        "hd {hd}: {} reads {} — a per-kv-head contraction's tensors stay in HBM",
+                        e.op_name,
+                        a.buffer
+                    );
+                }
+            }
+        }
+    }
+
     /// `batched_decode_head_major` at granite's geometry over its 2048-page pool: `seqs` sequences
     /// walking `walk` blocks, at the chunking a decode batch rung states.
     fn batched_walk(seqs: u32, walk: u32) -> (KtirNode, BatchChunking) {

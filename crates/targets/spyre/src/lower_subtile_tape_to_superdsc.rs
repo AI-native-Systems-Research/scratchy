@@ -1557,6 +1557,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
         // decomposition declares an intermediate via `BundleLayout::synth_lx_op_local` (the
         // exx2 rmsnorm `rinv` stick) — every other bundle leaves it untouched.
         lx: Default::default(),
+        lx_planned: Default::default(),
+        lx_probe: Default::default(),
         arrangements: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         kv_request_stride_bytes,
         // ⛔ THE CLASS REGISTRIES, filled where their tables are placed above — the door resolves
@@ -6125,6 +6127,10 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // job is done at mint time (bundle-unique tids, above every placement). The baked artifact
         // carries the minted RESULTS (the synth placements above), not the minter.
         inter_cursor: _,
+        // EMIT-ONLY: the scratchpad plan's effect is the core-local pins it declared (in `lx` above,
+        // and in the compiled allocates); the plan itself and its probe log are spent at lowering.
+        lx_planned: _,
+        lx_probe: _,
     } = l;
 
     let mut places: Vec<bundle::Placement> = placements

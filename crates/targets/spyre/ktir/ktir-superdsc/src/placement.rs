@@ -294,6 +294,19 @@ pub struct BundleLayout {
     /// `&layout`-threaded emit can consult it by name.
     #[serde(skip)]
     pub lx: std::cell::RefCell<LxAlloc>,
+    /// ⭐ THE SCRATCHPAD PLAN — the intermediates [`crate::emit::lx_plan`] keeps in LX, core-locally,
+    /// by id and per-core bytes. [`Self::synth_df`] honours it: a planned id is declared through
+    /// [`Self::synth_lx_core_local`] instead of the HBM synth allocator, so the mint sites stay as
+    /// they are. Empty unless a plan ran.
+    #[serde(skip)]
+    pub lx_planned: std::cell::RefCell<std::collections::BTreeMap<PlaceId, u64>>,
+    /// ⭐ THE PLANNER'S PROBE — `Some` while [`crate::emit::lx_plan`] lowers a function on a copy of
+    /// this layout to learn how every op slices every tensor: each op's per-core slices land in the
+    /// log ([`LxTouch`]), and a pointwise op divides as it will once an operand of it is core-local
+    /// ([`Self::pointwise_core_local`]), so the slices the plan reads are the ones the real lowering
+    /// emits. `None` on every real lowering.
+    #[serde(skip)]
+    pub lx_probe: std::cell::RefCell<Option<Vec<LxTouch>>>,
     /// THE arrangement authority: `tensor name → its ONE device [`StickLayout`]`. The FIRST op to
     /// address a tensor declares its layout; every later op must address it EQUIVALENTLY
     /// ([`StickLayout::addr_eq`]) or `declare_arrangement` returns a build `Err` naming the tensor. A
@@ -423,6 +436,10 @@ pub struct LxAlloc {
     /// The work division the first op to touch each core-local tensor used, as a comparable
     /// signature ([`BundleLayout::record_lx_division`]). Every later op must match it.
     pub divisions: std::collections::BTreeMap<String, String>,
+    /// The WHOLE tensor's footprint for a core-local name the scratchpad plan declared
+    /// ([`BundleLayout::synth_df`]) — the shape the width laws read off an HBM synthetic's
+    /// [`SynthAlloc::sizes`], so a tensor's residency never changes the width an op sweeps it at.
+    pub full_sizes: std::collections::BTreeMap<String, u64>,
 }
 impl Default for LxAlloc {
     fn default() -> Self {
@@ -437,8 +454,34 @@ impl Default for LxAlloc {
             sizes: std::collections::BTreeMap::new(),
             core_local: std::collections::BTreeSet::new(),
             divisions: std::collections::BTreeMap::new(),
+            full_sizes: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// One op's touch of one tensor, as the planner's probe records it ([`BundleLayout::lx_probe`]): how
+/// the op hands the tensor out to its cores, or why it cannot share it core-locally at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LxTouch {
+    pub op: String,
+    pub tensor: String,
+    pub share: LxShare,
+}
+
+/// How one op slices one tensor across its cores — the planner's whole view of an op
+/// ([`crate::emit::lx_plan`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LxShare {
+    /// Core `c` holds `bytes` of the tensor starting at element `corners[c]` of its device layout —
+    /// the signature the core-local read law compares ([`BundleLayout::record_lx_division`]).
+    Slices { bytes: u64, corners: Vec<u64> },
+    /// The op walks the tensor a trip at a time, and a pin holds one slice.
+    TimeTiled,
+    /// The op reads the tensor's words as indices, or reads it through them.
+    Indirect,
+    /// The op views the tensor from an offset — part of it (torch-spyre's "partial/offset read"). A
+    /// core-local tensor's slices all start at its pin, so no view into it has an offset to take.
+    Partial,
 }
 
 /// ⭐⭐ THE ONE PIN-WINDOW BUDGET — the single place the window's arithmetic lives. Both
@@ -740,8 +783,44 @@ impl BundleLayout {
     /// or fp32-merge (4-byte / 32-stick) tensors. The footprint is reserved at the given [`Df`]'s true
     /// width, so a fp8 activation reserves HALF the fp16 bytes (the residency win) — not a name-suffix
     /// guess. `synth(name, dims)` is exactly `synth_df(name, dims, Df::Fp16)`.
+    ///
+    /// ⭐ A PLANNED id ([`Self::lx_planned`]) is declared core-local in LX instead, at its planned
+    /// per-core bytes: the scratchpad plan's one point of effect on the lowering.
     pub fn synth_df(&self, id: PlaceId, dims: &[u32], df: Df) {
-        self.synth_bytes(id, synth_footprint_bytes(dims, df));
+        let planned = self.lx_planned.borrow().get(&id).copied();
+        match planned {
+            Some(per_core_bytes) => {
+                self.synth_lx_core_local(id, per_core_bytes);
+                self.lx
+                    .borrow_mut()
+                    .full_sizes
+                    .insert(id.to_string(), synth_footprint_bytes(dims, df));
+            }
+            None => self.synth_bytes(id, synth_footprint_bytes(dims, df)),
+        }
+    }
+
+    /// The whole footprint of a core-local tensor the scratchpad plan declared ([`LxAlloc::full_sizes`]).
+    pub fn lx_full_size(&self, name: &str) -> Option<u64> {
+        self.lx.borrow().full_sizes.get(name).copied()
+    }
+
+    /// Whether a pointwise op over `names` (its output and inputs) divides as a core-local op does:
+    /// when one of them is core-local in LX, or while the planner's probe runs
+    /// ([`Self::lx_probe`]), which must see the division the op takes once one is.
+    pub fn pointwise_core_local<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> bool {
+        self.lx_probe.borrow().is_some() || names.into_iter().any(|n| self.lx_core_local(n))
+    }
+
+    /// Log one op's touch of one tensor while the planner's probe runs; a no-op otherwise.
+    pub fn note_lx_touch(&self, op: &str, tensor: &str, share: LxShare) {
+        if let Some(log) = self.lx_probe.borrow_mut().as_mut() {
+            log.push(LxTouch {
+                op: op.to_string(),
+                tensor: tensor.to_string(),
+                share,
+            });
+        }
     }
 
     /// Declare a SYNTHETIC intermediate LX-RESIDENT and OP-LOCAL at its FULL shape (`dims`,
