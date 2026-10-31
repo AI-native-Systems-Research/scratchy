@@ -295,11 +295,12 @@ pub struct BundleLayout {
     #[serde(skip)]
     pub lx: std::cell::RefCell<LxAlloc>,
     /// ⭐ THE SCRATCHPAD PLAN — the intermediates [`crate::emit::lx_plan`] keeps in LX, core-locally,
-    /// by id and per-core bytes. [`Self::synth_df`] honours it: a planned id is declared through
-    /// [`Self::synth_lx_core_local`] instead of the HBM synth allocator, so the mint sites stay as
-    /// they are. Empty unless a plan ran.
+    /// by id: each one's per-core bytes and the pin the plan placed it at ([`LxPin`]).
+    /// [`Self::synth_df`] honours it: a planned id is declared through [`Self::synth_lx_planned`]
+    /// instead of the HBM synth allocator, so the mint sites stay as they are. Empty unless a plan
+    /// ran.
     #[serde(skip)]
-    pub lx_planned: std::cell::RefCell<std::collections::BTreeMap<PlaceId, u64>>,
+    pub lx_planned: std::cell::RefCell<std::collections::BTreeMap<PlaceId, LxPin>>,
     /// ⭐ THE PLANNER'S PROBE — `Some` while [`crate::emit::lx_plan`] lowers a function on a copy of
     /// this layout to learn how every op slices every tensor: each op's per-core slices land in the
     /// log ([`LxTouch`]), and a pointwise op divides as it will once an operand of it is core-local
@@ -464,6 +465,15 @@ impl Default for LxAlloc {
             full_sizes: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// Where the scratchpad plan pins one tensor ([`BundleLayout::lx_planned`]): one core's slice of it,
+/// `per_core` bytes, at the LX byte address `at`, the same on every core. Two planned tensors live at
+/// disjoint times may share bytes, as torch-spyre's placement lets them ([`crate::emit::lx_plan`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LxPin {
+    pub per_core: u64,
+    pub at: u64,
 }
 
 /// How the scratchpad plan divides a walking program ([`BundleLayout::lx_division`]) — the two
@@ -835,12 +845,12 @@ impl BundleLayout {
     /// guess. `synth(name, dims)` is exactly `synth_df(name, dims, Df::Fp16)`.
     ///
     /// ⭐ A PLANNED id ([`Self::lx_planned`]) is declared core-local in LX instead, at its planned
-    /// per-core bytes: the scratchpad plan's one point of effect on the lowering.
+    /// pin: the scratchpad plan's one point of effect on the lowering.
     pub fn synth_df(&self, id: PlaceId, dims: &[u32], df: Df) {
         let planned = self.lx_planned.borrow().get(&id).copied();
         match planned {
-            Some(per_core_bytes) => {
-                self.synth_lx_core_local(id, per_core_bytes);
+            Some(pin) => {
+                self.synth_lx_planned(id, pin);
                 self.lx
                     .borrow_mut()
                     .full_sizes
@@ -984,6 +994,49 @@ impl BundleLayout {
         );
         a.next = o + fp;
         a.map.insert(name.clone(), o);
+        a.sizes.insert(name.clone(), fp);
+        a.core_local.insert(name);
+    }
+
+    /// Reserve `bytes` of the core-local pin window for one scratchpad plan and return where they
+    /// start: the plan places its tensors at offsets within them ([`LxPin::at`] is this base plus the
+    /// offset), and every pin declared after it lands past them.
+    ///
+    /// ⛔ PANICS past [`LX_PIN_END`], as [`Self::synth_lx_core_local`] does.
+    pub fn reserve_lx_plan(&self, bytes: u64) -> u64 {
+        let mut a = self.lx.borrow_mut();
+        let base = a.next;
+        assert!(
+            lx_window_fits(base + bytes - LX_PIN_BASE, a.op_local_bytes),
+            "a scratchpad plan of {bytes} B per core overflows the frontend's LX window at {base}, \
+             meeting the {} B of op-local slots already reserved against the {LX_PIN_END} boundary — \
+             the plan sized itself against the window it was handed (`lx_plan::plan`)",
+            a.op_local_bytes
+        );
+        a.next = base + bytes;
+        base
+    }
+
+    /// Declare a PLANNED tensor core-local at its pin ([`Self::lx_planned`]), inside the window the
+    /// plan reserved ([`Self::reserve_lx_plan`]) — the same declaration as
+    /// [`Self::synth_lx_core_local`], at the plan's address instead of the next free one. Idempotent
+    /// per name.
+    pub fn synth_lx_planned(&self, id: PlaceId, pin: LxPin) {
+        let name = id.to_string();
+        self.ids.borrow_mut().insert(name.clone(), id);
+        let mut a = self.lx.borrow_mut();
+        if a.map.contains_key(&name) {
+            return;
+        }
+        let fp = align128(pin.per_core.max(1));
+        assert!(
+            pin.at >= LX_PIN_BASE && pin.at + fp <= a.next,
+            "planned core-local LX tensor '{name}' pins at {} with a {fp}-byte slice, outside the \
+             window its plan reserved (below {})",
+            pin.at,
+            a.next
+        );
+        a.map.insert(name.clone(), pin.at);
         a.sizes.insert(name.clone(), fp);
         a.core_local.insert(name);
     }

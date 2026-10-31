@@ -15,10 +15,12 @@
 //! Here the same plan runs over the descriptors themselves. The function is lowered once on a copy
 //! of the layout with the probe on ([`BundleLayout::lx_probe`]), which logs how every op slices
 //! every tensor it names (the signature the core-local read law compares, `emit::core_slices`).
-//! A tensor this function minted is kept in LX when every op touching it hands each core the same
-//! bytes and none reads it through an index or a trip at a time, largest first while the pin window
-//! holds ([`crate::placement::lx_window_fits`]). The plan reaches the real lowering through one
-//! point, [`BundleLayout::synth_df`], and the read law re-checks every op against it there.
+//! A tensor this function minted is a candidate when every op touching it hands each core the same
+//! bytes and none reads it through an index or a trip at a time, and the candidates are placed as
+//! torch-spyre's greedy solver places them (`scratchpad/greedy_solver.py`): by lifetime, so two
+//! tensors live at disjoint times share bytes, in the window the pins leave
+//! ([`crate::placement::lx_window_fits`]). The plan reaches the real lowering through one point,
+//! [`BundleLayout::synth_df`], and the read law re-checks every op against it there.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -34,13 +36,26 @@ const PIN_ALIGN: u64 = 128;
 /// A node's mint record ([`KtirNode::minted`]), as one candidate's probe left it.
 type MintRecord = std::collections::HashMap<crate::ktir_node::MintKey, u32>;
 
-/// One tensor the plan may keep in LX: its id, one core's slice, and the HBM bytes it saves.
+/// One tensor the plan keeps in LX: its id, one core's slice, and where that slice sits in the
+/// plan's window (an offset into the bytes [`BundleLayout::reserve_lx_plan`] reserves).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Candidate {
     tid: u32,
     per_core: u64,
-    total: u64,
+    at: u64,
 }
+
+/// A tensor's lifetime over the function's ops in program order: from its first use to one past its
+/// last (torch-spyre's `LifetimeBoundBuffer::start_time` / `end_time`, `plan_solver.py`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Lifetime {
+    start: usize,
+    end: usize,
+}
+
+/// One op as the lifetimes read it: whether it is in the walk's body, and each tensor it names with
+/// whether it reads it.
+type OpUses<'a> = (bool, Vec<(&'a str, bool)>);
 
 /// Plan `node`'s function into `layout` ([`BundleLayout::lx_planned`], [`BundleLayout::lx_division`]).
 /// `probe` lowers the function into the layout it is handed; it runs on copies of `layout`, once per
@@ -51,8 +66,9 @@ struct Candidate {
 /// (`co_optimizing_lx_planning`): each candidate — the ops' own divisions, one row group per batch of
 /// the program's batched contractions (torch-spyre's decode trip, one kv head a core), and the
 /// program's per-head rows held query-row-major and split into chunks (its prompt trip,
-/// [`crate::placement::WalkDivision::HeadsInner`]) — is probed, and the one that keeps the most bytes
-/// in LX wins; a tie keeps the ops' own.
+/// [`crate::placement::WalkDivision::HeadsInner`]) — is probed, and the one that leaves the fewest of
+/// its minted bytes in HBM wins (torch-spyre's `score_leaf`, `exhaustive_search.py`: the whole
+/// footprint of every buffer the placement does not pin); a tie keeps the ops' own.
 ///
 /// ⭐ ONCE PER PROGRAM. A program already planned into this layout ([`KtirNode::lx_plan`], its
 /// pinned tensors still planned here) lowers under that plan again, with the tensors it minted: a card
@@ -93,6 +109,16 @@ pub(crate) fn plan(
             .clone()
     };
     let mut best: Option<(u64, Option<WalkDivision>, Vec<Candidate>, MintRecord)> = None;
+    // A minted tensor's whole footprint, wherever the probe declared it.
+    let footprint = |l: &BundleLayout, name: &str| -> u64 {
+        l.synth
+            .borrow()
+            .sizes
+            .get(name)
+            .or(l.lx.borrow().full_sizes.get(name))
+            .copied()
+            .unwrap_or(0)
+    };
     let candidates = batch_groups(node)
         .into_iter()
         .map(WalkDivision::Batches)
@@ -108,13 +134,22 @@ pub(crate) fn plan(
         *copy.lx_probe.borrow_mut() = Some(Vec::new());
         // A division the program cannot take — a form that refuses its shape — is no candidate, as
         // torch-spyre's search drops an illegal split; the ops' own division must lower.
-        match probe(&copy) {
-            Ok(_) => {}
+        let ops = match probe(&copy) {
+            Ok(ops) => ops,
             Err(_) if groups.is_some() => continue,
             Err(e) => return Err(e),
-        }
+        };
         let touches = copy.lx_probe.borrow_mut().take().unwrap_or_default();
-        let chosen = choose(&touches, &minted(), free);
+        let life = lifetimes(ops.iter().map(|e| {
+            (
+                e.walk.is_some(),
+                e.arg_bindings
+                    .iter()
+                    .map(|a| (a.buffer.as_str(), a.is_input))
+                    .collect(),
+            )
+        }));
+        let chosen = choose(&touches, &minted(), &life, free);
         // A form that needs a tensor core-local takes this division only if the plan keeps it there.
         let kept_names: BTreeSet<String> = chosen
             .iter()
@@ -126,9 +161,14 @@ pub(crate) fn plan(
         {
             continue;
         }
-        let kept: u64 = chosen.iter().map(|c| c.total).sum();
-        if best.as_ref().is_none_or(|(b, ..)| kept > *b) {
-            best = Some((kept, groups, chosen, record()));
+        let in_hbm: u64 = minted()
+            .into_iter()
+            .map(crate::place::act_name)
+            .filter(|name| !kept_names.contains(name))
+            .map(|name| footprint(&copy, &name))
+            .sum();
+        if best.as_ref().is_none_or(|(b, ..)| in_hbm < *b) {
+            best = Some((in_hbm, groups, chosen, record()));
         }
     }
     let (_, groups, chosen, minted_under) = best.unwrap_or_default();
@@ -137,11 +177,24 @@ pub(crate) fn plan(
     *node.minted.lock().unwrap_or_else(|p| p.into_inner()) = minted_under;
     layout.lx_division.set(groups);
     let pinned: Vec<PlaceId> = chosen.iter().map(|c| PlaceId::Act(c.tid)).collect();
-    layout.lx_planned.borrow_mut().extend(
-        chosen
-            .into_iter()
-            .map(|c| (PlaceId::Act(c.tid), c.per_core)),
-    );
+    let reach = chosen
+        .iter()
+        .map(|c| c.at + pin_bytes(c.per_core))
+        .max()
+        .unwrap_or(0);
+    let base = layout.reserve_lx_plan(reach);
+    layout
+        .lx_planned
+        .borrow_mut()
+        .extend(chosen.into_iter().map(|c| {
+            (
+                PlaceId::Act(c.tid),
+                crate::placement::LxPin {
+                    per_core: c.per_core,
+                    at: base + c.at,
+                },
+            )
+        }));
     *node.lx_plan.lock().unwrap_or_else(|p| p.into_inner()) = Some(crate::ktir_node::WalkPlan {
         division: groups,
         pinned,
@@ -213,10 +266,62 @@ pub(crate) fn check(layout: &BundleLayout, what: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// One core's slice of a tensor as a pin holds it: whole 128-byte units.
+fn pin_bytes(per_core: u64) -> u64 {
+    per_core.max(1).div_ceil(PIN_ALIGN) * PIN_ALIGN
+}
+
+/// torch-spyre's liveness (`calculate_liveness`) over the probe's ops in program order, widened as
+/// `counted_loop_lifetime_overrides` widens it (`scratchpad/utils.py:139`): the walk's body is ONE
+/// textual copy of every trip, so a tensor born outside the body (or never written) and read inside
+/// it is live for the body's whole span — the next trip reads it again after the body's last op —
+/// while a tensor the body itself writes keeps its own lifetime in each trip.
+fn lifetimes<'a>(ops: impl IntoIterator<Item = OpUses<'a>>) -> BTreeMap<&'a str, Lifetime> {
+    let ops: Vec<OpUses<'a>> = ops.into_iter().collect();
+    let mut life: BTreeMap<&str, Lifetime> = BTreeMap::new();
+    let mut born_in_body: BTreeMap<&str, bool> = BTreeMap::new();
+    for (i, (in_body, uses)) in ops.iter().enumerate() {
+        // Where a tensor is born: the first op that writes it, an op's writes before its reads; a
+        // tensor read before anything writes it is born outside every loop.
+        for &(name, _) in uses.iter().filter(|&&(_, read)| !read) {
+            born_in_body.entry(name).or_insert(*in_body);
+        }
+        for &(name, _) in uses.iter().filter(|&&(_, read)| read) {
+            born_in_body.entry(name).or_insert(false);
+        }
+        for &(name, _) in uses {
+            life.entry(name)
+                .and_modify(|l| l.end = i + 1)
+                .or_insert(Lifetime {
+                    start: i,
+                    end: i + 1,
+                });
+        }
+    }
+    let body: Vec<usize> = (0..ops.len()).filter(|&i| ops[i].0).collect();
+    if let (Some(&first), Some(&last)) = (body.first(), body.last()) {
+        for &i in &body {
+            for &(name, read) in &ops[i].1 {
+                if read && !born_in_body.get(name).copied().unwrap_or(false) {
+                    let l = life.get_mut(name).expect("a named tensor has a lifetime");
+                    l.start = l.start.min(first);
+                    l.end = l.end.max(last + 1);
+                }
+            }
+        }
+    }
+    life
+}
+
 /// torch-spyre's residency verdict and placement over the probe's log: a minted tensor every op
-/// hands out identically is a candidate, and candidates are pinned largest first (the HBM bytes they
-/// save) while their slices fit `free` bytes of the pin window.
-fn choose(touches: &[LxTouch], minted: &BTreeSet<u32>, free: u64) -> Vec<Candidate> {
+/// hands out identically is a candidate, its slice as far as any op reads it; and the candidates are
+/// placed by [`place`] in `free` bytes of the pin window.
+fn choose(
+    touches: &[LxTouch],
+    minted: &BTreeSet<u32>,
+    life: &BTreeMap<&str, Lifetime>,
+    free: u64,
+) -> Vec<Candidate> {
     let mut by_tensor: BTreeMap<&str, Vec<&LxShare>> = BTreeMap::new();
     for t in touches.iter().filter(|t| t.share != LxShare::Required) {
         by_tensor
@@ -224,11 +329,12 @@ fn choose(touches: &[LxTouch], minted: &BTreeSet<u32>, free: u64) -> Vec<Candida
             .or_default()
             .push(&t.share);
     }
-    let mut candidates: Vec<Candidate> = minted
+    let candidates: Vec<(u32, u64, Lifetime)> = minted
         .iter()
         .filter_map(|&tid| {
             let name = crate::place::act_name(tid);
             let shares = by_tensor.get(name.as_str())?;
+            let lifetime = *life.get(name.as_str())?;
             let LxShare::Slices { corners, .. } = shares.first()? else {
                 return None;
             };
@@ -244,26 +350,83 @@ fn choose(touches: &[LxTouch], minted: &BTreeSet<u32>, free: u64) -> Vec<Candida
                     }
                     _ => false,
                 })
-                .then(|| Candidate {
-                    tid,
-                    per_core,
-                    total: per_core * corners.len() as u64,
-                })
+                .then_some((tid, per_core, lifetime))
         })
         .collect();
-    candidates.sort_by(|a, b| b.total.cmp(&a.total).then(a.tid.cmp(&b.tid)));
-    let mut left = free;
-    candidates
-        .into_iter()
-        .filter(|c| {
-            let fp = c.per_core.max(1).div_ceil(PIN_ALIGN) * PIN_ALIGN;
-            let fits = fp <= left;
-            if fits {
-                left -= fp;
+    place(&candidates, free)
+}
+
+/// torch-spyre's greedy placement (`GreedyLayoutSolver.plan_layout`, `greedy_solver.py`) of each
+/// candidate's slice in `limit` bytes. Time walks the candidates' starts and ends in order; at each
+/// tick the tensors whose lifetime ends there free their bytes first, then each one whose lifetime
+/// starts there takes the lowest address that holds it ([`free_block`]). One that finds none stays in
+/// HBM.
+fn place(candidates: &[(u32, u64, Lifetime)], limit: u64) -> Vec<Candidate> {
+    let ticks: BTreeSet<usize> = candidates
+        .iter()
+        .flat_map(|&(_, _, l)| [l.start, l.end])
+        .collect();
+    // (address, pin bytes, end) of each tensor placed and still live.
+    let mut live: Vec<(u64, u64, usize)> = Vec::new();
+    let mut placed = Vec::new();
+    for t in ticks {
+        live.retain(|&(_, _, end)| end != t);
+        for &(tid, per_core, _) in candidates.iter().filter(|&&(_, _, l)| l.start == t) {
+            let size = pin_bytes(per_core);
+            if let Some(at) = free_block(&live, size, limit) {
+                live.push((at, size, candidates_end(candidates, tid)));
+                placed.push(Candidate { tid, per_core, at });
             }
-            fits
-        })
-        .collect()
+        }
+    }
+    placed
+}
+
+/// The end of candidate `tid`'s lifetime.
+fn candidates_end(candidates: &[(u32, u64, Lifetime)], tid: u32) -> usize {
+    candidates
+        .iter()
+        .find(|&&(t, _, _)| t == tid)
+        .map_or(0, |&(_, _, l)| l.end)
+}
+
+/// torch-spyre's `_find_free_block`: the lowest address `size` bytes fit at among the `live`
+/// placements in `limit` bytes — address 0 when nothing is live or the lowest live tensor starts at
+/// least `size` in, else the 128-byte boundary above every live tensor, else the first gap between
+/// them that holds it.
+fn free_block(live: &[(u64, u64, usize)], size: u64, limit: u64) -> Option<u64> {
+    if limit < size {
+        return None;
+    }
+    let lowest = live.iter().map(|&(at, _, _)| at).min();
+    if lowest.is_none_or(|lo| lo >= size) {
+        return Some(0);
+    }
+    let highest = live
+        .iter()
+        .map(|&(at, bytes, _)| at + bytes)
+        .max()
+        .unwrap_or(0);
+    let above = highest.div_ceil(PIN_ALIGN) * PIN_ALIGN;
+    if above + size <= limit {
+        return Some(above);
+    }
+    let mut spans: Vec<(u64, u64)> = live
+        .iter()
+        .map(|&(at, bytes, _)| (at, at + bytes))
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (lo, hi) in spans {
+        match merged.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    merged.windows(2).find_map(|w| {
+        let from = w[0].1.div_ceil(PIN_ALIGN) * PIN_ALIGN;
+        (w[1].0 >= from + size).then_some(from)
+    })
 }
 
 #[cfg(test)]
@@ -285,6 +448,14 @@ mod tests {
         }
     }
 
+    /// Every tensor live over the whole log.
+    fn all_live<'a>(names: &[&'a str]) -> BTreeMap<&'a str, Lifetime> {
+        names
+            .iter()
+            .map(|&n| (n, Lifetime { start: 0, end: 1 }))
+            .collect()
+    }
+
     /// ⭐ torch-spyre's verdicts, one tensor each: kept when every op starts each core's slice alike
     /// (one op reading only a stick plane of it reaches less far, and the slice is sized by the
     /// furthest reach); spilled on a division mismatch, an indirect read, a trip-at-a-time walk, or
@@ -304,7 +475,8 @@ mod tests {
             touch("add", "t14", even.clone()),
         ];
         let minted: BTreeSet<u32> = [10, 11, 12, 13].into();
-        let kept = choose(&log, &minted, 1 << 20);
+        let life = all_live(&["t10", "t11", "t12", "t13", "t14"]);
+        let kept = choose(&log, &minted, &life, 1 << 20);
         assert_eq!(
             kept.iter().map(|c| (c.tid, c.per_core)).collect::<Vec<_>>(),
             [(10, 128)],
@@ -312,23 +484,66 @@ mod tests {
         );
     }
 
-    /// The window is spent on the largest tensors first, and a slice that no longer fits spills.
+    /// ⭐ torch-spyre's greedy placement: tensors live at disjoint times share bytes — t3 arrives as t1
+    /// leaves and takes its slot — and one that arrives with the window full stays in HBM.
     #[test]
-    fn the_largest_tensors_take_the_window_first() {
-        let log = [
-            touch("a", "t1", slices(256, &[0, 128])),
-            touch("b", "t2", slices(1024, &[0, 512])),
-            touch("c", "t3", slices(512, &[0, 256])),
-        ];
-        let minted: BTreeSet<u32> = [1, 2, 3].into();
-        let kept: Vec<u32> = choose(&log, &minted, 1024 + 256)
-            .iter()
-            .map(|c| c.tid)
-            .collect();
-        assert_eq!(
-            kept,
-            [2, 1],
-            "t2 first; t3's 512 no longer fits, t1's 256 does"
+    fn tensors_live_at_disjoint_times_share_the_window() {
+        let at = |start, end| Lifetime { start, end };
+        let placed = place(
+            &[
+                (1, 512, at(0, 2)),
+                (2, 512, at(1, 3)),
+                (3, 512, at(2, 4)),
+                (4, 512, at(2, 3)),
+            ],
+            1024,
         );
+        assert_eq!(
+            placed.iter().map(|c| (c.tid, c.at)).collect::<Vec<_>>(),
+            [(1, 0), (2, 512), (3, 0)],
+            "t1 at 0 and t2 above it; at tick 2 t1 has left, so t3 takes 0 and t4 finds no room"
+        );
+    }
+
+    /// The first gap that holds a tensor takes it, at a 128-byte boundary, once the top is full.
+    #[test]
+    fn a_tensor_takes_the_first_gap_that_holds_it() {
+        let live = [(0, 256, 9), (512, 128, 9), (768, 256, 9)];
+        assert_eq!(free_block(&live, 256, 1024), Some(256), "the gap 256..512");
+        assert_eq!(free_block(&live, 384, 1024), None, "no gap holds 384");
+        assert_eq!(free_block(&[], 2048, 1024), None, "past the limit");
+    }
+
+    /// ⭐ torch-spyre's counted-loop widening: a tensor born before the walk and read inside it lives
+    /// through the whole body (the next trip reads it again), a tensor the body writes keeps its own
+    /// lifetime, and one read only after the walk is not widened.
+    #[test]
+    fn a_tensor_read_by_the_walk_lives_through_the_whole_body() {
+        let ops: Vec<OpUses<'_>> = vec![
+            (false, vec![("acc", false)]),
+            (false, vec![("q", false)]),
+            (true, vec![("q", true), ("s", false)]),
+            (true, vec![("s", true), ("p", false)]),
+            (true, vec![("p", true), ("acc", true), ("acc", false)]),
+            (false, vec![("acc", true), ("out", false)]),
+        ];
+        let life = lifetimes(ops);
+        let span = |n: &str| {
+            let l = life[n];
+            (l.start, l.end)
+        };
+        assert_eq!(
+            span("q"),
+            (1, 5),
+            "q: born before the body, read in it — through its end"
+        );
+        assert_eq!(span("s"), (2, 4), "s: the body's own");
+        assert_eq!(span("p"), (3, 5), "p: the body's own");
+        assert_eq!(
+            span("acc"),
+            (0, 6),
+            "acc: seeded before the body, carried through it"
+        );
+        assert_eq!(span("out"), (5, 6), "out: after the walk");
     }
 }
