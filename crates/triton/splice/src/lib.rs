@@ -4838,13 +4838,13 @@ mod walk_on_the_card {
     /// expanded once per query head of its group (read by every core at one start, from HBM), the
     /// mask added a stick plane at a time sprayed over each query row's heads in place, and the
     /// scores, the softmax and the carried state all in each core's LX. The trip's ops do not grow
-    /// with the rows: 27 at head dim 64, and 49 at 128, whose pages are still gathered in pieces and
-    /// re-laid on the trip (16 permutes). At 512 rows every value still fits, because a pin is held
+    /// with the rows: 23 at either head dim, each page gathered in one op (the reference's trip is
+    /// 21). At 512 rows every value still fits, because a pin is held
     /// for its value's lifetime rather than the walk's (torch-spyre's placement), so values the trip
     /// is done with hand their bytes to the next.
     #[test]
     fn the_prompt_trip_splits_its_query_rows_across_the_cores_in_lx() {
-        for (mq, hd, trip) in [(128, 64, 27), (512, 64, 27), (128, 128, 49), (512, 128, 49)] {
+        for (mq, hd, trip) in [(128, 64, 23), (512, 64, 23), (128, 128, 23), (512, 128, 23)] {
             let blocks = 4;
             let node = walk_at(mq, blocks, hd);
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
@@ -4961,11 +4961,11 @@ mod walk_on_the_card {
     /// rows into the stick-major `[64·32, 128]`, row `p·32 + h`, two whole-tensor permutes — and the
     /// output back after it, so each contraction is ONE op over every query head, its kernel the kv
     /// head's block expanded once per query head of its group, and nothing re-lays a head on a trip.
-    /// A page (8 kv heads × [`PAGE_SLOTS`] slots × 128) is past dxp's 64 KB entry bound, so the body
-    /// gathers it in 64 KB pieces through its page id doubled once per halving, piece `p` read and
-    /// landed `p · 64 KB` in.
+    /// Each page (8 kv heads × [`PAGE_SLOTS`] slots × 128, 256 KB) is gathered in ONE op, as the
+    /// reference's compiled prefill gathers it (`sdsc_4` / `sdsc_5`): its one entry the page, every kv
+    /// head's block landed stick-major — no pieces, no scaled page id, no permute on the trip.
     #[test]
-    fn a_two_stick_head_prompt_walk_relays_its_heads_and_gathers_pages_in_pieces() {
+    fn a_two_stick_head_prompt_walk_relays_its_heads_and_gathers_each_page_in_one_op() {
         let node = walk_at(64, 4, 128);
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
         allocate_paged_cache(&node, &layout).expect("the cache allocates");
@@ -5038,45 +5038,30 @@ mod walk_on_the_card {
                 e.op_name
             );
         }
-        let piece = 64 * 1024 / 2;
-        let pieces = 8 * PAGE_SLOTS * 128 / piece;
-        assert!(
-            named(&format!("gather{pieces}_o")).is_empty(),
-            "{pieces} pieces"
-        );
-        for d in (0..pieces).map(|p| named(&format!("gather{p}_o"))) {
-            assert_eq!(d.len(), 2, "the K page and the V page");
-            for i in d {
-                let e = &ops[i];
-                let p: u32 = e.op_name["gather".len()..e.op_name.len()]
-                    .split('_')
-                    .next()
-                    .and_then(|x| x.parse().ok())
-                    .expect("a piece index");
-                assert!(
-                    e.walk.is_some(),
-                    "{}: a page piece is in the body",
-                    e.op_name
-                );
-                let landed = e
-                    .arg_bindings
-                    .iter()
-                    .find(|x| !x.is_input)
-                    .expect("the landing")
-                    .offset_elems;
-                assert_eq!(landed, p * piece, "{}", e.op_name);
-            }
+        let pages: Vec<usize> = named("gather_o")
+            .into_iter()
+            .filter(|&i| ops[i].walk.is_some())
+            .collect();
+        assert_eq!(pages.len(), 2, "the K page and the V page, one op each");
+        for &i in &pages {
+            let e = &ops[i];
+            let split = serde_json::to_value(e.op.as_ref().expect("a descriptor"))
+                .expect("json")["numWkSlicesPerDim_"]
+                .clone();
+            assert_eq!(
+                split,
+                serde_json::json!({"mb": 1, "y": 1, "x": 1, "out": 1}),
+                "{}: the whole page on one core, as the reference's",
+                e.op_name
+            );
         }
-        let doubled = named("addi32toi32");
-        assert_eq!(
-            doubled.len() as u32,
-            2 * pieces.trailing_zeros(),
-            "each page's id doubled once per halving"
-        );
-        assert!(
-            doubled.iter().all(|&i| ops[i].walk.is_some()),
-            "per trip, in the body"
-        );
+        for e in ops.iter().filter(|e| e.walk.is_some()) {
+            assert!(
+                !e.op_name.starts_with("addi32toi32") && !e.op_name.starts_with("permute"),
+                "{}: nothing scales a page id or re-lays a page on the trip",
+                e.op_name
+            );
+        }
     }
 
     /// ⛔ A PAGE IN BLOCKS IS READ ONLY AS BLOCKS. Read `[KV, BLOCK, 128]`, a page lands as its kv

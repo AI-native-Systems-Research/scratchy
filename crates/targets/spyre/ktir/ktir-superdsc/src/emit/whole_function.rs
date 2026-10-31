@@ -4615,6 +4615,54 @@ fn lower_function_folded(
                         }
                         None => g,
                     };
+                    // ⭐ A PAGE OF BLOCKS IN ONE ENTRY, IN ONE OP — torch-spyre's prompt-trip page
+                    // gather: the entry selects the page, its kv heads' blocks are read inside the op,
+                    // and each lands stick-major, one after another — so no piece, no scaled index and
+                    // no permute follows.
+                    if g.entries == 1
+                        && let &[b, r, c] = to.as_slice()
+                        && b > 1
+                        && c % stick == 0
+                    {
+                        let (b, r, c) = (b as u32, r as u32, c as u32);
+                        let tid = mint_inter(k, layout, floor, res);
+                        let dst = stick_major_region(tid, b * r, c / stick as u32, layout);
+                        out.push(
+                            crate::ir::bridge::tiled_op_sdsc_op::assemble_page_gather_page(
+                                &format!("gather_o{tid}"),
+                                &crate::place::act_name(g.value_tid),
+                                &dst.name(),
+                                crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                                    crate::place::act_name(g.index_tid),
+                                    crate::superdsc_opspec::PageExtent::of_positions(1),
+                                    g.first_entry,
+                                ),
+                                crate::ir::bridge::tiled_op_sdsc_op::PageOfBlocks {
+                                    blocks: b,
+                                    rows: r,
+                                    cols: c,
+                                },
+                                sym_id_base,
+                                Some(layout),
+                            )
+                            .map_err(|message| Error {
+                                message: format!("{}: {message}", f.name),
+                            })?,
+                        );
+                        gather_carried[gi] = true;
+                        // A block one stick wide is the flat frame's own bytes.
+                        if c > stick as u32 {
+                            batch_blocks.insert(tid, c);
+                        }
+                        inter.insert(
+                            res,
+                            Region {
+                                is_out: false,
+                                ..dst
+                            },
+                        );
+                        continue;
+                    }
                     // ⭐ AN ENTRY PAST dxp's CHUNK BOUND is copied in pieces through its index
                     // scaled by the piece count — doubled, `addi32toi32(x, x)`, into a scratch
                     // stick, so no constant is placed (the walk's body reads none).
