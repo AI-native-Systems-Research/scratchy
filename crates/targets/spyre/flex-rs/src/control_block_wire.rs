@@ -1839,6 +1839,12 @@ impl ControlBlockWire {
                 dest_remote_base_bytes: compensated_remote_base(window.dmva),
                 first: place.first,
                 last: place.last,
+                // ⛔ EVERY MESSAGE UNSYNCED, AND THAT IS THE PAIRING'S LAW: each F-send increments
+                // the peer's write-done count on landing (measured on card — #1009 review, item
+                // 2), and the pipeline waits once per message (`TpSend::messages`). The order
+                // between a send and its producer is the CTRL barrier's (`pipeline_barrier`), not
+                // this bit. The vendor's windowed loop is not in this tree to read its `SetSync`
+                // from; this is the one site to change if the card says otherwise.
                 sync: false,
                 xsegv: false,
             })
