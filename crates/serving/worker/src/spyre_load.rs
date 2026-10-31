@@ -2317,6 +2317,15 @@ impl SpyreWorker {
                     &spill_tids,
                 )
                 .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
+                // ⭐ THE PEER'S LANDING SLOTS, POINTED AT THE WINDOW THIS OWNER JUST ALLOCATED. The
+                // window is a placement in the weight segment every other session aliases, and its
+                // device address exists only now; a world of one has no peer and this is a no-op.
+                // Done during load, so before this rank reports ready and before any step sends.
+                ss.point_landing_slots().map_err(|e| {
+                    werr(format!(
+                        "pointing the peer's landing slots at the receive window: {e}"
+                    ))
+                })?;
                 // ⭐ THE SPILLED WEIGHT TAIL'S DEVICE IMAGE, read back from the OWNER once its
                 // prepare has staged and uploaded it. Every borrowing session gets a copy of this
                 // (see `adopt_from_owner`) because the slot it lives in cannot be aliased. Empty —

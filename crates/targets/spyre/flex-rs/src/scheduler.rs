@@ -1352,10 +1352,45 @@ pub struct RdmaSendParams {
     pub place: RunPlace,
 }
 
-/// Build the F-send CB for `send`. Each endpoint's segment translates through ITS BASE exactly as
-/// [`build_compute_cb`] translates a tensor operand (the allocation's absolute address, the
-/// allocation's own size), so a send and the compute launch it is aimed from read one segment
-/// through one translation.
+/// ⭐ WHERE BYTES LAND ON A CARD: `end`'s first byte as a flat device VA in the ALLOCATOR's space —
+/// the segment of the region that backs `end.base` and the byte offset inside that region
+/// ([`ResolvedChunk::dmva`]), i.e. `((segment << 27) | (offset >> 7)) << 7`, the destination the
+/// tp37 cell composes for its buffer and lands at. ONE compose for both of a landing's halves: the
+/// send's xseg word (which must name its true destination) and the receiver's `XSEG[sid]` entry
+/// (which decides where it lands).
+///
+/// ⛔ NOT `end.segment`. A program segment means something only through a control block's own
+/// translation table, and a landing has no control block on the receiving card: `(program seg 1,
+/// layout offset)` names whatever the allocator placed at that address, not this allocation.
+///
+/// # Errors
+/// `length` bytes past the allocation, or an interleaved or unresolvable allocation.
+pub fn landing_va_bytes(
+    resolver: &dyn DeviceAddressResolver,
+    end: &RdmaOperand,
+    length: u64,
+) -> Result<u64, SchedulerError> {
+    let size = end.base.total_size().as_u64();
+    if end.offset + length > size {
+        return Err(mock_error(&format!(
+            "landing_va_bytes: the window [{}, {}) of segment {} runs past its {size} B allocation",
+            end.offset,
+            end.offset + length,
+            end.segment,
+        )));
+    }
+    let resolved = resolve_single_chunk(resolver, &end.base)?;
+    Ok(Flits(resolved.dmva(end.offset).value()).to_bytes())
+}
+
+/// Build ONE message's F-send CB for a CB stream that runs it beside the compute feeding it: the
+/// per-chunk CB of [`PfBackend::submit_p2p_rdma_send`] — the #1008 door's words
+/// (`hal_sbf::rdma12_unicast_send`: `sync` set, `xsegv` clear, the L4 one-flit compensation on the
+/// destination) placed by [`ControlBlockWire::p2p_rdma_send`] — with the source segment translated
+/// exactly as [`build_compute_cb`] translates a tensor operand (the allocation's absolute address,
+/// the allocation's own size), and the CTRL barrier set when `pipeline_barrier`. The destination is
+/// this card's own window allocation as the allocator places it ([`landing_va_bytes`]) — the peer's
+/// sits at the same address, the two cards allocating one sequence.
 ///
 /// # Errors
 /// An endpoint whose transfer runs past its allocation (a window too small for the payload, or a
@@ -1366,36 +1401,46 @@ pub fn build_rdma_send_cb(
     tag: ResponseTag,
     pipeline_barrier: bool,
 ) -> Result<ControlBlockWire, SchedulerError> {
-    let endpoint = |which: &str, o: &RdmaOperand| -> Result<RdmaEndpoint, SchedulerError> {
-        let resolved = resolve_single_chunk(resolver, &o.base)?;
-        let size = o.base.total_size().as_u64();
-        if o.offset + send.length.0 > size {
-            return Err(mock_error(&format!(
-                "build_rdma_send_cb: the {which} [{}, {}) of segment {} runs past its {size} B \
-                 allocation",
-                o.offset,
-                o.offset + send.length.0,
-                o.segment,
-            )));
-        }
-        Ok(RdmaEndpoint {
-            dmva: VirtualAddressSbf::new(o.segment, Flits::from_bytes(o.offset)),
-            xlat: XlatWindow {
-                region_paddr: resolved.xlat_absolute(),
-                length: SegmentExtent(size),
-            },
-        })
-    };
-    let wire = RdmaUnicastSend {
-        sid: send.sid,
-        dest_tid: send.dest_tid,
-        length: send.length,
-        source: endpoint("source", &send.source)?,
-        window: endpoint("window", &send.window)?,
-        place: send.place,
-    };
-    ControlBlockWire::rdma_unicast_send(tag, &wire, pipeline_barrier)
-        .map_err(|e| mock_error(&format!("build_rdma_send_cb: {e:?}")))
+    let size = send.source.base.total_size().as_u64();
+    if send.source.offset + send.length.0 > size {
+        return Err(mock_error(&format!(
+            "build_rdma_send_cb: the source [{}, {}) of segment {} runs past its {size} B \
+             allocation",
+            send.source.offset,
+            send.source.offset + send.length.0,
+            send.source.segment,
+        )));
+    }
+    let window = landing_va_bytes(resolver, &send.window, send.length.0)?;
+    let source = resolve_single_chunk(resolver, &send.source.base)?;
+    let dest_tids = [u64::from(send.dest_tid)];
+    let words = crate::hal_sbf::rdma12_unicast_send(&crate::senlib_ffi::Rdma12UnicastSendParams {
+        sid: u64::from(send.sid),
+        dest_tids: &dest_tids,
+        length_bytes: send.length.0,
+        src_segment: u64::from(send.source.segment),
+        src_offset_bytes: send.source.offset,
+        // ⭐ L4, as `submit_p2p_rdma_send` compensates it: the engine lands one flit below.
+        dest_remote_base_bytes: window + Flits::BYTES,
+        first: send.place.first,
+        last: send.place.last,
+        sync: true,
+        xsegv: false,
+    })
+    .map_err(|e| mock_error(&format!("build_rdma_send_cb: the send door refused — {e}")))?;
+    let cb = ControlBlockWire::p2p_rdma_send(
+        tag,
+        words,
+        u32::from(send.source.segment),
+        source.xlat_absolute(),
+        SegmentExtent(send.source.base.total_size().as_u64()),
+    )
+    .map_err(|e| mock_error(&format!("build_rdma_send_cb: xlat — {e:?}")))?;
+    Ok(if pipeline_barrier {
+        cb.with_ctrl_barrier()
+    } else {
+        cb
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -6342,6 +6387,38 @@ mod resolve_single_chunk_tests {
         fn resolve(&self, _chunk: &Chunk) -> Option<(u8, DevicePhysicalAddress, ByteSize)> {
             Some((self.segment, self.base, self.region_size))
         }
+    }
+
+    /// A landing is the allocator's address of the bytes — the REGION's segment and the offset
+    /// inside the region (the allocation's own offset plus the landing's) — never the program
+    /// segment the operand names; and a landing past its allocation refuses by name.
+    #[test]
+    fn a_landing_is_the_allocators_address_not_the_programs() {
+        let resolver = FixedResolver {
+            segment: 5,
+            base: DevicePhysicalAddress(0x1_0000_0000),
+            region_size: crate::address::ByteSize(1 << 30),
+        };
+        let window = RdmaOperand {
+            base: Arc::new(CompositeAddress::from_chunk(Chunk::new(
+                LogicalAddress::new(RegionId(1), ByteOffset(1 << 20)),
+                crate::address::ByteSize(1 << 22),
+                DomainId(0),
+            ))),
+            segment: 1,
+            offset: 8192,
+        };
+        let va = landing_va_bytes(&resolver, &window, 4096).unwrap();
+        assert_eq!(va, ((5u64 << 27) | (((1 << 20) + 8192) >> 7)) << 7);
+        assert_ne!(
+            va,
+            ((1u64 << 27) | (8192 >> 7)) << 7,
+            "not (program seg 1, layout offset)"
+        );
+        let why = landing_va_bytes(&resolver, &window, 1 << 22)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("runs past its 4194304 B allocation"), "{why}");
     }
 
     /// A send whose payload would run past the window's allocation is refused while it is still
