@@ -75,11 +75,35 @@ fn runtime_cell() -> &'static Mutex<Option<RuntimeInit>> {
 /// asked the topology which domain is real, and this module does not invent a multi-domain
 /// topology query that has no call site anywhere else.
 fn build_runtime() -> Result<Arc<RuntimeContext>, BringUpError> {
-    // A `CardIndex` is a `u16`, so it always fits the shim's `i32`.
-    let card = driven_card().get() as i32;
-    let rc = unsafe { flex_rs::senlib_ffi::flex_shim_init_runtime(card) };
-    if rc != 0 {
-        return Err(BringUpError::ShimInit(rc));
+    match card_cell().get() {
+        // ⭐ THE BIND, AND ITS PROOF: open the card by its address, then hold senlib's own
+        // resolution of the open card to it before anything else touches the device.
+        Some(pci) => {
+            flex_rs::senlib_ffi::init_runtime_at(pci).map_err(|(rc, why)| {
+                BringUpError::OpenAt {
+                    pci: pci.clone(),
+                    rc,
+                    why,
+                }
+            })?;
+            let resolved = flex_rs::senlib_ffi::resolved_pci();
+            if !resolved
+                .as_deref()
+                .is_some_and(|r| r.eq_ignore_ascii_case(pci.as_str()))
+            {
+                return Err(BringUpError::WrongCard {
+                    asked: pci.clone(),
+                    resolved,
+                });
+            }
+        }
+        // No card was chosen: the shim's first available device, as every one-card host runs.
+        None => {
+            let rc = unsafe { flex_rs::senlib_ffi::flex_shim_init_runtime(0) };
+            if rc != 0 {
+                return Err(BringUpError::ShimInit(rc));
+            }
+        }
     }
 
     // Real single on-card domain, sized off the card's actual HBM capacity
@@ -125,54 +149,52 @@ fn build_runtime() -> Result<Arc<RuntimeContext>, BringUpError> {
     RuntimeContext::create(None, scheduler, allocator).map_err(BringUpError::Context)
 }
 
-/// A card's PCI enumeration index (`sen_pci_card_count` / `pcie_address_for_card`), which is also
-/// the logical device id `flex_shim_init_runtime` opens.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct CardIndex(u16);
+pub use flex_rs::senlib_ffi::{NotAPciAddress, PciAddress};
 
-impl CardIndex {
-    /// The card a process drives when nothing chose one.
-    pub const FIRST: Self = Self(0);
-
-    pub const fn new(index: u16) -> Self {
-        Self(index)
-    }
-
-    pub const fn get(self) -> u32 {
-        self.0 as u32
-    }
+/// Which card a process's runtime opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DrivenCard {
+    /// The shim's first available device — what a process that chose none opens.
+    FirstAvailable,
+    /// The card at this address ([`drive_card`]).
+    At(PciAddress),
 }
 
-impl fmt::Display for CardIndex {
+impl fmt::Display for DrivenCard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "card {}", self.0)
+        match self {
+            Self::FirstAvailable => f.write_str("the first available card"),
+            Self::At(pci) => write!(f, "the card at {pci}"),
+        }
     }
 }
 
-fn card_cell() -> &'static OnceLock<CardIndex> {
-    static CARD: OnceLock<CardIndex> = OnceLock::new();
+fn card_cell() -> &'static OnceLock<PciAddress> {
+    static CARD: OnceLock<PciAddress> = OnceLock::new();
     &CARD
 }
 
-/// The card this process's runtime opens: the one [`drive_card`] chose, else [`CardIndex::FIRST`].
-pub fn driven_card() -> CardIndex {
-    card_cell().get().copied().unwrap_or(CardIndex::FIRST)
+/// The card this process's runtime opens: the one [`drive_card`] chose, else the first available.
+pub fn driven_card() -> DrivenCard {
+    card_cell().get().map_or(DrivenCard::FirstAvailable, |pci| {
+        DrivenCard::At(pci.clone())
+    })
 }
 
 /// The process already drives another card. A process holds ONE runtime (senlib's PF handle is
 /// process-global), so it drives one card for its life.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CardTaken {
-    pub driving: CardIndex,
-    pub asked: CardIndex,
+    pub driving: DrivenCard,
+    pub asked: PciAddress,
 }
 
 impl fmt::Display for CardTaken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "this process already drives {} and cannot open {} — one runtime per process, one \
-             card per runtime",
+            "this process already drives {} and cannot open the card at {} — one runtime per \
+             process, one card per runtime",
             self.driving, self.asked
         )
     }
@@ -180,27 +202,28 @@ impl fmt::Display for CardTaken {
 
 impl std::error::Error for CardTaken {}
 
-/// Choose the card this process drives, BEFORE anything brings the runtime up (a bring-up with no
-/// choice opens [`CardIndex::FIRST`] and fixes it). Choosing the card already driven is a no-op.
+/// Choose the card this process drives, by its PCI address, BEFORE anything brings the runtime up
+/// (a bring-up with no choice opens the first available card and fixes it). Choosing the card
+/// already chosen is a no-op.
 ///
 /// # Errors
 /// [`CardTaken`] when the process already drives (or chose) another card.
-pub fn drive_card(card: CardIndex) -> Result<(), CardTaken> {
-    // Held across the choice: a bring-up reads `driven_card` under this same lock, so none can
-    // start between the check and the choice.
+pub fn drive_card(card: &PciAddress) -> Result<(), CardTaken> {
+    // Held across the choice: a bring-up reads the choice under this same lock, so none can start
+    // between the check and the choice.
     let runtime = runtime_cell().lock().unwrap_or_else(|e| e.into_inner());
     let driving = if runtime.is_some() {
         driven_card()
     } else {
-        *card_cell().get_or_init(|| card)
+        DrivenCard::At(card_cell().get_or_init(|| card.clone()).clone())
     };
     drop(runtime);
-    if driving == card {
+    if driving == DrivenCard::At(card.clone()) {
         Ok(())
     } else {
         Err(CardTaken {
             driving,
-            asked: card,
+            asked: card.clone(),
         })
     }
 }
@@ -439,6 +462,17 @@ impl std::error::Error for HwError {}
 pub enum BringUpError {
     /// `flex_shim_init_runtime` — the senlib device init — returned a nonzero rc.
     ShimInit(i32),
+    /// The card the process chose ([`drive_card`]) would not open at its address.
+    OpenAt {
+        pci: PciAddress,
+        rc: i32,
+        why: String,
+    },
+    /// The open card is not the one asked for: senlib resolved another address (or none).
+    WrongCard {
+        asked: PciAddress,
+        resolved: Option<String>,
+    },
     /// `FlexAllocator::new` refused the domain topology.
     AllocatorInit(FlexAllocatorError),
     /// `create_scheduler` refused the device kind / chip.
@@ -451,6 +485,15 @@ impl fmt::Display for BringUpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ShimInit(rc) => write!(f, "flex_shim_init_runtime failed: rc={rc}"),
+            Self::OpenAt { pci, rc, why } => {
+                write!(f, "the card at {pci} did not open (rc={rc}): {why}")
+            }
+            Self::WrongCard { asked, resolved } => write!(
+                f,
+                "asked for the card at {asked}, but senlib opened {} — the bind did not select \
+                 the card",
+                resolved.as_deref().unwrap_or("no card")
+            ),
             Self::AllocatorInit(e) => write!(f, "{e}"),
             Self::Scheduler(e) => write!(f, "{e}"),
             Self::Context(e) => write!(f, "{e}"),
@@ -1349,10 +1392,10 @@ impl DevAddr {
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// The cards a sharded session spans: the one this process drives and its peer's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CardPair {
-    pub own: CardIndex,
-    pub peer: CardIndex,
+    pub own: PciAddress,
+    pub peer: PciAddress,
 }
 
 /// The ids a rank's collective control blocks name: its own sid (its sends signal on it), the
@@ -1387,7 +1430,7 @@ pub enum AttachRefusal {
     /// A world of one has no peer.
     NoPeer(TpIdentity),
     /// The peer card is this card.
-    SelfLoop { card: CardIndex },
+    SelfLoop { card: PciAddress },
     /// The link names a card this process does not drive.
     NotDriven(CardTaken),
     /// The process is already linked, as another rank or for another window.
@@ -1506,7 +1549,7 @@ pub fn link_peer(
             })
         };
     }
-    drive_card(cards.own).map_err(AttachRefusal::NotDriven)?;
+    drive_card(&cards.own).map_err(AttachRefusal::NotDriven)?;
     init_runtime().map_err(|e| AttachRefusal::BringUp(e.to_string()))?;
     let mut unit = flex_rs::multi_device::RdmaUnit::new(
         flex_rs::multi_device::RankId(me.rank()),
@@ -1515,7 +1558,7 @@ pub fn link_peer(
     );
     unit.attach_peer(
         flex_rs::multi_device::RankId(u32::from(route.dest_tid)),
-        cards.peer.get(),
+        &cards.peer,
         window.end(),
     )
     .map_err(AttachRefusal::Mapping)?;
@@ -1619,35 +1662,37 @@ mod tests {
         use crate::bundle_code::collective::{Payload, TpWorld, WireBytes};
         let window = RecvWindow::new(1 << 20, Payload::from(WireBytes::CAP)).unwrap();
         let alone = TpWorld::of::<1>().ranks().next().unwrap();
+        let card = |bus: &str| PciAddress::parse(&format!("0000:{bus}:00.0")).unwrap();
         let pair = |own, peer| CardPair {
-            own: CardIndex::new(own),
-            peer: CardIndex::new(peer),
+            own: card(own),
+            peer: card(peer),
         };
         assert!(matches!(
-            link_peer(alone, pair(0, 1), window),
+            link_peer(alone, pair("3b", "86"), window),
             Err(AttachRefusal::NoPeer(_))
         ));
         let rank0 = TpWorld::of::<2>().ranks().next().unwrap();
         assert!(matches!(
-            link_peer(rank0, pair(3, 3), window),
-            Err(AttachRefusal::SelfLoop { card }) if card == CardIndex::new(3)
+            link_peer(rank0, pair("3b", "3b"), window),
+            Err(AttachRefusal::SelfLoop { card: c }) if c == card("3b")
         ));
         assert!(peer_link().is_none(), "a refused link links nothing");
     }
 
-    /// A process drives one card: choosing it again is a no-op, choosing another is refused by
-    /// name, before any bring-up.
+    /// A process drives one card, named by its address: choosing it again is a no-op, choosing
+    /// another is refused by name, before any bring-up.
     #[test]
     fn a_process_drives_the_one_card_it_chose() {
-        let first = CardIndex::new(7);
-        drive_card(first).expect("the first choice is the card");
-        drive_card(first).expect("the same card again");
-        assert_eq!(driven_card(), first);
+        let first = PciAddress::parse("0000:3b:00.0").unwrap();
+        let other = PciAddress::parse("0000:86:00.0").unwrap();
+        drive_card(&first).expect("the first choice is the card");
+        drive_card(&first).expect("the same card again");
+        assert_eq!(driven_card(), DrivenCard::At(first.clone()));
         assert_eq!(
-            drive_card(CardIndex::new(8)),
+            drive_card(&other),
             Err(CardTaken {
-                driving: first,
-                asked: CardIndex::new(8)
+                driving: DrivenCard::At(first),
+                asked: other
             })
         );
     }

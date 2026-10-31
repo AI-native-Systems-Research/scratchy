@@ -130,6 +130,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         pipeline_parallel_size: args.pipeline_parallel_size,
         num_nodes: args.num_nodes,
         node_rank: args.node_rank,
+        tp_cards: args.tp_cards.clone(),
         master_addr: args.master_addr.clone(),
         master_port: args.master_port,
         disable_async_scheduling: args.disable_async_scheduling,

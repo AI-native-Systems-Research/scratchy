@@ -108,6 +108,10 @@ pub struct VllmConfig {
     pub num_nodes: usize,
     /// This node's rank (0 = master).
     pub node_rank: usize,
+    /// The cards of a tensor-parallel world whose ranks each drive one card (spyre), by PCI
+    /// address, in rank order: rank r drives `tp_cards[r]`. Empty in a world of one, which opens
+    /// the backend's first available card.
+    pub tp_cards: Vec<String>,
     /// Master address for multi-node NCCL rendezvous.
     pub master_addr: String,
     /// Master port for multi-node NCCL rendezvous.
@@ -188,6 +192,7 @@ impl Default for VllmConfig {
             pipeline_parallel_size: 1,
             num_nodes: 1,
             node_rank: 0,
+            tp_cards: Vec::new(),
             master_addr: "localhost".to_string(),
             master_port: 29500,
             cuda_graph_mode: "auto".to_string(),
@@ -584,6 +589,7 @@ fn create_worker(
         is_pooling,
         tp_rank,
         tp_world_size,
+        tp_cards: config.tp_cards.clone(),
         pp_rank: 0,
         pp_size: 1,
         gguf_file: config.gguf_file.clone(),
@@ -1892,6 +1898,7 @@ fn initialize_core_tp(config: &VllmConfig, speculation: &Speculation) -> Result<
                 is_pooling,
                 tp_rank: rank,
                 tp_world_size: tp_size,
+                tp_cards: Vec::new(),
                 pp_rank: 0,
                 pp_size: 1,
                 gguf_file: config.gguf_file.clone(),
@@ -2461,6 +2468,7 @@ fn initialize_stack_multinode(
             is_pooling,
             tp_rank: 0,
             tp_world_size: tp_size,
+            tp_cards: Vec::new(),
             pp_rank: 0,
             pp_size: 1,
             gguf_file: config.gguf_file.clone(),
@@ -2787,6 +2795,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         is_pooling,
         tp_rank: node_rank,
         tp_world_size: tp_size,
+        tp_cards: Vec::new(),
         gguf_file: config.gguf_file.clone(),
         lora_adapter: config.lora_adapter.clone(),
         kv_cache_dtype: config.kv_cache_dtype.clone(),
@@ -2984,6 +2993,7 @@ fn initialize_stack_tp_pp(
                         is_pooling,
                         tp_rank,
                         tp_world_size: tp_size,
+                        tp_cards: Vec::new(),
                         pp_rank,
                         pp_size,
                         gguf_file: config.gguf_file.clone(),
@@ -3348,6 +3358,7 @@ fn initialize_stack_tp(
                 is_pooling,
                 tp_rank: rank,
                 tp_world_size: tp_size,
+                tp_cards: Vec::new(),
                 pp_rank: 0,
                 pp_size: 1,
                 gguf_file: config.gguf_file.clone(),
@@ -3772,6 +3783,7 @@ fn initialize_stack_external(
             is_pooling,
             tp_rank: rank,
             tp_world_size: world_size,
+            tp_cards: Vec::new(),
             pp_rank: 0,
             pp_size: 1,
             gguf_file: config.gguf_file.clone(),

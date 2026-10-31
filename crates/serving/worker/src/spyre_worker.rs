@@ -131,12 +131,18 @@ pub struct SpyreWorker {
     /// one. Set by [`SpyreWorker::seat_in`] before `load_model`, which loads that world's forward,
     /// stages this rank's slice of every weight, and links the peer card.
     pub(crate) seat: Option<scratchy_target_spyre::bundle_code::collective::TpIdentity>,
+    /// The world's cards by PCI address, in rank order (`--tp-cards`) — empty when none were
+    /// named, which a world of one runs on the first available card and a sharded world refuses.
+    #[cfg(feature = "spyre-hw")]
+    pub(crate) cards: Vec<scratchy_target_spyre::runtime::PciAddress>,
 }
 
 impl SpyreWorker {
     pub fn new(config: WorkerConfig, model_path: String) -> Self {
         Self {
             seat: None,
+            #[cfg(feature = "spyre-hw")]
+            cards: Vec::new(),
             config,
             model_path,
             is_shutdown: false,
@@ -187,13 +193,15 @@ impl SpyreWorker {
         self.gpu_memory_utilization = gpu_memory_utilization;
     }
 
-    /// Seat this worker as rank `rank` of a `world`-rank tensor-parallel world, before
-    /// `load_model`. A world of one seats nothing.
+    /// Seat this worker as rank `rank` of a `world`-rank tensor-parallel world, on the cards
+    /// `cards` names by PCI address in rank order, before `load_model`. A world of one seats
+    /// nothing, and drives `cards[0]` when one is named.
     ///
     /// # Errors
-    /// A world spyre does not bake, a rank past it, or a sharded world on the emulator — which
-    /// runs one card and has no device p2p to send over.
-    pub fn seat_in(&mut self, world: usize, rank: usize) -> anyhow::Result<()> {
+    /// A world spyre does not bake, a rank past it, a sharded world on the emulator (which runs one
+    /// card and has no device p2p to send over), a card list that is not one address per rank, or
+    /// an entry that is not a PCI address.
+    pub fn seat_in(&mut self, world: usize, rank: usize, cards: &[String]) -> anyhow::Result<()> {
         use scratchy_target_spyre::bundle_code::collective::{SPYRE_TP_WORLDS, TpWorld};
         let w = u32::try_from(world)
             .ok()
@@ -212,6 +220,21 @@ impl SpyreWorker {
                 "a {world}-rank world runs on cards linked by device p2p RDMA; this build is the \
                  emulator, which runs one card"
             );
+        }
+        // One address per rank, or — in a world of one only — none at all.
+        if cards.len() != world && !(cards.is_empty() && !w.is_sharded()) {
+            anyhow::bail!(
+                "a {world}-rank world names its cards by PCI address, one per rank \
+                 (`--tp-cards`); {} were given",
+                cards.len()
+            );
+        }
+        #[cfg(feature = "spyre-hw")]
+        {
+            self.cards = cards
+                .iter()
+                .map(|c| scratchy_target_spyre::runtime::PciAddress::parse(c))
+                .collect::<Result<_, _>>()?;
         }
         self.seat = w.is_sharded().then_some(me);
         Ok(())
@@ -310,7 +333,7 @@ impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFacto
             cfg.gpu_memory_utilization,
         );
         worker
-            .seat_in(cfg.tp_world_size, cfg.tp_rank)
+            .seat_in(cfg.tp_world_size, cfg.tp_rank, &cfg.tp_cards)
             .context("spyre tensor-parallel seat")?;
         worker.init_device().context("spyre init_device")?;
         worker.load_model().context("spyre load_model")?;

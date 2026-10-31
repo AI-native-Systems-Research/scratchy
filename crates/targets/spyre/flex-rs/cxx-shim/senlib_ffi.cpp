@@ -65,6 +65,13 @@ namespace {
 std::shared_ptr<senlib::snt1p0::PfWrapper> g_pfw;
 std::once_flag g_pfw_once;
 int g_pfw_init_rc = -1;
+// The card g_pfw drives, as senlib resolved it (its own PciDevId's
+// to_string), and which door opened it. ONE PROCESS INITS EXACTLY ONE CARD:
+// the BDF door refuses a different address, and refuses any address once
+// the first-available door has opened a card it did not name.
+std::mutex g_pfw_mu;
+std::string g_pfw_pci;
+bool g_pfw_by_bdf = false;
 
 // Diagnostic channel for the exceptions this ABI boundary is obliged to catch.
 //
@@ -99,6 +106,11 @@ extern "C" const char* flex_shim_last_error(void) {
 
 void init_pfw_once(int32_t /*logical_device_id*/) {
     std::call_once(g_pfw_once, [] {
+        std::lock_guard<std::mutex> lock(g_pfw_mu);
+        // The BDF door already opened this process's card: keep it.
+        if (g_pfw) {
+            return;
+        }
         try {
             // Real device identification + open: senlib::snt1p0::SenPci::pf()
             // with no argument selects "first available device", matching
@@ -108,6 +120,7 @@ void init_pfw_once(int32_t /*logical_device_id*/) {
             // VFIO device open.
             auto pci_id = senlib::snt1p0::SenPci::pf();
             g_pfw = std::make_shared<senlib::snt1p0::PfWrapper>(pci_id);
+            g_pfw_pci = pci_id.to_string();
             g_pfw_init_rc = 0;
         } catch (const std::exception& e) {
             fprintf(stderr, "[senlib-ffi] init_pfw: %s\n", e.what());
@@ -177,6 +190,8 @@ uint64_t g_pinned_next_handle = 1;
 // mapping. A mismatched length for an already-mapped peer is an error.
 std::mutex g_p2p_mu;
 std::unordered_map<uint32_t, uint64_t> g_p2p_mapped;
+// The same memo for peers named by PCI address (flex_senlib_p2p_create_mapping_bdf).
+std::unordered_map<std::string, uint64_t> g_p2p_mapped_bdf;
 
 // Mirrors Rust's `SenlibP2pSegment` (#[repr(C)] { c_int aux; void* addr }).
 struct FlexP2pSegmentShim {
@@ -204,6 +219,59 @@ vfio::snt1p0::vfio_backend* p2p_vfio_backend() {
     return reinterpret_cast<vfio::snt1p0::vfio_backend*>(impl);
 }
 
+// The one body of both mapping doors: map the peer `peer_of()` names (once
+// per key, memoized in `memo` at its length — a different length refuses),
+// then marshal peer_dev_info into `out_segments`.
+template <typename Key, typename PeerOf>
+int32_t p2p_map(const char* fn, std::unordered_map<Key, uint64_t>& memo, const Key& key,
+                PeerOf peer_of, uint64_t len_bytes, void* out_segments,
+                size_t max_segments, size_t* out_count) {
+    try {
+        if (!g_pfw || !out_count) {
+            shim_record_error(fn, !g_pfw ? "runtime not initialized" : "null out_count");
+            return -1;
+        }
+        auto* vb = p2p_vfio_backend();
+        {
+            std::lock_guard<std::mutex> lock(g_p2p_mu);
+            auto it = memo.find(key);
+            if (it != memo.end()) {
+                if (it->second != len_bytes) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg),
+                             "peer already mapped with length %llu (asked %llu)",
+                             static_cast<unsigned long long>(it->second),
+                             static_cast<unsigned long long>(len_bytes));
+                    shim_record_error(fn, msg);
+                    return -1;
+                }
+                // Already mapped with this length: idempotent re-marshal.
+            } else {
+                vb->create_iommu_mapping_for_cross_port_p2p_rdma(
+                    peer_of(), static_cast<size_t>(len_bytes));
+                memo.emplace(key, len_bytes);
+            }
+        }
+        const auto& info = vb->peer_dev_info;
+        *out_count = info.size();
+        if (out_segments != nullptr) {
+            auto* dst = static_cast<FlexP2pSegmentShim*>(out_segments);
+            size_t n = std::min(info.size(), max_segments);
+            for (size_t i = 0; i < n; ++i) {
+                dst[i].aux = static_cast<int32_t>(info[i].first);
+                dst[i].addr = info[i].second;
+            }
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        shim_record_error(fn, e.what());
+        return -1;
+    } catch (...) {
+        shim_record_error(fn, "unknown exception");
+        return -1;
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -223,6 +291,55 @@ int32_t flex_shim_init_runtime(int32_t logical_device_id) {
         fprintf(stderr, "[senlib-ffi] flex_shim_init_runtime: unknown exception\n");
         return -2;
     }
+}
+
+// Brings up the card at PCI address `pci_addr` (a BDF, "dddd:bb:dd.f") —
+// senlib's card-selecting SenPci::pf(const std::string&) overload
+// (senpci.hpp:36), where flex_shim_init_runtime's SenPci::pf() opens the
+// first available device whatever it is asked. The same address again is
+// idempotent; a different address, or any address once the first-available
+// door has opened a card, refuses by name (-3): one process inits exactly
+// one card. Read the address senlib resolved with flex_shim_resolved_pci.
+int32_t flex_shim_init_runtime_bdf(const char* pci_addr) {
+    try {
+        if (pci_addr == nullptr) {
+            shim_record_error("flex_shim_init_runtime_bdf", "null pci address");
+            return -1;
+        }
+        const std::string asked(pci_addr);
+        std::lock_guard<std::mutex> lock(g_pfw_mu);
+        if (g_pfw) {
+            if (g_pfw_by_bdf && g_pfw_pci == asked) {
+                return 0;
+            }
+            const std::string msg = "this process already drives " + g_pfw_pci +
+                                    (g_pfw_by_bdf ? " (opened by address)"
+                                                  : " (opened as the first available device)") +
+                                    " and cannot open " + asked;
+            shim_record_error("flex_shim_init_runtime_bdf", msg.c_str());
+            return -3;
+        }
+        auto pci_id = senlib::snt1p0::SenPci::pf(asked);
+        g_pfw = std::make_shared<senlib::snt1p0::PfWrapper>(pci_id);
+        g_pfw_pci = pci_id.to_string();
+        g_pfw_by_bdf = true;
+        g_pfw_init_rc = 0;
+        return 0;
+    } catch (const std::exception& e) {
+        shim_record_error("flex_shim_init_runtime_bdf", e.what());
+        return -2;
+    } catch (...) {
+        shim_record_error("flex_shim_init_runtime_bdf", "unknown exception");
+        return -2;
+    }
+}
+
+// The PCI address of the card this process drives, as senlib resolved it
+// (the live PfWrapper's own PciDevId), or nullptr before any door opened
+// one. Owned by the shim; stable for the process's life once set.
+const char* flex_shim_resolved_pci(void) {
+    std::lock_guard<std::mutex> lock(g_pfw_mu);
+    return g_pfw ? g_pfw_pci.c_str() : nullptr;
 }
 
 // Real device memory capacity, in bytes — senlib::snt1p0::PfInterface::GetLPDDRSize(),
@@ -865,61 +982,34 @@ int32_t flex_senlib_check_and_clear_rdma_status(void) {
 int32_t flex_senlib_p2p_create_mapping(uint32_t peer_card_index, uint64_t len_bytes,
                                        void* out_segments, size_t max_segments,
                                        size_t* out_count) {
-    try {
-        if (!g_pfw || !out_count) {
-            shim_record_error("flex_senlib_p2p_create_mapping",
-                              !g_pfw ? "runtime not initialized" : "null out_count");
-            return -1;
-        }
-        auto* vb = p2p_vfio_backend();
-        {
-            std::lock_guard<std::mutex> lock(g_p2p_mu);
-            auto it = g_p2p_mapped.find(peer_card_index);
-            if (it != g_p2p_mapped.end()) {
-                if (it->second != len_bytes) {
-                    char msg[128];
-                    snprintf(msg, sizeof(msg),
-                             "peer %u already mapped with length %llu (asked %llu)",
-                             peer_card_index, static_cast<unsigned long long>(it->second),
-                             static_cast<unsigned long long>(len_bytes));
-                    shim_record_error("flex_senlib_p2p_create_mapping", msg);
-                    return -1;
-                }
-                // Already mapped with this length: idempotent re-marshal.
-            } else {
-                // The peer's PciDevId, from the same SenPciShared::pf(index)
-                // lookup this shim's device bring-up and
-                // senlib_senpci_pf_address use. Pod-verified:
-                // senpci_shared.hpp declares `PciDevId pf(unsigned
-                // whichcard = 0)` and the SDK has exactly one PciDevId class
-                // (vfio::shared, pcidevid.hpp), pulled into vfio::snt1p0 by
-                // using-directive — the call type-checks as the very
-                // PciDevId create_iommu_mapping_for_cross_port_p2p_rdma
-                // takes.
-                auto peer = senlib::shared::SenPciShared::pf(peer_card_index);
-                vb->create_iommu_mapping_for_cross_port_p2p_rdma(
-                    peer, static_cast<size_t>(len_bytes));
-                g_p2p_mapped.emplace(peer_card_index, len_bytes);
-            }
-        }
-        const auto& info = vb->peer_dev_info;
-        *out_count = info.size();
-        if (out_segments != nullptr) {
-            auto* dst = static_cast<FlexP2pSegmentShim*>(out_segments);
-            size_t n = std::min(info.size(), max_segments);
-            for (size_t i = 0; i < n; ++i) {
-                dst[i].aux = static_cast<int32_t>(info[i].first);
-                dst[i].addr = info[i].second;
-            }
-        }
-        return 0;
-    } catch (const std::exception& e) {
-        shim_record_error("flex_senlib_p2p_create_mapping", e.what());
-        return -1;
-    } catch (...) {
-        shim_record_error("flex_senlib_p2p_create_mapping", "unknown exception");
+    // The peer's PciDevId, from the same SenPciShared::pf(index) lookup
+    // senlib_senpci_pf_address uses. Pod-verified: senpci_shared.hpp declares
+    // `PciDevId pf(unsigned whichcard = 0)` and the SDK has exactly one
+    // PciDevId class (vfio::shared, pcidevid.hpp), pulled into vfio::snt1p0 by
+    // using-directive — the call type-checks as the very PciDevId
+    // create_iommu_mapping_for_cross_port_p2p_rdma takes.
+    return p2p_map(
+        "flex_senlib_p2p_create_mapping", g_p2p_mapped, peer_card_index,
+        [&] { return senlib::shared::SenPciShared::pf(peer_card_index); }, len_bytes,
+        out_segments, max_segments, out_count);
+}
+
+// flex_senlib_p2p_create_mapping, with the peer named by its PCI address —
+// senlib's SenPci::pf(const std::string&) (senpci.hpp:36), the overload that
+// selects a card by address rather than by enumeration order. Memoized per
+// address, at its length, like the index door.
+int32_t flex_senlib_p2p_create_mapping_bdf(const char* peer_pci, uint64_t len_bytes,
+                                           void* out_segments, size_t max_segments,
+                                           size_t* out_count) {
+    if (peer_pci == nullptr) {
+        shim_record_error("flex_senlib_p2p_create_mapping_bdf", "null peer pci address");
         return -1;
     }
+    const std::string peer(peer_pci);
+    return p2p_map(
+        "flex_senlib_p2p_create_mapping_bdf", g_p2p_mapped_bdf, peer,
+        [&] { return senlib::snt1p0::SenPci::pf(peer); }, len_bytes, out_segments,
+        max_segments, out_count);
 }
 
 // Exports `size` bytes of the open card's `bar` at `offset` as a DMABuf fd:
