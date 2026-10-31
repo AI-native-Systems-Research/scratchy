@@ -3941,29 +3941,46 @@ pub fn emit_sdsc(
             // `Span::Swept` with NO declaration reproduces `op.iter.extent(d)` exactly, and no
             // operand in any shipped bundle declares one — so every existing bundle is byte-identical.
             maxDimSizes_: {
-                let walk = sl.device_walk(
-                    crate::sdsc_abstract::DeviceExtents::of_view(
-                        &v.layout
-                            .iter()
-                            .map(|&d| iter.extent(d) as usize)
-                            .collect::<Vec<_>>(),
-                        &v.device_extent
-                            .iter()
-                            .map(|o| o.map(|p| p as usize))
-                            .collect::<Vec<_>>(),
-                        v.layout
-                            .iter()
-                            .position(|&d| d == v.stick)
-                            .unwrap_or(usize::MAX),
-                        &vec![true; v.layout.len()],
-                        crate::sdsc_abstract::Span::Swept,
-                    )
-                    .dims()
+                let swept: Vec<usize> = v.layout.iter().map(|&d| iter.extent(d) as usize).collect();
+                let stick_pos = v
+                    .layout
                     .iter()
-                    .map(|&e| e as i64)
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-                );
+                    .position(|&d| d == v.stick)
+                    .unwrap_or(usize::MAX);
+                let device: Vec<i64> = crate::sdsc_abstract::DeviceExtents::of_view(
+                    &swept,
+                    &v.device_extent
+                        .iter()
+                        .map(|o| o.map(|p| p as usize))
+                        .collect::<Vec<_>>(),
+                    stick_pos,
+                    &vec![true; v.layout.len()],
+                    crate::sdsc_abstract::Span::Swept,
+                )
+                .dims()
+                .iter()
+                .map(|&e| e as i64)
+                .collect();
+                let walk = sl.device_walk(&device);
+                // ⭐ A STICK-BLOCKED WINDOW OF A TALLER TENSOR, more than one stick wide, walks the
+                // tensor's own rows (`DeviceWalk::of_window`): left to `-1`, dxp strides its stick
+                // groups by the op's swept rows. MEASURED on granite-3.1-8b: each kv head's score
+                // contraction read its `[84, 128]` query slice of the `[672, 128]` head-major query
+                // with the second stick 84 rows in, the next kv head's first stick. A one-stick view
+                // has no second stick group, so every hd=64 bundle emits byte-identically.
+                let windowed = device
+                    .iter()
+                    .zip(&swept)
+                    .enumerate()
+                    .any(|(i, (&d, &s))| i != stick_pos && d > s as i64);
+                let multi_stick = swept
+                    .get(stick_pos)
+                    .is_some_and(|&e| e > v.df.elems_per_stick() as usize);
+                let walk = if walk.reconstructs() && windowed && multi_stick {
+                    crate::sdsc_abstract::DeviceWalk::of_window(&device)
+                } else {
+                    walk
+                };
                 // Paged only on the gathered value side. Every pin was resolved against this operand's
                 // own layout above, so `paged_at` cannot be the thing that drops one.
                 let walk = if paged_dims.is_empty() {

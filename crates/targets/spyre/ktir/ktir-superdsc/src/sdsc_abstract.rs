@@ -1238,6 +1238,22 @@ impl serde::Serialize for DeviceWalk {
 }
 
 impl DeviceWalk {
+    /// Whether dxp is left to rebuild this walk from `N_` (the `-1` per dim a stick-blocked start
+    /// ships with).
+    pub(crate) fn reconstructs(&self) -> bool {
+        matches!(self.0, Walk::Reconstruct { .. })
+    }
+
+    /// ⭐ A STICK-BLOCKED VIEW OF A TALLER ALLOCATION, pinned to the allocation's own extents. dxp
+    /// rebuilds a `-1` walk from the op's `N_`, so a view that sweeps `m` rows of a `rows`-row
+    /// stick-major tensor gets its stick-group stride from `m`, not `rows`: right for the first stick
+    /// and short by `rows - m` rows for every one after it. Pinned, dxp walks the tensor's own rows
+    /// (`maxDimSizes_` are the strides, innermost first, `dsc/dsc2.cpp:2971-2979`). `extents` are the
+    /// view's DEVICE extents, one per `layoutDimOrder_`.
+    pub(crate) fn of_window(extents: &[i64]) -> Self {
+        DeviceWalk(Walk::RowMajor(extents.to_vec()))
+    }
+
     /// The same walk with its dims in another order: entry `i` of the result is entry `from[i]` of
     /// this one (a paged pin follows its dim). `None` unless `from` is a permutation of `0..rank`.
     pub(crate) fn reordered(&self, from: &[usize]) -> Option<Self> {
