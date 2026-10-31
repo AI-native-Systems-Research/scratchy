@@ -507,12 +507,17 @@ template <typename T>
   const bool fresh = start == 1u;
   const uint drafts = GDN_VER_DRAFTS == 0u ? 0u : (code >> 8) & 0xffu;
   const bool replays = GDN_VER_DRAFTS > 0u && start >= 2u;
+  const uint area = (code >> 16) & 1u;
   const uint lane_ix = code >> 17;
   const uint c = gdn_ver_channel(h, 0u, tid);
-  // The seed gdn_verify read: the slot's ring, a restore's snapshot, or a replay's stream.
-  device float* lane_ptr = conv_lanes + (lane_ix * CONV_DIM + c) * STREAM_LEN;
+  // The seed gdn_verify read: the slot's ring, a restore's snapshot, or a replay's stream (the
+  // area the verify step before wrote); this step's stream goes into the other, as gdn_verify's.
+  auto stream = [&](uint a) {
+    return conv_lanes + ((lane_ix * 2u + a) * CONV_DIM + c) * STREAM_LEN;
+  };
+  device float* lane_ptr = stream(1u - area);
   const device float* start_ptr =
-      replays ? lane_ptr + (start - 1u)
+      replays ? stream(area) + (start - 1u)
               : conv_state + (uint(gdn_start_slot(seq_slots, start)) * CONV_DIM + c) * STATE_LEN;
   float seed[8];
   for (uint ki = 0; ki < STATE_LEN; ki++) {
