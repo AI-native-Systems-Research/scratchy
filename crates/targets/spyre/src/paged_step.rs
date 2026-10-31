@@ -291,11 +291,7 @@ pub fn step_sources(
         int32.push((step.int32_zero, words(vec![0; run]), vec![1, run]));
     }
     Ok(StepSources {
-        mask: (
-            step.mask,
-            mask_stack(step, rows),
-            vec![(step.walk * step.rows) as usize, step.page_slots as usize],
-        ),
+        mask: (step.mask, mask_stack(step, rows), mask_shape(step)),
         int32,
     })
 }
@@ -420,11 +416,35 @@ pub fn batch_sources(
 
 /// ⭐ ONE STEP ON THE CARD — the step's own operands ([`step_sources`], [`batch_sources`]) as the
 /// card's placements hold them ([`PagedStep::card_placements`]): the mask as values the session
-/// narrows to the card's fp16 at bind (its rows are one `page_slots` stick each, so the row-major
-/// stack IS the stick-major one), and the int32 tables as little-endian words, the index table a
-/// walk reads one row per trip laid at the walk's card step ([`PagedStep::card_walk_step`],
-/// `loop_fold`'s pitched index table). `kv_row_pool` and the int32 zero are no step's: they are the
-/// same for every step of a pool, staged once at load ([`card_statics`]).
+/// narrows to the card's fp16 at bind, laid stick-major ([`card_mask`]), and the int32 tables as
+/// little-endian words, the index table a walk reads one row per trip laid at the walk's card step
+/// ([`PagedStep::card_walk_step`], `loop_fold`'s pitched index table). `kv_row_pool` and the int32
+/// zero are no step's: they are the same for every step of a pool, staged once at load
+/// ([`card_statics`]).
+/// ⭐ THE MASK STACK AS THE CARD READS IT — stick-major over the whole `[rows, page_slots]` stack
+/// ([`crate::forward_tape::stick_scatter`]): row `r`'s stick `s` at stick `s · rows + r`, the
+/// layout the kernels address the stack in (a tile's second stick one plane of `rows` further on),
+/// and the reason a trip's tile is [`PagedStep::card_walk_step`] further along every plane. One
+/// stick wide, at 64-slot pages, it is the row-major stack byte for byte; at 128 slots the row-major
+/// stack read stick-major handed every odd query row the next row's masked half — MEASURED on card,
+/// granite 2b and 8b prompt-blind, the P·V rows of odd prompt positions all zero.
+fn card_mask(mask: &[f32], shape: &[usize]) -> Vec<f32> {
+    let (width, rows) = match shape.split_last() {
+        Some((&w, lead)) => (w, lead.iter().product()),
+        None => (0, 0),
+    };
+    if width <= ktir_superdsc::superdsc_opspec::Df::Fp16.elems_per_stick() as usize {
+        return mask.to_vec();
+    }
+    crate::forward_tape::stick_scatter(rows, width, mask)
+}
+
+/// The single-sequence mask stack's `[walk · rows, page_slots]` shape — the one statement the host
+/// stack ([`step_sources`]) and the card's ([`card_step_sources`]) are laid by.
+fn mask_shape(step: &PagedStep) -> Vec<usize> {
+    vec![(step.walk * step.rows) as usize, step.page_slots as usize]
+}
+
 pub struct CardSources {
     pub mask: (u32, Vec<f32>),
     pub int32: Vec<(u32, Vec<u8>)>,
@@ -468,7 +488,10 @@ pub fn card_step_sources(
     }
     let table = le_words(page_table(step, blocks, rows)?);
     Ok(CardSources {
-        mask: (step.mask, mask_stack(step, rows)),
+        mask: (
+            step.mask,
+            card_mask(&mask_stack(step, rows), &mask_shape(step)),
+        ),
         int32: vec![
             (
                 step.page_table,
@@ -508,9 +531,9 @@ pub fn card_batch_sources(
             }
         })
         .collect();
-    let (mask_tid, mask, _) = logical.mask;
+    let (mask_tid, mask, shape) = logical.mask;
     Ok(CardSources {
-        mask: (mask_tid, mask),
+        mask: (mask_tid, card_mask(&mask, &shape)),
         int32,
     })
 }
@@ -875,6 +898,58 @@ mod tests {
             card.words(s.kv_row_pool).is_none() && card.words(s.int32_zero).is_none(),
             "the pool's statics are staged at load, never per step"
         );
+    }
+
+    /// ⭐ THE CARD HOLDS THE MASK STACK STICK-MAJOR — at 128-slot pages a row is two sticks, and the
+    /// kernels read the stack's row `r` stick `s` at stick `s · rows + r`, the second half of every
+    /// row one whole plane on. Staged row-major (the bytes the 64-slot stack happened to share with
+    /// its stick-major form) every odd query row read the next row's masked half: measured on the
+    /// card, the P·V rows of odd prompt positions all zero. A sequence's stack and a decode batch's.
+    #[test]
+    fn the_card_holds_the_mask_stack_stick_major() {
+        let s = PagedStep {
+            page_slots: 128,
+            ..step()
+        };
+        let rows = StepRows { start: 5, real: 2 };
+        let blocks = [2u32, 3];
+        let logical = mask_stack(&s, &rows);
+        let card = card_step_sources(&s, &blocks, &rows).unwrap();
+        let (n, w) = ((s.walk * s.rows) as usize, s.page_slots as usize);
+        assert_eq!(card.mask.1.len(), logical.len());
+        for r in 0..n {
+            for c in 0..w {
+                assert_eq!(
+                    card.mask.1[(c / 64) * (n * 64) + r * 64 + c % 64],
+                    logical[r * w + c],
+                    "row {r} slot {c}"
+                );
+            }
+        }
+        assert_ne!(
+            card.mask.1, logical,
+            "two sticks a row: not the row-major bytes"
+        );
+        let b = PagedStep {
+            page_slots: 128,
+            ..batch()
+        };
+        let seqs = [BatchSeq {
+            blocks: &[2, 3],
+            pos: 133,
+        }];
+        let (_, want, shape) = batch_sources(&b, &seqs).unwrap().mask;
+        let got = card_batch_sources(&b, &seqs).unwrap().mask.1;
+        let n = shape[0];
+        for r in 0..n {
+            for c in 0..w {
+                assert_eq!(
+                    got[(c / 64) * (n * 64) + r * 64 + c % 64],
+                    want[r * w + c],
+                    "batch row {r} slot {c}"
+                );
+            }
+        }
     }
 
     /// A decode batch's chunk page ids, one chunk per trip: chunk `c`'s `J · B` ids at

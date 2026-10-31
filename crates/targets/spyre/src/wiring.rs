@@ -713,8 +713,9 @@ impl PagedStep {
 
     /// ⭐ THE WALK'S STEP ON THE CARD — the bytes one trip moves the mask tile, and so the pitch the
     /// card holds the trip's page ids at: the relaunch shifts every step source in the activation
-    /// segment by that one step (`loop_fold`'s pitched index table). The tile is one-stick rows of
-    /// the stick-major stack, 128 B apart: `rows` of them for one sequence (`[rows, page_slots]`),
+    /// segment by that one step (`loop_fold`'s pitched index table). The stack is stick-major
+    /// (`paged_step::card_mask`), so one trip's tile is its rows' sticks in every plane of it, 128 B
+    /// a row: `rows` of them for one sequence (`[rows, page_slots]`),
     /// so page table row `i` sits at `i · rows · 128` B (one int32 stick at decode), and
     /// `entries · nkvh` of them for a decode batch (`[J, B, nkvh, 1, page_slots]`), so chunk `c`'s
     /// ids sit at `c · entries · nkvh · 128` B.
