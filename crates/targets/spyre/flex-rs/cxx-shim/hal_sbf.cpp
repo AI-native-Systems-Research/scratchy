@@ -61,31 +61,6 @@ void section_words(const SectionT& section, uint64_t* out_words) {
     std::memcpy(out_words, &section, sizeof(SectionT));
 }
 
-// THE xseg COMPOSE — the one function behind both of the word's destinations:
-// the send section's xseg field and the receiver's XSEG[SID] register
-// (`flex_hal_xseg_compose`, whose word Rust hands to `write_xseg`). Flits,
-// then the valid bit (30), then odd parity over the result (31), as the vendor
-// loop composes it. `dest_remote_base_bytes` is already compensated by the
-// caller. Refuses (false, reason recorded under `fn`) a misaligned base, which
-// bytes_to_flits would truncate, and a base whose flits reach bit 30.
-bool compose_xseg(const char* fn, uint64_t dest_remote_base_bytes, uint32_t* out_xseg) {
-    if ((dest_remote_base_bytes % 128) != 0) {
-        hal_record_error(fn, "dest_remote_base_bytes must be 128-aligned (bytes_to_flits truncates)");
-        return false;
-    }
-    const uint64_t dest_flits =
-        hal::snt1p0::VirtualAddressSBF::bytes_to_flits(dest_remote_base_bytes);
-    if ((dest_flits >> 30) != 0) {
-        hal_record_error(fn, "dest_remote_base_bytes overflows the xseg word");
-        return false;
-    }
-    uint64_t xseg = dest_flits;
-    xseg |= 1ULL << 30;  // the valid bit
-    xseg |= static_cast<uint64_t>(std::popcount(xseg) & 1ULL) << 31;  // odd parity
-    *out_xseg = static_cast<uint32_t>(xseg);
-    return true;
-}
-
 }  // namespace
 
 extern "C" {
@@ -240,10 +215,13 @@ int32_t flex_hal_rdma12_unicast_send_encode(
                              "src_offset_bytes exceeds the 16 GiB segment");
             return -1;
         }
-        // The xseg word: the one compose the XSEG register door shares.
-        uint32_t xseg = 0;
-        if (!compose_xseg("flex_hal_rdma12_unicast_send_encode", dest_remote_base_bytes,
-                          &xseg)) {
+        // The xseg word's flits must leave bits 30 (valid) and 31 (parity)
+        // free.
+        const uint64_t dest_flits =
+            hal::snt1p0::VirtualAddressSBF::bytes_to_flits(dest_remote_base_bytes);
+        if ((dest_flits >> 30) != 0) {
+            hal_record_error("flex_hal_rdma12_unicast_send_encode",
+                             "dest_remote_base_bytes overflows the xseg word");
             return -1;
         }
 
@@ -257,6 +235,9 @@ int32_t flex_hal_rdma12_unicast_send_encode(
         rdma.SetSync(sync != 0);
         rdma.SetXsegv(xsegv != 0);
         rdma.SetLengthBytes(length_bytes);
+        uint64_t xseg = dest_flits;
+        xseg |= 1ULL << 30;  // the valid bit
+        xseg |= static_cast<uint64_t>(std::popcount(xseg) & 1ULL) << 31;  // odd parity
         rdma.SetXseg(xseg);
         // Source device address via the mixin's own (segment_id,
         // offset_flits) overload; bytes_to_flits is the header's conversion.
@@ -270,25 +251,6 @@ int32_t flex_hal_rdma12_unicast_send_encode(
         return -1;
     } catch (...) {
         hal_record_error("flex_hal_rdma12_unicast_send_encode", "unknown exception");
-        return -1;
-    }
-}
-
-// The xseg word alone (32 bits), for the receiver's XSEG[SID] register: the
-// SAME compose the send section's xseg field gets, so the word a receiver
-// programs and the word its peer's send carries agree by construction.
-int32_t flex_hal_xseg_compose(uint64_t dest_remote_base_bytes, uint32_t* out_xseg) {
-    try {
-        if (out_xseg == nullptr) {
-            hal_record_error("flex_hal_xseg_compose", "null out_xseg");
-            return -1;
-        }
-        return compose_xseg("flex_hal_xseg_compose", dest_remote_base_bytes, out_xseg) ? 0 : -1;
-    } catch (const std::exception& e) {
-        hal_record_error("flex_hal_xseg_compose", e.what());
-        return -1;
-    } catch (...) {
-        hal_record_error("flex_hal_xseg_compose", "unknown exception");
         return -1;
     }
 }

@@ -170,23 +170,28 @@ unsafe extern "C" {
     /// MUST be called (and succeed, i.e. return 0) before any other
     /// function in this module is called; every other function
     /// assumes a live `flex::DeviceHandle` is already cached.
-    /// ⛔ `logical_device_id` SELECTS NOTHING: the shim opens senlib's
-    /// `SenPci::pf()`, the FIRST AVAILABLE device, whatever it is passed.
-    /// A process that must drive a particular card opens it by address
-    /// ([`init_runtime_at`]).
+    /// `logical_device_id` mirrors `flex::initializeRuntime`'s own parameter
+    /// (which Spyre card to bring up; 0 for a single-device host).
     pub fn flex_shim_init_runtime(logical_device_id: i32) -> i32;
 
-    /// Brings up the card at PCI address `pci_addr` (NUL-terminated
-    /// `dddd:bb:dd.f`) — senlib's `SenPci::pf(const std::string&)`. The same
-    /// address again returns 0; a different one, or any once
-    /// [`flex_shim_init_runtime`] opened a card, returns -3 with the reason
-    /// in [`flex_shim_last_error`]. Safe wrapper: [`init_runtime_at`].
-    fn flex_shim_init_runtime_bdf(pci_addr: *const c_char) -> i32;
+    /// The rank-scoped bring-up door: selects the card by BDF string through
+    /// `SenPci::pf(const std::string&)` — `logical_device_id` above selects
+    /// nothing (the shim's `init_pfw_once` comments out the parameter and
+    /// takes `SenPci::pf()`'s first available card), so a two-process,
+    /// one-card-per-rank cell needs this door. `pci_addr` is the
+    /// "DDDD:BB:DD.F" form. Returns 0 on success, -3 for the second-init
+    /// refusal (one process inits exactly one card — same BDF is idempotent,
+    /// a different BDF or a BDF after the no-arg door refuses by name).
+    pub fn flex_shim_init_runtime_bdf(pci_addr: *const c_char) -> i32;
 
-    /// The PCI address of the open card as senlib resolved it, or null
-    /// before any door opened one. Shim-owned; stable once set. Safe
-    /// wrapper: [`resolved_pci`].
-    fn flex_shim_resolved_pci() -> *const c_char;
+    /// The bind proof: writes senlib's own resolved PCI address (read from
+    /// the live `PciDevId` handed to `PfWrapper`, in "DDDD:BB:DD.F" form)
+    /// into `out` (capacity `cap`, NUL-terminated) and returns the length
+    /// written, or -1 if nothing is initialized / the buffer is too small.
+    /// A rank names the BDF it asked for; this is what senlib actually
+    /// resolved — the cell asserts the two are equal, both ranks, before
+    /// any BAT work.
+    pub fn flex_shim_resolved_pci(out: *mut c_char, cap: usize) -> i32;
 
     /// Real device memory capacity in bytes for the currently-open card —
     /// `flex::DeviceHandle::GetDmpaSize()`, the exact call the real C++
@@ -571,119 +576,6 @@ pub fn last_shim_error() -> String {
     }
 }
 
-/// ⭐ A CARD'S PCI ADDRESS — `dddd:bb:dd.f` (domain, bus, device, function), lowercase: what senlib
-/// selects a card by (`SenPci::pf(const std::string&)`). Minted only by [`PciAddress::parse`], so
-/// a value is always one address the shim can be handed whole.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PciAddress(std::ffi::CString);
-
-/// A string that is not a `dddd:bb:dd.f` PCI address.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NotAPciAddress(pub String);
-
-impl std::fmt::Display for NotAPciAddress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{:?} is not a PCI address — a card is named `dddd:bb:dd.f` (domain, bus, device, \
-             function), e.g. `0000:3b:00.0`",
-            self.0
-        )
-    }
-}
-
-impl std::error::Error for NotAPciAddress {}
-
-impl PciAddress {
-    /// `Some` iff `s` is `dddd:bb:dd.f`: four, two and two hex digits and a function 0–7. Hex
-    /// digits are taken in either case and kept lowercase.
-    ///
-    /// # Errors
-    /// [`NotAPciAddress`].
-    pub fn parse(s: &str) -> Result<Self, NotAPciAddress> {
-        let hex = |p: &str, n: usize| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit());
-        let well_formed = match s.split([':', '.']).collect::<Vec<_>>().as_slice() {
-            [domain, bus, device, function] => {
-                hex(domain, 4)
-                    && hex(bus, 2)
-                    && hex(device, 2)
-                    && matches!(function.as_bytes(), [b'0'..=b'7'])
-                    && s.as_bytes()[4] == b':'
-                    && s.as_bytes()[7] == b':'
-                    && s.as_bytes()[10] == b'.'
-            }
-            _ => false,
-        };
-        if !well_formed {
-            return Err(NotAPciAddress(s.to_string()));
-        }
-        std::ffi::CString::new(s.to_ascii_lowercase())
-            .map(Self)
-            .map_err(|_| NotAPciAddress(s.to_string()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        // Built from ASCII by `parse`.
-        self.0.to_str().unwrap_or_default()
-    }
-
-    fn as_c(&self) -> *const c_char {
-        self.0.as_ptr()
-    }
-}
-
-impl std::fmt::Display for PciAddress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl PciAddress {
-    /// The bus address region `region` (BAR `region`) of this card decodes at — the kernel's own
-    /// reading of the card's config space (`/sys/bus/pci/devices/<addr>/resource`, the value
-    /// `setpci` reports), never senlib's.
-    ///
-    /// # Errors
-    /// The sysfs file unread, or no such region in it.
-    pub fn region_base(&self, region: usize) -> Result<u64, String> {
-        let path = format!("/sys/bus/pci/devices/{}/resource", self.as_str());
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
-        region_base_of(&text, region).ok_or_else(|| format!("{path} has no region {region}"))
-    }
-}
-
-/// Region `region`'s start in a sysfs `resource` file: one `start end flags` line per region, each
-/// a `0x` hex word. `None` for a missing, unparsable or unassigned (zero) region.
-fn region_base_of(resource: &str, region: usize) -> Option<u64> {
-    let start = resource.lines().nth(region)?.split_whitespace().next()?;
-    let base = u64::from_str_radix(start.strip_prefix("0x")?, 16).ok()?;
-    (base != 0).then_some(base)
-}
-
-/// Bring the runtime up on the card at `pci` (`SenPci::pf(const std::string&)`).
-///
-/// # Errors
-/// The shim's rc and message: the address refused by senlib (-2), or a process that already drives
-/// another card (-3).
-pub fn init_runtime_at(pci: &PciAddress) -> Result<(), (i32, String)> {
-    // SAFETY: `pci` is a NUL-terminated string the shim copies before returning.
-    let rc = unsafe { flex_shim_init_runtime_bdf(pci.as_c()) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err((rc, last_shim_error()))
-    }
-}
-
-/// The open card's PCI address as senlib resolved it — the bind's proof. `None` before bring-up.
-pub fn resolved_pci() -> Option<String> {
-    // SAFETY: the shim returns null or a NUL-terminated string it owns for the process's life.
-    unsafe {
-        let p = flex_shim_resolved_pci();
-        (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
-    }
-}
-
 /// Safe wrapper: query a pipeline's configured CB queue capacity.
 ///
 /// Returns `None` when `cbi` is `None` (mirrors the C++ `if(!cbi) return
@@ -840,6 +732,46 @@ pub fn pcie_address_for_card(card_index: u32) -> String {
         }
         CStr::from_ptr(ptr).to_string_lossy().into_owned()
     }
+}
+
+/// Safe wrapper over the rank-scoped bring-up door
+/// (`flex_shim_init_runtime_bdf`): selects the card by BDF string. Same BDF
+/// twice in one process is idempotent; a different BDF, or a BDF init after
+/// the no-arg door already bound a card, is refused by name.
+///
+/// # Errors
+/// Returns `Err` with the shim's refusal/init message on any nonzero rc.
+pub fn init_runtime_bdf(bdf: &str) -> Result<(), String> {
+    // SAFETY: `bdf` is copied into a NUL-terminated CString for the duration
+    // of the call; the shim does not retain the pointer.
+    let c_bdf = std::ffi::CString::new(bdf).map_err(|_| "BDF contains a NUL byte".to_string())?;
+    let rc = unsafe { flex_shim_init_runtime_bdf(c_bdf.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper over the bind-proof getter (`flex_shim_resolved_pci`):
+/// senlib's own resolved PCI address for the initialized runtime, in
+/// "DDDD:BB:DD.F" form. The caller names the BDF it asked for; this returns
+/// what senlib actually bound.
+///
+/// # Errors
+/// Returns `Err` if nothing is initialized yet.
+pub fn resolved_pci() -> Result<String, String> {
+    let mut buf = [0 as c_char; 32];
+    // SAFETY: `buf` is a valid 32-byte writable array; the shim writes at most
+    // a NUL-terminated "DDDD:BB:DD.F" (max 12 chars + NUL) into it.
+    let n = unsafe { flex_shim_resolved_pci(buf.as_mut_ptr(), buf.len()) };
+    if n < 0 {
+        return Err("no initialized runtime to read the resolved PCI address from".to_string());
+    }
+    // SAFETY: the shim NUL-terminated the written prefix on success.
+    Ok(unsafe { CStr::from_ptr(buf.as_ptr()) }
+        .to_string_lossy()
+        .into_owned())
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -1022,17 +954,6 @@ unsafe extern "C" {
         out_count: *mut usize,
     ) -> i32;
 
-    /// [`flex_senlib_p2p_create_mapping`] with the peer named by its PCI address
-    /// (`SenPci::pf(const std::string&)`), memoized per address. Safe wrapper:
-    /// [`p2p_create_mapping_at`].
-    fn flex_senlib_p2p_create_mapping_bdf(
-        peer_pci: *const c_char,
-        len_bytes: u64,
-        out_segments: *mut SenlibP2pSegment,
-        max_segments: usize,
-        out_count: *mut usize,
-    ) -> i32;
-
     /// Exports `size` bytes of the open card's `bar` at `offset` as a
     /// DMABuf file descriptor: `PfInterface::get_dmabuf(int bar,
     /// uint64_t offset, size_t size)` (pod `pf_interface.hpp:111` — the
@@ -1152,48 +1073,52 @@ pub fn p2p_create_mapping(
     peer_card_index: u32,
     len_bytes: u64,
 ) -> Result<Vec<SenlibP2pSegment>, String> {
-    // SAFETY: the marshal hands a valid out-buffer of `max` entries and a valid count pointer.
-    marshal_segments(|out, max, count| unsafe {
-        flex_senlib_p2p_create_mapping(peer_card_index, len_bytes, out, max, count)
-    })
-}
-
-/// [`p2p_create_mapping`] with the peer named by its PCI address — the card it IS, never its place
-/// in an enumeration order.
-///
-/// # Errors
-/// As [`p2p_create_mapping`].
-pub fn p2p_create_mapping_at(
-    peer: &PciAddress,
-    len_bytes: u64,
-) -> Result<Vec<SenlibP2pSegment>, String> {
-    // SAFETY: as above; `peer` is a NUL-terminated string the shim copies.
-    marshal_segments(|out, max, count| unsafe {
-        flex_senlib_p2p_create_mapping_bdf(peer.as_c(), len_bytes, out, max, count)
-    })
-}
-
-/// Read a mapping door's `peer_dev_info` out: once into a small buffer, and again, exactly sized,
-/// when the door reports more segments than it held (`out_count` always carries the true total; the
-/// shim's memo makes the second call a re-marshal of the same mapping, never a second mapping).
-///
-/// The first pod run should LOG the returned segments before interpreting them — the `aux` field's
-/// meaning and the `addr` field's DMA-vs-host nature are the experiment's open questions.
-fn marshal_segments(
-    door: impl Fn(*mut SenlibP2pSegment, usize, *mut usize) -> i32,
-) -> Result<Vec<SenlibP2pSegment>, String> {
-    let empty = SenlibP2pSegment {
-        aux: 0,
-        addr: std::ptr::null_mut(),
-    };
-    let mut segments = vec![empty; 8];
+    let mut segments = vec![
+        SenlibP2pSegment {
+            aux: 0,
+            addr: std::ptr::null_mut()
+        };
+        8
+    ];
     let mut count = 0usize;
-    if door(segments.as_mut_ptr(), segments.len(), &mut count) != 0 {
+    // SAFETY: `segments` is a valid mutable slice of `max_segments` entries
+    // for the duration of the call; `out_count` is a valid out-pointer. The
+    // shim is memoized per (peer, len), so the retry below re-marshals the
+    // same mapping rather than creating a second one.
+    let rc = unsafe {
+        flex_senlib_p2p_create_mapping(
+            peer_card_index,
+            len_bytes,
+            segments.as_mut_ptr(),
+            segments.len(),
+            &mut count,
+        )
+    };
+    if rc != 0 {
         return Err(last_shim_error());
     }
     if count > segments.len() {
-        segments.resize(count, empty);
-        if door(segments.as_mut_ptr(), segments.len(), &mut count) != 0 {
+        // The mapping produced more segments than the first buffer held
+        // (`out_count` always carries the true total): re-marshal with an
+        // exactly-sized buffer — idempotent by the shim's memoization.
+        segments.resize(
+            count,
+            SenlibP2pSegment {
+                aux: 0,
+                addr: std::ptr::null_mut(),
+            },
+        );
+        // SAFETY: same as above, now sized for the reported count.
+        let rc = unsafe {
+            flex_senlib_p2p_create_mapping(
+                peer_card_index,
+                len_bytes,
+                segments.as_mut_ptr(),
+                segments.len(),
+                &mut count,
+            )
+        };
+        if rc != 0 {
             return Err(last_shim_error());
         }
     }
@@ -1317,6 +1242,19 @@ unsafe extern "C" {
     /// sentinel (told apart below by whether the shim recorded an error).
     fn flex_senlib_check_and_clear_rdma_status() -> i32;
 
+    /// `cxx-shim/senlib_ffi.cpp`: programs peer `tid`'s base address in this
+    /// card's RDMA base-address table (pf_interface.hpp:178
+    /// `SetBaseAddrTable(uint8_t, uint64_t)` — the vendor's
+    /// `initialize_p2p_address_table` install). Returns 0 on success, -1 on
+    /// shim failure.
+    fn flex_senlib_set_base_addr_table(tid: u8, pci_addr: u64) -> i32;
+
+    /// `cxx-shim/senlib_ffi.cpp`: the PCI address of `bdf`'s BAR `region`,
+    /// as senlib itself resolves it (senpci.hpp:263
+    /// `pciaddr_for_region(PciDevId, int)` — static, no runtime init
+    /// required). Returns 0 on error (a real BAR base is never 0).
+    fn flex_shim_pci_addr_for_region(bdf: *const c_char, region: u8) -> u64;
+
     /// `cxx-shim/hal_sbf.cpp`: the calling thread's most recent hal_sbf
     /// error (`""` if none). Thread-local, owned by the shim, valid until
     /// this thread's next failed hal_sbf call.
@@ -1366,11 +1304,6 @@ unsafe extern "C" {
     /// section words of a response block) into the semantic mirror above.
     /// Returns 0 on success, -1 on refusal.
     fn flex_hal_r5_appdata_decode(app_words: *const u64, out: *mut HalR5AppData) -> i32;
-
-    /// `cxx-shim/hal_sbf.cpp`: the xseg word alone, by the same compose the
-    /// Rdma12 send encoder fills its xseg field with. Returns 0 on success,
-    /// -1 on refusal.
-    fn flex_hal_xseg_compose(dest_remote_base_bytes: u64, out_xseg: *mut u32) -> i32;
 }
 
 /// The calling thread's most recent hal_sbf error message, for attaching to
@@ -1410,25 +1343,6 @@ pub fn write_xseg(sid: u8, xseg: u32) -> Result<(), String> {
     }
 }
 
-/// Safe wrapper: the xseg word for a (compensated) remote base, composed by
-/// the SAME shim function that fills the Rdma12 send section's xseg field —
-/// so the word a receiver hands [`write_xseg`] and the word its peer's send
-/// carries agree by construction, never by two spellings of one compose.
-///
-/// # Errors
-/// Returns `Err` with the shim's message on a refused base (misaligned, or
-/// past the word's flit field).
-pub fn hal_xseg_compose(dest_remote_base_bytes: u64) -> Result<u32, String> {
-    let mut xseg = 0u32;
-    // SAFETY: a plain integer in and a valid out-pointer.
-    let rc = unsafe { flex_hal_xseg_compose(dest_remote_base_bytes, &mut xseg) };
-    if rc == 0 {
-        Ok(xseg)
-    } else {
-        Err(last_hal_error())
-    }
-}
-
 /// Safe wrapper: read back the XSEG[SID] translation-table entry for `sid`.
 ///
 /// # Errors
@@ -1454,6 +1368,42 @@ pub fn read_wdone(sid: u8) -> Result<u32, String> {
     let rc = unsafe { flex_senlib_read_wdone(sid, &mut val) };
     if rc == 0 {
         Ok(val)
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper: program peer `tid`'s base address in this card's RDMA
+/// base-address table — the symmetric-BAT install (every rank installs every
+/// peer's BAR2, the vendor's `initialize_p2p_address_table` shape) the
+/// engine's `SetTid(dest BAT index)` resolves through.
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the install did not reach senlib.
+pub fn set_base_addr_table(tid: u8, pci_addr: u64) -> Result<(), String> {
+    // SAFETY: plain integer arguments; the shim checks its own runtime state
+    // before touching senlib.
+    let rc = unsafe { flex_senlib_set_base_addr_table(tid, pci_addr) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper: the PCI address of `bdf`'s BAR `region`, as senlib itself
+/// resolves it — the vendor's own BAT value source. A `region` of 2 is
+/// BAR2, the no-NTB P2P base the BAT installs.
+///
+/// # Errors
+/// Returns `Err` if senlib resolved 0 (a real BAR base is never 0).
+pub fn pci_addr_for_region(bdf: &str, region: u8) -> Result<u64, String> {
+    let c_bdf = std::ffi::CString::new(bdf).map_err(|_| "BDF contains a NUL byte".to_string())?;
+    // SAFETY: `c_bdf` is a NUL-terminated CString valid for the duration of
+    // the static senlib call; the shim does not retain the pointer.
+    let v = unsafe { flex_shim_pci_addr_for_region(c_bdf.as_ptr(), region) };
+    if v != 0 {
+        Ok(v)
     } else {
         Err(last_shim_error())
     }
@@ -1652,49 +1602,5 @@ pub fn hal_r5_appdata_decode(app_words: &[u64; 4]) -> Result<HalR5AppData, Strin
         Ok(out)
     } else {
         Err(last_hal_error())
-    }
-}
-
-#[cfg(test)]
-mod pci_address_tests {
-    use super::*;
-
-    /// A card is named `dddd:bb:dd.f`; anything else — an enumeration index, a short form, a
-    /// function past 7 — is refused by name, and hex is kept lowercase.
-    #[test]
-    fn a_card_is_named_by_its_full_pci_address() {
-        let a = PciAddress::parse("0000:3B:00.0").unwrap();
-        assert_eq!(a.as_str(), "0000:3b:00.0");
-        assert_eq!(a, PciAddress::parse("0000:3b:00.0").unwrap());
-        for bad in [
-            "0",
-            "3b:00.0",
-            "0000:3b:00",
-            "0000:3b:00.8",
-            "0000:3b.00:0",
-            "0000:3b:00:0",
-            "000g:3b:00.0",
-            "0000:3b:00.0 ",
-            "",
-        ] {
-            assert_eq!(
-                PciAddress::parse(bad),
-                Err(NotAPciAddress(bad.to_string())),
-                "{bad:?}"
-            );
-        }
-    }
-
-    /// A sysfs `resource` file's region starts, by line; an unassigned region (all zeros) and a
-    /// missing one read as none.
-    #[test]
-    fn a_region_base_is_its_line_of_the_resource_file() {
-        let resource = "0x00000000d4000000 0x00000000d4ffffff 0x0000000000040200\n\
-                        0x0000000000000000 0x0000000000000000 0x0000000000000000\n\
-                        0x0000038000000000 0x0000038fffffffff 0x000000000014220c\n";
-        assert_eq!(region_base_of(resource, 0), Some(0xd400_0000));
-        assert_eq!(region_base_of(resource, 1), None);
-        assert_eq!(region_base_of(resource, 2), Some(0x0380_0000_0000));
-        assert_eq!(region_base_of(resource, 3), None);
     }
 }

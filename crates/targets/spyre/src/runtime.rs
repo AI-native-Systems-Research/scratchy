@@ -76,20 +76,20 @@ fn runtime_cell() -> &'static Mutex<Option<RuntimeInit>> {
 /// topology query that has no call site anywhere else.
 fn build_runtime() -> Result<Arc<RuntimeContext>, BringUpError> {
     match card_cell().get() {
-        // ⭐ THE BIND, AND ITS PROOF: open the card by its address, then hold senlib's own
-        // resolution of the open card to it before anything else touches the device.
+        // ⭐ THE BIND, AND ITS PROOF (#1008's doors, as the tp37 cell runs them): open the card
+        // by its address, then hold senlib's own resolution of the open card to it before
+        // anything else touches the device.
         Some(pci) => {
-            flex_rs::senlib_ffi::init_runtime_at(pci).map_err(|(rc, why)| {
+            flex_rs::senlib_ffi::init_runtime_bdf(pci.as_str()).map_err(|why| {
                 BringUpError::OpenAt {
                     pci: pci.clone(),
-                    rc,
                     why,
                 }
             })?;
             let resolved = flex_rs::senlib_ffi::resolved_pci();
             if !resolved
                 .as_deref()
-                .is_some_and(|r| r.eq_ignore_ascii_case(pci.as_str()))
+                .is_ok_and(|r| r.eq_ignore_ascii_case(pci.as_str()))
             {
                 return Err(BringUpError::WrongCard {
                     asked: pci.clone(),
@@ -149,7 +149,67 @@ fn build_runtime() -> Result<Arc<RuntimeContext>, BringUpError> {
     RuntimeContext::create(None, scheduler, allocator).map_err(BringUpError::Context)
 }
 
-pub use flex_rs::senlib_ffi::{NotAPciAddress, PciAddress};
+/// ⭐ A CARD'S PCI ADDRESS — `dddd:bb:dd.f` (domain, bus, device, function), lowercase: what senlib
+/// selects a card by (`flex_rs::senlib_ffi::init_runtime_bdf`, `SenPci::pf(const std::string&)`)
+/// and reports back (`resolved_pci`, the same lowercase form). Minted only by
+/// [`PciAddress::parse`], so a value is always one address the doors can be handed whole.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PciAddress(String);
+
+/// A string that is not a `dddd:bb:dd.f` PCI address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotAPciAddress(pub String);
+
+impl fmt::Display for NotAPciAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:?} is not a PCI address — a card is named `dddd:bb:dd.f` (domain, bus, device, \
+             function), e.g. `0000:3b:00.0`",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NotAPciAddress {}
+
+impl PciAddress {
+    /// `Ok` iff `s` is `dddd:bb:dd.f`: four, two and two hex digits and a function 0–7. Hex
+    /// digits are taken in either case and kept lowercase.
+    ///
+    /// # Errors
+    /// [`NotAPciAddress`].
+    pub fn parse(s: &str) -> Result<Self, NotAPciAddress> {
+        let hex = |p: &str, n: usize| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit());
+        let well_formed = match s.split([':', '.']).collect::<Vec<_>>().as_slice() {
+            [domain, bus, device, function] => {
+                hex(domain, 4)
+                    && hex(bus, 2)
+                    && hex(device, 2)
+                    && matches!(function.as_bytes(), [b'0'..=b'7'])
+                    && s.as_bytes()[4] == b':'
+                    && s.as_bytes()[7] == b':'
+                    && s.as_bytes()[10] == b'.'
+            }
+            _ => false,
+        };
+        if well_formed {
+            Ok(Self(s.to_ascii_lowercase()))
+        } else {
+            Err(NotAPciAddress(s.to_string()))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PciAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// Which card a process's runtime opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -463,15 +523,11 @@ pub enum BringUpError {
     /// `flex_shim_init_runtime` — the senlib device init — returned a nonzero rc.
     ShimInit(i32),
     /// The card the process chose ([`drive_card`]) would not open at its address.
-    OpenAt {
-        pci: PciAddress,
-        rc: i32,
-        why: String,
-    },
+    OpenAt { pci: PciAddress, why: String },
     /// The open card is not the one asked for: senlib resolved another address (or none).
     WrongCard {
         asked: PciAddress,
-        resolved: Option<String>,
+        resolved: Result<String, String>,
     },
     /// `FlexAllocator::new` refused the domain topology.
     AllocatorInit(FlexAllocatorError),
@@ -485,15 +541,18 @@ impl fmt::Display for BringUpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ShimInit(rc) => write!(f, "flex_shim_init_runtime failed: rc={rc}"),
-            Self::OpenAt { pci, rc, why } => {
-                write!(f, "the card at {pci} did not open (rc={rc}): {why}")
-            }
-            Self::WrongCard { asked, resolved } => write!(
-                f,
-                "asked for the card at {asked}, but senlib opened {} — the bind did not select \
-                 the card",
-                resolved.as_deref().unwrap_or("no card")
-            ),
+            Self::OpenAt { pci, why } => write!(f, "the card at {pci} did not open: {why}"),
+            Self::WrongCard { asked, resolved } => match resolved {
+                Ok(r) => write!(
+                    f,
+                    "asked for the card at {asked}, but senlib opened {r} — the bind did not \
+                     select the card"
+                ),
+                Err(why) => write!(
+                    f,
+                    "asked for the card at {asked}, but senlib resolves no open card: {why}"
+                ),
+            },
             Self::AllocatorInit(e) => write!(f, "{e}"),
             Self::Scheduler(e) => write!(f, "{e}"),
             Self::Context(e) => write!(f, "{e}"),
@@ -1095,10 +1154,13 @@ impl Stream {
                 // reading the operand before the compute that writes it has retired.
                 BatchedCb::Send(s) => build_rdma_send_cb(&resolver, &s.params(), tag, true)
                     .map_err(HwError::CbRender)?,
-                BatchedCb::Wait { sid } => {
-                    ControlBlockWire::rdma_wdone_wait(tag, &[*sid], false)
-                        .map_err(|e| HwError::CbRender(format!("rdma_wdone_wait: {e:?}").into()))?
-                }
+                // `submit_p2p_rdma_wait`'s CB, in the stream: #1008's wdone door (`sync` set),
+                // placed by its builder.
+                BatchedCb::Wait { sid } => ControlBlockWire::p2p_rdma_wait(
+                    tag,
+                    flex_rs::hal_sbf::rdma10_wdone_wait(&[u64::from(*sid)], true)
+                        .map_err(|e| HwError::CbRender(format!("rdma10_wdone_wait: {e}").into()))?,
+                ),
             });
         }
         Ok(cbs)
@@ -1235,7 +1297,7 @@ pub struct RdmaSend {
     pub source: RdmaEnd,
     pub window: RdmaEnd,
     /// This message's place in its send's run.
-    pub place: flex_rs::control_block_wire::RunPlace,
+    pub place: flex_rs::scheduler::RunPlace,
 }
 
 impl RdmaSend {
@@ -1438,17 +1500,10 @@ pub enum AttachRefusal {
         linked: (TpIdentity, RecvWindow),
         asked: (TpIdentity, RecvWindow),
     },
-    /// The cross-port IOMMU mapping to the peer card was refused.
-    Mapping(flex_rs::multi_device::RdmaUnitError),
-    /// The mapping did not install the peer card's region-2 bus address, as read off the kernel's
-    /// view of the card (`installed`: the mapping's segment addresses).
-    BatNotThePeer {
-        peer: PciAddress,
-        region2: u64,
-        installed: Vec<u64>,
-    },
-    /// The peer card's region-2 bus address could not be read.
+    /// senlib could not name the peer card's region-2 address.
     PeerRegion(String),
+    /// Base-address-table entry `tid` could not be installed.
+    Bat { tid: u8, why: String },
     /// The runtime this card's side of the link needs did not come up.
     BringUp(String),
     /// The window's xseg word did not compose, or `XSEG[peer sid]` could not be programmed.
@@ -1474,21 +1529,14 @@ impl fmt::Display for AttachRefusal {
                 "this process is linked as {linked:?} and cannot link again as {asked:?} — one \
                  card has one XSEG[peer sid], so every bundle it runs shares one window"
             ),
-            Self::Mapping(e) => write!(
+            Self::PeerRegion(e) => write!(
                 f,
-                "the cross-port p2p mapping to the peer card was refused: {e:?} (device p2p RDMA \
-                 is the only path; there is no host fallback)"
+                "the peer card's region-2 address could not be read: {e} (device p2p RDMA is the \
+                 only path; there is no host fallback)"
             ),
-            Self::BatNotThePeer {
-                peer,
-                region2,
-                installed,
-            } => write!(
-                f,
-                "the p2p mapping did not install the peer card's region-2 address: the card at \
-                 {peer} decodes region 2 at {region2:#x}, the mapping installed {installed:#x?}"
-            ),
-            Self::PeerRegion(e) => write!(f, "the peer card's region 2 could not be read: {e}"),
+            Self::Bat { tid, why } => {
+                write!(f, "installing base-address-table entry {tid} failed: {why}")
+            }
             Self::BringUp(e) => write!(f, "the card runtime did not come up: {e}"),
             Self::Xseg(e) => write!(f, "programming XSEG[peer sid] failed: {e}"),
         }
@@ -1498,11 +1546,11 @@ impl fmt::Display for AttachRefusal {
 impl std::error::Error for AttachRefusal {}
 
 /// ⭐ THE P2P LINK A SHARDED SESSION SENDS OVER — tensor parallelism's one load-time fact: which
-/// physical card is the peer. Minted only by [`link_peer`], which maps the peer card over the
-/// cross-port IOMMU (device p2p RDMA, `P2pProtocol::P2pRdma` — never host DMA) and programs this
-/// card's `XSEG[peer sid]` with the receive window's word, the same word every peer send carries.
-/// A session holding one has done both, so its sends have somewhere to land and its waits have
-/// something to count.
+/// physical card is the peer. Minted only by [`link_peer`], which installs the peer card's
+/// region-2 address in this card's base-address table (device p2p RDMA — never host DMA) and
+/// programs this card's `XSEG[peer sid]` with the receive window's word, the same word every peer
+/// send carries. A session holding one has done both, so its sends have somewhere to land and its
+/// waits have something to count.
 ///
 /// ONE PER PROCESS. The process drives one card and the card has one `XSEG[peer sid]`, so every
 /// bundle the process runs (decode, prefill, every rung) lands its peer's sends in the one window
@@ -1570,46 +1618,32 @@ pub fn link_peer(
     }
     drive_card(&cards.own).map_err(AttachRefusal::NotDriven)?;
     init_runtime().map_err(|e| AttachRefusal::BringUp(e.to_string()))?;
-    let mut unit = flex_rs::multi_device::RdmaUnit::new(
-        flex_rs::multi_device::RankId(me.rank()),
-        me.world().get(),
-        true,
-    );
-    // ⭐ THE MAPPING'S LENGTH COVERS THE WINDOW: `[0, window.end())` of the peer's weight segment
-    // holds `[window.offset(), window.end())` — the window starts deep in the segment (above the
-    // packed weights), so its SIZE alone would not reach it.
-    let mapping = unit
-        .attach_peer(
-            flex_rs::multi_device::RankId(u32::from(route.dest_tid)),
-            &cards.peer,
-            window.end(),
-        )
-        .map_err(AttachRefusal::Mapping)?;
-    // ⭐ THE BAT INSTALL, ASSERTED (#1009 review, item 5): the mapping installs the peer card's
-    // region-2 bus address (measured on card, both ranks symmetric), and the kernel's own reading
-    // of the peer's config space is what it must equal — the card the address names, never an
-    // enumeration order.
-    let region2 = cards
-        .peer
-        .region_base(2)
+    // ⭐ THE SYMMETRIC BAT, AS THE tp37 CELL INSTALLS IT (#1008): entry `dest_tid` — the peer's
+    // rank, the destination every send names — holds the peer card's region-2 PCI address, from
+    // senlib's own region-address door (the vendor's `initialize_p2p_address_table` value
+    // source), for the card the address names, never an enumeration order.
+    let peer_region2 = flex_rs::senlib_ffi::pci_addr_for_region(cards.peer.as_str(), 2)
         .map_err(AttachRefusal::PeerRegion)?;
-    let installed: Vec<u64> = mapping.segments().iter().map(|s| s.addr as u64).collect();
-    if !installed.contains(&region2) {
-        return Err(AttachRefusal::BatNotThePeer {
-            peer: cards.peer.clone(),
-            region2,
-            installed,
-        });
-    }
-    let landing = flex_rs::control_block_wire::VirtualAddressSbf::new(
-        RecvWindow::SEGMENT as u8,
-        flex_rs::control_block_wire::Flits::from_bytes(window.offset()),
-    );
-    let word = flex_rs::control_block_wire::window_xseg(landing).map_err(AttachRefusal::Xseg)?;
+    flex_rs::senlib_ffi::set_base_addr_table(route.dest_tid, peer_region2).map_err(|why| {
+        AttachRefusal::Bat {
+            tid: route.dest_tid,
+            why,
+        }
+    })?;
+    // ⭐ THE RECEIVER'S XSEG[peer sid], AS THE tp37 CELL PROGRAMS IT: `hal_sbf::rdma_xseg` of the
+    // window's flat VA plus the one-flit L4 compensation — the same compensated destination
+    // `scheduler::build_rdma_send_cb` hands the send door.
+    let window_va = flex_rs::control_block_wire::Flits(
+        flex_rs::control_block_wire::VirtualAddressSbf::new(
+            RecvWindow::SEGMENT as u8,
+            flex_rs::control_block_wire::Flits::from_bytes(window.offset()),
+        )
+        .value(),
+    )
+    .to_bytes();
+    let word = flex_rs::hal_sbf::rdma_xseg(window_va + flex_rs::control_block_wire::Flits::BYTES)
+        .map_err(AttachRefusal::Xseg)?;
     flex_rs::senlib_ffi::write_xseg(route.peer_sid, word).map_err(AttachRefusal::Xseg)?;
-    // The mapping lives as long as the process: the link is never dropped, so the unit holding it
-    // is leaked rather than kept (its raw segment pointers keep it out of any process-wide value).
-    std::mem::forget(unit);
     let link: &'static PeerLink = Box::leak(Box::new(PeerLink { me, route, window }));
     *cell = Some(link);
     Ok(link)
@@ -1692,6 +1726,32 @@ mod tests {
         );
         let alone = TpWorld::of::<1>().ranks().next().unwrap();
         assert_eq!(PeerRoute::of(alone), None);
+    }
+
+    /// A card is named by its full PCI address, in either case, kept lowercase; anything else is
+    /// refused by name.
+    #[test]
+    fn a_card_is_named_by_its_full_pci_address() {
+        let a = PciAddress::parse("0000:3B:00.0").unwrap();
+        assert_eq!(a.as_str(), "0000:3b:00.0");
+        assert_eq!(a, PciAddress::parse("0000:3b:00.0").unwrap());
+        for bad in [
+            "0",
+            "3b:00.0",
+            "0000:3b:00",
+            "0000:3b:00.8",
+            "0000:3b.00:0",
+            "0000:3b:00:0",
+            "000g:3b:00.0",
+            "0000:3b:00.0 ",
+            "",
+        ] {
+            assert_eq!(
+                PciAddress::parse(bad),
+                Err(NotAPciAddress(bad.to_string())),
+                "{bad:?}"
+            );
+        }
     }
 
     /// The two refusals that need no card: a world of one has no peer, and a peer card that is

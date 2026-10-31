@@ -77,8 +77,7 @@ use crate::address::{ByteSize, Chunk, CompositeAddress};
 use crate::compute::{ComputeParams, ComputeWireBatch};
 use crate::control_block_wire::{
     AllocationTotalSize, ControlBlockWire, DevicePhysicalAddress, Flits, HostPhysicalAddress,
-    RdmaEndpoint, RdmaUnicastSend, ResponseTag, RunPlace, SegmentExtent, TransferSize,
-    VirtualAddressSbf, XlatWindow,
+    ResponseTag, SegmentExtent, TransferSize, VirtualAddressSbf,
 };
 use crate::dma::{DmaDirection, DmaParams, DmaPipelineShape, FillParams, FillPipeline};
 use crate::flex_config::{DeviceKind, RuntimeConfig};
@@ -537,6 +536,12 @@ pub struct P2PDataParams {
     pub op_name: String,
     pub is_send: bool,
 }
+
+/// Port of the vendor's unicast chunk bound
+/// (`pf_runtime_scheduler.cpp:50 constexpr uint32_t P2P_RDMA_WINDOW_SIZE
+/// = 4 * 1024 * 1024`): `submitP2PRdmaSend`'s loop sends one Rdma12 CB per
+/// window-sized chunk of the transfer.
+const P2P_RDMA_WINDOW_SIZE: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct P2PRdmaSendParams {
@@ -1331,7 +1336,25 @@ pub struct RdmaOperand {
     pub offset: u64,
 }
 
-/// One F-send to render (`ControlBlockWire::rdma_unicast_send`), its endpoints still allocations.
+/// A message's place in its send's run — the send section's own `first` / `last` protocol bits,
+/// as [`PfBackend::submit_p2p_rdma_send`]'s window loop sets them: `first` on the first chunk,
+/// `last` on the final one; a one-message send is both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunPlace {
+    pub first: bool,
+    pub last: bool,
+}
+
+impl RunPlace {
+    /// The only message of its send.
+    pub const ALONE: Self = Self {
+        first: true,
+        last: true,
+    };
+}
+
+/// One F-send message to render in a CB stream ([`build_rdma_send_cb`]), its endpoints still
+/// allocations.
 pub struct RdmaSendParams {
     /// The SENDING rank's write-done sid.
     pub sid: u8,
@@ -1346,22 +1369,23 @@ pub struct RdmaSendParams {
     pub place: RunPlace,
 }
 
-/// Build the F-send CB for `send`. Each endpoint's segment translates through ITS BASE exactly as
-/// [`build_compute_cb`] translates a tensor operand (the allocation's absolute address, the
-/// allocation's own size), so a send and the compute launch it is aimed from read one segment
-/// through one translation.
+/// Build ONE message's F-send CB for a CB stream that runs it beside the compute feeding it: the
+/// per-chunk CB of [`PfBackend::submit_p2p_rdma_send`] — the #1008 door's words
+/// (`hal_sbf::rdma12_unicast_send`: `sync` set, `xsegv` clear, the L4 one-flit compensation on the
+/// destination) placed by [`ControlBlockWire::p2p_rdma_send`] — with the source segment translated
+/// exactly as [`build_compute_cb`] translates a tensor operand (the allocation's absolute address,
+/// the allocation's own size), and the CTRL barrier set when `pipeline_barrier`.
 ///
 /// # Errors
 /// An endpoint whose transfer runs past its allocation (a window too small for the payload, or a
-/// fragment past its operand), an interleaved or unresolvable allocation, or the wire's refusal.
+/// fragment past its operand), an interleaved or unresolvable allocation, or the door's refusal.
 pub fn build_rdma_send_cb(
     resolver: &dyn DeviceAddressResolver,
     send: &RdmaSendParams,
     tag: ResponseTag,
     pipeline_barrier: bool,
 ) -> Result<ControlBlockWire, SchedulerError> {
-    let endpoint = |which: &str, o: &RdmaOperand| -> Result<RdmaEndpoint, SchedulerError> {
-        let resolved = resolve_single_chunk(resolver, &o.base)?;
+    for (which, o) in [("source", &send.source), ("window", &send.window)] {
         let size = o.base.total_size().as_u64();
         if o.offset + send.length.0 > size {
             return Err(mock_error(&format!(
@@ -1372,24 +1396,42 @@ pub fn build_rdma_send_cb(
                 o.segment,
             )));
         }
-        Ok(RdmaEndpoint {
-            dmva: VirtualAddressSbf::new(o.segment, Flits::from_bytes(o.offset)),
-            xlat: XlatWindow {
-                region_paddr: resolved.xlat_absolute(),
-                length: SegmentExtent(size),
-            },
-        })
-    };
-    let wire = RdmaUnicastSend {
-        sid: send.sid,
-        dest_tid: send.dest_tid,
-        length: send.length,
-        source: endpoint("source", &send.source)?,
-        window: endpoint("window", &send.window)?,
-        place: send.place,
-    };
-    ControlBlockWire::rdma_unicast_send(tag, &wire, pipeline_barrier)
-        .map_err(|e| mock_error(&format!("build_rdma_send_cb: {e:?}")))
+    }
+    let source = resolve_single_chunk(resolver, &send.source.base)?;
+    // The window's flat VA — the same on the peer (one layout on every card), the `dst_offset`
+    // the tp37 cell composes from the receiver's segment and offset.
+    let window = Flits(
+        VirtualAddressSbf::new(send.window.segment, Flits::from_bytes(send.window.offset)).value(),
+    )
+    .to_bytes();
+    let dest_tids = [u64::from(send.dest_tid)];
+    let words = crate::hal_sbf::rdma12_unicast_send(&crate::senlib_ffi::Rdma12UnicastSendParams {
+        sid: u64::from(send.sid),
+        dest_tids: &dest_tids,
+        length_bytes: send.length.0,
+        src_segment: u64::from(send.source.segment),
+        src_offset_bytes: send.source.offset,
+        // ⭐ L4, as `submit_p2p_rdma_send` compensates it: the engine lands one flit below.
+        dest_remote_base_bytes: window + Flits::BYTES,
+        first: send.place.first,
+        last: send.place.last,
+        sync: true,
+        xsegv: false,
+    })
+    .map_err(|e| mock_error(&format!("build_rdma_send_cb: the send door refused — {e}")))?;
+    let cb = ControlBlockWire::p2p_rdma_send(
+        tag,
+        words,
+        u32::from(send.source.segment),
+        source.xlat_absolute(),
+        SegmentExtent(send.source.base.total_size().as_u64()),
+    )
+    .map_err(|e| mock_error(&format!("build_rdma_send_cb: xlat — {e:?}")))?;
+    Ok(if pipeline_barrier {
+        cb.with_ctrl_barrier()
+    } else {
+        cb
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -4894,33 +4936,150 @@ impl SchedulerBackend for PfBackend {
         );
     }
 
-    /// Real `PfRuntimeScheduler::submitP2PRdmaSend` (`pf_runtime_scheduler.cpp:488-608`)
-    /// builds a full unicast/multicast RDMA CB sequence and performs the
-    /// transfer. Porting that (window-chunked RDMA CB building against
-    /// `P2P_RDMA_WINDOW_SIZE`, multicast fan-out) is separate scope from this
-    /// pass. Previously stubbed to silent fake-success; an explicit error is
-    /// strictly better — a caller that believes an RDMA send happened when it
-    /// never did is a correctness bug in its own right.
+    /// Port of `PfRuntimeScheduler::submitP2PRdmaSend` (live pod file
+    /// `/project_src/flex/src/runtime_stream/1p0/pf_runtime_scheduler.cpp`,
+    /// `submitP2PRdmaSend` :289-447 — the unicast path; the multicast path is
+    /// refused at the door, per the tp=2 ring's unicast law). The vendor's
+    /// head, quoted: `dmva_offset = compositeAddressToDmva(*device_address)`,
+    /// `dmva_size = device_address->total_size()`, one single-entry
+    /// SegmentTable at `seg_offset + dmva_size`, then the unicast loop — one
+    /// Rdma12 RDMA_SINGLECAST CB per `P2P_RDMA_WINDOW_SIZE` (4 MiB) chunk,
+    /// `SetSync(true)`, submitted on `PipelineId::COMPUTE`.
+    ///
+    /// ⭐ THE DOORS, NOT A RE-ENCODING: each chunk's DMO section is the #1008
+    /// door's finished words (`hal_sbf::rdma12_unicast_send`), which packs
+    /// the vendor loop's ten setters and refuses the laws at its own face —
+    /// the unicast law (one destination), and the F-SEND law: the vendor loop
+    /// sets `SetXsegv(true)` (the T-send preamble), which the recorded
+    /// transport laws override (L3/E8: the receiver's XSEG table is
+    /// authoritative and host-programmed; an F-send's CB word is ignored) —
+    /// `xsegv: false` here and the door refuses anything else.
+    ///
+    /// ⭐ THE −128 LANDING COMPENSATION (L4, ONE SITE): the engine writes ONE
+    /// FLIT (128 B) BELOW the xseg-resolved destination — engine-fixed,
+    /// measured on both preamble paths. Compensated HERE, at the caller of
+    /// the door, exactly once: `dest_remote_base_bytes + 128`. Never a knob,
+    /// never a second site.
     fn submit_p2p_rdma_send(
         &self,
-        _state: &Arc<SchedulerState>,
-        _params: &P2PRdmaSendParams,
+        state: &Arc<SchedulerState>,
+        params: &P2PRdmaSendParams,
         callback: CompletionCallback,
     ) {
-        callback(Err(mock_error(
-            "PfRuntimeScheduler: submitP2PRdmaSend not implemented in this port (known gap — real RDMA CB building out of scope)",
-        )));
+        // The unicast shape the door demands, named here before any CB is
+        // built: one sid (the signal is from OUR rank, L1), one destination.
+        if params.sid_list.len() != 1 {
+            return callback(Err(mock_error(&format!(
+                "PfRuntimeScheduler::submitP2PRdmaSend: the tp=2 ring is unicast — sid_list carries \
+                 {} sid(s), exactly one (this rank's) is legal",
+                params.sid_list.len()
+            ))));
+        }
+        let resolved =
+            match resolve_single_chunk(self.addr_resolver.as_ref(), &params.device_address) {
+                Ok(r) => r,
+                Err(e) => return callback(Err(e)),
+            };
+        let total = params.device_address.total_size().as_u64();
+        let xlat_length = resolved.segment_extent(0, total);
+        let sid = u64::from(params.sid_list[0]);
+        // The door words per chunk, pre-rendered: the build closure below
+        // stamps only the response tags onto the assembled CBs.
+        let mut words_per_chunk: Vec<[u64; 2]> = Vec::new();
+        let mut offset = 0u64;
+        let mut remaining = total;
+        let mut first = true;
+        while remaining > 0 {
+            let chunk_len = remaining.min(P2P_RDMA_WINDOW_SIZE);
+            let door = crate::senlib_ffi::Rdma12UnicastSendParams {
+                sid,
+                dest_tids: &params.dest_ranks,
+                length_bytes: chunk_len,
+                src_segment: u64::from(resolved.segment),
+                src_offset_bytes: resolved.offset_bytes + offset,
+                // ⭐ L4: the engine lands one flit (128 B) BELOW the
+                // xseg-resolved destination — compensated at this ONE site,
+                // the door's caller, per the recorded law.
+                dest_remote_base_bytes: params.dst_offset + offset + 128,
+                first,
+                last: chunk_len == remaining,
+                sync: true,
+                xsegv: false,
+            };
+            match crate::hal_sbf::rdma12_unicast_send(&door) {
+                Ok(words) => words_per_chunk.push(words),
+                Err(e) => {
+                    return callback(Err(mock_error(&format!(
+                        "PfRuntimeScheduler::submitP2PRdmaSend: the send door refused — {e}"
+                    ))));
+                }
+            }
+            first = false;
+            offset += chunk_len;
+            remaining -= chunk_len;
+        }
+        let num_cbs = words_per_chunk.len() as u64;
+        let segment = u32::from(resolved.segment);
+        let region_paddr = resolved.xlat_base();
+        submit_to_hardware(
+            state,
+            self.response_worker(),
+            self.capacity.as_ref(),
+            SubmitShape::ops(PipelineId::Compute),
+            num_cbs,
+            callback,
+            |tags| {
+                let mut cbs = Vec::with_capacity(tags.len());
+                for (i, tag) in tags.iter().enumerate() {
+                    cbs.push(
+                        ControlBlockWire::p2p_rdma_send(
+                            *tag,
+                            words_per_chunk[i],
+                            segment,
+                            region_paddr,
+                            xlat_length,
+                        )
+                        .map_err(|e| {
+                            mock_error(&format!(
+                                "PfRuntimeScheduler::submitP2PRdmaSend: xlat — {e:?}"
+                            ))
+                        })?,
+                    );
+                }
+                Ok(cbs)
+            },
+        );
     }
-    /// Same known gap as `submit_p2p_rdma_send`, for the wait side.
+    /// Port of `PfRuntimeScheduler::submitP2PRdmaWait` (pf_runtime_scheduler.cpp:449-493):
+    /// ONE Rdma10 RDMA_WDONE_BARRIER CB — the DMI slot carries the #1008
+    /// door's finished words (`hal_sbf::rdma10_wdone_wait`), over an EMPTY
+    /// segment table ("wdone barrier doesn't need segment translations"),
+    /// `SetSync(true)`, submitted on `PipelineId::COMPUTE`. The sids are the
+    /// SENDERS' rank numbers (L1: the receiver waits the SOURCE rank's sid);
+    /// the door refuses duplicates and the shim composes the bitmask.
     fn submit_p2p_rdma_wait(
         &self,
-        _state: &Arc<SchedulerState>,
-        _params: &P2PRdmaWaitParams,
+        state: &Arc<SchedulerState>,
+        params: &P2PRdmaWaitParams,
         callback: CompletionCallback,
     ) {
-        callback(Err(mock_error(
-            "PfRuntimeScheduler: submitP2PRdmaWait not implemented in this port (known gap — real RDMA CB building out of scope)",
-        )));
+        let sids: Vec<u64> = params.sid_list.iter().map(|&s| u64::from(s)).collect();
+        submit_to_hardware(
+            state,
+            self.response_worker(),
+            self.capacity.as_ref(),
+            SubmitShape::ops(PipelineId::Compute),
+            1,
+            callback,
+            |tags| {
+                let words = crate::hal_sbf::rdma10_wdone_wait(&sids, true).map_err(|e| {
+                    mock_error(&format!(
+                        "PfRuntimeScheduler::submitP2PRdmaWait: the wait door refused — {e}"
+                    ))
+                })?;
+                Ok(vec![ControlBlockWire::p2p_rdma_wait(tags[0], words)])
+            },
+        );
     }
     fn submit_p2p_firmware_signal(
         &self,
