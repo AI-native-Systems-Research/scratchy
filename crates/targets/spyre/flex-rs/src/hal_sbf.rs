@@ -173,6 +173,35 @@ pub fn rdma10_wdone_wait(sids: &[u64], sync: bool) -> Result<[u64; 2], String> {
     senlib_ffi::hal_rdma10_wdone_wait_encode(sids, sync)
 }
 
+/// The composed XSEG[SID] table word for a remote base, in the caller's
+/// COMPENSATED form (the base the engine should resolve the transfer's
+/// destination through). This is the same word the send encoder composes
+/// in-shim (`cxx-shim/hal_sbf.cpp`: flits, then the valid bit 30, then odd
+/// parity over the result — the vendor loop's own compose), factored out so
+/// the RECEIVER can host-program its table with the identical value
+/// (`senlib_ffi::write_xseg`) — the F-send law's other half. One compose,
+/// two destinations; keeping it beside the send door is what makes that
+/// sameness a file-local fact instead of a cross-tree promise.
+///
+/// Refuses by name when the flits leave no room for the two high bits (the
+/// same bound the shim's send encoder refuses).
+///
+/// # Errors
+/// Returns `Err` if `dest_remote_base_bytes` overflows the xseg word.
+pub fn rdma_xseg(dest_remote_base_bytes: u64) -> Result<u32, String> {
+    let flits = dest_remote_base_bytes >> 7;
+    if flits >= 1 << 30 {
+        return Err(format!(
+            "dest_remote_base_bytes 0x{dest_remote_base_bytes:X} overflows the xseg word: its \
+             flits leave no room for the valid (30) and parity (31) bits"
+        ));
+    }
+    let mut xseg = flits;
+    xseg |= 1 << 30; // the valid bit
+    xseg |= u64::from((xseg.count_ones() & 1) == 1) << 31; // odd parity
+    Ok(xseg as u32)
+}
+
 /// The R5 appdata arm of a response block: the four APP section words,
 /// exactly as the response block carries them, decoded through the SDK's
 /// own getters into the semantic mirror. The arm is only meaningful when
