@@ -415,12 +415,13 @@ impl GdnStateDims {
         )
     }
 
-    /// One layer's lane shapes: a conv stream a channel, `[lanes, conv_dim, conv_stream_len]`, and
+    /// One layer's lane shapes: two conv stream areas a channel, `[lanes, 2 · conv_dim,
+    /// conv_stream_len]` (the previous verify step's and this one's, as its two record areas), and
     /// a lane's records, `[lanes, ssm_lane_len]`.
     fn lane_shapes(self, lanes: DraftLanes) -> ([usize; 3], [usize; 2]) {
         let (count, rows) = (usize::from(lanes.count()), lanes.rows());
         (
-            [count, self.conv_dim, self.conv_stream_len(rows)],
+            [count, 2 * self.conv_dim, self.conv_stream_len(rows)],
             [count, self.ssm_lane_len(rows)],
         )
     }
@@ -736,8 +737,9 @@ mod tests {
 
     /// A slot costs what it costs without drafts; the drafts' conv streams and records cost their
     /// lanes alone. Qwen3.6-35B-A3B's geometry: 128 slots and 4 lanes of 2 drafts keep the
-    /// draft state of 4 sequences, where a draft area in every slot kept it for 128 (11.3 MiB a
-    /// lane over its 30 GDN layers; 14.1 MiB when the conv kept a window a row).
+    /// draft state of 4 sequences, where a draft area in every slot kept it for 128 (16.9 MiB a
+    /// lane over its 30 GDN layers, its conv streams in two areas; 14.1 MiB when the conv kept a
+    /// window a row).
     #[test]
     fn draft_state_costs_its_lanes_not_its_slots() {
         let dims = GdnStateDims {
@@ -755,11 +757,11 @@ mod tests {
         // A slot's entry: its f32 conv ring, its ssm state at the metal kernels' half width.
         let entry = 4 * dims.conv_entry_len() + 2 * dims.ssm_entry_len();
         assert_eq!(plain, 30 * 128 * entry);
-        // A lane is the draft area every slot used to carry: a conv stream a channel (the window
-        // a verify step starts from, then its k + 1 rows' inputs) and two record areas, 11.3 MiB
-        // over the 30 layers.
-        let lane = 4 * (dims.conv_dim * dims.conv_stream_len(rows) + dims.ssm_lane_len(rows));
-        assert_eq!(30 * lane, 11_842_560);
+        // A lane is the draft area every slot used to carry: two conv stream areas a channel (the
+        // previous verify step's and this one's, each the window a verify step starts from, then
+        // its k + 1 rows' inputs) and two record areas, 16.9 MiB over the 30 layers.
+        let lane = 4 * (2 * dims.conv_dim * dims.conv_stream_len(rows) + dims.ssm_lane_len(rows));
+        assert_eq!(30 * lane, 17_740_800);
         assert_eq!(pool(128, lanes), plain + 30 * 4 * lane);
         assert_eq!(DraftLanes::new(CheckpointRows::NONE, 4), None);
         assert_eq!(DraftLanes::new(rows, 0), None);

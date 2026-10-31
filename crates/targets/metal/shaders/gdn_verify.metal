@@ -233,9 +233,15 @@ template <typename T>
     // This channel's window in slot `s`, and its stream in the lane: a replay starts from the
     // window after the last kept row, row `start - 2`'s, the next STATE_LEN of the stream past it.
     auto ring = [&](int s) { return conv_state + (uint(s) * CONV_DIM + c) * STATE_LEN; };
-    device float* lane_ptr = conv_lanes + (lane_ix * CONV_DIM + c) * STREAM_LEN;
+    // The lane's two stream areas, as its records': the previous verify step's, which a replay
+    // starts from, and this step's, which only the channel's persisting threadgroup writes — so
+    // no threadgroup reads a seed another overwrites.
+    auto stream = [&](uint a) {
+      return conv_lanes + ((lane_ix * 2u + a) * CONV_DIM + c) * STREAM_LEN;
+    };
+    device float* lane_ptr = stream(1u - area);
     const device float* start_ptr =
-        replays ? lane_ptr + (start - 1u) : ring(gdn_start_slot(seq_slots, start));
+        replays ? stream(area) + (start - 1u) : ring(gdn_start_slot(seq_slots, start));
     // The seed stays in registers: a replay's lives in the stream this step overwrites.
     for (uint ki = 0; ki < STATE_LEN; ki++) {
       seed[ki] = fresh ? 0.0f : start_ptr[ki];

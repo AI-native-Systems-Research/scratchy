@@ -143,9 +143,15 @@ template <typename T>
   // The seed the sequence's first block walks in from: its slot, a restore's snapshot, or the
   // window after the last kept row of the lane's stream, row `start - 2`'s (zero when fresh).
   device float* state_ptr = ring(seq_slots.slot);
-  device float* lane_ptr = conv_lanes + ((code >> 17) * conv_dim + d) * stream_len;
+  // The lane's two stream areas, as its records': the previous verify step's (`area`), which a
+  // replay starts from, and this step's.
+  uint area = (code >> 16) & 1u;
+  auto stream = [&](uint a) {
+    return conv_lanes + (((code >> 17) * 2u + a) * conv_dim + d) * stream_len;
+  };
+  device float* lane_ptr = stream(1u - area);
   const device float* start_ptr =
-      replays ? lane_ptr + (start - 1u) : ring(gdn_start_slot(seq_slots, start));
+      replays ? stream(area) + (start - 1u) : ring(gdn_start_slot(seq_slots, start));
 
   const int t_end = metal::min(t0 + int(GDN_CONV_BLOCK), seqlen);
 
