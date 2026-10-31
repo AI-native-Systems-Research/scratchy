@@ -1045,9 +1045,10 @@ fn ktir_only(k: ktir_superdsc::ktir_node::KtirNode) -> EmittedOp {
 /// engine. The consume names the operand and this fragment ([`TpConsume`]), which is all the send
 /// needs.
 ///
-/// ⛔ ONE FRAGMENT: the window holds one fragment, so an operand wider than one p2p message is
-/// refused by name — every collective the analysis weaves at decode, and at prefill up to a
-/// message, fits one.
+/// ⛔ ONE FRAGMENT: the window holds one fragment — `WINDOW_ROWS` rows of the operand
+/// (`RecvWindow::bytes_for`), more than any bundle hands a collective — so every operand is one,
+/// and its send is a run of messages when it passes the cap. An operand with more rows than the
+/// window is refused by name.
 ///
 /// [`TpConsume`]: ktir_superdsc::collective::TpConsume
 fn send_fragment<F: RopeForm>(
@@ -1059,8 +1060,8 @@ fn send_fragment<F: RopeForm>(
     match crate::tp_plan::consume_fragments(rows, cols).as_deref() {
         Ok([f]) => Ok(*f),
         Ok(more) => Err(NodeLowering::Unhandled(format!(
-            "the {kind:?} operand [{rows}, {cols}] is {} p2p fragments — a send moves a whole \
-             operand, so a collective wider than one message is not lowered",
+            "the {kind:?} operand [{rows}, {cols}] is {} p2p fragments — more rows than the \
+             receive window holds, and two fragments of one collective cannot share it",
             more.len()
         ))),
         Err(why) => Err(NodeLowering::Unhandled(format!(
@@ -1155,8 +1156,7 @@ fn all_reduce_consumes<F: RopeForm>(
 /// consume group and every other rank skips it whole.
 ///
 /// ⛔ ONE FRAGMENT. A block copy moves a WHOLE source, and the window holds one fragment at a
-/// time, so a block wider than one message is refused by name; the gathers the analysis weaves (a
-/// vocabulary projection's row, at decode and at the prefill tail's one row) fit one.
+/// time — `WINDOW_ROWS` rows of the block, which every block a bundle hands a gather fits.
 ///
 /// [`TpConsume`]: ktir_superdsc::collective::TpConsume
 fn all_gather_consumes<F: RopeForm>(node: &SubtileNode<F>, cols: u32) -> NodeLowering {

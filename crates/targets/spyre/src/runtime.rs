@@ -1440,6 +1440,15 @@ pub enum AttachRefusal {
     },
     /// The cross-port IOMMU mapping to the peer card was refused.
     Mapping(flex_rs::multi_device::RdmaUnitError),
+    /// The mapping did not install the peer card's region-2 bus address, as read off the kernel's
+    /// view of the card (`installed`: the mapping's segment addresses).
+    BatNotThePeer {
+        peer: PciAddress,
+        region2: u64,
+        installed: Vec<u64>,
+    },
+    /// The peer card's region-2 bus address could not be read.
+    PeerRegion(String),
     /// The runtime this card's side of the link needs did not come up.
     BringUp(String),
     /// The window's xseg word did not compose, or `XSEG[peer sid]` could not be programmed.
@@ -1470,6 +1479,16 @@ impl fmt::Display for AttachRefusal {
                 "the cross-port p2p mapping to the peer card was refused: {e:?} (device p2p RDMA \
                  is the only path; there is no host fallback)"
             ),
+            Self::BatNotThePeer {
+                peer,
+                region2,
+                installed,
+            } => write!(
+                f,
+                "the p2p mapping did not install the peer card's region-2 address: the card at \
+                 {peer} decodes region 2 at {region2:#x}, the mapping installed {installed:#x?}"
+            ),
+            Self::PeerRegion(e) => write!(f, "the peer card's region 2 could not be read: {e}"),
             Self::BringUp(e) => write!(f, "the card runtime did not come up: {e}"),
             Self::Xseg(e) => write!(f, "programming XSEG[peer sid] failed: {e}"),
         }
@@ -1556,12 +1575,32 @@ pub fn link_peer(
         me.world().get(),
         true,
     );
-    unit.attach_peer(
-        flex_rs::multi_device::RankId(u32::from(route.dest_tid)),
-        &cards.peer,
-        window.end(),
-    )
-    .map_err(AttachRefusal::Mapping)?;
+    // ⭐ THE MAPPING'S LENGTH COVERS THE WINDOW: `[0, window.end())` of the peer's weight segment
+    // holds `[window.offset(), window.end())` — the window starts deep in the segment (above the
+    // packed weights), so its SIZE alone would not reach it.
+    let mapping = unit
+        .attach_peer(
+            flex_rs::multi_device::RankId(u32::from(route.dest_tid)),
+            &cards.peer,
+            window.end(),
+        )
+        .map_err(AttachRefusal::Mapping)?;
+    // ⭐ THE BAT INSTALL, ASSERTED (#1009 review, item 5): the mapping installs the peer card's
+    // region-2 bus address (measured on card, both ranks symmetric), and the kernel's own reading
+    // of the peer's config space is what it must equal — the card the address names, never an
+    // enumeration order.
+    let region2 = cards
+        .peer
+        .region_base(2)
+        .map_err(AttachRefusal::PeerRegion)?;
+    let installed: Vec<u64> = mapping.segments().iter().map(|s| s.addr as u64).collect();
+    if !installed.contains(&region2) {
+        return Err(AttachRefusal::BatNotThePeer {
+            peer: cards.peer.clone(),
+            region2,
+            installed,
+        });
+    }
     let landing = flex_rs::control_block_wire::VirtualAddressSbf::new(
         RecvWindow::SEGMENT as u8,
         flex_rs::control_block_wire::Flits::from_bytes(window.offset()),

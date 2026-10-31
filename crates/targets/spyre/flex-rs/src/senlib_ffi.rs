@@ -638,6 +638,28 @@ impl std::fmt::Display for PciAddress {
     }
 }
 
+impl PciAddress {
+    /// The bus address region `region` (BAR `region`) of this card decodes at — the kernel's own
+    /// reading of the card's config space (`/sys/bus/pci/devices/<addr>/resource`, the value
+    /// `setpci` reports), never senlib's.
+    ///
+    /// # Errors
+    /// The sysfs file unread, or no such region in it.
+    pub fn region_base(&self, region: usize) -> Result<u64, String> {
+        let path = format!("/sys/bus/pci/devices/{}/resource", self.as_str());
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+        region_base_of(&text, region).ok_or_else(|| format!("{path} has no region {region}"))
+    }
+}
+
+/// Region `region`'s start in a sysfs `resource` file: one `start end flags` line per region, each
+/// a `0x` hex word. `None` for a missing, unparsable or unassigned (zero) region.
+fn region_base_of(resource: &str, region: usize) -> Option<u64> {
+    let start = resource.lines().nth(region)?.split_whitespace().next()?;
+    let base = u64::from_str_radix(start.strip_prefix("0x")?, 16).ok()?;
+    (base != 0).then_some(base)
+}
+
 /// Bring the runtime up on the card at `pci` (`SenPci::pf(const std::string&)`).
 ///
 /// # Errors
@@ -1661,5 +1683,18 @@ mod pci_address_tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// A sysfs `resource` file's region starts, by line; an unassigned region (all zeros) and a
+    /// missing one read as none.
+    #[test]
+    fn a_region_base_is_its_line_of_the_resource_file() {
+        let resource = "0x00000000d4000000 0x00000000d4ffffff 0x0000000000040200\n\
+                        0x0000000000000000 0x0000000000000000 0x0000000000000000\n\
+                        0x0000038000000000 0x0000038fffffffff 0x000000000014220c\n";
+        assert_eq!(region_base_of(resource, 0), Some(0xd400_0000));
+        assert_eq!(region_base_of(resource, 1), None);
+        assert_eq!(region_base_of(resource, 2), Some(0x0380_0000_0000));
+        assert_eq!(region_base_of(resource, 3), None);
     }
 }
