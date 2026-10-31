@@ -1727,6 +1727,14 @@ impl MetalWorker {
             cycles: HashMap::new(),
             snapshot_windows: None,
             snapshot_window_keys: Vec::new(),
+            penalty_words: residency.pin(scratchy_target_metal::mtl4_dispatch::shared_zeroed(
+                device,
+                slots * target.vocab_size() as usize * size_of::<u32>(),
+            )),
+            penalty_counted: HashMap::new(),
+            penalize_entries: None,
+            penalize_raw: None,
+            vocab: target.vocab_size() as u32,
             contexts: ::scratchy_serving_engine::spec_decode::draft_context::DraftContexts::new(
                 window as u32,
             ),
@@ -3329,6 +3337,7 @@ impl MetalWorker {
         &mut self,
         jobs: &[(usize, u32)],
         req_ids: &[String],
+        penalized: &std::collections::HashSet<usize>,
     ) -> ExecutorResult<scratchy_target_metal::sampling::PendingSampler> {
         // `vocab` is the lm_head logits width (== METAL_VOCAB_SIZE == config
         // vocab_size). Take it from the model so the sampler params assemble
@@ -3356,6 +3365,7 @@ impl MetalWorker {
             &mut self.seeded_rngs,
             |id| self.input_batch.history(id),
             |id| self.input_batch.num_generated(id),
+            |i| penalized.contains(&i),
             vocab,
         );
         let record = self.deferral.as_mut().map(|(d, _)| &mut d.host_writes);
@@ -4227,6 +4237,16 @@ impl MetalWorker {
             if reserve_pinned(&mut d.cycle_buffer, &mtl_device, &residency, bytes as usize) {
                 residency.commit();
             }
+            let entry_bytes = size_of::<scratchy_target_metal::dflash2::PenalizeEntry>();
+            let bytes = step.penalties.len().max(1) * entry_bytes;
+            if reserve_pinned(&mut d.penalize_entries, &mtl_device, &residency, bytes) {
+                residency.commit();
+            }
+            let raw_rows: usize = step.penalties.iter().map(|(_, e)| e.rows as usize).sum();
+            let bytes = raw_rows.max(1) * d.logits_row_bytes();
+            if reserve_pinned(&mut d.penalize_raw, &mtl_device, &residency, bytes) {
+                residency.commit();
+            }
         }
         // A block drafter's step scores its logprobs after its acceptance.
         let block_scores = matches!(then, Some(Then::Block(_)));
@@ -4460,6 +4480,11 @@ impl MetalWorker {
                         gm.num_rows,
                     )
                     .map_err(|e| format!("encode_grammar_mask: {e:?}"))?;
+                }
+                // A block drafter's penalized sequences' rows, before the argmax and every policy
+                // reads them.
+                if let Some(h) = head_cell.borrow().as_ref() {
+                    h.penalize(enc, logits_buf)?;
                 }
                 let argmax_kernels_ref: &scratchy_target_metal::argmax::ArgmaxKernels = unsafe {
                     &*(argmax_kernels_addr as *const scratchy_target_metal::argmax::ArgmaxKernels)
@@ -5172,6 +5197,9 @@ struct BlockStep {
     rebuilds: Vec<Rebuild>,
     /// The snapshots the step saves its lanes' windows into.
     saves: Vec<WindowSave>,
+    /// Each penalized sequence's sampled rows, penalized before any selection reads them, and its
+    /// index in the step.
+    penalties: Vec<(usize, scratchy_target_metal::dflash2::PenalizeEntry)>,
 }
 
 /// A lane's window copied from a prefix-cache snapshot's.
@@ -5299,6 +5327,21 @@ struct Dflash2 {
     /// prefix.
     snapshot_windows: Option<scratchy_target_metal::sparse_kv::SparseStores>,
     snapshot_window_keys: Vec<Option<u64>>,
+    /// Each ring slot's penalty words (Splash's penalty table, a row a state lane: `dflash2::
+    /// rebuild_penalty_words`), `[slots, vocab]` u32 the host writes — a penalized request's row
+    /// follows its history, rebuilt when it takes the slot and counted on each step after — and
+    /// each penalized request's slot and the output its row counts. A step that reads them runs
+    /// alone, never behind another (history-reading requests are never deferred).
+    penalty_words: scratchy_target_metal::residency::Pinned,
+    penalty_counted: HashMap<String, (u32, usize)>,
+    /// A step's penalty entries ([`scratchy_target_metal::dflash2::PenalizeEntry`]), grown to the
+    /// widest step.
+    penalize_entries: Option<scratchy_target_metal::residency::Pinned>,
+    /// The penalized rows' raw logits, set aside while the step's selections read them penalized
+    /// and back before its logprobs score them (raw, as vLLM's `raw_logprobs`), grown to the
+    /// widest step.
+    penalize_raw: Option<scratchy_target_metal::residency::Pinned>,
+    vocab: u32,
     /// Each request's draft context: its plan (Splash's `planDraftContext`) — which of its
     /// prompt's rows the drafter captures, for its snapshots' windows and its end's — and whether
     /// its rings wait for a rebuild from a restored window.
@@ -5328,6 +5371,76 @@ impl Dflash2 {
         self.slots.release(req_id);
         self.cycles.remove(req_id);
         self.contexts.release(req_id);
+        self.penalty_counted.remove(req_id);
+    }
+
+    /// A row of its target's logits, in bytes: half or bfloat (`MetalDtype`) a token.
+    fn logits_row_bytes(&self) -> usize {
+        self.vocab as usize * size_of::<u16>()
+    }
+
+    /// The copies of each penalized row's logits between `logits` and the raw rows' buffer:
+    /// `aside` from the logits to it, else back.
+    fn raw_copies<'b>(
+        &'b self,
+        penalties: &[(usize, scratchy_target_metal::dflash2::PenalizeEntry)],
+        logits: &'b ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+        aside: bool,
+    ) -> Result<Vec<scratchy_target_metal::dflash2::BufferCopy<'b>>, String> {
+        let raw = (self.penalize_raw.as_ref())
+            .ok_or("a DFlash2 step penalizes without its raw rows' buffer")?;
+        let row = self.logits_row_bytes() as u64;
+        let mut at = 0;
+        Ok((penalties.iter())
+            .map(|(_, e)| {
+                let (logits_at, len) = (u64::from(e.logits_row) * row, u64::from(e.rows) * row);
+                let raw_at = at;
+                at += len;
+                match aside {
+                    true => scratchy_target_metal::dflash2::BufferCopy {
+                        from: logits,
+                        from_at: logits_at,
+                        to: &**raw,
+                        to_at: raw_at,
+                        len,
+                    },
+                    false => scratchy_target_metal::dflash2::BufferCopy {
+                        from: &**raw,
+                        from_at: raw_at,
+                        to: logits,
+                        to_at: logits_at,
+                        len,
+                    },
+                }
+            })
+            .collect())
+    }
+
+    /// `req_id`'s penalty words in ring slot `slot` brought to its history: rebuilt from its
+    /// `prompt` and `generated` when it takes the slot, otherwise its output since counted in
+    /// (Splash `bindPenalties`, `commitSelected`).
+    fn sync_penalty_words(
+        &mut self,
+        req_id: &str,
+        slot: u32,
+        (prompt, generated): (&[u32], &[u32]),
+    ) {
+        use ::objc2_metal::MTLBuffer as _;
+        let vocab = self.vocab as usize;
+        // SAFETY: the table holds `slots · vocab` words and slot `slot` is one of them; no command
+        // buffer reads it (a step reading it runs alone, its predecessor done).
+        let words = unsafe {
+            let base = self.penalty_words.contents().as_ptr().cast::<u32>();
+            std::slice::from_raw_parts_mut(base.add(slot as usize * vocab), vocab)
+        };
+        match self.penalty_counted.get(req_id) {
+            Some(&(at, counted)) if at == slot && counted <= generated.len() => {
+                scratchy_target_metal::dflash2::count_penalty_tokens(words, &generated[counted..]);
+            }
+            _ => scratchy_target_metal::dflash2::rebuild_penalty_words(words, prompt, generated),
+        }
+        self.penalty_counted
+            .insert(req_id.to_owned(), (slot, generated.len()));
     }
 
     /// `request`'s draft context plan: its prompt's replay from the tokens it resumes past, and
@@ -5368,6 +5481,49 @@ struct BlockPassesEncoder<'a> {
 impl<'a> BlockPassesEncoder<'a> {
     fn rows(&self) -> usize {
         self.dflash2.drafter.budget.drafts + 1
+    }
+
+    /// Each penalized sequence's sampled rows' penalties (`dflash2_penalize`), on `logits`: its
+    /// entries written first.
+    fn penalize(
+        &self,
+        enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        logits: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+    ) -> Result<(), String> {
+        use ::objc2_metal::MTLBuffer as _;
+        let entries: Vec<_> = self.step.penalties.iter().map(|&(_, e)| e).collect();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let buffer = (self.dflash2.penalize_entries.as_ref())
+            .ok_or("a DFlash2 step penalizes without its entries' buffer")?;
+        let bytes = as_bytes(&entries);
+        // SAFETY: the buffer holds the step's entries (reserved before its forward), and no command
+        // buffer reads it: a step that penalizes runs alone.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                buffer.contents().as_ptr().cast::<u8>(),
+                bytes.len(),
+            );
+        }
+        let table = argument_table(
+            &self.device,
+            &[
+                logits.gpuAddress(),
+                self.dflash2.penalty_words.gpuAddress(),
+                buffer.gpuAddress(),
+            ],
+        )?;
+        // The step's logprobs score the raw logits: its penalized rows, set aside first.
+        if self.logprobs.is_some() {
+            let aside = self
+                .dflash2
+                .raw_copies(&self.step.penalties, logits, true)?;
+            scratchy_target_metal::dflash2::encode_buffer_copies(enc, &aside);
+        }
+        (self.dflash2.sampling).encode_penalize(enc, &table, entries.len() as u32);
+        Ok(())
     }
 
     fn layout(&self) -> scratchy_target_metal::dflash2::CycleLayout {
@@ -5438,6 +5594,13 @@ impl<'a> BlockPassesEncoder<'a> {
             self.dflash2.accept.encode(enc, &table, lanes as u32);
         }
         if let Some(pass) = &self.logprobs {
+            // The penalized rows' raw logits back, the selections done (`Self::penalize`).
+            if !step.penalties.is_empty() {
+                let back = self
+                    .dflash2
+                    .raw_copies(&step.penalties, outputs.logits, false)?;
+                scratchy_target_metal::dflash2::encode_buffer_copies(enc, &back);
+            }
             pass.encode(
                 &self.device.device,
                 enc,
@@ -5471,7 +5634,7 @@ impl<'a> BlockPassesEncoder<'a> {
         let lanes_buffer = &**lanes_windows.buffer();
         if let Some(snapshots) = snapshots {
             let restored: Vec<_> = (step.restores.iter())
-                .map(|r| scratchy_target_metal::dflash2::WindowCopy {
+                .map(|r| scratchy_target_metal::dflash2::BufferCopy {
                     from: snapshots,
                     from_at: snapshot_at(r.snapshot),
                     to: lanes_buffer,
@@ -5479,7 +5642,7 @@ impl<'a> BlockPassesEncoder<'a> {
                     len: window.bytes(),
                 })
                 .collect();
-            scratchy_target_metal::dflash2::encode_window_copies(enc, &restored);
+            scratchy_target_metal::dflash2::encode_buffer_copies(enc, &restored);
         }
         let mut onto: Option<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>> = None;
         for rebuild in &step.rebuilds {
@@ -5512,7 +5675,7 @@ impl<'a> BlockPassesEncoder<'a> {
         }
         if let Some(snapshots) = snapshots {
             let before: Vec<_> = (step.saves.iter())
-                .map(|s| scratchy_target_metal::dflash2::WindowCopy {
+                .map(|s| scratchy_target_metal::dflash2::BufferCopy {
                     from: lanes_buffer,
                     from_at: lane_at(s.ring_slot),
                     to: snapshots,
@@ -5520,7 +5683,7 @@ impl<'a> BlockPassesEncoder<'a> {
                     len: window.bytes(),
                 })
                 .collect();
-            scratchy_target_metal::dflash2::encode_window_copies(enc, &before);
+            scratchy_target_metal::dflash2::encode_buffer_copies(enc, &before);
         }
         // 3. The commit over the step's rows: the target's captured rows, and a cycle's retained
         // counts.
@@ -5574,7 +5737,7 @@ impl<'a> BlockPassesEncoder<'a> {
             let rows: Vec<_> = (step.saves.iter())
                 .flat_map(|s| {
                     (window.positions(s.from, s.to).into_iter()).map(move |r| {
-                        scratchy_target_metal::dflash2::WindowCopy {
+                        scratchy_target_metal::dflash2::BufferCopy {
                             from: lanes_buffer,
                             from_at: lane_at(s.ring_slot) + r.start,
                             to: snapshots,
@@ -5584,7 +5747,7 @@ impl<'a> BlockPassesEncoder<'a> {
                     })
                 })
                 .collect();
-            scratchy_target_metal::dflash2::encode_window_copies(enc, &rows);
+            scratchy_target_metal::dflash2::encode_buffer_copies(enc, &rows);
         }
         // 4. The block draft over each lane's next block, its tokens and positions the device's.
         if let Some(block) = block.filter(|b| b.drafts) {
@@ -5723,6 +5886,19 @@ impl<'a> HeadEncoder<'a> {
         match self {
             Self::Mtp(h) => h.encode(enc, tokens, &retained(outputs.hidden)),
             Self::Block(b) => b.encode(enc, tokens, outputs),
+        }
+    }
+
+    /// A block drafter's penalized sequences' rows, rewritten in place on `logits` (the target's)
+    /// before any selection reads them; nothing for an MTP head, whose requests draft unpenalized.
+    fn penalize(
+        &self,
+        enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        logits: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Mtp(_) => Ok(()),
+            Self::Block(b) => b.penalize(enc, logits),
         }
     }
 
@@ -8388,6 +8564,48 @@ impl Worker for MetalWorker {
                                 });
                             }
                         }
+                        // Each penalized sequence's sampled rows, its words brought to its history
+                        // (Splash's penalty table and `decode_sample_penalize_verify`): row r of a
+                        // verify counts the drafts its context adds, inputs 1..r.
+                        let mut penalties = Vec::new();
+                        for (i, req_id) in step_rows.req_ids.iter().enumerate() {
+                            let params = (self.sampling_params_map.get(req_id))
+                                .filter(|p| p.reads_history());
+                            let Some(params) = params else {
+                                continue;
+                            };
+                            if !scheduler_output.draft_req_ids.contains(req_id) {
+                                continue;
+                            }
+                            let slot =
+                                d.slots.of(req_id).map_err(ExecutorError::WorkerExecution)?;
+                            let history = self.input_batch.history(req_id);
+                            d.sync_penalty_words(req_id, slot, history);
+                            let sampled = step_rows.sampled.of_seq(i);
+                            let inputs: Vec<u32> = (sampled.clone())
+                                .map(|j| step_rows.input_ids[step_rows.sampled.rows()[j] as usize])
+                                .collect();
+                            let penalty = [
+                                params.repetition_penalty as f32,
+                                params.presence_penalty as f32,
+                                params.frequency_penalty as f32,
+                            ];
+                            let entry = scratchy_target_metal::dflash2::PenalizeEntry::new(
+                                sampled.start as u32,
+                                &inputs,
+                                slot,
+                                penalty,
+                            );
+                            tracing::debug!(
+                                "DFlash2 {req_id}: penalized from logits row {}, {} rows, inputs \
+                                 {:?}, its words counting {} output tokens",
+                                entry.logits_row,
+                                entry.rows,
+                                &entry.inputs[..entry.rows as usize],
+                                history.1.len(),
+                            );
+                            penalties.push((i, entry));
+                        }
                         let rows = d.drafter.budget.drafts as u32 + 1;
                         let candidates_a_lane = d.drafter.budget.drafts
                             * scratchy_target_metal::dflash2::CANDIDATES as usize;
@@ -8405,6 +8623,7 @@ impl Worker for MetalWorker {
                             restores,
                             rebuilds,
                             saves,
+                            penalties,
                         };
                         for lane in lanes {
                             let req_id = &req_ids_in_order[lane.step];
@@ -8541,6 +8760,12 @@ impl Worker for MetalWorker {
                 )
             })
             .unwrap_or_default();
+        // A block drafter's penalized sequences, whose rows the step penalizes before this sampler
+        // (`dflash2_penalize`): at temperature 0 their argmax is their token, and this sampler reads
+        // their penalties as none.
+        let penalized: std::collections::HashSet<usize> = (block_step.as_ref())
+            .map(|s| s.penalties.iter().map(|&(i, _)| i).collect())
+            .unwrap_or_default();
         let mut fused_sample_jobs: Vec<(usize, u32)> = Vec::new();
         for (i, req_id) in req_ids_in_order.iter().enumerate() {
             let req_slice = &prepared.req_inputs[i];
@@ -8548,10 +8773,11 @@ impl Worker for MetalWorker {
             if !req_slice.emits_token || target_sampled.contains(&i) {
                 continue;
             }
-            let greedy = self
-                .sampling_params_map
-                .get(req_id)
-                .is_none_or(SamplingParams::is_greedy);
+            let greedy = self.sampling_params_map.get(req_id).is_none_or(|p| {
+                p.is_greedy()
+                    || (penalized.contains(&i)
+                        && p.sampling_type() == scratchy_core_common::SamplingType::Greedy)
+            });
             if greedy {
                 continue;
             }
@@ -8571,7 +8797,7 @@ impl Worker for MetalWorker {
             && self.model.as_deref().map(|m| m.metal_dtype())
                 != Some(scratchy_target_metal::interpreter::metal::MetalDtype::Int4)
         {
-            match self.prepare_gpu_sampler(&fused_sample_jobs, &req_ids_in_order) {
+            match self.prepare_gpu_sampler(&fused_sample_jobs, &req_ids_in_order, &penalized) {
                 Ok(ps) => self.pending_sampler = Some(ps),
                 Err(e) => tracing::warn!("fused sampler prep failed ({e}); using argmax fallback"),
             }

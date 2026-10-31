@@ -224,11 +224,12 @@ impl<T> StepOutcome<T> {
 }
 
 /// Whether `req_id` takes speculative drafts: it is running, and its sampling does not read its
-/// history (a verify row's would need the drafts before it).
-fn takes_drafts(scheduler: &Scheduler, req_id: &str) -> bool {
-    scheduler
-        .get_request(req_id)
-        .is_some_and(|r| !r.status.is_finished() && !r.sampling_params.reads_history())
+/// history — a verify row's would need the drafts before it — unless its verify rows' penalties
+/// count them (`penalized`, [`Proposer::penalizes_verify_rows`]).
+fn takes_drafts(scheduler: &Scheduler, req_id: &str, penalized: bool) -> bool {
+    scheduler.get_request(req_id).is_some_and(|r| {
+        !r.status.is_finished() && (penalized || !r.sampling_params.reads_history())
+    })
 }
 
 impl EngineCore {
@@ -658,7 +659,8 @@ impl EngineCore {
         if on_device
             && sched.draft_req_ids.contains(req_id)
             && sched.scheduled_spec_decode_tokens.contains_key(req_id)
-            && takes_drafts(&self.scheduler, req_id)
+            // A penalized request's words follow its history on the host: never led.
+            && takes_drafts(&self.scheduler, req_id, false)
             && self.scheduler.get_request_counts().1 == 0
         {
             let req_id = req_id.clone();
@@ -694,7 +696,9 @@ impl EngineCore {
             return;
         };
         let scheduler = &self.scheduler;
-        sched.draft_req_ids = proposer.plan(sched, &|req_id| takes_drafts(scheduler, req_id));
+        let penalized = proposer.penalizes_verify_rows();
+        sched.draft_req_ids =
+            proposer.plan(sched, &|req_id| takes_drafts(scheduler, req_id, penalized));
         // A step whose head reads nothing back runs its pass 1 KV-only — no chain — so the step
         // behind it pre-schedules as behind a plain one: past the gate, or when every planned
         // request runs a prefill chunk short of its prompt's end (a long prompt's every chunk but
@@ -762,7 +766,8 @@ impl EngineCore {
                     }
                 })
             };
-            let takes_drafts = |req_id: &str| takes_drafts(scheduler_ref, req_id);
+            let penalized = proposer.penalizes_verify_rows();
+            let admits = |req_id: &str| takes_drafts(scheduler_ref, req_id, penalized);
             let backend = self.executor.as_mut().and_then(|e| e.spec_decode_backend());
             let mut ctx = ProposerStepCtx {
                 scheduled_req_ids: &scheduled_req_ids,
@@ -771,7 +776,7 @@ impl EngineCore {
                 backend,
                 draft_seed: model_output.draft_seed_inputs.as_ref(),
                 sampled_token_ids: Some(&model_output.sampled_token_ids),
-                takes_drafts: &takes_drafts,
+                takes_drafts: &admits,
             };
             let drafts_map = proposer.propose_for_step(&mut ctx);
             for (req_id, drafts) in drafts_map {
@@ -780,9 +785,7 @@ impl EngineCore {
                 }
                 // Still running, and drafting (`takes_drafts`).
                 let keeps_drafts = self.scheduler.get_request(&req_id).is_some_and(|r| {
-                    !r.status.is_finished()
-                        && !r.all_token_ids.is_empty()
-                        && !r.sampling_params.reads_history()
+                    !r.all_token_ids.is_empty() && takes_drafts(&self.scheduler, &req_id, penalized)
                 });
                 if !keeps_drafts {
                     continue;
@@ -1920,6 +1923,7 @@ mod tests {
                     num_speculative_tokens: 2,
                     max_seqs: 2,
                     max_model_len: 4096,
+                    block: false,
                 },
             )),
             ..make_spec_decode_config()
@@ -1976,6 +1980,7 @@ mod tests {
                     num_speculative_tokens: 2,
                     max_seqs: 2,
                     max_model_len: 4096,
+                    block: false,
                 },
             )),
             ..make_spec_decode_config()

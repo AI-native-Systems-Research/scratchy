@@ -217,6 +217,7 @@ pub fn gather_gpu_sample_params<'h>(
     seeded_rngs: &mut std::collections::HashMap<String, rand::rngs::StdRng>,
     history: impl Fn(&str) -> (&'h [u32], &'h [u32]),
     generated: impl Fn(&str) -> usize,
+    already_penalized: impl Fn(usize) -> bool,
     vocab: u32,
 ) -> scratchy_core_common::GpuSampleParams {
     use rand::Rng;
@@ -251,6 +252,12 @@ pub fn gather_gpu_sample_params<'h>(
                 )
             },
         );
+        // A request whose rows the step penalized before the sampler (a DFlash2 drafter's,
+        // `dflash2_penalize`) is penalized once.
+        let (rep, freq, pres) = match already_penalized(i) {
+            true => (1.0, 0.0, 0.0),
+            false => (rep, freq, pres),
+        };
         params.row_indices.push(row);
         params.temperatures.push(t);
         params.top_ks.push(k);
@@ -879,6 +886,7 @@ mod tests {
                 &mut rngs,
                 |_| (empty, empty),
                 |_| 7,
+                |_| false,
                 32,
             )
             .uniforms

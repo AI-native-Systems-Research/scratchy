@@ -830,6 +830,7 @@ mod tests {
                 num_speculative_tokens: 2,
                 max_seqs: 2,
                 max_model_len: 4096,
+                            block: false,
             },
         ));
         let greedy = |id: &str| EngineCoreRequest {

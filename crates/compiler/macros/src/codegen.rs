@@ -7664,13 +7664,21 @@ fn metal_off_tape_tokens(
         dflash2_accept,
         dflash2_sampling,
     } = ids;
-    let dflash2_sampling = dflash2_sampling.map(|TargetSampling { mass, search, draw }| {
-        quote!(::scratchy_target_metal::off_tape::TargetSampling {
-            mass: #mass,
-            search: #search,
-            draw: #draw,
-        })
-    });
+    let dflash2_sampling = dflash2_sampling.map(
+        |TargetSampling {
+             mass,
+             search,
+             draw,
+             penalize,
+         }| {
+            quote!(::scratchy_target_metal::off_tape::TargetSampling {
+                mass: #mass,
+                search: #search,
+                draw: #draw,
+                penalize: #penalize,
+            })
+        },
+    );
     let vocab_suffix = vocab_suffix.map(
         |SuffixKernels {
              suffix,

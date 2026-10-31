@@ -182,8 +182,9 @@ pub struct ProposerStepCtx<'a> {
     pub sampled_token_ids: Option<&'a [Vec<u32>]>,
     /// Whether a request takes drafts. A verify step keeps a draft while the target's token at its
     /// row — argmax, or sampled for a sampled request — equals it: rejection sampling of one-token
-    /// drafts. A request whose sampling reads its token history (penalties) runs undrafted: a
-    /// verify row's history would need the drafts before it.
+    /// drafts. A request whose sampling reads its token history (penalties) runs undrafted unless
+    /// the proposer penalizes verify rows ([`Proposer::penalizes_verify_rows`]): a verify row's
+    /// history needs the drafts before it.
     pub takes_drafts: &'a dyn Fn(&str) -> bool,
 }
 
@@ -206,6 +207,13 @@ pub trait Proposer {
         _takes_drafts: &dyn Fn(&str) -> bool,
     ) -> std::collections::HashSet<String> {
         std::collections::HashSet::new()
+    }
+
+    /// Whether a verify row's penalties count the drafts before it: a block drafter's worker
+    /// penalizes its verify rows from each sequence's penalty words and those drafts (Splash's
+    /// `decode_sample_penalize_verify`), so a penalized request drafts. No other proposer's does.
+    fn penalizes_verify_rows(&self) -> bool {
+        false
     }
 
     /// The most sequences a step drafts for, when a worker-side head drafts: a step of more runs

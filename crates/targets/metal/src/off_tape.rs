@@ -194,6 +194,7 @@ pub struct TargetSampling<K> {
     pub mass: K,
     pub search: K,
     pub draw: K,
+    pub penalize: K,
 }
 
 pub type OffTapeKernels = OffTape<BakedKernel, &'static [BakedKernel]>;
@@ -278,6 +279,7 @@ impl OffTape<PipelineKey, Vec<PipelineKey>> {
                     mass: key("dflash2_sample_mass_f16", "dflash2_sample_mass_bf16"),
                     search: key("dflash2_sample_search_f16", "dflash2_sample_search_bf16"),
                     draw: key("dflash2_sample_draw_f16", "dflash2_sample_draw_bf16"),
+                    penalize: key("dflash2_penalize_f16", "dflash2_penalize_bf16"),
                 }
             }),
         }
@@ -306,6 +308,7 @@ impl<K> OffTape<K, Vec<K>> {
                 mass: f(s.mass),
                 search: f(s.search),
                 draw: f(s.draw),
+                penalize: f(s.penalize),
             }),
         }
     }

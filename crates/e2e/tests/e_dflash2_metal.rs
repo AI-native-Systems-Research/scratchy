@@ -69,12 +69,21 @@ fn request(prompt: &str) -> CompletionRequest {
 
 /// Every prompt's output, `width` requests at once, in prompt order.
 async fn outputs(base_url: &str, width: usize) -> Vec<EngineOutput> {
+    outputs_of(base_url, width, request).await
+}
+
+/// Every prompt's output, each request `build` makes, `width` at once, in prompt order.
+async fn outputs_of(
+    base_url: &str,
+    width: usize,
+    build: fn(&str) -> CompletionRequest,
+) -> Vec<EngineOutput> {
     let mut out = Vec::with_capacity(PROMPTS.len());
     for chunk in PROMPTS.chunks(width) {
         let mut set = tokio::task::JoinSet::new();
         for (i, &prompt) in chunk.iter().enumerate() {
-            let client = Client::new(base_url);
-            set.spawn(async move { (i, client.completion(&request(prompt)).await) });
+            let (client, request) = (Client::new(base_url), build(prompt));
+            set.spawn(async move { (i, client.completion(&request).await) });
         }
         let mut done = set.join_all().await;
         done.sort_by_key(|&(i, _)| i);
@@ -88,6 +97,19 @@ async fn outputs(base_url: &str, width: usize) -> Vec<EngineOutput> {
 
 /// Each run of `got` against the same prompt's run in `reference`, by `label`.
 fn assert_close(reference: &[EngineOutput], got: &[EngineOutput], label: &str) {
+    assert_close_under(reference, got, label, None);
+}
+
+/// [`assert_close`] for requests under a frequency and a presence penalty (`penalties`): the
+/// margin of a divergence is between the two tokens' penalized logits — their raw logprobs, less
+/// each one's penalty from its count in the reference's output before it. (A repetition penalty
+/// scales a logit, so it orders tokens by their absolute logits, which logprobs do not carry.)
+fn assert_close_under(
+    reference: &[EngineOutput],
+    got: &[EngineOutput],
+    label: &str,
+    penalties: Option<[f64; 2]>,
+) {
     for (i, (want, got)) in reference.iter().zip(got).enumerate() {
         // A run that diverges may end its text sooner: they compare up to the shorter.
         assert!(
@@ -106,7 +128,18 @@ fn assert_close(reference: &[EngineOutput], got: &[EngineOutput], label: &str) {
             (want.output_tokens.iter().zip(&got.output_tokens)).position(|(a, b)| a != b);
         if let Some(at) = diverged {
             let (mine, theirs) = (&want.output_tokens[at], &got.output_tokens[at]);
-            let margin = want.logprobs[at][mine] - want.logprobs[at][theirs];
+            let penalty = |token: &String| {
+                let [frequency, presence] = penalties.unwrap_or_default();
+                let count = (want.output_tokens[..at].iter())
+                    .filter(|&t| t == token)
+                    .count();
+                match count {
+                    0 => 0.0,
+                    n => frequency * n as f64 + presence,
+                }
+            };
+            let margin = (want.logprobs[at][mine] - penalty(mine))
+                - (want.logprobs[at][theirs] - penalty(theirs));
             eprintln!(
                 "MARGIN {label} prompt {i} position {at}: {margin:.4} nats ({mine:?} vs {theirs:?})"
             );
@@ -165,6 +198,47 @@ async fn drafted_output_is_the_targets() {
         eprintln!("drafting, {width} at once: {proposed} draft tokens proposed");
         assert!(proposed > 0, "{width} at once drafts");
         assert_close(&alone, &drafted, &format!("drafting, {width} at once"));
+    }
+}
+
+// ── Penalized output ────────────────────────────────────────────────────────────────────────
+
+/// The frequency and presence penalties of [`penalized`] requests.
+const PENALTIES: [f64; 2] = [0.4, 0.3];
+
+/// A request reading its history: a frequency and a presence penalty. (Repetition, which scales a
+/// logit, is the kernel test's: a divergence's margin under it is not in the logprobs.)
+fn penalized(prompt: &str) -> CompletionRequest {
+    let [frequency, presence] = PENALTIES;
+    CompletionRequest {
+        frequency_penalty: Some(frequency),
+        presence_penalty: Some(presence),
+        ..request(prompt)
+    }
+}
+
+/// Penalized requests draft — their verify rows penalized from their penalty words and the drafts
+/// before each row (Splash's `decode_sample_penalize_verify`) — and say what the target alone says
+/// under the same penalties, one at a time and four at once, up to a near tie; their logprobs are
+/// the raw ones, as the target alone's.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn penalized_drafted_output_is_the_targets() {
+    scratchy_e2e::skip_if_no_gpu!();
+    let alone = {
+        let server = server(&["--num-speculative-tokens", "0"]).await;
+        outputs_of(server.base_url(), 1, penalized).await
+    };
+    let server = server(&["--enable-metrics"]).await;
+    let url = server.base_url();
+    for width in [1, 4] {
+        let before = draft_tokens(url).await;
+        let drafted = outputs_of(url, width, penalized).await;
+        let proposed = draft_tokens(url).await - before;
+        eprintln!("PENALIZED drafting, {width} at once: {proposed} draft tokens proposed");
+        assert!(proposed > 0, "penalized requests draft, {width} at once");
+        let label = format!("penalized, drafting, {width} at once");
+        assert_close_under(&alone, &drafted, &label, Some(PENALTIES));
     }
 }
 

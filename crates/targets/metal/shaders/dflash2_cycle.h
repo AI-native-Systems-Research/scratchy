@@ -91,3 +91,18 @@ struct TargetVocabularyRange {
   float rest;
   uint after;
 };
+
+// One penalized sequence of a step (Splash's `SamplingPenaltyParams`, an entry of it): its first
+// row in the step's logits and how many it has (a verify step's anchor and drafts, or one), its
+// penalty words' row, its penalties (repetition with its saturated inverse, presence, frequency),
+// and the step's input tokens of those rows: row r's context adds inputs 1..r, its drafts.
+struct PenalizeEntry {
+  uint logits_row;
+  uint rows;
+  uint table_row;
+  float repetition;
+  float repetition_inverse;
+  float presence;
+  float frequency;
+  uint inputs[8];
+};

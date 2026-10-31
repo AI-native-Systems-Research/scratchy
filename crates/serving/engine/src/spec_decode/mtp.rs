@@ -240,6 +240,9 @@ pub struct MtpProposerConfig {
     pub max_seqs: usize,
     /// Maximum model context length: no draft lands past it.
     pub max_model_len: usize,
+    /// The head drafts a block a pass (`DraftBudget::block`, a DFlash2 drafter), whose worker
+    /// penalizes its verify rows ([`Proposer::penalizes_verify_rows`]).
+    pub block: bool,
 }
 
 /// The MTP proposer (module docs).
@@ -778,6 +781,10 @@ impl Proposer for MtpProposer {
         Some(self.config.max_seqs)
     }
 
+    fn penalizes_verify_rows(&self) -> bool {
+        self.config.block
+    }
+
     fn propose_for_step(&mut self, ctx: &mut ProposerStepCtx<'_>) -> HashMap<String, Vec<u32>> {
         // The worker drafted for the requests this step planned.
         ctx.worker_drafts.cloned().unwrap_or_default()
@@ -902,6 +909,7 @@ mod tests {
             num_speculative_tokens: 3,
             max_seqs: 2,
             max_model_len: 4096,
+            block: false,
         })
     }
 

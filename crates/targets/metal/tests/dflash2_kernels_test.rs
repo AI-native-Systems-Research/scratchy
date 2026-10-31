@@ -3140,3 +3140,147 @@ fn a_context_window_reads_back_what_splash_stores() {
         }
     }
 }
+
+// ── The penalties (Splash target_sampling_metal_test.mm `penalties`, `requirePenalizedRows`) ────
+//
+// Splash's checks of its penalty kernel against the host's arithmetic, on scratchy's bf16 logits:
+// each penalized sequence's rows rewritten from its own words row, counting at verify row r the
+// drafts of input rows 1..r, rounded to bf16 as the kernel writes them; every other logit
+// bitwise unchanged.
+
+use scratchy_target_metal::dflash2::PenalizeEntry;
+
+/// bf16's largest finite value, where the kernel saturates.
+fn bf16_max() -> f32 {
+    f32::from_bits(0x7f7f_0000)
+}
+
+/// Splash `referencePenalty`, on the target's sampler's counting: the logit of a token the prompt
+/// and the output hold `count` times between them, as the kernel computes it before rounding.
+fn reference_penalty(value: f32, count: u32, entry: &PenalizeEntry) -> f32 {
+    if count == 0 {
+        return value;
+    }
+    let value = value
+        * match value > 0.0 {
+            true => entry.repetition_inverse,
+            false => entry.repetition,
+        };
+    (value - (entry.frequency * count as f32 + entry.presence)).clamp(-bf16_max(), bf16_max())
+}
+
+/// Splash `penaltyTable`: `rows` rows of words, each with small counts at a density of its own,
+/// and a few counts at the 2^20-token limit.
+fn penalty_table(vocabulary: usize, rows: usize) -> Vec<u32> {
+    let mut table = vec![0u32; rows * vocabulary];
+    for slot in 0..rows {
+        let mut random = Random(0x0074_6162_6c65 + slot as u64);
+        for token in 0..vocabulary {
+            let draw = random.next() % 64;
+            let mut word = u32::from(draw < 8 + 6 * slot as u32);
+            if draw.is_multiple_of(3) {
+                word += 1 + draw % (slot as u32 + 3);
+            }
+            if draw == 63 && token.is_multiple_of(7) {
+                word = 1 << 20;
+            }
+            table[slot * vocabulary + token] = word;
+        }
+    }
+    table
+}
+
+/// Two penalized sequences of one step's 16 logits rows — a verify block of 8 rows from row 0 on
+/// words row 3 (every penalty), and a single row at row 11 on words row 1 (presence alone) —
+/// rewrite exactly their own rows: each logit as Splash's host arithmetic computes it from its
+/// words and its row's drafts, rounded to bf16, and every other row bitwise as it was. The drafts
+/// repeat the block's best tokens, so the counts they add move its argmax.
+#[test]
+fn penalized_rows_are_rewritten_from_their_words_and_drafts() {
+    let Some(gpu) = Gpu::new() else { return };
+    let vocabulary = 1003usize;
+    let mut random = Random(0x0070_656e);
+    let rows = 16usize;
+    let logits = random.bf16s(rows * vocabulary, 8.0);
+    let table = penalty_table(vocabulary, 4);
+    // The block's best tokens, by its first row.
+    let mut order: Vec<usize> = (0..vocabulary).collect();
+    order.sort_by(|&a, &b| value(logits[b]).total_cmp(&value(logits[a])));
+    let best = |i: usize| order[i] as u32;
+    let block = [
+        best(9),
+        best(0),
+        best(1),
+        best(0),
+        best(2),
+        best(3),
+        best(1),
+        best(4),
+    ];
+    let entries = [
+        PenalizeEntry::new(0, &block, 3, [1.3, 0.25, 0.5]),
+        PenalizeEntry::new(11, &[best(5)], 1, [1.0, 1.5, 0.0]),
+    ];
+    let b_logits = gpu.buffer(&logits);
+    let b_words = gpu.buffer(&table);
+    let b_entries = gpu.buffer(&entries);
+    let constants = TargetSamplingConstants {
+        vocab: scratchy_target_metal::tape::ids::LogitsWidth(vocabulary as u32),
+        rows: ROWS,
+    };
+    let pso = gpu.pipeline(
+        "dflash2_target_sampling",
+        "dflash2_penalize_bf16",
+        constants,
+    );
+    let mut batch = gpu.batch();
+    batch.encode(
+        &pso,
+        &[(&b_logits, 0), (&b_words, 1), (&b_entries, 2)],
+        &[],
+        &[],
+        &[],
+        tg(entries.len() * vocabulary.div_ceil(256), 1, 1),
+        tg(256, 1, 1),
+    );
+    batch.commit(true);
+    let got: Vec<u16> = read(&b_logits, rows * vocabulary);
+
+    let argmax = |v: &[u16]| {
+        (0..vocabulary)
+            .max_by(|&a, &b| value(v[a]).total_cmp(&value(v[b])))
+            .expect("a vocabulary")
+    };
+    let mut moved = 0;
+    for row in 0..rows {
+        let entry = (entries.iter())
+            .find(|e| (e.logits_row..e.logits_row + e.rows).contains(&(row as u32)));
+        for token in 0..vocabulary {
+            let at = row * vocabulary + token;
+            let (before, after) = (logits[at], got[at]);
+            let Some(entry) = entry else {
+                assert_eq!(after, before, "row {row} token {token}: an unpenalized row");
+                continue;
+            };
+            let r = (row as u32 - entry.logits_row) as usize;
+            let word = table[entry.table_row as usize * vocabulary + token];
+            let drafted = (1..=r).filter(|&i| entry.inputs[i] == token as u32).count() as u32;
+            let count = word + drafted;
+            let expected = reference_penalty(value(before), count, entry);
+            // One product rounds alike; a fused subtraction may land a bf16 step either way.
+            let exact = after == bits(expected);
+            let within = (value(after) - expected).abs() <= ulp_bf16(expected);
+            assert!(
+                exact || (count > 0 && within),
+                "row {row} token {token}: wrote {} for {} (count {count}), expected {expected}",
+                value(after),
+                value(before)
+            );
+        }
+        if entry.is_some_and(|e| e.rows > 1) {
+            let span = row * vocabulary..(row + 1) * vocabulary;
+            moved += usize::from(argmax(&got[span.clone()]) != argmax(&logits[span]));
+        }
+    }
+    assert!(moved > 0, "the penalties moved no verify row's argmax");
+}

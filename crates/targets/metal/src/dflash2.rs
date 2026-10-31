@@ -204,6 +204,80 @@ pub struct TargetSamplingKernels {
     pub mass: crate::off_tape::OffTapePipeline,
     pub search: crate::off_tape::OffTapePipeline,
     pub draw: crate::off_tape::OffTapePipeline,
+    /// Each penalized sequence's sampled rows' penalties, in place ([`PenalizeEntry`]).
+    pub penalize: crate::off_tape::OffTapePipeline,
+    vocab: u32,
+}
+
+/// The most rows a [`PenalizeEntry`] covers: a block's (`dflash2_cycle.h`).
+pub const PENALIZE_ROWS: usize = 8;
+
+/// One penalized sequence of a step (`dflash2_cycle.h` `PenalizeEntry`; an entry of Splash's
+/// `SamplingPenaltyParams`): its first row in the step's logits and how many, its penalty words'
+/// row, its penalties, and the step's input tokens of those rows — row r's context adds inputs
+/// 1..r, its drafts.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PenalizeEntry {
+    pub logits_row: u32,
+    pub rows: u32,
+    pub table_row: u32,
+    pub repetition: f32,
+    pub repetition_inverse: f32,
+    pub presence: f32,
+    pub frequency: f32,
+    pub inputs: [u32; PENALIZE_ROWS],
+}
+
+const _: () = assert!(
+    size_of::<PenalizeEntry>() == 60,
+    "dflash2_cycle.h's PenalizeEntry"
+);
+
+impl PenalizeEntry {
+    /// The entry of a sequence's `inputs` rows from logits row `logits_row`, its words at row
+    /// `table_row`: its repetition's inverse saturated, as Splash's (`1 / 2^-149` overflows).
+    pub fn new(
+        logits_row: u32,
+        inputs: &[u32],
+        table_row: u32,
+        [repetition, presence, frequency]: [f32; 3],
+    ) -> Self {
+        assert!(
+            (1..=PENALIZE_ROWS).contains(&inputs.len()),
+            "a penalized sequence has 1 to {PENALIZE_ROWS} rows, not {}",
+            inputs.len()
+        );
+        let mut rows = [0; PENALIZE_ROWS];
+        rows[..inputs.len()].copy_from_slice(inputs);
+        Self {
+            logits_row,
+            rows: inputs.len() as u32,
+            table_row,
+            repetition,
+            repetition_inverse: (1.0 / repetition).min(f32::MAX),
+            presence,
+            frequency,
+            inputs: rows,
+        }
+    }
+}
+
+/// A sequence's penalty words (Splash `Sampling::rebuildPenaltyWords`, runtime/ops/Sampling.cpp,
+/// a word a token) from its history, counted as the target's own sampler counts them
+/// (sampling.metal `sample_softmax_reduce`): each token's occurrences in its prompt and its output,
+/// the one count its repetition, frequency and presence penalties all read.
+pub fn rebuild_penalty_words(words: &mut [u32], prompt: &[u32], generated: &[u32]) {
+    words.fill(0);
+    count_penalty_tokens(words, prompt);
+    count_penalty_tokens(words, generated);
+}
+
+/// Splash `Sampling::countPenaltyTokens`: `selected`, emitted, counted into the words.
+pub fn count_penalty_tokens(words: &mut [u32], selected: &[u32]) {
+    for &token in selected {
+        words[token as usize] += 1;
+    }
 }
 
 /// Where one step's cycle reads and writes, in one buffer for `lanes` lanes of `rows`-row blocks,
@@ -371,6 +445,8 @@ impl TargetSamplingKernels {
                     mass: crate::off_tape::OffTapePipeline::new(device, &k.mass)?,
                     search: crate::off_tape::OffTapePipeline::new(device, &k.search)?,
                     draw: crate::off_tape::OffTapePipeline::new(device, &k.draw)?,
+                    penalize: crate::off_tape::OffTapePipeline::new(device, &k.penalize)?,
+                    vocab: kernels.vocab.get(),
                 })
             })
             .transpose()
@@ -399,6 +475,23 @@ impl TargetSamplingKernels {
             draw,
             rows * VOCABULARY_GROUPS,
             VOCABULARY_THREADS,
+        );
+    }
+
+    /// Encode `entries` penalized sequences' penalties onto `encoder` (`table`: the logits, the
+    /// penalty words and the entries), after what is on it: 256 tokens a threadgroup.
+    pub fn encode_penalize(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        entries: u32,
+    ) {
+        encode_after(
+            &self.penalize,
+            encoder,
+            table,
+            entries * self.vocab.div_ceil(256),
+            256,
         );
     }
 }
@@ -605,9 +698,9 @@ impl WindowLayout {
     }
 }
 
-/// A copy between two context windows' bytes: `len` bytes from `from` at `from_at` to `to` at
-/// `to_at` — a lane's window and a prefix-cache snapshot's, either way.
-pub struct WindowCopy<'a> {
+/// A copy of `len` bytes from `from` at `from_at` to `to` at `to_at`: a lane's context window and
+/// a prefix-cache snapshot's, either way, or a penalized row's raw logits set aside and back.
+pub struct BufferCopy<'a> {
     pub from: &'a objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
     pub from_at: u64,
     pub to: &'a objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
@@ -617,9 +710,9 @@ pub struct WindowCopy<'a> {
 
 /// Encode `copies` on `encoder` between what comes before and after them: each copy waits for
 /// every dispatch and copy before it, and every dispatch and copy after them waits for the copies.
-pub fn encode_window_copies(
+pub fn encode_buffer_copies(
     encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
-    copies: &[WindowCopy<'_>],
+    copies: &[BufferCopy<'_>],
 ) {
     use objc2_metal::{
         MTL4CommandEncoder as _, MTL4ComputeCommandEncoder as _, MTL4VisibilityOptions, MTLStages,
@@ -634,7 +727,7 @@ pub fn encode_window_copies(
         MTL4VisibilityOptions::Device,
     );
     for c in copies {
-        // SAFETY: every range lies inside its buffer: a slot's window, laid out by `WindowLayout`.
+        // SAFETY: every range lies inside its buffer, as its caller laid it out.
         unsafe {
             encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
                 c.from,
@@ -722,6 +815,20 @@ impl DraftRingPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host word helpers: each token's occurrences in the prompt and the output counted, as
+    /// the target's sampler counts them, and counting adds to what a rebuild made.
+    #[test]
+    fn penalty_words_count_the_prompt_and_the_output() {
+        let mut words = vec![7u32; 8];
+        rebuild_penalty_words(&mut words, &[1, 2, 2], &[2, 3, 3]);
+        assert_eq!(words, [0, 1, 3, 2, 0, 0, 0, 0]);
+        count_penalty_tokens(&mut words, &[3, 5]);
+        assert_eq!(words, [0, 1, 3, 3, 0, 1, 0, 0]);
+        let entry = PenalizeEntry::new(4, &[9, 8], 2, [f32::from_bits(1), 0.5, 0.25]);
+        assert_eq!((entry.rows, entry.inputs[..3].to_vec()), (2, vec![9, 8, 0]));
+        assert_eq!(entry.repetition_inverse, f32::MAX, "1 / 2^-149 saturates");
+    }
 
     /// A window of 2048 positions of 2048-value rows: 1024 code bytes and 32 groups of 4 bytes a
     /// position, codes first. Positions 10..14 are four slots' codes and groups; positions

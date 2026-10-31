@@ -803,6 +803,7 @@ impl Speculation {
                 num_speculative_tokens,
                 max_seqs: Self::budget(head).max_seqs(),
                 max_model_len,
+                block: Self::budget(head).block,
             })),
         }
     }

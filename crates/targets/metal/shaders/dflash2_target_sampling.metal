@@ -888,10 +888,67 @@ template <typename L>
   }
 }
 
+// ── The penalties (sampling.metal:929-1004 `penalize_logit`, `penalize_token`,
+// `decode_sample_penalize_verify`) ─────────────────────────────────────────────────────────────
+//
+// Each penalized sequence's sampled rows, rewritten in place before any selection reads them, with
+// these changes: the logits are the model's activation type (Splash's f32), saturating at that
+// type's largest finite value; an entry carries its own logits row, row count and input tokens
+// (Splash's parameter arrays and its verify input buffer).
+
+template <typename L> inline float largest_finite();
+template <> inline float largest_finite<half>() { return 65504.0f; }
+template <> inline float largest_finite<bfloat>() { return as_type<float>(0x7f7f0000u); }
+
+// The sampling penalties of one logit with a nonzero count of its token, as the target's own
+// sampler applies them (sampling.metal `sample_softmax_reduce`): repetition divides a positive
+// logit and multiplies a negative one, and presence and frequency lower it by the count. The count
+// is the token's occurrences in the prompt and the output. The result saturates, so no rewritten
+// logit is infinite; a NaN or -inf logit (masked) stays as it is.
+inline float penalize_logit(float value, uint count, PenalizeEntry entry) {
+  const uint bits = as_type<uint>(value);
+  if ((bits & 0x7fffffffu) > 0x7f800000u || bits == 0xff800000u)
+    return value;
+  value *= value > 0.0f ? entry.repetition_inverse : entry.repetition;
+  value -= entry.frequency * float(count) + entry.presence;
+  return clamp(value, -largest_finite<L>(), largest_finite<L>());
+}
+
+// One thread a token of an entry: a threadgroup of 256 tokens, `ceil(TSAMPLE_VOCAB / 256)` an
+// entry. Bit r of `drafted` is set when the entry's input row r holds the token: row r counts bits
+// 1..r on top of the words' count.
+template <typename L>
+[[kernel]] void dflash2_penalize(device L *logits [[buffer(0)]],
+                                 device const uint *words [[buffer(1)]],
+                                 device const PenalizeEntry *entries [[buffer(2)]],
+                                 uint group [[threadgroup_position_in_grid]],
+                                 uint thread_index [[thread_position_in_threadgroup]]) {
+  constexpr uint kGroupsAnEntry = (TSAMPLE_VOCAB + 255u) / 256u;
+  const uint token = (group % kGroupsAnEntry) * 256u + thread_index;
+  if (token >= TSAMPLE_VOCAB)
+    return;
+  const PenalizeEntry entry = entries[group / kGroupsAnEntry];
+  uint drafted = 0;
+  for (uint row = 1; row < entry.rows; ++row)
+    drafted |= uint(entry.inputs[row] == token) << row;
+  const uint word = words[ulong(entry.table_row) * TSAMPLE_VOCAB + token];
+  if (!word && !drafted)
+    return;
+  device L *column = logits + ulong(entry.logits_row) * TSAMPLE_VOCAB + token;
+  for (uint row = 0; row < entry.rows; ++row) {
+    const uint count = word + popcount(drafted & ((2u << row) - 2u));
+    if (!count)
+      continue;
+    device L &logit = column[ulong(row) * TSAMPLE_VOCAB];
+    logit = L(penalize_logit<L>(float(logit), count, entry));
+  }
+}
+
 #define INST_TSAMPLE(tag, L)                                         \
   SCRATCHY_KERNEL(dflash2_sample_mass_##tag, dflash2_sample_mass<L>)     \
   SCRATCHY_KERNEL(dflash2_sample_search_##tag, dflash2_sample_search<L>) \
-  SCRATCHY_KERNEL(dflash2_sample_draw_##tag, dflash2_sample_draw<L>)
+  SCRATCHY_KERNEL(dflash2_sample_draw_##tag, dflash2_sample_draw<L>)    \
+  SCRATCHY_KERNEL(dflash2_penalize_##tag, dflash2_penalize<L>)
 
 INST_TSAMPLE(f16, half)
 INST_TSAMPLE(bf16, bfloat)

@@ -7411,6 +7411,7 @@ mod tests {
                 num_speculative_tokens: 2,
                 max_seqs: 2,
                 max_model_len: 4096,
+                            block: false,
             },
         ));
         let client = Box::new(InprocClient::new(config, Box::new(FailingExecutor)));
