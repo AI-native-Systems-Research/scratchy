@@ -525,9 +525,14 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
         .nodes
         .iter()
         .find(|n| matches!(n.op, SubOp::Sample { .. }));
+    // ⭐ A SPLIT HEAD IS THE TAIL'S PRODUCT TOO. A vocabulary projection split across ranks is one
+    // rank's block (`n` < vocab), and it reaches the draw through the all-gather that restores the
+    // whole vocabulary — the same product, gathered.
     let feeds_the_tail_product = match (&draw, &node.op) {
         (Some(sample), SubOp::MatmulTile { n, .. }) => match &sample.op {
-            SubOp::Sample { vocab, .. } => *n == *vocab,
+            SubOp::Sample { vocab, .. } => {
+                *n == *vocab || gathers_to_width(ir, node.output.tensor, *vocab)
+            }
             _ => false,
         },
         (Some(sample), _) => match &sample.op {
@@ -539,10 +544,37 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
             node.output.region.cols.len == result_cols
         }
     };
+    // A projection's rows are its ACTIVATION's: a folded tail that gathers is declared one row from
+    // the projection's output down (`subtile_ir::mint_sample`, so the gather's operand is a whole
+    // one-row tensor), while the prompt rows it folds over are still `mq`. Every other tail op, and
+    // every projection of a tail that does not gather, has the same rows in and out.
+    let rows = match &node.op {
+        SubOp::MatmulTile { .. } => node.inputs.first().map_or(0, |a| a.region.rows.len),
+        _ => node.output.region.rows.len,
+    };
     feeds_the_tail_product
-        && node.output.region.rows.len > 1
+        && rows > 1
         && !rows_are_requests
         && tensor_feeds_result_through_row_local_ops(ir, node.output.tensor)
+}
+
+/// Whether `t` reaches an all-gather restoring `width` columns through single-input logit
+/// epilogues — the path a split vocabulary projection takes to the draw.
+fn gathers_to_width<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &SubtileIR<F>,
+    t: scratchy_subtile::subtile_ir::TensorId,
+    width: u32,
+) -> bool {
+    ir.nodes
+        .iter()
+        .filter(|n| n.inputs.iter().any(|i| i.tensor == t))
+        .any(|n| match &n.op {
+            SubOp::AllGather { cols } => *cols == width,
+            SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if n.inputs.len() == 1 => {
+                gathers_to_width(ir, n.output.tensor, width)
+            }
+            _ => false,
+        })
 }
 
 /// EVERY OP THE SPLICE EMITS FOR ONE NODE. Every kind is one op except the prefill
@@ -993,6 +1025,9 @@ pub fn row_local_tail_op<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F
             // stick — no row mixing — so a minted graph's feeds-walk traverses
             // it from the tail to the re-pointed result.
             | SubOp::Sample { .. }
+            // ⭐ AN ALL-GATHER IS ROW-LOCAL: row `r` of its output is row `r` of every rank's
+            // block, side by side — a split vocabulary projection's tail passes through it.
+            | SubOp::AllGather { .. }
     )
 }
 
