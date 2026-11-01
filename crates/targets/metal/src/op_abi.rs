@@ -251,7 +251,14 @@ pub const METAL_KV_CODEC: KvCodecFacts = {
 /// TODO: derive it, and the decoder ladder's verify-sized rungs, from the compiled heads'
 /// `spec_verify_rows`: a head budget past 8 rows puts verify steps onto the 64-row
 /// prefill-shaped tape.
-pub const METAL_VERIFY_ROWS: u32 = 8;
+pub const METAL_VERIFY_ROWS: u32 =
+    scratchy_forward_compiler::DFLASH2_BLOCK_LANES as u32 * METAL_LANE_VERIFY_ROWS;
+
+/// A verify lane's rows: a sequence's token and its drafts (Splash's SPLASH_TARGET_VERIFY_ROWS), at
+/// most a Gated-DeltaNet verify's rows a sequence (`gdn_verify.metal` GDN_VER_ROWS). A
+/// verify-sized bucket holds up to [`scratchy_forward_compiler::DFLASH2_BLOCK_LANES`] such lanes,
+/// each its own sequence: every decode-shaped kernel reads a sequence's rows from `cu_seqlens`.
+pub const METAL_LANE_VERIFY_ROWS: u32 = 8;
 
 /// Whether a guarded codec step runs at a bake, and under which runtime gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -662,6 +669,7 @@ const F_ROUTED_WIDE: FoldPattern<MetalFusion> = FoldPattern::RoutedExperts {
         sorted_per_expert: METAL_SORTED_PAIRS_PER_EXPERT,
         grouped_per_expert: METAL_GROUPED_PAIRS_PER_EXPERT,
         decode_rows: METAL_DECODE_GROUPED_ROWS,
+        lane_rows: METAL_LANE_VERIFY_ROWS,
     },
     kernel: MetalFusion::MoeRouted,
 };
@@ -677,6 +685,7 @@ const F_ROUTED_NARROW: FoldPattern<MetalFusion> = FoldPattern::RoutedExperts {
         sorted_per_expert: METAL_SORTED_PAIRS_PER_EXPERT,
         grouped_per_expert: METAL_GROUPED_PAIRS_PER_EXPERT,
         decode_rows: METAL_DECODE_GROUPED_ROWS,
+        lane_rows: METAL_LANE_VERIFY_ROWS,
     },
     kernel: MetalFusion::MoeRouted,
 };

@@ -25,7 +25,11 @@ import torch
 import torch.nn.functional as F
 
 
-@forward
+# The 16 and 32 rungs hold a 2-4-lane DFlash2 verify (lanes x 8 rows, Splash's
+# SPLASH_MAXIMUM_BATCH_WIDTH x SPLASH_TARGET_VERIFY_ROWS) on decode-shaped kernels: on the
+# default ladder it ran the 64-row prefill tape, 21-28 ms of GPU at 9-16 rows (M5 Max) against
+# Splash's 13.96 / 19.66 ms 2- / 4-lane cycles. A head shares its target's rungs.
+@forward(workloads=[1, 2, 4, 8, 16, 32, 64, 512, 1024, 2048, 4096])
 def dflash2():
     context = rmsnorm(gemm(target_hidden, fc), hidden_norm)
     stored = draft_window_store(context, positions)
