@@ -965,30 +965,36 @@ mod tests {
     }
 
     /// spyre-inference's dispatch: the decode kernel, at one query row, is the one that reads
-    /// `kv_row_pool`, so a decode step stages it and a prompt chunk does not.
+    /// `kv_row_pool`: BOTH ONE-SEQUENCE KERNELS stage it — the decode trip and the prompt trip, which
+    /// gathers its page as the pool's `nkvh` rows so the gather divides a kv head a core. A decode
+    /// BATCH reads its pages through `chunk_page_ids` and stages no pool.
     #[test]
-    fn only_a_decode_step_stages_kv_row_pool() {
+    fn both_one_sequence_steps_stage_kv_row_pool() {
         let blocks = [2u32, 0];
-        let tids = |s: &PagedStep, rows: StepRows| -> Vec<u32> {
-            step_sources(s, &blocks, &rows)
-                .unwrap()
+        for (what, s, rows) in [
+            ("a prompt chunk", step(), StepRows { start: 5, real: 2 }),
+            (
+                "a decode step",
+                PagedStep { rows: 1, ..step() },
+                StepRows { start: 5, real: 1 },
+            ),
+        ] {
+            let srcs = step_sources(&s, &blocks, &rows).unwrap();
+            assert!(
+                srcs.int32.iter().any(|(t, ..)| *t == s.kv_row_pool),
+                "{what} stages kv_row_pool"
+            );
+            let (_, zero, _) = srcs
                 .int32
                 .iter()
-                .map(|(t, ..)| *t)
-                .collect()
-        };
-        let chunk = step();
-        let staged = tids(&chunk, StepRows { start: 5, real: 2 });
-        assert!(!staged.contains(&chunk.kv_row_pool) && !staged.contains(&chunk.int32_zero));
-        let decode = PagedStep { rows: 1, ..step() };
-        let srcs = step_sources(&decode, &blocks, &StepRows { start: 5, real: 1 }).unwrap();
-        assert!(srcs.int32.iter().any(|(t, ..)| *t == decode.kv_row_pool));
-        let (_, zero, _) = srcs
-            .int32
-            .iter()
-            .find(|(t, ..)| *t == decode.int32_zero)
-            .expect("a decode step stages the int32 zero beside kv_row_pool");
-        assert!(zero.iter().all(|&b| b == 0) && !zero.is_empty());
+                .find(|(t, ..)| *t == s.int32_zero)
+                .unwrap_or_else(|| panic!("{what} stages the int32 zero beside kv_row_pool"));
+            assert!(zero.iter().all(|&b| b == 0) && !zero.is_empty(), "{what}");
+        }
+        // A decode batch's attention reads no pool.
+        let batch = batch();
+        assert!(!batch.reads_kv_row_pool());
+        assert!(card_statics(&batch).unwrap().is_empty());
     }
 
     fn ints(b: &[u8]) -> Vec<i32> {
@@ -1151,9 +1157,15 @@ mod tests {
             .1;
         assert_eq!(zero.len(), run * 4);
         assert!(zero.iter().all(|&b| b == 0));
+        // A prompt chunk gathers its page through the same pool, so its statics are the same.
+        assert_eq!(
+            card_statics(&step()).unwrap(),
+            statics,
+            "a prompt chunk reads the same pool"
+        );
         assert!(
-            card_statics(&step()).unwrap().is_empty(),
-            "a prompt chunk reads none"
+            card_statics(&batch()).unwrap().is_empty(),
+            "a decode batch reads none"
         );
         assert!(
             card_statics(&batch()).unwrap().is_empty(),
