@@ -2247,6 +2247,39 @@ impl SpyreWorker {
                 //
                 // ⛔ THE LADDER STILL BUILDS IN PARALLEL. This reorders WHO ALLOCATES FIRST; it does not
                 // serialize startup, and the aliasing after the join is unchanged.
+                let _t_sess = std::time::Instant::now();
+                // The DECODE session is the sole OWNER of the resident weights — it is the only one that
+                // binds and stages them; the batched-prefill session and every ladder rung borrow seg1
+                // from it by alias. So this takes `weights` by MOVE and no copy of that ~2.6 GB host
+                // buffer is ever made.
+                let mut ss = SuperDscSession::new(
+                    code,
+                    vocab,
+                    kv_dim,
+                    num_blocks,
+                    weights,
+                    wirings.decode.load_consts,
+                    &spill_tids,
+                )
+                .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
+                // ⭐ THE PEER'S LANDING SLOTS, POINTED AT THE WINDOW THIS OWNER JUST ALLOCATED. The
+                // window is a placement in the weight segment every other session aliases, and its
+                // device address exists only now; a world of one has no peer and this is a no-op.
+                // Done during load, so before this rank reports ready and before any step sends.
+                ss.point_landing_slots().map_err(|e| {
+                    werr(format!(
+                        "pointing the peer's landing slots at the receive window: {e}"
+                    ))
+                })?;
+                // ⭐ THE LADDER SPAWNS ONLY NOW, AFTER THE OWNER HAS ALLOCATED. Its rungs allocate
+                // their own segments concurrently, so spawned any earlier they race the owner for
+                // the allocator, and where the owner's weight segment lands is whichever request
+                // wins — per process. That cost one rank of a world its window: the receive window
+                // is a placement in this segment, every rank must land it at one address, and
+                // #1009 runs 20/22 measured two ranks placing it 1.8 GB apart. (It is also the
+                // bimodal decode above: the owner allocating first is what puts seg1 in the fast
+                // region every run.) The rungs alias seg1 from the owner after the join, so they
+                // never needed to start sooner.
                 let ladder_join = {
                     // The prefill wiring's staged constants, staged by every rung through its own
                     // seg3 (the general mint's nine tables — see the anchor's own `prefill_consts`).
@@ -2304,30 +2337,6 @@ impl SpyreWorker {
                     })
                 };
 
-                let _t_sess = std::time::Instant::now();
-                // The DECODE session is the sole OWNER of the resident weights — it is the only one that
-                // binds and stages them; the batched-prefill session and every ladder rung borrow seg1
-                // from it by alias. So this takes `weights` by MOVE and no copy of that ~2.6 GB host
-                // buffer is ever made.
-                let mut ss = SuperDscSession::new(
-                    code,
-                    vocab,
-                    kv_dim,
-                    num_blocks,
-                    weights,
-                    wirings.decode.load_consts,
-                    &spill_tids,
-                )
-                .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
-                // ⭐ THE PEER'S LANDING SLOTS, POINTED AT THE WINDOW THIS OWNER JUST ALLOCATED. The
-                // window is a placement in the weight segment every other session aliases, and its
-                // device address exists only now; a world of one has no peer and this is a no-op.
-                // Done during load, so before this rank reports ready and before any step sends.
-                ss.point_landing_slots().map_err(|e| {
-                    werr(format!(
-                        "pointing the peer's landing slots at the receive window: {e}"
-                    ))
-                })?;
                 // ⭐ THE SPILLED WEIGHT TAIL'S DEVICE IMAGE, read back from the OWNER once its
                 // prepare has staged and uploaded it. Every borrowing session gets a copy of this
                 // (see `adopt_from_owner`) because the slot it lives in cannot be aliased. Empty —
