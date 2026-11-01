@@ -3977,14 +3977,12 @@ pub fn numeric_gate<F: RopeForm>(
     // table rather than at its block's own index. The reference attends the cache's token-major
     // rows; the pools the paged walk reads are those SAME values laid into their pages
     // (`pool_of_rows`), so the two read one set of keys.
-    // One request's step: the gate runs in an emulator bake, whose decode rungs are one request
-    // wide (the batch rungs, `PagedKvPool::BATCH_RUNGS`, bake for the card alone) — a decode
-    // bundle's one row is that request's, read by the batched kernel at one sequence, and a prompt
-    // chunk's rows are one sequence's (the bake's `rows_are_requests`).
+    // One sequence's step: the gate runs in an emulator bake, whose decode rungs are one request
+    // wide (the batch rungs, `PagedKvPool::BATCH_RUNGS`, bake for the card alone).
     let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
         ir,
         rung.active_cap,
-        scratchy_triton_splice::PagedRows::of_requests(prefill.is_none()),
+        scratchy_triton_splice::PagedRows::Sequence,
     )
     .map_err(|e| e.0)?;
     let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
@@ -4104,7 +4102,7 @@ pub fn numeric_gate<F: RopeForm>(
     // other, the page table and the write rows int32 words on the typed channel (the f16 source
     // channel would encode them into half the bytes their views span).
     if let Some(p) = paged {
-        let srcs = crate::paged_step::request_sources(&p, &blocks, &step_rows)
+        let srcs = crate::paged_step::step_sources(&p, &blocks, &step_rows)
             .map_err(|e| format!("the gate's paged step: {e}"))?;
         for (tid, bytes, shape) in srcs.int32 {
             emu_weights.push((tid as usize, bytes, scratchy_tensors::DType::I32, shape));

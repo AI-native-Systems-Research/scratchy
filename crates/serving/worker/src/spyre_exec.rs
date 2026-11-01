@@ -566,9 +566,18 @@ impl Worker for SpyreWorker {
                         },
                     )
                     .collect();
-                // Every decode rung is a decode batch (`batched_decode_head_major`), the W=1 seat
-                // one sequence of it: spyre-inference's sequence buckets start at 1.
-                let rows_in = LaunchRows::Batch { seqs: &seqs_in };
+                // The W=1 seat is one sequence's decode (`page_attn_head_major_decode`); a ladder rung
+                // is a decode batch (`batched_decode_head_major`).
+                let rows_in = match ri {
+                    RungId::Owner => LaunchRows::Sequence {
+                        blocks: &blocks[0],
+                        rows: scratchy_target_spyre::paged_step::StepRows {
+                            start: decode_ids[0].1,
+                            real: 1,
+                        },
+                    },
+                    RungId::Ladder(_) => LaunchRows::Batch { seqs: &seqs_in },
+                };
                 // ⭐ THE ONE DECODE PATH, SUBMITTED: every row is a different request and every row
                 // is sampled ON THE CARD by the rung's minted sampler; the idx stick's raw D2H is
                 // enqueued and comes back through the SAME collect door whether this schedule

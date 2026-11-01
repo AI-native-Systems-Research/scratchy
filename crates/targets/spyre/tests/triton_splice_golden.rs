@@ -2454,8 +2454,8 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
 /// every entry, misses. Four chunkings: two chunks (each block slot its own softmax, merged after
 /// the walk), one chunk (one maximum per sequence), and two chunks under Triton's gather floor in
 /// pages, gathered by kv head (two sequences on the 2-page rung, and on the 1-page rung: the shape
-/// two concurrent short requests decode at), and one request's decode as a batch of one, deep and
-/// short. One bundle row past the real sequences is padded, as a bucketed batch is.
+/// two concurrent short requests decode at). One bundle row past the real sequences is padded, as
+/// a bucketed batch is.
 #[test]
 #[cfg(feature = "spyre-emu")]
 fn spliced_decode_batch_executes_the_real_programs() {
