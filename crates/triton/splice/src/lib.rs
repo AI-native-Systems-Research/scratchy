@@ -4716,6 +4716,68 @@ mod walk_on_the_card {
         }
     }
 
+    /// ⭐ THE LEADING-AXIS MAXIMUM FOLDS BY HALVING — `log₂ J` ops, not `J - 1`. A decode batch's
+    /// one-chunk arm shares one maximum across its `J` block slots (`torch.amax(..., dim=0)`), and
+    /// the card's reduce folds only along the stick, so the fold is a chain of combines; folding the
+    /// first half against the second makes that chain `log₂ J` levels of half the windows each — the
+    /// same elements, the same answer (`max` reassociates EXACTLY), 5 ops instead of 31 at `J = 32`.
+    ///
+    /// Counted against the `J = 1` lowering, where the fold is skipped entirely, so the kernel's own
+    /// non-fold maximums (its `finfo.min` clamp, its rescale) cancel out of both sides.
+    ///
+    /// ⛔ THE SUM FOLDS KEEP WALKING, and that is the point of the last assertion: fp16 addition does
+    /// not reassociate, the only executor of these descriptors is the card, so a sum tree would be a
+    /// numeric change this build cannot check. The `add` count must stay at the walk's `J - 1` per
+    /// fold until a card run can hold a tree to spyre-inference's own answer.
+    #[test]
+    fn the_leading_axis_maximum_folds_by_halving() {
+        for hd in [64, 128] {
+            for seqs in [1u32, 2] {
+                let count = |walk: u32, prefix: &str| -> u32 {
+                    let (node, _) = batched_walk_at(seqs, walk, hd);
+                    let layout =
+                        triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+                    allocate_paged_cache(&node, &layout).expect("the cache allocates");
+                    let mut sym = 0i64;
+                    let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                        &node,
+                        Some(&layout),
+                        &mut sym,
+                    )
+                    .unwrap_or_else(|e| panic!("B={seqs} walk={walk} hd={hd}: {}", e.message));
+                    ops.iter().filter(|e| e.op_name.starts_with(prefix)).count() as u32
+                };
+                // `J = 1`: no fold at all, so this is the kernel's own non-fold maximums.
+                let base = count(1, "maximum");
+                for slots in [4u32, 16, 32 / seqs] {
+                    let at = format!("B={seqs} J={slots} hd={hd}");
+                    let (_, c) = batched_walk_at(seqs, slots, hd);
+                    assert_eq!(
+                        (c.blocks_per_chunk, c.num_chunks),
+                        (slots, 1),
+                        "{at}: the one-chunk arm"
+                    );
+                    let levels = slots.trailing_zeros();
+                    assert_eq!(
+                        count(slots, "maximum") - base,
+                        levels,
+                        "{at}: the slot maximum folds in {levels} level(s), where the walk would \
+                         take {}",
+                        slots - 1
+                    );
+                    // ⛔ The sum folds still walk — one op a window. Two of them (the running sum
+                    // and the carried output), so at least `2·(J-1)` adds survive.
+                    assert!(
+                        count(slots, "add") >= 2 * (slots - 1),
+                        "{at}: the sum folds must still walk ({} adds) — a tree there re-rounds \
+                         fp16 and only the card can hold it to spyre-inference's answer",
+                        count(slots, "add")
+                    );
+                }
+            }
+        }
+    }
+
     /// One chunk is straight-line: no loop to relaunch, every descriptor once.
     #[test]
     fn a_one_chunk_decode_batch_is_straight_line() {

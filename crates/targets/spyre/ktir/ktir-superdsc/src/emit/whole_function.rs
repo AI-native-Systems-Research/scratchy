@@ -5370,8 +5370,40 @@ fn lower_function_folded(
             let rows = src.v_rows / blocks;
             let stick = crate::work::FP16_ELEMS_PER_STICK;
             let column = src.c_len == 1;
+            // ⭐ THE FOLD HALVES INSTEAD OF WALKING, WHERE THE COMBINE REASSOCIATES EXACTLY.
+            // `acc = w₀ ∘ w₁ ∘ … ∘ w_{J-1}` left to right is `J - 1` ops of one window each; folding
+            // the first half against the second is `log₂ J` ops of HALF the windows each — the same
+            // elements combined, so the same total work, in 5 ops instead of 31 at `J = 32` (a decode
+            // batch's one-chunk arm at the 4096-position rung, where the `J` block slots share one
+            // maximum: `torch.amax(..., dim=0)`).
+            //
+            // ⛔ MAXIMUM ONLY, AND THAT IS A NUMERICS ARGUMENT, NOT A CAUTION. `max` is exactly
+            // reassociable — every order yields the same bits — so the tree and the walk compute one
+            // answer. fp16 ADDITION IS NOT: re-ordering a sum re-rounds it, and the only executor of
+            // these descriptors is the card ([`crate::emit`] is inspected here, never run), so a sum
+            // tree would be a numeric change this build cannot check. `Sum` keeps the walk until a
+            // card run can hold a tree to spyre-inference's own answer.
+            //
+            // A block count that is not a power of two keeps the walk too: the halving would leave an
+            // odd window per level, and the pairing that handles it is a second law for a shape this
+            // port never bakes (`J = min(32 / seqs, blocks)` over power-of-two buckets is always one).
+            let halving = matches!(kind, ReduceKind::Max) && blocks.is_power_of_two();
             let tid = mint_inter(k, layout, floor, res);
             layout.synth(crate::place::PlaceId::Act(tid), &[rows, src.v_cols]);
+            // ⛔ THE TREE'S WIDE LEVELS GET THEIR OWN BUFFER, NOT A TALLER RESULT. A level above the
+            // last writes several windows, and the result buffer is ONE window — the shape every
+            // consumer of this reduction reads. Widening it instead made the result present as its
+            // buffer (`[256, 1]` against a `[128, 1]` consumer) and the pointwise extent law refused
+            // it by name, correctly. Minted only where a level actually needs it (`blocks > 2`).
+            // ⛔ ITS OWN MINT KEY. `MintKey::Scratch` is `(ssa, n)`, and this `ssa` is the reduction's
+            // OPERAND — which is some other op's result, so a discriminator another arm already uses
+            // on a result (`0` at the shape and gather mints) could hand both the same buffer. `10`
+            // is this arm's alone.
+            let wide = (halving && blocks > 2).then(|| {
+                let t = mint_scratch(k, layout, floor, data, 10);
+                layout.synth(crate::place::PlaceId::Act(t), &[src.v_rows / 2, src.v_cols]);
+                (t, src.v_rows / 2)
+            });
             let acc = Region {
                 tid,
                 v_rows: rows,
@@ -5408,6 +5440,19 @@ fn lower_function_folded(
                     ..src
                 })
             };
+            // `w` consecutive windows of the view at `tid`, from window `first` — the halving fold's
+            // operand, which spans many windows where [`window`] is exactly one.
+            let span = |tid: u32, v_rows: u32, first: u32, w: u32, is_out: bool| {
+                sticks(Region {
+                    tid,
+                    v_rows,
+                    r_start: first * rows,
+                    r_len: w * rows,
+                    r_cover: (first * rows, (first + w) * rows),
+                    is_out,
+                    ..src
+                })
+            };
             let combine = match kind {
                 ReduceKind::Max => Elementwise::Maximum,
                 ReduceKind::Sum => Elementwise::Add,
@@ -5432,28 +5477,65 @@ fn lower_function_folded(
                     }
                 }
             };
-            for j in 1..blocks {
-                let lhs = if j == 1 {
-                    window(0)
-                } else {
-                    sticks(Region {
-                        is_out: false,
-                        ..acc
-                    })
-                };
-                for c in 0..columns {
-                    out.extend(super::lower_ktir_to_superdsc::elementwise(
-                        f.name,
-                        combine,
-                        &[
-                            in_column(lhs, c),
-                            in_column(window(j), c),
-                            in_column(sticks(acc), c),
-                        ],
-                        &[],
-                        sym_id_base,
-                        Some(layout),
-                    )?);
+            if halving {
+                // Each level folds the first half of the windows against the second, into the first
+                // half of the accumulator: `J → J/2 → … → 1`, `log₂ J` levels. Level 0 reads the
+                // source; every level after it reads what the one before wrote.
+                let mut n = blocks;
+                let mut from_src = true;
+                while n > 1 {
+                    let half = n / 2;
+                    let (from_tid, from_rows) = match (from_src, wide) {
+                        (true, _) => (src.tid, src.v_rows),
+                        (false, Some((t, r))) => (t, r),
+                        // Unreachable: `from_src` is false only after a level wrote, and a level
+                        // above the last is the only writer of anything but `acc`.
+                        (false, None) => (tid, rows),
+                    };
+                    let lhs = span(from_tid, from_rows, 0, half, false);
+                    let rhs = span(from_tid, from_rows, half, half, false);
+                    // The LAST level (one window out) is the result; every level above it is wide.
+                    let dst = match wide.filter(|_| half > 1) {
+                        Some((t, r)) => span(t, r, 0, half, true),
+                        None => sticks(acc),
+                    };
+                    for c in 0..columns {
+                        out.extend(super::lower_ktir_to_superdsc::elementwise(
+                            f.name,
+                            combine,
+                            &[in_column(lhs, c), in_column(rhs, c), in_column(dst, c)],
+                            &[],
+                            sym_id_base,
+                            Some(layout),
+                        )?);
+                    }
+                    n = half;
+                    from_src = false;
+                }
+            } else {
+                for j in 1..blocks {
+                    let lhs = if j == 1 {
+                        window(0)
+                    } else {
+                        sticks(Region {
+                            is_out: false,
+                            ..acc
+                        })
+                    };
+                    for c in 0..columns {
+                        out.extend(super::lower_ktir_to_superdsc::elementwise(
+                            f.name,
+                            combine,
+                            &[
+                                in_column(lhs, c),
+                                in_column(window(j), c),
+                                in_column(sticks(acc), c),
+                            ],
+                            &[],
+                            sym_id_base,
+                            Some(layout),
+                        )?);
+                    }
                 }
             }
             inter.insert(
