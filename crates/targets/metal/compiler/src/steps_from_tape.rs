@@ -2429,7 +2429,7 @@ impl Recording<'_> {
             L::EmbedRowGather { .. } | L::ChainStage { .. } => {
                 return Err(self.no(i, Refused::ChainedHead));
             }
-            L::AllReduce | L::AllGather { .. } => {
+            L::AllReduce { .. } | L::AllGather { .. } => {
                 return Err(self.no(i, Refused::Collective));
             }
         }))
