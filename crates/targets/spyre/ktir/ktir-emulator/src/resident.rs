@@ -765,15 +765,25 @@ impl ResidentExecutor {
     /// CONTIGUOUS slice at `t·rows .. t·rows+rows`. Stated off the tensor's own
     /// dims and the pick, both sentinel legs and the widened-width clamp exactly
     /// as the eval arm states them (the clamp's extent is the weight view's own
-    /// cols — the region's statement, arriving here as the resident's widest
-    /// shape for the tid; a widest cols past the staged extent reads the memory
-    /// sim's zero-fill, the same zeros the clamp names). LOAD-BEARING AND
-    /// NON-OBVIOUS: that widest shape is `collect_view_shapes`' — widest
-    /// strictly-greater-wins, TIES KEEP THE FIRST — and the door's entry view
-    /// (logical `[hidden, vocab]`) walks before the lm-head matmul's view, so
-    /// the tie between the two `[hidden, vocab]` views lands on the door's
-    /// own: `rows = hidden`, the walk's own law.
-    fn run_embed_row_gather(&self, node: &NodeSpec, k: u32) -> Result<(), String> {
+    /// cols — the region's statement).
+    ///
+    /// ⭐ THE DOOR'S OWN VIEWS STATE ITS OPERANDS, NOT THE TID'S WIDEST. The
+    /// resident stages a tid at the widest view any node states of it (an
+    /// allocation must hold every view), and the lm-head matmul views the same
+    /// weight as its `[n_dev, hidden]` transpose-B storage. Where the matmul's
+    /// device width pads past the weight's own columns, that view is strictly
+    /// wider, and its rows are `n_dev`, not `hidden`: a split head's vocabulary
+    /// block (granite's 24640 columns, a matmul device width of 26624) is the
+    /// first such weight, since a whole head's widened pad covers its device
+    /// width. So the walk reads the four extents off the views THIS node's
+    /// skeleton states (the IR tensors' own `[rows, cols]`), and reads the
+    /// weight's first `rows·cols` elements, which the staging wrote.
+    fn run_embed_row_gather(
+        &self,
+        node: &NodeSpec,
+        ops: &[Operation<'_>],
+        k: u32,
+    ) -> Result<(), String> {
         let tids: Vec<u64> = node.bindings.iter().map(|b| b.tensor).collect();
         if tids.len() != 4 {
             return Err(format!(
@@ -790,13 +800,19 @@ impl ResidentExecutor {
             );
         }
         let (s_tid, l_tid, w_tid, o_tid) = (tids[0], tids[1], tids[2], tids[3]);
+        let own: HashMap<u64, Vec<usize>> = {
+            let arg_to_tensor: HashMap<Ssa, u64> =
+                node.bindings.iter().map(|b| (b.arg, b.tensor)).collect();
+            let mut own = HashMap::new();
+            crate::segmented::collect_view_shapes(ops, &arg_to_tensor, &mut own);
+            own
+        };
         // ⭐ THE WIDTH, OFF THE ROW OUT'S OWN STATED EXTENT — `[width, hidden]`,
         // one gathered row per request. The skeleton's Shape-only view states
-        // the tensor's own dims, so the widest-shape walk hands the door the
-        // mint's own statement; a 0-width or non-matrix out is a graph the
-        // mint never made.
-        let o_shape = self.shapes.get(&o_tid).ok_or_else(|| {
-            format!("embed_row_gather: the row out t{o_tid} has no derived shape")
+        // the tensor's own dims, the mint's own statement; a 0-width or
+        // non-matrix out is a graph the mint never made.
+        let o_shape = own.get(&o_tid).ok_or_else(|| {
+            format!("embed_row_gather: the door states no view of the row out t{o_tid}")
         })?;
         if o_shape.len() != 2 || o_shape[0] == 0 {
             return Err(format!(
@@ -810,10 +826,9 @@ impl ResidentExecutor {
         // The weight at its OWN view dtype (an fp8-packed view reads one byte per
         // element — the same per-tid law the pointer binding and the readback
         // use), full extent.
-        let shape = self
-            .shapes
-            .get(&w_tid)
-            .ok_or_else(|| format!("embed_row_gather: the weight t{w_tid} has no derived shape"))?;
+        let shape = own.get(&w_tid).ok_or_else(|| {
+            format!("embed_row_gather: the door states no view of the weight t{w_tid}")
+        })?;
         if shape.len() != 2 {
             return Err(format!(
                 "embed_row_gather: the weight t{w_tid} states a {}-dim shape; the walk needs \
@@ -841,8 +856,8 @@ impl ResidentExecutor {
             .read_bytes(w_stick * STICK_BYTES, nbytes);
         let w = crate::codec::decode(&wbytes, rows * cols, w_dt);
         // The two index sticks, whole — row r's own words are slices of these.
-        let s_shape = self.shapes.get(&s_tid).ok_or_else(|| {
-            format!("embed_row_gather: the s stick t{s_tid} has no derived shape")
+        let s_shape = own.get(&s_tid).ok_or_else(|| {
+            format!("embed_row_gather: the door states no view of the s stick t{s_tid}")
         })?;
         if s_shape.len() != 2 || s_shape[0] != width {
             return Err(format!(
@@ -1512,7 +1527,7 @@ impl ResidentExecutor {
                     // missing-Strides refusal, not a fallback.
                     let door_ran = match node.program {
                         Program::EmbedRowGather { k } => {
-                            self.run_embed_row_gather(node, k)?;
+                            self.run_embed_row_gather(node, func.operations, k)?;
                             true
                         }
                         Program::ChainStage { hidden, k, .. } => {
