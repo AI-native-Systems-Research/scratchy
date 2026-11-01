@@ -115,3 +115,50 @@ fn each_kv_heads_ops_divide_their_work_as_at_one_rank() {
         "the ops that see the head count"
     );
 }
+
+fn cache_write(nkvh: u32) -> Vec<(String, serde_json::Value)> {
+    use ktir_superdsc::emit::lower_ktir_to_superdsc::{KvCacheWrite, kv_cache_write};
+    let mut sym = 0i64;
+    kv_cache_write(
+        KvCacheWrite {
+            t: 0,
+            mq: 512,
+            nkvh,
+            hd: 64,
+            rows_are_requests: false,
+            new_k: "t_newk",
+            new_v: "t_newv",
+            kc: "t_kc",
+            vc: "t_vc",
+            kct: "t_kct",
+            ident: "t_ident",
+        },
+        &mut sym,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("the cache write lowers: {}", e.message))
+    .iter()
+    .map(|e| (e.op_name.clone(), serde_json::to_value(&e.op).unwrap()))
+    .collect()
+}
+
+/// A 512-row prompt chunk's cache write — both page parts' copies of K and V, and both parts' Kᵀ
+/// re-transposes — is the one-rank world's, kv head by kv head: the two-rank world emits exactly the
+/// one-rank world's ops for its four kv heads, each dividing its work as at one rank.
+#[test]
+fn each_kv_heads_cache_write_divides_its_work_as_at_one_rank() {
+    let one = cache_write(8);
+    let two = cache_write(4);
+    assert_eq!(two.len() * 2, one.len(), "half the kv heads, half the ops");
+    for (n, v2) in &two {
+        let (_, v1) = one
+            .iter()
+            .find(|(m, _)| m == n)
+            .unwrap_or_else(|| panic!("the two-rank write emits {n}, which the one-rank does not"));
+        assert_eq!(
+            division(n, v1),
+            division(n, v2),
+            "{n} divides its work differently at two ranks"
+        );
+    }
+}
