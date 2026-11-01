@@ -762,6 +762,97 @@ int32_t flex_senlib_ainc_wdone(uint8_t sid) {
     }
 }
 
+// ── The XSEG[SID] / wdone-read / RDMA-status doors (pf_interface.hpp:118-123)
+//
+// write_xseg is THE host door for programming the on-device XSEG[SID]
+// translation-table entry — the peer-side segment translation the RDMA
+// engine itself reads device addresses through. The value it takes is the
+// composed xseg word the hal_sbf send encoder produces
+// (`flex_hal_rdma12_unicast_send_encode` in cxx-shim/hal_sbf.cpp).
+
+// Writes the on-device XSEG[SID] translation-table entry for `sid`.
+// Cited: pf_interface.hpp:122 `void write_xseg(uint8_t sid, uint32_t xseg,
+// bool checkregs = true)`.
+int32_t flex_senlib_write_xseg(uint8_t sid, uint32_t xseg) {
+    try {
+        if (!g_pfw) {
+            shim_record_error("flex_senlib_write_xseg", "runtime not initialized");
+            return -1;
+        }
+        g_pfw->interface()->write_xseg(sid, xseg);
+        return 0;
+    } catch (const std::exception& e) {
+        shim_record_error("flex_senlib_write_xseg", e.what());
+        return -1;
+    } catch (...) {
+        shim_record_error("flex_senlib_write_xseg", "unknown exception");
+        return -1;
+    }
+}
+
+// Reads back the on-device XSEG[SID] translation-table entry for `sid`.
+// Cited: pf_interface.hpp:123 `uint32_t read_xseg(uint8_t sid)`.
+int32_t flex_senlib_read_xseg(uint8_t sid, uint32_t* out_xseg) {
+    try {
+        if (!g_pfw || !out_xseg) {
+            shim_record_error("flex_senlib_read_xseg",
+                              !g_pfw ? "runtime not initialized" : "null out_xseg");
+            return -1;
+        }
+        *out_xseg = g_pfw->interface()->read_xseg(sid);
+        return 0;
+    } catch (const std::exception& e) {
+        shim_record_error("flex_senlib_read_xseg", e.what());
+        return -1;
+    } catch (...) {
+        shim_record_error("flex_senlib_read_xseg", "unknown exception");
+        return -1;
+    }
+}
+
+// Reads the on-device write-done counter for `sid`.
+// Cited: pf_interface.hpp:121 `uint32_t read_wdone(uint8_t sid,
+// bool checkregs = false)`.
+int32_t flex_senlib_read_wdone(uint8_t sid, uint32_t* out_val) {
+    try {
+        if (!g_pfw || !out_val) {
+            shim_record_error("flex_senlib_read_wdone",
+                              !g_pfw ? "runtime not initialized" : "null out_val");
+            return -1;
+        }
+        *out_val = g_pfw->interface()->read_wdone(sid);
+        return 0;
+    } catch (const std::exception& e) {
+        shim_record_error("flex_senlib_read_wdone", e.what());
+        return -1;
+    } catch (...) {
+        shim_record_error("flex_senlib_read_wdone", "unknown exception");
+        return -1;
+    }
+}
+
+// Checks and clears the RDMA error status.
+// Cited: pf_interface.hpp:118 `int check_and_clear_rdma_status()`.
+// Returns the senlib status pass-through; -1 doubles as this shim's own
+// failure sentinel (told apart via `flex_shim_last_error()`).
+int32_t flex_senlib_check_and_clear_rdma_status(void) {
+    try {
+        if (!g_pfw) {
+            shim_record_error("flex_senlib_check_and_clear_rdma_status",
+                              "runtime not initialized");
+            return -1;
+        }
+        return g_pfw->interface()->check_and_clear_rdma_status();
+    } catch (const std::exception& e) {
+        shim_record_error("flex_senlib_check_and_clear_rdma_status", e.what());
+        return -1;
+    } catch (...) {
+        shim_record_error("flex_senlib_check_and_clear_rdma_status",
+                          "unknown exception");
+        return -1;
+    }
+}
+
 // Creates the cross-port P2P IOMMU mapping for peer card
 // `peer_card_index`, sized `len_bytes` (senlib
 // vfio_backend::create_iommu_mapping_for_cross_port_p2p_rdma), then
