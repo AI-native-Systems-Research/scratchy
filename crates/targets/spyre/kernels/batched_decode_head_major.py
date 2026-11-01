@@ -33,16 +33,20 @@ Where Triton spells a torch op differently, the spelling is Triton's and the op 
   the softmax state is `[slots, num_seqs, kv, group]`, their `[slots, num_seqs, kv, group, 1]`
   without the unit axis, and the one-chunk state drops their leading unit slot axis too;
 * `tl.exp` takes f32, so each `exp` widens its f16 argument and narrows the result (the ladder folds
-  the pair back to the f16 op);
-* Triton's gather takes at least 8 indices, and a chunk of spyre-inference's own `blocks_per_chunk`
-  (`batched_decode_chunking`) can hold fewer entries. Such a chunk gathers each page's kv heads as
-  the folded cache's rows (`ROWS_PER_PAGE = num_kv_heads`: `page * kv + a`, the decode kernel's own
-  `kv_row_pool` fold), its query rows folded alike (`row * kv + a` of the query read
-  `[num_tokens * kv, group * head_size]`): `rep_row_ids` `[entries * kv]` and `chunk_page_ids`
-  `[num_chunks, entries * kv]`, entry `e`'s kv head `a` at `e * kv + a`. The floor then counts
-  `entries * kv` rows, and only where even those are under 8 does the chunk take more block slots
-  than theirs, the slots past a sequence's blocks masked and gathering page 0 — their own padding
-  law ("padding columns gather page 0 under an all -inf mask and contribute zero").
+  the pair back to the f16 op).
+
+ONE FORM IS OURS, NOT THEIRS. Triton's gather takes at least 8 indices, and a chunk of their own
+`blocks_per_chunk` (`batched_decode_chunking`) can hold fewer entries, whose whole pages Triton
+cannot gather. Such a chunk gathers each page's kv heads as the folded cache's rows
+(`ROWS_PER_PAGE = num_kv_heads`: `page * kv + a`, the per-sequence decode kernel's `kv_row_pool`
+form), its query rows folded alike (`row * kv + a` of the query read `[num_tokens * kv, group *
+head_size]`): `rep_row_ids` `[entries * kv]` and `chunk_page_ids` `[num_chunks, entries * kv]`,
+entry `e`'s kv head `a` at `e * kv + a`. Their batched kernel never folds — its docstring: "folding
+anyway measured roughly 1.5-2x slower" — so the fold is taken only below the floor, where the
+alternative is more block slots than theirs. The floor then counts `entries * kv` rows, and only
+where even those are under 8 does the chunk take more block slots than theirs, the slots past a
+sequence's blocks masked and gathering page 0 — their own padding law ("padding columns gather
+page 0 under an all -inf mask and contribute zero").
 """
 
 import triton
