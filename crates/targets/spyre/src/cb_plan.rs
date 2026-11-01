@@ -51,7 +51,8 @@
 //! two scalars refuses there — loudly, at prepare, never as a wrong token.
 
 use anyhow::{Result, anyhow, bail};
-use flex_rs::control_block_wire::{CB_NUM_BYTES, ControlBlockWire, RunPlace};
+use flex_rs::control_block_wire::{CB_NUM_BYTES, ControlBlockWire};
+use flex_rs::scheduler::RunPlace;
 
 use crate::bundle_code::NUM_SEGMENTS;
 use crate::bundle_code::collective::{CbStep, RecvWindow, TpConsume, TpSend, group_steps};
