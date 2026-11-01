@@ -1801,14 +1801,21 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
     if batch {
-        // spyre-inference's eligibility (`_batched_decode_preconditions_met`): a chunk gathering as
-        // many pages as the pool holds faults their device, and their per-sequence loop serves it.
+        // ⛔ spyre-inference's ELIGIBILITY (`_batched_decode_preconditions_met`, `spyre_attn.py`
+        // 297fc48): a chunk gathering as many pages as the pool holds faults their device
+        // (torch-spyre#4033), and their per-sequence LOOP — one launch a sequence — serves that step
+        // instead. We have no per-sequence loop: one rung is one launch, so the only honest answer
+        // is this refusal, by name. It needs a pool of at most `CORES` pages to fire, i.e. a context
+        // of at most `CORES · PAGE_SLOTS` positions, and the one config in scope that small
+        // (tinyllama-1.1b, 2048) bakes no spyre decode at all (its head is untied). PORTING their
+        // loop is what admits such a pool.
         let chunking = BatchChunking::of(mq, blocks, nkvh);
         if chunking.entries() >= pages {
             return Err(format!(
-                "triton splice: AttnDecode t{}: a {mq}-sequence batch walking {blocks} block(s) \
-                 gathers {} pages a chunk, and the pool holds {pages} — spyre-inference serves \
-                 that batch one sequence at a time",
+                "triton splice: AttnDecode t{}: a {mq}-sequence decode walking {blocks} block(s) \
+                 gathers {} page(s) a chunk, and the pool holds {pages} — a gather of the whole \
+                 pool faults the card, so spyre-inference serves this step with its per-sequence \
+                 loop, one launch a sequence, which this port does not have",
                 node.output.tensor.index(),
                 chunking.entries()
             ));
