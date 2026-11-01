@@ -11979,6 +11979,18 @@ fn dump_wavefront_mega(
                                                         b < ceiling_walk
                                                     }
                                                 })
+                                                // ⛔ A DECODE BATCH RUNS NO ONE-CHUNK WALK
+                                                // (`BatchChunking::batch_walk_runs`): its rungs start
+                                                // at its first two-chunk walk, by this filter, not by a
+                                                // lowering refusal dropping them.
+                                                .filter(|&b| match gk.paged.and_then(|p| p.batch()) {
+                                                    Some(c) => scratchy_target_spyre::paged_step::BatchChunking::batch_walk_runs(
+                                                        c.seqs,
+                                                        b,
+                                                        gk.paged.map_or(1, |p| p.nkvh),
+                                                    ),
+                                                    None => true,
+                                                })
                                                 .map(|b| {
                                                     let slots = b * scratchy_target_spyre::paged_step::PAGE_SLOTS;
                                                     (
