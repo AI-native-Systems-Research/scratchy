@@ -304,13 +304,17 @@ pub struct BatchSeq<'a> {
     pub pos: usize,
 }
 
-/// A decode batch's sources: `rep_row_ids` `[E]`, `chunk_page_ids` `[C, E, 1]` and `mask_by_chunk`
-/// `[C, J, B, nkvh, 1, page_slots]` (`E = J · B`), and the KV write index of each sequence's token —
+/// A decode batch's sources: `rep_row_ids` `[E · P]`, `chunk_page_ids` `[C, E · P]` and
+/// `mask_by_chunk` `[C, J, B, nkvh, 1, page_slots]` (`E = J · B`, `P` the chunking's
+/// `rows_per_page`), and the KV write index of each sequence's token —
 /// `SpyreAttentionMetadataBuilder.build`'s decode-batch precomputes:
 ///
 /// * the query rows are the sequences' own, `0..n`, a padded sequence's row 0, repeated once per block
 ///   slot (`query_row_ids.repeat(blocks_per_chunk)`);
 /// * the page ids are each sequence's blocks down the block-slot axis, zero past them;
+/// * both index tables as the kernel gathers: entry `e`'s row `a` at `e · P + a` holding
+///   `x · P + a` — at `P = nkvh` (a chunk under Triton's gather floor in pages) the decode kernel's
+///   `kv_row_pool` fold, at `P = 1` theirs as they are;
 /// * the mask is 0 where a sequence's key is at or before its position and `finfo(f16).min` past
 ///   it, `-inf` on the block slots past its blocks, and a padded sequence's block 0 `finfo.min` (so
 ///   its softmax stays finite); the kv head axis materialized, as the tiled walk reads it.
@@ -356,6 +360,13 @@ pub fn batch_sources(
         }
     }
     let words = |w: Vec<i32>| -> Vec<u8> { w.into_iter().flat_map(i32::to_le_bytes).collect() };
+    // Each entry as the `rows_per_page` rows `x · rows_per_page + a` the kernel gathers by.
+    let per = chunking.rows_per_page as i32;
+    let fold = |x: &[i32]| -> Vec<i32> {
+        x.iter()
+            .flat_map(|&v| (0..per).map(move |a| v * per + a))
+            .collect()
+    };
     // query_row_ids, repeated once per block slot: entry `j · B + s`.
     let rep: Vec<i32> = (0..j)
         .flat_map(|_| (0..b).map(|s| if s < n { s as i32 } else { 0 }))
@@ -407,8 +418,12 @@ pub fn batch_sources(
     Ok(StepSources {
         mask: (step.chunk_masks, chunk_masks, vec![c * e * nkvh, slots]),
         int32: vec![
-            (step.rep_rows, words(rep), vec![e]),
-            (step.chunk_pages, words(pages), vec![c * e]),
+            (step.rep_rows, words(fold(&rep)), vec![e * per as usize]),
+            (
+                step.chunk_pages,
+                words(fold(&pages)),
+                vec![c * e * per as usize],
+            ),
             (step.write_rows, words(write), vec![nkvh * b]),
         ],
     })
@@ -513,10 +528,10 @@ pub fn card_batch_sources(
     seqs: &[BatchSeq<'_>],
 ) -> Result<CardSources, PagedStepError> {
     let logical = batch_sources(step, seqs)?;
-    let entries = step
+    let rows = step
         .batch()
         .ok_or_else(|| PagedStepError("card_batch_sources: not a decode batch".into()))?
-        .entries() as usize;
+        .index_rows() as usize;
     let int32 = logical
         .int32
         .into_iter()
@@ -524,7 +539,7 @@ pub fn card_batch_sources(
             if tid == step.chunk_pages {
                 (
                     tid,
-                    pitched(&bytes, entries * 4, step.card_walk_step() as usize),
+                    pitched(&bytes, rows * 4, step.card_walk_step() as usize),
                 )
             } else {
                 (tid, bytes)
@@ -739,7 +754,8 @@ mod tests {
             Some(BatchChunking {
                 seqs: 4,
                 blocks_per_chunk: 2,
-                num_chunks: 1
+                num_chunks: 1,
+                rows_per_page: 1
             })
         );
         let (a, b) = ([7u32, 3], [9u32]);
@@ -781,6 +797,58 @@ mod tests {
         assert_eq!(at(1, 1, 1), &[f32::NEG_INFINITY; 4]);
         assert_eq!(at(0, 2, 0), &[MASKED; 4]);
         assert_eq!(at(1, 3, 0), &[f32::NEG_INFINITY; 4]);
+    }
+
+    /// ⭐ A CHUNK UNDER TRITON'S GATHER FLOOR IN PAGES STAGES ITS TABLES FOLDED BY KV HEAD — two
+    /// sequences of one block: spyre-inference's chunk is one block slot (2 pages), under the floor of
+    /// 8, so each page is gathered as its 2 kv heads' rows, and only those 4 rows under the floor
+    /// take a second, masked slot (`ceil(8 / (2 · 2))`). Entry `e`'s head `a` at `e · 2 + a` holds
+    /// `x · 2 + a`, of its query row and of its page alike, on the host and in the card's pitched
+    /// chunk row.
+    #[test]
+    fn a_chunk_under_the_gather_floor_stages_its_tables_by_kv_head() {
+        let s = PagedStep {
+            rows: 2,
+            walk: 1,
+            ..batch()
+        };
+        let c = s.batch().unwrap();
+        assert_eq!(
+            (c.blocks_per_chunk, c.num_chunks, c.rows_per_page),
+            (2, 1, 2)
+        );
+        let (a, b) = ([5u32], [11u32]);
+        let seqs = [
+            BatchSeq { blocks: &a, pos: 2 },
+            BatchSeq { blocks: &b, pos: 0 },
+        ];
+        let src = batch_sources(&s, &seqs).expect("stages");
+        let words = |t: u32| -> Vec<i32> {
+            ints(
+                &src.int32
+                    .iter()
+                    .find(|(tid, ..)| *tid == t)
+                    .expect("staged")
+                    .1,
+            )
+        };
+        // Entries (slot 0: rows 0, 1; slot 1: rows 0, 1), each at `row · 2 + a`.
+        assert_eq!(words(s.rep_rows), vec![0, 1, 2, 3, 0, 1, 2, 3]);
+        // Slot 0 pages (5, 11), slot 1 the padding's page 0, each at `page · 2 + a`.
+        assert_eq!(words(s.chunk_pages), vec![10, 11, 22, 23, 0, 1, 0, 1]);
+        let card = card_batch_sources(&s, &seqs).unwrap();
+        let got = ints(card.words(s.chunk_pages).unwrap());
+        assert_eq!(got.len(), s.card_walk_step() as usize / 4);
+        assert_eq!(&got[..8], &[10, 11, 22, 23, 0, 1, 0, 1]);
+        assert!(got[8..].iter().all(|&v| v == 0));
+        assert_eq!(
+            s.card_placements()
+                .iter()
+                .find(|(t, ..)| *t == s.rep_rows)
+                .map(|&(.., bytes)| bytes),
+            Some(u64::from(scratchy_triton_splice::INT32_STICK) * 4),
+            "the folded query rows fit their one stick"
+        );
     }
 
     /// A sequence whose position is past the rung's walk cannot run on it.
@@ -974,7 +1042,7 @@ mod tests {
             .iter()
             .find(|(t, ..)| *t == s.chunk_pages)
             .unwrap();
-        let (row, pitch) = (c.entries() as usize, s.card_walk_step() as usize / 4);
+        let (row, pitch) = (c.index_rows() as usize, s.card_walk_step() as usize / 4);
         let got = ints(card.words(s.chunk_pages).unwrap());
         assert_eq!(got.len(), c.num_chunks as usize * pitch);
         for (k, chunk) in ints(want).chunks(row).enumerate() {

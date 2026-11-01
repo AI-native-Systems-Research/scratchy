@@ -16,6 +16,8 @@ The operands are theirs, in their order:
 * `mask_by_chunk` `[num_chunks, blocks_per_chunk, num_seqs, num_kv_heads, 1, block_size]`;
 * `out`, whose first `num_seqs` rows the kernel stores (`out[:num_seqs].copy_(attn)`).
 
+`ROWS_PER_PAGE` is 1, or `num_kv_heads` for a chunk of fewer than 8 entries (below).
+
 `entries = blocks_per_chunk * num_seqs`. The walk is `walk_tiles` over the `num_chunks` chunks, the
 carry seeded `(-inf, 0, 0)`. With more than one chunk each block slot keeps its own running softmax
 (`_entry_local_update`), and the slots merge once after the walk (`_merge_entry_local`); with one
@@ -32,10 +34,15 @@ Where Triton spells a torch op differently, the spelling is Triton's and the op 
   without the unit axis, and the one-chunk state drops their leading unit slot axis too;
 * `tl.exp` takes f32, so each `exp` widens its f16 argument and narrows the result (the ladder folds
   the pair back to the f16 op);
-* Triton's gather needs at least 8 indices, so the host sizes a chunk to at least 8 entries: below
-  that, the chunk takes `ceil(8 / num_seqs)` block slots, the ones past a sequence's blocks masked
-  and gathering page 0, which is their own padding law ("padding columns gather page 0 under an
-  all -inf mask and contribute zero").
+* Triton's gather takes at least 8 indices, and a chunk of spyre-inference's own `blocks_per_chunk`
+  (`batched_decode_chunking`) can hold fewer entries. Such a chunk gathers each page's kv heads as
+  the folded cache's rows (`ROWS_PER_PAGE = num_kv_heads`: `page * kv + a`, the decode kernel's own
+  `kv_row_pool` fold), its query rows folded alike (`row * kv + a` of the query read
+  `[num_tokens * kv, group * head_size]`): `rep_row_ids` `[entries * kv]` and `chunk_page_ids`
+  `[num_chunks, entries * kv]`, entry `e`'s kv head `a` at `e * kv + a`. The floor then counts
+  `entries * kv` rows, and only where even those are under 8 does the chunk take more block slots
+  than theirs, the slots past a sequence's blocks masked and gathering page 0 — their own padding
+  law ("padding columns gather page 0 under an all -inf mask and contribute zero").
 """
 
 import triton
@@ -50,7 +57,8 @@ def batched_decode_head_major_kernel(query, rep_row_ids, k_pages, v_pages,  #
                                      NUM_KV_HEADS: tl.constexpr,
                                      NUM_QUERIES_PER_KV: tl.constexpr,  #
                                      BLOCK_SIZE: tl.constexpr, HEAD_SIZE: tl.constexpr,  #
-                                     NUM_PAGES: tl.constexpr, SCALE: tl.constexpr):
+                                     NUM_PAGES: tl.constexpr, ROWS_PER_PAGE: tl.constexpr,  #
+                                     SCALE: tl.constexpr):
     B: tl.constexpr = NUM_SEQS
     J: tl.constexpr = BLOCKS_PER_CHUNK
     KV: tl.constexpr = NUM_KV_HEADS
@@ -58,20 +66,25 @@ def batched_decode_head_major_kernel(query, rep_row_ids, k_pages, v_pages,  #
     D: tl.constexpr = HEAD_SIZE
     NUM_HEADS: tl.constexpr = KV * G
     ENTRIES: tl.constexpr = J * B
+    P: tl.constexpr = ROWS_PER_PAGE
+    ROWS: tl.constexpr = ENTRIES * P
     PAGE: tl.constexpr = KV * BLOCK_SIZE * D
 
-    q_rows_desc = tl.make_tensor_descriptor(query, shape=[NUM_TOKENS, NUM_HEADS * D],
-                                            strides=[NUM_HEADS * D, 1],
-                                            block_shape=[1, NUM_HEADS * D])
-    rep_desc = tl.make_tensor_descriptor(rep_row_ids, shape=[ENTRIES], strides=[1],
-                                         block_shape=[ENTRIES])
-    k_whole = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES, PAGE], strides=[PAGE, 1],
-                                        block_shape=[1, PAGE])
-    v_whole = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES, PAGE], strides=[PAGE, 1],
-                                        block_shape=[1, PAGE])
-    # chunk_page_ids `[num_chunks, entries, 1]`, contiguous: chunk c's ids are the entries at c * E.
-    ids_desc = tl.make_tensor_descriptor(chunk_page_ids, shape=[NUM_CHUNKS * ENTRIES], strides=[1],
-                                         block_shape=[ENTRIES])
+    # The query `[num_tokens * P, num_heads * D / P]`: token t's row r is row t * P + r.
+    q_rows_desc = tl.make_tensor_descriptor(query, shape=[NUM_TOKENS * P, NUM_HEADS * D // P],
+                                            strides=[NUM_HEADS * D // P, 1],
+                                            block_shape=[1, NUM_HEADS * D // P])
+    # rep_row_ids `[entries * P]`: entry e's row r at e * P + r, holding rep * P + r.
+    rep_desc = tl.make_tensor_descriptor(rep_row_ids, shape=[ROWS], strides=[1],
+                                         block_shape=[ROWS])
+    # The cache `[num_pages * P, page / P]`: page p's row r is row p * P + r.
+    k_rows = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES * P, PAGE // P],
+                                       strides=[PAGE // P, 1], block_shape=[1, PAGE // P])
+    v_rows = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES * P, PAGE // P],
+                                       strides=[PAGE // P, 1], block_shape=[1, PAGE // P])
+    # chunk_page_ids `[num_chunks, entries * P]`, contiguous: chunk c's rows are the ROWS at c * ROWS.
+    ids_desc = tl.make_tensor_descriptor(chunk_page_ids, shape=[NUM_CHUNKS * ROWS], strides=[1],
+                                         block_shape=[ROWS])
     # mask_by_chunk `[num_chunks, J, B, KV, 1, block]`: chunk c's tile is J * B * KV rows of a block.
     masks = tl.make_tensor_descriptor(mask_by_chunk, shape=[NUM_CHUNKS * ENTRIES * KV, BLOCK_SIZE],
                                       strides=[BLOCK_SIZE, 1],
@@ -90,9 +103,9 @@ def batched_decode_head_major_kernel(query, rep_row_ids, k_pages, v_pages,  #
         tile_output = tl.zeros([J, B, KV, G, D], dtype=tl.float16)
         for c in tl.range(0, NUM_CHUNKS, 1):
             # page_ids = page_ids[0]; k_page = k_pages[page_ids].reshape(entries, KV, block, D)
-            page_ids = ids_desc.load([c * ENTRIES])
-            k_page = tl.reshape(k_whole.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
-            v_page = tl.reshape(v_whole.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
+            page_ids = ids_desc.load([c * ROWS])
+            k_page = tl.reshape(k_rows.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
+            v_page = tl.reshape(v_rows.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
             # scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
             scores = tl.dot(q, tl.trans(k_page, (0, 2, 1)), out_dtype=tl.float16) * SCALE
             # sc = scores.reshape(J, B, KV, G, block) + mask_rows
@@ -122,9 +135,9 @@ def batched_decode_head_major_kernel(query, rep_row_ids, k_pages, v_pages,  #
         tile_sum = tl.zeros([B, KV, G], dtype=tl.float16)
         tile_output = tl.zeros([B, KV, G, D], dtype=tl.float16)
         for c in tl.range(0, NUM_CHUNKS, 1):
-            page_ids = ids_desc.load([c * ENTRIES])
-            k_page = tl.reshape(k_whole.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
-            v_page = tl.reshape(v_whole.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
+            page_ids = ids_desc.load([c * ROWS])
+            k_page = tl.reshape(k_rows.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
+            v_page = tl.reshape(v_rows.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
             scores = tl.dot(q, tl.trans(k_page, (0, 2, 1)), out_dtype=tl.float16) * SCALE
             mask_rows = tl.reshape(masks.load([c * ENTRIES * KV, 0]), [J, B, KV, BLOCK_SIZE])
             sc = tl.reshape(scores, [J, B, KV, G, BLOCK_SIZE]) + mask_rows[:, :, :, None, :]

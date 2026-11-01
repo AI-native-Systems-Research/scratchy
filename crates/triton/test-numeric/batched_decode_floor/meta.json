@@ -9,7 +9,7 @@
   },
   "step": {
     "contexts": [
-      100,
+      50,
       30
     ],
     "seqs_bucket": 2,
@@ -21,31 +21,31 @@
   },
   "derived": {
     "kv_lens": [
-      101,
+      51,
       31
     ],
     "blocks": [
-      2,
+      1,
       1
     ],
     "tables": [
       [
-        8,
-        0
+        8
       ],
       [
-        2
+        0
       ]
     ],
-    "blocks_bucket": 2,
+    "blocks_bucket": 1,
     "theirs": {
-      "blocks_per_chunk": 2,
+      "blocks_per_chunk": 1,
       "num_chunks": 1
     },
     "triton": {
-      "blocks_per_chunk": 4,
+      "blocks_per_chunk": 2,
       "num_chunks": 1,
-      "entries": 8
+      "entries": 4,
+      "rows_per_page": 2
     },
     "scale": 0.125,
     "geometry": {
@@ -106,7 +106,7 @@
       "file": "mask.bin",
       "dtype": "f16",
       "shape": [
-        16,
+        8,
         64
       ]
     },

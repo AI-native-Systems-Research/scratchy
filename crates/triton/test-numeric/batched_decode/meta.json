@@ -53,7 +53,8 @@
     "triton": {
       "blocks_per_chunk": 4,
       "num_chunks": 1,
-      "entries": 16
+      "entries": 16,
+      "rows_per_page": 1
     },
     "scale": 0.125,
     "geometry": {

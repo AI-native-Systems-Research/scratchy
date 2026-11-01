@@ -1460,15 +1460,21 @@ impl PagedRows {
 /// `blocks_per_chunk` block slots per chunk, so a chunk gathers `entries = blocks_per_chunk · seqs`
 /// pages (their target: one per core), and `num_chunks` chunks cover the walk.
 ///
-/// One difference, Triton's: its gather takes at least 8 indices (`semantic.py`'s
-/// `descriptor_gather`), so a chunk is at least `ceil(8 / seqs)` block slots; the slots past a
-/// sequence's blocks gather page 0 under a fully masked tile, their own padding law ("padding
+/// Triton's gather takes at least 8 indices (`semantic.py`'s `descriptor_gather`). A chunk of 8
+/// entries or more gathers its pages whole, one index a page, as theirs does. A chunk of fewer
+/// gathers each page's kv heads as the folded cache's rows (`rows_per_page = nkvh`, the decode
+/// kernel's `kv_row_pool` fold), so its gather is `entries · nkvh` rows, and only a chunk under 8 of
+/// those takes more block slots than theirs: at least `ceil(8 / (seqs · nkvh))`, the slots past a
+/// sequence's blocks gathering page 0 under a fully masked tile, their own padding law ("padding
 /// columns gather page 0 under an all -inf mask and contribute zero").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatchChunking {
     pub seqs: u32,
     pub blocks_per_chunk: u32,
     pub num_chunks: u32,
+    /// The index rows one page's gather takes: 1 (the whole page), or the kv heads (each head's
+    /// block, the index tables folded by kv head).
+    pub rows_per_page: u32,
 }
 
 impl BatchChunking {
@@ -1477,24 +1483,36 @@ impl BatchChunking {
     /// Triton's gather floor.
     pub const GATHER_FLOOR: u32 = 8;
 
-    pub const fn of(seqs: u32, blocks: u32) -> BatchChunking {
+    pub const fn of(seqs: u32, blocks: u32, nkvh: u32) -> BatchChunking {
         let theirs = {
             let j = Self::CORES / seqs;
             let j = if j < blocks { j } else { blocks };
             if j < 1 { 1 } else { j }
         };
-        let floor = Self::GATHER_FLOOR.div_ceil(seqs);
+        let rows_per_page = if theirs * seqs < Self::GATHER_FLOOR {
+            nkvh
+        } else {
+            1
+        };
+        let floor = Self::GATHER_FLOOR.div_ceil(seqs * rows_per_page);
         let blocks_per_chunk = if theirs < floor { floor } else { theirs };
         BatchChunking {
             seqs,
             blocks_per_chunk,
             num_chunks: blocks.div_ceil(blocks_per_chunk),
+            rows_per_page,
         }
     }
 
     /// Pages one chunk gathers.
     pub const fn entries(self) -> u32 {
         self.blocks_per_chunk * self.seqs
+    }
+
+    /// Index rows one chunk gathers — `entries · rows_per_page`, the words of each chunk's page ids
+    /// and of `rep_row_ids`.
+    pub const fn index_rows(self) -> u32 {
+        self.entries() * self.rows_per_page
     }
 }
 
@@ -1518,11 +1536,12 @@ pub struct PagedStepTids {
     /// `kv_row_pool` `[num_pages, num_kv_heads, 1]` int32: every page's folded-cache rows
     /// `page * num_kv_heads + kv` (the decode kernel's).
     pub kv_row_pool: u32,
-    /// A decode batch's `rep_row_ids` `[entries]` int32: entry `j · seqs + s` holds sequence `s`'s
-    /// query row.
+    /// A decode batch's `rep_row_ids` `[entries · rows_per_page]` int32 ([`BatchChunking`]): entry
+    /// `j · seqs + s`'s row `a` holds `row · rows_per_page + a` of sequence `s`'s query row.
     pub rep_rows: u32,
-    /// A decode batch's `chunk_page_ids` `[num_chunks, entries, 1]` int32: chunk `c`'s entry
-    /// `j · seqs + s` holds the page of block slot `j` of sequence `s`.
+    /// A decode batch's `chunk_page_ids` `[num_chunks, entries · rows_per_page]` int32: chunk `c`'s
+    /// entry `j · seqs + s`'s row `a` holds `page · rows_per_page + a` of block slot `j` of sequence
+    /// `s` (at `rows_per_page = num_kv_heads`, the decode kernel's `kv_row_pool` fold).
     pub chunk_pages: u32,
     /// A decode batch's `mask_by_chunk` `[num_chunks, blocks_per_chunk, seqs, num_kv_heads, 1,
     /// block_size]`.
@@ -1782,7 +1801,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     if batch {
         // spyre-inference's eligibility (`_batched_decode_preconditions_met`): a chunk gathering as
         // many pages as the pool holds faults their device, and their per-sequence loop serves it.
-        let chunking = BatchChunking::of(mq, blocks);
+        let chunking = BatchChunking::of(mq, blocks, nkvh);
         if chunking.entries() >= pages {
             return Err(format!(
                 "triton splice: AttnDecode t{}: a {mq}-sequence batch walking {blocks} block(s) \
@@ -1816,6 +1835,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             ("BLOCK_SIZE", PAGE_SLOTS),
             ("HEAD_SIZE", hd),
             ("NUM_PAGES", pages),
+            ("ROWS_PER_PAGE", chunking.rows_per_page),
         ] {
             signature.insert(k.to_string(), ArgSpec::Constexpr);
             constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
@@ -3755,20 +3775,20 @@ mod production_ktir_dump {
         }
         // ...and `batched_decode_head_major` over that pool, the chunkings a decode batch rung
         // states (`BatchChunking::of`): 4 sequences on the 4-page rung (one chunk), on the 64-page
-        // rung (8 chunks, each block slot its own softmax), 2 sequences on the 2-page rung (a
-        // chunk under the gather floor), and 32 on the 4-page rung (4 chunks of ONE block slot —
+        // rung (8 chunks, each block slot its own softmax), 2 sequences on the 2-page rung (four
+        // pages, 32 kv rows), and 32 on the 4-page rung (4 chunks of ONE block slot —
         // the widest batch rung, where the slots' merge folds one). At head dim 128 (granite-3.1-8b)
         // the one-chunk and many-chunk batches, and the widest rung on its one-page walk.
         for (name, seqs, walk, hd) in [
             ("batched_decode", 4u32, 4u32, 64i128),
             ("batched_decode_chunks", 4, 64, 64),
-            ("batched_decode_floor", 2, 2, 64),
+            ("batched_decode_pair", 2, 2, 64),
             ("batched_decode_one_slot", 32, 4, 64),
             ("batched_decode_hd128", 4, 4, 128),
             ("batched_decode_chunks_hd128", 4, 64, 128),
             ("batched_decode_one_slot_hd128", 32, 1, 128),
         ] {
-            let c = BatchChunking::of(seqs, walk);
+            let c = BatchChunking::of(seqs, walk, 8);
             v.push((
                 name,
                 BATCHED_DECODE,
@@ -3794,6 +3814,7 @@ mod production_ktir_dump {
                         ("BLOCK_SIZE", Val::Int(i128::from(PAGE_SLOTS))),
                         ("HEAD_SIZE", Val::Int(hd)),
                         ("NUM_PAGES", Val::Int(2048)),
+                        ("ROWS_PER_PAGE", Val::Int(i128::from(c.rows_per_page))),
                         ("SCALE", Val::Float(0.125)),
                     ],
                 ),
@@ -3998,7 +4019,7 @@ mod production_ktir_dump {
             | "paged_attn_prefill_hd128"
             | "batched_decode"
             | "batched_decode_chunks"
-            | "batched_decode_floor"
+            | "batched_decode_pair"
             | "batched_decode_one_slot"
             | "batched_decode_hd128"
             | "batched_decode_chunks_hd128"
@@ -4447,7 +4468,7 @@ mod walk_on_the_card {
         else {
             panic!("the batched decode row is spliced");
         };
-        let c = BatchChunking::of(seqs, walk);
+        let c = BatchChunking::of(seqs, walk, 8);
         let mut signature = HashMap::new();
         let mut constexprs = HashMap::new();
         for p in ["query", "k_pages", "v_pages", "mask_by_chunk", "out"] {
@@ -4466,6 +4487,7 @@ mod walk_on_the_card {
             ("BLOCK_SIZE", PAGE_SLOTS),
             ("HEAD_SIZE", hd),
             ("NUM_PAGES", 2048),
+            ("ROWS_PER_PAGE", c.rows_per_page),
         ] {
             signature.insert(k.to_string(), ArgSpec::Constexpr);
             constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
@@ -4565,10 +4587,23 @@ mod walk_on_the_card {
     /// every entry landed in a scratch, then copied to the entry's pitch. Two concurrent requests
     /// decoded garbage on the card from their first batched step (bisected: `b82250b17`, 64-slot
     /// pages, coherent; the 128-slot page, which switched 2b onto the pieces, first bad).
+    ///
+    /// A chunk of fewer than 8 pages (two sequences' one block each) gathers its pages' kv heads, a
+    /// head a core — still each page whole, and spyre-inference's own one block slot.
     #[test]
     fn a_decode_batch_gathers_each_page_whole() {
-        for (seqs, hd) in [(2u32, 64u32), (2, 128), (8, 64)] {
-            let (node, c) = batched_walk_at(seqs, 1, hd);
+        for (seqs, walk, hd, rows_per_page) in [
+            (2u32, 1u32, 64u32, 8u32),
+            (2, 1, 128, 8),
+            (8, 1, 64, 1),
+            (4, 4, 128, 1),
+        ] {
+            let (node, c) = batched_walk_at(seqs, walk, hd);
+            assert_eq!(
+                (c.blocks_per_chunk, c.rows_per_page),
+                ((32 / seqs).min(walk), rows_per_page),
+                "B={seqs} walk={walk}: spyre-inference's block slots"
+            );
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
@@ -4598,10 +4633,10 @@ mod walk_on_the_card {
                     .clone();
                 assert_eq!(
                     split["mb"],
-                    c.entries(),
-                    "{at} {}: a page a core over the chunk's {} entries",
+                    c.index_rows(),
+                    "{at} {}: a page (or a page's kv head) a core over the chunk's {} index rows",
                     e.op_name,
-                    c.entries()
+                    c.index_rows()
                 );
             }
         }

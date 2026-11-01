@@ -575,6 +575,8 @@ struct Batch {
     seqs: i128,
     blocks_per_chunk: i128,
     num_chunks: i128,
+    /// The index rows one page's gather takes: 1, or the kv heads (the tables folded by kv head).
+    rows_per_page: i128,
 }
 
 impl Batch {
@@ -586,6 +588,7 @@ impl Batch {
             seqs: get(&step.meta["seqs"]),
             blocks_per_chunk: get(&t["blocks_per_chunk"]),
             num_chunks: get(&t["num_chunks"]),
+            rows_per_page: get(&t["rows_per_page"]),
             step,
         }
     }
@@ -621,6 +624,7 @@ impl Batch {
                 ("BLOCK_SIZE", block),
                 ("HEAD_SIZE", hd),
                 ("NUM_PAGES", pages),
+                ("ROWS_PER_PAGE", self.rows_per_page),
             ],
         );
         k.signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
@@ -631,15 +635,16 @@ impl Batch {
         let f = lower(BATCHED, &k);
         let (rows, width) = (self.seqs as usize, (nqh * hd) as usize);
         let e = self.entries() as usize;
+        let index_rows = e * self.rows_per_page as usize;
         let page = vec![pages as usize, (nkvh * block * hd) as usize];
         let out = run(
             &f,
             vec![
                 s.arg("q", vec![rows, width]),
-                i32_arg(rep_row_ids, vec![e]),
+                i32_arg(rep_row_ids, vec![index_rows]),
                 s.arg("kp", page.clone()),
                 s.arg("vp", page),
-                i32_arg(page_ids, vec![self.num_chunks as usize * e]),
+                i32_arg(page_ids, vec![self.num_chunks as usize * index_rows]),
                 s.arg(
                     "mask",
                     vec![self.num_chunks as usize * e * nkvh as usize, block as usize],
@@ -683,9 +688,15 @@ fn the_batch_matches_spyre_inference(config: &str) {
         "{config}: {err:.3e} from spyre-inference's answer, gate {gate:.3e}"
     );
 
+    // Both tables hold `x · per + a` at entry `e`'s row `a` (`per` = 1: `x` itself).
+    let per = b.rows_per_page as i32;
     // CONTROL 1 — each sequence attends its OWN query: rotating the sequences' query rows must
     // miss (a kernel reading one row for every entry would not).
-    let rotated_rows: Vec<i32> = rep.iter().map(|&r| (r + 1) % b.seqs as i32).collect();
+    let seqs = b.seqs as i32;
+    let rotated_rows: Vec<i32> = rep
+        .iter()
+        .map(|&r| ((r / per + 1) % seqs) * per + r % per)
+        .collect();
     let miss = max_abs(&b.attend(&rotated_rows, &ids), &exact);
     println!("{config}: rotated query rows miss by {miss:.3e}");
     assert!(
@@ -694,13 +705,30 @@ fn the_batch_matches_spyre_inference(config: &str) {
     );
     // CONTROL 2 — the pages are read THROUGH the ids: shifting every id by one page must miss.
     let pages = b.step.geom("NUM_PAGES") as i32;
-    let shifted: Vec<i32> = ids.iter().map(|&p| (p + 1) % pages).collect();
+    let shifted: Vec<i32> = ids
+        .iter()
+        .map(|&p| ((p / per + 1) % pages) * per + p % per)
+        .collect();
     let miss = max_abs(&b.attend(&rep, &shifted), &exact);
     println!("{config}: shifted page ids miss by {miss:.3e}");
     assert!(
         miss > CONTROL_MARGIN * gate,
         "{config}: shifted page ids still match ({miss:.3e})"
     );
+    // CONTROL 3 — a page's kv heads are gathered as its rows: rotating each page's heads must
+    // miss.
+    if per > 1 {
+        let heads_rotated: Vec<i32> = ids
+            .iter()
+            .map(|&p| p - p % per + (p % per + 1) % per)
+            .collect();
+        let miss = max_abs(&b.attend(&rep, &heads_rotated), &exact);
+        println!("{config}: rotated kv heads miss by {miss:.3e}");
+        assert!(
+            miss > CONTROL_MARGIN * gate,
+            "{config}: rotated kv heads still match ({miss:.3e})"
+        );
+    }
 }
 
 /// Three sequences in the 4-sequence bucket, one chunk: the slots share one maximum per sequence.
@@ -715,7 +743,8 @@ fn a_decode_batch_over_two_chunks_matches_spyre_inference() {
     the_batch_matches_spyre_inference("batched_decode_chunks");
 }
 
-/// A chunk under Triton's gather floor, padded to 8 entries with masked block slots.
+/// A chunk under Triton's gather floor in pages (two sequences of one block): gathered by kv head,
+/// its tables folded, and at two kv heads those 4 rows padded to 8 with a masked block slot.
 #[test]
 fn a_decode_batch_under_the_gather_floor_matches_spyre_inference() {
     the_batch_matches_spyre_inference("batched_decode_floor");
