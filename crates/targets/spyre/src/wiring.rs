@@ -2059,9 +2059,9 @@ impl std::fmt::Display for WorldNotBaked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "this model has no forward for a {}-rank world (it baked {:?}); the bake names why \
-             in its `[spyre-tp]` warning",
-            self.world, self.baked
+            "this model has no forward for a {}-rank world (it baked {:?}): build with \
+             `--features tp/{}`, or see the bake's `[spyre-tp]` warning for why it was skipped",
+            self.world, self.baked, self.world
         )
     }
 }

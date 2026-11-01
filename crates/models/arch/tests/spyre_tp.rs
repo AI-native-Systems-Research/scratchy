@@ -2,15 +2,21 @@
 //! granite's sharded worlds, through the real `#[forward]` expansion.
 //!
 //! The spyre and subtile crates prove the sharding analysis and the collective emission on
-//! hand-built graphs; this proves what granite's own bake ships: one sharded world per entry of
-//! `SpyreWorld::SHARDED` (2, 4 and 8 ranks, in that order), each with its own decode bundle and
+//! hand-built graphs; this proves what granite's own bake ships under `tp-2,tp-4,tp-8`: one sharded
+//! world per entry of `SpyreWorld::SHARDED` (2, 4 and 8 ranks, in that order), each with its own decode bundle and
 //! wiring, and the slice law each source loads by — derived by the analysis, never declared.
 //! Granite's 40 layers each carry two K-split projections (o and down), each followed by the
 //! all-reduce the analysis wove in, so exactly 80 sources load by ROWS. Its odd vocab (49155) is
 //! split by a padded column block (`SourceShard::ColBlocks`): each rank holds a block of the lm
 //! head, and an all-gather restores the whole row before the draw.
 
-#![cfg(all(feature = "spyre", feature = "granite-3.1-2b-instruct"))]
+#![cfg(all(
+    feature = "spyre",
+    feature = "granite-3.1-2b-instruct",
+    feature = "tp-2",
+    feature = "tp-4",
+    feature = "tp-8"
+))]
 
 use scratchy_target_spyre::wiring::SourceShard;
 

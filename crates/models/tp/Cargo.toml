@@ -1,0 +1,24 @@
+[package]
+name = "scratchy-tp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tensor-parallel build scope: which sharded worlds the spyre bake emits beside the one-rank world (`tp/<W>` from scratchy-cli)."
+
+[features]
+# A crate of its own for the same reason as scratchy-quantizations and scratchy-spec, and like
+# scratchy-spec its features forward to scratchy-models (the `model` instance the CLI selects): Cargo forbids
+# aliasing one crate under two names in one Cargo.toml, and `crates/cli/scr/Cargo.toml` already
+# aliases scratchy-models `model`, scratchy-quantizations `quant` and scratchy-spec `spec`.
+#
+# NO DEFAULT: a build bakes the one-rank world only. Every sharded world is a full lowering of the
+# model (and under `spyre-emu` a numeric gate on each of its ranks), so a world is baked only when
+# asked for — `--features spyre-hw,model/granite-3.1-2b-instruct,tp/2`. A world named here that
+# spyre does not bake (`SPYRE_TP_WORLDS`) fails the build by name.
+2 = ["scratchy-models/tp-2"]
+4 = ["scratchy-models/tp-4"]
+8 = ["scratchy-models/tp-8"]
+all = ["2", "4", "8"]
+
+[dependencies]
+scratchy-models = { path = "../arch", default-features = false }

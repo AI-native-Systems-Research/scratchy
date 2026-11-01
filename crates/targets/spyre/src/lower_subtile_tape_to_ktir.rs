@@ -1269,8 +1269,8 @@ fn all_reduce_consumes<F: RopeForm>(
 /// consume per rank adds the `W` fragments — so the exchange is one hop, not `log2 W`
 /// ([`ReduceForm`]).
 ///
-/// ⭐ THE SAME TREE AS RECURSIVE DOUBLING, so the forms agree bit for bit: `((f0 + f1) + (f2 + f3))
-/// + …`, in absolute rank order, evaluated depth first. A left subtree accumulates into its
+/// ⭐ THE SAME TREE AS RECURSIVE DOUBLING, so the forms agree bit for bit:
+/// `((f0 + f1) + (f2 + f3)) + …`, in absolute rank order, evaluated depth first. A left subtree accumulates into its
 /// destination, and the right subtree of `2^k` ranks into round sum `k − 1`, a scratch region of the
 /// window the direct form never sends — so `log2 W − 1` round sums hold every pending right half,
 /// exactly the window's [`RecvWindow::round_sums`]. Each rank reads its own fragment from its

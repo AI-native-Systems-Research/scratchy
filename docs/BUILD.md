@@ -212,6 +212,21 @@ No `spec/*` feature named = only the heads inside their targets' checkpoints
 and the targets' default published drafters compile (with `metal`); a cuda or
 spyre build compiles none.
 
+## `-Ftp/<W>` — which tensor-parallel worlds a spyre build bakes
+
+A spyre build bakes each selected model's one-rank world. A tensor-parallel world is baked only when
+named: `tp/2`, `tp/4`, `tp/8`, or `tp/all` for all three. Each one is a full lowering of the model
+(and, under `spyre-emu`, a numeric gate on every one of its ranks), so the default is none. The CLI
+reaches them through a fourth alias crate, `tp` (`crates/models/tp/`), for the same reason `quant`
+and `spec` are crates of their own.
+
+```bash
+cargo build --release -p scratchy-cli --features spyre-hw,serve,model/granite-3.1-2b-instruct,tp/4
+```
+
+A binary serves `--tensor-parallel-size W` only if it was built with `tp/W`; any other width is
+refused at load, by name. The metal and cuda backends ignore these features.
+
 ## `turboquant` — KV cache compression, fixed at build time
 
 On metal, a model's KV cache is either dense (the model's own dtype) or

@@ -160,6 +160,10 @@ model = { package = "scratchy-models", path = "../../models/arch", optional = tr
 # features forward to scratchy-models (this same `model` instance), so this is
 # a regular-dependency edge, not a build-dependency one.
 spec = { package = "scratchy-spec", path = "../../models/spec", optional = true }
+# Tensor-parallel build scope, for CLI reachability like `spec`: `--features tp/2` (or `tp/4`,
+# `tp/8`, `tp/all`) bakes that sharded world beside the one-rank world for every selected spyre
+# model. None by default: a `scr` build without `tp/<W>` serves one card per model.
+tp = { package = "scratchy-tp", path = "../../models/tp", optional = true }
 scratchy-bench = { workspace = true, optional = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
