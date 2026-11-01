@@ -330,8 +330,9 @@ all-arches = [
 "gemma-4-26b-a4b-it-assistant" = ["arch-gemma4-assistant"]
 "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant" = ["arch-gemma4-assistant"]
 
-# dflash2 (1 configs)
+# dflash2 (2 configs)
 "qwen3.6-35b-a3b-dflash2" = ["arch-dflash2"]
+"qwen3.8-27b-dflash2" = ["arch-dflash2"]
 
 # qwen3-5-vl (2 configs)
 "qwen3.5-9b" = ["arch-qwen3-5-vl"]
@@ -553,6 +554,7 @@ all-arches = [
 ]
 "dflash2" = [
     "qwen3.6-35b-a3b-dflash2",
+    "qwen3.8-27b-dflash2",
 ]
 "qwen3-5-vl" = [
     "qwen3.5-9b",
@@ -715,6 +717,7 @@ all = [
     "gemma-4-26b-a4b-it-assistant",
     "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant",
     "qwen3.6-35b-a3b-dflash2",
+    "qwen3.8-27b-dflash2",
     "qwen3.5-9b",
     "qwen3.5-9b-parity-tiny",
     "qwen3.6-27b",
