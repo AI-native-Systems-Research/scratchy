@@ -544,18 +544,46 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
             node.output.region.cols.len == result_cols
         }
     };
-    // A projection's rows are its ACTIVATION's: a folded tail that gathers is declared one row from
-    // the projection's output down (`subtile_ir::mint_sample`, so the gather's operand is a whole
-    // one-row tensor), while the prompt rows it folds over are still `mq`. Every other tail op, and
-    // every projection of a tail that does not gather, has the same rows in and out.
+    // A projection's rows are the PROMPT's it folds over: a folded tail that gathers is declared one
+    // row from the projection's output down (`subtile_ir::mint_sample`, so the gather's operand is a
+    // whole one-row tensor), and its projection reads the last row of the `mq`-row prompt
+    // ([`folded_prompt`]). Every other tail op, and every projection of a tail that does not gather,
+    // has the same rows in and out.
     let rows = match &node.op {
-        SubOp::MatmulTile { .. } => node.inputs.first().map_or(0, |a| a.region.rows.len),
+        SubOp::MatmulTile { .. } => folded_prompt(node, ir)
+            .or_else(|| node.inputs.first().copied())
+            .map_or(0, |a| a.region.rows.len),
         _ => node.output.region.rows.len,
     };
     feeds_the_tail_product
         && rows > 1
         && !rows_are_requests
         && tensor_feeds_result_through_row_local_ops(ir, node.output.tensor)
+}
+
+/// The whole prompt a gathered tail's projection folds over. That projection states the row it
+/// computes — its activation region is the LAST row of the `[mq, hidden]` prompt
+/// (`subtile_ir`'s `fold_gathered_tail`), so the host reference computes exactly the fold's
+/// product — and the fold extracts that row from the whole prompt. `None` for every other node,
+/// the one-rank tail among them (its region is already the whole prompt), and the fold's own m=1
+/// matmul, whose activation is the `LAST_HIDDEN` staging beyond the graph.
+fn folded_prompt<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Option<scratchy_subtile::subtile_ir::TensorRegion> {
+    use scratchy_subtile::subtile_ir::{Range, Region, TensorRegion};
+    if !matches!(node.op, SubOp::MatmulTile { .. }) {
+        return None;
+    }
+    let a = node.inputs.first()?;
+    let mq = ir.tensors.get(a.tensor.index())?.rows;
+    (mq > 1 && a.region.rows == Range::new(mq - 1, 1)).then_some(TensorRegion {
+        tensor: a.tensor,
+        region: Region {
+            rows: Range::new(0, mq),
+            cols: a.region.cols,
+        },
+    })
 }
 
 /// Whether `t` reaches an all-gather restoring `width` columns through single-input logit
@@ -1338,7 +1366,7 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 ) -> Result<Vec<EmittedOp>, String> {
     use scratchy_subtile::subtile_ir::Region as SubRegion;
 
-    let a = &node.inputs[0];
+    let a = folded_prompt(node, ir).unwrap_or(node.inputs[0]);
     let (mq, hidden) = (a.region.rows.len, a.region.cols.len);
     let stk = 64u32; // Fp16::ELEMS_PER_STICK — the stick the door's lmlast arm checks
     if hidden % stk != 0 {
@@ -1396,7 +1424,7 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
     let extraction_node = SubtileNode {
         id: node.id,
         op: node.op,
-        inputs: vec![*a],
+        inputs: vec![a],
         output: scratchy_subtile::subtile_ir::TensorRegion {
             tensor: scratchy_subtile::subtile_ir::TensorId::from_index(last_hidden as usize),
             region: SubRegion {
@@ -2789,7 +2817,9 @@ fn matmul_window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
 ) -> Result<(u32, u32), String> {
     let out = &node.output;
-    let a = &node.inputs[0];
+    // A gathered tail's projection states its last prompt row; its kernel is the fold over the
+    // whole prompt.
+    let a = &folded_prompt(node, ir).unwrap_or(node.inputs[0]);
     let out_total = ir.tensors[out.tensor.index()].rows;
     let a_total = ir.tensors.get(a.tensor.index()).map(|s| s.rows);
     if out.region.rows.start != 0 || a.region.rows.start != 0 {
