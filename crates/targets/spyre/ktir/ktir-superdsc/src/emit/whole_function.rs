@@ -6169,6 +6169,13 @@ fn lower_function_folded(
                     && !indirect_tile_of(f, s.operands.get(1).copied())
             })
         };
+        let op_dims: Vec<i64> = op
+            .result_type
+            .and_then(|t| t.dims())
+            .map(<[i64]>::to_vec)
+            .unwrap_or_default();
+        // Stored through a shape op: the op writes the stored parameter's bytes in its OWN frame.
+        let mut through_shape = false;
         let mut stored = stores_of(op.result).or_else(|| {
             let res = op.result?;
             let shape = f.operations.iter().find(|o| {
@@ -6179,14 +6186,15 @@ fn lower_function_folded(
             })?;
             // Only through a shape op that moves no byte: one that does is a stick permute, which
             // the shape op's own arm lowers into the stored parameter.
-            let dims = |o: &Operation<'_>| -> Vec<i64> {
-                o.result_type
-                    .and_then(|t| t.dims())
-                    .map(<[i64]>::to_vec)
-                    .unwrap_or_default()
-            };
-            same_card_bytes(&dims(op), &dims(shape)).then_some(())?;
-            stores_of(shape.result)
+            let shape_dims = shape
+                .result_type
+                .and_then(|t| t.dims())
+                .map(<[i64]>::to_vec)
+                .unwrap_or_default();
+            same_card_bytes(&op_dims, &shape_dims).then_some(())?;
+            let s = stores_of(shape.result);
+            through_shape = s.is_some();
+            s
         });
         // ⭐⭐⭐ THE fp8 WEIGHT-SCALE EPILOGUE, ABSORBED AT THE DOT. `matmul_fp8.py` spells the W8A8
         // contraction's scale multiply IN THE KERNEL — `p * ws` between the dot and the store — so
@@ -6719,6 +6727,21 @@ fn lower_function_folded(
         };
         o = windowed_region(k, o, tile)?;
         o.is_out = true;
+        // ⭐ THROUGH A SHAPE OP THAT MOVES NO BYTE, THE OUTPUT IS READ IN THE OP'S OWN FRAME — the
+        // same card bytes, framed as the op's operands are: a decode batch of one's `[1, KV, G, D]`
+        // softmax output, stored as `out`'s `[1, KV·G·D]` row, is written `[KV·G, D]`, the frame
+        // its `[KV·G, D]` operands share (an elementwise op's operands and output are one tile).
+        let frame = flat_frame(&op_dims);
+        if through_shape
+            && o.r_start == 0
+            && o.c_start == 0
+            && o.r_len == o.v_rows
+            && o.c_len == o.v_cols
+            && frame != [o.v_rows, o.v_cols]
+            && frame[0] * frame[1] == o.v_rows * o.v_cols
+        {
+            o = reframed(o, frame);
+        }
         per_op.push(o);
         // ⭐⭐⭐ A STORED RESULT IS STILL READABLE. The value this op writes to the store's
         // parameter lives in that parameter's buffer, and a LATER compute consumer of it

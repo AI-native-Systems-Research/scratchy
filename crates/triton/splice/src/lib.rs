@@ -4563,7 +4563,16 @@ mod walk_on_the_card {
     #[test]
     fn a_decode_batch_lowers_at_every_rung_shape() {
         for hd in [64, 128] {
-            for (seqs, walk) in [(2, 1), (2, 64), (32, 1), (32, 64), (4, 2048)] {
+            for (seqs, walk) in [
+                (1, 1),
+                (1, 64),
+                (1, 2048),
+                (2, 1),
+                (2, 64),
+                (32, 1),
+                (32, 64),
+                (4, 2048),
+            ] {
                 let at = format!("{seqs} sequences over {walk} blocks at head dim {hd}");
                 let (node, c) = batched_walk_at(seqs, walk, hd);
                 let layout = triton_ktir_superdsc::layout::for_node(&node)
