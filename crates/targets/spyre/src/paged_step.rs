@@ -554,32 +554,6 @@ pub fn card_batch_sources(
     })
 }
 
-/// ⭐ ONE REQUEST'S STEP ON EITHER KIND OF BUNDLE — its prompt rows on a sequence bundle
-/// ([`step_sources`]), or its one decode row on a decode bundle, which spyre-inference decodes with
-/// the batched kernel at one sequence ([`batch_sources`] of the request alone: its sequence buckets
-/// start at 1). The bundle states which it is ([`PagedStep::paged_rows`]); a decode bundle takes
-/// one row of a request, its token at `rows.start`.
-pub fn request_sources(
-    step: &PagedStep,
-    blocks: &[u32],
-    rows: &StepRows,
-) -> Result<StepSources, PagedStepError> {
-    match step.paged_rows {
-        PagedRows::Sequence => step_sources(step, blocks, rows),
-        PagedRows::Batch if rows.real == 1 => batch_sources(
-            step,
-            &[BatchSeq {
-                blocks,
-                pos: rows.start,
-            }],
-        ),
-        PagedRows::Batch => Err(PagedStepError(format!(
-            "a decode bundle runs one row of a request, and this step asks for {} rows from {}",
-            rows.real, rows.start
-        ))),
-    }
-}
-
 /// ⭐ THE POOL'S STATICS ON THE CARD — `kv_row_pool` at the card's run pitch (page `p`'s `nkvh` rows
 /// in the first words of its [`INDEX_RUN_WORDS`] run: the run the decode walk's chained index copies
 /// per page) and the int32 zero that copy adds to. The same for every step, so the session whose
@@ -876,41 +850,6 @@ mod tests {
             Some(u64::from(scratchy_triton_splice::INT32_STICK) * 4),
             "the folded query rows fit their one stick"
         );
-    }
-
-    /// ⭐ ONE REQUEST'S DECODE IS A DECODE BATCH OF ONE — spyre-inference's sequence buckets start at
-    /// 1, so a decode bundle's one row stages the batched kernel's tables (the request alone, at its
-    /// token's position), exactly what a batch of that one sequence stages; a prompt bundle stages
-    /// the sequence's tables; and a decode bundle given several rows of one request refuses them.
-    #[test]
-    fn one_requests_decode_is_a_decode_batch_of_one() {
-        let decode = PagedStep {
-            rows: 1,
-            paged_rows: PagedRows::Batch,
-            ..step()
-        };
-        let blocks = [2u32, 3];
-        let got = request_sources(&decode, &blocks, &StepRows { start: 5, real: 1 }).unwrap();
-        let want = batch_sources(
-            &decode,
-            &[BatchSeq {
-                blocks: &blocks,
-                pos: 5,
-            }],
-        )
-        .unwrap();
-        assert_eq!(got.int32, want.int32);
-        assert_eq!(got.mask, want.mask);
-        let tids: Vec<u32> = got.int32.iter().map(|(t, ..)| *t).collect();
-        assert!(tids.contains(&decode.rep_rows) && tids.contains(&decode.chunk_pages));
-        assert!(!tids.contains(&decode.page_table) && !tids.contains(&decode.kv_row_pool));
-        let prompt = step();
-        let rows = StepRows { start: 5, real: 2 };
-        assert_eq!(
-            request_sources(&prompt, &blocks, &rows).unwrap().int32,
-            step_sources(&prompt, &blocks, &rows).unwrap().int32
-        );
-        assert!(request_sources(&decode, &blocks, &rows).is_err());
     }
 
     /// A sequence whose position is past the rung's walk cannot run on it.
