@@ -4784,13 +4784,13 @@ fn lower_function_folded(
                         }
                         None => g,
                     };
-                    // ⭐ A PAGE OF BLOCKS IN ONE ENTRY, IN ONE OP — torch-spyre's prompt-trip page
-                    // gather: the entry selects the page, its kv heads' blocks are read inside the op,
-                    // and each lands stick-major, one after another — so no piece, no scaled index and
-                    // no permute follows.
-                    if g.entries == 1
-                        && let &[b, r, c] = to.as_slice()
-                        && b > 1
+                    // ⭐ PAGES OF BLOCKS, ONE ENTRY A PAGE, IN ONE OP — torch-spyre's prompt-trip page
+                    // gather (and a decode batch's chunk of pages, one a core): each entry selects a
+                    // page, its kv heads' blocks are read inside the op, and each lands stick-major,
+                    // one after another — so no piece, no scaled index and no permute follows.
+                    if let &[b, r, c] = to.as_slice()
+                        && b > i64::from(g.entries)
+                        && b % i64::from(g.entries) == 0
                         && c % stick == 0
                         // Landed stick-major: the frame a multi-stick page is read in (`page_to_sticks`,
                         // as the one-block-an-entry gather below requires), and at one stick the
@@ -4811,7 +4811,8 @@ fn lower_function_folded(
                                     g.first_entry,
                                 ),
                                 crate::ir::bridge::tiled_op_sdsc_op::PageOfBlocks {
-                                    blocks: b,
+                                    entries: g.entries,
+                                    blocks: b / g.entries,
                                     rows: r,
                                     cols: c,
                                 },
@@ -4987,18 +4988,11 @@ fn lower_function_folded(
                         is_fp8: false,
                         band: None,
                     };
-                    // Several entries in pieces land piece by piece first, in a scratch as large.
-                    let landing = (pieces > 1 && g.entries > 1).then(|| {
-                        let tid = mint_scratch(k, layout, floor, src, 0);
-                        layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
-                        Region { tid, ..r }
-                    });
                     out.extend(super::lower_ktir_to_superdsc::page_gather(
                         f.name,
                         &g,
                         (page_sticks, pieces),
                         &r,
-                        landing.as_ref(),
                         sym_id_base,
                         Some(layout),
                     )?);
