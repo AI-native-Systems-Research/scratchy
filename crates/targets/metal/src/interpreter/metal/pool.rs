@@ -1997,6 +1997,15 @@ fn begin_step<W: CanonicalParams>(
         .worker
         .draft_cycle
         .store(inputs.draft.is_some_and(|d| d.cycle), Relaxed);
+    // No sequence holds more rows than a verify lane: a one-sequence step holds `num_tokens`.
+    let lane = crate::op_abi::METAL_LANE_VERIFY_ROWS;
+    worker.worker.lane_rows.store(
+        match inputs.cu_seqlens_q {
+            Some(cu) => cu.windows(2).all(|w| w[1].saturating_sub(w[0]) <= lane),
+            None => inputs.num_tokens <= lane,
+        },
+        Relaxed,
+    );
     for (to, bytes) in inputs.deferred.iter().flat_map(|d| &d.host_writes) {
         writes.stage(to, bytes);
     }

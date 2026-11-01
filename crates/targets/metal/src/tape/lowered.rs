@@ -807,6 +807,13 @@ pub enum RuntimeGate {
     /// a step that also replays or records, which runs those sequences and
     /// leaves the rest to the simd scan.
     OnlyIfPlainGdnRows,
+    /// Run only on a step whose every sequence holds at most a verify lane's rows
+    /// (`op_abi::METAL_LANE_VERIFY_ROWS`): the Gated-DeltaNet verify command, whose threadgroup
+    /// holds one sequence's rows, at a bucket of more (a 2-4-lane verify's).
+    OnlyIfLaneRows,
+    /// Run on a step one of whose sequences holds more than a verify lane's rows (a short prompt in
+    /// one chunk): the three-command Gated-DeltaNet path the verify command replaces.
+    UnlessLaneRows,
     /// Run only on a DFlash2 cycle's context commit — a forward whose lanes each hold their
     /// verify's block and retained a count of it (`ForwardInputs::draft_cycle`): Splash's
     /// `draft_context_kv_commit`.
@@ -864,6 +871,8 @@ impl RuntimeGate {
             G::UnlessUnrotatedBlocks => G::OnlyIfUnrotatedBlocks,
             G::OnlyIfPlainGdn => G::UnlessPlainGdn,
             G::UnlessPlainGdn => G::OnlyIfPlainGdn,
+            G::OnlyIfLaneRows => G::UnlessLaneRows,
+            G::UnlessLaneRows => G::OnlyIfLaneRows,
             G::OnlyIfDraftCycle => G::UnlessDraftCycle,
             G::UnlessDraftCycle => G::OnlyIfDraftCycle,
             G::OnlyIfPlainGdnRows | G::All(_) | G::Any(_) => return None,

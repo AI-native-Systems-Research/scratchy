@@ -39,9 +39,46 @@ const SHAPES: &[(usize, usize, usize)] = &[
     (2, 256, 2048),    // Qwen3.6-35B-A3B MoE router, verify buckets (2 / 4 / 8 rows)
     (4, 256, 2048),
     (8, 256, 2048),
+    (13, 256, 2048), // a 2-lane DFlash2 verify (two 8-row lanes, a partial chunk)
+    (16, 256, 2048),
+    (27, 256, 2048), // four lanes, a partial last chunk
+    (32, 256, 2048),
+    (3, 256, 2048), // 27's last chunk alone
     (2048, 128, 2816), // Gemma-4-26B-A4B MoE router prefill (bf16: blocked)
     (256, 256, 2048),  // Qwen3.6-35B-A3B MoE router, the first blocked bucket on main (NAX here)
 ];
+
+/// A row of a verify-sized GEMV (up to 32 rows, in 8-row chunks) is the bits the 8-row GEMV gives
+/// it: each chunk sums its rows alone, so a lane's rows do not depend on the lanes beside them.
+#[test]
+fn a_chunked_gemv_row_is_the_eight_row_gemv_bits() {
+    let Some((device, pl)) = make_pipelines() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let (n, k) = (256usize, 2048usize);
+    let weight: Vec<bf16> = (0..n * k)
+        .map(|i| bf16::from_f32(((i as f32) * 0.019).cos() * 0.3))
+        .collect();
+    let w_buf = common::shared_slice(&device, &weight);
+    let run = |m: usize, input: &[bf16]| -> Option<Vec<u16>> {
+        let in_buf = common::shared_slice(&device, input);
+        let out_buf = common::shared_zeroed(&device, m * n * std::mem::size_of::<bf16>());
+        let (pso, grid, threads) = gemm(&pl, MetalDtype::Bf16, (m, n, k));
+        common::dispatch_threadgroups(&device, &pso, &[&out_buf, &in_buf, &w_buf], grid, threads)
+            .then(|| common::read_slice::<bf16>(&out_buf, m * n).iter().map(|v| v.to_bits()).collect())
+    };
+    let m = 27usize;
+    let input: Vec<bf16> = (0..m * k)
+        .map(|i| bf16::from_f32(((i as f32) * 0.013).sin() * 0.3))
+        .collect();
+    let Some(all) = run(m, &input) else { return };
+    for chunk in (0..m).step_by(8) {
+        let rows = 8.min(m - chunk);
+        let Some(alone) = run(rows, &input[chunk * k..(chunk + rows) * k]) else { return };
+        assert_eq!(&all[chunk * n..(chunk + rows) * n], &alone[..], "rows {chunk}..{}", chunk + rows);
+    }
+}
 
 /// The blocked bf16 GEMM runs the 8×8-tile GEMM's MMAs in its order: the same bits, at the MoE
 /// routers' prefill shapes and at M/N/K tails (K = 16q + 8).
