@@ -37,7 +37,7 @@ import triton.language as tl
 
 @triton.jit
 def page_attn_head_major_prefill_kernel(query, query_row_index, k_pages, v_pages,  #
-                                        page_index_table, kv_row_pool, mask_stack, out,  #
+                                        page_index_table, mask_stack, out,  #
                                         NUM_TOKENS: tl.constexpr, NUM_HEADS: tl.constexpr,  #
                                         NUM_KV_HEADS: tl.constexpr, HEAD_SIZE: tl.constexpr,  #
                                         BLOCK_SIZE: tl.constexpr, NUM_PAGES: tl.constexpr,  #
@@ -74,30 +74,14 @@ def page_attn_head_major_prefill_kernel(query, query_row_index, k_pages, v_pages
     q = tl.reshape(tl.trans(tl.reshape(q_rows, [P, NUM_HEADS, HEAD_SIZE]), (1, 0, 2)),
                    [NUM_KV_HEADS, G * P, HEAD_SIZE])
 
-    # ⭐ THE PAGE AS ITS KV HEADS' ROWS, GATHERED ONE HEAD A CORE — the decode trip's own frame
-    # (`page_attn_head_major_decode`'s `k_folded`/`pool`), applied to the prompt trip. The cache is
-    # contiguous `[pages, kv, block, D]`, so page `p`'s head `a` IS row `p·kv + a` of
-    # `[pages·kv, block·D]`, and `kv_row_pool[p]` names those `kv` rows.
-    #
-    # ⛔ WHY NOT THE UNFOLDED ROW. Reading the page as ONE `[1, kv·block·D]` row makes the trip's
-    # gather a single `mb` position with the kv heads on a `y` axis, and a gather divides over cores
-    # by `mb` ALONE (`gather_copy_cores`: splitting any other axis divides the entry and breaks
-    # `skip_addr`). So the whole page — 128 KB at granite-2b, 256 KB at the 8b — moved on ONE CORE,
-    # every trip of every layer, which at a 10k prompt is ~33,500 trips. `kv` index entries divide
-    # `kv` ways, which is what torch-spyre's compiled prefill does (`sdsc_6`,
-    # `numWkSlicesPerDim_ {mb: 8}`).
-    k_folded = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES * NUM_KV_HEADS,
-                                                         BLOCK_SIZE * HEAD_SIZE],
-                                         strides=[BLOCK_SIZE * HEAD_SIZE, 1],
-                                         block_shape=[1, BLOCK_SIZE * HEAD_SIZE])
-    v_folded = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES * NUM_KV_HEADS,
-                                                         BLOCK_SIZE * HEAD_SIZE],
-                                         strides=[BLOCK_SIZE * HEAD_SIZE, 1],
-                                         block_shape=[1, BLOCK_SIZE * HEAD_SIZE])
-    # kv_row_pool `[num_pages, num_kv_heads, 1]`: page p's slab is the num_kv_heads elements at
-    # p * num_kv_heads.
-    pool = tl.make_tensor_descriptor(kv_row_pool, shape=[NUM_PAGES * NUM_KV_HEADS], strides=[1],
-                                     block_shape=[NUM_KV_HEADS])
+    k_unfolded = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES,
+                                                           NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE],
+                                           strides=[NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE, 1],
+                                           block_shape=[1, NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE])
+    v_unfolded = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES,
+                                                           NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE],
+                                           strides=[NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE, 1],
+                                           block_shape=[1, NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE])
     masks = tl.make_tensor_descriptor(mask_stack, shape=[NUM_BLOCKS * P, BLOCK_SIZE],
                                       strides=[BLOCK_SIZE, 1], block_shape=[P, BLOCK_SIZE])
 
@@ -111,9 +95,8 @@ def page_attn_head_major_prefill_kernel(query, query_row_index, k_pages, v_pages
         # page_idx = page_index[0, 0:1]
         page = tl.load(page_index_table + i * INT32_ELEMS_PER_STICK)
         # k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
-        kv_rows = pool.load([page * NUM_KV_HEADS])
-        k_page = tl.reshape(k_folded.gather(kv_rows, 0), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
-        v_page = tl.reshape(v_folded.gather(kv_rows, 0), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
+        k_page = tl.reshape(k_unfolded.load([page, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
+        v_page = tl.reshape(v_unfolded.load([page, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
         # scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         scores = tl.reshape(tl.dot(q, tl.trans(k_page, (0, 2, 1)), out_dtype=tl.float16) * SCALE,
                             [NUM_KV_HEADS, G, P, BLOCK_SIZE])
