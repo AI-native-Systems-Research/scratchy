@@ -234,18 +234,6 @@ impl TpIdentity {
             sender.rank
         }))
     }
-
-    /// The other rank of a two-rank world — the one peer this card sends to and hears from.
-    /// `None` in a world of one, where there is no peer.
-    pub const fn peer(self) -> Option<TpIdentity> {
-        match self.world.0 {
-            2 => Some(TpIdentity {
-                rank: 1 - self.rank,
-                world: self.world,
-            }),
-            _ => None,
-        }
-    }
 }
 
 /// ONE p2p MESSAGE: a whole, non-zero number of flits, no wider than [`RDMA_MESSAGE_CAP_BYTES`]
@@ -823,13 +811,17 @@ mod tests {
     }
 
     #[test]
-    fn a_rank_carries_its_world_and_its_peer() {
+    fn a_rank_carries_its_world_and_its_peers() {
         let w = TpWorld::of::<2>();
         let ids: Vec<TpIdentity> = w.ranks().collect();
         assert_eq!(ids.len(), 2);
-        assert_eq!(ids[0].peer(), Some(ids[1]));
-        assert_eq!(ids[1].peer(), Some(ids[0]));
-        assert_eq!(TpWorld::of::<1>().ranks().next().unwrap().peer(), None);
+        assert!(ids.iter().all(|id| id.world() == w));
+        assert_eq!(ids[0].peers().collect::<Vec<_>>(), [ids[1]]);
+        assert_eq!(ids[1].peers().collect::<Vec<_>>(), [ids[0]]);
+        assert_eq!(
+            TpWorld::of::<1>().ranks().next().unwrap().peers().count(),
+            0
+        );
     }
 
     /// Consecutive collectives in run order must alternate cuts: an even run per replayed layer

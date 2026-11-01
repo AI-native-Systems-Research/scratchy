@@ -12,14 +12,24 @@ pub use ktir_superdsc::collective::*;
 /// One control block of a bundle's pipeline, in the order the compute FIFO runs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CbStep {
-    /// The F-send in front of consume group `group`: this rank's fragment of the consume's operand,
-    /// from its own placement into the peer's receive window, on this card's DMA engine — device p2p
-    /// RDMA (flex-rs `scheduler::build_rdma_send_cb`), one F-send per message. Each message's
-    /// landing increments the peer's write-done counter on this rank's sid for its landing slot.
-    Send { group: usize, consume: TpConsume },
-    /// Wait for the peer's fragment to land in this rank's window (consumes one write-done per
-    /// message on the peer's sid for its slot; flex-rs `ControlBlockWire::p2p_rdma_wait`).
-    Wait { group: usize, consume: TpConsume },
+    /// An F-send in front of consume group `group`: this rank's fragment of the consume's operand,
+    /// from its own placement into its region of peer `to`'s receive window, on this card's DMA
+    /// engine — device p2p RDMA (flex-rs `scheduler::build_rdma_send_cb`), one F-send per message.
+    /// Each message's landing increments `to`'s write-done counter on this rank's sid for its
+    /// landing slot.
+    Send {
+        group: usize,
+        consume: TpConsume,
+        to: TpIdentity,
+    },
+    /// Wait for peer `from`'s fragment to land in its region of this rank's window (consumes one
+    /// write-done per message on `from`'s sid for its slot; flex-rs
+    /// `ControlBlockWire::p2p_rdma_wait`).
+    Wait {
+        group: usize,
+        consume: TpConsume,
+        from: TpIdentity,
+    },
     /// Launch group `group`'s programs.
     Launch { group: usize },
 }
@@ -35,17 +45,26 @@ pub fn plays_on(tp: Option<TpConsume>, session: TpIdentity) -> bool {
         .is_none_or(|p| p.launches_on(session))
 }
 
-/// One group's control blocks, in order: a consume group is `send, wait, launch`, every other group
-/// one launch. A collective's send is never a group of its own: the consume names everything the
-/// send moves, so every consume has exactly one send in front of it and a wait never queues ahead
-/// of its own rank's send (the symmetric deadlock: both ranks waiting, neither sending).
-pub fn group_steps(group: usize, tp: Option<TpConsume>) -> impl Iterator<Item = CbStep> {
+/// One group's control blocks, in order: a consume group played by `session` is a send to each of
+/// its peers, then a wait on each, then the launch; every other group is one launch. A collective's
+/// send is never a group of its own: the consume names everything the send moves, so every consume
+/// has one send per peer in front of it, and no wait queues ahead of its own rank's sends (the
+/// symmetric deadlock: every rank waiting, none sending). Every rank names its peers in rank order.
+pub fn group_steps(
+    group: usize,
+    tp: Option<(TpConsume, TpIdentity)>,
+) -> impl Iterator<Item = CbStep> {
     let steps: Vec<CbStep> = match tp {
-        Some(consume) => vec![
-            CbStep::Send { group, consume },
-            CbStep::Wait { group, consume },
-            CbStep::Launch { group },
-        ],
+        Some((consume, session)) => session
+            .peers()
+            .map(|to| CbStep::Send { group, consume, to })
+            .chain(session.peers().map(|from| CbStep::Wait {
+                group,
+                consume,
+                from,
+            }))
+            .chain([CbStep::Launch { group }])
+            .collect(),
         None => vec![CbStep::Launch { group }],
     };
     steps.into_iter()
@@ -62,7 +81,7 @@ pub fn cb_pipeline<'g>(
         .iter()
         .enumerate()
         .filter(move |(_, g)| plays_on(g.kv.tp, session))
-        .flat_map(|(group, g)| group_steps(group, g.kv.tp))
+        .flat_map(move |(group, g)| group_steps(group, g.kv.tp.map(|c| (c, session))))
 }
 
 /// WHERE A CONSUME'S SEND READS AND LANDS — segment-relative, as the bundle baked it. The source is
@@ -341,18 +360,27 @@ mod tests {
             consume_group(consume),
             crate::LaunchGroup::default(),
         ];
-        let rank0 = TpWorld::of::<2>().ranks().next().unwrap();
-        let steps: Vec<CbStep> = cb_pipeline(&groups, rank0).collect();
+        let ranks: Vec<TpIdentity> = TpWorld::of::<2>().ranks().collect();
+        let steps: Vec<CbStep> = cb_pipeline(&groups, ranks[0]).collect();
         assert_eq!(
             steps,
             [
                 CbStep::Launch { group: 0 },
-                CbStep::Send { group: 1, consume },
-                CbStep::Wait { group: 1, consume },
+                CbStep::Send {
+                    group: 1,
+                    consume,
+                    to: ranks[1]
+                },
+                CbStep::Wait {
+                    group: 1,
+                    consume,
+                    from: ranks[1]
+                },
                 CbStep::Launch { group: 1 },
                 CbStep::Launch { group: 2 },
             ]
         );
+        let rank0 = ranks[0];
         assert_eq!(wdone_balance(cb_pipeline(&groups, rank0)), 0);
     }
 
@@ -376,16 +404,19 @@ mod tests {
         for (mine, id) in ranks.iter().enumerate() {
             let steps: Vec<CbStep> = cb_pipeline(&groups, *id).collect();
             let consume = consume_at(*id);
+            let peer = ranks[1 - mine];
             assert_eq!(
                 steps,
                 [
                     CbStep::Send {
                         group: mine,
-                        consume
+                        consume,
+                        to: peer
                     },
                     CbStep::Wait {
                         group: mine,
-                        consume
+                        consume,
+                        from: peer
                     },
                     CbStep::Launch { group: mine },
                     CbStep::Launch { group: 2 },

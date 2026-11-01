@@ -845,26 +845,20 @@ impl SpyreWorker {
         // std::call_once makes prepare's own init block only on the remainder — a pure
         // latency win with no change to the bytes that reach the device.
         // ⭐ A RANK DRIVES ITS OWN CARD, by the PCI address `--tp-cards` names for its rank, chosen
-        // before that bring-up opens one; its peer is the card named for the peer's rank. A world
+        // before that bring-up opens one; each peer is the card named for that peer's rank. A world
         // of one drives the one card named, or the first available when none is.
         #[cfg(feature = "spyre-hw")]
-        let cards = self.seat.and_then(|me| {
-            let card = |r: scratchy_target_spyre::bundle_code::collective::TpIdentity| {
-                self.cards.get(r.rank() as usize).cloned()
-            };
-            Some(scratchy_target_spyre::runtime::CardPair {
-                own: card(me)?,
-                peer: card(me.peer()?)?,
-            })
-        });
+        let cards = self
+            .seat
+            .map(|me| scratchy_target_spyre::runtime::WorldCards::of(me, self.cards.clone()))
+            .transpose()
+            .map_err(|e| werr(e.to_string()))?;
         #[cfg(feature = "spyre-hw")]
-        if self.seat.is_some() && cards.is_none() {
-            return Err(werr(
-                "a sharded rank names its card and its peer's by PCI address (`--tp-cards`)",
-            ));
-        }
-        #[cfg(feature = "spyre-hw")]
-        if let Some(own) = cards.as_ref().map(|c| &c.own).or(self.cards.first()) {
+        if let Some(own) = cards
+            .as_ref()
+            .map(scratchy_target_spyre::runtime::WorldCards::own)
+            .or(self.cards.first())
+        {
             scratchy_target_spyre::runtime::drive_card(own).map_err(|e| werr(e.to_string()))?;
         }
         #[cfg(feature = "spyre-hw")]
@@ -1262,15 +1256,19 @@ impl SpyreWorker {
                                 me.world().get()
                             ))
                         })?;
-                    scratchy_target_spyre::runtime::link_peer(me, cards.clone(), window)
+                    scratchy_target_spyre::runtime::link_peer(cards.clone(), window)
                         .map_err(|e| werr(e.to_string()))?;
+                    let peers: Vec<String> = me
+                        .peers()
+                        .map(|p| format!("rank {} on {}", p.rank(), cards.of_rank(p)))
+                        .collect();
                     info!(
-                        "[spyre-worker] rank {} of {}: linked {} to its peer on {} over device \
+                        "[spyre-worker] rank {} of {}: linked {} to its peers ({}) over device \
                          p2p RDMA, window {window:?}",
                         me.rank(),
                         me.world().get(),
-                        cards.own,
-                        cards.peer,
+                        cards.own(),
+                        peers.join(", "),
                     );
                 }
                 // ⭐ THE SEGMENT BUDGET's runtime work list, read BEFORE any session is built (the

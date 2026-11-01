@@ -1479,11 +1479,56 @@ impl DevAddr {
 //  The p2p link — tensor parallelism's one load-time fact
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// The cards a sharded session spans: the one this process drives and its peer's.
+/// ⭐ THE CARDS A SHARDED WORLD SPANS, IN RANK ORDER — rank `r` drives the `r`-th, as
+/// `--tp-cards` names them — with the rank this process runs as. Minted only by
+/// [`WorldCards::of`], which refuses a list that is not one card per rank, and a card named twice (a
+/// rank that would send to itself).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CardPair {
-    pub own: PciAddress,
-    pub peer: PciAddress,
+pub struct WorldCards {
+    me: TpIdentity,
+    cards: Vec<PciAddress>,
+}
+
+impl WorldCards {
+    /// `cards`, rank `r`'s at index `r`, for a process running as `me`.
+    ///
+    /// # Errors
+    /// [`AttachRefusal::NoPeer`] in a world of one, [`AttachRefusal::Cards`] for a list that is not
+    /// one card per rank, [`AttachRefusal::SelfLoop`] for a card named twice.
+    pub fn of(me: TpIdentity, cards: Vec<PciAddress>) -> Result<Self, AttachRefusal> {
+        if !me.world().is_sharded() {
+            return Err(AttachRefusal::NoPeer(me));
+        }
+        if cards.len() != me.world().get() as usize {
+            return Err(AttachRefusal::Cards {
+                world: me.world().get(),
+                named: cards.len(),
+            });
+        }
+        if let Some(card) = cards
+            .iter()
+            .enumerate()
+            .find_map(|(i, c)| cards[..i].contains(c).then(|| c.clone()))
+        {
+            return Err(AttachRefusal::SelfLoop { card });
+        }
+        Ok(Self { me, cards })
+    }
+
+    /// The rank this process runs as.
+    pub fn me(&self) -> TpIdentity {
+        self.me
+    }
+
+    /// The card this process drives.
+    pub fn own(&self) -> &PciAddress {
+        &self.cards[self.me.rank() as usize]
+    }
+
+    /// The card rank `r` drives.
+    pub fn of_rank(&self, r: TpIdentity) -> &PciAddress {
+        &self.cards[r.rank() as usize]
+    }
 }
 
 /// The ids a rank's collective control blocks name: per landing slot, its own sid (its message
@@ -1503,15 +1548,32 @@ pub struct PeerRoute {
 }
 
 impl PeerRoute {
-    /// The route between `me` and its peer. `None` in a world of one.
-    pub fn of(me: TpIdentity) -> Option<Self> {
-        let peer = me.peer()?;
+    /// The route between `me` and `peer`. `None` for a rank and itself, or two ranks of different
+    /// worlds.
+    pub fn between(me: TpIdentity, peer: TpIdentity) -> Option<Self> {
         Some(Self {
             me,
             peer,
             lands_in: peer.region_of(me)?,
             hears_in: me.region_of(peer)?,
         })
+    }
+
+    /// Every route `me` has: one per peer, in the peers' rank order.
+    pub fn all(me: TpIdentity) -> Vec<Self> {
+        me.peers()
+            .filter_map(|peer| Self::between(me, peer))
+            .collect()
+    }
+
+    /// The rank this route sends from.
+    pub fn me(self) -> TpIdentity {
+        self.me
+    }
+
+    /// The rank this route sends to and hears from.
+    pub fn peer(self) -> TpIdentity {
+        self.peer
     }
 
     /// This rank's region of the peer's window: where its messages land on the peer's card.
@@ -1548,7 +1610,9 @@ impl PeerRoute {
 pub enum AttachRefusal {
     /// A world of one has no peer.
     NoPeer(TpIdentity),
-    /// The peer card is this card.
+    /// The world's cards are not one per rank.
+    Cards { world: u32, named: usize },
+    /// A card named for two ranks — one of them would send to itself.
     SelfLoop { card: PciAddress },
     /// The link names a card this process does not drive.
     NotDriven(CardTaken),
@@ -1576,9 +1640,14 @@ impl fmt::Display for AttachRefusal {
                 me.rank(),
                 me.world().get()
             ),
+            Self::Cards { world, named } => write!(
+                f,
+                "a {world}-rank world names one card per rank, in rank order (`--tp-cards`); \
+                 {named} were named"
+            ),
             Self::SelfLoop { card } => write!(
                 f,
-                "the peer card is this card ({card}) — a rank cannot send to itself"
+                "the card {card} is named for two ranks — a rank cannot send to itself"
             ),
             Self::NotDriven(e) => write!(f, "the link's own card is not this process's: {e}"),
             Self::AlreadyLinked { linked, asked } => write!(
@@ -1617,7 +1686,8 @@ impl std::error::Error for AttachRefusal {}
 #[derive(Debug)]
 pub struct PeerLink {
     me: TpIdentity,
-    route: PeerRoute,
+    /// One per peer, in rank order — leaked with the link, so a bound collective holds them.
+    routes: &'static [PeerRoute],
     window: RecvWindow,
     /// The window's first byte as the allocator places it — set once, by [`point_landing_slots`].
     landing: OnceLock<u64>,
@@ -1629,9 +1699,9 @@ impl PeerLink {
         self.me
     }
 
-    /// The ids this process's sends and waits name.
-    pub fn route(&self) -> PeerRoute {
-        self.route
+    /// The ids this process's sends and waits name, one route per peer in rank order.
+    pub fn routes(&self) -> &'static [PeerRoute] {
+        self.routes
     }
 
     /// Where the peer's sends land on this card.
@@ -1699,21 +1769,18 @@ pub fn peer_link() -> Option<&'static PeerLink> {
     *link_cell().lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Link this process — rank `me`, driving `cards.own` — to its peer on `cards.peer`, for sends
-/// landing in `window`. Linking again as the same rank for the same window returns the link
-/// already made.
+/// Link this process — `cards.me()`, driving `cards.own()` — to each of its peers on the card
+/// `cards` names for its rank, for sends landing in `window`. Linking again as the same rank for the
+/// same window returns the link already made.
 ///
 /// # Errors
 /// [`AttachRefusal`], by name.
 pub fn link_peer(
-    me: TpIdentity,
-    cards: CardPair,
+    cards: WorldCards,
     window: RecvWindow,
 ) -> Result<&'static PeerLink, AttachRefusal> {
-    let route = PeerRoute::of(me).ok_or(AttachRefusal::NoPeer(me))?;
-    if cards.own == cards.peer {
-        return Err(AttachRefusal::SelfLoop { card: cards.own });
-    }
+    let me = cards.me();
+    let routes = PeerRoute::all(me);
     let mut cell = link_cell().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(link) = *cell {
         return if (link.me, link.window) == (me, window) {
@@ -1725,23 +1792,27 @@ pub fn link_peer(
             })
         };
     }
-    drive_card(&cards.own).map_err(AttachRefusal::NotDriven)?;
+    drive_card(cards.own()).map_err(AttachRefusal::NotDriven)?;
     init_runtime().map_err(|e| AttachRefusal::BringUp(e.to_string()))?;
-    // ⭐ THE SYMMETRIC BAT, AS THE tp37 CELL INSTALLS IT (#1008): entry `dest_tid` — the peer's
-    // rank, the destination every send names — holds the peer card's region-2 PCI address, from
-    // senlib's own region-address door (the vendor's `initialize_p2p_address_table` value
-    // source), for the card the address names, never an enumeration order.
-    let peer_region2 = flex_rs::senlib_ffi::pci_addr_for_region(cards.peer.as_str(), 2)
-        .map_err(AttachRefusal::PeerRegion)?;
-    flex_rs::senlib_ffi::set_base_addr_table(route.dest_tid(), peer_region2).map_err(|why| {
-        AttachRefusal::Bat {
-            tid: route.dest_tid(),
-            why,
-        }
-    })?;
+    // ⭐ THE SYMMETRIC BAT, AS THE tp37 CELL INSTALLS IT (#1008), ONE ENTRY PER PEER: entry
+    // `dest_tid` — the peer's rank, the destination every send to it names — holds that peer card's
+    // region-2 PCI address, from senlib's own region-address door (the vendor's
+    // `initialize_p2p_address_table` value source), for the card the address names, never an
+    // enumeration order.
+    for route in &routes {
+        let peer_region2 =
+            flex_rs::senlib_ffi::pci_addr_for_region(cards.of_rank(route.peer()).as_str(), 2)
+                .map_err(AttachRefusal::PeerRegion)?;
+        flex_rs::senlib_ffi::set_base_addr_table(route.dest_tid(), peer_region2).map_err(
+            |why| AttachRefusal::Bat {
+                tid: route.dest_tid(),
+                why,
+            },
+        )?;
+    }
     let link: &'static PeerLink = Box::leak(Box::new(PeerLink {
         me,
-        route,
+        routes: Box::leak(routes.into_boxed_slice()),
         window,
         landing: OnceLock::new(),
     }));
@@ -1792,7 +1863,11 @@ pub fn point_landing_slots(link: &PeerLink, window_region: &DevAddr) -> Result<(
     }
     let _ = link.landing.set(landing);
     let mut pointed: Vec<String> = Vec::new();
-    for (slot, at) in link.window.slots(link.route.hears_in()) {
+    for (route, (slot, at)) in link
+        .routes
+        .iter()
+        .flat_map(|r| link.window.slots(r.hears_in()).map(move |s| (*r, s)))
+    {
         // The slot's own extent: one message, or the region's remainder for its last.
         let len = (link.window.region().get() - u64::from(slot.message()) * cap).min(cap);
         let va = flex_rs::scheduler::landing_va_bytes(
@@ -1807,9 +1882,8 @@ pub fn point_landing_slots(link: &PeerLink, window_region: &DevAddr) -> Result<(
         .map_err(|e| AttachRefusal::Xseg(e.to_string()))?;
         let word = flex_rs::hal_sbf::rdma_xseg(va + flex_rs::control_block_wire::Flits::BYTES)
             .map_err(AttachRefusal::Xseg)?;
-        flex_rs::senlib_ffi::write_xseg(link.route.wait_sid(slot), word)
-            .map_err(AttachRefusal::Xseg)?;
-        pointed.push(format!("XSEG[{}]=0x{va:x}", link.route.wait_sid(slot)));
+        flex_rs::senlib_ffi::write_xseg(route.wait_sid(slot), word).map_err(AttachRefusal::Xseg)?;
+        pointed.push(format!("XSEG[{}]=0x{va:x}", route.wait_sid(slot)));
     }
     // The load-time ordering made observable: this line precedes the rank's ready report, and so
     // every step's sends.
@@ -1885,8 +1959,17 @@ mod tests {
     fn a_route_names_each_slots_sids_and_the_peers_index() {
         use crate::bundle_code::collective::{TpWorld, WindowCut};
         let ranks: Vec<TpIdentity> = TpWorld::of::<2>().ranks().collect();
-        let routes = [ranks[0], ranks[1]].map(|r| PeerRoute::of(r).unwrap());
+        let routes = [ranks[0], ranks[1]].map(|r| {
+            let all = PeerRoute::all(r);
+            assert_eq!(all.len(), 1, "a two-rank world's rank has one peer");
+            all[0]
+        });
         assert_eq!(routes.map(|r| r.dest_tid()), [1, 0]);
+        assert_eq!(
+            routes.map(|r| (r.me(), r.peer())),
+            [(ranks[0], ranks[1]), (ranks[1], ranks[0])]
+        );
+        assert_eq!(PeerRoute::between(ranks[0], ranks[0]), None);
         for k in 0..2 {
             for m in 0..2 {
                 let slot = LandingSlot::of(WindowCut::of_collective(k), m).unwrap();
@@ -1897,7 +1980,7 @@ mod tests {
             }
         }
         let alone = TpWorld::of::<1>().ranks().next().unwrap();
-        assert_eq!(PeerRoute::of(alone), None);
+        assert!(PeerRoute::all(alone).is_empty());
     }
 
     /// A world runs only when every rank's window lands at this rank's address: one peer elsewhere,
@@ -1945,33 +2028,31 @@ mod tests {
         }
     }
 
-    /// The two refusals that need no card: a world of one has no peer, and a peer card that is
-    /// this card is a rank sending to itself.
+    /// The refusals that need no card, at the cards themselves: a world of one has no peer, a list
+    /// that is not one card per rank, and a card named for two ranks — a rank sending to itself.
+    /// The ranks' cards are read in rank order.
     #[test]
-    fn a_link_refuses_no_peer_and_a_self_loop_before_touching_the_card() {
-        use crate::bundle_code::collective::{Payload, TpWorld, WireBytes};
-        let window = RecvWindow::new(
-            1 << 20,
-            Payload::from(WireBytes::CAP),
-            crate::bundle_code::collective::TpWorld::of::<2>(),
-        )
-        .unwrap();
+    fn a_worlds_cards_refuse_no_peer_a_short_list_and_a_self_loop() {
+        use crate::bundle_code::collective::TpWorld;
         let alone = TpWorld::of::<1>().ranks().next().unwrap();
         let card = |bus: &str| PciAddress::parse(&format!("0000:{bus}:00.0")).unwrap();
-        let pair = |own, peer| CardPair {
-            own: card(own),
-            peer: card(peer),
-        };
         assert!(matches!(
-            link_peer(alone, pair("3b", "86"), window),
+            WorldCards::of(alone, vec![card("3b")]),
             Err(AttachRefusal::NoPeer(_))
         ));
-        let rank0 = TpWorld::of::<2>().ranks().next().unwrap();
+        let ranks: Vec<TpIdentity> = TpWorld::of::<2>().ranks().collect();
         assert!(matches!(
-            link_peer(rank0, pair("3b", "3b"), window),
+            WorldCards::of(ranks[0], vec![card("3b")]),
+            Err(AttachRefusal::Cards { world: 2, named: 1 })
+        ));
+        assert!(matches!(
+            WorldCards::of(ranks[0], vec![card("3b"), card("3b")]),
             Err(AttachRefusal::SelfLoop { card: c }) if c == card("3b")
         ));
-        assert!(peer_link().is_none(), "a refused link links nothing");
+        let cards = WorldCards::of(ranks[1], vec![card("3b"), card("86")]).unwrap();
+        assert_eq!(cards.own(), &card("86"));
+        assert_eq!(cards.of_rank(ranks[0]), &card("3b"));
+        assert!(peer_link().is_none(), "naming cards links nothing");
     }
 
     /// A process drives one card, named by its address: choosing it again is a no-op, choosing
