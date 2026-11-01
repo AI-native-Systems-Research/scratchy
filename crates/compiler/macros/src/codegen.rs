@@ -10146,6 +10146,12 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     //    measured 25 groups/layer (granite-2b, 40 layers) to 73 (gemma-4-12b, 48): a flat
     //    ceiling tight enough to hold the 2b refuses the 12b. Card-only: on the emulator the
     //    drained groups are one-per-op KTIR programs, a different unit this budget never sees.
+    //
+    //    ⭐ AND PER TENSOR-PARALLEL WORLD. Every world (`SPYRE_TP_WORLDS`) bakes the model's whole
+    //    ladder again, by design, so each world's ladder is held to the ceiling on its own: a world
+    //    whose rungs grew is refused by name, and a world added to the row is not mistaken for one.
+    //    A bundle's world is the window it bakes (`collective::baked_window`), one with none is the
+    //    world of one. MEASURED: granite-2b fp8 at worlds 1/2/4/8 is 13,779 groups in all.
     #[cfg(feature = "spyre-hw")]
     {
         let layers: usize =
@@ -10154,16 +10160,35 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
             }) as usize;
         let per_layer = scratchy_target_spyre::superdsc_bake::BakeBudget::MAX_GROUPS_PER_LAYER;
         let ceiling = layers * per_layer;
-        if n_groups > ceiling {
-            panic!(
-                "[spyre-superdsc] {}: {n_groups} launch group(s) across {layers} layer(s) is \
-                 PAST THE BAKE BUDGET of {per_layer} groups per layer ({ceiling} total). Group \
-                 count is the dxp floor's multiplication lever — a ladder this wide is a bake \
-                 that grew, not one a wider queue absorbs. Moving the budget is a measured \
-                 decision that names the bake; this refusal is the measurement.",
-                model.source_stem
-            );
+        let mut per_world = std::collections::BTreeMap::<u32, usize>::new();
+        for b in &bundles {
+            let world = scratchy_target_spyre::bundle_code::collective::baked_window(&b.layout)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "[spyre-superdsc] bundle {} bakes no one window: {e:?}",
+                        b.fp
+                    )
+                })
+                .map_or(1, |w| w.world().get());
+            *per_world.entry(world).or_default() += b.groups.len();
         }
+        for (world, groups) in &per_world {
+            if *groups > ceiling {
+                panic!(
+                    "[spyre-superdsc] {}: {groups} launch group(s) in the world of {world} across \
+                     {layers} layer(s) is PAST THE BAKE BUDGET of {per_layer} groups per layer \
+                     ({ceiling} per world). Group count is the dxp floor's multiplication lever — \
+                     a ladder this wide is a bake that grew, not one a wider queue absorbs. Moving \
+                     the budget is a measured decision that names the bake; this refusal is the \
+                     measurement.",
+                    model.source_stem
+                );
+            }
+        }
+        eprintln!(
+            "[spyre-superdsc] {}: launch groups per world {per_world:?} (ceiling {ceiling} each)",
+            model.source_stem
+        );
     }
     // The programs are `const` items and the placement tables `static`s; both precede the
     // `inventory::submit!`s that name them.
