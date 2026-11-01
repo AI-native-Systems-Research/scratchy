@@ -66,18 +66,19 @@ pub fn cb_pipeline<'g>(
 }
 
 /// WHERE A CONSUME'S SEND READS AND LANDS — segment-relative, as the bundle baked it. The source is
-/// the consume's fragment inside the operand's placement; the landing is this card's own receive
-/// window (the layout is card-symmetric, so the peer's window is at the same place). Only the
-/// segment BASES are bound at load: the launch the send is aimed from supplies them, exactly as it
-/// supplies them to the consume's own program.
+/// the consume's fragment inside the operand's placement; the landing is the sender's region of the
+/// receiver's window, at the same place on every card (the layout is card-symmetric), so the sender
+/// names it from its own window ([`TpSend::messages`]). Only the segment BASES are bound at load: the
+/// launch the send is aimed from supplies them, exactly as it supplies them to the consume's own
+/// program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TpSend {
     /// The program segment the operand lives in.
     pub source_segment: u8,
     /// The fragment's first byte inside that segment.
     pub source_offset: u64,
-    /// The window cut's offset inside [`RecvWindow::SEGMENT`].
-    pub window_offset: u64,
+    /// The window it lands in, inside [`RecvWindow::SEGMENT`].
+    pub window: RecvWindow,
     pub bytes: CutPayload,
     /// The cut it lands in — message `m` lands in slot `(cut, m)`, signalling that slot's sid.
     pub cut: WindowCut,
@@ -96,8 +97,10 @@ pub enum SendUnplaced {
     WindowMisplaced { segment: u32, bank: u32 },
     /// The window's cuts are not equal, adjacent and in order — not one window.
     WindowCutsApart { cut: usize, offset: u64, size: u64 },
-    /// The fragment is wider than one window cut.
+    /// The fragment is wider than one peer's region of a window cut.
     WindowTooSmall { window: u64, bytes: u64 },
+    /// The window's cuts hold a count of regions no baked world has.
+    WindowRegions { regions: u32 },
     /// The operand lives in the weight segment, which a consume launch pins to layer 0's bank-0
     /// copy — a layer-shifted operand would be read at the wrong layer.
     OperandInWeightSegment(crate::PlaceId),
@@ -119,34 +122,45 @@ pub enum SendUnplaced {
 /// A cut missing or misplaced, cuts that are not one window, or an address that is not whole
 /// flits — by name.
 pub fn baked_window(layout: &crate::BundleLayout<'_>) -> Result<Option<RecvWindow>, SendUnplaced> {
-    let cuts = ktir_superdsc::reserved_tids::TP_RECV_CUT_TIDS;
-    let Some(first) = layout.place(crate::PlaceId::Act(cuts[0])) else {
+    use ktir_superdsc::reserved_tids::tp_recv_tid;
+    let Some(first) = layout.place(crate::PlaceId::Act(tp_recv_tid(0, 0))) else {
         return Ok(None);
     };
-    for (i, &tid) in cuts.iter().enumerate() {
-        let cut = layout
-            .place(crate::PlaceId::Act(tid))
-            .ok_or(SendUnplaced::Window)?;
-        if cut.segment != RecvWindow::SEGMENT || cut.bank != 0 {
-            return Err(SendUnplaced::WindowMisplaced {
-                segment: cut.segment,
-                bank: cut.bank,
-            });
-        }
-        if cut.size != first.size || cut.offset != first.offset + i as u64 * first.size {
-            return Err(SendUnplaced::WindowCutsApart {
-                cut: i,
-                offset: cut.offset,
-                size: cut.size,
-            });
-        }
-    }
-    Payload::new(first.size)
-        .and_then(|cut| RecvWindow::new(first.offset, cut))
-        .map(Some)
+    // The world is the count of peers' regions the first cut holds: one per peer.
+    let regions = (0..PeerRegion::MAX)
+        .take_while(|&r| {
+            layout
+                .place(crate::PlaceId::Act(tp_recv_tid(0, r)))
+                .is_some()
+        })
+        .count() as u32;
+    let world = TpWorld::named(regions + 1).ok_or(SendUnplaced::WindowRegions { regions })?;
+    let window = Payload::new(first.size)
+        .and_then(|region| RecvWindow::new(first.offset, region, world))
         .ok_or(SendUnplaced::Misaligned {
             offset: first.offset,
-        })
+        })?;
+    for (i, cut) in (0..WINDOW_CUTS).map(|k| (k, WindowCut::of_collective(k))) {
+        for region in PeerRegion::of_world(world) {
+            let placed = layout
+                .place(crate::PlaceId::Act(cut.tid(region)))
+                .ok_or(SendUnplaced::Window)?;
+            if placed.segment != RecvWindow::SEGMENT || placed.bank != 0 {
+                return Err(SendUnplaced::WindowMisplaced {
+                    segment: placed.segment,
+                    bank: placed.bank,
+                });
+            }
+            if placed.size != first.size || placed.offset != window.region_offset(cut, region) {
+                return Err(SendUnplaced::WindowCutsApart {
+                    cut: i,
+                    offset: placed.offset,
+                    size: placed.size,
+                });
+            }
+        }
+    }
+    Ok(Some(window))
 }
 
 impl TpSend {
@@ -160,12 +174,14 @@ impl TpSend {
     ) -> Result<Self, SendUnplaced> {
         let window = baked_window(layout)?.ok_or(SendUnplaced::Window)?;
         let bytes = consume.fragment.bytes();
-        if bytes.get() > window.cut().get() {
+        if bytes.get() > window.region().get() {
             return Err(SendUnplaced::WindowTooSmall {
-                window: window.cut().get(),
+                window: window.region().get(),
                 bytes: bytes.get(),
             });
         }
+        // Every region of a cut starts a whole region past the cut's first, so one aligned cut
+        // aligns them all.
         let landing = window.cut_offset(consume.cut);
         let operand = layout
             .place(consume.operand)
@@ -191,10 +207,10 @@ impl TpSend {
             // `Placement::segment` is below `NUM_SEGMENTS`.
             source_segment: operand.segment as u8,
             source_offset,
-            window_offset: landing,
-            // A fragment within one cut is within the cut's slots (`RecvWindow::new`).
+            window,
+            // A fragment within one region is within the region's slots (`RecvWindow::new`).
             bytes: CutPayload::new(bytes).ok_or(SendUnplaced::WindowTooSmall {
-                window: window.cut().get(),
+                window: window.region().get(),
                 bytes: bytes.get(),
             })?,
             cut: consume.cut,
@@ -221,17 +237,27 @@ impl TpSend {
     /// landing slot of its own ([`CutPayload::landings`]). Every one increments its slot's
     /// write-done counter on the peer once, so a send of N messages is waited for N times, once
     /// per slot (a wait consumes exactly one count): the pipeline issues N waits for it.
-    pub fn messages(self) -> impl Iterator<Item = TpMessage> {
+    ///
+    /// `region` is the sender's region of the receiver's window
+    /// ([`TpIdentity::region_of`]`(receiver, sender)`) — where on that card this rank's messages land.
+    pub fn messages(self, region: PeerRegion) -> impl Iterator<Item = TpMessage> {
+        let landing = self.window.region_offset(self.cut, region);
         self.bytes
             .landings(self.cut)
             .map(move |(slot, m)| TpMessage {
                 source_offset: self.source_offset + m.offset,
-                window_offset: self.window_offset + m.offset,
+                window_offset: landing + m.offset,
                 bytes: m.bytes,
                 first: m.first,
                 last: m.last,
                 slot,
             })
+    }
+
+    /// The landing slots its messages take, in order — the same in every peer's region, so a wait
+    /// for any peer's twin send counts these.
+    pub fn slots(self) -> impl Iterator<Item = LandingSlot> {
+        self.bytes.landings(self.cut).map(|(slot, _)| slot)
     }
 }
 
@@ -417,6 +443,16 @@ mod tests {
         window_of(WireBytes::CAP.get())
     }
 
+    /// The window [`window`] places: a two-rank world's, one region per cut.
+    fn two_rank_window() -> RecvWindow {
+        RecvWindow::new(1 << 20, Payload::from(WireBytes::CAP), TpWorld::of::<2>()).unwrap()
+    }
+
+    /// A two-rank world's one peer region.
+    fn only_region() -> PeerRegion {
+        PeerRegion::of_world(TpWorld::of::<2>()).next().unwrap()
+    }
+
     fn with(mut window: Vec<crate::Placement>, more: crate::Placement) -> Vec<crate::Placement> {
         window.push(more);
         window
@@ -445,15 +481,20 @@ mod tests {
         let places = layout(with(window(), operand));
         for k in 0..WINDOW_CUTS {
             let cut = WindowCut::of_collective(k);
+            let send = TpSend::resolve(&places, TpConsume { cut, ..consume }).unwrap();
             assert_eq!(
-                TpSend::resolve(&places, TpConsume { cut, ..consume }).unwrap(),
+                send,
                 TpSend {
                     source_segment: 0,
                     source_offset: 8192 + fragment.byte_offset(),
-                    window_offset: (1 << 20) + k as u64 * WireBytes::CAP.get(),
+                    window: two_rank_window(),
                     bytes: CutPayload::new(fragment.bytes()).unwrap(),
                     cut,
                 }
+            );
+            assert_eq!(
+                send.messages(only_region()).next().unwrap().window_offset,
+                (1 << 20) + k as u64 * WireBytes::CAP.get()
             );
         }
         assert_ne!(fragment.byte_offset(), 0);
@@ -464,8 +505,10 @@ mod tests {
     #[test]
     fn the_baked_window_is_its_cuts_read_back() {
         let window = baked_window(&layout(window())).unwrap().unwrap();
+        assert_eq!(window, two_rank_window());
         assert_eq!(window.offset(), 1 << 20);
-        assert_eq!(window.cut(), Payload::from(WireBytes::CAP));
+        assert_eq!(window.region(), Payload::from(WireBytes::CAP));
+        assert_eq!(window.world(), TpWorld::of::<2>());
         assert_eq!(window.size(), WINDOW_CUTS as u64 * WireBytes::CAP.get());
         assert_eq!(baked_window(&layout(vec![])), Ok(None));
     }
@@ -492,13 +535,16 @@ mod tests {
         let landed: Vec<(usize, u64)> = sends(&places, &groups)
             .unwrap()
             .into_iter()
-            .map(|s| (s.group, s.send.window_offset))
+            .map(|s| {
+                let first = s.send.messages(only_region()).next().unwrap();
+                (s.group, first.window_offset)
+            })
             .collect();
         let cap = WireBytes::CAP.get();
         assert_eq!(landed, [(0, 1 << 20), (2, (1 << 20) + cap), (3, 1 << 20)]);
         assert_eq!(WindowCut::baked(1), WindowCut::of_collective(1));
         assert_eq!(
-            WindowCut::of_collective(1).tid(),
+            WindowCut::of_collective(1).tid(only_region()),
             ktir_superdsc::reserved_tids::TP_RECV_CUT_TIDS[1]
         );
     }
@@ -510,21 +556,25 @@ mod tests {
     fn a_wide_send_is_a_run_of_messages_at_matching_offsets() {
         let cap = WireBytes::CAP.get();
         let cut = WindowCut::of_collective(1);
+        let window = RecvWindow::new(
+            1 << 30,
+            Payload::new(u64::from(MAX_CUT_MESSAGES) * cap).unwrap(),
+            TpWorld::of::<2>(),
+        )
+        .unwrap();
         let send = TpSend {
             source_segment: 0,
             source_offset: 8192,
-            window_offset: 1 << 30,
+            window,
             bytes: CutPayload::new(Payload::new(2 * cap + 256).unwrap()).unwrap(),
             cut,
         };
-        let m: Vec<TpMessage> = send.messages().collect();
+        let m: Vec<TpMessage> = send.messages(only_region()).collect();
         assert_eq!(m.len(), 3);
+        let land = window.region_offset(cut, only_region());
         for (k, x) in m.iter().enumerate() {
             let at = k as u64 * cap;
-            assert_eq!(
-                (x.source_offset, x.window_offset),
-                (8192 + at, (1 << 30) + at)
-            );
+            assert_eq!((x.source_offset, x.window_offset), (8192 + at, land + at));
             assert_eq!((x.first, x.last), (k == 0, k == 2));
             assert_eq!(x.slot, LandingSlot::of(cut, k as u32).unwrap());
         }

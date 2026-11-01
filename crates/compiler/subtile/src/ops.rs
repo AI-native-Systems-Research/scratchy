@@ -162,7 +162,7 @@ macro_rules! for_each_subop {
                 rows = [in0], gemm_w = [none], tp = [whole];
             Mean [SubOp::Mean] arity = (|n| n == 1), cols = [one], rows = [in0], gemm_w = [none], tp = [rowwise];
             // Inserted by `tensor_parallel::shard` alone — never stated by a front end.
-            AllReduce [SubOp::AllReduce] arity = (|n| n == 1), cols = [in0], rows = [in0],
+            AllReduce [SubOp::AllReduce { .. }] arity = (|n| n == 1), cols = [in0], rows = [in0],
                 gemm_w = [none], tp = [collective];
             AllGather [SubOp::AllGather { .. }] arity = (|n| n == 1), cols = [field cols],
                 rows = [in0], gemm_w = [none], tp = [collective];

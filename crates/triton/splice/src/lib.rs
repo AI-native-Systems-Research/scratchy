@@ -374,7 +374,7 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         // stream — p2p sends to the peers' receive windows, a write-done wait, then the
         // consume — and its only kernel (the consume's add) is the `Add` row's. The spyre
         // emitter's collective arm owns it; no Triton program states a card-to-card transfer.
-        SubOp::AllReduce | SubOp::AllGather { .. } => TritonKernelRow::Refused(
+        SubOp::AllReduce { .. } | SubOp::AllGather { .. } => TritonKernelRow::Refused(
             "a collective lowers as a CB sequence by the spyre emitter's collective arm, \
              never as one spliced kernel",
         ),
@@ -597,7 +597,7 @@ fn gathers_to_width<F: scratchy_subtile::subtile_ir::RopeForm>(
         .iter()
         .filter(|n| n.inputs.iter().any(|i| i.tensor == t))
         .any(|n| match &n.op {
-            SubOp::AllGather { cols } => *cols == width,
+            SubOp::AllGather { cols, .. } => *cols == width,
             SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if n.inputs.len() == 1 => {
                 gathers_to_width(ir, n.output.tensor, width)
             }
@@ -2801,7 +2801,7 @@ fn matmul_out_width<F: scratchy_subtile::subtile_ir::RopeForm>(
                     | SubOp::RmsNorm { .. }
                     | SubOp::Elementwise(_)
                     | SubOp::SiluMul
-                    | SubOp::AllReduce
+                    | SubOp::AllReduce { .. }
                     | SubOp::AllGather { .. }
             )
         });

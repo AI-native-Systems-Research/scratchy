@@ -391,7 +391,7 @@ pub(crate) fn site_cbs(tp: SiteTp, launch: BatchedCompute) -> Result<Vec<Batched
                 else {
                     bail!("group {index} sends with no binding or after its launch");
                 };
-                for m in send.messages() {
+                for m in send.messages(route.lands_in()) {
                     out.push(BatchedCb::Send(RdmaSend {
                         sid: route.send_sid(m.slot),
                         dest_tid: route.dest_tid(),
@@ -413,9 +413,9 @@ pub(crate) fn site_cbs(tp: SiteTp, launch: BatchedCompute) -> Result<Vec<Batched
                 let Some(BoundCollective { send, route }) = bound else {
                     bail!("group {index} waits with no binding");
                 };
-                for m in send.messages() {
+                for slot in send.slots() {
                     out.push(BatchedCb::Wait {
-                        sid: route.wait_sid(m.slot),
+                        sid: route.wait_sid(slot),
                     });
                 }
             }
@@ -1194,6 +1194,11 @@ pub(crate) fn patch_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A two-rank world's window at 1 MiB, one message-wide region per cut.
+    fn two_rank_window() -> RecvWindow {
+        RecvWindow::new(1 << 20, Payload::from(WireBytes::CAP), TpWorld::of::<2>()).unwrap()
+    }
     use crate::bundle_code::collective::{
         CollectiveKind, CutPayload, LandingSlot, Payload, Sid, TpWorld, WindowCut, WireBytes,
         fragments,
@@ -1243,7 +1248,7 @@ mod tests {
         let send = TpSend {
             source_segment: 3,
             source_offset: 4096,
-            window_offset: 1 << 20,
+            window: two_rank_window(),
             bytes: CutPayload::new(Payload::new(4096).unwrap()).unwrap(),
             cut,
         };
@@ -1277,7 +1282,8 @@ mod tests {
         );
         assert_eq!(
             (region(&s.window), s.window.segment, s.window.offset),
-            (11, 1, 1 << 20)
+            (11, 1, (1 << 20) + WireBytes::CAP.get()),
+            "cut 1 is one region past the window's first"
         );
         assert!(matches!(cbs[1], BatchedCb::Wait { sid } if sid == peer));
         assert!(matches!(cbs[2], BatchedCb::Consume(_)));
@@ -1295,7 +1301,7 @@ mod tests {
         let send = TpSend {
             source_segment: 0,
             source_offset: 0,
-            window_offset: 1 << 20,
+            window: two_rank_window(),
             bytes: CutPayload::new(Payload::new(cap + 4096).unwrap()).unwrap(),
             cut,
         };

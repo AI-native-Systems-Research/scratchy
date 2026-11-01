@@ -465,7 +465,7 @@ pub const RESERVED_REGIONS: [TidRegion; 8] = [
     TidRegion {
         name: "tp_recv",
         base: TP_RECV_TID,
-        slots: TP_RECV_CUT_TIDS.len() as u32,
+        slots: TP_RECV_CUT_TIDS.len() as u32 * crate::collective::PeerRegion::MAX,
     },
 ];
 
@@ -484,6 +484,14 @@ pub const TP_RECV_TID: u32 = u32::MAX - 2_000_171;
 /// never lands where this rank still reads `k`. Both cuts are placements OF the one window, never
 /// a second window that could disagree with it.
 pub const TP_RECV_CUT_TIDS: [u32; 2] = [TP_RECV_TID, TP_RECV_TID - 1];
+
+/// ⭐ THE TID OF ONE PEER'S REGION OF ONE CUT — every cut holds one region per sending peer
+/// (`collective::PeerRegion`), each its own placement, so a consume binds exactly the fragments it
+/// reads. Region 0 of cut `c` is [`TP_RECV_CUT_TIDS`]`[c]`: a two-rank window, one region per cut,
+/// keeps the tids it has always had. Region `r` sits `r` whole cut-runs below.
+pub const fn tp_recv_tid(cut: u32, region: u32) -> u32 {
+    TP_RECV_TID - (region * TP_RECV_CUT_TIDS.len() as u32 + cut)
+}
 
 /// Is `tid` one of the reserved synthetics — a sentinel, a slot of any region, or `LAST_HIDDEN_TID`
 /// (which sits at `u32::MAX`, one ABOVE the sentinels region's base, so a region scan alone misses

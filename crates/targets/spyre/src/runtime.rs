@@ -34,7 +34,7 @@ const _: () = {
     );
 };
 
-use crate::bundle_code::collective::{LandingSlot, RecvWindow, Sid, TpIdentity};
+use crate::bundle_code::collective::{LandingSlot, PeerRegion, RecvWindow, Sid, TpIdentity};
 use flex_rs::address::{Chunk, CompositeAddress, LogicalAddress, RegionId};
 use flex_rs::allocator::{
     AllocationDirective, AllocationDirectiveError, FlexAllocator, FlexAllocatorError,
@@ -1496,15 +1496,33 @@ pub struct CardPair {
 pub struct PeerRoute {
     me: TpIdentity,
     peer: TpIdentity,
+    /// This rank's region of the peer's window — where its sends land.
+    lands_in: PeerRegion,
+    /// The peer's region of this card's window — where the peer's sends land.
+    hears_in: PeerRegion,
 }
 
 impl PeerRoute {
     /// The route between `me` and its peer. `None` in a world of one.
     pub fn of(me: TpIdentity) -> Option<Self> {
+        let peer = me.peer()?;
         Some(Self {
             me,
-            peer: me.peer()?,
+            peer,
+            lands_in: peer.region_of(me)?,
+            hears_in: me.region_of(peer)?,
         })
+    }
+
+    /// This rank's region of the peer's window: where its messages land on the peer's card.
+    pub fn lands_in(self) -> PeerRegion {
+        self.lands_in
+    }
+
+    /// The peer's region of this card's window: where the peer's messages land, and where this
+    /// card's `XSEG` entries for the peer's slots point.
+    pub fn hears_in(self) -> PeerRegion {
+        self.hears_in
     }
 
     /// The sid this rank's message into `slot` signals on.
@@ -1774,9 +1792,9 @@ pub fn point_landing_slots(link: &PeerLink, window_region: &DevAddr) -> Result<(
     }
     let _ = link.landing.set(landing);
     let mut pointed: Vec<String> = Vec::new();
-    for (slot, at) in link.window.slots() {
-        // The slot's own extent: one message, or the cut's remainder for its last.
-        let len = (link.window.cut().get() - u64::from(slot.message()) * cap).min(cap);
+    for (slot, at) in link.window.slots(link.route.hears_in()) {
+        // The slot's own extent: one message, or the region's remainder for its last.
+        let len = (link.window.region().get() - u64::from(slot.message()) * cap).min(cap);
         let va = flex_rs::scheduler::landing_va_bytes(
             &resolver,
             &RdmaOperand {
@@ -1932,7 +1950,12 @@ mod tests {
     #[test]
     fn a_link_refuses_no_peer_and_a_self_loop_before_touching_the_card() {
         use crate::bundle_code::collective::{Payload, TpWorld, WireBytes};
-        let window = RecvWindow::new(1 << 20, Payload::from(WireBytes::CAP)).unwrap();
+        let window = RecvWindow::new(
+            1 << 20,
+            Payload::from(WireBytes::CAP),
+            crate::bundle_code::collective::TpWorld::of::<2>(),
+        )
+        .unwrap();
         let alone = TpWorld::of::<1>().ranks().next().unwrap();
         let card = |bus: &str| PciAddress::parse(&format!("0000:{bus}:00.0")).unwrap();
         let pair = |own, peer| CardPair {

@@ -850,14 +850,15 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | SubOp::VisionRope
             | SubOp::GatedDeltaNet
             | SubOp::Mean
-            | SubOp::AllReduce
+            | SubOp::AllReduce { .. }
             | SubOp::RouteSoftmax
             | SubOp::RouteArgsort
             | SubOp::RouteGatherScores
             | SubOp::RouteRenorm
             | SubOp::ExpertUnsort => {}
-            // The whole width a gather restores is class: two widths are two exchanges.
-            SubOp::AllGather { cols } => cols.hash(h),
+            // The whole width a gather restores is class: two widths are two exchanges. The world
+            // is not: every collective of one forward runs over the same one.
+            SubOp::AllGather { cols, .. } => cols.hash(h),
             // The vocab and the row count are class: two vocab widths are
             // different programs (every staged table and the whole row's tile
             // shape key off it), and so are two batch widths (the grid and
@@ -1277,15 +1278,23 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     // ⛔ NEVER STATED BY A FRONT END. Only `crate::tensor_parallel::shard` inserts these, at
     // exactly the edges where a value's placement does not meet its consumer's demand, so the
     // per-rank forward that carries them is the one the analysis proved equal to the unsharded
-    // one. Their operand is a value in rank-local shape; every rank runs the same op.
+    // one. Their operand is a value in rank-local shape; every rank runs the same op. Each states
+    // the `world` it runs over — the analysis's, one for every collective of a forward — so every
+    // reader of the graph (a target's consume, its receive window, the host reference) reads the
+    // rank count off the op it lowers.
     /// The sum over every rank of a PARTIAL value: `out = Σ_r x_r`, summed in ABSOLUTE RANK
     /// ORDER (`((x_0 + x_1) + x_2) + …`) on every rank, so the replicated result is
     /// bit-identical across ranks. `inputs` = `[x]`; output the shape of `x`.
-    AllReduce,
+    AllReduce {
+        world: crate::tensor_parallel::WorldSize,
+    },
     /// The concatenation over every rank of a column-SPLIT value: rank `r`'s `[rows, cols / W]`
     /// block lands at columns `[r · cols / W, (r + 1) · cols / W)`. `inputs` = `[x]`; `cols` is the
     /// WHOLE width the gather restores.
-    AllGather { cols: u32 },
+    AllGather {
+        cols: u32,
+        world: crate::tensor_parallel::WorldSize,
+    },
 
     // ── A MoE block, op by op (see `NumExperts`) ──────────────────
     /// The router's own pre-norm: `rmsnorm(x, router.scale)`. `inputs` = `[x, router]`.
@@ -2868,7 +2877,7 @@ pub fn mint_embed_chain<F: RopeForm>(
     for node in graph.nodes.iter().skip(1) {
         if node.inputs.iter().any(|i| i.tensor == embed_row) {
             assert_eq!(
-                matches!(node.op, SubOp::AllReduce),
+                matches!(node.op, SubOp::AllReduce { .. }),
                 split,
                 "mint_embed_chain: the embed rows t{} are read by a {:?} — over {} table the \
                  gather's rows are read {}",
@@ -3545,7 +3554,7 @@ pub fn eval_node<F: RopeForm>(
         // ⛔ A COLLECTIVE HAS NO ONE-RANK VALUE: it reads every rank's operand. The sharded
         // forward that carries one is evaluated by `tensor_parallel::eval_ranks`, which runs
         // every other node through here and the collectives across ranks itself.
-        SubOp::AllReduce | SubOp::AllGather { .. } => panic!(
+        SubOp::AllReduce { .. } | SubOp::AllGather { .. } => panic!(
             "{} read on one rank: a sharded forward is evaluated by \
              tensor_parallel::eval_ranks",
             node.op.name()
@@ -4325,8 +4334,8 @@ pub fn lower_region(
             SubOp::GatedDeltaNet => SubOp::GatedDeltaNet,
             SubOp::Mamba2 { inner } => SubOp::Mamba2 { inner },
             SubOp::Mean => SubOp::Mean,
-            SubOp::AllReduce => SubOp::AllReduce,
-            SubOp::AllGather { cols } => SubOp::AllGather { cols },
+            SubOp::AllReduce { world } => SubOp::AllReduce { world },
+            SubOp::AllGather { cols, world } => SubOp::AllGather { cols, world },
             SubOp::RouterNorm { eps, router } => SubOp::RouterNorm { eps, router },
             SubOp::RouterLogits { experts, router } => SubOp::RouterLogits { experts, router },
             SubOp::RouteSoftmax => SubOp::RouteSoftmax,
@@ -5695,7 +5704,10 @@ mod tests {
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
                 OpDesc {
-                    op: SubOp::AllGather { cols: 4096 },
+                    op: SubOp::AllGather {
+                        cols: 4096,
+                        world: crate::tensor_parallel::WorldSize::of::<2>(),
+                    },
                     m: 4,
                     inputs: vec![InputRef::Op(0)],
                 },
