@@ -124,6 +124,16 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         L::MatmulTile { .. } | L::VarlenAttention { .. } | L::EncoderAttn { .. } => {
             FRESH.reads_across()
         }
+        // Splash's drafter: a convolution reads the row before each row of a block, an attention
+        // every row of it, each into a buffer of its own; a capture copies its rows out, a context
+        // commit writes the ring and a selection the drafter's runtime outputs, each publishing
+        // its operand 0 as it found it.
+        L::DraftConv { .. } | L::DraftAttention { .. } => FRESH.reads_across(),
+        L::CaptureHidden { .. }
+        | L::DraftContextKv { .. }
+        | L::DraftWindowStore
+        | L::DraftWindowLoad
+        | L::DraftSelect => FRESH.output(A::Operand(OperandIx(0))),
         // Two-output ops bind a SECOND buffer (VisionRope's k', GateSplit's gate).
         L::VisionRope => FRESH.reads_across().two_outputs(),
         L::GateSplit { .. } => FRESH.two_outputs(),
@@ -241,7 +251,14 @@ pub const METAL_KV_CODEC: KvCodecFacts = {
 /// TODO: derive it, and the decoder ladder's verify-sized rungs, from the compiled heads'
 /// `spec_verify_rows`: a head budget past 8 rows puts verify steps onto the 64-row
 /// prefill-shaped tape.
-pub const METAL_VERIFY_ROWS: u32 = 8;
+pub const METAL_VERIFY_ROWS: u32 =
+    scratchy_forward_compiler::DFLASH2_BLOCK_LANES as u32 * METAL_LANE_VERIFY_ROWS;
+
+/// A verify lane's rows: a sequence's token and its drafts (Splash's SPLASH_TARGET_VERIFY_ROWS), at
+/// most a Gated-DeltaNet verify's rows a sequence (`gdn_verify.metal` GDN_VER_ROWS). A
+/// verify-sized bucket holds up to [`scratchy_forward_compiler::DFLASH2_BLOCK_LANES`] such lanes,
+/// each its own sequence: every decode-shaped kernel reads a sequence's rows from `cu_seqlens`.
+pub const METAL_LANE_VERIFY_ROWS: u32 = 8;
 
 /// Whether a guarded codec step runs at a bake, and under which runtime gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,10 +372,17 @@ pub const METAL_GROUPED_PAIRS_PER_EXPERT: f32 = 4.0;
 
 /// The pairs per expert at which a bake sorts the per-pair matvecs' rows by expert, so an expert
 /// two rows pick is read once: where it was measured to win (#232: Gemma-4's 128 experts at
-/// bucket 8, the full conc-8 decode step). The sorted matvecs run the bucket's every pair, so
-/// thicker, they lose to the gathered ones on a short prompt (Qwen3.6, 2 per expert: 161 ms vs
-/// 98 ms).
+/// bucket 8, the full conc-8 decode step). Thicker, the sorted matvecs lose to the gathered ones on
+/// a short prompt (Qwen3.6, 2 per expert: 161 ms vs 98 ms).
 pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.5..1.0;
+
+/// The bucket at which a bake sorts the per-pair matvecs' rows by expert whatever their density:
+/// a lane's verify, Splash's one decode plan (~/git/splash runtime/ops/MoE.cpp:290 `decodePlan`,
+/// lanes × SPLASH_TARGET_VERIFY_ROWS rows), which groups every route by expert on 8-row tiles
+/// (ops/MoE.hpp `MoeConfig::expertTile`, M8 for every decode plan; `moeGgufPrefillTile` picks only a
+/// prefill plan's tile height). Above `METAL_SORTED_PAIRS` pairs alone: below it the sort is mlx's
+/// to refuse (gpt-oss's 32 at bucket 8 gather).
+pub const METAL_DECODE_GROUPED_ROWS: u32 = METAL_VERIFY_ROWS;
 
 /// The bucket rows from which a gathered bake's gate/up command runs the pairs that share an
 /// expert in the expert's first pair (`SharedExperts::InFirstPair`, up to [`METAL_VERIFY_ROWS`]):
@@ -644,6 +668,8 @@ const F_ROUTED_WIDE: FoldPattern<MetalFusion> = FoldPattern::RoutedExperts {
         grouped_bundles: METAL_GROUPED_EXPERTS,
         sorted_per_expert: METAL_SORTED_PAIRS_PER_EXPERT,
         grouped_per_expert: METAL_GROUPED_PAIRS_PER_EXPERT,
+        decode_rows: METAL_DECODE_GROUPED_ROWS,
+        lane_rows: METAL_LANE_VERIFY_ROWS,
     },
     kernel: MetalFusion::MoeRouted,
 };
@@ -658,6 +684,8 @@ const F_ROUTED_NARROW: FoldPattern<MetalFusion> = FoldPattern::RoutedExperts {
         grouped_bundles: METAL_GROUPED_EXPERTS,
         sorted_per_expert: METAL_SORTED_PAIRS_PER_EXPERT,
         grouped_per_expert: METAL_GROUPED_PAIRS_PER_EXPERT,
+        decode_rows: METAL_DECODE_GROUPED_ROWS,
+        lane_rows: METAL_LANE_VERIFY_ROWS,
     },
     kernel: MetalFusion::MoeRouted,
 };

@@ -68,9 +68,13 @@ use crate::tape::constants::{TapeVariant, UnboundConstant};
 /// dispatch covers, its last threadgroup moving back to the last `GEMV_ROWS` rows.
 pub const GEMV_ROWS: u32 = 4;
 
-/// The most input rows the GEMV takes (`MAX_ROWS` in `gemm.metal`): a speculative verify step's
-/// rows, each weight slice loaded once for all of them. More rows run a tiled GEMM.
-pub const GEMV_MAX_ROWS: u32 = 8;
+/// The most input rows the GEMV takes (`MAX_ROWS` in `gemm.metal`): a verify-sized bucket's
+/// ([`crate::op_abi::METAL_VERIFY_ROWS`], up to four 8-row lanes), run in chunks of
+/// [`GEMV_CHUNK_ROWS`], each weight slice read from DRAM once. More rows run a tiled GEMM.
+pub const GEMV_MAX_ROWS: u32 = crate::op_abi::METAL_VERIFY_ROWS;
+
+/// The rows a GEMV chunk sums in registers (`CHUNK` in `gemm.metal`): the 8-row GEMV's every row.
+pub const GEMV_CHUNK_ROWS: u32 = 8;
 
 /// Rows from which a bf16 GEMM runs blocked (`gemm_bf16_blocked`): 2.1-2.2x the 8×8-tile GEMM at
 /// a 2048-row MoE router on base M5 (128 × 2816, 256 × 2048), ahead from 256 rows; under them
@@ -293,7 +297,15 @@ pub fn gemm_pipeline(
         }
     };
     let dispatch = DispatchShape {
-        threadgroups: (n.div_ceil(tile), if gemv { 1 } else { m.div_ceil(tile) }, 1),
+        threadgroups: (
+            n.div_ceil(tile),
+            if gemv {
+                m.div_ceil(GEMV_CHUNK_ROWS)
+            } else {
+                m.div_ceil(tile)
+            },
+            1,
+        ),
         threads_per_threadgroup: (threads, 1, 1),
         m_scaling: None,
     };
@@ -594,6 +606,21 @@ mod tests {
                 | KernelId::GateSplit
                 | KernelId::GateScale
                 | KernelId::GatedDeltaNet
+                | KernelId::CaptureRows
+                | KernelId::DraftConv
+                | KernelId::DraftAttentionQkv
+                | KernelId::DraftAttentionSplit
+                | KernelId::DraftAttentionReduce
+                | KernelId::DraftAttentionReorder
+                | KernelId::DraftContextCommit
+                | KernelId::DraftContextPrefill
+                | KernelId::DraftWindowStoreCommit
+                | KernelId::DraftWindowStorePrefill
+                | KernelId::DraftWindowLoad
+                | KernelId::DraftSelectTop16
+                | KernelId::DraftSelectEdges
+                | KernelId::DraftSelectWalk
+                | KernelId::DraftVerifyRows
                 | KernelId::SplitKReduceSum
             | KernelId::RmsNormUnit
             | KernelId::ScalarWeightMul
@@ -618,7 +645,6 @@ mod tests {
             | KernelId::AffineGatherQmmT
             | KernelId::AffineGatherQmmTNax
             | KernelId::MoeGroupOffsets
-            | KernelId::MoeGroupInit
             | KernelId::MoeGroupScatter
             | KernelId::MoeGroupScatterQ8
             | KernelId::MoeWeightedSum
@@ -777,6 +803,21 @@ mod tests {
             | KernelId::GateSplit
             | KernelId::GateScale
             | KernelId::GatedDeltaNet
+            | KernelId::CaptureRows
+            | KernelId::DraftConv
+            | KernelId::DraftAttentionQkv
+            | KernelId::DraftAttentionSplit
+            | KernelId::DraftAttentionReduce
+            | KernelId::DraftAttentionReorder
+            | KernelId::DraftContextCommit
+            | KernelId::DraftContextPrefill
+            | KernelId::DraftWindowStoreCommit
+            | KernelId::DraftWindowStorePrefill
+            | KernelId::DraftWindowLoad
+            | KernelId::DraftSelectTop16
+            | KernelId::DraftSelectEdges
+            | KernelId::DraftSelectWalk
+            | KernelId::DraftVerifyRows
             | KernelId::SplitKReduceSum
             | KernelId::RopeOnceNax
             | KernelId::RopeOnceSteel
@@ -804,7 +845,6 @@ mod tests {
             | KernelId::AffineGatherQmmT
             | KernelId::AffineGatherQmmTNax
             | KernelId::MoeGroupOffsets
-            | KernelId::MoeGroupInit
             | KernelId::MoeGroupScatter
             | KernelId::MoeGroupScatterQ8
             | KernelId::MoeWeightedSum

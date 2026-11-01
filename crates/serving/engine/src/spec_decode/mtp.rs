@@ -190,25 +190,45 @@ use super::proposer::{Proposer, ProposerStepCtx};
 /// `spec_drafts`). A step of few sequences drafts the most, a larger one fewer, and one past
 /// [`Self::max_seqs`] none: its verify step would leave the verify-shaped bucket for a
 /// prefill-shaped one, where a verify row costs what a prompt row does.
+///
+/// A block drafter's sequences each draft all of its `drafts` or none (`block`): its pass drafts
+/// a block — a sequence's newest token and a row a draft — whatever a step verifies of it. Its
+/// `verify_rows` are a LANE's (Splash's `SPLASH_TARGET_VERIFY_ROWS`), and a step verifies up to
+/// [`BLOCK_LANES`] lanes side by side, each its own block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DraftBudget {
     pub drafts: usize,
     pub verify_rows: usize,
+    pub block: bool,
 }
 
+/// The most lanes a block drafter's step drafts for, each verifying its own block: Splash's
+/// SPLASH_MAXIMUM_BATCH_WIDTH, the lanes its target's buckets bake the block draft for
+/// (`scratchy_forward_compiler::DFLASH2_BLOCK_LANES`, asserted equal in the worker).
+pub const BLOCK_LANES: usize = 4;
+
 impl DraftBudget {
-    /// The drafts each of a step's `seqs` sequences gets.
+    /// The drafts each of a step's `seqs` sequences gets. A block drafter's lane verifies its own
+    /// block at `verify_rows` rows, so each of up to [`BLOCK_LANES`] sequences drafts its whole
+    /// block, and a step of more drafts none.
     pub fn drafts_at(self, seqs: usize) -> usize {
+        if self.block {
+            let whole = self.drafts < self.verify_rows && seqs <= BLOCK_LANES;
+            return if whole { self.drafts } else { 0 };
+        }
         (self.verify_rows / seqs.max(1))
             .saturating_sub(1)
             .min(self.drafts)
     }
 
-    /// The most sequences a step drafts for: one draft each still fits.
+    /// The most sequences a step drafts for: one draft each still fits — a block drafter's lanes,
+    /// each holding its whole block.
     pub fn max_seqs(self) -> usize {
-        match self.drafts {
-            0 => 0,
-            _ => self.verify_rows / 2,
+        match (self.drafts, self.block) {
+            (0, _) => 0,
+            (drafts, true) if drafts < self.verify_rows => BLOCK_LANES,
+            (_, true) => 0,
+            (_, false) => self.verify_rows / 2,
         }
     }
 
@@ -304,6 +324,8 @@ pub struct StepRows<'a> {
     pub block_size: usize,
     /// Each sequence's prompt length: its tokens before its reply.
     pub prompt_lens: &'a [u32],
+    /// Each sequence's tokens so far, its prompt and its reply: where a prefill of it ends.
+    pub history_lens: &'a [u32],
     /// The rows the target samples: its tokens, a row of them a sampled row.
     pub sampled: &'a SampledRows,
 }
@@ -813,6 +835,7 @@ mod tests {
                 block_size: 16,
                 // `a`'s prompt its first 8 tokens, its reply the 3 after; `b`'s 8-token prompt.
                 prompt_lens: &[8, 8],
+                history_lens: &[11, 8],
                 sampled: &self.sampled,
             }
         }
@@ -868,6 +891,7 @@ mod tests {
                 block_ids: &self.block_ids,
                 block_size: 16,
                 prompt_lens: &[8, 8, 3],
+                history_lens: &[11, 8, 6],
                 sampled: &self.sampled,
             }
         }
@@ -897,6 +921,7 @@ mod tests {
         budget: DraftBudget {
             drafts: 3,
             verify_rows: 8,
+            block: false,
         },
         max_model_len: 4096,
         reads_target_kv: false,
@@ -912,6 +937,7 @@ mod tests {
         let qwen = DraftBudget {
             drafts: 2,
             verify_rows: 8,
+            block: false,
         };
         let at = |b: DraftBudget| (1..=6).map(|c| b.drafts_at(c)).collect::<Vec<_>>();
         assert_eq!(at(qwen), [2, 2, 1, 1, 0, 0]);
@@ -920,9 +946,40 @@ mod tests {
         let gemma = DraftBudget {
             drafts: 1,
             verify_rows: 3,
+            block: false,
         };
         assert_eq!(at(gemma), [1, 0, 0, 0, 0, 0]);
         assert_eq!((gemma.max_seqs(), gemma.draft_rows(usize::MAX)), (1, 1));
+        // Splash's DFlash2 drafter (7 drafts, a lane's 8-row verify): each of up to four lanes
+        // drafts its whole block (Splash's SPLASH_MAXIMUM_BATCH_WIDTH), a step of more none.
+        let dflash2 = DraftBudget {
+            drafts: 7,
+            verify_rows: 8,
+            block: true,
+        };
+        assert_eq!(at(dflash2), [7, 7, 7, 7, 0, 0]);
+        assert_eq!(
+            (dflash2.max_seqs(), dflash2.draft_rows(usize::MAX)),
+            (4, 28)
+        );
+        assert_eq!(
+            dflash2.draft_rows(2),
+            14,
+            "a width of two drafts two blocks"
+        );
+        // A block that does not fit its lane's verify drafts nothing.
+        let unfit = DraftBudget {
+            verify_rows: 7,
+            ..dflash2
+        };
+        assert_eq!((at(unfit), unfit.max_seqs()), (vec![0; 6], 0));
+        for c in 1..=8 {
+            assert_eq!(
+                dflash2.drafts_at(c) > 0,
+                c <= dflash2.max_seqs(),
+                "lanes at {c}"
+            );
+        }
         for b in [qwen, gemma] {
             for c in 1..=8 {
                 assert!(c * (1 + b.drafts_at(c)) <= b.verify_rows || b.drafts_at(c) == 0);
@@ -1223,6 +1280,7 @@ mod tests {
         budget: DraftBudget {
             drafts: 3,
             verify_rows: 5,
+            block: false,
         },
         ..DRAFTER
     };

@@ -39,6 +39,12 @@ use crate::shape::{Dim, Shape, canonical_mul};
 pub struct WeightsManifest {
     pub entries: BTreeMap<String, Shape>,
     pub packed_splits: BTreeMap<String, Vec<String>>,
+    /// Optional `__packed_concats__` top-level key — the reverse of `__packed_splits__`: a weight
+    /// the DSL reads as ONE projection whose rows are several on-disk projections' rows, in the
+    /// listed order (Splash's fused QKV: `self_attn.qkv_proj` ← q, k, v). Each part must itself
+    /// appear in `entries`. An MLX-affine one loads still packed
+    /// (`LinearLayer::load_affine_quant_rows_concat`).
+    pub packed_concats: BTreeMap<String, Vec<String>>,
     /// Optional `__pad_to_mult8__` top-level key — list of weights to
     /// zero-pad on a specified axis to the next multiple of 8 at CPU
     /// load time. Each entry pairs a stem (matched against the
@@ -130,6 +136,7 @@ impl WeightsManifest {
         Self {
             entries: out,
             packed_splits: BTreeMap::new(),
+            packed_concats: BTreeMap::new(),
             pad_to_mult8: Vec::new(),
             kinds: BTreeMap::new(),
         }
@@ -241,6 +248,7 @@ pub fn load_file(path: &Path) -> Result<WeightsManifest, ManifestError> {
     })?;
     let mut entries: BTreeMap<String, Shape> = BTreeMap::new();
     let mut packed_splits: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut packed_concats: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut pad_to_mult8: Vec<PadHint> = Vec::new();
     let mut kinds: BTreeMap<String, ManifestEntryKind> = BTreeMap::new();
     for (k, v) in obj {
@@ -283,12 +291,16 @@ pub fn load_file(path: &Path) -> Result<WeightsManifest, ManifestError> {
             }
             continue;
         }
-        if k == "__packed_splits__" {
+        if k == "__packed_splits__" || k == "__packed_concats__" {
             let map = v.as_object().ok_or_else(|| ManifestError::BadShape {
                 path: path.to_path_buf(),
                 weight: k.clone(),
-                reason: "`__packed_splits__` must be an object".into(),
+                reason: format!("`{k}` must be an object"),
             })?;
+            let into = match k.as_str() {
+                "__packed_splits__" => &mut packed_splits,
+                _ => &mut packed_concats,
+            };
             for (packed, targets_v) in map {
                 let arr = targets_v
                     .as_array()
@@ -306,7 +318,7 @@ pub fn load_file(path: &Path) -> Result<WeightsManifest, ManifestError> {
                     })?;
                     targets.push(s.to_string());
                 }
-                packed_splits.insert(packed.clone(), targets);
+                into.insert(packed.clone(), targets);
             }
             continue;
         }
@@ -320,9 +332,19 @@ pub fn load_file(path: &Path) -> Result<WeightsManifest, ManifestError> {
             kinds.insert(k.clone(), kind);
         }
     }
+    for (fused, parts) in &packed_concats {
+        if let Some(missing) = (parts.iter()).find(|p| !entries.contains_key(p.as_str())) {
+            return Err(ManifestError::BadShape {
+                path: path.to_path_buf(),
+                weight: fused.clone(),
+                reason: format!("packed-concat part `{missing}` has no entry of its own"),
+            });
+        }
+    }
     Ok(WeightsManifest {
         entries,
         packed_splits,
+        packed_concats,
         pad_to_mult8,
         kinds,
     })

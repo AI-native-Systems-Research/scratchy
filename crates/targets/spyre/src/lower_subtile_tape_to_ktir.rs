@@ -1155,7 +1155,14 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::AttnPackedKv
         | SubOp::SampleRowsGather
         | SubOp::SampleRowsScatter
-        | SubOp::AllRowsMatmul => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
+        | SubOp::AllRowsMatmul
+        | SubOp::CaptureHidden { .. }
+        | SubOp::DraftConv { .. }
+        | SubOp::DraftAttention { .. }
+        | SubOp::DraftContextKv { .. }
+        | SubOp::DraftWindowStore
+        | SubOp::DraftWindowLoad
+        | SubOp::DraftSelect => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
         // ⭐ THE CHAINED HEAD'S PAIR — HAND-MINTED KTIR, never spliced: these are the
         // `Transpose` precedent class (a computed-value op whose body the DOOR
         // assembles), so the producer's whole statement is the door-shaped skeleton

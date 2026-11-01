@@ -379,9 +379,9 @@ pub struct BucketBaking {
     /// a kernel exceeds the 31-binding argument-table cap (such buckets
     /// have no MTL4 execution path).
     pub mtl4_steps: Option<Vec<super::mtl4::Mtl4Step>>,
-    /// Per dispatch, in dispatch order, whether a forward reading only its cache writes plays it
-    /// ([`LoweredMetalTape::cache_live_expanded`]).
-    pub cache_live: Vec<bool>,
+    /// Per dispatch, in dispatch order, the plays short of the whole forward that play it
+    /// ([`LoweredMetalTape::live_expanded`]).
+    pub live: Vec<crate::tape::lowered::PlayLive>,
 }
 
 #[derive(Debug)]
@@ -616,6 +616,12 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// step that also replays or records, the pipelined scan's twin runs those
     /// sequences (`RuntimeGate::OnlyIfPlainGdnRows`).
     pub gdn_plain_rows: std::sync::atomic::AtomicBool,
+    /// Whether the step about to run is a DFlash2 cycle's context commit
+    /// (`RuntimeGate::OnlyIfDraftCycle`), set from its inputs before it is encoded.
+    pub draft_cycle: std::sync::atomic::AtomicBool,
+    /// Whether every sequence of the step about to run holds at most a verify lane's rows
+    /// (`RuntimeGate::OnlyIfLaneRows`), set from its inputs before it is encoded.
+    pub lane_rows: std::sync::atomic::AtomicBool,
     /// Per-dispatch GPU timestamp heap (`SCRATCHY_METAL_KERNEL_TIME`).
     /// `None` unless the env var is set at worker build — the probe is
     /// opt-in and costs nothing otherwise. One timestamp is written
@@ -953,6 +959,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // when W::ROPE_ON_READ, so pinned below like block_tables
                 // (16-byte placeholder + never bound on non-spans arches).
                 block_unrotated_flags,
+                // The live-row count the MoE sort reads by baked gpuAddress — pinned below.
+                num_tokens_u32,
                 // The sampled rows the gather and its undoing read by baked gpuAddress — pinned
                 // below.
                 num_sample_rows_u32,
@@ -979,6 +987,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // TurboQuant packed stores + codebook — pinned below when Some
                 // (dispatch-bound by baked gpuAddress, same lazy-pager hazard).
                 tq,
+                // A target's captured rows for its drafter: bound by baked gpuAddress (16-byte
+                // placeholder on a model no drafter reads), pinned below.
+                draft_capture,
+                // A drafter's per-forward buffers, pinned below when Some; its ring pools are
+                // pinned by their owner, as the GDN state pools are.
+                draft,
                 // Host bookkeeping of the input buffers' written bytes, not a GPU buffer.
                 written: _,
             } = runtime;
@@ -989,6 +1003,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // Span labels: bound by dispatch-baked address on rope-on-read
             // arches (slot 8 of the prefill attention), so pin like seq_used_k.
             pin(span_ids);
+            // The forward's num_tokens: the MoE sort binds it by dispatch-baked address, and every
+            // forward's input writes fill it.
+            pin(num_tokens_u32);
             // The rows the forward samples: the lm_head slice's gather and the logits compaction
             // bind them by dispatch-baked address, same lazy-pager hazard as the inputs.
             pin(num_sample_rows_u32);
@@ -1057,6 +1074,15 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 pin(&t.scratch.k_table);
                 pin(&t.scratch.v_table);
             }
+            pin(draft_capture);
+            if let Some(d) = draft {
+                for b in [&d.ring_slots, &d.retained, &d.lane_params] {
+                    pin(b);
+                }
+                for b in &d.outputs {
+                    pin(b);
+                }
+            }
             r.commit();
         }
 
@@ -1101,6 +1127,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
             gdn_plain: std::sync::atomic::AtomicBool::new(true),
             gdn_plain_rows: std::sync::atomic::AtomicBool::new(true),
+            draft_cycle: std::sync::atomic::AtomicBool::new(false),
+            lane_rows: std::sync::atomic::AtomicBool::new(true),
             kernel_time_heap: if std::env::var_os("SCRATCHY_METAL_KERNEL_TIME").is_some() {
                 Some(super::mtl4::new_registered_kernel_time_heap(&device))
             } else {
@@ -1246,6 +1274,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .load(std::sync::atomic::Ordering::Relaxed),
             gdn_plain: self.gdn_plain.load(std::sync::atomic::Ordering::Relaxed),
             gdn_plain_rows: (self.gdn_plain_rows).load(std::sync::atomic::Ordering::Relaxed),
+            draft_cycle: (self.draft_cycle).load(std::sync::atomic::Ordering::Relaxed),
+            lane_rows: (self.lane_rows).load(std::sync::atomic::Ordering::Relaxed),
         };
         // A skipped dispatch's fence, owed to the next one played.
         let mut carried = Fence::None;
@@ -1261,10 +1291,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
             {
                 let this_idx = flat_idx;
                 flat_idx += 1;
-                // A forward reading only its cache writes skips what none of them needs, its fence
-                // passed on to the next dispatch it plays: the fence orders what came before it
-                // against what comes after, whichever dispatch that is.
-                if reads == super::ForwardReads::CacheWrites && !baking.cache_live[this_idx] {
+                // A forward reading less than the whole skips what none of its reads needs, its
+                // fence passed on to the next dispatch it plays: the fence orders what came before
+                // it against what comes after, whichever dispatch that is.
+                if !baking.live[this_idx].plays(reads) {
                     carried = carried.max(*need_barrier);
                     continue;
                 }
@@ -1392,7 +1422,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // the tape position; the pool prints deltas after the
                 // host wait.
                 if let Some(heap) = &self.kernel_time_heap {
-                    heap.write_timestamp(enc, step.kernel, tg_scaled);
+                    heap.write_timestamp(enc, step.kernel, tg_scaled, *tpt, need_barrier);
                 }
                 #[cfg(feature = "forward-telemetry")]
                 if tape_enabled {
@@ -1489,7 +1519,6 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::SplitKReduceSum => KernelKind::Gemm,
         K::MoeWeightedSum
         | K::MoeGroupOffsets
-        | K::MoeGroupInit
         | K::MoeGroupScatter
         | K::MoeGroupScatterQ8
         | K::MoePerExpertScale
@@ -1596,8 +1625,15 @@ fn bake_bucket<W: CanonicalParams>(
                 .get(cmd_idx)
                 .copied()
                 .unwrap_or(Fence::Coherent);
-            // Dense GEMM: M is the height axis but the bake here is for a dense linear that
-            // always dispatches at the actual M (no bucket_m baking), so leave m_scaling as None.
+            // A GEMV's chunks of rows are its grid's height (`gemm_pipeline`): scaled to the step's
+            // live rows, so a step of fewer rows than the bucket runs only its chunks. A tiled GEMM's
+            // grid stays the bucket's.
+            let gemv_scaling = (shape.threadgroups.1 > 1 && pipeline_is_gemv(&shape, dims))
+                .then_some(super::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::Y,
+                    bucket_m: super::ids::BucketM(dims.m),
+                    set_axis: None,
+                });
             match steps.last_mut() {
                 Some(BucketStep::Dispatch {
                     pipeline: prev,
@@ -1610,7 +1646,7 @@ fn bake_bucket<W: CanonicalParams>(
                 }) if same_pipeline(prev, &pipeline) => {
                     direct_bindings.push(bindings_for_cmd);
                     direct_dispatch.push(dispatch_for_cmd);
-                    direct_m_scaling.push(None);
+                    direct_m_scaling.push(gemv_scaling);
                     barrier_before.push(cmd_barrier);
                     // Gemm path is never gated (no slice); push None to keep the Vec aligned
                     // with `direct_dispatch`.
@@ -1622,7 +1658,7 @@ fn bake_bucket<W: CanonicalParams>(
                         pipeline,
                         direct_bindings: vec![bindings_for_cmd],
                         direct_dispatch: vec![dispatch_for_cmd],
-                        direct_m_scaling: vec![None],
+                        direct_m_scaling: vec![gemv_scaling],
                         barrier_before: vec![cmd_barrier],
                         runtime_gate: vec![None],
                     });
@@ -1726,7 +1762,7 @@ fn bake_bucket<W: CanonicalParams>(
     Ok(BucketBaking {
         bucket_m: tape.bucket_m,
         mtl4_steps,
-        cache_live: tape.cache_live_expanded(),
+        live: tape.live_expanded(),
     })
 }
 
@@ -1979,6 +2015,8 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
         unrotated_blocks,
         gdn_plain,
         gdn_plain_rows,
+        draft_cycle,
+        lane_rows,
     } = step;
     let decode_step = num_tokens == num_seqs;
     match gate {
@@ -2002,6 +2040,10 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
         Some(super::lowered::RuntimeGate::OnlyIfPlainGdn) => gdn_plain,
         Some(super::lowered::RuntimeGate::UnlessPlainGdn) => !gdn_plain,
         Some(super::lowered::RuntimeGate::OnlyIfPlainGdnRows) => gdn_plain_rows,
+        Some(super::lowered::RuntimeGate::OnlyIfLaneRows) => lane_rows,
+        Some(super::lowered::RuntimeGate::UnlessLaneRows) => !lane_rows,
+        Some(super::lowered::RuntimeGate::OnlyIfDraftCycle) => draft_cycle,
+        Some(super::lowered::RuntimeGate::UnlessDraftCycle) => !draft_cycle,
         Some(super::lowered::RuntimeGate::All(gates)) => {
             gates.iter().all(|g| gate_matches(Some(*g), step))
         }
@@ -2025,6 +2067,12 @@ pub struct StepFacts {
     pub gdn_plain: bool,
     /// Some sequence takes a plain Gated-DeltaNet step over more than one row.
     pub gdn_plain_rows: bool,
+    /// The forward is a DFlash2 cycle's context commit: each lane its verify's block, of which
+    /// it retained a count ([`super::DraftInputs::cycle`]).
+    pub draft_cycle: bool,
+    /// Every sequence of the step holds at most a verify lane's rows
+    /// (`op_abi::METAL_LANE_VERIFY_ROWS`).
+    pub lane_rows: bool,
 }
 
 /// Rewrite the m-axis of a baked threadgroup grid to match the
@@ -2072,6 +2120,12 @@ fn scale_tg_for_num_tokens(
         *slot = count.max(1) as usize;
     }
     tg
+}
+
+/// Whether a dense GEMM of `dims` played at `shape` is the chunked GEMV (`gemm_pipeline`): its
+/// threadgroups of 256 threads, its grid's height its chunks of rows.
+fn pipeline_is_gemv(shape: &super::lowered::DispatchShape, dims: super::lowered::GemmDims) -> bool {
+    dims.m <= super::pipelines::GEMV_MAX_ROWS && shape.threads_per_threadgroup == (256, 1, 1)
 }
 
 fn mtl_size_pair(cmd: &LoweredCommand, variant: TapeVariant) -> (MTLSize, MTLSize) {
@@ -2177,6 +2231,8 @@ mod tests {
             unrotated_blocks,
             gdn_plain: true,
             gdn_plain_rows: true,
+            draft_cycle: false,
+            lane_rows: true,
         };
         for (tokens, seqs, decode) in [
             (1, 1, true),
@@ -2369,6 +2425,8 @@ mod tests {
                 unrotated_blocks: false,
                 gdn_plain: true,
                 gdn_plain_rows: true,
+                draft_cycle: false,
+                lane_rows: true,
             };
             for cmd in cmds {
                 let key = crate::specialized_pipeline_cache::PipelineKey::new(
@@ -2525,6 +2583,7 @@ mod tests {
             kv_cache_v: (0..num_layers).map(|_| alloc_buffer(device, 16)).collect(),
             block_unrotated_flags: (0..num_layers).map(|_| alloc_buffer(device, 16)).collect(),
             tq: None,
+            num_tokens_u32: alloc_buffer(device, 4),
             num_sample_rows_u32: alloc_buffer(device, 4),
             sample_indices: alloc_buffer(device, 16),
             gdn_state_conv: ::std::vec::Vec::new(),
@@ -2545,6 +2604,8 @@ mod tests {
             vision_window_index: alloc_buffer(device, 16),
             vision_reverse_indices: alloc_buffer(device, 16),
             vision_position_ids: alloc_buffer(device, 16),
+            draft_capture: alloc_buffer(device, 16),
+            draft: None,
             written: Default::default(),
         }
     }
@@ -2642,7 +2703,7 @@ mod tests {
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
-            cache_live: &[],
+            live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
@@ -2735,6 +2796,8 @@ mod tests {
             lm_head_barriers: &[],
             tapes: &[],
             kernels: &[],
+            plays_result: true,
+            weight_bytes: crate::tape::step::WeightBytes::default(),
         };
         hidden.iter().map(bucket).collect()
     }
@@ -3039,7 +3102,7 @@ mod tests {
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
-            cache_live: &[],
+            live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
@@ -3132,7 +3195,7 @@ mod tests {
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
-            cache_live: &[],
+            live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
@@ -3259,7 +3322,7 @@ mod tests {
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
-            cache_live: &[],
+            live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],

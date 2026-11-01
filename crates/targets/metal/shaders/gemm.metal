@@ -647,13 +647,26 @@ template <typename T, typename G>
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]])
 {
-    constexpr int MAX_ROWS = 8;   // = GEMV_MAX_ROWS (pipelines.rs)
+    // Rows in chunks of GEMV_CHUNK_ROWS, at most GEMV_MAX_ROWS (pipelines.rs) in all, a chunk a
+    // threadgroup row (tid.y): a chunk's sums stay in registers, and the chunks of a verify step of
+    // up to four 8-row lanes read each weight slice from DRAM once and from cache after. Each row's
+    // sum is the 8-row GEMV's.
+    constexpr int CHUNK = 8;      // = GEMV_CHUNK_ROWS (pipelines.rs)
+    constexpr int MAX_ROWS = 32;  // = GEMV_MAX_ROWS (pipelines.rs)
     if (GEMM_M > uint(MAX_ROWS)) return;
+    const int r0 = int(tid.y) * CHUNK;
+    if (r0 >= int(GEMM_M)) return;
     constexpr int BN = 8;         // simdgroups per threadgroup, all along K
     constexpr int TM = 4;         // outputs per thread
-    threadgroup float tgp[MAX_ROWS * BN * (TM + TM)];
-    gemv_specialized_impl<T, G, MAX_ROWS>(
-        output, input, weight, gain, tgp, int(GEMM_M), tid.x, simd_gid, simd_lid);
+    threadgroup float tgp[CHUNK * BN * (TM + TM)];
+    // The chunk's rows, a constant wherever GEMM_M makes it one (at most a chunk, or whole chunks):
+    // the impl's row loops then unroll over registers, as the 8-row GEMV's do.
+    const int rows = int(GEMM_M) <= CHUNK         ? int(GEMM_M)
+                     : int(GEMM_M) % CHUNK == 0   ? CHUNK
+                                                  : min(CHUNK, int(GEMM_M) - r0);
+    gemv_specialized_impl<T, G, CHUNK>(
+        output + size_t(r0) * uint(GEMM_N), input + size_t(r0) * uint(GEMM_K), weight, gain, tgp,
+        rows, tid.x, simd_gid, simd_lid);
 }
 
 // `gemv_normed_rows_*`: the normed gemv over EVERY row of an M-row batch — a router's pre-norm

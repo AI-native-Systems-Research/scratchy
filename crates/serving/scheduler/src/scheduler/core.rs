@@ -25,8 +25,8 @@ use tracing::warn;
 
 use super::interface::{PauseState, SchedulerInterface};
 use super::output::{
-    CachedKvOp, CachedRequestData, NewRequestData, RecurrentStateOps, SchedulerOutput,
-    SharedMemoryOps, StateSnapshotOp, StepId,
+    CachedKvOp, CachedRequestData, NewRequestData, RecurrentAdmissionOp, RecurrentStateOps,
+    SchedulerOutput, SharedMemoryOps, StateSnapshotOp, StepId,
 };
 use super::recurrent_state::{SnapshotBudget, StateSnapshots};
 use super::request_queue::{RequestQueue, SchedulingPolicy, create_request_queue};
@@ -3372,6 +3372,7 @@ impl SchedulerInterface for Scheduler {
         let mut req_to_reused_blocks: HashMap<String, Vec<usize>> = HashMap::new();
         let mut num_scheduled_tokens: HashMap<String, usize> = HashMap::new();
         let mut state_restores: Vec<StateSnapshotOp> = Vec::new();
+        let mut admissions: Vec<RecurrentAdmissionOp> = Vec::new();
         let mut cached_kv: Vec<CachedKvOp> = Vec::new();
         let mut token_budget = self.max_num_scheduled_tokens;
         let mut scheduled_spec_decode_tokens: HashMap<String, Vec<u32>> = HashMap::new();
@@ -3711,6 +3712,11 @@ impl SchedulerInterface for Scheduler {
                         }
                         if let Some(plan) = &recurrent {
                             self.kv_cache.admit_recurrent_prefix(&request_id, plan);
+                            admissions.push(RecurrentAdmissionOp {
+                                req_id: request_id.clone(),
+                                resume: plan.tokens,
+                                save_points: plan.save_points.iter().map(|&(p, _)| p).collect(),
+                            });
                             if let Some((slot, key)) = plan.restore {
                                 state_restores.push(StateSnapshotOp {
                                     req_id: request_id.clone(),
@@ -3855,6 +3861,7 @@ impl SchedulerInterface for Scheduler {
             primes_only: false,
             spec_pipeline: Default::default(),
             recurrent_state: RecurrentStateOps {
+                admissions,
                 restores: state_restores,
                 cached_kv,
                 saves: state_saves,
@@ -8709,6 +8716,39 @@ mod tests {
             .map(|op| op.position)
             .collect();
         assert_eq!(saved, vec![688], "its own end, past the restored state");
+    }
+
+    /// A request's admission hands the worker where its prefill resumes and every position it
+    /// snapshots on the way, once: a drafter whose context a snapshot keeps plans by them.
+    #[test]
+    fn recurrent_admission_names_its_resume_and_save_points() {
+        let mut sched = recurrent_scheduler(4, 4096);
+        let turn1: Vec<u32> = (0..600).collect();
+        sched.add_request(request_with("t1", turn1.clone()));
+        let saved = sched.schedule();
+        let admission = |req_id: &str, resume, save_points| RecurrentAdmissionOp {
+            req_id: req_id.into(),
+            resume,
+            save_points,
+        };
+        assert_eq!(
+            saved.recurrent_state.admissions,
+            vec![admission("t1", 0, vec![592])]
+        );
+        sched.commit_step(&saved);
+        prefill_and_finish(&mut sched, "t1");
+        let turn2: Vec<u32> = turn1.iter().copied().chain(1000..1100).collect();
+        sched.add_request(request_with("t2", turn2));
+        let out = run_step(&mut sched);
+        assert_eq!(
+            out.recurrent_state.admissions,
+            vec![admission("t2", 592, vec![688])]
+        );
+        let next = run_step(&mut sched);
+        assert!(
+            next.recurrent_state.admissions.is_empty(),
+            "a running request is admitted once"
+        );
     }
 
     #[test]

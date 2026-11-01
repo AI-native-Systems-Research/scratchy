@@ -407,15 +407,12 @@ pub enum KernelId {
     MoeWeightedSum,
     /// MoE grouped-GEMM prefill: histogram `topk_inds` + padded
     /// exclusive-scan offsets. Single threadgroup. Function constants
-    /// `MG_M` (0) / `MG_NUM_EXPERTS` (1). Bindings `(topk_inds @ 0,
-    /// count @ 1, offset @ 2, total @ 3)`. Symbol `moe_group_offsets`
-    /// in `moe_group.metallib`.
+    /// `MG_M` (0) / `MG_NUM_EXPERTS` (1), and the init's `MG_MPAD_MAX` (2) /
+    /// `MG_SENTINEL` (7): every threadgroup also sentinel-fills its rows of
+    /// `indices_pad` and zeroes its `fill` counters. Bindings `(topk_inds @ 0,
+    /// count @ 1, offset @ 2, total @ 3, num_tokens @ 4, indices_pad @ 5,
+    /// fill @ 6)`. Symbol `moe_group_offsets` in `moe_group.metallib`.
     MoeGroupOffsets,
-    /// MoE grouped-GEMM prefill: sentinel-fill `indices_pad` + zero the
-    /// `fill` counters. Function constants `MG_NUM_EXPERTS` (1) /
-    /// `MG_MPAD_MAX` (2). Bindings `(indices_pad @ 0, fill @ 1)`.
-    /// Symbol `moe_group_init`.
-    MoeGroupInit,
     /// MoE grouped-GEMM prefill: scatter each (token,expert) row to its
     /// padded slot, recording `pos`, `indices_pad`, and the gathered
     /// `x_pad` row. Function constants `MG_M`(0)/`MG_NUM_EXPERTS`(1)/
@@ -500,6 +497,40 @@ pub enum KernelId {
     /// [`Self::AttentionDecodeGqaTq`]'s second pass (`attention_via_cache_v2_combine_*`): merges
     /// each query head's partials into its output.
     AttentionDecodeCombine,
+    // ── Splash's DFlash2 drafter (`dflash2.metal`, `dflash2_select.metal`) ──────────────────────
+    /// A captured layer's rows into their block of the rows a drafter reads (Splash's
+    /// `row_copy`, `QwenTarget::addCapture`): `copy_rows_strided_{f16,bf16}` in
+    /// `elementwise.metal`.
+    CaptureRows,
+    /// One stage of a drafter's dynamic convolution: `draft_conv_<dtype>`.
+    DraftConv,
+    /// A draft attention's q/k norms, RoPE and layouts: `draft_attention_qkv_<dtype>_rope_<r>`.
+    DraftAttentionQkv,
+    /// A draft attention's splits over the ring and the block: `draft_attention_split_<dtype>`.
+    DraftAttentionSplit,
+    /// A draft attention's fixed-order combine: `draft_attention_reduce_<dtype>`.
+    DraftAttentionReduce,
+    /// A draft attention's rows back in row order: `draft_attention_reorder_<dtype>`.
+    DraftAttentionReorder,
+    /// A cycle's context commit of its retained rows: `draft_context_kv_commit_<dtype>_rope_<r>`.
+    DraftContextCommit,
+    /// A prompt's context commit: `prefill_draft_context_kv_<dtype>_rope_<r>`.
+    DraftContextPrefill,
+    /// A cycle's commit of its retained rows into its lanes' context windows:
+    /// `draft_window_store_commit_<dtype>`.
+    DraftWindowStoreCommit,
+    /// A prompt's commit into its sequences' context windows: `prefill_draft_window_store_<dtype>`.
+    DraftWindowStorePrefill,
+    /// A ring rebuild's rows out of its sequences' context windows: `draft_window_load_<dtype>`.
+    DraftWindowLoad,
+    /// A proposal row's sharded top-16: `draft_select_top16_sharded_<dtype>`.
+    DraftSelectTop16,
+    /// The candidates' edge tables: `draft_select_edges_<dtype>`.
+    DraftSelectEdges,
+    /// The walk into the proposals: `draft_select_dflash`.
+    DraftSelectWalk,
+    /// The rows each lane's target verifies: `draft_verify_rows`.
+    DraftVerifyRows,
 }
 
 /// Which sequences of a step a command computes correctly.
@@ -590,7 +621,6 @@ impl KernelId {
             | Self::MoeRoute
             | Self::MoeWeightedSum
             | Self::MoeGroupOffsets
-            | Self::MoeGroupInit
             | Self::MoeGroupScatter
             | Self::MoeGroupScatterQ8
             | Self::MoePerExpertScale
@@ -608,7 +638,23 @@ impl KernelId {
             | Self::RowProgram
             | Self::AttentionViaCacheTq
             | Self::AttentionDecodeGqaTq
-            | Self::AttentionDecodeCombine => SeqScope::AllRows,
+            | Self::AttentionDecodeCombine
+            // Each lane is a sequence, read through its own ring slot.
+            | Self::CaptureRows
+            | Self::DraftConv
+            | Self::DraftAttentionQkv
+            | Self::DraftAttentionSplit
+            | Self::DraftAttentionReduce
+            | Self::DraftAttentionReorder
+            | Self::DraftContextCommit
+            | Self::DraftContextPrefill
+            | Self::DraftWindowStoreCommit
+            | Self::DraftWindowStorePrefill
+            | Self::DraftWindowLoad
+            | Self::DraftSelectTop16
+            | Self::DraftSelectEdges
+            | Self::DraftSelectWalk
+            | Self::DraftVerifyRows => SeqScope::AllRows,
         }
     }
 }
@@ -761,6 +807,19 @@ pub enum RuntimeGate {
     /// a step that also replays or records, which runs those sequences and
     /// leaves the rest to the simd scan.
     OnlyIfPlainGdnRows,
+    /// Run only on a step whose every sequence holds at most a verify lane's rows
+    /// (`op_abi::METAL_LANE_VERIFY_ROWS`): the Gated-DeltaNet verify command, whose threadgroup
+    /// holds one sequence's rows, at a bucket of more (a 2-4-lane verify's).
+    OnlyIfLaneRows,
+    /// Run on a step one of whose sequences holds more than a verify lane's rows (a short prompt in
+    /// one chunk): the three-command Gated-DeltaNet path the verify command replaces.
+    UnlessLaneRows,
+    /// Run only on a DFlash2 cycle's context commit — a forward whose lanes each hold their
+    /// verify's block and retained a count of it (`ForwardInputs::draft_cycle`): Splash's
+    /// `draft_context_kv_commit`.
+    OnlyIfDraftCycle,
+    /// Run unless the forward is a cycle's commit: a prompt's (`prefill_draft_context_kv`).
+    UnlessDraftCycle,
     /// Run only when every gate in the list matches.
     All(&'static [RuntimeGate]),
     /// Run when some gate in the list matches.
@@ -781,6 +840,43 @@ impl RuntimeGate {
             [only] => *only,
             _ => RuntimeGate::All(baked(all)),
         }
+    }
+
+    /// Whether no step runs both a command gated `self` and one gated `other`: one is the other's
+    /// complement (a twin and the command it replaces), or a list's gates decide it.
+    pub fn excludes(self, other: RuntimeGate) -> bool {
+        use RuntimeGate as G;
+        match (self, other) {
+            (G::All(gates), _) => gates.iter().any(|g| g.excludes(other)),
+            (_, G::All(gates)) => gates.iter().any(|g| self.excludes(*g)),
+            (G::Any(gates), _) => gates.iter().all(|g| g.excludes(other)),
+            (_, G::Any(gates)) => gates.iter().all(|g| self.excludes(*g)),
+            (gate, other) => gate.complement() == Some(other),
+        }
+    }
+
+    /// The gate that runs exactly on the steps this one does not, if one does.
+    fn complement(self) -> Option<RuntimeGate> {
+        use RuntimeGate as G;
+        Some(match self {
+            G::UnlessEveryRowSampled => G::OnlyIfEveryRowSampled,
+            G::OnlyIfEveryRowSampled => G::UnlessEveryRowSampled,
+            G::OnlyIfDecodeStep => G::UnlessDecodeStep,
+            G::UnlessDecodeStep => G::OnlyIfDecodeStep,
+            G::OnlyIfSmallMTokens => G::UnlessSmallMTokens,
+            G::UnlessSmallMTokens => G::OnlyIfSmallMTokens,
+            G::OnlyIfOneSequence => G::UnlessOneSequence,
+            G::UnlessOneSequence => G::OnlyIfOneSequence,
+            G::OnlyIfUnrotatedBlocks => G::UnlessUnrotatedBlocks,
+            G::UnlessUnrotatedBlocks => G::OnlyIfUnrotatedBlocks,
+            G::OnlyIfPlainGdn => G::UnlessPlainGdn,
+            G::UnlessPlainGdn => G::OnlyIfPlainGdn,
+            G::OnlyIfLaneRows => G::UnlessLaneRows,
+            G::UnlessLaneRows => G::OnlyIfLaneRows,
+            G::OnlyIfDraftCycle => G::UnlessDraftCycle,
+            G::UnlessDraftCycle => G::OnlyIfDraftCycle,
+            G::OnlyIfPlainGdnRows | G::All(_) | G::Any(_) => return None,
+        })
     }
 }
 
@@ -949,6 +1045,9 @@ pub enum SourceRef<'w> {
     /// plain dense sink-logit tensor (the single tensor of its bundle,
     /// read through [`WeightTensor::Weight`] like [`Self::CosSin`]).
     AttnSinks(scratchy_tensors::tensor::GpuTensor),
+    /// A bare tensor read verbatim (a DFlash2 drafter's convolution base kernel, selector
+    /// codebook), read through [`WeightTensor::Weight`] like [`Self::CosSin`].
+    Tensor(scratchy_tensors::tensor::GpuTensor),
     /// Mixtral-style MoE: dense router + packed per-expert slabs.
     FusedMoe(&'w scratchy_layers::layers_moe::FusedMoELayer),
     /// Qwen-style MoE with an optional shared expert.
@@ -1016,6 +1115,7 @@ impl SourceRef<'_> {
             (Self::LayerNorm(n), T::Bias) => n.bias,
             (Self::CosSin(t), T::Weight) => Some(t),
             (Self::AttnSinks(t), T::Weight) => Some(t),
+            (Self::Tensor(t), T::Weight) => Some(t),
             (Self::Linear(l @ L::Dense(_)), T::Weight) => Some(l.dense_weight()),
             (Self::Linear(l @ L::Dense(_)), T::Bias) => l.dense_bias(),
             (Self::Linear(l @ L::AffineQuant(_)), T::Weight) => Some(l.affine_weight()),
@@ -1267,6 +1367,9 @@ pub enum RuntimeBindingKind {
     BlockUnrotatedFlags {
         layer: LayerId,
     },
+    /// `[1]` u32 — the in-flight forward's `num_tokens`, written by the pool at every forward's
+    /// start: the MoE sort counts the step's live pairs, `num_tokens · top_k`, not the bucket's.
+    NumTokensU32,
     /// `[1]` u32 — the in-flight forward's sampled rows' count (`SampleIndices`' length): the
     /// rows the lm_head slice gathers and puts back, and the logits rows a compaction keeps.
     NumSampleRowsU32,
@@ -1327,6 +1430,33 @@ pub enum RuntimeBindingKind {
     /// head reads. `LoadRows(TargetHidden)` copies it into an arena slot. Carried on
     /// `ForwardCtx::target_hidden`, written per forward by the worker.
     TargetHidden,
+    // ── A DFlash2 cycle (`crate::dflash2`) ──────────────────────────────────────────────────
+    /// `[num_tokens, slots · hidden]` model-dtype — the rows a target captures for the drafter
+    /// compiled beside it: each captured layer's output rows in its block (`CaptureRows`), which
+    /// the drafter's context commit reads as its `TargetHidden`. Kept past the forward.
+    DraftCapture,
+    /// A drafter's ring keys at `layer`: `[slot][kv head][window][head dim]` model-dtype, the
+    /// pool of every ring slot (`dflash2.metal`).
+    DraftRingKeys {
+        layer: LayerId,
+    },
+    /// A drafter's ring values at `layer`: `[slot][kv head][head dim][window]` model-dtype.
+    DraftRingValues {
+        layer: LayerId,
+    },
+    /// `[num_seqs]` u32 — each lane's ring slot, written per forward by the worker.
+    DraftRingSlots,
+    /// A drafter's context windows: one a ring slot, each its slot's 4-bit context rows
+    /// (`dflash2.metal` `DRAFT_WINDOW_BYTES`), kept across forwards.
+    DraftWindow,
+    /// `[num_seqs]` u32 — the rows of its verify each lane retained (a cycle's acceptance), what
+    /// its context commit writes.
+    DraftRetained,
+    /// `[num_seqs]` [`crate::dflash2::DraftLaneParams`] — each lane's policy for the cycle.
+    DraftLaneParams,
+    /// A region of a drafter's outputs: what its selection writes, its target's acceptance and
+    /// the host read.
+    DraftOutputs(crate::dflash2::DraftOutput),
     /// `[num_tokens, hidden]` model-dtype — the projected vision-encoder
     /// embeddings (`ForwardCtx::mm_embeds`), copied row-blockwise into
     /// the text embedding stream at the image-placeholder rows by
@@ -1710,11 +1840,24 @@ impl RuntimeBindingKind {
             Self::TqNormsV { layer } => Self::TqNormsV {
                 layer: layer.advance(by),
             },
-            Self::InputIds
+            Self::DraftRingKeys { layer } => Self::DraftRingKeys {
+                layer: layer.advance(by),
+            },
+            Self::DraftRingValues { layer } => Self::DraftRingValues {
+                layer: layer.advance(by),
+            },
+            Self::DraftCapture
+            | Self::DraftRingSlots
+            | Self::DraftWindow
+            | Self::DraftRetained
+            | Self::DraftLaneParams
+            | Self::DraftOutputs(_)
+            | Self::InputIds
             | Self::Positions
             | Self::CuSeqlensQ
             | Self::SeqUsedK
             | Self::SpanIds
+            | Self::NumTokensU32
             | Self::NumSampleRowsU32
             | Self::SampleIndices
             | Self::GdnStateIndices
@@ -2004,13 +2147,13 @@ impl LoweredMetalTape {
         out
     }
 
-    /// `cache_live`, expanded in lockstep with [`Self::commands_expanded`]: every iteration of a
-    /// loop's body runs whole. A command past the mask runs.
-    pub fn cache_live_expanded(&self) -> Vec<bool> {
+    /// `live`, expanded in lockstep with [`Self::commands_expanded`]: every iteration of a loop's
+    /// body runs whole. A command past the mask runs in every play.
+    pub fn live_expanded(&self) -> Vec<PlayLive> {
         let mut out = Vec::with_capacity(self.commands.len());
-        let live = self.cache_live;
+        let live = self.live;
         Self::walk(self.loops, 0..self.commands.len(), 0, &mut |pos, _| {
-            out.push(live.get(pos).copied().unwrap_or(true))
+            out.push(live.get(pos).copied().unwrap_or(PlayLive::EVERY))
         });
         out
     }
@@ -2241,12 +2384,56 @@ pub struct LoweredMetalTape {
     /// The rows of the logits buffer (the terminal slot) the tape's commands write: what the
     /// buffer holds beyond the rows a step samples ([`Self::logits_slot_rows`]).
     pub logits_rows: LogitsRows,
-    /// Per command, whether a forward reading only its cache writes plays it
-    /// ([`crate::interpreter::metal::ForwardReads::CacheWrites`]): what a KV or recurrent-state
-    /// write needs, from the metal compiler's liveness walk over the rows. Off for the lm_head,
-    /// the attention and MLP past a model's last KV writer, and a projection only they read (the
-    /// Q a rope append rotates beside the K and V it writes); on for every cache write.
-    pub cache_live: &'static [bool],
+    /// Per command, the plays of its forward short of the whole that play it ([`PlayLive`]).
+    pub live: &'static [PlayLive],
+}
+
+/// The plays of its forward a command runs in besides the whole forward
+/// ([`crate::interpreter::metal::ForwardReads`]), from the metal compiler's liveness walks over
+/// the rows: what a play's reads need.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct PlayLive {
+    /// What a KV or recurrent-state write needs (`ForwardReads::CacheWrites`). Off for the
+    /// lm_head, the attention and MLP past a model's last KV writer, and a projection only they
+    /// read (the Q a rope append rotates beside the K and V it writes); on for every cache write.
+    pub cache_writes: bool,
+    /// What the forward's result needs (`ForwardReads::Result`).
+    pub result: bool,
+    /// What rebuilding a DFlash2 drafter's rings from its context window needs
+    /// (`ForwardReads::Rebuild`): the window's load and the ring writers after it, never the
+    /// commit's rows before its window.
+    pub rebuild: bool,
+}
+
+impl PlayLive {
+    /// A command every play runs.
+    pub const EVERY: Self = Self {
+        cache_writes: true,
+        result: true,
+        rebuild: true,
+    };
+
+    /// Whether a forward its caller reads `reads` of plays the command.
+    pub fn plays(self, reads: crate::interpreter::metal::ForwardReads) -> bool {
+        use crate::interpreter::metal::ForwardReads as R;
+        match reads {
+            // Every command but a rebuild's own: the window's load, which a whole forward's
+            // commit has the exact rows of.
+            R::Outputs => self.cache_writes || self.result || !self.rebuild,
+            R::CacheWrites => self.cache_writes,
+            R::Result => self.result,
+            R::Rebuild => self.rebuild,
+        }
+    }
+
+    /// Whichever plays either runs in.
+    pub fn or(self, other: Self) -> Self {
+        Self {
+            cache_writes: self.cache_writes || other.cache_writes,
+            result: self.result || other.result,
+            rebuild: self.rebuild || other.rebuild,
+        }
+    }
 }
 
 /// Errors produced by the lowering pass. Every step kind lowers (the

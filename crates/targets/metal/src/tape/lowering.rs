@@ -57,7 +57,7 @@ use crate::specialized_pipeline_cache::ConstantValue;
 use crate::tape::lowered::{
     Binding, DecodePartials, DispatchShape, Fence, GatedCommand, GemmDims, IntoBaked, KernelId,
     LogitsRows, LoweredCommand, LoweredMetalTape, LoweringError, MScaleAxis, MScaling, MetalDtype,
-    RowTile, RuntimeBindingKind, RuntimeGate, SetAxis, SplitSteps, WeightTensor, baked,
+    PlayLive, RowTile, RuntimeBindingKind, RuntimeGate, SetAxis, SplitSteps, WeightTensor, baked,
     baked_commands,
 };
 
@@ -81,6 +81,8 @@ pub struct BakePoint<'a> {
     /// [`ConstantType::KvCap`]: super::constants::ConstantType::KvCap
     pub block_cap: u32,
     pub profile: Option<&'a crate::targets::MetalTargetProfile>,
+    /// The chip class the tape serves (`GenClass::for_device` picks it at load).
+    pub class: crate::tape::lowered::GenClass,
 }
 
 /// The weights a row can bind: its site's sources and the model's class rotary tables.
@@ -157,14 +159,13 @@ pub fn lower_subtile_tape_to_metal(
         &steps.backbone,
         &steps.backbone_barriers,
         &steps.backbone_sources,
-        &steps.backbone_cache_live,
+        &steps.backbone_live,
     )?;
-    // A cache-only forward runs none of the lm_head.
     let (lh, lh_logits) = half(
         &steps.lm_head,
         &steps.lm_head_barriers,
         &steps.lm_head_sources,
-        &vec![false; steps.lm_head.len()],
+        &steps.lm_head_live,
     )?;
     let writes_kv_cache = |c: &GatedCommand| {
         writer_binds(c, |k| {
@@ -187,7 +188,7 @@ pub fn lower_subtile_tape_to_metal(
     Ok(LoweredMetalTape {
         bucket_m: at.bucket_m,
         num_arena_slots: at.num_arena_slots,
-        cache_live: baked([bb.cache_live, lh.cache_live].concat()),
+        live: baked([bb.live, lh.live].concat()),
         commands: baked_commands(commands.collect()).map_err(LoweringError::TooManyCommands)?,
         barrier_before: baked([bb.barrier_before, lh.barrier_before].concat()),
         // The backbone's commands lead this concatenation, so its loop's `start`/`period`
@@ -1022,6 +1023,7 @@ fn route_small_m(
     bucket_m: u32,
     w: RowSources<'_>,
     profile: Option<&crate::targets::MetalTargetProfile>,
+    class: crate::tape::lowered::GenClass,
 ) -> Result<Vec<GatedCommand>, LoweringError> {
     use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
     // A sample-rows step lowered its matmul, twin included.
@@ -1067,10 +1069,23 @@ fn route_small_m(
     // µs base M5 / M5 Max, wide vs twin: lm_head 2182 / 540 vs 2333 / 604, gdn out_proj
     // 70.8 / 31.8 vs 71.1 / 90.1; its 8-row bucket streams them twice, lm_head 4368 / 1049 vs
     // 2369 / 572).
-    if cmds
+    let wide = cmds
         .iter()
-        .any(|c| c.command.kernel == KernelId::AffineQmvWide)
-        && pick_qmv_kernel_wide(n, k, 4, bucket_m, true).weight_streams(bucket_m) == 1
+        .any(|c| c.command.kernel == KernelId::AffineQmvWide);
+    if wide && pick_qmv_kernel_wide(n, k, 4, bucket_m, true).weight_streams(bucket_m) == 1 {
+        return Ok(cmds);
+    }
+    // On a chip of the wide class, a twin of at most one threadgroup a core (of the fewest the class
+    // holds) leaves most of them idle, and the bucket's own matvec, of twice its threadgroups, each
+    // streaming less, runs the projection sooner: its weights are too few for the second stream to
+    // cost what the latency does. A 40-core chip emulated by width at bucket 8, wide against twin µs
+    // (`affine_staged_test`): drafter conv proj and each of the shared expert's gate and up 512 x 2048
+    // 6.3 / 8.1, GDN a, b 32 x 2048 5.9 / 8.1; at 128 threadgroups the twin is as fast (shared down
+    // 2048 x 512, 4.6 / 4.7) and past them faster (out_proj 2048 x 4096, 23.8 / 18.7). A 10-core
+    // base M5 at full width runs the twin faster (shared down 22.9 / 16.6), and its class keeps it.
+    if wide
+        && class == crate::tape::lowered::GenClass::M5Wide
+        && n / SMALL_M_TILE_COLS <= crate::tape::lowered::M5_WIDE_MIN_CORES
     {
         return Ok(cmds);
     }
@@ -1261,8 +1276,24 @@ fn route_gdn(
         GuardRun::Gated(gate) => Some(GatedCommand { command, gate }),
         GuardRun::Dropped => None,
     };
+    // A bucket wider than a verify lane carrying the verify pair (`gdn_verify`): it runs the steps
+    // whose every sequence holds a lane's rows at most, and the commands after it every other step.
+    let lane_split =
+        bucket_m > GDN_VERIFY_ROWS && cmds.iter().any(|c| c.command.library == "gdn_verify");
+    let lane_gate = |gate: Option<RuntimeGate>, lane: RuntimeGate| match lane_split {
+        true => Some(RuntimeGate::and(gate, &[lane])),
+        false => gate,
+    };
     let mut out = Vec::with_capacity(cmds.len() + 2);
     for GatedCommand { command, .. } in cmds {
+        if command.library == "gdn_verify" {
+            out.push(GatedCommand {
+                command,
+                gate: lane_gate(None, RuntimeGate::OnlyIfLaneRows),
+            });
+            continue;
+        }
+        let at = out.len();
         if command.library == "gdn_decode" {
             out.extend(gated(command, &decoded));
         } else if pipelines && command.library == "gdn_scan_varlen" && command.function == simd {
@@ -1305,6 +1336,9 @@ fn route_gdn(
             out.extend(beside_gate);
         } else {
             out.extend(gated(command, &|d, q| !decoded(d, q)));
+        }
+        for c in &mut out[at..] {
+            c.gate = lane_gate(c.gate, RuntimeGate::UnlessLaneRows);
         }
     }
     out
@@ -1578,7 +1612,7 @@ fn lower(
     rows: &[StepRow],
     barriers_in: &[Fence],
     sources: &[Vec<RowSource>],
-    live_rows: &[bool],
+    live_rows: &[PlayLive],
     at: &BakePoint<'_>,
 ) -> Result<(LoweredMetalTape, Option<LogitsRows>), LoweringError> {
     let BakePoint {
@@ -1587,13 +1621,14 @@ fn lower(
         num_arena_slots,
         block_cap,
         profile,
+        class,
         ..
     } = *at;
     let mut commands: Vec<GatedCommand> = Vec::with_capacity(rows.len());
     let mut barrier_before: Vec<Fence> = Vec::with_capacity(rows.len());
-    // Per command, whether a cache-only forward runs it: its row's verdict (a row past the walk's
-    // runs), and a pre-pass a running row reuses runs whatever its own row's.
-    let mut cache_live: Vec<bool> = Vec::with_capacity(rows.len());
+    // Per command, the plays short of the whole forward that run it: its row's (a row past the
+    // walk's runs in every play), and a pre-pass runs in every play a row reusing it runs in.
+    let mut live_cmds: Vec<PlayLive> = Vec::with_capacity(rows.len());
     let mut quantized_at: Option<usize> = None;
     // The layer loop, if this tape has one. Set by the `StepRow::Loop` arm below,
     // which records the body instead of unrolling it.
@@ -1708,8 +1743,9 @@ fn lower(
                     m_divisor,
                 )?;
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
-                let cmds = route_small_m(p, step, own, bucket_m, w, profile)?;
+                let cmds = route_small_m(p, step, own, bucket_m, w, profile, class)?;
                 let cmds = route_gdn(p, step, cmds, bucket_m);
+                let cmds = route_draft_commit(step, cmds);
                 let cmds = decode_attention_per_kv_head(
                     p,
                     step,
@@ -1743,14 +1779,14 @@ fn lower(
                 let mut cmds = route_by_sequence_count(i, cmds)?;
                 update_shape_state(step, &mut m_divisor);
                 let reuses = cmds.first().is_some_and(|c| Some(*c) == quantized);
-                let live = live_rows.get(i).copied().unwrap_or(true);
-                if !live && cmds.iter().any(writes_cache) {
+                let live = live_rows.get(i).copied().unwrap_or(PlayLive::EVERY);
+                if !live.cache_writes && cmds.iter().any(writes_cache) {
                     return Err(LoweringError::CacheWriterSkipped { index: i });
                 }
                 if reuses {
                     cmds.remove(0);
-                    if live && let Some(at) = quantized_at {
-                        cache_live[at] = true;
+                    if let Some(at) = quantized_at {
+                        live_cmds[at] = live_cmds[at].or(live);
                     }
                 } else if !cmds.is_empty() {
                     let gemm = |c: &GatedCommand| {
@@ -1766,7 +1802,7 @@ fn lower(
                     quantized_at = quantized.map(|_| commands.len());
                 }
                 let n_cmds = cmds.len();
-                cache_live.extend(std::iter::repeat_n(live, n_cmds));
+                live_cmds.extend(std::iter::repeat_n(live, n_cmds));
                 // The hazard fences track arena slots, not the shared scratch: a command that
                 // writes it (a W4A8 pre-pass, a split-K partial) must wait for the previous reader.
                 let writes_scratch = if !reuses
@@ -1782,10 +1818,19 @@ fn lower(
                 };
                 commands.extend(cmds);
                 if n_cmds >= 1 {
-                    barrier_before.push(flag_for(i).max(writes_scratch).max(carried));
-                    // A step's later commands (a SplitK partial-writer → reduce
-                    // pair) read what its first wrote: RAW, Coherent.
-                    barrier_before.extend(std::iter::repeat_n(Fence::Coherent, n_cmds - 1));
+                    let flag = flag_for(i).max(writes_scratch).max(carried);
+                    // A step's later commands (a SplitK partial-writer → reduce pair) read what
+                    // an earlier one wrote: RAW, Coherent. One no step runs with any before it (a
+                    // small-M twin and the GEMM it replaces) is the step's first wherever it runs,
+                    // and fences as the step does: its siblings run between the same barriers.
+                    let step = &commands[commands.len() - n_cmds..];
+                    barrier_before.extend(step.iter().enumerate().map(|(j, c)| {
+                        let alone = step[..j].iter().all(|e| match (e.gate, c.gate) {
+                            (Some(e), Some(c)) => e.excludes(c),
+                            _ => false,
+                        });
+                        if alone { flag } else { Fence::Coherent }
+                    }));
                     carried = Fence::None;
                 } else {
                     carried = carried.max(flag_for(i));
@@ -1808,11 +1853,11 @@ fn lower(
     // so an inner loop ahead of its parent would be read as the parent.
     loops.sort_by_key(|l| (l.start, std::cmp::Reverse(l.period)));
     debug_assert_eq!(commands.len(), barrier_before.len());
-    debug_assert_eq!(commands.len(), cache_live.len());
+    debug_assert_eq!(commands.len(), live_cmds.len());
     let tape = LoweredMetalTape {
         bucket_m,
         num_arena_slots,
-        cache_live: baked(cache_live),
+        live: baked(live_cmds),
         commands: baked_commands(commands).map_err(LoweringError::TooManyCommands)?,
         barrier_before: baked(barrier_before),
         loops: baked(loops),
@@ -3259,6 +3304,440 @@ fn lower_one(
                 ]),
                 gemm_dims: None,
             }
+        }
+
+        // ── Splash's DFlash2 drafter: each kernel dispatched as its host op dispatches it
+        //    (~/git/splash runtime/ops/DraftAttention.cpp, runtime/ops/DraftSelector.cpp,
+        //    runtime/model/QwenTarget.cpp `addCapture`) ──
+        I::CaptureHidden(Slot(input), capture) => {
+            let dtype = dequant_dtype_for(p);
+            let hidden = p.hidden_size as u32;
+            let n = eff_m * hidden;
+            LoweredCommand {
+                kernel: KernelId::CaptureRows,
+                library: "dflash2_capture",
+                function: draft_pick(dtype, "capture_rows_f16", "capture_rows_bf16"),
+                constants: super::kernel_constants::CaptureConstants {
+                    hidden,
+                    slot: capture.slot,
+                    slots: capture.slots,
+                    elements: n,
+                }
+                .into_baked(),
+                dispatch: draft_rows_1d(n, bucket_m),
+                bindings: baked(vec![
+                    Binding::ArenaSlot {
+                        slot: *input,
+                        binding_index: 0,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::DraftCapture,
+                        binding_index: 1,
+                    },
+                ]),
+                gemm_dims: None,
+            }
+        }
+        I::DraftConv(c) => {
+            let dtype = dequant_dtype_for(p);
+            let g = draft_geometry(p);
+            let layer = LayerId(c.layer.0 + layer_offset);
+            let groups = (g.rows * p.hidden_size as u32).div_ceil(THREADS_PER_GROUP);
+            let arena = |slot: Slot, binding_index| Binding::ArenaSlot {
+                slot: slot.0,
+                binding_index,
+            };
+            LoweredCommand {
+                kernel: KernelId::DraftConv,
+                library: "dflash2",
+                function: draft_pick(dtype, "draft_conv_f16", "draft_conv_bf16"),
+                constants: draft_constants(p, c.residual.is_some()),
+                dispatch: draft_lanes_grid(groups, g, bucket_m, 1),
+                bindings: baked(vec![
+                    arena(c.input, 0),
+                    arena(c.dynamic, 1),
+                    source(w.of(WeightKind::Tensor, 0)?, WeightTensor::Weight, layer, 2),
+                    // The preparing stage adds no residual: it binds its input in its place.
+                    arena(c.residual.unwrap_or(c.input), 3),
+                    arena(c.output, 4),
+                ]),
+                gemm_dims: None,
+            }
+        }
+        I::DraftAttention(Slot(qkv), Slot(out), LayerId(layer)) => {
+            let dtype = dequant_dtype_for(p);
+            let g = draft_geometry(p);
+            let layer = LayerId(*layer + layer_offset);
+            let act = draft_act_bytes(p);
+            let s = crate::dflash2::AttentionScratch::at(g, super::ids::BucketM(bucket_m), act);
+            *moe_scratch_bytes = (*moe_scratch_bytes).max(s.total as u32);
+            let scratch = |at: u64, binding_index| Binding::MoeScratch {
+                binding_index,
+                byte_offset: at as u32,
+            };
+            let runtime = |kind, binding_index| Binding::Runtime {
+                kind,
+                binding_index,
+            };
+            let constants = draft_constants(p, true);
+            let rope = w.of(WeightKind::CosSin, 0)?;
+            // Splash's prepare dispatch: a group per 256 value elements, at least one per
+            // (row, head) norm task.
+            let prepare_groups = (g.rows * g.kv_heads * g.head_dim)
+                .div_ceil(THREADS_PER_GROUP)
+                .max(g.rows * (g.query_heads + g.kv_heads));
+            let reorder_groups = (g.rows * g.query_heads * g.head_dim).div_ceil(THREADS_PER_GROUP);
+            let splits = crate::dflash2::ATTENTION_SPLITS;
+            return Ok(vec![
+                LoweredCommand {
+                    kernel: KernelId::DraftAttentionQkv,
+                    library: "dflash2",
+                    function: draft_pick(
+                        dtype,
+                        "draft_attention_qkv_f16_rope_f16",
+                        "draft_attention_qkv_bf16_rope_bf16",
+                    ),
+                    constants,
+                    dispatch: draft_lanes_grid(prepare_groups, g, bucket_m, 1),
+                    bindings: baked(vec![
+                        Binding::ArenaSlot {
+                            slot: *qkv,
+                            binding_index: 0,
+                        },
+                        scratch(s.queries, 1),
+                        source(
+                            w.of(WeightKind::RmsNorm, 0)?,
+                            WeightTensor::Weight,
+                            layer,
+                            2,
+                        ),
+                        source(
+                            w.of(WeightKind::RmsNorm, 1)?,
+                            WeightTensor::Weight,
+                            layer,
+                            3,
+                        ),
+                        source(rope, WeightTensor::Weight, layer, 4),
+                        runtime(RuntimeBindingKind::Positions, 5),
+                        scratch(s.query_keys, 6),
+                        scratch(s.query_values, 7),
+                    ]),
+                    gemm_dims: None,
+                },
+                LoweredCommand {
+                    kernel: KernelId::DraftAttentionSplit,
+                    library: "dflash2",
+                    function: draft_pick(
+                        dtype,
+                        "draft_attention_split_f16",
+                        "draft_attention_split_bf16",
+                    ),
+                    constants,
+                    dispatch: draft_lanes_grid(g.kv_heads, g, bucket_m, splits),
+                    bindings: baked(vec![
+                        scratch(s.queries, 0),
+                        runtime(RuntimeBindingKind::DraftRingKeys { layer }, 1),
+                        runtime(RuntimeBindingKind::DraftRingValues { layer }, 2),
+                        runtime(RuntimeBindingKind::DraftRingSlots, 3),
+                        runtime(RuntimeBindingKind::Positions, 4),
+                        scratch(s.query_keys, 5),
+                        scratch(s.query_values, 6),
+                        scratch(s.partials, 7),
+                    ]),
+                    gemm_dims: None,
+                },
+                LoweredCommand {
+                    kernel: KernelId::DraftAttentionReduce,
+                    library: "dflash2",
+                    function: draft_pick(
+                        dtype,
+                        "draft_attention_reduce_f16",
+                        "draft_attention_reduce_bf16",
+                    ),
+                    constants,
+                    dispatch: draft_lanes_grid(g.kv_heads, g, bucket_m, 1),
+                    bindings: baked(vec![scratch(s.queries, 0), scratch(s.partials, 1)]),
+                    gemm_dims: None,
+                },
+                LoweredCommand {
+                    kernel: KernelId::DraftAttentionReorder,
+                    library: "dflash2",
+                    function: draft_pick(
+                        dtype,
+                        "draft_attention_reorder_f16",
+                        "draft_attention_reorder_bf16",
+                    ),
+                    constants,
+                    dispatch: draft_lanes_grid(reorder_groups, g, bucket_m, 1),
+                    bindings: baked(vec![
+                        scratch(s.queries, 0),
+                        Binding::ArenaSlot {
+                            slot: *out,
+                            binding_index: 1,
+                        },
+                    ]),
+                    gemm_dims: None,
+                },
+            ]);
+        }
+        I::DraftContextKv(Slot(kv), LayerId(layer)) => {
+            let dtype = dequant_dtype_for(p);
+            let g = draft_geometry(p);
+            let layer = LayerId(*layer + layer_offset);
+            let constants = draft_constants(p, true);
+            let runtime = |kind, binding_index| Binding::Runtime {
+                kind,
+                binding_index,
+            };
+            let head = [
+                Binding::ArenaSlot {
+                    slot: *kv,
+                    binding_index: 0,
+                },
+                source(
+                    w.of(WeightKind::RmsNorm, 0)?,
+                    WeightTensor::Weight,
+                    layer,
+                    1,
+                ),
+                source(w.of(WeightKind::CosSin, 0)?, WeightTensor::Weight, layer, 2),
+                runtime(RuntimeBindingKind::Positions, 3),
+                runtime(RuntimeBindingKind::DraftRingKeys { layer }, 4),
+                runtime(RuntimeBindingKind::DraftRingValues { layer }, 5),
+                runtime(RuntimeBindingKind::DraftRingSlots, 6),
+            ];
+            let tasks = eff_m * g.kv_heads;
+            // A cycle's commit, then a prompt's: `route_draft_commit` gates them apart.
+            return Ok(vec![
+                LoweredCommand {
+                    kernel: KernelId::DraftContextCommit,
+                    library: "dflash2",
+                    function: draft_pick(
+                        dtype,
+                        "draft_context_kv_commit_f16_rope_f16",
+                        "draft_context_kv_commit_bf16_rope_bf16",
+                    ),
+                    constants,
+                    dispatch: draft_tasks(tasks, bucket_m),
+                    bindings: baked(
+                        (head.iter().copied())
+                            .chain([
+                                runtime(RuntimeBindingKind::DraftRetained, 7),
+                                runtime(RuntimeBindingKind::CuSeqlensQ, 8),
+                                runtime(RuntimeBindingKind::NumTokensU32, 9),
+                            ])
+                            .collect(),
+                    ),
+                    gemm_dims: None,
+                },
+                LoweredCommand {
+                    kernel: KernelId::DraftContextPrefill,
+                    library: "dflash2",
+                    function: draft_pick(
+                        dtype,
+                        "prefill_draft_context_kv_f16_rope_f16",
+                        "prefill_draft_context_kv_bf16_rope_bf16",
+                    ),
+                    constants,
+                    dispatch: draft_tasks(tasks, bucket_m),
+                    bindings: baked(
+                        (head.iter().copied())
+                            .chain([
+                                runtime(RuntimeBindingKind::CuSeqlensQ, 7),
+                                runtime(RuntimeBindingKind::NumTokensU32, 8),
+                            ])
+                            .collect(),
+                    ),
+                    gemm_dims: None,
+                },
+            ]);
+        }
+        I::DraftWindowStore(Slot(context)) | I::DraftWindowLoad(Slot(context)) => {
+            let dtype = dequant_dtype_for(p);
+            let constants = draft_constants(p, true);
+            let runtime = |kind, binding_index| Binding::Runtime {
+                kind,
+                binding_index,
+            };
+            // One simdgroup per row and 64-value group, eight to a threadgroup (Splash's
+            // SPLASH_DRAFT_CONTEXT_SIMDGROUPS).
+            let groups = (p.hidden_size as u32).div_ceil(64);
+            let dispatch = draft_tasks((eff_m * groups).div_ceil(8), bucket_m);
+            let head = [
+                Binding::ArenaSlot {
+                    slot: *context,
+                    binding_index: 0,
+                },
+                runtime(RuntimeBindingKind::DraftWindow, 1),
+                runtime(RuntimeBindingKind::Positions, 2),
+                runtime(RuntimeBindingKind::DraftRingSlots, 3),
+            ];
+            let command =
+                |kernel, f16: &'static str, bf16: &'static str, tail: &[Binding]| LoweredCommand {
+                    kernel,
+                    library: "dflash2",
+                    function: draft_pick(dtype, f16, bf16),
+                    constants,
+                    dispatch,
+                    bindings: baked(head.iter().chain(tail).copied().collect()),
+                    gemm_dims: None,
+                };
+            let rows = [
+                runtime(RuntimeBindingKind::CuSeqlensQ, 4),
+                runtime(RuntimeBindingKind::NumTokensU32, 5),
+            ];
+            return Ok(match inst {
+                // A cycle's commit, then a prompt's: `route_draft_commit` gates them apart.
+                I::DraftWindowStore(_) => vec![
+                    command(
+                        KernelId::DraftWindowStoreCommit,
+                        "draft_window_store_commit_f16",
+                        "draft_window_store_commit_bf16",
+                        &[
+                            runtime(RuntimeBindingKind::DraftRetained, 4),
+                            runtime(RuntimeBindingKind::CuSeqlensQ, 5),
+                            runtime(RuntimeBindingKind::NumTokensU32, 6),
+                        ],
+                    ),
+                    command(
+                        KernelId::DraftWindowStorePrefill,
+                        "prefill_draft_window_store_f16",
+                        "prefill_draft_window_store_bf16",
+                        &rows,
+                    ),
+                ],
+                _ => vec![command(
+                    KernelId::DraftWindowLoad,
+                    "draft_window_load_f16",
+                    "draft_window_load_bf16",
+                    &rows,
+                )],
+            });
+        }
+        I::DraftSelect(Slot(logits), Slot(selector)) => {
+            let dtype = dequant_dtype_for(p);
+            let g = draft_geometry(p);
+            let s = crate::dflash2::SelectScratch::at(g, super::ids::BucketM(bucket_m));
+            *moe_scratch_bytes = (*moe_scratch_bytes).max(s.total as u32);
+            let lanes = g.lanes(super::ids::BucketM(bucket_m)).max(1) as u32;
+            let constants = draft_select_constants(p, lanes);
+            let scratch = |at: u64, binding_index| Binding::MoeScratch {
+                binding_index,
+                byte_offset: at as u32,
+            };
+            let runtime = |kind, binding_index| Binding::Runtime {
+                kind,
+                binding_index,
+            };
+            let output = |region, binding_index| {
+                runtime(RuntimeBindingKind::DraftOutputs(region), binding_index)
+            };
+            use crate::dflash2::{DraftOutput as O, PROPOSALS, SAMPLING_SHARDS};
+            let unindexed = LayerId(0);
+            let rows = lanes * PROPOSALS;
+            let one = |groups: u32, threads: u32| DispatchShape {
+                threadgroups: (groups, 1, 1),
+                threads_per_threadgroup: (threads, 1, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    set_axis: None,
+                    axis: crate::tape::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                }),
+            };
+            return Ok(vec![
+                LoweredCommand {
+                    kernel: KernelId::DraftSelectTop16,
+                    library: "dflash2_select",
+                    function: draft_pick(
+                        dtype,
+                        "draft_select_top16_sharded_f16",
+                        "draft_select_top16_sharded_bf16",
+                    ),
+                    constants,
+                    dispatch: one(rows * SAMPLING_SHARDS, THREADS_PER_GROUP),
+                    bindings: baked(vec![
+                        Binding::ArenaSlot {
+                            slot: *logits,
+                            binding_index: 0,
+                        },
+                        scratch(s.partial_ids, 1),
+                        scratch(s.partial_values, 2),
+                    ]),
+                    gemm_dims: None,
+                },
+                LoweredCommand {
+                    kernel: KernelId::DraftSelectEdges,
+                    library: "dflash2_select",
+                    function: draft_pick(
+                        dtype,
+                        "draft_select_edges_f16",
+                        "draft_select_edges_bf16",
+                    ),
+                    constants,
+                    dispatch: one(rows, crate::dflash2::EDGE_THREADS),
+                    bindings: baked(vec![
+                        scratch(s.partial_ids, 0),
+                        scratch(s.partial_values, 1),
+                        output(O::Candidates, 2),
+                        output(O::Unary, 3),
+                        Binding::ArenaSlot {
+                            slot: *selector,
+                            binding_index: 4,
+                        },
+                        source(
+                            w.of(WeightKind::Tensor, 0)?,
+                            WeightTensor::Weight,
+                            unindexed,
+                            5,
+                        ),
+                        source(
+                            w.of(WeightKind::Tensor, 1)?,
+                            WeightTensor::Weight,
+                            unindexed,
+                            6,
+                        ),
+                        runtime(RuntimeBindingKind::InputIds, 7),
+                        runtime(RuntimeBindingKind::NumTokensU32, 8),
+                    ]),
+                    gemm_dims: None,
+                },
+                LoweredCommand {
+                    kernel: KernelId::DraftSelectWalk,
+                    library: "dflash2_select",
+                    function: "draft_select_dflash",
+                    constants,
+                    dispatch: one(lanes, 1),
+                    bindings: baked(vec![
+                        output(O::Candidates, 0),
+                        output(O::Unary, 1),
+                        scratch(s.partial_values, 2),
+                        output(O::Tokens, 3),
+                        output(O::QProbs, 4),
+                        output(O::Confidence, 5),
+                        runtime(RuntimeBindingKind::DraftLaneParams, 6),
+                        runtime(RuntimeBindingKind::NumTokensU32, 7),
+                    ]),
+                    gemm_dims: None,
+                },
+                LoweredCommand {
+                    kernel: KernelId::DraftVerifyRows,
+                    library: "dflash2_select",
+                    function: "draft_verify_rows",
+                    constants,
+                    dispatch: DispatchShape {
+                        threadgroups: (1, 1, 1),
+                        threads_per_threadgroup: (1, 1, 1),
+                        m_scaling: None,
+                    },
+                    bindings: baked(vec![
+                        output(O::Confidence, 0),
+                        output(O::VerifyRows, 1),
+                        runtime(RuntimeBindingKind::DraftLaneParams, 2),
+                        runtime(RuntimeBindingKind::NumTokensU32, 3),
+                    ]),
+                    gemm_dims: None,
+                },
+            ]);
         }
 
         // ── Qwen3.5-MoE shared-expert combine: out = routed + shared_y * sigmoid(g) ──
@@ -5292,21 +5771,24 @@ fn lower_one(
             // scratch a barrier apart. Its shader's static asserts are these bounds. A
             // threadgroup a (sequence, key head, VALUE head) — `tgid.y` over `nv`, 2× the key
             // heads' fill on a model whose value heads outnumber them.
+            // Its rows are a SEQUENCE's (`cu_seqlens`, a threadgroup a sequence): at most a verify
+            // lane's (GDN_VERIFY_ROWS) at every verify-sized bucket, which holds up to
+            // `DFLASH2_BLOCK_LANES` such lanes; a bucket of fewer rows bounds them tighter.
+            let seq_rows = bucket_m.min(GDN_VERIFY_ROWS);
             let verify = (simd_scan
                 && nv.is_multiple_of(nk)
                 && 2 * hk + hv <= 1024
                 && hv == 128
                 && kernel <= 8
-                && (2..=GDN_VERIFY_ROWS).contains(&bucket_m)
-                && bucket_m <= 32
+                && (2..=crate::op_abi::METAL_VERIFY_ROWS).contains(&bucket_m)
                 && p.spec_drafts < GDN_VERIFY_ROWS
-                && bucket_m + p.spec_drafts < 32
-                && bucket_m * (2 * hk + 2 * hv) * 4
-                    + (2 * bucket_m + p.spec_drafts + 1 + 3 * bucket_m) * 4
+                && seq_rows + p.spec_drafts < 32
+                && seq_rows * (2 * hk + 2 * hv) * 4
+                    + (2 * seq_rows + p.spec_drafts + 1 + 3 * seq_rows) * 4
                     <= 32768)
                 .then(|| {
                     let rows = [
-                        ConstantValue::uint(7, bucket_m),
+                        ConstantValue::uint(7, seq_rows),
                         ConstantValue::uint(8, p.spec_drafts),
                     ];
                     let lanes = p.spec_drafts > 0;
@@ -5329,9 +5811,14 @@ fn lower_one(
                     );
                     vec![verify, qk_state]
                 });
-            if let Some(verify) = verify {
-                return Ok(verify);
-            }
+            // At most a lane's rows a bucket: every sequence is within the verify command's. A
+            // wider bucket (a 2-4-lane verify's) may also carry a sequence of more rows, a short
+            // prompt's one chunk: the verify command runs a step whose sequences hold a lane's rows
+            // at most, and the commands below every other (`route_gdn`, the lane-rows gates).
+            let verify = match verify {
+                Some(v) if bucket_m <= GDN_VERIFY_ROWS => return Ok(v),
+                v => v,
+            };
 
             let layout = GdnScratchLayout::compute(bucket_m, conv_dim, nv, value_dim);
             *moe_scratch_bytes = (*moe_scratch_bytes).max(layout.total);
@@ -5376,6 +5863,10 @@ fn lower_one(
                 None,
             ));
 
+            // The verify pair first: `route_gdn` gates it on the lane rows, the rest off them.
+            if let Some(verify) = verify {
+                return Ok(verify.into_iter().chain(cmds).collect());
+            }
             return Ok(cmds);
         }
 
@@ -5652,7 +6143,9 @@ fn lower_one(
                 // VISION_Q_SIZE (= vision_num_heads * vision_head_dim) is the residual-stream
                 // width the interpolated positional embedding is added to.
                 RowsExtern::PosEmbeds => (p.vision_q_size, RuntimeBindingKind::VisionPosEmbeds),
-                RowsExtern::TargetHidden => (p.hidden_size, RuntimeBindingKind::TargetHidden),
+                RowsExtern::TargetHidden => {
+                    (p.target_hidden_width, RuntimeBindingKind::TargetHidden)
+                }
             };
             let n_elems = eff_m * width as u32;
             LoweredCommand {
@@ -6032,6 +6525,138 @@ const MLP_STEEL_THREADS: u32 = 128;
 /// MLX gemv port's `blockM = BM*SM*TM = 4`.
 const MLP_DECODE_BLOCK_M: u32 = 4;
 
+/// A DFlash2 drafter kernel's symbol at the activation dtype.
+fn draft_pick(dtype: DequantDtype, f16: &'static str, bf16: &'static str) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => f16,
+        DequantDtype::Bf16 => bf16,
+    }
+}
+
+/// The drafter's geometry its kernels index by: its block (its drafts and their anchor) and its
+/// attention's heads.
+fn draft_geometry(p: &MetalModelConsts) -> crate::dflash2::DraftGeometry {
+    crate::dflash2::DraftGeometry {
+        rows: p.spec_drafts + 1,
+        query_heads: p.num_q_heads,
+        kv_heads: p.num_kv_heads,
+        head_dim: p.head_dim,
+    }
+}
+
+/// The activation's bytes per element.
+fn draft_act_bytes(p: &MetalModelConsts) -> u64 {
+    match dequant_dtype_for(p) {
+        DequantDtype::F16 | DequantDtype::Bf16 => 2,
+    }
+}
+
+/// Every `dflash2.metal` command's constants (`DraftConstants`); `finish` is a convolution's stage.
+fn draft_constants(p: &MetalModelConsts, finish: bool) -> &'static [ConstantValue] {
+    let g = draft_geometry(p);
+    super::kernel_constants::DraftConstants {
+        rows: g.rows,
+        query_heads: g.query_heads,
+        kv_heads: g.kv_heads,
+        head_dim: g.head_dim,
+        window: p.sliding_window.max(0) as u32,
+        splits: crate::dflash2::ATTENTION_SPLITS,
+        hidden: p.hidden_size as u32,
+        conv_group: p.draft_conv_group,
+        conv_finish: u32::from(finish),
+        rms_eps: p.rms_norm_eps,
+        scale: p.attn_scale,
+    }
+    .into_baked()
+}
+
+/// Every `dflash2_select.metal` command's constants at a bucket of `lanes` lanes
+/// (`DraftSelectConstants`): Splash's selector, and its verify rows' model, its target's
+/// ([`VerifyRows::of_target`](crate::dflash2::VerifyRows::of_target)).
+fn draft_select_constants(p: &MetalModelConsts, lanes: u32) -> &'static [ConstantValue] {
+    use crate::dflash2::{CANDIDATES, PROPOSALS, SAMPLING_SHARDS, VerifyRows};
+    super::kernel_constants::DraftSelectConstants {
+        vocab: p.vocab_size as u32,
+        rows: draft_geometry(p).rows,
+        positions: PROPOSALS,
+        candidates: CANDIDATES,
+        rank: p.draft_selector_rank,
+        shards: SAMPLING_SHARDS,
+        verify: VerifyRows::of_target(p.target_routes_experts),
+        lanes,
+    }
+    .into_baked()
+}
+
+/// A drafter grid of `x` groups by the bucket's lanes (set to the step's sequences) by `z`, of 256
+/// threads.
+fn draft_lanes_grid(
+    x: u32,
+    g: crate::dflash2::DraftGeometry,
+    bucket_m: u32,
+    z: u32,
+) -> DispatchShape {
+    use crate::tape::lowered::{MScaleAxis, MScaling, SetAxis};
+    DispatchShape {
+        threadgroups: (x, g.lanes(super::ids::BucketM(bucket_m)).max(1) as u32, z),
+        threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+        m_scaling: Some(MScaling {
+            axis: MScaleAxis::Y,
+            bucket_m: super::ids::BucketM(bucket_m),
+            set_axis: Some(SetAxis::Seqs(MScaleAxis::Y)),
+        }),
+    }
+}
+
+/// A grid of one 256-thread group per task, scaled with the step's rows.
+fn draft_tasks(tasks: u32, bucket_m: u32) -> DispatchShape {
+    use crate::tape::lowered::{MScaleAxis, MScaling};
+    DispatchShape {
+        threadgroups: (tasks.max(1), 1, 1),
+        threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+        m_scaling: Some(MScaling {
+            axis: MScaleAxis::X,
+            bucket_m: super::ids::BucketM(bucket_m),
+            set_axis: None,
+        }),
+    }
+}
+
+/// A one-thread-per-element grid over `n` elements, scaled with the step's rows.
+fn draft_rows_1d(n: u32, bucket_m: u32) -> DispatchShape {
+    use crate::tape::lowered::{MScaleAxis, MScaling};
+    let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
+    d.m_scaling = Some(MScaling {
+        set_axis: None,
+        axis: MScaleAxis::X,
+        bucket_m: super::ids::BucketM(bucket_m),
+    });
+    d
+}
+
+/// A drafter's context commit runs Splash's two writers apart (`lower_one`): a cycle's commit of
+/// its lanes' retained verify rows, else a prompt's rows — into its rings and into its windows
+/// alike.
+fn route_draft_commit(step: &MetalStep, cmds: Vec<GatedCommand>) -> Vec<GatedCommand> {
+    use crate::tape::lowered::RuntimeGate::{self, OnlyIfDraftCycle, UnlessDraftCycle};
+    if !matches!(
+        step,
+        MetalStep::DraftContextKv(..) | MetalStep::DraftWindowStore(..)
+    ) {
+        return cmds;
+    }
+    cmds.into_iter()
+        .map(|GatedCommand { command, gate }| {
+            let by = match command.kernel {
+                KernelId::DraftContextCommit | KernelId::DraftWindowStoreCommit => OnlyIfDraftCycle,
+                _ => UnlessDraftCycle,
+            };
+            let gate = Some(RuntimeGate::and(gate, baked(vec![by])));
+            GatedCommand { command, gate }
+        })
+        .collect()
+}
+
 /// Pick the f16-or-bf16 specialization for a kernel that follows the
 /// `<base>_<dtype>_specialized` naming convention. Centralizes the
 /// `Int4`-not-yet-wired panic so each lowering arm spells out only
@@ -6155,7 +6780,7 @@ fn gdn_decode_static_name(dtype: DequantDtype) -> &'static str {
 
 /// The most rows a bucket of `gdn_verify` steps holds (its shader's `GDN_VER_ROWS`, at most 8: a
 /// simdgroup a row's norms): the verify-sized buckets.
-const GDN_VERIFY_ROWS: u32 = crate::op_abi::METAL_VERIFY_ROWS;
+const GDN_VERIFY_ROWS: u32 = crate::op_abi::METAL_LANE_VERIFY_ROWS;
 
 fn gdn_verify_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
@@ -7439,7 +8064,8 @@ enum MoeGrouping {
     /// Pure gathered: pair rows in token order, no sort — the projections read the token rows.
     Gathered,
     /// Sorted gathered: the `moe_group` sort at padding 1 — same-expert pairs adjacent, so the
-    /// gathered matvecs' repeat slab reads hit cache; `mpad_max` = pairs.
+    /// gathered matvecs' repeat slab reads hit cache; `mpad_max` = pairs, the step's live ones
+    /// first.
     Sorted,
     /// Grouped: the sort at padding 64 — each 64-row output tile is one expert's, for the
     /// batched per-expert GEMMs.
@@ -7489,13 +8115,24 @@ impl MoeScratch {
         // Sorted at 0.5–1 per expert: the per-pair matvecs stay, sorted by expert so an expert two
         // rows pick is read once from DRAM (Gemma-4 at bucket 8 × top-8: ~52 distinct experts hold
         // 64 pairs, a quarter of the slab reads repeats — 17% of the base-M5 conc-8 step). Anything
-        // else gathers: the sorted matvecs run the bucket's every pair, the gathered ones its live.
+        // else gathers. Either runs the step's live pairs alone.
         use crate::op_abi::{
-            METAL_GROUPED_PAIRS_PER_EXPERT, METAL_SORTED_PAIRS, METAL_SORTED_PAIRS_PER_EXPERT,
+            METAL_DECODE_GROUPED_ROWS, METAL_GROUPED_PAIRS_PER_EXPERT, METAL_LANE_VERIFY_ROWS,
+            METAL_SORTED_PAIRS, METAL_SORTED_PAIRS_PER_EXPERT,
         };
         let pairs = bucket_m * b.top_k.0;
         let per_expert = pairs as f32 / b.experts.0 as f32;
+        // A lane's verify sorts on every bank (Splash's decode plan); the 2-4-lane verifies wider
+        // buckets carry are only a block drafter's target's (`draft_capture_slots`), so only its
+        // bake sorts there: another model keeps its own ladder at those buckets.
+        let lanes = if p.draft_capture_slots > 0 {
+            METAL_LANE_VERIFY_ROWS..=METAL_DECODE_GROUPED_ROWS
+        } else {
+            METAL_LANE_VERIFY_ROWS..=METAL_LANE_VERIFY_ROWS
+        };
         let grouping = match groups && pairs >= METAL_SORTED_PAIRS {
+            // A verify of one to four lanes, Splash's decode plan, groups every route by expert.
+            true if lanes.contains(&bucket_m) => MoeGrouping::Sorted,
             true if per_expert >= METAL_GROUPED_PAIRS_PER_EXPERT => MoeGrouping::Grouped,
             true if METAL_SORTED_PAIRS_PER_EXPERT.contains(&per_expert) => MoeGrouping::Sorted,
             _ => MoeGrouping::Gathered,
@@ -7715,8 +8352,8 @@ fn lower_moe_step(
                 GatedAct::SwigluOai => (KernelId::SwigluOaiMul, swiglu_oai_mul_static_name(dtype)),
             };
             let (rows, m_scaling) = match s.grouping {
-                MoeGrouping::Gathered => (pairs, ms(A::X)),
-                MoeGrouping::Sorted | MoeGrouping::Grouped => (s.l.mpad_max, None),
+                MoeGrouping::Gathered | MoeGrouping::Sorted => (pairs, ms(A::X)),
+                MoeGrouping::Grouped => (s.l.mpad_max, None),
             };
             let n = rows * inter;
             let shape = grid((n.div_ceil(256), 1, 1), (256, 1, 1), m_scaling);
@@ -7833,13 +8470,12 @@ fn lower_moe_step(
             bindings.push(s.at(9, R::ExpertUp));
         }
         bindings.extend(gain);
-        // Pairs along X. Gathered: the live pairs exactly — a verify bucket runs an expert's
-        // pairs in its first pair's threadgroup, scanning the live ones. Sorted: the full static
-        // grid — a short step's live pairs sit past the m-scaled edge, on rows the init
-        // sentinel-filled.
+        // Pairs along X: the live pairs exactly. Gathered — a verify bucket runs an expert's pairs
+        // in its first pair's threadgroup, scanning the live ones; sorted — the sort lays the live
+        // pairs out first, the rows past the step's left out (`moe_group_offsets`).
         let scaling = match s.grouping {
-            MoeGrouping::Gathered => ms(A::X),
-            MoeGrouping::Sorted | MoeGrouping::Grouped => None,
+            MoeGrouping::Gathered | MoeGrouping::Sorted => ms(A::X),
+            MoeGrouping::Grouped => None,
         };
         let shape = grid((pairs, inter.div_ceil(8), 1), (32, 4, 1), scaling);
         let gather = AffineGatherQmvConstants {
@@ -8144,15 +8780,18 @@ fn lower_moe_step(
         // (token, expert) row to its padded slot — at padding 1 (sorted) or 64 (grouped).
         // Gathered: nothing — the projections read the token rows.
         S::Sort(Slot(x)) if s.grouping != MoeGrouping::Gathered => {
-            let (mpad, one) = (s.l.mpad_max as i32, (1, 1, 1));
+            let mpad = s.l.mpad_max as i32;
             let pad = s.grouping.pad().expect("a sorted bake pads");
             let sentinel = s.grouping.sentinel(e) as i32;
+            // One command groups the routes and fills the padding (Splash's `group_routes`).
             let offsets = vec![
                 C::int(0, pairs as i32),
                 C::int(1, e as i32),
+                C::int(2, mpad),
+                C::int(3, k as i32),
                 C::int(6, pad as i32),
+                C::int(7, sentinel),
             ];
-            let init = vec![C::int(1, e as i32), C::int(2, mpad), C::int(7, sentinel)];
             let scatter = [0, 1, 2, 3, 4]
                 .into_iter()
                 .zip([pairs, e, s.l.mpad_max, k, hidden]);
@@ -8200,21 +8839,19 @@ fn lower_moe_step(
                         lib,
                         "moe_group_offsets",
                         offsets,
-                        grid(one, (256, 1, 1), None),
+                        grid((l.mpad_max.max(e).div_ceil(256), 1, 1), (256, 1, 1), None),
                         vec![
                             s.at(0, R::TopKIndices),
                             at(1, l.grp_count),
                             at(2, l.grp_offset),
                             at(3, l.grp_total),
+                            Binding::Runtime {
+                                kind: RuntimeBindingKind::NumTokensU32,
+                                binding_index: 4,
+                            },
+                            at(5, l.grp_indices_pad),
+                            at(6, l.grp_fill),
                         ],
-                    ),
-                    cmd(
-                        KernelId::MoeGroupInit,
-                        lib,
-                        "moe_group_init",
-                        init,
-                        grid((l.mpad_max.div_ceil(256), 1, 1), (256, 1, 1), None),
-                        vec![at(0, l.grp_indices_pad), at(1, l.grp_fill)],
                     ),
                     cmd(
                         scatter_kernel,
@@ -8373,11 +9010,10 @@ fn lower_moe_step(
                 let ((x, norm, gain), indices) = (normed_rows(&s, 3, rows)?, gather_indices(&s, 4));
                 bindings.extend([x, indices, s.at(5, out)]);
                 bindings.extend(gain);
-                // A sorted bake runs the full static grid: a short step's live pairs sit past
-                // the m-scaled edge, on rows the init sentinel-filled.
+                // The live pairs, which a sorted bake's sort lays out first.
                 let scaling = match s.grouping {
-                    MoeGrouping::Gathered => ms(A::Z),
-                    MoeGrouping::Sorted | MoeGrouping::Grouped => None,
+                    MoeGrouping::Gathered | MoeGrouping::Sorted => ms(A::Z),
+                    MoeGrouping::Grouped => None,
                 };
                 let shape = grid((1, n_out.div_ceil(8), pairs), (32, 2, 1), scaling);
                 let mut qmv: Vec<ConstantValue> = AffineGatherQmvConstants {
@@ -8428,12 +9064,12 @@ fn lower_moe_step(
         S::UpAct(up, act, routing) => {
             gated_command(up, ExpertBody::Ungated(act), routing, moe_scratch_bytes)?
         }
-        // Gathered: one command runs the down matvec of each token's pairs, 4 rows at a time,
-        // and combines those rows. A sorted bake cannot: the kernel pairs each token's rows by
-        // grid-adjacency (simdgroup k = pair k), which the sort permutes apart — so a sorted or
-        // grouped bake runs each step's own commands.
+        // Gathered or sorted: one command runs the down matvec of each token's pairs, 4 rows at a
+        // time, and combines those rows — a sorted bake's reading each pair's row where its sort
+        // put it (`pos`). A grouped bake runs each step's own commands: its batched GEMMs write
+        // the down rows of a 64-row expert tile.
         S::DownCombine(down, Slot(out), ends)
-            if s.grouping != MoeGrouping::Gathered || matches!(down.rows, MoeRows::Tokens(_)) =>
+            if s.grouping == MoeGrouping::Grouped || matches!(down.rows, MoeRows::Tokens(_)) =>
         {
             // Only the gathered command computes the combine's ends.
             if ends != crate::tape::step::CombineEnds::default() {
@@ -8456,6 +9092,10 @@ fn lower_moe_step(
             if let Some((Slot(shared), Slot(gate))) = ends.gate_scale {
                 bindings.extend([arena_at(8, shared), arena_at(9, gate)]);
             }
+            let sorted_rows = s.grouping == MoeGrouping::Sorted;
+            if sorted_rows {
+                bindings.push(scratch_at(11, s.l.grp_pos));
+            }
             // Tokens fastest, as the gate/up's pairs.
             let shape = grid((bucket_m, hidden.div_ceil(4), 1), (32, k, 1), ms(A::X));
             let mut constants: Vec<ConstantValue> = AffineCombineQmvConstants {
@@ -8463,6 +9103,7 @@ fn lower_moe_step(
                 top_k: b.top_k,
                 gate_scale: ends.gate_scale.is_some(),
                 residual: ends.residual,
+                sorted_rows,
             }
             .into();
             // gpt-oss experts carry a per-expert LINEAR bias on the down projection too — [E,
@@ -8502,8 +9143,8 @@ fn lower_moe_step(
         }
         S::Act(UngatedAct::Relu2) => {
             let (rows, m_scaling) = match s.grouping {
-                MoeGrouping::Gathered => (pairs, ms(A::X)),
-                MoeGrouping::Sorted | MoeGrouping::Grouped => (s.l.mpad_max, None),
+                MoeGrouping::Gathered | MoeGrouping::Sorted => (pairs, ms(A::X)),
+                MoeGrouping::Grouped => (s.l.mpad_max, None),
             };
             let n = rows * inter;
             let symbol = pick_specialized_symbol("relu2_f16", "relu2_bf16", p.metal_dtype);
@@ -8773,6 +9414,9 @@ mod tests {
             rotary: Some(TEST_ROTARY),
             block_cap: 128,
             profile,
+            class: profile.map_or(crate::tape::lowered::GenClass::M1, |t| {
+                crate::tape::lowered::GenClass::of(t.generation)
+            }),
         }
     }
 
@@ -8846,11 +9490,17 @@ mod tests {
         );
         let n = rows.len();
         let mut tape = row_tape(rows.clone());
-        tape.backbone_cache_live = std::iter::once(true).chain([false].repeat(n - 1)).collect();
+        tape.backbone_live = cache_plays(
+            &std::iter::once(true)
+                .chain([false].repeat(n - 1))
+                .collect::<Vec<_>>(),
+        );
         let lowered =
             lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(64, None)).expect("lowers");
         let commands = lowered.commands_expanded();
-        let live = lowered.cache_live_expanded();
+        let live: Vec<bool> = (lowered.live_expanded().iter())
+            .map(|p| p.cache_writes)
+            .collect();
         assert_eq!(commands[0].command.kernel, KernelId::RopeAppend);
         assert!(live[0] && writes_cache(&commands[0]));
         let (played, skipped): (Vec<_>, Vec<_>) = commands.iter().zip(&live).partition(|p| *p.1);
@@ -8861,7 +9511,7 @@ mod tests {
         );
 
         let mut refused = row_tape(rows);
-        refused.backbone_cache_live = vec![false; n];
+        refused.backbone_live = cache_plays(&vec![false; n]);
         let err = lower_subtile_tape_to_metal(&refused, &tq_consts(), bake_point(64, None));
         assert!(matches!(
             err,
@@ -8878,7 +9528,21 @@ mod tests {
             }])),
             ..lowered
         };
-        assert_eq!(rolled.cache_live_expanded(), live.repeat(3));
+        let rolled_live: Vec<bool> = (rolled.live_expanded().iter())
+            .map(|p| p.cache_writes)
+            .collect();
+        assert_eq!(rolled_live, live.repeat(3));
+    }
+
+    /// A tape's rows as the cache play's walk keeps them, every row in the result play.
+    fn cache_plays(cache_writes: &[bool]) -> Vec<PlayLive> {
+        (cache_writes.iter())
+            .map(|&cache_writes| PlayLive {
+                cache_writes,
+                result: true,
+                rebuild: false,
+            })
+            .collect()
     }
 
     /// Lower one coded layer — the KV writer, then its attention — at `bucket_m`.
@@ -10880,6 +11544,47 @@ mod tests {
         }
     }
 
+    /// On the wide class, a projection whose twin is at most one threadgroup a core of the class's
+    /// fewest runs its own matvec at a small-M bucket; a wider one, and every projection on the M5
+    /// class, takes the twin.
+    #[test]
+    fn a_narrow_projection_keeps_its_matvec_on_the_wide_class() {
+        use crate::tape::lowered::GenClass;
+        use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
+        let gemm = |n: u32| {
+            MetalStep::AffineQmm(AffineMatmul {
+                input: Slot(0),
+                output: Slot(1),
+                layer: LayerId(0),
+                n: NDim(n),
+                k: KDim(2048),
+                bits: AffineBits(4),
+                vector_limit: QmvBatchLimit(10),
+                ..q_proj()
+            })
+        };
+        let widest = SMALL_M_TILE_COLS * crate::tape::lowered::M5_WIDE_MIN_CORES;
+        let twin = vec![
+            (KernelId::AffineQmvWide, Some(UnlessSmallMTokens)),
+            (KernelId::AffineQmmSmallM, Some(OnlyIfSmallMTokens)),
+        ];
+        let own = vec![(KernelId::AffineQmvWide, None)];
+        for (class, n, want) in [
+            (GenClass::M5Wide, widest, &own),
+            (GenClass::M5Wide, 2 * widest, &twin),
+            (GenClass::M5, widest, &twin),
+            (GenClass::M5, 2 * widest, &twin),
+        ] {
+            let at = BakePoint {
+                class,
+                ..bake_point(8, Some(&crate::targets::M5_10CORE))
+            };
+            let tape = lower_subtile_tape_to_metal(&row_tape(plain(&[gemm(n)])), &tp(), at)
+                .expect("lowers");
+            assert_eq!(&gated_steps(&tape), want, "{class:?}, n {n}");
+        }
+    }
+
     /// The small-M wide band follows MLX's gen-15 boundary
     /// (`affine_qmv_wide_ok`): every production bake profile from the M3 on —
     /// the Mid class bakes against an M4 profile, the M5 class its own —
@@ -11104,21 +11809,28 @@ mod tests {
                     .iter()
                     .any(|b| matches!(b, Binding::Scratch { .. }))
             });
+            // A scratch write fences Ordered on its own; the elided gather's carried fence maxes
+            // with it.
+            let first = match writes_scratch {
+                true => F::Ordered.max(gather_fences),
+                false => gather_fences,
+            };
+            // A command no step runs with any before it (the small-M twin, gated against the GEMM's
+            // commands) fences as the step does; the step's other later commands (the SplitK reduce,
+            // the W4A8 GEMM) read what an earlier one wrote: RAW.
             let flags: Vec<F> = (0..n)
                 .map(|c| {
-                    if c == 0 && writes_scratch {
-                        // A scratch write fences Ordered on its own; the
-                        // elided gather's carried fence maxes with it.
-                        F::Ordered.max(gather_fences)
-                    } else if c > 0 {
-                        // The step's later commands (the SplitK reduce, the
-                        // W4A8 GEMM) read what the first wrote: RAW.
-                        F::Coherent
-                    } else {
-                        gather_fences
-                    }
+                    let alone = matmul[..c].iter().all(|e| match (e.gate, matmul[c].gate) {
+                        (Some(e), Some(g)) => e.excludes(g),
+                        _ => false,
+                    });
+                    if alone { first } else { F::Coherent }
                 })
                 .collect();
+            // At the twin's bucket, the twin is the one such later command.
+            if last == K::AffineQmmSmallM {
+                assert_eq!(flags.last(), Some(&first), "bucket {bucket_m}: the twin");
+            }
             assert_eq!(
                 tape.barrier_before[..n],
                 flags,
@@ -11291,12 +12003,12 @@ mod tests {
         let mut tape = row_tape(rows);
         tape.backbone_barriers = vec![Fence::None; 6];
         // A cache-only forward skips the q projection, and plays the pre-pass k and v reuse.
-        tape.backbone_cache_live = vec![false, true, true, false, false, true];
+        tape.backbone_live = cache_plays(&[false, true, true, false, false, true]);
         let tape = lower_subtile_tape_to_metal(&tape, &tp(), bake_point(512, m5)).expect("lowers");
         let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.command.kernel).collect();
         assert_eq!(kinds, [Quant, Gemm, Gemm, Gemm, Quant, Gemm, Quant, Gemm]);
         assert_eq!(
-            tape.cache_live,
+            tape.live.iter().map(|p| p.cache_writes).collect::<Vec<_>>(),
             [true, false, true, true, false, false, true, true]
         );
         assert_eq!(
@@ -12592,10 +13304,11 @@ mod tests {
     }
 
     /// A bake groups its experts from 4 pairs per expert (mlx's gate) and sorts them at 0.5–1
-    /// (where #232 measured the sort winning); anything else gathers. On the bucket ladder at top
-    /// 8: Gemma-4's 128 experts keep the choices they were measured at (sorted at 8, grouped from
-    /// 64). Qwen3.6's 256 gather below 512, as they did before they could group: at bucket 64 (2
-    /// per expert) a short prompt prefilled in 98 ms gathered, 105 ms grouped, 161 ms sorted.
+    /// (where #232 measured the sort winning), and at a lane's verify bucket at any density
+    /// (Splash's decode plan); anything else gathers. On the bucket ladder at top 8: Gemma-4's 128
+    /// experts keep the choices they were measured at (sorted at 8, grouped from 64). Qwen3.6's
+    /// 256 sort at 8 and gather at 64, where a short prompt prefilled in 98 ms gathered, 105 ms
+    /// grouped, 161 ms sorted.
     #[test]
     fn a_bake_groups_and_sorts_where_measured_to_win() {
         let p = tp();
@@ -12610,7 +13323,7 @@ mod tests {
             ),
             (
                 256,
-                [Gathered, Gathered, Gathered, Gathered, Gathered, Grouped],
+                [Gathered, Gathered, Gathered, Sorted, Gathered, Grouped],
             ),
         ] {
             let got = [1, 2, 4, 8, 64, 512].map(|bucket_m| grouping(experts, bucket_m));

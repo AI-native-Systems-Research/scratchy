@@ -272,6 +272,41 @@ pub enum OpKind {
     /// `export_hidden(x)`: the hidden state the forward exports for a reader after it (an MTP
     /// drafter's next draft), in place of the final matmul's input.
     ExportHidden,
+    /// `capture_hidden(x)`: a layer's output rows copied into their column block of the rows a
+    /// drafter reads (Splash's target capture, runtime/model/QwenTarget.cpp `addCapture`): the
+    /// block of the layer's place in `draft_capture_layers`. Identity: it returns `x`.
+    CaptureHidden,
+    /// `draft_context_kv(kv, k_norm, positions, rotary)`: a DFlash2 drafter's context commit of
+    /// one layer (Splash `draft_context_kv_commit` / `prefill_draft_context_kv`): each row's keys
+    /// (normed, roped) and values written into the layer's ring at the row's position. Identity: it
+    /// returns `kv`.
+    DraftContextKv,
+    /// `draft_window_store(context, positions)`: a DFlash2 drafter's commit of its context rows
+    /// into the lane's context window at their positions, 4-bit (Splash `DFlashContextWindow`,
+    /// `DraftAttention::addWindowStore`, runtime/model/DFlashDraft.cpp:118-180), from which a
+    /// prefix-cache hit rebuilds the lane's rings. Identity: it returns `context`.
+    DraftWindowStore,
+    /// `draft_window_load(context, positions)`: the context rows of the forward's positions, out
+    /// of the lane's context window, written over `context` (Splash `addWindowLoad`, in
+    /// `DFlashDraft::addContextRebuild`, DFlashDraft.cpp:184-198). Only a forward rebuilding the
+    /// lane's rings plays it: a commit's layers read the rows its store took, exact.
+    DraftWindowLoad,
+    /// `draft_conv(x, dynamic, base)` / `draft_conv(x, dynamic, base, residual)`: one stage of a
+    /// DFlash2 drafter's dynamic convolution (Splash `draft_conv`): each channel of a block row
+    /// and of the row before it, weighted by the stage's base kernel plus the channel group's
+    /// dynamic weight; the second stage (with the residual) adds it.
+    DraftConv,
+    /// `draft_attention(qkv, q_norm, k_norm, positions, rotary)`: a DFlash2 drafter's attention
+    /// of one layer (Splash `draft_attention_qkv`, `_bf16_split`, `_bf16_reduce`, `_reorder`):
+    /// each block row's query over the layer's ring and the block's own rows, every one of which
+    /// it sees. `[.., num_attention_heads * head_dim]`.
+    DraftAttention,
+    /// `draft_select(logits, selector, predecessor_codebook, successor_codebook)`: a DFlash2
+    /// drafter's proposals (Splash `draft_select_top16_sharded`, `_edges`, `_dflash`,
+    /// `draft_verify_rows`): each proposal row's top-16 candidates, scored with the codebooks from
+    /// the previous choice, walked into the block's proposals, and the rows its target verifies.
+    /// Identity: it returns `logits`.
+    DraftSelect,
     /// Variable-length attention used by vision encoders (Qwen2-VL,
     /// Qwen2.5-VL, ViT-style towers). Same q/k/v shape as `Attention`
     /// but with a `cu_seqlens` ragged-batch index instead of a paged
@@ -596,6 +631,13 @@ impl OpKind {
             "shared_attention" => Some(Self::SharedAttention),
             "shared_sliding_attention" => Some(Self::SharedSlidingAttention),
             "export_hidden" => Some(Self::ExportHidden),
+            "capture_hidden" => Some(Self::CaptureHidden),
+            "draft_context_kv" => Some(Self::DraftContextKv),
+            "draft_window_store" => Some(Self::DraftWindowStore),
+            "draft_window_load" => Some(Self::DraftWindowLoad),
+            "draft_conv" => Some(Self::DraftConv),
+            "draft_attention" => Some(Self::DraftAttention),
+            "draft_select" => Some(Self::DraftSelect),
             // Vision-tower ops. Unambiguous names: the four below are
             // unused on the decoder side, so the lookup is shared with
             // the decoder prelude — a `#[forward]` body that wrote
@@ -657,6 +699,13 @@ impl OpKind {
             Self::SharedAttention => "shared_attention",
             Self::SharedSlidingAttention => "shared_sliding_attention",
             Self::ExportHidden => "export_hidden",
+            Self::CaptureHidden => "capture_hidden",
+            Self::DraftContextKv => "draft_context_kv",
+            Self::DraftWindowStore => "draft_window_store",
+            Self::DraftWindowLoad => "draft_window_load",
+            Self::DraftConv => "draft_conv",
+            Self::DraftAttention => "draft_attention",
+            Self::DraftSelect => "draft_select",
             Self::VarlenAttention => "varlen_attention",
             Self::Silu => "silu",
             Self::Gelu => "gelu",

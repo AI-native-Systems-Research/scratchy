@@ -27,8 +27,8 @@ mod shared_memory;
 pub use self::core::Scheduler;
 pub use interface::{PauseState, SchedulerInterface};
 pub use output::{
-    CachedKvOp, CachedRequestData, KvGranule, NewRequestData, RecurrentStateOps, SchedulerOutput,
-    SharedMemoryOps, SnapshotUnit, StateSnapshotOp,
+    CachedKvOp, CachedRequestData, KvGranule, NewRequestData, RecurrentAdmissionOp,
+    RecurrentStateOps, SchedulerOutput, SharedMemoryOps, SnapshotUnit, StateSnapshotOp,
 };
 pub use recurrent_state::SnapshotBudget;
 pub use request_queue::{
