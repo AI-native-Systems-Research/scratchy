@@ -1485,14 +1485,23 @@ impl BatchChunking {
     /// Triton's gather floor.
     pub const GATHER_FLOOR: u32 = 8;
 
+    /// ⛔ `seqs` AND `nkvh` ARE COUNTS, ONE OR MORE. Both divide here, so a zero is a panic at BAKE
+    /// and not a wrong answer — `seqs` has divided since this function existed (`CORES / seqs`) and
+    /// `nkvh` since the fold was added (`GATHER_FLOOR.div_ceil(seqs · rows_per_page)`). Every
+    /// producer already has them non-zero by type (`AttnGeometry::nkvh` is a `NonZero`, a bundle's
+    /// rows are its baked width), so the clamps below are not a tolerance for zero: they keep this
+    /// `const fn` TOTAL, so a malformed step is a wrong chunking a test can catch rather than a
+    /// build that dies inside a `const` evaluation. The honest end state is a `NonZeroU32` pair in
+    /// the signature; that waits on `PagedStep`'s fields, which the bake's codegen quotes as `u32`.
     pub const fn of(seqs: u32, blocks: u32, nkvh: u32) -> BatchChunking {
+        let seqs = if seqs < 1 { 1 } else { seqs };
         let theirs = {
             let j = Self::CORES / seqs;
             let j = if j < blocks { j } else { blocks };
             if j < 1 { 1 } else { j }
         };
         let rows_per_page = if theirs * seqs < Self::GATHER_FLOOR {
-            nkvh
+            if nkvh < 1 { 1 } else { nkvh }
         } else {
             1
         };
@@ -1885,10 +1894,9 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         ("v_pages", "*fp16"),
         ("page_index_table", "*i32"),
     ];
-    // ⭐ BOTH ONE-SEQUENCE KERNELS READ `kv_row_pool`. The decode trip always did; the prompt trip
-    // now does too, so its page gather is the pool's `nkvh` rows — one kv head a core — instead of
-    // one unfolded row on a single core (`PagedStep::reads_kv_row_pool`).
-    pointers.push(("kv_row_pool", "*i32"));
+    if decode {
+        pointers.push(("kv_row_pool", "*i32"));
+    }
     pointers.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
     for (p, ty) in pointers {
         signature.insert(
@@ -1930,7 +1938,9 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         t(&node.inputs[2]),
         BufferId::new(tids.page_table),
     ];
-    bindings.push(BufferId::new(tids.kv_row_pool));
+    if decode {
+        bindings.push(BufferId::new(tids.kv_row_pool));
+    }
     bindings.extend([BufferId::new(tids.mask), t(&node.output)]);
     let k = rebind(
         positional,
@@ -4307,9 +4317,10 @@ mod walk_on_the_card {
         for p in ["query", "k_pages", "v_pages", "mask_stack", "out"] {
             signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("spec"));
         }
-        // Both one-sequence kernels read `kv_row_pool` — the prompt trip gathers its page as the
-        // pool's rows, one kv head a core, as the decode trip does.
-        let ints = ["query_row_index", "page_index_table", "kv_row_pool"];
+        let mut ints = vec!["query_row_index", "page_index_table"];
+        if decode {
+            ints.push("kv_row_pool");
+        }
         for p in ints {
             signature.insert(p.to_string(), ArgSpec::parse("*i32").expect("spec"));
         }
@@ -4594,6 +4605,40 @@ mod walk_on_the_card {
                 );
             }
         }
+    }
+
+    /// ⛔ `BatchChunking::of` IS TOTAL — `seqs` and `nkvh` both divide in it, so a zero would be a
+    /// panic inside a `const` evaluation at BAKE rather than a wrong answer a test could catch. No
+    /// producer passes zero (`AttnGeometry::nkvh` is a `NonZero`, a rung's rows are its baked
+    /// width), which is exactly why this is pinned: the invariant lives in the callers today, so
+    /// nothing but this test stops the function from dying if one ever slips.
+    #[test]
+    fn the_chunking_is_total_at_zero_counts() {
+        for (seqs, blocks, nkvh) in [(0u32, 4u32, 8u32), (2, 4, 0), (0, 0, 0), (1, 0, 8)] {
+            let c = BatchChunking::of(seqs, blocks, nkvh);
+            assert!(
+                c.seqs >= 1 && c.blocks_per_chunk >= 1 && c.rows_per_page >= 1,
+                "of({seqs}, {blocks}, {nkvh}) = {c:?}"
+            );
+            // `entries` and `index_rows` multiply those, so they are non-zero too — the extents
+            // every caller sizes a placement and an index table by.
+            assert!(c.entries() >= 1 && c.index_rows() >= 1, "{c:?}");
+        }
+        // And the real geometries are untouched by the clamps.
+        assert_eq!(
+            BatchChunking::of(1, 128, 8),
+            BatchChunking {
+                seqs: 1,
+                blocks_per_chunk: 32,
+                num_chunks: 4,
+                rows_per_page: 1
+            }
+        );
+        assert_eq!(
+            BatchChunking::of(2, 1, 8).rows_per_page,
+            8,
+            "under the floor"
+        );
     }
 
     /// ⛔ A DECODE BATCH GATHERS EACH OF ITS PAGES WHOLE, ONE OP FOR ALL OF THEM — the whole-page

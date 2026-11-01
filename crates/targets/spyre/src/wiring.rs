@@ -704,15 +704,11 @@ impl PagedStep {
         }
     }
 
-    /// Whether this bundle's attention reads `kv_row_pool` — BOTH ONE-SEQUENCE KERNELS DO. The
-    /// decode trip always did; the prompt trip now does too, so that it gathers its page as the
-    /// pool's `nkvh` rows — one kv head a core, as torch-spyre's compiled prefill gathers it — where
-    /// an unfolded `[1, nkvh · block · hd]` row was ONE `mb` position with the kv heads on a `y`
-    /// axis the gather's `mb`-only division cannot split, so a whole page (128 KB at granite-2b,
-    /// 256 KB at the 8b) moved on a SINGLE CORE on every trip of every layer. A decode BATCH reads
-    /// its pages through `chunk_page_ids` instead and needs no pool.
+    /// Whether this bundle's attention reads `kv_row_pool` — spyre-inference's dispatch: the decode
+    /// kernel at one query row of one sequence does; the prefill kernel past it and the batched
+    /// decode kernel do not.
     pub const fn reads_kv_row_pool(self) -> bool {
-        self.batch().is_none()
+        self.rows == 1 && self.batch().is_none()
     }
 
     /// ⭐ THE WALK'S STEP ON THE CARD — the bytes one trip moves the mask tile, and so the pitch the

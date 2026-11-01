@@ -105,9 +105,9 @@ fn attn_kernel(s: &AttnShape) -> (&'static str, KernelSpec) {
         ("v_pages", "*fp16"),
         ("page_index_table", "*i32"),
     ];
-    // Both one-sequence kernels read `kv_row_pool`: the prompt trip gathers its page as the pool's
-    // `nkvh` rows, one kv head a core, as the decode trip does.
-    pointers.push(("kv_row_pool", "*i32"));
+    if decode {
+        pointers.push(("kv_row_pool", "*i32"));
+    }
     pointers.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
     let mut ce = vec![
         ("NUM_TOKENS", s.padded_query_len),
@@ -422,15 +422,20 @@ fn attend(s: &Step, kp: &[f64], vp: &[f64], pt: Arg) -> Vec<f64> {
     // The batch is this one sequence: its rows are the query's rows, in order.
     let row_index: Vec<i32> = (0..mq as i32).collect();
     let mut bound = vec![s.arg("q", q_shape.clone()), i32_arg(&row_index, vec![rows])];
-    // BOTH one-sequence kernels read the FOLDED cache `[pages * kv, block * D]` through
-    // `kv_row_pool` `[pages, kv, 1]` — the same bytes the unfolded `[pages, kv * block * D]` view
-    // holds, gathered a kv head a core.
-    let folded = vec![(pages * nkvh) as usize, (block * hd) as usize];
-    bound.push(f16_arg(kp, folded.clone()));
-    bound.push(f16_arg(vp, folded));
-    bound.push(pt);
-    let pool: Vec<i32> = (0..(pages * nkvh) as i32).collect();
-    bound.push(i32_arg(&pool, vec![pages as usize, nkvh as usize]));
+    if mq == 1 {
+        // The folded cache `[pages * kv, block, D]`, and `kv_row_pool` `[pages, kv, 1]`.
+        let folded = vec![(pages * nkvh) as usize, (block * hd) as usize];
+        bound.push(f16_arg(kp, folded.clone()));
+        bound.push(f16_arg(vp, folded));
+        bound.push(pt);
+        let pool: Vec<i32> = (0..(pages * nkvh) as i32).collect();
+        bound.push(i32_arg(&pool, vec![pages as usize, nkvh as usize]));
+    } else {
+        let unfolded = vec![pages as usize, (nkvh * block * hd) as usize];
+        bound.push(f16_arg(kp, unfolded.clone()));
+        bound.push(f16_arg(vp, unfolded));
+        bound.push(pt);
+    }
     // `[num_blocks, padded_query_len, block_size]`, as recorded.
     bound.push(s.arg("mask", vec![nb as usize * rows, block as usize]));
     bound.push(f16_arg(&vec![0.0; rows * width], q_shape));
