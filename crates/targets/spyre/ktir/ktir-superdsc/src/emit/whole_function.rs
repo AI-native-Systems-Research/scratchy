@@ -4293,7 +4293,7 @@ fn lower_function_folded(
                 let source = match head_rows {
                     Some(h) => {
                         let mid = row_major_region(
-                            mint_scratch(k, layout, floor, res, Scratch::HeadRowsMid),
+                            mint_scratch(k, layout, floor, res, Scratch::RelayoutMid),
                             h.rows * h.row_sticks,
                             layout,
                         );
@@ -4705,7 +4705,7 @@ fn lower_function_folded(
                             // and a second permute lays the head rows stick-major, the frame the
                             // one-row arm above lands (and the batched dot reads a block of).
                             let mid = row_major_region(
-                                mint_scratch(k, layout, floor, res, Scratch::QueryHeadRowsMid),
+                                mint_scratch(k, layout, floor, res, Scratch::RelayoutMid),
                                 h.rows * h.row_sticks,
                                 layout,
                             );
@@ -7476,7 +7476,7 @@ fn heads_inner_pair(
     };
     let mid = (block.sticks > 1).then(|| {
         row_major_region(
-            mint_scratch(m.k, m.layout, m.floor, key, Scratch::BlockRelayoutMid),
+            mint_scratch(m.k, m.layout, m.floor, key, Scratch::RelayoutMid),
             block.rows * block.heads * block.sticks,
             m.layout,
         )

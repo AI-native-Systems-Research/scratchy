@@ -686,14 +686,16 @@ pub enum MintKey {
 /// the splice tests build, plus the granite-2b and -8b bakes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Scratch {
-    /// A head-major relayout's row-major middle frame, at a head's own rows.
-    HeadRowsMid,
-    /// A head-major relayout's row-major middle frame, at the query's head rows (head dim 128).
-    QueryHeadRowsMid,
-    /// A block relayout's row-major middle frame (`new_block_relayout`).
-    BlockRelayoutMid,
-    /// A scatter's rows, stick-major read as row-major at one base.
-    ScatterRowMajor,
+    /// ⭐ A RELAYOUT'S ROW-MAJOR MIDDLE FRAME — the four sites that take one share this variant,
+    /// because they shared the `0` the `u8` era gave them and the one-to-one replacement keeps
+    /// every key exactly as it is: a head-major relayout's middle at a head's own rows and at the
+    /// query's head rows (head dim 128), a block relayout's middle, and a scatter's rows read
+    /// row-major at one base. They `synth` DIFFERENT extents, so if two of them ever saw one value
+    /// the first would win — SPLITTING them is therefore a real change, not a rename, and it needs
+    /// its own evidence: a before/after descriptor diff of the FULL-MODEL bakes, since two of the
+    /// four (the scatter's rows, the block relayout's middle) are reached by the forward and not by
+    /// `lower_walk`, which is all the walk-level diff covers.
+    RelayoutMid,
     /// A gathered index table, permuted stick-to-row.
     GatherTableRowMajor,
     /// The rows a chained index gather lands.

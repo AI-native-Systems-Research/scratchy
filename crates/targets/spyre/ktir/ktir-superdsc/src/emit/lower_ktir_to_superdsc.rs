@@ -1197,7 +1197,7 @@ pub fn load_scatters(
                 layout,
                 super::whole_function::mint_floor(k),
                 value,
-                crate::ktir_node::Scratch::ScatterRowMajor,
+                crate::ktir_node::Scratch::RelayoutMid,
             );
             layout.synth(PlaceId::Act(tid), &[src.v_rows * groups, width]);
             let scratch = crate::place::act_name(tid);
