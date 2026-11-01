@@ -244,17 +244,22 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
 /// so it lowers on a target whose rotary kernels want a full-width table the attention fixture's
 /// `[1, hd]` one is not.
 pub fn mlp_sublayer(h: u32, i: u32) -> LoweringInput {
+    mlp_sublayer_rows(h, i, 1)
+}
+
+/// [`mlp_sublayer`] over `m` rows — a prompt chunk's width, where `mlp_sublayer` is one decode row.
+pub fn mlp_sublayer_rows(h: u32, i: u32, m: u32) -> LoweringInput {
     let gemm = |n: u32, act: usize, w: usize| OpDesc {
         op: SubOp::MatmulTile {
             n,
             weight: crate::lower::GemmWeight::Dense,
         },
-        m: 1,
+        m,
         inputs: vec![InputRef::Op(act), InputRef::Ext(w)],
     };
     LoweringInput {
         sources: vec![
-            SourceShape { rows: 1, cols: h },
+            SourceShape { rows: m, cols: h },
             SourceShape { rows: 1, cols: h },
             SourceShape { rows: h, cols: i },
             SourceShape { rows: h, cols: i },
@@ -266,20 +271,20 @@ pub fn mlp_sublayer(h: u32, i: u32) -> LoweringInput {
                     eps: 1e-5,
                     gain: GainConvention::Scale,
                 },
-                m: 1,
+                m,
                 inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
             },
             gemm(i, 0, 2),
             gemm(i, 0, 3),
             OpDesc {
                 op: SubOp::SiluMul,
-                m: 1,
+                m,
                 inputs: vec![InputRef::Op(1), InputRef::Op(2)],
             },
             gemm(h, 3, 4),
             OpDesc {
                 op: SubOp::Elementwise(EwKind::Add),
-                m: 1,
+                m,
                 inputs: vec![InputRef::Ext(0), InputRef::Op(4)],
             },
         ],

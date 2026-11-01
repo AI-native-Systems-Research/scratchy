@@ -1108,7 +1108,12 @@ fn collective_world<F: RopeForm>(
     })
 }
 
-/// ⭐ THE ALL-REDUCE BY RECURSIVE DOUBLING: `log2 W` consume launches, one per round
+/// ⭐ THE ALL-REDUCE, IN THE FORM ITS FRAGMENT'S SIZE CHOOSES ([`ReduceForm::of`]): a fragment past
+/// [`ReduceForm::DIRECT_MAX_BYTES`] by recursive doubling, as below; a narrower one — every decode
+/// row — directly ([`direct_tree_consumes`]), because an exchange that small is bound by its hops.
+/// Both add the one canonical tree, so the two forms' sums are the same bits.
+///
+/// THE RECURSIVE-DOUBLING FORM: `log2 W` consume launches, one per round
 /// ([`Round`]). Round `j` adds this rank's running sum to its partner's (rank `r XOR 2^j`), which
 /// lands in the partner's region of the receive window: `out_j = own_{j−1} + partner_{j−1}`, where
 /// `own_{−1}` is this rank's fragment of the operand. Each launch is marked with the [`TpConsume`]
@@ -1136,6 +1141,8 @@ fn collective_world<F: RopeForm>(
 /// [`Round::region`]: ktir_superdsc::collective::Round::region
 /// [`PeerRegion`]: ktir_superdsc::collective::PeerRegion
 /// [`Fragment::at_start`]: ktir_superdsc::collective::Fragment::at_start
+/// [`ReduceForm::of`]: ktir_superdsc::collective::ReduceForm::of
+/// [`ReduceForm::DIRECT_MAX_BYTES`]: ktir_superdsc::collective::ReduceForm::DIRECT_MAX_BYTES
 fn all_reduce_consumes<F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -1162,6 +1169,13 @@ fn all_reduce_consumes<F: RopeForm>(
         Err(refusal) => return refusal,
     };
     let cut = window_cut(node, ir);
+    // A world of two is one round either way: its one consume, as it has always been.
+    if world.round_count() > 1
+        && ktir_superdsc::collective::ReduceForm::of(world, f.bytes().get())
+            == ktir_superdsc::collective::ReduceForm::Direct
+    {
+        return direct_tree_consumes(node, ir, rows_are_requests, world, f, cut);
+    }
     let cols_at = |start: u32| Range::new(start + f.first_col(), f.cols());
     let operand = TensorRegion {
         tensor: x.tensor,
@@ -1247,6 +1261,130 @@ fn all_reduce_consumes<F: RopeForm>(
         e.tp_consume = Some(consume);
         ops.push(e);
         before = Some(round);
+    }
+    NodeLowering::Ops(ops)
+}
+
+/// ⭐ THE DIRECT ALL-REDUCE: every rank sends its fragment to every peer and waits on each, then ONE
+/// consume per rank adds the `W` fragments — so the exchange is one hop, not `log2 W`
+/// ([`ReduceForm`]).
+///
+/// ⭐ THE SAME TREE AS RECURSIVE DOUBLING, so the forms agree bit for bit: `((f0 + f1) + (f2 + f3))
+/// + …`, in absolute rank order, evaluated depth first. A left subtree accumulates into its
+/// destination, and the right subtree of `2^k` ranks into round sum `k − 1`, a scratch region of the
+/// window the direct form never sends — so `log2 W − 1` round sums hold every pending right half,
+/// exactly the window's [`RecvWindow::round_sums`]. Each rank reads its own fragment from its
+/// operand and peer `s`'s from region `(r XOR s) − 1` of its cut, so each rank bakes its own
+/// consume, played by that rank alone ([`PlaysAt`]), as the all-gather's are. fp16 addition
+/// commutes, so every rank's sum is the same bits whichever operand of a pair is its own.
+///
+/// [`ReduceForm`]: ktir_superdsc::collective::ReduceForm
+/// [`RecvWindow::round_sums`]: ktir_superdsc::collective::RecvWindow::round_sums
+/// [`PlaysAt`]: ktir_superdsc::collective::PlaysAt
+fn direct_tree_consumes<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    rows_are_requests: bool,
+    world: ktir_superdsc::collective::TpWorld,
+    f: ktir_superdsc::collective::Fragment,
+    cut: ktir_superdsc::collective::WindowCut,
+) -> NodeLowering {
+    use ktir_superdsc::collective::{CollectiveKind, Exchange, PlaysAt, TpConsume, TpIdentity};
+    use ktir_superdsc::reserved_tids::tp_round_sum_tid;
+    use scratchy_subtile::subtile_ir::{EwKind, Range, Region, TensorRegion};
+    let x = node.inputs[0];
+    let rows = x.region.rows.len;
+    let cols_at = |start: u32| Range::new(start + f.first_col(), f.cols());
+    let out = TensorRegion {
+        tensor: node.output.tensor,
+        region: Region {
+            rows: node.output.region.rows,
+            cols: cols_at(node.output.region.cols.start),
+        },
+    };
+    let whole = |tid: u32| TensorRegion {
+        tensor: TensorId::from_index(tid as usize),
+        region: Region {
+            rows: Range::new(0, rows),
+            cols: Range::new(0, f.cols()),
+        },
+    };
+    // Rank `r`'s fragment as rank `me` reads it: its own operand's columns, or `r`'s region of its cut.
+    let fragment_on = |me: TpIdentity, r: TpIdentity| -> Option<TensorRegion> {
+        if r == me {
+            return Some(TensorRegion {
+                tensor: x.tensor,
+                region: Region {
+                    rows: x.region.rows,
+                    cols: cols_at(x.region.cols.start),
+                },
+            });
+        }
+        Some(whole(cut.tid(me.region_of(r)?)))
+    };
+    // The adds of the tree over `frags` into `dst`, depth first: `(dst, a, b)` per add.
+    fn tree(
+        frags: &[TensorRegion],
+        dst: TensorRegion,
+        scratch: &dyn Fn(u32) -> TensorRegion,
+        adds: &mut Vec<(TensorRegion, TensorRegion, TensorRegion)>,
+    ) {
+        match frags {
+            [a, b] => adds.push((dst, *a, *b)),
+            _ => {
+                let (left, right) = frags.split_at(frags.len() / 2);
+                tree(left, dst, scratch, adds);
+                // A right half of `2^k` fragments sums into round sum `k − 1`.
+                let s = scratch(right.len().trailing_zeros() - 1);
+                tree(right, s, scratch, adds);
+                adds.push((dst, dst, s));
+            }
+        }
+    }
+    let scratch = |k: u32| whole(tp_round_sum_tid(k));
+    let mut ops = Vec::new();
+    for me in world.ranks() {
+        let Some(frags) = world
+            .ranks()
+            .map(|r| fragment_on(me, r))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return NodeLowering::Unhandled(format!(
+                "rank {} of a {}-rank world has no window region for one of its peers",
+                me.rank(),
+                world.get()
+            ));
+        };
+        let consume = TpConsume {
+            kind: CollectiveKind::AllReduce,
+            operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
+            fragment: f,
+            plays_at: Some(PlaysAt::of(me)),
+            cut,
+            exchange: Exchange::EveryPeer,
+        };
+        let mut adds = Vec::with_capacity(frags.len() - 1);
+        tree(&frags, out, &scratch, &mut adds);
+        for (step, (dst, a, b)) in adds.into_iter().enumerate() {
+            let add = SubtileNode {
+                id: node.id,
+                op: SubOp::Elementwise(EwKind::Add),
+                inputs: vec![a, b],
+                output: dst,
+            };
+            let mut e = match scratchy_triton_splice::lower(&add, ir, rows_are_requests) {
+                Ok(e) => e,
+                Err(reason) => return NodeLowering::Unhandled(reason),
+            };
+            // A launch's name is its program's identity, and every add shares the node's id.
+            let name = format!("tpconsume_s{}_r{}_a{step}", node.id.index(), me.rank());
+            if let Some(kt) = e.ktir.as_mut() {
+                kt.func.name = ktir_core::arena::Arena::global().str(name.clone());
+            }
+            e.op_name = name;
+            e.tp_consume = Some(consume);
+            ops.push(e);
+        }
     }
     NodeLowering::Ops(ops)
 }
