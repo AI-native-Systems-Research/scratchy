@@ -40,7 +40,7 @@ impl SpyreWorld {
     /// ⭐ EVERY SHARDED WORLD SPYRE BAKES, narrowest first — the `SPYRE_TP_WORLDS` row past its world
     /// of one, each minted from its const `W`. The bake shards a forward for each, and the wiring
     /// names the analysis's world for each; a world added to the row and not here fails the build.
-    pub const SHARDED: [SpyreWorld; 2] = [Self::of::<2>(), Self::of::<4>()];
+    pub const SHARDED: [SpyreWorld; 3] = [Self::of::<2>(), Self::of::<4>(), Self::of::<8>()];
 
     /// The sharded world of `w` ranks, as `SHARDED` names it.
     pub fn sharded(w: u32) -> Option<Self> {

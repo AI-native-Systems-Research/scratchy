@@ -40,7 +40,7 @@ use crate::superdsc_opspec::{DataFormat, Fp16};
 
 /// The world sizes a spyre bundle can be baked for — the target's const row. A world of one is a
 /// forward with no collectives; a wider world is `W − 1` peers per card.
-pub const SPYRE_TP_WORLDS: &[u32] = &[1, 2, 4];
+pub const SPYRE_TP_WORLDS: &[u32] = &[1, 2, 4, 8];
 
 /// The widest single p2p message, in bytes — the cross-card transfer cap (`CopyToRemote`'s
 /// validation; flex-rs `multi_device::MAX_HDMA_MESSAGE_BYTES`, which the target crate pins equal).

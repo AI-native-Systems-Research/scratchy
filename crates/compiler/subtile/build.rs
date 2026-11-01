@@ -35,7 +35,7 @@ type Geometry = (u64, u64, u64);
 /// here because a build script cannot name a spyre crate without making every metal and cuda build
 /// compile one. It is written into the generated file, and `model_geometry.rs` const-asserts it
 /// equal to the authority under `spyre`, so the two cannot drift.
-const SPYRE_TP_WORLDS: &[u32] = &[1, 2, 4];
+const SPYRE_TP_WORLDS: &[u32] = &[1, 2, 4, 8];
 
 /// Write `$OUT_DIR/config_geometry.rs` — the literal geometries `src/model_geometry.rs` turns into
 /// const-generic instantiations.
