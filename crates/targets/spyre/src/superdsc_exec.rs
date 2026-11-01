@@ -5724,17 +5724,20 @@ impl Executor {
         self.seg_host[seg.get()].len()
     }
 
-    /// ZERO a whole tensor segment ON THE DEVICE, in chunks, from a small host buffer.
+    /// ZERO a whole tensor segment ON THE DEVICE, with the vendor's fill op.
     ///
-    /// Exists so zeroing the KV pool does not require a host mirror of it. The pool has to start
-    /// zeroed — a page handed to a request otherwise holds whatever was in device memory, and decode
-    /// computes q·k over the WHOLE page before the validity mask applies, so uninitialised bytes go
-    /// through the arithmetic as denormals and NaN. The old route (read_seg → write_seg) addressed a
-    /// host allocation the size of the entire pool: 960 MB, and 3.84 GB at a 1024-slot page. This
-    /// walks the segment with an 8 MB buffer, and the device sees the same zeros.
+    /// Exists so zeroing the KV pool requires neither a host mirror of it nor host-pushed
+    /// zeros. The pool has to start zeroed — a page handed to a request otherwise holds
+    /// whatever was in device memory, and decode computes q·k over the WHOLE page before the
+    /// validity mask applies, so uninitialised bytes go through the arithmetic as denormals
+    /// and NaN. And the bytes must not ride the host→device path to get there: that path is
+    /// bandwidth-bound (~3.5 GB/s effective), so a host-pushed fill of a 16384 MB pool costs
+    /// seconds, while the card writes its own memory far faster
+    /// ([`Stream::fill_zero`]; measured rate on the card: `fill_zero_probe`).
     ///
-    /// The walk is [`DevAddr::windows`], so a multi-chunk (interleaved) region is zeroed chunk by
-    /// chunk with the same 8 MB windows — every byte the region owns, none it does not.
+    /// The walk is [`DevAddr::windows`] at 64 MB, so a multi-chunk (interleaved) region is
+    /// zeroed chunk by chunk — every byte the region owns, none it does not — and each window
+    /// is the single-chunk shape the fill control block resolves.
     pub fn zero_seg(&mut self, seg: SegIdx) -> Result<()> {
         let i = seg.get();
         let addr = self.seg_addr[i]
@@ -5744,19 +5747,18 @@ impl Executor {
         if total == 0 {
             return Ok(());
         }
-        const CHUNK: NonZeroU64 = NonZeroU64::new(8 << 20).unwrap();
-        let zeros = vec![0u8; CHUNK.get().min(total) as usize];
+        // The window size only sets how many fill control blocks the walk submits (each is a
+        // fixed enqueue cost on both host and device); no host buffer rides the fill.
+        const CHUNK: NonZeroU64 = NonZeroU64::new(64 << 20).unwrap();
         let stream = self.stream_ref()?;
         for win in addr.windows(CHUNK) {
-            let sz = win.total_size().as_u64() as usize;
             stream
-                .h2d(&zeros[..sz], &win)
-                .map_err(|e| anyhow!("zero H2D (seg{i}): {e}"))?;
-            // The window must outlive the transfer.
-            stream
-                .synchronize()
-                .map_err(|e| anyhow!("zero sync (seg{i}): {e}"))?;
+                .fill_zero(&win)
+                .map_err(|e| anyhow!("zero fill (seg{i}): {e}"))?;
         }
+        stream
+            .synchronize()
+            .map_err(|e| anyhow!("zero sync (seg{i}): {e}"))?;
         Ok(())
     }
 

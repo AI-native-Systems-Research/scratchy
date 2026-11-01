@@ -27,7 +27,10 @@ use flex_rs::allocator::{
 };
 use flex_rs::compute::{BootstrapOffset, ComputeParams, KernelName};
 use flex_rs::device_memory_allocator::DeviceMemoryAllocator;
-use flex_rs::dma::{DmaDirection, DmaParams, DmaPipelineShape, DmaShaping, HostVirtualAddress};
+use flex_rs::dma::{
+    DmaDirection, DmaParams, DmaPipelineShape, DmaShaping, FillParams, FillPattern, FillPipeline,
+    HostVirtualAddress,
+};
 use flex_rs::flex_config::DeviceKind;
 use flex_rs::memory_region::{DomainId, MemoryType};
 use flex_rs::runtime::{RuntimeContext, RuntimeContextError};
@@ -615,6 +618,28 @@ impl Stream {
         self.h2d_shaped(bytes, addr, DmaShaping::default(), None)
     }
 
+    /// ⭐ DEVICE-SIDE ZERO FILL of `addr` — the vendor's `RuntimeOperationFill`
+    /// (`SetHAFill`): the card writes the pattern itself, NO host bytes cross
+    /// the wire. `addr` must be a single-chunk window (the scheduler's fill CB
+    /// resolves one chunk — `DevAddr::windows` yields exactly that shape). The
+    /// host→device path is bandwidth-bound (~3.5 GB/s effective), so zeroing a
+    /// large region by host-pushed H2D costs seconds where the card's own fill
+    /// costs a fraction of that — `fill_zero_probe` measures the real rate on
+    /// the card it runs on.
+    pub fn fill_zero(&self, addr: &DevAddr) -> Result<(), HwError> {
+        let stream = self.live()?;
+        // `FillParams::new` takes the caller's size verbatim (the C++ member-init
+        // list has no validation), so the window's own extent is the byte count —
+        // the same pairing `h2d` gets from a slice's length.
+        let params = FillParams::new(
+            addr.0.clone(),
+            addr.total_size(),
+            FillPattern(0),
+            FillPipeline::Dmai,
+        );
+        stream.launch_fill(params).map_err(HwError::Stream)
+    }
+
     /// ⭐ H2D ON THE COMPUTE PIPELINE — same transfer, same slice-length law, different hardware
     /// queue. Port of the vendor's `DmaParams::use_compute_pipeline = true` submission shape:
     /// the DMA rides `PipelineId::COMPUTE` with the step's compute ops instead of `ASYNC_DMAI`
@@ -1177,10 +1202,11 @@ mod tests {
             .collect()
     }
 
-    /// ⭐ THE ZERO-FILL WALK OVER AN INTERLEAVED REGION (#672). `zero_seg` H2Ds exactly these
-    /// windows, so this is the address half of zeroing a multi-chunk KV pool — the half a card is
-    /// not needed for. Each chunk is cut at the step in its OWN region/offset/domain, a short tail
-    /// stays short, a zero-length chunk sends nothing, and the bytes sum to the region's size.
+    /// ⭐ THE ZERO-FILL WALK OVER AN INTERLEAVED REGION (#672). `zero_seg` fills exactly these
+    /// windows on the card, so this is the address half of zeroing a multi-chunk KV pool — the
+    /// half a card is not needed for. Each chunk is cut at the step in its OWN
+    /// region/offset/domain, a short tail stays short, a zero-length chunk sends nothing, and
+    /// the bytes sum to the region's size.
     #[test]
     fn windows_cover_each_chunk_of_an_interleaved_region_once() {
         let addr = DevAddr(Arc::new(CompositeAddress::from_chunks(vec![
