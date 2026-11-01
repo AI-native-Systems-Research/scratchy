@@ -3042,7 +3042,7 @@ fn stage_synth_weights<F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     only: Option<&std::collections::HashSet<u64>>,
     // Each weight's synth stream (`dbg_synth_val`'s first argument) — its own tid, except where a
-    // two-rank gate gives a rank's slice of a sharded weight a stream of its own.
+    // sharded gate gives a rank's slice of a sharded weight a stream of its own.
     seed: &dyn Fn(u32) -> usize,
 ) -> StagedWeights {
     use scratchy_subtile::lower::GemmWeight;
@@ -3220,7 +3220,7 @@ fn stage_synth_weights<F: RopeForm>(
 /// Pre-attention tids (rmsnorm/qkv/rope) depend only on hidden+weights, so the
 /// comparison needs NO mask/cache alignment — the bug localizes to one op.
 /// A gated run's readback, as the teacher-forced walk restarts from it: the run's own tensors, and —
-/// for one rank of a two-rank gate — the peer whose emulated operands its collectives read.
+/// for one rank of a sharded gate — the peers whose emulated operands its collectives read.
 #[cfg(feature = "spyre-emu")]
 #[derive(Clone, Copy)]
 struct EmuReadback<'a> {
@@ -3233,15 +3233,16 @@ fn is_collective<F: RopeForm>(op: &SubOp<F>) -> bool {
     matches!(op, SubOp::AllReduce { .. } | SubOp::AllGather { .. })
 }
 
-/// THE OTHER RANK of a two-rank gate, as one rank's reference reads it: which rank THIS one is (the
-/// collective's operands combine in absolute rank order — `eval_collective`'s law) and the peer's
-/// buffers, indexed by tid like the rank's own, that its collectives read the peer's operand from.
-/// Empty buffers stand for a peer not yet evaluated — the first pass of the lockstep golden, whose
+/// THE OTHER RANKS of a sharded gate, as one rank's reference reads them: which rank THIS one is
+/// (the collective's operands combine in absolute rank order — `eval_collective`'s law) and every
+/// rank's buffers, in rank order and indexed by tid like the rank's own, that its collectives read
+/// the peers' operands from. This rank's own entry is never read (its own buffers stand there), and
+/// empty buffers stand for a peer not yet evaluated — the first pass of the lockstep golden, whose
 /// collectives the later passes correct.
 #[derive(Clone, Copy)]
 pub(crate) struct GatePeer<'a> {
     pub rank: u32,
-    pub bufs: &'a [Vec<f32>],
+    pub all: &'a [Vec<Vec<f32>>],
 }
 
 impl GatePeer<'_> {
@@ -3251,12 +3252,18 @@ impl GatePeer<'_> {
         ir: &SubtileIR<F>,
         own: &[Vec<f32>],
     ) -> Vec<f32> {
-        let theirs = if self.bufs.is_empty() { own } else { self.bufs };
-        let ranks: [&[Vec<f32>]; 2] = if self.rank == 0 {
-            [own, theirs]
-        } else {
-            [theirs, own]
-        };
+        let ranks: Vec<&[Vec<f32>]> = self
+            .all
+            .iter()
+            .enumerate()
+            .map(|(q, bufs)| {
+                if q as u32 == self.rank || bufs.is_empty() {
+                    own
+                } else {
+                    bufs.as_slice()
+                }
+            })
+            .collect();
         scratchy_subtile::tensor_parallel::eval_collective(node, ir, &ranks)
     }
 }
@@ -4148,7 +4155,7 @@ pub fn write_eval_golden<F: RopeForm>(
 /// synth weights (the session's resident bytes, and the clone the reference view decodes), the
 /// load-time constants, the seat, and every probe source (synth at the IR shape, scales as ones,
 /// the rope rows, the compile-time scalars, the length mask). ONE staging for every gate: the
-/// one-rank gate stages it once; the two-rank gate once per rank, with `seed` naming each source's
+/// one-rank gate stages it once; the sharded gate once per rank, with `seed` naming each source's
 /// synth stream — a rank's slice of a sharded source is its own, a replicated source the same on
 /// every rank.
 #[cfg(feature = "spyre-emu")]
@@ -4459,8 +4466,8 @@ pub struct GateRung<'a> {
     /// directory half.
     pub cap: u32,
     /// The slice law of every source, when the rung was baked for a sharded world (the analysis's
-    /// `ShardedForward::sources`) — `None` for a world of one. A sharded rung is gated on both
-    /// ranks at once ([`numeric_gate_two_rank`]).
+    /// `ShardedForward::sources`) — `None` for a world of one. A sharded rung is gated on every rank
+    /// of its world at once ([`numeric_gate_sharded`]).
     pub shards: Option<&'a [scratchy_subtile::tensor_parallel::SourceShard]>,
 }
 
@@ -4486,7 +4493,7 @@ pub fn numeric_gate<F: RopeForm>(
     // send fills, and its collectives have no one-rank reference, so it is gated on both ranks at
     // once — below, once the covering slice is known. A sharded rung with no slice laws to stage
     // its ranks by is a bake defect, refused by name.
-    let two_rank = match (ir.nodes.iter().find(|n| is_collective(&n.op)), rung.shards) {
+    let sharded = match (ir.nodes.iter().find(|n| is_collective(&n.op)), rung.shards) {
         (None, _) => None,
         (Some(_), Some(shards)) => Some(shards),
         (Some(n), None) => {
@@ -4651,7 +4658,7 @@ pub fn numeric_gate<F: RopeForm>(
         keep
     });
     let covering: Option<&std::collections::HashSet<u64>> = covering_owned.as_ref();
-    if let Some(shards) = two_rank {
+    if let Some(shards) = sharded {
         let mut scope = String::new();
         if let Some(p) = prefill {
             scope.push_str(&format!(" [prefill mq={}]", p.mq));
@@ -4662,7 +4669,7 @@ pub fn numeric_gate<F: RopeForm>(
                 t.layers.0, t.layers.1
             ));
         }
-        return numeric_gate_two_rank(TwoRankGate {
+        return numeric_gate_sharded(ShardedGate {
             groups,
             ir,
             weight_ids,
@@ -4840,7 +4847,7 @@ pub fn numeric_gate<F: RopeForm>(
 }
 
 /// One gated run, judged: its readback against its reference — the run's own inputs. One rank's
-/// run of a two-rank gate carries its `peer`, whose buffers the reference's collectives read.
+/// run of a sharded gate carries its `peer`, whose buffers the reference's collectives read.
 #[cfg(feature = "spyre-emu")]
 struct GateRun<'a, F: RopeForm> {
     ir: &'a SubtileIR<F>,
@@ -4869,7 +4876,7 @@ struct GateWorst {
 
 /// ⭐ THE GATE'S VERDICT ON ONE RUN — every compared tensor at its floor, judged on its producing
 /// op's own execution (the teacher-forced walk), the refusal carrying its evidence. The one-rank
-/// gate judges its one run here; the two-rank gate each rank's.
+/// gate judges its one run here; the sharded gate each rank's.
 #[cfg(feature = "spyre-emu")]
 fn judge_gate_run<F: RopeForm>(
     run: GateRun<'_, F>,
@@ -5291,10 +5298,10 @@ impl GoldenIndex {
     }
 }
 
-/// A sharded rung under the two-rank gate — what [`numeric_gate`] hands [`numeric_gate_two_rank`]
+/// A sharded rung under the sharded gate — what [`numeric_gate`] hands [`numeric_gate_sharded`]
 /// once its covering slice and taint map are known.
 #[cfg(feature = "spyre-emu")]
-struct TwoRankGate<'a, F: RopeForm> {
+struct ShardedGate<'a, F: RopeForm> {
     groups: &'a [bundle::LaunchGroup<'static>],
     ir: &'a SubtileIR<F>,
     weight_ids: &'a std::collections::HashSet<u32>,
@@ -5307,28 +5314,28 @@ struct TwoRankGate<'a, F: RopeForm> {
     scope: String,
 }
 
-/// ⭐⭐ THE TWO-RANK GATE — a sharded rung, run on BOTH ranks at once and judged against the
-/// two-rank reference. The review's law (#1009, item 3): the bundle's own consumes read the window
-/// the peer's send filled, so the gate steps the ranks' emulator sessions collective by collective,
-/// exactly as the cards step: each rank runs up to its next consume, the PEER's operand fragment —
-/// what the peer's F-send would land — is staged into this rank's receive window, and the consume
-/// runs over it. Then:
+/// ⭐⭐ THE SHARDED GATE — a sharded rung, run on EVERY rank of its world at once and judged against
+/// the world's reference. The review's law (#1009, item 3): the bundle's own consumes read the
+/// window the peers' sends filled, so the gate steps the ranks' emulator sessions collective by
+/// collective, exactly as the cards step: each rank runs up to its next consume, EACH PEER's
+/// operand fragment — what that peer's F-send would land — is staged into that peer's region of
+/// this rank's receive window, and the consume runs over them. Then:
 ///
 /// - each rank's run is judged against its OWN reference ([`judge_gate_run`], the one-rank gate's
 ///   verdict) — the rank's graph evaluated with its collectives read across ranks
 ///   ([`GatePeer`], `tensor_parallel::eval_collective`'s law), the lockstep golden settled to a
 ///   fixed point (each pass resolves one more collective);
-/// - every value the reference holds bit-identical on both ranks — a REPLICATED value — must come
-///   back bit-identical from both emulated ranks (the canonical reduction order's promise).
+/// - every value the reference holds bit-identical on every rank — a REPLICATED value — must come
+///   back bit-identical from every emulated rank (the canonical reduction order's promise).
 ///
 /// A rank's slice of a sharded source draws its own synth stream, so the ranks' partials differ
-/// and a consume that read its own operand twice, or the window at the wrong offset, diverges;
-/// replicated sources are the same on both ranks, as they are on the cards.
+/// and a consume that read its own operand twice, or a window region at the wrong offset, diverges;
+/// replicated sources are the same on every rank, as they are on the cards.
 #[cfg(feature = "spyre-emu")]
-fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), String> {
-    use crate::bundle_code::collective::{TpIdentity, TpWorld, plays_on};
+fn numeric_gate_sharded<F: RopeForm>(gate: ShardedGate<'_, F>) -> Result<(), String> {
+    use crate::bundle_code::collective::{TpIdentity, plays_on};
     use scratchy_subtile::tensor_parallel::SourceShard;
-    let TwoRankGate {
+    let ShardedGate {
         groups,
         ir,
         weight_ids,
@@ -5340,7 +5347,9 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
         shards,
         scope,
     } = gate;
-    let ranks: Vec<TpIdentity> = TpWorld::of::<2>().ranks().collect();
+    let world = crate::tp_plan::world_of_ir(ir)?
+        .ok_or("a sharded rung states its world through its collectives, and this one has none")?;
+    let ranks: Vec<TpIdentity> = world.ranks().collect();
     // ── Each rank's probe: its slices of the sharded sources on a stream of their own (ONE seed,
     //    read by the session's staging and by the reference alike) ──
     const RANK_STREAM: usize = 1 << 28;
@@ -5450,18 +5459,24 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
     }
     let mut outs: Vec<std::collections::HashMap<u64, Vec<f32>>> =
         vec![std::collections::HashMap::new(); ranks.len()];
-    // A staged window: `run_step`'s source — the cut's tid, its values, their shape.
+    // A staged window region: `run_step`'s source — the region's tid, its values, their shape. Each
+    // rank's next consume reads one per peer.
     type StagedWindow = (u64, Vec<f32>, Vec<usize>);
-    let mut windows: Vec<Option<StagedWindow>> = vec![None; ranks.len()];
+    let mut windows: Vec<Vec<StagedWindow>> = vec![Vec::new(); ranks.len()];
     for k in 0..nseg {
         for (r, session) in sessions.iter_mut().enumerate() {
             let sources = if k == 0 {
                 std::mem::take(&mut probes[r].sources)
             } else {
-                let staged = windows[r]
-                    .take()
-                    .ok_or_else(|| format!("rank {r} reached segment {k} with no window staged"))?;
-                vec![staged]
+                let staged = std::mem::take(&mut windows[r]);
+                if staged.len() + 1 != ranks.len() {
+                    return Err(format!(
+                        "rank {r} reached segment {k} with {} of its {} peers' regions staged",
+                        staged.len(),
+                        ranks.len() - 1
+                    ));
+                }
+                staged
             };
             let mut want: Vec<(u64, usize)> = golden_index
                 .tids
@@ -5483,8 +5498,10 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
         if k + 1 == nseg {
             break;
         }
-        for (r, window) in windows.iter_mut().enumerate() {
-            let peer = 1 - r;
+        for (r, peer) in (0..ranks.len()).flat_map(|r| (0..ranks.len()).map(move |p| (r, p))) {
+            if peer == r {
+                continue;
+            }
             let Some(c) = segs[peer][k + 1].first().and_then(|g| g.kv.tp) else {
                 return Err(format!(
                     "rank {peer}'s segment {} does not open with a consume",
@@ -5531,7 +5548,7 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
             for i in r0..r0 + fr {
                 win.extend_from_slice(&v[i * cols + c0..i * cols + c0 + fc]);
             }
-            *window = Some((u64::from(mine.cut.tid(region)), win, vec![fr, fc]));
+            windows[r].push((u64::from(mine.cut.tid(region)), win, vec![fr, fc]));
         }
     }
     // ── The lockstep reference, to its fixed point ──
@@ -5560,7 +5577,7 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
                     covering,
                     Some(GatePeer {
                         rank: me.rank(),
-                        bufs: &golden[1 - r],
+                        all: &golden,
                     }),
                     &seed(r),
                 )
@@ -5574,11 +5591,25 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
     }
     if !settled {
         return Err(format!(
-            "the two-rank reference did not settle in {} passes over {collectives} collective(s)",
+            "the {}-rank reference did not settle in {} passes over {collectives} collective(s)",
+            ranks.len(),
             collectives + 2
         ));
     }
-    // ── Each rank judged against its own reference ──
+    // ── Each rank judged against its own reference, its collectives reading the other ranks'
+    //    emulated buffers ──
+    let emu_bufs: Vec<Vec<Vec<f32>>> = outs
+        .iter()
+        .map(|o| {
+            let mut bufs: Vec<Vec<f32>> = vec![Vec::new(); ir.tensors.len()];
+            for (t, v) in o {
+                if let Some(slot) = bufs.get_mut(*t as usize) {
+                    slot.clone_from(v);
+                }
+            }
+            bufs
+        })
+        .collect();
     let mut worst: Vec<GateWorst> = Vec::with_capacity(ranks.len());
     let mut compared = 0;
     for (r, me) in ranks.iter().enumerate() {
@@ -5589,12 +5620,6 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
             .map(|t| (*t, 0))
             .collect();
         compared += compare.len();
-        let mut peer_bufs: Vec<Vec<f32>> = vec![Vec::new(); ir.tensors.len()];
-        for (t, v) in &outs[1 - r] {
-            if let Some(slot) = peer_bufs.get_mut(*t as usize) {
-                slot.clone_from(v);
-            }
-        }
         worst.push(
             judge_gate_run(
                 GateRun {
@@ -5611,7 +5636,7 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
                     cap,
                     peer: Some(GatePeer {
                         rank: me.rank(),
-                        bufs: &peer_bufs,
+                        all: &emu_bufs,
                     }),
                 },
                 golden[r].clone(),
@@ -5619,20 +5644,21 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
             .map_err(|e| format!("rank {r}: {e}"))?,
         );
     }
-    // ── Replicated values: bit-identical on both emulated ranks ──
+    // ── Replicated values: bit-identical on every emulated rank ──
     let same = |a: &[f32], b: &[f32]| {
         a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
     };
     let mut replicated = 0;
     let mut split: Vec<String> = Vec::new();
     for &t in &golden_index.tids {
-        let (g0, g1) = (&golden[0][t as usize], &golden[1][t as usize]);
-        if g0.is_empty() || !same(g0, g1) {
+        let g0 = &golden[0][t as usize];
+        if g0.is_empty() || !golden.iter().all(|g| same(g0, &g[t as usize])) {
             continue;
         }
-        if let (Some(e0), Some(e1)) = (outs[0].get(&t), outs[1].get(&t)) {
+        let emulated: Option<Vec<&Vec<f32>>> = outs.iter().map(|o| o.get(&t)).collect();
+        if let Some(emulated) = emulated {
             replicated += 1;
-            if !same(e0, e1) {
+            if !emulated.iter().all(|e| same(emulated[0], e)) {
                 split.push(format!(
                     "t{t} ({})",
                     golden_index.op.get(&t).copied().unwrap_or("?")
@@ -5655,11 +5681,12 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
         .unwrap_or((0, 0));
     let w = |f: fn(&GateWorst) -> f32| worst.iter().map(f).fold(0f32, f32::max);
     eprintln!(
-        "[spyre-superdsc] NUMERIC GATE PASS {fp} (two ranks, {} gated collective(s) of \
+        "[spyre-superdsc] NUMERIC GATE PASS {fp} ({} ranks, {} gated collective(s) of \
          {collectives}): {compared} rank-tensors at the floor, {replicated} replicated tensors \
          bit-identical across ranks (worst local clean {:.4}, worst local fp8-chained {:.4}; \
          worst total clean {:.4}, worst total fp8-chained {:.4}; LX peak {lx_peak} of {lx_cap} \
          bytes){scope}",
+        ranks.len(),
         collective_nodes.len(),
         w(|g| g.local_clean),
         w(|g| g.local_fp8),
