@@ -312,6 +312,46 @@ impl Round {
     }
 }
 
+/// ⭐ HOW AN ALL-REDUCE EXCHANGES, CHOSEN AT BAKE FROM ITS WORLD AND ITS FRAGMENT'S BYTES.
+///
+/// * [`Self::Direct`]: every rank sends its fragment to every peer and waits on each, then ONE
+///   consume adds all `W` fragments. Its `W − 1` sends issue back to back and its waits overlap, so
+///   the exchange costs ONE serialized hop, over `2(W − 1) + 1` control blocks.
+/// * [`Self::RecursiveDoubling`]: `log2 W` rounds of send, wait, add. `3·log2 W` control blocks,
+///   but the rounds are SERIALIZED: round `j + 1` sends what round `j` added, so the exchange costs
+///   `log2 W` hops.
+///
+/// ⛔ MEASURED, granite-3.1-2b fp8 at four ranks, one pod and image (#1019 runs 34 and 38): the tree
+/// made every decode step 1.6 ms SLOWER (ITL mean 12.6 → 14.2 ms, the whole gap distribution
+/// shifted), against a predicted gain. A decode all-reduce moves one row — 4 KiB at hidden 2048 —
+/// and an exchange that small is bound by its hops, not by its control blocks: one extra hop,
+/// ~20 µs, on each of 81 all-reduces. So a fragment of at most [`Self::DIRECT_MAX_BYTES`] reduces
+/// directly, and only a wider one, where moving bytes rather than waiting on hops is the cost,
+/// takes the tree.
+///
+/// A world of two has one round either way, and both forms are the same one consume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReduceForm {
+    Direct,
+    RecursiveDoubling,
+}
+
+impl ReduceForm {
+    /// The widest fragment the direct exchange takes: one decode row at the widest batch rung of a
+    /// hidden-4096 model (32 rows × 4096 × fp16 = 256 KiB). Every decode all-reduce granite makes is
+    /// at or under it; a prefill chunk's (512 rows, 2–4 MiB) is over it.
+    pub const DIRECT_MAX_BYTES: u64 = 256 * 1024;
+
+    /// The form an all-reduce over `world` of a `bytes`-byte fragment takes.
+    pub const fn of(world: TpWorld, bytes: u64) -> Self {
+        if world.round_count() <= 1 || bytes <= Self::DIRECT_MAX_BYTES {
+            Self::Direct
+        } else {
+            Self::RecursiveDoubling
+        }
+    }
+}
+
 /// WHICH PEERS A CONSUME'S SENDS AND WAITS EXCHANGE WITH.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Exchange {

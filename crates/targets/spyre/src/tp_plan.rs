@@ -386,8 +386,9 @@ mod tests {
         }
     }
 
-    /// ⭐ EVERY WORLD WIDER THAN TWO REDUCES BY RECURSIVE DOUBLING. Every all-reduce of a four- or
-    /// eight-rank decode lowers to `log2 W` consumes, one per round, each played by every rank: round
+    /// ⭐ A WIDE ALL-REDUCE IN A WORLD WIDER THAN TWO REDUCES BY RECURSIVE DOUBLING. A prompt chunk's
+    /// all-reduce (512 rows, past `ReduceForm::DIRECT_MAX_BYTES`) at four or eight ranks lowers to
+    /// `log2 W` consumes, one per round, each played by every rank: round
     /// `j` adds this rank's running sum (its partial, then round `j − 1`'s sum) to its partner's,
     /// read out of region `2^j − 1` of its window, and writes round `j`'s sum (the output, at the
     /// last round). Each rank's pipeline is, per round, a send to `rank XOR 2^j`, a wait on it, and the
@@ -410,7 +411,11 @@ mod tests {
             let world = spyre.plan();
             let w = world.get();
             let n = world.round_count() as usize;
-            let b = tp_bake(&one_layer_input(), spyre).unwrap();
+            let b = tp_bake(
+                &scratchy_subtile::fixtures::mlp_sublayer_rows(2048, 8192, 512),
+                spyre,
+            )
+            .unwrap();
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let node = ir
                 .nodes
@@ -497,6 +502,126 @@ mod tests {
                         round.index()
                     );
                 }
+                assert_eq!(wdone_balance(cb_pipeline(&groups, me)), 0);
+            }
+        }
+    }
+
+    /// ⭐ A DECODE ALL-REDUCE IN A WORLD WIDER THAN TWO REDUCES DIRECTLY (#1019 runs 34 and 38: the
+    /// tree's serialized rounds cost a one-row exchange a hop each). Every rank sends its one-row
+    /// fragment to every peer and waits on each, then launches its own consume, played by it alone,
+    /// adding the `W` fragments as the canonical tree: `W − 1` adds, its own fragment read from its
+    /// operand and every peer's from region `(r XOR s) − 1` of the cut, every right half summed into
+    /// a round sum. The pipeline is `2(W − 1) + 1` control blocks with the write-done ledger closed.
+    #[test]
+    fn a_decode_all_reduce_reduces_directly_in_every_wider_world() {
+        use crate::bundle_code::collective::{
+            CbStep, Exchange, PlaysAt, ReduceForm, cb_pipeline, wdone_balance,
+        };
+        use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
+        use crate::lower_subtile_tape_to_superdsc::{FoldGrouping, launch_index};
+        use ktir_superdsc::collective::CollectiveKind;
+        use ktir_superdsc::ktir_node::ActiveCap;
+        use ktir_superdsc::reserved_tids::tp_round_sum_tid;
+        use scratchy_subtile::subtile_ir::{SubOp, lower_region};
+
+        for spyre in SpyreWorld::SHARDED
+            .into_iter()
+            .filter(|w| w.plan().get() > 2)
+        {
+            let world = spyre.plan();
+            let w = world.get();
+            let b = tp_bake(&one_layer_input(), spyre).unwrap();
+            let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
+            let node = ir
+                .nodes
+                .iter()
+                .find(|n| matches!(n.op, SubOp::AllReduce { .. }))
+                .expect("a sharded layer reduces its partials");
+            let ops = match lower_one_node(node, &ir, ActiveCap::FULL, false) {
+                NodeLowering::Ops(v) => v,
+                NodeLowering::Unhandled(why) => panic!("tp={w}: did not lower: {why}"),
+                NodeLowering::HostRouted(k) => panic!("tp={w}: host-routed: {k}"),
+            };
+            let c0 = ops[0].tp_consume.expect("a consume");
+            assert_eq!(
+                ReduceForm::of(world, c0.fragment.bytes().get()),
+                ReduceForm::Direct,
+                "tp={w}: a one-row fragment is small"
+            );
+            assert_eq!(
+                ops.len(),
+                (w * (w - 1)) as usize,
+                "tp={w}: W − 1 adds per rank"
+            );
+            let partial = node.inputs[0].tensor.index() as u32;
+            let output = node.output.tensor.index() as u32;
+            for (me, adds) in world.ranks().zip(ops.chunks((w - 1) as usize)) {
+                for op in adds {
+                    let c = op.tp_consume.expect("every add is the consume");
+                    assert_eq!(c.kind, CollectiveKind::AllReduce);
+                    assert_eq!(c.exchange, Exchange::EveryPeer, "tp={w}: one hop");
+                    assert_eq!(c.plays_at, Some(PlaysAt::of(me)), "tp={w}: its own rank");
+                    assert_eq!(c.operand.tid(), partial, "tp={w}: it sends its partial");
+                }
+                let binds = |i: usize| -> Vec<u32> {
+                    adds[i]
+                        .ktir
+                        .as_ref()
+                        .expect("a program")
+                        .bindings
+                        .iter()
+                        .map(|b| b.get())
+                        .collect()
+                };
+                // The tree reads every fragment exactly once: its own from the operand, each peer's
+                // from that peer's region of the cut.
+                let reads: Vec<u32> = (0..adds.len())
+                    .flat_map(|i| binds(i)[..2].to_vec())
+                    .filter(|t| {
+                        *t == partial
+                            || (*t != output && !(0..3).any(|k| *t == tp_round_sum_tid(k)))
+                    })
+                    .collect();
+                let mut want: Vec<u32> = vec![partial];
+                want.extend(me.peers().map(|p| c0.cut.tid(me.region_of(p).unwrap())));
+                let (mut got, mut want) = (reads, want);
+                got.sort_unstable();
+                want.sort_unstable();
+                assert_eq!(got, want, "tp={w} rank {}: every fragment once", me.rank());
+                assert_eq!(
+                    binds(adds.len() - 1).last(),
+                    Some(&output),
+                    "tp={w}: the last add writes the output"
+                );
+            }
+            let shifts = launch_index(&ops, FoldGrouping::Split);
+            let groups: Vec<crate::bundle_code::LaunchGroup<'static>> = shifts
+                .iter()
+                .map(|kv| crate::bundle_code::LaunchGroup {
+                    kv: *kv,
+                    ..Default::default()
+                })
+                .collect();
+            for me in world.ranks() {
+                let steps: Vec<CbStep> = cb_pipeline(&groups, me).collect();
+                let peers = (w - 1) as usize;
+                assert_eq!(
+                    steps.len(),
+                    2 * peers + 1,
+                    "tp={w}: one hop, 2(W − 1) + 1 blocks"
+                );
+                assert!(
+                    steps[..peers]
+                        .iter()
+                        .all(|s| matches!(s, CbStep::Send { .. }))
+                );
+                assert!(
+                    steps[peers..2 * peers]
+                        .iter()
+                        .all(|s| matches!(s, CbStep::Wait { .. }))
+                );
+                assert!(matches!(steps[2 * peers], CbStep::Launch { .. }));
                 assert_eq!(wdone_balance(cb_pipeline(&groups, me)), 0);
             }
         }
