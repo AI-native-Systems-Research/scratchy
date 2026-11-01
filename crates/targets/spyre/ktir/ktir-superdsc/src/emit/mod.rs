@@ -6664,9 +6664,11 @@ pub(crate) fn restickify_transpose_opspec_batched(
 ) -> Result<OpSpec, String> {
     let _rows_ext = StickExtent::<Fp16>::new(rows)?;
     let _cols_ext = StickExtent::<Fp16>::new(cols)?;
-    if batch <= 1 || batch > MAX_CORES {
+    // One batch a core, or past the cores, as many consecutive batches a core as divide evenly.
+    let cores = crate::work::core_split(batch, MAX_CORES);
+    if batch <= 1 || cores <= 1 {
         return Err(format!(
-            "restickify transpose '{o_name}': a batch of {batch} is not one batch a core of {MAX_CORES}"
+            "restickify transpose '{o_name}': a batch of {batch} divides over no cores of {MAX_CORES}"
         ));
     }
     let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
@@ -6682,9 +6684,13 @@ pub(crate) fn restickify_transpose_opspec_batched(
         dim("out", cols, true),
     ];
     let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
-        BTreeMap::from([("mb", batch)])
+        BTreeMap::from([("mb", cores)])
     })?;
-    let resident = 2 * u64::from(rows) * u64::from(cols) * u64::from(Fp16::WORD_LENGTH);
+    let resident = 2
+        * u64::from(batch / cores)
+        * u64::from(rows)
+        * u64::from(cols)
+        * u64::from(Fp16::WORD_LENGTH);
     if resident > USABLE_LX_BYTES {
         return Err(format!(
             "restickify transpose '{o_name}': one core's [{rows}, {cols}] block in and out is \

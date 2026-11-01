@@ -986,9 +986,12 @@ pub fn matmul_opspec_x_batched(
     use crate::superdsc_opspec::{ItDim, ViewFrame};
     let n_ext = StickExtent::<Fp16>::new(n)?;
     let k_ext = StickExtent::<Fp16>::new(k)?;
-    if batch <= 1 || batch > MAX_CORES {
+    // One batch a core, or past the cores, as many consecutive batches a core as divide evenly
+    // (a decode batch's `J · B · KV` blocks).
+    let cores = crate::work::core_split(batch, MAX_CORES);
+    if batch <= 1 || cores <= 1 {
         return Err(format!(
-            "matmul_opspec_x_batched('{o_name}'): a batch of {batch} is not one batch a core of \
+            "matmul_opspec_x_batched('{o_name}'): a batch of {batch} divides over no cores of \
              {MAX_CORES}"
         ));
     }
@@ -1006,7 +1009,7 @@ pub fn matmul_opspec_x_batched(
         dim(InAxis::NAME, k_ext.elems(), true, true),
     ];
     let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
-        std::collections::BTreeMap::from([("x", batch)])
+        std::collections::BTreeMap::from([("x", cores)])
     })?;
     let active = [Scale::Active, Scale::Active, Scale::Active];
     let input = TensorArg::<3>::new(
