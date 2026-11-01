@@ -2106,9 +2106,9 @@ fn the_paged_attention_splices_with_its_contract() {
             node.inputs[2].tensor.index() as u32,
             tids.page_table,
         ];
-        if s.mq == 1 {
-            want.push(tids.kv_row_pool);
-        }
+        // Both one-sequence kernels bind the pool: the prompt trip gathers its page as the pool's
+        // rows, a kv head a core, as the decode trip does.
+        want.push(tids.kv_row_pool);
         want.extend([tids.mask, node.output.tensor.index() as u32]);
         assert_eq!(bound, want, "{at}");
         assert_eq!(k.mask.map(|m| m.get()), Some(tids.mask), "{at}");

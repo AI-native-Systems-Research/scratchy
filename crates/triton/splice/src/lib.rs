@@ -1885,9 +1885,10 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         ("v_pages", "*fp16"),
         ("page_index_table", "*i32"),
     ];
-    if decode {
-        pointers.push(("kv_row_pool", "*i32"));
-    }
+    // ⭐ BOTH ONE-SEQUENCE KERNELS READ `kv_row_pool`. The decode trip always did; the prompt trip
+    // now does too, so its page gather is the pool's `nkvh` rows — one kv head a core — instead of
+    // one unfolded row on a single core (`PagedStep::reads_kv_row_pool`).
+    pointers.push(("kv_row_pool", "*i32"));
     pointers.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
     for (p, ty) in pointers {
         signature.insert(
@@ -1929,9 +1930,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         t(&node.inputs[2]),
         BufferId::new(tids.page_table),
     ];
-    if decode {
-        bindings.push(BufferId::new(tids.kv_row_pool));
-    }
+    bindings.push(BufferId::new(tids.kv_row_pool));
     bindings.extend([BufferId::new(tids.mask), t(&node.output)]);
     let k = rebind(
         positional,
@@ -4308,10 +4307,9 @@ mod walk_on_the_card {
         for p in ["query", "k_pages", "v_pages", "mask_stack", "out"] {
             signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("spec"));
         }
-        let mut ints = vec!["query_row_index", "page_index_table"];
-        if decode {
-            ints.push("kv_row_pool");
-        }
+        // Both one-sequence kernels read `kv_row_pool` — the prompt trip gathers its page as the
+        // pool's rows, one kv head a core, as the decode trip does.
+        let ints = ["query_row_index", "page_index_table", "kv_row_pool"];
         for p in ints {
             signature.insert(p.to_string(), ArgSpec::parse("*i32").expect("spec"));
         }
