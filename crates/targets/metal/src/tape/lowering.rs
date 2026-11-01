@@ -1276,8 +1276,23 @@ fn route_gdn(
         GuardRun::Gated(gate) => Some(GatedCommand { command, gate }),
         GuardRun::Dropped => None,
     };
+    // A bucket wider than a verify lane carrying the verify pair (`gdn_verify`): it runs the steps
+    // whose every sequence holds a lane's rows at most, and the commands after it every other step.
+    let lane_split = bucket_m > GDN_VERIFY_ROWS && cmds.iter().any(|c| c.command.library == "gdn_verify");
+    let lane_gate = |gate: Option<RuntimeGate>, lane: RuntimeGate| match lane_split {
+        true => Some(RuntimeGate::and(gate, &[lane])),
+        false => gate,
+    };
     let mut out = Vec::with_capacity(cmds.len() + 2);
     for GatedCommand { command, .. } in cmds {
+        if command.library == "gdn_verify" {
+            out.push(GatedCommand {
+                command,
+                gate: lane_gate(None, RuntimeGate::OnlyIfLaneRows),
+            });
+            continue;
+        }
+        let at = out.len();
         if command.library == "gdn_decode" {
             out.extend(gated(command, &decoded));
         } else if pipelines && command.library == "gdn_scan_varlen" && command.function == simd {
@@ -1320,6 +1335,9 @@ fn route_gdn(
             out.extend(beside_gate);
         } else {
             out.extend(gated(command, &|d, q| !decoded(d, q)));
+        }
+        for c in &mut out[at..] {
+            c.gate = lane_gate(c.gate, RuntimeGate::UnlessLaneRows);
         }
     }
     out
@@ -5752,21 +5770,24 @@ fn lower_one(
             // scratch a barrier apart. Its shader's static asserts are these bounds. A
             // threadgroup a (sequence, key head, VALUE head) — `tgid.y` over `nv`, 2× the key
             // heads' fill on a model whose value heads outnumber them.
+            // Its rows are a SEQUENCE's (`cu_seqlens`, a threadgroup a sequence): at most a verify
+            // lane's (GDN_VERIFY_ROWS) at every verify-sized bucket, which holds up to
+            // `DFLASH2_BLOCK_LANES` such lanes; a bucket of fewer rows bounds them tighter.
+            let seq_rows = bucket_m.min(GDN_VERIFY_ROWS);
             let verify = (simd_scan
                 && nv.is_multiple_of(nk)
                 && 2 * hk + hv <= 1024
                 && hv == 128
                 && kernel <= 8
-                && (2..=GDN_VERIFY_ROWS).contains(&bucket_m)
-                && bucket_m <= 32
+                && (2..=crate::op_abi::METAL_VERIFY_ROWS).contains(&bucket_m)
                 && p.spec_drafts < GDN_VERIFY_ROWS
-                && bucket_m + p.spec_drafts < 32
-                && bucket_m * (2 * hk + 2 * hv) * 4
-                    + (2 * bucket_m + p.spec_drafts + 1 + 3 * bucket_m) * 4
+                && seq_rows + p.spec_drafts < 32
+                && seq_rows * (2 * hk + 2 * hv) * 4
+                    + (2 * seq_rows + p.spec_drafts + 1 + 3 * seq_rows) * 4
                     <= 32768)
                 .then(|| {
                     let rows = [
-                        ConstantValue::uint(7, bucket_m),
+                        ConstantValue::uint(7, seq_rows),
                         ConstantValue::uint(8, p.spec_drafts),
                     ];
                     let lanes = p.spec_drafts > 0;
@@ -5789,9 +5810,14 @@ fn lower_one(
                     );
                     vec![verify, qk_state]
                 });
-            if let Some(verify) = verify {
-                return Ok(verify);
-            }
+            // At most a lane's rows a bucket: every sequence is within the verify command's. A
+            // wider bucket (a 2-4-lane verify's) may also carry a sequence of more rows, a short
+            // prompt's one chunk: the verify command runs a step whose sequences hold a lane's rows
+            // at most, and the commands below every other (`route_gdn`, the lane-rows gates).
+            let verify = match verify {
+                Some(v) if bucket_m <= GDN_VERIFY_ROWS => return Ok(v),
+                v => v,
+            };
 
             let layout = GdnScratchLayout::compute(bucket_m, conv_dim, nv, value_dim);
             *moe_scratch_bytes = (*moe_scratch_bytes).max(layout.total);
@@ -5836,6 +5862,10 @@ fn lower_one(
                 None,
             ));
 
+            // The verify pair first: `route_gdn` gates it on the lane rows, the rest off them.
+            if let Some(verify) = verify {
+                return Ok(verify.into_iter().chain(cmds).collect());
+            }
             return Ok(cmds);
         }
 
@@ -8091,11 +8121,17 @@ impl MoeScratch {
         };
         let pairs = bucket_m * b.top_k.0;
         let per_expert = pairs as f32 / b.experts.0 as f32;
+        // A lane's verify sorts on every bank (Splash's decode plan); the 2-4-lane verifies wider
+        // buckets carry are only a block drafter's target's (`draft_capture_slots`), so only its
+        // bake sorts there: another model keeps its own ladder at those buckets.
+        let lanes = if p.draft_capture_slots > 0 {
+            METAL_LANE_VERIFY_ROWS..=METAL_DECODE_GROUPED_ROWS
+        } else {
+            METAL_LANE_VERIFY_ROWS..=METAL_LANE_VERIFY_ROWS
+        };
         let grouping = match groups && pairs >= METAL_SORTED_PAIRS {
             // A verify of one to four lanes, Splash's decode plan, groups every route by expert.
-            true if (METAL_LANE_VERIFY_ROWS..=METAL_DECODE_GROUPED_ROWS).contains(&bucket_m) => {
-                MoeGrouping::Sorted
-            }
+            true if lanes.contains(&bucket_m) => MoeGrouping::Sorted,
             true if per_expert >= METAL_GROUPED_PAIRS_PER_EXPERT => MoeGrouping::Grouped,
             true if METAL_SORTED_PAIRS_PER_EXPERT.contains(&per_expert) => MoeGrouping::Sorted,
             _ => MoeGrouping::Gathered,

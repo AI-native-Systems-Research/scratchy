@@ -619,6 +619,9 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// Whether the step about to run is a DFlash2 cycle's context commit
     /// (`RuntimeGate::OnlyIfDraftCycle`), set from its inputs before it is encoded.
     pub draft_cycle: std::sync::atomic::AtomicBool,
+    /// Whether every sequence of the step about to run holds at most a verify lane's rows
+    /// (`RuntimeGate::OnlyIfLaneRows`), set from its inputs before it is encoded.
+    pub lane_rows: std::sync::atomic::AtomicBool,
     /// Per-dispatch GPU timestamp heap (`SCRATCHY_METAL_KERNEL_TIME`).
     /// `None` unless the env var is set at worker build — the probe is
     /// opt-in and costs nothing otherwise. One timestamp is written
@@ -1125,6 +1128,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             gdn_plain: std::sync::atomic::AtomicBool::new(true),
             gdn_plain_rows: std::sync::atomic::AtomicBool::new(true),
             draft_cycle: std::sync::atomic::AtomicBool::new(false),
+            lane_rows: std::sync::atomic::AtomicBool::new(true),
             kernel_time_heap: if std::env::var_os("SCRATCHY_METAL_KERNEL_TIME").is_some() {
                 Some(super::mtl4::new_registered_kernel_time_heap(&device))
             } else {
@@ -1271,6 +1275,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             gdn_plain: self.gdn_plain.load(std::sync::atomic::Ordering::Relaxed),
             gdn_plain_rows: (self.gdn_plain_rows).load(std::sync::atomic::Ordering::Relaxed),
             draft_cycle: (self.draft_cycle).load(std::sync::atomic::Ordering::Relaxed),
+            lane_rows: (self.lane_rows).load(std::sync::atomic::Ordering::Relaxed),
         };
         // A skipped dispatch's fence, owed to the next one played.
         let mut carried = Fence::None;
@@ -1620,8 +1625,16 @@ fn bake_bucket<W: CanonicalParams>(
                 .get(cmd_idx)
                 .copied()
                 .unwrap_or(Fence::Coherent);
-            // Dense GEMM: M is the height axis but the bake here is for a dense linear that
-            // always dispatches at the actual M (no bucket_m baking), so leave m_scaling as None.
+            // A GEMV's chunks of rows are its grid's height (`gemm_pipeline`): scaled to the step's
+            // live rows, so a step of fewer rows than the bucket runs only its chunks. A tiled GEMM's
+            // grid stays the bucket's.
+            let gemv_scaling = (shape.threadgroups.1 > 1
+                && pipeline_is_gemv(&shape, dims))
+            .then_some(super::lowered::MScaling {
+                axis: super::lowered::MScaleAxis::Y,
+                bucket_m: super::ids::BucketM(dims.m),
+                set_axis: None,
+            });
             match steps.last_mut() {
                 Some(BucketStep::Dispatch {
                     pipeline: prev,
@@ -1634,7 +1647,7 @@ fn bake_bucket<W: CanonicalParams>(
                 }) if same_pipeline(prev, &pipeline) => {
                     direct_bindings.push(bindings_for_cmd);
                     direct_dispatch.push(dispatch_for_cmd);
-                    direct_m_scaling.push(None);
+                    direct_m_scaling.push(gemv_scaling);
                     barrier_before.push(cmd_barrier);
                     // Gemm path is never gated (no slice); push None to keep the Vec aligned
                     // with `direct_dispatch`.
@@ -1646,7 +1659,7 @@ fn bake_bucket<W: CanonicalParams>(
                         pipeline,
                         direct_bindings: vec![bindings_for_cmd],
                         direct_dispatch: vec![dispatch_for_cmd],
-                        direct_m_scaling: vec![None],
+                        direct_m_scaling: vec![gemv_scaling],
                         barrier_before: vec![cmd_barrier],
                         runtime_gate: vec![None],
                     });
@@ -2004,6 +2017,7 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
         gdn_plain,
         gdn_plain_rows,
         draft_cycle,
+        lane_rows,
     } = step;
     let decode_step = num_tokens == num_seqs;
     match gate {
@@ -2027,6 +2041,8 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
         Some(super::lowered::RuntimeGate::OnlyIfPlainGdn) => gdn_plain,
         Some(super::lowered::RuntimeGate::UnlessPlainGdn) => !gdn_plain,
         Some(super::lowered::RuntimeGate::OnlyIfPlainGdnRows) => gdn_plain_rows,
+        Some(super::lowered::RuntimeGate::OnlyIfLaneRows) => lane_rows,
+        Some(super::lowered::RuntimeGate::UnlessLaneRows) => !lane_rows,
         Some(super::lowered::RuntimeGate::OnlyIfDraftCycle) => draft_cycle,
         Some(super::lowered::RuntimeGate::UnlessDraftCycle) => !draft_cycle,
         Some(super::lowered::RuntimeGate::All(gates)) => {
@@ -2055,6 +2071,9 @@ pub struct StepFacts {
     /// The forward is a DFlash2 cycle's context commit: each lane its verify's block, of which
     /// it retained a count ([`super::DraftInputs::cycle`]).
     pub draft_cycle: bool,
+    /// Every sequence of the step holds at most a verify lane's rows
+    /// (`op_abi::METAL_LANE_VERIFY_ROWS`).
+    pub lane_rows: bool,
 }
 
 /// Rewrite the m-axis of a baked threadgroup grid to match the
@@ -2102,6 +2121,12 @@ fn scale_tg_for_num_tokens(
         *slot = count.max(1) as usize;
     }
     tg
+}
+
+/// Whether a dense GEMM of `dims` played at `shape` is the chunked GEMV (`gemm_pipeline`): its
+/// threadgroups of 256 threads, its grid's height its chunks of rows.
+fn pipeline_is_gemv(shape: &super::lowered::DispatchShape, dims: super::lowered::GemmDims) -> bool {
+    dims.m <= super::pipelines::GEMV_MAX_ROWS && shape.threads_per_threadgroup == (256, 1, 1)
 }
 
 fn mtl_size_pair(cmd: &LoweredCommand, variant: TapeVariant) -> (MTLSize, MTLSize) {
@@ -2208,6 +2233,7 @@ mod tests {
             gdn_plain: true,
             gdn_plain_rows: true,
             draft_cycle: false,
+            lane_rows: true,
         };
         for (tokens, seqs, decode) in [
             (1, 1, true),
@@ -2401,6 +2427,7 @@ mod tests {
                 gdn_plain: true,
                 gdn_plain_rows: true,
                 draft_cycle: false,
+                lane_rows: true,
             };
             for cmd in cmds {
                 let key = crate::specialized_pipeline_cache::PipelineKey::new(
