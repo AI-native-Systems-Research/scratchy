@@ -552,16 +552,17 @@ pub enum EwDivision {
     Groups(u32),
 }
 
-/// [`EwDivision::Groups`]: `mb` split into exactly `n` cores, nothing else — `n` groups of `mb / n`
-/// rows. [`distribute_cores`] for an op whose rows `n` does not divide, or past the core budget.
+/// [`EwDivision::Groups`]: `mb` split into `n` groups of `mb / n` rows, one a core — or, past the core
+/// budget, as many cores as divide `n` evenly ([`core_split`]), each holding that many consecutive
+/// groups (a decode batch's `J · B · KV` blocks over 32 cores, 8 blocks a core). [`distribute_cores`]
+/// for an op whose rows the groups do not divide.
 pub fn row_groups(dims: &[ItDim], max_cores: u32, n: u32) -> BTreeMap<&'static str, u32> {
+    let cores = core_split(n, max_cores);
     match dims
         .iter()
         .find(|d| d.name == "mb" && !d.is_reduction && !d.is_stick)
     {
-        Some(mb) if n > 1 && n <= max_cores && mb.size.is_multiple_of(n) => {
-            BTreeMap::from([(mb.name, n)])
-        }
+        Some(mb) if cores > 1 && mb.size.is_multiple_of(n) => BTreeMap::from([(mb.name, cores)]),
         _ => distribute_cores(dims, max_cores),
     }
 }

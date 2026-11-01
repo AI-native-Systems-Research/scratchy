@@ -4660,6 +4660,62 @@ mod walk_on_the_card {
         }
     }
 
+    /// ⭐⭐ A DECODE BATCH's CHUNK IN THE DECODE TRIP's FORM — the kernel spyre-inference serves every
+    /// decode with (`batched_decode_head_major`, one sequence included). A chunk's `J · B · KV` page
+    /// blocks are the trip's batch: its K and V pages each gathered in ONE op (a page a core), Kᵀ
+    /// laid by one all-blocks restickify, the scores and the value product each ONE contraction over
+    /// every block, and the softmax between them — as many consecutive blocks a core as divide over
+    /// the 32 (8 at 256 blocks). 22 ops a chunk, from ~800 one block at a time.
+    #[test]
+    fn a_decode_batch_chunk_runs_in_the_decode_trips_form() {
+        for hd in [64, 128] {
+            for seqs in [1, 4] {
+                let at = format!("{seqs} sequences over 128 blocks at head dim {hd}");
+                let (node, c) = batched_walk_at(seqs, 128, hd);
+                let blocks = c.index_rows() * 8 / c.rows_per_page;
+                let layout =
+                    triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+                allocate_paged_cache(&node, &layout).expect("the cache allocates");
+                let mut sym = 0i64;
+                let ops =
+                    ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                        .unwrap_or_else(|e| panic!("{at}: {}", e.message));
+                let body: Vec<_> = ops.iter().filter(|e| e.walk.is_some()).collect();
+                assert_eq!(body.len(), 22, "{at}: the chunk's ops");
+                let named = |prefix: &str| -> Vec<&&ktir_superdsc::emit::EmittedOp> {
+                    body.iter()
+                        .filter(|e| e.op_name.starts_with(prefix))
+                        .collect()
+                };
+                assert_eq!(
+                    named("gather").len(),
+                    2,
+                    "{at}: the K and the V pages, one op each"
+                );
+                let split = |e: &ktir_superdsc::emit::EmittedOp| {
+                    serde_json::to_value(e.op.as_ref().expect("a descriptor")).expect("json")
+                        ["numWkSlicesPerDim_"]
+                        .clone()
+                };
+                let bmms = named("bmm");
+                assert_eq!(bmms.len(), 2, "{at}: the scores and the value product");
+                for e in bmms {
+                    assert_eq!(
+                        split(e)["x"],
+                        serde_json::json!(ktir_superdsc::work::core_split(blocks, 32)),
+                        "{at} {}: every block, over the cores",
+                        e.op_name
+                    );
+                }
+                assert_eq!(
+                    named("transpose").len(),
+                    1,
+                    "{at}: one all-blocks restickify"
+                );
+            }
+        }
+    }
+
     /// One chunk is straight-line: no loop to relaunch, every descriptor once.
     #[test]
     fn a_one_chunk_decode_batch_is_straight_line() {
