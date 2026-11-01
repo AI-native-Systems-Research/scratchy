@@ -452,7 +452,11 @@ impl Worker for SpyreWorker {
                     let SendnnSession::SuperDsc(sb) = &model.session;
                     sb.decode_rung_for(
                         scratchy_subtile::sdsc_abstract::LiveRows::of_scheduled(decode_ids.len()),
-                        decode_ids.iter().map(|(_, start)| *start).max().unwrap_or(0),
+                        decode_ids
+                            .iter()
+                            .map(|(_, start)| *start)
+                            .max()
+                            .unwrap_or(0),
                     )
                 }
             };
