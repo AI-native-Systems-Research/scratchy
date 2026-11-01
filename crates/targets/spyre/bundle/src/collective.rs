@@ -46,25 +46,36 @@ pub fn plays_on(tp: Option<TpConsume>, session: TpIdentity) -> bool {
 }
 
 /// One group's control blocks, in order: a consume group played by `session` is a send to each of
-/// its peers, then a wait on each, then the launch; every other group is one launch. A collective's
-/// send is never a group of its own: the consume names everything the send moves, so every consume
-/// has one send per peer in front of it, and no wait queues ahead of its own rank's sends (the
-/// symmetric deadlock: every rank waiting, none sending). Every rank names its peers in rank order.
+/// the peers it exchanges with ([`Exchange`]: every peer, or one round's partner), then a wait on
+/// each, then the launch; every other group is one launch. A collective's send is never a group of
+/// its own: the consume names everything the send moves, so every consume has one send per peer in
+/// front of it, and no wait queues ahead of its own rank's sends (the symmetric deadlock: every rank
+/// waiting, none sending). Every rank names its peers in rank order.
+///
+/// ⭐ A ROUND IS SEND, WAIT, ADD. Round `j` of an all-reduce exchanges with `rank XOR 2^j` alone, and
+/// its partner plays the same round in the same order, so the pair's sends meet: `3·log2 W` blocks
+/// per all-reduce, against `2(W − 1) + 1` for one consume over every peer.
 pub fn group_steps(
     group: usize,
     tp: Option<(TpConsume, TpIdentity)>,
 ) -> impl Iterator<Item = CbStep> {
     let steps: Vec<CbStep> = match tp {
-        Some((consume, session)) => session
-            .peers()
-            .map(|to| CbStep::Send { group, consume, to })
-            .chain(session.peers().map(|from| CbStep::Wait {
-                group,
-                consume,
-                from,
-            }))
-            .chain([CbStep::Launch { group }])
-            .collect(),
+        Some((consume, session)) => {
+            let peers: Vec<TpIdentity> = match consume.exchange {
+                Exchange::EveryPeer => session.peers().collect(),
+                Exchange::Round(round) => session.partner(round).into_iter().collect(),
+            };
+            peers
+                .iter()
+                .map(|&to| CbStep::Send { group, consume, to })
+                .chain(peers.iter().map(|&from| CbStep::Wait {
+                    group,
+                    consume,
+                    from,
+                }))
+                .chain([CbStep::Launch { group }])
+                .collect()
+        }
         None => vec![CbStep::Launch { group }],
     };
     steps.into_iter()
@@ -120,6 +131,8 @@ pub enum SendUnplaced {
     WindowTooSmall { window: u64, bytes: u64 },
     /// The window's cuts hold a count of regions no baked world has.
     WindowRegions { regions: u32 },
+    /// A round sum is missing, or not one region at its place above the cuts.
+    RoundSumMisplaced { round: u32 },
     /// The operand lives in the weight segment, which a consume launch pins to layer 0's bank-0
     /// copy — a layer-shifted operand would be read at the wrong layer.
     OperandInWeightSegment(crate::PlaceId),
@@ -179,7 +192,30 @@ pub fn baked_window(layout: &crate::BundleLayout<'_>) -> Result<Option<RecvWindo
             }
         }
     }
+    for round in world.rounds() {
+        let Some(offset) = window.round_sum_offset(round) else {
+            continue;
+        };
+        let misplaced = SendUnplaced::RoundSumMisplaced {
+            round: round.index(),
+        };
+        let placed = layout.place(round_sum(round)).ok_or(misplaced.clone())?;
+        if placed.segment != RecvWindow::SEGMENT
+            || placed.bank != 0
+            || placed.offset != offset
+            || placed.size != first.size
+        {
+            return Err(misplaced);
+        }
+    }
     Ok(Some(window))
+}
+
+/// The placement id of round `round`'s running sum (`RecvWindow::round_sum_offset`).
+pub fn round_sum(round: Round) -> crate::PlaceId {
+    crate::PlaceId::Act(ktir_superdsc::reserved_tids::tp_round_sum_tid(
+        round.index(),
+    ))
 }
 
 impl TpSend {
@@ -205,7 +241,14 @@ impl TpSend {
         let operand = layout
             .place(consume.operand)
             .ok_or(SendUnplaced::Operand(consume.operand))?;
-        if operand.segment == RecvWindow::SEGMENT {
+        // ⭐ A ROUND SUM IS THE ONE OPERAND IN THE WEIGHT SEGMENT: it is part of the window, which
+        // every consume launch reads unshifted (bank 0), so the launch's base addresses it as baked.
+        // Anything else there is a weight a rolled layer shifts, read at layer 0's copy.
+        let in_window = window
+            .world()
+            .rounds()
+            .any(|r| consume.operand == round_sum(r) && window.round_sum_offset(r).is_some());
+        if operand.segment == RecvWindow::SEGMENT && !in_window {
             return Err(SendUnplaced::OperandInWeightSegment(consume.operand));
         }
         let end = consume.fragment.byte_offset() + bytes.get();
@@ -354,6 +397,7 @@ mod tests {
             fragment: frag(),
             plays_at: None,
             cut: WindowCut::of_collective(0),
+            exchange: Exchange::Round(Round::baked(0)),
         };
         let groups = [
             crate::LaunchGroup::default(),
@@ -395,6 +439,7 @@ mod tests {
             fragment: frag(),
             plays_at: Some(PlaysAt::of(r)),
             cut: WindowCut::of_collective(0),
+            exchange: Exchange::EveryPeer,
         };
         let groups = [
             consume_group(consume_at(ranks[0])),
@@ -437,6 +482,7 @@ mod tests {
             fragment: frag(),
             plays_at: None,
             cut: WindowCut::of_collective(0),
+            exchange: Exchange::Round(Round::baked(0)),
         })
         .kv;
         assert_eq!(plain.weight_slot(4096, 2), (4096, 2));
@@ -507,6 +553,7 @@ mod tests {
             fragment,
             plays_at: None,
             cut: WindowCut::of_collective(0),
+            exchange: Exchange::Round(Round::baked(0)),
         };
         let operand = placed(crate::PlaceId::Act(7), 0, 8192, 4 * 256 * 2);
         let places = layout(with(window(), operand));
@@ -554,6 +601,7 @@ mod tests {
             fragment: frag(),
             plays_at: None,
             cut: WindowCut::of_collective(k),
+            exchange: Exchange::Round(Round::baked(0)),
         };
         let operand = placed(crate::PlaceId::Act(7), 0, 0, frag().bytes().get());
         let places = layout(with(window(), operand));
@@ -631,6 +679,7 @@ mod tests {
             fragment: frag(),
             plays_at: None,
             cut: WindowCut::of_collective(0),
+            exchange: Exchange::Round(Round::baked(0)),
         };
         let whole = frag().bytes().get();
         let operand = || placed(crate::PlaceId::Act(7), 0, 0, whole);

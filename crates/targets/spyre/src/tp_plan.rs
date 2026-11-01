@@ -337,13 +337,14 @@ mod tests {
         }
     }
 
-    /// ⭐ THE STATIC AUDIT (#1007 §5) PASSES A SHARDED SUBLAYER AT TWO AND FOUR RANKS, AND REFUSES A
+    /// ⭐ THE STATIC AUDIT (#1007 §5) PASSES A SHARDED SUBLAYER IN EVERY WORLD, AND REFUSES A
     /// WINDOW THAT MOVED. Each consume's descriptors read its own fragment at the operand's
-    /// placement and every peer's region of its cut at its first byte. Moving one region by a
-    /// stick, under unchanged descriptors, is a consume reading the wrong bytes: refused, naming it.
+    /// placement (a round sum's, past the first round) and the region of its cut it reads at its
+    /// first byte. Moving that region by a stick, under unchanged descriptors, is a consume reading
+    /// the wrong bytes: refused, naming it.
     #[test]
     fn the_static_audit_passes_every_world_and_refuses_a_moved_region() {
-        use crate::bundle_code::collective::{PeerRegion, WindowCut};
+        use crate::bundle_code::collective::{Exchange, PeerRegion, WindowCut};
         use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
         use crate::lower_subtile_tape_to_superdsc::{
             FoldGrouping, audit_collective_addresses, launch_index, render_dxp_input,
@@ -364,11 +365,15 @@ mod tests {
             let w = world.plan().get();
             audit_collective_addresses(&rendered, &shifts, &layout, "sublayer")
                 .unwrap_or_else(|e| panic!("tp={w}: {}", e.0));
-            let cut = ops.iter().find_map(|e| e.tp_consume).unwrap().cut;
-            let last = PeerRegion::of_world(world.plan()).last().unwrap();
+            // The region the last consume reads: its round's partner's, or a gather's last peer's.
+            let c = ops.iter().rev().find_map(|e| e.tp_consume).unwrap();
+            let read = match c.exchange {
+                Exchange::Round(round) => round.region(),
+                Exchange::EveryPeer => PeerRegion::of_world(world.plan()).last().unwrap(),
+            };
             layout
                 .placements
-                .get_mut(&WindowCut::tid(cut, last))
+                .get_mut(&WindowCut::tid(c.cut, read))
                 .unwrap()
                 .offset += 128;
             let refused = audit_collective_addresses(&rendered, &shifts, &layout, "sublayer")
@@ -381,18 +386,21 @@ mod tests {
         }
     }
 
-    /// ⭐ EVERY WORLD WIDER THAN TWO SUMS IN ABSOLUTE RANK ORDER, EACH RANK ITS OWN CONSUME. Every
-    /// all-reduce of a four- or eight-rank decode lowers to one consume per rank, played at that rank
-    /// alone: `W − 1` adds, `((f_0 + f_1) + f_2) + …`, reading the rank's own partial at its own rank
-    /// and each peer's from that peer's region of its window. Each rank's pipeline sends to its
-    /// `W − 1` peers, waits on all of them, then launches — and skips the other ranks' consumes whole.
+    /// ⭐ EVERY WORLD WIDER THAN TWO REDUCES BY RECURSIVE DOUBLING. Every all-reduce of a four- or
+    /// eight-rank decode lowers to `log2 W` consumes, one per round, each played by every rank: round
+    /// `j` adds this rank's running sum (its partial, then round `j − 1`'s sum) to its partner's,
+    /// read out of region `2^j − 1` of its window, and writes round `j`'s sum (the output, at the
+    /// last round). Each rank's pipeline is, per round, a send to `rank XOR 2^j`, a wait on it, and the
+    /// launch: `3·log2 W` control blocks, the partners' sends meeting, the write-done ledger closed.
     #[test]
-    fn wider_worlds_sum_every_partial_in_rank_order() {
-        use crate::bundle_code::collective::{CbStep, PeerRegion, cb_pipeline};
+    fn wider_worlds_reduce_by_recursive_doubling() {
+        use crate::bundle_code::collective::{CbStep, Exchange, cb_pipeline, wdone_balance};
         use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
         use crate::lower_subtile_tape_to_superdsc::{FoldGrouping, launch_index};
         use ktir_superdsc::collective::CollectiveKind;
         use ktir_superdsc::ktir_node::ActiveCap;
+        use ktir_superdsc::place::PlaceId;
+        use ktir_superdsc::reserved_tids::tp_round_sum_tid;
         use scratchy_subtile::subtile_ir::{SubOp, lower_region};
 
         for spyre in SpyreWorld::SHARDED
@@ -400,7 +408,8 @@ mod tests {
             .filter(|w| w.plan().get() > 2)
         {
             let world = spyre.plan();
-            let w = world.get() as usize;
+            let w = world.get();
+            let n = world.round_count() as usize;
             let b = tp_bake(&one_layer_input(), spyre).unwrap();
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let node = ir
@@ -417,55 +426,54 @@ mod tests {
                     panic!("tp={w}: the collective was host-routed: {k}")
                 }
             };
-            assert_eq!(ops.len(), w * (w - 1), "tp={w}: W − 1 adds per rank");
-            assert_eq!(
-                PeerRegion::of_world(world).count(),
-                w - 1,
-                "a region per peer"
-            );
+            assert_eq!(ops.len(), n, "tp={w}: one add per round");
             let partial = node.inputs[0].tensor.index() as u32;
-            for (me, adds) in world.ranks().zip(ops.chunks(w - 1)) {
-                let c = adds[0].tp_consume.expect("the program is the consume");
+            let output = node.output.tensor.index() as u32;
+            for (j, (op, round)) in ops.iter().zip(world.rounds()).enumerate() {
+                let c = op.tp_consume.expect("the program is the consume");
                 assert_eq!(c.kind, CollectiveKind::AllReduce);
-                assert!(
-                    c.plays_at.is_some_and(|p| p.rank() == me),
-                    "tp={w}: rank {}'s sum is its own",
-                    me.rank()
-                );
-                assert!(
-                    adds.iter().all(|a| a.tp_consume == Some(c)),
-                    "one consume group"
-                );
-                // The first add reads ranks 0 and 1, each later add one more rank, in order: own
-                // partial at its own rank, every other rank out of its region of this rank's window.
-                let reads = |k: usize| -> Vec<u32> {
-                    adds[k]
-                        .ktir
-                        .as_ref()
-                        .expect("a program")
-                        .bindings
-                        .iter()
-                        .map(|b| b.get())
-                        .collect()
+                assert_eq!(c.exchange, Exchange::Round(round), "tp={w}: round {j}");
+                assert!(c.plays_at.is_none(), "tp={w}: every rank plays round {j}");
+                // It sends what it holds: the partial, then the last round's sum.
+                let (sent, own) = if j == 0 {
+                    (partial, partial)
+                } else {
+                    let prev = tp_round_sum_tid(j as u32 - 1);
+                    (prev, prev)
                 };
-                let source = |r: u32| -> u32 {
-                    let rank = world.rank(r).unwrap();
-                    if rank == me {
-                        partial
-                    } else {
-                        c.cut.tid(me.region_of(rank).unwrap())
-                    }
-                };
-                assert!(reads(0).starts_with(&[source(0), source(1)]), "f_0 + f_1");
-                for k in 1..w - 1 {
-                    assert!(
-                        reads(k).contains(&source(k as u32 + 1)),
-                        "tp={w}: add {k} reads rank {}",
-                        k + 1
-                    );
+                assert_eq!(c.operand, PlaceId::Act(sent), "tp={w}: round {j} sends");
+                let binds: Vec<u32> = op
+                    .ktir
+                    .as_ref()
+                    .expect("a program")
+                    .bindings
+                    .iter()
+                    .map(|b| b.get())
+                    .collect();
+                let partner_region = c.cut.tid(round.region());
+                assert!(
+                    binds.starts_with(&[own, partner_region]),
+                    "tp={w}: round {j} adds its own running sum to its partner's: {binds:?}"
+                );
+                // The one region every rank's partner of this round lands in.
+                for me in world.ranks() {
+                    let partner = me.partner(round).unwrap();
+                    assert_eq!(me.region_of(partner), Some(round.region()));
+                    assert_eq!(partner.partner(round), Some(me), "partners pair");
                 }
+                let writes = if j + 1 == n {
+                    output
+                } else {
+                    tp_round_sum_tid(j as u32)
+                };
+                assert_eq!(binds.last(), Some(&writes), "tp={w}: round {j} writes");
             }
             let shifts = launch_index(&ops, FoldGrouping::Split);
+            assert_eq!(
+                shifts.len(),
+                n,
+                "tp={w}: each round is its own launch group"
+            );
             let groups: Vec<crate::bundle_code::LaunchGroup<'static>> = shifts
                 .iter()
                 .map(|kv| crate::bundle_code::LaunchGroup {
@@ -475,32 +483,21 @@ mod tests {
                 .collect();
             for me in world.ranks() {
                 let steps: Vec<CbStep> = cb_pipeline(&groups, me).collect();
-                let peers: Vec<_> = me.peers().collect();
-                let sends: Vec<_> = steps
-                    .iter()
-                    .filter_map(|s| match s {
-                        CbStep::Send { to, .. } => Some(*to),
-                        _ => None,
-                    })
-                    .collect();
-                let waits: Vec<_> = steps
-                    .iter()
-                    .filter_map(|s| match s {
-                        CbStep::Wait { from, .. } => Some(*from),
-                        _ => None,
-                    })
-                    .collect();
-                assert_eq!(
-                    sends,
-                    peers,
-                    "tp={w}: rank {} sends to each peer once",
-                    me.rank()
-                );
-                assert_eq!(waits, peers, "and waits on each once");
-                assert!(
-                    matches!(steps.last(), Some(CbStep::Launch { .. })),
-                    "then launches"
-                );
+                assert_eq!(steps.len(), 3 * n, "tp={w}: send, wait, launch per round");
+                for (round, three) in world.rounds().zip(steps.chunks(3)) {
+                    let partner = me.partner(round).unwrap();
+                    assert!(
+                        matches!(three, [
+                            CbStep::Send { to, .. },
+                            CbStep::Wait { from, .. },
+                            CbStep::Launch { .. },
+                        ] if *to == partner && *from == partner),
+                        "tp={w}: rank {} round {}: {three:?}",
+                        me.rank(),
+                        round.index()
+                    );
+                }
+                assert_eq!(wdone_balance(cb_pipeline(&groups, me)), 0);
             }
         }
     }

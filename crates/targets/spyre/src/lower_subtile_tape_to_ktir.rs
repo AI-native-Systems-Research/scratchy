@@ -1108,29 +1108,41 @@ fn collective_world<F: RopeForm>(
     })
 }
 
-/// The all-reduce's consume launches: the `Add` splice over every rank's fragment of the operand
-/// ([`crate::tp_plan::consume_fragments`], the same cut the window is sized over) — this rank's own
-/// and each peer's, out of its region of the receive window — each marked with the [`TpConsume`] its
-/// launch group carries into the CB pipeline.
+/// ⭐ THE ALL-REDUCE BY RECURSIVE DOUBLING: `log2 W` consume launches, one per round
+/// ([`Round`]). Round `j` adds this rank's running sum to its partner's (rank `r XOR 2^j`), which
+/// lands in the partner's region of the receive window: `out_j = own_{j−1} + partner_{j−1}`, where
+/// `own_{−1}` is this rank's fragment of the operand. Each launch is marked with the [`TpConsume`]
+/// its group carries into the CB pipeline — send the running sum to the partner, wait for the
+/// partner's, add — so an all-reduce is `3·log2 W` control blocks, not `2(W − 1) + 1`.
+///
+/// ⭐ ONE PROGRAM PER ROUND, PLAYED BY EVERY RANK. A window region is placed by the XOR law
+/// ([`PeerRegion`]), so round `j`'s partner lands in region `2^j − 1` on every rank
+/// ([`Round::region`]): the round reads the same bytes whichever rank runs it. And fp16 addition
+/// commutes, so the two partners of a round compute the same bits, and every rank adds the same
+/// tree, `((f0 + f1) + (f2 + f3)) + …` — the replicated sum is bit-identical on every rank. In a
+/// world of two that is the one consume it has always been, under the name it has always had.
+///
+/// ⭐ A ROUND'S SUM IS A BUFFER OF ITS OWN. Round `j + 1` SENDS round `j`'s sum, so it cannot be
+/// the buffer the next add writes: each round but the last writes its window round sum
+/// (`RecvWindow::round_sum_offset`, `tp_round_sum_tid`), and the last writes the output.
 ///
 /// A window region holds ONE fragment at a time, laid out from its first byte as the `[rows, cols]`
 /// tensor that fragment is — a run of whole stick columns is byte-identical to such a tensor — so
-/// every fragment's window view is columns `[0, cols)` of its peer's region of the collective's cut.
-///
-/// ⭐ EVERY RANK SUMS IN ABSOLUTE RANK ORDER, `((f_0 + f_1) + f_2) + …`, its own fragment at its own
-/// rank, so the replicated sum is bit-identical on every rank. In a world of two that is
-/// `own + peer` on rank 0 and `peer + own` on rank 1 — the same fp16 sum, addition commutes — so ONE
-/// consume every rank plays stands for both. A wider world's order depends on which rank is which,
-/// so it bakes one consume per rank (a chain of `W − 1` adds into the output), each played by its
-/// rank alone, as the all-gather's are.
+/// the partner's view is columns `[0, cols)` of its region of the collective's cut, and a round
+/// sum keeps the fragment from its first byte too ([`Fragment::at_start`]).
 ///
 /// [`TpConsume`]: ktir_superdsc::collective::TpConsume
+/// [`Round`]: ktir_superdsc::collective::Round
+/// [`Round::region`]: ktir_superdsc::collective::Round::region
+/// [`PeerRegion`]: ktir_superdsc::collective::PeerRegion
+/// [`Fragment::at_start`]: ktir_superdsc::collective::Fragment::at_start
 fn all_reduce_consumes<F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> NodeLowering {
-    use ktir_superdsc::collective::{CollectiveKind, PlaysAt, TpConsume, TpIdentity};
+    use ktir_superdsc::collective::{CollectiveKind, Exchange, Round, TpConsume};
+    use ktir_superdsc::reserved_tids::tp_round_sum_tid;
     use scratchy_subtile::subtile_ir::{EwKind, Range, Region, TensorRegion};
     let x = node.inputs[0];
     let rows = x.region.rows.len;
@@ -1143,14 +1155,21 @@ fn all_reduce_consumes<F: RopeForm>(
             "an all-reduce over a world of one — the analysis weaves no collective there".into(),
         );
     }
-    // The consume names the send — this rank's partial into each peer's window — which the CB
-    // pipeline issues ahead of the consume's waits.
+    // The consume names the send — this rank's running sum to its round's partner — which the CB
+    // pipeline issues ahead of the consume's wait.
     let f = match send_fragment(node, CollectiveKind::AllReduce) {
         Ok(f) => f,
         Err(refusal) => return refusal,
     };
     let cut = window_cut(node, ir);
     let cols_at = |start: u32| Range::new(start + f.first_col(), f.cols());
+    let operand = TensorRegion {
+        tensor: x.tensor,
+        region: Region {
+            rows: x.region.rows,
+            cols: cols_at(x.region.cols.start),
+        },
+    };
     let out = TensorRegion {
         tensor: node.output.tensor,
         region: Region {
@@ -1158,84 +1177,76 @@ fn all_reduce_consumes<F: RopeForm>(
             cols: cols_at(node.output.region.cols.start),
         },
     };
-    // Rank `r`'s fragment as rank `me` reads it: its own operand's columns, or `r`'s region of
-    // `me`'s window.
-    let fragment_on = |me: TpIdentity, r: TpIdentity| -> Option<TensorRegion> {
-        if r == me {
-            return Some(TensorRegion {
-                tensor: x.tensor,
-                region: Region {
-                    rows: x.region.rows,
-                    cols: cols_at(x.region.cols.start),
-                },
-            });
-        }
-        Some(TensorRegion {
-            tensor: TensorId::from_index(cut.tid(me.region_of(r)?) as usize),
-            region: Region {
-                rows: Range::new(0, rows),
-                cols: Range::new(0, f.cols()),
-            },
-        })
+    // One fragment's `[rows, cols]` from the first byte of a buffer that holds only it.
+    let whole = |tid: u32| TensorRegion {
+        tensor: TensorId::from_index(tid as usize),
+        region: Region {
+            rows: Range::new(0, rows),
+            cols: Range::new(0, f.cols()),
+        },
     };
-    // Each player's sum: its operands in absolute rank order, and the rank it plays at (`None`: every
-    // rank). A world of two keeps its one consume, rank 0's order.
-    let mut players: Vec<(Option<TpIdentity>, Vec<TensorRegion>)> = Vec::new();
-    for me in world.ranks() {
-        let Some(operands) = world
-            .ranks()
-            .map(|r| fragment_on(me, r))
-            .collect::<Option<Vec<_>>>()
-        else {
-            return NodeLowering::Unhandled(format!(
-                "rank {} of a {}-rank world has no window region for one of its peers",
-                me.rank(),
-                world.get()
-            ));
-        };
-        if world.peers() == 1 {
-            players.push((None, operands));
-            break;
+    let last = world.round_count() - 1;
+    // The running sum round `j` writes: its round sum, or the output after the last round.
+    let sum_of = |j: Round| {
+        if j.index() == last {
+            out
+        } else {
+            whole(tp_round_sum_tid(j.index()))
         }
-        players.push((Some(me), operands));
-    }
+    };
     let mut ops = Vec::new();
-    for (player, operands) in players {
-        let consume = TpConsume {
-            kind: CollectiveKind::AllReduce,
-            operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
-            fragment: f,
-            plays_at: player.map(PlaysAt::of),
-            cut,
+    let mut before: Option<Round> = None;
+    for round in world.rounds() {
+        // What this rank holds going into the round, and so what it sends: its fragment of the
+        // operand, then each round's sum.
+        let (own, consume) = match before {
+            None => (
+                operand,
+                TpConsume {
+                    kind: CollectiveKind::AllReduce,
+                    operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
+                    fragment: f,
+                    plays_at: None,
+                    cut,
+                    exchange: Exchange::Round(round),
+                },
+            ),
+            Some(prev) => (
+                sum_of(prev),
+                TpConsume {
+                    kind: CollectiveKind::AllReduce,
+                    operand: ktir_superdsc::place::PlaceId::Act(tp_round_sum_tid(prev.index())),
+                    fragment: f.at_start(),
+                    plays_at: None,
+                    cut,
+                    exchange: Exchange::Round(round),
+                },
+            ),
         };
-        // `out = f_0 + f_1`, then `out = out + f_k` for every later rank.
-        for (step, pair) in std::iter::once((operands[0], operands[1]))
-            .chain(operands[2..].iter().map(|&o| (out, o)))
-            .enumerate()
-        {
-            let add = SubtileNode {
-                id: node.id,
-                op: SubOp::Elementwise(EwKind::Add),
-                inputs: vec![pair.0, pair.1],
-                output: out,
-            };
-            let mut e = match scratchy_triton_splice::lower(&add, ir, rows_are_requests) {
-                Ok(e) => e,
-                Err(reason) => return NodeLowering::Unhandled(reason),
-            };
-            // A launch's name is its program's identity, and every add shares the node's id. The
-            // one consume of a world of two keeps the name it has always had.
-            let name = match player {
-                None => format!("tpconsume_s{}_f0", node.id.index()),
-                Some(me) => format!("tpconsume_s{}_r{}_a{step}", node.id.index(), me.rank()),
-            };
-            if let Some(kt) = e.ktir.as_mut() {
-                kt.func.name = ktir_core::arena::Arena::global().str(name.clone());
-            }
-            e.op_name = name;
-            e.tp_consume = Some(consume);
-            ops.push(e);
+        let add = SubtileNode {
+            id: node.id,
+            op: SubOp::Elementwise(EwKind::Add),
+            inputs: vec![own, whole(cut.tid(round.region()))],
+            output: sum_of(round),
+        };
+        let mut e = match scratchy_triton_splice::lower(&add, ir, rows_are_requests) {
+            Ok(e) => e,
+            Err(reason) => return NodeLowering::Unhandled(reason),
+        };
+        // A launch's name is its program's identity, and every round shares the node's id. The
+        // one consume of a world of two keeps the name it has always had.
+        let name = if world.round_count() == 1 {
+            format!("tpconsume_s{}_f0", node.id.index())
+        } else {
+            format!("tpconsume_s{}_j{}", node.id.index(), round.index())
+        };
+        if let Some(kt) = e.ktir.as_mut() {
+            kt.func.name = ktir_core::arena::Arena::global().str(name.clone());
         }
+        e.op_name = name;
+        e.tp_consume = Some(consume);
+        ops.push(e);
+        before = Some(round);
     }
     NodeLowering::Ops(ops)
 }
@@ -1313,6 +1324,7 @@ fn all_gather_consumes<F: RopeForm>(
             fragment,
             plays_at: Some(PlaysAt::of(id)),
             cut,
+            exchange: ktir_superdsc::collective::Exchange::EveryPeer,
         };
         // This rank's block, then each peer's from its region, in rank order. A world of two has
         // one peer, whose leg is named for its kind alone, as the part tag of a one-part write is.

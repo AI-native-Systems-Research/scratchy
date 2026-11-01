@@ -1215,8 +1215,9 @@ pub fn slice_source<T: SliceElement>(
 
 /// ⭐ WHAT A COLLECTIVE MEANS — its value on every rank, given every rank's buffers in ABSOLUTE
 /// RANK ORDER (`ranks[r]` is rank `r`'s). An [`SubOp::AllReduce`] sums its operand over the ranks
-/// in that order; an [`SubOp::AllGather`] concatenates their column blocks in that order. The one
-/// law [`eval_ranks`] and any lockstep reference over a rank's own buffers read.
+/// as one tree in that order — adjacent pairs, then pairs of pairs (the recursive-doubling order a
+/// power-of-two world's rounds add in); an [`SubOp::AllGather`] concatenates their column blocks in
+/// that order. The one law [`eval_ranks`] and any lockstep reference over a rank's own buffers read.
 ///
 /// # Panics
 /// On a node that is not a collective, or handed buffers for a world other than the one it
@@ -1238,17 +1239,22 @@ pub fn eval_collective<F: RopeForm>(
     }
     match node.op {
         SubOp::AllReduce { .. } => {
-            let parts: Vec<Vec<f32>> = ranks
+            let mut level: Vec<Vec<f32>> = ranks
                 .iter()
                 .map(|b| gather(&node.inputs[0], graph, b).0)
                 .collect();
-            let mut sum = parts[0].clone();
-            for p in &parts[1..] {
-                for (a, x) in sum.iter_mut().zip(p) {
-                    *a += *x;
-                }
+            // One level of the tree per round: block `2i` plus block `2i + 1`.
+            while level.len() > 1 {
+                level = level
+                    .chunks(2)
+                    .map(|pair| match pair {
+                        [a, b] => a.iter().zip(b).map(|(x, y)| x + y).collect(),
+                        [a] => a.clone(),
+                        _ => unreachable!("chunks of two"),
+                    })
+                    .collect();
             }
-            sum
+            level.pop().unwrap_or_default()
         }
         SubOp::AllGather { cols, .. } => {
             let parts: Vec<(Vec<f32>, u32, u32)> = ranks
