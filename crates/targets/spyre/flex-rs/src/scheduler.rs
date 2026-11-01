@@ -77,8 +77,7 @@ use crate::address::{ByteSize, Chunk, CompositeAddress};
 use crate::compute::{ComputeParams, ComputeWireBatch};
 use crate::control_block_wire::{
     AllocationTotalSize, ControlBlockWire, DevicePhysicalAddress, Flits, HostPhysicalAddress,
-    RdmaEndpoint, RdmaUnicastSend, ResponseTag, RunPlace, SegmentExtent, TransferSize,
-    VirtualAddressSbf, XlatWindow,
+    ResponseTag, SegmentExtent, TransferSize, VirtualAddressSbf,
 };
 use crate::dma::{DmaDirection, DmaParams, DmaPipelineShape, FillParams, FillPipeline};
 use crate::flex_config::{DeviceKind, RuntimeConfig};
@@ -1337,7 +1336,25 @@ pub struct RdmaOperand {
     pub offset: u64,
 }
 
-/// One F-send to render (`ControlBlockWire::rdma_unicast_send`), its endpoints still allocations.
+/// A message's place in its send's run — the send section's own `first` / `last` protocol bits,
+/// as [`PfBackend::submit_p2p_rdma_send`]'s window loop sets them: `first` on the first chunk,
+/// `last` on the final one; a one-message send is both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunPlace {
+    pub first: bool,
+    pub last: bool,
+}
+
+impl RunPlace {
+    /// The only message of its send.
+    pub const ALONE: Self = Self {
+        first: true,
+        last: true,
+    };
+}
+
+/// One F-send message to render in a CB stream ([`build_rdma_send_cb`]), its endpoints still
+/// allocations.
 pub struct RdmaSendParams {
     /// The SENDING rank's write-done sid.
     pub sid: u8,
@@ -1394,7 +1411,7 @@ pub fn landing_va_bytes(
 ///
 /// # Errors
 /// An endpoint whose transfer runs past its allocation (a window too small for the payload, or a
-/// fragment past its operand), an interleaved or unresolvable allocation, or the wire's refusal.
+/// fragment past its operand), an interleaved or unresolvable allocation, or the door's refusal.
 pub fn build_rdma_send_cb(
     resolver: &dyn DeviceAddressResolver,
     send: &RdmaSendParams,

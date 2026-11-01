@@ -1825,15 +1825,17 @@ impl RdmaUnit {
     }
 
     /// Creates (or idempotently re-marshals) the cross-port IOMMU mapping
-    /// for `target`, identifying the peer card by its PCI address (senlib's
-    /// `SenPci::pf(const std::string&)` — the card it is, never its place in
-    /// an enumeration order). This is the #550 re-add's core call: senlib's
+    /// for `target`, identifying the peer card by `peer_card_index` (the
+    /// same PCI enumeration index `sen_pci_card_count()`/
+    /// `pcie_address_for_card()` address — the peer's `PciDevId` comes from
+    /// the same `SenPciShared::pf()` lookup the shim's device bring-up
+    /// uses). This is the #550 re-add's core call: senlib's
     /// `create_iommu_mapping_for_cross_port_p2p_rdma`, which nothing above
     /// senlib calls today — scratchy is its first caller.
     pub fn attach_peer(
         &mut self,
         target: RankId,
-        peer: &senlib_ffi::PciAddress,
+        peer_card_index: u32,
         len_bytes: u64,
     ) -> Result<&PeerMapping, RdmaUnitError> {
         if !self.rdma_enabled {
@@ -1848,7 +1850,7 @@ impl RdmaUnit {
                 world_size: self.world_size,
             });
         }
-        let segments = senlib_ffi::p2p_create_mapping_at(peer, len_bytes)
+        let segments = senlib_ffi::p2p_create_mapping(peer_card_index, len_bytes)
             .map_err(RdmaUnitError::AttachFailed)?;
         if self
             .peers
