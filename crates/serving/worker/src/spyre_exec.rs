@@ -450,9 +450,10 @@ impl Worker for SpyreWorker {
                     // The count the rung is selected FROM is the LIVE one; everything the launch
                     // then binds is sized by the rung's own baked width.
                     let SendnnSession::SuperDsc(sb) = &model.session;
-                    sb.decode_rung_for(scratchy_subtile::sdsc_abstract::LiveRows::of_scheduled(
-                        decode_ids.len(),
-                    ))
+                    sb.decode_rung_for(
+                        scratchy_subtile::sdsc_abstract::LiveRows::of_scheduled(decode_ids.len()),
+                        decode_ids.iter().map(|(_, start)| *start).max().unwrap_or(0),
+                    )
                 }
             };
             // ⭐⭐⭐ #32 (c4b) — THE SEATING DISSOLVES whenever a decoder runs OUTSIDE the batched

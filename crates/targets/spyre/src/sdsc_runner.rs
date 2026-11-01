@@ -514,6 +514,14 @@ impl SuperDscSession {
         crate::wiring::BakeFacts::of(&self.exec.code().layout)
     }
 
+    /// The positions this session's narrowest walk rung covers: its ladder's first rung, the shortest
+    /// context a step on it walks. `None` for an unrolled bundle, which carries no ladder.
+    pub fn first_walk_positions(&self) -> Option<u64> {
+        let meta = self.exec.code().reroll.as_ref()?;
+        let rung = meta.ladder().ok()?.rungs().first()?;
+        Some(u64::from(rung.active_cap.get()))
+    }
+
     pub fn step_body(&mut self, start: usize) -> Result<crate::superdsc_exec::StepBody> {
         self.exec
             .step_body(crate::superdsc_exec::SeqPos(start as i64))

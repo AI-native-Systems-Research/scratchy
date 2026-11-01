@@ -400,11 +400,29 @@ impl SuperDscBundle {
     /// SMALLEST ladder rung that holds `live` requests. `None` when `live` exceeds the widest
     /// rung — the caller then refuses: there is no one-forward-per-request decode arm any more.
     ///
-    /// The live count is the only input: live request `i` runs in slot `i`, whatever its pages.
+    /// Live request `i` runs in slot `i`, whatever its pages. `deepest_pos` is the furthest position
+    /// a live request decodes at this step, which moves one request off the owner (below).
     pub(crate) fn decode_rung_for(
         &self,
         live: scratchy_subtile::sdsc_abstract::LiveRows,
+        deepest_pos: usize,
     ) -> Option<RungId> {
+        // ⭐ ONE REQUEST PAST THE TWO-ROW RUNG'S FIRST WALK RUNS ON THAT RUNG, its second row
+        // padding. A decode batch's walks are two chunks or more by bake
+        // (`BatchChunking::batch_walk_runs`), the form card-coherent on both granite models, and past
+        // that first walk it decodes one request faster than the owner's per-sequence walk
+        // (granite-3.1-2b fp8: 36.5 against ~50.5 ms at ~4k, 49.0 against 79.6 at ~10k;
+        // granite-3.1-8b bf16: 178.7 against 198.6 at ~10k). Short of it the owner's walk is the
+        // faster one, and every other decode is unchanged.
+        if live.get() == 1
+            && let Some(i) = self.decode_rungs.iter().position(|r| r.seqs.count() >= 2)
+            && self.decode_rungs[i]
+                .sess
+                .first_walk_positions()
+                .is_some_and(|first| deepest_pos as u64 >= first)
+        {
+            return Some(RungId::Ladder(i));
+        }
         if live.get() <= 1 {
             // The owner ALWAYS exists — it is the session every rung aliases — so the W=1
             // seat is never absent and a single request never falls to a second path.
