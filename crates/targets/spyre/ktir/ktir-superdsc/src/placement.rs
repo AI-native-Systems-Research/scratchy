@@ -21,7 +21,7 @@
 
 use crate::addr::{DevOff, Win};
 use crate::place::PlaceId;
-use crate::sdsc_abstract::{KindTag, StickLayout, Stk};
+use crate::sdsc_abstract::{ArrangementClaim, KindTag, StickLayout, Stk};
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::Df;
 
@@ -307,14 +307,15 @@ pub struct BundleLayout {
     /// `&layout`-threaded emit can consult it by name.
     #[serde(skip)]
     pub lx: std::cell::RefCell<LxAlloc>,
-    /// THE arrangement authority: `tensor name → its ONE device [`StickLayout`]`. The FIRST op to
-    /// address a tensor declares its layout; every later op must address it EQUIVALENTLY
-    /// ([`StickLayout::addr_eq`]) or `declare_arrangement` returns a build `Err` naming the tensor. A
+    /// THE arrangement authority: `tensor name → its ONE device arrangement` ([`ArrangementClaim`]). The
+    /// FIRST op to address a tensor declares it; every later op must address it EQUIVALENTLY
+    /// ([`ArrangementClaim::agrees`]) or `declare_arrangement` returns a build `Err` naming the tensor. A
     /// tensor has ONE physical layout — so a producer that writes it stick-major and a consumer that
     /// reads it flat (the M>1 prefill scramble) is a COMPILE-TIME failure, not silently-wrong bytes.
     /// Interior-mutable so the `&layout`-threaded `emit_sdsc` can declare on first sight.
     #[serde(skip)]
-    pub arrangements: std::cell::RefCell<std::collections::BTreeMap<String, StickLayout>>,
+    pub arrangements:
+        std::cell::RefCell<std::collections::BTreeMap<String, (ArrangementClaim, String)>>,
     /// BYTES BETWEEN TWO REQUESTS' KV inside one page+layer — [`PagedKvPool::request_stride`] in
     /// bytes, or 0 when this bundle has no paged KV.
     ///
@@ -1007,8 +1008,9 @@ impl BundleLayout {
         a.sizes.insert(name, fp);
     }
 
-    /// THE arrangement authority. Record that tensor `name` is addressed through `want`; a later op that
-    /// addresses it NON-equivalently ([`StickLayout::addr_eq`]) is a build `Err` naming the tensor.
+    /// THE arrangement authority. Record that tensor `name` is addressed through `want` by op `by`; a later op that
+    /// addresses it NON-equivalently ([`ArrangementClaim::agrees`], over [`StickLayout::addr_eq`]) is a
+    /// build `Err` naming the tensor.
     /// `addr_eq` is true for the same layout, and for a byte-identical RESHAPE (same total elements, both
     /// contiguous — e.g. `[1,2048]` ↔ `[32,64]`), which IS safe: identical bytes. It is FALSE for the M>1
     /// same-shape Dense-vs-stick scramble AND for a different-TOTAL disagreement (`[4,64]` vs `[32,64]`),
@@ -1017,20 +1019,23 @@ impl BundleLayout {
     pub fn declare_arrangement(
         &self,
         name: &str,
-        want: StickLayout,
-    ) -> Result<StickLayout, SuperDscError> {
+        want: impl Into<ArrangementClaim>,
+        by: &str,
+    ) -> Result<ArrangementClaim, SuperDscError> {
+        let want = want.into();
         let mut m = self.arrangements.borrow_mut();
         match m.get(name) {
-            Some(existing) if !existing.addr_eq(&want) => Err(SuperDscError(format!(
-                "tensor '{name}': device arrangement {want:?} conflicts with the earlier {existing:?} — a \
+            Some((existing, first)) if !existing.agrees(want) => Err(SuperDscError(format!(
+                "tensor '{name}': device arrangement {want:?} (op '{by}') conflicts with the earlier \
+                 {existing:?} (op '{first}') — a \
                  tensor has ONE physical layout, but a producer and consumer address it differently (a \
                  same-shape Dense-vs-stick scramble, OR a different-TOTAL size mismatch where the consumer \
                  reads bytes the producer never wrote). Address it ONE way, or insert an explicit \
                  restickify/replication op. This is the arrangement authority (declare_arrangement)."
             ))),
-            Some(existing) => Ok(*existing),
+            Some((existing, _)) => Ok(*existing),
             None => {
-                m.insert(name.to_string(), want);
+                m.insert(name.to_string(), (want, by.to_string()));
                 Ok(want)
             }
         }
