@@ -138,6 +138,16 @@ impl TpWorld {
         (0..self.0).map(move |rank| TpIdentity { rank, world: self })
     }
 
+    /// The rounds of this world's recursive-doubling all-reduce, in order: `log2 W` of them.
+    pub fn rounds(self) -> impl Iterator<Item = Round> {
+        (0..self.0.trailing_zeros()).map(Round)
+    }
+
+    /// How many rounds its all-reduce takes: `log2 W`.
+    pub const fn round_count(self) -> u32 {
+        self.0.trailing_zeros()
+    }
+
     /// Whether this world exchanges anything at all.
     pub const fn is_sharded(self) -> bool {
         self.0 > 1
@@ -162,11 +172,29 @@ const WIDEST_WORLD: u32 = {
     w
 };
 
+const _: () = {
+    let mut i = 0;
+    while i < SPYRE_TP_WORLDS.len() {
+        assert!(
+            SPYRE_TP_WORLDS[i].is_power_of_two(),
+            "every baked world is a power of two: the window's XOR region law and the all-reduce's \
+             recursive-doubling rounds both need one"
+        );
+        i += 1;
+    }
+};
+
 /// ⭐ ONE SENDING PEER'S PLACE IN A RECEIVE WINDOW. Every cut of a card's window holds one region
-/// per peer, in rank order with the card's own rank left out: on rank `r`, rank `s`'s region is
-/// `s` below `r` and `s − 1` above it. Minted only by [`TpIdentity::region_of`], so it is below the
-/// world's peer count by construction. In a world of two the one peer's region is 0, so the window
-/// is exactly one region per cut.
+/// per peer: on rank `r`, rank `s`'s region is `(r XOR s) − 1` ([`TpIdentity::region_of`]). In a
+/// power-of-two world `r XOR s` runs over `1..W` exactly once as `s` runs over the peers, so the
+/// regions are `0..W−1`, one per peer, and in a world of two the one peer's region is 0 — the
+/// window is exactly one region per cut.
+///
+/// ⭐ WHY XOR, NOT RANK ORDER: a recursive-doubling round pairs `r` with `r XOR 2^j`, and that
+/// partner's region is `2^j − 1` ON EVERY RANK ([`Round::region`]). So a round's consume reads one
+/// region whatever rank plays it: one program per round, played everywhere, instead of a variant
+/// per rank. Minted only by [`TpIdentity::region_of`] and [`Round::region`], so it is below the
+/// world's peer count by construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PeerRegion(u32);
 
@@ -222,18 +250,77 @@ impl TpIdentity {
         self.world.ranks().filter(move |r| r.rank != self.rank)
     }
 
-    /// The region of this card's receive window that `sender`'s messages land in. `None` for this
-    /// rank itself (a rank never sends to itself) or a rank of another world.
+    /// The region of this card's receive window that `sender`'s messages land in: `(r XOR s) − 1`
+    /// ([`PeerRegion`]). `None` for this rank itself (a rank never sends to itself) or a rank of
+    /// another world.
     pub const fn region_of(self, sender: TpIdentity) -> Option<PeerRegion> {
         if sender.world.0 != self.world.0 || sender.rank == self.rank {
             return None;
         }
-        Some(PeerRegion(if sender.rank > self.rank {
-            sender.rank - 1
-        } else {
-            sender.rank
-        }))
+        // Both ranks are below a power-of-two world, so their XOR is in `1..W`.
+        Some(PeerRegion((self.rank ^ sender.rank) - 1))
     }
+
+    /// This rank's partner in `round`: the rank whose bit `round` differs. `None` for a round this
+    /// world does not have.
+    pub const fn partner(self, round: Round) -> Option<TpIdentity> {
+        if round.0 >= self.world.round_count() {
+            return None;
+        }
+        Some(TpIdentity {
+            rank: self.rank ^ (1 << round.0),
+            world: self.world,
+        })
+    }
+}
+
+/// ⭐ ONE ROUND OF A RECURSIVE-DOUBLING ALL-REDUCE. Round `j` pairs rank `r` with `r XOR 2^j`:
+/// each sends the other its running sum and adds the one it receives. After round `j` every rank
+/// holds the sum over its aligned block of `2^(j+1)` ranks, so after `log2 W` rounds every rank holds
+/// the whole sum, in `log2 W` sends and waits instead of `W − 1`.
+///
+/// ⭐ EVERY RANK ADDS THE SAME TREE. Round `j` adds the two halves of a block, and fp16 addition
+/// commutes (`a + b == b + a`, bit for bit), so the two partners compute the same bits whichever
+/// half is their own: the sum is `((f0 + f1) + (f2 + f3)) + …` on every rank, bit-identical.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Round(u32);
+
+impl Round {
+    /// The most rounds any baked world's all-reduce takes.
+    pub const MAX: u32 = WIDEST_WORLD.trailing_zeros();
+
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+
+    /// Re-mint from the index the `#[forward]` macro bakes; refuses at BUILD a round no baked world
+    /// has.
+    ///
+    /// ```compile_fail
+    /// use ktir_superdsc::collective::Round;
+    /// const R: Round = Round::baked(Round::MAX);
+    /// ```
+    pub const fn baked(round: u32) -> Self {
+        assert!(round < Self::MAX, "an all-reduce round no baked world has");
+        Self(round)
+    }
+
+    /// The region this round's partner lands in — `(r XOR (r XOR 2^j)) − 1 = 2^j − 1`, the same on
+    /// every rank.
+    pub const fn region(self) -> PeerRegion {
+        PeerRegion((1 << self.0) - 1)
+    }
+}
+
+/// WHICH PEERS A CONSUME'S SENDS AND WAITS EXCHANGE WITH.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Exchange {
+    /// Every peer: this rank sends its fragment to each and waits on each — the all-gather, whose
+    /// consume places every rank's block.
+    EveryPeer,
+    /// One round of the recursive-doubling all-reduce: this rank and its partner of that round
+    /// ([`TpIdentity::partner`]) alone.
+    Round(Round),
 }
 
 /// ONE p2p MESSAGE: a whole, non-zero number of flits, no wider than [`RDMA_MESSAGE_CAP_BYTES`]
@@ -565,9 +652,27 @@ impl RecvWindow {
         })
     }
 
-    /// The whole window's bytes — every cut.
+    /// How many round sums the window keeps: every all-reduce round's but the last, whose sum is
+    /// the collective's own output. None in a world of two.
+    pub const fn round_sums(self) -> u32 {
+        self.world.round_count() - 1
+    }
+
+    /// ⭐ WHERE ROUND `round`'S RUNNING SUM LIVES — above the cuts, one region each: the next round
+    /// SENDS it, so it is a buffer of its own rather than the round's output, which a send's read
+    /// and the next consume's write would share. `None` for the last round, which writes the
+    /// collective's output. Device-resident in the weight segment like the cuts, so no step
+    /// uploads it, and every consume launch reads it unshifted.
+    pub const fn round_sum_offset(self, round: Round) -> Option<u64> {
+        if round.0 >= self.round_sums() {
+            return None;
+        }
+        Some(self.offset + WINDOW_CUTS as u64 * self.cut_bytes() + round.0 as u64 * self.region.0)
+    }
+
+    /// The whole window's bytes — every cut, then the round sums.
     pub const fn size(self) -> u64 {
-        WINDOW_CUTS as u64 * self.cut_bytes()
+        WINDOW_CUTS as u64 * self.cut_bytes() + self.round_sums() as u64 * self.region.0
     }
 
     /// One past the window's last byte — the weight segment must reserve up to here.
@@ -727,6 +832,15 @@ impl Fragment {
     pub const fn bytes(self) -> Payload {
         self.bytes
     }
+
+    /// The same columns as the whole of a buffer that holds only them — a round's running sum,
+    /// which keeps one fragment from its first byte.
+    pub const fn at_start(self) -> Self {
+        Self {
+            first_stick: 0,
+            ..self
+        }
+    }
 }
 
 /// Why an operand cannot be cut into fragments.
@@ -791,6 +905,21 @@ pub struct TpConsume {
     pub plays_at: Option<PlaysAt>,
     /// The window cut the send lands in and the consume reads.
     pub cut: WindowCut,
+    /// Which peers its sends and waits name.
+    pub exchange: Exchange,
+}
+
+impl TpConsume {
+    /// Whether this consume OPENS its collective — the one consume over every peer, or an
+    /// all-reduce's first round. A later round continues the collective its first round opened: it
+    /// lands in the same cut, because a pair of ranks exchanges once per collective and the cuts
+    /// alternate per collective ([`cuts_alternate`]).
+    pub const fn opens_collective(self) -> bool {
+        match self.exchange {
+            Exchange::EveryPeer => true,
+            Exchange::Round(round) => round.0 == 0,
+        }
+    }
 }
 
 /// The one rank that launches a rank-selected consume. Minted from a [`TpIdentity`], or re-minted
@@ -974,6 +1103,62 @@ mod tests {
         assert_eq!(two[0].region_of(one), None);
         for (k, &tid) in crate::reserved_tids::TP_RECV_CUT_TIDS.iter().enumerate() {
             assert_eq!(WindowCut::of_collective(k).tid(PeerRegion(0)), tid);
+        }
+    }
+
+    /// ⭐ THE XOR LAW: on every rank of every baked world, the peers' regions are `0..W−1`, each
+    /// once; and every round's partner lands in the round's one region, `2^j − 1`, whichever rank
+    /// it is — so a round reads the same bytes on every rank.
+    #[test]
+    fn every_rank_maps_its_peers_onto_the_regions_and_each_round_onto_one() {
+        for &w in SPYRE_TP_WORLDS.iter().filter(|&&w| w > 1) {
+            let world = TpWorld::named(w).unwrap();
+            assert_eq!(world.rounds().count() as u32, w.trailing_zeros());
+            for me in world.ranks() {
+                let mut regions: Vec<u32> = me
+                    .peers()
+                    .map(|p| me.region_of(p).unwrap().index())
+                    .collect();
+                regions.sort_unstable();
+                assert_eq!(
+                    regions,
+                    (0..w - 1).collect::<Vec<_>>(),
+                    "tp={w} rank {}",
+                    me.rank()
+                );
+                for round in world.rounds() {
+                    let partner = me.partner(round).unwrap();
+                    assert_ne!(partner, me);
+                    assert_eq!(partner.partner(round), Some(me));
+                    assert_eq!(me.region_of(partner), Some(round.region()));
+                }
+            }
+        }
+        // A round its world does not have has no partner.
+        let two = TpWorld::of::<2>().ranks().next().unwrap();
+        assert_eq!(two.partner(Round::baked(1)), None);
+    }
+
+    /// ⭐ THE ROUND SUMS SIT ABOVE THE CUTS, one region each, every round's but the last: none in a
+    /// world of two (its window is exactly the cuts it always was), one at four ranks, two at eight.
+    #[test]
+    fn the_window_keeps_a_region_per_round_sum_above_its_cuts() {
+        let region = Payload::new(2 << 20).unwrap();
+        for (w, sums) in [(2u32, 0u32), (4, 1), (8, 2)] {
+            let world = TpWorld::named(w).unwrap();
+            let window = RecvWindow::new(1 << 20, region, world).unwrap();
+            let cuts = WINDOW_CUTS as u64 * (w as u64 - 1) * region.get();
+            assert_eq!(window.round_sums(), sums);
+            assert_eq!(window.size(), cuts + sums as u64 * region.get(), "tp={w}");
+            let rounds: Vec<Round> = world.rounds().collect();
+            for (j, &round) in rounds.iter().enumerate() {
+                let at = window.round_sum_offset(round);
+                if (j as u32) < sums {
+                    assert_eq!(at, Some(window.offset() + cuts + j as u64 * region.get()));
+                } else {
+                    assert_eq!(at, None, "tp={w}: the last round writes the output");
+                }
+            }
         }
     }
 

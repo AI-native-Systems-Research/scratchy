@@ -401,7 +401,7 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 }
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 8] = [
+pub const RESERVED_REGIONS: [TidRegion; 9] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -467,7 +467,23 @@ pub const RESERVED_REGIONS: [TidRegion; 8] = [
         base: TP_RECV_TID,
         slots: TP_RECV_CUT_TIDS.len() as u32 * crate::collective::PeerRegion::MAX,
     },
+    // ⭐ THE ALL-REDUCE'S ROUND SUMS — see [`tp_round_sum_tid`]. Below the window's region, with
+    // room for the window to grow, in tids no artifact has ever carried.
+    TidRegion {
+        name: "tp_round_sum",
+        base: TP_ROUND_SUM_TID,
+        slots: crate::collective::Round::MAX,
+    },
 ];
+
+/// ⭐ RESERVED tid for the recursive-doubling all-reduce's first ROUND SUM — the running sum round 0
+/// writes and round 1 sends (`collective::RecvWindow::round_sum_offset`).
+pub const TP_ROUND_SUM_TID: u32 = TP_RECV_TID - 64;
+
+/// The tid of round `round`'s running sum.
+pub const fn tp_round_sum_tid(round: u32) -> u32 {
+    TP_ROUND_SUM_TID - round
+}
 
 /// ⭐ RESERVED tid for the TENSOR-PARALLEL RECEIVE WINDOW — its first cut
 /// ([`TP_RECV_CUT_TIDS`]), and the base of the one `(segment, offset, size)` triple per card

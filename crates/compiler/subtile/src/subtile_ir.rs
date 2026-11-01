@@ -1282,8 +1282,9 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     // the `world` it runs over — the analysis's, one for every collective of a forward — so every
     // reader of the graph (a target's consume, its receive window, the host reference) reads the
     // rank count off the op it lowers.
-    /// The sum over every rank of a PARTIAL value: `out = Σ_r x_r`, summed in ABSOLUTE RANK
-    /// ORDER (`((x_0 + x_1) + x_2) + …`) on every rank, so the replicated result is
+    /// The sum over every rank of a PARTIAL value: `out = Σ_r x_r`, summed as ONE TREE over ranks
+    /// in absolute order — adjacent pairs, then adjacent pairs of those (`((x_0 + x_1) + (x_2 +
+    /// x_3)) + …`, the recursive-doubling order) — on every rank, so the replicated result is
     /// bit-identical across ranks. `inputs` = `[x]`; output the shape of `x`.
     AllReduce {
         world: crate::tensor_parallel::WorldSize,

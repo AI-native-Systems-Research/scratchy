@@ -2718,20 +2718,23 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
 ) -> Result<(u32, u32), String> {
+    // A SYNTHETIC BEYOND THE GRAPH (the tensor-parallel receive window, an all-reduce's round sum)
+    // has no storage in the graph: its storage IS its region, from its first byte —
+    // `matmul_window_of`'s law for the LAST_HIDDEN staging. So it joins the node's one storage
+    // window only when that region is exactly the window the others state; anything else is the
+    // disagreement refused below.
+    let total = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
+        ir.tensors
+            .get(tr.tensor.index())
+            .map_or(tr.region.cols.len, |s| s.cols)
+    };
     let out = &node.output;
-    let n_total = ir.tensors[out.tensor.index()].cols;
+    let n_total = total(out);
     let (r, c_start) = (out.region.rows.start, out.region.cols.start);
     // The operands must window the SAME slice of the SAME storage — the builder's
     // own law (`load_region` per operand, one chunk per node).
     for tr in &node.inputs {
-        // A SYNTHETIC BEYOND THE GRAPH (the tensor-parallel receive window) has no storage in the
-        // graph: its storage IS its region, from its first byte — `matmul_window_of`'s law for the
-        // LAST_HIDDEN staging. So it joins the node's one storage window only when that region is
-        // exactly the window the output states; anything else is the disagreement refused below.
-        let in_total = ir
-            .tensors
-            .get(tr.tensor.index())
-            .map_or(tr.region.cols.len, |s| s.cols);
+        let in_total = total(tr);
         if tr.region.rows.start != r || tr.region.cols.start != c_start || in_total != n_total {
             return Err(format!(
                 "triton splice: t{}'s operands disagree about the window (output [{r}, \

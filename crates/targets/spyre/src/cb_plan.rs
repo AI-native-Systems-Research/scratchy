@@ -1257,6 +1257,9 @@ mod tests {
             fragment: fragments(1, 2048, Payload::from(WireBytes::CAP)).unwrap()[0],
             plays_at: None,
             cut: WindowCut::of_collective(0),
+            exchange: crate::bundle_code::collective::Exchange::Round(
+                crate::bundle_code::collective::Round::baked(0),
+            ),
         }
     }
 

@@ -1101,6 +1101,24 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 );
             }
         }
+        // ⭐ THE ALL-REDUCE'S ROUND SUMS, above the cuts: every round's but the last, each one region
+        // (`RecvWindow::round_sum_offset`). None in a world of two.
+        for round in world.rounds() {
+            if let Some(offset) = window.round_sum_offset(round) {
+                let tid = ktir_superdsc::reserved_tids::tp_round_sum_tid(round.index());
+                placements.insert(
+                    tid,
+                    TensorPlacement {
+                        tid,
+                        role: SegRole::Weight,
+                        segment: w,
+                        bank: 0,
+                        offset,
+                        size: window.region().get(),
+                    },
+                );
+            }
+        }
         seg_bytes[w] = window.end();
     }
     // ── ROPE permutation matrix P [hd,hd] (task: in-bundle RoPE) ── If the tape has
@@ -5438,13 +5456,37 @@ fn numeric_gate_sharded<F: RopeForm>(gate: ShardedGate<'_, F>) -> Result<(), Str
                 && covering.is_none_or(|c| c.contains(&(n.output.tensor.index() as u64)))
         })
         .collect();
-    if collective_nodes.len() + 1 != nseg {
+    // Which collective node each segment's opening consume belongs to: a collective opens with its
+    // first round (or its one consume over every peer), and its later rounds continue it.
+    let opens = |c: ktir_superdsc::collective::TpConsume| c.opens_collective();
+    let mut collective_of: Vec<usize> = Vec::with_capacity(nseg);
+    for seg in segs[0].iter().skip(1) {
+        let Some(c) = seg.first().and_then(|g| g.kv.tp) else {
+            return Err("a segment past the first does not open with a consume".to_string());
+        };
+        let next = match collective_of.last() {
+            None => 0,
+            Some(&n) if opens(c) => n + 1,
+            Some(&n) => n,
+        };
+        collective_of.push(next);
+    }
+    if collective_of.last().map_or(0, |n| n + 1) != collective_nodes.len() {
         return Err(format!(
-            "{} segment(s) for {} collective node(s) — a consume per collective",
+            "{} segment(s) for {} collective node(s) — every collective's consumes open segments",
             nseg,
             collective_nodes.len()
         ));
     }
+    // What a consume sends, as a tid this rank's session reads back: the collective's operand for
+    // its first round (or its one consume), a round's running sum after that.
+    let sent_tid = |c: ktir_superdsc::collective::TpConsume, node: usize| -> u64 {
+        if opens(c) {
+            collective_nodes[node].inputs[0].tensor.index() as u64
+        } else {
+            u64::from(c.operand.tid())
+        }
+    };
     let mut outs: Vec<std::collections::HashMap<u64, Vec<f32>>> =
         vec![std::collections::HashMap::new(); ranks.len()];
     // A staged window region: `run_step`'s source — the region's tid, its values, their shape. Each
@@ -5456,15 +5498,7 @@ fn numeric_gate_sharded<F: RopeForm>(gate: ShardedGate<'_, F>) -> Result<(), Str
             let sources = if k == 0 {
                 std::mem::take(&mut probes[r].sources)
             } else {
-                let staged = std::mem::take(&mut windows[r]);
-                if staged.len() + 1 != ranks.len() {
-                    return Err(format!(
-                        "rank {r} reached segment {k} with {} of its {} peers' regions staged",
-                        staged.len(),
-                        ranks.len() - 1
-                    ));
-                }
-                staged
+                std::mem::take(&mut windows[r])
             };
             let mut want: Vec<(u64, usize)> = golden_index
                 .tids
@@ -5472,8 +5506,13 @@ fn numeric_gate_sharded<F: RopeForm>(gate: ShardedGate<'_, F>) -> Result<(), Str
                 .filter(|t| observables[r][k].contains(t))
                 .map(|t| (*t, 0))
                 .collect();
-            if let Some(n) = collective_nodes.get(k) {
-                let t = n.inputs[0].tensor.index() as u64;
+            // What this rank's next consume sends, which its peers stage.
+            if let Some(c) = segs[r]
+                .get(k + 1)
+                .and_then(|s| s.first())
+                .and_then(|g| g.kv.tp)
+            {
+                let t = sent_tid(c, collective_of[k]);
                 if !want.iter().any(|(w, _)| *w == t) {
                     want.push((t, 0));
                 }
@@ -5496,26 +5535,43 @@ fn numeric_gate_sharded<F: RopeForm>(gate: ShardedGate<'_, F>) -> Result<(), Str
                     k + 1
                 ));
             };
-            let x = collective_nodes[k].inputs[0];
-            let tid = x.tensor.index();
-            let t = ir.tensors[tid];
-            let (rows, cols) = (t.rows as usize, t.cols as usize);
-            let v = outs[peer].get(&(tid as u64)).ok_or_else(|| {
+            // Only what this consume exchanges lands: every peer's, or the round's partner's.
+            let lands = match c.exchange {
+                ktir_superdsc::collective::Exchange::EveryPeer => true,
+                ktir_superdsc::collective::Exchange::Round(round) => {
+                    ranks[peer].partner(round) == Some(ranks[r])
+                }
+            };
+            if !lands {
+                continue;
+            }
+            let f = c.fragment;
+            let tid = sent_tid(c, collective_of[k]);
+            let v = outs[peer].get(&tid).ok_or_else(|| {
                 format!(
-                    "rank {peer}'s operand t{tid} for consume {} was not read back",
+                    "rank {peer}'s send t{tid} for consume {} was not read back",
                     k + 1
                 )
             })?;
-            // The fragment's columns are the operand REGION's (`send_fragment` cuts the region).
-            let f = c.fragment;
-            let (r0, fr) = (x.region.rows.start as usize, f.rows() as usize);
-            let (c0, fc) = (
-                (x.region.cols.start + f.first_col()) as usize,
-                f.cols() as usize,
-            );
+            // The operand's first round sends its fragment of the operand REGION (`send_fragment`
+            // cuts the region); a later round sends its running sum, which holds the fragment from
+            // its first element.
+            let (rows, cols, r0, c0) = if opens(c) {
+                let x = collective_nodes[collective_of[k]].inputs[0];
+                let t = ir.tensors[x.tensor.index()];
+                (
+                    t.rows as usize,
+                    t.cols as usize,
+                    x.region.rows.start as usize,
+                    (x.region.cols.start + f.first_col()) as usize,
+                )
+            } else {
+                (f.rows() as usize, f.cols() as usize, 0, 0)
+            };
+            let (fr, fc) = (f.rows() as usize, f.cols() as usize);
             if r0 + fr > rows || c0 + fc > cols || v.len() < rows * cols {
                 return Err(format!(
-                    "rank {peer}'s operand t{tid} [{rows}, {cols}] ({} read back) cannot hold \
+                    "rank {peer}'s send t{tid} [{rows}, {cols}] ({} read back) cannot hold \
                      the fragment rows {fr} cols [{c0}, {})",
                     v.len(),
                     c0 + fc
@@ -8184,7 +8240,8 @@ impl RolledSuperDsc {
                 let same = last.is_some_and(|p| {
                     (p.kind, p.operand, p.fragment, p.cut) == (c.kind, c.operand, c.fragment, c.cut)
                 });
-                if !same {
+                // One entry per COLLECTIVE: a later round continues the one its first opened.
+                if !same && c.opens_collective() {
                     out.push(c.cut);
                 }
                 last = Some(c);
@@ -8638,11 +8695,23 @@ pub(crate) fn audit_collective_addresses(
                 c.fragment.byte_offset()
             )));
         }
-        let mine = regions_of(c.cut)?;
+        // The regions it reads: every peer's of its cut, or its round's partner's alone.
+        let mine = match c.exchange {
+            ktir_superdsc::collective::Exchange::EveryPeer => regions_of(c.cut)?,
+            ktir_superdsc::collective::Exchange::Round(round) => {
+                vec![at(c.cut.tid(round.region())).ok_or_else(|| {
+                    refuse(format!(
+                        "the receive window places no region {} for round {}",
+                        round.region().index(),
+                        round.index()
+                    ))
+                })?]
+            }
+        };
         for (r, &(base, _)) in mine.iter().enumerate() {
             if !starts.contains(&base) {
                 return Err(refuse(format!(
-                    "no core starts at peer region {r}'s first byte, {base}"
+                    "no core starts at the first byte of the {r}-th region it reads, {base}"
                 )));
             }
         }
