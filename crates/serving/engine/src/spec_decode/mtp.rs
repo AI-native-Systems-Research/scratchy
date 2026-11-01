@@ -213,7 +213,7 @@ impl DraftBudget {
     /// block, and a step of more drafts none.
     pub fn drafts_at(self, seqs: usize) -> usize {
         if self.block {
-            let whole = self.drafts + 1 <= self.verify_rows && seqs <= BLOCK_LANES;
+            let whole = self.drafts < self.verify_rows && seqs <= BLOCK_LANES;
             return if whole { self.drafts } else { 0 };
         }
         (self.verify_rows / seqs.max(1))
