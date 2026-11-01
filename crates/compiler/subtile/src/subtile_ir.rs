@@ -1953,6 +1953,10 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
 /// them is that row: the gather's operand is then a whole one-row tensor, contiguous, and the fold
 /// writes its m=1 product into exactly it. (A tail with no gather — every one-rank graph — keeps
 /// its declared rows: its row 0 is read locally, never sent.)
+///
+/// The projection's activation keeps its `mq` rows, and its region on the projection is the LAST
+/// of them: one output row is the last prompt row's product, so the graph states exactly what the
+/// fold computes, and every evaluator of the graph (the host reference among them) reads that row.
 fn fold_gathered_tail<F: RopeForm>(graph: &mut SubtileIR<F>, gathered: TensorId) {
     let mut tail = vec![gathered];
     let mut t = graph
@@ -1981,6 +1985,21 @@ fn fold_gathered_tail<F: RopeForm>(graph: &mut SubtileIR<F>, gathered: TensorId)
             ),
         }
     }
+    let projection = graph
+        .nodes
+        .iter()
+        .position(|n| n.output.tensor == t)
+        .expect("the folded tail's projection");
+    let activation = graph.nodes[projection].inputs[0];
+    let mq = graph.tensors[activation.tensor.index()].rows;
+    assert_eq!(
+        activation.region.rows,
+        Range::new(0, mq),
+        "the folded gathered tail's projection reads rows {:?} of its {mq}-row activation t{} — \
+         the fold takes the last row of the whole prompt",
+        activation.region.rows,
+        activation.tensor.index()
+    );
     for &t in &tail {
         graph.tensors[t.index()].rows = 1;
     }
@@ -1996,6 +2015,7 @@ fn fold_gathered_tail<F: RopeForm>(graph: &mut SubtileIR<F>, gathered: TensorId)
             }
         }
     }
+    graph.nodes[projection].inputs[0].region.rows = Range::new(mq - 1, 1);
 }
 
 // ── The chained head's laws (the constants every reader shares) ─────
@@ -5682,8 +5702,9 @@ mod tests {
             ],
             result: 1,
         };
-        // (gather in region rows, gather in TENSOR rows, projection out tensor rows)
-        let rows_of_gather = |suffix: SampleRows| {
+        // ((gather in region rows, gather in TENSOR rows, projection out tensor rows), the
+        // projection's activation rows, the projection's host-reference product)
+        let fold = |suffix: SampleRows| {
             let mut g = lower_region(&input, nz(64));
             mint_sample(&mut g, suffix);
             ValidatedGraph::new(&g).expect("the minted graph validates");
@@ -5697,15 +5718,36 @@ mod tests {
                 .iter()
                 .find(|n| matches!(n.op, SubOp::MatmulTile { .. }))
                 .expect("the projection");
+            // The same values in both graphs: the two sources keep their ids and shapes.
+            let bufs: Vec<Vec<f32>> = g
+                .tensors
+                .iter()
+                .map(|t| {
+                    (0..t.rows * t.cols)
+                        .map(|i| (i % 13) as f32 / 8.0 - 0.75)
+                        .collect()
+                })
+                .collect();
             (
-                gather.inputs[0].region.rows.len,
-                g.shape(gather.inputs[0].tensor).rows,
-                g.shape(projection.output.tensor).rows,
+                (
+                    gather.inputs[0].region.rows.len,
+                    g.shape(gather.inputs[0].tensor).rows,
+                    g.shape(projection.output.tensor).rows,
+                ),
+                projection.inputs[0].region.rows,
+                eval_node(projection, &g, &bufs),
             )
         };
+        let (folded_rows, folded_reads, folded_product) = fold(SampleRows::Folded);
+        let (all_rows, all_reads, all_product) = fold(SampleRows::All);
         // Folded: a whole one-row tensor all the way down — the gather's operand is contiguous.
-        assert_eq!(rows_of_gather(SampleRows::Folded), (1, 1, 1));
-        assert_eq!(rows_of_gather(SampleRows::All), (4, 4, 4));
+        assert_eq!(folded_rows, (1, 1, 1));
+        assert_eq!(all_rows, (4, 4, 4));
+        // The folded projection reads the prompt's last row, so its host reference is the row the
+        // fold writes: the unfolded projection's last row.
+        assert_eq!(folded_reads, Range::new(3, 1));
+        assert_eq!(all_reads, Range::new(0, 4));
+        assert_eq!(folded_product, all_product[3 * 2048..]);
     }
 
     fn chained_head_fixture(width: u32, hidden: u32) -> crate::lower::LoweringInput {
