@@ -2019,6 +2019,44 @@ fn a_sliding_window_attention_is_refused() {
     assert!(e.contains("sliding window"), "{e}");
 }
 
+/// ⛔ A POOL NO BIGGER THAN A CHUNK IS REFUSED BY NAME — spyre-inference's own eligibility
+/// (`_batched_decode_preconditions_met`): a gather of every page the pool holds faults the card, and
+/// their per-sequence LOOP serves that step, which this port does not have. One request's decode is
+/// a batch of one, so the bound is its too: a chunk takes `min(32, blocks)` pages, and the ceiling
+/// rung walks the whole pool, so it fires exactly where the pool is at most 32 pages — a context of
+/// at most 4096 positions. A pool past that (granite's own) splices.
+#[test]
+fn a_pool_no_bigger_than_a_chunk_is_refused() {
+    const P: u32 = scratchy_triton_splice::PAGE_SLOTS;
+    let at_pages = |pages: u32| AttnShape {
+        geom: (32, 8, 64),
+        mq: 1,
+        cap: pages * P,
+        rung: 0,
+        rope_appended: true,
+    };
+    // 16 pages (a 2048-position context): the ceiling rung walks all 16 and a chunk gathers 16.
+    let small = at_pages(16);
+    let ir = attn_ir(small, 0.015625);
+    let node = ir.nodes.last().expect("the attention");
+    let Err(e) =
+        scratchy_triton_splice::lower_attn(node, &ir, small.active_cap(), PagedRows::Batch)
+    else {
+        panic!("a chunk gathering the whole pool must be refused");
+    };
+    assert!(
+        e.contains("gathers 16 page(s) a chunk, and the pool holds 16")
+            && e.contains("per-sequence loop"),
+        "the refusal must name the pool and their loop: {e}"
+    );
+    // 64 pages: a chunk takes 32 of them, so the same one-request decode splices.
+    let big = at_pages(64);
+    let ir = attn_ir(big, 0.015625);
+    let node = ir.nodes.last().expect("the attention");
+    scratchy_triton_splice::lower_attn(node, &ir, big.active_cap(), PagedRows::Batch)
+        .expect("a pool wider than one chunk splices");
+}
+
 #[test]
 fn the_paged_attention_splices_with_its_contract() {
     for &s in ATTN_SHAPES {
@@ -2422,13 +2460,15 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
 #[cfg(feature = "spyre-emu")]
 fn spliced_decode_batch_executes_the_real_programs() {
     const P: u32 = scratchy_triton_splice::PAGE_SLOTS;
-    let shape = |seqs: u32, walk: u32| AttnShape {
-        geom: (32, 8, 64),
+    let at_hd = |seqs: u32, walk: u32, hd: u32| AttnShape {
+        geom: (32, 8, hd),
         mq: seqs,
         cap: 64 * P,
         rung: walk * P,
         rope_appended: true,
     };
+    // granite-3.1-2b's head dim; the 8b's 128 is `at_hd`.
+    let shape = |seqs: u32, walk: u32| at_hd(seqs, walk, 64);
     for (s, contexts) in [
         // 4-sequence bucket over the 64-page walk: J = 8, C = 8.
         (
@@ -2454,6 +2494,17 @@ fn spliced_decode_batch_executes_the_real_programs() {
             vec![4000],
         ),
         (shape(1, 1), vec![100]),
+        // ...and both of those at head dim 128 (granite-3.1-8b), whose two-stick head rows take the
+        // relayout the one-stick forms never build: the 8b is where the per-sequence route's single
+        // request decoded garbage, so a batch of one is executed there too.
+        (
+            AttnShape {
+                rung: 0,
+                ..at_hd(1, 64, 128)
+            },
+            vec![4000],
+        ),
+        (at_hd(1, 1, 128), vec![100]),
     ] {
         execute_one_decode_batch(s, &contexts);
     }
