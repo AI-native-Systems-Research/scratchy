@@ -1638,7 +1638,7 @@ pub(crate) fn forward_chunk(
             .paged
             .ok_or_else(|| werr("this bundle states no paged step — its attention has no pools"))?;
         let rows = scratchy_target_spyre::paged_step::StepRows { start, real: n };
-        let srcs = scratchy_target_spyre::paged_step::step_sources(&step, &blocks, &rows)
+        let srcs = scratchy_target_spyre::paged_step::request_sources(&step, &blocks, &rows)
             .map_err(|e| werr(format!("request {id}: paged step: {e}")))?;
         session
             .set_typed_sources(

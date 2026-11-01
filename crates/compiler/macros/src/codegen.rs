@@ -11383,9 +11383,11 @@ fn dump_wavefront_mega(
              -> (BakeOut, Vec<BakeEffect>) {
                 let mut fx: Vec<BakeEffect> = Vec::new();
                 let is_prefill = prefill_mq.is_some();
-                // A prefill chunk's rows are one prompt's positions; the decode bundle's are one
-                // token each of the running requests once it is baked wider than a single row.
-                let rows_are_requests = !is_prefill && decode_rows > 1;
+                // A prefill chunk's rows are one prompt's positions; a decode bundle's are one token
+                // each of the running requests, at any width — one row is one request's token, and
+                // spyre-inference decodes it with the batched kernel at one sequence (its sequence
+                // buckets start at 1). Every other reader of the fact short-circuits at one row.
+                let rows_are_requests = !is_prefill;
                 // ⛔ THE WIRING MUST NOT DESCRIBE A PROGRAM THAT DID NOT SHIP. A prefill
                 // rung whose reroll fails PANICS (no rung may fail to lower), but this
                 // closure's KTIR emission and wiring stamp run AFTER the reroll and
