@@ -958,8 +958,15 @@ mod tests {
             block: true,
         };
         assert_eq!(at(dflash2), [7, 7, 7, 7, 0, 0]);
-        assert_eq!((dflash2.max_seqs(), dflash2.draft_rows(usize::MAX)), (4, 28));
-        assert_eq!(dflash2.draft_rows(2), 14, "a width of two drafts two blocks");
+        assert_eq!(
+            (dflash2.max_seqs(), dflash2.draft_rows(usize::MAX)),
+            (4, 28)
+        );
+        assert_eq!(
+            dflash2.draft_rows(2),
+            14,
+            "a width of two drafts two blocks"
+        );
         // A block that does not fit its lane's verify drafts nothing.
         let unfit = DraftBudget {
             verify_rows: 7,
@@ -967,7 +974,11 @@ mod tests {
         };
         assert_eq!((at(unfit), unfit.max_seqs()), (vec![0; 6], 0));
         for c in 1..=8 {
-            assert_eq!(dflash2.drafts_at(c) > 0, c <= dflash2.max_seqs(), "lanes at {c}");
+            assert_eq!(
+                dflash2.drafts_at(c) > 0,
+                c <= dflash2.max_seqs(),
+                "lanes at {c}"
+            );
         }
         for b in [qwen, gemma] {
             for c in 1..=8 {

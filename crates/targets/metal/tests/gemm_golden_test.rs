@@ -43,7 +43,7 @@ const SHAPES: &[(usize, usize, usize)] = &[
     (16, 256, 2048),
     (27, 256, 2048), // four lanes, a partial last chunk
     (32, 256, 2048),
-    (3, 256, 2048), // 27's last chunk alone
+    (3, 256, 2048),    // 27's last chunk alone
     (2048, 128, 2816), // Gemma-4-26B-A4B MoE router prefill (bf16: blocked)
     (256, 256, 2048),  // Qwen3.6-35B-A3B MoE router, the first blocked bucket on main (NAX here)
 ];
@@ -66,7 +66,12 @@ fn a_chunked_gemv_row_is_the_eight_row_gemv_bits() {
         let out_buf = common::shared_zeroed(&device, m * n * std::mem::size_of::<bf16>());
         let (pso, grid, threads) = gemm(&pl, MetalDtype::Bf16, (m, n, k));
         common::dispatch_threadgroups(&device, &pso, &[&out_buf, &in_buf, &w_buf], grid, threads)
-            .then(|| common::read_slice::<bf16>(&out_buf, m * n).iter().map(|v| v.to_bits()).collect())
+            .then(|| {
+                common::read_slice::<bf16>(&out_buf, m * n)
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect()
+            })
     };
     let m = 27usize;
     let input: Vec<bf16> = (0..m * k)
@@ -75,8 +80,15 @@ fn a_chunked_gemv_row_is_the_eight_row_gemv_bits() {
     let Some(all) = run(m, &input) else { return };
     for chunk in (0..m).step_by(8) {
         let rows = 8.min(m - chunk);
-        let Some(alone) = run(rows, &input[chunk * k..(chunk + rows) * k]) else { return };
-        assert_eq!(&all[chunk * n..(chunk + rows) * n], &alone[..], "rows {chunk}..{}", chunk + rows);
+        let Some(alone) = run(rows, &input[chunk * k..(chunk + rows) * k]) else {
+            return;
+        };
+        assert_eq!(
+            &all[chunk * n..(chunk + rows) * n],
+            &alone[..],
+            "rows {chunk}..{}",
+            chunk + rows
+        );
     }
 }
 

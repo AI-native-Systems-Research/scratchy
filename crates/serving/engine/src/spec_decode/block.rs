@@ -699,8 +699,15 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(block.cu_seqlens_q, [0, 8, 16], "a lane's block is its own 8 rows");
-        assert_eq!(block.positions, [(31..39).collect::<Vec<_>>(), (13..21).collect()].concat());
+        assert_eq!(
+            block.cu_seqlens_q,
+            [0, 8, 16],
+            "a lane's block is its own 8 rows"
+        );
+        assert_eq!(
+            block.positions,
+            [(31..39).collect::<Vec<_>>(), (13..21).collect()].concat()
+        );
         let five: Vec<String> = (0..5).map(|i| format!("s{i}")).collect();
         let wide = Step {
             req_ids: five.clone(),
@@ -712,8 +719,10 @@ mod tests {
         };
         let ids: Vec<&str> = five.iter().map(String::as_str).collect();
         assert_eq!(
-            (DRAFTER.passes(&wide.rows(), &plan(&ids), &[]).expect("a valid plan"))
-                .and_then(|p| p.block),
+            (DRAFTER
+                .passes(&wide.rows(), &plan(&ids), &[])
+                .expect("a valid plan"))
+            .and_then(|p| p.block),
             None,
             "a step past BLOCK_LANES sequences drafts none"
         );
