@@ -37,6 +37,16 @@ impl SpyreWorld {
         }
     }
 
+    /// ⭐ EVERY SHARDED WORLD SPYRE BAKES, narrowest first — the `SPYRE_TP_WORLDS` row past its world
+    /// of one, each minted from its const `W`. The bake shards a forward for each, and the wiring
+    /// names the analysis's world for each; a world added to the row and not here fails the build.
+    pub const SHARDED: [SpyreWorld; 2] = [Self::of::<2>(), Self::of::<4>()];
+
+    /// The sharded world of `w` ranks, as `SHARDED` names it.
+    pub fn sharded(w: u32) -> Option<Self> {
+        Self::SHARDED.into_iter().find(|s| s.plan.get() == w)
+    }
+
     pub const fn plan(self) -> TpWorld {
         self.plan
     }
@@ -83,6 +93,22 @@ pub fn world_of_ir<F: scratchy_subtile::subtile_ir::RopeForm>(
         })
         .transpose()
 }
+
+const _: () = {
+    use crate::bundle_code::collective::SPYRE_TP_WORLDS;
+    assert!(
+        SPYRE_TP_WORLDS.len() == SpyreWorld::SHARDED.len() + 1 && SPYRE_TP_WORLDS[0] == 1,
+        "SPYRE_TP_WORLDS is the world of one and then every sharded world"
+    );
+    let mut i = 0;
+    while i < SpyreWorld::SHARDED.len() {
+        assert!(
+            SPYRE_TP_WORLDS[i + 1] == SpyreWorld::SHARDED[i].plan.get(),
+            "SpyreWorld::SHARDED names the SPYRE_TP_WORLDS row's sharded worlds, in order"
+        );
+        i += 1;
+    }
+};
 
 /// The narrowest column block spyre splits a tensor at: one fp16 stick. A per-rank extent that is
 /// not whole sticks is not a layout the device's tiles can address, so the analysis replicates such
@@ -257,6 +283,106 @@ mod tests {
         assert_eq!(shifts.len(), 2, "each consume is its own launch group");
         for (s, e) in shifts.iter().zip(&ops) {
             assert_eq!(s.tp, e.tp_consume);
+        }
+    }
+
+    /// ⭐ FOUR RANKS SUM IN ABSOLUTE RANK ORDER, EACH ITS OWN CONSUME. Every all-reduce of a
+    /// four-rank decode lowers to one consume per rank, played at that rank alone: three adds,
+    /// `((f_0 + f_1) + f_2) + f_3`, reading the rank's own partial at its own rank and each peer's
+    /// from that peer's region of its window. Each rank's pipeline sends to its three peers, waits
+    /// on all three, then launches — and skips the other ranks' consumes whole.
+    #[test]
+    fn four_ranks_sum_every_partial_in_rank_order() {
+        use crate::bundle_code::collective::{CbStep, PeerRegion, TpWorld, cb_pipeline};
+        use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
+        use crate::lower_subtile_tape_to_superdsc::{FoldGrouping, launch_index};
+        use ktir_superdsc::collective::CollectiveKind;
+        use ktir_superdsc::ktir_node::ActiveCap;
+        use scratchy_subtile::subtile_ir::{SubOp, lower_region};
+
+        let world = TpWorld::of::<4>();
+        let b = tp_bake(&one_layer_input(), SpyreWorld::of::<4>()).unwrap();
+        let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
+        let node = ir
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, SubOp::AllReduce { .. }))
+            .expect("a four-rank layer reduces its partials");
+        let ops = match lower_one_node(node, &ir, ActiveCap::FULL, false) {
+            NodeLowering::Ops(v) => v,
+            NodeLowering::Unhandled(why) => panic!("the collective did not lower: {why}"),
+            NodeLowering::HostRouted(k) => panic!("the collective was host-routed: {k}"),
+        };
+        assert_eq!(ops.len(), 4 * 3, "three adds per rank");
+        let partial = node.inputs[0].tensor.index() as u32;
+        for (me, adds) in world.ranks().zip(ops.chunks(3)) {
+            let c = adds[0].tp_consume.expect("the program is the consume");
+            assert_eq!(c.kind, CollectiveKind::AllReduce);
+            assert!(
+                c.plays_at.is_some_and(|p| p.rank() == me),
+                "rank {}'s sum is its own",
+                me.rank()
+            );
+            assert!(
+                adds.iter().all(|a| a.tp_consume == Some(c)),
+                "one consume group"
+            );
+            // The first add reads ranks 0 and 1, each later add one more rank, in order: own
+            // partial at its own rank, every other rank out of its region of this rank's window.
+            let reads = |k: usize| -> Vec<u32> {
+                adds[k]
+                    .ktir
+                    .as_ref()
+                    .expect("a program")
+                    .bindings
+                    .iter()
+                    .map(|b| b.get())
+                    .collect()
+            };
+            let source = |r: u32| -> u32 {
+                let rank = world.rank(r).unwrap();
+                if rank == me {
+                    partial
+                } else {
+                    c.cut.tid(me.region_of(rank).unwrap())
+                }
+            };
+            assert!(reads(0).starts_with(&[source(0), source(1)]), "f_0 + f_1");
+            assert!(reads(1).contains(&source(2)), "+ f_2");
+            assert!(reads(2).contains(&source(3)), "+ f_3");
+            assert_eq!(PeerRegion::of_world(world).count(), 3, "a region per peer");
+        }
+        let shifts = launch_index(&ops, FoldGrouping::Split);
+        let groups: Vec<crate::bundle_code::LaunchGroup<'static>> = shifts
+            .iter()
+            .map(|kv| crate::bundle_code::LaunchGroup {
+                kv: *kv,
+                ..Default::default()
+            })
+            .collect();
+        for me in world.ranks() {
+            let steps: Vec<CbStep> = cb_pipeline(&groups, me).collect();
+            let peers: Vec<_> = me.peers().collect();
+            let sends: Vec<_> = steps
+                .iter()
+                .filter_map(|s| match s {
+                    CbStep::Send { to, .. } => Some(*to),
+                    _ => None,
+                })
+                .collect();
+            let waits: Vec<_> = steps
+                .iter()
+                .filter_map(|s| match s {
+                    CbStep::Wait { from, .. } => Some(*from),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sends, peers, "rank {} sends to each peer once", me.rank());
+            assert_eq!(waits, peers, "and waits on each once");
+            assert!(
+                matches!(steps.last(), Some(CbStep::Launch { .. })),
+                "then launches"
+            );
         }
     }
 

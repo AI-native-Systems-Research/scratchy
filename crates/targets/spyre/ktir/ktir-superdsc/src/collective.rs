@@ -39,8 +39,8 @@
 use crate::superdsc_opspec::{DataFormat, Fp16};
 
 /// The world sizes a spyre bundle can be baked for — the target's const row. A world of one is a
-/// forward with no collectives; two is one peer per card.
-pub const SPYRE_TP_WORLDS: &[u32] = &[1, 2];
+/// forward with no collectives; a wider world is `W − 1` peers per card.
+pub const SPYRE_TP_WORLDS: &[u32] = &[1, 2, 4];
 
 /// The widest single p2p message, in bytes — the cross-card transfer cap (`CopyToRemote`'s
 /// validation; flex-rs `multi_device::MAX_HDMA_MESSAGE_BYTES`, which the target crate pins equal).
@@ -86,7 +86,7 @@ impl TpWorld {
     /// The world of `W` ranks. A `W` outside [`SPYRE_TP_WORLDS`] does not compile:
     ///
     /// ```compile_fail
-    /// let _ = ktir_superdsc::collective::TpWorld::of::<4>();
+    /// let _ = ktir_superdsc::collective::TpWorld::of::<3>();
     /// ```
     ///
     /// ```
@@ -805,6 +805,7 @@ mod tests {
         assert_eq!(TpWorld::named(2), Some(TpWorld::of::<2>()));
         assert_eq!(TpWorld::named(0), None);
         assert_eq!(TpWorld::named(3), None);
+        assert_eq!(TpWorld::named(4), Some(TpWorld::of::<4>()));
         let w = TpWorld::of::<2>();
         assert_eq!(w.rank(1), w.ranks().nth(1));
         assert_eq!(w.rank(2), None);

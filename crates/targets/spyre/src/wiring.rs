@@ -1910,13 +1910,6 @@ impl std::fmt::Display for SliceRefusal {
 
 impl std::error::Error for SliceRefusal {}
 
-// The bridge below names every spyre world; a new one must be added there too.
-const _: () = assert!(
-    crate::bundle_code::collective::SPYRE_TP_WORLDS.len() == 2
-        && crate::bundle_code::collective::SPYRE_TP_WORLDS[0] == 1
-        && crate::bundle_code::collective::SPYRE_TP_WORLDS[1] == 2
-);
-
 /// The shared analysis's names for `me`'s rank and world.
 fn analysis_rank(
     me: crate::bundle_code::collective::TpIdentity,
@@ -1925,10 +1918,8 @@ fn analysis_rank(
     scratchy_subtile::tensor_parallel::WorldSize,
 ) {
     use scratchy_subtile::tensor_parallel::WorldSize;
-    let world = match me.world().get() {
-        1 => WorldSize::of::<1>(),
-        _ => WorldSize::of::<2>(),
-    };
+    let world = crate::tp_plan::SpyreWorld::sharded(me.world().get())
+        .map_or(WorldSize::of::<1>(), crate::tp_plan::SpyreWorld::analysis);
     let rank = world
         .ranks()
         .nth(me.rank() as usize)
