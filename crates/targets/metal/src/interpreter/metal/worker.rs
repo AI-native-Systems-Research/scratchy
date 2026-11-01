@@ -1628,13 +1628,12 @@ fn bake_bucket<W: CanonicalParams>(
             // A GEMV's chunks of rows are its grid's height (`gemm_pipeline`): scaled to the step's
             // live rows, so a step of fewer rows than the bucket runs only its chunks. A tiled GEMM's
             // grid stays the bucket's.
-            let gemv_scaling = (shape.threadgroups.1 > 1
-                && pipeline_is_gemv(&shape, dims))
-            .then_some(super::lowered::MScaling {
-                axis: super::lowered::MScaleAxis::Y,
-                bucket_m: super::ids::BucketM(dims.m),
-                set_axis: None,
-            });
+            let gemv_scaling = (shape.threadgroups.1 > 1 && pipeline_is_gemv(&shape, dims))
+                .then_some(super::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::Y,
+                    bucket_m: super::ids::BucketM(dims.m),
+                    set_axis: None,
+                });
             match steps.last_mut() {
                 Some(BucketStep::Dispatch {
                     pipeline: prev,

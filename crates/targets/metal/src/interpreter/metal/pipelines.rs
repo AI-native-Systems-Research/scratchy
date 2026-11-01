@@ -299,7 +299,11 @@ pub fn gemm_pipeline(
     let dispatch = DispatchShape {
         threadgroups: (
             n.div_ceil(tile),
-            if gemv { m.div_ceil(GEMV_CHUNK_ROWS) } else { m.div_ceil(tile) },
+            if gemv {
+                m.div_ceil(GEMV_CHUNK_ROWS)
+            } else {
+                m.div_ceil(tile)
+            },
             1,
         ),
         threads_per_threadgroup: (threads, 1, 1),

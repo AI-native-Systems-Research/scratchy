@@ -1278,7 +1278,8 @@ fn route_gdn(
     };
     // A bucket wider than a verify lane carrying the verify pair (`gdn_verify`): it runs the steps
     // whose every sequence holds a lane's rows at most, and the commands after it every other step.
-    let lane_split = bucket_m > GDN_VERIFY_ROWS && cmds.iter().any(|c| c.command.library == "gdn_verify");
+    let lane_split =
+        bucket_m > GDN_VERIFY_ROWS && cmds.iter().any(|c| c.command.library == "gdn_verify");
     let lane_gate = |gate: Option<RuntimeGate>, lane: RuntimeGate| match lane_split {
         true => Some(RuntimeGate::and(gate, &[lane])),
         false => gate,
