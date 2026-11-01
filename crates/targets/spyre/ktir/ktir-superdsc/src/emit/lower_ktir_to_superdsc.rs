@@ -6519,21 +6519,24 @@ pub fn gather_pieces(page_sticks: u32) -> Option<u32> {
 /// gather's index by its per-entry extent, so through an index already scaled by `pieces` (the
 /// caller's) a piece's extent steps a whole entry, and piece `p` reads and lands `p` pieces in.
 ///
-/// ⭐ SEVERAL ENTRIES IN PIECES (a decode batch's pages at head dim 128) land each piece's entries
-/// one after another — a gather's landing steps by its own extent, the piece — so they land in
-/// `landing`, piece by piece, and runs of one piece copy them into `out` at the entry's pitch.
+/// ⛔ ONE ENTRY ONLY, IN PIECES. Several entries' pieces land a piece apart, and the form that landed
+/// them in a scratch and copied each piece to its entry's pitch (a stick-run copy a piece) was
+/// MEASURED wrong on the card (granite-3.1-2b's decode batch at 128-slot pages, tensordump): the
+/// piece gathers landed the pool's bytes, and the run copies dropped one piece, duplicated the
+/// others and wrote every entry to one pitch, so two concurrent requests' pages overwrote each
+/// other. A chunk of whole pages is gathered in one op instead
+/// ([`crate::ir::bridge::tiled_op_sdsc_op::page_gather_page_opspec`]); any other several-entry
+/// shape past the entry bound is refused here by name.
 pub fn page_gather(
     name: &str,
     g: &Gather,
     (page_sticks, pieces): (u32, u32),
     out: &Region,
-    landing: Option<&Region>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
     use crate::ir::bridge::tiled_op_sdsc_op::{
-        GatheredWords, PageGatherRows, StickRuns, assemble_page_gather_copy,
-        assemble_stick_runs_copy,
+        GatheredWords, PageGatherRows, assemble_page_gather_copy,
     };
     if pieces == 0 || !page_sticks.is_multiple_of(pieces) {
         return err(format!(
@@ -6541,29 +6544,18 @@ pub fn page_gather(
              sticks of the entry"
         ));
     }
+    if pieces > 1 && g.entries > 1 {
+        return err(format!(
+            "{name}: {} entries of {page_sticks} sticks, each past the {}-byte sub-row entry bound — \
+             several entries in pieces land a piece apart, and the run copy of each piece to its \
+             entry's pitch dropped and collided pages on the card; a chunk of whole pages gathers in \
+             one op (page_gather_page_opspec)",
+            g.entries, SUB_ROW_GATHER_ENTRY_BYTES_MAX
+        ));
+    }
     let piece_sticks = page_sticks / pieces;
     let stick = Fp16::ELEMS_PER_STICK;
-    let interleave = pieces > 1 && g.entries > 1;
-    let (into, mut ops) = match (interleave, landing) {
-        (false, _) => (out, Vec::new()),
-        (true, Some(l)) => (l, Vec::new()),
-        (true, None) => {
-            return err(format!(
-                "{name}: {} entries gathered in {pieces} pieces land a piece apart, and no landing \
-                 holds them for the copy to the entries' pitch",
-                g.entries
-            ));
-        }
-    };
-    // Where piece `p` lands: `p` pieces into each entry, or, interleaving, after the `p` pieces
-    // before it of every entry.
-    let landed_at = |p: u32| {
-        if interleave {
-            p * g.entries * piece_sticks * stick
-        } else {
-            p * piece_sticks * stick
-        }
-    };
+    let mut ops = Vec::with_capacity(pieces as usize);
     for p in 0..pieces {
         let gather = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
             crate::place::act_name(g.index_tid),
@@ -6579,13 +6571,13 @@ pub fn page_gather(
             assemble_page_gather_copy(
                 &op_name,
                 &crate::place::act_name(g.value_tid),
-                &into.name(),
+                &out.name(),
                 gather,
                 PageGatherRows {
                     rows: g.entries * piece_sticks,
                     words: GatheredWords::Fp16,
                     src_elems: p * piece_sticks * stick,
-                    dst_elems: landed_at(p),
+                    dst_elems: p * piece_sticks * stick,
                 },
                 sym_id_base,
                 layout,
@@ -6594,31 +6586,6 @@ pub fn page_gather(
                 message: format!("{name}: {message}"),
             })?,
         );
-    }
-    if interleave {
-        for p in 0..pieces {
-            ops.push(
-                assemble_stick_runs_copy(
-                    &format!("pieces{p}_o{}", out.tid),
-                    &into.name(),
-                    &out.name(),
-                    StickRuns {
-                        runs: g.entries,
-                        run_sticks: piece_sticks,
-                        src_pitch: piece_sticks,
-                        dst_pitch: page_sticks,
-                        src_elems: landed_at(p),
-                        dst_elems: p * piece_sticks * stick,
-                        df: Df::Fp16,
-                    },
-                    sym_id_base,
-                    layout,
-                )
-                .map_err(|message| Error {
-                    message: format!("{name}: {message}"),
-                })?,
-            );
-        }
     }
     Ok(ops)
 }
@@ -9447,6 +9414,32 @@ mod gather_pieces_tests {
             Some(2),
             "the measured 128 KB refusal is copied in halves"
         );
+    }
+
+    /// ⛔ SEVERAL ENTRIES ARE NEVER COPIED IN PIECES — the run copy of each piece to its entry's pitch
+    /// dropped and collided pages on the card; one entry in halves still copies, several are refused
+    /// by name.
+    #[test]
+    fn several_entries_in_pieces_are_refused() {
+        let g = |entries: u32| Gather {
+            index_tid: 4,
+            value_tid: 2,
+            entries,
+            first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+            tile: Ssa(0),
+            load: Ssa(1),
+            via: None,
+        };
+        // A granite-3.1-2b page at 128 slots: 1024 sticks, 128 KB, two pieces.
+        let page = |entries: u32| elementwise_tests::reg(9, entries * 1024, 64, true);
+        let mut sym = 0i64;
+        let one = page_gather("walk", &g(1), (1024, 2), &page(1), &mut sym, None)
+            .expect("one entry copies in halves");
+        assert_eq!(one.len(), 2, "one gather a piece");
+        match page_gather("walk", &g(8), (1024, 2), &page(8), &mut sym, None) {
+            Err(e) => assert!(e.message.contains("collided pages"), "{}", e.message),
+            Ok(ops) => panic!("eight entries in pieces lowered to {} ops", ops.len()),
+        }
     }
 }
 

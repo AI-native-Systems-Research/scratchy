@@ -875,10 +875,11 @@ pub fn assemble_page_gather_blocks(
         .map_err(|e| format!("assemble_page_gather_blocks {op_name}: {e}"))
 }
 
-/// One page of a [`page_gather_page_opspec`]: `blocks` row-major `[rows, cols]` blocks one after
-/// another (a paged cache's page of `blocks` kv heads).
+/// The pages of a [`page_gather_page_opspec`]: `entries` pages, each `blocks` row-major `[rows, cols]`
+/// blocks one after another (a paged cache's page of `blocks` kv heads).
 #[derive(Clone, Copy, Debug)]
 pub struct PageOfBlocks {
+    pub entries: u32,
     pub blocks: u32,
     pub rows: u32,
     pub cols: u32,
@@ -887,9 +888,9 @@ pub struct PageOfBlocks {
 /// ⭐ torch-spyre's PROMPT-TRIP PAGE GATHER — the whole page in ONE op, its one index entry selecting
 /// the page and every kv head's block of it read inside the op (the reference's compiled prefill,
 /// `sdsc_4` / `sdsc_5`: `N_ {mb: 8, x: 128, y: 128, out: 1, i: 1}`, the index on the size-one `i`,
-/// `numWkSlicesPerDim_ {}`). Here an `identity` over `N_ {mb: 1, y: blocks, x: rows, out: cols}`, the
-/// index on `mb` (one position an entry, so `skip_addr` is the whole page, `y·x·out`), on one core
-/// as the reference's is. The value is read as the reference reads it — row-major,
+/// `numWkSlicesPerDim_ {}`). Here an `identity` over `N_ {mb: entries, y: blocks, x: rows, out: cols}`,
+/// the index on `mb` (one position an entry, so `skip_addr` is the whole page, `y·x·out`): one entry
+/// on one core as the reference's is, and several pages (a decode batch's chunk) one a core. The value is read as the reference reads it — row-major,
 /// `['out','x','y','mb']` innermost-first (its `['y','x','mb','out','i']`) — and lands one kv head's
 /// block after another, each stick-major (`['x','out','y','mb']`), the frame the trip's batched
 /// restickify and contractions read a block of at its base.
@@ -897,10 +898,22 @@ pub fn page_gather_page_opspec(
     src: &str,
     dst: &str,
     gather: crate::superdsc_opspec::GatherIndex,
-    PageOfBlocks { blocks, rows, cols }: PageOfBlocks,
+    PageOfBlocks {
+        entries,
+        blocks,
+        rows,
+        cols,
+    }: PageOfBlocks,
 ) -> Result<OpSpec, String> {
     let df = Df::Fp16;
     crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    if entries == 0 || entries > cap {
+        return Err(format!(
+            "page_gather_page_opspec('{src}' -> '{dst}'): {entries} pages — one op gathers one to \
+             {cap} (its index is one stick)"
+        ));
+    }
     if gather.page.get() != 1 || blocks == 0 || rows == 0 {
         return Err(format!(
             "page_gather_page_opspec('{src}' -> '{dst}'): one entry is one page of {blocks} \
@@ -917,13 +930,13 @@ pub fn page_gather_page_opspec(
         df,
     };
     let dims = [
-        dim("mb", 1, false),
+        dim("mb", entries, false),
         dim("y", blocks, false),
         dim("x", rows, false),
         dim("out", cols, true),
     ];
-    let plan = crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
-        std::collections::BTreeMap::new()
+    let plan = crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |d, max| {
+        gather_copy_cores(d, max, 1)
     })?;
     let layout = ["mb", "y", "x", "out"];
     let arg = |is_input: bool, name: &str, device: [&'static str; 4]| -> Result<_, String> {
@@ -2181,6 +2194,7 @@ mod page_gather_blocks_tests {
             "Tensor1",
             gather,
             PageOfBlocks {
+                entries: 1,
                 blocks: 8,
                 rows: 128,
                 cols: 128,
@@ -2221,6 +2235,53 @@ mod page_gather_blocks_tests {
             serde_json::json!(["x", "out", "y", "mb"]),
             "each kv head's block landed stick-major, one after another"
         );
+    }
+
+    fn pages(entries: u32) -> Result<OpSpec, String> {
+        page_gather_page_opspec(
+            "Tensor0",
+            "Tensor1",
+            GatherIndex::of_scratch_rows(
+                "Tensor9".into(),
+                PageExtent::of_positions(1),
+                EntryBase::ZERO,
+            ),
+            PageOfBlocks {
+                entries,
+                blocks: 8,
+                rows: 128,
+                cols: 64,
+            },
+        )
+    }
+
+    /// ⭐ A DECODE BATCH's CHUNK OF PAGES — granite-3.1-2b's two sequences, 4 block slots each: the
+    /// chunk's 8 whole `[8, 128, 64]` pages in one op, a page a core, each entry's index word read by
+    /// its own core.
+    #[test]
+    fn a_chunk_of_pages_is_gathered_a_page_a_core() {
+        let op = pages(8).expect("the chunk's gather builds");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = crate::emit::emit_sdsc("gather_o1", &op, &folds, None).expect("it emits");
+        let v = serde_json::to_value(&sdsc).expect("the op serializes");
+        assert_eq!(
+            v["numWkSlicesPerDim_"],
+            serde_json::json!({"mb": 8, "y": 1, "x": 1, "out": 1}),
+            "a page a core"
+        );
+        assert_eq!(
+            v["dscs_"][0]["gather_o1"]["N_"],
+            serde_json::json!({"name_": "n", "mb_": 8, "y_": 8, "x_": 128, "out_": 64})
+        );
+    }
+
+    /// One op's index is one 32-word stick: a chunk of 32 pages gathers in one op, and 33 is refused
+    /// by name — never handed to a copy form the card has not run.
+    #[test]
+    fn more_pages_than_one_index_stick_are_refused() {
+        assert!(pages(32).is_ok(), "32 pages, one index stick");
+        let e = pages(33).expect_err("33 pages");
+        assert!(e.contains("33 pages"), "{e}");
     }
 
     /// ⭐ THE REFERENCE's K PAGE GATHER (granite-3.1-8b's decode trip, `sdsc_6`): eight kv heads'

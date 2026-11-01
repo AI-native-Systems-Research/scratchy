@@ -4558,6 +4558,55 @@ mod walk_on_the_card {
         }
     }
 
+    /// ⛔ A DECODE BATCH GATHERS EACH OF ITS PAGES WHOLE, ONE OP FOR ALL OF THEM — the whole-page
+    /// gather over its `J · B` entries, a page a core, never the pieces form. At 128-slot pages a
+    /// granite page is 128 KB (2b) or 256 KB (8b), past the one-stick sub-row copy's 64 KB entry, and
+    /// a batch's several entries went through it in pieces: the ids doubled, each half-page piece of
+    /// every entry landed in a scratch, then copied to the entry's pitch. Two concurrent requests
+    /// decoded garbage on the card from their first batched step (bisected: `b82250b17`, 64-slot
+    /// pages, coherent; the 128-slot page, which switched 2b onto the pieces, first bad).
+    #[test]
+    fn a_decode_batch_gathers_each_page_whole() {
+        for (seqs, hd) in [(2u32, 64u32), (2, 128), (8, 64)] {
+            let (node, c) = batched_walk_at(seqs, 1, hd);
+            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            let mut sym = 0i64;
+            let ops =
+                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                    .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
+            let at = format!("B={seqs} hd={hd}");
+            assert!(
+                ops.iter()
+                    .all(|e| !e.op_name.starts_with("pieces")
+                        && !e.op_name.starts_with("addi32toi32")),
+                "{at}: no piece copy and no scaled index"
+            );
+            // The query rows' gathers are named a stick column (`gather{c}_..`) or a run of rows.
+            let pages: Vec<_> = ops
+                .iter()
+                .filter(|e| e.op_name.starts_with("gather_o"))
+                .collect();
+            assert_eq!(
+                pages.len(),
+                2,
+                "{at}: one gather for the K pages, one for the V pages"
+            );
+            for e in pages {
+                let split = serde_json::to_value(e.op.as_ref().expect("a descriptor"))
+                    .expect("json")["numWkSlicesPerDim_"]
+                    .clone();
+                assert_eq!(
+                    split["mb"],
+                    c.entries(),
+                    "{at} {}: a page a core over the chunk's {} entries",
+                    e.op_name,
+                    c.entries()
+                );
+            }
+        }
+    }
+
     /// One chunk is straight-line: no loop to relaunch, every descriptor once.
     #[test]
     fn a_one_chunk_decode_batch_is_straight_line() {
