@@ -2028,6 +2028,37 @@ const ATTN_SHAPES: &[AttnShape] = &[
         rung: 0,
         rope_appended: true,
     },
+    // granite-2b's RANK geometries, as tensor parallelism shards its heads (16/4 at two ranks, 8/2
+    // at four): the same GQA group of 4 heads of 64, fewer groups per card. Decode over the whole
+    // one-page cache, and the one-pass prefill chunk.
+    AttnShape {
+        geom: (16, 4, 64),
+        mq: 1,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (16, 4, 64),
+        mq: 31,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (8, 2, 64),
+        mq: 1,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (8, 2, 64),
+        mq: 31,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
 ];
 
 /// The attention fixture's decode-position model: how many positions the mask says are valid
