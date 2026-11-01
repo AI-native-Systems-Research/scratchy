@@ -42,6 +42,34 @@ pub(crate) type StagedWeight = (usize, Vec<u8>, SDType, Vec<usize>);
 #[cfg(feature = "spyre-hw")]
 const RESIDENT_SEGS: [(i64, &str); 2] = [(1, "resident WEIGHTS"), (2, "resident KV")];
 
+/// ⭐⭐ THE KV POOL'S TABLES A **PREFILL** SESSION MUST STAGE FOR ITSELF — `kv_row_pool` and the int32
+/// zero beside it, from the PREFILL bundle's own paged step.
+///
+/// ⛔ NOT COVERED BY [`adopt_from_owner`], AND THAT IS THE WHOLE POINT. The pool is placed as an
+/// INTERMEDIATE colour segment (`CardSeat::Static` → `SegRole::Intermediate`) while the alias list is
+/// the RESIDENT segments — weights and KV — alone. So a prefill session that staged none gathered its
+/// prefix KV through an **unstaged buffer**: a clean launch, and garbage from the first token of every
+/// prompt chunk. Measured on the card (granite-2b and -8b, solo and concurrent alike) the moment the
+/// prompt trip began reading the pool. Every prefill session therefore stages its own copy, exactly as
+/// it already does for the sampler's staged constants, which sit in the same never-aliased segment.
+///
+/// ⛔ AND IT COMES FROM THE PREFILL BUNDLE'S STEP, NEVER THE DECODE ONE. A decode bundle's rows are
+/// its requests' (`PagedRows::Batch`), which reads its pages through `chunk_page_ids` and stages no
+/// pool at all — so `card_statics` on the decode step is EMPTY, and deriving a prefill session's
+/// statics from it would leave the defect exactly where it was.
+///
+/// Empty when this model bakes no prefill bundle, or when its prompt trip reads no pool.
+#[cfg(feature = "spyre-hw")]
+fn prefill_pool_statics(
+    wirings: &'static scratchy_target_spyre::wiring::Wirings,
+) -> ExecutorResult<Vec<(u32, Vec<u8>)>> {
+    let Some(step) = wirings.prefill.as_ref().unwrap_or(&wirings.decode).paged else {
+        return Ok(Vec::new());
+    };
+    scratchy_target_spyre::paged_step::card_statics(&step)
+        .map_err(|e| werr(format!("the prefill sessions' KV pool statics: {e}")))
+}
+
 /// ⭐ EVERYTHING A BORROWING SESSION NEEDS FROM THE OWNER, AS ONE CALL: the resident segments it
 /// ADOPTS by alias, and the spilled weight tail it must be handed its own COPY of.
 ///
@@ -1564,6 +1592,9 @@ impl SpyreWorker {
                             .as_ref()
                             .unwrap_or(&wirings.decode)
                             .load_consts;
+                        // The pool's own tables, staged per prefill session — see
+                        // [`prefill_pool_statics`] for why they cannot be aliased.
+                        let anchor_pool = prefill_pool_statics(wirings)?;
                         let pss = if anchor_reserves {
                             SuperDscSession::new_reserving(
                                 pcode,
@@ -1571,6 +1602,7 @@ impl SpyreWorker {
                                 kv_dim,
                                 num_blocks,
                                 prefill_consts,
+                                &anchor_pool,
                                 &spill_tids,
                             )
                         } else {
@@ -1581,6 +1613,7 @@ impl SpyreWorker {
                                 num_blocks,
                                 &RESIDENT_SEGS.map(|(seg, _)| seg),
                                 prefill_consts,
+                                &anchor_pool,
                                 &spill_tids,
                             )
                         }
@@ -1691,12 +1724,16 @@ impl SpyreWorker {
                     // Owned copy for the background build: the spilled tail's ids are declared
                     // resident by every session, and these rungs are built off this thread.
                     let ladder_spill = spill_tids.clone();
+                    // These are PREFILL rungs (`rung_consts = prefill_consts`), so each stages the
+                    // pool's tables for itself ([`prefill_pool_statics`]).
+                    let ladder_pool = prefill_pool_statics(wirings)?;
                     std::thread::spawn(move || {
                         let workers: Vec<_> = chunks
                             .into_iter()
                             .map(|part| {
                                 let rung_spill = ladder_spill.clone();
                                 let rung_consts = prefill_consts;
+                                let rung_pool = ladder_pool.clone();
                                 std::thread::spawn(move || {
                                     part.into_iter()
                                         .map(|(rm, rcode)| {
@@ -1707,6 +1744,7 @@ impl SpyreWorker {
                                                 num_blocks,
                                                 &[1, 2],
                                                 rung_consts,
+                                                &rung_pool,
                                                 &rung_spill,
                                             );
                                             (rm, r)
@@ -1891,6 +1929,7 @@ impl SpyreWorker {
                     pmq: u32,
                     rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static>,
                 }
+                let pool_for_prefix = prefill_pool_statics(wirings)?;
                 let mut prefix_jobs: Vec<PrefixRungJob> = Vec::new();
                 for &(pmq, psent) in g0.prefill_prefix {
                     if pmq <= 1 || psent.is_empty() {
@@ -1927,6 +1966,10 @@ impl SpyreWorker {
                             .iter()
                             .map(|job| {
                                 let spill = &spill_tids;
+                                // PREFILL rungs: the pool's tables, per session
+                                // ([`prefill_pool_statics`]). Borrowed from outside the scope, as
+                                // `spill` is — a binding inside it would not outlive the spawn.
+                                let pool = &pool_for_prefix;
                                 scope.spawn(move || {
                                     SuperDscSession::new_borrowing_with_consts(
                                         job.rcode,
@@ -1937,6 +1980,7 @@ impl SpyreWorker {
                                         // The general mint's nine tables, this bundle's
                                         // own seg3 copy.
                                         prefix_consts,
+                                        pool,
                                         spill,
                                     )
                                     .map_err(|e| {
@@ -2145,6 +2189,10 @@ impl SpyreWorker {
                                         num_blocks,
                                         &[1, 2],
                                         job.rung_consts,
+                                        // A decode rung's rows are its requests', so its attention
+                                        // reads its pages through `chunk_page_ids` and stages no
+                                        // pool (`PagedStep::reads_kv_row_pool`).
+                                        &[],
                                         spill,
                                     )
                                     .map_err(|e| {

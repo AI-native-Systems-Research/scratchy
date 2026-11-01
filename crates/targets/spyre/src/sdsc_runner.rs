@@ -209,6 +209,7 @@ impl SuperDscSession {
             num_blocks,
             borrowed,
             &[],
+            &[],
             spilled_tail,
         )
     }
@@ -227,6 +228,14 @@ impl SuperDscSession {
         num_blocks: usize,
         borrowed: &[i64],
         load_consts: &[(u32, crate::wiring::LoadConst)],
+        // ⛔ THE POOL'S OWN TABLES, FOR A SESSION WHOSE ATTENTION READS THEM. They are NOT covered by
+        // `borrowed`: the pool statics are placed as an INTERMEDIATE colour segment
+        // (`CardSeat::Static` -> `SegRole::Intermediate`), and the alias list is the RESIDENT segments
+        // (weights, KV) alone — so a borrower that reads `kv_row_pool` and passes none here gathers
+        // through an UNSTAGED buffer. That is a clean launch and garbage from the first token, which
+        // is what the prompt trip did on the card the moment it began reading the pool. Same reason
+        // `load_consts` is per-session here rather than aliased.
+        pool_statics: &[(u32, Vec<u8>)],
         spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
@@ -238,7 +247,7 @@ impl SuperDscSession {
             },
             Vec::new(),
             load_consts,
-            &[],
+            pool_statics,
             borrowed,
             spilled_tail,
         )
@@ -262,6 +271,8 @@ impl SuperDscSession {
         kv_dim: usize,
         num_blocks: usize,
         load_consts: &[(u32, crate::wiring::LoadConst)],
+        // The pool's own tables, for the same reason the borrowing constructor takes them.
+        pool_statics: &[(u32, Vec<u8>)],
         spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
@@ -273,7 +284,7 @@ impl SuperDscSession {
             },
             Vec::new(),
             load_consts,
-            &[],
+            pool_statics,
             &[],
             spilled_tail,
         )
