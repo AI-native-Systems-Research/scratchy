@@ -204,9 +204,11 @@ impl SuperDscSession {
     ) -> Result<Self> {
         Self::new_borrowing_with_consts(
             code,
-            vocab,
-            kv_dim,
-            num_blocks,
+            SessionDims {
+                vocab,
+                kv_dim,
+                num_blocks,
+            },
             borrowed,
             &[],
             &[],
@@ -223,9 +225,7 @@ impl SuperDscSession {
     /// at load — through the same load-time channel the owner uses.
     pub fn new_borrowing_with_consts(
         code: &'static crate::bundle_code::BundleCode<'static>,
-        vocab: usize,
-        kv_dim: usize,
-        num_blocks: usize,
+        dims: SessionDims,
         borrowed: &[i64],
         load_consts: &[(u32, crate::wiring::LoadConst)],
         // ⛔ THE POOL'S OWN TABLES, FOR A SESSION WHOSE ATTENTION READS THEM. They are NOT covered by
@@ -240,11 +240,7 @@ impl SuperDscSession {
     ) -> Result<Self> {
         Self::new_inner(
             code,
-            SessionDims {
-                vocab,
-                kv_dim,
-                num_blocks,
-            },
+            dims,
             Vec::new(),
             load_consts,
             pool_statics,

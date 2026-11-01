@@ -1608,9 +1608,11 @@ impl SpyreWorker {
                         } else {
                             SuperDscSession::new_borrowing_with_consts(
                                 pcode,
-                                vocab,
-                                kv_dim,
-                                num_blocks,
+                                scratchy_target_spyre::sdsc_runner::SessionDims {
+                                    vocab,
+                                    kv_dim,
+                                    num_blocks,
+                                },
                                 &RESIDENT_SEGS.map(|(seg, _)| seg),
                                 prefill_consts,
                                 &anchor_pool,
@@ -1739,9 +1741,11 @@ impl SpyreWorker {
                                         .map(|(rm, rcode)| {
                                             let r = SuperDscSession::new_borrowing_with_consts(
                                                 rcode,
-                                                vocab,
-                                                kv_dim,
-                                                num_blocks,
+                                                scratchy_target_spyre::sdsc_runner::SessionDims {
+                                                    vocab,
+                                                    kv_dim,
+                                                    num_blocks,
+                                                },
                                                 &[1, 2],
                                                 rung_consts,
                                                 &rung_pool,
@@ -1973,9 +1977,11 @@ impl SpyreWorker {
                                 scope.spawn(move || {
                                     SuperDscSession::new_borrowing_with_consts(
                                         job.rcode,
-                                        vocab,
-                                        kv_dim,
-                                        num_blocks,
+                                        scratchy_target_spyre::sdsc_runner::SessionDims {
+                                            vocab,
+                                            kv_dim,
+                                            num_blocks,
+                                        },
                                         &[1, 2],
                                         // The general mint's nine tables, this bundle's
                                         // own seg3 copy.
@@ -2184,9 +2190,11 @@ impl SpyreWorker {
                                 scope.spawn(move || {
                                     SuperDscSession::new_borrowing_with_consts(
                                         job.rcode,
-                                        vocab,
-                                        kv_dim,
-                                        num_blocks,
+                                        scratchy_target_spyre::sdsc_runner::SessionDims {
+                                            vocab,
+                                            kv_dim,
+                                            num_blocks,
+                                        },
                                         &[1, 2],
                                         job.rung_consts,
                                         // A decode rung's rows are its requests', so its attention
