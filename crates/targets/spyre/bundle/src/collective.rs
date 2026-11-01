@@ -597,19 +597,19 @@ mod tests {
             source_segment: 0,
             source_offset: 8192,
             window,
-            bytes: CutPayload::new(Payload::new(2 * cap + 256).unwrap()).unwrap(),
+            bytes: CutPayload::new(Payload::new(cap + 256).unwrap()).unwrap(),
             cut,
         };
         let m: Vec<TpMessage> = send.messages(only_region()).collect();
-        assert_eq!(m.len(), 3);
+        assert_eq!(m.len(), 2);
         let land = window.region_offset(cut, only_region());
         for (k, x) in m.iter().enumerate() {
             let at = k as u64 * cap;
             assert_eq!((x.source_offset, x.window_offset), (8192 + at, land + at));
-            assert_eq!((x.first, x.last), (k == 0, k == 2));
+            assert_eq!((x.first, x.last), (k == 0, k == 1));
             assert_eq!(x.slot, LandingSlot::of(cut, k as u32).unwrap());
         }
-        assert_eq!(m[2].bytes.get(), 256);
+        assert_eq!(m[1].bytes.get(), 256);
         assert_eq!(
             m.iter().map(|x| x.bytes.get()).sum::<u64>(),
             send.bytes.get().get()

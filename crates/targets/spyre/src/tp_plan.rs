@@ -117,19 +117,64 @@ pub const SPYRE_SPLIT_GRANULE: SplitGranule =
     SplitGranule::of::<{ <Fp16 as DataFormat>::ELEMS_PER_STICK }>();
 
 /// ⭐ THE ONE CUT OF A COLLECTIVE'S OPERAND — the consume launches the emitter mints for a
-/// `[rows, cols]` operand, and the fragments the window is sized over, are this function's output
-/// and nothing else's, so no fragment can be wider than the window it lands in.
+/// `[rows, cols]` operand are this function's output and nothing else's.
 ///
-/// ⛔ CUT AT ONE WINDOW CUT (`RecvWindow::cut_bytes_for` — `WINDOW_ROWS` rows of the operand),
-/// never at the wire: a send moves any payload as its run of messages (`Payload::messages`), but
-/// two fragments of one collective cannot share its cut — the peer's next fragment can land while
-/// this rank still consumes the last (a wdone says "landed", never "read"). Every operand a bundle
-/// hands a collective has at most `WINDOW_ROWS` rows, so the cut is always ONE fragment.
+/// ⛔ CUT AT THE WIDEST REGION A WINDOW CAN HAVE (`MAX_CUT_MESSAGES` messages), never at the wire: a
+/// send moves any payload as its run of messages (`Payload::messages`), but two fragments of one
+/// collective cannot share its region — the peer's next fragment can land while this rank still
+/// consumes the last (a wdone says "landed", never "read"). The window is sized for the widest send
+/// its forward makes ([`window_region`]), so every operand a bundle hands a collective is ONE
+/// fragment, and the bake's send gate (`collective::sends`) refuses one wider than its region.
 pub fn consume_fragments(rows: u32, cols: u32) -> Result<Vec<Fragment>, FragmentRefusal> {
-    match RecvWindow::cut_bytes_for(cols) {
-        Some(window) => fragments(rows, cols, window),
+    let widest = crate::bundle_code::collective::MAX_CUT_MESSAGES as u64
+        * crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES;
+    match Payload::new(widest) {
+        Some(width) => fragments(rows, cols, width),
         None => Err(FragmentRefusal::RaggedCols { cols }),
     }
+}
+
+/// ⭐ ONE REGION OF THE RECEIVE WINDOW A FORWARD NEEDS — the widest send any of its collectives can
+/// make ([`SendRows::bytes`]): the drawn result's gather carries at most a decode batch, every other
+/// collective a prompt chunk. The role is read off the graph: an all-gather whose value reaches the
+/// result through row-local ops is the result's gather. `None` for a forward with no collective.
+///
+/// # Errors
+/// A send wider than a region can be (`RecvWindow::region_for`), naming its bytes.
+pub fn window_region<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &scratchy_subtile::subtile_ir::SubtileIR<F>,
+) -> Result<Option<Payload>, String> {
+    use crate::bundle_code::collective::SendRows;
+    use scratchy_subtile::subtile_ir::SubOp;
+    let widest = ir
+        .nodes
+        .iter()
+        .filter_map(|n| {
+            let role = match n.op {
+                SubOp::AllGather { .. }
+                    if scratchy_triton_splice::tensor_feeds_result_through_row_local_ops(
+                        ir,
+                        n.output.tensor,
+                    ) =>
+                {
+                    SendRows::ResultGather
+                }
+                SubOp::AllReduce { .. } | SubOp::AllGather { .. } => SendRows::Chunk,
+                _ => return None,
+            };
+            Some(role.bytes(n.inputs[0].region.cols.len))
+        })
+        .max();
+    widest
+        .map(|w| {
+            RecvWindow::region_for(w).ok_or_else(|| {
+                format!(
+                    "a collective's widest send is {w} B — no receive-window region holds it \
+                     within the sid budget"
+                )
+            })
+        })
+        .transpose()
 }
 
 /// Why a tensor-parallel bake cannot be planned.
@@ -140,6 +185,8 @@ pub enum TpBakeRefusal {
         collective: usize,
         why: FragmentRefusal,
     },
+    /// A send wider than any receive-window region can be.
+    Window(String),
 }
 
 /// A forward sharded for one spyre world, with the receive window its collectives need.
@@ -147,9 +194,9 @@ pub enum TpBakeRefusal {
 pub struct TpBake {
     pub world: SpyreWorld,
     pub sharded: ShardedForward,
-    /// One cut of the receive window the forward's collectives need —
-    /// [`RecvWindow::cut_bytes_for`] its widest collective operand, the cut the layout places
-    /// `WINDOW_CUTS` of. `None` exactly when the forward has no collective (a world of one).
+    /// One region of the receive window the forward's collectives need ([`window_region`]), the
+    /// region the layout places per peer in each of `WINDOW_CUTS` cuts. `None` exactly when the
+    /// forward has no collective (a world of one).
     pub window_cut: Option<Payload>,
 }
 
@@ -158,7 +205,6 @@ pub fn tp_bake(input: &LoweringInput, world: SpyreWorld) -> Result<TpBake, TpBak
     let sharded = tensor_parallel::shard(input, world.analysis, SPYRE_SPLIT_GRANULE, &[])
         .map_err(TpBakeRefusal::Shard)?;
     let shapes = tensor_parallel::op_shapes(&sharded.local);
-    let mut widest_cols: Option<u32> = None;
     for (collective, c) in sharded.collectives.iter().enumerate() {
         let (rows, cols) = match c.reads {
             scratchy_subtile::lower::InputRef::Op(r) => shapes[r],
@@ -168,12 +214,17 @@ pub fn tp_bake(input: &LoweringInput, world: SpyreWorld) -> Result<TpBake, TpBak
             }
         };
         consume_fragments(rows, cols).map_err(|why| TpBakeRefusal::Fragment { collective, why })?;
-        widest_cols = Some(widest_cols.map_or(cols, |w| w.max(cols)));
     }
+    let ir = scratchy_subtile::subtile_ir::lower_region(
+        &sharded.local,
+        std::num::NonZeroU32::new(<Fp16 as DataFormat>::ELEMS_PER_STICK)
+            .expect("a stick holds elements"),
+    );
+    let window_cut = window_region(&ir).map_err(TpBakeRefusal::Window)?;
     Ok(TpBake {
         world,
         sharded,
-        window_cut: widest_cols.and_then(RecvWindow::cut_bytes_for),
+        window_cut,
     })
 }
 
