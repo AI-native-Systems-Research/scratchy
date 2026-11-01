@@ -702,6 +702,16 @@ fn decode_rows(
     scratchy_target_metal::tape::ids::DecodeRows(u32::try_from(rows).unwrap_or(u32::MAX))
 }
 
+// A block drafter's step drafts the lanes the device's verify budget prices: the engine's lane cap
+// is the metal target's.
+#[cfg(feature = "metal")]
+const _: () = assert!(
+    scratchy_serving_engine::spec_decode::BLOCK_LANES == scratchy_target_metal::dflash2::BUDGET_LANES
+        && scratchy_serving_engine::spec_decode::BLOCK_LANES
+            == scratchy_forward_compiler::DFLASH2_BLOCK_LANES,
+    "a block drafter drafts the lanes its verify budget prices and its buckets bake"
+);
+
 /// The drafts a compiled head makes a step's sequences ([`DraftBudget`]): its registration's
 /// counts.
 #[cfg(feature = "metal")]

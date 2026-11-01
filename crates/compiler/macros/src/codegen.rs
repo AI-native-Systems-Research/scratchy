@@ -10768,6 +10768,12 @@ fn reroll_tokens(
     }
 }
 
+/// The lanes a DFlash2 drafter's block draft runs in a step, each its own `spec_verify_rows` block:
+/// Splash's SPLASH_MAXIMUM_BATCH_WIDTH. Its buckets through `lanes × spec_verify_rows` rows play the
+/// block draft. The engine's lane cap (`scratchy_serving_engine::spec_decode::BLOCK_LANES`) is
+/// asserted equal where both are in scope (`scratchy_forward_compiler::DFLASH2_BLOCK_LANES`).
+const DFLASH2_BLOCK_LANES: u64 = scratchy_forward_compiler::DFLASH2_BLOCK_LANES as u64;
+
 // The emu's ONE width is LX-derived per model (`emu_prefill_lx_width`
 // below): the widest ladder rung whose fp8 gemms' INTRA-NODE tiles fit a
 // core's 2 MiB LX. This constant is now only the COLLISION-FREE CEILING
@@ -15371,9 +15377,12 @@ pub fn emit_model(
     // that holds them (`plays_result_through`). A bucket past it plays the context commit alone,
     // and its arena holds what the commit's tiles (`commit_tiles`) write: the block's — its
     // lm_head's logits, a vocabulary a row, above all — are never written there.
+    // The rows are a lane's (`spec_verify_rows`) times the lanes a step drafts
+    // (`scratchy_serving_engine::spec_decode::BLOCK_LANES`, Splash's SPLASH_MAXIMUM_BATCH_WIDTH).
     let plays_result_through = match model.bounds.get("selector_rank") {
         Some(&rank) if rank > 0 => {
             (model.bounds.get("spec_verify_rows").copied()).and_then(|rows| {
+                let rows = rows * DFLASH2_BLOCK_LANES;
                 num_tokens_points
                     .iter()
                     .copied()
