@@ -1515,6 +1515,18 @@ impl BatchChunking {
         }
     }
 
+    /// ⛔ WHETHER A DECODE BATCH MAY RUN A WALK OF `blocks` — only where the walk is two chunks or
+    /// more. A one-chunk decode batch is MEASURED wrong on the card in every form it has been
+    /// lowered in (granite-3.1-2b fp8: spyre-inference's shared-maximum arm scrambled its
+    /// probability blocks at every odd kv head; the entry-local loop at one trip was refused at
+    /// lowering; a straight-line entry-local step decoded garbage at two sequences and an unsampleable
+    /// row at eight), while the entry-local walk over two chunks or more is coherent at 2 and 8
+    /// sequences, short context to 3k. So a decode batch's walk rungs start at its first two-chunk
+    /// walk, and a step whose context is shorter runs that rung, its extra block slots masked.
+    pub const fn batch_walk_runs(seqs: u32, blocks: u32, nkvh: u32) -> bool {
+        Self::of(seqs, blocks, nkvh).num_chunks >= 2
+    }
+
     /// Pages one chunk gathers.
     pub const fn entries(self) -> u32 {
         self.blocks_per_chunk * self.seqs
@@ -4829,6 +4841,25 @@ mod walk_on_the_card {
                         count(slots, "add")
                     );
                 }
+            }
+        }
+    }
+
+    /// ⛔ A DECODE BATCH RUNS ONLY WALKS OF TWO CHUNKS OR MORE (`BatchChunking::batch_walk_runs`):
+    /// at granite's 8 kv heads over 32 cores, two sequences' walks start at 32 blocks (two chunks of
+    /// 16), four at 16, eight at 8, sixteen at 4 and thirty-two at 2; every walk below is one chunk,
+    /// the form the card decodes wrong.
+    #[test]
+    fn a_decode_batch_runs_no_one_chunk_walk() {
+        for (seqs, first) in [(2u32, 32u32), (4, 16), (8, 8), (16, 4), (32, 2)] {
+            for blocks in [1u32, 2, 4, 8, 16, 32, 64, 128, 1024] {
+                let runs = BatchChunking::batch_walk_runs(seqs, blocks, 8);
+                assert_eq!(runs, blocks >= first, "B={seqs} over {blocks} blocks");
+                assert_eq!(
+                    runs,
+                    BatchChunking::of(seqs, blocks, 8).num_chunks >= 2,
+                    "B={seqs} over {blocks} blocks: the rule is the chunk count"
+                );
             }
         }
     }
