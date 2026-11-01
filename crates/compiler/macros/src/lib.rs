@@ -1998,8 +1998,9 @@ pub fn compile_carrier(
             }
         };
         // A variant's multi-token-prediction head facts. The registry carries the arch-wide ones
-        // (every head variant must agree), so a loader knows them before the head loads.
-        #[derive(Debug, PartialEq)]
+        // (every head variant must agree, but for the targets each drafts for, which it unites), so
+        // a loader knows them before the head loads.
+        #[derive(Clone, Debug, PartialEq)]
         struct HeadFacts {
             /// Its forward reads `target_hidden`: it is a head.
             reads_target_hidden: bool,
@@ -2090,20 +2091,29 @@ pub fn compile_carrier(
             match heads.first() {
                 None => quote! { ::core::option::Option::None },
                 Some(first) => {
+                    // Its variants may draft for different targets (Splash's DFlash2 drafter for
+                    // Qwen3.6-35B-A3B and for Qwen3.8-27B: one MoE arch, one dense): the head
+                    // drafts for all of them. Every other fact is the arch's, one for all of them.
+                    let same_but_targets = |head: &&HeadFacts| {
+                        HeadFacts {
+                            drafts_for: first.drafts_for.clone(),
+                            ..(*head).clone()
+                        } == **first
+                    };
                     assert!(
-                        heads.iter().all(|head| head == first),
+                        heads.iter().all(same_but_targets),
                         "{arch_ident}: its head variants disagree on where they load lent weights, \
-                         how many lm_head rows they read, whose head they are, where they ship or \
-                         how many tokens they draft ({heads:?}); a loader must know them before \
-                         the head loads"
+                         how many lm_head rows they read, where they ship or how many tokens they \
+                         draft ({heads:?}); a loader must know them before the head loads"
                     );
+                    let drafts_for: std::collections::BTreeSet<&String> =
+                        heads.iter().flat_map(|head| &head.drafts_for).collect();
                     let [arch] = &hf_arches[..] else {
                         panic!("{arch_ident}: a head registers under one identity ({hf_arches:?})");
                     };
                     let HeadFacts {
                         lent: [Some(embed_tokens), lm_head],
                         lm_head_rows,
-                        drafts_for,
                         repo_infix,
                         checkpoint_prefix,
                         spec,
