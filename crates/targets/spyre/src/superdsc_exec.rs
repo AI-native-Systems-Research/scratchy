@@ -2551,6 +2551,21 @@ impl Executor {
             }
         }
         lap("tensor-h2d", &mut t0);
+        // ⭐ THE PAGED POOL STARTS ZEROED, filled on the device by the session that allocated it — it
+        // has no host image to upload (above). An unwritten slot is read before its mask applies, and
+        // a decode batch reads page 0 (the null page) under an all-masked row for every block slot
+        // past a sequence's blocks, as spyre-inference does over its zeroed cache. Device memory left
+        // as found holds non-finite words, which no additive mask cancels: MEASURED on the card with
+        // the pool unfilled, 8,253 of them in page 0. A session that borrows the pool takes the
+        // owner's zeroed region by alias.
+        if self.kv.paged
+            && !self.seg_borrowed[SEG_KV.get()]
+            && !(reserve_only && is_resident_seg(SEG_KV.get()))
+        {
+            self.zero_seg(SEG_KV)
+                .map_err(|e| anyhow!("prepare: zeroing the paged KV pool: {e}"))?;
+            lap("kv-zero", &mut t0);
+        }
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("prepare: sync: {e}"))?;

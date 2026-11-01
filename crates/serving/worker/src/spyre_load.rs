@@ -1776,7 +1776,8 @@ impl SpyreWorker {
                     spill_images.push((seg, image));
                 }
 
-                // The pools start zeroed: `prepare` uploads the KV segment's host image.
+                // The pools start zeroed: `prepare` fills the paged KV segment on the device (it has
+                // no host image to upload).
                 debug!(
                     "[timing] SuperDscSession::new (bind weights + prepare) took {:.2}s",
                     _t_sess.elapsed().as_secs_f64()
