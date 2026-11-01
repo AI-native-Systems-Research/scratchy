@@ -8533,6 +8533,148 @@ pub fn ktir_groups(
 /// Returns the identity each group's compiled artifact will be found under — nothing here reads a
 /// compiled result back; that happens once for the whole emit, in [`EmittedBundle::into_code`], after
 /// `superdsc_bake::finish_global()` has drained the queue.
+/// Every `startAddressCoreCorelet_.data_` value under `v` — every per-core start address a dxp input
+/// descriptor states, across all of its tensors.
+pub(crate) fn descriptor_starts(v: &serde_json::Value, out: &mut Vec<u64>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, x) in m {
+                if k == "startAddressCoreCorelet_" {
+                    if let Some(d) = x.get("data_").and_then(|d| d.as_object()) {
+                        out.extend(d.values().filter_map(|s| s.as_str()?.parse::<u64>().ok()));
+                    }
+                } else {
+                    descriptor_starts(x, out);
+                }
+            }
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| descriptor_starts(x, out)),
+        _ => {}
+    }
+}
+
+/// ⭐ THE STATIC AUDIT OF EVERY COLLECTIVE OPERAND (#1007 §5): before any card runs a bundle, the very
+/// input dxp compiles must read each consume's operands at their typed placements
+/// (`SEGMENT_OFFSETS[segment] + offset`). For every consume group:
+///
+/// - **its own fragment:** some core starts at the operand's placement plus the fragment's offset —
+///   the bytes its send moves to the peers are the bytes it reads itself;
+/// - **every peer's region:** some core starts at the first byte of each peer's region of the cut it
+///   names — a consume reads all `W − 1` of them, in every world and either kind;
+/// - **nothing unplaced, nothing else of the window:** every core starts inside some placement of
+///   the bundle, and none inside the receive window outside this cut's regions — so no consume reads
+///   bytes the layout gave nothing, the other cut, or past its own.
+///
+/// The send half is [`bundle::collective::sends`], which the bundle's build resolves against the
+/// same placements. A failure is a build error naming the bundle, the group and the address.
+pub(crate) fn audit_collective_addresses(
+    rendered: &[GroupInput],
+    shifts: &[bundle::KvShifts],
+    layout: &BundleLayout,
+    fp: &str,
+) -> Result<(), SuperDscError> {
+    use ktir_superdsc::collective::{PeerRegion, TpWorld, WINDOW_CUTS, WindowCut};
+    use ktir_superdsc::reserved_tids::tp_recv_tid;
+    use ktir_superdsc::wire::SEGMENT_OFFSETS;
+    let at = |tid: u32| -> Option<(u64, u64)> {
+        layout
+            .placements
+            .get(&tid)
+            .map(|p| (SEGMENT_OFFSETS[p.segment] + p.offset, p.size))
+    };
+    // The world the window serves: one region per peer in its first cut.
+    let peers = (0..PeerRegion::MAX)
+        .take_while(|&r| at(tp_recv_tid(0, r)).is_some())
+        .count() as u32;
+    let Some(world) = TpWorld::named(peers + 1).filter(|w| w.is_sharded()) else {
+        return match shifts.iter().find_map(|k| k.tp) {
+            Some(_) => Err(SuperDscError(format!(
+                "{fp}: a bundle with a collective consume places {peers} receive-window region(s) \
+                 — no sharded world's window"
+            ))),
+            None => Ok(()),
+        };
+    };
+    let regions_of = |cut: WindowCut| -> Result<Vec<(u64, u64)>, SuperDscError> {
+        PeerRegion::of_world(world)
+            .map(|r| {
+                at(cut.tid(r)).ok_or_else(|| {
+                    SuperDscError(format!(
+                        "{fp}: the receive window places no region {} in cut {}",
+                        r.index(),
+                        cut.index()
+                    ))
+                })
+            })
+            .collect()
+    };
+    let window: Vec<(u64, u64)> = (0..WINDOW_CUTS)
+        .map(WindowCut::of_collective)
+        .map(regions_of)
+        .collect::<Result<Vec<_>, _>>()?
+        .concat();
+    let inside = |spans: &[(u64, u64)], a: u64| spans.iter().any(|&(b, n)| (b..b + n).contains(&a));
+    let placed: Vec<(u64, u64)> = layout
+        .placements
+        .values()
+        .map(|p| (SEGMENT_OFFSETS[p.segment] + p.offset, p.size))
+        .collect();
+    for g in rendered {
+        let Some(c) = shifts.get(g.group as usize).and_then(|k| k.tp) else {
+            continue;
+        };
+        let mut starts: Vec<u64> = Vec::new();
+        for (name, body) in &g.files {
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(body)
+                .map_err(|e| SuperDscError(format!("{fp}: group {}'s {name}: {e}", g.group)))?;
+            descriptor_starts(&v, &mut starts);
+        }
+        let refuse = |what: String| {
+            SuperDscError(format!(
+                "{fp}: group {}'s collective consume (cut {}) fails the static address audit: \
+                 {what}",
+                g.group,
+                c.cut.index()
+            ))
+        };
+        let (operand, _) = at(c.operand.tid())
+            .ok_or_else(|| refuse(format!("its operand {} has no placement", c.operand)))?;
+        let own = operand + c.fragment.byte_offset();
+        if !starts.contains(&own) {
+            return Err(refuse(format!(
+                "no core starts at its own fragment, {own} ({} + {})",
+                operand,
+                c.fragment.byte_offset()
+            )));
+        }
+        let mine = regions_of(c.cut)?;
+        for (r, &(base, _)) in mine.iter().enumerate() {
+            if !starts.contains(&base) {
+                return Err(refuse(format!(
+                    "no core starts at peer region {r}'s first byte, {base}"
+                )));
+            }
+        }
+        if let Some(stray) = starts.iter().find(|&&a| !inside(&placed, a)) {
+            return Err(refuse(format!(
+                "a core starts at {stray}, which no placement of the bundle holds"
+            )));
+        }
+        if let Some(stray) = starts
+            .iter()
+            .find(|&&a| inside(&window, a) && !inside(&mine, a))
+        {
+            return Err(refuse(format!(
+                "a core starts at {stray}, inside the receive window but outside this cut's regions"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn ktir_groups_via_superdsc(
     ops: &[EmittedOp],
     fp: &str,
@@ -8861,6 +9003,9 @@ fn ktir_groups_via_superdsc(
         let _pc = crate::pc::Pc::start("launch");
         launch_index(&sdsc_ops, fold)
     };
+    if let Some(layout) = layout {
+        audit_collective_addresses(&rendered, &shifts, layout, fp)?;
+    }
     let mut groups: Vec<(bundle::KvShifts, crate::superdsc_bake::GroupId)> = Vec::new();
     let mut staged: u64 = 0;
     // No dxp (a Mac / cardless `cargo check`) ⇒ nothing to stage, and nothing to stage it FOR. This

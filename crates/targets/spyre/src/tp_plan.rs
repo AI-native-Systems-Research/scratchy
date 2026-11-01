@@ -286,6 +286,50 @@ mod tests {
         }
     }
 
+    /// ⭐ THE STATIC AUDIT (#1007 §5) PASSES A SHARDED SUBLAYER AT TWO AND FOUR RANKS, AND REFUSES A
+    /// WINDOW THAT MOVED. Each consume's descriptors read its own fragment at the operand's
+    /// placement and every peer's region of its cut at its first byte. Moving one region by a
+    /// stick, under unchanged descriptors, is a consume reading the wrong bytes: refused, naming it.
+    #[test]
+    fn the_static_audit_passes_every_world_and_refuses_a_moved_region() {
+        use crate::bundle_code::collective::{PeerRegion, WindowCut};
+        use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
+        use crate::lower_subtile_tape_to_superdsc::{
+            FoldGrouping, audit_collective_addresses, launch_index, render_dxp_input,
+        };
+        use ktir_superdsc::ktir_node::ActiveCap;
+        use scratchy_subtile::fixtures::mlp_sublayer;
+        use scratchy_subtile::subtile_ir::lower_region;
+
+        for world in SpyreWorld::SHARDED {
+            let b = tp_bake(&mlp_sublayer(2048, 8192), world).unwrap();
+            let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
+            let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
+            let (ops, mut layout) =
+                lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let rendered = render_dxp_input(&ops, FoldGrouping::Split).unwrap();
+            let shifts = launch_index(&ops, FoldGrouping::Split);
+            assert!(shifts.iter().any(|k| k.tp.is_some()), "a consume to audit");
+            let w = world.plan().get();
+            audit_collective_addresses(&rendered, &shifts, &layout, "sublayer")
+                .unwrap_or_else(|e| panic!("tp={w}: {}", e.0));
+            let cut = ops.iter().find_map(|e| e.tp_consume).unwrap().cut;
+            let last = PeerRegion::of_world(world.plan()).last().unwrap();
+            layout
+                .placements
+                .get_mut(&WindowCut::tid(cut, last))
+                .unwrap()
+                .offset += 128;
+            let refused = audit_collective_addresses(&rendered, &shifts, &layout, "sublayer")
+                .expect_err("a consume whose region moved reads the wrong bytes");
+            assert!(
+                refused.0.contains("static address audit"),
+                "tp={w}: {}",
+                refused.0
+            );
+        }
+    }
+
     /// ⭐ FOUR RANKS SUM IN ABSOLUTE RANK ORDER, EACH ITS OWN CONSUME. Every all-reduce of a
     /// four-rank decode lowers to one consume per rank, played at that rank alone: three adds,
     /// `((f_0 + f_1) + f_2) + f_3`, reading the rank's own partial at its own rank and each peer's
@@ -458,7 +502,7 @@ mod tests {
                 continue;
             }
             let v: serde_json::Value = serde_json::from_str(body).unwrap();
-            collect_starts(&v, &mut starts);
+            crate::lower_subtile_tape_to_superdsc::descriptor_starts(&v, &mut starts);
         }
         assert!(!starts.is_empty(), "the descriptor states no start address");
         // The window's first stick is core 0's start, and its 2048 columns are 32 sticks, one per core.
@@ -643,25 +687,6 @@ mod tests {
                 }
             }
             serde_json::Value::Array(a) => a.iter().for_each(|x| core0_starts(x, out)),
-            _ => {}
-        }
-    }
-
-    /// Every `startAddressCoreCorelet_.data_` value under `v`.
-    fn collect_starts(v: &serde_json::Value, out: &mut Vec<u64>) {
-        match v {
-            serde_json::Value::Object(m) => {
-                for (k, x) in m {
-                    if k == "startAddressCoreCorelet_" {
-                        if let Some(d) = x.get("data_").and_then(|d| d.as_object()) {
-                            out.extend(d.values().filter_map(|s| s.as_str()?.parse::<u64>().ok()));
-                        }
-                    } else {
-                        collect_starts(x, out);
-                    }
-                }
-            }
-            serde_json::Value::Array(a) => a.iter().for_each(|x| collect_starts(x, out)),
             _ => {}
         }
     }
