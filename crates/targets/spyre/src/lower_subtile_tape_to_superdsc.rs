@@ -1047,38 +1047,26 @@ pub fn compute_bundle_layout<F: RopeForm>(
     };
     // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW — placed iff the forward carries a collective, in the
     // weight segment's base region (bank 0) directly above the packed weights: `WINDOW_CUTS`
-    // adjacent cuts of `RecvWindow::cut_bytes_for` the forward's widest collective operand, one
-    // placement per cut's tid (`WindowCut::tid`) — collective `k` lands in cut
-    // `WindowCut::of_collective(k)`.
+    // adjacent cuts, each one region per peer of `tp_plan::window_region` — the widest send the
+    // forward's collectives make — one placement per (cut, region) tid (`WindowCut::tid`).
+    // Collective `k` lands in cut `WindowCut::of_collective(k)`.
     //
     // ⛔ UNIFORM BY CONSTRUCTION, NOT BY COORDINATION. Every bundle of a forward (prefix, rolled
     // body, suffix) is baked over THIS one layout, and `weight_segment_parity` holds every layout
     // of a session to one weight extent — so `(seg1, align128(extent), size)` is the same triple
-    // wherever a send is baked and wherever its consume reads. The size reads only the operand's
-    // COLUMNS and the target's row cap (`WINDOW_ROWS`), never this bundle's row count, which is
-    // what keeps a decode layout and every prefill rung's equal; and `consume_fragments` cuts at
-    // the same law, so no fragment can exceed it.
+    // wherever a send is baked and wherever its consume reads. The size reads only each
+    // collective's ROLE and COLUMNS and the target's row caps (`SendRows`), never this bundle's row
+    // count, which is what keeps a decode layout and every prefill rung's equal; and the bake's send
+    // gate (`collective::sends`) refuses a fragment wider than its region.
     //
     // ⭐ A REGION PER PEER: each cut holds one region per rank this card hears from, in rank order
     // (`collective::PeerRegion`), each its own placement — so a world of two places exactly the one
     // region per cut it always has. The world is the one every collective of the forward states.
-    let widest_cols = ir
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.op, SubOp::AllReduce { .. } | SubOp::AllGather { .. }))
-        .map(|n| n.inputs[0].region.cols.len)
-        .max();
-    if let Some(widest_cols) = widest_cols {
+    if let Some(region) = crate::tp_plan::window_region(ir).map_err(SuperDscError)? {
         let world = crate::tp_plan::world_of_ir(ir)
             .map_err(SuperDscError)?
             .ok_or_else(|| SuperDscError("a forward with a collective states its world".into()))?;
         let w = SegRole::Weight.segment();
-        let region =
-            ktir_superdsc::collective::RecvWindow::cut_bytes_for(widest_cols).ok_or_else(|| {
-                SuperDscError(format!(
-                    "a collective's operand has {widest_cols} columns — no receive window holds it"
-                ))
-            })?;
         let window =
             ktir_superdsc::collective::RecvWindow::new(align128(seg_bytes[w]), region, world)
                 .ok_or_else(|| {

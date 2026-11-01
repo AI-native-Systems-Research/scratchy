@@ -402,9 +402,12 @@ pub fn cuts_alternate(cuts: impl IntoIterator<Item = WindowCut>) -> Result<(), C
     Ok(())
 }
 
-/// The most messages one window cut holds — the width of a rank's landing-slot budget. A forward
-/// whose widest collective operand needs more refuses at bake ([`RecvWindow::cut_bytes_for`]).
-pub const MAX_CUT_MESSAGES: u32 = 8;
+/// The most messages one window region holds — the width of a rank's landing-slot budget per cut.
+/// A forward whose widest send needs more refuses at bake ([`RecvWindow::region_for`]). Two: the
+/// widest send granite makes is one 512-row chunk of its hidden (2 MiB at the 2b, 4 MiB at the 8b —
+/// one message), and a rank's budget is `WINDOW_CUTS × MAX_CUT_MESSAGES` sids, which eight ranks fit
+/// in the card's 64.
+pub const MAX_CUT_MESSAGES: u32 = 2;
 
 /// ⭐ ONE MESSAGE'S FIXED PLACE IN THE RECEIVE WINDOW: message `message` of a send into cut `cut`,
 /// at the cut's offset plus `message` whole messages ([`RecvWindow::slot_offset`]).
@@ -572,20 +575,51 @@ impl RecvWindow {
         self.offset + self.size()
     }
 
-    /// ⭐ ONE CUT A FORWARD'S COLLECTIVES NEED: [`WINDOW_ROWS`] rows of its widest collective
-    /// operand (`widest_cols`, stick-rounded fp16). It reads only the operand's COLUMNS (the
-    /// forward's) and the row cap (the target's) — never a bundle's own row count — so every
-    /// bundle of one forward places the same window, as the link's `XSEG` entries and the shared
-    /// weight segment require. Any fragment of any collective of the forward fits a cut whole, so
-    /// a collective is ONE fragment and its send is a run of messages ([`Payload::messages`]),
-    /// each landing in a slot of its own. `None` for no columns, or for a cut wider than
-    /// [`MAX_CUT_MESSAGES`] messages — more slots than a rank's sid budget holds.
-    pub const fn cut_bytes_for(widest_cols: u32) -> Option<Payload> {
-        let cols = widest_cols.next_multiple_of(STICK_ELEMS) as u64;
-        match Payload::new(cols * <Fp16 as DataFormat>::WORD_LENGTH as u64 * WINDOW_ROWS as u64) {
-            Some(cut) if cut.message_count() <= MAX_CUT_MESSAGES => Some(cut),
+    /// ⭐ ONE REGION A FORWARD'S COLLECTIVES NEED: the widest send any of them can make
+    /// (`widest`, from [`SendRows::bytes`]), as a whole number of flits. It reads only each
+    /// collective's ROLE and COLUMNS (the forward's) and the row caps (the target's) — never a
+    /// bundle's own row count — so every bundle of one forward places the same window, as the
+    /// link's `XSEG` entries and the shared weight segment require. Every fragment of every
+    /// collective of the forward fits a region whole, so a collective is ONE fragment and its send
+    /// is a run of messages ([`Payload::messages`]), each landing in a slot of its own. `None` for
+    /// no bytes, or for a region wider than [`MAX_CUT_MESSAGES`] messages — more slots than a
+    /// rank's sid budget holds.
+    pub const fn region_for(widest: u64) -> Option<Payload> {
+        match Payload::new(widest.next_multiple_of(FLIT_BYTES)) {
+            Some(region) if region.message_count() <= MAX_CUT_MESSAGES => Some(region),
             _ => None,
         }
+    }
+}
+
+/// ⭐ HOW MANY ROWS A COLLECTIVE CAN HAND ITS SEND, by the role of the value it exchanges — the law
+/// the receive window is sized by ([`RecvWindow::region_for`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendRows {
+    /// A value every row of a prompt chunk carries: up to [`WINDOW_ROWS`] rows.
+    Chunk,
+    /// The gather of the drawn result's logits. A prompt chunk folds its result to the one row it
+    /// draws from (`subtile_ir::fold_gathered_tail`), so only a decode step hands it more rows than
+    /// one — at most its batch, [`PagedKvPool::WIDEST_BATCH_RUNG`].
+    ///
+    /// [`PagedKvPool::WIDEST_BATCH_RUNG`]: crate::sdsc_abstract::PagedKvPool::WIDEST_BATCH_RUNG
+    ResultGather,
+}
+
+impl SendRows {
+    /// The most rows a send in this role carries.
+    pub const fn cap(self) -> u32 {
+        match self {
+            Self::Chunk => WINDOW_ROWS,
+            Self::ResultGather => crate::sdsc_abstract::PagedKvPool::WIDEST_BATCH_RUNG,
+        }
+    }
+
+    /// The most bytes a send in this role carries for a `cols`-wide fp16 operand, stick-rounded.
+    pub const fn bytes(self, cols: u32) -> u64 {
+        self.cap() as u64
+            * cols.next_multiple_of(STICK_ELEMS) as u64
+            * <Fp16 as DataFormat>::WORD_LENGTH as u64
     }
 }
 
@@ -875,7 +909,7 @@ mod tests {
     #[test]
     fn a_windows_slots_tile_its_cuts() {
         let two = TpWorld::of::<2>();
-        let region = Payload::new(2 * RDMA_MESSAGE_CAP_BYTES + FLIT_BYTES).unwrap();
+        let region = Payload::new(RDMA_MESSAGE_CAP_BYTES + FLIT_BYTES).unwrap();
         let w = RecvWindow::new(1 << 20, region, two).unwrap();
         let only = PeerRegion::of_world(two).collect::<Vec<_>>();
         assert_eq!(only.len(), 1);
@@ -889,10 +923,8 @@ mod tests {
             [
                 (0, 0, at(0, 0)),
                 (0, 1, at(0, 1)),
-                (0, 2, at(0, 2)),
                 (1, 0, at(1, 0)),
                 (1, 1, at(1, 1)),
-                (1, 2, at(1, 2)),
             ]
         );
         assert_eq!(w.size(), WINDOW_CUTS as u64 * region.get());
@@ -901,7 +933,30 @@ mod tests {
         let past = Payload::new(widest.get() + FLIT_BYTES).unwrap();
         assert!(RecvWindow::new(0, past, two).is_none());
         assert!(RecvWindow::new(0, widest, TpWorld::of::<1>()).is_none());
-        assert!(RecvWindow::cut_bytes_for(1 << 20).is_none());
+        assert_eq!(RecvWindow::region_for(widest.get()), Some(widest));
+        assert_eq!(RecvWindow::region_for(widest.get() + 1), None);
+        assert_eq!(RecvWindow::region_for(0), None);
+    }
+
+    /// A send's rows by its role: a prompt chunk's value takes the window's rows, the drawn result's
+    /// gather a decode batch's. granite-2b's widest send is a 512-row chunk of its 2048-wide hidden,
+    /// one message, and its two-rank logits block (24640 columns) at a batch is narrower still.
+    #[test]
+    fn a_send_carries_the_rows_its_role_hands_it() {
+        assert_eq!(SendRows::Chunk.cap(), WINDOW_ROWS);
+        assert_eq!(
+            SendRows::ResultGather.cap(),
+            crate::sdsc_abstract::PagedKvPool::WIDEST_BATCH_RUNG
+        );
+        let hidden = SendRows::Chunk.bytes(2048);
+        assert_eq!(hidden, 512 * 2048 * 2);
+        assert!(SendRows::ResultGather.bytes(24640) < hidden);
+        assert_eq!(
+            RecvWindow::region_for(hidden).map(|r| r.message_count()),
+            Some(1)
+        );
+        // The old law — the window's rows of the logits block — is past the budget.
+        assert_eq!(RecvWindow::region_for(SendRows::Chunk.bytes(24640)), None);
     }
 
     /// Each rank hears its peers in rank order, its own rank left out: rank `s` lands in region
