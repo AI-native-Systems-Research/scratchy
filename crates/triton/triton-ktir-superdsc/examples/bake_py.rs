@@ -180,6 +180,12 @@ fn main() {
             Ok(l) => l,
             Err(e) => refused!(e.stage, e.message),
         };
+        // A paged kernel's cache is allocated row-outermost, as the production dump allocates it.
+        if matches!(program, Program::PagedAttn | Program::PagedKvWrite)
+            && let Err(e) = triton_ktir_superdsc::layout::allocate_paged_cache(&node, &layout)
+        {
+            refused!("cache", e);
+        }
         match triton_ktir_superdsc::emit_whole(&node, Some(&layout)) {
             Err(e) => refused!(e.stage, e.message),
             Ok(ops) => {

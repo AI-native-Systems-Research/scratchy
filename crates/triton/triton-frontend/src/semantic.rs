@@ -1451,12 +1451,72 @@ impl Semantic {
         x_offsets: ValueId,
         y_offset: ValueId,
     ) -> Result<ValueId> {
+        let rows = self.indirect_rows(desc, x_offsets, Indirect::Gather)?;
+        let ty = Type::Tensor(vec![rows.count, rows.cols], std::rc::Rc::new(rows.elem));
+        Ok(self.emit1(
+            "tt.descriptor_gather",
+            &[desc, x_offsets, y_offset],
+            ty,
+            &[],
+        ))
+    }
+
+    /// `desc.scatter(value, x_offsets, y_offset)` -> `tt.descriptor_scatter`
+    /// (`semantic.py`'s `descriptor_scatter`), the gather's write twin: row `i` of `value`
+    /// lands at descriptor row `x_offsets[i]`, columns `[y_offset, y_offset + block[1])`.
+    ///
+    /// Triton guards it with the gather's own five asserts, spelled `scatter` (one helper, so
+    /// the two cannot drift), and the op verifier (`verifyGatherScatterOp`) adds what the
+    /// gather states through its RESULT type: the value is exactly `[x_offsets.shape[0],
+    /// block[1]]` of the descriptor's element type. Unlike `descriptor_store` there is no
+    /// implicit cast -- `semantic.py` passes `value.handle` through untouched -- so a value of
+    /// another element type is refused rather than converted.
+    ///
+    /// The operands are MLIR's `$desc[$x_offsets, $y_offset], $src`, in that order.
+    pub fn descriptor_scatter(
+        &mut self,
+        desc: ValueId,
+        value: ValueId,
+        x_offsets: ValueId,
+        y_offset: ValueId,
+    ) -> Result<()> {
+        let rows = self.indirect_rows(desc, x_offsets, Indirect::Scatter)?;
+        let vty = self.ty(value).clone();
+        if vty.shape() != [rows.count, rows.cols] || *vty.scalar() != rows.elem {
+            return Err(Error::new(
+                format!(
+                    "`.scatter`'s value must be [{}, {}] x {} -- one row of the descriptor's \
+                     block per index -- but it is {vty}",
+                    rows.count, rows.cols, rows.elem
+                ),
+                0,
+                0,
+            ));
+        }
+        self.emit0(
+            "tt.descriptor_scatter",
+            &[desc, x_offsets, y_offset, value],
+            &[],
+        );
+        Ok(())
+    }
+
+    /// The five asserts `descriptor_gather` and `descriptor_scatter` share (`semantic.py`), in
+    /// Triton's own order, answering the indexed rows' extent: `count` rows (the index vector's
+    /// length) of `cols` elements of `elem`.
+    fn indirect_rows(
+        &self,
+        desc: ValueId,
+        x_offsets: ValueId,
+        op: Indirect,
+    ) -> Result<IndirectRows> {
+        let name = op.name();
         let dty = self.ty(desc);
         let (block, elem) = match &dty {
             Type::TensorDesc(s, e) => (s.clone(), (**e).clone()),
             other => {
                 return Err(Error::new(
-                    format!("`.gather` needs a tensor descriptor, got {other}"),
+                    format!("`.{name}` needs a tensor descriptor, got {other}"),
                     0,
                     0,
                 ));
@@ -1465,7 +1525,7 @@ impl Semantic {
         if block.len() != 2 {
             return Err(Error::new(
                 format!(
-                    "`.gather` needs a 2D descriptor, but this one has rank {} (block [{}])",
+                    "`.{name}` needs a 2D descriptor, but this one has rank {} (block [{}])",
                     block.len(),
                     join(&block)
                 ),
@@ -1476,8 +1536,8 @@ impl Semantic {
         if block[0] != 1 {
             return Err(Error::new(
                 format!(
-                    "`.gather`'s descriptor block must have EXACTLY ONE ROW, but this one is \
-                     [{}]. The gathered row count comes from the index vector, so a \
+                    "`.{name}`'s descriptor block must have EXACTLY ONE ROW, but this one is \
+                     [{}]. The {name}ed row count comes from the index vector, so a \
                      multi-row block has no meaning -- make the descriptor's block \
                      [1, cols].",
                     join(&block)
@@ -1491,7 +1551,7 @@ impl Semantic {
         if xshape.len() != 1 {
             return Err(Error::new(
                 format!(
-                    "`.gather`'s index vector must be 1D, got [{}]",
+                    "`.{name}`'s index vector must be 1D, got [{}]",
                     join(&xshape)
                 ),
                 0,
@@ -1502,7 +1562,7 @@ impl Semantic {
             Type::Int(16, _) | Type::Int(32, _) => {}
             other => {
                 return Err(Error::new(
-                    format!("`.gather`'s index vector must have dtype int16 or int32, got {other}"),
+                    format!("`.{name}`'s index vector must have dtype int16 or int32, got {other}"),
                     0,
                     0,
                 ));
@@ -1511,8 +1571,8 @@ impl Semantic {
         if xshape[0] < 8 {
             return Err(Error::new(
                 format!(
-                    "`.gather` needs at least 8 indices, got {}. Triton asserts this \
-                     (`descriptor gather must have at least 8 rows`).",
+                    "`.{name}` needs at least 8 indices, got {}. Triton asserts this \
+                     (`descriptor {name} must have at least 8 rows`).",
                     xshape[0]
                 ),
                 0,
@@ -1527,7 +1587,7 @@ impl Semantic {
             Type::Int(b, _) => *b,
             other => {
                 return Err(Error::new(
-                    format!("`.gather` on a descriptor of {other} has no defined width"),
+                    format!("`.{name}` on a descriptor of {other} has no defined width"),
                     0,
                     0,
                 ));
@@ -1537,7 +1597,7 @@ impl Semantic {
         if block[1] < min_cols {
             return Err(Error::new(
                 format!(
-                    "`.gather` of {elem} needs at least {min_cols} columns, but the \
+                    "`.{name}` of {elem} needs at least {min_cols} columns, but the \
                      descriptor block is [{}]",
                     join(&block)
                 ),
@@ -1545,13 +1605,11 @@ impl Semantic {
                 0,
             ));
         }
-        let ty = Type::Tensor(vec![xshape[0], block[1]], std::rc::Rc::new(elem));
-        Ok(self.emit1(
-            "tt.descriptor_gather",
-            &[desc, x_offsets, y_offset],
-            ty,
-            &[],
-        ))
+        Ok(IndirectRows {
+            count: xshape[0],
+            cols: block[1],
+            elem,
+        })
     }
 
     /// `desc.store(offsets, value)` -> `tt.descriptor_store`.
@@ -2097,6 +2155,31 @@ pub enum Bitwise {
     Xor,
     Shl,
     Shr,
+}
+
+/// Which indirect access a descriptor's row checks are for: the read or the write through an
+/// index vector. Its spelling is the Python method's, which is what every refusal names.
+#[derive(Clone, Copy)]
+enum Indirect {
+    Gather,
+    Scatter,
+}
+
+impl Indirect {
+    fn name(self) -> &'static str {
+        match self {
+            Indirect::Gather => "gather",
+            Indirect::Scatter => "scatter",
+        }
+    }
+}
+
+/// The rows an indirect access moves: `count` (the index vector's length) of `cols` elements
+/// of `elem` (the descriptor block's width and element type).
+struct IndirectRows {
+    count: i64,
+    cols: i64,
+    elem: Type,
 }
 
 fn join(xs: &[i64]) -> String {

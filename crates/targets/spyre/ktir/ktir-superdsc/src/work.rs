@@ -40,6 +40,17 @@ pub fn core_split(size: u32, max_cores: u32) -> u32 {
     1
 }
 
+/// The cores a gather or scatter of `entries` index entries divides over: the most, at most
+/// `max_cores`, that split the entries evenly into runs each dividing `stick` (the entries one index
+/// register holds) — so no core's run straddles two sticks of the table
+/// (`emit::index_stick_starts`). At most `stick` entries it is [`core_split`]: one entry a core.
+/// `None` when no division does (more entries than `max_cores` sticks).
+pub fn index_core_split(entries: u32, max_cores: u32, stick: u32) -> Option<u32> {
+    (1..=max_cores.min(entries.max(1)))
+        .rev()
+        .find(|&c| entries.is_multiple_of(c) && stick.is_multiple_of(entries / c))
+}
+
 /// ⭐⭐⭐ THE ONE-ROW MATMUL'S CORE FILL — `(out, in)` cores for a matmul whose `mb` is one row, both in
 /// WHOLE STICKS of their own axis: the most cores that fit `max_cores`, and among those the widest
 /// `out` (so the reduction fan-in is the smallest that fills the machine).
@@ -534,6 +545,26 @@ pub enum EwDivision {
     /// outright by a decode batch chunk's `esub` and `exp`. Their shared core-local `cesub` is sized under
     /// it, so both ops keep it (`attn`'s `ChunkBufs::sm_division_of`).
     SticksFirst,
+    /// ⭐ `n` ROW GROUPS, one a core ([`row_groups`]) — the division a walk's scratchpad plan chooses
+    /// ([`crate::emit::lx_plan`]) when its ops divide as its batched contractions do: torch-spyre's
+    /// decode trip runs every op on one core per kv head, the head's query rows together, so each
+    /// intermediate stays in that core's LX from the op that writes it to the ops that read it.
+    Groups(u32),
+}
+
+/// [`EwDivision::Groups`]: `mb` split into `n` groups of `mb / n` rows, one a core — or, past the core
+/// budget, as many cores as divide `n` evenly ([`core_split`]), each holding that many consecutive
+/// groups (a decode batch's `J · B · KV` blocks over 32 cores, 8 blocks a core). [`distribute_cores`]
+/// for an op whose rows the groups do not divide.
+pub fn row_groups(dims: &[ItDim], max_cores: u32, n: u32) -> BTreeMap<&'static str, u32> {
+    let cores = core_split(n, max_cores);
+    match dims
+        .iter()
+        .find(|d| d.name == "mb" && !d.is_reduction && !d.is_stick)
+    {
+        Some(mb) if cores > 1 && mb.size.is_multiple_of(n) => BTreeMap::from([(mb.name, cores)]),
+        _ => distribute_cores(dims, max_cores),
+    }
 }
 
 impl EwDivision {
@@ -556,10 +587,11 @@ impl EwDivision {
     /// The splitter this division names, in the shape [`WorkPlan::divide`] takes. [`Self::Law`] is not a
     /// splitter until it is resolved, so it names the rows-first one — the law's answer when there is
     /// nothing to resolve it on — and every door resolves before asking.
-    pub fn splitter(self) -> fn(&[ItDim], u32) -> BTreeMap<&'static str, u32> {
-        match self {
-            EwDivision::Law | EwDivision::RowsFirst => distribute_cores,
-            EwDivision::SticksFirst => distribute_cores_sticks_first,
+    pub fn splitter(self) -> impl Fn(&[ItDim], u32) -> BTreeMap<&'static str, u32> {
+        move |dims, max_cores| match self {
+            EwDivision::Law | EwDivision::RowsFirst => distribute_cores(dims, max_cores),
+            EwDivision::SticksFirst => distribute_cores_sticks_first(dims, max_cores),
+            EwDivision::Groups(n) => row_groups(dims, max_cores, n),
         }
     }
 }
@@ -847,6 +879,68 @@ pub fn distribute_cores_sticks_first(
         }
     }
     splits
+}
+
+/// ⭐⭐⭐ A ROW-SPLIT OP'S CORES, SPENT ALONG ITS LAYOUT — the outer of its two row dims first, and
+/// the inner one only once every core holds ONE of the outer.
+///
+/// `rows` is the op's two row dims in its tensors' layout order, outermost first (`["y", "mb"]` for
+/// a `[y, mb, out]` spray, `["mb", "y"]` for `[mb, y, out]`). In this frame a core walks its own
+/// slice as if the slice were the whole tensor: it steps the outer dim by the INNER dim's per-core
+/// extent, not by the tensor's. So a core that holds several of the outer dim must hold ALL of the
+/// inner one, or each of its outer steps lands a fraction of a block short and the cores' writes
+/// pile onto one another. MEASURED on the card: granite-3.1-2b's prompt walk added its `[21, 64]`
+/// mask over `[y = 32, mb = 21]` with `mb` split 21 ways, and the op wrote 52 = 21 + 32 − 1 of its
+/// 672 sticks (each core 32 consecutive sticks from its own row), so the masked slots kept a zero
+/// score and the prompt's softmax came out uniform — the same shape as the flat row-major
+/// `nz=3968` row-mixing [`distribute_cores`] notes. (A stick-major `[mb, out]` op is not this
+/// frame: its out-sticks step at the tensor's row count with `mb` split, card-proven by every
+/// prefill rmsnorm.)
+///
+/// The outer dim takes [`core_split`]'s largest divisor within the budget, and the inner dim the
+/// rest only when that split is the outer dim's whole extent; the stick dim is never split (a
+/// row-split op is one stick wide).
+pub fn distribute_cores_layout_first(
+    rows: [&'static str; 2],
+) -> impl Fn(&[ItDim], u32) -> BTreeMap<&'static str, u32> {
+    move |dims: &[ItDim], max_cores: u32| {
+        let mut splits = BTreeMap::new();
+        let extent = |name: &str| {
+            dims.iter()
+                .find(|d| d.name == name && !d.is_reduction && !d.is_stick)
+                .map(|d| d.size)
+        };
+        let (Some(outer), Some(inner)) = (extent(rows[0]), extent(rows[1])) else {
+            return splits;
+        };
+        let so = core_split(outer, max_cores);
+        if so > 1 {
+            splits.insert(rows[0], so);
+        }
+        if so == outer {
+            let si = core_split(inner, max_cores / so.max(1));
+            if si > 1 {
+                splits.insert(rows[1], si);
+            }
+        }
+        splits
+    }
+}
+
+/// The law [`distribute_cores_layout_first`] spends cores under, checked on a finished plan: a core
+/// that holds more than one of `rows[0]` (the outer row dim of the op's layout) holds all of
+/// `rows[1]`. `Err` names the per-core extents and the row-mixing they make.
+pub fn layout_walk_is_whole(plan: &WorkPlan, rows: [&'static str; 2]) -> Result<(), String> {
+    let (outer, inner) = (plan.per_core_extent(rows[0]), plan.split_of(rows[1]));
+    if outer > 1 && inner > 1 {
+        return Err(format!(
+            "each core holds {outer} of `{}` and a {inner}-way split of `{}` inside it — a core steps \
+             `{}` by its own slice of `{}`, not the tensor's, so its blocks land short and the cores' \
+             writes overlap (the row-mixing `distribute_cores_layout_first` exists to prevent)",
+            rows[0], rows[1], rows[0], rows[1]
+        ));
+    }
+    Ok(())
 }
 
 /// Per-core slice index along each split dim, for `coreIdToWkSlice_`. Cores are
@@ -1469,5 +1563,82 @@ mod kani_proofs {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_first_tests {
+    use super::{distribute_cores_layout_first, layout_walk_is_whole};
+    use crate::superdsc_opspec::{Df, ItDim, MAX_CORES, MaxCores, WorkPlan};
+
+    /// A row-split op's `[mb, out, y]` dims at one stick.
+    fn dims(mb: u32, y: u32) -> Vec<ItDim> {
+        let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
+            name,
+            size,
+            is_reduction: false,
+            is_stick,
+            df: Df::Fp16,
+        };
+        vec![
+            dim("mb", mb, false),
+            dim("out", 64, true),
+            dim("y", y, false),
+        ]
+    }
+
+    /// ⭐⭐⭐ THE LAW, AT EVERY SHAPE: for both layouts, every spray count up to llama-70b's 64 query
+    /// heads (and past), and every row count up to the widest prompt chunk, the plan is a valid
+    /// `WorkPlan`, never splits the stick, and leaves no core walking its outer row dim over a split
+    /// inner one.
+    #[test]
+    fn a_row_split_plan_never_walks_its_outer_dim_over_a_split_inner_one() {
+        for rows in [["y", "mb"], ["mb", "y"]] {
+            for y in 1..=96 {
+                for mb in (1..=64).chain([71, 96, 128, 256, 512]) {
+                    let plan = WorkPlan::divide(
+                        &dims(mb, y),
+                        MaxCores::<MAX_CORES>,
+                        distribute_cores_layout_first(rows),
+                    )
+                    .unwrap_or_else(|e| panic!("{rows:?} y={y} mb={mb}: refused: {e}"));
+                    assert_eq!(plan.split_of("out"), 1, "{rows:?} y={y} mb={mb}: out split");
+                    layout_walk_is_whole(&plan, rows)
+                        .unwrap_or_else(|e| panic!("{rows:?} y={y} mb={mb}: {e}"));
+                }
+            }
+        }
+    }
+
+    /// The card's case: granite-3.1-2b's prompt walk adds its `[21, 64]` mask over `[y = 32,
+    /// mb = 21]`. One spray per core and the 21 rows whole, where the elementwise law had split
+    /// `mb` 21 ways under all 32 sprays (52 of 672 sticks written).
+    #[test]
+    fn the_prompt_mask_spray_takes_one_head_block_per_core() {
+        let divide = |mb: u32, y: u32| {
+            let plan = WorkPlan::divide(
+                &dims(mb, y),
+                MaxCores::<MAX_CORES>,
+                distribute_cores_layout_first(["y", "mb"]),
+            )
+            .unwrap_or_else(|e| panic!("y={y} mb={mb}: {e}"));
+            (plan.split_of("y"), plan.split_of("mb"))
+        };
+        assert_eq!(divide(21, 32), (32, 1));
+        // The J-slot merge's `[y = 4, mb = 64]`: one spray per core, so its rows split too.
+        assert_eq!(divide(64, 4), (4, 8));
+        // granite-4's 40 query heads: two sprays per core, the rows whole.
+        assert_eq!(divide(21, 40), (20, 1));
+    }
+
+    /// The elementwise law's division at the card's case is the one the check refuses — the
+    /// measured row-mixing, stated as a plan.
+    #[test]
+    fn the_rows_split_under_every_spray_is_refused() {
+        let plan = WorkPlan::divide(&dims(21, 32), MaxCores::<MAX_CORES>, |_, _| {
+            [("mb", 21)].into_iter().collect()
+        })
+        .expect("a 21-way row split is a valid plan");
+        assert!(layout_walk_is_whole(&plan, ["y", "mb"]).is_err());
     }
 }

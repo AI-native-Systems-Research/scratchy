@@ -1529,6 +1529,30 @@ impl<'a> CodeGen<'a> {
                     .map(Val::Ir)
                     .map_err(|e| Self::located(e, pos))
             }
+            // `desc.scatter(value, x_offsets, y_offset)` -- Triton's `tensor_descriptor.scatter`
+            // (`core.py`), the VALUE first, then the gather's own two arguments in the gather's
+            // own order, so the constant a literal `y_offset` produces lands immediately before
+            // the scatter, as it does before a gather.
+            "scatter" => {
+                let (Some(value), Some(x), Some(y)) = (args.first(), args.get(1), args.get(2))
+                else {
+                    return Err(Error::new(
+                        "`.scatter` needs a value, an index vector and a column offset",
+                        pos.line,
+                        pos.col,
+                    ));
+                };
+                let value = self
+                    .sem
+                    .to_tensor(value)
+                    .map_err(|e| Self::located(e, pos))?;
+                let x = self.sem.to_tensor(x).map_err(|e| Self::located(e, pos))?;
+                let y = self.make_scalar(y, Type::i32(), pos)?;
+                self.sem
+                    .descriptor_scatter(recv_id, value, x, y)
+                    .map_err(|e| Self::located(e, pos))?;
+                Ok(Val::None)
+            }
             "to" => {
                 let dt = match args.first() {
                     Some(Val::Dtype(t)) => t.clone(),
@@ -1982,14 +2006,17 @@ impl<'a> CodeGen<'a> {
         let (mangle_args, def_line, combiner, widen_to): (Vec<Val>, u32, &str, Option<Type>) =
             match which {
                 // max(input, axis, return_indices=False, return_indices_tie_break_left=True,
-                //     keep_dims=False)
-                "max" => {
+                //     keep_dims=False), and `min` (`standard.py:236`), its mirror through
+                // `_elementwise_min`.
+                "max" | "min" => {
                     let ri = kwv("return_indices").unwrap_or(Val::Bool(false));
                     if ri.as_int() != Some(0) {
                         return Err(Error::new(
-                            "tl.max(..., return_indices=True) is not lowered: it uses \
-                             `_reduce_with_indices` and a two-value combiner, and no fixture \
-                             uses it",
+                            format!(
+                                "tl.{which}(..., return_indices=True) is not lowered: it uses \
+                                 `_reduce_with_indices` and a two-value combiner, and no \
+                                 fixture uses it"
+                            ),
                             pos.line,
                             pos.col,
                         ));
@@ -2001,10 +2028,15 @@ impl<'a> CodeGen<'a> {
                         Type::Int(b, _) if *b < 32 => Some(Type::i32()),
                         _ => None,
                     };
+                    let (def_line, combiner) = if which == "max" {
+                        (177, "_elementwise_max")
+                    } else {
+                        (236, "_elementwise_min")
+                    };
                     (
                         vec![Val::Int(axis_i as i128), ri, tb, keep_dims.clone()],
-                        177,
-                        "_elementwise_max",
+                        def_line,
+                        combiner,
                         widen,
                     )
                 }
@@ -2188,10 +2220,10 @@ impl<'a> CodeGen<'a> {
         if self.generated.contains(&symbol) {
             return Ok(symbol);
         }
-        let def_line = if which == "_elementwise_max" {
-            169
-        } else {
-            262
+        let def_line = match which {
+            "_elementwise_max" => 169,
+            "_elementwise_min" => 228,
+            _ => 262,
         };
         let std_py: std::rc::Rc<str> = std::rc::Rc::from(STANDARD_PY);
         let func_loc = Loc::File {
@@ -2213,6 +2245,10 @@ impl<'a> CodeGen<'a> {
             "_elementwise_max" => self
                 .sem
                 .max_min(&Val::Ir(a), &Val::Ir(b), true)
+                .map_err(|e| Self::located(e, pos))?,
+            "_elementwise_min" => self
+                .sem
+                .max_min(&Val::Ir(a), &Val::Ir(b), false)
                 .map_err(|e| Self::located(e, pos))?,
             _ => self
                 .sem
@@ -2576,6 +2612,43 @@ impl<'a> CodeGen<'a> {
                     .map(Val::Ir)
                     .map_err(|e| Self::located(e, pos))
             }
+            // `tl.trans(input, *dims)` -> `tt.trans` with `dims` as its `order` (upstream
+            // `semantic.permute`). The dims arrive as one tuple or as positional ints; with none,
+            // a rank-2 tensor swaps its two axes, as upstream's default does.
+            "trans" => {
+                let x = self.ir_arg(&get(0, "input"), "tl.trans", pos)?;
+                let rank = self.sem.ty(x).shape().len();
+                let dims: Vec<Val> = match &args[1.min(args.len())..] {
+                    [Val::Seq(d)] => d.clone(),
+                    rest => rest.to_vec(),
+                };
+                let order: Vec<i64> = if dims.is_empty() && rank == 2 {
+                    vec![1, 0]
+                } else {
+                    let mut sorted: Vec<i64> = dims
+                        .iter()
+                        .map(|d| d.as_int().and_then(|v| i64::try_from(v).ok()))
+                        .collect::<Option<Vec<i64>>>()
+                        .unwrap_or_default();
+                    let order = sorted.clone();
+                    sorted.sort_unstable();
+                    if sorted != (0..rank as i64).collect::<Vec<_>>() {
+                        return Err(Error::new(
+                            format!(
+                                "tl.trans needs a compile-time permutation of the {rank} axes of \
+                                 its input"
+                            ),
+                            pos.line,
+                            pos.col,
+                        ));
+                    }
+                    order
+                };
+                self.sem
+                    .trans(x, &order)
+                    .map(Val::Ir)
+                    .map_err(|e| Self::located(e, pos))
+            }
             "arange" => {
                 let a = get(0, "start")
                     .and_then(|v| v.as_int())
@@ -2687,7 +2760,7 @@ impl<'a> CodeGen<'a> {
             // `tl.max` / `tl.sum` are `@jit` helpers in `standard.py`, so each becomes a call
             // to a generated function whose body is a `tt.reduce` with a combiner region that
             // itself calls another generated helper.
-            "max" | "sum" => {
+            "max" | "min" | "sum" => {
                 let input = self.ir_arg(&get(0, "input"), &format!("tl.{name}"), pos)?;
                 let axis = get(1, "axis");
                 self.call_std_reduction(name, input, axis, kw, pos)

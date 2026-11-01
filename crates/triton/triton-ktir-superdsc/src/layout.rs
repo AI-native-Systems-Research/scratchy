@@ -68,13 +68,70 @@ const GRANULE: u64 = 128;
 /// up to, not what the tensor is.
 const SCALE_BYTES: u64 = 2;
 
+/// ⭐ THE REGISTRY CONSTANTS A PROGRAM READS — every value its lowering looks up in
+/// `BundleLayout::scalarmul_scales` (a bound `[1,1]` const): the program's own scalars
+/// ([`scales_for_program_shape`]) and, for a walk, its carried buffers' seeds. What a one-kernel
+/// layout's registry holds ([`for_regions`]), and what a bundle's registry must hold for every
+/// program it bakes.
+pub fn registry_constants(node: &KtirNode) -> Result<Vec<f32>, Error> {
+    let flat = ktir_superdsc::emit::loop_fold::flatten(node).map_err(|e| Error {
+        stage: "layout",
+        message: format!("{e:?}"),
+    })?;
+    registry_at_trip0(flat.as_ref().map_or(node, |f| &f.node), flat.as_ref())
+}
+
+/// [`registry_constants`] of the program at trip 0, its walk `flat` when it walks.
+fn registry_at_trip0(
+    node: &KtirNode,
+    flat: Option<&ktir_superdsc::emit::loop_fold::Flattened>,
+) -> Result<Vec<f32>, Error> {
+    let mut out = scales_for_program_shape(node.program, &node.func)?;
+    for v in flat.iter().flat_map(|f| f.fold.seeds()) {
+        if !out.iter().any(|x| x.to_bits() == v.to_bits()) {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
 /// The layout for one node, and the refusal when the program cannot have one.
 ///
 /// Calls [`regions`] itself so the driver needs nothing but the node. A `regions` failure is
 /// reported under the SAME stage label [`crate::emit_node`] uses for it, so adding a layout does not
 /// move where a program that never had a readable parameter list is refused.
+/// Where spyre-inference's paged kernels take the KV cache: `k_pages`/`v_pages` (the write's
+/// `k_rows`/`v_rows`) are parameters 2 and 3 of every one, the positions the splice's `lower_attn`
+/// and `lower_kv_write` bind the model's cache at.
+const PAGED_CACHE_PARAMS: [usize; 2] = [2, 3];
+
+/// ⭐ THE KV CACHE'S ALLOCATION IN A ONE-KERNEL BUNDLE — spyre-inference's `allocate_pages`: the
+/// cache a paged kernel reads or writes is allocated row-outermost (`head_major_kv_layout`,
+/// [`ktir_superdsc::placement::BundleLayout::allocate_row_outermost`]). A model bundle's cache is
+/// allocated where the bake places it (`compute_bundle_layout`).
+pub fn allocate_paged_cache(node: &KtirNode, layout: &BundleLayout) -> Result<(), String> {
+    for i in PAGED_CACHE_PARAMS {
+        let Some(b) = node.bindings.get(i) else {
+            return Err(format!(
+                "{}: a paged kernel binds {} buffers, so no cache at parameter {i}",
+                node.func.name,
+                node.bindings.len()
+            ));
+        };
+        layout
+            .allocate_row_outermost(b.get())
+            .map_err(|e| format!("{}: {}", node.func.name, e.0))?;
+    }
+    Ok(())
+}
+
 pub fn for_node(node: &KtirNode) -> Result<BundleLayout, Error> {
-    let r = regions(node).map_err(|e| Error {
+    // A walking program's windows are its trip-0 windows (`loop_fold::flatten`).
+    let flat = ktir_superdsc::emit::loop_fold::flatten(node).map_err(|e| Error {
+        stage: "regions",
+        message: format!("{e:?}"),
+    })?;
+    let r = regions(flat.as_ref().map_or(node, |f| &f.node)).map_err(|e| Error {
         stage: "regions",
         message: format!("{e:?}"),
     })?;
@@ -85,6 +142,13 @@ pub fn for_node(node: &KtirNode) -> Result<BundleLayout, Error> {
 /// node's `regions` are read ONCE and the layout cannot be built from a different reading than the
 /// body gets.
 pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error> {
+    // ⭐ A WALKING PROGRAM IS PLACED AT TRIP 0 — the reading its lowering takes
+    // (`loop_fold::flatten`) — and its carried buffers' seeds are registry constants too.
+    let flat = ktir_superdsc::emit::loop_fold::flatten(node).map_err(|e| Error {
+        stage: "layout",
+        message: format!("{e:?}"),
+    })?;
+    let node = flat.as_ref().map_or(node, |f| &f.node);
     let name = node.func.name;
     // ⛔ REFUSE BEFORE PLACING ANYTHING, because a body that names a device constant this module
     // did not place does not get a diagnostic — it gets `resolve_seg_base`'s panic.
@@ -123,7 +187,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         });
     }
 
-    let scalarmul_scales = scales_for_program_shape(node.program, &node.func)?;
+    let scalarmul_scales = registry_at_trip0(node, flat.as_ref())?;
 
     // WHICH PARAMETERS ARE GATHER INDEX VECTORS, read off the program by the SAME function family
     // the lowering body reads them with — so the placement and the descriptor cannot disagree about
@@ -163,6 +227,13 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         }
     }
     let index_tids: std::collections::BTreeSet<u32> = gathers.iter().map(|g| g.index_tid).collect();
+    // ⭐ A CHAINED INDEX'S TABLE IS HELD AT THE CARD'S RUN PITCH — each position's run of `scale`
+    // words at `INDEX_RUN_WORDS` words (`index_run_gather` copies that much per position), so the
+    // table is `positions × INDEX_RUN_WORDS` words on the card, not the program's packed run.
+    let chained: std::collections::BTreeMap<u32, u32> = gathers
+        .iter()
+        .filter_map(|g| g.via.map(|c| (g.index_tid, c.scale)))
+        .collect();
 
     // ⭐⭐⭐ THE PARAMETERS A CONVERT DOOR SWEEPS (the β ruling, front-b-noise, auditor
     // 2026-10-27) — reserved at the DEVICE width below, not the logical footprint. The
@@ -309,18 +380,34 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // `scalarmul_scale_tid(i)` and a rung-3 scale at its own parameter tid, which is
         // what `scalarmul_bound` passes `split_out_excluding` as a skip tid so the region
         // never counts as tensor arity.
-        let is_bound_scale = reg.v_rows == 1 && reg.v_cols == 1;
+        // An int32 `[1,1]` view (a one-block walk's page table, read at its one entry) is an
+        // index, not a launcher-bound fp16 scalar: it keeps its stick.
+        let is_bound_scale = reg.v_rows == 1 && reg.v_cols == 1 && df == Df::Fp16;
         // ⭐⭐⭐ β FIRST, BEFORE THE BOUND-SCALE ARM — a `[1,1]` parameter a convert sweeps
         // (the sampler's gate at the b1 rung) is NOT a launcher-bound fp16 const: the door
         // addresses it at the 64-element device width, so the 2-B `SCALE_BYTES` placement is
         // the measured over-run (256 B against 2 B). Every OTHER `[1,1]` parameter keeps the
         // bound-scale size — its readers are broadcasts, granule-guarded at one 128-B read.
-        let size = if convert_swept.contains(&reg.tid) {
+        let size = if let Some(&scale) = chained.get(&reg.tid) {
+            let words = reg.v_rows as u64 * reg.v_cols as u64;
+            words.div_ceil(scale as u64)
+                * ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64
+                * df.word_length() as u64
+        } else if convert_swept.contains(&reg.tid) {
             reg.v_rows as u64
                 * DeviceWidth::for_convert(reg.v_cols).get() as u64
                 * df.word_length() as u64
         } else if is_bound_scale {
             SCALE_BYTES
+        } else if matches!(node.program, Program::PagedAttn) && index_tids.contains(&reg.tid) {
+            // ⭐ A PAGED PROGRAM'S GATHER INDEX, AT LEAST THE INT32 OPS' DEVICE WIDTH: a page past
+            // dxp's entry bound (head dim 128) is gathered in pieces through its index doubled by
+            // `addi32toi32`, which reads `INDEX_RUN_WORDS` words — within a walk trip's card pitch
+            // where the bake places the table (`PagedStep::card_placements`), and here as wide.
+            synth_footprint_bytes(&[reg.v_rows, reg.v_cols], df).max(
+                u64::from(ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS)
+                    * df.word_length() as u64,
+            )
         } else {
             synth_footprint_bytes(&[reg.v_rows, reg.v_cols], df)
         };
@@ -374,6 +461,22 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
             tid,
             SegRole::Activation,
             SCALE_BYTES,
+            &mut placements,
+            &mut segment_bytes,
+        )?;
+    }
+
+    // ── THE CHAINED INDEX'S INT32 ZERO ──────────────────────────────────────────────────────────
+    // A chained index copies its run against the host-staged int32 zero stick
+    // (`PAGED_INT32_ZERO_TID`, `addi32toi32(zero, run)`), which the door reads by its reserved tid —
+    // placed, as the bake places it (`PagedStep::card_placements`), in the segment neither a walk's
+    // relaunch nor a layer's launch shifts.
+    if !chained.is_empty() {
+        pack(
+            name,
+            ktir_superdsc::reserved_tids::PAGED_INT32_ZERO_TID,
+            SegRole::Intermediate,
+            u64::from(ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS) * 4,
             &mut placements,
             &mut segment_bytes,
         )?;
@@ -600,7 +703,6 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         weight_scale_folds: Vec::new(),
         // No head-major o_proj copies: the restructure is minted from a spyre bundle's
         // attention→o_proj dataflow, and one Triton kernel's parameter list is not that graph.
-        weight_copies: Vec::new(),
         // The rope-P class set, filled where P itself is placed (see the Rope arm above). `drive_rope`
         // resolves this rope's `p_tid` off it — the same registry the consumer ladder's door resolves
         // through, so the two ladders cannot disagree about which P table a class reads.
@@ -612,6 +714,11 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // No pinned-LX intermediates: the triton shim emits no rmsnorm-style scratchpad
         // tensors, so the per-core pin registry starts empty — same role as `synth` above.
         lx: Default::default(),
+        // No scratchpad plan yet, and no probe running: the plan is made per walking program, at
+        // its lowering (`ktir_superdsc::emit::lx_plan`), into the layout this returns.
+        lx_planned: Default::default(),
+        lx_probe: Default::default(),
+        lx_division: Default::default(),
         // The arrangement authority starts empty and every op declares into it — that is the point:
         // the FIRST op to address a tensor fixes its device layout and a later disagreement is a
         // build error. Pre-seeding it would pre-decide arrangements no descriptor has stated.
@@ -766,12 +873,6 @@ fn is_per_program_node(f: &IRFunction<'static>) -> bool {
 
 fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
     match p {
-        Program::Attn => Some(&[
-            "ATTN_MASK_TID",
-            "ATTN_CAUSAL_TID",
-            "IDENTITY_TID",
-            "kct_resident_tid(k)",
-        ]),
         // `Rope` is HERE and not above: its one reserved constant is placed by [`for_regions`],
         // from an extent the program states.
         Program::Rope
@@ -785,7 +886,13 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         // The sampler's tables (and its per-row noise and temperature operands) ride as
         // ORDINARY tensor operands (the node's own inputs, placed like every staged
         // buffer) — no reserved tid names one.
-        | Program::Sample => None,
+        | Program::Sample
+        // The paged attention's pools, page table and mask stack, and the paged write's rows, are
+        // all tensor PARAMETERS the host binds, each at the extent its own view states. Three of them
+        // are bound at the paged step's reserved tids (`PAGED_STEP_BASE`), but as parameters: no
+        // body names one.
+        | Program::PagedAttn
+        | Program::PagedKvWrite => None,
         // ⭐ NO ENTRY POINT ON THIS LADDER, SO NO CONSTANTS TO NAME. None of these programs has a
         // body this crate's door can reach — the splice's registry produces none of them (its
         // by-name refusals stop their SubOps at the producer), and the door itself refuses them by
@@ -967,7 +1074,26 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
         .iter()
         .flat_map(|c| c.consumed.iter().copied())
         .collect();
+    // (4) the splats the walk materializes as filled buffers — the same rule its operand
+    // resolution applies (`splat_fill_values`).
+    for v in W::splat_fill_values(f).map_err(|e| crate::Error {
+        stage: "layout",
+        message: e.message,
+    })? {
+        push(v, &mut out);
+    }
     for op in f.operations.iter() {
+        // (3) the constant side of a `min`/`max` against a splat — the walk's
+        // `ScalarBinary`, which reads its constant through the registry exactly as a scalar
+        // multiply reads its multiplier.
+        if matches!(
+            op.op_type,
+            ktir_core::opkind::OpKind::ArithMinnumf | ktir_core::opkind::OpKind::ArithMaxnumf
+        ) && let Some((v, _)) = W::splat_scale_of(f, op)
+        {
+            push(v, &mut out);
+            continue;
+        }
         if op.op_type != ktir_core::opkind::OpKind::ArithMulf {
             continue;
         }
@@ -1033,16 +1159,6 @@ fn scales_for(
         }
         // `scalarmul` resolves ONE value: `scale_slot(layout, program_scalarmul_scale(&k.func))`.
         Program::ScalarMul => L::program_scalarmul_scale(f).into_iter().collect(),
-        // `attn_at` resolves TWO — the score scale AND its square root, in that order:
-        // `scale_idx` on `scale_val`, then `sqrt_scale_idx` on `scale_val.sqrt()`, because
-        // "torch-spyre splits into sqrt_scale on both Q and K". `compute_bundle_layout` pushes the
-        // same pair for `SubOp::AttnDecode` (`push_scale(*scale)` then `push_scale(scale.sqrt())`).
-        // Unreachable today — `for_regions` refuses `Attn` at the reserved-const door above — but
-        // stated here so the registry is not a second place the pair could go missing.
-        Program::Attn => match L::program_score_scale(f) {
-            Some(v) => vec![v, v.sqrt()],
-            None => Vec::new(),
-        },
         // `rmsnorm_unit` resolves ONE value: its epsilon (`scale_slot` after
         // `program_rmsnorm_eps`) — no gain leg, so no offset.
         Program::RmsNormUnit => L::program_rmsnorm_eps(f).into_iter().collect(),
@@ -1070,6 +1186,10 @@ fn scales_for(
         // The sampler's tables are tensor operands, never `scalarmul_scales` lookups —
         // a value registered for it would occupy a slot nothing asks for.
         | Program::Sample
+        // The paged attention states its score scale as an immediate multiply and the paged
+        // write is a pure scatter; neither reads the registry.
+        | Program::PagedAttn
+        | Program::PagedKvWrite
         // `EmbedRowGather` and `ChainStage` are the spyre door's `#603` bodies (see the
         // same note at `reserved_consts_for`); on THIS ladder they are refused at both
         // the splice and the door, so there is no body to ask.
@@ -1227,6 +1347,7 @@ mod tests {
             mask: None,
             node_out_tid: None,
             minted: Default::default(),
+            lx_plan: Default::default(),
         };
 
         let layout = for_node(&node).expect("the two-ids program has a layout");

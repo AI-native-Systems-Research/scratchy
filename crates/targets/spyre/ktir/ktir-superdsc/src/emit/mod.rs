@@ -43,10 +43,14 @@ use std::collections::BTreeMap;
 /// main's `lower_matmul_node` arity-3 branch — the W8A8 fp8 matmul descriptors, reached from the
 /// facts the KTIR states. See its own header.
 pub mod ktir_matmul_fp8;
-/// KTIR → SuperDSC: `ibm/main`'s eight `lower_*_node` bodies with their input door changed. The two
-/// that cross a model-geometry const door ([`lower_ktir_to_superdsc::attn_at`],
-/// [`lower_ktir_to_superdsc::rope_at`]) are public generic entry points the CALLER instantiates.
+/// A PROGRAM THAT WALKS: one constant-trip `scf.for`, its body built once at trip 0 and relaunched
+/// per trip by the card (the paged attention's page walk).
+pub mod loop_fold;
+/// KTIR → SuperDSC: `ibm/main`'s `lower_*_node` bodies with their input door changed. The one that
+/// crosses a model-geometry const door ([`lower_ktir_to_superdsc::rope_at`]) is a public generic
+/// entry point the CALLER instantiates.
 pub mod lower_ktir_to_superdsc;
+pub mod lx_plan;
 /// THE WHOLE-FUNCTION DOOR — walk a multi-op KTIR program in program order and dispatch each
 /// compute op to the per-kind entry point that already lowers it. A producer that hands over a
 /// whole kernel (a Triton-derived `IRFunction` holding an MLP's two projections and its silu, or a
@@ -132,6 +136,17 @@ pub(crate) fn view_stick_layout(
         .iter()
         .position(|&d| d == view.stick)
         .unwrap_or(usize::MAX);
+    if view.frame == crate::superdsc_opspec::ViewFrame::FoldedRows
+        && let Some(&stick_ext) = host_size_us.get(stick_idx)
+    {
+        let rows: usize = host_size_us
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != stick_idx)
+            .map(|(_, &e)| e)
+            .product();
+        return crate::sdsc_abstract::StickLayout::row_blocked_df(rows.max(1), stick_ext, view.df);
+    }
     if view.row_blocked && !host_size_us.is_empty() {
         let feat: usize = host_size_us[1..].iter().product::<usize>().max(1);
         return crate::sdsc_abstract::StickLayout::row_blocked_df(host_size_us[0], feat, view.df);
@@ -395,6 +410,8 @@ fn per_core_addr(
                 walk::Corner::fp8_kernel_out(&corner),
                 walk::Fp8KernelKRows::of_device_extents(&host_size),
             )
+        } else if view.frame == crate::superdsc_opspec::ViewFrame::FoldedRows {
+            folded_rows_off(view, &extents, &corner, view_layout.lanes()) as u64
         } else {
             view_layout.off_view(&extents, &corner) as u64
         };
@@ -404,6 +421,80 @@ fn per_core_addr(
         addrs.push(base + off_elems * view.df.word_length() as u64);
     }
     Ok(addrs)
+}
+
+/// A [`crate::superdsc_opspec::ViewFrame::FoldedRows`] view's element offset of `corner`: its non-stick
+/// components folded, outermost first, into one row of the flat `[rows, stick]` tensor, and that
+/// row's stick-blocked address ([`crate::sdsc_abstract::dev_off_stk`]).
+fn folded_rows_off(
+    view: &ArgView<'_>,
+    extents: &crate::sdsc_abstract::DeviceExtents,
+    corner: &[usize],
+    lanes: usize,
+) -> usize {
+    let dims = extents.dims();
+    let stick_idx = view.layout.iter().position(|&d| d == view.stick);
+    let (mut row, mut rows) = (0usize, 1usize);
+    for (i, (&e, &c)) in dims.iter().zip(corner).enumerate() {
+        if Some(i) != stick_idx {
+            row = row * e + c;
+            rows *= e;
+        }
+    }
+    let (stick_ext, stick_corner) = stick_idx.map_or((lanes, 0), |i| (dims[i], corner[i]));
+    crate::sdsc_abstract::dev_off_stk(&[rows, stick_ext], 1, &[row, stick_corner], lanes)
+}
+
+/// ⭐ AN INDEX OF SEVERAL STICKS — each core's start at the stick holding its own entries. dxp loads
+/// a core's index register (the IBR) as ONE stick from that core's start, and reads the core's
+/// entries at `(slice · per-core entries · 4) % 128` inside it (`L3DlOpsScheduler.cpp`'s IBR
+/// schedule), so a table past one stick is read right only if every core starts at its entries'
+/// stick: torch-spyre's compiled query gather (512 entries, `mb` split 16) starts core `c`'s index
+/// `128·c` bytes in. A one-stick table keeps one start for every core, and a core whose entries
+/// straddle two sticks cannot be read from one: refused.
+fn index_stick_starts(
+    op_name: &str,
+    mut starts: Vec<u64>,
+    plan: &WorkPlan,
+    pins: &[(&'static str, crate::superdsc_opspec::PageExtent)],
+    wk_slice: &BTreeMap<String, BTreeMap<&'static str, crate::superdsc_opspec::SliceIndex>>,
+) -> Result<Vec<u64>, SuperDscError> {
+    let stick = u64::from(<crate::superdsc_opspec::SenUint32 as DataFormat>::ELEMS_PER_STICK);
+    let entries = |positions: u32, page: crate::superdsc_opspec::PageExtent| {
+        u64::from(positions / page.get().max(1))
+    };
+    let total: u64 = pins
+        .iter()
+        .map(|&(d, page)| entries(plan.extent(d), page))
+        .product();
+    if total <= stick {
+        return Ok(starts);
+    }
+    let &[(d, page)] = pins else {
+        return Err(SuperDscError(format!(
+            "op '{op_name}': an index of {total} entries over {} paged dims — past one stick, a \
+             core's entries are found only along one entry dim",
+            pins.len()
+        )));
+    };
+    let per_core = entries(plan.per_core_extent(d), page);
+    if per_core == 0 || per_core > stick || !stick.is_multiple_of(per_core) {
+        return Err(SuperDscError(format!(
+            "op '{op_name}': {total} index entries, {per_core} a core — a core reads its entries \
+             from ONE {stick}-entry stick, so its run must divide the stick"
+        )));
+    }
+    let word = u64::from(<crate::superdsc_opspec::SenUint32 as DataFormat>::WORD_LENGTH);
+    for (c, s) in starts.iter_mut().enumerate() {
+        let idx = wk_slice
+            .get(&c.to_string())
+            .and_then(|m| m.get(d))
+            .copied()
+            .unwrap_or(crate::superdsc_opspec::SliceIndex::UNSPLIT);
+        let first = entries(plan.corner_elems(d, idx), page);
+        *s += first / stick * stick * word;
+    }
+    Ok(starts)
 }
 
 /// The `N_` iteration space for a shape-preserving ELEMENTWISE op over
@@ -494,6 +585,40 @@ fn pointwise_opspec(
 /// ([`In::y_broadcast`]): a `[mb, out]` source sprayed down the op's leading `y` dim carries
 /// `y = RedNonStick` there — the vendor's own reduced-dim law (`superdsc.py`'s
 /// `reduced_dims → scale = -1`), the same scale the on-card-proven pmask fusion uses.
+/// ⭐ WHERE A ROW SPRAY'S COPIES SIT AMONG THE OP'S ROWS — the order of the `y` dim in the op's
+/// row frame. `Outer`: the `[y, mb, out]` frame, `y` sprays of the `mb`-row source one after another
+/// (a LEADING-axis broadcast, the J-slot merge). `Inner`: the `[mb, y, out]` frame, each of the
+/// source's `mb` rows repeated `y` times in a row (a broadcast of the axis just before the stick —
+/// a decode batch's mask over its query-head group, `[J, B, KV, 1, block] -> [J, B, KV, G, block]`).
+/// One descriptor either way: the operand's `y` scale is the vendor's reduced-dim `-1`, and the
+/// order is the op's tensors' layout order (`["y", "mb", "out"]` or `["mb", "y", "out"]`), so the
+/// flat row `j·mb + b` or `b·y + j` is the stick-blocked row the mints reserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SprayOrder {
+    Outer,
+    Inner,
+}
+
+impl SprayOrder {
+    /// The op's tensors' layout order, outermost first — this emitter's own address frame.
+    pub(crate) const fn layout(self) -> [&'static str; 3] {
+        match self {
+            SprayOrder::Outer => ["y", "mb", "out"],
+            SprayOrder::Inner => ["mb", "y", "out"],
+        }
+    }
+
+    /// The same frame in the order dxp reads `layoutDimOrder_`: INNERMOST first, so the two row dims
+    /// swap (`TensorArg::with_device_order`). The stick dim is one stick here, so where it sits does not
+    /// move a byte.
+    pub(crate) const fn device_layout(self) -> [&'static str; 3] {
+        match self {
+            SprayOrder::Outer => ["mb", "y", "out"],
+            SprayOrder::Inner => ["y", "mb", "out"],
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct EwOperand<'a> {
     // Fields are PRIVATE and there are NO raw ctors: the ONLY way to build an EwOperand is `In::ew()`,
@@ -515,6 +640,8 @@ pub struct EwOperand<'a> {
     /// leading-axis `linalg.broadcast` over a multi-row source whose result is `[y, mb, ..]`),
     /// so the count is the broadcast's OWN stated leading extent — not a caller's pick.
     y_broadcast: u32,
+    /// Where the spray's copies sit ([`SprayOrder`]); read only when `y_broadcast > 1`.
+    y_order: SprayOrder,
     col_offset: u32,
     /// The [`crate::addr::ColWindow`] `col_offset` came from — set only by [`In::col_window`], so a
     /// stick-major presentation of a column window is admitted by type, never by testing the integer.
@@ -541,14 +668,17 @@ impl<'a> EwOperand<'a> {
         ]
     }
 
-    /// The SAME scales in Y-MAJOR order `[y, mb, out]` — the layout order the row-split mode's
-    /// op presents its tensors in (the `TensorArg` layout of the y-major frame, the same
-    /// `["y", "mb", "out"]` head-outermost spelling the batched matmul's walks use). A rotation
-    /// of [`scale`](Self::scale)'s `[mb, out, y]`, so the y-major builder reads one ordered
-    /// triple per operand instead of re-deriving it at its own call site.
-    pub(crate) fn scale_ymajor(&self) -> [Scale; 3] {
+    /// The SAME scales in the row-split mode's layout order ([`SprayOrder::layout`]): `[y, mb, out]`
+    /// for an outer spray (the same `["y", "mb", "out"]` head-outermost spelling the batched
+    /// matmul's walks use), `[mb, y, out]` for an inner one. A permutation of
+    /// [`scale`](Self::scale)'s `[mb, out, y]`, so the row-split builder reads one ordered triple
+    /// per operand instead of re-deriving it at its own call site.
+    pub(crate) fn scale_sprayed(&self, order: SprayOrder) -> [Scale; 3] {
         let s = self.scale();
-        [s[2], s[0], s[1]]
+        match order {
+            SprayOrder::Outer => [s[2], s[0], s[1]],
+            SprayOrder::Inner => [s[0], s[2], s[1]],
+        }
     }
 
     // Read-only accessors, `pub(crate)` so the TileIR→SdscOp bridge functions that read these
@@ -568,6 +698,10 @@ impl<'a> EwOperand<'a> {
     /// The row-split spray count — 0 when this operand is not a y-broadcast.
     pub(crate) fn y_broadcast(&self) -> u32 {
         self.y_broadcast
+    }
+    /// The row-split spray's order — meaningful only when [`Self::y_broadcast`] is above 1.
+    pub(crate) fn y_order(&self) -> SprayOrder {
+        self.y_order
     }
     pub(crate) fn col_offset(&self) -> u32 {
         self.col_offset
@@ -600,7 +734,14 @@ impl<'a> EwOperand<'a> {
         stick_lanes: u32,
     ) -> (u32, u32) {
         if self.y_broadcast > 1 {
-            return (rows / self.y_broadcast, stick_elems);
+            return (
+                rows / self.y_broadcast,
+                if self.out_broadcast {
+                    stick_lanes
+                } else {
+                    stick_elems
+                },
+            );
         }
         match (self.mb_broadcast, self.out_broadcast) {
             (true, true) => (1, stick_lanes),
@@ -1764,49 +1905,155 @@ fn core_local_reads_agree(
                  walks a different slice per trip, and the pin holds one"
             )));
         }
-        let plan = &op.iter;
-        let slice_bytes = v
-            .layout
-            .iter()
-            .map(|d| u64::from(plan.per_core_extent(d)))
-            .product::<u64>()
-            * u64::from(v.df.word_length());
+        let (slice_bytes, corners) = core_slices(op, v)?;
         let (_, pin_bytes) = l.lx_pin(name).unwrap_or_default();
-        if slice_bytes > pin_bytes {
+        let plane_bytes = match (v.offset_elems, stick_plane(op, v)) {
+            (0, _) => 0,
+            (_, Some(elems)) => u64::from(elems) * u64::from(v.df.word_length()),
+            (off, None) => {
+                return Err(SuperDscError(format!(
+                    "op '{op_name}' reads core-local LX tensor '{name}' at offset {off} elements, \
+                     which is no stick plane of it — each core holds whole planes of its own rows"
+                )));
+            }
+        };
+        if plane_bytes + slice_bytes > pin_bytes {
             return Err(SuperDscError(format!(
-                "op '{op_name}': one core's slice of core-local LX tensor '{name}' is {slice_bytes} B, \
-                 past its {pin_bytes}-byte pin"
+                "op '{op_name}': one core's slice of core-local LX tensor '{name}' is {slice_bytes} B \
+                 at {plane_bytes} B in, past its {pin_bytes}-byte pin"
             )));
         }
-        // Where each core's slice starts in the tensor's device layout: the very per-core START an HBM
-        // operand of this view would carry (`per_core_addr` over `view_stick_layout`, at base 0).
-        let as_hbm = ArgView {
-            is_input: v.is_input,
-            name: v.name,
-            role: v.role,
-            scale: v.scale,
-            device_dims: v.device_dims,
-            layout: v.layout,
-            stick: v.stick,
-            allocation: Allocation::Hbm,
-            offset_elems: v.offset_elems,
-            df: v.df,
-            row_blocked: v.row_blocked,
-            device_extent: v.device_extent,
-        };
-        let dims: Vec<&'static str> = plan.dims().iter().map(|d| d.name).collect();
-        let corners = per_core_addr(
-            0,
-            &as_hbm,
-            &view_stick_layout(&as_hbm, plan),
-            plan,
-            &crate::work::core_to_wk_slice(plan, &dims),
-            0,
-            plan.cores_used().get(),
-        )?;
-        let signature = format!("each core's {slice_bytes} B slice at {corners:?}");
+        // The slices' starts: every op dividing the tensor alike, whichever of its stick planes it
+        // reads ([`stick_plane`]); each one's size is bounded by the pin above.
+        let signature = format!("each core's slice at {corners:?}");
         l.record_lx_division(name, op_name, signature)
             .map_err(SuperDscError)?;
+    }
+    Ok(())
+}
+
+/// ⭐ A STICK-PLANE WINDOW — a view one or more sticks wide at offset `plane · rows · stick` of a
+/// stick-major tensor of `rows` rows (an elementwise op run one stick column at a time). Each core
+/// holding the tensor's rows in its LX holds every plane of them, its own `per-core rows` rows a plane
+/// (`[planes][per-core rows][stick]`), so the window's plane sits `plane · per-core rows · stick` into
+/// the core's slice. `None` for any other offset view, and for a view whose rows are not split as a
+/// whole tensor's would be.
+///
+/// A view whose STICK dim the op splits is a one-stick buffer read stick-major (an inner spray's
+/// `[y, mb · stick]`, its rows along the stick dim): each core's slice of it is a block of those
+/// rows, so the plane is the whole view, and only an offset of whole views is one — the window's
+/// plane sits that many core slices in.
+fn stick_plane(op: &OpSpec, v: &ArgView<'_>) -> Option<u32> {
+    let plan = &op.iter;
+    let stick = v.df.elems_per_stick();
+    let (mut rows, mut per_core) = (1u32, 1u32);
+    let mut lanes = (stick, stick);
+    for (&d, &sc) in v.layout.iter().zip(v.scale.iter()) {
+        if d == v.stick {
+            if !matches!(sc, Scale::Active) || !plan.extent(d).is_multiple_of(stick) {
+                return None;
+            }
+            if plan.per_core_extent(d) < plan.extent(d) {
+                lanes = (plan.extent(d), plan.per_core_extent(d));
+            }
+            continue;
+        }
+        if !matches!(sc, Scale::Active) {
+            return None;
+        }
+        rows *= plan.extent(d);
+        per_core *= plan.per_core_extent(d);
+    }
+    let plane = rows.checked_mul(lanes.0)?;
+    (v.offset_elems > 0 && v.offset_elems.is_multiple_of(plane))
+        .then(|| v.offset_elems / plane * per_core * lanes.1)
+}
+
+/// One core's slice of the tensor `v` names, in bytes, and where each core's slice starts in the
+/// tensor's device layout: the very per-core START an HBM operand of this view would carry
+/// (`per_core_addr` over `view_stick_layout`, at base 0). The signature the core-local read law
+/// compares ([`core_local_reads_agree`]) and the planner's probe logs ([`note_lx_touches`]).
+fn core_slices(op: &OpSpec, v: &ArgView<'_>) -> Result<(u64, Vec<u64>), SuperDscError> {
+    let plan = &op.iter;
+    // Each core's MATERIALIZED slice ([`materialized_bytes`]'s law, per core): a reduced or broadcast
+    // stick dim is one stick, any other collapsed dim one row — so a per-row column a reduction
+    // writes and an elementwise op reads broadcast is the same slice to both.
+    let slice_bytes = v
+        .layout
+        .iter()
+        .zip(v.scale.iter())
+        .map(|(&d, &sc)| match sc {
+            Scale::Active => u64::from(plan.per_core_extent(d)),
+            _ if d == v.stick => u64::from(v.df.elems_per_stick()),
+            _ => 1,
+        })
+        .product::<u64>()
+        * u64::from(v.df.word_length());
+    let as_hbm = ArgView {
+        is_input: v.is_input,
+        name: v.name,
+        role: v.role,
+        scale: v.scale,
+        device_dims: v.device_dims,
+        layout: v.layout,
+        stick: v.stick,
+        allocation: Allocation::Hbm,
+        offset_elems: v.offset_elems,
+        df: v.df,
+        row_blocked: v.row_blocked,
+        device_extent: v.device_extent,
+        frame: v.frame,
+        device_order: v.device_order,
+    };
+    let dims: Vec<&'static str> = plan.dims().iter().map(|d| d.name).collect();
+    let corners = per_core_addr(
+        0,
+        &as_hbm,
+        &view_stick_layout(&as_hbm, plan),
+        plan,
+        &crate::work::core_to_wk_slice(plan, &dims),
+        0,
+        plan.cores_used().get(),
+    )?;
+    Ok((slice_bytes, corners))
+}
+
+/// The scratchpad planner's probe ([`BundleLayout::lx_probe`]): how this op hands every tensor it
+/// names out to its cores — its slices, or why it cannot share the tensor core-locally (torch-spyre's
+/// `_BufferResidencyChecks`: a tensor read as indices or through them, an op walking it a trip at a
+/// time, and a view of part of it). A no-op outside the probe.
+fn note_lx_touches(
+    op_name: &str,
+    op: &OpSpec,
+    views: &[ArgView<'_>],
+    layout: Option<&BundleLayout>,
+) -> Result<(), SuperDscError> {
+    let Some(l) = layout else { return Ok(()) };
+    if l.lx_probe.borrow().is_none() {
+        return Ok(());
+    }
+    let indirect: Vec<usize> = op
+        .indirect
+        .iter()
+        .flat_map(|i| [i.index, i.value])
+        .collect();
+    for (i, v) in views.iter().enumerate() {
+        let share = if indirect.contains(&i) {
+            crate::placement::LxShare::Indirect
+        } else if op.time_tile.is_some() {
+            crate::placement::LxShare::TimeTiled
+        } else if v.offset_elems != 0 && stick_plane(op, v).is_none() {
+            crate::placement::LxShare::Partial
+        } else {
+            // A stick-plane window reaches its plane's end of each core's slice.
+            let (bytes, corners) = core_slices(op, v)?;
+            let plane = u64::from(stick_plane(op, v).unwrap_or(0)) * u64::from(v.df.word_length());
+            crate::placement::LxShare::Slices {
+                bytes: plane + bytes,
+                corners,
+            }
+        };
+        l.note_lx_touch(op_name, v.name, share);
     }
     Ok(())
 }
@@ -2346,6 +2593,11 @@ pub struct EmittedOp {
     /// separate loop body and no state to thread, which is why unbounded context costs no
     /// restructuring.
     pub kv_page_fold: bool,
+    /// ⭐ A WALK'S BLOCK BODY — this descriptor is one of the ops the program's `scf.for` runs per
+    /// trip, built at trip 0 ([`loop_fold`]): the card relaunches it [`loop_fold::WalkTrips::trips`]
+    /// times, shifting the step's sources by [`loop_fold::WalkTrips::step_bytes`] per relaunch.
+    /// `None` for every op outside a walk.
+    pub walk: Option<loop_fold::WalkTrips>,
     /// THIS OP'S KERNEL STEPS ONE REQUEST PER UNIT OF ITS BATCH AXIS, so ONE launch computes every row
     /// of the batch and the fold needs a pass per PAGE rather than per (request, page).
     ///
@@ -2478,6 +2730,40 @@ impl EmittedOp {
             .collect()
     }
 
+    /// This op with every HBM tensor it places in `segment` read `bytes` further in — the shift a
+    /// relaunch of its group applies to that segment's base, made at compile time. LX tensors and
+    /// every other segment keep their addresses.
+    pub fn shifted_in_segment(&self, segment: usize, bytes: u64) -> EmittedOp {
+        let mut e = self.clone();
+        let size = crate::wire::SEGMENT_SIZE;
+        let Some(window) = crate::wire::SEGMENT_OFFSETS
+            .get(segment)
+            .map(|&b| b..b + size)
+        else {
+            return e;
+        };
+        if let Some(op) = e.op.as_mut() {
+            for dsc_map in op.dscs_.iter_mut() {
+                for dsc in dsc_map.values_mut() {
+                    for node in dsc
+                        .scheduleTree_
+                        .iter_mut()
+                        .filter(|n| n.component_ == "hbm")
+                    {
+                        for v in node.startAddressCoreCorelet_.data_.values_mut() {
+                            if let Ok(a) = v.parse::<u64>()
+                                && window.contains(&a)
+                            {
+                                *v = (a + bytes).to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        e
+    }
+
     /// An op that carries ONLY its program.
     ///
     /// ⛔ EVERY OTHER FIELD IS THE SuperDSC DESCRIPTOR'S. `arg_bindings`, `affine_strides`, the
@@ -2496,6 +2782,7 @@ impl EmittedOp {
             slab_stride_bytes: 0,
             slot_no_fuse: false,
             kv_page_fold: false,
+            walk: None,
             kv_batched_requests: false,
             kv_gathered: false,
             kv_fold_rows: Default::default(),
@@ -2527,6 +2814,7 @@ impl EmittedOp {
             affine_strides: self.affine_strides.clone(),
             slot_stride_bytes: self.slot_stride_bytes,
             kv_page_fold: self.kv_page_fold,
+            walk: self.walk,
             kv_batched_requests: self.kv_batched_requests,
             kv_gathered: self.kv_gathered,
             kv_fold_rows: self.kv_fold_rows,
@@ -2605,6 +2893,7 @@ impl EmittedOp {
             affine_strides,
             slot_stride_bytes: 0,
             kv_page_fold: false,
+            walk: None,
             kv_batched_requests: false,
             kv_gathered: false,
             kv_fold_rows: crate::sdsc_abstract::FoldRowRegime::WholeBatch,
@@ -3034,15 +3323,27 @@ fn set_iter_dim_i(it: &mut IterSpace, name: &str, v: i64) {
 /// so every op references a shared tensor at the SAME address (task #55). Without a
 /// layout (unit tests / single-op fixtures) it falls back to the per-op
 /// `segment_base(arg_index)` (arg 0→seg0, …) — correct for a one-op bundle.
+/// Where an operand's view starts, in elements: into its tensor, or — a core-local tensor's stick
+/// plane ([`stick_plane`]) — already into each core's own slice.
+#[derive(Clone, Copy, Debug)]
+enum ViewOffset {
+    Tensor(u32),
+    CorePlane(u32),
+}
+
 fn resolve_seg_base(
     layout: Option<&BundleLayout>,
     name: &str,
     arg_index: usize,
-    offset_elems: u32,
+    offset: ViewOffset,
     arg_bytes: u64,
     df: Df,
     lane_read: bool,
 ) -> Result<(u64, u64), SuperDscError> {
+    let (offset_elems, core_plane) = match offset {
+        ViewOffset::Tensor(e) => (e, false),
+        ViewOffset::CorePlane(e) => (e, true),
+    };
     let slice = offset_elems as u64 * df.word_length() as u64; // 4 B for fp32, 1 B fp8/int8, else 2 B fp16
     // The footprint guard's WINDOW END — the last byte this access can touch.
     //
@@ -3083,6 +3384,9 @@ fn resolve_seg_base(
             // bound — `core_local_reads_agree` checks the per-core slice against it. And it has no
             // addressable offset: every core's slice starts AT the pin.
             if l.lx_core_local(name) {
+                if core_plane {
+                    return Ok((0, pin + slice));
+                }
                 if slice != 0 {
                     return Err(SuperDscError(format!(
                         "core-local LX tensor '{name}' addressed at offset {slice}B — each core's slice \
@@ -3230,6 +3534,7 @@ pub fn emit_sdsc(
         }
     }
     core_local_reads_agree(op_name, op, &views, layout)?;
+    note_lx_touches(op_name, op, &views, layout)?;
     // fp8 W8A8 matmul: a matmul/batchmatmul with an fp8 (SEN143_FP8) NON-OUTPUT operand. The DDL
     // `batchmatmulfp8` kernel (bmm.ddl:55) + its dataflow constraint require a DISTINCT operand layout
     // vs the fp16 kernel (verified against IBM's l0_tethering/fp8_32core_nonmx fixture): the fp8 WEIGHT
@@ -3319,7 +3624,13 @@ pub fn emit_sdsc(
             ldsIdx_: i as u32,
             dsName_: format!("Tensor{i}"),
             dsType_: v.role.ds_type(),
-            scale_: v.scale.iter().map(|s| s.to_i64()).collect(),
+            // In the order this tensor's dims go to dxp (`ArgView::device_positions`).
+            scale_: match v.device_positions() {
+                Some(from) if from.len() == v.scale.len() => {
+                    from.iter().map(|&j| v.scale[j].to_i64()).collect()
+                }
+                _ => v.scale.iter().map(|s| s.to_i64()).collect(),
+            },
             wordLength: v.df.word_length(),
             // Per-tensor dtype from the arg's typed `Df` (`v.df`, the SINGLE source of truth) — NOT a name
             // suffix. `Df::Fp32` → IEEE_FP32 (4-byte, the KSPLIT fp32-SFP-merge partials); `Df::Fp8` →
@@ -3370,19 +3681,19 @@ pub fn emit_sdsc(
         primary.entry(v.role.ds_type()).or_insert_with(|| {
             if is_transpose_out {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
                     stickDimOrder_: vec!["out", "mb"],
                     stickSize_: vec![8, 8],
                 }
             } else if is_fp8_kernel {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
                     stickDimOrder_: vec!["in", "out"],
                     stickSize_: vec![2, 64],
                 }
             } else {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
                     stickDimOrder_: vec![v.stick],
                     stickSize_: vec![v.df.elems_per_stick()], // fp16/bf16: 64; fp32: 32; fp8/int8: 128
                 }
@@ -3686,8 +3997,18 @@ pub fn emit_sdsc(
             }
             clamped * v.df.word_length() as u64
         };
-        let (seg_base, intra_base) =
-            resolve_seg_base(layout, v.name, i, v.offset_elems, arg_bytes, v.df, {
+        // A core-local tensor's stick-plane window sits at that plane of each core's own slice.
+        let core_plane = layout
+            .filter(|l| l.lx_core_local(v.name))
+            .and_then(|_| stick_plane(op, v));
+        let (seg_base, intra_base) = resolve_seg_base(
+            layout,
+            v.name,
+            i,
+            core_plane.map_or(ViewOffset::Tensor(v.offset_elems), ViewOffset::CorePlane),
+            arg_bytes,
+            v.df,
+            {
                 // ⭐ A SUB-STICK OFFSET ON A COLLAPSED STICK DIM IS A LANE READ — the RedStick
                 // stride-0 fold reads ONE element per materialized row at `row_base + offset`
                 // (exx2's E[x²] pair slot at element 8, read by rmsnorm's `rmxn`), so the offset
@@ -3704,7 +4025,8 @@ pub fn emit_sdsc(
                 stick_collapsed
                     && v.offset_elems > 0
                     && !(v.offset_elems as u64).is_multiple_of(v.df.elems_per_stick() as u64)
-            })?;
+            },
+        )?;
         // ── arrangement authority ── record THIS view's device layout for its tensor. If an earlier op
         // addressed the same tensor NON-equivalently (a producer/consumer Dense-vs-stick disagreement, the
         // M>1 scramble), this is a build Err naming the tensor — not silent garbage on-card. Declare only
@@ -3728,10 +4050,32 @@ pub fn emit_sdsc(
             .or_else(|| l.synth.borrow().sizes.get(v.name).copied());
             let full = full_bytes.is_none_or(|fp| arg_bytes >= fp);
             if active && full && !matches!(v.role, Role::Kernel) && !v.allocation.is_lx() {
-                l.declare_arrangement(v.name, view_stick_layout(v, iter))?;
+                let own = view_stick_layout(v, iter);
+                let arrangement = match v.frame {
+                    crate::superdsc_opspec::ViewFrame::Own
+                    | crate::superdsc_opspec::ViewFrame::FoldedRows => own,
+                    crate::superdsc_opspec::ViewFrame::StickColumns => {
+                        own.of_stick_columns().ok_or_else(|| {
+                            SuperDscError(format!(
+                                "op '{op_name}': tensor '{}' is iterated by its stick columns, but \
+                                 the view arranges it {own:?}, not as row-major whole sticks",
+                                v.name
+                            ))
+                        })?
+                    }
+                };
+                l.declare_arrangement(v.name, arrangement)?;
             }
         }
         let per_core = per_core_addr(seg_base, v, &sl, iter, &wk_slice, intra_base, cores)?;
+        // A gathered or scattered COPY's index past one stick (the token-plane matmul's gathered
+        // kernel keeps its own probe-proven spelling, one start for every core).
+        let per_core = match &indirect_role {
+            Some(IndirectRole::Index { pins, .. }) if !kernel_bearing => {
+                index_stick_starts(op_name, per_core, &op.iter, pins, &wk_slice)?
+            }
+            _ => per_core,
+        };
         // No two cores of an OUTPUT tensor may share a byte address (aliased write) — EXCEPT a K-split
         // matmul, where the `k` cores each contract a K-slice into a PARTIAL product that dxp
         // PSUM-accumulates into the SHARED output tile (torch-spyre's reduction-dim split). That case is
@@ -3776,6 +4120,19 @@ pub fn emit_sdsc(
             }
         }
         let addr = AddrFold::new(&per_core, folds);
+        // The order dxp reads this view's dims in, innermost first, as positions in `v.layout` — set
+        // only where it is not `v.layout`'s (`TensorArg::with_device_order`).
+        let device_from = v.device_positions();
+        if device_from
+            .as_ref()
+            .is_some_and(|from| from.len() != v.layout.len())
+        {
+            return Err(SuperDscError(format!(
+                "op {op_name}: tensor {i} ('{}') states device order {:?} over layout {:?} — not a \
+                 permutation of it",
+                v.name, v.device_order, v.layout
+            )));
+        }
         tree.push(AllocNode {
             nodeType_: "allocate",
             name_: name,
@@ -3815,7 +4172,9 @@ pub fn emit_sdsc(
             // stick-major tensor — dxp applies `get_generic_stick_layout` INTERNALLY when it reconstructs
             // the stick-blocked `device_size` from `-1`, so the mb-outermost label + `-1` already yields the
             // stick-major walk (`element_torchspyre_parity`). Reordering here DIVERGES from the golden.
-            layoutDimOrder_: v.layout.to_vec(),
+            // A view that states its own device order (two row dims, read innermost-first by dxp) is
+            // the one exception, and states it on the view.
+            layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
             // ── The ON-CARD WALK, DERIVED from the SAME `sl` the per-core START uses (`StickLayout::
             // max_dim_sizes`) so the two cannot disagree. Stick-blocked (`RowBlocked`/`Kernel`) ⇒ `-1` per
             // dim (dxp reconstructs the RowBlocked device_size from N_/layoutDimOrder_/stickSize_ and
@@ -3844,35 +4203,63 @@ pub fn emit_sdsc(
             // `Span::Swept` with NO declaration reproduces `op.iter.extent(d)` exactly, and no
             // operand in any shipped bundle declares one — so every existing bundle is byte-identical.
             maxDimSizes_: {
-                let walk = sl.device_walk(
-                    crate::sdsc_abstract::DeviceExtents::of_view(
-                        &v.layout
-                            .iter()
-                            .map(|&d| iter.extent(d) as usize)
-                            .collect::<Vec<_>>(),
-                        &v.device_extent
-                            .iter()
-                            .map(|o| o.map(|p| p as usize))
-                            .collect::<Vec<_>>(),
-                        v.layout
-                            .iter()
-                            .position(|&d| d == v.stick)
-                            .unwrap_or(usize::MAX),
-                        &vec![true; v.layout.len()],
-                        crate::sdsc_abstract::Span::Swept,
-                    )
-                    .dims()
+                let swept: Vec<usize> = v.layout.iter().map(|&d| iter.extent(d) as usize).collect();
+                let stick_pos = v
+                    .layout
                     .iter()
-                    .map(|&e| e as i64)
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-                );
+                    .position(|&d| d == v.stick)
+                    .unwrap_or(usize::MAX);
+                let device: Vec<i64> = crate::sdsc_abstract::DeviceExtents::of_view(
+                    &swept,
+                    &v.device_extent
+                        .iter()
+                        .map(|o| o.map(|p| p as usize))
+                        .collect::<Vec<_>>(),
+                    stick_pos,
+                    &vec![true; v.layout.len()],
+                    crate::sdsc_abstract::Span::Swept,
+                )
+                .dims()
+                .iter()
+                .map(|&e| e as i64)
+                .collect();
+                let walk = sl.device_walk(&device);
+                // ⭐ A STICK-BLOCKED WINDOW OF A TALLER TENSOR, more than one stick wide, walks the
+                // tensor's own rows (`DeviceWalk::of_window`): left to `-1`, dxp strides its stick
+                // groups by the op's swept rows. MEASURED on granite-3.1-8b: each kv head's score
+                // contraction read its `[84, 128]` query slice of the `[672, 128]` head-major query
+                // with the second stick 84 rows in, the next kv head's first stick. A one-stick view
+                // has no second stick group, so every hd=64 bundle emits byte-identically.
+                let windowed = device
+                    .iter()
+                    .zip(&swept)
+                    .enumerate()
+                    .any(|(i, (&d, &s))| i != stick_pos && d > s as i64);
+                let multi_stick = swept
+                    .get(stick_pos)
+                    .is_some_and(|&e| e > v.df.elems_per_stick() as usize);
+                let walk = if walk.reconstructs() && windowed && multi_stick {
+                    crate::sdsc_abstract::DeviceWalk::of_window(&device)
+                } else {
+                    walk
+                };
                 // Paged only on the gathered value side. Every pin was resolved against this operand's
                 // own layout above, so `paged_at` cannot be the thing that drops one.
-                if paged_dims.is_empty() {
+                let walk = if paged_dims.is_empty() {
                     walk
                 } else {
                     walk.clone().paged_at(&paged_dims).unwrap_or(walk)
+                };
+                // In the order `layoutDimOrder_` states the dims.
+                match &device_from {
+                    None => walk,
+                    Some(from) => walk.reordered(from).ok_or_else(|| {
+                        SuperDscError(format!(
+                            "op {op_name}: tensor {i} ('{}'): its walk does not reorder to its \
+                             device order",
+                            v.name
+                        ))
+                    })?,
                 }
             },
             // ── INDIRECT (GATHERED) HBM ACCESS ──
@@ -4297,6 +4684,7 @@ pub struct In<'a, K: KindTag> {
     mb_broadcast: bool,
     out_broadcast: bool,
     y_broadcast: u32,
+    y_order: SprayOrder,
     col_offset: u32,
     col_window: Option<crate::addr::ColWindow>,
 }
@@ -4308,6 +4696,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
         }
@@ -4318,6 +4707,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: true,
             out_broadcast: true,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
         }
@@ -4328,6 +4718,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: true,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
         }
@@ -4338,6 +4729,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
         }
@@ -4352,6 +4744,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: w.dev().into_raw_elems(),
             col_window: Some(w),
         }
@@ -4364,6 +4757,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: false,
             out_broadcast: true,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
         }
@@ -4375,6 +4769,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: true,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
         }
@@ -4387,6 +4782,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: true,
             out_broadcast: false,
             y_broadcast: 0,
+            y_order: SprayOrder::Outer,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
         }
@@ -4401,19 +4797,35 @@ impl<'a, K: KindTag> In<'a, K> {
     /// before this operand is built: `rows == y·mb`, the source single-stick. `y`
     /// must be ≥ 2 — a spray of one is a reshape, not a broadcast, and is refused by the
     /// admission upstream.
-    pub fn y_broadcast(h: &'a Stk<K>, y: u32) -> Self {
+    pub fn y_broadcast(h: &'a Stk<K>, spray: crate::emit::lower_ktir_to_superdsc::Spray) -> Self {
+        let y = spray.count;
         assert!(
             y > 1,
-            "In::y_broadcast: a spray count of {y} is not a broadcast — the leading dim must \
+            "In::y_broadcast: a spray count of {y} is not a broadcast — the sprayed dim must \
              spray a real count (the walk's Y admission refuses y == 1 upstream)"
         );
         In {
             h,
             mb_broadcast: false,
-            out_broadcast: false,
+            // A spray of per-row scalars reads one value per row: the stick's stride-0 read too.
+            out_broadcast: spray.of == crate::emit::lower_ktir_to_superdsc::SprayOf::RowScalars,
             y_broadcast: y,
+            y_order: spray.order,
             col_offset: 0,
             col_window: None,
+        }
+    }
+    /// [`y_broadcast`](Self::y_broadcast) PLUS a base `col_offset` — the spray's `[mb, out]` source
+    /// at an element base inside a larger buffer (one stick column of a multi-stick source, the
+    /// window a walk's trip takes of its mask stack).
+    pub fn y_broadcast_at(
+        h: &'a Stk<K>,
+        spray: crate::emit::lower_ktir_to_superdsc::Spray,
+        col_offset: crate::addr::DevOff,
+    ) -> Self {
+        In {
+            col_offset: col_offset.into_raw_elems(),
+            ..Self::y_broadcast(h, spray)
         }
     }
     pub fn ew(&self) -> EwOperand<'a> {
@@ -4423,6 +4835,7 @@ impl<'a, K: KindTag> In<'a, K> {
             mb_broadcast: self.mb_broadcast,
             out_broadcast: self.out_broadcast,
             y_broadcast: self.y_broadcast,
+            y_order: self.y_order,
             col_offset: self.col_offset,
             col_window: self.col_window,
         }
@@ -5423,6 +5836,7 @@ mod transpose_tests {
             mask: None,
             node_out_tid: None,
             minted: Default::default(),
+            lx_plan: Default::default(),
         }
     }
 
@@ -6231,6 +6645,129 @@ fn restickify_transpose_opspec_2d(
         ));
     }
     Ok(op)
+}
+
+/// ⭐⭐ torch-spyre's ALL-HEADS RESTICKIFY — `[b, rows, cols] → [b, cols, rows]` as ONE `ReStickifyOpHBM`
+/// over `N_ {mb: b, y: rows, out: cols}` split `{mb: b}`: core `i` relays batch `i`'s stick-major
+/// `[rows, cols]` block into its stick-major `[cols, rows]` one. The reference's compiled decode trip
+/// re-lays its gathered K page so (`numWkSlicesPerDim_ {mb: 8, x: 1, out: 1}`), one kv head a core, so
+/// each core's `Kᵀ` block is where the all-heads contraction on that core reads its kernel
+/// ([`crate::ir::bridge::tiled_op_sdsc_op::matmul::opspec::matmul_opspec_x_batched`]).
+///
+/// Both sides are blocks one after another (batch `i` at `i·rows·cols`), stated to dxp innermost-first
+/// (`['y','out','mb']` in, `['out','y','mb']` out): the 2-D door's own two views
+/// ([`restickify_kt_opspec_2d`]) with the batch outermost.
+pub(crate) fn restickify_transpose_opspec_batched(
+    batch: u32,
+    (rows, cols): (u32, u32),
+    (in_name, o_name): (&str, &str),
+) -> Result<OpSpec, String> {
+    let _rows_ext = StickExtent::<Fp16>::new(rows)?;
+    let _cols_ext = StickExtent::<Fp16>::new(cols)?;
+    // One batch a core, or past the cores, as many consecutive batches a core as divide evenly.
+    let cores = crate::work::core_split(batch, MAX_CORES);
+    if batch <= 1 || cores <= 1 {
+        return Err(format!(
+            "restickify transpose '{o_name}': a batch of {batch} divides over no cores of {MAX_CORES}"
+        ));
+    }
+    let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df: Df::Fp16,
+    };
+    let dims = [
+        dim("mb", batch, false),
+        dim("y", rows, true),
+        dim("out", cols, true),
+    ];
+    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
+        BTreeMap::from([("mb", cores)])
+    })?;
+    let resident = 2
+        * u64::from(batch / cores)
+        * u64::from(rows)
+        * u64::from(cols)
+        * u64::from(Fp16::WORD_LENGTH);
+    if resident > USABLE_LX_BYTES {
+        return Err(format!(
+            "restickify transpose '{o_name}': one core's [{rows}, {cols}] block in and out is \
+             {resident} B against the {USABLE_LX_BYTES}-B LX scratchpad, and a restickify cannot be \
+             time-tiled (its output stick is the whole `y` extent)"
+        ));
+    }
+    let active = [Scale::Active, Scale::Active, Scale::Active];
+    let input = TensorArg::<3>::new(
+        true,
+        in_name.to_string(),
+        Role::Input,
+        active,
+        plan.iter_syms(["mb", "y", "out"]),
+        ["mb", "y", "out"],
+        "out",
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?
+    .with_device_order(["y", "out", "mb"])
+    .map_err(|e| e.0)?;
+    let output = TensorArg::<3>::new(
+        false,
+        o_name.to_string(),
+        Role::Output,
+        active,
+        plan.iter_syms(["mb", "out", "y"]),
+        ["mb", "out", "y"],
+        "y",
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?
+    .with_device_order(["out", "y", "mb"])
+    .map_err(|e| e.0)?;
+    Ok(OpSpec {
+        op: OpFunc::Restickify,
+        is_reduction: false,
+        iter: plan,
+        args: vec![AnyTensorArg::R3(input), AnyTensorArg::R3(output)],
+        op_info: OpInfo::None,
+        tiled_symbols: vec![],
+        time_tile: None,
+        indirect: None,
+        coordinate_mask: None,
+    })
+}
+
+/// [`restickify_transpose_opspec_batched`] assembled over whole buffers, each side minted at its
+/// `batch` blocks' flat run.
+pub fn try_assemble_restickify_transpose_batched(
+    op_name: &str,
+    batch: u32,
+    (rows, cols): (u32, u32),
+    (in_, o): (&Stk<RowBlockedTag>, &Stk<RowBlockedTag>),
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let run = batch * rows * cols;
+    mint_full_window(
+        &format!("{op_name}: operand '{}'", in_.name()),
+        in_,
+        0,
+        1,
+        run,
+        layout,
+    )?;
+    mint_full_window(
+        &format!("{op_name}: output '{}'", o.name()),
+        o,
+        0,
+        1,
+        run,
+        layout,
+    )?;
+    let op = restickify_transpose_opspec_batched(batch, (rows, cols), (in_.name(), o.name()))?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
 }
 
 /// [`restickify_transpose_opspec_2d`] assembled — the fallible form, because this is reached by a
@@ -7711,6 +8248,7 @@ mod embed_row_gather_tests {
             mask: None,
             node_out_tid: None,
             minted: Default::default(),
+            lx_plan: Default::default(),
         }
     }
 
@@ -8470,6 +9008,7 @@ mod chain_stage_tests {
             mask: None,
             node_out_tid: None,
             minted: Default::default(),
+            lx_plan: Default::default(),
         }
     }
 

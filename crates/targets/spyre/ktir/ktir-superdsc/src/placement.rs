@@ -21,7 +21,7 @@
 
 use crate::addr::{DevOff, Win};
 use crate::place::PlaceId;
-use crate::sdsc_abstract::{KindTag, StickLayout, Stk};
+use crate::sdsc_abstract::{KindTag, StickKind, StickLayout, Stk};
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::Df;
 
@@ -258,19 +258,6 @@ pub struct BundleLayout {
     /// existed.
     #[serde(default)]
     pub weight_scale_folds: Vec<(u32, f32)>,
-    /// ⭐ THE HEAD-MAJOR o_proj PERMUTED COPIES — `(companion weight tid, permuted copy tid)`, one
-    /// pair per o_proj weight the head-major restructure companions. Where the bundle's
-    /// single-row attention finalize writes `out` SLAB-MAJOR, the o matmul's contraction axis
-    /// arrives permuted and its B operand must be the SECOND, k-shuffled o_proj copy staged under
-    /// `oproj_headmajor_tid` — the copy whose retile walk (in [`Self::kernel_weights`]) enumerates
-    /// exactly that order. The worker materializes each `to` tid from its `from` tid's bytes at
-    /// load. MINTED BUNDLE-INVARIANTLY — keyed on the geometry (multi-slab head dim + fp8 W8A8 o
-    /// matmul), never on the bundle's row count, because every bundle of a model shares ONE
-    /// staged weight segment; only the EMISSION gates on rows. EMPTY for every model the gate
-    /// excludes (granite-3.1-2b's one-slab head dim, every dense o_proj), which keeps those
-    /// bundles byte-identical to before this field existed.
-    #[serde(default)]
-    pub weight_copies: Vec<(u32, u32)>,
     /// ⭐ THE ROPE-P CLASS SET — this tape's DISTINCT rope head dims, sorted descending. Index `i` ↔
     /// [`rope_p_class_tid`](crate::reserved_tids::rope_p_class_tid)`(i)` (class 0 = the widest =
     /// `ROPE_P_TID`). One `[hd,hd]` P table per class: a hybrid (gemma-4) carries two rope head dims
@@ -307,6 +294,27 @@ pub struct BundleLayout {
     /// `&layout`-threaded emit can consult it by name.
     #[serde(skip)]
     pub lx: std::cell::RefCell<LxAlloc>,
+    /// ⭐ THE SCRATCHPAD PLAN — the intermediates [`crate::emit::lx_plan`] keeps in LX, core-locally,
+    /// by id: each one's per-core bytes and the pin the plan placed it at ([`LxPin`]).
+    /// [`Self::synth_df`] honours it: a planned id is declared through [`Self::synth_lx_planned`]
+    /// instead of the HBM synth allocator, so the mint sites stay as they are. Empty unless a plan
+    /// ran.
+    #[serde(skip)]
+    pub lx_planned: std::cell::RefCell<std::collections::BTreeMap<PlaceId, LxPin>>,
+    /// ⭐ THE PLANNER'S PROBE — `Some` while [`crate::emit::lx_plan`] lowers a function on a copy of
+    /// this layout to learn how every op slices every tensor: each op's per-core slices land in the
+    /// log ([`LxTouch`]), and a pointwise op divides as it will once an operand of it is core-local
+    /// ([`Self::pointwise_core_local`]), so the slices the plan reads are the ones the real lowering
+    /// emits. `None` on every real lowering.
+    #[serde(skip)]
+    pub lx_probe: std::cell::RefCell<Option<Vec<LxTouch>>>,
+    /// ⭐ THE SCRATCHPAD PLAN'S DIVISION — `Some` while a walking program is lowered under a plan
+    /// that divides its elementwise and reduce ops into row groups, one a core
+    /// ([`crate::work::EwDivision::Groups`]); `None` otherwise. [`Self::ew_law`] and
+    /// [`Self::reduce_rows`] read it where those ops resolve their default division, and the walk's
+    /// contractions take the form it names.
+    #[serde(skip)]
+    pub lx_division: std::cell::Cell<Option<WalkDivision>>,
     /// THE arrangement authority: `tensor name → its ONE device [`StickLayout`]`. The FIRST op to
     /// address a tensor declares its layout; every later op must address it EQUIVALENTLY
     /// ([`StickLayout::addr_eq`]) or `declare_arrangement` returns a build `Err` naming the tensor. A
@@ -436,6 +444,10 @@ pub struct LxAlloc {
     /// The work division the first op to touch each core-local tensor used, as a comparable
     /// signature ([`BundleLayout::record_lx_division`]). Every later op must match it.
     pub divisions: std::collections::BTreeMap<String, String>,
+    /// The WHOLE tensor's footprint for a core-local name the scratchpad plan declared
+    /// ([`BundleLayout::synth_df`]) — the shape the width laws read off an HBM synthetic's
+    /// [`SynthAlloc::sizes`], so a tensor's residency never changes the width an op sweeps it at.
+    pub full_sizes: std::collections::BTreeMap<String, u64>,
 }
 impl Default for LxAlloc {
     fn default() -> Self {
@@ -450,8 +462,79 @@ impl Default for LxAlloc {
             sizes: std::collections::BTreeMap::new(),
             core_local: std::collections::BTreeSet::new(),
             divisions: std::collections::BTreeMap::new(),
+            full_sizes: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// Where the scratchpad plan pins one tensor ([`BundleLayout::lx_planned`]): one core's slice of it,
+/// `per_core` bytes, at the LX byte address `at`, the same on every core. Two planned tensors live at
+/// disjoint times may share bytes, as torch-spyre's placement lets them ([`crate::emit::lx_plan`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LxPin {
+    pub per_core: u64,
+    pub at: u64,
+}
+
+/// How the scratchpad plan divides a walking program ([`BundleLayout::lx_division`]) — the two
+/// divisions torch-spyre's compiled walks take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkDivision {
+    /// One batch of the walk's batched contractions a core, `n` of them: its decode trip (all-heads
+    /// contractions split by batch, each core's kernel in its LX).
+    Batches(u32),
+    /// The walk's per-head rows held query-row-major (row `p·heads + h`) and split into `chunks`
+    /// contiguous runs, one a core: its prompt trip (contractions split by rows, every core reading
+    /// one shared kernel per query head from HBM).
+    HeadsInner { chunks: u32 },
+}
+
+impl WalkDivision {
+    /// The row groups the walk's elementwise and reduce ops divide into.
+    pub const fn row_groups(self) -> u32 {
+        match self {
+            WalkDivision::Batches(n) => n,
+            WalkDivision::HeadsInner { chunks } => chunks,
+        }
+    }
+
+    /// Whether the walk's batched transposes and contractions over `batch` batches each run as ONE
+    /// op: the decode trip's, one batch a core, and the prompt trip's, every batch on every core.
+    pub const fn one_op_over(self, batch: u32) -> bool {
+        match self {
+            WalkDivision::Batches(n) => n == batch,
+            WalkDivision::HeadsInner { .. } => true,
+        }
+    }
+}
+
+/// One op's touch of one tensor, as the planner's probe records it ([`BundleLayout::lx_probe`]): how
+/// the op hands the tensor out to its cores, or why it cannot share it core-locally at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LxTouch {
+    pub op: String,
+    pub tensor: String,
+    pub share: LxShare,
+}
+
+/// How one op slices one tensor across its cores — the planner's whole view of an op
+/// ([`crate::emit::lx_plan`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LxShare {
+    /// Core `c` holds `bytes` of the tensor starting at element `corners[c]` of its device layout —
+    /// the signature the core-local read law compares ([`BundleLayout::record_lx_division`]).
+    Slices { bytes: u64, corners: Vec<u64> },
+    /// The op walks the tensor a trip at a time, and a pin holds one slice.
+    TimeTiled,
+    /// The op reads the tensor's words as indices, or reads it through them.
+    Indirect,
+    /// The op views the tensor from an offset — part of it (torch-spyre's "partial/offset read"). A
+    /// core-local tensor's slices all start at its pin, so no view into it has an offset to take.
+    Partial,
+    /// The op's form needs the tensor core-local — an all-heads contraction's kernel, which the
+    /// reference keeps in each core's LX and which faults read from HBM per core. A plan that does not
+    /// keep it there cannot take the form ([`crate::emit::lx_plan`]).
+    Required,
 }
 
 /// ⭐⭐ THE ONE PIN-WINDOW BUDGET — the single place the window's arithmetic lives. Both
@@ -612,10 +695,17 @@ impl BundleLayout {
             // its declared shape may be the full tensor's — the same early return the bake-time
             // guard takes. But it has no addressable offset: every core's slice starts AT the pin.
             if self.lx_core_local(name) {
-                if off_elems != 0 {
+                // A STICK-PLANE window — whole planes of the tensor's own rows — sits at that plane
+                // of every core's slice (`emit::stick_plane`), which the read law bounds by the pin.
+                let plane = u64::from(layout.rows as u32) * layout.df.elems_per_stick() as u64;
+                let plane_window = layout.kind == StickKind::RowBlocked
+                    && rows as usize == layout.rows
+                    && off_elems.is_multiple_of(plane.max(1));
+                if off_elems != 0 && !plane_window {
                     return Err(format!(
                         "{what}: core-local LX tensor '{name}' windowed at element {off_elems} — \
-                         each core's slice sits at the pin, so a view into it has no offset to take"
+                         each core's slice sits at the pin, and only a whole stick plane of its \
+                         rows is a view into it"
                     ));
                 }
                 return Ok(());
@@ -753,8 +843,62 @@ impl BundleLayout {
     /// or fp32-merge (4-byte / 32-stick) tensors. The footprint is reserved at the given [`Df`]'s true
     /// width, so a fp8 activation reserves HALF the fp16 bytes (the residency win) — not a name-suffix
     /// guess. `synth(name, dims)` is exactly `synth_df(name, dims, Df::Fp16)`.
+    ///
+    /// ⭐ A PLANNED id ([`Self::lx_planned`]) is declared core-local in LX instead, at its planned
+    /// pin: the scratchpad plan's one point of effect on the lowering.
     pub fn synth_df(&self, id: PlaceId, dims: &[u32], df: Df) {
-        self.synth_bytes(id, synth_footprint_bytes(dims, df));
+        let planned = self.lx_planned.borrow().get(&id).copied();
+        match planned {
+            Some(pin) => {
+                self.synth_lx_planned(id, pin);
+                self.lx
+                    .borrow_mut()
+                    .full_sizes
+                    .insert(id.to_string(), synth_footprint_bytes(dims, df));
+            }
+            None => self.synth_bytes(id, synth_footprint_bytes(dims, df)),
+        }
+    }
+
+    /// The whole footprint of a core-local tensor the scratchpad plan declared ([`LxAlloc::full_sizes`]).
+    pub fn lx_full_size(&self, name: &str) -> Option<u64> {
+        self.lx.borrow().full_sizes.get(name).copied()
+    }
+
+    /// Whether a pointwise op over `names` (its output and inputs) divides as a core-local op does:
+    /// when one of them is core-local in LX, or while the planner's probe runs
+    /// ([`Self::lx_probe`]), which must see the division the op takes once one is.
+    pub fn pointwise_core_local<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> bool {
+        self.lx_probe.borrow().is_some() || names.into_iter().any(|n| self.lx_core_local(n))
+    }
+
+    /// The division an elementwise op under the law takes: the scratchpad plan's row groups while it
+    /// is in force ([`Self::lx_division`]), else the law's own resolution.
+    pub fn ew_law(&self, stick_major: bool, core_local: bool) -> crate::work::EwDivision {
+        match self.lx_division.get() {
+            Some(d) => crate::work::EwDivision::Groups(d.row_groups()),
+            None => crate::work::EwDivision::Law.resolve(stick_major, core_local),
+        }
+    }
+
+    /// The division a row-wise reduce takes: the scratchpad plan's row groups while it is in force,
+    /// else rows first.
+    pub fn reduce_rows(&self) -> crate::ir::bridge::tiled_op_sdsc_op::reduce::ReduceDivision {
+        use crate::ir::bridge::tiled_op_sdsc_op::reduce::ReduceDivision;
+        self.lx_division.get().map_or(ReduceDivision::Rows, |d| {
+            ReduceDivision::Groups(d.row_groups())
+        })
+    }
+
+    /// Log one op's touch of one tensor while the planner's probe runs; a no-op otherwise.
+    pub fn note_lx_touch(&self, op: &str, tensor: &str, share: LxShare) {
+        if let Some(log) = self.lx_probe.borrow_mut().as_mut() {
+            log.push(LxTouch {
+                op: op.to_string(),
+                tensor: tensor.to_string(),
+                share,
+            });
+        }
     }
 
     /// Declare a SYNTHETIC intermediate LX-RESIDENT and OP-LOCAL at its FULL shape (`dims`,
@@ -850,6 +994,49 @@ impl BundleLayout {
         );
         a.next = o + fp;
         a.map.insert(name.clone(), o);
+        a.sizes.insert(name.clone(), fp);
+        a.core_local.insert(name);
+    }
+
+    /// Reserve `bytes` of the core-local pin window for one scratchpad plan and return where they
+    /// start: the plan places its tensors at offsets within them ([`LxPin::at`] is this base plus the
+    /// offset), and every pin declared after it lands past them.
+    ///
+    /// ⛔ PANICS past [`LX_PIN_END`], as [`Self::synth_lx_core_local`] does.
+    pub fn reserve_lx_plan(&self, bytes: u64) -> u64 {
+        let mut a = self.lx.borrow_mut();
+        let base = a.next;
+        assert!(
+            lx_window_fits(base + bytes - LX_PIN_BASE, a.op_local_bytes),
+            "a scratchpad plan of {bytes} B per core overflows the frontend's LX window at {base}, \
+             meeting the {} B of op-local slots already reserved against the {LX_PIN_END} boundary — \
+             the plan sized itself against the window it was handed (`lx_plan::plan`)",
+            a.op_local_bytes
+        );
+        a.next = base + bytes;
+        base
+    }
+
+    /// Declare a PLANNED tensor core-local at its pin ([`Self::lx_planned`]), inside the window the
+    /// plan reserved ([`Self::reserve_lx_plan`]) — the same declaration as
+    /// [`Self::synth_lx_core_local`], at the plan's address instead of the next free one. Idempotent
+    /// per name.
+    pub fn synth_lx_planned(&self, id: PlaceId, pin: LxPin) {
+        let name = id.to_string();
+        self.ids.borrow_mut().insert(name.clone(), id);
+        let mut a = self.lx.borrow_mut();
+        if a.map.contains_key(&name) {
+            return;
+        }
+        let fp = align128(pin.per_core.max(1));
+        assert!(
+            pin.at >= LX_PIN_BASE && pin.at + fp <= a.next,
+            "planned core-local LX tensor '{name}' pins at {} with a {fp}-byte slice, outside the \
+             window its plan reserved (below {})",
+            pin.at,
+            a.next
+        );
+        a.map.insert(name.clone(), pin.at);
         a.sizes.insert(name.clone(), fp);
         a.core_local.insert(name);
     }
@@ -1034,5 +1221,41 @@ impl BundleLayout {
                 Ok(want)
             }
         }
+    }
+
+    /// ⭐ A BUFFER ALLOCATED ROW-OUTERMOST — its fp16 elements in order, `[rows][sticks][stick]`:
+    /// torch-spyre's row-outermost `SpyreTensorLayout`, the one spyre-inference allocates its paged
+    /// KV cache in (`head_major_kv_layout`, device `[pages·kv, block, sticks, stick]`, which keeps the
+    /// indexed row whole at device position 0). One row of it is one contiguous run in whatever frame
+    /// a program reads it, so a gather of a row is one copy. Stated by whoever allocates the buffer,
+    /// through the arrangement authority and before any op addresses it, so an op that then addresses
+    /// it stick-major is the authority's build `Err`.
+    pub fn allocate_row_outermost(&self, tid: u32) -> Result<(), SuperDscError> {
+        let Some(p) = self.placements.get(&tid) else {
+            return Err(SuperDscError(format!(
+                "t{tid} is allocated row-outermost but this bundle never placed it"
+            )));
+        };
+        let stick = u64::from(Df::Fp16.elems_per_stick());
+        let elems = p.size / 2;
+        if !elems.is_multiple_of(stick) {
+            return Err(SuperDscError(format!(
+                "t{tid}: a row-outermost allocation of {elems} fp16 elements is not whole \
+                 {stick}-element sticks"
+            )));
+        }
+        self.declare_arrangement(
+            &crate::place::act_name(tid),
+            StickLayout::flat((elems / stick) as usize, stick as usize),
+        )
+        .map(drop)
+    }
+
+    /// Whether `tid`'s arrangement is row-major — allocated so ([`Self::allocate_row_outermost`]).
+    pub fn is_row_outermost(&self, tid: u32) -> bool {
+        self.arrangements
+            .borrow()
+            .get(&crate::place::act_name(tid))
+            .is_some_and(|a| a.kind == StickKind::Flat)
     }
 }

@@ -68,6 +68,7 @@ type PlannedProgram = (
     Option<u64>,
     std::collections::HashSet<u64>,
     Vec<NodeSpec>,
+    HashMap<u64, Vec<usize>>,
 );
 
 /// For KTIR_SEG_PROF: scan a fused function's ops and return (label, n_matmuls)
@@ -178,6 +179,14 @@ struct ResidentProgram {
     lx_pin_window_bytes: Option<u64>,
     /// This program's final result tensor ids (for default readback).
     results: std::collections::HashSet<u64>,
+    /// ⭐ THIS PROGRAM'S OWN TENSOR SHAPES — what its views state, before the executor merges
+    /// every program's widest into [`ResidentExecutor::shapes`] to size the shared sticks.
+    /// Decode and prefill share the id space for their WEIGHTS, but each bundle's mints insert
+    /// sources at the graph's source ceiling (the draw's in both, the chained head's in decode
+    /// alone), so every id past the ceiling names a DIFFERENT tensor in each program —
+    /// granite-3.1-2b's t472 is decode's s stick `[1, 32]` and prefill's first activation
+    /// `[31, 2048]`. A door reads its operands' extents HERE, off the program it is running.
+    shapes: HashMap<u64, Vec<usize>>,
 }
 
 pub struct ResidentExecutor {
@@ -241,14 +250,6 @@ pub struct ResidentExecutor {
     /// time `last_token_only` is enabled for a `run_program(idx)`. `[idx]` holds the
     /// rewritten `(segments, result-segment-index)` so the rewrite is done once.
     last_token_segs: std::cell::RefCell<HashMap<usize, Vec<Segment<'static>>>>,
-    /// Run isolated decode (m=1) attention segments via the fused CPU GEMV/softmax
-    /// path instead of the decomposed op storm. Read once at construction (the
-    /// planner gates the segment isolation on the same env var, so this only needs
-    /// to recognize+compute the now-Native node). Default `true` — the fused path
-    /// is a measured win (llama decode ~1.33x, smollm2 ~2.0x) and golden-faithful
-    /// (max-abs identical to the decomposed oracle). Set `KTIR_NO_FUSE_ATTN` to
-    /// opt out (falls back to the decomposed oracle path).
-    fuse_attn: bool,
     /// Keep the multi-core grid SERIAL (no worker-pool parallelism). Set by
     /// [`new_native`](Self::new_native): every node runs at its native grid, so a
     /// non-attention multi-tile kernel dispatches per-core Metal GEMV concurrently —
@@ -496,13 +497,14 @@ impl ResidentExecutor {
                 lx_pin_window_bytes,
                 spec.results.clone(),
                 spec.nodes.clone(),
+                prog_shapes,
             ));
         }
 
         // Size the HBM (LX-per-core array) for the largest grid across ALL programs.
         let grid = planned
             .iter()
-            .map(|(m, segs, _, _, _)| largest_grid(m, segs))
+            .map(|(m, segs, _, _, _, _)| largest_grid(m, segs))
             .max()
             .unwrap_or(1);
         let mem = SpyreMemoryHierarchy::new(grid);
@@ -546,12 +548,13 @@ impl ResidentExecutor {
         let programs = planned
             .into_iter()
             .map(
-                |(module, segments, lx_pin_window_bytes, results, nodes)| ResidentProgram {
+                |(module, segments, lx_pin_window_bytes, results, nodes, shapes)| ResidentProgram {
                     module,
                     segments,
                     lx_pin_window_bytes,
                     nodes,
                     results,
+                    shapes,
                 },
             )
             .collect();
@@ -569,91 +572,24 @@ impl ResidentExecutor {
             seg_keys: std::cell::RefCell::new(HashMap::new()),
             last_token_only: false,
             last_token_segs: std::cell::RefCell::new(HashMap::new()),
-            // Default ON (opt out via KTIR_NO_FUSE_ATTN). KTIR_FORCE_FUSE_ATTN
-            // forces it ON even when KTIR_NO_FUSE_ATTN is set — the conformance
-            // harness uses it to guarantee the decode (m=1) attention island takes
-            // the fused GEMV/softmax/GEMV Metal path (proven by gemm_or_blas_gpu>0)
-            // rather than the decomposed oracle. (The non-decode example attention
-            // programs — sdpa m=32, paged_attention m=8 — are not recognized as the
-            // decode island and run the decomposed grid, which fires the same
-            // per-op gemm_or_blas_gpu offload anyway.)
-            fuse_attn: std::env::var_os("KTIR_FORCE_FUSE_ATTN").is_some()
-                || std::env::var_os("KTIR_NO_FUSE_ATTN").is_none(),
             // Native-grid example runs keep the grid serial (concurrent per-core
             // Metal GEMV is not thread-safe); the fused/attention path stays parallel.
             serial_cores: force_native,
         })
     }
 
-    /// FUSED CPU m=1 ATTENTION. Resolve each island arg to its resident HBM stick
-    /// (via `node.bindings`: arg name → tensor id → stick → byte addr), decode the
-    /// f16 inputs to f32, run [`DecodeAttnIsland::compute_f32`], and write the f16
-    /// output row back to the O tensor's stick. Reproduces the decomposed path's
-    /// exact arithmetic per head with f32 accumulation (golden-faithful), at ~3·H
-    /// primitives instead of the ~1500-op decomposed storm.
-    fn run_fused_decode_attention(
-        &self,
-        node: &NodeSpec,
-        island: &ktir_optimizer::head_rewrite::DecodeAttnIsland,
-    ) -> Result<(), String> {
-        // argument -> tensor id, from the node bindings.
-        let arg_tid: HashMap<Ssa, u64> = node.bindings.iter().map(|b| (b.arg, b.tensor)).collect();
-        let read_arg = |arg: Ssa, n: usize| -> Result<Vec<f32>, String> {
-            let tid = *arg_tid
-                .get(&arg)
-                .ok_or_else(|| format!("fused attn: arg %{} not bound", arg.0))?;
-            let s = *self
-                .stick
-                .get(&tid)
-                .ok_or_else(|| format!("fused attn: tensor t{tid} has no resident stick"))?;
-            let nbytes = n * self.dtype.bytes_per_elem();
-            let bytes = self.mem.hbm.borrow().read_bytes(s * STICK_BYTES, nbytes);
-            Ok(crate::codec::decode(&bytes, n, self.dtype))
-        };
+    /// A door operand's shape — the RUNNING program's own statement of it
+    /// ([`ResidentProgram::shapes`]), never the merged widest that sizes the shared stick: an id
+    /// past the source ceiling names a different tensor in each program.
+    fn door_shape(&self, prog: usize, tid: u64) -> Option<&Vec<usize>> {
+        self.programs[prog].shapes.get(&tid)
+    }
 
-        let q_cols = island.q_cols as usize;
-        let cap = island.cap as usize;
-        let kv_cols = island.kv_cols as usize;
-        let q = read_arg(island.q_arg, q_cols)?;
-        let mask = read_arg(island.mask_arg, cap)?;
-        // Read only the LIVE context rows. The mask is `[1, cap]` and cheap, but Kc/Vc are
-        // `[cap, kv_cols]` each and every row costs an f16->f32 decode out of HBM — at a
-        // 4096-deep capacity that is most of this function's work, for rows whose softmax
-        // weight is exactly zero. Rows are `[cap, kv_cols]` row-major, so the live prefix
-        // is a leading slice.
-        let live = ktir_optimizer::head_rewrite::DecodeAttnIsland::live_context(&mask);
-        let kc = read_arg(island.kc_arg, live * kv_cols)?;
-        let kd = read_arg(island.kd_arg, kv_cols)?;
-        let vc = read_arg(island.vc_arg, live * kv_cols)?;
-        let vd = read_arg(island.vd_arg, kv_cols)?;
-
-        let mut o = vec![0.0f32; q_cols];
-        island.compute_f32(
-            ktir_optimizer::head_rewrite::DecodeAttnInputs {
-                q: &q,
-                mask: &mask,
-                kc: &kc,
-                kd: &kd,
-                vc: &vc,
-                vd: &vd,
-            },
-            &mut o,
-        );
-
-        // Write the output row back to the O tensor's stick as f16.
-        let o_tid = *arg_tid
-            .get(&island.o_arg)
-            .ok_or_else(|| format!("fused attn: output arg %{} not bound", island.o_arg.0))?;
-        let o_stick = *self
-            .stick
-            .get(&o_tid)
-            .ok_or_else(|| format!("fused attn: output t{o_tid} has no resident stick"))?;
-        let obytes = crate::codec::encode(&o, self.dtype);
-        self.mem
-            .hbm
-            .borrow_mut()
-            .write_bytes(o_stick * STICK_BYTES, &obytes);
-        Ok(())
+    /// A door operand's element count in the running program — `0` when the program states no
+    /// shape for it.
+    fn door_numel(&self, prog: usize, tid: u64) -> usize {
+        self.door_shape(prog, tid)
+            .map_or(0, |s| s.iter().product::<usize>())
     }
 
     /// ONE DOOR STICK'S FULL WORDS — every element, decoded at the stick's
@@ -667,15 +603,17 @@ impl ResidentExecutor {
     /// restaging the real seed (a `LoadConst` carrying the token id, u32
     /// words) is future work for the chain's real-seed leg, never silently
     /// approximated here.
-    fn read_door_stick(&self, tid: u64) -> Result<Vec<f32>, String> {
+    fn read_door_stick(&self, prog: usize, tid: u64) -> Result<Vec<f32>, String> {
         let s = *self
             .stick
             .get(&tid)
             .ok_or_else(|| format!("door: t{tid} has no resident stick"))?;
-        let n = *self
-            .numel
-            .get(&tid)
-            .ok_or_else(|| format!("door: t{tid} has no derived extent"))?;
+        let n = self.door_numel(prog, tid);
+        if n == 0 {
+            return Err(format!(
+                "door: t{tid} has no derived extent in program {prog}"
+            ));
+        }
         let dt = self.view_dtype.get(&tid).copied().unwrap_or(self.dtype);
         let bytes = self
             .mem
@@ -696,15 +634,17 @@ impl ResidentExecutor {
     /// (`hidden` itself); lanes past the mark ride the f16 grid, and no door
     /// read answers them (the row door reads word 0 of each row's sticks
     /// only).
-    fn write_door_stick(&self, tid: u64, vals: &[f32]) -> Result<(), String> {
+    fn write_door_stick(&self, prog: usize, tid: u64, vals: &[f32]) -> Result<(), String> {
         let s = *self
             .stick
             .get(&tid)
             .ok_or_else(|| format!("door: t{tid} has no resident stick"))?;
-        let n = *self
-            .numel
-            .get(&tid)
-            .ok_or_else(|| format!("door: t{tid} has no derived extent"))?;
+        let n = self.door_numel(prog, tid);
+        if n == 0 {
+            return Err(format!(
+                "door: t{tid} has no derived extent in program {prog}"
+            ));
+        }
         if vals.len() != n {
             return Err(format!(
                 "door: t{tid} states {n} elements; the door wrote {} — a per-row window that \
@@ -768,7 +708,7 @@ impl ResidentExecutor {
     /// (logical `[hidden, vocab]`) walks before the lm-head matmul's view, so
     /// the tie between the two `[hidden, vocab]` views lands on the door's
     /// own: `rows = hidden`, the walk's own law.
-    fn run_embed_row_gather(&self, node: &NodeSpec, k: u32) -> Result<(), String> {
+    fn run_embed_row_gather(&self, prog: usize, node: &NodeSpec, k: u32) -> Result<(), String> {
         let tids: Vec<u64> = node.bindings.iter().map(|b| b.tensor).collect();
         if tids.len() != 4 {
             return Err(format!(
@@ -790,7 +730,7 @@ impl ResidentExecutor {
         // the tensor's own dims, so the widest-shape walk hands the door the
         // mint's own statement; a 0-width or non-matrix out is a graph the
         // mint never made.
-        let o_shape = self.shapes.get(&o_tid).ok_or_else(|| {
+        let o_shape = self.door_shape(prog, o_tid).ok_or_else(|| {
             format!("embed_row_gather: the row out t{o_tid} has no derived shape")
         })?;
         if o_shape.len() != 2 || o_shape[0] == 0 {
@@ -806,8 +746,7 @@ impl ResidentExecutor {
         // element — the same per-tid law the pointer binding and the readback
         // use), full extent.
         let shape = self
-            .shapes
-            .get(&w_tid)
+            .door_shape(prog, w_tid)
             .ok_or_else(|| format!("embed_row_gather: the weight t{w_tid} has no derived shape"))?;
         if shape.len() != 2 {
             return Err(format!(
@@ -836,7 +775,7 @@ impl ResidentExecutor {
             .read_bytes(w_stick * STICK_BYTES, nbytes);
         let w = crate::codec::decode(&wbytes, rows * cols, w_dt);
         // The two index sticks, whole — row r's own words are slices of these.
-        let s_shape = self.shapes.get(&s_tid).ok_or_else(|| {
+        let s_shape = self.door_shape(prog, s_tid).ok_or_else(|| {
             format!("embed_row_gather: the s stick t{s_tid} has no derived shape")
         })?;
         if s_shape.len() != 2 || s_shape[0] != width {
@@ -847,7 +786,7 @@ impl ResidentExecutor {
             ));
         }
         let s_lanes = s_shape[1];
-        let l_numel = *self.numel.get(&l_tid).unwrap_or(&0);
+        let l_numel = self.door_numel(prog, l_tid);
         if l_numel == 0 || !l_numel.is_multiple_of(width) {
             return Err(format!(
                 "embed_row_gather: the l stick t{l_tid} states {l_numel} elements over width \
@@ -856,8 +795,8 @@ impl ResidentExecutor {
             ));
         }
         let l_row_words = l_numel / width;
-        let s_buf = self.read_door_stick(s_tid)?;
-        let l_buf = self.read_door_stick(l_tid)?;
+        let s_buf = self.read_door_stick(prog, s_tid)?;
+        let l_buf = self.read_door_stick(prog, l_tid)?;
         let mut out = vec![0.0f32; width * rows];
         for r in 0..width {
             // The golden's own saturating float→int arithmetic (`as usize` in
@@ -887,7 +826,7 @@ impl ResidentExecutor {
         }
         // The rows out decode at the MODEL dtype on readback (the doors' views
         // are Shape-only, so `meta_for`'s per-tid lookup falls to `self.dtype`).
-        self.write_door_stick(o_tid, &out)?;
+        self.write_door_stick(prog, o_tid, &out)?;
         Ok(())
     }
 
@@ -935,6 +874,7 @@ impl ResidentExecutor {
     /// placement's sticks.
     fn run_chain_stage(
         &self,
+        prog: usize,
         node: &NodeSpec,
         pad_vocab: u32,
         hidden: u32,
@@ -978,8 +918,7 @@ impl ResidentExecutor {
         // ⭐ THE WIDTH, OFF THE S-VALUE OUT'S OWN STATED EXTENT —
         // `[width, CHAIN_IDX_BLOCK]`, one decomposed row per request.
         let o_shape = self
-            .shapes
-            .get(&o_tid)
+            .door_shape(prog, o_tid)
             .ok_or_else(|| format!("chain_stage: the s-value out t{o_tid} has no derived shape"))?;
         if o_shape.len() != 2 || o_shape[0] == 0 {
             return Err(format!(
@@ -994,8 +933,7 @@ impl ResidentExecutor {
         // read, mirrored: whatever the producer stated (the argmax's idx stick
         // is [width, 1]), row r's pick is word 0 of ITS row.
         let p_shape = self
-            .shapes
-            .get(&pick_tid)
+            .door_shape(prog, pick_tid)
             .ok_or_else(|| format!("chain_stage: the pick t{pick_tid} has no derived shape"))?;
         if p_shape.len() != 2 || p_shape[0] != width {
             return Err(format!(
@@ -1009,7 +947,7 @@ impl ResidentExecutor {
         // `[width, 32]` (its row width IS the pattern's lane count,
         // CHAIN_IDX_BLOCK), the l stick `[width·l_sticks, 32]` (row r's
         // l_sticks sticks contiguous).
-        let s_numel = *self.numel.get(&s_tid).unwrap_or(&0);
+        let s_numel = self.door_numel(prog, s_tid);
         if s_numel == 0 || !s_numel.is_multiple_of(width) || s_numel / width != lanes {
             return Err(format!(
                 "chain_stage: the s stick t{s_tid} states {s_numel} elements over width \
@@ -1017,7 +955,7 @@ impl ResidentExecutor {
                  CHAIN_IDX_BLOCK], one stick row per request"
             ));
         }
-        let l_numel = *self.numel.get(&l_tid).unwrap_or(&0);
+        let l_numel = self.door_numel(prog, l_tid);
         if l_numel == 0 || !l_numel.is_multiple_of(width) {
             return Err(format!(
                 "chain_stage: the l stick t{l_tid} states {l_numel} elements over width \
@@ -1029,7 +967,7 @@ impl ResidentExecutor {
         // The ramp's modulus — the payload's own hidden, never the stick's
         // lane count (`chain_l_stick_ramp`'s own law).
         let entries = hidden / 64;
-        let pick_buf = self.read_door_stick(pick_tid)?;
+        let pick_buf = self.read_door_stick(prog, pick_tid)?;
         let mut s_pat = vec![0.0f32; s_numel];
         let mut l_ramp = vec![0.0f32; l_numel];
         let mut out = vec![0.0f32; width * lanes];
@@ -1066,8 +1004,8 @@ impl ResidentExecutor {
                 l_ramp[r * l_row_words + j as usize] = v as f32;
             }
         }
-        self.write_door_stick(s_tid, &s_pat)?;
-        self.write_door_stick(l_tid, &l_ramp)?;
+        self.write_door_stick(prog, s_tid, &s_pat)?;
+        self.write_door_stick(prog, l_tid, &l_ramp)?;
         // The fresh s-value stick is the node's ONE compared output; its
         // Shape-only view reads back at the MODEL dtype (`meta_for`'s law), so
         // it is encoded there. The gate's compare is RELATIVE
@@ -1076,7 +1014,7 @@ impl ResidentExecutor {
         // not ir.result (the exact-0 index law binds only
         // `tid == ir.result.index()`), so it takes the clean tolerance — the
         // emulator's modelling of the card's u32 stick, stated, not hidden.
-        self.write_door_stick(o_tid, &out)?;
+        self.write_door_stick(prog, o_tid, &out)?;
         Ok(())
     }
 
@@ -1509,7 +1447,7 @@ impl ResidentExecutor {
                     // missing-Strides refusal, not a fallback.
                     let door_ran = match node.program {
                         Program::EmbedRowGather { k } => {
-                            self.run_embed_row_gather(node, k)?;
+                            self.run_embed_row_gather(idx, node, k)?;
                             true
                         }
                         Program::ChainStage {
@@ -1518,39 +1456,16 @@ impl ResidentExecutor {
                             k,
                             ..
                         } => {
-                            self.run_chain_stage(node, pad_vocab, hidden, k)?;
+                            self.run_chain_stage(idx, node, pad_vocab, hidden, k)?;
                             true
                         }
                         _ => false,
                     };
-                    // FUSED CPU m=1 ATTENTION (default ON; opt out via
-                    // KTIR_NO_FUSE_ATTN): when the native segment recognizes as the
-                    // decode (m=1) attention island, compute it directly with
-                    // BLAS-style GEMV + softmax + GEMV per head against resident HBM
-                    // — collapsing the ~1500-op decomposed storm to ~3·H primitives.
-                    // Default-on: the planner isolates this node into a Native
-                    // segment unless KTIR_NO_FUSE_ATTN is set (then it stays folded
-                    // in a Fused segment, decomposed — the oracle path), so
-                    // recognition here is the steady-state path for an isolated m=1
-                    // attention node. If recognition fails (a non-decode native
-                    // node), fall through to the decomposed grid run below.
-                    let fused = if !door_ran && self.fuse_attn {
-                        if let Some(island) =
-                            ktir_optimizer::head_rewrite::recognize_head_attention_decode(func)
-                        {
-                            self.run_fused_decode_attention(node, &island)?;
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
                     if seg_prof {
                         native_ops = op_type_histogram(func.operations);
                     }
-                    if fused || door_ran {
-                        // computed in the fused/door path; outputs already resident in HBM.
+                    if door_ran {
+                        // computed by the host door; outputs already resident in HBM.
                     } else {
                         let grid = func.grid;
                         let mut input_ptrs: Vec<(Ssa, Value)> =

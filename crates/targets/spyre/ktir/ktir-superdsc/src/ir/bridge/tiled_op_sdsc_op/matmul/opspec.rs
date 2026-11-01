@@ -149,21 +149,7 @@ pub fn matmul_opspec_off_operands_phys<DF: DataFormat>(
         // The strides ride ON the batch axis, so they arrive here already paired with the `y` extent
         // they describe — there is no slot for a caller to fill one without the other.
         batch.batch_strides(),
-        // The contraction's own split rides ON the K — see `ContractionSplit` — and the output's ON
-        // the N — see `OutputSplit`. Every door but the chunk's decode value leg and its decode score
-        // parts is `Planned` on both, which is the form's splitter exactly as before.
-        match (k.split(), n.split()) {
-            (crate::sdsc_abstract::ContractionSplit::AcrossCores, _) => {
-                super::dims::matmul_split_map_contraction
-            }
-            (_, crate::sdsc_abstract::OutputSplit::ColumnsAcrossCores) => {
-                super::dims::matmul_split_map_columns
-            }
-            (_, crate::sdsc_abstract::OutputSplit::RowsAcrossCores) => {
-                super::dims::matmul_split_map_rows
-            }
-            _ => matmul_split_map_for(form),
-        },
+        matmul_split_map_for(form),
     )
 }
 
@@ -496,6 +482,16 @@ where
         )
         .map_err(|e| e.0)?
         .with_offset(a_off);
+        // ⭐ THE ACTIVATION'S OWN ROW COUNT, WHEN THIS OP SWEEPS A SLICE OF IT — the same law the
+        // output takes below: a stick-blocked view's stick-group stride comes from its `mb` DEVICE
+        // extent, so a slice of a taller activation (a batched contraction's batch rows, read out of
+        // the flat frame) is addressed with the TENSOR's rows, not the op's.
+        let input = match phys_mb {
+            Some(phys) if phys > plan.extent(MbAxis::NAME) => input
+                .with_device_extent(MbAxis::NAME, phys)
+                .map_err(|e| e.0)?,
+            _ => input,
+        };
         let output_walk = Walk2::output_rows_by_n();
         let output = TensorArg::<2>::new(
             false,
@@ -963,4 +959,409 @@ pub fn matmul_opspec_batched_off(
         indirect: None,
         coordinate_mask: None,
     })
+}
+
+/// ⭐⭐ torch-spyre's ALL-HEADS CONTRACTION — `[b, m, k] × [b, k, n] → [b, m, n]` as ONE `batchmatmul`
+/// over `N_ {x: b, mb: m, out: n, in: k}`, split `{x: b}`: core `x` contracts batch `x`'s `[m, k]`
+/// against its own `[k, n]` kernel. Its compiled decode trip states exactly this (its QKᵀ and P·V,
+/// `numWkSlicesPerDim_ {x: 8, mb: 1, out: 1, in: 1}`), one kv head a core, so the op divides as the
+/// trip's elementwise ops do and every intermediate can stay in that core's LX.
+///
+/// ⛔ ITS KERNEL IS CORE-LOCAL LX, AS THE REFERENCE'S IS. A 3-D per-batch kernel read from HBM with a
+/// distinct start per core FAULTED on the card ([`matmul_opspec_batched_off`]'s doc); the reference never
+/// patches its kernel per core because each core's block is already in its own LX. The caller refuses
+/// the form unless the scratchpad plan put the kernel there.
+///
+/// The activation and output are the flat frames a walk's rank-3 values live in, `[b·m, k]` and
+/// `[b·m, n]` stick-major ([`crate::superdsc_opspec::ViewFrame::FoldedRows`]: core `x` starts at row
+/// `x·m`), stated to dxp innermost-first as the reference states them (`['mb','x','in']`,
+/// `['mb','x','out']`); the kernel is the blocks a batched transpose or a page gather lays one after
+/// another, batch `x`'s stick-major `[k, n]` at `x·k·n` (`['in','out','x']`, the reference's own
+/// kernel order).
+pub fn matmul_opspec_x_batched(
+    batch: u32,
+    (m, n, k): (u32, u32, u32),
+    (a_name, w_name, o_name): (&str, &str, &str),
+) -> Result<OpSpec, String> {
+    use crate::superdsc_opspec::{ItDim, ViewFrame};
+    let n_ext = StickExtent::<Fp16>::new(n)?;
+    let k_ext = StickExtent::<Fp16>::new(k)?;
+    // One batch a core, or past the cores, as many consecutive batches a core as divide evenly
+    // (a decode batch's `J · B · KV` blocks).
+    let cores = crate::work::core_split(batch, MAX_CORES);
+    if batch <= 1 || cores <= 1 {
+        return Err(format!(
+            "matmul_opspec_x_batched('{o_name}'): a batch of {batch} divides over no cores of \
+             {MAX_CORES}"
+        ));
+    }
+    let dim = |name: &'static str, size: u32, is_reduction: bool, is_stick: bool| ItDim {
+        name,
+        size,
+        is_reduction,
+        is_stick,
+        df: Df::Fp16,
+    };
+    let dims = [
+        dim("x", batch, false, false),
+        dim(MbAxis::NAME, m, false, false),
+        dim(OutAxis::NAME, n_ext.elems(), false, true),
+        dim(InAxis::NAME, k_ext.elems(), true, true),
+    ];
+    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
+        std::collections::BTreeMap::from([("x", cores)])
+    })?;
+    let active = [Scale::Active, Scale::Active, Scale::Active];
+    let input = TensorArg::<3>::new(
+        true,
+        a_name.to_string(),
+        Role::Input,
+        active,
+        plan.iter_syms(["x", MbAxis::NAME, InAxis::NAME]),
+        ["x", MbAxis::NAME, InAxis::NAME],
+        InAxis::NAME,
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?
+    .with_frame(ViewFrame::FoldedRows)
+    .with_device_order([MbAxis::NAME, "x", InAxis::NAME])
+    .map_err(|e| e.0)?;
+    let kernel = TensorArg::<3>::new(
+        true,
+        w_name.to_string(),
+        Role::Kernel,
+        active,
+        plan.iter_syms(["x", InAxis::NAME, OutAxis::NAME]),
+        ["x", InAxis::NAME, OutAxis::NAME],
+        OutAxis::NAME,
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?
+    .with_device_order([InAxis::NAME, OutAxis::NAME, "x"])
+    .map_err(|e| e.0)?;
+    let output = TensorArg::<3>::new(
+        false,
+        o_name.to_string(),
+        Role::Output,
+        active,
+        plan.iter_syms(["x", MbAxis::NAME, OutAxis::NAME]),
+        ["x", MbAxis::NAME, OutAxis::NAME],
+        OutAxis::NAME,
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?
+    .with_frame(ViewFrame::FoldedRows)
+    .with_device_order([MbAxis::NAME, "x", OutAxis::NAME])
+    .map_err(|e| e.0)?;
+    Ok(OpSpec {
+        op: OpFunc::matmul(batch),
+        is_reduction: true,
+        iter: plan,
+        args: vec![
+            AnyTensorArg::R3(input),
+            AnyTensorArg::R3(kernel),
+            AnyTensorArg::R3(output),
+        ],
+        op_info: OpInfo::None,
+        tiled_symbols: Vec::new(),
+        time_tile: None,
+        indirect: None,
+        coordinate_mask: None,
+    })
+}
+
+/// Where a batched operand's batch sits among its rows in the flat frame `[b·m, ·]` it lives in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchRows {
+    /// Batch-major: batch `x`'s row `r` is flat row `x·m + r` (the head-major frame).
+    Outer,
+    /// Batch-minor: flat row `r·b + x`, every batch's row `r` together — the reference's prompt trip,
+    /// its kv heads innermost, so a split of the rows hands each core one contiguous run.
+    Inner,
+}
+
+impl BatchRows {
+    /// The view's own frame, outermost first.
+    const fn layout(self, stick: &'static str) -> [&'static str; 3] {
+        match self {
+            BatchRows::Outer => ["x", MbAxis::NAME, stick],
+            BatchRows::Inner => [MbAxis::NAME, "x", stick],
+        }
+    }
+
+    /// The same frame in the order dxp reads `layoutDimOrder_`, innermost first.
+    const fn device(self, stick: &'static str) -> [&'static str; 3] {
+        match self {
+            BatchRows::Outer => [MbAxis::NAME, "x", stick],
+            BatchRows::Inner => ["x", MbAxis::NAME, stick],
+        }
+    }
+}
+
+/// ⭐⭐ torch-spyre's PROMPT-TRIP CONTRACTION — `[b, m, k] × [b, k, n] → [b, m, n]` as ONE `batchmatmul`
+/// over `N_ {x: b, mb: m, out: n, in: k}`, split `{mb: chunks}` and the batch whole on every core: core
+/// `c` contracts rows `c·m/chunks..` of every batch against every batch's kernel. The reference's
+/// compiled prompt trip divides its QKᵀ and P·V this way (split on its prompt rows alone,
+/// `numWkSlicesPerDim_ {y: 16}`), so its kernels — Kᵀ and V — are read from HBM at ONE start by every
+/// core, never patched per core (the per-core 3-D HBM kernel is the form that faulted,
+/// [`matmul_opspec_batched_off`]'s doc).
+///
+/// The activation and the output each state where the batch sits in their rows ([`BatchRows`]); the
+/// reference's own QKᵀ reads its query head-major and writes its scores kv-innermost, so the two may
+/// differ. Both are flat stick-major frames read through
+/// [`crate::superdsc_opspec::ViewFrame::FoldedRows`]. The kernel is the batch's blocks one after another
+/// (`['in','out','x']`), as [`matmul_opspec_x_batched`]'s.
+pub fn matmul_opspec_rows_split(
+    batch: u32,
+    (m, n, k): (u32, u32, u32),
+    chunks: u32,
+    (a_rows, o_rows): (BatchRows, BatchRows),
+    (a_name, w_name, o_name): (&str, &str, &str),
+) -> Result<OpSpec, String> {
+    use crate::superdsc_opspec::{ItDim, ViewFrame};
+    let n_ext = StickExtent::<Fp16>::new(n)?;
+    let k_ext = StickExtent::<Fp16>::new(k)?;
+    if batch == 0 || chunks <= 1 || chunks > MAX_CORES || !m.is_multiple_of(chunks) {
+        return Err(format!(
+            "matmul_opspec_rows_split('{o_name}'): {m} rows of {batch} batch(es) in {chunks} chunks \
+             — the rows split into 2 to {MAX_CORES} whole chunks"
+        ));
+    }
+    let dim = |name: &'static str, size: u32, is_reduction: bool, is_stick: bool| ItDim {
+        name,
+        size,
+        is_reduction,
+        is_stick,
+        df: Df::Fp16,
+    };
+    let dims = [
+        dim("x", batch, false, false),
+        dim(MbAxis::NAME, m, false, false),
+        dim(OutAxis::NAME, n_ext.elems(), false, true),
+        dim(InAxis::NAME, k_ext.elems(), true, true),
+    ];
+    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
+        std::collections::BTreeMap::from([(MbAxis::NAME, chunks)])
+    })?;
+    let active = [Scale::Active, Scale::Active, Scale::Active];
+    let rows = |is_input: bool,
+                name: &str,
+                role: Role,
+                order: BatchRows,
+                stick: &'static str|
+     -> Result<TensorArg<3>, String> {
+        TensorArg::<3>::new(
+            is_input,
+            name.to_string(),
+            role,
+            active,
+            plan.iter_syms(order.layout(stick)),
+            order.layout(stick),
+            stick,
+            Allocation::Hbm,
+        )
+        .map_err(|e| e.0)?
+        .with_frame(ViewFrame::FoldedRows)
+        .with_device_order(order.device(stick))
+        .map_err(|e| e.0)
+    };
+    let input = rows(true, a_name, Role::Input, a_rows, InAxis::NAME)?;
+    let kernel = TensorArg::<3>::new(
+        true,
+        w_name.to_string(),
+        Role::Kernel,
+        active,
+        plan.iter_syms(["x", InAxis::NAME, OutAxis::NAME]),
+        ["x", InAxis::NAME, OutAxis::NAME],
+        OutAxis::NAME,
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?
+    .with_device_order([InAxis::NAME, OutAxis::NAME, "x"])
+    .map_err(|e| e.0)?;
+    let output = rows(false, o_name, Role::Output, o_rows, OutAxis::NAME)?;
+    Ok(OpSpec {
+        op: OpFunc::matmul(batch),
+        is_reduction: true,
+        iter: plan,
+        args: vec![
+            AnyTensorArg::R3(input),
+            AnyTensorArg::R3(kernel),
+            AnyTensorArg::R3(output),
+        ],
+        op_info: OpInfo::None,
+        tiled_symbols: Vec::new(),
+        time_tile: None,
+        indirect: None,
+        coordinate_mask: None,
+    })
+}
+
+#[cfg(test)]
+mod x_batched_tests {
+    use super::*;
+
+    /// Each operand's `(layoutDimOrder_, per-core start offsets from core 0, in bytes)`.
+    fn operands(op: &OpSpec) -> Vec<(Vec<String>, Vec<u64>)> {
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+        let mut sym = 0i64;
+        let emitted = crate::emit::emit_sdsc_tiled("bmm_x", op, &folds, &mut sym, None)
+            .expect("the all-heads contraction emits");
+        let dsc = emitted.op.expect("a descriptor").dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc")
+            .clone();
+        dsc.scheduleTree_
+            .iter()
+            .filter(|n| n.nodeType_ == "allocate")
+            .map(|n| {
+                let at = |c: u32| -> u64 {
+                    n.startAddressCoreCorelet_.data_[&format!("[{c}, 0, 0]")]
+                        .parse()
+                        .expect("a decimal address")
+                };
+                let order = serde_json::to_value(&n.layoutDimOrder_).expect("an order");
+                let order = order
+                    .as_array()
+                    .expect("a list")
+                    .iter()
+                    .map(|v| v.as_str().expect("a dim").to_string())
+                    .collect();
+                (order, (0..8).map(|c| at(c) - at(0)).collect())
+            })
+            .collect()
+    }
+
+    /// ⭐ THE REFERENCE'S QKᵀ AT granite-3.1-2b's 128-SLOT PAGE — 8 kv heads, a core each: core `x`
+    /// reads kv head `x`'s 4 query rows of the flat `[32, 64]` query (`x·4·64` elements in), its own
+    /// `[64, 128]` Kᵀ block (`x·64·128`), and writes its 4 rows of the flat `[32, 128]` scores, whose
+    /// second stick sits a whole 32-row plane on, so its rows start `x·4·64` in as well. Each operand
+    /// states its order to dxp innermost-first, as the reference's compiled program does.
+    #[test]
+    fn the_all_heads_contraction_hands_each_core_its_kv_head() {
+        let op = matmul_opspec_x_batched(8, (4, 128, 64), ("q", "kt", "sc"))
+            .expect("the 2b score leg builds");
+        assert_eq!(op.iter.splits().get("x"), Some(&8), "one kv head a core");
+        assert_eq!(op.iter.cores_used().get(), 8);
+        let ops = operands(&op);
+        let step = |bytes: u64| (0..8).map(|c| c * bytes).collect::<Vec<u64>>();
+        assert_eq!(
+            ops[0],
+            (vec!["mb".into(), "x".into(), "in".into()], step(4 * 64 * 2))
+        );
+        assert_eq!(
+            ops[1],
+            (
+                vec!["in".into(), "out".into(), "x".into()],
+                step(64 * 128 * 2)
+            )
+        );
+        assert_eq!(
+            ops[2],
+            (
+                vec!["mb".into(), "x".into(), "out".into()],
+                step(4 * 64 * 2)
+            )
+        );
+    }
+
+    /// The P·V at the same page: the probabilities' 4 rows of the flat `[32, 128]` (two sticks a row,
+    /// the second a plane on) against kv head `x`'s `[128, 64]` V block, into its 4 rows of `[32, 64]`.
+    #[test]
+    fn the_value_contraction_reads_the_flat_probabilities() {
+        let op = matmul_opspec_x_batched(8, (4, 64, 128), ("p", "v", "pv"))
+            .expect("the 2b value leg builds");
+        let ops = operands(&op);
+        let step = |bytes: u64| (0..8).map(|c| c * bytes).collect::<Vec<u64>>();
+        assert_eq!(ops[0].1, step(4 * 64 * 2), "row x·4 of the first plane");
+        assert_eq!(ops[1].1, step(128 * 64 * 2), "kv head x's block");
+        assert_eq!(ops[2].1, step(4 * 64 * 2));
+    }
+}
+
+#[cfg(test)]
+mod rows_split_tests {
+    use super::*;
+
+    /// Each operand's `(layoutDimOrder_, every core's start offset from core 0, in bytes)`.
+    fn operands(op: &OpSpec) -> Vec<(serde_json::Value, Vec<u64>)> {
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+        let mut sym = 0i64;
+        let emitted = crate::emit::emit_sdsc_tiled("bmm_r", op, &folds, &mut sym, None)
+            .expect("the contraction emits");
+        let dsc = emitted.op.expect("a descriptor").dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc")
+            .clone();
+        let cores = op.iter.cores_used().get();
+        dsc.scheduleTree_
+            .iter()
+            .filter(|n| n.nodeType_ == "allocate")
+            .map(|n| {
+                let at = |c: u32| -> u64 {
+                    n.startAddressCoreCorelet_.data_[&format!("[{c}, 0, 0]")]
+                        .parse()
+                        .expect("a decimal address")
+                };
+                (
+                    serde_json::to_value(&n.layoutDimOrder_).expect("an order"),
+                    (0..cores).map(|c| at(c) - at(0)).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// ⭐ THE REFERENCE'S PROMPT QKᵀ SHAPE at granite-3.1-2b's 128-row chunk: 8 kv heads of `4·128`
+    /// query rows against `[64, 128]` Kᵀ blocks, the rows in 16 chunks. Core `c` reads chunk `c` of
+    /// every kv head's rows of the head-major query (32 rows in), every Kᵀ block at the SAME start, and
+    /// writes its chunk of the kv-innermost scores: 32 rows of 8 kv heads, 256 rows in.
+    #[test]
+    fn each_core_contracts_its_rows_of_every_head_against_the_shared_kernel() {
+        let op = matmul_opspec_rows_split(
+            8,
+            (512, 128, 64),
+            16,
+            (BatchRows::Outer, BatchRows::Inner),
+            ("q", "kt", "sc"),
+        )
+        .expect("the 2b prompt score leg builds");
+        assert_eq!(op.iter.splits().get("mb"), Some(&16));
+        assert_eq!(
+            op.iter.splits().get("x"),
+            None,
+            "every kv head on every core"
+        );
+        let ops = operands(&op);
+        let step = |bytes: u64| (0..16).map(|c| c * bytes).collect::<Vec<u64>>();
+        assert_eq!(
+            ops[0],
+            (serde_json::json!(["mb", "x", "in"]), step(32 * 64 * 2))
+        );
+        assert_eq!(
+            ops[1],
+            (serde_json::json!(["in", "out", "x"]), vec![0; 16]),
+            "one kernel start for every core"
+        );
+        assert_eq!(
+            ops[2],
+            (serde_json::json!(["x", "mb", "out"]), step(32 * 8 * 64 * 2))
+        );
+    }
+
+    /// A chunk count that does not divide the rows is refused.
+    #[test]
+    fn rows_that_do_not_divide_are_refused() {
+        assert!(
+            matmul_opspec_rows_split(
+                8,
+                (500, 128, 64),
+                16,
+                (BatchRows::Inner, BatchRows::Inner),
+                ("a", "w", "o"),
+            )
+            .is_err()
+        );
+    }
 }

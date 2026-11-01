@@ -474,6 +474,67 @@ pub fn assemble_matmul_placed<O: crate::sdsc_abstract::KindTag>(
     )
 }
 
+/// One operand of a row-sliced contraction ([`assemble_matmul_rows`]): its handle and the element
+/// base of the window this op takes of it.
+pub struct RowsOperand<'a, T: crate::sdsc_abstract::KindTag> {
+    pub h: &'a Stk<T>,
+    pub off: u32,
+}
+
+/// The extents of a row-sliced contraction: the `[m, k] · [k, n]` it computes, the row count of the
+/// `[rows, n]` tensor its output is a slice of, and the row count of the stick-major tensor its
+/// activation is read from (`rows` for a slice of the flat frame, `m` for a batch block standing
+/// alone).
+#[derive(Clone, Copy, Debug)]
+pub struct RowsShape {
+    pub m: MatM,
+    pub n: MatN,
+    pub k: MatK,
+    pub rows: u32,
+    pub a_rows: u32,
+}
+
+/// ⭐ ONE BATCH OF A BATCHED CONTRACTION over flat-frame operands — `linalg.batch_matmul`'s per-batch
+/// descriptor. Its activation and output are rows `[r0, r0 + m)` of `[rows, k]` / `[rows, n]`
+/// stick-major tensors (the flat frame every rank-3 value lives in), and its kernel is a standalone
+/// `[k, n]` block. A row slice of a stick-major tensor is addressed at element base `r0 · stick` with
+/// the TENSOR's row count as the `mb` device extent — its stick-group stride is `rows · stick`, not the
+/// op's `m · stick` (`matmul_opspec_split`'s `phys_mb`, on both the activation and the output).
+pub fn assemble_matmul_rows(
+    op_name: &str,
+    shape: RowsShape,
+    a: RowsOperand<'_, crate::sdsc_abstract::RowBlockedTag>,
+    w: RowsOperand<'_, crate::sdsc_abstract::KernelTag>,
+    o: RowsOperand<'_, crate::sdsc_abstract::RowBlockedTag>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let form = SharedKernelBmmForm::batch_inner_proven(super::walk::MatmulWrapperSite::witness());
+    let mut op = matmul_opspec_split::<Fp16, _>(
+        shape.m.get(),
+        shape.n.get(),
+        shape.k.get(),
+        1,
+        a.h.name(),
+        w.h.name(),
+        o.h.name(),
+        a.off,
+        w.off,
+        o.off,
+        <Fp16 as DataFormat>::DF,
+        Some(shape.rows),
+        form,
+        None,
+        super::dims::matmul_split_map_for(form),
+    )?;
+    // The activation's own stick-group pitch, when it is not the output's: a batch block read on
+    // its own (`a_rows == m`) is a standalone stick-major `[m, k]`.
+    if shape.a_rows != shape.rows {
+        op.args[0].set_device_extent("mb", shape.a_rows);
+    }
+    Ok(assemble_from_opspec(op_name, op, sym_id_base, layout))
+}
+
 /// Shared tail: work-division folds + emit. Identical for both entry points, so a change to how an
 /// OpSpec becomes an EmittedOp cannot apply to one and not the other.
 fn assemble_from_opspec(

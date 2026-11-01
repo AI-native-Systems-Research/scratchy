@@ -1,0 +1,161 @@
+{
+  "config": "batched_decode_chunks",
+  "geometry": {
+    "NQH": 14,
+    "NKVH": 2,
+    "HD": 64,
+    "BLOCK": 64,
+    "NUM_PAGES": 33
+  },
+  "step": {
+    "contexts": [
+      600,
+      70,
+      300,
+      1
+    ],
+    "seqs_bucket": 4,
+    "num_pages": 33,
+    "geom": {
+      "NQH": 14,
+      "NKVH": 2
+    }
+  },
+  "derived": {
+    "kv_lens": [
+      601,
+      71,
+      301,
+      2
+    ],
+    "blocks": [
+      10,
+      2,
+      5,
+      1
+    ],
+    "tables": [
+      [
+        32,
+        16,
+        17,
+        3,
+        30,
+        28,
+        31,
+        0,
+        4,
+        12
+      ],
+      [
+        10,
+        15
+      ],
+      [
+        27,
+        7,
+        8,
+        2,
+        19
+      ],
+      [
+        29
+      ]
+    ],
+    "blocks_bucket": 16,
+    "theirs": {
+      "blocks_per_chunk": 8,
+      "num_chunks": 2
+    },
+    "triton": {
+      "blocks_per_chunk": 8,
+      "num_chunks": 2,
+      "entries": 32,
+      "rows_per_page": 1
+    },
+    "scale": 0.125,
+    "geometry": {
+      "NQH": 14,
+      "NKVH": 2,
+      "HD": 64,
+      "BLOCK": 64,
+      "NUM_PAGES": 33
+    }
+  },
+  "seqs": 4,
+  "files": {
+    "q": {
+      "file": "q.bin",
+      "dtype": "f16",
+      "shape": [
+        4,
+        896
+      ]
+    },
+    "kp": {
+      "file": "kp.bin",
+      "dtype": "f16",
+      "shape": [
+        33,
+        2,
+        64,
+        64
+      ]
+    },
+    "vp": {
+      "file": "vp.bin",
+      "dtype": "f16",
+      "shape": [
+        33,
+        2,
+        64,
+        64
+      ]
+    },
+    "rep_row_ids": {
+      "file": "rep_row_ids.bin",
+      "dtype": "i32",
+      "shape": [
+        32
+      ]
+    },
+    "chunk_page_ids": {
+      "file": "chunk_page_ids.bin",
+      "dtype": "i32",
+      "shape": [
+        2,
+        32,
+        1
+      ]
+    },
+    "mask": {
+      "file": "mask.bin",
+      "dtype": "f16",
+      "shape": [
+        128,
+        64
+      ]
+    },
+    "out_f16": {
+      "file": "out_f16.bin",
+      "dtype": "f16",
+      "shape": [
+        4,
+        896
+      ]
+    },
+    "out_f32": {
+      "file": "out_f32.bin",
+      "dtype": "f32",
+      "shape": [
+        4,
+        896
+      ]
+    }
+  },
+  "seed": 0,
+  "torch": "2.8.0",
+  "spyre_inference": "297fc48a339062e1609a963f9d89854000953baa",
+  "generated_by": "crates/triton/test-numeric/gen_paged_attn_data.py",
+  "reference": "spyre-inference reshape_and_cache_head_major_kernel, then batched_decode_head_major_kernel, unmodified, SPYRE_ATTN_FOR_EACH_TILE=0"
+}

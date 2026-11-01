@@ -48,7 +48,7 @@ use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::opkind::OpKind;
 
 use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gathers_of, regions};
-use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind};
+use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind, Scratch};
 // The broadcast AXIS is the emission door's own vocabulary — `elementwise` selects the `In` builder
 // from it — so it lives beside that door and this recogniser names the same type rather than a
 // parallel one that would have to be mapped across the boundary. The CONVERT KIND is the same
@@ -733,9 +733,299 @@ pub fn program_silu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<SiluMulCha
         if readers.next().is_some() || head.is_none_or(|o| o.op_type != OpKind::MathExp) {
             continue;
         }
+        // ⭐ AND THE `exp` FEEDS A SIGMOID'S `1 + e`. An exponential of a negation that no `addf`
+        // reads is not a sigmoid at all but the program's own `exp(-x)` — spyre-inference's
+        // online-softmax rescale `exp(-relu(scores_max - tile_max))`, read by the running sum and
+        // the running output — and lowers as the two ops it states. One that does feed an `addf`
+        // is claimed, and every link of its chain must close.
+        let Some(exp_v) = head.and_then(|o| o.result) else {
+            continue;
+        };
+        if !deep
+            .iter()
+            .any(|o| o.op_type == OpKind::ArithAddf && o.operands.contains(&exp_v))
+        {
+            continue;
+        }
         out.push(silu_mul_chain_from(f, neg)?);
     }
     Ok(out)
+}
+
+/// A gathered table's `[rows, cols]` — the gather's tile's data view.
+fn gather_table_dims(f: &IRFunction<'static>, g: &Gather) -> Result<(u32, u32), Error> {
+    let tile = f.operations.iter().find(|o| o.result == Some(g.tile));
+    let view = tile
+        .and_then(|t| t.operands.first().copied())
+        .and_then(|v| f.operations.iter().find(|o| o.result == Some(v)));
+    let dims = view.and_then(|v| v.result_type).and_then(|t| t.dims());
+    match dims {
+        Some(&[r, c]) => Ok((r as u32, c as u32)),
+        other => err(format!(
+            "{}: a gathered table states a {other:?} view — a row gather reads a 2-D `[rows, cols]` \
+             table",
+            f.name
+        )),
+    }
+}
+
+/// `r`'s buffer read in the `[rows, cols]` frame of the same card bytes.
+fn reframed(r: Region, [rows, cols]: [u32; 2]) -> Region {
+    Region {
+        v_rows: rows,
+        v_cols: cols,
+        r_start: 0,
+        c_start: 0,
+        r_len: rows,
+        c_len: cols,
+        r_cover: (0, rows),
+        c_cover: (0, cols),
+        ..r
+    }
+}
+
+/// ⭐ THE HEAD-MAJOR PAIR at `op` — a reshape/transpose pair between a stick-major `[B, A·W]` block
+/// and the head-major `[A·B, W]`: `(the pair's last result, the frame it is read in, W in sticks)`.
+/// At `W` one stick the pair moves no byte (below); wider, it is [`HeadMajorCopies`].
+///
+/// A stick-major `[B, A·S]` buffer (`S` one stick) holds stick column `a` of row `b` at
+/// `(a·B + b)·S` — head-major `[A, B, S]` row-major, byte for byte. So
+///
+/// * `reshape [B, A·S] → [B, A, S]` read only by `transpose [1, 0, 2] → [A, B, S]` is the source in
+///   the `[A·B, S]` frame (`op` the reshape), and
+/// * `transpose [1, 0, 2]` of `[A, B, S]` row-major `→ [B, A, S]` read only by
+///   `reshape → [B, A·S]` is the source in the stick-major `[B, A·S]` frame (`op` the transpose).
+///
+/// `None` for anything else.
+fn head_major_pair(
+    f: &IRFunction<'static>,
+    op: &ktir_core::ir::Operation<'static>,
+    from: &[i64],
+    to: &[i64],
+) -> Option<(Ssa, [u32; 2], u32)> {
+    let stick = i64::from(crate::work::FP16_ELEMS_PER_STICK);
+    let res = op.result?;
+    let deep = f.ops_deep();
+    let sole_reader = |v: Ssa| {
+        let mut rs = deep
+            .iter()
+            .copied()
+            .filter(move |o| o.operands.contains(&v));
+        let first = rs.next();
+        if rs.next().is_some() { None } else { first }
+    };
+    let perm_102 = |o: &ktir_core::ir::Operation<'static>| {
+        o.op_type == OpKind::LinalgTranspose
+            && o.attributes.iter().any(|(k, v)| {
+                matches!((k, v), (AttrKey::Permutation, Attr::IntList(p)) if *p == [1, 0, 2])
+            })
+    };
+    let dims_of = |o: &ktir_core::ir::Operation<'static>| -> Option<Vec<i64>> {
+        o.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec)
+    };
+    match op.op_type {
+        OpKind::TensorReshape => {
+            let ([b, aw], [b2, a, s]) = (from, to) else {
+                return None;
+            };
+            if b != b2 || s % stick != 0 || a * s != *aw {
+                return None;
+            }
+            let t = sole_reader(res).filter(|o| perm_102(o))?;
+            if dims_of(t)? != [*a, *b, *s] {
+                return None;
+            }
+            Some((t.result?, [(a * b) as u32, *s as u32], (s / stick) as u32))
+        }
+        OpKind::LinalgTranspose if perm_102(op) => {
+            let [a, b, s] = from else {
+                return None;
+            };
+            if s % stick != 0 || to != [*b, *a, *s] {
+                return None;
+            }
+            let r = sole_reader(res).filter(|o| o.op_type == OpKind::TensorReshape)?;
+            if dims_of(r)? != [*b, a * s] {
+                return None;
+            }
+            Some((r.result?, [*b as u32, (a * s) as u32], (s / stick) as u32))
+        }
+        _ => None,
+    }
+}
+
+/// ⭐ THE HEAD-MAJOR PAIR AT A HEAD `S > 1` STICKS WIDE — the stick-major `[B, A·S·stick]` block
+/// holds head `a`'s stick `s` as the run of `B` sticks at stick column `a·S + s`, and the head-major
+/// `[A·B, S·stick]` holds it at `s·A·B + a·B`. So the relayout either way is `S` copies — one per
+/// stick of a head — of `A` runs of `B` sticks, at pitch `S·B` on the block's side and `B` on the
+/// head-major side ([`crate::ir::bridge::tiled_op_sdsc_op::StickRuns`]): spyre-inference's
+/// `q_rows.unsqueeze(0).transpose(1, 2).reshape(...)` and its output's inverse, at head dim 128.
+struct HeadMajorCopies<'a> {
+    block: &'a Region,
+    heads: &'a Region,
+    a: u32,
+    b: u32,
+    sticks: u32,
+}
+
+impl<'a> HeadMajorCopies<'a> {
+    /// The copies between `block` (`[B, A·S·stick]`) and `heads` (`[A·B, S·stick]`), `A·B` rows of
+    /// `S` sticks on the head-major side.
+    fn of(block: &'a Region, heads: &'a Region, rows: u32, sticks: u32) -> Result<Self, Error> {
+        let stick = crate::work::FP16_ELEMS_PER_STICK;
+        let b = block.v_rows;
+        if b == 0 || !rows.is_multiple_of(b) || block.v_cols != (rows / b) * sticks * stick {
+            return err(format!(
+                "a head-major relayout between t{} `[{}, {}]` and t{} `[{rows}, {}]`: the block is \
+                 not `B` rows of the `A·S` sticks the head-major side's `A·B` rows hold",
+                block.tid,
+                block.v_rows,
+                block.v_cols,
+                heads.tid,
+                sticks * stick
+            ));
+        }
+        Ok(Self {
+            block,
+            heads,
+            a: rows / b,
+            b,
+            sticks,
+        })
+    }
+
+    /// Stick `s` of every head, block to head-major.
+    fn to_heads(
+        &self,
+        name: &str,
+        sym_id_base: &mut i64,
+        layout: &BundleLayout,
+    ) -> Result<Vec<super::EmittedOp>, Error> {
+        self.copies(name, true, sym_id_base, layout)
+    }
+
+    /// Stick `s` of every head, head-major to block.
+    fn to_block(
+        &self,
+        name: &str,
+        sym_id_base: &mut i64,
+        layout: &BundleLayout,
+    ) -> Result<Vec<super::EmittedOp>, Error> {
+        self.copies(name, false, sym_id_base, layout)
+    }
+
+    fn copies(
+        &self,
+        name: &str,
+        to_heads: bool,
+        sym_id_base: &mut i64,
+        layout: &BundleLayout,
+    ) -> Result<Vec<super::EmittedOp>, Error> {
+        use crate::ir::bridge::tiled_op_sdsc_op::{StickRuns, assemble_stick_runs_copy};
+        let stick = crate::work::FP16_ELEMS_PER_STICK;
+        let (a, b, n) = (self.a, self.b, self.sticks);
+        (0..n)
+            .map(|s| {
+                // Block side: run `a` at `a·S·B + s·B` sticks; head-major side: at `s·A·B + a·B`.
+                let (block_pitch, block_elems) = (n * b, s * b * stick);
+                let (heads_pitch, heads_elems) = (b, s * a * b * stick);
+                let (src, dst, runs) = if to_heads {
+                    (
+                        self.block,
+                        self.heads,
+                        StickRuns {
+                            runs: a,
+                            run_sticks: b,
+                            src_pitch: block_pitch,
+                            dst_pitch: heads_pitch,
+                            src_elems: block_elems,
+                            dst_elems: heads_elems,
+                            df: crate::superdsc_opspec::Df::Fp16,
+                        },
+                    )
+                } else {
+                    (
+                        self.heads,
+                        self.block,
+                        StickRuns {
+                            runs: a,
+                            run_sticks: b,
+                            src_pitch: heads_pitch,
+                            dst_pitch: block_pitch,
+                            src_elems: heads_elems,
+                            dst_elems: block_elems,
+                            df: crate::superdsc_opspec::Df::Fp16,
+                        },
+                    )
+                };
+                assemble_stick_runs_copy(
+                    &format!("heads{s}_o{}", dst.tid),
+                    &src.name(),
+                    &dst.name(),
+                    runs,
+                    sym_id_base,
+                    Some(layout),
+                )
+                .map_err(|message| Error {
+                    message: format!("{name}: {message}"),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Whether `tile` is a `ktdp.construct_indirect_access_tile`.
+fn indirect_tile_of(f: &IRFunction<'static>, tile: Option<Ssa>) -> bool {
+    tile.is_some_and(|t| {
+        f.operations
+            .iter()
+            .any(|o| o.result == Some(t) && o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+    })
+}
+
+/// ⭐ THE SCATTER A VALUE IS STORED THROUGH — `res`, or a shape op that moves no byte of it, written
+/// by a `ktdp.store` through an indirect access tile: its rows land on the rows of the destination
+/// parameter its index names. `None` when no such store reads it.
+fn indirect_store_of(
+    k: &KtirNode,
+    res: Ssa,
+) -> Result<Option<super::lower_ktir_to_superdsc::RowScatter>, Error> {
+    let f = &k.func;
+    let dims = |v: Ssa| -> Vec<i64> {
+        f.ops_deep()
+            .into_iter()
+            .find(|o| o.result == Some(v))
+            .and_then(|o| o.result_type)
+            .and_then(|t| t.dims())
+            .map(<[i64]>::to_vec)
+            .unwrap_or_default()
+    };
+    // Through a shape op only when it moves no byte: one that does is a relayout, and the scatter
+    // reads its result (the reshape's own stick permute).
+    let reshaped = f
+        .operations
+        .iter()
+        .find(|o| {
+            matches!(
+                o.op_type,
+                OpKind::TensorReshape | OpKind::TensorCollapseShape | OpKind::TensorExpandShape
+            ) && o.operands.first() == Some(&res)
+        })
+        .and_then(|o| o.result)
+        .filter(|&v| same_card_bytes(&dims(res), &dims(v)));
+    let Some(store) = f.operations.iter().find(|s| {
+        s.op_type == OpKind::KtdpStore
+            && (s.operands.first() == Some(&res) || s.operands.first().copied() == reshaped)
+            && indirect_tile_of(f, s.operands.get(1).copied())
+    }) else {
+        return Ok(None);
+    };
+    let tile = f
+        .operations
+        .iter()
+        .find(|o| o.result == store.operands.get(1).copied())
+        .expect("indirect_tile_of found it");
+    super::lower_ktir_to_superdsc::row_scatter_of(k, tile).map(Some)
 }
 
 /// The one chain headed by `neg`, proven link by link.
@@ -1011,6 +1301,24 @@ enum Lowering {
     /// never lowers, exactly as before. See [`int_binary`] for the card form (leg B1) and the
     /// shapes it refuses.
     IntBinary(IntBinary),
+    /// `tile <min|max> <splatted constant>` — `ScalarMul`'s tiebreak for the binaries whose other
+    /// side is a constant (the walk's `min(tile_max - scores_max, 0)` clamp): the constant is the
+    /// registry's bound `[1,1]` const, sprayed over the tile exactly as a scalar multiplier is.
+    ScalarBinary(Elementwise, f32),
+    /// `linalg.batch_matmul` `[b, m, k] × [b, k, n] → [b, m, n]` — one 2-D contraction per batch,
+    /// each over its batch's rows of the flat-frame A and output and its batch's own `[k, n]`
+    /// kernel block. See [`super::lower_ktir_to_superdsc::batch_matmul`].
+    BatchMatmul {
+        batch: u32,
+        activation: super::lower_ktir_to_superdsc::BatchFrame,
+    },
+    /// A rank-3 `linalg.transpose` `[b, r, c] → [b, c, r]` — one 2-D transpose per batch, whose
+    /// output blocks are the `[k, n]` kernels a batched contraction reads, its input in `input`.
+    /// See [`super::lower_ktir_to_superdsc::batch_transpose`].
+    BatchTranspose {
+        batch: u32,
+        input: super::lower_ktir_to_superdsc::BatchFrame,
+    },
 }
 
 /// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole function.
@@ -1594,18 +1902,19 @@ fn program_broadcast_chains(
         // source is ONE flat row; anything else on a leading or middle axis is ROW-REPLICATION —
         // each flat row of the source repeating down the merged row axis — and is refused by name
         // below, because no operand mode addresses it (see that refusal).
-        let rank = bc
+        let res_dims: Option<Vec<i64>> = bc
             .attributes
             .iter()
             .find_map(|(k, v)| match (k, v) {
-                (AttrKey::Shape, Attr::IntList(d)) => Some(d.len()),
+                (AttrKey::Shape, Attr::IntList(d)) => Some(d.to_vec()),
                 _ => None,
             })
             .or_else(|| {
                 bc.result_type
                     .as_ref()
-                    .and_then(|t| t.dims().map(|d| d.len()))
+                    .and_then(|t| t.dims().map(|d| d.to_vec()))
             });
+        let rank = res_dims.as_ref().map(Vec::len);
         let Some(rank) = rank else {
             return err(format!(
                 "{}: `linalg.broadcast` states no shaped result, so its rank — the frame the \
@@ -1615,24 +1924,87 @@ fn program_broadcast_chains(
         };
         // Mutable because the Y ADMISSION below re-states a leading multi-row spray's axis and
         // flat flag after the walk-back has resolved the source's own row count.
+        // ⭐ A RUN OF LEADING AXES IS ONE LEADING AXIS OF THE FLAT FRAME: the flat frame folds every
+        // axis but the last into its rows, so spraying `[0..k)` (spyre-inference's mask tile over
+        // `[kv_head, group]`, `mask_tile[0]` broadcast against `[kv, group, query, block]`) is the
+        // leading spray `[0]` is, its count the product of the k sprayed extents (the Y admission
+        // below).
+        let leading = rank > 2
+            && !dims.is_empty()
+            && dims.len() < rank
+            && dims.iter().enumerate().all(|(i, &d)| d == i as i64);
         let (mut axis, mut flat) = match (rank, dims) {
             (_, [1]) if rank <= 2 => (BcastAxis::Col, false),
             (_, [0]) if rank <= 2 => (BcastAxis::Mb, false),
             (r, [d]) if r > 2 && *d as usize == r - 1 => (BcastAxis::Col, true),
-            (r, [d]) if r > 2 && *d == 0 => (BcastAxis::Mb, true),
+            _ if leading => (BcastAxis::Mb, true),
+            // ⭐ A LEADING RUN PLUS THE STICK AXIS IS A PER-ROW SCALAR SPRAYED DOWN THE LEADING
+            // AXES: `[B, KV, G] -> [J, B, KV, G, block]` (`Dimensions=[0, 4]`, a decode batch's
+            // one-chunk running max against its scores) — the `Col` read and the outer row spray at
+            // once. The count is the leading run's extent; the cover (the source's values ARE the
+            // result's rows after the run) is proved after the walk-back.
+            (r, ds)
+                if r > 2
+                    && ds.len() >= 2
+                    && ds.last() == Some(&(r as i64 - 1))
+                    && ds[..ds.len() - 1]
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &d)| d == i as i64) =>
+            {
+                let k = ds.len() - 1;
+                let count: i64 = res_dims
+                    .as_ref()
+                    .map(|s| s[..k].iter().product())
+                    .unwrap_or(0);
+                if count <= 1 {
+                    return err(format!(
+                        "{}: `linalg.broadcast` adds the leading run {:?} and the stick axis of a \
+                         rank-{r} tensor, to a leading extent of {count} — no spray",
+                        f.name,
+                        &ds[..k]
+                    ));
+                }
+                (
+                    BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::outer_row_scalars(
+                        count as u32,
+                    )),
+                    false,
+                )
+            }
+            // ⭐ THE AXIS JUST BEFORE THE STICK IS THE INNER ROW SPRAY: each of the source's flat
+            // rows repeated `y` times in a row (`[J, B, KV, 1, block] -> [J, B, KV, G, block]`, a
+            // decode batch's mask over its query-head group) — the row-split mode in its
+            // `[mb, y, out]` order. The count is the result's own extent on the axis; the cover
+            // (the source's rows ARE the result's rows before it) is proved after the walk-back,
+            // as the outer spray's is.
+            (r, [d]) if r > 2 && *d as usize == r - 2 && *d > 0 => {
+                match res_dims.as_ref().and_then(|s| s.get(*d as usize)) {
+                    Some(&y) if y > 1 => (
+                        BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::inner(y as u32)),
+                        false,
+                    ),
+                    other => {
+                        return err(format!(
+                            "{}: `linalg.broadcast` adds dim {d} of a rank-{r} tensor — the axis \
+                             just before the stick — to an extent of {other:?}; a spray of one is \
+                             no broadcast, and an unstated extent is no spray count",
+                            f.name
+                        ));
+                    }
+                }
+            }
             (r, [d]) if r > 2 => {
                 return err(format!(
                     "{}: `linalg.broadcast` adds dim {d} of a rank-{r} tensor — a MIDDLE axis of \
-                     the flat frame. Row-major that is ROW-REPLICATION: the source's extent on \
-                     that axis is 1 by the broadcast's own law, so each of the source's flat rows \
-                     repeats down the merged row axis (the batched paged-decode kernel's mask add \
-                     is exactly this shape, `[B, 1, PS] -> [B, G, PS]`). The device's pointwise \
-                     operand modes state a per-row scalar (`In::col`, one address per row) and a \
-                     row vector (`In::mb`, one row addressed once); neither states an address that \
-                     advances every k rows, and no descriptor in this door's vocabulary does, so \
-                     this is named rather than half-addressed. The door-proven statement of the \
-                     same math is `attn.py`'s own mask law: the host stages the mask at the score \
-                     tile's own rows and the kernel adds it at base — no broadcast at all",
+                     the flat frame with more than the stick after it. Row-major that is \
+                     ROW-REPLICATION AT A STRIDE: each of the source's flat rows repeats down the \
+                     merged row axis with the axes after the sprayed one interleaved between the \
+                     copies. The device's pointwise operand modes state a per-row scalar \
+                     (`In::col`), a row vector (`In::mb`) and a row spray of a whole source either \
+                     outermost or innermost of the rows (`Y`, `[y, mb, out]` or `[mb, y, out]`); \
+                     none states an address that advances every k rows with a stride between the \
+                     copies, so this is named rather than half-addressed",
                     f.name
                 ));
             }
@@ -1692,9 +2064,25 @@ fn program_broadcast_chains(
                     };
                     let want = match axis {
                         BcastAxis::Col => target.len().checked_sub(1),
-                        // `Mb` and the (later-assigned) `Y` both spray a LEADING axis: the
+                        // A per-row scalar's spray inserts two degenerate dims, one expand each:
+                        // the leading one and the stick's — this expand is either.
+                        BcastAxis::Y(super::lower_ktir_to_superdsc::Spray {
+                            of: super::lower_ktir_to_superdsc::SprayOf::RowScalars,
+                            ..
+                        }) => {
+                            if target.first() == Some(&1) {
+                                Some(0)
+                            } else {
+                                target.len().checked_sub(1)
+                            }
+                        }
+                        // The inner spray's axis is the one just before the stick.
+                        BcastAxis::Y(sp) if sp.order == crate::emit::SprayOrder::Inner => {
+                            target.len().checked_sub(2)
+                        }
+                        // `Mb` and the (later-assigned) outer `Y` both spray a LEADING axis: the
                         // relay's insert must be the leading `1` either way — at classification
-                        // time the axis is still `Mb` (the `Y` admission runs after the
+                        // time the axis is still `Mb` (the outer `Y` admission runs after the
                         // walk-back, on the resolved source's own row count), and a chain the
                         // admission flips to `Y` passed the same leading-`1` check here.
                         BcastAxis::Mb | BcastAxis::Y(_) => Some(0),
@@ -1702,7 +2090,13 @@ fn program_broadcast_chains(
                     // CROSS-CHECKED AGAINST THE BROADCAST'S OWN `Dimensions`: two independent
                     // statements of the same axis, so a program where they disagree is refused instead
                     // of one of them being believed.
-                    if want.map(|i| target.get(i).copied()) != Some(Some(1)) {
+                    // ⭐ ONCE THE SPRAYED AXIS IS PROVEN by the expand nearest the broadcast, an expand
+                    // further out only inserts another unit dim — a one-chunk decode batch's leading
+                    // `J = 1` (`[32, 8, 4]` → `[1, 32, 8, 4]` → `[1, 32, 8, 4, 1]`) — which moves no
+                    // element, so the walk crosses it.
+                    if !saw_degenerate_expand
+                        && want.map(|i| target.get(i).copied()) != Some(Some(1))
+                    {
                         return err(format!(
                             "{}: `tensor.expand_shape` targets {target:?}, whose {} axis is not \
                              degenerate, but the `linalg.broadcast` reading it sprays along {axis:?}. \
@@ -1713,8 +2107,15 @@ fn program_broadcast_chains(
                             f.name,
                             match axis {
                                 BcastAxis::Col => "trailing",
-                                // `Mb` and the post-walk-back `Y` both spray the LEADING axis —
-                                // the same word names it for the reader either way.
+                                BcastAxis::Y(super::lower_ktir_to_superdsc::Spray {
+                                    of: super::lower_ktir_to_superdsc::SprayOf::RowScalars,
+                                    ..
+                                }) => "leading or trailing",
+                                BcastAxis::Y(sp) if sp.order == crate::emit::SprayOrder::Inner => {
+                                    "second-to-last"
+                                }
+                                // `Mb` and the post-walk-back outer `Y` both spray the LEADING
+                                // axis — the same word names it for the reader either way.
                                 BcastAxis::Mb | BcastAxis::Y(_) => "leading",
                             }
                         ));
@@ -1932,7 +2333,11 @@ fn program_broadcast_chains(
                         source_rows.unwrap_or(0)
                     ));
                 };
-                let y = s.first().copied().unwrap_or(0);
+                // The spray count: the leading axes the broadcast adds, folded; the source's rows must
+                // then be the rest of the row axes, folded.
+                let lead = dims.len().min(s.len());
+                let y: i64 = s[..lead].iter().product();
+                let mb: i64 = s[lead..s.len().saturating_sub(1)].iter().product();
                 if y <= 1 {
                     return err(format!(
                         "{}: `linalg.broadcast` sprays a rank > 2 source of {} flat rows down its \
@@ -1957,8 +2362,8 @@ fn program_broadcast_chains(
                             f.name
                         ));
                     }
-                    Some(rows) if s.get(1).is_some_and(|&m| m as u32 == rows) => {
-                        axis = BcastAxis::Y(y as u32);
+                    Some(rows) if mb as u32 == rows => {
+                        axis = BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::outer(y as u32));
                         flat = false;
                         y_admitted = true;
                     }
@@ -1982,6 +2387,52 @@ fn program_broadcast_chains(
                     }
                 }
             }
+        }
+        // ⭐ THE INNER SPRAY'S COVER: the source's flat rows must BE the result's rows before the
+        // sprayed axis — `[J·B·KV, block]` under `[J, B, KV, G, block]` — or the copies would read
+        // rows the source does not have. Proved on the resolved source's own shape, independently
+        // of the count the classification read off the result.
+        if let BcastAxis::Y(sp) = axis
+            && sp.order == crate::emit::SprayOrder::Inner
+        {
+            let source_rows = def_of(cursor)
+                .and_then(super::lower_ktir_to_superdsc::shape_2d)
+                .map(|(r, _)| r as i64);
+            let before: Option<i64> = res_dims
+                .as_ref()
+                .map(|s| s[..s.len().saturating_sub(2)].iter().product());
+            if source_rows.is_none() || source_rows != before {
+                return err(format!(
+                    "{}: `linalg.broadcast` sprays its second-to-last axis {} times over a source \
+                     of {source_rows:?} flat rows, but the result's rows before that axis are \
+                     {before:?} — the inner row spray repeats each SOURCE row in place, so the \
+                     two must be the same rows, or the copies read rows the source does not have",
+                    f.name, sp.count
+                ));
+            }
+            y_admitted = true;
+        }
+        // ⭐ THE PER-ROW SCALARS' COVER: the source holds one value per result row after the
+        // sprayed run — `B·KV·G` values under `[J, B, KV, G, block]` — proved on the resolved
+        // source's own element count.
+        if let BcastAxis::Y(sp) = axis
+            && sp.of == super::lower_ktir_to_superdsc::SprayOf::RowScalars
+        {
+            let numel = def_of(cursor)
+                .and_then(super::lower_ktir_to_superdsc::shape_2d)
+                .map(|(r, c)| i64::from(r) * i64::from(c));
+            let rows: Option<i64> = res_dims.as_ref().map(|s| {
+                s[..s.len().saturating_sub(1)].iter().product::<i64>() / i64::from(sp.count)
+            });
+            if numel.is_none() || numel != rows {
+                return err(format!(
+                    "{}: `linalg.broadcast` sprays {numel:?} per-row values down {} leading \
+                     copies of {rows:?} rows each — one value per row is the cover, or the read \
+                     reaches values the source does not have",
+                    f.name, sp.count
+                ));
+            }
+            y_admitted = true;
         }
         if !saw_degenerate_expand && !y_admitted {
             // ⭐ THE SOURCE'S OWN LOAD IS A SECOND PROOF OF THE SAME FACT. An fp8 weight-scale chain
@@ -2115,6 +2566,18 @@ fn presented_flat(r: &Region, axis: BcastAxis) -> Result<Region, String> {
     );
     let presented = match axis {
         BcastAxis::Col => frame.flat_col()?,
+        // ⭐ ONE WHOLE ROW OF A MULTI-ROW, MULTI-STICK VIEW is already the row vector — the rank-2
+        // `Mb` window the emitter sprays one stick column at a time when its sticks sit a
+        // row-block apart (`elementwise_broadcast`'s strided row vector). No flat row presents
+        // it. A ONE-stick view's row is one contiguous stick, which the flat row below presents.
+        BcastAxis::Mb
+            if r.r_len == 1
+                && r.c_start == 0
+                && r.c_len == r.v_cols
+                && r.v_cols > crate::superdsc_opspec::Df::Fp16.elems_per_stick() =>
+        {
+            return Ok(*r);
+        }
         BcastAxis::Mb => frame.flat_mb()?,
         // The row-split mode addresses the source's OWN `[mb, out]` region — the presentation
         // is the identity, and this arm exists only because the match is exhaustive.
@@ -2364,6 +2827,10 @@ fn windowed_region(k: &KtirNode, mut r: Region, tile: &Operation<'_>) -> Result<
     // descriptor can carry.
     let window = match row.and_then(|s| consts.get(&s).copied()) {
         Some(rs) => Some((rs as u32, tr)),
+        // ⭐ A TILE AS TALL AS ITS VIEW SITS AT ROW 0 whatever its corner computes: any other corner
+        // reads rows past the view. spyre-inference's prompt kernel under Triton's gather floor
+        // reads its `[P, D]` query as the one tile at `query_row_index[0]` over the `[P, D]` view.
+        None if tr == r.v_rows => Some((0, tr)),
         None => row.and_then(|s| {
             let u = uniform.get(&s)?;
             let band = positions.checked_mul(u.stride)?;
@@ -2943,20 +3410,52 @@ fn row_tiled_family(
 /// holds `act_name(tid)`), so a record carried into a different layout mints fresh instead
 /// of colliding with that layout's placements. `floor` is the node-derived bound from
 /// [`lower_function`] — see its law doc for why the mint is bundle-seeded, not node-seeded.
-fn mint_inter(k: &KtirNode, layout: &BundleLayout, floor: u32, ssa: Ssa) -> u32 {
+pub(super) fn mint_inter(k: &KtirNode, layout: &BundleLayout, floor: u32, ssa: Ssa) -> u32 {
+    mint(k, layout, floor, crate::ktir_node::MintKey::Value(ssa))
+}
+
+/// [`mint_inter`] for the `n`th scratch the lowering of `ssa` takes beside its own buffer
+/// ([`crate::ktir_node::MintKey::Scratch`]).
+pub(super) fn mint_scratch(
+    k: &KtirNode,
+    layout: &BundleLayout,
+    floor: u32,
+    ssa: Ssa,
+    which: crate::ktir_node::Scratch,
+) -> u32 {
+    mint(
+        k,
+        layout,
+        floor,
+        crate::ktir_node::MintKey::Scratch(ssa, which),
+    )
+}
+
+fn mint(k: &KtirNode, layout: &BundleLayout, floor: u32, key: crate::ktir_node::MintKey) -> u32 {
     let mut minted = k.minted.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(&tid) = minted.get(&ssa)
-        && layout
-            .synth
-            .borrow()
-            .map
-            .contains_key(&crate::place::act_name(tid))
-    {
-        return tid;
+    // Declared by this layout either way: an HBM synthetic, or a core-local LX one the scratchpad
+    // plan kept there ([`super::lx_plan`]).
+    if let Some(&tid) = minted.get(&key) {
+        let name = crate::place::act_name(tid);
+        if layout.synth.borrow().map.contains_key(&name) || layout.lx_core_local(&name) {
+            return tid;
+        }
     }
     let tid = layout.take_inter_tid(floor);
-    minted.insert(ssa, tid);
+    minted.insert(key, tid);
     tid
+}
+
+/// The node-derived FLOOR [`mint_inter`] honors: above the highest non-reserved tensor the node
+/// binds (see the law at [`lower_walk`]'s use).
+pub(super) fn mint_floor(k: &KtirNode) -> u32 {
+    k.bindings
+        .iter()
+        .chain(k.mask.iter())
+        .map(|b| b.get())
+        .filter(|t| !crate::reserved_tids::is_reserved(*t))
+        .max()
+        .map_or(0, |m| m + 1)
 }
 
 /// ⭐⭐⭐ THE ARRANGEMENT PROPAGATION — which of a node's PARAMETERS the bake must stage in a
@@ -3070,6 +3569,9 @@ pub fn staggered_sources(
             }
             Lowering::Node(Program::Transpose) => 1,
             Lowering::IntBinary(_) => 2,
+            Lowering::ScalarBinary(..) => 1,
+            Lowering::BatchMatmul { .. } => 2,
+            Lowering::BatchTranspose { .. } => 1,
             Lowering::Node(_) => op.operands.len(),
         };
         let raw_in: Vec<Ssa> = match (terminal, scalar, bound_scale) {
@@ -3247,6 +3749,76 @@ pub fn lower_function(
     sym_id_base: &mut i64,
     headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
 ) -> Result<Vec<super::EmittedOp>, Error> {
+    lower_function_folded(k, layout, sym_id_base, headmajor, None)
+}
+
+/// ⭐ A PROGRAM THAT WALKS — one constant-trip `scf.for`, the paged attention's page walk — through
+/// the SAME per-op walk as every straight-line program: [`super::loop_fold::flatten`] states the
+/// body inline at trip 0, the walk lowers it op by op, and the ops the body emitted are marked as the
+/// walk's ([`super::EmittedOp::walk`]) — the descriptors the card relaunches once per trip. The
+/// loop-carried values are buffers seeded before the walk with the values the program initialises
+/// them to and overwritten by each trip's yielded values.
+///
+/// A ONE-TRIP walk states no loop at all — the front end promotes it to its body (MLIR's
+/// `SimplifyTrivialLoops`), the carried values read as their splatted inits — and lowers as the
+/// straight-line program it is.
+pub fn lower_walk(
+    k: &KtirNode,
+    layout: Option<&BundleLayout>,
+    sym_id_base: &mut i64,
+) -> Result<Vec<super::EmittedOp>, Error> {
+    let flat = super::loop_fold::flatten(k)?;
+    let (node, fold) = match &flat {
+        Some(flat) => (&flat.node, Some(&flat.fold)),
+        None => (k, None),
+    };
+    // ⭐ torch-spyre plans LX before it emits ([`super::lx_plan`]): a probe lowering learns how every
+    // op slices every tensor, and the plan keeps in LX what every op hands out alike.
+    let Some(layout) = layout else {
+        return lower_function_folded(node, None, sym_id_base, None, fold);
+    };
+    super::lx_plan::plan(node, layout, |probe| {
+        let mut sym = *sym_id_base;
+        lower_function_folded(node, Some(probe), &mut sym, None, fold)
+    })?;
+    let probed = node
+        .minted
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let ops = lower_function_folded(node, Some(layout), sym_id_base, None, fold);
+    // The plan's division is this program's alone: every other function of the bundle divides as
+    // its own ops do.
+    layout.lx_division.set(None);
+    let ops = ops?;
+    if *node.minted.lock().unwrap_or_else(|p| p.into_inner()) != probed {
+        return err(format!(
+            "{}: the scratchpad plan's probe and the real lowering minted different tensors, so the \
+             plan's ids name other buffers",
+            node.func.name
+        ));
+    }
+    super::lx_plan::check(layout, node.func.name)?;
+    // The program keeps what its flattened copy minted and planned, so its next lowering into this
+    // layout (the bake's real pass after its declaring one) takes the same tensors and the same plan.
+    if flat.is_some() {
+        *k.minted.lock().unwrap_or_else(|p| p.into_inner()) = probed;
+        *k.lx_plan.lock().unwrap_or_else(|p| p.into_inner()) = node
+            .lx_plan
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+    }
+    Ok(ops)
+}
+
+fn lower_function_folded(
+    k: &KtirNode,
+    layout: Option<&BundleLayout>,
+    sym_id_base: &mut i64,
+    headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
+    fold: Option<&super::loop_fold::LoopFold>,
+) -> Result<Vec<super::EmittedOp>, Error> {
     let f = &k.func;
     let mut out = Vec::new();
     let mut lowered = 0usize;
@@ -3280,14 +3852,7 @@ pub fn lower_function(
     // there. This node-derived value survives as the FLOOR the bundle minter honors — a node
     // lowered into a layout that places its own bindings high still mints clear of its own
     // tensors — and as the replay gate below.
-    let floor: u32 = k
-        .bindings
-        .iter()
-        .chain(k.mask.iter())
-        .map(|b| b.get())
-        .filter(|t| !crate::reserved_tids::is_reserved(*t))
-        .max()
-        .map_or(0, |m| m + 1);
+    let floor = mint_floor(k);
     let mut inter: std::collections::HashMap<Ssa, Region> = std::collections::HashMap::new();
     // THE fp8 SCALE MULFS THE DOT ABSORBED. The walk lowers each op once, and an absorbed epilogue
     // (`p * ws`, see the absorption at the `stored` lookup) already rode into its dot's emission —
@@ -3348,6 +3913,17 @@ pub fn lower_function(
         .map(|(i, g)| (g.load, i))
         .collect();
     let mut gather_carried = vec![false; gathers.len()];
+    // The second op of every head-major pair ([`head_major_pair`]), lowered with the first.
+    let mut head_major_skip: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
+    // Under the prompt trip's division ([`crate::placement::WalkDivision::HeadsInner`]), the rows a
+    // head holds, once the query's head-major pair has laid its rows out query-row-major.
+    let mut heads_rows: Option<u32> = None;
+    let heads_inner = layout.is_some_and(|l| {
+        matches!(
+            l.lx_division.get(),
+            Some(crate::placement::WalkDivision::HeadsInner { .. })
+        )
+    });
     // The row fold's own view of the same analyses — built once here so its helpers read ONE
     // value rather than threading three slices each (see [`FoldAnalyses`]).
     let analyses = FoldAnalyses {
@@ -3360,7 +3936,128 @@ pub fn lower_function(
     // disagree about which integer op is data.
     let int_compute = integer_compute_of(f);
 
-    for op in f.operations.iter() {
+    // ⭐⭐⭐ THE WALK'S CARRIED STATE — one buffer per `iter_args` value, read by every trip and
+    // overwritten by its yielded value (see [`super::loop_fold`]). Minted HERE, before any op, and
+    // SEEDED with the value the program initialises it to; the loop's result names the same buffer,
+    // so the ops after the walk read it directly. A value framed per row of a reduction (the running
+    // max and sum: the shape of a `linalg.reduce` result) is the `[numel, 1]` column the reduction
+    // writes; anything else is its flat frame.
+    let mut yield_target: std::collections::HashMap<Ssa, (Ssa, Region)> =
+        std::collections::HashMap::new();
+    if let Some(fold) = fold {
+        let Some(layout) = layout else {
+            return err(format!(
+                "{}: a walk's carried state needs a `BundleLayout` to hold its buffers",
+                f.name
+            ));
+        };
+        let def_of = |v: Ssa| f.operations.iter().find(|o| o.result == Some(v));
+        for c in &fold.carried {
+            let init = def_of(c.init);
+            let dims: Vec<i64> = init
+                .and_then(|o| o.result_type)
+                .and_then(|t| t.dims())
+                .map(<[i64]>::to_vec)
+                .unwrap_or_default();
+            if dims.is_empty() {
+                return err(format!(
+                    "{}: the walk's carried value %{} states no shaped init",
+                    f.name, c.arg.0
+                ));
+            }
+            let frame = value_frame(f, &dims);
+            let tid = mint_inter(k, layout, floor, c.arg);
+            layout.synth(crate::place::PlaceId::Act(tid), &frame);
+            let r = Region {
+                tid,
+                v_rows: frame[0],
+                v_cols: frame[1],
+                r_start: 0,
+                c_start: 0,
+                r_len: frame[0],
+                c_len: frame[1],
+                r_cover: (0, frame[0]),
+                c_cover: (0, frame[1]),
+                is_out: false,
+                is_fp8: false,
+                band: None,
+            };
+            inter.insert(c.arg, r);
+            inter.insert(c.result, r);
+            yield_target.insert(c.yielded, (c.arg, r));
+            out.extend(super::lower_ktir_to_superdsc::fill(
+                f.name,
+                c.seed,
+                &Region { is_out: true, ..r },
+                sym_id_base,
+                Some(layout),
+            )?);
+        }
+    }
+    // The ops the walk's body stated — a contiguous run of the flattened program — and where the
+    // descriptors they emit start and end.
+    let body_at: Option<(usize, usize)> = fold.and_then(|fd| {
+        let at: Vec<usize> = f
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.result.is_some_and(|r| fd.body.contains(&r)))
+            .map(|(i, _)| i)
+            .collect();
+        Some((*at.first()?, *at.last()? + 1))
+    });
+    let mut body_out: (usize, Option<usize>) = (0, None);
+    // The int32 zero every chained index's run is copied against ([`int_zero_run`]).
+    let mut int_zero: Option<u32> = None;
+    // A carried buffer may take its yielded value's write only once nothing later reads the value it
+    // holds: the last op reading each carried arg, by position.
+    let last_read = |arg: Ssa| -> Option<usize> {
+        f.operations.iter().rposition(|o| o.operands.contains(&arg))
+    };
+    // THE BATCH-BLOCKED BUFFERS, by their blocks' width `c` — `[r, c]` stick-major blocks one after
+    // another: a batched transpose's output (the `[k, n]` kernels a batched contraction reads), and
+    // a page read `[kv, block, 128]`, permuted per kv head. One stick wide a block run is the flat
+    // frame's own bytes; wider it is not, and only the readers that address a block at its base
+    // take one ([`wide_blocks`]).
+    let mut batch_blocks: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+
+    for (oi, op) in f.operations.iter().enumerate() {
+        if let Some((start, end)) = body_at {
+            if oi == start {
+                // ⭐⭐⭐ THE BODY READS NO REGISTRY CONSTANT. A relaunch shifts the segment the step's
+                // sources live in — the activation segment, where the registry's bound consts live
+                // too — so a scalar read in the body would land a trip's step past its constant. Every
+                // splatted constant the body reads as an operand is a BUFFER instead, filled ONCE
+                // here, before the body's descriptors begin, and read dense on every trip.
+                for o in &f.operations[start..end] {
+                    for v in dense_splat_operands(f, o) {
+                        if inter.contains_key(&v) {
+                            continue;
+                        }
+                        if let Some((r, value)) = splat_buffer(k, layout, floor, v)? {
+                            out.extend(super::lower_ktir_to_superdsc::fill(
+                                f.name,
+                                value,
+                                &r,
+                                sym_id_base,
+                                layout,
+                            )?);
+                            inter.insert(v, Region { is_out: false, ..r });
+                        }
+                    }
+                }
+                if let Some(layout) = layout
+                    && gathers.iter().any(|g| g.via.is_some())
+                {
+                    int_zero = Some(int_zero_run(f.name, layout)?);
+                }
+                body_out.0 = out.len();
+            }
+            if oi == end {
+                body_out.1 = Some(out.len());
+            }
+        }
+        let in_body = body_at.is_some_and(|(start, end)| (start..end).contains(&oi));
         // ⭐ THE ONE `is_plumbing` EXEMPTION: an integer arith op [`integer_compute_of`] classified
         // as COMPUTE is data, not addressing, and lowers through [`Lowering::IntBinary`] below.
         // Every other plumbing op — including every integer op of every kernel that bakes today,
@@ -3373,12 +4070,25 @@ pub fn lower_function(
         {
             continue;
         }
+        // ⭐ AN INTEGER SCALAR EXTRACTED FROM A LOAD IS AN ADDRESS — a position read through a table
+        // (`page = tl.load(page_index_table + i * 32)`), which a chained gather reads in place
+        // ([`super::lower_ktir_to_superdsc::ChainedIndex`]); no node kind consumes it as data.
+        if op.op_type == OpKind::TensorExtract
+            && matches!(
+                op.result_type,
+                Some(ktir_core::irtype::IrType::Scalar(DType::I32 | DType::I64))
+                    | Some(ktir_core::irtype::IrType::Index)
+            )
+        {
+            continue;
+        }
         // The chain's INTERIOR — negate, exp, 1+, divide — is lowered by nothing at all: the one
         // `Program::SiluMul` below stands for all five ops, and the device primitive never
         // materialises these values. Skipped BEFORE `program_of`, which would otherwise refuse the
         // `arith.negf` for having no 1:1 mapping (correctly, in isolation).
         if op.result.is_some_and(|r| {
-            silus.iter().any(|c| c.consumed.contains(&r))
+            head_major_skip.contains(&r)
+                || silus.iter().any(|c| c.consumed.contains(&r))
                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
                 // The expand/collapse/broadcast chain itself: no descriptor, the consumer states it.
                 || bcast_consumed.contains(&r)
@@ -3393,6 +4103,1212 @@ pub fn lower_function(
         }) {
             continue;
         }
+        // ⭐⭐⭐ A SHAPE OP THAT MOVES NO BYTE NAMES ITS SOURCE'S BUFFER — a `tensor.reshape`,
+        // `collapse_shape` or `expand_shape` whose source and result frames are the same card bytes
+        // ([`same_card_bytes`]) lowers to nothing, and its result is its source's region. A shape op
+        // that WOULD move bytes is a relayout this door does not state, and is refused by name.
+        //
+        // ⭐ A GATHERED LOAD REACHING ONE IS MATERIALIZED FIRST — the page gather: the load's one
+        // index entry selects a whole slab of the paged value (a page of a row-outermost cache, every kv head of it), so
+        // its rows reach a consumer only through a contiguous scratch the gathered copy fills
+        // ([`super::lower_ktir_to_superdsc::page_gather`]), and the shape op names that scratch.
+        if matches!(
+            op.op_type,
+            OpKind::TensorReshape | OpKind::TensorCollapseShape | OpKind::TensorExpandShape
+        ) && let (Some(res), Some(&src)) = (op.result, op.operands.first())
+        {
+            if let Some(r) = inter.get(&src)
+                && wide_blocks(&batch_blocks, r.tid)
+            {
+                return err(format!(
+                    "{}: `{:?}` reads t{}, whose bytes are batch blocks one after another — every \
+                     frame a shape op names is the flat frame's, which those bytes are not",
+                    f.name, op.op_type, r.tid
+                ));
+            }
+            let def_dims = |v: Ssa| -> Vec<i64> {
+                f.operations
+                    .iter()
+                    .find(|o| o.result == Some(v))
+                    .and_then(|o| o.result_type)
+                    .and_then(|t| t.dims())
+                    .map(<[i64]>::to_vec)
+                    .unwrap_or_default()
+            };
+            let (mut from, to) = (def_dims(src), def_dims(res));
+            // A GATHER FROM A ROW-OUTERMOST BUFFER (the paged cache's allocation,
+            // [`BundleLayout::allocate_row_outermost`]) is held as the page gather lands it —
+            // one-stick sub-rows, its slabs' own row-major bytes — whatever shape the load states.
+            // A gather from a tiled buffer lands stick-major at the load's own shape
+            // ([`super::lower_ktir_to_superdsc::row_gather`]).
+            let stick = i64::from(crate::work::FP16_ELEMS_PER_STICK);
+            let numel: i64 = from.iter().product();
+            let row_outermost =
+                |gi: usize| layout.is_some_and(|l| l.is_row_outermost(gathers[gi].value_tid));
+            if gathered_loads
+                .get(&src)
+                .is_some_and(|&gi| row_outermost(gi))
+                && numel % stick == 0
+            {
+                from = vec![numel / stick, stick];
+            }
+            // ⭐ THE HEAD-MAJOR PAIR — a reshape of a stick-major `[B, A·S]` row block into
+            // `[B, A, S]` read only by the `[1, 0, 2]` transpose into `[A, B, S]`: on the card the
+            // two together move no byte (stick column `a` of the block IS head `a`'s rows), so the
+            // transpose's result is the source's own bytes in the `[A·B, S]` frame, and both lower
+            // to nothing (spyre-inference's `q_rows.unsqueeze(0).transpose(1, 2).reshape(...)`).
+            if !gathered_loads.contains_key(&src)
+                && let Some((t_res, frame, sticks)) = head_major_pair(f, op, &from, &to)
+            {
+                let source = match region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
+                {
+                    Some(r) => r,
+                    None => {
+                        return err(format!(
+                            "{}: the head-major reshape reads a value this walk holds no buffer for",
+                            f.name
+                        ));
+                    }
+                };
+                let r = match layout {
+                    // The prompt trip's frame: each query row's heads together.
+                    Some(layout) if heads_inner => {
+                        let rows = from[0] as u32;
+                        let block = HeadBlock {
+                            rows,
+                            heads: frame[0] / rows,
+                            sticks,
+                        };
+                        let m = Minter { k, layout, floor };
+                        let (ops, r) =
+                            heads_inner_pair(m, res, f.name, &source, block, true, sym_id_base)?;
+                        out.extend(ops);
+                        heads_rows = Some(rows);
+                        r
+                    }
+                    Some(layout) if sticks > 1 => {
+                        let tid = mint_inter(k, layout, floor, res);
+                        let dst = stick_major_region(tid, frame[0], sticks, layout);
+                        out.extend(
+                            HeadMajorCopies::of(&source, &dst, frame[0], sticks)?.to_heads(
+                                f.name,
+                                sym_id_base,
+                                layout,
+                            )?,
+                        );
+                        Region {
+                            is_out: false,
+                            ..dst
+                        }
+                    }
+                    _ => reframed(source, frame),
+                };
+                inter.insert(res, r);
+                inter.insert(t_res, r);
+                head_major_skip.insert(t_res);
+                continue;
+            }
+            // ⭐ ROW-MAJOR ROWS READ STICK-MAJOR — `[R·C, stick]` (a batched dot's per-head rows,
+            // `[B, KV, G, D]`) reshaped to `[R, C·stick]` (the `[B, H·D]` output block): the stick
+            // permute back, into the parameter the reshape's result is stored to when it is stored
+            // whole, else into a minted buffer. Head rows several sticks wide (head dim 128) are
+            // stick-major themselves, so they go row-major first ([`HeadRows`]).
+            let back = stick_major_split(&to, &from)
+                .map(|split| (split, None))
+                .or_else(|| HeadRows::of(&to, &from).map(|h| ((h.rows, h.row_sticks), Some(h))));
+            if !gathered_loads.contains_key(&src)
+                && !same_card_bytes(&from, &to)
+                && let Some(((rows, sticks), head_rows)) = back
+            {
+                let Some(layout) = layout else {
+                    return err(format!(
+                        "{}: a stick permute needs a `BundleLayout` to hold its result",
+                        f.name
+                    ));
+                };
+                let Some(source) = region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
+                else {
+                    return err(format!(
+                        "{}: `{:?}` permutes a value this walk holds no buffer for",
+                        f.name, op.op_type
+                    ));
+                };
+                let stored_to = f.operations.iter().find(|s| {
+                    s.op_type == OpKind::KtdpStore
+                        && s.operands.first() == Some(&res)
+                        && !indirect_tile_of(f, s.operands.get(1).copied())
+                });
+                let dst = match stored_to {
+                    Some(store) => {
+                        let tile = f.operations.iter().find(|o| {
+                            o.op_type == OpKind::KtdpConstructAccessTile
+                                && Some(o.result) == Some(store.operands.get(1).copied())
+                        });
+                        let o = match tile {
+                            Some(t) => region_of_view_operand(k, t, 0)?
+                                .map(|o| windowed_region(k, o, t))
+                                .transpose()?,
+                            None => None,
+                        };
+                        match o {
+                            Some(o)
+                                if (o.r_start, o.c_start, o.r_len, o.c_len)
+                                    == (0, 0, rows, sticks * stick as u32) =>
+                            {
+                                Region { is_out: true, ..o }
+                            }
+                            _ => {
+                                return err(format!(
+                                    "{}: the permuted `[{rows}, {}]` block is stored somewhere \
+                                     other than a whole `[{rows}, {}]` parameter window",
+                                    f.name,
+                                    sticks * stick as u32,
+                                    sticks * stick as u32
+                                ));
+                            }
+                        }
+                    }
+                    None => {
+                        let tid = mint_inter(k, layout, floor, res);
+                        layout.synth(
+                            crate::place::PlaceId::Act(tid),
+                            &[rows, sticks * stick as u32],
+                        );
+                        Region {
+                            tid,
+                            v_rows: rows,
+                            v_cols: sticks * stick as u32,
+                            r_start: 0,
+                            c_start: 0,
+                            r_len: rows,
+                            c_len: sticks * stick as u32,
+                            r_cover: (0, rows),
+                            c_cover: (0, sticks * stick as u32),
+                            is_out: true,
+                            is_fp8: false,
+                            band: None,
+                        }
+                    }
+                };
+                let source = match head_rows {
+                    Some(h) => {
+                        let mid = row_major_region(
+                            mint_scratch(k, layout, floor, res, Scratch::RelayoutMid),
+                            h.rows * h.row_sticks,
+                            layout,
+                        );
+                        out.push(permute(
+                            f.name,
+                            &source,
+                            &mid,
+                            Permuted::whole((h.head_rows, h.sticks)),
+                            crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                            sym_id_base,
+                            Some(layout),
+                        )?);
+                        Region {
+                            is_out: false,
+                            ..mid
+                        }
+                    }
+                    None => source,
+                };
+                out.push(permute(
+                    f.name,
+                    &source,
+                    &dst,
+                    Permuted::whole((rows, sticks)),
+                    crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                    sym_id_base,
+                    Some(layout),
+                )?);
+                inter.insert(
+                    res,
+                    Region {
+                        is_out: false,
+                        ..dst
+                    },
+                );
+                continue;
+            }
+            // ⭐ STICK-MAJOR ROWS READ ROW-MAJOR — `[R, C·stick]` (a batched dot's `[KV, G, 128]`
+            // output, heads two sticks wide) reshaped to `[R·C, stick]` or one row of `R·C` sticks
+            // (spyre-inference's `attn.reshape(1, num_heads, head_size)`): the stick permute into a
+            // minted row-major buffer, and the rows a scatter takes from there.
+            if !gathered_loads.contains_key(&src)
+                && !same_card_bytes(&from, &to)
+                && let Some((rows, sticks)) = stick_major_split(&from, &to)
+            {
+                let Some(layout) = layout else {
+                    return err(format!(
+                        "{}: a stick permute needs a `BundleLayout` to hold its result",
+                        f.name
+                    ));
+                };
+                let Some(source) = region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
+                else {
+                    return err(format!(
+                        "{}: `{:?}` permutes a value this walk holds no buffer for",
+                        f.name, op.op_type
+                    ));
+                };
+                let tid = mint_inter(k, layout, floor, res);
+                let dst = row_major_region(tid, rows * sticks, layout);
+                out.push(permute(
+                    f.name,
+                    &source,
+                    &dst,
+                    Permuted::whole((rows, sticks)),
+                    crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                    sym_id_base,
+                    Some(layout),
+                )?);
+                let r = reframed(
+                    Region {
+                        is_out: false,
+                        ..dst
+                    },
+                    flat_frame(&to),
+                );
+                inter.insert(res, r);
+                if let Some(sc) = indirect_store_of(k, res)? {
+                    out.extend(super::lower_ktir_to_superdsc::row_scatter(
+                        f.name,
+                        &reframed(r, [sc.entries, sc.cols]),
+                        sc,
+                        sc.value_rows,
+                        sym_id_base,
+                        Some(layout),
+                    )?);
+                }
+                continue;
+            }
+            // A row-outermost page lands as one-stick rows; read in a multi-stick frame, it is permuted
+            // after the landing (below).
+            let page_to_sticks = gathered_loads
+                .get(&src)
+                .is_some_and(|&gi| row_outermost(gi))
+                && !same_card_bytes(&from, &to)
+                && stick_major_split(&to, &from).is_some();
+            if !same_card_bytes(&from, &to)
+                && !page_to_sticks
+                && !gathered_loads
+                    .get(&src)
+                    .is_some_and(|&gi| !row_outermost(gi))
+            {
+                return err(format!(
+                    "{}: `{:?}` re-frames {from:?} as {to:?}, which moves bytes on the card (the \
+                     two stick-major frames place an element at different addresses) — a \
+                     relayout this door does not state",
+                    f.name, op.op_type
+                ));
+            }
+            let source = match gathered_loads.get(&src) {
+                Some(&gi) => {
+                    let Some(layout) = layout else {
+                        return err(format!(
+                            "{}: a page gather needs a `BundleLayout` to hold its scratch",
+                            f.name
+                        ));
+                    };
+                    if !row_outermost(gi) {
+                        let g = gathers[gi];
+                        let (table_rows, cols) = gather_table_dims(f, &g)?;
+                        let sticks = cols / crate::work::FP16_ELEMS_PER_STICK;
+                        let pair = head_major_pair(f, op, &from, &to);
+                        // The stick-major `[entries, cols]` the gathered rows land in.
+                        let mint_rows = || {
+                            let tid = mint_inter(k, layout, floor, src);
+                            layout.synth(crate::place::PlaceId::Act(tid), &[g.entries, cols]);
+                            Region {
+                                tid,
+                                v_rows: g.entries,
+                                v_cols: cols,
+                                r_start: 0,
+                                c_start: 0,
+                                r_len: g.entries,
+                                c_len: cols,
+                                r_cover: (0, g.entries),
+                                c_cover: (0, cols),
+                                is_out: true,
+                                is_fp8: false,
+                                band: None,
+                            }
+                        };
+                        // ⭐ THE ROWS IN ONE GATHER, as torch-spyre gathers a chunk's query rows (its
+                        // compiled prefill's `sdsc_0`: every row's every head in one op, the value
+                        // read row-major). A row of this stick-major table is `sticks` runs
+                        // `table_rows` sticks apart, which no index entry names whole, so the table
+                        // is laid row-major first and the rows gathered from there. The prompt
+                        // trip's query-row-major frame reads them as gathered (below); anything
+                        // else, laid back stick-major.
+                        let rows_major = if table_rows > 1 && sticks > 1 {
+                            let table = Region {
+                                tid: g.value_tid,
+                                v_rows: table_rows,
+                                v_cols: cols,
+                                r_start: 0,
+                                c_start: 0,
+                                r_len: table_rows,
+                                c_len: cols,
+                                r_cover: (0, table_rows),
+                                c_cover: (0, cols),
+                                is_out: false,
+                                is_fp8: false,
+                                band: None,
+                            };
+                            let table_rows_major = row_major_region(
+                                mint_scratch(k, layout, floor, src, Scratch::GatherTableRowMajor),
+                                table_rows * sticks,
+                                layout,
+                            );
+                            out.push(permute(
+                                f.name,
+                                &table,
+                                &table_rows_major,
+                                Permuted::whole((table_rows, sticks)),
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            let gathered = row_major_region(
+                                mint_scratch(k, layout, floor, src, Scratch::GatheredRowMajor),
+                                g.entries * sticks,
+                                layout,
+                            );
+                            // One gather a run of index entries — the runs the cores read a
+                            // stick of the index each ([`index_runs`]), one op up to 32 sticks.
+                            //
+                            // [`index_runs`]: super::lower_ktir_to_superdsc::index_runs
+                            let stick = crate::work::FP16_ELEMS_PER_STICK;
+                            for (i, (first, entries)) in
+                                super::lower_ktir_to_superdsc::index_runs(g.entries)
+                                    .into_iter()
+                                    .enumerate()
+                            {
+                                let base = crate::superdsc_opspec::EntryBase::of_entries(
+                                    g.first_entry.entries() + first,
+                                )
+                                .map_err(|message| Error {
+                                    message: format!("{}: {message}", f.name),
+                                })?;
+                                out.push(
+                                    crate::ir::bridge::tiled_op_sdsc_op::assemble_page_gather_copy(
+                                        &format!("gather{i}_o{}", gathered.tid),
+                                        &table_rows_major.name(),
+                                        &gathered.name(),
+                                        crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                                            crate::place::act_name(g.index_tid),
+                                            crate::superdsc_opspec::PageExtent::of_positions(
+                                                sticks,
+                                            ),
+                                            base,
+                                        ),
+                                        crate::ir::bridge::tiled_op_sdsc_op::PageGatherRows {
+                                            rows: entries * sticks,
+                                            words:
+                                                crate::ir::bridge::tiled_op_sdsc_op::GatheredWords::Fp16,
+                                            src_elems: 0,
+                                            dst_elems: first * sticks * stick,
+                                        },
+                                        sym_id_base,
+                                        Some(layout),
+                                    )
+                                    .map_err(|message| Error {
+                                        message: format!("{}: {message}", f.name),
+                                    })?,
+                                );
+                            }
+                            Some(Region {
+                                is_out: false,
+                                ..gathered
+                            })
+                        } else {
+                            None
+                        };
+                        gather_carried[gi] = true;
+                        let query_row_major = heads_inner && pair.is_some();
+                        let r = match rows_major {
+                            Some(_) if query_row_major => None,
+                            Some(gathered) => {
+                                let r = mint_rows();
+                                out.push(permute(
+                                    f.name,
+                                    &gathered,
+                                    &r,
+                                    Permuted::whole((g.entries, sticks)),
+                                    crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                                    sym_id_base,
+                                    Some(layout),
+                                )?);
+                                Some(r)
+                            }
+                            None => {
+                                let r = mint_rows();
+                                out.extend(super::lower_ktir_to_superdsc::row_gather(
+                                    f.name,
+                                    &g,
+                                    table_rows,
+                                    cols,
+                                    &r,
+                                    sym_id_base,
+                                    Some(layout),
+                                )?);
+                                Some(r)
+                            }
+                        }
+                        .map(|r| Region { is_out: false, ..r });
+                        if let Some(r) = r {
+                            inter.insert(src, r);
+                        }
+                        // Every frame but the prompt trip's query-row-major one reads the rows
+                        // stick-major.
+                        let stick_rows = || {
+                            r.ok_or_else(|| Error {
+                                message: format!(
+                                    "{}: the gathered rows were laid only query-row-major",
+                                    f.name
+                                ),
+                            })
+                        };
+                        if let Some((t_res, frame, sticks)) = pair {
+                            let r2 = if heads_inner {
+                                // The prompt trip's frame: each query row's heads together.
+                                let rows = from[0] as u32;
+                                let block = HeadBlock {
+                                    rows,
+                                    heads: frame[0] / rows,
+                                    sticks,
+                                };
+                                heads_rows = Some(rows);
+                                match (rows_major, r) {
+                                    // Gathered row-major, a query row's heads ARE its per-head
+                                    // rows `p·H + h`: one stick a head, that frame's own bytes;
+                                    // wider, each head's row laid stick-major.
+                                    (Some(gathered), _) if sticks == 1 => gathered,
+                                    (Some(gathered), _) => {
+                                        let tid = mint_inter(k, layout, floor, res);
+                                        let dst = stick_major_region(
+                                            tid,
+                                            rows * block.heads,
+                                            sticks,
+                                            layout,
+                                        );
+                                        out.push(permute(
+                                            f.name,
+                                            &gathered,
+                                            &dst,
+                                            Permuted::whole((rows * block.heads, sticks)),
+                                            crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                                            sym_id_base,
+                                            Some(layout),
+                                        )?);
+                                        Region {
+                                            is_out: false,
+                                            ..dst
+                                        }
+                                    }
+                                    (None, Some(r)) => {
+                                        let m = Minter { k, layout, floor };
+                                        let (ops, r2) = heads_inner_pair(
+                                            m,
+                                            res,
+                                            f.name,
+                                            &r,
+                                            block,
+                                            true,
+                                            sym_id_base,
+                                        )?;
+                                        out.extend(ops);
+                                        r2
+                                    }
+                                    (None, None) => {
+                                        return err(format!(
+                                            "{}: the gathered query rows landed in no buffer",
+                                            f.name
+                                        ));
+                                    }
+                                }
+                            } else if sticks > 1 {
+                                let tid = mint_inter(k, layout, floor, res);
+                                let dst = stick_major_region(tid, frame[0], sticks, layout);
+                                out.extend(
+                                    HeadMajorCopies::of(&stick_rows()?, &dst, frame[0], sticks)?
+                                        .to_heads(f.name, sym_id_base, layout)?,
+                                );
+                                Region {
+                                    is_out: false,
+                                    ..dst
+                                }
+                            } else {
+                                reframed(stick_rows()?, frame)
+                            };
+                            inter.insert(res, r2);
+                            inter.insert(t_res, r2);
+                            head_major_skip.insert(t_res);
+                        } else if same_card_bytes(&from, &to) {
+                            inter.insert(res, reframed(stick_rows()?, flat_frame(&to)));
+                        } else if let Some((rows, sticks)) = stick_major_split(&from, &to) {
+                            // ⭐ THE GATHERED ROWS' ROW-MAJOR SPLIT — spyre-inference's
+                            // `query.index_select(0, rep_row_ids).reshape(entries, KV, G, D)`: the
+                            // gathered `[R, C·stick]` block lands stick-major, and the reshape
+                            // reads its `R·C` sticks row by row, so the card permutes the sticks
+                            // once into a row-major `[R·C, stick]` buffer.
+                            let tid = mint_inter(k, layout, floor, res);
+                            let dst = row_major_region(tid, rows * sticks, layout);
+                            out.push(permute(
+                                f.name,
+                                &stick_rows()?,
+                                &dst,
+                                Permuted::whole((rows, sticks)),
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            inter.insert(
+                                res,
+                                reframed(
+                                    Region {
+                                        is_out: false,
+                                        ..dst
+                                    },
+                                    flat_frame(&to),
+                                ),
+                            );
+                        } else if let Some((rows, sticks)) = stick_major_split(&to, &from) {
+                            // ⭐ A GATHERED ROW READ IN A MULTI-STICK FRAME — one query row of
+                            // heads two sticks wide (`[NQH·128]` read as `[KV, G, 128]`): its
+                            // sticks run head by head, and the frame holds each head's sticks a
+                            // row block apart, so the card permutes them once.
+                            let tid = mint_inter(k, layout, floor, res);
+                            let dst = stick_major_region(tid, rows, sticks, layout);
+                            out.push(permute(
+                                f.name,
+                                &stick_rows()?,
+                                &dst,
+                                Permuted::whole((rows, sticks)),
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            inter.insert(
+                                res,
+                                Region {
+                                    is_out: false,
+                                    ..dst
+                                },
+                            );
+                        } else if let Some(h) = HeadRows::of(&from, &to) {
+                            // ⭐ GATHERED ROWS OF MULTI-STICK HEADS, READ AS HEAD ROWS — a batch's
+                            // query rows `[R, H·S·stick]` read as `[R·KV, G, S·stick]` at head dim
+                            // 128: the row-major split puts each head row's `S` sticks together,
+                            // and a second permute lays the head rows stick-major, the frame the
+                            // one-row arm above lands (and the batched dot reads a block of).
+                            let mid = row_major_region(
+                                mint_scratch(k, layout, floor, res, Scratch::RelayoutMid),
+                                h.rows * h.row_sticks,
+                                layout,
+                            );
+                            out.push(permute(
+                                f.name,
+                                &stick_rows()?,
+                                &mid,
+                                Permuted::whole((h.rows, h.row_sticks)),
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            let tid = mint_inter(k, layout, floor, res);
+                            let dst = stick_major_region(tid, h.head_rows, h.sticks, layout);
+                            // The flat stick-major frame: a batched contraction reads its activation
+                            // there, each batch's rows at their row offset in every stick plane.
+                            out.push(permute(
+                                f.name,
+                                &Region {
+                                    is_out: false,
+                                    ..mid
+                                },
+                                &dst,
+                                Permuted::whole((h.head_rows, h.sticks)),
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            inter.insert(
+                                res,
+                                Region {
+                                    is_out: false,
+                                    ..dst
+                                },
+                            );
+                        } else {
+                            return err(format!(
+                                "{}: `{:?}` re-frames a gathered {from:?} as {to:?}, which moves \
+                                 bytes on the card — a relayout this door does not state. A \
+                                 stick-major row is its heads in stick order only while a head is \
+                                 ONE {stick}-element stick, and its row-major split is the rows' \
+                                 sticks in order",
+                                f.name, op.op_type
+                            ));
+                        }
+                        continue;
+                    }
+                    let (g, page_sticks) = page_gather_of(f, gathers[gi])?;
+                    // ⭐ A CHAINED INDEX runs as its two gathers: the run of index words is copied
+                    // first, through the position table, into a scratch stick the gather then reads.
+                    let g = match g.via {
+                        Some(chain) => {
+                            let zero = match int_zero {
+                                Some(z) => z,
+                                None => {
+                                    let z = int_zero_run(f.name, layout)?;
+                                    int_zero = Some(z);
+                                    z
+                                }
+                            };
+                            let run = mint_scratch(k, layout, floor, src, Scratch::IndexRun);
+                            layout.synth_df(
+                                crate::place::PlaceId::Act(run),
+                                &[1, super::lower_ktir_to_superdsc::INDEX_RUN_WORDS],
+                                crate::superdsc_opspec::Df::SenUint32,
+                            );
+                            out.extend(super::lower_ktir_to_superdsc::index_run_gather(
+                                f.name,
+                                &g,
+                                chain,
+                                (run, zero),
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            Gather {
+                                index_tid: run,
+                                first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+                                via: None,
+                                ..g
+                            }
+                        }
+                        None => g,
+                    };
+                    // ⭐ PAGES OF BLOCKS, ONE ENTRY A PAGE, IN ONE OP — torch-spyre's prompt-trip page
+                    // gather (and a decode batch's chunk of pages, one a core): each entry selects a
+                    // page, its kv heads' blocks are read inside the op, and each lands stick-major,
+                    // one after another — so no piece, no scaled index and no permute follows.
+                    if let &[b, r, c] = to.as_slice()
+                        && b > i64::from(g.entries)
+                        && b % i64::from(g.entries) == 0
+                        && c % stick == 0
+                        // Landed stick-major: the frame a multi-stick page is read in (`page_to_sticks`,
+                        // as the one-block-an-entry gather below requires), and at one stick the
+                        // row-major frame's own bytes.
+                        && (page_to_sticks || c == stick)
+                    {
+                        let (b, r, c) = (b as u32, r as u32, c as u32);
+                        let tid = mint_inter(k, layout, floor, res);
+                        let dst = stick_major_region(tid, b * r, c / stick as u32, layout);
+                        out.push(
+                            crate::ir::bridge::tiled_op_sdsc_op::assemble_page_gather_page(
+                                &format!("gather_o{tid}"),
+                                &crate::place::act_name(g.value_tid),
+                                &dst.name(),
+                                crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                                    crate::place::act_name(g.index_tid),
+                                    crate::superdsc_opspec::PageExtent::of_positions(1),
+                                    g.first_entry,
+                                ),
+                                crate::ir::bridge::tiled_op_sdsc_op::PageOfBlocks {
+                                    entries: g.entries,
+                                    blocks: b / g.entries,
+                                    rows: r,
+                                    cols: c,
+                                },
+                                sym_id_base,
+                                Some(layout),
+                            )
+                            .map_err(|message| Error {
+                                message: format!("{}: {message}", f.name),
+                            })?,
+                        );
+                        gather_carried[gi] = true;
+                        // A block one stick wide is the flat frame's own bytes.
+                        if c > stick as u32 {
+                            batch_blocks.insert(tid, c);
+                        }
+                        inter.insert(
+                            res,
+                            Region {
+                                is_out: false,
+                                ..dst
+                            },
+                        );
+                        continue;
+                    }
+                    // ⭐ AN ENTRY PAST dxp's CHUNK BOUND is copied in pieces through its index
+                    // scaled by the piece count — doubled, `addi32toi32(x, x)`, into a scratch
+                    // stick, so no constant is placed (the walk's body reads none).
+                    let Some(pieces) = super::lower_ktir_to_superdsc::gather_pieces(page_sticks)
+                    else {
+                        return err(format!(
+                            "{}: a gathered entry of {page_sticks} sticks splits into no power of \
+                             two of whole-stick pieces under the one-stick sub-row copy's {}-byte \
+                             entry bound",
+                            f.name,
+                            super::lower_ktir_to_superdsc::SUB_ROW_GATHER_ENTRY_BYTES_MAX
+                        ));
+                    };
+                    let g = if pieces > 1 {
+                        if g.first_entry != crate::superdsc_opspec::EntryBase::ZERO {
+                            return err(format!(
+                                "{}: a gathered entry split in {pieces} pieces reads its index at \
+                                 entry {} — the doubling reads the index stick at its base",
+                                f.name,
+                                g.first_entry.entries()
+                            ));
+                        }
+                        // The integer ops' device width, the chained index run's own
+                        // ([`super::lower_ktir_to_superdsc::INDEX_RUN_WORDS`]).
+                        let words = super::lower_ktir_to_superdsc::INDEX_RUN_WORDS;
+                        let index_stick = |tid: u32, is_out: bool| Region {
+                            tid,
+                            v_rows: 1,
+                            v_cols: words,
+                            r_start: 0,
+                            c_start: 0,
+                            r_len: 1,
+                            c_len: words,
+                            r_cover: (0, 1),
+                            c_cover: (0, words),
+                            is_out,
+                            is_fp8: false,
+                            band: None,
+                        };
+                        // The doubling reads the index's first `words` words: the page id and
+                        // the rest of its stick — inside the table's card pitch of a stick a
+                        // score row, and refused by name where the placement is shorter.
+                        let placed = layout.placements.get(&g.index_tid).map_or(0, |p| p.size);
+                        if placed < u64::from(words) * 4 {
+                            return err(format!(
+                                "{}: a gathered entry split in {pieces} pieces scales its index \
+                                 t{} by `addi32toi32` over {words} words, and t{} is placed in \
+                                 {placed} bytes",
+                                f.name, g.index_tid, g.index_tid
+                            ));
+                        }
+                        let mut scaled = index_stick(g.index_tid, false);
+                        for halving in 0..pieces.trailing_zeros() {
+                            let tid = mint_scratch(
+                                k,
+                                layout,
+                                floor,
+                                src,
+                                Scratch::ScaledIndex(halving as u8),
+                            );
+                            layout.synth_df(
+                                crate::place::PlaceId::Act(tid),
+                                &[1, words],
+                                crate::superdsc_opspec::Df::SenUint32,
+                            );
+                            out.extend(super::lower_ktir_to_superdsc::int_binary(
+                                f.name,
+                                super::lower_ktir_to_superdsc::IntBinary::Add,
+                                &[scaled, scaled, index_stick(tid, true)],
+                                &[],
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            scaled = index_stick(tid, false);
+                        }
+                        Gather {
+                            index_tid: scaled.tid,
+                            ..g
+                        }
+                    } else {
+                        g
+                    };
+                    // ⭐ ONE BLOCK AN ENTRY, READ STICK-MAJOR — a page read as `[B, R, C·stick]`
+                    // whose `B` blocks are its `B` index entries: each entry's row-major block lands
+                    // stick-major as it is gathered, one entry a core (torch-spyre's compiled page
+                    // gather), so no permute follows.
+                    if page_to_sticks
+                        && pieces == 1
+                        && let &[b, r, c] = to.as_slice()
+                        && b == i64::from(g.entries)
+                        && c > stick
+                        && c % stick == 0
+                    {
+                        let (b, r, c) = (b as u32, r as u32, c as u32);
+                        let tid = mint_inter(k, layout, floor, res);
+                        let dst = stick_major_region(tid, b * r, c / stick as u32, layout);
+                        out.push(
+                            crate::ir::bridge::tiled_op_sdsc_op::assemble_page_gather_blocks(
+                                &format!("gather_o{tid}"),
+                                &crate::place::act_name(g.value_tid),
+                                &dst.name(),
+                                crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                                    crate::place::act_name(g.index_tid),
+                                    crate::superdsc_opspec::PageExtent::of_positions(1),
+                                    g.first_entry,
+                                ),
+                                crate::ir::bridge::tiled_op_sdsc_op::PageGatherBlocks {
+                                    entries: b,
+                                    rows: r,
+                                    cols: c,
+                                    dst_elems: 0,
+                                },
+                                sym_id_base,
+                                Some(layout),
+                            )
+                            .map_err(|message| Error {
+                                message: format!("{}: {message}", f.name),
+                            })?,
+                        );
+                        gather_carried[gi] = true;
+                        if b > 1 {
+                            batch_blocks.insert(tid, c);
+                        }
+                        inter.insert(
+                            res,
+                            Region {
+                                is_out: false,
+                                ..dst
+                            },
+                        );
+                        continue;
+                    }
+                    let [rows, cols] = flat_frame(&from);
+                    if cols != crate::work::FP16_ELEMS_PER_STICK {
+                        return err(format!(
+                            "{}: a page gather's rows are {cols} wide — the gathered copy lands \
+                             a slab as one-stick sub-rows, the stick-major frame its consumers \
+                             read only at one stick",
+                            f.name
+                        ));
+                    }
+                    let tid = mint_inter(k, layout, floor, src);
+                    layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
+                    let r = Region {
+                        tid,
+                        v_rows: rows,
+                        v_cols: cols,
+                        r_start: 0,
+                        c_start: 0,
+                        r_len: rows,
+                        c_len: cols,
+                        r_cover: (0, rows),
+                        c_cover: (0, cols),
+                        is_out: true,
+                        is_fp8: false,
+                        band: None,
+                    };
+                    out.extend(super::lower_ktir_to_superdsc::page_gather(
+                        f.name,
+                        &g,
+                        (page_sticks, pieces),
+                        &r,
+                        sym_id_base,
+                        Some(layout),
+                    )?);
+                    gather_carried[gi] = true;
+                    let r = Region { is_out: false, ..r };
+                    inter.insert(src, r);
+                    r
+                }
+                None => match region_for_operand(k, src)?.or_else(|| inter.get(&src).copied()) {
+                    Some(r) => Region { is_out: false, ..r },
+                    None => {
+                        return err(format!(
+                            "{}: `{:?}` re-frames a value this walk holds no buffer for",
+                            f.name, op.op_type
+                        ));
+                    }
+                },
+            };
+            // ⭐ A ROW-OUTERMOST PAGE READ IN A MULTI-STICK FRAME — kv heads two sticks wide: the
+            // page gather lands its slabs as one-stick rows, and the frame holds each row's sticks a
+            // row block apart, so the card permutes the landing (the `restickify` torch-spyre's
+            // stickification inserts where a consumer reads another layout). A rank-3
+            // `[B, R, C·stick]` read is `B` blocks a batched op takes one at a time — a batched
+            // transpose's input, a batched contraction's kernel — so each block is permuted on its
+            // own, into blocks one after another ([`batch_blocks`]).
+            if page_to_sticks && let Some((rows, sticks)) = stick_major_split(&to, &from) {
+                let Some(layout) = layout else {
+                    return err(format!(
+                        "{}: a stick permute needs a `BundleLayout` to hold its result",
+                        f.name
+                    ));
+                };
+                let tid = mint_inter(k, layout, floor, res);
+                let dst = stick_major_region(tid, rows, sticks, layout);
+                let blocks = match to.as_slice() {
+                    [b, _, _] => *b as u32,
+                    _ => 1,
+                };
+                if blocks > 1 {
+                    for b in 0..blocks {
+                        out.push(permute(
+                            f.name,
+                            &source,
+                            &dst,
+                            Permuted {
+                                rows: rows / blocks,
+                                sticks,
+                                block: Some(b),
+                            },
+                            crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                            sym_id_base,
+                            Some(layout),
+                        )?);
+                    }
+                    batch_blocks.insert(tid, sticks * crate::work::FP16_ELEMS_PER_STICK);
+                } else {
+                    out.push(permute(
+                        f.name,
+                        &source,
+                        &dst,
+                        Permuted::whole((rows, sticks)),
+                        crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                        sym_id_base,
+                        Some(layout),
+                    )?);
+                }
+                inter.insert(
+                    res,
+                    Region {
+                        is_out: false,
+                        ..dst
+                    },
+                );
+                continue;
+            }
+            // The same bytes, in the frame the result is held in — the frame its consumers read
+            // (a `[1, 2048]` gathered query row is the `[8, 4, 64]` batched dot's `[32, 64]`; a
+            // per-row column stays one value per stick row, [`value_frame`]).
+            let [rr, rc] = value_frame(f, &to);
+            let whole = source.r_start == 0
+                && source.c_start == 0
+                && source.r_len == source.v_rows
+                && source.c_len == source.v_cols;
+            let column = |[r, c]: [u32; 2]| c == 1 && r > 1;
+            if whole && column([source.v_rows, source.v_cols]) != column([rr, rc]) {
+                return err(format!(
+                    "{}: `{:?}` reads t{} `[{}, {}]` as `[{rr}, {rc}]` — a per-row column holds one \
+                     value per stick row, and a dense frame packs a row's values into its sticks: \
+                     different bytes",
+                    f.name, op.op_type, source.tid, source.v_rows, source.v_cols
+                ));
+            }
+            let source = if whole && source.v_rows * source.v_cols == rr * rc {
+                reframed(source, [rr, rc])
+            } else {
+                source
+            };
+            inter.insert(res, source);
+            continue;
+        }
+        // ⭐ THE HEAD-MAJOR PAIR FROM THE TRANSPOSE's SIDE — spyre-inference's
+        // `attn.reshape(1, num_heads, P, D).transpose(1, 2).reshape(P, num_heads, D)`: the source's
+        // own bytes in the stick-major frame, and the rows a scatter takes from there.
+        if op.op_type == OpKind::LinalgTranspose
+            && let (Some(res), Some(&src)) = (op.result, op.operands.first())
+        {
+            let dims = |v: Ssa| -> Vec<i64> {
+                f.operations
+                    .iter()
+                    .find(|o| o.result == Some(v))
+                    .and_then(|o| o.result_type)
+                    .and_then(|t| t.dims())
+                    .map(<[i64]>::to_vec)
+                    .unwrap_or_default()
+            };
+            if let Some((r_res, frame, sticks)) = head_major_pair(f, op, &dims(src), &dims(res)) {
+                let Some(source) = region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
+                else {
+                    return err(format!(
+                        "{}: the head-major transpose reads a value this walk holds no buffer for",
+                        f.name
+                    ));
+                };
+                if wide_blocks(&batch_blocks, source.tid) {
+                    return err(format!(
+                        "{}: the head-major transpose reads t{}, whose bytes are batch blocks one \
+                         after another, as a stick-major frame",
+                        f.name, source.tid
+                    ));
+                }
+                // ⭐ THE ROWS IN ONE SCATTER, as torch-spyre scatters a chunk's output rows (its
+                // compiled prefill's `sdsc_26`: every row's every head in one op). The prompt trip's
+                // query-row-major rows ARE the output's rows laid row-major — at one stick a head the
+                // same bytes, wider each head's row laid row-major first — while the destination is
+                // stick-major, whose rows no index entry names whole: so the destination is laid
+                // row-major, the rows scattered into it, and it is laid back.
+                if let Some(layout) = layout
+                    && heads_inner
+                    && let Some(sc) = indirect_store_of(k, r_res)?
+                    && sc.value_rows > 1
+                    && sc.cols > crate::work::FP16_ELEMS_PER_STICK
+                {
+                    let stick = crate::work::FP16_ELEMS_PER_STICK;
+                    let col_sticks = sc.cols / stick;
+                    if source.v_rows * sticks != sc.entries * col_sticks {
+                        return err(format!(
+                            "{}: query-row-major rows t{} `[{}, {}]` scattered as {} rows of {}",
+                            f.name, source.tid, source.v_rows, source.v_cols, sc.entries, sc.cols
+                        ));
+                    }
+                    let rows_major = if sticks == 1 {
+                        source
+                    } else {
+                        let tid = mint_scratch(k, layout, floor, r_res, Scratch::HeadMajorBlocks);
+                        let mid = row_major_region(tid, source.v_rows * sticks, layout);
+                        out.push(permute(
+                            f.name,
+                            &source,
+                            &mid,
+                            Permuted::whole((source.v_rows, sticks)),
+                            crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                            sym_id_base,
+                            Some(layout),
+                        )?);
+                        Region {
+                            is_out: false,
+                            ..mid
+                        }
+                    };
+                    let dest = Region {
+                        tid: sc.value_tid,
+                        v_rows: sc.value_rows,
+                        v_cols: sc.cols,
+                        r_start: 0,
+                        c_start: 0,
+                        r_len: sc.value_rows,
+                        c_len: sc.cols,
+                        r_cover: (0, sc.value_rows),
+                        c_cover: (0, sc.cols),
+                        is_out: false,
+                        is_fp8: false,
+                        band: None,
+                    };
+                    let dest_rows = row_major_region(
+                        mint_scratch(k, layout, floor, r_res, Scratch::HeadMajorMid),
+                        sc.value_rows * col_sticks,
+                        layout,
+                    );
+                    out.push(permute(
+                        f.name,
+                        &dest,
+                        &dest_rows,
+                        Permuted::whole((sc.value_rows, col_sticks)),
+                        crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                        sym_id_base,
+                        Some(layout),
+                    )?);
+                    for (i, (first, entries)) in
+                        super::lower_ktir_to_superdsc::index_runs(sc.entries)
+                            .into_iter()
+                            .enumerate()
+                    {
+                        let base = crate::superdsc_opspec::EntryBase::of_entries(
+                            sc.first_entry.entries() + first,
+                        )
+                        .map_err(|message| Error {
+                            message: format!("{}: {message}", f.name),
+                        })?;
+                        out.push(
+                            crate::ir::bridge::tiled_op_sdsc_op::assemble_scatter_copy(
+                                &format!("scatter{i}_o{}", sc.value_tid),
+                                &rows_major.name(),
+                                &dest_rows.name(),
+                                crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                                    crate::place::act_name(sc.index_tid),
+                                    crate::superdsc_opspec::PageExtent::of_positions(col_sticks),
+                                    base,
+                                ),
+                                crate::ir::bridge::tiled_op_sdsc_op::ScatterCopySpec {
+                                    rows: entries * col_sticks,
+                                    cols: stick,
+                                    df: crate::superdsc_opspec::Df::Fp16,
+                                    src_elems: first * col_sticks * stick,
+                                    dst_elems: 0,
+                                },
+                                sym_id_base,
+                                Some(layout),
+                            )
+                            .map_err(|message| Error {
+                                message: format!("{}: {message}", f.name),
+                            })?,
+                        );
+                    }
+                    out.push(permute(
+                        f.name,
+                        &Region {
+                            is_out: false,
+                            ..dest_rows
+                        },
+                        &Region {
+                            is_out: true,
+                            ..dest
+                        },
+                        Permuted::whole((sc.value_rows, col_sticks)),
+                        crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                        sym_id_base,
+                        Some(layout),
+                    )?);
+                    head_major_skip.insert(r_res);
+                    continue;
+                }
+                let r = match layout {
+                    // The prompt trip's frame back: each query row's heads together, into the
+                    // query rows' own block.
+                    Some(layout) if heads_inner => {
+                        let rows = frame[0];
+                        let block = HeadBlock {
+                            rows,
+                            heads: source.v_rows / rows,
+                            sticks,
+                        };
+                        let m = Minter { k, layout, floor };
+                        let (ops, r) =
+                            heads_inner_pair(m, r_res, f.name, &source, block, false, sym_id_base)?;
+                        out.extend(ops);
+                        r
+                    }
+                    Some(layout) if sticks > 1 => {
+                        let tid = mint_inter(k, layout, floor, r_res);
+                        let dst = stick_major_region(
+                            tid,
+                            frame[0],
+                            frame[1] / crate::work::FP16_ELEMS_PER_STICK,
+                            layout,
+                        );
+                        out.extend(
+                            HeadMajorCopies::of(&dst, &source, source.v_rows, sticks)?.to_block(
+                                f.name,
+                                sym_id_base,
+                                layout,
+                            )?,
+                        );
+                        Region {
+                            is_out: false,
+                            ..dst
+                        }
+                    }
+                    _ => reframed(source, frame),
+                };
+                inter.insert(res, r);
+                inter.insert(r_res, r);
+                head_major_skip.insert(r_res);
+                if let Some(sc) = indirect_store_of(k, r_res)? {
+                    out.extend(super::lower_ktir_to_superdsc::row_scatter(
+                        f.name,
+                        &reframed(r, [sc.entries, sc.cols]),
+                        sc,
+                        sc.value_rows,
+                        sym_id_base,
+                        layout,
+                    )?);
+                }
+                continue;
+            }
+        }
         // The terminal — the `up` multiply for the fused form, the divide itself for a bare one —
         // IS the fused program, and its inputs are the chain's gate and up rather than its own
         // operands (which are `silu(gate)` and up). Everything else keeps the 1:1 map exactly as
@@ -3406,13 +5322,252 @@ pub fn lower_function(
         let reduce = (op.op_type == OpKind::LinalgReduce)
             .then(|| reduce_kind_of(op))
             .flatten();
+        // ⭐ A REDUCTION OVER THE LEADING AXIS IS A CHAIN OF COMBINES — the card's reduce folds
+        // along the stick, and `Dimensions=[0]` folds the `J` blocks of rows a rank-N value's flat
+        // frame holds one after another (a decode batch's `J` block slots: `torch.amax(..., dim=0)`,
+        // `torch.sum(..., dim=0)`). So the `J` row windows of `R` rows each combine pairwise into
+        // the `[R, ·]` result: `acc = win₀ ∘ win₁`, then `acc = acc ∘ winⱼ`. A per-row column (one
+        // value per stick row, the row reductions' own form) is combined as its one-stick rows —
+        // its storage is stick-wide, and the pad lanes the combine writes are never read.
+        if let Some(kind) = reduce
+            && op.attributes.iter().any(
+                |(k, v)| matches!((k, v), (AttrKey::Dimensions, Attr::IntList(d)) if *d == [0]),
+            )
+            && let (Some(res), Some(&data)) = (op.result, op.operands.first())
+        {
+            let Some(layout) = layout else {
+                return err(format!(
+                    "{}: a leading-axis reduction needs a `BundleLayout` to hold its result",
+                    f.name
+                ));
+            };
+            let Some(src) = region_for_operand(k, data)?.or_else(|| inter.get(&data).copied())
+            else {
+                return err(format!(
+                    "{}: a leading-axis reduction reads a value this walk holds no buffer for",
+                    f.name
+                ));
+            };
+            // The blocks folded: the source's elements over the result's.
+            let result_numel: i64 = op
+                .result_type
+                .and_then(|t| t.dims())
+                .map_or(0, |d| d.iter().product());
+            let src_numel = i64::from(src.v_rows) * i64::from(src.c_len);
+            let blocks = if result_numel > 0 && src_numel % result_numel == 0 {
+                (src_numel / result_numel) as u32
+            } else {
+                0
+            };
+            // ONE block folds nothing: the result is the source's own bytes (a decode batch whose
+            // chunk holds one block slot, `J = 1`), as a shape op that moves no byte names its source.
+            if blocks == 1 && src.r_len == src.v_rows {
+                inter.insert(
+                    res,
+                    Region {
+                        is_out: false,
+                        ..src
+                    },
+                );
+                continue;
+            }
+            if blocks < 2 || !src.v_rows.is_multiple_of(blocks) || src.r_len != src.v_rows {
+                return err(format!(
+                    "{}: a leading-axis reduction over {blocks} block(s) of t{}'s {} rows — the \
+                     combine folds whole equal row blocks of a whole view",
+                    f.name, src.tid, src.v_rows
+                ));
+            }
+            let rows = src.v_rows / blocks;
+            let stick = crate::work::FP16_ELEMS_PER_STICK;
+            let column = src.c_len == 1;
+            // ⭐ THE FOLD HALVES INSTEAD OF WALKING, WHERE THE COMBINE REASSOCIATES EXACTLY.
+            // `acc = w₀ ∘ w₁ ∘ … ∘ w_{J-1}` left to right is `J - 1` ops of one window each; folding
+            // the first half against the second is `log₂ J` ops of HALF the windows each — the same
+            // elements combined, so the same total work, in 5 ops instead of 31 at `J = 32` (a decode
+            // batch's one-chunk arm at the 4096-position rung, where the `J` block slots share one
+            // maximum: `torch.amax(..., dim=0)`).
+            //
+            // ⛔ MAXIMUM ONLY, AND THAT IS A NUMERICS ARGUMENT, NOT A CAUTION. `max` is exactly
+            // reassociable — every order yields the same bits — so the tree and the walk compute one
+            // answer. fp16 ADDITION IS NOT: re-ordering a sum re-rounds it, and the only executor of
+            // these descriptors is the card ([`crate::emit`] is inspected here, never run), so a sum
+            // tree would be a numeric change this build cannot check. `Sum` keeps the walk until a
+            // card run can hold a tree to spyre-inference's own answer.
+            //
+            // A block count that is not a power of two keeps the walk too: the halving would leave an
+            // odd window per level, and the pairing that handles it is a second law for a shape this
+            // port never bakes (`J = min(32 / seqs, blocks)` over power-of-two buckets is always one).
+            let halving = matches!(kind, ReduceKind::Max) && blocks.is_power_of_two();
+            let tid = mint_inter(k, layout, floor, res);
+            layout.synth(crate::place::PlaceId::Act(tid), &[rows, src.v_cols]);
+            // ⛔ THE TREE'S WIDE LEVELS GET THEIR OWN BUFFER, NOT A TALLER RESULT. A level above the
+            // last writes several windows, and the result buffer is ONE window — the shape every
+            // consumer of this reduction reads. Widening it instead made the result present as its
+            // buffer (`[256, 1]` against a `[128, 1]` consumer) and the pointwise extent law refused
+            // it by name, correctly. Minted only where a level actually needs it (`blocks > 2`).
+            // ⛔ ITS OWN MINT KEY. `MintKey::Scratch` is `(ssa, n)`, and this `ssa` is the reduction's
+            // OPERAND — which is some other op's result, so a discriminator another arm already uses
+            // on a result (`0` at the shape and gather mints) could hand both the same buffer. `10`
+            // is this arm's alone.
+            let wide = (halving && blocks > 2).then(|| {
+                let t = mint_scratch(k, layout, floor, data, Scratch::FoldTreeWide);
+                layout.synth(crate::place::PlaceId::Act(t), &[src.v_rows / 2, src.v_cols]);
+                (t, src.v_rows / 2)
+            });
+            let acc = Region {
+                tid,
+                v_rows: rows,
+                v_cols: src.v_cols,
+                r_start: 0,
+                c_start: 0,
+                r_len: rows,
+                c_len: src.c_len,
+                r_cover: (0, rows),
+                c_cover: (0, src.v_cols),
+                is_out: true,
+                is_fp8: false,
+                band: None,
+            };
+            // A column's one-stick rows, as the dense arm combines them.
+            let sticks = |r: Region| {
+                if column {
+                    Region {
+                        v_cols: stick,
+                        c_len: stick,
+                        c_cover: (0, stick),
+                        ..r
+                    }
+                } else {
+                    r
+                }
+            };
+            let window = |j: u32| {
+                sticks(Region {
+                    r_start: j * rows,
+                    r_len: rows,
+                    r_cover: (j * rows, (j + 1) * rows),
+                    is_out: false,
+                    ..src
+                })
+            };
+            // `w` consecutive windows of the view at `tid`, from window `first` — the halving fold's
+            // operand, which spans many windows where [`window`] is exactly one.
+            let span = |tid: u32, v_rows: u32, first: u32, w: u32, is_out: bool| {
+                sticks(Region {
+                    tid,
+                    v_rows,
+                    r_start: first * rows,
+                    r_len: w * rows,
+                    r_cover: (first * rows, (first + w) * rows),
+                    is_out,
+                    ..src
+                })
+            };
+            let combine = match kind {
+                ReduceKind::Max => Elementwise::Maximum,
+                ReduceKind::Sum => Elementwise::Add,
+            };
+            // ⭐ A ROW BLOCK SEVERAL STICKS WIDE (head dim 128) combines one stick column at a time: a
+            // window at a row corner is addressable only inside one column plane of its view.
+            let columns = if column {
+                1
+            } else {
+                (src.c_len / stick).max(1)
+            };
+            let in_column = |r: Region, c: u32| {
+                if columns == 1 {
+                    r
+                } else {
+                    let c_start = r.c_start + c * stick;
+                    Region {
+                        c_start,
+                        c_len: stick,
+                        c_cover: (c_start, c_start + stick),
+                        ..r
+                    }
+                }
+            };
+            if halving {
+                // Each level folds the first half of the windows against the second, into the first
+                // half of the accumulator: `J → J/2 → … → 1`, `log₂ J` levels. Level 0 reads the
+                // source; every level after it reads what the one before wrote.
+                let mut n = blocks;
+                let mut from_src = true;
+                while n > 1 {
+                    let half = n / 2;
+                    let (from_tid, from_rows) = match (from_src, wide) {
+                        (true, _) => (src.tid, src.v_rows),
+                        (false, Some((t, r))) => (t, r),
+                        // Unreachable: `from_src` is false only after a level wrote, and a level
+                        // above the last is the only writer of anything but `acc`.
+                        (false, None) => (tid, rows),
+                    };
+                    let lhs = span(from_tid, from_rows, 0, half, false);
+                    let rhs = span(from_tid, from_rows, half, half, false);
+                    // The LAST level (one window out) is the result; every level above it is wide.
+                    let dst = match wide.filter(|_| half > 1) {
+                        Some((t, r)) => span(t, r, 0, half, true),
+                        None => sticks(acc),
+                    };
+                    for c in 0..columns {
+                        out.extend(super::lower_ktir_to_superdsc::elementwise(
+                            f.name,
+                            combine,
+                            &[in_column(lhs, c), in_column(rhs, c), in_column(dst, c)],
+                            &[],
+                            sym_id_base,
+                            Some(layout),
+                        )?);
+                    }
+                    n = half;
+                    from_src = false;
+                }
+            } else {
+                for j in 1..blocks {
+                    let lhs = if j == 1 {
+                        window(0)
+                    } else {
+                        sticks(Region {
+                            is_out: false,
+                            ..acc
+                        })
+                    };
+                    for c in 0..columns {
+                        out.extend(super::lower_ktir_to_superdsc::elementwise(
+                            f.name,
+                            combine,
+                            &[
+                                in_column(lhs, c),
+                                in_column(window(j), c),
+                                in_column(sticks(acc), c),
+                            ],
+                            &[],
+                            sym_id_base,
+                            Some(layout),
+                        )?);
+                    }
+                }
+            }
+            inter.insert(
+                res,
+                Region {
+                    is_out: false,
+                    ..acc
+                },
+            );
+            continue;
+        }
         // `arith.mulf` by a SPLATTED CONSTANT is a scalar multiply, not an `Elementwise(Mul)` — the
         // tiebreak `Program`'s own doc names. Read per-op, because one decoder layer states four
         // different multipliers. Checked BEFORE the 1:1 map, which would otherwise route it to
         // `Elementwise(Mul)` and then fail on the splat operand having no `Region`.
         let scalar = (op.op_type == OpKind::ArithMulf)
             .then(|| splat_scale_of(f, op))
-            .flatten();
+            .flatten()
+            // A constant beside a BROADCAST operand has no scalar form: the multiply is two sprays,
+            // so the splat is materialized and the op runs as its own elementwise kind.
+            .filter(|(_, t)| !in_body && !bcasts.contains_key(t));
         // ⭐ RUNG 3: a mulf by a splat of a LOADED `[1,1]` PARAMETER is the SAME tiebreak with the
         // multiplier bound at launch rather than baked. `to_ktir`'s `expand_splat_of_scalar_argument`
         // emits the `[1,1]` view/tile/load chain for a scalar argument and re-points its splat at the
@@ -3464,6 +5619,61 @@ pub fn lower_function(
             }
             _ => None,
         };
+        // `x min c` / `x max c` with `c` a splatted constant — the tiebreak `splat_scale_of` states
+        // for a multiply, applied to the two binaries whose constant side the device reads the same
+        // way (a bound `[1,1]` const sprayed over the tile).
+        let scalar_binary = match op.op_type {
+            OpKind::ArithMinnumf => Some(Elementwise::Minimum),
+            OpKind::ArithMaxnumf => Some(Elementwise::Maximum),
+            _ => None,
+        }
+        .and_then(|e| splat_scale_of(f, op).map(|(v, t)| (e, v, t)))
+        .filter(|(_, _, t)| !in_body && !bcasts.contains_key(t));
+        // THE BATCHED KINDS — a rank-3 `linalg.batch_matmul`, and a rank-3 `linalg.transpose` that
+        // swaps the two trailing axes: the batch is the leading extent of the result type.
+        let rank3_batch = || match op.result_type {
+            Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 3 => {
+                u32::try_from(dims[0]).ok()
+            }
+            _ => None,
+        };
+        let batched = match op.op_type {
+            OpKind::LinalgBatchMatmul => {
+                let Some(batch) = rank3_batch() else {
+                    return err(format!(
+                        "{}: a `linalg.batch_matmul` whose result is not a rank-3 `[b, m, n]` tensor",
+                        f.name
+                    ));
+                };
+                Some(Lowering::BatchMatmul {
+                    batch,
+                    activation: super::lower_ktir_to_superdsc::BatchFrame::Flat,
+                })
+            }
+            OpKind::LinalgTranspose if rank3_batch().is_some() => {
+                let perm = op.attributes.iter().find_map(|(k, v)| match (k, v) {
+                    (AttrKey::Permutation, Attr::IntList(p)) => Some(*p),
+                    _ => None,
+                });
+                if perm != Some(&[0, 2, 1][..]) {
+                    return err(format!(
+                        "{}: a rank-3 `linalg.transpose` with permutation {perm:?} — the batched \
+                         transpose this door lowers keeps the batch axis and swaps the two trailing \
+                         ones (`[0, 2, 1]`)",
+                        f.name
+                    ));
+                }
+                // Its input in blocks when a permute laid it so ([`batch_blocks`]).
+                let input = match op.operands.first().and_then(|v| inter.get(v)) {
+                    Some(r) if batch_blocks.contains_key(&r.tid) => {
+                        super::lower_ktir_to_superdsc::BatchFrame::Blocks
+                    }
+                    _ => super::lower_ktir_to_superdsc::BatchFrame::Flat,
+                };
+                rank3_batch().map(|batch| Lowering::BatchTranspose { batch, input })
+            }
+            _ => None,
+        };
         let Some(program) = terminal
             .map(|c| {
                 if c.up.is_some() {
@@ -3483,6 +5693,8 @@ pub fn lower_function(
             .or(equal.map(|_| Lowering::Node(Program::Elementwise(Elementwise::Equal))))
             .or(convert.map(Lowering::Convert))
             .or(int_binary)
+            .or(scalar_binary.map(|(e, v, _)| Lowering::ScalarBinary(e, v)))
+            .or(batched)
             .or_else(|| program_of(op.op_type).map(Lowering::Node))
         else {
             return err(format!(
@@ -3540,6 +5752,11 @@ pub fn lower_function(
                 }
             }
             Lowering::Node(Program::Transpose) => 1,
+            // The constant side rides the op as a bound `[1,1]` const, like a scalar multiplier's.
+            Lowering::ScalarBinary(..) => 1,
+            // A batched contraction's `outs` init is no input, exactly as the 2-D one's.
+            Lowering::BatchMatmul { .. } => 2,
+            Lowering::BatchTranspose { .. } => 1,
             Lowering::Node(_) => op.operands.len(),
         };
 
@@ -3570,6 +5787,10 @@ pub fn lower_function(
             // RUNG 3: same rule, the splat's other side. The bound scale is a `[1,1]` parameter, not
             // an operand of the descriptor.
             (None, None, Some(b)) => vec![b.tensor],
+            // A splatted-constant binary's tensor side, wherever the splat sits.
+            (None, None, None) if scalar_binary.is_some() => {
+                vec![scalar_binary.expect("just matched").2]
+            }
             (None, None, None) => op.operands.iter().copied().take(n_in).collect(),
         };
 
@@ -3578,9 +5799,25 @@ pub fn lower_function(
         // the recogniser proved is then CHECKED against that region's shape below rather than trusted:
         // two independent facts about the same operand, so a chain whose axis and extent disagree
         // cannot address a full tile as a vector.
+        // A walk relaid query-row-major ([`heads_inner_pair`]) holds row `p·H + h` where the
+        // program states `h·P + p`: the program's spray of a `[P, ·]` source down its leading
+        // heads axis is, in the frame the walk runs in, each source row repeated over the heads in
+        // place — an inner spray of the same count.
         let mut bcast_axes: Vec<Option<BcastAxis>> = in_values
             .iter()
             .map(|v| bcasts.get(v).map(|b| b.axis))
+            .map(|axis| match axis {
+                Some(BcastAxis::Y(sp))
+                    if heads_rows.is_some()
+                        && sp.order == crate::emit::SprayOrder::Outer
+                        && sp.of == super::lower_ktir_to_superdsc::SprayOf::Tile =>
+                {
+                    Some(BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::inner(
+                        sp.count,
+                    )))
+                }
+                other => other,
+            })
             .collect();
         // ⭐⭐⭐ THE FLAT FORM'S FLAG RIDES BESIDE THE AXIS, because the two say different things:
         // the axis says which MODE the consumer addresses the operand in, the flag says the
@@ -3665,16 +5902,35 @@ pub fn lower_function(
                         per_op.push(present(*r)?);
                         from_parameter.push(false);
                     }
-                    None => {
-                        return err(format!(
-                            "{}: `{:?}` input {i} is neither a load of a parameter nor an \
-                             intermediate this function produced — so it is a constant (a \
-                             `tensor.splat`). `Program::ScalarMul` is the door for \"times a stated \
-                             constant\" and choosing it here would pick a node kind for the \
-                             producer, so it is refused instead",
-                            f.name, op.op_type
-                        ));
-                    }
+                    // ⭐ A SPLATTED CONSTANT READ AS A DENSE OPERAND IS A BUFFER OF ITS ONE VALUE —
+                    // `tensor.splat`'s own lowering: minted at the splat's frame and filled from the
+                    // registry's bound const ([`super::lower_ktir_to_superdsc::fill`]). The op that
+                    // reads it keeps its own kind; only a multiply/min/max beside a dense tensor
+                    // reads its constant side as a scalar instead (`ScalarMul`, `ScalarBinary`).
+                    None => match splat_buffer(k, layout, floor, *v)? {
+                        Some((r, value)) => {
+                            out.extend(super::lower_ktir_to_superdsc::fill(
+                                f.name,
+                                value,
+                                &r,
+                                sym_id_base,
+                                layout,
+                            )?);
+                            let r = Region { is_out: false, ..r };
+                            inter.insert(*v, r);
+                            per_op.push(present(r)?);
+                            from_parameter.push(false);
+                        }
+                        None => {
+                            return err(format!(
+                                "{}: `{:?}` input {i} is neither a load of a parameter nor an \
+                                 intermediate this function produced, nor a splatted float \
+                                 constant (a splat of anything else names no one value to \
+                                 fill)",
+                                f.name, op.op_type
+                            ));
+                        }
+                    },
                 },
             }
         }
@@ -3694,7 +5950,10 @@ pub fn lower_function(
             let r = per_op[i];
             let degenerate = match axis {
                 BcastAxis::Col => r.c_len == 1,
-                BcastAxis::Mb => r.v_rows == 1,
+                // One row of its view: the whole view at one row, or a one-row window of a taller
+                // one (the walk's mask tile, row `i` of the stack), which the emitter addresses at
+                // its own row.
+                BcastAxis::Mb => r.v_rows == 1 || r.r_len == 1,
                 // ⭐ THE ROW-SPLIT SOURCE IS A FULL TILE ON PURPOSE — the opposite of degenerate
                 // — so there is nothing to check in THIS frame. Its proof is the consumer's own
                 // want check (`elementwise_broadcast`: the source at `[rows/y, c_len]` against
@@ -3961,11 +6220,75 @@ pub fn lower_function(
             transposed_b_is_placeable(f.name, b, b_from_parameter)?;
         }
 
-        // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result.
-        let mut stored = f
-            .operations
-            .iter()
-            .find(|s| s.op_type == OpKind::KtdpStore && s.operands.first().copied() == op.result);
+        // ⛔ A BATCHED CONTRACTION READS ITS KERNEL AS PER-BATCH `[k, n]` BLOCKS — written so by a
+        // batched transpose, or a one-stick-wide flat frame (the same bytes). Any other kernel's
+        // flat frame interleaves the batches stick by stick, and no base offset names one block.
+        // ⛔ AND A BATCH-BLOCKED BUFFER WIDER THAN A STICK IS READ ONLY AS BLOCKS — by a batched
+        // transpose (its input) or a batched contraction (its kernel). Anything else reads the flat
+        // frame, whose stick columns those bytes are not.
+        for (i, x) in per_op.iter().enumerate() {
+            let reads_blocks = matches!(
+                (&program, i),
+                (Lowering::BatchTranspose { .. }, 0) | (Lowering::BatchMatmul { .. }, 1)
+            );
+            if wide_blocks(&batch_blocks, x.tid) && !reads_blocks {
+                return err(format!(
+                    "{}: input {i} t{} `[{}, {}]` holds batch blocks one after another, which only \
+                     a batched transpose's input or a batched contraction's kernel reads",
+                    f.name, x.tid, x.v_rows, x.v_cols
+                ));
+            }
+        }
+        if let Lowering::BatchMatmul { .. } = program
+            && let Some(w) = per_op.get(1)
+            && !(batch_blocks.contains_key(&w.tid) || w.c_len == crate::work::FP16_ELEMS_PER_STICK)
+        {
+            return err(format!(
+                "{}: a batched contraction's kernel t{} is a `[{}, {}]` flat frame no batched \
+                 transpose wrote — its batches' `[k, n]` blocks are not contiguous runs of it",
+                f.name, w.tid, w.v_rows, w.v_cols
+            ));
+        }
+        // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result — directly, or
+        // through a shape op that moves no byte (the walk's `[NKVH, ROWS, HD]` result stored as the
+        // `[NQH, MQ, HD]` the output view states).
+        // ⭐ A STORE THROUGH AN INDIRECT TILE IS A SCATTER, NOT THIS OP's OUTPUT: the value is an
+        // intermediate, and [`indirect_store_of`] copies it to the rows its index names after the op
+        // writes it (spyre-inference's `out.index_copy_(0, query_row_index, attn)`).
+        let stores_of = |v: Option<Ssa>| {
+            f.operations.iter().find(|s| {
+                s.op_type == OpKind::KtdpStore
+                    && s.operands.first().copied() == v
+                    && !indirect_tile_of(f, s.operands.get(1).copied())
+            })
+        };
+        let op_dims: Vec<i64> = op
+            .result_type
+            .and_then(|t| t.dims())
+            .map(<[i64]>::to_vec)
+            .unwrap_or_default();
+        // Stored through a shape op: the op writes the stored parameter's bytes in its OWN frame.
+        let mut through_shape = false;
+        let mut stored = stores_of(op.result).or_else(|| {
+            let res = op.result?;
+            let shape = f.operations.iter().find(|o| {
+                matches!(
+                    o.op_type,
+                    OpKind::TensorReshape | OpKind::TensorCollapseShape | OpKind::TensorExpandShape
+                ) && o.operands.first() == Some(&res)
+            })?;
+            // Only through a shape op that moves no byte: one that does is a stick permute, which
+            // the shape op's own arm lowers into the stored parameter.
+            let shape_dims = shape
+                .result_type
+                .and_then(|t| t.dims())
+                .map(<[i64]>::to_vec)
+                .unwrap_or_default();
+            same_card_bytes(&op_dims, &shape_dims).then_some(())?;
+            let s = stores_of(shape.result);
+            through_shape = s.is_some();
+            s
+        });
         // ⭐⭐⭐ THE fp8 WEIGHT-SCALE EPILOGUE, ABSORBED AT THE DOT. `matmul_fp8.py` spells the W8A8
         // contraction's scale multiply IN THE KERNEL — `p * ws` between the dot and the store — so
         // the dot's result is never stored directly: without this arm the walk would mint it an
@@ -4090,7 +6413,25 @@ pub fn lower_function(
                     f.name, op.op_type
                 ));
             };
+            // ⭐⭐⭐ A PER-ROW SCALAR OF A RANK-N TILE IS A COLUMN — a reduction over a rank-N
+            // tile's last axis writes one value per row of its `[rows, cols]` flat frame, i.e. the
+            // `[rows, 1]` column `assemble_reduce_seeded` writes, whatever rank the program states
+            // it at (`[B, G]` for a `[B, G, PS]` tile); and a pointwise op over such a column (the
+            // running max's `max`, the rescale's `exp`) keeps it one. Framed `[numel, 1]`, not the
+            // stated shape's own `[B, G]`, which would be a different stick per row.
+            let numel: Option<i64> = op
+                .result_type
+                .and_then(|t| t.dims())
+                .filter(|d| d.len() >= 2)
+                .map(|d| d.iter().product());
+            let per_row_scalar = numel.is_some_and(|n| {
+                matches!(program, Lowering::Reduce(_))
+                    || per_op
+                        .iter()
+                        .any(|r| !r.is_out && r.c_len == 1 && i64::from(r.r_len) == n)
+            });
             let dims = match op.result_type {
+                _ if per_row_scalar => [numel.expect("just checked") as u32, 1],
                 Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 2 => {
                     [dims[0] as u32, dims[1] as u32]
                 }
@@ -4150,7 +6491,17 @@ pub fn lower_function(
             // whose every input is a minted band intermediate states no windowed input; its mint
             // stays at the tile and the extents law refuses the sweep mismatch by name — refused
             // at the op that could have extended it, not silently mis-sized.)
-            let dims = [band_rows_of(&per_op, dims[0]), dims[1]];
+            // A BROADCAST operand's window is the vector it sprays, not the op's sweep (the walk's
+            // mask tile, `[ROWS, BLOCK]` of the stack, sprayed over every kv head's rows) — unless
+            // its window is the launch's own flush band, which IS the sweep (the batched sampler's
+            // `pid`-cornered per-row seed, `[B, 1]` sprayed along the `[B, V]` rows it banks).
+            let swept: Vec<Region> = per_op
+                .iter()
+                .enumerate()
+                .filter(|(i, r)| bcast_axes.get(*i).is_none_or(Option::is_none) || r.band.is_some())
+                .map(|(_, r)| *r)
+                .collect();
+            let dims = [band_rows_of(&swept, dims[0]), dims[1]];
             let Some(layout) = layout else {
                 return err(format!(
                     "{}: `{:?}`'s result is an intermediate, which needs a `BundleLayout` to hold \
@@ -4158,7 +6509,29 @@ pub fn lower_function(
                     f.name, op.op_type
                 ));
             };
-            let tid = mint_inter(k, layout, floor, res);
+            // ⭐ A WALK'S YIELDED VALUE IS WRITTEN INTO ITS CARRIED BUFFER — the next trip reads it
+            // there — once nothing later in the body reads the value the buffer still holds.
+            let carried = yield_target.get(&res).copied();
+            if let Some((arg, target)) = carried {
+                if [target.v_rows, target.v_cols] != dims {
+                    return err(format!(
+                        "{}: the walk yields a `[{}, {}]` value into a carried `[{}, {}]` buffer",
+                        f.name, dims[0], dims[1], target.v_rows, target.v_cols
+                    ));
+                }
+                if last_read(arg).is_some_and(|last| last > oi) {
+                    return err(format!(
+                        "{}: the walk's carried %{} is read after the op that writes its next \
+                         value — the card holds ONE buffer per carried value, so the program must \
+                         read the old value before it computes the new one",
+                        f.name, arg.0
+                    ));
+                }
+            }
+            let tid = match carried {
+                Some((_, target)) => target.tid,
+                None => mint_inter(k, layout, floor, res),
+            };
             // ⛔⛔⛔ A MATMUL'S INTERMEDIATE IS RESERVED AT ITS **DEVICE** WIDTH, NOT THE LOGICAL
             // SHAPE — everything else keeps the logical dims.
             //
@@ -4229,7 +6602,9 @@ pub fn lower_function(
             // refuse the first over-run, or without it the next intermediate would be aliased.
             // `synth_df` reserves the true width, the same fact `pointwise_broadcast_opspec_df`
             // threads into the descriptors.
-            layout.synth_df(crate::place::PlaceId::Act(tid), &dev_dims, op_df);
+            if carried.is_none() {
+                layout.synth_df(crate::place::PlaceId::Act(tid), &dev_dims, op_df);
+            }
             // ⭐⭐⭐ THE BAND PROPAGATES THROUGH THE MINT — a banded op's intermediate is a
             // banded operand of the NEXT op. The minted region states the band its inputs
             // stated (`band_of` refuses a disagreement), so a chain of ops over a flush band
@@ -4253,6 +6628,138 @@ pub fn lower_function(
             };
             inter.insert(res, r);
             per_op.push(r);
+            // ⭐⭐ A BATCHED CONTRACTION'S ACTIVATION WIDER THAN A STICK, READ AS BATCH BLOCKS. In the
+            // flat frame a batch's rows are a slice whose sticks sit the TENSOR's rows apart, and the
+            // card's contraction steps them by its own rows whatever the descriptor states — MEASURED
+            // on granite-3.1-8b: each kv head's `[84, 128]` slice of the `[672, 128]` head-major query
+            // contracted its second stick from the next kv head's first (the card's scores match that
+            // read at rel-rms 0.0012, the intended one at 1.19). So the batches are copied into
+            // standalone stick-major `[m, k]` blocks first — the head-major pair's block side, `[m,
+            // b·k]`, one stick-run copy per stick of a batch ([`HeadMajorCopies::to_block`], the
+            // attention output's own relayout) — and the contraction reads blocks.
+            let program = match program {
+                // ⭐ THE PROMPT TRIP'S CONTRACTION ([`crate::placement::WalkDivision::HeadsInner`]): its
+                // activation is query-row-major, `heads` heads of `heads_rows` rows, so the batch is
+                // the query HEAD, and each head contracts against its kv head's kernel block — laid
+                // once per query head of a group first (torch-spyre's own expansion), so every core
+                // reads one kernel at one start.
+                Lowering::BatchMatmul {
+                    batch,
+                    activation: super::lower_ktir_to_superdsc::BatchFrame::Flat,
+                } if heads_inner => {
+                    let (a, w) = (per_op[0], per_op[1]);
+                    let Some(rows) = heads_rows.filter(|&r| r > 0 && a.v_rows.is_multiple_of(r))
+                    else {
+                        return err(format!(
+                            "{}: a contraction of t{} `[{}, {}]` under the query-row-major plan, \
+                             whose query rows were never laid out so",
+                            f.name, a.tid, a.v_rows, a.v_cols
+                        ));
+                    };
+                    let heads = a.v_rows / rows;
+                    if !heads.is_multiple_of(batch) || !w.v_rows.is_multiple_of(batch) {
+                        return err(format!(
+                            "{}: {heads} query heads over a {batch}-batch kernel t{} `[{}, {}]` — \
+                             each kv head serves a whole group of query heads",
+                            f.name, w.tid, w.v_rows, w.v_cols
+                        ));
+                    }
+                    let block_rows = w.v_rows / batch;
+                    let tid = mint_scratch(k, layout, floor, res, Scratch::BatchKernelBlocks);
+                    let expanded = stick_major_region(
+                        tid,
+                        heads * block_rows,
+                        w.v_cols / crate::work::FP16_ELEMS_PER_STICK,
+                        layout,
+                    );
+                    out.push(
+                        crate::ir::bridge::tiled_op_sdsc_op::assemble_expand_blocks(
+                            &format!("expand_o{tid}"),
+                            &w.name(),
+                            &expanded.name(),
+                            crate::ir::bridge::tiled_op_sdsc_op::ExpandedBlocks {
+                                batch,
+                                group: heads / batch,
+                                rows: block_rows,
+                                cols: w.v_cols,
+                            },
+                            sym_id_base,
+                            Some(layout),
+                        )
+                        .map_err(|message| Error {
+                            message: format!("{}: {message}", f.name),
+                        })?,
+                    );
+                    batch_blocks.insert(tid, w.v_cols);
+                    per_op[1] = Region {
+                        is_out: false,
+                        ..expanded
+                    };
+                    Lowering::BatchMatmul {
+                        batch: heads,
+                        activation: super::lower_ktir_to_superdsc::BatchFrame::HeadsInner,
+                    }
+                }
+                Lowering::BatchMatmul {
+                    batch,
+                    activation: super::lower_ktir_to_superdsc::BatchFrame::Flat,
+                } if batch > 1
+                    && !layout
+                        .lx_division
+                        .get()
+                        .is_some_and(|d| d.one_op_over(batch))
+                    && per_op
+                        .first()
+                        .is_some_and(|a| a.v_cols > crate::work::FP16_ELEMS_PER_STICK) =>
+                {
+                    let a = per_op[0];
+                    let stick = crate::work::FP16_ELEMS_PER_STICK;
+                    if !a.v_rows.is_multiple_of(batch) || !a.v_cols.is_multiple_of(stick) {
+                        return err(format!(
+                            "{}: a {batch}-batch contraction's activation t{} `[{}, {}]` is not \
+                             whole batches of whole sticks",
+                            f.name, a.tid, a.v_rows, a.v_cols
+                        ));
+                    }
+                    let (m, sticks) = (a.v_rows / batch, a.v_cols / stick);
+                    let tid = mint_scratch(k, layout, floor, res, Scratch::BatchActivationBlocks);
+                    let blocks = stick_major_region(tid, m, batch * sticks, layout);
+                    let copies = HeadMajorCopies::of(&blocks, &a, a.v_rows, sticks)?.to_block(
+                        f.name,
+                        sym_id_base,
+                        layout,
+                    )?;
+                    // ⭐ AN ACTIVATION THE WALK'S BODY DOES NOT DEFINE IS LAID OUT ONCE, BEFORE THE
+                    // WALK. The body relaunches once per page, so the decode query's copies — the
+                    // same bytes on every trip — would run once per page; they go ahead of the
+                    // body's first descriptor instead, into scratch no trip writes (a synthetic
+                    // intermediate's footprint is its own, [`crate::placement::BundleLayout::synth`]).
+                    let invariant = in_body
+                        && fold.is_some_and(|fd| {
+                            in_values.first().is_some_and(|v| {
+                                !fd.body.contains(v) && fd.carried.iter().all(|c| c.arg != *v)
+                            })
+                        });
+                    if invariant {
+                        let n = copies.len();
+                        out.splice(body_out.0..body_out.0, copies);
+                        body_out.0 += n;
+                    } else {
+                        out.extend(copies);
+                    }
+                    per_op[0] = Region {
+                        tid,
+                        is_out: false,
+                        ..a
+                    };
+                    batch_blocks.insert(tid, a.v_cols);
+                    Lowering::BatchMatmul {
+                        batch,
+                        activation: super::lower_ktir_to_superdsc::BatchFrame::Blocks,
+                    }
+                }
+                other => other,
+            };
             let name = f.name;
             let mut emitted = emit_one(
                 name,
@@ -4269,6 +6776,20 @@ pub fn lower_function(
                 },
             )?;
             out.append(&mut emitted);
+            if let Lowering::BatchTranspose { .. } = program {
+                batch_blocks.insert(r.tid, r.v_cols);
+            }
+            // ⭐ AND WHERE THE PROGRAM STORES THE VALUE THROUGH AN INDEX, THE ROWS GO THERE NOW.
+            if let Some(sc) = indirect_store_of(k, res)? {
+                out.extend(super::lower_ktir_to_superdsc::row_scatter(
+                    f.name,
+                    &reframed(r, [sc.entries, sc.cols]),
+                    sc,
+                    sc.value_rows,
+                    sym_id_base,
+                    Some(layout),
+                )?);
+            }
             lowered += 1;
             continue;
         };
@@ -4299,6 +6820,21 @@ pub fn lower_function(
         };
         o = windowed_region(k, o, tile)?;
         o.is_out = true;
+        // ⭐ THROUGH A SHAPE OP THAT MOVES NO BYTE, THE OUTPUT IS READ IN THE OP'S OWN FRAME — the
+        // same card bytes, framed as the op's operands are: a decode batch of one's `[1, KV, G, D]`
+        // softmax output, stored as `out`'s `[1, KV·G·D]` row, is written `[KV·G, D]`, the frame
+        // its `[KV·G, D]` operands share (an elementwise op's operands and output are one tile).
+        let frame = flat_frame(&op_dims);
+        if through_shape
+            && o.r_start == 0
+            && o.c_start == 0
+            && o.r_len == o.v_rows
+            && o.c_len == o.v_cols
+            && frame != [o.v_rows, o.v_cols]
+            && frame[0] * frame[1] == o.v_rows * o.v_cols
+        {
+            o = reframed(o, frame);
+        }
         per_op.push(o);
         // ⭐⭐⭐ A STORED RESULT IS STILL READABLE. The value this op writes to the store's
         // parameter lives in that parameter's buffer, and a LATER compute consumer of it
@@ -4340,6 +6876,33 @@ pub fn lower_function(
         lowered += 1;
     }
 
+    // ⭐ A PARAMETER'S ROWS SCATTERED — a `ktdp.store` of a `ktdp.load` through an indirect access
+    // tile, in any program: the card's scatter copy ([`super::lower_ktir_to_superdsc::load_scatters`]).
+    // The rows are a parameter's, so they move once the compute is done — which is program order
+    // only while nothing the program reads is a destination they land in, so that is refused.
+    let scattered = super::lower_ktir_to_superdsc::load_scatters(f.name, k, sym_id_base, layout)?;
+    for sc in super::lower_ktir_to_superdsc::scatters_of(k)? {
+        let read = gathers.iter().any(|g| g.value_tid == sc.value_tid)
+            || f.ops_deep().iter().any(|o| {
+                o.op_type == OpKind::KtdpLoad
+                    && o.result.is_some_and(|v| {
+                        region_for_operand(k, v)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|r| r.tid == sc.value_tid)
+                    })
+            });
+        if read {
+            return err(format!(
+                "{}: the program scatters rows into t{} and also reads it — the scatter runs after \
+                 the compute, so a read of its destination would see the rows before they land",
+                f.name, sc.value_tid
+            ));
+        }
+    }
+    let scatters = !scattered.is_empty();
+    out.extend(scattered);
+
     // ⭐ THE PURE-COPY ARM. A copy program states no compute op at all — its ops are loads and
     // stores, every one of them plumbing this walk skips — so `lowered == 0` is not a refusal for
     // it but the expected shape, and the one production copy is the LmLast last-row extraction
@@ -4360,8 +6923,11 @@ pub fn lower_function(
         let r = regions(k)?;
         return super::lower_ktir_to_superdsc::lmlast(f.name, k, &r, sym_id_base, layout);
     }
-    if lowered == 0 {
-        return err(format!("{}: no compute op in the function", f.name));
+    if lowered == 0 && !scatters {
+        return err(format!(
+            "{}: no compute op and no scatter in the function",
+            f.name
+        ));
     }
     // ⛔⛔⛔ A GATHER THE PROGRAM STATES AND NO DESCRIPTOR CARRIES IS A SILENTLY DIRECT READ.
     //
@@ -4389,7 +6955,617 @@ pub fn lower_function(
             ));
         }
     }
+    // ⭐⭐⭐ THE WALK'S BODY, MARKED — every descriptor the body's ops emitted is relaunched once per
+    // trip ([`super::EmittedOp::walk`]), its gathers resolved through the index the trip's shift
+    // points at (`kv_gathered`) and the run kept whole as one fold (`kv_page_fold`): a fold cut into
+    // two groups would run every trip of the first before the second, reading the scratch the first
+    // left behind.
+    if let (Some(fold), Some(_)) = (fold, body_at) {
+        let end = body_out.1.unwrap_or(out.len());
+        let trips = super::loop_fold::WalkTrips {
+            trips: fold.trips,
+            step_bytes: fold.step_bytes,
+        };
+        for e in &mut out[body_out.0..end] {
+            e.walk = Some(trips);
+            e.kv_page_fold = true;
+            e.kv_gathered = true;
+        }
+    }
     Ok(out)
+}
+
+/// THE FRAME A VALUE OF `dims` IS HELD IN: a per-row scalar of a reduction — a value shaped as a
+/// `linalg.reduce` result of this function, the running max and sum — is the `[numel, 1]` column the
+/// reduction writes; anything else is its flat frame.
+fn value_frame(f: &IRFunction<'static>, dims: &[i64]) -> [u32; 2] {
+    // The shapes a per-row column takes: a stick fold's result, a leading fold of a per-row
+    // column (a decode batch's `J` block slots' running max, folded), and a shape op over one (the
+    // folded max expanded back over the slots: one value per stick row in either shape) — to a
+    // fixed point.
+    let deep = f.ops_deep();
+    let dims_of = |o: &Operation<'_>| o.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec);
+    let mut columns: Vec<Vec<i64>> = deep
+        .iter()
+        .filter(|o| o.op_type == OpKind::LinalgReduce && folds_the_stick(o))
+        .filter_map(|o| dims_of(o))
+        .collect();
+    loop {
+        let more: Vec<Vec<i64>> = deep
+            .iter()
+            .filter(|o| {
+                (o.op_type == OpKind::LinalgReduce && !folds_the_stick(o))
+                    || matches!(
+                        o.op_type,
+                        OpKind::TensorReshape
+                            | OpKind::TensorExpandShape
+                            | OpKind::TensorCollapseShape
+                    )
+            })
+            .filter(|o| {
+                o.operands
+                    .first()
+                    .and_then(|&v| deep.iter().find(|d| d.result == Some(v)))
+                    .and_then(|d| dims_of(d))
+                    .is_some_and(|d| columns.contains(&d))
+            })
+            .filter_map(|o| dims_of(o))
+            .filter(|d| !columns.contains(d))
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        columns.extend(more);
+    }
+    let per_row = columns.iter().any(|d| d == dims);
+    if per_row {
+        [dims.iter().product::<i64>() as u32, 1]
+    } else {
+        flat_frame(dims)
+    }
+}
+
+/// Whether a `linalg.reduce` folds its input's LAST axis — the stick, one value per row of the
+/// flat frame, the per-row column a row reduction writes. A fold of any other axis (the leading
+/// `J` of a decode batch's block slots) writes a tile of the input's own rows.
+fn folds_the_stick(o: &Operation<'_>) -> bool {
+    let rank = o.result_type.and_then(|t| t.dims()).map_or(0, <[i64]>::len);
+    o.attributes.iter().any(
+        |(k, v)| matches!((k, v), (AttrKey::Dimensions, Attr::IntList(d)) if *d == [rank as i64]),
+    )
+}
+
+/// The values of the splatted constants the walk MATERIALIZES — a splat read as a dense operand of a
+/// binary op ([`splat_buffer`]), the registry constants its fills read. A splat a multiply, `min` or
+/// `max` reads beside a dense tensor is a scalar operand instead (`ScalarMul`, `ScalarBinary`), and a
+/// contraction's or reduction's init is the op's own seed; neither is materialized.
+pub fn splat_fill_values(f: &IRFunction<'static>) -> Result<Vec<f32>, Error> {
+    let (bcasts, _) = program_broadcast_chains(f)?;
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let splat_value = |s: Ssa| -> Option<f32> {
+        let sp = def_of(s).filter(|o| o.op_type == OpKind::TensorSplat)?;
+        let c = def_of(*sp.operands.first()?).filter(|o| o.op_type == OpKind::ArithConstant)?;
+        c.attributes.iter().find_map(|(k, v)| match (k, v) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x as f32),
+            _ => None,
+        })
+    };
+    let mut out: Vec<f32> = Vec::new();
+    for op in f.operations.iter() {
+        let scalar_side = matches!(
+            op.op_type,
+            OpKind::ArithMulf | OpKind::ArithMinnumf | OpKind::ArithMaxnumf
+        );
+        let binary = scalar_side
+            || matches!(
+                op.op_type,
+                OpKind::ArithAddf | OpKind::ArithSubf | OpKind::ArithDivf
+            );
+        let [a, b] = op.operands[..] else { continue };
+        if !binary {
+            continue;
+        }
+        for (x, other) in [(a, b), (b, a)] {
+            let Some(v) = splat_value(x) else { continue };
+            let absorbed =
+                scalar_side && splat_value(other).is_none() && !bcasts.contains_key(&other);
+            if !absorbed && !out.iter().any(|y| y.to_bits() == v.to_bits()) {
+                out.push(v);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The splatted float constants a binary float op reads as OPERANDS — the values the walk's body
+/// materializes before its descriptors begin. A contraction's `outs` and a reduction's init are not
+/// among them: those are the op's own seeds, never read as data.
+fn dense_splat_operands(f: &IRFunction<'static>, o: &Operation<'static>) -> Vec<Ssa> {
+    if !matches!(
+        o.op_type,
+        OpKind::ArithAddf
+            | OpKind::ArithSubf
+            | OpKind::ArithMulf
+            | OpKind::ArithDivf
+            | OpKind::ArithMinnumf
+            | OpKind::ArithMaxnumf
+    ) {
+        return Vec::new();
+    }
+    let def_of = |s: Ssa| f.operations.iter().find(|x| x.result == Some(s));
+    o.operands
+        .iter()
+        .copied()
+        .filter(|v| {
+            def_of(*v).is_some_and(|sp| {
+                sp.op_type == OpKind::TensorSplat
+                    && sp
+                        .operands
+                        .first()
+                        .and_then(|c| def_of(*c))
+                        .is_some_and(|c| {
+                            c.op_type == OpKind::ArithConstant
+                                && c.attributes.iter().any(|(k, a)| {
+                                    *k == AttrKey::Value && matches!(a, Attr::Float(_))
+                                })
+                        })
+            })
+        })
+        .collect()
+}
+
+/// A splatted float constant's BUFFER — minted at its frame ([`value_frame`]) and declared to the
+/// layout, with the value it holds — or `None` when `v` is not a `tensor.splat` of a float constant.
+fn splat_buffer(
+    k: &KtirNode,
+    layout: Option<&BundleLayout>,
+    floor: u32,
+    v: Ssa,
+) -> Result<Option<(Region, f32)>, Error> {
+    let f = &k.func;
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let Some(splat) = def_of(v).filter(|o| o.op_type == OpKind::TensorSplat) else {
+        return Ok(None);
+    };
+    let value = splat
+        .operands
+        .first()
+        .and_then(|c| def_of(*c))
+        .filter(|o| o.op_type == OpKind::ArithConstant)
+        .and_then(|o| {
+            o.attributes.iter().find_map(|(k, a)| match (k, a) {
+                (AttrKey::Value, Attr::Float(x)) => Some(*x as f32),
+                _ => None,
+            })
+        });
+    let (Some(value), Some(dims)) = (value, splat.result_type.and_then(|t| t.dims())) else {
+        return Ok(None);
+    };
+    let Some(layout) = layout else {
+        return err(format!(
+            "{}: a splatted constant read as a dense operand needs a `BundleLayout` to hold its \
+             buffer",
+            f.name
+        ));
+    };
+    let [rows, cols] = value_frame(f, dims);
+    let tid = mint_inter(k, layout, floor, v);
+    layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
+    Ok(Some((
+        Region {
+            tid,
+            v_rows: rows,
+            v_cols: cols,
+            r_start: 0,
+            c_start: 0,
+            r_len: rows,
+            c_len: cols,
+            r_cover: (0, rows),
+            c_cover: (0, cols),
+            is_out: true,
+            is_fp8: false,
+            band: None,
+        },
+        value,
+    )))
+}
+
+/// ⭐ THE INT32 ZERO a chained index's run is copied against
+/// ([`super::lower_ktir_to_superdsc::index_run_gather`], `addi32toi32(zero, run)` — the int32 copy dxp
+/// binds): the decode step's host-staged zero stick (`PAGED_INT32_ZERO_TID`), [`INDEX_RUN_WORDS`] i32
+/// zeros — staged by the host as every int32 the attention reads is, never made on the card. Refused
+/// by name when the bundle does not place it, or places it short of a run.
+///
+/// [`INDEX_RUN_WORDS`]: super::lower_ktir_to_superdsc::INDEX_RUN_WORDS
+fn int_zero_run(name: &str, layout: &BundleLayout) -> Result<u32, Error> {
+    let tid = crate::reserved_tids::PAGED_INT32_ZERO_TID;
+    let words = super::lower_ktir_to_superdsc::INDEX_RUN_WORDS;
+    match layout.placements.get(&tid) {
+        Some(p) if p.size >= u64::from(words) * 4 => Ok(tid),
+        placed => err(format!(
+            "{name}: a chained index copies its run against the host-staged int32 zero t{tid}, which \
+             this bundle places in {} bytes — a run is {words} words",
+            placed.map_or(0, |p| p.size)
+        )),
+    }
+}
+
+/// Whether `tid` holds batch blocks wider than one stick — bytes no flat frame names
+/// ([`lower_function_folded`]'s `batch_blocks`).
+fn wide_blocks(blocks: &std::collections::HashMap<u32, u32>, tid: u32) -> bool {
+    blocks
+        .get(&tid)
+        .is_some_and(|&w| w > crate::work::FP16_ELEMS_PER_STICK)
+}
+
+/// A value's FLAT FRAME — every axis but the last folded into rows ([`shape_2d`]'s reading).
+fn flat_frame(dims: &[i64]) -> [u32; 2] {
+    match dims {
+        [] => [1, 1],
+        [c] => [1, *c as u32],
+        [lead @ .., c] => [lead.iter().product::<i64>() as u32, *c as u32],
+    }
+}
+
+/// ⭐ THE ROW-MAJOR SPLIT OF A STICK-MAJOR BLOCK — `(R, C)` when `stick_major`'s flat frame is
+/// `[R, C·stick]`, `R ≥ 2` rows of `C ≥ 2` sticks, and `row_major` is the same card bytes as
+/// `[R·C, stick]` (its own flat frame, or one row of `R·C` sticks, or a row-outermost page's one-stick
+/// landing): the same elements, row `r`'s sticks in order, which on the card are different bytes
+/// (`[C][R][stick]` vs `[R][C][stick]`) — the pair a stick permute moves between. One row of the
+/// stick-major side is the same bytes in both frames, and no permute. (A head two sticks wide puts
+/// granite-3.1-8b's `[kv, group, 128]` on the stick-major side.)
+fn stick_major_split(stick_major: &[i64], row_major: &[i64]) -> Option<(u32, u32)> {
+    let stick = crate::work::FP16_ELEMS_PER_STICK;
+    let [rows, cols] = flat_frame(stick_major);
+    let sticks = cols / stick;
+    (cols.is_multiple_of(stick)
+        && rows >= 2
+        && sticks >= 2
+        && same_card_bytes(row_major, &[i64::from(rows * sticks), i64::from(stick)]))
+    .then_some((rows, sticks))
+}
+
+/// ⭐ STICK-MAJOR ROWS READ AS HEAD ROWS OF SEVERAL STICKS — a `[R, C·stick]` block (`R ≥ 2`) read
+/// in a frame whose flat form is `[N, S·stick]`, `S ≥ 2`, `N` a multiple of `R` and `N·S = R·C`: row
+/// `r`'s sticks split into `N / R` head rows of `S` sticks each. On the card that is two stick
+/// permutes — the row-major split `[R·C, stick]`, then its `N` rows of `S` sticks back to stick-major
+/// `[N, S·stick]` — since an element moves across all three of the head, the stick and the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeadRows {
+    rows: u32,
+    row_sticks: u32,
+    head_rows: u32,
+    sticks: u32,
+}
+
+impl HeadRows {
+    fn of(stick_major: &[i64], heads: &[i64]) -> Option<Self> {
+        let stick = crate::work::FP16_ELEMS_PER_STICK;
+        let [rows, cols] = flat_frame(stick_major);
+        let [head_rows, width] = flat_frame(heads);
+        let (row_sticks, sticks) = (cols / stick, width / stick);
+        (rows >= 2
+            && cols.is_multiple_of(stick)
+            && width.is_multiple_of(stick)
+            && sticks >= 2
+            && head_rows.is_multiple_of(rows)
+            && head_rows * sticks == rows * row_sticks)
+            .then_some(Self {
+                rows,
+                row_sticks,
+                head_rows,
+                sticks,
+            })
+    }
+}
+
+/// A minted row-major `[rows, stick]` buffer's region.
+fn row_major_region(tid: u32, rows: u32, layout: &BundleLayout) -> Region {
+    let stick = crate::work::FP16_ELEMS_PER_STICK;
+    layout.synth(crate::place::PlaceId::Act(tid), &[rows, stick]);
+    Region {
+        tid,
+        v_rows: rows,
+        v_cols: stick,
+        r_start: 0,
+        c_start: 0,
+        r_len: rows,
+        c_len: stick,
+        r_cover: (0, rows),
+        c_cover: (0, stick),
+        is_out: true,
+        is_fp8: false,
+        band: None,
+    }
+}
+
+/// A minted stick-major `[rows, sticks · stick]` buffer's region.
+fn stick_major_region(tid: u32, rows: u32, sticks: u32, layout: &BundleLayout) -> Region {
+    let cols = sticks * crate::work::FP16_ELEMS_PER_STICK;
+    layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
+    Region {
+        tid,
+        v_rows: rows,
+        v_cols: cols,
+        r_start: 0,
+        c_start: 0,
+        r_len: rows,
+        c_len: cols,
+        r_cover: (0, rows),
+        c_cover: (0, cols),
+        is_out: true,
+        is_fp8: false,
+        band: None,
+    }
+}
+
+/// What one stick permute moves: `rows` rows of `sticks` sticks — the whole buffers, or `Some(b)`:
+/// block `b` of buffers holding `[rows, sticks · stick]` blocks one after another.
+#[derive(Clone, Copy)]
+struct Permuted {
+    rows: u32,
+    sticks: u32,
+    block: Option<u32>,
+}
+
+impl Permuted {
+    fn whole((rows, sticks): (u32, u32)) -> Self {
+        Self {
+            rows,
+            sticks,
+            block: None,
+        }
+    }
+}
+
+/// One stick permute between `src` and `dst` ([`crate::ir::bridge::tiled_op_sdsc_op::StickPermute`]).
+fn permute(
+    name: &str,
+    src: &Region,
+    dst: &Region,
+    Permuted {
+        rows,
+        sticks,
+        block,
+    }: Permuted,
+    direction: crate::ir::bridge::tiled_op_sdsc_op::StickPermute,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<super::EmittedOp, Error> {
+    let base = block.map_or(0, |b| b * rows * sticks * crate::work::FP16_ELEMS_PER_STICK);
+    let op_name = match block {
+        None => format!("permute_o{}", dst.tid),
+        Some(b) => format!("permute{b}_o{}", dst.tid),
+    };
+    crate::ir::bridge::tiled_op_sdsc_op::assemble_stick_permute(
+        &op_name,
+        &src.name(),
+        &dst.name(),
+        crate::ir::bridge::tiled_op_sdsc_op::StickPermuteSpec {
+            rows,
+            sticks,
+            df: crate::superdsc_opspec::Df::Fp16,
+            direction,
+            src_elems: base,
+            dst_elems: base,
+        },
+        sym_id_base,
+        layout,
+    )
+    .map_err(|message| Error {
+        message: format!("{name}: {message}"),
+    })
+}
+
+/// A block of `rows` rows of `heads` heads, each head `sticks` sticks wide.
+#[derive(Clone, Copy, Debug)]
+struct HeadBlock {
+    rows: u32,
+    heads: u32,
+    sticks: u32,
+}
+
+/// ⭐ THE QUERY-ROW-MAJOR FRAME, torch-spyre's prompt trip's ([`crate::placement::WalkDivision::HeadsInner`])
+/// — the head-major pair's two sides under that division: the stick-major block `[rows, heads ·
+/// sticks · stick]` and its per-head rows `[rows · heads, sticks · stick]`, stick-major, row
+/// `p · heads + h` (each query row's heads together, so a split of the rows hands each core whole query
+/// rows of every head). `into_heads` lays the block out as per-head rows; otherwise the reverse. A
+/// head one stick wide is one stick permute; wider, the per-head rows go row-major through `mid` first
+/// (two permutes, [`HeadRows`]'s two).
+fn heads_inner_relayout(
+    name: &str,
+    (src, dst, mid): (&Region, &Region, Option<&Region>),
+    HeadBlock {
+        rows,
+        heads,
+        sticks,
+    }: HeadBlock,
+    into_heads: bool,
+    sym_id_base: &mut i64,
+    layout: &BundleLayout,
+) -> Result<Vec<super::EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::StickPermute::{RowToStick, StickToRow};
+    let (block, per_head) = (
+        Permuted::whole((rows, heads * sticks)),
+        Permuted::whole((rows * heads, sticks)),
+    );
+    match (sticks, mid) {
+        (1, _) => Ok(vec![permute(
+            name,
+            src,
+            dst,
+            block,
+            if into_heads { StickToRow } else { RowToStick },
+            sym_id_base,
+            Some(layout),
+        )?]),
+        (_, Some(mid)) => {
+            let mid_in = Region {
+                is_out: false,
+                ..*mid
+            };
+            let (first, second) = if into_heads {
+                (
+                    permute(name, src, mid, block, StickToRow, sym_id_base, Some(layout))?,
+                    permute(
+                        name,
+                        &mid_in,
+                        dst,
+                        per_head,
+                        RowToStick,
+                        sym_id_base,
+                        Some(layout),
+                    )?,
+                )
+            } else {
+                (
+                    permute(
+                        name,
+                        src,
+                        mid,
+                        per_head,
+                        StickToRow,
+                        sym_id_base,
+                        Some(layout),
+                    )?,
+                    permute(
+                        name,
+                        &mid_in,
+                        dst,
+                        block,
+                        RowToStick,
+                        sym_id_base,
+                        Some(layout),
+                    )?,
+                )
+            };
+            Ok(vec![first, second])
+        }
+        (_, None) => err(format!(
+            "{name}: heads {sticks} sticks wide go between their frames row-major, and no scratch \
+             holds them"
+        )),
+    }
+}
+
+/// Where a walk mints its intermediates: the node, the layout and the node's floor ([`mint_inter`]).
+#[derive(Clone, Copy)]
+struct Minter<'a> {
+    k: &'a KtirNode,
+    layout: &'a BundleLayout,
+    floor: u32,
+}
+
+/// [`heads_inner_relayout`] into a buffer minted for `key` (and, for heads wider than a stick, the
+/// row-major scratch it goes through): the head-major pair under the prompt trip's division. Returns
+/// the relayout and the result's region.
+fn heads_inner_pair(
+    m: Minter<'_>,
+    key: Ssa,
+    name: &str,
+    source: &Region,
+    block: HeadBlock,
+    into_heads: bool,
+    sym_id_base: &mut i64,
+) -> Result<(Vec<super::EmittedOp>, Region), Error> {
+    let tid = mint_inter(m.k, m.layout, m.floor, key);
+    let dst = if into_heads {
+        stick_major_region(tid, block.rows * block.heads, block.sticks, m.layout)
+    } else {
+        stick_major_region(tid, block.rows, block.heads * block.sticks, m.layout)
+    };
+    let mid = (block.sticks > 1).then(|| {
+        row_major_region(
+            mint_scratch(m.k, m.layout, m.floor, key, Scratch::RelayoutMid),
+            block.rows * block.heads * block.sticks,
+            m.layout,
+        )
+    });
+    let ops = heads_inner_relayout(
+        name,
+        (source, &dst, mid.as_ref()),
+        block,
+        into_heads,
+        sym_id_base,
+        m.layout,
+    )?;
+    Ok((
+        ops,
+        Region {
+            is_out: false,
+            ..dst
+        },
+    ))
+}
+
+/// Whether two shapes of one value are the SAME BYTES on the card: every element at the same address
+/// in both stick-major flat frames (`(c / stick)·(rows·stick) + r·stick + c % stick`, a row padded to
+/// whole sticks). True for equal frames, and for a re-framing that keeps every row one stick wide or
+/// moves rows within one row of sticks; false — a relayout — otherwise.
+fn same_card_bytes(from: &[i64], to: &[i64]) -> bool {
+    if from.iter().product::<i64>() != to.iter().product::<i64>() {
+        return false;
+    }
+    let (a, b) = (flat_frame(from), flat_frame(to));
+    if a == b {
+        return true;
+    }
+    let stick = crate::work::FP16_ELEMS_PER_STICK as u64;
+    let addr = |[rows, cols]: [u32; 2], e: u64| -> u64 {
+        let (r, c) = (e / cols as u64, e % cols as u64);
+        (c / stick) * (rows as u64 * stick) + r * stick + c % stick
+    };
+    let numel: u64 = from.iter().product::<i64>() as u64;
+    (0..numel).all(|e| addr(a, e) == addr(b, e))
+}
+
+/// A PAGE gather, read off its indirect tile: the tile's indirect dim enumerates `entries` index
+/// words, and each selects one contiguous slab — the product of the tile's other extents —
+/// `page_sticks` one-stick sub-rows long. [`gathers_of`] reads every gather as one entry per ROW
+/// (the embedding's row gather); a page gather's tile states fewer entries than rows, and its own
+/// shape says how many.
+fn page_gather_of(f: &IRFunction<'static>, g: Gather) -> Result<(Gather, u32), Error> {
+    let Some(tile) = f.operations.iter().find(|o| o.result == Some(g.tile)) else {
+        return err(format!(
+            "{}: the gather's tile states no defining op",
+            f.name
+        ));
+    };
+    let dims: Vec<i64> = tile
+        .attributes
+        .iter()
+        .find_map(|(k, v)| match (k, v) {
+            (AttrKey::Shape, Attr::IntList(d)) => Some(d.to_vec()),
+            _ => None,
+        })
+        .or_else(|| tile.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec))
+        .unwrap_or_default();
+    let d = match tile.attr(AttrKey::DimKinds) {
+        Some(Attr::StrList(kinds)) => kinds.iter().position(|k| *k == "indirect"),
+        _ => None,
+    };
+    let (Some(d), false) = (d, dims.is_empty()) else {
+        return err(format!(
+            "{}: the gather's tile states no shape or no indirect dim",
+            f.name
+        ));
+    };
+    let entries = dims[d] as u32;
+    let slab: i64 = dims
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != d)
+        .map(|(_, x)| *x)
+        .product();
+    let stick = crate::work::FP16_ELEMS_PER_STICK as i64;
+    if d != 0 || slab % stick != 0 {
+        return err(format!(
+            "{}: a page gather selects whole contiguous slabs along its LEADING dim, each a whole \
+             number of sticks — this tile's indirect dim is {d} and its slab {slab} elements",
+            f.name
+        ));
+    }
+    Ok((Gather { entries, ..g }, (slab / stick) as u32))
 }
 
 /// WHAT ONLY THE WALK CAN STATE about one op. Threaded rather than re-derived, because [`emit_one`]
@@ -4526,6 +7702,36 @@ fn emit_one(
                 kind,
                 per_op,
                 bcast,
+                sym_id_base,
+                layout,
+            );
+        }
+        Lowering::ScalarBinary(e, value) => {
+            return super::lower_ktir_to_superdsc::scalar_binary(
+                name,
+                e,
+                value,
+                per_op,
+                sym_id_base,
+                layout,
+            );
+        }
+        Lowering::BatchMatmul { batch, activation } => {
+            return super::lower_ktir_to_superdsc::batch_matmul(
+                name,
+                batch,
+                activation,
+                per_op,
+                sym_id_base,
+                layout,
+            );
+        }
+        Lowering::BatchTranspose { batch, input } => {
+            return super::lower_ktir_to_superdsc::batch_transpose(
+                name,
+                batch,
+                input,
+                per_op,
                 sym_id_base,
                 layout,
             );
@@ -5155,21 +8361,62 @@ mod broadcast_chain_tests {
         assert_eq!(b.src, Ssa(0), "the consumer reads the rank-2 SOURCE");
     }
 
-    /// ⛔⛔ THE RANK-3 MIDDLE AXIS — THE MASK ADD, `[256, 256] -> [256, 1, 256] -> [256, 4, 256]`
-    /// with `Dimensions=[1]`, spelled `reshape -> collapse -> broadcast` with no expand at all.
-    /// Row-major, spraying the middle axis repeats each of the source's flat rows down the
-    /// merged row axis (`result[b, g, j] = source[b, 0, j]`: flat row `b·4 + g` reads flat row
-    /// `b` — the row index ADVANCES every G rows), and no operand mode in this door's vocabulary
-    /// addresses that. The refusal must NAME the shape and `attn.py`'s door-proven restatement —
-    /// the host stages the mask at the score tile's own rows and the kernel adds it at base —
-    /// because that restatement is the kernel's move, not a lowering fix.
+    /// ⭐⭐⭐ THE AXIS JUST BEFORE THE STICK — THE MASK ADD, `[256, 256] -> [256, 1, 256] ->
+    /// [256, 4, 256]` with `Dimensions=[1]`, spelled `reshape -> collapse -> broadcast` with no
+    /// expand at all — ADMITTED as the INNER row spray: `result[b, g, j] = source[b, j]`, flat row
+    /// `b·4 + g` reading flat row `b`, which the `[mb, y, out]` row-split frame addresses byte for
+    /// byte (each of the source's 256 rows repeated 4 times in a row). The cover is proved on the
+    /// source's own shape: its 256 flat rows are the result's rows before the sprayed axis.
     #[test]
-    fn the_rank3_middle_axis_is_row_replication_and_refused() {
-        let m = refusal3(
+    fn the_axis_before_the_stick_over_a_multirow_source_is_the_inner_row_spray() {
+        let f = chain3(
             &[256, 256],
             Relay::Reshape(&[256, 1, 256]),
             &[256, 256],
             &[256, 4, 256],
+            &[1],
+        );
+        let (map, _) = program_broadcast_chains(&f).expect("the mask add's own chain");
+        let b = map
+            .get(&Ssa(4))
+            .expect("the broadcast's result is what a consumer names");
+        assert_eq!(
+            b.axis,
+            BcastAxis::Y(super::super::lower_ktir_to_superdsc::Spray::inner(4)),
+            "each source row repeated 4 times in a row is the inner row spray"
+        );
+        assert!(!b.flat, "the spray's source is the `[mb, out]` tile itself");
+        assert_eq!(b.src, Ssa(0), "the walk-back reaches the rank-2 SOURCE");
+    }
+
+    /// ⛔ AN INNER SPRAY WHOSE SOURCE IS NOT THE RESULT'S LEADING ROWS — a 128-row source under a
+    /// result whose rows before the sprayed axis are 256: the copies would read rows the source
+    /// does not have, so the cover proof refuses it by name.
+    #[test]
+    fn an_inner_spray_over_the_wrong_rows_is_refused() {
+        let m = refusal3(
+            &[128, 256],
+            Relay::Reshape(&[128, 1, 256]),
+            &[128, 256],
+            &[256, 4, 256],
+            &[1],
+        );
+        assert!(
+            m.contains("second-to-last axis") && m.contains("rows the source does not have"),
+            "names the cover the spray needs: {m}"
+        );
+    }
+
+    /// ⛔⛔ A MIDDLE AXIS WITH MORE THAN THE STICK AFTER IT — `[64, 8, 64] -> [64, 4, 8, 64]` over
+    /// `Dimensions=[1]`: each source row's copies are interleaved with the axes after the sprayed
+    /// one, a replication at a stride no operand mode addresses, so it is refused by name.
+    #[test]
+    fn a_middle_axis_with_axes_after_it_is_row_replication_and_refused() {
+        let m = refusal3(
+            &[512, 64],
+            Relay::Reshape(&[64, 1, 8, 64]),
+            &[512, 64],
+            &[64, 4, 8, 64],
             &[1],
         );
         assert!(
@@ -5177,12 +8424,8 @@ mod broadcast_chain_tests {
             "names the axis class, not just the index: {m}"
         );
         assert!(
-            m.contains("ROW-REPLICATION"),
+            m.contains("ROW-REPLICATION AT A STRIDE"),
             "names the data movement the device cannot address: {m}"
-        );
-        assert!(
-            m.contains("attn.py"),
-            "names the door-proven restatement so the kernel side knows the move: {m}"
         );
     }
 
@@ -5210,7 +8453,7 @@ mod broadcast_chain_tests {
             .expect("the broadcast's result is what a consumer names");
         assert_eq!(
             b.axis,
-            BcastAxis::Y(4),
+            BcastAxis::Y(super::super::lower_ktir_to_superdsc::Spray::outer(4)),
             "a multi-row source sprayed down a NEW leading dim is the row-split form"
         );
         assert!(
@@ -5526,7 +8769,11 @@ mod presented_flat_tests {
     /// the `y`-broadcast scale owns the addressing, so the presentation is the identity.
     #[test]
     fn the_row_split_mode_presents_nothing() {
-        let p = presented_flat(&reg(64, 4), BcastAxis::Y(4)).expect("the identity");
+        let p = presented_flat(
+            &reg(64, 4),
+            BcastAxis::Y(super::super::lower_ktir_to_superdsc::Spray::outer(4)),
+        )
+        .expect("the identity");
         assert_eq!((p.v_rows, p.v_cols), (64, 4));
     }
 }

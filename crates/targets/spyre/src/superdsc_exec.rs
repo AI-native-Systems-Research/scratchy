@@ -623,6 +623,7 @@ impl OpProg {
                 // ⭐ THE OTHER HALF OF `fold_plan::collapsed`, and what sends the fold's KV shift to
                 // zero — a bake fact, carried on the group exactly like the axis itself.
                 gathered: kv.gathered,
+                walk: kv.walk,
             },
         }
     }
@@ -1328,72 +1329,18 @@ impl Executor {
     /// names — the same rule the prefix/suffix follow. A single-class model's `bodies` is exactly
     /// `[self.code]`.
     fn load_bodies(&mut self) -> Result<()> {
+        // ⭐ A ROLLED BODY'S RUNGS COME OFF ITS LADDER (`RerollMeta::ladder`), the one reading the
+        // bake proves — never empty. Only an unrolled bundle, which carries no ladder, is ladderless.
         let rungs: &[bundle::LadderRung<'static>] = match &self.code.reroll {
-            Some(m) if m.rungs.len() > 1 => &m.rungs,
-            _ => &[],
+            Some(m) => m
+                .ladder()
+                .map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))?
+                .rungs(),
+            None => &[],
         };
-        // ONE LIST PER CLASS, this bundle as class 0's anchor and every other class a sibling.
-        let class_ops = |m: &'static bundle::RerollMeta<'static>| -> Result<Vec<Ops>> {
-            let mut v = Vec::with_capacity(m.bodies.len());
-            for (ci, fp) in m.bodies.iter().enumerate() {
-                v.push(if ci == 0 {
-                    bind_ops(self.code)
-                } else {
-                    Self::sibling_ops("rolled body class", fp)?
-                });
-            }
-            Ok(v)
-        };
+        // An UNROLLED bundle is its one body; a rolled one is its ladder, and runs only its rungs.
         if rungs.is_empty() {
-            if let Some(m) = &self.code.reroll {
-                self.body_ops = class_ops(m)?;
-                self.body_fused = PerClass::of_every_class(
-                    self.body_ops.len(),
-                    m.bodies_fused
-                        .iter()
-                        .map(|fp| bundle::sibling(fp).map(bind_ops)),
-                );
-            } else {
-                self.body_ops = vec![bind_ops(self.code)];
-            }
-            // ⛔⛔⛔ THE PROGRAM COUNT IS NOT A DEBUG DETAIL — IT IS WHETHER THIS MODEL COMPUTES.
-            //
-            // A bundle carries a memory PLAN and a set of device PROGRAMS. The plan is what every session
-            // line reports ("session ready", placements, `decode caps`), so a bundle whose programs are
-            // MISSING loads clean and serves nothing: no launch, no error, a logits buffer that stays
-            // zero, a constant argmax, and `"text": ""` with `finish_reason: "length"`. It took a whole
-            // session to find because the only symptoms were an absurd 0.6 ms/token and a `cap` that came
-            // out as `num_blocks * 64` — the unpaged formula, because `latch_paged_geometry` scans THESE
-            // OP LISTS for `kv_page_slots` and finds nothing in an empty one.
-            //
-            // So the counts go at INFO, always, next to the fingerprint: one line that says whether the
-            // thing that was loaded can run. And zero says so in its own words rather than by arithmetic.
-            let n_body: usize = self.body_ops.iter().map(|o| o.len()).sum();
-            if n_body == 0 && self.prefix_ops.is_empty() && self.suffix_ops.is_empty() {
-                bail!(
-                    "bundle {} has ZERO device programs (0 body / 0 prefix / 0 suffix launch groups). \
-                     Its memory plan is present, which is why every session line would otherwise report \
-                     itself ready — but NOTHING CAN BE LAUNCHED: forwards return in microseconds, the \
-                     logits buffer stays zero, argmax lands on a constant token id, and every completion \
-                     comes back EMPTY (`finish_reason: \"length\"`, ~0.6 ms/token) with no error anywhere. \
-                     REFUSING TO LOAD: serving this is strictly worse than not starting. The cause is a \
-                     BAKE that emitted placements without programs — set `DEEPTOOLS_PATH` (and the \
-                     deeptools `LD_LIBRARY_PATH`) in the stage that runs `cargo build`, not only at \
-                     runtime.",
-                    self.code.fp,
-                );
-            } else {
-                info!(
-                    "[sdsc-superdsc] bundle {}: {} body ({} class(es)) + {} prefix + {} suffix \
-                     launch group(s)",
-                    self.code.fp,
-                    n_body,
-                    self.body_ops.len(),
-                    self.prefix_ops.len(),
-                    self.suffix_ops.len()
-                );
-            }
-            return Ok(());
+            self.body_ops = vec![bind_ops(self.code)];
         }
         // The ladder came ASCENDING by `active_cap` from the emit, so it stays so. Each rung's
         // class 0 body IS this bundle's rung sibling — the registry resolves like any other.
@@ -1418,17 +1365,45 @@ impl Executor {
                     .collect::<Vec<_>>(),
             )
         }));
-        debug!(
-            "[sdsc-superdsc] PAGED KV: {} of {} rungs have a fold-fused twin (a context inside one \
-             page runs it — the split body costs two extra launches per layer, ~1 ms/token)",
-            self.body_rungs_fused.len(),
-            self.body_rungs.len()
-        );
+        // ⛔⛔⛔ THE PROGRAM COUNT IS NOT A DEBUG DETAIL — IT IS WHETHER THIS MODEL COMPUTES.
+        //
+        // A bundle carries a memory PLAN and a set of device PROGRAMS. The plan is what every session
+        // line reports ("session ready", placements, `decode caps`), so a bundle whose programs are
+        // MISSING loads clean and serves nothing: no launch, no error, a logits buffer that stays
+        // zero, a constant argmax, and `"text": ""` with `finish_reason: "length"`. It took a whole
+        // session to find because the only symptoms were an absurd 0.6 ms/token and a `cap` that came
+        // out as `num_blocks * 64`.
+        //
+        // So the counts go at INFO, always, next to the fingerprint: one line that says whether the
+        // thing that was loaded can run — the one body or every rung's — and zero says so in its own
+        // words rather than by arithmetic.
+        let n_body: usize = self.body_ops.iter().map(|o| o.len()).sum::<usize>()
+            + self
+                .body_rungs
+                .iter()
+                .flat_map(|(_, classes)| classes.iter())
+                .map(|o| o.len())
+                .sum::<usize>();
+        if n_body == 0 && self.prefix_ops.is_empty() && self.suffix_ops.is_empty() {
+            bail!(
+                "bundle {} has ZERO device programs (0 body / 0 prefix / 0 suffix launch groups). \
+                 Its memory plan is present, which is why every session line would otherwise report \
+                 itself ready — but NOTHING CAN BE LAUNCHED: forwards return in microseconds, the \
+                 logits buffer stays zero, argmax lands on a constant token id, and every completion \
+                 comes back EMPTY (`finish_reason: \"length\"`, ~0.6 ms/token) with no error anywhere. \
+                 REFUSING TO LOAD: serving this is strictly worse than not starting. The cause is a \
+                 BAKE that emitted placements without programs — set `DEEPTOOLS_PATH` (and the \
+                 deeptools `LD_LIBRARY_PATH`) in the stage that runs `cargo build`, not only at \
+                 runtime.",
+                self.code.fp,
+            );
+        }
         let caps: Vec<u32> = self.body_rungs.iter().map(|(c, _)| c.get()).collect();
-        debug!(
-            "[sdsc-superdsc] load: LADDER — {} decode rungs (active_cap {caps:?}), {} prefix + {} \
-             suffix kernel(s)",
-            self.body_rungs.len(),
+        info!(
+            "[sdsc-superdsc] bundle {}: {n_body} body launch group(s) over {} rung(s) (active_cap \
+             {caps:?}) + {} prefix + {} suffix",
+            self.code.fp,
+            self.body_rungs.len().max(1),
             self.prefix_ops.len(),
             self.suffix_ops.len()
         );
@@ -2109,50 +2084,6 @@ impl Executor {
             self.weight_bank_host[b] = vec![0u8; bytes];
         }
 
-        // ⛔ EVERY PLACED COPY MUST BE BOUND — the owner-scoped mirror of the bound-without-place
-        // refusal in the loop below. The head-major o_proj copies are PLACED by the layout but
-        // STAGED only through the wiring's `weight_copies` list, which the worker turns into bound
-        // rows at load. #299's registry rewrite of `graph_wiring` emptied that list while the
-        // placement pass kept placing, so every copy window sat never-written while the m=1 fp8 o
-        // matmul read it: fluent garbage, card-only, granite-3.1-8b fp8 m=1 alone (every other
-        // geometry never reads a copy, and the emulator executes the KTIR program, not the staging,
-        // so no bench caught it either).
-        //
-        // ⛔ THE CHECK BELONGS TO THE WEIGHT-SEGMENT OWNER ALONE (2026-10-27, granite-3.1-8b fp8:
-        // the borrowing prefill anchor refused at load over 40 copies it never stages). A borrower
-        // BINDS NO WEIGHTS, whatever its `bound` holds: the load-const channel stages resident
-        // constants through the weight channel (`bind_const_fp32` and `bind_weight` both insert
-        // into `weight_ids`), so a borrowing rung or anchor that stages its own tables trips the
-        // `bound ∩ weight_ids` test below — while the copies it "fails" to bind are delivered by
-        // the owner's alias (`alias_seg_from` / `adopt_from_owner`), never by its own staging. The
-        // mint is bundle-invariant (one staged weight segment serves every bundle), so the owner's
-        // check covers every borrower's reads: a wiring list that lost the copies refuses at the
-        // OWNER, naming the same #299 class.
-        let stages_weights = !self.seg_borrowed[SEG_WEIGHT.get()]
-            && self.bound.keys().any(|nm| self.weight_ids.contains(nm));
-        if stages_weights {
-            let unbound: Vec<u32> = self
-                .code
-                .layout
-                .weight_copies
-                .iter()
-                .map(|&(_, to)| to)
-                .filter(|&to| !self.bound.contains_key(&bundle::PlaceId::Act(to)))
-                .collect();
-            if !unbound.is_empty() {
-                bail!(
-                    "stage: {} o_proj head-major cop{} placed but never bound (first: t{}) — the \
-                     wiring's weight_copies list and the layout's placements disagree, so the m=1 \
-                     fp8 o matmul would read never-written windows. REFUSING: this is the #299 \
-                     defect class (graph_wiring's registry rewrite dropped the copy mint), and a \
-                     session that stages weights must stage every copy the layout places.",
-                    unbound.len(),
-                    if unbound.len() == 1 { "y" } else { "ies" },
-                    unbound[0],
-                );
-            }
-        }
-
         // ── Collect the weight placements, validating each against its own extent. ──
         // One bound tensor's staging transform — what the parallel stage loop does to its bytes.
         // ⭐ VERBATIM IS A THIRD THING, NOT THE ABSENCE OF THE SECOND: this used to be
@@ -2620,6 +2551,21 @@ impl Executor {
             }
         }
         lap("tensor-h2d", &mut t0);
+        // ⭐ THE PAGED POOL STARTS ZEROED, filled on the device by the session that allocated it — it
+        // has no host image to upload (above). An unwritten slot is read before its mask applies, and
+        // a decode batch reads page 0 (the null page) under an all-masked row for every block slot
+        // past a sequence's blocks, as spyre-inference does over its zeroed cache. Device memory left
+        // as found holds non-finite words, which no additive mask cancels: MEASURED on the card with
+        // the pool unfilled, 8,253 of them in page 0. A session that borrows the pool takes the
+        // owner's zeroed region by alias.
+        if self.kv.paged
+            && !self.seg_borrowed[SEG_KV.get()]
+            && !(reserve_only && is_resident_seg(SEG_KV.get()))
+        {
+            self.zero_seg(SEG_KV)
+                .map_err(|e| anyhow!("prepare: zeroing the paged KV pool: {e}"))?;
+            lap("kv-zero", &mut t0);
+        }
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("prepare: sync: {e}"))?;
@@ -3128,6 +3074,11 @@ impl Executor {
     /// site — it is that `DecodeRung` no longer HAS a `swept` or a `gathers_kv` field to read, and the
     /// only value that answers either question is minted here, by the selector, from the selector's own
     /// answer.
+    /// The baked bundle this executor runs.
+    pub fn code(&self) -> &'static bundle::BundleCode<'static> {
+        self.code
+    }
+
     pub fn step_body(&mut self, seq_pos: SeqPos) -> Result<StepBody> {
         let n_fold_pages = self.n_fold_pages(seq_pos);
         // `valid_len = seq_pos + 1` — positions [0..seq_pos] are filled, including the token written to
@@ -3174,17 +3125,14 @@ impl Executor {
     }
 
     /// THIS selection's swept extent — its own ladder rung's `active_cap`, which every class of a
-    /// rung shares (a rung IS one swept extent; the classes are the programs baked for it).
-    ///
-    /// The ladderless arms (`Body`/`BodyFused`: an UNROLLED bundle, which has no `rungs` and therefore
-    /// no ladder) sweep their whole baked capacity, and on the paged path that is one page — the number
-    /// the ops themselves carry. It is the value the host's guard used for every bundle before the
-    /// ladder's own extent was plumbed through, so a ladderless bundle behaves exactly as it did.
-    fn body_swept(&self, sel: BodySel) -> SweptCols {
+    /// rung shares (a rung IS one swept extent; the classes are the programs baked for it). `None` for
+    /// the ladderless arms (`Body`/`BodyFused`: an UNROLLED bundle, which bakes no rung and so states
+    /// no sweep — there is no walk to stage for it, and none is made up).
+    fn body_swept(&self, sel: BodySel) -> Option<SweptCols> {
         match sel {
-            BodySel::Rung(i) => self.body_rungs[i].0,
-            BodySel::RungFused(i) => self.body_rungs_fused[i].0,
-            _ => SweptCols::new(self.kv.page_slots.0.max(0) as u32),
+            BodySel::Rung(i) => Some(self.body_rungs[i].0),
+            BodySel::RungFused(i) => Some(self.body_rungs_fused[i].0),
+            BodySel::Body | BodySel::BodyFused => None,
         }
     }
 
@@ -3248,36 +3196,34 @@ impl Executor {
             self.trace_body("split-noladder", valid_len, -1, reqs, 0, false);
             return Ok(BodySel::Body);
         }
-        for (i, (swept, _)) in self.body_rungs.iter().enumerate() {
-            // ⛔ `SweptCols::covers` AND NOT `>=` ON BARE INTEGERS. The sibling ladder is keyed by the
-            // batch WIDTH, so an operand-swapped comparison — or one against the wrong ladder — used to
-            // type-check and return a body baked for a 64-column sweep because four requests are live.
-            if swept.covers(valid_len.max(0) as u64) {
-                self.trace_body("split", valid_len, -1, reqs, swept.get() as i64, false);
-                return Ok(BodySel::Rung(i));
-            }
-        }
-        // ⚠️ THE FALLBACK, VISIBLE — AND BAKED. A `valid_len` past every rung's sweep runs the rung the
-        // bake PROVED serves any length (`RerollMeta::fallback_rung`, never a split-KV chunk — see
-        // `fold_plan::the_fallback_serves_any_length`). Chosen here, it was the top, which #438 made the
-        // widest chunk, and every granite-2b step past 16,384 tokens was refused.
-        let top = self
-            .code
-            .reroll
-            .as_ref()
-            .map(|m| m.fallback_rung as usize)
-            .filter(|&at| at < self.body_rungs.len())
-            .ok_or_else(|| {
-                anyhow!(
-                    "bundle {}: no baked fallback rung inside its {}-rung ladder — the bake proves one \
-                     for every ladder it emits, so this artifact is not one it emitted",
-                    self.code.fp,
-                    self.body_rungs.len()
-                )
-            })?;
-        let cap = self.body_rungs[top].0.get() as i64;
-        self.trace_body("split-CEILING", valid_len, -1, reqs, cap, false);
-        Ok(BodySel::Rung(top))
+        // ⭐ THE ONE SELECTION (`Ladder::rung_for`), which the bake ran over every position this bundle
+        // admits: the narrowest rung whose sweep covers `valid_len` (`SweptCols::covers`, never `>=` on
+        // bare integers — the sibling ladder is keyed by the batch WIDTH), else the baked fallback.
+        let Some(meta) = self.code.reroll.as_ref() else {
+            return Err(anyhow!(
+                "bundle {}: {} decode rung(s) and no ladder to select among them",
+                self.code.fp,
+                self.body_rungs.len()
+            ));
+        };
+        let (at, rung) = meta
+            .ladder()
+            .map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))?
+            .rung_for(valid_len.max(0) as u64);
+        let variant = if rung.active_cap.covers(valid_len.max(0) as u64) {
+            "split"
+        } else {
+            "split-CEILING"
+        };
+        self.trace_body(
+            variant,
+            valid_len,
+            -1,
+            reqs,
+            rung.active_cap.get() as i64,
+            false,
+        );
+        Ok(BodySel::Rung(at))
     }
 
     /// Pick the body for this step: the sk_bucket rung by live length, and — when the fold would
@@ -3426,12 +3372,16 @@ impl Executor {
         // pending batch — a drain between ops of an unflushed rung observes nothing — so each of
         // them falls back to this function's per-op submission, bit for bit: `repeat_probe`
         // (double-submits per op), `perop_sync`/`group_time` (drain per op), `prefix_time`
-        // (drains at a rotating MID-RUNG group), `optrace` (drains + D2H after each op).
-        // `prog_verify`/`segaddr`/`launch_mark`/`submit_time` are batch-safe: they read program
-        // memory or host state this rung's compute ops never write, and `submit_time` measures
-        // the flush itself as the enqueue.
-        let collect =
-            !(d.repeat_probe || d.perop_sync || d.group_time || d.prefix_time || d.optrace);
+        // (drains at a rotating MID-RUNG group), `optrace` and `tensordump` (drain + D2H after
+        // each op). `prog_verify`/`segaddr`/`launch_mark`/`submit_time` are batch-safe: they read
+        // program memory or host state this rung's compute ops never write, and `submit_time`
+        // measures the flush itself as the enqueue.
+        let collect = !(d.repeat_probe
+            || d.perop_sync
+            || d.group_time
+            || d.prefix_time
+            || d.optrace
+            || d.tensordump.is_some());
         let mut pending: Vec<PendingLaunch> = Vec::new();
         // The OR of every entry's per-op barrier — one head barrier on the batch is equivalent
         // to per-op barriers for an all-compute list (flex-rs drains the OTHER pipelines'
@@ -6134,7 +6084,7 @@ enum SuffixLaunch {
 #[derive(Clone, Copy, Debug)]
 pub struct StepBody {
     sel: BodySel,
-    swept: SweptCols,
+    swept: Option<SweptCols>,
     gathers: crate::wiring::GathersKv,
     folds: bool,
     lx_op_local_bytes: u64,
@@ -6148,7 +6098,8 @@ impl StepBody {
     /// window count (`nb`), and how far the fold's sweep reaches (`first_unswept_slot`). The ceiling is
     /// the LOOSE bound for the guard — it passed at 1536 covered slots while a 128-column body really
     /// covered 768 — and for the scratch it is a different NUMBER from the one the body reads.
-    pub const fn swept(self) -> SweptCols {
+    /// `None` for an unrolled bundle's body, which bakes no rung and so states no sweep.
+    pub const fn swept(self) -> Option<SweptCols> {
         self.swept
     }
 
