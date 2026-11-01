@@ -3,8 +3,8 @@
 The job: **CB-pipelined tensor parallelism (TP) for spyre.** Every change on
 this branch answers to the rules below. There is no Spyre card on this
 machine, so everything is checked by compiling: Rust builds and tests, plus
-dxp bakes through
-`/Users/moosevan/tmp/dt_src/build/dxp/dxp_standalone`.
+dxp bakes through the deeptools build `$DEEPTOOLS_PATH` points at
+(`$DEEPTOOLS_PATH/build/dxp/dxp_standalone`).
 
 ## The TP rules
 
