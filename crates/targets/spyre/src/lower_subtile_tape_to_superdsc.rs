@@ -1058,22 +1058,34 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // COLUMNS and the target's row cap (`WINDOW_ROWS`), never this bundle's row count, which is
     // what keeps a decode layout and every prefill rung's equal; and `consume_fragments` cuts at
     // the same law, so no fragment can exceed it.
+    //
+    // ⭐ A REGION PER PEER: each cut holds one region per rank this card hears from, in rank order
+    // (`collective::PeerRegion`), each its own placement — so a world of two places exactly the one
+    // region per cut it always has. The world is the one every collective of the forward states.
     let widest_cols = ir
         .nodes
         .iter()
-        .filter(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
+        .filter(|n| matches!(n.op, SubOp::AllReduce { .. } | SubOp::AllGather { .. }))
         .map(|n| n.inputs[0].region.cols.len)
         .max();
     if let Some(widest_cols) = widest_cols {
+        let world = crate::tp_plan::world_of_ir(ir)
+            .map_err(SuperDscError)?
+            .ok_or_else(|| SuperDscError("a forward with a collective states its world".into()))?;
         let w = SegRole::Weight.segment();
-        let cut =
+        let region =
             ktir_superdsc::collective::RecvWindow::cut_bytes_for(widest_cols).ok_or_else(|| {
                 SuperDscError(format!(
                     "a collective's operand has {widest_cols} columns — no receive window holds it"
                 ))
             })?;
-        let window = ktir_superdsc::collective::RecvWindow::new(align128(seg_bytes[w]), cut)
-            .ok_or_else(|| SuperDscError("an align128 offset is flit-aligned".to_string()))?;
+        let window =
+            ktir_superdsc::collective::RecvWindow::new(align128(seg_bytes[w]), region, world)
+                .ok_or_else(|| {
+                    SuperDscError(
+                        "an align128 offset is flit-aligned, in a world that exchanges".to_string(),
+                    )
+                })?;
         if window.end() > bundle::MAX_SEGMENT_BYTES {
             return Err(SuperDscError(format!(
                 "the tensor-parallel receive window [{}, {}) does not fit the weight segment's \
@@ -1086,18 +1098,20 @@ pub fn compute_bundle_layout<F: RopeForm>(
         for cut in (0..ktir_superdsc::collective::WINDOW_CUTS)
             .map(ktir_superdsc::collective::WindowCut::of_collective)
         {
-            let tid = cut.tid();
-            placements.insert(
-                tid,
-                TensorPlacement {
+            for peer in ktir_superdsc::collective::PeerRegion::of_world(world) {
+                let tid = cut.tid(peer);
+                placements.insert(
                     tid,
-                    role: SegRole::Weight,
-                    segment: w,
-                    bank: 0,
-                    offset: window.cut_offset(cut),
-                    size: window.cut().get(),
-                },
-            );
+                    TensorPlacement {
+                        tid,
+                        role: SegRole::Weight,
+                        segment: w,
+                        bank: 0,
+                        offset: window.region_offset(cut, peer),
+                        size: window.region().get(),
+                    },
+                );
+            }
         }
         seg_bytes[w] = window.end();
     }
@@ -3216,7 +3230,7 @@ struct EmuReadback<'a> {
 
 /// Whether `op` reads across ranks — the nodes a rank's reference evaluates against its peer.
 fn is_collective<F: RopeForm>(op: &SubOp<F>) -> bool {
-    matches!(op, SubOp::AllReduce | SubOp::AllGather { .. })
+    matches!(op, SubOp::AllReduce { .. } | SubOp::AllGather { .. })
 }
 
 /// THE OTHER RANK of a two-rank gate, as one rank's reference reads it: which rank THIS one is (the
@@ -5509,11 +5523,15 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
                     k + 1
                 ));
             };
+            // ...and the region is the SENDER's on the receiver's card.
+            let region = ranks[r]
+                .region_of(ranks[peer])
+                .ok_or_else(|| format!("rank {r}'s window has no region for its peer {peer}"))?;
             let mut win = Vec::with_capacity(fr * fc);
             for i in r0..r0 + fr {
                 win.extend_from_slice(&v[i * cols + c0..i * cols + c0 + fc]);
             }
-            *window = Some((u64::from(mine.cut.tid()), win, vec![fr, fc]));
+            *window = Some((u64::from(mine.cut.tid(region)), win, vec![fr, fc]));
         }
     }
     // ── The lockstep reference, to its fixed point ──
@@ -11013,23 +11031,32 @@ mod tests {
         assert_eq!(sends.len(), 1, "one all-reduce, one send");
         let consume = groups[sends[0].group].kv.tp.unwrap();
         let partial = layout.placements[&consume.operand.tid()];
-        let window = layout.placements[&consume.cut.tid()];
+        let only = bundle::collective::PeerRegion::of_world(bundle::collective::TpWorld::of::<2>())
+            .next()
+            .unwrap();
+        let window = layout.placements[&consume.cut.tid(only)];
         assert_eq!(consume.cut, bundle::collective::WindowCut::of_collective(0));
+        let baked_window = bundle::collective::baked_window(&baked).unwrap().unwrap();
         assert_eq!(
             sends[0].send,
             bundle::collective::TpSend {
                 source_segment: partial.segment as u8,
                 source_offset: partial.offset,
-                window_offset: window.offset,
+                window: baked_window,
                 bytes: bundle::collective::CutPayload::new(consume.fragment.bytes()).unwrap(),
                 cut: consume.cut,
             }
+        );
+        assert_eq!(
+            sends[0].send.messages(only).next().unwrap().window_offset,
+            window.offset,
+            "the send lands where the consume reads"
         );
         let windowless = bundle::BundleLayout {
             places: baked
                 .places
                 .iter()
-                .filter(|p| p.id != bundle::PlaceId::Act(consume.cut.tid()))
+                .filter(|p| p.id != bundle::PlaceId::Act(consume.cut.tid(only)))
                 .cloned()
                 .collect::<Vec<_>>()
                 .into(),

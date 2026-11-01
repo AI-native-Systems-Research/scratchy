@@ -46,6 +46,44 @@ impl SpyreWorld {
     }
 }
 
+/// ⭐ THE WORLD A SHARDED FORWARD RUNS OVER — the one its collectives state, as a world spyre bakes.
+/// `None` for a forward with no collective.
+///
+/// # Errors
+/// Two collectives stating different worlds (a graph the analysis never makes), or a world spyre
+/// does not bake — by name.
+pub fn world_of_ir<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &scratchy_subtile::subtile_ir::SubtileIR<F>,
+) -> Result<Option<TpWorld>, String> {
+    use scratchy_subtile::subtile_ir::SubOp;
+    let mut stated: Option<u32> = None;
+    for n in &ir.nodes {
+        let (SubOp::AllReduce { world } | SubOp::AllGather { world, .. }) = n.op else {
+            continue;
+        };
+        match stated {
+            Some(w) if w != world.get() => {
+                return Err(format!(
+                    "the forward's collectives state two worlds, {w} and {} ranks — one forward \
+                     runs over one",
+                    world.get()
+                ));
+            }
+            _ => stated = Some(world.get()),
+        }
+    }
+    stated
+        .map(|w| {
+            TpWorld::named(w).ok_or_else(|| {
+                format!(
+                    "the forward's collectives run over {w} ranks — not a world spyre bakes ({:?})",
+                    crate::bundle_code::collective::SPYRE_TP_WORLDS
+                )
+            })
+        })
+        .transpose()
+}
+
 /// The narrowest column block spyre splits a tensor at: one fp16 stick. A per-rank extent that is
 /// not whole sticks is not a layout the device's tiles can address, so the analysis replicates such
 /// an op instead of splitting it.
@@ -118,6 +156,13 @@ mod tests {
     use super::*;
     use scratchy_subtile::fixtures::one_layer_input;
 
+    /// A two-rank world's one peer region — every window read these tests make.
+    fn only_region() -> crate::bundle_code::collective::PeerRegion {
+        crate::bundle_code::collective::PeerRegion::of_world(TpWorld::of::<2>())
+            .next()
+            .unwrap()
+    }
+
     /// One rank: no collective, no window — the tp=1 identity at the plan's level.
     #[test]
     fn one_rank_needs_no_window() {
@@ -170,7 +215,11 @@ mod tests {
         let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
         let mut ops = Vec::new();
         let mut operands = Vec::new();
-        for node in ir.nodes.iter().filter(|n| matches!(n.op, SubOp::AllReduce)) {
+        for node in ir
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, SubOp::AllReduce { .. }))
+        {
             operands.push(PlaceId::Act(node.inputs[0].tensor.index() as u32));
             match lower_one_node(node, &ir, ActiveCap::FULL, false) {
                 NodeLowering::Ops(v) => ops.extend(v),
@@ -198,7 +247,9 @@ mod tests {
             );
             let k = consume.ktir.as_ref().expect("a program");
             assert!(
-                k.bindings.iter().any(|b| b.get() == c.cut.tid()),
+                k.bindings
+                    .iter()
+                    .any(|b| b.get() == c.cut.tid(only_region())),
                 "the consume reads its cut of the receive window"
             );
         }
@@ -265,7 +316,7 @@ mod tests {
         let (ops, layout) =
             lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
         let cut = ops.iter().find_map(|e| e.tp_consume).unwrap().cut;
-        let window = layout.placements[&cut.tid()];
+        let window = layout.placements[&cut.tid(only_region())];
         let want = SEGMENT_OFFSETS[window.segment] + window.offset;
         let consumes: Vec<_> = ops
             .iter()
@@ -326,7 +377,7 @@ mod tests {
             SEGMENT_OFFSETS[p.segment] + p.offset
         };
         let cut = ops.iter().find_map(|e| e.tp_consume).unwrap().cut;
-        let (out, window) = (at(ir.result.index() as u32), at(cut.tid()));
+        let (out, window) = (at(ir.result.index() as u32), at(cut.tid(only_region())));
         for rank in 0..2u64 {
             let peer = 1 - rank;
             let group: Vec<_> = ops
@@ -400,7 +451,7 @@ mod tests {
         let partial = ir
             .nodes
             .iter()
-            .find(|n| matches!(n.op, SubOp::AllReduce))
+            .find(|n| matches!(n.op, SubOp::AllReduce { .. }))
             .unwrap()
             .inputs[0]
             .tensor
@@ -436,11 +487,11 @@ mod tests {
             }
         }
         assert!(
-            firsts.contains(&at(partial)) && firsts.contains(&at(c.cut.tid())),
+            firsts.contains(&at(partial)) && firsts.contains(&at(c.cut.tid(only_region()))),
             "the consume reads the partial and the window at their typed placements: {firsts:?}"
         );
         assert_eq!(
-            layout.placements[&c.cut.tid()].segment,
+            layout.placements[&c.cut.tid(only_region())].segment,
             1,
             "the window is in segment 1"
         );

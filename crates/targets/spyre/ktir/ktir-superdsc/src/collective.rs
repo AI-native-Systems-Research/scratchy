@@ -142,6 +142,61 @@ impl TpWorld {
     pub const fn is_sharded(self) -> bool {
         self.0 > 1
     }
+
+    /// How many peers each rank hears from — the receive window's regions per cut.
+    pub const fn peers(self) -> u32 {
+        self.0 - 1
+    }
+}
+
+/// The widest world [`SPYRE_TP_WORLDS`] names.
+const WIDEST_WORLD: u32 = {
+    let mut w = 0;
+    let mut i = 0;
+    while i < SPYRE_TP_WORLDS.len() {
+        if SPYRE_TP_WORLDS[i] > w {
+            w = SPYRE_TP_WORLDS[i];
+        }
+        i += 1;
+    }
+    w
+};
+
+/// ⭐ ONE SENDING PEER'S PLACE IN A RECEIVE WINDOW. Every cut of a card's window holds one region
+/// per peer, in rank order with the card's own rank left out: on rank `r`, rank `s`'s region is
+/// `s` below `r` and `s − 1` above it. Minted only by [`TpIdentity::region_of`], so it is below the
+/// world's peer count by construction. In a world of two the one peer's region is 0, so the window
+/// is exactly one region per cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PeerRegion(u32);
+
+impl PeerRegion {
+    /// The most regions any baked world's window has per cut.
+    pub const MAX: u32 = WIDEST_WORLD - 1;
+
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+
+    /// Every region of `world`'s windows, in rank order of the peers they hold.
+    pub fn of_world(world: TpWorld) -> impl Iterator<Item = PeerRegion> {
+        (0..world.peers()).map(PeerRegion)
+    }
+
+    /// Re-mint from the index the `#[forward]` macro bakes; refuses at BUILD a region no baked world
+    /// has.
+    ///
+    /// ```compile_fail
+    /// use ktir_superdsc::collective::PeerRegion;
+    /// const R: PeerRegion = PeerRegion::baked(PeerRegion::MAX);
+    /// ```
+    pub const fn baked(region: u32) -> Self {
+        assert!(
+            region < Self::MAX,
+            "a receive-window region no baked world has"
+        );
+        Self(region)
+    }
 }
 
 /// THE RANK, WITH ITS WORLD — one fact. Minted only by [`TpWorld::ranks`], so `rank < world`
@@ -160,6 +215,24 @@ impl TpIdentity {
 
     pub const fn world(self) -> TpWorld {
         self.world
+    }
+
+    /// Every other rank of this world, in rank order — the peers this card sends to and hears from.
+    pub fn peers(self) -> impl Iterator<Item = TpIdentity> {
+        self.world.ranks().filter(move |r| r.rank != self.rank)
+    }
+
+    /// The region of this card's receive window that `sender`'s messages land in. `None` for this
+    /// rank itself (a rank never sends to itself) or a rank of another world.
+    pub const fn region_of(self, sender: TpIdentity) -> Option<PeerRegion> {
+        if sender.world.0 != self.world.0 || sender.rank == self.rank {
+            return None;
+        }
+        Some(PeerRegion(if sender.rank > self.rank {
+            sender.rank - 1
+        } else {
+            sender.rank
+        }))
     }
 
     /// The other rank of a two-rank world — the one peer this card sends to and hears from.
@@ -307,9 +380,10 @@ impl WindowCut {
         self.0 as usize
     }
 
-    /// The tid the cut's placement carries — what a consume program binds to read it.
-    pub const fn tid(self) -> u32 {
-        crate::reserved_tids::TP_RECV_CUT_TIDS[self.0 as usize]
+    /// The tid `region`'s placement in this cut carries — what a consume program binds to read that
+    /// peer's fragment.
+    pub const fn tid(self, region: PeerRegion) -> u32 {
+        crate::reserved_tids::tp_recv_tid(self.0, region.0)
     }
 }
 
@@ -415,67 +489,94 @@ impl CutPayload {
     }
 }
 
-/// THE RECEIVE WINDOW — one per card, where the peer's sends land. One typed triple, the same in
+/// THE RECEIVE WINDOW — one per card, where its peers' sends land. One typed triple, the same in
 /// every bundle of a forward (prefill, decode, every rung), so a send baked into one bundle and the
 /// consume baked into another always name the same bytes.
 ///
 /// It lives in the weight segment ([`RecvWindow::SEGMENT`]), the one process-shared,
 /// placement-stable segment, above the packed weights, and it is [`WINDOW_CUTS`] equal, adjacent
-/// cuts of [`RecvWindow::cut_bytes_for`] the forward's widest collective operand — never one
-/// bundle's own need. Each cut is a run of fixed landing slots ([`RecvWindow::slots`]), one
-/// `XSEG` entry per slot per peer, each pointing at its slot.
+/// cuts. A cut holds one REGION per peer ([`PeerRegion`], in rank order), each region
+/// [`RecvWindow::cut_bytes_for`] the forward's widest collective operand — never one bundle's own
+/// need. Each region is a run of fixed landing slots ([`RecvWindow::slots`]), one `XSEG` entry per
+/// slot, each pointing at its slot. In a world of two a cut is one region, and the window is
+/// exactly the one it has always been.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RecvWindow {
     offset: u64,
-    cut: Payload,
+    region: Payload,
+    world: TpWorld,
 }
 
 impl RecvWindow {
     /// The weight segment (seg1).
     pub const SEGMENT: u32 = 1;
 
-    /// The window at `offset` of [`WINDOW_CUTS`] cuts of `cut` bytes. `Some` iff `offset` is
-    /// flit-aligned and a cut is at most [`MAX_CUT_MESSAGES`] messages — a slot each.
-    pub const fn new(offset: u64, cut: Payload) -> Option<Self> {
-        if !offset.is_multiple_of(FLIT_BYTES) || cut.message_count() > MAX_CUT_MESSAGES {
+    /// `world`'s window at `offset`: [`WINDOW_CUTS`] cuts of one `region`-byte region per peer.
+    /// `Some` iff the world exchanges at all, `offset` is flit-aligned, and a region is at most
+    /// [`MAX_CUT_MESSAGES`] messages — a slot each.
+    pub const fn new(offset: u64, region: Payload, world: TpWorld) -> Option<Self> {
+        if !world.is_sharded()
+            || !offset.is_multiple_of(FLIT_BYTES)
+            || region.message_count() > MAX_CUT_MESSAGES
+        {
             return None;
         }
-        Some(Self { offset, cut })
+        Some(Self {
+            offset,
+            region,
+            world,
+        })
     }
 
     pub const fn offset(self) -> u64 {
         self.offset
     }
 
-    /// One cut's bytes.
-    pub const fn cut(self) -> Payload {
-        self.cut
+    /// One region's bytes — the most one peer's send into a cut can carry.
+    pub const fn region(self) -> Payload {
+        self.region
     }
 
-    /// Where `cut` starts in the segment.
+    /// The world whose peers land here.
+    pub const fn world(self) -> TpWorld {
+        self.world
+    }
+
+    /// One cut's bytes: a region per peer.
+    const fn cut_bytes(self) -> u64 {
+        self.world.peers() as u64 * self.region.0
+    }
+
+    /// Where `cut` starts in the segment — its first region.
     pub const fn cut_offset(self, cut: WindowCut) -> u64 {
-        self.offset + cut.0 as u64 * self.cut.0
+        self.offset + cut.0 as u64 * self.cut_bytes()
     }
 
-    /// Where `slot` starts in the segment: its cut, plus its whole messages before it.
-    pub const fn slot_offset(self, slot: LandingSlot) -> u64 {
-        self.cut_offset(slot.cut) + slot.message as u64 * RDMA_MESSAGE_CAP_BYTES
+    /// Where `region` of `cut` starts in the segment.
+    pub const fn region_offset(self, cut: WindowCut, region: PeerRegion) -> u64 {
+        self.cut_offset(cut) + region.0 as u64 * self.region.0
     }
 
-    /// ⭐ EVERY SLOT THIS WINDOW HAS, with its offset in the segment — each cut's run of messages.
-    /// What the receiver programs, one `XSEG` entry per slot per peer, at link.
-    pub fn slots(self) -> impl Iterator<Item = (LandingSlot, u64)> {
+    /// Where `slot` of `region` starts in the segment: its region, plus its whole messages before
+    /// it.
+    pub const fn slot_offset(self, region: PeerRegion, slot: LandingSlot) -> u64 {
+        self.region_offset(slot.cut, region) + slot.message as u64 * RDMA_MESSAGE_CAP_BYTES
+    }
+
+    /// ⭐ EVERY SLOT `region` HAS, with its offset in the segment — each cut's run of messages. What
+    /// the receiver programs for the peer landing there, one `XSEG` entry per slot, at link.
+    pub fn slots(self, region: PeerRegion) -> impl Iterator<Item = (LandingSlot, u64)> {
         (0..WINDOW_CUTS).flat_map(move |k| {
             let cut = WindowCut::of_collective(k);
-            (0..self.cut.message_count()).filter_map(move |m| {
-                LandingSlot::of(cut, m).map(|slot| (slot, self.slot_offset(slot)))
+            (0..self.region.message_count()).filter_map(move |m| {
+                LandingSlot::of(cut, m).map(|slot| (slot, self.slot_offset(region, slot)))
             })
         })
     }
 
     /// The whole window's bytes — every cut.
     pub const fn size(self) -> u64 {
-        WINDOW_CUTS as u64 * self.cut.0
+        WINDOW_CUTS as u64 * self.cut_bytes()
     }
 
     /// One past the window's last byte — the weight segment must reserve up to here.
@@ -780,13 +881,16 @@ mod tests {
     /// no window at all.
     #[test]
     fn a_windows_slots_tile_its_cuts() {
-        let cut = Payload::new(2 * RDMA_MESSAGE_CAP_BYTES + FLIT_BYTES).unwrap();
-        let w = RecvWindow::new(1 << 20, cut).unwrap();
+        let two = TpWorld::of::<2>();
+        let region = Payload::new(2 * RDMA_MESSAGE_CAP_BYTES + FLIT_BYTES).unwrap();
+        let w = RecvWindow::new(1 << 20, region, two).unwrap();
+        let only = PeerRegion::of_world(two).collect::<Vec<_>>();
+        assert_eq!(only.len(), 1);
         let slots: Vec<(u32, u32, u64)> = w
-            .slots()
+            .slots(only[0])
             .map(|(s, at)| (s.cut().index() as u32, s.message(), at))
             .collect();
-        let at = |c: u64, m: u64| (1 << 20) + c * cut.get() + m * RDMA_MESSAGE_CAP_BYTES;
+        let at = |c: u64, m: u64| (1 << 20) + c * region.get() + m * RDMA_MESSAGE_CAP_BYTES;
         assert_eq!(
             slots,
             [
@@ -798,11 +902,31 @@ mod tests {
                 (1, 2, at(1, 2)),
             ]
         );
+        assert_eq!(w.size(), WINDOW_CUTS as u64 * region.get());
         let widest = Payload::new(u64::from(MAX_CUT_MESSAGES) * RDMA_MESSAGE_CAP_BYTES).unwrap();
-        assert!(RecvWindow::new(0, widest).is_some());
+        assert!(RecvWindow::new(0, widest, two).is_some());
         let past = Payload::new(widest.get() + FLIT_BYTES).unwrap();
-        assert!(RecvWindow::new(0, past).is_none());
+        assert!(RecvWindow::new(0, past, two).is_none());
+        assert!(RecvWindow::new(0, widest, TpWorld::of::<1>()).is_none());
         assert!(RecvWindow::cut_bytes_for(1 << 20).is_none());
+    }
+
+    /// Each rank hears its peers in rank order, its own rank left out: rank `s` lands in region
+    /// `s` below the receiver and `s − 1` above it, and a region's tid in cut 0 is the cut's own.
+    #[test]
+    fn a_peer_lands_in_its_rank_ordered_region() {
+        let two: Vec<TpIdentity> = TpWorld::of::<2>().ranks().collect();
+        assert_eq!(two[0].peers().collect::<Vec<_>>(), [two[1]]);
+        assert_eq!(two[1].peers().collect::<Vec<_>>(), [two[0]]);
+        assert_eq!(two[0].region_of(two[1]).map(PeerRegion::index), Some(0));
+        assert_eq!(two[1].region_of(two[0]).map(PeerRegion::index), Some(0));
+        assert_eq!(two[0].region_of(two[0]), None);
+        let one = TpWorld::of::<1>().ranks().next().unwrap();
+        assert_eq!(one.peers().count(), 0);
+        assert_eq!(two[0].region_of(one), None);
+        for (k, &tid) in crate::reserved_tids::TP_RECV_CUT_TIDS.iter().enumerate() {
+            assert_eq!(WindowCut::of_collective(k).tid(PeerRegion(0)), tid);
+        }
     }
 
     #[test]

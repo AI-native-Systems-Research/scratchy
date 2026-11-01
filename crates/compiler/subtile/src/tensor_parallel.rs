@@ -417,11 +417,15 @@ impl Weave<'_> {
         let (kind, op) = match (r, self.place_of(r)) {
             (InputRef::Op(j), Placement::Whole) => return Ok(InputRef::Op(self.op_map[j])),
             (InputRef::Ext(_), Placement::Whole) => return Ok(r),
-            (_, Placement::Partial) => (CollectiveKind::AllReduce, SubOp::AllReduce),
+            (_, Placement::Partial) => (
+                CollectiveKind::AllReduce,
+                SubOp::AllReduce { world: self.world },
+            ),
             (InputRef::Op(j), Placement::Split(Axis::Cols)) => (
                 CollectiveKind::AllGather,
                 SubOp::AllGather {
                     cols: self.shape[j].1,
+                    world: self.world,
                 },
             ),
             (InputRef::Op(j), Placement::Split(Axis::HeadRows { .. })) => {
@@ -1215,15 +1219,25 @@ pub fn slice_source<T: SliceElement>(
 /// law [`eval_ranks`] and any lockstep reference over a rank's own buffers read.
 ///
 /// # Panics
-/// On a node that is not a collective.
+/// On a node that is not a collective, or handed buffers for a world other than the one it
+/// states.
 pub fn eval_collective<F: RopeForm>(
     node: &crate::subtile_ir::SubtileNode<F>,
     graph: &SubtileIR<F>,
     ranks: &[&[Vec<f32>]],
 ) -> Vec<f32> {
     use crate::subtile_ir::gather;
+    if let SubOp::AllReduce { world } | SubOp::AllGather { world, .. } = node.op {
+        assert_eq!(
+            ranks.len() as u32,
+            world.get(),
+            "a collective over {} ranks handed {} ranks' buffers",
+            world.get(),
+            ranks.len()
+        );
+    }
     match node.op {
-        SubOp::AllReduce => {
+        SubOp::AllReduce { .. } => {
             let parts: Vec<Vec<f32>> = ranks
                 .iter()
                 .map(|b| gather(&node.inputs[0], graph, b).0)
@@ -1236,7 +1250,7 @@ pub fn eval_collective<F: RopeForm>(
             }
             sum
         }
-        SubOp::AllGather { cols } => {
+        SubOp::AllGather { cols, .. } => {
             let parts: Vec<(Vec<f32>, u32, u32)> = ranks
                 .iter()
                 .map(|b| gather(&node.inputs[0], graph, b))
@@ -1294,7 +1308,7 @@ pub fn eval_ranks<F: RopeForm>(
     for node in &graph.nodes {
         let shape: TensorShape = graph.shape(node.output.tensor);
         let outs: Vec<Vec<f32>> = match node.op {
-            SubOp::AllReduce | SubOp::AllGather { .. } => {
+            SubOp::AllReduce { .. } | SubOp::AllGather { .. } => {
                 let ranks: Vec<&[Vec<f32>]> = bufs.iter().map(|b| b.as_slice()).collect();
                 vec![eval_collective(node, graph, &ranks); w]
             }
@@ -1533,7 +1547,9 @@ mod tests {
         let mut input = one_layer_input();
         let last = input.ops.len() - 1;
         input.ops.push(OpDesc {
-            op: SubOp::AllReduce,
+            op: SubOp::AllReduce {
+                world: WorldSize::of::<2>(),
+            },
             m: 1,
             inputs: vec![InputRef::Op(last)],
         });
@@ -1761,7 +1777,7 @@ mod tests {
             .nodes
             .iter()
             .filter(|n| n.inputs.iter().any(|i| i.tensor == rows))
-            .map(|n| matches!(n.op, SubOp::AllReduce))
+            .map(|n| matches!(n.op, SubOp::AllReduce { .. }))
             .collect();
         assert_eq!(
             readers,
@@ -1856,7 +1872,7 @@ mod tests {
         assert_eq!(sf.local.result, last.op);
         assert!(matches!(
             sf.local.ops[last.op].op,
-            SubOp::AllGather { cols: 1000 }
+            SubOp::AllGather { cols: 1000, .. }
         ));
         sharded_equals_unsharded_at(&input, w, g);
     }

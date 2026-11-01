@@ -46,9 +46,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|e| e.tp_consume)
         .ok_or("the two-rank sublayer bakes no consume")?
         .cut;
+    let peer = ktir_superdsc::collective::PeerRegion::of_world(SpyreWorld::of::<2>().plan())
+        .next()
+        .ok_or("a two-rank world has a peer")?;
     let window = layout
         .placements
-        .get(&cut.tid())
+        .get(&cut.tid(peer))
         .ok_or("the sharded layout carries no receive window cut")?;
     eprintln!(
         "{} op(s), {} consume op(s); window cut {} seg{} @ {} ({} B)",

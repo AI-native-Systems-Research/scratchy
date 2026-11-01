@@ -1083,9 +1083,29 @@ fn window_cut<F: RopeForm>(
         .nodes
         .iter()
         .take_while(|n| n.id != node.id)
-        .filter(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
+        .filter(|n| matches!(n.op, SubOp::AllReduce { .. } | SubOp::AllGather { .. }))
         .count();
     ktir_superdsc::collective::WindowCut::of_collective(k)
+}
+
+/// The world a collective states it runs over, as one spyre bakes — or the refusal naming a world
+/// spyre does not.
+fn collective_world<F: RopeForm>(
+    node: &SubtileNode<F>,
+) -> Result<ktir_superdsc::collective::TpWorld, NodeLowering> {
+    let (SubOp::AllReduce { world } | SubOp::AllGather { world, .. }) = node.op else {
+        return Err(NodeLowering::Unhandled(format!(
+            "{:?} is not a collective and states no world",
+            node.op
+        )));
+    };
+    ktir_superdsc::collective::TpWorld::named(world.get()).ok_or_else(|| {
+        NodeLowering::Unhandled(format!(
+            "a collective over {} ranks — not a world spyre bakes ({:?})",
+            world.get(),
+            ktir_superdsc::collective::SPYRE_TP_WORLDS
+        ))
+    })
 }
 
 /// The all-reduce's consume launches: per stick-column fragment of the operand
@@ -1104,10 +1124,26 @@ fn all_reduce_consumes<F: RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> NodeLowering {
-    use ktir_superdsc::collective::{CollectiveKind, TpConsume};
+    use ktir_superdsc::collective::{CollectiveKind, PeerRegion, TpConsume};
     use scratchy_subtile::subtile_ir::{EwKind, Range, Region, TensorRegion};
     let x = node.inputs[0];
     let rows = x.region.rows.len;
+    let world = match collective_world(node) {
+        Ok(w) => w,
+        Err(refusal) => return refusal,
+    };
+    // ⛔ ONE PEER'S FRAGMENT: the sum below is `own + peer`, which is every rank's sum in absolute
+    // rank order only in a world of two (fp16 addition commutes). A wider world sums its ranks in
+    // that order on every rank, a consume per rank — not built yet, so refused by name.
+    let mut regions = PeerRegion::of_world(world);
+    let (Some(region), None) = (regions.next(), regions.next()) else {
+        return NodeLowering::Unhandled(format!(
+            "an all-reduce over {} ranks sums {} peers' fragments in rank order; this consume \
+             adds one peer's",
+            world.get(),
+            world.peers()
+        ));
+    };
     // The consume names the send — this rank's partial into the peer's window — which the CB
     // pipeline issues ahead of the consume's wait.
     let frags = match send_fragment(node, CollectiveKind::AllReduce) {
@@ -1115,7 +1151,7 @@ fn all_reduce_consumes<F: RopeForm>(
         Err(refusal) => return refusal,
     };
     let cut = window_cut(node, ir);
-    let window = TensorId::from_index(cut.tid() as usize);
+    let window = TensorId::from_index(cut.tid(region) as usize);
     let mut ops = Vec::with_capacity(frags.len());
     for (k, f) in frags.into_iter().enumerate() {
         let cols_at = |start: u32| Range::new(start + f.first_col(), f.cols());
@@ -1184,12 +1220,14 @@ fn all_gather_consumes<F: RopeForm>(
     ir: &SubtileIR<F>,
     cols: u32,
 ) -> NodeLowering {
-    use ktir_superdsc::collective::{CollectiveKind, PlaysAt, STICK_ELEMS, TpConsume, TpWorld};
+    use ktir_superdsc::collective::{CollectiveKind, PeerRegion, PlaysAt, STICK_ELEMS, TpConsume};
     use scratchy_subtile::subtile_ir::{Range, Region, TensorRegion};
     let x = node.inputs[0];
     let (rows, lc) = (x.region.rows.len, x.region.cols.len);
-    // Spyre's one sharded world (`SPYRE_TP_WORLDS = [1, 2]`); a gather in any forward is its.
-    let world = TpWorld::of::<2>();
+    let world = match collective_world(node) {
+        Ok(w) => w,
+        Err(refusal) => return refusal,
+    };
     // ⭐ THE BLOCKS COVER THE WIDTH, THE LAST ONE MAYBE PADDED. Rank `r`'s block is `lc` columns
     // at column `r·lc`, and the gathered value is the first `cols` of them — every column, at an
     // even split; at a padded one (`tensor_parallel::split_block`), the last block's tail past the
@@ -1211,8 +1249,8 @@ fn all_gather_consumes<F: RopeForm>(
         Err(refusal) => return refusal,
     };
     let cut = window_cut(node, ir);
-    let window = |rank: u32| TensorRegion {
-        tensor: TensorId::from_index(cut.tid() as usize),
+    let window = |region: PeerRegion, rank: u32| TensorRegion {
+        tensor: TensorId::from_index(cut.tid(region) as usize),
         region: Region {
             rows: Range::new(0, rows),
             cols: Range::new(0, width_of(rank)),
@@ -1232,11 +1270,8 @@ fn all_gather_consumes<F: RopeForm>(
             cols: Range::new(node.output.region.cols.start + rank * lc, width_of(rank)),
         },
     };
-    let mut ops = Vec::with_capacity(2 * world.get() as usize);
+    let mut ops = Vec::with_capacity((world.get() * world.get()) as usize);
     for id in world.ranks() {
-        let Some(peer) = id.peer() else {
-            return NodeLowering::Unhandled("a two-rank world's rank has no peer".to_string());
-        };
         let consume = TpConsume {
             kind: CollectiveKind::AllGather,
             operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
@@ -1244,10 +1279,25 @@ fn all_gather_consumes<F: RopeForm>(
             plays_at: Some(PlaysAt::of(id)),
             cut,
         };
-        for (src, dst, leg) in [
-            (own(id.rank()), block_at(id.rank()), "own"),
-            (window(peer.rank()), block_at(peer.rank()), "peer"),
-        ] {
+        // This rank's block, then each peer's from its region, in rank order. A world of two has
+        // one peer, whose leg is named for its kind alone, as the part tag of a one-part write is.
+        let mut legs = vec![(own(id.rank()), block_at(id.rank()), "own".to_string())];
+        for peer in id.peers() {
+            let Some(region) = id.region_of(peer) else {
+                return NodeLowering::Unhandled(format!(
+                    "rank {} of its world has no region for its peer {}",
+                    id.rank(),
+                    peer.rank()
+                ));
+            };
+            let leg = if world.peers() > 1 {
+                format!("peer{}", peer.rank())
+            } else {
+                "peer".to_string()
+            };
+            legs.push((window(region, peer.rank()), block_at(peer.rank()), leg));
+        }
+        for (src, dst, leg) in legs {
             let name = format!("tpgather_s{}_r{}_{leg}", node.id.index(), id.rank());
             match scratchy_triton_splice::lower_block_copy(node, src, dst, span, &name) {
                 Ok(mut e) => {
@@ -1343,11 +1393,11 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // window), writing the output's same columns. Two operands, because spyre bakes worlds of
         // one and two (`SPYRE_TP_WORLDS`) and a world of one has no collective; fp16 addition is
         // commutative, so both ranks compute bit-identical sums.
-        SubOp::AllReduce => all_reduce_consumes(node, ir, rows_are_requests),
+        SubOp::AllReduce { .. } => all_reduce_consumes(node, ir, rows_are_requests),
         // ⭐ THE ALL-GATHER'S CONSUME IS RANK-SELECTED: this rank's block and the peer's land at
         // columns that depend on which rank is which, so the bake carries one consume per rank
         // and each session plays its own (`bundle::collective::cb_pipeline`).
-        SubOp::AllGather { cols } => all_gather_consumes(node, ir, *cols),
+        SubOp::AllGather { cols, .. } => all_gather_consumes(node, ir, *cols),
         // ⛔ THE 2b EXPANSION KINDS, named here instead of `expansion_ops!()`: the 2a
         // routing below made the macro's patterns for THOSE kinds unreachable
         // (`unreachable_patterns` is `-D warnings`), and the remaining members are a

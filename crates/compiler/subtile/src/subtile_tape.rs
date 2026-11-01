@@ -3418,7 +3418,9 @@ pub(crate) mod tests {
                 let out = num_sources + nodes.len() as u32;
                 nodes.push(SubtileNode {
                     id: SubtileId(nodes.len() as u32),
-                    op: SubOp::AllReduce,
+                    op: SubOp::AllReduce {
+                        world: crate::tensor_parallel::WorldSize::of::<2>(),
+                    },
                     inputs: vec![whole(r)],
                     output: whole(out),
                 });
