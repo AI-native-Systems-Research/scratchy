@@ -48,7 +48,7 @@ use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::opkind::OpKind;
 
 use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gathers_of, regions};
-use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind};
+use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind, Scratch};
 // The broadcast AXIS is the emission door's own vocabulary — `elementwise` selects the `In` builder
 // from it — so it lives beside that door and this recogniser names the same type rather than a
 // parallel one that would have to be mapped across the boundary. The CONVERT KIND is the same
@@ -3421,9 +3421,14 @@ pub(super) fn mint_scratch(
     layout: &BundleLayout,
     floor: u32,
     ssa: Ssa,
-    n: u8,
+    which: crate::ktir_node::Scratch,
 ) -> u32 {
-    mint(k, layout, floor, crate::ktir_node::MintKey::Scratch(ssa, n))
+    mint(
+        k,
+        layout,
+        floor,
+        crate::ktir_node::MintKey::Scratch(ssa, which),
+    )
 }
 
 fn mint(k: &KtirNode, layout: &BundleLayout, floor: u32, key: crate::ktir_node::MintKey) -> u32 {
@@ -4288,7 +4293,7 @@ fn lower_function_folded(
                 let source = match head_rows {
                     Some(h) => {
                         let mid = row_major_region(
-                            mint_scratch(k, layout, floor, res, 0),
+                            mint_scratch(k, layout, floor, res, Scratch::HeadRowsMid),
                             h.rows * h.row_sticks,
                             layout,
                         );
@@ -4453,7 +4458,7 @@ fn lower_function_folded(
                                 band: None,
                             };
                             let table_rows_major = row_major_region(
-                                mint_scratch(k, layout, floor, src, 8),
+                                mint_scratch(k, layout, floor, src, Scratch::GatherTableRowMajor),
                                 table_rows * sticks,
                                 layout,
                             );
@@ -4467,7 +4472,7 @@ fn lower_function_folded(
                                 Some(layout),
                             )?);
                             let gathered = row_major_region(
-                                mint_scratch(k, layout, floor, src, 9),
+                                mint_scratch(k, layout, floor, src, Scratch::GatheredRowMajor),
                                 g.entries * sticks,
                                 layout,
                             );
@@ -4700,7 +4705,7 @@ fn lower_function_folded(
                             // and a second permute lays the head rows stick-major, the frame the
                             // one-row arm above lands (and the batched dot reads a block of).
                             let mid = row_major_region(
-                                mint_scratch(k, layout, floor, res, 0),
+                                mint_scratch(k, layout, floor, res, Scratch::QueryHeadRowsMid),
                                 h.rows * h.row_sticks,
                                 layout,
                             );
@@ -4761,7 +4766,7 @@ fn lower_function_folded(
                                     z
                                 }
                             };
-                            let run = mint_scratch(k, layout, floor, src, 1);
+                            let run = mint_scratch(k, layout, floor, src, Scratch::IndexRun);
                             layout.synth_df(
                                 crate::place::PlaceId::Act(run),
                                 &[1, super::lower_ktir_to_superdsc::INDEX_RUN_WORDS],
@@ -4890,7 +4895,13 @@ fn lower_function_folded(
                         }
                         let mut scaled = index_stick(g.index_tid, false);
                         for halving in 0..pieces.trailing_zeros() {
-                            let tid = mint_scratch(k, layout, floor, src, 2 + halving as u8);
+                            let tid = mint_scratch(
+                                k,
+                                layout,
+                                floor,
+                                src,
+                                Scratch::ScaledIndex(halving as u8),
+                            );
                             layout.synth_df(
                                 crate::place::PlaceId::Act(tid),
                                 &[1, words],
@@ -5146,7 +5157,7 @@ fn lower_function_folded(
                     let rows_major = if sticks == 1 {
                         source
                     } else {
-                        let tid = mint_scratch(k, layout, floor, r_res, 1);
+                        let tid = mint_scratch(k, layout, floor, r_res, Scratch::HeadMajorBlocks);
                         let mid = row_major_region(tid, source.v_rows * sticks, layout);
                         out.push(permute(
                             f.name,
@@ -5177,7 +5188,7 @@ fn lower_function_folded(
                         band: None,
                     };
                     let dest_rows = row_major_region(
-                        mint_scratch(k, layout, floor, r_res, 2),
+                        mint_scratch(k, layout, floor, r_res, Scratch::HeadMajorMid),
                         sc.value_rows * col_sticks,
                         layout,
                     );
@@ -5400,7 +5411,7 @@ fn lower_function_folded(
             // on a result (`0` at the shape and gather mints) could hand both the same buffer. `10`
             // is this arm's alone.
             let wide = (halving && blocks > 2).then(|| {
-                let t = mint_scratch(k, layout, floor, data, 10);
+                let t = mint_scratch(k, layout, floor, data, Scratch::FoldTreeWide);
                 layout.synth(crate::place::PlaceId::Act(t), &[src.v_rows / 2, src.v_cols]);
                 (t, src.v_rows / 2)
             });
@@ -6654,7 +6665,7 @@ fn lower_function_folded(
                         ));
                     }
                     let block_rows = w.v_rows / batch;
-                    let tid = mint_scratch(k, layout, floor, res, 2);
+                    let tid = mint_scratch(k, layout, floor, res, Scratch::BatchKernelBlocks);
                     let expanded = stick_major_region(
                         tid,
                         heads * block_rows,
@@ -6711,7 +6722,7 @@ fn lower_function_folded(
                         ));
                     }
                     let (m, sticks) = (a.v_rows / batch, a.v_cols / stick);
-                    let tid = mint_scratch(k, layout, floor, res, 1);
+                    let tid = mint_scratch(k, layout, floor, res, Scratch::BatchActivationBlocks);
                     let blocks = stick_major_region(tid, m, batch * sticks, layout);
                     let copies = HeadMajorCopies::of(&blocks, &a, a.v_rows, sticks)?.to_block(
                         f.name,
@@ -7465,7 +7476,7 @@ fn heads_inner_pair(
     };
     let mid = (block.sticks > 1).then(|| {
         row_major_region(
-            mint_scratch(m.k, m.layout, m.floor, key, 0),
+            mint_scratch(m.k, m.layout, m.floor, key, Scratch::BlockRelayoutMid),
             block.rows * block.heads * block.sticks,
             m.layout,
         )
