@@ -92,6 +92,17 @@ pub(crate) fn view_stick_layout(
     view: &ArgView<'_>,
     plan: &WorkPlan,
 ) -> crate::sdsc_abstract::StickLayout {
+    view_arrangement(view, plan).layout()
+}
+
+/// What a view CLAIMS about its tensor's bytes: [`view_stick_layout`]'s layout (its
+/// [`ArrangementClaim::layout`](crate::sdsc_abstract::ArrangementClaim::layout)), plus whether the view
+/// reads head-major — the fact the arrangement authority needs to tell a head-major read of a
+/// stick-blocked tensor from the M>1 scramble when the two have one shape.
+pub(crate) fn view_arrangement(
+    view: &ArgView<'_>,
+    plan: &WorkPlan,
+) -> crate::sdsc_abstract::ArrangementClaim {
     // PHYSICAL extent per dim, not this op's iteration view of it. `TensorArg::device_extent` has
     // always documented itself as the thing "every stride/offset is derived from, NOT from
     // `iteration_space[dim]`" — torch-spyre's `arg.device_size` / `dev_dim_size > it_dim_size` case.
@@ -134,7 +145,9 @@ pub(crate) fn view_stick_layout(
         .unwrap_or(usize::MAX);
     if view.row_blocked && !host_size_us.is_empty() {
         let feat: usize = host_size_us[1..].iter().product::<usize>().max(1);
-        return crate::sdsc_abstract::StickLayout::row_blocked_df(host_size_us[0], feat, view.df);
+        return crate::sdsc_abstract::ArrangementClaim::Rows(
+            crate::sdsc_abstract::StickLayout::row_blocked_df(host_size_us[0], feat, view.df),
+        );
     }
     // ── mq>1 activation: STICK-MAJOR (RowBlocked), torch-spyre-faithful ───────────────────────────────
     // A multi-stick `[m>1, k]` non-KERNEL activation is addressed STICK-MAJOR (RowBlocked) — the SAME
@@ -151,7 +164,7 @@ pub(crate) fn view_stick_layout(
     // `Flat`, so head-major attention intermediates stay row-major (correct — they are genuinely row-major).
     // Decode (rows<=1) and single-stick (cols<=lanes) are byte-identical to before (RowBlocked≡Flat there).
     // KERNELS (weights / KV cache) re-tile via their RetileDescriptor.
-    crate::sdsc_abstract::StickLayout::for_view_df(&host_size_us, stick_idx, view.df)
+    crate::sdsc_abstract::ArrangementClaim::for_view_df(&host_size_us, stick_idx, view.df)
 }
 
 fn per_core_addr(
@@ -3737,7 +3750,7 @@ pub fn emit_sdsc(
             .or_else(|| l.synth.borrow().sizes.get(v.name).copied());
             let full = full_bytes.is_none_or(|fp| arg_bytes >= fp);
             if active && full && !matches!(v.role, Role::Kernel) && !v.allocation.is_lx() {
-                l.declare_arrangement(v.name, view_stick_layout(v, iter))?;
+                l.declare_arrangement(v.name, view_arrangement(v, iter), op_name)?;
             }
         }
         let per_core = per_core_addr(seg_base, v, &sl, iter, &wk_slice, intra_base, cores)?;
