@@ -659,13 +659,59 @@ pub struct WalkPlan {
 }
 
 /// What a node's lowering mints an intermediate for ([`KtirNode::minted`]): an SSA value's own
-/// buffer, or the `n`th scratch the lowering of that value takes beside it — a relayout's middle
+/// buffer, or one of the scratches the lowering of that value takes beside it — a relayout's middle
 /// frame, a gather's landing — which no value of the program names, and which the declare pass and
 /// the real pass must still find under one name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MintKey {
     Value(ktir_core::ir::Ssa),
-    Scratch(ktir_core::ir::Ssa, u8),
+    Scratch(ktir_core::ir::Ssa, Scratch),
+}
+
+/// ⭐⭐ WHICH SCRATCH — one variant per minting site, so the compiler keeps them apart.
+///
+/// ⛔ THIS WAS A HAND-PICKED `u8`, AND THAT IS A SILENT-ALIASING SHAPE. The key is `(ssa, n)`, the
+/// `ssa` at most sites is the lowering's OPERAND or RESULT — i.e. some other op's result — and each
+/// site `synth`s its own extents, where `BundleLayout::synth` is FIRST-ONE-WINS. So two sites that
+/// happened to pick the same `n` and to see the same value would be handed ONE buffer at the FIRST
+/// one's shape: four sites picked `0` (two relayout middles, a block relayout's middle, a scatter's
+/// row-major rows), three picked `1` and three picked `2`. Nothing here could have caught it — the
+/// numbers carry no meaning a reader or a compiler can check, and a new site picks the next free
+/// number by grepping. Naming the PURPOSE makes uniqueness the compiler's job and the sharing (if a
+/// site ever wants it) a written decision rather than a coincidence of integers.
+///
+/// Introduced as a ONE-TO-ONE replacement — every site that had its own `(ssa, n)` has its own
+/// variant — so the keys, the tids and therefore every emitted descriptor are unchanged. The
+/// evidence is a byte-for-byte diff of every descriptor the walk lowerings emit over every shape
+/// the splice tests build, plus the granite-2b and -8b bakes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Scratch {
+    /// A head-major relayout's row-major middle frame, at a head's own rows.
+    HeadRowsMid,
+    /// A head-major relayout's row-major middle frame, at the query's head rows (head dim 128).
+    QueryHeadRowsMid,
+    /// A block relayout's row-major middle frame (`new_block_relayout`).
+    BlockRelayoutMid,
+    /// A scatter's rows, stick-major read as row-major at one base.
+    ScatterRowMajor,
+    /// A gathered index table, permuted stick-to-row.
+    GatherTableRowMajor,
+    /// The rows a chained index gather lands.
+    GatheredRowMajor,
+    /// The index run a chained gather copies per page.
+    IndexRun,
+    /// The `i`th doubling of a piece-split gather's index.
+    ScaledIndex(u8),
+    /// A head-major pair's stick-major blocks.
+    HeadMajorBlocks,
+    /// A head-major pair's middle frame.
+    HeadMajorMid,
+    /// A batched contraction's kernel, expanded to its query heads.
+    BatchKernelBlocks,
+    /// A batched contraction's activation, laid as blocks.
+    BatchActivationBlocks,
+    /// The wide levels of a leading-axis fold that halves (`emit::whole_function`'s reduce arm).
+    FoldTreeWide,
 }
 
 impl Clone for KtirNode {
