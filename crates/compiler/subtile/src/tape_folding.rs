@@ -237,9 +237,12 @@ pub struct RoutedBands {
     pub sorted_per_expert: std::ops::Range<f32>,
     /// The pairs per expert from which a bake tiles a groupable bundle's pairs instead.
     pub grouped_per_expert: f32,
-    /// The rows of a verify-sized bucket, at which a bake sorts a groupable bundle's pairs at any
-    /// density: a decode plan groups every route by expert.
+    /// The rows of the widest verify-sized bucket: from a lane's verify (`lane_rows`) through
+    /// them, a bake sorts a groupable bundle's pairs at any density, as a decode plan of lanes ×
+    /// a lane's rows groups every route by expert.
     pub decode_rows: u32,
+    /// A verify lane's rows, the narrowest bucket a decode plan groups at.
+    pub lane_rows: u32,
 }
 
 impl RoutedBands {
@@ -257,7 +260,7 @@ impl RoutedBands {
         let per_expert = pairs as f32 / experts.get() as f32;
         self.grouped_bundles.contains(&bundle)
             && pairs >= self.grouped_pairs
-            && (rows == self.decode_rows
+            && ((rows >= self.lane_rows && rows <= self.decode_rows)
                 || self.sorted_per_expert.contains(&per_expert)
                 || per_expert >= self.grouped_per_expert)
     }
@@ -1908,6 +1911,7 @@ mod tests {
                         sorted_per_expert: 0.5..1.0,
                         grouped_per_expert: 4.0,
                         decode_rows: 0,
+                        lane_rows: 0,
                     },
                     kernel: Kern::Routed,
                 },

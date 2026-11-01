@@ -6749,7 +6749,7 @@ fn gdn_decode_static_name(dtype: DequantDtype) -> &'static str {
 
 /// The most rows a bucket of `gdn_verify` steps holds (its shader's `GDN_VER_ROWS`, at most 8: a
 /// simdgroup a row's norms): the verify-sized buckets.
-const GDN_VERIFY_ROWS: u32 = crate::op_abi::METAL_VERIFY_ROWS;
+const GDN_VERIFY_ROWS: u32 = crate::op_abi::METAL_LANE_VERIFY_ROWS;
 
 fn gdn_verify_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
@@ -8086,14 +8086,16 @@ impl MoeScratch {
         // 64 pairs, a quarter of the slab reads repeats — 17% of the base-M5 conc-8 step). Anything
         // else gathers. Either runs the step's live pairs alone.
         use crate::op_abi::{
-            METAL_DECODE_GROUPED_ROWS, METAL_GROUPED_PAIRS_PER_EXPERT, METAL_SORTED_PAIRS,
-            METAL_SORTED_PAIRS_PER_EXPERT,
+            METAL_DECODE_GROUPED_ROWS, METAL_GROUPED_PAIRS_PER_EXPERT, METAL_LANE_VERIFY_ROWS,
+            METAL_SORTED_PAIRS, METAL_SORTED_PAIRS_PER_EXPERT,
         };
         let pairs = bucket_m * b.top_k.0;
         let per_expert = pairs as f32 / b.experts.0 as f32;
         let grouping = match groups && pairs >= METAL_SORTED_PAIRS {
-            // A lane's verify, Splash's decode plan, groups every route by expert.
-            true if bucket_m == METAL_DECODE_GROUPED_ROWS => MoeGrouping::Sorted,
+            // A verify of one to four lanes, Splash's decode plan, groups every route by expert.
+            true if (METAL_LANE_VERIFY_ROWS..=METAL_DECODE_GROUPED_ROWS).contains(&bucket_m) => {
+                MoeGrouping::Sorted
+            }
             true if per_expert >= METAL_GROUPED_PAIRS_PER_EXPERT => MoeGrouping::Grouped,
             true if METAL_SORTED_PAIRS_PER_EXPERT.contains(&per_expert) => MoeGrouping::Sorted,
             _ => MoeGrouping::Gathered,
