@@ -11479,10 +11479,27 @@ fn dump_wavefront_mega(
             fold_census: std::cell::RefCell<WeightFoldCensus>,
             weight_seg_ledger: std::cell::RefCell<Vec<(String, u64, Vec<u64>)>>,
         }
+        // ⭐ ONLY THE WORLDS THE BUILD ASKS FOR (`tp/<W>`, the macro's `tp-<W>` features). Each
+        // sharded world is a full lowering of the model — and under `spyre-emu` a numeric gate on
+        // every one of its ranks — so none is baked by default.
+        let asked_worlds = [
+            (2u32, cfg!(feature = "tp-2")),
+            (4, cfg!(feature = "tp-4")),
+            (8, cfg!(feature = "tp-8")),
+        ];
         let sharded_cells: Vec<(scratchy_target_spyre::tp_plan::SpyreWorld, WorldCells)> =
-            scratchy_target_spyre::tp_plan::SpyreWorld::SHARDED
+            asked_worlds
                 .iter()
-                .map(|&w| {
+                .filter(|(_, asked)| *asked)
+                .map(|&(w, _)| {
+                    scratchy_target_spyre::tp_plan::SpyreWorld::sharded(w).unwrap_or_else(|| {
+                        panic!(
+                            "[spyre-tp] the build asks for tp/{w}, a world spyre does not bake \
+                             (SPYRE_TP_WORLDS)"
+                        )
+                    })
+                })
+                .map(|w| {
                     (
                         w,
                         WorldCells {
@@ -11498,6 +11515,10 @@ fn dump_wavefront_mega(
                     )
                 })
                 .collect();
+        // The worlds alone, `Copy` and `Sync`: the parallel rung bakes below read which worlds were
+        // asked for, never the cells, which only the serial commit writes.
+        let sharded_worlds: Vec<scratchy_target_spyre::tp_plan::SpyreWorld> =
+            sharded_cells.iter().map(|(w, _)| *w).collect();
         let sharded: Vec<(scratchy_target_spyre::tp_plan::SpyreWorld, WorldBake<'_>)> =
             sharded_cells
                 .iter()
@@ -14172,7 +14193,7 @@ fn dump_wavefront_mega(
                     // whole or not at all. Indexed by the world's place in `SpyreWorld::SHARDED`,
                     // which is its cells' place too.
                     let tp: Vec<(usize, (to_wavefront::LoweredDecode, Vec<BakeEffect>))> =
-                        scratchy_target_spyre::tp_plan::SpyreWorld::SHARDED
+                        sharded_worlds
                             .iter()
                             .zip(&tp_sources)
                             .enumerate()

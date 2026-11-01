@@ -46,6 +46,7 @@ members = [
     "crates/models/vision",
     "crates/models/quantization",
     "crates/models/spec",
+    "crates/models/tp",
     "crates/compiler",
     "crates/compiler/macros",
     "crates/compiler/subtile",

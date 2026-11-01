@@ -3482,6 +3482,7 @@ dependencies = [
  "scratchy-spec",
  "scratchy-target-cuda",
  "scratchy-target-spyre",
+ "scratchy-tp",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3948,6 +3949,13 @@ dependencies = [
  "anyhow",
  "cudarc",
  "memmap2",
+]
+
+[[package]]
+name = "scratchy-tp"
+version = "0.1.0"
+dependencies = [
+ "scratchy-models",
 ]
 
 [[package]]

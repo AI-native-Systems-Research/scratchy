@@ -771,6 +771,11 @@ spyre-hw = ["spyre", "scratchy-forward-compiler-macro/spyre-hw"]
 # an emu build refuses to compile a bundle whose emulator run diverges from the
 # reference semantics at the probe.
 spyre-emu = ["spyre", "scratchy-forward-compiler-macro/spyre-emu"]
+# Tensor-parallel worlds (`scratchy-tp`'s `tp/<W>` from the CLI): each bakes that sharded world
+# beside the one-rank world. None by default.
+tp-2 = ["scratchy-forward-compiler-macro/tp-2"]
+tp-4 = ["scratchy-forward-compiler-macro/tp-4"]
+tp-8 = ["scratchy-forward-compiler-macro/tp-8"]
 # TurboQuant KV compression for every metal model whose geometry the codec
 # takes (see scratchy-forward-compiler-macro's `turboquant`); no effect on the
 # other backends. Off here like every other scope; `scratchy-cli`'s `metal` turns it on.

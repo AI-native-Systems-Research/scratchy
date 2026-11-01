@@ -60,6 +60,11 @@ nccl = ["scratchy-forward-compiler/nccl"]
 # with `KV_CODEC = TurboQuant`, the rest stay dense and are named in the build
 # output. Nothing selects it at runtime. `scratchy-cli` turns it on by default.
 turboquant = []
+# Tensor-parallel build scope: which sharded worlds the spyre bake emits beside the one-rank world.
+# None by default. Reached from `scratchy-cli` as `tp/<W>` (the `scratchy-tp` alias crate).
+tp-2 = []
+tp-4 = []
+tp-8 = []
 
 [dependencies]
 tracing = { workspace = true }
