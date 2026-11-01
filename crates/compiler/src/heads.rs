@@ -51,6 +51,13 @@ pub struct HeadRegistration {
     pub drafting: HeadDrafting,
 }
 
+/// The most lanes a block drafter's step drafts for, each verifying its own block at the head's
+/// `spec_verify_rows` (a lane's: Splash's SPLASH_TARGET_VERIFY_ROWS): Splash's
+/// SPLASH_MAXIMUM_BATCH_WIDTH (runtime/metal/abi/ExecutionGeometry.h), the lanes its decode plan
+/// runs side by side (runtime/ops/MoE.cpp `decodePlan`, lanes × SPLASH_TARGET_VERIFY_ROWS rows) and
+/// its verify budget prices (`VerifyBudget::kLanes`).
+pub const DFLASH2_BLOCK_LANES: usize = 4;
+
 /// How a head drafts a sequence's tokens each step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadDrafting {

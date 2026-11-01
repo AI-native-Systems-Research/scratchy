@@ -680,9 +680,42 @@ mod tests {
         .expect("planned");
         assert!(!passes.commits[0].cycle, "a decode step commits every row");
         assert_eq!(passes.commits[0].positions, [30, 12]);
+        // Each sequence is a lane of its own (up to BLOCK_LANES), its block its own 8 rows.
+        let block = passes.block.expect("two lanes draft");
         assert_eq!(
-            passes.block, None,
-            "two sequences' blocks overflow 8 verify rows"
+            block.lanes,
+            [
+                BlockLane {
+                    step: 0,
+                    sampled: 0,
+                    drafts: 0,
+                    position: 30,
+                },
+                BlockLane {
+                    step: 1,
+                    sampled: 1,
+                    drafts: 0,
+                    position: 12,
+                },
+            ]
+        );
+        assert_eq!(block.cu_seqlens_q, [0, 8, 16], "a lane's block is its own 8 rows");
+        assert_eq!(block.positions, [(31..39).collect::<Vec<_>>(), (13..21).collect()].concat());
+        let five: Vec<String> = (0..5).map(|i| format!("s{i}")).collect();
+        let wide = Step {
+            req_ids: five.clone(),
+            input_ids: vec![7; 5],
+            positions: vec![30; 5],
+            cu: (0..=5).collect(),
+            history: vec![31; 5],
+            sampled: SampledRows::of(&[0, 1, 2, 3, 4, 5], |_| false).expect("rows"),
+        };
+        let ids: Vec<&str> = five.iter().map(String::as_str).collect();
+        assert_eq!(
+            (DRAFTER.passes(&wide.rows(), &plan(&ids), &[]).expect("a valid plan"))
+                .and_then(|p| p.block),
+            None,
+            "a step past BLOCK_LANES sequences drafts none"
         );
         assert_eq!(
             DRAFTER
