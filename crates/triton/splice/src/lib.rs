@@ -4725,10 +4725,12 @@ mod walk_on_the_card {
     /// Counted against the `J = 1` lowering, where the fold is skipped entirely, so the kernel's own
     /// non-fold maximums (its `finfo.min` clamp, its rescale) cancel out of both sides.
     ///
-    /// ⛔ THE SUM FOLDS KEEP WALKING, and that is the point of the last assertion: fp16 addition does
-    /// not reassociate, the only executor of these descriptors is the card, so a sum tree would be a
-    /// numeric change this build cannot check. The `add` count must stay at the walk's `J - 1` per
-    /// fold until a card run can hold a tree to spyre-inference's own answer.
+    /// ⛔ THE SUM FOLDS KEEP WALKING, and the last assertion says what lifts that rather than
+    /// blessing the walk: fp16 addition does not reassociate and nothing local executes these
+    /// descriptors, so a sum tree is an unverified re-rounding — and so is the walk, since which
+    /// order torch-spyre's compiled program sums in is not known here. The walk is the incumbent,
+    /// not the reference; only a card run holding a new order to spyre-inference's own output
+    /// settles it.
     #[test]
     fn the_leading_axis_maximum_folds_by_halving() {
         for hd in [64, 128] {
@@ -4765,12 +4767,22 @@ mod walk_on_the_card {
                          take {}",
                         slots - 1
                     );
-                    // ⛔ The sum folds still walk — one op a window. Two of them (the running sum
-                    // and the carried output), so at least `2·(J-1)` adds survive.
+                    // ⛔ THE SUM FOLDS STILL WALK, AND NOT BECAUSE THE WALK IS THE FAITHFUL ORDER.
+                    // Two of them (the running sum and the carried output), one op a window, so at
+                    // least `2·(J-1)` adds survive. WHAT LIFTS THIS: a card run that holds a sum
+                    // tree to spyre-inference's own output. Until then a tree is an UNVERIFIED
+                    // re-rounding — fp16 addition does not reassociate and nothing but the card
+                    // executes these descriptors — and so is the walk: which order torch-spyre's
+                    // compiled program sums in is NOT known here (our `.scratch/torch_ref` capture
+                    // holds 6 of its 28 descriptors and the reductions are not among them). The walk
+                    // is the INCUMBENT, not the reference; this assertion pins "do not change the
+                    // summation order without card evidence", in either direction.
                     assert!(
                         count(slots, "add") >= 2 * (slots - 1),
-                        "{at}: the sum folds must still walk ({} adds) — a tree there re-rounds \
-                         fp16 and only the card can hold it to spyre-inference's answer",
+                        "{at}: the sum folds changed shape ({} adds for {slots} slots). Lift this \
+                         only with a card run holding the new order to spyre-inference's own \
+                         output — fp16 addition re-rounds and nothing local executes these \
+                         descriptors, so neither order is verified here",
                         count(slots, "add")
                     );
                 }
