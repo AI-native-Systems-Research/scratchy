@@ -411,6 +411,7 @@ fn program_kind_tokens(
         Program::Matmul => quote! { __KProgram::Matmul },
         Program::Sample => quote! { __KProgram::Sample },
         Program::LmLast => quote! { __KProgram::LmLast },
+        Program::BlockCopy => quote! { __KProgram::BlockCopy },
         Program::Rope => quote! { __KProgram::Rope },
         Program::Attn => quote! { __KProgram::Attn },
         Program::Transpose => quote! { __KProgram::Transpose },

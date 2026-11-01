@@ -100,26 +100,8 @@ fn allreduce_min_rank0(
 fn allreduce_min_worker(value: usize, master_addr: &str, port: u16) -> Result<usize> {
     let addr = format!("{master_addr}:{port}");
 
-    // Retry connection with backoff.
-    let mut stream = None;
-    for attempt in 0..30 {
-        match TcpStream::connect(&addr) {
-            Ok(s) => {
-                stream = Some(s);
-                break;
-            }
-            Err(e) => {
-                if attempt < 29 {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                } else {
-                    return Err(e).with_context(|| {
-                        format!("worker: failed to connect to {addr} for allreduce")
-                    });
-                }
-            }
-        }
-    }
-    let mut stream = stream.unwrap();
+    let mut stream = connect_within(&addr, CONNECT_BUDGET)
+        .with_context(|| format!("worker: failed to connect to {addr} for allreduce"))?;
 
     // Send our value.
     stream
@@ -182,24 +164,83 @@ impl TcpControlChannel {
                 world_size - 1
             );
 
-            let mut streams = Vec::with_capacity(world_size - 1);
+            // ⭐ SEATED BY THE RANK EACH FOLLOWER STATES, NOT BY ARRIVAL. Followers connect in
+            // whatever order they start, so `streams[r - 1]` is rank `r` only because each one says
+            // which rank it is ([`HELLO`]); in accept order, every per-follower fact (a ready
+            // frame's landing address) would belong to whichever rank happened to connect first.
+            let mut seats: Vec<Option<TcpStream>> = (1..world_size).map(|_| None).collect();
             for i in 1..world_size {
-                let (stream, peer) = listener.accept().with_context(|| {
+                let (mut stream, peer) = listener.accept().with_context(|| {
                     format!("rank 0: failed to accept control channel connection {i}")
                 })?;
                 // Disable Nagle's algorithm for low-latency framing.
                 stream.set_nodelay(true).ok();
-                info!("Control channel: accepted follower {} from {}", i, peer);
-                streams.push(stream);
+                let mut hello = [0u8; HELLO_FRAME];
+                stream.read_exact(&mut hello).with_context(|| {
+                    format!("rank 0: the follower from {peer} never said its rank")
+                })?;
+                let word = |at: usize| {
+                    u32::from_le_bytes([hello[at], hello[at + 1], hello[at + 2], hello[at + 3]])
+                        as usize
+                };
+                let (their_rank, their_world) = (word(1), word(5));
+                if hello[0] != HELLO {
+                    anyhow::bail!(
+                        "rank 0: the follower from {peer} opened with {:#04x}, not its rank",
+                        hello[0]
+                    );
+                }
+                if their_world != world_size {
+                    anyhow::bail!(
+                        "rank 0: the follower from {peer} runs a world of {their_world}, this one \
+                         is {world_size}"
+                    );
+                }
+                let seat = their_rank
+                    .checked_sub(1)
+                    .and_then(|s| seats.get_mut(s))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "rank 0: the follower from {peer} says it is rank {their_rank}, not a \
+                             follower of a world of {world_size}"
+                        )
+                    })?;
+                if seat.is_some() {
+                    anyhow::bail!("rank 0: two followers say they are rank {their_rank}");
+                }
+                info!(
+                    "Control channel: accepted follower rank {} from {}",
+                    their_rank, peer
+                );
+                *seat = Some(stream);
             }
+            let streams = seats
+                .into_iter()
+                .collect::<Option<Vec<TcpStream>>>()
+                .expect("every follower seat filled: world_size - 1 accepts, no rank twice");
 
             Ok(Self {
                 role: ChannelRole::Leader { streams },
             })
         } else {
             let addr = format!("{master_addr}:{port}");
-            let stream = connect_with_retry(&addr, 30, 500)?;
+            let mut stream = connect_within(&addr, CONNECT_BUDGET)?;
             stream.set_nodelay(true).ok();
+            let mut hello = [0u8; HELLO_FRAME];
+            hello[0] = HELLO;
+            hello[1..5].copy_from_slice(
+                &u32::try_from(rank)
+                    .context("control channel: a rank past u32")?
+                    .to_le_bytes(),
+            );
+            hello[5..9].copy_from_slice(
+                &u32::try_from(world_size)
+                    .context("control channel: a world past u32")?
+                    .to_le_bytes(),
+            );
+            stream
+                .write_all(&hello)
+                .with_context(|| format!("rank {rank}: failed to say its rank to {addr}"))?;
             info!("Control channel: rank {} connected to {}", rank, addr);
             Ok(Self {
                 role: ChannelRole::Follower { stream },
@@ -263,34 +304,118 @@ impl TcpControlChannel {
     }
 }
 
-/// Connect to a TCP address with retry and backoff.
-fn connect_with_retry(addr: &str, max_attempts: usize, delay_ms: u64) -> Result<TcpStream> {
-    for attempt in 0..max_attempts {
-        match TcpStream::connect(addr) {
-            Ok(s) => return Ok(s),
-            Err(e) => {
-                if attempt < max_attempts - 1 {
-                    let delay = std::time::Duration::from_millis(delay_ms);
-                    info!(
-                        "Control channel: connection to {} failed (attempt {}): {}, retrying in {:?}",
-                        addr,
-                        attempt + 1,
-                        e,
-                        delay
-                    );
-                    std::thread::sleep(delay);
-                } else {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "control channel: failed to connect to {} after {} attempts",
-                            addr, max_attempts
-                        )
-                    });
-                }
+/// The byte a follower's ready frame opens with ([`TcpControlChannel::report_ready`]).
+const READY: u8 = 0x52;
+
+/// A ready frame: [`READY`], whether a landing address follows (0 or 1), and the address (LE).
+const READY_FRAME: usize = 10;
+
+impl TcpControlChannel {
+    /// A follower tells its leader it is ready — the one frame that flows follower → leader.
+    ///
+    /// A tensor-parallel rank whose collectives run card to card (spyre's p2p RDMA) must not
+    /// issue its first send before every peer has mapped the link and programmed the window it
+    /// lands in; the leader holds its first step until every follower has said so.
+    ///
+    /// `landing` is the device address this rank's peers land their sends at, for a world whose
+    /// collectives land in a receive window: the leader checks every rank names the same one
+    /// (each send names its own window's address for its peer's). `None` for a world without.
+    pub fn report_ready(&mut self, landing: Option<u64>) -> Result<()> {
+        let mut frame = [0u8; READY_FRAME];
+        frame[0] = READY;
+        if let Some(a) = landing {
+            frame[1] = 1;
+            frame[2..].copy_from_slice(&a.to_le_bytes());
+        }
+        match &mut self.role {
+            ChannelRole::Follower { stream } => stream
+                .write_all(&frame)
+                .and_then(|()| stream.flush())
+                .context("control channel: failed to report ready"),
+            ChannelRole::Leader { .. } => {
+                anyhow::bail!("report_ready() called on leader (rank 0)")
             }
         }
     }
-    unreachable!()
+
+    /// The leader blocks until every follower has [`report_ready`](Self::report_ready), and
+    /// returns each follower's landing address, in rank order (rank 1 first).
+    pub fn await_ready(&mut self) -> Result<Vec<Option<u64>>> {
+        match &mut self.role {
+            ChannelRole::Leader { streams } => {
+                let mut landings = Vec::with_capacity(streams.len());
+                for (i, stream) in streams.iter_mut().enumerate() {
+                    let mut frame = [0u8; READY_FRAME];
+                    stream.read_exact(&mut frame).with_context(|| {
+                        format!("control channel: follower {} never reported ready", i + 1)
+                    })?;
+                    if frame[0] != READY {
+                        anyhow::bail!(
+                            "control channel: follower {} sent {:#04x}, not ready",
+                            i + 1,
+                            frame[0]
+                        );
+                    }
+                    let mut address = [0u8; 8];
+                    address.copy_from_slice(&frame[2..]);
+                    landings.push(match frame[1] {
+                        0 => None,
+                        1 => Some(u64::from_le_bytes(address)),
+                        other => anyhow::bail!(
+                            "control channel: follower {}'s ready frame says {other:#04x} for \
+                             whether a landing address follows",
+                            i + 1
+                        ),
+                    });
+                }
+                Ok(landings)
+            }
+            ChannelRole::Follower { .. } => {
+                anyhow::bail!("await_ready() called on follower (rank > 0)")
+            }
+        }
+    }
+}
+
+/// A follower's first frame: this tag, then its rank and its world size, each a little-endian u32.
+const HELLO: u8 = 0x48;
+const HELLO_FRAME: usize = 9;
+
+/// ⭐ HOW LONG A FOLLOWER WAITS FOR RANK 0 TO LISTEN. A follower is started before rank 0 (rank 0
+/// waits for all of them), so it must outlast rank 0's whole launch-to-listen time plus the launch
+/// stagger, at every world size — a fixed attempt count was 15 s, and measured on a 4-card pod
+/// (#1009 run 17) rank 1 gave up 0.5 s before rank 0's listener opened. Long enough for any startup;
+/// a rank 0 that never comes still ends the follower, by name, instead of leaving it waiting forever.
+const CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often a waiting follower retries.
+const CONNECT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Connect to `addr`, retrying every [`CONNECT_POLL`] until it accepts or `budget` has passed.
+fn connect_within(addr: &str, budget: std::time::Duration) -> Result<TcpStream> {
+    let start = std::time::Instant::now();
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match TcpStream::connect(addr) {
+            Ok(s) => return Ok(s),
+            Err(e) if start.elapsed() + CONNECT_POLL < budget => {
+                info!(
+                    "Control channel: connection to {} failed (attempt {}): {}, retrying in {:?}",
+                    addr, attempt, e, CONNECT_POLL
+                );
+                std::thread::sleep(CONNECT_POLL);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "control channel: failed to connect to {addr} within {budget:?} \
+                         ({attempt} attempts) — rank 0 never listened"
+                    )
+                });
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +425,104 @@ fn connect_with_retry(addr: &str, max_attempts: usize, delay_ms: u64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A follower started before rank 0 connects once rank 0 listens, however late inside the
+    /// budget — here rank 0 binds two polls after the follower starts trying.
+    #[test]
+    fn a_follower_waits_for_a_late_listener() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(CONNECT_POLL * 2);
+            let l = TcpListener::bind(("127.0.0.1", port)).unwrap();
+            l.accept().map(|_| ())
+        });
+        connect_within(&addr, std::time::Duration::from_secs(10)).unwrap();
+        late.join().unwrap().unwrap();
+    }
+
+    /// Followers are seated by the rank they state, whatever order they connect in: rank 3
+    /// connects first here, and its ready frame is still the third entry.
+    #[test]
+    fn followers_are_seated_by_rank_not_arrival() {
+        let port = master_port_binding(CONTROL_CHANNEL_PORT_OFFSET);
+        let landing = |rank: usize| Some(0x1000 * rank as u64);
+        let leader = std::thread::spawn(move || {
+            let mut ch = TcpControlChannel::establish(0, 4, "127.0.0.1", port).unwrap();
+            ch.await_ready().unwrap()
+        });
+        for rank in [3, 1, 2] {
+            let mut ch = TcpControlChannel::establish(rank, 4, "127.0.0.1", port).unwrap();
+            ch.report_ready(landing(rank)).unwrap();
+            std::mem::forget(ch);
+        }
+        assert_eq!(leader.join().unwrap(), [landing(1), landing(2), landing(3)]);
+    }
+
+    /// A follower of another world size is refused by name — the bake and the load must agree.
+    #[test]
+    fn a_follower_of_another_world_is_refused() {
+        let port = master_port_binding(CONTROL_CHANNEL_PORT_OFFSET);
+        let leader = std::thread::spawn(move || {
+            TcpControlChannel::establish(0, 2, "127.0.0.1", port)
+                .err()
+                .map(|e| format!("{e:#}"))
+        });
+        let _follower = TcpControlChannel::establish(1, 4, "127.0.0.1", port).unwrap();
+        let err = leader
+            .join()
+            .unwrap()
+            .expect("a world-of-4 follower refused");
+        assert!(err.contains("world of 4"), "{err}");
+    }
+
+    /// A rank 0 that never listens ends the wait at the budget, by name.
+    #[test]
+    fn a_follower_gives_up_at_its_budget() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let err = connect_within(&format!("127.0.0.1:{port}"), CONNECT_POLL * 2).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("rank 0 never listened"),
+            "{err:#}"
+        );
+    }
+
+    /// The leader's `await_ready` returns only after every follower reported ready, with each
+    /// follower's landing address in rank order, and a broadcast still reaches each follower
+    /// afterwards.
+    #[test]
+    fn the_leader_waits_for_every_follower_to_report_ready() {
+        let port = master_port_binding(CONTROL_CHANNEL_PORT_OFFSET);
+        let landing = |rank: usize| (rank == 1).then_some(0x4_c842_2800_u64);
+        let followers: Vec<_> = (1..3)
+            .map(|rank| {
+                std::thread::spawn(move || {
+                    let mut ch = TcpControlChannel::establish(rank, 3, "127.0.0.1", port).unwrap();
+                    ch.report_ready(landing(rank)).unwrap();
+                    assert!(ch.await_ready().is_err(), "a follower awaits no one");
+                    ch.recv().unwrap()
+                })
+            })
+            .collect();
+        let mut leader = TcpControlChannel::establish(0, 3, "127.0.0.1", port).unwrap();
+        assert_eq!(leader.await_ready().unwrap(), [landing(1), landing(2)]);
+        assert!(
+            leader.report_ready(None).is_err(),
+            "a leader reports to no one"
+        );
+        leader.broadcast(b"step").unwrap();
+        for f in followers {
+            assert_eq!(f.join().unwrap(), b"step");
+        }
+    }
 
     /// A `master_port` whose `master_port + offset`, the port actually bound,
     /// is free. Probing the base instead collides across parallel tests: the

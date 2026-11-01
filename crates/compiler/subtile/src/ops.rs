@@ -55,6 +55,20 @@
 //!     sink and every non-gemm weight reader are NOT gemm weights — they stage by their own
 //!     paths, so classifying them here would make the bake refuse them).
 //!
+//! - `tp` is the op's SHARDING RULE, the one fact tensor parallelism reads
+//!   (`crate::tensor_parallel::TpRule`, whose variants these classes name):
+//!   - `[contract]` — operand 0 is contracted against the gemm weight's K rows;
+//!   - `[linear]` — channel-local and linear in every activation operand, so a partial sum
+//!     passes through it;
+//!   - `[pointwise]` — channel-local but not linear;
+//!   - `[rowwise]` — reduces over each row's whole column extent;
+//!   - `[heads]` — local to an attention head (rotary, the KV writers, attention);
+//!   - `[view]` — re-lays rows against columns (the per-head reshape);
+//!   - `[collective]` — the analysis's own output;
+//!   - `[whole]` — no rule: whole operands in, whole value out, weights replicated. It is
+//!     the correct default for any op, so an op without a rule costs collectives, never
+//!     correctness.
+//!
 //! Rows after `@expansion` are the ops one construct expands to (an arch-level MoE block, or the KV
 //! codec or sampled rows a target's facts insert); they also generate `expansion_ops!()`, the
 //! pattern a target without them refuses by.
@@ -66,87 +80,92 @@ macro_rules! for_each_subop {
         $cb! {
             // 2 = [act, W] fp16 / affine; 3 = [act, W, w_scale] fp8 W8A8.
             MatmulTile [SubOp::MatmulTile { .. }] arity = (|n| n == 2 || n == 3),
-                cols = [field n], rows = [in0], gemm_w = [in 1];
+                cols = [field n], rows = [in0], gemm_w = [in 1], tp = [contract];
             SumReduce [SubOp::SumReduce { .. }] arity = (|n| n >= 1), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [linear];
             // The one op with its own row scale: `m · mult / div`, stated by its payload.
             Reshape [SubOp::Reshape { .. }] arity = (|n| n == 1), cols = [field cols],
-                rows = [scale rows], gemm_w = [none];
+                rows = [scale rows], gemm_w = [none], tp = [view];
             Silu [SubOp::Elementwise(EwKind::Silu)] arity = (|n| n == 1), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [pointwise];
             Gelu [SubOp::Elementwise(EwKind::Gelu)] arity = (|n| n == 1), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [pointwise];
             QuickGelu [SubOp::Elementwise(EwKind::QuickGelu)] arity = (|n| n == 1), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [pointwise];
             GeluErf [SubOp::Elementwise(EwKind::GeluErf)] arity = (|n| n == 1), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [pointwise];
             Relu2 [SubOp::Elementwise(EwKind::Relu2)] arity = (|n| n == 1), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [pointwise];
             Mul [SubOp::Elementwise(EwKind::Mul)] arity = (|n| n == 2), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [pointwise];
             Add [SubOp::Elementwise(EwKind::Add)] arity = (|n| n == 2), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [linear];
             Sub [SubOp::Elementwise(EwKind::Sub)] arity = (|n| n == 2), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             BiasAdd [SubOp::Elementwise(EwKind::BiasAdd)] arity = (|n| n == 2), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [pointwise];
             ScalarMul [SubOp::ScalarMul { .. }] arity = (|n| n == 1), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [linear];
             SiluMul [SubOp::SiluMul] arity = (|n| n == 2), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [pointwise];
             RmsNorm [SubOp::RmsNorm { .. }] arity = (|n| n == 2), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [rowwise];
             RmsNormReduce [SubOp::RmsNormReduce { .. }] arity = (|n| n == 1), cols = [one],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [rowwise];
             RmsNormApply [SubOp::RmsNormApply { .. }] arity = (|n| n == 3), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [rowwise];
             RopeRotate [SubOp::RopeRotate { .. }] arity = (|n| n == 3), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [heads];
             // E.12: RopeAppend takes [K, cos, sin, V, K_cache, V_cache]
             // — the caches are per-layer PrefixK / PrefixV sources used
             // as TMA-store destinations for the new decode token's K/V.
             RopeAppend [SubOp::RopeAppend { .. }] arity = (|n| n == 6), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [heads];
             // `[K, V, K_cache, V_cache]`: the un-rotated writer.
             KvAppend [SubOp::KvAppend { .. }] arity = (|n| n == 4), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [heads];
             // `[Q, (K_seg, V_seg)...]`, optionally with a trailing
             // `[num_heads]` sinks weight source (gpt-oss attention
             // sinks — a 6th input read as a weight, not a K/V pair).
             AttnDecode [SubOp::AttnDecode { .. }] arity = (|n| (n >= 3 && n % 2 == 1) || n == 6),
-                cols = [q_width geom], rows = [in0], gemm_w = [none];
+                cols = [q_width geom], rows = [in0], gemm_w = [none], tp = [heads];
             TanhSoftCap [SubOp::TanhSoftCap { .. }] arity = (|n| n == 1), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [pointwise];
             RmsNormUnit [SubOp::RmsNormUnit { .. }] arity = (|n| n == 1), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [rowwise];
             ScalarWeightMul [SubOp::ScalarWeightMul] arity = (|n| n == 2), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [linear];
             GateSplit [SubOp::GateSplit { .. }] arity = (|n| n == 1), cols = [field half_cols],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             GateApply [SubOp::GateApply] arity = (|n| n == 2), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             Concat [SubOp::Concat { .. }] arity = (|n| n == 2), cols = [field cols],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             GateScale [SubOp::GateScale] arity = (|n| n == 3), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             // Host-staged: the buffer is delivered by the runtime, not by an operand — so there is
             // no operand to inherit rows from.
             LoadRows [SubOp::LoadRows { .. }] arity = (|n| n == 0), cols = [field width],
-                rows = [m], gemm_w = [none];
+                rows = [m], gemm_w = [none], tp = [whole];
             // The index table is a runtime input, not an operand — hence ONE.
             EmbeddingGather [SubOp::EmbeddingGather { .. }] arity = (|n| n == 1), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             VisionRope [SubOp::VisionRope] arity = (|n| n == 2), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             VarlenAttention [SubOp::VarlenAttention { .. }] arity = (|n| n == 3), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             EncoderAttn [SubOp::EncoderAttn { .. }] arity = (|n| n == 3), cols = [q_width geom],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             GatedDeltaNet [SubOp::GatedDeltaNet] arity = (|n| n == 5), cols = [in1], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             Mamba2 [SubOp::Mamba2 { .. }] arity = (|n| n == 2), cols = [field inner],
-                rows = [in0], gemm_w = [none];
-            Mean [SubOp::Mean] arity = (|n| n == 1), cols = [one], rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
+            Mean [SubOp::Mean] arity = (|n| n == 1), cols = [one], rows = [in0], gemm_w = [none], tp = [rowwise];
+            // Inserted by `tensor_parallel::shard` alone — never stated by a front end.
+            AllReduce [SubOp::AllReduce { .. }] arity = (|n| n == 1), cols = [in0], rows = [in0],
+                gemm_w = [none], tp = [collective];
+            AllGather [SubOp::AllGather { .. }] arity = (|n| n == 1), cols = [field cols],
+                rows = [in0], gemm_w = [none], tp = [collective];
             // The token draw: one `[rows, PAD_V]` logits block, its four
             // per-row `[rows, 1]` seed word tables and per-row temperature
             // reciprocals, plus the twenty staged tables (functions of the
@@ -160,20 +179,20 @@ macro_rules! for_each_subop {
             // equal). ⭐ NO ROW WORD in the key (the P3 localization
             // ruling, 2026-10-27): the seed quadruple is request-owned.
             Sample [SubOp::Sample { .. }] arity = (|n| n == 26), cols = [stick],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             // The chained head's row gather: `[s_stick, l_stick, embed_matrix]` —
             // the s stick's rows out (one per request), `hidden` wide (the op's
             // own field, never a shape read). The matrix is read as DATA already
             // staged as the lm-head's gemm weight; classifying it gemm_w here
             // would double-stage it.
             EmbedRowGather [SubOp::EmbedRowGather { .. }] arity = (|n| n == 3),
-                cols = [field hidden], rows = [in0], gemm_w = [none];
+                cols = [field hidden], rows = [in0], gemm_w = [none], tp = [whole];
             // The pick staged into the persistent chain placements through the
             // decompose tables: the fresh s-value stick out, one u32 stick wide
             // (`[ustick]` — CHAIN_IDX_BLOCK, the SENUINT32 stick), one row per
             // pick row (the write-through is GPU-only, RopeAppend's law).
             ChainStage [SubOp::ChainStage { .. }] arity = (|n| n == 5), cols = [ustick],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             // The ops one construct expands to (a MoE block, a KV codec's steps, sampled rows) —
             // also generating `expansion_ops!()`, the pattern a target without them refuses by.
             @expansion
@@ -181,60 +200,60 @@ macro_rules! for_each_subop {
             // this step's tokens. An un-rotated writer (`kv_append`, Nemotron-H) has no rotary
             // row, so its encode reads the cache alone.
             KvEncode [SubOp::KvEncode { .. }] arity = (|n| (1..=3).contains(&n)), cols = [one],
-                rows = [m], gemm_w = [none];
+                rows = [m], gemm_w = [none], tp = [whole];
             KvStage [SubOp::KvStage { .. }] arity = (|n| n == 1), cols = [one], rows = [m],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             RotateRows [SubOp::RotateRows { .. }] arity = (|n| n == 1), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             // `[q, out, packed_k, packed_v]`, optionally with the attention's
             // trailing `[num_heads]` sinks weight source (gpt-oss attention
             // sinks — the 5th input read as a weight, as the dense form's 6th).
             AttnPackedKv [SubOp::AttnPackedKv] arity = (|n| n == 4 || n == 5), cols = [in1],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             RouterNorm [SubOp::RouterNorm { .. }] arity = (|n| n == 2), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             RouterLogits [SubOp::RouterLogits { .. }] arity = (|n| n == 2), cols = [nz experts],
-                rows = [in0], gemm_w = [in 1];
+                rows = [in0], gemm_w = [in 1], tp = [whole];
             RouteSoftmax [SubOp::RouteSoftmax] arity = (|n| n == 1), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             RouteSigmoidBias [SubOp::RouteSigmoidBias { .. }] arity = (|n| n == 2), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             RouteBias [SubOp::RouteBias { .. }] arity = (|n| n == 2), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             RouteArgsort [SubOp::RouteArgsort] arity = (|n| n == 1), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             RouteTopK [SubOp::RouteTopK { .. }] arity = (|n| n == 1), cols = [nz k], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             RouteGatherScores [SubOp::RouteGatherScores] arity = (|n| n == 2), cols = [in1],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             RouteScale [SubOp::RouteScale { .. }] arity = (|n| n == 1), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             RouteRenorm [SubOp::RouteRenorm] arity = (|n| n == 1), cols = [in0], rows = [in0],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             RouteExpertScale [SubOp::RouteExpertScale { .. }] arity = (|n| n == 3), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             // The MoE pair-row ops: their `[pairs]` cols class lays the rows out `[m, k·w]`, so the
             // registered row count is the token count and the pair structure is the target's to
             // derive. ExpertUnsort restores TOKEN order from pair rows.
             ExpertSort [SubOp::ExpertSort { .. }] arity = (|n| n == 2), cols = [pairs in0 k],
-                rows = [m], gemm_w = [none];
+                rows = [m], gemm_w = [none], tp = [whole];
             ExpertMatmul [SubOp::ExpertMatmul { .. }] arity = (|n| n == 3 || n == 4), cols = [pairs n k],
-                rows = [m], gemm_w = [in 2];
+                rows = [m], gemm_w = [in 2], tp = [whole];
             ExpertGatedAct [SubOp::ExpertGatedAct { .. }] arity = (|n| n == 2), cols = [in0],
-                rows = [m], gemm_w = [none];
+                rows = [m], gemm_w = [none], tp = [whole];
             ExpertAct [SubOp::ExpertAct { .. }] arity = (|n| n == 1), cols = [in0],
-                rows = [m], gemm_w = [none];
+                rows = [m], gemm_w = [none], tp = [whole];
             ExpertUnsort [SubOp::ExpertUnsort] arity = (|n| n == 2), cols = [in0], rows = [m],
-                gemm_w = [none];
+                gemm_w = [none], tp = [whole];
             ExpertCombine [SubOp::ExpertCombine { .. }] arity = (|n| n == 2), cols = [field hidden],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             SampleRowsGather [SubOp::SampleRowsGather] arity = (|n| n == 1), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             SampleRowsScatter [SubOp::SampleRowsScatter] arity = (|n| n == 1), cols = [in0],
-                rows = [in0], gemm_w = [none];
+                rows = [in0], gemm_w = [none], tp = [whole];
             // `[rows, over, weight]`, or `[.., weight, w_scale]` for an fp8 matmul.
             AllRowsMatmul [SubOp::AllRowsMatmul] arity = (|n| n == 3 || n == 4), cols = [in1],
-                rows = [in0], gemm_w = [in 2];
+                rows = [in0], gemm_w = [in 2], tp = [whole];
         }
     };
 }
@@ -343,14 +362,45 @@ macro_rules! __gemm_w_body {
     };
 }
 
+// ── Derived: the sharding rule ──────────────────────────────────────
+// One class per row, naming a `TpRule` variant (see `crate::tensor_parallel`).
+macro_rules! __tp_body {
+    ([contract]) => {
+        $crate::tensor_parallel::TpRule::Contract
+    };
+    ([linear]) => {
+        $crate::tensor_parallel::TpRule::Linear
+    };
+    ([pointwise]) => {
+        $crate::tensor_parallel::TpRule::Pointwise
+    };
+    ([rowwise]) => {
+        $crate::tensor_parallel::TpRule::Rowwise
+    };
+    ([heads]) => {
+        $crate::tensor_parallel::TpRule::Heads
+    };
+    ([view]) => {
+        $crate::tensor_parallel::TpRule::View
+    };
+    ([collective]) => {
+        $crate::tensor_parallel::TpRule::Collective
+    };
+    ([whole]) => {
+        $crate::tensor_parallel::TpRule::Whole
+    };
+}
+
 macro_rules! __derive_registry {
     ($( $kind:ident [$pat:pat] arity = (|$an:ident| $arity:expr), cols = $cols:tt,
-        rows = $rows:tt, gemm_w = $gw:tt; )*
+        rows = $rows:tt, gemm_w = $gw:tt, tp = $tp:tt; )*
      @expansion $( $ek:ident [$ep:pat] arity = (|$ean:ident| $ea:expr), cols = $ec:tt,
-        rows = $erc:tt, gemm_w = $egw:tt; )*) => {
+        rows = $erc:tt, gemm_w = $egw:tt, tp = $etp:tt; )*) => {
         __derive_registry! {
-            $( $kind [$pat] arity = (|$an| $arity), cols = $cols, rows = $rows, gemm_w = $gw; )*
-            $( $ek [$ep] arity = (|$ean| $ea), cols = $ec, rows = $erc, gemm_w = $egw; )*
+            $( $kind [$pat] arity = (|$an| $arity), cols = $cols, rows = $rows, gemm_w = $gw,
+                tp = $tp; )*
+            $( $ek [$ep] arity = (|$ean| $ea), cols = $ec, rows = $erc, gemm_w = $egw,
+                tp = $etp; )*
         }
 
         /// Every op an arch-level construct expands to, as ONE match pattern (use it with
@@ -363,7 +413,7 @@ macro_rules! __derive_registry {
         }
     };
     ($( $kind:ident [$pat:pat] arity = (|$an:ident| $arity:expr), cols = $cols:tt,
-        rows = $rows:tt, gemm_w = $gw:tt; )*) => {
+        rows = $rows:tt, gemm_w = $gw:tt, tp = $tp:tt; )*) => {
         /// An op without its fields: how a declared target table names an op. Derived from the
         /// registry, so no table keeps a parallel list.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -441,6 +491,17 @@ macro_rules! __derive_registry {
                 use $crate::subtile_ir::{EwKind, SubOp};
                 match self {
                     $( $pat => __gemm_w_body!($gw), )*
+                }
+            }
+
+            /// ⭐ THE OP'S SHARDING RULE — what `crate::tensor_parallel::shard` may do with its
+            /// operands' placements. A fact about the OP, never about a model or a weight's
+            /// name: every collective the analysis inserts follows from these rows and the
+            /// dataflow alone.
+            pub fn tp_rule(&self) -> $crate::tensor_parallel::TpRule {
+                use $crate::subtile_ir::{EwKind, SubOp};
+                match self {
+                    $( $pat => __tp_body!($tp), )*
                 }
             }
         }

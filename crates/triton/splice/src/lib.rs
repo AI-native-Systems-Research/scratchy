@@ -285,6 +285,18 @@ pub fn lmlast_row() -> TritonKernelRow {
     }
 }
 
+/// THE BLOCK COPY — an all-gather consume's leg (`blockcopy.py`), placed by
+/// [`lower_block_copy`], which the spyre emitter's collective arm calls; no `SubOp` reaches it
+/// through [`row`].
+pub fn blockcopy_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/blockcopy.py"),
+        file: "blockcopy.py",
+        entry: "blockcopy_fwd",
+        program: Program::BlockCopy,
+    }
+}
+
 /// THE ATTENTION FAMILY — one row, one kernel, every shape: `attn.py`'s own three
 /// constexpr-selected arms (the causal one-pass, decode, prefill continuation) are the
 /// builder's own three arms restated, so the row does not branch on shape at all.
@@ -357,6 +369,14 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::ExpertCombine { .. }
         | SubOp::ExpertMatmul { .. } => TritonKernelRow::Refused(
             "the MoE lowers only from kernels/moe.py through KTIR — no per-op MoE row exists",
+        ),
+        // ⛔ A COLLECTIVE IS NOT ONE KERNEL. It is a control-block sequence in the compute
+        // stream — p2p sends to the peers' receive windows, a write-done wait, then the
+        // consume — and its only kernel (the consume's add) is the `Add` row's. The spyre
+        // emitter's collective arm owns it; no Triton program states a card-to-card transfer.
+        SubOp::AllReduce { .. } | SubOp::AllGather { .. } => TritonKernelRow::Refused(
+            "a collective lowers as a CB sequence by the spyre emitter's collective arm, \
+             never as one spliced kernel",
         ),
         SubOp::TanhSoftCap { .. } => TritonKernelRow::Spliced {
             src: include_str!("../../../targets/spyre/kernels/tanhsoftcap.py"),
@@ -505,9 +525,14 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
         .nodes
         .iter()
         .find(|n| matches!(n.op, SubOp::Sample { .. }));
+    // ⭐ A SPLIT HEAD IS THE TAIL'S PRODUCT TOO. A vocabulary projection split across ranks is one
+    // rank's block (`n` < vocab), and it reaches the draw through the all-gather that restores the
+    // whole vocabulary — the same product, gathered.
     let feeds_the_tail_product = match (&draw, &node.op) {
         (Some(sample), SubOp::MatmulTile { n, .. }) => match &sample.op {
-            SubOp::Sample { vocab, .. } => *n == *vocab,
+            SubOp::Sample { vocab, .. } => {
+                *n == *vocab || gathers_to_width(ir, node.output.tensor, *vocab)
+            }
             _ => false,
         },
         (Some(sample), _) => match &sample.op {
@@ -519,10 +544,65 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
             node.output.region.cols.len == result_cols
         }
     };
+    // A projection's rows are the PROMPT's it folds over: a folded tail that gathers is declared one
+    // row from the projection's output down (`subtile_ir::mint_sample`, so the gather's operand is a
+    // whole one-row tensor), and its projection reads the last row of the `mq`-row prompt
+    // ([`folded_prompt`]). Every other tail op, and every projection of a tail that does not gather,
+    // has the same rows in and out.
+    let rows = match &node.op {
+        SubOp::MatmulTile { .. } => folded_prompt(node, ir)
+            .or_else(|| node.inputs.first().copied())
+            .map_or(0, |a| a.region.rows.len),
+        _ => node.output.region.rows.len,
+    };
     feeds_the_tail_product
-        && node.output.region.rows.len > 1
+        && rows > 1
         && !rows_are_requests
         && tensor_feeds_result_through_row_local_ops(ir, node.output.tensor)
+}
+
+/// The whole prompt a gathered tail's projection folds over. That projection states the row it
+/// computes — its activation region is the LAST row of the `[mq, hidden]` prompt
+/// (`subtile_ir`'s `fold_gathered_tail`), so the host reference computes exactly the fold's
+/// product — and the fold extracts that row from the whole prompt. `None` for every other node,
+/// the one-rank tail among them (its region is already the whole prompt), and the fold's own m=1
+/// matmul, whose activation is the `LAST_HIDDEN` staging beyond the graph.
+fn folded_prompt<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Option<scratchy_subtile::subtile_ir::TensorRegion> {
+    use scratchy_subtile::subtile_ir::{Range, Region, TensorRegion};
+    if !matches!(node.op, SubOp::MatmulTile { .. }) {
+        return None;
+    }
+    let a = node.inputs.first()?;
+    let mq = ir.tensors.get(a.tensor.index())?.rows;
+    (mq > 1 && a.region.rows == Range::new(mq - 1, 1)).then_some(TensorRegion {
+        tensor: a.tensor,
+        region: Region {
+            rows: Range::new(0, mq),
+            cols: a.region.cols,
+        },
+    })
+}
+
+/// Whether `t` reaches an all-gather restoring `width` columns through single-input logit
+/// epilogues — the path a split vocabulary projection takes to the draw.
+fn gathers_to_width<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &SubtileIR<F>,
+    t: scratchy_subtile::subtile_ir::TensorId,
+    width: u32,
+) -> bool {
+    ir.nodes
+        .iter()
+        .filter(|n| n.inputs.iter().any(|i| i.tensor == t))
+        .any(|n| match &n.op {
+            SubOp::AllGather { cols, .. } => *cols == width,
+            SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if n.inputs.len() == 1 => {
+                gathers_to_width(ir, n.output.tensor, width)
+            }
+            _ => false,
+        })
 }
 
 /// EVERY OP THE SPLICE EMITS FOR ONE NODE. Every kind is one op except the prefill
@@ -973,6 +1053,9 @@ pub fn row_local_tail_op<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F
             // stick — no row mixing — so a minted graph's feeds-walk traverses
             // it from the tail to the re-pointed result.
             | SubOp::Sample { .. }
+            // ⭐ AN ALL-GATHER IS ROW-LOCAL: row `r` of its output is row `r` of every rank's
+            // block, side by side — a split vocabulary projection's tail passes through it.
+            | SubOp::AllGather { .. }
     )
 }
 
@@ -1283,7 +1366,7 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 ) -> Result<Vec<EmittedOp>, String> {
     use scratchy_subtile::subtile_ir::Region as SubRegion;
 
-    let a = &node.inputs[0];
+    let a = folded_prompt(node, ir).unwrap_or(node.inputs[0]);
     let (mq, hidden) = (a.region.rows.len, a.region.cols.len);
     let stk = 64u32; // Fp16::ELEMS_PER_STICK — the stick the door's lmlast arm checks
     if hidden % stk != 0 {
@@ -1341,7 +1424,7 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
     let extraction_node = SubtileNode {
         id: node.id,
         op: node.op,
-        inputs: vec![*a],
+        inputs: vec![a],
         output: scratchy_subtile::subtile_ir::TensorRegion {
             tensor: scratchy_subtile::subtile_ir::TensorId::from_index(last_hidden as usize),
             region: SubRegion {
@@ -1394,6 +1477,68 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
     let matmul = lower_one(&at_m1, ir, false)?;
 
     Ok(vec![extract, matmul])
+}
+
+/// THE BLOCK COPY'S PRODUCER — `dst = src` for a whole source (a graph tensor, or the receive
+/// window beyond the graph) and a destination region that is a column window `[0, R) × [off,
+/// off + C_SRC)` of a `dst_cols`-wide tensor: one spliced `blockcopy.py` program named `name`.
+/// `node` is the collective the copy realizes — its id and op key the program like every other.
+pub fn lower_block_copy<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    src: scratchy_subtile::subtile_ir::TensorRegion,
+    dst: scratchy_subtile::subtile_ir::TensorRegion,
+    dst_cols: u32,
+    name: &str,
+) -> Result<EmittedOp, String> {
+    let (rows, c_src) = (src.region.rows.len, src.region.cols.len);
+    let off = dst.region.cols.start;
+    let stk = 64u32; // Fp16::ELEMS_PER_STICK — the stick the door's block copy checks
+    if !c_src.is_multiple_of(stk) || !dst_cols.is_multiple_of(stk) || !off.is_multiple_of(stk) {
+        return Err(format!(
+            "triton splice: {name}: a block of {c_src} columns at column {off} of a {dst_cols}-wide \
+             destination is not a run of whole {stk}-fp16 sticks"
+        ));
+    }
+    let src_py = match blockcopy_row() {
+        TritonKernelRow::Spliced { src, .. } => src,
+        TritonKernelRow::Refused(why) => return Err(why.to_string()),
+    };
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for p in ["desc_src", "desc_dst"] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+        );
+    }
+    for (k, v) in [
+        ("R", rows),
+        ("C_SRC", c_src),
+        ("C_DST", dst_cols),
+        ("COL_OFF", off),
+        ("N_STICKS", rows * (c_src / stk)),
+    ] {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
+    }
+    let spec = KernelSpec {
+        file: "blockcopy.py".to_string(),
+        kernel: "blockcopy_fwd".to_string(),
+        signature,
+        constexprs,
+    };
+    let module = compile_kernel(src_py, &spec, &[1])?;
+    let copy = SubtileNode {
+        id: node.id,
+        op: node.op,
+        inputs: vec![src],
+        output: dst,
+    };
+    let mut k = mint(&copy, module, &Program::BlockCopy, default_bindings(&copy))?;
+    k.func.name = Arena::global().str(name.to_string());
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(e)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -2032,7 +2177,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // stays LOGICAL: its door arm returns early through
             // `matmul_fp8_descriptors(m, k, n)` and is not pad-idempotent.
             let (m_total, _a_total) = matmul_window_of(node, ir)?;
-            let n_dev = ktir_superdsc::work::DeviceWidth::for_matmul(m, *n, k, false).get();
+            let n_dev = matmul_out_width(node, ir, m, *n, k);
             ce("M", Val::Int(i128::from(m)))?;
             ce("K", Val::Int(i128::from(k)))?;
             ce("N", Val::Int(i128::from(n_dev)))?;
@@ -2573,13 +2718,23 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
 ) -> Result<(u32, u32), String> {
+    // A SYNTHETIC BEYOND THE GRAPH (the tensor-parallel receive window, an all-reduce's round sum)
+    // has no storage in the graph: its storage IS its region, from its first byte —
+    // `matmul_window_of`'s law for the LAST_HIDDEN staging. So it joins the node's one storage
+    // window only when that region is exactly the window the others state; anything else is the
+    // disagreement refused below.
+    let total = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
+        ir.tensors
+            .get(tr.tensor.index())
+            .map_or(tr.region.cols.len, |s| s.cols)
+    };
     let out = &node.output;
-    let n_total = ir.tensors[out.tensor.index()].cols;
+    let n_total = total(out);
     let (r, c_start) = (out.region.rows.start, out.region.cols.start);
     // The operands must window the SAME slice of the SAME storage — the builder's
     // own law (`load_region` per operand, one chunk per node).
     for tr in &node.inputs {
-        let in_total = ir.tensors[tr.tensor.index()].cols;
+        let in_total = total(tr);
         if tr.region.rows.start != r || tr.region.cols.start != c_start || in_total != n_total {
             return Err(format!(
                 "triton splice: t{}'s operands disagree about the window (output [{r}, \
@@ -2606,12 +2761,68 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// spells one. The fold's m=1 tail is row 0 of the `[mq, vocab]` logits storage, so
 /// it passes; any other row-windowed matmul is a shape to spell with a kernel, not to
 /// silently mis-address.
+/// ⭐ THE WIDTH A DENSE MATMUL'S PROGRAM STATES FOR ITS OUTPUT — the width its READERS address.
+///
+/// The door's device width (`DeviceWidth::for_matmul`) may pad the output's stick count to fill
+/// the util floor, and the layout reserves the padded width. The program's output view must name
+/// what its readers read, because the program's views are row-major (the emulator runs them as
+/// stated): a reader that states the LOGICAL width over a buffer written at the padded one reads
+/// every row past the first at the wrong stride. So:
+/// - when EVERY reader is a family whose kernel states the logical width — RoPE, the attention,
+///   the norms, the elementwise and gated-activation families, a collective — the output is the
+///   logical width, stick-rounded;
+/// - otherwise the padded width stands: a pad-aware reader (the ScalarMul family, whose window IS
+///   `DeviceWidth::for_pointwise` — the logits scale over the padded lm head) or one this law does
+///   not name (the sampler's widened row) reads the storage the door pads.
+///
+/// The card is unchanged either way: the door re-derives its padded write from the stated width
+/// (`for_matmul` is idempotent at a padded width and pads the logical one alike), and a card
+/// activation is stick-major, so the leading sticks of a padded write are the logical tensor's
+/// bytes. MEASURED (the emulator gates): smollm2's one-rank prefill k/v (`[31, 192]`, 3 sticks)
+/// and granite's two-rank prefill k/v (`[31, 256]`, 4 sticks) were written at 512 and read at
+/// their logical widths — row 0 right, every later row at the wrong stride.
+fn matmul_out_width<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &scratchy_subtile::subtile_ir::SubtileIR<F>,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> u32 {
+    let out = node.output.tensor;
+    let mut readers = ir
+        .nodes
+        .iter()
+        .filter(|r| r.inputs.iter().any(|i| i.tensor == out))
+        .peekable();
+    let logical_readers = readers.peek().is_some()
+        && readers.all(|r| {
+            matches!(
+                r.op,
+                SubOp::RopeRotate { .. }
+                    | SubOp::RopeAppend { .. }
+                    | SubOp::AttnDecode { .. }
+                    | SubOp::RmsNorm { .. }
+                    | SubOp::Elementwise(_)
+                    | SubOp::SiluMul
+                    | SubOp::AllReduce { .. }
+                    | SubOp::AllGather { .. }
+            )
+        });
+    if logical_readers {
+        n.next_multiple_of(ktir_superdsc::work::FP16_ELEMS_PER_STICK)
+    } else {
+        ktir_superdsc::work::DeviceWidth::for_matmul(m, n, k, false).get()
+    }
+}
+
 fn matmul_window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
 ) -> Result<(u32, u32), String> {
     let out = &node.output;
-    let a = &node.inputs[0];
+    // A gathered tail's projection states its last prompt row; its kernel is the fold over the
+    // whole prompt.
+    let a = &folded_prompt(node, ir).unwrap_or(node.inputs[0]);
     let out_total = ir.tensors[out.tensor.index()].rows;
     let a_total = ir.tensors.get(a.tensor.index()).map(|s| s.rows);
     if out.region.rows.start != 0 || a.region.rows.start != 0 {
@@ -3127,6 +3338,7 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::TanhSoftCap => "tanhsoftcap",
         Program::ScalarWeightMul => "scalarwmul",
         Program::Reshape => "reshape",
+        Program::BlockCopy => "blockcopy",
         // ⭐ THE SAMPLER'S OWN STEM — #813's argmax law: a spliced whole-function kernel
         // keeps its own name (`argmax_s{id}`), never the generic `triton`, so a bake log
         // names the draw's descriptors for what they are.

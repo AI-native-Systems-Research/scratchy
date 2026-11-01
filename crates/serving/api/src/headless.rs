@@ -10,23 +10,35 @@
 //!
 //! NCCL collectives in the model forward pass synchronize tensor data
 //! between ranks automatically — no explicit NCCL calls needed here.
+//! On spyre each rank is a process driving one card, and its collectives
+//! are the card's own p2p RDMA control blocks, in the same stream as the
+//! compute — this loop only hands each rank the step to run.
 
-#[cfg(feature = "nccl")]
+#[cfg(any(feature = "nccl", feature = "spyre-hw"))]
 use scratchy_serving_engine::executor::Executor;
-#[cfg(feature = "nccl")]
+#[cfg(any(feature = "nccl", feature = "spyre-hw"))]
 use scratchy_serving_transport::TcpControlChannel;
-#[cfg(feature = "nccl")]
+#[cfg(any(feature = "nccl", feature = "spyre-hw"))]
 use scratchy_serving_worker::multinode::ControlMessage;
-#[cfg(feature = "nccl")]
+#[cfg(any(feature = "nccl", feature = "spyre-hw"))]
 use scratchy_serving_worker::uniproc::UniProcExecutor;
-#[cfg(feature = "nccl")]
-use tracing::{error, info};
+#[cfg(any(feature = "nccl", feature = "spyre-hw"))]
+use tracing::info;
 
 /// Run the headless worker loop. Blocks forever (or until shutdown).
 ///
 /// Loops on TCP control channel: receive `ControlMessage` from rank 0,
 /// dispatch to local executor, discard output, repeat.
-#[cfg(feature = "nccl")]
+///
+/// ⛔ A FAILED MESSAGE STOPS THIS RANK, BY NAME. The leader runs every step this rank runs, and its
+/// collectives wait on this rank's half: a follower that logged a failed step and carried on left
+/// the leader waiting at its first collective for a send that never came. Returning the error
+/// shuts this rank down and closes the control channel, so the leader's next broadcast fails with
+/// an error instead of a stall.
+///
+/// # Errors
+/// The first message this rank fails to carry out, or a channel that fails.
+#[cfg(any(feature = "nccl", feature = "spyre-hw"))]
 pub fn run_headless(
     mut executor: UniProcExecutor,
     mut channel: TcpControlChannel,
@@ -38,7 +50,8 @@ pub fn run_headless(
         match ControlMessage::recv(&mut channel)? {
             ControlMessage::ExecuteModel(scheduler_output) => {
                 if let Err(e) = executor.execute_model(&scheduler_output) {
-                    error!("Headless worker: execute_model failed: {e}");
+                    executor.shutdown();
+                    anyhow::bail!("headless worker: a step failed, so this rank stops — {e}");
                 }
             }
             ControlMessage::InitCache {
@@ -50,13 +63,17 @@ pub fn run_headless(
                     num_gpu_blocks, num_cpu_blocks
                 );
                 if let Err(e) = executor.initialize_cache(num_gpu_blocks, num_cpu_blocks) {
-                    error!("Headless worker: initialize_cache failed: {e}");
+                    executor.shutdown();
+                    anyhow::bail!(
+                        "headless worker: initialize_cache failed, so this rank stops — {e}"
+                    );
                 }
             }
             ControlMessage::Warmup => {
                 info!("Headless worker: warming up model");
                 if let Err(e) = executor.worker_mut().compile_or_warm_up_model() {
-                    error!("Headless worker: warmup failed: {e}");
+                    executor.shutdown();
+                    anyhow::bail!("headless worker: warmup failed, so this rank stops — {e}");
                 }
             }
             ControlMessage::Shutdown => {

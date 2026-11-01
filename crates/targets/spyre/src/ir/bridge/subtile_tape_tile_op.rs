@@ -112,6 +112,11 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
         | SubOp::KvAppend { .. }
         | scratchy_subtile::expansion_ops!()
         | SubOp::Mean => Err(format!("{:?} is not a spyre standard tile op", n.op)),
+        // A collective is a CB sequence (p2p sends, a write-done wait, the consume), not a tile.
+        SubOp::AllReduce { .. } | SubOp::AllGather { .. } => Err(format!(
+            "{} is a collective — a CB sequence, never a standard tile op",
+            n.op.name()
+        )),
         // The token draw is NOT one standard tile either: its body is whole-row
         // reduces over a PAD_V-wide row plus a [1, 64] pointwise tail — a MIXED-WIDTH
         // body the [mb, out_active, y] declaration cannot state (out_active would have

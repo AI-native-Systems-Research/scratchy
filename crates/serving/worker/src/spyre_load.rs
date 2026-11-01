@@ -500,6 +500,66 @@ fn materialize_weight_copies(
     Ok(())
 }
 
+/// ⭐ ONE RANK'S SHARE OF THE CHECKPOINT. The generated loader binds every weight whole; a rank of
+/// a sharded world stages only its slice of each, by the law the analysis derived for that source
+/// ([`scratchy_target_spyre::wiring::TpForward::slice_source_bytes`]). `whole` is the one-rank
+/// wiring, whose shapes are the tensors' as they sit in the checkpoint.
+pub(crate) struct RankCut {
+    pub(crate) forward: &'static scratchy_target_spyre::wiring::TpForward,
+    pub(crate) me: scratchy_target_spyre::bundle_code::collective::TpIdentity,
+    pub(crate) whole: &'static scratchy_target_spyre::wiring::Wiring,
+}
+
+impl RankCut {
+    fn cut(&self, id: u32, bytes: Vec<u8>, elem: usize, is_gemm: bool) -> ExecutorResult<Vec<u8>> {
+        let &whole = self.whole.tensor_shapes.get(id as usize).ok_or_else(|| {
+            werr(format!(
+                "source {id} has no one-rank shape to cut rank {}'s share from",
+                self.me.rank()
+            ))
+        })?;
+        self.forward
+            .slice_source_bytes(self.me, id, bytes, elem, whole, is_gemm)
+            .map_err(|e| werr(format!("rank {}: {e}", self.me.rank())))
+    }
+}
+
+/// The sharded forward `f`, in the shape the card loader reads a model's bundle in: its decode
+/// bundle, and its prefill bundle when the bake made one (else the decode bundle's own fingerprint,
+/// the loader's "no batched prefill"). A sharded world bakes no batch or width ladders, so it
+/// names none. Leaked: the process serves one model for its life.
+#[cfg(feature = "spyre-hw")]
+fn sharded_bundle(
+    one_rank: &'static SengraphBundle,
+    f: &'static scratchy_target_spyre::wiring::TpForward,
+) -> ExecutorResult<&'static SengraphBundle> {
+    use scratchy_target_spyre::manifest::{SengraphBundleData, SengraphBundleGroup};
+    let g0 = one_rank
+        .groups
+        .first()
+        .ok_or_else(|| werr("the one-rank bundle has no layer group"))?;
+    let named = |fp: &str| SengraphBundleData {
+        manifest_json: "",
+        graph_json: Box::leak(format!("{SUPERDSC_SENTINEL}{fp}").into_boxed_str()),
+        g2_fingerprint: "",
+    };
+    let group = SengraphBundleGroup {
+        group: 0,
+        input_tensor: g0.input_tensor,
+        result_tensor: g0.result_tensor,
+        prefill: named(f.prefill.as_ref().map_or(f.decode.fp, |p| p.fp)),
+        decode: named(f.decode.fp),
+        // The world's own ladders, as its bake rendered them — the same shape the one-rank group
+        // carries, so every ladder path below serves a sharded world unchanged.
+        prefill_rungs: f.prefill_rungs,
+        decode_rungs: f.decode_rungs,
+        prefill_prefix: f.prefill_prefix,
+    };
+    Ok(Box::leak(Box::new(SengraphBundle {
+        groups: Box::leak(Box::new([group])),
+    })))
+}
+
 pub(crate) fn stage_bound_weights(
     bound: &[scratchy_forward_compiler::BoundWeight],
     // ⛔ FOR PLACEMENT EXISTENCE ONLY — never for names. The K-split branches
@@ -510,6 +570,8 @@ pub(crate) fn stage_bound_weights(
     // emptied every completion in `22a8f469`. Asked of the GENERATED wiring
     // now, which carries the same per-id extents the manifest did.
     wiring: &scratchy_target_spyre::wiring::Wiring,
+    // A rank of a sharded world stages its share of each tensor; `None` stages it whole.
+    cut: Option<&RankCut>,
     // The allocator that owns the bound tensors' buffers: staging TAKES each buffer
     // (no copy) at its last binding instead of copying it while the original stays alive.
     alloc: &mut SpyreAllocator,
@@ -570,6 +632,10 @@ pub(crate) fn stage_bound_weights(
             }
         };
         let dt = bw.tensor.dtype();
+        let bytes = match cut {
+            Some(c) => c.cut(bw.id, bytes, dt.size_bytes(), is_gemm)?,
+            None => bytes,
+        };
         // The sengraph emits every GEMM `MatMul` with `transpose_b=false`, so the
         // bound `ModelInput` must be the logical `[in, out] = [k, n]` (= on-disk
         // `Wᵀ`). The on-disk safetensors buffer is `[out, in] = [n, k]`, recorded
@@ -778,6 +844,23 @@ impl SpyreWorker {
         // host-side weight load below by kicking it off on a background thread NOW.
         // std::call_once makes prepare's own init block only on the remainder — a pure
         // latency win with no change to the bytes that reach the device.
+        // ⭐ A RANK DRIVES ITS OWN CARD, by the PCI address `--tp-cards` names for its rank, chosen
+        // before that bring-up opens one; each peer is the card named for that peer's rank. A world
+        // of one drives the one card named, or the first available when none is.
+        #[cfg(feature = "spyre-hw")]
+        let cards = self
+            .seat
+            .map(|me| scratchy_target_spyre::runtime::WorldCards::of(me, self.cards.clone()))
+            .transpose()
+            .map_err(|e| werr(e.to_string()))?;
+        #[cfg(feature = "spyre-hw")]
+        if let Some(own) = cards
+            .as_ref()
+            .map(scratchy_target_spyre::runtime::WorldCards::own)
+            .or(self.cards.first())
+        {
+            scratchy_target_spyre::runtime::drive_card(own).map_err(|e| werr(e.to_string()))?;
+        }
         #[cfg(feature = "spyre-hw")]
         SuperDscSession::prewarm_runtime();
 
@@ -919,10 +1002,41 @@ impl SpyreWorker {
         // `stage_bound_weights` reads its `tensor_shapes` on both paths — that is where the staged
         // `[rows, cols]` comes from now that the manifest no longer supplies it. Gating it left the
         // KTIR-only build referencing a binding that did not exist.
-        let wirings: &'static scratchy_target_spyre::wiring::Wirings = model
+        let one_rank: &'static scratchy_target_spyre::wiring::Wirings = model
             .superdsc_wiring()
             .and_then(|w| w.downcast_ref::<scratchy_target_spyre::wiring::Wirings>())
             .ok_or_else(|| werr("the matched model exposes no launch wiring"))?;
+        // ⭐ THE WORLD'S FORWARD. A seated rank runs the forward the bake sharded for its world —
+        // its own bundles, its own wiring, and the slice law each source loads by — or refuses by
+        // name; never the one-rank forward, whose shapes are the whole model's.
+        let sharded: Option<(
+            &'static scratchy_target_spyre::wiring::TpForward,
+            scratchy_target_spyre::bundle_code::collective::TpIdentity,
+        )> = match self.seat {
+            None => None,
+            Some(me) => {
+                let baked = model
+                    .superdsc_tp()
+                    .and_then(|t| {
+                        t.downcast_ref::<&'static [scratchy_target_spyre::wiring::TpForward]>()
+                    })
+                    .copied()
+                    .ok_or_else(|| werr("the matched model exposes no sharded worlds"))?;
+                match scratchy_target_spyre::wiring::forward_for(baked, me)
+                    .map_err(|e| werr(e.to_string()))?
+                {
+                    scratchy_target_spyre::wiring::WorldForward::Sharded(f) => Some((f, me)),
+                    scratchy_target_spyre::wiring::WorldForward::OneRank => None,
+                }
+            }
+        };
+        let wirings: &'static scratchy_target_spyre::wiring::Wirings =
+            sharded.map_or(one_rank, |(f, _)| &f.wirings);
+        #[cfg(feature = "spyre-hw")]
+        let bundle: &'static SengraphBundle = match sharded {
+            Some((f, _)) => sharded_bundle(bundle, f)?,
+            None => bundle,
+        };
         let (dparsed_all, pparsed) = {
             let d = vec![wiring_to_parsed(&wirings.decode)?];
             // A model with no batched-prefill program simply has none; the
@@ -957,7 +1071,13 @@ impl SpyreWorker {
             bound.len(),
             wirings.decode.tensor_shapes.len()
         );
-        let weights = stage_bound_weights(&bound, &wirings.decode, gw.allocator_mut())?;
+        let cut = sharded.map(|(forward, me)| RankCut {
+            forward,
+            me,
+            whole: &one_rank.decode,
+        });
+        let weights =
+            stage_bound_weights(&bound, &wirings.decode, cut.as_ref(), gw.allocator_mut())?;
         tracing::info!(
             "[weights] staged {} weight(s) for the session",
             weights.len()
@@ -1121,6 +1241,36 @@ impl SpyreWorker {
                         scratchy_target_spyre::bundle_code::registered_fps(),
                     ))
                 })?;
+                // ⭐ THE PEER LINK, BEFORE THE FIRST SESSION LOADS. A rank installs its peer's
+                // card in its BAT and points its `XSEG` entries at the slots of the window its
+                // world's bundles bake; every
+                // session below then loads against that one link (`Executor::load` refuses a
+                // bundle whose window is elsewhere, and a sharded one with no link at all).
+                if let (Some((_, me)), Some(cards)) = (sharded, cards) {
+                    let window = scratchy_target_spyre::superdsc_exec::RankSeat::baked_window(code)
+                        .map_err(|e| werr(format!("bundle {fp}: {e}")))?
+                        .ok_or_else(|| {
+                            werr(format!(
+                                "bundle {fp} is the {}-rank world's decode, but bakes no \
+                                     receive window",
+                                me.world().get()
+                            ))
+                        })?;
+                    scratchy_target_spyre::runtime::link_peer(cards.clone(), window)
+                        .map_err(|e| werr(e.to_string()))?;
+                    let peers: Vec<String> = me
+                        .peers()
+                        .map(|p| format!("rank {} on {}", p.rank(), cards.of_rank(p)))
+                        .collect();
+                    info!(
+                        "[spyre-worker] rank {} of {}: linked {} to its peers ({}) over device \
+                         p2p RDMA, window {window:?}",
+                        me.rank(),
+                        me.world().get(),
+                        cards.own(),
+                        peers.join(", "),
+                    );
+                }
                 // ⭐ THE SEGMENT BUDGET's runtime work list, read BEFORE any session is built (the
                 // first of them is constructed below, and `weights` moves into the DECODE session
                 // later on): which weights the emitter spilled out of the weight segment, as byte
@@ -2095,6 +2245,39 @@ impl SpyreWorker {
                 //
                 // ⛔ THE LADDER STILL BUILDS IN PARALLEL. This reorders WHO ALLOCATES FIRST; it does not
                 // serialize startup, and the aliasing after the join is unchanged.
+                let _t_sess = std::time::Instant::now();
+                // The DECODE session is the sole OWNER of the resident weights — it is the only one that
+                // binds and stages them; the batched-prefill session and every ladder rung borrow seg1
+                // from it by alias. So this takes `weights` by MOVE and no copy of that ~2.6 GB host
+                // buffer is ever made.
+                let mut ss = SuperDscSession::new(
+                    code,
+                    vocab,
+                    kv_dim,
+                    num_blocks,
+                    weights,
+                    wirings.decode.load_consts,
+                    &spill_tids,
+                )
+                .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
+                // ⭐ THE PEER'S LANDING SLOTS, POINTED AT THE WINDOW THIS OWNER JUST ALLOCATED. The
+                // window is a placement in the weight segment every other session aliases, and its
+                // device address exists only now; a world of one has no peer and this is a no-op.
+                // Done during load, so before this rank reports ready and before any step sends.
+                ss.point_landing_slots().map_err(|e| {
+                    werr(format!(
+                        "pointing the peer's landing slots at the receive window: {e}"
+                    ))
+                })?;
+                // ⭐ THE LADDER SPAWNS ONLY NOW, AFTER THE OWNER HAS ALLOCATED. Its rungs allocate
+                // their own segments concurrently, so spawned any earlier they race the owner for
+                // the allocator, and where the owner's weight segment lands is whichever request
+                // wins — per process. That cost one rank of a world its window: the receive window
+                // is a placement in this segment, every rank must land it at one address, and
+                // #1009 runs 20/22 measured two ranks placing it 1.8 GB apart. (It is also the
+                // bimodal decode above: the owner allocating first is what puts seg1 in the fast
+                // region every run.) The rungs alias seg1 from the owner after the join, so they
+                // never needed to start sooner.
                 let ladder_join = {
                     // The prefill wiring's staged constants, staged by every rung through its own
                     // seg3 (the general mint's nine tables — see the anchor's own `prefill_consts`).
@@ -2152,21 +2335,6 @@ impl SpyreWorker {
                     })
                 };
 
-                let _t_sess = std::time::Instant::now();
-                // The DECODE session is the sole OWNER of the resident weights — it is the only one that
-                // binds and stages them; the batched-prefill session and every ladder rung borrow seg1
-                // from it by alias. So this takes `weights` by MOVE and no copy of that ~2.6 GB host
-                // buffer is ever made.
-                let mut ss = SuperDscSession::new(
-                    code,
-                    vocab,
-                    kv_dim,
-                    num_blocks,
-                    weights,
-                    wirings.decode.load_consts,
-                    &spill_tids,
-                )
-                .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
                 // ⭐ THE SPILLED WEIGHT TAIL'S DEVICE IMAGE, read back from the OWNER once its
                 // prepare has staged and uploaded it. Every borrowing session gets a copy of this
                 // (see `adopt_from_owner`) because the slot it lives in cannot be aliased. Empty —

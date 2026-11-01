@@ -756,6 +756,16 @@ impl DmaSection {
     pub const fn to_words(self) -> [u64; 2] {
         self.words
     }
+
+    /// A DMA section from the #1008 doors' FINISHED WORDS, verbatim — the
+    /// wire doors (`hal_sbf::rdma12_unicast_send` / `rdma10_wdone_wait`)
+    /// return exactly the two words `set_dmo`/`set_dmi` would copy into a
+    /// control block, so the P2P CB builders place them without re-encoding
+    /// a single field. The words are trusted as-is: every field bound and
+    /// law checked at the door, never here.
+    pub const fn from_words(words: [u64; 2]) -> Self {
+        Self { words }
+    }
 }
 
 /// Byte offsets of the 6 CB sections within the 128-byte control block, per
@@ -1071,6 +1081,63 @@ impl ControlBlockWire {
         ))
     }
 
+    /// Port of `PfRuntimeScheduler::submitP2PRdmaSend`'s per-chunk CB
+    /// (pf_runtime_scheduler.cpp:289-447, the unicast loop): the DMO slot
+    /// carries the Rdma12 RDMA_SINGLECAST section's FINISHED WORDS from the
+    /// #1008 door — never re-encoded here — and the XLAT entry is the source
+    /// segment's own translation, the loop's per-CB
+    /// `translations()[seg_id].SetPaddrBytes(paddr)` stamp over the
+    /// single-entry `SegmentTable` the vendor builds at
+    /// `xlat_length = seg_offset + dmva_size` (the WHOLE transfer's extent,
+    /// one entry shared by every chunk CB, exactly as the vendor's one
+    /// `SegmentTable::createSingleEntry` is).
+    ///
+    /// The vendor's loop sets `SetXsegv(true)` (the T-send preamble); the
+    /// recorded transport laws override that — L3's F-send law, encoded at
+    /// the door, which refuses `xsegv` — so the words arriving here are
+    /// already the F-send shape and the receiver host-programs its XSEG
+    /// table instead.
+    ///
+    /// # Errors
+    /// Returns `Err` if `xlat_length` exceeds the hardware's max XLAT
+    /// translation size (same `EncodeLength` port as `fill`).
+    pub fn p2p_rdma_send(
+        tag: ResponseTag,
+        dmo_words: [u64; 2],
+        src_segment: u32,
+        region_paddr: DevicePhysicalAddress,
+        xlat_length: SegmentExtent,
+    ) -> Result<Self, XlatLengthTooLarge> {
+        let mut xlat = [XlatEntry::invalid(); 8];
+        xlat[src_segment as usize] =
+            XlatEntry::for_segment_extent(region_paddr, xlat_length, XlatAccessMode::ReadWrite)?;
+        Ok(Self::assemble(
+            CtrlSection::new(tag, false),
+            R5Section::none(),
+            DmaSection::skip(),
+            DmaSection::from_words(dmo_words),
+            ComputeSection::skip(),
+            xlat,
+        ))
+    }
+
+    /// Port of `PfRuntimeScheduler::submitP2PRdmaWait`'s single CB
+    /// (pf_runtime_scheduler.cpp:449-493): the DMI slot carries the Rdma10
+    /// RDMA_WDONE_BARRIER section's finished words from the #1008 door, over
+    /// an EMPTY segment table — "wdone barrier doesn't need segment
+    /// translations" — so every XLAT entry stays invalid. No error path: no
+    /// XLAT length is encoded.
+    pub fn p2p_rdma_wait(tag: ResponseTag, dmi_words: [u64; 2]) -> Self {
+        Self::assemble(
+            CtrlSection::new(tag, false),
+            R5Section::none(),
+            DmaSection::from_words(dmi_words),
+            DmaSection::skip(),
+            ComputeSection::skip(),
+            [XlatEntry::invalid(); 8],
+        )
+    }
+
     /// Port of `ControlBlockStream::CreateNullCb`
     /// (`flex/src/control_blocks/control_block_stream.cpp:375-388`, declared
     /// at `control_block_stream.hpp:252-257`, pod C++ @65ad807bb): a control
@@ -1251,6 +1318,21 @@ impl ControlBlockWire {
         let mut word = [0u8; 8];
         word.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
         BitField::<32, 32>::unpack(u64::from_le_bytes(word)) != 0
+    }
+
+    /// The same CB with its CTRL barrier bit SET — `CtrlSectionSBF::SetBarrier` applied to a built
+    /// CB, the way the vendor's `Optimize` (`FLEX_FORCE_CB_BARRIER`) applies it to every CB of a
+    /// stream. A CB in one stream with the compute that feeds it takes it — a send behind the
+    /// compute that writes its operand, a consume behind the wait that admits its window — so it
+    /// cannot start before everything ahead of it retires. Everything else in word 0 — the tag,
+    /// the cancel byte, the EDEP field — is kept.
+    #[must_use]
+    pub fn with_ctrl_barrier(mut self) -> Self {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&self.bytes[CTRL_SECTION..CTRL_SECTION + 8]);
+        let word = u64::from_le_bytes(w) | BitField::<32, 32>::pack(1);
+        self.bytes[CTRL_SECTION..CTRL_SECTION + 8].copy_from_slice(&word.to_le_bytes());
+        self
     }
 }
 
@@ -2714,5 +2796,25 @@ mod tests {
         bytes[APP_SECTION + 1] = 0xAB;
         let qgi = ResponseBlockWire::from_bytes(&bytes).app_qgi().unwrap();
         assert_eq!(qgi.job_count(), 0xABCD);
+    }
+
+    #[test]
+    fn a_barrier_set_after_the_build_touches_only_its_bit() {
+        let mut plain = ControlBlockWire::null(ResponseTag(0x5A5A), false);
+        plain.set_edep(1);
+        let fenced = plain.with_ctrl_barrier();
+        assert!(!plain.ctrl_barrier());
+        assert!(fenced.ctrl_barrier());
+        assert_eq!(fenced.edep(), 1);
+        let mut expect = plain;
+        let bit = BitField::<32, 32>::pack(1).to_le_bytes();
+        for (b, m) in expect.bytes_mut()[CTRL_SECTION..CTRL_SECTION + 8]
+            .iter_mut()
+            .zip(bit)
+        {
+            *b |= m;
+        }
+        assert_eq!(fenced, expect);
+        assert_eq!(fenced, fenced.with_ctrl_barrier());
     }
 }

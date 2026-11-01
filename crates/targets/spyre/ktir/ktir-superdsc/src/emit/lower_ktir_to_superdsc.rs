@@ -58,7 +58,7 @@ use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{
     DataFormat, Df, Fp16, Fp32, ItDim, SdscFoldSet, SenUint32, StickExtent,
 };
-use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
+use crate::work::{DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
 use ktir_core::affine::AffineExpr;
 use ktir_core::attrkey::AttrKey;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
@@ -5576,6 +5576,83 @@ pub fn lmlast(
         .collect())
 }
 
+/// A BLOCK COPY — `dst[:, off .. off + C_SRC] = src` for a whole `[R, C_SRC]` source and an
+/// `[R, C_DST]` destination: an all-gather consume's leg, placing one rank's block at its columns.
+///
+/// ⭐ ONE OP, AND WHY ONE IS RIGHT HERE WHEN [`lmlast`] NEEDS `hidden/64`. Stick-major, a run of
+/// whole stick columns is contiguous at BOTH ends: the source's `C_SRC/64` stick columns are its
+/// whole buffer, and the destination's stick columns `off/64 ..` start at `rc_of(R, C_DST, 0, off)`
+/// = `(off/64)·R·64` and run on unbroken. Read as the tall-narrow `[(C_SRC/64)·R, 64]` tensor both
+/// runs physically are, the copy is ONE identity over a row range — the one coordInfo form fp16
+/// represents. `lmlast` extracts one ROW of many, whose sticks are strided by `mq`, which is what
+/// costs it one op per stick.
+pub fn block_copy(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let outs: Vec<Region> = r.iter().copied().filter(|x| x.is_out).collect();
+    let [out] = outs[..] else {
+        return err(format!(
+            "{name}: {} parameter(s) written by a `ktdp.store` — a block copy writes exactly one",
+            outs.len()
+        ));
+    };
+    let ins: Vec<Region> = r.iter().copied().filter(|x| !x.is_out).collect();
+    let [src] = ins[..] else {
+        return err(format!(
+            "{name}: {} tensor input(s) — a block copy reads exactly one",
+            ins.len()
+        ));
+    };
+    let stk = Fp16::ELEMS_PER_STICK;
+    let (rows, c_src) = (src.v_rows, src.v_cols);
+    let (c_dst, off) = (out.v_cols, out.c_start);
+    // The source is read WHOLE from its corner, the destination at row 0 and a stick-aligned column:
+    // anything else is not a run of whole stick columns at either end, and no single row range of a
+    // tall-narrow view names it.
+    if src.r_start != 0 || src.c_start != 0 || out.r_start != 0 {
+        return err(format!(
+            "{name}: reads t{} from [{}, {}] and writes t{} from row {} — a block copy moves a WHOLE \
+             source into a column block of the destination",
+            src.tid, src.r_start, src.c_start, out.tid, out.r_start
+        ));
+    }
+    if out.v_rows != rows {
+        return err(format!(
+            "{name}: copies {rows} rows into a {}-row destination — a column block spans every row",
+            out.v_rows
+        ));
+    }
+    if !c_src.is_multiple_of(stk) || !c_dst.is_multiple_of(stk) || !off.is_multiple_of(stk) {
+        return err(format!(
+            "{name}: source width {c_src}, destination width {c_dst} and column {off} must all be \
+             whole {stk}-fp16 sticks — a partial stick column is not a contiguous run"
+        ));
+    }
+    if off + c_src > c_dst {
+        return err(format!(
+            "{name}: the block [{off}, {}) runs past the destination's {c_dst} columns",
+            off + c_src
+        ));
+    }
+    let sticks = c_src / stk;
+    let src_name = rb(&src.name(), rows, c_src);
+    let dst = rb(&out.name(), rows, c_dst);
+    Ok(vec![assemble_pointwise_broadcast_off(
+        name,
+        "identity",
+        crate::sdsc_abstract::RowCount::of_stick_column_rows(sticks, rows),
+        crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+        &[In::sliced(&src_name, crate::addr::rc_of(rows, c_src, 0, 0, Df::Fp16)).ew()],
+        &dst,
+        crate::addr::rc_of(rows, c_dst, 0, off, Df::Fp16),
+        sym_id_base,
+        layout,
+    )])
+}
+
 /// main's `lower_matmul_node` (main 7752-8362).
 ///
 /// Its door: `m`/`k`/`n` came from a `TileOp` built off the node and now come from the program's own
@@ -5842,31 +5919,49 @@ pub fn matmul_oriented(
     let n_dev =
         DeviceWidth::for_matmul(m, n, k, matches!(proof.origin, OperandOrigin::Windowed)).get();
     let macs = m as u64 * n_dev as u64 * k as u64;
-    // ── GUARD #11 (util floor) computed on the PROVEN partition `CoreSplit::plan` (Kani: disjoint +
-    //    covering, #50-free) — the SAME split the emit uses (`matmul_split_map` defers to CoreSplit for
-    //    batch=1). A FLOP-heavy matmul left on <8 cores is the 1.45× sengraph regression this emitter
-    //    exists to fix; the padding above is what fills them for a prime-stick output. ──
-    let sp = CoreSplit::plan(m, n_dev);
-    let cores = sp.ncores();
+    // ── GUARD #11 (util floor) computed on the split this matmul is EMITTED with — the splitter its
+    //    opspec takes (`matmul_split_map`: torch-spyre's cost model for a prompt's rows, the one-row
+    //    fill for one) over the same `[m, n_dev, k]`. A FLOP-heavy matmul left on <8 cores is the
+    //    1.45× sengraph regression this emitter exists to fix; the padding above is what fills them
+    //    for a prime-stick output.
+    //
+    //    ⛔ NOT `CoreSplit::plan`, which this guard read when the emitter split by it. The emitter now
+    //    splits a prompt's rows by the cost model, contraction included, so the two disagree exactly
+    //    where the guard matters: granite-8b's eight-rank MLP shard (`35×1600×4096`, 25 output sticks)
+    //    is 7 cores by `CoreSplit` (rows first, 35 = 5·7) and fills the card by the split it ships. ──
+    // `n_dev` is whole sticks by construction and `k` was checked above, so both extents mint.
+    let (Ok(n_ext), Ok(k_ext)) = (StickExtent::<Fp16>::new(n_dev), StickExtent::<Fp16>::new(k))
+    else {
+        return err(format!(
+            "MatmulTile t{}: [{n_dev}, {k}] is not whole fp16 sticks",
+            out.tid
+        ));
+    };
+    use crate::ir::bridge::tiled_op_sdsc_op::matmul::dims::{matmul_dims, matmul_split_map};
+    let split = matmul_split_map(
+        &matmul_dims::<Fp16>(m, &n_ext, &k_ext, 1),
+        crate::superdsc_opspec::MAX_CORES,
+    );
+    let cores: u32 = split.values().product();
     if macs >= (1 << 20) && cores < UTIL_FLOOR_CORES {
         return err(format!(
-            "MatmulTile t{}: {m}×{n_dev}×{k} ({macs} MACs) CoreSplit-divided onto only {cores} \
-             core(s) — below the util floor; the OUTPUT stick count is not splittable to ≥8 even \
-             after padding.",
+            "MatmulTile t{}: {m}×{n_dev}×{k} ({macs} MACs) is split {split:?}, onto only {cores} \
+             core(s) — below the util floor even after padding the output's sticks.",
             out.tid
         ));
     }
     // ── GUARD (priority-1, from OBSERVED on-card crash 2026-06-25): the per-core STICK extent (N on
     //    OUTPUT/KERNEL) MUST stay a whole 64-fp16 stick — a sub-stick split DtException's the dxp
-    //    scheduler (L3DlOpsScheduler.cpp:1040). `CoreSplit` splits `out` by STICK COUNT (whole sticks by
-    //    construction) and never splits K, so this holds; kept as a build-time seal. ──
-    if !(n_dev / sp.stick_cores).is_multiple_of(FP16_ELEMS_PER_STICK) {
+    //    scheduler (L3DlOpsScheduler.cpp:1040). The splitter cuts `out` by STICK COUNT (whole sticks
+    //    by construction); kept as a build-time seal on the split it chose. ──
+    use crate::ir::bridge::tiled_op_sdsc_op::matmul::walk::{OutAxis, WalkAxis};
+    let stick_cores = split.get(OutAxis::NAME).copied().unwrap_or(1);
+    if !(n_dev / stick_cores).is_multiple_of(FP16_ELEMS_PER_STICK) {
         return err(format!(
-            "MatmulTile t{}: CoreSplit stick_cores={} leaves a SUB-STICK per-core N extent \
-             (N/core={}) — must be a multiple of {FP16_ELEMS_PER_STICK}.",
+            "MatmulTile t{}: the split's out cores ({stick_cores}) leave a SUB-STICK per-core N \
+             extent (N/core={}) — must be a multiple of {FP16_ELEMS_PER_STICK}.",
             out.tid,
-            sp.stick_cores,
-            n_dev / sp.stick_cores
+            n_dev / stick_cores
         ));
     }
     let op_name = format!("matmul_o{}", out.tid);

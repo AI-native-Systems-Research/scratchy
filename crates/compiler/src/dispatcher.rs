@@ -175,6 +175,13 @@ pub trait ScratchyWeights: Send + Sync {
         None
     }
 
+    /// The per-model SHARDED WORLDS — one forward per tensor-parallel world the bake sharded
+    /// this model for, beside the one-rank wiring [`Self::superdsc_wiring`] carries. Neutral
+    /// `&dyn Any` for the same reason: this cfg-free trait cannot name a target crate's type.
+    fn superdsc_tp(&self) -> Option<&'static (dyn core::any::Any + Send + Sync)> {
+        None
+    }
+
     /// The embedding table, for the host-side token gather.
     ///
     /// ⛔ IT CANNOT BE RE-READ BY NAME AFTER LOADING. The generated

@@ -598,6 +598,7 @@ pub(crate) fn run_prefill_batch(
             (Some(_), scratchy_subtile::sdsc_abstract::SeedSource::Host(_)) => Some(&tokens[..]),
             _ => None,
         },
+        seat: pf.tp_identity(),
         positions: &positions,
         causal,
         prefix: prefix_src,
@@ -2629,9 +2630,12 @@ pub(crate) fn forward_chunk(
                 let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
                 let l_sticks = scratchy_subtile::subtile_ir::chain_l_sticks(chain.hidden) as usize;
                 let toks32: Vec<u32> = toks.iter().map(|&t| t as u32).collect();
-                let s_words = scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks32, rows);
+                // The emulator plays a world of one: rank 0's block, the whole table.
+                let block = scratchy_target_spyre::wiring::chain_block(chain.block, None);
+                let s_words =
+                    scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks32, rows, block);
                 let l_words =
-                    scratchy_subtile::subtile_ir::chain_l_seed(&toks32, chain.hidden, rows);
+                    scratchy_subtile::subtile_ir::chain_l_seed(&toks32, chain.hidden, rows, block);
                 dynamic.push((
                     chain.s_src as u64,
                     s_words.iter().map(|w| f32::from_bits(*w)).collect(),
@@ -3169,16 +3173,12 @@ mod pad_clamp_tests {
         let draws: Vec<Option<&SampledDraw>> = owned.iter().map(Some).collect();
         let laws = batch_seat_laws(&draws, &live, 4).expect("the full laws lay");
         assert_eq!(laws.len(), 4);
-        for s in 0..4 {
-            let law = laws[s].draw.unwrap_or_else(|| {
+        for (s, seat) in laws.iter().enumerate() {
+            let law = seat.draw.unwrap_or_else(|| {
                 panic!("row {s} of a FULL rung staged greedy — no row is a pad")
             });
             assert_eq!(law.seed, 1000 + s as u64, "row {s} runs its OWN draw");
-            assert_eq!(
-                laws[s].step,
-                10 + s as u32,
-                "row {s} keeps its own step salt"
-            );
+            assert_eq!(seat.step, 10 + s as u32, "row {s} keeps its own step salt");
         }
     }
 
@@ -3247,6 +3247,7 @@ mod pad_clamp_tests {
             k: 3,
             hidden: 2048,
             replaces: 7,
+            block: 65536,
         };
         let shape = ForwardShape {
             rows: 1,

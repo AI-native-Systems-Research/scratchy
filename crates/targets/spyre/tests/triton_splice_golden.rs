@@ -556,12 +556,215 @@ fn spliced_dense_matmul_executes_the_real_program() {
 /// One spliced dense matmul through the production session entry, checked against a
 /// host reference over the SAME on-disk `[n, k]` weight bytes the worker binds.
 fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
+    let group = spliced_matmul_group(m, k, n);
+
+    // The host data, bound EXACTLY as the worker binds it (`spyre_load.rs`'s
+    // non-hw arm): A `[m, k]` and the GEMM weight VERBATIM in its on-disk `[n, k]`
+    // orientation — the same bytes the historical builder's transpose-B maps read. The f32
+    // reference is over that same buffer: `W[ni, ki]` at `ni * k + ki`.
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 13) as f32) * 0.01 - 0.06)
+        .collect();
+    let w: Vec<f32> = (0..k * n)
+        .map(|i| ((i % 17) as f32) * 0.02 - 0.16)
+        .collect();
+    let want = host_matmul(&a, &w, m, k, n);
+
+    let mut session =
+        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
+            .expect("build the one-program session");
+    let out = session
+        .run_step(
+            0,
+            vec![
+                (0, a, vec![m as usize, k as usize]),
+                (1, w, vec![n as usize, k as usize]),
+            ],
+            &[(2, 0)],
+        )
+        .expect("run the spliced matmul program");
+    let max_abs = max_abs_err(&out[&2], &want);
+    assert!(
+        max_abs < 0.05,
+        "the REAL spliced matmul program diverged from the host reference: max abs err {max_abs}"
+    );
+}
+
+/// ⭐ TWO SESSIONS ON ONE THREAD READ THEIR OWN RESIDENT WEIGHTS. The emulator's GPU weight cache
+/// is per THREAD and keyed by a weight's HBM address, and a resident pass trusts the key without
+/// sampling content; two sessions over the same program lay the same weight tid out at the same
+/// address. The two ranks of the two-rank gate are exactly that — and before the cache was
+/// claimed per executor, the second session's prefill GEMM (m > 1 always offloads) ran on the
+/// FIRST session's weight. Alternating A, B, A, each against its own reference, pins it.
+#[test]
+#[cfg(feature = "spyre-emu")]
+fn two_sessions_on_one_thread_read_their_own_resident_weights() {
+    let (m, k, n) = (31u32, 2048u32, 512u32);
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 13) as f32) * 0.01 - 0.06)
+        .collect();
+    // B's weight is A's negated, so a session served the other's weight is off by twice its product.
+    let weights = |sign: f32| -> Vec<f32> {
+        (0..(k * n) as usize)
+            .map(|i| sign * (((i % 17) as f32) * 0.02 - 0.16))
+            .collect()
+    };
+    let session = |w: &[f32]| {
+        let bytes: Vec<u8> = w
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect();
+        scratchy_target_spyre::runner::SpyreSession::new_multi(
+            &[(&[spliced_matmul_group(m, k, n)], &[2u64])],
+            vec![(
+                1,
+                bytes,
+                scratchy_tensors::DType::F16,
+                vec![n as usize, k as usize],
+            )],
+        )
+        .expect("build a one-program session over its own resident weight")
+    };
+    let (wa, wb) = (weights(1.0), weights(-1.0));
+    let (want_a, want_b) = (host_matmul(&a, &wa, m, k, n), host_matmul(&a, &wb, m, k, n));
+    // L1 error relative to the reference: ~1e-3 for the right weight (f16 operands), 2 for the other.
+    let rel = |got: &[f32], want: &[f32]| -> f32 {
+        let d: f32 = got.iter().zip(want).map(|(g, w)| (g - w).abs()).sum();
+        d / want.iter().map(|w| w.abs()).sum::<f32>()
+    };
+    assert!(
+        rel(&want_a, &want_b) > 1.0,
+        "the two weights must give far-apart products, or the test cannot tell them apart"
+    );
+    let mut sessions = [session(&wa), session(&wb)];
+    for (who, s, want) in [
+        ("A", 0, &want_a),
+        ("B", 1, &want_b),
+        ("A again", 0, &want_a),
+    ] {
+        let out = sessions[s]
+            .run_step(
+                0,
+                vec![(0, a.clone(), vec![m as usize, k as usize])],
+                &[(2, 0)],
+            )
+            .expect("run the spliced matmul program");
+        let err = rel(&out[&2], want);
+        assert!(
+            err < 0.02,
+            "session {who} read another session's weight: rel err {err} against its own"
+        );
+    }
+}
+
+/// ⭐ A NARROW PREFILL MATMUL WRITES THE WIDTH ITS READERS READ. `[31, 2048] · [2048, 256]` crosses
+/// the util floor's MAC threshold, and `DeviceWidth::for_matmul` pads its 4 output sticks to 8; a
+/// program that STATES that padded width writes every row at a 512 stride, while an elementwise
+/// reader of the same tensor states the logical 256 — row 0 right, every later row read from the
+/// wrong place (measured: smollm2's one-rank and granite's two-rank prefill k/v). The splice states
+/// the logical width when every reader does, so the output reads back row-major at 256.
+#[test]
+#[cfg(feature = "spyre-emu")]
+fn a_narrow_prefill_matmul_writes_the_width_its_readers_read() {
+    let (m, k, n) = (31u32, 2048u32, 256u32);
+    assert!(
+        ktir_superdsc::work::DeviceWidth::for_matmul(m, n, k, false).get() > n,
+        "the shape must be one the door pads, or the test proves nothing"
+    );
+    // The matmul (t0 · t1 → t2) and an elementwise reader of its output (t2 + t3 → t4).
+    let mut ir = matmul_ir(m, k, n);
+    ir.tensors.push(TensorShape { rows: m, cols: n });
+    ir.tensors.push(TensorShape { rows: m, cols: n });
+    let whole = |t: usize, s: &[TensorShape]| TensorRegion {
+        tensor: TensorId::from_index(t),
+        region: s[t].whole(),
+    };
+    let reader = SubtileNode {
+        id: scratchy_subtile::subtile_ir::SubtileId::from_index(1),
+        op: SubOp::Elementwise(EwKind::Add),
+        inputs: vec![whole(2, &ir.tensors), whole(3, &ir.tensors)],
+        output: whole(4, &ir.tensors),
+    };
+    ir.nodes.push(reader);
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 13) as f32) * 0.01 - 0.06)
+        .collect();
+    let w: Vec<f32> = (0..k * n)
+        .map(|i| ((i % 17) as f32) * 0.02 - 0.16)
+        .collect();
+    let want = host_matmul(&a, &w, m, k, n);
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&[spliced_node_group(&ir, 0)], &[2u64])],
+        Vec::new(),
+    )
+    .expect("build the one-program session");
+    let out = session
+        .run_step(
+            0,
+            vec![
+                (0, a, vec![m as usize, k as usize]),
+                (1, w, vec![n as usize, k as usize]),
+            ],
+            &[(2, 0)],
+        )
+        .expect("run the spliced matmul program");
+    let got = &out[&2];
+    assert_eq!(got.len(), (m * n) as usize);
+    let row_err = |r: usize| {
+        let at = r * n as usize..(r + 1) * n as usize;
+        max_abs_err(&got[at.clone()], &want[at])
+    };
+    for r in [0, 1, (m - 1) as usize] {
+        assert!(
+            row_err(r) < 0.05,
+            "row {r} of the narrow prefill matmul reads back wrong: max abs err {}",
+            row_err(r)
+        );
+    }
+}
+
+/// `A[m, k] · W[n, k]ᵀ` on the host, over the on-disk `[n, k]` weight.
+fn host_matmul(a: &[f32], w: &[f32], m: u32, k: u32, n: u32) -> Vec<f32> {
+    let mut want = vec![0.0f32; (m * n) as usize];
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0.0f32;
+            for ki in 0..k {
+                acc += a[(mi * k + ki) as usize] * w[(ni * k + ki) as usize];
+            }
+            want[(mi * n + ni) as usize] = acc;
+        }
+    }
+    want
+}
+
+fn max_abs_err(got: &[f32], want: &[f32]) -> f32 {
+    assert_eq!(got.len(), want.len());
+    got.iter()
+        .zip(want)
+        .map(|(g, w)| (g - w).abs())
+        .fold(0.0f32, f32::max)
+}
+
+/// The one spliced dense matmul's launch group — the tape's own numbering (A t0, W t1, O t2).
+fn spliced_matmul_group(
+    m: u32,
+    k: u32,
+    n: u32,
+) -> scratchy_target_spyre::bundle_code::LaunchGroup<'static> {
+    spliced_node_group(&matmul_ir(m, k, n), 0)
+}
+
+/// Node `at` of `ir`, spliced, as a one-program launch group bound by the tape's own numbering.
+fn spliced_node_group(
+    ir: &SubtileIR,
+    at: usize,
+) -> scratchy_target_spyre::bundle_code::LaunchGroup<'static> {
     use std::borrow::Cow;
 
-    let ir = matmul_ir(m, k, n);
-    let node = &ir.nodes[0];
-    let spliced = scratchy_triton_splice::lower(node, &ir, true)
-        .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
+    let node = &ir.nodes[at];
+    let spliced = scratchy_triton_splice::lower(node, ir, true)
+        .unwrap_or_else(|e| panic!("splice compiled node {at}: {e}"));
     let k_node = spliced
         .ktir
         .as_ref()
@@ -583,7 +786,7 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
             )
         })
         .collect();
-    let group = scratchy_target_spyre::bundle_code::LaunchGroup {
+    scratchy_target_spyre::bundle_code::LaunchGroup {
         kv: Default::default(),
         programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
             func: k_node.func,
@@ -597,52 +800,7 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
         init_binary: Cow::Borrowed(&[]),
         job_bin_ptr: 0,
         correction: Cow::Borrowed(&[]),
-    };
-
-    // The host data, bound EXACTLY as the worker binds it (`spyre_load.rs`'s
-    // non-hw arm): A `[m, k]` and the GEMM weight VERBATIM in its on-disk `[n, k]`
-    // orientation — the same bytes the historical builder's transpose-B maps read. The f32
-    // reference is over that same buffer: `W[ni, ki]` at `ni * k + ki`.
-    let a: Vec<f32> = (0..m * k)
-        .map(|i| ((i % 13) as f32) * 0.01 - 0.06)
-        .collect();
-    let w: Vec<f32> = (0..k * n)
-        .map(|i| ((i % 17) as f32) * 0.02 - 0.16)
-        .collect();
-    let mut want = vec![0.0f32; (m * n) as usize];
-    for mi in 0..m {
-        for ni in 0..n {
-            let mut acc = 0.0f32;
-            for ki in 0..k {
-                acc += a[(mi * k + ki) as usize] * w[(ni * k + ki) as usize];
-            }
-            want[(mi * n + ni) as usize] = acc;
-        }
     }
-
-    let mut session =
-        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
-            .expect("build the one-program session");
-    let out = session
-        .run_step(
-            0,
-            vec![
-                (0, a, vec![m as usize, k as usize]),
-                (1, w, vec![n as usize, k as usize]),
-            ],
-            &[(2, 0)],
-        )
-        .expect("run the spliced matmul program");
-    let got = &out[&2];
-    assert_eq!(got.len(), (m * n) as usize);
-    let mut max_abs = 0.0f32;
-    for (g, wnt) in got.iter().zip(&want) {
-        max_abs = max_abs.max((g - wnt).abs());
-    }
-    assert!(
-        max_abs < 0.05,
-        "the REAL spliced matmul program diverged from the host reference: max abs err {max_abs}"
-    );
 }
 
 /// The elementwise rows' EXECUTION gate — same calibration as the matmul one above: the
@@ -1868,6 +2026,51 @@ const ATTN_SHAPES: &[AttnShape] = &[
         mq: 96,
         cap: 256,
         rung: 0,
+        rope_appended: true,
+    },
+    // granite-2b's RANK geometries, as tensor parallelism shards its heads (16/4 at two ranks, 8/2
+    // at four): the same GQA group of 4 heads of 64, fewer groups per card. Decode over the whole
+    // one-page cache, and the one-pass prefill chunk.
+    AttnShape {
+        geom: (16, 4, 64),
+        mq: 1,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (16, 4, 64),
+        mq: 31,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (8, 2, 64),
+        mq: 1,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (8, 2, 64),
+        mq: 31,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 64),
+        mq: 1,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 64),
+        mq: 32,
+        cap: 256,
+        rung: u32::MAX,
         rope_appended: true,
     },
 ];

@@ -127,11 +127,22 @@ pub struct SpyreWorker {
     /// fraction to take. cuda and metal both size from `total_memory * utilization`, so the flag meant
     /// something on two backends out of three.
     pub(crate) gpu_memory_utilization: f64,
+    /// THE RANK THIS WORKER RUNS, when it runs one rank of a sharded world — `None` in a world of
+    /// one. Set by [`SpyreWorker::seat_in`] before `load_model`, which loads that world's forward,
+    /// stages this rank's slice of every weight, and links the peer card.
+    pub(crate) seat: Option<scratchy_target_spyre::bundle_code::collective::TpIdentity>,
+    /// The world's cards by PCI address, in rank order (`--tp-cards`) — empty when none were
+    /// named, which a world of one runs on the first available card and a sharded world refuses.
+    #[cfg(feature = "spyre-hw")]
+    pub(crate) cards: Vec<scratchy_target_spyre::runtime::PciAddress>,
 }
 
 impl SpyreWorker {
     pub fn new(config: WorkerConfig, model_path: String) -> Self {
         Self {
+            seat: None,
+            #[cfg(feature = "spyre-hw")]
+            cards: Vec::new(),
             config,
             model_path,
             is_shutdown: false,
@@ -180,6 +191,53 @@ impl SpyreWorker {
             max_num_seqs.and_then(scratchy_subtile::sdsc_abstract::AdmittedRequests::new);
         self.declared_context = max_model_len;
         self.gpu_memory_utilization = gpu_memory_utilization;
+    }
+
+    /// Seat this worker as rank `rank` of a `world`-rank tensor-parallel world, on the cards
+    /// `cards` names by PCI address in rank order, before `load_model`. A world of one seats
+    /// nothing, and drives `cards[0]` when one is named.
+    ///
+    /// # Errors
+    /// A world spyre does not bake, a rank past it, a sharded world on the emulator (which runs one
+    /// card and has no device p2p to send over), a card list that is not one address per rank, or
+    /// an entry that is not a PCI address.
+    pub fn seat_in(&mut self, world: usize, rank: usize, cards: &[String]) -> anyhow::Result<()> {
+        use scratchy_target_spyre::bundle_code::collective::{SPYRE_TP_WORLDS, TpWorld};
+        let w = u32::try_from(world)
+            .ok()
+            .and_then(TpWorld::named)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "spyre bakes the tensor-parallel worlds {SPYRE_TP_WORLDS:?}, not {world}"
+                )
+            })?;
+        let me = u32::try_from(rank)
+            .ok()
+            .and_then(|r| w.rank(r))
+            .ok_or_else(|| anyhow::anyhow!("rank {rank} is not a rank of a {world}-rank world"))?;
+        if w.is_sharded() && !cfg!(feature = "spyre-hw") {
+            anyhow::bail!(
+                "a {world}-rank world runs on cards linked by device p2p RDMA; this build is the \
+                 emulator, which runs one card"
+            );
+        }
+        // One address per rank, or — in a world of one only — none at all.
+        if cards.len() != world && !(cards.is_empty() && !w.is_sharded()) {
+            anyhow::bail!(
+                "a {world}-rank world names its cards by PCI address, one per rank \
+                 (`--tp-cards`); {} were given",
+                cards.len()
+            );
+        }
+        #[cfg(feature = "spyre-hw")]
+        {
+            self.cards = cards
+                .iter()
+                .map(|c| scratchy_target_spyre::runtime::PciAddress::parse(c))
+                .collect::<Result<_, _>>()?;
+        }
+        self.seat = w.is_sharded().then_some(me);
+        Ok(())
     }
 
     /// Parsed HF config — available after [`Worker::load_model`]. `create_worker`
@@ -274,6 +332,9 @@ impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFacto
             cfg.max_model_len,
             cfg.gpu_memory_utilization,
         );
+        worker
+            .seat_in(cfg.tp_world_size, cfg.tp_rank, &cfg.tp_cards)
+            .context("spyre tensor-parallel seat")?;
         worker.init_device().context("spyre init_device")?;
         worker.load_model().context("spyre load_model")?;
         let hf_config = worker
@@ -289,3 +350,22 @@ impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFacto
 inventory::submit!(
     &SpyreWorkerFactory as &dyn scratchy_serving_engine::worker_factory::WorkerFactory
 );
+
+/// This process's receive-window landing address, once its landing slots are pointed — what a
+/// follower reports with its ready frame. `None` in a world of one.
+#[cfg(feature = "spyre-hw")]
+pub fn tp_window_landing() -> Option<u64> {
+    scratchy_target_spyre::runtime::peer_link().and_then(|l| l.landing())
+}
+
+/// Rank 0's half of the window-symmetry check: every follower's reported landing address must be
+/// this process's ([`scratchy_target_spyre::runtime::refuse_if_windows_apart`]).
+///
+/// # Errors
+/// [`scratchy_target_spyre::runtime::WindowsApart`], naming every address.
+#[cfg(feature = "spyre-hw")]
+pub fn refuse_if_tp_windows_apart(
+    peers: &[Option<u64>],
+) -> Result<(), scratchy_target_spyre::runtime::WindowsApart> {
+    scratchy_target_spyre::runtime::refuse_if_windows_apart(tp_window_landing(), peers)
+}

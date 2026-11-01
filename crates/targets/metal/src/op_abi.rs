@@ -155,7 +155,11 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         // copy — fresh buffers both, the persistent placement is not an arena colour
         // at all.
         | L::EmbedRowGather { .. }
-        | L::ChainStage { .. } => FRESH,
+        | L::ChainStage { .. }
+        // The collectives (tensor parallelism's; metal runs one rank, so the analysis inserts
+        // none here): each writes the whole value into a buffer of its own.
+        | L::AllReduce { .. }
+        | L::AllGather { .. } => FRESH,
         // The rest of a MoE block lives in the op scratch (`moe_write`), not the arena.
         L::RouterNorm { .. }
         | L::RouterLogits { .. }

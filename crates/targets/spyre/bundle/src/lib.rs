@@ -37,6 +37,10 @@
 /// The DeepTools `processComputeOnHostCommand` port, run at BUILD time — see [`correction`].
 pub mod correction;
 
+/// Tensor parallelism's control-block pipeline as baked data: the world, the rank, the receive
+/// window, the sids and the send → wait → consume ring — see [`collective`].
+pub mod collective;
+
 /// Re-exported so the `inventory::submit!` the macro emits into each arch crate resolves through the
 /// same path as the types it submits — the arch crate need not depend on `inventory` itself.
 pub use inventory;
@@ -393,6 +397,11 @@ pub struct KvShifts {
     pub gathered: bool,
     /// What one fold pass covers — see [`FoldRows`]. Meaningful only when [`Self::page_fold`].
     pub fold_rows: FoldRows,
+    /// ⭐ `Some` iff this group is a COLLECTIVE'S CONSUME. Its launch is preceded by this rank's send
+    /// of the operand fragment — an F-send control block, device p2p RDMA — and the wait for the
+    /// peer's ([`collective::cb_pipeline`]), and it reads the receive window — a weight-segment
+    /// placement no per-layer weight shift or bank may move. Always `None` in a world of one.
+    pub tp: Option<collective::TpConsume>,
 }
 
 impl KvShifts {
@@ -405,6 +414,21 @@ impl KvShifts {
     /// Does this group restickify a Kᵀ slab? Derived, for the same reason.
     pub const fn slab_write(self) -> bool {
         self.slab_stride_bytes > 0
+    }
+
+    /// ⭐ WHERE THIS LAUNCH'S WEIGHT SLOT RESOLVES — `(byte shift, bank)` from the layer's own
+    /// `(layer_shift, layer_bank)`.
+    ///
+    /// ⛔ A CONSUME IS NEVER SHIFTED OR BANKED. Its weight-segment operand is the receive window, ONE
+    /// placement in the base region where the peer's send lands; a rolled body hands layer `v` a
+    /// weight base shifted by `v · weight_stride`, and a banked launch resolves the slot through
+    /// another region entirely — either one aims the consume at bytes no send ever wrote. Every
+    /// other group takes the layer's own pair unchanged.
+    pub const fn weight_slot(self, layer_shift: u64, layer_bank: usize) -> (u64, usize) {
+        match self.tp {
+            None => (layer_shift, layer_bank),
+            Some(_) => (0, 0),
+        }
     }
 }
 

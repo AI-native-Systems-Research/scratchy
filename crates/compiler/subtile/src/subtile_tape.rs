@@ -1713,6 +1713,28 @@ pub fn find_layer_loop<F: crate::subtile_ir::RopeForm>(
     detect_repeating_run_subtile(&class_fingerprints(tape, graph))
 }
 
+/// How many collectives ([`crate::tensor_parallel::TpRule::Collective`]) one rolled layer of
+/// `graph` holds — the steps of [`find_layer_loop`]'s body that are one. `None` when no layer
+/// loop rolls.
+pub fn collectives_per_layer<F: crate::subtile_ir::RopeForm>(
+    tape: &SubtileTape,
+    graph: &crate::subtile_ir::SubtileIR<F>,
+) -> Option<usize> {
+    let (start, period, _) = find_layer_loop(tape, graph)?;
+    Some(
+        tape.instrs[start..start + period]
+            .iter()
+            .filter(|i| match i {
+                Instr::Compute { node, .. } => {
+                    graph.nodes[node.index()].op.tp_rule()
+                        == crate::tensor_parallel::TpRule::Collective
+                }
+                _ => false,
+            })
+            .count(),
+    )
+}
+
 /// Largest contiguous run describable as `iters>=2` byte-identical
 /// (fingerprint) copies of a `period`-length body. Same shape as
 /// `detect_repeating_run`.
@@ -3358,6 +3380,76 @@ pub(crate) mod tests {
             // provenance of, so the map is empty.
             op_output: Vec::new(),
         }
+    }
+
+    /// Four layers `r_{k+1} = r_k · W_k` after a leading silu, each followed by `per_layer`
+    /// all-reduces of its output — the shape of a sharded decoder whose layer reduces once (an
+    /// unsplittable attention) or twice (Megatron).
+    fn collective_chain(per_layer: u32) -> SubtileIR<NeoX> {
+        let whole = |t: u32| TensorRegion {
+            tensor: TensorId(t),
+            region: Region {
+                rows: Range::new(0, 1),
+                cols: Range::new(0, 4),
+            },
+        };
+        let layers = 4u32;
+        let n_ops = 1 + layers * (1 + per_layer);
+        let num_sources = 1 + layers;
+        let tensors = vec![TensorShape { rows: 1, cols: 4 }; (num_sources + n_ops) as usize];
+        let mut nodes = vec![silu_node(
+            0,
+            TensorId(0),
+            Range::new(0, 4),
+            TensorId(num_sources),
+            Range::new(0, 4),
+        )];
+        let mut r = num_sources;
+        for k in 0..layers {
+            let out = num_sources + nodes.len() as u32;
+            nodes.push(SubtileNode {
+                id: SubtileId(nodes.len() as u32),
+                op: SubOp::Elementwise(EwKind::Mul),
+                inputs: vec![whole(r), whole(1 + k)],
+                output: whole(out),
+            });
+            r = out;
+            for _ in 0..per_layer {
+                let out = num_sources + nodes.len() as u32;
+                nodes.push(SubtileNode {
+                    id: SubtileId(nodes.len() as u32),
+                    op: SubOp::AllReduce {
+                        world: crate::tensor_parallel::WorldSize::of::<2>(),
+                    },
+                    inputs: vec![whole(r)],
+                    output: whole(out),
+                });
+                r = out;
+            }
+        }
+        SubtileIR {
+            tensors,
+            num_sources,
+            nodes,
+            result: TensorId(r),
+            op_output: Vec::new(),
+        }
+    }
+
+    /// One rolled layer's collectives, counted off the roll's own body: a layer that reduces once
+    /// holds one, a Megatron layer two — the count a target whose collectives alternate receive
+    /// buffers reads to know whether a one-layer body replays them alternating.
+    #[test]
+    fn a_rolled_layer_counts_its_collectives() {
+        let per_layer = |n: u32| {
+            let g = collective_chain(n);
+            let valid = crate::subtile_ir::ValidatedGraph::new(&g).expect("validates");
+            let tape = lower_dag_to_tape(&valid);
+            collectives_per_layer(&tape, &g)
+        };
+        assert_eq!(per_layer(1), Some(1));
+        assert_eq!(per_layer(2), Some(2));
+        assert_eq!(per_layer(0), Some(0), "an unsharded layer holds none");
     }
 
     /// A cell's layers: the leading kind's copies, then the odd one out — at its OWN length.

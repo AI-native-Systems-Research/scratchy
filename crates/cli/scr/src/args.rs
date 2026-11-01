@@ -511,6 +511,12 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0)]
     pub node_rank: usize,
 
+    /// The cards of a tensor-parallel world whose ranks each drive one card (spyre), by PCI
+    /// address in rank order, comma-separated: rank r drives the r-th
+    /// (e.g. `--tp-cards 0000:3b:00.0,0000:86:00.0`). Every rank's process is given the same list.
+    #[arg(long, value_delimiter = ',')]
+    pub tp_cards: Vec<String>,
+
     /// Master node address for multi-node NCCL rendezvous (default: localhost).
     #[arg(long, default_value = "localhost")]
     pub master_addr: String,

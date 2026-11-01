@@ -378,67 +378,21 @@ pub fn assemble_matmul_windowed(
     emitted
 }
 
-/// [`assemble_matmul_off`] for an op that sweeps only PART of the activation's rows: `m` is what it
-/// COMPUTES; the activation's base offset and its head pitch (how many rows the tensor is actually
-/// packed with per stick plane) arrive TOGETHER as one [`OperandPlacement`], and stride derivation
-/// uses the pitch.
+/// ⭐⭐⭐ [`assemble_matmul_off`] WITH BOTH SIDES PLACED BY A LAW — the activation and the output each
+/// arrive as an [`OperandPlacement`], its offset and its pitch (how many rows the tensor is actually
+/// packed with per stick plane) together, so neither one's offset can be paired with another law's
+/// pitch, and `m` is only what the op COMPUTES.
 ///
-/// The row-batched attention fold is the caller. A pass computes one request's row per head (`m = 1`)
-/// out of an activation with `mq` rows, and the y-batched form is stick-major — a head is one stick
-/// PLANE away, and a plane is `m * stick` elements. Deriving that from `m` puts every head but the
-/// first `mq`x too close; the placement's pitch is the tensor's own packing, correct while still
-/// computing one row. There is no standalone pitch slot: offset and pitch are both answers of the
-/// row law that placed the operand, so the score leg's packing cannot be handed to the value leg.
-#[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_off_phys_m<O: crate::sdsc_abstract::KindTag>(
-    op_name: &str,
-    m: MatM,
-    n: MatN,
-    k: MatK,
-    batch: MatY,
-    form: SharedKernelBmmForm,
-    a: &Stk<crate::sdsc_abstract::RowBlockedTag>,
-    a_place: OperandPlacement,
-    w: &Stk<crate::sdsc_abstract::KernelTag>,
-    w_off: crate::addr::DevOff,
-    o: &Stk<O>,
-    o_off: crate::addr::DevOff,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> EmittedOp {
-    let (a_off, w_off, o_off) = (
-        a_place.off().into_raw_elems(),
-        w_off.into_raw_elems(),
-        o_off.into_raw_elems(),
-    );
-    let (a_name, w_name, o_name) = (a.name(), w.name(), o.name());
-    let op = super::opspec::matmul_opspec_off_operands_phys::<Fp16>(
-        m,
-        n,
-        k,
-        batch,
-        form,
-        a_name,
-        w_name,
-        o_name,
-        a_off,
-        w_off,
-        o_off,
-        <Fp16 as crate::superdsc_opspec::DataFormat>::DF,
-        Some(a_place.head_pitch()),
-    )
-    .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
-    assemble_from_opspec(op_name, op, sym_id_base, layout)
-}
-
-/// ⭐⭐⭐ [`assemble_matmul_off_phys_m`] WITH THE OUTPUT PLACED BY A LAW TOO — both operands arrive as
-/// [`OperandPlacement`]s, so neither one's offset can be paired with another law's pitch.
+/// The KV cache write is the caller that needs both: its two sides are placed by the SAME law at
+/// different depths (`mq` rows per source plane, `PLANE_SLOTS` per cache plane), and its output offset
+/// is an answer of that law rather than a number the site adds up.
 ///
-/// The KV cache write is the caller: its two sides are placed by the SAME law at different depths
-/// (`mq` rows per source plane, `PLANE_SLOTS` per cache plane), and its output offset is an answer of
-/// that law rather than a number the site adds up. `o_place`'s pitch reaches the walk through
-/// [`crate::sdsc_abstract::MatY`]'s batch strides, exactly as `a_place`'s does; this entry point is
-/// what stops the OFFSET half being taken from somewhere else.
+/// ⭐ EACH OPERAND'S OWN PITCH. The builder reads `phys_mb` for the INPUT of a `y`-batched op (whose
+/// output pitch rides on [`crate::sdsc_abstract::MatY`]'s batch strides) and for the OUTPUT of an
+/// unbatched one, so the pitch handed over is that operand's. Handing the source's to an unbatched
+/// output told the cache write's plane it was `mq` rows deep: inert in every address (the write is one
+/// stick wide, so the stick-group stride multiplies nothing), but it is the extent the arrangement
+/// authority reads, and at one kv head per card the plane's one block is its whole footprint.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_matmul_placed<O: crate::sdsc_abstract::KindTag>(
     op_name: &str,
@@ -456,22 +410,28 @@ pub fn assemble_matmul_placed<O: crate::sdsc_abstract::KindTag>(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
-    assemble_matmul_off_phys_m(
-        op_name,
+    let phys = if batch.get() > 1 {
+        a_place.head_pitch()
+    } else {
+        o_place.head_pitch()
+    };
+    let op = super::opspec::matmul_opspec_off_operands_phys::<Fp16>(
         m,
         n,
         k,
         batch,
         form,
-        a,
-        a_place,
-        w,
-        w_off,
-        o,
-        o_place.off(),
-        sym_id_base,
-        layout,
+        a.name(),
+        w.name(),
+        o.name(),
+        a_place.off().into_raw_elems(),
+        w_off.into_raw_elems(),
+        o_place.off().into_raw_elems(),
+        <Fp16 as crate::superdsc_opspec::DataFormat>::DF,
+        Some(phys),
     )
+    .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    assemble_from_opspec(op_name, op, sym_id_base, layout)
 }
 
 /// Shared tail: work-division folds + emit. Identical for both entry points, so a change to how an

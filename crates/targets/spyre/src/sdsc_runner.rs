@@ -908,6 +908,17 @@ impl SuperDscSession {
     ///
     /// MUST be called after BOTH sessions have been prepared — prepare zero-inits and H2Ds every
     /// segment, so aliasing earlier would let the owner's prepare wipe the now-shared region.
+    /// Point the peer's landing slots at this session's receive window — the OWNER of the weight
+    /// segment calls it once, after it is built ([`Executor::point_landing_slots`]).
+    pub fn point_landing_slots(&self) -> Result<()> {
+        self.exec.point_landing_slots()
+    }
+
+    /// The rank this session plays as — `None` at a world of one ([`Executor::tp_identity`]).
+    pub fn tp_identity(&self) -> Option<crate::bundle_code::collective::TpIdentity> {
+        self.exec.tp_identity()
+    }
+
     pub fn alias_seg_from(&mut self, owner: &SuperDscSession, seg: i64) -> Result<()> {
         let s =
             SegIdx::checked(seg).ok_or_else(|| anyhow!("alias_seg: segment {seg} out of range"))?;

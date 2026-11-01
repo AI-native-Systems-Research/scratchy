@@ -53,6 +53,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -64,6 +65,9 @@ namespace {
 // process, not once per FFI call.
 std::shared_ptr<senlib::snt1p0::PfWrapper> g_pfw;
 std::once_flag g_pfw_once;
+// The BDF door's own once flag + the resolved id it bound (bind proof).
+std::once_flag g_pfw_bdf_once;
+std::optional<vfio::shared::PciDevId> g_pfw_pci;
 int g_pfw_init_rc = -1;
 
 // Diagnostic channel for the exceptions this ABI boundary is obliged to catch.
@@ -114,6 +118,48 @@ void init_pfw_once(int32_t /*logical_device_id*/) {
             g_pfw_init_rc = -2;
         } catch (...) {
             fprintf(stderr, "[senlib-ffi] init_pfw: unknown exception\n");
+            g_pfw_init_rc = -2;
+        }
+    });
+}
+
+// ── THE RANK-SCOPED BDF SEAM (Phase 2, tp37) ─────────────────────────────
+//
+// flex_shim_init_runtime ignores logical_device_id (the parameter is
+// commented out of init_pfw_once's signature above; the no-arg SenPci::pf()
+// opens the FIRST available device) — the single-device shape this ABI slice
+// was built with. The two-rank cell needs each process bound to ITS OWN
+// card, so this door selects by BDF STRING: SenPci::pf(const std::string&)
+// (senpci.hpp:36), the vendor's own unambiguous selection — no whichcard
+// enumeration to drift against lspci ordering.
+//
+// THE SECOND-INIT LAW: one process inits exactly one card. A repeat with the
+// SAME BDF is an idempotent no-op (the first init's runtime stands); a
+// different BDF — or a BDF init after the no-arg door already bound card 0 —
+// REFUSES BY NAME, never a silent no-op: otherwise a rank-scoping bug binds
+// both ranks to one card and greens on it.
+//
+// THE BIND PROOF: the resolved id is kept and read back through
+// flex_shim_resolved_pci() — the four fields of the PciDevId actually handed
+// to PfWrapper, from senlib's own accessors, never the input string echoed.
+
+// The BDF the BDF door bound (nullopt if the no-arg door ran or nothing is
+// initialized yet).
+std::optional<std::string> g_pfw_bdf;
+
+void init_pfw_once_bdf(const char* pci_addr) {
+    std::call_once(g_pfw_bdf_once, [pci_addr] {
+        try {
+            auto pci_id = senlib::snt1p0::SenPci::pf(std::string(pci_addr));
+            g_pfw = std::make_shared<senlib::snt1p0::PfWrapper>(pci_id);
+            g_pfw_pci = pci_id;
+            g_pfw_bdf = std::string(pci_addr);
+            g_pfw_init_rc = 0;
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[senlib-ffi] init_pfw_bdf: %s\n", e.what());
+            g_pfw_init_rc = -2;
+        } catch (...) {
+            fprintf(stderr, "[senlib-ffi] init_pfw_bdf: unknown exception\n");
             g_pfw_init_rc = -2;
         }
     });
@@ -223,6 +269,59 @@ int32_t flex_shim_init_runtime(int32_t logical_device_id) {
         fprintf(stderr, "[senlib-ffi] flex_shim_init_runtime: unknown exception\n");
         return -2;
     }
+}
+
+// The rank-scoped BDF seam (see init_pfw_once_bdf's comment block). Selects
+// the card by BDF string through SenPci::pf(const std::string&) — the
+// existing no-arg door is byte-untouched beside it.
+//
+// SECOND-INIT LAW: one process inits exactly one card. Same BDF again =
+// idempotent no-op (0). A different BDF, or a BDF init after the no-arg
+// door already bound a card, REFUSES BY NAME (-3) — never a silent no-op
+// that would green a rank-scoping bug on one card.
+int32_t flex_shim_init_runtime_bdf(const char* pci_addr) {
+    try {
+        if (g_pfw) {
+            if (g_pfw_bdf && *g_pfw_bdf == std::string(pci_addr)) {
+                return 0;  // idempotent: the same card, already bound
+            }
+            fprintf(stderr,
+                    "[senlib-ffi] flex_shim_init_runtime_bdf: one process inits exactly one card — "
+                    "runtime already bound to %s, refusing %s\n",
+                    g_pfw_bdf ? g_pfw_bdf->c_str() : "(the no-arg door's first available card)",
+                    pci_addr);
+            return -3;
+        }
+        init_pfw_once_bdf(pci_addr);
+        return (g_pfw_init_rc == 0 && g_pfw) ? 0 : (g_pfw_init_rc == 0 ? -1 : g_pfw_init_rc);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[senlib-ffi] flex_shim_init_runtime_bdf: %s\n", e.what());
+        return -2;
+    } catch (...) {
+        fprintf(stderr, "[senlib-ffi] flex_shim_init_runtime_bdf: unknown exception\n");
+        return -2;
+    }
+}
+
+// THE BIND PROOF: the resolved PCI address of the initialized runtime, read
+// from the LIVE PciDevId handed to PfWrapper (senlib's own accessors, its
+// "DDDD:BB:DD.F" format), into a caller-provided buffer. Returns the length
+// written (excluding the NUL), or -1 if nothing is initialized or the
+// buffer is too small — the caller names the BDF it asked for; this is what
+// senlib actually resolved.
+int32_t flex_shim_resolved_pci(char* out, size_t cap) {
+    if (!g_pfw_pci || !out || cap == 0) {
+        return -1;
+    }
+    const auto& id = *g_pfw_pci;
+    char buf[32];
+    const int n = snprintf(buf, sizeof(buf), "%04x:%02x:%02x.%x", id.pci_seg(), id.pci_bus(),
+                           id.pci_dev(), id.pci_func());
+    if (n < 0 || static_cast<size_t>(n) >= cap) {
+        return -1;
+    }
+    memcpy(out, buf, static_cast<size_t>(n) + 1);
+    return n;
 }
 
 // Real device memory capacity, in bytes — senlib::snt1p0::PfInterface::GetLPDDRSize(),
@@ -787,6 +886,54 @@ int32_t flex_senlib_write_xseg(uint8_t sid, uint32_t xseg) {
     } catch (...) {
         shim_record_error("flex_senlib_write_xseg", "unknown exception");
         return -1;
+    }
+}
+
+// ── The symmetric-BAT doors (Phase 2 Step 1's L5 half)
+//
+// The BAT (RDMA base-address table) is what the SetTid(dest BAT index) of a
+// unicast send resolves through on the ENGINE: BAT[peer_tid] = the peer
+// card's BAR2 PCI base. The vendor's wireup is symmetric — every rank
+// installs every peer's entry at PfDeviceHandle construction, before any CB
+// exists (pf_device_handle.cpp:138-147, :228-277) — with the value
+// `pciaddr_for_region(SenPci::pf(peer_bdf), 2)`.
+
+// Programs peer `tid`'s base address in this card's RDMA base-address table.
+// Cited: pf_interface.hpp:178 `void SetBaseAddrTable(uint8_t tid, uint64_t
+// pci_addr)`; flex pf_device_handle.cpp:255 (NTB) / :271 (PCI BAR2) in
+// initialize_p2p_address_table.
+int32_t flex_senlib_set_base_addr_table(uint8_t tid, uint64_t pci_addr) {
+    try {
+        if (!g_pfw) {
+            shim_record_error("flex_senlib_set_base_addr_table", "runtime not initialized");
+            return -1;
+        }
+        g_pfw->interface()->SetBaseAddrTable(tid, pci_addr);
+        return 0;
+    } catch (const std::exception& e) {
+        shim_record_error("flex_senlib_set_base_addr_table", e.what());
+        return -1;
+    } catch (...) {
+        shim_record_error("flex_senlib_set_base_addr_table", "unknown exception");
+        return -1;
+    }
+}
+
+// The vendor's BAT value source: the PCI address of `bdf`'s BAR `region`, as
+// senlib itself resolves it. Cited: senpci.hpp:263 `static uint64_t
+// pciaddr_for_region(PciDevId bus_id, int region_number)`. Static senlib
+// calls — no runtime init required. Returns 0 on error (a real BAR base is
+// never 0); the message is in the shim error buffer.
+uint64_t flex_shim_pci_addr_for_region(const char* bdf, uint8_t region) {
+    try {
+        auto pci_id = senlib::snt1p0::SenPci::pf(std::string(bdf));
+        return senlib::snt1p0::SenPci::pciaddr_for_region(pci_id, static_cast<int>(region));
+    } catch (const std::exception& e) {
+        shim_record_error("flex_shim_pci_addr_for_region", e.what());
+        return 0;
+    } catch (...) {
+        shim_record_error("flex_shim_pci_addr_for_region", "unknown exception");
+        return 0;
     }
 }
 

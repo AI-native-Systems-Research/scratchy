@@ -197,6 +197,11 @@ pub struct ResidentExecutor {
     /// Which tensor ids are program SOURCES (weights / mask / input) — written
     /// once via `set_source`, NOT zeroed per pass. Union across all programs.
     sources: std::collections::HashSet<u64>,
+    /// This executor's identity on the thread-local GPU weight cache — see
+    /// `metal::claim_weight_cache`. Unique per executor in the process, never 0. Only the metal
+    /// cache reads it, so it exists only where that cache does.
+    #[cfg(metal)]
+    id: u64,
     /// Tensor ids written by some forward NODE (a node output) — MUTABLE across
     /// passes (e.g. the KV-cache prefixes the decode forward grows). A cached GPU
     /// weight buffer keyed on such a tid can go stale, so it is dropped on every
@@ -556,7 +561,11 @@ impl ResidentExecutor {
             )
             .collect();
 
+        #[cfg(metal)]
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(ResidentExecutor {
+            #[cfg(metal)]
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             programs,
             shapes,
             mem,
@@ -760,15 +769,25 @@ impl ResidentExecutor {
     /// CONTIGUOUS slice at `t·rows .. t·rows+rows`. Stated off the tensor's own
     /// dims and the pick, both sentinel legs and the widened-width clamp exactly
     /// as the eval arm states them (the clamp's extent is the weight view's own
-    /// cols — the region's statement, arriving here as the resident's widest
-    /// shape for the tid; a widest cols past the staged extent reads the memory
-    /// sim's zero-fill, the same zeros the clamp names). LOAD-BEARING AND
-    /// NON-OBVIOUS: that widest shape is `collect_view_shapes`' — widest
-    /// strictly-greater-wins, TIES KEEP THE FIRST — and the door's entry view
-    /// (logical `[hidden, vocab]`) walks before the lm-head matmul's view, so
-    /// the tie between the two `[hidden, vocab]` views lands on the door's
-    /// own: `rows = hidden`, the walk's own law.
-    fn run_embed_row_gather(&self, node: &NodeSpec, k: u32) -> Result<(), String> {
+    /// cols — the region's statement).
+    ///
+    /// ⭐ THE DOOR'S OWN VIEWS STATE ITS OPERANDS, NOT THE TID'S WIDEST. The
+    /// resident stages a tid at the widest view any node states of it (an
+    /// allocation must hold every view), and the lm-head matmul views the same
+    /// weight as its `[n_dev, hidden]` transpose-B storage. Where the matmul's
+    /// device width pads past the weight's own columns, that view is strictly
+    /// wider, and its rows are `n_dev`, not `hidden`: a split head's vocabulary
+    /// block (granite's 24640 columns, a matmul device width of 26624) is the
+    /// first such weight, since a whole head's widened pad covers its device
+    /// width. So the walk reads the four extents off the views THIS node's
+    /// skeleton states (the IR tensors' own `[rows, cols]`), and reads the
+    /// weight's first `rows·cols` elements, which the staging wrote.
+    fn run_embed_row_gather(
+        &self,
+        node: &NodeSpec,
+        ops: &[Operation<'_>],
+        k: u32,
+    ) -> Result<(), String> {
         let tids: Vec<u64> = node.bindings.iter().map(|b| b.tensor).collect();
         if tids.len() != 4 {
             return Err(format!(
@@ -785,13 +804,19 @@ impl ResidentExecutor {
             );
         }
         let (s_tid, l_tid, w_tid, o_tid) = (tids[0], tids[1], tids[2], tids[3]);
+        let own: HashMap<u64, Vec<usize>> = {
+            let arg_to_tensor: HashMap<Ssa, u64> =
+                node.bindings.iter().map(|b| (b.arg, b.tensor)).collect();
+            let mut own = HashMap::new();
+            crate::segmented::collect_view_shapes(ops, &arg_to_tensor, &mut own);
+            own
+        };
         // ⭐ THE WIDTH, OFF THE ROW OUT'S OWN STATED EXTENT — `[width, hidden]`,
         // one gathered row per request. The skeleton's Shape-only view states
-        // the tensor's own dims, so the widest-shape walk hands the door the
-        // mint's own statement; a 0-width or non-matrix out is a graph the
-        // mint never made.
-        let o_shape = self.shapes.get(&o_tid).ok_or_else(|| {
-            format!("embed_row_gather: the row out t{o_tid} has no derived shape")
+        // the tensor's own dims, the mint's own statement; a 0-width or
+        // non-matrix out is a graph the mint never made.
+        let o_shape = own.get(&o_tid).ok_or_else(|| {
+            format!("embed_row_gather: the door states no view of the row out t{o_tid}")
         })?;
         if o_shape.len() != 2 || o_shape[0] == 0 {
             return Err(format!(
@@ -805,10 +830,9 @@ impl ResidentExecutor {
         // The weight at its OWN view dtype (an fp8-packed view reads one byte per
         // element — the same per-tid law the pointer binding and the readback
         // use), full extent.
-        let shape = self
-            .shapes
-            .get(&w_tid)
-            .ok_or_else(|| format!("embed_row_gather: the weight t{w_tid} has no derived shape"))?;
+        let shape = own.get(&w_tid).ok_or_else(|| {
+            format!("embed_row_gather: the door states no view of the weight t{w_tid}")
+        })?;
         if shape.len() != 2 {
             return Err(format!(
                 "embed_row_gather: the weight t{w_tid} states a {}-dim shape; the walk needs \
@@ -836,8 +860,8 @@ impl ResidentExecutor {
             .read_bytes(w_stick * STICK_BYTES, nbytes);
         let w = crate::codec::decode(&wbytes, rows * cols, w_dt);
         // The two index sticks, whole — row r's own words are slices of these.
-        let s_shape = self.shapes.get(&s_tid).ok_or_else(|| {
-            format!("embed_row_gather: the s stick t{s_tid} has no derived shape")
+        let s_shape = own.get(&s_tid).ok_or_else(|| {
+            format!("embed_row_gather: the door states no view of the s stick t{s_tid}")
         })?;
         if s_shape.len() != 2 || s_shape[0] != width {
             return Err(format!(
@@ -896,11 +920,13 @@ impl ResidentExecutor {
     /// resident HBM. SIX bound tensors in mint order (the skeleton's operand
     /// list — the node's inputs, then the output): the pick stick, the
     /// persistent s stick, the persistent l stick, the two decompose tables,
-    /// and the fresh s-value stick out. The tables are UNREAD here — the
-    /// golden's own law ("the table operands are unread by the reference: the
-    /// reference states the decompose's RESULT, never its walk"), staged once
-    /// at load for the card's gather doors and carried by the node's bindings
-    /// like every other operand.
+    /// and the fresh s-value stick out. ⭐ THE TABLES ARE THE DECOMPOSE — the
+    /// card's own walk, two table gathers at the pick: row `t` of the s table
+    /// is the pick's lane pattern and row `t` of the l table its lane ramp.
+    /// They are the ONLY place a rank's vocabulary block lives (the node is the
+    /// same on every rank; each rank stages its own block's tables), so a door
+    /// that re-derived the decompose from the pick would answer every rank as
+    /// rank 0.
     ///
     /// ⭐⭐⭐⭐⭐ EVERY ROW IS ITS OWN REQUEST — the decompose is per row at
     /// EVERY decode width: row `r` reads ITS OWN pick (word 0 of the pick
@@ -912,14 +938,13 @@ impl ResidentExecutor {
     /// gate. The width is the s-value OUT's own stated extent
     /// (`[width, CHAIN_IDX_BLOCK]`), never a derivation from the sticks.
     ///
-    /// The ruled table's law, per row: `s = t >> 6` clamped to 0 past
-    /// `pad_vocab`, stated as the LANE PATTERN `k·s + (i mod k)` over the
-    /// stick's lanes — the clamp keeps even the sentinel read on slab 0's
-    /// pattern, and the sentinel ramp's lanes name the transposed placement's
-    /// unwritten zero tail (word 0 = `hidden`, the mark a real pick's word 0
-    /// ≤ 63 never collides with). `table_rows` rides the payload for the
-    /// card's staged tables and is unread here by the same law that leaves
-    /// the table operands unread. `hidden` is the payload's own statement
+    /// The tables' law (`chain_s_row` / `chain_l_row`): the LANE PATTERN
+    /// `k·s + (i mod k)` of the pick's slab within the rank's block, slab 0's
+    /// pattern for a pick the block does not hold, and the sentinel ramp's
+    /// lanes naming the transposed placement's unwritten zero tail (word 0 =
+    /// `hidden`, the mark a real pick's word 0 ≤ 63 never collides with). A
+    /// pick past the tables' rows is refused by name: the sentinel is their
+    /// last row, so no answerable pick is. `hidden` is the payload's own statement
     /// (the paired gather's width, the same single source the staged tables
     /// carry) — the lane ramp's modulus `64·(j mod (hidden/64)) + l` and the
     /// sentinel mark's own value, NEVER derived from the stick's lane count
@@ -933,13 +958,7 @@ impl ResidentExecutor {
     /// entry count `hidden/64`: at a partial last stick the words past the
     /// entries re-bind to the row's own first entries, never past the
     /// placement's sticks.
-    fn run_chain_stage(
-        &self,
-        node: &NodeSpec,
-        pad_vocab: u32,
-        hidden: u32,
-        k: u32,
-    ) -> Result<(), String> {
+    fn run_chain_stage(&self, node: &NodeSpec, hidden: u32, k: u32) -> Result<(), String> {
         let tids: Vec<u64> = node.bindings.iter().map(|b| b.tensor).collect();
         if tids.len() != 6 {
             return Err(format!(
@@ -961,6 +980,7 @@ impl ResidentExecutor {
         // the reference states the decompose's result, never its walk); the
         // fresh s-value out is [5], not [3].
         let (pick_tid, s_tid, l_tid, o_tid) = (tids[0], tids[1], tids[2], tids[5]);
+        let (stab_tid, ltab_tid) = (tids[3], tids[4]);
         if hidden == 0 {
             return Err(
                 "chain_stage: the payload states hidden = 0 — the lane ramp's modulus is the \
@@ -1026,45 +1046,41 @@ impl ResidentExecutor {
             ));
         }
         let l_row_words = l_numel / width;
-        // The ramp's modulus — the payload's own hidden, never the stick's
-        // lane count (`chain_l_stick_ramp`'s own law).
-        let entries = hidden / 64;
+        // The two tables, one row per answerable pick: the s table's rows are one
+        // pattern stick (`lanes` words), the l table's one request's ramp window.
+        let stab = self.read_door_stick(stab_tid)?;
+        let ltab = self.read_door_stick(ltab_tid)?;
+        let table_rows = stab.len() / lanes;
+        if table_rows == 0
+            || stab.len() != table_rows * lanes
+            || ltab.len() != table_rows * l_row_words
+        {
+            return Err(format!(
+                "chain_stage: the decompose tables t{stab_tid}/t{ltab_tid} hold {}/{} words — \
+                 not one {lanes}-word pattern and one {l_row_words}-word ramp per pick row",
+                stab.len(),
+                ltab.len()
+            ));
+        }
         let pick_buf = self.read_door_stick(pick_tid)?;
         let mut s_pat = vec![0.0f32; s_numel];
         let mut l_ramp = vec![0.0f32; l_numel];
         let mut out = vec![0.0f32; width * lanes];
         for r in 0..width {
-            let t = pick_buf[r * pick_cols] as u64;
-            let s = if t < pad_vocab as u64 {
-                (t >> 6) as u32
-            } else {
-                0
-            };
-            let l = t as u32 & 63;
+            let t = pick_buf[r * pick_cols] as usize;
+            if t >= table_rows {
+                return Err(format!(
+                    "chain_stage: row {r}'s pick {t} is past the tables' {table_rows} rows — \
+                     the sentinel is their last row, so no answerable pick is"
+                ));
+            }
             // Row r's OWN pattern words at r·lanes, its OWN ramp words at
             // r·l_row_words — the layouts `chain_s_seed`/`chain_l_seed` state.
-            for i in 0..lanes as u32 {
-                let v = if t < pad_vocab as u64 {
-                    k * s + i % k
-                } else {
-                    // The sentinel leg: slab-0 pattern (bus safety).
-                    i % k
-                };
-                s_pat[r * lanes + i as usize] = v as f32;
-                out[r * lanes + i as usize] = v as f32;
-            }
-            for j in 0..l_row_words as u32 {
-                // The real ramp `64·(j mod entries) + l`; the sentinel ramp
-                // `hidden + (j mod entries)` (the zero tail's own sticks —
-                // the mod wrap is `chain_l_sentinel_ramp`'s whole safety law
-                // at a partial last stick).
-                let v = if t < pad_vocab as u64 {
-                    64 * (j % entries) + l
-                } else {
-                    hidden + j % entries
-                };
-                l_ramp[r * l_row_words + j as usize] = v as f32;
-            }
+            let s_row = &stab[t * lanes..(t + 1) * lanes];
+            s_pat[r * lanes..(r + 1) * lanes].copy_from_slice(s_row);
+            out[r * lanes..(r + 1) * lanes].copy_from_slice(s_row);
+            l_ramp[r * l_row_words..(r + 1) * l_row_words]
+                .copy_from_slice(&ltab[t * l_row_words..(t + 1) * l_row_words]);
         }
         self.write_door_stick(s_tid, &s_pat)?;
         self.write_door_stick(l_tid, &l_ramp)?;
@@ -1208,6 +1224,8 @@ impl ResidentExecutor {
     /// which is otherwise a second full pass over ~4.7 GB.
     pub fn set_sources_owned(&mut self, args: Vec<(u64, Arg)>) -> Result<(), String> {
         #[cfg(metal)]
+        crate::metal::claim_weight_cache(self.id);
+        #[cfg(metal)]
         let mut just_set: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for (tid, arg) in args {
             if !self.stick.contains_key(&tid) {
@@ -1249,6 +1267,8 @@ impl ResidentExecutor {
     /// for an all-f16 model the weights land in HBM with a single copy each, never
     /// touching `Vec<f32>`. [`Arg::Tensor`] (host f32) still narrows on the way in.
     pub fn set_sources(&mut self, args: &[(u64, Arg)]) -> Result<(), String> {
+        #[cfg(metal)]
+        crate::metal::claim_weight_cache(self.id);
         #[cfg(metal)]
         let mut just_set: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for &(tid, ref arg) in args {
@@ -1361,6 +1381,8 @@ impl ResidentExecutor {
                 self.programs.len()
             ));
         }
+        #[cfg(metal)]
+        crate::metal::claim_weight_cache(self.id);
         self.zero_non_sources();
 
         // Resident weights are uploaded once (and the weight cache is cleared on
@@ -1509,16 +1531,11 @@ impl ResidentExecutor {
                     // missing-Strides refusal, not a fallback.
                     let door_ran = match node.program {
                         Program::EmbedRowGather { k } => {
-                            self.run_embed_row_gather(node, k)?;
+                            self.run_embed_row_gather(node, func.operations, k)?;
                             true
                         }
-                        Program::ChainStage {
-                            pad_vocab,
-                            hidden,
-                            k,
-                            ..
-                        } => {
-                            self.run_chain_stage(node, pad_vocab, hidden, k)?;
+                        Program::ChainStage { hidden, k, .. } => {
+                            self.run_chain_stage(node, hidden, k)?;
                             true
                         }
                         _ => false,

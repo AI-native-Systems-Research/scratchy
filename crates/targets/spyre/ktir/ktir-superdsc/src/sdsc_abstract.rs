@@ -2304,6 +2304,82 @@ impl StickLayout {
     }
 }
 
+/// ⭐ WHAT ONE ACCESS SAYS ABOUT ITS TENSOR'S BYTES — the unit the arrangement authority
+/// (`BundleLayout::declare_arrangement`) records and compares. Most accesses are 2-D, and their
+/// [`StickLayout`] is the whole claim. A HEAD-MAJOR read carries one more fact its layout drops: which
+/// axis is its groups.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArrangementClaim {
+    /// A 2-D access, at its layout.
+    Rows(StickLayout),
+    /// A rank-3 `[groups, rows, one stick]` read — group `g`, row `r`, lane `d` at
+    /// `(g·rows + r)·L + d`, contiguous, so [`StickLayout::for_view_df`] classifies it
+    /// `Flat [groups, rows·L]` ([`Self::layout`]).
+    HeadMajor { groups: usize, rows: usize, df: Df },
+}
+
+impl From<StickLayout> for ArrangementClaim {
+    fn from(layout: StickLayout) -> Self {
+        ArrangementClaim::Rows(layout)
+    }
+}
+
+impl ArrangementClaim {
+    /// The claim an access of view `dims`, sticked on `stick_idx`, makes: [`Self::HeadMajor`] for a
+    /// rank-3 view whose stick axis is exactly one stick, [`Self::Rows`] at
+    /// [`StickLayout::for_view_df`]'s layout for every other.
+    pub fn for_view_df(dims: &[usize], stick_idx: usize, df: Df) -> ArrangementClaim {
+        let layout = StickLayout::for_view_df(dims, stick_idx, df);
+        match *dims {
+            [groups, rows, stick] if stick_idx == 2 && stick == layout.lanes() => {
+                ArrangementClaim::HeadMajor { groups, rows, df }
+            }
+            _ => ArrangementClaim::Rows(layout),
+        }
+    }
+
+    /// The layout the access addresses by.
+    pub fn layout(self) -> StickLayout {
+        match self {
+            ArrangementClaim::Rows(layout) => layout,
+            ArrangementClaim::HeadMajor { groups, rows, df } => StickLayout {
+                rows: groups,
+                cols: rows * df.elems_per_stick() as usize,
+                df,
+                kind: StickKind::Flat,
+            },
+        }
+    }
+
+    /// Do two accesses of one tensor address its every element at the same byte? Their layouts'
+    /// [`StickLayout::addr_eq`], plus the one fact only a head-major read can state: it IS the stick
+    /// groups of a stick-blocked `[rows, groups·L]` tensor laid end to end. Group `g` of that tensor is
+    /// its columns `[g·L, (g+1)·L)` — head `g` at one stick a head — and the first line of `addr_eq`'s
+    /// row-expansion proof puts its row `r`, lane `d` at `g·rows·L + r·L + d`, the read's own byte. A
+    /// one-kv-head attention's group read of Q (`[gqa, mq, hd]` over `[mq, heads·hd]`, every head one
+    /// group) is that read. It holds even where `groups == rows` gives the read's layout the tensor's
+    /// shape: the layout alone cannot tell this frame from the M>1 scramble, the claim can. At a head
+    /// dim of several sticks the groups are sticks, not heads, so a per-head `[heads, rows, hd]` read
+    /// is not head-major here and stays a conflict.
+    pub fn agrees(self, other: ArrangementClaim) -> bool {
+        let frames = |groups: usize, rows: usize, df: Df, t: StickLayout| {
+            t.df == df
+                && !matches!(t.kind, StickKind::Flat)
+                && t.rows == rows
+                && t.cols == groups * t.lanes()
+        };
+        match (self, other) {
+            (ArrangementClaim::HeadMajor { groups, rows, df }, ArrangementClaim::Rows(t))
+            | (ArrangementClaim::Rows(t), ArrangementClaim::HeadMajor { groups, rows, df })
+                if frames(groups, rows, df, t) =>
+            {
+                true
+            }
+            _ => self.layout().addr_eq(&other.layout()),
+        }
+    }
+}
+
 /// ⭐⭐⭐⭐⭐ A REGION'S DEVICE FRAME, AS A TYPE — the stick-blocked residency a `(rows, cols)`
 /// region names, and the LAW a re-presentation of that region must satisfy to keep addressing
 /// the same bytes.
@@ -4628,6 +4704,12 @@ impl RowCount {
     /// The padding remainder `mq_pad - mq` — the zero-fill of the rows RoPE never packs.
     pub const fn of_zero_pad_rows(rows: u32) -> RowCount {
         RowCount(rows)
+    }
+    /// A run of `sticks` whole stick columns of a `rows`-row tensor, read as the tall-narrow
+    /// `[sticks · rows, stick]` tensor it IS in memory (stick-major: each stick column is `rows`
+    /// contiguous sticks) — a block copy's one sweep.
+    pub const fn of_stick_column_rows(sticks: u32, rows: u32) -> RowCount {
+        RowCount(sticks * rows)
     }
     /// Residual-stream token rows — outside the attention row-and-width run.
     pub const fn of_token_rows(rows: u32) -> RowCount {

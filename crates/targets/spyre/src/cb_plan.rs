@@ -15,7 +15,7 @@
 //! never pays for it: `Executor::prepare` renders every allocated launch list
 //! two ways — the walk ([`walk_items`]) and the plan
 //! ([`build_cb_plan`] + [`CbPlan::render`]) — through ONE render door
-//! (`crate::runtime::Stream::render_compute_batch`, the same
+//! (`crate::runtime::Stream::render_batch`, the same
 //! `build_compute_cb` the submit path runs) and REFUSES TO LOAD on the first
 //! differing byte. A lazily-allocated split ladder is checked at its allocation
 //! (`ensure_split_bodies`), the one event that makes it exist — never per step.
@@ -52,10 +52,17 @@
 
 use anyhow::{Result, anyhow, bail};
 use flex_rs::control_block_wire::{CB_NUM_BYTES, ControlBlockWire};
+use flex_rs::scheduler::RunPlace;
 
 use crate::bundle_code::NUM_SEGMENTS;
+use crate::bundle_code::collective::{
+    CbStep, RecvWindow, TpConsume, TpIdentity, TpSend, group_steps,
+};
 use crate::fold_plan::{self, OpKv, SessionKv, SlotPos, UniformPages};
-use crate::runtime::{BatchedCompute, ByteSize, DevAddr, Stream, prog_offset_base};
+use crate::runtime::{
+    BatchedCb, BatchedCompute, ByteSize, DevAddr, PeerRoute, RdmaEnd, RdmaSend, Stream,
+    prog_offset_base,
+};
 use crate::superdsc_exec::{
     LaunchWhere, Ops, SEG_INTERMEDIATE, SEG_KV, SEG_MASK, SEG_WEIGHT, SeqPos,
 };
@@ -234,13 +241,21 @@ pub(crate) fn launch_site(
     // handing a different region here is the whole mechanism that lets one segment's
     // worth of addresses span several regions. Bank 0 (`weight_bank` = 0, every unbanked
     // bundle) is `seg_addr[SEG_WEIGHT]`, exactly as before.
-    let wbase = segment_base(seg, banks, where_.weight_bank, SEG_WEIGHT.get())?;
+    // ⭐ AND A COLLECTIVE'S CONSUME TAKES NEITHER: its weight-segment operand is the receive window,
+    // one placement in the base region, so `weight_slot` pins it to shift 0 in bank 0 — the one law
+    // the walk and the plan twin both read through this function.
+    let (weight_shift, weight_bank) = op
+        .code
+        .kv
+        .weight_slot(off[SEG_WEIGHT.get()], where_.weight_bank);
+    off[SEG_WEIGHT.get()] = weight_shift;
+    let wbase = segment_base(seg, banks, weight_bank, SEG_WEIGHT.get())?;
     let mut ta = Vec::with_capacity(NUM_SEGMENTS);
     for (i, &sh) in off.iter().enumerate() {
         let base = if i == SEG_WEIGHT.get() {
             wbase
         } else {
-            segment_base(seg, banks, where_.weight_bank, i)?
+            segment_base(seg, banks, weight_bank, i)?
         };
         ta.push(
             if sh > 0
@@ -314,6 +329,134 @@ pub(crate) fn launch_site(
     }))
 }
 
+/// A collective's consume as a session BOUND it: the send its baked placements name and the routes
+/// the session's link gives it, one per peer. Minted only at bind (`superdsc_exec::bind_ops`), for
+/// the consumes the session plays.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BoundCollective {
+    pub(crate) send: TpSend,
+    /// The rank the session runs as.
+    pub(crate) me: TpIdentity,
+    /// One route per peer, in rank order (`runtime::PeerLink::routes`).
+    pub(crate) routes: &'static [PeerRoute],
+}
+
+impl BoundCollective {
+    /// The route to and from `peer`.
+    fn route(&self, index: usize, peer: TpIdentity) -> Result<PeerRoute> {
+        self.routes
+            .iter()
+            .copied()
+            .find(|r| r.peer() == peer)
+            .ok_or_else(|| {
+                anyhow!(
+                    "group {index}: rank {} has no route to its peer {}",
+                    self.me.rank(),
+                    peer.rank()
+                )
+            })
+    }
+}
+
+/// What [`site_cbs`] reads off a group: its launch order, its consume (the bundle's), and the
+/// session's binding of it.
+#[derive(Clone, Copy)]
+pub(crate) struct SiteTp {
+    pub(crate) index: usize,
+    pub(crate) consume: Option<TpConsume>,
+    pub(crate) bound: Option<BoundCollective>,
+}
+
+/// ⭐ ONE (op, PASS)'S CONTROL BLOCKS — its launch, and in front of a collective's consume the send
+/// and the wait, in the bundle's own order ([`group_steps`]). The submit walk, [`walk_items`] and
+/// [`CbPlan::render`] all stage through this, so the walk and its twin cannot disagree about a
+/// collective's CBs any more than about a launch's.
+///
+/// The send's two endpoints are addressed through THE CONSUME LAUNCH'S OWN SEGMENT BASES: the
+/// operand's segment as the consume reads it (every layer shift the launch carries applies) and the
+/// window's as the consume reads it (pinned to bank 0, unshifted, by `weight_slot`). So the bytes
+/// the send moves and the bytes the consume reads are one set.
+pub(crate) fn site_cbs(tp: SiteTp, launch: BatchedCompute) -> Result<Vec<BatchedCb>> {
+    let SiteTp {
+        index,
+        consume,
+        bound,
+    } = tp;
+    // A consume the session never bound is a group bind refused — unreachable from `bind_ops`,
+    // which binds every consume it keeps; refused here rather than staged without its send.
+    let bound = match (consume, bound) {
+        (Some(_), None) => bail!("group {index} is a collective's consume the session never bound"),
+        (_, b) => b,
+    };
+    let end = |l: &BatchedCompute, segment: u8, offset: u64| -> Result<RdmaEnd> {
+        let base = l.tensor_allocs.get(usize::from(segment)).ok_or_else(|| {
+            anyhow!(
+                "group {index}: the send names segment {segment}, but the consume launch binds \
+                 only {} segment(s)",
+                l.tensor_allocs.len()
+            )
+        })?;
+        Ok(RdmaEnd {
+            base: base.clone(),
+            segment,
+            offset,
+        })
+    };
+    let mut launch = Some(launch);
+    let mut out = Vec::with_capacity(3);
+    for step in group_steps(index, consume.zip(bound.map(|b| b.me))) {
+        match step {
+            // ⭐ THE CUT: a send is its run of messages (`TpSend::messages`, the vendor's windowed
+            // loop), one F-send each, into this rank's region of the peer's window.
+            CbStep::Send { to, .. } => {
+                let (Some(b), Some(l)) = (bound, launch.as_ref()) else {
+                    bail!("group {index} sends with no binding or after its launch");
+                };
+                let (send, route) = (b.send, b.route(index, to)?);
+                for m in send.messages(route.lands_in()) {
+                    out.push(BatchedCb::Send(RdmaSend {
+                        sid: route.send_sid(m.slot),
+                        dest_tid: route.dest_tid(),
+                        bytes: m.bytes,
+                        source: end(l, send.source_segment, m.source_offset)?,
+                        window: end(l, RecvWindow::SEGMENT as u8, m.window_offset)?,
+                        place: RunPlace {
+                            first: m.first,
+                            last: m.last,
+                        },
+                    }));
+                }
+            }
+            // ⭐ AND THE PAIRING: every one of the peer's messages increments its slot's counter
+            // once and a wait consumes exactly one count, so its run of N messages is waited for N
+            // times, once per slot. The peer's run is this rank's own — the forward is SPMD and the
+            // cut is the payload's — so this rank's messages name the peer's slots too.
+            CbStep::Wait { from, .. } => {
+                let Some(b) = bound else {
+                    bail!("group {index} waits with no binding");
+                };
+                let (send, route) = (b.send, b.route(index, from)?);
+                for slot in send.slots() {
+                    out.push(BatchedCb::Wait {
+                        sid: route.wait_sid(slot),
+                    });
+                }
+            }
+            CbStep::Launch { .. } => {
+                let Some(l) = launch.take() else {
+                    bail!("group {index} launches twice");
+                };
+                out.push(if consume.is_some() {
+                    BatchedCb::Consume(l)
+                } else {
+                    BatchedCb::Compute(l)
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The walk's staged batch for one launch call — the OLD way, built from the
 /// same `op_reps`/`launch_site` the submit walk reads. This is the parity
 /// gate's reference side. The submit walk keeps its own loop (its diag knobs
@@ -326,7 +469,7 @@ pub(crate) fn walk_items(
     seg: &[Option<DevAddr>; NUM_SEGMENTS],
     banks: &[Option<DevAddr>],
     where_: &LaunchWhere,
-) -> Result<(Vec<BatchedCompute>, bool)> {
+) -> Result<(Vec<BatchedCb>, bool)> {
     let mut items = Vec::new();
     let mut barrier = false;
     for oi in 0..ops.len() {
@@ -338,7 +481,7 @@ pub(crate) fn walk_items(
                 continue;
             };
             barrier |= site.barrier;
-            items.push(site.batched_compute());
+            items.extend(site_cbs(ops[oi].site_tp(), site.batched_compute())?);
         }
     }
     Ok((items, barrier))
@@ -371,6 +514,8 @@ pub(crate) struct CbPlanEntry {
     /// the walk's own arithmetic to the byte (a pre-shifted base would clamp
     /// differently at the region's end).
     bases: Vec<(DevAddr, u64)>,
+    /// The collective CBs in front of this entry, staged by the walk's own [`site_cbs`].
+    tp: SiteTp,
 }
 
 /// One launch's CB constructor list — the walk's sequence as data, keyed by
@@ -390,7 +535,7 @@ impl CbPlan {
         &self,
         fold: &SessionKv,
         where_: &LaunchWhere,
-    ) -> Result<(Vec<BatchedCompute>, bool)> {
+    ) -> Result<(Vec<BatchedCb>, bool)> {
         let Some(per) = UniformPages::sweeping(where_.n_fold_pages, fold) else {
             bail!(
                 "cb_plan render: the page maps do not admit a uniform {}-page sweep",
@@ -433,13 +578,39 @@ impl CbPlan {
                 );
             }
             barrier |= e.barrier;
-            items.push(BatchedCompute {
-                prog: e.prog.clone(),
-                tensor_allocs,
-                bootstrap_offset: e.bootstrap_offset,
-            });
+            items.extend(site_cbs(
+                e.tp,
+                BatchedCompute {
+                    prog: e.prog.clone(),
+                    tensor_allocs,
+                    bootstrap_offset: e.bootstrap_offset,
+                },
+            )?);
         }
         Ok((items, barrier))
+    }
+
+    /// Which entry, and which of its group's steps, the plan's `i`-th CB is — an entry stages one
+    /// CB per step ([`site_cbs`]), so a refusal names the send or wait, not just its group.
+    fn cb_label(&self, i: usize) -> String {
+        self.entries
+            .iter()
+            .flat_map(|e| {
+                group_steps(e.tp.index, e.tp.consume.zip(e.tp.bound.map(|b| b.me)))
+                    .map(move |s| (e, s))
+            })
+            .nth(i)
+            .map_or_else(
+                || format!("CB {i}"),
+                |(e, s)| {
+                    let step = match s {
+                        CbStep::Send { .. } => "send",
+                        CbStep::Wait { .. } => "wait",
+                        CbStep::Launch { .. } => "launch",
+                    };
+                    format!("{} {step}", e.label)
+                },
+            )
     }
 }
 
@@ -454,9 +625,6 @@ pub(crate) fn build_cb_plan(
     banks: &[Option<DevAddr>],
     where_: &LaunchWhere,
 ) -> Result<CbPlan> {
-    // The weight base is per-launch, not per-entry — resolve it once, the way
-    // the walk resolves `wbase` before its segment loop.
-    let wbase = segment_base(seg, banks, where_.weight_bank, SEG_WEIGHT.get())?;
     // The sweep witness, once, for the barrier probe below — the same
     // `UniformPages::sweeping` the walk's `launch_site` mints per pass; a fold
     // that cannot sweep refuses here exactly as the walk would refuse there.
@@ -488,15 +656,25 @@ pub(crate) fn build_cb_plan(
                     .deltas()
                     .is_some()
             });
+        // WHICH REGION BACKS THE WEIGHT SLOT, AND AT WHAT SHIFT — `weight_slot`, the one law the
+        // walk's `launch_site` reads: the launch's bank and layer shift, except for a collective's
+        // consume, pinned to bank 0 at shift 0 because its weight-segment operand is the window.
+        let (weight_shift, weight_bank) = op
+            .code
+            .kv
+            .weight_slot(where_.byte_off[SEG_WEIGHT.get()], where_.weight_bank);
+        let wbase = segment_base(seg, banks, weight_bank, SEG_WEIGHT.get())?;
         for rep in 0..reps {
             let mut bases = Vec::with_capacity(NUM_SEGMENTS);
             for i in 0..NUM_SEGMENTS {
-                let base = if i == SEG_WEIGHT.get() {
-                    wbase
+                bases.push(if i == SEG_WEIGHT.get() {
+                    (wbase.clone(), weight_shift)
                 } else {
-                    segment_base(seg, banks, where_.weight_bank, i)?
-                };
-                bases.push((base.clone(), where_.byte_off[i]));
+                    (
+                        segment_base(seg, banks, weight_bank, i)?.clone(),
+                        where_.byte_off[i],
+                    )
+                });
             }
             entries.push(CbPlanEntry {
                 label: format!("{}/rep{rep}", op.label()),
@@ -520,6 +698,7 @@ pub(crate) fn build_cb_plan(
                 rep,
                 barrier: !next_is_slot_write,
                 bases,
+                tp: op.site_tp(),
             });
         }
     }
@@ -563,8 +742,8 @@ pub(crate) fn parity_check(
     // patch site (2b stamps pool-leased tags), so it cancels in the compare
     // and what remains — tensor XLAT paddrs and lengths, program, bootstrap —
     // is everything the device would be handed.
-    let old = stream.render_compute_batch(&walked, 1)?;
-    let new = stream.render_compute_batch(&rendered, 1)?;
+    let old = stream.render_batch(&walked, 1)?;
+    let new = stream.render_batch(&rendered, 1)?;
     for (i, (a, b)) in old.iter().zip(new.iter()).enumerate() {
         if a != b {
             let (mut at, mut wb, mut pb) = (0, 0u8, 0u8);
@@ -580,7 +759,7 @@ pub(crate) fn parity_check(
                  data twin of the walk disagrees; refusing to load rather than replay a \
                  wrong image.",
                 old.len(),
-                plan.entries[i].label
+                plan.cb_label(i)
             );
         }
     }
@@ -807,14 +986,14 @@ pub(crate) fn build_patch_plan(
     let plan = build_cb_plan(ops, fold, seg, banks, where_)?;
     let render = |w: &LaunchWhere| -> Result<Vec<ControlBlockWire>> {
         let (items, _) = plan.render(fold, w)?;
-        Ok(stream.render_compute_batch(&items, 1)?)
+        Ok(stream.render_batch(&items, 1)?)
     };
     // The canvas, rendered once — and the host-fence OR with it: a constant
     // of the plan (entry-keyed, the same for every render of this plan), so
     // the canvas render's value is the image's, what the player submits
     // every step of this image with.
     let (items, barrier) = plan.render(fold, where_)?;
-    let canvas = stream.render_compute_batch(&items, 1)?;
+    let canvas = stream.render_batch(&items, 1)?;
     // The two differentials. Each moves exactly one scalar's worth of
     // arithmetic — the other held — so each moving word's measured difference
     // is one equation in that word's coefficients. There is NO page
@@ -911,7 +1090,7 @@ pub(crate) fn render_row(
 ) -> Result<RowImage> {
     let plan = build_cb_plan(ops, fold, seg, banks, where_)?;
     let (items, barrier) = plan.render(fold, where_)?;
-    let canvas = stream.render_compute_batch(&items, 1)?;
+    let canvas = stream.render_batch(&items, 1)?;
     let per = fold.page_slots.get().max(1);
     Ok(RowImage {
         canvas,
@@ -994,7 +1173,7 @@ pub(crate) fn patch_check(
                 ..*where_
             },
         )?;
-        Ok(stream.render_compute_batch(&items, 1)?)
+        Ok(stream.render_batch(&items, 1)?)
     };
     for (spos, what) in samples {
         let expected = walk_render(spos)?;
@@ -1036,4 +1215,205 @@ pub(crate) fn patch_check(
             plan: patch_plan,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A two-rank world's window at 1 MiB, one message-wide region per cut.
+    fn two_rank_window() -> RecvWindow {
+        RecvWindow::new(1 << 20, Payload::from(WireBytes::CAP), TpWorld::of::<2>()).unwrap()
+    }
+    use crate::bundle_code::collective::{
+        CollectiveKind, CutPayload, LandingSlot, Payload, Sid, TpWorld, WindowCut, WireBytes,
+        fragments,
+    };
+    use crate::runtime::Chunk0;
+    use flex_rs::address::{ByteOffset, RegionId};
+    use flex_rs::memory_region::DomainId;
+
+    /// One launch over seven distinct segment bases, region `10 + segment`.
+    fn launch() -> BatchedCompute {
+        let at = |region: u64| {
+            DevAddr::from_chunk(Chunk0 {
+                region: RegionId(region),
+                offset: ByteOffset(0),
+                size: ByteSize(1 << 26),
+                domain: DomainId(0),
+            })
+        };
+        BatchedCompute {
+            prog: at(99),
+            tensor_allocs: (0..NUM_SEGMENTS as u64).map(|s| at(10 + s)).collect(),
+            bootstrap_offset: 0,
+        }
+    }
+
+    fn consume() -> TpConsume {
+        TpConsume {
+            kind: CollectiveKind::AllReduce,
+            operand: crate::bundle_code::PlaceId::Act(7),
+            fragment: fragments(1, 2048, Payload::from(WireBytes::CAP)).unwrap()[0],
+            plays_at: None,
+            cut: WindowCut::of_collective(0),
+            exchange: crate::bundle_code::collective::Exchange::Round(
+                crate::bundle_code::collective::Round::baked(0),
+            ),
+        }
+    }
+
+    fn region(e: &RdmaEnd) -> u64 {
+        e.base.chunk0().unwrap().region.0
+    }
+
+    /// A consume site stages send, wait, then the barriered consume; the send reads its operand
+    /// through the consume launch's own base for that segment and lands through its weight-segment
+    /// base, signalling on this rank's sid for its slot; the wait counts the peer's for that slot.
+    #[test]
+    fn a_consume_site_is_send_wait_consume_through_its_own_bases() {
+        let rank1 = TpWorld::of::<2>().ranks().nth(1).unwrap();
+        let cut = WindowCut::of_collective(1);
+        let send = TpSend {
+            source_segment: 3,
+            source_offset: 4096,
+            window: two_rank_window(),
+            bytes: CutPayload::new(Payload::new(4096).unwrap()).unwrap(),
+            cut,
+        };
+        let slot = LandingSlot::of(cut, 0).unwrap();
+        let (own, peer) = (
+            Sid::of(rank1, slot).get(),
+            Sid::of(rank1.peers().next().unwrap(), slot).get(),
+        );
+        let bound = BoundCollective {
+            send,
+            me: rank1,
+            routes: Box::leak(PeerRoute::all(rank1).into_boxed_slice()),
+        };
+        let cbs = site_cbs(
+            SiteTp {
+                index: 5,
+                consume: Some(consume()),
+                bound: Some(bound),
+            },
+            launch(),
+        )
+        .unwrap();
+        assert_eq!(cbs.len(), 3);
+        let BatchedCb::Send(s) = &cbs[0] else {
+            panic!("the send leads");
+        };
+        assert_eq!((s.sid, s.dest_tid, s.bytes.get()), (own, 0, 4096));
+        assert_eq!(s.place, RunPlace::ALONE);
+        assert_eq!(
+            (region(&s.source), s.source.segment, s.source.offset),
+            (13, 3, 4096)
+        );
+        assert_eq!(
+            (region(&s.window), s.window.segment, s.window.offset),
+            (11, 1, (1 << 20) + WireBytes::CAP.get()),
+            "cut 1 is one region past the window's first"
+        );
+        assert!(matches!(cbs[1], BatchedCb::Wait { sid } if sid == peer));
+        assert!(matches!(cbs[2], BatchedCb::Consume(_)));
+    }
+
+    /// A send wider than one message stages as its run — every message an F-send at the matching
+    /// offset into a slot of its own, `first` / `last` on its ends — then one wait per message on
+    /// that slot's sid, then the consume: the write-done counts it raises on the peer are exactly
+    /// the counts the peer's waits take, slot by slot.
+    #[test]
+    fn a_wide_send_stages_its_messages_then_as_many_waits() {
+        let rank0 = TpWorld::of::<2>().ranks().next().unwrap();
+        let cap = WireBytes::CAP.get();
+        let cut = WindowCut::of_collective(0);
+        let send = TpSend {
+            source_segment: 0,
+            source_offset: 0,
+            window: two_rank_window(),
+            bytes: CutPayload::new(Payload::new(cap + 4096).unwrap()).unwrap(),
+            cut,
+        };
+        let slot = |m| LandingSlot::of(cut, m).unwrap();
+        let peer = rank0.peers().next().unwrap();
+        let cbs = site_cbs(
+            SiteTp {
+                index: 1,
+                consume: Some(consume()),
+                bound: Some(BoundCollective {
+                    send,
+                    me: rank0,
+                    routes: Box::leak(PeerRoute::all(rank0).into_boxed_slice()),
+                }),
+            },
+            launch(),
+        )
+        .unwrap();
+        assert_eq!(cbs.len(), 5);
+        let sends: Vec<&RdmaSend> = cbs[..2]
+            .iter()
+            .map(|c| match c {
+                BatchedCb::Send(s) => s,
+                _ => panic!("the run's sends lead"),
+            })
+            .collect();
+        assert_eq!(
+            sends
+                .iter()
+                .map(|s| (s.source.offset, s.window.offset, s.bytes.get()))
+                .collect::<Vec<_>>(),
+            [(0, 1 << 20, cap), (cap, (1 << 20) + cap, 4096)]
+        );
+        assert_eq!(
+            sends.iter().map(|s| s.place).collect::<Vec<_>>(),
+            [
+                RunPlace {
+                    first: true,
+                    last: false
+                },
+                RunPlace {
+                    first: false,
+                    last: true
+                }
+            ]
+        );
+        assert_eq!(
+            sends.iter().map(|s| s.sid).collect::<Vec<_>>(),
+            [Sid::of(rank0, slot(0)).get(), Sid::of(rank0, slot(1)).get()]
+        );
+        for (i, m) in [0, 1].into_iter().enumerate() {
+            let want = Sid::of(peer, slot(m)).get();
+            assert!(matches!(cbs[2 + i], BatchedCb::Wait { sid } if sid == want));
+        }
+        assert!(matches!(cbs[4], BatchedCb::Consume(_)));
+    }
+
+    /// A plain group is its one launch; a consume the session never bound refuses rather than
+    /// stage a consume with no send in front of it.
+    #[test]
+    fn a_plain_site_is_one_launch_and_an_unbound_consume_refuses() {
+        let plain = site_cbs(
+            SiteTp {
+                index: 0,
+                consume: None,
+                bound: None,
+            },
+            launch(),
+        )
+        .unwrap();
+        assert!(matches!(plain.as_slice(), [BatchedCb::Compute(_)]));
+        let why = site_cbs(
+            SiteTp {
+                index: 2,
+                consume: Some(consume()),
+                bound: None,
+            },
+            launch(),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(why.contains("never bound"), "{why}");
+    }
 }

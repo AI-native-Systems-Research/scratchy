@@ -124,6 +124,9 @@ pub enum Refused {
     /// there is no metal lowering to write; a node here is a wiring bug (a chain-minted
     /// graph handed to the metal tape), never a missing kernel.
     ChainedHead,
+    /// A collective: metal runs one rank, where tensor parallelism weaves none in, so a node
+    /// here is a sharded forward handed to the metal tape — a wiring bug, never a missing kernel.
+    Collective,
 }
 
 impl std::fmt::Display for StepRefusal {
@@ -2425,6 +2428,9 @@ impl Recording<'_> {
             // is the same wiring bug under the mint that constructs them.
             L::EmbedRowGather { .. } | L::ChainStage { .. } => {
                 return Err(self.no(i, Refused::ChainedHead));
+            }
+            L::AllReduce { .. } | L::AllGather { .. } => {
+                return Err(self.no(i, Refused::Collective));
             }
         }))
     }

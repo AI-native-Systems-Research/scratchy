@@ -219,6 +219,8 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::ScalarMul { .. }
             | O::SiluMul
             | O::Mean
+            | O::AllReduce { .. }
+            | O::AllGather { .. }
             | O::RopeRotate { .. }
             | O::RopeAppend { .. }
             | O::KvAppend { .. }
@@ -333,6 +335,21 @@ impl LoweringInput {
                     return Some(j);
                 }
                 (SubOp::TanhSoftCap { .. }, Some(&InputRef::Op(j))) => at = j,
+                _ => return None,
+            }
+        }
+    }
+
+    /// The source the result's vocabulary projection contracts against — its `[hidden, vocab]`
+    /// table — when the forward ends with an arity-2 projection under single-input logit
+    /// epilogues (a scale, Gemma's softcap): the tail the device draw's mints admit.
+    pub fn vocab_table(&self) -> Option<usize> {
+        let mut at = self.result;
+        loop {
+            let od = &self.ops[at];
+            match (od.op, od.inputs.as_slice()) {
+                (SubOp::MatmulTile { .. }, &[_, InputRef::Ext(w)]) => return Some(w),
+                (SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. }, &[InputRef::Op(j)]) => at = j,
                 _ => return None,
             }
         }

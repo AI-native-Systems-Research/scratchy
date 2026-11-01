@@ -368,7 +368,7 @@ impl Wiring {
     ) -> Result<(), String> {
         use crate::lower_subtile_tape_to_superdsc as sd;
         let nqh = self.geometry.nqh as u64;
-        let want = nqh * mq as u64 * score_width as u64 * 2;
+        let want = causal_mask_bytes(nqh, mq, score_width);
         match layout.place_of_tid(sd::ATTN_CAUSAL_TID) {
             Some(p) if p.size == want => Ok(()),
             Some(p) => Err(format!(
@@ -682,6 +682,13 @@ pub struct LayerWiring {
     pub kv_width: u32,
 }
 
+/// The causal mask's bytes at `nqh` query heads, `mq` rows and a `score_width`-column score axis:
+/// the `nqh · mq · score_width` fp16 elements the layout places and the host stages. ONE law, read
+/// by the load's [`Wiring::verify_causal_placement`] and by the bake's check of the same pairing.
+pub const fn causal_mask_bytes(nqh: u64, mq: u32, score_width: u32) -> u64 {
+    nqh * mq as u64 * score_width as u64 * 2
+}
+
 /// Model geometry, baked.
 ///
 /// ⛔ THE WORKER USED TO RE-READ THIS FROM `config.json` AT RUNTIME
@@ -958,6 +965,13 @@ pub struct Wiring {
 /// (the tape's ChainSeed steps replaced the EmbedRow push), stated once at
 /// the mint and read by the layout stamp's resident excuse and the bake's
 /// binding-check arm; the worker never names it.
+///
+/// `block` is the table columns one rank's gather reads (the mint's own `block`): the widened
+/// table's pad at a world of one, a rank's vocabulary block when the projection is split. With the
+/// rank a session plays as, it is the rank's [`ChainBlock`] ([`chain_block`]) — the one fact the
+/// tables and the seeds both decompose a pick through.
+///
+/// [`ChainBlock`]: scratchy_subtile::subtile_ir::ChainBlock
 #[derive(Clone, Copy, Debug)]
 pub struct ChainWiring {
     pub s_src: u32,
@@ -965,6 +979,18 @@ pub struct ChainWiring {
     pub k: u32,
     pub hidden: u32,
     pub replaces: u32,
+    pub block: u32,
+}
+
+/// ⭐ THE BLOCK A SESSION'S CHAINED HEAD GATHERS — `width` columns at the origin of the rank `me`
+/// plays as; rank 0's, the whole table, for a session of a world of one (`None`). Bound at load
+/// from the session's own seat, never baked: one bake serves every rank, and the rank lives only
+/// in the bytes each rank stages (its tables, its seeds).
+pub fn chain_block(
+    width: u32,
+    me: Option<crate::bundle_code::collective::TpIdentity>,
+) -> scratchy_subtile::subtile_ir::ChainBlock {
+    scratchy_subtile::subtile_ir::ChainBlock::of_rank(width, me.map_or(0, |m| m.rank()))
 }
 
 /// ⭐ THE GRAPH'S OWN CHAIN FACT — read once off the mint by `chain_of_ir`
@@ -1028,10 +1054,14 @@ pub enum LoadConst {
     /// at the mint beside it — the l-tab's LANE RAMP
     /// `64·(i mod (hidden/64)) + (t&63)` reads its entry count from it), so
     /// the staging is self-contained: the fill never re-derives either.
+    ///
+    /// `block` is the mint's own block width ([`ChainWiring::block`]); the rank's origin is bound
+    /// when the session stages the table ([`Self::build`]'s `me`).
     ChainStageTable {
         pad_vocab: u32,
         k: u32,
         hidden: u32,
+        block: u32,
         operand: u8,
     },
 }
@@ -1043,7 +1073,13 @@ impl LoadConst {
     /// on one leg only). PURE IN THE ARRANGEMENT: a `Dl16ToFp32` entry's bytes
     /// come out already permuted into the stagger the consuming island reads,
     /// so every leg that calls here stages identical bytes by construction.
-    pub fn build(&self) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
+    ///
+    /// `me` is the rank the staging session plays as (`None` at a world of one): the chain's
+    /// tables are its rank's [`chain_block`]; every other kind is the same on every rank.
+    pub fn build(
+        &self,
+        me: Option<crate::bundle_code::collective::TpIdentity>,
+    ) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
         match *self {
             LoadConst::SampleTable {
                 vocab,
@@ -1079,12 +1115,14 @@ impl LoadConst {
                 pad_vocab,
                 k,
                 hidden,
+                block,
                 operand,
             } => {
-                let (bytes, dt, shape) = chain_staged_tables(pad_vocab, k, hidden)
-                    .into_iter()
-                    .nth((operand - 1) as usize)
-                    .expect("the mint emits operand 1..=2 — the registry's own row");
+                let (bytes, dt, shape) =
+                    chain_staged_tables(pad_vocab, k, hidden, chain_block(block, me))
+                        .into_iter()
+                        .nth((operand - 1) as usize)
+                        .expect("the mint emits operand 1..=2 — the registry's own row");
                 (bytes, dt, shape)
             }
         }
@@ -1121,8 +1159,11 @@ impl LoadConst {
     /// pointwise island reads; a one-word-per-row table has no lane stream to
     /// permute, and a mark on one is a mint/propagation disagreement — refuse
     /// it, never permute the rows' words.
-    pub fn card_bytes(&self) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
-        let (bytes, dt, shape) = self.build();
+    pub fn card_bytes(
+        &self,
+        me: Option<crate::bundle_code::collective::TpIdentity>,
+    ) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
+        let (bytes, dt, shape) = self.build(me);
         // Only the sampler's own tables carry the uniform-col class; every
         // other kind — the chain's decompose ramps — falls through VERBATIM,
         // and a second such kind arrives here by this match failing to
@@ -1266,6 +1307,13 @@ pub fn stage_col_stick_heads<const N: usize>(
 /// BEFORE any consumer of the sentinel rows runs, so those rows are bus
 /// safety, never a value the forward reads.
 ///
+/// ⭐ A RANK'S TABLES ARE ITS BLOCK'S (`block`, the session's [`chain_block`]).
+/// At a world of one the block is the whole widened table and the rows above
+/// are exact. When the vocabulary projection is split, a row whose pick another
+/// rank holds stages the sentinel's values too — this rank's ZERO addend,
+/// which the analysis's all-reduce sums with the owner's row — and an owned
+/// pick decomposes at its column within the block.
+///
 /// ⛔ THE WORDS ARE THE DEVICE ENCODING — SENUINT32 lane values as u32 LE
 /// words, `DType::I32`. The staging door for I32 consts is the VERBATIM
 /// one (`raw_ids`' law: LE bytes are the device encoding for raw integer
@@ -1274,6 +1322,7 @@ pub fn chain_staged_tables(
     pad_vocab: u32,
     k: u32,
     hidden: u32,
+    block: scratchy_subtile::subtile_ir::ChainBlock,
 ) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
     // The mint stated k; the fill TRUSTS it — and a k outside the law's
     // window would not mis-fill, it would UNNAME (k = 0 dies a divide-by-
@@ -1292,14 +1341,16 @@ pub fn chain_staged_tables(
         pad_vocab as usize + scratchy_subtile::subtile_ir::SAMPLE_SENTINEL_OFFSET as usize + 1;
     let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
     // The stab row is the LANE PATTERN, not a splat: lane i names entry
-    // k·(t>>6) + (i mod k) of the weight's slab-major staging. Past
-    // pad_vocab the base clamps to s = 0, so every lane stays a quarter of
-    // slab 0 — the clamp's bus safety under the entry-word encoding.
+    // k·s + (i mod k) of the weight's slab-major staging, `s` the pick's slab
+    // within the rank's block (`chain_s_row`, the one spelling the seeds
+    // share). A pick the block does not hold — past the pad at a world of
+    // one, outside the rank's columns when the table is split — clamps to
+    // s = 0, so every lane stays a quarter of slab 0: the clamp's bus safety
+    // under the entry-word encoding.
     let mut stab = Vec::with_capacity(rows * lanes * 4);
     for t in 0..rows as u32 {
-        let base = if t < pad_vocab { k * (t >> 6) } else { 0 };
-        for i in 0..lanes as u32 {
-            stab.extend_from_slice(&(base + i % k).to_le_bytes());
+        for w in scratchy_subtile::subtile_ir::chain_s_row(k, t, block) {
+            stab.extend_from_slice(&w.to_le_bytes());
         }
     }
     // The ltab row is the pick's WHOLE LANE RAMP, not a splat: word `i` names
@@ -1314,11 +1365,7 @@ pub fn chain_staged_tables(
     let l_words = l_sticks * lanes;
     let mut ltab = Vec::with_capacity(rows * l_words * 4);
     for t in 0..rows as u32 {
-        let row = if t < pad_vocab {
-            scratchy_subtile::subtile_ir::chain_l_stick_ramp(t & 63, hidden)
-        } else {
-            scratchy_subtile::subtile_ir::chain_l_sentinel_ramp(hidden)
-        };
+        let row = scratchy_subtile::subtile_ir::chain_l_row(t, hidden, block);
         // The fill and the shape are ONE law: the ramp is self-sized at the
         // stick count, so a row's length IS the placement's word count —
         // asserted here, never trusted, so the two cannot drift by a silent
@@ -1770,6 +1817,275 @@ pub struct Wirings {
     pub decode: Wiring,
     /// `None` when the model bakes no batched-prefill program.
     pub prefill: Option<Wiring>,
+}
+
+/// How each rank loads a source — the shared analysis's slice law, re-exported so the tokens
+/// `#[forward]` emits name one path and a loader slices through
+/// `scratchy_subtile::tensor_parallel::slice_source`, the one implementation of it.
+pub use scratchy_subtile::tensor_parallel::SourceShard;
+
+/// ⭐ ONE SHARDED WORLD'S FORWARD, AS `#[forward]` BAKED IT — what a session running as one rank
+/// of `world` loads instead of the one-rank wiring.
+///
+/// ⛔ THE WORLD TRAVELS WITH ITS BUNDLE. A session constructed for one world must not run a bundle
+/// baked for another: the shapes it stages, the window its consumes read and the peer it sends to
+/// are all the world's. Selecting a forward is matching `world` against the session's
+/// `TpIdentity::world`, never an index or a flag.
+pub struct TpForward {
+    pub world: crate::bundle_code::collective::TpWorld,
+    /// The rank-local decode bundle — the same on every rank (one bake serves the world).
+    pub decode: crate::manifest::KtirBundleData,
+    /// The rank-local batched-prefill bundle, when the model bakes one.
+    pub prefill: Option<crate::manifest::KtirBundleData>,
+    /// Their launch wirings, numbered by the rank-local forwards' own tensor ids.
+    pub wirings: Wirings,
+    /// Per source of the one-rank forward (same indices): the slice each rank loads.
+    pub sources: &'static [SourceShard],
+    /// ⭐ THIS WORLD'S THREE LADDERS — the rank-local bundles of the prefill-width ladder, the decode
+    /// batch ladder and the prefix-capable (continuation-chunk) ladder, baked in this world and
+    /// rendered by the one renderer a one-rank manifest group's ladders go through. Same types, same
+    /// rules ([`crate::manifest::SengraphBundleGroup`]): the prefill and decode ladders are empty
+    /// unless more than one width baked; the prefix ladder carries every width that baked. Without
+    /// them a sharded world decodes one request per step and has no bundle for a prompt's
+    /// continuation chunks.
+    pub prefill_rungs: &'static [(u32, &'static str)],
+    pub decode_rungs: &'static [(
+        crate::manifest::RungSeqs,
+        crate::manifest::SweptCols,
+        crate::manifest::BundleSentinel,
+        crate::manifest::RungLoadConsts,
+    )],
+    pub prefill_prefix: &'static [(u32, &'static str)],
+}
+
+/// Why rank `me`'s share of a source could not be cut from its checkpoint bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SliceRefusal {
+    /// The sharded forward states no slice law for this source.
+    NotASource { id: u32, sources: usize },
+    /// The whole tensor's bytes are not its one-rank shape's.
+    Size { id: u32, bytes: usize, want: usize },
+    /// The element width has no byte-exact cut here.
+    Element { id: u32, bytes: usize },
+    /// The split axis does not divide by the world.
+    Indivisible {
+        id: u32,
+        shard: SourceShard,
+        rows: u32,
+        cols: u32,
+    },
+    /// A head-block split of a gemm weight — a law the analysis gives caches, not weights.
+    HeadSplitGemm { id: u32 },
+}
+
+impl std::fmt::Display for SliceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotASource { id, sources } => write!(
+                f,
+                "source {id} has no slice law (the sharded forward states {sources})"
+            ),
+            Self::Size { id, bytes, want } => write!(
+                f,
+                "source {id} is {bytes} bytes on disk, but its one-rank shape spans {want}"
+            ),
+            Self::Element { id, bytes } => {
+                write!(f, "source {id}: a {bytes}-byte element has no cut")
+            }
+            Self::Indivisible {
+                id,
+                shard,
+                rows,
+                cols,
+            } => write!(
+                f,
+                "source {id} [{rows}, {cols}] does not split {shard:?} across the world"
+            ),
+            Self::HeadSplitGemm { id } => {
+                write!(f, "source {id} is a gemm weight with a head-block split")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SliceRefusal {}
+
+/// The shared analysis's names for `me`'s rank and world.
+fn analysis_rank(
+    me: crate::bundle_code::collective::TpIdentity,
+) -> (
+    scratchy_subtile::tensor_parallel::RankIndex,
+    scratchy_subtile::tensor_parallel::WorldSize,
+) {
+    use scratchy_subtile::tensor_parallel::WorldSize;
+    let world = crate::tp_plan::SpyreWorld::sharded(me.world().get())
+        .map_or(WorldSize::of::<1>(), crate::tp_plan::SpyreWorld::analysis);
+    let rank = world
+        .ranks()
+        .nth(me.rank() as usize)
+        .expect("a TpIdentity's rank is below its world");
+    (rank, world)
+}
+
+impl TpForward {
+    /// ⭐ THE BYTES RANK `me` STAGES FOR SOURCE `id`: its share of the whole checkpoint tensor
+    /// `full`, cut by the slice law the analysis derived for that source ([`Self::sources`]) —
+    /// `scratchy_subtile::tensor_parallel::slice_source`, the one implementation of it.
+    ///
+    /// `whole` is the source's one-rank shape (the one-rank wiring's `tensor_shapes`) and `elem`
+    /// its element width. A gemm weight sits on disk as `[n, k]`, the transpose of its logical
+    /// `[k, n]`, so its row and column laws trade places on the bytes.
+    ///
+    /// # Errors
+    /// [`SliceRefusal`], by name.
+    pub fn slice_source_bytes(
+        &self,
+        me: crate::bundle_code::collective::TpIdentity,
+        id: u32,
+        full: Vec<u8>,
+        elem: usize,
+        whole: (u32, u32),
+        is_gemm: bool,
+    ) -> Result<Vec<u8>, SliceRefusal> {
+        let shard = *self
+            .sources
+            .get(id as usize)
+            .ok_or(SliceRefusal::NotASource {
+                id,
+                sources: self.sources.len(),
+            })?;
+        cut_source_bytes(shard, me, id, full, elem, whole, is_gemm)
+    }
+}
+
+/// [`TpForward::slice_source_bytes`] once the source's law is known.
+fn cut_source_bytes(
+    shard: SourceShard,
+    me: crate::bundle_code::collective::TpIdentity,
+    id: u32,
+    full: Vec<u8>,
+    elem: usize,
+    whole: (u32, u32),
+    is_gemm: bool,
+) -> Result<Vec<u8>, SliceRefusal> {
+    use scratchy_subtile::subtile_ir::SourceShape;
+    use scratchy_subtile::tensor_parallel::slice_source;
+    if shard == SourceShard::Whole {
+        return Ok(full);
+    }
+    let (rows, cols) = whole;
+    let want = rows as usize * cols as usize * elem;
+    if full.len() != want {
+        return Err(SliceRefusal::Size {
+            id,
+            bytes: full.len(),
+            want,
+        });
+    }
+    let w = me.world().get();
+    let divides = match shard {
+        SourceShard::Whole
+        | SourceShard::Partial
+        | SourceShard::ColBlocks { .. }
+        | SourceShard::RowBlocks { .. } => true,
+        SourceShard::Rows => rows.is_multiple_of(w),
+        SourceShard::Cols => cols.is_multiple_of(w),
+        SourceShard::HeadRows { heads } => {
+            heads.get().is_multiple_of(w) && rows.is_multiple_of(heads.get())
+        }
+    };
+    if !divides {
+        return Err(SliceRefusal::Indivisible {
+            id,
+            shard,
+            rows,
+            cols,
+        });
+    }
+    // The bytes' own layout: a gemm weight's disk order is the transpose of its logical one.
+    let (shape, shard) = if is_gemm {
+        let disk = SourceShape {
+            rows: cols,
+            cols: rows,
+        };
+        match shard {
+            SourceShard::Rows => (disk, SourceShard::Cols),
+            SourceShard::Cols => (disk, SourceShard::Rows),
+            SourceShard::ColBlocks { block } => (disk, SourceShard::RowBlocks { block }),
+            SourceShard::RowBlocks { block } => (disk, SourceShard::ColBlocks { block }),
+            // Rank 0 holds the value and every other rank zeros, in either byte order.
+            SourceShard::Whole | SourceShard::Partial => (disk, shard),
+            SourceShard::HeadRows { .. } => return Err(SliceRefusal::HeadSplitGemm { id }),
+        }
+    } else {
+        (SourceShape { rows, cols }, shard)
+    };
+    let (rank, world) = analysis_rank(me);
+    fn cut<const N: usize>(
+        full: &[u8],
+        shape: SourceShape,
+        shard: SourceShard,
+        rank: scratchy_subtile::tensor_parallel::RankIndex,
+        world: scratchy_subtile::tensor_parallel::WorldSize,
+    ) -> Vec<u8> {
+        let (elems, _) = full.as_chunks::<N>();
+        slice_source(elems, shape, shard, rank, world).into_flattened()
+    }
+    match elem {
+        1 => Ok(cut::<1>(&full, shape, shard, rank, world)),
+        2 => Ok(cut::<2>(&full, shape, shard, rank, world)),
+        4 => Ok(cut::<4>(&full, shape, shard, rank, world)),
+        bytes => Err(SliceRefusal::Element { id, bytes }),
+    }
+}
+
+/// Which forward a session runs — decided by its rank's world, and nothing else.
+pub enum WorldForward {
+    /// A world of one: the model's one-rank wiring.
+    OneRank,
+    /// A sharded world: the forward the bake sharded for it.
+    Sharded(&'static TpForward),
+}
+
+/// A session whose world has no forward.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorldNotBaked {
+    pub world: u32,
+    /// The sharded worlds the model DID bake.
+    pub baked: Vec<u32>,
+}
+
+impl std::fmt::Display for WorldNotBaked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this model has no forward for a {}-rank world (it baked {:?}): build with \
+             `--features tp/{}`, or see the bake's `[spyre-tp]` warning for why it was skipped",
+            self.world, self.baked, self.world
+        )
+    }
+}
+
+/// ⭐ THE ONE SELECTION: the forward a session running as `identity` loads. A world of one runs the
+/// one-rank wiring; a sharded world runs exactly the forward baked for it, or the load refuses by
+/// name — never a fallback to the one-rank forward (whose shapes are the whole model's, not a
+/// rank's) and never another world's.
+pub fn forward_for(
+    sharded: &'static [TpForward],
+    identity: crate::bundle_code::collective::TpIdentity,
+) -> Result<WorldForward, WorldNotBaked> {
+    let world = identity.world();
+    if !world.is_sharded() {
+        return Ok(WorldForward::OneRank);
+    }
+    sharded
+        .iter()
+        .find(|f| f.world == world)
+        .map(WorldForward::Sharded)
+        .ok_or_else(|| WorldNotBaked {
+            world: world.get(),
+            baked: sharded.iter().map(|f| f.world.get()).collect(),
+        })
 }
 
 impl Wiring {
@@ -2598,6 +2914,7 @@ mod constant_tape_tests {
                     embed_tokens: &[],
                     tokens: &[],
                     chain_seeds: None,
+                    seat: None,
                     positions: &[],
                     causal,
                     prefix: None,
@@ -2700,5 +3017,89 @@ mod constant_tape_tests {
             ),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tp_slice_tests {
+    use super::*;
+    use crate::bundle_code::collective::TpWorld;
+
+    /// A gemm weight's bytes sit on disk as `[n, k]`: its K-split (`Rows`) takes a column block of
+    /// those bytes and its N-split (`Cols`) a row block, each rank its own, and a `Whole` source
+    /// passes through untouched — a multi-byte element moving as one.
+    #[test]
+    fn a_rank_stages_its_block_of_the_disk_bytes() {
+        let world = TpWorld::of::<2>();
+        let (r0, r1) = (world.rank(0).unwrap(), world.rank(1).unwrap());
+        // Logical [k=2, n=4]; on disk [n=4, k=2], element (n, k) = 10·n + k.
+        let disk: Vec<u8> = (0..4u8)
+            .flat_map(|n| (0..2u8).map(move |k| 10 * n + k))
+            .collect();
+        let cut = |shard, me| cut_source_bytes(shard, me, 7, disk.clone(), 1, (2, 4), true);
+        assert_eq!(cut(SourceShard::Rows, r0), Ok(vec![0, 10, 20, 30]));
+        assert_eq!(cut(SourceShard::Rows, r1), Ok(vec![1, 11, 21, 31]));
+        assert_eq!(cut(SourceShard::Cols, r0), Ok(vec![0, 1, 10, 11]));
+        assert_eq!(cut(SourceShard::Cols, r1), Ok(vec![20, 21, 30, 31]));
+        assert_eq!(cut(SourceShard::Whole, r1), Ok(disk.clone()));
+        // A two-byte element moves as one: a norm row [1, 4] split by columns.
+        let row: Vec<u8> = (0..8).collect();
+        assert_eq!(
+            cut_source_bytes(SourceShard::Cols, r1, 3, row, 2, (1, 4), false),
+            Ok(vec![4, 5, 6, 7])
+        );
+    }
+
+    /// An uneven vocabulary's padded N-split (`ColBlocks`) is a row block of the disk bytes like
+    /// the even one, the last rank's rows past the vocabulary staged zero — the columns its local
+    /// projection computes and the all-gather crops.
+    #[test]
+    fn a_padded_block_stages_zeros_past_the_source() {
+        let world = TpWorld::of::<2>();
+        let (r0, r1) = (world.rank(0).unwrap(), world.rank(1).unwrap());
+        // Logical [k=2, n=3]; on disk [n=3, k=2], element (n, k) = 10·n + k.
+        let disk: Vec<u8> = (0..3u8)
+            .flat_map(|n| (0..2u8).map(move |k| 10 * n + k))
+            .collect();
+        let block = SourceShard::ColBlocks {
+            block: std::num::NonZeroU32::new(2).unwrap(),
+        };
+        let cut = |me| cut_source_bytes(block, me, 7, disk.clone(), 1, (2, 3), true);
+        assert_eq!(cut(r0), Ok(vec![0, 1, 10, 11]));
+        assert_eq!(cut(r1), Ok(vec![20, 21, 0, 0]));
+    }
+
+    /// Every cut it cannot make byte-exactly is refused by name.
+    #[test]
+    fn a_cut_it_cannot_make_is_refused() {
+        let r0 = TpWorld::of::<2>().rank(0).unwrap();
+        assert_eq!(
+            cut_source_bytes(SourceShard::Cols, r0, 1, vec![0; 6], 1, (2, 4), false),
+            Err(SliceRefusal::Size {
+                id: 1,
+                bytes: 6,
+                want: 8
+            })
+        );
+        assert_eq!(
+            cut_source_bytes(SourceShard::Cols, r0, 1, vec![0; 3], 1, (1, 3), false),
+            Err(SliceRefusal::Indivisible {
+                id: 1,
+                shard: SourceShard::Cols,
+                rows: 1,
+                cols: 3
+            })
+        );
+        assert_eq!(
+            cut_source_bytes(SourceShard::Rows, r0, 1, vec![0; 24], 3, (2, 4), true),
+            Err(SliceRefusal::Element { id: 1, bytes: 3 })
+        );
+        let heads = SourceShard::HeadRows {
+            heads: std::num::NonZeroU32::new(2).unwrap(),
+        };
+        assert_eq!(
+            cut_source_bytes(heads, r0, 1, vec![0; 8], 1, (2, 4), true),
+            Err(SliceRefusal::HeadSplitGemm { id: 1 })
+        );
     }
 }

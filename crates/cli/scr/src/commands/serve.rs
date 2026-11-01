@@ -130,6 +130,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         pipeline_parallel_size: args.pipeline_parallel_size,
         num_nodes: args.num_nodes,
         node_rank: args.node_rank,
+        tp_cards: args.tp_cards.clone(),
         master_addr: args.master_addr.clone(),
         master_port: args.master_port,
         disable_async_scheduling: args.disable_async_scheduling,
@@ -183,6 +184,20 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         })
         .await
         .expect("initialize_and_run_follower panicked");
+    }
+
+    // A follower rank of a spyre world: its own card, stepped by rank 0; no engine, no HTTP server.
+    #[cfg(feature = "spyre-hw")]
+    if scratchy_serving_api::init::is_spyre_follower(&config) {
+        info!(
+            "Spyre rank {} of {}: entering headless mode",
+            config.node_rank, config.tensor_parallel_size
+        );
+        return tokio::task::spawn_blocking(move || {
+            scratchy_serving_api::init::initialize_and_run_spyre_follower(&config)
+        })
+        .await
+        .expect("initialize_and_run_spyre_follower panicked");
     }
 
     // Keep a clone for /server_info (before we move config into the blocking task).

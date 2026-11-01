@@ -20,6 +20,21 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, OnceLock};
 
+// ⭐ THE COLLECTIVE PLAN'S TWO WIRE FACTS ARE THE RUNTIME'S. The bundle crate is a leaf and cannot
+// name flex-rs, so it declares the message cap and the flit itself; this is the one place both
+// crates are in scope, and a disagreement fails the build here rather than cutting a fragment the
+// card refuses or misaligning a window.
+const _: () = {
+    assert!(
+        crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES
+            == flex_rs::multi_device::MAX_HDMA_MESSAGE_BYTES
+    );
+    assert!(
+        crate::bundle_code::collective::FLIT_BYTES == flex_rs::control_block_wire::Flits::BYTES
+    );
+};
+
+use crate::bundle_code::collective::{LandingSlot, PeerRegion, RecvWindow, Sid, TpIdentity};
 use flex_rs::address::{Chunk, CompositeAddress, LogicalAddress, RegionId};
 use flex_rs::allocator::{
     AllocationDirective, AllocationDirectiveError, FlexAllocator, FlexAllocatorError,
@@ -36,8 +51,9 @@ use flex_rs::memory_region::{DomainId, MemoryType};
 use flex_rs::runtime::{RuntimeContext, RuntimeContextError};
 use flex_rs::scheduler::{
     DeviceAddressResolver, FlexAllocatorAddressResolver, HardwareSubmit, QueueCapacitySource,
-    SchedulerBackendConfig, SchedulerFactoryError, SenlibHardwareSubmit, SenlibQueueCapacity,
-    build_compute_cb, create_scheduler,
+    RdmaOperand, RdmaSendParams, SchedulerBackendConfig, SchedulerFactoryError,
+    SenlibHardwareSubmit, SenlibQueueCapacity, build_compute_cb, build_rdma_send_cb,
+    create_scheduler,
 };
 use flex_rs::shared_host_pool::{SharedHostPool, SharedHostPoolError};
 use flex_rs::stream::{
@@ -62,9 +78,35 @@ fn runtime_cell() -> &'static Mutex<Option<RuntimeInit>> {
 /// asked the topology which domain is real, and this module does not invent a multi-domain
 /// topology query that has no call site anywhere else.
 fn build_runtime() -> Result<Arc<RuntimeContext>, BringUpError> {
-    let rc = unsafe { flex_rs::senlib_ffi::flex_shim_init_runtime(0) };
-    if rc != 0 {
-        return Err(BringUpError::ShimInit(rc));
+    match card_cell().get() {
+        // ⭐ THE BIND, AND ITS PROOF (#1008's doors, as the tp37 cell runs them): open the card
+        // by its address, then hold senlib's own resolution of the open card to it before
+        // anything else touches the device.
+        Some(pci) => {
+            flex_rs::senlib_ffi::init_runtime_bdf(pci.as_str()).map_err(|why| {
+                BringUpError::OpenAt {
+                    pci: pci.clone(),
+                    why,
+                }
+            })?;
+            let resolved = flex_rs::senlib_ffi::resolved_pci();
+            if !resolved
+                .as_deref()
+                .is_ok_and(|r| r.eq_ignore_ascii_case(pci.as_str()))
+            {
+                return Err(BringUpError::WrongCard {
+                    asked: pci.clone(),
+                    resolved,
+                });
+            }
+        }
+        // No card was chosen: the shim's first available device, as every one-card host runs.
+        None => {
+            let rc = unsafe { flex_rs::senlib_ffi::flex_shim_init_runtime(0) };
+            if rc != 0 {
+                return Err(BringUpError::ShimInit(rc));
+            }
+        }
     }
 
     // Real single on-card domain, sized off the card's actual HBM capacity
@@ -108,6 +150,145 @@ fn build_runtime() -> Result<Arc<RuntimeContext>, BringUpError> {
     .map_err(BringUpError::Scheduler)?;
 
     RuntimeContext::create(None, scheduler, allocator).map_err(BringUpError::Context)
+}
+
+/// ⭐ A CARD'S PCI ADDRESS — `dddd:bb:dd.f` (domain, bus, device, function), lowercase: what senlib
+/// selects a card by (`flex_rs::senlib_ffi::init_runtime_bdf`, `SenPci::pf(const std::string&)`)
+/// and reports back (`resolved_pci`, the same lowercase form). Minted only by
+/// [`PciAddress::parse`], so a value is always one address the doors can be handed whole.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PciAddress(String);
+
+/// A string that is not a `dddd:bb:dd.f` PCI address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotAPciAddress(pub String);
+
+impl fmt::Display for NotAPciAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:?} is not a PCI address — a card is named `dddd:bb:dd.f` (domain, bus, device, \
+             function), e.g. `0000:3b:00.0`",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NotAPciAddress {}
+
+impl PciAddress {
+    /// `Ok` iff `s` is `dddd:bb:dd.f`: four, two and two hex digits and a function 0–7. Hex
+    /// digits are taken in either case and kept lowercase.
+    ///
+    /// # Errors
+    /// [`NotAPciAddress`].
+    pub fn parse(s: &str) -> Result<Self, NotAPciAddress> {
+        let hex = |p: &str, n: usize| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit());
+        let well_formed = match s.split([':', '.']).collect::<Vec<_>>().as_slice() {
+            [domain, bus, device, function] => {
+                hex(domain, 4)
+                    && hex(bus, 2)
+                    && hex(device, 2)
+                    && matches!(function.as_bytes(), [b'0'..=b'7'])
+                    && s.as_bytes()[4] == b':'
+                    && s.as_bytes()[7] == b':'
+                    && s.as_bytes()[10] == b'.'
+            }
+            _ => false,
+        };
+        if well_formed {
+            Ok(Self(s.to_ascii_lowercase()))
+        } else {
+            Err(NotAPciAddress(s.to_string()))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PciAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Which card a process's runtime opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DrivenCard {
+    /// The shim's first available device — what a process that chose none opens.
+    FirstAvailable,
+    /// The card at this address ([`drive_card`]).
+    At(PciAddress),
+}
+
+impl fmt::Display for DrivenCard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FirstAvailable => f.write_str("the first available card"),
+            Self::At(pci) => write!(f, "the card at {pci}"),
+        }
+    }
+}
+
+fn card_cell() -> &'static OnceLock<PciAddress> {
+    static CARD: OnceLock<PciAddress> = OnceLock::new();
+    &CARD
+}
+
+/// The card this process's runtime opens: the one [`drive_card`] chose, else the first available.
+pub fn driven_card() -> DrivenCard {
+    card_cell().get().map_or(DrivenCard::FirstAvailable, |pci| {
+        DrivenCard::At(pci.clone())
+    })
+}
+
+/// The process already drives another card. A process holds ONE runtime (senlib's PF handle is
+/// process-global), so it drives one card for its life.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardTaken {
+    pub driving: DrivenCard,
+    pub asked: PciAddress,
+}
+
+impl fmt::Display for CardTaken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "this process already drives {} and cannot open the card at {} — one runtime per \
+             process, one card per runtime",
+            self.driving, self.asked
+        )
+    }
+}
+
+impl std::error::Error for CardTaken {}
+
+/// Choose the card this process drives, by its PCI address, BEFORE anything brings the runtime up
+/// (a bring-up with no choice opens the first available card and fixes it). Choosing the card
+/// already chosen is a no-op.
+///
+/// # Errors
+/// [`CardTaken`] when the process already drives (or chose) another card.
+pub fn drive_card(card: &PciAddress) -> Result<(), CardTaken> {
+    // Held across the choice: a bring-up reads the choice under this same lock, so none can start
+    // between the check and the choice.
+    let runtime = runtime_cell().lock().unwrap_or_else(|e| e.into_inner());
+    let driving = if runtime.is_some() {
+        driven_card()
+    } else {
+        DrivenCard::At(card_cell().get_or_init(|| card.clone()).clone())
+    };
+    drop(runtime);
+    if driving == DrivenCard::At(card.clone()) {
+        Ok(())
+    } else {
+        Err(CardTaken {
+            driving,
+            asked: card.clone(),
+        })
+    }
 }
 
 fn get_or_init_runtime() -> Result<Arc<RuntimeContext>, Arc<BringUpError>> {
@@ -305,7 +486,7 @@ pub enum HwError {
     /// `RuntimeContext::reset` refused.
     Reset(RuntimeContextError),
     /// Rendering compute-CB wire images OFF the submit path refused — the CB
-    /// encoder cannot express an operand ([`Stream::render_compute_batch`]).
+    /// encoder cannot express an operand ([`Stream::render_batch`]).
     /// Never a submission: nothing was sent to the device.
     CbRender(SchedulerError),
     /// A #606 pooled copy ([`Stream::pooled_copy_on_compute`]) was refused by the
@@ -344,6 +525,13 @@ impl std::error::Error for HwError {}
 pub enum BringUpError {
     /// `flex_shim_init_runtime` — the senlib device init — returned a nonzero rc.
     ShimInit(i32),
+    /// The card the process chose ([`drive_card`]) would not open at its address.
+    OpenAt { pci: PciAddress, why: String },
+    /// The open card is not the one asked for: senlib resolved another address (or none).
+    WrongCard {
+        asked: PciAddress,
+        resolved: Result<String, String>,
+    },
     /// `FlexAllocator::new` refused the domain topology.
     AllocatorInit(FlexAllocatorError),
     /// `create_scheduler` refused the device kind / chip.
@@ -356,6 +544,18 @@ impl fmt::Display for BringUpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ShimInit(rc) => write!(f, "flex_shim_init_runtime failed: rc={rc}"),
+            Self::OpenAt { pci, why } => write!(f, "the card at {pci} did not open: {why}"),
+            Self::WrongCard { asked, resolved } => match resolved {
+                Ok(r) => write!(
+                    f,
+                    "asked for the card at {asked}, but senlib opened {r} — the bind did not \
+                     select the card"
+                ),
+                Err(why) => write!(
+                    f,
+                    "asked for the card at {asked}, but senlib resolves no open card: {why}"
+                ),
+            },
             Self::AllocatorInit(e) => write!(f, "{e}"),
             Self::Scheduler(e) => write!(f, "{e}"),
             Self::Context(e) => write!(f, "{e}"),
@@ -928,32 +1128,22 @@ impl Stream {
     /// JobPlanStepCompute (the resident binary runs by its bootstrap address; dxp does not
     /// apply `tensor_byte_offsets` to per-op addresses). Widening this to a general batch
     /// door means growing [`BatchedCompute`], not a new method.
-    pub fn compute_batch(
+    fn compute_batch<'l>(
         &self,
-        launches: &[BatchedCompute],
+        launches: impl Iterator<Item = &'l BatchedCompute>,
         pipeline_barrier: bool,
     ) -> Result<(), HwError> {
         let stream = self.live()?;
-        let params: Vec<ComputeParams> = launches
-            .iter()
-            .map(|l| {
-                ComputeParams::new(
-                    l.prog.0.clone(),
-                    l.tensor_allocs.iter().map(|a| a.0.clone()).collect(),
-                    KernelName(String::new()),
-                    BootstrapOffset(l.bootstrap_offset),
-                    Vec::new(),
-                )
-            })
-            .collect();
+        let params: Vec<ComputeParams> = launches.map(BatchedCompute::params).collect();
         stream
             .launch_compute_batch(params, pipeline_barrier, None)
             .map_err(HwError::Stream)
     }
 
-    /// Render the wire bytes of a compute batch WITHOUT submitting it (#603
+    /// Render the wire bytes of a staged batch WITHOUT submitting it (#603
     /// PR2's image-render door): the same `flex_rs::scheduler::build_compute_cb`
-    /// the submit path runs per CB, over the same resolver TYPE the Pf backend
+    /// the submit path runs per compute CB, and `build_rdma_send_cb` for a
+    /// collective's send, over the same resolver TYPE the Pf backend
     /// resolves with (`FlexAllocatorAddressResolver` on the runtime's own
     /// allocator — the very `Arc` `build_runtime` handed the backend, so the
     /// region map both read is one map), at CALLER-chosen tags. Tags only
@@ -966,9 +1156,9 @@ impl Stream {
     /// (`superdsc_exec::Executor::prepare`) renders one step's batch both the
     /// walk way and the CbPlan way THROUGH THIS ONE DOOR, so what it compares
     /// is exactly what the device would be handed.
-    pub fn render_compute_batch(
+    pub fn render_batch(
         &self,
-        launches: &[BatchedCompute],
+        items: &[BatchedCb],
         first_tag: u32,
     ) -> Result<Vec<ControlBlockWire>, HwError> {
         let resolver = FlexAllocatorAddressResolver::new(
@@ -976,29 +1166,66 @@ impl Stream {
                 .get_allocator()
                 .map_err(|e| HwError::Alloc(AllocError::Context(e)))?,
         );
-        let mut cbs = Vec::with_capacity(launches.len());
-        for (i, l) in launches.iter().enumerate() {
-            let params = ComputeParams::new(
-                l.prog.0.clone(),
-                l.tensor_allocs.iter().map(|a| a.0.clone()).collect(),
-                KernelName(String::new()),
-                BootstrapOffset(l.bootstrap_offset),
-                Vec::new(),
-            );
-            cbs.push(
-                build_compute_cb(&resolver, &params, ResponseTag(first_tag + i as u32))
+        let compute = |l: &BatchedCompute, tag: ResponseTag| {
+            build_compute_cb(&resolver, &l.params(), tag).map_err(HwError::CbRender)
+        };
+        let mut cbs = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let tag = ResponseTag(first_tag + i as u32);
+            cbs.push(match item {
+                BatchedCb::Compute(l) => compute(l, tag)?,
+                BatchedCb::Consume(l) => compute(l, tag)?.with_ctrl_barrier(),
+                // ⭐ THE SEND WAITS FOR ITS PRODUCER: the barrier keeps the DMA engine from
+                // reading the operand before the compute that writes it has retired.
+                BatchedCb::Send(s) => build_rdma_send_cb(&resolver, &s.params(), tag, true)
                     .map_err(HwError::CbRender)?,
-            );
+                // `submit_p2p_rdma_wait`'s CB, in the stream: #1008's wdone door (`sync` set),
+                // placed by its builder.
+                BatchedCb::Wait { sid } => ControlBlockWire::p2p_rdma_wait(
+                    tag,
+                    flex_rs::hal_sbf::rdma10_wdone_wait(&[u64::from(*sid)], true)
+                        .map_err(|e| HwError::CbRender(format!("rdma10_wdone_wait: {e}").into()))?,
+                ),
+            });
         }
         Ok(cbs)
     }
 
+    /// Submit a staged batch as ONE doorbell. A batch of plain compute launches takes
+    /// `Self::compute_batch`, the door it always took; a batch that carries a collective's
+    /// control blocks is rendered through [`Self::render_batch`] and submitted as wires
+    /// ([`Self::compute_wires`]) with the leased tags stamped on, so the sends, waits and consumes
+    /// ride the same FIFO as the compute that produces and consumes their bytes.
+    pub fn submit_batch(&self, items: &[BatchedCb], pipeline_barrier: bool) -> Result<(), HwError> {
+        if items.iter().all(|i| matches!(i, BatchedCb::Compute(_))) {
+            return self.compute_batch(
+                items.iter().filter_map(|i| match i {
+                    BatchedCb::Compute(l) => Some(l),
+                    _ => None,
+                }),
+                pipeline_barrier,
+            );
+        }
+        let canvas = Arc::new(self.render_batch(items, 0)?);
+        self.compute_wires(
+            ComputeWireBatch {
+                canvas,
+                patch: Box::new(|tags, cbs| {
+                    for (cb, tag) in cbs.iter_mut().zip(tags.iter()) {
+                        cb.set_tag(*tag);
+                    }
+                }),
+            },
+            pipeline_barrier,
+        )
+    }
+
     /// #603 PR2's replay submit door — the write side of
-    /// [`Self::render_compute_batch`]'s images: submit a canvas the render
+    /// [`Self::render_batch`]'s images: submit a canvas the render
     /// door produced (and the prepare gates proved) as ONE doorbell, with
     /// the batch's stamp closure applying the step's patches and the
     /// pool-leased tags to the copy the backend takes under the submission
-    /// lock. Same one-operation shape as [`Self::compute_batch`] — one
+    /// lock. Same one-operation shape as `Self::compute_batch` — one
     /// barrier decision (`pipeline_barrier` is the OR of the step's per-op
     /// host fences), one fence, one capacity gate, in-flight accounting per
     /// CB — so the step is ordered on the ring exactly as its per-rung
@@ -1036,7 +1263,7 @@ pub use flex_rs::address::{ByteOffset, ByteSize};
 pub use flex_rs::compute::ComputeWireBatch;
 pub use flex_rs::control_block_wire::{ControlBlockWire, ResponseTag};
 
-/// One entry of a [`Stream::compute_batch`] list — the owned handles one compute launch
+/// One compute launch of a [`Stream::submit_batch`] list — the owned handles one compute launch
 /// needs. The handles are owned (not borrowed) because a batch outlives the loop that
 /// builds it; see `compute_batch`'s ⛔ note. Field semantics match [`Stream::compute`]'s
 /// parameters of the same names.
@@ -1047,6 +1274,74 @@ pub struct BatchedCompute {
     pub tensor_allocs: Vec<DevAddr>,
     /// Offset within the program allocation where kernel execution begins.
     pub bootstrap_offset: u64,
+}
+
+impl BatchedCompute {
+    /// The launch's parameters — `kernel_name=""` and no tensor byte offsets, the one shape every
+    /// batched launch takes (see `Stream::compute_batch`).
+    fn params(&self) -> ComputeParams {
+        ComputeParams::new(
+            self.prog.0.clone(),
+            self.tensor_allocs.iter().map(|a| a.0.clone()).collect(),
+            KernelName(String::new()),
+            BootstrapOffset(self.bootstrap_offset),
+            Vec::new(),
+        )
+    }
+}
+
+/// One control block of a staged batch ([`Stream::submit_batch`], [`Stream::render_batch`]).
+pub enum BatchedCb {
+    /// A compute launch.
+    Compute(BatchedCompute),
+    /// A collective's consume: the compute launch with its CTRL barrier bit set, so it cannot start
+    /// before the write-done wait in front of it retires (#1007 §3).
+    Consume(BatchedCompute),
+    /// A collective's F-send into the peer's receive window.
+    Send(RdmaSend),
+    /// Wait for one of the peer's messages to land: one write-done count on the sid the PEER
+    /// signals for that message's landing slot.
+    Wait { sid: u8 },
+}
+
+/// One end of a send, addressed as the launch it is aimed from addresses it: the allocation backing
+/// program segment `segment` for that launch, and the byte offset inside it.
+pub struct RdmaEnd {
+    pub base: DevAddr,
+    pub segment: u8,
+    pub offset: u64,
+}
+
+/// ONE MESSAGE of a collective's F-send, its endpoints still allocations (rendered by
+/// `flex_rs::scheduler::build_rdma_send_cb`).
+pub struct RdmaSend {
+    /// The SENDING rank's write-done sid.
+    pub sid: u8,
+    /// The peer's BAT index.
+    pub dest_tid: u8,
+    pub bytes: crate::bundle_code::collective::WireBytes,
+    pub source: RdmaEnd,
+    pub window: RdmaEnd,
+    /// This message's place in its send's run.
+    pub place: flex_rs::scheduler::RunPlace,
+}
+
+impl RdmaSend {
+    fn params(&self) -> RdmaSendParams {
+        let end = |e: &RdmaEnd| RdmaOperand {
+            base: e.base.0.clone(),
+            segment: e.segment,
+            offset: e.offset,
+        };
+        RdmaSendParams {
+            sid: self.sid,
+            dest_tid: self.dest_tid,
+            length: flex_rs::control_block_wire::TransferSize(self.bytes.get()),
+            source: end(&self.source),
+            window: end(&self.window),
+            place: self.place,
+        }
+    }
 }
 
 /// One chunk's identity — what a shifted or sliced sub-address is built from. The fields are
@@ -1074,7 +1369,7 @@ pub struct Chunk0 {
 ///
 /// `Clone` is a descriptor refcount bump and nothing more: the field is an `Arc`, the
 /// underlying device memory is never freed (see above), so two handles describe the same
-/// allocation exactly as one handle and a borrow do. The batch door ([`Stream::compute_batch`])
+/// allocation exactly as one handle and a borrow do. The batch door ([`Stream::submit_batch`])
 /// needs it — a batch item outlives the loop that built its shifted bases, so it must own its
 /// handles instead of borrowing them.
 #[derive(Clone)]
@@ -1180,6 +1475,429 @@ impl DevAddr {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  The p2p link — tensor parallelism's one load-time fact
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ⭐ THE CARDS A SHARDED WORLD SPANS, IN RANK ORDER — rank `r` drives the `r`-th, as
+/// `--tp-cards` names them — with the rank this process runs as. Minted only by
+/// [`WorldCards::of`], which refuses a list that is not one card per rank, and a card named twice (a
+/// rank that would send to itself).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorldCards {
+    me: TpIdentity,
+    cards: Vec<PciAddress>,
+}
+
+impl WorldCards {
+    /// `cards`, rank `r`'s at index `r`, for a process running as `me`.
+    ///
+    /// # Errors
+    /// [`AttachRefusal::NoPeer`] in a world of one, [`AttachRefusal::Cards`] for a list that is not
+    /// one card per rank, [`AttachRefusal::SelfLoop`] for a card named twice.
+    pub fn of(me: TpIdentity, cards: Vec<PciAddress>) -> Result<Self, AttachRefusal> {
+        if !me.world().is_sharded() {
+            return Err(AttachRefusal::NoPeer(me));
+        }
+        if cards.len() != me.world().get() as usize {
+            return Err(AttachRefusal::Cards {
+                world: me.world().get(),
+                named: cards.len(),
+            });
+        }
+        if let Some(card) = cards
+            .iter()
+            .enumerate()
+            .find_map(|(i, c)| cards[..i].contains(c).then(|| c.clone()))
+        {
+            return Err(AttachRefusal::SelfLoop { card });
+        }
+        Ok(Self { me, cards })
+    }
+
+    /// The rank this process runs as.
+    pub fn me(&self) -> TpIdentity {
+        self.me
+    }
+
+    /// The card this process drives.
+    pub fn own(&self) -> &PciAddress {
+        &self.cards[self.me.rank() as usize]
+    }
+
+    /// The card rank `r` drives.
+    pub fn of_rank(&self, r: TpIdentity) -> &PciAddress {
+        &self.cards[r.rank() as usize]
+    }
+}
+
+/// The ids a rank's collective control blocks name: per landing slot, its own sid (its message
+/// into that slot signals on it) and the peer's (its wait for the peer's message into that slot
+/// counts on it, and this card's `XSEG` entry for it points at the slot); and the peer's BAT index
+/// (where its sends land).
+///
+/// The BAT index is the peer's RANK — the vendor's `dest_rank`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerRoute {
+    me: TpIdentity,
+    peer: TpIdentity,
+    /// This rank's region of the peer's window — where its sends land.
+    lands_in: PeerRegion,
+    /// The peer's region of this card's window — where the peer's sends land.
+    hears_in: PeerRegion,
+}
+
+impl PeerRoute {
+    /// The route between `me` and `peer`. `None` for a rank and itself, or two ranks of different
+    /// worlds.
+    pub fn between(me: TpIdentity, peer: TpIdentity) -> Option<Self> {
+        Some(Self {
+            me,
+            peer,
+            lands_in: peer.region_of(me)?,
+            hears_in: me.region_of(peer)?,
+        })
+    }
+
+    /// Every route `me` has: one per peer, in the peers' rank order.
+    pub fn all(me: TpIdentity) -> Vec<Self> {
+        me.peers()
+            .filter_map(|peer| Self::between(me, peer))
+            .collect()
+    }
+
+    /// The rank this route sends from.
+    pub fn me(self) -> TpIdentity {
+        self.me
+    }
+
+    /// The rank this route sends to and hears from.
+    pub fn peer(self) -> TpIdentity {
+        self.peer
+    }
+
+    /// This rank's region of the peer's window: where its messages land on the peer's card.
+    pub fn lands_in(self) -> PeerRegion {
+        self.lands_in
+    }
+
+    /// The peer's region of this card's window: where the peer's messages land, and where this
+    /// card's `XSEG` entries for the peer's slots point.
+    pub fn hears_in(self) -> PeerRegion {
+        self.hears_in
+    }
+
+    /// The sid this rank's message into `slot` signals on.
+    pub fn send_sid(self, slot: LandingSlot) -> u8 {
+        Sid::of(self.me, slot).get()
+    }
+
+    /// The sid this rank waits on for the peer's message into `slot` — and the `XSEG` entry this
+    /// card points at the slot.
+    pub fn wait_sid(self, slot: LandingSlot) -> u8 {
+        Sid::of(self.peer, slot).get()
+    }
+
+    /// The peer's BAT index: its rank, which `TpWorld::of` bounds far below a byte.
+    pub fn dest_tid(self) -> u8 {
+        self.peer.rank() as u8
+    }
+}
+
+/// Why a sharded session could not link to its peer. Each is a load refusal: a topology without
+/// device p2p RDMA is refused, never served over the host.
+#[derive(Debug)]
+pub enum AttachRefusal {
+    /// A world of one has no peer.
+    NoPeer(TpIdentity),
+    /// The world's cards are not one per rank.
+    Cards { world: u32, named: usize },
+    /// A card named for two ranks — one of them would send to itself.
+    SelfLoop { card: PciAddress },
+    /// The link names a card this process does not drive.
+    NotDriven(CardTaken),
+    /// The process is already linked, as another rank or for another window.
+    AlreadyLinked {
+        linked: (TpIdentity, RecvWindow),
+        asked: (TpIdentity, RecvWindow),
+    },
+    /// senlib could not name the peer card's region-2 address.
+    PeerRegion(String),
+    /// Base-address-table entry `tid` could not be installed.
+    Bat { tid: u8, why: String },
+    /// The runtime this card's side of the link needs did not come up.
+    BringUp(String),
+    /// A landing slot's xseg word did not compose, or its `XSEG` entry could not be programmed.
+    Xseg(String),
+}
+
+impl fmt::Display for AttachRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoPeer(me) => write!(
+                f,
+                "rank {} of a {}-rank world has no peer to link",
+                me.rank(),
+                me.world().get()
+            ),
+            Self::Cards { world, named } => write!(
+                f,
+                "a {world}-rank world names one card per rank, in rank order (`--tp-cards`); \
+                 {named} were named"
+            ),
+            Self::SelfLoop { card } => write!(
+                f,
+                "the card {card} is named for two ranks — a rank cannot send to itself"
+            ),
+            Self::NotDriven(e) => write!(f, "the link's own card is not this process's: {e}"),
+            Self::AlreadyLinked { linked, asked } => write!(
+                f,
+                "this process is linked as {linked:?} and cannot link again as {asked:?} — one \
+                 card's XSEG entries point at one window's slots, so every bundle it runs shares \
+                 one window"
+            ),
+            Self::PeerRegion(e) => write!(
+                f,
+                "the peer card's region-2 address could not be read: {e} (device p2p RDMA is the \
+                 only path; there is no host fallback)"
+            ),
+            Self::Bat { tid, why } => {
+                write!(f, "installing base-address-table entry {tid} failed: {why}")
+            }
+            Self::BringUp(e) => write!(f, "the card runtime did not come up: {e}"),
+            Self::Xseg(e) => write!(f, "programming a landing slot's XSEG entry failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AttachRefusal {}
+
+/// ⭐ THE P2P LINK A SHARDED SESSION SENDS OVER — tensor parallelism's one load-time fact: which
+/// physical card is the peer. Minted only by [`link_peer`], which installs the peer card's
+/// region-2 address in this card's base-address table (device p2p RDMA — never host DMA), so this
+/// card's sends reach the peer. The other half — this card's `XSEG` entry for each of the peer's
+/// landing slots, pointed at that slot of the receive window — is [`point_landing_slots`]'s, once
+/// the session that owns the window has allocated it.
+///
+/// ONE PER PROCESS. The process drives one card and the card's `XSEG` entries point at one window's
+/// slots, so every bundle the process runs (decode, prefill, every rung) lands its peer's sends in
+/// the one window the link programmed — [`crate::superdsc_exec::Executor::load`] refuses a bundle
+/// whose window is elsewhere.
+#[derive(Debug)]
+pub struct PeerLink {
+    me: TpIdentity,
+    /// One per peer, in rank order — leaked with the link, so a bound collective holds them.
+    routes: &'static [PeerRoute],
+    window: RecvWindow,
+    /// The window's first byte as the allocator places it — set once, by [`point_landing_slots`].
+    landing: OnceLock<u64>,
+}
+
+impl PeerLink {
+    /// The rank this process runs as.
+    pub fn identity(&self) -> TpIdentity {
+        self.me
+    }
+
+    /// The ids this process's sends and waits name, one route per peer in rank order.
+    pub fn routes(&self) -> &'static [PeerRoute] {
+        self.routes
+    }
+
+    /// Where the peer's sends land on this card.
+    pub fn window(&self) -> RecvWindow {
+        self.window
+    }
+
+    /// The window's first byte as the allocator placed it on this card — `None` until
+    /// [`point_landing_slots`] has pointed the slots at it.
+    pub fn landing(&self) -> Option<u64> {
+        self.landing.get().copied()
+    }
+}
+
+/// The ranks of a world place their receive windows at different device addresses. A send names
+/// its own window's address for its peer's (the two cards allocate one sequence), so this world
+/// would send to addresses its peers do not land at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowsApart {
+    pub own: Option<u64>,
+    pub peers: Vec<Option<u64>>,
+}
+
+impl fmt::Display for WindowsApart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "this rank's receive window lands at {:x?}, but its peers' land at {:x?} — every rank \
+             of a world must place its window at one address, which each send names for its peer's",
+            self.own, self.peers
+        )
+    }
+}
+
+impl std::error::Error for WindowsApart {}
+
+/// ⭐ EVERY RANK'S WINDOW AT ONE ADDRESS — checked, not assumed. A send's xseg word names the
+/// sender's own window address for the peer's (`flex_rs::scheduler::build_rdma_send_cb`), which is right
+/// only while both cards place the window identically; the followers report theirs with their
+/// ready frame, and the leader holds its first step until this passes.
+///
+/// # Errors
+/// [`WindowsApart`]: any peer's landing address that is not this rank's, or a rank with none.
+pub fn refuse_if_windows_apart(
+    own: Option<u64>,
+    peers: &[Option<u64>],
+) -> Result<(), WindowsApart> {
+    if own.is_some() && peers.iter().all(|p| *p == own) {
+        Ok(())
+    } else {
+        Err(WindowsApart {
+            own,
+            peers: peers.to_vec(),
+        })
+    }
+}
+
+fn link_cell() -> &'static Mutex<Option<&'static PeerLink>> {
+    static LINK: Mutex<Option<&'static PeerLink>> = Mutex::new(None);
+    &LINK
+}
+
+/// The link this process made, when it runs one rank of a sharded world.
+pub fn peer_link() -> Option<&'static PeerLink> {
+    *link_cell().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Link this process — `cards.me()`, driving `cards.own()` — to each of its peers on the card
+/// `cards` names for its rank, for sends landing in `window`. Linking again as the same rank for the
+/// same window returns the link already made.
+///
+/// # Errors
+/// [`AttachRefusal`], by name.
+pub fn link_peer(
+    cards: WorldCards,
+    window: RecvWindow,
+) -> Result<&'static PeerLink, AttachRefusal> {
+    let me = cards.me();
+    let routes = PeerRoute::all(me);
+    let mut cell = link_cell().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(link) = *cell {
+        return if (link.me, link.window) == (me, window) {
+            Ok(link)
+        } else {
+            Err(AttachRefusal::AlreadyLinked {
+                linked: (link.me, link.window),
+                asked: (me, window),
+            })
+        };
+    }
+    drive_card(cards.own()).map_err(AttachRefusal::NotDriven)?;
+    init_runtime().map_err(|e| AttachRefusal::BringUp(e.to_string()))?;
+    // ⭐ THE SYMMETRIC BAT, AS THE tp37 CELL INSTALLS IT (#1008), ONE ENTRY PER PEER: entry
+    // `dest_tid` — the peer's rank, the destination every send to it names — holds that peer card's
+    // region-2 PCI address, from senlib's own region-address door (the vendor's
+    // `initialize_p2p_address_table` value source), for the card the address names, never an
+    // enumeration order.
+    for route in &routes {
+        let peer_region2 =
+            flex_rs::senlib_ffi::pci_addr_for_region(cards.of_rank(route.peer()).as_str(), 2)
+                .map_err(AttachRefusal::PeerRegion)?;
+        flex_rs::senlib_ffi::set_base_addr_table(route.dest_tid(), peer_region2).map_err(
+            |why| AttachRefusal::Bat {
+                tid: route.dest_tid(),
+                why,
+            },
+        )?;
+    }
+    let link: &'static PeerLink = Box::leak(Box::new(PeerLink {
+        me,
+        routes: Box::leak(routes.into_boxed_slice()),
+        window,
+        landing: OnceLock::new(),
+    }));
+    *cell = Some(link);
+    Ok(link)
+}
+
+/// ⭐ POINT EVERY ONE OF THE PEER'S LANDING SLOTS AT ITS SLOT OF THIS CARD'S WINDOW — one `XSEG`
+/// entry per slot, each programmed once, as the tp37 cell programs its one. An F-send lands where its
+/// sid's entry points and nowhere else (#1009, E8a), so the peer's message into slot `s` signals
+/// `wait_sid(s)` and that entry names the slot: `hal_sbf::rdma_xseg` of the slot's flat VA plus the
+/// one-flit L4 compensation, the VA from [`flex_rs::scheduler::landing_va_bytes`] — the same compose
+/// the send's own word takes.
+///
+/// ⛔ THE VA IS THE ALLOCATOR'S, SO THIS RUNS ONCE THE WINDOW IS ALLOCATED. The window is a placement
+/// in the weight segment, and where that segment's bytes ARE — the region's segment and the
+/// allocation's offset inside it — exists only once a session has allocated it. `window_region` is
+/// that allocation: the weight segment of the session that OWNS it (every other session aliases
+/// it). MEASURED, #1009 run 5: the entries pointed at `(program seg 1, layout offset)`, an address
+/// the allocator gave to something else, and every collective ran clean over a window the peer's
+/// bytes never reached — garbage from token 0.
+///
+/// # Errors
+/// [`AttachRefusal`]: the runtime, a slot past the allocation, or a word that will not compose or
+/// program.
+pub fn point_landing_slots(link: &PeerLink, window_region: &DevAddr) -> Result<(), AttachRefusal> {
+    let rt = get_or_init_runtime().map_err(|e| AttachRefusal::BringUp(e.to_string()))?;
+    let resolver = FlexAllocatorAddressResolver::new(
+        rt.get_allocator()
+            .map_err(|e| AttachRefusal::BringUp(format!("{e:?}")))?,
+    );
+    let cap = crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES;
+    let landing = flex_rs::scheduler::landing_va_bytes(
+        &resolver,
+        &RdmaOperand {
+            base: window_region.0.clone(),
+            segment: RecvWindow::SEGMENT as u8,
+            offset: link.window.offset(),
+        },
+        link.window.size(),
+    )
+    .map_err(|e| AttachRefusal::Xseg(e.to_string()))?;
+    if link.landing.get().is_some_and(|l| *l != landing) {
+        return Err(AttachRefusal::Xseg(format!(
+            "the window is pointed at 0x{landing:x}, but this process already pointed it at {:x?}",
+            link.landing.get()
+        )));
+    }
+    let _ = link.landing.set(landing);
+    let mut pointed: Vec<String> = Vec::new();
+    for (route, (slot, at)) in link
+        .routes
+        .iter()
+        .flat_map(|r| link.window.slots(r.hears_in()).map(move |s| (*r, s)))
+    {
+        // The slot's own extent: one message, or the region's remainder for its last.
+        let len = (link.window.region().get() - u64::from(slot.message()) * cap).min(cap);
+        let va = flex_rs::scheduler::landing_va_bytes(
+            &resolver,
+            &RdmaOperand {
+                base: window_region.0.clone(),
+                segment: RecvWindow::SEGMENT as u8,
+                offset: at,
+            },
+            len,
+        )
+        .map_err(|e| AttachRefusal::Xseg(e.to_string()))?;
+        let word = flex_rs::hal_sbf::rdma_xseg(va + flex_rs::control_block_wire::Flits::BYTES)
+            .map_err(AttachRefusal::Xseg)?;
+        flex_rs::senlib_ffi::write_xseg(route.wait_sid(slot), word).map_err(AttachRefusal::Xseg)?;
+        pointed.push(format!("XSEG[{}]=0x{va:x}", route.wait_sid(slot)));
+    }
+    // The load-time ordering made observable: this line precedes the rank's ready report, and so
+    // every step's sends.
+    tracing::info!(
+        "[spyre-tp] rank {} of {}: {} landing slot(s) pointed at the receive window ({:?}): {}",
+        link.me.rank(),
+        link.me.world().get(),
+        pointed.len(),
+        link.window,
+        pointed.join(", "),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1231,6 +1949,127 @@ mod tests {
         assert_eq!(
             got.iter().map(|w| w.2).sum::<u64>(),
             addr.total_size().as_u64()
+        );
+    }
+
+    /// Per landing slot, each rank of a two-rank world signals on its own sid and waits on the
+    /// sid its peer signals for that slot, and lands on the peer's BAT index; a world of one has
+    /// no route.
+    #[test]
+    fn a_route_names_each_slots_sids_and_the_peers_index() {
+        use crate::bundle_code::collective::{TpWorld, WindowCut};
+        let ranks: Vec<TpIdentity> = TpWorld::of::<2>().ranks().collect();
+        let routes = [ranks[0], ranks[1]].map(|r| {
+            let all = PeerRoute::all(r);
+            assert_eq!(all.len(), 1, "a two-rank world's rank has one peer");
+            all[0]
+        });
+        assert_eq!(routes.map(|r| r.dest_tid()), [1, 0]);
+        assert_eq!(
+            routes.map(|r| (r.me(), r.peer())),
+            [(ranks[0], ranks[1]), (ranks[1], ranks[0])]
+        );
+        assert_eq!(PeerRoute::between(ranks[0], ranks[0]), None);
+        for k in 0..2 {
+            for m in 0..2 {
+                let slot = LandingSlot::of(WindowCut::of_collective(k), m).unwrap();
+                // The two ends of one landing: what rank 0 sends on is what rank 1 waits on.
+                assert_eq!(routes[0].send_sid(slot), routes[1].wait_sid(slot));
+                assert_eq!(routes[1].send_sid(slot), routes[0].wait_sid(slot));
+                assert_ne!(routes[0].send_sid(slot), routes[1].send_sid(slot));
+            }
+        }
+        let alone = TpWorld::of::<1>().ranks().next().unwrap();
+        assert!(PeerRoute::all(alone).is_empty());
+    }
+
+    /// A world runs only when every rank's window lands at this rank's address: one peer elsewhere,
+    /// or a rank that pointed none, refuses by name with every address.
+    #[test]
+    fn a_world_whose_windows_land_apart_refuses() {
+        let a = Some(0x4_c842_2800_u64);
+        assert_eq!(refuse_if_windows_apart(a, &[a]), Ok(()));
+        assert_eq!(refuse_if_windows_apart(a, &[a, a]), Ok(()));
+        let apart = Some(0x4_c862_2800_u64);
+        assert_eq!(
+            refuse_if_windows_apart(a, &[apart]),
+            Err(WindowsApart {
+                own: a,
+                peers: vec![apart]
+            })
+        );
+        assert!(refuse_if_windows_apart(a, &[None]).is_err());
+        assert!(refuse_if_windows_apart(None, &[None]).is_err());
+    }
+
+    /// A card is named by its full PCI address, in either case, kept lowercase; anything else is
+    /// refused by name.
+    #[test]
+    fn a_card_is_named_by_its_full_pci_address() {
+        let a = PciAddress::parse("0000:3B:00.0").unwrap();
+        assert_eq!(a.as_str(), "0000:3b:00.0");
+        assert_eq!(a, PciAddress::parse("0000:3b:00.0").unwrap());
+        for bad in [
+            "0",
+            "3b:00.0",
+            "0000:3b:00",
+            "0000:3b:00.8",
+            "0000:3b.00:0",
+            "0000:3b:00:0",
+            "000g:3b:00.0",
+            "0000:3b:00.0 ",
+            "",
+        ] {
+            assert_eq!(
+                PciAddress::parse(bad),
+                Err(NotAPciAddress(bad.to_string())),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// The refusals that need no card, at the cards themselves: a world of one has no peer, a list
+    /// that is not one card per rank, and a card named for two ranks — a rank sending to itself.
+    /// The ranks' cards are read in rank order.
+    #[test]
+    fn a_worlds_cards_refuse_no_peer_a_short_list_and_a_self_loop() {
+        use crate::bundle_code::collective::TpWorld;
+        let alone = TpWorld::of::<1>().ranks().next().unwrap();
+        let card = |bus: &str| PciAddress::parse(&format!("0000:{bus}:00.0")).unwrap();
+        assert!(matches!(
+            WorldCards::of(alone, vec![card("3b")]),
+            Err(AttachRefusal::NoPeer(_))
+        ));
+        let ranks: Vec<TpIdentity> = TpWorld::of::<2>().ranks().collect();
+        assert!(matches!(
+            WorldCards::of(ranks[0], vec![card("3b")]),
+            Err(AttachRefusal::Cards { world: 2, named: 1 })
+        ));
+        assert!(matches!(
+            WorldCards::of(ranks[0], vec![card("3b"), card("3b")]),
+            Err(AttachRefusal::SelfLoop { card: c }) if c == card("3b")
+        ));
+        let cards = WorldCards::of(ranks[1], vec![card("3b"), card("86")]).unwrap();
+        assert_eq!(cards.own(), &card("86"));
+        assert_eq!(cards.of_rank(ranks[0]), &card("3b"));
+        assert!(peer_link().is_none(), "naming cards links nothing");
+    }
+
+    /// A process drives one card, named by its address: choosing it again is a no-op, choosing
+    /// another is refused by name, before any bring-up.
+    #[test]
+    fn a_process_drives_the_one_card_it_chose() {
+        let first = PciAddress::parse("0000:3b:00.0").unwrap();
+        let other = PciAddress::parse("0000:86:00.0").unwrap();
+        drive_card(&first).expect("the first choice is the card");
+        drive_card(&first).expect("the same card again");
+        assert_eq!(driven_card(), DrivenCard::At(first.clone()));
+        assert_eq!(
+            drive_card(&other),
+            Err(CardTaken {
+                driving: DrivenCard::At(first),
+                asked: other
+            })
         );
     }
 

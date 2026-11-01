@@ -16,8 +16,8 @@ use ktir_superdsc::addr::OutCorner;
 use ktir_superdsc::emit;
 use ktir_superdsc::work::EwDivision;
 use scratchy_subtile::sdsc_abstract::{
-    BlockCols, KernelTag, RowBlockedTag, RowCount, SpyreTensorLayout, Staged, StickKind,
-    StickLayout, Stk, stage_2d,
+    ArrangementClaim, BlockCols, KernelTag, RowBlockedTag, RowCount, SpyreTensorLayout, Staged,
+    StickKind, StickLayout, Stk, stage_2d,
 };
 use scratchy_subtile::superdsc_opspec::Df;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
@@ -544,6 +544,88 @@ fn addr_eq_catches_only_the_m_gt_1_dense_vs_stick_scramble() {
 }
 
 #[test]
+fn a_whole_group_head_major_read_is_the_stick_major_frame() {
+    // One kv head per card (granite at eight ranks: 4 query heads over 1 kv head, hd 64): the
+    // new-block score's group read of the prompt chunk's Q is a `[gqa, mq, hd]` head-major view, and
+    // with one group it covers the WHOLE `[mq, heads·hd]` tensor, so it declares an arrangement.
+    for mq in [32, 4] {
+        let q = StickLayout::row_blocked(mq, 4 * 64);
+        let read = ArrangementClaim::for_view_df(&[4, mq, 64], 2, Df::Fp16);
+        assert_eq!(
+            read,
+            ArrangementClaim::HeadMajor {
+                groups: 4,
+                rows: mq,
+                df: Df::Fp16
+            }
+        );
+        assert_eq!(
+            read.layout(),
+            StickLayout::for_view_df(&[4, mq, 64], 2, Df::Fp16),
+            "the claim addresses by the layout the view classifies to"
+        );
+        // Stick group `g` of `[mq, 256]` is head `g`'s rows of one stick, end to end: the read's
+        // group `g`. Same bytes, element for element.
+        for (r, c) in [
+            (0, 0),
+            (3, 3),
+            (mq - 1, 63),
+            (0, 64),
+            (2, 130),
+            (mq - 1, 255),
+        ] {
+            let (g, d) = (c / 64, c % 64);
+            assert_eq!(
+                q.dev_off(r, c),
+                read.layout().dev_off(g, r * 64 + d),
+                "q[{r}, {c}] at mq {mq}"
+            );
+        }
+        let bl = superdsc::BundleLayout::default();
+        assert!(bl.declare_arrangement("q", q, "test").is_ok());
+        assert!(bl.declare_arrangement("q", read, "test").is_ok(), "mq {mq}");
+        // At mq 4 the read's layout is the tensor's own shape, `Flat [4, 256]`. A 2-D access at that
+        // layout is the M>1 scramble and stays a conflict: only the head-major claim frames it.
+        let flat = bl.declare_arrangement("q", StickLayout::flat(mq, 4 * 64), "test");
+        assert!(
+            flat.is_err(),
+            "a row-major [{mq}, 256] read of q is the scramble"
+        );
+        // Either order: the head-major read first, the producer after.
+        let bl = superdsc::BundleLayout::default();
+        assert!(bl.declare_arrangement("q", read, "test").is_ok());
+        assert!(
+            bl.declare_arrangement("q", q, "test").is_ok(),
+            "mq {mq}, read first"
+        );
+    }
+
+    // The groups are STICKS, not heads. At two sticks a head (hd 128) a per-HEAD read
+    // `[4, 32, 128]` puts head `h`, row `r`, column `s·L + d` at `2h·m·L + 2r·L + s·L + d` where the
+    // tensor holds it at `(2h+s)·m·L + r·L + d`: a different byte for all but two elements of each
+    // head, so it stays a conflict. The per-STICK read `[8, 32, 64]` is the tensor's bytes.
+    let q128 = StickLayout::row_blocked(32, 4 * 128);
+    let per_head = ArrangementClaim::for_view_df(&[4, 32, 128], 2, Df::Fp16);
+    assert_eq!(
+        per_head,
+        ArrangementClaim::Rows(StickLayout::flat(4, 32 * 128))
+    );
+    let bl = superdsc::BundleLayout::default();
+    assert!(bl.declare_arrangement("q128", q128, "test").is_ok());
+    assert!(bl.declare_arrangement("q128", per_head, "test").is_err());
+    let per_stick = ArrangementClaim::for_view_df(&[8, 32, 64], 2, Df::Fp16);
+    for (r, c) in [(0, 0), (1, 64), (31, 127), (5, 200), (31, 511)] {
+        let (g, d) = (c / 64, c % 64);
+        assert_eq!(
+            q128.dev_off(r, c),
+            per_stick.layout().dev_off(g, r * 64 + d),
+            "q128[{r}, {c}]"
+        );
+    }
+    assert!(bl.declare_arrangement("q128", per_stick, "test").is_ok());
+}
+
+#[test]
 fn arrangement_authority_rejects_producer_consumer_disagreement() {
     // THE LOCK (task #6): ONE device layout per tensor. First declaration wins; a later NON-equivalent
     // declaration for the SAME tensor is a build Err naming it — so the M>1 Dense-vs-stick scramble is a
@@ -552,15 +634,15 @@ fn arrangement_authority_rejects_producer_consumer_disagreement() {
     let bl = superdsc::BundleLayout::default();
     // producer writes 'resid' RowBlocked [31,2048]; a second RowBlocked access is the canonical (Ok).
     assert!(
-        bl.declare_arrangement("resid", StickLayout::row_blocked(31, 2048))
+        bl.declare_arrangement("resid", StickLayout::row_blocked(31, 2048), "test")
             .is_ok()
     );
     assert!(
-        bl.declare_arrangement("resid", StickLayout::row_blocked(31, 2048))
+        bl.declare_arrangement("resid", StickLayout::row_blocked(31, 2048), "test")
             .is_ok()
     );
     // a consumer reading it FLAT at rows>1 is a hard Err that names the tensor.
-    let bad = bl.declare_arrangement("resid", StickLayout::flat(31, 2048));
+    let bad = bl.declare_arrangement("resid", StickLayout::flat(31, 2048), "test");
     assert!(
         bad.is_err(),
         "reading 'resid' Flat after it was written RowBlocked (rows>1) MUST be a build Err"
@@ -572,11 +654,11 @@ fn arrangement_authority_rejects_producer_consumer_disagreement() {
     // rows==1 decode: RowBlocked then Flat is NOT a conflict (they address identically) — working path safe.
     let bl1 = superdsc::BundleLayout::default();
     assert!(
-        bl1.declare_arrangement("dec", StickLayout::row_blocked(1, 2048))
+        bl1.declare_arrangement("dec", StickLayout::row_blocked(1, 2048), "test")
             .is_ok()
     );
     assert!(
-        bl1.declare_arrangement("dec", StickLayout::flat(1, 2048))
+        bl1.declare_arrangement("dec", StickLayout::flat(1, 2048), "test")
             .is_ok(),
         "rows==1 RowBlocked/Flat is not a conflict — the authority must not false-fire on decode"
     );

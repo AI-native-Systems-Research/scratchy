@@ -35,6 +35,28 @@
 // parsed out of the model configs. Included before the doors below, which invoke them.
 include!(concat!(env!("OUT_DIR"), "/config_geometry.rs"));
 
+// The build script derived the tensor-parallel rank geometries for ITS copy of the world row; the
+// row's authority is the target's. One fact, held equal here.
+#[cfg(feature = "spyre")]
+const _: () = {
+    let (seen, row) = (
+        SPYRE_TP_WORLDS_SEEN,
+        ktir_superdsc::collective::SPYRE_TP_WORLDS,
+    );
+    assert!(
+        seen.len() == row.len(),
+        "build.rs's world row drifted from SPYRE_TP_WORLDS"
+    );
+    let mut i = 0;
+    while i < row.len() {
+        assert!(
+            seen[i] == row[i],
+            "build.rs's world row drifted from SPYRE_TP_WORLDS"
+        );
+        i += 1;
+    }
+};
+
 /// A COUNT along one head axis of a model. Distinct types, so a query-head count cannot be handed
 /// to something that wanted a kv-head count — under GQA they are different numbers, and passing one
 /// where the other belongs addresses another head's keys, which is fluent wrong output rather than

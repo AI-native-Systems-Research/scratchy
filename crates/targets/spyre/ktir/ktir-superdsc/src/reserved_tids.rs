@@ -401,7 +401,7 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 }
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 7] = [
+pub const RESERVED_REGIONS: [TidRegion; 9] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -460,7 +460,54 @@ pub const RESERVED_REGIONS: [TidRegion; 7] = [
         base: u32::MAX - 1_000_171,
         slots: 1_000_000,
     },
+    // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW'S CUTS — see [`TP_RECV_CUT_TIDS`]. Below
+    // `kct_resident`'s floor, in tids no artifact has ever carried.
+    TidRegion {
+        name: "tp_recv",
+        base: TP_RECV_TID,
+        slots: TP_RECV_CUT_TIDS.len() as u32 * crate::collective::PeerRegion::MAX,
+    },
+    // ⭐ THE ALL-REDUCE'S ROUND SUMS — see [`tp_round_sum_tid`]. Below the window's region, with
+    // room for the window to grow, in tids no artifact has ever carried.
+    TidRegion {
+        name: "tp_round_sum",
+        base: TP_ROUND_SUM_TID,
+        slots: crate::collective::Round::MAX,
+    },
 ];
+
+/// ⭐ RESERVED tid for the recursive-doubling all-reduce's first ROUND SUM — the running sum round 0
+/// writes and round 1 sends (`collective::RecvWindow::round_sum_offset`).
+pub const TP_ROUND_SUM_TID: u32 = TP_RECV_TID - 64;
+
+/// The tid of round `round`'s running sum.
+pub const fn tp_round_sum_tid(round: u32) -> u32 {
+    TP_ROUND_SUM_TID - round
+}
+
+/// ⭐ RESERVED tid for the TENSOR-PARALLEL RECEIVE WINDOW — its first cut
+/// ([`TP_RECV_CUT_TIDS`]), and the base of the one `(segment, offset, size)` triple per card
+/// (`scratchy_spyre_bundle::collective::RecvWindow`) whose cuts every collective's consume reads.
+///
+/// ⛔ NOT IN THE ROUTER-CONST HOLE (MAX-137 .. MAX-146) — those slots are BURNED (see the note
+/// above the region table): a stale artifact still naming one would alias the window. It takes the
+/// first tid below `kct_resident`'s floor instead, which nothing has been baked against.
+pub const TP_RECV_TID: u32 = u32::MAX - 2_000_171;
+
+/// ⭐ THE RECEIVE WINDOW'S CUTS — one tid per disjoint cut of the ONE window, cut `i` placed
+/// `i` cut-widths above the window's base (`compute_bundle_layout`). The forward's `k`-th
+/// collective uses cut `k % 2` (`collective::WindowCut`), so a peer's send for collective `k + 1`
+/// never lands where this rank still reads `k`. Both cuts are placements OF the one window, never
+/// a second window that could disagree with it.
+pub const TP_RECV_CUT_TIDS: [u32; 2] = [TP_RECV_TID, TP_RECV_TID - 1];
+
+/// ⭐ THE TID OF ONE PEER'S REGION OF ONE CUT — every cut holds one region per sending peer
+/// (`collective::PeerRegion`), each its own placement, so a consume binds exactly the fragments it
+/// reads. Region 0 of cut `c` is [`TP_RECV_CUT_TIDS`]`[c]`: a two-rank window, one region per cut,
+/// keeps the tids it has always had. Region `r` sits `r` whole cut-runs below.
+pub const fn tp_recv_tid(cut: u32, region: u32) -> u32 {
+    TP_RECV_TID - (region * TP_RECV_CUT_TIDS.len() as u32 + cut)
+}
 
 /// Is `tid` one of the reserved synthetics — a sentinel, a slot of any region, or `LAST_HIDDEN_TID`
 /// (which sits at `u32::MAX`, one ABOVE the sentinels region's base, so a region scan alone misses
