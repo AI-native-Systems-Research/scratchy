@@ -697,9 +697,9 @@ impl PagedStep {
     /// sequence's rows.
     pub const fn batch(self) -> Option<crate::paged_step::BatchChunking> {
         match self.paged_rows {
-            crate::paged_step::PagedRows::Batch => {
-                Some(crate::paged_step::BatchChunking::of(self.rows, self.walk))
-            }
+            crate::paged_step::PagedRows::Batch => Some(crate::paged_step::BatchChunking::of(
+                self.rows, self.walk, self.nkvh,
+            )),
             crate::paged_step::PagedRows::Sequence => None,
         }
     }
@@ -760,7 +760,11 @@ impl PagedStep {
             Some(c) => {
                 let (chunks, entries) = (u64::from(c.num_chunks), u64::from(c.entries()));
                 v.extend([
-                    (self.rep_rows, CardSeat::Step, sticks(entries)),
+                    (
+                        self.rep_rows,
+                        CardSeat::Step,
+                        sticks(u64::from(c.index_rows())),
+                    ),
                     (
                         self.chunk_pages,
                         CardSeat::Step,

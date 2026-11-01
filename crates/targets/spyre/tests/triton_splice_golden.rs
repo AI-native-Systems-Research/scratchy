@@ -2413,9 +2413,11 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
 /// granite's geometry, staged by `batch_sources` (the worker's law), against an f64 softmax over
 /// each sequence's OWN keys. Every sequence holds its own pages (the pool's pages reversed, dealt
 /// out in turn), so a kernel that reads one sequence's pages for another, or one query row for
-/// every entry, misses. Three chunkings: two chunks (each block slot its own softmax, merged after
-/// the walk), one chunk (one maximum per sequence), and a chunk under Triton's gather floor. One
-/// bundle row past the real sequences is padded, as a bucketed batch is.
+/// every entry, misses. Four chunkings: two chunks (each block slot its own softmax, merged after
+/// the walk), one chunk (one maximum per sequence), and two chunks under Triton's gather floor in
+/// pages, gathered by kv head (two sequences on the 2-page rung, and on the 1-page rung: the shape
+/// two concurrent short requests decode at). One bundle row past the real sequences is padded, as
+/// a bucketed batch is.
 #[test]
 #[cfg(feature = "spyre-emu")]
 fn spliced_decode_batch_executes_the_real_programs() {
@@ -2438,8 +2440,10 @@ fn spliced_decode_batch_executes_the_real_programs() {
         ),
         // The 4-page rung: J = 4, C = 1.
         (shape(4, 4), vec![150, 40, 100]),
-        // Two sequences on the 2-page rung: J = 2 is 4 entries, under the floor, so J = 4.
+        // Two sequences on the 2-page rung: J = 2 is 4 pages, under the floor, so its 32 kv rows.
         (shape(2, 2), vec![100, 30]),
+        // ...and on the 1-page rung: J = 1, 2 pages, 16 kv rows.
+        (shape(2, 1), vec![100, 30]),
     ] {
         execute_one_decode_batch(s, &contexts);
     }

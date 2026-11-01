@@ -29,8 +29,10 @@ The BATCHED configs (`BATCHED_CONFIGS`) are one decode step of several sequences
 sequence and block buckets, their kernel on it, and the same metadata in the tiled walk's layout
 (`_mirror_batched_decode_indices`) for the Triton kernel, which is what is recorded:
 `q.bin` `[B, NQH*HD]`, `kp.bin`/`vp.bin` the pools after the step's writes, `rep_row_ids.bin`
-`[E]` i32, `chunk_page_ids.bin` `[C, E, 1]` i32, `mask.bin` `[C*E*NKVH, BLOCK]` (the
-`[C, J, B, NKVH, 1, BLOCK]` stack), `out_f16.bin`/`out_f32.bin` `[B, NQH*HD]`.
+`[E*P]` i32 and `chunk_page_ids.bin` `[C, E*P, 1]` i32 (`P` the Triton kernel's `ROWS_PER_PAGE`: 1, or
+NKVH for a chunk under Triton's gather floor in pages, its tables folded by kv head), `mask.bin`
+`[C*E*NKVH, BLOCK]` (the `[C, J, B, NKVH, 1, BLOCK]` stack), `out_f16.bin`/`out_f32.bin`
+`[B, NQH*HD]`.
 """
 
 import argparse
@@ -85,9 +87,10 @@ BATCHED_CONFIGS = {
     # after the walk: blocks bucket 16, J = 8, C = 2, E = 32.
     "batched_decode_chunks": dict(contexts=[600, 70, 300, 1], seqs_bucket=4, num_pages=33,
                                   geom=KV2),
-    # Two sequences over two blocks: J = 2, E = 4, under Triton's gather floor of 8, so the Triton
-    # kernel's chunk takes 4 block slots (the extra two masked) and E = 8.
-    "batched_decode_floor": dict(contexts=[100, 30], seqs_bucket=2, num_pages=9, geom=KV2),
+    # Two sequences in one block each: J = 1, E = 2, four kv rows at two KV heads, under Triton's
+    # gather floor of 8, so the Triton kernel's chunk takes 2 block slots (the extra one masked and
+    # gathering page 0) and E = 4.
+    "batched_decode_floor": dict(contexts=[50, 30], seqs_bucket=2, num_pages=9, geom=KV2),
 }
 
 SPYRE_CORE_COUNT = 32  # `spyre_attn_bucketer._SPYRE_CORE_COUNT`
@@ -295,23 +298,34 @@ def batched_step(kernels, cfg, dtype):
         q.reshape(b_seqs, nqh * hd), rep, kp, vp, ids, mask_by_chunk, scale, b_seqs, j, nkvh,
         nqh // nkvh, block, hd)
 
-    # THE TRITON KERNEL'S METADATA: the same builder at the gather floor's block slots, in the
-    # tiled walk's layout (`_mirror_batched_decode_indices`): ids `[C, E, 1]`, the mask
-    # `[C, J, B, KV, 1, block]` with its KV axis materialized.
-    jt = max(j, -(-TRITON_GATHER_FLOOR // b_seqs))
+    # THE TRITON KERNEL'S METADATA: the same builder in the tiled walk's layout
+    # (`_mirror_batched_decode_indices`), the mask `[C, J, B, KV, 1, block]` with its KV axis
+    # materialized. A chunk of fewer than 8 entries is under Triton's gather floor in pages, so the
+    # kernel gathers its pages' kv heads (`ROWS_PER_PAGE = KV`) and both index tables are FOLDED by
+    # kv head (entry e's kv head a at e * KV + a holding x * KV + a, the decode kernel's
+    # `kv_row_pool` fold): the query rows `[E * KV]`, the page ids `[C, E * KV]`. The floor then
+    # counts those rows, so the block slots are theirs unless `B * J * KV < 8`.
+    per = nkvh if b_seqs * j < TRITON_GATHER_FLOOR else 1
+    jt = max(j, -(-TRITON_GATHER_FLOOR // (b_seqs * per)))
     rep_t, ids_t, mask_t, ct = batched_metadata(tables, blocks, stacks, b_seqs, b_blocks, jt, nkvh,
                                                 block, dtype)
     e = jt * b_seqs
     mask_tiled = (mask_t.transpose(0, 1).unsqueeze(2).unsqueeze(3)
                   .expand(ct * jt, b_seqs, nkvh, 1, block).contiguous()
                   .reshape(ct * e * nkvh, block))
+    rows = torch.arange(per, dtype=torch.int32)
+
+    def fold(x):
+        return (x.reshape(-1, 1) * per + rows).reshape(-1)
+
     return dict(
-        q=q.reshape(b_seqs, nqh * hd), kp=kp, vp=vp, rep_row_ids=rep_t,
-        chunk_page_ids=ids_t.reshape(ct, e, 1), mask=mask_tiled,
+        q=q.reshape(b_seqs, nqh * hd), kp=kp, vp=vp, rep_row_ids=fold(rep_t),
+        chunk_page_ids=fold(ids_t).reshape(ct, e * per, 1), mask=mask_tiled,
         out=out.reshape(b_seqs, nqh * hd),
         meta=dict(kv_lens=kv_lens, blocks=blocks, tables=tables, blocks_bucket=b_blocks,
                   theirs=dict(blocks_per_chunk=j, num_chunks=c),
-                  triton=dict(blocks_per_chunk=jt, num_chunks=ct, entries=e), scale=scale,
+                  triton=dict(blocks_per_chunk=jt, num_chunks=ct, entries=e,
+                              rows_per_page=per), scale=scale,
                   geometry=g),
     )
 
