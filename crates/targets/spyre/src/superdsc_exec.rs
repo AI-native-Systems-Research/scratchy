@@ -33,7 +33,7 @@ use crate::fold_plan::{
 };
 use crate::runtime::{
     BatchedCb, ByteOffset, ByteSize, ComputeWireBatch, ControlBlockWire, DevAddr, HwError,
-    PeerLink, PeerRoute, Stream,
+    PeerLink, Stream,
 };
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
@@ -1385,13 +1385,13 @@ impl Executor {
                 bundle::registered_fps(),
             )
         })?;
-        bind_ops(code, self.session())
+        bind_ops(code, self.link)
     }
 
     /// An OPTIONAL sibling's launch groups — a fold-fused twin, which a bundle may not carry.
     fn optional_sibling_ops(&self, fp: &bundle::SiblingFp<'static>) -> Result<Option<Ops>> {
         bundle::sibling(fp)
-            .map(|code| bind_ops(code, self.session()))
+            .map(|code| bind_ops(code, self.link))
             .transpose()
     }
 
@@ -1498,7 +1498,7 @@ impl Executor {
             let mut v = Vec::with_capacity(m.bodies.len());
             for (ci, fp) in m.bodies.iter().enumerate() {
                 v.push(if ci == 0 {
-                    bind_ops(self.code, self.session())?
+                    bind_ops(self.code, self.link)?
                 } else {
                     self.sibling_ops("rolled body class", fp)?
                 });
@@ -1516,7 +1516,7 @@ impl Executor {
                 self.body_fused = PerClass::of_every_class(body_ops.len(), fused);
                 self.body_ops = body_ops;
             } else {
-                self.body_ops = vec![bind_ops(self.code, self.session())?];
+                self.body_ops = vec![bind_ops(self.code, self.link)?];
             }
             // ⛔⛔⛔ THE PROGRAM COUNT IS NOT A DEBUG DETAIL — IT IS WHETHER THIS MODEL COMPUTES.
             //
@@ -6397,8 +6397,9 @@ impl StepBody {
 /// never meant to run.
 fn bind_ops(
     code: &'static bundle::BundleCode<'static>,
-    session: Option<bundle::collective::TpIdentity>,
+    link: Option<&'static PeerLink>,
 ) -> Result<Ops> {
+    let session = link.map(PeerLink::identity);
     let sends: BTreeMap<usize, bundle::collective::TpSend> =
         bundle::collective::sends(&code.layout, &code.groups)
             .map_err(|u| {
@@ -6416,8 +6417,7 @@ fn bind_ops(
     for (i, g) in code.groups.iter().enumerate() {
         let mut collective = None;
         if let Some(consume) = g.kv.tp {
-            let Some((me, route)) = session.and_then(|me| PeerRoute::of(me).map(|r| (me, r)))
-            else {
+            let Some((me, routes)) = session.zip(link.map(PeerLink::routes)) else {
                 bail!(
                     "bundle {} group {i} is a collective's consume, so the bundle was baked for a \
                      sharded world — a world-of-one session cannot run it (link the process's \
@@ -6446,7 +6446,7 @@ fn bind_ops(
                     code.fp
                 );
             };
-            collective = Some(cb_plan::BoundCollective { send, route });
+            collective = Some(cb_plan::BoundCollective { send, me, routes });
         }
         ops.push(OpProg::new(g, &code.fp, i, collective));
     }

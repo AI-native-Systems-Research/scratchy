@@ -55,7 +55,9 @@ use flex_rs::control_block_wire::{CB_NUM_BYTES, ControlBlockWire};
 use flex_rs::scheduler::RunPlace;
 
 use crate::bundle_code::NUM_SEGMENTS;
-use crate::bundle_code::collective::{CbStep, RecvWindow, TpConsume, TpSend, group_steps};
+use crate::bundle_code::collective::{
+    CbStep, RecvWindow, TpConsume, TpIdentity, TpSend, group_steps,
+};
 use crate::fold_plan::{self, OpKv, SessionKv, SlotPos, UniformPages};
 use crate::runtime::{
     BatchedCb, BatchedCompute, ByteSize, DevAddr, PeerRoute, RdmaEnd, RdmaSend, Stream,
@@ -327,13 +329,33 @@ pub(crate) fn launch_site(
     }))
 }
 
-/// A collective's consume as a session BOUND it: the send its baked placements name and the route
-/// the session's link gives it. Minted only at bind (`superdsc_exec::bind_ops`), for the consumes
-/// the session plays.
+/// A collective's consume as a session BOUND it: the send its baked placements name and the routes
+/// the session's link gives it, one per peer. Minted only at bind (`superdsc_exec::bind_ops`), for
+/// the consumes the session plays.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BoundCollective {
     pub(crate) send: TpSend,
-    pub(crate) route: PeerRoute,
+    /// The rank the session runs as.
+    pub(crate) me: TpIdentity,
+    /// One route per peer, in rank order (`runtime::PeerLink::routes`).
+    pub(crate) routes: &'static [PeerRoute],
+}
+
+impl BoundCollective {
+    /// The route to and from `peer`.
+    fn route(&self, index: usize, peer: TpIdentity) -> Result<PeerRoute> {
+        self.routes
+            .iter()
+            .copied()
+            .find(|r| r.peer() == peer)
+            .ok_or_else(|| {
+                anyhow!(
+                    "group {index}: rank {} has no route to its peer {}",
+                    self.me.rank(),
+                    peer.rank()
+                )
+            })
+    }
 }
 
 /// What [`site_cbs`] reads off a group: its launch order, its consume (the bundle's), and the
@@ -382,15 +404,15 @@ pub(crate) fn site_cbs(tp: SiteTp, launch: BatchedCompute) -> Result<Vec<Batched
     };
     let mut launch = Some(launch);
     let mut out = Vec::with_capacity(3);
-    for step in group_steps(index, consume) {
+    for step in group_steps(index, consume.zip(bound.map(|b| b.me))) {
         match step {
             // ⭐ THE CUT: a send is its run of messages (`TpSend::messages`, the vendor's windowed
-            // loop), one F-send each.
-            CbStep::Send { .. } => {
-                let (Some(BoundCollective { send, route }), Some(l)) = (bound, launch.as_ref())
-                else {
+            // loop), one F-send each, into this rank's region of the peer's window.
+            CbStep::Send { to, .. } => {
+                let (Some(b), Some(l)) = (bound, launch.as_ref()) else {
                     bail!("group {index} sends with no binding or after its launch");
                 };
+                let (send, route) = (b.send, b.route(index, to)?);
                 for m in send.messages(route.lands_in()) {
                     out.push(BatchedCb::Send(RdmaSend {
                         sid: route.send_sid(m.slot),
@@ -409,10 +431,11 @@ pub(crate) fn site_cbs(tp: SiteTp, launch: BatchedCompute) -> Result<Vec<Batched
             // once and a wait consumes exactly one count, so its run of N messages is waited for N
             // times, once per slot. The peer's run is this rank's own — the forward is SPMD and the
             // cut is the payload's — so this rank's messages name the peer's slots too.
-            CbStep::Wait { .. } => {
-                let Some(BoundCollective { send, route }) = bound else {
+            CbStep::Wait { from, .. } => {
+                let Some(b) = bound else {
                     bail!("group {index} waits with no binding");
                 };
+                let (send, route) = (b.send, b.route(index, from)?);
                 for slot in send.slots() {
                     out.push(BatchedCb::Wait {
                         sid: route.wait_sid(slot),
@@ -572,7 +595,10 @@ impl CbPlan {
     fn cb_label(&self, i: usize) -> String {
         self.entries
             .iter()
-            .flat_map(|e| group_steps(e.tp.index, e.tp.consume).map(move |s| (e, s)))
+            .flat_map(|e| {
+                group_steps(e.tp.index, e.tp.consume.zip(e.tp.bound.map(|b| b.me)))
+                    .map(move |s| (e, s))
+            })
             .nth(i)
             .map_or_else(
                 || format!("CB {i}"),
@@ -1255,11 +1281,12 @@ mod tests {
         let slot = LandingSlot::of(cut, 0).unwrap();
         let (own, peer) = (
             Sid::of(rank1, slot).get(),
-            Sid::of(rank1.peer().unwrap(), slot).get(),
+            Sid::of(rank1.peers().next().unwrap(), slot).get(),
         );
         let bound = BoundCollective {
             send,
-            route: PeerRoute::of(rank1).unwrap(),
+            me: rank1,
+            routes: Box::leak(PeerRoute::all(rank1).into_boxed_slice()),
         };
         let cbs = site_cbs(
             SiteTp {
@@ -1306,14 +1333,15 @@ mod tests {
             cut,
         };
         let slot = |m| LandingSlot::of(cut, m).unwrap();
-        let peer = rank0.peer().unwrap();
+        let peer = rank0.peers().next().unwrap();
         let cbs = site_cbs(
             SiteTp {
                 index: 1,
                 consume: Some(consume()),
                 bound: Some(BoundCollective {
                     send,
-                    route: PeerRoute::of(rank0).unwrap(),
+                    me: rank0,
+                    routes: Box::leak(PeerRoute::all(rank0).into_boxed_slice()),
                 }),
             },
             launch(),
