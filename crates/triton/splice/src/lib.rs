@@ -1462,11 +1462,13 @@ impl PagedRows {
 ///
 /// Triton's gather takes at least 8 indices (`semantic.py`'s `descriptor_gather`). A chunk of 8
 /// entries or more gathers its pages whole, one index a page, as theirs does. A chunk of fewer
-/// gathers each page's kv heads as the folded cache's rows (`rows_per_page = nkvh`, the decode
-/// kernel's `kv_row_pool` fold), so its gather is `entries · nkvh` rows, and only a chunk under 8 of
-/// those takes more block slots than theirs: at least `ceil(8 / (seqs · nkvh))`, the slots past a
-/// sequence's blocks gathering page 0 under a fully masked tile, their own padding law ("padding
-/// columns gather page 0 under an all -inf mask and contribute zero").
+/// cannot, and gathers each page's kv heads as the folded cache's rows instead (`rows_per_page =
+/// nkvh`, the per-sequence decode kernel's `kv_row_pool` form) — OURS, not theirs: their batched
+/// kernel never folds, and measured folding "roughly 1.5-2x slower" (its docstring). Its gather is
+/// `entries · nkvh` rows, and only a chunk under 8 of those takes more block slots than theirs: at
+/// least `ceil(8 / (seqs · nkvh))`, the slots past a sequence's blocks gathering page 0 under a fully
+/// masked tile, their own padding law ("padding columns gather page 0 under an all -inf mask and
+/// contribute zero").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatchChunking {
     pub seqs: u32,
@@ -1541,7 +1543,7 @@ pub struct PagedStepTids {
     pub rep_rows: u32,
     /// A decode batch's `chunk_page_ids` `[num_chunks, entries · rows_per_page]` int32: chunk `c`'s
     /// entry `j · seqs + s`'s row `a` holds `page · rows_per_page + a` of block slot `j` of sequence
-    /// `s` (at `rows_per_page = num_kv_heads`, the decode kernel's `kv_row_pool` fold).
+    /// `s` (at `rows_per_page = num_kv_heads`, our fold under Triton's gather floor: [`BatchChunking`]).
     pub chunk_pages: u32,
     /// A decode batch's `mask_by_chunk` `[num_chunks, blocks_per_chunk, seqs, num_kv_heads, 1,
     /// block_size]`.

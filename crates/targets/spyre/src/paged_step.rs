@@ -313,8 +313,9 @@ pub struct BatchSeq<'a> {
 ///   slot (`query_row_ids.repeat(blocks_per_chunk)`);
 /// * the page ids are each sequence's blocks down the block-slot axis, zero past them;
 /// * both index tables as the kernel gathers: entry `e`'s row `a` at `e · P + a` holding
-///   `x · P + a` — at `P = nkvh` (a chunk under Triton's gather floor in pages) the decode kernel's
-///   `kv_row_pool` fold, at `P = 1` theirs as they are;
+///   `x · P + a` — at `P = 1` theirs as they are; at `P = nkvh` (a chunk under Triton's gather
+///   floor in pages) folded by kv head, the per-sequence decode kernel's `kv_row_pool` form, which
+///   their batched builder never stages ([`BatchChunking`]);
 /// * the mask is 0 where a sequence's key is at or before its position and `finfo(f16).min` past
 ///   it, `-inf` on the block slots past its blocks, and a padded sequence's block 0 `finfo.min` (so
 ///   its softmax stays finite); the kv head axis materialized, as the tiled walk reads it.

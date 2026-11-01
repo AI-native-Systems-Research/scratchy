@@ -302,9 +302,10 @@ def batched_step(kernels, cfg, dtype):
     # (`_mirror_batched_decode_indices`), the mask `[C, J, B, KV, 1, block]` with its KV axis
     # materialized. A chunk of fewer than 8 entries is under Triton's gather floor in pages, so the
     # kernel gathers its pages' kv heads (`ROWS_PER_PAGE = KV`) and both index tables are FOLDED by
-    # kv head (entry e's kv head a at e * KV + a holding x * KV + a, the decode kernel's
-    # `kv_row_pool` fold): the query rows `[E * KV]`, the page ids `[C, E * KV]`. The floor then
-    # counts those rows, so the block slots are theirs unless `B * J * KV < 8`.
+    # kv head (entry e's kv head a at e * KV + a holding x * KV + a, the per-sequence decode
+    # kernel's `kv_row_pool` form -- ours: their batched path never folds): the query rows
+    # `[E * KV]`, the page ids `[C, E * KV]`. The floor then counts those rows, so the block slots
+    # are theirs unless `B * J * KV < 8`.
     per = nkvh if b_seqs * j < TRITON_GATHER_FLOOR else 1
     jt = max(j, -(-TRITON_GATHER_FLOOR // (b_seqs * per)))
     rep_t, ids_t, mask_t, ct = batched_metadata(tables, blocks, stacks, b_seqs, b_blocks, jt, nkvh,
