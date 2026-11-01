@@ -51,6 +51,7 @@ arch-qwen3 = []
 arch-qwen3-5 = []
 arch-qwen3-5-moe = []
 arch-qwen3-5-mtp = []
+arch-qwen3-5-dense-mtp = []
 arch-gemma4-assistant = []
 arch-dflash2 = []
 arch-qwen3-5-vl =["arch-qwen3-5", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
@@ -91,6 +92,7 @@ all-arches = [
     "arch-qwen3-5",
     "arch-qwen3-5-moe",
     "arch-qwen3-5-mtp",
+    "arch-qwen3-5-dense-mtp",
     "arch-gemma4-assistant",
     "arch-dflash2",
     "arch-qwen3-5-vl",
@@ -751,7 +753,7 @@ all = [
 # only when `--speculative-model` names them. Reached as `spec/mtp` from
 # scratchy-cli through scratchy-spec (crates/models/spec), which forwards here:
 # like quant scope, it needs its own crate for its own CLI alias.
-mtp-heads = ["arch-qwen3-5-mtp", "arch-nemotron-h-mtp", "arch-gemma4-assistant", "arch-dflash2"]
+mtp-heads = ["arch-qwen3-5-mtp", "arch-qwen3-5-dense-mtp", "arch-nemotron-h-mtp", "arch-gemma4-assistant", "arch-dflash2"]
 mtp = ["mtp-heads"]
 
 # Backends — ONE definition each (this is what kills the per-arch duplication).
