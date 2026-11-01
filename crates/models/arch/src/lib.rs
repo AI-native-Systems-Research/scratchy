@@ -167,6 +167,9 @@ pub mod qwen3_5_moe;
 #[cfg(all(feature = "arch-qwen3-5-mtp", any(feature = "cuda", feature = "metal")))]
 #[path = "arch/qwen3_5_mtp.rs"]
 pub mod qwen3_5_mtp;
+#[cfg(all(feature = "arch-qwen3-5-dense-mtp", any(feature = "cuda", feature = "metal")))]
+#[path = "arch/qwen3_5_dense_mtp.rs"]
+pub mod qwen3_5_dense_mtp;
 
 #[cfg(all(feature = "arch-gemma4-assistant", feature = "metal"))]
 #[path = "arch/gemma4_assistant.rs"]
