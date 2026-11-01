@@ -1,22 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
-//! granite's two-rank world, through the real `#[forward]` expansion.
+//! granite's sharded worlds, through the real `#[forward]` expansion.
 //!
 //! The spyre and subtile crates prove the sharding analysis and the collective emission on
-//! hand-built graphs; this proves what granite's own bake ships: ONE sharded world, world 2, with
-//! its own decode bundle and wiring, and the slice law each source loads by — derived by the
-//! analysis, never declared. Granite's 40 layers each carry two K-split projections (o and down),
-//! each followed by the all-reduce the analysis wove in, so exactly 80 sources load by ROWS; its
-//! odd vocab (49155) does not split into whole sticks, so the lm head stays whole and no
-//! all-gather is needed.
+//! hand-built graphs; this proves what granite's own bake ships: one sharded world per entry of
+//! `SpyreWorld::SHARDED` (2, 4 and 8 ranks, in that order), each with its own decode bundle and
+//! wiring, and the slice law each source loads by — derived by the analysis, never declared.
+//! Granite's 40 layers each carry two K-split projections (o and down), each followed by the
+//! all-reduce the analysis wove in, so exactly 80 sources load by ROWS. Its odd vocab (49155) is
+//! split by a padded column block (`SourceShard::ColBlocks`): each rank holds a block of the lm
+//! head, and an all-gather restores the whole row before the draw.
 
 #![cfg(all(feature = "spyre", feature = "granite-3.1-2b-instruct"))]
 
 use scratchy_target_spyre::wiring::SourceShard;
 
 #[test]
-fn granite_ships_one_two_rank_world() {
+fn granite_ships_every_sharded_world() {
     let model = &scratchy_models::granite::granite_3_1_2b_instruct::SUPERDSC_TP;
-    assert_eq!(model.len(), 1, "granite bakes exactly one sharded world");
+    let worlds: Vec<u32> = model.iter().map(|tp| tp.world.get()).collect();
+    let sharded: Vec<u32> = scratchy_target_spyre::tp_plan::SpyreWorld::SHARDED
+        .iter()
+        .map(|w| w.plan().get())
+        .collect();
+    assert_eq!(
+        worlds, sharded,
+        "granite bakes every sharded world, in order"
+    );
     let tp = &model[0];
     assert_eq!(tp.world.get(), 2);
     assert!(

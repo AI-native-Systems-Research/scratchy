@@ -199,7 +199,7 @@ pub fn baked_window(layout: &crate::BundleLayout<'_>) -> Result<Option<RecvWindo
         let misplaced = SendUnplaced::RoundSumMisplaced {
             round: round.index(),
         };
-        let placed = layout.place(round_sum(round)).ok_or(misplaced.clone())?;
+        let placed = layout.place(round_sum(round)).ok_or(misplaced)?;
         if placed.segment != RecvWindow::SEGMENT
             || placed.bank != 0
             || placed.offset != offset
