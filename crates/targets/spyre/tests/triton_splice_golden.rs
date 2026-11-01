@@ -2059,6 +2059,20 @@ const ATTN_SHAPES: &[AttnShape] = &[
         rung: u32::MAX,
         rope_appended: true,
     },
+    AttnShape {
+        geom: (4, 1, 64),
+        mq: 1,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 64),
+        mq: 32,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
 ];
 
 /// The attention fixture's decode-position model: how many positions the mask says are valid
