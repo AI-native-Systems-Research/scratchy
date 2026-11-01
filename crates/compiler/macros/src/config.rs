@@ -1838,9 +1838,13 @@ fn model_params_from_json(
         scalars.entry(k.clone()).or_insert(*v);
     }
     let quantization = parse_quantization(json, source_path)?;
-    let tie_word_embeddings = parse_tie_word_embeddings(json)
-        .or(spec.tie_default)
-        .unwrap_or(false);
+    // An in-checkpoint head reads its target's config, whose `tie_word_embeddings` says where the
+    // TARGET keeps its lm_head (Qwen3.5-0.8B: in its embedding table). The head's lm_head is a
+    // slot of its own the target lends either way (`target.lent_weight_prefix`), never its embedding.
+    let tie_word_embeddings = spec.checkpoint_of.is_empty()
+        && parse_tie_word_embeddings(json)
+            .or(spec.tie_default)
+            .unwrap_or(false);
     // An arch that is a part of another model's checkpoint (an MTP head) registers under the
     // identity it declares, not the architecture its (the whole checkpoint's) config names.
     let (architectures, (drafts_for, published, target_experts)) =
@@ -3683,6 +3687,22 @@ mod tests {
             head.checkpoint_prefix.as_deref(),
             Some("language_model.mtp")
         );
+    }
+
+    /// Qwen3.5-0.8B ties its lm_head to its embedding; its dense MTP head, read off the same
+    /// config, does not: the target lends the head both apart, so every variant of the head loads
+    /// them from the same places.
+    #[test]
+    fn a_tied_target_lends_its_head_an_untied_lm_head() {
+        let target_path = repo_model_archs("qwen3-5").join("qwen3.5-0.8b.json");
+        let (_, json) = read_json_file(&target_path).expect("json");
+        let parse = |arch: &str| {
+            let spec = load_arch_json(&repo_model_archs(arch)).expect("arch.json");
+            model_params_from_json(&json, "qwen3.5-0.8b", &target_path, Vec::new(), &spec)
+                .expect("parse")
+        };
+        assert!(parse("qwen3-5").tie_word_embeddings);
+        assert!(!parse("qwen3-5-dense-mtp").tie_word_embeddings);
     }
 
     /// The MTP head compiles on exactly the configs of `checkpoint_of` that declare its layers:
