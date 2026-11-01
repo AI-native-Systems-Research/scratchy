@@ -58,7 +58,7 @@ use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{
     DataFormat, Df, Fp16, Fp32, ItDim, SdscFoldSet, SenUint32, StickExtent,
 };
-use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
+use crate::work::{DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
 use ktir_core::affine::AffineExpr;
 use ktir_core::attrkey::AttrKey;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
@@ -5919,31 +5919,49 @@ pub fn matmul_oriented(
     let n_dev =
         DeviceWidth::for_matmul(m, n, k, matches!(proof.origin, OperandOrigin::Windowed)).get();
     let macs = m as u64 * n_dev as u64 * k as u64;
-    // ── GUARD #11 (util floor) computed on the PROVEN partition `CoreSplit::plan` (Kani: disjoint +
-    //    covering, #50-free) — the SAME split the emit uses (`matmul_split_map` defers to CoreSplit for
-    //    batch=1). A FLOP-heavy matmul left on <8 cores is the 1.45× sengraph regression this emitter
-    //    exists to fix; the padding above is what fills them for a prime-stick output. ──
-    let sp = CoreSplit::plan(m, n_dev);
-    let cores = sp.ncores();
+    // ── GUARD #11 (util floor) computed on the split this matmul is EMITTED with — the splitter its
+    //    opspec takes (`matmul_split_map`: torch-spyre's cost model for a prompt's rows, the one-row
+    //    fill for one) over the same `[m, n_dev, k]`. A FLOP-heavy matmul left on <8 cores is the
+    //    1.45× sengraph regression this emitter exists to fix; the padding above is what fills them
+    //    for a prime-stick output.
+    //
+    //    ⛔ NOT `CoreSplit::plan`, which this guard read when the emitter split by it. The emitter now
+    //    splits a prompt's rows by the cost model, contraction included, so the two disagree exactly
+    //    where the guard matters: granite-8b's eight-rank MLP shard (`35×1600×4096`, 25 output sticks)
+    //    is 7 cores by `CoreSplit` (rows first, 35 = 5·7) and fills the card by the split it ships. ──
+    // `n_dev` is whole sticks by construction and `k` was checked above, so both extents mint.
+    let (Ok(n_ext), Ok(k_ext)) = (StickExtent::<Fp16>::new(n_dev), StickExtent::<Fp16>::new(k))
+    else {
+        return err(format!(
+            "MatmulTile t{}: [{n_dev}, {k}] is not whole fp16 sticks",
+            out.tid
+        ));
+    };
+    use crate::ir::bridge::tiled_op_sdsc_op::matmul::dims::{matmul_dims, matmul_split_map};
+    let split = matmul_split_map(
+        &matmul_dims::<Fp16>(m, &n_ext, &k_ext, 1),
+        crate::superdsc_opspec::MAX_CORES,
+    );
+    let cores: u32 = split.values().product();
     if macs >= (1 << 20) && cores < UTIL_FLOOR_CORES {
         return err(format!(
-            "MatmulTile t{}: {m}×{n_dev}×{k} ({macs} MACs) CoreSplit-divided onto only {cores} \
-             core(s) — below the util floor; the OUTPUT stick count is not splittable to ≥8 even \
-             after padding.",
+            "MatmulTile t{}: {m}×{n_dev}×{k} ({macs} MACs) is split {split:?}, onto only {cores} \
+             core(s) — below the util floor even after padding the output's sticks.",
             out.tid
         ));
     }
     // ── GUARD (priority-1, from OBSERVED on-card crash 2026-06-25): the per-core STICK extent (N on
     //    OUTPUT/KERNEL) MUST stay a whole 64-fp16 stick — a sub-stick split DtException's the dxp
-    //    scheduler (L3DlOpsScheduler.cpp:1040). `CoreSplit` splits `out` by STICK COUNT (whole sticks by
-    //    construction) and never splits K, so this holds; kept as a build-time seal. ──
-    if !(n_dev / sp.stick_cores).is_multiple_of(FP16_ELEMS_PER_STICK) {
+    //    scheduler (L3DlOpsScheduler.cpp:1040). The splitter cuts `out` by STICK COUNT (whole sticks
+    //    by construction); kept as a build-time seal on the split it chose. ──
+    use crate::ir::bridge::tiled_op_sdsc_op::matmul::walk::{OutAxis, WalkAxis};
+    let stick_cores = split.get(OutAxis::NAME).copied().unwrap_or(1);
+    if !(n_dev / stick_cores).is_multiple_of(FP16_ELEMS_PER_STICK) {
         return err(format!(
-            "MatmulTile t{}: CoreSplit stick_cores={} leaves a SUB-STICK per-core N extent \
-             (N/core={}) — must be a multiple of {FP16_ELEMS_PER_STICK}.",
+            "MatmulTile t{}: the split's out cores ({stick_cores}) leave a SUB-STICK per-core N \
+             extent (N/core={}) — must be a multiple of {FP16_ELEMS_PER_STICK}.",
             out.tid,
-            sp.stick_cores,
-            n_dev / sp.stick_cores
+            n_dev / stick_cores
         ));
     }
     let op_name = format!("matmul_o{}", out.tid);
