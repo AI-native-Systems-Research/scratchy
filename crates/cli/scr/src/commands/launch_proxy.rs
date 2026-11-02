@@ -268,7 +268,7 @@ fn route(
             method,
             &url,
             local_headers.iter().copied(),
-            local_body,
+            &local_body,
         );
         return ("local", result);
     }
@@ -279,7 +279,7 @@ fn route(
         .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str(), v)));
     (
         "gateway",
-        forward(&proxy.agent, method, &url, passthrough, body.to_vec()),
+        forward(&proxy.agent, method, &url, passthrough, body),
     )
 }
 
@@ -328,7 +328,7 @@ fn forward<'a>(
     method: &Method,
     url: &str,
     headers: impl Iterator<Item = (&'a str, &'a str)>,
-    body: Vec<u8>,
+    body: &[u8],
 ) -> Result<Response> {
     let mut req = axum::http::Request::builder()
         .method(method.as_str())

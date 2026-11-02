@@ -110,13 +110,18 @@ pub struct LaunchClaudeArgs {
     /// Pick the best model for this Mac (metal only): the biggest quantized MLX
     /// checkpoint its memory class fits and this binary compiles in, served with
     /// the widest context its KV cache holds. Prints the build line when the
-    /// pick is not compiled in.
-    #[arg(short = 'A', long, conflicts_with_all = ["model_tag", "model"])]
+    /// pick is not compiled in. Picks for a server launch starts, so it does not
+    /// combine with --server-url.
+    #[arg(short = 'A', long, conflicts_with_all = ["model_tag", "model", "server_url"])]
     pub best_model: bool,
 
     /// --best-model's settings, serving this model instead of the pick: `-a
     /// mlx-community/Qwen3.5-9B-4bit` or `-a=<MODEL>`. Implies --best-model.
-    #[arg(short = 'a', value_name = "MODEL", conflicts_with_all = ["model_tag", "model"])]
+    #[arg(
+        short = 'a',
+        value_name = "MODEL",
+        conflicts_with_all = ["model_tag", "model", "server_url"]
+    )]
     pub best_model_override: Option<String>,
 
     /// Keep the session on your own gateway and send only Claude Code's

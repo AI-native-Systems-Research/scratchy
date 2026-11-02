@@ -38,6 +38,10 @@ pub(crate) struct Tier {
     pub(crate) model: &'static str,
     /// The `configs/<arch>/<stem>.json` that has to be compiled in to load it.
     pub(crate) stem: &'static str,
+    /// The `model/<feature>` that compiles that config. Usually the stem, but a
+    /// stem a vision arch also has is the vision arch's under its bare name,
+    /// and the text arch's copy is `<stem>-text-only`.
+    pub(crate) feature: &'static str,
     /// The quant preset that checkpoint loads under.
     pub(crate) quant: &'static str,
     /// What the weights are, for the one line launch prints.
@@ -62,6 +66,7 @@ pub(crate) const TIERS: &[Tier] = &[
         min_gib: 96,
         model: "mlx-community/Qwen3.5-122B-A10B-OptiQ-2bit",
         stem: "qwen3.5-122b-a10b",
+        feature: "qwen3.5-122b-a10b",
         quant: "mlx-affine-b4-g64-qembed",
         weights: "MLX 2/4-bit mixed",
     },
@@ -69,6 +74,7 @@ pub(crate) const TIERS: &[Tier] = &[
         min_gib: 36,
         model: "mlx-community/Qwen3.6-35B-A3B-4bit",
         stem: "qwen3.6-35b-a3b",
+        feature: "qwen3.6-35b-a3b",
         quant: "mlx-affine-b4-g64-qembed",
         weights: "MLX 4-bit",
     },
@@ -76,6 +82,9 @@ pub(crate) const TIERS: &[Tier] = &[
         min_gib: 16,
         model: "mlx-community/Qwen3.5-9B-4bit",
         stem: "qwen3.5-9b",
+        // `model/qwen3.5-9b` is the vision arch (qwen3-5-vl), which has no
+        // quant presets, so it never emits the `-qembed` variant `pick` needs.
+        feature: "qwen3.5-9b-text-only",
         quant: "mlx-affine-b4-g64-qembed",
         weights: "MLX 4-bit",
     },
@@ -83,6 +92,7 @@ pub(crate) const TIERS: &[Tier] = &[
         min_gib: 0,
         model: "mlx-community/Qwen2.5-3B-Instruct-4bit",
         stem: "qwen2.5-3b",
+        feature: "qwen2.5-3b",
         quant: "mlx-affine-b4-g64-qembed",
         weights: "MLX 4-bit",
     },
@@ -126,7 +136,7 @@ pub(crate) fn pick(mem_bytes: u64, compiled: &[String]) -> Result<Pick, &'static
 pub(crate) fn build_line(tier: &Tier) -> String {
     format!(
         "cargo build --release -p scratchy-cli --features metal,claude,model/{},quant/{}",
-        tier.stem, tier.quant
+        tier.feature, tier.quant
     )
 }
 
@@ -286,6 +296,28 @@ mod tests {
             "cargo build --release -p scratchy-cli --features \
              metal,claude,model/qwen3.6-35b-a3b,quant/mlx-affine-b4-g64-qembed"
         );
+        // The 9B stem is also a vision arch's, under its bare name; the text
+        // arch that has the quant preset is `-text-only`.
+        assert_eq!(
+            build_line(&TIERS[2]),
+            "cargo build --release -p scratchy-cli --features \
+             metal,claude,model/qwen3.5-9b-text-only,quant/mlx-affine-b4-g64-qembed"
+        );
+    }
+
+    /// Every rung's build-line feature is a real `model/<feature>` of
+    /// scratchy-models, so the printed command at least resolves.
+    #[test]
+    fn every_tier_feature_exists_in_scratchy_models() {
+        let manifest = include_str!("../../../../models/arch/Cargo.toml");
+        for tier in TIERS {
+            let decl = format!("\n\"{}\" = [", tier.feature);
+            assert!(
+                manifest.contains(&decl),
+                "no `{}` feature in scratchy-models",
+                tier.feature
+            );
+        }
     }
 
     #[test]

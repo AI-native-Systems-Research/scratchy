@@ -166,6 +166,12 @@ fn auto_mode_only_env(proxy_url: &str) -> Vec<(&'static str, String)> {
             super::launch_proxy::CLASSIFIER_MODEL.to_string(),
         ),
     ]
+    .into_iter()
+    // Blanked for the same reason as in `launch_env`: a set `CLAUDE_CODE_USE_*`
+    // sends the session to that provider, around the proxy, and every check
+    // then asks it for a model it does not have.
+    .chain(PROVIDER_SELECTION_VARS.iter().map(|k| (*k, String::new())))
+    .collect()
 }
 
 /// The gateway an `--auto-mode-only` session keeps talking to, from the user's
@@ -197,8 +203,14 @@ async fn run_auto_mode_only(
     // A server launch did not start may still think before it answers, and a
     // check whose verdict comes late or never is denied (`serve_argv` turns
     // thinking off only for a server launch starts).
-    if let Some(warning) = external_classifier_warning(server.is_none()) {
-        eprintln!("{warning}");
+    if server.is_none() {
+        eprintln!(
+            "Warning: --server-url uses a server launch did not start, so launch cannot turn its \
+             thinking off. A model that reasons before answering (Qwen3.6, for one) is slow on \
+             safety checks and Claude Code denies the action when no verdict comes back. Start \
+             that server with `--default-chat-template-kwargs '{{\"enable_thinking\": false}}'`, \
+             or drop --server-url and let launch start one."
+        );
     }
     // The served id, not the one launch was given: a local path or an alias
     // serves under a name of the server's own.
@@ -313,19 +325,6 @@ fn claude_exit(claude_bin: &str, status: std::process::ExitStatus) -> Result<()>
         Some(code) => bail!("`{claude_bin}` exited with status {code}"),
         None => bail!("`{claude_bin}` terminated by signal"),
     }
-}
-
-/// The warning `--auto-mode-only` prints when the local server is one launch did
-/// not start (`--server-url`), so its thinking setting is not launch's to set.
-fn external_classifier_warning(external: bool) -> Option<String> {
-    external.then(|| {
-        "Warning: --server-url uses a server launch did not start, so launch cannot turn its \
-         thinking off. A model that reasons before answering (Qwen3.6, for one) is slow on safety \
-         checks and Claude Code denies the action when no verdict comes back. Start that server \
-         with `--default-chat-template-kwargs '{\"enable_thinking\": false}'`, or drop \
-         --server-url and let launch start one."
-            .to_string()
-    })
 }
 
 /// What the local server's request count says about the safety checks. Zero is
@@ -1465,10 +1464,9 @@ mod tests {
         ClaudeCodeLimits, LaunchClaudeArgs, PROVIDER_SELECTION_VARS, SessionInject,
         SmallWindowOrigin, asked_max_model_len, auto_mode_only_env, claude_code_floor_warning,
         claude_code_output_budget, claude_code_window, claude_settings_json,
-        context_window_from_models, context_window_warning, external_classifier_warning,
-        gen_uuid_v4, ignored_with_server_url, is_print_mode, launch_env, provenance_report,
-        resolve_session_inject, serve_argv, session_id_from_args, settings_flag_in_args,
-        user_gateway,
+        context_window_from_models, context_window_warning, gen_uuid_v4, ignored_with_server_url,
+        is_print_mode, launch_env, provenance_report, resolve_session_inject, serve_argv,
+        session_id_from_args, settings_flag_in_args, user_gateway,
     };
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -1511,6 +1509,11 @@ mod tests {
 
         assert!(parse(&["claude", "my-model", "-A"]).is_err());
         assert!(parse(&["claude", "-m", "my-model", "-a", "other"]).is_err());
+        // The pick is for a server launch starts, so an external one refuses it.
+        let url = "--server-url=http://127.0.0.1:8000";
+        assert!(parse(&["claude", "-A", url]).is_err());
+        assert!(parse(&["claude", "-a", "m", url]).is_err());
+        assert!(parse(&["claude", "m", url]).is_ok());
     }
 
     /// `--auto-mode-only` combines with every way of naming the local model.
@@ -1543,6 +1546,9 @@ mod tests {
             get("CLAUDE_CODE_AUTO_MODE_MODEL"),
             Some(crate::commands::launch_proxy::CLASSIFIER_MODEL)
         );
+        for provider in PROVIDER_SELECTION_VARS {
+            assert_eq!(get(provider), Some(""), "{provider} would bypass the proxy");
+        }
         for untouched in [
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_API_KEY",
@@ -1556,16 +1562,6 @@ mod tests {
                 "{untouched} is the user's, not launch's"
             );
         }
-    }
-
-    /// A server launch did not start gets a warning naming the flag that turns
-    /// its thinking off; one launch started (thinking already off) gets none.
-    #[test]
-    fn auto_mode_only_warns_about_an_external_servers_thinking() {
-        let warning = external_classifier_warning(true).expect("external server warns");
-        assert!(warning.contains("--default-chat-template-kwargs"));
-        assert!(warning.contains("enable_thinking"));
-        assert_eq!(external_classifier_warning(false), None);
     }
 
     /// The gateway comes from the user's own `ANTHROPIC_BASE_URL`; without one
