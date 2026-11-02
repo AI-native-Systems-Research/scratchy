@@ -409,7 +409,7 @@ impl PrefixLadder {
 /// one request decoding with up to 31 padding rows.
 #[cfg(any(test, feature = "spyre-hw"))]
 pub(crate) fn deep_solo_rung(
-    rungs: impl IntoIterator<Item = (u32, Option<u64>)>,
+    rungs: impl IntoIterator<Item = (usize, Option<u64>)>,
     deepest_pos: u64,
 ) -> Option<usize> {
     rungs.into_iter().position(|(width, first_walk)| {
@@ -676,7 +676,7 @@ mod deep_solo_tests {
     #[test]
     fn one_request_decodes_on_a_narrow_rung_past_its_first_walk_and_never_a_wide_one() {
         let ladder = [
-            (1u32, Some(6144u64)),
+            (1usize, Some(6144u64)),
             (2, Some(4096)),
             (4, Some(2048)),
             (8, Some(1024)),
