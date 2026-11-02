@@ -4069,6 +4069,47 @@ fn lower_function_folded(
             }
             if oi == end {
                 body_out.1 = Some(out.len());
+                // ⭐ A CARRIED VALUE THE CODE AFTER THE WALK READS ACROSS CORES IS HANDED BACK ONCE.
+                // The scratchpad plan keeps a tensor core-local only where every op slices it alike
+                // ([`super::lx_plan`]). The trips do, but a decode batch's merge after the walk
+                // folds the carried max over its block slots, which lie on different cores of the
+                // walk's split — so that one read cost the max its LX residency on every trip
+                // (#1026: the sum and output stayed, the max went to HBM). The merge reads a copy
+                // instead, made once after the last trip; `max(x, x)` is `x` exactly.
+                if let (Some(layout), Some(fold)) = (layout, fold) {
+                    let after = &f.operations[end..];
+                    for c in &fold.carried {
+                        let folded_after = after.iter().any(|o| {
+                            o.operands.first() == Some(&c.result)
+                                && o.attributes.iter().any(|(k, v)| {
+                                    matches!((k, v), (AttrKey::Dimensions, Attr::IntList(d)) if *d == [0])
+                                })
+                        });
+                        let Some(&r) = inter.get(&c.result).filter(|_| folded_after) else {
+                            continue;
+                        };
+                        let tid =
+                            mint_scratch(k, layout, floor, c.result, Scratch::CarriedHandback);
+                        layout.synth(crate::place::PlaceId::Act(tid), &[r.v_rows, r.v_cols]);
+                        let copy = Region { tid, ..r };
+                        out.extend(super::lower_ktir_to_superdsc::elementwise(
+                            f.name,
+                            Elementwise::Maximum,
+                            &[
+                                r,
+                                r,
+                                Region {
+                                    is_out: true,
+                                    ..copy
+                                },
+                            ],
+                            &[],
+                            sym_id_base,
+                            Some(layout),
+                        )?);
+                        inter.insert(c.result, copy);
+                    }
+                }
             }
         }
         let in_body = body_at.is_some_and(|(start, end)| (start..end).contains(&oi));

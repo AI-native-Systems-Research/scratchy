@@ -4783,6 +4783,62 @@ mod walk_on_the_card {
         }
     }
 
+    /// ⭐ A DECODE BATCH'S CARRIED STATE LIVES IN LX — the running maximum, the running sum and the
+    /// output accumulator each core keeps across the walk, as torch-spyre's compiled walk keeps all
+    /// three. Every walk op that writes a carried value writes it core-locally.
+    #[test]
+    fn a_decode_batch_keeps_its_carried_state_in_lx() {
+        for (seqs, walk, hd) in [
+            (1u32, 128u32, 64u32),
+            (4, 128, 64),
+            (1, 128, 128),
+            (4, 64, 128),
+        ] {
+            let (node, _) = batched_walk_at(seqs, walk, hd);
+            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            let mut sym = 0i64;
+            let ops =
+                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                    .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
+            let at = format!("B={seqs} walk={walk} hd={hd}");
+            // The walk's carried buffers: what a trip writes that a seed before the walk filled.
+            let filled: Vec<String> = ops
+                .iter()
+                .filter(|e| e.walk.is_none() && e.op_name.starts_with("fill_o"))
+                .filter_map(|e| e.arg_bindings.last().map(|a| a.buffer.clone()))
+                .collect();
+            let seeded: Vec<String> = filled
+                .into_iter()
+                .filter(|b| {
+                    ops.iter()
+                        .filter(|e| e.walk.is_some())
+                        .any(|e| e.arg_bindings.iter().any(|a| !a.is_input && a.buffer == *b))
+                })
+                .collect();
+            assert_eq!(
+                seeded.len(),
+                3,
+                "{at}: max, sum and output carried: {seeded:?}"
+            );
+            let spilled: Vec<String> = ops
+                .iter()
+                .filter(|e| e.walk.is_some())
+                .flat_map(|e| {
+                    e.arg_bindings
+                        .iter()
+                        .filter(|a| seeded.contains(&a.buffer))
+                        .filter(|a| !layout.lx_core_local(&a.buffer))
+                        .map(move |a| format!("{} {}", e.op_name, a.buffer))
+                })
+                .collect();
+            assert!(
+                spilled.is_empty(),
+                "{at}: carried state outside LX: {spilled:?}"
+            );
+        }
+    }
+
     /// ⭐ THE LEADING-AXIS MAXIMUM FOLDS BY HALVING — `log₂ J` ops, not `J - 1`. A decode batch's
     /// one-chunk arm shares one maximum across its `J` block slots (`torch.amax(..., dim=0)`), and
     /// the card's reduce folds only along the stick, so the fold is a chain of combines; folding the
