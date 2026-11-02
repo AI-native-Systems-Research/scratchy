@@ -415,6 +415,69 @@ A run whose validity checks fail prints them and exits non-zero. That is
 intentional: a FROZEN rep that faulted no more than COLD did not measure a frozen
 start, and reporting it would be worse than reporting nothing.
 
+### Dataset cells: open loop at fixed rates
+
+The matrix's real-dataset cells (`--scale-axes tasks`, its default sweep) time each engine
+**open loop**: requests arrive on a Poisson schedule (`bench serve --request-rate R`, gamma
+inter-arrivals with `--burstiness 1`), at rates set before the run, the same for every engine.
+They are not run closed loop, each user sending its next request the moment its last answer
+returns: a closed loop's users fall into lockstep. An engine that batches its users finishes them
+together and gets them back as a burst every round, so one prompt prefills alone and the rest
+queue behind it. Its TTFT then measures the loop's synchronization, not its prefill: on a base M5
+the closed-loop grid read scratchy 0.70× to 0.81× of oMLX at 4 users and short prompts, though
+scratchy is 1.24× to 2.6× faster to its first token at 1 user on every model.
+
+**The rule, per model and workload:**
+- **Base rate:** scratchy's own 1-user closed-loop request rate on that model and workload, a
+  `base` cell measured first: completed requests over its duration. Measured on scratchy alone,
+  and read by every other engine.
+- **Rates:** fractions of the base rate, `TASK_RATE_STEPS`: 0.5 and 1 in a quick run, 0.25, 0.5,
+  0.75 and 1 with `--full`. The same absolute rates on every engine, so engines are compared at
+  the same offered load. An engine that cannot keep up shows it as rising TTFT and queueing, which
+  is the comparison.
+- **Cap:** `--max-concurrency` is the grid's largest users count. It bounds in-flight requests;
+  it does not set the load.
+- **A conversation** (`sharegpt-multi-turn`) arrives as one unit: its start is on the schedule,
+  its turns follow one another, each after the last has answered.
+
+**Comparable answers:** a timed cell forces every answer to its task's length
+(`bench serve --timed-answers`: `ignore_eos`), the same on every engine: a RAG task's 64 tokens,
+a conversation turn's recorded reply, a shared-prefix question's 32. Answers ending on their own
+are each engine's own length, so their total time is not like for like. Accuracy is therefore not
+scored on timed cells; `--full`'s `rag-accuracy` cell scores it, its answers running free, closed
+loop. A span query (`rag-spans`, scratchy's own row) cannot be forced: its answers end on their
+own, so its total time is scratchy's alone and is not compared.
+
+**Timeouts:** an open-loop cell's limit adds its arrival schedule's own span (its requests over the
+rate), so a low rate is not taken for a hung server: 16 tasks at 0.03/s take 534 s before any is
+served.
+
+**Recorded:** each cell's offered `request_rate`, and per request its send time
+(`start_times`, seconds from the cell's start), TTFT and end-to-end time, so an arrival's
+effect can be told from an engine's from the run file alone.
+
+### The grid: natural text, open loop above 1 user
+
+The diagnostic grid (`--random`, prompts × answers × users) keeps its fixed shapes, for long
+prompts, regressions and attribution, but changes two things:
+
+- **Natural text, not random token IDs.** Each prompt is a slice of exactly its length of real
+  text (`bench serve --dataset-name natural`: the ShareGPT file's human turns, cut at seeded
+  offsets, the same prompts on every engine). Random token IDs route a mixture-of-experts model's
+  experts unlike any real prompt, and three of the small set's four models are MoE.
+- **Open loop above 1 user.** A cell at *u* users offers `GRID_LOAD` (1) × the rate of scratchy's
+  own 1-user cell at the same prompt and answer length, on a Poisson schedule; *u* is only its cap
+  in flight. The 1-user cells stay closed loop: one user has no lockstep, and they are the base
+  rates. Every engine is offered scratchy's rates, so the comparison is at the same load; an engine
+  with no scratchy cell at that shape to take its rate from is not run there.
+- **The rate is not scaled up by the users count.** An offered load above what the server
+  sustains fills the cap, and a full cap holds arrivals back and sends them in bursts, which is
+  the lockstep again. On an M3 Pro, granite-4.2-3b at 1024-token prompts and 4 users: *u* × 0.5 ×
+  the 1-user rate (0.83/s) saturated the server, 60% of sends within 50 ms of the last and TTFT
+  5.4 s; 1× (0.42/s) kept Poisson arrivals, 7%, and TTFT 1.45 s against one user's 1.37 s. Each
+  cell's log line gives its share of sends within 50 ms of the last (`burst`), so a cell whose cap
+  held its arrivals back shows it.
+
 ### Multi-turn prefix-reuse cells
 
 `scr bench serve --dataset-name multi-turn` runs closed-loop conversations: each

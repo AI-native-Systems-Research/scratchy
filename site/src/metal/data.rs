@@ -334,6 +334,16 @@ pub struct Scaling {
     /// ran at 1 user only. None: every prompt `max_prompt` allows.
     #[serde(default)]
     pub max_prompt_users: Option<u32>,
+    /// The dataset workloads the tasks axis ran, every engine on the same tasks; absent before
+    /// the matrix ran datasets, and in a `--random` run.
+    #[serde(default)]
+    pub workloads: Option<Vec<String>>,
+    /// The workloads scratchy alone ran (`rag-spans`, its passage reuse).
+    #[serde(default)]
+    pub workloads_scratchy: Option<Vec<String>>,
+    /// A dataset task's longest prompt, in tokens: a longer one was left out, on every engine.
+    #[serde(default)]
+    pub task_max_prompt: Option<u32>,
 }
 
 /// What a model ran at when a limit lowered it (GLM-4.5-Air: 4 users).
@@ -406,6 +416,17 @@ pub struct Model {
     pub scaling_mistralrs: Option<Vec<Cell>>,
     #[serde(default)]
     pub scaling_splash: Option<Vec<Cell>>,
+    /// The dataset workloads' cells, per engine: one a workload and users count.
+    #[serde(default)]
+    pub tasks: Option<Vec<TaskCell>>,
+    #[serde(default)]
+    pub tasks_omlx: Option<Vec<TaskCell>>,
+    #[serde(default)]
+    pub tasks_omlx_tq: Option<Vec<TaskCell>>,
+    #[serde(default)]
+    pub tasks_mlx_lm: Option<Vec<TaskCell>>,
+    #[serde(default)]
+    pub tasks_splash: Option<Vec<TaskCell>>,
     /// Per engine key, what it served: the ollama tag or GGUF file and its
     /// quantization, and the files' revision.
     #[serde(default)]
@@ -476,6 +497,62 @@ pub struct Rep {
     /// Launch until the first token: ready, then the first request.
     pub ttft_exec_s: Option<f64>,
     pub peak_rss_mib: Option<f64>,
+}
+
+/// One dataset workload at one users count, as `scr bench serve --dataset-name <workload>`
+/// measured it: answers ending on their own, every engine sent the same tasks.
+#[derive(Deserialize, Clone, Debug)]
+pub struct TaskCell {
+    pub workload: String,
+    /// Users at once.
+    pub conc: u32,
+    pub completed: Option<u32>,
+    #[serde(default)]
+    pub failed: Option<u32>,
+    pub median_ttft_ms: Option<f64>,
+    #[serde(default)]
+    pub median_e2el_ms: Option<f64>,
+    /// Answer tokens a task took, on average.
+    #[serde(default)]
+    pub mean_output_tokens: Option<f64>,
+    /// Every answer token the cell's requests delivered.
+    #[serde(default)]
+    pub total_output_tokens: Option<u64>,
+    /// Prompt tokens the server's cache served, on average; None where it sent no count.
+    #[serde(default)]
+    pub mean_cached_tokens: Option<f64>,
+    /// The share of answers right, by the dataset's own text scoring; None where nothing is
+    /// scored (chat turns, the shared-prefix questions).
+    #[serde(default)]
+    pub accuracy: Option<f64>,
+    /// Answers that opened as reasoning: a request whose thinking could not be turned off (a span
+    /// query), so its accuracy and tokens are no like-for-like with a plain answer's.
+    #[serde(default)]
+    pub thinking_answers: Option<u32>,
+    /// Answers that ran to their cap rather than ending on their own.
+    #[serde(default)]
+    pub capped_answers: Option<u32>,
+    /// Tasks sent, the denominator of accuracy. None in runs from before it was recorded.
+    #[serde(default)]
+    pub num_tasks: Option<u32>,
+    #[serde(default)]
+    pub timed_out: bool,
+}
+
+impl TaskCell {
+    /// Answer tokens a task took, on average: as recorded, or from the cell's total where only
+    /// that is (a ShareGPT single-turn cell, timed on the completions path).
+    pub fn answer_tokens(&self) -> Option<f64> {
+        self.mean_output_tokens.or_else(|| {
+            let n = self.completed.filter(|&n| n > 0)?;
+            Some(self.total_output_tokens? as f64 / f64::from(n))
+        })
+    }
+
+    /// Whether it measured anything: some request answered.
+    pub fn measured(&self) -> bool {
+        self.completed.unwrap_or(0) > 0 && !self.timed_out
+    }
 }
 
 /// A size in bytes.
