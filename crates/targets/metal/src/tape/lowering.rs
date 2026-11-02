@@ -1153,7 +1153,7 @@ fn route_small_m(
     // 24 / 17, lm_head 1641 / 1384). The pre-pass is shared by the matmuls of one activation.
     let short = (W4a8Gemm::for_small_m(n, k)).filter(|_| {
         class == crate::tape::lowered::GenClass::M5Wide
-            && bucket_m < W4A8_SMALL_M_ROWS
+            && bucket_m <= W4A8_SMALL_M_ROWS
             && matches!(group_size, 64 | 128)
             && k.is_multiple_of(64)
     });
