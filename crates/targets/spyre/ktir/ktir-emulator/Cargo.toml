@@ -80,10 +80,6 @@ name = "bench_amx_vs_metal"
 path = "tests/bench_amx_vs_metal.rs"
 
 [[test]]
-name = "flash_attn_timing"
-path = "tests/flash_attn_timing.rs"
-
-[[test]]
 name = "gpu_dispatch_floor"
 path = "tests/gpu_dispatch_floor.rs"
 

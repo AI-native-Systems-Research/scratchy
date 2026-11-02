@@ -43,7 +43,6 @@ fn program_from(s: &str) -> Option<Program> {
         "lmlast" => Program::LmLast,
         "transpose" => Program::Transpose,
         "rope" => Program::Rope,
-        "attn" => Program::Attn,
         other => {
             let kind = other.strip_prefix("ew:")?;
             Program::Elementwise(match kind {

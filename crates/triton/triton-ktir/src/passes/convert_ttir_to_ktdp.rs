@@ -32,11 +32,12 @@ pub fn run(module: &mut Module) -> Result<()> {
     walk_1_descriptors(module)?;
     precondition_check(module)?;
     convert_access_ops(module)?;
-    // AFTER the direct path, and the order is load-bearing rather than tidy: a gather's
-    // `x_offsets` must already BE the lowered `ktdp.load` so its index view can be traced.
-    // The C++ gets the same effect from a conversion adaptor, which hands the pattern the
-    // post-conversion value.
-    convert_gathers(module)?;
+    // AFTER the direct path, and the order is load-bearing rather than tidy: a gather's or a
+    // scatter's `x_offsets` must already BE the lowered `ktdp.load` so its index view can be
+    // traced. The C++ gets the same effect from a conversion adaptor, which hands the pattern
+    // the post-conversion value.
+    convert_indirect(module)?;
+    convert_scalar_reads(module)?;
     fold_trans_into_access_tile_order(module);
     refuse_raw_tile_access(module)?;
     Ok(())
@@ -373,8 +374,9 @@ fn convert_access_ops(module: &mut Module) -> Result<()> {
         })
         .collect();
     let index = module.def_index();
+    let loops = loop_ranges(module, &index);
     let mut edits: Vec<(OpPath, Vec<Op>)> = Vec::with_capacity(paths.len());
-    // The scalar id reads (and their `tt.addptr`) a slab gather consumed: its indirect tile
+    // The scalar id reads (and their `tt.addptr`) a slab access consumed: its indirect tile
     // reads the ids VIEW, so the read itself has no consumer left. Erased below, here,
     // because `tt.load` is read-only and DCE keeps it -- and an unconverted `tt` op is a
     // `to_ktir` refusal.
@@ -387,12 +389,10 @@ fn convert_access_ops(module: &mut Module) -> Result<()> {
         ) {
             continue;
         }
-        // ⭐ A LOAD WHOSE OFFSET IS DATA IS A SLAB GATHER, NOT A DIRECT TILE. See
-        // [`slab_gather`]: the offset traces to a scalar `tt.load`, so the block's address
+        // ⭐ AN ACCESS WHOSE OFFSET IS DATA IS A SLAB GATHER OR SCATTER, NOT A DIRECT TILE. See
+        // [`slab_access`]: the offset traces to a scalar `tt.load`, so the block's address
         // depends on memory and the access must be an indirect tile.
-        if op.kind == OpKind::TtDescriptorLoad
-            && let Some((replacement, read)) = slab_gather(module, &index, &op)?
-        {
+        if let Some((replacement, read)) = slab_access(module, &index, &loops, &op)? {
             edits.push((path, replacement));
             consumed.push(read);
             continue;
@@ -499,7 +499,7 @@ fn convert_access_ops(module: &mut Module) -> Result<()> {
     Ok(())
 }
 
-/// Erase each scalar id read a slab gather consumed, and the `tt.addptr` it read through,
+/// Erase each scalar id read a slab access consumed, and the `tt.addptr` it read through,
 /// when nothing else uses it. A read with another user stays, and then reaches `to_ktir` as
 /// an unconverted `tt` op -- a refusal by name, never a dropped value.
 fn erase_consumed_id_reads(module: &mut Module, reads: &[Ssa]) {
@@ -542,7 +542,8 @@ fn erase_consumed_id_reads(module: &mut Module, reads: &[Ssa]) {
     walk::splice_many(module, paths.into_iter().map(|p| (p, Vec::new())).collect());
 }
 
-/// ⭐⭐⭐ THE SLAB GATHER — a `tt.descriptor_load` one of whose offsets is DATA.
+/// ⭐⭐⭐ THE SLAB ACCESS — a `tt.descriptor_load` (a SLAB GATHER) or `tt.descriptor_store` (a SLAB
+/// SCATTER) one of whose offsets is DATA.
 ///
 /// Upstream's mixture-of-experts matmul (`triton_kernels/matmul_details/_p_matmul.py:423`)
 /// reads a routed expert id as a SCALAR (`expt = tl.load(ids + p)`) and offsets the expert
@@ -556,21 +557,55 @@ fn erase_consumed_id_reads(module: &mut Module, reads: &[Ssa]) {
 ///
 /// ```text
 ///   index view   a [n] memref over the ids POINTER the scalar was read through
-///   capture 0    the element offset p of that read (`tt.addptr %ids, %p`; 0 for `%ids`)
+///   capture 0    the element offset p of that read (`tt.addptr %ids, %p`; 0 for `%ids`) --
+///                a constant, or a loop's own value (below)
 ///   dim d        INDIRECT: ids[c_0 + d_d] -- the routed id; d_d ranges over the block's 1
 ///   other dims   direct: c_j + d_j -- the load's own constant offsets
 /// ```
 ///
-/// `None` when no offset is data -- the direct path then lowers the load as before. `Some`
+/// The STORE is the load's mirror through the same tile: `desc.store([tl.load(rows + r), 0], x)`
+/// writes one block at an address read from memory -- a one-entry scatter, the spelling Triton
+/// leaves for a row count under `desc.scatter`'s floor of 8 rows (`tt.descriptor_scatter`'s own
+/// lowering is [`convert_indirect`]). The two differ only in the op that goes through the tile:
+/// `ktdp.load` (collapsed to a rank-reduced declared type) or `ktdp.store` of the stored value.
+///
+/// INSIDE A LOOP THAT STAYS A LOOP the read's element offset may follow the loop: `tl.load(ids + i * 32)`
+/// in `for i in tl.range(0, N, 1)` reads `p = i · 32 + c` on trip `i` (a page walk reading its page
+/// table one stick-wide row per block). Every `p` any trip reads is then known from the loop's own
+/// constant bounds (see [`SlabOffset`]), so the index view spans the largest and capture 0 is the
+/// trip's own `p`, an `index` cast of the value the body computed.
+///
+/// `None` when no offset is data -- the direct path then lowers the access as before. `Some`
 /// carries the replacement ops and the scalar read the tile now subsumes.
 ///
+/// ⭐ A DATA OFFSET ON AN AXIS WIDER THAN ONE IS THE DIRECT PATH'S: the block starts at the read
+/// row and runs `extent` rows on from it (`k_page = k_tiles.load([first, 0])`, a kernel reading
+/// the consecutive rows an index names under Triton's gather floor). Its anchor is the read's
+/// own value ([`convert_scalar_reads`]), so the tile is a direct one at a corner known only at
+/// run time — a single index cannot stand for `extent` rows in an indirect tile.
+///
 /// ⛔ REFUSED BY NAME, NEVER GUESSED: two data offsets (one index view per tile, the
-/// `to_ktir_emit` law); a data offset on a dim whose block extent is not 1 (the id selects ONE
-/// slab; a wider block would need an index per row, which is `tt.descriptor_gather`); a data
-/// offset that is not a direct `tt.load` of `ptr + constant` (arithmetic on a read value has
-/// no index view to point at); and a non-constant direct offset beside a data one.
-fn slab_gather(module: &mut Module, index: &DefIndex, op: &Op) -> Result<Option<(Vec<Op>, Ssa)>> {
-    let offsets = &op.operands[1..];
+/// `to_ktir_emit` law); a data offset that is not a direct `tt.load` of `ptr + p`, `p` a constant
+/// or an affine function of a constant-trip loop's induction variable (arithmetic on a read value
+/// has no index view to point at); and a non-constant direct offset beside a data one.
+fn slab_access(
+    module: &mut Module,
+    index: &DefIndex,
+    loops: &HashMap<Ssa, LoopRange>,
+    op: &Op,
+) -> Result<Option<(Vec<Op>, Ssa)>> {
+    let is_load = op.kind == OpKind::TtDescriptorLoad;
+    let what = if is_load {
+        "tt.descriptor_load"
+    } else {
+        "tt.descriptor_store"
+    };
+    // A load's operands are [desc, offsets...]; a store's are [desc, offsets..., value].
+    let offsets = if is_load {
+        &op.operands[1..]
+    } else {
+        &op.operands[1..op.operands.len() - 1]
+    };
     let data: Vec<usize> = offsets
         .iter()
         .enumerate()
@@ -589,8 +624,8 @@ fn slab_gather(module: &mut Module, index: &DefIndex, op: &Op) -> Result<Option<
         return Err(Refusal::new(
             PASS,
             format!(
-                "a tt.descriptor_load has {} data-dependent offsets; an indirect access tile \
-                 reads ONE index view, so only one axis may be offset by a loaded value",
+                "a {what} has {} data-dependent offsets; an indirect access tile reads ONE \
+                 index view, so only one axis may be offset by a loaded value",
                 data.len()
             ),
         ));
@@ -602,14 +637,7 @@ fn slab_gather(module: &mut Module, index: &DefIndex, op: &Op) -> Result<Option<
         .ok_or_else(|| Refusal::new(PASS, "descriptor operand has no type"))?;
     let block_shape = desc_ty.dims().map(|d| d.to_vec()).unwrap_or_default();
     if block_shape.get(dim).copied() != Some(1) {
-        return Err(Refusal::new(
-            PASS,
-            format!(
-                "a tt.descriptor_load offsets axis {dim} by a loaded value, but the block is \
-                 {block_shape:?} on that axis. A loaded offset selects ONE slab (block extent \
-                 1); selecting several rows by data is tt.descriptor_gather"
-            ),
-        ));
+        return Ok(None);
     }
     // The scalar read: `tt.load %p` where `%p` is the ids argument or `tt.addptr %ids, %c`.
     let read = index.def_of(offsets[dim]).expect("filtered on a def above");
@@ -622,17 +650,10 @@ fn slab_gather(module: &mut Module, index: &DefIndex, op: &Op) -> Result<Option<
             let off = add
                 .operands
                 .get(1)
-                .and_then(|v| super::dot_to_linalg::const_int_index(index, *v))
-                .ok_or_else(|| {
-                    Refusal::new(
-                        PASS,
-                        "the slab id is read through `tt.addptr` by a non-constant offset; the \
-                         index view's subscript must be a compile-time element offset",
-                    )
-                })?;
-            (add.operands[0], off)
+                .ok_or_else(|| Refusal::new(PASS, "tt.addptr with no offset operand"))?;
+            (add.operands[0], SlabOffset::of(index, loops, *off)?)
         }
-        _ => (ptr, 0),
+        _ => (ptr, SlabOffset::Const(0)),
     };
     let elem = match index.type_of(ids) {
         Some(IrType::Ptr { elem }) => elem,
@@ -664,9 +685,9 @@ fn slab_gather(module: &mut Module, index: &DefIndex, op: &Op) -> Result<Option<
                 Refusal::new(
                     PASS,
                     format!(
-                        "a slab-gather tt.descriptor_load has a non-constant offset on axis {i} \
-                         beside its data-dependent one; the indirect tile's direct subscripts \
-                         are compile-time constants here"
+                        "a slab {what} has a non-constant offset on axis {i} beside its \
+                         data-dependent one; the indirect tile's direct subscripts are \
+                         compile-time constants here"
                     ),
                 )
             })?,
@@ -679,9 +700,9 @@ fn slab_gather(module: &mut Module, index: &DefIndex, op: &Op) -> Result<Option<
         .map(|r| module.hint(r))
         .unwrap_or_else(|| "slab".into());
     let mut out: Vec<Op> = Vec::new();
-    // The ids memory view: `[elem_off + 1]` is the extent the read addresses; the index view
-    // is a view of STORAGE, so its extent only bounds the subscripts the tile states.
-    let n = elem_off + 1;
+    // The ids memory view: one past the largest offset any read addresses; the index view is a
+    // view of STORAGE, so its extent only bounds the subscripts the tile states.
+    let n = elem_off.last() + 1;
     let ids_idx = module.fresh_named(&hint);
     out.push(
         Op::new(OpKind::UnrealizedConversionCast)
@@ -707,15 +728,38 @@ fn slab_gather(module: &mut Module, index: &DefIndex, op: &Op) -> Result<Option<
             )
             .with_attr(AttrKey::MemorySpace, Attr::Str("HBM".into())),
     );
-    // One `index` constant per capture: the read's element offset, then each direct offset.
+    // Capture 0, the read's element offset: a constant, or the loop's own value cast to `index`.
     let mut captures: Vec<Ssa> = Vec::with_capacity(offsets.len());
-    for c in std::iter::once(elem_off).chain(
-        consts
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != dim)
-            .map(|(_, c)| *c),
-    ) {
+    match elem_off {
+        SlabOffset::Const(c) => {
+            let v = module.fresh_named(&hint);
+            out.push(
+                Op::new(OpKind::ArithConstant)
+                    .with_result(v, IrType::Index)
+                    .with_attr(AttrKey::Value, Attr::Int(c)),
+            );
+            captures.push(v);
+        }
+        SlabOffset::Loop { value, .. } if index.type_of(value) == Some(IrType::Index) => {
+            captures.push(value);
+        }
+        SlabOffset::Loop { value, .. } => {
+            let v = module.fresh_named(&hint);
+            out.push(
+                Op::new(OpKind::ArithIndexCast)
+                    .with_result(v, IrType::Index)
+                    .with_operands([value]),
+            );
+            captures.push(v);
+        }
+    }
+    // Then one `index` constant per direct offset.
+    for c in consts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != dim)
+        .map(|(_, c)| *c)
+    {
         let v = module.fresh_named(&hint);
         out.push(
             Op::new(OpKind::ArithConstant)
@@ -788,6 +832,14 @@ fn slab_gather(module: &mut Module, index: &DefIndex, op: &Op) -> Result<Option<
                 ops: Vec::new(),
             }),
     );
+    if !is_load {
+        let value = *op
+            .operands
+            .last()
+            .ok_or_else(|| Refusal::new(PASS, "a tt.descriptor_store has no stored value"))?;
+        out.push(Op::new(OpKind::KtdpStore).with_operands([value, tile_val]));
+        return Ok(Some((out, offsets[dim])));
+    }
     let res = op.result().expect("a descriptor_load defines a value");
     let ty = op
         .result_type()
@@ -830,6 +882,283 @@ fn slab_gather(module: &mut Module, index: &DefIndex, op: &Op) -> Result<Option<
         );
     }
     Ok(Some((out, offsets[dim])))
+}
+
+/// ⭐⭐ A SCALAR READ WHOSE VALUE IS A VALUE — `page = tl.load(page_index_table + i * 32)` feeding
+/// `page * NUM_KV_HEADS`, where no slab access consumed the read ([`slab_access`]) and the program
+/// computes with what it read.
+///
+/// Lowered to the read it is: a `[n]` memory view over the pointer argument, a one-element direct
+/// tile at the read's element offset, a `ktdp.load` of it, and a `tensor.extract` of the element:
+///
+/// ```text
+///   tt.load %ids + p      ->   ktdp.load (ktdp.construct_access_tile %ids_view[p] {block [1]})
+///                              tensor.extract %t[0]
+/// ```
+///
+/// The offset `p` is a constant or an affine function of a constant-trip loop's induction variable
+/// ([`SlabOffset`]), so the view spans every element any trip reads.
+///
+/// ⛔ REFUSED BY NAME: a read through a computed pointer (no argument to view), and an offset the
+/// view cannot bound (data, or a loop the ladder cannot range).
+fn convert_scalar_reads(module: &mut Module) -> Result<()> {
+    let paths: Vec<OpPath> = walk::paths(module)
+        .into_iter()
+        .filter(|p| {
+            walk::at(module, p)
+                .map(|o| {
+                    o.kind == OpKind::TtLoad && matches!(o.result_type(), Some(IrType::Scalar(_)))
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let index = module.def_index();
+    let loops = loop_ranges(module, &index);
+    let mut edits: Vec<(OpPath, Vec<Op>)> = Vec::with_capacity(paths.len());
+    let mut addptrs: Vec<Ssa> = Vec::new();
+    for path in paths {
+        let op = walk::at(module, &path).expect("path").clone();
+        let res = op.result().expect("a tt.load defines a value");
+        let ty = op
+            .result_type()
+            .cloned()
+            .expect("filtered on a scalar type");
+        let ptr = *op
+            .operands
+            .first()
+            .ok_or_else(|| Refusal::new(PASS, "tt.load with no pointer operand"))?;
+        let (ids, off) = match index.def_of(ptr) {
+            Some(add) if add.kind == OpKind::TtAddptr => {
+                addptrs.push(ptr);
+                let o = add
+                    .operands
+                    .get(1)
+                    .ok_or_else(|| Refusal::new(PASS, "tt.addptr with no offset operand"))?;
+                (add.operands[0], SlabOffset::of(&index, &loops, *o)?)
+            }
+            _ => (ptr, SlabOffset::Const(0)),
+        };
+        let elem = match index.type_of(ids) {
+            Some(IrType::Ptr { elem }) => elem,
+            other => {
+                return Err(Refusal::new(
+                    PASS,
+                    format!(
+                        "a scalar tt.load reads through a {other:?}, not a kernel pointer \
+                         argument; there is no memory view to read it from"
+                    ),
+                ));
+            }
+        };
+        if index.def_of(ids).is_some() {
+            return Err(Refusal::new(
+                PASS,
+                "a scalar tt.load's pointer is computed, not a kernel argument; there is no \
+                 memory view to read it from",
+            ));
+        }
+        let hint = module.hint(res);
+        let n = off.last() + 1;
+        let mut out: Vec<Op> = Vec::new();
+        let ids_idx = module.fresh_named(&hint);
+        out.push(
+            Op::new(OpKind::UnrealizedConversionCast)
+                .with_result(ids_idx, IrType::Index)
+                .with_operands([ids]),
+        );
+        let view = module.fresh_named(&hint);
+        out.push(
+            Op::new(OpKind::KtdpConstructMemoryView)
+                .with_result(
+                    view,
+                    IrType::MemRef {
+                        dims: vec![n],
+                        elem,
+                    },
+                )
+                .with_operands([ids_idx])
+                .with_attr(AttrKey::Shape, Attr::IntList(vec![n]))
+                .with_attr(AttrKey::Strides, Attr::IntList(vec![1]))
+                .with_attr(
+                    AttrKey::CoordinateSet,
+                    Attr::AffineSet(build_range_set_nd(&[n])),
+                )
+                .with_attr(AttrKey::MemorySpace, Attr::Str("HBM".into())),
+        );
+        let at = match off {
+            SlabOffset::Const(c) => {
+                let v = module.fresh_named(&hint);
+                out.push(
+                    Op::new(OpKind::ArithConstant)
+                        .with_result(v, IrType::Index)
+                        .with_attr(AttrKey::Value, Attr::Int(c)),
+                );
+                v
+            }
+            SlabOffset::Loop { value, .. } => value,
+        };
+        let (casts, tile_op) =
+            build_direct_access_tile(module, &index, view, &[1], &[at], &[], &hint);
+        let tile = tile_op.result().expect("the tile defines a value");
+        out.extend(casts);
+        out.push(tile_op);
+        let one = module.fresh_named(&hint);
+        out.push(
+            Op::new(OpKind::KtdpLoad)
+                .with_result(
+                    one,
+                    IrType::Tensor {
+                        dims: vec![1],
+                        elem,
+                    },
+                )
+                .with_operands([tile]),
+        );
+        let zero = module.fresh_named(&hint);
+        out.push(
+            Op::new(OpKind::ArithConstant)
+                .with_result(zero, IrType::Index)
+                .with_attr(AttrKey::Value, Attr::Int(0)),
+        );
+        out.push(
+            Op::new(OpKind::Other("tensor.extract".into()))
+                .with_result(res, ty)
+                .with_operands([one, zero]),
+        );
+        edits.push((path, out));
+    }
+    walk::splice_many(module, edits);
+    // The `tt.addptr`s the reads went through have no reader left.
+    let used = walk::used_values(module);
+    let dead: Vec<OpPath> = walk::paths(module)
+        .into_iter()
+        .filter(|p| {
+            walk::at(module, p)
+                .map(|o| {
+                    o.kind == OpKind::TtAddptr
+                        && o.results
+                            .iter()
+                            .all(|v| addptrs.contains(v) && !used.contains(v))
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    walk::splice_many(module, dead.into_iter().map(|p| (p, Vec::new())).collect());
+    Ok(())
+}
+
+/// The values a constant-trip `scf.for`'s induction variable takes: `first`, then every `step` up to
+/// `last` inclusive.
+#[derive(Clone, Copy, Debug)]
+struct LoopRange {
+    first: i64,
+    last: i64,
+}
+
+/// Every constant-trip `scf.for` induction variable in `module`, with the values it takes. A loop
+/// whose bounds are not constants, or that runs no trip, has no range and so offsets no slab read.
+fn loop_ranges(module: &Module, index: &DefIndex) -> HashMap<Ssa, LoopRange> {
+    let konst = |v: Ssa| super::dot_to_linalg::const_int_index(index, v);
+    walk::paths(module)
+        .into_iter()
+        .filter_map(|p| walk::at(module, &p))
+        .filter(|o| o.kind == OpKind::ScfFor)
+        .filter_map(|o| {
+            let (lb, ub, step) = (
+                konst(*o.operands.first()?)?,
+                konst(*o.operands.get(1)?)?,
+                konst(*o.operands.get(2)?)?,
+            );
+            if step <= 0 || ub <= lb {
+                return None;
+            }
+            let trips = (ub - lb + step - 1) / step;
+            let iv = o.regions.first()?.args.first()?.0;
+            Some((
+                iv,
+                LoopRange {
+                    first: lb,
+                    last: lb + (trips - 1) * step,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// A slab id's element offset into its ids buffer.
+#[derive(Clone, Copy, Debug)]
+enum SlabOffset {
+    /// A compile-time constant.
+    Const(i64),
+    /// `value`, an affine function `iv · scale + bias` of a constant-trip loop's induction variable
+    /// (`scale >= 0`, every trip's offset >= 0): `last` is the largest offset any trip reads.
+    Loop { value: Ssa, last: i64 },
+}
+
+impl SlabOffset {
+    fn of(index: &DefIndex, loops: &HashMap<Ssa, LoopRange>, v: Ssa) -> Result<SlabOffset> {
+        if let Some(c) = super::dot_to_linalg::const_int_index(index, v) {
+            return Ok(SlabOffset::Const(c));
+        }
+        match affine_in_loop(index, loops, v) {
+            Some((range, scale, bias)) if scale >= 0 && range.first * scale + bias >= 0 => {
+                Ok(SlabOffset::Loop {
+                    value: v,
+                    last: range.last * scale + bias,
+                })
+            }
+            _ => Err(Refusal::new(
+                PASS,
+                "the slab id is read through `tt.addptr` by an offset that is neither a \
+                 compile-time constant nor a non-negative affine function of a constant-trip \
+                 loop's induction variable; the index view must span every offset a read takes",
+            )),
+        }
+    }
+
+    /// The largest offset any read takes.
+    fn last(self) -> i64 {
+        match self {
+            SlabOffset::Const(c) => c,
+            SlabOffset::Loop { last, .. } => last,
+        }
+    }
+}
+
+/// `v` as `iv · scale + bias` over a loop of [`loop_ranges`], through constant `arith.muli` /
+/// `arith.addi` and the integer casts between them; `None` when it is anything else.
+fn affine_in_loop(
+    index: &DefIndex,
+    loops: &HashMap<Ssa, LoopRange>,
+    v: Ssa,
+) -> Option<(LoopRange, i64, i64)> {
+    if let Some(r) = loops.get(&v) {
+        return Some((*r, 1, 0));
+    }
+    let konst = |x: Ssa| super::dot_to_linalg::const_int_index(index, x);
+    let d = index.def_of(v)?;
+    let (a, b) = (d.operands.first().copied(), d.operands.get(1).copied());
+    match d.kind {
+        OpKind::ArithMuli | OpKind::ArithAddi => {
+            let (a, b) = (a?, b?);
+            let (x, c) = match (konst(a), konst(b)) {
+                (_, Some(c)) => (a, c),
+                (Some(c), _) => (b, c),
+                _ => return None,
+            };
+            let (r, s, o) = affine_in_loop(index, loops, x)?;
+            if d.kind == OpKind::ArithMuli {
+                Some((r, s.checked_mul(c)?, o.checked_mul(c)?))
+            } else {
+                Some((r, s, o.checked_add(c)?))
+            }
+        }
+        OpKind::ArithIndexCast => affine_in_loop(index, loops, a?),
+        _ => None,
+    }
 }
 
 /// The axes a rank-reduced load KEEPS, when `declared` is `block` with some unit axes dropped
@@ -1187,7 +1516,7 @@ fn trace_index_view(module: &Module, x_offsets: Ssa) -> Result<(Ssa, Vec<Ssa>)> 
         .ok_or_else(|| {
             Refusal::new(
                 PASS,
-                "tt.descriptor_gather's x_offsets is not the result of a lowered descriptor \
+                "an indirect access's x_offsets is not the result of a lowered descriptor \
                  load, so the memory view its indices live in cannot be recovered. The \
                  indices must be read through a descriptor in the same block; a \
                  tensor-typed function argument has no view to point at.",
@@ -1204,7 +1533,7 @@ fn trace_index_view(module: &Module, x_offsets: Ssa) -> Result<(Ssa, Vec<Ssa>)> 
         .ok_or_else(|| {
             Refusal::new(
                 PASS,
-                "tt.descriptor_gather's x_offsets is loaded from something that is not a \
+                "an indirect access's x_offsets is loaded from something that is not a \
                  direct ktdp.construct_access_tile",
             )
         })?;
@@ -1216,21 +1545,28 @@ fn trace_index_view(module: &Module, x_offsets: Ssa) -> Result<(Ssa, Vec<Ssa>)> 
     Ok((base, tile.operands[1..].to_vec()))
 }
 
-/// Lower every `tt.descriptor_gather` to `ktdp.construct_indirect_access_tile` + `ktdp.load`.
+/// Lower every `tt.descriptor_gather` to `ktdp.construct_indirect_access_tile` + `ktdp.load`,
+/// and every `tt.descriptor_scatter` to the SAME tile + `ktdp.store` -- the C++'s
+/// `ConvertDescriptorScatter`, which is its gather helper with the load swapped for a store.
 ///
-/// `tt.descriptor_scatter` is deliberately NOT ported. The C++ has it
-/// (`ConvertDescriptorScatter`, the same helper with a `ktdp.store`), and no fixture in this
-/// tree emits one -- so porting it would be untested code that looks tested. An unconverted
-/// descriptor op is refused by name by [`refuse_raw_tile_access`]'s sibling checks, so the
-/// omission fails closed rather than passing something through.
-fn convert_gathers(module: &mut Module) -> Result<()> {
+/// One walk for both, because the tile IS the same: the indexed rows (`x_offsets`, traced to
+/// its view), the column offset, and the subscript maps over the moved block. All that differs
+/// is the direction, and where the block's shape is read: a gather's RESULT type, a scatter's
+/// stored VALUE type (`[x_offsets.len, block[1]]` either way -- the front end and the op
+/// verifier both hold it).
+fn convert_indirect(module: &mut Module) -> Result<()> {
     // COLLECTED FIRST, the same law as the other walks: the `while find` here
     // re-walked the module per gather. All edits land in ONE rebuild per block.
     let paths: Vec<OpPath> = walk::paths(module)
         .into_iter()
         .filter(|p| {
             walk::at(module, p)
-                .map(|o| o.kind == OpKind::TtDescriptorGather)
+                .map(|o| {
+                    matches!(
+                        o.kind,
+                        OpKind::TtDescriptorGather | OpKind::TtDescriptorScatter
+                    )
+                })
                 .unwrap_or(false)
         })
         .collect();
@@ -1238,36 +1574,53 @@ fn convert_gathers(module: &mut Module) -> Result<()> {
     let mut edits: Vec<(OpPath, Vec<Op>)> = Vec::with_capacity(paths.len());
     for path in paths {
         let op = walk::at(module, &path).expect("path").clone();
-        if op.kind != OpKind::TtDescriptorGather {
-            continue;
-        }
-        // `tt.descriptor_gather %desc[%x_offsets, %y_offset]`.
-        if op.operands.len() != 3 {
+        let scatter = match op.kind {
+            OpKind::TtDescriptorGather => false,
+            OpKind::TtDescriptorScatter => true,
+            _ => continue,
+        };
+        let spelling = op.kind.spelling();
+        // `tt.descriptor_gather %desc[%x_offsets, %y_offset]`, and the scatter's
+        // `tt.descriptor_scatter %desc[%x_offsets, %y_offset], %src`.
+        let arity = if scatter { 4 } else { 3 };
+        if op.operands.len() != arity {
             return Err(Refusal::new(
                 PASS,
                 format!(
-                    "tt.descriptor_gather takes a descriptor, an x_offsets tensor and a \
-                     y_offset; found {} operand(s)",
+                    "{spelling} takes a descriptor, an x_offsets tensor and a y_offset{}; \
+                     found {} operand(s)",
+                    if scatter { " and the stored value" } else { "" },
                     op.operands.len()
                 ),
             ));
         }
         let view = descriptor_mem_view(&index, &op).ok_or_else(|| {
-            Refusal::new(PASS, "the gather's descriptor was not lowered by walk 1")
+            Refusal::new(
+                PASS,
+                format!("the {spelling}'s descriptor was not lowered by walk 1"),
+            )
         })?;
         let (index_view, anchors) = trace_index_view(module, op.operands[1])?;
-        let result_ty = op
-            .result_type()
-            .cloned()
-            .ok_or_else(|| Refusal::new(PASS, "tt.descriptor_gather has no result type"))?;
-        let result_shape = result_ty.dims().map(|d| d.to_vec()).unwrap_or_default();
+        // The moved block's type: what the gather defines, or what the scatter stores.
+        let block_ty = if scatter {
+            index.type_of(op.operands[3])
+        } else {
+            op.result_type().cloned()
+        }
+        .ok_or_else(|| {
+            Refusal::new(
+                PASS,
+                format!("{spelling}'s moved block has no type to shape its tile"),
+            )
+        })?;
+        let result_shape = block_ty.dims().map(|d| d.to_vec()).unwrap_or_default();
         let (kinds, maps, space_set, space_order) =
             gather_subscripts(anchors.len(), &result_shape)?;
 
         let hint = op
             .result()
             .map(|r| module.hint(r))
-            .unwrap_or_else(|| "gather".into());
+            .unwrap_or_else(|| if scatter { "scatter" } else { "gather" }.into());
         // The y_offset arrives as i32 and is cast to index, exactly as the direct path casts
         // its own indices. `canonicalize` folds the cast of a constant afterwards, which is
         // why the golden shows a bare `%c0 : index`.
@@ -1323,14 +1676,20 @@ fn convert_gathers(module: &mut Module) -> Result<()> {
                 ops: Vec::new(),
             });
 
-        let res = op.result().expect("a gather defines a value");
-        let load = Op::new(OpKind::KtdpLoad)
-            .with_result(res, result_ty)
-            .with_operands([tile_val]);
+        // The direction: the gather READS the tile into its result, the scatter WRITES its
+        // value through the tile -- the direct store's own operand order, `[src, tile]`.
+        let access = if scatter {
+            Op::new(OpKind::KtdpStore).with_operands([op.operands[3], tile_val])
+        } else {
+            let res = op.result().expect("a gather defines a value");
+            Op::new(OpKind::KtdpLoad)
+                .with_result(res, block_ty)
+                .with_operands([tile_val])
+        };
 
         let mut replacement = casts;
         replacement.push(tile);
-        replacement.push(load);
+        replacement.push(access);
         edits.push((path, replacement));
     }
     walk::splice_many(module, edits);

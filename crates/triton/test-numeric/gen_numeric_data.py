@@ -85,7 +85,7 @@ import numpy as np
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_FIXTURES = os.path.abspath(os.path.join(_HERE, "..", "fixtures"))
+_FIXTURES = os.path.abspath(os.path.join(_HERE, "..", "test-fixtures"))
 
 SEED = 0
 
@@ -173,6 +173,8 @@ def _attn_ce_1tile():
     # non-causal 1-tile geometry: STAGE=1, everything else shared with the 16-tile launch.
     return {"Z": 1, "H": 4, "N_CTX": 256, "HEAD_DIM": 128,
             "BLOCK_M": 64, "BLOCK_N": 64, "GQA": 2, "STAGE": 1, "sm_scale": 1.0}
+
+
 
 
 CONFIGS = {
@@ -276,27 +278,6 @@ CONFIGS = {
     "paged_score_small": dict(fixture="paged_score", kernel="paged_vmatmul_fwd",
                               ce={"M": 8, "K": 64, "V": 128,
                                   "BLOCK_M": 8, "HEAD_DIM": 64}, grid=[1]),
-    # ⭐⭐⭐ TASK 27: PAGED FLASH ATTENTION, THE ONE-BLOCK STEP -- the full flash body
-    # around rung 4's gathered V-leg contraction. The block table (desc_ids) picks the
-    # V rows at runtime; the score matmul runs over a HOST-PRESENTED Kt plane (the
-    # shipped attention's third physical plane, because a transposed gather is
-    # arch-refused and two gathers in one program are refused by `gather_of`); the value
-    # contraction is `tl.dot(p, v_rows)` verbatim. One launch = one KV block = 64 rows.
-    # The ids are the SAME PERMUTATION as `paged_score_small`'s, for the same negative
-    # control: sorted ids must read the table's first 64 rows directly and DIFFER from
-    # `ref_out.bin` -- a match there is the direct-read trap and a FAILURE.
-    "paged_attention_small": dict(fixture="paged_attention", kernel="paged_attn_fwd",
-                                  ce={"N_CTX": 64, "HEAD_DIM": 64, "V": 1024,
-                                      "BLOCK_M": 64}, grid=[1]),
-    # TASK 28: the multi-block paged form. The block table is `[2, 64]` i32 on device
-    # (one row per block, sliced at a constant corner per unrolled trip), kt is
-    # `[64, 128]` with block t's K^T in column block t, and the reference runs the
-    # kernel's own base-2 recurrence over both blocks. Controls: sorted table, block
-    # SWAP, and the input corruptions -- all must differ from `ref_out.bin`.
-    "paged_attention_multiblock": dict(
-        fixture="paged_attention_multiblock", kernel="paged_attn_multiblock_fwd",
-        ce={"NUM_BLOCKS": 2, "BLOCK_N": 64, "HEAD_DIM": 64, "V": 1024,
-            "BLOCK_M": 64}, grid=[1]),
 }
 
 # Above this, the bytes are NOT checked in: `meta.json` carries `"oversized": true`, `"staging"`,
@@ -557,64 +538,10 @@ def _paged_score_inputs(mod, ce):
     return ins, ref, note
 
 
-def _paged_attention_inputs(mod, ce):
-    q, kt, table = mod.inputs(seed=SEED, m=ce["BLOCK_M"], n_ctx=ce["N_CTX"],
-                              v=ce["V"], head_dim=ce["HEAD_DIM"])
-    # THE SAME PERMUTATION, THE SAME NEGATIVE CONTROL as `paged_score_small`: sorted ids
-    # read the table's first 64 rows directly, and that product must DIFFER from
-    # `ref_out.bin` -- a run that still matches with sorted ids is the direct-read trap
-    # (the gather legs ignored the index operand) and is a FAILURE, not a pass.
-    perm = torch.tensor([
-        53, 29, 32, 22, 39, 40, 28, 26, 50, 42, 49, 20, 55, 43, 58, 47,
-        0, 57, 37, 2, 8, 15, 24, 31, 7, 38, 36, 21, 52, 60, 27, 56,
-        45, 51, 62, 10, 12, 44, 41, 54, 13, 16, 61, 11, 17, 23, 34, 33,
-        14, 3, 48, 18, 35, 59, 1, 4, 5, 9, 63, 25, 46, 6, 19, 30,
-    ], dtype=torch.int32)
-    ref = mod.reference(q, kt, table, perm)
-    ins = [("desc_q", q, "f16"), ("desc_kt", kt, "f16"), ("desc_v", table, "f16"),
-           ("desc_ids", perm, "i32"),
-           ("desc_o", torch.zeros(ce["BLOCK_M"], ce["HEAD_DIM"]), "f16")]
-    note = (
-        f"THE IDS ARE A PERMUTATION of 0..63 (one KV block of 64 rows), not the "
-        f"identity, so a direct read of the table's first 64 rows is a DIFFERENT "
-        f"matrix product and must not match `ref_out.bin`. THE NEGATIVE CONTROL IS "
-        f"PART OF THE CONTRACT: bind the ids SORTED (0..63) against these same "
-        f"q/kt/v bytes and the output must equal the softmax-weighted product over "
-        f"v[:64] and DIFFER from `ref_out.bin` -- a run that still matches with "
-        f"sorted ids is the direct-read trap (the gather legs ignored the index "
-        f"operand) and is a FAILURE, not a pass."
-    )
-    return ins, ref, note
 
 
-def _paged_attention_multiblock_inputs(mod, ce):
-    q, kt, table = mod.inputs(seed=SEED, m=ce["BLOCK_M"],
-                              num_blocks=ce["NUM_BLOCKS"],
-                              block_n=ce["BLOCK_N"], v=ce["V"],
-                              head_dim=ce["HEAD_DIM"])
-    # THE BLOCK TABLE IS A PERMUTATION of 0..127 in `[2, 64]` shape, scattered so no
-    # block's rows are contiguous in the table. THREE negative controls are part of the
-    # contract: (a) SORTED table must give the base-2 softmax over table[:128] in row
-    # order and DIFFER from `ref_out.bin` (the direct-read trap); (b) a block SWAP
-    # (rows flipped) must DIFFER (catches a trip reading the wrong table row -- the
-    # one-block form cannot see block-level errors); (c) input corruptions as in the
-    # one-block scorer.
-    tbl = mod.PAGED_ATTN_TABLE[:ce["NUM_BLOCKS"] * ce["BLOCK_N"]].reshape(
-        ce["NUM_BLOCKS"], ce["BLOCK_N"])
-    ref = mod.reference(q, kt, table, tbl, block_n=ce["BLOCK_N"])
-    ins = [("desc_q", q, "f16"), ("desc_kt", kt, "f16"), ("desc_v", table, "f16"),
-           ("desc_table", tbl, "i32"),
-           ("desc_o", torch.zeros(ce["BLOCK_M"], ce["HEAD_DIM"]), "f16")]
-    note = (
-        f"THE BLOCK TABLE IS A PERMUTATION of 0..{tbl.numel() - 1} in "
-        f"[{ce['NUM_BLOCKS']}, {ce['BLOCK_N']}] shape, scattered across blocks. "
-        f"SORTED table: output must equal the base-2 softmax over table rows in "
-        f"order and DIFFER from `ref_out.bin` (a match is the direct-read trap). "
-        f"BLOCK SWAP (rows flipped): must DIFFER (a trip reading the wrong table "
-        f"row gives block-level wrong rows, which the one-block controls cannot "
-        f"see). Both are FAILURES if they match, not passes."
-    )
-    return ins, ref, note
+
+
 
 
 def _attn_inputs_1tile(mod, ce):
@@ -717,8 +644,6 @@ BUILD = {
     "attention_flash_noncausal_1tile": _attn_inputs_1tile,
     "mul_scale_small": _mul_scale_inputs,
     "paged_score_small": _paged_score_inputs,
-    "paged_attention_small": _paged_attention_inputs,
-    "paged_attention_multiblock": _paged_attention_multiblock_inputs,
 }
 
 # Which function produced each side, for `meta.json`. The default is the FIXTURE's own

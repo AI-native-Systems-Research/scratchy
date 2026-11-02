@@ -3876,6 +3876,7 @@ dependencies = [
  "sha2 0.11.1",
  "tracing",
  "tracing-subscriber",
+ "triton-ktir-superdsc",
 ]
 
 [[package]]

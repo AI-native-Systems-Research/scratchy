@@ -118,6 +118,11 @@ pub const OP_SET: &[&str] = &[
     // with `to_ktir_emit`'s Other arm naming its `KOpKind`. The executed proof is
     // `triton-numeric:tests/argmax_first_max.rs`, whose kernel widens a live mask.
     "arith.uitofp", // Other, on purpose
+    // `tl.min` over an int32 index (`standard.py:228`'s `_elementwise_min` → `core.minimum`):
+    // the paged decode kernel's first row of an ascending `kv_row_pool` run under Triton's gather
+    // floor. Rides `Other` like `uitofp`; `to_ktir_emit`'s Other arm names `KOpKind::ArithMinsi`,
+    // which the emulator serves.
+    "arith.minsi", // Other, on purpose
     // math
     "math.exp",
     "math.exp2",
@@ -149,6 +154,9 @@ pub const OP_SET: &[&str] = &[
     "tt.descriptor_load",
     "tt.descriptor_store",
     "tt.descriptor_gather",
+    // The gather's write twin -- `reshape_and_cache_head_major.py`'s KV cache store. `convert_ttir_to_ktdp`
+    // lowers it to the gather's own indirect access tile plus a `ktdp.store`.
+    "tt.descriptor_scatter",
     // The routed expert id of `expert_slab.ttir.mlir`: one SCALAR read through a pointer,
     // `tt.addptr %ids, %p : !tt.ptr<i32>, i32` then `tt.load %ptr : !tt.ptr<i32>` -- no
     // mask, no other, no attributes (the default `isVolatile` prints as nothing). Both

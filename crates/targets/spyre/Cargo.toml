@@ -48,6 +48,9 @@ scratchy-spyre-bundle = { path = "bundle" }
 # for a SubtileNode. UNCONDITIONAL (see [features]): it is the only producer for the
 # spliced op kinds, and the ladder is dependency-free offline.
 scratchy-triton-splice = { path = "../../triton/splice" }
+# The registry constants a spliced program reads (`layout::registry_constants`) — the bundle
+# registry holds them (`bundle_registry`); the splice already depends on it.
+triton-ktir-superdsc = { path = "../../triton/triton-ktir-superdsc" }
 scratchy-tensors = { path = "../../tensors" }
 # `kill(-pid, SIGKILL)` on a `dxp_standalone` process group — see `superdsc_bake`'s worker pool.
 libc = { workspace = true }

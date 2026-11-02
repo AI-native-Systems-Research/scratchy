@@ -271,6 +271,7 @@ fn two_trip_program(swapped: Swapped) -> KtirNode {
         mask: None,
         node_out_tid: None,
         minted: Default::default(),
+        lx_plan: Default::default(),
     }
 }
 

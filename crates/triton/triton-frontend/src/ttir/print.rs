@@ -621,6 +621,21 @@ fn print_op(
                 res_tys.join(", ")
             )
         }
+        // The INDIRECT write. `assemblyFormat` is `$desc [$x_offsets, $y_offset], $src
+        // attr-dict : type(operands)`, so the operand types print as a bare list:
+        //   tt.descriptor_scatter %d[%ids, %y], %v : !tt.tensordesc<1x64xf16>, tensor<8xi32>,
+        //                                             i32, tensor<8x64xf16>
+        "tt.descriptor_scatter" => {
+            let opnd_tys: Vec<String> = op.operands.iter().map(|v| m.ty(*v).to_string()).collect();
+            format!(
+                "tt.descriptor_scatter {}[{}, {}], {} : {}",
+                operands[0],
+                operands[1],
+                operands[2],
+                operands[3],
+                opnd_tys.join(", ")
+            )
+        }
         "tt.descriptor_store" => {
             let last = operands.len() - 1;
             let idx = operands[1..last].join(", ");
