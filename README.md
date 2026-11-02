@@ -106,22 +106,17 @@ Note the convention for selecting models and quants:
 
 ### Prebuilt binary (Homebrew)
 
-On macOS 26.2+ (Apple Silicon), the release build of `scr` is published
-signed (Developer ID) and notarized. This repo is its own Homebrew tap
-(`Formula/scr.rb`), so:
+On macOS 26.2 or newer (Apple Silicon), skip the build entirely:
 
 ```bash
 brew tap scratchy https://github.com/AI-native-Systems-Research/scratchy
 brew install scratchy/scr
 ```
 
-The same artifact is attached to each [GitHub
-Release](https://github.com/AI-native-Systems-Research/scratchy/releases) as
-`scr-<tag>-macos-arm64.tar.gz` (with a `.sha256`). Publishing a release
-triggers `.github/workflows/release-macos.yml`, which builds
-`metal,model/all`, signs, notarizes, uploads, and commits the formula update
-back to this repo. The secrets and repo variable that workflow needs are
-listed in its comments.
+The binary is signed and notarized, so it runs without Gatekeeper
+warnings. The same file is on the
+[releases page](https://github.com/AI-native-Systems-Research/scratchy/releases)
+if you'd rather download it directly.
 
 ### Deep Dives
 
