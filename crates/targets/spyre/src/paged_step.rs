@@ -305,7 +305,7 @@ pub struct BatchSeq<'a> {
 }
 
 /// A decode batch's sources: `rep_row_ids` `[E · P]`, `chunk_page_ids` `[C, E · P]` and
-/// `mask_by_chunk` `[C, J, B, nkvh, 1, page_slots]` (`E = J · B`, `P` the chunking's
+/// `mask_by_chunk` `[C, J, B, 1, 1, page_slots]` (`E = J · B`, `P` the chunking's
 /// `rows_per_page`), and the KV write index of each sequence's token —
 /// `SpyreAttentionMetadataBuilder.build`'s decode-batch precomputes:
 ///
@@ -318,7 +318,8 @@ pub struct BatchSeq<'a> {
 ///   their batched builder never stages ([`BatchChunking`]);
 /// * the mask is 0 where a sequence's key is at or before its position and `finfo(f16).min` past
 ///   it, `-inf` on the block slots past its blocks, and a padded sequence's block 0 `finfo.min` (so
-///   its softmax stays finite); the kv head axis materialized, as the tiled walk reads it.
+///   its softmax stays finite); one row per (block slot, sequence), which every kv head reads
+///   through the kernel's broadcast, as their builder's `expand` over the kv axis does.
 ///
 /// A padded row's KV write lands on [`NULL_SLOT`], as spyre-inference's padded tokens' do: its
 /// attention reads page 0 under the padded sequence's mask and answers nothing anyone reads, so what
@@ -394,14 +395,14 @@ pub fn batch_sources(
             mask_bs[(s * padded) * slots + col] = MASKED;
         }
     }
-    // `[C·J, B, nkvh, slots]`: row `i`, sequence `s`, every kv head reads mask_bs_bb[s, i].
-    let mut chunk_masks = Vec::with_capacity(padded * b * nkvh * slots);
+    // `[C·J, B, slots]`: row `i`, sequence `s` is mask_bs_bb[s, i]. Every kv head reads that one row
+    // through the kernel's broadcast, so it is staged once, not once per kv head.
+    let mut chunk_masks = Vec::with_capacity(padded * b * slots);
     for i in 0..padded {
         for s in 0..b {
-            let row = &mask_bs[(s * padded + i) * slots..(s * padded + i + 1) * slots];
-            for _ in 0..nkvh {
-                chunk_masks.extend_from_slice(row);
-            }
+            chunk_masks.extend_from_slice(
+                &mask_bs[(s * padded + i) * slots..(s * padded + i + 1) * slots],
+            );
         }
     }
     // One token per real row, at its position; a padded row at the null slot.
@@ -417,7 +418,7 @@ pub fn batch_sources(
     }
     let e = j * b;
     Ok(StepSources {
-        mask: (step.chunk_masks, chunk_masks, vec![c * e * nkvh, slots]),
+        mask: (step.chunk_masks, chunk_masks, vec![c * e, slots]),
         int32: vec![
             (step.rep_rows, words(fold(&rep)), vec![e * per as usize]),
             (
@@ -815,15 +816,16 @@ mod tests {
         assert_eq!(&w[..4], &[3 * 8 + 1, 9 * 8 + 2, 0, 0]);
         assert_eq!(&w[4..], &[3 * 8 + 4 + 1, 9 * 8 + 4 + 2, 4, 4]);
         let (tid, m, shape) = &src.mask;
-        assert_eq!((*tid, shape.clone()), (s.chunk_masks, vec![2 * 4 * 2, 4]));
-        // Element (slot i, sequence q, head h, column c) at ((i · 4 + q) · 2 + h) · 4 + c.
-        let at = |i: usize, q: usize, h: usize| &m[((i * 4 + q) * 2 + h) * 4..][..4];
-        assert_eq!(at(0, 0, 1), &[0.0; 4]);
-        assert_eq!(at(1, 0, 0), &[0.0, 0.0, MASKED, MASKED]);
-        assert_eq!(at(0, 1, 0), &[0.0, 0.0, 0.0, MASKED]);
-        assert_eq!(at(1, 1, 1), &[f32::NEG_INFINITY; 4]);
-        assert_eq!(at(0, 2, 0), &[MASKED; 4]);
-        assert_eq!(at(1, 3, 0), &[f32::NEG_INFINITY; 4]);
+        // One row per (slot, sequence): every kv head reads it through the kernel's broadcast.
+        assert_eq!((*tid, shape.clone()), (s.chunk_masks, vec![2 * 4, 4]));
+        // Element (slot i, sequence q, column c) at (i · 4 + q) · 4 + c.
+        let at = |i: usize, q: usize| &m[(i * 4 + q) * 4..][..4];
+        assert_eq!(at(0, 0), &[0.0; 4]);
+        assert_eq!(at(1, 0), &[0.0, 0.0, MASKED, MASKED]);
+        assert_eq!(at(0, 1), &[0.0, 0.0, 0.0, MASKED]);
+        assert_eq!(at(1, 1), &[f32::NEG_INFINITY; 4]);
+        assert_eq!(at(0, 2), &[MASKED; 4]);
+        assert_eq!(at(1, 3), &[f32::NEG_INFINITY; 4]);
     }
 
     /// ⭐ A CHUNK UNDER TRITON'S GATHER FLOOR IN PAGES STAGES ITS TABLES FOLDED BY KV HEAD — two

@@ -13,7 +13,8 @@ The operands are theirs, in their order:
 * `k_pages` / `v_pages` the cache `[num_pages_total, num_kv_heads, block_size, head_size]`;
 * `chunk_page_ids` `[num_chunks, entries, 1]` int32, chunk `c`'s entry `j * num_seqs + s` holding
   the page of block slot `j` of sequence `s`;
-* `mask_by_chunk` `[num_chunks, blocks_per_chunk, num_seqs, num_kv_heads, 1, block_size]`;
+* `mask_by_chunk` `[num_chunks, blocks_per_chunk, num_seqs, 1, 1, block_size]`, their mask with its kv
+  axis broadcast (`mask_bs_bb.expand(...)` over `num_kv_heads`), held at one row per (slot, sequence);
 * `out`, whose first `num_seqs` rows the kernel stores (`out[:num_seqs].copy_(attn)`).
 
 `ROWS_PER_PAGE` is 1, or `num_kv_heads` for a chunk of fewer than 8 entries (below).
@@ -89,10 +90,11 @@ def batched_decode_head_major_kernel(query, rep_row_ids, k_pages, v_pages,  #
     # chunk_page_ids `[num_chunks, entries * P]`, contiguous: chunk c's rows are the ROWS at c * ROWS.
     ids_desc = tl.make_tensor_descriptor(chunk_page_ids, shape=[NUM_CHUNKS * ROWS], strides=[1],
                                          block_shape=[ROWS])
-    # mask_by_chunk `[num_chunks, J, B, KV, 1, block]`: chunk c's tile is J * B * KV rows of a block.
-    masks = tl.make_tensor_descriptor(mask_by_chunk, shape=[NUM_CHUNKS * ENTRIES * KV, BLOCK_SIZE],
+    # mask_by_chunk `[num_chunks, J, B, 1, 1, block]`: chunk c's tile is J * B rows of a block, one per
+    # (block slot, sequence); every kv head reads its row through the broadcast below, as theirs does.
+    masks = tl.make_tensor_descriptor(mask_by_chunk, shape=[NUM_CHUNKS * ENTRIES, BLOCK_SIZE],
                                       strides=[BLOCK_SIZE, 1],
-                                      block_shape=[ENTRIES * KV, BLOCK_SIZE])
+                                      block_shape=[ENTRIES, BLOCK_SIZE])
     out_rows = tl.make_tensor_descriptor(out, shape=[NUM_TOKENS, NUM_HEADS * D],
                                          strides=[NUM_HEADS * D, 1], block_shape=[B, NUM_HEADS * D])
 
@@ -113,8 +115,10 @@ def batched_decode_head_major_kernel(query, rep_row_ids, k_pages, v_pages,  #
             # scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
             scores = tl.dot(q, tl.trans(k_page, (0, 2, 1)), out_dtype=tl.float16) * SCALE
             # sc = scores.reshape(J, B, KV, G, block) + mask_rows
-            mask_rows = tl.reshape(masks.load([c * ENTRIES * KV, 0]), [J, B, KV, BLOCK_SIZE])
-            sc = tl.reshape(scores, [J, B, KV, G, BLOCK_SIZE]) + mask_rows[:, :, :, None, :]
+            # one mask row per (block slot, sequence), sprayed over its kv heads' query rows
+            mask_rows = tl.reshape(masks.load([c * ENTRIES, 0]), [J, B, BLOCK_SIZE])
+            sc = tl.reshape(tl.reshape(scores, [J, B, KV * G, BLOCK_SIZE]) + mask_rows[:, :, None, :],
+                            [J, B, KV, G, BLOCK_SIZE])
             # _entry_local_update: sc = torch.clamp(sc, min=torch.finfo(sc.dtype).min)
             sc = tl.maximum(sc, -65504.0)
             pos_max = tl.max(sc, 4)
@@ -143,8 +147,10 @@ def batched_decode_head_major_kernel(query, rep_row_ids, k_pages, v_pages,  #
             k_page = tl.reshape(k_rows.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
             v_page = tl.reshape(v_rows.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
             scores = tl.dot(q, tl.trans(k_page, (0, 2, 1)), out_dtype=tl.float16) * SCALE
-            mask_rows = tl.reshape(masks.load([c * ENTRIES * KV, 0]), [J, B, KV, BLOCK_SIZE])
-            sc = tl.reshape(scores, [J, B, KV, G, BLOCK_SIZE]) + mask_rows[:, :, :, None, :]
+            # one mask row per (block slot, sequence), sprayed over its kv heads' query rows
+            mask_rows = tl.reshape(masks.load([c * ENTRIES, 0]), [J, B, BLOCK_SIZE])
+            sc = tl.reshape(tl.reshape(scores, [J, B, KV * G, BLOCK_SIZE]) + mask_rows[:, :, None, :],
+                            [J, B, KV, G, BLOCK_SIZE])
             # chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=0, keepdim=True)
             chunk_max = tl.max(tl.max(sc, 4), 0)
             # rescale = torch.exp(-torch.relu(chunk_max - tile_max))

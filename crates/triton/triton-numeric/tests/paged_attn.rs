@@ -645,14 +645,43 @@ impl Batch {
                 s.arg("kp", page.clone()),
                 s.arg("vp", page),
                 i32_arg(page_ids, vec![self.num_chunks as usize * index_rows]),
-                s.arg(
-                    "mask",
-                    vec![self.num_chunks as usize * e * nkvh as usize, block as usize],
-                ),
+                self.mask_rows(e, nkvh as usize, block as usize),
                 f16_arg(&vec![0.0; rows * width], vec![rows, width]),
             ],
         );
         out.last().expect("the out operand").clone()
+    }
+
+    /// The recorded mask `[C·E·NKVH, BLOCK]` (spyre-inference's stack, its kv axis materialized) as
+    /// the kernel reads it, `[C·E, BLOCK]`: one row per (block slot, sequence), every kv head reading
+    /// that row through the kernel's broadcast. The recorded copies of a row are asserted equal, so
+    /// taking the first loses nothing the reference states.
+    fn mask_rows(&self, e: usize, nkvh: usize, block: usize) -> Arg {
+        let (data, recorded, dtype) = self.step.file("mask");
+        let rows = self.num_chunks as usize * e;
+        assert_eq!(
+            recorded.iter().product::<usize>(),
+            rows * nkvh * block,
+            "mask: {recorded:?}"
+        );
+        let width = block * 2;
+        let mut out = Vec::with_capacity(rows * width);
+        for r in 0..rows {
+            let first = &data[(r * nkvh) * width..][..width];
+            for h in 1..nkvh {
+                assert_eq!(
+                    &data[(r * nkvh + h) * width..][..width],
+                    first,
+                    "mask row {r}: kv head {h} differs from kv head 0"
+                );
+            }
+            out.extend_from_slice(first);
+        }
+        Arg::TensorBytes {
+            data: out,
+            shape: vec![rows, block],
+            dtype,
+        }
     }
 
     fn words(&self, key: &str) -> Vec<i32> {
