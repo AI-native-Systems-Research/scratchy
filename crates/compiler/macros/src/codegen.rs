@@ -12647,7 +12647,13 @@ fn dump_wavefront_mega(
                                                      fingerprint) — every rung the bake was asked \
                                                      for must ship"
                                                 );
-                                            } else {
+                                            } else if batch_rung {
+                                                // ⛔ ONLY A BATCH-LADDER BAKE IS A RUNG. The one-request
+                                                // owner's decode bake is the session every rung aliases,
+                                                // not one of them: recorded as a width-1 rung it would be
+                                                // loaded and launched as a decode batch, and a one-row
+                                                // batch rung of the ladder would be deduped behind it.
+                                                //
                                                 // `cap` IS this body's swept extent: `bfp` is the
                                                 // CEILING rung (the interior sweep rungs go to
                                                 // `sk_bucket_rungs`), and `ActiveCap::FULL` resolves
