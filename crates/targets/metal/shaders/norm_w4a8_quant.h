@@ -27,7 +27,10 @@ METAL_FUNC void norm_w4a8_quant_row(
         amax = max(amax, simd_shuffle_xor(amax, 1));
         amax = max(amax, simd_shuffle_xor(amax, 2));
         amax = max(amax, simd_shuffle_xor(amax, 4));
-        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f, a = amax / 127.0f;
+        // The pre-pass compiles without fast math (`quantized_qmm_nax` reaches MPP), a norm with
+        // it: its divides are the correctly rounded ones, spelled out.
+        const float inv = amax > 0.0f ? precise::divide(127.0f, amax) : 0.0f;
+        const float a = precise::divide(amax, 127.0f);
         const float4 q0 = rint(v0 * inv), q1 = rint(v1 * inv);
         float sum = (q0.x + q0.y) + (q0.z + q0.w) + (q1.x + q1.y) + (q1.z + q1.w);
         sum += simd_shuffle_xor(sum, 1);
