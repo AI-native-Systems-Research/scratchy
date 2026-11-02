@@ -113,11 +113,6 @@ brew tap scratchy https://github.com/AI-native-Systems-Research/scratchy
 brew install scratchy/scr
 ```
 
-The binary is signed and notarized, so it runs without Gatekeeper
-warnings. The same file is on the
-[releases page](https://github.com/AI-native-Systems-Research/scratchy/releases)
-if you'd rather download it directly.
-
 ### Deep Dives
 
 - See [`docs/blogs/REUSE.md`](docs/blogs/REUSE.md) — *What does "reuse" mean in
