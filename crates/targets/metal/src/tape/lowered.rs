@@ -497,6 +497,12 @@ pub enum KernelId {
     /// [`Self::AttentionDecodeGqaTq`]'s second pass (`attention_via_cache_v2_combine_*`): merges
     /// each query head's partials into its output.
     AttentionDecodeCombine,
+    /// A verify step's lanes' query rows packed a KV head's group to a 64-row tile
+    /// (`attention_verify_pack_q_*`), for [`Self::AttentionVerifySplit`].
+    AttentionVerifyPack,
+    /// The packed NAX paged attention with its keys split (`..._packed_split<S>`): a threadgroup a
+    /// (split, KV head, sequence), storing token-keyed partials for `AttentionDecodeCombine`.
+    AttentionVerifySplit,
     // ── Splash's DFlash2 drafter (`dflash2.metal`, `dflash2_select.metal`) ──────────────────────
     /// A captured layer's rows into their block of the rows a drafter reads (Splash's
     /// `row_copy`, `QwenTarget::addCapture`): `copy_rows_strided_{f16,bf16}` in
@@ -639,6 +645,8 @@ impl KernelId {
             | Self::AttentionViaCacheTq
             | Self::AttentionDecodeGqaTq
             | Self::AttentionDecodeCombine
+            | Self::AttentionVerifyPack
+            | Self::AttentionVerifySplit
             // Each lane is a sequence, read through its own ring slot.
             | Self::CaptureRows
             | Self::DraftConv

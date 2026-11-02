@@ -964,7 +964,8 @@ fn route_by_sequence_count(
     cmds: Vec<GatedCommand>,
 ) -> Result<Vec<GatedCommand>, LoweringError> {
     use crate::tape::lowered::RuntimeGate::{
-        self, OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessOneSequence, UnlessUnrotatedBlocks,
+        self, OnlyIfLaneRows, OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessLaneRows,
+        UnlessOneSequence, UnlessUnrotatedBlocks,
     };
     use crate::tape::lowered::SeqScope::{AllRows, RowZero};
     let Some(row_zero) = cmds.iter().find(|c| c.command.seq_scope() == RowZero) else {
@@ -990,12 +991,29 @@ fn route_by_sequence_count(
         });
     }
     let plain = twins().any(|c| !reropes(c));
+    // A verify step's lanes' attention (`verify_lane_attention`) takes the plain twin's steps
+    // whose every sequence holds a lane's rows at most; the plain twin keeps the rest.
+    let lane = |c: &LoweredCommand| {
+        matches!(
+            c.kernel,
+            KernelId::AttentionVerifyPack
+                | KernelId::AttentionVerifySplit
+                | KernelId::AttentionDecodeCombine
+        )
+    };
+    let lanes = cmds.iter().any(|c| lane(&c.command));
     Ok(cmds
         .into_iter()
         .map(|c| {
             let only: &[RuntimeGate] = match c.command.seq_scope() {
                 RowZero => &[OnlyIfOneSequence],
+                AllRows if lane(&c.command) => {
+                    &[UnlessOneSequence, UnlessUnrotatedBlocks, OnlyIfLaneRows]
+                }
                 AllRows if !per_row(&c.command) => return c,
+                AllRows if !reropes(&c.command) && lanes => {
+                    &[UnlessOneSequence, UnlessUnrotatedBlocks, UnlessLaneRows]
+                }
                 AllRows if !reropes(&c.command) => &[UnlessOneSequence, UnlessUnrotatedBlocks],
                 AllRows if plain => &[UnlessOneSequence, OnlyIfUnrotatedBlocks],
                 AllRows => &[UnlessOneSequence],
@@ -2094,6 +2112,142 @@ fn sdpa_paged_command(
         }
         _ => LoweredCommand::for_kernel::<AttentionSdpaPagedF16>(constants, bindings, dispatch),
     }
+}
+
+/// The splits a verify step's packed attention spreads a sequence's keys over: at 4 sequences of 8
+/// rows over ~4000 keys (Qwen3.8-27B, M5 Max, `split_k_verify_attention_times`), 4 splits ran in
+/// 273 µs, 8 in 291 and 16 in 256, against 644 for one and 962 for the per-query-head tile.
+const VERIFY_SPLITS: u32 = 4;
+
+/// The rows a packed verify tile holds: the NAX tile's (`BQ`), a group's heads' 8-row lanes.
+const VERIFY_TILE_ROWS: u32 = 64;
+
+/// The geometry of a layer class a verify lane attention lowers at.
+struct VerifyLaneShape<'a> {
+    dtype_tag: &'a str,
+    head_dim: u32,
+    num_kv_heads: u32,
+    block_size: u32,
+    bucket_m: u32,
+}
+
+/// A verify step's lanes' attention, in place of the paged NAX attention's `plain` twin (one
+/// threadgroup a query head, its 64-row tile holding a lane's 8 rows, the whole context walked
+/// serially): `attention_verify_pack_q` packs each KV head's group of query heads' lanes into one
+/// tile, `..._packed_split<VERIFY_SPLITS>` reads each KV page once for the group, its keys split
+/// [`VERIFY_SPLITS`] ways, storing token-keyed partials `[token][q_head][splits][2 + head_dim]`,
+/// and `attention_via_cache_v2_combine` merges them into the output, a threadgroup a (token, query
+/// head). Taken where the instantiations exist (head_dim 256 over 16-token pages), the group's
+/// lanes fit the tile, and the bucket's partials and packed rows stay small (at most
+/// [`VERIFY_TILE_ROWS`] rows: the scratch scales with them). `None` keeps the plain twin alone.
+fn verify_lane_attention(
+    p: &MetalModelConsts,
+    s: VerifyLaneShape<'_>,
+    plain: &LoweredCommand,
+    moe_scratch_bytes: &mut u32,
+) -> Option<[LoweredCommand; 3]> {
+    use crate::tape::lowered::{MScaleAxis, MScaling, SetAxis};
+    let gqa = p.num_q_heads / s.num_kv_heads.max(1);
+    let (split_sym, pack_sym) = match (s.dtype_tag, s.head_dim, s.block_size) {
+        ("bf16", 256, 16) => (
+            "attention_steel_nax_paged_bf16_bq64_bk32_bd256_wm4_wn2_bs16_packed_split4",
+            "attention_verify_pack_q_bf16_bd256",
+        ),
+        ("f16", 256, 16) => (
+            "attention_steel_nax_paged_f16_bq64_bk32_bd256_wm4_wn2_bs16_packed_split4",
+            "attention_verify_pack_q_f16_bd256",
+        ),
+        _ => return None,
+    };
+    const _: () = assert!(VERIFY_SPLITS == 4, "the instantiated split count");
+    let fits = gqa * crate::op_abi::METAL_LANE_VERIFY_ROWS <= VERIFY_TILE_ROWS
+        && p.num_q_heads == gqa * s.num_kv_heads
+        && s.bucket_m <= VERIFY_TILE_ROWS;
+    if !fits {
+        return None;
+    }
+    let (hd, m) = (s.head_dim, s.bucket_m);
+    // Packed rows, a sequence's tile per KV head (a step brings at most a sequence a row), then
+    // the partials, a row's per query head and split.
+    let packed_bytes = m * s.num_kv_heads * VERIFY_TILE_ROWS * hd * 2;
+    let partials_bytes = m * p.num_q_heads * VERIFY_SPLITS * (hd + 2) * 4;
+    *moe_scratch_bytes = (*moe_scratch_bytes).max(packed_bytes + partials_bytes);
+    let packed = scratch_at(1, 0);
+    let by_seqs = Some(MScaling {
+        axis: MScaleAxis::Z,
+        bucket_m: super::ids::BucketM(m),
+        set_axis: Some(SetAxis::Seqs(MScaleAxis::Z)),
+    });
+    let arena = |b: &Binding, index| matches!(b, Binding::ArenaSlot { binding_index, .. } if *binding_index == index);
+    let q = *plain.bindings.iter().find(|b| arena(b, 1))?;
+    let out = *plain.bindings.iter().find(|b| arena(b, 0))?;
+    let pack = LoweredCommand {
+        kernel: KernelId::AttentionVerifyPack,
+        function: pack_sym,
+        dispatch: DispatchShape {
+            threadgroups: (VERIFY_TILE_ROWS, s.num_kv_heads, m),
+            threads_per_threadgroup: (hd, 1, 1),
+            m_scaling: by_seqs,
+        },
+        bindings: baked(vec![
+            scratch_at(0, 0),
+            q.at(1),
+            Binding::Runtime {
+                kind: RuntimeBindingKind::CuSeqlensQ,
+                binding_index: 2,
+            },
+        ]),
+        ..*plain
+    };
+    let split = LoweredCommand {
+        kernel: KernelId::AttentionVerifySplit,
+        function: split_sym,
+        dispatch: DispatchShape {
+            threadgroups: (VERIFY_SPLITS, s.num_kv_heads, m),
+            m_scaling: by_seqs,
+            ..plain.dispatch
+        },
+        bindings: baked(
+            (plain.bindings.iter())
+                .map(|b| if arena(b, 1) { packed } else { *b })
+                .chain([scratch_at(10, packed_bytes)])
+                .collect(),
+        ),
+        ..*plain
+    };
+    let combine = LoweredCommand {
+        kernel: KernelId::AttentionDecodeCombine,
+        library: "attention",
+        function: pick_specialized_symbol(
+            "attention_via_cache_v2_combine_f16_specialized",
+            "attention_via_cache_v2_combine_bf16_specialized",
+            p.metal_dtype,
+        ),
+        // The combine's own slots (`attention.metal`): the geometry and ATTN_SPLITS, ATTN_TQ unset.
+        constants: baked(vec![
+            ConstantValue::uint(0, hd),
+            ConstantValue::uint(1, p.num_q_heads),
+            ConstantValue::uint(2, s.num_kv_heads),
+            ConstantValue::float(3, p.attn_scale),
+            ConstantValue::uint(4, s.block_size),
+            ConstantValue::kv_cap(5),
+            ConstantValue::uint(6, crate::BLOCKS_PER_CHUNK),
+            ConstantValue::int(7, 0),
+            ConstantValue::uint(18, VERIFY_SPLITS),
+        ]),
+        dispatch: DispatchShape {
+            threadgroups: (m, p.num_q_heads, 1),
+            threads_per_threadgroup: (combine_threads(hd), 1, 1),
+            m_scaling: Some(MScaling {
+                axis: MScaleAxis::X,
+                bucket_m: super::ids::BucketM(m),
+                set_axis: None,
+            }),
+        },
+        bindings: baked(vec![out, scratch_at(SPLIT_PARTIALS_SLOT, packed_bytes)]),
+        gemm_dims: None,
+    };
+    Some([pack, split, combine])
 }
 
 /// The steel/NAX paged prefill attention's grid: one threadgroup per
@@ -5304,7 +5458,28 @@ fn lower_one(
                         ..attn_cmd
                     };
                     let reroping = sdpa_paged(reroping_constants, bindings_for(false, true));
-                    return Ok(vec![rope_cmd, attn_cmd, plain, reroping]);
+                    // A verify step's lanes take the packed split attention in the plain twin's
+                    // place (`route_by_sequence_count` gates the two).
+                    let lanes = (use_nax && !sliding && sinks.is_none())
+                        .then(|| {
+                            verify_lane_attention(
+                                p,
+                                VerifyLaneShape {
+                                    dtype_tag: steel_dtype_tag,
+                                    head_dim,
+                                    num_kv_heads,
+                                    block_size,
+                                    bucket_m,
+                                },
+                                &plain,
+                                moe_scratch_bytes,
+                            )
+                        })
+                        .flatten();
+                    let mut cmds = vec![rope_cmd, attn_cmd, plain];
+                    cmds.extend(lanes.into_iter().flatten());
+                    cmds.push(reroping);
+                    return Ok(cmds);
                 }
                 attn_cmd
             } else if use_gqa_shared {
@@ -11505,6 +11680,82 @@ mod tests {
         assert_eq!(attn.dispatch.threads_per_threadgroup, (128, 1, 1));
         assert_eq!(constant(attn, 7), Some(1024));
         assert_eq!((constant(attn, 10), constant(attn, 14)), (None, Some(1)));
+    }
+
+    /// A verify-lane bucket's full attention at Qwen3.8-27B's geometry (24 q heads, 4 KV heads,
+    /// head_dim 256, NAX): the packed split trio — pack, split, combine — runs a step of several
+    /// sequences each within a lane's rows, the plain twin every other such step, the rope-once
+    /// pair and the re-roping twin as before. Past 64 rows, or without NAX, the trio is absent.
+    #[test]
+    fn verify_lanes_take_the_packed_split_attention() {
+        use crate::tape::lowered::RuntimeGate::{
+            All, OnlyIfLaneRows, OnlyIfOneSequence, UnlessLaneRows, UnlessOneSequence,
+            UnlessUnrotatedBlocks,
+        };
+        let p = MetalModelConsts {
+            num_q_heads: 24,
+            global_head_dim: 256,
+            num_global_kv_heads: 4,
+            global_block_size: 16,
+            rope_on_read: true,
+            ..tp()
+        };
+        let rows = plain(&[attention(MetalStep::AttentionPrefillPaged, 0, NeoX)]);
+        let lower = |bucket, profile| {
+            lower_subtile_tape_to_metal(&row_tape(rows.clone()), &p, bake_point(bucket, profile))
+                .expect("lowers")
+        };
+        let m5 = lower(64, Some(&crate::targets::M5_10CORE));
+        let steps: Vec<_> = (m5.commands.iter())
+            .map(|c| (c.command.kernel, c.gate))
+            .collect();
+        let trio = Some(All(&[
+            UnlessOneSequence,
+            UnlessUnrotatedBlocks,
+            OnlyIfLaneRows,
+        ]));
+        let plain_gate = Some(All(&[
+            UnlessOneSequence,
+            UnlessUnrotatedBlocks,
+            UnlessLaneRows,
+        ]));
+        assert_eq!(
+            steps[..6],
+            [
+                (KernelId::RopeOnceNax, Some(OnlyIfOneSequence)),
+                (KernelId::AttentionPrefillSdpaPaged, Some(OnlyIfOneSequence)),
+                (KernelId::AttentionPrefillSdpaPaged, plain_gate),
+                (KernelId::AttentionVerifyPack, trio),
+                (KernelId::AttentionVerifySplit, trio),
+                (KernelId::AttentionDecodeCombine, trio),
+            ]
+        );
+        let (pack, split, combine) = (
+            &m5.commands[3].command,
+            &m5.commands[4].command,
+            &m5.commands[5].command,
+        );
+        assert_eq!(pack.dispatch.threadgroups, (VERIFY_TILE_ROWS, 4, 64));
+        assert_eq!(split.dispatch.threadgroups, (VERIFY_SPLITS, 4, 64));
+        assert_eq!(
+            split.function,
+            "attention_steel_nax_paged_bf16_bq64_bk32_bd256_wm4_wn2_bs16_packed_split4"
+        );
+        assert_eq!(combine.dispatch.threadgroups, (64, 24, 1));
+        assert!((combine.constants.iter()).any(|k| *k == ConstantValue::uint(18, VERIFY_SPLITS)));
+        assert!(
+            (combine.constants.iter()).all(|k| k.index != 13),
+            "ATTN_TQ unset"
+        );
+        // The packed rows then the partials, both in the op scratch.
+        let packed = 64 * 4 * VERIFY_TILE_ROWS * 256 * 2;
+        let partials = 64 * 24 * VERIFY_SPLITS * 258 * 4;
+        assert!(m5.moe_scratch_bytes >= packed + partials);
+        let has_trio = |t: &LoweredMetalTape| {
+            (t.commands.iter()).any(|c| c.command.kernel == KernelId::AttentionVerifySplit)
+        };
+        assert!(!has_trio(&lower(512, Some(&crate::targets::M5_10CORE))));
+        assert!(!has_trio(&lower(64, None)));
     }
 
     /// Hybrid arches (gemma-4) compress only the GLOBAL layers — the codec pass

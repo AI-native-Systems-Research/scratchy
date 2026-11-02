@@ -1484,6 +1484,8 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::AttentionViaCacheTq
         | K::AttentionDecodeGqaTq
         | K::AttentionDecodeCombine
+        | K::AttentionVerifyPack
+        | K::AttentionVerifySplit
         | K::AttentionPrefillSdpaPaged
         | K::AttnGatherKRope
         | K::AttnGatherVCopyT
