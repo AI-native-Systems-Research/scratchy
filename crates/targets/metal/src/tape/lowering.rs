@@ -46,7 +46,7 @@ fn attention_blocks_per_chunk(chunked: bool) -> u32 {
 use crate::op_abi::GuardRun;
 use crate::quantized::{
     DequantDtype, NaxDequant, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
-    W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Act, W4a8Rows, W4a8Tile, pick_qmm_t_kernel,
+    W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Act, W4a8Gemm, W4a8Rows, W4a8Tile, pick_qmm_t_kernel,
     pick_qmv_kernel_wide, qmm_t_dispatch_shape, qmm_t_kernel_static_name,
     qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name, qmv_dispatch_shape,
     qmv_kernel_static_name, small_m_kernel_static_name, splitk_reduce_kernel_static_name,
@@ -1740,6 +1740,7 @@ fn lower(
                     &mut attn_unfused_scratch_bytes,
                     block_cap,
                     profile,
+                    class,
                     m_divisor,
                 )?;
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
@@ -2057,6 +2058,8 @@ fn lower_one(
     // `roped_k_scratch` `num_pages` so long context isn't truncated.
     block_cap: u32,
     profile: Option<&crate::targets::MetalTargetProfile>,
+    // The chip class the tape serves: the W4A8 GEMM splits K on the wide class.
+    gen_class: crate::tape::lowered::GenClass,
     // The row-count divisor in force, threaded by `lower()` (1 normally;
     // `vision_merge_factor` after the merger reshape) so post-merge ops
     // dispatch over `bucket_m / m_divisor` rows.
@@ -2103,6 +2106,7 @@ fn lower_one(
                 attn_unfused_scratch_bytes,
                 block_cap,
                 profile,
+                gen_class,
                 m_divisor,
             );
         }
@@ -2129,6 +2133,7 @@ fn lower_one(
                     attn_unfused_scratch_bytes,
                     block_cap,
                     profile,
+                    gen_class,
                     m_divisor,
                 )
             };
@@ -2948,20 +2953,16 @@ fn lower_one(
                             *b = Binding::Scratch { binding_index: 3 };
                         }
                     }
+                    // A grid too sparse for the wide class's cores splits K instead.
+                    let kernel = W4a8Gemm::for_shape(tile, n_v, k_v, bucket_m, gen_class);
                     let gemm = LoweredCommand {
                         kernel: KernelId::AffineQmmW4a8,
                         library: "quantized_qmm_nax",
-                        function: qmm_w4a8_static_name(
-                            W4a8Rows::Dense,
-                            dtype,
-                            scale_dtype,
-                            gs,
-                            tile,
-                        ),
+                        function: kernel.static_name(dtype, scale_dtype, gs),
                         constants: constants(),
                         dispatch: DispatchShape {
-                            threadgroups: (n_v / tile.cols(), bucket_m / W4A8_TILE_ROWS, 1),
-                            threads_per_threadgroup: (32 * tile.simdgroups(), 1, 1),
+                            threadgroups: (n_v / kernel.cols(), bucket_m / W4A8_TILE_ROWS, 1),
+                            threads_per_threadgroup: (32 * kernel.simdgroups(), 1, 1),
                             m_scaling: rows(),
                         },
                         bindings: baked(bindings),
@@ -5613,6 +5614,7 @@ fn lower_one(
                 attn_unfused_scratch_bytes,
                 block_cap,
                 profile,
+                gen_class,
                 m_divisor,
             )?;
             let layer = layer.get() + layer_offset;
@@ -11967,6 +11969,65 @@ mod tests {
         ]));
     }
 
+    /// On the wide class, a W4A8 GEMM in a bucket of at most two row tiles whose one row tile
+    /// holds too few simdgroups for the cores splits K the fewest ways that fill them
+    /// (Qwen3.8-27B's verify, in the 64-row bucket: its MLP down, o_proj, k and v), keeping the
+    /// tiled GEMM where the row tile is already full (gate/up) and in every bucket past two row
+    /// tiles; the M5 class keeps the tiled GEMM throughout.
+    #[test]
+    fn a_sparse_w4a8_grid_splits_k_on_the_wide_class() {
+        use crate::quantized::{W4a8Gemm, W4a8SplitK};
+        use crate::tape::lowered::GenClass::{M5, M5Wide};
+        use W4a8Gemm::{SplitK, Tiled};
+        use W4a8SplitK::{Ways2, Ways4, Ways8};
+        let p = tp();
+        let (dtype, scale) = (dequant_dtype_for(&p), scale_dtype_for(&p));
+        let gemm = |n, k| {
+            row_tape(plain(&[MetalStep::AffineQmm(AffineMatmul {
+                input: Slot(0),
+                output: Slot(1),
+                layer: LayerId(0),
+                n: NDim(n),
+                k: KDim(k),
+                group_size: AffineGroupSize(64),
+                bits: AffineBits(4),
+                vector_limit: QmvBatchLimit(10),
+                ends: QmvEnds::default(),
+            })]))
+        };
+        let wide = Tiled(W4a8Tile::Cols128);
+        // (class, bucket, n, k, kernel, grid width, threads)
+        let cases = [
+            (M5Wide, 64, 17408, 5120, wide, 136, 128),
+            (M5Wide, 64, 5120, 17408, SplitK(Ways4), 160, 128),
+            (M5Wide, 32, 5120, 17408, SplitK(Ways4), 160, 128),
+            (M5Wide, 64, 1024, 5120, SplitK(Ways8), 32, 256),
+            (M5Wide, 64, 10240, 5120, SplitK(Ways2), 320, 64),
+            (M5Wide, 64, 1024, 128, SplitK(Ways2), 32, 64),
+            (M5Wide, 128, 5120, 17408, wide, 40, 128),
+            (M5Wide, 512, 1024, 5120, wide, 8, 128),
+            (M5, 64, 5120, 17408, wide, 40, 128),
+        ];
+        for (class, bucket_m, n, k, kernel, grid, threads) in cases {
+            let at = BakePoint {
+                class,
+                ..bake_point(bucket_m, Some(&crate::targets::M5_10CORE))
+            };
+            let tape = lower_subtile_tape_to_metal(&gemm(n, k), &tp(), at).expect("lowers");
+            let qmm = &tape.commands[1].command;
+            let case = format!("{class:?} bucket {bucket_m} n {n} k {k}");
+            assert_eq!(qmm.kernel, KernelId::AffineQmmW4a8, "{case}");
+            assert_eq!(qmm.function, kernel.static_name(dtype, scale, 64), "{case}");
+            let rows = bucket_m / W4A8_TILE_ROWS;
+            assert_eq!(qmm.dispatch.threadgroups, (grid, rows, 1), "{case}");
+            assert_eq!(
+                qmm.dispatch.threads_per_threadgroup,
+                (threads, 1, 1),
+                "{case}"
+            );
+        }
+    }
+
     /// W4A8 matmuls of one activation in a row share its pre-pass, whatever their widths: the
     /// next one's GEMM reads the scratch as the first left it, behind no barrier of its own
     /// (nothing it reads is in flight). A matmul of another activation quantizes its own, and so
@@ -12764,6 +12825,7 @@ mod tests {
             &mut attn_unfused,
             128,
             None,
+            crate::tape::lowered::GenClass::M1,
             1,
         )
         .expect("lower scalar_mul");
@@ -12805,6 +12867,7 @@ mod tests {
             &mut unfused,
             128,
             None,
+            crate::tape::lowered::GenClass::M1,
             1,
         )
         .expect("lower")
@@ -12853,6 +12916,7 @@ mod tests {
             &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
+            crate::tape::lowered::GenClass::M1,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -12944,6 +13008,7 @@ mod tests {
             &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
+            crate::tape::lowered::GenClass::M1,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -12997,6 +13062,7 @@ mod tests {
             &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
+            crate::tape::lowered::GenClass::M1,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -13083,6 +13149,7 @@ mod tests {
             &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
+            crate::tape::lowered::GenClass::M1,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -13158,6 +13225,7 @@ mod tests {
             &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
+            crate::tape::lowered::GenClass::M1,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -13201,6 +13269,7 @@ mod tests {
             &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
+            crate::tape::lowered::GenClass::M1,
             /*m_divisor=*/ 1,
         )
         .expect("lower");

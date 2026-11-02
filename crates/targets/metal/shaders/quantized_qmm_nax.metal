@@ -1385,6 +1385,88 @@ template <typename T, typename S, int G, int TN, int NSG>
     qmm_w4a8_impl<T, S, G, 32, TN, NSG>(w, scales, biases, scratch, y, tgid);
 }
 
+// The split-K W4A8 GEMM, for a GEMM whose (N/TN)·(M/32) tiles leave a wide chip's
+// cores short of simdgroups (a narrow N, a 32-row bucket): KS simdgroups a threadgroup,
+// each the whole TM x TN tile over every KS-th 64-chunk (adjacent chunks in flight
+// together), summed through threadgroup memory pairwise — (s0 + s_KS/2) first —
+// into simdgroup 0, which stores the tile as `qmm_w4a8_impl` does. Same buffers,
+// constants and per-chunk arithmetic; the chunk sums associate differently.
+// Grid (N/TN, M/32), 32·KS threads.
+template <typename T, typename S, int G, int TN, int KS>
+[[kernel, max_total_threads_per_threadgroup(KS * 32)]] void affine_qmm_w4a8_splitk(
+    const device uchar* w [[buffer(0)]], const device S* scales [[buffer(1)]],
+    const device S* biases [[buffer(2)]], const device uchar* scratch [[buffer(3)]],
+    device T* y [[buffer(4)]], uint2 tgid [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    using namespace mpp::tensor_ops;
+    using Ext = dextents<int32_t, 2>;
+    constexpr int TM = 32;
+    static_assert(KS >= 2 && (KS & (KS - 1)) == 0, "KS: a power of two, at least 2");
+    const int K = QMM_K, N = QMM_N, M = QMM_M, KG = K / G, KC = K / 64;
+    using XA = tensor<device int8_t, Ext, tensor_inline>;
+    using XB = tensor<device int4b_format, Ext, tensor_inline>;
+    XA A((device int8_t*)scratch, Ext(K, M));
+    XB B((typename XB::data_handle_type)w, Ext(K, N));
+    const device float2* qa = (const device float2*)(scratch + int64_t(M) * K);
+    constexpr auto desc =
+        matmul2d_descriptor(TM, TN, 64, false, true, false, matmul2d_descriptor::mode::multiply);
+    matmul2d<desc, execution_simdgroups<1>> op;
+    const int row0 = int(tgid.y) * TM, col0 = int(tgid.x) * TN;
+    auto sA0 = A.template slice<64, TM>(0, row0);
+    auto sB0 = B.template slice<64, TN>(0, col0);
+    auto part = op.template get_destination_cooperative_tensor<decltype(sA0), decltype(sB0), int>();
+    auto acc = op.template get_destination_cooperative_tensor<decltype(sA0), decltype(sB0), float>();
+    _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) acc[i] = 0.0f;
+    }
+    for (int c = int(sg); c < KC; c += KS) {
+        auto sA = A.template slice<64, TM>(c * 64, row0);
+        auto sB = B.template slice<64, TN>(c * 64, col0);
+        op.run(sA, sB, part);
+        const int g = c * 64 / G;
+        _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < part.get_capacity(); ++i) {
+            if (part.is_valid_element(i)) {
+                const auto idx = part.get_multidimensional_index(i);
+                const int n = col0 + idx[0], m = row0 + idx[1];
+                const float s = float(scales[n * KG + g]);
+                const float2 q = qa[int64_t(m) * KC + c];
+                acc[i] = fma(float(part[i]) * q.x, s,
+                             fma(fma(8.0f, s, float(biases[n * KG + g])), q.y, acc[i]));
+            }
+        }
+    }
+    // Every simdgroup's tile has the one layout: element i of a lane is the same (n, m) in each.
+    threadgroup float red[(KS / 2) * TM * TN];
+    for (int h = KS / 2; h >= 1; h /= 2) {
+        if (int(sg) >= h && int(sg) < 2 * h) {
+            _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+                if (acc.is_valid_element(i)) {
+                    const auto idx = acc.get_multidimensional_index(i);
+                    red[((int(sg) - h) * TM + idx[1]) * TN + idx[0]] = acc[i];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (int(sg) < h) {
+            _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+                if (acc.is_valid_element(i)) {
+                    const auto idx = acc.get_multidimensional_index(i);
+                    acc[i] += red[(int(sg) * TM + idx[1]) * TN + idx[0]];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (sg != 0) return;
+    auto out = op.template get_destination_cooperative_tensor<decltype(sA0), decltype(sB0), T>();
+    _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) out[i] = T(acc[i]);
+    }
+    tensor<device T, Ext, tensor_inline> C(y, Ext(N, M));
+    auto mC = C.template slice<TN, TM>(col0, row0);
+    out.store(mC);
+}
+
 template <typename T, typename S, int G, int TN, int NSG>
 [[kernel]] void affine_gather_qmm_w4a8(
     const device uchar* w [[buffer(0)]], const device S* scales [[buffer(1)]],
@@ -1420,9 +1502,20 @@ SCRATCHY_KERNEL(affine_gather_w4a8_quant_f16, affine_gather_w4a8_quant<half>)
     INST_QMM_W4A8(act_tag, act_type, scale_tag, scale_type, gs, 128, 4)                        \
     INST_QMM_W4A8(act_tag, act_type, scale_tag, scale_type, gs, 64, 2)
 
+#define INST_QMM_W4A8_SPLITK(act_tag, act_type, scale_tag, scale_type, gs, tn, ks)            \
+  SCRATCHY_KERNEL(affine_qmm_w4a8_splitk_##act_tag##_s_##scale_tag##_gs_##gs##_tn_##tn##_ks_##ks, \
+                  affine_qmm_w4a8_splitk<act_type, scale_type, gs, tn, ks>)
+
+#define INST_QMM_W4A8_SPLITK_TILES(act_tag, act_type, scale_tag, scale_type, gs)               \
+    INST_QMM_W4A8_SPLITK(act_tag, act_type, scale_tag, scale_type, gs, 32, 2) \
+    INST_QMM_W4A8_SPLITK(act_tag, act_type, scale_tag, scale_type, gs, 32, 4) \
+    INST_QMM_W4A8_SPLITK(act_tag, act_type, scale_tag, scale_type, gs, 32, 8)
+
 #define INST_QMM_W4A8_GS(act_tag, act_type, scale_tag, scale_type)                             \
     INST_QMM_W4A8_TILES(act_tag, act_type, scale_tag, scale_type, 64)                          \
-    INST_QMM_W4A8_TILES(act_tag, act_type, scale_tag, scale_type, 128)
+    INST_QMM_W4A8_TILES(act_tag, act_type, scale_tag, scale_type, 128)                         \
+    INST_QMM_W4A8_SPLITK_TILES(act_tag, act_type, scale_tag, scale_type, 64)                   \
+    INST_QMM_W4A8_SPLITK_TILES(act_tag, act_type, scale_tag, scale_type, 128)
 
 INST_QMM_W4A8_GS(f16,  half,   f16,  half)
 INST_QMM_W4A8_GS(f16,  half,   bf16, bfloat)
