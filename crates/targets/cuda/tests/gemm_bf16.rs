@@ -962,3 +962,215 @@ fn gemm_col64_bf16_repeats_bit_identically() {
         "the 64-column GEMM is not deterministic: see the lines above"
     );
 }
+
+// ── #1031: the split-K decode GEMV ─────────────────────────────────
+
+use scratchy_target_cuda::kernels::gemv_split_bf16_abt;
+use scratchy_target_cuda::step::{gemv_scratch_bytes, gemv_splits};
+
+/// Every real decode shape (#1031's speed table, the qwen and Gemma projections and lm_heads),
+/// Gemma's off-chunk `k` 704 and 2112 (its shared expert, 2112 = 8¼ chunks) and the grid and `k`
+/// tails of `GEMV_SHAPES`.
+const SPLIT_SHAPES: &[(u32, u32, &str)] = &[
+    (4096, 4096, "9b: o_proj"),
+    (8192, 4096, "9b: q_proj with its gate"),
+    (12288, 4096, "9b: gate_proj / up_proj"),
+    (4096, 12288, "9b: down_proj"),
+    (1024, 4096, "9b: k_proj / v_proj"),
+    (248_320, 4096, "9b: the lm_head"),
+    (248_320, 1024, "0.8b: the lm_head"),
+    (4096, 1024, "0.8b: q_proj"),
+    (3584, 1024, "0.8b: gate_proj"),
+    (6144, 1024, "0.8b: in_proj_qkv"),
+    (1024, 3584, "0.8b: down_proj"),
+    (262_144, 2816, "gemma: the lm_head"),
+    (2816, 704, "gemma: k 704"),
+    (2816, 2112, "gemma: the shared expert's down, k 2112"),
+    (8, 8, "one CTA, one k vector"),
+    (1000, 72, "a partial last block, 9 k vectors"),
+    (1, 8, "one column"),
+];
+
+/// One split GEMV of `(n, k)` at `splits` over `a` and `b` in fresh buffers, the scratch `partials`
+/// (or null), `c` NaN-poisoned with a tail; returns `c`'s `n + TAIL` elements.
+fn split_run(
+    device: &CudaDevice,
+    (a, b): (&DeviceBuffer, &DeviceBuffer),
+    partials: Option<&DeviceBuffer>,
+    (n, k, splits): (u32, u32, u32),
+) -> Result<Vec<u16>, KernelError> {
+    let c = DeviceBuffer::upload(device, &vec![SENTINEL; n as usize + TAIL]).expect("upload c");
+    let p = partials.map_or(std::ptr::null_mut(), DeviceBuffer::ptr);
+    // SAFETY: `a`, `b` and `c` hold k, n·k and n + TAIL bf16, `partials` at least the split's
+    // scratch bytes, all cudaMalloc'd and disjoint; the download waits for the default stream.
+    let launched = unsafe {
+        gemv_split_bf16_abt(
+            (a.ptr(), b.ptr(), c.ptr()),
+            p,
+            (n, k, splits),
+            std::ptr::null_mut(),
+        )
+    };
+    launched.map(|()| c.download().expect("download c"))
+}
+
+/// #1031's correctness rule at every split shape, at the split `gemv_splits` picks and at one
+/// split: within the GEMV bound of f64, the tail untouched, bit-identical on a repeat, and the
+/// same bits with the operands at another offset (a 256-byte-shifted `a` and `B`).
+#[test]
+fn the_split_gemv_is_within_the_bound_repeatable_and_offset_independent() {
+    let device = h100();
+    let mut pass = true;
+    for &(n, k, what) in SPLIT_SHAPES {
+        let (nu, ku) = (n as usize, k as usize);
+        let a_bits = bf16_inputs(ku, 0x5917_0000 ^ u64::from(k));
+        let b_bits = bf16_inputs(nu * ku, 0x5918_0000 ^ (u64::from(n) << 32) ^ u64::from(k));
+        let a = DeviceBuffer::upload(&device, &a_bits).expect("upload a");
+        let b = DeviceBuffer::upload(&device, &b_bits).expect("upload B");
+        // The same data 128 elements (256 bytes) into a larger buffer.
+        let shift = |x: &[u16]| [vec![0u16; 128], x.to_vec()].concat();
+        let a_off = DeviceBuffer::upload(&device, &shift(&a_bits)).expect("upload a");
+        let b_off = DeviceBuffer::upload(&device, &shift(&b_bits)).expect("upload B");
+        for splits in [gemv_splits(n, k, 1), 1] {
+            let bytes = gemv_scratch_bytes(n, 1, splits).expect("scratch bytes") as usize;
+            let scratch = (bytes > 0)
+                .then(|| DeviceBuffer::upload(&device, &vec![SENTINEL; bytes / 2 + 128]))
+                .map(|r| r.expect("upload scratch"));
+            let run = |a: &DeviceBuffer, b: &DeviceBuffer| {
+                split_run(&device, (a, b), scratch.as_ref(), (n, k, splits))
+            };
+            let (first, second) = match (run(&a, &b), run(&a, &b)) {
+                (Ok(x), Ok(y)) => (x, y),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("gemv_split n={n} k={k} splits={splits}: launch failed: {e} FAIL");
+                    pass = false;
+                    continue;
+                }
+            };
+            // The shifted copies: the launcher's pointers 256 bytes in.
+            let moved = {
+                let c = DeviceBuffer::upload(&device, &vec![SENTINEL; nu + TAIL]).expect("upload");
+                let p = scratch
+                    .as_ref()
+                    .map_or(std::ptr::null_mut(), DeviceBuffer::ptr);
+                let (ap, bp) = (
+                    a_off.ptr().wrapping_byte_add(256),
+                    b_off.ptr().wrapping_byte_add(256),
+                );
+                // SAFETY: as `split_run`'s, the operands 256 bytes into their larger buffers.
+                unsafe {
+                    gemv_split_bf16_abt((ap, bp, c.ptr()), p, (n, k, splits), std::ptr::null_mut())
+                }
+                .expect("the moved launch");
+                c.download().expect("download c")
+            };
+            let tail = first[nu..].iter().all(|&x| x == SENTINEL);
+            let cmp = compare(&first[..nu], &a_bits, &b_bits, 1, nu, ku);
+            let (repeat, offset) = (
+                mismatched_bits(&first, &second),
+                mismatched_bits(&first, &moved),
+            );
+            let (_, _, g, r, bd) = cmp.worst;
+            let ratio = (g - r).abs() / bd.max(f64::MIN_POSITIVE);
+            let ok = cmp.pass() && tail && repeat == 0 && offset == 0;
+            eprintln!(
+                "gemv_split n={n} k={k} splits={splits}: {} tail_intact={tail} \
+                 repeat_mismatched_bits={repeat} offset_mismatched_bits={offset}{} {} ({what})",
+                cmp.line(),
+                if ratio > 0.99 {
+                    " RATIO ABOVE 0.99"
+                } else {
+                    ""
+                },
+                if ok { "PASS" } else { "FAIL" }
+            );
+            pass &= ok;
+        }
+    }
+    assert!(pass, "a split GEMV shape failed: see the lines above");
+}
+
+/// The split launcher refuses, before touching any pointer: every `GEMV_REFUSED` shape, a split
+/// of 0, above 16, above the row's chunks, one leaving a run empty, and a null scratch above one
+/// split; `c` stays poisoned.
+#[test]
+fn the_split_gemv_refuses_bad_splits_and_a_null_scratch() {
+    let device = h100();
+    let a = DeviceBuffer::upload(&device, &vec![0; REFUSED_BUFFER]).expect("upload a");
+    let b = DeviceBuffer::upload(&device, &vec![0; REFUSED_BUFFER]).expect("upload B");
+    let s = DeviceBuffer::upload(&device, &vec![0; REFUSED_BUFFER]).expect("upload scratch");
+    let mut cases: Vec<(u32, u32, u32, bool)> =
+        GEMV_REFUSED.iter().map(|&(n, k)| (n, k, 1, true)).collect();
+    cases.extend([
+        (64, 1024, 0, true),
+        (64, 8192, 17, true),
+        (64, 1024, 5, true),
+        (64, 2304, 7, true),
+        (64, 1024, 2, false),
+    ]);
+    let mut pass = true;
+    for (n, k, splits, with_scratch) in cases {
+        let scratch = with_scratch.then_some(&s);
+        let got = split_run(&device, (&a, &b), scratch, (n, k, splits));
+        let ok = got.as_ref().err() == Some(&KernelError::GemvSplit { n, k, splits });
+        eprintln!(
+            "gemv_split n={n} k={k} splits={splits} scratch={with_scratch}: {:?} {}",
+            got.err(),
+            if ok { "PASS" } else { "FAIL" }
+        );
+        pass &= ok;
+    }
+    assert!(pass, "the split launcher took a shape it must refuse");
+}
+
+/// #1031's bandwidth table, recorded: per real shape, the weight bytes (`n · k · 2` plus `a`) over
+/// the median of 50 launches after 10 warm-ups, each timed from the host to its completion (an
+/// upper bound on the kernel time), at `gemv_splits`' split, beside the one-split time. The gates
+/// (2.4 TB/s on the 9B's projections, 2.6 on the lm_heads, 1.8 and 1.5 on the small shapes) are
+/// checked on the GKE run's CUDA-event numbers, not here.
+#[test]
+fn the_split_gemv_bandwidth_is_recorded() {
+    let device = h100();
+    for &(n, k, what) in &SPLIT_SHAPES[..14] {
+        let (nu, ku) = (n as usize, k as usize);
+        let a = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x7A)).expect("upload a");
+        let b = DeviceBuffer::upload(&device, &bf16_inputs(nu * ku, 0x7B)).expect("upload B");
+        let c = DeviceBuffer::upload(&device, &vec![0; nu]).expect("upload c");
+        let bytes = (nu * ku + ku) as f64 * 2.0;
+        let mut line = Vec::new();
+        for splits in [gemv_splits(n, k, 1), 1] {
+            let sb = gemv_scratch_bytes(n, 1, splits).expect("scratch") as usize;
+            let s = DeviceBuffer::upload(&device, &vec![0; sb / 2 + 128]).expect("upload scratch");
+            let mut times = Vec::new();
+            for i in 0..60 {
+                let start = std::time::Instant::now();
+                // SAFETY: as `split_run`'s.
+                unsafe {
+                    gemv_split_bf16_abt(
+                        (a.ptr(), b.ptr(), c.ptr()),
+                        s.ptr(),
+                        (n, k, splits),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("launch");
+                c.download().expect("wait");
+                if i >= 10 {
+                    times.push(start.elapsed().as_secs_f64());
+                }
+            }
+            times.sort_by(f64::total_cmp);
+            let med = times[times.len() / 2];
+            line.push(format!(
+                "splits={splits} median={:.1}us {:.2}TB/s",
+                med * 1e6,
+                bytes / med / 1e12
+            ));
+        }
+        eprintln!(
+            "gemv_split bandwidth n={n} k={k}: {} (host-timed with the download; recorded, not \
+             asserted) ({what})",
+            line.join(", ")
+        );
+    }
+}

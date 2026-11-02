@@ -2205,3 +2205,123 @@ fn gemma_moe_kernel_times_are_recorded() {
         }
     }
 }
+
+// ── #1031: the split-K expert GEMV ─────────────────────────────────
+
+use scratchy_target_cuda::kernels::{expert_gemv_split_bf16, gemv_split_bf16_abt};
+use scratchy_target_cuda::step::{gemv_scratch_bytes, gemv_splits};
+
+/// The expert GEMV at `gemv_splits`' split for its 8 pairs, at the 35B's and Gemma's decode shapes
+/// (Gemma's `k` 704, off the 256-element chunk, included), 8 distinct experts: each pair's row
+/// within the GEMM bound of f64 and bit-identical to `gemv_split_bf16_abt` on the same row and
+/// expert slice at the same split, the tail intact, a repeat bit-identical; then the time over the
+/// 8 experts' bytes, recorded (#1031's 1.8 TB/s gate is checked on the GKE CUDA-event numbers).
+#[test]
+fn the_split_expert_gemv_is_the_split_gemv_per_pair() {
+    let device = h100();
+    let mut pass = true;
+    let topk_idx = [3u32, 120, 17, 64, 0, 127, 99, 42];
+    let pairs = topk_idx.len();
+    for (what, n, k, pair_rows) in [
+        ("35b gate_up", INTER, HIDDEN, false),
+        ("35b down", HIDDEN, INTER, true),
+        ("gemma gate_up", GEMMA_I, GEMMA_H, false),
+        ("gemma down", GEMMA_H, GEMMA_I, true),
+    ] {
+        let experts = 128usize;
+        let splits = gemv_splits(n as u32, k as u32, pairs as u32);
+        let a_rows = if pair_rows { pairs } else { 1 };
+        let a_bits = bf16_inputs(a_rows * k, 0x5E7 ^ n as u64);
+        let b_bits = bf16_inputs(experts * n * k, 0x5E8 ^ k as u64);
+        let (a, b, ib) = (
+            up(&device, &a_bits),
+            up(&device, &b_bits),
+            up_u32(&device, &topk_idx),
+        );
+        let sb = gemv_scratch_bytes(n as u32, pairs as u32, splits).expect("scratch") as usize;
+        let s = up(&device, &vec![SENTINEL; sb / 2 + 128]);
+        let run = || {
+            let c = up(&device, &vec![SENTINEL; pairs * n + TAIL]);
+            // SAFETY: cudaMalloc pointers are 256-byte aligned; `a` holds a_rows·k bf16, `b`
+            // 128·n·k, `topk_idx` 8 u32 below 128, `s` the split's scratch, `c` 8·n and the
+            // tail; null is the default stream, which the download waits for.
+            unsafe {
+                expert_gemv_split_bf16(
+                    (a.ptr(), b.ptr(), ib.ptr()),
+                    (c.ptr(), s.ptr()),
+                    (1, pairs as u32, n as u32, k as u32),
+                    (experts as u32, n as u32),
+                    (pair_rows, splits),
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("expert_gemv_split_bf16 launch");
+            c.download().expect("download")
+        };
+        let (gpu, again) = (run(), run());
+        let tail = gpu[pairs * n..].iter().all(|&v| v == SENTINEL);
+        let repeat = mismatched_bits(&gpu, &again);
+        let (mut bits_bad, mut bound_bad, mut worst) = (0usize, 0usize, 0.0f64);
+        for (p, &e) in topk_idx.iter().enumerate() {
+            let (e, row) = (e as usize, if pair_rows { p } else { 0 });
+            let a_p = &a_bits[row * k..(row + 1) * k];
+            let a_up = up(&device, a_p);
+            let b_e = b.ptr().wrapping_byte_add(e * n * k * 2);
+            let c_p = up(&device, &vec![SENTINEL; n]);
+            let s_p = up(
+                &device,
+                &vec![0; gemv_scratch_bytes(n as u32, 1, splits).unwrap() as usize / 2 + 128],
+            );
+            // SAFETY: `a_up` holds k bf16, `b_e` expert e's n·k inside `b`, `c_p` n, `s_p` the
+            // one-pair scratch at the same split; null is the default stream.
+            unsafe {
+                gemv_split_bf16_abt(
+                    (a_up.ptr(), b_e, c_p.ptr()),
+                    s_p.ptr(),
+                    (n as u32, k as u32, splits),
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("gemv_split_bf16_abt launch");
+            bits_bad +=
+                mismatched_bits(&gpu[p * n..(p + 1) * n], &c_p.download().expect("download"));
+            let cmp = common::numerics::compare(
+                &gpu[p * n..(p + 1) * n],
+                a_p,
+                &b_bits[e * n * k..(e + 1) * n * k],
+                1,
+                n,
+                k,
+            );
+            bound_bad += cmp.out_of_bound;
+            let (_, _, g, r, bd) = cmp.worst;
+            worst = worst.max((g - r).abs() / bd.max(f64::MIN_POSITIVE));
+        }
+        let ok = bits_bad == 0 && bound_bad == 0 && tail && repeat == 0;
+        let mut times = Vec::new();
+        for i in 0..60 {
+            let start = std::time::Instant::now();
+            let _ = run();
+            if i >= 10 {
+                times.push(start.elapsed().as_secs_f64());
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        let med = times[times.len() / 2];
+        let bytes = (pairs * n * k * 2) as f64;
+        eprintln!(
+            "expert_gemv_split m=1 {what} n={n} k={k} splits={splits}: mismatched_bits={bits_bad} \
+             out_of_bound={bound_bad} worst_ratio={worst:.4} repeat_mismatched_bits={repeat} \
+             tail_intact={tail} {}; time median={:.1}us {:.2}TB/s over the 8 experts' bytes \
+             (host-timed with the uploads and download; recorded, not asserted)",
+            verdict(ok),
+            med * 1e6,
+            bytes / med / 1e12
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "a split expert GEMV differs from the split GEMV: see the lines above"
+    );
+}
