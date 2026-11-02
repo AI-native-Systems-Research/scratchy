@@ -4366,8 +4366,57 @@ fn lower_function_folded(
                         f.name, op.op_type
                     ));
                 };
-                let tid = mint_inter(k, layout, floor, res);
-                let dst = row_major_region(tid, rows * sticks, layout);
+                // ⛔ A RESULT THE PROGRAM STORES WHOLE GOES TO ITS PARAMETER. No op lowers the
+                // `ktdp.store` of a value a shape op produced (its producer writes the parameter, as
+                // the row-major arm above does), so a permute into a minted buffer here left the
+                // stored parameter unwritten: granite-3.1-8b's one-request decode stores its
+                // attention `[1, heads·128]` this way, and the output projection read a buffer no
+                // op had written (card: "Fraryning000…" from the second token, on every walk). The
+                // row-major `[R·C, stick]` landing is the stored parameter's own bytes only where
+                // the parameter is one row, or one stick wide; anything else is refused by name.
+                let stored_to = f.operations.iter().find(|s| {
+                    s.op_type == OpKind::KtdpStore
+                        && s.operands.first() == Some(&res)
+                        && !indirect_tile_of(f, s.operands.get(1).copied())
+                });
+                let dst = match stored_to {
+                    Some(store) => {
+                        let tile = f.operations.iter().find(|o| {
+                            o.op_type == OpKind::KtdpConstructAccessTile
+                                && Some(o.result) == Some(store.operands.get(1).copied())
+                        });
+                        let o = match tile {
+                            Some(t) => region_of_view_operand(k, t, 0)?
+                                .map(|o| windowed_region(k, o, t))
+                                .transpose()?,
+                            None => None,
+                        };
+                        let stick = crate::work::FP16_ELEMS_PER_STICK;
+                        match o {
+                            Some(o)
+                                if (o.r_start, o.c_start) == (0, 0)
+                                    && (o.r_len, o.c_len) == (o.v_rows, o.v_cols)
+                                    && o.v_rows * o.v_cols == rows * sticks * stick
+                                    && (o.v_rows == 1 || o.v_cols == stick) =>
+                            {
+                                reframed(Region { is_out: true, ..o }, [rows * sticks, stick])
+                            }
+                            _ => {
+                                return err(format!(
+                                    "{}: the row-major `[{}, {stick}]` landing of a stick-major \
+                                     `[{rows}, {}]` block is stored to a window that is not those \
+                                     bytes whole",
+                                    f.name,
+                                    rows * sticks,
+                                    sticks * stick
+                                ));
+                            }
+                        }
+                    }
+                    None => {
+                        row_major_region(mint_inter(k, layout, floor, res), rows * sticks, layout)
+                    }
+                };
                 out.push(permute(
                     f.name,
                     &source,

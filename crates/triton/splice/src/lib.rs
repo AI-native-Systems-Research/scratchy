@@ -4840,6 +4840,53 @@ mod walk_on_the_card {
     /// with; the runs go out 32 an op instead, so every core copies one run. Two sequences over four
     /// blocks, or eight over one, are 64 blocks (two ops a plane); two over one gather a kv head a
     /// core and read the probabilities with no relayout at all.
+    /// ⭐ A BATCH OF ONE WRITES ITS ATTENTION TO THE OUTPUT IT STORES. One sequence's attention at a
+    /// head two sticks wide (granite-3.1-8b) is one `[1, heads·128]` row read from the stick-major
+    /// `[kv·group, 128]` blocks, which the lowering lands row-major with one permute. That permute
+    /// went into a minted buffer and nothing stored the output parameter: on the card the output
+    /// projection read bytes no op had written ("Fraryning000…" from the second token at every
+    /// walk). So the permute's destination is the stored output itself, at every batch width and
+    /// both head dims.
+    #[test]
+    fn a_decode_batch_writes_its_attention_to_the_output_it_stores() {
+        for (seqs, walk, hd) in [
+            (1u32, 1u32, 128u32),
+            (1, 64, 128),
+            (1, 1, 64),
+            (2, 1, 128),
+            (2, 4, 64),
+        ] {
+            let (node, _) = batched_walk_at(seqs, walk, hd);
+            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            let mut sym = 0i64;
+            let ops =
+                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                    .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
+            let at = format!("B={seqs} walk={walk} hd={hd}");
+            // `out` is the kernel's last parameter.
+            let out = ktir_superdsc::place::act_name((node.bindings.len() - 1) as u32);
+            assert!(
+                ops.iter().any(|e| e
+                    .arg_bindings
+                    .iter()
+                    .any(|a| !a.is_input && a.buffer == out)),
+                "{at}: some op writes the stored output {out}; writers: {:?}",
+                ops.iter()
+                    .filter(|e| e.op_name.starts_with("permute"))
+                    .map(|e| (
+                        e.op_name.clone(),
+                        e.arg_bindings
+                            .iter()
+                            .filter(|a| !a.is_input)
+                            .map(|a| a.buffer.clone())
+                            .collect::<Vec<_>>()
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
     /// ⭐ A DECODE BATCH'S QUERY TABLE IS RELAID FROM THE QUERY'S OWN FRAME. Folded under Triton's
     /// gather floor, the kernel reads the `[tokens, heads·hd]` query as `[tokens·kv, heads·hd/kv]`
     /// rows; stick-major on the card those are different bytes, and the producer wrote the query's
@@ -4872,12 +4919,15 @@ mod walk_on_the_card {
                 .filter(reads_query)
                 .collect();
             if seqs == 1 {
-                assert!(permutes.is_empty(), "{at}: one row is its own row-major table");
+                assert!(
+                    permutes.is_empty(),
+                    "{at}: one row is its own row-major table"
+                );
                 continue;
             }
             assert_eq!(permutes.len(), 1, "{at}: one relayout of the query");
-            let v = serde_json::to_value(permutes[0].op.as_ref().expect("a descriptor"))
-                .expect("json");
+            let v =
+                serde_json::to_value(permutes[0].op.as_ref().expect("a descriptor")).expect("json");
             let n = &v["dscs_"][0][&permutes[0].op_name]["N_"];
             assert_eq!(
                 (n["mb_"].as_u64(), n["y_"].as_u64()),
