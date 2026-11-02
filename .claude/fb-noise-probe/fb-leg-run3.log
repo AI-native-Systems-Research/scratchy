@@ -1,0 +1,58 @@
+==== fb-noise-leg start 2026-10-26T20:37:03Z ====
+==== FB-BUILD-RUNNER-START 2026-10-26T20:37:03Z ====
+   Compiling ktir-superdsc v0.1.0 (/work/front-b-noise/crates/targets/spyre/ktir/ktir-superdsc)
+   Compiling scratchy-spyre-bundle v0.1.0 (/work/front-b-noise/crates/targets/spyre/bundle)
+   Compiling triton-ktir-superdsc v0.1.0 (/work/front-b-noise/crates/triton/triton-ktir-superdsc)
+   Compiling scratchy-subtile v0.1.0 (/work/front-b-noise/crates/compiler/subtile)
+   Compiling scratchy-triton-splice v0.1.0 (/work/front-b-noise/crates/triton/splice)
+   Compiling scratchy-target-spyre v0.1.0 (/work/front-b-noise/crates/targets/spyre)
+    Finished `release` profile [optimized] target(s) in 42.13s
+==== FB-BUILD-RUNNER-OK 2026-10-26T20:37:45Z ====
+==== FB-BAKE-START 2026-10-26T20:37:45Z ====
+   Compiling ktir-superdsc v0.1.0 (/work/front-b-noise/crates/targets/spyre/ktir/ktir-superdsc)
+   Compiling triton-ktir-superdsc v0.1.0 (/work/front-b-noise/crates/triton/triton-ktir-superdsc)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.52s
+     Running `/work/pr916/head/target/debug/examples/bake_py hash_noise /work/fb-noise-probe/hash-noise`
+BAKED    hash_noise                            whole-function: ops=38 files=39
+==== FB-BAKE-OK 2026-10-26T20:37:50Z ====
+==== FB-INPUTS 2026-10-26T20:37:50Z ====
+t00_slo.bin uint32 1048576 elems 4194304 B
+t01_shi.bin uint32 1048576 elems 4194304 B
+t02_stp.bin uint32 1048576 elems 4194304 B
+t03_srow.bin uint32 1048576 elems 4194304 B
+t04_c1.bin uint32 1048576 elems 4194304 B
+t05_c2.bin uint32 1048576 elems 4194304 B
+t06_c3.bin uint32 1048576 elems 4194304 B
+t07_c256.bin uint32 1048576 elems 4194304 B
+t08_lane.bin float32 1048576 elems 4194304 B
+t09_fm8.bin float32 1048576 elems 4194304 B
+t10_ftop.bin float32 1048576 elems 4194304 B
+t11_fzero.bin float32 1048576 elems 4194304 B
+t12_fhalf.bin float32 1048576 elems 4194304 B
+t13_fm22.bin float32 1048576 elems 4194304 B
+t14_cmin.bin float16 1048576 elems 2097152 B
+==== FB-DXP 2026-10-26T20:37:50Z ====
+FB-DXP-OK (249984 B image)
+==== FB-RUN-START 2026-10-26T20:37:52Z ====
+  bound t11 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t12 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t13 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t14 RAW: 2097152 B verbatim, no IEEE→SEN conversion
+read t15 RAW -> /work/fb-noise-probe/out_u.bin (4194304 B, verbatim, no codec)
+read t16 RAW -> /work/fb-noise-probe/out_g.bin (4194304 B, verbatim, no codec)
+read t17 RAW -> /work/fb-noise-probe/out_ui.bin (4194304 B, verbatim, no codec)
+read t18 RAW -> /work/fb-noise-probe/out_gi.bin (4194304 B, verbatim, no codec)
+==== FB-CHECK 2026-10-26T20:37:58Z ====
+VERDICT u-bitcheck: PASS diff=0/1048576
+VERDICT u-in-open-unit: True
+VERDICT u-chi2(255df): 226.33  (expected 4096/bin; min=3909 max=4280; p~0.9016 WH-approx)
+VERDICT g-card: finite=True (nonfinite=0) mean=0.576039
+           (want 0.577216, err -0.001177)
+           var=1.632352 (want 1.644934, err -0.012582)
+VERDICT g-host-ref (f64 log, same u): mean=0.577748 var=1.646838
+VERDICT g-fp16-emu (host fp16 chain, same clamps): mean=0.577798 var=1.647400
+           clamped lanes: inner=53 outer=272; |emu-card|: max=2.632812 mean=0.004160
+VERDICT exits: ui-trunc diff=0/1048576  gi-trunc diff=385613/1048576
+verdict written: /work/fb-noise-probe/fb-noise-verdict.json
+==== fb-noise-leg end 2026-10-26T20:37:59Z checkrc=0 ====
+FB-NOISE-DONE

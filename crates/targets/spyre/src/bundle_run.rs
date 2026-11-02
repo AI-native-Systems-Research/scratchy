@@ -436,6 +436,24 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         lx_op_local_bytes: 0,
         // No chunk form either, so no probability-part pins beside absent gathers.
         lx_prob_pin_bytes: 0,
+        // And no pin window: no placement layout was ever computed for a Triton-lowered
+        // bundle, so there is no proven window to state — `None`, not a silent zero.
+        lx_pin_window_bytes: None,
+        // The graph's own source bound, read off the parse with the same KIND split the
+        // launch-time `declare_sources` below applies to the bound inputs (activation-role,
+        // below the reserved-const floor): a run that binds every kernel tensor states exactly
+        // this bound, and the layout — not the run — is where the bundle states it.
+        num_sources: pf
+            .places
+            .iter()
+            .filter(|p| p.role == "Activation" && p.tid < RESERVED_TID_FLOOR)
+            .map(|p| p.tid + 1)
+            .max()
+            .unwrap_or(0),
+        // No source is resident here — the launch-time list is empty for the same reason: a
+        // single-kernel bundle has no prefix-KV cache for the device to fill and no load-time
+        // constant tables for an owner to bind.
+        resident_source_tids: std::borrow::Cow::Owned(Vec::new()),
     };
 
     println!("  parsed segment_bytes {:?}", segment_bytes);
@@ -540,9 +558,48 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         .collect::<Result<_>>()?;
     let outputs: BTreeMap<u32, String> = output
         .iter()
-        .filter(|o| !o.starts_with("synth:"))
+        .filter(|o| !o.starts_with("synth:") && !o.starts_with("raw:"))
         .map(|s| split_binding(s, "output"))
         .collect::<Result<_>>()?;
+    // `raw:t<id>=<path>` on the OUTPUT side — the readback twin of the input `raw:t<id>` marker.
+    // `read_tensor` runs every byte through `sen_to_ieee_bytes`, the SEN169→IEEE fp16 codec, so an
+    // int32 tensor read that way comes back MANGLED — each 4-byte entry decoded as two fp16 values
+    // and re-encoded, a different, valid, arbitrary pair of numbers (the mirror of what the input
+    // marker's own doc records an fp16 pass doing to an index table on the way IN). A kernel whose
+    // output IS an index — the gather class, argmax's token id — therefore has no honest readback
+    // without this spelling: the bytes are taken verbatim out of the placement's segment, no codec,
+    // no stick permutation.
+    let raw_outs: std::collections::BTreeMap<u32, String> = output
+        .iter()
+        .filter(|o| o.starts_with("raw:"))
+        .map(|s| {
+            let body = s.strip_prefix("raw:").expect("filtered on the prefix");
+            split_binding(body, "output")
+        })
+        .collect::<Result<_>>()?;
+
+    // ⛔ THE SAME COLLISION LAW THE BIND SIDE STATES, for the same reason: a tensor both
+    // `--output t7=a.bin` and `--output raw:t7=b.bin` names would write two files from two
+    // different decoders and nothing here could know which the caller meant to compare.
+    for tid in raw_outs.keys() {
+        if outputs.contains_key(tid) {
+            bail!(
+                "raw:t{tid}: t{tid} is also a plain `--output` — two statements of one readback, \
+                 one through the fp16 codec and one verbatim, and nothing here can know which the \
+                 caller meant to compare"
+            );
+        }
+        // The stick-major map is defined over 2-byte fp16 elements (`dev_order`, `restick`). A raw
+        // output is not fp16 — the only one today is an int32 index stick — so permuting it would
+        // shuffle half-words across entry boundaries.
+        if sticks.contains_key(tid) {
+            bail!(
+                "raw:t{tid} and stick:t{tid}: the stick-major map permutes 2-byte fp16 elements, \
+                 and a raw output is not fp16. Applying it to an int32 stick would swap half-words \
+                 between entries and yield numbers nobody asked for."
+            );
+        }
+    }
 
     // ⛔⛔⛔ A `raw:` MARKER THAT NAMES NOTHING IS EXACTLY THE SILENT WRONG ANSWER IT EXISTS TO STOP.
     // `raw:` only changes how a tensor is STAGED, so a typo'd or stale id leaves the buffer on the
@@ -903,7 +960,38 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         std::fs::write(path, &bytes).with_context(|| format!("--output t{tid}={path}"))?;
         println!("read t{tid} -> {path} ({} B)", bytes.len());
     }
-    if outputs.is_empty() && !out_ids.is_empty() {
+    // THE RAW READBACKS — verbatim placement bytes, no codec. `read_seg` D2Hs the WHOLE segment
+    // raw ("raw sen-fp16 bytes, NO conversion" — its own doc); the placement's own (offset, size)
+    // names this tensor's window inside it, the same coordinates every other read in this file
+    // resolves through, so the slice cannot disagree with where the descriptors wrote.
+    for (tid, path) in &raw_outs {
+        let p = pf
+            .places
+            .iter()
+            .find(|q| q.tid == *tid)
+            .ok_or_else(|| anyhow!("--output raw:t{tid}: no such tensor in placements.json"))?;
+        let seg = crate::superdsc_exec::SegIdx::checked(p.segment as i64)
+            .ok_or_else(|| anyhow!("raw output t{tid}: segment {} out of range", p.segment))?;
+        let whole = exec.read_seg(seg)?;
+        let a = p.offset as usize;
+        let b = (p.offset + p.size) as usize;
+        if b > whole.len() {
+            bail!(
+                "raw output t{tid} spans [{a}, {b}) of segment {} but only {} B are \
+                 host-readable — the placement reaches past what the launch's own segment map \
+                 sized, which is a producer/launcher disagreement and not a readback to truncate",
+                p.segment,
+                whole.len()
+            );
+        }
+        let bytes = whole[a..b].to_vec();
+        std::fs::write(path, &bytes).with_context(|| format!("--output raw:t{tid}={path}"))?;
+        println!(
+            "read t{tid} RAW -> {path} ({} B, verbatim, no codec)",
+            bytes.len()
+        );
+    }
+    if outputs.is_empty() && raw_outs.is_empty() && !out_ids.is_empty() {
         println!(
             "note: the producer marks t{:?} as the output; pass --output t<id>=<path> to read it back",
             out_ids

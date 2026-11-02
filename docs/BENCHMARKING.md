@@ -128,6 +128,19 @@ nothing is self-reported.
   already pushed the mark to ~270 MiB.
 - **`evicted`** — KiB that left the page cache when a FROZEN repetition's
   eviction ran, from `/proc/meminfo` `Cached` sampled either side of it.
+- **`power`** — whole-run energy, from the workspace's own
+  [`scratchy-power-sampler`](../crates/benches/power-sampler) binary: Apple's
+  IOReport energy counters (no root, no third-party tool),
+  sampled at 1 Hz from before the first build to after the last server is
+  down, so the number covers everything the run cost — the same window for
+  every engine. Reported per rail (`cpu_j`, `gpu_j`, `ane_j`) and as their
+  sum (`soc_j`, `soc_wh`, `soc_avg_w`, `soc_peak_w`): CPU + GPU + ANE, the
+  rails every reader has. DRAM and display are not in it. On macOS 27 it reads
+  the CLPC counters (cumulative nJ, per-chip-driver ids), because there the
+  "Energy Model" group's `CPU Energy` channel reads 0 under load; on every
+  other release it reads the "Energy Model" group's `CPU Energy`, `GPU Energy`
+  and `ANE` channels by name. A rail with no live channel stops the sampler,
+  and the run, instead of reporting zeros.
 
 ### Proving the eviction happened
 
@@ -285,7 +298,10 @@ These favour one side or the other and must travel with any published number.
   its `model_settings.json`) is the like-for-like rival for a default
   scratchy build, and **oMLX** as shipped (FP16 KV) the like-for-like one for
   mlx-lm.
-- **oMLX is the Metal matrix's default rival, run as it ships.** Its own
+- **oMLX is the Metal matrix's default rival, at its own defaults.** Until a
+  release takes `ignore_eos`, it runs from starpit/omlx's `feat/api-ignore-eos`
+  (oMLX main plus jundot/omlx#4978), not a release: see "Not every engine
+  answers to length". Its own
   caching stays on (the SSD cache kept in the run's output, a fresh one per
   variant, so nothing carries between runs), because `--no-cache` drops it to
   plain mlx-lm batching. Its memory guard stays at its default tier and
@@ -304,8 +320,16 @@ These favour one side or the other and must travel with any published number.
   `engine_declined` with the engine's own message and that engine's cells
   skipped for the model — the page says "Declined before serving" instead of
   ‡'d cells that never ran. `--engines all` adds mlx-lm,
-  vllm-metal, ollama, llama.cpp and mistral.rs.
-- **Not every engine serves the same files.** oMLX, mlx-lm and vllm-metal load
+  vllm-metal, ollama, llama.cpp, mistral.rs and Splash.
+- **Splash runs on the Qwen models only, and only when asked.** It is not one
+  of a full run's defaults: `--engines all` times it, or naming it. Inco AI's
+  engine serves the Qwen family and nothing else in the matrix, so such a run
+  times it on those and leaves its column empty elsewhere. It runs as it ships: with the DFlash
+  draft model it pairs with each checkpoint (it has no switch to turn the
+  draft off), its INT8 KV and its own batching, the way a user gets it. Its
+  speed with one user is speculative decoding's, as scratchy's is with an
+  MTP head; TPOT, from the server's token count, covers both the same way.
+- **Not every engine serves the same files.** oMLX, mlx-lm, vllm-metal and Splash load
   the same mlx-community checkpoint as scratchy; ollama's `-mlx` tags are
   ollama's own MLX builds (`gemma4:26b-mlx` is NVFP4, not 4-bit affine); llama.cpp
   and mistral.rs run a Q4_K_M GGUF. The run records each engine's quantization
@@ -313,10 +337,13 @@ These favour one side or the other and must travel with any published number.
 - **Not every engine answers to length.** `bench serve` asks every engine to
   ignore EOS (`ignore_eos: true`), so each request decodes its full
   `--output-len`. scratchy does.
-  - oMLX's HTTP API takes no `ignore_eos`. Its own flag of that name, added in
-    oMLX 2026-10-21 (#4687 there), is internal to its admin benchmark. Its answers
-    stop at EOS: on the M1 Max run in #479, qwen3.6-35b-a3b's oMLX cells delivered
-    62–64% of the tokens asked for.
+  - oMLX releases through 0.7.x take no `ignore_eos` over HTTP. Their own flag of
+    that name, added in oMLX 2026-10-21 (#4687 there), is internal to their admin
+    benchmark, so their answers stop at EOS: on the M1 Max run in #479,
+    qwen3.6-35b-a3b's oMLX cells delivered 62–64% of the tokens asked for. The
+    matrix therefore builds oMLX from starpit/omlx's `feat/api-ignore-eos` branch
+    (jundot/omlx#4978), whose HTTP API takes it, and records that build by its
+    commit; runs on a release still stop at EOS.
   - ollama ignores `ignore_eos` too, and mlx-lm sometimes stops short.
   - Such a cell measures less decode than its label says, over shorter answers
     with smaller KV, which flatters tok/s. So the page marks every number from a

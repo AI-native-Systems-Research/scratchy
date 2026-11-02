@@ -538,6 +538,7 @@ fn load_dir_mode(
         ("locateanything-3b", "locateanything"),
         ("qwen3.5-9b", "qwen3-5-vl"),
         ("qwen3.6-27b", "qwen3-5-vl"),
+        ("qwen3.8-27b", "qwen3-5-vl"),
     ];
     let arch_name = dir
         .file_name()

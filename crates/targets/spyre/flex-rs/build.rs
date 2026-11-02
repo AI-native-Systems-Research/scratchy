@@ -1,12 +1,15 @@
-//! Compiles and links `cxx-shim/senlib_ffi.cpp` — the real C++ senlib FFI
-//! binding (see its own file header). Unconditional by default — flex-rs is
-//! the only senlib path in the workspace, so its shim must build whenever
+//! Compiles and links the crate's C++ shim: `cxx-shim/senlib_ffi.cpp` (the
+//! real senlib FFI binding) and `cxx-shim/hal_sbf.cpp` (the hal SBF wire
+//! doors — see each file's own header). Unconditional by default — flex-rs
+//! is the only senlib path in the workspace, so its shim must build whenever
 //! anything actually links against real senlib, with no separate opt-in.
 //! This is the only build script in the spyre tree.
 //!
 //! This links ONLY against `senlib` (+ its own transitive deps: flightlog,
 //! boost). It does NOT link `libflex.so` or any `sendnn_*` library — this
-//! crate has no `flex::` dependency at all, by design.
+//! crate has no `flex::` dependency at all, by design. The hal SBF headers
+//! install inside senlib's own include root (`senlib/include/hal/`), so
+//! hal_sbf.cpp needs no include path beyond senlib's.
 //!
 //! `SCRATCHY_SKIP_SENDNN_CXX=1` skips the compile (cargo check/clippy only —
 //! a link will fail): the escape hatch that keeps a laptop with no Spyre SDK
@@ -19,6 +22,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SCRATCHY_SKIP_SENDNN_CXX");
     println!("cargo:rerun-if-env-changed=FLEX_RS_SPYRE_ROOT");
     println!("cargo:rerun-if-changed=cxx-shim/senlib_ffi.cpp");
+    println!("cargo:rerun-if-changed=cxx-shim/hal_sbf.cpp");
 
     let spyre_root: PathBuf = env::var("FLEX_RS_SPYRE_ROOT")
         .unwrap_or_else(|_| "/opt/ibm/spyre".to_string())
@@ -63,6 +67,7 @@ fn main() {
         // senlib headers (parse_init_buffer.hpp) use std::span (C++20).
         .std("c++20")
         .file("cxx-shim/senlib_ffi.cpp")
+        .file("cxx-shim/hal_sbf.cpp")
         .warnings(true);
     // senlib's own include root, plus `runtime/include` for the `common/`
     // headers senlib's own public headers (device_identity.hpp) need to

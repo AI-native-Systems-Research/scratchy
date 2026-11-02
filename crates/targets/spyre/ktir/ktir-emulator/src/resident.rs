@@ -49,11 +49,14 @@
 use crate::arena::Arena;
 use crate::attrkey::AttrKey;
 use crate::dtypes::DType;
-use crate::interpreter::{Arg, Output, execute_function_in_exec_only};
+use crate::interpreter::{
+    Arg, Output, execute_function_in_exec_only, execute_function_in_exec_only_pinned,
+};
 use crate::ir::{Attr, IRFunction, IRModule, Operation, Ssa, Value};
 use crate::memory::{STICK_BYTES, SpyreMemoryHierarchy};
 use crate::opkind::OpKind;
 use ktir_optimizer::fusion::{NodeSpec, ProgramSpec, Segment, plan_segments_budgeted};
+use ktir_superdsc::ktir_node::Program;
 use std::collections::HashMap;
 
 /// One planned program before it becomes a [`ResidentProgram`]: the (rewritten)
@@ -62,6 +65,7 @@ use std::collections::HashMap;
 type PlannedProgram = (
     IRModule<'static>,
     Vec<Segment<'static>>,
+    Option<u64>,
     std::collections::HashSet<u64>,
     Vec<NodeSpec>,
 );
@@ -159,6 +163,19 @@ struct ResidentProgram {
     /// dataflow executor runs these per-tile (the fused segments collapse the grid,
     /// so they can't be run tile-major).
     nodes: Vec<NodeSpec>,
+    /// ⭐ THE LX PIN WINDOW THIS PROGRAM'S FUSED SEGMENTS CHARGE — its bundle
+    /// layout's own `lx_window_fits` budget (core-local pins + op-local slot
+    /// classes), the ONLY LX bytes a fused segment's run charges (auditor ruling
+    /// 2026-10-27: the card holds these pins and nothing else — intermediates are
+    /// HBM — so the emulator charges this per segment and never the tiles).
+    /// `None` is stated IN THE TYPE for the two cases that have no window: a
+    /// NATIVE-ONLY program (`new_native` plans no fused segment, so nothing on
+    /// its path reads a window — it runs the decomposed arm's whole-tile
+    /// accounting), and a fused-path program whose bundle stated none — which
+    /// [`Self::build`] refuses at load, naming the program, so the Fused arm's
+    /// own resolve of this Option is a refusal that names the segment, never a
+    /// silent zero a later change could start charging.
+    lx_pin_window_bytes: Option<u64>,
     /// This program's final result tensor ids (for default readback).
     results: std::collections::HashSet<u64>,
 }
@@ -270,8 +287,12 @@ impl ResidentExecutor {
     /// allocate ONE persistent HBM stick per tensor (stable address across
     /// passes). Sources are not yet written — call [`set_source`](Self::set_source)
     /// / [`set_sources`](Self::set_sources) before [`run`](Self::run).
-    pub fn new(funcs: &[IRFunction<'static>], spec: &ProgramSpec) -> Result<Self, String> {
-        Self::new_multi(vec![(funcs, spec)])
+    pub fn new(
+        funcs: &[IRFunction<'static>],
+        spec: &ProgramSpec,
+        lx_pin_window_bytes: Option<u64>,
+    ) -> Result<Self, String> {
+        Self::new_multi(vec![(funcs, spec)], vec![lx_pin_window_bytes])
     }
 
     /// Build an executor holding MULTIPLE programs that SHARE one resident weight
@@ -281,10 +302,38 @@ impl ResidentExecutor {
     /// allocated for the UNION of all programs' tensors; the HBM is sized for the
     /// largest grid any program needs. `run_program(i, ..)` runs program `i` (in
     /// declaration order); `run(..)` runs program 0.
+    ///
+    /// `lx_pin_windows[i]` is program `i`'s bundle-stated LX pin window — its
+    /// layout's `lx_window_fits` budget, the only LX its fused segments charge
+    /// (auditor ruling 2026-10-27). `None` is REFUSED at load, naming the
+    /// program: only an emission-lowered bundle carries a window, and a program
+    /// that stated none cannot run the fused path on a silent zero.
     pub fn new_multi(
         programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
+        lx_pin_windows: Vec<Option<u64>>,
     ) -> Result<Self, String> {
-        Self::build(programs, false)
+        Self::build(programs, false, None, &lx_pin_windows)
+    }
+
+    /// ⭐ [`new_multi`](Self::new_multi) WITH A SHAPE FLOOR — the TAPE's own
+    /// tensor-shape statement, threaded by a caller that holds it (the numeric
+    /// gate holds the minted krg; the worker holds the wiring). Every stick is
+    /// allocated for at least the floored element count, so a tensor whose
+    /// widest view the shape walk cannot see — an INTERIOR edge of a fused
+    /// function, where no arg→tid mapping reaches the reader's view (measured:
+    /// the argmax mint's PAD_V-wide logits row over the lm-head matmul's
+    /// narrower device-width out view, t1136 staged `[1, 51200]` while the krg
+    /// states `[1, 65536]`) — still fits its stick. The view walk stays the
+    /// only law for standalone runs ([`new_multi`](Self::new_multi)); the
+    /// floor is a MAX, so it can only ever RAISE an allocation, never shrink
+    /// one the views already sized. `lx_pin_windows` is the per-program pin
+    /// window — see [`Self::new_multi`].
+    pub fn new_multi_floored(
+        programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
+        shape_floor: &HashMap<u64, usize>,
+        lx_pin_windows: Vec<Option<u64>>,
+    ) -> Result<Self, String> {
+        Self::build(programs, false, Some(shape_floor), &lx_pin_windows)
     }
 
     /// Like [`new`](Self::new), but plan EVERY node as a [`Segment::Native`] run at
@@ -298,13 +347,18 @@ impl ResidentExecutor {
     /// (K-loop GEMM reconstruction where recognizable), and per-op Metal offloads
     /// (`metal_gemm_or_blas` / fused map windows) ride along — this is the resident
     /// executor's Native arm, just applied to every node.
+    ///
+    /// No pin window: a native-only executor plans no fused segment, so there is
+    /// nothing on this path that charges one.
     pub fn new_native(funcs: &[IRFunction<'static>], spec: &ProgramSpec) -> Result<Self, String> {
-        Self::build(vec![(funcs, spec)], true)
+        Self::build(vec![(funcs, spec)], true, None, &[None])
     }
 
     fn build(
         programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
         force_native: bool,
+        shape_floor: Option<&HashMap<u64, usize>>,
+        lx_pin_windows: &[Option<u64>],
     ) -> Result<Self, String> {
         // A new resident HBM: every borrowed weight view minted over a previous one is
         // now stale (see `metal::RESIDENT_GEN`), and is discarded rather than dispatched.
@@ -312,6 +366,14 @@ impl ResidentExecutor {
         crate::metal::RESIDENT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if programs.is_empty() {
             return Err("resident: new_multi needs at least one program".into());
+        }
+        if lx_pin_windows.len() != programs.len() {
+            return Err(format!(
+                "resident: {} program(s) against {} LX pin window(s) — one window per program, \
+                 in declaration order, so the two must be the same length",
+                programs.len(),
+                lx_pin_windows.len()
+            ));
         }
         let dtype = DType::F16;
         let bpe = dtype.bytes_per_elem();
@@ -333,7 +395,25 @@ impl ResidentExecutor {
         let mut view_dtypes: HashMap<u64, DType> = HashMap::new();
 
         let arena = crate::arena::Arena::global();
-        for (funcs, spec) in programs {
+        for (pi, (funcs, spec)) in programs.into_iter().enumerate() {
+            // ⭐ THE PIN WINDOW IS RESOLVED AT LOAD (auditor ruling 2026-10-27): a program
+            // whose bundle stated no window (`None`) cannot run the fused path — charging a
+            // silent zero would pass the LX guard on a budget nobody proved. Refused HERE,
+            // naming the program, before any segment runs. A native-only executor
+            // (`new_native`) plans no fused segment and carries `None` in the type — nothing
+            // on that path reads a window.
+            let lx_pin_window_bytes = if force_native {
+                None
+            } else {
+                Some(lx_pin_windows[pi].ok_or_else(|| {
+                    format!(
+                        "resident: program {pi} ({}) stated no LX pin window — only an \
+                         emission-lowered bundle carries one (its layout's lx_window_fits \
+                         budget), and a program without one cannot run the fused path",
+                        funcs.first().map(|f| f.name).unwrap_or("?")
+                    )
+                })?)
+            };
             // Optimize at the execution entry (see
             // `crate::segmented::apply_attention_rewrites`): every resident program
             // gets the attention IR rewrites, applied ONCE here before planning.
@@ -410,13 +490,19 @@ impl ResidentExecutor {
                 ids.insert(r);
             }
             sources.extend(spec.sources.iter().copied());
-            planned.push((module, segments, spec.results.clone(), spec.nodes.clone()));
+            planned.push((
+                module,
+                segments,
+                lx_pin_window_bytes,
+                spec.results.clone(),
+                spec.nodes.clone(),
+            ));
         }
 
         // Size the HBM (LX-per-core array) for the largest grid across ALL programs.
         let grid = planned
             .iter()
-            .map(|(m, segs, _, _)| largest_grid(m, segs))
+            .map(|(m, segs, _, _, _)| largest_grid(m, segs))
             .max()
             .unwrap_or(1);
         let mem = SpyreMemoryHierarchy::new(grid);
@@ -430,8 +516,28 @@ impl ResidentExecutor {
                     .get(&tid)
                     .cloned()
                     .ok_or_else(|| format!("no shape derivable for tensor t{tid}"))?;
-                let n: usize = shape.iter().product();
-                let s = hbm.allocate((n * bpe).max(bpe) as i64);
+                let mut n: usize = shape.iter().product();
+                // ⭐ THE TAPE'S OWN SHAPE STATEMENT IS A FLOOR, where the caller
+                // holds it: the view walk derives a tid's extent only from views
+                // its arg→tid mappings reach, and a widened reader's view can sit
+                // past that reach (an interior edge of a fused function). An
+                // allocation must hold EVERY view that addresses the tensor, and
+                // the krg's tensor shape is the tape's own statement of it — so
+                // the floor takes the max and can only ever RAISE the allocation.
+                if let Some(floor) = shape_floor.and_then(|f| f.get(&tid)) {
+                    n = n.max(*floor);
+                }
+                // ⭐ AND THE STICK IS SIZED AT THE TID'S OWN VIEW DTYPE, not the
+                // model dtype: an fp8 weight binds 1-byte elements, an f32 table
+                // or i32 stick 4-byte ones, and the uniform model-dtype bpe
+                // under-allocated those by half (measured: the argmax's fp32
+                // scale table — 64 elements staged at 128 bytes against a
+                // 256-byte view). Every reader already keys this same per-tid
+                // view dtype (`ptr_for`, the readback decode, the verbatim
+                // source staging); the allocation now agrees with them.
+                let dt = view_dtypes.get(&tid).copied().unwrap_or(dtype);
+                let dt_bpe = dt.bytes_per_elem();
+                let s = hbm.allocate((n * dt_bpe).max(dt_bpe) as i64);
                 stick.insert(tid, s);
                 numel.insert(tid, n);
             }
@@ -439,12 +545,15 @@ impl ResidentExecutor {
 
         let programs = planned
             .into_iter()
-            .map(|(module, segments, results, nodes)| ResidentProgram {
-                module,
-                segments,
-                nodes,
-                results,
-            })
+            .map(
+                |(module, segments, lx_pin_window_bytes, results, nodes)| ResidentProgram {
+                    module,
+                    segments,
+                    lx_pin_window_bytes,
+                    nodes,
+                    results,
+                },
+            )
             .collect();
 
         Ok(ResidentExecutor {
@@ -544,6 +653,430 @@ impl ResidentExecutor {
             .hbm
             .borrow_mut()
             .write_bytes(o_stick * STICK_BYTES, &obytes);
+        Ok(())
+    }
+
+    /// ONE DOOR STICK'S FULL WORDS — every element, decoded at the stick's
+    /// own per-tid law: a tid with a stated view dtype reads there (the pick
+    /// is the argmax's i32 idx stick), and the doors' own Shape-only views
+    /// leave `view_dtype` with no entry, so the PERSISTENT s/l sticks decode
+    /// at the MODEL dtype — the encoding the gate's own staging used (every
+    /// non-weight source arrives as f16-encoded probe values,
+    /// `dbg_synth_val` f32s handed in as `Arg::Tensor { dtype: F16 }`). The
+    /// u32 SENUINT32 wire is the CARD's format, not the gate's model;
+    /// restaging the real seed (a `LoadConst` carrying the token id, u32
+    /// words) is future work for the chain's real-seed leg, never silently
+    /// approximated here.
+    fn read_door_stick(&self, tid: u64) -> Result<Vec<f32>, String> {
+        let s = *self
+            .stick
+            .get(&tid)
+            .ok_or_else(|| format!("door: t{tid} has no resident stick"))?;
+        let n = *self
+            .numel
+            .get(&tid)
+            .ok_or_else(|| format!("door: t{tid} has no derived extent"))?;
+        let dt = self.view_dtype.get(&tid).copied().unwrap_or(self.dtype);
+        let bytes = self
+            .mem
+            .hbm
+            .borrow()
+            .read_bytes(s * STICK_BYTES, n * dt.bytes_per_elem());
+        Ok(crate::codec::decode(&bytes, n, dt))
+    }
+
+    /// A DOOR STICK'S FULL WORDS BACK — the whole stick encoded at the MODEL
+    /// dtype, the same staging class `read_door_stick` reads the persistent
+    /// sticks back through, so a later forward reads the door's own words
+    /// coherently. These sticks are placements the doors own across steps,
+    /// never gate results. The write refuses a count that disagrees with the
+    /// stick's own derived extent — a door that mis-sizes its per-row window
+    /// must fail loudly, not truncate. f16-exact at the classes the door
+    /// laws name: lane patterns (< 32), ramps (< 2048), the sentinel mark
+    /// (`hidden` itself); lanes past the mark ride the f16 grid, and no door
+    /// read answers them (the row door reads word 0 of each row's sticks
+    /// only).
+    fn write_door_stick(&self, tid: u64, vals: &[f32]) -> Result<(), String> {
+        let s = *self
+            .stick
+            .get(&tid)
+            .ok_or_else(|| format!("door: t{tid} has no resident stick"))?;
+        let n = *self
+            .numel
+            .get(&tid)
+            .ok_or_else(|| format!("door: t{tid} has no derived extent"))?;
+        if vals.len() != n {
+            return Err(format!(
+                "door: t{tid} states {n} elements; the door wrote {} — a per-row window that \
+                 disagrees with the stick's own extent is a mis-derived width, never a \
+                 truncation",
+                vals.len()
+            ));
+        }
+        let bytes = crate::codec::encode(vals, self.dtype);
+        self.mem
+            .hbm
+            .borrow_mut()
+            .write_bytes(s * STICK_BYTES, &bytes);
+        Ok(())
+    }
+
+    /// THE ROW DOOR, HOST FORM — the chained head's embedding-row production
+    /// (#603), the golden's own law (`subtile_ir`'s EmbedRowGather eval arm)
+    /// restated against resident HBM, on `run_fused_decode_attention`'s
+    /// mechanics. FOUR parameters in mint order: the persistent s stick, the
+    /// persistent l stick, the tied weight, the `[width, hidden]` rows out.
+    ///
+    /// ⭐⭐⭐⭐⭐ EVERY ROW IS ITS OWN REQUEST — the chained head is per row at
+    /// EVERY decode width (the per-row mint and the batch ladder): row `r`
+    /// re-joins ITS OWN pick from ITS OWN sticks' words — word 0 of row `r`'s
+    /// s-stick row is the LANE PATTERN's first lane `k·s + 0`, so
+    /// `s = word0/k` EXACT; word 0 of row `r`'s FIRST l-stick row is the LANE
+    /// RAMP's first lane, `l` itself; then `t = s·64 + l` — and walks ITS OWN
+    /// column of the matrix. A door that reads row 0's words for every row
+    /// would hand every request request 0's slab — the batching reward hack,
+    /// this time inside the gate — so the walk is per row, and the width is
+    /// the row OUT's own stated extent (`[width, hidden]`, one gathered row
+    /// per request), never a derivation from the sticks. In the GATE'S MODEL
+    /// the sticks are f16-staged probe values (≈ 0), so every row's walk
+    /// answers t = 0 and gathers `W[:, 0]` — the same row the golden's own
+    /// eval gathers off the same staged values, its `as usize` saturating the
+    /// probe to 0 exactly as this walk does. Both sentinel legs stay, per
+    /// row: the sentinel ramp's word 0 is `hidden` (the zero row), and every
+    /// pick past the matrix's widened width clamps to the zero row, while a
+    /// pick in `[vocab, pad)` reads the pad columns' own zeros.
+    ///
+    /// The l stick is ONE STICK WIDE — `[width·l_sticks, 32]`, row `r`'s
+    /// `l_sticks` sticks contiguous (`chain_l_seed`'s layout, the placement
+    /// the per-stick cut walks) — so row `r`'s first l word sits
+    /// `l_sticks·32` elements past row 0's, at `r·l_row_words` where
+    /// `l_row_words` is the stick's own extent over the width. The s stick
+    /// is `[width, 32]`: row `r`'s first word at `r·s_lanes`.
+    ///
+    /// ⭐ THE WEIGHT WALK IS OFF THE GEMM-STAGED TRANSPOSE. The tied weight is
+    /// gemm-classified (`stage_synth_weights` collects matmul weight inputs
+    /// unconditionally), so its stick is `[cols, rows]` row-major —
+    /// `stick[j·rows + l] = W[l, j]` — and the token's column `W[:, t]` is the
+    /// CONTIGUOUS slice at `t·rows .. t·rows+rows`. Stated off the tensor's own
+    /// dims and the pick, both sentinel legs and the widened-width clamp exactly
+    /// as the eval arm states them (the clamp's extent is the weight view's own
+    /// cols — the region's statement, arriving here as the resident's widest
+    /// shape for the tid; a widest cols past the staged extent reads the memory
+    /// sim's zero-fill, the same zeros the clamp names). LOAD-BEARING AND
+    /// NON-OBVIOUS: that widest shape is `collect_view_shapes`' — widest
+    /// strictly-greater-wins, TIES KEEP THE FIRST — and the door's entry view
+    /// (logical `[hidden, vocab]`) walks before the lm-head matmul's view, so
+    /// the tie between the two `[hidden, vocab]` views lands on the door's
+    /// own: `rows = hidden`, the walk's own law.
+    fn run_embed_row_gather(&self, node: &NodeSpec, k: u32) -> Result<(), String> {
+        let tids: Vec<u64> = node.bindings.iter().map(|b| b.tensor).collect();
+        if tids.len() != 4 {
+            return Err(format!(
+                "embed_row_gather: the mint states FOUR parameters (s stick, l stick, weight, \
+                 row out); this node binds {}",
+                tids.len()
+            ));
+        }
+        if k == 0 {
+            return Err(
+                "embed_row_gather: the payload states k = 0 — the slab entry count the mint \
+                 derived is empty, so the lane pattern s = word0/k has no statement"
+                    .to_string(),
+            );
+        }
+        let (s_tid, l_tid, w_tid, o_tid) = (tids[0], tids[1], tids[2], tids[3]);
+        // ⭐ THE WIDTH, OFF THE ROW OUT'S OWN STATED EXTENT — `[width, hidden]`,
+        // one gathered row per request. The skeleton's Shape-only view states
+        // the tensor's own dims, so the widest-shape walk hands the door the
+        // mint's own statement; a 0-width or non-matrix out is a graph the
+        // mint never made.
+        let o_shape = self.shapes.get(&o_tid).ok_or_else(|| {
+            format!("embed_row_gather: the row out t{o_tid} has no derived shape")
+        })?;
+        if o_shape.len() != 2 || o_shape[0] == 0 {
+            return Err(format!(
+                "embed_row_gather: the row out t{o_tid} states a {}-dim shape {:?}; the walk \
+                 needs the rows' own [width, hidden] with width > 0",
+                o_shape.len(),
+                o_shape
+            ));
+        }
+        let (width, hidden) = (o_shape[0], o_shape[1]);
+        // The weight at its OWN view dtype (an fp8-packed view reads one byte per
+        // element — the same per-tid law the pointer binding and the readback
+        // use), full extent.
+        let shape = self
+            .shapes
+            .get(&w_tid)
+            .ok_or_else(|| format!("embed_row_gather: the weight t{w_tid} has no derived shape"))?;
+        if shape.len() != 2 {
+            return Err(format!(
+                "embed_row_gather: the weight t{w_tid} states a {}-dim shape; the walk needs \
+                 the matrix's own [rows, cols]",
+                shape.len()
+            ));
+        }
+        let (rows, cols) = (shape[0], shape[1]);
+        if rows != hidden {
+            return Err(format!(
+                "embed_row_gather: the row out t{o_tid} states hidden {hidden} but the weight \
+                 t{w_tid} states {rows} rows — the mint states one hidden off the matrix's own \
+                 row count; a disagreement is a graph the mint never made"
+            ));
+        }
+        let w_stick = *self.stick.get(&w_tid).ok_or_else(|| {
+            format!("embed_row_gather: the weight t{w_tid} has no resident stick")
+        })?;
+        let w_dt = self.view_dtype.get(&w_tid).copied().unwrap_or(self.dtype);
+        let nbytes = rows * cols * w_dt.bytes_per_elem();
+        let wbytes = self
+            .mem
+            .hbm
+            .borrow()
+            .read_bytes(w_stick * STICK_BYTES, nbytes);
+        let w = crate::codec::decode(&wbytes, rows * cols, w_dt);
+        // The two index sticks, whole — row r's own words are slices of these.
+        let s_shape = self.shapes.get(&s_tid).ok_or_else(|| {
+            format!("embed_row_gather: the s stick t{s_tid} has no derived shape")
+        })?;
+        if s_shape.len() != 2 || s_shape[0] != width {
+            return Err(format!(
+                "embed_row_gather: the s stick t{s_tid} states {:?} against the row out's \
+                 width {width} — the mint states [width, 32], one stick row per request",
+                s_shape
+            ));
+        }
+        let s_lanes = s_shape[1];
+        let l_numel = *self.numel.get(&l_tid).unwrap_or(&0);
+        if l_numel == 0 || !l_numel.is_multiple_of(width) {
+            return Err(format!(
+                "embed_row_gather: the l stick t{l_tid} states {l_numel} elements over width \
+                 {width} — not a whole per-row window (the mint's [width·l_sticks, 32] layout, \
+                 row r's sticks contiguous)"
+            ));
+        }
+        let l_row_words = l_numel / width;
+        let s_buf = self.read_door_stick(s_tid)?;
+        let l_buf = self.read_door_stick(l_tid)?;
+        let mut out = vec![0.0f32; width * rows];
+        for r in 0..width {
+            // The golden's own saturating float→int arithmetic (`as usize` in
+            // the eval arm, cast BEFORE the divide): a staged probe value ≈
+            // 0.02 answers 0, a negative saturates to 0, and u64 carries the
+            // walk to the clamp without overflow (the gate runs in debug
+            // builds where it would panic).
+            let s = (s_buf[r * s_lanes] as u64) / k as u64;
+            let l = l_buf[r * l_row_words] as u64;
+            // The corrupted-chain refusal, per row — the golden's own assert
+            // (`subtile_ir`'s eval arm): a lane is either below the slab
+            // stick's own width (CHAIN_SLAB_STICK_ELEMS, 64) or the sentinel
+            // mark `hidden` itself; anything else is a corrupted chain, not a
+            // pick, and the door refuses it rather than gather a wrong row.
+            if !(l < 64 || l == rows as u64) {
+                return Err(format!(
+                    "embed_row_gather: row {r}'s lane stick answers {l}, neither a lane below \
+                     the stick width 64 nor the sentinel mark hidden = {rows} — a corrupted \
+                     chain, not a pick"
+                ));
+            }
+            let t = s * 64 + l;
+            if l != rows as u64 && t < cols as u64 {
+                let base = (t as usize) * rows;
+                out[r * rows..(r + 1) * rows].copy_from_slice(&w[base..base + rows]);
+            }
+        }
+        // The rows out decode at the MODEL dtype on readback (the doors' views
+        // are Shape-only, so `meta_for`'s per-tid lookup falls to `self.dtype`).
+        self.write_door_stick(o_tid, &out)?;
+        Ok(())
+    }
+
+    /// THE DECOMPOSE DOOR, HOST FORM — the chained head's pick decompose (#603),
+    /// the golden's own law (`subtile_ir`'s ChainStage eval arm) restated against
+    /// resident HBM. SIX bound tensors in mint order (the skeleton's operand
+    /// list — the node's inputs, then the output): the pick stick, the
+    /// persistent s stick, the persistent l stick, the two decompose tables,
+    /// and the fresh s-value stick out. The tables are UNREAD here — the
+    /// golden's own law ("the table operands are unread by the reference: the
+    /// reference states the decompose's RESULT, never its walk"), staged once
+    /// at load for the card's gather doors and carried by the node's bindings
+    /// like every other operand.
+    ///
+    /// ⭐⭐⭐⭐⭐ EVERY ROW IS ITS OWN REQUEST — the decompose is per row at
+    /// EVERY decode width: row `r` reads ITS OWN pick (word 0 of the pick
+    /// stick's row `r`, an IN-GRAPH tensor at its OWN view dtype — the
+    /// argmax's i32 idx stick, I32, the value below 2^24 exact as decoded)
+    /// and decomposes it into row `r`'s OWN pattern and ramp words. A door
+    /// that decomposes row 0's pick for every row hands every request
+    /// request 0's slab — the batching reward hack, this time inside the
+    /// gate. The width is the s-value OUT's own stated extent
+    /// (`[width, CHAIN_IDX_BLOCK]`), never a derivation from the sticks.
+    ///
+    /// The ruled table's law, per row: `s = t >> 6` clamped to 0 past
+    /// `pad_vocab`, stated as the LANE PATTERN `k·s + (i mod k)` over the
+    /// stick's lanes — the clamp keeps even the sentinel read on slab 0's
+    /// pattern, and the sentinel ramp's lanes name the transposed placement's
+    /// unwritten zero tail (word 0 = `hidden`, the mark a real pick's word 0
+    /// ≤ 63 never collides with). `table_rows` rides the payload for the
+    /// card's staged tables and is unread here by the same law that leaves
+    /// the table operands unread. `hidden` is the payload's own statement
+    /// (the paired gather's width, the same single source the staged tables
+    /// carry) — the lane ramp's modulus `64·(j mod (hidden/64)) + l` and the
+    /// sentinel mark's own value, NEVER derived from the stick's lane count
+    /// (`lanes·64` is one model's hidden by coincidence).
+    ///
+    /// The l stick is ONE STICK WIDE — `[width·l_sticks, 32]`, row `r`'s
+    /// `l_sticks` sticks contiguous (`chain_l_seed`'s layout) — so row `r`'s
+    /// ramp window sits `l_row_words` elements past row 0's, and the ramp's
+    /// own law (`chain_l_stick_ramp` / `chain_l_sentinel_ramp`, the bytes the
+    /// device's own table gathers write) wraps its word index modulo the
+    /// entry count `hidden/64`: at a partial last stick the words past the
+    /// entries re-bind to the row's own first entries, never past the
+    /// placement's sticks.
+    fn run_chain_stage(
+        &self,
+        node: &NodeSpec,
+        pad_vocab: u32,
+        hidden: u32,
+        k: u32,
+    ) -> Result<(), String> {
+        let tids: Vec<u64> = node.bindings.iter().map(|b| b.tensor).collect();
+        if tids.len() != 6 {
+            return Err(format!(
+                "chain_stage: the mint states SIX bound tensors (pick, s stick, l stick, the \
+                 two decompose tables, s-value out); this node binds {}",
+                tids.len()
+            ));
+        }
+        if k == 0 {
+            return Err(
+                "chain_stage: the payload states k = 0 — the slab entry count the mint derived \
+                 is empty, so the lane pattern has no modulus"
+                    .to_string(),
+            );
+        }
+        // The skeleton's operand law: the node's inputs in order, then the
+        // output — (pick, s stick, l stick, s table, l table, out). The two
+        // decompose tables at [3]/[4] are UNREAD here (the golden's own law:
+        // the reference states the decompose's result, never its walk); the
+        // fresh s-value out is [5], not [3].
+        let (pick_tid, s_tid, l_tid, o_tid) = (tids[0], tids[1], tids[2], tids[5]);
+        if hidden == 0 {
+            return Err(
+                "chain_stage: the payload states hidden = 0 — the lane ramp's modulus is the \
+                 entry count hidden/64, and a zero hidden names no entries"
+                    .to_string(),
+            );
+        }
+        if !hidden.is_multiple_of(64) {
+            return Err(format!(
+                "chain_stage: the payload states hidden = {hidden} — the lane ramp's modulus \
+                 hidden/64 is not whole, so the ramp has no statement (every chained hidden \
+                 is a multiple of 64; a graph the mint never made)"
+            ));
+        }
+        // ⭐ THE WIDTH, OFF THE S-VALUE OUT'S OWN STATED EXTENT —
+        // `[width, CHAIN_IDX_BLOCK]`, one decomposed row per request.
+        let o_shape = self
+            .shapes
+            .get(&o_tid)
+            .ok_or_else(|| format!("chain_stage: the s-value out t{o_tid} has no derived shape"))?;
+        if o_shape.len() != 2 || o_shape[0] == 0 {
+            return Err(format!(
+                "chain_stage: the s-value out t{o_tid} states a {}-dim shape {:?}; the \
+                 decompose needs the stick's own [width, CHAIN_IDX_BLOCK] with width > 0",
+                o_shape.len(),
+                o_shape
+            ));
+        }
+        let (width, lanes) = (o_shape[0], o_shape[1]);
+        // The pick stick's own row width — the golden's `pick[r·pick_cols]`
+        // read, mirrored: whatever the producer stated (the argmax's idx stick
+        // is [width, 1]), row r's pick is word 0 of ITS row.
+        let p_shape = self
+            .shapes
+            .get(&pick_tid)
+            .ok_or_else(|| format!("chain_stage: the pick t{pick_tid} has no derived shape"))?;
+        if p_shape.len() != 2 || p_shape[0] != width {
+            return Err(format!(
+                "chain_stage: the pick t{pick_tid} states {:?} against the out's width \
+                 {width} — the mint states one pick row per request",
+                p_shape
+            ));
+        }
+        let pick_cols = p_shape[1];
+        // The two persistent sticks' per-row windows: the s stick is
+        // `[width, 32]` (its row width IS the pattern's lane count,
+        // CHAIN_IDX_BLOCK), the l stick `[width·l_sticks, 32]` (row r's
+        // l_sticks sticks contiguous).
+        let s_numel = *self.numel.get(&s_tid).unwrap_or(&0);
+        if s_numel == 0 || !s_numel.is_multiple_of(width) || s_numel / width != lanes {
+            return Err(format!(
+                "chain_stage: the s stick t{s_tid} states {s_numel} elements over width \
+                 {width} against the out's {lanes} lanes — the mint states [width, \
+                 CHAIN_IDX_BLOCK], one stick row per request"
+            ));
+        }
+        let l_numel = *self.numel.get(&l_tid).unwrap_or(&0);
+        if l_numel == 0 || !l_numel.is_multiple_of(width) {
+            return Err(format!(
+                "chain_stage: the l stick t{l_tid} states {l_numel} elements over width \
+                 {width} — not a whole per-row window (the mint's [width·l_sticks, 32] \
+                 layout, row r's sticks contiguous)"
+            ));
+        }
+        let l_row_words = l_numel / width;
+        // The ramp's modulus — the payload's own hidden, never the stick's
+        // lane count (`chain_l_stick_ramp`'s own law).
+        let entries = hidden / 64;
+        let pick_buf = self.read_door_stick(pick_tid)?;
+        let mut s_pat = vec![0.0f32; s_numel];
+        let mut l_ramp = vec![0.0f32; l_numel];
+        let mut out = vec![0.0f32; width * lanes];
+        for r in 0..width {
+            let t = pick_buf[r * pick_cols] as u64;
+            let s = if t < pad_vocab as u64 {
+                (t >> 6) as u32
+            } else {
+                0
+            };
+            let l = t as u32 & 63;
+            // Row r's OWN pattern words at r·lanes, its OWN ramp words at
+            // r·l_row_words — the layouts `chain_s_seed`/`chain_l_seed` state.
+            for i in 0..lanes as u32 {
+                let v = if t < pad_vocab as u64 {
+                    k * s + i % k
+                } else {
+                    // The sentinel leg: slab-0 pattern (bus safety).
+                    i % k
+                };
+                s_pat[r * lanes + i as usize] = v as f32;
+                out[r * lanes + i as usize] = v as f32;
+            }
+            for j in 0..l_row_words as u32 {
+                // The real ramp `64·(j mod entries) + l`; the sentinel ramp
+                // `hidden + (j mod entries)` (the zero tail's own sticks —
+                // the mod wrap is `chain_l_sentinel_ramp`'s whole safety law
+                // at a partial last stick).
+                let v = if t < pad_vocab as u64 {
+                    64 * (j % entries) + l
+                } else {
+                    hidden + j % entries
+                };
+                l_ramp[r * l_row_words + j as usize] = v as f32;
+            }
+        }
+        self.write_door_stick(s_tid, &s_pat)?;
+        self.write_door_stick(l_tid, &l_ramp)?;
+        // The fresh s-value stick is the node's ONE compared output; its
+        // Shape-only view reads back at the MODEL dtype (`meta_for`'s law), so
+        // it is encoded there. The gate's compare is RELATIVE
+        // (`rel = dsum/gsum.max(1e-6)`), and f16's universal relative error
+        // ≤ 2⁻¹¹ ≈ 4.9e-4 is under CLEAN_TOL 5e-3 at ANY magnitude; s_out is
+        // not ir.result (the exact-0 index law binds only
+        // `tid == ir.result.index()`), so it takes the clean tolerance — the
+        // emulator's modelling of the card's u32 stick, stated, not hidden.
+        self.write_door_stick(o_tid, &out)?;
         Ok(())
     }
 
@@ -935,17 +1468,61 @@ impl ResidentExecutor {
                     let key = self.seg_plan_key(fs.func.operations);
                     // Name the SEGMENT in any failure: a program is hundreds of segments, and the
                     // op-level error alone (an SSA and a shape) does not say which one.
-                    execute_function_in_exec_only(
+                    //
+                    // ⭐ THE PINNED ENTRY — this segment's ONLY LX charge is the program's
+                    // bundle-stated pin window (auditor ruling 2026-10-27): the card holds
+                    // those pins and nothing else for this run (intermediates are HBM synth
+                    // regions), so the emulator charges that window per segment and never
+                    // the tiles. The bytes come from the bundle's own layout — stamped on
+                    // the LaunchProgram at its mint from the placement layout's
+                    // `lx_window_bytes()`. The Option resolves HERE, naming the segment: a
+                    // fused segment in a program with no window is a bypassed load refusal,
+                    // never a silent zero.
+                    let lx_pin_window_bytes =
+                        self.programs[idx].lx_pin_window_bytes.ok_or_else(|| {
+                            format!(
+                                "seg{seg_i} fused @{}: the program stated no LX pin window — the \
+                             load-time refusal was bypassed; a fused segment cannot charge a \
+                             window nobody proved",
+                                fs.func.name
+                            )
+                        })?;
+                    execute_function_in_exec_only_pinned(
                         &self.mem,
                         fs.func.operations,
                         (1, 1, 1),
                         &input_ptrs,
                         Some(key),
+                        lx_pin_window_bytes,
                     )
                     .map_err(|e| format!("seg{seg_i} fused @{}: {e}", fs.func.name))?;
                 }
                 Segment::Native(node) => {
                     let func = self.programs[idx].module.get_function(&node.func)?;
+                    // THE CHAINED HEAD'S DOORS (#603): a door node's KTIR body is a
+                    // STRUCTURAL SKELETON minted for the card-side door assembly (a
+                    // load of the first operand's view, a store to the last), not
+                    // door semantics — so the resident substitutes the HOST door,
+                    // keyed on the node's carried `program` kind (the mint's one
+                    // typed statement, never the func name). No env opt-out, unlike
+                    // attention's oracle below: the door's decomposed path is the
+                    // missing-Strides refusal, not a fallback.
+                    let door_ran = match node.program {
+                        Program::EmbedRowGather { k } => {
+                            self.run_embed_row_gather(node, k)?;
+                            true
+                        }
+                        Program::ChainStage {
+                            pad_vocab,
+                            hidden,
+                            k,
+                            ..
+                        } => {
+                            self.run_chain_stage(node, pad_vocab, hidden, k)?;
+                            true
+                        }
+                        _ => false,
+                    };
                     // FUSED CPU m=1 ATTENTION (default ON; opt out via
                     // KTIR_NO_FUSE_ATTN): when the native segment recognizes as the
                     // decode (m=1) attention island, compute it directly with
@@ -957,7 +1534,7 @@ impl ResidentExecutor {
                     // recognition here is the steady-state path for an isolated m=1
                     // attention node. If recognition fails (a non-decode native
                     // node), fall through to the decomposed grid run below.
-                    let fused = if self.fuse_attn {
+                    let fused = if !door_ran && self.fuse_attn {
                         if let Some(island) =
                             ktir_optimizer::head_rewrite::recognize_head_attention_decode(func)
                         {
@@ -972,8 +1549,8 @@ impl ResidentExecutor {
                     if seg_prof {
                         native_ops = op_type_histogram(func.operations);
                     }
-                    if fused {
-                        // computed in fused path; outputs already resident in HBM.
+                    if fused || door_ran {
+                        // computed in the fused/door path; outputs already resident in HBM.
                     } else {
                         let grid = func.grid;
                         let mut input_ptrs: Vec<(Ssa, Value)> =
@@ -1226,6 +1803,33 @@ impl ResidentExecutor {
         v
     }
 
+    /// The maximum `lx.used` any core's LX reached since this executor was
+    /// built — the RESIDENCY HIGH-WATER MARK over every program run against
+    /// its scratchpads (see [`LXScratchpad::peak_used`]). The per-segment
+    /// clear resets `used`; the peak survives it, so this is the executor's
+    /// own headroom statement, and the bake-time numeric gate logs it: a
+    /// bundle that fits must leave headroom, not fit by zero.
+    pub fn lx_peak_used(&self) -> i64 {
+        self.mem
+            .lx_scratchpads
+            .iter()
+            .map(|p| p.borrow().peak_used)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The scratchpads' per-core capacity (every core is built the same size;
+    /// the max is stated so a heterogeneous build could never silently
+    /// overreport headroom).
+    pub fn lx_capacity(&self) -> i64 {
+        self.mem
+            .lx_scratchpads
+            .iter()
+            .map(|p| p.borrow().capacity)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// COMPUTE-TILE DATAFLOW — the general grid-parallel executor. The raw nodes
     /// are grid=[H,1]: H independent compute-tiles. Run them TILE-major instead of
     /// node-major — each tile streams through its whole per-row chain with NO
@@ -1417,7 +2021,6 @@ impl ResidentExecutor {
     /// Cheap: these are activations (kB) not weights (GB).
     fn zero_non_sources(&mut self) {
         let hbm = self.mem.hbm.borrow_mut();
-        let bpe = self.dtype.bytes_per_elem();
         for (&tid, &s) in &self.stick {
             if self.sources.contains(&tid) {
                 continue;
@@ -1426,6 +2029,15 @@ impl ResidentExecutor {
             if n == 0 {
                 continue;
             }
+            // The stick's OWN view dtype, the same per-tid law the allocation
+            // sizes by — a 4-byte-element stick zeroed at the model dtype's 2
+            // would leave its upper half stale across passes.
+            let bpe = self
+                .view_dtype
+                .get(&tid)
+                .copied()
+                .unwrap_or(self.dtype)
+                .bytes_per_elem();
             // Zero the existing backing bytes IN PLACE — every non-source stick is
             // already allocated (the stick base is its exact allocation base), so
             // fill its bytes rather than allocating a fresh zero `Vec` +
@@ -1487,7 +2099,12 @@ impl ResidentExecutor {
             .ok_or_else(|| format!("t{tid} has no resident stick"))?;
         let n = *self.numel.get(&tid).unwrap_or(&0);
         let shape = self.shapes.get(&tid).cloned().unwrap_or_else(|| vec![n]);
-        Ok((tid, s, n, shape, self.dtype))
+        // The tid's OWN view dtype — the same per-tid law the allocation sizes
+        // by. The model dtype here mis-decoded the first non-f16 result stick
+        // (measured: the argmax's i32 idx answer, i32 bytes read as f16 pairs
+        // — 12360 came back as [0.1338, 0, ...]).
+        let dt = self.view_dtype.get(&tid).copied().unwrap_or(self.dtype);
+        Ok((tid, s, n, shape, dt))
     }
 }
 
@@ -1707,14 +2324,17 @@ fn largest_grid(module: &IRModule<'static>, segments: &[Segment<'static>]) -> us
 /// the weights are uploaded exactly once across all passes.
 ///
 /// `args` and `outputs` are keyed by TENSOR ID (`outputs` empty = the program's
-/// declared results); the returned map is keyed the same way.
+/// declared results); the returned map is keyed the same way. `lx_pin_window_bytes`
+/// is the program's bundle-stated LX pin window — `None` is refused at load, naming
+/// the program (see [`ResidentExecutor::new`]).
 pub fn execute_resident(
     funcs: &[IRFunction<'static>],
     spec: &ProgramSpec,
     args: &[(u64, Arg)],
     outputs: &[u64],
+    lx_pin_window_bytes: Option<u64>,
 ) -> Result<HashMap<u64, Output>, String> {
-    let mut exec = ResidentExecutor::new(funcs, spec)?;
+    let mut exec = ResidentExecutor::new(funcs, spec, lx_pin_window_bytes)?;
     exec.set_sources(args)?;
     // PRODUCTION DEFAULT: only the last token's logits are computed — autoregressive
     // generation samples the next token from the final position, so the other rows

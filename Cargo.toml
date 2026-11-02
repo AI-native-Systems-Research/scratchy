@@ -12,6 +12,7 @@ members = [
     "crates/core/hf-hub-downloader",
     "crates/serving/transport",
     "crates/benches",
+    "crates/benches/power-sampler",
     "crates/cli/scr",
     "crates/e2e",
     "crates/tensors",

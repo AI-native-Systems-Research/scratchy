@@ -1267,10 +1267,6 @@ pub enum RuntimeBindingKind {
     BlockUnrotatedFlags {
         layer: LayerId,
     },
-    /// `[1]` u32 — actual `num_tokens` of this forward, written by
-    /// the worker at `forward()` entry, for a kernel that needs M at
-    /// runtime without a function constant (M varies per call).
-    NumTokensU32,
     /// `[1]` u32 — the in-flight forward's sampled rows' count (`SampleIndices`' length): the
     /// rows the lm_head slice gathers and puts back, and the logits rows a compaction keeps.
     NumSampleRowsU32,
@@ -1719,7 +1715,6 @@ impl RuntimeBindingKind {
             | Self::CuSeqlensQ
             | Self::SeqUsedK
             | Self::SpanIds
-            | Self::NumTokensU32
             | Self::NumSampleRowsU32
             | Self::SampleIndices
             | Self::GdnStateIndices
@@ -2288,6 +2283,13 @@ pub enum LoweringError {
     NoRotaryTable { index: usize },
     /// A gated row whose realization already gates its commands: one command, two gates.
     DoubleGate { index: usize },
+    /// A decode attention at tape index `index` that the TurboQuant split takes binds, past its
+    /// sinks, a buffer at `slot`: the split's partials slot, which that buffer would overlap.
+    SplitPartialsSlotTaken {
+        index: usize,
+        kernel: KernelId,
+        slot: u8,
+    },
     /// A command at tape index `index` writes a cache — KV, a recurrent state — and the row it
     /// lowers from is not one a cache-only forward runs: the liveness walk and the lowering
     /// disagree on what writes a cache.
@@ -2375,6 +2377,15 @@ impl std::fmt::Display for LoweringError {
                 f,
                 "lowering: the row at tape index {index} is gated, and its realization gates a \
                  command of its own"
+            ),
+            Self::SplitPartialsSlotTaken {
+                index,
+                kernel,
+                slot,
+            } => write!(
+                f,
+                "lowering: the {kernel:?} at tape index {index} binds a buffer at slot {slot}, \
+                 the TurboQuant decode split's partials slot"
             ),
             Self::CacheWriterSkipped { index } => write!(
                 f,

@@ -1,0 +1,43 @@
+{
+ "lanes": 1048576,
+ "u_bitcheck": {
+  "diff": 0,
+  "detail": []
+ },
+ "u_in_open_unit": true,
+ "u_chi2_256bins": {
+  "chi2": 226.333984375,
+  "df": 255,
+  "expected_per_bin": 4096.0,
+  "min_bin": 3909,
+  "max_bin": 4280,
+  "p_wilson_hilferty": 0.9015805992206833
+ },
+ "g_card": {
+  "finite": true,
+  "nonfinite_lanes": 0,
+  "mean": 0.576039090519771,
+  "var_pop": 1.6323519747011161,
+  "gumbel_mean": 0.5772156649015329,
+  "gumbel_var": 1.6449340668482264,
+  "mean_abs_err": 0.0011765743817618857,
+  "var_abs_err": 0.012582092147110258
+ },
+ "g_host_ref": {
+  "mean": 0.5777476435755258,
+  "var_pop": 1.6468383784274148
+ },
+ "g_fp16_emulation": {
+  "mean": 0.5777978897094727,
+  "var_pop": 1.6474004983901978,
+  "clamped_lanes_inner": 53,
+  "clamped_lanes_outer": 272,
+  "max_abs_diff_vs_card": 2.6328125,
+  "mean_abs_diff_vs_card": 0.004159808886015526
+ },
+ "exits": {
+  "ui_trunc_diff_vacuous_all_zero": 0,
+  "gi_floor_diff": 0,
+  "gi_trunc_diff": 385613
+ }
+}

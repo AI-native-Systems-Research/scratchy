@@ -179,24 +179,19 @@ pub(crate) fn pool_partition(sb: &SuperDscBundle) -> ExecutorResult<PoolPartitio
     })
 }
 
-/// Point ONE session at the pages a request owns. Needed for EVERY session that forwards for it:
-/// prefill rungs are separate sessions sharing seg2 by alias, each with its own page map.
-#[cfg(feature = "spyre-hw")]
-pub(crate) fn bind_request_pages(
-    session: &mut SuperDscSession,
-    req: &ReqState,
-    ctx: PageMapCtx<'_>,
-) -> ExecutorResult<()> {
-    let at = scratchy_subtile::sdsc_abstract::BatchSlot::solo(&req.kv_hist);
-    bind_request_pages_at(session, req, LaunchSlot::solo(), at, ctx)
-}
-
+/// ⛔ THE SOLO PAGE BIND IS GONE WITH THE SOLO FORWARD: `bind_request_pages` bound the
+/// one-request session's map at the request's own history, and the solo m=1 arm that
+/// called it is DELETED — a generation step is a batch of one on the decode OWNER
+/// through the shared decode path, whose page map is installed per launch slot
+/// (`bind_launch_slot`). A prefill chunk's pages bind through [`bind_chunk_pages`]
+/// below, which covers every page a wider window writes.
+///
 /// Point a PREFILL CHUNK's session at the pages it reads AND every page it writes — `write` is the run
 /// the chunk is about to write ([`ChunkStart::wrote`](scratchy_subtile::sdsc_abstract::ChunkStart::wrote)).
 ///
-/// [`bind_request_pages`] backs only the page holding the history's next slot, which is every page a
-/// chunk of at most one page writes. A wider window's cache write is cut into page parts, each resolving
-/// its own page through this map, so each of those pages needs a host block of its own — and a part
+/// A chunk of at most one page writes only the page holding the history's next slot.
+/// A wider window's cache write is cut into page parts, each resolving its own page
+/// through this map, so each of those pages needs a host block of its own — and a part
 /// whose page lies past the chunk's last real row finds none and is skipped by the launch.
 #[cfg(feature = "spyre-hw")]
 pub(crate) fn bind_chunk_pages(
@@ -240,7 +235,8 @@ pub(crate) fn bind_chunk_pages(
 #[cfg(feature = "spyre-hw")]
 /// EVERY PRINT-ONLY FLAG THIS FILE READS ON A PER-STEP OR PER-LAUNCH PATH, RESOLVED ONCE PER PROCESS.
 ///
-/// ⛔⛔⛔ `std::env::var_os` LOCKS THE ENVIRONMENT AND WALKS IT, and these sit in `bind_request_pages_at` (per
+/// ⛔⛔⛔ `std::env::var_os` LOCKS THE ENVIRONMENT AND WALKS IT, and these sit in the page-map
+/// installs (per
 /// request per step), `run_prefill_batch` (per prefill chunk AND per batched decode step — six of them) and
 /// `superdsc_forward_chunk`. That is ~10 environment walks per token here, on top of the hundreds
 /// `fold_plan::reps` and `trace_pass` were doing per op and per pass. Host time paid every token to answer a
@@ -255,7 +251,10 @@ pub(crate) fn bind_chunk_pages(
 #[cfg(feature = "spyre-hw")]
 pub(crate) struct Flags {
     pub(crate) phase_time: bool,
-    pub(crate) timing: bool,
+    // ⛔ NO `timing` ANY MORE: its only reader was the SOLO step-timing line, and the
+    // solo arm is deleted — a step's host segments now land in `step_segs`, whose
+    // print gate is `--bench` in the CLI, never an env var. A flag nothing reads is
+    // a lie about what the program can do.
 }
 
 // ⛔ `sendnn`-ONLY, restored from 8bd5c755b. My branch was cut BEFORE that commit added
@@ -268,7 +267,6 @@ pub(crate) fn flags() -> &'static Flags {
         let on = |k: &str| std::env::var_os(k).is_some();
         Flags {
             phase_time: on("SCRATCHY_SDSC_PHASE_TIME"),
-            timing: on("SCRATCHY_SUPERDSC_TIMING"),
         }
     })
 }
@@ -307,52 +305,6 @@ pub(crate) fn bind_launch_slot(
         .set_block_table(
             scratchy_target_spyre::fold_plan::LaunchSlotIdx::of_launch(slot.index() as i64),
             i64::from(at.get()),
-            &pages,
-        )
-        .map_err(|e| werr(format!("superdsc paged: set_block_table: {e}")))
-}
-
-/// Install request `slot` of a batch: its page map and the KV slot its next token writes at.
-///
-/// Called once per scheduled request before a batched forward.
-///
-/// ⛔ `at` IS A [`BatchSlot`], NOT A POSITION, and that is the whole point of the type: this call is the
-/// only way a write slot reaches the device, and it now cannot be reached with a token count. A batch
-/// binds every one of its requests at the SAME slot — a launch resolves one slot shift for every trip
-/// inside it, so per-request slots mean one launch per request — and `BatchSlot` is the value that can
-/// only have come from the live requests' own histories.
-#[cfg(feature = "spyre-hw")]
-pub(crate) fn bind_request_pages_at(
-    session: &mut SuperDscSession,
-    req: &ReqState,
-    slot: LaunchSlot,
-    at: scratchy_subtile::sdsc_abstract::BatchSlot,
-    ctx: PageMapCtx<'_>,
-) -> ExecutorResult<()> {
-    let pos = i64::from(at.get());
-    if !session.is_paged() {
-        return Ok(());
-    }
-    // ⛔ THERE IS NO ROW TO FETCH FIRST. This began by reading the request's `PagedKv` and refusing if it
-    // held none — "request holds no KV row" — because the map's write page came from that row's reserved
-    // pages. The map is now a function of the host's list and this request's history alone, so there is no
-    // pre-forward state to be missing and no such refusal to make.
-    let want = RowPages::holding(SlotCount::new(at.get().saturating_add(1)));
-    let map = req.page_map(ctx, want).ok_or_else(|| {
-        werr(format!(
-            "superdsc paged: cannot map {} page(s): the host granted {} block(s). Every page holding a key \
-             must be a host block — the scheduler allocates this request's own pages plus ONE for the \
-             batch's shared write page, so the PAGE COUNT here is authoritative and the shortfall is in \
-             that allocation (`KvExtent::span_now`, `Request::kv_inflight_slots`)",
-            want.get(),
-            ctx.host.len(),
-        ))
-    })?;
-    let pages: Vec<i64> = map.as_i64();
-    session
-        .set_block_table(
-            scratchy_target_spyre::fold_plan::LaunchSlotIdx::of_launch(slot.index() as i64),
-            pos,
             &pages,
         )
         .map_err(|e| werr(format!("superdsc paged: set_block_table: {e}")))

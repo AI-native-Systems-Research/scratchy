@@ -26,6 +26,8 @@ Standard library only.
 
 import argparse
 import base64
+import binascii
+import gzip
 import json
 import re
 import subprocess
@@ -48,6 +50,9 @@ REPLY_MARK = "<!-- metal-round reply {id} -->"
 OTHER_ENGINES = ["mlx_lm", "ollama", "omlx", "omlx_tq", "vllm_metal", "llama_cpp", "mistralrs"]
 
 FENCE = re.compile(r"```json[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S)
+# A run gzipped and base64'd, so one that keeps every request (50 a cell) still fits a comment's
+# 64 KB: the metal-bench skill posts it so. Line breaks inside the block are ignored.
+PACKED = re.compile(r"```json\+gzip\+base64[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S)
 UTC = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -120,11 +125,19 @@ def stamp(run):
 
 
 def runs_in(body):
-    """The JSON blocks in a comment, parsed; a block that does not parse is an error string."""
+    """The JSON blocks in a comment, plain or packed (PACKED), parsed; a block that does not parse
+    is an error string."""
     out = []
     for block in FENCE.findall(body or ""):
         try:
             out.append(json.loads(block))
+        except json.JSONDecodeError as e:
+            out.append(f"its JSON does not parse ({e})")
+    for block in PACKED.findall(body or ""):
+        try:
+            out.append(json.loads(gzip.decompress(base64.b64decode("".join(block.split()), validate=True))))
+        except (binascii.Error, OSError, EOFError, UnicodeDecodeError) as e:
+            out.append(f"its packed run does not unpack ({e})")
         except json.JSONDecodeError as e:
             out.append(f"its JSON does not parse ({e})")
     return out

@@ -12,12 +12,16 @@
 // (sequence, key head), split by the value heads it serves so the machine fills (a key head's
 // value heads are independent: each channel's conv and each value dim's scan state are its own).
 // Every sub-threadgroup computes its key head's q and k conv into its own threadgroup memory
-// (the norms and the scan read them); only the first persists their state, and each value
-// channel's state is persisted by its owner alone.
+// (the norms and the scan read them), each from their seed; each value channel's state is
+// persisted by its owner alone, and the q and k channels' by `gdn_verify_qk_state`, the command
+// after, a barrier apart: a threadgroup reading a q or k seed would otherwise race the one
+// overwriting it, since no ordering holds between threadgroups (#914 made every verify step's
+// greedy output vary run to run).
 //   1. the conv, a thread a channel (the head's q and k, and this threadgroup's value head's v),
-//      walking the sequence's rows: each row's output into threadgroup memory, a verify row's
-//      window into its draft lane's checkpoint and its conv row into the lane's records, the ring
-//      after the last row into the slot — `gdn_conv1d_varlen`'s seed, checkpoints, saves and ring;
+//      walking the sequence's rows: each row's output into threadgroup memory and a verify row's
+//      conv row into the lane's records; a value channel's verify rows' windows into its draft
+//      lane's checkpoints and its ring after the last row into the slot — `gdn_conv1d_varlen`'s
+//      seed, checkpoints, saves and ring;
 //   2. each row's q and k norms (a simdgroup a row) and each row's value head's gates, a verify
 //      row's into the records; a replayed row's k norm, from its record;
 //   3. the scan, a simdgroup per value dim at a time, BATCH state rows in flight, lanes splitting
@@ -38,7 +42,8 @@
 // kernel width, 6 the norm's eps, 7 the rows a sequence (GDN_VER_ROWS), 8 the model's drafts
 // (`SPEC_DRAFTS`, the lanes' layout; 0: the lanes, buffers 14 and 15, unread).
 // Dispatch: grid (1, num_k_heads * R, num_seqs) — R = num_v_heads / num_k_heads value heads a
-// key head serves, one threadgroup each — threads (1024, 1, 1).
+// key head serves, one threadgroup each — threads (1024, 1, 1); then `gdn_verify_qk_state`, grid
+// (1, num_k_heads, num_seqs), threads (1024, 1, 1), its bindings the same.
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -102,6 +107,48 @@ static_assert(ROWS * (CHANNELS + RV) * 4u + (2u * ROWS + REPLAY_MAX + 3u * ROWS)
 inline uint gdn_ver_channel(uint h, uint i, uint c) {
   return c < 2u * K ? (c < K ? h * K + c : KEY_DIM + h * K + c - K)
                     : 2u * KEY_DIM + (h * R + i) * Vd + c - 2u * K;
+}
+
+// The conv state channel `c` of sequence `n` leaves after its step's `rows` rows from `t0` on,
+// walked from its `seed`: a verify row's window into the draft lane's checkpoint, each save's
+// window into its snapshot, and the ring after the last row into the slot (`gdn_state.h`).
+template <typename T>
+inline void gdn_ver_persist_conv(thread const float* seed, uint c, uint rows, uint t0, uint drafts,
+                                 int slot, int2 saves_through, GdnSeqSlots seq_slots,
+                                 device float* lane_ptr, device float* conv_state,
+                                 const device T* qkv) {
+  auto ring = [&](int s) { return conv_state + (uint(s) * CONV_DIM + c) * STATE_LEN; };
+  float window[8];
+  for (uint ki = 0; ki < STATE_LEN; ki++) {
+    window[ki] = seed[ki];
+  }
+  for (uint t = 0; t < rows; t++) {
+    for (uint ki = 0; ki + 1 < STATE_LEN; ki++) {
+      window[ki] = window[ki + 1];
+    }
+    if (STATE_LEN > 0u) {
+      window[STATE_LEN - 1u] = float(qkv[(t0 + t) * CONV_DIM + c]);
+    }
+    if (drafts > 0u && t <= drafts) {
+      for (uint ki = 0; ki < STATE_LEN; ki++) {
+        lane_ptr[t * CONV_DIM * STATE_LEN + ki] = window[ki];
+      }
+    }
+    for (uint sv = 0; sv < GDN_SAVES; sv++) {
+      if (gdn_saves_after(saves_through, sv, int(t))) {
+        device float* snap = ring(seq_slots.saves[sv].y);
+        for (uint ki = 0; ki < STATE_LEN; ki++) {
+          snap[ki] = window[ki];
+        }
+      }
+    }
+  }
+  // The ring: the last STATE_LEN inputs of `[seed ++ x]`.
+  device float* state = ring(slot);
+  for (uint ki = 0; ki < STATE_LEN; ki++) {
+    const int p = int(rows) + int(ki) - int(STATE_LEN);
+    state[ki] = p < 0 ? seed[rows + ki] : float(qkv[(t0 + uint(p)) * CONV_DIM + c]);
+  }
 }
 
 template <typename T>
@@ -169,10 +216,11 @@ template <typename T>
   // 1. The conv, a thread a channel.
   if (tid < CHANNELS) {
     const uint c = gdn_ver_channel(h, i, tid);
-    // This channel's state is this threadgroup's to persist: a v channel's only by its owner,
-    // a q or k channel's only by the key head's first sub-threadgroup (the others still compute
-    // the conv — their norms and scan read it).
-    const bool persists = tid >= 2u * K || i == 0u;
+    // A v channel is its owner's alone: it records its rows and persists its state. A q or k
+    // channel is every sub-threadgroup's (their norms and scans read its conv): the first records
+    // its rows, and `gdn_verify_qk_state` persists its state once every one has read its seed.
+    const bool owns = tid >= 2u * K;
+    const bool records = owns || i == 0u;
     float wlocal[8], window[8], seed[8];
     for (uint ki = 0; ki <= STATE_LEN; ki++) {
       wlocal[ki] = float(conv_w[c * GDN_VER_CONV_KERNEL + ki]);
@@ -201,30 +249,13 @@ template <typename T>
       if (STATE_LEN > 0u) {
         window[STATE_LEN - 1u] = x_t;
       }
-      if (persists && drafts > 0u && t <= drafts) {
-        for (uint ki = 0; ki < STATE_LEN; ki++) {
-          lane_ptr[t * CONV_DIM * STATE_LEN + ki] = window[ki];
-        }
+      if (records && drafts > 0u && t <= drafts) {
         recorded[t * REC_LEN + c] = y;
       }
-      if (persists) {
-        for (uint sv = 0; sv < GDN_SAVES; sv++) {
-          if (gdn_saves_after(saves_through, sv, int(t))) {
-            device float* snap = ring(seq_slots.saves[sv].y);
-            for (uint ki = 0; ki < STATE_LEN; ki++) {
-              snap[ki] = window[ki];
-            }
-          }
-        }
-      }
     }
-    // The ring: the last STATE_LEN inputs of `[seed ++ x]`.
-    if (persists) {
-      device float* state = ring(slot);
-      for (uint ki = 0; ki < STATE_LEN; ki++) {
-        const int p = int(rows) + int(ki) - int(STATE_LEN);
-        state[ki] = p < 0 ? seed[rows + ki] : float(qkv[(t0 + uint(p)) * CONV_DIM + c]);
-      }
+    if (owns) {
+      gdn_ver_persist_conv<T>(seed, c, rows, t0, drafts, slot, saves_through, seq_slots,
+                              lane_ptr, conv_state, qkv);
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -424,8 +455,64 @@ template <typename T>
   }
 }
 
+// gdn_verify_qk_state — the conv state a gdn_verify step's q and k channels leave, the command
+// after it: every one of its threadgroups has read their seed by then. A threadgroup a (sequence,
+// key head), a thread a q or k channel of it; gdn_verify's bindings, of which it reads the rows,
+// the slots, the step codes and the conv state and lanes.
+template <typename T>
+[[kernel]] void gdn_verify_qk_state(
+    device       T*     out           [[buffer(0)]],
+    const device T*     qkv           [[buffer(1)]],
+    const device T*     z             [[buffer(2)]],
+    const device T*     a             [[buffer(3)]],
+    const device T*     b             [[buffer(4)]],
+    const device T*     conv_w        [[buffer(5)]],
+    device       float* conv_state    [[buffer(6)]],
+    device       half*  ssm_state     [[buffer(7)]],
+    const device int*   cu_seqlens    [[buffer(8)]],
+    const device GdnSeqSlots* state_indices [[buffer(9)]],
+    const device uint*  gdn_step      [[buffer(10)]],
+    const device float* a_log         [[buffer(11)]],
+    const device T*     dt_bias       [[buffer(12)]],
+    const device float* norm_w        [[buffer(13)]],
+    device       float* conv_lanes    [[buffer(14)]],
+    device       float* ssm_lanes     [[buffer(15)]],
+    uint3 tgid     [[threadgroup_position_in_grid]],
+    uint  tid      [[thread_index_in_threadgroup]])
+{
+  const uint n = tgid.z;
+  const uint h = tgid.y;
+  const int bos = cu_seqlens[n];
+  const int seq_len = cu_seqlens[n + 1] - bos;
+  const GdnSeqSlots seq_slots = state_indices[n];
+  const int slot = seq_slots.slot;
+  if (seq_len <= 0 || slot < 0 || tid >= 2u * K) {
+    return;
+  }
+  const uint rows = min(uint(seq_len), ROWS);
+  const uint code = gdn_step[n];
+  const uint start = code & 0xffu;
+  const bool fresh = start == 1u;
+  const uint drafts = GDN_VER_DRAFTS == 0u ? 0u : (code >> 8) & 0xffu;
+  const bool replays = GDN_VER_DRAFTS > 0u && start >= 2u;
+  const uint lane_ix = code >> 17;
+  const uint c = gdn_ver_channel(h, 0u, tid);
+  // The seed gdn_verify read: the slot's ring, a restore's snapshot, or a replay's checkpoint.
+  device float* lane_ptr = conv_lanes + (lane_ix * (GDN_VER_DRAFTS + 1u) * CONV_DIM + c) * STATE_LEN;
+  const device float* start_ptr =
+      replays ? lane_ptr + (start - 2u) * CONV_DIM * STATE_LEN
+              : conv_state + (uint(gdn_start_slot(seq_slots, start)) * CONV_DIM + c) * STATE_LEN;
+  float seed[8];
+  for (uint ki = 0; ki < STATE_LEN; ki++) {
+    seed[ki] = fresh ? 0.0f : start_ptr[ki];
+  }
+  gdn_ver_persist_conv<T>(seed, c, rows, uint(bos), drafts, slot, gdn_saves_through(seq_slots),
+                          seq_slots, lane_ptr, conv_state, qkv);
+}
+
 #define INST_GDN_VERIFY(dtype_tag, mtl_type) \
-  SCRATCHY_KERNEL(gdn_verify_##dtype_tag, gdn_verify<mtl_type>)
+  SCRATCHY_KERNEL(gdn_verify_##dtype_tag, gdn_verify<mtl_type>) \
+  SCRATCHY_KERNEL(gdn_verify_qk_state_##dtype_tag, gdn_verify_qk_state<mtl_type>)
 
 INST_GDN_VERIFY(f16,  half)
 INST_GDN_VERIFY(bf16, bfloat)

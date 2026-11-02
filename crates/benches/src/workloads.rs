@@ -16,6 +16,7 @@ use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
 /// One dataset task, ready to send.
+#[derive(Clone)]
 pub(crate) struct Task {
     /// The plain request's chat messages, in order: `{"role", "content"}`.
     pub(crate) messages: Vec<serde_json::Value>,
@@ -28,6 +29,7 @@ pub(crate) struct Task {
 }
 
 /// How a task's answer is scored: a text comparison, so it costs no run time.
+#[derive(Clone)]
 pub(crate) enum Score {
     /// The answer, or one of its aliases, is in the response, else token F1 at least 0.5 (the
     /// multi-document QA benchmarks' rule), as `rule` says its source scores it.
@@ -38,6 +40,8 @@ pub(crate) enum Score {
     },
     /// LongBench v2: the letter the response picks, A to D.
     Choice(String),
+    /// Nothing to score: a chat turn or a synthetic question with no single right answer.
+    None,
 }
 
 impl Score {
@@ -53,12 +57,20 @@ impl Score {
                 format!("{answer} (or {})", aliases.join(", "))
             }
             Score::Choice(letter) => letter.clone(),
+            Score::None => String::new(),
         }
     }
 
-    /// 1.0 for a right answer, 0.0 for a wrong one.
+    /// Whether the task has a right answer to score.
+    pub(crate) fn scored(&self) -> bool {
+        !matches!(self, Score::None)
+    }
+
+    /// 1.0 for a right answer, 0.0 for a wrong one; 0.0 for a task with nothing to score, which
+    /// [`Score::scored`] leaves out of accuracy.
     pub(crate) fn score(&self, response: &str) -> f64 {
         match self {
+            Score::None => 0.0,
             // Each source scored as its own benchmark scores it ([`crate::scoring`]), whether or
             // not this task has aliases.
             Score::Contains {
@@ -202,6 +214,75 @@ impl Task {
             "input": input,
         }}))
     }
+}
+
+/// The longest ShareGPT reply a multi-turn task asks for, in tokens: a turn's cap is its recorded
+/// reply's length, at most this.
+pub(crate) const CHAT_MAX_TOKENS: usize = 256;
+
+/// The turns per ShareGPT conversation a multi-turn workload sends: the first `CHAT_TURNS`.
+pub(crate) const CHAT_TURNS: usize = 4;
+
+/// One ShareGPT conversation as multi-turn tasks: turn k sends the human and gpt turns before it,
+/// as the dataset recorded them, then human turn k. So every engine gets the same prompts, and
+/// turn k's prompt opens with turn k-1's, for the cache to serve. Its answer cap is the recorded
+/// reply's length in tokens (`reply_tokens`), at most [`CHAT_MAX_TOKENS`]. The caller sends them
+/// as one unit, in order.
+pub(crate) fn chat_tasks(
+    turns: &[(String, String)],
+    reply_tokens: &dyn Fn(&str) -> usize,
+) -> Vec<Task> {
+    let mut history: Vec<serde_json::Value> = Vec::new();
+    let mut tasks = Vec::new();
+    for (human, gpt) in turns.iter().take(CHAT_TURNS) {
+        history.push(serde_json::json!({"role": "user", "content": human}));
+        tasks.push(Task {
+            messages: history.clone(),
+            spans_input: None,
+            max_tokens: reply_tokens(gpt).clamp(1, CHAT_MAX_TOKENS),
+            score: Score::None,
+        });
+        history.push(serde_json::json!({"role": "assistant", "content": gpt}));
+    }
+    tasks
+}
+
+/// The answer cap of a shared-prefix question: a short answer.
+pub(crate) const SHARED_PREFIX_MAX_TOKENS: usize = 32;
+
+/// A synthetic shared-prefix workload, as vLLM's `prefix_repetition` and SGLang's
+/// `generated-shared-prefix` build it: `groups` system prompts of `prefix` text, each with
+/// `per_group` short questions. With `reuse` false, every question gets a system prompt of its
+/// own of the same length: the control, whose cache saves nothing. `text(stream)` is seeded text
+/// for that stream ([`crate::datasets::seeded_text`]): the prefix and each question its own.
+pub(crate) fn shared_prefix_tasks(
+    groups: usize,
+    per_group: usize,
+    reuse: bool,
+    prefix: &dyn Fn(u64) -> String,
+    question: &dyn Fn(u64) -> String,
+) -> Vec<Task> {
+    let mut tasks = Vec::with_capacity(groups * per_group);
+    for g in 0..groups {
+        for q in 0..per_group {
+            let n = (g * per_group + q) as u64;
+            let system = if reuse {
+                prefix(g as u64)
+            } else {
+                prefix(1_000_000 + n)
+            };
+            tasks.push(Task {
+                messages: vec![
+                    serde_json::json!({"role": "system", "content": system}),
+                    serde_json::json!({"role": "user", "content": question(n)}),
+                ],
+                spans_input: None,
+                max_tokens: SHARED_PREFIX_MAX_TOKENS,
+                score: Score::None,
+            });
+        }
+    }
+    tasks
 }
 
 /// `n` tasks, seeded: the same tasks for the same seed, on every engine and every run. Drawn
@@ -390,6 +471,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Turn k of a conversation sends the recorded turns before it and then its own human turn, so
+    /// turn k's prompt opens with turn k-1's; its cap is the recorded reply's length, bounded.
+    #[test]
+    fn a_conversations_turns_carry_its_recorded_history() {
+        let turns: Vec<(String, String)> = (0..6)
+            .map(|k| (format!("question {k}"), "reply ".repeat(k * 200)))
+            .collect();
+        let words = |t: &str| t.split_whitespace().count();
+        let tasks = chat_tasks(&turns, &words);
+        assert_eq!(tasks.len(), CHAT_TURNS, "the first CHAT_TURNS turns");
+        assert_eq!(tasks[0].messages.len(), 1);
+        assert_eq!(
+            tasks[2].messages.len(),
+            5,
+            "two exchanges, then the question"
+        );
+        assert_eq!(tasks[2].messages[1]["role"], "assistant");
+        assert_eq!(tasks[2].messages[1]["content"], turns[0].1);
+        assert_eq!(tasks[2].messages[4]["content"], "question 2");
+        assert_eq!(
+            tasks[1].messages[..1],
+            tasks[2].messages[..1],
+            "turn 2 opens with turn 1"
+        );
+        assert_eq!(
+            tasks[0].max_tokens, 1,
+            "an empty recorded reply still asks for a token"
+        );
+        assert_eq!(tasks[1].max_tokens, 200);
+        assert_eq!(tasks[3].max_tokens, CHAT_MAX_TOKENS, "bounded");
+        assert!(!tasks[0].score.scored());
+    }
+
+    /// A group's questions share its system prompt; the control gives each its own.
+    #[test]
+    fn shared_prefix_shares_its_prompt_and_the_control_does_not() {
+        let text = |s: u64| format!("text {s}");
+        let shared = shared_prefix_tasks(2, 3, true, &text, &text);
+        assert_eq!(shared.len(), 6);
+        let system = |t: &Task| t.messages[0]["content"].clone();
+        assert_eq!(system(&shared[0]), system(&shared[2]), "one group");
+        assert_ne!(system(&shared[0]), system(&shared[3]), "two groups");
+        assert_ne!(
+            shared[0].messages[1], shared[1].messages[1],
+            "each question its own"
+        );
+        let control = shared_prefix_tasks(2, 3, false, &text, &text);
+        let prompts: std::collections::HashSet<_> = control.iter().map(system).collect();
+        assert_eq!(prompts.len(), 6, "the control shares nothing");
+        assert_eq!(
+            control[4].messages[1], shared[4].messages[1],
+            "the same questions"
+        );
     }
 
     #[test]

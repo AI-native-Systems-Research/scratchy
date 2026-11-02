@@ -300,6 +300,19 @@ jobs:
       - name: Compiled no crate macos-scope skips for
         run: scripts/ci-macos-scope.sh lock
 
+  # The energy sampler on macOS 27, whose reader (the CLPC counters) differs from 26's. GitHub's
+  # macOS 27 image is the `xcode-27` label (preview).
+  power-sampler-macos-27:
+    name: macos-arm64 27 (power sampler)
+    needs: macos-scope
+    if: ${{ !cancelled() && !(needs.macos-scope.result == 'success' && needs.macos-scope.outputs.macos == 'false') }}
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Power sampler
+        run: scripts/ci-power-sampler.sh
+
   macos-metal-tests:
     name: macos-arm64 (metal tests)
     needs: macos-scope
@@ -351,6 +364,10 @@ jobs:
 
       - name: KTIR optimizer tests
         run: cargo test -p ktir-optimizer
+
+      # The Metal matrix's energy sampler on macOS 26; power-sampler-macos-27 runs it on 27.
+      - name: Power sampler
+        run: scripts/ci-power-sampler.sh
 
       # Variant-selection gates (#202). These decide WHICH compiled model
       # variant claims a checkpoint, and both halves fail OPEN — a broken
@@ -507,6 +524,17 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (spyre triton)
         run: cargo clippy -p scratchy-target-spyre --features spyre-emu --all-targets -- -D warnings
+      # The card surface: what `src/lib.rs` gates on `spyre-hw` (superdsc_exec and the device
+      # runtime) compiles under no other step — the one above lints `spyre-emu`, and the
+      # linux-workspace clippy builds the target featureless — so it rotted between card
+      # runs, and #299's E0277s reached main green (#553). Lib only: the examples need a card
+      # host. Check-only, so the SDK's C++ shim is skipped as in the linux-workspace job; flex-rs,
+      # the shim's Rust side, is linted with it. The worker's hw surface can't join: its
+      # scratchy-models build script links flex-rs, which needs the SDK's libsenlib.
+      - name: Clippy (spyre-hw card surface)
+        env:
+          SCRATCHY_SKIP_SENDNN_CXX: "1"
+        run: cargo clippy -p scratchy-target-spyre -p flex-rs --features scratchy-target-spyre/spyre-hw -- -D warnings
       - name: Test (spyre triton golden + emu execution)
         run: cargo test -p scratchy-target-spyre --features spyre-emu --lib --tests
       # The worker's spyre modules compile under no other CI job:

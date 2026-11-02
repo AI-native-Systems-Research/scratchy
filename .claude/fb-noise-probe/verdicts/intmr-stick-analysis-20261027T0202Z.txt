@@ -1,0 +1,7 @@
+intmr_col_add — the operand word the card used, per output stick (row r, stick k):
+ row 0: row0 row1 row0 row1 row0 row1 row0 row1 row0 row1 row0 row1 row0 row1 row0 row1
+ row 1: row0 row1 row0 row1 row0 row1 row0 row1 row0 row1 row0 row1 row0 row1 row0 row1
+
+LAW: output stick k (within the row) reads operand row k mod 2 — for EVERY output
+row. The word is a function of the stick index alone, never of the output row.
+At rows=1 (intb/intm) k mod 1 = 0 always, so the one-row legs could not see it.

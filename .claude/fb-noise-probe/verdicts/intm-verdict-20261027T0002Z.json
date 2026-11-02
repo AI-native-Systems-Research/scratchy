@@ -1,0 +1,8 @@
+{
+  "probe": "intmul_bcast",
+  "form": "muli32toi32, [1,512] dense SENUINT32 + [1,1] Col-broadcast",
+  "lanes": 512,
+  "b_word": "0x85EBCA77",
+  "mismatches": 0,
+  "pass": true
+}

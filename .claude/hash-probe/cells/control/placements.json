@@ -1,0 +1,39 @@
+{
+  "segment_bytes": [
+    9437184,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "places": [
+    {
+      "tid": 0,
+      "role": "Activation",
+      "segment": 0,
+      "bank": 0,
+      "offset": 0,
+      "size": 1048576
+    },
+    {
+      "tid": 1,
+      "role": "Activation",
+      "segment": 0,
+      "bank": 0,
+      "offset": 4194304,
+      "size": 1048576
+    },
+    {
+      "tid": 2,
+      "role": "Logits",
+      "segment": 0,
+      "bank": 0,
+      "offset": 8388608,
+      "size": 1048576
+    }
+  ],
+  "synth": [],
+  "scalarmul_scales": []
+}

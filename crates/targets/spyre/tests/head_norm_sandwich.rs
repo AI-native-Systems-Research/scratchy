@@ -278,8 +278,12 @@ fn windowed_rmsnorm_matches_the_unfused_sandwich() {
             );
 
             // Run the whole graph on the emulator and compare BOTH the sandwich's raw
-            // output and the sink reading it.
-            let groups = superdsc::ktir_groups(&ops, superdsc::FoldGrouping::Split).unwrap();
+            // output and the sink reading it. The window is stated EXPLICITLY: this
+            // hand-lowered test graph minted no LX pins, so the budget its fused
+            // segments run under is zero (auditor ruling 2026-10-27 — a program
+            // without a stated window is refused, never silently charged).
+            let groups =
+                superdsc::ktir_groups(&ops, superdsc::FoldGrouping::Split, Some(0)).unwrap();
             let results = [flat as u64, ir.result.index() as u64];
             let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
                 &[(&groups, &results)],

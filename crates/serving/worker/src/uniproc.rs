@@ -217,6 +217,16 @@ impl Executor for UniProcExecutor {
         self.worker.shutdown();
         self.is_shutdown = true;
     }
+
+    /// ⭐ #32 (C) — straight through to the worker: it is the thing that owns
+    /// the in-flight queue a knock asks to drain.
+    fn set_drain_door(&mut self, door: scratchy_serving_engine::core_client::DrainDoor) {
+        self.worker.set_drain_door(door);
+    }
+
+    fn drain_until(&mut self, cell: &std::sync::Arc<scratchy_serving_engine::executor::DrainCell>) {
+        self.worker.drain_until(cell);
+    }
 }
 
 // ---------------------------------------------------------------------------

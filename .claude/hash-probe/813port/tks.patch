@@ -1,0 +1,717 @@
+diff --git a/crates/triton/triton-ktir-superdsc/examples/bake_py.rs b/crates/triton/triton-ktir-superdsc/examples/bake_py.rs
+index dd3e163eb1..e4667a2eb0 100644
+--- a/crates/triton/triton-ktir-superdsc/examples/bake_py.rs
++++ b/crates/triton/triton-ktir-superdsc/examples/bake_py.rs
+@@ -43,10 +43,20 @@ fn main() {
+         std::process::exit(2);
+     }
+     let (config, out_dir) = (&args[0], PathBuf::from(&args[1]));
+-    let Some((kspec, grid, program)) = cases::case(config) else {
++    let Some((kspec, grid, door)) = cases::case(config) else {
+         eprintln!("no case for `{config}`");
+         std::process::exit(2);
+     };
++    // A `None` door kind is a named stage, not an oversight: the configuration's kernel is
++    // stated in generic ops whose SuperDSC lowering does not exist yet (see the `case` arm),
++    // and this driver is THE door driver -- guessing a kind here would bake the wrong body.
++    let Some(program) = door else {
++        eprintln!(
++            "`{config}` has no KTIR→SuperDSC door yet -- its kernel is stated in generic ops \
++             (see the case row). Numeric legs: triton-numeric."
++        );
++        std::process::exit(2);
++    };
+ 
+     macro_rules! refused {
+         ($stage:expr, $err:expr) => {{
+diff --git a/crates/triton/triton-ktir-superdsc/src/cases.rs b/crates/triton/triton-ktir-superdsc/src/cases.rs
+index f9e7bab121..ea38341ba0 100644
+--- a/crates/triton/triton-ktir-superdsc/src/cases.rs
++++ b/crates/triton/triton-ktir-superdsc/src/cases.rs
+@@ -79,6 +79,10 @@ pub const ALL: &[&str] = &[
+     // partitioned parameters. The `to_ktir.rs` count fix's gate.
+     "attention_banded_fold",
+     "attention_banded_batch",
++    // ⭐ THE LADDER-FORM SAMPLER -- through the whole-function door (every op in the kernel
++    // crosses a generic arm; see the `case` row). The door-kind field carries a placeholder
++    // the walk never reads; the per-`Program` run refuses that row loudly at its arity check.
++    "argmax_first_max",
+ ];
+ 
+ pub fn root() -> PathBuf {
+@@ -115,11 +119,20 @@ pub fn spec(fixture: &str, kernel: &str, ptrs: &[(&str, &str)], ces: &[(&str, Va
+     }
+ }
+ 
+-/// One configuration: which `.py`, which kernel, the constexprs, the grid, and the node kind.
++/// One configuration: which `.py`, which kernel, the constexprs, the grid, and the door kind.
+ ///
+ /// The constexprs and grid are the SAME VALUES as `test/experiment1/index.json` and
+ /// `pure_rust_ktir.rs`'s case table. `Program` is stated, not inferred -- see the crate docs.
+-pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
++///
++/// ⚠️ THE THIRD FIELD IS `Option<Program>`, AND `None` IS A STAGE, NOT AN ABSENCE. A `Some(kind)`
++/// row has a KTIR→SuperDSC door: `bake_py` and the emit tests can drive it to descriptors. A
++/// `None` row has NONE YET -- its kernel is stated in generic Triton ops (`tt.reduce`,
++/// `arith.cmpf`, `scf.for`, …) whose door lowering is the open rung, and minting a
++/// kernel-specific `Program` variant to fill the hole is exactly what the ladder forbids: the
++/// row is registered so the NUMERIC legs (`.py` → TTIR → KTIR → executor) run on it today, and
++/// the door consumers REFUSE it loudly rather than guessing a kind. When the generic scan/loop
++/// door exists, the row flips to `Some(...)` and this paragraph shrinks.
++pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Option<Program>)> {
+     Some(match name {
+         "rmsnorm_granite" => (
+             spec(
+@@ -139,7 +152,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 ],
+             ),
+             vec![1],
+-            Program::RmsNorm,
++            Some(Program::RmsNorm),
+         ),
+         // THE SAME NORM AT 32 ROWS -- the control for the `mb` FOLD.
+         //
+@@ -169,7 +182,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 ],
+             ),
+             vec![1],
+-            Program::RmsNorm,
++            Some(Program::RmsNorm),
+         ),
+         // SWIGLU AT TWO BLOCKINGS, to separate two problems that look like one.
+         //
+@@ -190,7 +203,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &swiglu_ce(128, 256, 64, 128),
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         "swiglu_mlp_flat" => (
+             spec(
+@@ -200,7 +213,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &swiglu_ce(128, 256, 256, 128),
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         // GRANITE WIDTH, FLAT. D_FF=12800, so this states a [64, 12800] f16 extent = 1.56 MiB --
+         // more than an LX tile. THE POINT IS THAT WE DO NOT MATERIALISE IT: their
+@@ -216,7 +229,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &swiglu_ce(4096, 12800, 12800, 4096),
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         // SWIGLU AS `pure_rust_ktir.rs` STATES IT -- the BLOCKED forms, kept beside the flat ones
+         // so "does un-blocking clear this?" is a question one binary answers twice.
+@@ -228,7 +241,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &swiglu_ce_m(16, 128, 256, 128, 64),
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         "swiglu_mlp_granite" => (
+             spec(
+@@ -238,7 +251,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &swiglu_ce(4096, 12800, 64, 4096),
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         // ⭐⭐ GRANITE WIDTH AT THE BLOCKING WHOSE TILES ACTUALLY FIT A 2 MiB LX, which is the
+         // configuration `triton-numeric` gets a NUMBER from. The two above do not: `_flat` refuses
+@@ -306,7 +319,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &swiglu_ce(4096, 12800, 64, 2048),
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         // ROPE. THE GRID IS ONE WORK ITEM PER TOKEN POSITION -- `vec![N_TOK]` -- and it is ONE
+         // DIMENSION, not two.
+@@ -325,12 +338,12 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+         "rope_q32" => (
+             spec("rope", "rope_fwd", ROPE, &rope_ce(32)),
+             vec![256],
+-            Program::Rope,
++            Some(Program::Rope),
+         ),
+         "rope_kv8" => (
+             spec("rope", "rope_fwd", ROPE, &rope_ce(8)),
+             vec![256],
+-            Program::Rope,
++            Some(Program::Rope),
+         ),
+         // EMBEDDING. `Program::ScalarMul` is the kind of the one COMPUTE op (`rows * EMB_SCALE`);
+         // the gather itself is addressing, and whether this crate has a door for an INDIRECT access
+@@ -367,7 +380,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &embedding_ce(256, 64),
+             ),
+             vec![4],
+-            Program::ScalarMul,
++            Some(Program::ScalarMul),
+         ),
+         "embedding_granite_bm128" => (
+             spec(
+@@ -377,7 +390,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &embedding_ce(256, 128),
+             ),
+             vec![2],
+-            Program::ScalarMul,
++            Some(Program::ScalarMul),
+         ),
+         // ⭐⭐⭐ THE ACCEPTING SIDE, AND THE ONE CONFIGURATION THAT MAKES THE GUARD A GUARD RATHER THAN
+         // A WITHDRAWAL. N_TOK = 32 is exactly ONE index stick (`CopyDims::ENTRIES_PER_OP`, the
+@@ -396,7 +409,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &embedding_ce(32, 32),
+             ),
+             vec![1],
+-            Program::ScalarMul,
++            Some(Program::ScalarMul),
+         ),
+         // THE DECODER BLOCK -- 12 matmuls in one function for one layer, 24 for two, so it is the
+         // whole-function door's real case. `Program` is stated only because the signature demands
+@@ -412,7 +425,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &dec_ce(64),
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         "decoder_layer_one_flat" => (
+             spec(
+@@ -422,7 +435,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &dec_ce(256),
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         "decoder_two_layers" => (
+             spec(
+@@ -432,7 +445,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &dec_ce(64),
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         "decoder_two_layers_flat" => (
+             spec(
+@@ -442,7 +455,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &dec_ce(256),
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         // ⭐ ATTENTION, THE ONE KERNEL THIS TABLE HAD NO ROW FOR — so no attention descriptor has
+         // ever gone down the from-source ladder (`bake_py`), only the ttir-golden path that
+@@ -466,7 +479,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &attn_ce(1),
+             ),
+             vec![4, 4],
+-            Program::Attn,
++            Some(Program::Attn),
+         ),
+         // ⭐ THE ONE-TILE FORM OF THE SAME KERNEL — the whole recurrence at the smallest launch that
+         // states it. `attn_ce(1)` is untouched (N_CTX=256, BLOCK_M=BLOCK_N=64), so this is ONE query
+@@ -489,12 +502,12 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &attn_ce(1),
+             ),
+             vec![1, 1],
+-            Program::Attn,
++            Some(Program::Attn),
+         ),
+         "attention_flash_causal" => (
+             spec("attention_flash", "attn_fwd", ATTN, &attn_ce(3)),
+             vec![4, 4],
+-            Program::Attn,
++            Some(Program::Attn),
+         ),
+         // ⭐ fp8 W8A8 AT THE SMALL TWIN'S SHAPES -- the whole contract is the four
+         // buffers (x f16 [M,K], w PACKED fp8 [N,K], ws f16 [1,N], o f16 [M,N]) and the
+@@ -525,7 +538,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 ],
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         // ⭐ RUNG 3, THE MEASUREMENT. The kernel is `mul` with the second pointer
+         // replaced by ONE runtime fp32 scalar (`a * scale`), so the whole case is the
+@@ -555,7 +568,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 &[("n", Val::Int(1024)), ("BLOCK", Val::Int(64))],
+             ),
+             vec![16],
+-            Program::Elementwise(Elementwise::Mul),
++            Some(Program::Elementwise(Elementwise::Mul)),
+         ),
+         // ⭐ RUNG 2 IN TWO DIMENSIONS. `mul_scale_small` states the per-core uniform
+         // corner (`pid * BLOCK`) on a 1-D window; this row states the same rung on a 2-D
+@@ -588,7 +601,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+             ),
+             // M / BLOCK_M: the grid tiles `a`'s rows exactly, one row band per core.
+             vec![8],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         // ⭐⭐⭐ RUNG 4 OF THE ADDRESS-PROVENANCE LADDER, THE MEASUREMENT: `q @ gather(k,
+         // ids).T` -- a row index read from DEVICE MEMORY, the gathered rows feeding a
+@@ -626,7 +639,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 ],
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         // ⭐⭐⭐ TASK 27 — PAGED FLASH ATTENTION, THE ONE-BLOCK STEP: the full flash body
+         // around rung 4's gathered V-leg contraction. The block table (`desc_ids`) picks
+@@ -662,7 +675,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 ],
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         // ⭐ TASK 28: the paged form PROPER — the KV sweep over a DEVICE-RESIDENT block
+         // table with the flash recurrence (m, l, acc) carried across blocks in ONE
+@@ -696,7 +709,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+                 ],
+             ),
+             vec![1],
+-            Program::Matmul,
++            Some(Program::Matmul),
+         ),
+         // ⭐ THE DOUBLE-UNROLL COUNT TWIN — `banded_attn_fwd` is the production
+         // paged-decode arm's body at granite-3.1-2b's real decode geometry (GQA=4,
+@@ -729,8 +742,66 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+         // stays multi-dot so `dot_to_linalg`'s single-dot canonical verifiers (which
+         // refuse a computed A-offset) never gate it — the same exemption the
+         // production kernel rides.
+-        "attention_banded_fold" => (banded_attn_spec(1), vec![1, 8, 4], Program::Attn),
+-        "attention_banded_batch" => (banded_attn_spec(2), vec![2, 8, 4], Program::Attn),
++        "attention_banded_fold" => (banded_attn_spec(1), vec![1, 8, 4], Some(Program::Attn)),
++        "attention_banded_batch" => (banded_attn_spec(2), vec![2, 8, 4], Some(Program::Attn)),
++        // ⭐ THE LADDER FORM OF THE GREEDY SAMPLER (#603/#500, #714's nuke ruling): the vocab
++        // scan as ONE Triton kernel stated in generic ops -- the whole padded row as ONE
++        // descriptor tile (rmsnorm's whole-row block), five whole-row `tt.reduce` maxima,
++        // three equality masks, four staged fp16 index tables (the two DECREASING ramps
++        // pick first-block then first-lane; the two INCREASING 0-based tables read the
++        // selected numbers back out through the one-hot, so the kernel states NO
++        // subtraction anywhere), and ONE fp32 island for the final `b*64 + l`. FIRST-max
++        // by arithmetic (the ramps' monotonicity), STRAIGHT-LINE (no loops at all -- the
++        // door receives ~20 generic ops, not a spliced trip bomb), one program over the
++        // solo decode step's [PAD_V] row. See the fixture's own docstring for the full
++        // algorithm and host contract.
++        //
++        // ⭐ THE DOOR IS THE WHOLE-FUNCTION WALK, and every op in the kernel crosses it
++        // through a GENERIC arm: the five maxima as bare `Reduce(Max)`, the three
++        // `cmpf(oeq)`+`uitofp` pairs folded to `Elementwise(Equal)` (the vendor's own
++        // `OpFunc::Equal` -- the device HAS the primitive and KTIR cannot name it in one
++        // op), the fp16 multiplies as `Elementwise(Mul)` (the `[1]`-answer widens through
++        // the broadcast operand mode), and the island as `dl16tofp32` -> same-stick f32
++        // multiply-add -> `fp32toint32` (the KSPLIT device recipe, `assemble_convert`).
++        // ⭐ THE DOOR KIND IS REAL NOW, not a placeholder: the SPLICE produces this body
++        // (the production `kernels/argmax.py`, `SubOp::ArgMax`'s row), and `Program::ArgMax`
++        // is its stated classification -- the same fact every spliced family states
++        // (`Program::RmsNorm`, `Program::SiluMul`, ...). The old "no algorithm name is
++        // wanted" ruling was the STANDALONE ladder's (a placeholder sufficed when nothing
++        // produced the kind); the splice changed the fact. The whole-function walk
++        // (`KTIR_WHOLE=1`) still never reads it; a per-`Program` run refuses loudly at
++        // the program arm (an eleven-parameter whole-function body is `emit_whole`'s, not
++        // a single-descriptor dispatch's). (⛔ NOT the vendor topk pair: `topk.ddl`'s
++        // ripple keeps the LAST index among equals -- `GREATERTHAN(running, candidate)`
++        // with an equal candidate displacing -- so `topkindex` at k=1 is LAST-max and
++        // cannot serve #631's law.)
++        "argmax_first_max" => (
++            spec(
++                "argmax_first_max",
++                "argmax_first_max_kernel",
++                &[
++                    ("logits_ptr", "*fp16"),
++                    ("bramp_ptr", "*fp16"),
++                    ("lramp_ptr", "*fp16"),
++                    ("binc_ptr", "*fp16"),
++                    ("linc_ptr", "*fp16"),
++                    ("ones_ptr", "*fp16"),
++                    ("sixtyfour_ptr", "*fp32"),
++                    ("padoff_ptr", "*fp16"),
++                    ("gramp_ptr", "*fp16"),
++                    ("ginc_ptr", "*fp16"),
++                    ("idx_ptr", "*i32"),
++                ],
++                &[
++                    ("V", Val::Int(49155)),
++                    ("PAD_V", Val::Int(65536)),
++                    ("NB", Val::Int(1024)),
++                    ("BLOCK", Val::Int(64)),
++                ],
++            ),
++            vec![1],
++            Some(Program::ArgMax),
++        ),
+         _ => return None,
+     })
+ }
+@@ -973,11 +1044,34 @@ mod tests {
+         }
+         assert_eq!(
+             super::ALL.len(),
+-            28,
++            29,
+             "a configuration was added or removed: update ALL (and the module title) deliberately"
+         );
+     }
+ 
++    /// ⛔ A `None` DOOR KIND IS A STAGE, NOT A DEFAULT. Every row whose third field is `None`
++    /// must SAY SO in its arm's comment (why no `Program` variant is honest for it yet), and this
++    /// test pins the SET of such rows by name -- so a new `None` row is a deliberate act that
++    /// updates this list, not a copy-paste of another arm's trailing field. When a row gains
++    /// its door it leaves this list and the list shrinks toward empty, which is the direction
++    /// the ladder runs. ⭐ THE LIST IS NOW EMPTY: `argmax_first_max` was the last doorless row,
++    /// and its kernel crosses the whole-function door through generic arms only -- the ladder's
++    /// stated destination. A new `None` row starts the list over and must say why.
++    #[test]
++    fn the_rows_without_a_door_are_exactly_the_named_set() {
++        const DOORLESS: &[&str] = &[];
++        for name in super::ALL {
++            let (_, _, door) = super::case(name).expect("a name from ALL");
++            let doorless = door.is_none();
++            assert_eq!(
++                doorless,
++                DOORLESS.contains(name),
++                "`{name}`'s door-kind is {door:?}; the DOORLESS set says {}",
++                DOORLESS.contains(name)
++            );
++        }
++    }
++
+     /// A name that is NOT a configuration comes back `None` rather than resolving to a neighbour.
+     /// The `_ => return None` arm is the fail-closed edge every consumer relies on to tell
+     /// "no such config" from "this config refused".
+diff --git a/crates/triton/triton-ktir-superdsc/src/layout.rs b/crates/triton/triton-ktir-superdsc/src/layout.rs
+index 987c6ab2ed..94473cb733 100644
+--- a/crates/triton/triton-ktir-superdsc/src/layout.rs
++++ b/crates/triton/triton-ktir-superdsc/src/layout.rs
+@@ -146,7 +146,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
+     // contract agrees independently (`semantic.py`'s `descriptor_gather` asserts an int16/int32
+     // index vector; `embedding.py` declares `desc_ids` as `*i32` for exactly this reason).
+     for g in &gathers {
+-        let idx_dtype = index_view_dtype(node, g.index_tid);
++        let idx_dtype = param_view_dtype(node, g.index_tid);
+         if idx_dtype != Some(ktir_core::dtypes::DType::I32) {
+             return Err(Error {
+                 stage: "layout",
+@@ -224,25 +224,51 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
+         // element product is the buffer's; `Region`'s own doc is explicit that the view shape is
+         // not always the tensor's shape (rope views `x` as `[rows·heads, hd]`), and it is the
+         // shape every descriptor here addresses through.
+-        // ⭐⭐⭐ A GATHER'S INDEX BUFFER IS FOUR BYTES AN ELEMENT, AND THE FOOTPRINT GUARD IS WHY THIS
+-        // CANNOT BE LEFT AT THE fp16 DEFAULT. `Region` states a view's fp8-ness and nothing else, so an
+-        // `*i32` parameter was sized as if it were fp16 — 512 B for `embedding.py`'s `[256]` id vector
+-        // against the 1024 B it really is. `resolve_seg_base`'s guard then compares the descriptor's
+-        // 1024 B access against that 512 B placement and refuses the CORRECT descriptor:
+-        //   `t0: access offset 0B + 1024B exceeds its placement footprint 512B (seg3)`
+-        // — measured, and the reason this arm exists. Had the numbers happened to fit, the other
+-        // direction would have been worse: the guard would have waved through an access reaching into
+-        // whatever is packed next.
++        // ⭐⭐⭐ THE FORMAT IS THE PARAMETER'S OWN VIEW DTYPE, READ PER PARAMETER — not an fp16
++        // default with two carved exceptions. `Region` states a view's fp8-ness and nothing else,
++        // so this used to size every other parameter as if it were fp16 — which was measured to
++        // refuse the CORRECT descriptor the moment a kernel carries a non-fp16 parameter:
++        //   `t6: access window end 256B (offset 0B, operand 256B) exceeds its placement
++        //    footprint 128B (seg3)`
++        // for argmax's `[1,64]` f32 `sixtyfour` table — the f32 mulf accesses 256 B (64 × 4 B)
++        // against a 128 B (64 × 2 B) placement. Had the numbers happened to fit, the other
++        // direction would have been worse: the guard would have waved through an access reaching
++        // into whatever is packed next.
+         //
+-        // The format is [`Df::Uint32`], which is the format the DESCRIPTOR declares for that operand
+-        // (`Role::KernelIdx` ⇒ SENUINT32, `wordLength` 4) — so the placement and the access are sized in
+-        // ONE format rather than in two that have to agree.
+-        let df = if index_tids.contains(&reg.tid) {
+-            Df::SenUint32
+-        } else if reg.is_fp8 {
+-            Df::Fp8
+-        } else {
+-            Df::Fp16
++        // The dtype is the `ktdp.construct_memory_view`'s own `Dtype` — the only statement of that
++        // buffer's element width anywhere in the program — read by [`param_view_dtype`] through
++        // the SAME tid→parameter join [`regions`] itself uses. The mapping is one-to-one onto the
++        // formats the device has: F16→Fp16, F32→Fp32 (4 B / 32-stick), Fp8E4m3→Fp8 (which is what
++        // `Region::is_fp8` states, so the two readers agree by construction), I32→SenUint32 (4 B —
++        // the gather-index law below, now reached by the view's own dtype rather than by tid, and
++        // covering an `*i32` OUTPUT like argmax's `idx_ptr` exactly as it always covered the index).
++        // A view that states NO dtype is placed at fp16: that is the behavior-preserving reading
++        // (every parameter of every config that baked before states F16, Fp8E4m3 or the gather's
++        // I32, so this arm changes no existing placement), and "not stated" still cannot hide an
++        // over-run — the footprint guard compares the descriptor's access, sized by the OPS' own
++        // result types, against this placement, so an unstated-dtype parameter read at 4 B/elem is
++        // refused loudly rather than waved through. Every OTHER stated dtype (i1, i64) has no
++        // device format at all and is refused BY NAME — sizing it at fp16 would over-reserve and
++        // turn the guard into a rubber stamp for exactly the access it exists to catch.
++        let df = match param_view_dtype(node, reg.tid) {
++            Some(ktir_core::dtypes::DType::F16) => Df::Fp16,
++            Some(ktir_core::dtypes::DType::F32) => Df::Fp32,
++            Some(ktir_core::dtypes::DType::Fp8E4m3) => Df::Fp8,
++            Some(ktir_core::dtypes::DType::I32) => Df::SenUint32,
++            None => Df::Fp16,
++            Some(other) => {
++                return Err(Error {
++                    stage: "layout",
++                    message: format!(
++                        "{name}: the parameter t{} states element type {other:?}, which has no \
++                         device format — the placement would have to be sized at some other \
++                         format's bytes and the footprint guard would then be comparing an access \
++                         against a fiction. Give the buffer a dtype the device has (f16, f32, \
++                         f8E4M3FN, i32) or lower it through a view that states one.",
++                        reg.tid,
++                    ),
++                });
++            }
+         };
+         // ⛔⛔⛔ A RUNG-3 BOUND SCALE — a `[1,1]` PARAMETER — IS 2 B, NOT ITS STICK-PADDED
+         // FOOTPRINT. `synth_footprint_bytes(&[1,1], Fp16)` pads the inner axis to the
+@@ -501,6 +527,21 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
+             .collect::<std::collections::BTreeMap<_, _>>(),
+     );
+ 
++    // ⭐ THE GRAPH'S OWN SOURCE BOUND — the kernel's own tensor parameters: every Activation-role
++    // placement that is not a reserved const (P, the scale consts and the fp8 bounds are
++    // producer-staged, not caller-filled). The exclusive bound of those tids, the same fact
++    // `bundle_run`'s launch-time `declare_sources` derives from the bound inputs — stated here so
++    // the bundle carries it, per the `SegRole::Logits` law that a session reads a bundle's facts
++    // off the bundle. Computed BEFORE the literal, which moves `placements`.
++    let num_sources = placements
++        .values()
++        .filter(|p| {
++            p.role == SegRole::Activation && !ktir_superdsc::reserved_tids::is_reserved(p.tid)
++        })
++        .map(|p| p.tid + 1)
++        .max()
++        .unwrap_or(0);
++
+     Ok(BundleLayout {
+         placements,
+         ids,
+@@ -547,6 +588,12 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
+         // No paged KV in a single Triton kernel's parameter list; 0 is the documented "no paged KV"
+         // value, not a placeholder.
+         kv_request_stride_bytes: 0,
++        // ⭐ THE GRAPH'S OWN SOURCE BOUND — computed above the literal (which moves `placements`).
++        num_sources,
++        // No source is resident: a single Triton kernel has no prefix-KV cache for the device to
++        // fill and no load-time constant tables for an owner session to bind — the consts above
++        // are staged by the runner, not excused from the bind walk.
++        resident_source_tids: Vec::new(),
+     })
+ }
+ 
+@@ -556,10 +603,17 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
+ ///
+ /// The tid→parameter join is [`regions`]' own (`bindings[i]` is the tensor `arguments[i]` points at), so
+ /// this reaches the same parameter that walk does rather than keeping a second copy of the mapping.
++/// It is read for EVERY parameter now, not just a gather's index: the placement's `Df` — and so its
++/// byte footprint — is derived from it (see the `df` arm in [`for_regions`]), because sizing an
++/// `*i32` or `*f32` parameter at fp16 bytes is measured to refuse the correct descriptor.
+ ///
+-/// `None` when nothing is bound to `tid` or its view carries no dtype. The caller turns that into a
+-/// refusal rather than a default: "not stated" and "stated as i32" are different facts.
+-fn index_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DType> {
++/// `None` when nothing is bound to `tid` or its view carries no dtype. The gather-index check turns
++/// that into a refusal rather than a default: "not stated" and "stated as i32" are different facts.
++/// For the placement itself `None` reads as fp16 — the behavior-preserving choice, since every
++/// parameter of every config that baked before states F16, Fp8E4m3 or the gather's I32 — and the
++/// footprint guard still catches an access the placement under-sized, so the default cannot hide an
++/// over-run.
++fn param_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DType> {
+     use ktir_core::attrkey::AttrKey;
+     use ktir_core::ir::Attr;
+     use ktir_core::opkind::OpKind;
+@@ -633,7 +687,10 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
+         | Program::SiluMul
+         | Program::LmLast
+         | Program::Transpose
+-        | Program::Matmul => None,
++        | Program::Matmul
++        // The argmax's nine tables ride as ORDINARY tensor operands (the node's own
++        // inputs, placed like every staged buffer) — no reserved tid names one.
++        | Program::ArgMax => None,
+         // ⭐ NO ENTRY POINT ON THIS LADDER, SO NO CONSTANTS TO NAME. None of these programs has a
+         // body this crate's door can reach — the splice's registry produces none of them (its
+         // by-name refusals stop their SubOps at the producer), and the door itself refuses them by
+@@ -864,7 +921,10 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
+         | Program::LmLast
+         | Program::Transpose
+         | Program::Matmul
+-        | Program::Rope => Vec::new(),
++        | Program::Rope
++        // The argmax's tables are tensor operands, never `scalarmul_scales` lookups —
++        // a value registered for it would occupy a slot nothing asks for.
++        | Program::ArgMax => Vec::new(),
+         // ⭐ EMPTY FOR THE SAME REASON, ONE STEP EARLIER: none of these programs has a body on
+         // this ladder (the splice produces none of them and the door refuses them by name), so
+         // there is no body to ask which values it looks up. A value registered for a program that
+diff --git a/crates/triton/triton-ktir-superdsc/src/lib.rs b/crates/triton/triton-ktir-superdsc/src/lib.rs
+index 5d634ae4a5..72db5caf1e 100644
+--- a/crates/triton/triton-ktir-superdsc/src/lib.rs
++++ b/crates/triton/triton-ktir-superdsc/src/lib.rs
+@@ -254,6 +254,21 @@ fn emit_regions(
+                 ),
+             });
+         }
++        // ⭐ THE ARGMAX IS THE ATTENTION'S OWN CLASS HERE: a multi-op whole-function
++        // body (five whole-row reduces, the equality chain, the fp32 island) over
++        // NINE parameters — lowered from its compiled ops through the whole-function
++        // door (`emit_whole`, the fixture ladder's own `argmax_first_max` path), and a
++        // per-`Program` dispatch would be a second, hand-rolled path. Do not add one.
++        Program::ArgMax => {
++            return Err(Error {
++                stage: "program",
++                message: format!(
++                    "{:?} is an eleven-parameter whole-function body — `emit_whole` is its \
++                     door, and a per-`Program` dispatch would be a second, hand-rolled path",
++                    node.program
++                ),
++            });
++        }
+         // THE MONOMORPHISATION DOOR. `rope_at::<HD>` is not reachable without the geometry, and
+         // the geometry is a const parameter, so `Program::Rope` is refused here and driven from
+         // `drive_rope` which takes it explicitly. Refused rather than defaulted: a wrong head
+@@ -744,8 +759,11 @@ module {
+     /// receives it, not only as the pass writes it.
+     #[test]
+     fn the_door_reads_the_shipped_spelling() {
+-        let (kspec, grid, program) =
++        let (kspec, grid, door) =
+             cases::case("mul_scale_small").expect("the case table states the configuration");
++        // This bridge drives the DOOR (`assert_the_forms_agree` reads the kind); `mul_scale_small`
++        // is `Some(ScalarMul)`, and a row without a door cannot take this path at all.
++        let program = door.expect("`mul_scale_small` states its door kind");
+         let src = std::fs::read_to_string(&kspec.file).expect("read the fixture");
+         let mut tt = codegen::compile(&src, &kspec, Target::spyre()).expect("codegen");
+         opt::make_ttir(&mut tt).expect("make_ttir");
+diff --git a/crates/triton/triton-ktir-superdsc/tests/argmax_whole_function_door_refusal.rs b/crates/triton/triton-ktir-superdsc/tests/argmax_whole_function_door_refusal.rs
+new file mode 100644
+index 0000000000..09ffe4e8ee
+--- /dev/null
++++ b/crates/triton/triton-ktir-superdsc/tests/argmax_whole_function_door_refusal.rs
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: Apache-2.0
++
++//! ⛔ THE WHOLE-FUNCTION BODY CANNOT CROSS THE PER-`Program` DOOR — AND THE TEST THAT KEEPS
++//! IT HONEST.
++//!
++//! `argmax_first_max`'s case row states `Program::ArgMax` — the SPLICE's own classification
++//! for the production `kernels/argmax.py` (`SubOp::ArgMax`'s row), no longer a placeholder:
++//! the splice produces this body, so the kind is stated like every spliced family's. The
++//! kernel crosses through the WHOLE-FUNCTION door (`emit_whole`), which walks the function's
++//! ops and never dispatches on the `Program`; the per-`Program` door REFUSES the kind by
++//! name — an eleven-parameter whole-function body (seven whole-row reduces, the equality
++//! chain, the fp32 island) is not a single-descriptor dispatch, and building one would be a
++//! second, hand-rolled path. This file pins that refusal.
++//!
++//! The chain is driven from the configuration table (the same statement `bake_py` and
++//! the banded twin read — a test that restated the fixture, the constexprs, or the grid
++//! would be a second statement of a configuration, and a configuration restated in two
++//! places drifts in one of them): source → ttir → KTIR → `to_ktir`'s passes → their
++//! node. Then, over ONE node:
++//!
++//! * CONTROL — `emit_whole` with the node's own layout EMITS. The module is good, so
++//!   the per-`Program` refusal below is the door's verdict about the body's shape,
++//!   never a broken module masquerading as one.
++//! * THE PIN — `emit_node` over the SAME node REFUSES, naming the whole-function door
++//!   as the body's. If a future arm mints a per-`Program` dispatch for this kind, this
++//!   is the test that goes red.
++
++use ktir_superdsc::ktir_node::Program;
++
++/// The node behind the row, through the same value-level legs `bake_py` runs — minus
++/// the bake directory. `Err` carries the first refusing stage's message.
++fn node_of(name: &str) -> ktir_superdsc::ktir_node::KtirNode {
++    let (kspec, grid, door) = triton_ktir_superdsc::cases::case(name)
++        .unwrap_or_else(|| panic!("`{name}` is not a configuration"));
++    // This test drives BOTH doors, so a doorless row cannot run here by construction.
++    let program = door.unwrap_or_else(|| panic!("`{name}` has no door kind to drive"));
++    let src = std::fs::read_to_string(&kspec.file)
++        .map_err(|e| format!("read: {e}"))
++        .unwrap();
++    let mut tt =
++        triton_frontend::codegen::compile(&src, &kspec, triton_frontend::target::Target::spyre())
++            .map_err(|e| format!("codegen: {e}"))
++            .unwrap();
++    triton_frontend::opt::make_ttir(&mut tt)
++        .map_err(|e| format!("make_ttir: {e}"))
++        .unwrap();
++    let mut m = triton_ktir::from_ttir::convert(&tt)
++        .map_err(|e| format!("from_ttir: {e}"))
++        .unwrap();
++    triton_ktir::make_ktir(&mut m, &grid)
++        .map_err(|e| format!("make_ktir: {e}"))
++        .unwrap();
++    triton_ktir::passes::to_ktir::run(&mut m, &grid)
++        .map_err(|e| format!("to_ktir: {e}"))
++        .unwrap();
++    triton_ktir_superdsc::node_for(&m, program)
++        .map_err(|e| format!("{}: {}", e.stage, e.message))
++        .unwrap()
++}
++
++#[test]
++fn the_per_program_door_refuses_while_the_whole_door_emits() {
++    let node = node_of("argmax_first_max");
++    // CONTROL — the whole-function door emits over this node; a failure here means the
++    // module broke, and the refusal below would prove nothing about the body's shape.
++    let layout = triton_ktir_superdsc::layout::for_node(&node)
++        .map_err(|e| format!("{}: {}", e.stage, e.message))
++        .unwrap();
++    let ops = triton_ktir_superdsc::emit_whole(&node, Some(&layout))
++        .map_err(|e| format!("{}: {}", e.stage, e.message))
++        .unwrap();
++    assert!(
++        !ops.is_empty(),
++        "the whole-function door emitted no ops — an emission over nothing"
++    );
++    // THE PIN — the per-`Program` door refuses the whole-function body BY NAME, naming
++    // `emit_whole` as its door. Whatever classification the row states, an eleven-parameter
++    // multi-op body is not a single-descriptor dispatch.
++    let err = match triton_ktir_superdsc::emit_node(&node) {
++        Err(e) => e,
++        Ok(ops) => panic!(
++            "the per-`Program` door must refuse the whole-kernel node, but it emitted {} \
++             op(s) — a per-`Program` dispatch over this body is a second, hand-rolled path",
++            ops.len()
++        ),
++    };
++    assert!(
++        err.message.contains("eleven-parameter whole-function body"),
++        "the per-`Program` refusal must name the whole-function door as the body's, got: \
++         [{}] {} (door kind: {:?})",
++        err.stage,
++        err.message,
++        Program::ArgMax
++    );
++}
+diff --git a/crates/triton/triton-ktir-superdsc/tests/banded_attn_trip_count.rs b/crates/triton/triton-ktir-superdsc/tests/banded_attn_trip_count.rs
+index 6bd0cddf8d..ab5e7fc314 100644
+--- a/crates/triton/triton-ktir-superdsc/tests/banded_attn_trip_count.rs
++++ b/crates/triton/triton-ktir-superdsc/tests/banded_attn_trip_count.rs
+@@ -53,8 +53,11 @@
+ /// runs under `KTIR_WHOLE=1`, minus the bake directory. `Err` carries the first
+ /// refusing stage's message.
+ fn drive(name: &str) -> Result<Vec<String>, String> {
+-    let (kspec, grid, program) = triton_ktir_superdsc::cases::case(name)
++    let (kspec, grid, door) = triton_ktir_superdsc::cases::case(name)
+         .unwrap_or_else(|| panic!("`{name}` is not a configuration"));
++    // This test drives the DOOR, so a doorless row cannot run here by construction; the twin
++    // rows it names both have `Program::Attn`.
++    let program = door.unwrap_or_else(|| panic!("`{name}` has no door kind to drive"));
+     let src = std::fs::read_to_string(&kspec.file).map_err(|e| format!("read: {e}"))?;
+     let mut tt =
+         triton_frontend::codegen::compile(&src, &kspec, triton_frontend::target::Target::spyre())

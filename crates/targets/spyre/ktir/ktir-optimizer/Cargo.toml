@@ -20,7 +20,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "KTIR IR→IR optimization passes (function fusion, trace packing). Depends only on ktir-core."
+description = "KTIR IR→IR optimization passes (function fusion, trace packing)."
 readme = false
 license = "Apache-2.0"
 repository = "https://github.com/torch-spyre/ktir-cpu"
@@ -32,3 +32,10 @@ path = "src/lib.rs"
 [dependencies.ktir-core]
 version = "0.1.0"
 path = "../ktir-core"
+
+# ⭐ THE `Program` KIND, for `NodeSpec`'s carried field — the planner's door
+# isolation keys on the mint's one typed statement of what a node computes.
+# A leaf beside ktir-core (serde/serde_json/half only below it), so no cycle.
+[dependencies.ktir-superdsc]
+version = "0.1.0"
+path = "../ktir-superdsc"

@@ -60,6 +60,7 @@ fn build_spec(programs: &[bundle::LaunchProgram<'static>], results: &[u64]) -> P
         }
         nodes.push(NodeSpec {
             func: p.func.name.to_string(),
+            program: p.program,
             bindings,
         });
     }
@@ -118,6 +119,18 @@ fn weight_arg(data: Vec<u8>, dt: SDType, shape: Vec<usize>) -> Arg {
             shape,
             dtype: DType::Fp8E4m3,
         },
+        // ⭐ i32 RIDES THE VERBATIM BYTE PATH TOO — the sampler's seed table
+        // is a `memref<si32>` view, so `set_source_bytes` sees `dtype ==
+        // view_dt` and `write_bytes`-copies the LE words straight into HBM
+        // (SenUint32 shares IEEE_FP32's 4-byte/32-stick geometry). Routing it
+        // through the `other` arm's F32 would label the words f32: 4× the
+        // elements, the wrong decode on any crossing path — the same
+        // mislabeling class the fp8 comment above records.
+        SDType::I32 => Arg::TensorBytes {
+            data,
+            shape,
+            dtype: DType::I32,
+        },
         _ => Arg::TensorBytes {
             data,
             shape,
@@ -163,16 +176,57 @@ impl SpyreSession {
         programs: &[(&[bundle::LaunchGroup<'static>], &[u64])],
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
     ) -> Result<Self> {
+        // An empty floor matches no tid, so every stick keeps its view-derived
+        // size — today's behavior, stated once instead of duplicated.
+        Self::new_multi_floored(programs, weights, &std::collections::HashMap::new())
+    }
+
+    /// ⭐ [`new_multi`](Self::new_multi) WITH A SHAPE FLOOR — the tape's own
+    /// tensor-shape statement (element counts keyed by tensor id), which the
+    /// resident sticks allocate at LEAST. For callers that hold the graph the
+    /// programs were lowered from — the bake-time numeric gate holds the
+    /// minted krg, the worker holds the wiring — because a widened reader
+    /// whose view sits on an interior edge of a fused function is invisible
+    /// to the emulator's view walk, and the krg's shape is the tape's own
+    /// statement of the tensor's extent (the same authority the bundle
+    /// layout reserves from). The floor is a MAX: it can only raise an
+    /// allocation, never shrink one the views already sized.
+    pub fn new_multi_floored(
+        programs: &[(&[bundle::LaunchGroup<'static>], &[u64])],
+        weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
+        shape_floor: &std::collections::HashMap<u64, usize>,
+    ) -> Result<Self> {
         let mut funcs: Vec<Vec<ktir_core::ir::IRFunction<'static>>> =
             Vec::with_capacity(programs.len());
         let mut specs: Vec<ProgramSpec> = Vec::with_capacity(programs.len());
-        for (groups, results) in programs {
+        // ⭐ THE PIN WINDOW, PER PROGRAM — read off the bundle's own LaunchPrograms
+        // (stamped at their mint from the placement layout's `lx_window_bytes()`),
+        // with the agreement guard: every launch flattened into ONE session program
+        // must state the SAME window, because one program runs ONE bundle's budget.
+        // A program whose launches state none (`None`) passes through as `None` and
+        // the resident refuses it at load, naming it — never a silent zero.
+        let mut pin_windows: Vec<Option<u64>> = Vec::with_capacity(programs.len());
+        for (pi, (groups, results)) in programs.iter().enumerate() {
             // A group IS a launch, and its programs run in order; the groups run in order too, so
             // the whole program is that sequence flattened.
             let progs: Vec<bundle::LaunchProgram<'static>> = groups
                 .iter()
                 .flat_map(|g| g.programs.iter().cloned())
                 .collect();
+            let mut window: Option<u64> = None;
+            for (li, p) in progs.iter().enumerate() {
+                if li == 0 {
+                    window = p.lx_pin_window_bytes;
+                } else if window != p.lx_pin_window_bytes {
+                    return Err(anyhow!(
+                        "session program {pi} mixes launches with different LX pin windows \
+                         ({window:?} vs {:?}) — one program runs ONE bundle's window, so the \
+                         launches it flattens must all come from that bundle",
+                        p.lx_pin_window_bytes
+                    ));
+                }
+            }
+            pin_windows.push(window);
             funcs.push(progs.iter().map(|p| p.func).collect());
             specs.push(build_spec(&progs, results));
         }
@@ -187,8 +241,8 @@ impl SpyreSession {
             .map(|f| f.as_slice())
             .zip(specs.iter())
             .collect();
-        let session =
-            Session::new_multi(prog_refs, args).map_err(|e| anyhow!("Session::new_multi: {e}"))?;
+        let session = Session::new_multi_floored(prog_refs, args, shape_floor, pin_windows)
+            .map_err(|e| anyhow!("Session::new_multi: {e}"))?;
         Ok(Self { session })
     }
 
@@ -277,6 +331,20 @@ impl SpyreSession {
     /// [`ktir_emulator::program::Session::observable_tids`]).
     pub fn observable_tids(&self, prog: usize) -> Vec<u64> {
         self.session.observable_tids(prog)
+    }
+
+    /// The LX residency high-water mark over everything this session has run
+    /// (see [`ktir_emulator::program::Session::lx_peak_used`]). The numeric
+    /// gate logs it so a bundle that fits states its headroom, not just its
+    /// pass.
+    pub fn lx_peak_used(&self) -> i64 {
+        self.session.lx_peak_used()
+    }
+
+    /// The per-core LX capacity (see
+    /// [`ktir_emulator::program::Session::lx_capacity`]).
+    pub fn lx_capacity(&self) -> i64 {
+        self.session.lx_capacity()
     }
 }
 
@@ -431,11 +499,19 @@ mod tests {
             kv: Default::default(),
             programs: std::borrow::Cow::Owned(vec![bundle::LaunchProgram {
                 func,
+                // The fixture's body is an ArithAddf of two [1, 4] rows — the kind its own ops
+                // state (the KtirNode test precedent: body-derived, never a guess).
+                program: ktir_superdsc::ktir_node::Program::Elementwise(
+                    ktir_superdsc::ktir_node::Elementwise::Add,
+                ),
                 args: std::borrow::Cow::Owned(vec![
                     (scores_p, bundle::PlaceId::Act(SCORES as u32)),
                     (mask_p, bundle::PlaceId::Act(MASK as u32)),
                     (out_p, bundle::PlaceId::Act(OUT as u32)),
                 ]),
+                // Stated EXPLICITLY (auditor ruling 2026-10-27): this hand-built
+                // fixture program mints no LX pins, so its window is zero.
+                lx_pin_window_bytes: Some(0),
             }]),
             init_binary: std::borrow::Cow::Borrowed(&[]),
             job_bin_ptr: 0,

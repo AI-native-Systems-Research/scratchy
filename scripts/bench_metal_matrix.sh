@@ -20,6 +20,8 @@
 #   warm: send -> first token, median over unique prompts to a resident server
 #   peak RSS, major faults             scr bench startup --exec (per child, wait4)
 #   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve (warm, conc 1)
+#   energy: J per rail, Wh + avg/peak W scratchy-power-sampler (CLPC counters,
+#                                        1 Hz, whole run, all engines)
 #   prompt x answer x users grid       scr bench serve (1, 2, 4 users;
 #     (heat maps, every curve)           128 to 8192 in;
 #                                        64 out, --full adds 512 and 2048 at 1)
@@ -28,6 +30,8 @@
 #
 # Needs: passwordless `sudo purge` for the frozen rung (a sudoers rule for
 # /usr/sbin/purge; see the Metal bench skill), or pass --scenarios cold,warm.
+# Energy: the sampler reads the CLPC counters on macOS 27 and IOReport's Energy
+# Model group elsewhere; a rail with no live channel ends the run.
 # Weights download on first use unless --offline.
 #
 # Scaling (--no-scaling skips it; --scale-axes picks from conc,input,output,grid):
@@ -36,16 +40,15 @@
 # offered (--max-concurrency), not the effective decode batch. The default
 # sweep is the grid: prompt x answer x users, at --scale-grid-conc's user
 # counts (1, 2 and 4 by default, on every Mac), so neither the separate
-# users sweep (conc) nor the prompt sweep (input) is needed: the grid's prompts reach 8k
-# and its 1-user row is the prompt sweep. One user at a time is what most Macs
-# see (#349). --scale-axes conc,grid,input adds the other sweeps back. A cell
-# sends --scale-rounds rounds of its users count (4; a quick run, 2), and at least
-# --scale-num-prompts requests (12): 12 at 1 user, 16 at 4, so its medians are
-# of the users count kept full, not one ramp-up and drain.
-# Above 1 user the grid runs only --scale-grid-users-output's answer lengths
-# (64): the users x prompt heat maps read 64-token answers, and long answers at
-# many users were half a sweep. With --full, 1 user runs every answer length
-# (64, 512 and 2048), the decode-vs-answer-length curve; a quick run, 64 alone.
+# users sweep (conc) nor the prompt sweep (input) is needed: the grid's prompts
+# reach 4k below 64 GB (128, 512, 1024, 4096) and 8k from it (128, 1024, 4096,
+# 8192), and its 1-user row is the prompt sweep. One user at a time is what most
+# Macs see (#349). --scale-axes conc,grid,input adds the other sweeps back. A
+# cell sends --scale-num-prompts requests (50) with 64-token answers, quick and
+# full alike, at least --scale-rounds rounds of its users count, so its
+# distribution is of the users count kept full, not one ramp-up and drain.
+# --scale-grid-output adds answer lengths; above 1 user the grid runs only
+# --scale-grid-users-output's (64).
 # --scale-grid-users-output "" runs the whole cube.
 #
 # With mlx-lm, a blocking parity gate runs first: `scr chat` vs mlx_lm.generate,
@@ -59,8 +62,8 @@
 # comparison engine (every --full run), or --parity forcing it (the smoke
 # run's setup check). A scratchy-only run — the quick form — skips it and
 # records "parity_skipped" instead.
-# Comparison engines. By default oMLX and oMLX TurboQuant, the strongest MLX
-# rival, so the time goes into the users dimension of the grid instead
+# Comparison engines. By default oMLX, the strongest MLX rival (oMLX TurboQuant
+# is an ablation of its own, by name), so the time goes into the users dimension of the grid instead
 # (#349); --engines all runs every installed one, --engines a,b names some:
 #   mlx-lm      python with `import mlx_lm` ($VIRTUAL_ENV, python3, or --mlx-python)
 #   ollama      `ollama serve` on --port, its MLX engine (the -mlx tags); pulls
@@ -70,23 +73,32 @@
 #   oMLX        `omlx serve` over the downloaded MLX checkpoint, twice:
 #               as installed (FP16 KV), and with its TurboQuant KV turned on
 #               (4-bit), so scratchy's TurboQuant default meets a like-for-like
-#               rival as well as oMLX's own default. Its HTTP API takes no
-#               ignore_eos, so its answers stop at EOS (§ on the page, #479)
+#               rival as well as oMLX's own default. Built from starpit/omlx's
+#               feat/api-ignore-eos branch (jundot/omlx#4978), its HTTP API
+#               takes ignore_eos and answers to length; releases through 0.7.x
+#               drop it and stop at EOS (§ on the page, #479)
 #   mistral.rs  `mistralrs serve`, the same Q4_K_M GGUF as llama.cpp; a Rust
 #               control: is scratchy fast because of its compiler, or Rust?
+#   Splash      `splash serve` (Inco AI), the same MLX checkpoint as scratchy;
+#               Qwen only (it serves the Qwen family and nothing else here),
+#               with the DFlash draft it ships for each model, as a user gets it
 # Every engine but mlx-lm is restarted per axis, sized for that axis (concurrent
 # requests x context), since most of them reserve KV for that up front.
 #
 # Pins: an agreed run names every engine's version and scratchy's commit, and
 # the runner refuses to start if anything installed differs:
 #   --pin scratchy=f378699ec --pin mlx-lm=0.31.3 --pin ollama=0.35.1 ...
-# (llama.cpp pins its build number, b1234). --unpinned runs anyway and says so.
+# (llama.cpp pins its build number, b1234; scratchy and a source-built oMLX a
+# commit prefix). --unpinned runs anyway and says so.
 #
 # --serve-args "..." adds extra `scr serve` flags (recorded in the JSON). None
 # by default: `scr serve` sizes --max-num-batched-tokens to the largest resident
 # prefill bucket, the same as any user gets.
-# --cell-timeout-s bounds each scaling cell. A cell that times out or has failed
-# requests is recorded as it ended, and the server is restarted for the next
+# --cell-timeout-s bounds each scaling cell, plus its answers' decode at a hang's
+# --cell-hang-tok-s (10 tok/s per user): a cell of 2048-token answers decodes 14
+# of them, past 600 s on a base M5, so a flat limit cut off every engine that
+# served them in full and kept the ones that stopped early at EOS. A cell that
+# times out or has failed requests is recorded as it ended, and the server is restarted for the next
 # cell: a server that ran out of memory on one cell has not measured the
 # others, and an engine's out-of-memory stays on the page as failed cells.
 # --fail-fast stops at the first scratchy build or parity-gate failure instead
@@ -122,11 +134,11 @@ MODELS_ALL=(
   "granite-4.1-8b=mlx-community/granite-4.1-8b-4bit:mlx-affine-b4-g32"                 # 5.2 GB, dense
   "granite-4.1-30b=mlx-community/granite-4.1-30b-4bit:mlx-affine-b4-g32"               # 18.0 GB, dense
 )
-# The default round is one model per class, sized to the Mac: the small set
-# below 64 GB of memory, the large set at 64 GB and above. --models small or
-# --models large names one; --models full runs both, where each fits. Each
-# run file records this table (config.classes) and the cut-off
-# (config.large_from_gb), and the page reads its overview's columns from them.
+# The default round is one model per class, the small set, on every Mac: a 64 GB Mac runs the same
+# models as a 36 GB one, so each column of the page is one model across every chip, and the full
+# run is the small set's length everywhere. --models large names the large set (64 GB only),
+# --models full runs both, where each fits. Each run file records this table (config.classes) and
+# the cut-off (config.large_from_gb), which now sizes only the grid's prompts (SCALE_GRID_INPUT_*).
 LARGE_GB=64
 CLASSES=(
   # class | small | large
@@ -219,6 +231,7 @@ mlx_parity_config() {
 }
 
 MODELS=()
+MODELS_GIVEN=0           # --models was passed: the run did not take the default set
 # Two kinds of run. By default a quick one, aimed at about 25 minutes (not yet
 # measured as it now runs):
 # scratchy alone, cold and warm, one rep, 64-token answers. The page
@@ -260,6 +273,7 @@ READY_TIMEOUT_S=1800
 # A cell's limit. On a 36 GB M3 Pro 221 of 222 grid cells finished inside it, the slowest 2048-
 # token answers to 8k prompts near 10 minutes; a hung server would otherwise hold a cell forever.
 CELL_TIMEOUT_S=600
+CELL_HANG_TOK_S=10       # a user's decode slower than this is a hung server's
 SERVE_ARGS=""
 SEED=""
 MLX_PYTHON=""
@@ -268,8 +282,11 @@ OLLAMA_AUTO=1
 ENGINES=""               # --engines: unset for DEFAULT_ENGINES, all for every installed one
 ENGINES_GIVEN=0          # --engines was passed (even as "": scratchy alone)
 LEGACY_NO=0              # --no-mlx / --no-ollama was passed
-DEFAULT_ENGINES=""       # scratchy alone; --full: oMLX and oMLX TurboQuant
-(( FULL )) && DEFAULT_ENGINES="omlx,omlx_tq"
+DEFAULT_ENGINES=""       # scratchy alone; --full: oMLX
+# oMLX TurboQuant is not in a full run: its behaviour is an ablation of its own (--engines names it).
+# Splash is not a default either: it adds about an hour to each Mac's full run, on the Qwen models alone.
+# --engines all runs it, as does naming it (--engines omlx,omlx_tq,splash).
+(( FULL )) && DEFAULT_ENGINES="omlx"
 PINS=()
 UNPINNED=0
 SCALING=1
@@ -277,22 +294,30 @@ SCALE_AXES="grid"
 SCALE_CONC="1,2,4"
 SCALE_INPUT="128,512,2048,8192"
 SCALE_OUTPUT="16,64,256,1024"
-# The grid, the same on every Mac: a Mac's memory picks its models, not its cells, so each square
-# of the page means one thing on every machine. 32k prompts and 8 or 16 users cost more than they
-# showed: on a 32 GB base M5 two 32k prompts at once did not finish 12 requests in the cell
-# timeout, and the full run took about a day on the M4 and M5 Macs.
-SCALE_GRID_INPUT="128,1024,4096,8192"
-SCALE_GRID_OUTPUT="64"         # --full: 64,512,2048, the 1-user decode-vs-answer-length curve
-(( FULL )) && SCALE_GRID_OUTPUT="64,512,2048"
+# The grid, the same on every Mac of a memory set: its prompts by the set (below), 64-token
+# answers, 1, 2 and 4 users. 32k prompts and 8 or 16 users cost more than they showed: on a 32 GB
+# base M5 two 32k prompts at once did not finish 12 requests in the cell timeout, and the full run
+# took about a day on the M4 and M5 Macs. Long answers went too: on a base M5 the 512- and
+# 2048-token answers were 77% of a full run's 11 hours, for one curve.
+SCALE_GRID_INPUT=""            # unset: the memory set's (SCALE_GRID_INPUT_SMALL or _LARGE)
+# A small Mac's prompts stop at 4096: its 8k cells were 57% of its 64-token grid's time.
+SCALE_GRID_INPUT_SMALL="128,512,1024,4096"
+SCALE_GRID_INPUT_LARGE="128,1024,4096,8192"
+SCALE_GRID_OUTPUT="64"
 SCALE_GRID_CONC="1,2,4"        # the grid's users dimension; empty: 1 and the base count
 SCALE_GRID_USERS_OUTPUT="64"   # the answer lengths above 1 user; empty: every --scale-grid-output
 SCALE_BASE_INPUT=1024
 SCALE_BASE_OUTPUT=64
 SCALE_BASE_CONC=8
-SCALE_NUM_PROMPTS=12     # a cell's requests: at least this many,
+# A cell's requests, at least this many: 50 dots a cell on the page, a distribution and not
+# twelve points of one.
+SCALE_NUM_PROMPTS=50
 SCALE_ROUNDS=2           # and at least this many rounds of its users count; --full: 4
 (( FULL )) && SCALE_ROUNDS=4
 SCALE_WARMUPS=2
+# A cell's repeats, one after another on the same server, each with prompts of its own (1: its
+# SCALE_NUM_PROMPTS requests are all of it).
+SCALE_REPEATS=1
 SCALE_SEED_BASE=20260927
 # The TTFT, TPOT and end-to-end percentiles every `bench serve` reports and the JSON keeps
 # (p<N>_<metric>_ms): the spread across a cell's requests, not just its middle and tail.
@@ -300,7 +325,7 @@ PERCENTILES="25,50,75,90,99"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --models)            IFS=',' read -r -a MODELS <<<"$2"; shift 2 ;;
+        --models)            IFS=',' read -r -a MODELS <<<"$2"; MODELS_GIVEN=1; shift 2 ;;
         --scenarios)         SCENARIOS="$2"; shift 2 ;;
         --reps)              REPS="$2"; shift 2 ;;
         --prime)             PRIME="$2"; shift 2 ;;
@@ -315,6 +340,7 @@ while [[ $# -gt 0 ]]; do
         --settle-s)          SETTLE_S="$2"; shift 2 ;;
         --ready-timeout-s)   READY_TIMEOUT_S="$2"; shift 2 ;;
         --cell-timeout-s)    CELL_TIMEOUT_S="$2"; shift 2 ;;
+        --cell-hang-tok-s)   CELL_HANG_TOK_S="$2"; shift 2 ;;
         --serve-args)        SERVE_ARGS="$2"; shift 2 ;;
         --seed)              SEED="$2"; shift 2 ;;
         --mlx-python)        MLX_PYTHON="$2"; shift 2 ;;
@@ -331,6 +357,7 @@ while [[ $# -gt 0 ]]; do
         --scale-grid-conc)   SCALE_GRID_CONC="$2"; shift 2 ;;
         --scale-grid-users-output) SCALE_GRID_USERS_OUTPUT="$2"; shift 2 ;;
         --scale-num-prompts) SCALE_NUM_PROMPTS="$2"; shift 2 ;;
+        --scale-repeats)     SCALE_REPEATS="$2"; shift 2 ;;
         --scale-rounds)      SCALE_ROUNDS="$2"; shift 2 ;;
         --scale-warmups)     SCALE_WARMUPS="$2"; shift 2 ;;
         --scale-base-input)  SCALE_BASE_INPUT="$2"; shift 2 ;;
@@ -350,9 +377,12 @@ while [[ $# -gt 0 ]]; do
         *)                   echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
-# This Mac's set: the large models need 64 GB, the small ones are the round below that.
+# Every Mac runs the small set; its memory picks only the grid's prompts (below).
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
-if (( MEM_GB >= LARGE_GB )); then MODELS_DEFAULT="${MODELS_LARGE}"; else MODELS_DEFAULT="${MODELS_SMALL}"; fi
+MODELS_DEFAULT="${MODELS_SMALL}"   # the large set runs by name (--models large)
+if [[ -z "${SCALE_GRID_INPUT}" ]]; then
+    if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_INPUT="${SCALE_GRID_INPUT_LARGE}"; else SCALE_GRID_INPUT="${SCALE_GRID_INPUT_SMALL}"; fi
+fi
 [[ ${#MODELS[@]} -eq 0 ]] && IFS=',' read -r -a MODELS <<<"${MODELS_DEFAULT}"
 case "${MODELS[*]}" in
     all)   MODELS=("${MODELS_ALL[@]}") ;;
@@ -382,6 +412,7 @@ VLLM_BIN="$(command -v vllm || true)"
 OMLX_BIN="$(command -v omlx || true)"
 [[ -z "${OMLX_BIN}" && -x "${HOME}/.omlx/bin/omlx" ]] && OMLX_BIN="${HOME}/.omlx/bin/omlx"
 MISTRALRS_BIN="$(command -v mistralrs || true)"
+SPLASH_BIN="$(command -v splash || true)"
 
 # key|label|variable holding its binary: one row per comparison engine, in the
 # order the page shows them. key names its JSON fields (cache_ladder_<key>, ...).
@@ -393,6 +424,7 @@ ENGINE_ROWS=(
     "omlx|oMLX|OMLX_BIN"
     "omlx_tq|oMLX TurboQuant|OMLX_BIN"
     "mistralrs|mistral.rs|MISTRALRS_BIN"
+    "splash|Splash|SPLASH_BIN"
 )
 # --engines: run exactly these (by label or key), and refuse a name that is
 # unknown or not installed; all, every installed engine; scratchy, none or ""
@@ -485,8 +517,25 @@ engine_version() { # key
                     [[ -n "${v}" ]] && echo "${v}" \
                         || { local -a py; read -r -a py <<<"$(head -1 "${VLLM_BIN}" | sed 's/^#!//')"
                              "${py[@]}" -c 'import importlib.metadata as m; print(m.version("vllm-metal"))'; } ;;
-        omlx)       "${OMLX_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 ;;
+        omlx)       # a source checkout (the Metal bench skill's install) by its commit, which
+                    # tells a branch from the release it was cut after, -dirty when it has local
+                    # changes (no pin matches that); else the release it prints. Only a launcher
+                    # run by a python, and a checkout whose top is the package's own source: git -C
+                    # "" is the cwd (scratchy), and git -C walks up to any repo around a site-packages.
+                    local -a py; read -r -a py <<<"$(head -1 "${OMLX_BIN}" | sed 's/^#!//')"
+                    local src=""
+                    [[ "${py[${#py[@]}-1]##*/}" == python* ]] && src="$("${py[@]}" -c \
+                        'import omlx, os; print(os.path.dirname(os.path.dirname(os.path.realpath(omlx.__file__))))' 2>/dev/null)"
+                    if [[ -n "${src}" && "$(git -C "${src}" rev-parse --show-toplevel 2>/dev/null)" == "${src}" ]]; then
+                        echo "$(git -C "${src}" rev-parse HEAD)$(git -C "${src}" diff --quiet HEAD || echo -dirty)"
+                    else
+                        "${OMLX_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1
+                    fi ;;
         mistralrs)  "${MISTRALRS_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 ;;
+        splash)     # the Homebrew formula's version, else what the binary prints
+                    local v; v="$(brew list --versions splash 2>/dev/null | awk '{print $2}')"
+                    [[ -n "${v}" ]] && echo "${v}" \
+                        || "${SPLASH_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 ;;
     esac 2>/dev/null || true
 }
 pin_for() { # label -> its pinned version, or nothing; always succeeds (set -e). Any case.
@@ -502,8 +551,8 @@ check_pin() { # label installed
     local want; want="$(pin_for "$1")"
     if [[ -z "${want}" ]]; then
         pin_problems+=("$1 is not pinned (installed: ${2:-unknown})")
-    elif [[ "$1" == scratchy ]]; then
-        [[ "$2" == "${want}"* ]] || pin_problems+=("scratchy is at ${2:0:12}, pinned ${want}")
+    elif [[ "$2" =~ ^[0-9a-f]{40}$ ]]; then # a commit (scratchy, a source-built oMLX): its prefix
+        [[ "$2" == "${want}"* ]] || pin_problems+=("$1 is at ${2:0:12}, pinned ${want}")
     elif [[ "${2#b}" != "${want#b}" ]]; then
         pin_problems+=("$1 is ${2:-unknown}, pinned ${want}")
     fi
@@ -568,10 +617,10 @@ for row in "${ENGINE_ROWS[@]}"; do
 done
 PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
-export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB
+export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB MODELS_GIVEN
 export STARTED_UTC PERCENTILES PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
-       SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS \
-       MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S RESUME MODELS_FULL
+       SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS SCALE_REPEATS \
+       MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S CELL_HANG_TOK_S RESUME MODELS_FULL
 python3 - "${JSON}" "${chip}" <<'PY'
 import json, os, subprocess, sys
 out, chip = sys.argv[1:3]
@@ -610,14 +659,24 @@ json.dump({
              # overview columns.
              "classes": [dict(zip(("class", "small", "large"), row.split("|")))
                          for row in e["CLASS_TABLE"].splitlines()],
-             # The memory from which a Mac runs the large set.
+             # The memory from which a Mac's grid runs to 8192-token prompts (below it, 4096).
              "large_from_gb": int(e["LARGE_GB"]),
+             # The set every Mac runs by default, small, whatever its memory, recorded only by a
+             # run that took it (no --models): the page reads the overview's column models from the
+             # newest run that records a lineup, so a --models large, full or by-name run must not
+             # say small. None there, as in runs from before it, which took the large set from
+             # large_from_gb.
+             "default_set": None if e["MODELS_GIVEN"] == "1" else "small",
+             # The run named its models (--models): it took no default set, and the page takes the
+             # lineup's rule from the newest run that did.
+             "models_given": e["MODELS_GIVEN"] == "1",
              "cold_priming_launches": int(e["PRIME_LAUNCHES"]),
              "startup_request": {"input_len": int(e["INPUT_LEN"]), "output_len": int(e["OUTPUT_LEN"]),
                                  "warm_requests": int(e["WARM_REQUESTS"])},
              "kv_cache_dtype": e["KV_CACHE_DTYPE"] or "default (TurboQuant)",
              "scratchy_serve_args": e["SERVE_ARGS"] or None,
              "cell_timeout_s": int(e["CELL_TIMEOUT_S"]),
+             "cell_hang_tok_s": int(e["CELL_HANG_TOK_S"]),
              # --resume: cells an earlier run of this output finished are kept, not remeasured.
              "resumed": e["RESUME"] == "1",
              # bench serve counts a request whose stream ended aborted or errored
@@ -634,6 +693,7 @@ json.dump({
                           "conc": int(e["SCALE_BASE_CONC"])},
                  "min_prompts_per_cell": int(e["SCALE_NUM_PROMPTS"]),
                  "min_rounds_per_cell": int(e["SCALE_ROUNDS"]),
+                 "repeats_per_cell": int(e["SCALE_REPEATS"]),
                  "concurrency_is": "offered (--max-concurrency), not the effective decode batch"},
              "comparison": {row.split("|")[0]: row.split("|")[2] == "1"
                             for row in e["ENGINE_INFO"].splitlines()[1:]},
@@ -688,6 +748,10 @@ kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "${c}"; done; kil
 cleanup() {
     exec >/dev/null; echo
     serve_down
+    # While the processes it measured are still ours to stop: folds the CSV and
+    # prints nothing (stdout is already gone); the happy path folds again, loudly,
+    # after the final summary — fold_power itself only runs once.
+    fold_power
     local c; for c in $(pgrep -P $$); do kill_tree "${c}"; done
     # A killed subshell orphans its children, so also stop whatever is on this run's port.
     pkill -TERM -f "bench (startup|serve) .*(--port ${PORT}|127\.0\.0\.1:${PORT})" 2>/dev/null || true
@@ -695,6 +759,63 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
+
+# Whole-run energy, one number. The workspace's own zero-dependency sampler
+# reads Apple's CLPC cpu/gpu/ane energy counters (IOReport, no root) once a
+# second into RAW; fold_power sums them into the run JSON at the end. It runs
+# from before the first build to after the last server is down, so the number
+# covers everything the run cost — the same window for every engine.
+POWER_LOG="${RAW}/power.csv"
+POWER_FOLDED=0
+fold_power() { # stop the sampler and fold its CSV into the run JSON, once
+    [[ ${POWER_FOLDED} -eq 0 && -n "${POWER_PID:-}" ]] || return 0
+    POWER_FOLDED=1
+    { kill -TERM "${POWER_PID}" 2>/dev/null || true; wait "${POWER_PID}" 2>/dev/null || true; } 2>/dev/null
+    [[ -s "${POWER_LOG}" ]] || die "power sampler wrote nothing to ${POWER_LOG} (see ${RAW}/power-sampler.log)"
+    python3 - "${JSON}" "${POWER_LOG}" <<'PY'
+import csv, json, sys
+js, power_log = sys.argv[1], sys.argv[2]
+# A row: unix_s, interval_s, cpu_j, gpu_j, ane_j, the interval that ended at unix_s.
+rows = [[float(x) for x in r] for r in csv.reader(open(power_log)) if len(r) == 5]
+cpu = sum(r[2] for r in rows)
+gpu = sum(r[3] for r in rows)
+ane = sum(r[4] for r in rows)
+window = sum(r[1] for r in rows)
+# Peak power: the highest single interval's energy over that interval's own length.
+peak = max((r[2] + r[3] + r[4]) / r[1] for r in rows if r[1] > 0)
+# soc: CPU + GPU + ANE, the rails every reader has; DRAM and display are not in it.
+soc = cpu + gpu + ane
+reader = next((l.split("energy from ", 1)[1].strip() for l in open(power_log.replace("power.csv", "power-sampler.log"))
+               if "energy from " in l), "unknown")
+d = json.load(open(js))
+d["power"] = {
+    "source": f"scratchy-power-sampler ({reader})",
+    "csv": power_log,
+    "samples": len(rows),
+    "window_s": round(window, 1),
+    "cpu_j": round(cpu, 1), "gpu_j": round(gpu, 1), "ane_j": round(ane, 1),
+    "soc_j": round(soc, 1), "soc_wh": round(soc / 3600, 3),
+    "soc_avg_w": round(soc / window, 2) if window else None,
+    "soc_peak_w": round(peak, 2),
+}
+json.dump(d, open(js, "w"), indent=2)
+print(f"power   : {soc / 3600:.2f} Wh soc ({cpu / 3600:.2f} cpu, {gpu / 3600:.2f} gpu, {ane / 3600:.2f} ane)"
+      f" over {window:.0f}s, peak {peak:.1f} W -> {js}")
+PY
+}
+if (( SKIP_BUILD )); then
+    [[ -x "${ROOT}/target/release/scratchy-power-sampler" ]] \
+        || die "--skip-build, but there is no target/release/scratchy-power-sampler to run"
+else
+    cargo build --release -p scratchy-power-sampler >"${RAW}/power-build.log" 2>&1 \
+        || die "scratchy-power-sampler build failed: see ${RAW}/power-build.log"
+fi
+"${ROOT}/target/release/scratchy-power-sampler" --interval-ms 1000 \
+    >"${POWER_LOG}" 2>"${RAW}/power-sampler.log" &
+POWER_PID=$!
+sleep 1
+kill -0 "${POWER_PID}" 2>/dev/null \
+    || die "power sampler died at startup: $(tail -2 "${RAW}/power-sampler.log" 2>/dev/null)"
 
 max_of() { local m=0 x; IFS=',' read -r -a _xs <<<"$1"; for x in "${_xs[@]}"; do (( x > m )) && m=${x}; done; echo "${m}"; }
 
@@ -772,6 +893,19 @@ mistralrs_cmd() { # --max-model-len is its context; --max-seq-len only sizes dev
 }
 mistralrs_ready() { echo /v1/models; }
 
+# Splash serves the Qwen family only, so other models get no column. It loads the
+# MLX checkpoint scratchy measures, with the DFlash draft it ships for that model
+# (there is no switch to turn the draft off), and batches concurrent requests by
+# itself: --queue-size is how many it admits at once, not a batch size, and its
+# default (32) is above every users count here. It plans memory as if it had the
+# whole Mac, which it does here, one server at a time.
+splash_model() { case "$1" in qwen*) echo "$2" ;; esac; }
+splash_cmd() { # --max-context is its context limit; its own default is the model's
+    local x=""; (( $3 )) && x+=" --max-context $3"
+    echo "${SPLASH_BIN} serve --model $1 --served-model-name $1 --host 127.0.0.1 --port ${PORT}${x}"
+}
+splash_ready() { echo /ready; }
+
 # The largest context any of this run's sweeps needs (0 without scaling).
 largest_ctx() {
     local m=0 a par ctx; local -a axs
@@ -828,6 +962,11 @@ footprint_bytes() { # pid -> bytes, or nothing if it has gone
     taskpolicy -b footprint -f bytes -p "$1" 2>/dev/null \
         | awk '{ for (i = 1; i < NF; i++) if ($i == "Footprint:") { print $(i + 1); exit } }' || true
 }
+# The Mac's thermal state as pmset reports it, one "Name = N" a line: nothing on a cool Mac (its
+# "No ... recorded" notes), a CPU speed limit and warning levels on a throttled one. Taken around
+# every repeat, so a cell measured on a throttled Mac can be told from one that was not.
+# A pmset that fails prints "unread" instead, so it is not taken for a cool Mac.
+therm_now() { pmset -g therm 2>/dev/null || echo unread; }
 mem_sampler() { # pid out
     local p b s
     exec >/dev/null; echo   # a refused log line in the forked buffer must not reach tree_pids (cleanup)
@@ -856,6 +995,16 @@ print(f"{j['output_throughput']:7.1f} tok/s · TTFT p50 {f(j['median_ttft_ms'], 
 PY
 }
 run_cell() { # prefix axis rung input output conc
+    # Each repeat on the same server; a repeat that hung or failed ends the cell, and the next
+    # cell gets a fresh server (run_rep).
+    local r
+    for (( r = 0; r < SCALE_REPEATS; r++ )); do
+        run_rep "$@" "${r}"
+        (( cells_hung || cells_dead )) && break
+    done
+    return 0
+}
+run_rep() { # prefix axis rung input output conc repeat
     # The cell before this one timed out or had failed requests: a fresh server, so a server
     # that ran out of memory there is not what this cell measures. One that will not come back
     # leaves the rest of the sweep unmeasured.
@@ -871,12 +1020,14 @@ run_cell() { # prefix axis rung input output conc
             return 0
         fi
     fi
-    local out_json="$1.$2-$3.json" seed rc=0
+    # Repeat 0 keeps the cell's own file and seed, so a run from before repeats reads the same.
+    local out_json="$1.$2-$3.json" seed rc=0 tag="" warmups="${SCALE_WARMUPS}"
+    (( $7 )) && { out_json="$1.$2-$3.r$7.json"; tag=":r$7"; warmups=0; }
     # Enough requests that the users count is kept full: one round alone is
     # a ramp-up and a drain, and fewer requests than users never fill it.
     local n=$(( $6 * SCALE_ROUNDS > SCALE_NUM_PROMPTS ? $6 * SCALE_ROUNDS : SCALE_NUM_PROMPTS ))
-    seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:$2:$3" | cksum | cut -d' ' -f1)
-    printf '    %-16s in %-5s out %-5s conc %-3s ' "$2=$3" "$4" "$5" "$6"
+    seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:$2:$3${tag}" | cksum | cut -d' ' -f1)
+    printf '    %-16s in %-5s out %-5s conc %-3s ' "$2=$3${tag#:}" "$4" "$5" "$6"
     # --resume: a cell an earlier run of this output finished cleanly is kept, not measured again.
     if (( RESUME )) && python3 -c 'import json, sys; j = json.load(open(sys.argv[1]))
 sys.exit(not j.get("completed") or any(j.get(k) for k in ("failed", "timed_out", "dead_server")))' \
@@ -884,18 +1035,22 @@ sys.exit(not j.get("completed") or any(j.get(k) for k in ("failed", "timed_out",
         echo "$(numbers "${out_json}") · kept (--resume)"
         return 0
     fi
-    local mem="${out_json%.json}.mem" sampler=""
+    local mem="${out_json%.json}.mem" sampler="" therm_before therm_after
     rm -f "${mem}"
+    therm_before="$(therm_now)"
     [[ -n "${srv}" ]] && { mem_sampler "${srv}" "${mem}" & sampler=$!; }
-    # perl's alarm survives exec: SIGALRM ends the client after CELL_TIMEOUT_S.
+    # The cell's limit: the flat one, plus its answers decoded at a hang's rate, its users at once.
+    local limit=$(( CELL_TIMEOUT_S + ((n + SCALE_WARMUPS + $6 - 1) / $6) * $5 / CELL_HANG_TOK_S ))
+    # perl's alarm survives exec: SIGALRM ends the client after the limit.
     # The client's output goes to a log; stderr off hides bash's job notice.
-    { perl -e 'alarm shift; exec @ARGV' "${CELL_TIMEOUT_S}" \
+    { perl -e 'alarm shift; exec @ARGV' "${limit}" \
         "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${cell_model:-${id}}" \
         ${cell_tok:+--tokenizer "${cell_tok}"} \
         --num-prompts "${n}" --input-len "$4" --output-len "$5" \
-        --max-concurrency "$6" --temperature 0 --seed "${seed}" --num-warmups "${SCALE_WARMUPS}" \
-        --percentile-metrics ttft,tpot,e2el --metric-percentiles "${PERCENTILES}" \
+        --max-concurrency "$6" --temperature 0 --seed "${seed}" --num-warmups "${warmups}" \
+        --percentile-metrics ttft,tpot,e2el --metric-percentiles "${PERCENTILES}" --save-detailed \
         --output-json "${out_json}" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1; } 2>/dev/null || rc=$?
+    therm_after="$(therm_now)"
     [[ -n "${sampler}" ]] && { kill "${sampler}" 2>/dev/null; wait "${sampler}" 2>/dev/null; } || true
     [[ -s "${mem}" && -f "${out_json}" ]] && python3 - "${out_json}" "${mem}" <<'PY' || true
 import json, statistics, sys
@@ -905,7 +1060,7 @@ json.dump(j, open(sys.argv[1], "w"), indent=2)
 PY
     if (( rc == 142 )); then
         cells_hung=1
-        echo "timed out after ${CELL_TIMEOUT_S}s"
+        echo "timed out after ${limit}s"
         # The client wrote nothing: record the cell as one whose every request failed.
         python3 - "${out_json}" "${n}" <<'PY2'
 import json, sys
@@ -953,6 +1108,21 @@ PY2
             echo "    ${why} (see ${RAW}/cells-${stem}.log)"
         fi
     fi
+    # Every repeat's file now exists, a failed or timed-out one's too: the Mac's thermal state
+    # around it goes in, so a cell measured on a throttled Mac can be told from one that was not.
+    [[ -f "${out_json}" ]] && python3 - "${out_json}" "${therm_before}" "${therm_after}" <<'PY' || true
+import json, re, sys
+p, before, after = sys.argv[1:4]
+def therm(text):
+    """pmset -g therm as numbers, each "Name = N" line: {} where it reports no warning, None where
+    pmset could not be read (therm_now's "unread")."""
+    if text.strip() == "unread":
+        return None
+    return {k.strip(): int(v) for k, v in re.findall(r"^\s*([A-Za-z0-9_ ]+?)\s*=\s*(\d+)\s*$", text, re.M)}
+j = json.load(open(p))
+j["thermal"] = {"before": therm(before), "after": therm(after)}
+json.dump(j, open(p, "w"), indent=2)
+PY
 }
 run_scale_cells() { # prefix restart-function full-length [axes]
     # full-length: 1 where the engine serves ignore_eos to full length (scratchy), so a short
@@ -1037,7 +1207,7 @@ engine_prepare() { # key label model -> prints the name requests carry; fails if
     fi
     serve_up "${log}" "$("${key}_ready")" bash -c "exec ${up}" || { prepare_failed; return 1; }
     case "${key}" in
-        mlx_lm|vllm_metal) name="${model}" ;;
+        mlx_lm|vllm_metal|splash) name="${model}" ;;   # splash: --served-model-name is the repo id
         ollama)
             show() { curl -fsS -m 10 "http://127.0.0.1:${PORT}/api/show" -d "{\"model\":\"${model}\"}"; }
             if ! show >/dev/null 2>&1; then
@@ -1431,7 +1601,11 @@ KEEP = ["median_ttft_ms", "median_tpot_ms",
         # A cell the client never finished (--cell-timeout-s), so its requests count as failed.
         "timed_out",
         # A cell whose server answered with almost nothing (run_cell): no measurement.
-        "dead_server"]
+        "dead_server",
+        # The Mac's thermal state around the cell (run_rep): {} where pmset reports no warning, a
+        # CPU speed limit where the Mac was throttled. Over repeats, the first's before and the
+        # last's after (pooled).
+        "thermal"]
 CELL = re.compile(r"\.(conc|input|output|grid)-(\d+)(?:x(\d+))?(?:@(\d+))?\.json$")
 def load(name):
     p = os.path.join(raw, name)
@@ -1441,6 +1615,48 @@ def load(name):
 PCT = re.compile(r"p[0-9.]+_(ttft|tpot|e2el)_ms")
 def metrics(j):
     return {k: v for k, v in j.items() if k in KEEP or PCT.fullmatch(k)} if j else None
+def pct(xs, p):
+    """numpy.percentile(method='linear'), as bench serve computes its own."""
+    if not xs:
+        return None
+    xs = sorted(xs); k = (len(xs) - 1) * p / 100; f = int(k)
+    return xs[f] + (xs[min(f + 1, len(xs) - 1)] - xs[f]) * (k - f)
+def requests(reps):
+    """Every request of a cell's repeats, from bench serve's --save-detailed: parallel arrays in
+    request order, ms. A timing is null where it was never seen: the request failed, or (TTFT
+    and TPOT) all its tokens came in one chunk, which bench serve leaves out of them too."""
+    out = {k: [] for k in ("rep", "ttft_ms", "tpot_ms", "e2el_ms", "output_tokens")}
+    for r, j in enumerate(reps):
+        for t, e2, n, ch, err in zip(j["ttfts"], j["latencies"], j["output_lens"], j["chunks"], j["errors"]):
+            ok, streamed = not err, not (n > 1 and ch <= 1)
+            out["rep"].append(r)
+            out["ttft_ms"].append(round(t * 1000, 1) if ok and streamed else None)
+            out["tpot_ms"].append(round((e2 - t) * 1000 / (n - 1), 2) if ok and streamed and n > 1 else None)
+            out["e2el_ms"].append(round(e2 * 1000, 1) if ok else None)
+            out["output_tokens"].append(n)
+    return out
+def pooled(reps):
+    """A cell's figures over every request of all its repeats, as bench serve figures one."""
+    if len(reps) == 1 or not all("errors" in j for j in reps):
+        return metrics(reps[0])
+    m = metrics(reps[0]) | {k: sum(j.get(k) or 0 for j in reps)
+                            for k in ("completed", "failed", "total_output_tokens", "duration", "unstreamed_requests")}
+    m["output_throughput"] = m["total_output_tokens"] / m["duration"] if m["duration"] else None
+    m["request_throughput"] = m["completed"] / m["duration"] if m["duration"] else None
+    q = requests(reps)
+    for name in ("ttft", "tpot", "e2el"):
+        xs = [x for x in q[f"{name}_ms"] if x is not None]
+        m[f"median_{name}_ms"] = pct(xs, 50)
+        for p in (int(x) for x in env["PERCENTILES"].split(",")):
+            m[f"p{p}_{name}_ms"] = pct(xs, p)
+    for k in ("timed_out", "dead_server"):
+        if any(j.get(k) for j in reps):
+            m[k] = True
+    # The Mac's thermal state around the whole cell: before its first repeat, after its last.
+    if any("thermal" in j for j in reps):
+        m["thermal"] = {"before": (reps[0].get("thermal") or {}).get("before"),
+                        "after": (reps[-1].get("thermal") or {}).get("after")}
+    return m
 grid_users = {int(x) for x in env["GRID_CONC_LIST"].split(",")}
 grid_inputs = {int(x) for x in env["SCALE_GRID_INPUT"].split(",") if x}
 def scaling(engine):
@@ -1458,7 +1674,14 @@ def scaling(engine):
         where = ({"rung": f"{a}x{b}", "input_len": int(a), "output_len": int(b),
                   "conc": int(users or env["BASE_CONC"])}
                  if axis == "grid" else {"rung": int(a)})
-        cells.append({"axis": axis, **where, **metrics(j)})
+        # Its repeats after the first (run_rep), in order, up to the first missing one.
+        reps = [j]
+        while len(reps) < int(env["SCALE_REPEATS"]) and (r := load(os.path.basename(p)[:-5] + f".r{len(reps)}.json")):
+            reps.append(r)
+        cell = {"axis": axis, **where, **pooled(reps), "repeats": len(reps)}
+        if all("errors" in r for r in reps):
+            cell["requests"] = requests(reps)
+        cells.append(cell)
     return cells or None
 def parity_ties():
     """From the gate's log: {prompt: [gap, ...]} for each prompt that passed as a near-tie."""
@@ -1542,6 +1765,7 @@ done
 
 echo; echo "================================================================"
 summary
+fold_power
 
 # A model scratchy never served must fail the run, not sit in the table as a
 # row of dashes: a preset that matches no checkpoint looks exactly like that.

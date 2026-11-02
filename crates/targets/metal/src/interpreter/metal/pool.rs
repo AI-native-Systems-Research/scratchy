@@ -2218,13 +2218,6 @@ fn write_runtime_inputs(
             return Err(ForwardError::KvNotMapped { block, mapped });
         }
     }
-    // The forward's actual num_tokens, for a kernel that reads M at runtime.
-    write(
-        "num_tokens",
-        &runtime.num_tokens_u32,
-        bytes_of(&[inputs.num_tokens]),
-        Padding::Zero,
-    )?;
     // The rows the forward samples: the lm_head slice gathers them and puts them back, a
     // compaction moves their logits to the front.
     let sampled = inputs.sampled_rows;
@@ -2449,7 +2442,6 @@ mod tests {
             kv_cache_v: (0..num_layers).map(|_| alloc(device, 16)).collect(),
             block_unrotated_flags: (0..num_layers).map(|_| alloc(device, 16)).collect(),
             tq: None,
-            num_tokens_u32: alloc(device, 4),
             num_sample_rows_u32: alloc(device, 4),
             sample_indices: alloc(device, 16),
             gdn_state_conv: ::std::vec::Vec::new(),
@@ -2800,7 +2792,6 @@ mod tests {
             kv_cache_v: vec![alloc(d, 16)],
             block_unrotated_flags: vec![alloc(d, 16)],
             tq: None,
-            num_tokens_u32: alloc(d, 4),
             num_sample_rows_u32: alloc(d, 4),
             sample_indices: alloc(d, max_m_bytes),
             gdn_state_conv: ::std::vec::Vec::new(),
@@ -3205,6 +3196,86 @@ mod tests {
             [5, 80, 81, 9],
             "variant 2, picked on the device"
         );
+    }
+
+    /// Every buffer a step's input writes reach is in the set its command buffer declares: a copy
+    /// or fill into one that is not lands wherever its stale pages map, which on gemma-4-12b at a
+    /// long context is a buffer the forward reads (#429).
+    #[test]
+    fn a_step_writes_only_buffers_its_command_buffer_holds_resident() {
+        let Some(pool) = build_multi_bucket_pool(&[4], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        pool.ensure_mtl4();
+        let residency = pool.allocator.residency();
+        let sampled = residency.pin(crate::mtl4_dispatch::shared_bytes(
+            &pool.device,
+            bytes_of(&[42]),
+        ));
+        residency.commit();
+        let guard = pool.checkout().expect("a worker");
+        let token = crate::interpreter::metal::DeviceInput::token((*sampled).clone(), 0, 0);
+        let inputs = ForwardInputs {
+            span_ids: Some(&[0]),
+            num_tokens: 1,
+            input_ids: &[5],
+            positions: &[3],
+            slot_mappings: vec![&[3]],
+            cu_seqlens_q: Some(&[0, 1]),
+            seq_used_k: Some(&[4]),
+            block_tables: Vec::new(),
+            sampled_rows: &EVERY_ROW[..1],
+            gdn_state_indices: None,
+            gdn_is_fresh: Some(&[0]),
+            vision_rope_freqs: None,
+            vision_cu_seqlens_full: None,
+            vision_cu_seqlens_window: None,
+            vision_window_index: None,
+            vision_reverse_indices: None,
+            vision_position_ids: None,
+            pixels: None,
+            pos_embeds: None,
+            mm_embeds: None,
+            mm_dst_rows: None,
+            mrope_cos_sin: None,
+            target_hidden: None,
+            device_inputs: &[token],
+            deferred: None,
+            reads: ForwardReads::Outputs,
+        };
+        let writes = begin_step(&guard, &inputs, pool.block_table_stride).expect("inputs fit");
+        let reached: Vec<&Buffer> = (writes.ops.iter())
+            .flat_map(|op| match op {
+                InputWrite::Staged { to, .. } | InputWrite::Fill { to, .. } => vec![to],
+                InputWrite::Device { src, to, .. } => vec![src, to],
+                InputWrite::Select { .. } => Vec::new(),
+            })
+            .collect();
+        assert!(!reached.is_empty(), "the step writes its inputs");
+        let runtime = &guard.runtime;
+        let named = |b: &Buffer| {
+            let fields = [
+                ("input_ids", &runtime.input_ids),
+                ("positions", &runtime.positions),
+                ("cu_seqlens_q", &runtime.cu_seqlens_q),
+                ("seq_used_k", &runtime.seq_used_k),
+                ("span_ids", &runtime.span_ids),
+                ("num_sample_rows_u32", &runtime.num_sample_rows_u32),
+                ("sample_indices", &runtime.sample_indices),
+                ("gdn_is_fresh", &runtime.gdn_is_fresh),
+            ];
+            (fields.iter())
+                .find(|(_, f)| std::ptr::eq(&***f, &**b))
+                .map_or("a buffer", |(n, _)| n)
+        };
+        for b in reached {
+            assert!(
+                residency.holds(&**b),
+                "the step writes {}, which its command buffer does not hold resident",
+                named(b)
+            );
+        }
     }
 
     /// Two forwards played onto one command buffer, on one worker: each reads its own inputs — its

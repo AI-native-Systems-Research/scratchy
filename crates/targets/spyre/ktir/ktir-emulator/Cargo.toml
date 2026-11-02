@@ -111,6 +111,10 @@ path = "tests/port_lx_scoping.rs"
 name = "port_ops"
 path = "tests/port_ops.rs"
 
+[[test]]
+name = "sampler_on_emulator"
+path = "tests/sampler_on_emulator.rs"
+
 [[bench]]
 name = "smollm2_bench"
 path = "benches/smollm2_bench.rs"
@@ -127,6 +131,13 @@ optional = true
 [dependencies.ktir-core]
 version = "0.1.0"
 path = "../ktir-core"
+
+# ⭐ THE `Program` KIND, for the resident's door recognition — the chained head's
+# doors are substituted by carried kind, never by a parsed name. A leaf (its own
+# header's "⛔ NEVER ktir-emulator" forbids the REVERSE edge, which this is not).
+[dependencies.ktir-superdsc]
+version = "0.1.0"
+path = "../ktir-superdsc"
 
 [dependencies.ktir-optimizer]
 version = "0.1.0"

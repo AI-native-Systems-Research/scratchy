@@ -382,6 +382,11 @@ pub struct AttentionViaCacheConstants {
     pub query_rows: QueryRows,
 }
 
+impl AttentionViaCacheConstants {
+    /// `ATTN_SINKS` (slot 21): the sink column's switch ([`Self::sinks`]).
+    pub const SINKS: ConstSlot = ConstSlot(21);
+}
+
 /// What the decode attention's threadgroup rows query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueryRows {
@@ -420,7 +425,10 @@ impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
             v.push(ConstantValue::uint(ConstSlot(12), pc));
         }
         if let Some(sinks) = c.sinks {
-            v.push(ConstantValue::uint(ConstSlot(21), sinks));
+            v.push(ConstantValue::uint(
+                AttentionViaCacheConstants::SINKS,
+                sinks,
+            ));
         }
         v.push(ConstantValue::uint(
             AttentionViaCacheTqConstants::HEADS,
@@ -1377,6 +1385,17 @@ pub struct ArgmaxConstants {
 
 impl From<ArgmaxConstants> for Vec<ConstantValue> {
     fn from(c: ArgmaxConstants) -> Self {
+        vec![ConstantValue::uint(ConstSlot(0), c.vocab.get())]
+    }
+}
+
+/// `logprobs.metal` slot 0: the logits per row.
+pub struct LogprobsConstants {
+    pub vocab: crate::tape::ids::LogitsWidth,
+}
+
+impl From<LogprobsConstants> for Vec<ConstantValue> {
+    fn from(c: LogprobsConstants) -> Self {
         vec![ConstantValue::uint(ConstSlot(0), c.vocab.get())]
     }
 }

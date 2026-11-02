@@ -587,7 +587,12 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
         kv: Default::default(),
         programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
             func: k_node.func,
+            program: k_node.program,
             args: Cow::Owned(args),
+            // Stated EXPLICITLY (auditor ruling 2026-10-27): this hand-built program
+            // minted no LX pins, so the window its fused segments run under is zero —
+            // a program without a stated window is refused, never silently charged.
+            lx_pin_window_bytes: Some(0),
         }]),
         init_binary: Cow::Borrowed(&[]),
         job_bin_ptr: 0,
@@ -691,7 +696,12 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
         kv: Default::default(),
         programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
             func: k_node.func,
+            program: k_node.program,
             args: Cow::Owned(args),
+            // Stated EXPLICITLY (auditor ruling 2026-10-27): this hand-built program
+            // minted no LX pins, so the window its fused segments run under is zero —
+            // a program without a stated window is refused, never silently charged.
+            lx_pin_window_bytes: Some(0),
         }]),
         init_binary: Cow::Borrowed(&[]),
         job_bin_ptr: 0,
@@ -783,7 +793,12 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
         kv: Default::default(),
         programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
             func: k_node.func,
+            program: k_node.program,
             args: Cow::Owned(args),
+            // Stated EXPLICITLY (auditor ruling 2026-10-27): this hand-built program
+            // minted no LX pins, so the window its fused segments run under is zero —
+            // a program without a stated window is refused, never silently charged.
+            lx_pin_window_bytes: Some(0),
         }]),
         init_binary: Cow::Borrowed(&[]),
         job_bin_ptr: 0,
@@ -1066,7 +1081,12 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
         kv: Default::default(),
         programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
             func: k_node.func,
+            program: k_node.program,
             args: Cow::Owned(args),
+            // Stated EXPLICITLY (auditor ruling 2026-10-27): this hand-built program
+            // minted no LX pins, so the window its fused segments run under is zero —
+            // a program without a stated window is refused, never silently charged.
+            lx_pin_window_bytes: Some(0),
         }]),
         init_binary: Cow::Borrowed(&[]),
         job_bin_ptr: 0,
@@ -1415,7 +1435,12 @@ fn execute_fp8_program(
         kv: Default::default(),
         programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
             func: k_node.func,
+            program: k_node.program,
             args: Cow::Owned(args),
+            // Stated EXPLICITLY (auditor ruling 2026-10-27): this hand-built program
+            // minted no LX pins, so the window its fused segments run under is zero —
+            // a program without a stated window is refused, never silently charged.
+            lx_pin_window_bytes: Some(0),
         }]),
         init_binary: Cow::Borrowed(&[]),
         job_bin_ptr: 0,

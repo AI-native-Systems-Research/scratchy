@@ -53,6 +53,7 @@ use ktir_superdsc::placement::{
 use ktir_superdsc::reserved_tids::{ROPE_P_TID, scalarmul_scale_tid};
 use ktir_superdsc::superdsc_opspec::Df;
 use ktir_superdsc::wire::SEGMENT_SIZE;
+use ktir_superdsc::work::DeviceWidth;
 
 use crate::Error;
 
@@ -146,7 +147,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // contract agrees independently (`semantic.py`'s `descriptor_gather` asserts an int16/int32
     // index vector; `embedding.py` declares `desc_ids` as `*i32` for exactly this reason).
     for g in &gathers {
-        let idx_dtype = index_view_dtype(node, g.index_tid);
+        let idx_dtype = param_view_dtype(node, g.index_tid);
         if idx_dtype != Some(ktir_core::dtypes::DType::I32) {
             return Err(Error {
                 stage: "layout",
@@ -162,6 +163,27 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         }
     }
     let index_tids: std::collections::BTreeSet<u32> = gathers.iter().map(|g| g.index_tid).collect();
+
+    // ⭐⭐⭐ THE PARAMETERS A CONVERT DOOR SWEEPS (the β ruling, front-b-noise, auditor
+    // 2026-10-27) — reserved at the DEVICE width below, not the logical footprint. The
+    // door's β admission widens a sub-device-width whole-view column window to
+    // `DeviceWidth::for_convert` (the 64-element width our own `PlanCorelets` demands of a
+    // tile — the α cell's base bake measured the 32-element refusal), and the emitter then
+    // SWEEPS that width over the placement this loop sizes: a `[rows, 1]` seed table read
+    // through a crossed convert (the sampler's gate) is swept at `rows × 64 × word` bytes
+    // while `synth_footprint_bytes` reserves `rows × 32 × word` (the SenUint32 stick) —
+    // MEASURED as `resolve_seg_base`'s refusal on the b1 dump: `t4: access window end 256B
+    // (offset 0B, operand 256B) exceeds its placement footprint 2B (seg3)`. ONE decision for
+    // the reservation and the sweep (`for_convert`, the matmul `dev_dims` precedent), so they
+    // cannot disagree. A FIXED POINT at every 64-multiple: every convert-read parameter ever
+    // placed is full-row-width (the sampler's logits at [1, 65536], the fp8 tail's
+    // activations), where `for_convert(cols) == cols` and this reservation is
+    // byte-identical to `synth_footprint_bytes` — only the sampler's `[rows, 1]` gate moves.
+    // The kind set is the DOOR'S OWN (`whole_function`'s `convert kind of` discriminates
+    // exactly `ArithExtf | ArithFptosi | ArithSitofp | ArithTruncf`), read off the same
+    // load→tile→view→argument chain `bound_scale_of` walks, so the placement and the
+    // descriptor cannot disagree about which buffer a convert reads.
+    let convert_swept = convert_swept_tids(node);
 
     let mut placements: std::collections::BTreeMap<u32, TensorPlacement> = Default::default();
     // Bytes placed per segment so far — the running high-water [`pack`] appends at.
@@ -224,25 +246,51 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // element product is the buffer's; `Region`'s own doc is explicit that the view shape is
         // not always the tensor's shape (rope views `x` as `[rows·heads, hd]`), and it is the
         // shape every descriptor here addresses through.
-        // ⭐⭐⭐ A GATHER'S INDEX BUFFER IS FOUR BYTES AN ELEMENT, AND THE FOOTPRINT GUARD IS WHY THIS
-        // CANNOT BE LEFT AT THE fp16 DEFAULT. `Region` states a view's fp8-ness and nothing else, so an
-        // `*i32` parameter was sized as if it were fp16 — 512 B for `embedding.py`'s `[256]` id vector
-        // against the 1024 B it really is. `resolve_seg_base`'s guard then compares the descriptor's
-        // 1024 B access against that 512 B placement and refuses the CORRECT descriptor:
-        //   `t0: access offset 0B + 1024B exceeds its placement footprint 512B (seg3)`
-        // — measured, and the reason this arm exists. Had the numbers happened to fit, the other
-        // direction would have been worse: the guard would have waved through an access reaching into
-        // whatever is packed next.
+        // ⭐⭐⭐ THE FORMAT IS THE PARAMETER'S OWN VIEW DTYPE, READ PER PARAMETER — not an fp16
+        // default with two carved exceptions. `Region` states a view's fp8-ness and nothing else,
+        // so this used to size every other parameter as if it were fp16 — which was measured to
+        // refuse the CORRECT descriptor the moment a kernel carries a non-fp16 parameter:
+        //   `t6: access window end 256B (offset 0B, operand 256B) exceeds its placement
+        //    footprint 128B (seg3)`
+        // for argmax's `[1,64]` f32 `sixtyfour` table — the f32 mulf accesses 256 B (64 × 4 B)
+        // against a 128 B (64 × 2 B) placement. Had the numbers happened to fit, the other
+        // direction would have been worse: the guard would have waved through an access reaching
+        // into whatever is packed next.
         //
-        // The format is [`Df::Uint32`], which is the format the DESCRIPTOR declares for that operand
-        // (`Role::KernelIdx` ⇒ SENUINT32, `wordLength` 4) — so the placement and the access are sized in
-        // ONE format rather than in two that have to agree.
-        let df = if index_tids.contains(&reg.tid) {
-            Df::SenUint32
-        } else if reg.is_fp8 {
-            Df::Fp8
-        } else {
-            Df::Fp16
+        // The dtype is the `ktdp.construct_memory_view`'s own `Dtype` — the only statement of that
+        // buffer's element width anywhere in the program — read by [`param_view_dtype`] through
+        // the SAME tid→parameter join [`regions`] itself uses. The mapping is one-to-one onto the
+        // formats the device has: F16→Fp16, F32→Fp32 (4 B / 32-stick), Fp8E4m3→Fp8 (which is what
+        // `Region::is_fp8` states, so the two readers agree by construction), I32→SenUint32 (4 B —
+        // the gather-index law below, now reached by the view's own dtype rather than by tid, and
+        // covering an `*i32` OUTPUT like argmax's `idx_ptr` exactly as it always covered the index).
+        // A view that states NO dtype is placed at fp16: that is the behavior-preserving reading
+        // (every parameter of every config that baked before states F16, Fp8E4m3 or the gather's
+        // I32, so this arm changes no existing placement), and "not stated" still cannot hide an
+        // over-run — the footprint guard compares the descriptor's access, sized by the OPS' own
+        // result types, against this placement, so an unstated-dtype parameter read at 4 B/elem is
+        // refused loudly rather than waved through. Every OTHER stated dtype (i1, i64) has no
+        // device format at all and is refused BY NAME — sizing it at fp16 would over-reserve and
+        // turn the guard into a rubber stamp for exactly the access it exists to catch.
+        let df = match param_view_dtype(node, reg.tid) {
+            Some(ktir_core::dtypes::DType::F16) => Df::Fp16,
+            Some(ktir_core::dtypes::DType::F32) => Df::Fp32,
+            Some(ktir_core::dtypes::DType::Fp8E4m3) => Df::Fp8,
+            Some(ktir_core::dtypes::DType::I32) => Df::SenUint32,
+            None => Df::Fp16,
+            Some(other) => {
+                return Err(Error {
+                    stage: "layout",
+                    message: format!(
+                        "{name}: the parameter t{} states element type {other:?}, which has no \
+                         device format — the placement would have to be sized at some other \
+                         format's bytes and the footprint guard would then be comparing an access \
+                         against a fiction. Give the buffer a dtype the device has (f16, f32, \
+                         f8E4M3FN, i32) or lower it through a view that states one.",
+                        reg.tid,
+                    ),
+                });
+            }
         };
         // ⛔⛔⛔ A RUNG-3 BOUND SCALE — a `[1,1]` PARAMETER — IS 2 B, NOT ITS STICK-PADDED
         // FOOTPRINT. `synth_footprint_bytes(&[1,1], Fp16)` pads the inner axis to the
@@ -262,7 +310,16 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // what `scalarmul_bound` passes `split_out_excluding` as a skip tid so the region
         // never counts as tensor arity.
         let is_bound_scale = reg.v_rows == 1 && reg.v_cols == 1;
-        let size = if is_bound_scale {
+        // ⭐⭐⭐ β FIRST, BEFORE THE BOUND-SCALE ARM — a `[1,1]` parameter a convert sweeps
+        // (the sampler's gate at the b1 rung) is NOT a launcher-bound fp16 const: the door
+        // addresses it at the 64-element device width, so the 2-B `SCALE_BYTES` placement is
+        // the measured over-run (256 B against 2 B). Every OTHER `[1,1]` parameter keeps the
+        // bound-scale size — its readers are broadcasts, granule-guarded at one 128-B read.
+        let size = if convert_swept.contains(&reg.tid) {
+            reg.v_rows as u64
+                * DeviceWidth::for_convert(reg.v_cols).get() as u64
+                * df.word_length() as u64
+        } else if is_bound_scale {
             SCALE_BYTES
         } else {
             synth_footprint_bytes(&[reg.v_rows, reg.v_cols], df)
@@ -501,6 +558,21 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
             .collect::<std::collections::BTreeMap<_, _>>(),
     );
 
+    // ⭐ THE GRAPH'S OWN SOURCE BOUND — the kernel's own tensor parameters: every Activation-role
+    // placement that is not a reserved const (P, the scale consts and the fp8 bounds are
+    // producer-staged, not caller-filled). The exclusive bound of those tids, the same fact
+    // `bundle_run`'s launch-time `declare_sources` derives from the bound inputs — stated here so
+    // the bundle carries it, per the `SegRole::Logits` law that a session reads a bundle's facts
+    // off the bundle. Computed BEFORE the literal, which moves `placements`.
+    let num_sources = placements
+        .values()
+        .filter(|p| {
+            p.role == SegRole::Activation && !ktir_superdsc::reserved_tids::is_reserved(p.tid)
+        })
+        .map(|p| p.tid + 1)
+        .max()
+        .unwrap_or(0);
+
     Ok(BundleLayout {
         placements,
         ids,
@@ -547,6 +619,12 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // No paged KV in a single Triton kernel's parameter list; 0 is the documented "no paged KV"
         // value, not a placeholder.
         kv_request_stride_bytes: 0,
+        // ⭐ THE GRAPH'S OWN SOURCE BOUND — computed above the literal (which moves `placements`).
+        num_sources,
+        // No source is resident: a single Triton kernel has no prefix-KV cache for the device to
+        // fill and no load-time constant tables for an owner session to bind — the consts above
+        // are staged by the runner, not excused from the bind walk.
+        resident_source_tids: Vec::new(),
     })
 }
 
@@ -556,10 +634,17 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
 ///
 /// The tid→parameter join is [`regions`]' own (`bindings[i]` is the tensor `arguments[i]` points at), so
 /// this reaches the same parameter that walk does rather than keeping a second copy of the mapping.
+/// It is read for EVERY parameter now, not just a gather's index: the placement's `Df` — and so its
+/// byte footprint — is derived from it (see the `df` arm in [`for_regions`]), because sizing an
+/// `*i32` or `*f32` parameter at fp16 bytes is measured to refuse the correct descriptor.
 ///
-/// `None` when nothing is bound to `tid` or its view carries no dtype. The caller turns that into a
-/// refusal rather than a default: "not stated" and "stated as i32" are different facts.
-fn index_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DType> {
+/// `None` when nothing is bound to `tid` or its view carries no dtype. The gather-index check turns
+/// that into a refusal rather than a default: "not stated" and "stated as i32" are different facts.
+/// For the placement itself `None` reads as fp16 — the behavior-preserving choice, since every
+/// parameter of every config that baked before states F16, Fp8E4m3 or the gather's I32 — and the
+/// footprint guard still catches an access the placement under-sized, so the default cannot hide an
+/// over-run.
+fn param_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DType> {
     use ktir_core::attrkey::AttrKey;
     use ktir_core::ir::Attr;
     use ktir_core::opkind::OpKind;
@@ -573,6 +658,69 @@ fn index_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DTyp
         (AttrKey::Dtype, Attr::Dtype(d)) => Some(*d),
         _ => None,
     })
+}
+
+/// The parameters a CONVERT DOOR op reads — the buffers whose placements the β reservation
+/// widens to the device width (see [`for_regions`]' `convert_swept` block for the law and
+/// the measured refusal it answers).
+///
+/// The chain is the one every parameter-reading walk in this crate takes (`bound_scale_of`'s
+/// `splat_view`, [`param_view_dtype`]'s tid join): convert → `ktdp.load` → access tile →
+/// memory view → function argument, resolved to a tid through the node's own `bindings`. A
+/// convert whose operand is anything else (an in-function intermediate — the sampler's
+/// `sitofp` over the hash ramp) owns no placement here, so it is simply not in the set: its
+/// input is a minted intermediate, sized by the mint, not by this module.
+///
+/// The KIND SET is the door's own — `whole_function`'s convert-kind discriminant reads
+/// exactly `ArithExtf | ArithFptosi | ArithSitofp | ArithTruncf` — so a new convert kind is
+/// E0004 at the door and absent here, never widened behind the door's back. Shape
+/// preservation is NOT re-proved here: the door refuses a dims-changing or
+/// dims-never-stated convert by name, so a program whose convert is not the one-for-one hop
+/// never reaches a placement this set influenced.
+fn convert_swept_tids(node: &KtirNode) -> std::collections::BTreeSet<u32> {
+    use ktir_core::ir::Ssa;
+    use ktir_core::opkind::OpKind;
+    let f = &node.func;
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let mut out = std::collections::BTreeSet::new();
+    for op in f.operations.iter() {
+        if !matches!(
+            op.op_type,
+            OpKind::ArithExtf | OpKind::ArithFptosi | OpKind::ArithSitofp | OpKind::ArithTruncf
+        ) {
+            continue;
+        }
+        // load → tile → view → argument, each step proved by its op kind — a convert whose
+        // operand chain is anything else reads an intermediate and owns no placement here.
+        let Some(load) = op.operands.first().and_then(|&s| def_of(s)) else {
+            continue;
+        };
+        if load.op_type != OpKind::KtdpLoad {
+            continue;
+        }
+        let Some(tile) = load.operands.first().and_then(|&s| def_of(s)) else {
+            continue;
+        };
+        if tile.op_type != OpKind::KtdpConstructAccessTile {
+            continue;
+        }
+        let Some(view) = tile.operands.first().and_then(|&s| def_of(s)) else {
+            continue;
+        };
+        if view.op_type != OpKind::KtdpConstructMemoryView {
+            continue;
+        }
+        let Some(ptr) = view.operands.first().copied() else {
+            continue;
+        };
+        let Some(idx) = f.arguments.iter().position(|(s, _)| *s == ptr) else {
+            continue;
+        };
+        if let Some(tid) = node.bindings.get(idx).map(|b| b.get()) {
+            out.insert(tid);
+        }
+    }
+    out
 }
 
 /// The reserved device constants a `Program`'s entry point names without them being parameters, or
@@ -633,7 +781,11 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         | Program::SiluMul
         | Program::LmLast
         | Program::Transpose
-        | Program::Matmul => None,
+        | Program::Matmul
+        // The sampler's tables (and its per-row noise and temperature operands) ride as
+        // ORDINARY tensor operands (the node's own inputs, placed like every staged
+        // buffer) — no reserved tid names one.
+        | Program::Sample => None,
         // ⭐ NO ENTRY POINT ON THIS LADDER, SO NO CONSTANTS TO NAME. None of these programs has a
         // body this crate's door can reach — the splice's registry produces none of them (its
         // by-name refusals stop their SubOps at the producer), and the door itself refuses them by
@@ -641,11 +793,20 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         // rather than `_` so a new `Program` variant is E0004 here, not a silent `None` that
         // pretends to have read a body it never had. (The MoE programs are no longer variants at
         // all — the MoE lowers only from `kernels/moe.py` through KTIR.)
+        //
+        // `EmbedRowGather` and `ChainStage` are HERE and only here: their bodies (the slab
+        // gather, the restickify transpose, the row gather, the relayout; the three one-entry
+        // table gathers) are the SPYRE door's — `ktir_superdsc_door`'s `lk::embed_row_gather`
+        // and `lk::chain_stage`, the `#603` chained head — minted by the spyre-side emitter and
+        // refused by name at the splice's registry, so a node carrying either into THIS crate is
+        // a routing change, not a missing arm.
         Program::RmsNormUnit
         | Program::TanhSoftCap
         | Program::ScalarWeightMul
         | Program::Reshape
-        | Program::WindowedRmsNorm { .. } => None,
+        | Program::WindowedRmsNorm { .. }
+        | Program::EmbedRowGather { .. }
+        | Program::ChainStage { .. } => None,
     }
 }
 
@@ -774,23 +935,31 @@ fn overlaps_none(
 fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f32>, crate::Error> {
     use ktir_superdsc::emit::whole_function as W;
 
-    if is_per_program_node(f) {
-        return Ok(scales_for(p, f));
-    }
-
+    // ⭐⭐⭐ THE CHAINS ARE READ ONCE, FOR BOTH PATHS — the OnePlusScale gain offset is a
+    // registry lookup in BOTH doors' rmsnorm bodies (`scale_slot(layout, 1.0)` after
+    // `program_gain_offset`), and it is an `arith.addf` offset, so the splat-multiplier walk
+    // below cannot see it in either path. Reading `ones` off the same chains the emitter
+    // dispatches on is the one-statement answer for both.
     let chains = W::program_rmsnorm_chains(f).map_err(|e| crate::Error {
         stage: "layout",
         message: e.message,
     })?;
+    if is_per_program_node(f) {
+        return Ok(scales_for(p, f, &chains));
+    }
+
     let mut out: Vec<f32> = Vec::new();
     let push = |v: f32, out: &mut Vec<f32>| {
         if !out.iter().any(|x| x.to_bits() == v.to_bits()) {
             out.push(v);
         }
     };
-    // (1) the epsilons, one per chain.
+    // (1) the epsilons and gain offsets, one pair per chain.
     for c in &chains {
         push(c.eps, &mut out);
+        if let Some(ones) = c.ones {
+            push(ones, &mut out);
+        }
     }
     // (2) the splat multipliers that survive the fusions. A chain-interior multiply is not a scalar
     // multiply at all — the fused body owns its constants — so its value must not take a slot.
@@ -837,11 +1006,31 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
 /// same call. Nothing else here can drift either — the walk (`f.operations`, not `ops_deep()`), the
 /// `arith.constant`-behind-`tensor.splat` shape, the one-root rule and the all-`mulf`-agree rule are
 /// all theirs by construction now.
-fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
+fn scales_for(
+    p: Program,
+    f: &IRFunction<'static>,
+    chains: &[ktir_superdsc::emit::whole_function::RmsNormChain],
+) -> Vec<f32> {
     use ktir_superdsc::emit::lower_ktir_to_superdsc as L;
+    // The OnePlusScale gain offset the rmsnorm bodies resolve by value — read off the SAME
+    // chains the emitter dispatches on, deduped by bits like every push above.
+    let mut ones: Vec<f32> = Vec::new();
+    for c in chains {
+        if let Some(v) = c.ones
+            && !ones.iter().any(|x| x.to_bits() == v.to_bits())
+        {
+            ones.push(v);
+        }
+    }
     match p {
-        // `rmsnorm` resolves ONE value: `scale_slot(layout, program_rmsnorm_eps(&k.func))`.
-        Program::RmsNorm => L::program_rmsnorm_eps(f).into_iter().collect(),
+        // `rmsnorm` resolves TWO values: `scale_slot(layout, program_rmsnorm_eps(..))` and,
+        // in the OnePlusScale form, `scale_slot(layout, program_gain_offset(..))` — the
+        // `[1,1]` const the gain add reads ahead of the gain multiply.
+        Program::RmsNorm => {
+            let mut out: Vec<f32> = L::program_rmsnorm_eps(f).into_iter().collect();
+            out.extend(ones);
+            out
+        }
         // `scalarmul` resolves ONE value: `scale_slot(layout, program_scalarmul_scale(&k.func))`.
         Program::ScalarMul => L::program_scalarmul_scale(f).into_iter().collect(),
         // `attn_at` resolves TWO — the score scale AND its square root, in that order:
@@ -854,6 +1043,19 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
             Some(v) => vec![v, v.sqrt()],
             None => Vec::new(),
         },
+        // `rmsnorm_unit` resolves ONE value: its epsilon (`scale_slot` after
+        // `program_rmsnorm_eps`) — no gain leg, so no offset.
+        Program::RmsNormUnit => L::program_rmsnorm_eps(f).into_iter().collect(),
+        // `windowed_rmsnorm` resolves TWO: `program_windowed_eps` and, in the gained
+        // OnePlusScale form, the gain offset.
+        Program::WindowedRmsNorm { .. } => {
+            let mut out: Vec<f32> = L::program_windowed_eps(f).into_iter().collect();
+            out.extend(ones);
+            out
+        }
+        // `tanhsoftcap` resolves ONE value: the cap (`scale_slot` after
+        // `program_tanhsoftcap_cap`).
+        Program::TanhSoftCap => L::program_tanhsoftcap_cap(f).into_iter().collect(),
         // ⭐ EMPTY, AND THAT IS THE ANSWER FOR THESE. None of these bodies calls `scale_slot` or
         // indexes `scalarmul_scales` — grep over the file: the only readers are `rmsnorm`,
         // `scalarmul`, `attn_at` and `scale_idx_of` (which only recognises a RESERVED tid among the
@@ -864,18 +1066,20 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         | Program::LmLast
         | Program::Transpose
         | Program::Matmul
-        | Program::Rope => Vec::new(),
-        // ⭐ EMPTY FOR THE SAME REASON, ONE STEP EARLIER: none of these programs has a body on
-        // this ladder (the splice produces none of them and the door refuses them by name), so
-        // there is no body to ask which values it looks up. A value registered for a program that
-        // cannot run would occupy a slot nothing asks for — the exact registry-divergence defect
-        // this function's doc records — so empty is the answer, and enumerated (never `_`) so a
-        // new variant is E0004 rather than a silent slot decision.
-        Program::RmsNormUnit
-        | Program::TanhSoftCap
-        | Program::ScalarWeightMul
-        | Program::Reshape
-        | Program::WindowedRmsNorm { .. } => Vec::new(),
+        | Program::Rope
+        // The sampler's tables are tensor operands, never `scalarmul_scales` lookups —
+        // a value registered for it would occupy a slot nothing asks for.
+        | Program::Sample
+        // `EmbedRowGather` and `ChainStage` are the spyre door's `#603` bodies (see the
+        // same note at `reserved_consts_for`); on THIS ladder they are refused at both
+        // the splice and the door, so there is no body to ask.
+        | Program::EmbedRowGather { .. }
+        | Program::ChainStage { .. } => Vec::new(),
+        // ⭐ EMPTY FOR THE SAME REASON, ONE STEP EARLIER: `scalarweightmul`'s weight is a
+        // RUNTIME fp16 scalar parameter (the program's own operand, staged by the host)
+        // and `reshape` is a pure copy — neither resolves a registry value. Enumerated
+        // (never `_`) so a new variant is E0004 rather than a silent slot decision.
+        Program::ScalarWeightMul | Program::Reshape => Vec::new(),
     }
 }
 
