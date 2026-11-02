@@ -11845,11 +11845,10 @@ fn dump_wavefront_mega(
                                                     )
                                                     .map(superdsc::bundle::SiblingFp::from)
                                                     .unwrap_or_else(|e| {
-                                                        eprintln!(
+                                                        panic!(
                                                             "[spyre-superdsc] {base}: fold-fused \
-                                                             body twin emit failed: {e}"
-                                                        );
-                                                        superdsc::bundle::SiblingFp::none()
+                                                             body twin does not emit: {e}"
+                                                        )
                                                     })
                                                 })
                                                 .collect()
@@ -12043,7 +12042,6 @@ fn dump_wavefront_mega(
                                                                     'static,
                                                                 >,
                                                             > = Vec::new();
-                                                            let mut ok = true;
                                                             for (ci, b) in
                                                                 rr.bodies.iter().enumerate()
                                                             {
@@ -12098,71 +12096,62 @@ fn dump_wavefront_mega(
                                                                             superdsc::bundle::SiblingFp::from,
                                                                         )
                                                                         .unwrap_or_else(|e| {
-                                                                            eprintln!(
-                                                                                "[spyre-superdsc] \
-                                                                                 {base}: rung {} fused \
-                                                                                 twin emit failed: {e}",
+                                                                            panic!(
+                                                                                "[spyre-superdsc] {base}: rung {} \
+                                                                                 fused twin does not emit: {e}",
                                                                                 rung.get()
-                                                                            );
-                                                                            superdsc::bundle::SiblingFp::none()
+                                                                            )
                                                                         })
                                                                     } else {
                                                                         superdsc::bundle::SiblingFp::none()
                                                                     });
                                                                     }
-                                                                    Err(e) => {
-                                                                        eprintln!(
-                                                                            "[spyre-superdsc] {base}: \
-                                                                         ladder rung {} \
-                                                                         body class {ci} emit \
-                                                                         failed: {e}",
-                                                                            rung.get()
-                                                                        );
-                                                                        ok = false;
-                                                                    }
+                                                                    Err(e) => panic!(
+                                                                        "[spyre-superdsc] {base}: ladder rung {} body \
+                                                                         class {ci} does not emit: {e}",
+                                                                        rung.get()
+                                                                    ),
                                                                 }
                                                             }
-                                                            if ok {
-                                                                eprintln!(
-                                                                    "[spyre-superdsc] {base}: ladder rung \
-                                                                 active_cap={} baked",
-                                                                    rung.get()
-                                                                );
-                                                                let rung_folds = rfps
-                                                                    .iter()
-                                                                    .all(|fp| folds_of(fp));
-                                                                let rec = superdsc::bundle::LadderRung {
-                                                                    active_cap: superdsc::bundle::SweptCols::new(rung_swept),
-                                                                    bodies: rung_fps(&rfps),
-                                                                    bodies_fused: std::borrow::Cow::Owned(rfused),
-                                                                };
-                                                                // Read off the rung record itself: the
-                                                                // record the runtime loads — any class's
-                                                                // twin counts.
-                                                                let fused_twin =
-                                                                    rec.bodies_fused.iter().any(|f| !f.is_none());
-                                                                Some((
-                                                                    rec,
-                                                                    (
-                                                                        superdsc::bundle::SweptCols::new(rung_swept),
-                                                                        scratchy_target_spyre::fold_plan::RungReach {
-                                                                            folds: rung_folds,
-                                                                            fused_twin,
-                                                                        },
-                                                                    ),
-                                                                    (rung, rr.layout),
-                                                                ))
-                                                            } else {
-                                                                None
-                                                            }
-                                                        }
-                                                        Err(e) => {
                                                             eprintln!(
-                                                                "[spyre-superdsc] {base}: ladder rung {} lower failed: {e}",
+                                                                "[spyre-superdsc] {base}: ladder rung \
+                                                             active_cap={} baked",
                                                                 rung.get()
                                                             );
-                                                            None
+                                                            let rung_folds = rfps
+                                                                .iter()
+                                                                .all(|fp| folds_of(fp));
+                                                            let rec = superdsc::bundle::LadderRung {
+                                                                active_cap: superdsc::bundle::SweptCols::new(rung_swept),
+                                                                bodies: rung_fps(&rfps),
+                                                                bodies_fused: std::borrow::Cow::Owned(rfused),
+                                                            };
+                                                            // Read off the rung record itself: the
+                                                            // record the runtime loads — any class's
+                                                            // twin counts.
+                                                            let fused_twin =
+                                                                rec.bodies_fused.iter().any(|f| !f.is_none());
+                                                            Some((
+                                                                rec,
+                                                                (
+                                                                    superdsc::bundle::SweptCols::new(rung_swept),
+                                                                    scratchy_target_spyre::fold_plan::RungReach {
+                                                                        folds: rung_folds,
+                                                                        fused_twin,
+                                                                    },
+                                                                ),
+                                                                (rung, rr.layout),
+                                                            ))
                                                         }
+                                                        // ⛔ A RUNG THE LADDER ASKED FOR MUST LOWER (#1023). Dropping it
+                                                        // served its positions on the next rung up with no sign
+                                                        // anywhere (a proc macro's stderr is swallowed on success),
+                                                        // which hid a broken one-chunk lowering for a whole bisect.
+                                                        // A ladder that wants fewer rungs states so where it is built.
+                                                        Err(e) => panic!(
+                                                            "[spyre-superdsc] {base}: ladder rung {} does not lower: {e}",
+                                                            rung.get()
+                                                        ),
                                                     }
                                                         })
                                                         .collect()
