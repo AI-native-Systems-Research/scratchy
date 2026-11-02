@@ -1395,7 +1395,12 @@ template <typename T, typename S, int G, int TN, int NSG>
 // 4-16-token step in a bucket of 32 or more rows multiplies half the padded rows the
 // 32-row tile does. An element's sum is the same at either TM (each simdgroup's
 // chunks, then the pairwise reduction), so the two tiles agree bit for bit on the
-// rows both cover. Grid (N/TN, M/TM), 32·KS threads; the bucket's M is a multiple of TM.
+// rows both cover. Grid (N/TN, ⌈M/TM⌉), 32·KS threads. A bucket of fewer rows than the
+// 16-row tile (the 8-row bucket's small-M step, `M < TM`) reads a scratch laid out for TM
+// rows (`w4a8_scratch_rows`: its pre-pass baked at them), multiplies the whole static tile,
+// and stores only the bucket's rows. A row's sum reads its own int8 row and chunk scales
+// alone, so whatever the scratch holds past the step's rows changes none of the rows stored,
+// and each is the bits of the 16-row tile's in a bucket of 16 or more.
 template <typename T, typename S, int G, int TM, int TN, int KS>
 [[kernel, max_total_threads_per_threadgroup(KS * 32)]] void affine_qmm_w4a8_splitk(
     const device uchar* w [[buffer(0)]], const device S* scales [[buffer(1)]],
@@ -1407,11 +1412,14 @@ template <typename T, typename S, int G, int TM, int TN, int KS>
     static_assert(TM == 16 || TM == 32, "TM: the bucket's 32-row tile or the small-M 16");
     static_assert(KS >= 2 && (KS & (KS - 1)) == 0, "KS: a power of two, at least 2");
     const int K = QMM_K, N = QMM_N, M = QMM_M, KG = K / G, KC = K / 64;
+    // The scratch's rows: the bucket's, or the whole tile in a bucket short of it.
+    constexpr bool short_rows = M < TM;
+    const int MS = short_rows ? TM : M;
     using XA = tensor<device int8_t, Ext, tensor_inline>;
     using XB = tensor<device int4b_format, Ext, tensor_inline>;
-    XA A((device int8_t*)scratch, Ext(K, M));
+    XA A((device int8_t*)scratch, Ext(K, MS));
     XB B((typename XB::data_handle_type)w, Ext(K, N));
-    const device float2* qa = (const device float2*)(scratch + int64_t(M) * K);
+    const device float2* qa = (const device float2*)(scratch + int64_t(MS) * K);
     constexpr auto desc =
         matmul2d_descriptor(TM, TN, 64, false, true, false, matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroups<1>> op;
@@ -1467,8 +1475,14 @@ template <typename T, typename S, int G, int TM, int TN, int KS>
         if (acc.is_valid_element(i)) out[i] = T(acc[i]);
     }
     tensor<device T, Ext, tensor_inline> C(y, Ext(N, M));
-    auto mC = C.template slice<TN, TM>(col0, row0);
-    out.store(mC);
+    if constexpr (short_rows) {
+        // The bucket's rows of the tile: a bounds-checked slice.
+        auto mC = C.template slice<TN, dynamic_extent>(col0, row0);
+        out.store(mC);
+    } else {
+        auto mC = C.template slice<TN, TM>(col0, row0);
+        out.store(mC);
+    }
 }
 
 template <typename T, typename S, int G, int TN, int NSG>

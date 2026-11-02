@@ -46,8 +46,8 @@ fn attention_blocks_per_chunk(chunked: bool) -> u32 {
 use crate::op_abi::GuardRun;
 use crate::quantized::{
     DequantDtype, NaxDequant, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
-    W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Act, W4a8Gemm, W4a8Rows, W4a8Tile, narrow_matvec,
-    pick_qmm_t_kernel, pick_qmv_kernel, pick_qmv_kernel_wide, qmm_t_dispatch_shape,
+    W4A8_GROUPED_TILE, W4A8_SMALL_M_ROWS, W4A8_TILE_ROWS, W4a8Act, W4a8Gemm, W4a8Rows, W4a8Tile,
+    narrow_matvec, pick_qmm_t_kernel, pick_qmv_kernel, pick_qmv_kernel_wide, qmm_t_dispatch_shape,
     qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name,
     qmv_dispatch_shape, qmv_kernel_static_name, small_m_kernel_static_name,
     splitk_reduce_kernel_static_name, w4a8_act_quant_static_name, w4a8_quant_static_name,
@@ -1019,6 +1019,7 @@ fn route_small_m(
     w: RowSources<'_>,
     profile: Option<&crate::targets::MetalTargetProfile>,
     class: crate::tape::lowered::GenClass,
+    splitk_scratch_bytes: &mut u32,
 ) -> Result<Vec<GatedCommand>, LoweringError> {
     use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
     // A sample-rows step lowered its matmul, twin included.
@@ -1122,6 +1123,98 @@ fn route_small_m(
                 _ => c,
             })
             .chain([GatedCommand::gated(small_m, OnlyIfSmallMTokens)])
+            .collect());
+    }
+    // On the wide class, a bucket short of the 16-row W4A8 tile (the 8-row bucket, whose own
+    // GEMM is the wide matvec) runs its small-M step through the same tile behind a pre-pass of
+    // its own, both on that step alone: the pre-pass writes a scratch laid out for the tile's 16
+    // rows, the GEMM stores the bucket's (`affine_qmm_w4a8_splitk`, `M < TM`). The bf16 twin's
+    // 8-row tile re-reads its bf16 rows twice a 16-column tile (`row8_verify_probe_test`, 8 live
+    // rows in the 8-row bucket, µs twin / pre-pass + W4A8 16-row: gate/up 158 / 151, MLP down
+    // 170 / 148, o_proj 61 / 53, gdn qkv 97 / 90, gdn z 63 / 53, q+gate 116 / 114, k and v
+    // 24 / 17, lm_head 1641 / 1384). The pre-pass is shared by the matmuls of one activation.
+    let short = (W4a8Gemm::for_small_m(n, k)).filter(|_| {
+        class == crate::tape::lowered::GenClass::M5Wide
+            && bucket_m < W4A8_SMALL_M_ROWS
+            && matches!(group_size, 64 | 128)
+            && k.is_multiple_of(64)
+    });
+    if let Some(kernel) = short {
+        let (dtype, rows) = (dequant_dtype_for(p), W4A8_SMALL_M_ROWS);
+        *splitk_scratch_bytes = (*splitk_scratch_bytes).max(w4a8_scratch_bytes(rows, k));
+        let scaling = Some(crate::interpreter::metal::lowered::MScaling {
+            set_axis: None,
+            axis: crate::tape::lowered::MScaleAxis::Y,
+            bucket_m: super::ids::BucketM(bucket_m),
+        });
+        let quant = LoweredCommand {
+            kernel: KernelId::AffineW4a8Quant,
+            library: "quantized_qmm_nax",
+            function: w4a8_quant_static_name(W4a8Rows::Dense, dtype),
+            // The scratch's rows are the tile's: the GEMM reads its chunk scales past them.
+            constants: baked(
+                [
+                    ConstantValue::int(0, k as i32),
+                    ConstantValue::int(2, rows as i32),
+                ]
+                .into_iter()
+                .chain(codes.constant())
+                .collect(),
+            ),
+            dispatch: DispatchShape {
+                threadgroups: ((k / 64).div_ceil(16), bucket_m, 1),
+                threads_per_threadgroup: (128, 1, 1),
+                m_scaling: scaling,
+            },
+            bindings: baked(vec![
+                Binding::ArenaSlot {
+                    slot: in_slot,
+                    binding_index: 0,
+                },
+                Binding::Scratch { binding_index: 1 },
+            ]),
+            gemm_dims: None,
+        };
+        let mut bindings =
+            affine_qmm_bindings(in_slot, out_slot, layer, w.of(WeightKind::Linear, 0)?);
+        for b in bindings.iter_mut() {
+            if matches!(
+                b,
+                Binding::ArenaSlot {
+                    binding_index: 3,
+                    ..
+                }
+            ) {
+                *b = Binding::Scratch { binding_index: 3 };
+            }
+        }
+        let gemm = LoweredCommand {
+            kernel: KernelId::AffineQmmW4a8,
+            library: "quantized_qmm_nax",
+            function: kernel.static_name(dtype, scale_dtype_for(p), group_size),
+            constants: super::kernel_constants::AffineQmmTConstants {
+                k: super::ids::KDimI32(k as i32),
+                n: super::ids::NDimI32(n as i32),
+                m: super::ids::MDimI32(bucket_m as i32),
+                codes,
+            }
+            .into_baked(),
+            dispatch: DispatchShape {
+                threadgroups: (n / kernel.cols(), 1, 1),
+                threads_per_threadgroup: (32 * kernel.simdgroups(), 1, 1),
+                m_scaling: scaling,
+            },
+            bindings: baked(bindings),
+            gemm_dims: None,
+        };
+        // The pre-pass first, so the next matmul of the activation reads its scratch as it is.
+        return Ok([GatedCommand::gated(quant, OnlyIfSmallMTokens)]
+            .into_iter()
+            .chain(
+                cmds.into_iter()
+                    .map(|c| GatedCommand::gated(c.command, UnlessSmallMTokens)),
+            )
+            .chain([GatedCommand::gated(gemm, OnlyIfSmallMTokens)])
             .collect());
     }
     let small_m = LoweredCommand {
@@ -1779,7 +1872,16 @@ fn lower(
                     m_divisor,
                 )?;
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
-                let cmds = route_small_m(p, step, own, bucket_m, w, profile, class)?;
+                let cmds = route_small_m(
+                    p,
+                    step,
+                    own,
+                    bucket_m,
+                    w,
+                    profile,
+                    class,
+                    &mut splitk_scratch_bytes,
+                )?;
                 let cmds = route_gdn(p, step, cmds, bucket_m);
                 let cmds = route_draft_commit(step, cmds);
                 let cmds = decode_attention_per_kv_head(
@@ -1825,10 +1927,13 @@ fn lower(
                         live_cmds[at] = live_cmds[at].or(live);
                     }
                 } else if !cmds.is_empty() {
+                    // The 8-row bucket's own wide matvec runs beside its small-M pre-pass pair.
                     let gemm = |c: &GatedCommand| {
                         matches!(
                             c.command.kernel,
-                            KernelId::AffineQmmW4a8 | KernelId::AffineQmmSmallM
+                            KernelId::AffineQmmW4a8
+                                | KernelId::AffineQmmSmallM
+                                | KernelId::AffineQmvWide
                         )
                     };
                     quantized = cmds.split_first().and_then(|(first, rest)| {
@@ -11675,8 +11780,7 @@ mod tests {
     /// pre-pass ungated, the bucket's GEMM `UnlessSmallMTokens`, the 16-row GEMM
     /// `OnlyIfSmallMTokens` with the GEMM's constants, bindings and row scaling, its grid
     /// `(n / 32, bucket / 16)`, K split the fewest ways from 4 that fill the cores (Qwen3.8-27B's
-    /// verify shapes in the 64-row bucket). The M5 class, and a bucket whose own GEMM is not
-    /// W4A8 (the 8-row bucket's wide matvec), keep the bf16 twin.
+    /// verify shapes in the 64-row bucket). The M5 class keeps the bf16 twin in every bucket.
     #[test]
     fn a_w4a8_bucket_runs_its_small_m_step_in_a_16_row_w4a8_tile() {
         use crate::quantized::{W4a8Gemm, W4a8SplitK};
@@ -11745,22 +11849,153 @@ mod tests {
             // The pre-pass the step's either GEMM reads runs first on every step.
             assert_eq!(tape.barrier_before[2], tape.barrier_before[1], "{case}");
         }
-        // The M5 class keeps the bf16 twin; so does the wide class's 8-row bucket (no W4A8).
-        for (class, bucket_m) in [(M5, 64), (M5Wide, 8)] {
-            let tape = lower(class, bucket_m, 17408, 5120);
+        // The M5 class keeps the bf16 twin, the 64-row bucket's and the 8-row bucket's.
+        for bucket_m in [64, 8] {
+            let tape = lower(M5, bucket_m, 17408, 5120);
             let small = tape.commands.last().expect("a command");
-            assert_eq!(small.gate, Some(OnlyIfSmallMTokens), "{class:?} {bucket_m}");
+            assert_eq!(small.gate, Some(OnlyIfSmallMTokens), "{bucket_m}");
             assert_eq!(
                 small.command.kernel,
                 KernelId::AffineQmmSmallM,
-                "{class:?} {bucket_m}"
+                "{bucket_m}"
             );
         }
     }
 
+    /// On the wide class, the 8-row bucket (its own GEMM the wide matvec, short of the 16-row W4A8
+    /// tile) runs its small-M step as a pre-pass and the 16-row split-K W4A8 GEMM
+    /// (`W4a8Gemm::SmallM`), both `OnlyIfSmallMTokens`, the wide matvec `UnlessSmallMTokens`
+    /// between them: the pre-pass baked at the tile's 16 rows (its constant M, the scratch its
+    /// rows size), its grid scaled from the bucket's 8; the GEMM baked at the bucket's 8 (it
+    /// stores those), its grid `(n / 32, 1)`, the activation's slot read from the scratch, the
+    /// split `W4a8Gemm::for_small_m`'s. The tape's scratch holds the 16-row layout. The pre-pass
+    /// runs first, so the next matmul of the activation reuses it; the GEMM fences as the step.
+    /// A group size the W4A8 GEMM has no instantiation for keeps the bf16 twin.
+    #[test]
+    fn the_eight_row_bucket_runs_its_small_m_step_in_a_16_row_w4a8_tile() {
+        use crate::quantized::{W4A8_SMALL_M_ROWS, W4a8Gemm, W4a8SplitK};
+        use crate::tape::lowered::GenClass::M5Wide;
+        use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
+        use W4a8SplitK::{Ways4, Ways8};
+        let p = tp();
+        let (dtype, scale) = (dequant_dtype_for(&p), scale_dtype_for(&p));
+        let gemm = |n, k, group_size| {
+            row_tape(plain(&[MetalStep::AffineQmm(AffineMatmul {
+                input: Slot(0),
+                output: Slot(1),
+                layer: LayerId(0),
+                n: NDim(n),
+                k: KDim(k),
+                group_size: AffineGroupSize(group_size),
+                bits: AffineBits(4),
+                vector_limit: QmvBatchLimit(10),
+                ends: QmvEnds::default(),
+            })]))
+        };
+        let at = BakePoint {
+            class: M5Wide,
+            ..bake_point(8, Some(&crate::targets::M5_10CORE))
+        };
+        // (n, k, ways): gate/up, down, gdn z, k/v, lm_head.
+        for (n, k, ways) in [
+            (17408, 5120, Ways4),
+            (5120, 17408, Ways4),
+            (6144, 5120, Ways4),
+            (1024, 5120, Ways8),
+            (248320, 5120, Ways4),
+        ] {
+            let tape = lower_subtile_tape_to_metal(&gemm(n, k, 64), &p, at).expect("lowers");
+            let case = format!("n {n} k {k}");
+            assert_eq!(
+                gated_steps(&tape),
+                [
+                    (KernelId::AffineW4a8Quant, Some(OnlyIfSmallMTokens)),
+                    (KernelId::AffineQmvWide, Some(UnlessSmallMTokens)),
+                    (KernelId::AffineQmmW4a8, Some(OnlyIfSmallMTokens)),
+                ],
+                "{case}"
+            );
+            let [quant, wide, small] = [0, 1, 2].map(|i| &tape.commands[i].command);
+            let rows = W4A8_SMALL_M_ROWS;
+            let slot = |c: &LoweredCommand, i| c.constants.iter().find(|v| v.index == i).copied();
+            assert_eq!(
+                slot(quant, 0),
+                Some(ConstantValue::int(0, k as i32)),
+                "{case}"
+            );
+            assert_eq!(
+                slot(quant, 2),
+                Some(ConstantValue::int(2, rows as i32)),
+                "{case}: the pre-pass writes the tile's rows' layout"
+            );
+            assert_eq!(quant.dispatch.threadgroups, ((k / 64).div_ceil(16), 8, 1));
+            let scaling = quant.dispatch.m_scaling.expect("scaled by the step's rows");
+            assert_eq!(scaling.bucket_m.0, 8, "{case}");
+            assert_eq!(scaling.axis, crate::tape::lowered::MScaleAxis::Y, "{case}");
+            assert!(
+                tape.splitk_scratch_bytes >= w4a8_scratch_bytes(rows, k),
+                "{case}"
+            );
+            let kernel = W4a8Gemm::SmallM(ways);
+            assert_eq!(kernel, W4a8Gemm::for_small_m(n, k).expect("a 16-row tile"));
+            assert_eq!(
+                small.function,
+                kernel.static_name(dtype, scale, 64),
+                "{case}"
+            );
+            assert_eq!(small.dispatch.threadgroups, (n / 32, 1, 1), "{case}");
+            assert_eq!(
+                small.dispatch.threads_per_threadgroup,
+                (32 * ways.ways(), 1, 1),
+                "{case}"
+            );
+            assert_eq!(small.dispatch.m_scaling, quant.dispatch.m_scaling, "{case}");
+            assert_eq!(
+                slot(small, 2),
+                Some(ConstantValue::int(2, 8)),
+                "{case}: the GEMM stores the bucket's 8 rows"
+            );
+            // The GEMM reads the scratch where the wide matvec reads the activation; the rest of
+            // its bindings are the matvec's.
+            assert!(
+                small
+                    .bindings
+                    .contains(&Binding::Scratch { binding_index: 3 }),
+                "{case}"
+            );
+            let weights = |c: &LoweredCommand| -> Vec<Binding> {
+                (c.bindings.iter())
+                    .filter(|b| !matches!(b, Binding::Scratch { .. }))
+                    .filter(|b| {
+                        !matches!(
+                            b,
+                            Binding::ArenaSlot {
+                                binding_index: 3,
+                                ..
+                            }
+                        )
+                    })
+                    .copied()
+                    .collect()
+            };
+            assert_eq!(weights(small), weights(wide), "{case}");
+            assert_eq!(tape.barrier_before[1], tape.barrier_before[0], "{case}");
+            assert_eq!(
+                tape.barrier_before[2],
+                Fence::Coherent,
+                "{case}: reads the pre-pass"
+            );
+        }
+        // Group size 32: no W4A8 instantiation, the bf16 twin.
+        let tape = lower_subtile_tape_to_metal(&gemm(17408, 5120, 32), &p, at).expect("lowers");
+        let small = tape.commands.last().expect("a command");
+        assert_eq!(small.command.kernel, KernelId::AffineQmmSmallM);
+    }
+
     /// On the wide class, a projection whose twin is at most one threadgroup a core of the class's
-    /// fewest runs its own matvec at a small-M bucket; a wider one, and every projection on the M5
-    /// class, takes the twin.
+    /// fewest runs its own matvec at a small-M bucket; a wider one takes the pre-pass and 16-row
+    /// W4A8 GEMM at the 8-row bucket (1024 x 2048 at 8 rows, `row8_verify_probe_test`, µs wide /
+    /// twin / W4A8: 8.8 / 10.5 / 8.4), and every projection on the M5 class takes the twin.
     #[test]
     fn a_narrow_projection_keeps_its_matvec_on_the_wide_class() {
         use crate::tape::lowered::GenClass;
@@ -11783,9 +12018,14 @@ mod tests {
             (KernelId::AffineQmmSmallM, Some(OnlyIfSmallMTokens)),
         ];
         let own = vec![(KernelId::AffineQmvWide, None)];
+        let w4a8 = vec![
+            (KernelId::AffineW4a8Quant, Some(OnlyIfSmallMTokens)),
+            (KernelId::AffineQmvWide, Some(UnlessSmallMTokens)),
+            (KernelId::AffineQmmW4a8, Some(OnlyIfSmallMTokens)),
+        ];
         for (class, n, want) in [
             (GenClass::M5Wide, widest, &own),
-            (GenClass::M5Wide, 2 * widest, &twin),
+            (GenClass::M5Wide, 2 * widest, &w4a8),
             (GenClass::M5, widest, &twin),
             (GenClass::M5, 2 * widest, &twin),
         ] {

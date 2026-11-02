@@ -203,7 +203,15 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) -> Vec<f32> 
         shared(device, &biases_h),
         shared(device, &x_h),
     );
-    let y_buf = shared(device, &vec![0u16; g.bucket_m * n]);
+    // The bucket's rows, then sentinel rows out to a 16-row tile: a kernel stores none of them.
+    const SENTINEL: u16 = 0x7fc1;
+    let y_rows = g.bucket_m.max(16);
+    let y_buf = shared(
+        device,
+        &(0..y_rows * n)
+            .map(|i| if i < g.bucket_m * n { 0 } else { SENTINEL })
+            .collect::<Vec<u16>>(),
+    );
     let mut batch = Mtl4DispatchBatch::begin(device).expect("mtl4");
     let name = match g.kernel {
         Kernel::SmallM(tile) => {
@@ -232,12 +240,30 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) -> Vec<f32> 
             name
         }
         Kernel::W4a8(kernel) => {
+            // A bucket short of the kernel's row tile (the 8-row bucket's 16-row tile) runs its
+            // pre-pass at the tile's rows, as the tape bakes it: the scratch's layout is the
+            // tile's. The scratch starts as garbage, so rows past the step's are whatever it held.
+            let scratch_rows = (g.bucket_m as u32).max(kernel.rows());
             let scratch = shared(
                 device,
-                &vec![0u8; w4a8_scratch_bytes(g.bucket_m as u32, k as u32) as usize],
+                &vec![0xa5u8; w4a8_scratch_bytes(scratch_rows, k as u32) as usize],
             );
+            let quant_consts = vec![
+                ConstantValue::int(0, k as i32),
+                ConstantValue::int(1, n as i32),
+                ConstantValue::int(2, scratch_rows as i32),
+            ];
+            let quant = baked_build(
+                cache,
+                &PipelineKey::new(
+                    "quantized_qmm_nax",
+                    w4a8_quant_static_name(W4a8Rows::Dense, g.act.act()),
+                    quant_consts,
+                ),
+            )
+            .expect("pipeline");
             batch.encode(
-                &pipeline(w4a8_quant_static_name(W4a8Rows::Dense, g.act.act())),
+                &quant,
                 &[(&x_buf, 0), (&scratch, 1)],
                 &[],
                 &[],
@@ -269,11 +295,14 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) -> Vec<f32> 
         }
     };
     batch.commit(true);
-    let got: Vec<f32> =
-        unsafe { std::slice::from_raw_parts(y_buf.contents().as_ptr() as *const u16, m * n) }
-            .iter()
-            .map(|&b| g.act.value(b))
-            .collect();
+    let all =
+        unsafe { std::slice::from_raw_parts(y_buf.contents().as_ptr() as *const u16, y_rows * n) };
+    assert!(
+        all[g.bucket_m * n..].iter().all(|&b| b == SENTINEL),
+        "{name} m={m} n={n} k={k}: stored past the bucket's {} rows",
+        g.bucket_m
+    );
+    let got: Vec<f32> = all[..m * n].iter().map(|&b| g.act.value(b)).collect();
 
     // f32 accumulation over K products of magnitude ≲ 1, then one rounding
     // to the activation dtype.
@@ -488,6 +517,54 @@ fn w4a8_small_m_tile_is_the_split_k_gemm_bits() {
                         assert_eq!(
                             bits(&small),
                             bits(&bucket),
+                            "{split:?} gs {group_size} m {m} k {k} {act:?}/{scale:?}"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// The small-M step's 16-row W4A8 GEMM in the 8-row bucket (`W4a8Gemm::SmallM`, `M` = 8 < the
+/// tile's 16): its pre-pass baked at the tile's 16 rows, the scratch's rows past the step's left
+/// as garbage, the GEMM storing the bucket's rows alone. Every split, both group sizes, every
+/// dtype pairing, the small-M steps' 4 to 8 rows and K = 1088 that no split divides: against the
+/// host reference, and BIT FOR BIT against the same GEMM in the 64-row bucket over the same
+/// rows. A row's sum reads its own int8 row and chunk scales alone, so the rows the tile
+/// multiplies past the step's change none of it; the 8 rows past the bucket's it never stores
+/// (the output buffer is the bucket's).
+#[test]
+fn w4a8_small_m_tile_in_the_eight_row_bucket_is_the_tile_bits() {
+    with_nax(|device, cache| {
+        for (act, scale) in [
+            (Dtype::Bf16, Dtype::Bf16),
+            (Dtype::Bf16, Dtype::F16),
+            (Dtype::F16, Dtype::F16),
+            (Dtype::F16, Dtype::Bf16),
+        ] {
+            for group_size in [64, 128] {
+                for split in W4a8SplitK::ALL {
+                    for (m, k) in [(4, 1024usize), (7, 1024), (8, 1024), (8, 1088)] {
+                        if !k.is_multiple_of(group_size) {
+                            continue;
+                        }
+                        let gemm = |bucket_m| Gemm {
+                            act,
+                            scale,
+                            group_size,
+                            m,
+                            bucket_m,
+                            n: 192,
+                            k,
+                            kernel: Kernel::W4a8(W4a8Gemm::SmallM(split)),
+                        };
+                        let eight = run(device, cache, &gemm(8));
+                        let wide = run(device, cache, &gemm(64));
+                        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                        assert_eq!(
+                            bits(&eight),
+                            bits(&wide),
                             "{split:?} gs {group_size} m {m} k {k} {act:?}/{scale:?}"
                         );
                     }
