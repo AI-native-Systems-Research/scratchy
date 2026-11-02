@@ -3273,6 +3273,8 @@ mod pad_clamp_tests {
                 embed_tokens: &[],
                 tokens: &[],
                 chain_seeds,
+                // A world of one: the host-tape replay under test has no collective.
+                seat: None,
                 positions: &[],
                 causal: scratchy_subtile::sdsc_abstract::CausalKey::chunk(
                     scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("a width"),
