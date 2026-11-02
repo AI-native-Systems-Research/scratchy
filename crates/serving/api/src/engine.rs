@@ -2214,13 +2214,21 @@ impl AsyncEngine {
         // tokio worker. That contract is the one trap in this shape; a future
         // resolver that knocks from an async context must move the knock onto
         // a blocking thread first.
-        let knock_tx = sched_tx.clone();
+        // ⚠️ The door holds a WEAK sender, never a strong one: the executor
+        // owns the door, and a strong clone held on the executor's own thread
+        // keeps the channel open from the receiving side — the pipeline's
+        // drop (which closes the channel to end the executor's
+        // `blocking_recv`) would then join forever while the executor waits
+        // for one more message. The weak form upgrades per knock and fails
+        // the knock (not the shutdown) once the pipeline is gone.
+        let knock_tx = sched_tx.downgrade();
         executor.set_drain_door(DrainDoor::from_knock(move |cell| {
-            knock_tx
-                .blocking_send(ExecutorWork::Knock(cell))
-                .map_err(|_| {
-                    EngineError::Executor("drain door: the executor thread is gone".into())
-                })
+            let tx = knock_tx.upgrade().ok_or_else(|| {
+                EngineError::Executor("drain door: the executor thread is gone".into())
+            })?;
+            tx.blocking_send(ExecutorWork::Knock(cell)).map_err(|_| {
+                EngineError::Executor("drain door: the executor thread is gone".into())
+            })
         }));
 
         // Spawn the executor on a dedicated OS thread, and own both its
@@ -7439,12 +7447,16 @@ mod tests {
                     output.req_ids,
                     Box::new(move || {
                         events.lock().unwrap().push(format!("knock:{step}"));
-                        door.knock(std::sync::Arc::clone(&cell))
-                            .map_err(|e| e.to_string())?;
-                        let tokens = cell.wait().map_err(|e| e.to_string())?;
+                        // A refused knock is the teardown race, not a lost step: the door's
+                        // weak sender refuses exactly when the executor thread has finished
+                        // its shutdown, and shutdown error-fills every pending cell (the law
+                        // `shutdown` below states) — so the resolver falls through to the
+                        // wait and is answered either way. Never parked.
+                        let _ = door.knock(std::sync::Arc::clone(&cell));
+                        let tokens = cell.wait().map_err(|e| e.to_string());
                         events.lock().unwrap().push(format!("answer:{step}"));
                         answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Ok(tokens)
+                        tokens
                     }),
                 ),
             )
@@ -7554,57 +7566,119 @@ mod tests {
     /// that kept a deferring worker (spyre's pure decode on `scr serve`) at depth 1. Without
     /// the wiring the executor is never handed a door, so it never defers and no resolver is
     /// ever answered — both assertions below fail on that base.
+    ///
+    /// The WHOLE body — spawn, stream, assertions, and the engine's own drop — runs under one
+    /// timeout: teardown used to HANG here (the door held a strong sender on the executor's
+    /// own channel, so the pipeline's drop could never close it), and a hang must FAIL the
+    /// test, not outlive it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_the_async_loop_pipelines_deferred_steps_through_the_drain_door() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let answered = Arc::new(AtomicUsize::new(0));
-        let executor = KnockingExecutor {
-            inner: NoopExecutor::new(1024),
-            step: 0,
-            door: None,
-            pending: Vec::new(),
-            events: Arc::clone(&events),
-            answered: Arc::clone(&answered),
-        };
-        // The scheduler's own flag too: a step is scheduled behind the one in flight, which is
-        // what puts execute(N+1) on the executor thread before N's resolver knocks.
-        let mut config = make_engine_config();
-        config.async_scheduling = true;
-        config.scheduler_config.async_scheduling = Some(true);
-        let client = Box::new(InprocClient::new(config, Box::new(executor)));
-        let mut engine = AsyncEngine::new(client, "test-model".to_string(), 4096);
-        engine.set_async_scheduling(true);
-        let engine = Arc::new(engine);
-        engine.spawn_step_loop();
-
-        let mut request =
-            make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])));
-        request.max_tokens = Some(16);
-        request.stream = true;
-        let (_, _, mut rx) = engine.completion_stream(request).await.unwrap();
         tokio::time::timeout(Duration::from_secs(30), async {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let answered = Arc::new(AtomicUsize::new(0));
+            let executor = KnockingExecutor {
+                inner: NoopExecutor::new(1024),
+                step: 0,
+                door: None,
+                pending: Vec::new(),
+                events: Arc::clone(&events),
+                answered: Arc::clone(&answered),
+            };
+            // The scheduler's own flag too: a step is scheduled behind the one in flight, which is
+            // what puts execute(N+1) on the executor thread before N's resolver knocks.
+            let mut config = make_engine_config();
+            config.async_scheduling = true;
+            config.scheduler_config.async_scheduling = Some(true);
+            let client = Box::new(InprocClient::new(config, Box::new(executor)));
+            let mut engine = AsyncEngine::new(client, "test-model".to_string(), 4096);
+            engine.set_async_scheduling(true);
+            let engine = Arc::new(engine);
+            engine.spawn_step_loop();
+
+            let mut request =
+                make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])));
+            request.max_tokens = Some(16);
+            request.stream = true;
+            let (_, _, mut rx) = engine.completion_stream(request).await.unwrap();
             while rx.recv().await.is_some() {}
+            // Teardown runs on a BLOCKING thread the timeout below can abandon: the engine's
+            // drop joins the executor thread (`ExecutorPipeline::drop`), and a join that hangs
+            // on the tokio worker would hang the timeout with it. A hang must FAIL the test.
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+            let teardown = Arc::clone(&engine);
+            drop(engine);
+            tokio::task::spawn_blocking(move || {
+                drop(teardown);
+                let _ = done_tx.send(());
+            });
+            tokio::time::timeout(Duration::from_secs(30), done_rx)
+                .await
+                .expect("the engine's teardown never finished (the executor thread never joined)")
+                .expect("the teardown thread panicked");
+
+            let log = events.lock().unwrap().clone();
+            let execs = log.iter().filter(|e| e.starts_with("exec:")).count();
+            let knocks = log.iter().filter(|e| e.starts_with("knock:")).count();
+            assert!(execs > 1, "the request ran more than one step");
+            // The teardown race, stated not hidden: depth-2 pipelining executes the step
+            // BEHIND the one that finishes the request (17 execs for max_tokens 16), and
+            // the loop's task can be gone before that overshoot's resolver runs — its
+            // ModelRunnerOutput is dropped unresolved, so at most ONE step (the overshoot)
+            // never knocks. Every resolver that DID knock is answered — the executor's
+            // shutdown error-fills every pending cell before the thread joins, so the
+            // answer only trails the join by a scheduler wakeup. Wait that straggler out:
+            // a resolver still parked here is the defect this test exists to catch.
+            assert!(
+                execs - knocks <= 1,
+                "more than the pipelining overshoot went unresolved: {log:?}"
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let knocks_live = || {
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|e| e.starts_with("knock:"))
+                        .count()
+                };
+                loop {
+                    while answered.load(SeqCst) < knocks_live() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    // Settle one beat: a resolver still mid-closure at the join records
+                    // its knock late, and its cell is already filled — 100 ms is orders
+                    // of magnitude past that wakeup.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if answered.load(SeqCst) >= knocks_live() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("a resolver that knocked was never answered — parked on its cell");
+            let knocks_final = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.starts_with("knock:"))
+                .count();
+            assert_eq!(
+                answered.load(SeqCst),
+                knocks_final,
+                "every deferred step's resolver that knocked was answered"
+            );
+            // Depth 2, the claim itself: the step behind a deferred one executed before the
+            // deferred one resolved. Step 0 is the one both sides of the wiring must order.
+            let pos = |name: &str| log.iter().position(|e| e == name).unwrap_or(usize::MAX);
+            assert!(
+                pos("exec:1") < pos("answer:0"),
+                "step 1 executed before step 0's resolver answered — the loop drained in-call \
+                 (depth 1); log: {log:?}"
+            );
         })
         .await
-        .expect("the stream never ended");
-
-        let log = events.lock().unwrap().clone();
-        let execs = log.iter().filter(|e| e.starts_with("exec:")).count();
-        assert!(execs > 1, "the request ran more than one step");
-        assert_eq!(
-            answered.load(SeqCst),
-            execs,
-            "every deferred step's resolver was answered"
-        );
-        // Depth 2, the claim itself: the step behind a deferred one executed before the
-        // deferred one resolved. Step 0 is the one both sides of the wiring must order.
-        let pos = |name: &str| log.iter().position(|e| e == name).unwrap_or(usize::MAX);
-        assert!(
-            pos("exec:1") < pos("answer:0"),
-            "step 1 executed before step 0's resolver answered — the loop drained in-call \
-             (depth 1); log: {log:?}"
-        );
+        .expect("the test hung — the stream never ended or teardown never finished");
     }
 
     /// A failed speculative step (an MTP head plans drafts for every request it admits) is
