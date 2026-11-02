@@ -230,6 +230,16 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_gemv_bf16_abt_prepare() -> i32;
+    fn scratchy_cuda_gemv_split_bf16_abt(
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        partials: *mut c_void,
+        n: u32,
+        k: u32,
+        splits: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemv_bf16_abt(
         a: *const c_void,
         b: *const c_void,
@@ -399,6 +409,22 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_expert_gemv_bf16_prepare() -> i32;
+    fn scratchy_cuda_expert_gemv_split_bf16(
+        a: *const c_void,
+        b: *const c_void,
+        topk_idx: *const c_void,
+        c: *mut c_void,
+        partials: *mut c_void,
+        m: u32,
+        top_k: u32,
+        n: u32,
+        k: u32,
+        experts: u32,
+        expert_rows: u32,
+        pair_rows: u32,
+        splits: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_expert_gemv_bf16(
         a: *const c_void,
         b: *const c_void,
@@ -470,6 +496,9 @@ pub enum KernelError {
     NarrowShape { m: u32, n: u32, k: u32 },
     /// The GEMV does not take this shape; nothing was launched.
     GemvShape { n: u32, k: u32 },
+    /// The split-K GEMV does not take this shape, split count or scratch (a null scratch above
+    /// one split); nothing was launched.
+    GemvSplit { n: u32, k: u32, splits: u32 },
     /// The decode attention does not take this shape, scale or window; nothing was launched.
     AttnDecodeShape {
         q_heads: u32,
@@ -605,6 +634,10 @@ impl fmt::Display for KernelError {
             KernelError::GdnNormShape { rows, nv, head_v } => write!(
                 f,
                 "GDN gated norm refused shape rows={rows} nv={nv} head_v={head_v}, or its eps"
+            ),
+            KernelError::GemvSplit { n, k, splits } => write!(
+                f,
+                "GEMV refused split shape n={n} k={k} splits={splits}, or its scratch"
             ),
             KernelError::MoeShape { kernel, dims } => {
                 write!(f, "{kernel} refused shape {dims:?}")
@@ -1351,9 +1384,9 @@ pub unsafe fn gemm_narrow_bf16_abt(
 }
 
 /// Launch the bf16 GEMV `c = a · Bᵀ`, the one-row GEMM: `a` is `[1, k]`, `B` `[n, k]` and `c`
-/// `[1, n]`, row-major bf16, accumulated in f32 and rounded once. ThunderKittens' WGMMA over 64
-/// columns of `c` per CTA, in a fixed K order, so the bits do not depend on the launch; only the
-/// `n` elements of `c` are written. Asynchronous.
+/// `[1, n]`, row-major bf16, accumulated in f32 and rounded once: [`gemv_split_bf16_abt`] at one
+/// split, each row's products added in a fixed K order, so the bits do not depend on the launch;
+/// only the `n` elements of `c` are written. Asynchronous.
 ///
 /// Refused with [`KernelError::GemvShape`], before any pointer is touched, unless `n` is
 /// non-zero, `k` a non-zero multiple of 8 (`step::GEMV_BF16_MULTIPLE`), and both at most
@@ -1376,6 +1409,35 @@ pub unsafe fn gemv_bf16_abt(
     // shape before it touches a pointer and catches every C++ exception.
     let code = unsafe { scratchy_cuda_gemv_bf16_abt(a, b, c, n, k, stream) };
     check(code, KernelError::GemvShape { n, k })
+}
+
+/// [`gemv_bf16_abt`] with its `k` cut into `splits` runs of whole 256-element chunks
+/// (`step::gemv_splits` chooses it at expansion): each split's f32 partials go to `partials`, and
+/// a second launch adds them in ascending split order and rounds once. Within the GEMV bound of
+/// f64, and bit-identical on a repeat; at `splits` 1 it is [`gemv_bf16_abt`]'s bits.
+/// Asynchronous.
+///
+/// Refused with [`KernelError::GemvSplit`], before any pointer is touched, unless the shape is
+/// [`gemv_bf16_abt`]'s, `splits` is in `1..=16` (`step::GEMV_MAX_SPLITS`) and cuts `⌈k / 256⌉`
+/// chunks into non-empty runs (`step::gemv_split_chunks`), `partials` is not null above one split,
+/// and `splits · n_pad` is at most `i32::MAX`.
+///
+/// # Safety
+///
+/// As [`gemv_bf16_abt`]'s; and at `splits > 1`, `partials` must be a 16-byte-aligned device
+/// pointer to `step::gemv_scratch_bytes(n, 1, splits)` bytes, valid for both launches and
+/// overlapping no operand.
+pub unsafe fn gemv_split_bf16_abt(
+    (a, b, c): (*const c_void, *const c_void, *mut c_void),
+    partials: *mut c_void,
+    (n, k, splits): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape and split before it touches a pointer and catches every C++ exception.
+    let code =
+        unsafe { scratchy_cuda_gemv_split_bf16_abt(a, b, c, partials, n, k, splits, stream) };
+    check(code, KernelError::GemvSplit { n, k, splits })
 }
 
 // THE TMA BOX PROBE (`kernels/tma_box_probe.cu`): test support, for `tests/tma_bounds.rs` only.
@@ -2134,6 +2196,56 @@ pub unsafe fn expert_gemv_bf16(
             experts,
             expert_rows,
             u32::from(pair_rows),
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MoeShape {
+            kernel: "expert_gemv_bf16",
+            dims: [m, top_k, n, k],
+        },
+    )
+}
+
+/// [`expert_gemv_bf16`] at `splits` K runs (`step::gemv_splits` of `(n, k)` and the `m · top_k`
+/// pairs), its partials in `partials`, added in ascending split order by a second launch: each
+/// pair's row is [`gemv_split_bf16_abt`]'s bits at the same split on the same row and expert
+/// slice. Asynchronous.
+///
+/// Refused with [`KernelError::MoeShape`] `{ kernel: "expert_gemv_bf16", .. }` for a shape
+/// [`expert_gemv_bf16`] refuses, or a split [`gemv_split_bf16_abt`] refuses, before any pointer
+/// is touched.
+///
+/// # Safety
+///
+/// As [`expert_gemv_bf16`]'s; and at `splits > 1`, `partials` must be a 16-byte-aligned device
+/// pointer to `step::gemv_scratch_bytes(n, m · top_k, splits)` bytes, valid for both launches and
+/// overlapping no operand.
+pub unsafe fn expert_gemv_split_bf16(
+    (a, b, topk_idx): (*const c_void, *const c_void, *const c_void),
+    (c, partials): (*mut c_void, *mut c_void),
+    (m, top_k, n, k): (u32, u32, u32, u32),
+    (experts, expert_rows): (u32, u32),
+    (pair_rows, splits): (bool, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `expert_gemv_bf16`'s, and the scratch contract above.
+    let code = unsafe {
+        scratchy_cuda_expert_gemv_split_bf16(
+            a,
+            b,
+            topk_idx,
+            c,
+            partials,
+            m,
+            top_k,
+            n,
+            k,
+            experts,
+            expert_rows,
+            u32::from(pair_rows),
+            splits,
             stream,
         )
     };

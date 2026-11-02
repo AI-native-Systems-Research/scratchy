@@ -153,6 +153,7 @@ fn tape(weight_bytes: &'static [u64]) -> CudaTape {
         gdn: None,
         moe: None,
         rotary_local: None,
+        gemv_scratch: None,
     }
 }
 

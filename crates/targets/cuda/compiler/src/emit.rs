@@ -836,6 +836,7 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
         kv,
         gdn,
         moe,
+        gemv_scratch,
     } = c;
     CudaTape {
         bucket_m: *bucket_m,
@@ -897,6 +898,7 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
             },
         ),
         moe: *moe,
+        gemv_scratch: *gemv_scratch,
     }
 }
 

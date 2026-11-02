@@ -448,6 +448,11 @@ pub struct CudaTape {
     /// The MoE scratch, exactly when a step is a MoE step (a router, a routing, a sort, an expert
     /// projection or a combine); `None` for a tape with no mixture of experts.
     pub moe: Option<MoeTape>,
+    /// The decode GEMVs' split-K scratch (#1031): the f32 partials of the one GEMV running at a
+    /// time, `step::gemv_scratch_bytes` of the largest split step, exactly when a `Gemv`, a GEMV
+    /// `RouterLogits` or an `ExpertGemv` takes more than one K split; `None` otherwise. Only those
+    /// steps read or write it, and nothing in it outlives the step.
+    pub gemv_scratch: Option<ArenaSpan>,
 }
 
 /// Which of the tape's reserved regions a [`TapeError`] names.
@@ -460,6 +465,7 @@ pub enum Region {
     Sequence,
     GdnSequence,
     GdnScratch,
+    GemvScratch,
     MoeLogits,
     MoeTopKIdx,
     MoeScores,
@@ -486,6 +492,7 @@ impl std::fmt::Display for Region {
             Self::Sequence => "the sequence region",
             Self::GdnSequence => "the GDN sequence region",
             Self::GdnScratch => "the GDN scratch",
+            Self::GemvScratch => "the GEMV scratch",
             Self::MoeLogits => "the MoE logits",
             Self::MoeTopKIdx => "the MoE top-k indices",
             Self::MoeScores => "the MoE scores",
@@ -624,6 +631,13 @@ pub enum TapeError {
     /// The `step`-th step is a one-row kernel's (a GEMV or the decode attention) and its rows are
     /// `rows`, not 1, or the tape's bucket is not one row.
     OneRowStep { step: usize, rows: u32 },
+    /// The GEMV scratch is missing, present with no split step, of other bytes than the largest
+    /// split step writes (`want`), misaligned, past the arena, or over a region.
+    GemvScratch {
+        span: Option<ArenaSpan>,
+        want: u64,
+        total: u64,
+    },
     /// The `step`-th step's rope reads `table`, which is not the tape's rotary table (`None`
     /// when the tape has none).
     RotaryMismatch {
@@ -909,6 +923,11 @@ impl std::fmt::Display for TapeError {
                 "the tape's KV attention classes are not a geometry the kernels take, or a layer \
                  names no class"
             ),
+            Self::GemvScratch { span, want, total } => write!(
+                f,
+                "the GEMV scratch is {span:?}; its split steps write {want} bytes, aligned to \
+                 {CUDA_ARENA_ALIGN} inside the {total}-byte arena, over no other region"
+            ),
             Self::OneRowStep { step, rows } => write!(
                 f,
                 "step {step} is a one-row kernel's (the GEMV or the decode attention) at \
@@ -1141,6 +1160,7 @@ impl CudaTape {
         }
         let scratch = self.gdn_regions(total, &mut regions)?;
         let moe = self.moe_regions(total, &regions)?;
+        let gemv = self.gemv_region(total, &regions, moe)?;
         for (step, s) in self.steps.iter().enumerate() {
             let e = s.extents().ok_or(TapeError::StepOverflow { step })?;
             let reads = e.reads.iter().flatten();
@@ -1199,6 +1219,7 @@ impl CudaTape {
             if let Some(moe) = moe {
                 self.check_moe_scratch(step, s, &e, moe)?;
             }
+            self.check_gemv_scratch(step, &e, gemv)?;
             self.check_step_operands(step, s)?;
             if let Some(layer) = e.gdn {
                 let layers = self.gdn.map_or(0, |g| g.layers.len());
@@ -1687,6 +1708,62 @@ impl CudaTape {
         Ok(Some(moe.span()))
     }
 
+    /// The GEMV scratch, when the tape has one: aligned, inside the arena, overlapping no region
+    /// the forward fills and not the MoE scratch, and exactly the bytes its largest split step
+    /// writes (`step::gemv_scratch_bytes`); and present exactly when a step splits. Returns it.
+    fn gemv_region(
+        &self,
+        total: u64,
+        regions: &[(Region, ArenaSpan)],
+        moe: Option<ArenaSpan>,
+    ) -> Result<Option<ArenaSpan>, TapeError> {
+        let mut want = 0u64;
+        for (step, s) in self.steps.iter().enumerate() {
+            let need = s.gemv_scratch().ok_or(TapeError::StepOverflow { step })?;
+            want = want.max(need);
+        }
+        match (self.gemv_scratch, want) {
+            (None, 0) => Ok(None),
+            (Some(span), want) if span.bytes == want && want > 0 => {
+                let clear = regions.iter().all(|&(_, r)| !overlap(r, span))
+                    && moe.is_none_or(|m| !overlap(m, span));
+                if span.offset.0.is_multiple_of(CUDA_ARENA_ALIGN) && inside(span, total) && clear {
+                    Ok(Some(span))
+                } else {
+                    Err(TapeError::GemvScratch {
+                        span: Some(span),
+                        want,
+                        total,
+                    })
+                }
+            }
+            (span, want) => Err(TapeError::GemvScratch { span, want, total }),
+        }
+    }
+
+    /// Only a split decode GEMV reads or writes the GEMV scratch (its partials, through the
+    /// scratch pointer it is handed, not its extents); no step's spans touch it.
+    fn check_gemv_scratch(
+        &self,
+        step: usize,
+        e: &crate::step::StepExtents,
+        scratch: Option<ArenaSpan>,
+    ) -> Result<(), TapeError> {
+        let Some(scratch) = scratch else {
+            return Ok(());
+        };
+        let writes = [Some(e.writes), e.second_write];
+        let mut spans = e.reads.iter().chain(&writes).flatten().copied();
+        match spans.find(|&s| overlap(s, scratch)) {
+            Some(write) => Err(TapeError::WriteOverRegion {
+                step,
+                write,
+                region: Region::GemvScratch,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// No step but a MoE step reads or writes the MoE scratch, except the `SiluMul` over its gate
     /// and up rows into its activation rows; and no colour lies inside it.
     fn check_moe_scratch(
@@ -2006,6 +2083,7 @@ mod tests {
         gdn: None,
         moe: None,
         rotary_local: None,
+        gemv_scratch: None,
     };
 
     /// `GOOD` with its steps replaced by `step` alone.
@@ -2982,6 +3060,7 @@ mod tests {
             gdn,
             moe: None,
             rotary_local: None,
+            gemv_scratch: None,
         }
     }
 
@@ -3451,6 +3530,11 @@ mod tests {
                 tape: s,
             },
             TapeError::MoeScratchTouched { step: 1, span: s },
+            TapeError::GemvScratch {
+                span: Some(s),
+                want: 4,
+                total: 8,
+            },
         ];
         for e in &all {
             match e {
@@ -3495,7 +3579,8 @@ mod tests {
                 | TapeError::MoeRegionShape { .. }
                 | TapeError::MoeStepGeometry { .. }
                 | TapeError::MoeRegionMismatch { .. }
-                | TapeError::MoeScratchTouched { .. } => {}
+                | TapeError::MoeScratchTouched { .. }
+                | TapeError::GemvScratch { .. } => {}
             }
         }
         all
@@ -3517,6 +3602,7 @@ mod tests {
             Region::Sequence,
             Region::GdnSequence,
             Region::GdnScratch,
+            Region::GemvScratch,
             Region::MoeLogits,
             Region::MoeTopKIdx,
             Region::MoeScores,
@@ -3587,6 +3673,7 @@ mod tests {
         gdn: None,
         moe: None,
         rotary_local: None,
+        gemv_scratch: None,
     };
 
     /// A one-row GEMV tape validates; a GEMV of more than one row, or one in a bucket of more
@@ -3699,6 +3786,7 @@ mod tests {
             gdn: None,
             moe,
             rotary_local: None,
+            gemv_scratch: None,
         }
     }
 

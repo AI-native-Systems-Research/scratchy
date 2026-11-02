@@ -269,6 +269,7 @@ pub static GDN_LAYER_M128: CudaTape = CudaTape {
     gdn: gdn_tape(3416064, (3416320, 4210688)),
     moe: None,
     rotary_local: None,
+    gemv_scratch: None,
 };
 
 /// [`gdn_layer`]`(256)`: every colour of [`GDN_LAYER_M128`] doubled. `x` 0, `n` (then `o`) 524288,
@@ -309,4 +310,5 @@ pub static GDN_LAYER_M256: CudaTape = CudaTape {
     gdn: gdn_tape(6832128, (6832384, 8421376)),
     moe: None,
     rotary_local: None,
+    gemv_scratch: None,
 };
