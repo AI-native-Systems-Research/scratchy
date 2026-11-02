@@ -1684,6 +1684,85 @@ fn row_gate(
     cmds.into_iter().map(gated).collect()
 }
 
+/// `norm` (an `RmsNorm` or `FusedAddRmsNorm` command) as its quantizing twin
+/// (`rmsnorm_w4a8q_*` / `fused_add_rmsnorm_w4a8q_*`), which also writes the scratch the W4A8
+/// pre-pass `quant` writes from the norm's output — the same bytes (`norm_w4a8_quant.h`). Where
+/// `quant` reads the slot `norm` writes, over its rows (one a threadgroup, scaled alike with the
+/// live rows), under the same gate, and the row fits beside the norm's sum in threadgroup memory.
+fn quantizing_norm(norm: &GatedCommand, quant: &GatedCommand) -> Option<GatedCommand> {
+    let (n, q) = (&norm.command, &quant.command);
+    let constant = |c: &LoweredCommand, index| {
+        (c.constants.iter())
+            .find(|v| v.index == index)
+            .map(|v| v.bits)
+    };
+    let slot = |c: &LoweredCommand, index| {
+        c.bindings.iter().find_map(|b| match *b {
+            Binding::ArenaSlot {
+                slot,
+                binding_index,
+            } if binding_index == index => Some(slot),
+            _ => None,
+        })
+    };
+    // The normed rows: RmsNorm's output, FusedAddRmsNorm's delta.
+    let normed = match n.kernel {
+        KernelId::RmsNorm => 0,
+        KernelId::FusedAddRmsNorm => 1,
+        _ => return None,
+    };
+    let function = match n.function {
+        "rmsnorm_f16_s_f16_specialized" => "rmsnorm_w4a8q_f16_s_f16_specialized",
+        "rmsnorm_bf16_s_f16_specialized" => "rmsnorm_w4a8q_bf16_s_f16_specialized",
+        "rmsnorm_f16_s_bf16_specialized" => "rmsnorm_w4a8q_f16_s_bf16_specialized",
+        "rmsnorm_bf16_s_bf16_specialized" => "rmsnorm_w4a8q_bf16_s_bf16_specialized",
+        "fused_add_rmsnorm_f16_s_f16_specialized" => "fused_add_rmsnorm_w4a8q_f16_s_f16_specialized",
+        "fused_add_rmsnorm_bf16_s_f16_specialized" => {
+            "fused_add_rmsnorm_w4a8q_bf16_s_f16_specialized"
+        }
+        "fused_add_rmsnorm_f16_s_bf16_specialized" => {
+            "fused_add_rmsnorm_w4a8q_f16_s_bf16_specialized"
+        }
+        "fused_add_rmsnorm_bf16_s_bf16_specialized" => {
+            "fused_add_rmsnorm_w4a8q_bf16_s_bf16_specialized"
+        }
+        _ => return None,
+    };
+    let (hidden, threads) = (constant(n, 1)?, n.dispatch.threads_per_threadgroup.0);
+    let scaling = |c: &LoweredCommand| c.dispatch.m_scaling.map(|s| (s.bucket_m, s.set_axis));
+    // The row (2-byte activations) and the row sum's partials in threadgroup memory.
+    let fits = 2 * hidden + 4 * threads <= 32768;
+    let same = q.kernel == KernelId::AffineW4a8Quant
+        && norm.gate == quant.gate
+        && slot(n, normed).is_some_and(|s| slot(q, 0) == Some(s))
+        && constant(q, 0) == Some(hidden)
+        && constant(n, 0) == Some(n.dispatch.threadgroups.0)
+        && n.dispatch.threadgroups.0 == q.dispatch.threadgroups.1
+        && scaling(n).is_some()
+        && scaling(n) == scaling(q)
+        && q.bindings.contains(&Binding::Scratch { binding_index: 1 })
+        && fits;
+    if !same {
+        return None;
+    }
+    let rows = constant(q, 2)?;
+    let constants = (n.constants.iter().copied())
+        .chain([ConstantValue::uint(6, rows)])
+        .collect();
+    let bindings = (n.bindings.iter().copied())
+        .chain([Binding::Scratch { binding_index: 3 }])
+        .collect();
+    Some(GatedCommand {
+        command: LoweredCommand {
+            function,
+            constants: baked(constants),
+            bindings: baked(bindings),
+            ..*n
+        },
+        gate: norm.gate,
+    })
+}
+
 /// A loop span the walk has entered but not yet left.
 struct OpenSpan {
     /// First command of the body, in the emitted command stream.
@@ -1813,6 +1892,10 @@ fn lower(
     // pre-pass and the GEMMs reading it. A next row whose pre-pass is the same command (the same
     // activation, rows and gate) reads the scratch as it is. Never across a loop's edge.
     let mut quantized: Option<GatedCommand> = None;
+    // The last command row's command when it is one RMSNorm (`RmsNorm` / `FusedAddRmsNorm`): a
+    // next row's W4A8 pre-pass over its rows folds into it (`quantizing_norm`). Never across a
+    // loop's edge.
+    let mut norm_at: Option<usize> = None;
 
     while i < rows.len() {
         let closed = loops.len();
@@ -1826,6 +1909,7 @@ fn lower(
         );
         if loops.len() > closed || matches!(rows[i], StepRow::Loop { .. }) {
             quantized = None;
+            norm_at = None;
         }
         // A fence a body's last rows carry past every command reaches the next
         // iteration's first command too.
@@ -1935,6 +2019,7 @@ fn lower(
                 let mut cmds = route_by_sequence_count(i, cmds)?;
                 update_shape_state(step, &mut m_divisor);
                 let reuses = cmds.first().is_some_and(|c| Some(*c) == quantized);
+                let mut fused_norm = false;
                 let live = live_rows.get(i).copied().unwrap_or(PlayLive::EVERY);
                 if !live.cache_writes && cmds.iter().any(writes_cache) {
                     return Err(LoweringError::CacheWriterSkipped { index: i });
@@ -1963,6 +2048,20 @@ fn lower(
                             .then_some(*first)
                     });
                     quantized_at = quantized.map(|_| commands.len());
+                    // The pre-pass over the rows the norm just before it wrote: the norm writes
+                    // the scratch itself, and the pre-pass goes.
+                    let folded = quantized.zip(norm_at).and_then(|(quant, at)| {
+                        quantizing_norm(&commands[at], &quant).map(|norm| (at, norm))
+                    });
+                    if let Some((at, norm)) = folded {
+                        commands[at] = norm;
+                        live_cmds[at] = live_cmds[at].or(live);
+                        // The norm now writes the scratch: it waits for the previous reader.
+                        barrier_before[at] = barrier_before[at].max(Fence::Ordered);
+                        quantized_at = Some(at);
+                        cmds.remove(0);
+                        fused_norm = true;
+                    }
                 }
                 let n_cmds = cmds.len();
                 live_cmds.extend(std::iter::repeat_n(live, n_cmds));
@@ -1982,6 +2081,12 @@ fn lower(
                 commands.extend(cmds);
                 if n_cmds >= 1 {
                     let flag = flag_for(i).max(writes_scratch).max(carried);
+                    // A GEMM whose pre-pass folded into the norm reads the scratch the norm wrote.
+                    let flag = if fused_norm {
+                        flag.max(Fence::Coherent)
+                    } else {
+                        flag
+                    };
                     // A step's later commands (a SplitK partial-writer → reduce pair) read what
                     // an earlier one wrote: RAW, Coherent. One no step runs with any before it (a
                     // small-M twin and the GEMM it replaces) is the step's first wherever it runs,
@@ -1995,6 +2100,14 @@ fn lower(
                         if alone { flag } else { Fence::Coherent }
                     }));
                     carried = Fence::None;
+                    let norm = |c: &GatedCommand| {
+                        matches!(
+                            c.command.kernel,
+                            KernelId::RmsNorm | KernelId::FusedAddRmsNorm
+                        )
+                    };
+                    norm_at = (n_cmds == 1 && norm(&commands[commands.len() - 1]))
+                        .then(|| commands.len() - 1);
                 } else {
                     carried = carried.max(flag_for(i));
                 }
