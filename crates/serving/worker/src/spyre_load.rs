@@ -2077,10 +2077,8 @@ impl SpyreWorker {
                     // live, and the fold would cover `active_cap * pages` columns while the deepest row
                     // needs `write_slot + 1`. Both keys were bare `u32` until now.
                     let rn = rung_n.get() as usize;
-                    // ⭐ A ONE-ROW RUNG IS A BATCH OF ONE (the batched kernel), built as every other
-                    // rung is; the one-request OWNER is the `decode` session already built above, and
-                    // the bake ships no width-0 rung.
-                    if rn == 0 {
+                    // The one-request rung IS the `decode` session already built and aliased above.
+                    if rn <= 1 {
                         continue;
                     }
                     // The manifest's `RungSeqs` IS a baked row count — this is the one boundary where
