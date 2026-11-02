@@ -24,11 +24,24 @@
 
 use std::collections::HashSet;
 
+use ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations;
 use scratchy_subtile::subtile_ir::{
     EwKind, GainConvention, Range, Region, SubOp, SubtileIR, SubtileNode, TensorId, TensorRegion,
     TensorShape,
 };
-use scratchy_target_spyre::ktir_superdsc_door::lower as door_lower;
+use scratchy_target_spyre::ktir_superdsc_door::{BundleAttnParams, lower as bundle_lower};
+
+/// One program through the production door as a bundle of its own — the fp8 quantize set starts
+/// empty, which is what a one-program bundle's is.
+fn door_lower(
+    k: &ktir_superdsc::ktir_node::KtirNode,
+    sym: &mut i64,
+    layout: Option<&ktir_superdsc::placement::BundleLayout>,
+    attn: Option<BundleAttnParams>,
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, ktir_superdsc::emit::lower_ktir_to_superdsc::Error>
+{
+    bundle_lower(k, sym, layout, attn, &mut QuantizedActivations::default())
+}
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::compute_bundle_layout;
 use scratchy_triton_splice::PagedRows;
 
@@ -1248,10 +1261,11 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
         // Each program through the door under the SAME layout, symbol counters
         // threaded in bundle order (the door's names are per-bundle).
         let mut s_sym = 0i64;
+        let mut s_fp8 = QuantizedActivations::default();
         for s_op in &spliced_ops {
             let s_ktir = s_op.ktir.as_ref().expect("spliced op carries its program");
-            let _emitted =
-                door_lower(s_ktir, &mut s_sym, Some(&layout), None).unwrap_or_else(|e| {
+            let _emitted = bundle_lower(s_ktir, &mut s_sym, Some(&layout), None, &mut s_fp8)
+                .unwrap_or_else(|e| {
                     panic!(
                         "spliced program lowered (mq={mq} k={k} n={n}): {}",
                         e.message

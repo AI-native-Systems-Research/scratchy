@@ -1021,6 +1021,7 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
     // parameters — the same call `lower_subtile_tape_to_ktir`'s re-rolled walk makes.
     let attn_params = attn_bundle_params(ir, rows_are_requests);
     let mut sym_id_base: i64 = 0;
+    let mut fp8_quantized = ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default();
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(programs.len());
     for e in &programs {
         let k = e.ktir.as_ref().ok_or_else(|| {
@@ -1036,6 +1037,7 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
                 &mut sym_id_base,
                 Some(&bundle_layout),
                 attn_params,
+                &mut fp8_quantized,
             )
             .map_err(|err| {
                 SuperDscError(format!("{}: KTIR -> SuperDSC: {}", e.op_name, err.message))
@@ -2624,6 +2626,8 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         .chain(std::iter::once(&suffix))
     {
         let mut declare_syms: i64 = 0;
+        // The declaring pass mints what the real one will, so it threads the same per-bundle set.
+        let mut declare_fp8 = ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default();
         for e in ops.iter() {
             let Some(k) = e.ktir.as_ref() else { continue };
             // An emulator bake leaves the KV cache to the emulator — the KTIR's own buffers
@@ -2638,6 +2642,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                 &mut declare_syms,
                 Some(&bundle_layout),
                 attn_params,
+                &mut declare_fp8,
             )
             .map_err(|err| {
                 SuperDscError(format!(

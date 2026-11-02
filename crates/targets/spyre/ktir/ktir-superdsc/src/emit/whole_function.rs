@@ -3757,13 +3757,20 @@ pub fn staggered_sources(
     Ok(marked)
 }
 
+///
+/// `quantized` is the bundle's fp8 activation-quantize set ([`QuantizedActivations`]): an fp8 matmul
+/// on an activation an earlier program of the bundle already quantized reuses that chain. A caller
+/// lowering one program alone passes a fresh one.
+///
+/// [`QuantizedActivations`]: super::ktir_matmul_fp8::QuantizedActivations
 pub fn lower_function(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     sym_id_base: &mut i64,
     headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
+    quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
 ) -> Result<Vec<super::EmittedOp>, Error> {
-    lower_function_folded(k, layout, sym_id_base, headmajor, None)
+    lower_function_folded(k, layout, sym_id_base, headmajor, None, quantized)
 }
 
 /// ⭐ A PROGRAM THAT WALKS — one constant-trip `scf.for`, the paged attention's page walk — through
@@ -3780,6 +3787,7 @@ pub fn lower_walk(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     sym_id_base: &mut i64,
+    quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
 ) -> Result<Vec<super::EmittedOp>, Error> {
     let flat = super::loop_fold::flatten(k)?;
     let (node, fold) = match &flat {
@@ -3789,18 +3797,27 @@ pub fn lower_walk(
     // ⭐ torch-spyre plans LX before it emits ([`super::lx_plan`]): a probe lowering learns how every
     // op slices every tensor, and the plan keeps in LX what every op hands out alike.
     let Some(layout) = layout else {
-        return lower_function_folded(node, None, sym_id_base, None, fold);
+        return lower_function_folded(node, None, sym_id_base, None, fold, quantized);
     };
     super::lx_plan::plan(node, layout, |probe| {
+        // The probe is a dry run: it learns the slicing from the set as the real lowering will
+        // see it, and leaves the bundle's set as it found it.
         let mut sym = *sym_id_base;
-        lower_function_folded(node, Some(probe), &mut sym, None, fold)
+        lower_function_folded(
+            node,
+            Some(probe),
+            &mut sym,
+            None,
+            fold,
+            &mut quantized.clone(),
+        )
     })?;
     let probed = node
         .minted
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
-    let ops = lower_function_folded(node, Some(layout), sym_id_base, None, fold);
+    let ops = lower_function_folded(node, Some(layout), sym_id_base, None, fold, quantized);
     // The plan's division is this program's alone: every other function of the bundle divides as
     // its own ops do.
     layout.lx_division.set(None);
@@ -3832,6 +3849,7 @@ fn lower_function_folded(
     sym_id_base: &mut i64,
     headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
     fold: Option<&super::loop_fold::LoopFold>,
+    quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
 ) -> Result<Vec<super::EmittedOp>, Error> {
     let f = &k.func;
     let mut out = Vec::new();
@@ -6957,6 +6975,7 @@ fn lower_function_folded(
                     bcast: &bcast_axes,
                     df: op_df,
                 },
+                quantized,
             )?;
             out.append(&mut emitted);
             if let Lowering::BatchTranspose { .. } = program {
@@ -7054,6 +7073,7 @@ fn lower_function_folded(
                 bcast: &bcast_axes,
                 df: op_df,
             },
+            quantized,
         )?;
         out.append(&mut emitted);
         lowered += 1;
@@ -7866,6 +7886,7 @@ fn emit_one(
     layout: Option<&BundleLayout>,
     headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
     proof: WalkProof<'_>,
+    quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
 ) -> Result<Vec<super::EmittedOp>, Error> {
     let WalkProof {
         b_orient,
@@ -7999,10 +8020,6 @@ fn emit_one(
     };
     Ok(match program {
         Program::Matmul => {
-            // The fp8 activation-quantize dedup set is per-BUNDLE. One op at a time here, so a
-            // fresh set is correct for an fp16 program; an fp8 one needs it threaded across ops and
-            // that is not yet done, so it is stated rather than silently per-op.
-            let mut q = std::collections::HashSet::new();
             // ⛔ THE ORIENTATION IS PROVEN, NEVER DEFAULTED. `b_orient` is `Some` exactly when
             // `program` is `Node(Program::Matmul)`, which is this arm — but a default here would be
             // the silent wrong contraction at `k == n`, so the impossible case refuses by name.
@@ -8019,7 +8036,8 @@ fn emit_one(
                 per_op,
                 sym_id_base,
                 layout,
-                &mut q,
+                // The BUNDLE's set, threaded from the door: q/k/v on one rms output quantize it once.
+                quantized,
                 super::lower_ktir_to_superdsc::MatmulProof {
                     b,
                     // This door's operands are WINDOWS of the caller's parameters — the fact the
