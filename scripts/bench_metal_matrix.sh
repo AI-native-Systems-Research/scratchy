@@ -756,6 +756,8 @@ cleanup() {
     # A killed subshell orphans its children, so also stop whatever is on this run's port.
     pkill -TERM -f "bench (startup|serve) .*(--port ${PORT}|127\.0\.0\.1:${PORT})" 2>/dev/null || true
     lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN -t 2>/dev/null | xargs kill -TERM 2>/dev/null || true
+    # A run stopped or crashed mid-model leaves its oMLX homes; nothing reads them after.
+    rm -rf "${RAW}/omlx-home" "${RAW}/omlx-home-tq" "${RAW}/omlx-home-probe"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
@@ -869,6 +871,9 @@ omlx_serve() { # base-dir PAR
     echo "${OMLX_BIN} serve --base-path $1 --model-dir ${RAW}/omlx-models --host 127.0.0.1 --port ${PORT} --paged-ssd-cache-dir $1/ssd-cache${x}"
 }
 omlx_home()   { [[ "$1" == omlx_tq ]] && echo "${RAW}/omlx-home-tq" || echo "${RAW}/omlx-home"; }
+# A variant's home once its model is done: its SSD cache is that model's prompts alone, and reached
+# 87 GB in one full run on a 36 GB M3 Pro, so it goes then, not at the next model's start.
+omlx_clear() { [[ "$1" == omlx || "$1" == omlx_tq ]] && rm -rf "$(omlx_home "$1")"; return 0; }
 omlx_cmd()    { omlx_serve "$(omlx_home omlx)" "$2"; }
 omlx_tq_cmd() { omlx_serve "$(omlx_home omlx_tq)" "$2"; }
 omlx_ready()    { echo /v1/models; }
@@ -1275,7 +1280,7 @@ run_engine() { # key label
     [[ "${key}" == ollama && ",${SCENARIOS}," == *",frozen,"* ]] && evict=(--evict-path "${HOME}/.ollama/models/blobs")
     run_ladder "${label}" "${name}" "$("${key}_cmd" "${model}" 0 0)" "$([[ ${key} == mlx_lm ]] && echo mlx-lm || echo vllm)" \
         "${RAW}/exec-${key}-${stem}.json" ${evict[@]+"${evict[@]}"}
-    (( SCALING )) || return 0
+    (( SCALING )) || { omlx_clear "${key}"; return 0; }
     cell_model="${name}"; cell_tok="${id}"
     IFS=',' read -r -a axes <<<"${SCALE_AXES}"
     for ax in "${axes[@]}"; do
@@ -1291,6 +1296,7 @@ run_engine() { # key label
         serve_down
     done
     cell_model=""; cell_tok=""
+    omlx_clear "${key}"
 }
 
 # ---- summary: one model's rows, or everything ----------------------------
