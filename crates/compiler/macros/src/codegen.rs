@@ -11379,13 +11379,19 @@ fn dump_wavefront_mega(
              // The row count THIS bundle is baked at. Not `primary_m`: a batch-ladder
              // rung is a wider bake of the same tape, and reading the env knob here
              // would tell every rung it was one row.
-             decode_rows: u32|
+             decode_rows: u32,
+             // ⭐ WHETHER THIS BAKE IS A DECODE BATCH RUNG — stated by the one call site that bakes
+             // the batch ladder, never inferred from `decode_rows`: the ladder's one-row rung is a
+             // batch of one request (the batched kernel), while the one-request owner is the
+             // per-sequence decode at the same one row.
+             batch_rung: bool|
              -> (BakeOut, Vec<BakeEffect>) {
                 let mut fx: Vec<BakeEffect> = Vec::new();
                 let is_prefill = prefill_mq.is_some();
                 // A prefill chunk's rows are one prompt's positions; the decode bundle's are one
-                // token each of the running requests once it is baked wider than a single row.
-                let rows_are_requests = !is_prefill && decode_rows > 1;
+                // token each of the running requests once it is baked wider than a single row, and
+                // a batch rung's are at any width.
+                let rows_are_requests = !is_prefill && (decode_rows > 1 || batch_rung);
                 // ⛔ THE WIRING MUST NOT DESCRIBE A PROGRAM THAT DID NOT SHIP. A prefill
                 // rung whose reroll fails PANICS (no rung may fail to lower), but this
                 // closure's KTIR emission and wiring stamp run AFTER the reroll and
@@ -12674,7 +12680,7 @@ fn dump_wavefront_mega(
                                             // ~96x the work. `seq_sym.is_none()` is the same
                                             // discriminator the superdsc block above uses to exclude
                                             // that symbolic tape.
-                                            if decode_rows <= 1 && seq_sym.is_none() {
+                                            if decode_rows <= 1 && seq_sym.is_none() && !batch_rung {
                                                 fx.push(BakeEffect::DecodeFp(bfp));
                                             }
                                         }
@@ -12963,7 +12969,7 @@ fn dump_wavefront_mega(
                     // calls' effects in that order however the rungs were baked).
                     let slot = if is_prefill {
                         prefill_fp_stamped.then_some(WiringSlot::Prefill)
-                    } else if seq_sym.is_none() && decode_rows == primary_m {
+                    } else if seq_sym.is_none() && decode_rows == primary_m && !batch_rung {
                         Some(WiringSlot::Decode)
                     } else {
                         None
@@ -13087,7 +13093,8 @@ fn dump_wavefront_mega(
              seq_sym: Option<(&'static str, u32)>,
              prefill_mq: Option<u32>,
              active_cap: scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
-             decode_rows: u32| {
+             decode_rows: u32,
+             batch_rung: bool| {
                 let (r, fx) = emit_bundle_deferred(
                     lwd,
                     base,
@@ -13096,6 +13103,7 @@ fn dump_wavefront_mega(
                     prefill_mq,
                     active_cap,
                     decode_rows,
+                    batch_rung,
                 );
                 commit_bake(lwd, fx);
                 r
@@ -13117,6 +13125,7 @@ fn dump_wavefront_mega(
                 None, // decode path (Store + PagedAttnCompute) -- no prefill width
                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                 primary_m,
+                false,
             );
 
         // ── DECODE CAP BUCKETS (KTIR emulator path) ───────────────────────────────────────────────
@@ -13162,6 +13171,7 @@ fn dump_wavefront_mega(
                     None,
                     scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                     primary_m,
+                    false,
                 );
                 decode_bundles.push((m, n));
             }
@@ -13206,10 +13216,33 @@ fn dump_wavefront_mega(
             // ops at 32 requests, ~4 minutes alone), and dxp compiles groups in submission order, so
             // emitted last it started ~200 s into a granite-2b bake and WAS the bake's tail. Order is
             // free here: `decode_rung_lits` sorts the ladder by width before baking it.
-            for seqs in scratchy_subtile::sdsc_abstract::PagedKvPool::BATCH_RUNGS
+            // ⭐ AND A ONE-ROW RUNG — a batch of ONE request through the batched kernel, which
+            // gathers each page once where the two-row rung's padding row gathers it twice
+            // (granite-3.1-2b fp8, one request at ~10k: 35.9 ms against 43.5 on the two-row rung,
+            // 42.0 on main). The worker sends one request past this rung's first walk to it, and
+            // keeps a shorter one on the owner's per-sequence walk (`decode_rung_for`).
+            //
+            // ⛔ AT A ONE-STICK HEAD ONLY (head dim 64). At head dim 128 the one-row batched decode is
+            // MEASURED wrong on the card — granite-3.1-8b decodes garbage from its second token, the
+            // first wrong tensor its layer-0 batched attention's output (#1022) — so a two-stick head
+            // bakes no one-row rung and its one request keeps the two-row rung.
+            let head_dim = model.bounds.get("head_dim").copied().unwrap_or_else(|| {
+                let h = model.bounds.get("hidden_size").copied().unwrap_or(0);
+                let n = model
+                    .bounds
+                    .get("num_attention_heads")
+                    .copied()
+                    .unwrap_or(1)
+                    .max(1);
+                h / n
+            });
+            let one_row_rung = head_dim == u64::from(scratchy_subtile::sdsc_abstract::POOL_STICK);
+            let ladder: Vec<u32> = one_row_rung
+                .then_some(1u32)
                 .into_iter()
-                .rev()
-            {
+                .chain(scratchy_subtile::sdsc_abstract::PagedKvPool::BATCH_RUNGS)
+                .collect();
+            for seqs in ladder.into_iter().rev() {
                 match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
                     decode_asn_check,
@@ -13230,6 +13263,8 @@ fn dump_wavefront_mega(
                             None,
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                             seqs,
+                            // A batch rung: its rows are requests at every width, one included.
+                            true,
                         );
                     }
                     Err(e) => panic!(
@@ -13505,6 +13540,7 @@ fn dump_wavefront_mega(
                         // together; that combination is not what this flag selects.
                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE,
                         1, // a prompt chunk is one request however many positions it spans
+                        false,
                     );
                     Ok((lwd_p, r, fx))
                 }
@@ -13595,6 +13631,7 @@ fn dump_wavefront_mega(
                             Some(m),
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                             1, // a prompt chunk is one request
+                            false,
                         );
                     }
                     Err(e) => panic!(
@@ -13735,6 +13772,7 @@ fn dump_wavefront_mega(
                         // The CB sengraph's rows are a batch SYMBOL the DEM resolves at runtime, not
                         // a baked request count.
                         1,
+                        false,
                     );
                     (sg, groups)
                 }

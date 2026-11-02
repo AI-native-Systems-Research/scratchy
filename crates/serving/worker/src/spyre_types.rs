@@ -414,12 +414,15 @@ impl SuperDscBundle {
         // (granite-3.1-2b fp8: 36.5 against ~50.5 ms at ~4k, 49.0 against 79.6 at ~10k;
         // granite-3.1-8b bf16: 178.7 against 198.6 at ~10k). Short of it the owner's walk is the
         // faster one, and every other decode is unchanged.
+        // The NARROWEST such rung: the one-row batched rung where the bake has one (it gathers each
+        // page once; granite-3.1-2b fp8 ~10k: 35.9 against the two-row rung's 43.5), else the
+        // two-row rung. The ladder is ascending by width, so the first match is the narrowest.
         if live.get() == 1
-            && let Some(i) = self.decode_rungs.iter().position(|r| r.seqs.count() >= 2)
-            && self.decode_rungs[i]
-                .sess
-                .first_walk_positions()
-                .is_some_and(|first| deepest_pos as u64 >= first)
+            && let Some(i) = self.decode_rungs.iter().position(|r| {
+                r.sess
+                    .first_walk_positions()
+                    .is_some_and(|first| deepest_pos as u64 >= first)
+            })
         {
             return Some(RungId::Ladder(i));
         }
@@ -428,6 +431,8 @@ impl SuperDscBundle {
             // seat is never absent and a single request never falls to a second path.
             return Some(RungId::Owner);
         }
+        // ⛔ NEVER THE ONE-ROW RUNG FOR A BATCH: past one live request, the smallest rung that holds
+        // them, which `count() >= live` already excludes the one-row rung from.
         self.decode_rungs
             .iter()
             .position(|r| r.seqs.count() >= live.get())
