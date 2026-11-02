@@ -714,6 +714,9 @@ pub enum Scratch {
     BatchActivationBlocks,
     /// The wide levels of a leading-axis fold that halves (`emit::whole_function`'s reduce arm).
     FoldTreeWide,
+    /// A walk's carried value, copied once after the last trip for a reader that slices it across
+    /// cores, so the carried buffer itself stays core-local (`emit::whole_function`, #1026).
+    CarriedHandback,
 }
 
 impl Clone for KtirNode {
