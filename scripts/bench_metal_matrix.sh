@@ -73,10 +73,10 @@
 #   oMLX        `omlx serve` over the downloaded MLX checkpoint, twice:
 #               as installed (FP16 KV), and with its TurboQuant KV turned on
 #               (4-bit), so scratchy's TurboQuant default meets a like-for-like
-#               rival as well as oMLX's own default. Built from starpit/omlx's
-#               feat/api-ignore-eos branch (jundot/omlx#4978), its HTTP API
-#               takes ignore_eos and answers to length; releases through 0.7.x
-#               drop it and stop at EOS (§ on the page, #479)
+#               rival as well as oMLX's own default. From jundot/omlx 0.7.3 on,
+#               its HTTP API takes ignore_eos and answers to length
+#               (jundot/omlx#4978); earlier releases drop it and stop at EOS
+#               (§ on the page, #479)
 #   mistral.rs  `mistralrs serve`, the same Q4_K_M GGUF as llama.cpp; a Rust
 #               control: is scratchy fast because of its compiler, or Rust?
 #   Splash      `splash serve` (Inco AI), the same MLX checkpoint as scratchy;
