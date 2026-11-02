@@ -267,3 +267,50 @@ def bad_kernel(a_ptr, BLOCK: tl.constexpr):
         "the refusal must name the AST node type `While`; got: {msg}"
     );
 }
+
+/// HOST CODE AT MODULE LEVEL MAY OPEN A BLOCK. A fixture's torch half is ordinary Python, and
+/// a `if __name__ == "__main__":` guard (or a module-level `for`, `with`, `else`) is a host
+/// statement whose indented body the parser must consume, not stall on: `skip_logical_line`
+/// once stopped at the block's INDENT without consuming it and `parse` called straight back in,
+/// forever (`sdpa.py`'s self-check guard hung the ladder for 10 minutes at 7 MB).
+///
+/// The compile runs on its own thread under a deadline, so a regression FAILS here instead of
+/// hanging the suite. The kernel must still compile -- a block skipped by refusing the file would
+/// make every fixture with a host guard unparseable.
+#[test]
+fn a_module_level_host_block_is_skipped_not_spun_on() {
+    let src = r#"
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def ok_kernel(a_ptr, BLOCK: tl.constexpr):
+    a_desc = tl.make_tensor_descriptor(a_ptr, shape=[BLOCK], strides=[1], block_shape=[BLOCK])
+    a_desc.store([0], a_desc.load([0]) * 2.0)
+
+
+for n in (1, 2):
+    if n > 1:
+        print(f"{n}")
+else:
+    pass
+
+if __name__ == "__main__":
+    print("host")
+"#;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Built on the compiling thread: a `KernelSpec` is not `Send`.
+        let spec = common::simple_spec("ok_kernel", &[("a_ptr", "*fp16"), ("BLOCK", "constexpr")]);
+        let _ = tx.send(
+            codegen::compile(src, &spec, Target::spyre())
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        );
+    });
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the parse must FINISH: a module-level host block must be consumed, not spun on");
+    got.expect("a kernel followed by module-level host blocks must still compile");
+}

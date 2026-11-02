@@ -387,7 +387,9 @@ fn attrkey(k: &AttrKey) -> Result<Key> {
         Predicate => Key::As(KAttrKey::Predicate),
 
         // The function's, not an operation's.
-        SymName | Grid | Noinline | FoldedGridLoop | UnrolledGridLoop => Key::OnFunction,
+        SymName | Grid | Noinline | FoldedGridLoop | UnrolledGridLoop | PartitionClones => {
+            Key::OnFunction
+        }
 
         // Ours. See the note above.
         Pattern | WorkDivision | Index | DataBounds | OutputPartition | PtRows | XrfCapacity
@@ -620,6 +622,7 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
             // name -- that is the loud-by-design edge for a KERNEL; this arm is the parsed-
             // text and future-kernel surface.
             "arith.subi" => KOpKind::ArithSubi,
+            "arith.minsi" => KOpKind::ArithMinsi,
             "arith.extsi" => KOpKind::ArithExtsi,
             "arith.trunci" => KOpKind::ArithTrunci,
             "arith.ori" => KOpKind::ArithOri,
@@ -1053,7 +1056,7 @@ fn generic_as_broadcast<'a>(op: &Op, a: &'a Arena) -> Result<Vec<Operation<'a>>>
 /// so `embedding_granite`'s `(d0, d1, d2, d3) -> (d0 + d2)` becomes `(d0, d1)[s0, s1] -> (s0 + d0)`
 /// -- `ids[program_id * BLOCK_M + row]`, which is the address the fixture writes.
 fn indirect_access_tile<'a>(op: &Op, a: &'a Arena) -> Result<Operation<'a>> {
-    // `(base, captures.., index_view)`: the printed operand order, which `convert_gathers`
+    // `(base, captures.., index_view)`: the printed operand order, which `convert_indirect`
     // documents and `triton-superdsc-lower` reads `operands.last()` on.
     if op.operands.len() < 3 {
         return Err(refuse(format!(

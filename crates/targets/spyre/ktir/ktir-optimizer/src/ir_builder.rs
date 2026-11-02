@@ -83,28 +83,6 @@ impl Ops {
         Attr::IntList(self.a.ints(v))
     }
 
-    /// Attach ONE region (a straight-line op list) to `op`.
-    pub(crate) fn with_region(
-        &self,
-        op: Operation<'static>,
-        body: Vec<Operation<'static>>,
-    ) -> Operation<'static> {
-        self.regions(op, vec![body])
-    }
-
-    pub(crate) fn regions(
-        &self,
-        op: Operation<'static>,
-        bodies: Vec<Vec<Operation<'static>>>,
-    ) -> Operation<'static> {
-        let bodies: Vec<&'static [Operation<'static>]> =
-            bodies.into_iter().map(|b| self.a.ops(b)).collect();
-        Operation {
-            regions: self.a.regions(bodies),
-            ..op
-        }
-    }
-
     /// A rank-`n` identity affine map: `(d0..dn) -> (d0..dn)`.
     pub(crate) fn identity_map(&self, n: usize) -> AffineMap<'static> {
         self.perm_map(n, &(0..n).collect::<Vec<_>>())

@@ -72,6 +72,7 @@ pub(crate) mod cb_plan;
 /// launch sits. The LAUNCHER is the worker's (it owns the session).
 pub mod forward_tape;
 pub mod manifest;
+pub mod paged_step;
 /// Bundle execution on the `ktir_emulator` emulator — behind the `runner` feature
 /// (it links the emulator). Emit/weight-load paths use [`manifest`] alone.
 #[cfg(feature = "spyre-emu")]

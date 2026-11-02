@@ -348,8 +348,14 @@ fn gather_copy_cores(
         .filter(|_| entry_page > 0)
     {
         // The BASIS is the entry count, and the split of `mb` is that same number — so every core gets a
-        // whole number of entries and `min(per_core, page)` is always the page.
-        let split = crate::work::core_split(mb.size / entry_page, max_cores);
+        // whole number of entries and `min(per_core, page)` is always the page. Past one index stick,
+        // every core's run also lies within one stick of the table (`index_core_split`).
+        let split = crate::work::index_core_split(
+            mb.size / entry_page,
+            max_cores,
+            crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+        )
+        .unwrap_or(1);
         if split > 1 {
             splits.insert(mb.name, split);
         }
@@ -481,6 +487,890 @@ pub fn assemble_gather_copy(
         .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"))
 }
 
+/// ⭐⭐⭐ THE SCATTER'S COPY — the mirror of [`gather_copy_opspec`]: an `identity` from a contiguous
+/// source into a PAGED destination written through an index, so row `j` of the source lands at the
+/// destination entry `index[j]` names.
+///
+/// ## The shape, read off `dxp/test/test_scatter_1core/sdsc_1.json`
+/// ```text
+/// allocate-Tensor1_hbm  indirectAllocType_ index_tensor  relatedIndirectAccessAlloc_ allocate-Tensor2_hbm
+/// allocate-Tensor2_hbm  indirectAllocType_ value_tensor  relatedIndirectAccessAlloc_ allocate-Tensor1_hbm
+///                       maxDimSizes_ [1, -1, -1]
+/// computeOp_  opFuncName identity  inputLabeledDs ["Tensor0-idx0"]  outputLabeledDs ["Tensor2-idx2"]
+///             indirectAccessIndexLabeledDs ["Tensor1-idx1"]
+/// ```
+/// The gather's copy with the pair on the OUTPUT ([`OpSpec::attach_scatter_index`]); the scheduler
+/// turns that output's LX→HBM transfer indirect (`L3DlOpsScheduler.cpp:6880-6945`).
+///
+/// ## The same laws as the gather's copy, for the same reasons
+/// `cols` is ONE stick and `rows` counts one-stick SUB-ROWS, `scatter.page` of them per entry (a
+/// `[n, hd]` row is `hd / stick` sub-rows), so one index step moves `page · stick` elements — the
+/// row the index names. At most one index stick of entries per op, and cores split by whole entries
+/// only ([`gather_copy_cores`]): `skip_addr` is derived from the per-core extents, so a split entry
+/// is a clean bake writing the wrong rows. `src_elems` is the source's own base, for a run past the
+/// first.
+pub fn scatter_copy_opspec(
+    src: &str,
+    dst: &str,
+    scatter: crate::superdsc_opspec::GatherIndex,
+    spec: ScatterCopySpec,
+) -> Result<OpSpec, String> {
+    let ScatterCopySpec {
+        rows,
+        cols,
+        df,
+        src_elems,
+        dst_elems,
+    } = spec;
+    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
+    if cols != df.elems_per_stick() {
+        return Err(format!(
+            "scatter_copy_opspec('{src}' -> '{dst}'): `out` is {cols} elements, and a scattered \
+             copy's `out` must be exactly one {stick}-element stick — declare the row as one-stick \
+             sub-rows with the entry `page` covering them",
+            stick = df.elems_per_stick(),
+        ));
+    }
+    let page = scatter.page.get();
+    if page == 0 || !rows.is_multiple_of(page) {
+        return Err(format!(
+            "scatter_copy_opspec('{src}' -> '{dst}'): {rows} `mb` positions do not divide into \
+             whole {page}-position entries, so the last index entry would cover a partial row"
+        ));
+    }
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    if crate::work::index_core_split(rows / page, MAX_CORES, cap).is_none() {
+        return Err(format!(
+            "scatter_copy_opspec('{src}' -> '{dst}'): {} index entries divide over no {MAX_CORES} \
+             cores into runs each core reads from ONE {cap}-entry stick — entries past a core's \
+             stick wrap and write another core's rows",
+            rows / page
+        ));
+    }
+    let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df,
+    };
+    let tile_op = TileOp {
+        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        dims: vec![
+            dim("mb", rows, false),
+            dim("out", cols, true),
+            dim("y", 1, false),
+        ],
+        df,
+    };
+    // Rank-3 and `mb`-only core splits: the gather copy's two card-measured laws (see its call).
+    let mut op = pointwise_opspec_from_tile_split(
+        &tile_op,
+        OpFunc::Identity,
+        &[src],
+        dst,
+        true,
+        |dims: &[crate::superdsc_opspec::ItDim], max_cores: u32| {
+            gather_copy_cores(dims, max_cores, page)
+        },
+        // The destination is addressed THROUGH the index from the pool's own base.
+        OutView::at(0),
+    )?;
+    for a in op.args.iter_mut() {
+        a.set_df(df);
+    }
+    if src_elems > 0 {
+        op.args[0].set_offset_elems(src_elems);
+    }
+    op.attach_scatter_index(scatter).ok_or_else(|| {
+        format!(
+            "scatter_copy_opspec('{src}' -> '{dst}'): the index declaration does not fit this op — \
+             its dims are [mb, out, y], so the paged axis must be `mb`"
+        )
+    })?;
+    if dst_elems > 0
+        && let Some(o) = op.args.last_mut()
+    {
+        o.set_offset_elems(dst_elems);
+    }
+    Ok(op)
+}
+
+/// THE WORDS A PAGE GATHER MOVES, and so the op that moves them unchanged. dxp binds `identity` on
+/// fp16 and fp32 data only (`unary_parallel.ddl`); the binds over SENUINT32 data are
+/// `int32idxtoaddr`, `addi32toi32` and `muli32toi32` (`broadcast_ops.ddl:26`), so a run of int32
+/// index words is gathered as `zero + run` — the wrapping add of a stick of zeros, which moves every
+/// word as it is.
+#[derive(Clone, Copy, Debug)]
+pub enum GatheredWords<'a> {
+    /// fp16 rows — an `identity` copy.
+    Fp16,
+    /// int32 index words — `addi32toi32(zero, run)`, `zero` one stick of zeros.
+    SenUint32 { zero: &'a str },
+}
+
+impl GatheredWords<'_> {
+    fn df(self) -> Df {
+        match self {
+            GatheredWords::Fp16 => Df::Fp16,
+            GatheredWords::SenUint32 { .. } => Df::SenUint32,
+        }
+    }
+}
+
+/// THE PAGE GATHER — the scatter's mirror image: a copy whose gathered INPUT is the paged value,
+/// read through the index one whole entry at a time (`dxp/test/test_gather_1core/sdsc_1.json`'s
+/// shape), into a contiguous scratch. `rows` one-stick sub-rows of the scratch, `gather.page` of them
+/// per index entry, so `skip_addr` — the page times the unpinned extents — is one entry's own size and
+/// the paged value's entries must sit exactly that far apart (a whole page of a pool does). The copy
+/// is the op [`GatheredWords`] names; the gathered input is its LAST, next to the index.
+pub fn page_gather_copy_opspec(
+    src: &str,
+    dst: &str,
+    gather: crate::superdsc_opspec::GatherIndex,
+    rows: u32,
+    cols: u32,
+    words: GatheredWords<'_>,
+) -> Result<OpSpec, String> {
+    let df = words.df();
+    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
+    if cols != df.elems_per_stick() {
+        return Err(format!(
+            "page_gather_copy_opspec('{src}' -> '{dst}'): `out` is {cols} elements, and a gathered \
+             copy's `out` must be exactly one {stick}-element stick — declare the entry as one-stick \
+             sub-rows with the `page` covering them",
+            stick = df.elems_per_stick(),
+        ));
+    }
+    let page = gather.page.get();
+    if page == 0 || !rows.is_multiple_of(page) {
+        return Err(format!(
+            "page_gather_copy_opspec('{src}' -> '{dst}'): {rows} `mb` positions do not divide into \
+             whole {page}-position entries, so the last index entry would cover a partial page"
+        ));
+    }
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    if crate::work::index_core_split(rows / page, MAX_CORES, cap).is_none() {
+        return Err(format!(
+            "page_gather_copy_opspec('{src}' -> '{dst}'): {} index entries divide over no \
+             {MAX_CORES} cores into runs each core reads from ONE {cap}-entry stick — entries past \
+             a core's stick wrap and gather another core's pages",
+            rows / page
+        ));
+    }
+    let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df,
+    };
+    let (op_func, ins): (OpFunc, Vec<&str>) = match words {
+        GatheredWords::Fp16 => (OpFunc::Identity, vec![src]),
+        GatheredWords::SenUint32 { zero } => (OpFunc::AddI32ToI32, vec![zero, src]),
+    };
+    let tile_op = TileOp {
+        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
+            n_operands: ins.len() as u32 + 1,
+        },
+        dims: vec![
+            dim("mb", rows, false),
+            dim("out", cols, true),
+            dim("y", 1, false),
+        ],
+        df,
+    };
+    let mut op = pointwise_opspec_from_tile_split(
+        &tile_op,
+        op_func,
+        &ins,
+        dst,
+        true,
+        |dims: &[crate::superdsc_opspec::ItDim], max_cores: u32| {
+            gather_copy_cores(dims, max_cores, page)
+        },
+        OutView::at(0),
+    )?;
+    for a in op.args.iter_mut() {
+        a.set_df(df);
+    }
+    op.attach_gather_index(gather, ins.len() - 1).ok_or_else(|| {
+        format!(
+            "page_gather_copy_opspec('{src}' -> '{dst}'): the index declaration does not fit this \
+             op — its dims are [mb, out, y], so the paged axis must be `mb`"
+        )
+    })?;
+    Ok(op)
+}
+
+/// A page gather's extent: `rows` one-stick sub-rows of `words` in the scratch it fills, read from
+/// `src_elems` into the gathered value (its entries counted from there) and written `dst_elems`
+/// into the scratch.
+#[derive(Clone, Copy, Debug)]
+pub struct PageGatherRows<'a> {
+    pub rows: u32,
+    pub words: GatheredWords<'a>,
+    pub src_elems: u32,
+    pub dst_elems: u32,
+}
+
+/// [`page_gather_copy_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_page_gather_copy(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    gather: crate::superdsc_opspec::GatherIndex,
+    PageGatherRows {
+        rows,
+        words,
+        src_elems,
+        dst_elems,
+    }: PageGatherRows<'_>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let gathered = match words {
+        GatheredWords::Fp16 => 0,
+        GatheredWords::SenUint32 { .. } => 1,
+    };
+    let mut op =
+        page_gather_copy_opspec(src, dst, gather, rows, words.df().elems_per_stick(), words)?;
+    if src_elems > 0 {
+        op.args[gathered].set_offset_elems(src_elems);
+    }
+    if dst_elems > 0
+        && let Some(o) = op.args.last_mut()
+    {
+        o.set_offset_elems(dst_elems);
+    }
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_page_gather_copy {op_name}: {e}"))
+}
+
+/// What a [`page_gather_blocks_opspec`] moves: `entries` index entries, each one `[rows, cols]` block
+/// of the gathered value, landed `dst_elems` into the destination.
+#[derive(Clone, Copy, Debug)]
+pub struct PageGatherBlocks {
+    pub entries: u32,
+    pub rows: u32,
+    pub cols: u32,
+    pub dst_elems: u32,
+}
+
+/// ⭐ torch-spyre's PAGE GATHER INTO STICK-MAJOR BLOCKS — `identity` over `N_ {mb: entries, x: rows,
+/// out: cols, y: 1}`, `mb` split one whole entry a core, each entry one `[rows, cols]` block of the
+/// gathered value. The value is read row-major (`['out','x','mb','y']` innermost-first: a row's
+/// sticks together, the paged cache's row-outermost block) and the block lands stick-major
+/// (`['x','out','mb','y']`: stick column `c`'s `rows` rows together), so a block several sticks wide
+/// is relaid by the gather itself. The reference's compiled decode trip gathers each kv head's page
+/// so, one head a core, straight into the LX its Kᵀ restickify and its value contraction read
+/// (`numWkSlicesPerDim_ {mb: 8}`, `Tensor1 ['out','x','mb','y']`, `Tensor2 ['x','out','mb','y']`).
+///
+/// One entry is one `mb` position ([`GatherIndex::page`] 1), so `skip_addr` is the unpinned `x·out`:
+/// one block. Only `mb` is split ([`gather_copy_cores`]'s law).
+pub fn page_gather_blocks_opspec(
+    src: &str,
+    dst: &str,
+    gather: crate::superdsc_opspec::GatherIndex,
+    PageGatherBlocks {
+        entries,
+        rows,
+        cols,
+        dst_elems,
+    }: PageGatherBlocks,
+) -> Result<OpSpec, String> {
+    let df = Df::Fp16;
+    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
+    if gather.page.get() != 1 {
+        return Err(format!(
+            "page_gather_blocks_opspec('{src}' -> '{dst}'): an entry is one `mb` position — one \
+             [{rows}, {cols}] block — and the index states {} positions an entry",
+            gather.page.get()
+        ));
+    }
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    if entries == 0 || entries > cap || rows == 0 {
+        return Err(format!(
+            "page_gather_blocks_opspec('{src}' -> '{dst}'): {entries} entries of {rows} rows — one \
+             op gathers one to {cap} whole blocks (its index is one stick)"
+        ));
+    }
+    let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df,
+    };
+    let dims = [
+        dim("mb", entries, false),
+        dim("x", rows, false),
+        dim("out", cols, true),
+        dim("y", 1, false),
+    ];
+    let plan = crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |d, max| {
+        gather_copy_cores(d, max, 1)
+    })?;
+    let layout = ["y", "mb", "x", "out"];
+    let arg = |is_input: bool, name: &str, device: [&'static str; 4]| -> Result<_, String> {
+        Ok(AnyTensorArg::R4(
+            TensorArg::<4>::new(
+                is_input,
+                name.to_string(),
+                Role::Output,
+                [Scale::Active; 4],
+                plan.iter_syms(layout),
+                layout,
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_device_order(device)
+            .map_err(|e| e.0)?,
+        ))
+    };
+    let args = vec![
+        arg(true, src, ["out", "x", "mb", "y"])?,
+        arg(false, dst, ["x", "out", "mb", "y"])?,
+    ];
+    let mut op = OpSpec {
+        op: OpFunc::Identity,
+        is_reduction: false,
+        iter: plan,
+        args,
+        op_info: OpInfo::None,
+        tiled_symbols: vec![],
+        time_tile: None,
+        indirect: None,
+        coordinate_mask: None,
+    };
+    op.attach_gather_index(gather, 0).ok_or_else(|| {
+        format!(
+            "page_gather_blocks_opspec('{src}' -> '{dst}'): the index declaration does not fit this \
+             op — its dims are [mb, x, out, y], so the paged axis must be `mb`"
+        )
+    })?;
+    if dst_elems > 0
+        && let Some(o) = op.args.last_mut()
+    {
+        o.set_offset_elems(dst_elems);
+    }
+    Ok(op)
+}
+
+/// [`page_gather_blocks_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_page_gather_blocks(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    gather: crate::superdsc_opspec::GatherIndex,
+    blocks: PageGatherBlocks,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = page_gather_blocks_opspec(src, dst, gather, blocks)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_page_gather_blocks {op_name}: {e}"))
+}
+
+/// The pages of a [`page_gather_page_opspec`]: `entries` pages, each `blocks` row-major `[rows, cols]`
+/// blocks one after another (a paged cache's page of `blocks` kv heads).
+#[derive(Clone, Copy, Debug)]
+pub struct PageOfBlocks {
+    pub entries: u32,
+    pub blocks: u32,
+    pub rows: u32,
+    pub cols: u32,
+}
+
+/// ⭐ torch-spyre's PROMPT-TRIP PAGE GATHER — the whole page in ONE op, its one index entry selecting
+/// the page and every kv head's block of it read inside the op (the reference's compiled prefill,
+/// `sdsc_4` / `sdsc_5`: `N_ {mb: 8, x: 128, y: 128, out: 1, i: 1}`, the index on the size-one `i`,
+/// `numWkSlicesPerDim_ {}`). Here an `identity` over `N_ {mb: entries, y: blocks, x: rows, out: cols}`,
+/// the index on `mb` (one position an entry, so `skip_addr` is the whole page, `y·x·out`): one entry
+/// on one core as the reference's is, and several pages (a decode batch's chunk) one a core. The value is read as the reference reads it — row-major,
+/// `['out','x','y','mb']` innermost-first (its `['y','x','mb','out','i']`) — and lands one kv head's
+/// block after another, each stick-major (`['x','out','y','mb']`), the frame the trip's batched
+/// restickify and contractions read a block of at its base.
+pub fn page_gather_page_opspec(
+    src: &str,
+    dst: &str,
+    gather: crate::superdsc_opspec::GatherIndex,
+    PageOfBlocks {
+        entries,
+        blocks,
+        rows,
+        cols,
+    }: PageOfBlocks,
+) -> Result<OpSpec, String> {
+    let df = Df::Fp16;
+    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    if entries == 0 || entries > cap {
+        return Err(format!(
+            "page_gather_page_opspec('{src}' -> '{dst}'): {entries} pages — one op gathers one to \
+             {cap} (its index is one stick)"
+        ));
+    }
+    if gather.page.get() != 1 || blocks == 0 || rows == 0 {
+        return Err(format!(
+            "page_gather_page_opspec('{src}' -> '{dst}'): one entry is one page of {blocks} \
+             [{rows}, {cols}] blocks — one `mb` position — and the index states {} positions an \
+             entry",
+            gather.page.get()
+        ));
+    }
+    let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df,
+    };
+    let dims = [
+        dim("mb", entries, false),
+        dim("y", blocks, false),
+        dim("x", rows, false),
+        dim("out", cols, true),
+    ];
+    let plan = crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |d, max| {
+        gather_copy_cores(d, max, 1)
+    })?;
+    let layout = ["mb", "y", "x", "out"];
+    let arg = |is_input: bool, name: &str, device: [&'static str; 4]| -> Result<_, String> {
+        Ok(AnyTensorArg::R4(
+            TensorArg::<4>::new(
+                is_input,
+                name.to_string(),
+                Role::Output,
+                [Scale::Active; 4],
+                plan.iter_syms(layout),
+                layout,
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_device_order(device)
+            .map_err(|e| e.0)?,
+        ))
+    };
+    let args = vec![
+        arg(true, src, ["out", "x", "y", "mb"])?,
+        arg(false, dst, ["x", "out", "y", "mb"])?,
+    ];
+    let mut op = OpSpec {
+        op: OpFunc::Identity,
+        is_reduction: false,
+        iter: plan,
+        args,
+        op_info: OpInfo::None,
+        tiled_symbols: vec![],
+        time_tile: None,
+        indirect: None,
+        coordinate_mask: None,
+    };
+    op.attach_gather_index(gather, 0).ok_or_else(|| {
+        format!(
+            "page_gather_page_opspec('{src}' -> '{dst}'): the index declaration does not fit this \
+             op — its dims are [mb, y, x, out], so the paged axis must be `mb`"
+        )
+    })?;
+    Ok(op)
+}
+
+/// [`page_gather_page_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_page_gather_page(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    gather: crate::superdsc_opspec::GatherIndex,
+    page: PageOfBlocks,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = page_gather_page_opspec(src, dst, gather, page)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_page_gather_page {op_name}: {e}"))
+}
+
+/// What a [`expand_blocks_opspec`] copies: `batch` stick-major `[rows, cols]` blocks, each `group`
+/// times.
+#[derive(Clone, Copy, Debug)]
+pub struct ExpandedBlocks {
+    pub batch: u32,
+    pub group: u32,
+    pub rows: u32,
+    pub cols: u32,
+}
+
+/// ⭐ torch-spyre's KERNEL EXPANSION — `batch` stick-major `[rows, cols]` blocks copied `group` times
+/// each, into `batch · group` blocks one after another: block `i·group + j` is block `i`. The
+/// reference's compiled prompt trip contracts each query head against a kernel block of its own, so
+/// it lays Kᵀ and V once per query head of a group (its `ReStickifyOpHBM` and its V relayout, the
+/// group dim broadcast on the read side), and every core of its row-split contraction then reads
+/// one kernel at one start.
+///
+/// An `identity` over `N_ {mb: batch, x: group, y: rows, out: cols}`, one block a core: the source
+/// read with `x` broadcast, both sides stated to dxp innermost-first as stick-major blocks
+/// (`['y','out','x','mb']`).
+pub fn expand_blocks_opspec(
+    src: &str,
+    dst: &str,
+    ExpandedBlocks {
+        batch,
+        group,
+        rows,
+        cols,
+    }: ExpandedBlocks,
+) -> Result<OpSpec, String> {
+    let df = Df::Fp16;
+    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
+    if batch == 0 || group < 2 || rows == 0 {
+        return Err(format!(
+            "expand_blocks_opspec('{src}' -> '{dst}'): {batch} block(s) of {rows} rows, {group} \
+             times each — an expansion copies whole blocks at least twice"
+        ));
+    }
+    let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df,
+    };
+    let dims = [
+        dim("mb", batch, false),
+        dim("x", group, false),
+        dim("y", rows, false),
+        dim("out", cols, true),
+    ];
+    let (mb_cores, x_cores) = {
+        let mb = crate::work::core_split(batch, MAX_CORES);
+        (mb, crate::work::core_split(group, MAX_CORES / mb))
+    };
+    let plan = crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
+        std::collections::BTreeMap::from([("mb", mb_cores), ("x", x_cores)])
+    })?;
+    let layout = ["mb", "x", "y", "out"];
+    let arg = |is_input: bool, name: &str, scale: [Scale; 4]| -> Result<_, String> {
+        Ok(AnyTensorArg::R4(
+            TensorArg::<4>::new(
+                is_input,
+                name.to_string(),
+                Role::Output,
+                scale,
+                plan.iter_syms(layout),
+                layout,
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_device_order(["y", "out", "x", "mb"])
+            .map_err(|e| e.0)?,
+        ))
+    };
+    let args = vec![
+        arg(
+            true,
+            src,
+            [
+                Scale::Active,
+                Scale::RedNonStick,
+                Scale::Active,
+                Scale::Active,
+            ],
+        )?,
+        arg(false, dst, [Scale::Active; 4])?,
+    ];
+    Ok(OpSpec {
+        op: OpFunc::Identity,
+        is_reduction: false,
+        iter: plan,
+        args,
+        op_info: OpInfo::None,
+        tiled_symbols: vec![],
+        time_tile: None,
+        indirect: None,
+        coordinate_mask: None,
+    })
+}
+
+/// [`expand_blocks_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_expand_blocks(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    blocks: ExpandedBlocks,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = expand_blocks_opspec(src, dst, blocks)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_expand_blocks {op_name}: {e}"))
+}
+
+/// ⭐ A STICK PERMUTE'S DIRECTION — between the two card frames of `R` rows of `C` sticks:
+/// STICK-MAJOR `[R, C·stick]` (stick column `c`'s `R` rows contiguous: bytes `[C][R][stick]`) and
+/// ROW-MAJOR `[R·C, stick]` (row `r`'s `C` sticks contiguous: bytes `[R][C][stick]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StickPermute {
+    /// Stick-major to row-major: a gathered `[R, H·D]` query block read as `[R·H, D]` rows.
+    StickToRow,
+    /// Row-major to stick-major: `[R·H, D]` rows stored as the `[R, H·D]` output block.
+    RowToStick,
+}
+
+/// ⭐ THE STICK PERMUTE — an `identity` over `[mb = rows, out = stick, y = sticks]` whose input and
+/// output present the SAME iteration in the two row-split orders: `["y", "mb", "out"]` (flat row
+/// `y·rows + mb`, the stick-major frame — stick column `y`, row `mb`) and `["mb", "y", "out"]` (flat
+/// row `mb·sticks + y`, the row-major frame). So element `(mb, y, c)` moves from one frame's byte to
+/// the other's and nothing else changes: the relayout a reshape between the two frames is on the
+/// card. Every operand is Active on every dim; the addressing is the row-split mode's own scale-
+/// driven rule (`build_coordinates`/`per_core_addr`), only the two layout orders differ.
+pub fn stick_permute_opspec(
+    src: &str,
+    dst: &str,
+    rows: u32,
+    sticks: u32,
+    df: Df,
+    direction: StickPermute,
+) -> Result<OpSpec, String> {
+    use crate::emit::SprayOrder;
+    let stick = df.elems_per_stick();
+    if rows == 0 || sticks < 2 {
+        return Err(format!(
+            "stick_permute('{src}' -> '{dst}'): {rows} row(s) of {sticks} stick(s) — a permute \
+             needs rows and at least two sticks a row, or the two frames are the same bytes"
+        ));
+    }
+    let (from, to) = match direction {
+        StickPermute::StickToRow => (SprayOrder::Outer, SprayOrder::Inner),
+        StickPermute::RowToStick => (SprayOrder::Inner, SprayOrder::Outer),
+    };
+    let tile_op =
+        crate::emit::lower_ktir_to_superdsc::pointwise_tile_op_df(rows, stick, sticks, 2, df);
+    let tiled = tile_op
+        .tile(
+            MaxCores::<MAX_CORES>,
+            EwDivision::Law.resolve(false, false).splitter(),
+            "out",
+        )
+        .map_err(|e| e.0)?;
+    let (plan, time_tile) = (tiled.plan, tiled.time_tile);
+    let arg = |is_input: bool, name: &str, order: SprayOrder| -> Result<AnyTensorArg, String> {
+        Ok(AnyTensorArg::R3(
+            TensorArg::<3>::new(
+                is_input,
+                name.to_string(),
+                Role::Output,
+                [Scale::Active, Scale::Active, Scale::Active],
+                plan.iter_syms(order.layout()),
+                order.layout(),
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_df(df)
+            .with_row_blocked(matches!(df, Df::Fp32))
+            // The stick-major side is iterated by its stick columns (`y` outermost).
+            .with_frame(match order {
+                SprayOrder::Outer => crate::superdsc_opspec::ViewFrame::StickColumns,
+                SprayOrder::Inner => crate::superdsc_opspec::ViewFrame::Own,
+            })
+            .with_device_order(order.device_layout())
+            .map_err(|e| e.0)?,
+        ))
+    };
+    let args = vec![arg(true, src, from)?, arg(false, dst, to)?];
+    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
+    Ok(OpSpec {
+        op: OpFunc::Identity,
+        is_reduction: false,
+        iter: plan,
+        args,
+        op_info: OpInfo::None,
+        tiled_symbols,
+        time_tile,
+        indirect: None,
+        coordinate_mask: None,
+    })
+}
+
+/// One stick permute's extents: `rows` rows of `sticks` sticks of `df`, in `direction`, read from
+/// `src_elems` elements into the source and written from `dst_elems` into the destination.
+#[derive(Clone, Copy, Debug)]
+pub struct StickPermuteSpec {
+    pub rows: u32,
+    pub sticks: u32,
+    pub df: Df,
+    pub direction: StickPermute,
+    pub src_elems: u32,
+    pub dst_elems: u32,
+}
+
+/// [`stick_permute_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_stick_permute(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    StickPermuteSpec {
+        rows,
+        sticks,
+        df,
+        direction,
+        src_elems,
+        dst_elems,
+    }: StickPermuteSpec,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let mut op = stick_permute_opspec(src, dst, rows, sticks, df, direction)?;
+    if src_elems > 0 {
+        op.args[0].set_offset_elems(src_elems);
+    }
+    if dst_elems > 0 {
+        op.args[1].set_offset_elems(dst_elems);
+    }
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_stick_permute {op_name}: {e}"))
+}
+
+/// ⭐ RUNS OF STICKS, COPIED AT TWO PITCHES — `runs` runs of `run_sticks` contiguous sticks of `df`,
+/// run `r` read at `src_elems + r · src_pitch` sticks into the source and written at
+/// `dst_elems + r · dst_pitch` sticks into the destination.
+#[derive(Clone, Copy, Debug)]
+pub struct StickRuns {
+    pub runs: u32,
+    pub run_sticks: u32,
+    pub src_pitch: u32,
+    pub dst_pitch: u32,
+    pub src_elems: u32,
+    pub dst_elems: u32,
+    pub df: Df,
+}
+
+/// [`StickRuns`] as an `identity` over `[mb = runs, y = run_sticks, out = stick]`: both sides lay a
+/// run's sticks contiguous (`["mb", "y", "out"]`) and each states its own pitch as the physical
+/// extent of `y` ([`TensorArg::with_device_extent`]) — the scatter-row output's form
+/// ([`pointwise_opspec_from_tile_split`]) on both sides.
+pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<OpSpec, String> {
+    let StickRuns {
+        runs: n,
+        run_sticks,
+        src_pitch,
+        dst_pitch,
+        src_elems,
+        dst_elems,
+        df,
+    } = runs;
+    if n == 0 || run_sticks == 0 || src_pitch < run_sticks || dst_pitch < run_sticks {
+        return Err(format!(
+            "stick_runs_copy('{src}' -> '{dst}'): {n} run(s) of {run_sticks} stick(s) at pitches \
+             {src_pitch} and {dst_pitch} — a run is at least one stick, and a pitch at least a run"
+        ));
+    }
+    let stick = df.elems_per_stick();
+    let tile_op =
+        crate::emit::lower_ktir_to_superdsc::pointwise_tile_op_df(n, stick, run_sticks, 2, df);
+    let tiled = tile_op
+        .tile(
+            MaxCores::<MAX_CORES>,
+            EwDivision::Law.resolve(false, false).splitter(),
+            "out",
+        )
+        .map_err(|e| e.0)?;
+    let (plan, time_tile) = (tiled.plan, tiled.time_tile);
+    let arg =
+        |is_input: bool, name: &str, pitch: u32, elems: u32| -> Result<AnyTensorArg, String> {
+            let t = TensorArg::<3>::new(
+                is_input,
+                name.to_string(),
+                Role::Output,
+                [Scale::Active, Scale::Active, Scale::Active],
+                plan.iter_syms(["mb", "y", "out"]),
+                ["mb", "y", "out"],
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_df(df)
+            .with_offset(elems)
+            // A run's sticks are its innermost dim, in dxp's innermost-first order.
+            .with_device_order(crate::emit::SprayOrder::Inner.device_layout())
+            .map_err(|e| e.0)?;
+            let t = if pitch == run_sticks {
+                t
+            } else {
+                t.with_device_extent("y", pitch).map_err(|e| e.0)?
+            };
+            Ok(AnyTensorArg::R3(t))
+        };
+    let args = vec![
+        arg(true, src, src_pitch, src_elems)?,
+        arg(false, dst, dst_pitch, dst_elems)?,
+    ];
+    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
+    Ok(OpSpec {
+        op: OpFunc::Identity,
+        is_reduction: false,
+        iter: plan,
+        args,
+        op_info: OpInfo::None,
+        tiled_symbols,
+        time_tile,
+        indirect: None,
+        coordinate_mask: None,
+    })
+}
+
+/// [`stick_runs_copy_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_stick_runs_copy(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    runs: StickRuns,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = stick_runs_copy_opspec(src, dst, runs)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_stick_runs_copy {op_name}: {e}"))
+}
+
+/// One scattered copy's extents: `rows` one-stick sub-rows of `cols` (one stick) elements of `df`,
+/// read from the source starting `src_elems` elements in, written through the index from the
+/// destination's base plus `dst_elems`.
+#[derive(Clone, Copy, Debug)]
+pub struct ScatterCopySpec {
+    pub rows: u32,
+    pub cols: u32,
+    pub df: Df,
+    pub src_elems: u32,
+    pub dst_elems: u32,
+}
+
+/// [`scatter_copy_opspec`] + `emit_sdsc_tiled` — the one assembler for a scattered copy.
+pub fn assemble_scatter_copy(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    scatter: crate::superdsc_opspec::GatherIndex,
+    spec: ScatterCopySpec,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = scatter_copy_opspec(src, dst, scatter, spec)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_scatter_copy {op_name}: {e}"))
+}
+
 /// `layout` decides only the work division ([`EwDivision`]), exactly as for
 /// [`pointwise_broadcast_opspec_from_tile`]: `None` has no core-local pins.
 pub fn pointwise_opspec_from_tile(
@@ -499,15 +1389,19 @@ pub fn pointwise_opspec_from_tile(
         .unwrap_or(1);
     // The builder's own rank-2 decision (`stickmajor` below) — the division follows it.
     let stick_major = !head_major && rows > 1;
-    let core_local = layout
-        .is_some_and(|l| l.lx_core_local(o_name) || in_names.iter().any(|n| l.lx_core_local(n)));
+    let core_local = layout.is_some_and(|l| {
+        l.pointwise_core_local(std::iter::once(o_name).chain(in_names.iter().copied()))
+    });
+    let division = layout.map_or(EwDivision::Law.resolve(stick_major, core_local), |l| {
+        l.ew_law(stick_major, core_local)
+    });
     pointwise_opspec_from_tile_split(
         tile_op,
         op,
         in_names,
         o_name,
         head_major,
-        EwDivision::Law.resolve(stick_major, core_local).splitter(),
+        division.splitter(),
         // Whole-tensor output — every caller but the gather copy, whose runs land at a base.
         OutView::whole(),
     )
@@ -714,21 +1608,23 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // bytes and the output's `(y·mb, out)` bytes are the same stick-blocked bytes the mints
     // reserved. Everything below is cross-checks; the addressing itself is the ordinary
     // scale-driven rule (`build_coordinates`/`per_core_addr`), which is why the form needs no
-    // new addressing code — only the layout order and the operand scales stated honestly.
-    let stated_ys: Vec<u32> = inputs
+    // new addressing code — only the layout order and the operand scales stated honestly, and
+    // the cores divided along that layout order (the division below).
+    let stated_ys: Vec<(u32, crate::emit::SprayOrder)> = inputs
         .iter()
-        .map(|i| i.y_broadcast())
-        .filter(|&y| y > 1)
+        .filter(|i| i.y_broadcast() > 1)
+        .map(|i| (i.y_broadcast(), i.y_order()))
         .collect();
-    let ymajor = !stated_ys.is_empty();
-    if ymajor {
-        // ONE spray count per op: every y-broadcast operand of one op sprays the broadcast's own
-        // leading extent, so a disagreement is two ops fused under one name.
-        let y = stated_ys[0];
-        if !stated_ys.iter().all(|&s| s == y) {
+    // The row-split mode's order — `Some` exactly when an operand is a y-broadcast.
+    let spray = stated_ys.first().map(|&(_, order)| order);
+    if let Some(order) = spray {
+        // ONE spray per op: every y-broadcast operand of one op sprays the broadcast's own extent,
+        // at its own order, so a disagreement is two ops fused under one name.
+        let y = stated_ys[0].0;
+        if !stated_ys.iter().all(|&s| s == (y, order)) {
             return Err(format!(
-                "{o_name}: the op's y-broadcast operands state different spray counts \
-                 ({stated_ys:?}) — one op has ONE leading extent"
+                "{o_name}: the op's y-broadcast operands state different sprays \
+                 ({stated_ys:?}) — one op has ONE sprayed extent at one order"
             ));
         }
         // The TileOp must state the same count on its own `y` dim: the tiler's iteration space
@@ -743,7 +1639,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
         }
         // THE SINGLE-STICK LAW — the frame law's own `cols ≤ lanes` half, restated at the
         // emission: the spray's source is single-stick, so an op wider than one stick did not
-        // come through the Y admission. This is also what keeps `ymajor` and `stickmajor` below
+        // come through the Y admission. This is also what keeps the row-split mode and `stickmajor` below
         // disjoint (stickmajor requires `cols >` one stick).
         if cols > Fp16::ELEMS_PER_STICK {
             return Err(format!(
@@ -769,7 +1665,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // ⭐ THE DIVISION FOLLOWS THE LAYOUT JUST DECIDED for an ungathered op — the same
     // `stickmajor`, so the operands' rank and the cores' cut are one decision. See `EwDivision`.
     let core_local = layout.is_some_and(|l| {
-        l.lx_core_local(o_name) || inputs.iter().any(|i| l.lx_core_local(i.name()))
+        l.pointwise_core_local(std::iter::once(o_name).chain(inputs.iter().map(|i| i.name())))
     });
     // ⭐⭐⭐ A GATHERED OP'S SPLIT IS ITS `GatherSplit` (`crate::work`), VERBATIM — not resolved from the operand
     // layout (the elementwise law's input) and not consulted for `stickmajor`: only the entry
@@ -777,26 +1673,56 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // unpinned dims — a split elsewhere shrinks what one index entry covers. The mint already
     // refused every shape that would have needed one, so the closure hands the tiler the minted
     // map whatever budget it asks with.
-    let tiled = match &division {
-        CoreDivision::Gathered(g) => tile_op
+    // ⭐⭐ A ROW-SPLIT OP'S CORES FOLLOW ITS LAYOUT ([`crate::work::distribute_cores_layout_first`]):
+    // its two row dims in the spray's layout order, the outer split first. The elementwise law
+    // (sticks first, then `mb`) is the wrong-byte division for the `[y, mb, out]` spray — it splits
+    // `mb` under a `y` every core walks, which the card measured as row-mixing — so an op that
+    // sprays takes this division or none.
+    let spray_rows = spray.map(|order| {
+        let [outer, inner, _] = order.layout();
+        [outer, inner]
+    });
+    let tiled = match (&division, spray_rows) {
+        (CoreDivision::Gathered(g), None) => tile_op
             .tile(MaxCores::<MAX_CORES>, |_, _| g.splits().clone(), "out")
             .map_err(|e| e.0)?,
-        CoreDivision::Ew(d) => tile_op
+        (CoreDivision::Ew(EwDivision::Law), Some(rows)) => tile_op
             .tile(
                 MaxCores::<MAX_CORES>,
-                d.resolve(stickmajor, core_local).splitter(),
+                crate::work::distribute_cores_layout_first(rows),
                 "out",
             )
             .map_err(|e| e.0)?,
+        (CoreDivision::Ew(d), None) => {
+            let d = match (d, layout) {
+                (EwDivision::Law, Some(l)) => l.ew_law(stickmajor, core_local),
+                (d, _) => d.resolve(stickmajor, core_local),
+            };
+            tile_op
+                .tile(MaxCores::<MAX_CORES>, d.splitter(), "out")
+                .map_err(|e| e.0)?
+        }
+        (stated, Some(_)) => {
+            return Err(format!(
+                "{o_name}: a row-split (y-broadcast) op states its own core division \
+                 ({}) — its cores follow the spray's layout, so it takes the elementwise law",
+                match stated {
+                    CoreDivision::Gathered(_) => "a gather's".to_string(),
+                    CoreDivision::Ew(d) => format!("{d:?}"),
+                }
+            ));
+        }
     };
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
-    // Y-MAJOR in the row-split mode (`ymajor` above): the syms are picked by NAME in the order
-    // the layout states them, so the plan's own `y`/`mb`/`out` syms feed the `["y", "mb", "out"]`
-    // TensorArgs directly — the same plan, walked head-outermost.
-    let device_dims = if ymajor {
-        plan.iter_syms(["y", "mb", "out"])
-    } else {
-        plan.iter_syms(["mb", "out", "y"])
+    if let Some(rows) = spray_rows {
+        crate::work::layout_walk_is_whole(&plan, rows).map_err(|e| format!("{o_name}: {e}"))?;
+    }
+    // THE ROW-SPLIT MODE's ORDER (`spray` above): the syms are picked by NAME in the order the
+    // layout states them (`SprayOrder::layout`), so the plan's own `y`/`mb`/`out` syms feed the
+    // TensorArgs directly — the same plan, walked in the spray's order.
+    let device_dims = match spray {
+        Some(order) => plan.iter_syms(order.layout()),
+        None => plan.iter_syms(["mb", "out", "y"]),
     };
     // ── STICK-MAJOR RESIDUAL + PER-HEAD ATTN ── The m>1 seam fix: a residual whole-tensor
     // pointwise op writes FLAT (rank-3 [mb,out,y=1]) but the consuming matmul reads STICK-MAJOR
@@ -840,8 +1766,9 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // is pinned by `time_tiled_broadcast_operand_is_address_stable` in `emit/mod.rs`.
 
     // Build a rank-2 stick-major (`stickmajor`), the legacy rank-3 flat operand, or — in the
-    // row-split mode — the Y-MAJOR rank-3 operand (`["y", "mb", "out"]`, the caller passing the
-    // scale in the same order via [`EwOperand::scale_ymajor`]). rank-2 drops the size-1 `y` dim +
+    // row-split mode — the rank-3 operand in the spray's order (`["y", "mb", "out"]` or
+    // `["mb", "y", "out"]`, the caller passing the scale in the same order via
+    // [`EwOperand::scale_sprayed`]). rank-2 drops the size-1 `y` dim +
     // its scale so `for_view_df` classifies it RowBlocked (stick-major), matching the matmul I/O.
     let mk =
         |is_input: bool, name: &str, scale: [Scale; 3], off: u32| -> Result<AnyTensorArg, String> {
@@ -863,17 +1790,16 @@ pub fn pointwise_broadcast_opspec_from_tile(
                     .with_row_blocked(matches!(df, Df::Fp32)),
                 ))
             } else {
-                Ok(AnyTensorArg::R3(
-                    TensorArg::<3>::new(
+                Ok(AnyTensorArg::R3({
+                    let t = TensorArg::<3>::new(
                         is_input,
                         name.to_string(),
                         Role::Output,
                         scale,
                         device_dims,
-                        if ymajor {
-                            ["y", "mb", "out"]
-                        } else {
-                            ["mb", "out", "y"]
+                        match spray {
+                            Some(order) => order.layout(),
+                            None => ["mb", "out", "y"],
                         },
                         "out",
                         Allocation::Hbm,
@@ -881,8 +1807,15 @@ pub fn pointwise_broadcast_opspec_from_tile(
                     .map_err(|e| e.0)?
                     .with_offset(off)
                     .with_df(df)
-                    .with_row_blocked(matches!(df, Df::Fp32)),
-                ))
+                    .with_row_blocked(matches!(df, Df::Fp32));
+                    // A spray's two row dims go to dxp innermost first.
+                    match spray {
+                        Some(order) => t
+                            .with_device_order(order.device_layout())
+                            .map_err(|e| e.0)?,
+                        None => t,
+                    }
+                }))
             }
         };
     let mut args = Vec::with_capacity(inputs.len() + 1);
@@ -890,10 +1823,9 @@ pub fn pointwise_broadcast_opspec_from_tile(
         args.push(mk(
             true,
             inp.name(),
-            if ymajor {
-                inp.scale_ymajor()
-            } else {
-                inp.scale()
+            match spray {
+                Some(order) => inp.scale_sprayed(order),
+                None => inp.scale(),
             },
             inp.col_offset(),
         )?);
@@ -1021,4 +1953,584 @@ pub fn assemble_pointwise_seeded_from_tile(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_pointwise {op_name}: {e}"))
+}
+
+#[cfg(test)]
+mod scatter_tests {
+    use super::*;
+    use crate::superdsc_opspec::{EntryBase, GatherIndex, PageExtent};
+
+    /// The vendor's `test_scatter_1core` shape: `[input, index, output]`, and the pair's VALUE is the
+    /// output — the operand written through the index — never the input.
+    #[test]
+    fn a_scattered_copy_writes_its_output_through_the_index() {
+        let op = scatter_copy_opspec(
+            "act_1",
+            "act_2",
+            GatherIndex::of_scratch_rows(
+                "act_3".into(),
+                PageExtent::of_positions(2),
+                EntryBase::ZERO,
+            ),
+            ScatterCopySpec {
+                rows: 16,
+                cols: 64,
+                df: Df::Fp16,
+                src_elems: 0,
+                dst_elems: 0,
+            },
+        )
+        .expect("an 8-row, two-stick-per-row scatter builds");
+        let ia = op.indirect.expect("the scatter declares its pair");
+        assert_eq!(op.args.len(), 3, "input, index, output");
+        assert_eq!(ia.value, 2, "the output is the paged value");
+        assert_eq!(ia.index, 1, "the index sits between input and output");
+    }
+
+    /// Entries no core division keeps within one 32-entry index stick a core are refused: dxp loads
+    /// each core's index as one stick, and the entries past it wrap onto another core's rows. 33
+    /// entries split only into runs of 3 or 11 (or over 33 cores), each straddling a stick.
+    #[test]
+    fn a_scatter_past_one_index_stick_is_refused() {
+        let e = scatter_copy_opspec(
+            "act_1",
+            "act_2",
+            GatherIndex::of_scratch_rows(
+                "act_3".into(),
+                PageExtent::of_positions(1),
+                EntryBase::ZERO,
+            ),
+            ScatterCopySpec {
+                rows: 33,
+                cols: 64,
+                df: Df::Fp16,
+                src_elems: 0,
+                dst_elems: 0,
+            },
+        )
+        .expect_err("33 entries do not fit one index stick");
+        assert!(e.contains("ONE 32-entry stick"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod stick_permute_tests {
+    use super::*;
+    use crate::place::{PlaceId, act_name};
+    use crate::sdsc_abstract::StickLayout;
+
+    fn layout() -> BundleLayout {
+        let l = BundleLayout::default();
+        l.synth(PlaceId::Act(1), &[32, 128]);
+        l.synth(PlaceId::Act(2), &[64, 64]);
+        l
+    }
+
+    fn spec(direction: StickPermute) -> StickPermuteSpec {
+        StickPermuteSpec {
+            rows: 32,
+            sticks: 2,
+            df: Df::Fp16,
+            direction,
+            src_elems: 0,
+            dst_elems: 0,
+        }
+    }
+
+    /// ⭐ THE STICK-MAJOR SIDE SPEAKS IN ITS TENSOR'S FRAME. A `[32, 128]` value its producer declared
+    /// stick-major is read by its stick columns, `[2, 32, 64]` — a view the authority would class
+    /// as the row-major `[2, 2048]`, the scramble it exists to refuse — so the permute derives the
+    /// tensor's own frame from that view, and the authority holds it to the producer's.
+    #[test]
+    fn the_stick_major_side_declares_its_tensors_frame() {
+        let l = layout();
+        let (src, dst) = (act_name(1), act_name(2));
+        l.declare_arrangement(&src, StickLayout::row_blocked(32, 128))
+            .expect("the producer's stick-major [32, 128]");
+        let mut sym = 0i64;
+        assemble_stick_permute(
+            "permute_o2",
+            &src,
+            &dst,
+            spec(StickPermute::StickToRow),
+            &mut sym,
+            Some(&l),
+        )
+        .expect("the permute reads the producer's frame");
+        assert!(
+            l.arrangements.borrow()[&dst].addr_eq(&StickLayout::row_blocked(64, 64)),
+            "the row-major side is its own frame, one-stick rows"
+        );
+        // The control: the view's own frame, stated for the same tensor, is the scramble.
+        assert!(
+            l.declare_arrangement(&src, StickLayout::flat(2, 2048))
+                .is_err(),
+            "the stick-column view in its own frame conflicts with the producer's"
+        );
+    }
+
+    /// A permute's stick-major OUTPUT states the frame its consumers read: stick-major `[32, 128]`.
+    #[test]
+    fn the_stick_major_output_is_declared_stick_major() {
+        let l = layout();
+        let (rows, out) = (act_name(2), act_name(1));
+        let mut sym = 0i64;
+        assemble_stick_permute(
+            "permute_o1",
+            &rows,
+            &out,
+            spec(StickPermute::RowToStick),
+            &mut sym,
+            Some(&l),
+        )
+        .expect("the permute writes the stick-major block");
+        l.declare_arrangement(&out, StickLayout::row_blocked(32, 128))
+            .expect("a consumer reading [32, 128] stick-major agrees");
+    }
+
+    /// ⭐⭐ dxp READS `layoutDimOrder_` INNERMOST FIRST, so each side states its frame that way. At
+    /// head dim 128 a 21-row chunk's StickToRow reads the stick-major `[2 sticks][21 rows]` source —
+    /// rows innermost, `["mb", "y", "out"]`, walk `[21, 2, 64]` — and writes the row-major
+    /// `[21 rows][2 sticks]` scratch — sticks innermost, `["y", "mb", "out"]`, walk `[2, 21, 64]`.
+    /// The emitter's own frames (`["y", "mb", "out"]` for the stick-major side) went to dxp as written
+    /// and the card read every row dim swapped: granite-3.1-8b's KV relay put each head's second stick
+    /// from the wrong rows.
+    #[test]
+    fn each_side_states_its_frame_innermost_first() {
+        let op = stick_permute_opspec(
+            "Tensor0",
+            "Tensor1",
+            21,
+            2,
+            Df::Fp16,
+            StickPermute::StickToRow,
+        )
+        .expect("the 21-row permute builds");
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = crate::emit::emit_sdsc("permute_o1", &op, &folds, None).expect("it emits");
+        let dsc = &sdsc.dscs_[0]["permute_o1"];
+        let side = |i: usize| {
+            let n = &dsc.scheduleTree_[i];
+            (
+                n.layoutDimOrder_.clone(),
+                serde_json::to_value(&n.maxDimSizes_).expect("the walk serializes"),
+            )
+        };
+        assert_eq!(
+            side(0),
+            (vec!["mb", "y", "out"], serde_json::json!([21, 2, 64])),
+            "the stick-major source: rows innermost"
+        );
+        assert_eq!(
+            side(1),
+            (vec!["y", "mb", "out"], serde_json::json!([2, 21, 64])),
+            "the row-major scratch: sticks innermost"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stick_runs_tests {
+    use super::*;
+
+    fn runs(src_pitch: u32, dst_pitch: u32) -> StickRuns {
+        StickRuns {
+            runs: 32,
+            run_sticks: 64,
+            src_pitch,
+            dst_pitch,
+            src_elems: 64 * 64,
+            dst_elems: 32 * 64 * 64,
+            df: Df::Fp16,
+        }
+    }
+
+    /// Each side states its own pitch as `y`'s physical extent, and only where it is not the run.
+    #[test]
+    fn each_side_states_its_own_pitch() {
+        let op = stick_runs_copy_opspec("t1", "t2", runs(128, 64)).expect("the copy builds");
+        let v: Vec<_> = op.args.iter().map(|a| a.view()).collect();
+        assert_eq!(
+            v[0].device_extent,
+            [None, Some(128), None],
+            "the source's pitch"
+        );
+        assert_eq!(
+            v[1].device_extent,
+            [None, None, None],
+            "the destination is dense"
+        );
+        assert_eq!(
+            (v[0].offset_elems, v[1].offset_elems),
+            (64 * 64, 32 * 64 * 64)
+        );
+        assert_eq!(v[0].layout, ["mb", "y", "out"]);
+    }
+
+    /// A pitch shorter than a run would overlap its runs.
+    #[test]
+    fn a_pitch_under_a_run_is_refused() {
+        assert!(stick_runs_copy_opspec("t1", "t2", runs(32, 64)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod page_gather_blocks_tests {
+    use super::*;
+    use crate::superdsc_opspec::{EntryBase, GatherIndex, PageExtent};
+
+    /// ⭐ THE REFERENCE's PROMPT-TRIP PAGE GATHER (granite-3.1-8b's prefill, `sdsc_4` / `sdsc_5`): the
+    /// whole `[8, 128, 128]` page in one op on one core, its one entry the page — read row-major as
+    /// the reference reads it, landed one kv head's stick-major block after another.
+    #[test]
+    fn the_whole_page_is_gathered_in_one_op() {
+        let gather = GatherIndex::of_scratch_rows(
+            "Tensor9".into(),
+            PageExtent::of_positions(1),
+            EntryBase::ZERO,
+        );
+        let op = page_gather_page_opspec(
+            "Tensor0",
+            "Tensor1",
+            gather,
+            PageOfBlocks {
+                entries: 1,
+                blocks: 8,
+                rows: 128,
+                cols: 128,
+            },
+        )
+        .expect("the page gather builds");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = crate::emit::emit_sdsc("gather_o1", &op, &folds, None).expect("it emits");
+        let v = serde_json::to_value(&sdsc).expect("the op serializes");
+        assert_eq!(
+            v["numWkSlicesPerDim_"],
+            serde_json::json!({"mb": 1, "y": 1, "x": 1, "out": 1}),
+            "one core, as the reference's"
+        );
+        let dsc = &v["dscs_"][0]["gather_o1"];
+        assert_eq!(
+            dsc["N_"],
+            serde_json::json!({"name_": "n", "mb_": 1, "y_": 8, "x_": 128, "out_": 128})
+        );
+        let alloc: Vec<&serde_json::Value> = dsc["scheduleTree_"]
+            .as_array()
+            .expect("a tree")
+            .iter()
+            .filter(|n| n["nodeType_"] == "allocate")
+            .collect();
+        let order = |i: usize| alloc[i]["layoutDimOrder_"].clone();
+        assert_eq!(
+            alloc[0]["indirectAllocType_"],
+            serde_json::json!("value_tensor")
+        );
+        assert_eq!(
+            order(0),
+            serde_json::json!(["out", "x", "y", "mb"]),
+            "the page read row-major, a row's sticks together, as the reference's"
+        );
+        assert_eq!(
+            order(alloc.len() - 1),
+            serde_json::json!(["x", "out", "y", "mb"]),
+            "each kv head's block landed stick-major, one after another"
+        );
+    }
+
+    fn pages(entries: u32) -> Result<OpSpec, String> {
+        page_gather_page_opspec(
+            "Tensor0",
+            "Tensor1",
+            GatherIndex::of_scratch_rows(
+                "Tensor9".into(),
+                PageExtent::of_positions(1),
+                EntryBase::ZERO,
+            ),
+            PageOfBlocks {
+                entries,
+                blocks: 8,
+                rows: 128,
+                cols: 64,
+            },
+        )
+    }
+
+    /// ⭐ A DECODE BATCH's CHUNK OF PAGES — granite-3.1-2b's two sequences, 4 block slots each: the
+    /// chunk's 8 whole `[8, 128, 64]` pages in one op, a page a core, each entry's index word read by
+    /// its own core.
+    #[test]
+    fn a_chunk_of_pages_is_gathered_a_page_a_core() {
+        let op = pages(8).expect("the chunk's gather builds");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = crate::emit::emit_sdsc("gather_o1", &op, &folds, None).expect("it emits");
+        let v = serde_json::to_value(&sdsc).expect("the op serializes");
+        assert_eq!(
+            v["numWkSlicesPerDim_"],
+            serde_json::json!({"mb": 8, "y": 1, "x": 1, "out": 1}),
+            "a page a core"
+        );
+        assert_eq!(
+            v["dscs_"][0]["gather_o1"]["N_"],
+            serde_json::json!({"name_": "n", "mb_": 8, "y_": 8, "x_": 128, "out_": 64})
+        );
+    }
+
+    /// One op's index is one 32-word stick: a chunk of 32 pages gathers in one op, and 33 is refused
+    /// by name — never handed to a copy form the card has not run.
+    #[test]
+    fn more_pages_than_one_index_stick_are_refused() {
+        assert!(pages(32).is_ok(), "32 pages, one index stick");
+        let e = pages(33).expect_err("33 pages");
+        assert!(e.contains("33 pages"), "{e}");
+    }
+
+    /// ⭐ THE REFERENCE's K PAGE GATHER (granite-3.1-8b's decode trip, `sdsc_6`): eight kv heads'
+    /// `[128, 128]` blocks, one a core, read row-major and landed stick-major.
+    #[test]
+    fn the_gather_lands_each_entrys_block_stick_major() {
+        let gather = GatherIndex::of_scratch_rows(
+            "Tensor9".into(),
+            PageExtent::of_positions(1),
+            EntryBase::ZERO,
+        );
+        let op = page_gather_blocks_opspec(
+            "Tensor0",
+            "Tensor1",
+            gather,
+            PageGatherBlocks {
+                entries: 8,
+                rows: 128,
+                cols: 128,
+                dst_elems: 0,
+            },
+        )
+        .expect("the block gather builds");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = crate::emit::emit_sdsc("gather_o1", &op, &folds, None).expect("it emits");
+        let v = serde_json::to_value(&sdsc).expect("the op serializes");
+        assert_eq!(
+            v["numWkSlicesPerDim_"],
+            serde_json::json!({"mb": 8, "x": 1, "out": 1, "y": 1}),
+            "one entry a core"
+        );
+        let dsc = &v["dscs_"][0]["gather_o1"];
+        assert_eq!(
+            dsc["N_"],
+            serde_json::json!({"name_": "n", "mb_": 8, "x_": 128, "out_": 128, "y_": 1})
+        );
+        let alloc: Vec<&serde_json::Value> = dsc["scheduleTree_"]
+            .as_array()
+            .expect("a tree")
+            .iter()
+            .filter(|n| n["nodeType_"] == "allocate")
+            .collect();
+        let side = |i: usize| {
+            (
+                alloc[i]["layoutDimOrder_"].clone(),
+                alloc[i]["indirectAllocType_"].clone(),
+            )
+        };
+        assert_eq!(
+            side(0),
+            (
+                serde_json::json!(["out", "x", "mb", "y"]),
+                serde_json::json!("value_tensor")
+            ),
+            "the page read row-major, a row's two sticks together"
+        );
+        assert_eq!(
+            alloc[0]["maxDimSizes_"],
+            serde_json::json!([-1, -1, 1, -1]),
+            "one `mb` position an entry: skip_addr is one block"
+        );
+        assert_eq!(
+            side(1),
+            (serde_json::json!(["mb"]), serde_json::json!("index_tensor"))
+        );
+        assert_eq!(
+            side(2),
+            (
+                serde_json::json!(["x", "out", "mb", "y"]),
+                serde_json::json!("no_indirection")
+            ),
+            "each block landed stick-major, a stick column's rows together"
+        );
+        let block = 128 * 128 * 2;
+        for (i, a) in [&alloc[0], &alloc[2]].into_iter().enumerate() {
+            let starts = &a["startAddressCoreCorelet_"]["data_"];
+            let at = |c: u64| -> u64 {
+                starts[format!("[{c}, 0, 0]")]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("a concrete start")
+            };
+            for c in 1..8 {
+                assert_eq!(
+                    at(c) - at(0),
+                    c * block,
+                    "side {i}: core {c} starts at its block"
+                );
+            }
+        }
+    }
+
+    /// An entry is one block, so an index stating several positions an entry is refused.
+    #[test]
+    fn an_entry_of_several_positions_is_refused() {
+        let gather = GatherIndex::of_scratch_rows(
+            "Tensor9".into(),
+            PageExtent::of_positions(2),
+            EntryBase::ZERO,
+        );
+        let blocks = PageGatherBlocks {
+            entries: 8,
+            rows: 128,
+            cols: 128,
+            dst_elems: 0,
+        };
+        let Err(m) = page_gather_blocks_opspec("Tensor0", "Tensor1", gather, blocks) else {
+            panic!("an entry of two positions is two blocks' worth of one");
+        };
+        assert!(m.contains("one `mb` position"), "{m}");
+    }
+}
+
+#[cfg(test)]
+mod expand_blocks_tests {
+    use super::*;
+
+    /// ⭐ granite's Kᵀ for the prompt trip: 8 kv heads' `[64, 128]` blocks, each laid for its 4 query
+    /// heads. Core `kv·4 + g` reads kv head `kv`'s block and writes query head `kv·4 + g`'s.
+    #[test]
+    fn each_query_head_gets_its_kv_heads_block() {
+        let op = expand_blocks_opspec(
+            "Tensor0",
+            "Tensor1",
+            ExpandedBlocks {
+                batch: 8,
+                group: 4,
+                rows: 64,
+                cols: 128,
+            },
+        )
+        .expect("the expansion builds");
+        assert_eq!(op.iter.cores_used().get(), 32, "one block a core");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let v = serde_json::to_value(
+            crate::emit::emit_sdsc("expand_o1", &op, &folds, None).expect("it emits"),
+        )
+        .expect("json");
+        let tree = v["dscs_"][0]["expand_o1"]["scheduleTree_"]
+            .as_array()
+            .expect("a tree")
+            .clone();
+        let starts = |i: usize| -> Vec<u64> {
+            let data = &tree[i]["startAddressCoreCorelet_"]["data_"];
+            let at = |c: u32| -> u64 {
+                data[format!("[{c}, 0, 0]")]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("a concrete start")
+            };
+            (0..32).map(|c| at(c) - at(0)).collect()
+        };
+        let block = 64 * 128 * 2;
+        assert_eq!(
+            starts(0),
+            (0..32u64).map(|c| c / 4 * block).collect::<Vec<_>>(),
+            "kv head c/4's block"
+        );
+        assert_eq!(
+            starts(1),
+            (0..32u64).map(|c| c * block).collect::<Vec<_>>(),
+            "query head c's block"
+        );
+        for n in &tree[..2] {
+            assert_eq!(
+                n["layoutDimOrder_"],
+                serde_json::json!(["y", "out", "x", "mb"]),
+                "stick-major blocks"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod index_stick_tests {
+    use super::*;
+    use crate::superdsc_opspec::{EntryBase, GatherIndex, PageExtent};
+
+    /// Each core's index start, in core order, of a one-stick-sub-row gather of `entries` rows.
+    fn index_starts(entries: u32) -> Vec<u64> {
+        let op = page_gather_copy_opspec(
+            "Tensor0",
+            "Tensor2",
+            GatherIndex::of_scratch_rows(
+                "Tensor1".into(),
+                PageExtent::of_positions(1),
+                EntryBase::ZERO,
+            ),
+            entries,
+            64,
+            GatheredWords::Fp16,
+        )
+        .expect("the gather builds");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let v = serde_json::to_value(
+            crate::emit::emit_sdsc("gather_o2", &op, &folds, None).expect("it emits"),
+        )
+        .expect("json");
+        let dsc = &v["dscs_"][0]["gather_o2"];
+        let index = dsc["scheduleTree_"]
+            .as_array()
+            .expect("a tree")
+            .iter()
+            .find(|n| n["indirectAllocType_"] == "index_tensor")
+            .expect("the index");
+        let data = &index["startAddressCoreCorelet_"]["data_"];
+        (0..op.iter.cores_used().get())
+            .map(|c| {
+                data[format!("[{c}, 0, 0]")]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("a concrete start")
+            })
+            .collect()
+    }
+
+    /// ⭐ torch-spyre's 512-entry query gather: past one index stick, each core's index starts at
+    /// the stick holding its entries — here 16 entries a core over 32 cores, so cores `2s` and
+    /// `2s + 1` share stick `s`, 128 bytes a stick.
+    #[test]
+    fn each_core_reads_the_index_stick_holding_its_entries() {
+        let starts = index_starts(512);
+        assert_eq!(starts.len(), 32, "16 entries a core");
+        for (c, &s) in starts.iter().enumerate() {
+            assert_eq!(s - starts[0], (c as u64 / 2) * 128, "core {c}");
+        }
+    }
+
+    /// One stick of entries keeps ONE start for every core, as every gather before it did: dxp reads
+    /// each core's entries inside that stick.
+    #[test]
+    fn a_one_stick_index_has_one_start() {
+        let starts = index_starts(32);
+        assert_eq!(starts.len(), 32);
+        assert!(starts.iter().all(|&s| s == starts[0]), "{starts:?}");
+    }
+
+    /// The runs one op each serves: up to 32 cores of one stick, cut at a whole stick where no
+    /// division keeps every core within one.
+    #[test]
+    fn the_index_runs_fill_every_core_a_stick() {
+        use crate::emit::lower_ktir_to_superdsc::index_runs;
+        assert_eq!(index_runs(8), vec![(0, 8)]);
+        assert_eq!(index_runs(512), vec![(0, 512)]);
+        assert_eq!(
+            index_runs(4096),
+            vec![(0, 1024), (1024, 1024), (2048, 1024), (3072, 1024)]
+        );
+        assert_eq!(index_runs(33), vec![(0, 32), (32, 1)]);
+        assert_eq!(index_runs(1027), vec![(0, 1024), (1024, 3)]);
+    }
 }

@@ -248,7 +248,18 @@ pub enum Program {
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].
     LmLast,
     Rope,
-    Attn,
+    /// PAGED ATTENTION — `kernels/page_attn_head_major_decode.py` / `_prefill.py`, spyre-inference's
+    /// head-major online-softmax page walk: each active block's page is read from the page index
+    /// table and its K and V GATHERED from the pools (`ktdp.construct_indirect_access_tile` loads).
+    /// Their parameters, in their order: `query`, `query_row_index`, the K pool, the V pool, the
+    /// page index table, `kv_row_pool` (the decode kernel's), the mask stack, `out`. The paged form's
+    /// SuperDSC lowering is the generic whole-function route.
+    PagedAttn,
+    /// THE PAGED KV CACHE WRITE — `kernels/reshape_and_cache_head_major.py`, spyre-inference's
+    /// `reshape_and_cache_head_major`: this step's K and V rows SCATTERED into the pools
+    /// (`ktdp.store` through an indirect access tile). Their parameters: `key`, `value`, the K pool,
+    /// the V pool, the per-kv-head row index.
+    PagedKvWrite,
     /// A 2-D BLOCK TRANSPOSE of a whole tensor — `[mb, out]` → `[out, mb]`, one
     /// `interslicetranspose_fp16` on the PT unit. See
     /// [`transpose`](crate::emit::lower_ktir_to_superdsc::transpose).
@@ -632,7 +643,77 @@ pub struct KtirNode {
     /// A `Mutex` and not a `RefCell` because the splice's whole-function memo holds
     /// `KtirNode` in a process-wide `static` and requires `Sync`. The clone the memo hands
     /// each rung carries the record BY CONTENTS — see the manual `Clone` below.
-    pub minted: std::sync::Mutex<std::collections::HashMap<ktir_core::ir::Ssa, u32>>,
+    pub minted: std::sync::Mutex<std::collections::HashMap<MintKey, u32>>,
+    /// The scratchpad plan this walking program was lowered under ([`WalkPlan`]), once it has been.
+    pub lx_plan: std::sync::Mutex<Option<WalkPlan>>,
+}
+
+/// The scratchpad plan a walking program was lowered under ([`crate::emit::lx_plan`]): the division
+/// it chose and the tensors it pinned. A card bake lowers each program twice into one layout — the
+/// pass that declares the bundle's synthetics, then the real one — and the second lowers under the
+/// first's plan, with the first's tensors, rather than planning again around the first's own pins.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WalkPlan {
+    pub division: Option<crate::placement::WalkDivision>,
+    pub pinned: Vec<crate::place::PlaceId>,
+}
+
+/// What a node's lowering mints an intermediate for ([`KtirNode::minted`]): an SSA value's own
+/// buffer, or one of the scratches the lowering of that value takes beside it — a relayout's middle
+/// frame, a gather's landing — which no value of the program names, and which the declare pass and
+/// the real pass must still find under one name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MintKey {
+    Value(ktir_core::ir::Ssa),
+    Scratch(ktir_core::ir::Ssa, Scratch),
+}
+
+/// ⭐⭐ WHICH SCRATCH — one variant per minting site, so the compiler keeps them apart.
+///
+/// ⛔ THIS WAS A HAND-PICKED `u8`, AND THAT IS A SILENT-ALIASING SHAPE. The key is `(ssa, n)`, the
+/// `ssa` at most sites is the lowering's OPERAND or RESULT — i.e. some other op's result — and each
+/// site `synth`s its own extents, where `BundleLayout::synth` is FIRST-ONE-WINS. So two sites that
+/// happened to pick the same `n` and to see the same value would be handed ONE buffer at the FIRST
+/// one's shape: four sites picked `0` (two relayout middles, a block relayout's middle, a scatter's
+/// row-major rows), three picked `1` and three picked `2`. Nothing here could have caught it — the
+/// numbers carry no meaning a reader or a compiler can check, and a new site picks the next free
+/// number by grepping. Naming the PURPOSE makes uniqueness the compiler's job and the sharing (if a
+/// site ever wants it) a written decision rather than a coincidence of integers.
+///
+/// Introduced as a ONE-TO-ONE replacement — every site that had its own `(ssa, n)` has its own
+/// variant — so the keys, the tids and therefore every emitted descriptor are unchanged. The
+/// evidence is a byte-for-byte diff of every descriptor the walk lowerings emit over every shape
+/// the splice tests build, plus the granite-2b and -8b bakes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Scratch {
+    /// ⭐ A RELAYOUT'S ROW-MAJOR MIDDLE FRAME — the four sites that take one share this variant,
+    /// because they shared the `0` the `u8` era gave them and the one-to-one replacement keeps
+    /// every key exactly as it is: a head-major relayout's middle at a head's own rows and at the
+    /// query's head rows (head dim 128), a block relayout's middle, and a scatter's rows read
+    /// row-major at one base. They `synth` DIFFERENT extents, so if two of them ever saw one value
+    /// the first would win — SPLITTING them is therefore a real change, not a rename, and it needs
+    /// its own evidence: a before/after descriptor diff of the FULL-MODEL bakes, since two of the
+    /// four (the scatter's rows, the block relayout's middle) are reached by the forward and not by
+    /// `lower_walk`, which is all the walk-level diff covers.
+    RelayoutMid,
+    /// A gathered index table, permuted stick-to-row.
+    GatherTableRowMajor,
+    /// The rows a chained index gather lands.
+    GatheredRowMajor,
+    /// The index run a chained gather copies per page.
+    IndexRun,
+    /// The `i`th doubling of a piece-split gather's index.
+    ScaledIndex(u8),
+    /// A head-major pair's stick-major blocks.
+    HeadMajorBlocks,
+    /// A head-major pair's middle frame.
+    HeadMajorMid,
+    /// A batched contraction's kernel, expanded to its query heads.
+    BatchKernelBlocks,
+    /// A batched contraction's activation, laid as blocks.
+    BatchActivationBlocks,
+    /// The wide levels of a leading-axis fold that halves (`emit::whole_function`'s reduce arm).
+    FoldTreeWide,
 }
 
 impl Clone for KtirNode {
@@ -654,6 +735,12 @@ impl Clone for KtirNode {
             node_out_tid: self.node_out_tid,
             minted: std::sync::Mutex::new(
                 self.minted
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone(),
+            ),
+            lx_plan: std::sync::Mutex::new(
+                self.lx_plan
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .clone(),

@@ -283,6 +283,7 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
         mask: None,
         node_out_tid: None,
         minted: Default::default(),
+        lx_plan: Default::default(),
     }
 }
 
