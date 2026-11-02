@@ -11,7 +11,9 @@
 //! caller: the worker routes every sendnn bundle to `SuperDsc`. Under `sendnn` the only bundle that
 //! runs is the dxp-compiled SuperDSC bundle.
 
-use crate::superdsc_exec::{Executor, KvDim, Logits, NewTokens, PoolPages, SegIdx, SeqPos, Vocab};
+use crate::superdsc_exec::{
+    DeferredRead, Executor, KvDim, Logits, NewTokens, PoolPages, SegIdx, SeqPos, Vocab,
+};
 use anyhow::{Result, anyhow, bail};
 use scratchy_subtile::sdsc_abstract::{
     FoldPages, FoldRowRegime, FoldWalker, MaskBlocks, PrefixMaskShape,
@@ -144,15 +146,30 @@ pub struct SuperDscSession {
 impl SuperDscSession {
     /// Load the bundle, bind the weights, and prepare (allocate + upload the resident program,
     /// weights and KV pool).
-    #[allow(clippy::type_complexity)]
+    ///
+    /// ⭐ THE GRAPH'S OWN SOURCE FACTS ARE READ OFF `code`, NEVER ARGUED: the
+    /// source count and the resident source ids are stamped on the bundle's
+    /// layout at the bake, so a session built here walks exactly the source
+    /// range of the graph it runs — a caller cannot hand it another graph's
+    /// numbers. Only the spilled weight tail is an argument (a load-time copy
+    /// decision the layout cannot make for the caller).
+    ///
+    /// `load_consts` is the wiring's OWN staged-constant list — the tables a
+    /// spliced kernel declares as sources. They are bound ONCE here, before
+    /// prepare, resident like a weight (each is a function of the graph
+    /// alone); a session that binds none passes an empty slice. A BORROWING
+    /// rung binds its OWN copy through
+    /// [`new_borrowing_with_consts`](Self::new_borrowing_with_consts) — the
+    /// tables sit in the per-session activation segment, which no alias
+    /// covers.
     pub fn new(
         code: &'static crate::bundle_code::BundleCode<'static>,
         vocab: usize,
         kv_dim: usize,
         num_blocks: usize,
-        num_sources: u32,
-        resident_sources: &[u32],
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
+        load_consts: &[(u32, crate::wiring::LoadConst)],
+        spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
             code,
@@ -161,10 +178,10 @@ impl SuperDscSession {
                 kv_dim,
                 num_blocks,
             },
-            num_sources,
-            resident_sources,
             weights,
+            load_consts,
             &[],
+            spilled_tail,
         )
     }
 
@@ -182,9 +199,35 @@ impl SuperDscSession {
         vocab: usize,
         kv_dim: usize,
         num_blocks: usize,
-        num_sources: u32,
-        resident_sources: &[u32],
         borrowed: &[i64],
+        spilled_tail: &[u32],
+    ) -> Result<Self> {
+        Self::new_borrowing_with_consts(
+            code,
+            vocab,
+            kv_dim,
+            num_blocks,
+            borrowed,
+            &[],
+            spilled_tail,
+        )
+    }
+
+    /// [`new_borrowing`](Self::new_borrowing) for a session that ALSO binds its own staged
+    /// constants — every BATCHED DECODE rung. The sampler's nine tables are SOURCES placed in
+    /// the ACTIVATION segment, which is never aliased (each session's seg3 is its own region,
+    /// and the tables' offsets are rung-local: the `[rows, PAD_V]` noise block packs ahead of
+    /// them at THIS rung's row count), so a borrower that binds nothing reads ZEROS where its
+    /// tables sit. Each rung stages its own copy — a few MB against the rung's programs, once
+    /// at load — through the same load-time channel the owner uses.
+    pub fn new_borrowing_with_consts(
+        code: &'static crate::bundle_code::BundleCode<'static>,
+        vocab: usize,
+        kv_dim: usize,
+        num_blocks: usize,
+        borrowed: &[i64],
+        load_consts: &[(u32, crate::wiring::LoadConst)],
+        spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
             code,
@@ -193,10 +236,10 @@ impl SuperDscSession {
                 kv_dim,
                 num_blocks,
             },
-            num_sources,
-            resident_sources,
             Vec::new(),
+            load_consts,
             borrowed,
+            spilled_tail,
         )
     }
 
@@ -208,16 +251,17 @@ impl SuperDscSession {
     /// ALLOCATION, not from the bytes — and those bytes are dead, since the session is aliased onto
     /// decode's copy immediately afterwards. So reserving without populating keeps the placement and
     /// drops the bind + stage (6.97s of startup for granite-3.1-8b, measured).
+    ///
+    /// `load_consts` — the prefill wiring's own staged-constant list. The general mint puts the
+    /// sampler's nine tables in EVERY prefill rung too, and they sit in the session's own seg3
+    /// (never aliased), so the anchor stages its own copy exactly as a borrowing rung does.
     pub fn new_reserving(
         code: &'static crate::bundle_code::BundleCode<'static>,
         vocab: usize,
         kv_dim: usize,
         num_blocks: usize,
-        // ⛔ REQUIRED, from the generated wiring. Ids `0..num_sources` are host-filled every
-        // forward; the executor refuses to launch with one unwritten. Passing it as an ARGUMENT
-        // rather than a setter is the lock: a new session site cannot forget it.
-        num_sources: u32,
-        resident_sources: &[u32],
+        load_consts: &[(u32, crate::wiring::LoadConst)],
+        spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
             code,
@@ -226,22 +270,29 @@ impl SuperDscSession {
                 kv_dim,
                 num_blocks,
             },
-            num_sources,
-            resident_sources,
             Vec::new(),
+            load_consts,
             &[],
+            spilled_tail,
         )
     }
 
     fn new_inner(
         code: &'static crate::bundle_code::BundleCode<'static>,
         dims: SessionDims,
-        num_sources: u32,
-        // The prefix-KV source ids — placed and inside `0..num_sources`, but device-resident, so
-        // no per-step bind names them.
-        resident_sources: &[u32],
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
+        // The wiring's staged-constant list — bound once before prepare by the
+        // OWNER only (see [`Self::new`]); borrowers pass none and read the
+        // owner's bytes through the alias.
+        load_consts: &[(u32, crate::wiring::LoadConst)],
         borrowed: &[i64],
+        // The spilled weight tail's tids — the ONE resident slice the layout cannot state: the
+        // spill is a load-time copy decision (a weight whose slot also holds an m-dependent
+        // intermediate color cannot be aliased, so `adopt_from_owner` copies it into this
+        // session's own region), so the LOADER declares it resident here, exactly as it hands it
+        // over. Leaving it out is a REFUSED LAUNCH, not a silent wrong answer — the completeness
+        // check classifies the un-copied tail `SourceFiller::Nobody` and stops.
+        spilled_tail: &[u32],
     ) -> Result<Self> {
         let SessionDims {
             vocab,
@@ -255,7 +306,18 @@ impl SuperDscSession {
             KvDim(kv_dim),
             PoolPages(num_blocks as i64),
         )?;
-        exec.declare_sources(num_sources, resident_sources.iter().copied());
+        // ⭐ THE GRAPH'S OWN SOURCE FACTS — the count and the resident ids are stamped on the
+        // layout this session's `code` carries, so the completeness walk covers exactly the
+        // source range of the graph being run: prefix-KV caches and load-const tables excused
+        // by the bundle's own list, the spilled tail by the caller's, and nothing else.
+        exec.declare_sources(
+            code.layout.num_sources,
+            code.layout
+                .resident_source_tids
+                .iter()
+                .copied()
+                .chain(spilled_tail.iter().copied()),
+        );
         // BORROWED segments must be declared BEFORE prepare — afterwards the full region is already
         // allocated and transferred, so the flag would be a silent no-op (the executor refuses).
         for &seg in borrowed {
@@ -276,6 +338,15 @@ impl SuperDscSession {
             };
             exec.bind_weight(crate::bundle_code::PlaceId::Act(id as u32), bytes);
         }
+        // ⭐ THE STAGED CONSTANTS ride the same law: bound once, before
+        // prepare, into the same weight channel `stage_weights` converts and
+        // uploads — a table the owner never binds reads as ZEROS on card, and
+        // the kernel composes its answer from zeros (measured: the argmax
+        // mint's first card run answered token 0 — EOS — on every decode
+        // step, while the build's own numeric gate passed, because the gate's
+        // emulator binds its own sources and never crosses this seat).
+        exec.bind_load_consts(load_consts)?;
+        let n_staged = n_bound + load_consts.len();
         debug!(
             "[timing] bind weights loop took {:.2}s",
             t_bind.elapsed().as_secs_f64()
@@ -287,15 +358,15 @@ impl SuperDscSession {
         // pure scheduling.
         //
         // NOTHING BOUND is the same situation as BORROWED: with no weights this call only zero-fills
-        // a host shadow of a segment that is about to be replaced by an alias.
-        if !borrowed.is_empty() || n_bound == 0 {
+        // a host shadow of a segment that is about to be replaced by an alias. A BORROWER THAT
+        // BINDS STAGED CONSTANTS still stages: `stage_weights` gives every borrowed segment its
+        // 128 B placeholder, so the only shadow this writes is the ACTIVATION segment's — the one
+        // holding this session's own load-const tables, which no alias can deliver (the tables are
+        // per-session placements, and a rung's seg3 is its own region).
+        if n_staged == 0 {
             debug!(
-                "[timing] weight bind + stage SKIPPED ({})",
-                if borrowed.is_empty() {
-                    "nothing bound — segments reserved, populated by alias".to_string()
-                } else {
-                    format!("segments {borrowed:?} borrowed by alias")
-                }
+                "[timing] weight bind + stage SKIPPED (nothing bound — segments reserved, \
+                 populated by alias)"
             );
         } else {
             let t_stage = std::time::Instant::now();
@@ -576,6 +647,50 @@ impl SuperDscSession {
         self.exec.keyed_holds(id)
     }
 
+    /// ⭐ #32 (A) — ONE PIPELINED STEP'S SUBMIT HALF: the same private forward
+    /// body `run_step_inner` reaches through `predict` for
+    /// `StepLogits::LeftOnDevice`, with NO trailing drain — the doorbell is rung
+    /// and the host returns (see `Executor::submit_step`). The loop's ONE fence —
+    /// the finish half of the stick read, `finish_deferred_read_raw` below — is
+    /// what waits this submission out; `predict`'s tail sync is the drain this
+    /// door exists to not run. Call `stage_step_acts` first: this door submits
+    /// whatever the shadow holds.
+    pub fn submit_step(&mut self, n_new: usize, seq_pos: usize) -> Result<()> {
+        self.exec
+            .submit_step(NewTokens(n_new as i64), SeqPos(seq_pos as i64))
+    }
+
+    /// ⭐ #32 (A) — ENQUEUE THE STEP'S STICK READ, no drain: the D2H rides the
+    /// compute pipeline behind the step's CBs, and the host keeps working until
+    /// the loop's ONE fence (the runner spelling of
+    /// `Executor::defer_read_tensor_raw`).
+    pub fn defer_read_tensor_raw(
+        &mut self,
+        id: crate::bundle_code::PlaceId,
+        cap_bytes: usize,
+    ) -> Result<DeferredRead> {
+        self.exec.defer_read_tensor_raw(id, cap_bytes)
+    }
+
+    /// ⭐ #32 (C) — THE RING TWIN, for a pick not consumed until a later drain:
+    /// two outstanding shadow reads for the same stick race, so an in-flight
+    /// step's read lands in its own ring slot (the runner spelling of
+    /// `Executor::defer_read_tensor_ring`).
+    pub fn defer_read_tensor_ring(
+        &mut self,
+        id: crate::bundle_code::PlaceId,
+        cap_bytes: usize,
+    ) -> Result<DeferredRead> {
+        self.exec.defer_read_tensor_ring(id, cap_bytes)
+    }
+
+    /// ⭐ #32 (A) — THE LOOP'S ONE FENCE: park on this read's own completion
+    /// (and the shadow's quiet point), then return the bytes the transfer
+    /// brought back (the runner spelling of `Executor::finish_deferred_read_raw`).
+    pub fn finish_deferred_read_raw(&mut self, read: &DeferredRead) -> Result<Vec<u8>> {
+        self.exec.finish_deferred_read_raw(read)
+    }
+
     /// Bind `id` as a function of `key` alone, narrowed to f16 here. The next step uploads it, and
     /// no later step re-uploads it until another key is bound (see `Executor::bind_input_keyed`).
     pub fn bind_keyed(
@@ -605,11 +720,25 @@ impl SuperDscSession {
         self.exec.stage_keyed(id, key, f32_to_f16_le(vals))
     }
 
-    /// The bind loop every step runs before its forward — the three channels
-    /// (`run_step_inner`'s own): f32 narrowed to f16 at the boundary, already-f16
-    /// bytes as-is, and RAW LE int32 through `bind_input_raw`. One body, so a new
-    /// channel or a new guard cannot land on one step shape and skip the other.
-    fn bind_activations(
+    /// ⭐⭐⭐ THE ONCARD HAND-OFF — the sticks a stable decode seating leaves to the card's own
+    /// ChainStage writes. Ends the refill's re-send of a previous `Host` launch's seed bind
+    /// (see `Executor::hand_to_card`); a churned seating's re-bind re-inserts it.
+    pub fn hand_to_card(&mut self, id: crate::bundle_code::PlaceId) {
+        self.exec.hand_to_card(id)
+    }
+
+    /// ⭐ #32 (A) — THE BIND LOOP EVERY STEP RUNS BEFORE ITS FORWARD, PUB FOR THE
+    /// PIPELINED LOOP, which stages half a step at a time: it calls this with
+    /// step `j+1`'s acts while the device still executes step `j` (the
+    /// position-pure half, pre-fence), then stages the ONE token-dependent bind
+    /// after the fence. `submit_step` is the other half — its refill uploads
+    /// whatever the shadow holds, so the split between the two calls is where
+    /// the pipelining lives. The one-shot `run_step_inner` path composes this
+    /// same body, never a second spelling of it. The three channels are its
+    /// own: f32 narrowed to f16 at the boundary, already-f16 bytes as-is, and
+    /// RAW LE int32 through `bind_input_raw`. One body, so a new channel or a
+    /// new guard cannot land on one step shape and skip the other.
+    pub fn stage_step_acts(
         &mut self,
         activations: &[crate::wiring::Bind],
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
@@ -680,7 +809,7 @@ impl SuperDscSession {
         activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
-        self.bind_activations(activations, activations_f16, activations_i32)?;
+        self.stage_step_acts(activations, activations_f16, activations_i32)?;
         let (n_new, seq_pos) = (NewTokens(n_new as i64), SeqPos(seq_pos as i64));
         match logits {
             StepLogits::ReadBack => {
@@ -725,6 +854,19 @@ impl SuperDscSession {
         Ok(f16_le_to_f32(&self.exec.read_tensor(id, cap)?))
     }
 
+    /// ⭐ THE GENERIC RAW-READ VARIANT of [`Self::read_tensor`] — the tensor's
+    /// own bytes, VERBATIM, no f16 decode. A step whose rung's result is not
+    /// the f16 row runs `StepLogits::LeftOnDevice` and reads the result here:
+    /// the CALLER decodes at the dtype the wiring's `result_dtype` states (an
+    /// index stick's raw LE int32 words), because only the wiring knows it.
+    pub fn read_tensor_raw(
+        &mut self,
+        id: crate::bundle_code::PlaceId,
+        cap_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        self.exec.read_tensor_raw(id, cap_bytes)
+    }
+
     /// Zero a whole tensor segment ON THE DEVICE, without a host mirror of it.
     ///
     /// The KV pool must start zeroed (decode computes q·k over a whole page before the validity mask
@@ -738,7 +880,7 @@ impl SuperDscSession {
     }
 
     /// D2H the whole tensor segment as raw sen-fp16 bytes (the prefill→decode KV handoff: read the
-    /// PREFILL session's seg2, then [`write_seg`](Self::write_seg) it into the DECODE session's).
+    /// PREFILL session's seg2, then hand it to the decode session's alias door).
     pub fn read_seg(&mut self, seg: i64) -> Result<Vec<u8>> {
         let s =
             SegIdx::checked(seg).ok_or_else(|| anyhow!("read_seg: segment {seg} out of range"))?;
@@ -752,37 +894,6 @@ impl SuperDscSession {
         let s = SegIdx::checked(seg)
             .ok_or_else(|| anyhow!("write_seg_prefix: segment {seg} out of range"))?;
         self.exec.write_seg_prefix(s, bytes)
-    }
-
-    /// Overwrite the whole tensor segment from raw sen-fp16 bytes + H2D it.
-    pub fn write_seg(&mut self, seg: i64, bytes: &[u8]) -> Result<()> {
-        let s =
-            SegIdx::checked(seg).ok_or_else(|| anyhow!("write_seg: segment {seg} out of range"))?;
-        // GUARD: this is a RAW whole-segment copy with no layout cross-check. Assert the source byte
-        // count == THIS session's segment size. A mismatch means the two independently baked bundles
-        // placed the segment differently — which would silently hand wrong-OFFSET data for every
-        // tensor past the divergence (semi-coherent garble, no crash).
-        //
-        // ⛔ THE CAUSE IS NOT ALWAYS A KV ASYMMETRY, which this used to assert outright and cost a
-        // misdiagnosis. A whole-segment copy is only meaningful between bundles whose extent for that
-        // segment AGREES, and that holds for seg2 (nothing in its size depends on the query-row count)
-        // but for very little else: any segment carrying an intermediate COLOR or the logits scales
-        // with m, so its total differs per rung by construction — MEASURED, seg6 is 421,257,216 B in
-        // the decode bundle and 432,218,112 B in a prefill one, the same 419,430,400 B tail beside a
-        // 1,826,816 B and a 12,787,712 B color. For a payload that occupies a PREFIX of the segment
-        // (the spilled weight tail) the copy that is actually well-defined is
-        // [`SuperDscSession::write_seg_prefix`], not this one.
-        let expect = self.exec.seg_bytes(s);
-        if bytes.len() != expect {
-            bail!(
-                "write_seg(seg={seg}): source {} bytes != this session's segment {expect} bytes — \
-                 the two bundles place seg{seg} differently. A whole-segment copy needs their \
-                 extents to agree; if the payload is a prefix of the segment, copy it with \
-                 write_seg_prefix instead",
-                bytes.len()
-            );
-        }
-        self.exec.write_seg(s, bytes)
     }
 
     /// Point THIS session's segment at `owner`'s device region, so the two SHARE it and no copy is

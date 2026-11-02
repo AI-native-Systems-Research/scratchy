@@ -1,0 +1,29 @@
+--- a/crates/serving/worker/src/spyre_forward.rs
++++ b/crates/serving/worker/src/spyre_forward.rs
+@@ -522,7 +522,25 @@
+                     ))
+                 })?
+                 .unwrap_or_default();
+-            Some(l.get(..vocab).unwrap_or(&l).to_vec())
++            let v = l.get(..vocab).unwrap_or(&l).to_vec();
++            // FB-CHAT-REFERENCE (scratch-tree probe on main e63c6f8ac8, NEVER
++            // committed): dump the prompt-final chunk's next-token logits —
++            // main's own host read-back, the reference distribution for the
++            // front-b chat leg's seeded draws. Print-only beside the dump.
++            {
++                use std::sync::atomic::{AtomicU64, Ordering};
++                static N: AtomicU64 = AtomicU64::new(0);
++                let n = N.fetch_add(1, Ordering::SeqCst);
++                let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
++                match std::fs::write(format!("/work/fb-chat-main/logits-{n:04}.bin"), bytes) {
++                    Ok(()) => eprintln!(
++                        "FB-CHAT-REF logits-{n:04}.bin: {} elems (vocab {vocab})",
++                        v.len()
++                    ),
++                    Err(e) => eprintln!("FB-CHAT-REF logits dump failed: {e}"),
++                }
++            }
++            Some(v)
+         }
+         // The shim's own logits D2H converts ONE row from the placement's start (it was written for
+         // the folded tail), so it cannot serve this case. Run with a null out-pointer and read the

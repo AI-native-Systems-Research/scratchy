@@ -41,7 +41,9 @@
 //! `CreateComputeDataTransfer` (immediate DMA), and `CreateFillDma`
 //! (`flex/src/control_blocks/control_block_stream/control_block_stream.hpp`).
 //! RDMA/HDMA/R5 section encoding is out of scope (never emitted by this
-//! runtime) and is not ported here.
+//! runtime) and is not ported here — those sections are provided by the
+//! cxx-shim `hal_sbf` doors (`cxx-shim/hal_sbf.cpp`, wrapped at
+//! `crate::hal_sbf`, the r5-wire port).
 
 /// A bit range `[HI, LO]` (inclusive, hardware convention — matches the real
 /// headers' own `ADD_SAFE_BITFIELD_MEMBER_PDF(name, hi, lo)` argument order)

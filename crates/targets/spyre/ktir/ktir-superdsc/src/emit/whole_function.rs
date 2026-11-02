@@ -43,6 +43,7 @@
 //! guessed node kind is a well-formed descriptor computing the wrong function.
 
 use ktir_core::attrkey::AttrKey;
+use ktir_core::dtypes::DType;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::opkind::OpKind;
 
@@ -50,9 +51,11 @@ use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gathers_of, regi
 use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind};
 // The broadcast AXIS is the emission door's own vocabulary — `elementwise` selects the `In` builder
 // from it — so it lives beside that door and this recogniser names the same type rather than a
-// parallel one that would have to be mapped across the boundary.
-use super::lower_ktir_to_superdsc::BcastAxis;
+// parallel one that would have to be mapped across the boundary. The CONVERT KIND is the same
+// trade for a dtype-convert: the emission door's own vocabulary, not a `Program` variant.
+use super::lower_ktir_to_superdsc::{BcastAxis, ConvertKind, IntBinary, RowBand};
 use crate::placement::BundleLayout;
+use crate::superdsc_opspec::Df;
 use crate::work::DeviceWidth;
 
 /// THE SILU LONGHAND, as the ONE fused op it is — `out = silu(gate) · up`.
@@ -698,10 +701,21 @@ fn rmsnorm_chain_from(
 /// chain. Refusing a function for holding two was an artificial limit that turned a legitimate
 /// two-layer program into a refusal.
 ///
-/// An empty `Vec` means there is no `arith.negf` at all, i.e. nothing here claims to be a silu.
-/// `Err` means one was found and the chain around it does NOT close — reported rather than left to
-/// the 1:1 map, because "`ArithNegf` has no `Program`" would send a reader looking for a missing
-/// `Elementwise` variant when the real answer is that a silu is mis-shaped.
+/// An empty `Vec` means no `arith.negf` is a silu head, i.e. nothing here claims to be a
+/// silu. `Err` means one was found and the chain around it does NOT close — reported rather than
+/// left to the 1:1 map, because a half-proven silu lowered op-by-op would read like a missing
+/// `Elementwise` variant when the real answer is that the silu is mis-shaped.
+///
+/// ⭐ THE HEAD TEST, AND WHY IT IS THE READER: a negf is a silu head ONLY IF its one
+/// reader is `math.exp` — the second op of `x·sigmoid(x)`'s longhand. A negf read by
+/// anything else is not a mis-shaped silu but a NEGATION the program means (the Gumbel
+/// transform's `g = -log(-log(u))` negates twice around the inner log), and the card has
+/// its own opFunc for it (`OpFuncs::NEG`), so the walk lowers it as
+/// `Elementwise(Neg)` rather than this fusion refusing it. Before `Neg` existed there
+/// WAS no such program, so every negf had to justify itself here — that is no longer
+/// true, and claiming all of them would make `-log(x)` unlowerable while `0-x` lowers.
+/// The mis-shaped-silu report keeps its full force INSIDE the chain: once the head
+/// test passes, every link must close or the function is refused.
 pub fn program_silu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<SiluMulChain>, Error> {
     let mut out = Vec::new();
     for neg in f
@@ -709,6 +723,16 @@ pub fn program_silu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<SiluMulCha
         .iter()
         .filter(|o| o.op_type == OpKind::ArithNegf)
     {
+        // THE HEAD TEST: exactly one reader, and it is `math.exp`. Anything else —
+        // no reader, several readers, or one reader of any other kind — is not this
+        // fusion's negf, and `silu_mul_chain_from` below is never entered for it.
+        let Some(neg_v) = neg.result else { continue };
+        let deep = f.ops_deep();
+        let mut readers = deep.iter().copied().filter(|o| o.operands.contains(&neg_v));
+        let head = readers.next();
+        if readers.next().is_some() || head.is_none_or(|o| o.op_type != OpKind::MathExp) {
+            continue;
+        }
         out.push(silu_mul_chain_from(f, neg)?);
     }
     Ok(out)
@@ -923,6 +947,11 @@ pub fn program_of(op: OpKind) -> Option<Program> {
         OpKind::LinalgMatmul => Program::Matmul,
         OpKind::LinalgBatchMatmul => Program::Matmul,
         OpKind::MathExp => Program::Elementwise(Elementwise::Exp),
+        OpKind::MathLog => Program::Elementwise(Elementwise::Log),
+        // The Gumbel transform's negations (`g = -log(-log(u))`). `OpFuncs::NEG`
+        // is the card's own opFunc, and a negf that is NOT a silu head has no
+        // other owner — see [`program_silu_mul_chains`] for the head test.
+        OpKind::ArithNegf => Program::Elementwise(Elementwise::Neg),
         OpKind::MathRsqrt => Program::Elementwise(Elementwise::Rsqrt),
         OpKind::MathSqrt => Program::Elementwise(Elementwise::Sqrt),
         OpKind::MathAbsf => Program::Elementwise(Elementwise::Abs),
@@ -968,6 +997,20 @@ enum Lowering {
     /// for the Scale convention. See [`program_rmsnorm_chains`] for why fusing it is the fix and
     /// filling the scale registry was not.
     RmsNorm(f32, Option<f32>),
+    /// A dtype-CONVERT cast — `arith.extf` f16→f32 (`dl16tofp32`) or `arith.fptosi` f32→i32
+    /// (`fp32toint32`) — the vendor's own convert `OpFunc`s, 1:1 in (op kind, element pair).
+    /// Local rather than a `Program` variant for the same reason `Reduce` is: a bare convert is
+    /// reachable only through this walk, and `Program` is matched exhaustively by consumers
+    /// outside this crate. See [`convert_kind_of`] for the discriminator and what it refuses.
+    Convert(ConvertKind),
+    /// A wrapping i32 BINARY op — `arith.muli`/`arith.addi` — over SENUINT32 data, the noise
+    /// hash's integer class. Local for the same reason [`Convert`](Lowering::Convert) is. The
+    /// discriminator is NOT the op kind alone: most integer arith in a Triton-derived program is
+    /// ADDRESSING (see [`is_plumbing`]'s own law), and only the ops [`integer_compute_of`]
+    /// classifies as COMPUTE reach this arm — an integer op outside that set is plumbing and
+    /// never lowers, exactly as before. See [`int_binary`] for the card form (leg B1) and the
+    /// shapes it refuses.
+    IntBinary(IntBinary),
 }
 
 /// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole function.
@@ -1131,6 +1174,214 @@ pub fn reduce_kind_of(op: &ktir_core::ir::Operation<'static>) -> Option<ReduceKi
     })
 }
 
+/// THE CONVERT A CAST NAMES, where the naming is 1:1 in (op kind, element pair).
+///
+/// ⭐ NOT IN [`program_of`] for the same reason [`reduce_kind_of`] is not: `program_of` takes an
+/// `OpKind` alone, and `OpKind::ArithExtf` says "a widening cast happens here" without saying
+/// WHICH — `extf` f16→f32 is `dl16tofp32`, an `extf` f16→f32 over an INTEGER target is a
+/// different op with no recipe. The element pair is read off the op's own types, so nothing is
+/// stapled to the program a third party must restate.
+///
+/// The two recipes are the vendor's own convert `OpFunc`s, and they are the KSPLIT fp32 island's
+/// two ends: `dl16tofp32` widens an fp16 stick to same-stick fp32 (the multiply-add's entrance —
+/// ⛔ an fp16 value MUST stage through it on the way to an integer, because `Fp32ToInt32`'s DDL
+/// slice law refuses a direct fp16→u32 pairing), and `fp32toint32` re-sticks an IEEE fp32 word
+/// as a SENUINT32 index (the exit).
+///
+/// ⛔ EVERY OTHER PAIR IS A NAMED REFUSAL, NOT A FALLTHROUGH. An `extf`/`fptosi`/`sitofp`/
+/// `truncf` that reaches this function with a pair outside the recipes returns `Err` here —
+/// naming the op, the operand's element and the result's — rather than `Ok(None)`, because
+/// `Ok(None)` would hand it to the generic "no 1:1 `Program`" refusal whose message cannot say
+/// WHICH converts this door does lower.
+fn convert_kind_of(
+    f: &IRFunction<'static>,
+    op: &ktir_core::ir::Operation<'static>,
+) -> Result<Option<ConvertKind>, Error> {
+    if !matches!(
+        op.op_type,
+        OpKind::ArithExtf | OpKind::ArithFptosi | OpKind::ArithSitofp | OpKind::ArithTruncf
+    ) {
+        return Ok(None);
+    }
+    // The operand's element type, read off its DEFINING op's result type — the same lookup
+    // `splat_scale_of`'s `def_of` makes, top-level, because a cast's operand is a value this
+    // function computed or loaded, never a region interior.
+    let elem_of = |v: Ssa| {
+        f.operations
+            .iter()
+            .find(|o| o.result == Some(v))
+            .and_then(|o| o.result_type)
+            .and_then(|t| t.elem())
+    };
+    let [operand] = op.operands[..] else {
+        return err(format!(
+            "{}: `{:?}` states {} operands — a dtype-convert reads exactly one",
+            f.name,
+            op.op_type,
+            op.operands.len()
+        ));
+    };
+    let in_elem = elem_of(operand);
+    let out_elem = op.result_type.and_then(|t| t.elem());
+    match (op.op_type, in_elem, out_elem) {
+        (OpKind::ArithExtf, Some(DType::F16), Some(DType::F32)) => {
+            Ok(Some(ConvertKind::Dl16ToFp32))
+        }
+        (OpKind::ArithFptosi, Some(DType::F32), Some(DType::I32)) => {
+            Ok(Some(ConvertKind::Fp32ToInt32))
+        }
+        // The integer-side entrance: a SENUINT32 word → an IEEE fp32 value, the reverse recipe
+        // of `fp32toint32` (card leg B1's i2f cell proved the pairing on card). The on-card
+        // Gumbel noise's wrap-fold extraction rides it (front-b-noise).
+        (OpKind::ArithSitofp, Some(DType::I32), Some(DType::F32)) => {
+            Ok(Some(ConvertKind::Int32ToFp32))
+        }
+        // The narrow-back: an IEEE fp32 value → an fp16 one, the reverse recipe of
+        // `dl16tofp32`. The card's `log` is FP16-ONLY (the vendor DDL binds it to
+        // `[%type_fp16]` alone — no fp32 binding, unlike `tanh`), so the Gumbel draw's
+        // log chain must narrow before its logs or dxp refuses the op mapping
+        // (front-b-noise, measured on the card leg). The `truncf` that narrows is
+        // LEGALIZE-PROOF by construction: `LegalizeTypes` removes only f16→f16
+        // truncfs (widening churn after the collapse), so a genuine f32→f16 pair
+        // survives the pass and reaches this arm.
+        (OpKind::ArithTruncf, Some(DType::F32), Some(DType::F16)) => {
+            Ok(Some(ConvertKind::Fp32ToDl16))
+        }
+        _ => err(format!(
+            "{}: `{:?}` {:?} → {:?} is not one of the dtype-converts this door lowers. The \
+             device's convert OpFuncs spell exactly four recipes reachable from a Triton kernel: \
+             `arith.extf` f16 → f32 (`dl16tofp32`, the fp32 island's entrance), \
+             `arith.fptosi` f32 → i32 (`fp32toint32`, its exit — an fp16 value must stage \
+             through the widen first; the direct fp16→u32 cast is DDL-refused), \
+             `arith.sitofp` i32 → f32 (`int32tofp32`, the entrance from the integer side), and \
+             `arith.truncf` f32 → f16 (`fp32todl16`, the narrow-back — the card's `log` is \
+             fp16-only, so an f32 value on its way to one must narrow first). Any other pair \
+             is a producer form refused by name rather than lowered as the nearest convert",
+            f.name, op.op_type, in_elem, out_elem
+        )),
+    }
+}
+
+/// THE BUFFER FORMAT an op's result type names.
+///
+/// F16 and F32 are the fp16/fp32 sticks; I32 is SENUINT32 — the 4-byte/32-stick index format
+/// that is `fp32toint32`'s own output. A STATED type with none of those mappings (a bool, an
+/// i64, an fp8 result) is refused BY NAME: silently defaulting to fp16 would reserve HALF the
+/// bytes an f32 intermediate needs (the footprint guard refuses the first over-run, or without
+/// it the next intermediate is aliased onto it) and mis-stick every descriptor over it.
+///
+/// ⭐ AN UNSTATED type keeps the door's historical fp16 basis. `Operation::new` defaults
+/// `result_type` to `None`, and a hand-built IR (the unit tests' minimal programs) states no
+/// type at all — every op the real pipeline emits carries one, so `None` here is an omitted
+/// annotation, not a fact to refuse, and the only behavior-preserving reading is the fp16 basis
+/// every one of those programs was lowered under before the format became readable here.
+fn result_df_of(name: &str, op: &ktir_core::ir::Operation<'static>) -> Result<Df, Error> {
+    match op.result_type.and_then(|t| t.elem()) {
+        None => Ok(Df::Fp16),
+        Some(DType::F16) => Ok(Df::Fp16),
+        Some(DType::F32) => Ok(Df::Fp32),
+        Some(DType::I32) => Ok(Df::SenUint32),
+        Some(other) => err(format!(
+            "{name}: `{:?}`'s result element type is {other:?}, which has no buffer format this \
+             door mints — an intermediate of that dtype has no stick basis to reserve or address. \
+             It is refused by name rather than defaulted to fp16, which would reserve the wrong \
+             width and mis-stick every descriptor over it",
+            op.op_type
+        )),
+    }
+}
+
+/// The equality-mask folds: each retype's result → the comparison's own two operands, plus the
+/// i1 results the fold consumed (skipped at the walk's loop top, beside the chain interiors).
+struct EqualMasks {
+    by_retype: std::collections::HashMap<Ssa, (Ssa, Ssa)>,
+    consumed: std::collections::HashSet<Ssa>,
+}
+
+/// ⭐⭐⭐ THE EQUALITY MASK — `arith.cmpf(oeq)` retyped by `arith.uitofp`, folded to ONE
+/// `Elementwise(Equal)`.
+///
+/// # WHY THIS RECOGNISER EXISTS AT ALL, AND WHY IT IS NOT AN EXCEPTION TO THE MODULE HEADER
+///
+/// The device HAS the primitive: `OpFunc::Equal` (`broadcast_ops.ddl:41`) realizes `a == b` as
+/// an fp16 0.0/1.0 TENSOR — `EQUAL` into a BOOL state reg, then `SELECT(plus1, zero)` — the
+/// same arity-2 broadcast-op family as `maximum`/`minimum`. KTIR has no op for that: the
+/// comparison is `arith.cmpf` (an i1) and the 0/1 tensor is a SEPARATE `arith.uitofp` retype,
+/// because an i1 cannot ride the fp16 stick. So the two-op spelling is the only one a producer
+/// HAS — the same argument that admits the silu longhand ([`program_silu_mul_chains`]): the
+/// device's op exists and the IR cannot name it in one op, and lowering the pair op-by-op would
+/// emit a form the pointwise family does not have (a bool-typed compare with no stick) rather
+/// than a slower lowering of the same function. The fold is the 1:1 map: `cmpf(oeq)` +
+/// `uitofp`→f16 IS `Elementwise(Equal)` over the cmpf's own two operands.
+///
+/// # ⛔ WHAT IS REFUSED RATHER THAN GUESSED
+///
+/// * the predicate must be `oeq` — `OpFunc::Equal` is EQUALITY (NaN compares FALSE on the SFP
+///   unit, matching the ordered compare), and any other predicate is a DIFFERENT function this
+///   fold must not silently re-mean. An unfolded `cmpf` — any other predicate, or one whose sole
+///   reader is not the retype — is left alone and reaches the walk's by-name refusal, which
+///   names `ArithCmpf`.
+/// * the retype's target must be F16 or F32 — the two formats the elementwise door lowers. The
+///   device op's wire-level result IS the 0/1 tensor (`SELECT(plus1, zero)`), stated at the
+///   RETYPE'S OWN df — the walk's `op_df` reads the retype's result type — so the sampler's fp32
+///   Gumbel-max mask (`(score == mm).to(tl.float32)`) folds to `Elementwise(Equal)` at Fp32
+///   through the df-carrying builder, the same broadcast-op family `maximum`/`minimum` take. A
+///   `uitofp` to any other width is left alone rather than re-emitted at a format the door
+///   refuses by name.
+/// * the `cmpf`'s i1 result must have exactly ONE consumer, the retype — the fold DESTROYS the
+///   i1 value (the device op never materialises it), so a second reader would read a value
+///   nothing writes. The same seal the silu recogniser states for its longhand interior.
+///
+/// Returns the folds ([`EqualMasks`]): each `uitofp` result → the `cmpf`'s two operands, and the
+/// i1 results the fold consumed.
+fn program_equal_masks(f: &IRFunction<'static>) -> Result<EqualMasks, Error> {
+    let mut masks = EqualMasks {
+        by_retype: std::collections::HashMap::new(),
+        consumed: std::collections::HashSet::new(),
+    };
+    let deep = f.ops_deep();
+    for op in deep
+        .iter()
+        .copied()
+        .filter(|o| o.op_type == OpKind::ArithCmpf)
+    {
+        let Some(res) = op.result else { continue };
+        // THE PREDICATE IS THE FUNCTION: ordered equality is `OpFunc::Equal`'s own semantics.
+        let oeq = op
+            .attributes
+            .iter()
+            .any(|(k, v)| matches!((k, v), (AttrKey::Predicate, Attr::Str(s)) if *s == "oeq"));
+        if !oeq {
+            continue;
+        }
+        let [a, b] = op.operands[..] else { continue };
+        // ⛔ EXACTLY ONE READER, AND IT IS THE RETYPE — see the seal above.
+        let mut consumers = deep.iter().copied().filter(|o| o.operands.contains(&res));
+        let Some(u) = consumers.next() else { continue };
+        if consumers.next().is_some() || u.op_type != OpKind::ArithUitofp || u.operands != [res] {
+            continue;
+        }
+        // ⛔ THE RETYPE'S TARGET IS F16 OR F32 — the two formats the elementwise door lowers, and
+        // the emitted `Elementwise(Equal)` states the RETYPE'S OWN df (`op_df` reads the result
+        // type below), so the fp32 Gumbel-max mask lowers as the fp32 form of the same
+        // broadcast-op family. Any other width is left alone for the by-name refusal, rather than
+        // re-emitted at a format the door refuses.
+        if !matches!(
+            u.result_type,
+            Some(ktir_core::irtype::IrType::Tensor {
+                elem: DType::F16 | DType::F32,
+                ..
+            })
+        ) {
+            continue;
+        }
+        let Some(u_res) = u.result else { continue };
+        masks.by_retype.insert(u_res, (a, b));
+        masks.consumed.insert(res);
+    }
+    Ok(masks)
+}
+
 /// Is this op addressing or bookkeeping rather than computation?
 fn is_plumbing(op: OpKind) -> bool {
     matches!(
@@ -1169,6 +1420,75 @@ fn is_plumbing(op: OpKind) -> bool {
             | OpKind::ArithCeildivui
             | OpKind::ArithFloordivsi
     )
+}
+
+/// ⭐⭐⭐⭐⭐ INTEGER COMPUTE, DECIDED BY CONSUMERS — the results of the integer arith ops that are
+/// DATA rather than ADDRESSING, and therefore the ONE exemption to [`is_plumbing`]'s integer rule.
+///
+/// That rule's claim — "every one of these in a Triton-derived program computes a subscript … and
+/// is consumed by a `ktdp.construct_access_tile`, never by a compute op" — held for every kernel
+/// this door had lowered until the on-card noise hash (front-b-noise): a ~20-op wrapping i32
+/// mul/add chain whose result feeds an `arith.sitofp` (the wrap-fold extraction's
+/// `int32tofp32`), with not one subscript in it. The device HAS the node kind — `muli32toi32` /
+/// `addi32toi32` on SENUINT32 data, card leg B1 — so refusing the chain as plumbing would be
+/// wrong in the other direction: the consumers decide.
+///
+/// The classification is a BACKWARD FIXPOINT over exactly three seeds, each a consumer that can
+/// only be reading DATA:
+///   * an op this walk LOWERS — not plumbing, not integer arith (the `sitofp`, an `fptosi`, a
+///     float op, a reduce). A subscript never feeds one, because every body here reads tensor
+///     operands, and addressing reaches a descriptor only through a tile op;
+///   * a `ktdp.store`'s VALUE operand — the program's own statement that this integer is an
+///     output, not an address. Before this fixpoint such a chain was skipped with its store
+///     (both plumbing) and the output parameter was silently never written;
+///   * an integer arith op already classified compute — the chain's own interior.
+///
+/// Everything else keeps the plumbing reading verbatim: an integer op whose consumers are all
+/// tile constructors, splats and constants stays addressing, lowered by nothing, exactly as
+/// before — so for every kernel that bakes today this set's membership among their integer ops
+/// is empty and the walk below is byte-identical.
+fn integer_compute_of(f: &IRFunction<'static>) -> std::collections::HashSet<Ssa> {
+    let is_int_arith =
+        |k: OpKind| matches!(k, OpKind::ArithMuli | OpKind::ArithAddi | OpKind::ArithSubi);
+    // result → the ops naming it as an operand.
+    let mut consumers: std::collections::HashMap<Ssa, Vec<&ktir_core::ir::Operation<'static>>> =
+        std::collections::HashMap::new();
+    for op in f.operations.iter() {
+        for v in op.operands.iter() {
+            consumers.entry(*v).or_default().push(op);
+        }
+    }
+    let mut compute = std::collections::HashSet::new();
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for op in f.operations.iter() {
+            let Some(res) = op.result else { continue };
+            if !is_int_arith(op.op_type) || compute.contains(&res) {
+                continue;
+            }
+            let is_data = consumers.get(&res).is_some_and(|cs| {
+                cs.iter().any(|c| {
+                    if c.op_type == OpKind::KtdpStore {
+                        // Operand 0 is the VALUE; a store never reads a subscript.
+                        c.operands.first() == Some(&res)
+                    } else if is_int_arith(c.op_type) {
+                        // Chain interior: compute only by the fixpoint's own membership.
+                        c.result.is_some_and(|r| compute.contains(&r))
+                    } else {
+                        // An op this walk lowers — the seed class. Plumbing consumers (tile
+                        // constructors, splats, constants, casts of pointers) confer nothing.
+                        !is_plumbing(c.op_type)
+                    }
+                })
+            });
+            if is_data {
+                compute.insert(res);
+                grew = true;
+            }
+        }
+    }
+    compute
 }
 
 /// ONE recognised broadcast: the value a consumer reads, resolved back to the rank-2 SOURCE the
@@ -1218,7 +1538,8 @@ struct Bcast {
 /// This recogniser therefore returns, for each broadcast RESULT, the source value a consumer should
 /// read and the axis — and the `consumed` set of every value the chain minted, which no descriptor
 /// lowers. It is the same rank walk [`program_rmsnorm_chains`] already does for its `rsqrt` and its
-/// gain (through the same three op kinds, to depth 3); this generalises it to any consumer.
+/// gain (through the same op kinds, to depth 3, plus the shape-preserving elementwise converts
+/// below); this generalises it to any consumer.
 ///
 /// # ⛔ WHAT IS REFUSED RATHER THAN GUESSED
 ///
@@ -1327,9 +1648,13 @@ fn program_broadcast_chains(
                 ));
             }
         };
-        // WALK BACK to the rank-2 value the chain started from, through the SAME three op kinds and the
-        // SAME depth `program_rmsnorm_chains` walks. The `tensor.empty` second operand is the
-        // broadcast's `outs` init and carries no data, so only operand 0 is followed.
+        // WALK BACK to the rank-2 value the chain started from, through the same op kinds and the
+        // SAME depth `program_rmsnorm_chains` walks, plus the shape-preserving elementwise converts
+        // (a convert is one-for-one on elements, so the extent the broadcast must prove is
+        // unchanged across it — the arm's own comment states the proof, and the law the binding
+        // obeys: the convert EMITS and the consumer binds its result, never its operand). The
+        // `tensor.empty` second operand is the broadcast's `outs` init and carries no data, so only
+        // operand 0 is followed.
         let Some(mut cursor) = bc.operands.first().copied() else {
             return err(format!(
                 "{}: `linalg.broadcast` has no source operand",
@@ -1338,8 +1663,15 @@ fn program_broadcast_chains(
         };
         let mut chain = vec![res];
         let mut saw_degenerate_expand = false;
+        // ⭐⭐⭐ THE OUTERMOST CONVERT THE WALK CROSSED, if it crossed one — the value the
+        // consumer's operand BINDS (see the convert arm). `None` until a convert is crossed,
+        // and then never overwritten: the loop walks OUTWARD from the broadcast, so the FIRST
+        // convert crossed is the outermost — the one whose result the collapse/broadcast chain
+        // actually sprays.
+        let mut crossed_convert: Option<Ssa> = None;
         for _ in 0..3 {
             let Some(d) = def_of(cursor) else { break };
+            let mut convert_hop = false;
             match d.op_type {
                 OpKind::TensorExpandShape => {
                     // ⛔ THE DEGENERATE DIM IS WHAT MAKES THIS A BROADCAST. `TargetShape` states the
@@ -1457,9 +1789,92 @@ fn program_broadcast_chains(
                         None => break,
                     }
                 }
+                // ⭐⭐⭐⭐⭐ A SHAPE-PRESERVING ELEMENTWISE CONVERT IS TRAVERSED ONLY TO PROVE THE
+                // EXTENT — IT IS NEVER PLUMBING, AND THE CONSUMER NEVER BINDS ITS OPERAND.
+                // `arith.sitofp`/`extf`/`truncf` are elementwise — one result element per
+                // operand element, converted — so the EXTENT the broadcast has to prove is
+                // unchanged across the hop and the walk keeps going to the load whose own
+                // window states the vector-ness (the second proof below). But a convert
+                // changes the value's ENCODING, not just its shape: the bytes on the two
+                // sides of the hop are NOT the same value, so the consumer binds the
+                // OUTERMOST crossed convert's RESULT — a minted intermediate the main walk
+                // emits through `Lowering::Convert` — and never the load the convert reads.
+                //
+                // ⛔ MEASURED ON THE CARD (front-b-noise, round 3, nickm2): binding the load
+                // made the sampler's `noise·gate` multiply read the per-row gate's RAW
+                // SENUINT32 placement as IEEE_FP32 — the staged u32 word 1 read as the
+                // denormal 2^-149, an effective gate of 2^-127 — so score lost its noise
+                // term entirely (score = the dl16-staggered x to denormal precision, t2 =
+                // fl(g·2^-127) bit-proven) and the pick collapsed to argmax at every
+                // temperature: greedy accidentally correct, sampling silently greedy.
+                //
+                // The proof the hop itself takes is the same class the reshape hop takes:
+                // an equality stated by the IR itself, with the convert's own shape (its
+                // `Shape`, which `to_ktir_emit`'s `state_shape_and_dtype` post-pass stamps
+                // from the result type) on one side and its operand's (the producer's own
+                // statement — the next hop out, which the loop is about to walk to anyway)
+                // on the other. A convert whose two stated shapes disagree is a real data
+                // movement this door cannot express, named rather than traversed; one that
+                // states either side not at all stops the walk AT the convert's result,
+                // where the load-window proof below honestly fails, rather than guessing
+                // the traversal.
+                OpKind::ArithSitofp | OpKind::ArithExtf | OpKind::ArithTruncf => {
+                    let dims_of = |o: &Operation<'static>| {
+                        o.attributes
+                            .iter()
+                            .find_map(|(k, v)| match (k, v) {
+                                (AttrKey::Shape, Attr::IntList(s)) => Some(s.to_vec()),
+                                _ => None,
+                            })
+                            .or_else(|| {
+                                o.result_type
+                                    .as_ref()
+                                    .and_then(|t| t.dims().map(|ds| ds.to_vec()))
+                            })
+                    };
+                    let result_dims = dims_of(d);
+                    let operand_dims = d
+                        .operands
+                        .first()
+                        .and_then(|&s| def_of(s))
+                        .and_then(dims_of);
+                    match (result_dims, operand_dims) {
+                        (Some(r), Some(o)) if r == o => {
+                            // The hop is proven shape-preserving, so the walk continues to
+                            // the load for the extent proofs — and the convert EMITS: its
+                            // result leaves `chain` (below), so the main walk lowers it, and
+                            // the FIRST convert crossed is the outermost whose result the
+                            // consumer binds.
+                            if crossed_convert.is_none() {
+                                crossed_convert = Some(cursor);
+                            }
+                            convert_hop = true;
+                        }
+                        (Some(r), Some(o)) => {
+                            return err(format!(
+                                "{}: `{:?}` converts a {o:?}-shaped operand to {r:?} — an \
+                                 elementwise convert is one-for-one on elements, so a dims \
+                                 change is a real data movement, not the shape-preserving hop \
+                                 a broadcast chain traverses. The broadcast's source would be \
+                                 a relayout this door cannot express, so it is named rather \
+                                 than mis-addressed",
+                                f.name, d.op_type
+                            ));
+                        }
+                        // Either side's dims are not stated here: stop AT the convert's result
+                        // and let the consumer's own region lookup name what cannot be found,
+                        // rather than guessing the traversal.
+                        _ => break,
+                    }
+                }
                 _ => break,
             }
-            chain.push(cursor);
+            // ⭐ A CROSSED CONVERT'S RESULT IS NOT PLUMBING — it emits through the main walk's
+            // `Lowering::Convert` arm — so it never enters `chain`, whose every member is
+            // "lowered by nothing". The consumer binds it through `crossed_convert` instead.
+            if !convert_hop {
+                chain.push(cursor);
+            }
             let Some(next) = d.operands.first().copied() else {
                 break;
             };
@@ -1642,7 +2057,14 @@ fn program_broadcast_chains(
         map.insert(
             res,
             Bcast {
-                src: cursor,
+                // ⭐⭐⭐ THE CONSUMER BINDS THE OUTERMOST CROSSED CONVERT'S RESULT when the walk
+                // crossed one — the minted intermediate that convert emits into — and the
+                // final cursor otherwise. The extent proofs above read the CURSOR (the load)
+                // either way: the convert is traversed to PROVE the extent, never to bind. A
+                // consumer binding the load would read the convert's OPERAND with the
+                // consumer's own format — the raw-encoding defect the round-3 card leg
+                // measured (see the convert arm).
+                src: crossed_convert.unwrap_or(cursor),
                 axis,
                 flat,
             },
@@ -1972,16 +2394,52 @@ fn windowed_region(k: &KtirNode, mut r: Region, tile: &Operation<'_>) -> Result<
     // parameter walk's fold.
     if row.is_some_and(|s| !consts.contains_key(&s)) {
         r.r_cover = (rs, rs.saturating_add(r_len));
+        // ⭐⭐⭐ AND THE TYPED BAND RIDES THE REGION — the flush band the launch's own
+        // tiles tile. This is the ONE construction site in the crate (`RowBand::flush`
+        // is `pub(crate)` and named for this arm): the band can equal the whole view
+        // (base 0, band == rows — the batched sampler's `pid`-cornered `[1, ·]` tiles
+        // over `[B, ·]`), which no extent test can tell from an ordinary whole-view
+        // read, so the mint reads it back as a TYPE. See [`RowBand`].
+        r.band = Some(RowBand::flush(tr, positions as u32));
     }
     Ok(r)
 }
 
 /// The rows a banded op's minted intermediate must hold: a WINDOWED input's band (`r_len`), or
 /// `logical` when every input is whole-view. See the mint's own doc for the full argument.
+///
+/// ⭐⭐⭐ A FLUSH BAND COUNTS EVEN WHEN IT EQUALS THE VIEW — that is the whole reason
+/// [`RowBand`] is typed. A `pid`-cornered `[1, ·]` tile over a `[B, ·]` view resolves as
+/// the band `[0, B)` — shape-identical to a whole-view read, invisible to the
+/// `r_cover != (0, v_rows)` test above — so the typed field is the one witness, and the
+/// mint must size to the band (`[B, ·]`) exactly as rope's mint sizes to `[1024, ·]`.
 fn band_rows_of(ins: &[Region], logical: u32) -> u32 {
     ins.iter()
-        .find(|x| x.r_cover != (0, x.v_rows))
+        .find(|x| x.r_cover != (0, x.v_rows) || x.band.is_some())
         .map_or(logical, |x| x.r_len)
+}
+
+/// The ONE band a set of inputs states, refusing disagreement: an op sweeps one band,
+/// and a mint between two differently-banded inputs would size to whichever it saw
+/// first. `None` when no input is banded — the ordinary case, byte-identical to before.
+fn band_of(name: &str, ins: &[Region]) -> Result<Option<RowBand>, Error> {
+    let mut stated: Option<RowBand> = None;
+    for x in ins {
+        if let Some(b) = x.band {
+            match stated {
+                None => stated = Some(b),
+                Some(prev) if prev == b => {}
+                Some(prev) => {
+                    return err(format!(
+                        "{name}: the op reads inputs banded differently ({prev:?} vs {b:?}) — \
+                         one op sweeps one band, and a mint between them would size to whichever \
+                         it saw first"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(stated)
 }
 
 /// The [`Region`] of the parameter that operand `slot` of a TILE op reinterprets — the tail both the
@@ -2501,6 +2959,288 @@ fn mint_inter(k: &KtirNode, layout: &BundleLayout, floor: u32, ssa: Ssa) -> u32 
     tid
 }
 
+/// ⭐⭐⭐ THE ARRANGEMENT PROPAGATION — which of a node's PARAMETERS the bake must stage in a
+/// STAGGERED arrangement, decided ENTIRELY at bake time off the TARGET-ABI CONST TABLE.
+///
+/// The `dl16tofp32` widen writes its output lane-permuted when both operands are standard (the
+/// measured stagger — see [`crate::element_arrangement`]). That is a fact about the OPCODE, so
+/// it is stated as a const table row ([`crate::element_arrangement::OP_OUTPUT_ARRANGEMENT`])
+/// and THIS pass takes the table as input: a convert's output carries whatever arrangement its
+/// row states, a POINTWISE op propagates the stagger to every same-width operand and its output
+/// (the device reads operand buffers lane-for-lane, so a standard-staged operand of a staggered
+/// op would be read permuted — the mixing refusal below), and a REDUCTION ends it (the stagger
+/// permutes within 64-element blocks; a reduction over the multiset is order-free). A
+/// `[m, 1]` broadcast (`Col`) is order-free the same way — one scalar per row. Everything the
+/// pass decides is a BUILD-TIME fact: the marked parameters' staged bytes are emitted already
+/// permuted ([`crate::wiring`]'s builders are pure in the arrangement), and the runtime only
+/// indexes. The worker decides NOTHING.
+///
+/// ⛔ TWO REFUSALS, BOTH BY NAME, both `cargo build` failures at expansion — the typed guard the
+/// arrangement cannot reach as a handle kind:
+///
+/// * a staggered value meeting a COMPUTED standard one where order matters (pointwise over a
+///   full-width operand that is neither staggered nor a parameter the bake can restage);
+/// * a staggered value reaching a `ktdp.store` — the host read-back channel is standard-order,
+///   so a stored stagger is a permuted answer by construction, refused here rather than read.
+///
+/// Returns the marked parameters: buffer tid → the arrangement to stage. Parameters the pass
+/// never marks stay [`ElementArrangement::Standard`], and the map is EMPTY for every program
+/// with no staggered convert — a decoder layer changes nothing.
+pub fn staggered_sources(
+    k: &KtirNode,
+) -> Result<std::collections::BTreeMap<u32, crate::element_arrangement::ElementArrangement>, Error>
+{
+    use crate::element_arrangement::ElementArrangement;
+    let f = &k.func;
+    let mut arr: std::collections::HashMap<Ssa, ElementArrangement> =
+        std::collections::HashMap::new();
+    let mut marked = std::collections::BTreeMap::new();
+    // The same chain analyses the walk reads, so the propagation and the lowering cannot
+    // disagree about which op is which — the classification below is the walk's own, verbatim.
+    let silus = program_silu_mul_chains(f)?;
+    let rmsnorms = program_rmsnorm_chains(f)?;
+    let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
+    let equal_masks = program_equal_masks(f)?;
+
+    for op in f.operations.iter() {
+        if is_plumbing(op.op_type) {
+            continue;
+        }
+        if op.result.is_some_and(|r| {
+            silus.iter().any(|c| c.consumed.contains(&r))
+                || rmsnorms.iter().any(|c| c.consumed.contains(&r))
+                || bcast_consumed.contains(&r)
+                || equal_masks.consumed.contains(&r)
+        }) {
+            continue;
+        }
+        let terminal = silus.iter().find(|c| op.result == Some(c.mul));
+        let reduce = (op.op_type == OpKind::LinalgReduce)
+            .then(|| reduce_kind_of(op))
+            .flatten();
+        let scalar = (op.op_type == OpKind::ArithMulf)
+            .then(|| splat_scale_of(f, op))
+            .flatten();
+        let bound_scale = if op.op_type == OpKind::ArithMulf && scalar.is_none() {
+            bound_scale_of(k, op)?
+        } else {
+            None
+        };
+        let rms = rmsnorms.iter().find(|c| op.result == Some(c.out));
+        let equal = (op.op_type == OpKind::ArithUitofp)
+            .then(|| {
+                op.result
+                    .and_then(|r| equal_masks.by_retype.get(&r).copied())
+            })
+            .flatten();
+        let convert = convert_kind_of(f, op)?;
+        let Some(program) = terminal
+            .map(|c| {
+                if c.up.is_some() {
+                    Lowering::Silu
+                } else {
+                    Lowering::Node(Program::Elementwise(Elementwise::Silu))
+                }
+            })
+            .or(rms.map(|c| Lowering::RmsNorm(c.eps, c.ones)))
+            .or(reduce.map(Lowering::Reduce))
+            .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
+            .or(bound_scale.map(Lowering::BoundScalarMul))
+            .or(equal.map(|_| Lowering::Node(Program::Elementwise(Elementwise::Equal))))
+            .or(convert.map(Lowering::Convert))
+            .or_else(|| program_of(op.op_type).map(Lowering::Node))
+        else {
+            // An op the walk cannot lower is the walk's own by-name refusal — the bake fails
+            // there with the richer message, so the propagation has nothing to say about it.
+            continue;
+        };
+        let n_in = match program {
+            Lowering::Silu => 2,
+            Lowering::Reduce(_) => 1,
+            Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_) => 1,
+            Lowering::RmsNorm(..) => 2,
+            Lowering::Convert(_) => 1,
+            Lowering::Node(Program::Matmul) => 2,
+            Lowering::Node(Program::Elementwise(e)) => {
+                match super::lower_ktir_to_superdsc::elementwise_op_func(f.name, e) {
+                    Ok((_, arity)) => arity,
+                    // The walk refuses this op after us; the propagation does not need its arity.
+                    Err(_) => op.operands.len(),
+                }
+            }
+            Lowering::Node(Program::Transpose) => 1,
+            Lowering::IntBinary(_) => 2,
+            Lowering::Node(_) => op.operands.len(),
+        };
+        let raw_in: Vec<Ssa> = match (terminal, scalar, bound_scale) {
+            _ if rms.is_some() => {
+                let c = rms.expect("just matched");
+                vec![c.x, c.gamma]
+            }
+            _ if equal.is_some() => {
+                let (a, b) = equal.expect("just matched");
+                vec![a, b]
+            }
+            (Some(c), _, _) => match c.up {
+                Some(up) => vec![c.gate, up],
+                None => vec![c.gate],
+            },
+            (None, Some((_, tensor)), _) => vec![tensor],
+            (None, None, Some(b)) => vec![b.tensor],
+            (None, None, None) => op.operands.iter().copied().take(n_in).collect(),
+        };
+        // One input's (SOURCE, ORDER-FREENESS). The ruling's semantics are a SHAPE fact, not a
+        // spelling fact: an operand that supplies ONE SCALAR PER OUTPUT ROW is order-free — a
+        // `Col` broadcast chain, a `[·, 1]` parameter, or a computed per-row value (a reduce
+        // result) whose own type states the degenerate column — while a dense operand, an
+        // `Mb`/`Y` spray and a `[1, ·]` row are read LANE FOR LANE, so the consumer's
+        // arrangement is the operand's. Read off the broadcast chain when the program spells
+        // one, and off the operand's OWN region/type when it does not (Triton's implicit
+        // broadcast needs no chain, and the emitter selects the operand mode from the same
+        // degenerate extent).
+        let dims_of = |v: Ssa| -> Option<&'static [i64]> {
+            f.operations
+                .iter()
+                .find(|o| o.result == Some(v))
+                .and_then(|o| o.result_type)
+                .and_then(|t| t.dims())
+        };
+        let resolved = |v: Ssa| -> (Ssa, bool) {
+            match bcasts.get(&v) {
+                Some(b) => (b.src, b.axis == BcastAxis::Col),
+                None => {
+                    let per_row = match region_for_operand(k, v) {
+                        // A parameter: the VIEW's own column extent decides.
+                        Ok(Some(r)) => r.c_len == 1,
+                        // A value this function computed: its own result type's shape decides —
+                        // `[·, 1]` or rank-1 `[rows]` is the per-row vector a reduce produces.
+                        _ => {
+                            matches!(dims_of(v), Some(d) if d.len() == 1 || *d.last().unwrap_or(&0) == 1)
+                        }
+                    };
+                    (v, per_row)
+                }
+            }
+        };
+        // `arr` is mutated inside the marking loop below, so this is a fn taking the map rather
+        // than a closure borrowing it.
+        fn staggered(arr: &std::collections::HashMap<Ssa, ElementArrangement>, v: Ssa) -> bool {
+            arr.get(&v) == Some(&ElementArrangement::Dl16ToFp32)
+        }
+        let out_arr = match program {
+            // A REDUCTION IS ORDER-FREE: the stagger permutes within 64-element blocks and the
+            // reduction's answer is a function of the multiset, so the stagger ends here.
+            Lowering::Reduce(_) => ElementArrangement::Standard,
+            // THE ONLY PLACE AN ARRANGEMENT IS DECIDED: the convert's own const-table row.
+            Lowering::Convert(kind) => {
+                crate::element_arrangement::output_arrangement_of(kind.op_func())
+                    .unwrap_or(ElementArrangement::Standard)
+            }
+            // POINTWISE — the stagger propagates through it, and every same-width operand that
+            // is read lane-for-lane must agree with the output's arrangement.
+            Lowering::Silu
+            | Lowering::ScalarMul(_)
+            | Lowering::BoundScalarMul(_)
+            | Lowering::RmsNorm(..)
+            | Lowering::Node(Program::Elementwise(_)) => {
+                let mut out = ElementArrangement::Standard;
+                for v in &raw_in {
+                    let (src, order_free) = resolved(*v);
+                    if !order_free && staggered(&arr, src) {
+                        out = ElementArrangement::Dl16ToFp32;
+                    }
+                }
+                if out == ElementArrangement::Dl16ToFp32 {
+                    for v in &raw_in {
+                        let (src, order_free) = resolved(*v);
+                        if order_free || staggered(&arr, src) {
+                            continue;
+                        }
+                        // A standard full-width operand of a staggered op would be READ
+                        // permuted. It must be a PARAMETER the bake can restage — anything
+                        // this function computed is the mixing refusal.
+                        match region_for_operand(k, src)? {
+                            Some(r) => {
+                                marked.insert(r.tid, ElementArrangement::Dl16ToFp32);
+                                // ⭐ AND THE VALUE CARRIES IT FROM NOW ON: a marked parameter is
+                                // staged staggered, so every LATER consumer reads it in the
+                                // arrangement — the sampler's `selG = (gramp == jG)` reads the
+                                // same `gramp` the marking op did, and its output must come out
+                                // staggered or the one-hot chain mixes arrangements two ops
+                                // later. Without this, the second read sees a standard value and
+                                // the mixing refusal fires on a program the device computes
+                                // consistently.
+                                arr.insert(src, ElementArrangement::Dl16ToFp32);
+                            }
+                            None => {
+                                return err(format!(
+                                    "{}: a standard value this function computed meets a \
+                                     staggered one at `{:?}` — the pointwise lane order is the \
+                                     stagger's, so the standard operand would be read permuted. \
+                                     Stage the operand through the arrangement (a parameter the \
+                                     bake can restage) or reduce before the mix",
+                                    f.name, op.op_type
+                                ));
+                            }
+                        }
+                    }
+                }
+                out
+            }
+            // EVERY OTHER PROGRAM — matmul, transpose, the fused attention kinds — addresses its
+            // operands in an order of its own, so a staggered input has no staging that is
+            // correct. Refused by name rather than lowered as the nearest arrangement.
+            _ => {
+                for v in &raw_in {
+                    let (src, order_free) = resolved(*v);
+                    if !order_free && staggered(&arr, src) {
+                        return err(format!(
+                            "{}: a staggered value reaches `{:?}`, whose addressing is not \
+                             lane-for-lane pointwise — there is no arrangement to stage the \
+                             operand in. Reduce before the op, or keep the stagger inside the \
+                             pointwise island",
+                            f.name, op.op_type
+                        ));
+                    }
+                }
+                ElementArrangement::Standard
+            }
+        };
+        // ⛔ A CONVERT'S OWN STAGGERED INPUT is a composition of two arrangements the table
+        // does not state — refused before the output's row is applied.
+        if matches!(program, Lowering::Convert(_))
+            && raw_in
+                .first()
+                .is_some_and(|v| staggered(&arr, resolved(*v).0))
+        {
+            return err(format!(
+                "{}: a staggered value enters a dtype-convert — the composition of the stagger \
+                 with the convert's own output arrangement is not a fact the const table \
+                 states, so it is refused rather than guessed. Reduce before the convert",
+                f.name
+            ));
+        }
+        if let Some(r) = op.result {
+            arr.insert(r, out_arr);
+            // ⛔ AND A STAGGERED VALUE NEVER REACHES A STORE: the host read-back channel is
+            // standard-order, so a stored stagger is a permuted answer by construction.
+            if out_arr == ElementArrangement::Dl16ToFp32
+                && f.operations.iter().any(|s| {
+                    s.op_type == OpKind::KtdpStore && s.operands.first().copied() == Some(r)
+                })
+            {
+                return err(format!(
+                    "{}: a staggered value is stored — the host read-back channel reads \
+                     standard order, so the store would answer permuted. Reduce before the \
+                     store (the arrangement ends at a reduction)",
+                    f.name
+                ));
+            }
+        }
+    }
+    Ok(marked)
+}
+
 pub fn lower_function(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
@@ -2579,7 +3319,11 @@ pub fn lower_function(
     // THE BROADCAST PLUMBING, read before the walk for the same reason: these ops lower to NOTHING and
     // the consumer carries the broadcast as an operand mode. See [`program_broadcast_chains`].
     let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
-    // ⭐⭐⭐ THE GATHERS THE PROGRAM STATES, read ONCE and from [`gathers_of`] — the same joins the
+    // THE EQUALITY MASKS, read before the walk for the same reason the silus are: the device's
+    // `OpFunc::Equal` is ONE op and KTIR spells it as two (`cmpf` + `uitofp`), so the comparison
+    // is chain-interior and the RETYPE is the terminal this walk lowers. See
+    // [`program_equal_masks`].
+    let equal_masks = program_equal_masks(f)?; // ⭐⭐⭐ THE GATHERS THE PROGRAM STATES, read ONCE and from [`gathers_of`] — the same joins the
     // per-`Program` door's `gather_of` makes, so the two doors cannot disagree about which parameter
     // is the table or which is the index. A program with ONE indirect tile reads identically to
     // `gather_of`; a program with SEVERAL is either the unrolled-sweep shape (every tile over the
@@ -2611,9 +3355,22 @@ pub fn lower_function(
         rmsnorms: &rmsnorms,
         gathered_loads: &gathered_loads,
     };
+    // ⭐ THE INTEGER COMPUTE SET — [`integer_compute_of`]'s own doc states the fixpoint. Read once
+    // here so the loop-top exemption and the derivation arm below read ONE set and cannot
+    // disagree about which integer op is data.
+    let int_compute = integer_compute_of(f);
 
     for op in f.operations.iter() {
-        if is_plumbing(op.op_type) {
+        // ⭐ THE ONE `is_plumbing` EXEMPTION: an integer arith op [`integer_compute_of`] classified
+        // as COMPUTE is data, not addressing, and lowers through [`Lowering::IntBinary`] below.
+        // Every other plumbing op — including every integer op of every kernel that bakes today,
+        // whose consumers are all tiles and splats — keeps the skip verbatim.
+        if is_plumbing(op.op_type)
+            && !(matches!(
+                op.op_type,
+                OpKind::ArithMuli | OpKind::ArithAddi | OpKind::ArithSubi
+            ) && op.result.is_some_and(|r| int_compute.contains(&r)))
+        {
             continue;
         }
         // The chain's INTERIOR — negate, exp, 1+, divide — is lowered by nothing at all: the one
@@ -2625,6 +3382,9 @@ pub fn lower_function(
                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
                 // The expand/collapse/broadcast chain itself: no descriptor, the consumer states it.
                 || bcast_consumed.contains(&r)
+                // An equality mask's `arith.cmpf`: the fold destroyed the i1, and the `uitofp`
+                // terminal below stands for the pair.
+                || equal_masks.consumed.contains(&r)
                 // An fp8 dot's absorbed scale mulf: it rode into the dot's emission above.
                 || fp8_epilogue.contains(&r)
                 // A row-folded family's non-leader block: the leader's one whole-view descriptor
@@ -2668,6 +3428,42 @@ pub fn lower_function(
         // An rmsnorm chain's TERMINAL gain multiply becomes the one fused program. Checked before the
         // splat arm and before the 1:1 map, both of which would otherwise claim it.
         let rms = rmsnorms.iter().find(|c| op.result == Some(c.out));
+        // AN EQUALITY MASK'S RETYPE is the fold's terminal: the `Elementwise(Equal)` stands for the
+        // `cmpf(oeq)`+`uitofp` pair, and its inputs are the comparison's own operands (resolved
+        // below). Checked before the 1:1 map, which has no `ArithUitofp` arm — an unfolded retype
+        // falls to the by-name refusal, correctly.
+        let equal = (op.op_type == OpKind::ArithUitofp)
+            .then(|| {
+                op.result
+                    .and_then(|r| equal_masks.by_retype.get(&r).copied())
+            })
+            .flatten();
+        // A dtype-convert cast, 1:1 in (op kind, element pair) — see [`convert_kind_of`]. `Err` for
+        // an `extf`/`fptosi` whose pair is outside the two recipes (the named refusal lives there);
+        // `None` for every other op kind, which falls through to the 1:1 map.
+        let convert = convert_kind_of(f, op)?;
+        // An integer arith op the loop top admitted (so [`integer_compute_of`] proved it data).
+        // `None` for every non-integer op; a `muli`/`addi` outside the compute set never reaches
+        // here (the loop top skipped it), so the arm cannot fire for addressing.
+        let int_binary = match op.op_type {
+            OpKind::ArithMuli => Some(Lowering::IntBinary(IntBinary::Mul)),
+            OpKind::ArithAddi => Some(Lowering::IntBinary(IntBinary::Add)),
+            // ⛔ `subi` IS DATA when the fixpoint says so (the loop top admitted it), but the
+            // device's integer vocabulary has no subtract — the card's own `addi32toi32` with a
+            // negated operand is the spelling, and choosing it here would rewrite the producer's
+            // arithmetic. Refused by name, never silently re-meaned.
+            OpKind::ArithSubi => {
+                return err(format!(
+                    "{}: an `arith.subi` this walk classifies as integer COMPUTE — the device's \
+                     integer vocabulary has no subtract (arch_enums.cpp's opFuncs carry \
+                     addi32toi32/muli32toi32 only), and rewriting `a - b` as `a + (-b)` here would \
+                     re-mean the producer's arithmetic rather than lower it. State the negation \
+                     in the kernel and keep the add",
+                    f.name
+                ));
+            }
+            _ => None,
+        };
         let Some(program) = terminal
             .map(|c| {
                 if c.up.is_some() {
@@ -2684,6 +3480,9 @@ pub fn lower_function(
             .or(reduce.map(Lowering::Reduce))
             .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
             .or(bound_scale.map(Lowering::BoundScalarMul))
+            .or(equal.map(|_| Lowering::Node(Program::Elementwise(Elementwise::Equal))))
+            .or(convert.map(Lowering::Convert))
+            .or(int_binary)
             .or_else(|| program_of(op.op_type).map(Lowering::Node))
         else {
             return err(format!(
@@ -2693,6 +3492,14 @@ pub fn lower_function(
                 f.name, op.op_type
             ));
         };
+
+        // ⭐ THE OP'S OWN RESULT FORMAT, read off the result type and never assumed: every op this
+        // door had lowered before the fp32 island is fp16, and the island's multiply-add states
+        // F32. It is threaded to the MINT (the intermediate reserves the ACTUAL dtype's width —
+        // an f32 buffer at an fp16 reservation is half the bytes, aliased onto the next tensor)
+        // and to the ELEMENTWISE EMISSION (the stick basis and `dataFormat_` are the dtype's own
+        // facts). Read once here so no consumer re-derives it and drifts.
+        let op_df = result_df_of(f.name, op)?;
 
         // THE WEIGHT'S ORIENTATION, PROVEN FROM THE MAPS before any extent is trusted. See
         // [`BOrient`]: the extent guards downstream cannot distinguish the two framings when
@@ -2719,6 +3526,12 @@ pub fn lower_function(
             Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_) => 1,
             // x and gamma; the epsilon, `1/cols` and the oneplus offset are the fused body's own.
             Lowering::RmsNorm(..) => 2,
+            // A dtype-convert reads ONE tensor; the formats ride the `OpFunc`
+            // (`convert_dtypes`), never the operand list.
+            Lowering::Convert(_) => 1,
+            // A wrapping i32 binary reads TWO tensors; the format (SENUINT32) rides the op's
+            // own result type through `op_df`.
+            Lowering::IntBinary(_) => 2,
             Lowering::Node(Program::Matmul) => 2,
             Lowering::Node(Program::Elementwise(e)) => {
                 match super::lower_ktir_to_superdsc::elementwise_op_func(f.name, e) {
@@ -2737,6 +3550,13 @@ pub fn lower_function(
             _ if rms.is_some() => {
                 let c = rms.expect("just matched");
                 vec![c.x, c.gamma]
+            }
+            // THE EQUALITY MASK's inputs are the comparison's own two operands, not the retype's
+            // (the retype reads the i1 the fold destroys). The broadcast resolution below then
+            // applies to them exactly as it would to a spelled two-tensor op's.
+            _ if equal.is_some() => {
+                let (a, b) = equal.expect("just matched");
+                vec![a, b]
             }
             (Some(c), _, _) => match c.up {
                 Some(up) => vec![c.gate, up],
@@ -2758,7 +3578,7 @@ pub fn lower_function(
         // the recogniser proved is then CHECKED against that region's shape below rather than trusted:
         // two independent facts about the same operand, so a chain whose axis and extent disagree
         // cannot address a full tile as a vector.
-        let bcast_axes: Vec<Option<BcastAxis>> = in_values
+        let mut bcast_axes: Vec<Option<BcastAxis>> = in_values
             .iter()
             .map(|v| bcasts.get(v).map(|b| b.axis))
             .collect();
@@ -2898,6 +3718,51 @@ pub fn lower_function(
                      statements about the same operand and they disagree, so neither is believed.",
                     f.name, op.op_type, r.tid, r.v_rows, r.c_len,
                 ));
+            }
+        }
+
+        // ⭐⭐⭐⭐⭐ THE BAND'S OWN `Mb` DERIVATION — a shared single-row table against a banded
+        // sweep (auditor-approved with the band design, 2026-10-27). A flush band's per-row
+        // operand is `[B, n]` while the tables it combines with are functions of the vocab
+        // alone — whole-view `[1, n]` parameters the program never spells a
+        // `linalg.broadcast` for (Triton's implicit broadcast folds into the load's own tile
+        // shape), so `bcasts` states no axis and the DENSE path's extents law refuses. The
+        // device expresses it exactly: an `Mb` operand is one row of values sprayed over the
+        // rows, `In::mb`'s own mode. The derivation is keyed on the TYPED band, never a
+        // shape guess: it fires only when an input CARRIES a band (`RowBand`, constructed
+        // only by `windowed_region`'s uniform-row arm) whose height exceeds one row, and
+        // only for the kinds whose door consumes the axis — the elementwise door (the
+        // original admission) and, since wall 10 (auditor GO 2026-10-27, the intmb
+        // scatter-harness leg), the INTEGER door: the batched sampler's hash is an
+        // `IntBinary` mixing the whole-row `lane` table (`[1, PAD_V]` i32) with the
+        // band-typed tile (`sample_fwd.py`'s `h = lane * hc1 + slo`), the same
+        // program-invariant-table law this derivation states. The operand must be
+        // whole-view single-row at row 0, un-banded, and as wide as the OUTPUT's own column
+        // extent — the width check is against the op's stated result, not against a sibling
+        // input, because the banded operand beside the table can be the reduce's `[B, 1]`
+        // per-row scalar (mode `Col`), whose one column says nothing about the spray's width.
+        // A table wider or narrower than the output is still refused by name at the extents
+        // law below; every existing kernel (no banded input) is untouched.
+        if matches!(
+            program,
+            Lowering::Node(Program::Elementwise(_)) | Lowering::IntBinary(_)
+        ) && let Some(band) = band_of(f.name, &per_op)?
+            && band.height() > 1
+        {
+            let out_cols = op
+                .result_type
+                .and_then(|t| t.dims())
+                .and_then(|d| d.last().copied());
+            for (i, x) in per_op.iter().enumerate() {
+                if bcast_axes[i].is_none()
+                    && x.band.is_none()
+                    && x.r_start == 0
+                    && x.r_cover == (0, x.v_rows)
+                    && x.v_rows == 1
+                    && out_cols == Some(x.c_len as i64)
+                {
+                    bcast_axes[i] = Some(BcastAxis::Mb);
+                }
             }
         }
 
@@ -3309,7 +4174,7 @@ pub fn lower_function(
             // whole-function intermediate (the worker's weight zero-pad is the one on the
             // per-`Program` path), so it reserves what the emitter addresses.
             //
-            // ⛔ AND ONLY THE MATMUL ARM, because a POINTWISE result's bump is OPTIONAL and the
+            // ⛔ AND ONLY THE MATMUL AND CONVERT ARMS, because a POINTWISE result's bump is OPTIONAL and the
             // consumer side already yields to the layout: `pointwise_width_the_output_holds`
             // caps a pointwise emission at the width its operands' placements actually hold, so a
             // pointwise intermediate minted LOGICAL is read and written at its logical width
@@ -3340,9 +4205,38 @@ pub fn lower_function(
                         DeviceWidth::for_matmul(dims[0], dims[1], k, true).get(),
                     ]
                 }
+                // ⭐⭐⭐ A CONVERT'S INTERMEDIATE IS RESERVED AT THE **DEVICE** WIDTH TOO (the β
+                // ruling, front-b-noise, auditor 2026-10-27) — the SAME precedent, a different
+                // producer rule. The door's β admission widens a sub-device-width column window
+                // (the crossed convert's minted `[B, 1]` result, the sampler's gate chain) to
+                // `DeviceWidth::for_convert` — the 64-element device width our own PlanCorelets
+                // demands of a tile and `convert_opspec`'s own fp16-stick basis states — and the
+                // emitter then SWEEPS that width over the buffer this mint reserves: a mint at
+                // the logical `[B, 1]` (128 B/row) is half the bytes the convert addresses
+                // (256 B/row), the exact `resolve_seg_base` over-run shape the matmul arm
+                // records. ONE decision for the reservation and the sweep (`for_convert`), so
+                // they cannot disagree. A fixed point at every 64-multiple — every convert
+                // intermediate ever minted is full-row-width, so this arm is byte-identical for
+                // all of them. The REGION stays `[B, 1]`: the consumer's Col window reads row
+                // r's FIRST stick alone (the pad words the convert writes past it are never
+                // read), the same inert-pad claim the matmul arm makes.
+                Lowering::Convert(_) => [dims[0], DeviceWidth::for_convert(dims[1]).get()],
                 _ => dims,
             };
-            layout.synth(crate::place::PlaceId::Act(tid), &dev_dims);
+            // ⭐ THE MINT RESERVES THE OP'S OWN RESULT FORMAT — `synth` is `synth_df(Fp16)`, and
+            // an f32 intermediate (the widen island's multiply-add results) at an fp16
+            // reservation is HALF the bytes the emission writes: the footprint guard would
+            // refuse the first over-run, or without it the next intermediate would be aliased.
+            // `synth_df` reserves the true width, the same fact `pointwise_broadcast_opspec_df`
+            // threads into the descriptors.
+            layout.synth_df(crate::place::PlaceId::Act(tid), &dev_dims, op_df);
+            // ⭐⭐⭐ THE BAND PROPAGATES THROUGH THE MINT — a banded op's intermediate is a
+            // banded operand of the NEXT op. The minted region states the band its inputs
+            // stated (`band_of` refuses a disagreement), so a chain of ops over a flush band
+            // mints every intermediate at the band's height: without this, the first mint
+            // would drop the typed fact and the second op's inputs would look whole-view
+            // again, minting `[1, ·]` while its per-row operands are `[B, ·]`.
+            let band = band_of(f.name, &per_op)?;
             let r = Region {
                 tid,
                 v_rows: dims[0],
@@ -3355,6 +4249,7 @@ pub fn lower_function(
                 c_cover: (0, dims[1]),
                 is_out: true,
                 is_fp8: false,
+                band,
             };
             inter.insert(res, r);
             per_op.push(r);
@@ -3370,6 +4265,7 @@ pub fn lower_function(
                     b_orient,
                     gather: op_gather.map(|(g, _, _)| g),
                     bcast: &bcast_axes,
+                    df: op_df,
                 },
             )?;
             out.append(&mut emitted);
@@ -3404,6 +4300,27 @@ pub fn lower_function(
         o = windowed_region(k, o, tile)?;
         o.is_out = true;
         per_op.push(o);
+        // ⭐⭐⭐ A STORED RESULT IS STILL READABLE. The value this op writes to the store's
+        // parameter lives in that parameter's buffer, and a LATER compute consumer of it
+        // (the noise probe's `u`: stored as an output AND fed to `log`) must find it there
+        // — without this record the consumer's lookup falls through to "a constant (a
+        // `tensor.splat`)", the walk's only other reading of a value it did not mint.
+        // `is_out` is cleared on the recorded copy: the semantic fact is "a readable
+        // buffer holding this value", and the consumer's own `present` already forces
+        // `is_out = false` at lookup, so the two statements cannot disagree.
+        //
+        // ⛔ BYTE-IDENTICAL FOR EVERY KERNEL THAT BAKES TODAY, BY THE WALK'S OWN REFUSAL:
+        // a stored result with a compute consumer never lowered before (this exact
+        // refusal fired), so the entry is dead weight unless a producer states the
+        // computes-then-stores-then-reads form. The fp8 epilogue's absorbed mulf rides
+        // the same insert safely — the contraction writes the SCALED result into the
+        // store's region (its own out-region law), so the bytes a consumer would read
+        // are the bytes the program states.
+        if let Some(res) = op.result {
+            let mut recorded = o;
+            recorded.is_out = false;
+            inter.insert(res, recorded);
+        }
 
         let mut emitted = emit_one(
             f.name,
@@ -3416,6 +4333,7 @@ pub fn lower_function(
                 b_orient,
                 gather: op_gather.map(|(g, _, _)| g),
                 bcast: &bcast_axes,
+                df: op_df,
             },
         )?;
         out.append(&mut emitted);
@@ -3493,6 +4411,11 @@ struct WalkProof<'a> {
     /// [`program_broadcast_chains`]) — positional with `per_op`'s inputs, empty when no operand is
     /// broadcast.
     bcast: &'a [Option<BcastAxis>],
+    /// THE OP'S OWN RESULT FORMAT, read off the result type ([`result_df_of`]) — `Fp16` for every
+    /// op this door lowered before the fp32 island, `Fp32` on the island's multiply-add. Read by
+    /// the `Elementwise` arm, which states it on the tile and every `TensorArg`; unread by the
+    /// arms whose formats ride other facts (the convert's ride its `OpFunc`).
+    df: Df,
 }
 
 /// Hand ONE op's regions to the body its `Program` names.
@@ -3513,6 +4436,7 @@ fn emit_one(
         b_orient,
         gather,
         bcast,
+        df,
     } = proof;
     // THE FUSED SILU. Reached only through [`program_silu_mul_chains`], which PROVED the five-op
     // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
@@ -3523,8 +4447,19 @@ fn emit_one(
         }
         // A BARE ROW REDUCTION. The entry point refuses a multi-row `max` by name — see its doc for
         // the measured device defect that makes that a correctness matter rather than a limitation.
+        // ⭐ THE OP'S OWN RESULT FORMAT RIDES IT ([`reduce_df`]): an fp16 reduce keeps the proven
+        // seeded body verbatim; an fp32 one (the island's `max`/`sum` over an f32 intermediate)
+        // rides the torch-spyre fp32-rmsnorm precedent's own df-carrying body, because the fp16
+        // descriptor would mis-stick every read of the fp32 buffer.
         Lowering::Reduce(kind) => {
-            return super::lower_ktir_to_superdsc::reduce(name, kind, per_op, sym_id_base, layout);
+            return super::lower_ktir_to_superdsc::reduce_df(
+                name,
+                kind,
+                per_op,
+                df,
+                sym_id_base,
+                layout,
+            );
         }
         // `tile * <constant>`, with the multiplier this op's own — `scalarmul_at` is the shared body
         // the per-`Program` door reaches through `scalarmul`, so the two cannot drift about what a
@@ -3572,6 +4507,29 @@ fn emit_one(
                 layout,
             );
         }
+        // A DTYPE-CONVERT — one input, one output, both the RowBlocked token stream, the formats
+        // riding the `OpFunc` through `convert_dtypes`. The same `assemble_convert` body the fp8
+        // quantiser's tail and the KSPLIT pair's own device recipe use, so the doors cannot
+        // drift about what a convert emits.
+        Lowering::Convert(kind) => {
+            return super::lower_ktir_to_superdsc::convert(name, kind, per_op, sym_id_base, layout);
+        }
+        // A WRAPPING i32 BINARY — two inputs, one output, all SENUINT32: dense and corner-free
+        // (B1's own measured form), plus the ONE-ROW `Col` broadcast operand mode through the
+        // SAME body the fp doors reach (see [`int_binary`]'s doc — that admission is MEASURED
+        // for BOTH kinds: the int-bcast add leg and the int-mul-bcast mul leg, nickm2,
+        // bit-for-bit, 512/512 lanes each; `Y`, `Mb`, the
+        // multi-row `Col` and every corner are refused there by name).
+        Lowering::IntBinary(kind) => {
+            return super::lower_ktir_to_superdsc::int_binary(
+                name,
+                kind,
+                per_op,
+                bcast,
+                sym_id_base,
+                layout,
+            );
+        }
         Lowering::Node(p) => p,
     };
     Ok(match program {
@@ -3613,9 +4571,15 @@ fn emit_one(
                 },
             )?
         }
-        Program::Elementwise(e) => {
-            super::lower_ktir_to_superdsc::elementwise(name, e, per_op, bcast, sym_id_base, layout)?
-        }
+        Program::Elementwise(e) => super::lower_ktir_to_superdsc::elementwise_df(
+            name,
+            e,
+            per_op,
+            bcast,
+            df,
+            sym_id_base,
+            layout,
+        )?,
         Program::Transpose => {
             super::lower_ktir_to_superdsc::transpose(name, per_op, sym_id_base, layout)?
         }
@@ -3784,6 +4748,7 @@ fn gathered_matmul_materializes(
         c_cover: (0, head),
         is_out: true,
         is_fp8: false,
+        band: None,
     };
     // ── (3) THE GATHERED IDENTITY COPY — the `test_gather_1core` shape, through the one body
     // that declares an index operand. One input (the table), `identity`, the intermediate as
@@ -4327,6 +5292,164 @@ mod broadcast_chain_tests {
             "names the relayout at the reshape itself: {m}"
         );
     }
+
+    /// WHAT THE SAMPLER'S GATE CHAIN LOOKS LIKE, from the post-fold KTIR of `sample_fwd.py`: the
+    /// kernel loads the per-row gate as a `[1, 1]` i32 window of the seed table (the hash's own
+    /// law makes that table i32), Triton's implicit promotion converts it to f32
+    /// (`sgate.to(tl.float32)`), the collapse drops the degenerate dim, and the broadcast sprays
+    /// the per-row scalar along the stick axis:
+    ///
+    /// ```text
+    /// %sgate_2 = KtdpLoad(...)                        Shape=[1, 1]
+    /// %gate = arith.sitofp(%sgate_2)                  Shape=[1, 1]
+    /// %score_5 = TensorCollapseShape(%gate)           TargetShape=[1]
+    /// %score_6 = TensorEmpty()                        Shape=[1, 64]
+    /// %score_7 = LinalgBroadcast(%score_5, %score_6)  Shape=[1, 64] Dimensions=[1]
+    /// ```
+    ///
+    /// `load_shape`/`conv_shape` state the two sides of the traversal's proof independently, so a
+    /// case can break the equality alone; `arg_source: true` replaces the load with a function
+    /// argument, the case whose operand side is stated NOWHERE.
+    fn chain_conv(
+        load_shape: &'static [i64],
+        conv_shape: &'static [i64],
+        arg_source: bool,
+        res: &'static [i64],
+    ) -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let (src, conv, col, emp, bc) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let sh = |op: Operation<'static>, s: &'static [i64]| {
+            op.with_attr(a, AttrKey::Shape, Attr::IntList(s))
+        };
+        let mut ops = vec![];
+        let mut args = vec![];
+        if arg_source {
+            args.push((src, IrType::Index));
+        } else {
+            ops.push(sh(
+                Operation::new(a, Some(src), OpKind::KtdpLoad, &[]),
+                load_shape,
+            ));
+        }
+        ops.push(sh(
+            Operation::new(a, Some(conv), OpKind::ArithSitofp, &[src]),
+            conv_shape,
+        ));
+        ops.push(
+            sh(
+                Operation::new(a, Some(col), OpKind::TensorCollapseShape, &[conv]),
+                &[1],
+            )
+            .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[1])),
+        );
+        ops.push(sh(
+            Operation::new(a, Some(emp), OpKind::TensorEmpty, &[]),
+            res,
+        ));
+        ops.push(
+            sh(
+                Operation::new(a, Some(bc), OpKind::LinalgBroadcast, &[col, emp]),
+                res,
+            )
+            .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[1])),
+        );
+        IRFunction {
+            name: "bcast_conv_probe",
+            arguments: a.args(args),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    fn refusal_conv(
+        load_shape: &'static [i64],
+        conv_shape: &'static [i64],
+        arg_source: bool,
+        res: &'static [i64],
+    ) -> String {
+        program_broadcast_chains(&chain_conv(load_shape, conv_shape, arg_source, res))
+            .err()
+            .map(|e| e.message)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a convert-chain refusal for load={load_shape:?} conv={conv_shape:?}"
+                )
+            })
+    }
+
+    /// ⭐⭐⭐ THE SAMPLER'S GATE CHAIN — load `[1, 1]` i32 → `sitofp` `[1, 1]` f32 → collapse →
+    /// broadcast `Dimensions=[1]`. The walk crosses the SHAPE-PRESERVING convert (the IR's own
+    /// `[1, 1] == [1, 1]` is the proof) and the LOAD's own window supplies the vector-ness: extent
+    /// 1 on the sprayed axis, the second proof.
+    ///
+    /// ⭐⭐⭐⭐⭐ THE PIN REVERSED (front-b-noise, round 3, measured on the card): the consumer
+    /// binds the CONVERT'S RESULT — the minted `[B, 1]` intermediate the convert emits into —
+    /// never the load. The earlier pin (`b.src ==` the load, the convert "plumbing and lowered
+    /// by nothing") was WRONG: a convert changes the value's ENCODING, and binding the load made
+    /// the card read the per-row gate's raw SENUINT32 placement as IEEE_FP32 — the staged u32
+    /// word 1 as the denormal 2^-149, an effective gate of 2^-127 — so score lost its noise
+    /// term and the pick collapsed to argmax at every temperature (greedy accidentally
+    /// correct). The convert now EMITS through the main walk's `Lowering::Convert` arm; only
+    /// the collapse and the broadcast remain plumbing.
+    #[test]
+    fn the_gate_chain_crosses_its_sitofp_and_binds_the_converts_result() {
+        let f = chain_conv(&[1, 1], &[1, 1], false, &[1, 64]);
+        let (map, consumed) = program_broadcast_chains(&f).expect("the gate's own chain");
+        let b = map
+            .get(&Ssa(4))
+            .expect("the broadcast's result is what a consumer names");
+        assert_eq!(
+            b.axis,
+            BcastAxis::Col,
+            "`Dimensions=[1]` sprays along the stick axis"
+        );
+        assert_eq!(
+            b.src,
+            Ssa(1),
+            "the consumer binds the CONVERT'S result — the minted intermediate it emits into"
+        );
+        for v in [Ssa(2), Ssa(4)] {
+            assert!(
+                consumed.contains(&v),
+                "{v:?} is plumbing and must be lowered by nothing"
+            );
+        }
+        assert!(
+            !consumed.contains(&Ssa(1)),
+            "the sitofp EMITS (`Lowering::Convert`) — a convert is never plumbing"
+        );
+    }
+
+    /// ⛔ A CONVERT WHOSE TWO STATED SHAPES DISAGREE — load `[1, 1]`, convert `[2, 1]`: an
+    /// elementwise convert is one-for-one on elements, so a dims change is a real data movement
+    /// and the traversal's proof fails at the convert itself. Named there, not mis-addressed.
+    #[test]
+    fn a_convert_whose_stated_shapes_disagree_is_refused() {
+        let m = refusal_conv(&[1, 1], &[2, 1], false, &[1, 64]);
+        assert!(
+            m.contains("one-for-one on elements"),
+            "says WHY a dims change is different in kind, not just that it was rejected: {m}"
+        );
+        assert!(
+            m.contains("real data movement"),
+            "names the relayout at the convert itself: {m}"
+        );
+    }
+
+    /// ⛔ AN OPERAND SIDE STATED NOWHERE — the convert reads a function argument (no producer, no
+    /// `Shape`), so the equality has no second side and the walk stops AT the convert's result:
+    /// the load-window proof below then honestly fails, because the value it would read is the
+    /// convert's own result. This is the control that the traversal is PROVEN per hop and not
+    /// granted to every convert the walk meets.
+    #[test]
+    fn a_convert_of_an_unstated_operand_stops_the_walk() {
+        let m = refusal_conv(&[1, 1], &[1, 1], true, &[1, 64]);
+        assert!(
+            m.contains("DEGENERATE dim"),
+            "the unproven-extent refusal fires with the walk stopped at the convert: {m}"
+        );
+    }
 }
 
 /// ⭐ THE FLAT PRESENTATION IS CHECKED AT THE REFRAME — [`presented_flat`] runs the source's own
@@ -4352,6 +5475,7 @@ mod presented_flat_tests {
             c_cover: (0, cols),
             is_out: false,
             is_fp8: false,
+            band: None,
         }
     }
 
@@ -4803,6 +5927,119 @@ mod silu_chain_tests {
             (cs[0].gate, cs[1].gate),
             (Ssa(0), Ssa(100)),
             "each chain's gate is its own negate's operand"
+        );
+    }
+}
+
+/// ⭐ THE EQUALITY-MASK FOLD'S REWIDTH — the sampler's Gumbel-max body spells its mask as
+/// `(score == mm).to(tl.float32)` (the whole noise chain is fp32), and the fold used to accept
+/// only a `uitofp` to F16, so the fp32 mask missed the fold and the bare `cmpf` reached the
+/// walk's by-name refusal (`ArithCmpf has no 1:1 Program`) — the run-5 wall after the fp32
+/// broadcast arm. The gate now accepts F16 OR F32 (the two formats the elementwise door lowers),
+/// and the emitted `Elementwise(Equal)` states the RETYPE'S OWN df (`op_df` reads the result
+/// type), so the fp32 mask lowers as the fp32 form of the same broadcast-op family
+/// `maximum`/`minimum` take. This suite pins the widened gate against the fold's own laws: the
+/// fp32 retype folds (new), the fp16 one still folds (control), and each refusal — a non-`oeq`
+/// predicate, a retype to a format the door refuses, a second reader of the i1 — still fires.
+#[cfg(test)]
+mod equal_mask_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::irtype::IrType;
+
+    /// The two-op spelling a producer MUST emit (KTIR has no one-op equality tensor):
+    /// `%i1 = arith.cmpf(pred, %x, %y)` then `%m = arith.uitofp(%i1)` retyped to `elem`.
+    /// `second_reader` adds a second consumer of the i1, breaking the fold's one-reader seal.
+    fn mask_fn(pred: &'static str, elem: DType, second_reader: bool) -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let (x, y, i1, m) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let mut ops = vec![
+            Operation::new(a, Some(i1), OpKind::ArithCmpf, &[x, y]).with_attr(
+                a,
+                AttrKey::Predicate,
+                Attr::Str(pred),
+            ),
+            Operation {
+                result_type: Some(IrType::Tensor {
+                    dims: &[4, 256],
+                    elem,
+                }),
+                ..Operation::new(a, Some(m), OpKind::ArithUitofp, &[i1])
+            },
+        ];
+        if second_reader {
+            ops.push(Operation::new(a, Some(Ssa(4)), OpKind::ArithUitofp, &[i1]));
+        }
+        IRFunction {
+            name: "equal_mask_probe",
+            arguments: a.args(vec![(x, IrType::Index), (y, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    #[test]
+    fn the_fp32_retype_folds() {
+        // The sampler's own spelling: `(score == mm).to(tl.float32)`.
+        let masks =
+            program_equal_masks(&mask_fn("oeq", DType::F32, false)).expect("the fold never errs");
+        assert_eq!(
+            masks.by_retype.get(&Ssa(3)).copied(),
+            Some((Ssa(0), Ssa(1))),
+            "the fp32 mask folds to the comparison's own operands"
+        );
+        assert!(
+            masks.consumed.contains(&Ssa(2)),
+            "the fold consumed the i1 the device op never materialises"
+        );
+    }
+
+    #[test]
+    fn the_fp16_retype_still_folds() {
+        // The control: the fp16 mask the MoE ports rest on keeps its fold, unchanged.
+        let masks =
+            program_equal_masks(&mask_fn("oeq", DType::F16, false)).expect("the fold never errs");
+        assert_eq!(
+            masks.by_retype.get(&Ssa(3)).copied(),
+            Some((Ssa(0), Ssa(1))),
+            "the fp16 mask folds exactly as before the gate widened"
+        );
+    }
+
+    #[test]
+    fn a_non_oeq_predicate_is_not_folded() {
+        // `OpFunc::Equal` is EQUALITY; any other predicate is a different function and must be
+        // left for the by-name refusal rather than silently re-meant.
+        let masks =
+            program_equal_masks(&mask_fn("olt", DType::F32, false)).expect("the fold never errs");
+        assert!(
+            masks.by_retype.is_empty(),
+            "a `cmpf(olt)` does not fold to `Elementwise(Equal)`"
+        );
+    }
+
+    #[test]
+    fn a_retype_to_a_format_the_door_refuses_is_not_folded() {
+        // F16 and F32 are the two formats the elementwise door lowers; anything else would be
+        // re-emitted at a format the door refuses by name, so the fold leaves it alone.
+        let masks = program_equal_masks(&mask_fn("oeq", DType::Fp8E4m3, false))
+            .expect("the fold never errs");
+        assert!(
+            masks.by_retype.is_empty(),
+            "a `uitofp` to a non-F16/F32 width does not fold"
+        );
+    }
+
+    #[test]
+    fn a_second_reader_of_the_i1_blocks_the_fold() {
+        // The fold DESTROYS the i1 (the device op never materialises it), so a second reader
+        // would read a value nothing writes.
+        let masks =
+            program_equal_masks(&mask_fn("oeq", DType::F32, true)).expect("the fold never errs");
+        assert!(
+            masks.by_retype.is_empty(),
+            "a cmpf whose i1 has two consumers does not fold"
         );
     }
 }

@@ -1,0 +1,46 @@
+diff --git a/crates/targets/metal/compiler/src/steps_from_tape.rs b/crates/targets/metal/compiler/src/steps_from_tape.rs
+index 2f43689dd0..45eb4a5a66 100644
+--- a/crates/targets/metal/compiler/src/steps_from_tape.rs
++++ b/crates/targets/metal/compiler/src/steps_from_tape.rs
+@@ -116,6 +116,10 @@ pub enum Refused {
+     CodecUnanchored,
+     /// A sample-rows step whose construct holds no matmul.
+     NoSampledMatmul,
++    /// The minted greedy pick (#603): a spliced Triton kernel only the spyre bake mints, so a
++    /// metal tape carries no ArgMax node by construction — one that does is a wiring bug named
++    /// here, not a missing lowering to write.
++    DeviceSampler,
+ }
+ 
+ impl std::fmt::Display for StepRefusal {
+@@ -2406,6 +2410,12 @@ impl Recording<'_> {
+             L::SumReduce { .. } | L::RmsNormReduce { .. } | L::RmsNormApply { .. } => {
+                 return Err(self.no(i, Refused::TileLevel));
+             }
++            // The minted greedy pick is a spyre-bake op; metal keeps the host pick. Reached
++            // only by a wiring bug (a minted graph handed to the metal tape), and the refusal
++            // names it as one instead of `todo!`-ing a lowering that must never exist.
++            L::ArgMax { .. } => {
++                return Err(self.no(i, Refused::DeviceSampler));
++            }
+         }))
+     }
+ }
+diff --git a/crates/targets/metal/src/op_abi.rs b/crates/targets/metal/src/op_abi.rs
+index d99d974a1d..bc4722f61b 100644
+--- a/crates/targets/metal/src/op_abi.rs
++++ b/crates/targets/metal/src/op_abi.rs
+@@ -143,7 +143,12 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
+         | L::AttnDecode { .. }
+         | L::LoadRows { .. }
+         | L::EmbeddingGather { .. }
+-        | L::ExpertCombine { .. } => FRESH,
++        | L::ExpertCombine { .. }
++        // The greedy pick's idx stick (#603): the kernel reads the widened logits row and the
++        // seven staged tables and writes its OWN stick — a fresh buffer, never an alias of any
++        // operand. Metal never mints the argmax (the mint is the spyre bake's), but the rule
++        // table is exhaustive by law, and the stick's colour is FRESH whichever target runs it.
++        | L::ArgMax { .. } => FRESH,
+         // The rest of a MoE block lives in the op scratch (`moe_write`), not the arena.
+         L::RouterNorm { .. }
+         | L::RouterLogits { .. }

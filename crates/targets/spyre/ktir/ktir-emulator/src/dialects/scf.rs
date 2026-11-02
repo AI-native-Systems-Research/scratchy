@@ -317,7 +317,7 @@ fn run_region(
     if env.tracker.is_none()
         && crate::metal::force_gpu_map()
         && std::env::var_os("KTIR_NO_GPU_MAP").is_none()
-        && let Some(plan) = cached_region_map_plan(ops)
+        && let Some(plan) = cached_region_map_plan(ops, env.convert_model)
     {
         return run_region_with_map_offload(ops, ctx, env, &plan);
     }
@@ -473,17 +473,24 @@ fn body_dies_at(
 /// program's body — which would apply the wrong program's plan (the softmax_fwd
 /// plan to softmax_wide, etc.). The IR is immutable for a run, so a body executed
 /// thousands of times (e.g. a 4096-row softmax `scf.for`) plans its windows ONCE.
+/// The key also carries the run's widen model: the plan's kernels widen as the
+/// interpreter does under it, so an IEEE run's plan is never served to a card run.
 /// Returns `None` when the body has no offloadable window (the caller then takes
 /// the plain op-by-op path with zero per-iteration overhead).
 #[cfg(metal)]
-fn cached_region_map_plan(ops: &[Operation<'static>]) -> Option<std::rc::Rc<RegionMapPlan>> {
+fn cached_region_map_plan(
+    ops: &[Operation<'static>],
+    model: crate::env::ConvertModel,
+) -> Option<std::rc::Rc<RegionMapPlan>> {
     use std::cell::RefCell;
     use std::collections::HashMap;
+    /// The body's structural fingerprint, and the run's widen model.
+    type PlanKey = (u64, crate::env::ConvertModel);
     thread_local! {
-        static CACHE: RefCell<HashMap<u64, Option<std::rc::Rc<RegionMapPlan>>>> =
+        static CACHE: RefCell<HashMap<PlanKey, Option<std::rc::Rc<RegionMapPlan>>>> =
             RefCell::new(HashMap::new());
     }
-    let key = crate::comm_sched::plan_key(ops);
+    let key: PlanKey = (crate::comm_sched::plan_key(ops), model);
     CACHE.with(|c| {
         c.borrow_mut()
             .entry(key)
@@ -498,7 +505,7 @@ fn cached_region_map_plan(ops: &[Operation<'static>]) -> Option<std::rc::Rc<Regi
                 if ops.iter().any(|o| o.op_type == OpKind::LinalgMatmul) {
                     return None;
                 }
-                let plan = crate::metal::map_fusion_plan(ops);
+                let plan = crate::metal::map_fusion_plan(ops, model);
                 if plan.0.is_empty() {
                     None
                 } else {

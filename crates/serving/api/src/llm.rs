@@ -66,6 +66,10 @@ pub struct RequestOutput {
     pub finished: bool,
     /// Time to first token in seconds (measured in generate_impl output loop).
     pub ttft_s: Option<f64>,
+    /// Wall-clock instant the first sampled token arrived. Set even when that token detokenizes
+    /// to no text (a skipped special token, e.g. gpt-oss's channel openers), where a text
+    /// callback would never fire — the CLI's startup-relative "1st token" is measured from it.
+    pub first_token_at: Option<std::time::Instant>,
     /// Average inter-token latency in seconds.
     pub avg_itl_s: Option<f64>,
 }
@@ -971,6 +975,7 @@ impl LLM {
             let first_idx = p_idx * n;
             let ttft_s =
                 first_token_time[first_idx].map(|ft| ft.duration_since(start).as_secs_f64());
+            let first_token_at = first_token_time[first_idx];
             let avg_itl_s = if itl_count[first_idx] > 0 {
                 Some(itl_sum[first_idx] / itl_count[first_idx] as f64)
             } else {
@@ -984,6 +989,7 @@ impl LLM {
                 outputs: completion_outputs,
                 finished: true,
                 ttft_s,
+                first_token_at,
                 avg_itl_s,
             });
         }
@@ -1135,6 +1141,10 @@ impl LLM {
         // spinning while the request waits to be admitted) — two very different bugs, same symptom.
         let mut steps = 0usize;
         let mut _d_step0 = std::time::Duration::ZERO;
+        // The first token's arrival, stamped where the token IDs are seen — NOT in the
+        // detokenizer's text callback, which never fires when the first token decodes to no
+        // text (a skipped special token, e.g. gpt-oss's `<|channel|>` openers).
+        let mut first_token_at: Option<std::time::Instant> = None;
         'stream: while self.client.has_unfinished_requests() {
             if self.interrupted() {
                 return Err(self.stop(std::slice::from_ref(&request_id)));
@@ -1157,6 +1167,9 @@ impl LLM {
             for output in &outputs.outputs {
                 if output.request_id != request_id {
                     continue;
+                }
+                if all_token_ids.is_empty() && !output.new_token_ids.is_empty() {
+                    first_token_at.get_or_insert(std::time::Instant::now());
                 }
                 if ttft_phase && all_token_ids.is_empty() && !output.new_token_ids.is_empty() {
                     // `to_first_token` is queue + prefill forward(s) + sample; the SDSC phase lines
@@ -1236,6 +1249,7 @@ impl LLM {
             }],
             finished: true,
             ttft_s: None,
+            first_token_at,
             avg_itl_s: None,
         })
     }
@@ -1420,6 +1434,7 @@ mod tests {
             }],
             finished: true,
             ttft_s: None,
+            first_token_at: None,
             avg_itl_s: None,
         };
         let _ = format!("{output:?}");

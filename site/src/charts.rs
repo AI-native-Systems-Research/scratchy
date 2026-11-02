@@ -11,7 +11,7 @@ use std::fmt;
 use dioxus::prelude::*;
 use serde::Serialize;
 
-use crate::carbon::{Alignment, Definition, Stack};
+use crate::carbon::{Alignment, Definition, Layer, Stack, Tile};
 
 /// Draws every chart from its rendered spec.
 pub const CHARTS_JS: &str = include_str!("charts.js");
@@ -24,16 +24,6 @@ pub const CHARTS_JS: &str = include_str!("charts.js");
 pub struct Themed {
     pub light: &'static str,
     pub dark: &'static str,
-}
-
-impl Themed {
-    /// The same colour in both themes.
-    pub const fn both(colour: &'static str) -> Self {
-        Themed {
-            light: colour,
-            dark: colour,
-        }
-    }
 }
 
 impl fmt::Display for Themed {
@@ -111,17 +101,26 @@ impl Better {
     }
 }
 
-/// A series' colour, fixed per role: blue, orange, aqua from the data-viz
-/// reference palette, validated as a set (all pairs, CVD and normal vision)
-/// against Carbon's white and g100 surfaces, so the same in both themes. Aqua
-/// is under 3:1 on white, so every chart has a legend and a table view. A
-/// previous run is a grey nearer the page than the series, so it reads as
-/// behind.
+/// A series' colour, fixed per role: Carbon's categorical palette in its
+/// order, white's on white and g100's on g100, less its cyan (purple 70 / 60,
+/// teal 70 / 60, magenta 70 / 40). Cyan is the heat maps' "scratchy faster",
+/// which fills the gap between scratchy's line and its rival's, so no line is
+/// cyan. A previous run is a grey nearer the page than the series, so it reads
+/// as behind.
 pub fn colour(class: &str) -> Themed {
     match class {
-        "s1" => Themed::both("#2a78d6"),
-        "s2" => Themed::both("#d95926"),
-        "s3" => Themed::both("#1baf7a"),
+        "s1" => Themed {
+            light: "#6929c4",
+            dark: "#8a3ffc",
+        },
+        "s2" => Themed {
+            light: "#005d5d",
+            dark: "#007d79",
+        },
+        "s3" => Themed {
+            light: "#9f1853",
+            dark: "#ff7eb6",
+        },
         _ => Ramp::Gray.at::<40>(),
     }
 }
@@ -147,7 +146,38 @@ pub enum Chart<'a> {
     Combo {
         data: Vec<SparkPoint>,
         options: ChartOptions<'a>,
+        /// The line series charts.js dashes, which Carbon's options cannot ask for.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        dashed: Vec<&'static str>,
     },
+    /// Carbon's BubbleChart: a bubble per spot measurements share, its area their count.
+    Bubble {
+        data: Vec<BubblePoint<'a>>,
+        options: ChartOptions<'a>,
+        /// A one-measurement bubble's radius in px: charts.js scales every other from it, by
+        /// [`BubblePoint::radius`].
+        unit_radius: f64,
+    },
+}
+
+/// One bubble: its series, where along the bottom axis, its value, and the square root of how
+/// many measurements it stands for (Carbon maps `radius` linearly onto px, so its area counts
+/// them; charts.js prints the count back in the tooltip).
+#[derive(Serialize)]
+pub struct BubblePoint<'a> {
+    pub group: &'a str,
+    pub key: f64,
+    pub value: f64,
+    pub radius: f64,
+}
+
+/// A bubble chart's bubbles: Carbon's `bubble` option.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Bubbles {
+    pub radius_maps_to: &'static str,
+    pub radius_label: &'static str,
+    pub fill_opacity: f64,
 }
 
 /// One point of a sparkline. On the two lines, a side's value; on the fills,
@@ -207,7 +237,37 @@ pub struct ChartOptions<'a> {
     pub combo: Option<Vec<ComboLayer>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<Bounds>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bubble: Option<Bubbles>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub line: Option<LineOptions>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub hover: Option<Hover>,
     pub toolbar: Enabled,
+}
+
+/// What hovering a chart shows: Carbon's tooltip, and on a line chart its ruler, the line at the
+/// pointer's step whose points the tooltip lists. Unset, Carbon shows both.
+#[derive(Serialize)]
+pub struct Hover {
+    pub tooltip: Enabled,
+    pub ruler: Enabled,
+}
+
+impl Hover {
+    /// Neither: for a chart whose points are not one per step across its series.
+    pub const NONE: Hover = Hover {
+        tooltip: Enabled { enabled: false },
+        ruler: Enabled { enabled: false },
+    };
+}
+
+/// A line chart's options: how Carbon joins its points (a d3 curve's name), and whether it marks
+/// each one.
+#[derive(Serialize)]
+pub struct LineOptions {
+    pub curve: &'static str,
+    pub points: Enabled,
 }
 
 #[derive(Serialize)]
@@ -401,7 +461,8 @@ impl Chart<'_> {
         match self {
             Chart::GroupedBar { options, .. }
             | Chart::Heatmap { options, .. }
-            | Chart::Combo { options, .. } => options,
+            | Chart::Combo { options, .. }
+            | Chart::Bubble { options, .. } => options,
         }
     }
 }
@@ -445,6 +506,7 @@ pub fn ratio_scale(fit: ScaleFit, id: &str) -> Element {
                 .to_string(),
             "1fr",
         ),
+        ScaleFit::Fill => ("flex: none; align-self: stretch; ".to_string(), "1fr"),
     };
     rsx! {
         div { id: "{id}", style: "{place}display: grid; grid-template-columns: 0.75rem max-content; grid-template-rows: repeat({rows}, {track}); column-gap: 0.5rem; font-size: 0.75rem; line-height: 1",
@@ -487,6 +549,8 @@ pub fn ratio_scale(fit: ScaleFit, id: &str) -> Element {
 pub enum ScaleFit {
     Fixed,
     Beside,
+    /// Stretched to the whole height of the box it sits in: the one map's grid rows.
+    Fill,
 }
 
 /// A ratio map's two axes, read like a table: `across` left to right, `down`
@@ -562,6 +626,9 @@ pub fn mini_heatmap(
             locale: Locale::total(total_label),
             combo: None,
             bounds: None,
+            bubble: None,
+            line: None,
+            hover: None,
             toolbar: Enabled { enabled: false },
         },
         ratio: true,
@@ -623,43 +690,50 @@ pub fn glance_mini(
 }
 
 /// A glance's heat maps beside their ratio scale: a row per `rows` (a
-/// machine on metal.html, a dtype on spyre.html), its name, then a cell per
-/// `columns` (a model), each the column's
-/// name over `cell(row, column)`, that row's grids of that model as
-/// glance_minis. The cells are one width, 11.5rem (two 88px grids and the 8px
-/// between them), and on a narrow screen shrink together rather than wrap, as
-/// the sparkline panels' columns do: so every grid on the page is one size,
-/// the columns line up down the rows, and the scale stands beside them all.
-/// Each row's names share a track and its grids the next, so a name that
-/// wraps onto two lines leaves its grids level with their neighbours'.
+/// machine on metal.html, a dtype on spyre.html), its name turned upward
+/// beside its first tile, then a tile per `columns` (a model), each the
+/// column's name over `cell(row, column)`, that row's grids of that model as
+/// glance_minis. The cells are one width, `column_width` (metal.html shares
+/// the panel's width among them), and on a narrow screen shrink together
+/// rather than wrap: so every grid on the page is one size, the columns line
+/// up down the rows, and the scale stands beside them all.
 pub fn glance_maps(
     rows: &[&str],
     columns: &[&str],
+    column_width: &str,
+    scale: bool,
     cell: impl Fn(&str, &str) -> Element,
 ) -> Element {
     let grid = format!(
-        "flex: 0 1 auto; min-width: 0; align-self: start; display: grid; \
-         grid-template-columns: 7rem repeat({}, minmax(0, 11.5rem)); gap: 1.5rem",
+        "flex: 1 1 auto; min-width: 0; align-self: start; display: grid; \
+         grid-template-columns: max-content repeat({}, {column_width}); row-gap: var(--cds-spacing-06)",
         columns.len()
     );
     rsx! {
         div { style: "display: flex; gap: 2rem",
             div { style: "{grid}",
                 for row in rows {
-                    div { style: "grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; row-gap: 0.5rem",
-                        div { style: "grid-row: span 2", "{row}" }
+                    div { style: "grid-column: 1 / -1; display: grid; grid-template-columns: subgrid",
+                        // The row's name turned to read upward, spaced from its first tile's left edge by
+                        // padding-left, which the half turn puts on the tile's side.
+                        div { style: "writing-mode: vertical-rl; transform: rotate(180deg); text-align: center; padding-left: var(--cds-spacing-03)", strong { "{row}" } }
+                        // Each model on a tile of the next layer, so neighbouring models read apart.
                         for column in columns {
-                            div { style: "align-self: end; text-align: center", "{column}" }
-                        }
-                        for column in columns {
-                            div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
-                                {cell(row, column)}
+                            Layer { level: 1,
+                                Tile { style: "height: 100%; box-sizing: border-box; min-width: 0",
+                                    Stack { gap: 3,
+                                        div { style: "text-align: center", "{column}" }
+                                        div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
+                                            {cell(row, column)}
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-            {ratio_scale(ScaleFit::Beside, GLANCE_SCALE)}
+            if scale { {ratio_scale(ScaleFit::Beside, GLANCE_SCALE)} }
         }
     }
 }
@@ -878,8 +952,8 @@ pub fn sparkline(
     label: &str,
 ) -> Element {
     // The rival's carried continuation is its own line dataset — Carbon has
-    // no way to dash part of one series, so charts.js dashes this one by its
-    // name — in the rival's own colour. The id must live as long as the
+    // no way to dash part of one series, so charts.js dashes this one
+    // (`dashed`) — in the rival's own colour. The id must live as long as the
     // spec; the build is a one-shot process, so one leak a chart is sound.
     let carried: Option<&'static str> = axes
         .carry
@@ -920,6 +994,7 @@ pub fn sparkline(
     };
     let spec = Chart::Combo {
         data: spark_points(pts, axes.better, scratchy, rival, carried),
+        dashed: carried.into_iter().collect(),
         options: ChartOptions {
             title: String::new(),
             // Users, both lengths and model sizes grow by a factor per step:
@@ -964,6 +1039,9 @@ pub fn sparkline(
                 upper_bound_maps_to: "upper",
                 lower_bound_maps_to: "lower",
             }),
+            bubble: None,
+            line: None,
+            hover: None,
             toolbar: Enabled { enabled: false },
         },
     };

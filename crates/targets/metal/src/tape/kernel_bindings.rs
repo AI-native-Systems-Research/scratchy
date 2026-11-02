@@ -3,8 +3,8 @@
 //!
 //! Each `BindingSet` struct captures the per-call-variable bindings
 //! (`ArenaSlotIdx`, `LayerId`, weight thunks) for one kernel family.
-//! The runtime-fixed bindings (`CuSeqlensQ`, `SeqUsedK`, `BlockTable`,
-//! `NumTokensU32`) are baked into the `From<Self> for Vec<Binding<W>>`
+//! The runtime-fixed bindings (`CuSeqlensQ`, `SeqUsedK`, `BlockTable`)
+//! are baked into the `From<Self> for Vec<Binding<W>>`
 //! conversion — they live at the same per-kernel binding index every
 //! time so the lowering arm doesn't restate them.
 //!
@@ -67,6 +67,10 @@ fn push_rope_on_read_bindings(
 }
 
 // ── AttentionPrefillSdpaPaged (both sdpa_vector and steel variants) ─
+
+/// The slot a paged prefill attention binds its rotary table at, re-roping K as it reads. Its
+/// one model source besides gpt-oss's sinks (slot 9): what tells a re-roping twin from a plain one.
+pub const PREFILL_ROPE_ON_READ_SLOT: u8 = 7;
 
 /// Bindings for `KernelId::AttentionPrefillSdpaPaged`. Seven slots:
 /// 0 = output (arena), 1 = Q (arena), 2 = CuSeqlensQ (runtime),
@@ -131,7 +135,7 @@ impl From<AttentionPrefillPagedBindingSet> for Vec<Binding> {
             // NAX spans: pre-roped K from the scratch at slot 7.
             v.push(Binding::RopedKScratch { binding_index: 7 });
         } else if let Some(table) = s.rope_on_read {
-            push_rope_on_read_bindings(&mut v, s.kv_layer, table, 7);
+            push_rope_on_read_bindings(&mut v, s.kv_layer, table, PREFILL_ROPE_ON_READ_SLOT);
         }
         // Block-diagonal span attention: the per-block span-label buffer at slot
         // 8, bound whenever spans/rope-on-read is active (the kernel reads it
@@ -188,6 +192,12 @@ impl From<RopeOnceNaxBindingSet> for Vec<Binding> {
 /// 3 = BlockTable (runtime), 4 = KvCacheK\[layer\] (runtime),
 /// 5 = KvCacheV\[layer\] (runtime).
 ///
+/// The slot a decode attention binds gpt-oss's sinks at ([`AttentionViaCacheBindingSet::sinks`]).
+pub const DECODE_SINKS_SLOT: u8 = 16;
+
+/// The slot `attention_via_cache_v2_combine` binds them at: its 16 is the split's partials.
+pub const COMBINE_SINKS_SLOT: u8 = 17;
+
 /// Same `kv_layer` payload appears at slots 4 + 5 — the layer index
 /// is single-field on the BindingSet so they can't drift.
 pub struct AttentionViaCacheBindingSet {
@@ -242,7 +252,12 @@ impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
             push_rope_on_read_bindings(&mut v, s.kv_layer, table, 6);
         }
         if let Some(sinks) = s.sinks {
-            v.push(source(sinks, WeightTensor::Weight, s.kv_layer, 16));
+            v.push(source(
+                sinks,
+                WeightTensor::Weight,
+                s.kv_layer,
+                DECODE_SINKS_SLOT,
+            ));
         }
         if s.query_rows == super::kernel_constants::QueryRows::PerToken {
             v.push(Binding::Runtime {

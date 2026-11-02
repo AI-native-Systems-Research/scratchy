@@ -2555,6 +2555,27 @@ impl<'a> CodeGen<'a> {
                     .map(Val::Ir)
                     .map_err(|e| Self::located(e, pos))
             }
+            // `tl.expand_dims(input, axis)` -> `tt.expand_dims` (the axis attribute). The
+            // unit-dim insertion a reduced [1] needs before a unit-dim broadcast can meet
+            // the tile domain -- see `census::TL_FUNCTIONS`'s entry for the construct's
+            // first use.
+            "expand_dims" => {
+                let x = self.ir_arg(&get(0, "input"), "tl.expand_dims", pos)?;
+                let axis = get(1, "axis")
+                    .and_then(|v| v.as_int())
+                    .and_then(|a| i64::try_from(a).ok())
+                    .ok_or_else(|| {
+                        Error::new(
+                            "tl.expand_dims needs a compile-time `axis`",
+                            pos.line,
+                            pos.col,
+                        )
+                    })?;
+                self.sem
+                    .expand_dims(x, axis)
+                    .map(Val::Ir)
+                    .map_err(|e| Self::located(e, pos))
+            }
             "arange" => {
                 let a = get(0, "start")
                     .and_then(|v| v.as_int())
@@ -2606,12 +2627,19 @@ impl<'a> CodeGen<'a> {
             // op every downstream dialect already serves. The f32 width gate applies as
             // to every `math.*` unary, so a kernel states the widen/truncate island
             // (`tanhsoftcap.py`), which LegalizeTypes collapses.
-            "exp" | "math.exp2" | "rsqrt" | "math.rsqrt" | "tanh" | "math.tanh" => {
+            // `tl.log` is the same shape as `tanh` above it: `math.py`'s `log` is re-exported
+            // into `tl`, both spellings reach one `create_log`, and the TTIR spelling is
+            // `math.log` — the on-card Gumbel noise's transform (front-b-noise). `math.log2`
+            // is a DIFFERENT op (`OpKind::MathLog2`) and a different rounding than the card's
+            // `log` opFunc, so the rescale is never substituted.
+            "exp" | "math.exp2" | "rsqrt" | "math.rsqrt" | "tanh" | "math.tanh" | "log"
+            | "math.log" => {
                 let v = self.ir_arg(&get(0, "x"), name, pos)?;
                 let op = match name {
                     "exp" => "math.exp",
                     "math.exp2" => "math.exp2",
                     "tanh" | "math.tanh" => "math.tanh",
+                    "log" | "math.log" => "math.log",
                     _ => "math.rsqrt",
                 };
                 self.sem

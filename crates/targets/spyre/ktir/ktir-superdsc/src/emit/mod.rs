@@ -753,6 +753,59 @@ pub(crate) fn mint_full_window<O: KindTag>(
     }
 }
 
+/// ⭐ THE SCATTER-WINDOW MINT — the chained head's ChainRow door ([`crate::sdsc_abstract::GatherDest::Scatter`]'s
+/// placement half): the run's `entries` ONE-STICK entries of request `r`, landing at the scatter law's
+/// own stride — entry `j` at element `(j·W + r)·lanes` of the `[W, row_width]` buffer whose residency is
+/// `StickLayout::row_blocked(W, row_width)`. The window is NOT contiguous, so [`mint_full_window`]
+/// cannot ask this question; this door states the stride-aware bound instead: the LAST element any
+/// entry touches is `base + (entries−1)·W·lanes + lanes`, and that contiguous SPAN must fit the buffer
+/// — the same two authorities (the handle's declared shape, and the placement footprint by name when a
+/// layout is at hand) pricing the same bytes the full-window mint prices, reached through a span whose
+/// end is exactly the scatter's furthest write.
+pub(crate) fn mint_scatter_window(
+    what: &str,
+    name: &str,
+    dest: &crate::sdsc_abstract::GatherDest,
+    df: Df,
+    base_elems: u64,
+    entries: u32,
+    layout: Option<&BundleLayout>,
+) -> Result<(), String> {
+    let crate::sdsc_abstract::GatherDest::Scatter {
+        rows: interleave,
+        cols: row_width,
+    } = dest
+    else {
+        return Err(format!(
+            "{what}: not a scatter destination — this mint states the scatter law and \
+             no other"
+        ));
+    };
+    let (interleave, row_width) = (*interleave, *row_width);
+    let lanes = df.elems_per_stick();
+    if interleave == 0 || !row_width.is_multiple_of(lanes) {
+        return Err(format!(
+            "{what}: the scatter buffer is [{interleave}, {row_width}] at {lanes} lanes per \
+             stick — a zero scatter width or a row width the stick does not divide is not a \
+             buffer this law can name"
+        ));
+    }
+    let span = (entries as u64)
+        .saturating_sub(1)
+        .saturating_mul(interleave as u64)
+        .saturating_mul(lanes as u64)
+        .saturating_add(lanes as u64);
+    mint_full_window(
+        &format!("{what} (scatter law: entry j of request r at (j·{interleave} + r)·{lanes})"),
+        &rb_df(name, interleave, row_width, df),
+        base_elems,
+        1,
+        u32::try_from(span)
+            .map_err(|_| format!("{what}: the scatter span {span} overflows a 32-bit window"))?,
+        layout,
+    )
+}
+
 /// Whether a `[rows, cols]` fp16 pointwise op over `n_inputs` operands runs WITHOUT time-tiling — the
 /// very tile op and tiler [`pointwise_broadcast_opspec_df`] builds, asked before the op is. A caller
 /// cuts an op this answers `false` for, because a time-tiled op with a broadcast operand is refused
@@ -4066,8 +4119,14 @@ pub fn emit_sdsc(
                         <Fp8 as DataFormat>::NAME
                     } else if views.get(out_idx).is_some_and(|o| matches!(o.df, Df::Bf16)) {
                         "BF16E"
-                    } else if matches!(op.op, OpFunc::Fp32ToInt32) {
-                        // The value-cast converts are bound in fp32 MODE ONLY
+                    } else if matches!(
+                        op.op,
+                        OpFunc::Fp32ToInt32
+                            | OpFunc::Int32ToFp32
+                            | OpFunc::MulI32ToI32
+                            | OpFunc::AddI32ToI32
+                    ) {
+                        // The value-cast converts and the INTEGER MATH ops are bound in fp32 MODE
                         // (unary_parallel.ddl:47-50 — int32tofp32/fp32toint32 are
                         // `operation_bind([%type_fp32], ...)`; the DDL comment:
                         // "the conversion is carried out in fp32 mode, ICVT
@@ -4078,6 +4137,17 @@ pub fn emit_sdsc(
                         // format. An SEN169_FP16 marker here is dxp's
                         // "Scheduler failed to find a suitable op mapping"
                         // (SchedulerStages.cpp:40) — no fp16-mode bind exists.
+                        // The integer mul/add carry the SAME marker on SENUINT32
+                        // data — card leg B1's passing cells state
+                        // `muli32toi32`/`addi32toi32` with SENUINT32 labeledDs
+                        // (wordLength 4) and this IEEE_FP32 computeOp marker: the
+                        // SFP unit's fp32-mode datapath executes the wrapping i32
+                        // op, so the marker states the MODE, never the data. A
+                        // first-arg lookup (`views.first()`, the torch-spyre
+                        // superdsc.py:882 law the arm below applies) would see
+                        // SENUINT32 and fall to the fp16 default — the exact
+                        // no-suitable-op-mapping refusal — so these four state
+                        // their marker themselves.
                         Df::Fp32.dataformat()
                     } else if views.first().is_some_and(|v| matches!(v.df, Df::Fp32)) {
                         // torch-spyre sets the computeOp data_format from args[0]
@@ -4449,6 +4519,10 @@ fn convert_dtypes(op: OpFunc) -> (Df, Df) {
         // through `dl16tofp32` FIRST — the widening convert carries no slice
         // constraint of its own (quantization_double_pad.ddl:58).
         OpFunc::Fp32ToInt32 => (Df::Fp32, Df::SenUint32),
+        // int32tofp32: SENUINT32 word → IEEE_FP32 value — the reverse recipe of the above,
+        // both 32-element wordLength-4 sticks (card leg B1's i2f cell). The on-card Gumbel
+        // noise's wrap-fold extraction (front-b-noise) rides it.
+        OpFunc::Int32ToFp32 => (Df::SenUint32, Df::Fp32),
         _ => (Df::Fp16, Df::Fp16),
     }
 }
@@ -6116,17 +6190,22 @@ pub fn assemble_restickify_kt_2d(
 /// The extents are plain `u32` here rather than the paged-KV
 /// [`KtTileSlots`](crate::sdsc_abstract::KtTileSlots)/[`KtTileFeats`](crate::sdsc_abstract::KtTileFeats)
 /// newtypes [`assemble_restickify_kt_2d`] takes: this door serves an arbitrary producer-stated shape,
-/// which is exactly the thing those newtypes exist to forbid for the cache. Offsets are zero — a
-/// `linalg.transpose` names whole buffers (its caller refuses a window).
+/// which is exactly the thing those newtypes exist to forbid for the cache. Offsets are zero for a
+/// `linalg.transpose` (whole buffers — its caller refuses a window); the chained head's per-request
+/// form ([`try_assemble_restickify_transpose_2d_at`]) passes each request's element bases. The
+/// offsets change only where each side's window sits, never the per-core tile, so the LX guard
+/// below is the SAME guard at every base.
 fn restickify_transpose_opspec_2d(
     rows: u32,
     cols: u32,
     in_name: &str,
     o_name: &str,
+    in_off: u32,
+    out_off: u32,
 ) -> Result<OpSpec, String> {
     // The Kᵀ builder IS this descriptor: `cap`→`y` is the row axis, `hd`→`out` the column axis, and
     // both stick laws are checked there. Sharing it means the two doors cannot drift apart.
-    let op = restickify_kt_opspec_2d(rows, cols, in_name, o_name, 0, 0)?;
+    let op = restickify_kt_opspec_2d(rows, cols, in_name, o_name, in_off, out_off)?;
     // ⛔⛔⛔ AND IT MUST FAIL CLOSED ON LX, BECAUSE THIS DOOR CANNOT TIME-TILE ITS WAY OUT.
     //
     // `transpose_opspec` reached `TileOp::tile`, which splits the `out` stick dim in TIME when the
@@ -6173,23 +6252,78 @@ pub fn try_assemble_restickify_transpose_2d(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp, String> {
+    try_assemble_restickify_transpose_2d_at(
+        op_name,
+        rows,
+        cols,
+        RestickifySide::whole(in_),
+        RestickifySide::whole(o),
+        sym_id_base,
+        layout,
+    )
+}
+
+/// ONE SIDE of a windowed restickify — the handle AND the element base of its window, handed
+/// over together because they advance together (the per-request form below) and a caller that
+/// supplies one without deciding the other has not stated the transpose it wants. The
+/// whole-buffer form is `off: 0`, stated by [`RestickifySide::whole`] so the delegation below
+/// reads as the law it is.
+pub struct RestickifySide<'a> {
+    /// The side's whole-buffer handle — the mint bounds the window against the handle's
+    /// declared (and, when a layout is at hand, PLACED) extent, never against the window.
+    pub h: &'a Stk<RowBlockedTag>,
+    /// Where this side's window sits, in ELEMENTS of the handle's own format.
+    pub off: u32,
+}
+
+impl<'a> RestickifySide<'a> {
+    /// The whole-buffer window — base 0, the `linalg.transpose` caller's own law (its door
+    /// refuses a windowed transpose, so the flat run at 0 IS the op's whole access).
+    pub fn whole(h: &'a Stk<RowBlockedTag>) -> Self {
+        Self { h, off: 0 }
+    }
+}
+
+/// [`try_assemble_restickify_transpose_2d`] AT A BASE — the per-request form the chained head's
+/// widened scratch needs (#603): ONE `[width·rows, cols]` slab placement holds every request's
+/// block request-major, and request `r`'s transpose reads its `[rows, cols]` window at element
+/// base `in_off` and writes its `[cols, rows]` window at `out_off`. The whole-buffer form above
+/// is this door at `(0, 0)`, and delegates to it — one construction, so the two callers' emitted
+/// descriptors cannot drift.
+///
+/// ⛔ THE OFFSETS ARE ELEMENT COUNTS INTO THE CALLER'S OWN HANDLES, and the mint is what makes
+/// that safe: each side's window is bounded (base + window inside the handle's declared — and,
+/// when a layout is at hand, PLACED — extent), so an offset past the request's block is a build
+/// `Err` here, never a clean bake writing the next request's rows. The output side's handle
+/// states the PLACEMENT's extents — for the chain that is `[width·(cols + 1), rows]`, the
+/// sentinel's reserved zero row inside the accounted extent — while the WINDOW minted is the real
+/// `[cols, rows]` transpose, exactly as the whole-buffer form mints it.
+pub fn try_assemble_restickify_transpose_2d_at(
+    op_name: &str,
+    rows: u32,
+    cols: u32,
+    in_: RestickifySide<'_>,
+    o: RestickifySide<'_>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
     mint_full_window(
-        &format!("{op_name}: operand '{}'", in_.name()),
-        in_,
-        0,
+        &format!("{op_name}: operand '{}'", in_.h.name()),
+        in_.h,
+        in_.off as u64,
         rows,
         cols,
         layout,
     )?;
     mint_full_window(
-        &format!("{op_name}: output '{}'", o.name()),
-        o,
-        0,
+        &format!("{op_name}: output '{}'", o.h.name()),
+        o.h,
+        o.off as u64,
         cols,
         rows,
         layout,
     )?;
-    let op = restickify_transpose_opspec_2d(rows, cols, in_.name(), o.name())?;
+    let op = restickify_transpose_opspec_2d(rows, cols, in_.h.name(), o.h.name(), in_.off, o.off)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
 }
@@ -6268,6 +6402,17 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         "abs" => OpFunc::Abs,
         "silu" => OpFunc::Silu,
         "exp" => OpFunc::Exp,
+        // `arch_enums.cpp`'s LOG_FWD bind — the on-card Gumbel noise's transform
+        // (front-b-noise). One spelling, `log`, matching `OpFunc::name()`.
+        "log" => OpFunc::Log,
+        // `arch_enums.cpp`'s NEG bind — the Gumbel transform's two negations.
+        "neg" => OpFunc::Neg,
+        // B1's i2f leg spelling — the reverse of `fp32toint32` above.
+        "int32tofp32" => OpFunc::Int32ToFp32,
+        // B1's integer-math leg spellings — wrapping i32 mul/add on SENUINT32 data (the noise
+        // hash's mix, front-b-noise). Same one-spelling law as `log` above.
+        "muli32toi32" => OpFunc::MulI32ToI32,
+        "addi32toi32" => OpFunc::AddI32ToI32,
         "reciprocal" => OpFunc::Reciprocal,
         "sqrt" => OpFunc::Sqrt,
         "rsqrt" => OpFunc::Rsqrt,
@@ -6508,10 +6653,25 @@ pub(crate) fn check_pointwise_cols(
     what: &str,
     out_id: u32,
 ) -> Result<(), SuperDscError> {
-    if !cols.is_multiple_of(FP16_ELEMS_PER_STICK) {
+    check_pointwise_cols_df(cols, what, out_id, Df::Fp16)
+}
+
+/// [`check_pointwise_cols`] at a stated [`Df`] — the stick basis is the ACTUAL dtype's (fp32 =
+/// 32-element stick), the same law [`pointwise_broadcast_opspec_df`] states for the tile: a
+/// per-row fp32 lane is cols=32, valid fp32 but NOT a 64-multiple, so an Fp16 extent would
+/// wrongly reject it — and a 64-multiple that is not a whole fp32 stick cannot exist (64 is a
+/// 32-multiple), so every form the fp16 check admitted stays admitted.
+pub(crate) fn check_pointwise_cols_df(
+    cols: u32,
+    what: &str,
+    out_id: u32,
+    df: Df,
+) -> Result<(), SuperDscError> {
+    let stick = df.elems_per_stick();
+    if !cols.is_multiple_of(stick) {
         return Err(SuperDscError(format!(
-            "{what} t{out_id}: cols={cols} not a multiple of the {FP16_ELEMS_PER_STICK}-fp16 \
-             stick (assemble_pointwise emits no coordinateMasking_) — pad cols"
+            "{what} t{out_id}: cols={cols} not a multiple of the {stick}-element {df:?} stick \
+             (assemble_pointwise emits no coordinateMasking_) — pad cols"
         )));
     }
     Ok(())
@@ -7409,6 +7569,1093 @@ mod time_tiled_mb_operand_advances_per_trip {
             g1 > g0,
             "the mb operand moved {g0:#x} → {g1:#x}: it must ADVANCE — each trip reads its \
              own out-window of the row, unlike the address-stable scalar broadcast"
+        );
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE CHAINED HEAD'S DOOR, AT ITS ENTRY POINT (#603) — [`lower_ktir_to_superdsc::embed_row_gather`],
+/// the same law the transpose's entry-point tests state: a hand-minted program shaped like the real
+/// producer's (four parameters in mint order — the slab index stick, the lane index stick, the tied
+/// weight, the [1, hidden] row out — each with a memory view and an access tile, one store through the
+/// out tile), lowered layout-free, must bake the three legs in chain order and refuse every stated-law
+/// violation BY NAME.
+#[cfg(test)]
+mod embed_row_gather_tests {
+    use super::*;
+    use crate::ktir_node::{BufferId, KtirNode, Program};
+    use crate::place::PlaceId;
+    use crate::place::act_name;
+    use ktir_core::arena::Arena;
+    use ktir_core::attrkey::AttrKey;
+    use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
+    use ktir_core::irtype::IrType;
+    use ktir_core::opkind::OpKind;
+
+    /// The chained head's smallest honest geometry: `hidden` 128 (two 64-sticks, so the transpose and
+    /// the row gather each have more than one block to place), `vocab` 512 (eight 64-lane slabs), both
+    /// index sticks `[1, 32]` — the u32 index-stick class `ChainStage`'s table gathers write.
+    const HIDDEN: i64 = 128;
+    const VOCAB: i64 = 512;
+    const IDX: (i64, i64) = (1, 32);
+
+    /// One KTIR program shaped like the spyre emitter's mint: parameters 0..3 are (s stick, l stick,
+    /// weight, row out), each with a `construct_memory_view` + `construct_access_tile` of its whole
+    /// buffer, one load off the weight and one store through the out tile. `weight_col_corner` states a
+    /// NONZERO column corner on the weight's tile — the windowed case the whole-view law refuses.
+    /// `entries` states the payload's slab-gather entry count — the mint's own answer for the stated
+    /// hidden (1 for every toy hidden here; 4 for the granite-shaped legs).
+    fn embed_row_gather_program(
+        s_shape: (i64, i64),
+        l_shape: (i64, i64),
+        w_shape: (i64, i64),
+        out_shape: (i64, i64),
+        weight_col_corner: i64,
+        entries: u32,
+    ) -> KtirNode {
+        let a: &'static Arena = Arena::global();
+        let shape = |op: Operation<'static>, s: (i64, i64)| {
+            op.with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![s.0, s.1])))
+        };
+        let (p_s, p_l, p_w, p_out, zero, corner) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4), Ssa(5));
+        let (v_s, v_l, v_w, v_out) = (Ssa(6), Ssa(7), Ssa(8), Ssa(9));
+        let (t_s, t_l, t_w, t_out, val) = (Ssa(10), Ssa(11), Ssa(12), Ssa(13), Ssa(14));
+        let w_corner = if weight_col_corner == 0 { zero } else { corner };
+        let ops = vec![
+            Operation::new(a, Some(zero), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(0),
+            ),
+            Operation::new(a, Some(corner), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(weight_col_corner),
+            ),
+            shape(
+                Operation::new(a, Some(v_s), OpKind::KtdpConstructMemoryView, &[p_s]),
+                s_shape,
+            ),
+            shape(
+                Operation::new(
+                    a,
+                    Some(t_s),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_s, zero, zero],
+                ),
+                s_shape,
+            ),
+            shape(
+                Operation::new(a, Some(v_l), OpKind::KtdpConstructMemoryView, &[p_l]),
+                l_shape,
+            ),
+            shape(
+                Operation::new(
+                    a,
+                    Some(t_l),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_l, zero, zero],
+                ),
+                l_shape,
+            ),
+            shape(
+                Operation::new(a, Some(v_w), OpKind::KtdpConstructMemoryView, &[p_w]),
+                w_shape,
+            ),
+            shape(
+                Operation::new(
+                    a,
+                    Some(t_w),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_w, zero, w_corner],
+                ),
+                (w_shape.0, w_shape.1 - weight_col_corner),
+            ),
+            shape(
+                Operation::new(a, Some(v_out), OpKind::KtdpConstructMemoryView, &[p_out]),
+                out_shape,
+            ),
+            shape(
+                Operation::new(
+                    a,
+                    Some(t_out),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_out, zero, zero],
+                ),
+                out_shape,
+            ),
+            Operation::new(a, Some(val), OpKind::KtdpLoad, &[t_w]),
+            Operation::new(a, None, OpKind::KtdpStore, &[val, t_out]),
+        ];
+        KtirNode {
+            func: IRFunction {
+                name: "embed_row_gather_s0",
+                arguments: a.args(vec![
+                    (p_s, IrType::Index),
+                    (p_l, IrType::Index),
+                    (p_w, IrType::Index),
+                    (p_out, IrType::Index),
+                ]),
+                operations: a.ops(ops),
+                grid: (1, 1, 1),
+                return_type: None,
+            },
+            // k = `entries` — the payload's stated entry count for this
+            // fixture's hidden (the mint's own law answer).
+            program: Program::EmbedRowGather { k: entries },
+            bindings: vec![
+                BufferId::new(301),
+                BufferId::new(302),
+                BufferId::new(303),
+                BufferId::new(304),
+            ],
+            mask: None,
+            node_out_tid: None,
+            minted: Default::default(),
+        }
+    }
+
+    fn whole_program() -> KtirNode {
+        embed_row_gather_program(IDX, IDX, (HIDDEN, VOCAB), (1, HIDDEN), 0, 1)
+    }
+
+    fn lower(k: &KtirNode) -> Result<Vec<EmittedOp>, lower_ktir_to_superdsc::Error> {
+        let mut sid = 0i64;
+        let r = lower_ktir_to_superdsc::regions(k)?;
+        lower_ktir_to_superdsc::embed_row_gather(k.func.name, k, &r, &mut sid, None)
+    }
+
+    /// The refusal message, or a panic naming what was emitted instead (`EmittedOp` is deliberately
+    /// not `Debug`, so `expect_err` cannot be used).
+    fn refusal(k: &KtirNode) -> String {
+        match lower(k) {
+            Ok(ops) => panic!(
+                "expected a refusal, got {} descriptor(s): {:?}",
+                ops.len(),
+                ops.iter().map(|o| o.op_name.clone()).collect::<Vec<_>>()
+            ),
+            Err(e) => e.message,
+        }
+    }
+
+    /// The SLAB-GATHER leg's per-core Dsc — the body the card schedules from, reached off the first
+    /// op of the chain (the names tests pin that ordering first). The `gather_cut` module's `body`
+    /// spelling, local to this module so the two never couple.
+    fn slab_body(ops: &[EmittedOp]) -> &crate::wire::Dsc {
+        ops[0]
+            .op
+            .as_ref()
+            .expect("the slab gather carries a descriptor")
+            .dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc per leg")
+    }
+
+    /// The ROW-GATHER leg's per-core Dsc — the same spelling as [`slab_body`], off the chain's
+    /// third op (the ramp-addressed leg the defect lived in).
+    fn row_body(ops: &[EmittedOp]) -> &crate::wire::Dsc {
+        ops[2]
+            .op
+            .as_ref()
+            .expect("the row gather carries a descriptor")
+            .dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc per leg")
+    }
+
+    /// THE CONTROL: the legal geometry bakes, and it bakes the THREE LEGS IN CHAIN ORDER — the slab
+    /// gather, the transpose, the row gather — each named after its leg, so a reordering or a dropped
+    /// leg fails on the names, not just the count. This is the k = 1 DEGENERATE on the SLAB side
+    /// (hidden 128: 512·128 = 65,536 B, far under the budget — the payload's lawful answer is one
+    /// entry), so it pins the slab gather's one-entry descriptor as the split's own baseline — and
+    /// the ROW side's NEW geometry beside it: the ramp-addressed leg at hidden 128 runs
+    /// `hidden/64` = 2 one-stick entries, the flat one-entry read it replaces.
+    #[test]
+    fn the_legal_geometry_lowers_to_the_three_legs_in_chain_order() {
+        let ops = lower(&whole_program())
+            .expect("a stick-aligned chained head is the case this door supports");
+        let names: Vec<&str> = ops.iter().map(|o| o.op_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "embed_row_gather_s0_slabg",
+                "embed_row_gather_s0_xpose",
+                "embed_row_gather_s0_rowg",
+            ],
+            "the chain is slab gather → transpose → row gather, each named after its leg"
+        );
+        // ⛔ THE DEGENERATE'S DESCRIPTOR, EXECUTED — the byte-identical baseline the split is
+        // claimed against, pinned as a descriptor rather than stated in prose: ONE live entry
+        // (page = hidden/1 = the whole `mb`), so the gather's whole-entry division law
+        // (`gather_copy_cores`) leaves `mb` unsplit — one core owning the whole hidden. This is
+        // today's one-entry splat geometry, and the k=4 test's 4-entry division is the same law
+        // at the split.
+        let slabg = ops[0]
+            .op
+            .as_ref()
+            .expect("the slab gather carries a descriptor");
+        assert_eq!(
+            slabg.numWkSlicesPerDim_.get("mb"),
+            Some(&1),
+            "one live entry: the degenerate's `mb` does not split"
+        );
+        assert_eq!(slabg.numCoresUsed_, 1, "one entry, one core");
+        assert_eq!(
+            slab_body(&ops).dataStageParam_["0"].ss_.mb_,
+            HIDDEN,
+            "the per-core `mb` is the whole hidden — the splat's own geometry"
+        );
+        // ⛔ THE ROW GATHER'S RAMP GEOMETRY, EXECUTED — the leg the defect lived in: at
+        // hidden 128 the row gather runs hidden/64 = 2 ONE-STICK entries (page 1), so `mb`
+        // splits by its 2 live entries over 2 cores and each core's `mb` IS the page — one
+        // stick, `skip_addr = 64` elements, the ramp lane naming source stick `64·i + l`.
+        // The old flat spelling (page = hidden/stk = 2) showed `mb` unsplit at one core
+        // owning per-core mb 2 — the consecutive-stick walk the ramp law closes.
+        let rowg = ops[2]
+            .op
+            .as_ref()
+            .expect("the row gather carries a descriptor");
+        assert_eq!(
+            rowg.numWkSlicesPerDim_.get("mb"),
+            Some(&2),
+            "the row gather's `mb` splits by its 2 one-stick entries (the flat read shows 1)"
+        );
+        assert_eq!(rowg.numCoresUsed_, 2, "2 entries, one core each");
+        assert_eq!(
+            row_body(&ops).dataStageParam_["0"].ss_.mb_,
+            1,
+            "the per-core `mb` IS the page — one stick per entry"
+        );
+    }
+
+    /// ⭐ THE SPLIT AT GRANITE'S OWN GEOMETRY — hidden 2048, the payload's k = 4
+    /// (the mint's law answer: 512·2048 = 1,048,576 B over the vendor budget at
+    /// one entry, 524,288 over at two, 262,144 in at four): the door bakes the
+    /// same three legs in the same chain order at the split — the slab gather's
+    /// page 512 positions, its per-core LX charge one entry's. The FLAT-ADDRESS
+    /// LAW (stated at the leg) keeps the split's bytes and addresses identical
+    /// to the splat's; the semantic pin is scratchy-subtile's k = 4 graph leg,
+    /// and this is the door's own acceptance of the split geometry.
+    #[test]
+    fn embed_row_gather_splits_the_slab_at_k_four() {
+        let ops = lower(&embed_row_gather_program(
+            IDX,
+            IDX,
+            (2048, VOCAB),
+            (1, 2048),
+            0,
+            4,
+        ))
+        .expect("the split geometry is the case this door exists for");
+        let names: Vec<&str> = ops.iter().map(|o| o.op_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "embed_row_gather_s0_slabg",
+                "embed_row_gather_s0_xpose",
+                "embed_row_gather_s0_rowg",
+            ],
+            "the split keeps the chain — slab gather → transpose → row gather"
+        );
+        // ⛔⛔⛔ THE EMITTED GEOMETRY — THE TIE BETWEEN PAYLOAD AND DESCRIPTOR, pinned on the
+        // descriptor the card sees. The counterfactual this exists to refuse: `of_positions(hidden)`
+        // — the unsplit spelling — BAKES CLEAN through every check on the way here (the charge
+        // backstop reads the LOCAL `page = hidden/entries`; the raw door sees rows/hidden = 1
+        // entry; the leg names are unchanged) and gathers entry word0 = k·s = 4s with skip_addr
+        // one whole slab — slab 4s, not slab s: silently wrong rows, and an out-of-bounds read
+        // past the weight's region, caught only by the card. Here the split is EXECUTED, not
+        // stated: `mb` 2048 positions divided by WHOLE ENTRIES (page 512) is 4 live entries,
+        // and the gather's whole-entry division law (`gather_copy_cores`) spreads them over 4
+        // cores — one entry per core, exactly the per-core LX charge the two-ceiling law bounds.
+        let slabg = ops[0]
+            .op
+            .as_ref()
+            .expect("the slab gather carries a descriptor");
+        assert_eq!(
+            slabg.numWkSlicesPerDim_.get("mb"),
+            Some(&4),
+            "the slab gather's `mb` splits by its 4 live entries (the unsplit spelling shows 1)"
+        );
+        assert_eq!(
+            slabg.numCoresUsed_, 4,
+            "4 entries, one core each — the gather's whole-entry division"
+        );
+        assert_eq!(
+            slab_body(&ops).dataStageParam_["0"].ss_.mb_,
+            512,
+            "the per-core `mb` IS the page — one 512-position entry per core"
+        );
+        // ⛔ THE ROW GATHER AT GRANITE'S OWN WIDTH — hidden 2048 runs hidden/64 = 32
+        // one-stick entries, exactly the IBR stick's lanes: `mb` splits 32 ways, one
+        // stick per core (`skip_addr = 64` elements), the ramp lane `i` naming source
+        // stick `64·i + l` — the transposed row's own sticks, never a flat walk.
+        let rowg = ops[2]
+            .op
+            .as_ref()
+            .expect("the row gather carries a descriptor");
+        assert_eq!(
+            rowg.numWkSlicesPerDim_.get("mb"),
+            Some(&32),
+            "the row gather's `mb` splits by its 32 one-stick entries (the flat read shows 1)"
+        );
+        assert_eq!(rowg.numCoresUsed_, 32, "32 entries, one core each");
+        assert_eq!(
+            row_body(&ops).dataStageParam_["0"].ss_.mb_,
+            1,
+            "the per-core `mb` IS the page — one stick per entry"
+        );
+    }
+
+    /// ⛔ THE PINNED DEFECT'S OWN SHAPE, REFUSED BY NAME — hidden 2048 at ONE
+    /// entry (the stale payload: the geometry that produced dxp's
+    /// `Expect valid chunk size that fits in LX` on the card) charges one core
+    /// 4 × 262,144 = 1,048,576 B against the 406,323 B vendor budget, and the
+    /// door names the charge, the budget, and the stale payload — a bake
+    /// failure, never a card surprise.
+    #[test]
+    fn embed_row_gather_refuses_the_pinned_lx_charge() {
+        let e = refusal(&embed_row_gather_program(
+            IDX,
+            IDX,
+            (2048, VOCAB),
+            (1, 2048),
+            0,
+            1,
+        ));
+        assert!(
+            e.contains("charge one core 1048576 B of LX"),
+            "names the per-core charge, got: {e}"
+        );
+        assert!(
+            e.contains("4 × one entry's 262144 B"),
+            "states the 4× law and one entry's bytes, got: {e}"
+        );
+        assert!(
+            e.contains("VENDOR_LX_SCHED_BYTES = 406323 B"),
+            "names the vendor budget, got: {e}"
+        );
+        assert!(
+            e.contains("a payload stating fewer entries is stale"),
+            "names the stale payload, got: {e}"
+        );
+    }
+
+    /// ⛔ THE LIVE-ENTRY CEILING, SURFACING THROUGH THE RAW DOOR — k = 64 at
+    /// hidden 2048 divides the hidden and clears the charge (4 × 32 × 64 × 2 =
+    /// 16,384 B, far under), but 64 entries is past the 32-entry IBR stick cap,
+    /// and the raw door's wrap refusal (rung 8's corruption, made
+    /// unrepresentable) fires through the slab gather's leg.
+    #[test]
+    fn embed_row_gather_refuses_entries_past_the_ibr_stick_cap() {
+        let e = refusal(&embed_row_gather_program(
+            IDX,
+            IDX,
+            (2048, VOCAB),
+            (1, 2048),
+            0,
+            64,
+        ));
+        assert!(
+            e.contains("64 index entries"),
+            "the raw door's refusal surfaces through the leg, got: {e}"
+        );
+        assert!(
+            e.contains("one gather op's index is ONE 32-entry stick"),
+            "names the IBR stick cap, got: {e}"
+        );
+    }
+
+    /// ⛔ THE LANE INDEX CARRIES EVERY ENTRY OF EVERY REQUEST — hidden 4096 at the
+    /// payload's lawful k = 8 (512·512 = 262,144 B, inside the budget) is a geometry
+    /// this door ACCEPTS since the per-stick cut landed (the rung-8 remedy: the row
+    /// gather's 64 one-stick entries run ONE OP PER INDEX STICK against an IBR loaded
+    /// 32 words per stick, so the old 32-entry ceiling became a SHAPE law) — and the
+    /// lane index must therefore state `[width·l_sticks, 32]`: row r's 2 sticks then
+    /// row r+1's. The ONE-ROW spelling `[1, 32]` (the era this test module was written
+    /// in) is a stale payload at this hidden — refused by name, never half-gathered on
+    /// the card — and the LAWFUL two-stick spelling bakes, which is the proof the cut
+    /// handles the row width the ceiling used to refuse.
+    #[test]
+    fn embed_row_gather_refuses_a_stale_one_stick_lane_index() {
+        let e = refusal(&embed_row_gather_program(
+            IDX,
+            IDX,
+            (4096, VOCAB),
+            (1, 4096),
+            0,
+            8,
+        ));
+        assert!(
+            e.contains("the lane index t302 states [1, 32]"),
+            "names the lane index and its stale shape, got: {e}"
+        );
+        assert!(
+            e.contains("the row gather runs 64 one-stick entries per request"),
+            "names the leg and its per-request entry count, got: {e}"
+        );
+        assert!(
+            e.contains("the lane index is [2, 32]"),
+            "names the lawful two-stick spelling, got: {e}"
+        );
+        assert!(
+            e.contains("never half-gathered on the card"),
+            "states the law, got: {e}"
+        );
+        // The lawful spelling bakes: the same geometry with the lane index
+        // stating every entry (`[width·l_sticks, 32]` = [2, 32] at width 1)
+        // lowers the three legs — the per-stick cut's own answer to the row
+        // the old ceiling refused.
+        let ops = lower(&embed_row_gather_program(
+            IDX,
+            (2, 32),
+            (4096, VOCAB),
+            (1, 4096),
+            0,
+            8,
+        ))
+        .expect("the two-stick lane index is the lawful spelling at hidden 4096");
+        let names: Vec<&str> = ops.iter().map(|o| o.op_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "embed_row_gather_s0_slabg",
+                "embed_row_gather_s0_xpose",
+                "embed_row_gather_s0_rowg0",
+                "embed_row_gather_s0_rowg1",
+            ],
+            "the cut runs the slab gather and the transpose, then ONE ROW-GATHER OP PER \
+             INDEX STICK — two at the two-stick lane index, the per-stick cut's own \
+             signature (the single `rowg` the one-stick spellings bake)"
+        );
+    }
+
+    /// ⛔ A COUNT THAT LEAVES A PARTIAL PAGE IS AN ADDRESS — k = 3 at hidden
+    /// 2048 does not divide (2048 = 3·682 + 2), and the door refuses the
+    /// payload by name before any geometry is minted: the mint's law answers
+    /// only divisors of the hidden.
+    #[test]
+    fn embed_row_gather_refuses_a_count_that_leaves_a_partial_page() {
+        let e = refusal(&embed_row_gather_program(
+            IDX,
+            IDX,
+            (2048, VOCAB),
+            (1, 2048),
+            0,
+            3,
+        ));
+        assert!(
+            e.contains("states 3 slab entries against hidden 2048"),
+            "names the payload count and the hidden, got: {e}"
+        );
+        assert!(
+            e.contains("must DIVIDE the hidden"),
+            "states the divisibility law, got: {e}"
+        );
+    }
+
+    /// ⛔ THE IDX-STICK CLASS, REFUSED BY NAME ON BOTH INDEX OPERANDS — the u32 index
+    /// stick's own shape is `[1, 32]` SENUINT32; a wider index declares entries this op
+    /// never spends, and the refusal must say WHICH index stick is wrong.
+    #[test]
+    fn an_index_stick_off_the_idx_class_is_refused_and_named() {
+        let e = refusal(&embed_row_gather_program(
+            (1, 128),
+            IDX,
+            (HIDDEN, VOCAB),
+            (1, HIDDEN),
+            0,
+            1,
+        ));
+        assert!(
+            e.contains("the slab index t301 states [1, 128]"),
+            "names the slab index stick and its shape, got: {e}"
+        );
+        assert!(
+            e.contains("the u32 index-stick class"),
+            "names the class the stick must carry, got: {e}"
+        );
+        let e = refusal(&embed_row_gather_program(
+            IDX,
+            (2, 32),
+            (HIDDEN, VOCAB),
+            (1, HIDDEN),
+            0,
+            1,
+        ));
+        assert!(
+            e.contains("the lane index t302 states [2, 32]"),
+            "names the LANE index stick when that is the wrong one, got: {e}"
+        );
+    }
+
+    /// ⛔ THE VOCAB STICK LAW — a vocab that is not a whole multiple of 64 is a partial slab, i.e. an
+    /// ADDRESS, and the refusal must blame the vocab axis (not the hidden one, which is also stated).
+    #[test]
+    fn a_partial_slab_vocab_is_refused_blaming_the_vocab_axis() {
+        let e = refusal(&embed_row_gather_program(
+            IDX,
+            IDX,
+            (HIDDEN, 100),
+            (1, HIDDEN),
+            0,
+            1,
+        ));
+        assert!(
+            e.contains("vocab 100, not a whole multiple"),
+            "blames the vocab axis, got: {e}"
+        );
+    }
+
+    /// ⛔ THE VOCAB STICK LAW AT THE REAL PRODUCTION SHAPE — granite-3.1-2b's own
+    /// `[2048, 49155]` (49155 = 768·64 + 67, a partial slab), the exact pair the
+    /// fix-5 cell's build leg refused at expansion on 2026-10-24: the mint stated
+    /// the weight at its raw vocab and the door caught it before any card run.
+    /// The toy shapes above and the module's stick-whole fixtures (512 here, 4096
+    /// at the chain stage's) never pin the REAL pair — this one does, so the
+    /// guard that caught the raw-vocab weight fires in the suite against the
+    /// shape that actually occurred, never again only in production. The legal
+    /// graph states the PAD (the widening pass's law); this refusal is the
+    /// door's half of that pair.
+    #[test]
+    fn the_granite_vocab_shape_is_refused_as_a_partial_slab() {
+        let e = refusal(&embed_row_gather_program(
+            IDX,
+            IDX,
+            (2048, 49155),
+            (1, 2048),
+            0,
+            4,
+        ));
+        assert!(
+            e.contains("vocab 49155, not a whole multiple of the 64-element fp16 stick"),
+            "names the real vocab and the stick width, got: {e}"
+        );
+        assert!(
+            e.contains("a partial slab is an address"),
+            "states the address law, got: {e}"
+        );
+    }
+
+    /// ⛔ THE HIDDEN STICK LAW — the transpose leg requires `hidden` 64-aligned, and the refusal names
+    /// the transpose (the leg that needs it), so a producer pads the right axis.
+    #[test]
+    fn an_unaligned_hidden_is_refused_naming_the_transpose_leg() {
+        let e = refusal(&embed_row_gather_program(
+            IDX,
+            IDX,
+            (96, VOCAB),
+            (1, 96),
+            0,
+            1,
+        ));
+        assert!(
+            e.contains("hidden 96 is not a whole multiple"),
+            "names the hidden extent, got: {e}"
+        );
+        assert!(
+            e.contains("the transpose leg"),
+            "names the leg that needs the alignment, got: {e}"
+        );
+    }
+
+    /// ⛔ THE TIE'S OWN SHAPE — the row out is `[1, hidden]` with `hidden` the weight's own row count;
+    /// a `[1, 2·hidden]` out (or a mismatched weight row count) is the tied-embedding shape being
+    /// stated wrong, not a tiling decision, and is refused as such.
+    #[test]
+    fn an_out_that_is_not_one_row_of_the_weight_is_refused() {
+        let e = refusal(&embed_row_gather_program(
+            IDX,
+            IDX,
+            (HIDDEN, VOCAB),
+            (1, 2 * HIDDEN),
+            0,
+            1,
+        ));
+        assert!(
+            e.contains("the row out t304 states [1, 256]"),
+            "names the out view and its stated shape, got: {e}"
+        );
+        assert!(
+            e.contains("tied-embedding shape"),
+            "names the law the shape violates, got: {e}"
+        );
+    }
+
+    /// ⛔ THE WHOLE-VIEW LAW — the chain's legs name whole buffers (the gather and transpose doors
+    /// take a name and extents, no corner), so a stated column window on the weight is refused rather
+    /// than widened: the descriptor would read columns the program never declared.
+    #[test]
+    fn a_windowed_weight_is_refused_rather_than_widened() {
+        let e = refusal(&embed_row_gather_program(
+            IDX,
+            IDX,
+            (HIDDEN, VOCAB),
+            (1, HIDDEN),
+            64,
+            1,
+        ));
+        assert!(
+            e.contains("the weight t303 takes columns 64..512"),
+            "names the operand, its tid and its window, got: {e}"
+        );
+    }
+
+    /// ⭐ THE SCRATCH PLACEMENTS, AT THEIR TRUE FOOTPRINTS — the door mints the slab and the
+    /// transposed slab through the placement's own synth join, and the transposed placement
+    /// carries the SENTINEL'S ZERO TAIL: `[65, hidden]`, not `[64, hidden]` — the real
+    /// transpose writes exactly the first `hidden` sticks (element `(out, y)` at stick
+    /// `64·⌊y/64⌋ + out` tops out at `hidden − 1`), and an `l_tab` sentinel mapping's ramp
+    /// lanes name the UNWRITTEN tail `[hidden, hidden + hidden/64)`, which the extra row
+    /// reserves (the two-ended device parity's sentinel leg, stated as bytes: 65·hidden·2,
+    /// the tail never written by any op).
+    #[test]
+    fn the_transposed_slab_reserves_the_sentinels_zero_tail() {
+        use crate::placement::{SegRole, TensorPlacement};
+        let mut l = BundleLayout::default();
+        // The four act operands, placed the way a bake places them — the sticks at one
+        // u32 stick each, the weight at `[hidden, vocab]` fp16, the row out at
+        // `[1, hidden]` fp16.
+        for (tid, bytes) in [
+            (301u32, 32u64 * 4),
+            (302, 32 * 4),
+            (303, (HIDDEN as u64) * (VOCAB as u64) * 2),
+            (304, (HIDDEN as u64) * 2),
+        ] {
+            l.ids.borrow_mut().insert(act_name(tid), PlaceId::Act(tid));
+            l.placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    role: SegRole::Intermediate,
+                    segment: 0,
+                    bank: 0,
+                    offset: 0,
+                    size: bytes,
+                },
+            );
+        }
+        let mut sid = 0i64;
+        let program = whole_program();
+        let r = lower_ktir_to_superdsc::regions(&program).unwrap();
+        lower_ktir_to_superdsc::embed_row_gather(
+            program.func.name,
+            &program,
+            &r,
+            &mut sid,
+            Some(&l),
+        )
+        .expect("the legal geometry places");
+        assert_eq!(
+            l.id_of("t304_cslab"),
+            Some(PlaceId::Synth {
+                of: 304,
+                role: crate::place::SynthRole::ChainSlab
+            }),
+            "the slab's identity is the synth join, minted off the row out's tid"
+        );
+        assert_eq!(
+            l.id_of("t304_cslabt"),
+            Some(PlaceId::Synth {
+                of: 304,
+                role: crate::place::SynthRole::ChainSlabT
+            }),
+            "the transposed slab's identity is the synth join"
+        );
+        let sizes = l.synth.borrow();
+        assert_eq!(
+            sizes.sizes["t304_cslab"],
+            crate::placement::align128((HIDDEN as u64) * 64 * 2),
+            "the slab is [hidden, 64] fp16"
+        );
+        assert_eq!(
+            sizes.sizes["t304_cslabt"],
+            crate::placement::align128((64 + 1) * (HIDDEN as u64) * 2),
+            "the transposed slab is [65, hidden] fp16 — 64 rows of transpose PLUS the \
+             sentinel's zero tail"
+        );
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE CHAINED HEAD'S PICK DECOMPOSE, AT ITS ENTRY POINT (#603) —
+/// [`lower_ktir_to_superdsc::chain_stage`], the same law the row door's tests state: a
+/// hand-minted program shaped like the real producer's (six parameters in mint order —
+/// the pick stick, the persistent s stick, the persistent l stick, the two decompose
+/// tables, the fresh s-value stick out), lowered, must bake the three one-entry table
+/// gathers in order and refuse every stated-law violation BY NAME — the tables' own
+/// extent included, cross-checked against the program's `pad_vocab` so a mismatched
+/// pair cannot gather past the staged bytes; and with a layout it must mint NO synth of
+/// its own (the tables are graph sources the placement pass places, never door-minted
+/// reservations).
+#[cfg(test)]
+mod chain_stage_tests {
+    use super::*;
+    use crate::ktir_node::{BufferId, KtirNode, Program};
+    use crate::place::PlaceId;
+    use crate::place::act_name;
+    use ktir_core::arena::Arena;
+    use ktir_core::attrkey::AttrKey;
+    use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
+    use ktir_core::irtype::IrType;
+    use ktir_core::opkind::OpKind;
+
+    /// The decompose's smallest honest geometry: the pick stick `[1, 64]` (the argmax idx
+    /// stick's own class), all three destinations `[1, 32]` (the u32 stick), both tables
+    /// `[table_rows, 32]` — the extent the PAYLOAD states (the mint's one computation; the
+    /// door re-derives nothing) — with `pad_vocab` 4096 and `table_rows` 8257, the pair
+    /// the mint states for a one-group vocab pad.
+    const PICK: (i64, i64) = (1, 64);
+    const USTICK: (i64, i64) = (1, 32);
+    const PAD_VOCAB: u32 = 4096;
+    /// The mint's stated extent for `PAD_VOCAB` 4096 (4096 + 4160 + 1), pinned here as
+    /// the payload the door reads — the derivation is the mint's, proved at the mint.
+    const TABLE_ROWS: u32 = 8257;
+    const TABLES: (i64, i64) = (TABLE_ROWS as i64, 32);
+    /// The door tests' toy hidden — `chain_slab_entries(128)` answers 1 (subtile_ir's
+    /// own test pins 128 as "the door tests' toy"), the one-entry geometry these tests
+    /// state; the payload carries it, the door never derives it.
+    const HIDDEN: u32 = 128;
+
+    /// One KTIR program shaped like the spyre emitter's mint: parameters 0..5 are (pick,
+    /// s stick, l stick, s table, l table, s-value out), each with a memory view and an
+    /// access tile of its whole buffer, one load off the pick tile and one store through
+    /// the out tile.
+    fn chain_stage_program(
+        pick_shape: (i64, i64),
+        s_shape: (i64, i64),
+        l_shape: (i64, i64),
+        stab_shape: (i64, i64),
+        ltab_shape: (i64, i64),
+        out_shape: (i64, i64),
+        pad_vocab: u32,
+        table_rows: u32,
+        hidden: u32,
+    ) -> KtirNode {
+        let a: &'static Arena = Arena::global();
+        let shape = |op: Operation<'static>, s: (i64, i64)| {
+            op.with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![s.0, s.1])))
+        };
+        let (p_pick, p_s, p_l, p_stab, p_ltab, p_out, zero) =
+            (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4), Ssa(5), Ssa(6));
+        let (v_pick, v_s, v_l, v_stab, v_ltab, v_out) =
+            (Ssa(7), Ssa(8), Ssa(9), Ssa(10), Ssa(11), Ssa(12));
+        let (t_pick, t_s, t_l, t_stab, t_ltab, t_out, val) = (
+            Ssa(13),
+            Ssa(14),
+            Ssa(15),
+            Ssa(16),
+            Ssa(17),
+            Ssa(18),
+            Ssa(19),
+        );
+        let ops = vec![
+            Operation::new(a, Some(zero), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(0),
+            ),
+            shape(
+                Operation::new(a, Some(v_pick), OpKind::KtdpConstructMemoryView, &[p_pick]),
+                pick_shape,
+            ),
+            shape(
+                Operation::new(
+                    a,
+                    Some(t_pick),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_pick, zero, zero],
+                ),
+                pick_shape,
+            ),
+            shape(
+                Operation::new(a, Some(v_s), OpKind::KtdpConstructMemoryView, &[p_s]),
+                s_shape,
+            ),
+            shape(
+                Operation::new(
+                    a,
+                    Some(t_s),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_s, zero, zero],
+                ),
+                s_shape,
+            ),
+            shape(
+                Operation::new(a, Some(v_l), OpKind::KtdpConstructMemoryView, &[p_l]),
+                l_shape,
+            ),
+            shape(
+                Operation::new(
+                    a,
+                    Some(t_l),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_l, zero, zero],
+                ),
+                l_shape,
+            ),
+            shape(
+                Operation::new(a, Some(v_stab), OpKind::KtdpConstructMemoryView, &[p_stab]),
+                stab_shape,
+            ),
+            shape(
+                Operation::new(
+                    a,
+                    Some(t_stab),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_stab, zero, zero],
+                ),
+                stab_shape,
+            ),
+            shape(
+                Operation::new(a, Some(v_ltab), OpKind::KtdpConstructMemoryView, &[p_ltab]),
+                ltab_shape,
+            ),
+            shape(
+                Operation::new(
+                    a,
+                    Some(t_ltab),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_ltab, zero, zero],
+                ),
+                ltab_shape,
+            ),
+            shape(
+                Operation::new(a, Some(v_out), OpKind::KtdpConstructMemoryView, &[p_out]),
+                out_shape,
+            ),
+            shape(
+                Operation::new(
+                    a,
+                    Some(t_out),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_out, zero, zero],
+                ),
+                out_shape,
+            ),
+            Operation::new(a, Some(val), OpKind::KtdpLoad, &[t_pick]),
+            Operation::new(a, None, OpKind::KtdpStore, &[val, t_out]),
+        ];
+        KtirNode {
+            func: IRFunction {
+                name: "chain_stage_s0",
+                arguments: a.args(vec![
+                    (p_pick, IrType::Index),
+                    (p_s, IrType::Index),
+                    (p_l, IrType::Index),
+                    (p_stab, IrType::Index),
+                    (p_ltab, IrType::Index),
+                    (p_out, IrType::Index),
+                ]),
+                operations: a.ops(ops),
+                grid: (1, 1, 1),
+                return_type: None,
+            },
+            // k = 1 — these door tests pin today's one-entry geometry (the
+            // splat-pattern tables this fixture's refusals exercise); hidden
+            // is the payload's own statement, never derived from the stick.
+            program: Program::ChainStage {
+                pad_vocab,
+                table_rows,
+                k: 1,
+                hidden,
+            },
+            bindings: vec![
+                BufferId::new(301),
+                BufferId::new(302),
+                BufferId::new(303),
+                BufferId::new(305),
+                BufferId::new(306),
+                BufferId::new(307),
+            ],
+            mask: None,
+            node_out_tid: None,
+            minted: Default::default(),
+        }
+    }
+
+    fn whole_program() -> KtirNode {
+        chain_stage_program(
+            PICK, USTICK, USTICK, TABLES, TABLES, USTICK, PAD_VOCAB, TABLE_ROWS, HIDDEN,
+        )
+    }
+
+    fn lower(k: &KtirNode) -> Result<Vec<EmittedOp>, lower_ktir_to_superdsc::Error> {
+        let mut sid = 0i64;
+        let r = lower_ktir_to_superdsc::regions(k)?;
+        lower_ktir_to_superdsc::chain_stage(k.func.name, k, &r, &mut sid, None)
+    }
+
+    fn refusal(k: &KtirNode) -> String {
+        match lower(k) {
+            Ok(ops) => panic!(
+                "expected a refusal, got {} descriptor(s): {:?}",
+                ops.len(),
+                ops.iter().map(|o| o.op_name.clone()).collect::<Vec<_>>()
+            ),
+            Err(e) => e.message,
+        }
+    }
+
+    /// THE CONTROL: the legal geometry bakes, and it bakes the THREE GATHERS IN ORDER —
+    /// the persistent s write, the fresh s-value output, the persistent l write — each
+    /// named after its leg.
+    #[test]
+    fn the_legal_geometry_lowers_to_the_three_gathers_in_order() {
+        let ops = lower(&whole_program())
+            .expect("a stick-aligned chain stage is the case this door supports");
+        let names: Vec<&str> = ops.iter().map(|o| o.op_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "chain_stage_s0_sg",
+                "chain_stage_s0_so",
+                "chain_stage_s0_lg",
+            ],
+            "the decompose is s-persistent → s-fresh → l-persistent, each named after its \
+             leg"
+        );
+    }
+
+    /// ⛔ THE PICK-STICK CLASS — the sampler idx stick's own shape is `[width, 64]`
+    /// (i32 lanes, every lane of row r equal to row r's pick, splatted by the kernel
+    /// that wrote it); a pick off that class is a producer the chain never minted,
+    /// refused by name.
+    #[test]
+    fn a_pick_stick_off_the_argmax_class_is_refused() {
+        let e = refusal(&chain_stage_program(
+            (1, 32),
+            USTICK,
+            USTICK,
+            TABLES,
+            TABLES,
+            USTICK,
+            PAD_VOCAB,
+            TABLE_ROWS,
+            HIDDEN,
+        ));
+        assert!(
+            e.contains("the pick stick t301 states [1, 32]"),
+            "names the pick stick and its shape, got: {e}"
+        );
+        assert!(
+            e.contains("the sampler idx-stick class, [width, 64]"),
+            "names the class the pick must carry, got: {e}"
+        );
+    }
+
+    /// ⛔ THE U32-STICK CLASS ON EVERY DESTINATION — a staged table's gathered destination
+    /// is exactly one `[1, 32]` SENUINT32 stick (the full-window law); a wider destination
+    /// is refused naming WHICH one is wrong.
+    #[test]
+    fn a_destination_off_the_ustick_class_is_refused_and_named() {
+        let e = refusal(&chain_stage_program(
+            PICK,
+            (1, 64),
+            USTICK,
+            TABLES,
+            TABLES,
+            USTICK,
+            PAD_VOCAB,
+            TABLE_ROWS,
+            HIDDEN,
+        ));
+        assert!(
+            e.contains("the persistent s stick t302 states [1, 64]"),
+            "names the persistent s stick and its shape, got: {e}"
+        );
+        assert!(
+            e.contains("the u32 index-stick class"),
+            "names the class the destination must carry, got: {e}"
+        );
+        let e = refusal(&chain_stage_program(
+            PICK,
+            USTICK,
+            USTICK,
+            TABLES,
+            TABLES,
+            (1, 64),
+            PAD_VOCAB,
+            TABLE_ROWS,
+            HIDDEN,
+        ));
+        assert!(
+            e.contains("the s-value output t307 states [1, 64]"),
+            "names the OUTPUT when that is the wrong one, got: {e}"
+        );
+    }
+
+    /// ⛔ THE TABLE OPERANDS' OWN EXTENT — each table must state exactly
+    /// `[table_rows, 32]`, the extent the PAYLOAD states (the mint's one computation of
+    /// it; the door re-derives nothing); a table staged at another model's vocab (or
+    /// truncated by the splice) is refused naming WHICH table and what it stated. The
+    /// one-short row is the sharpest probe: the sentinel row itself drops out of the
+    /// extent.
+    #[test]
+    fn a_table_off_the_staged_extent_is_refused_and_named() {
+        let short = (TABLE_ROWS as i64 - 1, 32);
+        let e = refusal(&chain_stage_program(
+            PICK, USTICK, USTICK, short, TABLES, USTICK, PAD_VOCAB, TABLE_ROWS, HIDDEN,
+        ));
+        assert!(
+            e.contains("the s decompose table t305 states [8256, 32]"),
+            "names the s table, its tid, and its stated shape, got: {e}"
+        );
+        assert!(
+            e.contains("[8257, 32]"),
+            "names the payload's own stated extent, got: {e}"
+        );
+        let e = refusal(&chain_stage_program(
+            PICK, USTICK, USTICK, TABLES, short, USTICK, PAD_VOCAB, TABLE_ROWS, HIDDEN,
+        ));
+        assert!(
+            e.contains("the l decompose table t306 states [8256, 32]"),
+            "names the l table when THAT is the wrong one, got: {e}"
+        );
+    }
+
+    /// ⭐ THE TABLES ARE GRAPH SOURCES, NOT DOOR-MINTED SYNTHS — with a layout the legal
+    /// geometry mints NO synth of its own: the two decompose tables are ordinary tensor
+    /// operands the placement pass places (and the worker stages once at load through the
+    /// load-const registry), so a door that reserved anything for them would be a second
+    /// staging. The slab synths of [`lower_ktir_to_superdsc::embed_row_gather`] are the
+    /// door's only chain reservations.
+    #[test]
+    fn the_legal_geometry_mints_no_table_synth() {
+        use crate::placement::TensorPlacement;
+        let mut l = BundleLayout::default();
+        // The six act operands, placed the way a bake places them — the pick at one
+        // `[1, 64]` i32 stick, the persistent sticks and the fresh output at one u32
+        // stick each, the two tables at their staged `[table_rows, 32]` footprints.
+        for (tid, bytes) in [
+            (301u32, 64u64 * 4),
+            (302, 32 * 4),
+            (303, 32 * 4),
+            (305, TABLE_ROWS as u64 * 32 * 4),
+            (306, TABLE_ROWS as u64 * 32 * 4),
+            (307, 32 * 4),
+        ] {
+            l.ids.borrow_mut().insert(act_name(tid), PlaceId::Act(tid));
+            l.placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    role: crate::placement::SegRole::Intermediate,
+                    segment: 0,
+                    bank: 0,
+                    offset: 0,
+                    size: bytes,
+                },
+            );
+        }
+        let mut sid = 0i64;
+        let k = whole_program();
+        let r = lower_ktir_to_superdsc::regions(&k).unwrap();
+        lower_ktir_to_superdsc::chain_stage(k.func.name, &k, &r, &mut sid, Some(&l))
+            .expect("the legal geometry places");
+        assert!(
+            l.synth.borrow().sizes.is_empty(),
+            "the tables are graph sources the placement pass places — the door must mint \
+             no synth of its own for them"
         );
     }
 }

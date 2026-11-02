@@ -240,16 +240,40 @@ fn emit_regions(
         // a missing arm — the day the splice learns to produce one, its arm moves out of this
         // group and takes a real entry point with it. (The MoE programs are no longer variants at
         // all — the MoE lowers only from `kernels/moe.py` through KTIR.)
+        //
+        // `EmbedRowGather` and `ChainStage` are HERE and only here: their bodies (the slab
+        // gather, the restickify transpose, the row gather, the relayout; the three one-entry
+        // table gathers) are the SPYRE door's — `ktir_superdsc_door`'s `lk::embed_row_gather`
+        // and `lk::chain_stage`, the `#603` chained head — minted by the spyre-side emitter and
+        // refused by name at the splice's registry, so a node carrying either into THIS crate is
+        // a routing change, not a missing arm.
         Program::RmsNormUnit
         | Program::TanhSoftCap
         | Program::ScalarWeightMul
         | Program::Reshape
-        | Program::WindowedRmsNorm { .. } => {
+        | Program::WindowedRmsNorm { .. }
+        | Program::EmbedRowGather { .. }
+        | Program::ChainStage { .. } => {
             return Err(Error {
                 stage: "program",
                 message: format!(
                     "{:?} has no entry point on the Triton ladder — the splice produces none of \
                      these, so a node carrying one here is a routing change, not a missing arm",
+                    node.program
+                ),
+            });
+        }
+        // ⭐ THE SAMPLER IS THE ATTENTION'S OWN CLASS HERE: a multi-op whole-function
+        // body (whole-row reduces, the equality chain, the f32 selection) over
+        // THIRTEEN parameters — lowered from its compiled ops through the
+        // whole-function door (`emit_whole`), and a per-`Program` dispatch would be a
+        // second, hand-rolled path. Do not add one.
+        Program::Sample => {
+            return Err(Error {
+                stage: "program",
+                message: format!(
+                    "{:?} is a thirteen-parameter whole-function body — `emit_whole` is its \
+                     door, and a per-`Program` dispatch would be a second, hand-rolled path",
                     node.program
                 ),
             });
@@ -746,6 +770,8 @@ module {
     fn the_door_reads_the_shipped_spelling() {
         let (kspec, grid, program) =
             cases::case("mul_scale_small").expect("the case table states the configuration");
+        // This bridge drives the DOOR (`assert_the_forms_agree` reads the kind); the case
+        // table states `mul_scale_small` as `Elementwise(Mul)` — the kind this path takes.
         let src = std::fs::read_to_string(&kspec.file).expect("read the fixture");
         let mut tt = codegen::compile(&src, &kspec, Target::spyre()).expect("codegen");
         opt::make_ttir(&mut tt).expect("make_ttir");

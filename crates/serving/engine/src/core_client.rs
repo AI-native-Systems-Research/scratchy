@@ -186,6 +186,39 @@ enum PipelineMsg {
         Vec<Vec<u32>>,
         std::sync::mpsc::SyncSender<EngineResult<Vec<Vec<f32>>>>,
     ),
+    /// ⭐ #32 (C) — A KNOCK: drain the worker's in-flight queue until the named
+    /// cell is filled. Sent by a deferred output's resolver (another thread);
+    /// handled by [`executor_bg_loop`] through [`crate::executor::Executor::drain_until`].
+    Knock(std::sync::Arc<crate::executor::DrainCell>),
+    /// ⭐ #32 (C) — TEARDOWN. The worker holds a [`DrainDoor`] (a sender
+    /// clone) for exactly this channel, so dropping the client's sender alone
+    /// would never close it — the thread would outlive the client and a join
+    /// would deadlock. This message ends the loop; the thread then runs the
+    /// worker's own shutdown (whose drain flushes every in-flight step).
+    Shutdown,
+}
+
+/// ⭐ #32 (C) — THE DRAIN DOOR: a clone of the executor thread's scheduler
+/// channel, handed DOWN to the worker (through
+/// [`crate::executor::Executor::set_drain_door`]) so a deferred output's
+/// resolver can KNOCK — ask the thread that owns the in-flight queue to drain
+/// until the step it is waiting on lands. Clone by design: the worker's copy
+/// outlives the client's, which is exactly why teardown is a MESSAGE
+/// ([`PipelineMsg::Shutdown`]) rather than a channel close.
+#[derive(Clone)]
+pub struct DrainDoor {
+    tx: std::sync::mpsc::SyncSender<PipelineMsg>,
+}
+
+impl DrainDoor {
+    /// Knock: drain until `cell` is filled. Returns `Err` only when the
+    /// executor thread is gone — a resolver that cannot knock resolves its
+    /// cell with the error rather than hang.
+    pub fn knock(&self, cell: std::sync::Arc<crate::executor::DrainCell>) -> EngineResult<()> {
+        self.tx
+            .send(PipelineMsg::Knock(cell))
+            .map_err(|_| EngineError::Executor("drain door: the executor thread is gone".into()))
+    }
 }
 
 /// Results from the background executor thread.
@@ -211,6 +244,10 @@ fn executor_bg_loop(
             PipelineMsg::Embed(token_id_seqs, reply) => {
                 let _ = reply.send(executor.embed(token_id_seqs));
             }
+            PipelineMsg::Knock(cell) => {
+                executor.drain_until(&cell);
+            }
+            PipelineMsg::Shutdown => break,
         }
     }
     executor.shutdown();
@@ -231,6 +268,13 @@ impl Drop for InprocClient {
             let PipelineState {
                 sched_tx, _thread, ..
             } = pipeline;
+            // ⭐ #32 (C) — SHUTDOWN IS A MESSAGE, NOT A CLOSE. The worker
+            // holds a DrainDoor (a sender clone) onto this channel for the
+            // whole session, so dropping ours alone would leave the channel
+            // open and the join below deadlocked. The message ends the loop;
+            // the thread's own exit path then runs the worker's shutdown
+            // drain (every in-flight step's fence and bookkeeping).
+            let _ = sched_tx.send(PipelineMsg::Shutdown);
             drop(sched_tx);
             let _ = _thread.join();
         }
@@ -261,10 +305,17 @@ impl InprocClient {
         if self.pipeline.is_some() || !self.engine.async_scheduling() {
             return;
         }
-        if let Some(executor) = self.engine.take_executor() {
+        if let Some(mut executor) = self.engine.take_executor() {
             info!("InprocClient: spawning background executor thread for pipelined execution");
             let (sched_tx, sched_rx) = std::sync::mpsc::sync_channel::<PipelineMsg>(2);
             let (result_tx, result_rx) = std::sync::mpsc::sync_channel(2);
+            // ⭐ #32 (C) — THE DOOR, HANDED DOWN BEFORE THE MOVE. The worker's
+            // deferred resolvers knock through this clone; without it a
+            // deferred output has no way to wake the one thread that can fill
+            // its cell, and deferral would be a hang instead of an overlap.
+            executor.set_drain_door(DrainDoor {
+                tx: sched_tx.clone(),
+            });
             let thread = std::thread::Builder::new()
                 .name("scratchy-serving-worker".into())
                 .spawn(move || executor_bg_loop(executor, sched_rx, result_tx))

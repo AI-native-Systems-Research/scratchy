@@ -1,0 +1,258 @@
+{
+  "probe": "p3-localize",
+  "order": "auditor 2026-10-27: one run, seed 1234 solo and 1234+9999 concurrent; per decode step, request-1234's seat words and picked token vs solo; first differing step",
+  "seed": 1234,
+  "solo_entries": 64,
+  "pair_entries_1234": 64,
+  "pair_entries_9999": 64,
+  "solo_launches_with_readback": 64,
+  "pair_launches_with_readback": 67,
+  "pair_1234_rows": {
+    "0": 64
+  },
+  "pair_1234_launch_kinds": {
+    "decode-batch": 61,
+    "prefill-final": 1,
+    "solo": 2
+  },
+  "pair_9999_rows": {
+    "0": 3,
+    "1": 61
+  },
+  "pair_9999_row_words": {
+    "0": 3,
+    "1": 61
+  },
+  "common_steps": 64,
+  "solo_only_steps": [],
+  "pair_only_steps": [],
+  "duplicate_step_words": [],
+  "first_divergence_step": 77,
+  "first_words_diff": null,
+  "first_pick_diff": {
+    "step": 77,
+    "solo_pick": 931,
+    "pair_pick": 31256,
+    "words_equal": true,
+    "solo_argmax": 31256,
+    "pair_argmax": 31256,
+    "ctx": "decode-batch mq=2 start=77",
+    "row": 0
+  },
+  "member_diff_counts_over_common": {
+    "seed_lo": 0,
+    "seed_hi": 0,
+    "step": 0,
+    "gate": 0,
+    "row": 0
+  },
+  "pick_diff_count_over_common": 52,
+  "pick_diff_steps": [
+    77,
+    78,
+    79,
+    80,
+    81,
+    82,
+    83,
+    84,
+    85,
+    86,
+    87,
+    88,
+    89,
+    90,
+    91,
+    92,
+    93,
+    94,
+    95,
+    96,
+    97,
+    98,
+    99,
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119,
+    120,
+    121,
+    122,
+    123,
+    124,
+    125,
+    126,
+    127,
+    128,
+    129
+  ],
+  "branch": "numeric",
+  "branch_text": "Seat words are equal at every common step but the pick differs \u2014 numeric (the shared decode-batch mq=2 rung is a different baked tape than the solo rows=1 one); main's batched path shows the same flip class, and the gate becomes 'batched equals main's batched', not solo.",
+  "texts": {
+    "solo_seed1234": "The ocean, the vast and complex water system, encompasses about 71% of the Earth's surface, housing an extraordinary biodiversity of marine life. It plays a crucial role in regulating global climate and weather patterns through its evaporation and heat distribution,",
+    "pair_seed1234": "The ocean, the vast and complex water system, covers more than 70 percent of the Earth's surface, providing a habitat for an astonishing variety of life forms and playing a crucial role in regulating our climate. Its depths remain largely unexplored, with scientific exp",
+    "pair_seed9999": "The ocean, covering more than 70% of the Earth's surface, is a vast, interconnected body of water that hosts an astonishing variety of marine life. With its diverse ecosystems encompassing coral reefs, deep-sea trenches, and vast open"
+  },
+  "solo_context": [
+    {
+      "ctx": "solo pos=75",
+      "row": 0,
+      "words": [
+        1234,
+        0,
+        75,
+        1,
+        0
+      ],
+      "pick": 2664,
+      "argmax": 3361,
+      "eq": false
+    },
+    {
+      "ctx": "solo pos=76",
+      "row": 0,
+      "words": [
+        1234,
+        0,
+        76,
+        1,
+        0
+      ],
+      "pick": 30,
+      "argmax": 30,
+      "eq": true
+    },
+    {
+      "ctx": "solo pos=77",
+      "row": 0,
+      "words": [
+        1234,
+        0,
+        77,
+        1,
+        0
+      ],
+      "pick": 931,
+      "argmax": 31256,
+      "eq": false
+    },
+    {
+      "ctx": "solo pos=78",
+      "row": 0,
+      "words": [
+        1234,
+        0,
+        78,
+        1,
+        0
+      ],
+      "pick": 980,
+      "argmax": 980,
+      "eq": true
+    },
+    {
+      "ctx": "solo pos=79",
+      "row": 0,
+      "words": [
+        1234,
+        0,
+        79,
+        1,
+        0
+      ],
+      "pick": 2515,
+      "argmax": 2515,
+      "eq": true
+    }
+  ],
+  "pair_context": [
+    {
+      "ctx": "decode-batch mq=2 start=75",
+      "row": 0,
+      "words": [
+        1234,
+        0,
+        75,
+        1,
+        0
+      ],
+      "pick": 2664,
+      "argmax": 3361,
+      "eq": false
+    },
+    {
+      "ctx": "decode-batch mq=2 start=76",
+      "row": 0,
+      "words": [
+        1234,
+        0,
+        76,
+        1,
+        0
+      ],
+      "pick": 30,
+      "argmax": 30,
+      "eq": true
+    },
+    {
+      "ctx": "decode-batch mq=2 start=77",
+      "row": 0,
+      "words": [
+        1234,
+        0,
+        77,
+        1,
+        0
+      ],
+      "pick": 31256,
+      "argmax": 31256,
+      "eq": true
+    },
+    {
+      "ctx": "decode-batch mq=2 start=78",
+      "row": 0,
+      "words": [
+        1234,
+        0,
+        78,
+        1,
+        0
+      ],
+      "pick": 1829,
+      "argmax": 1829,
+      "eq": true
+    },
+    {
+      "ctx": "decode-batch mq=2 start=79",
+      "row": 0,
+      "words": [
+        1234,
+        0,
+        79,
+        1,
+        0
+      ],
+      "pick": 2784,
+      "argmax": 2784,
+      "eq": true
+    }
+  ],
+  "divergence_solo_readback_raw": "2026-10-27T08:58:48.879352Z DEBUG SEAT_READBACK solo pos=77 rows=1 hc1(t742)=0x9E3779B1 hc2(t743)=0x85EBCA77 hc3(t744)=0xC2B2AE3D c256(t745)=0x00000100  lane(t746)=[0, 1065353216, 1073741824, 1077936128] r0:words=[1234, 0, 77, 1, 0]:invt=1:pick=Some(931):argmax=Some(31256):eq=false",
+  "divergence_pair_readback_raw": "2026-10-27T08:58:50.956985Z DEBUG SEAT_READBACK decode-batch mq=2 start=77 rows=2 hc1(t742)=0x9E3779B1/r1=0x9E3779B1 hc2(t743)=0x85EBCA77/r1=0x85EBCA77 hc3(t744)=0xC2B2AE3D/r1=0xC2B2AE3D c256(t745)=0x00000100/r1=0x00000100  lane(t746)=[0, 1065353216, 1073741824, 1077936128] r0:words=[1234, 0, 77, 1, 0]:invt=1:pick=Some(31256):argmax=Some(31256):eq=true r1:words=[9999, 0, 75, 1, 1]:invt=1:pick=Some(41):argmax=Some(41):eq=true",
+  "divergence_pair_bind_raw": "2026-10-27T08:58:50.923979Z DEBUG SEAT_BIND rows=2 seed_words=[727, 728, 729, 730, 731] invt=t732 laws=r0:seed=1234@step77:inv_t1 r1:seed=9999@step75:inv_t1"
+}

@@ -306,8 +306,12 @@ pub struct GpuSampleParams {
     pub any_penalty: bool,
 }
 
-/// Deterministic per-request seed for an UNSEEDED GPU-sampling request:
-/// FNV-1a(req_id bytes, then `position` LE bytes) with a fixed basis. Backend-
+/// Deterministic per-request seed for an UNSEEDED GPU-sampling request: Splash's
+/// `nextUniform` (runtime/model/Runtime.cpp:834), SplitMix64 of the request's
+/// seed plus its draw counter times the golden gamma, with FNV-1a of `req_id`
+/// as the seed and `position + 1` as the counter, so a request's successive
+/// draws are independent (FNV-1a over the position's bytes alone leaves each
+/// draw a fixed shift of the one before it). Backend-
 /// AND TP-rank-independent (no process RNG, no per-rank state) so every
 /// sampler derives the identical seed for the same `(req_id, position)`.
 /// `position` is the request's generated-token count at this step (advances each
@@ -321,11 +325,27 @@ pub fn fnv_seed(req_id: &str, position: u32) -> u32 {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
     }
-    for b in position.to_le_bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    let counter = u64::from(position) + 1;
+    let mut v = h.wrapping_add(counter.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    v = (v ^ (v >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    v = (v ^ (v >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    v ^= v >> 31;
+    (v >> 32) as u32 // upper 32 bits for maximum entropy
+}
+
+/// The un-truncated FNV-1a state behind [`fnv_seed`] — a PER-REQUEST seed for a
+/// draw whose per-position salt lives somewhere else (the spyre seat stages one
+/// seed per request and lets the card's noise hash mix the position in, so the
+/// request-level seed must not already depend on it). Same basis, same prime,
+/// same "not `DefaultHasher`" law; the only difference is that nothing is cut
+/// off.
+pub fn fnv_seed64(req_id: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for b in req_id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
     }
-    (h >> 32) as u32 // upper 32 bits for maximum entropy
+    h
 }
 
 /// Convert a `u32` seed to a uniform in `[0, 1)` by stuffing its top 23 bits into
@@ -517,6 +537,36 @@ pub struct LogprobsOutput {
 mod tests {
     use super::*;
 
+    /// An unseeded request's draw at one position says nothing about its draw at the next: over
+    /// 4096 request ids and four steps each, the (this draw, next draw) pairs fill an 8 x 8 grid
+    /// evenly (chi-square under 103.4, the 63-df p = 0.001 point). Hashing the position's bytes
+    /// into FNV-1a with no finalizer made each draw the one before it shifted by 3/8 or 5/8, so
+    /// the first token's draw chose the second's (chi-square in the tens of thousands).
+    #[test]
+    fn an_unseeded_request_s_successive_draws_are_independent() {
+        const BINS: usize = 8;
+        let mut grid = [[0u32; BINS]; BINS];
+        let bin = |u: f32| ((u * BINS as f32) as usize).min(BINS - 1);
+        for request in 0..4096 {
+            let req_id = format!("cmpl-{request}");
+            for position in 0..4 {
+                let this = seed_to_uniform(fnv_seed(&req_id, position));
+                let next = seed_to_uniform(fnv_seed(&req_id, position + 1));
+                grid[bin(this)][bin(next)] += 1;
+            }
+        }
+        let expected = (4096 * 4) as f64 / (BINS * BINS) as f64;
+        let chi_square: f64 = grid
+            .iter()
+            .flatten()
+            .map(|&n| (f64::from(n) - expected).powi(2) / expected)
+            .sum();
+        assert!(
+            chi_square < 103.4,
+            "chi-square {chi_square:.1} over {grid:?}"
+        );
+    }
+
     /// A prompt opens thinking where its last `<think>` has no `</think>` after it, and closes it
     /// where it ends with a closed think block (whitespace alone after the close). An earlier
     /// turn's finished thinking, with the conversation after it, closes nothing: the reply's own
@@ -549,6 +599,18 @@ mod tests {
             ThinkFirst::of(tokens, Absent),
             Some(ThinkFirst::MayOpen(tokens))
         );
+    }
+
+    /// The per-request seed derivation is a FIXED function of the id: same id
+    /// → same seed, every call and every process (no RNG, no clock — the
+    /// `fnv_seed` law), and different ids disagree. A seed that drifted would
+    /// make an unseeded draw unreproducible within one run, which is the one
+    /// property this derivation exists for.
+    #[test]
+    fn fnv_seed64_is_a_fixed_function_of_the_request_id() {
+        assert_eq!(fnv_seed64("req-1"), fnv_seed64("req-1"));
+        assert_ne!(fnv_seed64("req-1"), fnv_seed64("req-2"));
+        assert_ne!(fnv_seed64(""), 0);
     }
 
     #[test]

@@ -143,6 +143,40 @@ pub enum SynthRole {
     //    cannot share one tensor at offsets ──
     GatherKtLx(u32),
     GatherVLx(u32),
+    // ── the chained head (#603) ──
+    //
+    // ⭐ THE PER-STEP SLABS `Program::ChainStage` / `Program::EmbedRowGather` lower
+    // through. The decompose's two u32 tables are NOT synths — they are ordinary
+    // graph sources the mint inserts (the argmax nine's own idiom), staged once at
+    // load through the load-const registry; the placements here are only the
+    // gather/transpose scratch, sized at expansion as arena activations.
+    /// The `[width·hidden, 64]` copy of the batch's picked 64-column slabs of the
+    /// (tied) embedding matrix — `EmbedRowGather`'s leg-1 destination, one request's
+    /// `[hidden, 64]` block per row at element base `row·hidden·64` (request-major;
+    /// at width 1 this IS the single `[hidden, 64]` slab).
+    ChainSlab,
+    /// ⭐ THE TRANSPOSED SLABS, `[width·(64+1), hidden]` — request r's rows `64r..64r+64`
+    /// are `EmbedRowGather`'s leg-2 transpose of r's [`ChainSlab`] block, and ROW `64r+64`
+    /// IS r's SENTINEL'S RESERVED ZERO ROW: never written by any op, staged zero once at
+    /// prepare (the synthetic-constants law), so the lane-64 sentinel pick (`l_tab`'s
+    /// past-`pad_vocab` mapping) reads a ZERO ROW, never past the placement. The one-row
+    /// cost per request — `hidden · 2 B` — is the price of keeping an already-broken chat
+    /// off the device bus (the loud `idx > vocab` refusal at the readback still fires;
+    /// this row only keeps the bus quiet while it does).
+    ChainSlabT,
+    /// ⭐⭐ THE REQUEST-MAJOR ROWS, `[width·row_entries, 64]` — `EmbedRowGather`'s leg-3
+    /// destination at width > 1, ONE STICK WIDE (the KV fold's own card-proven dest class:
+    /// `cols == one stick`, where the gather's row-major-over-entries write and the
+    /// RowBlocked handle coincide), request r's picked row at sticks
+    /// `[r·row_entries, (r+1)·row_entries)`. This is NOT the body's operand: the emission
+    /// reads the m>1 residual stream STICK-MAJOR (`spyre_forward.rs:228-235`), so leg 4 —
+    /// a pointwise-identity relayout, a Flat `[width, hidden]` read of THIS scratch into
+    /// the RowBlocked `[width, hidden]` activation — exists exactly when
+    /// `sdsc_abstract::row_major_is_stick_major(width, hidden)` is FALSE (a derived layout
+    /// fact, never a width branch; `embed_row_relayout_proofs` is the Kani record). ELIDED
+    /// entirely at the coincidence — width 1 keeps the tip's exact `[1, hidden]` dest and
+    /// this role is never minted.
+    ChainRow,
 }
 
 impl fmt::Display for SynthRole {
@@ -211,6 +245,9 @@ impl fmt::Display for SynthRole {
             Self::LAcc(i) => write!(f, "lacc{i}"),
             Self::GatherKtLx(i) => write!(f, "gktlx{i}"),
             Self::GatherVLx(h) => write!(f, "gvlx{h}"),
+            Self::ChainSlab => f.write_str("cslab"),
+            Self::ChainSlabT => f.write_str("cslabt"),
+            Self::ChainRow => f.write_str("crow"),
         }
     }
 }

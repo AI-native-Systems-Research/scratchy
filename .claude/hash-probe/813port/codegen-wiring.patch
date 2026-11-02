@@ -1,0 +1,127 @@
+diff --git a/crates/compiler/macros/src/codegen.rs b/crates/compiler/macros/src/codegen.rs
+index 2e212aadc8..898fa617cb 100644
+--- a/crates/compiler/macros/src/codegen.rs
++++ b/crates/compiler/macros/src/codegen.rs
+@@ -9309,6 +9309,17 @@ fn emit_superdsc_wiring(
+         let mut embeds = 0usize;
+         for id in 0..gk.num_sources {
+             let Some(b) = lwd.bindings.get(id as usize) else {
++                // ⭐ A LOAD-CONST SOURCE — minted below the `LoweredDecode`
++                // binding layer, so it carries NO `SourceBinding`: the wiring's
++                // `load_consts` list names it (BY MEMBERSHIP in the generic
++                // list, never by the op that minted it), and the worker stages
++                // its bytes once at load through the kind's builder — the rope
++                // tables' own law. This arm is that list's declaration; every
++                // other binding-less source is still the
++                // hang-or-silent-wrong refusal below.
++                if gk.load_consts.iter().any(|&(tid, _)| tid == id) {
++                    continue;
++                }
+                 fail.push(format!(
+                     "source t{id} is inside `num_sources` but has NO binding — nothing fills it"
+                 ));
+@@ -9464,6 +9475,30 @@ fn emit_superdsc_wiring(
+     // (Moved above the rotary-source emission: `hd` and `theta` are the base
+     // class's facts, and each cos/sin source's `RotaryKind` reads them.)
+     let result = u32l(gk.result_tensor);
++    // ⭐ THE RESULT'S OWN DTYPE — straight off the bake's one derivation
++    // (`result_dtype_of_ir`, the result producer's own kernel signature), never
++    // recomputed here: it is the fact that tells the worker whether the rung's
++    // answer is the f16 row (convert and argmax on the host) or an index stick
++    // (read raw, the device already picked).
++    // `scratchy-tensors` is only a dev-dependency where this expands (the
++    // models crate), so the literal rides the spyre crate's own root re-export
++    // — the same `::scratchy_target_spyre::` prefix every other wiring type
++    // in this emission uses.
++    let result_dtype = match gk.result_dtype {
++        scratchy_target_spyre::DType::F16 => quote! { ::scratchy_target_spyre::DType::F16 },
++        scratchy_target_spyre::DType::BF16 => quote! { ::scratchy_target_spyre::DType::BF16 },
++        scratchy_target_spyre::DType::F32 => quote! { ::scratchy_target_spyre::DType::F32 },
++        scratchy_target_spyre::DType::U32 => quote! { ::scratchy_target_spyre::DType::U32 },
++        scratchy_target_spyre::DType::I32 => quote! { ::scratchy_target_spyre::DType::I32 },
++        // `result_dtype_of_ir` refuses every dtype the readback cannot name, so
++        // this arm is unreachable by construction — spelled out so a new DType
++        // variant fails HERE rather than silently lower in the wiring.
++        other => panic!(
++            "[superdsc-wiring] {}: the result's dtype {other:?} has no wiring literal — the \
++             readback cannot read it back",
++            model.source_stem
++        ),
++    };
+     let num_sources = u32l(gk.num_sources);
+     let dp = u32l(decode_position);
+     let mask = match gk.attn_mask {
+@@ -9578,9 +9613,33 @@ fn emit_superdsc_wiring(
+             quote! { (#id, #k) }
+         })
+         .collect::<Vec<_>>();
++    // ⭐ THE LOAD-TIME CONSTANTS — straight off the bake's own one derivation
++    // (`load_consts_of_ir`, the same list the numeric gate stages), never
++    // recomputed here: each entry is `(tid, kind)` and the KIND names the
++    // shared builder that makes the bytes, so the worker and the gate stage
++    // identical bytes by construction.
++    let load_const_toks = gk
++        .load_consts
++        .iter()
++        .map(|&(tid, kind)| {
++            let tid = u32l(tid);
++            let kind = match kind {
++                scratchy_target_spyre::wiring::LoadConst::ArgMaxTable { vocab, operand } => {
++                    quote! {
++                        ::scratchy_target_spyre::wiring::LoadConst::ArgMaxTable {
++                            vocab: #vocab,
++                            operand: #operand,
++                        }
++                    }
++                }
++            };
++            quote! { (#tid, #kind) }
++        })
++        .collect::<Vec<_>>();
+     quote! {
+         ::scratchy_target_spyre::wiring::Wiring {
+             result: #result,
++            result_dtype: #result_dtype,
+             num_sources: #num_sources,
+             attn_mask: #mask,
+             decode_position: #dp,
+@@ -9605,6 +9664,7 @@ fn emit_superdsc_wiring(
+             weight_scale_folds: &[#(#weight_scale_fold_lits),*],
+             weight_copies: &[#(#weight_copy_lits),*],
+             fp8_k_pads: &[#(#fp8_k_pad_toks),*],
++            load_consts: &[#(#load_const_toks),*],
+         }
+     }
+ }
+@@ -10024,6 +10084,8 @@ fn layout_tokens(
+         kv_request_stride_bytes,
+         lx_op_local_bytes,
+         lx_prob_pin_bytes,
++        num_sources,
++        resident_source_tids,
+     } = l;
+     let segs = segment_bytes
+         .iter()
+@@ -10058,6 +10120,13 @@ fn layout_tokens(
+     // budget, summed beside the gathers at the bake's `lx_form` admission. 0 for a bundle whose
+     // chunk form mints none.
+     let lxpp = proc_macro2::Literal::u64_unsuffixed(*lx_prob_pin_bytes);
++    // The graph's own wiring facts — the source count and the resident ids, so every session
++    // reads them off the bundle it runs rather than off another graph's wiring (the mint's
++    // renumbering makes the two differ; see the layout field's own doc).
++    let nsrc = proc_macro2::Literal::u32_unsuffixed(*num_sources);
++    let res = resident_source_tids
++        .iter()
++        .map(|t| proc_macro2::Literal::u32_unsuffixed(*t));
+     // The segment budget's verdict, as a variant: every reader matches on it.
+     let tail = match weight_tail {
+         scratchy_target_spyre::bundle_code::WeightTail::InPlace => {
+@@ -10087,6 +10156,8 @@ fn layout_tokens(
+             kv_request_stride_bytes: #krs,
+             lx_op_local_bytes: #lxol,
+             lx_prob_pin_bytes: #lxpp,
++            num_sources: #nsrc,
++            resident_source_tids: ::std::borrow::Cow::Borrowed(&[#(#res),*]),
+         }
+     }
+ }

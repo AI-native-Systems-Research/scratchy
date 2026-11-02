@@ -1,6 +1,6 @@
 ---
 name: metal-bench
-description: Metal benchmark matrix runs on a Mac. Use to run scripts/bench_metal_matrix.sh against mlx-lm, ollama, llama.cpp, vllm-metal, oMLX and mistral.rs on this Mac (a full run, or a quick smoke run to check the setup), or to add a finished run's JSON to the site's Metal page (site/data/metal).
+description: Metal benchmark matrix runs on a Mac. Use to run scripts/bench_metal_matrix.sh against mlx-lm, ollama, llama.cpp, vllm-metal, oMLX, mistral.rs and Splash on this Mac (a full run, or a quick smoke run to check the setup), or to add a finished run's JSON to the site's Metal page (site/data/metal).
 ---
 
 # Metal benchmark run (one Mac → one JSON → the site)
@@ -21,32 +21,38 @@ runs everything else.
 **Three kinds of run:**
 - A **quick run** is the default, and what the user means by "run the
   benchmark" unless they say otherwise. **It asks no questions:** see
-  **Quick run** below. The script with no flags but `--unpinned`: this Mac's
-  four models (the small set below 64 GB, the large set at 64 GB), scratchy
+  **Quick run** below. The script with no flags but `--unpinned`: the small
+  set's four models, on every Mac whatever its memory, scratchy
   alone, cold and warm, one rep, the users × prompt grid at 1, 2 and 4
-  users and prompts to 8k, the same on every Mac (its memory picks the models),
-  and 64-token answers, two rounds of each users count a cell.
+  users, 64-token answers and 50 requests a cell, every request kept (the
+  page plots each one). Prompts are 128, 512, 1024 and 4096 tokens below
+  64 GB, and 128, 1024, 4096 and 8192 from 64 GB; the memory sizes only the
+  prompts. Every cell records the Mac's thermal state before and after it.
   scratchy runs at its defaults on every Mac, and every cell runs: one
   that runs out of memory is recorded as failed. The page keeps every
   other engine's numbers, and scratchy's frozen launches, from the last full
   run, each tagged with its date. Its length is not measured yet in this
-  form: the one M3 Pro quick run took 43 minutes, before every cell ran and
-  at four rounds a cell. The aim is about 25 minutes. Report the run's length.
+  form: an estimated 1.5 hours on a base M5 (scratchy's share of the full
+  run's grid, plus builds and startup). Report the run's length.
 - A **full run** renews every number: `--full` adds the comparison engines
-  (oMLX and oMLX TurboQuant), frozen (needs `sudo purge`), three reps, four
-  rounds of each users count a cell, and the 512- and 2048-token answers at
-  1 user (the decode-vs-answer-length curve). It takes hours; run it when the engines or the grid change, or
+  (oMLX; oMLX TurboQuant is an ablation of its own, run by name), frozen
+  (needs `sudo purge`) and three reps of the startup ladder, on the same
+  grid as a quick run. On a base M5 that is an estimated 3 hours (50
+  requests a cell, measured per request in an earlier full run); a 64 GB
+  Mac's 8k prompts add more, not yet measured. It takes hours; run it when the engines or the grid change, or
   for a published study. It's pinned (`--pin`) and goes through every
   pre-flight question in step 2.
 - A **smoke run** checks the setup: `--models gpt-oss-20b --no-scaling
   --parity --out-dir /tmp/metal-smoke`. Its JSON never goes on the site, so after
   step 4 you're done.
 
-**The rounds:** one model per class, a small one for 36 GB and a large one
-for 64 GB. Sliding window: gpt-oss-20b / gpt-oss-120b-3bit. Mamba-2:
+**The rounds:** one model per class, the small set on every Mac by default,
+so each overview column is one model across every chip; the large set (64 GB
+only) runs by name. Sliding window: gpt-oss-20b / gpt-oss-120b-3bit. Mamba-2:
 nemotron-3-nano-30b-a3b / nemotron-3-super-120b-a12b. Gated DeltaNet:
 qwen3.6-35b-a3b / qwen3.5-122b-a10b. Dense: granite-4.2-3b / granite-4.2-30b. The large set is 2- and 3-bit (OptiQ or 3-bit), since no 4-bit 120B fits 64 GB: its numbers aren't comparable with the 4-bit small set on quality.
-`--models small`, `large` or `full` picks a set; glm-4.5-air and the gemma
+`--models small`, `large` or `full` picks a set (`large` is the 120B round,
+on a 64 GB Mac; `full` runs both where each fits); glm-4.5-air and the gemma
 and qwen3.6-27b models run by name. The run file records the class table
 (`config.classes`), and the page's overview reads its columns from it.
 
@@ -92,14 +98,29 @@ command -v vllm || { brew tap vllm-project/vllm-metal https://github.com/vllm-pr
                      && brew install vllm-project/vllm-metal/vllm-metal; }
 command -v mistralrs || curl --proto '=https' --tlsv1.2 -sSf \
   https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.sh | MISTRALRS_INSTALL_TAG=<tag> sh
+command -v splash || brew install incoai/tap/splash   # for --engines all; needs an M3 or newer, macOS 26.4+
 ```
+
+Splash (Inco AI) is not one of a full run's defaults: it adds about an hour to
+each Mac's run. `--engines all` times it, as does naming it (`--engines
+omlx,omlx_tq,splash`). It serves the Qwen family only, so such a run times it
+on the Qwen models and prints `nothing to serve` for the others. It loads the same
+MLX checkpoint as scratchy and downloads the draft model it pairs with it
+into the Hugging Face cache on first use, so the first full run needs
+internet for that too.
 
 oMLX goes in from source, with its native kernels: a plain install (Homebrew
 included) skips them, and the Qwen3.5/3.6 family then falls back to much
-slower paths. Building them needs full Xcode, not only the Command Line Tools:
+slower paths. Building them needs full Xcode, not only the Command Line Tools.
+For now it comes from starpit/omlx's `feat/api-ignore-eos` branch: oMLX main
+plus jundot/omlx#4978, which lets its HTTP API take `ignore_eos`. Releases
+through 0.7.x drop the field, so their answers stop at EOS and are timed over
+less work than the other engines did. Go back to a jundot/omlx release once
+one includes it. An older `~/omlx` (a release, or not a git checkout) goes
+aside first, its `.venv` with it, since the branch needs newer MLX:
 
 ```bash
-git clone --branch <tag> https://github.com/jundot/omlx ~/omlx && cd ~/omlx
+git clone --branch feat/api-ignore-eos https://github.com/starpit/omlx ~/omlx && cd ~/omlx
 python3.13 -m venv .venv && OMLX_WITH_CUSTOM_KERNEL=1 .venv/bin/pip install -e .
 .venv/bin/python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
 ln -s ~/omlx/.venv/bin/omlx /opt/homebrew/bin/omlx   # the script looks for omlx on PATH
@@ -131,8 +152,8 @@ sudo -k && sudo -n -l /usr/sbin/purge >/dev/null && echo "rule works"
 no frozen rung, so treat it like any partial run in step 5.
 
 **Done when:** `~/.venvs/mlx/bin/python -c 'import mlx_lm'` exits 0,
-`command -v` prints a path for `ollama`, `llama-server`, `vllm`, `omlx` and
-`mistralrs` (or the user has chosen to leave one out), oMLX's kernel status
+`command -v` prints a path for `ollama`, `llama-server`, `vllm`, `omlx`,
+`mistralrs` and `splash` (or the user has chosen to leave one out), oMLX's kernel status
 shows them available, and the check prints `rule works` without asking for a
 password, or the user has chosen to run without the frozen rung.
 
@@ -154,7 +175,7 @@ pmset -g batt | head -1
 sysctl -n hw.memsize | awk '{print $1/2^30 " GB"}'
 osascript -e 'quit app "Ollama"' 2>/dev/null   # the desktop app competes for memory
 sleep 2; pkill -f '/Applications/Ollama.app/'  # quitting the app leaves its `ollama serve` on :11434
-pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|caffeinate -dims'   # leftovers from an earlier run
+pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve|caffeinate -dims'   # leftovers from an earlier run
 lsof -nP -iTCP:8751 -sTCP:LISTEN               # the script's --port
 ```
 
@@ -202,18 +223,25 @@ the `--models` flag (none for this Mac's set, or `--models full`).
 Full run. Pin every engine the run uses and scratchy's commit to the versions
 agreed for this round, so all the Macs run the same thing; the script refuses
 to start while any pin is missing or doesn't match, and lists what's wrong.
-Names match in any case, scratchy's pin is a commit prefix, and llama.cpp's
-is its build number:
+Names match in any case. scratchy's pin is a commit prefix, and so is oMLX's
+when it is a git checkout, as the branch above is (`git -C ~/omlx rev-parse
+--short HEAD`); a release install pins its version. llama.cpp's is its build
+number:
 
 ```bash
 source ~/.venvs/mlx/bin/activate
-caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast [--models full] \
-  --pin scratchy=<sha> --pin oMLX=<v> 2>&1 | tee ~/metal-matrix-run.log
+caffeinate -dims ./scripts/bench_metal_matrix.sh --full --fail-fast [--models full] \
+  --pin scratchy=<sha> --pin oMLX=<commit> 2>&1 | tee ~/metal-matrix-run.log
 echo "exit ${PIPESTATUS[0]}"
 ```
 
+`--full` is what makes it a full run. Without it the script runs a quick
+run under the pins: scratchy alone, no frozen rung, one rep, and step 4
+reports its scope as `quick`.
+
 With `--engines all`, pin the others too: `--pin mlx-lm=<v> --pin ollama=<v>
---pin llama.cpp=b<build> --pin vllm-metal=<v> --pin mistral.rs=<v>`. oMLX
+--pin llama.cpp=b<build> --pin vllm-metal=<v> --pin mistral.rs=<v> --pin
+Splash=<v>`. oMLX
 TurboQuant shares oMLX's pin.
 
 `--unpinned` runs without pins and records that in the JSON (`pinned:
@@ -255,11 +283,13 @@ act on each one as it appears:
 
 - the engine lines in the header, one per engine (`llama.cpp : <path>
   (<version>)`): a `skipped` line under one means it isn't installed or
-  isn't selected (by default only oMLX and oMLX TurboQuant run). If it's an
+  isn't selected (by default a full run times only oMLX). If it's an
   engine the user meant to run, stop the run and go back to step 1.
 - `skipped: needs N GB`: expected for glm-4.5-air on a Mac under 64 GB.
 - `--- mistral.rs: nothing to serve`: expected for every MoE model; it runs
   only the dense ones, since it runs out of memory on MoE GGUFs on Metal.
+- `--- Splash: nothing to serve`, in a run that selected Splash: expected for
+  every model but the Qwen ones; Splash serves only the Qwen family.
 - `N FAILED` on a cell, then `requests failed`, or `timed out after 600s`:
   that engine ran out of memory (or errored, or was too slow) at that size.
   The server is restarted and the next cell runs (`(server restarted)`); the
@@ -340,10 +370,10 @@ steps, and the `scr bench` and server it started keep running. Stop all of
 them:
 
 ```bash
-pkill -TERM -f 'bench_metal_matrix.sh|scr bench (startup|serve)|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|caffeinate -dims'
+pkill -TERM -f 'bench_metal_matrix.sh|scr bench (startup|serve)|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve|caffeinate -dims'
 pkill -TERM -f ' chat -m .* --device metal'    # the parity gate's scratchy side
 sleep 10
-pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|caffeinate -dims'
+pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve|caffeinate -dims'
 lsof -nP -iTCP:8751 -sTCP:LISTEN -t | xargs kill 2>/dev/null   # whatever server the run started
 ```
 
@@ -421,24 +451,30 @@ Never copy a smoke run, or anything under `/tmp/metal-smoke`.
 
 The site shows each chip's two newest runs, as current and previous, and
 computes the ▲/▼ change badges from them. Add the new run, keep the run
-before it as the previous one, and remove anything older. Copy first, and
-prune only once the copy has worked: `cp -n` refuses to overwrite a run that
-has the same name, and in that case nothing should be removed.
+before it as the previous one, and move anything older to
+`site/data/metal/history/`, which the page's Over time section reads. Copy
+first, and move only once the copy has worked: `cp -n` refuses to overwrite
+a run that has the same name, and in that case nothing should be moved.
 
 ```bash
 m=$(basename "$f" | sed -E 's/-[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{6}Z)?-[0-9a-f]{8}\.json$//')   # e.g. apple-m3-pro
 if cp -n "$f" site/data/metal/; then
-  ls site/data/metal/"$m"-*.json | sort | sed '$d' | sed '$d' | xargs -r git rm -q   # keep the newest two
+  ls site/data/metal/"$m"-*.json | sort | sed '$d' | sed '$d' \
+    | xargs -r -I{} git mv {} site/data/metal/history/   # keep the newest two; the rest to history/
 else
-  echo "$(basename "$f") is already in site/data/metal; nothing copied or removed"
+  echo "$(basename "$f") is already in site/data/metal; nothing copied or moved"
 fi
 ```
 
 If it says the file is already there, show the user both files and let them
 decide which one to keep.
 
-**Done when:** `ls site/data/metal/$m-*` lists at most two files, and the
-newest one is `$(basename "$f")`.
+Don't delete a run: move it. The one exception is a Mac retired from the
+round, whose runs can be removed with `git rm`.
+
+**Done when:** `ls site/data/metal/$m-*` lists at most two files, the
+newest one is `$(basename "$f")`, and `git status --short site/data/metal`
+shows the new run as added and any older one as renamed into `history/`.
 
 ## 6. Preview
 
@@ -500,15 +536,16 @@ fi
 Two people opening a round at once makes two issues: post to the lower
 number, and close the other.
 
-Post the run as a comment: one line, then the JSON, compact (no indents: a
-64 GB Mac's run with every cell is about 64 KB indented, at GitHub's comment
-limit), in a collapsed block:
+Post the run as a comment: one line, then the JSON gzipped and base64'd in a
+`json+gzip+base64` block, collapsed. A run keeps every request (50 a cell),
+and packed it is about a third of its compact size (`scripts/metal_round.py`
+unpacks it):
 
 ```bash
 {
   python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["machine"]["chip"], "quick run,", d["generated_utc"] + ", at", d["repo"]["sha"][:8])' "$f"
-  printf '\n<details><summary>run JSON</summary>\n\n```json\n'
-  python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")))' "$f"
+  printf '\n<details><summary>run JSON (gzip, base64)</summary>\n\n```json+gzip+base64\n'
+  python3 -c 'import base64,gzip,json,sys,textwrap; print("\n".join(textwrap.wrap(base64.b64encode(gzip.compress(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")).encode(), 9)).decode(), 76)))' "$f"
   printf '```\n</details>\n'
 } > /tmp/metal-round-comment.md
 wc -c < /tmp/metal-round-comment.md

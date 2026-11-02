@@ -23,3 +23,9 @@ ktir-superdsc = { path = "../../targets/spyre/ktir/ktir-superdsc" }
 triton-frontend = { path = "../triton-frontend" }
 triton-ktir = { path = "../triton-ktir" }
 triton-ktir-superdsc = { path = "../triton-ktir-superdsc" }
+
+[dev-dependencies]
+# The byte-identity dump's per-op stable text: `wire::SdscOp` derives `Serialize`,
+# so the dump serializes each emitted op rather than `Debug`-printing it (floats
+# and maps must render identically across runs for the diff to mean anything).
+serde_json = { workspace = true }

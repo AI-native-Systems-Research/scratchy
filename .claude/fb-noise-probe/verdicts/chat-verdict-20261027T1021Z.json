@@ -1,0 +1,291 @@
+{
+  "probe": "seeded-chat",
+  "prompt": "Write two sentences about the ocean.",
+  "p1_same_seed_identical": true,
+  "p2_diff_seed_different": true,
+  "p3_concurrent_pair_deterministic": {
+    "seed1234_run_a_equals_run_b": true,
+    "seed9999_run_a_equals_run_b": true,
+    "gate": "the concurrent pair against itself across two runs (ruling (b), 2026-10-27 \u2014 batched numerics, never equated with solo)",
+    "informational_vs_solo": {
+      "seed1234_pair_equals_solo": false,
+      "seed9999_pair_equals_solo": false,
+      "note": "information only \u2014 the rows=2 rung is a different baked tape than the solo one (the batched-numerics class)"
+    }
+  },
+  "texts": {
+    "solo_seed1234_a": "The ocean, the vast and complex water system, encompasses about 71% of the Earth's surface, housing an extraordinary biodiversity of marine life. It plays a crucial role in regulating global climate and weather patterns through its evaporation and heat distribution,",
+    "solo_seed1234_b": "The ocean, the vast and complex water system, encompasses about 71% of the Earth's surface, housing an extraordinary biodiversity of marine life. It plays a crucial role in regulating global climate and weather patterns through its evaporation and heat distribution,",
+    "solo_seed9999": "The ocean, spanning over 70% of the Earth's surface, serves as a vital global ecosystem, providing essential resources, oxygen, and supporting an incredible diversity of life, from microscopic plankton to towering whales. It embodies vast, untamed",
+    "concurrent_seed1234_run_a": "The ocean, the vast and complex water system, covers more than 70 percent of the Earth's surface, providing a habitat for an astonishing variety of life forms and playing a crucial role in regulating our climate. Its depths remain largely unexplored, with scientific exp",
+    "concurrent_seed1234_run_b": "The ocean, the vast and complex water system, covers more than 70 percent of the Earth's surface, providing a habitat for an astonishing variety of life forms and playing a crucial role in regulating our climate. Its depths remain largely unexplored, with scientific exp",
+    "concurrent_seed9999_run_a": "Theingly thet'ss ofs:Ming, the thely, thed./ysetThis....,:'sbest1..displayandSeasSeAt.The What's a's Se de,set,. aboutamentMajoring,The:est. The o",
+    "concurrent_seed9999_run_b": "Theingly thet'ss ofs:Ming, the thely, thed./ysetThis....,:'sbest1..displayandSeasSeAt.The What's a's Se de,set,. aboutamentMajoring,The:est. The o",
+    "greedy_server": "The ocean, covering more than 70% of the Earth's surface, is a vast and complex ecosystem teeming with diverse marine life, from microscopic plankton to the majestic blue whale. It plays a crucial role in regulating our planet's c",
+    "greedy_scr_chat": "The ocean, covering more than 70% of the Earth's surface, is a vast and complex ecosystem teeming with diverse marine life, from microscopic plankton to the majestic blue whale. It plays a crucial role in regulating our planet's c",
+    "greedy_main": "The ocean, covering more than 70% of the Earth's surface, is a vast and complex ecosystem teeming with diverse marine life, from microscopic plankton to the majestic blue whale. It plays a crucial role in regulating our planet's c"
+  },
+  "p4_greedy": {
+    "server_equals_main": true,
+    "scr_chat_equals_main": true,
+    "server_equals_scr_chat": true
+  },
+  "p5_distribution": {
+    "draws": 200,
+    "seeds": "100000..100199",
+    "temperature": 1.0,
+    "ambiguous_texts": [
+      "\ufffd",
+      "\ufffd",
+      "\ufffd",
+      "\ufffd",
+      "\ufffd"
+    ],
+    "top10": [
+      {
+        "id": 1318,
+        "text": "The",
+        "p": 0.966086941399754,
+        "expected": 193.2173882799508,
+        "observed": 194,
+        "sigma": 2.559803236837638,
+        "z": 0.3057312018309799,
+        "ambiguous_text": false
+      },
+      {
+        "id": 35,
+        "text": "1",
+        "p": 0.024185513340216097,
+        "expected": 4.83710266804322,
+        "observed": 6,
+        "sigma": 2.1725825316745198,
+        "z": 0.5352603710113034,
+        "ambiguous_text": false
+      },
+      {
+        "id": 2166,
+        "text": "Sp",
+        "p": 0.0031232646958061112,
+        "expected": 0.6246529391612222,
+        "observed": 0,
+        "sigma": 0.7891146828498431,
+        "z": -0.7915870186388161,
+        "ambiguous_text": false
+      },
+      {
+        "id": 51,
+        "text": "A",
+        "p": 0.0009525419143444521,
+        "expected": 0.19050838286889044,
+        "observed": 0,
+        "sigma": 0.43626473115434605,
+        "z": -0.38101676573778087,
+        "ambiguous_text": false
+      },
+      {
+        "id": 65,
+        "text": "O",
+        "p": 0.0005777458757112753,
+        "expected": 0.11554917514225505,
+        "observed": 0,
+        "sigma": 0.3398270399524952,
+        "z": -0.2310983502845101,
+        "ambiguous_text": false
+      },
+      {
+        "id": 22097,
+        "text": "Our",
+        "p": 0.0005260436060796975,
+        "expected": 0.10520872121593951,
+        "observed": 0,
+        "sigma": 0.32427361416069617,
+        "z": -0.21041744243187901,
+        "ambiguous_text": false
+      },
+      {
+        "id": 1465,
+        "text": "As",
+        "p": 0.00042268791222983305,
+        "expected": 0.08453758244596661,
+        "observed": 0,
+        "sigma": 0.29069201817686285,
+        "z": -0.16907516489193322,
+        "ambiguous_text": false
+      },
+      {
+        "id": 32588,
+        "text": "Stretch",
+        "p": 0.00039092241398659645,
+        "expected": 0.0781844827973193,
+        "observed": 0,
+        "sigma": 0.2795602237990374,
+        "z": -0.1563689655946386,
+        "ambiguous_text": false
+      },
+      {
+        "id": 11428,
+        "text": "Cover",
+        "p": 0.00033437366014317304,
+        "expected": 0.06687473202863461,
+        "observed": 0,
+        "sigma": 0.25855825432523927,
+        "z": -0.13374946405726923,
+        "ambiguous_text": false
+      },
+      {
+        "id": 25307,
+        "text": "Bene",
+        "p": 0.00024848540479531907,
+        "expected": 0.04969708095906381,
+        "observed": 0,
+        "sigma": 0.22290072220561458,
+        "z": -0.09939416191812762,
+        "ambiguous_text": false
+      }
+    ],
+    "pass_within_3sigma": true,
+    "draws_in_ref_top1000": 200,
+    "expected_in_ref_top1000": 199.98580436134978,
+    "draws_outside_top1000": {},
+    "n_outside": 0
+  },
+  "p5c_concurrent": {
+    "draws": 200,
+    "temperature": 1.0,
+    "pairing": "seeds 100000..100199, concurrent pairs (2k, 2k+1)",
+    "each_equals_solo": true,
+    "top10": [
+      {
+        "id": 1318,
+        "text": "The",
+        "p": 0.966086941399754,
+        "expected": 193.2173882799508,
+        "observed": 194,
+        "sigma": 2.559803236837638,
+        "z": 0.3057312018309799,
+        "ambiguous_text": false
+      },
+      {
+        "id": 35,
+        "text": "1",
+        "p": 0.024185513340216097,
+        "expected": 4.83710266804322,
+        "observed": 6,
+        "sigma": 2.1725825316745198,
+        "z": 0.5352603710113034,
+        "ambiguous_text": false
+      },
+      {
+        "id": 2166,
+        "text": "Sp",
+        "p": 0.0031232646958061112,
+        "expected": 0.6246529391612222,
+        "observed": 0,
+        "sigma": 0.7891146828498431,
+        "z": -0.7915870186388161,
+        "ambiguous_text": false
+      },
+      {
+        "id": 51,
+        "text": "A",
+        "p": 0.0009525419143444521,
+        "expected": 0.19050838286889044,
+        "observed": 0,
+        "sigma": 0.43626473115434605,
+        "z": -0.38101676573778087,
+        "ambiguous_text": false
+      },
+      {
+        "id": 65,
+        "text": "O",
+        "p": 0.0005777458757112753,
+        "expected": 0.11554917514225505,
+        "observed": 0,
+        "sigma": 0.3398270399524952,
+        "z": -0.2310983502845101,
+        "ambiguous_text": false
+      },
+      {
+        "id": 22097,
+        "text": "Our",
+        "p": 0.0005260436060796975,
+        "expected": 0.10520872121593951,
+        "observed": 0,
+        "sigma": 0.32427361416069617,
+        "z": -0.21041744243187901,
+        "ambiguous_text": false
+      },
+      {
+        "id": 1465,
+        "text": "As",
+        "p": 0.00042268791222983305,
+        "expected": 0.08453758244596661,
+        "observed": 0,
+        "sigma": 0.29069201817686285,
+        "z": -0.16907516489193322,
+        "ambiguous_text": false
+      },
+      {
+        "id": 32588,
+        "text": "Stretch",
+        "p": 0.00039092241398659645,
+        "expected": 0.0781844827973193,
+        "observed": 0,
+        "sigma": 0.2795602237990374,
+        "z": -0.1563689655946386,
+        "ambiguous_text": false
+      },
+      {
+        "id": 11428,
+        "text": "Cover",
+        "p": 0.00033437366014317304,
+        "expected": 0.06687473202863461,
+        "observed": 0,
+        "sigma": 0.25855825432523927,
+        "z": -0.13374946405726923,
+        "ambiguous_text": false
+      },
+      {
+        "id": 25307,
+        "text": "Bene",
+        "p": 0.00024848540479531907,
+        "expected": 0.04969708095906381,
+        "observed": 0,
+        "sigma": 0.22290072220561458,
+        "z": -0.09939416191812762,
+        "ambiguous_text": false
+      }
+    ],
+    "pass_within_3sigma": true,
+    "draws_in_ref_top1000": 200,
+    "expected_in_ref_top1000": 199.98580436134978,
+    "draws_outside_top1000": {},
+    "n_outside": 0
+  },
+  "log_evidence": {
+    "seat_bind_lines": 790,
+    "seat_bound_seed_1234": true,
+    "seat_bound_seed_9999": true,
+    "both_seeds_one_launch": true,
+    "prefill_batched_lines": 408,
+    "decode_batch_lines": 1,
+    "two_row_rung_line": true,
+    "seat_readback_lines": 790,
+    "sample_seat_lines": [
+      "2026-10-27T10:20:16.754713Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:seed=1234@step0:inv_t1",
+      "2026-10-27T10:20:16.828025Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:seed=1234@step67:inv_t1",
+      "2026-10-27T10:20:16.860348Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:seed=1234@step68:inv_t1",
+      "2026-10-27T10:20:16.890777Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:seed=1234@step69:inv_t1",
+      "2026-10-27T10:20:16.920582Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:seed=1234@step70:inv_t1",
+      "2026-10-27T10:20:16.950171Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:seed=1234@step71:inv_t1"
+    ]
+  },
+  "phaseB_no_prefix_caching": {
+    "note": "server restarted with --no-prefix-caching; diagnostics, not gates",
+    "p1_same_seed_identical": true,
+    "p3_seed1234_pair_vs_solo_info": false,
+    "p3_seed9999_pair_vs_solo_info": false,
+    "both_seeds_one_launch": true,
+    "seat_bind_lines": 195
+  }
+}

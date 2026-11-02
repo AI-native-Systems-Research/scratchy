@@ -1635,6 +1635,26 @@ pub fn dev_off_stk(dims: &[usize], stick_idx: usize, idx: &[usize], stk: usize) 
     }
 }
 
+/// ⭐⭐ DOES A ROW-MAJOR STAGING AND THE STICK-BLOCKED READ OF THE SAME `[rows, cols]` fp16
+/// ACTIVATION COINCIDE IN BYTES? One predicate, TWO consumers that must not drift:
+///
+/// * `lower_ktir_to_superdsc`'s chained-head door (`embed_row_gather`, #603) uses it as the
+///   LEG-4 ELISION — the row gather's request-major scratch IS the `[rows, cols]` activation,
+///   byte for byte, exactly while this holds, and the relayout leg exists exactly when it does
+///   not. A WIDTH BRANCH IS NOT PERMITTED THERE: the elision is this derived layout fact, never
+///   `if width == 1`.
+/// * `forward_tape::stick_scatter`'s one-row identity lemma rests on the same fact — decode's
+///   row-major staging and prefill's stick-scattered staging are the same bytes exactly while
+///   this holds.
+///
+/// The law is [`StickLayout::addr_eq`]'s same-shape branch, not a second formula: `rows == 1`
+/// (one row — nothing to interleave) or `cols <= lanes` (one stick's worth of columns — no
+/// blocking to differ). `cols` is a whole number of fp16 sticks at every caller (the
+/// activations' own law), so `cols <= lanes` is `cols == 64` there.
+pub fn row_major_is_stick_major(rows: usize, cols: usize) -> bool {
+    StickLayout::flat(rows, cols).addr_eq(&StickLayout::row_blocked(rows, cols))
+}
+
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  SYSTOLIC LAYOUT vocabulary — the typed core that makes "wrong layout" unexpressible. `StickLayout`
 //  OWNS `dev_off` (delegates to the free fn above, byte-identical — Kani `dev_off_method_equals_free_fn`
@@ -8936,6 +8956,22 @@ pub enum BatchPrefix {
     Fold(DeclaredFold),
     /// One row block every row block reads — [`batch_chunk_mask_f16`].
     Chunk(BatchChunk),
+    /// ⭐⭐⭐⭐⭐ THE ONE-REQUEST SEAT'S OWN FORM — ONE BROADCAST ROW over the bake's reserve, staged
+    /// by the same law the deleted solo loop staged (an f32 row the bind narrows, validity the
+    /// request's own [`KvHistory`]). The owner session's bodies are ONE-REQUEST bodies: the door
+    /// rules they may take the per-page gather only as a CHUNK "whose read IS the broadcast row"
+    /// (`ktir_superdsc_door`'s `gathers_kv` law), and a body that does not gather reads the row
+    /// broadcast too — so EVERY body of that seat reads this form, fused rung or chunk rung.
+    ///
+    /// ⛔⛔⛔ STAGING THE FOLD'S BLOCKS FOR ONE OF THESE BODIES IS SILENT AND WRONG, and it was the
+    /// W=1 text defect (auditor ruling 2026-10-27): the broadcast read of the block buffer is
+    /// `dev_off(0, c) = (c/64)·(rows·64) + c%64`, which is the TRUE row-0 bytes for `c < 64` and
+    /// ROW `c/64`'s FIRST BLOCK past it — the head rows' own validity, mostly VALID. A step whose
+    /// sweep stays inside one stick is byte-identical either way (the defect hid there), and the
+    /// first step past it — the rung 64→128 switch, on card — attends ~64 PHANTOM COLUMNS of
+    /// unwritten keys: a small deterministic logits perturbation that flips the first near-tie,
+    /// fluent on both sides. Measured 3/3 prompts, one token each at valid_len 67/72/68.
+    OneRequest,
 }
 
 /// ⭐⭐⭐ THE BATCH CHUNK's PER-ROW MASK, in the device's own f16 — one [`BatchChunk::mask_rows`] ×
@@ -9425,6 +9461,21 @@ pub enum GatherDest {
     /// at the pin, so the run has no addressable offset (the destination entry must be 0) and
     /// the per-core slice is the read law's bound, checked against the pin at emit.
     CoreLocalLx,
+    /// ⭐⭐⭐ THE CHAIN'S SCATTER-LAW SCRATCH — the one dest whose entries do not land
+    /// consecutively. `rows` is the scatter's width W and `cols` the row width (hidden):
+    /// the buffer is the `[W, hidden]` ChainRow, and entry `j` of request `r` lands at
+    /// element `(j·W + r)·lanes` — the SAME bytes `StickLayout::row_blocked(W, hidden)`
+    /// places (row `r`'s stick `j` at stick `j·W + r`), which is why the consumer (the
+    /// relayout's memcpy and the body behind it) reads the buffer under that layout.
+    ///
+    /// The entry stride `W·lanes` is the dest view's OWN row pitch, stated by the door as
+    /// the view's physical `y` extent (`["mb", "y", "out"]`, stick innermost so a stick's
+    /// lanes stay contiguous) — never a per-call stride literal. Constructed at exactly
+    /// one site: the chained embedding's row gather, and only when row-major and
+    /// stick-major do NOT coincide (W > 1 and a multi-stick row) — at coincidence the
+    /// chain writes the OUT directly and this arm has no caller, so the W = 1 emission
+    /// is untouched by construction.
+    Scatter { rows: u32, cols: u32 },
 }
 
 /// ⭐⭐⭐⭐⭐ A HAND-BUILT COPY'S WHOLE DECLARED LAW AS ONE VALUE — the extents, the format, the run
@@ -9987,6 +10038,40 @@ impl SlotMap {
     }
 }
 
+/// ⭐⭐⭐ WHERE A LAUNCH'S EMBED-HEAD SEED COMES FROM — the seed law, as a type.
+///
+/// Every row a decode launch binds FEEDS one token to the chained head's gather: the persistent
+/// sticks the `EmbedRowGather` reads. The DEVICE writes those sticks itself — each step's
+/// `ChainStage` decomposes the pick that step drew into them — so on a seating that has not
+/// changed since the step that wrote them, the card's own write IS each seat's seed and the host
+/// binds nothing. A host bind is needed exactly when a seat's sticks are NOT the card's own
+/// current seed for their occupant:
+///
+/// - a request's FIRST step on a rung's session (its prompt's final token, host-known);
+/// - a CHURNED seat — slots are dense in the live list (`live i runs in slot i`), so any join or
+///   leave re-seats requests onto sticks that hold the PREVIOUS occupant's pick;
+/// - a PADDING seat at a changed live count — the pad must clamp to the last live row's token,
+///   and the card's stage writes the pad row's OWN drawn pick, not the clamp;
+/// - a RUNG SWITCH — a different session, whose sticks were never seeded.
+///
+/// A prompt chunk is always [`SeedSource::Host`]: its rows are the prompt's own tokens and the
+/// tape's head kernel is the host-pushed `EmbedRow` — the same arm, because "the host knows every
+/// row's token" is the one fact both regimes share.
+///
+/// ⛔ `OnCard` IS NOT "BIND NOTHING AND HOPE". It states the seating is stable — the host's
+/// assertion that every seat's sticks were written by this session's own previous step for the
+/// request now sitting there. The launch it widens to carries no token ([`RowInputs::token`] is
+/// `None`), so a consumer cannot accidentally stage a seed it does not have: the only way to
+/// bind a seed is the `Host` arm.
+#[derive(Clone, Copy)]
+pub enum SeedSource<'a> {
+    /// One token per LIVE row, host-known — seeded through the raw u32 channel this launch.
+    Host(&'a [usize]),
+    /// The device's own `ChainStage` writes are each seat's seed — a stable seating. Nothing is
+    /// bound, and no row's token is a host fact.
+    OnCard,
+}
+
 /// ⭐⭐⭐ THE LIVE ROWS OF A BATCHED LAUNCH — one [`BatchRow`] per LIVE slot, in slot order, and
 /// NOTHING for the padding slots.
 ///
@@ -10016,29 +10101,50 @@ impl LiveBatch {
     /// with a COMPLETE set of row inputs. This is the one door from "who is live" to "what every row
     /// runs", and the only constructor of [`LaunchRows`].
     ///
-    /// `toks` is the launch's own token list, ONE PER LIVE ROW, from the same walk that minted `self`;
-    /// any other length refuses, so no caller can pair a row with another slot's token. Live 0 is
-    /// picked HERE and not by the caller, because the replicated row is not a choice: live 0 is the row
-    /// whose page map every padding slot borrows, so live 0's write cell is the cell a padding write
-    /// races.
+    /// `seeds` is the launch's seed law ([`SeedSource`]). `Host` carries one token per live row,
+    /// from the same walk that minted `self`; any other length refuses, so no caller can pair a row
+    /// with another slot's token. Live 0 is picked HERE and not by the caller, because the
+    /// replicated row is not a choice: live 0 is the row whose page map every padding slot borrows,
+    /// so live 0's write cell is the cell a padding write races. `OnCard` widens with no tokens at
+    /// all — the card's own `ChainStage` writes are every seat's seed — and every row's
+    /// [`RowInputs::token`] is `None`, so a seed cannot be half-staged.
     ///
-    /// `None` when the batch is empty (no live 0 to replicate), when the tokens do not match the live
-    /// rows, when a token is not a `u32`, or when more requests are live than the rung is wide.
-    pub fn launch_rows<'a>(&'a self, toks: &[usize], width: RungWidth) -> Option<LaunchRows<'a>> {
-        if toks.len() != self.rows.len() || self.rows.len() > width.count() {
-            return None;
-        }
+    /// `None` when the batch is empty (no live 0 to replicate), when host-known tokens do not match
+    /// the live rows, when a token is not a `u32`, or when more requests are live than the rung is
+    /// wide.
+    pub fn launch_rows<'a>(
+        &'a self,
+        seeds: SeedSource<'_>,
+        width: RungWidth,
+    ) -> Option<LaunchRows<'a>> {
+        let ids: Option<Vec<TokenId>> = match seeds {
+            SeedSource::Host(toks) => {
+                if toks.len() != self.rows.len() || self.rows.len() > width.count() {
+                    return None;
+                }
+                Some(
+                    toks.iter()
+                        .map(|&t| u32::try_from(t).ok().map(TokenId))
+                        .collect::<Option<_>>()?,
+                )
+            }
+            SeedSource::OnCard => {
+                if self.rows.len() > width.count() {
+                    return None;
+                }
+                None
+            }
+        };
         let live0 = self.rows.first()?;
-        let ids: Vec<TokenId> = toks
-            .iter()
-            .map(|&t| u32::try_from(t).ok().map(TokenId))
-            .collect::<Option<_>>()?;
         // ⭐ ALL FOUR ASPECTS, IN ONE EXPRESSION. There is no way to build a replica that mirrors
         // live 0's token but not its history, because there is no other constructor and no field is
         // optional — which is the whole lock: the two previous attempts at this each mirrored one
         // aspect and left another, and a partial replica writes different bytes into live 0's cell.
+        // (In the `OnCard` arm the token aspect is the CARD's seed, mirrored by its own stage write
+        // rather than by this value — the replica still carries the other three, which the host
+        // DOES own: the rotation, the column and the history.)
         let pad = PadRowReplica {
-            token: *ids.first()?,
+            token: ids.as_ref().and_then(|i| i.first().copied()),
             rope_pos: live0.rope_pos,
             // Live 0's launch slot, which under the diagonal new-block law IS the column its query row
             // attends. `SlotMap::of_live` hands slots out densely from live 0, so it is slot 0.
@@ -10086,7 +10192,7 @@ impl LiveBatch {
 /// expression: a replica that mirrors some aspects and not others is a value with no way to exist.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PadRowReplica {
-    token: TokenId,
+    token: Option<TokenId>,
     rope_pos: SeqPos,
     new_block_col: LaunchSlot,
     hist: KvHistory,
@@ -10102,7 +10208,9 @@ pub struct LaunchRows<'a> {
     live: &'a LiveBatch,
     pad: PadRowReplica,
     width: RungWidth,
-    toks: Vec<TokenId>,
+    /// `None` in the [`SeedSource::OnCard`] arm — no row's token is a host fact there, so none can
+    /// be staged as one. See [`SeedSource`] for the seed law.
+    toks: Option<Vec<TokenId>>,
 }
 
 /// ⭐⭐ ONE ROW'S COMPLETE INPUTS — the token it gathers, the position it rotates at, the new-block
@@ -10118,15 +10226,17 @@ pub struct LaunchRows<'a> {
 /// No public constructor: the only way to one is [`LaunchRows::row`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RowInputs<'a> {
-    token: TokenId,
+    token: Option<TokenId>,
     rope_pos: SeqPos,
     new_block_col: LaunchSlot,
     hist: &'a KvHistory,
 }
 
 impl<'a> RowInputs<'a> {
-    /// The token this row's embedding gathers.
-    pub fn token(self) -> TokenId {
+    /// The token this row's embedding gathers — `None` on an [`SeedSource::OnCard`] launch, where
+    /// the seed is the card's own `ChainStage` write and staging one from the host is exactly what
+    /// the seed law forbids.
+    pub fn token(self) -> Option<TokenId> {
         self.token
     }
 
@@ -10172,7 +10282,7 @@ impl<'a> LaunchRows<'a> {
         }
         Some(match self.live.row(slot) {
             Some(b) => RowInputs {
-                token: self.toks[slot],
+                token: self.toks.as_ref().and_then(|t| t.get(slot).copied()),
                 rope_pos: b.rope_pos,
                 new_block_col: LaunchSlot(slot),
                 hist: &b.hist,

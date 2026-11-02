@@ -21,6 +21,11 @@
 //! role breaks every match that must learn it, at build time, in one place.
 
 use crate::bundle_code as bundle;
+use crate::lower_subtile_tape_to_superdsc::{DeviceWidth, row_footprint_bytes};
+pub use ktir_superdsc::element_arrangement::{
+    DL16TOFP32_PERMUTATION, ElementArrangement, dl16tofp32_stagger,
+};
+use ktir_superdsc::superdsc_opspec::Df;
 use scratchy_tensors::GpuTensor;
 
 // ⭐ `act_name` MOVED TO `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS. Its
@@ -239,6 +244,20 @@ impl BakeFacts {
 }
 
 impl Wiring {
+    /// ⭐ IS THE RUNG'S RESULT THE PICKED TOKEN ITSELF? — the one question the
+    /// worker asks of [`Self::result_dtype`]. An integer result (the device
+    /// argmax's `i32` idx stick today) states the device already picked: the
+    /// step leaves the result on the device, reads the stick's raw bytes at
+    /// this dtype, and the host's row-argmax is replaced by the stick's first
+    /// word. Keyed on the DTYPE the result's own producer stated, never on the
+    /// op's name — a second kernel with an index result rides the same branch.
+    pub const fn result_is_index(&self) -> bool {
+        matches!(
+            self.result_dtype,
+            scratchy_tensors::DType::I32 | scratchy_tensors::DType::U32
+        )
+    }
+
     /// ⛔ THE CLASS SETS, CHECKED AGAINST THE PLACEMENTS — ONCE, AT LOAD.
     ///
     /// The bake used to emit the identity and rope-P tables as f32 LITERALS staged at the BASE head
@@ -485,6 +504,9 @@ impl Wiring {
             prefix_mask: owns_prefix,
             kv_block_index: gathers.get(),
             n_consts,
+            // The phase projects straight off the wiring's own field — the
+            // tip's law: `phase: self.phase`, never a second derivation.
+            phase: self.phase,
         }
     }
 }
@@ -765,6 +787,19 @@ impl RotaryKind {
 pub struct Wiring {
     /// Tensor id of the logits.
     pub result: u32,
+    /// ⭐ THE RESULT'S OWN DTYPE — the fact that decides how the worker reads the
+    /// rung's answer back ([`Self::result_is_index`] is the one question asked of
+    /// it). Stated by the result producer's own kernel signature when a spliced
+    /// kernel produced the result, and the f16 row every native lm-head tail
+    /// emits otherwise.
+    ///
+    /// ⛔ THE ROW REMAINS A PLACED TENSOR, READABLE BY TID, when the result is an
+    /// index stick: the answer re-point is the greedy contract's redirect of the
+    /// ANSWER (the host reads the picked token, not the row it was picked from),
+    /// never a deletion of the row. Any consumer that needs the row can still
+    /// name its tid and read it; the mint widens it, places it, and leaves every
+    /// writer exactly where it was.
+    pub result_dtype: scratchy_tensors::DType,
     /// Tensor ids `0..num_sources` are caller-filled.
     pub num_sources: u32,
     /// The AttnDecode runtime length mask, if the model has a maskable decode.
@@ -857,6 +892,873 @@ pub struct Wiring {
     /// alone. Empty for every 128-aligned model — granite, g8b
     /// and g12b stage byte-identically.
     pub fp8_k_pads: &'static [(u32, u32)],
+    /// ⭐ THE LOAD-TIME CONSTANTS — `(tid, kind)` for every resident buffer the
+    /// graph's own producer minted below the `SourceBinding` layer: staged ONCE
+    /// at load through the kind's builder ([`LoadConst::build`]), never a
+    /// per-step source, never baked as literals. The rope tables' own law,
+    /// stated as a LIST: a second spliced kernel with staged tables adds one
+    /// [`LoadConst`] kind and rides this same field — no new wiring surface, no
+    /// per-op field, no consumer that names the op. The ids are the graph's own
+    /// tensor ids (the same ids the placement pass places).
+    pub load_consts: &'static [(u32, LoadConst)],
+    /// ⭐ THE SAMPLER'S PER-STEP SEAT — `Some` exactly when the rung carries the
+    /// token draw (the minted `Sample` node), naming the TWO sources the draw
+    /// reads FRESH EVERY DECODE STEP. A NAMED CLASS, never a bare tid pair
+    /// riding an arithmetic: the mint inserts the pair at the graph's source
+    /// ceiling, and a consumer that recomputed those tids would be a second
+    /// derivation free to disagree with the mint (the `weight_copies` one-mint
+    /// law). The class is the source gate's own spelling too: the seat's tids
+    /// count as filled ONLY when bound THIS STEP — a decode launch without a
+    /// fresh seed/inv_t bind REFUSES LOUDLY (the PrefixMask precedent), never
+    /// a held default, because a held seed row is a held TOKEN — every
+    /// subsequent draw would repeat the same pick wherever temperature was
+    /// live. `None` on every rung that mints no draw (prefill rungs, host-sampled
+    /// emulators), and a `None` on a rung the worker samples through is a
+    /// wiring/consumer mismatch the launch gate names.
+    pub sample_seat: Option<SampleSeat>,
+    /// ⭐ THE FORWARD'S OWN PHASE — the same
+    /// [`crate::forward_tape::ForwardPhase`] the tape's shape carries, spelled
+    /// once here and projected into the shape (`phase: self.phase`, never a
+    /// second derivation). `Decode` carries the chained head's stick sources
+    /// ([`ChainWiring`], the mint's payload); `Prefill` is every unchained
+    /// program, byte-identical behavior to before the mint existed.
+    ///
+    /// ⛔ THIS ONE FIELD IS THE WORKER'S WHOLE CONTRACT with the chain: on
+    /// `Decode`, the per-step embed-row push is REPLACED by the sticks' seed
+    /// (the decompose of the token the step feeds, bound through the raw u32
+    /// channel) — the gather reads the sticks, never a host-pushed row. The
+    /// per-step path STAGES the seed every step: an idempotent restatement of
+    /// what the device's own ChainStage wrote (step t feeds the token step
+    /// t-1 picked, which is exactly what step t-1's stage wrote into the
+    /// sticks), so the first play — the prompt's final token, which no stage
+    /// has written yet — is the one that matters. The block path stages the
+    /// seed once per block; the device's own stage writes carry every step
+    /// after.
+    ///
+    /// A decode wiring that reaches this field carries `Decode` BY
+    /// CONSTRUCTION: the expansion's mint refuses any decode-slot rung that
+    /// would not mint (untied embedding, no EmbeddedHidden source), so no
+    /// emitted decode wiring exists without the chain.
+    pub phase: crate::forward_tape::ForwardPhase,
+}
+
+/// The chained head's stick sources — the persistent state the mint threaded
+/// between steps ([`Wiring::phase`]'s `Decode` payload). `s_src`/`l_src` are the
+/// `[1, CHAIN_IDX_BLOCK]` SENUINT32 sources the ChainStage WRITES each step
+/// and the EmbedRowGather READS the next: the slab-gather entry words and the
+/// transposed row's own stick ramp. `k` is the entry count
+/// (`chain_slab_entries`' answer for the graph's hidden, stated once at the
+/// mint): both host seeds compute the s stick's lane pattern
+/// `k·(t>>6) + (i mod k)` from it. `hidden` is the graph's own hidden width
+/// (the EmbedRowGather node's own field, stated once at the mint): the l
+/// seed's LANE RAMP `64·(i mod (hidden/64)) + (t&63)` reads its entry count
+/// from it — the one spelling every l-law site shares, never re-derived
+/// downstream. `replaces` is the row the chain REPLACED —
+/// the caller-filled `[1, hidden]` source whose host filler the chain removed
+/// (the tape's ChainSeed steps replaced the EmbedRow push), stated once at
+/// the mint and read by the layout stamp's resident excuse and the bake's
+/// binding-check arm; the worker never names it.
+#[derive(Clone, Copy, Debug)]
+pub struct ChainWiring {
+    pub s_src: u32,
+    pub l_src: u32,
+    pub k: u32,
+    pub hidden: u32,
+    pub replaces: u32,
+}
+
+/// ⭐ THE GRAPH'S OWN CHAIN FACT — read once off the mint by `chain_of_ir`
+/// (lower_subtile_tape_to_ktir), the one derivation. `Chained` carries the
+/// payload BY TYPE; `Unchained` is every graph the mint did not touch —
+/// prefill walks, batch ladder rungs, the symbolic CB batch, the emulator
+/// tapes — not a missing anything, the graph's own state: a graph landing
+/// there is one of those or a defect to investigate, never a silent
+/// fallback. The EMITTER derives the forward phase from the SLOT
+/// ([`Wiring::phase`]); this fact is the payload, and the two disagreeing is
+/// the E0004 belt at emission.
+#[derive(Clone, Copy)]
+pub enum ChainFact {
+    Chained { chain: ChainWiring },
+    Unchained,
+}
+
+/// ⭐ A LOAD-TIME CONSTANT'S KIND — the shared builder that makes its bytes.
+/// A kind names a BUILDER ([`Self::build`]), never a consumer: this enum is
+/// the producer's statement of its host contract, translated once into the
+/// generic [`Wiring::load_consts`] list, and everything downstream (the bake's
+/// numeric gate, the worker's load staging) iterates the list op-blind,
+/// choosing fp32-verbatim vs fp16-convert off the ENTRY'S OWN dtype.
+#[derive(Clone, Copy, Debug)]
+pub enum LoadConst {
+    /// One of the sampler's twenty operand tables, by the kernel's operand
+    /// order (the table's own position among the node's table inputs — the
+    /// row, the seed and the temperature precede them and are never load
+    /// constants). Bytes from [`sample_staged_tables`] — the one derivation
+    /// every stager reads, so a table defect cannot hide on one leg only.
+    /// `arrangement` is
+    /// the BAKE'S OWN propagation fact (the propagation pass `ktir_superdsc::emit::whole_function::staggered_sources`): the table the
+    /// sampler's staggered pointwise island reads lane-for-lane is staged
+    /// ALREADY IN ITS ARRANGEMENT ([`dl16tofp32_stagger`]) — `build()` is pure
+    /// in this field, so the worker stages what the bake states and decides
+    /// nothing.
+    SampleTable {
+        vocab: u32,
+        /// The RUNG'S OWN ROW COUNT — the mint's own `rows` fact (the solo rung
+        /// at 1, every batched rung at its baked width). The ten UNIFORM tables
+        /// (the hash multipliers, the wrap-fold's 2^8, the fold's five f32
+        /// constants, the FEST clamp) stage the SAME word at EVERY row of a
+        /// `[rows, 1]` table — the seed words' own class, so the door's `Col`
+        /// operand mode reads row r's stick head like it does a seed word, at
+        /// every band height (the auditor's 2026-10-27 ruling). The per-lane
+        /// tables ignore it (their shapes are whole-row, functions of the vocab
+        /// alone).
+        rows: u32,
+        operand: u8,
+        arrangement: ElementArrangement,
+    },
+    /// One of the chained head's two decompose tables, by the ChainStage's
+    /// operand order (1-based over the stage's table inputs, past the pick
+    /// and the two sticks — the same convention as the sampler's nine).
+    /// Bytes from [`chain_staged_tables`] — the one derivation every stager
+    /// reads, so a table defect cannot hide on one leg only. `k` is the
+    /// slab-gather entry count the mint stated into the node
+    /// (scratchy-subtile's `chain_slab_entries` — the lane pattern's
+    /// modulus; cited not linked, the leaf-crate law), and `hidden` is the
+    /// graph's own hidden width (the EmbedRowGather node's own field, stated
+    /// at the mint beside it — the l-tab's LANE RAMP
+    /// `64·(i mod (hidden/64)) + (t&63)` reads its entry count from it), so
+    /// the staging is self-contained: the fill never re-derives either.
+    ChainStageTable {
+        pad_vocab: u32,
+        k: u32,
+        hidden: u32,
+        operand: u8,
+    },
+}
+
+impl LoadConst {
+    /// The const's bytes, true dtype, and `[rows, cols]` shape — ONE
+    /// derivation per kind, shared by every stager (the bake's numeric gate
+    /// and the worker's load staging both call here, so a defect cannot hide
+    /// on one leg only). PURE IN THE ARRANGEMENT: a `Dl16ToFp32` entry's bytes
+    /// come out already permuted into the stagger the consuming island reads,
+    /// so every leg that calls here stages identical bytes by construction.
+    pub fn build(&self) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
+        match *self {
+            LoadConst::SampleTable {
+                vocab,
+                rows,
+                operand,
+                arrangement,
+            } => {
+                let (bytes, dt, shape) = sample_staged_tables(vocab, rows)
+                    .into_iter()
+                    .nth((operand - 1) as usize)
+                    .expect("the mint emits operand 1..=20 — the registry's own row");
+                let bytes = match (dt, arrangement) {
+                    // The stagger is an f32-word-stream fact; an f16 table never carries it.
+                    (scratchy_tensors::DType::F32, ElementArrangement::Dl16ToFp32) => {
+                        let words: Vec<f32> = bytes
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|p| f32::from_le_bytes(*p))
+                            .collect();
+                        dl16tofp32_stagger(&words)
+                            .into_iter()
+                            .flat_map(|w| w.to_le_bytes())
+                            .collect()
+                    }
+                    _ => bytes,
+                };
+                (bytes, dt, shape)
+            }
+            // The fill reads the kind's own `hidden` — the ramp's entry
+            // count, the mint's own statement — never re-derived here.
+            LoadConst::ChainStageTable {
+                pad_vocab,
+                k,
+                hidden,
+                operand,
+            } => {
+                let (bytes, dt, shape) = chain_staged_tables(pad_vocab, k, hidden)
+                    .into_iter()
+                    .nth((operand - 1) as usize)
+                    .expect("the mint emits operand 1..=2 — the registry's own row");
+                (bytes, dt, shape)
+            }
+        }
+    }
+
+    /// The ten UNIFORM `[rows, 1]` tables — the seeds' own class, by the
+    /// kernel's operand order: `hc1`/`hc2`/`hc3`/`c256` (10..=13) and
+    /// `fm8`/`ftop`/`fzero`/`fhalf`/`fm22` (15..=19) are 4-byte words, `cmin`
+    /// (20) is the fp16 clamp. Every other operand is whole-row (`lane` is
+    /// 14) or `[1, BLOCK]` — their staging is verbatim, never spread.
+    pub fn is_uniform_col(&self) -> bool {
+        match *self {
+            LoadConst::SampleTable { operand, .. } => {
+                (10..=13).contains(&operand) || (15..=20).contains(&operand)
+            }
+            // The chain's decompose tables are whole-row multi-stick ramps —
+            // never the seeds' one-word-per-row class.
+            LoadConst::ChainStageTable { .. } => false,
+        }
+    }
+
+    /// ⭐ THE CARD FORM of this const's bytes — [`Self::build`]'s VALUES
+    /// arranged the way the card's placements read them. The ten UNIFORM
+    /// `[rows, 1]` tables spread to each row's stick head through
+    /// [`stage_col_stick_heads`] — the seat's own law, ONE function for every
+    /// card stager of the class — and every other table is verbatim (a
+    /// whole-row table places exactly its bytes). The worker's
+    /// `bind_load_consts` stages THIS form; the emulator's legs stage
+    /// [`Self::build`]'s dense form, the same split the seat already states
+    /// (card: stick heads; emulator: packed at `[rows, 1]`).
+    ///
+    /// ⛔ A UNIFORM COL TABLE NEVER CARRIES THE STAGGER. The `Dl16ToFp32`
+    /// arrangement is a lane-for-lane fact of a whole-row table the staggered
+    /// pointwise island reads; a one-word-per-row table has no lane stream to
+    /// permute, and a mark on one is a mint/propagation disagreement — refuse
+    /// it, never permute the rows' words.
+    pub fn card_bytes(&self) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
+        let (bytes, dt, shape) = self.build();
+        // Only the sampler's own tables carry the uniform-col class; every
+        // other kind — the chain's decompose ramps — falls through VERBATIM,
+        // and a second such kind arrives here by this match failing to
+        // compile, never by silently taking the per-row spread.
+        let (rows, operand, arrangement) = match *self {
+            LoadConst::SampleTable {
+                rows,
+                operand,
+                arrangement,
+                ..
+            } => (rows, operand, arrangement),
+            LoadConst::ChainStageTable { .. } => return (bytes, dt, shape),
+        };
+        if self.is_uniform_col() {
+            if matches!(arrangement, ElementArrangement::Dl16ToFp32) {
+                panic!(
+                    "the sampler's uniform col table (operand {operand}) carries the \
+                     Dl16ToFp32 stagger — a `[rows, 1]` table has no lane stream to permute; \
+                     the propagation marked a table the mint knows is per-row"
+                );
+            }
+            let stride = col_row_stride_bytes(dt);
+            // The dense form carries row r's word at `r · elem` — the spread
+            // reads exactly that element and lands it at the row's stick head.
+            let bytes = match dt {
+                scratchy_tensors::DType::I32 | scratchy_tensors::DType::F32 => {
+                    stage_col_stick_heads::<4>(rows as usize, stride, |r| {
+                        bytes[r * 4..r * 4 + 4]
+                            .try_into()
+                            .expect("a whole i32/f32 element")
+                    })
+                }
+                scratchy_tensors::DType::F16 => {
+                    stage_col_stick_heads::<2>(rows as usize, stride, |r| {
+                        bytes[r * 2..r * 2 + 2]
+                            .try_into()
+                            .expect("a whole f16 element")
+                    })
+                }
+                other => panic!(
+                    "the sampler's uniform col table (operand {operand}) builds as {other:?} \
+                     — no `[rows, 1]` card spelling is stated for that dtype"
+                ),
+            };
+            return (bytes, dt, shape);
+        }
+        (bytes, dt, shape)
+    }
+}
+
+/// ⭐ THE CARD'S ROW STRIDE for a `[rows, 1]` table of dtype `dt` — the
+/// placement's own reservation, [`row_footprint_bytes`] at one column, so the
+/// stager and the reservation cannot drift (the same derivation the seat's
+/// `seed_row_words` states in words: 128 B, a whole 32-element u32 stick, for
+/// the i32/f32 tables; the fp16 col table's own footprint for `cmin`).
+pub fn col_row_stride_bytes(dt: scratchy_tensors::DType) -> usize {
+    let df = match dt {
+        scratchy_tensors::DType::F32 => Df::Fp32,
+        scratchy_tensors::DType::I32 => Df::SenUint32,
+        scratchy_tensors::DType::F16 => Df::Fp16,
+        other => panic!(
+            "no `[rows, 1]` card table of {other:?} — the sampler's col class is i32, f32 and \
+             the one fp16 clamp alone"
+        ),
+    };
+    row_footprint_bytes(1, df) as usize
+}
+
+/// ⭐⭐⭐ ONE STAGING FUNCTION FOR EVERY `[rows, 1]` CARD TABLE — the seed
+/// words' own class (the auditor's 2026-10-27 ruling, Finding 1). A
+/// `[rows, 1]` placement reserves ONE WHOLE STICK FOOTPRINT PER ROW
+/// ([`col_row_stride_bytes`]), and the Col operand mode reads row r's word at
+/// its STICK HEAD — byte `r · stride`. The worker's per-step seat
+/// (`sample_binds`) and the bake's ten UNIFORM tables
+/// ([`LoadConst::card_bytes`]) stage through THIS fn, so the seat's words and
+/// the uniform tables can never disagree about where a row's word lives.
+///
+/// ⛔ THE DEFECT THIS REPLACES was measured in the code, not on the card: the
+/// uniform tables were staged DENSE — `rows` words, row 0's stick alone — so
+/// at any rung with `rows > 1` every row past 0 read ZERO at its stick head
+/// (a zero hash multiplier folds every row's noise to the same value). The
+/// seat already staged the correct `r · seed_row_words` form; this fn is that
+/// law, stated once for both stagers.
+pub fn stage_col_stick_heads<const N: usize>(
+    rows: usize,
+    stride_bytes: usize,
+    elem: impl Fn(usize) -> [u8; N],
+) -> Vec<u8> {
+    assert!(
+        stride_bytes >= N,
+        "a `[rows, 1]` row stride of {stride_bytes} B cannot hold a {N}-byte element — the \
+         placement's own reservation law and the element's dtype disagree"
+    );
+    let mut out = vec![0u8; rows * stride_bytes];
+    for r in 0..rows {
+        let head = r * stride_bytes;
+        out[head..head + N].copy_from_slice(&elem(r));
+    }
+    out
+}
+
+/// ⭐ THE CHAINED HEAD'S TWO DECOMPOSE TABLES — the ChainStage's own host
+/// contract, stated ONCE for every stager (the same law as
+/// [`sample_staged_tables`]): the bake-time numeric gate and the worker's
+/// load-time staging read this same fn, so a table defect cannot hide on one
+/// leg only. In the stage's OPERAND ORDER — `stab, ltab` — each entry is
+/// `(bytes, dtype, [rows, cols])`:
+///
+/// * `stab` — row `t`'s LANE PATTERN: lane `i` stages the slab-gather entry
+///   word `k·(t>>6) + (i mod k)`, the picked token's quarter of its
+///   superword index under the door's K-way page split (core `q` of the
+///   gather reads word `q` as entry `q`'s index — the IBR's single-stick
+///   modulo law). `k` arrives as the mint's stated entry count, never
+///   re-derived here. `k = 1` degenerates to the splat byte-for-byte
+///   (`i mod 1 = 0`).
+/// * `ltab` — row `t`'s LANE RAMP: the pick's WHOLE l index,
+///   `32·chain_l_sticks(hidden)` words, word `i` staging SOURCE STICK
+///   `64·(i mod (hidden/64)) + (t&63)` of the transposed row
+///   (`chain_l_stick_ramp`, the ONE spelling — self-sized at the stick
+///   count, the row gather's `hidden/64` one-stick entries spread over the
+///   per-stick cut's index sticks), never a splat. `hidden` arrives as the
+///   mint's stated width, never re-derived here.
+///
+/// The decompose is ONE derivation shared by host and device: the sticks
+/// staged here, the mint's reference eval, and the worker's seed (staged per
+/// step in the per-step path — idempotent with the device's own writes — and
+/// once per block in the block path) all compute `s = t>>6` / `l = t&63`
+/// from the same pick and encode `s` in the same `k·s + (i mod k)` lane
+/// pattern. Tables are functions of `pad_vocab`, `k`, and `hidden`, constant
+/// across decode steps, staged ONCE.
+///
+/// The SENTINEL (all-NaN row, #666): the device answers `PAD_V + 4160`, so
+/// the tables run to `pad_vocab + SAMPLE_SENTINEL_OFFSET + 1` rows to keep
+/// that pick's gather IN EXTENT. Past `pad_vocab` every row stages the
+/// sentinel's own values — `stab` = the s=0 LANE PATTERN (every lane names a
+/// quarter of slab 0, the clamp's bus safety: no special-cased row class),
+/// `ltab` = the SENTINEL RAMP (`chain_l_sentinel_ramp` — lanes naming the
+/// transposed placement's unwritten zero tail, word 0 = `hidden` the mark: a
+/// real pick's word 0 is a lane `≤ 63 < 64 ≤ hidden`, so the mark never
+/// collides): the readback refusal (`checked_picked_token`) errors the step
+/// BEFORE any consumer of the sentinel rows runs, so those rows are bus
+/// safety, never a value the forward reads.
+///
+/// ⛔ THE WORDS ARE THE DEVICE ENCODING — SENUINT32 lane values as u32 LE
+/// words, `DType::I32`. The staging door for I32 consts is the VERBATIM
+/// one (`raw_ids`' law: LE bytes are the device encoding for raw integer
+/// words), never the IEEE→SEN convert `bind_weight` would run.
+pub fn chain_staged_tables(
+    pad_vocab: u32,
+    k: u32,
+    hidden: u32,
+) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
+    // The mint stated k; the fill TRUSTS it — and a k outside the law's
+    // window would not mis-fill, it would UNNAME (k = 0 dies a divide-by-
+    // zero at `i % k`; a k past CHAIN_IDX_BLOCK wraps the entry words past
+    // the stick's own lane count). The law's one refusal site is the mint;
+    // this guard re-states the window so a caller defect is a named
+    // refusal, never an arithmetic casualty.
+    assert!(
+        (1..=scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK).contains(&k),
+        "chain_staged_tables: k is {k} — the entry count must sit in \
+         [1, CHAIN_IDX_BLOCK = {}], the window chain_slab_entries answers in \
+         (the mint's stated k; a fill outside the window is a caller defect)",
+        scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK
+    );
+    let rows =
+        pad_vocab as usize + scratchy_subtile::subtile_ir::SAMPLE_SENTINEL_OFFSET as usize + 1;
+    let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
+    // The stab row is the LANE PATTERN, not a splat: lane i names entry
+    // k·(t>>6) + (i mod k) of the weight's slab-major staging. Past
+    // pad_vocab the base clamps to s = 0, so every lane stays a quarter of
+    // slab 0 — the clamp's bus safety under the entry-word encoding.
+    let mut stab = Vec::with_capacity(rows * lanes * 4);
+    for t in 0..rows as u32 {
+        let base = if t < pad_vocab { k * (t >> 6) } else { 0 };
+        for i in 0..lanes as u32 {
+            stab.extend_from_slice(&(base + i % k).to_le_bytes());
+        }
+    }
+    // The ltab row is the pick's WHOLE LANE RAMP, not a splat: word `i` names
+    // SOURCE STICK `64·(i mod (hidden/64)) + (t&63)` of the transposed row
+    // (`chain_l_stick_ramp`, the ONE spelling the tape seed, the worker's
+    // twin push, and this fill all share — SELF-SIZED at the stick count, so
+    // one row is the whole multi-stick l index the row gather's per-stick cut
+    // walks). Past pad_vocab the row is the SENTINEL RAMP
+    // (`chain_l_sentinel_ramp`) — words naming the transposed placement's
+    // unwritten zero tail, word 0 = `hidden` the mark.
+    let l_sticks = scratchy_subtile::subtile_ir::chain_l_sticks(hidden) as usize;
+    let l_words = l_sticks * lanes;
+    let mut ltab = Vec::with_capacity(rows * l_words * 4);
+    for t in 0..rows as u32 {
+        let row = if t < pad_vocab {
+            scratchy_subtile::subtile_ir::chain_l_stick_ramp(t & 63, hidden)
+        } else {
+            scratchy_subtile::subtile_ir::chain_l_sentinel_ramp(hidden)
+        };
+        // The fill and the shape are ONE law: the ramp is self-sized at the
+        // stick count, so a row's length IS the placement's word count —
+        // asserted here, never trusted, so the two cannot drift by a silent
+        // edit in either spelling.
+        assert_eq!(
+            row.len(),
+            l_words,
+            "chain_staged_tables: the l ramp answered {} words for hidden {hidden} — \
+             chain_l_sticks says {l_sticks} sticks = {l_words} words; the ONE spelling has \
+             drifted",
+            row.len()
+        );
+        for w in row {
+            ltab.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    vec![
+        (stab, scratchy_tensors::DType::I32, [rows, lanes]),
+        (ltab, scratchy_tensors::DType::I32, [rows, l_words]),
+    ]
+}
+
+// ⭐ THE TWO CROSS-PINS — the move of `chain_slab_entries` down to
+// scratchy-subtile (the leaf-crate law: the mint and both reference arms are
+// unconditional subtile code) spells the budget and the cap in a second
+// crate. These close the two-spelling hole: a drift in EITHER crate is a
+// cargo-build failure of this one.
+const _: () = assert!(
+    scratchy_subtile::subtile_ir::CHAIN_SLAB_LX_BUDGET
+        == ktir_superdsc::superdsc_opspec::VENDOR_LX_SCHED_BYTES,
+    "the slab-gather LX budget: scratchy-subtile's spelled const must equal \
+     ktir-superdsc's VENDOR_LX_SCHED_BYTES"
+);
+const _: () = assert!(
+    scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as u64
+        == ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP as u64,
+    "the entry cap: CHAIN_IDX_BLOCK (the u32 index stick's width) must equal \
+     CopyDims::ENTRIES_PER_OP (the IBR ceiling) — one stick, two spellings"
+);
+
+/// ⭐⭐⭐ THE GATE TABLE'S β IMAGE — the ONE `[rows, 1]` table whose chain crosses the
+/// i32→f32 convert, staged at the convert's own device sweep (front-b-noise, auditor
+/// ruling 2026-10-27). The table's reservation is [`gate_row_stride_bytes`] (two u32
+/// sticks per row), and the convert's `[rows, 64]` addressing over it is STICK-BLOCKED —
+/// row r's first stick is flat stick `r`, its second flat stick `rows + r` — so the image
+/// is the one-stick head staging (row r's gate at byte `r · 128`, the SAME head
+/// [`stage_col_stick_heads`] ever wrote, the Col operand mode's own address) followed by
+/// the sweep's second sticks, ZERO: the widened words are converted and never read, and a
+/// zero-filled reservation is deterministic — no uninitialized tail for the sweep to
+/// consume. `head_stride` is the seed words' own one-stick stride
+/// ([`col_row_stride_bytes`]); `sweep_stride` is the gate's own reservation
+/// ([`gate_row_stride_bytes`]) — both passed in so this fn stages LAWS, never
+/// recomputations.
+pub fn stage_gate_sweep<const N: usize>(
+    rows: usize,
+    head_stride: usize,
+    sweep_stride: usize,
+    elem: impl Fn(usize) -> [u8; N],
+) -> Vec<u8> {
+    assert!(
+        sweep_stride.is_multiple_of(head_stride) && sweep_stride >= head_stride,
+        "the gate's sweep stride {sweep_stride} B is not a whole multiple of the head stride \
+         {head_stride} B — the stick-blocked image requires the sweep to be whole head-sticks"
+    );
+    let mut out = stage_col_stick_heads::<N>(rows, head_stride, elem);
+    out.resize(rows * sweep_stride, 0);
+    out
+}
+
+/// ⭐ THE GATE TABLE'S OWN ROW RESERVATION — `DeviceWidth::for_convert(1)` in i32 words
+/// (64 = two u32 sticks, 256 B), the SAME one decision the convert door sweeps, the
+/// whole-function mint reserves, and the layout's `nbytes` places — stated here so the
+/// worker's per-row write and the placement's reservation cannot drift, exactly
+/// [`col_row_stride_bytes`]'s own contract for the one-stick tables.
+pub fn gate_row_stride_bytes() -> usize {
+    DeviceWidth::for_convert(1).get() as usize * 4
+}
+
+/// ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the five sources the
+/// token draw reads FRESH EVERY DECODE STEP (the seed quadruple's four word
+/// tables and inv_t). Derived ONCE off the minted
+/// `Sample` node ([`lower_subtile_tape_to_ktir::sample_seat_of_ir`], the same
+/// one-derivation law [`LoadConst`] rides) and carried on
+/// [`Wiring::sample_seat`]; the mint's own facts, never recomputed.
+///
+/// ⛔ COUNTED AS FILLED ONLY WHEN BOUND THIS STEP. The source gate treats the
+/// seat's tids as a class apart from every other source: a weight is staged
+/// once at load, a load-const once at load, and an activation is bound before
+/// the launch that reads it — but the seed words and inv_t go STALE the
+/// moment a step completes, because the seed's step word is the step's own
+/// freshness. A decode launch without a fresh bind of EVERY SEAT OPERAND
+/// REFUSES LOUDLY, the PrefixMask precedent, never a held default: a held
+/// seed row is a held
+/// TOKEN (every subsequent draw repeats the same pick wherever temperature is
+/// live), which is the silent-wrong-answer class the whole wiring exists to
+/// refuse.
+#[derive(Clone, Copy, Debug)]
+pub struct SampleSeat {
+    /// The SEED WORD sources' tids — the four `[rows, 1]` i32 per-row word
+    /// tables of the quadruple `(seed_lo, seed_hi, step, greedy_gate)`,
+    /// in that order, each `invt`'s own class (one stick per row, the word
+    /// at the stick head), staged EVERY STEP by the worker (the noise itself
+    /// is computed on the card from them). ⭐ NO ROW WORD (auditor ruling
+    /// 2026-10-27, the P3 localization): the hash key is request-owned
+    /// alone — the seed and the request's own step count — so a request
+    /// draws the same noise in any baked row of any batched launch. Four
+    /// tables, not one `[rows, 4]`: the Col operand mode that broadcasts a
+    /// word reads the stick head ALONE (the int-bcast card leg's measured
+    /// law), so every word rides its own corner-free table — the
+    /// auditor's wall-4 ruling (a).
+    pub seed_words: [u32; 4],
+    /// The temperature reciprocal's tid — the rung's `[rows, 1]` f32 inv_t
+    /// column, staged every step with the seed words.
+    pub invt: u32,
+    /// The rung's OWN row count — the mint's own `rows` fact (the solo rung at
+    /// 1, every batched rung at its baked width), the row count of both
+    /// per-row operands and of the draw's grid.
+    pub rows: u32,
+    /// ⭐ THE LOGITS ROW's tid — the Sample node's `inputs[0]`, the tensor the
+    /// mint keeps placed and readable by tid even as it re-points the rung's
+    /// RESULT at the idx stick (the pick is `[rows, BLOCK]`, not `rows` rows
+    /// of vocab, so reading the result as logits refused every rung at load).
+    /// The worker reads the launch's logits through this tid — the same fact
+    /// the solo launch reads the pick through; a bake without a draw keeps the
+    /// result AS the logits, so that consumer falls back to `result_id`.
+    pub row: u32,
+    /// The EMITTED vocab — the row's own width, the sentinel threshold the
+    /// consumer refuses past.
+    pub vocab: u32,
+    /// `sample_pad_vocab(vocab)` — the width the f32 tables share.
+    pub pad_vocab: u32,
+    /// Every seed word table's ROW STRIDE in i32 words on the CARD — the
+    /// placement's own reservation law for a `[rows, 1]` SenUint32 table
+    /// (`row_footprint_bytes(1, SenUint32) / 4`, a whole 32-element u32
+    /// stick = 32 words, `invt`'s own stride), so the worker's per-row write
+    /// and the placement's per-row reservation cannot drift. The word of
+    /// row `r` in table `k` lands at word `r · seed_row_words` of that
+    /// table's region — the STICK HEAD the Col operand mode reads.
+    pub seed_row_words: u32,
+    /// ⭐⭐⭐ THE GATE TABLE'S OWN ROW STRIDE in i32 words — the ONE table of
+    /// the quadruple whose chain crosses the i32→f32 convert
+    /// (`sgate.to(tl.float32)`), so the β ruling (front-b-noise, auditor
+    /// 2026-10-27) reserves it at the convert's own device sweep:
+    /// `DeviceWidth::for_convert(1)` = 64 words = TWO u32 sticks per row,
+    /// against the other three tables' one. The GATE ITSELF still lands at
+    /// row r's stick HEAD — byte `r · 128`, the same address the one-stick
+    /// law ever stated, because the convert's `[rows, 64]` addressing is
+    /// stick-blocked (row r's first stick is flat stick `r`) — and the
+    /// widened words past the head are the sweep's own padding: converted,
+    /// never read. Staged by [`stage_gate_sweep`]; the worker checks it
+    /// against [`gate_row_stride_bytes`] the same way `seed_row_words` is
+    /// checked against [`col_row_stride_bytes`].
+    pub gate_row_words: u32,
+}
+
+/// ⭐ THE SAMPLER'S TWENTY STAGED TABLES — the kernel's own host contract
+/// (`kernels/sample_fwd.py`'s docstring), stated ONCE for every stager: the
+/// bake-time numeric gate and the worker's load-time staging read this same
+/// fn, so a table defect cannot hide on one leg only (the synth weights' own
+/// law). The tables are functions of the vocab alone, constant across decode
+/// steps, staged ONCE.
+///
+/// ⭐ THE SELECTION TABLES ARE F32 — the selection's own dtype. The score is a
+/// sum `x·inv_t + g`; comparing it in f16 would round near-ties into ties the
+/// host reference never sees, so the whole selection runs f32 and the tables
+/// state the SAME numbers the f16 argmax tables carried (#813's own values),
+/// re-stated in the wider dtype — exact integers either way.
+///
+/// ⭐ THE NOISE SECTION'S ELEVEN ARE DTYPE-FAITHFUL TO THE KERNEL'S LOADS:
+/// `hc1`/`hc2`/`hc3`/`c256` are i32 (the hash's wrapping-integer class —
+/// SenUint32 shares IEEE_FP32's 4-byte geometry, so the staging is verbatim
+/// LE words), `lane` and the fold's five constants are f32, and `cmin` is
+/// fp16 (2^-14, the smallest normal — the clamp never leaves the fp16 stick;
+/// staged through the SEN convert like every fp16 weight, a REAL conversion
+/// since SEN169 ≠ IEEE binary16).
+///
+/// In the kernel's OPERAND ORDER — `bramp, lramp, binc, linc, ones, sixtyfour,
+/// padoff, gramp, ginc, hc1, hc2, hc3, c256, lane, fm8, ftop, fzero, fhalf,
+/// fm22, cmin` — each entry is `(bytes, dtype, [rows, cols])`:
+///
+/// * `bramp` — strictly DECREASING in the block index WITHIN EACH GROUP and
+///   PERIODIC across groups (`GROUP_BLOCKS - (b % GROUP_BLOCKS)`), so the
+///   second `max` lands on the FIRST block holding the row's maximum inside
+///   the first maximal group; its lane values top out at 64, exact at
+///   ANY vocab. 0 on the pad lanes, which can never win a max the real lanes
+///   contest.
+/// * `lramp` — strictly decreasing within each block, PERIODIC (`BLOCK - l`),
+///   so the third `max` lands on the first lane of that block.
+/// * `binc` / `linc` — the INCREASING 0-based block-within-group / lane index
+///   tables the one-hot reads the selected numbers back out through
+///   (`binc` periodic, `GROUP_BLOCKS` wide); on the pad lanes they stage
+///   `GROUP_BLOCKS` / `BLOCK` — the SENTINEL's own values.
+/// * `ones` / `sixtyfour` — the `[1, BLOCK]` widen tables: the ones broadcast
+///   the selected numbers out to the output stick, the scale row carries the
+///   `·64` of the wide integer combine (used twice: once for the block term,
+///   once squared for the group term's `·4096`; exact in f32 below 2^24).
+/// * `padoff` — THE PAD LAW: 0.0 on `[0, vocab)`, f32::MIN (−FLT_MAX,
+///   0xFF7FFFFF) on the pads — the fp32 reduce template's own "negInf"
+///   (`summeanmaxexx2_fp32.ddl:71`), NEVER IEEE −inf (an exponent-all-ones
+///   lane reads as NaN on the card and poisons the max). The kernel adds it
+///   to the score LAST, so a pad lane can never win whatever the row's pad
+///   bytes hold (the lm-head's zero-pad columns write 0.0 there every step;
+///   NaN rides through, keeping the all-NaN sentinel intact). Carried as a
+///   staged table — the same host contract as every other constant — never
+///   a V-constexpr mask.
+/// * `gramp` — the TWO-LEVEL RAMP's outer level: strictly DECREASING in the
+///   group index (`G - g`), constant across each group's 4096 lanes, 0 on the
+///   pad lanes. Its ceiling is the group count, which the admission gate
+///   keeps ≤ 2048, so the FIRST maximal GROUP wins the first `max` at any
+///   vocab the gate admits (a single flat block ramp would need NB = 8192 at
+///   gemma-4's PAD_V 524288, past fp16's exact range: that is why the ramp is
+///   two-level).
+/// * `ginc` — the INCREASING 0-based group index table; `G` on the pad lanes
+///   (the sentinel's group half).
+/// * `hc1` / `hc2` / `hc3` — the counter hash's multipliers, the staged
+///   spellings of `0x9E3779B1` / `0x85EBCA77` / `0xC2B2AE3D` (multiplication
+///   by an odd constant is a bijection mod 2^32; the squares between them
+///   break the linear structure an xor-shift mix would break on a richer
+///   vocabulary). ⭐ `[rows, 1]` — the same word at every row's stick head,
+///   THE SEEDS' OWN CLASS (auditor ruling 2026-10-27): the bake stages them
+///   at the rung's own rows, so the worker writes nothing for them, and the
+///   consuming multiplies read them through the int-bcast operand mode like
+///   seed words at every band height — never whole-row splats (the wall-5
+///   measured law: a `[1, PAD_V]` splat burns PAD_V·4 B of local store to
+///   carry one repeated word).
+/// * `c256` — the wrap-fold's 2^8: `h·2^8 mod 2^32` extracts the low 24 bits
+///   with no compare (the device has no lane-wise integer compare). `[rows, 1]`,
+///   one word per row — the seeds' own class.
+/// * `lane` — the per-lane index `0..PAD_V-1` as f32 (exact below 2^24),
+///   ingested by the index-cast law — the no-arange law's own reading: a
+///   per-lane fact is host-staged, never a splatted interior value. The one
+///   GENUINELY per-lane fact of the noise section's eleven: whole-row.
+/// * `fm8` / `ftop` / `fzero` / `fhalf` / `fm22` — the fold's constants
+///   `2^-8`, `2^23 - 1`, `0`, `0.5`, `2^-22`: the abs fold's scale, the
+///   strict-interior reflect point, the floor catch, and the uniform grid's
+///   half-ulp and scale — `u = (np + 0.5)·2^-22` lands strictly inside
+///   `(0, 1)` on every attainable `np`. `[rows, 1]` each — the seeds' own
+///   class, broadcast by their consuming ops.
+/// * `cmin` — the fp16 island's clamp `2^-14`, the FEST log's domain guard on
+///   both entries (subnormal/FTZ behavior never reached). `[rows, 1]` — the
+///   `maximum`'s broadcast operand, the seeds' own class.
+///
+/// The SENTINEL (all-NaN row, #666): the one-hot falls on the pad lanes,
+/// where the tables stage `ginc = G`, `binc = GROUP_BLOCKS`, `linc = BLOCK`,
+/// so idx = `G·4096 + GROUP_BLOCKS·64 + BLOCK = PAD_V + 4160`, past the last
+/// real lane.
+///
+/// Every selection value is a small exact integer (`G ≤ 2048` by the admission
+/// gate; `padoff` stages only 0.0 and −inf); every noise value is either an
+/// exact i32 constant or an exact f32/fp16 power of two, so the staging round
+/// trips bit-exactly.
+///
+/// ⭐ THE COL ENTRIES ARE THE VALUE FORM — `rows` words, memref-dense, the
+/// spelling the emulator's legs stage (a `[rows, 1]` view over these bytes
+/// reads row r's word at `r`). The CARD's placements reserve a whole stick
+/// footprint per row and the Col operand mode reads the STICK HEAD, so the
+/// worker stages [`LoadConst::card_bytes`] — these same values spread through
+/// [`stage_col_stick_heads`], the seat's own law (Finding 1, 2026-10-27: the
+/// dense form staged onto the card left every row past 0 reading ZERO).
+pub fn sample_staged_tables(
+    vocab: u32,
+    rows: u32,
+) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
+    let pad_v = scratchy_subtile::subtile_ir::sample_pad_vocab(vocab) as usize;
+    let block = scratchy_subtile::subtile_ir::SAMPLE_BLOCK as usize;
+    let group_blocks = scratchy_subtile::subtile_ir::SAMPLE_GROUP_BLOCKS as usize;
+    let groups = scratchy_subtile::subtile_ir::sample_groups(pad_v as u32) as usize;
+    let v = vocab as usize;
+    // A whole-row f32 table under a per-lane rule: lane `i < vocab` takes
+    // `real(i)`, a pad lane takes `pad`.
+    let f32_row = |real: &dyn Fn(usize) -> usize, pad: usize| -> Vec<u8> {
+        (0..pad_v)
+            .flat_map(|i| {
+                let x = if i < v { real(i) } else { pad };
+                (x as f32).to_le_bytes()
+            })
+            .collect()
+    };
+    // A whole-row i32 splat's per-row form — the hash constants' own value
+    // (SenUint32, the same 4-byte geometry as f32; the LE words ARE the device
+    // encoding), ONE WORD PER ROW of a `[rows, 1]` table. ⭐ THE WALL-5 MEASURED
+    // LAW holds — a uniform constant is never a whole-row splat (which burns
+    // PAD_V·4 B of local store to carry one repeated word; ten of them tip the
+    // 2 MiB LX) — and ⭐ THE 2026-10-27 RULING restages it as the SEED WORDS'
+    // OWN CLASS: `[rows, 1]` at the rung's own row count, the same word at
+    // every row's stick head, so the `Col` operand mode reads row r's word
+    // exactly as it reads a seed word, at every band height (a `[1, 1]` table
+    // at a multi-row rung would demand a scalar broadcast no door states).
+    let i32_col =
+        |x: i32| -> Vec<u8> { (0..rows as usize).flat_map(|_| x.to_le_bytes()).collect() };
+    // A whole-row f32 splat's per-row form — the fold's constants, the same law.
+    let f32_col =
+        |x: f32| -> Vec<u8> { (0..rows as usize).flat_map(|_| x.to_le_bytes()).collect() };
+    vec![
+        // bramp: GROUP_BLOCKS - (b % GROUP_BLOCKS), periodic, pads 0.
+        (
+            f32_row(&|i| group_blocks - (i / block) % group_blocks, 0),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // lramp: BLOCK - l, periodic, pads 0.
+        (
+            f32_row(&|i| block - i % block, 0),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // binc: the block-within-group index, periodic, pads GROUP_BLOCKS.
+        (
+            f32_row(&|i| (i / block) % group_blocks, group_blocks),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // linc: the lane index, pads BLOCK.
+        (
+            f32_row(&|i| i % block, block),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // ones: [1, BLOCK] of 1.0.
+        (
+            (0..block).flat_map(|_| 1.0f32.to_le_bytes()).collect(),
+            scratchy_tensors::DType::F32,
+            [1, block],
+        ),
+        // sixtyfour: [1, BLOCK] of 64.0.
+        (
+            (0..block).flat_map(|_| 64.0f32.to_le_bytes()).collect(),
+            scratchy_tensors::DType::F32,
+            [1, block],
+        ),
+        // padoff: THE PAD LAW — 0.0 on the real lanes, f32::MIN (−FLT_MAX,
+        // 0xFF7FFFFF) on the pads. Not an `f32_row` operand: the pad value is
+        // −FLT_MAX, not a small integer. ⭐ NEVER IEEE −inf: the hardware's
+        // fp32 domain does not use IEEE inf — the fp32 reduce template's own
+        // "negInf" seed is 0xFF7FFFFF, a FINITE number
+        // (`summeanmaxexx2_fp32.ddl:71`), and an exponent-all-ones lane reads
+        // as NaN on the card, so an IEEE −inf staged verbatim poisons the max
+        // into NaN. −FLT_MAX loses every max a real lane contests exactly the
+        // way −inf does (both are below every finite score), with no NaN to
+        // ride through. (#813's f16 pads never hit this: `ieee_to_sen`
+        // saturates −inf to SEN's finite minimum on that path.)
+        (
+            (0..pad_v)
+                .flat_map(|i| {
+                    let x = if i < v { 0.0 } else { f32::MIN };
+                    x.to_le_bytes()
+                })
+                .collect(),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // gramp: G - g, constant per group, pads 0 — the two-level ramp's
+        // outer level.
+        (
+            f32_row(&|i| groups - i / (block * group_blocks), 0),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // ginc: the group index, pads G — the sentinel's group half.
+        (
+            f32_row(&|i| i / (block * group_blocks), groups),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // hc1 / hc2 / hc3: the counter hash's multipliers, i32 — the
+        // staged spellings of 0x9E3779B1 / 0x85EBCA77 / 0xC2B2AE3D. `[rows, 1]`,
+        // the same word at every row's stick head (the seeds' own class): uniform
+        // constants broadcast by their consuming multiplies through the int-bcast
+        // operand mode, never whole-row splats.
+        (
+            i32_col(-1640531535),
+            scratchy_tensors::DType::I32,
+            [rows as usize, 1],
+        ),
+        (
+            i32_col(-2048144777),
+            scratchy_tensors::DType::I32,
+            [rows as usize, 1],
+        ),
+        (
+            i32_col(-1028477379),
+            scratchy_tensors::DType::I32,
+            [rows as usize, 1],
+        ),
+        // c256: the wrap-fold's 2^8, i32 — `[rows, 1]`, one word per row.
+        (
+            i32_col(256),
+            scratchy_tensors::DType::I32,
+            [rows as usize, 1],
+        ),
+        // lane: the per-lane index 0..PAD_V-1 as f32 (exact below 2^24) —
+        // every lane its own index, pads included (the hash runs per lane;
+        // the pad lanes lose on the pad law, never on the noise).
+        (
+            (0..pad_v).flat_map(|i| (i as f32).to_le_bytes()).collect(),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // fm8 / ftop / fzero / fhalf / fm22: the fold's f32 constants —
+        // 2^-8, 2^23 - 1, 0, 0.5, 2^-22. `[rows, 1]`, the same word at every
+        // row's stick head (the seeds' own class): uniform constants broadcast
+        // by their consuming ops, never whole-row splats.
+        (
+            f32_col(0.00390625),
+            scratchy_tensors::DType::F32,
+            [rows as usize, 1],
+        ),
+        (
+            f32_col(8388607.0),
+            scratchy_tensors::DType::F32,
+            [rows as usize, 1],
+        ),
+        (
+            f32_col(0.0),
+            scratchy_tensors::DType::F32,
+            [rows as usize, 1],
+        ),
+        (
+            f32_col(0.5),
+            scratchy_tensors::DType::F32,
+            [rows as usize, 1],
+        ),
+        (
+            f32_col(2f32.powi(-22)),
+            scratchy_tensors::DType::F32,
+            [rows as usize, 1],
+        ),
+        // cmin: the fp16 island's clamp 2^-14 (fp16's smallest normal) —
+        // fp16, the FEST log's domain guard; staged through the SEN convert
+        // like every fp16 weight (a REAL conversion: SEN169 ≠ IEEE binary16).
+        // `[rows, 1]` — the same word at every row's stick head, the
+        // `maximum`'s broadcast operand in the seeds' own class.
+        (
+            (0..rows as usize)
+                .flat_map(|_| half::f16::from_f32(2f32.powi(-14)).to_le_bytes())
+                .collect(),
+            scratchy_tensors::DType::F16,
+            [rows as usize, 1],
+        ),
+    ]
 }
 
 /// The per-model wiring set: one [`Wiring`] per baked PROGRAM.
@@ -1695,6 +2597,7 @@ mod constant_tape_tests {
                     causal_heads_per_block: w.causal_heads_per_block(causal),
                     embed_tokens: &[],
                     tokens: &[],
+                    chain_seeds: None,
                     positions: &[],
                     causal,
                     prefix: None,
@@ -1748,6 +2651,7 @@ mod constant_tape_tests {
     fn uniform_wiring() -> Wiring {
         Wiring {
             result: 0,
+            result_dtype: scratchy_tensors::DType::F16,
             num_sources: 0,
             attn_mask: None,
             decode_position: 0,
@@ -1772,6 +2676,9 @@ mod constant_tape_tests {
             fp8_k_pads: &[],
             weight_scale_folds: &[],
             weight_copies: &[],
+            load_consts: &[],
+            sample_seat: None,
+            phase: crate::forward_tape::ForwardPhase::Prefill,
         }
     }
 

@@ -1,0 +1,43 @@
+  1 launch group(s)
+  parsed segment_bytes [127926272, 0, 0, 60817408, 16777216, 0, 0]
+    hash-noise: init_binary 249984 B, job_bin_ptr 0x1c00000000, 0 flit(s)
+[2m2026-10-26T20:37:52.509346Z[0m [32m INFO[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-superdsc] bundle hash-noise: 1 body (1 class(es)) + 0 prefix + 0 suffix launch group(s)
+[2m2026-10-26T20:37:52.509357Z[0m [34mDEBUG[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-superdsc] load OK — bundle=hash-noise, 19 placements, seg_bytes=[127926272, 0, 0, 60817408, 16777216, 0, 0], logits=t15, vocab=2097152 kv_dim=1 num_blocks=1
+0 0 0 0 0 0 0   <- shadows before stage_weights
+127926272 128 128 60817408 16777216 128 128   <- after stage_weights
+[2m2026-10-26T20:37:58.392470Z[0m [32m INFO[0m [2mflex_rs::runtime[0m[2m:[0m Logical Device ID: DeviceId(-1)
+[2m2026-10-26T20:37:58.392498Z[0m [34mDEBUG[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-superdsc] program H2D Prefix: 0 of 0 op(s) staged through a heap copy (Cow::Borrowed ⇒ possibly .rodata ⇒ unpinnable for DMA)
+[2m2026-10-26T20:37:58.396232Z[0m [34mDEBUG[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-superdsc] program H2D Body(0): 0 of 1 op(s) staged through a heap copy (Cow::Borrowed ⇒ possibly .rodata ⇒ unpinnable for DMA)
+[2m2026-10-26T20:37:58.396247Z[0m [34mDEBUG[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-superdsc] program H2D Suffix: 0 of 0 op(s) staged through a heap copy (Cow::Borrowed ⇒ possibly .rodata ⇒ unpinnable for DMA)
+[2m2026-10-26T20:37:58.396261Z[0m [34mDEBUG[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-superdsc] seg-alloc seg0: bytes=127926272 chunk0=Some(Chunk0 { region: RegionId(17179869312), offset: ByteOffset(0), size: ByteSize(127926272), domain: DomainId(0) }) (padded total 127926272)
+[2m2026-10-26T20:37:58.396267Z[0m [34mDEBUG[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-superdsc] seg-alloc seg1: bytes=0 chunk0=Some(Chunk0 { region: RegionId(17179869312), offset: ByteOffset(127926272), size: ByteSize(128), domain: DomainId(0) }) (padded total 128)
+[2m2026-10-26T20:37:58.396271Z[0m [34mDEBUG[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-superdsc] seg-alloc seg2: bytes=0 chunk0=Some(Chunk0 { region: RegionId(17179869312), offset: ByteOffset(127926400), size: ByteSize(128), domain: DomainId(0) }) (padded total 128)
+[2m2026-10-26T20:37:58.396274Z[0m [34mDEBUG[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-superdsc] seg-alloc seg3: bytes=60817408 chunk0=Some(Chunk0 { region: RegionId(17179869312), offset: ByteOffset(127926528), size: ByteSize(60817408), domain: DomainId(0) }) (padded total 60817408)
+[2m2026-10-26T20:37:58.396278Z[0m [34mDEBUG[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-superdsc] seg-alloc seg4: bytes=16777216 chunk0=Some(Chunk0 { region: RegionId(17179869312), offset: ByteOffset(188743936), size: ByteSize(16777216), domain: DomainId(0) }) (padded total 16777216)
+[2m2026-10-26T20:37:58.396282Z[0m [34mDEBUG[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-superdsc] seg-alloc seg5: bytes=0 chunk0=Some(Chunk0 { region: RegionId(17179869312), offset: ByteOffset(205521152), size: ByteSize(128), domain: DomainId(0) }) (padded total 128)
+[2m2026-10-26T20:37:58.396285Z[0m [34mDEBUG[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-superdsc] seg-alloc seg6: bytes=0 chunk0=Some(Chunk0 { region: RegionId(17179869312), offset: ByteOffset(205521280), size: ByteSize(128), domain: DomainId(0) }) (padded total 128)
+[2m2026-10-26T20:37:58.438615Z[0m [34mDEBUG[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-cbplan] parity gate: 1 CB(s) proven byte-identical across 1 (list × launch-row) context(s); patch gate: 0 moving word(s) verified off-sample across 1 image(s)
+[2m2026-10-26T20:37:58.438627Z[0m [34mDEBUG[0m [2mscratchy_target_spyre::superdsc_exec[0m[2m:[0m [sdsc-superdsc] prepare OK — 0 weight(s) placed into 7 packed segments
+127926272 128 128 60817408 16777216 128 128   <- after prepare
+  zeroed seg0
+  zeroed seg3
+  zeroed seg4
+  bound t0 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t1 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t2 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t3 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t4 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t5 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t6 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t7 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t8 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t9 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t10 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t11 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t12 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t13 RAW: 4194304 B verbatim, no IEEE→SEN conversion
+  bound t14 RAW: 2097152 B verbatim, no IEEE→SEN conversion
+read t15 RAW -> /work/fb-noise-probe/out_u.bin (4194304 B, verbatim, no codec)
+read t16 RAW -> /work/fb-noise-probe/out_g.bin (4194304 B, verbatim, no codec)
+read t17 RAW -> /work/fb-noise-probe/out_ui.bin (4194304 B, verbatim, no codec)
+read t18 RAW -> /work/fb-noise-probe/out_gi.bin (4194304 B, verbatim, no codec)

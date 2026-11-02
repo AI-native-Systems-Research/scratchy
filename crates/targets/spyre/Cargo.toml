@@ -140,6 +140,13 @@ required-features = ["spyre-hw"]
 name = "shared_host_pool_probe"
 required-features = ["spyre-hw"]
 
+# #1016's card leg: `Stream::fill_zero` on real hardware — the vendor's fill op's
+# first caller is `zero_seg`, so this proves the fill CB writes zeros on a card
+# (poisoned non-zero first, all-zero after), across a window boundary.
+[[example]]
+name = "fill_zero_probe"
+required-features = ["spyre-hw"]
+
 # The proof harnesses in this crate compile only under the model checker, so `cfg(kani)` is a real name a
 # normal build never defines. DECLARED rather than silenced: an undeclared cfg is how ~100 commits of "the
 # proofs hold" turned out to be vacuous (a normal build skipped the module and said nothing), and declaring

@@ -933,7 +933,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // until its residency is explicitly decided — either pinned here
             // (`pin(field)`) or bound to `field: _` with a reason. A new
             // dispatch-bound buffer that is silently left un-pinned reads stale
-            // zero pages → token salad.
+            // zero pages → token salad. One a step's input writes copy or fill is
+            // pinned too, bound by a command or not: the copy lands wherever its
+            // stale pages map.
             let RuntimeBindings {
                 input_ids,
                 positions,
@@ -951,8 +953,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // when W::ROPE_ON_READ, so pinned below like block_tables
                 // (16-byte placeholder + never bound on non-spans arches).
                 block_unrotated_flags,
-                // Bound by no command.
-                num_tokens_u32: _,
                 // The sampled rows the gather and its undoing read by baked gpuAddress — pinned
                 // below.
                 num_sample_rows_u32,
@@ -2525,7 +2525,6 @@ mod tests {
             kv_cache_v: (0..num_layers).map(|_| alloc_buffer(device, 16)).collect(),
             block_unrotated_flags: (0..num_layers).map(|_| alloc_buffer(device, 16)).collect(),
             tq: None,
-            num_tokens_u32: alloc_buffer(device, 4),
             num_sample_rows_u32: alloc_buffer(device, 4),
             sample_indices: alloc_buffer(device, 16),
             gdn_state_conv: ::std::vec::Vec::new(),

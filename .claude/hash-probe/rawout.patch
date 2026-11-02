@@ -1,0 +1,138 @@
+--- crates/targets/spyre/src/bundle_run.rs	2026-10-26 09:11:15
++++ b/crates/targets/spyre/src/bundle_run.rs	2026-10-26 09:45:28
+@@ -536,14 +536,58 @@
+                 None => (lhs.to_string(), None),
+             };
+             Ok((name, rows, path.to_string()))
++        })
++        .collect::<Result<_>>()?;
++    // `rawout:t<id>` — READ THIS TENSOR BACK VERBATIM, the mirror of `raw:` on the input side.
++    // A MARKER, not a binding: the file still comes from this tensor's own `--output t<id>=<path>`
++    // entry — `rawout:` only says how to read it back — so it carries no `=`, exactly like `raw:`.
++    let rawouts: std::collections::BTreeSet<u32> = output
++        .iter()
++        .filter_map(|o| o.strip_prefix("rawout:"))
++        .map(|body| {
++            if body.contains('=') {
++                bail!(
++                    "`rawout:{body}`: `rawout:` is a MARKER, not a binding — it takes no `=<path>`. \
++                     The file comes from this tensor's own `--output t<id>=<path>` entry and \
++                     `rawout:` only says to read the bytes back verbatim, so pass both: \
++                     `--output t<id>=<path> rawout:t<id>`."
++                );
++            }
++            let tid = body
++                .strip_prefix('t')
++                .unwrap_or(body)
++                .parse::<u32>()
++                .with_context(|| format!("`rawout:{body}`: `{body}` is not a tensor id"))?;
++            Ok(tid)
+         })
+         .collect::<Result<_>>()?;
+     let outputs: BTreeMap<u32, String> = output
+         .iter()
+-        .filter(|o| !o.starts_with("synth:"))
++        .filter(|o| !o.starts_with("synth:") && !o.starts_with("rawout:"))
+         .map(|s| split_binding(s, "output"))
+         .collect::<Result<_>>()?;
+ 
++    // ⛔⛔⛔ A `rawout:` MARKER THAT NAMES NOTHING is the read-side twin of the `raw:` check
++    // below: a typo'd id leaves the output on the decoded path, `sen_to_ieee_bytes` rewrites
++    // every 2-byte half of each 4-byte u32 entry, and the file LOOKS like plausible bytes.
++    for tid in &rawouts {
++        if !outputs.contains_key(tid) {
++            bail!(
++                "rawout:t{tid}: no `t{tid}=<path>` among the outputs. `rawout:` says how to read a \
++                 tensor back, not which file — on its own it changes nothing, and this tensor, if \
++                 some other spelling reads it, would go through the SEN169 decode `rawout:` exists \
++                 to avoid."
++            );
++        }
++        if sticks.contains_key(tid) {
++            bail!(
++                "rawout:t{tid} and stick:t{tid}: the stick-major map permutes 2-byte fp16 \
++                 elements, and a raw tensor is not fp16 — the input side's own law. Reading it \
++                 back through that map would shuffle half-words between entries."
++            );
++        }
++    }
++
+     // ⛔⛔⛔ A `raw:` MARKER THAT NAMES NOTHING IS EXACTLY THE SILENT WRONG ANSWER IT EXISTS TO STOP.
+     // `raw:` only changes how a tensor is STAGED, so a typo'd or stale id leaves the buffer on the
+     // default path — through `ieee_to_sen_bytes`, which rewrites both halves of every int32 index
+@@ -892,16 +936,47 @@
+             .iter()
+             .find(|q| q.tid == *tid)
+             .ok_or_else(|| anyhow!("--output t{tid}: no such tensor in placements.json"))?;
+-        let bytes = exec.read_tensor(
+-            ktir_superdsc::place::PlaceId::Act(*tid),
+-            (p.size / 2) as usize,
+-        )?;
+-        let bytes = match layout_of(*tid, p.size, "output")? {
+-            Some((rows, cols)) => restick(&bytes, rows, cols, false),
+-            None => bytes,
++        // ⭐ THE RAW TWIN: `rawout:t<id>` reads this tensor's own placement window out of its
++        // segment VERBATIM — no `sen_to_ieee_bytes`, no stick map — the read-side mirror of
++        // `raw:`'s staging law. A u32 stick read through the decode would have every 4-byte
++        // entry rewritten as two SEN169 fp16s: plausible bytes, wrong values, no fault. The
++        // BANK law is `read_tensor`'s own and is restated for the raw path because `read_seg`
++        // addresses only bank 0's region — a banked placement read raw would silently return
++        // another bank's bytes at this offset.
++        let bytes = if rawouts.contains(tid) {
++            if p.bank != 0 {
++                bail!(
++                    "rawout:t{tid}: it is in weight bank {}, and a segment read addresses only \
++                     bank 0's region — REFUSING rather than returning another bank's bytes",
++                    p.bank
++                );
++            }
++            let seg = crate::superdsc_exec::SegIdx::checked(p.segment as i64)
++                .ok_or_else(|| anyhow!("rawout:t{tid}: segment {} out of range", p.segment))?;
++            let whole = exec.read_seg(seg)?;
++            let a = p.offset as usize;
++            let b = (p.offset + p.size) as usize;
++            if b > whole.len() {
++                bail!(
++                    "rawout:t{tid}: spans [{a}, {b}) of segment {} but only {} B are \
++                     host-readable — set SCRATCHY_SUPERDSC_DBG to keep every shadow alive",
++                    p.segment,
++                    whole.len()
++                );
++            }
++            whole[a..b].to_vec()
++        } else {
++            let bytes = exec.read_tensor(
++                ktir_superdsc::place::PlaceId::Act(*tid),
++                (p.size / 2) as usize,
++            )?;
++            match layout_of(*tid, p.size, "output")? {
++                Some((rows, cols)) => restick(&bytes, rows, cols, false),
++                None => bytes,
++            }
+         };
+         std::fs::write(path, &bytes).with_context(|| format!("--output t{tid}={path}"))?;
+-        println!("read t{tid} -> {path} ({} B)", bytes.len());
++        println!("read t{tid} -> {path} ({} B{})", bytes.len(), if rawouts.contains(tid) { " RAW" } else { "" });
+     }
+     if outputs.is_empty() && !out_ids.is_empty() {
+         println!(
+--- crates/targets/spyre/examples/bundle_run_dev.rs
++++ b/crates/targets/spyre/examples/bundle_run_dev.rs
+@@ -36,11 +36,16 @@
+         if a == "--out" {
+             next_is_out = true;
+             continue;
+         }
+-        if next_is_out {
++        // `rawout:t<id>` rides the OUTPUT list from anywhere — `bundle_run::run`'s marker
++        // parse reads it there, while `--out` takes exactly one `t<id>=<path>` binding, so
++        // a marker spelled after the binding would otherwise fall into the input list and
++        // die at its `t<id>=<path>` parse (measured: "--input wants t<id>=<path>, got
++        // rawout:t2").
++        if next_is_out || a.starts_with("rawout:") {
+             outputs.push(a.clone());
+             next_is_out = false;
+         } else {
+             inputs.push(a.clone());
+         }
+     }

@@ -432,6 +432,57 @@ pub fn generate_multi_turn(
     })
 }
 
+/// Seeded word text of at most `target` tokens under `count_tokens`, from stream `stream` of
+/// `seed`: the same text for the same (seed, stream), on every engine. Built from common words,
+/// never from decoded token ids.
+pub fn seeded_text(
+    count_tokens: &dyn Fn(&str) -> Result<usize>,
+    seed: u64,
+    stream: u64,
+    target: usize,
+) -> Result<String> {
+    let sizer = Sizer {
+        count_tokens,
+        words: WORDS.split_whitespace().collect(),
+        seed,
+    };
+    Ok(sizer.text(stream, target)?.text)
+}
+
+/// Every ShareGPT conversation's (human, gpt) turn pairs, in order: a conversation whose turns do
+/// not alternate human then gpt is cut where they stop, and one with no full pair is left out.
+pub fn load_sharegpt_conversations(path: &Path) -> Result<Vec<Vec<(String, String)>>> {
+    let data = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read ShareGPT dataset from {}", path.display()))?;
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(&data).context("Failed to parse ShareGPT JSON")?;
+    let turn = |c: &serde_json::Value, from: &str| {
+        (c.get("from").and_then(|f| f.as_str()) == Some(from))
+            .then(|| c.get("value").and_then(|v| v.as_str()).map(str::to_string))
+            .flatten()
+    };
+    let mut out = Vec::new();
+    for entry in &entries {
+        let Some(turns) = entry.get("conversations").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        let mut pairs = Vec::new();
+        for pair in turns.chunks(2) {
+            match pair {
+                [h, g] => match (turn(h, "human"), turn(g, "gpt")) {
+                    (Some(h), Some(g)) => pairs.push((h, g)),
+                    _ => break,
+                },
+                _ => break,
+            }
+        }
+        if !pairs.is_empty() {
+            out.push(pairs);
+        }
+    }
+    Ok(out)
+}
+
 /// Cuts one dataset's seeded word streams to length.
 struct Sizer<'a> {
     count_tokens: &'a dyn Fn(&str) -> Result<usize>,
@@ -529,6 +580,41 @@ mod tests {
                 assert_eq!(next[prev.len() + 1]["role"], "user");
             }
         }
+    }
+
+    #[test]
+    fn sharegpt_conversations_keep_their_turns_in_pairs() {
+        let dir = std::env::temp_dir().join(format!("sharegpt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.json");
+        let t = |from: &str, v: &str| serde_json::json!({"from": from, "value": v});
+        let data = serde_json::json!([
+            {"conversations": [t("human", "a"), t("gpt", "b"), t("human", "c"), t("gpt", "d")]},
+            {"conversations": [t("human", "x"), t("gpt", "y"), t("gpt", "z")]},
+            {"conversations": [t("gpt", "no human first")]},
+            {"id": "no conversations"},
+        ]);
+        std::fs::write(&path, data.to_string()).unwrap();
+        let c = load_sharegpt_conversations(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(c.len(), 2);
+        assert_eq!(
+            c[0],
+            vec![("a".into(), "b".into()), ("c".into(), "d".into())]
+        );
+        assert_eq!(
+            c[1],
+            vec![("x".into(), "y".into())],
+            "cut where the turns stop alternating"
+        );
+    }
+
+    #[test]
+    fn seeded_text_is_the_same_for_a_seed_and_stream() {
+        let a = seeded_text(&words, 7, 3, 40).unwrap();
+        assert_eq!(a, seeded_text(&words, 7, 3, 40).unwrap());
+        assert_ne!(a, seeded_text(&words, 7, 4, 40).unwrap());
+        assert!(words(&a).unwrap() <= 40);
     }
 
     #[test]

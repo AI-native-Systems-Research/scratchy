@@ -21,7 +21,7 @@ use crate::stream::MetalStreamError;
 use crate::tape::ids::{BitsetWords, BlockSize, KDimI32, LogitsWidth, MDimI32, NDimI32};
 use crate::tape::kernel_constants::{
     AffineCodes, AffineQmvConstants, AffineQmvWideConstants, ArgmaxConstants,
-    ChainAdvanceConstants, GrammarMaskConstants, MtpChainConstants,
+    ChainAdvanceConstants, GrammarMaskConstants, LogprobsConstants, MtpChainConstants,
 };
 use crate::tape::lowered::{BakedKernel, MetalDtype};
 use crate::tape::quantized::{
@@ -154,6 +154,8 @@ pub struct OffTape<K, L> {
     pub vocab: LogitsWidth,
     pub argmax: K,
     pub argmax_dual_write: K,
+    /// The OpenAI logprobs of emitted tokens ([`crate::logprobs`]).
+    pub logprobs: K,
     pub grammar_mask: K,
     /// Every sampler stage, `[telemetry spill compiled in][stage]`; the `sampler-telemetry`
     /// feature picks the row ([`OffTapeKernels::sampler`]).
@@ -184,16 +186,18 @@ impl OffTape<PipelineKey, Vec<PipelineKey>> {
         drafts: bool,
         vocab_suffix: Option<VocabSuffix>,
     ) -> Self {
-        let (argmax, dual_write, grammar_mask, cast) = match dtype {
+        let (argmax, dual_write, logprobs, grammar_mask, cast) = match dtype {
             MetalDtype::F16 => (
                 "argmax_f16",
                 "argmax_f16_dual_write",
+                "logprobs_topk_f16",
                 "grammar_mask_f16",
                 CastDtype::F16,
             ),
             MetalDtype::Bf16 => (
                 "argmax_bf16",
                 "argmax_bf16_dual_write",
+                "logprobs_topk_bf16",
                 "grammar_mask_bf16",
                 CastDtype::Bf16,
             ),
@@ -217,6 +221,7 @@ impl OffTape<PipelineKey, Vec<PipelineKey>> {
             vocab,
             argmax: argmax_key(argmax),
             argmax_dual_write: argmax_key(dual_write),
+            logprobs: PipelineKey::new("logprobs", logprobs, LogprobsConstants { vocab }.into()),
             grammar_mask: PipelineKey::new("grammar_mask", grammar_mask, grammar.into()),
             sampler: [false, true].map(|t| SamplerStage::ALL.map(|s| s.key(vocab, cast, t))),
             chain_advance: PipelineKey::new(
@@ -237,6 +242,7 @@ impl<K> OffTape<K, Vec<K>> {
             vocab: self.vocab,
             argmax: f(self.argmax),
             argmax_dual_write: f(self.argmax_dual_write),
+            logprobs: f(self.logprobs),
             grammar_mask: f(self.grammar_mask),
             sampler: self.sampler.map(|row| row.map(&mut f)),
             chain_advance: f(self.chain_advance),

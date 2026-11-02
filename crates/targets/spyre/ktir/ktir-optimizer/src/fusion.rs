@@ -26,6 +26,7 @@ use ktir_core::attrkey::AttrKey;
 use ktir_core::ir::{Attr, IRFunction, IRModule, Operation, Ssa};
 use ktir_core::irtype::IrType;
 use ktir_core::opkind::OpKind;
+use ktir_superdsc::ktir_node::Program;
 use std::collections::{HashMap, HashSet};
 
 /// One function argument's binding to a logical tensor and its direction.
@@ -43,6 +44,13 @@ pub struct Binding {
 #[derive(Clone, Debug)]
 pub struct NodeSpec {
     pub func: String,
+    /// WHAT THE NODE COMPUTES — the mint's own `Program` kind with its payload,
+    /// carried from the KtirNode through `LaunchProgram` (never re-derived, never
+    /// parsed from the func name). The planner's DOOR isolation keys on this
+    /// field: a door node's KTIR body is a structural skeleton for the card-side
+    /// door assembly, not door semantics, so it must not be collapsed into a
+    /// fused `[1,1]` function.
+    pub program: Program,
     pub bindings: Vec<Binding>,
 }
 
@@ -76,8 +84,11 @@ pub enum Segment<'a> {
     /// token-parallel (`[8,1]`) matmul nodes folded in here by ignoring the SPMD
     /// grid and rebuilding the whole GEMM. Pointer args are named `%t<id>_ptr`.
     Fused(FusedSegment<'a>),
-    /// A single attention node, run at its native multi-core grid. The
-    /// `bindings` carry the original arg→tensor mapping the executor marshals.
+    /// A single node the executor must run SEPARATELY from any fused run — an
+    /// attention node at its native multi-core grid (the `bindings` carry the
+    /// original arg→tensor mapping the executor marshals), or a chained-head
+    /// DOOR (#603) whose host implementation the resident substitutes by
+    /// `program` kind.
     Native(NodeSpec),
 }
 
@@ -416,6 +427,28 @@ pub fn plan_segments_budgeted<'a>(
         })
         .collect::<Result<_, _>>()?;
 
+    // Per-node DOOR classification (the chained head, #603). A door node's KTIR
+    // body is a STRUCTURAL SKELETON minted for the card-side door assembly — a
+    // load of the first operand's view and a store to the last — not door
+    // semantics, so executing it op by op inside a fused function computes a
+    // copy, not the door. Isolated as its own `Segment::Native` (the same law
+    // as decode attention) so the resident executor can substitute the host
+    // door, keyed on the node's CARRIED `program` kind — the mint's one
+    // statement of the fact, never the func name (the spelling this crate
+    // retired). NO opt-out env var, unlike attention's KTIR_NO_FUSE_ATTN
+    // oracle: the door's decomposed path is the missing-Strides refusal, not
+    // an oracle, so there is nothing sound to fall back to.
+    let door: Vec<bool> = spec
+        .nodes
+        .iter()
+        .map(|n| {
+            matches!(
+                n.program,
+                Program::EmbedRowGather { .. } | Program::ChainStage { .. }
+            )
+        })
+        .collect();
+
     // For widening segment-local sources/results: which node indices produce /
     // consume each tensor, across the WHOLE program.
     let mut produced_at: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -441,7 +474,7 @@ pub fn plan_segments_budgeted<'a>(
     let mut segments: Vec<Segment> = Vec::new();
     let mut i = 0;
     while i < spec.nodes.len() {
-        if attn[i] {
+        if attn[i] || door[i] {
             segments.push(Segment::Native(spec.nodes[i].clone()));
             i += 1;
             continue;
@@ -449,7 +482,7 @@ pub fn plan_segments_budgeted<'a>(
         // Maximal run [start, j) of consecutive non-attention nodes.
         let start = i;
         let mut j = i;
-        while j < spec.nodes.len() && !attn[j] {
+        while j < spec.nodes.len() && !attn[j] && !door[j] {
             j += 1;
         }
         // Split the maximal run into sub-runs that each fit the LX live-set
@@ -1270,9 +1303,14 @@ fn emit_ops<'a>(
 mod tests {
     use super::*;
     use crate::ir_builder::Ops;
+    // The elementwise kind names only the tests' body-honest NodeSpec
+    // literals — the lib's own reads match `Program` variants, never the
+    // elementwise payload, so the import lives here (check-5's clippy pair:
+    // a lib-level import was unused outside cfg(test)).
     use ktir_core::attrkey::AttrKey;
     use ktir_core::dtypes::DType;
     use ktir_core::ir::Attr;
+    use ktir_superdsc::ktir_node::Elementwise;
 
     /// Build a node function: load whole tensor from `%in`, "compute" (identity
     /// copy via `math.exp`), store whole to `%out`. `whole` toggles whether the
@@ -1393,6 +1431,8 @@ mod tests {
             nodes: vec![
                 NodeSpec {
                     func: "a".into(),
+                    // copy_node's body computes MathExp — the kind its own ops state.
+                    program: Program::Elementwise(Elementwise::Exp),
                     bindings: vec![
                         Binding {
                             arg: a_in,
@@ -1408,6 +1448,7 @@ mod tests {
                 },
                 NodeSpec {
                     func: "b".into(),
+                    program: Program::Elementwise(Elementwise::Exp),
                     bindings: vec![
                         Binding {
                             arg: b_in,
@@ -1692,6 +1733,8 @@ mod tests {
             nodes: vec![
                 NodeSpec {
                     func: "a".into(),
+                    // copy_node's body computes MathExp — the kind its own ops state.
+                    program: Program::Elementwise(Elementwise::Exp),
                     bindings: vec![
                         Binding {
                             arg: a_in,
@@ -1707,6 +1750,8 @@ mod tests {
                 },
                 NodeSpec {
                     func: "b".into(),
+                    // attn_node's body is the attention signature the walk classifies.
+                    program: Program::Attn,
                     bindings: vec![
                         Binding {
                             arg: b_in,
@@ -1722,6 +1767,7 @@ mod tests {
                 },
                 NodeSpec {
                     func: "c".into(),
+                    program: Program::Elementwise(Elementwise::Exp),
                     bindings: vec![
                         Binding {
                             arg: c_in,
@@ -1804,6 +1850,38 @@ mod tests {
             seg_c.func.grid == (1, 1, 1),
             "fused segment runs at grid [1,1]"
         );
+    }
+
+    #[test]
+    fn plan_isolates_door_into_native_segment_by_carried_kind() {
+        // A door node is isolated by its CARRIED kind, never by its body: the
+        // middle node's body is a plain copy (the attention walk would leave it
+        // fused-eligible), and the `Program::ChainStage` payload alone puts it
+        // Native — the mint's one typed statement is the discriminator.
+        let (fa, a_in, a_out) = copy_node("a", 16, true);
+        let (fb, b_in, b_out) = copy_node("b", 16, true);
+        let (fc, c_in, c_out) = copy_node("c", 16, true);
+        let m = module(vec![fa, fb, fc]);
+        let mut spec = three_node_attn_spec(a_in, a_out, b_in, b_out, c_in, c_out);
+        // The door tests' own toy payload (emit's chain_stage_tests consts).
+        spec.nodes[1].program = Program::ChainStage {
+            pad_vocab: 4096,
+            table_rows: 8257,
+            k: 1,
+            hidden: 128,
+        };
+        let segs = plan_segments(Arena::global(), &m, &spec).unwrap();
+        assert_eq!(
+            segs.len(),
+            3,
+            "the door breaks the run: [fused a], [native door], [fused c]"
+        );
+        match &segs[1] {
+            Segment::Native(n) => assert_eq!(n.func, "b", "the door node stays native"),
+            _ => panic!("expected the door in a native segment, never fused"),
+        }
+        assert!(matches!(segs[0], Segment::Fused(_)), "node a fused");
+        assert!(matches!(segs[2], Segment::Fused(_)), "node c fused");
     }
 
     #[test]

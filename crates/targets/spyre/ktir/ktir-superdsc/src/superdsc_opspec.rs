@@ -1449,6 +1449,18 @@ pub enum OpFunc {
     Abs,
     Silu,
     Exp,
+    /// `log` — elementwise natural log (sfp unit). `arch_enums.cpp`'s `LOG_FWD`
+    /// bind (`{OpFuncs::LOG_FWD, "log"}`, the opFuncsToString row the sampler's
+    /// on-card Gumbel noise targets — front-b-noise, auditor order 2026-10-26).
+    /// The card's log is its own approximation (~90% correctly-rounded, worst
+    /// near 1 — card leg B1), so a bit-exact reference routes through the card,
+    /// never a host log.
+    Log,
+    /// `neg` — elementwise negation (sfp unit). `arch_enums.cpp`'s `NEG` bind
+    /// (`{OpFuncs::NEG, "neg"}`). The sampler's on-card Gumbel noise negates
+    /// twice around the inner log (`g = -log(-log(u))`, front-b-noise) — the
+    /// negation is the card's own opFunc, never a subtract-from-zero.
+    Neg,
     Reciprocal,
     Sqrt,
     Rsqrt,
@@ -1475,6 +1487,22 @@ pub enum OpFunc {
     /// the SAME rank-3 law as the fp16↔fp32 converts — a rank-2 collapse of a narrowing convert
     /// drops the `y` dim dxp's buffer walk needs (see [`crate::emit::convert_opspec`]).
     Fp32ToInt32,
+    /// `int32tofp32` — the REVERSE value cast, a SENUINT32 word → an IEEE fp32 value. Card-proven
+    /// by leg B1's `i2f_g1` cell (bit-matched against host `as f32` over full-range u32 patterns:
+    /// exact below 2^24, ties-up rounding above — an exactly-representable value rounds to itself).
+    /// The on-card Gumbel noise's wrap-fold extraction rides it (front-b-noise): the extracted
+    /// word is a multiple of 2^8 with ≤24 significant bits, exact even at magnitude ~2^31.
+    Int32ToFp32,
+    /// `muli32toi32` — elementwise WRAPPING i32 multiply on SENUINT32 data (`arch_enums.cpp:496`,
+    /// sfp unit). Card-proven by leg B1's `muli32toi32` cell (bit-matched against host wrapping
+    /// i32 mul): `SENUINT32` labeledDs at wordLength 4 with the computeOp's `dataFormat_` marker
+    /// `IEEE_FP32` — the integer ops ride the SFP unit's fp32-mode datapath, so the marker states
+    /// the MODE, never the data. The on-card noise hash's mixing multiplies (front-b-noise).
+    MulI32ToI32,
+    /// `addi32toi32` — elementwise WRAPPING i32 add, the `muli32toi32` cell's own twin
+    /// (`arch_enums.cpp:497`, same SENUINT32/IEEE_FP32-marker form, card leg B1). The hash's
+    /// seed and lane additions.
+    AddI32ToI32,
     Sum,
     Max,
     Mean,
@@ -1596,7 +1624,15 @@ pub enum OpFunc {
     /// broadcast.
     Where3,
     /// ⭐⭐⭐ `topkindex` / `topkvalue` — the vendor's fused top-k PAIR (`topk.ddl`), the k largest
-    /// with slots DESCENDING (slot 0 = the max), ties keeping the FIRST index among equals.
+    /// with slots DESCENDING (slot 0 = the max), ties keeping the LAST index among equals — the
+    /// ripple's compare is `state = GREATERTHAN(running, candidate)` with
+    /// `val = SELECT(state, running, candidate)` (`topk.ddl:180-181`), so a candidate EQUAL to the
+    /// running max makes `state` false and DISPLACES it: the later scan position wins. (An earlier
+    /// revision of this comment claimed the FIRST index — a doc-only claim the fixture tests never
+    /// executed, since a fixture JSON carries descriptors, not values; `moe.py`'s own ripple note
+    /// — "among equal values the later scan position first" — was the correct reading all along.
+    /// ⛔ CONSEQUENCE FOR THE SAMPLER: `topkindex` at k=1 is LAST-max argmax, which violates
+    /// #631's first-max law — the greedy decode door rung may NOT lower first-max to this pair.)
     /// `topkindex` emits the `[.., k]` indices, `topkvalue` the `[.., k]` values at those indices —
     /// the pair the graph compiler's fission produces (`nodeFissionFusion.cpp:6542+` fissures a
     /// "TopK" into "TopKValue"+"TopKIndex"), and the optimizer's own decomposition law
@@ -1670,6 +1706,8 @@ impl OpFunc {
             OpFunc::Abs => "abs",
             OpFunc::Silu => "silu",
             OpFunc::Exp => "exp",
+            OpFunc::Log => "log",
+            OpFunc::Neg => "neg",
             OpFunc::Reciprocal => "reciprocal",
             OpFunc::Sqrt => "sqrt",
             OpFunc::Rsqrt => "rsqrt",
@@ -1681,6 +1719,9 @@ impl OpFunc {
             OpFunc::Dl16ToFp32 => "dl16tofp32",
             OpFunc::Fp32ToDl16 => "fp32todl16",
             OpFunc::Fp32ToInt32 => "fp32toint32",
+            OpFunc::Int32ToFp32 => "int32tofp32",
+            OpFunc::MulI32ToI32 => "muli32toi32",
+            OpFunc::AddI32ToI32 => "addi32toi32",
             OpFunc::Sum => "sum",
             OpFunc::Max => "max",
             OpFunc::Mean => "mean",
@@ -2660,6 +2701,33 @@ impl EntryBase {
         EntryBase(sticks * <SenUint32 as DataFormat>::ELEMS_PER_STICK)
     }
 
+    /// ⭐ THE FIRST STICK OF ONE ROW OF A STICK-SCATTERED `[rows, …]` TENSOR — the scatter
+    /// law's own spelling of "row `r`'s index starts here", and the ONLY spelling a per-row
+    /// index base may take.
+    ///
+    /// ⛔ A `[rows, cols]` DEVICE TENSOR IS STICK-SCATTERED: element `(r, c)` lands at stick
+    /// `(c/EPS)·rows + r`, so row `r`'s first stick is flat stick `r` and its LATER sticks sit
+    /// at `b·rows + r`, interleaved with every other row's — a multi-stick row is NEVER
+    /// contiguous on the device. A base spelled as a WORD offset of a row-major layout
+    /// (`64·r` for a 64-word row) compiles at `rows == 1`, where the two spellings coincide,
+    /// and at every wider width reads ANOTHER ROW's lanes with a clean bake — the exact
+    /// W=1-hidden defect this constructor removes. It takes the ROW and the tensor's own row
+    /// count and nothing else, so a word count or a row-major stride cannot be expressed as
+    /// one: `row` must name a real row of a `rows`-row tensor, and the scatter law answers
+    /// the stick.
+    pub const fn of_scattered_row(row: u32, rows: u32) -> EntryBase {
+        assert!(
+            rows > 0,
+            "of_scattered_row: a 0-row tensor has no row to name"
+        );
+        assert!(
+            row < rows,
+            "of_scattered_row: the row is past the tensor's own row count — the scatter law \
+             names only real rows"
+        );
+        EntryBase::of_sticks(row)
+    }
+
     /// A base stated directly in ENTRIES — the program's own anchor for a gather whose run starts
     /// past its index buffer's first word (an unrolled sweep's trip `b` states `b · BLOCK_N`).
     ///
@@ -3597,6 +3665,34 @@ mod tests {
         // And the starts that ARE whole sticks build.
         assert!(StickRun::covering(0, 8).is_ok());
         assert!(StickRun::covering(32, 8).is_ok());
+    }
+
+    /// ⭐ A ROW-MAJOR PICK BASE CANNOT BE BUILT — `of_scattered_row` takes the ROW and the
+    /// tensor's own row count, so the `2·r` word-offset spelling that read row 0's lanes as
+    /// row 1's pick at every width past one (the W=1-hidden b2 defect) has no expression:
+    /// only a real row of a real row count goes in, and the scatter law answers the stick.
+    #[test]
+    fn a_row_major_pick_base_cannot_be_built() {
+        // Row r's first stick IS flat stick r at every width — the scatter law.
+        for rows in [1u32, 2, 4, 8] {
+            for r in 0..rows {
+                assert_eq!(
+                    EntryBase::of_scattered_row(r, rows),
+                    EntryBase::of_sticks(r),
+                    "row {r} of a {rows}-row tensor starts at its own flat stick"
+                );
+            }
+        }
+        // A row past the tensor's own row count is refused, never wrapped onto
+        // another row's sticks — the `2·r` shape dies here at every width > 1.
+        let err = std::panic::catch_unwind(|| EntryBase::of_scattered_row(2, 2))
+            .expect_err("row 2 of a 2-row tensor is not a row");
+        let err = err.downcast_ref::<&str>().copied().unwrap_or_default();
+        assert!(
+            err.contains("scatter law names only real rows"),
+            "the refusal must name the scatter law. Got: {err}"
+        );
+        assert!(std::panic::catch_unwind(|| EntryBase::of_scattered_row(1, 0)).is_err());
     }
 
     /// ⭐ THE RUN IS THE STICKS THE ENTRIES OCCUPY, NOT THE ENTRIES — the span half of `covering`

@@ -1,0 +1,1074 @@
+// RUN: clang -x c -E -P -o %t.json %s && SENARCH=rcudd1a ddc_standalone -s %t.json -d 1
+
+{
+  "int32tofp32_test" : {
+    "sdscFoldProps_" : [
+      {"factor_" : 1, "label_" : "time"}
+    ],
+    "sdscFolds_" :  {
+      "dim_prop_func" : [
+        { "Affine" : {"alpha_" : 1, "beta_" : 0} }
+      ],
+      "dim_prop_attr" : [
+                      { "factor_" : 1, "label_" : "time" }
+                    ],
+      "data_" : {
+        "[0]" :"0"
+      }
+    },
+    "coreFoldProp_" : {"factor_" : 32, "label_" : "core"},
+    "coreletFoldProp_" : {"factor_" : 2, "label_" : "corelet"},
+    "folded_sdsc_name_" : "",
+    "fold_coord_" : [  ],
+    "numCoresUsed_" : 8,
+    "unpadN_" : {"name_" : "n", "in_" : -1, "out_" : 32, "mb_" : 1, "i_" : 56, "j_" : 56, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : 3136, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+    "N_" : {"name_" : "n", "in_" : -1, "out_" : 32, "mb_" : 1, "i_" : 56, "j_" : 56, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : 3136, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+    "coreIdToDsc_" : { 
+      "0" : 0, "4" : 0, "8" : 0, "12" : 0, "16" : 0, "20" : 0, "24" : 0, "28" : 0
+    }, 
+    "numWkSlicesPerDim_" : { "out" : 1, "mb" : 1, "i" : 8, "j" : 1 },
+    "coreIdToWkSlice_" : { 
+      "0" : { "out" : 0, "mb" : 0, "i" : 0, "j" : 0 }, 
+      "4" : { "out" : 0, "mb" : 0, "i" : 1, "j" : 0 }, 
+      "8" : { "out" : 0, "mb" : 0, "i" : 2, "j" : 0 }, 
+      "12" : { "out" : 0, "mb" : 0, "i" : 3, "j" : 0 }, 
+      "16" : { "out" : 0, "mb" : 0, "i" : 4, "j" : 0 }, 
+      "20" : { "out" : 0, "mb" : 0, "i" : 5, "j" : 0 }, 
+      "24" : { "out" : 0, "mb" : 0, "i" : 6, "j" : 0 }, 
+      "28" : { "out" : 0, "mb" : 0, "i" : 7, "j" : 0 }
+    }, 
+    "opFuncsUsed_" : [  ], 
+    "ldsShareInfo_" : [
+    ],
+    "prodConsList" : {
+    },
+    "coreIdToDscSchedule" : {
+      "0" : [[-1 ,0 ,0 ,0] ],
+      "4" : [[-1 ,0 ,0 ,0] ],
+      "8" : [[-1 ,0 ,0 ,0] ],
+      "12" : [[-1 ,0 ,0 ,0] ],
+      "16" : [[-1 ,0 ,0 ,0] ],
+      "20" : [[-1 ,0 ,0 ,0] ],
+      "24" : [[-1 ,0 ,0 ,0] ],
+      "28" : [[-1 ,0 ,0 ,0] ]
+    },
+    "target_" : "senulator",
+    "dscs_" : [ 
+      {
+        "int32tofp32_test" : {
+          "numCoresUsed_" : 8,
+          "numCoreletsUsed_" : 1,
+          "coreIdsUsed_" : [ 0, 4, 8, 12, 16, 20, 24, 28 ],
+          "unpadN_" : {"name_" : "unpadn", "in_" : -1, "out_" : -1, "mb_" : -1, "i_" : -1, "j_" : -1, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : -1, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+          "N_" : {"name_" : "n", "in_" : -1, "out_" : 32, "mb_" : 1, "i_" : 56, "j_" : 56, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : 3136, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+          "dscN_" : {"name_" : "dscn", "in_" : -1, "out_" : -1, "mb_" : -1, "i_" : -1, "j_" : -1, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : -1, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+          "ChipD_" : {"name_" : "chipd", "in_" : -1, "out_" : -1, "mb_" : -1, "i_" : -1, "j_" : -1, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : -1, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+          "ChipletD_" : {"name_" : "chipletd", "in_" : -1, "out_" : -1, "mb_" : -1, "i_" : -1, "j_" : -1, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : -1, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+          "CoreD_" : {"name_" : "d", "in_" : -1, "out_" : -1, "mb_" : -1, "i_" : -1, "j_" : -1, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : -1, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+          "CoreletD_" : {"name_" : "coreletd", "in_" : -1, "out_" : -1, "mb_" : -1, "i_" : -1, "j_" : -1, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : -1, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+          "B_" : {"name_" : "b", "in_" : -1, "out_" : -1, "mb_" : -1, "i_" : -1, "j_" : -1, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : -1, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+          "T_" : {"name_" : "t", "in_" : -1, "out_" : -1, "mb_" : -1, "i_" : -1, "j_" : -1, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : -1, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+          "Tel_" : {"name_" : "tel", "in_" : -1, "out_" : -1, "mb_" : -1, "i_" : -1, "j_" : -1, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : -1, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+          "P_" : {"name_" : "p", "in_" : -1, "out_" : -1, "mb_" : -1, "i_" : -1, "j_" : -1, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : -1, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+          "Pel_" : {"name_" : "pel", "in_" : -1, "out_" : -1, "mb_" : -1, "i_" : -1, "j_" : -1, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "r_" : -1, "c_" : -1, "ij_" : -1, "rc_" : -1, "kij_" : -1, "sij_" : -1, "zij_" : -1, "si_" : -1, "sj_" : -1, "zi_" : -1, "zj_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+          "loopOrder_" : [],
+          "loopProperties_" : {
+          },
+          "auxLoopOrder_" : {
+          },
+          "coordinateMasking_" : {  },
+          "maskingConstId_" : -1,
+          "numCoreletsUsed_DSC2_" : 1,
+          "dataStageParam_" : {
+            "0" : {
+              "ss_" : {"name_" : "core", "in_" : -1, "out_" : 32, "mb_" : 1, "i_" : 7, "j_" : 56, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+              "el_" : {"name_" : "core", "in_" : -1, "out_" : 32, "mb_" : 1, "i_" : 7, "j_" : 56, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}}
+            },
+            "1" : {
+              "ss_" : {"name_" : "chunk", "in_" : -1, "out_" : 32, "mb_" : 1, "i_" : 7, "j_" : 56, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}},
+              "el_" : {"name_" : "chunk", "in_" : -1, "out_" : 32, "mb_" : 1, "i_" : 7, "j_" : 56, "ki_" : -1, "kj_" : -1, "x_" : -1, "x1_" : -1, "y_" : -1, "coreletSplit_" : {}, "rowSplit_" : {}, "peSfpSplit_" : {}, "paddingSizes_" : {}}
+            }
+          },
+          "constantInfo_" : {
+          },
+          "gtrIdsUsed_" : [],
+          "scheduleTreeHeadDenId_" : 0,
+          "scheduleTree_" : [
+            {
+              "nodeType_" : "allocate",
+              "name_" : "allocate_model/BatchNormalization_5_out_hbm",
+              "prev_" : "",
+              "relevantComps_" : {
+              },
+              "ldsIdx_" : 0,
+              "constIdx_" : -1,
+              "tempStorageForCompute_" : "",
+              "component_" : "hbm",
+              "padding_" : {},
+              "layoutDimOrder_" : ["j", "i", "mb", "out"],
+              "maxDimSizes_" : [-1, -1, -1, -1],
+              "numBuffers_" : 1,
+              "startAddressCoreCorelet_" :  {
+                "dim_prop_func" : [
+                  { "Map" : {} },
+                  { "Const" : {} },
+                  { "Const" : {} }
+                ],
+                "dim_prop_attr" : [
+                      { "factor_" : 32, "label_" : "core" },
+                      { "factor_" : 2, "label_" : "corelet" },
+                      { "factor_" : 1, "label_" : "time" }
+                    ],
+                "data_" : {
+                  "[0, 0, 0]" :"320715520",
+                  "[1, 0, 0]" :"32",
+                  "[2, 0, 0]" :"860943792",
+                  "[3, 0, 0]" :"32",
+                  "[4, 0, 0]" :"320765696",
+                  "[5, 0, 0]" :"0",
+                  "[6, 0, 0]" :"0",
+                  "[7, 0, 0]" :"32",
+                  "[8, 0, 0]" :"320815872",
+                  "[9, 0, 0]" :"0",
+                  "[10, 0, 0]" :"0",
+                  "[11, 0, 0]" :"0",
+                  "[12, 0, 0]" :"320866048",
+                  "[13, 0, 0]" :"0",
+                  "[14, 0, 0]" :"0",
+                  "[15, 0, 0]" :"0",
+                  "[16, 0, 0]" :"320916224",
+                  "[17, 0, 0]" :"0",
+                  "[18, 0, 0]" :"0",
+                  "[19, 0, 0]" :"0",
+                  "[20, 0, 0]" :"320966400",
+                  "[21, 0, 0]" :"0",
+                  "[22, 0, 0]" :"0",
+                  "[23, 0, 0]" :"0",
+                  "[24, 0, 0]" :"321016576",
+                  "[25, 0, 0]" :"0",
+                  "[26, 0, 0]" :"0",
+                  "[27, 0, 0]" :"0",
+                  "[28, 0, 0]" :"321066752",
+                  "[29, 0, 0]" :"0",
+                  "[30, 0, 0]" :"0",
+                  "[31, 0, 0]" :"0"
+                }
+              },
+              "bufferOffsetCoreCorelet_" : {},
+              "backGapCore_" : {},
+              "indirectAllocType_" : "no_indirection",
+              "allocUsers_" : { "transfer_lds0_src:hbm_dst:lx" : 1 }
+            },
+            {
+              "nodeType_" : "allocate",
+              "name_" : "allocate_model/cast_out_hbm",
+              "prev_" : "",
+              "relevantComps_" : {
+              },
+              "ldsIdx_" : 1,
+              "constIdx_" : -1,
+              "tempStorageForCompute_" : "",
+              "component_" : "hbm",
+              "padding_" : {},
+              "layoutDimOrder_" : ["j", "i", "mb", "out"],
+              "maxDimSizes_" : [-1, -1, -1, -1],
+              "numBuffers_" : 1,
+              "startAddressCoreCorelet_" :  {
+                "dim_prop_func" : [
+                  { "Map" : {} },
+                  { "Const" : {} },
+                  { "Const" : {} }
+                ],
+                "dim_prop_attr" : [
+                      { "factor_" : 32, "label_" : "core" },
+                      { "factor_" : 2, "label_" : "corelet" },
+                      { "factor_" : 1, "label_" : "time" }
+                    ],
+                "data_" : {
+                  "[0, 0, 0]" :"320314112",
+                  "[1, 0, 0]" :"32",
+                  "[2, 0, 0]" :"1",
+                  "[3, 0, 0]" :"0",
+                  "[4, 0, 0]" :"320364288",
+                  "[5, 0, 0]" :"0",
+                  "[6, 0, 0]" :"0",
+                  "[7, 0, 0]" :"0",
+                  "[8, 0, 0]" :"320414464",
+                  "[9, 0, 0]" :"0",
+                  "[10, 0, 0]" :"0",
+                  "[11, 0, 0]" :"0",
+                  "[12, 0, 0]" :"320464640",
+                  "[13, 0, 0]" :"0",
+                  "[14, 0, 0]" :"0",
+                  "[15, 0, 0]" :"0",
+                  "[16, 0, 0]" :"320514816",
+                  "[17, 0, 0]" :"0",
+                  "[18, 0, 0]" :"0",
+                  "[19, 0, 0]" :"0",
+                  "[20, 0, 0]" :"320564992",
+                  "[21, 0, 0]" :"0",
+                  "[22, 0, 0]" :"0",
+                  "[23, 0, 0]" :"0",
+                  "[24, 0, 0]" :"320615168",
+                  "[25, 0, 0]" :"0",
+                  "[26, 0, 0]" :"0",
+                  "[27, 0, 0]" :"0",
+                  "[28, 0, 0]" :"320665344",
+                  "[29, 0, 0]" :"0",
+                  "[30, 0, 0]" :"0",
+                  "[31, 0, 0]" :"0"
+                }
+              },
+              "bufferOffsetCoreCorelet_" : {},
+              "backGapCore_" : {},
+              "indirectAllocType_" : "no_indirection",
+              "allocUsers_" : { "transfer_lds1_src:lx_dst:hbm" : 1 }
+            },
+            {
+              "nodeType_" : "loop",
+              "name_" : "loop_ds0_ds1_out",
+              "prev_" : "",
+              "relevantComps_" : {
+              },
+              "next_" : ["loop_ds0_ds1_mb"],
+              "numId_" : 0,
+              "denId_" : 1,
+              "parametricLoop_" : 0,
+              "parametricIterCount_" : -1,
+              "parametricLdsIdx_" : -1,
+              "dims_" : [{"dim_" : "out", "kind_" : "unpadded"}]
+            },
+            {
+              "nodeType_" : "loop",
+              "name_" : "loop_ds0_ds1_mb",
+              "prev_" : "loop_ds0_ds1_out",
+              "relevantComps_" : {
+              },
+              "next_" : ["loop_ds0_ds1_i"],
+              "numId_" : 0,
+              "denId_" : 1,
+              "parametricLoop_" : 0,
+              "parametricIterCount_" : -1,
+              "parametricLdsIdx_" : -1,
+              "dims_" : [{"dim_" : "mb", "kind_" : "unpadded"}]
+            },
+            {
+              "nodeType_" : "loop",
+              "name_" : "loop_ds0_ds1_i",
+              "prev_" : "loop_ds0_ds1_mb",
+              "relevantComps_" : {
+              },
+              "next_" : ["loop_ds0_ds1_j"],
+              "numId_" : 0,
+              "denId_" : 1,
+              "parametricLoop_" : 0,
+              "parametricIterCount_" : -1,
+              "parametricLdsIdx_" : -1,
+              "dims_" : [{"dim_" : "i", "kind_" : "unpadded"}]
+            },
+            {
+              "nodeType_" : "loop",
+              "name_" : "loop_ds0_ds1_j",
+              "prev_" : "loop_ds0_ds1_i",
+              "relevantComps_" : {
+              },
+              "next_" : ["allocate_lds0_lx", "transfer_lds0_src:hbm_dst:lx", "allocate_lds1_lx", "sync_send_l3lu_to_lxlu", "sync_receive_lxlu_from_l3lu", "sync_send_lxlu_to_l3lu", "sync_receive_l3lu_from_lxlu", "lx_below_schedule", "sync_send_lxsu_to_l3su", "sync_receive_l3su_from_lxsu", "sync_send_l3su_to_lxsu", "sync_receive_lxsu_from_l3su", "transfer_lds1_src:lx_dst:hbm"],
+              "numId_" : 0,
+              "denId_" : 1,
+              "parametricLoop_" : 0,
+              "parametricIterCount_" : -1,
+              "parametricLdsIdx_" : -1,
+              "dims_" : [{"dim_" : "j", "kind_" : "unpadded"}]
+            },
+            {
+              "nodeType_" : "allocate",
+              "name_" : "allocate_lds0_lx",
+              "prev_" : "loop_ds0_ds1_j",
+              "relevantComps_" : {
+              },
+              "ldsIdx_" : 0,
+              "constIdx_" : -1,
+              "tempStorageForCompute_" : "",
+              "component_" : "lx",
+              "padding_" : {},
+              "layoutDimOrder_" : ["j", "i", "mb", "out"],
+              "maxDimSizes_" : [-1, -1, -1, -1],
+              "numBuffers_" : 2,
+              "startAddressCoreCorelet_" :  {
+                "dim_prop_func" : [
+                  { "Map" : {} },
+                  { "Map" : {} },
+                  { "Const" : {} }
+                ],
+                "dim_prop_attr" : [
+                      { "factor_" : 32, "label_" : "core" },
+                      { "factor_" : 2, "label_" : "corelet" },
+                      { "factor_" : 1, "label_" : "time" }
+                    ],
+                "data_" : {
+                  "[0, 0, 0]" :"0",
+                  "[0, 1, 0]" :"32",
+                  "[1, 0, 0]" :"32",
+                  "[1, 1, 0]" :"32",
+                  "[2, 0, 0]" :"32",
+                  "[2, 1, 0]" :"32",
+                  "[3, 0, 0]" :"32",
+                  "[3, 1, 0]" :"32",
+                  "[4, 0, 0]" :"0",
+                  "[4, 1, 0]" :"32",
+                  "[5, 0, 0]" :"32",
+                  "[5, 1, 0]" :"32",
+                  "[6, 0, 0]" :"32",
+                  "[6, 1, 0]" :"32",
+                  "[7, 0, 0]" :"32",
+                  "[7, 1, 0]" :"32",
+                  "[8, 0, 0]" :"0",
+                  "[8, 1, 0]" :"32",
+                  "[9, 0, 0]" :"32",
+                  "[9, 1, 0]" :"32",
+                  "[10, 0, 0]" :"32",
+                  "[10, 1, 0]" :"32",
+                  "[11, 0, 0]" :"32",
+                  "[11, 1, 0]" :"32",
+                  "[12, 0, 0]" :"0",
+                  "[12, 1, 0]" :"32",
+                  "[13, 0, 0]" :"32",
+                  "[13, 1, 0]" :"32",
+                  "[14, 0, 0]" :"32",
+                  "[14, 1, 0]" :"32",
+                  "[15, 0, 0]" :"32",
+                  "[15, 1, 0]" :"32",
+                  "[16, 0, 0]" :"0",
+                  "[16, 1, 0]" :"32",
+                  "[17, 0, 0]" :"32",
+                  "[17, 1, 0]" :"32",
+                  "[18, 0, 0]" :"32",
+                  "[18, 1, 0]" :"32",
+                  "[19, 0, 0]" :"32",
+                  "[19, 1, 0]" :"32",
+                  "[20, 0, 0]" :"0",
+                  "[20, 1, 0]" :"32",
+                  "[21, 0, 0]" :"32",
+                  "[21, 1, 0]" :"32",
+                  "[22, 0, 0]" :"32",
+                  "[22, 1, 0]" :"32",
+                  "[23, 0, 0]" :"32",
+                  "[23, 1, 0]" :"32",
+                  "[24, 0, 0]" :"0",
+                  "[24, 1, 0]" :"32",
+                  "[25, 0, 0]" :"32",
+                  "[25, 1, 0]" :"32",
+                  "[26, 0, 0]" :"32",
+                  "[26, 1, 0]" :"32",
+                  "[27, 0, 0]" :"32",
+                  "[27, 1, 0]" :"32",
+                  "[28, 0, 0]" :"0",
+                  "[28, 1, 0]" :"32",
+                  "[29, 0, 0]" :"32",
+                  "[29, 1, 0]" :"32",
+                  "[30, 0, 0]" :"32",
+                  "[30, 1, 0]" :"32",
+                  "[31, 0, 0]" :"32",
+                  "[31, 1, 0]" :"32"
+                }
+              },
+              "bufferOffsetCoreCorelet_" : {"0":{"0":"50176"}, "4":{"0":"50176"}, "8":{"0":"50176"}, "12":{"0":"50176"}, "16":{"0":"50176"}, "20":{"0":"50176"}, "24":{"0":"50176"}, "28":{"0":"50176"}},
+              "backGapCore_" : {},
+              "indirectAllocType_" : "no_indirection",
+              "allocUsers_" : { "transfer_lds0_src:hbm_dst:lx" : 1 }
+            },
+            {
+              "nodeType_" : "transfer",
+              "name_" : "transfer_lds0_src:hbm_dst:lx",
+              "prev_" : "loop_ds0_ds1_j",
+              "relevantComps_" : {
+              },
+              "src_" : {"unit_" : "l3lu", "storage_" : "hbm"},
+              "dstVias_" : [
+                {
+                  "loc_" : {"unit_" : "l3lu", "storage_" : "lx"},
+                  "via_" : []
+                }
+              ],
+              "lastFusableParentLoopSrc_" : "",
+              "lastFusableParentLoopDst_" : [""],
+              "srcLdsAndLoopOffsets_" : {
+                "myLdsIdx_" : 0,
+                "startAddr_" :  {
+                  "dim_prop_func" : [
+                    { "Map" : {} },
+                    { "Const" : {} },
+                    { "Const" : {} }
+                  ],
+                  "dim_prop_attr" : [
+                      { "factor_" : 32, "label_" : "core" },
+                      { "factor_" : 2, "label_" : "corelet" },
+                      { "factor_" : 1, "label_" : "time" }
+                    ],
+                  "data_" : {
+                    "[0, 0, 0]" :"2505590",
+                    "[1, 0, 0]" :"0",
+                    "[2, 0, 0]" :"6726123",
+                    "[3, 0, 0]" :"0",
+                    "[4, 0, 0]" :"2505982",
+                    "[5, 0, 0]" :"0",
+                    "[6, 0, 0]" :"0",
+                    "[7, 0, 0]" :"0",
+                    "[8, 0, 0]" :"2506374",
+                    "[9, 0, 0]" :"0",
+                    "[10, 0, 0]" :"0",
+                    "[11, 0, 0]" :"0",
+                    "[12, 0, 0]" :"2506766",
+                    "[13, 0, 0]" :"0",
+                    "[14, 0, 0]" :"0",
+                    "[15, 0, 0]" :"0",
+                    "[16, 0, 0]" :"2507158",
+                    "[17, 0, 0]" :"0",
+                    "[18, 0, 0]" :"0",
+                    "[19, 0, 0]" :"0",
+                    "[20, 0, 0]" :"2507550",
+                    "[21, 0, 0]" :"0",
+                    "[22, 0, 0]" :"0",
+                    "[23, 0, 0]" :"0",
+                    "[24, 0, 0]" :"2507942",
+                    "[25, 0, 0]" :"0",
+                    "[26, 0, 0]" :"0",
+                    "[27, 0, 0]" :"0",
+                    "[28, 0, 0]" :"2508334",
+                    "[29, 0, 0]" :"0",
+                    "[30, 0, 0]" :"0",
+                    "[31, 0, 0]" :"0"
+                  }
+                },
+                "latchDataId_" : -1,
+                "constantId_" : -1,
+                "constEleOffsets_" : {
+                },
+                "loopEleOffsets_" : {
+                  "0" : {
+                    "loop_ds0_ds1_i" : {"i" : 7},
+                    "loop_ds0_ds1_j" : {"j" : 56},
+                    "loop_ds0_ds1_mb" : {"mb" : 1},
+                    "loop_ds0_ds1_out" : {"out" : 32}
+                  }
+                },
+                "bufferAddrOffset_" : {},
+                "bufferSwitchPosition_" : "",
+                "dataConnect_" : ""
+              },
+              "dstLdsAndLoopOffsets_" : [
+                {
+                  "myLdsIdx_" : 0,
+                  "startAddr_" :  {
+                    "dim_prop_func" : [
+                      { "Map" : {} },
+                      { "Map" : {} },
+                      { "Const" : {} }
+                    ],
+                    "dim_prop_attr" : [
+                      { "factor_" : 32, "label_" : "core" },
+                      { "factor_" : 2, "label_" : "corelet" },
+                      { "factor_" : 1, "label_" : "time" }
+                    ],
+                    "data_" : {
+                      "[0, 0, 0]" :"0",
+                      "[0, 1, 0]" :"0",
+                      "[1, 0, 0]" :"0",
+                      "[1, 1, 0]" :"0",
+                      "[2, 0, 0]" :"0",
+                      "[2, 1, 0]" :"0",
+                      "[3, 0, 0]" :"0",
+                      "[3, 1, 0]" :"0",
+                      "[4, 0, 0]" :"0",
+                      "[4, 1, 0]" :"0",
+                      "[5, 0, 0]" :"0",
+                      "[5, 1, 0]" :"0",
+                      "[6, 0, 0]" :"0",
+                      "[6, 1, 0]" :"0",
+                      "[7, 0, 0]" :"0",
+                      "[7, 1, 0]" :"0",
+                      "[8, 0, 0]" :"0",
+                      "[8, 1, 0]" :"0",
+                      "[9, 0, 0]" :"0",
+                      "[9, 1, 0]" :"0",
+                      "[10, 0, 0]" :"0",
+                      "[10, 1, 0]" :"0",
+                      "[11, 0, 0]" :"0",
+                      "[11, 1, 0]" :"0",
+                      "[12, 0, 0]" :"0",
+                      "[12, 1, 0]" :"0",
+                      "[13, 0, 0]" :"0",
+                      "[13, 1, 0]" :"0",
+                      "[14, 0, 0]" :"0",
+                      "[14, 1, 0]" :"0",
+                      "[15, 0, 0]" :"0",
+                      "[15, 1, 0]" :"0",
+                      "[16, 0, 0]" :"0",
+                      "[16, 1, 0]" :"0",
+                      "[17, 0, 0]" :"0",
+                      "[17, 1, 0]" :"0",
+                      "[18, 0, 0]" :"0",
+                      "[18, 1, 0]" :"0",
+                      "[19, 0, 0]" :"0",
+                      "[19, 1, 0]" :"0",
+                      "[20, 0, 0]" :"0",
+                      "[20, 1, 0]" :"0",
+                      "[21, 0, 0]" :"0",
+                      "[21, 1, 0]" :"0",
+                      "[22, 0, 0]" :"0",
+                      "[22, 1, 0]" :"0",
+                      "[23, 0, 0]" :"0",
+                      "[23, 1, 0]" :"0",
+                      "[24, 0, 0]" :"0",
+                      "[24, 1, 0]" :"0",
+                      "[25, 0, 0]" :"0",
+                      "[25, 1, 0]" :"0",
+                      "[26, 0, 0]" :"0",
+                      "[26, 1, 0]" :"0",
+                      "[27, 0, 0]" :"0",
+                      "[27, 1, 0]" :"0",
+                      "[28, 0, 0]" :"0",
+                      "[28, 1, 0]" :"0",
+                      "[29, 0, 0]" :"0",
+                      "[29, 1, 0]" :"0",
+                      "[30, 0, 0]" :"0",
+                      "[30, 1, 0]" :"0",
+                      "[31, 0, 0]" :"0",
+                      "[31, 1, 0]" :"0"
+                    }
+                  },
+                  "latchDataId_" : -1,
+                  "constantId_" : -1,
+                  "constEleOffsets_" : {
+                  },
+                  "loopEleOffsets_" : {
+                  },
+                  "bufferAddrOffset_" : {"0" : {"0" : "392"}, "4" : {"0" : "392"}, "8" : {"0" : "392"}, "12" : {"0" : "392"}, "16" : {"0" : "392"}, "20" : {"0" : "392"}, "24" : {"0" : "392"}, "28" : {"0" : "392"}},
+                  "bufferSwitchPosition_" : "loop_ds0_ds1_j",
+                  "dataConnect_" : ""
+                }
+              ],
+              "replicationFactor_" : 1,
+              "unitTimeTransfer_" : [
+              ],
+              "rotateNumElements_" : 0,
+              "coreIdToGTRInfo_" : {
+                "0" : {
+                  "groupId_" : -1,
+                  "numSharers_" : 1
+                },
+                "4" : {
+                  "groupId_" : -1,
+                  "numSharers_" : 1
+                },
+                "8" : {
+                  "groupId_" : -1,
+                  "numSharers_" : 1
+                },
+                "12" : {
+                  "groupId_" : -1,
+                  "numSharers_" : 1
+                },
+                "16" : {
+                  "groupId_" : -1,
+                  "numSharers_" : 1
+                },
+                "20" : {
+                  "groupId_" : -1,
+                  "numSharers_" : 1
+                },
+                "24" : {
+                  "groupId_" : -1,
+                  "numSharers_" : 1
+                },
+                "28" : {
+                  "groupId_" : -1,
+                  "numSharers_" : 1
+                }
+              },
+              "transferSize_" : {},
+              "coreletViews_" : {
+              }
+            },
+            {
+              "nodeType_" : "allocate",
+              "name_" : "allocate_lds1_lx",
+              "prev_" : "loop_ds0_ds1_j",
+              "relevantComps_" : {
+              },
+              "ldsIdx_" : 1,
+              "constIdx_" : -1,
+              "tempStorageForCompute_" : "",
+              "component_" : "lx",
+              "padding_" : {},
+              "layoutDimOrder_" : ["j", "i", "mb", "out"],
+              "maxDimSizes_" : [-1, -1, -1, -1],
+              "numBuffers_" : 2,
+              "startAddressCoreCorelet_" :  {
+                "dim_prop_func" : [
+                  { "Map" : {} },
+                  { "Map" : {} },
+                  { "Const" : {} }
+                ],
+                "dim_prop_attr" : [
+                      { "factor_" : 32, "label_" : "core" },
+                      { "factor_" : 2, "label_" : "corelet" },
+                      { "factor_" : 1, "label_" : "time" }
+                    ],
+                "data_" : {
+                  "[0, 0, 0]" :"100352",
+                  "[0, 1, 0]" :"1023228432",
+                  "[1, 0, 0]" :"879252512",
+                  "[1, 1, 0]" :"878003072",
+                  "[2, 0, 0]" :"1023228112",
+                  "[2, 1, 0]" :"1023145600",
+                  "[3, 0, 0]" :"877914208",
+                  "[3, 1, 0]" :"879276096",
+                  "[4, 0, 0]" :"100352",
+                  "[4, 1, 0]" :"1023221856",
+                  "[5, 0, 0]" :"1023214016",
+                  "[5, 1, 0]" :"1023211312",
+                  "[6, 0, 0]" :"1023228112",
+                  "[6, 1, 0]" :"1023174928",
+                  "[7, 0, 0]" :"1023175136",
+                  "[7, 1, 0]" :"1023282160",
+                  "[8, 0, 0]" :"100352",
+                  "[8, 1, 0]" :"32",
+                  "[9, 0, 0]" :"32",
+                  "[9, 1, 0]" :"32",
+                  "[10, 0, 0]" :"878106624",
+                  "[10, 1, 0]" :"878109184",
+                  "[11, 0, 0]" :"878137856",
+                  "[11, 1, 0]" :"878129664",
+                  "[12, 0, 0]" :"100352",
+                  "[12, 1, 0]" :"878260224",
+                  "[13, 0, 0]" :"0",
+                  "[13, 1, 0]" :"1023155840",
+                  "[14, 0, 0]" :"878234112",
+                  "[14, 1, 0]" :"878106624",
+                  "[15, 0, 0]" :"0",
+                  "[15, 1, 0]" :"878137920",
+                  "[16, 0, 0]" :"100352",
+                  "[16, 1, 0]" :"878129840",
+                  "[17, 0, 0]" :"877986336",
+                  "[17, 1, 0]" :"878109216",
+                  "[18, 0, 0]" :"1023161536",
+                  "[18, 1, 0]" :"1023228112",
+                  "[19, 0, 0]" :"1023145600",
+                  "[19, 1, 0]" :"1023175136",
+                  "[20, 0, 0]" :"100352",
+                  "[20, 1, 0]" :"1023160192",
+                  "[21, 0, 0]" :"1023282160",
+                  "[21, 1, 0]" :"1023214016",
+                  "[22, 0, 0]" :"32",
+                  "[22, 1, 0]" :"32",
+                  "[23, 0, 0]" :"32",
+                  "[23, 1, 0]" :"32",
+                  "[24, 0, 0]" :"100352",
+                  "[24, 1, 0]" :"32",
+                  "[25, 0, 0]" :"32",
+                  "[25, 1, 0]" :"32",
+                  "[26, 0, 0]" :"32",
+                  "[26, 1, 0]" :"32",
+                  "[27, 0, 0]" :"32",
+                  "[27, 1, 0]" :"32",
+                  "[28, 0, 0]" :"100352",
+                  "[28, 1, 0]" :"32",
+                  "[29, 0, 0]" :"32",
+                  "[29, 1, 0]" :"32",
+                  "[30, 0, 0]" :"32",
+                  "[30, 1, 0]" :"32",
+                  "[31, 0, 0]" :"32",
+                  "[31, 1, 0]" :"32"
+                }
+              },
+              "bufferOffsetCoreCorelet_" : {"0":{"0":"50176"}, "4":{"0":"50176"}, "8":{"0":"50176"}, "12":{"0":"50176"}, "16":{"0":"50176"}, "20":{"0":"50176"}, "24":{"0":"50176"}, "28":{"0":"50176"}},
+              "backGapCore_" : {},
+              "indirectAllocType_" : "no_indirection",
+              "allocUsers_" : { "transfer_lds1_src:lx_dst:hbm" : 1 }
+            },
+            {
+              "nodeType_" : "sync",
+              "name_" : "sync_send_l3lu_to_lxlu",
+              "prev_" : "loop_ds0_ds1_j",
+              "relevantComps_" : {
+              },
+              "units_" : ["l3lu"],
+              "isReceive_" : 0,
+              "isSoft_" : 0,
+              "implicitSyncRefTransfer_" : "",
+              "otherEndOfTheSignals_" : ["sync_receive_lxlu_from_l3lu"]
+            },
+            {
+              "nodeType_" : "sync",
+              "name_" : "sync_receive_lxlu_from_l3lu",
+              "prev_" : "loop_ds0_ds1_j",
+              "relevantComps_" : {
+              },
+              "units_" : ["lxlu"],
+              "isReceive_" : 1,
+              "isSoft_" : 0,
+              "implicitSyncRefTransfer_" : "",
+              "otherEndOfTheSignals_" : ["sync_send_l3lu_to_lxlu"]
+            },
+            {
+              "nodeType_" : "sync",
+              "name_" : "sync_send_lxlu_to_l3lu",
+              "prev_" : "loop_ds0_ds1_j",
+              "relevantComps_" : {
+              },
+              "units_" : ["lxlu"],
+              "isReceive_" : 0,
+              "isSoft_" : 0,
+              "implicitSyncRefTransfer_" : "",
+              "otherEndOfTheSignals_" : ["sync_receive_l3lu_from_lxlu"]
+            },
+            {
+              "nodeType_" : "sync",
+              "name_" : "sync_receive_l3lu_from_lxlu",
+              "prev_" : "loop_ds0_ds1_j",
+              "relevantComps_" : {
+              },
+              "units_" : ["l3lu"],
+              "isReceive_" : 1,
+              "isSoft_" : 0,
+              "implicitSyncRefTransfer_" : "",
+              "otherEndOfTheSignals_" : ["sync_send_lxlu_to_l3lu"]
+            },
+            {
+              "nodeType_" : "block",
+              "name_" : "lx_below_schedule",
+              "prev_" : "loop_ds0_ds1_j",
+              "relevantComps_" : {
+              },
+              "next_" : []
+            },
+            {
+              "nodeType_" : "sync",
+              "name_" : "sync_send_lxsu_to_l3su",
+              "prev_" : "loop_ds0_ds1_j",
+              "relevantComps_" : {
+              },
+              "units_" : ["lxsu"],
+              "isReceive_" : 0,
+              "isSoft_" : 0,
+              "implicitSyncRefTransfer_" : "",
+              "otherEndOfTheSignals_" : ["sync_receive_l3su_from_lxsu"]
+            },
+            {
+              "nodeType_" : "sync",
+              "name_" : "sync_receive_l3su_from_lxsu",
+              "prev_" : "loop_ds0_ds1_j",
+              "relevantComps_" : {
+              },
+              "units_" : ["l3su"],
+              "isReceive_" : 1,
+              "isSoft_" : 0,
+              "implicitSyncRefTransfer_" : "",
+              "otherEndOfTheSignals_" : ["sync_send_lxsu_to_l3su"]
+            },
+            {
+              "nodeType_" : "sync",
+              "name_" : "sync_send_l3su_to_lxsu",
+              "prev_" : "loop_ds0_ds1_j",
+              "relevantComps_" : {
+              },
+              "units_" : ["l3su"],
+              "isReceive_" : 0,
+              "isSoft_" : 0,
+              "implicitSyncRefTransfer_" : "",
+              "otherEndOfTheSignals_" : ["sync_receive_lxsu_from_l3su"]
+            },
+            {
+              "nodeType_" : "sync",
+              "name_" : "sync_receive_lxsu_from_l3su",
+              "prev_" : "loop_ds0_ds1_j",
+              "relevantComps_" : {
+              },
+              "units_" : ["lxsu"],
+              "isReceive_" : 1,
+              "isSoft_" : 0,
+              "implicitSyncRefTransfer_" : "",
+              "otherEndOfTheSignals_" : ["sync_send_l3su_to_lxsu"]
+            },
+            {
+              "nodeType_" : "transfer",
+              "name_" : "transfer_lds1_src:lx_dst:hbm",
+              "prev_" : "loop_ds0_ds1_j",
+              "relevantComps_" : {
+              },
+              "src_" : {"unit_" : "l3su", "storage_" : "lx"},
+              "dstVias_" : [
+                {
+                  "loc_" : {"unit_" : "l3su", "storage_" : "hbm"},
+                  "via_" : []
+                }
+              ],
+              "lastFusableParentLoopSrc_" : "",
+              "lastFusableParentLoopDst_" : [""],
+              "srcLdsAndLoopOffsets_" : {
+                "myLdsIdx_" : 1,
+                "startAddr_" :  {
+                  "dim_prop_func" : [
+                    { "Map" : {} },
+                    { "Map" : {} },
+                    { "Const" : {} }
+                  ],
+                  "dim_prop_attr" : [
+                      { "factor_" : 32, "label_" : "core" },
+                      { "factor_" : 2, "label_" : "corelet" },
+                      { "factor_" : 1, "label_" : "time" }
+                    ],
+                  "data_" : {
+                    "[0, 0, 0]" :"784",
+                    "[0, 1, 0]" :"7993972",
+                    "[1, 0, 0]" :"6869160",
+                    "[1, 1, 0]" :"6859399",
+                    "[2, 0, 0]" :"7993969",
+                    "[2, 1, 0]" :"7993325",
+                    "[3, 0, 0]" :"6858704",
+                    "[3, 1, 0]" :"6869344",
+                    "[4, 0, 0]" :"784",
+                    "[4, 1, 0]" :"7993920",
+                    "[5, 0, 0]" :"7993859",
+                    "[5, 1, 0]" :"7993838",
+                    "[6, 0, 0]" :"7993969",
+                    "[6, 1, 0]" :"7993554",
+                    "[7, 0, 0]" :"7993555",
+                    "[7, 1, 0]" :"7994391",
+                    "[8, 0, 0]" :"784",
+                    "[8, 1, 0]" :"0",
+                    "[9, 0, 0]" :"0",
+                    "[9, 1, 0]" :"0",
+                    "[10, 0, 0]" :"6860208",
+                    "[10, 1, 0]" :"6860228",
+                    "[11, 0, 0]" :"6860452",
+                    "[11, 1, 0]" :"6860388",
+                    "[12, 0, 0]" :"784",
+                    "[12, 1, 0]" :"6861408",
+                    "[13, 0, 0]" :"0",
+                    "[13, 1, 0]" :"7993405",
+                    "[14, 0, 0]" :"6861204",
+                    "[14, 1, 0]" :"6860208",
+                    "[15, 0, 0]" :"0",
+                    "[15, 1, 0]" :"6860452",
+                    "[16, 0, 0]" :"784",
+                    "[16, 1, 0]" :"6860389",
+                    "[17, 0, 0]" :"6859268",
+                    "[17, 1, 0]" :"6860228",
+                    "[18, 0, 0]" :"7993449",
+                    "[18, 1, 0]" :"7993969",
+                    "[19, 0, 0]" :"7993325",
+                    "[19, 1, 0]" :"7993555",
+                    "[20, 0, 0]" :"784",
+                    "[20, 1, 0]" :"7993439",
+                    "[21, 0, 0]" :"7994391",
+                    "[21, 1, 0]" :"7993859",
+                    "[22, 0, 0]" :"0",
+                    "[22, 1, 0]" :"0",
+                    "[23, 0, 0]" :"0",
+                    "[23, 1, 0]" :"0",
+                    "[24, 0, 0]" :"784",
+                    "[24, 1, 0]" :"0",
+                    "[25, 0, 0]" :"0",
+                    "[25, 1, 0]" :"0",
+                    "[26, 0, 0]" :"0",
+                    "[26, 1, 0]" :"0",
+                    "[27, 0, 0]" :"0",
+                    "[27, 1, 0]" :"0",
+                    "[28, 0, 0]" :"784",
+                    "[28, 1, 0]" :"0",
+                    "[29, 0, 0]" :"0",
+                    "[29, 1, 0]" :"0",
+                    "[30, 0, 0]" :"0",
+                    "[30, 1, 0]" :"0",
+                    "[31, 0, 0]" :"0",
+                    "[31, 1, 0]" :"0"
+                  }
+                },
+                "latchDataId_" : -1,
+                "constantId_" : -1,
+                "constEleOffsets_" : {
+                },
+                "loopEleOffsets_" : {
+                },
+                "bufferAddrOffset_" : {"0" : {"0" : "392"}, "4" : {"0" : "392"}, "8" : {"0" : "392"}, "12" : {"0" : "392"}, "16" : {"0" : "392"}, "20" : {"0" : "392"}, "24" : {"0" : "392"}, "28" : {"0" : "392"}},
+                "bufferSwitchPosition_" : "loop_ds0_ds1_j",
+                "dataConnect_" : ""
+              },
+              "dstLdsAndLoopOffsets_" : [
+                {
+                  "myLdsIdx_" : 1,
+                  "startAddr_" :  {
+                    "dim_prop_func" : [
+                      { "Map" : {} },
+                      { "Const" : {} },
+                      { "Const" : {} }
+                    ],
+                    "dim_prop_attr" : [
+                      { "factor_" : 32, "label_" : "core" },
+                      { "factor_" : 2, "label_" : "corelet" },
+                      { "factor_" : 1, "label_" : "time" }
+                    ],
+                    "data_" : {
+                      "[0, 0, 0]" :"2502454",
+                      "[1, 0, 0]" :"0",
+                      "[2, 0, 0]" :"0",
+                      "[3, 0, 0]" :"0",
+                      "[4, 0, 0]" :"2502846",
+                      "[5, 0, 0]" :"0",
+                      "[6, 0, 0]" :"0",
+                      "[7, 0, 0]" :"0",
+                      "[8, 0, 0]" :"2503238",
+                      "[9, 0, 0]" :"0",
+                      "[10, 0, 0]" :"0",
+                      "[11, 0, 0]" :"0",
+                      "[12, 0, 0]" :"2503630",
+                      "[13, 0, 0]" :"0",
+                      "[14, 0, 0]" :"0",
+                      "[15, 0, 0]" :"0",
+                      "[16, 0, 0]" :"2504022",
+                      "[17, 0, 0]" :"0",
+                      "[18, 0, 0]" :"0",
+                      "[19, 0, 0]" :"0",
+                      "[20, 0, 0]" :"2504414",
+                      "[21, 0, 0]" :"0",
+                      "[22, 0, 0]" :"0",
+                      "[23, 0, 0]" :"0",
+                      "[24, 0, 0]" :"2504806",
+                      "[25, 0, 0]" :"0",
+                      "[26, 0, 0]" :"0",
+                      "[27, 0, 0]" :"0",
+                      "[28, 0, 0]" :"2505198",
+                      "[29, 0, 0]" :"0",
+                      "[30, 0, 0]" :"0",
+                      "[31, 0, 0]" :"0"
+                    }
+                  },
+                  "latchDataId_" : -1,
+                  "constantId_" : -1,
+                  "constEleOffsets_" : {
+                  },
+                  "loopEleOffsets_" : {
+                    "0" : {
+                      "loop_ds0_ds1_i" : {"i" : 7},
+                      "loop_ds0_ds1_j" : {"j" : 56},
+                      "loop_ds0_ds1_mb" : {"mb" : 1},
+                      "loop_ds0_ds1_out" : {"out" : 32}
+                    }
+                  },
+                  "bufferAddrOffset_" : {},
+                  "bufferSwitchPosition_" : "",
+                  "dataConnect_" : ""
+                }
+              ],
+              "replicationFactor_" : 1,
+              "unitTimeTransfer_" : [
+              ],
+              "rotateNumElements_" : 0,
+              "coreIdToGTRInfo_" : {
+              },
+              "transferSize_" : {},
+              "coreletViews_" : {
+              }
+            }
+          ],
+          "primaryDsInfo_" : {
+            "OUTPUT" : {
+              "layoutDimOrder_" : ["j", "i", "mb", "out"],
+              "stickDimOrder_" : ["out"],
+              "stickSize_" : [32],
+              "stickRepl_" : [1]
+            }
+          },
+          "pdsRelation_" : { "isPdsReuse" : 1 },
+          "labeledDs_" : [
+            {
+              "ldsIdx_" : 0,
+              "dsName_" : "model/BatchNormalization_5_out",
+              "dsType_" : "OUTPUT",
+              "segment_" : "stack",
+              "isStatic_" : 0,
+              "isFirstUse_" : 0,
+              "isExternal_" : 0,
+              "scale_" : [1, 1, 1, 1],
+              "density_" : [1, 1, 1, 1],
+              "wordLength" : 4,
+              "dataFormat_" : "SENUINT32",
+              "level" : 0,
+              "memOrg_" : {
+                  "hbm" : { "isPresent" : 1, "isPadded" : 0, "isZeroPadded" : 0, "zpadGapFront" : [ 0, 0 ], "gapPerDim" : {  }, "dsOffset" : 0, "allocateNode_" : "allocate_model/BatchNormalization_5_out_hbm" },
+                  "lx" : { "isPresent" : 1, "isPadded" : 0, "isZeroPadded" : 0, "zpadGapFront" : [ 0, 0 ], "gapPerDim" : {  }, "dsOffset" : 0, "allocateNode_" : "allocate_lds0_lx" }
+              },
+              "dataTransfers_" : [
+              ],
+              "hbmStartAddress_" : 2505590,
+              "lxStartAddress_" : -1,
+              "hbmSize_" : 3136,
+              "lxSize_" : "18446744073709551615",
+              "lxBufferSize_" : "18446744073709551615",
+              "totSlicesPerDim_" : {  },
+              "coreStateInit_" : [
+              ]
+            },
+            {
+              "ldsIdx_" : 1,
+              "dsName_" : "model/cast_out",
+              "dsType_" : "OUTPUT",
+              "segment_" : "stack",
+              "isStatic_" : 0,
+              "isFirstUse_" : 0,
+              "isExternal_" : 0,
+              "scale_" : [1, 1, 1, 1],
+              "density_" : [1, 1, 1, 1],
+              "wordLength" : 4,
+              "dataFormat_" : "IEEE_FP32",
+              "level" : 0,
+              "memOrg_" : {
+                  "hbm" : { "isPresent" : 1, "isPadded" : 0, "isZeroPadded" : 0, "zpadGapFront" : [ 0, 0 ], "gapPerDim" : {  }, "dsOffset" : 0, "allocateNode_" : "allocate_model/cast_out_hbm" },
+                  "lx" : { "isPresent" : 1, "isPadded" : 0, "isZeroPadded" : 0, "zpadGapFront" : [ 0, 0 ], "gapPerDim" : {  }, "dsOffset" : 0, "allocateNode_" : "allocate_lds1_lx" }
+              },
+              "dataTransfers_" : [
+              ],
+              "hbmStartAddress_" : 2502454,
+              "lxStartAddress_" : -1,
+              "hbmSize_" : 3136,
+              "lxSize_" : "18446744073709551615",
+              "lxBufferSize_" : "18446744073709551615",
+              "totSlicesPerDim_" : {  },
+              "coreStateInit_" : [
+              ]
+            }
+          ],
+          "computeOp_" : [
+            {
+              "exUnit" : "sfp",
+              "opFuncName" : "int32tofp32",
+              "attributes_" : {
+                "dataFormat_" : "IEEE_FP32",
+                "fidelity_" : "regular"
+              },
+              "location" : "Inner",
+              "auxLoopName" : "",
+              "isAtMainLoop" : 1,
+              "isAtTop" : 1,
+              "level" : 0,
+              "coreExclude" : [  ],
+              "coreClExclude" : [  ],
+              "opConsts" : { },
+              "inputLabeledDs" : ["model/BatchNormalization_5_out-idx0"],
+              "interimLabeledDs" : [],
+              "outputLabeledDs" : ["model/cast_out-idx1"],
+              "indirectAccessIndexLabeledDs" : []
+            }
+          ],
+          "pcfg_" : [
+          ],
+          "target_" : "senulator"
+        }
+      }
+    ],
+    "datadscs_" : [ 
+    ]
+  }
+}
