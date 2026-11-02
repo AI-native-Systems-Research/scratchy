@@ -1711,23 +1711,7 @@ fn quantizing_norm(norm: &GatedCommand, quant: &GatedCommand) -> Option<GatedCom
         KernelId::FusedAddRmsNorm => 1,
         _ => return None,
     };
-    let function = match n.function {
-        "rmsnorm_f16_s_f16_specialized" => "rmsnorm_w4a8q_f16_s_f16_specialized",
-        "rmsnorm_bf16_s_f16_specialized" => "rmsnorm_w4a8q_bf16_s_f16_specialized",
-        "rmsnorm_f16_s_bf16_specialized" => "rmsnorm_w4a8q_f16_s_bf16_specialized",
-        "rmsnorm_bf16_s_bf16_specialized" => "rmsnorm_w4a8q_bf16_s_bf16_specialized",
-        "fused_add_rmsnorm_f16_s_f16_specialized" => "fused_add_rmsnorm_w4a8q_f16_s_f16_specialized",
-        "fused_add_rmsnorm_bf16_s_f16_specialized" => {
-            "fused_add_rmsnorm_w4a8q_bf16_s_f16_specialized"
-        }
-        "fused_add_rmsnorm_f16_s_bf16_specialized" => {
-            "fused_add_rmsnorm_w4a8q_f16_s_bf16_specialized"
-        }
-        "fused_add_rmsnorm_bf16_s_bf16_specialized" => {
-            "fused_add_rmsnorm_w4a8q_bf16_s_bf16_specialized"
-        }
-        _ => return None,
-    };
+    let function = quantizing_symbol(n.function)?;
     let (hidden, threads) = (constant(n, 1)?, n.dispatch.threads_per_threadgroup.0);
     let scaling = |c: &LoweredCommand| c.dispatch.m_scaling.map(|s| (s.bucket_m, s.set_axis));
     // The row (2-byte activations) and the row sum's partials in threadgroup memory.
@@ -1760,6 +1744,28 @@ fn quantizing_norm(norm: &GatedCommand, quant: &GatedCommand) -> Option<GatedCom
             ..*n
         },
         gate: norm.gate,
+    })
+}
+
+/// The quantizing twin of an RMSNorm kernel symbol (`rmsnorm.metal`'s `INST_RMSNORM_W4A8Q`,
+/// `fused_add_rmsnorm.metal`'s `INST_FUSED_ARN_W4A8Q`).
+fn quantizing_symbol(plain: &str) -> Option<&'static str> {
+    Some(match plain {
+        "rmsnorm_f16_s_f16_specialized" => "rmsnorm_w4a8q_f16_s_f16_specialized",
+        "rmsnorm_bf16_s_f16_specialized" => "rmsnorm_w4a8q_bf16_s_f16_specialized",
+        "rmsnorm_f16_s_bf16_specialized" => "rmsnorm_w4a8q_f16_s_bf16_specialized",
+        "rmsnorm_bf16_s_bf16_specialized" => "rmsnorm_w4a8q_bf16_s_bf16_specialized",
+        "fused_add_rmsnorm_f16_s_f16_specialized" => "fused_add_rmsnorm_w4a8q_f16_s_f16_specialized",
+        "fused_add_rmsnorm_bf16_s_f16_specialized" => {
+            "fused_add_rmsnorm_w4a8q_bf16_s_f16_specialized"
+        }
+        "fused_add_rmsnorm_f16_s_bf16_specialized" => {
+            "fused_add_rmsnorm_w4a8q_f16_s_bf16_specialized"
+        }
+        "fused_add_rmsnorm_bf16_s_bf16_specialized" => {
+            "fused_add_rmsnorm_w4a8q_bf16_s_bf16_specialized"
+        }
+        _ => return None,
     })
 }
 
@@ -13005,6 +13011,126 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// A W4A8 pre-pass over the rows the RMSNorm just before it wrote folds into the norm: its
+    /// quantizing twin (`rmsnorm_w4a8q_*`, `fused_add_rmsnorm_w4a8q_*`) writes the scratch, with the
+    /// pre-pass's rows at slot 6 and the scratch at binding 3, and the GEMMs read it behind a
+    /// coherent fence. Qwen3.8-27B's layer shapes on the wide class, at the 64- and 32-row
+    /// buckets (the 2-lane verify's 16 rows run in the 64-row one): the pre-passes after the input
+    /// norm (qkv, z) and the post-attention norm (gate, up) go; the ones after a GEMM (the GDN out
+    /// projection's input) and after SiluMul (down's) stay. The 16-row bucket has no W4A8 GEMM (not
+    /// a multiple of its 32-row tile). The 8-row bucket's pre-pass runs `OnlyIfSmallMTokens`, the
+    /// norm on every step: it stays.
+    #[test]
+    fn a_w4a8_pre_pass_after_a_norm_folds_into_the_norm() {
+        use crate::tape::lowered::GenClass::M5Wide;
+        use KernelId::{AffineW4a8Quant as Quant, FusedAddRmsNorm, RmsNorm};
+        let gemm = |input, output, n, k| {
+            MetalStep::AffineQmm(AffineMatmul {
+                input: Slot(input),
+                output: Slot(output),
+                layer: LayerId(0),
+                n: NDim(n),
+                k: KDim(k),
+                group_size: AffineGroupSize(64),
+                bits: AffineBits(4),
+                vector_limit: QmvBatchLimit(10),
+                ends: QmvEnds::default(),
+            })
+        };
+        let hidden = HiddenSize(5120);
+        let steps = [
+            // The input norm, then qkv and z of its rows.
+            MetalStep::RmsNorm(Slot(1), Slot(0), LayerId(0), hidden, RowsPerToken(1)),
+            gemm(0, 2, 10240, 5120),
+            gemm(0, 3, 6144, 5120),
+            // The out projection of another activation.
+            gemm(4, 5, 5120, 6144),
+            // The post-attention norm, then gate and up of its rows.
+            MetalStep::FusedAddRmsNorm(Slot(5), Slot(1), LayerId(0), hidden, RowsPerToken(1)),
+            gemm(5, 6, 17408, 5120),
+            gemm(5, 7, 17408, 5120),
+            MetalStep::SiluMul(Slot(6), Slot(7), Slot(4), IntermediateSize(17408)),
+            gemm(4, 3, 5120, 17408),
+        ];
+        let lower = |bucket_m| {
+            let at = BakePoint {
+                class: M5Wide,
+                ..bake_point(bucket_m, Some(&crate::targets::M5_10CORE))
+            };
+            lower_subtile_tape_to_metal(&row_tape(plain(&steps)), &tp(), at).expect("lowers")
+        };
+        for bucket_m in [64, 32] {
+            let tape = lower(bucket_m);
+            let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.command.kernel).collect();
+            let at = |k: KernelId| kinds.iter().position(|&e| e == k).expect("lowered");
+            let quants: Vec<usize> = (kinds.iter().enumerate())
+                .filter(|(_, k)| **k == Quant)
+                .map(|(i, _)| i)
+                .collect();
+            let case = format!("bucket {bucket_m}: {kinds:?}");
+            // Two pre-passes stay: the out projection's (after a GEMM) and down's (after SiluMul).
+            assert_eq!(quants.len(), 2, "{case}");
+            assert_eq!(
+                kinds[quants[0] - 1],
+                KernelId::AffineQmmW4a8,
+                "{case}: the out projection's pre-pass follows a GEMM"
+            );
+            assert_eq!(
+                kinds[quants[1] - 1],
+                KernelId::SiluMul,
+                "{case}: down's pre-pass follows SiluMul"
+            );
+            let p = tp();
+            for (norm, plain) in [
+                (RmsNorm, rmsnorm_kernel_static_name(&p, scale_dtype_for(&p))),
+                (
+                    FusedAddRmsNorm,
+                    fused_add_rmsnorm_kernel_static_name(&p, scale_dtype_for(&p)),
+                ),
+            ] {
+                let i = at(norm);
+                let c = &tape.commands[i].command;
+                assert_eq!(c.function, quantizing_symbol(plain).expect("a twin"), "{case}");
+                assert!(
+                    (c.constants.iter()).any(|v| *v == ConstantValue::uint(6, bucket_m)),
+                    "{case}: the scratch's rows"
+                );
+                assert!(
+                    c.bindings.contains(&Binding::Scratch { binding_index: 3 }),
+                    "{case}"
+                );
+                assert!(tape.barrier_before[i] >= Fence::Ordered, "{case}: writes the scratch");
+                // The GEMMs of its rows follow it, the first behind a coherent fence.
+                assert_ne!(kinds[i + 1], Quant, "{case}");
+                assert!(
+                    matches!(kinds[i + 1], KernelId::AffineQmmW4a8),
+                    "{case}"
+                );
+                assert_eq!(tape.barrier_before[i + 1], Fence::Coherent, "{case}");
+            }
+            assert!(
+                tape.splitk_scratch_bytes >= w4a8_scratch_bytes(bucket_m, 17408),
+                "{case}"
+            );
+        }
+        let tape = lower(16);
+        assert!(
+            !(tape.commands.iter()).any(|c| c.command.kernel == Quant),
+            "bucket 16: no W4A8"
+        );
+        // The 8-row bucket: the small-M pre-pass is gated, the norm is not, so it stays.
+        let tape = lower(8);
+        let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.command.kernel).collect();
+        assert_eq!(kinds[0], RmsNorm, "{kinds:?}");
+        assert_eq!(kinds[1], Quant, "{kinds:?}");
+        let p = tp();
+        assert_eq!(
+            tape.commands[0].command.function,
+            rmsnorm_kernel_static_name(&p, scale_dtype_for(&p)),
+            "{kinds:?}"
+        );
     }
 
     /// W4A8 matmuls of one activation in a row share its pre-pass, whatever their widths: the
