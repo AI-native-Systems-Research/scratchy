@@ -261,7 +261,7 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) -> Vec<f32> 
                 &[],
                 size(
                     n / kernel.cols() as usize,
-                    m.div_ceil(W4A8_TILE_ROWS as usize),
+                    m.div_ceil(kernel.rows() as usize),
                 ),
                 size(32 * kernel.simdgroups() as usize, 1),
             );
@@ -444,6 +444,52 @@ fn w4a8_split_k_matches_the_tiled_gemm() {
                                  split {a} tiled {b}"
                             );
                         }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// The small-M step's 16-row W4A8 GEMM (`W4a8Gemm::SmallM`, `affine_qmm_w4a8_splitk_*_tm_16_*`)
+/// at every split, both group sizes and every dtype pairing, at the small-M steps' live rows in
+/// the 64-row bucket and K = 1088 that no split divides: against the host reference, and BIT FOR
+/// BIT against the 32-row split-K GEMM of the same split over the same pre-pass. An element's sum
+/// is the same at either tile (each simdgroup's chunks in order, then the pairwise reduction), so
+/// the rows both cover agree exactly.
+#[test]
+fn w4a8_small_m_tile_is_the_split_k_gemm_bits() {
+    with_nax(|device, cache| {
+        for (act, scale) in [
+            (Dtype::Bf16, Dtype::Bf16),
+            (Dtype::Bf16, Dtype::F16),
+            (Dtype::F16, Dtype::F16),
+            (Dtype::F16, Dtype::Bf16),
+        ] {
+            for group_size in [64, 128] {
+                for split in W4a8SplitK::ALL {
+                    for (m, k) in [(4, 1024usize), (9, 1024), (16, 1024), (13, 1088)] {
+                        if !k.is_multiple_of(group_size) {
+                            continue;
+                        }
+                        let gemm = |kernel| Gemm {
+                            act,
+                            scale,
+                            group_size,
+                            m,
+                            bucket_m: 64,
+                            n: 192,
+                            k,
+                            kernel: Kernel::W4a8(kernel),
+                        };
+                        let small = run(device, cache, &gemm(W4a8Gemm::SmallM(split)));
+                        let bucket = run(device, cache, &gemm(W4a8Gemm::SplitK(split)));
+                        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                        assert_eq!(
+                            bits(&small),
+                            bits(&bucket),
+                            "{split:?} gs {group_size} m {m} k {k} {act:?}/{scale:?}"
+                        );
                     }
                 }
             }

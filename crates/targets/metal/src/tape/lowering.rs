@@ -1090,6 +1090,40 @@ fn route_small_m(
     {
         return Ok(cmds);
     }
+    // On the wide class, a bucket whose own GEMM is W4A8 multiplies the small-M step's rows in a
+    // 16-row tile of it (`W4a8Gemm::SmallM`) behind the same pre-pass, which then runs on every
+    // step. The bf16 twin re-reads its bf16 rows twice a 16-column tile, 7 bytes a weight byte,
+    // and its matrix unit streams them at ~2 TB/s: Qwen3.8-27B's 16-row verify ran every
+    // projection at 280-300 GB/s, lm_head included (`small_m_verify_probe_test`, 16 rows in the
+    // 64-row bucket, µs bf16 twin / W4A8 16-row: gate/up 17408 x 5120 198 / 151, MLP down
+    // 5120 x 17408 212 / 146, gdn qkv 10240 x 5120 117 / 89, gdn z 6144 x 5120 75 / 53, k and v
+    // 1024 x 5120 29 / 16, lm_head 248320 x 5120 2406 / 1361; the pre-pass 8-9 a matmul's
+    // activation). Unmeasured below the wide class.
+    let w4a8 = cmds
+        .iter()
+        .find(|c| c.command.kernel == KernelId::AffineQmmW4a8);
+    let small_w4a8 = (w4a8.zip(W4a8Gemm::for_small_m(n, k)))
+        .filter(|_| class == crate::tape::lowered::GenClass::M5Wide);
+    if let Some((gemm, kernel)) = small_w4a8 {
+        let gemm = gemm.command;
+        let small_m = LoweredCommand {
+            function: kernel.static_name(dequant_dtype_for(p), scale_dtype_for(p), group_size),
+            dispatch: DispatchShape {
+                threadgroups: (n / kernel.cols(), bucket_m / kernel.rows(), 1),
+                threads_per_threadgroup: (32 * kernel.simdgroups(), 1, 1),
+                ..gemm.dispatch
+            },
+            ..gemm
+        };
+        return Ok(cmds
+            .into_iter()
+            .map(|c| match c.command.kernel {
+                KernelId::AffineQmmW4a8 => GatedCommand::gated(c.command, UnlessSmallMTokens),
+                _ => c,
+            })
+            .chain([GatedCommand::gated(small_m, OnlyIfSmallMTokens)])
+            .collect());
+    }
     let small_m = LoweredCommand {
         kernel: KernelId::AffineQmmSmallM,
         library: "quantized_qmm_nax",
@@ -11632,6 +11666,94 @@ mod tests {
             assert!(
                 !kernels(gemm(n, bits), 64, profile).contains(&KernelId::AffineQmvFast),
                 "{n} columns, {bits}-bit: its own kernels"
+            );
+        }
+    }
+
+    /// On the wide class, a W4A8 bucket's small-M step runs the 16-row split-K W4A8 GEMM
+    /// (`W4a8Gemm::SmallM`) behind the bucket's own pre-pass, which runs on every step: the
+    /// pre-pass ungated, the bucket's GEMM `UnlessSmallMTokens`, the 16-row GEMM
+    /// `OnlyIfSmallMTokens` with the GEMM's constants, bindings and row scaling, its grid
+    /// `(n / 32, bucket / 16)`, K split the fewest ways from 4 that fill the cores (Qwen3.8-27B's
+    /// verify shapes in the 64-row bucket). The M5 class, and a bucket whose own GEMM is not
+    /// W4A8 (the 8-row bucket's wide matvec), keep the bf16 twin.
+    #[test]
+    fn a_w4a8_bucket_runs_its_small_m_step_in_a_16_row_w4a8_tile() {
+        use crate::quantized::{W4a8Gemm, W4a8SplitK};
+        use crate::tape::lowered::GenClass::{M5, M5Wide};
+        use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
+        use W4a8SplitK::{Ways4, Ways8};
+        let p = tp();
+        let (dtype, scale) = (dequant_dtype_for(&p), scale_dtype_for(&p));
+        let gemm = |n, k| {
+            row_tape(plain(&[MetalStep::AffineQmm(AffineMatmul {
+                input: Slot(0),
+                output: Slot(1),
+                layer: LayerId(0),
+                n: NDim(n),
+                k: KDim(k),
+                group_size: AffineGroupSize(64),
+                bits: AffineBits(4),
+                vector_limit: QmvBatchLimit(10),
+                ends: QmvEnds::default(),
+            })]))
+        };
+        let lower = |class, bucket_m, n, k| {
+            let at = BakePoint {
+                class,
+                ..bake_point(bucket_m, Some(&crate::targets::M5_10CORE))
+            };
+            lower_subtile_tape_to_metal(&gemm(n, k), &p, at).expect("lowers")
+        };
+        // (n, k, ways): gate/up, down, gdn z, k/v, lm_head.
+        for (n, k, ways) in [
+            (17408, 5120, Ways4),
+            (5120, 17408, Ways4),
+            (6144, 5120, Ways4),
+            (1024, 5120, Ways8),
+            (248320, 5120, Ways4),
+        ] {
+            let tape = lower(M5Wide, 64, n, k);
+            let case = format!("n {n} k {k}");
+            assert_eq!(
+                gated_steps(&tape),
+                [
+                    (KernelId::AffineW4a8Quant, None),
+                    (KernelId::AffineQmmW4a8, Some(UnlessSmallMTokens)),
+                    (KernelId::AffineQmmW4a8, Some(OnlyIfSmallMTokens)),
+                ],
+                "{case}"
+            );
+            let (own, small) = (&tape.commands[1].command, &tape.commands[2].command);
+            let kernel = W4a8Gemm::SmallM(ways);
+            assert_eq!(kernel, W4a8Gemm::for_small_m(n, k).expect("a 16-row tile"));
+            assert_eq!(
+                small.function,
+                kernel.static_name(dtype, scale, 64),
+                "{case}"
+            );
+            assert!(small.function.contains("_tm_16_tn_32_ks_"), "{case}");
+            assert_eq!(small.dispatch.threadgroups, (n / 32, 64 / 16, 1), "{case}");
+            assert_eq!(
+                small.dispatch.threads_per_threadgroup,
+                (32 * ways.ways(), 1, 1),
+                "{case}"
+            );
+            assert_eq!(small.dispatch.m_scaling, own.dispatch.m_scaling, "{case}");
+            assert_eq!(small.bindings, own.bindings, "{case}");
+            assert_eq!(small.constants, own.constants, "{case}");
+            // The pre-pass the step's either GEMM reads runs first on every step.
+            assert_eq!(tape.barrier_before[2], tape.barrier_before[1], "{case}");
+        }
+        // The M5 class keeps the bf16 twin; so does the wide class's 8-row bucket (no W4A8).
+        for (class, bucket_m) in [(M5, 64), (M5Wide, 8)] {
+            let tape = lower(class, bucket_m, 17408, 5120);
+            let small = tape.commands.last().expect("a command");
+            assert_eq!(small.gate, Some(OnlyIfSmallMTokens), "{class:?} {bucket_m}");
+            assert_eq!(
+                small.command.kernel,
+                KernelId::AffineQmmSmallM,
+                "{class:?} {bucket_m}"
             );
         }
     }

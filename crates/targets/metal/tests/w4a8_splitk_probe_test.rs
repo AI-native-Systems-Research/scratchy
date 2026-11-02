@@ -128,6 +128,7 @@ fn w4a8_against_split_k_at_qwen38_27b_shapes() {
                     let tag = match g {
                         W4a8Gemm::Tiled(t) => format!("tn{}", t.cols()),
                         W4a8Gemm::SplitK(s) => format!("k{}", s.ways()),
+                        W4a8Gemm::SmallM(s) => format!("m16k{}", s.ways()),
                     };
                     let tag = if g == picked { tag + "*" } else { tag };
                     (
