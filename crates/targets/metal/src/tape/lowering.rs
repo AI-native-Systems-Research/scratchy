@@ -1755,7 +1755,9 @@ fn quantizing_symbol(plain: &str) -> Option<&'static str> {
         "rmsnorm_bf16_s_f16_specialized" => "rmsnorm_w4a8q_bf16_s_f16_specialized",
         "rmsnorm_f16_s_bf16_specialized" => "rmsnorm_w4a8q_f16_s_bf16_specialized",
         "rmsnorm_bf16_s_bf16_specialized" => "rmsnorm_w4a8q_bf16_s_bf16_specialized",
-        "fused_add_rmsnorm_f16_s_f16_specialized" => "fused_add_rmsnorm_w4a8q_f16_s_f16_specialized",
+        "fused_add_rmsnorm_f16_s_f16_specialized" => {
+            "fused_add_rmsnorm_w4a8q_f16_s_f16_specialized"
+        }
         "fused_add_rmsnorm_bf16_s_f16_specialized" => {
             "fused_add_rmsnorm_w4a8q_bf16_s_f16_specialized"
         }
@@ -13092,7 +13094,11 @@ mod tests {
             ] {
                 let i = at(norm);
                 let c = &tape.commands[i].command;
-                assert_eq!(c.function, quantizing_symbol(plain).expect("a twin"), "{case}");
+                assert_eq!(
+                    c.function,
+                    quantizing_symbol(plain).expect("a twin"),
+                    "{case}"
+                );
                 assert!(
                     (c.constants.iter()).any(|v| *v == ConstantValue::uint(6, bucket_m)),
                     "{case}: the scratch's rows"
@@ -13101,13 +13107,13 @@ mod tests {
                     c.bindings.contains(&Binding::Scratch { binding_index: 3 }),
                     "{case}"
                 );
-                assert!(tape.barrier_before[i] >= Fence::Ordered, "{case}: writes the scratch");
+                assert!(
+                    tape.barrier_before[i] >= Fence::Ordered,
+                    "{case}: writes the scratch"
+                );
                 // The GEMMs of its rows follow it, the first behind a coherent fence.
                 assert_ne!(kinds[i + 1], Quant, "{case}");
-                assert!(
-                    matches!(kinds[i + 1], KernelId::AffineQmmW4a8),
-                    "{case}"
-                );
+                assert!(matches!(kinds[i + 1], KernelId::AffineQmmW4a8), "{case}");
                 assert_eq!(tape.barrier_before[i + 1], Fence::Coherent, "{case}");
             }
             assert!(

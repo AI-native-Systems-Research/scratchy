@@ -91,17 +91,30 @@ enum Norm {
     FusedAdd,
 }
 
-/// One case: `m` live rows of a `bucket`-row norm, the scratch laid out for `scratch_rows`.
+/// One case's rows: `m` live rows of a `bucket`-row norm over `k`-wide rows, the scratch laid out
+/// for `scratch_rows`.
+#[derive(Clone, Copy)]
+struct Rows {
+    k: usize,
+    m: usize,
+    bucket: usize,
+    scratch_rows: usize,
+}
+
+/// One case: `rows` of `norm` at the `(act, scale)` dtypes.
 fn case(
     device: &Device,
     cache: &SpecializedPipelineCache,
     norm: Norm,
     (act, scale): (Dtype, Dtype),
-    k: usize,
-    m: usize,
-    bucket: usize,
-    scratch_rows: usize,
+    rows: Rows,
 ) {
+    let Rows {
+        k,
+        m,
+        bucket,
+        scratch_rows,
+    } = rows;
     let mut rng = Rng(0x5eed ^ (k * 131 + m * 7 + bucket) as u64);
     // Rows of varied magnitude, a zero chunk (amax 0) in row 0.
     let x: Vec<u16> = (0..bucket * k)
@@ -243,7 +256,10 @@ fn case(
         "{what}: chunk scales differ"
     );
     // The test reads something: the quantized rows are not the garbage fill.
-    assert!(got.2[64..k].iter().any(|&b| b != 0xa5), "{what}: no int8 row");
+    assert!(
+        got.2[64..k].iter().any(|&b| b != 0xa5),
+        "{what}: no int8 row"
+    );
 }
 
 #[test]
@@ -270,7 +286,13 @@ fn quantizing_norms_match_the_norm_then_the_pre_pass() {
                 (5120, 5, 8, 16),
                 (576, 3, 32, 32),
             ] {
-                case(device, &cache, norm, d, k, m, bucket, rows);
+                let rows = Rows {
+                    k,
+                    m,
+                    bucket,
+                    scratch_rows: rows,
+                };
+                case(device, &cache, norm, d, rows);
             }
         }
     }
