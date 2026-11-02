@@ -198,26 +198,61 @@ enum PipelineMsg {
     Shutdown,
 }
 
-/// ⭐ #32 (C) — THE DRAIN DOOR: a clone of the executor thread's scheduler
-/// channel, handed DOWN to the worker (through
-/// [`crate::executor::Executor::set_drain_door`]) so a deferred output's
-/// resolver can KNOCK — ask the thread that owns the in-flight queue to drain
-/// until the step it is waiting on lands. Clone by design: the worker's copy
-/// outlives the client's, which is exactly why teardown is a MESSAGE
-/// ([`PipelineMsg::Shutdown`]) rather than a channel close.
+/// ⭐ #32 (C) — THE DRAIN DOOR: the knock a deferred output's resolver sends
+/// to the thread that owns the in-flight queue, handed DOWN to the worker
+/// (through [`crate::executor::Executor::set_drain_door`]) so the resolver
+/// can ask that thread to drain until the step it is waiting on lands.
+/// The payload is a CLOSURE, not a channel: the pipelined client's door is
+/// its `SyncSender<PipelineMsg>` clone ([`DrainDoor::over_channel`]), and
+/// `scr serve`'s step loop builds one from a raw closure over its own tokio
+/// executor channel ([`DrainDoor::from_knock`]) — one door shape, two
+/// owners. Clone by
+/// design: the worker's copy outlives the client's, which is exactly why
+/// teardown is a MESSAGE ([`PipelineMsg::Shutdown`]) rather than a channel
+/// close.
 #[derive(Clone)]
 pub struct DrainDoor {
-    tx: std::sync::mpsc::SyncSender<PipelineMsg>,
+    knock: std::sync::Arc<
+        dyn Fn(std::sync::Arc<crate::executor::DrainCell>) -> EngineResult<()> + Send + Sync,
+    >,
 }
 
 impl DrainDoor {
+    /// A door over the pipelined client's own scheduler channel. The
+    /// sender is a `SyncSender` clone, so the knock is a plain blocking
+    /// send — the caller is a resolver on any thread. Private to this
+    /// module: the message type is this module's own.
+    fn over_channel(tx: std::sync::mpsc::SyncSender<PipelineMsg>) -> Self {
+        Self::from_knock(move |cell| {
+            tx.send(PipelineMsg::Knock(cell)).map_err(|_| {
+                EngineError::Executor("drain door: the executor thread is gone".into())
+            })
+        })
+    }
+
+    /// A door from a raw knock closure — for owners whose executor thread
+    /// is fed by a channel this crate cannot name (`scr serve`'s step loop
+    /// builds one over its own tokio executor channel). The closure must
+    /// deliver the knock to the ONE thread that owns the worker's
+    /// in-flight queue; a `tokio` sender inside it may only be driven by
+    /// `blocking_send` from a blocking thread (see the server's
+    /// construction site for the panic-hazard contract).
+    pub fn from_knock(
+        knock: impl Fn(std::sync::Arc<crate::executor::DrainCell>) -> EngineResult<()>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            knock: std::sync::Arc::new(knock),
+        }
+    }
+
     /// Knock: drain until `cell` is filled. Returns `Err` only when the
     /// executor thread is gone — a resolver that cannot knock resolves its
     /// cell with the error rather than hang.
     pub fn knock(&self, cell: std::sync::Arc<crate::executor::DrainCell>) -> EngineResult<()> {
-        self.tx
-            .send(PipelineMsg::Knock(cell))
-            .map_err(|_| EngineError::Executor("drain door: the executor thread is gone".into()))
+        (self.knock)(cell)
     }
 }
 
@@ -313,9 +348,7 @@ impl InprocClient {
             // deferred resolvers knock through this clone; without it a
             // deferred output has no way to wake the one thread that can fill
             // its cell, and deferral would be a hang instead of an overlap.
-            executor.set_drain_door(DrainDoor {
-                tx: sched_tx.clone(),
-            });
+            executor.set_drain_door(DrainDoor::over_channel(sched_tx.clone()));
             let thread = std::thread::Builder::new()
                 .name("scratchy-serving-worker".into())
                 .spawn(move || executor_bg_loop(executor, sched_rx, result_tx))
