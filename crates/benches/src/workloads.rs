@@ -40,6 +40,9 @@ pub(crate) enum Score {
     },
     /// LongBench v2: the letter the response picks, A to D.
     Choice(String),
+    /// A coding exercise: the answer's code passes the exercise's unit tests, run apart
+    /// ([`crate::coding::TestRunner`]); [`Score::score`] cannot read it from the text.
+    Tests(Box<crate::coding::Exercise>),
     /// Nothing to score: a chat turn or a synthetic question with no single right answer.
     None,
 }
@@ -57,6 +60,7 @@ impl Score {
                 format!("{answer} (or {})", aliases.join(", "))
             }
             Score::Choice(letter) => letter.clone(),
+            Score::Tests(e) => format!("{}'s tests", e.name),
             Score::None => String::new(),
         }
     }
@@ -71,6 +75,8 @@ impl Score {
     pub(crate) fn score(&self, response: &str) -> f64 {
         match self {
             Score::None => 0.0,
+            // Run apart, by `run_tasks`: never reached through here.
+            Score::Tests(_) => 0.0,
             // Each source scored as its own benchmark scores it ([`crate::scoring`]), whether or
             // not this task has aliases.
             Score::Contains {
@@ -135,6 +141,10 @@ pub(crate) const PASSAGES: RagPrompt = RagPrompt {
     label: "Passage",
 };
 
+/// A RAG task's answer length when it is timed (`--timed-answers`): the gold answer is a few
+/// tokens, too short to time decoding, so a fixed short answer, the same on every engine.
+pub(crate) const RAG_TIMED_TOKENS: usize = 64;
+
 /// The answer cap. The multi-document QA benchmarks use 64, but the matrix's models open with a
 /// preamble (Granite 4.2: "Based solely on the provided documents..."), and at 64 tokens most
 /// answers ended before the answer: 1 of 6 right on MuSiQue. A reply still ends where the model
@@ -183,6 +193,16 @@ pub(crate) fn rag_task(
 }
 
 impl Task {
+    /// The answer length a timed request is forced to (`--timed-answers`), the same on every
+    /// engine: a RAG task's [`RAG_TIMED_TOKENS`], else its own cap, which is the dataset's
+    /// answer length (a conversation turn's recorded reply, a shared-prefix question's 32).
+    pub(crate) fn timed_tokens(&self) -> usize {
+        match self.score {
+            Score::Contains { .. } => RAG_TIMED_TOKENS.min(self.max_tokens),
+            _ => self.max_tokens,
+        }
+    }
+
     /// The plain request's messages as the in-process engine takes them.
     pub(crate) fn chat_messages(&self) -> Vec<scratchy_serving_api::llm::ChatMessage> {
         use scratchy_serving_api::llm::ChatMessage;

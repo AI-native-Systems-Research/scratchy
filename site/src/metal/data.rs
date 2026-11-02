@@ -334,6 +334,54 @@ pub struct Scaling {
     /// ran at 1 user only. None: every prompt `max_prompt` allows.
     #[serde(default)]
     pub max_prompt_users: Option<u32>,
+    /// The dataset workloads the tasks axis ran, every engine on the same tasks; absent before
+    /// the matrix ran datasets, and in a `--random` run.
+    #[serde(default)]
+    pub workloads: Option<Vec<String>>,
+    /// The workloads scratchy alone ran (`rag-spans`, its passage reuse).
+    #[serde(default)]
+    pub workloads_scratchy: Option<Vec<String>>,
+    /// A dataset task's longest prompt, in tokens: a longer one was left out, on every engine.
+    #[serde(default)]
+    pub task_max_prompt: Option<u32>,
+    /// The rounds of its users count a cell ran at least: with `task_min_prompts`, how many tasks
+    /// a dataset cell sent, in runs from before each cell recorded it.
+    #[serde(default)]
+    pub min_rounds_per_cell: Option<u32>,
+    #[serde(default)]
+    pub task_min_prompts: Option<u32>,
+}
+
+impl Scaling {
+    /// How a run sized its dataset cells: its rounds and its fewest tasks a cell, where it says.
+    pub fn task_sizing(&self) -> Option<TaskSizing> {
+        Some(TaskSizing {
+            rounds: self.min_rounds_per_cell?,
+            min_tasks: self.task_min_prompts?,
+        })
+    }
+}
+
+/// How a run sized its dataset cells (`run_task_cell`): `users` × `rounds` tasks, at least
+/// `min_tasks`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct TaskSizing {
+    pub rounds: u32,
+    pub min_tasks: u32,
+}
+
+impl TaskSizing {
+    /// How many tasks (conversations, for `sharegpt-multi-turn`) a cell of this workload at
+    /// `users` sent: `users` × the rounds, at least the fewest; a quarter of that in conversations
+    /// of four turns, at least 2.
+    pub fn count(self, workload: &str, users: u32) -> u32 {
+        let n = (users * self.rounds).max(self.min_tasks);
+        if workload == "sharegpt-multi-turn" {
+            (n / 4).max(2)
+        } else {
+            n
+        }
+    }
 }
 
 /// What a model ran at when a limit lowered it (GLM-4.5-Air: 4 users).
@@ -406,6 +454,17 @@ pub struct Model {
     pub scaling_mistralrs: Option<Vec<Cell>>,
     #[serde(default)]
     pub scaling_splash: Option<Vec<Cell>>,
+    /// The dataset workloads' cells, per engine: one a workload and users count.
+    #[serde(default)]
+    pub tasks: Option<Vec<TaskCell>>,
+    #[serde(default)]
+    pub tasks_omlx: Option<Vec<TaskCell>>,
+    #[serde(default)]
+    pub tasks_omlx_tq: Option<Vec<TaskCell>>,
+    #[serde(default)]
+    pub tasks_mlx_lm: Option<Vec<TaskCell>>,
+    #[serde(default)]
+    pub tasks_splash: Option<Vec<TaskCell>>,
     /// Per engine key, what it served: the ollama tag or GGUF file and its
     /// quantization, and the files' revision.
     #[serde(default)]
@@ -476,6 +535,77 @@ pub struct Rep {
     /// Launch until the first token: ready, then the first request.
     pub ttft_exec_s: Option<f64>,
     pub peak_rss_mib: Option<f64>,
+}
+
+/// One dataset workload at one users count, as `scr bench serve --dataset-name <workload>`
+/// measured it: answers ending on their own, every engine sent the same tasks.
+#[derive(Deserialize, Clone, Debug)]
+pub struct TaskCell {
+    pub workload: String,
+    /// The cell's load key: a rate step (1, 2, ... of `config.scaling.task_rate_steps`), 0 for the
+    /// 1-user closed-loop `base` cell the rates are fractions of; in runs from before open-loop
+    /// cells, and for `rag-accuracy`, its users at once. Cells of one key are the same load.
+    pub conc: u32,
+    /// How the cell was loaded: "rate" (open loop at `request_rate`), "base", or "users" (closed
+    /// loop at `conc` users). None in runs from before it was recorded: users.
+    #[serde(default)]
+    pub load: Option<String>,
+    /// The requests a second it was offered, open loop; None for a closed loop.
+    #[serde(default)]
+    pub request_rate: Option<f64>,
+    pub completed: Option<u32>,
+    #[serde(default)]
+    pub failed: Option<u32>,
+    pub median_ttft_ms: Option<f64>,
+    #[serde(default)]
+    pub median_e2el_ms: Option<f64>,
+    /// Answer tokens a task took, on average.
+    #[serde(default)]
+    pub mean_output_tokens: Option<f64>,
+    /// Every answer token the cell's requests delivered.
+    #[serde(default)]
+    pub total_output_tokens: Option<u64>,
+    /// Prompt tokens the server's cache served, on average; None where it sent no count.
+    #[serde(default)]
+    pub mean_cached_tokens: Option<f64>,
+    /// The share of answers right, by the dataset's own text scoring; None where nothing is
+    /// scored (chat turns, the shared-prefix questions).
+    #[serde(default)]
+    pub accuracy: Option<f64>,
+    /// Answers that opened as reasoning: a request whose thinking could not be turned off (a span
+    /// query), so its accuracy and tokens are no like-for-like with a plain answer's.
+    #[serde(default)]
+    pub thinking_answers: Option<u32>,
+    /// Answers that ran to their cap rather than ending on their own.
+    #[serde(default)]
+    pub capped_answers: Option<u32>,
+    /// Tasks sent, the denominator of accuracy (turns, for a conversation workload). None in runs
+    /// from before it was recorded.
+    #[serde(default)]
+    pub num_tasks: Option<u32>,
+    #[serde(default)]
+    pub timed_out: bool,
+    /// When the run this cell was borrowed from was made: a quick run's rival numbers, from the
+    /// newest earlier run that measured the same workload at the same users count and task cap.
+    /// None for a cell this run measured itself.
+    #[serde(skip)]
+    pub borrowed_from: Option<Utc>,
+}
+
+impl TaskCell {
+    /// Answer tokens a task took, on average: as recorded, or from the cell's total where only
+    /// that is (a ShareGPT single-turn cell, timed on the completions path).
+    pub fn answer_tokens(&self) -> Option<f64> {
+        self.mean_output_tokens.or_else(|| {
+            let n = self.completed.filter(|&n| n > 0)?;
+            Some(self.total_output_tokens? as f64 / f64::from(n))
+        })
+    }
+
+    /// Whether it measured anything: some request answered.
+    pub fn measured(&self) -> bool {
+        self.completed.unwrap_or(0) > 0 && !self.timed_out
+    }
 }
 
 /// A size in bytes.
