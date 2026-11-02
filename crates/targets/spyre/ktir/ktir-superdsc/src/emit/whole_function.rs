@@ -4456,35 +4456,79 @@ fn lower_function_folded(
                         // is laid row-major first and the rows gathered from there. The prompt
                         // trip's query-row-major frame reads them as gathered (below); anything
                         // else, laid back stick-major.
+                        // ⛔ THE TABLE'S BYTES ARE IN ITS OWN FRAME, NOT THE VIEW'S. The view is the
+                        // kernel's reading of the tensor (the folded decode batch reads a
+                        // `[tokens, heads·hd]` query as `[tokens·kv, heads·hd/kv]`); stick-major on
+                        // the card those are different bytes, and the producer wrote the tensor's own.
+                        // Row-major they are ONE element order, so the permute goes from the tensor's
+                        // own frame and lands the row-major table the view's rows index.
+                        let [own_rows, own_cols] = layout
+                            .frames
+                            .get(&g.value_tid)
+                            .copied()
+                            .unwrap_or([table_rows, cols]);
+                        if u64::from(own_rows) * u64::from(own_cols)
+                            != u64::from(table_rows) * u64::from(cols)
+                            || !own_cols.is_multiple_of(crate::work::FP16_ELEMS_PER_STICK)
+                        {
+                            return err(format!(
+                                "{}: the gathered table t{} is `[{own_rows}, {own_cols}]` in its own \
+                                 frame and the program reads it as `[{table_rows}, {cols}]` — not the \
+                                 same elements in whole sticks",
+                                f.name, g.value_tid
+                            ));
+                        }
+                        let own_sticks = own_cols / crate::work::FP16_ELEMS_PER_STICK;
                         let rows_major = if table_rows > 1 && sticks > 1 {
                             let table = Region {
                                 tid: g.value_tid,
-                                v_rows: table_rows,
-                                v_cols: cols,
+                                v_rows: own_rows,
+                                v_cols: own_cols,
                                 r_start: 0,
                                 c_start: 0,
-                                r_len: table_rows,
-                                c_len: cols,
-                                r_cover: (0, table_rows),
-                                c_cover: (0, cols),
+                                r_len: own_rows,
+                                c_len: own_cols,
+                                r_cover: (0, own_rows),
+                                c_cover: (0, own_cols),
                                 is_out: false,
                                 is_fp8: false,
                                 band: None,
                             };
-                            let table_rows_major = row_major_region(
-                                mint_scratch(k, layout, floor, src, Scratch::GatherTableRowMajor),
-                                table_rows * sticks,
-                                layout,
-                            );
-                            out.push(permute(
-                                f.name,
-                                &table,
-                                &table_rows_major,
-                                Permuted::whole((table_rows, sticks)),
-                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
-                                sym_id_base,
-                                Some(layout),
-                            )?);
+                            // One row in its own frame is already its elements in order — the
+                            // row-major table, read in place.
+                            let table_rows_major = if own_rows == 1 {
+                                Region {
+                                    v_rows: own_sticks,
+                                    v_cols: crate::work::FP16_ELEMS_PER_STICK,
+                                    r_len: own_sticks,
+                                    c_len: crate::work::FP16_ELEMS_PER_STICK,
+                                    r_cover: (0, own_sticks),
+                                    c_cover: (0, crate::work::FP16_ELEMS_PER_STICK),
+                                    ..table
+                                }
+                            } else {
+                                let rows = row_major_region(
+                                    mint_scratch(
+                                        k,
+                                        layout,
+                                        floor,
+                                        src,
+                                        Scratch::GatherTableRowMajor,
+                                    ),
+                                    table_rows * sticks,
+                                    layout,
+                                );
+                                out.push(permute(
+                                    f.name,
+                                    &table,
+                                    &rows,
+                                    Permuted::whole((own_rows, own_sticks)),
+                                    crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                                    sym_id_base,
+                                    Some(layout),
+                                )?);
+                                rows
+                            };
                             let gathered = row_major_region(
                                 mint_scratch(k, layout, floor, src, Scratch::GatheredRowMajor),
                                 g.entries * sticks,

@@ -1616,6 +1616,14 @@ pub fn compute_bundle_layout<F: RopeForm>(
             );
             tids
         },
+        // ⭐ EVERY GRAPH TENSOR'S OWN FRAME, from the graph that placed it — the shape its producer
+        // writes, which a program's own view of the tensor need not be (`BundleLayout::frames`).
+        frames: ir
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(tid, t)| (tid as u32, [t.rows, t.cols]))
+            .collect(),
     };
     // ⭐ THE CACHE IS ALLOCATED ROW-OUTERMOST, as spyre-inference's `allocate_pages` allocates it
     // (`head_major_kv_layout`) — before any op addresses it.
@@ -6119,6 +6127,9 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // on this bundle reads them off the bundle (never off another graph's wiring).
         num_sources,
         resident_source_tids,
+        // EMIT-ONLY: a tensor's own frame is what the lowering relays out from; the baked
+        // placements carry everything the runtime addresses.
+        frames: _,
         // EMIT-ONLY too: the class registries are build-time facts the door and the load-time bind
         // resolve through; the baked artifact carries each class's PLACEMENT (in `places` above),
         // which is all the runtime needs.

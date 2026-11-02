@@ -732,6 +732,9 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // fill and no load-time constant tables for an owner session to bind — the consts above
         // are staged by the runner, not excused from the bind walk.
         resident_source_tids: Vec::new(),
+        // One kernel's parameters have no producer graph to state another frame: each is read in
+        // the frame its own view states, which is what an empty map says.
+        frames: Default::default(),
     })
 }
 

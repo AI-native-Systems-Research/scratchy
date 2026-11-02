@@ -356,6 +356,15 @@ pub struct BundleLayout {
     /// read of unfilled memory.
     #[serde(default)]
     pub resident_source_tids: Vec<u32>,
+    /// ⭐ EACH GRAPH TENSOR'S OWN FRAME — `tid → [rows, cols]`, the shape its producer wrote it at,
+    /// stick-major on the card. A program reads a parameter through a view it states itself, and a
+    /// Triton descriptor may state a different frame of the same elements (the decode batch's folded
+    /// query, `[tokens · kv, heads · hd / kv]` over a `[tokens, heads · hd]` tensor): row-major the
+    /// two are one element order, stick-major they are different bytes. No program states which
+    /// frame the bytes are in, so the layout that placed the tensor states it here, and a relayout
+    /// starts from it. Empty for a layout that places no graph tensors.
+    #[serde(skip)]
+    pub frames: std::collections::BTreeMap<u32, [u32; 2]>,
 }
 
 /// Bump allocator for synthetic-intermediate offsets within the Intermediate

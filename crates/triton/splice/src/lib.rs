@@ -4840,6 +4840,54 @@ mod walk_on_the_card {
     /// with; the runs go out 32 an op instead, so every core copies one run. Two sequences over four
     /// blocks, or eight over one, are 64 blocks (two ops a plane); two over one gather a kv head a
     /// core and read the probabilities with no relayout at all.
+    /// ⭐ A DECODE BATCH'S QUERY TABLE IS RELAID FROM THE QUERY'S OWN FRAME. Folded under Triton's
+    /// gather floor, the kernel reads the `[tokens, heads·hd]` query as `[tokens·kv, heads·hd/kv]`
+    /// rows; stick-major on the card those are different bytes, and the producer wrote the query's
+    /// own. Card-measured (granite-3.1-2b, two short requests): the table permuted as if the bytes
+    /// were the view's (`[16, 256]`) equalled the query read in the wrong frame to the last bit, and
+    /// both replies decoded garbage. So the permute's rows are the query's own (two), and one row
+    /// is its elements in order already, so a batch of one permutes nothing.
+    #[test]
+    fn a_decode_batch_relays_its_query_from_the_querys_own_frame() {
+        for (seqs, walk, hd) in [(2u32, 1u32, 64u32), (1, 1, 64), (2, 4, 64), (2, 1, 128)] {
+            let (node, c) = batched_walk_at(seqs, walk, hd);
+            let mut layout =
+                triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            // Parameter 0 is the query; its producer wrote it `[tokens, heads · hd]`.
+            layout.frames.insert(0, [seqs, 32 * hd]);
+            allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            let mut sym = 0i64;
+            let ops =
+                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                    .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
+            let at = format!("B={seqs} walk={walk} hd={hd} rows/page={}", c.rows_per_page);
+            let reads_query = |e: &&ktir_superdsc::emit::EmittedOp| {
+                e.arg_bindings
+                    .iter()
+                    .any(|a| a.is_input && a.buffer == ktir_superdsc::place::act_name(0))
+            };
+            let permutes: Vec<_> = ops
+                .iter()
+                .filter(|e| e.op_name.starts_with("permute"))
+                .filter(reads_query)
+                .collect();
+            if seqs == 1 {
+                assert!(permutes.is_empty(), "{at}: one row is its own row-major table");
+                continue;
+            }
+            assert_eq!(permutes.len(), 1, "{at}: one relayout of the query");
+            let v = serde_json::to_value(permutes[0].op.as_ref().expect("a descriptor"))
+                .expect("json");
+            let n = &v["dscs_"][0][&permutes[0].op_name]["N_"];
+            assert_eq!(
+                (n["mb_"].as_u64(), n["y_"].as_u64()),
+                (Some(u64::from(seqs)), Some(u64::from(32 * hd / 64))),
+                "{at} {}: the query's own rows and sticks",
+                permutes[0].op_name
+            );
+        }
+    }
+
     #[test]
     fn a_decode_batch_lays_its_probabilities_out_one_run_a_core() {
         for (seqs, walk, hd) in [(2u32, 1u32, 64u32), (2, 4, 64), (8, 1, 64), (2, 4, 128)] {
