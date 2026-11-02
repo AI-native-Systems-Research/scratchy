@@ -717,11 +717,12 @@ impl PagedStep {
     /// (`paged_step::card_mask`), so one trip's tile is its rows' sticks in every plane of it, 128 B
     /// a row: `rows` of them for one sequence (`[rows, page_slots]`),
     /// so page table row `i` sits at `i · rows · 128` B (one int32 stick at decode), and
-    /// `entries · nkvh` of them for a decode batch (`[J, B, nkvh, 1, page_slots]`), so chunk `c`'s
-    /// ids sit at `c · entries · nkvh · 128` B.
+    /// `entries` of them for a decode batch (`[J, B, 1, 1, page_slots]`: one row per block slot and
+    /// sequence, every kv head reading it through the kernel's broadcast), so chunk `c`'s ids sit at
+    /// `c · entries · 128` B.
     pub const fn card_walk_step(self) -> u64 {
         let rows = match self.batch() {
-            Some(c) => c.entries() * self.nkvh,
+            Some(c) => c.entries(),
             None => self.rows,
         };
         rows as u64 * Df::Fp16.elems_per_stick() as u64 * 2
@@ -750,7 +751,7 @@ impl PagedStep {
     pub fn card_placements(self) -> Vec<(u32, CardSeat, u64)> {
         let int32_stick = u64::from(scratchy_triton_splice::INT32_STICK);
         let sticks = |words: u64| words.div_ceil(int32_stick) * int32_stick * 4;
-        let (slots, nkvh) = (u64::from(self.page_slots), u64::from(self.nkvh));
+        let slots = u64::from(self.page_slots);
         let mut v = vec![(
             self.write_rows,
             CardSeat::Step,
@@ -773,7 +774,7 @@ impl PagedStep {
                     (
                         self.chunk_masks,
                         CardSeat::Step,
-                        chunks * entries * nkvh * slots * 2,
+                        chunks * entries * slots * 2,
                     ),
                 ]);
             }

@@ -1554,8 +1554,8 @@ pub struct PagedStepTids {
     /// entry `j · seqs + s`'s row `a` holds `page · rows_per_page + a` of block slot `j` of sequence
     /// `s` (at `rows_per_page = num_kv_heads`, our fold under Triton's gather floor: [`BatchChunking`]).
     pub chunk_pages: u32,
-    /// A decode batch's `mask_by_chunk` `[num_chunks, blocks_per_chunk, seqs, num_kv_heads, 1,
-    /// block_size]`.
+    /// A decode batch's `mask_by_chunk` `[num_chunks, blocks_per_chunk, seqs, 1, 1, block_size]`:
+    /// one row per block slot and sequence, broadcast over the kv heads in the kernel.
     pub chunk_masks: u32,
     /// The decode step's int32 zero stick, staged beside `kv_row_pool`: the add identity the chained
     /// index's run copy reads on the card.
@@ -4564,7 +4564,7 @@ mod walk_on_the_card {
             .expect("the walk flattens")
             .expect("a multi-chunk walk states its loop");
         assert_eq!(flat.fold.trips, c.num_chunks);
-        assert_eq!(flat.fold.step_bytes, c.entries() * 8 * 128);
+        assert_eq!(flat.fold.step_bytes, c.entries() * 128);
         assert_eq!(
             flat.fold.carried.len(),
             3,
@@ -4587,7 +4587,7 @@ mod walk_on_the_card {
                 e.walk,
                 Some(WalkTrips {
                     trips: c.num_chunks,
-                    step_bytes: c.entries() * 8 * 128
+                    step_bytes: c.entries() * 128
                 }),
                 "{}",
                 e.op_name
