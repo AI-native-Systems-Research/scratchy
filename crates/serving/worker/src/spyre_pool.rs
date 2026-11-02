@@ -1,265 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
-//! THE PAGED KV POOL — cutting it, and binding a request's pages into a launch.
+//! THE CARD'S SESSIONS — recognising a SuperDSC bundle, picking a prefill rung, and the per-process
+//! print flags the launch path reads.
 //!
-//! Target-specific because the addressing is (`bind_launch_slot`, `PageMapCtx`, the fold's page
-//! maps), model-NEUTRAL because a page is a page: none of this changes when the architecture does.
+//! The KV pool itself has no host plumbing left here: it is a placed tensor of every bundle
+//! (`PagedStep::card_placements`), the scheduler's block table names its pages, and each launch
+//! stages the paged step's tables from that table (`scratchy_target_spyre::paged_step`).
 
-// ⭐ THIS WHOLE MODULE IS THE CARD'S PAGED-KV PLUMBING, so every import carries the cfg of the
-// blocks that use it — on the emulator the file contributes nothing.
-#[cfg(feature = "spyre-hw")]
-use scratchy_subtile::sdsc_abstract::{
-    BlockTable, LaunchSlot, PagedKvPool, PoolPages, PoolPartition, RowPages, SlotCount,
-};
 #[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::manifest::SengraphBundle;
 #[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::sdsc_runner::SuperDscSession;
 
-#[cfg(feature = "spyre-hw")]
-use crate::error::ExecutorResult;
-#[cfg(feature = "spyre-hw")]
-use crate::spyre_types::*;
-#[cfg(feature = "spyre-hw")]
-use crate::spyre_worker::*;
-
-/// ⭐ INSTALL THE PAGES THE HOST GAVE `req`, and refuse if they do not reach the slot the forward is
-/// about to write. Called before every forward.
-///
-/// 🛑 **IT USED TO ALLOCATE.** `ensure_pages` searched the pool for a page no live request held and
-/// pushed it onto the request's map, growing the map to whatever slot the batch needed. That is a second
-/// allocator over a pool the SCHEDULER already owns and refcounts, and it is exactly why prefix caching
-/// was off: a cache hit is the scheduler saying "these blocks hold that prefix", and pages the worker
-/// picked for itself hold it nowhere. The host's `block_ids` are the truth now, and [`BlockTable`] has no
-/// constructor that does not take them.
-///
-/// ⛔ SO THE FAILURE MODE MOVES, ON PURPOSE. Where the old code would silently draw another page, this
-/// refuses: the request's slot span has outrun the blocks the host allocated for it — a bug report instead
-/// of a request reading a page nobody wrote.
-///
-/// ⛔⛔⛔ **THIS REFUSAL'S OWN MESSAGE USED TO ACCUSE `ReqState::kv_extent` OF A REPORTING BUG, AND THAT WAS
-/// WRONG.** It fired at the SHIPPED width 8 on ragged batches, 5 of 5 trials
-/// (`cannot map 513 slot(s) = 3 page(s): the host granted 2 block(s)`), and the report was correct every
-/// time: the row really did lack the page. The defect was in the ALLOCATION — the scheduler sized it from a
-/// report that had aged one finalized step under async scheduling
-/// ([`scratchy_core_common::InflightSlots`]). ⭐ SO THE AUTHORITATIVE NUMBER IS THE LAUNCH'S, and the
-/// message says so: the span here is what the card is about to write, and a grant short of it is the host's
-/// arithmetic to answer for.
-#[cfg(feature = "spyre-hw")]
-pub(crate) fn install_host_blocks(
-    session: &mut SendnnSession,
-    req: &mut ReqState,
-    // SLOTS THIS FORWARD WILL HAVE OCCUPIED — a [`SlotCount`], not a `usize`, because the only thing done
-    // with it is a division by a page ([`RowPages::holding`]), and the page count that division produces
-    // was the same machine type as a slot count at all three sites that used it.
-    span: SlotCount,
-    // ⛔ NO `held: &HashSet<KvRow>`: this took the set of rows live requests were holding so it could claim a
-    // free one. Nothing is claimed here now.
-    // The host's list for this request (borrowed from `InputBatch`, the one store) plus the pool's owner
-    // split — see [`PageMapCtx`] for why the two travel together.
-    ctx: PageMapCtx<'_>,
-) -> ExecutorResult<()> {
-    // ONE variant, so this binds rather than matches — the sengraph families it used to fall
-    // through for are gone.
-    let SendnnSession::SuperDsc(sb) = session;
-    let Some(split) = sb.kv_split() else {
-        if sb.decode.is_paged() {
-            return Err(werr(format!(
-                // A page holds SLOTS, not requests, so the only way this fails is an empty pool or a
-                // batch wider than the PAGES available — one page each, minimum. The old message also
-                // blamed "the widest baked rung is wider than the requests a page holds", which was the
-                // request-dimension bound and no longer exists.
-                "superdsc paged: a pool of {} page(s) cannot serve a {}-wide batch — every sequence needs \
-                 at least one page of its own, so raise SUPERDSC_POOL_PAGES or admit fewer requests",
-                sb.pool_pages,
-                sb.decode_rungs
-                    .iter()
-                    .map(|r| r.seqs.get())
-                    .max()
-                    .unwrap_or(1),
-            )));
-        }
-        return Ok(());
-    };
-    // ⛔⛔⛔ NOTHING IS CLAIMED HERE ANY MORE. This used to take the lowest KV row no live request held
-    // (`free_row`) and keep it for the request's life, because the row named the pages that backed its
-    // batched write. The host allocates that page now (`own pages + 1`), so a request needs no identity in
-    // the pool at all: its pages are the scheduler's block ids and nothing else. `PagedKv`, `KvRow`,
-    // `AffineRows`, `free_row` and `rows_held` are gone with it, and so is the refusal that fired when every
-    // row was held — a concurrency limit that existed only because rows were a scarce per-request resource.
-    let _ = &split;
-    // ⛔ ONE PAGE, ONE MEANING. The bundle carries its own `page_slots` while the pool's mask geometry is
-    // baked from the const; they are the same quantity from two sources, so they are compared once here
-    // instead of being used interchangeably.
-    if sb.decode.page_slots != PagedKvPool::PAGE_SLOTS {
-        return Err(werr(format!(
-            "superdsc paged: the bundle says a page holds {} slot(s) but the pool's baked geometry says {} \
-             — the mask is blocked per (row, page) from the const, so nothing can honour both",
-            sb.decode.page_slots,
-            PagedKvPool::PAGE_SLOTS,
-        )));
-    }
-    // ⛔ THE CONTEXT CEILING. Every `rows_are_requests` bundle (the decode rungs) bakes its prefix
-    // mask at the DEVICE-DERIVED page ceiling — `MAX_SEGMENT_BYTES / page_bytes`, the most pages one
-    // region of KV can hold, read back from the rung's own placement — so a request deeper than that
-    // makes the fold read mask blocks the host never staged: zero bytes, VALID in an additive mask,
-    // and the row answers with one EOS token. A loud refusal is a bug report; a collapse is a wrong
-    // answer that reads as fluent.
-    let want = match sb.mask_reach() {
-        // `None` (no rung's layout readable) keeps the prior behaviour rather than refusing on a
-        // number we do not have — the per-launch `MaskBlocks::fits` check holds the same `None`
-        // semantics.
-        None => RowPages::holding(span),
-        Some(cap) => RowPages::holding(span).within_mask_reach(cap).ok_or_else(|| {
-            werr(format!(
-                "superdsc paged: request needs {} slot(s) = {} page(s) but a row may hold at most \
-                 {} page(s). That ceiling is the PREFIX MASK's, not the pool's: the rungs bake {} \
-                 mask block(s) — one per page, derived from the device (one region of KV over this \
-                 model's page bytes) — so a deeper row's fold would read mask bytes the host never \
-                 staged. The pool cannot out-run one region; serve a shorter context, fewer launch \
-                 rows, or a denser page (fp8 KV).",
-                span.get(),
-                RowPages::holding(span).get(),
-                cap.get(),
-                cap.get(),
-            ))
-        })?,
-    };
-    // ⭐ AND THE MAP MUST BE BUILDABLE — the host's blocks at the logical pages this request holds keys in,
-    // one shared scratch page for the fully-masked ones. `None` now means only one thing: the host granted
-    // fewer blocks than those pages need.
-    //
-    // ⛔ THE MESSAGE NO LONGER OFFERS `HOLE_PAGES_PER_ROW` AS THE REMEDY, because there is no reserve to
-    // raise. This is a DISAGREEMENT between the scheduler's allocation and the launch's page count, and the
-    // scheduler's rule is `KvSlotSpan::blocks_this_step` = own pages + one for the shared write page.
-    if req.page_map(ctx, want).is_none() {
-        return Err(werr(format!(
-            "superdsc paged: cannot map {} slot(s) = {} page(s): the host granted {} block(s). THE SLOT \
-             COUNT IS AUTHORITATIVE — it is the slot this launch is about to write, so the shortfall is in \
-             the host's allocation (`KvSlotSpan::blocks_this_step` = own pages + ONE for the batch's shared \
-             write page) and not in what the worker reported. Look first at what aged the span the \
-             allocation was sized from (`KvExtent::span_now`, `Request::kv_inflight_slots`)",
-            span.get(),
-            want.get(),
-            ctx.host.len(),
-        )));
-    }
-    Ok(())
-}
-
-/// ⭐ EVERYTHING NEEDED TO DERIVE ONE REQUEST'S PAGE MAP, as a single borrowed value: the host's block
-/// list — borrowed from [`InputBatch`], the ONE store — and the pool's owner split.
-///
-/// One parameter rather than two because they are only ever correct TOGETHER: `map_row` bounds every host
-/// id by `part.host_blocks()`, so a list from one pool checked against another partition would admit an id
-/// that names a reserved hole page. Threading them separately is what lets those two drift.
-#[cfg(feature = "spyre-hw")]
-#[derive(Clone, Copy)]
-pub(crate) struct PageMapCtx<'a> {
-    /// The scheduler's block ids for this request, block `j` = its TOKEN page `j`.
-    pub(crate) host: &'a [usize],
-    pub(crate) part: PoolPartition,
-}
-
-/// THE POOL'S OWNER SPLIT for the loaded bundle: which pages the host allocates from, and which back the
-/// batched write's hole. One derivation, so the count reported to the host
-/// (`kv_cache_num_blocks_override`) and the bound `map_row` checks ids against cannot disagree.
-#[cfg(feature = "spyre-hw")]
-pub(crate) fn pool_partition(sb: &SuperDscBundle) -> ExecutorResult<PoolPartition> {
-    let pool = PoolPages::of_pool(sb.pool_pages)
-        .ok_or_else(|| werr("superdsc paged: the pool has no pages — nothing can be served"))?;
-    PoolPartition::of_pool(pool, sb.pool_rows).ok_or_else(|| {
-        werr(format!(
-            "superdsc paged: a {}-page pool cannot serve {} launch row(s): the pool reserves {} shared \
-             scratch page and the host still needs a page per row. Give the pool a bigger memory budget, or \
-             bake a narrower decode ladder",
-            sb.pool_pages,
-            sb.pool_rows.get().get(),
-            PoolPartition::reserve(),
-        ))
-    })
-}
-
-/// ⛔ THE SOLO PAGE BIND IS GONE WITH THE SOLO FORWARD: `bind_request_pages` bound the
-/// one-request session's map at the request's own history, and the solo m=1 arm that
-/// called it is DELETED — a generation step is a batch of one on the decode OWNER
-/// through the shared decode path, whose page map is installed per launch slot
-/// (`bind_launch_slot`). A prefill chunk's pages bind through [`bind_chunk_pages`]
-/// below, which covers every page a wider window writes.
-///
-/// Point a PREFILL CHUNK's session at the pages it reads AND every page it writes — `write` is the run
-/// the chunk is about to write ([`ChunkStart::wrote`](scratchy_subtile::sdsc_abstract::ChunkStart::wrote)).
-///
-/// A chunk of at most one page writes only the page holding the history's next slot.
-/// A wider window's cache write is cut into page parts, each resolving its own page
-/// through this map, so each of those pages needs a host block of its own — and a part
-/// whose page lies past the chunk's last real row finds none and is skipped by the launch.
-#[cfg(feature = "spyre-hw")]
-pub(crate) fn bind_chunk_pages(
-    session: &mut SuperDscSession,
-    req: &ReqState,
-    write: scratchy_subtile::sdsc_abstract::ChunkWrite,
-    ctx: PageMapCtx<'_>,
-) -> ExecutorResult<()> {
-    if !session.is_paged() {
-        return Ok(());
-    }
-    let at = scratchy_subtile::sdsc_abstract::BatchSlot::solo(&req.kv_hist);
-    let map = req.chunk_page_map(ctx, write).ok_or_else(|| {
-        werr(format!(
-            "superdsc paged: cannot map the pages a prefill chunk writes ({:?}): the host granted {} \
-             block(s). Every page the chunk writes must be a host block — the scheduler allocates this \
-             step's tokens' pages, which hold every real row of every chunk of the step",
-            write.run(),
-            ctx.host.len(),
-        ))
-    })?;
-    session
-        .set_block_table(
-            scratchy_target_spyre::fold_plan::LaunchSlotIdx::of_launch(
-                LaunchSlot::solo().index() as i64
-            ),
-            i64::from(at.get()),
-            &map.as_i64(),
-        )
-        .map_err(|e| werr(format!("superdsc paged: set_block_table: {e}")))
-}
-
-/// Install ONE LAUNCH SLOT: which pool row it addresses, which pages, and the KV slot it writes at.
-///
-/// The row is passed rather than read off a request because a launch has slots a request does not own —
-/// a rung is the smallest baked width holding the live count, so the tail is padding — and the baked
-/// addressing gives slot `i` row `row0 + i` whether or not anyone lives there. Installing what the
-/// bundle actually does is what lets `fold_plan::LaunchPages` see a single stride and collapse the
-/// fold's passes; installing live 0's row for the padding made the row list `row0, row0+1, …, row0`,
-/// which admits no stride and refuses the collapse with no symptom but the missing speed.
-#[cfg(feature = "spyre-hw")]
 /// EVERY PRINT-ONLY FLAG THIS FILE READS ON A PER-STEP OR PER-LAUNCH PATH, RESOLVED ONCE PER PROCESS.
 ///
-/// ⛔⛔⛔ `std::env::var_os` LOCKS THE ENVIRONMENT AND WALKS IT, and these sit in the page-map
-/// installs (per
-/// request per step), `run_prefill_batch` (per prefill chunk AND per batched decode step — six of them) and
-/// `superdsc_forward_chunk`. That is ~10 environment walks per token here, on top of the hundreds
-/// `fold_plan::reps` and `trace_pass` were doing per op and per pass. Host time paid every token to answer a
-/// question whose answer cannot change: nothing mutates the environment mid-run.
+/// ⛔⛔⛔ `std::env::var_os` LOCKS THE ENVIRONMENT AND WALKS IT, and these sit on the launch path — per
+/// prefill chunk and per decode step. Host time paid every token to answer a question whose answer
+/// cannot change: nothing mutates the environment mid-run.
 ///
-/// ⭐ `superdsc_exec::Diag` ALREADY DID EXACTLY THIS (one `OnceLock`, ten flags) — these two files were the
-/// outliers, and both are on the path the C++ shim used to own. The port made every token pay for its traces.
-/// An instrument may print; it must not cost. See [[never-env-gates-no-reward-hacking]].
-// ⛔ `sendnn`-ONLY, restored from 8bd5c755b. My branch was cut BEFORE that commit added
-// these gates, and resolving the rebase conflict in favour of the split took the whole
-// file — which discarded them. They are what makes the KTIR-only build compile.
+/// ⭐ `superdsc_exec::Diag` ALREADY DID EXACTLY THIS (one `OnceLock`, ten flags). An instrument may
+/// print; it must not cost.
 #[cfg(feature = "spyre-hw")]
 pub(crate) struct Flags {
     pub(crate) phase_time: bool,
-    // ⛔ NO `timing` ANY MORE: its only reader was the SOLO step-timing line, and the
-    // solo arm is deleted — a step's host segments now land in `step_segs`, whose
-    // print gate is `--bench` in the CLI, never an env var. A flag nothing reads is
-    // a lie about what the program can do.
 }
 
-// ⛔ `sendnn`-ONLY, restored from 8bd5c755b. My branch was cut BEFORE that commit added
-// these gates, and resolving the rebase conflict in favour of the split took the whole
-// file — which discarded them. They are what makes the KTIR-only build compile.
 #[cfg(feature = "spyre-hw")]
 pub(crate) fn flags() -> &'static Flags {
     static F: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
@@ -269,45 +33,6 @@ pub(crate) fn flags() -> &'static Flags {
             phase_time: on("SCRATCHY_SDSC_PHASE_TIME"),
         }
     })
-}
-
-// ⛔ `sendnn`-ONLY, restored from 8bd5c755b. My branch was cut BEFORE that commit added
-// these gates, and resolving the rebase conflict in favour of the split took the whole
-// file — which discarded them. They are what makes the KTIR-only build compile.
-#[cfg(feature = "spyre-hw")]
-pub(crate) fn bind_launch_slot(
-    session: &mut SuperDscSession,
-    slot: LaunchSlot,
-    at: scratchy_subtile::sdsc_abstract::BatchSlot,
-    // THE MAP THIS LAUNCH BINDS — derived by the caller from the host's list and this row's history
-    // (`ReqState::page_map`), never a stored list.
-    pages: &BlockTable,
-) -> ExecutorResult<()> {
-    // ⛔⛔⛔ THIS TOOK AN `AffineRows` WITNESS, AND IT WAS PROVING SOMETHING NOTHING NEEDED.
-    //
-    // The argument existed so a caller could not reach this function without having shown the batch's KV rows
-    // were CONSECUTIVE (`kv_rows[0] + i`), and the row it derived was then used for... the page trace below.
-    // `set_block_table` takes a launch slot, a write slot and a page list; it has never taken a row. With the
-    // reserve gone there are no rows at all, so the witness, the consecutiveness proof and the
-    // "N live request(s) do not hold consecutive KV rows — decoding them one at a time" fallback go together.
-    if !session.is_paged() {
-        return Ok(());
-    }
-    if pages.is_empty() {
-        return Err(werr(
-            "superdsc paged: launch slot has no pages — the scheduler's block table must be installed \
-             before the first forward (an empty map would address another request's KV)"
-                .to_string(),
-        ));
-    }
-    let pages: Vec<i64> = pages.as_i64();
-    session
-        .set_block_table(
-            scratchy_target_spyre::fold_plan::LaunchSlotIdx::of_launch(slot.index() as i64),
-            i64::from(at.get()),
-            &pages,
-        )
-        .map_err(|e| werr(format!("superdsc paged: set_block_table: {e}")))
 }
 
 /// Index of the SMALLEST prefill rung that can hold `real` query rows. `rungs` is ascending, and the
@@ -330,10 +55,7 @@ pub(crate) const SUPERDSC_SENTINEL: &str = "SUPERDSC_BUNDLE:";
 /// NOT produce a DeepTools-compilable sengraph JSON; instead the codegen stamps the
 /// single group's decode-slot `graph_json` with the `SUPERDSC_BUNDLE:<fp>` sentinel
 /// (the dxp bundle is a DIRECTORY of per-supernode dxp blobs + plan, recovered at
-/// load via `bundle_code::bundle(fp)`). This MUST be checked BEFORE
-/// [`is_superdsc_bundle`]: the sentinel is not a
-/// real graph, so those predicates' `PagedAttn` / `prefill==decode` substring tests
-/// would misclassify it (e.g. default-mode also has one group with prefill==decode).
+/// load via `bundle_code::bundle(fp)`).
 #[cfg(feature = "spyre-hw")]
 pub(crate) fn is_superdsc_bundle(bundle: &SengraphBundle) -> bool {
     bundle.groups.len() == 1

@@ -34,12 +34,12 @@
 //! branch, unchanged, reached from facts the KTIR states — and the fp8 arm below calls it.
 
 use super::{
-    EmittedOp, In, assemble_convert, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d,
-    bmm_site, check_pointwise_cols, check_pointwise_cols_df, emit_sdsc_tiled, fl, op_func_from_str,
+    EmittedOp, In, assemble_convert, assemble_pointwise_broadcast_off, bmm_site,
+    check_pointwise_cols, check_pointwise_cols_df, emit_sdsc_tiled, fl, op_func_from_str,
     pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
-    assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
+    assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
@@ -49,10 +49,7 @@ use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::ktir_node::{Elementwise, KtirNode};
 use crate::place::{PlaceId, SynthRole};
 use crate::placement::{BundleLayout, syn};
-use crate::reserved_tids::{
-    ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_ZERO_TID, LAST_HIDDEN_TID, kct_resident_tid,
-    scalarmul_scale_tid,
-};
+use crate::reserved_tids::{LAST_HIDDEN_TID, scalarmul_scale_tid};
 use crate::sdsc_abstract::{KernelTag, Stk};
 use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{
@@ -242,7 +239,35 @@ pub struct Gather {
     /// reads: a TID comparison cannot prove it (a plain load of the same table resolves to the
     /// same tid), the load's own SSA can.
     pub load: Ssa,
+    /// ⭐ WHEN THE RUN'S POSITION IS ITSELF READ THROUGH A TABLE — spyre-inference's decode gather
+    /// `k_pages[kv_row_pool.index_select(0, page_index[0, 0:1])]`: the index view is `kv_row_pool`
+    /// and the run starts at `page · scale`, `page` read from the page table. `None` for a run whose
+    /// start is a constant ([`Gather::first_entry`]).
+    pub via: Option<ChainedIndex>,
 }
+
+/// ⭐ A CHAINED INDEX — a gather's run of index words starts at `position · scale`, the position read
+/// from entry `via_entry` of `via_tid`. The card runs it as the two gathers it is: one entry of the
+/// index table (the run, [`INDEX_RUN_WORDS`] per position) copied through `via_tid` into a scratch,
+/// then the gather through the scratch — the two device ops torch-spyre runs for the same two
+/// subscripts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainedIndex {
+    /// The parameter the position is read from.
+    pub via_tid: u32,
+    /// The entry of `via_tid` holding the position.
+    pub via_entry: crate::superdsc_opspec::EntryBase,
+    /// Index words per position: position `p`'s run is the words `p · scale ..`.
+    pub scale: u32,
+}
+
+/// ⭐ THE CARD WIDTH OF ONE POSITION'S INDEX RUN, in int32 words — what a chained index's first
+/// gather copies per position ([`index_run_gather`]), and so the pitch the index table holds each
+/// position's run at on the card. The copy is `zero + run` (dxp binds no int32 `identity`) against
+/// the host-staged zero stick ([`PAGED_INT32_ZERO_TID`](crate::reserved_tids::PAGED_INT32_ZERO_TID)),
+/// at the 64-element device width the int32 ops mint at (one 32-word stick does not): two SENUINT32
+/// sticks, the run's words in the first.
+pub const INDEX_RUN_WORDS: u32 = crate::work::FP16_ELEMS_PER_STICK;
 
 /// [`Gather`] for this program, or `None` when it states no indirect access.
 ///
@@ -303,50 +328,18 @@ pub fn gather_of(k: &KtirNode) -> Result<Option<Gather>, Error> {
 pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
     let f = &k.func;
     let consts = index_constants(&k.func);
+    // A tile a `ktdp.store` writes THROUGH is a SCATTER ([`scatters_of`]), not a gather: its rows
+    // are a destination, and no load reads them.
     let tiles: Vec<&Operation<'_>> = f
         .operations
         .iter()
-        .filter(|o| o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+        .filter(|o| {
+            o.op_type == OpKind::KtdpConstructIndirectAccessTile && !stored_through(f, o.result)
+        })
         .collect();
     let mut out: Vec<Gather> = Vec::with_capacity(tiles.len());
     for tile in &tiles {
-        // The SAME param walk `gather_of` runs, per tile — a closure over this tile's operands so
-        // the two readings cannot disagree about which parameter a tile's view names.
-        let param_tid = |slot: usize, what: &str| -> Result<u32, Error> {
-            let view_v = tile.operands.get(slot).copied().ok_or_else(|| Error {
-                message: format!(
-                    "{}: the indirect access tile states no {what} operand — a gather needs both the \
-                     tensor it reads and the index vector that chooses the rows",
-                    f.name
-                ),
-            })?;
-            let view = f
-                .operations
-                .iter()
-                .find(|o| o.result == Some(view_v) && o.op_type == OpKind::KtdpConstructMemoryView)
-                .ok_or_else(|| Error {
-                    message: format!(
-                        "{}: the indirect access tile's {what} operand is not a \
-                         `ktdp.construct_memory_view`, so no parameter can be named for it",
-                        f.name
-                    ),
-                })?;
-            let ptr = view.operands.first().copied();
-            let i = f
-                .arguments
-                .iter()
-                .position(|(a, _)| Some(*a) == ptr)
-                .ok_or_else(|| Error {
-                    message: format!(
-                        "{}: the indirect access tile's {what} view does not reinterpret a PARAMETER, \
-                         so the buffer it names has no binding and no placement",
-                        f.name
-                    ),
-                })?;
-            k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
-                message: format!("{}: parameter {i} has no bound buffer", f.name),
-            })
-        };
+        let param_tid = |slot: usize, what: &str| indirect_tile_param(k, tile, slot, what);
         let value_tid = param_tid(0, "gathered")?;
         let index_tid = param_tid(1, "index")?;
         if value_tid == index_tid {
@@ -372,76 +365,17 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
         // resolves); an unrolled sweep's trip `b` states `b · BLOCK_N`, and this walk refuses a
         // tile whose anchor is NOT a constant by name rather than gathering from index word 0 —
         // the silent wrong-row shape `EntryBase` exists to make unrepresentable at the emitter.
-        let first_entry = {
-            let kinds = tile.attr(AttrKey::DimKinds);
-            let vars = tile.attr(AttrKey::IntermediateVars);
-            let subs = tile.attr(AttrKey::DimSubs);
-            let (
-                Some(Attr::StrList(kinds)),
-                Some(Attr::Ssas(vars)),
-                Some(Attr::AffineMapList(subs)),
-            ) = (kinds, vars, subs)
-            else {
-                return err(format!(
-                    "{}: an indirect access tile states no `dim_kinds`/`intermediate_vars`/`dim_subs` \
-                     triple, so where its run of entries starts in the index buffer is unknown — the \
-                     gather would read index word 0 by default",
-                    f.name
-                ));
-            };
-            let Some(d) = kinds.iter().position(|k| *k == "indirect") else {
-                return err(format!(
-                    "{}: an indirect access tile states no `indirect` dim, so no subscript names the \
-                     index buffer it reads",
-                    f.name
-                ));
-            };
-            let Some(sub) = subs.get(d) else {
-                return err(format!(
-                    "{}: the indirect access tile's dim {d} carries no `dim_subs` map",
-                    f.name
-                ));
-            };
-            // ⛔ THE SUBSCRIPT MUST BE `Sym(0) + Dim(0)` AND NOTHING ELSE — the one form
-            // `gather_subscripts` builds and the one this reading can fold into an entry base. A
-            // tile with a scaled or second-symbol subscript names a different addressing program,
-            // and guessing its constant is an address; refusing names the map.
-            let anchor = match sub.exprs.first() {
-                Some(AffineExpr::Add(a, b)) => match (a, b) {
-                    (AffineExpr::Sym(i), AffineExpr::Dim(j)) if *i < vars.len() && *j == 0 => {
-                        consts.get(&vars[*i]).copied()
-                    }
-                    (AffineExpr::Dim(j), AffineExpr::Sym(i)) if *i < vars.len() && *j == 0 => {
-                        consts.get(&vars[*i]).copied()
-                    }
-                    _ => None,
-                },
-                Some(AffineExpr::Dim(j)) if *j == 0 => Some(0),
-                _ => None,
-            };
-            let Some(anchor) = anchor else {
-                return err(format!(
-                    "{}: the indirect access tile's subscript for dim {d} is not the form this \
-                     reader folds (`Sym(0) + Dim(0)` with `Sym(0)` a constant, or a bare `Dim(0)`), so \
-                     where this gather's entries start in the index buffer is unknown — the gather \
-                     would read index word 0 by default. State the trip's anchor as a constant.",
-                    f.name
-                ));
-            };
-            if anchor < 0 || anchor > u32::MAX as i64 {
-                return err(format!(
-                    "{}: the indirect access tile's index anchor is {anchor}, which is not a u32 \
-                     entry count",
-                    f.name
-                ));
-            }
-            // The constructor IS the stick-alignment check (issue 201 item 1): an anchor that is
-            // not a whole `SenUint32` stick into the index buffer refuses HERE, at the walk,
-            // before any descriptor exists — on both the uncut and the cut arm.
-            crate::superdsc_opspec::EntryBase::of_entries(anchor as u32).map_err(|msg| Error {
-                message: format!("{}: {msg}", f.name),
-            })?
+        // The constructor IS the stick-alignment check (issue 201 item 1): an anchor that is
+        // not a whole `SenUint32` stick into the index buffer refuses HERE, at the walk,
+        // before any descriptor exists — on both the uncut and the cut arm.
+        let (anchor, via) = match chained_index_of(k, tile, &consts)? {
+            Some(chain) => (0, Some(chain)),
+            None => (indirect_tile_anchor(k, tile, &consts)?, None),
         };
+        let first_entry =
+            crate::superdsc_opspec::EntryBase::of_entries(anchor).map_err(|msg| Error {
+                message: format!("{}: {msg}", f.name),
+            })?;
         // ⭐ NO CROSS-TILE PAIR CHECK — deliberately. The one-index law is per DESCRIPTOR, and the
         // walk below joins each op to its own tile by load identity, so two tiles over different
         // pairs are two descriptors each carrying one index operand — the batched paged-decode
@@ -489,9 +423,846 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
             first_entry,
             tile: tv,
             load,
+            via,
         });
     }
     Ok(out)
+}
+
+/// The parameter an indirect access tile's operand `slot` names — slot 0 is the DATA view (the
+/// tensor read or written through the index), slot 1 the INDEX view — resolved to its bound buffer.
+/// One reading for [`gathers_of`] and [`scatters_of`], so the two cannot disagree about which
+/// parameter a tile's view names.
+fn indirect_tile_param(
+    k: &KtirNode,
+    tile: &Operation<'_>,
+    slot: usize,
+    what: &str,
+) -> Result<u32, Error> {
+    let f = &k.func;
+    let view_v = tile.operands.get(slot).copied().ok_or_else(|| Error {
+        message: format!(
+            "{}: the indirect access tile states no {what} operand — a gather needs both the \
+                 tensor it reads and the index vector that chooses the rows",
+            f.name
+        ),
+    })?;
+    let view = f
+        .operations
+        .iter()
+        .find(|o| o.result == Some(view_v) && o.op_type == OpKind::KtdpConstructMemoryView)
+        .ok_or_else(|| Error {
+            message: format!(
+                "{}: the indirect access tile's {what} operand is not a \
+                     `ktdp.construct_memory_view`, so no parameter can be named for it",
+                f.name
+            ),
+        })?;
+    let ptr = view.operands.first().copied();
+    let i = f
+        .arguments
+        .iter()
+        .position(|(a, _)| Some(*a) == ptr)
+        .ok_or_else(|| Error {
+            message: format!(
+                "{}: the indirect access tile's {what} view does not reinterpret a PARAMETER, \
+                     so the buffer it names has no binding and no placement",
+                f.name
+            ),
+        })?;
+    k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
+        message: format!("{}: parameter {i} has no bound buffer", f.name),
+    })
+}
+
+/// Where an indirect access tile's run of entries starts in its index buffer — the tile's
+/// `Sym(0) + Dim(0)` subscript folded to a constant, in entries. One reading for [`gathers_of`]
+/// (which holds every gather to a stick-aligned start) and [`scatters_of`] (whose per-row stores
+/// coalesce into stick-aligned runs at the emitter, [`paged_kv_write`]).
+fn indirect_tile_anchor(
+    k: &KtirNode,
+    tile: &Operation<'_>,
+    consts: &std::collections::HashMap<Ssa, i64>,
+) -> Result<u32, Error> {
+    let f = &k.func;
+    let kinds = tile.attr(AttrKey::DimKinds);
+    let vars = tile.attr(AttrKey::IntermediateVars);
+    let subs = tile.attr(AttrKey::DimSubs);
+    let (Some(Attr::StrList(kinds)), Some(Attr::Ssas(vars)), Some(Attr::AffineMapList(subs))) =
+        (kinds, vars, subs)
+    else {
+        return err(format!(
+            "{}: an indirect access tile states no `dim_kinds`/`intermediate_vars`/`dim_subs` \
+                 triple, so where its run of entries starts in the index buffer is unknown — the \
+                 gather would read index word 0 by default",
+            f.name
+        ));
+    };
+    let Some(d) = kinds.iter().position(|k| *k == "indirect") else {
+        return err(format!(
+            "{}: an indirect access tile states no `indirect` dim, so no subscript names the \
+                 index buffer it reads",
+            f.name
+        ));
+    };
+    let Some(sub) = subs.get(d) else {
+        return err(format!(
+            "{}: the indirect access tile's dim {d} carries no `dim_subs` map",
+            f.name
+        ));
+    };
+    // ⛔ THE SUBSCRIPT MUST BE `Sym(0) + Dim(0)` AND NOTHING ELSE — the one form
+    // `gather_subscripts` builds and the one this reading can fold into an entry base. A
+    // tile with a scaled or second-symbol subscript names a different addressing program,
+    // and guessing its constant is an address; refusing names the map.
+    let anchor = match sub.exprs.first() {
+        Some(AffineExpr::Add(a, b)) => match (a, b) {
+            (AffineExpr::Sym(i), AffineExpr::Dim(j)) if *i < vars.len() && *j == 0 => {
+                consts.get(&vars[*i]).copied()
+            }
+            (AffineExpr::Dim(j), AffineExpr::Sym(i)) if *i < vars.len() && *j == 0 => {
+                consts.get(&vars[*i]).copied()
+            }
+            _ => None,
+        },
+        Some(AffineExpr::Dim(j)) if *j == 0 => Some(0),
+        _ => None,
+    };
+    let Some(anchor) = anchor else {
+        return err(format!(
+            "{}: the indirect access tile's subscript for dim {d} is not the form this \
+                 reader folds (`Sym(0) + Dim(0)` with `Sym(0)` a constant, or a bare `Dim(0)`), so \
+                 where this gather's entries start in the index buffer is unknown — the gather \
+                 would read index word 0 by default. State the trip's anchor as a constant.",
+            f.name
+        ));
+    };
+    if anchor < 0 || anchor > u32::MAX as i64 {
+        return err(format!(
+            "{}: the indirect access tile's index anchor is {anchor}, which is not a u32 \
+                 entry count",
+            f.name
+        ));
+    }
+    Ok(anchor as u32)
+}
+
+/// ⭐ THE CHAINED INDEX an indirect tile states, if its run starts at a position read from a table:
+/// the indirect dim's `Sym(0) + Dim(0)` subscript with `Sym(0)` the value
+///
+/// ```text
+///   index_cast( muli( tensor.extract( ktdp.load( construct_access_tile %table[c] ) ), scale ) )
+/// ```
+///
+/// (`muli` absent at scale 1), `c` a constant entry of the table's view. `None` when the subscript's
+/// symbol is a constant or not this chain — [`indirect_tile_anchor`] then reads it, and names any
+/// other form.
+fn chained_index_of(
+    k: &KtirNode,
+    tile: &Operation<'_>,
+    consts: &std::collections::HashMap<Ssa, i64>,
+) -> Result<Option<ChainedIndex>, Error> {
+    let f = &k.func;
+    let (Some(Attr::StrList(kinds)), Some(Attr::Ssas(vars)), Some(Attr::AffineMapList(subs))) = (
+        tile.attr(AttrKey::DimKinds),
+        tile.attr(AttrKey::IntermediateVars),
+        tile.attr(AttrKey::DimSubs),
+    ) else {
+        return Ok(None);
+    };
+    let Some(d) = kinds.iter().position(|k| *k == "indirect") else {
+        return Ok(None);
+    };
+    let sym = match subs.get(d).and_then(|m| m.exprs.first()) {
+        Some(AffineExpr::Add(a, b)) => match (a, b) {
+            (AffineExpr::Sym(i), AffineExpr::Dim(0)) | (AffineExpr::Dim(0), AffineExpr::Sym(i)) => {
+                vars.get(*i).copied()
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(sym) = sym.filter(|v| !consts.contains_key(v)) else {
+        return Ok(None);
+    };
+    let def = |v: Ssa| f.operations.iter().find(|o| o.result == Some(v));
+    let Some(cast) = def(sym).filter(|o| o.op_type == OpKind::ArithIndexCast) else {
+        return Ok(None);
+    };
+    let Some(mut v) = cast.operands.first().copied() else {
+        return Ok(None);
+    };
+    let mut scale = 1i64;
+    if let Some(mul) = def(v).filter(|o| o.op_type == OpKind::ArithMuli) {
+        let (Some(&a), Some(&b)) = (mul.operands.first(), mul.operands.get(1)) else {
+            return Ok(None);
+        };
+        let (x, c) = match (consts.get(&a), consts.get(&b)) {
+            (_, Some(&c)) => (a, c),
+            (Some(&c), _) => (b, c),
+            _ => return Ok(None),
+        };
+        scale = c;
+        v = x;
+    }
+    let Some(extract) = def(v).filter(|o| o.op_type == OpKind::TensorExtract) else {
+        return Ok(None);
+    };
+    let Some(load) = extract
+        .operands
+        .first()
+        .and_then(|&l| def(l))
+        .filter(|o| o.op_type == OpKind::KtdpLoad)
+    else {
+        return Ok(None);
+    };
+    let Some(read) = load
+        .operands
+        .first()
+        .and_then(|&t| def(t))
+        .filter(|o| o.op_type == OpKind::KtdpConstructAccessTile)
+    else {
+        return Ok(None);
+    };
+    let entry = read.operands.get(1).and_then(|c| consts.get(c)).copied();
+    let Some(entry) = entry.filter(|e| (0..=i64::from(u32::MAX)).contains(e)) else {
+        return err(format!(
+            "{}: a chained gather reads its position from a table entry this walk cannot fold to              a constant, so which entry the card reads it from is unknown",
+            f.name
+        ));
+    };
+    let scale = u32::try_from(scale).ok().filter(|s| (1..=32).contains(s)).ok_or_else(|| Error {
+        message: format!(
+            "{}: a chained gather's run is {scale} index words per position — the card copies a              position's run as ONE int32 stick, so a run must be 1..=32 words",
+            f.name
+        ),
+    })?;
+    let via_tid = indirect_tile_param(k, read, 0, "position table")?;
+    let via_entry =
+        crate::superdsc_opspec::EntryBase::of_entries(entry as u32).map_err(|msg| Error {
+            message: format!("{}: the chained gather's position entry: {msg}", f.name),
+        })?;
+    Ok(Some(ChainedIndex {
+        via_tid,
+        via_entry,
+        scale,
+    }))
+}
+
+/// ⭐ A ROW SCATTER OF A COMPUTED VALUE — `entries` rows written to the rows of `value_tid` that
+/// `index_tid` names from `first_entry` on, each `cols` wide (spyre-inference's
+/// `out.index_copy_(0, query_row_index, attn)`).
+#[derive(Clone, Copy, Debug)]
+pub struct RowScatter {
+    pub index_tid: u32,
+    pub value_tid: u32,
+    pub entries: u32,
+    pub first_entry: crate::superdsc_opspec::EntryBase,
+    pub cols: u32,
+    /// The destination view's rows — its stick columns sit this many sticks apart.
+    pub value_rows: u32,
+}
+
+/// The [`RowScatter`] an indirect store tile states.
+pub fn row_scatter_of(k: &KtirNode, tile: &Operation<'_>) -> Result<RowScatter, Error> {
+    let f = &k.func;
+    let consts = index_constants(f);
+    let value_tid = indirect_tile_param(k, tile, 0, "scattered")?;
+    let index_tid = indirect_tile_param(k, tile, 1, "index")?;
+    let (entries, cols) = shape_2d(tile).ok_or_else(|| Error {
+        message: format!(
+            "{}: the scatter's indirect tile states no 2-D `shape`, so how many rows it writes is \
+             unknown",
+            f.name
+        ),
+    })?;
+    let first_entry =
+        crate::superdsc_opspec::EntryBase::of_entries(indirect_tile_anchor(k, tile, &consts)?)
+            .map_err(|msg| Error {
+                message: format!("{}: {msg}", f.name),
+            })?;
+    let value_rows = tile
+        .operands
+        .first()
+        .and_then(|&v| f.operations.iter().find(|o| o.result == Some(v)))
+        .and_then(|v| v.result_type)
+        .and_then(|t| t.dims())
+        .and_then(|d| d.first().copied())
+        .ok_or_else(|| Error {
+            message: format!(
+                "{}: the scatter's destination view states no rows, so where its stick columns \
+                 sit is unknown",
+                f.name
+            ),
+        })? as u32;
+    Ok(RowScatter {
+        index_tid,
+        value_tid,
+        entries,
+        first_entry,
+        cols,
+        value_rows,
+    })
+}
+
+/// ⭐ ONE STICK COLUMN AT A TIME — how rows of a stick-major `[a_rows, cols]` buffer move through an
+/// index into (or out of) a stick-major `[b_rows, cols]` one. Stick column `j` of row `r` sits at
+/// `(j · rows + r) · stick`, so a row's sticks are `rows` sticks apart and no index entry names a
+/// whole row; column `j`'s sticks are one contiguous run, so each column moves as its own copy, one
+/// stick per entry, from each side's own column base. When both sides are ONE row, the row is one
+/// contiguous run on both and moves whole. `(a base, b base, sticks per entry)` per copy, in
+/// elements.
+/// ⭐ THE RUNS OF INDEX ENTRIES ONE GATHER OR SCATTER EACH SERVES — `(first, count)` over `entries`:
+/// as many as one op's cores read, each core one stick of the table
+/// ([`crate::work::index_core_split`]), torch-spyre's own 512-entry query gather. A run starts on a
+/// stick, and a run no split divides is cut at its last whole stick.
+pub fn index_runs(entries: u32) -> Vec<(u32, u32)> {
+    let stick = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    let most = stick * crate::superdsc_opspec::MAX_CORES;
+    let mut runs = Vec::new();
+    let mut first = 0;
+    while first < entries {
+        let left = entries - first;
+        let n = if left >= most {
+            most
+        } else if crate::work::index_core_split(left, crate::superdsc_opspec::MAX_CORES, stick)
+            .is_some()
+        {
+            left
+        } else {
+            left - left % stick
+        };
+        runs.push((first, n));
+        first += n;
+    }
+    runs
+}
+
+fn stick_columns(a_rows: u32, b_rows: u32, cols: u32) -> Vec<(u32, u32, u32)> {
+    let stick = Fp16::ELEMS_PER_STICK;
+    if a_rows == 1 && b_rows == 1 {
+        return vec![(0, 0, cols / stick)];
+    }
+    (0..cols / stick)
+        .map(|j| (j * a_rows * stick, j * b_rows * stick, 1))
+        .collect()
+}
+
+/// [`RowScatter`]'s card form: the stick-major `[entries, cols]` rows of `src` written through the
+/// index onto the stick-major destination's rows ([`stick_columns`]), one scatter per stick column and
+/// per 32 index entries — the same scatter a parameter's rows take ([`load_scatters`]).
+pub fn row_scatter(
+    name: &str,
+    src: &Region,
+    sc: RowScatter,
+    dst_rows: u32,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let stick = Fp16::ELEMS_PER_STICK;
+    if sc.cols == 0 || !sc.cols.is_multiple_of(stick) {
+        return err(format!(
+            "{name}: a scatter of {}-wide rows — a scattered row is a whole number of \
+             {stick}-element sticks",
+            sc.cols
+        ));
+    }
+    if (src.v_rows, src.v_cols) != (sc.entries, sc.cols) {
+        return err(format!(
+            "{name}: the scattered value is `[{}, {}]` and the store writes {} rows of {}",
+            src.v_rows, src.v_cols, sc.entries, sc.cols
+        ));
+    }
+    let (src_name, dst_name, index_name) = (
+        src.name(),
+        crate::place::act_name(sc.value_tid),
+        crate::place::act_name(sc.index_tid),
+    );
+    let mut ops = Vec::new();
+    for (c, (src_base, dst_base, page_sticks)) in stick_columns(sc.entries, dst_rows, sc.cols)
+        .into_iter()
+        .enumerate()
+    {
+        let page = crate::superdsc_opspec::PageExtent::of_positions(page_sticks);
+        for (i, (first, entries)) in index_runs(sc.entries).into_iter().enumerate() {
+            let base =
+                crate::superdsc_opspec::EntryBase::of_entries(sc.first_entry.entries() + first)
+                    .map_err(|message| Error {
+                        message: format!("{name}: {message}"),
+                    })?;
+            let scatter = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                index_name.clone(),
+                page,
+                base,
+            );
+            let op = crate::ir::bridge::tiled_op_sdsc_op::assemble_scatter_copy(
+                &format!("scatter{c}_{i}_o{}", sc.value_tid),
+                &src_name,
+                &dst_name,
+                scatter,
+                crate::ir::bridge::tiled_op_sdsc_op::ScatterCopySpec {
+                    rows: entries * page_sticks,
+                    cols: stick,
+                    df: Df::Fp16,
+                    src_elems: src_base + first * page_sticks * stick,
+                    dst_elems: dst_base,
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error { message })?;
+            ops.push(op);
+        }
+    }
+    Ok(ops)
+}
+
+/// ⭐ A ROW GATHER FROM A STICK-MAJOR TABLE — `g.entries` rows of the `[table_rows, cols]` table
+/// through the index, landed stick-major `[g.entries, cols]` in `out` ([`stick_columns`]): one gather
+/// per stick column and per 32 index entries, each moving one stick per entry from the column's own
+/// base (spyre-inference's `query.index_select(0, query_row_index)`).
+pub fn row_gather(
+    name: &str,
+    g: &Gather,
+    table_rows: u32,
+    cols: u32,
+    out: &Region,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::{
+        GatheredWords, PageGatherRows, assemble_page_gather_copy,
+    };
+    let stick = Fp16::ELEMS_PER_STICK;
+    if cols == 0 || !cols.is_multiple_of(stick) || (out.v_rows, out.v_cols) != (g.entries, cols) {
+        return err(format!(
+            "{name}: a gather of {} {cols}-wide rows into t{} `[{}, {}]` — a gathered row is a whole \
+             number of {stick}-element sticks, landed at its own shape",
+            g.entries, out.tid, out.v_rows, out.v_cols
+        ));
+    }
+    let mut ops = Vec::new();
+    for (c, (src_base, dst_base, page_sticks)) in stick_columns(table_rows, g.entries, cols)
+        .into_iter()
+        .enumerate()
+    {
+        for (i, (first, entries)) in index_runs(g.entries).into_iter().enumerate() {
+            let base =
+                crate::superdsc_opspec::EntryBase::of_entries(g.first_entry.entries() + first)
+                    .map_err(|message| Error {
+                        message: format!("{name}: {message}"),
+                    })?;
+            let gather = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                crate::place::act_name(g.index_tid),
+                crate::superdsc_opspec::PageExtent::of_positions(page_sticks),
+                base,
+            );
+            let op = assemble_page_gather_copy(
+                &format!("gather{c}_{i}_o{}", out.tid),
+                &crate::place::act_name(g.value_tid),
+                &out.name(),
+                gather,
+                PageGatherRows {
+                    rows: entries * page_sticks,
+                    words: GatheredWords::Fp16,
+                    src_elems: src_base,
+                    dst_elems: dst_base + first * page_sticks * stick,
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error {
+                message: format!("{name}: {message}"),
+            })?;
+            ops.push(op);
+        }
+    }
+    Ok(ops)
+}
+
+/// Whether a `ktdp.store` writes THROUGH the value `tile` — the tile is then a scatter's destination.
+fn stored_through(f: &IRFunction<'static>, tile: Option<Ssa>) -> bool {
+    tile.is_some_and(|t| {
+        f.operations
+            .iter()
+            .any(|o| o.op_type == OpKind::KtdpStore && o.operands.get(1) == Some(&t))
+    })
+}
+
+/// ⭐⭐⭐ A PARAMETER'S ROWS SCATTERED — a `ktdp.store` of a `ktdp.load` through a
+/// `ktdp.construct_indirect_access_tile`: rows of [`Scatter::src_tid`] written to the rows of
+/// [`Scatter::value_tid`] that [`Scatter::index_tid`] names. The mirror of [`Gather`], read off the
+/// same tile operands (slot 0 the destination's view, slot 1 the index's). A store of a COMPUTED
+/// value through an indirect tile is that op's own scatter ([`RowScatter`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Scatter {
+    /// The parameter holding the row index of every written row.
+    pub index_tid: u32,
+    /// The parameter written THROUGH the index.
+    pub value_tid: u32,
+    /// The parameter the stored rows are loaded from.
+    pub src_tid: u32,
+    /// Rows the store writes: the tile's slow extent, one index entry per row.
+    pub entries: u32,
+    /// Where this store's run of entries starts in the index buffer, in entries — any entry: a
+    /// per-row store writes one row at its own entry, and [`load_scatters`] coalesces the runs.
+    pub first_entry: u32,
+    /// Sticks in one stored row — the tile's width: one at head dim 64, two at 128.
+    pub sticks: u32,
+    /// Where this store's rows start in the source, counted in rows of [`Self::sticks`] sticks. The
+    /// source is stick-major `[rows, cols]` and its stick columns group into rows `sticks` wide, so
+    /// row `r` of the group at column `c` is `(c / (sticks · stick)) · rows + r` — spyre-inference's
+    /// `key[:, h]` row `t` is `h · T + t`, which is where their head-major `kv_write_index` puts its
+    /// entry. At one stick a row it is the source's own stick.
+    pub src_row: u32,
+    /// The stored value — the rows as loaded, which names the scratch a multi-stick run is relaid
+    /// through ([`load_scatters`]).
+    pub value: Ssa,
+}
+
+/// [`Scatter`] for every `ktdp.store` of a `ktdp.load` the program makes through an indirect access
+/// tile.
+pub fn scatters_of(k: &KtirNode) -> Result<Vec<Scatter>, Error> {
+    let f = &k.func;
+    let consts = index_constants(&k.func);
+    let mut out = Vec::new();
+    for store in f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::KtdpStore)
+    {
+        let (Some(&value), Some(&tv)) = (store.operands.first(), store.operands.get(1)) else {
+            continue;
+        };
+        let Some(tile) = f
+            .operations
+            .iter()
+            .find(|o| o.result == Some(tv) && o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+        else {
+            continue;
+        };
+        let value_tid = indirect_tile_param(k, tile, 0, "written")?;
+        let index_tid = indirect_tile_param(k, tile, 1, "index")?;
+        if value_tid == index_tid {
+            return err(format!(
+                "{}: the scatter's index view and the tensor it writes are the SAME parameter \
+                 (t{value_tid}) — one allocation cannot be both the `index_tensor` and the \
+                 `value_tensor` of one pair",
+                f.name
+            ));
+        }
+        let (entries, _) = shape_2d(tile).ok_or_else(|| Error {
+            message: format!(
+                "{}: the scatter's indirect access tile states no 2-D `shape`, so the number of \
+                 written rows is unknown",
+                f.name
+            ),
+        })?;
+        // A parameter's rows: a plain `ktdp.load` over an access tile of the source parameter.
+        // Any other stored value is computed, and its op scatters it.
+        let Some(load) = f
+            .operations
+            .iter()
+            .find(|o| o.result == Some(value) && o.op_type == OpKind::KtdpLoad)
+        else {
+            continue;
+        };
+        let first_entry = indirect_tile_anchor(k, tile, &consts)?;
+        let src_tile_v = load.operands.first().copied();
+        let src_tile = f
+            .operations
+            .iter()
+            .find(|o| o.result == src_tile_v && o.op_type == OpKind::KtdpConstructAccessTile)
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: the scatter's stored rows are not loaded through a plain access tile",
+                    f.name
+                ),
+            })?;
+        let src_view_v = src_tile.operands.first().copied();
+        let src_view = f
+            .operations
+            .iter()
+            .find(|o| o.result == src_view_v && o.op_type == OpKind::KtdpConstructMemoryView)
+            .ok_or_else(|| Error {
+                message: format!("{}: the scatter's source tile reads no memory view", f.name),
+            })?;
+        let ptr = src_view.operands.first().copied();
+        let i = f
+            .arguments
+            .iter()
+            .position(|(a, _)| Some(*a) == ptr)
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: the scatter's source view does not reinterpret a parameter",
+                    f.name
+                ),
+            })?;
+        let src_tid = k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
+            message: format!("{}: parameter {i} has no bound buffer", f.name),
+        })?;
+        let corner = |slot: usize| {
+            src_tile
+                .operands
+                .get(slot)
+                .and_then(|r| consts.get(r).copied())
+                .and_then(|r| u32::try_from(r).ok())
+        };
+        let (Some(src_row), Some(src_col)) = (corner(1), corner(2)) else {
+            return err(format!(
+                "{}: the scatter's source tile states no constant corner, so which source rows it \
+                 writes is unknown",
+                f.name
+            ));
+        };
+        let stick = Fp16::ELEMS_PER_STICK;
+        let view_rows = src_view
+            .result_type
+            .and_then(|t| t.dims())
+            .and_then(|d| d.first().copied())
+            .unwrap_or(0) as u32;
+        let width = shape_2d(src_tile).map_or(0, |(_, c)| c);
+        if width == 0 || !width.is_multiple_of(stick) || !src_col.is_multiple_of(width) {
+            return err(format!(
+                "{}: the scatter's source rows are {width} wide at column {src_col} — a scattered \
+                 row is a whole number of {stick}-element sticks of the source, its own head, at a \
+                 column that is a multiple of its width",
+                f.name
+            ));
+        }
+        out.push(Scatter {
+            index_tid,
+            value_tid,
+            src_tid,
+            entries,
+            first_entry,
+            sticks: width / stick,
+            src_row: (src_col / width) * view_rows + src_row,
+            value,
+        });
+    }
+    Ok(out)
+}
+
+/// One store's share of a scatter run: where its entries start, how many rows it writes, and the
+/// source row it writes first. Ordered by entry, so a run's pieces sort into program order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RunPiece {
+    entry: u32,
+    rows: u32,
+    src_row: u32,
+}
+
+/// The stores of one `(source, destination, table)` triple — one run of rows [`load_scatters`]
+/// cuts into index-stick ops — with the width of their rows and the first store's value.
+struct ScatterRun {
+    key: (u32, u32, u32),
+    sticks: u32,
+    value: Ssa,
+    pieces: Vec<RunPiece>,
+}
+
+/// ⭐⭐⭐ A PARAMETER'S ROWS SCATTERED, ON THE CARD — the program's `ktdp.store`s of loaded rows
+/// through indirect access tiles ([`scatters_of`]) as hardware scatters: every stored row lands in its
+/// destination at the row the index names, through the index registers. Empty when the program
+/// states none. (spyre-inference's `reshape_and_cache_head_major` is nothing else.)
+///
+/// Each stored row is one head's row of the stick-major source: at eight rows or more one store per
+/// head (`k_rows.index_copy_(0, idx, key[:, h])`), one per row below Triton's scatter floor, and row
+/// `t` of `key[:, h]` is the source's row `h · T + t` ([`Scatter::src_row`]). When the index puts that
+/// row at entry `h · T + t` (their head-major `kv_write_index`), source row and index entry advance
+/// together across every store of one (source, destination, table) triple, and the stores COALESCE
+/// into one run: rows `s0..s0 + n` of the source through entries `e0..e0 + n` of the table, cut into
+/// ops of one index stick each ([`assemble_scatter_copy`], the vendor's `test_scatter_1core` shape). A
+/// store that does not continue the run is refused by name: the copy moves source row `s0 + j`
+/// through entry `e0 + j`, and nothing else.
+///
+/// ⭐ A ROW OF SEVERAL STICKS (head dim 128) moves whole, as one entry of that many sticks. The
+/// destination is allocated row-outermost (spyre-inference's `head_major_kv_layout`), so an entry's
+/// sticks are contiguous there; in the stick-major source they are `rows` sticks apart. So the run's
+/// rows are first relaid row-major into a scratch, one stick permute per head (the restickify
+/// torch-spyre's stickification inserts ahead of their `index_copy_`), and the scatter reads entry
+/// `j`'s sticks from the scratch's row `s0 + j`.
+pub fn load_scatters(
+    name: &str,
+    k: &KtirNode,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let scatters = scatters_of(k)?;
+    if scatters.is_empty() {
+        return Ok(Vec::new());
+    }
+    let r = regions(k)?;
+    let region = |tid: u32| -> Result<&Region, Error> {
+        r.iter().find(|x| x.tid == tid).ok_or_else(|| Error {
+            message: format!("{name}: t{tid} is not a parameter of the program"),
+        })
+    };
+    let stick = Fp16::ELEMS_PER_STICK;
+    // Each (source, destination, table) triple in first-store order, with its stores' pieces.
+    let mut runs: Vec<ScatterRun> = Vec::new();
+    for sc in &scatters {
+        let key = (sc.src_tid, sc.value_tid, sc.index_tid);
+        let piece = RunPiece {
+            entry: sc.first_entry,
+            rows: sc.entries,
+            src_row: sc.src_row,
+        };
+        match runs.iter_mut().find(|r| r.key == key) {
+            Some(r) if r.sticks == sc.sticks => r.pieces.push(piece),
+            Some(r) => {
+                return err(format!(
+                    "{name}: stores into t{} write rows of {} and of {} sticks through one table",
+                    sc.value_tid, r.sticks, sc.sticks
+                ));
+            }
+            None => runs.push(ScatterRun {
+                key,
+                sticks: sc.sticks,
+                value: sc.value,
+                pieces: vec![piece],
+            }),
+        }
+    }
+    let mut ops = Vec::new();
+    for ScatterRun {
+        key: (src_tid, dst_tid, index_tid),
+        sticks,
+        value,
+        mut pieces,
+    } in runs
+    {
+        pieces.sort_unstable();
+        let (e0, s0) = pieces
+            .first()
+            .map(|p| (p.entry, p.src_row))
+            .unwrap_or_default();
+        let mut next = e0;
+        for &RunPiece {
+            entry,
+            rows,
+            src_row,
+        } in &pieces
+        {
+            if entry != next || src_row - s0 != entry - e0 {
+                return err(format!(
+                    "{name}: a store writes source rows {src_row}.. through index entries \
+                     {entry}.. where the run so far ends at {next} — the card's scatter copies \
+                     source row `{s0} + j` through entry `{e0} + j`, so the program's stores must \
+                     tile the run in order"
+                ));
+            }
+            next += rows;
+        }
+        let total = next - e0;
+        let (src, dst, index) = (region(src_tid)?, region(dst_tid)?, region(index_tid)?);
+        let width = sticks * stick;
+        if dst.v_cols != width {
+            return err(format!(
+                "{name}: t{dst_tid} is written as {}-wide rows by stores of {width}-wide rows — the \
+                 scatter copies one stored row per index entry",
+                dst.v_cols
+            ));
+        }
+        let groups = src.v_cols / width;
+        if s0 + total > src.v_rows * groups {
+            return err(format!(
+                "{name}: the stores write rows {s0}..{} of t{src_tid}, whose view holds {}",
+                s0 + total,
+                src.v_rows * groups
+            ));
+        }
+        // Where the scatter reads its rows: the source itself at one stick a row, or at one row a
+        // view (a decode step's — stick-major and row-major are then the same bytes), else the
+        // scratch its rows are relaid into, row-major.
+        let from = if sticks == 1 || src.v_rows == 1 {
+            src.name()
+        } else {
+            let Some(layout) = layout else {
+                return err(format!(
+                    "{name}: rows of {sticks} sticks are relaid through a scratch, which needs a \
+                     `BundleLayout` to hold it"
+                ));
+            };
+            if !layout.is_row_outermost(dst_tid) {
+                return err(format!(
+                    "{name}: t{dst_tid} takes rows of {sticks} sticks one entry each, which needs it \
+                     allocated row-outermost (`BundleLayout::allocate_row_outermost`), its rows \
+                     contiguous"
+                ));
+            }
+            let tid = super::whole_function::mint_scratch(
+                k,
+                layout,
+                super::whole_function::mint_floor(k),
+                value,
+                crate::ktir_node::Scratch::RelayoutMid,
+            );
+            layout.synth(PlaceId::Act(tid), &[src.v_rows * groups, width]);
+            let scratch = crate::place::act_name(tid);
+            // Each head's group of columns, stick-major `[sticks][rows]` in the source, to row-major
+            // `[rows][sticks]` at the same base in the scratch.
+            for g in s0 / src.v_rows..=(s0 + total - 1) / src.v_rows {
+                let base = g * src.v_rows * width;
+                ops.push(
+                    crate::ir::bridge::tiled_op_sdsc_op::assemble_stick_permute(
+                        &format!("scatter_rows{g}_o{dst_tid}"),
+                        &src.name(),
+                        &scratch,
+                        crate::ir::bridge::tiled_op_sdsc_op::StickPermuteSpec {
+                            rows: src.v_rows,
+                            sticks,
+                            df: Df::Fp16,
+                            direction:
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                            src_elems: base,
+                            dst_elems: base,
+                        },
+                        sym_id_base,
+                        Some(layout),
+                    )
+                    .map_err(|message| Error {
+                        message: format!("{name}: {message}"),
+                    })?,
+                );
+            }
+            scratch
+        };
+        let page = crate::superdsc_opspec::PageExtent::of_positions(sticks);
+        let (dst_name, index_name) = (dst.name(), index.name());
+        for (i, (first, entries)) in index_runs(total).into_iter().enumerate() {
+            let base =
+                crate::superdsc_opspec::EntryBase::of_entries(e0 + first).map_err(|message| {
+                    Error {
+                        message: format!("{name}: {message}"),
+                    }
+                })?;
+            let scatter = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                index_name.clone(),
+                page,
+                base,
+            );
+            let op = crate::ir::bridge::tiled_op_sdsc_op::assemble_scatter_copy(
+                &format!("scatter_run{i}_o{dst_tid}"),
+                &from,
+                &dst_name,
+                scatter,
+                crate::ir::bridge::tiled_op_sdsc_op::ScatterCopySpec {
+                    rows: entries * sticks,
+                    cols: stick,
+                    df: Df::Fp16,
+                    src_elems: (s0 + first) * width,
+                    dst_elems: 0,
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error { message })?;
+            ops.push(op);
+        }
+    }
+    Ok(ops)
 }
 
 /// ⛔⛔⛔ THE GUARD FOR THE FACT THIS FILE USED TO DROP: an operand this emitter addresses at the
@@ -1249,12 +2020,62 @@ pub enum BcastAxis {
     Col,
     /// `[1, n]` → `[m, n]`: a row vector (an rmsnorm gain) sprayed down the rows. `n1[None, :]`.
     Mb,
-    /// `[mb, out]` → `[y, mb, out]`: a MULTI-row source sprayed down a new LEADING dim — the
-    /// row-split form, the batched paged-decode kernel's J-slot merge (`[64, 4] -> [4, 64, 4]`,
-    /// `Dimensions=[0]` over a source the walk-back proved to be `y·mb` rows). The count is the
-    /// broadcast's own stated leading extent; the consumer checks it against the source region's
-    /// frame ([`crate::sdsc_abstract::RegionFrame::split_rows`]) before building the operand.
-    Y(u32),
+    /// `[mb, out]` → `[y, mb, out]` or `[mb, y, out]`: a MULTI-row source sprayed `y` times along
+    /// the rows — the row-split form. OUTER: down a new LEADING dim, the batched paged-decode
+    /// kernel's J-slot merge (`[64, 4] -> [4, 64, 4]`, `Dimensions=[0]` over a source the walk-back
+    /// proved to be `y·mb` rows). INNER: down the dim just before the stick, each source row
+    /// repeated `y` times in a row (a decode batch's mask over its query-head group). The count is
+    /// the broadcast's own stated extent; the consumer checks it against the source region's frame
+    /// ([`crate::sdsc_abstract::RegionFrame::split_rows`]) before building the operand.
+    Y(Spray),
+}
+
+/// A row spray: `count` copies of a multi-row source, at `order` among the op's rows
+/// ([`crate::emit::SprayOrder`]), of the source's whole rows or of one value per source row
+/// ([`SprayOf`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spray {
+    pub count: u32,
+    pub order: crate::emit::SprayOrder,
+    pub of: SprayOf,
+}
+
+/// What a row spray copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SprayOf {
+    /// The source's whole `[mb, out]` rows.
+    Tile,
+    /// One value per source row, sprayed along the stick as well — a per-row scalar (`Col`)
+    /// sprayed down a leading axis too: `[B, KV, G] -> [J, B, KV, G, block]`, a decode batch's
+    /// one-chunk running max against its scores. The source is the reduction's `[rows, 1]`
+    /// column at one stick per row, read at `out`'s stride-0 stick and `y`'s stride-0 dim.
+    RowScalars,
+}
+
+impl Spray {
+    pub const fn outer(count: u32) -> Spray {
+        Spray {
+            count,
+            order: crate::emit::SprayOrder::Outer,
+            of: SprayOf::Tile,
+        }
+    }
+
+    pub const fn inner(count: u32) -> Spray {
+        Spray {
+            count,
+            order: crate::emit::SprayOrder::Inner,
+            of: SprayOf::Tile,
+        }
+    }
+
+    pub const fn outer_row_scalars(count: u32) -> Spray {
+        Spray {
+            count,
+            order: crate::emit::SprayOrder::Outer,
+            of: SprayOf::RowScalars,
+        }
+    }
 }
 
 /// main's `lower_elementwise_node` (main 8362-8432). Its door: the [`Elementwise`] kind is stated by
@@ -2108,6 +2929,71 @@ fn elementwise_broadcast(
     // one; comparing a window's inputs against a view's extent is the mismatch that reads rows
     // nobody wrote.
     let rows = pointwise_rows(name, out)?;
+    // ⭐⭐⭐ A ROW-SPLIT SPRAY WIDER THAN ONE STICK GOES ONE STICK COLUMN AT A TIME. The split law
+    // below states the Y mode at ONE stick of `out` — a stick-major tensor's column `j` is the
+    // contiguous `[rows, stick]` block `j·rows·stick` in, and a wider `out` dim would stride past
+    // the rows the source occupies. So a multi-stick spray is its stick columns, each exactly that
+    // one-stick form: the walk's mask tile `[ROWS, BLOCK]`, sprayed over every kv head's rows.
+    // ⭐ AND A ROW VECTOR THAT IS ONE ROW OF A MULTI-ROW STICK-MAJOR VIEW is that spray at one row per
+    // spray: its sticks sit a whole row-block apart, so no flat row presents it, and each column
+    // reads its one stick at the row's own offset (spyre-inference's decode mask tile, row `i` of the
+    // `[num_blocks, block]` stack, added to every kv head's scores).
+    // ⭐ A ROW-SPLIT SOURCE THAT IS A WINDOW OF ITS VIEW goes the same way at any width: the split
+    // law below addresses the source's whole view, and the column-wise spray addresses its window
+    // (spyre-inference's prompt mask tile, rows `i · P..(i + 1) · P` of the `[num_blocks · P,
+    // block]` stack).
+    let lanes = df.elems_per_stick();
+    if out.c_len > lanes
+        && ins
+            .iter()
+            .zip(bcast)
+            .any(|(x, b)| matches!(b, Some(BcastAxis::Mb)) && x.v_rows > 1 && x.v_cols > lanes)
+    {
+        let as_rows: Vec<Option<BcastAxis>> = bcast
+            .iter()
+            .map(|b| match b {
+                Some(BcastAxis::Mb) => Some(BcastAxis::Y(Spray::outer(rows))),
+                other => *other,
+            })
+            .collect();
+        return elementwise_y_by_column(
+            BcastReq {
+                name,
+                what,
+                op_func,
+                ins,
+                out,
+                bcast: &as_rows,
+                df,
+            },
+            (rows, rows),
+            sym_id_base,
+            layout,
+        );
+    }
+    if let Some(y) = bcast.iter().find_map(|b| match b {
+        Some(BcastAxis::Y(sp)) => Some(sp.count),
+        _ => None,
+    }) && (out.c_len > lanes
+        || ins.iter().zip(bcast).any(|(x, b)| {
+            matches!(b, Some(BcastAxis::Y(_))) && (x.r_start, x.r_len) != (0, x.v_rows)
+        }))
+    {
+        return elementwise_y_by_column(
+            BcastReq {
+                name,
+                what,
+                op_func,
+                ins,
+                out,
+                bcast,
+                df,
+            },
+            (y, rows),
+            sym_id_base,
+            layout,
+        );
+    }
     // ⭐⭐⭐ THE ROW-SPLIT (Y) MODE'S FRAME, DERIVED BEFORE THE WANT LOOP — because the want row
     // for a `Y` operand (`rows/y`) is only honest when `y` DIVIDES `rows`, and that divisibility
     // is itself half of the frame law: the output's own device frame `[rows, c_len]` must split
@@ -2115,8 +3001,33 @@ fn elementwise_broadcast(
     // single-stick). [`RegionFrame::split_rows`] checks all of it and returns the op's
     // `[mb, out, y]` facts; its `Err` is the refusal, so a row-split the bytes do not support is
     // a build failure here, not a wrong-byte bake (the mb re-row's own defect class).
+    // A ROW SPRAY IS NEVER THE `[y, mb, out]` OP: an outer one goes out as the card's flat ops
+    // ([`elementwise_by_outer_spray`]), an inner one as one row-vector broadcast
+    // ([`elementwise_by_inner_spray`]).
+    if let Some(sp) = bcast.iter().find_map(|b| match b {
+        Some(BcastAxis::Y(sp)) => Some(*sp),
+        _ => None,
+    }) {
+        let req = BcastReq {
+            name,
+            what,
+            op_func,
+            ins,
+            out,
+            bcast,
+            df,
+        };
+        return match sp.order {
+            crate::emit::SprayOrder::Outer => {
+                elementwise_by_outer_spray(req, (sp.count, rows), sym_id_base, layout)
+            }
+            crate::emit::SprayOrder::Inner => {
+                elementwise_by_inner_spray(req, (sp.count, rows), sym_id_base, layout)
+            }
+        };
+    }
     let ymode: Option<u32> = bcast.iter().find_map(|b| match b {
-        Some(BcastAxis::Y(y)) => Some(*y),
+        Some(BcastAxis::Y(sp)) => Some(sp.count),
         _ => None,
     });
     let split = match ymode {
@@ -2137,7 +3048,13 @@ fn elementwise_broadcast(
             // ⭐ THE ROW-SPLIT SOURCE IS THE `[mb, out]` TILE — one spray's worth of the output's
             // rows, at the output's own column extent. The divisibility that makes `rows/y`
             // honest is the frame law above, already proven.
-            Some(BcastAxis::Y(y)) => (rows / y, out.c_len),
+            Some(BcastAxis::Y(sp)) => (
+                rows / sp.count,
+                match sp.of {
+                    SprayOf::Tile => out.c_len,
+                    SprayOf::RowScalars => 1,
+                },
+            ),
         };
         if (x.v_rows, x.c_len) != want {
             return err(format!(
@@ -2187,7 +3104,11 @@ fn elementwise_broadcast(
             // mint checks that swept window against the handle's declaration, so the annotation
             // now states the footprint the storage always had — `rb(name, rows, stick)` at the
             // op's own `df`, the same handle `rmsnorm.rs` mints for `rinv`.
-            Some(BcastAxis::Col) => rb(n, x.v_rows, df.elems_per_stick()),
+            Some(BcastAxis::Col)
+            | Some(BcastAxis::Y(Spray {
+                of: SprayOf::RowScalars,
+                ..
+            })) => rb(n, x.v_rows, df.elems_per_stick()),
             // ⭐⭐⭐ AND IN THE Y MODE EVERY OPERAND IS STICK-WIDE for the same reason: the op's
             // `out` dim IS the one stick the frame law allows, so the dense operand's storage is
             // `[v_rows, 64]` — the footprint its `(v_rows, c_len < 64)` mint already reserved —
@@ -2203,7 +3124,7 @@ fn elementwise_broadcast(
             None => In::full(h).ew(),
             Some(BcastAxis::Col) => In::col(h).ew(),
             Some(BcastAxis::Mb) => In::mb(h).ew(),
-            Some(BcastAxis::Y(y)) => In::y_broadcast(h, *y).ew(),
+            Some(BcastAxis::Y(sp)) => In::y_broadcast(h, *sp).ew(),
         })
         .collect();
     // The SAME `TileOp` the dense arm builds, so the two arms share one LX-tiling contract and a
@@ -2238,6 +3159,398 @@ fn elementwise_broadcast(
         sym_id_base,
         layout,
     )])
+}
+
+/// [`elementwise_broadcast`]'s row-split spray at an `out` wider than one stick: ONE descriptor per
+/// stick column `j`, each the one-stick Y form over the contiguous `[rows, stick]` blocks of its
+/// operands — a stick-major `[R, C]` tensor holds column `j`'s rows `[r0, r0 + rows)` at element
+/// `j·R·stick + r0·stick`, so every operand, its window included, is a base offset per column.
+/// Only dense and `Y` operands ride it; a `Col`/`Mb` operand beside a row split is refused.
+fn elementwise_y_by_column(
+    req: BcastReq<'_>,
+    (y, rows): (u32, u32),
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    if sprays_outermost(req.bcast) {
+        return elementwise_by_outer_spray(req, (y, rows), sym_id_base, layout);
+    }
+    if req.out.c_len <= req.df.elems_per_stick()
+        && req.bcast.iter().any(
+            |b| matches!(b, Some(BcastAxis::Y(sp)) if sp.order == crate::emit::SprayOrder::Inner),
+        )
+    {
+        return elementwise_by_inner_spray(req, (y, rows), sym_id_base, layout);
+    }
+    let BcastReq {
+        name,
+        what,
+        op_func,
+        ins,
+        out,
+        bcast,
+        df,
+    } = req;
+    let stick = df.elems_per_stick();
+    let cols = out.c_len;
+    if y < 2 || !rows.is_multiple_of(y) || !cols.is_multiple_of(stick) || out.c_start != 0 {
+        return err(format!(
+            "{what} {name}: a row split of {y} over the `[{rows}, {cols}]` output t{} — the spray \
+             needs whole sprays of rows and whole {stick}-element stick columns from column 0",
+            out.tid
+        ));
+    }
+    let mb = rows / y;
+    for (i, x) in ins.iter().enumerate() {
+        let want_rows = match bcast[i] {
+            None => rows,
+            Some(BcastAxis::Y(_)) => mb,
+            Some(other) => {
+                return err(format!(
+                    "{what} {name}: input {i} t{} is a {other:?} operand beside a row split — the \
+                     column-wise spray states dense and `Y` operands only",
+                    x.tid
+                ));
+            }
+        };
+        if x.r_len != want_rows || x.c_len != cols || x.c_start != 0 {
+            return err(format!(
+                "{what} {name}: input {i} t{} takes `[{}, {}]` at column {} of its view, and its \
+                 mode wants `[{want_rows}, {cols}]` from column 0",
+                x.tid, x.r_len, x.c_len, x.c_start
+            ));
+        }
+    }
+    let at = |x: &Region, j: u32| -> crate::addr::DevOff {
+        crate::addr::DevOff::from_view_step(j * x.v_rows * stick + x.r_start * stick)
+    };
+    let out_h = rb(&out.name(), out.v_rows, out.v_cols);
+    let handles: Vec<_> = ins
+        .iter()
+        .map(|x| rb(&x.name(), x.v_rows, x.v_cols))
+        .collect();
+    let tile_op = pointwise_tile_op_df(mb, stick, y, ins.len() as u32 + 1, df);
+    let mut ops = Vec::with_capacity((cols / stick) as usize);
+    for j in 0..cols / stick {
+        let ew: Vec<_> = handles
+            .iter()
+            .zip(ins)
+            .zip(bcast)
+            .map(|((h, x), b)| match b {
+                Some(BcastAxis::Y(sp)) => In::y_broadcast_at(h, *sp, at(x, j)).ew(),
+                _ => In::sliced(h, at(x, j)).ew(),
+            })
+            .collect();
+        ops.push(assemble_pointwise_broadcast_off_from_tile(
+            &format!("{op_func}{j}_o{}", out.tid),
+            &tile_op,
+            op_func,
+            rows,
+            stick,
+            &ew,
+            &out_h,
+            at(out, j),
+            sym_id_base,
+            layout,
+        ));
+    }
+    Ok(ops)
+}
+
+/// ⭐⭐⭐ AN INNER ROW SPRAY, AS ONE ROW-VECTOR BROADCAST — each of the source's `mb` one-stick rows
+/// repeated `y` times in a row (a decode batch's mask over its query-head group). The whole
+/// one-stick buffers, read as stick-major tensors, are already the frame the card's row-vector
+/// broadcast runs in:
+///
+/// * the dense operands and the output, `[mb · y, stick]` with row `b·y + j` at stick `b·y + j`,
+///   ARE the stick-major `[y, mb · stick]` whose element `(j, b)` sits at stick `b·y + j`;
+/// * the source, `[mb, stick]` with row `b` at stick `b`, IS the stick-major `[1, mb · stick]`.
+///
+/// So `out[b·y + j] = dense[b·y + j] ∘ src[b]` is `out[j, b] = dense[j, b] ∘ src[0, b]`: one flat
+/// op with the source an `Mb` row vector sprayed down `y` rows ([`In::mb`], the rmsnorm gain's own
+/// form, card-proven at every prefill). The `[mb, y, out]` op it replaces is the three-axis form
+/// the card mis-addresses with a broadcast operand (see [`elementwise_by_outer_spray`]).
+///
+/// Rows several sticks wide (the prompt trip's scores over a 128-slot page, query-row-major) are
+/// their stick planes one after another, each a one-stick buffer of every row: one such op per
+/// plane, every operand read at its plane.
+fn elementwise_by_inner_spray(
+    req: BcastReq<'_>,
+    (y, rows): (u32, u32),
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let BcastReq {
+        name,
+        what,
+        op_func,
+        ins,
+        out,
+        bcast,
+        df,
+    } = req;
+    let stick = df.elems_per_stick();
+    let planes = out.c_len.div_ceil(stick).max(1);
+    if y < 2 || !rows.is_multiple_of(y) || (planes > 1 && !out.c_len.is_multiple_of(stick)) {
+        return err(format!(
+            "{what} {name}: an inner spray of {y} over the `[{rows}, {}]` output t{} — the spray \
+             needs rows == y*mb (whole sprays of rows) and whole sticks",
+            out.c_len, out.tid
+        ));
+    }
+    let mb = rows / y;
+    // Each operand's rows from its view's first: the whole one-stick buffer, or its leading rows (a
+    // walk's first tile, which the relaunch moves trip by trip).
+    let leading =
+        |x: &Region, n: u32| (x.r_start, x.r_len, x.c_start) == (0, n, 0) && n <= x.v_rows;
+    if !leading(out, rows) {
+        return err(format!(
+            "{what} {name}: the output t{} takes rows {}.. of its `[{}, {}]` view — an inner spray \
+             reads its one-stick buffers from their first row as stick-major `[y, mb · stick]` tensors",
+            out.tid, out.r_start, out.v_rows, out.v_cols
+        ));
+    }
+    for (i, (x, b)) in ins.iter().zip(bcast).enumerate() {
+        let want = match b {
+            None => rows,
+            Some(BcastAxis::Y(Spray {
+                order: crate::emit::SprayOrder::Inner,
+                of: SprayOf::Tile,
+                count,
+            })) if *count == y => mb,
+            Some(other) => {
+                return err(format!(
+                    "{what} {name}: input {i} t{} is a {other:?} operand beside an inner spray of \
+                     {y} — the spray's row-vector op states dense and `Y` operands only",
+                    x.tid
+                ));
+            }
+        };
+        if !leading(x, want) || x.c_len.div_ceil(stick).max(1) != planes {
+            return err(format!(
+                "{what} {name}: input {i} t{} takes `[{}, {}]` at row {} of its `[{}, {}]` view, \
+                 and its mode wants its first `[{want}, {}]` rows",
+                x.tid, x.r_len, x.c_len, x.r_start, x.v_rows, x.v_cols, out.c_len
+            ));
+        }
+    }
+    // One plane's columns in the stick-major `[y, mb · stick]` frame; every buffer is declared
+    // whole, its planes one after another (`[y, planes · mb · stick]`, the same bytes).
+    let cols = mb * stick;
+    let out_h = rb(&out.name(), y, planes * cols);
+    let handles: Vec<_> = ins
+        .iter()
+        .zip(bcast)
+        .map(|(x, b)| match b {
+            Some(BcastAxis::Y(_)) => rb(&x.name(), 1, planes * x.v_rows * stick),
+            _ => rb(&x.name(), y, planes * cols),
+        })
+        .collect();
+    // Plane `c` of a stick-major buffer: its `c`-th stick column, every row of it.
+    let at = |x: &Region, c: u32| crate::addr::col_of(x.v_rows, x.v_cols, c * stick, df);
+    let tile_op = pointwise_tile_op_df(y, cols, 1, ins.len() as u32 + 1, df);
+    (0..planes)
+        .map(|c| {
+            let ew: Vec<_> = handles
+                .iter()
+                .zip(ins)
+                .zip(bcast)
+                .map(|((h, x), b)| match b {
+                    Some(BcastAxis::Y(_)) => In::mb_at(h, at(x, c)).ew(),
+                    _ => In::sliced(h, at(x, c)).ew(),
+                })
+                .collect();
+            Ok(assemble_pointwise_broadcast_off_from_tile(
+                &match planes {
+                    1 => format!("{op_func}_o{}", out.tid),
+                    _ => format!("{op_func}{c}_o{}", out.tid),
+                },
+                &tile_op,
+                op_func,
+                y,
+                cols,
+                &ew,
+                &out_h,
+                at(out, c),
+                sym_id_base,
+                layout,
+            ))
+        })
+        .collect()
+}
+
+/// Whether an op's broadcast operands spray a source down the OUTERMOST of its rows
+/// ([`crate::emit::SprayOrder::Outer`]).
+fn sprays_outermost(bcast: &[Option<BcastAxis>]) -> bool {
+    bcast
+        .iter()
+        .any(|b| matches!(b, Some(BcastAxis::Y(sp)) if sp.order == crate::emit::SprayOrder::Outer))
+}
+
+/// ⭐⭐⭐ AN OUTER ROW SPRAY, AS THE CARD'S OWN FLAT OPS — one dense `[rows, stick]` elementwise op
+/// per spray and stick column, the source read whole at each, never the one `[y, mb, out]` op.
+///
+/// The `[y, mb, out]` form is what the card got wrong. MEASURED on granite-3.1-2b's prompt walk:
+/// the `[21, 64]` mask sprayed over 32 head blocks wrote 52 of 672 sticks with `mb` split over the
+/// cores. With the cores taking whole head blocks instead, it wrote 362: in each block, local row
+/// `m` read mask row `2m` and then `2(m − 11) + 1`, and only a growing prefix of each half was
+/// written at all. The flat `[mb, out]` op is the form every rmsnorm, residual add and scale runs
+/// correctly on the card, so a spray is spent as those:
+///
+/// * a `Tile` source of one row (`mb == 1`) is the row vector it is: one op per stick column, the
+///   source's stick broadcast down all `y` rows ([`In::mb_at`], main's per-block prefix-mask
+///   slice);
+/// * a `Tile` source of `mb` rows: per spray `j`, the dense operands and the output at rows
+///   `j · mb..(j + 1) · mb`, the source's own rows read as a dense operand ([`In::sliced`]);
+/// * a `RowScalars` source: per spray `j`, its one stick per row read as a per-row scalar
+///   ([`In::col_at`], main's per-head-block reduced scalar).
+fn elementwise_by_outer_spray(
+    req: BcastReq<'_>,
+    (y, rows): (u32, u32),
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let BcastReq {
+        name,
+        what,
+        op_func,
+        ins,
+        out,
+        bcast,
+        df,
+    } = req;
+    let stick = df.elems_per_stick();
+    let cols = out.c_len;
+    // A sub-stick row is stored one stick wide (the mint's footprint), and runs as that one stick.
+    let width = if cols < stick { stick } else { cols };
+    if y < 2 || !rows.is_multiple_of(y) || !width.is_multiple_of(stick) || out.c_start != 0 {
+        return err(format!(
+            "{what} {name}: an outer spray of {y} over the `[{rows}, {cols}]` output t{} — the \
+             spray needs rows == y*mb (whole sprays of rows) and whole {stick}-element stick \
+             columns from column 0",
+            out.tid
+        ));
+    }
+    let mb = rows / y;
+    for (i, (x, b)) in ins.iter().zip(bcast).enumerate() {
+        let want = match b {
+            None => (rows, cols),
+            Some(BcastAxis::Y(Spray {
+                order: crate::emit::SprayOrder::Outer,
+                of: SprayOf::Tile,
+                count,
+            })) if *count == y => (mb, cols),
+            Some(BcastAxis::Y(Spray {
+                order: crate::emit::SprayOrder::Outer,
+                of: SprayOf::RowScalars,
+                count,
+            })) if *count == y => (mb, 1),
+            Some(other) => {
+                return err(format!(
+                    "{what} {name}: input {i} t{} is a {other:?} operand beside an outer spray of \
+                     {y} — the spray's flat ops state dense and `Y` operands only",
+                    x.tid
+                ));
+            }
+        };
+        if (x.r_len, x.c_len) != want || x.c_start != 0 {
+            return err(format!(
+                "{what} {name}: input {i} t{} takes `[{}, {}]` at column {} of its view, and its \
+                 mode wants `[{}, {}]` from column 0",
+                x.tid, x.r_len, x.c_len, x.c_start, want.0, want.1
+            ));
+        }
+    }
+    // A stick-major `[v_rows, v_cols]` tensor's stick column `c` is the contiguous block
+    // `c · v_rows · stick` in, its row `r` one stick into that.
+    let at = |x: &Region, c: u32, row: u32| -> crate::addr::DevOff {
+        crate::addr::DevOff::from_view_step(c * x.v_rows * stick + (x.r_start + row) * stick)
+    };
+    // Every handle at its stored width: whole sticks (a sub-stick row, and a row reduction's
+    // `[rows, 1]` result, one stick a row).
+    let out_h = rb(&out.name(), out.v_rows, out.v_cols.next_multiple_of(stick));
+    let handles: Vec<_> = ins
+        .iter()
+        .zip(bcast)
+        .map(|(x, b)| match b {
+            Some(BcastAxis::Y(Spray {
+                of: SprayOf::RowScalars,
+                ..
+            })) => rb(&x.name(), x.v_rows, stick),
+            _ => rb(&x.name(), x.v_rows, x.v_cols.next_multiple_of(stick)),
+        })
+        .collect();
+    let n_in = ins.len() as u32 + 1;
+    let columns = width / stick;
+    let op_name = |j: u32, c: u32| match columns {
+        1 => format!("{op_func}{j}_o{}", out.tid),
+        _ => format!("{op_func}{j}_{c}_o{}", out.tid),
+    };
+    let mut ops = Vec::new();
+    let row_vector = mb == 1
+        && bcast
+            .iter()
+            .all(|b| !matches!(b, Some(BcastAxis::Y(sp)) if sp.of == SprayOf::RowScalars));
+    if row_vector {
+        let tile_op = pointwise_tile_op_df(rows, stick, 1, n_in, df);
+        for c in 0..columns {
+            let ew: Vec<_> = handles
+                .iter()
+                .zip(ins)
+                .zip(bcast)
+                .map(|((h, x), b)| match b {
+                    Some(BcastAxis::Y(_)) => In::mb_at(h, at(x, c, 0)).ew(),
+                    _ => In::sliced(h, at(x, c, 0)).ew(),
+                })
+                .collect();
+            ops.push(assemble_pointwise_broadcast_off_from_tile(
+                &op_name(0, c),
+                &tile_op,
+                op_func,
+                rows,
+                stick,
+                &ew,
+                &out_h,
+                at(out, c, 0),
+                sym_id_base,
+                layout,
+            ));
+        }
+        return Ok(ops);
+    }
+    let tile_op = pointwise_tile_op_df(mb, stick, 1, n_in, df);
+    for j in 0..y {
+        for c in 0..columns {
+            let ew: Vec<_> = handles
+                .iter()
+                .zip(ins)
+                .zip(bcast)
+                .map(|((h, x), b)| match b {
+                    Some(BcastAxis::Y(Spray {
+                        of: SprayOf::Tile, ..
+                    })) => In::sliced(h, at(x, c, 0)).ew(),
+                    Some(BcastAxis::Y(Spray {
+                        of: SprayOf::RowScalars,
+                        ..
+                    })) => In::col_at(h, at(x, 0, 0)).ew(),
+                    _ => In::sliced(h, at(x, c, j * mb)).ew(),
+                })
+                .collect();
+            ops.push(assemble_pointwise_broadcast_off_from_tile(
+                &op_name(j, c),
+                &tile_op,
+                op_func,
+                mb,
+                stick,
+                &ew,
+                &out_h,
+                at(out, c, j * mb),
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    Ok(ops)
 }
 
 /// A dtype-CONVERT's kind — the device's own convert `OpFunc`s, discriminated by the
@@ -2674,7 +3987,8 @@ fn pointwise_width_the_output_holds(
                 .placements
                 .get(&tid)
                 .map(|p| p.size)
-                .or_else(|| l.synth.borrow().sizes.get(name).copied()),
+                .or_else(|| l.synth.borrow().sizes.get(name).copied())
+                .or_else(|| l.lx_full_size(name)),
             _ => l.synth.borrow().sizes.get(name).copied(),
         }?;
         // A footprint is `synth_footprint_bytes`: the INNER (column) axis stick-rounded, the outer
@@ -2932,312 +4246,6 @@ pub fn scalarmul(
     //
     // `None` for every program that states no `ktdp.construct_indirect_access_tile`.
     scalarmul_at(name, scale, gather_of(k)?, r, sym_id_base, layout)
-}
-
-/// A KV HEAD INDEX, TYPED, from a loop counter — the one place a bare `usize` becomes a [`KvHead`].
-///
-/// A kv head, a query head, a slot and a feature are all small integers, and nothing but spelling kept
-/// them apart at a call site. `?` here means a head past the pool's count is a build error rather than
-/// an address in the next plane.
-///
-/// [`KvHead`]: crate::sdsc_abstract::KvHead
-fn kv_head_of(kvh: u32, nkvh: u32) -> Result<crate::sdsc_abstract::KvHead, Error> {
-    let n = std::num::NonZeroU32::new(nkvh).ok_or_else(|| Error {
-        message: "a paged pool needs at least one kv head".into(),
-    })?;
-    crate::sdsc_abstract::KvHead::new(kvh, n).ok_or_else(|| Error {
-        message: format!("kv head {kvh} is past the pool's {nkvh} head(s)"),
-    })
-}
-
-/// main's `lower_attn_node` (main 9528-10376), waiting for its head geometry to become consts — the
-/// consumer side of `with_config_attn_geometry`, exactly as main's `LowerAttn` was.
-///
-/// ⛔⛔⛔ AND IT IS MAIN'S `LowerAttn` FIELD FOR FIELD, WHICH IS WHY `AttnFacts` IS GONE. main's pack
-/// is `{ node, cap, active_cap, rows_are_requests, sym_id_base, layout }`: the NODE, plus the four
-/// things the node does not state. This pack replaces `node` with the node's PROGRAM — from which
-/// [`attn_operands`] reads the six tensor identities and the resident capacity that main read off
-/// `node.inputs` / `node.op` / `ir.tensors` — and keeps exactly main's remainder. `scale` joins them
-/// because main took it off `node.op`'s `SubOp::AttnDecode { scale }` payload, the same place it took
-/// the geometry the door above turns into the consts.
-///
-/// ⛔ NOTHING HERE IS STAPLED TO THE PROGRAM. These are ARGUMENTS, supplied per call by the caller
-/// that crossed the geometry door — a third-party KTIR producer's caller states them from its own
-/// configs, exactly as scratchy's does. A record hanging off [`KtirNode`] is what made the crate's
-/// attention path unusable to anyone but this producer.
-pub struct AttnAt<'a> {
-    pub name: &'a str,
-    /// The node's KTIR, and its parameters as [`Region`]s — the program, and nothing beside it.
-    pub k: &'a KtirNode,
-    pub r: &'a [Region],
-    /// main's `LowerAttn::rows_are_requests` — TRUE when this bundle's query rows are separate
-    /// requests (a batched decode) rather than consecutive positions of one sequence.
-    ///
-    /// ⛔ THE ONE FACT WITH NO STATEMENT ANYWHERE IN THE PROGRAM, and it cannot have one: it decides
-    /// the DEVICE's row/slot laws (`attn_bundle_rows`' pad, rope's head-major collapse), which the
-    /// emulator does not model at all — the attention/rope programs never receive it and
-    /// emit the same ops either way.
-    pub rows_are_requests: bool,
-    /// Whether this bundle's attention reads the paged KV through an index — the caller-side twin of
-    /// the spyre door's `BundleAttnParams::gathers_kv` (the batched rungs' per-page gather, or the
-    /// one-request rung's split-KV chunk). Decides the `KV_BLOCK_INDEX_TID` admission below; the
-    /// placement reserves under the SAME fact — one predicate, both halves of the gather.
-    pub gathers_kv: bool,
-    /// The split-KV chunk's page count — the caller-side twin of `BundleAttnParams::chunk_pages`.
-    /// `Some` lowers the prefix through [`crate::sdsc_abstract::ChunkScratch`] (every resident page in
-    /// one pass); `None` keeps the per-page fold.
-    pub chunk_pages: Option<u32>,
-    /// Whether this bundle's attention score scale is carried by the staged weights — the
-    /// caller-side twin of the spyre door's `BundleAttnParams::scale_in_weights`. The fold removes
-    /// the score mulf from the program, so a folded program states NO multiplier; a model whose
-    /// attention scale genuinely IS 1.0 states none either (the triton→ktir pipeline folds a
-    /// multiply by 1.0 away). This fact is what tells the door that absence is one of those two
-    /// and not a broken program.
-    pub scale_in_weights: bool,
-    /// ⭐ WHETHER THE FINALIZE HANDS `out` TO o_proj SLAB-MAJOR — the caller-side twin of the spyre
-    /// door's `BundleAttnParams::headmajor_handoff`, and the SAME fact the matmul door swaps the o
-    /// matmul's B operand on (the permuted `oproj_headmajor_tid` copy): one fact, both halves of the
-    /// restructure, so neither can be emitted without the other. TRUE only for the single-row
-    /// (`mq == 1`) body of a multi-slab head dim with an fp8 W8A8 o matmul.
-    pub headmajor_handoff: bool,
-    pub sym_id_base: &'a mut i64,
-    pub layout: Option<&'a BundleLayout>,
-}
-
-/// ⭐⭐⭐ THE ATTENTION NODE'S OPERANDS AND ITS RESIDENT CAPACITY, READ OUT OF THE PROGRAM THAT
-/// STATES THEM — the seven fields `AttnFacts` used to carry from the producer.
-///
-/// Every one is a positional join on [`KtirNode::args`], which is the join [`regions`] already
-/// performs: the attention program mints its parameters in first-use order — `q`, `out`,
-/// then (when this node emits the runtime length mask) the mask, then EVERY segment's K view followed
-/// by EVERY segment's V view — and `crate::place::act_name(tid)` is the operand spelling every proven
-/// builder agrees on.
-///
-/// ⛔ AND THE POSITIONS ARE CROSS-CHECKED AGAINST THE SHAPES THEY MUST HAVE, because a silent
-/// positional slip REPOINTS A TENSOR: `q`/`out` are `[mq, nqh·hd]` and every K/V view is `[·, nkvh·hd]`,
-/// so a q↔kv swap is caught; the two views of one SEGMENT share a row extent while a segment's K and
-/// the NEXT segment's V do not, so an all-Ks-then-all-Vs order mistaken for an interleaved one is
-/// caught. A mismatch is a build error naming what disagreed, never a descriptor built on a guess.
-#[derive(Clone, Copy, Debug)]
-pub struct AttnOperands {
-    /// main's `inputs[0]` — the rotated Q.
-    pub q_id: u32,
-    /// main's `output`.
-    pub out_id: u32,
-    /// main's `kv.cache_tensor()` / `kv.v_cache_tensor()` — the resident prefix cache, segment 0.
-    pub k_id: u32,
-    pub v_id: u32,
-    /// main's `inputs[3]` / `inputs[4]` — this step's new K and V, the last segment.
-    pub new_k_id: u32,
-    pub new_v_id: u32,
-    /// The resident cache's structural capacity — the prefix K view's OWN row extent, which is
-    /// `ir.tensors[kv.cache_tensor()].rows`, i.e. exactly what main's call site looked up.
-    pub cap: u32,
-    /// Which PARAMETER the resident K is, so the sweep check below reads the rows of that buffer
-    /// without searching for it a second time.
-    pub k_param: usize,
-    /// The query row count, read off `q`'s own view — not a fact the caller states.
-    pub mq: u32,
-}
-
-/// [`AttnOperands`], with every position proven against the shape it must have.
-///
-/// `geom` is the witness the door minted, so the widths checked against are the model's, evaluated
-/// once — and the head dim is checked against the program's own per-head window, which is the first
-/// `ktdp.construct_access_tile` over the `q` view.
-pub fn attn_operands<const NQH: u32, const NKVH: u32, const HD: u32>(
-    name: &str,
-    k: &KtirNode,
-    r: &[Region],
-    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
-) -> Result<AttnOperands, Error> {
-    let (q_width, kv_width) = (geom.nqh() * geom.hd(), geom.nkvh() * geom.hd());
-    // `q`, then `out`: the attention program's first two parameter mints, in that order.
-    let (q, out) = match (r.first(), r.get(1)) {
-        (Some(q), Some(o)) => (q, o),
-        _ => {
-            return err(format!(
-                "{name}: an attention program states {} parameter(s); its construction mints at \
-                 least six (q, out, and each segment's K then V)",
-                r.len()
-            ));
-        }
-    };
-    // ⭐⭐⭐ THE QUERY ROW COUNT COMES FROM THE PROGRAM. It was `KtirNode::out_shape.0`, and both
-    // checks below forced it equal to this very view's row extent — so the record was a copy of what
-    // `q`'s own `ktdp.construct_memory_view` states, and a third-party producer had to supply a
-    // number its program already carries. The `out` check below is unchanged and still real: `q` and
-    // `out` must agree on rows, and both on the geometry's column width.
-    let mq = q.v_rows;
-    let shape_is = |role: &str, x: &Region, rows: u32, cols: u32| -> Result<(), Error> {
-        if (x.v_rows, x.v_cols) != (rows, cols) {
-            return err(format!(
-                "{name}: parameter {role} t{} states a `[{}, {}]` view where the node's geometry \
-                 (nqh={NQH} nkvh={NKVH} head_dim={HD}) and its {mq} query row(s) make it \
-                 `[{rows}, {cols}]` — the positional join on `KtirNode::args` disagrees with the \
-                 shape the operand must have, which means it names a different tensor",
-                x.tid, x.v_rows, x.v_cols,
-            ));
-        }
-        Ok(())
-    };
-    shape_is("q", q, mq, q_width)?;
-    shape_is("out", out, mq, q_width)?;
-    // ⛔ THE STORE SAYS WHICH ONE IS THE OUTPUT, so a q↔out transposition cannot survive even when
-    // (as here) the two share a shape.
-    if q.is_out || !out.is_out {
-        return err(format!(
-            "{name}: parameter 0 (t{}, read as `q`) is {}written by a `ktdp.store` and parameter 1 \
-             (t{}, taken as `out`) is {}— `q` is the read operand and `out` the written one, so this \
-             program's parameters are not the order the attention program mints them in",
-            q.tid,
-            if q.is_out { "" } else { "not " },
-            out.tid,
-            if out.is_out { "" } else { "not " },
-        ));
-    }
-    // ⭐ THE HEAD DIM, FROM THE PROGRAM'S OWN PER-HEAD WINDOW. The attention program reads head `h` as
-    // `tile(q_view, ·, h·hd, ·, hd)`, so the first access tile over the `q` view is `hd` wide — the
-    // one place the program states the head dim rather than a product with it.
-    //
-    // ⛔ AND IT IS THE TILE'S OWN `Shape`, NOT [`Region::c_len`]. That field is dropped to the whole
-    // view unless BOTH of the tile's corner operands are `arith.constant`s, and a PREFILL attention
-    // runs one head per core — its column corner is `arith.muli(pid, hd)`, so `c_len` reads back the
-    // full `nqh·hd` and a check against it refused every prefill bundle (MEASURED: "the program's
-    // first window on `q` t341 is 576 column(s) wide where the door's head dim is 64"). The `Shape`
-    // says `hd` either way.
-    let q_window_cols = param_first_tile(&k.func, &k.func.arguments[0].0).map(|(_, c)| c);
-    if q_window_cols != Some(geom.hd()) {
-        return err(format!(
-            "{name}: the program's first window on `q` t{} is {} where the door's head dim is {} — \
-             the geometry crossed does not belong to this program",
-            q.tid,
-            match q_window_cols {
-                Some(c) => format!("{c} column(s) wide"),
-                None => "not a window at all".to_string(),
-            },
-            geom.hd(),
-        ));
-    }
-    // The K/V segment parameters: everything after `q`/`out` except the runtime length mask, whose
-    // tensor id the node already states (it is SYNTHETIC — beyond the graph — so nothing else could).
-    let mask_tid = k.mask.map(|b| b.get());
-    let segs: Vec<(usize, &Region)> = r
-        .iter()
-        .enumerate()
-        .skip(2)
-        .filter(|(_, x)| Some(x.tid) != mask_tid)
-        .collect();
-    // main's own arity: `AttnDecode` "expects 5 inputs [q, prefix_k, prefix_v, new_k, new_v]", so
-    // exactly two segments, and the program states each one's K view before any V view.
-    let [(k_param, kc), (_, new_k), (_, vc), (_, new_v)] = match segs.as_slice() {
-        [a, b, c, d] => [*a, *b, *c, *d],
-        _ => {
-            return err(format!(
-                "{name}: the program takes {} K/V segment parameter(s); an attention node has \
-                 exactly four (the resident prefix cache's K and V, and this step's new K and V — \
-                 main's `inputs[1..5]`)",
-                segs.len()
-            ));
-        }
-    };
-    for (role, x) in [
-        ("resident K", kc),
-        ("new K", new_k),
-        ("resident V", vc),
-        ("new V", new_v),
-    ] {
-        if x.v_cols != kv_width {
-            return err(format!(
-                "{name}: parameter {role} t{} states a {}-column view where the node's geometry \
-                 (nqh={NQH} nkvh={NKVH} head_dim={HD}) makes a kv stream {kv_width} wide — the \
-                 positional join names a different tensor",
-                x.tid, x.v_cols,
-            ));
-        }
-    }
-    // ⛔ THE TWO VIEWS OF ONE SEGMENT SHARE A ROW EXTENT. This is what proves the order is
-    // all-Ks-then-all-Vs and not K,V,K,V: under the wrong reading `vc` would be the PREFIX's V (the
-    // full capacity) while `new_k` would be it too, and the resident/new row extents differ.
-    if kc.v_rows != vc.v_rows || new_k.v_rows != new_v.v_rows {
-        return err(format!(
-            "{name}: the resident cache's K t{} `[{}, ·]` and V t{} `[{}, ·]`, and this step's new K \
-             t{} `[{}, ·]` and V t{} `[{}, ·]`, must each be one segment's pair and so share a row \
-             extent — they do not, so the K and V parameter lists are not the order the \
-             construction mints them in",
-            kc.tid, kc.v_rows, vc.tid, vc.v_rows, new_k.tid, new_k.v_rows, new_v.tid, new_v.v_rows,
-        ));
-    }
-    Ok(AttnOperands {
-        q_id: q.tid,
-        out_id: out.tid,
-        k_id: kc.tid,
-        v_id: vc.tid,
-        new_k_id: new_k.tid,
-        new_v_id: new_v.tid,
-        cap: kc.v_rows,
-        k_param,
-        mq,
-    })
-}
-
-/// ⛔⛔⛔ AN ATTENTION PROGRAM'S SIZE MUST NOT GROW WITH ITS ROWS — the bake refuses a per-row unroll.
-///
-/// The continuation arm was a `tl.static_range(0, MQ)` of per-row bodies, each with its own `[qi + 1,
-/// HD]` causal tiles: `MQ` bodies whose tiles summed to `MQ²/2` rows. Its program, and every pass that
-/// walks it, grew with the rows: MEASURED on granite-2b, 94.7 s to lower at 256 rows (the bake's
-/// widest compile) and a build-script thread past 25 min at 102 GB without finishing at 512. The bundle
-/// was correct; only the build paid.
-///
-/// So the check is on the LOWERED program, at the door, for every multi-row attention: the number of
-/// windows it takes of its query `q` (parameter 0), regions included so a loop the front end failed to
-/// fold still counts its body. A whole-chunk head reads its query ONCE, so the program takes at most
-/// one window per head (`heads` — the grid is unrolled into the program, so every head's body is in
-/// it); a per-row form takes one per head PER ROW. That is the property a raw op-count bound cannot
-/// state, because a program's absolute size also scales with its heads and head dim. Decode
-/// (`mq == 1`) has one row, so the two forms coincide there.
-pub fn attn_program_is_flat_in_rows(
-    name: &str,
-    f: &IRFunction<'static>,
-    mq: u32,
-    heads: u32,
-) -> Result<(), Error> {
-    if mq <= 1 {
-        return Ok(());
-    }
-    let Some((q, _)) = f.arguments.first() else {
-        return err(format!(
-            "{name}: an attention program with no parameters — its query is parameter 0"
-        ));
-    };
-    let tiles = param_tiles_deep(f, q);
-    if tiles > heads as usize {
-        return err(format!(
-            "{name}: a {mq}-row attention program over {heads} head(s) takes {tiles} windows of its \
-             query, where a whole-chunk head takes one — it unrolls per row, so its size, its \
-             lowering and every pass over it grow with its rows. State the chunk whole: one score tile \
-             per segment and the causal triangle in the mask."
-        ));
-    }
-    Ok(())
-}
-
-/// The rows of one parameter's buffer the program actually READS — every `ktdp.construct_access_tile`
-/// over any view of it, as the widest row extent; `0` when it takes no window at all.
-///
-/// ⭐ THIS IS WHERE `active_cap` MEETS THE PROGRAM. A bundle baked at `ActiveCap::NONE` sweeps no
-/// resident prefix, and its program says so by naming the cache tensor (so the identity survives) and
-/// taking no access tile of it. `nb == 0` on the device and "no prefix block" in the emulator are then
-/// the same statement rather than two.
-///
-/// ⛔ [`regions`] CANNOT ANSWER THIS. Its window fields come from the FIRST access tile whose corner
-/// is a pair of `arith.constant`s, and attention's kv corner is `arith.addi(col_start, kv_head·hd)` —
-/// so that field falls back to the whole view, which is the capacity and not the sweep.
-fn param_read_rows(f: &IRFunction<'static>, ptr: &Ssa) -> u32 {
-    param_tiles(f, ptr)
-        .filter_map(|t| shape_2d(t).map(|(rows, _)| rows))
-        .max()
-        .unwrap_or(0)
 }
 
 /// The `[rows, cols]` of the FIRST window the program takes of one parameter's buffer — its access
@@ -3599,17 +4607,34 @@ pub fn program_score_scale(f: &IRFunction<'static>) -> Option<f32> {
         .filter(|o| o.op_type == OpKind::LinalgMatmul)
         .filter_map(|o| o.result)
         .collect();
-    f.operations
+    // A multiply by a splatted constant: its result -> the constant.
+    let scaled_by: std::collections::HashMap<Ssa, f64> = f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::ArithMulf)
+        .filter_map(|o| Some((o.result?, *splat_of.get(o.operands.get(1)?)?)))
+        .collect();
+    // The SCORES scaled, `(q · kᵀ) * s`: the multiply's left operand is the score matmul.
+    let on_scores = f
+        .operations
         .iter()
         .filter(|o| o.op_type == OpKind::ArithMulf)
         .find_map(|o| {
             let l = o.operands.first()?;
-            let rr = o.operands.get(1)?;
             if !is_matmul.contains(l) {
                 return None;
             }
-            Some(*splat_of.get(rr)? as f32)
-        })
+            Some(*scaled_by.get(&o.result?)? as f32)
+        });
+    // ⭐ OR THE QUERY scaled before the score matmul, `(q * s) · kᵀ` — torch-spyre's spelling
+    // (decompositions.py:2175 scales Q once, outside its KV loop). `(q·s)·kᵀ = (q·kᵀ)·s`, so it is
+    // the same multiplier, read where a matmul takes its LEFT operand from such a multiply.
+    on_scores.or_else(|| {
+        f.operations
+            .iter()
+            .filter(|o| o.op_type == OpKind::LinalgMatmul)
+            .find_map(|o| Some(*scaled_by.get(o.operands.first()?)? as f32))
+    })
 }
 
 /// The CAP a [`Program::TanhSoftCap`](crate::ktir_node::Program::TanhSoftCap)
@@ -4430,1016 +5455,6 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
     Ok(ops)
 }
 
-/// main's `lower_attn_node` (main 9528-10376) BODY, at its const geometry — BATCHED over q-heads
-/// (BatchMatmul, batch=`num_q_heads`), reading the resident transposed-K + replicated K/V cache
-/// (seg2, worker-filled) over the full `cap` masked by `t{ATTN_MASK_TID}`. Decode (mq=1): per head
-/// `scores[1,cap] = Q·Kᵀ·scale + mask`, softmax, `out=probs·V`. Viewed as `[nqh, cap]` for the
-/// ew/softmax ops (mb=nqh, out=cap; `[nqh,1,cap]`≡`[nqh,cap]` bytes). Softmax reduce-outputs are one
-/// stick (like rmsnorm's mean).
-pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
-    a: AttnAt<'_>,
-    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
-) -> Result<Vec<EmittedOp>, Error> {
-    let AttnAt {
-        name: _name,
-        k,
-        r,
-        rows_are_requests,
-        gathers_kv,
-        chunk_pages,
-        scale_in_weights,
-        headmajor_handoff,
-        sym_id_base,
-        layout,
-    } = a;
-    // ⭐⭐⭐ THE OPERANDS COME FROM THE PROGRAM. main read them off `node.inputs` / `node.op` /
-    // `ir.tensors[..].rows`; the program states every one of them, so this is the same reading through
-    // the door this file's header describes — not a record the producer filled in beside it.
-    let ops_in = attn_operands(_name, k, r, geom)?;
-    let mq = ops_in.mq;
-    attn_program_is_flat_in_rows(_name, &k.func, mq, geom.nqh())?;
-    let (k_id, v_id) = (ops_in.k_id, ops_in.v_id);
-    let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());
-    let cap = ops_in.cap;
-    let stick = Fp16::ELEMS_PER_STICK; // 64
-    // ── PAGED-ATTENTION COMPUTE EXTENT, READ OFF THE PROGRAM ──
-    //
-    // ⭐⭐⭐ IT WAS `AttnAt::active_cap`, THE RUNG, RESOLVED HERE. The rung is a PRODUCER input: it
-    // decides how many rows of the resident cache the attention program takes an access tile of, so the
-    // program already carries the swept extent and the lowering can read it back. `param_read_rows`
-    // is that reading — the widest row extent any `ktdp.construct_access_tile` over the cache
-    // parameter takes, and 0 when the program takes none (`ActiveCap::NONE`'s zero-length segment).
-    //
-    // ⛔ AND THIS WAS MEASURED, NOT ARGUED. The old code resolved the rung and then checked only
-    // whether the two AGREED ABOUT ZERO — never that the extents matched — so whether the field was
-    // derivable had never actually been established. Making `active_cap != prefix_rows` a hard error
-    // and building granite-3.1-8b fp8 on the card, whose bake loops the whole
-    // `ActiveCap::decode_ladder` (`codegen.rs:9470`, one bundle per rung), it never fired: every rung
-    // of the ladder resolved to exactly what its program reads. The emulator alone would NOT have
-    // shown this — it bakes `ActiveCap::FULL`, where `resolve` is trivially `cap`, which is the same
-    // blind spot that let a wrong rope reading through.
-    let prefix_rows = param_read_rows(&k.func, &k.func.arguments[ops_in.k_param].0);
-    let active_cap: u32 = prefix_rows;
-    // ⛔⛔⛔ THE RUNG AND THE PROGRAM MUST AGREE ABOUT WHETHER THERE IS A PREFIX AT ALL, because
-    // that is the one place the two consumers could compute different things and neither would fault.
-    // `ActiveCap::NONE` means `nb == 0` here — the new-token block alone seeds and finalizes the
-    // softmax — and the producer says the same thing by taking NO access tile of the resident cache
-    // (the tensor is still named, so its identity survives; see the attention program's zero-length
-    // segment). A rung that swept nothing against a program that reads the prefix — or the reverse —
-    // is an emulator that cannot be an oracle for this node, so it is a build error naming both.
-    // The swept extent cannot exceed the buffer it sweeps: the cache parameter's own view states
-    // `cap` rows, and a program taking a window past that addresses bytes nothing wrote.
-    if prefix_rows > cap {
-        return err(format!(
-            "AttnDecode t{}: the program reads {prefix_rows} row(s) of the resident cache t{k_id} \
-             whose own view states only {cap} — the capacity read off that view is not the buffer \
-             this program addresses.",
-            ops_in.out_id,
-        ));
-    }
-    // ⭐⭐⭐ THE MULTIPLIER COMES FROM THE PROGRAM, AND IT IS THE ONLY READING OF IT. The attention
-    // program states `attention_multiplier` inline (`self.scalar(f64::from(scale))`) because the emulator
-    // interprets these ops and the three attention optimizers recognise the scale by pattern; the
-    // DEVICE reads it as a bound `[1,1]` const, whose slot is resolved below FROM THIS VALUE.
-    //
-    // ⛔ IT WAS A CALLER-STATED `f32` CHECKED AGAINST THIS DERIVATION, WHICH IS A SIDECAR. The check
-    // could only ever pass — every program that lowered at all agreed with its caller — so the value
-    // the caller passed was never the source of anything, only a second copy of one config number
-    // travelling `SubtileIR → params → SuperDSC` past the IR. A third-party producer had to supply a
-    // number its own program already states. There is one reading now, and no default: a program with
-    // no multiplier is a build error naming it.
-    //
-    // ⭐ EXCEPT THE TWO CASES WHERE THE PROGRAM CANNOT STATE IT. One is THE FOLD: when the bundle's
-    // `√attention_multiplier` was folded into `W_q`/`W_k`, the node's scale was rewritten to 1.0
-    // before the splice minted this program, and the triton→ktir pipeline folds a multiply by 1.0
-    // away entirely — the program TRUTHFULLY states no multiplier, because no device multiply is
-    // left to do (the weights carry `√scale` each). The other is THE UNIT SCALE: a model whose
-    // attention scale genuinely is 1.0 (gemma-4's arch defaults `attention_multiplier` to it) has
-    // no multiply to state in the first place, and the same pipeline folding takes it — and the
-    // skip arm below is the correct lowering for both, because `√1.0` leaves the weights carrying
-    // the whole scale either way. `scale_in_weights` is the caller's statement that one of these
-    // is the case; a multiplier-less program without it is still the build error below, and a
-    // program that states a real multiplier WHILE the caller says the weights carry the scale is
-    // the half-applied fold — the multiplies would double-scale pre-scaled weights, so it is
-    // refused, not best-efforted.
-    let scale_val = match program_score_scale(&k.func) {
-        None if scale_in_weights => None,
-        None => {
-            return Err(Error {
-                message: format!(
-                    "AttnDecode t{}: the program states no score multiplier. The attention program \
-                     scales its scores with an `arith.mulf` against an `arith.constant`, and the \
-                     descriptor's `[1,1]` scale const is resolved from that value, so a program \
-                     without one cannot be lowered — unless the bundle's score scale is already \
-                     carried by its staged weights (folded into W_q/W_k, or a unit attention \
-                     scale), which the caller must then state in `BundleAttnParams::scale_in_weights`.",
-                    ops_in.out_id,
-                ),
-            });
-        }
-        Some(v) if scale_in_weights && v != 1.0 => {
-            return Err(Error {
-                message: format!(
-                    "AttnDecode t{}: the bundle states its attention scale is carried by the staged \
-                     weights, but the program still states a score multiplier of {v}. Both cases \
-                     that carry the scale (the fold, a unit multiplier) mint the program at 1.0, so \
-                     a real multiplier here means the graph and the splice disagreed — emitting the \
-                     multiplies would scale weights that already carry the scale.",
-                    ops_in.out_id,
-                ),
-            });
-        }
-        some => some,
-    };
-    // SPAN-OVERFLOW GUARD (ported from torch-spyre's span_overflow_hint_analysis.py). Real
-    // corrective re-tiling of the resident cache's PHYSICAL STORAGE (not just the compute sweep
-    // `active_cap` already bounds) means paging the cache into multiple physical buffers — a
-    // structural change to the resident-KV allocation, not something this one call site can retrofit
-    // in place. So this guard does what torch-spyre's planner does BEFORE re-tiling: run the actual
-    // search (`cheapest_split_clearing_span`) and report the split it finds, rather than a bare
-    // "not implemented". Unreachable for every real model config checked so far (granite hd=64,
-    // cap up to several thousand: span ~0.5 MB against a 256 MB budget — see
-    // `ir::bridge::span_overflow`'s own tests) — kept as a real `cargo build` guard, not a runtime
-    // assert, so a future config that DOES trip it fails loudly with the fix already computed.
-    {
-        use crate::ir::bridge::span_overflow::{
-            MAX_SPAN_BYTES, cheapest_split_clearing_span, physical_span_bytes,
-        };
-        let span = physical_span_bytes(cap, hd, stick, Fp16::WORD_LENGTH);
-        if span > MAX_SPAN_BYTES {
-            let cap_dim = ItDim {
-                name: "cap",
-                size: cap,
-                is_reduction: false,
-                is_stick: true,
-                df: Df::Fp16,
-            };
-            let split_report = match cheapest_split_clearing_span(&cap_dim, |split| {
-                physical_span_bytes(cap / split.max(1), hd, stick, Fp16::WORD_LENGTH)
-            }) {
-                Ok(split) => format!(
-                    "the cheapest legal split of `cap` that clears the limit is {split}-way \
-                     (cap/{split}={} slots/core) — but applying it requires paging the resident \
-                     KV allocation, not implemented at this call site",
-                    cap / split.max(1)
-                ),
-                Err(e) => format!("no legal split of `cap` clears the limit either: {e}"),
-            };
-            return err(format!(
-                "AttnDecode t{}: resident K/V cache [cap={cap}, hd={hd}] physical span {span} B \
-                 exceeds the {MAX_SPAN_BYTES} B hardware addressing limit. {split_report}.",
-                ops_in.out_id,
-            ));
-        }
-    }
-    // ⛔ ONE SOURCE FOR THE PADDED ROW COUNT AND THE ROW LAWS: `attn_bundle_rows` is the parse
-    // boundary from the bundle's runtime width to the pad law WITH the geometry's consts in scope,
-    // and the SAME carrier rides into `assemble_attn`, so the two cannot disagree. A decode width
-    // (one row, or rows that are requests) must be a baked ladder rung there — the pad is
-    // `Rung<MQ>`'s compile-time arithmetic and every row extent is `RungRowLaws`' const
-    // (`MaskRows = NQH*MQ` by the compiler), and an unlisted width is this loud bake error, the
-    // same boundary discipline as the geometry door in `lower_one_node`. A prefill chunk's width is
-    // a runtime quantity and takes the runtime arm of the same law.
-    let bundle_rows = crate::sdsc_abstract::attn_bundle_rows(geom, mq, rows_are_requests)
-        .ok_or_else(|| Error {
-            message: format!(
-                "AttnDecode t{}: a decode bundle at {mq} query rows — not a width the decode \
-                     ladder bakes (1, or PagedKvPool::BATCH_RUNGS). The decode width is a const of \
-                     the bundle (`Rung<MQ>`); bake a listed rung, or grow the ladder and its \
-                     dispatch together.",
-                ops_in.out_id
-            ),
-        })?;
-    let width = bundle_rows.width();
-    let mq_pad = width.pad().rows();
-    let t = ops_in.out_id;
-    let q = crate::place::act_name(ops_in.q_id); // roped Q [mq, nqh·hd]
-    let new_k = crate::place::act_name(ops_in.new_k_id); // roped new-K [mq_pad, nkvh·hd] (worker zero-pads rows)
-    let new_v = crate::place::act_name(ops_in.new_v_id); // new-V       [mq_pad, nkvh·hd]
-    let kc = crate::place::act_name(k_id); // natural K cache [nqh, cap, hd] (seg2, GQA-replicated, slab-major)
-    let vc = crate::place::act_name(v_id); // natural V cache [nqh, cap, hd] (seg2, GQA-replicated, slab-major)
-    let kct = crate::place::act_name(kct_resident_tid(k_id)); // resident Kᵀ scratch [nqh, hd, cap]
-    // ⭐⭐⭐ AN ATTENTION WHOSE SCALE THE WEIGHTS CARRY STATES NO SCALE AT ALL. The √scale was
-    // FOLDED into W_q and W_k (the producer half's `attn_scale_weight_folds` recognition), or the
-    // model's attention scale IS 1.0 and there was nothing to fold: the splice minted this program
-    // at scale 1.0 either way, the triton→ktir pipeline folded the `qk · 1.0` multiply away
-    // entirely, and the registry census skipped the node's arm — so `scale_val` above is `None`,
-    // and the query and the roped new-K arrive over the staged weights already carrying √scale
-    // each: `(q·√s)·(k·√s)ᵀ` is `(q·kᵀ)·s` with no device multiply left to do. The skip arm at the
-    // multiplies below takes both: no registry lookups (a folded node pushed no slot, so looking
-    // anything up is a desync error by design), no `qs`/`new_k_scaled` buffers, and the score legs
-    // read `q` and the roped new-K directly.
-    let pmask = crate::place::act_name(ATTN_MASK_TID); // [nqh, cap]    prefix validity (worker-tiled, mb-broadcast over mq)
-    let cmask = crate::place::act_name(ATTN_CAUSAL_TID); // [mq, mq_pad] causal triu (worker-tiled)
-    // [mq, nqh·hd] — the identity; every scratch name below is a rendering of it.
-    let attn_id = PlaceId::Act(t);
-    let n = |r: SynthRole| syn(layout, attn_id.synth(r));
-    // ⭐ THE IDENTITY CLASS TID — which `[hd,hd]` identity table this attention class's krep/vrep and
-    // cachewr matmuls name. One table per DISTINCT AttnDecode head dim (the bake's
-    // `attn_class_hds` registry), because a hybrid model's wide class reads slab 1 of a
-    // max-hd placement holding a base-hd table as ALL ZERO (dump-proven on gemma-4
-    // tiny-allglobal: `newkrep` lanes 64..127 zero while lanes 0..63 equal the roped K).
-    // A uniform model resolves class 0, which IS `IDENTITY_TID`, so its ops are unchanged.
-    let ident = crate::place::act_name(
-        layout
-            .and_then(|l| l.identity_tid_of_class(hd))
-            .ok_or_else(|| Error {
-                message: format!(
-                    "AttnDecode t{t}: head_dim {hd} absent from BundleLayout.attn_class_hds {:?} \
-                     (registry desync — the placement pass and this lowering disagree about the \
-                     tape's attention classes, so which identity table this node reads is not a \
-                     fact either of them states)",
-                    layout.map(|l| l.attn_class_hds.clone()).unwrap_or_default(),
-                ),
-            })?,
-    );
-
-    let mut ops: Vec<EmittedOp> = Vec::new();
-
-    // ── (0) ZERO new_k/new_v's PADDING rows [mq..mq_pad) before anything reads them (BUG #3, see
-    // ATTN_ZERO_TID's placement comment above). `new_k`/`new_v` are a lifetime-reused seg3
-    // intermediate — never explicitly re-zeroed between steps/layers — so rows beyond the real `mq`
-    // can alias whatever unrelated tensor last lived at that byte range. The causal mask only
-    // reliably neutralizes BOUNDED garbage; this makes the padding actually zero instead of relying
-    // on that. Per-kv-head (nkvh, not nqh — new_k/new_v are still nkvh-wide here, before GQA-replicate
-    // expands them), one zero-copy each, matching ATTN_ZERO's own [mqp,hd] per-head-width shape.
-    if mq_pad.row_axis_extent() > mq {
-        let zero = crate::place::act_name(ATTN_ZERO_TID);
-        let pad_rows = mq_pad.row_axis_extent() - mq;
-        // THE ONE OFFSET LEFT THAT A NEST CANNOT EXPRESS, and the reason is a real layout defect, not
-        // a missing abstraction. `new_k`/`new_v` are ALLOCATED `[mq_pad, nkvh*hd]` but RoPE PACKS them
-        // by the REAL row count `mq`, so a per-head block holds exactly `mq` rows and has no room of
-        // its own for padding: "row mq of head kvh" is not an address that exists. Framing the zero-fill
-        // on the packed nest trips the footprint check at decode (mq=1) immediately, and framing it on
-        // the padded nest moves every other consumer. So the zeros go where they have always gone --
-        // past the packed data -- which is NOT where the Kt restickify reads this head's padding from.
-        // It reads the NEXT head's real K/V there and relies on the causal mask to neutralise it.
-        //
-        // Reconciling that means making RoPE write `mq_pad`-framed, which is a worker change as well as
-        // an emitter one. Until then this stays byte-identical rather than becoming a second convention.
-        for kvh in 0..nkvh {
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_kzero{kvh}_o{t}"),
-                "identity",
-                crate::sdsc_abstract::RowCount::of_zero_pad_rows(pad_rows),
-                crate::sdsc_abstract::BlockCols::of_head_dim(hd),
-                &[In::full(&rb(&zero, pad_rows, hd)).ew()],
-                &rb(&new_k, mq_pad.row_axis_extent(), nkvh * hd),
-                // FLAT, and that is the finding: this lands past the packed data, in a region no
-                // consumer reads (see the note above), so it is placed row-major rather than through
-                // the stick law. Saying `flat` makes which arrangement was meant explicit instead of
-                // leaving `mq*nkvh*hd + kvh*hd` for a reader to infer.
-                crate::addr::Nest::flat(
-                    &["row", "feat"],
-                    &[mq_pad.row_axis_extent(), nkvh * hd],
-                    Df::Fp16,
-                )
-                .view()
-                .at(crate::addr::Idx::<crate::addr::Row>::n(mq))
-                .at(crate::addr::Idx::<crate::addr::Feat>::n(kvh * hd))
-                .dev(),
-                sym_id_base,
-                layout,
-            ));
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_vzero{kvh}_o{t}"),
-                "identity",
-                crate::sdsc_abstract::RowCount::of_zero_pad_rows(pad_rows),
-                crate::sdsc_abstract::BlockCols::of_head_dim(hd),
-                &[In::full(&rb(&zero, pad_rows, hd)).ew()],
-                &rb(&new_v, mq_pad.row_axis_extent(), nkvh * hd),
-                crate::addr::Nest::flat(
-                    &["row", "feat"],
-                    &[mq_pad.row_axis_extent(), nkvh * hd],
-                    Df::Fp16,
-                )
-                .view()
-                .at(crate::addr::Idx::<crate::addr::Row>::n(mq))
-                .at(crate::addr::Idx::<crate::addr::Feat>::n(kvh * hd))
-                .dev(),
-                sym_id_base,
-                layout,
-            ));
-        }
-    }
-
-    // ── (1) GQA-replicate: NEITHER K nor V's freshly-computed new-token block replicates to nqh
-    // anymore. `kct`/(the value-side equivalent for the new block) only ever need ONE representative
-    // copy per kv-head group — the resident-cache side (`kc`/`vc`, still genuinely nqh-sized for
-    // their own OWN separately-proven cache-write convention) is untouched, but the new-token block's
-    // OWN scratch buffers (new_k_rep/new_v_rep) are fresh allocations with no such constraint, so
-    // dedup them too. `assemble_attn`'s new-block reads (both K, from before, and V, now) map query
-    // head h to its kv-head via `gqa_kv_head`, matching producer/consumer by construction.
-    //
-    // A DECODE BATCH TRIMS THEM TOO. The copies exist so a per-head reader finds its own replicated
-    // slot; the GQA-group-batched attention reads the REPRESENTATIVE slot directly and never looks at
-    // them, and a batched decode now runs that form. So the `nkvh*2` identity copies a layer are pure
-    // work at any batch width, for the same reason they are at one row.
-    //
-    // Prefill keeps them — it runs the per-head reader — so its bundles stay byte-identical.
-    let decode_trim =
-        // ⭐ THE PARAMETER, NOT THE GLOBAL. This function already RECEIVES the kind; reading the
-        // thread-local here was a second carrier for one fact, and the two could disagree.
-        // ⛔ AND `mq == 1` IS NOT "SOLO DECODE": it is also a one-token prefill chunk. The kinds
-        // coincide at width one, which is exactly why `bs=1` passing never proved anything about the
-        // batched kind. Keep both terms, but understand the first as a WIDTH fact and the second as a
-        // KIND fact — they are not two spellings of the same test.
-        mq == 1 || rows_are_requests;
-    let (new_k_rep, new_v_rep) = if decode_trim {
-        (new_k.clone(), new_v.clone())
-    } else {
-        (
-            syn(layout, attn_id.synth(SynthRole::NewKRep)),
-            syn(layout, attn_id.synth(SynthRole::NewVRep)),
-        )
-    };
-    if !decode_trim && let Some(l) = layout {
-        for r in [SynthRole::NewKRep, SynthRole::NewVRep] {
-            l.synth(attn_id.synth(r), &[mq_pad.row_axis_extent(), nkvh * hd]);
-        }
-    }
-    // PER-KV-HEAD BASE = `kvh * mq * hd` (2026-07-28, CORRECTED from an earlier `mq_pad` version that
-    // regressed decode). The stride between kv-head column-blocks in these `[*, nkvh*hd]` tensors is
-    // set by their PRODUCER, RoPE, which writes head h row r at
-    // `rope_prefill_block_offset(r,h,mq,hd) = h*mq*hd + r*hd` -- stride `mq`, the chunk's REAL query-row
-    // count, NOT the stick-padded `mq_pad`.
-    //
-    // SLAB-SPLIT, for the same reason as every other head-dim-spanning op here. A single
-    // `[mq_pad, hd]` copy addresses its own second stick at `mq_pad*stick` — its declared row count
-    // — but RoPE, which WROTE this buffer, puts it at `mq*stick`, because it packs each (head, slab)
-    // as `mq` tightly-strided rows. Those coincide only when a head is ONE stick, and at
-    // head_dim 128 / mq 31 / mq_pad 64 they are 2112 elements apart: every kv-head's upper half of K
-    // and V is copied from, and to, the wrong place on every prefill.
-    //
-    // At nslab == 1 there is one iteration, every slab term is 0, `stick == hd` makes `n`/`k`
-    // identical, and the name collapses -- granite-3.1-2b emits exactly what it did before.
-    let krep_nslab = (hd / stick).max(1);
-    for kvh in 0..nkvh {
-        if decode_trim {
-            break; // the copies are the identity — `new_k_rep`/`new_v_rep` ARE `new_k`/`new_v`.
-        }
-        for s in 0..krep_nslab {
-            // ⛔⛔⛔ NAMED AXES, NOT HAND-SUMMED PRODUCTS — the same conversion as `attn.rs`'s kv stream,
-            // and the same reason: `kvh * hd + s * stick` adds two products of DIFFERENT UNITS (kv-head x
-            // head_dim, slab x lanes) into one column, and the two are IDENTICAL at hd == stick == 64.
-            let slab_off =
-                crate::addr::Nest::new(&["row", "head", "feat"], &[mq, nkvh, hd], Df::Fp16)
-                    .view()
-                    .at(crate::addr::Idx::<crate::addr::Head>::n(kvh))
-                    .slab(s)
-                    .dev();
-            // The identity's (in-slab s, out-slab s) diagonal block, as a coordinate on the [in, out]
-            // kernel nest rather than the product `s*stick*(hd+stick)` it works out to.
-            let ident_off = crate::addr::Nest::new(&["row", "feat"], &[hd, hd], Df::Fp16)
-                .view()
-                .at(crate::addr::Idx::<crate::addr::Row>::n(s * stick))
-                .slab(s)
-                .dev();
-            let nm = |base: &str| {
-                if krep_nslab == 1 {
-                    format!("attn_{base}{kvh}_o{t}")
-                } else {
-                    format!("attn_{base}{kvh}s{s}_o{t}")
-                }
-            };
-            ops.push(assemble_matmul_off(
-                &nm("krep"),
-                crate::sdsc_abstract::MatM::of_padded_chunk_rows(mq_pad),
-                crate::sdsc_abstract::MatN::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                crate::sdsc_abstract::MatK::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                crate::sdsc_abstract::MatY::unbatched(),
-                crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-                    bmm_site::TapeLoweringSite::witness(),
-                ),
-                &rb(&new_k, mq_pad.row_axis_extent(), nkvh * hd),
-                slab_off,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &ident),
-                ident_off,
-                &rb(&new_k_rep, mq_pad.row_axis_extent(), nkvh * hd),
-                slab_off,
-                sym_id_base,
-                layout,
-            ));
-            ops.push(assemble_matmul_off(
-                &nm("vrep"),
-                crate::sdsc_abstract::MatM::of_padded_chunk_rows(mq_pad),
-                crate::sdsc_abstract::MatN::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                crate::sdsc_abstract::MatK::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                crate::sdsc_abstract::MatY::unbatched(),
-                crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-                    bmm_site::TapeLoweringSite::witness(),
-                ),
-                &rb(&new_v, mq_pad.row_axis_extent(), nkvh * hd),
-                slab_off,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &ident),
-                ident_off,
-                &rb(&new_v_rep, mq_pad.row_axis_extent(), nkvh * hd),
-                slab_off,
-                sym_id_base,
-                layout,
-            ));
-        }
-    }
-
-    // ── (2) qs = Q·sqrt_scale, new_k_scaled = new_k_rep·sqrt_scale (torch-spyre scales BOTH Q and K
-    // by sqrt(scale), so `scores = (Q·√s)@(K·√s)ᵀ = Q@Kᵀ·s`). The resident cache stores K ALREADY
-    // scaled (see the cache-write below), so the prefix score needs only qs scaled. new_k_scaled is
-    // nkvh-wide now (K dedup, see above) — assemble_attn's "new block" score reads it per-query-head
-    // via the SAME gqa-dedup mapping kct_base already uses (matching producer/consumer by construction).
-    //
-    // ⭐ WHEN THE PROGRAM STATES NO MULTIPLIER — OR STATES 1.0 (see the comment beside `scale_val`)
-    // this whole section is SKIPPED: no multiplies, no `[1,1]` consts looked up, no
-    // `qs`/`new_k_scaled` synthetics — the score legs read `q` and the roped new-K (which the fold
-    // already pre-scaled) by their own names.
-    let (qs, new_k_scaled) = match scale_val {
-        None | Some(1.0) => (q.clone(), new_k_rep.clone()),
-        // attention_multiplier (config) — see the ORIGINAL header doc: NO 1/sqrt(hd) recompute.
-        Some(scale_val) => {
-            // ⭐ ONE LOOKUP LAW — `scale_slot`, the door every other bound constant resolves
-            // through (exact bits, then the f16 image). This arm once carried its own bits-only
-            // copy of the lookup, which refused any config whose attention multiplier is not
-            // f16-exact: the program states the multiplier's fp16 image (its `qk * SCALE` mulf
-            // runs on the fp16 dot's result, so the constant is the f16-rounded spelling) while
-            // the census registers the config's f32, and the two agree by bits only when the
-            // value is f16-exact. The f16 image the fallback matches is the value the worker
-            // binds anyway (`SCALE_BYTES = 2`).
-            let scale_idx = scale_slot(layout, scale_val).ok_or_else(|| Error {
-                message: format!(
-                    "AttnDecode t{t}: scale {scale_val} absent from BundleLayout.scalarmul_scales \
-                     (registry desync)"
-                ),
-            })?;
-            // unused directly: torch-spyre splits into sqrt_scale on both Q and K.
-            let _scale = crate::place::act_name(scalarmul_scale_tid(scale_idx));
-            // ⭐ √scale IS READ OFF THE REGISTRY'S OWN ENTRY — the census pushed `scale.sqrt()`
-            // of the config's f32, so the bits the lookup below wants match BY CONSTRUCTION;
-            // recomputing from the program's spelling could miss the census's entry by one
-            // f16 ulp of double rounding when the slot above resolved through the f16 image.
-            let sqrt_scale_val = match layout {
-                Some(l) => l.scalarmul_scales[scale_idx].sqrt(),
-                None => scale_val.sqrt(),
-            };
-            let sqrt_scale_idx = layout
-                .and_then(|l| {
-                    l.scalarmul_scales
-                        .iter()
-                        .position(|s| s.to_bits() == sqrt_scale_val.to_bits())
-                })
-                .ok_or_else(|| Error {
-                    message: format!(
-                        "AttnDecode t{t}: √scale {sqrt_scale_val} absent from scalarmul_scales \
-                     (registry desync)"
-                    ),
-                })?;
-            let sqrt_scale = crate::place::act_name(scalarmul_scale_tid(sqrt_scale_idx)); // [1,1] = √attention_multiplier
-            let (qs, new_k_scaled) = (n(SynthRole::Qs), n(SynthRole::NewKScaled));
-            if let Some(l) = layout {
-                l.synth(attn_id.synth(SynthRole::Qs), &[mq, nqh * hd]);
-                l.synth(
-                    attn_id.synth(SynthRole::NewKScaled),
-                    &[mq_pad.row_axis_extent(), nkvh * hd],
-                );
-            }
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_qs_o{t}"),
-                "multiply",
-                // Q is `[mq, nqh*hd]`: the chunk's REAL rows, the full query feature width.
-                crate::sdsc_abstract::RowCount::of_query_rows(
-                    crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-                ),
-                crate::sdsc_abstract::BlockCols::of_feature_cols(nqh * hd),
-                // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: the qs synthetic above reserves
-                // `[mq, nqh*hd]` and Q is the same plane, so both handles state the swept extent —
-                // the mint's bound. The `[1,1]` √scale keeps `rbo`: one RedStick IS its whole
-                // swept window.
-                &[
-                    In::full(&rb(&q, mq, nqh * hd)).ew(),
-                    In::scalar(&rbo(&sqrt_scale)).ew(),
-                ],
-                &rb(&qs, mq, nqh * hd),
-                crate::addr::DevOff::ZERO,
-                sym_id_base,
-                layout,
-            ));
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_nks_o{t}"),
-                "multiply",
-                // new-K is allocated `[mq_pad, nkvh*hd]`: the scale covers the PADDED rows, zeros included.
-                crate::sdsc_abstract::RowCount::of_padded_chunk_rows(mq_pad),
-                crate::sdsc_abstract::BlockCols::of_feature_cols(nkvh * hd),
-                &[
-                    In::full(&rb(&new_k_rep, mq_pad.row_axis_extent(), nkvh * hd)).ew(),
-                    In::scalar(&rbo(&sqrt_scale)).ew(),
-                ],
-                &rb(&new_k_scaled, mq_pad.row_axis_extent(), nkvh * hd),
-                crate::addr::DevOff::ZERO,
-                sym_id_base,
-                layout,
-            ));
-            (qs, new_k_scaled)
-        }
-    };
-
-    // ⭐ THE GATHER'S INDEX TENSOR, NAMED BY ITS RESERVED TID'S OWN SPELLING — `act_name` is what the
-    // placement, the bind and the descriptor all resolve through, so the tensor the descriptor gathers
-    // from is the tensor the worker fills. Under the SAME `gathers_kv` that places it: the reference
-    // gathers its pages on every decode, so the one-request rung gathers alongside the batched rungs,
-    // while prefill — rows are positions sharing one resident history, nothing per-row for an index
-    // to select — keeps the sweep and its byte-identical emission.
-    //
-    // ⛔⛔⛔ AND UNDER THE **GEOMETRY** TOO, WHICH IS THE OTHER HALF OF THE ONE RULE. `gathers_kv`
-    // alone named a tensor that `assemble_attn` may then decline (`GatherScratch::of_fold_pass` refuses a
-    // head dim its flat copy cannot express) — so an 8b bundle reserved the index activation and carried a
-    // `KvBlockIndex` forward step for a gather that appears in no descriptor. Asking
-    // `GatherScratch::admits` HERE and at the placement (`lower_subtile_tape_to_superdsc`) makes the two
-    // halves ONE predicate; see that door for why the split was invisible at hd=64.
-    // ⭐⭐⭐⭐⭐ THE PAGE-GRANULAR DOOR, ASKED HERE SO THE TENSOR'S NAME AND THE EMISSION ARE ONE
-    // PREDICATE — AND A REFUSAL IS A **BUILD FAILURE**, NOT A SILENTLY UNGATHERED BUNDLE.
-    //
-    // ⛔⛔⛔ IT WAS `.is_some()`, AND THAT IS HOW AN hd=128 BUILD PASSED ITS GATE WHILE GATHERING
-    // NOTHING. `PageScratch::of_pass` refused two slabs, this gate turned the refusal into `None`,
-    // `assemble_attn`'s `zip` turned `None` into the ungathered bundle, and every test that asked
-    // "does the gather work" was answered by a 2b build where the door was open. A runtime refusal that
-    // falls back to the form that shipped is indistinguishable from a working feature at the one
-    // geometry it is exercised on.
-    //
-    // ⭐ `expect` IS A COMPILE-TIME FAILURE HERE. `#[forward]` runs this whole pipeline at macro
-    // expansion, so a geometry the page gather cannot express now stops the BUILD and names the
-    // quantity, instead of emitting a bundle that quietly drops the gather. Every geometry
-    // `rows_are_requests` can present is admissible by construction — `mq <= WIDEST_BATCH_RUNG` is the
-    // same 32 as `ENTRIES_PER_PASS_MAX`, `hd` is a whole number of sticks for every model, and the entry
-    // count is cut to fit both the IBR stick and the LX chunk (`PageScratch::entries_per_op`) — so this
-    // panic is unreachable rather than enforced, which is the only shape a panic in the emitter may have.
-    //
-    // ⛔ THE `KV_BLOCK_INDEX_TID` PLACEMENT RESERVES ON `gathers_kv` ALONE (see
-    // `lower_subtile_tape_to_superdsc` for the measured reason it is not narrowed), and with the door
-    // now total under that same predicate the two halves are the SAME set of bundles — the hd=128
-    // asymmetry that had three doors giving two answers is gone.
-    // ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK, minted here so a chunk width this geometry cannot express is a BUILD
-    // failure naming the quantity — `ChunkScratch::of_chunk` refuses more than one feature slab, more
-    // than `PAGES_MAX` pages, or a footprint past `u32`. A chunk is a gathered read, so it demands the
-    // same `gathers_kv` the placement reserved the index under: a chunk without it would gather through
-    // an index no placement holds.
-    // A batch's rows are requests over their own runs of the chunk (`sdsc_abstract::BatchChunk`), which
-    // `assemble_attn` mints from this chunk and the width — so the row kind decides the mask's READ, not
-    // whether a chunk is admissible.
-    let chunk: Option<crate::sdsc_abstract::ChunkScratch> = chunk_pages.map(|pages| {
-        assert!(
-            gathers_kv,
-            "attention {_name}: a split-KV chunk of {pages} page(s) is a gathered read — it needs \
-             `gathers_kv` (the index placement); rows_are_requests={rows_are_requests}"
-        );
-        let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
-        crate::sdsc_abstract::ChunkScratch::of_chunk(pool, pages).unwrap_or_else(|| {
-            panic!(
-                "attention {_name}: a split-KV chunk of {pages} page(s) at nkvh={nkvh}, hd={hd} is not \
-                 expressible — `ChunkScratch::of_chunk` refuses more than one {stick}-element feature \
-                 slab, more than {max} pages, or a footprint past a u32 descriptor extent",
-                stick = crate::sdsc_abstract::POOL_STICK,
-                max = crate::sdsc_abstract::ChunkScratch::PAGES_MAX,
-            )
-        })
-    });
-    let kv_block_index: Option<String> = gathers_kv.then(|| {
-        let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
-        // A chunk's own door was asked above; the per-page door is the batched rungs'.
-        if chunk.is_some() {
-            return crate::place::act_name(crate::reserved_tids::KV_BLOCK_INDEX_TID);
-        }
-        crate::sdsc_abstract::PageScratch::of_pass(
-            pool,
-            crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-        )
-        .unwrap_or_else(|| {
-            panic!(
-                "the paged attention bundle for a batch of {mq} request row(s) at nkvh={nkvh}, \
-                 hd={hd} cannot express a page-granular KV gather, and a batched-decode bundle has \
-                 no ungathered form to fall back to. `PageScratch::of_pass` refuses when hd is not a \
-                 whole number of {stick}-element sticks, when the batch is wider than {max} index \
-                 entries, when one entry's double-buffered pair does not fit LX, or when the plane's \
-                 footprint leaves a u32 descriptor extent. Fix the geometry or widen the door — do \
-                 NOT reintroduce a fallback.",
-                stick = crate::sdsc_abstract::POOL_STICK,
-                max = crate::sdsc_abstract::PageScratch::ENTRIES_PER_PASS_MAX,
-            )
-        });
-        crate::place::act_name(crate::reserved_tids::KV_BLOCK_INDEX_TID)
-    });
-    // ── (3) the unified score/softmax/output computation — ONE algorithm for any mq (see
-    // ir::bridge::tiled_op_sdsc_op::attn's module doc for the torch-spyre correspondence). The head
-    // geometry travels as the minted type, not as three integers this call could reorder, and the
-    // width travels fused to its row laws on the boundary's one carrier.
-    ops.extend(assemble_attn(
-        t,
-        geom,
-        bundle_rows,
-        cap,
-        active_cap,
-        &qs,
-        &new_k_scaled,
-        &new_v_rep,
-        &kct,
-        &vc,
-        &pmask,
-        &cmask,
-        // ⭐⭐⭐⭐⭐ THE GATHER, ON — the prefix score leg's Kᵗ operand takes its KV base from this index
-        // tensor instead of from the runtime's per-launch page shift.
-        //
-        // ⛔ GATED ON `gathers_kv`, WHICH IS THE SAME CONDITION THE PLACEMENT USES. Both halves
-        // of a gather have to be decided once: `compute_bundle_layout` places `KV_BLOCK_INDEX_TID`
-        // under this predicate, `BakeFacts::gathers_kv` reads that placement, and the forward tape's
-        // `KvBlockIndex` step comes from that. The reference gathers on every decode — batched and
-        // one-request alike — while prefill shares ONE resident history across every row, so there is
-        // nothing per-row for an index to select and its emission stays byte-identical to before this
-        // existed.
-        //
-        // ⛔ AND THE NAME IS THE RESERVED TID'S OWN SPELLING, not a synthetic. `act_name` is what the
-        // placement, the bind and the descriptor all resolve through, so the tensor the descriptor
-        // gathers from is the tensor the worker fills. A name no placement matches is a bind the
-        // launcher SKIPS in silence, and a skipped index reads as zero — block 0, a real address — so
-        // every row of the batch would answer from row 0's keys.
-        //
-        // ══════════════════════════════════════════════════════════════════════════════════════════
-        // ⭐⭐⭐⭐⭐ ON — AND WHAT IT IS ATTACHED TO IS THE WHOLE STORY. A VENDOR CONSTRAINT MEASURED ON
-        // THE CARD THREE TIMES:
-        //
-        // **DEEPTOOLS CANNOT SCHEDULE A GATHER ON AN OP THAT HAS A `KERNEL` — i.e. ON A MATMUL.**
-        //
-        // The bake refuses, and the two refusals bracket the cause exactly (granite-3.1-2b fp8, pod
-        // `nickm-7db9667cdd-z2jc6`):
-        //   index memOrg_ = hbm+lx  ->  `sbf-ddc: DtException: Expect a valid allocate node.,
-        //                                L3DlOpsScheduler.cpp:2337`
-        //   index memOrg_ = hbm     ->  `sbf-ddc: DtException: Expect LX in labeledDs memOrg_.,
-        //                                L3DlOpsScheduler.cpp:2334`
-        // Both lines are in `calculateFlopPerByte`, which for EVERY HBM-pinned labeledDs demands an LX
-        // memOrg entry AND an allocated LX node. `allocAllMem` gives one to each STAGED operand and
-        // never to an index — an index is read into the IBR, not staged — so the two requirements
-        // cannot both be met and there is no third `memOrg_` to try.
-        //
-        // ⭐ IT ONLY RUNS FOR A REUSE OP, AND THAT IS THE WHOLE ANSWER.
-        // `L3DlOpsScheduler.cpp:1550` gates it on `isReuse`, and `hasDimensionReuse` (`:303-321`) is
-        // *"`primaryDsInfo_.size() > 1 && primaryDsInfo_.count(DsTypes::KERNEL)`"*. So:
-        //   our score op       primaryDsInfo_ {INPUT, KERNEL, OUTPUT, KERNEL_IDX}  -> reuse, EXPLORER RUNS
-        //   test_gather_1core  primaryDsInfo_ {OUTPUT, KERNEL_IDX}                 -> no KERNEL, skipped
-        //   sdsc_add_paged_l3lu primaryDsInfo_ {OUTPUT, KERNEL_IDX}                -> no KERNEL, skipped
-        // Neither vendor fixture gathers on a matmul. `test_gather_1core`'s op is `identity`; IBM's
-        // paged attention gathers on `AddZero` — an elementwise copy — and feeds the RESULT to its
-        // matmul. `a-gather-is-an-ordinary-compute-op-with-an-index-annotated-operand` says exactly
-        // that, and this is the constraint that forces it.
-        //
-        // ⭐ SO THE SHAPE THAT BAKES IS A SEPARATE GATHER OP, AND THAT IS WHAT `assemble_attn` NOW EMITS:
-        // two KERNEL-less `identity` copies that move the paged Kᵗ and V blocks through the index into
-        // CONTIGUOUS scratches, with the score and value matmuls reading those scratches per-request and
-        // carrying no gather at all. `emit_sdsc` still refuses a gather on a KERNEL-bearing op at build
-        // time (`asking_the_shipped_prefix_fold_for_a_gather_is_refused_naming_the_kernel` drives this
-        // very call path to prove the refusal reaches it), so the constraint is enforced rather than
-        // remembered.
-        //
-        // ⛔ `Some` IS THE COUPLING, NOT A SWITCH. Passing the NAME is what makes the emitter unable to
-        // gather unless a caller has a tensor to name — and the caller that names it is the same one that
-        // must place it (`compute_bundle_layout`, under this same `rows_are_requests`) and stage it
-        // (`BakeFacts::gathers_kv` → the forward tape's `KvBlockIndex` step). A name no placement matches
-        // is a bind the launcher SKIPS in silence, and a skipped index reads as entry 0 — a REAL address,
-        // page 0's first block, so every row of the batch would answer from one request's keys.
-        //
-        // ⛔ AND `assemble_attn` MAY STILL DECLINE IT. `GatherScratch::of_fold_pass` refuses a head dim
-        // above one stick, because a 64-slot window of the V plane is then `nslab` runs `PLANE_SLOTS*64`
-        // apart and a flat block copy would relayout it. That bundle emits exactly what it emits today
-        // rather than a copy that bakes and scrambles the value leg.
-        kv_block_index.as_deref(),
-        chunk,
-        attn_id,
-        rows_are_requests,
-        // The head-major o_proj handoff — the bundle fact the finalize above and the o matmul's
-        // B-operand swap key on together. See [`AttnAt::headmajor_handoff`].
-        headmajor_handoff,
-        sym_id_base,
-        layout,
-    )?);
-
-    // ── (4) + (5): the KV cache write and the Kᵀ re-transpose — see [`kv_cache_write`].
-    ops.extend(kv_cache_write(
-        KvCacheWrite {
-            t,
-            mq,
-            nkvh,
-            hd,
-            rows_are_requests,
-            new_k: &new_k_scaled,
-            new_v: &new_v_rep,
-            kc: &kc,
-            vc: &vc,
-            kct: &kct,
-            ident: &ident,
-        },
-        sym_id_base,
-        layout,
-    )?);
-    Ok(ops)
-}
-
-/// What one step's KV cache write moves, and between which buffers — everything [`kv_cache_write`]
-/// reads off the attention it closes.
-pub struct KvCacheWrite<'a> {
-    /// The attention's output tensor, which every op's name is suffixed with.
-    pub t: u32,
-    /// The step's query rows: one decode token, a batch's requests, or a prompt chunk's positions.
-    pub mq: u32,
-    pub nkvh: u32,
-    pub hd: u32,
-    /// The rows are a decode batch's requests (one op per request), not one sequence's positions.
-    pub rows_are_requests: bool,
-    /// This step's new K (already √-scaled) and V, `[mq, nkvh·hd]` row-blocked.
-    pub new_k: &'a str,
-    pub new_v: &'a str,
-    /// The resident natural-K, V and Kᵀ planes.
-    pub kc: &'a str,
-    pub vc: &'a str,
-    pub kct: &'a str,
-    /// The `[64, 64]` identity the copies contract against.
-    pub ident: &'a str,
-}
-
-/// ── (4) KV CACHE WRITE: append this step's new_k_scaled (nkvh-wide, dedup)/new_v_rep (nqh-wide)
-/// into the resident cache, then (5) re-transpose the Kᵀ plane from it. K writes only the nkvh
-/// representative slots (kvh*gqa) — `kctpost` (below) only ever reads those; the other slots were
-/// always dead. V is UNCHANGED (nqh writes, genuinely all read via `vc`'s own nqh-replicated
-/// convention). Writes K ALREADY sqrt-scaled, so future steps' prefix scores need no further K scaling.
-///
-/// REQUEST-MAJOR, so that one request's kv-head copies are CONSECUTIVE and fuse into a
-/// single launch. A group resolves one request's page table and write cursor, so the run
-/// breaks where the request changes (`GroupKind::Slot`'s `req`) — kv-head-major order would
-/// alternate requests every op and leave every copy its own launch, which is what made a
-/// batch of 8 slower than 8 separate forwards. One request ⇒ this loop runs once and the
-/// order is exactly what it was.
-///
-/// Its own function, public, so the emitted parts of a wide prompt window are pinned off the op list
-/// this very code returns rather than off a copy of it.
-pub fn kv_cache_write(
-    w: KvCacheWrite<'_>,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
-    let KvCacheWrite {
-        t,
-        mq,
-        nkvh,
-        hd,
-        rows_are_requests,
-        new_k: new_k_scaled,
-        new_v: new_v_rep,
-        kc,
-        vc,
-        kct,
-        ident,
-    } = w;
-    let stick = Fp16::ELEMS_PER_STICK;
-    let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
-    let mut ops: Vec<EmittedOp> = Vec::new();
-    let per_request = rows_are_requests && mq > 1;
-    // ⛔⛔⛔ AND THE SLAB CANNOT JOIN THAT `y` AXIS — MEASURED ON CARD, NOT INFERRED. The pair
-    // `(h, s)` linearizes as `h*nslab + s`, and that index steps exactly ONE STICK PLANE on BOTH
-    // operands, so ONE `y` of `nkvh*nslab` should cover both loops. It passes every check this backend
-    // has — the builder's y-stride check at hd 64/128/256/512, a conservation law differenced out of
-    // both nests, two Kani proofs of coverage + injectivity — and granite-2b (hd=64, where nslab==1
-    // makes the two forms identical) stays coherent 10/10. On granite-8b at hd=128 it produces GARBAGE
-    // from the first token ("The is a 1", 10/10 runs). So whatever makes a `y` step cross a feature
-    // slab is NOT the address arithmetic; do not retry the pair walk on the strength of the
-    // arithmetic, which is correct and insufficient.
-    let src_nest = crate::addr::Nest::new(&["row", "head", "feat"], &[mq, nkvh, hd], Df::Fp16);
-    // ⛔ `PLANE_SLOTS`, NOT `PAGE_SLOTS`, AND LOAD-BEARING AT EVERY HEAD DIM — this extent IS the
-    // write's kv-head stride (the `y` step is derived from it), and every READER takes its head stride
-    // from `PagedKvPool::plane_block_elems()`, which is physical. Declaring the ADDRESSABLE page while
-    // the pool strides by the PHYSICAL plane splits one law into two: writes land at `kvh*PAGE_SLOTS*hd`
-    // and reads at `kvh*PLANE_SLOTS*hd`, so every kv head but 0 reads keys nobody wrote. MEASURED: that
-    // regressed granite-2b (hd=64) from coherent to garbled, which is how it was found.
-    let dst_nest = crate::addr::Nest::new(
-        &["slot", "feat"],
-        &[crate::sdsc_abstract::PagedKvPool::PLANE_SLOTS as u32, hd],
-        Df::Fp16,
-    );
-    // ASKED OF THE SHAPE, once: the slab count reaches this write only through `slabs_of`, so there is
-    // no `hd/64` in scope for the loop and the pitches to spell differently.
-    let slabs = crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd, Df::Fp16);
-    // ⭐⭐⭐ A PROMPT WINDOW WIDER THAN A PAGE IS WRITTEN IN PAGE PARTS.
-    //
-    // One launch resolves ONE page per group (the page holding the group's cursor), and a page plane is
-    // `PAGE_SLOTS` slots of ONE kv head — so a single `[mq, hd]` copy of more rows than that would run off
-    // the page into the NEXT KV HEAD's block. Instead each `(kv head, slab)` copy is cut into parts of
-    // `PAGE_SLOTS` rows: part `p` reads the chunk's rows from `p·PAGE_SLOTS` and writes the SAME baked
-    // destination, carrying `kv_slot_offset = p·PAGE_SLOTS` so the runtime aims it at the page that slot
-    // falls in (`fold_plan::op_slot_pos`), and skips it when the request holds no such page (a short
-    // last chunk's padding). A window is a whole number of pages (`PREFILL_CHUNK_SLOTS`'s module law)
-    // and starts at a page boundary (`chunk_write_start`), so every part fills its page from slot 0.
-    //
-    // PART-MAJOR, so a part's copies are consecutive and fuse into one launch — the same reason the
-    // loop is request-major. A window that fits a page is ONE part with offset 0, and every name, row
-    // and op is exactly what it was.
-    let page = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
-    let parts = if per_request { 1 } else { mq.div_ceil(page) };
-    let part_tag = |p: u32| {
-        if parts > 1 {
-            format!("_p{p}")
-        } else {
-            String::new()
-        }
-    };
-    for req in 0..if per_request { mq } else { 1 } {
-        // ⛔ NO REQUEST TERM IN THE ADDRESS. `req` here indexes a ROW OF THE ACTIVATION and nothing more:
-        // which page that row's token lands in is the host's page map, applied as a per-launch shift. A page
-        // holds slots, not requests, so the address inside it is `(kv head, slot, feature)`.
-        let rq = if per_request {
-            format!("_r{req}")
-        } else {
-            String::new()
-        };
-        // ⛔⛔⛔ THE HEADS GO ON `y` ONLY WHEN THIS OP COVERS ONE ROW, and `rows_per_op` is that test.
-        //
-        // The plane-walk placement declares `pitch = rows * nslab`, which describes head-outermost planes of
-        // `rows` rows. The source is row-outermost — head `h` of row `r` is at `r*(nkvh*hd) + h*hd`, heads
-        // INTERLEAVED inside a row — so the two readings agree only at one row, where the row axis is
-        // degenerate. Decode qualifies both ways: solo decode has `mq == 1`, and a batched decode step emits
-        // one op per request (`per_request`), each covering its single row. A PREFILL CHUNK does not: one op
-        // spans `mq` rows, and `y` then strides heads as if each owned `mq` consecutive rows.
-        //
-        // MEASURED, granite-2b (hd=64, nslab=1) with the collapse ungated: every prompt from 400 characters
-        // up decodes fluent garbage (`'(\x03d. .exaggeret'` for a prompt whose answer is `Paris`).
-        let rows_per_op = if per_request { 1 } else { mq };
-        let heads_on_y = rows_per_op == 1;
-        for p in 0..parts {
-            // The part's first source row, and the rows it copies: the whole request row, or the chunk's
-            // rows from `p·PAGE_SLOTS` up to a page of them (the last part takes the remainder).
-            let (row0, part_rows) = if per_request {
-                (req, 1)
-            } else {
-                (p * page, (mq - p * page).min(page))
-            };
-            let pt = part_tag(p);
-            for s in 0..slabs.get() {
-                for h in 0..if heads_on_y { 1 } else { nkvh } {
-                    let a_place = if heads_on_y {
-                        crate::sdsc_abstract::OperandPlacement::of_plane_walk_by_head(
-                            &src_nest,
-                            crate::addr::Idx::<crate::addr::Row>::n(row0),
-                            s,
-                            slabs,
-                        )
-                    } else {
-                        crate::sdsc_abstract::OperandPlacement::at_head(
-                            &src_nest,
-                            crate::addr::Idx::<crate::addr::Row>::n(row0),
-                            h,
-                            s,
-                            slabs,
-                        )
-                    };
-                    let o_place = if heads_on_y {
-                        crate::sdsc_abstract::OperandPlacement::of_plane_walk_by_head_block_base(
-                            &dst_nest, s, slabs,
-                        )
-                    } else {
-                        crate::sdsc_abstract::OperandPlacement::at_block(
-                            &dst_nest,
-                            crate::sdsc_abstract::PagedKvPool::block_of(kv_head_of(h, nkvh)?),
-                            s,
-                            slabs,
-                        )
-                    };
-                    // K writes only the nkvh representative slots (`kctpost` only ever reads those); V is the
-                    // nkvh-wide `new_v_rep`, whose reader is kv-head indexed too. Both sides of both writes are
-                    // therefore kv-head indexed, which is what lets ONE `y` axis serve them.
-                    for (base, src, dst) in [("kc", new_k_scaled, kc), ("vc", new_v_rep, vc)] {
-                        ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
-                        &if heads_on_y {
-                            format!("cachewr_{base}s{s}{rq}{pt}_o{t}")
-                        } else {
-                            format!("cachewr_{base}{h}s{s}{rq}{pt}_o{t}")
-                        },
-                        // The kv stream's REAL rows this copy covers: one per request-copy, else the part's.
-                        crate::sdsc_abstract::MatM::of_query_rows(
-                            crate::sdsc_abstract::QueryRowCount::of_mq(part_rows),
-                        ),
-                        crate::sdsc_abstract::MatN::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                        crate::sdsc_abstract::MatK::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                        // `y` WALKS THE KV HEADS OF THIS SLAB — the same door the score leg's GQA group uses, and
-                        // for the same reason: the batch axis carries BOTH operands' head strides, so it cannot be
-                        // asked for without stating where the heads are, and the builder refuses a walk that
-                        // strides by neither.
-                        if heads_on_y {
-                            crate::sdsc_abstract::MatY::of_gqa_group(nkvh, a_place, o_place)
-                        } else {
-                            // The head is in both offsets, so there is no batch axis to stride — and nothing for the
-                            // builder's stride check to be wrong about.
-                            crate::sdsc_abstract::MatY::unbatched()
-                        },
-                        crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::of_kv_cache_write(
-                        ),
-                        &rb(src, mq, nkvh * hd),
-                        a_place,
-                        // I[64,64] — the identity for EVERY slab, so the shared 2-D kernel a `y` batch demands is
-                        // exactly what an identity copy needs. Offset 0: see the residency argument above.
-                        &Stk::<KernelTag>::kernel(stick as usize, stick as usize, ident),
-                        crate::addr::DevOff::ZERO,
-                        &Stk::<KernelTag>::kernel(
-                            crate::sdsc_abstract::PagedKvPool::PLANE_SLOTS,
-                            hd as usize,
-                            dst,
-                        ),
-                        o_place,
-                        sym_id_base,
-                        layout,
-                    ));
-                        if let Some(o) = ops.last_mut() {
-                            o.slot_stride_bytes = stick * 2;
-                            // PAGED: the slot is the position WITHIN its page; the page comes from the block table.
-                            o.kv_page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
-                            // ⭐ TAGGED WITH ITS ROW, and it has to be. Untagged, this op took the page from the
-                            // LAUNCH's position — fine while the address carried a request term, because then the row
-                            // was already in the address. That term is gone: a page holds slots, so the ONLY thing that
-                            // says which page this row's token lands in is the tag, which `nonfold_page_delta` turns
-                            // into that row's page through the host's block table.
-                            o.kv_request = req;
-                            // The page part: the runtime aims it `p` pages past the cursor's (see above).
-                            o.kv_slot_offset = p * page;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ── (5) RE-TRANSPOSE the resident Kᵀ cache from the natural kc the cachewr just wrote, so NEXT
-    // step's prefix score reads this step's new K too (hd==stick only — guarded above).
-    //
-    // ONE RE-TRANSPOSE PER (REQUEST, KV-HEAD) — not one for the whole batch.
-    //
-    // This loop used to run over kv-heads only, so a batch of 8 re-transposed ONE page: the one
-    // `pool.write_base(kvh, hd)` names, which after the shim's per-op shift is request 0's. Every
-    // other request's freshly-written K therefore never reached `kct`, so its NEXT step scored the
-    // prefix against a stale Kᵀ.
-    //
-    // AND THE REQUEST IS THE ADDRESS, NOT A TAG — so the batch's re-transposes are ONE launch.
-    //
-    // Flat product loop (not nested) so the body below keeps the indentation — and the shape — of the
-    // whole-page form it is otherwise unchanged from.
-    //
-    // ⭐ AND ONE PER PAGE PART, PART-MAJOR — the window's second page holds natural K the cache write
-    // just wrote, and its Kᵀ is as stale as the first page's was. A whole-page re-transpose is already
-    // the per-page form, so a part is the same op aimed `p` pages on (`kv_slot_offset`), skipped with
-    // its cache write when the request holds no such page.
-    let kct_reqs = if per_request { mq } else { 1 };
-    for (p, req, kvh) in (0..parts)
-        .flat_map(|p| (0..kct_reqs).map(move |r| (p, r)))
-        .flat_map(|(p, r)| (0..nkvh).map(move |k| (p, r, k)))
-    {
-        let rq = if per_request {
-            format!("_r{req}")
-        } else {
-            String::new()
-        };
-        let pt = part_tag(p);
-        // WHOLE-PAGE re-transpose, structurally the proven full-`cap` form with the page (equal to
-        // that cap) substituted — NOT the slab-granular variant, whose on-card attempt regressed
-        // decode. Source and destination take the identical `layer + page` shift, which is why
-        // natural K lives in the page rather than a segment of its own.
-        ops.push(assemble_restickify_kt_2d(
-            &format!("attn_kctpost{kvh}{rq}{pt}_o{t}"),
-            crate::sdsc_abstract::KtTileSlots::of_page(),
-            crate::sdsc_abstract::KtTileFeats::of_head_dim(hd),
-            // ⭐ BOTH HANDLES AT THE PLANE'S OWN LAW — `pool.addr` is PLANE-RELATIVE (each plane is
-            // its own named tensor; the plane base is implicit in which name an op takes), so the
-            // bound the mint states is the plane's own `plane_stride()` — the one number that sizes
-            // the pool's placement, stated by the same function the offsets come from. The window is
-            // ONE block (`[PAGE_SLOTS, hd]`), which the pool's own doctest pins inside the stride
-            // for every head the block table can name; a kv head past `nkvh` now refuses HERE
-            // instead of re-transposing another plane's bytes into Kᵀ.
-            &rb(kc, 1, pool.plane_stride() as u32),
-            // The two planes are the whole content of this op: it reads natural K and writes Kᵀ, both at
-            // the same `(kv head)` block of the page the launch was shifted to.
-            crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
-                crate::sdsc_abstract::KvPlane::Knat,
-                kv_head_of(kvh, nkvh)?,
-            ))),
-            &rb(kct, 1, pool.plane_stride() as u32),
-            crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
-                crate::sdsc_abstract::KvPlane::Kt,
-                kv_head_of(kvh, nkvh)?,
-            ))),
-            sym_id_base,
-            layout,
-        ));
-        // ⭐ TAGGED WITH ITS ROW, for the same reason the cache writes are: this op reads natural K and
-        // writes Kᵀ within ONE row's page, and with no request term left in the address the tag is the only
-        // thing that tells the runtime which page that is.
-        if let Some(o) = ops.last_mut() {
-            o.kv_request = req;
-            o.kv_slot_offset = p * page;
-        }
-    }
-
-    Ok(ops)
-}
-
 /// main's PREFILL LAST-ROW EXTRACTION — the first half of `lower_prefill_lm_head_at_m1`
 /// (main `lower_subtile_tape_to_superdsc.rs:10496-10534`), verbatim below its door.
 ///
@@ -6049,6 +6064,585 @@ pub fn matmul_oriented(
 /// at the block, measured against that golden (it reproduces the fixture's
 /// `numWkSlicesPerDim_ {"out": 8, "mb": 4}` verbatim), so every pair of whole 64-stick extents now
 /// bakes. The stick law below is therefore the ONLY shape this door refuses, deliberately.
+/// The registry slot holding `value` — the bound `[1,1]` const every splatted constant reaches the
+/// card through (`BundleLayout::scalarmul_scales`).
+fn registry_const(name: &str, value: f32, layout: Option<&BundleLayout>) -> Result<String, Error> {
+    let idx = scale_slot(layout, value).ok_or_else(|| Error {
+        message: format!(
+            "{name}: the constant {value}, read off the program, is absent from \
+             `BundleLayout::scalarmul_scales` — the descriptor reads a bound `[1,1]` const, so the \
+             value the program states must have a registry slot (registry desync)"
+        ),
+    })?;
+    Ok(crate::place::act_name(scalarmul_scale_tid(idx)))
+}
+
+/// `x <min|max> c` with `c` a splatted constant — the walk's `min(tile_max - scores_max, 0)` clamp.
+/// The constant is the registry's bound `[1,1]` const sprayed over the tile, exactly as
+/// [`scalarmul_at`] sprays a multiplier.
+pub fn scalar_binary(
+    name: &str,
+    e: Elementwise,
+    value: f32,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let (ins, out) = split_out(name, r, layout, 1)?;
+    let (op_func, _) = elementwise_op_func(name, e)?;
+    let x = ins[0];
+    if x.c_start != 0 || out.c_start != 0 || x.r_start != 0 || out.r_start != 0 {
+        return err(format!(
+            "{name}: a constant-operand `{op_func}` over a windowed operand — it reads and writes \
+             whole buffers"
+        ));
+    }
+    if (x.r_len, x.c_len) != (out.r_len, out.c_len) {
+        return err(format!(
+            "{name}: `{op_func}` reads t{} `[{}, {}]` and writes t{} `[{}, {}]` — a pointwise op \
+             keeps its shape",
+            x.tid, x.r_len, x.c_len, out.tid, out.r_len, out.c_len
+        ));
+    }
+    let rows = out.r_len;
+    let (cols, store_cols) = pointwise_width_the_output_holds(
+        layout,
+        &[&out.name(), &x.name()],
+        rows,
+        out.v_cols,
+        DeviceWidth::for_pointwise(out.c_len).get(),
+    )?;
+    let c_name = registry_const(name, value, layout)?;
+    let (x_h, out_h, c_h) = (
+        rb(&x.name(), rows, store_cols),
+        rb(&out.name(), rows, store_cols),
+        rbo(&c_name),
+    );
+    let inputs = [In::full(&x_h).ew(), In::scalar(&c_h).ew()];
+    let mut tile_op = pointwise_tile_op(rows, cols, 1, 2);
+    tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 2 };
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
+        &format!("{op_func}_o{}", out.tid),
+        &tile_op,
+        op_func,
+        rows,
+        cols,
+        &inputs,
+        &out_h,
+        crate::addr::OutCorner::ZERO,
+        sym_id_base,
+        layout,
+    )])
+}
+
+/// A buffer SEEDED with one value — a walk's carried state at the value the program initialises it
+/// to (`tensor.splat` of a constant): the registry's bound `[1,1]` const, sprayed over the whole
+/// buffer by an `identity`.
+pub fn fill(
+    name: &str,
+    value: f32,
+    out: &Region,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let rows = out.r_len;
+    let (cols, store_cols) = pointwise_width_the_output_holds(
+        layout,
+        &[&out.name()],
+        rows,
+        out.v_cols,
+        DeviceWidth::for_pointwise(out.c_len).get(),
+    )?;
+    let c_name = registry_const(name, value, layout)?;
+    let (out_h, c_h) = (rb(&out.name(), rows, store_cols), rbo(&c_name));
+    let inputs = [In::scalar(&c_h).ew()];
+    let mut tile_op = pointwise_tile_op(rows, cols, 1, 1);
+    tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 1 };
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
+        &format!("fill_o{}", out.tid),
+        &tile_op,
+        "identity",
+        rows,
+        cols,
+        &inputs,
+        &out_h,
+        crate::addr::OutCorner::ZERO,
+        sym_id_base,
+        layout,
+    )])
+}
+
+/// `linalg.batch_matmul` `[b, m, k] × [b, k, n] → [b, m, n]` — ONE 2-D contraction per batch.
+///
+/// The activation and the output are read in the FLAT FRAME every rank-3 value lives in (`[b·m, k]`
+/// and `[b·m, n]`, [`shape_2d`]'s reading), so batch `i` is the row slice `[i·m, (i+1)·m)` of each —
+/// addressed at element base `i·m·stick` with the tensor's own row count as its device extent
+/// ([`assemble_matmul_rows`](crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_rows)). A
+/// slice of a stick-major tensor is contiguous rows only while the tensor is ONE stick wide; wider,
+/// the slice's sticks sit `b·m` rows apart, which is exactly what the device extent states.
+///
+/// The kernel is batch `i`'s own `[k, n]` block, `i·k·n` elements in: the batched transpose writes its
+/// output as those blocks ([`batch_transpose`]), and a one-stick-wide `[b·k, n]` flat frame IS them.
+/// The caller proves which of the two its kernel is; the descriptor here reads blocks.
+///
+/// An activation in [`BatchFrame::Blocks`] is read the same way, batch `i` the standalone stick-major
+/// `[m, k]` at `i·m·k`. The walk lays a multi-stick activation so before the contraction: a slice of
+/// the flat frame wider than a stick has its sticks `b·m` rows apart, and the card's contraction steps
+/// them by its own `m` rows whatever the descriptor states (MEASURED on granite-3.1-8b's score leg,
+/// the query's second stick read from the next kv head).
+///
+/// ⛔ THE BATCH DOES NOT RIDE `y`. A `y`-batched contraction shares ONE kernel across the batch
+/// (`SharedKernelBmmForm`'s own law — a 3-D kernel is dxp garbage), and each batch here has its own:
+/// the score leg's `Kᵀ` page block and the value leg's `V` page block of its kv head.
+pub fn batch_matmul(
+    name: &str,
+    batch: u32,
+    activation: BatchFrame,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let (ins, out) = split_out(name, r, layout, 2)?;
+    let (a, w) = (ins[0], ins[1]);
+    for (x, role) in [(&a, "activation"), (&w, "kernel"), (&out, "output")] {
+        if x.r_start != 0 || x.c_start != 0 || x.r_len != x.v_rows || x.c_len != x.v_cols {
+            return err(format!(
+                "{name}: the batched contraction's {role} t{} is a window of its `[{}, {}]` view — \
+                 its per-batch slices are addressed from the buffer base",
+                x.tid, x.v_rows, x.v_cols
+            ));
+        }
+    }
+    let stick = Fp16::ELEMS_PER_STICK;
+    if batch == 0 || !a.v_rows.is_multiple_of(batch) || !w.v_rows.is_multiple_of(batch) {
+        return err(format!(
+            "{name}: a {batch}-batch contraction over t{} `[{}, {}]` and t{} `[{}, {}]` — each \
+             operand's flat frame holds whole batches",
+            a.tid, a.v_rows, a.v_cols, w.tid, w.v_rows, w.v_cols
+        ));
+    }
+    let (m, k, n) = (a.v_rows / batch, a.v_cols, w.v_cols);
+    if w.v_rows / batch != k || (out.v_rows, out.v_cols) != (batch * m, n) {
+        return err(format!(
+            "{name}: the batched contraction does not state `[b, m, k] × [b, k, n] → [b, m, n]` in \
+             its flat frames: A `[{}, {}]`, W `[{}, {}]`, O `[{}, {}]` at batch {batch}",
+            a.v_rows, a.v_cols, w.v_rows, w.v_cols, out.v_rows, out.v_cols
+        ));
+    }
+    if !k.is_multiple_of(stick) || !n.is_multiple_of(stick) {
+        return err(format!(
+            "{name}: the batched contraction's k = {k} and n = {n} must be whole {stick}-element sticks"
+        ));
+    }
+    let rows = batch * m;
+    // ⭐ THE PROMPT TRIP'S FORM, under the plan that holds the walk query-row-major: ONE contraction,
+    // the rows split into the plan's chunks and every batch on every core, its kernel one block per
+    // batch read from HBM at one start (torch-spyre's prompt QKᵀ and P·V).
+    if activation == BatchFrame::HeadsInner {
+        let Some(crate::placement::WalkDivision::HeadsInner { chunks }) =
+            layout.and_then(|l| l.lx_division.get())
+        else {
+            return err(format!(
+                "{name}: a query-row-major contraction outside the plan that holds the walk so"
+            ));
+        };
+        use crate::ir::bridge::tiled_op_sdsc_op::matmul::opspec::{
+            BatchRows, matmul_opspec_rows_split,
+        };
+        let op = matmul_opspec_rows_split(
+            batch,
+            (m, n, k),
+            chunks,
+            (BatchRows::Inner, BatchRows::Inner),
+            (&a.name(), &w.name(), &out.name()),
+        )
+        .map_err(|message| Error {
+            message: format!("{name}: {message}"),
+        })?;
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+        return Ok(vec![emit_sdsc_tiled(
+            &format!("bmm_o{}", out.tid),
+            &op,
+            &folds,
+            sym_id_base,
+            layout,
+        )?]);
+    }
+    // ⭐ THE ALL-HEADS FORM, under the scratchpad plan that divides the walk one batch a core
+    // ([`crate::emit::lx_plan`]): ONE contraction, core `x` on batch `x`, its kernel in that core's
+    // LX — torch-spyre's own decode trip. The plan takes the division only if it keeps the kernel
+    // core-local; the probe says the form needs it, and the real lowering refuses it otherwise.
+    if let Some(l) = layout
+        && l.lx_division.get() == Some(crate::placement::WalkDivision::Batches(batch))
+        && activation == BatchFrame::Flat
+    {
+        let w_name = w.name();
+        if l.lx_probe.borrow().is_some() {
+            l.note_lx_touch(name, &w_name, crate::placement::LxShare::Required);
+        } else if !l.lx_core_local(&w_name) {
+            return err(format!(
+                "{name}: the all-heads contraction's kernel t{} is not core-local in LX — the plan \
+                 that divides this walk one batch a core keeps it there, and a per-core kernel read \
+                 from HBM faulted on the card",
+                w.tid
+            ));
+        }
+        let op = crate::ir::bridge::tiled_op_sdsc_op::matmul::opspec::matmul_opspec_x_batched(
+            batch,
+            (m, n, k),
+            (&a.name(), &w_name, &out.name()),
+        )
+        .map_err(|message| Error {
+            message: format!("{name}: {message}"),
+        })?;
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+        return Ok(vec![emit_sdsc_tiled(
+            &format!("bmm_o{}", out.tid),
+            &op,
+            &folds,
+            sym_id_base,
+            layout,
+        )?]);
+    }
+    let (a_h, w_h, o_h) = (
+        rb(&a.name(), rows, k),
+        Stk::<KernelTag>::kernel(k as usize, (batch * n) as usize, w.name()),
+        rb(&out.name(), rows, n),
+    );
+    // One contraction per batch, its activation the flat frame's rows or its own block.
+    let flat = match activation {
+        BatchFrame::Flat => true,
+        BatchFrame::Blocks => false,
+        BatchFrame::HeadsInner => {
+            return err(format!(
+                "{name}: a query-row-major activation has no per-batch rows of its own"
+            ));
+        }
+    };
+    let mut ops = Vec::with_capacity(batch as usize);
+    for i in 0..batch {
+        use crate::ir::bridge::tiled_op_sdsc_op::{RowsOperand, RowsShape, assemble_matmul_rows};
+        ops.push(
+            assemble_matmul_rows(
+                &format!("bmm{i}_o{}", out.tid),
+                RowsShape {
+                    m: MatM::of_token_rows(m),
+                    n: MatN::of_out_features(n),
+                    k: MatK::of_in_features(k),
+                    rows,
+                    a_rows: if flat { rows } else { m },
+                },
+                RowsOperand {
+                    h: &a_h,
+                    off: if flat { i * m * stick } else { i * m * k },
+                },
+                RowsOperand {
+                    h: &w_h,
+                    off: i * k * n,
+                },
+                RowsOperand {
+                    h: &o_h,
+                    off: i * m * stick,
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error {
+                message: format!("{name}: {message}"),
+            })?,
+        );
+    }
+    Ok(ops)
+}
+
+/// Where a batched operand's `[r, c]` batch blocks sit in its buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchFrame {
+    /// The stick-major flat frame `[b·r, c]`: block `i` is its rows `i·r..`, a contiguous run only
+    /// while `c` is one stick — wider, the blocks interleave stick by stick.
+    Flat,
+    /// The blocks one after another: block `i` the stick-major `[r, c]` run at `i·r·c` (a page read
+    /// `[kv, block, 128]`, permuted per kv head).
+    Blocks,
+    /// The query-row-major frame of the prompt trip ([`crate::placement::WalkDivision::HeadsInner`]):
+    /// the stick-major flat frame `[r·b, c]` with batch `i`'s row `p` at flat row `p·b + i`, every
+    /// batch's row `p` together — read and written by the row-split contraction
+    /// ([`crate::ir::bridge::tiled_op_sdsc_op::matmul::opspec::matmul_opspec_rows_split`]) against one
+    /// kernel block per batch.
+    HeadsInner,
+}
+
+/// A rank-3 `linalg.transpose` `[b, r, c] → [b, c, r]` — ONE 2-D relayout per batch, through the
+/// restickify door at each batch's element base ([`super::try_assemble_restickify_transpose_2d_at`]).
+///
+/// Its output is written as `b` `[c, r]` stick-major BLOCKS, block `i` at `i·c·r` — the kernels a
+/// batched contraction reads ([`batch_matmul`]) — not as the `[b·c, r]` flat frame: the two are the
+/// same bytes only at `r` one stick wide, and the score leg's `Kᵀ` page is `[hd, page]`.
+///
+/// ⛔ A [`BatchFrame::Flat`] INPUT'S BATCH BLOCKS ARE ITS FLAT FRAME'S ROWS, which is a contiguous
+/// `[r, c]` block only while `c` is one stick: wider, a batch's rows are interleaved stick by stick
+/// with every other batch's, and no base offset names them. Refused by name above one stick; an input
+/// in [`BatchFrame::Blocks`] is read block by block at any width.
+pub fn batch_transpose(
+    name: &str,
+    batch: u32,
+    input: BatchFrame,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let (ins, out) = split_out(name, r, layout, 1)?;
+    let a = ins[0];
+    let stick = Fp16::ELEMS_PER_STICK;
+    if batch == 0 || !a.v_rows.is_multiple_of(batch) {
+        return err(format!(
+            "{name}: a {batch}-batch transpose over t{} `[{}, {}]` — the flat frame holds whole \
+             batches",
+            a.tid, a.v_rows, a.v_cols
+        ));
+    }
+    let (rows, cols) = (a.v_rows / batch, a.v_cols);
+    if (out.v_rows, out.v_cols) != (batch * cols, rows) {
+        return err(format!(
+            "{name}: transposes `[{batch}, {rows}, {cols}]` into t{} `[{}, {}]` — a batched \
+             transpose's flat output is `[{}, {rows}]`",
+            out.tid,
+            out.v_rows,
+            out.v_cols,
+            batch * cols
+        ));
+    }
+    if cols != stick && input == BatchFrame::Flat {
+        return err(format!(
+            "{name}: a batched transpose of `[{batch}, {rows}, {cols}]` — a batch's `[{rows}, \
+             {cols}]` block is a contiguous run of the flat frame only at one {stick}-element stick \
+             wide; at {cols} its sticks interleave with the other batches' and need a relayout \
+             first"
+        ));
+    }
+    for (x, role) in [(&a, "input"), (&out, "output")] {
+        if x.r_start != 0 || x.c_start != 0 || x.r_len != x.v_rows || x.c_len != x.v_cols {
+            return err(format!(
+                "{name}: the batched transpose's {role} t{} is a window of its view — it moves whole \
+                 buffers",
+                x.tid
+            ));
+        }
+    }
+    let (a_h, o_h) = (
+        rb(&a.name(), a.v_rows, cols),
+        rb(&out.name(), out.v_rows, rows),
+    );
+    // ⭐ THE ALL-HEADS FORM, under the plan that divides the walk one batch a core: ONE relayout, core
+    // `i` on batch `i` (torch-spyre's decode trip), so each core's block lands where the all-heads
+    // contraction on that core reads its kernel.
+    if layout.is_some_and(|l| l.lx_division.get().is_some_and(|d| d.one_op_over(batch))) {
+        return Ok(vec![
+            super::try_assemble_restickify_transpose_batched(
+                &format!("transpose_o{}", out.tid),
+                batch,
+                (rows, cols),
+                (&a_h, &o_h),
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error {
+                message: format!("{name}: {message}"),
+            })?,
+        ]);
+    }
+    let mut ops = Vec::with_capacity(batch as usize);
+    for i in 0..batch {
+        ops.push(
+            super::try_assemble_restickify_transpose_2d_at(
+                &format!("transpose{i}_o{}", out.tid),
+                rows,
+                cols,
+                super::RestickifySide {
+                    h: &a_h,
+                    off: i * rows * cols,
+                },
+                super::RestickifySide {
+                    h: &o_h,
+                    off: i * cols * rows,
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error {
+                message: format!("{name}: {message}"),
+            })?,
+        );
+    }
+    Ok(ops)
+}
+
+/// ⭐ THE BOUND ON ONE ENTRY OF OUR ONE-STICK SUB-ROW GATHER COPY ([`page_gather`]), in bytes. That
+/// copy's initial chunk is one entry (`getInitialChunkParams` sets the chunk dims to their minimum),
+/// and at double buffering that chunk must fit LX (`L3DlOpsScheduler.cpp:1537`, "initial chunk
+/// parameters must fit in LX"). Measured through `dxp_standalone` on that form at 8 kv heads: a 64 KB
+/// entry (64 slots × 64 head dims) compiles, and 128 KB is refused.
+///
+/// It is this form's bound, not dxp's: the same dxp compiles torch-spyre's own whole-page gathers
+/// (its compiled prefill's `sdsc_4` and `sdsc_5`, 256 KB, one entry, one core), and a page of several
+/// blocks is gathered in that form, whole
+/// ([`crate::ir::bridge::tiled_op_sdsc_op::page_gather_page_opspec`]).
+pub const SUB_ROW_GATHER_ENTRY_BYTES_MAX: u32 = 64 * 1024;
+
+/// The pieces a gathered entry of `page_sticks` fp16 sticks is copied in: the fewest, a power of two
+/// (so its index scales by doubling, [`page_gather`]), whose piece fits [`SUB_ROW_GATHER_ENTRY_BYTES_MAX`]
+/// and is whole sticks. `None` when no power of two divides the entry so.
+pub fn gather_pieces(page_sticks: u32) -> Option<u32> {
+    let stick_bytes = Fp16::ELEMS_PER_STICK * Fp16::WORD_LENGTH;
+    let mut pieces = 1u32;
+    loop {
+        if !page_sticks.is_multiple_of(pieces) {
+            return None;
+        }
+        if (page_sticks / pieces) * stick_bytes <= SUB_ROW_GATHER_ENTRY_BYTES_MAX {
+            return Some(pieces);
+        }
+        pieces *= 2;
+    }
+}
+
+/// ⭐ THE PAGE GATHER — a load through an indirect tile whose one index entry selects a whole
+/// contiguous slab (`kp_desc.load([page, 0, 0, 0])`, every kv head of a page), copied into the
+/// contiguous scratch `out` its consumers read ([`crate::ir::bridge::tiled_op_sdsc_op::page_gather_copy_opspec`]).
+///
+/// `entries` index words from `first_entry`, `page_sticks` one-stick sub-rows each: the slab is read
+/// as one-stick rows because a gathered entry is a contiguous RUN, which is also what keeps the
+/// scratch's bytes the gathered slab's own row-major bytes. The consumers read the scratch in the flat
+/// frame — the same bytes only while a row is one stick wide; the caller refuses a wider one.
+///
+/// An entry past [`SUB_ROW_GATHER_ENTRY_BYTES_MAX`] is copied in `pieces` ([`gather_pieces`]): dxp steps a
+/// gather's index by its per-entry extent, so through an index already scaled by `pieces` (the
+/// caller's) a piece's extent steps a whole entry, and piece `p` reads and lands `p` pieces in.
+///
+/// ⛔ ONE ENTRY ONLY, IN PIECES. Several entries' pieces land a piece apart, and the form that landed
+/// them in a scratch and copied each piece to its entry's pitch (a stick-run copy a piece) was
+/// MEASURED wrong on the card (granite-3.1-2b's decode batch at 128-slot pages, tensordump): the
+/// piece gathers landed the pool's bytes, and the run copies dropped one piece, duplicated the
+/// others and wrote every entry to one pitch, so two concurrent requests' pages overwrote each
+/// other. A chunk of whole pages is gathered in one op instead
+/// ([`crate::ir::bridge::tiled_op_sdsc_op::page_gather_page_opspec`]); any other several-entry
+/// shape past the entry bound is refused here by name.
+pub fn page_gather(
+    name: &str,
+    g: &Gather,
+    (page_sticks, pieces): (u32, u32),
+    out: &Region,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::{
+        GatheredWords, PageGatherRows, assemble_page_gather_copy,
+    };
+    if pieces == 0 || !page_sticks.is_multiple_of(pieces) {
+        return err(format!(
+            "{name}: an entry of {page_sticks} sticks gathered in {pieces} pieces — a piece is whole \
+             sticks of the entry"
+        ));
+    }
+    if pieces > 1 && g.entries > 1 {
+        return err(format!(
+            "{name}: {} entries of {page_sticks} sticks, each past the {}-byte sub-row entry bound — \
+             several entries in pieces land a piece apart, and the run copy of each piece to its \
+             entry's pitch dropped and collided pages on the card; a chunk of whole pages gathers in \
+             one op (page_gather_page_opspec)",
+            g.entries, SUB_ROW_GATHER_ENTRY_BYTES_MAX
+        ));
+    }
+    let piece_sticks = page_sticks / pieces;
+    let stick = Fp16::ELEMS_PER_STICK;
+    let mut ops = Vec::with_capacity(pieces as usize);
+    for p in 0..pieces {
+        let gather = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+            crate::place::act_name(g.index_tid),
+            crate::superdsc_opspec::PageExtent::of_positions(piece_sticks),
+            g.first_entry,
+        );
+        let op_name = if pieces == 1 {
+            format!("gather_o{}", out.tid)
+        } else {
+            format!("gather{p}_o{}", out.tid)
+        };
+        ops.push(
+            assemble_page_gather_copy(
+                &op_name,
+                &crate::place::act_name(g.value_tid),
+                &out.name(),
+                gather,
+                PageGatherRows {
+                    rows: g.entries * piece_sticks,
+                    words: GatheredWords::Fp16,
+                    src_elems: p * piece_sticks * stick,
+                    dst_elems: p * piece_sticks * stick,
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error {
+                message: format!("{name}: {message}"),
+            })?,
+        );
+    }
+    Ok(ops)
+}
+
+/// ⭐ A CHAINED INDEX'S FIRST GATHER — the run of `g`'s index words for one position, copied into
+/// the one-stick scratch `run` through entry `chain.via_entry` of the position table: the index table
+/// (`g.index_tid`, one stick per position on the card) is the gathered value, the position its
+/// index. The gather proper then reads its index words from `run` ([`ChainedIndex`]). The words are
+/// int32, so the copy is `zero + run` against the one-stick `zero`
+/// ([`GatheredWords::SenUint32`](crate::ir::bridge::tiled_op_sdsc_op::GatheredWords::SenUint32)).
+pub fn index_run_gather(
+    name: &str,
+    g: &Gather,
+    chain: ChainedIndex,
+    (run, zero): (u32, u32),
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::{
+        GatheredWords, PageGatherRows, assemble_page_gather_copy,
+    };
+    let stick = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
+    if g.entries > chain.scale || chain.scale > stick {
+        return err(format!(
+            "{name}: a chained gather takes {} index words of a {}-word run — a run is at most \
+             the one {stick}-word index stick its gather reads",
+            g.entries, chain.scale
+        ));
+    }
+    let sticks = INDEX_RUN_WORDS / stick;
+    let gather = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+        crate::place::act_name(chain.via_tid),
+        crate::superdsc_opspec::PageExtent::of_positions(sticks),
+        chain.via_entry,
+    );
+    let op = assemble_page_gather_copy(
+        &format!("gather_run_o{run}"),
+        &crate::place::act_name(g.index_tid),
+        &crate::place::act_name(run),
+        gather,
+        PageGatherRows {
+            rows: sticks,
+            words: GatheredWords::SenUint32 {
+                zero: &crate::place::act_name(zero),
+            },
+            src_elems: 0,
+            dst_elems: 0,
+        },
+        sym_id_base,
+        layout,
+    )
+    .map_err(|message| Error {
+        message: format!("{name}: {message}"),
+    })?;
+    Ok(vec![op])
+}
+
 pub fn transpose(
     name: &str,
     r: &[Region],
@@ -7158,7 +7752,7 @@ mod elementwise_tests {
 
     /// One whole-buffer operand: the view IS the window, and the store windows tile it — the shape
     /// `regions()` reports for a parameter whose `construct_access_tile` takes all of its view.
-    fn reg(tid: u32, rows: u32, cols: u32, is_out: bool) -> Region {
+    pub(super) fn reg(tid: u32, rows: u32, cols: u32, is_out: bool) -> Region {
         Region {
             tid,
             v_rows: rows,
@@ -7345,15 +7939,23 @@ mod elementwise_tests {
         assert_eq!(ops[0].op_name, "multiply_o7");
     }
 
-    /// ⭐⭐⭐ THE ROW-SPLIT (Y) MODE NOW EMITS — the J-slot merge's own op at its production
-    /// geometry: the subtract whose operands are the `[256, 4]` score tile (dense) and the
-    /// `[64, 4]` merged max (the J-reduce's output, one spray's worth of rows), under a
-    /// `[256, 4]` output — the exact regions the batched paged-decode kernel's broadcast chain
-    /// resolves to. One op, still `sub_o*`: the operand mode is addressing, not a
-    /// decomposition, and the frame law (`RegionFrame::split_rows`) has already re-proven
-    /// `rows == y*mb` and the single-stick source before any operand was built.
+    /// The offset op `op` binds `buf` at.
+    fn bound_at(op: &EmittedOp, buf: &str) -> u32 {
+        op.arg_bindings
+            .iter()
+            .find(|b| b.buffer == buf)
+            .unwrap_or_else(|| panic!("{} binds {buf}", op.op_name))
+            .offset_elems
+    }
+
+    /// ⭐⭐⭐ AN OUTER SPRAY IS ONE FLAT OP PER SPRAY — the J-slot merge's subtract at its
+    /// production geometry: the `[256, 4]` score tile (dense) and the `[64, 4]` merged max (one
+    /// spray's worth of rows) under a `[256, 4]` output, the regions the batched paged-decode
+    /// kernel's broadcast chain resolves to. It was one `[y, mb, out]` op, the form the card
+    /// mis-addressed (see [`elementwise_by_outer_spray`]); it is now four flat `[64, 64]` ops, spray
+    /// `j`'s score and output rows `j · 64` in and the merged max read whole each time.
     #[test]
-    fn a_stated_y_broadcast_operand_emits_one_op() {
+    fn a_stated_y_broadcast_operand_emits_one_flat_op_per_spray() {
         let r = node(
             reg(5, 256, 4, false),
             reg(6, 64, 4, false),
@@ -7364,17 +7966,127 @@ mod elementwise_tests {
             "sub_s3",
             Elementwise::Sub,
             &r,
-            &[None, Some(BcastAxis::Y(4))],
+            &[None, Some(BcastAxis::Y(Spray::outer(4)))],
             &mut sym,
             None,
         )
-        .expect("the J-slot merge's subtract is the row-split operand mode");
-        assert_eq!(ops.len(), 1, "an operand mode is not a decomposition");
-        assert_eq!(
-            ops[0].op_name, "sub_o7",
-            "the descriptor NAME must not change with the operand mode — it feeds the bundle \
-             fingerprint, and the row-split arm is the same op",
+        .expect("the J-slot merge's subtract lowers");
+        assert_eq!(ops.len(), 4, "one flat op per spray");
+        for (j, op) in ops.iter().enumerate() {
+            let j = j as u32;
+            assert_eq!(op.op_name, format!("sub{j}_o7"));
+            assert_eq!(
+                bound_at(op, "t7"),
+                j * 64 * 64,
+                "spray {j}: the output's rows"
+            );
+            assert_eq!(bound_at(op, "t5"), j * 64 * 64, "spray {j}: the dense rows");
+            assert_eq!(bound_at(op, "t6"), 0, "spray {j}: the source, read whole");
+        }
+    }
+
+    /// ⭐⭐ A HEAD-DIM-128 CONTRACTION READS ITS QUERY AS BATCH BLOCKS — granite-3.1-8b's score leg:
+    /// 8 kv heads, each an `[84, 128]` query block contracted against its `[128, 64]` Kᵀ block. As a
+    /// slice of the `[672, 128]` flat frame, the card stepped the slice's second stick by the op's 84
+    /// rows (MEASURED: the card's scores match that read at rel-rms 0.0012, pinned walk or not), so
+    /// the walk hands the contraction standalone blocks: kv head `i`'s activation `i·84·128` elements
+    /// in, walked as its own `[84, 128]` (`-1`), its scores still rows `i·84..` of the output.
+    #[test]
+    fn a_multi_stick_batch_reads_its_activation_as_blocks() {
+        let r = node(
+            reg(5, 672, 128, false),
+            reg(6, 8 * 128, 64, false),
+            reg(7, 672, 64, true),
         );
+        let mut sym = 0i64;
+        let ops = batch_matmul("bmm_s3", 8, BatchFrame::Blocks, &r, &mut sym, None)
+            .expect("the score leg lowers");
+        assert_eq!(ops.len(), 8, "one contraction per kv head");
+        for (i, op) in ops.iter().enumerate() {
+            let i = i as u32;
+            assert_eq!(
+                bound_at(op, "t5"),
+                i * 84 * 128,
+                "kv head {i}: its own query block"
+            );
+            assert_eq!(
+                bound_at(op, "t7"),
+                i * 84 * 64,
+                "kv head {i}: its rows of the scores"
+            );
+        }
+        let sdsc = ops[1].op.as_ref().expect("an emitted descriptor");
+        let dsc = sdsc.dscs_[0].values().next().expect("one descriptor");
+        assert_eq!(
+            serde_json::to_value(&dsc.scheduleTree_[0].maxDimSizes_).expect("the walk serializes"),
+            serde_json::json!([-1, -1]),
+            "a standalone block: dxp rebuilds its own [84, 128]"
+        );
+    }
+
+    /// ⭐⭐ AN INNER SPRAY IS ONE ROW-VECTOR BROADCAST — a decode batch's mask over its query-head
+    /// group at granite-3.1-2b's 32-request rung: the walk's first `[256, 64]` chunk tile of a
+    /// `[1024, 64]` mask stack, each row repeated 4 times down a `[1024, 64]` score tile. One flat
+    /// op over the buffers read as stick-major `[4, 256 · 64]`, the tile a row vector, all from
+    /// each buffer's first byte.
+    #[test]
+    fn an_inner_spray_is_one_row_vector_broadcast() {
+        let mut tile = reg(6, 1024, 64, false);
+        tile.r_len = 256;
+        tile.r_cover = (0, 256);
+        let r = node(reg(5, 1024, 64, false), tile, reg(7, 1024, 64, true));
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "add_s3",
+            Elementwise::Add,
+            &r,
+            &[None, Some(BcastAxis::Y(Spray::inner(4)))],
+            &mut sym,
+            None,
+        )
+        .expect("the group mask add lowers");
+        assert_eq!(ops.len(), 1, "one row-vector broadcast");
+        for buf in ["t5", "t6", "t7"] {
+            assert_eq!(bound_at(&ops[0], buf), 0, "{buf} read from its first byte");
+        }
+    }
+
+    /// ⭐⭐ THE PROMPT WALK'S MASK ADD — granite-3.1-2b's 21-row rung adds its `[21, 64]` mask over
+    /// 32 head blocks of scores. The card wrote 52, then 362, of its 672 sticks as one `[y, mb, out]`
+    /// op; it is now 32 flat `[21, 64]` adds, head block `j`'s scores and output `j · 21` rows in,
+    /// the mask read whole.
+    #[test]
+    fn the_prompt_mask_add_is_one_flat_add_per_head_block() {
+        let r = node(
+            reg(5, 672, 64, false),
+            reg(6, 21, 64, false),
+            reg(7, 672, 64, true),
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "add_s3",
+            Elementwise::Add,
+            &r,
+            &[None, Some(BcastAxis::Y(Spray::outer(32)))],
+            &mut sym,
+            None,
+        )
+        .expect("the prompt mask add lowers");
+        assert_eq!(ops.len(), 32, "one flat add per head block");
+        for (j, op) in ops.iter().enumerate() {
+            let j = j as u32;
+            assert_eq!(
+                bound_at(op, "t7"),
+                j * 21 * 64,
+                "block {j}: the output's rows"
+            );
+            assert_eq!(
+                bound_at(op, "t5"),
+                j * 21 * 64,
+                "block {j}: the scores' rows"
+            );
+            assert_eq!(bound_at(op, "t6"), 0, "block {j}: the mask, read whole");
+        }
     }
 
     /// ⭐ AND THE DESCRIPTOR STATES THE Y-MAJOR FRAME — the same op built directly at the
@@ -7389,7 +8101,7 @@ mod elementwise_tests {
         let dense_h = rb("t5", 256, 64);
         let merged_h = rb("t6", 64, 64);
         let dense = In::full(&dense_h).ew();
-        let merged = In::y_broadcast(&merged_h, 4).ew();
+        let merged = In::y_broadcast(&merged_h, Spray::outer(4)).ew();
         let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
             &pointwise_tile_op(64, 64, 4, 3),
             256,
@@ -7431,6 +8143,131 @@ mod elementwise_tests {
         );
     }
 
+    /// ⭐ AND A `[y, mb, out]` OP'S CORES TAKE WHOLE SPRAYS at this door, at the prompt mask add's
+    /// shape (`[21, 64]` over `[y = 32, mb = 21]`): the elementwise law split `mb` under all 32
+    /// sprays, which the card measured as row-mixing (52 of 672 sticks). The elementwise lowering
+    /// no longer sends an outer spray here (it runs as flat ops,
+    /// `the_prompt_mask_add_is_one_flat_add_per_head_block`); this pins the door's own division.
+    #[test]
+    fn a_y_major_op_takes_one_spray_per_core() {
+        let scores_h = rb("t5", 672, 64);
+        let mask_h = rb("t6", 21, 64);
+        let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(21, 64, 32, 3),
+            672,
+            64,
+            op_func_from_str("add"),
+            &[
+                In::full(&scores_h).ew(),
+                In::y_broadcast(&mask_h, Spray::outer(32)).ew(),
+            ],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            crate::work::CoreDivision::Ew(EwDivision::Law),
+        )
+        .expect("the prompt walk's mask add emits");
+        assert_eq!(
+            (op.iter.split_of("y"), op.iter.split_of("mb")),
+            (32, 1),
+            "one spray per core, the rows whole"
+        );
+        // ⭐ AND dxp IS TOLD THE FRAME INNERMOST FIRST: rows innermost, `["mb", "y", "out"]`, the
+        // walk `[21, 32, 64]` and the sprayed mask's broadcast `y` at position 1. As written
+        // (`["y", "mb", "out"]`) the card walked `y` innermost and wrote sticks `21c + 32m`.
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = crate::emit::emit_sdsc("add_o7", &op, &folds, None).expect("it emits");
+        let dsc = &sdsc.dscs_[0]["add_o7"];
+        for n in &dsc.scheduleTree_ {
+            assert_eq!(n.layoutDimOrder_, vec!["mb", "y", "out"], "{}", n.name_);
+            assert_eq!(
+                serde_json::to_value(&n.maxDimSizes_).expect("the walk serializes"),
+                serde_json::json!([21, 32, 64]),
+                "{}",
+                n.name_
+            );
+        }
+        assert_eq!(
+            dsc.labeledDs_[1].scale_,
+            vec![1, -1, 1],
+            "the mask's broadcast `y`, in dxp's order"
+        );
+    }
+
+    /// ⭐ THE INNER SPRAY'S DESCRIPTOR STATES THE `[mb, y, out]` FRAME — the same op as the outer
+    /// spray's above, every tensor laid out `["mb", "y", "out"]` so flat row `b·y + j` is
+    /// `(b, j)`: the sprayed source `[mb, out]` reads `source[b, c]` at `result[b·4 + j, c]` —
+    /// each of its 64 rows repeated 4 times in a row (a decode batch's mask over its group). The
+    /// source's scale is the same stride-0 read, in the frame's own order.
+    #[test]
+    fn the_inner_row_spray_op_states_the_mb_y_out_frame() {
+        use crate::superdsc_opspec::Scale;
+        let dense_h = rb("t5", 256, 64);
+        let mask_h = rb("t6", 64, 64);
+        let dense = In::full(&dense_h).ew();
+        let mask = In::y_broadcast(&mask_h, Spray::inner(4)).ew();
+        let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(64, 64, 4, 3),
+            256,
+            64,
+            op_func_from_str("add"),
+            &[dense, mask],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            crate::work::CoreDivision::Ew(EwDivision::Law),
+        )
+        .expect("the inner row-spray op emits");
+        assert_eq!(op.iter.extent("mb"), 64, "mb is the source's rows");
+        assert_eq!(op.iter.extent("y"), 4, "y is the spray count");
+        for a in &op.args {
+            assert_eq!(
+                a.view().layout,
+                &["mb", "y", "out"] as &[&'static str],
+                "every tensor presents the inner frame: {}",
+                a.view().name
+            );
+        }
+        let mask_view = op
+            .args
+            .iter()
+            .find(|a| a.view().name == "t6")
+            .expect("the sprayed source's arg")
+            .view();
+        assert_eq!(
+            mask_view.scale,
+            &[Scale::Active, Scale::RedNonStick, Scale::Active] as &[Scale],
+            "the spray dim is the stride-0 read, in the `[mb, y, out]` order"
+        );
+    }
+
+    /// ⛔ ONE OP SPRAYS AT ONE ORDER — an outer and an inner spray of the same count under one op
+    /// would lay its tensors out two ways at once. Refused by name.
+    #[test]
+    fn an_op_mixing_spray_orders_is_refused() {
+        let a_h = rb("t5", 64, 64);
+        let b_h = rb("t6", 64, 64);
+        let err = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(64, 64, 4, 3),
+            256,
+            64,
+            op_func_from_str("add"),
+            &[
+                In::y_broadcast(&a_h, Spray::outer(4)).ew(),
+                In::y_broadcast(&b_h, Spray::inner(4)).ew(),
+            ],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            crate::work::CoreDivision::Ew(EwDivision::Law),
+        )
+        .expect_err("two orders under one op");
+        assert!(err.contains("one order"), "{err}");
+    }
+
     /// ⛔ THE TILE AND THE OPERANDS MUST AGREE ON THE SPRAY COUNT — a `TileOp` whose `y` dim
     /// states a different count than the y-broadcast operands spray is a caller that built its
     /// tile from a different shape than its operands, and the tiler's iteration space and the
@@ -7440,7 +8277,7 @@ mod elementwise_tests {
         let dense_h = rb("t5", 256, 64);
         let merged_h = rb("t6", 64, 64);
         let dense = In::full(&dense_h).ew();
-        let merged = In::y_broadcast(&merged_h, 4).ew();
+        let merged = In::y_broadcast(&merged_h, Spray::outer(4)).ew();
         let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
             &pointwise_tile_op(64, 64, 2, 3),
             256,
@@ -7469,7 +8306,7 @@ mod elementwise_tests {
         let dense_h = rb("t5", 256, 128);
         let merged_h = rb("t6", 64, 128);
         let dense = In::full(&dense_h).ew();
-        let merged = In::y_broadcast(&merged_h, 4).ew();
+        let merged = In::y_broadcast(&merged_h, Spray::outer(4)).ew();
         let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
             &pointwise_tile_op(64, 128, 4, 3),
             256,
@@ -7506,7 +8343,7 @@ mod elementwise_tests {
             "sub_s3",
             Elementwise::Sub,
             &r,
-            &[None, Some(BcastAxis::Y(4))],
+            &[None, Some(BcastAxis::Y(Spray::outer(4)))],
             &mut sym,
             None,
         ) else {
@@ -7519,13 +8356,60 @@ mod elementwise_tests {
         );
     }
 
-    /// ⛔ AND THE MULTI-STICK OUTPUT — a `[256, 128]` output under a row-split flag: the
-    /// source would have to be multi-stick, which the split law refuses (the split's `out` dim
-    /// IS the one stick). Refused by name at the same door.
+    /// ⭐ AND THE MULTI-STICK OUTPUT — a `[256, 128]` output under an outer spray of 4 goes ONE
+    /// STICK COLUMN AT A TIME as well as one spray at a time: a stick-major tensor's column `c` is
+    /// the contiguous `[rows, stick]` block `c·rows·stick` in, so spray `j`'s op on column `c`
+    /// reads and writes `c·256·64 + j·64·64` in, and the `[64, 128]` source's column `c·64·64` in.
+    /// The offsets are the whole claim, so they are what is pinned.
     #[test]
-    fn a_multi_stick_output_under_a_row_split_flag_is_refused() {
+    fn a_multi_stick_output_under_a_row_split_goes_one_stick_column_at_a_time() {
         let r = node(
             reg(5, 256, 128, false),
+            reg(6, 64, 128, false),
+            reg(7, 256, 128, true),
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[None, Some(BcastAxis::Y(Spray::outer(4)))],
+            &mut sym,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("the column-wise spray lowers: {}", e.message));
+        assert_eq!(
+            ops.len(),
+            4 * 2,
+            "one descriptor per spray and stick column of `out`"
+        );
+        for (k, op) in ops.iter().enumerate() {
+            let (j, c) = (k as u32 / 2, k as u32 % 2);
+            let rows = c * 256 * 64 + j * 64 * 64;
+            assert_eq!(
+                bound_at(op, "t7"),
+                rows,
+                "spray {j} column {c}: the output's rows"
+            );
+            assert_eq!(
+                bound_at(op, "t5"),
+                rows,
+                "spray {j} column {c}: the dense rows"
+            );
+            assert_eq!(
+                bound_at(op, "t6"),
+                c * 64 * 64,
+                "spray {j} column {c}: the source's column, read whole"
+            );
+        }
+    }
+
+    /// ⛔ THE COLUMN-WISE SPRAY STATES DENSE AND `Y` OPERANDS ONLY — a per-row `Col` operand beside
+    /// a multi-stick row split is a mode the per-column form does not address, refused by name.
+    #[test]
+    fn a_col_operand_beside_a_multi_stick_row_split_is_refused() {
+        let r = node(
+            reg(5, 256, 1, false),
             reg(6, 64, 128, false),
             reg(7, 256, 128, true),
         );
@@ -7534,15 +8418,15 @@ mod elementwise_tests {
             "sub_s3",
             Elementwise::Sub,
             &r,
-            &[None, Some(BcastAxis::Y(4))],
+            &[Some(BcastAxis::Col), Some(BcastAxis::Y(Spray::outer(4)))],
             &mut sym,
             None,
         ) else {
-            panic!("a multi-stick row-split source must not emit");
+            panic!("a Col operand beside a multi-stick row split must not emit");
         };
         assert!(
-            e.message.contains("SINGLE stick column"),
-            "names the single-stick law: {}",
+            e.message.contains("dense and `Y` operands only"),
+            "names the column-wise spray's operand law: {}",
             e.message
         );
     }
@@ -7772,7 +8656,7 @@ mod elementwise_tests {
             "add_s3",
             IntBinary::Add,
             &r,
-            &[None, Some(BcastAxis::Y(4))],
+            &[None, Some(BcastAxis::Y(Spray::outer(4)))],
             &mut sym,
             None,
         ) else {
@@ -8488,6 +9372,110 @@ mod elementwise_tests {
             ops1[0].arg_bindings.iter().all(|b| b.offset_elems != 0),
             "every binding of the chunked piece sits at its window's corner"
         );
+    }
+}
+
+#[cfg(test)]
+mod gather_pieces_tests {
+    use super::*;
+
+    /// A page of 8 kv heads × 64 slots: 64 KB at a head of 64 is one piece, 128 KB at 128 is two,
+    /// and an entry no power of two divides into whole sticks under the bound has no split.
+    #[test]
+    fn an_entry_past_the_bound_is_halved_until_it_fits() {
+        assert_eq!(gather_pieces(8 * 64), Some(1));
+        assert_eq!(gather_pieces(8 * 64 * 2), Some(2));
+        assert_eq!(gather_pieces(8 * 64 * 4), Some(4));
+        assert_eq!(gather_pieces(1536), Some(4), "3 × 64 KB: four 48 KB pieces");
+        assert_eq!(
+            gather_pieces(513),
+            None,
+            "odd and past the bound: no half is whole sticks"
+        );
+    }
+
+    /// ⛔ THE ONE-STICK SUB-ROW COPY's BOUND IS A MEASUREMENT, PINNED. dxp has no one constant for
+    /// it: the refusal is `allocAllMem` failing under double buffering (`L3DlOpsScheduler.cpp:1536`,
+    /// "initial chunk parameters must fit in LX"), whose footprint depends on the copy's form — the
+    /// same dxp compiles torch-spyre's 256 KB whole-page gathers. For this form, `dxp_standalone`
+    /// compiled a 64 KB entry and refused 128 KB. A change to the bound must come with a new
+    /// measurement of this form, so the number is held here.
+    #[test]
+    fn the_sub_row_copys_entry_bound_is_the_measured_64_kb() {
+        assert_eq!(SUB_ROW_GATHER_ENTRY_BYTES_MAX, 64 * 1024);
+        let stick_bytes = Fp16::ELEMS_PER_STICK * Fp16::WORD_LENGTH;
+        assert_eq!(
+            gather_pieces(SUB_ROW_GATHER_ENTRY_BYTES_MAX / stick_bytes),
+            Some(1),
+            "the measured 64 KB compiles whole"
+        );
+        assert_eq!(
+            gather_pieces(2 * SUB_ROW_GATHER_ENTRY_BYTES_MAX / stick_bytes),
+            Some(2),
+            "the measured 128 KB refusal is copied in halves"
+        );
+    }
+
+    /// ⛔ SEVERAL ENTRIES ARE NEVER COPIED IN PIECES — the run copy of each piece to its entry's pitch
+    /// dropped and collided pages on the card; one entry in halves still copies, several are refused
+    /// by name.
+    #[test]
+    fn several_entries_in_pieces_are_refused() {
+        let g = |entries: u32| Gather {
+            index_tid: 4,
+            value_tid: 2,
+            entries,
+            first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+            tile: Ssa(0),
+            load: Ssa(1),
+            via: None,
+        };
+        // A granite-3.1-2b page at 128 slots: 1024 sticks, 128 KB, two pieces.
+        let page = |entries: u32| elementwise_tests::reg(9, entries * 1024, 64, true);
+        let mut sym = 0i64;
+        let one = page_gather("walk", &g(1), (1024, 2), &page(1), &mut sym, None)
+            .expect("one entry copies in halves");
+        assert_eq!(one.len(), 2, "one gather a piece");
+        match page_gather("walk", &g(8), (1024, 2), &page(8), &mut sym, None) {
+            Err(e) => assert!(e.message.contains("collided pages"), "{}", e.message),
+            Ok(ops) => panic!("eight entries in pieces lowered to {} ops", ops.len()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod batch_transpose_tests {
+    use super::elementwise_tests::reg;
+    use super::*;
+
+    /// `[8, 64, 128] → [8, 128, 64]`, the score leg's `Kᵀ` pages at a head two sticks wide.
+    fn pages() -> Vec<Region> {
+        vec![reg(5, 8 * 64, 128, false), reg(6, 8 * 128, 64, true)]
+    }
+
+    /// In the flat frame a batch's `[64, 128]` block is not a contiguous run: refused by name.
+    #[test]
+    fn a_flat_input_two_sticks_wide_is_refused() {
+        let mut sym = 0i64;
+        let Err(e) = batch_transpose("t", 8, BatchFrame::Flat, &pages(), &mut sym, None) else {
+            panic!("a flat [8, 64, 128] transposed per batch");
+        };
+        assert!(e.message.contains("interleave"), "{}", e.message);
+    }
+
+    /// In blocks, batch `i` is read at `i · 64 · 128` and written at `i · 128 · 64`.
+    #[test]
+    fn an_input_in_blocks_is_read_block_by_block() {
+        let mut sym = 0i64;
+        let ops = match batch_transpose("t", 8, BatchFrame::Blocks, &pages(), &mut sym, None) {
+            Ok(ops) => ops,
+            Err(e) => panic!("{}", e.message),
+        };
+        assert_eq!(ops.len(), 8);
+        for (i, e) in ops.iter().enumerate() {
+            let offs: Vec<u32> = e.arg_bindings.iter().map(|a| a.offset_elems).collect();
+            assert_eq!(offs, [i as u32 * 64 * 128; 2], "{}", e.op_name);
+        }
     }
 }
 

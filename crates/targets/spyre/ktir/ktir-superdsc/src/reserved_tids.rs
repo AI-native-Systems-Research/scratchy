@@ -400,8 +400,45 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
     out
 }
 
+/// ⭐⭐⭐ THE PAGED STEP's HOST SOURCES — spyre-inference's own attention operands besides the pools:
+/// the mask stack, the page index table, the KV write index, the query row index and `kv_row_pool`,
+/// and a decode batch's `rep_row_ids`, `chunk_page_ids` and `mask_by_chunk`.
+///
+/// ⛔ RESERVED, NOT NUMBERED PAST THE GRAPH. They were `ir.tensors.len() + k`, the attention mask's
+/// old law — and a resident session holds the decode AND the prefill programs, whose graphs differ in
+/// size (the prefill's sampler mint and lm-head fold give it fewer tensors): MEASURED on granite-2b,
+/// the prefill's sources sat at t1157–t1159, which are REAL tensors of the decode graph, so every
+/// prompt step's staging overwrote decode-program state and the forward printed garbage. A reserved
+/// region names the same ids for every bundle and no graph can produce one.
+///
+/// A NEW REGION, below `kct_resident`'s floor: the gaps above it are burned (stale artifacts may still
+/// carry their old slots), and nothing has ever been baked here.
+pub const PAGED_STEP_BASE: u32 = u32::MAX - 2_000_171;
+
+/// The paged step's mask stack — see [`PAGED_STEP_BASE`].
+pub const PAGED_MASK_TID: u32 = reserved_region("paged_step").at(0);
+/// The paged step's page table — see [`PAGED_STEP_BASE`].
+pub const PAGED_PAGE_TABLE_TID: u32 = reserved_region("paged_step").at(1);
+/// The paged step's KV write index — see [`PAGED_STEP_BASE`].
+pub const PAGED_WRITE_ROWS_TID: u32 = reserved_region("paged_step").at(2);
+/// The paged step's query row index — see [`PAGED_STEP_BASE`].
+pub const PAGED_QUERY_ROWS_TID: u32 = reserved_region("paged_step").at(3);
+/// The paged step's `kv_row_pool` — see [`PAGED_STEP_BASE`].
+pub const PAGED_KV_ROW_POOL_TID: u32 = reserved_region("paged_step").at(4);
+/// A decode batch's `rep_row_ids` — see [`PAGED_STEP_BASE`].
+pub const PAGED_REP_ROWS_TID: u32 = reserved_region("paged_step").at(5);
+/// A decode batch's `chunk_page_ids` — see [`PAGED_STEP_BASE`].
+pub const PAGED_CHUNK_PAGES_TID: u32 = reserved_region("paged_step").at(6);
+/// A decode batch's `mask_by_chunk` — see [`PAGED_STEP_BASE`].
+pub const PAGED_CHUNK_MASKS_TID: u32 = reserved_region("paged_step").at(7);
+/// The decode step's int32 ZERO stick — `INDEX_RUN_WORDS` i32 zeros the host stages beside
+/// `kv_row_pool`: the add identity the chained index's run copy reads (`addi32toi32(zero, run)`, the
+/// int32 copy dxp binds — it has no int32 `identity`). Host-staged, as every int32 the attention
+/// reads is (SENUINT32-tagged i32 bytes) — see [`PAGED_STEP_BASE`].
+pub const PAGED_INT32_ZERO_TID: u32 = reserved_region("paged_step").at(8);
+
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 7] = [
+pub const RESERVED_REGIONS: [TidRegion; 8] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -459,6 +496,12 @@ pub const RESERVED_REGIONS: [TidRegion; 7] = [
         name: "kct_resident",
         base: u32::MAX - 1_000_171,
         slots: 1_000_000,
+    },
+    // ⭐ THE PAGED STEP's host sources — see [`PAGED_STEP_BASE`].
+    TidRegion {
+        name: "paged_step",
+        base: PAGED_STEP_BASE,
+        slots: 9,
     },
 ];
 
@@ -539,6 +582,7 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("rope_p_class").base == ROPE_P_CLASS_BASE);
     assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
     assert!(reserved_region("kct_resident").slots > 0);
+    assert!(reserved_region("paged_step").base == PAGED_STEP_BASE);
 };
 
 pub const SENTINELS_ARE_INSIDE_THEIR_REGION: () = {

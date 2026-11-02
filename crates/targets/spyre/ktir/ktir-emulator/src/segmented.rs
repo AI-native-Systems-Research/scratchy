@@ -237,26 +237,14 @@ pub(crate) fn apply_attention_rewrites<'a>(a: &'a Arena, module: &mut IRModule<'
     // because the tiling is a property of the device that runs it — the card DECLARES its work
     // division (`WorkPlan::divide` / `time_tile_for_lx`) and never wants a loop nest. This emulator
     // executes the ops against a real 2 MB LX and cannot hold `W[2048, 2048]` fp16 (8 MB) whole, so
-    // it re-tiles here. Runs BEFORE the attention rewrites: those recognise whole-tensor score/
-    // context blocks, and a contraction inside one must already be in its tiled form when they look.
+    // it re-tiles here.
     let n_mm = ktir_optimizer::matmul_tile::apply_matmul_tiling(a, module);
     if n_mm > 0 && std::env::var_os("KTIR_REWRITE_VERBOSE").is_some() {
         eprintln!("[ktir-optimizer] matmul LX tiling: {n_mm} contraction(s)");
     }
-    // HEAD RE-ROLL (below-cap, TODO #1): unrolled per-query-row head-parallel
-    // attention -> whole-`[m,*]` tensor ops. FLASH (above-cap, TODO #2): cap-tile
-    // the re-rolled `[m,cap]` context block with online softmax. Disjoint via the
-    // shared `attention_needs_flash` predicate; head runs first so flash sees its
-    // re-rolled form.
-    let n_head = ktir_optimizer::head_rewrite::apply_head_rewrite(a, module, |scores_bytes| {
-        ktir_optimizer::fusion::attention_needs_flash(scores_bytes, budget)
-    });
-    let n_flash = ktir_optimizer::flash_attn::apply_flash_attention(a, module, |scores_bytes| {
-        ktir_optimizer::fusion::attention_needs_flash(scores_bytes, budget)
-    });
     // TILE COALESCE: collapse K>=2 structurally-identical dim-0-tiled
-    // elementwise blocks (e.g. RoPE) into one whole-height block. Fail-safe and
-    // independent of the attention rewrites; default ON, skippable for A/B.
+    // elementwise blocks (e.g. RoPE) into one whole-height block. Fail-safe;
+    // default ON, skippable for A/B.
     let n_coalesce = if std::env::var_os("KTIR_NO_TILE_COALESCE").is_some() {
         if std::env::var_os("KTIR_REWRITE_VERBOSE").is_some() {
             eprintln!("[ktir-optimizer] tile coalesce DISABLED (KTIR_NO_TILE_COALESCE)");
@@ -275,7 +263,7 @@ pub(crate) fn apply_attention_rewrites<'a>(a: &'a Arena, module: &mut IRModule<'
     let n_sink = ktir_optimizer::splat_sink::apply_splat_sink(a, module);
     if std::env::var_os("KTIR_REWRITE_VERBOSE").is_some() {
         eprintln!(
-            "[ktir-optimizer] attention rewrites @ execution entry: head re-roll fired on {n_head} node(s), flash cap-tiling fired on {n_flash} node(s) (budget={budget} bytes); tile coalesce fired on {n_coalesce} node(s); splat sink reordered {n_sink} function(s)"
+            "[ktir-optimizer] rewrites @ execution entry (budget={budget} bytes): tile coalesce fired on {n_coalesce} node(s); splat sink reordered {n_sink} function(s)"
         );
     }
 }
