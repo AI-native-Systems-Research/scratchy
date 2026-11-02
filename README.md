@@ -104,6 +104,25 @@ Note the convention for selecting models and quants:
   it. `metal-base` in place of `metal` builds the same engine with a dense KV
   cache and no MTP heads (`metal-base,model/mtp-heads` keeps MTP).
 
+### Prebuilt binary (Homebrew)
+
+On macOS 26.2+ (Apple Silicon), the release build of `scr` is published
+signed (Developer ID) and notarized. This repo is its own Homebrew tap
+(`Formula/scr.rb`), so:
+
+```bash
+brew tap scratchy https://github.com/AI-native-Systems-Research/scratchy
+brew install scratchy/scr
+```
+
+The same artifact is attached to each [GitHub
+Release](https://github.com/AI-native-Systems-Research/scratchy/releases) as
+`scr-<tag>-macos-arm64.tar.gz` (with a `.sha256`). Publishing a release
+triggers `.github/workflows/release-macos.yml`, which builds
+`metal,model/all`, signs, notarizes, uploads, and commits the formula update
+back to this repo. The secrets and repo variable that workflow needs are
+listed in its comments.
+
 ### Deep Dives
 
 - See [`docs/blogs/REUSE.md`](docs/blogs/REUSE.md) — *What does "reuse" mean in
