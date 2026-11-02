@@ -393,30 +393,6 @@ impl PrefixLadder {
     }
 }
 
-/// ⭐ THE RUNG ONE REQUEST DEEP IN ITS CONTEXT DECODES ON — the index, in `rungs`' ascending order of
-/// `(width, first walk position)`, of the NARROWEST rung of width one or two whose first walk the
-/// request has reached; `None` keeps it on the owner's per-sequence walk.
-///
-/// A one- or two-row decode batch rung runs the batched kernel, whose walks are two chunks or more by
-/// bake (`BatchChunking::batch_walk_runs`), and past that first walk it decodes one request faster
-/// than the owner (granite-3.1-2b fp8: 36.5 against ~50.5 ms at ~4k on the two-row rung, 36.2 against
-/// 79.6 at ~10k on the one-row one; granite-3.1-8b bf16: 178.7 against 198.6 at ~10k). Short of it
-/// the owner is the faster.
-///
-/// ⛔ NEVER WIDER THAN TWO ROWS. The wider rungs' first walks start LOWER (two-chunk walks at 32
-/// pages of 128 slots split over more rows: 4096 slots at two rows, 2048 at four, down to 256 at
-/// 32), so "the first rung whose first walk is reached" is a 4-to-32-row rung below 4096 positions,
-/// one request decoding with up to 31 padding rows.
-#[cfg(any(test, feature = "spyre-hw"))]
-pub(crate) fn deep_solo_rung(
-    rungs: impl IntoIterator<Item = (u32, Option<u64>)>,
-    deepest_pos: u64,
-) -> Option<usize> {
-    rungs.into_iter().position(|(width, first_walk)| {
-        width <= 2 && first_walk.is_some_and(|first| deepest_pos >= first)
-    })
-}
-
 #[cfg(feature = "spyre-hw")]
 impl SuperDscBundle {
     /// THE RUNG A DECODE STEP RUNS ON — [`RungId::Owner`] when one request is live (the W=1
@@ -431,15 +407,22 @@ impl SuperDscBundle {
         live: scratchy_subtile::sdsc_abstract::LiveRows,
         deepest_pos: usize,
     ) -> Option<RungId> {
-        // ⭐ ONE REQUEST PAST A NARROW RUNG'S FIRST WALK RUNS ON IT — the one- or two-row decode batch
-        // rung, never a wider one (`deep_solo_rung`).
+        // ⭐ ONE REQUEST PAST THE TWO-ROW RUNG'S FIRST WALK RUNS ON THAT RUNG, its second row
+        // padding. A decode batch's walks are two chunks or more by bake
+        // (`BatchChunking::batch_walk_runs`), the form card-coherent on both granite models, and past
+        // that first walk it decodes one request faster than the owner's per-sequence walk
+        // (granite-3.1-2b fp8: 36.5 against ~50.5 ms at ~4k, 49.0 against 79.6 at ~10k;
+        // granite-3.1-8b bf16: 178.7 against 198.6 at ~10k). Short of it the owner's walk is the
+        // faster one, and every other decode is unchanged.
+        // The NARROWEST such rung: the one-row batched rung where the bake has one (it gathers each
+        // page once; granite-3.1-2b fp8 ~10k: 35.9 against the two-row rung's 43.5), else the
+        // two-row rung. The ladder is ascending by width, so the first match is the narrowest.
         if live.get() == 1
-            && let Some(i) = deep_solo_rung(
-                self.decode_rungs
-                    .iter()
-                    .map(|r| (r.seqs.count(), r.sess.first_walk_positions())),
-                deepest_pos as u64,
-            )
+            && let Some(i) = self.decode_rungs.iter().position(|r| {
+                r.sess
+                    .first_walk_positions()
+                    .is_some_and(|first| deepest_pos as u64 >= first)
+            })
         {
             return Some(RungId::Ladder(i));
         }
@@ -662,51 +645,5 @@ impl SampledDraw {
                 .unwrap_or_else(|| scratchy_core_common::fnv_seed64(req_id)),
             inv_t: (1.0 / sp.temperature) as f32,
         }))
-    }
-}
-
-#[cfg(test)]
-mod deep_solo_tests {
-    use super::deep_solo_rung;
-
-    /// ⭐ ONE REQUEST GOES TO THE ONE- OR TWO-ROW RUNG PAST ITS FIRST WALK, AND NEVER TO A WIDER ONE —
-    /// granite-3.1-2b's ladder as the bake states it: `(width, first walk)` ascending by width, the
-    /// two-chunk floors of `BatchChunking::batch_walk_runs` (6144 at one row on the half-way ladder,
-    /// 4096 at two, 2048 at four, down to 256 at 32).
-    #[test]
-    fn one_request_decodes_on_a_narrow_rung_past_its_first_walk_and_never_a_wide_one() {
-        let ladder = [
-            (1u32, Some(6144u64)),
-            (2, Some(4096)),
-            (4, Some(2048)),
-            (8, Some(1024)),
-            (16, Some(512)),
-            (32, Some(256)),
-        ];
-        for (pos, want) in [
-            (200, None),
-            (300, None),
-            (700, None),
-            (1100, None),
-            (2100, None),
-            (4095, None),
-            (4096, Some(1)),
-            (6143, Some(1)),
-            (6144, Some(0)),
-            (10132, Some(0)),
-        ] {
-            assert_eq!(deep_solo_rung(ladder, pos), want, "one request at {pos}");
-        }
-        // The 8b bakes no one-row rung: past 4096 it is the two-row rung at every depth.
-        let no_one_row = &ladder[1..];
-        for (pos, want) in [(300, None), (4095, None), (4096, Some(0)), (10132, Some(0))] {
-            assert_eq!(
-                deep_solo_rung(no_one_row.iter().copied(), pos),
-                want,
-                "8b, one request at {pos}"
-            );
-        }
-        // An unrolled rung states no walk and is never chosen.
-        assert_eq!(deep_solo_rung([(1, None), (2, None)], 10132), None);
     }
 }
