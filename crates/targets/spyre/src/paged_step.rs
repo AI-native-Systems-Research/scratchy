@@ -68,7 +68,22 @@ pub fn prove_ladder_walks(
         .map(|r| r.active_cap.get())
         .max()
         .unwrap_or(0);
-    for p in 1..=u64::from(top) {
+    // ⭐ ONE POSITION PER INTERVAL, NOT EVERY POSITION (#1037). Which rung `rung_for` selects, and so
+    // both properties checked below, depends only on which rungs' sweeps reach `p`, and that changes
+    // only where `p` crosses a sweep. So the positions `1`, every sweep `c` and `c + 1` up to the top
+    // land in every interval the selection is constant on, and proving them proves `1..=top` — a few
+    // positions a rung instead of granite-3.1-8b's ~105k per bundle at expansion.
+    let top = u64::from(top);
+    let mut probes: Vec<u64> = std::iter::once(1)
+        .chain(ladder.rungs().iter().flat_map(|r| {
+            let c = u64::from(r.active_cap.get());
+            [c, c + 1]
+        }))
+        .filter(|&p| (1..=top).contains(&p))
+        .collect();
+    probes.sort_unstable();
+    probes.dedup();
+    for p in probes {
         let (at, rung) = ladder.rung_for(p);
         let swept = rung.active_cap.get();
         if !rung.active_cap.covers(p) {
@@ -737,6 +752,74 @@ mod tests {
             "past the pool"
         );
         assert!(prove_ladder_walks(&meta(&[]), step()).is_err(), "no rung");
+    }
+
+    /// ⭐ THE INTERVAL PROOF IS THE EVERY-POSITION PROOF. `prove_ladder_walks` checks one position per
+    /// interval of constant rung selection; this checks it against walking every position, over
+    /// ladders that pass and ladders that fail each way, in any rung order.
+    #[test]
+    fn the_interval_proof_agrees_with_every_position() {
+        use crate::bundle_code::{LadderRung, RerollMeta, SiblingFp, SweptCols};
+        use std::borrow::Cow;
+        let meta = |caps: &[u32]| RerollMeta {
+            prefix: SiblingFp::none(),
+            suffix: SiblingFp::none(),
+            bodies: Cow::Owned(vec![SiblingFp::none()]),
+            bodies_fused: Cow::Owned(vec![SiblingFp::none()]),
+            rungs: Cow::Owned(
+                caps.iter()
+                    .map(|&c| LadderRung {
+                        active_cap: SweptCols::new(c),
+                        bodies: Cow::Owned(vec![SiblingFp::none()]),
+                        bodies_fused: Cow::Owned(vec![SiblingFp::none()]),
+                    })
+                    .collect(),
+            ),
+            fallback_rung: caps.len().saturating_sub(1) as u32,
+            launches: Cow::Owned(Vec::new()),
+            kv_page_stride: 0,
+            prefix_weight_bank: 0,
+            suffix_weight_bank: 0,
+        };
+        let every = |m: &RerollMeta<'_>, s: PagedStep| -> Result<(), String> {
+            let ladder = m.ladder()?;
+            let top = ladder
+                .rungs()
+                .iter()
+                .map(|r| r.active_cap.get())
+                .max()
+                .unwrap_or(0);
+            for p in 1..=u64::from(top) {
+                let (_, rung) = ladder.rung_for(p);
+                if !rung.active_cap.covers(p)
+                    || s.on_body(s.rows, s.paged_rows, rung.active_cap.get())
+                        .is_none()
+                {
+                    return Err(format!("{p}"));
+                }
+            }
+            Ok(())
+        };
+        // `step()`: a 4-page pool of 4-slot pages.
+        for caps in [
+            &[8][..],
+            &[4, 8, 16],
+            &[16, 4, 8],
+            &[6],
+            &[4, 6, 16],
+            &[4, 32],
+            &[16, 12],
+            &[1],
+            &[4, 4, 8],
+            &[],
+        ] {
+            let m = meta(caps);
+            assert_eq!(
+                prove_ladder_walks(&m, step()).is_ok(),
+                every(&m, step()).is_ok(),
+                "ladder {caps:?}"
+            );
+        }
     }
 
     /// The pool is the model's context where every layer's K and V of it fit one device region,
