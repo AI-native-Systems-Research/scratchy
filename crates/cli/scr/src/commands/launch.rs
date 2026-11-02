@@ -204,11 +204,32 @@ async fn run_auto_mode_only(
     // serves under a name of the server's own.
     let local_model =
         served_model_id(&local_url, &args.auth_token).unwrap_or_else(|| model.to_string());
-    let proxy = super::launch_proxy::start(super::launch_proxy::Routes {
-        gateway: gateway.clone(),
-        local: local_url.clone(),
-        local_model: local_model.clone(),
-    })
+    // The proxy logs into the server's own log, so one file holds each safety
+    // check next to the server's lines for it. A `--server-url` server has no
+    // log of launch's to share.
+    let proxy_log = match &server {
+        Some(s) => {
+            eprintln!(
+                "Proxy traffic is logged to the server log too (grep '\\[proxy\\]' {}).",
+                s.log_path.display()
+            );
+            Some(append_log(&s.log_path)?)
+        }
+        None => {
+            eprintln!(
+                "Note: with --server-url there is no server log of launch's, so the proxy logs nothing."
+            );
+            None
+        }
+    };
+    let proxy = super::launch_proxy::start(
+        super::launch_proxy::Routes {
+            gateway: gateway.clone(),
+            local: local_url.clone(),
+            local_model: local_model.clone(),
+        },
+        proxy_log,
+    )
     .await?;
     let proxy_url = format!("http://{}", proxy.addr);
 
@@ -1169,6 +1190,17 @@ struct ServerProcess {
     /// The `--max-model-len` it was started with, to check the window it
     /// reports against.
     max_model_len: Option<usize>,
+    /// The server's log file, which the `--auto-mode-only` proxy appends to.
+    log_path: std::path::PathBuf,
+}
+
+/// `path` opened for appending, so writers sharing it never overwrite each
+/// other's lines.
+fn append_log(path: &std::path::Path) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open log file {}", path.display()))
 }
 
 impl ServerProcess {
@@ -1187,8 +1219,12 @@ impl ServerProcess {
         // leaving the device choice, prompt sizes, and prefill/decode timings
         // available for debugging.
         let log_path = std::env::temp_dir().join(format!("scr-launch-{port}.log"));
-        let log_file = std::fs::File::create(&log_path)
+        std::fs::File::create(&log_path)
             .with_context(|| format!("failed to create server log file {}", log_path.display()))?;
+        // Append mode, so each write lands at the end of the file: the
+        // `--auto-mode-only` proxy writes its lines to this same log, and a
+        // handle writing at its own offset would overwrite them.
+        let log_file = append_log(&log_path)?;
         let log_file2 = log_file
             .try_clone()
             .context("failed to clone the server log file handle")?;
@@ -1262,6 +1298,7 @@ impl ServerProcess {
             child,
             port,
             max_model_len,
+            log_path,
         })
     }
 }

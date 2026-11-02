@@ -28,6 +28,7 @@
 //!   denies every action: 0/8 parseable without it, 24/24 with it. The
 //!   security prompt itself is left as Claude Code wrote it.
 
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,6 +90,49 @@ pub(crate) struct Routes {
 struct Proxy {
     routes: Routes,
     agent: ureq::Agent,
+    /// Where each request is logged, one `[proxy]` line apiece: the local
+    /// server's own log, opened for appending. `None` logs nothing.
+    log: Option<std::sync::Mutex<std::fs::File>>,
+}
+
+/// One `[proxy]` log line: where a request went and how it went. No bodies and
+/// no headers, so it carries no prompts and no credentials.
+struct LogLine<'a> {
+    to: &'a str,
+    method: &'a Method,
+    path: &'a str,
+    model: Option<&'a str>,
+    /// The upstream's status, or the error that replaced it.
+    outcome: Result<u16, &'a str>,
+    ms: u128,
+    req_bytes: usize,
+}
+
+impl std::fmt::Display for LogLine<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Unix seconds, so the line sorts and compares against the server's
+        // own timestamps without a date-formatting dependency.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        write!(
+            f,
+            "{}.{:03} [proxy] to={} model={} ",
+            now.as_secs(),
+            now.subsec_millis(),
+            self.to,
+            self.model.unwrap_or("-")
+        )?;
+        match self.outcome {
+            Ok(status) => write!(f, "status={status}")?,
+            Err(e) => write!(f, "status=502 error={e:?}")?,
+        }
+        write!(
+            f,
+            " ms={} req_bytes={} {} {}",
+            self.ms, self.req_bytes, self.method, self.path
+        )
+    }
 }
 
 /// A running proxy. Dropping it stops the listener.
@@ -105,8 +149,9 @@ impl Drop for ProxyHandle {
     }
 }
 
-/// Start the proxy on a free local port.
-pub(crate) async fn start(routes: Routes) -> Result<ProxyHandle> {
+/// Start the proxy on a free local port. With `log`, each request appends one
+/// `[proxy]` line to that file.
+pub(crate) async fn start(routes: Routes, log: Option<std::fs::File>) -> Result<ProxyHandle> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(UPSTREAM_TIMEOUT))
         // A non-2xx answer is the gateway's to give Claude Code, not an error
@@ -115,7 +160,11 @@ pub(crate) async fn start(routes: Routes) -> Result<ProxyHandle> {
         .max_redirects(0)
         .build()
         .into();
-    let state = Arc::new(Proxy { routes, agent });
+    let state = Arc::new(Proxy {
+        routes,
+        agent,
+        log: log.map(std::sync::Mutex::new),
+    });
     let app = axum::Router::new()
         .fallback(handle)
         // axum caps a `Bytes` body at 2 MB by default. A long Claude Code
@@ -157,10 +206,34 @@ async fn handle(
         .to_string();
     // The proxy's own thread pool is tokio's; ureq is blocking.
     let proxy2 = proxy.clone();
-    let result =
-        tokio::task::spawn_blocking(move || route(&proxy2, &method, &path, &headers, &body))
-            .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("proxy task failed: {e}")));
+    let result = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let (to, result) = route(&proxy2, &method, &path, &headers, &body);
+        if let Some(log) = &proxy2.log {
+            let model = serde_json::from_slice::<Value>(&body).ok();
+            let error = result.as_ref().err().map(|e| format!("{e:#}"));
+            let line = LogLine {
+                to,
+                method: &method,
+                path: &path,
+                model: model.as_ref().and_then(|m| m["model"].as_str()),
+                outcome: match (&result, &error) {
+                    (Ok(resp), _) => Ok(resp.status().as_u16()),
+                    (Err(_), Some(e)) => Err(e.as_str()),
+                    (Err(_), None) => Err("unknown"),
+                },
+                ms: started.elapsed().as_millis(),
+                req_bytes: body.len(),
+            };
+            // A failed log write is not worth failing a request over.
+            if let Ok(mut file) = log.lock() {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+        result
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("proxy task failed: {e}")));
     result.unwrap_or_else(|e| {
         Response::builder()
             .status(StatusCode::BAD_GATEWAY)
@@ -176,33 +249,38 @@ async fn handle(
     })
 }
 
+/// Forward one request, and say where it went: `"local"` or `"gateway"`.
 fn route(
     proxy: &Proxy,
     method: &Method,
     path: &str,
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<Response> {
+) -> (&'static str, Result<Response>) {
     if let Some(local_body) = classifier_body(method, path, body, &proxy.routes.local_model) {
         let url = format!("{}{}", proxy.routes.local, path);
         let local_headers = [
             ("content-type", "application/json"),
             ("anthropic-version", "2023-06-01"),
         ];
-        return forward(
+        let result = forward(
             &proxy.agent,
             method,
             &url,
             local_headers.iter().copied(),
             local_body,
         );
+        return ("local", result);
     }
     let url = format!("{}{}", proxy.routes.gateway, path);
     let passthrough = headers
         .iter()
         .filter(|(k, _)| !HOP_BY_HOP.contains(&k.as_str()))
         .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str(), v)));
-    forward(&proxy.agent, method, &url, passthrough, body.to_vec())
+    (
+        "gateway",
+        forward(&proxy.agent, method, &url, passthrough, body.to_vec()),
+    )
 }
 
 /// The body to send the local server, when `body` is a classifier check: a
@@ -424,13 +502,20 @@ mod tests {
 
     /// A proxy in front of two stand-ins, and a blocking POST through it.
     async fn proxy_with_upstreams() -> (super::ProxyHandle, Seen, Seen) {
+        proxy_logging_to(None).await
+    }
+
+    async fn proxy_logging_to(log: Option<std::fs::File>) -> (super::ProxyHandle, Seen, Seen) {
         let (gateway, gateway_seen) = upstream(b"\x1f\x8bgateway").await;
         let (local, local_seen) = upstream(b"\x1f\x8blocal").await;
-        let proxy = super::start(super::Routes {
-            gateway,
-            local,
-            local_model: "local-model".to_string(),
-        })
+        let proxy = super::start(
+            super::Routes {
+                gateway,
+                local,
+                local_model: "local-model".to_string(),
+            },
+            log,
+        )
         .await
         .unwrap();
         (proxy, gateway_seen, local_seen)
@@ -517,6 +602,50 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(encoding.as_deref(), Some("gzip"));
         assert_eq!(bytes, b"\x1f\x8bgateway");
+    }
+
+    /// Each request appends one `[proxy]` line naming where it went, to a log
+    /// another writer (the server, in launch) appends to at the same time:
+    /// every line from both survives, none overwritten.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn logs_each_request_beside_the_servers_own_lines() {
+        use std::io::Write as _;
+        let path =
+            std::env::temp_dir().join(format!("scr-proxy-log-test-{}.log", std::process::id()));
+        std::fs::File::create(&path).unwrap();
+        let open = || {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+        };
+        let mut server = open();
+        writeln!(server, "server line 1").unwrap();
+
+        let (proxy, _, _) = proxy_logging_to(Some(open())).await;
+        let check = json!({ "model": CLASSIFIER_MODEL, "max_tokens": 8, "messages": [
+            { "role": "user", "content": [{ "type": "text", "text": "x" }] }
+        ]});
+        post(proxy.addr, serde_json::to_vec(&check).unwrap()).await;
+        writeln!(server, "server line 2").unwrap();
+        let main = json!({ "model": "claude-opus-5-5", "max_tokens": 8, "messages": [] });
+        post(proxy.addr, serde_json::to_vec(&main).unwrap()).await;
+
+        let log = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 4, "{log}");
+        assert_eq!(lines[0], "server line 1");
+        assert!(
+            lines[1].contains("[proxy] to=local model=scratchy-classifier status=200"),
+            "{log}"
+        );
+        assert_eq!(lines[2], "server line 2");
+        assert!(
+            lines[3].contains("[proxy] to=gateway model=claude-opus-5-5 status=200"),
+            "{log}"
+        );
+        assert!(!log.contains("user-token"), "no credentials in the log");
     }
 
     /// A request past axum's 2 MB default reaches the gateway instead of a 413.
