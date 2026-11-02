@@ -46,11 +46,12 @@ fn attention_blocks_per_chunk(chunked: bool) -> u32 {
 use crate::op_abi::GuardRun;
 use crate::quantized::{
     DequantDtype, NaxDequant, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
-    W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Act, W4a8Gemm, W4a8Rows, W4a8Tile, pick_qmm_t_kernel,
-    pick_qmv_kernel_wide, qmm_t_dispatch_shape, qmm_t_kernel_static_name,
-    qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name, qmv_dispatch_shape,
-    qmv_kernel_static_name, small_m_kernel_static_name, splitk_reduce_kernel_static_name,
-    w4a8_act_quant_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
+    W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Act, W4a8Gemm, W4a8Rows, W4a8Tile, narrow_matvec,
+    pick_qmm_t_kernel, pick_qmv_kernel, pick_qmv_kernel_wide, qmm_t_dispatch_shape,
+    qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name,
+    qmv_dispatch_shape, qmv_kernel_static_name, small_m_kernel_static_name,
+    splitk_reduce_kernel_static_name, w4a8_act_quant_static_name, w4a8_quant_static_name,
+    w4a8_scratch_bytes,
 };
 use crate::specialized_pipeline_cache::ConstantValue;
 
@@ -305,7 +306,7 @@ fn sample_rows(
                 a.layer,
                 ix,
                 codes,
-                /*wide_ok=*/ false,
+                pick_qmv_kernel(a.n.get(), a.k.get(), a.bits.get()),
                 Vec::new(),
             );
             let one = LogitsRows::Sampled { tile: RowTile::Row };
@@ -401,16 +402,10 @@ fn affine_qmv_command(
     layer: LayerId,
     ix: SourceIx,
     codes: super::kernel_constants::AffineCodes,
-    wide_ok: bool,
+    kernel: QmvKernel,
     end_weights: Vec<Binding>,
 ) -> LoweredCommand {
     let (n, k, bits) = (g.n.get(), g.k.get(), g.bits.get());
-    // The small-M band (MLX `qmv_wide`, gen-15+): weight groups are
-    // dequantized once and reused across the threadgroup's row tile,
-    // so the per-sequence weight re-stream the plain row-parallel qmv
-    // pays disappears. `rows` here is the bucket's row count; the wide
-    // grid is exact per bucket (nv baked), no m_scaling on X.
-    let kernel = pick_qmv_kernel_wide(n, k, bits, rows, wide_ok);
     let (tg, tpg) = qmv_dispatch_shape(kernel, rows, n, /*B=*/ 1);
     let (kernel_id, constants) = match kernel {
         QmvKernel::Quad { .. } => (
@@ -1069,6 +1064,12 @@ fn route_small_m(
     // µs base M5 / M5 Max, wide vs twin: lm_head 2182 / 540 vs 2333 / 604, gdn out_proj
     // 70.8 / 31.8 vs 71.1 / 90.1; its 8-row bucket streams them twice, lm_head 4368 / 1049 vs
     // 2369 / 572).
+    // A narrow projection's fast matvec runs every step its bucket's rows see
+    // (`narrow_matvec`): the twin's padded tile costs it 3x (`narrow_projection_at_verify_buckets`,
+    // 48 x 5120 at 16 rows, µs: fast 6.8, twin 25.7).
+    if narrow_matvec(n, k, 4, bucket_m) {
+        return Ok(cmds);
+    }
     let wide = cmds
         .iter()
         .any(|c| c.command.kernel == KernelId::AffineQmvWide);
@@ -2776,7 +2777,27 @@ fn lower_one(
             let gs = *group_size;
             let vl = *vector_limit;
 
-            if bucket_m < vl {
+            // A narrow projection at a bucket of up to 64 rows on the matrix unit's chips runs the
+            // row-parallel fast matvec (`narrow_matvec`): its few columns give the wide matvec a
+            // handful of threadgroups and the NAX GEMM's 64-column tile ONE (Qwen3.8-27B's GDN `a`
+            // and `b`, 48 x 5120, at the 64-row bucket its 4-lane verify plays: 108 µs a dispatch,
+            // ~10 ms a cycle).
+            let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
+            if is_nax && narrow_matvec(n_v, k_v, bits_v, bucket_m) {
+                let layer = super::ids::LayerId(*layer + layer_offset);
+                let codes = super::kernel_constants::AffineCodes::of(profile, bits_v);
+                affine_qmv_command(
+                    p,
+                    g,
+                    bucket_m,
+                    None,
+                    layer,
+                    w.of(WeightKind::Linear, 0)?,
+                    codes,
+                    QmvKernel::Fast,
+                    qmv_end_weights(g, w, layer_offset)?,
+                )
+            } else if bucket_m < vl {
                 // Matvec branch (decode-shape). The MLX-mirrored shape
                 // heuristic (qmv_fast when N%8==0 && K%512==0, qmv_quad
                 // when K∈{64,128}, else generic) — measured 0.28 ms /
@@ -2793,6 +2814,10 @@ fn lower_one(
                 // Every matvec-band kernel takes the folded ends (`qmv_fast_impl`,
                 // `qmv_impl` and `qmv_quad_impl` since #242, `qmv_wide_impl` since the
                 // wide gained them) — at any row count the bucket dispatches it.
+                // The small-M band (MLX `qmv_wide`, gen-15+): weight groups are
+                // dequantized once and reused across the threadgroup's row tile,
+                // so the per-sequence weight re-stream the plain row-parallel qmv
+                // pays disappears.
                 affine_qmv_command(
                     p,
                     g,
@@ -2801,7 +2826,7 @@ fn lower_one(
                     layer,
                     w.of(WeightKind::Linear, 0)?,
                     codes,
-                    wide_ok,
+                    pick_qmv_kernel_wide(n_v, k_v, bits_v, bucket_m, wide_ok),
                     qmv_end_weights(g, w, layer_offset)?,
                 )
             // The matmul band takes no ends: the qmm_t kernels have no norm / bias /
@@ -2826,7 +2851,6 @@ fn lower_one(
                 // lack the unit (M4's `matmul2d` emulates and produces a
                 // wrong layout), so `is_nax_capable` is false there.
                 // ~3× prefill GEMM speedup on M5.
-                let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
                 // 8-bit weights (Gemma4 MLP projections): NAX has
                 // `_b_8_` instantiations (byte-per-element W-loader,
                 // same MMA) — the dominant Gemma4 prefill lever (the
@@ -11546,6 +11570,68 @@ mod tests {
             assert!(
                 constants.iter().any(|c| c.index == 8) && constants.iter().any(|c| c.index == 10),
                 "bucket {bucket_m}: the matvec takes its norm (8) and residual add (10)"
+            );
+        }
+    }
+
+    /// A narrow projection (Qwen3.8-27B's Gated-DeltaNet `a` / `b`, 48 x 5120) at a bucket of up
+    /// to 64 rows on NAX runs the row-parallel fast matvec, ungated (no small-M twin), a
+    /// threadgroup row a row and its grid scaled to the live rows — past the bucket's matvec /
+    /// matmul boundary too (the 16-, 32- and 64-row buckets ran the NAX GEMM's one 64 x 64 tile).
+    /// A wider projection, 8-bit weights, the 512-row bucket and a pre-NAX chip keep their own
+    /// kernels.
+    #[test]
+    fn a_narrow_projection_runs_the_fast_matvec_at_verify_buckets() {
+        let gemm = |n: u32, bits: u32| {
+            MetalStep::AffineQmm(AffineMatmul {
+                input: Slot(0),
+                output: Slot(1),
+                layer: LayerId(0),
+                n: NDim(n),
+                k: KDim(5120),
+                bits: AffineBits(bits),
+                vector_limit: QmvBatchLimit(10),
+                ..q_proj()
+            })
+        };
+        let lower_at = |step, bucket_m, profile| {
+            lower_subtile_tape_to_metal(
+                &row_tape(plain(&[step])),
+                &tp(),
+                bake_point(bucket_m, profile),
+            )
+            .expect("lower_subtile_tape_to_metal")
+        };
+        let m5 = Some(&crate::targets::M5_10CORE);
+        for bucket_m in [2, 4, 8, 16, 32, 64] {
+            let tape = lower_at(gemm(48, 4), bucket_m, m5);
+            assert_eq!(
+                gated_steps(&tape),
+                [(KernelId::AffineQmvFast, None)],
+                "bucket {bucket_m}"
+            );
+            let d = tape.commands[0].command.dispatch;
+            assert_eq!(d.threadgroups, (bucket_m, 48 / 4, 1), "bucket {bucket_m}");
+            let scaling = d.m_scaling.expect("X-axis m_scaling");
+            assert!(matches!(scaling.axis, MScaleAxis::X) && scaling.set_axis.is_none());
+        }
+        let kernels = |step, bucket_m, profile| -> Vec<KernelId> {
+            lower_at(step, bucket_m, profile)
+                .commands
+                .iter()
+                .map(|c| c.command.kernel)
+                .collect()
+        };
+        assert_eq!(kernels(gemm(48, 4), 1, m5), [KernelId::AffineQmvFast]);
+        assert_eq!(kernels(gemm(48, 4), 512, m5), [KernelId::AffineQmmTNax]);
+        for (n, bits, profile) in [
+            (128, 4, m5),
+            (48, 8, m5),
+            (48, 4, Some(&crate::targets::M4_10CORE)),
+        ] {
+            assert!(
+                !kernels(gemm(n, bits), 64, profile).contains(&KernelId::AffineQmvFast),
+                "{n} columns, {bits}-bit: its own kernels"
             );
         }
     }

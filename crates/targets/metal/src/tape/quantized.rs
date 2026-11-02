@@ -164,6 +164,42 @@ pub const fn qmv_fast_covers(n: u32, k: u32) -> bool {
     n.is_multiple_of(8) && k.is_multiple_of(QMV_FAST_K_STEP)
 }
 
+/// The most output columns a projection runs the row-parallel fast matvec ([`QmvKernel::Fast`]) at
+/// for, at a bucket of up to [`NARROW_MATVEC_ROWS`] rows on a NAX device ([`narrow_matvec`]).
+///
+/// Its grid is a threadgroup a (row, 4 columns), where the wide matvec's is one a (5 rows, 8
+/// columns) and the NAX GEMM's one a 64 x 64 tile: a narrow projection's few columns give those
+/// a handful of threadgroups (the NAX GEMM ONE) and leave the cores idle, while its weights are
+/// small enough that the fast matvec's re-read of them a row comes from cache. M5 Max, µs a
+/// dispatch, DRAM-cold (`narrow_projection_at_verify_buckets`), NAX / wide / fast at 2-32 and at
+/// 64 rows: Qwen3.8-27B's GDN `a`, `b` (48 x 5120) 112 / 12-16 / 7.0-7.7 and 102 / 18 / 13.5;
+/// Qwen3.6-35B-A3B's (32 x 2048) 44 / 6.7-8.4 / 4.9-5.2 and 40 / 10 / 7.7. On a quarter of its
+/// cores (four copies between the same barriers: a 10-core base M5 emulated by width) the fast
+/// matvec stays within ~1.3x of the wide one through 64 columns and 3x ahead of the NAX GEMM
+/// (64 x 5120 at 64 rows: 44 / 32 / 97 fast / wide / NAX); at 128 columns it is 1.5x behind the
+/// wide one (87 / 58 at 64 rows).
+pub const NARROW_MATVEC_COLS: u32 = 64;
+
+/// The most rows a bucket runs a narrow projection's fast matvec at ([`narrow_matvec`]): the
+/// first prefill-shaped bucket, which a model without 16- and 32-row buckets plays its 2-4-lane
+/// verify on (Qwen3.8-27B's default ladder: 8 then 64). Its re-read of the weights a row grows
+/// with the rows, and at the 512-row bucket the NAX GEMM's tiles win (48 x 5120, µs a dispatch,
+/// a quarter of the cores: NAX 124, fast 250; at 128 rows NAX 104, fast 66).
+pub const NARROW_MATVEC_ROWS: u32 = 64;
+
+/// Whether an `n × k` `bits`-bit projection at an `m`-row bucket on a NAX device runs the
+/// row-parallel fast matvec, whatever the bucket's matvec / matmul boundary
+/// ([`get_qmv_batch_limit`]): 4-bit (the width measured), at most [`NARROW_MATVEC_COLS`] columns
+/// the one-row bucket's matvec is the fast one for (not the quad's K band), at 2 to
+/// [`NARROW_MATVEC_ROWS`] rows. Each row's sum is the one-row matvec's: a threadgroup row a row,
+/// its rows apart.
+pub fn narrow_matvec(n: u32, k: u32, bits: u32, m: u32) -> bool {
+    (2..=NARROW_MATVEC_ROWS).contains(&m)
+        && n <= NARROW_MATVEC_COLS
+        && bits == 4
+        && pick_qmv_kernel(n, k, bits) == QmvKernel::Fast
+}
+
 /// The M=1 form — `pick_qmv_kernel_wide` with `m = 1, wide_ok = false`.
 pub fn pick_qmv_kernel(n: u32, k: u32, bits: u32) -> QmvKernel {
     pick_qmv_kernel_wide(n, k, bits, 1, false)
