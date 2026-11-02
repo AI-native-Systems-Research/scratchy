@@ -4352,6 +4352,30 @@ mod walk_on_the_card {
         triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints")
     }
 
+    /// ⭐ A PROMPT CHUNK UNDER TRITON'S SCATTER FLOOR WRITES ITS OUTPUT. Under 8 query rows the
+    /// prefill kernel stores its attention as the tile at the first row the index names
+    /// (`out_tile.store([first, 0], attn)`), not by a scatter; the lowering must still write `out`.
+    #[test]
+    fn a_short_prompt_chunk_writes_its_output() {
+        for (mq, blocks, hd) in [(7i128, 1i128, 64i128), (7, 4, 64), (3, 1, 128), (64, 1, 64)] {
+            let node = walk_at(mq, blocks, hd);
+            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            let mut sym = 0i64;
+            let ops =
+                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                    .unwrap_or_else(|e| panic!("mq={mq} blocks={blocks} hd={hd}: {}", e.message));
+            let out = ktir_superdsc::place::act_name((node.bindings.len() - 1) as u32);
+            assert!(
+                ops.iter().any(|e| e
+                    .arg_bindings
+                    .iter()
+                    .any(|a| !a.is_input && a.buffer == out)),
+                "mq={mq} blocks={blocks} hd={hd}: some op writes the stored output {out}"
+            );
+        }
+    }
+
     /// ⭐⭐ THE DECODE TRIP IN torch-spyre's FORM — its compiled program's, at head dim 64 and 128: one
     /// kv head a core for every op of the trip, the page's Kᵀ re-laid by ONE all-heads restickify, the
     /// scores and the value product each ONE all-heads contraction, and the kernels, the scores and

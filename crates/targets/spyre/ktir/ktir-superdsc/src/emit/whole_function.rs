@@ -5400,6 +5400,41 @@ fn lower_function_folded(
                     }
                     _ => reframed(source, frame),
                 };
+                // ⛔ A RESULT THE PROGRAM STORES WHOLE GOES TO ITS PARAMETER. The pair's result is
+                // its source's own bytes (or the copies above); no op lowers the `ktdp.store`, so a
+                // direct store of it would be dropped and the parameter never written — the prompt
+                // trip under Triton's scatter floor (`out_tile.store([first, 0], attn)`, fewer than 8
+                // query rows). Its window is the whole stick-major parameter, the same bytes as the
+                // result's, so one stick-runs copy moves them.
+                let r = match (layout, stored_whole(k, r_res, r)?) {
+                    (Some(layout), Some(dst)) => {
+                        // The stored value's own stick-major frame on both sides — the pointwise
+                        // identity every elementwise op of this tensor states.
+                        let tile_op = super::lower_ktir_to_superdsc::pointwise_tile_op_df(
+                            r.v_rows,
+                            r.v_cols,
+                            1,
+                            2,
+                            crate::superdsc_opspec::Df::Fp16,
+                        );
+                        out.push(
+                            crate::ir::bridge::tiled_op_sdsc_op::assemble_pointwise_seeded_from_tile(
+                                &format!("store_o{}", dst.tid),
+                                &tile_op,
+                                "identity",
+                                &[&r.name()],
+                                &dst.name(),
+                                sym_id_base,
+                                Some(layout),
+                            ),
+                        );
+                        Region {
+                            is_out: false,
+                            ..dst
+                        }
+                    }
+                    _ => r,
+                };
                 inter.insert(res, r);
                 inter.insert(r_res, r);
                 head_major_skip.insert(r_res);
@@ -7081,6 +7116,42 @@ fn lower_function_folded(
     }
     every_store_is_written(k, &out)?;
     Ok(out)
+}
+
+/// The parameter window a value is stored to whole by a direct `ktdp.store`, when that window holds
+/// exactly `value`'s stick-major bytes: the same extents at corner 0, a whole parameter. `None` for a
+/// value no direct store reads; a store to any other window is refused by name, since this value's
+/// bytes are not that window's.
+fn stored_whole(k: &KtirNode, value: Ssa, held: Region) -> Result<Option<Region>, Error> {
+    let f = &k.func;
+    let deep = f.ops_deep();
+    let Some(store) = deep.iter().find(|s| {
+        s.op_type == OpKind::KtdpStore
+            && s.operands.first() == Some(&value)
+            && !indirect_tile_of(f, s.operands.get(1).copied())
+    }) else {
+        return Ok(None);
+    };
+    let Some(tile) = deep.iter().find(|o| {
+        o.op_type == OpKind::KtdpConstructAccessTile && o.result == store.operands.get(1).copied()
+    }) else {
+        return Ok(None);
+    };
+    let Some(o) = region_of_view_operand(k, tile, 0)?
+        .map(|o| windowed_region(k, o, tile))
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    let whole = (o.r_start, o.c_start) == (0, 0) && (o.r_len, o.c_len) == (o.v_rows, o.v_cols);
+    if !whole || (o.v_rows, o.v_cols) != (held.v_rows, held.v_cols) {
+        return err(format!(
+            "{}: a `[{}, {}]` value is stored to t{}'s `[{}, {}]` window at ({}, {}) — not the \
+             whole parameter at the value's own extents",
+            f.name, held.v_rows, held.v_cols, o.tid, o.r_len, o.c_len, o.r_start, o.c_start
+        ));
+    }
+    Ok(Some(Region { is_out: true, ..o }))
 }
 
 /// ⛔ EVERY PARAMETER THE PROGRAM STORES IS WRITTEN BY AN EMITTED OP. No descriptor lowers a
