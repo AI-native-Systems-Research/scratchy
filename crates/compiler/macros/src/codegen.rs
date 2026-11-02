@@ -11970,7 +11970,22 @@ fn dump_wavefront_mega(
                                             let prefix_free_chunk = is_prefill
                                                 && active_cap
                                                     == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE;
-                                            let sweep = scratchy_target_spyre::paged_step::walk_buckets(pool_pages)
+                                            // A decode batch walks every chunk of its rung, so its
+                                            // ladder takes the half-way rungs too
+                                            // (`batch_walk_buckets`); every other body keeps
+                                            // spyre-inference's powers of two.
+                                            let buckets = if gk
+                                                .paged
+                                                .and_then(|p| p.batch())
+                                                .is_some()
+                                            {
+                                                scratchy_target_spyre::paged_step::batch_walk_buckets(pool_pages)
+                                            } else {
+                                                scratchy_target_spyre::paged_step::walk_buckets(
+                                                    pool_pages,
+                                                )
+                                            };
+                                            let sweep = buckets
                                                 .into_iter()
                                                 .filter(|&b| {
                                                     if prefix_free_chunk {

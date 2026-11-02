@@ -32,7 +32,9 @@ use crate::wiring::PagedStep;
 
 /// The page walk's laws, where the bake and the worker that state a bundle's walk reach them: the
 /// page size, a rung's walk ([`walk_pages`]) and the rungs a pool is walked by ([`walk_buckets`]).
-pub use scratchy_triton_splice::{BatchChunking, PAGE_SLOTS, PagedRows, walk_buckets, walk_pages};
+pub use scratchy_triton_splice::{
+    BatchChunking, PAGE_SLOTS, PagedRows, batch_walk_buckets, walk_buckets, walk_pages,
+};
 
 /// `finfo(float16).min` — spyre-inference's masked additive value: finite, so a fully-masked tile's
 /// row maximum stays finite and its weights vanish under the running maximum.
