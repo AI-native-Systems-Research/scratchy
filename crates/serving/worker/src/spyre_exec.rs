@@ -1792,7 +1792,18 @@ impl Worker for SpyreWorker {
                     return Ok(out);
                 }
                 // NOT DEFERRABLE — drain it right here, through the same pop the knock takes.
-                let infl = self.in_flight.pop_back().expect("queued just above");
+                //
+                // ⛔ IN SUBMISSION ORDER. The step before this one may still be in flight (a stable
+                // seating submits at depth 2), and each drain appends its pick to the request's
+                // history. Draining this step first appended the two picks swapped, so the next
+                // churn re-seeded the request from the OLDER pick and it decoded that token twice
+                // (granite-3.1-2b: "Title: A A …" at a second request's join). The older steps
+                // drain first; this step is the queue's last.
+                while self.in_flight.len() > 1 {
+                    let older = self.in_flight.pop_front().expect("len > 1");
+                    Self::drain_one(older, model, requests, input_batch)?;
+                }
+                let infl = self.in_flight.pop_front().expect("queued just above");
                 let rows = Self::drain_one(infl, model, requests, input_batch)?;
                 // ── KCACHE PROBE (SCRATCHY_KCACHE_PROBE), BATCHED STEP ── the batched counterpart of the
                 // solo `[kcache]` probe: after the fold's forward (cache write included), read back the
