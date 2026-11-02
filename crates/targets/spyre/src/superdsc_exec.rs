@@ -5123,7 +5123,9 @@ impl Executor {
         t.replay_submit_ms += (t2 - t1).as_secs_f64() * 1e3;
         // First step AND the 256 cadence: the canonical gate cell is 64 tokens,
         // so a cadence-only marker would stay silent in exactly the run that
-        // must prove replay happened — the line IS the liveness proof.
+        // must prove replay happened — the line IS the liveness proof, under
+        // `RUST_LOG=debug` like every other `[sdsc-replay]` line: a plain
+        // `scr chat` (level `info`) must emit nothing.
         if t.replay_steps == 1 || t.replay_steps.is_multiple_of(256) {
             report_replay(&t);
         }
@@ -6355,15 +6357,16 @@ fn fold_signature(fold: &SessionKv, n_fold_pages: i64) -> Vec<i64> {
 /// 256-step cadence. ⛔ ONE WRITE: the same single-`format!` discipline as
 /// `[progverify]` — an abort from senlib's monitor thread takes the process
 /// down with no unwinding, so a buffered line is a line that never existed.
-/// This line is also the player's LIVENESS MARKER: a run whose stderr never
-/// shows it replayed nothing.
+/// This line is also the player's LIVENESS MARKER: a `RUST_LOG=debug` run
+/// whose stderr never shows it replayed nothing. A plain `scr chat` (level
+/// `info`) sees nothing — debug output is asked for, never imposed.
 fn report_replay(t: &Timers) {
     let steps = t.replay_steps.max(1);
     let derives = t.replay_derives.max(1);
-    let one = format!(
+    debug!(
         "[sdsc-replay] {} step(s) replayed: {:.1}% from cached image(s) | {:.1} CB(s)/step, {} \
          patch site(s)/image | lookup {:.1} us/step, submit {:.3} ms/step | {} derivation(s) at \
-         {:.1} ms each\n",
+         {:.1} ms each",
         t.replay_steps,
         100.0 * t.replay_hits as f64 / steps as f64,
         t.replay_cbs as f64 / steps as f64,
@@ -6373,7 +6376,6 @@ fn report_replay(t: &Timers) {
         t.replay_derives,
         t.replay_derive_ms / derives as f64,
     );
-    eprint!("{one}");
 }
 
 /// The submit / prefix-ladder / repeat-probe reports, emitted with the phase line.
