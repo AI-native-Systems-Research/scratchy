@@ -69,17 +69,31 @@ fn main() {
         .file("cxx-shim/senlib_ffi.cpp")
         .file("cxx-shim/hal_sbf.cpp")
         .warnings(true);
-    // senlib's own include root, plus `runtime/include` for the `common/`
-    // headers senlib's own public headers (device_identity.hpp) need to
-    // parse `common/self_doc_enum.hpp`. This crate's own .cpp code never
-    // includes anything under `flex/`, and only senlib itself is linked
-    // above — no libflex.so, no sendnn_*.
-    for sub in [
-        "senlib/include",
-        "senlib/flightlog/include",
-        "runtime/include",
-    ] {
+    // senlib's own include root. This crate's own .cpp code never includes
+    // anything under `flex/`, and only senlib itself is linked above — no
+    // libflex.so, no sendnn_*.
+    for sub in ["senlib/include", "senlib/flightlog/include"] {
         build.include(spyre_root.join(sub));
     }
+    // senlib's public headers (vfio_target.hpp, device_identity.hpp) include
+    // `common/self_doc_enum.hpp`, a header senlib does not install itself.
+    // Older images installed it under `runtime/include`; the current `:dev`
+    // images install no `common/` there and ship it only in the flex source
+    // tree at `/project_src/flex`. Take the first root that holds it.
+    let common_roots = [
+        spyre_root.join("runtime/include"),
+        PathBuf::from("/project_src/flex"),
+    ];
+    let common_root = common_roots
+        .iter()
+        .find(|root| root.join("common/self_doc_enum.hpp").is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "flex-rs: no `common/self_doc_enum.hpp` (senlib's public headers include it) \
+                 under any of {common_roots:?}"
+            )
+        });
+    build.include(common_root);
+    build.include(spyre_root.join("runtime/include"));
     build.compile("senlib_ffi");
 }
