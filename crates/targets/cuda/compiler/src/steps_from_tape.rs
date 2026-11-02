@@ -186,7 +186,10 @@ pub fn lower_step(
         | L::AttnPackedKv
         | L::SampleRowsGather
         | L::SampleRowsScatter
-        | L::AllRowsMatmul => Err(CanonicalRefusal::NotLowered {
+        | L::AllRowsMatmul
+        | L::Sample { .. }
+        | L::EmbedRowGather { .. }
+        | L::ChainStage { .. } => Err(CanonicalRefusal::NotLowered {
             step: s.step,
             op: op.name(),
         }),

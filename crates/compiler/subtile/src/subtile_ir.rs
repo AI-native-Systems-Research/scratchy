@@ -861,7 +861,10 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | L::AttnPackedKv
             | L::SampleRowsGather
             | L::SampleRowsScatter
-            | L::AllRowsMatmul => None,
+            | L::AllRowsMatmul
+            | L::Sample { .. }
+            | L::EmbedRowGather { .. }
+            | L::ChainStage { .. } => None,
         }
     }
 

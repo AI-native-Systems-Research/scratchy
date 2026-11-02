@@ -106,6 +106,9 @@ pub fn cuda_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRule
         | L::SampleRowsGather
         | L::SampleRowsScatter
         | L::AllRowsMatmul => FRESH.reads_across(),
+        // Spyre's token draw and chained head (the spyre bake's mints; CUDA never lowers them):
+        // each writes its own fresh buffer, metal's row.
+        L::Sample { .. } | L::EmbedRowGather { .. } | L::ChainStage { .. } => FRESH,
         // The routed half of a MoE block: in the MoE scratch ([`cuda_moe_write`]), not a colour.
         // Gemma's router norm is `[m, hidden]` bf16 like a colour, but only its router reads it,
         // so it lives in the scratch's router-norm region with the rest of the routing.
