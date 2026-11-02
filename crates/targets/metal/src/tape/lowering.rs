@@ -12057,9 +12057,10 @@ mod tests {
 
     /// On the wide class, a W4A8 GEMM in a bucket of at most two row tiles whose one row tile
     /// holds too few simdgroups for the cores splits K the fewest ways that fill them
-    /// (Qwen3.8-27B's verify, in the 64-row bucket: its MLP down, o_proj, k and v), keeping the
-    /// tiled GEMM where the row tile is already full (gate/up) and in every bucket past two row
-    /// tiles; the M5 class keeps the tiled GEMM throughout.
+    /// (Qwen3.8-27B's verify, in the 64-row bucket: its MLP down, o_proj, k and v), and one whose
+    /// row tile already fills them 4 ways (gate/up), keeping the tiled GEMM past the widest row
+    /// tile that splits (the lm_head) and in every bucket past two row tiles; the M5 class keeps
+    /// the tiled GEMM throughout.
     #[test]
     fn a_sparse_w4a8_grid_splits_k_on_the_wide_class() {
         use crate::quantized::{W4a8Gemm, W4a8SplitK};
@@ -12084,7 +12085,9 @@ mod tests {
         let wide = Tiled(W4a8Tile::Cols128);
         // (class, bucket, n, k, kernel, grid width, threads)
         let cases = [
-            (M5Wide, 64, 17408, 5120, wide, 136, 128),
+            (M5Wide, 64, 17408, 5120, SplitK(Ways4), 544, 128),
+            (M5Wide, 64, 248320, 5120, wide, 1940, 128),
+            (M5Wide, 128, 17408, 5120, wide, 136, 128),
             (M5Wide, 64, 5120, 17408, SplitK(Ways4), 160, 128),
             (M5Wide, 32, 5120, 17408, SplitK(Ways4), 160, 128),
             (M5Wide, 64, 1024, 5120, SplitK(Ways8), 32, 256),

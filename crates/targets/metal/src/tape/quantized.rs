@@ -891,6 +891,16 @@ pub const W4A8_SPLIT_K_COLS: u32 = 32;
 /// 1024 x 5120, 32 simdgroups, 80 / 18 at 8 ways; gate/up 17408 x 5120, 544, 140 / 140 at 2).
 pub const W4A8_SPLIT_K_MIN_SIMDGROUPS: u32 = 16 * crate::tape::lowered::M5_WIDE_MIN_CORES;
 
+/// The widest one row tile a W4A8 GEMM splits K at: past it the tiled grid's columns alone hide
+/// the loads (the 27B's lm_head, 248320 x 5120, 7760 tiles: 1809 µs tiled, 1616 at 4 ways in the
+/// probe, but within noise in the tape — 1.79 / 1.75 ms — where it is one dispatch a cycle; kept
+/// tiled). A row tile already at [`W4A8_SPLIT_K_MIN_SIMDGROUPS`] but under this still pays for 4
+/// ways, not 2: its tiled simdgroup walks every K chunk in series, and four of them in flight hide
+/// the chunk loads two do not (gate/up 17408 x 5120, 544 tiles, in the probe at 32 rows tiled /
+/// 2 / 4 ways: 145 / 183 / 169 µs, DRAM-cold the weights only; in the 64-row tape, its activation
+/// fresh, 22.07 / 20.75 ms a cycle at 4 ways, 291 / 309 GB/s).
+pub const W4A8_SPLIT_K_MAX_ROW_TILE: u32 = 4096;
+
 /// The most rows a bucket splitting K has: two row tiles. Its grid scales with the step's live
 /// rows, so the split is weighed at one row tile (a 4-way 8-token verify in the 64-row bucket),
 /// and costs little where two run (the probe at 64 rows, tiled / the one-tile pick: down 307 /
@@ -908,9 +918,10 @@ pub enum W4a8Gemm {
 impl W4a8Gemm {
     /// The kernel of an `n`-column, `k`-deep GEMM in a `bucket_m`-row bucket (a multiple of
     /// [`W4A8_TILE_ROWS`]) on a chip of `class`: on the wide class, in a bucket of at most
-    /// [`W4A8_SPLIT_K_MAX_ROWS`], split K the fewest ways that bring one row tile's grid to
-    /// [`W4A8_SPLIT_K_MIN_SIMDGROUPS`] (at most 8, and no more than K has 64-chunks); elsewhere,
-    /// and where one row tile already holds them, the widest tile. Unmeasured below the wide
+    /// [`W4A8_SPLIT_K_MAX_ROWS`] whose one row tile is narrower than
+    /// [`W4A8_SPLIT_K_MAX_ROW_TILE`], split K the fewest ways that bring one row tile's grid to
+    /// [`W4A8_SPLIT_K_MIN_SIMDGROUPS`], at least 4 where it already holds them (at most 8, and no
+    /// more than K has 64-chunks); elsewhere the widest tile. Unmeasured below the wide
     /// class, whose fewer cores the tiled grid fills sooner.
     pub fn for_shape(
         tile: W4a8Tile,
@@ -923,14 +934,15 @@ impl W4a8Gemm {
         if class != crate::tape::lowered::GenClass::M5Wide
             || bucket_m > W4A8_SPLIT_K_MAX_ROWS
             || !n.is_multiple_of(W4A8_SPLIT_K_COLS)
-            || row_tile >= W4A8_SPLIT_K_MIN_SIMDGROUPS
+            || row_tile >= W4A8_SPLIT_K_MAX_ROW_TILE
         {
             return Self::Tiled(tile);
         }
         let mut fits = W4a8SplitK::ALL.into_iter().filter(|s| s.ways() <= k / 64);
-        let fill = fits
-            .clone()
-            .find(|s| row_tile * s.ways() >= W4A8_SPLIT_K_MIN_SIMDGROUPS);
+        let fill = fits.clone().find(|s| {
+            row_tile * s.ways() >= W4A8_SPLIT_K_MIN_SIMDGROUPS
+                && (row_tile < W4A8_SPLIT_K_MIN_SIMDGROUPS || *s >= W4a8SplitK::Ways4)
+        });
         match fill.or_else(|| fits.next_back()) {
             Some(split) => Self::SplitK(split),
             None => Self::Tiled(tile),
