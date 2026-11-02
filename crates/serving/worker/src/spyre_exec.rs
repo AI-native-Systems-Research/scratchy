@@ -242,16 +242,35 @@ impl SpyreWorker {
         // executor and stream, and the W=1 seat is the owner session itself.
         let SendnnSession::SuperDsc(sb) = &mut model.session;
         let sess = sb.decode_seat(rung).sess;
-        let toks = match collect_decode_tokens(sess, &sub) {
-            Ok(t) => t,
-            Err(e) => {
-                let msg = e.to_string();
-                cell.fill(Err(scratchy_serving_engine::error::EngineError::Executor(
-                    msg.clone(),
-                )));
-                return Err(werr(msg));
-            }
-        };
+        // ⛔ ONE FILL, AFTER EVERY EXIT. The step's resolver parks on `cell` until it is filled, so a
+        // collect that returned before filling it hung that resolver for good — and the serve loop
+        // with it (#1030: a request finished by EOS, its overshoot step still in flight).
+        let picked = Self::collect_rows(sess, &sub, rows, requests, input_batch);
+        cell.fill(match &picked {
+            Ok(out) => Ok(out.clone()),
+            Err(e) => Err(scratchy_serving_engine::error::EngineError::Executor(
+                e.to_string(),
+            )),
+        });
+        picked
+    }
+
+    /// The collect itself: the step's picks, one per launch slot, and each live row's pool
+    /// bookkeeping. A row whose request is gone keeps its slot and skips the bookkeeping.
+    ///
+    /// ⭐ A FINISHED REQUEST CAN STILL HAVE A STEP IN FLIGHT. A deferred step submits while the one
+    /// before it is still on the card (depth 2), so a request that finishes by EOS on step `j` has
+    /// step `j+1` in flight; the next schedule names it in `finished_req_ids`, and
+    /// `execute_model` drops it before that step is drained. The engine discards the overshoot
+    /// token of a finished request, so the drain skips its bookkeeping rather than failing the step.
+    fn collect_rows(
+        sess: &mut scratchy_target_spyre::sdsc_runner::SuperDscSession,
+        sub: &crate::spyre_forward::SubmittedDecode,
+        rows: Vec<(String, usize, usize)>,
+        requests: &mut HashMap<String, ReqState>,
+        input_batch: &mut scratchy_serving_engine::input_batch::InputBatch,
+    ) -> ExecutorResult<Vec<u32>> {
+        let toks = collect_decode_tokens(sess, sub)?;
         // A REQUEST'S TOKEN COMES BACK IN THE SLOT THE LAUNCH PUT IT IN — the slot was resolved
         // at submit and rides in `rows`, so the drain cannot re-derive (and mis-derive) it.
         // The sentinel check already happened at the decode law (`collect_decode_tokens`);
@@ -266,17 +285,19 @@ impl SpyreWorker {
                     toks.len()
                 ))
             })?;
-            requests
-                .get_mut(&id)
-                .ok_or_else(|| werr(format!("unknown in-flight req {id}")))?;
-            input_batch.push_generated(&id, tok);
-            input_batch.set_tokens_in_pool(&id, start + 1);
+            // The token stays in its slot either way: the deferred output maps answer `i` to its
+            // `req_ids[i]` and the in-call drain reads slot `i`, so a dropped row would hand every
+            // later row its neighbour's token. A gone request's overshoot pick is discarded by the
+            // engine; it only skips the pool bookkeeping of a request that no longer exists.
+            if requests.contains_key(&id) {
+                input_batch.push_generated(&id, tok);
+                input_batch.set_tokens_in_pool(&id, start + 1);
+            }
             // ⭐ THE KV HISTORY WAS RECORDED AT SUBMIT (c4b) — the write slot is a position fact
             // the host knew when it launched, and the next step's geometry reads it before this
             // drain on a stable seating. The drain owns the PICK; the history was never its fact.
             out.push(tok);
         }
-        cell.fill(Ok(out.clone()));
         Ok(out)
     }
 }
@@ -513,9 +534,12 @@ impl Worker for SpyreWorker {
         // while the previous step is still in flight — depth 2. A CHURNED seating (below, at the
         // rung) still drains in-call, through the same pop the knock takes, because a re-seated
         // row's seed is the previous step's pick and only the drain holds it. Deferred steps that
-        // neither churn nor block are drained by their own resolver's knock — the engine resolves
-        // a step before the schedule two later can clean up the requests it named, so no drain
-        // races the finished-request cleanup.
+        // neither churn nor block are drained by their own resolver's knock.
+        //
+        // ⛔ AND A DRAIN CAN OUTLIVE ITS REQUEST. A request that finishes by EOS on one step has the
+        // next step already in flight; the schedule after names it in `finished_req_ids`, so the
+        // cleanup below drops it before that step is drained. The drain skips a gone request's
+        // bookkeeping (`collect_rows`), and fills every step's cell whatever the collect did.
         let Self {
             model,
             requests,
@@ -1986,11 +2010,18 @@ impl Worker for SpyreWorker {
                 cell.fill(Err(e));
                 return;
             };
-            if Self::drain_one(infl, model, &mut self.requests, &mut self.input_batch).is_err() {
+            if let Err(e) = Self::drain_one(infl, model, &mut self.requests, &mut self.input_batch)
+            {
                 // The step's own cell carries its error to its resolver. A failed collect
                 // leaves the stream sticky-dead, so every later step fails the same way —
-                // stop rather than hand each one the same dead fence.
-                break;
+                // stop, and answer the knocked step with that failure: a knock that returns with
+                // its cell unfilled parks its resolver forever.
+                if !cell.is_filled() {
+                    cell.fill(Err(scratchy_serving_engine::error::EngineError::Executor(
+                        format!("drain: an earlier in-flight step failed: {e}"),
+                    )));
+                }
+                return;
             }
         }
     }
