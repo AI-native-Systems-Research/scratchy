@@ -7079,7 +7079,47 @@ fn lower_function_folded(
             e.kv_gathered = true;
         }
     }
+    every_store_is_written(k, &out)?;
     Ok(out)
+}
+
+/// ⛔ EVERY PARAMETER THE PROGRAM STORES IS WRITTEN BY AN EMITTED OP. No descriptor lowers a
+/// `ktdp.store` itself: the op producing the stored value writes the parameter, so an arm that lands
+/// a stored value anywhere else drops the store and the parameter keeps whatever it held. That is a
+/// clean launch and wrong bytes downstream (granite-3.1-8b's batch-of-one attention: the output
+/// projection read an output no op wrote, "Fraryning000…"). So the lowering refuses, naming the
+/// parameter, any direct store whose parameter no emitted op writes.
+fn every_store_is_written(k: &KtirNode, out: &[super::EmittedOp]) -> Result<(), Error> {
+    let f = &k.func;
+    let written: std::collections::BTreeSet<&str> = out
+        .iter()
+        .flat_map(|e| e.arg_bindings.iter())
+        .filter(|a| !a.is_input)
+        .map(|a| a.buffer.as_str())
+        .collect();
+    let deep = f.ops_deep();
+    for s in &deep {
+        if s.op_type != OpKind::KtdpStore || indirect_tile_of(f, s.operands.get(1).copied()) {
+            continue;
+        }
+        let Some(tile) = deep.iter().find(|o| {
+            o.op_type == OpKind::KtdpConstructAccessTile && o.result == s.operands.get(1).copied()
+        }) else {
+            continue;
+        };
+        let Some(param) = region_of_view_operand(k, tile, 0)? else {
+            continue;
+        };
+        if !written.contains(param.name().as_str()) {
+            return err(format!(
+                "{}: the program stores parameter {}, and no emitted op writes it — the arm that \
+                 lowered the stored value landed it somewhere else",
+                f.name,
+                param.name()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// THE FRAME A VALUE OF `dims` IS HELD IN: a per-row scalar of a reduction — a value shaped as a
