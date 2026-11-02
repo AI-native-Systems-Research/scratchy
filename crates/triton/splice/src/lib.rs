@@ -4833,6 +4833,61 @@ mod walk_on_the_card {
         }
     }
 
+    /// ⛔ A DECODE BATCH LAYS ITS PROBABILITIES OUT AS BLOCKS ONE RUN A CORE. At 128-slot pages a
+    /// probability row is two sticks, and the value contraction reads it as `J · B · KV` blocks of
+    /// `G` rows: one stick-run copy a plane, a run a block. Past 32 blocks one copy hands a core
+    /// several runs, stepped by the run's device-extent pitch, a stride no copy on the card has run
+    /// with; the runs go out 32 an op instead, so every core copies one run. Two sequences over four
+    /// blocks, or eight over one, are 64 blocks (two ops a plane); two over one gather a kv head a
+    /// core and read the probabilities with no relayout at all.
+    #[test]
+    fn a_decode_batch_lays_its_probabilities_out_one_run_a_core() {
+        for (seqs, walk, hd) in [(2u32, 1u32, 64u32), (2, 4, 64), (8, 1, 64), (2, 4, 128)] {
+            let (node, c) = batched_walk_at(seqs, walk, hd);
+            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            let mut sym = 0i64;
+            let ops =
+                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                    .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
+            let at = format!("B={seqs} walk={walk} hd={hd}");
+            let copies: Vec<_> = ops
+                .iter()
+                .filter(|e| e.op_name.starts_with("heads"))
+                .collect();
+            // At head dim 64 the probabilities are the walk's only relayout (at 128 the query's
+            // two-stick rows go to blocks the same way, and ride the same law). A chunk gathered a
+            // kv head a core reads them as the decode trip does, with no relayout at all.
+            let blocks = c.entries() * 8;
+            if hd == 64 {
+                let want = match c.rows_per_page {
+                    1 => 2 * blocks.div_ceil(32),
+                    _ => 0,
+                };
+                assert_eq!(
+                    copies.len() as u32,
+                    want,
+                    "{at}: two planes, {blocks} runs 32 an op ({} rows a page)",
+                    c.rows_per_page
+                );
+            }
+            for e in copies {
+                let v = serde_json::to_value(e.op.as_ref().expect("a descriptor")).expect("json");
+                let runs = v["dscs_"][0][&e.op_name]["N_"]["mb_"].clone();
+                assert!(
+                    runs.as_u64().is_some_and(|r| r <= 32),
+                    "{at} {}: {runs} runs",
+                    e.op_name
+                );
+                assert_eq!(
+                    v["numWkSlicesPerDim_"]["mb"], runs,
+                    "{at} {}: one run a core",
+                    e.op_name
+                );
+            }
+        }
+    }
+
     /// One chunk is straight-line: no loop to relaunch, every descriptor once.
     #[test]
     fn a_one_chunk_decode_batch_is_straight_line() {

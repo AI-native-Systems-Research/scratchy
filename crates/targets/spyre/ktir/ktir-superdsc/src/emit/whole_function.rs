@@ -924,17 +924,24 @@ impl<'a> HeadMajorCopies<'a> {
         use crate::ir::bridge::tiled_op_sdsc_op::{StickRuns, assemble_stick_runs_copy};
         let stick = crate::work::FP16_ELEMS_PER_STICK;
         let (a, b, n) = (self.a, self.b, self.sticks);
-        (0..n)
-            .map(|s| {
+        // ⛔ AT MOST ONE RUN A CORE: a copy of more runs than cores hands a core several, which the
+        // card steps by the run's device-extent pitch — a stride no copy here has run with. Past the
+        // cores, the runs go out a core's worth an op, each op's runs one a core.
+        let per_op = crate::superdsc_opspec::MAX_CORES;
+        let chunks = a.div_ceil(per_op);
+        let mut ops = Vec::with_capacity((n * chunks) as usize);
+        for s in 0..n {
+            for k in 0..chunks {
+                let (first, count) = (k * per_op, per_op.min(a - k * per_op));
                 // Block side: run `a` at `a·S·B + s·B` sticks; head-major side: at `s·A·B + a·B`.
-                let (block_pitch, block_elems) = (n * b, s * b * stick);
-                let (heads_pitch, heads_elems) = (b, s * a * b * stick);
+                let (block_pitch, block_elems) = (n * b, s * b * stick + first * n * b * stick);
+                let (heads_pitch, heads_elems) = (b, s * a * b * stick + first * b * stick);
                 let (src, dst, runs) = if to_heads {
                     (
                         self.block,
                         self.heads,
                         StickRuns {
-                            runs: a,
+                            runs: count,
                             run_sticks: b,
                             src_pitch: block_pitch,
                             dst_pitch: heads_pitch,
@@ -948,7 +955,7 @@ impl<'a> HeadMajorCopies<'a> {
                         self.heads,
                         self.block,
                         StickRuns {
-                            runs: a,
+                            runs: count,
                             run_sticks: b,
                             src_pitch: heads_pitch,
                             dst_pitch: block_pitch,
@@ -958,19 +965,26 @@ impl<'a> HeadMajorCopies<'a> {
                         },
                     )
                 };
-                assemble_stick_runs_copy(
-                    &format!("heads{s}_o{}", dst.tid),
-                    &src.name(),
-                    &dst.name(),
-                    runs,
-                    sym_id_base,
-                    Some(layout),
-                )
-                .map_err(|message| Error {
-                    message: format!("{name}: {message}"),
-                })
-            })
-            .collect()
+                let op_name = match chunks {
+                    1 => format!("heads{s}_o{}", dst.tid),
+                    _ => format!("heads{s}r{k}_o{}", dst.tid),
+                };
+                ops.push(
+                    assemble_stick_runs_copy(
+                        &op_name,
+                        &src.name(),
+                        &dst.name(),
+                        runs,
+                        sym_id_base,
+                        Some(layout),
+                    )
+                    .map_err(|message| Error {
+                        message: format!("{name}: {message}"),
+                    })?,
+                );
+            }
+        }
+        Ok(ops)
     }
 }
 
