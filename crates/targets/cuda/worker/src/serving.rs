@@ -282,6 +282,9 @@ impl CudaServingWorker {
 }
 
 impl Worker for CudaServingWorker {
+    /// It samples no grammar.
+    fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
     fn init_device(&mut self) -> ExecutorResult<()> {
         self.device = Some(CudaDevice::open().map_err(init)?);
         Ok(())
