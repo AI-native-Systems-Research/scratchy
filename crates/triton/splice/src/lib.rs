@@ -1722,29 +1722,6 @@ pub fn walk_buckets(pages: u32) -> Vec<u32> {
     buckets
 }
 
-/// ⭐ A DECODE BATCH'S WALK RUNGS — [`walk_buckets`], plus a rung half way between each pair of
-/// powers of two at 32 pages and up (48, 96, 192, …). A decode batch's walk relaunches its chunk
-/// body with every chunk of its rung, masked ones at full price, so its cost is the rung's chunk
-/// count, not the context's: MEASURED on granite-3.1-8b bf16, the two-row rung's walk costs
-/// 0.072 ms a launch plus 0.139 ms per 16-page chunk it unrolls, so a ~10k context on the
-/// 128-page rung pays 8 chunks a layer where 5 reach it, and an 8200-token context paid 23.5 ms a
-/// step more than an 8120-token one for 8 live positions. The half-way rung puts a step at most
-/// 1.5x past its context instead of 2x. Below 32 pages the rungs are a chunk or two, and the
-/// powers of two stay as they are.
-pub fn batch_walk_buckets(pages: u32) -> Vec<u32> {
-    let mut buckets = walk_buckets(pages);
-    let halves: Vec<u32> = buckets
-        .iter()
-        .filter(|&&b| b >= 32)
-        .map(|&b| b + b / 2)
-        .filter(|&b| b < pages)
-        .collect();
-    buckets.extend(halves);
-    buckets.sort_unstable();
-    buckets.dedup();
-    buckets
-}
-
 /// The KV cache's allocation in a one-kernel bundle — see
 /// [`triton_ktir_superdsc::layout::allocate_paged_cache`], where the one-kernel layout lives.
 pub use triton_ktir_superdsc::layout::allocate_paged_cache;
@@ -4885,31 +4862,6 @@ mod walk_on_the_card {
                 );
             }
         }
-    }
-
-    /// ⭐ A DECODE BATCH'S LADDER TAKES THE HALF-WAY RUNGS FROM 32 PAGES UP — at granite-3.1-2b's
-    /// 1024-page pool the powers of two and 48, 96, 192, 384 and 768 — so a ~10k context's 80 pages
-    /// walk the 96-page rung (6 chunks of 16 at two sequences) and not the 128-page one (8). Every
-    /// power-of-two rung is still on it, so no context walks further than before.
-    #[test]
-    fn a_decode_batch_ladder_takes_the_half_way_rungs() {
-        assert_eq!(
-            batch_walk_buckets(1024),
-            vec![
-                1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
-            ]
-        );
-        assert_eq!(batch_walk_buckets(819).last(), Some(&819));
-        for pages in [64u32, 819, 1024, 1638] {
-            let (all, pow2) = (batch_walk_buckets(pages), walk_buckets(pages));
-            assert!(pow2.iter().all(|b| all.contains(b)), "{pages} pages");
-        }
-        let first_reaching =
-            |ladder: &[u32], need: u32| ladder.iter().copied().find(|&b| b >= need);
-        assert_eq!(first_reaching(&batch_walk_buckets(1024), 80), Some(96));
-        assert_eq!(first_reaching(&walk_buckets(1024), 80), Some(128));
-        assert_eq!(BatchChunking::of(2, 96, 8).num_chunks, 6);
-        assert_eq!(BatchChunking::of(2, 128, 8).num_chunks, 8);
     }
 
     /// One chunk is straight-line: no loop to relaunch, every descriptor once.
