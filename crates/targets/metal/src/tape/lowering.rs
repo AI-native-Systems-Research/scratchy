@@ -12079,11 +12079,8 @@ mod tests {
                 (KernelId::AttentionDecodeCombine, trio),
             ]
         );
-        let (pack, split, combine) = (
-            &m5.commands[3].command,
-            &m5.commands[4].command,
-            &m5.commands[5].command,
-        );
+        let [pack, split, combine] = [3, 4, 5].map(|i| m5.commands.get(i).command);
+        let (pack, split, combine) = (&pack, &split, &combine);
         assert_eq!(pack.dispatch.threadgroups, (VERIFY_TILE_ROWS, 4, 64));
         assert_eq!(split.dispatch.threadgroups, (VERIFY_SPLITS, 4, 64));
         assert_eq!(
@@ -12349,7 +12346,7 @@ mod tests {
                 [(KernelId::AffineQmvFast, None)],
                 "bucket {bucket_m}"
             );
-            let d = tape.commands[0].command.dispatch;
+            let d = tape.commands.get(0).command.dispatch;
             assert_eq!(d.threadgroups, (bucket_m, 48 / 4, 1), "bucket {bucket_m}");
             let scaling = d.m_scaling.expect("X-axis m_scaling");
             assert!(matches!(scaling.axis, MScaleAxis::X) && scaling.set_axis.is_none());
@@ -12428,7 +12425,8 @@ mod tests {
                 ],
                 "{case}"
             );
-            let (own, small) = (&tape.commands[1].command, &tape.commands[2].command);
+            let [own, small] = [1, 2].map(|i| tape.commands.get(i).command);
+            let (own, small) = (&own, &small);
             let kernel = W4a8Gemm::SmallM(ways);
             assert_eq!(
                 kernel,
@@ -12518,7 +12516,8 @@ mod tests {
                 ],
                 "{case}"
             );
-            let [quant, wide, small] = [0, 1, 2].map(|i| &tape.commands[i].command);
+            let [quant, wide, small] = [0, 1, 2].map(|i| tape.commands.get(i).command);
+            let [quant, wide, small] = [&quant, &wide, &small];
             let rows = W4A8_SMALL_M_ROWS;
             let slot = |c: &LoweredCommand, i| c.constants.iter().find(|v| v.index == i).copied();
             assert_eq!(
@@ -13071,7 +13070,7 @@ mod tests {
                 ..bake_point(bucket_m, Some(&crate::targets::M5_10CORE))
             };
             let tape = lower_subtile_tape_to_metal(&gemm(n, k), &tp(), at).expect("lowers");
-            let qmm = &tape.commands[1].command;
+            let qmm = &tape.commands.get(1).command;
             let case = format!("{class:?} bucket {bucket_m} n {n} k {k}");
             assert_eq!(qmm.kernel, KernelId::AffineQmmW4a8, "{case}");
             assert_eq!(qmm.function, kernel.static_name(dtype, scale, 64), "{case}");
@@ -13163,7 +13162,7 @@ mod tests {
                 ),
             ] {
                 let i = at(norm);
-                let c = &tape.commands[i].command;
+                let c = &tape.commands.get(i).command;
                 assert_eq!(
                     c.function,
                     quantizing_symbol(plain).expect("a twin"),
@@ -13199,7 +13198,7 @@ mod tests {
             let case = format!("bucket {bucket_m}: {kinds:?}");
             assert_eq!(kinds[0], RmsNorm, "{case}");
             assert_ne!(kinds[1], Quant, "{case}");
-            let c = &tape.commands[0];
+            let c = &tape.commands.get(0);
             let p = tp();
             assert_eq!(
                 c.command.function,
