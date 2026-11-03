@@ -8412,11 +8412,13 @@ impl Worker for MetalWorker {
         }
     }
 
-    /// A hybrid model's KV stores take no memory until a step maps them (`grow_metal_kv_to_cover`),
+    /// Every model's KV stores take no memory until a step maps them (`grow_metal_kv_to_cover`),
     /// and stay mapped — unless they share their budget with recurrent-state snapshots, whose runs
-    /// are mapped apart and released (`SharedKv`).
+    /// are mapped apart and released (`SharedKv`). Uniform models too: the stores map through the
+    /// highest block a step names, so the scheduler must hand out blocks already mapped before
+    /// never-used ones, or distinct prompts one at a time map the pool far past what they hold.
     fn kv_backing(&self) -> scratchy_core_common::KvBacking {
-        if cfg!(feature = "metal") && self.kv_is_hybrid && self.gdn_snapshot_cap == 0 {
+        if cfg!(feature = "metal") && self.gdn_snapshot_cap == 0 {
             scratchy_core_common::KvBacking::OnFirstUse
         } else {
             scratchy_core_common::KvBacking::Allocated

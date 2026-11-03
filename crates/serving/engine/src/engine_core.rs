@@ -276,8 +276,10 @@ impl EngineCore {
                     stores
                 );
                 tracker.enable_hybrid(num_blocks, groups, stores);
-                tracker = tracker.with_kv_backing(executor.kv_backing());
             }
+            // ⭐ AND HOW IT BACKS ITS KV BLOCKS WITH MEMORY, on either path: a worker that maps them on
+            // first use needs blocks it has mapped handed out before never-used ones.
+            tracker = tracker.with_kv_backing(executor.kv_backing());
             // ⭐ AND HOW MANY SNAPSHOTS OF THE MODEL'S RECURRENT STATE IT KEEPS. A Gated-DeltaNet
             // hybrid's prefix hit must also restore one; with none, `initialize_core` already kept
             // prefix caching off for it.
