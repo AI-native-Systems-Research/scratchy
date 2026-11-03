@@ -67,6 +67,8 @@ MLX_MTL_CONST int NAX_SIMD_SIZE = 32;
 SCRATCHY_CONSTANT_OPTIONAL(int, QMM_K, 0);
 SCRATCHY_CONSTANT_OPTIONAL(int, QMM_N, 1);
 SCRATCHY_CONSTANT_OPTIONAL(int, QMM_M, 2);
+// The second tensor's N of a paired split-K GEMM (`affine_qmm_w4a8_splitk_pair`).
+SCRATCHY_CONSTANT_OPTIONAL(int, QMM_N2, 9);
 // Block-diagonal span attention (hd512 unfused QKᵀ): per-position span-label
 // granularity (== metal KV block size). 0 / unset → no bound (dense path
 // byte-identical).
@@ -1485,6 +1487,102 @@ template <typename T, typename S, int G, int TM, int TN, int KS>
     }
 }
 
+// Two split-K W4A8 GEMMs of one activation in one dispatch (Splash's `gguf_decode_fused_m*`): a
+// threadgroup per column tile of either tensor, the first QMM_N / TN tiles the first's, the rest the
+// second's (its N at QMM_N2, its own buffers 5-7 and output 8). Each tile is exactly the
+// `affine_qmm_w4a8_splitk` tile of its tensor (same walk, sums and store), so either output is the
+// bits of its own dispatch; the pair only shares the grid, so neither tensor's narrow grid leaves
+// cores idle. Grid (N/TN + N2/TN, ⌈M/TM⌉), 32·KS threads.
+template <typename T, typename S, int G, int TM, int TN, int KS>
+[[kernel, max_total_threads_per_threadgroup(KS * 32)]] void affine_qmm_w4a8_splitk_pair(
+    const device uchar* w [[buffer(0)]], const device S* scales [[buffer(1)]],
+    const device S* biases [[buffer(2)]], const device uchar* scratch [[buffer(3)]],
+    device T* y [[buffer(4)]], const device uchar* w2 [[buffer(5)]],
+    const device S* scales2 [[buffer(6)]], const device S* biases2 [[buffer(7)]],
+    device T* y2 [[buffer(8)]], uint2 tgid [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    using namespace mpp::tensor_ops;
+    using Ext = dextents<int32_t, 2>;
+    static_assert(TM == 16 || TM == 32, "TM: the bucket's 32-row tile or the small-M 16");
+    static_assert(KS >= 2 && (KS & (KS - 1)) == 0, "KS: a power of two, at least 2");
+    const int tiles1 = QMM_N / TN;
+    const bool second = int(tgid.x) >= tiles1;
+    const int N = second ? QMM_N2 : QMM_N;
+    const device uchar* wt = second ? w2 : w;
+    const device S* st = second ? scales2 : scales;
+    const device S* bt = second ? biases2 : biases;
+    device T* yt = second ? y2 : y;
+    const int K = QMM_K, M = QMM_M, KG = K / G, KC = K / 64;
+    constexpr bool short_rows = M < TM;
+    const int MS = short_rows ? TM : M;
+    using XA = tensor<device int8_t, Ext, tensor_inline>;
+    using XB = tensor<device int4b_format, Ext, tensor_inline>;
+    XA A((device int8_t*)scratch, Ext(K, MS));
+    XB B((typename XB::data_handle_type)wt, Ext(K, N));
+    const device float2* qa = (const device float2*)(scratch + int64_t(MS) * K);
+    constexpr auto desc =
+        matmul2d_descriptor(TM, TN, 64, false, true, false, matmul2d_descriptor::mode::multiply);
+    matmul2d<desc, execution_simdgroups<1>> op;
+    const int row0 = int(tgid.y) * TM, col0 = (int(tgid.x) - (second ? tiles1 : 0)) * TN;
+    auto sA0 = A.template slice<64, TM>(0, row0);
+    auto sB0 = B.template slice<64, TN>(0, col0);
+    auto part = op.template get_destination_cooperative_tensor<decltype(sA0), decltype(sB0), int>();
+    auto acc = op.template get_destination_cooperative_tensor<decltype(sA0), decltype(sB0), float>();
+    _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) acc[i] = 0.0f;
+    }
+    for (int c = int(sg); c < KC; c += KS) {
+        auto sA = A.template slice<64, TM>(c * 64, row0);
+        auto sB = B.template slice<64, TN>(c * 64, col0);
+        op.run(sA, sB, part);
+        const int g = c * 64 / G;
+        _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < part.get_capacity(); ++i) {
+            if (part.is_valid_element(i)) {
+                const auto idx = part.get_multidimensional_index(i);
+                const int n = col0 + idx[0], m = row0 + idx[1];
+                const float s = float(st[n * KG + g]);
+                const float2 q = qa[int64_t(m) * KC + c];
+                acc[i] = fma(float(part[i]) * q.x, s,
+                             fma(fma(8.0f, s, float(bt[n * KG + g])), q.y, acc[i]));
+            }
+        }
+    }
+    threadgroup float red[(KS / 2) * TM * TN];
+    for (int h = KS / 2; h >= 1; h /= 2) {
+        if (int(sg) >= h && int(sg) < 2 * h) {
+            _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+                if (acc.is_valid_element(i)) {
+                    const auto idx = acc.get_multidimensional_index(i);
+                    red[((int(sg) - h) * TM + idx[1]) * TN + idx[0]] = acc[i];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (int(sg) < h) {
+            _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+                if (acc.is_valid_element(i)) {
+                    const auto idx = acc.get_multidimensional_index(i);
+                    acc[i] += red[(int(sg) * TM + idx[1]) * TN + idx[0]];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (sg != 0) return;
+    auto out = op.template get_destination_cooperative_tensor<decltype(sA0), decltype(sB0), T>();
+    _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) out[i] = T(acc[i]);
+    }
+    tensor<device T, Ext, tensor_inline> C(yt, Ext(N, M));
+    if constexpr (short_rows) {
+        auto mC = C.template slice<TN, dynamic_extent>(col0, row0);
+        out.store(mC);
+    } else {
+        auto mC = C.template slice<TN, TM>(col0, row0);
+        out.store(mC);
+    }
+}
+
 template <typename T, typename S, int G, int TN, int NSG>
 [[kernel]] void affine_gather_qmm_w4a8(
     const device uchar* w [[buffer(0)]], const device S* scales [[buffer(1)]],
@@ -1522,12 +1620,16 @@ SCRATCHY_KERNEL(affine_gather_w4a8_quant_f16, affine_gather_w4a8_quant<half>)
 
 #define INST_QMM_W4A8_SPLITK(act_tag, act_type, scale_tag, scale_type, gs, tn, ks)            \
   SCRATCHY_KERNEL(affine_qmm_w4a8_splitk_##act_tag##_s_##scale_tag##_gs_##gs##_tn_##tn##_ks_##ks, \
-                  affine_qmm_w4a8_splitk<act_type, scale_type, gs, 32, tn, ks>)
+                  affine_qmm_w4a8_splitk<act_type, scale_type, gs, 32, tn, ks>)                 \
+  SCRATCHY_KERNEL(affine_qmm_w4a8_splitk_pair_##act_tag##_s_##scale_tag##_gs_##gs##_tn_##tn##_ks_##ks, \
+                  affine_qmm_w4a8_splitk_pair<act_type, scale_type, gs, 32, tn, ks>)
 
 // The small-M step's 16-row tile (`W4a8Gemm::SmallM`).
 #define INST_QMM_W4A8_SPLITK_TM16(act_tag, act_type, scale_tag, scale_type, gs, tn, ks)       \
   SCRATCHY_KERNEL(affine_qmm_w4a8_splitk_##act_tag##_s_##scale_tag##_gs_##gs##_tm_16_tn_##tn##_ks_##ks, \
-                  affine_qmm_w4a8_splitk<act_type, scale_type, gs, 16, tn, ks>)
+                  affine_qmm_w4a8_splitk<act_type, scale_type, gs, 16, tn, ks>)                 \
+  SCRATCHY_KERNEL(affine_qmm_w4a8_splitk_pair_##act_tag##_s_##scale_tag##_gs_##gs##_tm_16_tn_##tn##_ks_##ks, \
+                  affine_qmm_w4a8_splitk_pair<act_type, scale_type, gs, 16, tn, ks>)
 
 #define INST_QMM_W4A8_SPLITK_TILES(act_tag, act_type, scale_tag, scale_type, gs)               \
     INST_QMM_W4A8_SPLITK(act_tag, act_type, scale_tag, scale_type, gs, 32, 2) \

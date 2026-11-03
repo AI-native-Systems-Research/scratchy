@@ -1068,6 +1068,40 @@ impl W4a8Gemm {
     }
 }
 
+/// The paired split-K W4A8 GEMM's symbol (`affine_qmm_w4a8_splitk_pair_*`): two tensors of one
+/// activation in one dispatch, each tile its own tensor's split-K tile. `None` for a tiled kernel,
+/// which has no paired twin.
+pub fn qmm_w4a8_pair_static_name(
+    kernel: W4a8Gemm,
+    dtype: DequantDtype,
+    scale_dtype: ScaleDtype,
+    group_size: u32,
+) -> Option<&'static str> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = (W4a8Gemm, DequantDtype, ScaleDtype, u32);
+    static CACHE: OnceLock<Mutex<HashMap<Key, &'static str>>> = OnceLock::new();
+    let (act, scale) = (dtype.symbol_infix(), scale_dtype.symbol_infix());
+    let name = match kernel {
+        W4a8Gemm::Tiled(_) => return None,
+        W4a8Gemm::SplitK(split) => format!(
+            "affine_qmm_w4a8_splitk_pair_{act}_s_{scale}_gs_{group_size}_tn_{W4A8_SPLIT_K_COLS}_ks_{}",
+            split.ways(),
+        ),
+        W4a8Gemm::SmallM(split) => format!(
+            "affine_qmm_w4a8_splitk_pair_{act}_s_{scale}_gs_{group_size}_tm_{W4A8_SMALL_M_ROWS}_tn_{W4A8_SPLIT_K_COLS}_ks_{}",
+            split.ways(),
+        ),
+    };
+    let mut guard = (CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock())
+        .expect("qmm_w4a8_pair_static_name cache poisoned");
+    Some(
+        guard
+            .entry((kernel, dtype, scale_dtype, group_size))
+            .or_insert_with(|| Box::leak(name.into_boxed_str())),
+    )
+}
+
 /// Scratch the W4A8 pre-pass writes for an `m x k` activation: int8
 /// `xq[m][k]`, then float2 `(scale, scale * sum)` per (row, 64-chunk).
 pub fn w4a8_scratch_bytes(m: u32, k: u32) -> u32 {

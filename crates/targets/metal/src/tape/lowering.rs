@@ -2011,6 +2011,13 @@ fn lower(
         rows,
         &mut m_divisor,
     );
+    pair_w4a8_gemms(
+        &mut commands,
+        &mut barrier_before,
+        &mut live_cmds,
+        &mut loops,
+        class,
+    );
     // ⛔ OUTERMOST FIRST. Spans close innermost-first, but the expander resolves a nest by
     // taking the first loop that starts at a position and recursing into the REST of the list —
     // so an inner loop ahead of its parent would be read as the parent.
@@ -2032,6 +2039,153 @@ fn lower(
         logits_rows: logits_rows.unwrap_or(LogitsRows::Bucket),
     };
     Ok((tape, logits_rows))
+}
+
+/// Two consecutive split-K W4A8 GEMMs of one activation (the same pre-pass scratch, kernel, rows,
+/// gate and no barrier between them: a Gated-DeltaNet layer's qkv and z, an attention layer's
+/// q and k) run as one dispatch of both tensors' column tiles (`affine_qmm_w4a8_splitk_pair`),
+/// Splash's fused decode projection: neither narrow grid alone fills the wide class's cores. Each
+/// output is the bits of its own GEMM. Run on the finished command list, the loops' spans and
+/// periods shrink with it.
+fn pair_w4a8_gemms(
+    commands: &mut Vec<GatedCommand>,
+    barrier_before: &mut Vec<Fence>,
+    live_cmds: &mut Vec<PlayLive>,
+    loops: &mut [super::lowered::TapeLoop],
+    class: crate::tape::lowered::GenClass,
+) {
+    if class != crate::tape::lowered::GenClass::M5Wide {
+        return;
+    }
+    let pair_symbol = |f: &str| -> Option<&'static str> {
+        use crate::quantized::{W4a8SplitK, qmm_w4a8_pair_static_name};
+        let kernels = (W4a8SplitK::ALL.into_iter().map(W4a8Gemm::SplitK))
+            .chain(W4a8SplitK::ALL.into_iter().map(W4a8Gemm::SmallM));
+        kernels
+            .flat_map(|k| [DequantDtype::F16, DequantDtype::Bf16].map(|d| (k, d)))
+            .flat_map(|(k, d)| [ScaleDtype::F16, ScaleDtype::Bf16].map(|s| (k, d, s)))
+            .flat_map(|(k, d, s)| [64, 128].map(|g| (k, d, s, g)))
+            .find(|&(k, d, s, g)| k.static_name(d, s, g) == f)
+            .and_then(|(k, d, s, g)| qmm_w4a8_pair_static_name(k, d, s, g))
+    };
+    let n_of = |c: &LoweredCommand| (c.constants.iter()).find(|v| v.index == 1).map(|v| v.bits);
+    let pairs = |a: &GatedCommand, b: &GatedCommand| -> Option<GatedCommand> {
+        let (x, y) = (&a.command, &b.command);
+        let same = x.kernel == KernelId::AffineQmmW4a8
+            && y.kernel == KernelId::AffineQmmW4a8
+            && x.function == y.function
+            && a.gate == b.gate
+            && x.dispatch.threads_per_threadgroup == y.dispatch.threads_per_threadgroup
+            && x.dispatch.threadgroups.1 == y.dispatch.threadgroups.1
+            && x.dispatch.m_scaling == y.dispatch.m_scaling
+            && (x.constants.iter().filter(|v| v.index != 1))
+                .eq(y.constants.iter().filter(|v| v.index != 1))
+            && x.bindings.contains(&Binding::Scratch { binding_index: 3 })
+            && y.bindings.contains(&Binding::Scratch { binding_index: 3 });
+        if !same {
+            return None;
+        }
+        let function = pair_symbol(x.function)?;
+        let n2 = n_of(y)?;
+        let moved = (y.bindings.iter()).filter_map(|b| match *b {
+            Binding::Source {
+                ix,
+                which,
+                layer,
+                binding_index: i @ 0..=2,
+            } => Some(Binding::Source {
+                ix,
+                which,
+                layer,
+                binding_index: i + 5,
+            }),
+            Binding::ArenaSlot {
+                slot,
+                binding_index: 4,
+            } => Some(Binding::ArenaSlot {
+                slot,
+                binding_index: 8,
+            }),
+            _ => None,
+        });
+        let bindings: Vec<Binding> = x.bindings.iter().copied().chain(moved).collect();
+        if bindings.len() != x.bindings.len() + 4 {
+            return None;
+        }
+        let constants: Vec<ConstantValue> = (x.constants.iter().copied())
+            .chain([ConstantValue::int(9, n2 as i32)])
+            .collect();
+        let (gx, gy, gz) = x.dispatch.threadgroups;
+        Some(GatedCommand {
+            command: LoweredCommand {
+                function,
+                constants: baked(constants),
+                bindings: baked(bindings),
+                dispatch: DispatchShape {
+                    threadgroups: (gx + y.dispatch.threadgroups.0, gy, gz),
+                    ..x.dispatch
+                },
+                ..*x
+            },
+            gate: a.gate,
+        })
+    };
+    // A loop's body boundary never splits a pair: a pair straddling one would merge two
+    // iterations' commands.
+    let edges: std::collections::BTreeSet<usize> = (loops.iter())
+        .flat_map(|l| [l.start as usize, (l.start + l.period) as usize])
+        .collect();
+    // Within a run of commands no barrier separates (the GEMMs of one activation, each beside its
+    // twins for the other step shapes), pair the first unpaired GEMM with the next one of its
+    // gate that pairs with it.
+    let mut keep = vec![true; commands.len()];
+    let mut run_start = 0;
+    for end in 1..=commands.len() {
+        let closes =
+            end == commands.len() || barrier_before[end] != Fence::None || edges.contains(&end);
+        if !closes {
+            continue;
+        }
+        for i in run_start..end {
+            if !keep[i] || commands[i].command.kernel != KernelId::AffineQmmW4a8 {
+                continue;
+            }
+            for j in i + 1..end {
+                if !keep[j] {
+                    continue;
+                }
+                if let Some(fused) = pairs(&commands[i], &commands[j]) {
+                    commands[i] = fused;
+                    live_cmds[i] = live_cmds[i].or(live_cmds[j]);
+                    keep[j] = false;
+                    break;
+                }
+            }
+        }
+        run_start = end;
+    }
+    if keep.iter().all(|&k| k) {
+        return;
+    }
+    // Old index -> new index; loop spans count the commands kept before them.
+    let mut new_at = Vec::with_capacity(keep.len() + 1);
+    let mut n = 0u32;
+    for &k in &keep {
+        new_at.push(n);
+        n += u32::from(k);
+    }
+    new_at.push(n);
+    for l in loops.iter_mut() {
+        let (s, e) = (l.start as usize, (l.start + l.period) as usize);
+        l.start = new_at[s];
+        l.period = new_at[e] - new_at[s];
+    }
+    let mut k = keep.iter();
+    commands.retain(|_| *k.next().expect("one keep a command"));
+    let mut k = keep.iter();
+    barrier_before.retain(|_| *k.next().expect("one keep a fence"));
+    let mut k = keep.iter();
+    live_cmds.retain(|_| *k.next().expect("one keep a live set"));
 }
 
 /// Abstract-interpret the row count across the step stream so the
@@ -12036,6 +12190,43 @@ mod tests {
     /// `OnlyIfSmallMTokens` with the GEMM's constants, bindings and row scaling, its grid
     /// `(n / 32, bucket / 16)`, K split the fewest ways from 4 that fill the cores (Qwen3.8-27B's
     /// verify shapes in the 64-row bucket). The M5 class keeps the bf16 twin in every bucket.
+    #[test]
+    fn probe_pair_qkvz() {
+        use crate::tape::lowered::GenClass::M5Wide;
+        let p = tp();
+        let mm = |input, output, n| {
+            MetalStep::AffineQmm(AffineMatmul {
+                input: Slot(input),
+                output: Slot(output),
+                layer: LayerId(0),
+                n: NDim(n),
+                k: KDim(5120),
+                group_size: AffineGroupSize(64),
+                bits: AffineBits(4),
+                vector_limit: QmvBatchLimit(10),
+                ends: QmvEnds::default(),
+            })
+        };
+        for bucket_m in [8u32, 16, 64] {
+            let at = BakePoint {
+                class: M5Wide,
+                ..bake_point(bucket_m, Some(&crate::targets::M5_10CORE))
+            };
+            let tape = lower_subtile_tape_to_metal(
+                &row_tape(plain(&[mm(0, 1, 10240), mm(0, 2, 6144)])),
+                &p,
+                at,
+            )
+            .expect("lowers");
+            for (c, f) in tape.commands.iter().zip(tape.barrier_before.iter()) {
+                eprintln!(
+                    "PAIR bucket {bucket_m}: {:?} {:?} {} {:?}",
+                    f, c.command.kernel, c.command.function, c.gate
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_w4a8_bucket_runs_its_small_m_step_in_a_16_row_w4a8_tile() {
         use crate::quantized::{W4a8Gemm, W4a8SplitK};
