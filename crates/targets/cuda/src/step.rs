@@ -262,6 +262,79 @@ pub const GEMM_NARROW_BF16_ONE_K_MULTIPLE: u32 = 256;
 /// `i32::MAX`; `m` is 1.
 pub const GEMV_BF16_MULTIPLE: u32 = 8;
 
+/// The decode GEMV's chunk along `k` (`kernels/gemv_bf16.cu`): one 512-byte vector TMA load per
+/// row and stage. A K split is a run of whole chunks.
+pub const GEMV_CHUNK: u32 = 256;
+/// The decode GEMV's output rows per CTA: 8 warps of 4 rows. The scratch holds each pair's `n`
+/// rounded up to it.
+pub const GEMV_BLOCK_ROWS: u32 = 32;
+/// The most K splits the decode GEMV takes (its launcher's bound).
+pub const GEMV_MAX_SPLITS: u32 = 16;
+/// The CTAs a decode GEMV aims for: two per SM of the H100's 132.
+pub const GEMV_TARGET_CTAS: u32 = 264;
+
+/// #1031's split table (`GEMV_SPLITS`), as a function of a decode GEMV's `(n, k)` and its pairs
+/// (1 for the dense GEMV and the router, `m · top_k` for the expert GEMV): the fewest K splits
+/// that put [`GEMV_TARGET_CTAS`] CTAs on the GPU, each split at least 2 chunks long (so its 4-stage
+/// ring has loads to overlap), at most [`GEMV_MAX_SPLITS`]. A pure function of the step's
+/// constant shape, so every launch of a step adds its products in the same order. The dense and
+/// the expert GEMV run one row routine and take this one table; at one pair and the same `(n, k)`
+/// they take the same split, so their rows are the same bits.
+///
+/// | `(n, k)`, pairs | blocks | split |
+/// |---|---|---|
+/// | 9B `(4096, 4096)`, `(4096, 12288)` | 128 | 3 |
+/// | 9B `(1024, 4096)` | 32 | 8 |
+/// | 0.8B `(4096, 1024)` | 128 | 2 |
+/// | the lm_heads, `n` ≥ 8448 | ≥ 264 | 1 |
+/// | 35B experts `(512, 2048)` × 8 | 128 | 3 |
+/// | Gemma experts `(704, 2816)` × 8 | 176 | 2 |
+pub const fn gemv_splits(n: u32, k: u32, pairs: u32) -> u32 {
+    let blocks = n.div_ceil(GEMV_BLOCK_ROWS) as u64 * pairs as u64;
+    let chunks = k.div_ceil(GEMV_CHUNK);
+    let mut splits = 1u32;
+    while blocks * (splits as u64) < GEMV_TARGET_CTAS as u64
+        && splits < GEMV_MAX_SPLITS
+        && chunks / (splits + 1) >= 2
+        && gemv_split_chunks(chunks, splits + 1) != 0
+    {
+        splits += 1;
+    }
+    splits
+}
+
+/// The chunks of one of `splits` K runs of a `chunks`-chunk row, `⌈chunks / splits⌉`, or 0 when
+/// that leaves a run empty or `splits` is out of `1..=GEMV_MAX_SPLITS`: the launcher's rule
+/// (`kernels/gemv_bf16.cu`, `split_chunks`), so every split [`gemv_splits`] picks is one it takes.
+pub const fn gemv_split_chunks(chunks: u32, splits: u32) -> u32 {
+    if splits == 0 || splits > GEMV_MAX_SPLITS || splits > chunks {
+        return 0;
+    }
+    let each = chunks.div_ceil(splits);
+    if (splits - 1) * each < chunks {
+        each
+    } else {
+        0
+    }
+}
+
+/// The f32 scratch bytes a decode GEMV at `splits` writes: `splits · pairs · n_pad` f32, `n_pad`
+/// `n` rounded up to [`GEMV_BLOCK_ROWS`]; 0 at one split (each CTA stores its rows directly).
+/// `None` on overflow.
+pub const fn gemv_scratch_bytes(n: u32, pairs: u32, splits: u32) -> Option<u64> {
+    if splits <= 1 {
+        return Some(0);
+    }
+    let rows = n.div_ceil(GEMV_BLOCK_ROWS) as u64 * GEMV_BLOCK_ROWS as u64;
+    let Some(per) = rows.checked_mul(pairs as u64) else {
+        return None;
+    };
+    let Some(all) = per.checked_mul(splits as u64) else {
+        return None;
+    };
+    all.checked_mul(4)
+}
+
 /// The RMSNorm's `cols` is a non-zero multiple of this: 8 bf16 is 16 bytes, so every row stride is a multiple of 16 bytes, as the ThunderKittens 16-row tile's TMA tensor maps need (`kernels/rms_norm_bf16.cu`). `rows`
 /// is non-zero and `rows · cols` at most `i32::MAX`.
 pub const RMS_NORM_BF16_COLS: u32 = 8;
@@ -1116,6 +1189,63 @@ pub struct StepExtents {
 }
 
 impl CudaStep {
+    /// A decode GEMV's K split and its pairs (`gemv_splits`): the dense GEMV and a GEMV router at
+    /// one pair, the expert GEMV at `m · top_k`; `None` for every other step. Every variant is
+    /// named, so a new step states whether it is one.
+    pub const fn gemv_split(&self) -> Option<(u32, u32, u32)> {
+        match *self {
+            Self::Gemv(GemmBf16 { n, k, .. }) => Some((n, 1, gemv_splits(n, k, 1))),
+            Self::RouterLogits(RouterLogitsBf16 {
+                experts,
+                hidden,
+                kernel: MatmulKernel::Gemv,
+                ..
+            }) => Some((experts, 1, gemv_splits(experts, hidden, 1))),
+            Self::ExpertGemv(g) => {
+                let (n, k) = g.n_k();
+                let Some(pairs) = g.m.checked_mul(g.top_k) else {
+                    return None;
+                };
+                Some((n, pairs, gemv_splits(n, k, pairs)))
+            }
+            Self::RouterLogits(_)
+            | Self::Embed(_)
+            | Self::Gemm(_)
+            | Self::GemmNarrow(_)
+            | Self::RmsNorm(_)
+            | Self::Add(_)
+            | Self::SiluMul(_)
+            | Self::Rope(_)
+            | Self::GateSplit(_)
+            | Self::GateApply(_)
+            | Self::RopeAppend(_)
+            | Self::AttnPrefill(_)
+            | Self::AttnDecode(_)
+            | Self::GatedDeltaNet(_)
+            | Self::MoeRoute(_)
+            | Self::ExpertSort(_)
+            | Self::ExpertGemm(_)
+            | Self::ExpertCombine(_)
+            | Self::GateScale(_)
+            | Self::Scale(_)
+            | Self::RmsNormUnit(_)
+            | Self::GeluMul(_)
+            | Self::LayerScale(_)
+            | Self::SoftCap(_)
+            | Self::RouterNorm(_)
+            | Self::GemmCol64(_) => None,
+        }
+    }
+
+    /// The GEMV scratch bytes the step writes: [`gemv_scratch_bytes`] of [`Self::gemv_split`], 0
+    /// for a step that is no decode GEMV or runs at one split; `None` on overflow.
+    pub const fn gemv_scratch(&self) -> Option<u64> {
+        match self.gemv_split() {
+            Some((n, pairs, splits)) => gemv_scratch_bytes(n, pairs, splits),
+            None => Some(0),
+        }
+    }
+
     /// What the step's kernel reads and writes, in bytes; `None` when a byte count overflows
     /// `u64`. Each arm states its own kernel's operands, next to that kernel's registry row:
     /// `CudaTape::validate` checks a tape against it.

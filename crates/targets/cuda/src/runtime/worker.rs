@@ -43,7 +43,7 @@ use crate::step::{
     ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
     GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16,
     MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
-    RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, gemv_splits,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
@@ -1360,6 +1360,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         tape: &CudaTape,
     ) -> Result<(), (usize, KernelError)> {
         let slot = |offset| Self::slot_of(arena, offset);
+        // The decode GEMVs' split-K scratch, null when no step splits (a launcher refuses a null
+        // scratch above one split).
+        let partials = tape
+            .gemv_scratch
+            .map_or(std::ptr::null_mut(), |s| slot(s.offset));
         // SAFETY (every arm): `new` validated the tape (`CudaTape::validate`): each span a step
         // reads or writes (`CudaStep::extents`, the kernel's own operand sizes) is 256-byte
         // aligned and inside the tape's arena, which is at most this worker's; each span it
@@ -1500,9 +1505,24 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 }
                 CudaStep::Gemv(GemmBf16 { a, b, c, n, k, .. }) => {
                     let b = weights[b.0 as usize].ptr();
+                    let splits = gemv_splits(n, k, 1);
                     // SAFETY: as above, for `a` (`k`, its `m` is 1: `validate`), `b` (`n*k`) and
-                    // `c` (`n`).
-                    unsafe { kernels::gemv_bf16_abt(slot(a), b, slot(c), (n, k), stream.0) }
+                    // `c` (`n`); the scratch is the tape's GEMV scratch, at least this step's
+                    // partials' bytes, which no other step touches (`validate`).
+                    unsafe {
+                        // One split is the unsplit launcher, the same kernel and bits, so its
+                        // refusal stays `GemvShape` (#1048's `tape_player` pin).
+                        if splits == 1 {
+                            kernels::gemv_bf16_abt(slot(a), b, slot(c), (n, k), stream.0)
+                        } else {
+                            kernels::gemv_split_bf16_abt(
+                                (slot(a), b, slot(c)),
+                                partials,
+                                (n, k, splits),
+                                stream.0,
+                            )
+                        }
+                    }
                 }
                 CudaStep::RouterLogits(RouterLogitsBf16 {
                     x,
@@ -1530,11 +1550,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 hidden,
                                 stream.0,
                             ),
-                            MatmulKernel::Gemv => kernels::gemv_bf16_abt(
-                                slot(x),
-                                b,
-                                slot(logits),
-                                (experts, hidden),
+                            MatmulKernel::Gemv => kernels::gemv_split_bf16_abt(
+                                (slot(x), b, slot(logits)),
+                                partials,
+                                (experts, hidden, gemv_splits(experts, hidden, 1)),
                                 stream.0,
                             ),
                             // Gemma's 128-expert router at m ≥ 2, its own projection.
@@ -1588,7 +1607,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 },
                 CudaStep::ExpertSort(sort) => Self::expert_sort(&sort, slot, stream),
                 CudaStep::ExpertGemm(g) => Self::expert_gemm(&g, slot, weights, stream),
-                CudaStep::ExpertGemv(g) => Self::expert_gemv(&g, slot, weights, stream),
+                CudaStep::ExpertGemv(g) => Self::expert_gemv(&g, slot, partials, weights, stream),
                 CudaStep::ExpertCombine(ExpertCombineBf16 {
                     down,
                     pos,
@@ -2236,11 +2255,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         }
     }
 
-    /// Enqueue the gathered expert GEMV (`kernels::expert_gemv_bf16`) over every pair at the step's
-    /// expert count, B at [`ExpertProjection::slab`]'s part of the bundle or bank.
+    /// Enqueue the gathered expert GEMV (`kernels::expert_gemv_split_bf16`) over every pair at the
+    /// step's expert count and K split (`step::gemv_splits`), B at [`ExpertProjection::slab`]'s
+    /// part of the bundle or bank, its partials in the tape's GEMV scratch `partials`.
     fn expert_gemv(
         g: &ExpertGemvBf16,
         slot: impl Fn(ArenaOffset) -> *mut c_void,
+        partials: *mut c_void,
         weights: &[DeviceBuffer],
         stream: &Stream,
     ) -> Result<(), KernelError> {
@@ -2256,16 +2277,18 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 dims: [g.m, g.top_k, n, k],
             });
         };
+        let splits = gemv_splits(n, k, g.m.saturating_mul(g.top_k));
         // SAFETY: as `enqueue`'s, for `a` (its `PairRows` rows of `k`), `topk_idx` (`m*top_k`),
-        // `c` (`m*top_k*n`) and the bundle (`moe_bundle`'s bytes, which `new` checked the buffer
-        // holds; every expert's `[n, k]` lies inside its part).
+        // `c` (`m*top_k*n`), the bundle (`moe_bundle`'s bytes, which `new` checked the buffer
+        // holds; every expert's `[n, k]` lies inside its part) and the scratch (the tape's GEMV
+        // scratch, at least this step's partials' bytes, which `validate` checked).
         unsafe {
-            kernels::expert_gemv_bf16(
+            kernels::expert_gemv_split_bf16(
                 (slot(g.a).cast_const(), b, slot(g.topk_idx).cast_const()),
-                slot(g.c),
+                (slot(g.c), partials),
                 (g.m, g.top_k, n, k),
                 (g.experts, expert_rows),
-                g.rows == PairRows::Pair,
+                (g.rows == PairRows::Pair, splits),
                 stream.0,
             )
         }

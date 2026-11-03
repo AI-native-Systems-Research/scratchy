@@ -221,6 +221,9 @@ pub struct CudaCanonical {
     pub gdn: Option<CanonicalGdn>,
     /// The MoE scratch, after the GDN regions: `Some` exactly when a step is a MoE step.
     pub moe: Option<MoeTape>,
+    /// The decode GEMVs' split-K scratch, after every other region, the token ids included:
+    /// `Some` exactly when a step takes more than one K split (`CudaStep::gemv_scratch`).
+    pub gemv_scratch: Option<ArenaSpan>,
 }
 
 /// One canonical's Gated-DeltaNet layers: the fields of a `scratchy_target_cuda::tape::GdnTape`,
@@ -1535,11 +1538,30 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             _ => None,
         })
     });
+    // The GEMV scratch, sized by the lowered steps, at the arena's end: the largest split step's
+    // partials (one GEMV runs at a time), `None` when no step splits.
+    let scratch = (steps.iter())
+        .map(CudaStep::gemv_scratch)
+        .try_fold(0u64, |most, s| Some(most.max(s?)))
+        .ok_or(CanonicalRefusal::Arena(ArenaRefusal::TooLarge))?;
+    let (gemv_scratch, total_bytes) = match scratch {
+        0 => (None, arena.total),
+        bytes => {
+            let end = (bytes.checked_next_multiple_of(CUDA_ARENA_ALIGN))
+                .and_then(|b| arena.total.checked_add(b))
+                .ok_or(CanonicalRefusal::Arena(ArenaRefusal::TooLarge))?;
+            let span = ArenaSpan {
+                offset: ArenaOffset(arena.total),
+                bytes,
+            };
+            (Some(span), end)
+        }
+    };
     Ok(CudaCanonical {
         bucket_m: arena.bucket_m,
         colour_bytes: arena.bytes,
         colour_offsets: arena.offsets,
-        total_bytes: arena.total,
+        total_bytes,
         input,
         result,
         weight_bytes,
@@ -1577,6 +1599,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         }),
         gdn,
         moe,
+        gemv_scratch,
     })
 }
 

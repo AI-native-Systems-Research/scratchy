@@ -163,6 +163,7 @@ pub static MLP_M128: CudaTape = CudaTape {
     gdn: None,
     moe: None,
     rotary_local: None,
+    gemv_scratch: None,
 };
 
 /// [`mlp`]`(256)`: `x` 0, `n` 524288, `gate` 1048576, `up` 2883584, `s` 4718592 (unused),
@@ -190,4 +191,5 @@ pub static MLP_M256: CudaTape = CudaTape {
     gdn: None,
     moe: None,
     rotary_local: None,
+    gemv_scratch: None,
 };

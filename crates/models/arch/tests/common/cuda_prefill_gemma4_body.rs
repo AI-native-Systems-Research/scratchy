@@ -1881,9 +1881,12 @@ fn median(mut v: Vec<f64>) -> f64 {
 /// real defect would show.
 ///
 /// Gated, the decode check that holds on these synthetic weights (#925's GKE diagnosis: the
-/// whole-model cosine is the near-hard softmax's, not a defect): (i) every step up to and
-/// including the `RopeAppend` bit-identical, input and output, and the K and V cache rows of both
-/// seats (0..=300) too; (ii) no step drifts; (iii) the decode attention's rel L2 against the f64 of
+/// whole-model cosine is the near-hard softmax's, not a defect): (i) every step before layer 0's
+/// first GEMV bit-identical, input and output, each GEMV through the `RopeAppend` within the GEMM
+/// bound of f64 on its own input row, and the K and V cache rows of both seats that come from
+/// bit-identical inputs (the prefill's, 0..300) bit-identical (#1031's split-K GEMV adds in
+/// another order than the prefill GEMM, so a projection's row is no longer the GEMM's bits; the
+/// user's decision 2026-11-02, option (a)); (ii) no step drifts; (iii) the decode attention's rel L2 against the f64 of
 /// its own query and cache at most twice the prefill attention's against its own; (iv) the same
 /// expert picks at the routing.
 #[test]
@@ -1915,6 +1918,10 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
         .position(|&i| matches!(one.steps[i], CudaStep::RopeAppend(_)))
         .expect("layer 0's RopeAppend");
     let mut through_append = true;
+    let first_gemv = (s1.iter())
+        .position(|&i| matches!(one.steps[i], CudaStep::Gemv(_)))
+        .expect("layer 0's projections");
+    let mut gemvs_bounded = true;
     let (mut cache_same, mut attention_ok, mut picks_same) = (None, None, None);
     for (j, (&i1, &i5)) in s1.iter().zip(&s512).enumerate() {
         let (a, b) = (one.steps[i1], many.steps[i5]);
@@ -1957,11 +1964,21 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
             false => drift("in", pair(0), matches!(a, CudaStep::Embed(_))),
         };
         let (out_line, out_rel) = drift("out", pair(1), route);
-        if j <= append {
+        if j < first_gemv {
             // Both regions present and equal: a region that is not one row per token, or an
             // in-place step's input, is not proven bit-identical.
             let same = |k: usize| pair(k).is_some_and(|(x, y)| x == y);
             through_append &= same(1) && (ea.in_place || same(0));
+        }
+        if j <= append
+            && let CudaStep::Gemv(g) = a
+            && let (Some((x, _)), Some((y, _))) = (pair(0), pair(1))
+        {
+            let b = host_weights()[g.b.0 as usize].as_ref().expect("the GEMV's weight");
+            let (n, k) = (g.n as usize, g.k as usize);
+            let cmp = numerics::compare(&y, &x, &b[..n * k], 1, n, k);
+            eprintln!("(k-diag0) step {j} GEMV against f64 on its own input: {}", cmp.line());
+            gemvs_bounded &= cmp.pass();
         }
         eprintln!(
             "(k-diag0) step {j} (m=1 step {i1} {}, m=512 step {i5} {}): {in_line}; {out_line}",
@@ -2002,8 +2019,9 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
                     .zip(&y[..p * width])
                     .filter(|(u, v)| u != v)
                     .count();
-                let row_same = x[p * width..] == y[p * width..];
-                cache_same = Some(cache_same.unwrap_or(true) && prefix == 0 && row_same);
+                // Row `p`'s K and V come from the decode's GEMVs, gated by their bound above; its
+                // drift is printed below.
+                cache_same = Some(cache_same.unwrap_or(true) && prefix == 0);
                 eprintln!(
                     "(k-diag0) step {j} cache layer {layer} {name}: seat A against seat B rows \
                      0..{p} mismatched_bits={prefix}; row {p} {}",
@@ -2050,11 +2068,15 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
     );
     let gates = [
         (
-            "(i) steps 0..={append} (through the RopeAppend) bit-identical, input and output",
+            "(i) steps 0..{first_gemv} (before the first GEMV) bit-identical, input and output",
             Some(through_append),
         ),
         (
-            "(i) the K and V cache rows 0..=300 of both seats bit-identical",
+            "(i) every GEMV through the RopeAppend within the GEMM bound of f64",
+            Some(gemvs_bounded),
+        ),
+        (
+            "(i) the K and V cache rows 0..300 of both seats bit-identical",
             cache_same,
         ),
         ("(ii) no step drifts", Some(first.is_none())),
