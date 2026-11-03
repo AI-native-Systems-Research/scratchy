@@ -1945,13 +1945,17 @@ fn lower(
                         live_cmds[at] = live_cmds[at].or(live);
                     }
                 } else if !cmds.is_empty() {
-                    // The 8-row bucket's own wide matvec runs beside its small-M pre-pass pair.
+                    // The 8-row bucket's own wide matvec, and the 16-row bucket's simdgroup GEMM
+                    // (16 rows is no multiple of the W4A8 tile's 32), run beside their small-M
+                    // pre-pass pair.
                     let gemm = |c: &GatedCommand| {
                         matches!(
                             c.command.kernel,
                             KernelId::AffineQmmW4a8
                                 | KernelId::AffineQmmSmallM
                                 | KernelId::AffineQmvWide
+                                | KernelId::AffineQmmT
+                                | KernelId::AffineQmmTNax
                         )
                     };
                     quantized = cmds.split_first().and_then(|(first, rest)| {
