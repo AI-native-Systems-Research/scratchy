@@ -51,7 +51,8 @@ pub fn whole_tile_blocks(
 /// How a [`SparseStores`]' blocks from block 0 are mapped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mapping {
-    /// Through the furthest block reached, at least doubling a step ([`SparseStores::grow_to`]).
+    /// Through exactly the furthest block a step named, at the store's granule
+    /// ([`SparseStores::grow_to`]).
     Grown,
     /// In runs of their own, mapped and released as a budget the KV shares with recurrent-state
     /// snapshots says ([`SparseStores::map_apart`]).
@@ -94,9 +95,10 @@ impl KvMapper {
 /// block ends in, so a block need not fill whole tiles.
 /// A sparse buffer in the wired residency set takes no memory, where a plain capacity-sized one
 /// is committed in full when made resident (gemma-4-26b on a 64 GB Mac: ~19 GiB of KV at
-/// startup). Each step maps the next run of blocks of every buffer from ONE heap and at least
-/// doubles what is mapped, so a pool reached through `n` blocks holds O(log n) heaps — not one
-/// per buffer per chunk (~65k for granite-2b's TurboQuant stores on a 32 GB M5).
+/// startup). Each step maps the next run of blocks of every buffer from ONE heap — exactly the
+/// run a step names, rounded to the granule, never past it — so a pool reached through `n`
+/// blocks holds one heap per granule of reach, not one per buffer per chunk (~65k for
+/// granite-2b's TurboQuant stores on a 32 GB M5).
 pub struct SparseStores {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     residency: MetalResidencySet,
@@ -366,10 +368,12 @@ impl SparseStores {
         }
     }
 
-    /// Map every store through `blocks` blocks, if it is not yet: one heap for the step, which at
-    /// least doubles what is mapped (up to the capacity), mapped on `mapper`, wired, and zeroed
-    /// where a store's blocks must read zero — in place when this returns. No forward in flight
-    /// names a block past what was mapped before, so this races none. Whether it mapped a step.
+    /// Map every store through `blocks` blocks, if it is not yet: one heap for the step, covering
+    /// exactly the run asked rounded to the store's granule (`unit`) and never past it — the
+    /// blocks a step names are the whole coloring of that step, known before it runs, so nothing
+    /// past them is mapped — mapped on `mapper`, wired, and zeroed where a store's blocks must
+    /// read zero: in place when this returns. No forward in flight names a block past what was
+    /// mapped before, so this races none. Whether it mapped a step.
     pub fn grow_to(&mut self, blocks: usize, mapper: &KvMapper) -> Result<bool, String> {
         if self.mapping == Mapping::Apart {
             return Err("these stores map their blocks in runs apart".into());
@@ -381,7 +385,7 @@ impl SparseStores {
         if blocks <= from {
             return Ok(false);
         }
-        let to = blocks.next_multiple_of(self.unit).max(2 * from);
+        let to = blocks.next_multiple_of(self.unit);
         let to = to.min(self.capacity);
         self.map(from, to, mapper)?;
         self.mapped.store(to, Ordering::Relaxed);
@@ -553,9 +557,9 @@ mod tests {
 
     /// Stores grown together share each step's heap without aliasing (`heapOffset` counts
     /// tiles), a zeroed store's new blocks read zero, mapped blocks keep their writes, and each
-    /// step at least doubles what is mapped.
+    /// step maps exactly the blocks asked, rounded to the granule — never past them.
     #[test]
-    fn stores_grow_in_doubling_steps_without_aliasing() {
+    fn stores_grow_exactly_to_the_named_reach_without_aliasing() {
         let Some(device) = crate::detect_device().map(|d| d.device) else {
             eprintln!("skipping: no Metal 4 GPU");
             return;
@@ -605,10 +609,14 @@ mod tests {
         );
         assert!(stores.grow_to(257, &mapper).expect("step 3"));
         assert!(stores.grow_to(600, &mapper).expect("step 4"));
+        // Exactly the granule that covers block 599: no doubling past the reach a step named.
         assert_eq!(
             (stores.mapped().load(Ordering::Relaxed), stores.heaps.len()),
-            (1024, 4)
+            (640, 4)
         );
+        assert!(!stores.grow_to(640, &mapper).expect("mapped"));
+        assert!(stores.grow_to(641, &mapper).expect("step 5"));
+        assert_eq!(stores.mapped().load(Ordering::Relaxed), 768);
         assert!(stores.grow_to(1025, &mapper).is_err(), "past the capacity");
     }
 

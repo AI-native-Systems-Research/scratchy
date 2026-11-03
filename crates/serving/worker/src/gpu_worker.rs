@@ -2857,10 +2857,13 @@ impl MetalWorker {
         // `grow_to_cover` allocates chunk by chunk, every PHYSICAL TENSOR's K then V
         // in slot order (group-shared: gemma4 has `num_tensors` < `num_layers`), from
         // the chunk after the last one the pool holds whole: views of the stores,
-        // mapped first through the chunk it grows to.
+        // mapped first through the chunk it grows to. The grow covers exactly the
+        // chunks the step's own block tables reach — their max is the whole coloring
+        // this pool can be asked for before the forward runs — and none past them,
+        // so the pool's memory follows the blocks in use and commits nothing the
+        // budget did not fund.
         let bpc = scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize;
-        let target = kv.growth_target(max_block);
-        let through = ((target.min(kv.num_blocks - 1) / bpc + 1) * bpc).min(kv.num_blocks);
+        let through = ((max_block.min(kv.num_blocks - 1) / bpc + 1) * bpc).min(kv.num_blocks);
         if !shared {
             stores
                 .grow_to(through, mapper)
@@ -2872,7 +2875,7 @@ impl MetalWorker {
         // already covered it); Err if a chunk's allocation failed, with the pool
         // holding exactly the chunks it held whole before it.
         let grew_result = kv.grow_to_cover(
-            target,
+            max_block,
             |bytes| {
                 let c = alloc_chunk_counter.get();
                 alloc_chunk_counter.set(c + 1);
