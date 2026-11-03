@@ -40,16 +40,17 @@ const LAYERS: u32 = 24;
 const KV_LAYERS: &[u32] = &[3, 7, 11, 15, 19, 23];
 
 /// Steps per tape, every bucket.
-const STEPS: usize = 369;
-const DECODE_STEPS: [(&str, usize); 12] = [
+const STEPS: usize = 321;
+const DECODE_STEPS: [(&str, usize); 13] = [
     ("Add", 48),
     ("AttnDecode", 6),
     ("Embed", 1),
     ("GateApply", 6),
     ("GateSplit", 6),
     ("GatedDeltaNet", 18),
-    ("GemmNarrow", 36),
-    ("Gemv", 151),
+    ("GemmNarrowGroup", 18),
+    ("Gemv", 97),
+    ("GemvGroup", 24),
     ("RmsNorm", 61),
     ("Rope", 6),
     ("RopeAppend", 6),
@@ -69,15 +70,16 @@ const DECODE_KV: [ArenaSpan; 3] = [span(598_784, 512), span(599_296, 4), span(59
 /// The GDN sequence, the GDN scratch.
 const DECODE_GDN: [ArenaSpan; 2] = [span(599_808, 16), span(600_064, 33_280)];
 
-const PREFILL_STEPS: [(&str, usize); 12] = [
+const PREFILL_STEPS: [(&str, usize); 13] = [
     ("Add", 48),
     ("Embed", 1),
     ("AttnPrefill", 6),
     ("GateApply", 6),
     ("GateSplit", 6),
     ("GatedDeltaNet", 18),
-    ("Gemm", 151),
-    ("GemmNarrow", 36),
+    ("Gemm", 97),
+    ("GemmGroup", 24),
+    ("GemmNarrowGroup", 18),
     ("RmsNorm", 61),
     ("Rope", 6),
     ("RopeAppend", 6),

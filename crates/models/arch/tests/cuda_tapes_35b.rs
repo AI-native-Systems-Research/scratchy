@@ -57,7 +57,7 @@ const TOP_K: u32 = 8;
 const INTER: u32 = 512;
 
 /// The steps every bucket shares, whatever its kernels.
-const COMMON_STEPS: [(&str, usize); 14] = [
+const COMMON_STEPS: [(&str, usize); 15] = [
     ("Add", 80),
     ("Embed", 1),
     ("ExpertCombine", 40),
@@ -65,7 +65,8 @@ const COMMON_STEPS: [(&str, usize); 14] = [
     ("GateScale", 40),
     ("GateSplit", 10),
     ("GatedDeltaNet", 30),
-    ("GemmNarrow", 100),
+    ("GemmNarrow", 40),
+    ("GemmNarrowGroup", 30),
     ("MoeRoute", 40),
     ("RmsNorm", 101),
     ("Rope", 10),
@@ -74,16 +75,22 @@ const COMMON_STEPS: [(&str, usize); 14] = [
     ("SiluMul", 80),
 ];
 /// The decode tape's own steps: its GEMMs are GEMVs, its experts gathered.
-const DECODE_STEPS: [(&str, usize); 3] = [("AttnDecode", 10), ("ExpertGemv", 120), ("Gemv", 251)];
+const DECODE_STEPS: [(&str, usize); 4] = [
+    ("AttnDecode", 10),
+    ("ExpertGemv", 120),
+    ("Gemv", 161),
+    ("GemvGroup", 40),
+];
 /// Every prefill tape's own steps: its experts sorted, then the grouped GEMM.
-const PREFILL_STEPS: [(&str, usize); 4] = [
+const PREFILL_STEPS: [(&str, usize); 5] = [
     ("AttnPrefill", 10),
     ("ExpertGemm", 120),
     ("ExpertSort", 40),
-    ("Gemm", 251),
+    ("Gemm", 161),
+    ("GemmGroup", 40),
 ];
-const DECODE_STEP_COUNT: usize = 973;
-const PREFILL_STEP_COUNT: usize = 1013;
+const DECODE_STEP_COUNT: usize = 893;
+const PREFILL_STEP_COUNT: usize = 933;
 const COLOURS: usize = 29;
 
 /// Per bucket: the arena's `total_bytes` (with the token ids), the MoE scratch's offset and bytes
@@ -269,8 +276,12 @@ fn every_tape_has_the_moe_blocks_steps() {
         assert_eq!(tape.steps.len(), count, "m={m}: steps");
         assert_eq!(tape.arena.colour_bytes.len(), COLOURS, "m={m}: colours");
         let mut narrow: BTreeMap<u32, usize> = BTreeMap::new();
-        for step in tape.steps {
-            if let CudaStep::GemmNarrow(GemmBf16 { n, .. }) = *step {
+        for step in tape
+            .steps
+            .iter()
+            .flat_map(|s| s.parts().into_iter().flatten())
+        {
+            if let CudaStep::GemmNarrow(GemmBf16 { n, .. }) = step {
                 *narrow.entry(n).or_default() += 1;
             }
         }

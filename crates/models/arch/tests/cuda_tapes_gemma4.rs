@@ -96,25 +96,31 @@ const COMMON_STEPS: [(&str, usize); 16] = [
     ("ExpertSteps", 90),
 ];
 /// The decode tape's own steps: its GEMMs are GEMVs, its experts gathered.
-const DECODE_STEPS: [(&str, usize); 3] = [("AttnDecode", 30), ("ExpertGemv", 90), ("Gemv", 206)];
+const DECODE_STEPS: [(&str, usize); 4] = [
+    ("AttnDecode", 30),
+    ("ExpertGemv", 90),
+    ("Gemv", 121),
+    ("GemvGroup", 30),
+];
 /// Every prefill tape's own steps: its experts sorted, then the grouped GEMM; the dense gate and
 /// up on the 64-column GEMM.
-const PREFILL_STEPS: [(&str, usize); 5] = [
+const PREFILL_STEPS: [(&str, usize); 6] = [
     ("AttnPrefill", 30),
     ("ExpertGemm", 90),
     ("ExpertSort", 30),
-    ("Gemm", 146),
+    ("Gemm", 61),
     ("GemmCol64", 60),
+    ("GemmGroup", 30),
 ];
-const DECODE_STEP_COUNT: usize = 990;
-const PREFILL_STEP_COUNT: usize = 1020;
+const DECODE_STEP_COUNT: usize = 935;
+const PREFILL_STEP_COUNT: usize = 965;
 const COLOURS: usize = 23;
 
 /// Per bucket: the arena's `total_bytes` (with the token ids), the MoE scratch's offset and bytes
 /// (from `logits` to the end of the router-norm rows), and its max tiles.
 const ARENAS: [(u32, u64, u64, u64, u32); 5] = [
-    // 753,408 bytes before #1031, plus its 32,768-byte GEMV scratch at the end.
-    (1, 786_176, 667_904, 85_248, 0),
+    // 753,408 bytes before #1031, plus its 65,536-byte GEMV scratch at the end.
+    (1, 818_944, 667_904, 85_248, 0),
     (512, 659_471_104, 341_183_232, 318_285_824, 159),
     (1024, 1_067_166_464, 682_365_696, 384_796_672, 191),
     (2048, 1_882_557_440, 1_364_730_624, 517_818_624, 255),

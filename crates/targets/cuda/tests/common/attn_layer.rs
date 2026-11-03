@@ -26,9 +26,11 @@
 //! 7, 8 `cos_q`, `sin_q` and 9, 10 `cos_k`, `sin_k` (the global rotary table), 11 `pk` and 12 `pv`
 //! (`PrefixK { 3 }` and `PrefixV { 3 }`, `[8192, 512]`, codegen's prefix capacity) and 13 `Wo`.
 //!
-//! Colours: 0 `x`; 1 `n`, then `o`; 2 `qg`; 3 `q` (and `qh`); 4 `qn` (and `qf`); 5 `k` (and `kh`),
-//! then `v`; 6 `kn` (and `kf`); 7 `qr`, then `ga`; 8 `kr`; 9 `attn`; 10 `y`; 11 the gate. After
-//! the colours: the rotary table, the block table, the slot mapping and the sequence.
+//! Colours: 0 `x`; 1 `n`, then `o`; 2 `qg`; 3 `k` (and `kh`), then `kr`; 4 `v`; 5 `q` (and `qh`);
+//! 6 `qn` (and `qf`); 7 `kn` (and `kf`); 8 `qr`, then `ga`; 9 `attn`; 10 `y`; 11 the gate. q, k and
+//! v are one grouped GEMM (#1049's `SiblingMatmuls` fold), which writes all three at once, so `v`
+//! has a colour of its own. After the colours: the rotary table, the block table, the slot mapping
+//! and the sequence.
 
 use std::num::NonZeroU32;
 
@@ -40,7 +42,8 @@ use scratchy_subtile::subtile_ir::{
 };
 use scratchy_target_cuda::step::{
     AddBf16, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GateApplyBf16,
-    GateSplitBf16, GemmBf16, RmsNormBf16, RopeAppendBf16, RopeBf16, RopePairing,
+    GateSplitBf16, GemmBf16, GemmGroupBf16, GroupMember, RmsNormBf16, RopeAppendBf16, RopeBf16,
+    RopePairing,
 };
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, KvClass, KvTape, RotaryTable, TapeInput,
@@ -209,6 +212,28 @@ const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
     })
 }
 
+/// A grouped GEMM's member: weight `b`, output `c`, `n` columns.
+const fn member((b, c, n): (u32, u64, u32)) -> GroupMember {
+    GroupMember {
+        b: WeightIx(b),
+        c: ArenaOffset(c),
+        n,
+    }
+}
+
+/// The q, k and v projections of `n` (#1049's grouped GEMM): `Wq` into `qg`, `Wk` into `k`, `Wv`
+/// into `v`.
+const fn qkv(n: u64, (qg, k, v): (u64, u64, u64), m: u32) -> CudaStep {
+    CudaStep::GemmGroup(GemmGroupBf16 {
+        a: ArenaOffset(n),
+        m,
+        k: H,
+        first: member((2, qg, 2 * Q)),
+        second: member((4, k, KV)),
+        third: Some(member((6, v, KV))),
+    })
+}
+
 const fn norm(x: u64, gain: u32, y: u64, rows: u32, cols: u32) -> CudaStep {
     CudaStep::RmsNorm(RmsNormBf16 {
         x: ArenaOffset(x),
@@ -346,11 +371,11 @@ pub static ATTN_LAYER_M128: CudaTape = CudaTape {
     bucket_m: 128,
     arena: ArenaLayout {
         colour_bytes: &[
-            262144, 262144, 1048576, 524288, 524288, 131072, 131072, 524288, 131072, 524288,
+            262144, 262144, 1048576, 131072, 131072, 524288, 524288, 131072, 524288, 524288,
             262144, 524288,
         ],
         colour_offsets: &[
-            0, 262144, 524288, 1572864, 2097152, 2621440, 2752512, 2883584, 3407872, 3538944,
+            0, 262144, 524288, 1572864, 1703936, 1835008, 2359296, 2883584, 3014656, 3538944,
             4063232, 4325376,
         ],
         total_bytes: 4867328,
@@ -360,17 +385,15 @@ pub static ATTN_LAYER_M128: CudaTape = CudaTape {
     weight_bytes: ATTN_LAYER_WEIGHT_BYTES,
     steps: &[
         norm(0, 1, 262144, 128, H),
-        gemm(262144, 2, 524288, 128, 2 * Q, H),
-        gate_split(524288, 1572864, 4325376, 128),
-        norm(1572864, 3, 2097152, 1024, HD),
-        gemm(262144, 4, 2621440, 128, KV, H),
-        norm(2621440, 5, 2752512, 256, HD),
-        gemm(262144, 6, 2621440, 128, KV, H),
-        rope(2097152, 4849664, 2883584, 128),
-        rope_append((2752512, 2621440), 4849664, 4866560, 3407872, 128),
-        attn(2883584, 4866048, 4867072, 3538944, 128),
-        gate_apply(3538944, 4325376, 2883584, 128),
-        gemm(2883584, 13, 262144, 128, H, Q),
+        qkv(262144, (524288, 1572864, 1703936), 128),
+        gate_split(524288, 1835008, 4325376, 128),
+        norm(1835008, 3, 2359296, 1024, HD),
+        norm(1572864, 5, 2883584, 256, HD),
+        rope(2359296, 4849664, 3014656, 128),
+        rope_append((2883584, 1703936), 4849664, 4866560, 1572864, 128),
+        attn(3014656, 4866048, 4867072, 3538944, 128),
+        gate_apply(3538944, 4325376, 3014656, 128),
+        gemm(3014656, 13, 262144, 128, H, Q),
         add(262144, 0, 4063232, 128),
     ],
     rotary: rotary(4849664, 16384),
@@ -381,20 +404,20 @@ pub static ATTN_LAYER_M128: CudaTape = CudaTape {
     gemv_scratch: None,
 };
 
-/// [`attn_layer`]`(256)`: `x` 0, `n` (then `o`) 524288, `qg` 1048576, `q` 3145728, `qn` 4194304,
-/// `k` (then `v`) 5242880, `kn` 5505024, `qr` (then `ga`) 5767168, `kr` 6815744, `attn` 7077888,
-/// `y` 8126464, the gate 8650752; colours end at 9699328. The rotary table (32768 bytes) at
+/// [`attn_layer`]`(256)`: `x` 0, `n` (then `o`) 524288, `qg` 1048576, `k` (then `kr`) 3145728, `v`
+/// 3407872, `q` 3670016, `qn` 4718592, `kn` 5767168, `qr` (then `ga`) 6029312, `attn` 7077888, `y`
+/// 8126464, the gate 8650752; colours end at 9699328. The rotary table (32768 bytes) at
 /// 9699328, the block table (512) at 9732096, the slot mapping (1024) at 9732608, the sequence (8,
 /// in a 256-byte slot) at 9733632.
 pub static ATTN_LAYER_M256: CudaTape = CudaTape {
     bucket_m: 256,
     arena: ArenaLayout {
         colour_bytes: &[
-            524288, 524288, 2097152, 1048576, 1048576, 262144, 262144, 1048576, 262144, 1048576,
+            524288, 524288, 2097152, 262144, 262144, 1048576, 1048576, 262144, 1048576, 1048576,
             524288, 1048576,
         ],
         colour_offsets: &[
-            0, 524288, 1048576, 3145728, 4194304, 5242880, 5505024, 5767168, 6815744, 7077888,
+            0, 524288, 1048576, 3145728, 3407872, 3670016, 4718592, 5767168, 6029312, 7077888,
             8126464, 8650752,
         ],
         total_bytes: 9733888,
@@ -404,17 +427,15 @@ pub static ATTN_LAYER_M256: CudaTape = CudaTape {
     weight_bytes: ATTN_LAYER_WEIGHT_BYTES,
     steps: &[
         norm(0, 1, 524288, 256, H),
-        gemm(524288, 2, 1048576, 256, 2 * Q, H),
-        gate_split(1048576, 3145728, 8650752, 256),
-        norm(3145728, 3, 4194304, 2048, HD),
-        gemm(524288, 4, 5242880, 256, KV, H),
-        norm(5242880, 5, 5505024, 512, HD),
-        gemm(524288, 6, 5242880, 256, KV, H),
-        rope(4194304, 9699328, 5767168, 256),
-        rope_append((5505024, 5242880), 9699328, 9732608, 6815744, 256),
-        attn(5767168, 9732096, 9733632, 7077888, 256),
-        gate_apply(7077888, 8650752, 5767168, 256),
-        gemm(5767168, 13, 524288, 256, H, Q),
+        qkv(524288, (1048576, 3145728, 3407872), 256),
+        gate_split(1048576, 3670016, 8650752, 256),
+        norm(3670016, 3, 4718592, 2048, HD),
+        norm(3145728, 5, 5767168, 512, HD),
+        rope(4718592, 9699328, 6029312, 256),
+        rope_append((5767168, 3407872), 9699328, 9732608, 3145728, 256),
+        attn(6029312, 9732096, 9733632, 7077888, 256),
+        gate_apply(7077888, 8650752, 6029312, 256),
+        gemm(6029312, 13, 524288, 256, H, Q),
         add(524288, 0, 8126464, 256),
     ],
     rotary: rotary(9699328, 32768),

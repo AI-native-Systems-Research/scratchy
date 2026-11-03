@@ -35,7 +35,8 @@ use scratchy_subtile::handoff::{LoweredDecode, SourceBinding, UnrollIndex};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
 use scratchy_target_cuda::step::{
-    AddBf16, CudaStep, GatedDeltaNetBf16, GemmBf16, RmsNormBf16, gdn_bundle,
+    AddBf16, CudaStep, GatedDeltaNetBf16, GemmBf16, GemmGroupBf16, GroupMember, RmsNormBf16,
+    gdn_bundle,
 };
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, TapeInput, WeightIx,
@@ -145,6 +146,27 @@ const fn gemm(a: u64, b: u32, c: u64, (m, n, k): (u32, u32, u32)) -> GemmBf16 {
     }
 }
 
+/// A grouped GEMM's member: weight `b`, output `c`, `n` columns.
+const fn member((b, c, n): (u32, u64, u32)) -> GroupMember {
+    GroupMember {
+        b: WeightIx(b),
+        c: ArenaOffset(c),
+        n,
+    }
+}
+
+/// The sibling projections of `a` (#1049's grouped GEMM): two members, `(b, c, n)` each.
+const fn group(a: u64, m: u32, members: [(u32, u64, u32); 2]) -> GemmGroupBf16 {
+    GemmGroupBf16 {
+        a: ArenaOffset(a),
+        m,
+        k: H,
+        first: member(members[0]),
+        second: member(members[1]),
+        third: None,
+    }
+}
+
 const fn norm(x: u64, y: u64, rows: u32) -> CudaStep {
     CudaStep::RmsNorm(RmsNormBf16 {
         x: ArenaOffset(x),
@@ -251,10 +273,12 @@ pub static GDN_LAYER_M128: CudaTape = CudaTape {
     weight_bytes: GDN_LAYER_WEIGHT_BYTES,
     steps: &[
         norm(0, 262144, 128),
-        CudaStep::Gemm(gemm(262144, 2, 524288, (128, CONV_DIM, H))),
-        CudaStep::Gemm(gemm(262144, 3, 2097152, (128, VALUE_DIM, H))),
-        CudaStep::GemmNarrow(gemm(262144, 4, 2621440, (128, NV, H))),
-        CudaStep::GemmNarrow(gemm(262144, 5, 2625536, (128, NV, H))),
+        CudaStep::GemmGroup(group(
+            262144,
+            128,
+            [(2, 524288, CONV_DIM), (3, 2097152, VALUE_DIM)],
+        )),
+        CudaStep::GemmNarrowGroup(group(262144, 128, [(4, 2621440, NV), (5, 2625536, NV)])),
         CudaStep::GatedDeltaNet(gdn_step(
             (524288, 2097152, 2621440, 2625536),
             2629632,
@@ -292,10 +316,12 @@ pub static GDN_LAYER_M256: CudaTape = CudaTape {
     weight_bytes: GDN_LAYER_WEIGHT_BYTES,
     steps: &[
         norm(0, 524288, 256),
-        CudaStep::Gemm(gemm(524288, 2, 1048576, (256, CONV_DIM, H))),
-        CudaStep::Gemm(gemm(524288, 3, 4194304, (256, VALUE_DIM, H))),
-        CudaStep::GemmNarrow(gemm(524288, 4, 5242880, (256, NV, H))),
-        CudaStep::GemmNarrow(gemm(524288, 5, 5251072, (256, NV, H))),
+        CudaStep::GemmGroup(group(
+            524288,
+            256,
+            [(2, 1048576, CONV_DIM), (3, 4194304, VALUE_DIM)],
+        )),
+        CudaStep::GemmNarrowGroup(group(524288, 256, [(4, 5242880, NV), (5, 5251072, NV)])),
         CudaStep::GatedDeltaNet(gdn_step(
             (1048576, 4194304, 5242880, 5251072),
             5259264,

@@ -351,13 +351,15 @@ mod tests {
     use scratchy_subtile::subtile_ir::{GainConvention, RowScale};
     use scratchy_subtile::tape_colouring::{Outputs, Reads, Residency};
 
-    /// The tables declare exactly CUDA's fused kernels, `SiluMul`, `GeluMul` and `MoeRoute`, and no
-    /// sliced `lm_head`: any other pattern, or a sampled weight, would ask the shared passes for a
-    /// kernel CUDA does not have. The routing fold takes the softmax as its one pre (Qwen), and as
-    /// its tail Gemma's scale (stage 0), a softmax or a renorm (stage 1) and Gemma's per-expert
-    /// scale (stage 2), nothing at stage 3.
+    /// The tables declare exactly CUDA's fused kernels, the grouped GEMMs (`SiblingMatmuls`, #1049),
+    /// `SiluMul`, `GeluMul` and `MoeRoute`, and no sliced `lm_head`: any other pattern, or a sampled
+    /// weight, would ask the shared passes for a kernel CUDA does not have. The sibling fold groups
+    /// up to three dense matmuls in `CUDA_SIBLING_BANDS`, leaving a gate or up projection (a matmul
+    /// a `Silu`, `Gelu` or `Mul` reads) to the gated fold. The routing fold takes the softmax as its
+    /// one pre (Qwen), and as its tail Gemma's scale (stage 0), a softmax or a renorm (stage 1) and
+    /// Gemma's per-expert scale (stage 2), nothing at stage 3.
     #[test]
-    fn cuda_declares_only_the_silu_mul_and_moe_route_folds_and_no_sampled_rows() {
+    fn cuda_declares_the_sibling_matmuls_silu_mul_and_moe_route_folds_and_no_sampled_rows() {
         assert!(CUDA_FUSIONS.counted.is_empty());
         assert!(CUDA_FUSIONS.rows.is_none());
         assert!(CUDA_SAMPLE_ROWS.weights.is_empty());
@@ -365,6 +367,13 @@ mod tests {
             panic!("expected one sweep, got {}", CUDA_FUSIONS.sweeps.len());
         };
         let [
+            FoldPattern::SiblingMatmuls {
+                matmul,
+                max,
+                bands,
+                gated,
+                kernel: siblings,
+            },
             FoldPattern::Gated { mul, activations },
             FoldPattern::Route {
                 top_k,
@@ -376,8 +385,24 @@ mod tests {
             },
         ] = sweep
         else {
-            panic!("expected one Gated and one Route pattern, got {sweep:?}");
+            panic!("expected one SiblingMatmuls, one Gated and one Route pattern, got {sweep:?}");
         };
+        assert_eq!((*matmul, *max), (SubOpKind::MatmulTile, 3));
+        assert_eq!(
+            *bands,
+            [
+                ColsBand {
+                    multiple: 256,
+                    max: u32::MAX
+                },
+                ColsBand {
+                    multiple: 8,
+                    max: 64
+                },
+            ]
+        );
+        assert_eq!(*gated, [SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul]);
+        assert_eq!(*siblings, CudaFusion::SiblingMatmuls);
         assert_eq!(*mul, SubOpKind::Mul);
         let [silu, gelu] = activations else {
             panic!("expected two gated activations, got {activations:?}");

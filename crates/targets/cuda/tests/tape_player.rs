@@ -1048,7 +1048,7 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
         pass &= check_rows("n_direct = RmsNorm(x, g_in)", &n, &n_ref, (m, AL_H));
         let qg = read(&mut worker, colour(tape, 2));
         pass &= check_stage("qg = n·Wqᵀ", &qg, &n, &w.wq, (m, 2 * AL_Q, AL_H));
-        let q = read(&mut worker, colour(tape, 3));
+        let q = read(&mut worker, colour(tape, 5));
         let gate = read(&mut worker, colour(tape, 11));
         let (want_q, want_gate) = gate_split_reference(&qg, (m, AL_Q), AL_HD);
         let split_bits = mismatched_bits(&q, &want_q) + mismatched_bits(&gate, &want_gate);
@@ -1057,21 +1057,21 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
             verdict(split_bits == 0)
         );
         pass &= split_bits == 0;
-        let qn = read(&mut worker, colour(tape, 4));
+        let qn = read(&mut worker, colour(tape, 6));
         let qn_ref = rms_norm_reference(&q, &w.q_norm, (m * 8, AL_HD), f64::from(EPS), 1.0);
         pass &= check_rows("qn = RmsNorm(q, q_norm)", &qn, &qn_ref, (m * 8, AL_HD));
-        // `k` (colour 5) holds `v` by the forward's end: the GEMM kernel is run alone on `n`.
+        // `k` (colour 3) holds `kr` by the forward's end: the GEMM kernel is run alone on `n`.
         let k = k_direct(&device, tape, &n, &w.wk);
         pass &= check_stage("k = n·Wkᵀ", &k, &n, &w.wk, (m, AL_KV, AL_H));
-        let kn = read(&mut worker, colour(tape, 6));
+        let kn = read(&mut worker, colour(tape, 7));
         let kn_ref = rms_norm_reference(&k, &w.k_norm, (m * 2, AL_HD), f64::from(EPS), 1.0);
         pass &= check_rows("kn = RmsNorm(k, k_norm)", &kn, &kn_ref, (m * 2, AL_HD));
-        let v = read(&mut worker, colour(tape, 5));
+        let v = read(&mut worker, colour(tape, 4));
         pass &= check_stage("v = n·Wvᵀ", &v, &n, &w.wv, (m, AL_KV, AL_H));
         let rotary = tape.rotary.expect("the tape has a rotary table");
         let uploaded = read(&mut worker, rotary.span);
         let table_ok = uploaded == rotary_rows(&positions, rotary.rot_dim, rotary.theta());
-        let kr = read(&mut worker, colour(tape, 8));
+        let kr = read(&mut worker, colour(tape, 3));
         let refs = rope_reference(&kn, &uploaded, (m, AL_KV), (AL_HD, AL_R), AL_R / 2);
         let cmp = compare_rope(&kr, &kn, &refs, AL_KV);
         let ok = cmp.rotated.pass() && cmp.pass_through_mismatched == 0 && table_ok;
@@ -1092,7 +1092,7 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
         );
         pass &= cache_bits == 0;
         let attn = read(&mut worker, colour(tape, 9));
-        let ga = read(&mut worker, colour(tape, 7));
+        let ga = read(&mut worker, colour(tape, 8));
         let ga_ref = gate_apply_reference(&attn, &gate);
         pass &= check_rows("ga = attn·sigmoid(gate)", &ga, &ga_ref, (m, AL_Q));
         let o = read(&mut worker, colour(tape, 1));
@@ -1124,8 +1124,8 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
             (&k_rows, &v_rows),
             (0, m),
         );
-        let CudaStep::AttnPrefill(step) = tape.steps[9] else {
-            panic!("step 9 is the attention");
+        let CudaStep::AttnPrefill(step) = tape.steps[7] else {
+            panic!("step 7 is the attention");
         };
         pass &= step.scale_bits == 0.0625f32.to_bits();
     }
@@ -1133,11 +1133,13 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
 }
 
 /// The tape's `k = n · Wkᵀ`, run by the GEMM kernel alone on device copies: the forward's `k` bit
-/// for bit (the kernel is deterministic), which `v` overwrites in the arena.
+/// for bit (the kernel is deterministic, and a grouped GEMM's member is its own GEMM's bits),
+/// which the rotated K overwrites in the arena.
 fn k_direct(device: &CudaDevice, tape: &CudaTape, n: &[u16], wk: &[u16]) -> Vec<u16> {
-    let CudaStep::Gemm(g) = tape.steps[4] else {
-        panic!("step 4 is the K projection");
+    let CudaStep::GemmGroup(group) = tape.steps[1] else {
+        panic!("step 1 is the q, k and v projections");
     };
+    let g = group.member(group.second);
     let (nb, wb) = (
         DeviceBuffer::upload(device, n).expect("upload n"),
         DeviceBuffer::upload(device, wk).expect("upload Wk"),
@@ -1164,8 +1166,8 @@ fn k_direct(device: &CudaDevice, tape: &CudaTape, n: &[u16], wk: &[u16]) -> Vec<
 /// `qr`, which the gate apply overwrites in the arena before the forward ends. The kernel is
 /// deterministic, so this is the forward's `qr` bit for bit.
 fn qr_direct(device: &CudaDevice, tape: &CudaTape, qn: &[u16], table: &[u16]) -> Vec<u16> {
-    let CudaStep::Rope(rope) = tape.steps[7] else {
-        panic!("step 7 is the query's rope");
+    let CudaStep::Rope(rope) = tape.steps[5] else {
+        panic!("step 5 is the query's rope");
     };
     let (xb, tb) = (
         DeviceBuffer::upload(device, qn).expect("upload qn"),
@@ -1249,7 +1251,7 @@ fn a_second_chunk_reads_the_first_from_the_cache() {
         "forward A's blocks after forward B: mismatched_bits={a_blocks_changed} {}",
         verdict(a_blocks_changed == 0)
     );
-    let qn = read(&mut worker, colour(tape, 4));
+    let qn = read(&mut worker, colour(tape, 6));
     let rotary = tape.rotary.expect("the tape has a rotary table");
     let uploaded = read(&mut worker, rotary.span);
     let qr = qr_direct(&device, tape, &qn, &uploaded);
@@ -1360,7 +1362,7 @@ fn a_short_chunk_pads() {
         verdict(rest == 0)
     );
     pass &= rest == 0;
-    let qn = read(&mut worker, colour(tape, 4));
+    let qn = read(&mut worker, colour(tape, 6));
     let rotary = tape.rotary.expect("the tape has a rotary table");
     let uploaded = read(&mut worker, rotary.span);
     let qr = qr_direct(&device, tape, &qn, &uploaded);
@@ -2579,9 +2581,9 @@ fn a_decode_step_attends_over_the_prefilled_cache() {
     let mut worker = CudaWorker::new(&device, buckets, &table, POOL, None).expect("worker");
     let one = &buckets[0];
     let (CudaStep::Rope(rope), CudaStep::RopeAppend(append), CudaStep::AttnDecode(decode)) =
-        (one.steps[7], one.steps[8], one.steps[9])
+        (one.steps[5], one.steps[6], one.steps[7])
     else {
-        panic!("steps 7, 8 and 9 of the one-row tape are the rope, the append and the attention");
+        panic!("steps 5, 6 and 7 of the one-row tape are the rope, the append and the attention");
     };
     // One row of `cols` bf16 at `at`.
     let span_of = |at: ArenaOffset, cols: usize| ArenaSpan {

@@ -42,16 +42,17 @@ const KV_LAYERS: &[u32] = &[3, 7, 11, 15, 19, 23, 27, 31];
 
 /// Steps per tape, every bucket: 1 embed, 24 GDN layers of 14 steps, 8 attention layers of 19,
 /// the final norm and the lm_head.
-const STEPS: usize = 491;
-const DECODE_STEPS: [(&str, usize); 12] = [
+const STEPS: usize = 427;
+const DECODE_STEPS: [(&str, usize); 13] = [
     ("Add", 64),
     ("AttnDecode", 8),
     ("Embed", 1),
     ("GateApply", 8),
     ("GateSplit", 8),
     ("GatedDeltaNet", 24),
-    ("GemmNarrow", 48),
-    ("Gemv", 201),
+    ("GemmNarrowGroup", 24),
+    ("Gemv", 129),
+    ("GemvGroup", 32),
     ("RmsNorm", 81),
     ("Rope", 8),
     ("RopeAppend", 8),
@@ -61,8 +62,8 @@ const DECODE_COLOUR_BYTES: &[u64] = &[
     8192, 8192, 16384, 8192, 64, 64, 24576, 24576, 24576, 24576, 8192, 2048, 2048, 2048, 8192,
     8192, 496640, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
 ];
-/// 784,128 bytes before #1031, plus its 16,384-byte GEMV scratch at the end.
-const DECODE_TOTAL: u64 = 800_512;
+/// 784,128 bytes before #1031, plus its 32,768-byte GEMV scratch at the end.
+const DECODE_TOTAL: u64 = 816_896;
 const DECODE_RESULT: ArenaSpan = span(170_496, 496_640);
 const DECODE_IDS: ArenaSpan = span(783_872, 4);
 const DECODE_ROTARY: ArenaSpan = span(732_672, 128);
@@ -71,15 +72,16 @@ const DECODE_KV: [ArenaSpan; 3] = [span(732_928, 512), span(733_440, 4), span(73
 /// The GDN sequence, the GDN scratch.
 const DECODE_GDN: [ArenaSpan; 2] = [span(733_952, 16), span(734_208, 49_664)];
 
-const PREFILL_STEPS: [(&str, usize); 12] = [
+const PREFILL_STEPS: [(&str, usize); 13] = [
     ("Add", 64),
     ("Embed", 1),
     ("AttnPrefill", 8),
     ("GateApply", 8),
     ("GateSplit", 8),
     ("GatedDeltaNet", 24),
-    ("Gemm", 201),
-    ("GemmNarrow", 48),
+    ("Gemm", 129),
+    ("GemmGroup", 32),
+    ("GemmNarrowGroup", 24),
     ("RmsNorm", 81),
     ("Rope", 8),
     ("RopeAppend", 8),

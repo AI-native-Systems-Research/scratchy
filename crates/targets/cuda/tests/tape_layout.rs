@@ -39,7 +39,7 @@ use scratchy_subtile::subtile_ir::{
     AttnMask, EwKind, GainConvention, RopeFormTag, RowScale, SourceShape, SubOp,
 };
 use scratchy_subtile::subtile_tape::Instr;
-use scratchy_target_cuda::step::{CudaStep, GemmBf16};
+use scratchy_target_cuda::step::{CudaStep, GemmBf16, GemmGroupBf16};
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ARENA_ALIGN, CudaTape, TapeInput, WeightIx,
 };
@@ -989,8 +989,9 @@ fn the_attention_layer_statics_are_what_their_canonicals_lower_to() {
     assert_tape_is_lowered("attn_layer(256)", &ATTN_LAYER_M256, &attn_layer(256));
 }
 
-/// Seventeen ops, thirteen launches: the four views emit none. The rope-append reads the rotated
-/// table and writes the rotated K (colour 8); the attention reads the rotated query, the tape's
+/// Seventeen ops, eleven launches: the four views emit none, and q, k and v are one grouped GEMM
+/// (#1049). The rope-append reads the rotated table and writes the rotated K over k's colour (3);
+/// the attention reads the rotated query, the tape's
 /// block table and sequence, and writes colour 9; the gate keeps `q`'s split live to the gate
 /// apply. After the colours: the rotary table, the block table, the slot mapping and the sequence.
 #[test]
@@ -999,7 +1000,7 @@ fn the_attention_layer_numbers() {
         let (h, q, kv) = (1024 * m * 2, 2048 * m * 2, 512 * m * 2);
         assert_eq!(
             tape.arena.colour_bytes,
-            [h, h, 2 * q, q, q, kv, kv, q, kv, q, h, q]
+            [h, h, 2 * q, kv, kv, q, q, kv, q, q, h, q]
         );
         let colours_end = 3 * h + 7 * q + 3 * kv;
         let rotary = tape.rotary.expect("the tape has a rope");
@@ -1029,19 +1030,17 @@ fn the_attention_layer_numbers() {
             (2, 256, 64)
         );
         assert_eq!(kv_tape.max_blocks_per_seq, 128);
-        assert_eq!(tape.steps.len(), 13);
+        assert_eq!(tape.steps.len(), 11);
     }
     assert_eq!(ATTN_LAYER_M256.arena.total_bytes, 9733888);
     assert_eq!(ATTN_LAYER_M128.arena.total_bytes, 4867328);
     let t = &ATTN_LAYER_M256;
     let [
         CudaStep::RmsNorm(n),
-        CudaStep::Gemm(qg),
+        CudaStep::GemmGroup(group),
         CudaStep::GateSplit(split),
         CudaStep::RmsNorm(qn),
-        CudaStep::Gemm(k),
         CudaStep::RmsNorm(kn),
-        CudaStep::Gemm(v),
         CudaStep::Rope(rope),
         CudaStep::RopeAppend(append),
         CudaStep::AttnPrefill(attn),
@@ -1050,23 +1049,21 @@ fn the_attention_layer_numbers() {
         CudaStep::Add(y),
     ] = *t.steps
     else {
-        panic!("the steps are the layer's thirteen launches, in order");
+        panic!("the steps are the layer's eleven launches, in order");
     };
+    let (qg, k) = (group.first, group.second);
+    let v = group.third.expect("the grouped GEMM is q, k and v");
     let colour = |c: usize| ArenaOffset(t.arena.colour_offsets[c]);
     let kv_tape = t.kv.expect("the tape has a KV cache");
     let table = t.rotary.expect("a rotary table").span.offset;
-    assert_eq!((qg.a, k.a, v.a), (n.y, n.y, n.y), "q, k and v project n");
+    assert_eq!(group.a, n.y, "q, k and v project n");
     assert_eq!(split.qg, qg.c);
     assert_eq!((qn.x, qn.rows), (split.q, 2048), "the per-head view of q");
     assert_eq!((kn.x, kn.rows), (k.c, 512), "the per-head view of k");
-    assert_eq!(
-        v.c, k.c,
-        "v is written over k's colour: k is dead after its norm"
-    );
     assert_eq!((rope.x, rope.table), (qn.y, table));
     assert_eq!(
         (append.k, append.v, append.table, append.k_out),
-        (kn.y, v.c, table, colour(8))
+        (kn.y, v.c, table, colour(3))
     );
     assert_eq!(append.slot_mapping, kv_tape.slot_mapping.offset);
     assert_eq!(
@@ -1458,33 +1455,36 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
     assert_eq!(a.block_table, kv.block_table.offset);
     assert_eq!(a.sequence, kv.sequence.offset);
     // The steps `tape_player`'s decode test reads: the query's rope, the append, the attention;
-    // the projections GEMVs.
+    // the projections GEMVs (q, k and v one grouped GEMV, #1049).
     assert!(matches!(
-        c.steps[7..10],
+        c.steps[5..8],
         [
             CudaStep::Rope(_),
             CudaStep::RopeAppend(_),
             CudaStep::AttnDecode(_)
         ]
     ));
-    for i in [1, 4, 6, 11] {
-        assert!(
-            matches!(c.steps[i], CudaStep::Gemv(GemmBf16 { m: 1, .. })),
-            "step {i}: {:?}",
-            c.steps[i]
-        );
-    }
+    assert!(
+        matches!(c.steps[1], CudaStep::GemvGroup(GemmGroupBf16 { m: 1, .. })),
+        "step 1: {:?}",
+        c.steps[1]
+    );
+    assert!(
+        matches!(c.steps[9], CudaStep::Gemv(GemmBf16 { m: 1, .. })),
+        "step 9: {:?}",
+        c.steps[9]
+    );
     // That test reads `qn` (the rope's input), `kr` and `v` (the append's) and `attn` back from
     // the arena after the forward: no step after the one writing each overwrites it.
-    let (CudaStep::Rope(rope), CudaStep::RopeAppend(append)) = (c.steps[7], c.steps[8]) else {
+    let (CudaStep::Rope(rope), CudaStep::RopeAppend(append)) = (c.steps[5], c.steps[6]) else {
         unreachable!("matched above");
     };
     let row = |at: ArenaOffset, cols: u32| span(at.0, 2 * u64::from(cols));
     for (what, read, from) in [
-        ("qn", row(rope.x, rope.cols), 7),
-        ("kr", row(append.k_out, append.cols), 8),
-        ("v", row(append.v, append.cols), 8),
-        ("attn", row(a.out, a.q_heads * a.head_dim), 9),
+        ("qn", row(rope.x, rope.cols), 5),
+        ("kr", row(append.k_out, append.cols), 6),
+        ("v", row(append.v, append.cols), 6),
+        ("attn", row(a.out, a.q_heads * a.head_dim), 7),
     ] {
         for (i, s) in c.steps.iter().enumerate().skip(from + 1) {
             let e = s.extents().expect("extents fit");
@@ -1691,8 +1691,8 @@ fn the_gdn_layer_statics_are_what_their_canonicals_lower_to() {
     }
 }
 
-/// The issue's predicted layout, read back from the lowering: 8 steps (the `a` and `b`
-/// projections on the narrow GEMM), the arena totals, the bundle's 99,328 bytes, the GDN
+/// The issue's predicted layout, read back from the lowering: 6 steps (the qkv and z projections
+/// one grouped GEMM, the `a` and `b` one grouped narrow GEMM, #1049), the arena totals, the bundle's 99,328 bytes, the GDN
 /// sequence and scratch after the colours, and the scratch's four regions.
 #[test]
 fn the_gdn_layer_numbers() {
@@ -1708,7 +1708,8 @@ fn the_gdn_layer_numbers() {
             .map(|s| match s {
                 CudaStep::RmsNorm(_) => "RmsNorm",
                 CudaStep::Gemm(_) => "Gemm",
-                CudaStep::GemmNarrow(_) => "GemmNarrow",
+                CudaStep::GemmGroup(_) => "GemmGroup",
+                CudaStep::GemmNarrowGroup(_) => "GemmNarrowGroup",
                 CudaStep::GatedDeltaNet(_) => "GatedDeltaNet",
                 CudaStep::Add(_) => "Add",
                 _ => "other",
@@ -1718,10 +1719,8 @@ fn the_gdn_layer_numbers() {
             names,
             [
                 "RmsNorm",
-                "Gemm",
-                "Gemm",
-                "GemmNarrow",
-                "GemmNarrow",
+                "GemmGroup",
+                "GemmNarrowGroup",
                 "GatedDeltaNet",
                 "Gemm",
                 "Add"
