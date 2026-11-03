@@ -1,0 +1,508 @@
+{
+  "schema": 2,
+  "issue": 91,
+  "epic": 3,
+  "generated_utc": "2026-10-25T15:09:28Z",
+  "generator": "scripts/bench_metal_matrix.sh",
+  "measured_by": {
+    "footprint": "this runner (cargo build, stat)",
+    "cache_ladder": "scr bench startup --exec",
+    "warm_serving": "scr bench serve",
+    "scaling": "scr bench serve"
+  },
+  "machine": {
+    "hw_model": "Mac15,7",
+    "chip": "Apple M3 Pro",
+    "cores_total": 12,
+    "cores_performance": 6,
+    "cores_efficiency": 6,
+    "memory_gb": 36,
+    "gpu_wired_limit_mb": 0,
+    "macos": "26.6.2 (25G83)",
+    "thermal_at_start": "Note: No thermal warning level has been recorded Note: No performance warning level has been recorded Note: No CPU power status has been recorded",
+    "power": "Now drawing from 'AC Power'"
+  },
+  "repo": {
+    "sha": "1bf86114b36dac533ad1e15189ae3f022f38dbdc",
+    "branch": "metal-datasets-matrix",
+    "dirty": true
+  },
+  "config": {
+    "scenarios": [
+      "cold",
+      "warm"
+    ],
+    "current_models": [
+      "gpt-oss-20b",
+      "nemotron-3-nano-30b-a3b",
+      "qwen3.6-35b-a3b",
+      "granite-4.2-8b",
+      "gpt-oss-120b-3bit",
+      "nemotron-3-super-120b-a12b",
+      "qwen3.5-122b-a10b",
+      "granite-4.2-30b"
+    ],
+    "classes": [
+      {
+        "class": "sliding window",
+        "small": "gpt-oss-20b",
+        "large": "gpt-oss-120b-3bit"
+      },
+      {
+        "class": "Mamba-2",
+        "small": "nemotron-3-nano-30b-a3b",
+        "large": "nemotron-3-super-120b-a12b"
+      },
+      {
+        "class": "Gated DeltaNet",
+        "small": "qwen3.6-35b-a3b",
+        "large": "qwen3.5-122b-a10b"
+      },
+      {
+        "class": "dense",
+        "small": "granite-4.2-8b",
+        "large": "granite-4.2-30b"
+      }
+    ],
+    "large_from_gb": 64,
+    "cold_priming_launches": 1,
+    "startup_request": {
+      "input_len": 64,
+      "output_len": 32,
+      "warm_requests": 20
+    },
+    "kv_cache_dtype": "default (TurboQuant)",
+    "scratchy_serve_args": null,
+    "cell_timeout_s": 1200,
+    "failures_counted": true,
+    "scaling": {
+      "axes": [
+        "tasks"
+      ],
+      "conc": [
+        1,
+        4,
+        16
+      ],
+      "input": [
+        128,
+        512,
+        2048,
+        8192
+      ],
+      "output": [
+        16,
+        64,
+        256,
+        1024
+      ],
+      "grid_input": [
+        128,
+        1024,
+        4096,
+        32768
+      ],
+      "grid_output": [
+        64
+      ],
+      "grid_conc": [
+        1,
+        2
+      ],
+      "grid_users_output": [
+        64
+      ],
+      "base": {
+        "input": 1024,
+        "output": 64,
+        "conc": 8
+      },
+      "min_prompts_per_cell": 12,
+      "min_rounds_per_cell": 2,
+      "workloads": [
+        "sharegpt",
+        "rag",
+        "sharegpt-multi-turn"
+      ],
+      "workloads_scratchy": [
+        "rag-spans"
+      ],
+      "task_max_prompt": 32768,
+      "task_min_prompts": 8,
+      "sharegpt": "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/192ab2185289094fc556ec8ce5ce1e8e587154ca/ShareGPT_V3_unfiltered_cleaned_split.json",
+      "concurrency_is": "offered (--max-concurrency), not the effective decode batch"
+    },
+    "comparison": {
+      "mlx_lm": false,
+      "ollama": false,
+      "llama_cpp": false,
+      "vllm_metal": false,
+      "omlx": false,
+      "omlx_tq": false,
+      "mistralrs": false
+    },
+    "engines": [
+      {
+        "key": "scratchy",
+        "label": "scratchy",
+        "installed": true,
+        "version": "1bf86114b36dac533ad1e15189ae3f022f38dbdc",
+        "pin": ""
+      },
+      {
+        "key": "mlx_lm",
+        "label": "mlx-lm",
+        "installed": false,
+        "version": "",
+        "pin": ""
+      },
+      {
+        "key": "ollama",
+        "label": "ollama",
+        "installed": false,
+        "version": "",
+        "pin": ""
+      },
+      {
+        "key": "llama_cpp",
+        "label": "llama.cpp",
+        "installed": false,
+        "version": "",
+        "pin": ""
+      },
+      {
+        "key": "vllm_metal",
+        "label": "vllm-metal",
+        "installed": false,
+        "version": "",
+        "pin": ""
+      },
+      {
+        "key": "omlx",
+        "label": "oMLX",
+        "installed": false,
+        "version": "",
+        "pin": ""
+      },
+      {
+        "key": "omlx_tq",
+        "label": "oMLX TurboQuant",
+        "installed": false,
+        "version": "",
+        "pin": ""
+      },
+      {
+        "key": "mistralrs",
+        "label": "mistral.rs",
+        "installed": false,
+        "version": "",
+        "pin": ""
+      }
+    ],
+    "engine_versions": {
+      "mlx_lm": null,
+      "ollama": null,
+      "llama_cpp": null,
+      "vllm_metal": null,
+      "omlx": null,
+      "omlx_tq": null,
+      "mistralrs": null
+    },
+    "pinned": false,
+    "pin_problems": [
+      "scratchy is not pinned (installed: 1bf86114b36dac533ad1e15189ae3f022f38dbdc)"
+    ]
+  },
+  "methodology": "docs/BENCHMARKING.md \u2014 rung definitions, fairness rules and disclosed asymmetries live there, not here",
+  "models": [
+    {
+      "stem": "granite-4.2-8b",
+      "model_id": "ibm-granite/granite-4.2-8b-q4-mlx",
+      "model_files": {
+        "revision": "9047f073e46c527f70dade07bb55b1700d728e36",
+        "from": "downloaded snapshot"
+      },
+      "quant": "mlx-affine-b4-g64-qembed",
+      "features": "metal,serve,bench-datasets,model/granite-4.2-8b,quant/mlx-affine-b4-g64-qembed",
+      "built": true,
+      "parity_mlx_lm": null,
+      "parity_skipped": null,
+      "parity_ties": null,
+      "footprint": {
+        "build_seconds": 130,
+        "binary_bytes": 44156384,
+        "container_image_bytes": null,
+        "note": "no container image: Metal is not available in Linux containers"
+      },
+      "cache_ladder": [
+        {
+          "scenario": "cold",
+          "mode": "server",
+          "rep": 0,
+          "ttft_exec_s": 0.370697292,
+          "t_ready_s": 0.116145708,
+          "ttft_from_send_s": 0.254531584,
+          "tpot_ms": 35.84983870967742,
+          "output_tokens": 32,
+          "peak_rss_mib": 274.578125,
+          "major_faults": 7,
+          "evicted_kib": null,
+          "text": " amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber"
+        },
+        {
+          "scenario": "warm",
+          "mode": "server",
+          "rep": 0,
+          "ttft_exec_s": 0.405251917,
+          "t_ready_s": 0.130153208,
+          "ttft_from_send_s": 0.21530564599999996,
+          "tpot_ms": 35.81929435483871,
+          "output_tokens": 32,
+          "peak_rss_mib": 282.359375,
+          "major_faults": 0,
+          "evicted_kib": null,
+          "text": " amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber amber"
+        }
+      ],
+      "warm_serving": {
+        "median_ttft_ms": 216.43285400000002,
+        "p99_ttft_ms": 218.189045,
+        "median_tpot_ms": 35.772766806451614,
+        "p99_tpot_ms": 38.31749225741935,
+        "median_e2el_ms": 1325.3868955,
+        "output_throughput": 24.042125560564227,
+        "request_throughput": 0.7513164237676321,
+        "completed": 20,
+        "failed": 0,
+        "total_output_tokens": 640,
+        "duration": 26.6199425,
+        "unstreamed_requests": 0
+      },
+      "scaling": null,
+      "tasks": [
+        {
+          "workload": "rag-spans",
+          "conc": 1,
+          "median_ttft_ms": 7985.860562499999,
+          "p99_ttft_ms": 10459.852571509999,
+          "median_tpot_ms": 38.36597317913386,
+          "median_e2el_ms": 17711.629,
+          "output_throughput": 14.153425278349461,
+          "completed": 8,
+          "failed": 0,
+          "total_output_tokens": 2027,
+          "duration": 143.216215166,
+          "server_mem_peak_mib": 4748.0,
+          "server_mem_median_mib": 4748.0,
+          "dataset": "musique",
+          "task_seed": 229759113,
+          "p90_ttft_ms": 9692.7130961,
+          "p90_e2el_ms": 19484.501071299997,
+          "p99_e2el_ms": 20314.84786963,
+          "mean_output_tokens": 253.375,
+          "mean_prompt_tokens": null,
+          "mean_cached_tokens": null,
+          "accuracy": 0.0,
+          "empty_answers": 0,
+          "thinking_answers": 0
+        },
+        {
+          "workload": "rag-spans",
+          "conc": 2,
+          "median_ttft_ms": 13999.628396,
+          "p99_ttft_ms": 21943.04435375,
+          "median_tpot_ms": 58.30757075098039,
+          "median_e2el_ms": 30025.9238955,
+          "output_throughput": 16.875322237952066,
+          "completed": 8,
+          "failed": 0,
+          "total_output_tokens": 2044,
+          "duration": 121.123613,
+          "server_mem_peak_mib": 7801.0,
+          "server_mem_median_mib": 7725.0,
+          "dataset": "musique",
+          "task_seed": 2136639322,
+          "p90_ttft_ms": 20924.3161625,
+          "p90_e2el_ms": 32563.1632463,
+          "p99_e2el_ms": 32564.312549629994,
+          "mean_output_tokens": 255.5,
+          "mean_prompt_tokens": null,
+          "mean_cached_tokens": null,
+          "accuracy": 0.25,
+          "empty_answers": 0,
+          "thinking_answers": 6
+        },
+        {
+          "workload": "rag",
+          "conc": 1,
+          "median_ttft_ms": 7453.6988335,
+          "p99_ttft_ms": 9538.724368309999,
+          "median_tpot_ms": 37.35113186274509,
+          "median_e2el_ms": 16976.101854,
+          "output_throughput": 14.850260501667588,
+          "completed": 8,
+          "failed": 0,
+          "total_output_tokens": 2048,
+          "duration": 137.910038667,
+          "server_mem_peak_mib": 3258.0,
+          "server_mem_median_mib": 3258.0,
+          "dataset": "musique",
+          "task_seed": 2932111425,
+          "p90_ttft_ms": 9082.846183099999,
+          "p90_e2el_ms": 18722.9044079,
+          "p99_e2el_ms": 19203.13046519,
+          "mean_output_tokens": 256.0,
+          "mean_prompt_tokens": 2397.875,
+          "mean_cached_tokens": 32.0,
+          "accuracy": 0.0,
+          "empty_answers": 0,
+          "thinking_answers": 0
+        },
+        {
+          "workload": "rag",
+          "conc": 2,
+          "median_ttft_ms": 8233.6705,
+          "p99_ttft_ms": 18039.32260406,
+          "median_tpot_ms": 39.73872007853192,
+          "median_e2el_ms": 21122.2020415,
+          "output_throughput": 12.112356955423362,
+          "completed": 8,
+          "failed": 0,
+          "total_output_tokens": 1157,
+          "duration": 95.522283917,
+          "server_mem_peak_mib": 7796.0,
+          "server_mem_median_mib": 7724.0,
+          "dataset": "musique",
+          "task_seed": 3694077842,
+          "p90_ttft_ms": 14568.3719126,
+          "p90_e2el_ms": 43175.3614876,
+          "p99_e2el_ms": 45832.517711559994,
+          "mean_output_tokens": 144.625,
+          "mean_prompt_tokens": 2624.625,
+          "mean_cached_tokens": 48.0,
+          "accuracy": 0.625,
+          "empty_answers": 0,
+          "thinking_answers": 0
+        },
+        {
+          "workload": "sharegpt-multi-turn",
+          "conc": 1,
+          "median_ttft_ms": 518.099292,
+          "p99_ttft_ms": 1221.2030980400002,
+          "median_tpot_ms": 35.70721634117647,
+          "median_e2el_ms": 8170.413333999999,
+          "output_throughput": 25.647017996673497,
+          "completed": 5,
+          "failed": 0,
+          "total_output_tokens": 908,
+          "duration": 35.403726083,
+          "server_mem_peak_mib": 3258.0,
+          "server_mem_median_mib": 3166.0,
+          "dataset": "sharegpt-multi-turn",
+          "task_seed": 3072606425,
+          "p90_ttft_ms": 1105.2067334000003,
+          "p90_e2el_ms": 10105.7699082,
+          "p99_e2el_ms": 10395.168177720001,
+          "mean_output_tokens": 181.6,
+          "mean_prompt_tokens": 252.4,
+          "mean_cached_tokens": 117.33333333333333,
+          "accuracy": null,
+          "empty_answers": 0,
+          "thinking_answers": 0
+        },
+        {
+          "workload": "sharegpt-multi-turn",
+          "conc": 2,
+          "median_ttft_ms": 363.337458,
+          "p99_ttft_ms": 1305.1691941600002,
+          "median_tpot_ms": 35.93398006666666,
+          "median_e2el_ms": 9443.603917,
+          "output_throughput": 26.139814605873525,
+          "completed": 3,
+          "failed": 0,
+          "total_output_tokens": 521,
+          "duration": 19.931281375,
+          "server_mem_peak_mib": 7725.0,
+          "server_mem_median_mib": 7633.0,
+          "dataset": "sharegpt-multi-turn",
+          "task_seed": 3318685450,
+          "p90_ttft_ms": 1132.1796916,
+          "p90_e2el_ms": 10278.764917,
+          "p99_e2el_ms": 10466.676142,
+          "mean_output_tokens": 173.66666666666666,
+          "mean_prompt_tokens": 178.66666666666666,
+          "mean_cached_tokens": 48.0,
+          "accuracy": null,
+          "empty_answers": 0,
+          "thinking_answers": 0
+        },
+        {
+          "workload": "sharegpt",
+          "conc": 1,
+          "median_ttft_ms": 164.5134165,
+          "p99_ttft_ms": 2967.176549379999,
+          "median_tpot_ms": 35.59978588650589,
+          "p99_tpot_ms": 36.26817665048179,
+          "median_e2el_ms": 9481.1857715,
+          "output_throughput": 26.77895141688852,
+          "request_throughput": 0.08808865597660698,
+          "completed": 8,
+          "failed": 0,
+          "total_output_tokens": 2432,
+          "duration": 90.817596333,
+          "unstreamed_requests": 0,
+          "server_mem_peak_mib": 1787.0,
+          "server_mem_median_mib": 1564.0,
+          "p90_ttft_ms": 1169.8799997999993,
+          "p90_e2el_ms": 21172.197416999996,
+          "p99_e2el_ms": 29589.554966999993
+        },
+        {
+          "workload": "sharegpt",
+          "conc": 2,
+          "median_ttft_ms": 422.99554149999994,
+          "p99_ttft_ms": 3199.6663085599994,
+          "median_tpot_ms": 37.462567554927325,
+          "p99_tpot_ms": 42.074333732915356,
+          "median_e2el_ms": 10832.603417,
+          "output_throughput": 44.5625094995562,
+          "request_throughput": 0.14415692519063875,
+          "completed": 8,
+          "failed": 0,
+          "total_output_tokens": 2473,
+          "duration": 55.495079334,
+          "unstreamed_requests": 0,
+          "server_mem_peak_mib": 4792.0,
+          "server_mem_median_mib": 4748.0,
+          "p90_ttft_ms": 1904.9632045999995,
+          "p90_e2el_ms": 22265.063707899997,
+          "p99_e2el_ms": 32535.707745189997
+        }
+      ],
+      "engine_models": {},
+      "engine_declined": null,
+      "scaling_limits": null,
+      "cache_ladder_mlx_lm": null,
+      "cache_ladder_ollama": null,
+      "cache_ladder_llama_cpp": null,
+      "cache_ladder_vllm_metal": null,
+      "cache_ladder_omlx": null,
+      "cache_ladder_omlx_tq": null,
+      "cache_ladder_mistralrs": null,
+      "scaling_mlx_lm": null,
+      "scaling_ollama": null,
+      "scaling_llama_cpp": null,
+      "scaling_vllm_metal": null,
+      "scaling_omlx": null,
+      "scaling_omlx_tq": null,
+      "scaling_mistralrs": null,
+      "tasks_mlx_lm": null,
+      "tasks_ollama": null,
+      "tasks_llama_cpp": null,
+      "tasks_vllm_metal": null,
+      "tasks_omlx": null,
+      "tasks_omlx_tq": null,
+      "tasks_mistralrs": null
+    }
+  ]
+}

@@ -344,6 +344,44 @@ pub struct Scaling {
     /// A dataset task's longest prompt, in tokens: a longer one was left out, on every engine.
     #[serde(default)]
     pub task_max_prompt: Option<u32>,
+    /// The rounds of its users count a cell ran at least: with `task_min_prompts`, how many tasks
+    /// a dataset cell sent, in runs from before each cell recorded it.
+    #[serde(default)]
+    pub min_rounds_per_cell: Option<u32>,
+    #[serde(default)]
+    pub task_min_prompts: Option<u32>,
+}
+
+impl Scaling {
+    /// How a run sized its dataset cells: its rounds and its fewest tasks a cell, where it says.
+    pub fn task_sizing(&self) -> Option<TaskSizing> {
+        Some(TaskSizing {
+            rounds: self.min_rounds_per_cell?,
+            min_tasks: self.task_min_prompts?,
+        })
+    }
+}
+
+/// How a run sized its dataset cells (`run_task_cell`): `users` × `rounds` tasks, at least
+/// `min_tasks`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct TaskSizing {
+    pub rounds: u32,
+    pub min_tasks: u32,
+}
+
+impl TaskSizing {
+    /// How many tasks (conversations, for `sharegpt-multi-turn`) a cell of this workload at
+    /// `users` sent: `users` × the rounds, at least the fewest; a quarter of that in conversations
+    /// of four turns, at least 2.
+    pub fn count(self, workload: &str, users: u32) -> u32 {
+        let n = (users * self.rounds).max(self.min_tasks);
+        if workload == "sharegpt-multi-turn" {
+            (n / 4).max(2)
+        } else {
+            n
+        }
+    }
 }
 
 /// What a model ran at when a limit lowered it (GLM-4.5-Air: 4 users).
@@ -504,8 +542,18 @@ pub struct Rep {
 #[derive(Deserialize, Clone, Debug)]
 pub struct TaskCell {
     pub workload: String,
-    /// Users at once.
+    /// The cell's load key: its users at once, sent stacked. A run that times cells open loop
+    /// records `load` too, and then its key is a rate step (1, 2, ... of
+    /// `config.scaling.task_rate_steps`), 0 for the 1-user `base` cell the rates are fractions of.
+    /// Cells of one key are the same load.
     pub conc: u32,
+    /// How the cell was loaded: "rate" (open loop at `request_rate`), "base", or "users" (stacked,
+    /// at `conc` users). None where a run did not record it: users, stacked.
+    #[serde(default)]
+    pub load: Option<String>,
+    /// The requests a second it was offered, open loop; None for a closed loop.
+    #[serde(default)]
+    pub request_rate: Option<f64>,
     pub completed: Option<u32>,
     #[serde(default)]
     pub failed: Option<u32>,
@@ -532,11 +580,17 @@ pub struct TaskCell {
     /// Answers that ran to their cap rather than ending on their own.
     #[serde(default)]
     pub capped_answers: Option<u32>,
-    /// Tasks sent, the denominator of accuracy. None in runs from before it was recorded.
+    /// Tasks sent, the denominator of accuracy (turns, for a conversation workload). None in runs
+    /// from before it was recorded.
     #[serde(default)]
     pub num_tasks: Option<u32>,
     #[serde(default)]
     pub timed_out: bool,
+    /// When the run this cell was borrowed from was made: a quick run's rival numbers, from the
+    /// newest earlier run that measured the same workload at the same users count and task cap.
+    /// None for a cell this run measured itself.
+    #[serde(skip)]
+    pub borrowed_from: Option<Utc>,
 }
 
 impl TaskCell {
