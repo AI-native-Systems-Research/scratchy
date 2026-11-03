@@ -205,22 +205,53 @@ pub fn bake_module() -> TokenStream {
         bake.compiled
     );
     let mut metallibs = std::collections::HashMap::new();
-    let mut statics = Vec::new();
-    for ((name, key), kernel) in names.iter().zip(&keys).zip(&bake.kernels) {
-        let next = metallibs.len();
-        let lib = *(metallibs.entry(std::sync::Arc::as_ptr(&kernel.metallib).cast::<u8>()))
-            .or_insert_with(|| {
-                let (lib, bytes) = (
-                    quote::format_ident!("M{next}"),
-                    metallib_file(&kernel.metallib),
-                );
-                let len = proc_macro2::Literal::usize_unsuffixed(kernel.metallib.len());
-                // The bytes ARE the static (an array, not a `&[u8]` to an anonymous allocation):
-                // the models' kernel tables copy these kernels, and each codegen unit that holds a
-                // copy would otherwise embed its own copy of the anonymous bytes.
-                statics.push(quote! { static #lib: [u8; #len] = *#bytes; });
-                next
-            });
+    let mut distinct: Vec<&[u8]> = Vec::new();
+    let lib_of: Vec<usize> = (bake.kernels.iter())
+        .map(|kernel| {
+            *(metallibs.entry(std::sync::Arc::as_ptr(&kernel.metallib).cast::<u8>()))
+                .or_insert_with(|| {
+                    distinct.push(&kernel.metallib);
+                    distinct.len() - 1
+                })
+        })
+        .collect();
+    if distinct.is_empty() {
+        return TokenStream::new();
+    }
+    let packed = aot::pack(&distinct);
+    eprintln!(
+        "[metal bake] {} metallibs, {} bytes packed to {} (dictionary {})",
+        distinct.len(),
+        distinct.iter().map(|m| m.len()).sum::<usize>(),
+        packed.frames.iter().map(Vec::len).sum::<usize>() + packed.dictionary.len(),
+        packed.dictionary.len(),
+    );
+    // The bytes ARE the statics (arrays, not `&[u8]`s to anonymous allocations): the models'
+    // kernel tables copy these kernels, and each codegen unit that holds a copy would otherwise
+    // embed its own copy of the anonymous bytes.
+    let (dictionary, dictionary_len) = (
+        metal_bake_file(&packed.dictionary, "dict"),
+        proc_macro2::Literal::usize_unsuffixed(packed.dictionary.len()),
+    );
+    let mut statics = vec![quote! {
+        static DICTIONARY_BYTES: [u8; #dictionary_len] = *#dictionary;
+        static DICTIONARY: __tl::BakedDictionary = __tl::BakedDictionary::new(&DICTIONARY_BYTES);
+    }];
+    for (i, (metallib, frame)) in distinct.iter().zip(&packed.frames).enumerate() {
+        let (lib, frame_id) = (quote::format_ident!("M{i}"), quote::format_ident!("F{i}"));
+        let bytes = metal_bake_file(frame, "metallib.zst");
+        let frame_len = proc_macro2::Literal::usize_unsuffixed(frame.len());
+        let len = proc_macro2::Literal::usize_unsuffixed(metallib.len());
+        statics.push(quote! {
+            static #frame_id: [u8; #frame_len] = *#bytes;
+            static #lib: __tl::BakedMetallib = __tl::BakedMetallib {
+                frame: &#frame_id,
+                dictionary: &DICTIONARY,
+                len: #len,
+            };
+        });
+    }
+    for (((name, key), kernel), lib) in names.iter().zip(&keys).zip(&bake.kernels).zip(lib_of) {
         let (id, metallib) = (
             quote::format_ident!("{name}"),
             quote::format_ident!("M{lib}"),
@@ -238,9 +269,6 @@ pub fn bake_module() -> TokenStream {
             };
         });
     }
-    if statics.is_empty() {
-        return TokenStream::new();
-    }
     quote! {
         use ::scratchy_target_metal::tape::constants as __tc;
         use ::scratchy_target_metal::tape::lowered as __tl;
@@ -248,21 +276,21 @@ pub fn bake_module() -> TokenStream {
     }
 }
 
-/// `metallib` as a file under the build's `OUT_DIR`, named by its content (models sharing a batch
-/// share the file), and the `include_bytes!` that embeds it: rustc reads the bytes rather than
-/// lexing them as a literal.
-fn metallib_file(metallib: &[u8]) -> TokenStream {
+/// `bytes` (a packed metallib's frame or the dictionary) as a file under the build's `OUT_DIR`,
+/// named by its content and `extension`, and the `include_bytes!` that embeds it: rustc reads the
+/// bytes rather than lexing them as a literal.
+fn metal_bake_file(bytes: &[u8], extension: &str) -> TokenStream {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let out = std::env::var("OUT_DIR").expect("the metal bake writes its metallibs under OUT_DIR");
     let fnv = |h: u64, &b: &u8| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
-    let hash = metallib.iter().fold(0xcbf2_9ce4_8422_2325, fnv);
-    let name = format!("metal-bake/{hash:016x}-{}.metallib", metallib.len());
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325, fnv);
+    let name = format!("metal-bake/{hash:016x}-{}.{extension}", bytes.len());
     let path = std::path::Path::new(&out).join(&name);
     if !path.exists() {
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("{}.{seq}.tmp", std::process::id()));
         std::fs::create_dir_all(path.parent().expect("metal-bake dir"))
-            .and_then(|()| std::fs::write(&tmp, metallib))
+            .and_then(|()| std::fs::write(&tmp, bytes))
             .and_then(|()| std::fs::rename(&tmp, &path))
             .unwrap_or_else(|e| panic!("metal bake: write {}: {e}", path.display()));
     }

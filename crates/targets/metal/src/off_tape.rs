@@ -15,7 +15,7 @@ use objc2_foundation::NSString;
 use objc2_metal::{MTLDevice as _, MTLLibrary as _};
 
 use crate::sampling::{CastDtype, SamplerStage};
-use crate::shader_cache::{ComputePipelineState, Device, Library, load_library_from_bytes};
+use crate::shader_cache::{ComputePipelineState, Device, Library, load_baked_library};
 use crate::specialized_pipeline_cache::{ConstantValue, PipelineKey};
 use crate::stream::MetalStreamError;
 use crate::tape::ids::{BitsetWords, BlockSize, KDimI32, LogitsWidth, MDimI32, NDimI32};
@@ -286,7 +286,7 @@ impl OffTapePipeline {
         let name = format!("{}.{}", kernel.library, kernel.function);
         let fail =
             |what: &str| MetalStreamError::ShaderCompilationFailed(format!("{name}: {what}"));
-        let library = load_library_from_bytes(device, kernel.metallib).map_err(|e| fail(&e))?;
+        let library = load_baked_library(device, kernel.metallib).map_err(|e| fail(&e))?;
         let function = library
             .newFunctionWithName(&NSString::from_str(kernel.entry))
             .ok_or_else(|| fail("function missing"))?;

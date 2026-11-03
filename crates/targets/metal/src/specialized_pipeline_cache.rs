@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
-use crate::shader_cache::load_library_from_bytes;
+use crate::shader_cache::{load_baked_library, load_library_from_bytes};
 use crate::stream::MetalStreamError;
 use crate::tape::lowered::BakedKernel;
 
@@ -128,10 +128,10 @@ impl SpecializedPipelineCache {
         let Some(k) = kernels.get(key) else {
             return Ok(None);
         };
-        let library = match libraries.entry(k.metallib.as_ptr() as usize) {
+        let library = match libraries.entry(std::ptr::from_ref(k.metallib) as usize) {
             Entry::Occupied(library) => library.get().clone(),
             Entry::Vacant(slot) => {
-                let library = load_library_from_bytes(&self.device, k.metallib).map_err(|e| {
+                let library = load_baked_library(&self.device, k.metallib).map_err(|e| {
                     MetalStreamError::ShaderCompilationFailed(format!(
                         "load baked `{}`: {e}",
                         k.entry
