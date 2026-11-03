@@ -17,9 +17,12 @@
 // stream `B`. The kernel is written for that, not as a GEMM at one row (the kernel it replaces ran
 // `gemm_bf16.cu`'s WGMMA template, 63 of its 64 rows zero, one CTA per 64 columns):
 //   - **Every SM streams.** The grid is `(column blocks, K splits, pairs)`. A CTA is 8 warps, each
-//     owning `ROWS_PER_WARP` = 4 consecutive output rows, so a column block is 32 rows; the `k`
-//     axis is cut into `splits` runs of whole 256-element chunks. `step::gemv_splits` picks the
-//     split from `(n, k)` so a narrow projection still puts two CTAs on each of the 132 SMs.
+//     owning `ROWS` consecutive output rows; the `k` axis is cut into `splits` runs of whole
+//     256-element chunks. `step::gemv_splits` splits only a narrow projection (under 66 blocks of
+//     32 rows), so it still puts two CTAs on each of the 132 SMs. `ROWS` is 4 (32-row blocks)
+//     above one split; at one split the launcher takes 4, 3 or 2 (`rows_per_warp`, a constant of
+//     the shape) so the grid ends in a nearly full wave of 264 CTAs, not a partial one. The bits
+//     are the same at every `ROWS`.
 //   - **16-byte transfers, one wait per chunk of several rows.** Each warp runs its own 4-stage
 //     ring of shared vectors: per stage, lane 0 sets the byte count (`tma::expect_bytes`) and
 //     issues one vector TMA load (`tma::load_async` of an `sv_bf<256>`, 512 bytes) of `a`'s chunk
@@ -92,6 +95,12 @@ constexpr int BLOCK_ROWS = WARPS * ROWS_PER_WARP;
 constexpr int MAX_SPLITS = 16;
 constexpr int STAGES = 4;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
+// The rows per warp a one-split launch may take instead of `ROWS_PER_WARP` (#1031 rework, the
+// diagnosis's row 2), in order of preference, and `step::GEMV_TARGET_CTAS`, the CTAs resident at
+// two per SM: `rows_per_warp` picks the first whose grid fills its last wave to 85%.
+constexpr int ROW_CHOICES[] = {4, 3, 2};
+static_assert(ROW_CHOICES[0] == ROWS_PER_WARP, "the 4-row instance is the split one");
+constexpr uint64_t TARGET_CTAS = 264;
 // The reduce kernel: one lane per output row, 8 warps per CTA.
 constexpr int REDUCE_WARPS = 8;
 constexpr int REDUCE_ROWS = kittens::WARP_THREADS;
@@ -148,20 +157,21 @@ static_assert(SMEM_VECTORS == 81920, "8 warps, 4 stages, a and 4 rows");
 constexpr int GEMV_SMEM_BYTES = int(SMEM_VECTORS) + 1024;
 static_assert(2 * GEMV_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "two CTAs per SM");
 
-template <bool EXPERT>
+// `ROWS` rows per warp, `WARPS · ROWS` per CTA. A row's sum does not depend on `ROWS` (each row
+// adds its own chunks in ascending K, then `warp::sum`), so every instance gives the same bits.
+template <bool EXPERT, int ROWS>
 __global__ __launch_bounds__(NUM_THREADS, 2) void gemv_bf16_ker(const __grid_constant__ gemv_globals g) {
     extern __shared__ int __shm[];
     shared_allocator<1024> al((int*)&__shm[0]);
     chunk_sv(&a_s)[WARPS][STAGES] = al.allocate<chunk_sv, WARPS, STAGES>();
-    chunk_sv(&b_s)[WARPS][STAGES][ROWS_PER_WARP] =
-        al.allocate<chunk_sv, WARPS, STAGES, ROWS_PER_WARP>();
+    chunk_sv(&b_s)[WARPS][STAGES][ROWS] = al.allocate<chunk_sv, WARPS, STAGES, ROWS>();
     __shared__ kittens::semaphore arrived[WARPS][STAGES];
 
     const int w = kittens::warpid();
     const int split = blockIdx.y;
     const int p = blockIdx.z;
-    const int row0 = blockIdx.x * BLOCK_ROWS + w * ROWS_PER_WARP;
-    const int rows = max(0, min(ROWS_PER_WARP, g.n - row0));
+    const int row0 = (blockIdx.x * WARPS + w) * ROWS;
+    const int rows = max(0, min(ROWS, g.n - row0));
     const int c0 = split * g.split_chunks;
     const int count = max(0, min(g.split_chunks, g.chunks - c0));
     const int a_row = p / g.row_div;
@@ -170,10 +180,10 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gemv_bf16_ker(const __grid_con
         depth = g.topk_idx[{0, 0, 0, p}];
     }
 
-    chunk_rv acc[ROWS_PER_WARP];
+    chunk_rv acc[ROWS];
     chunk_rv x, y;
 #pragma unroll
-    for (int r = 0; r < ROWS_PER_WARP; r++) {
+    for (int r = 0; r < ROWS; r++) {
         warp::zero(acc[r]);
     }
     if (rows > 0 && count > 0) {
@@ -201,7 +211,7 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gemv_bf16_ker(const __grid_con
             wait(arrived[w][s], (j / STAGES) % 2);
             warp::load(x, a_s[w][s]);
 #pragma unroll
-            for (int r = 0; r < ROWS_PER_WARP; r++) {
+            for (int r = 0; r < ROWS; r++) {
                 if (r < rows) {
                     warp::load(y, b_s[w][s][r]);
                     warp::mul(y, y, x);
@@ -218,7 +228,7 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gemv_bf16_ker(const __grid_con
     // Each row's partial, in every lane; lane 0 stores it. The rows past `n` (and a split past the
     // row's chunks) are +0, stored only into the scratch so the reduce reads written values.
 #pragma unroll
-    for (int r = 0; r < ROWS_PER_WARP; r++) {
+    for (int r = 0; r < ROWS; r++) {
         const float dot = warp::sum(acc[r]);
         const int row = row0 + r;
         if (warp::laneid() == 0) {
@@ -269,14 +279,60 @@ uint32_t split_chunks(uint32_t chunks, uint32_t splits) {
     return (splits - 1) * each < chunks ? each : 0;
 }
 
-// The main kernel of instance `EXPERT`, then at `splits > 1` the reduce, on `stream`.
+// The CTAs of a grid of `pairs` slices of `n` rows at `rows` rows per warp.
+uint64_t ctas(uint32_t n, uint32_t pairs, int rows) {
+    const uint64_t block = uint64_t(WARPS) * uint64_t(rows);
+    return (uint64_t(n) + block - 1) / block * uint64_t(pairs);
+}
+
+// The rows per warp of a launch, a constant of its shape: `ROWS_PER_WARP` above one split (the
+// scratch's rows are padded to its 32-row block); at one split the first of `ROW_CHOICES` whose
+// grid fills its last wave of `TARGET_CTAS` to 85%, else the one that fills it most. The products
+// fit in 64 bits (`n` at most INT_MAX, `pairs` at most 65,535).
+int rows_per_warp(uint32_t n, uint32_t pairs, uint32_t splits) {
+    if (splits > 1) {
+        return ROWS_PER_WARP;
+    }
+    int best = ROWS_PER_WARP;
+    uint64_t best_ctas = ctas(n, pairs, best);
+    uint64_t best_waves = (best_ctas + TARGET_CTAS - 1) / TARGET_CTAS;
+    for (const int rows : ROW_CHOICES) {
+        const uint64_t c = ctas(n, pairs, rows);
+        const uint64_t waves = (c + TARGET_CTAS - 1) / TARGET_CTAS;
+        if (20 * c >= 17 * TARGET_CTAS * waves) {
+            return rows;
+        }
+        if (c * best_waves > best_ctas * waves) {
+            best = rows;
+            best_ctas = c;
+            best_waves = waves;
+        }
+    }
+    return best;
+}
+
+// Instance `<EXPERT, ROWS>` of the main kernel over `pairs` slices of `n` rows and `splits` K runs.
+// Every instance takes the 4-row instance's shared memory, so two CTAs fit an SM whatever `ROWS`
+// is, as `TARGET_CTAS` assumes.
+template <bool EXPERT, int ROWS>
+cudaError_t launch_main(gemv_globals& G, uint32_t n, uint32_t pairs, uint32_t splits,
+                        cudaStream_t s) {
+    void* args[] = {&G};
+    const uint32_t block_rows = uint32_t(WARPS * ROWS);
+    const dim3 grid((n + block_rows - 1) / block_rows, splits, pairs), block(NUM_THREADS);
+    return cudaLaunchKernel(gemv_bf16_ker<EXPERT, ROWS>, grid, block, args, GEMV_SMEM_BYTES, s);
+}
+
+// The main kernel of instance `EXPERT` at `rows_per_warp`'s rows, then at `splits > 1` the reduce,
+// on `stream`.
 template <bool EXPERT>
 int launch(gemv_globals G, uint32_t n, uint32_t pairs, uint32_t splits, void* stream) {
-    void* args[] = {&G};
-    const dim3 grid(padded(n) / uint32_t(BLOCK_ROWS), splits, pairs), block(NUM_THREADS);
     const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    const int rows = rows_per_warp(n, pairs, splits);
     const cudaError_t launched =
-        cudaLaunchKernel(gemv_bf16_ker<EXPERT>, grid, block, args, GEMV_SMEM_BYTES, s);
+        rows == 2   ? launch_main<EXPERT, 2>(G, n, pairs, splits, s)
+        : rows == 3 ? launch_main<EXPERT, 3>(G, n, pairs, splits, s)
+                    : launch_main<EXPERT, ROWS_PER_WARP>(G, n, pairs, splits, s);
     if (launched != cudaSuccess || splits == 1) {
         return static_cast<int>(launched);
     }
@@ -360,27 +416,48 @@ int expert(const void* a, const void* b, const void* topk_idx, void* c, void* pa
 
 }  // namespace
 
-// Each instance's one-time setup: allow it `GEMV_SMEM_BYTES` of dynamic shared memory on the
-// current device (the default limit is 48 KB). Run once per device before any launch
-// (`kernels::prepare_all`, called by `CudaDevice::open`), never per launch. The reduce kernel has
-// no shared memory; the dense setup only loads it (`cudaFuncGetAttributes`), so a worker's graph
-// capture (`CudaWorker::new`, #1048) never loads it mid-capture.
+namespace {
+
+// Allow instance `<EXPERT, ROWS>` `GEMV_SMEM_BYTES` of dynamic shared memory, which loads it.
+template <bool EXPERT, int ROWS>
+cudaError_t prepare_one() {
+    return cudaFuncSetAttribute(gemv_bf16_ker<EXPERT, ROWS>,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize, GEMV_SMEM_BYTES);
+}
+
+// `prepare_one` of every `ROW_CHOICES` instance of `EXPERT`: the first failure, else cudaSuccess.
+template <bool EXPERT>
+cudaError_t prepare_instances() {
+    cudaError_t e = prepare_one<EXPERT, 4>();
+    if (e == cudaSuccess) {
+        e = prepare_one<EXPERT, 3>();
+    }
+    if (e == cudaSuccess) {
+        e = prepare_one<EXPERT, 2>();
+    }
+    return e;
+}
+
+}  // namespace
+
+// Each instance's one-time setup: allow every rows-per-warp instance `GEMV_SMEM_BYTES` of dynamic
+// shared memory on the current device (the default limit is 48 KB). Run once per device before
+// any launch (`kernels::prepare_all`, called by `CudaDevice::open`), never per launch. The reduce
+// kernel has no shared memory; the dense setup only loads it (`cudaFuncGetAttributes`), so a
+// worker's graph capture (`CudaWorker::new`, #1048) never loads a kernel mid-capture.
 //
 // 0 = done; any other value = the cudaError_t of the first call that failed.
 extern "C" int scratchy_cuda_gemv_bf16_abt_prepare(void) {
-    if (const cudaError_t e = cudaFuncSetAttribute(
-            gemv_bf16_ker<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, GEMV_SMEM_BYTES);
-        e != cudaSuccess) {
+    if (const cudaError_t e = prepare_instances<false>(); e != cudaSuccess) {
         return static_cast<int>(e);
     }
     cudaFuncAttributes attr;
     return static_cast<int>(cudaFuncGetAttributes(&attr, gemv_reduce_ker));
 }
 
-// `scratchy_cuda_gemv_bf16_abt_prepare`'s, for the expert instance.
+// `scratchy_cuda_gemv_bf16_abt_prepare`'s, for the expert instances.
 extern "C" int scratchy_cuda_expert_gemv_bf16_prepare(void) {
-    return static_cast<int>(cudaFuncSetAttribute(
-        gemv_bf16_ker<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, GEMV_SMEM_BYTES));
+    return static_cast<int>(prepare_instances<true>());
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
