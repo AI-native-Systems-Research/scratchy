@@ -21,7 +21,7 @@
 // math). GVA: the key head is `i_hv / (HV/H)`.
 //
 // `conv_out` is model dtype (`T`); `g`/`beta`/`o` and the lane records are f32; `ssm_state` is
-// `half`, cast at its loads and stores (the arithmetic f32).
+// `gdn_ssm_t`, cast at its loads and stores (the arithmetic f32).
 // State layout (cuda-symmetric): `state_indices[seq]` is the sequence's `GdnSeqSlots`
 //   (`gdn_state.h`), its slot the one its state lives in; a slot is its state
 //   entry ssm[HV, head_v, head_k] (row ((i_hv*head_v + i_v)*head_k)). When the model drafts, the
@@ -98,7 +98,7 @@ template <typename T>
     const device T*     conv_out      [[buffer(1)]],
     const device float* g             [[buffer(2)]],
     const device float* beta          [[buffer(3)]],
-    device       half*  ssm_state     [[buffer(4)]],
+    device       gdn_ssm_t*  ssm_state     [[buffer(4)]],
     const device int*   cu_seqlens    [[buffer(5)]],
     const device GdnSeqSlots* state_indices [[buffer(6)]],
     const device uint*  gdn_step      [[buffer(7)]],
@@ -148,13 +148,13 @@ template <typename T>
   uint entry_len = HV * Vd * K;
   uint rec_len = conv_dim + 2u * HV;
   uint area_len = (GDN_SCAN_DRAFTS + 1u) * rec_len;
-  device half* state_row = ssm_state + uint(slot_ix) * entry_len + (i_hv * Vd + i_v) * K;
+  device gdn_ssm_t* state_row = ssm_state + uint(slot_ix) * entry_len + (i_hv * Vd + i_v) * K;
   device float* lane = ssm_lanes + (code >> 17) * 2u * area_len;
   const device float* kept = lane + area * area_len;
   device float* recorded = lane + (1u - area) * area_len;
   int replayed = GDN_SCAN_DRAFTS > 0u && start >= 2u ? int(start - 1u) : 0;
   // The start state's row: the slot's, or a restore's snapshot's.
-  const device half* start_row =
+  const device gdn_ssm_t* start_row =
       ssm_state + uint(gdn_start_slot(seq_slots, start)) * entry_len + (i_hv * Vd + i_v) * K;
 
   float b_h[GDN_SCAN_KMAX];
@@ -173,14 +173,14 @@ template <typename T>
         // loaded it back — the f16 entry's round-trip; the replay holds the rows in registers,
         // so round the state through the entry's dtype to leave the same state.
         for (uint ki = 0; ki < K; ki++) {
-          b_h[ki] = float(half(b_h[ki]));
+          b_h[ki] = float(gdn_ssm_t(b_h[ki]));
         }
       }
       if (i_t == 0 && drafts > 0u && start != 0u) {
         // A verify step leaves the state it starts from in the slot (a slot start's is already
         // there).
         for (uint ki = 0; ki < K; ki++) {
-          state_row[ki] = half(b_h[ki]);
+          state_row[ki] = gdn_ssm_t(b_h[ki]);
         }
       }
       uint t = uint(bos + i_t);
@@ -255,10 +255,10 @@ template <typename T>
     }
     const int sv = gdn_stretch_save(saves_through, stretch, seq_len);
     if (sv >= 0) {
-      device half* snap =
+      device gdn_ssm_t* snap =
           ssm_state + uint(state_indices[i_n].saves[sv].y) * entry_len + (i_hv * Vd + i_v) * K;
       for (uint ki = 0; ki < K; ki++) {
-        snap[ki] = half(b_h[ki]);
+        snap[ki] = gdn_ssm_t(b_h[ki]);
         // The snapshot is the entry's f16 — a restore loads exactly this. The cold run carries
         // on in registers, so round them through the same store: a prefix-cache hit resumes
         // from what a miss computed, bit for bit.
@@ -270,7 +270,7 @@ template <typename T>
   // Any step but a verify step leaves its last row's state in the slot.
   if (drafts == 0u) {
     for (uint ki = 0; ki < K; ki++) {
-      state_row[ki] = half(b_h[ki]);
+      state_row[ki] = gdn_ssm_t(b_h[ki]);
     }
   }
 }
@@ -297,7 +297,7 @@ template <typename T>
     const device float* conv_out      [[buffer(1)]],
     const device T*     a             [[buffer(2)]],
     const device T*     b             [[buffer(3)]],
-    device       half*  ssm_state     [[buffer(4)]],
+    device       gdn_ssm_t*  ssm_state     [[buffer(4)]],
     const device int*   cu_seqlens    [[buffer(5)]],
     const device GdnSeqSlots* state_indices [[buffer(6)]],
     const device uint*  gdn_step      [[buffer(7)]],
@@ -350,14 +350,14 @@ template <typename T>
   auto row_in = [&](int s) {
     return ssm_state + uint(s) * entry_len + (i_hv * Vd + i_v) * K + lane * NPT;
   };
-  device half* state_row = row_in(slot_ix);
+  device gdn_ssm_t* state_row = row_in(slot_ix);
   device float* draft_lane = ssm_lanes + (code >> 17) * 2u * area_len;
   const device float* kept = draft_lane + area * area_len;
   device float* recorded = draft_lane + (1u - area) * area_len;
   const int replayed = GDN_SCAN_DRAFTS > 0u && start >= 2u ? int(start - 1u) : 0;
 
   // The start state: the slot's, or a restore's snapshot's.
-  const device half* start_row = row_in(gdn_start_slot(seq_slots, start));
+  const device gdn_ssm_t* start_row = row_in(gdn_start_slot(seq_slots, start));
   float st[NPT];
   for (uint i = 0; i < NPT; i++) {
     st[i] = start == 1u ? 0.0f : float(start_row[i]);
@@ -372,14 +372,14 @@ template <typename T>
       // loaded it back — the f16 entry's round-trip; the replay holds the rows in registers,
       // so round the state through the entry's dtype to leave the same state.
       for (uint i = 0; i < NPT; i++) {
-        st[i] = float(half(st[i]));
+        st[i] = float(gdn_ssm_t(st[i]));
       }
     }
     if (i_t == 0 && drafts > 0u && start != 0u) {
       // A verify step leaves the state it starts from in the slot (a slot start's is already
       // there).
       for (uint i = 0; i < NPT; i++) {
-        state_row[i] = half(st[i]);
+        state_row[i] = gdn_ssm_t(st[i]);
       }
     }
     const uint t = uint(bos + i_t);
@@ -467,9 +467,9 @@ template <typename T>
     }
     for (uint j = 0; j < GDN_SAVES; j++) {
       if (saves_through[j] == seq_len) {
-        device half* snap = row_in(seq_slots.saves[j].y);
+        device gdn_ssm_t* snap = row_in(seq_slots.saves[j].y);
         for (uint i = 0; i < NPT; i++) {
-          snap[i] = half(st[i]);
+          snap[i] = gdn_ssm_t(st[i]);
         }
       }
     }
@@ -482,9 +482,9 @@ template <typename T>
       }
       const int sv = gdn_stretch_save(saves_through, stretch, seq_len);
       if (sv >= 0) {
-        device half* snap = row_in(seq_slots.saves[sv].y);
+        device gdn_ssm_t* snap = row_in(seq_slots.saves[sv].y);
         for (uint i = 0; i < NPT; i++) {
-          snap[i] = half(st[i]);
+          snap[i] = gdn_ssm_t(st[i]);
           // The snapshot is the entry's f16 — a restore loads exactly this. The cold run
           // carries on in registers, so round them through the same store: a prefix-cache
           // hit resumes from what a miss computed, bit for bit.
@@ -497,7 +497,7 @@ template <typename T>
   // Any step but a verify step leaves its last row's state in the slot.
   if (drafts == 0u) {
     for (uint i = 0; i < NPT; i++) {
-      state_row[i] = half(st[i]);
+      state_row[i] = gdn_ssm_t(st[i]);
     }
   }
 }
