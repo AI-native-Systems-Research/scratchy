@@ -2455,6 +2455,11 @@ mod tests {
         assert!(!is_progress(&c(
             r#"{"model":"keepalive","choices":[{"text":"","finish_reason":null}]}"#
         )));
+        // From 0.7.3 its keepalive carries the real model name and reads as output, the same as
+        // the gpt-oss chunk above: the Metal matrix serves oMLX with `--sse-keepalive-mode comment`.
+        assert!(is_progress(&c(
+            r#"{"model":"gpt-oss","choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}"#
+        )));
         // llama.cpp's empty closing chunk, and a usage-only chunk: not output.
         assert!(!is_progress(&c(
             r#"{"model":"m","choices":[{"text":"","finish_reason":"stop"}]}"#

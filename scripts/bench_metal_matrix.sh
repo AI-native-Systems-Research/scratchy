@@ -868,7 +868,9 @@ omlx_model()    { echo "$2"; }
 omlx_tq_model() { echo "$2"; }
 omlx_serve() { # base-dir PAR
     local x=""; (( $2 )) && x=" --max-concurrent-requests $2"
-    echo "${OMLX_BIN} serve --base-path $1 --model-dir ${RAW}/omlx-models --host 127.0.0.1 --port ${PORT} --paged-ssd-cache-dir $1/ssd-cache${x}"
+    # Prefill keepalives as SSE comments: since 0.7.3 (jundot/omlx#4797) its default keepalive
+    # chunks carry the real model name, and bench serve would time the first one as the first token.
+    echo "${OMLX_BIN} serve --base-path $1 --model-dir ${RAW}/omlx-models --host 127.0.0.1 --port ${PORT} --paged-ssd-cache-dir $1/ssd-cache --sse-keepalive-mode comment${x}"
 }
 omlx_home()   { [[ "$1" == omlx_tq ]] && echo "${RAW}/omlx-home-tq" || echo "${RAW}/omlx-home"; }
 # A variant's home once its model is done: its SSD cache is that model's prompts alone, and reached
