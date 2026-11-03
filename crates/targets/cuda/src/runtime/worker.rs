@@ -164,8 +164,16 @@ pub enum WorkerError {
     /// The GDN pool's bytes (per GDN layer, `num_slots` slots of conv and ssm state) overflow
     /// `u64`: `num_slots` is too large for the tapes' geometry.
     GdnPoolTooLarge { num_slots: u32 },
-    /// Creating the stream or allocating the arena or a pool failed.
+    /// Creating the stream or allocating the arena or a pool failed, or recording a tape's
+    /// graph did.
     Cuda(CudaError),
+    /// Recording the tape at `bucket` into its graph, the launcher of its step `step` refused
+    /// (`error`): the shape `validate` passed is one the kernel does not take. Nothing ran.
+    Launch {
+        bucket: usize,
+        step: usize,
+        error: KernelError,
+    },
 }
 
 impl fmt::Display for WorkerError {
@@ -216,6 +224,15 @@ impl fmt::Display for WorkerError {
                 "a GDN pool of {num_slots} slots overflows u64 bytes for the tapes' GDN geometry"
             ),
             Self::Cuda(e) => write!(f, "cannot build the CUDA worker: {e}"),
+            Self::Launch {
+                bucket,
+                step,
+                error,
+            } => write!(
+                f,
+                "recording the tape of bucket {bucket} into its graph, step {step} did not \
+                 launch: {error}"
+            ),
         }
     }
 }
@@ -482,6 +499,29 @@ impl Drop for Stream {
     }
 }
 
+/// One bucket's tape as a CUDA Graph: the play loop's launches, recorded once at construction
+/// ([`CudaWorker::capture`]) and replayed by every forward with one `cudaGraphLaunch`. Each
+/// recorded launch holds its argument struct by value, its TMA tensor maps included, so a replay
+/// encodes nothing and calls no launcher.
+struct Graph(ffi::CudaGraphExecT);
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        // SAFETY: the exec came from cudaGraphInstantiateWithFlags and is destroyed once; no
+        // replay is in flight, since every forward ends in its own stream sync (`forward_as`),
+        // not because the stream's drop (which runs after this one) syncs. A failure cannot be
+        // reported from a destructor.
+        let _ = unsafe { ffi::cudaGraphExecDestroy(self.0) };
+    }
+}
+
+/// How a forward runs its steps: the bucket's graph, or each launch as the graph recorded it.
+#[derive(Clone, Copy)]
+enum Steps<'g> {
+    Graph(&'g Graph),
+    Launches,
+}
+
 /// The worker's paged KV pool: one allocation of every layer's K and V buffer, and the host side
 /// of the forward's KV regions.
 struct KvPool {
@@ -639,6 +679,10 @@ pub struct CudaWorker<'a, W: AsRef<[DeviceBuffer]> = &'a [DeviceBuffer]> {
     weights: W,
     /// The borrow a borrowed `W` holds.
     borrow: PhantomData<&'a [DeviceBuffer]>,
+    /// Per tape, its CUDA Graph, recorded at construction; `None` for a tape a step of which
+    /// `not_launched` names, whose forward refuses before any copy. Declared before `stream`, so
+    /// the graphs drop first.
+    graphs: Vec<Option<Graph>>,
     stream: Stream,
     arena: DeviceBuffer,
     /// The host side of the rotary tables, sized once for the largest tape's two: each forward
@@ -717,6 +761,9 @@ impl<'a> CudaWorker<'a> {
     /// sequence's first forward starts from zero without reading its slot (the `fresh` flag of
     /// [`GdnSequence`]), and overwrites it in full. When no tape has GDN layers, `gdn_pool` must
     /// be `None`.
+    ///
+    /// The graph capture assumes worker build is single-threaded per process: its `ThreadLocal`
+    /// capture does not see another thread's `cudaMalloc` or legacy-stream sync.
     pub fn new(
         device: &CudaDevice,
         tapes: &'static [CudaTape],
@@ -847,10 +894,26 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             }),
             None => None,
         };
+        let graphs = (tapes.iter().enumerate())
+            .map(|(bucket, tape)| {
+                if tape.steps.iter().any(|s| not_launched(s).is_some()) {
+                    return Ok(None);
+                }
+                Self::capture(
+                    &stream,
+                    &arena,
+                    weights.as_ref(),
+                    (kv.as_ref(), gdn.as_ref()),
+                    (bucket, tape),
+                )
+                .map(Some)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             tapes,
             weights,
             borrow: PhantomData,
+            graphs,
             stream,
             arena,
             rotary_host: vec![0; rotary_elements],
@@ -940,8 +1003,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     }
 
     /// Run bucket `bucket`'s tape: upload `input` into its input span (and, when the tape has a
-    /// rotary table, that table's rows for `positions`, one per token), launch every step in
-    /// order, download its result span into `result`, and wait once. Returns once the GPU is done,
+    /// rotary table, that table's rows for `positions`, one per token), run every step in
+    /// order (the bucket's CUDA Graph, recorded once when the worker was built), download its result span into `result`, and wait once. Returns once the GPU is done,
     /// error or not, so nothing the forward touched is still in use.
     ///
     /// `input` is of the kind the tape takes ([`TapeInput`]), else [`ForwardError::InputKind`],
@@ -975,6 +1038,37 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         gdn: Option<&GdnSequence>,
         result: &mut [u16],
     ) -> Result<(), ForwardError> {
+        self.forward_as(None, (bucket, input, positions), (kv, gdn), result)
+    }
+
+    /// [`Self::forward`] with each step launched one by one, the launches the graph recorded,
+    /// instead of replaying it: the same kernels with the same arguments in the same order, and the
+    /// same checks and copies, for the tests that check the two give the same bits.
+    pub fn forward_launched(
+        &mut self,
+        bucket: usize,
+        input: Input<'_>,
+        positions: &[u32],
+        kv: Option<&KvSequence<'_>>,
+        gdn: Option<&GdnSequence>,
+        result: &mut [u16],
+    ) -> Result<(), ForwardError> {
+        self.forward_as(
+            Some(Steps::Launches),
+            (bucket, input, positions),
+            (kv, gdn),
+            result,
+        )
+    }
+
+    /// [`Self::forward`] (`steps` `None`: the bucket's graph) or [`Self::forward_launched`].
+    fn forward_as(
+        &mut self,
+        steps: Option<Steps<'_>>,
+        (bucket, input, positions): (usize, Input<'_>, &[u32]),
+        (kv, gdn): (Option<&KvSequence<'_>>, Option<&GdnSequence>),
+        result: &mut [u16],
+    ) -> Result<(), ForwardError> {
         let tape = self.tapes.get(bucket).ok_or(ForwardError::Bucket {
             bucket,
             buckets: self.tapes.len(),
@@ -984,6 +1078,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         {
             return Err(ForwardError::NotLaunched { step, op });
         }
+        // A tape with no step `not_launched` names was captured at construction.
+        let graph = self.graphs[bucket]
+            .as_ref()
+            .expect("`new` captured every tape that launches");
+        let steps = steps.unwrap_or(Steps::Graph(graph));
         let ids = match (tape.input, input) {
             (TapeInput::Hidden(_), Input::Hidden(_)) => None,
             (TapeInput::TokenIds { vocab, .. }, Input::TokenIds(ids)) => Some((ids, vocab)),
@@ -1094,7 +1193,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             &self.arena,
             self.weights.as_ref(),
             (self.kv.as_ref(), self.gdn.as_ref()),
-            tape,
+            (tape, steps),
             Uploads {
                 input,
                 tables,
@@ -1197,121 +1296,70 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         copied.and(drained)
     }
 
-    /// Everything one forward enqueues, stopping at the first failure: the input copy, the rotary
-    /// table's rows when the tape has one (`table`: its span and the rows, which hold exactly its
-    /// bytes), the KV regions when it has a KV cache, every launch and the result copy. The
-    /// caller drains the stream whatever this returns.
-    fn enqueue(
+    /// Record `tape`'s steps ([`Self::play`]) on `stream` into a CUDA Graph and instantiate it:
+    /// one capture, at construction. Capture runs no kernel. It is `ThreadLocal`, so a call of this
+    /// thread that is unsafe during a capture (a synchronous copy, an allocation, a first load of a
+    /// kernel's module) ends it with an error, which is returned, never ignored: every kernel was
+    /// loaded when the device opened (`kernels::prepare_all`), so none loads here. A launcher that
+    /// refuses its step's shape ends the capture and is [`WorkerError::Launch`]; that error is the
+    /// one returned, and `cudaStreamEndCapture`'s (the capture it invalidated) is dropped.
+    fn capture(
+        stream: &Stream,
+        arena: &DeviceBuffer,
+        weights: &[DeviceBuffer],
+        pools: (Option<&KvPool>, Option<&GdnPool>),
+        (bucket, tape): (usize, &CudaTape),
+    ) -> Result<Graph, WorkerError> {
+        // SAFETY: the stream is live and idle (nothing was enqueued on it yet).
+        check(
+            unsafe { ffi::cudaStreamBeginCapture(stream.0, ffi::STREAM_CAPTURE_MODE_THREAD_LOCAL) },
+            "cudaStreamBeginCapture",
+        )
+        .map_err(WorkerError::Cuda)?;
+        let played = Self::play(stream, arena, weights, pools, tape);
+        let mut graph: ffi::CudaGraphT = std::ptr::null_mut();
+        // SAFETY: the stream is capturing; the capture ends here, whether `play` succeeded or not,
+        // so the stream is never left capturing.
+        let ended = check(
+            unsafe { ffi::cudaStreamEndCapture(stream.0, &mut graph) },
+            "cudaStreamEndCapture",
+        );
+        let instantiated = played
+            .map_err(|(step, error)| WorkerError::Launch {
+                bucket,
+                step,
+                error,
+            })
+            .and(ended.map_err(WorkerError::Cuda))
+            .and_then(|()| {
+                let mut exec: ffi::CudaGraphExecT = std::ptr::null_mut();
+                // SAFETY: `graph` is the capture's graph; `exec` is a valid out-pointer.
+                check(
+                    unsafe { ffi::cudaGraphInstantiateWithFlags(&mut exec, graph, 0) },
+                    "cudaGraphInstantiateWithFlags",
+                )
+                .map(|()| Graph(exec))
+                .map_err(WorkerError::Cuda)
+            });
+        if !graph.is_null() {
+            // SAFETY: the instantiated exec copies the graph; the graph itself is not used again.
+            let _ = unsafe { ffi::cudaGraphDestroy(graph) };
+        }
+        instantiated
+    }
+
+    /// Every step of `tape`, launched in tape order on `stream`, stopping at the first launcher
+    /// that refuses: the work [`Self::capture`] records into the bucket's graph. It reads only
+    /// fixed device addresses (the arena's spans, the weights, the pools' bases) and each step's
+    /// constant shape, so the recording is the forward's for every input.
+    fn play(
         stream: &Stream,
         arena: &DeviceBuffer,
         weights: &[DeviceBuffer],
         (kv, gdn): (Option<&KvPool>, Option<&GdnPool>),
         tape: &CudaTape,
-        uploads: Uploads<'_>,
-        result: &mut [u16],
-    ) -> Result<(), ForwardError> {
-        let Uploads {
-            input,
-            tables,
-            kv: kv_upload,
-            gdn: gdn_upload,
-        } = uploads;
+    ) -> Result<(), (usize, KernelError)> {
         let slot = |offset| Self::slot_of(arena, offset);
-        // SAFETY: the input span lies inside the tape's arena (`new` validated it), which is at
-        // most `arena_bytes`; `input` holds exactly its bytes (`forward` checked), and `input`
-        // stays borrowed until the caller's stream wait has returned.
-        check(
-            unsafe {
-                ffi::cudaMemcpyAsync(
-                    slot(tape.input.span().offset),
-                    input.ptr(),
-                    input.bytes() as usize,
-                    ffi::MEMCPY_HOST_TO_DEVICE,
-                    stream.0,
-                )
-            },
-            "cudaMemcpyAsync(host to device)",
-        )
-        .map_err(ForwardError::Cuda)?;
-        for (span, rows) in tables.into_iter().flatten() {
-            debug_assert_eq!(std::mem::size_of_val(rows) as u64, span.bytes);
-            // SAFETY: the rotary span lies inside the tape's arena (`new` validated it), which is
-            // at most `arena_bytes`; `rows` is `bucket_m · rot_dim` elements (`forward` checked
-            // `positions.len() == bucket_m`), exactly the span's bytes, and it is the worker's own
-            // buffer, which no forward touches until the caller's stream wait has returned.
-            check(
-                unsafe {
-                    ffi::cudaMemcpyAsync(
-                        slot(span.offset),
-                        rows.as_ptr().cast(),
-                        std::mem::size_of_val(rows),
-                        ffi::MEMCPY_HOST_TO_DEVICE,
-                        stream.0,
-                    )
-                },
-                "cudaMemcpyAsync(rotary table, host to device)",
-            )
-            .map_err(ForwardError::Cuda)?;
-        }
-        if let Some(up) = &kv_upload {
-            for (span, data, call) in [
-                (
-                    up.tape.block_table,
-                    up.block_table,
-                    "cudaMemcpyAsync(block table, host to device)",
-                ),
-                (
-                    up.tape.slot_mapping,
-                    up.slot_mapping,
-                    "cudaMemcpyAsync(slot mapping, host to device)",
-                ),
-                (
-                    up.tape.sequence,
-                    &up.sequence[..],
-                    "cudaMemcpyAsync(sequence, host to device)",
-                ),
-            ] {
-                debug_assert_eq!(std::mem::size_of_val(data) as u64, span.bytes);
-                // SAFETY: each region lies inside the tape's arena (`new` validated it), which is
-                // at most `arena_bytes`; `data` holds exactly its bytes (`max_blocks_per_seq`,
-                // `bucket_m` and 2 u32, which `validate` checked), and it is the worker's own
-                // buffer or `kv_upload`'s, which no forward touches until the caller's stream
-                // wait has returned.
-                check(
-                    unsafe {
-                        ffi::cudaMemcpyAsync(
-                            slot(span.offset),
-                            data.as_ptr().cast(),
-                            std::mem::size_of_val(data),
-                            ffi::MEMCPY_HOST_TO_DEVICE,
-                            stream.0,
-                        )
-                    },
-                    call,
-                )
-                .map_err(ForwardError::Cuda)?;
-            }
-        }
-        if let Some((span, data)) = gdn_upload {
-            debug_assert_eq!(std::mem::size_of_val(data) as u64, span.bytes);
-            // SAFETY: the GDN sequence region lies inside the tape's arena (`new` validated it),
-            // which is at most `arena_bytes`; `data` is its 16 bytes (`validate` checked the
-            // region's size), the worker's own buffer, which no forward touches until the
-            // caller's stream wait has returned.
-            check(
-                unsafe {
-                    ffi::cudaMemcpyAsync(
-                        slot(span.offset),
-                        data.as_ptr().cast(),
-                        std::mem::size_of_val(data),
-                        ffi::MEMCPY_HOST_TO_DEVICE,
-                        stream.0,
-                    )
-                },
-                "cudaMemcpyAsync(GDN sequence, host to device)",
-            )
-            .map_err(ForwardError::Cuda)?;
-        }
         // SAFETY (every arm): `new` validated the tape (`CudaTape::validate`): each span a step
         // reads or writes (`CudaStep::extents`, the kernel's own operand sizes) is 256-byte
         // aligned and inside the tape's arena, which is at most this worker's; each span it
@@ -1791,7 +1839,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 block_size: layout.block_size,
                                 num_blocks: layout.num_blocks,
                             };
-                            return Err(ForwardError::Launch { step, error });
+                            return Err((step, error));
                         }
                     };
                     // SAFETY: as above, for `q` and `out` (`rows*q_heads*head_dim`), and the
@@ -1840,7 +1888,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 block_size: layout.block_size,
                                 num_blocks: layout.num_blocks,
                             };
-                            return Err(ForwardError::Launch { step, error });
+                            return Err((step, error));
                         }
                     };
                     // SAFETY: as the prefill attention's, for `q` and `out` (`q_heads*head_dim`,
@@ -1861,7 +1909,140 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     }
                 }
             };
-            launched.map_err(|error| ForwardError::Launch { step, error })?;
+            launched.map_err(|error| (step, error))?;
+        }
+        Ok(())
+    }
+
+    /// Everything one forward enqueues, stopping at the first failure: the input copy, the rotary
+    /// table's rows when the tape has one (`table`: its span and the rows, which hold exactly its
+    /// bytes), the KV regions when it has a KV cache, the bucket's graph (every launch) and the
+    /// result copy. The caller drains the stream whatever this returns.
+    fn enqueue(
+        stream: &Stream,
+        arena: &DeviceBuffer,
+        weights: &[DeviceBuffer],
+        (kv, gdn): (Option<&KvPool>, Option<&GdnPool>),
+        (tape, steps): (&CudaTape, Steps<'_>),
+        uploads: Uploads<'_>,
+        result: &mut [u16],
+    ) -> Result<(), ForwardError> {
+        let Uploads {
+            input,
+            tables,
+            kv: kv_upload,
+            gdn: gdn_upload,
+        } = uploads;
+        let slot = |offset| Self::slot_of(arena, offset);
+        // SAFETY: the input span lies inside the tape's arena (`new` validated it), which is at
+        // most `arena_bytes`; `input` holds exactly its bytes (`forward` checked), and `input`
+        // stays borrowed until the caller's stream wait has returned.
+        check(
+            unsafe {
+                ffi::cudaMemcpyAsync(
+                    slot(tape.input.span().offset),
+                    input.ptr(),
+                    input.bytes() as usize,
+                    ffi::MEMCPY_HOST_TO_DEVICE,
+                    stream.0,
+                )
+            },
+            "cudaMemcpyAsync(host to device)",
+        )
+        .map_err(ForwardError::Cuda)?;
+        for (span, rows) in tables.into_iter().flatten() {
+            debug_assert_eq!(std::mem::size_of_val(rows) as u64, span.bytes);
+            // SAFETY: the rotary span lies inside the tape's arena (`new` validated it), which is
+            // at most `arena_bytes`; `rows` is `bucket_m · rot_dim` elements (`forward` checked
+            // `positions.len() == bucket_m`), exactly the span's bytes, and it is the worker's own
+            // buffer, which no forward touches until the caller's stream wait has returned.
+            check(
+                unsafe {
+                    ffi::cudaMemcpyAsync(
+                        slot(span.offset),
+                        rows.as_ptr().cast(),
+                        std::mem::size_of_val(rows),
+                        ffi::MEMCPY_HOST_TO_DEVICE,
+                        stream.0,
+                    )
+                },
+                "cudaMemcpyAsync(rotary table, host to device)",
+            )
+            .map_err(ForwardError::Cuda)?;
+        }
+        if let Some(up) = &kv_upload {
+            for (span, data, call) in [
+                (
+                    up.tape.block_table,
+                    up.block_table,
+                    "cudaMemcpyAsync(block table, host to device)",
+                ),
+                (
+                    up.tape.slot_mapping,
+                    up.slot_mapping,
+                    "cudaMemcpyAsync(slot mapping, host to device)",
+                ),
+                (
+                    up.tape.sequence,
+                    &up.sequence[..],
+                    "cudaMemcpyAsync(sequence, host to device)",
+                ),
+            ] {
+                debug_assert_eq!(std::mem::size_of_val(data) as u64, span.bytes);
+                // SAFETY: each region lies inside the tape's arena (`new` validated it), which is
+                // at most `arena_bytes`; `data` holds exactly its bytes (`max_blocks_per_seq`,
+                // `bucket_m` and 2 u32, which `validate` checked), and it is the worker's own
+                // buffer or `kv_upload`'s, which no forward touches until the caller's stream
+                // wait has returned.
+                check(
+                    unsafe {
+                        ffi::cudaMemcpyAsync(
+                            slot(span.offset),
+                            data.as_ptr().cast(),
+                            std::mem::size_of_val(data),
+                            ffi::MEMCPY_HOST_TO_DEVICE,
+                            stream.0,
+                        )
+                    },
+                    call,
+                )
+                .map_err(ForwardError::Cuda)?;
+            }
+        }
+        if let Some((span, data)) = gdn_upload {
+            debug_assert_eq!(std::mem::size_of_val(data) as u64, span.bytes);
+            // SAFETY: the GDN sequence region lies inside the tape's arena (`new` validated it),
+            // which is at most `arena_bytes`; `data` is its 16 bytes (`validate` checked the
+            // region's size), the worker's own buffer, which no forward touches until the
+            // caller's stream wait has returned.
+            check(
+                unsafe {
+                    ffi::cudaMemcpyAsync(
+                        slot(span.offset),
+                        data.as_ptr().cast(),
+                        std::mem::size_of_val(data),
+                        ffi::MEMCPY_HOST_TO_DEVICE,
+                        stream.0,
+                    )
+                },
+                "cudaMemcpyAsync(GDN sequence, host to device)",
+            )
+            .map_err(ForwardError::Cuda)?;
+        }
+        // Every step's launch, in tape order: the bucket's graph, captured from [`Self::play`] at
+        // construction, or (`Steps::Launches`, for the tests that compare the two) `play` itself.
+        // The uploads above and the result copy below stay outside the graph.
+        match steps {
+            // SAFETY: the graph was instantiated from this tape's play on this worker's stream,
+            // arena, weights and pools, which live as long as the worker; the uploads it reads are
+            // enqueued before it on the same stream.
+            Steps::Graph(graph) => check(
+                unsafe { ffi::cudaGraphLaunch(graph.0, stream.0) },
+                "cudaGraphLaunch",
+            )
+            .map_err(ForwardError::Cuda)?,
+            Steps::Launches => Self::play(stream, arena, weights, (kv, gdn), tape)
+                .map_err(|(step, error)| ForwardError::Launch { step, error })?,
         }
         // SAFETY: as the input copy, for the result span and `result`.
         check(

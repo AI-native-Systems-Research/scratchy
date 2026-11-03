@@ -189,6 +189,37 @@ int launch(const conv_globals& G, uint32_t rows, cudaStream_t stream) {
 
 }  // namespace
 
+// The kernel's one-time setup, run once per device by `kernels::prepare_all` (`CudaDevice::open`):
+// query its attributes (`cudaFuncGetAttributes`), which loads its module, so a worker's graph
+// capture (`CudaWorker::new`) never loads a kernel mid-capture. It changes nothing on the device.
+//
+// 0 = done; any other value = the cudaError_t of the first query that failed.
+extern "C" int scratchy_cuda_gdn_conv1d_prepare(void) {
+    cudaFuncAttributes attr;
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_conv1d_ker<2>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_conv1d_ker<3>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_conv1d_ker<4>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_conv1d_ker<5>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_conv1d_ker<6>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_conv1d_ker<7>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_conv1d_ker<8>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    return 0;
+}
+
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t
 // cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the runtime's last-error
@@ -196,13 +227,13 @@ int launch(const conv_globals& G, uint32_t rows, cudaStream_t stream) {
 //
 // `rows` and `conv_dim` must be non-zero, `conv_dim` a multiple of 128
 // (`step::GDN_CONV_CHANNEL_GROUP`, one warp's channels), `kernel` in 2..=8, `rows · conv_dim` at
-// most INT_MAX, and `slot_elems` (`GdnStateLayout::conv_elems_per_slot`) exactly
-// `conv_dim · (kernel − 1)`; all are checked before any pointer is touched. `x` is `[rows,
-// conv_dim]` bf16, `w` `[conv_dim, kernel]` f32, `conv_out` `[rows, conv_dim]` f32, `sequence`
-// `[slot, q_len, start, 0]` u32 with `1 ≤ q_len ≤ rows`, and `conv_state` one layer's conv buffer,
-// holding slot `slot`'s `slot_elems` f32 at `slot · slot_elems`. `conv_out` and `conv_state`
-// overlap nothing else. No shared memory, so no one-time setup. The launch is asynchronous on
-// `stream`.
+// most INT_MAX, and `slot_elems` (`GdnStateLayout::conv_elems_per_slot`) exactly `conv_dim ·
+// (kernel − 1)`; all are checked before any pointer is touched. `x` is `[rows, conv_dim]` bf16, `w`
+// `[conv_dim, kernel]` f32, `conv_out` `[rows, conv_dim]` f32, `sequence` `[slot, q_len, start, 0]`
+// u32 with `1 ≤ q_len ≤ rows`, and `conv_state` one layer's conv buffer, holding slot `slot`'s
+// `slot_elems` f32 at `slot · slot_elems`. `conv_out` and `conv_state` overlap nothing else. No
+// shared memory, so its one-time setup (`_prepare`, in `PREPARE`) only loads it. The launch is
+// asynchronous on `stream`.
 extern "C" int scratchy_cuda_gdn_conv1d(const void* x, const void* w, void* conv_state,
                                         uint64_t slot_elems, const void* sequence, void* conv_out,
                                         uint32_t rows, uint32_t conv_dim, uint32_t kernel,

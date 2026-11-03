@@ -93,16 +93,30 @@ __global__ __launch_bounds__(NUM_THREADS) void gdn_gating_ker(const __grid_const
 
 }  // namespace
 
+// The kernel's one-time setup, run once per device by `kernels::prepare_all` (`CudaDevice::open`):
+// query its attributes (`cudaFuncGetAttributes`), which loads its module, so a worker's graph
+// capture (`CudaWorker::new`) never loads a kernel mid-capture. It changes nothing on the device.
+//
+// 0 = done; any other value = the cudaError_t of the first query that failed.
+extern "C" int scratchy_cuda_gdn_gating_prepare(void) {
+    cudaFuncAttributes attr;
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_gating_ker); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    return 0;
+}
+
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t
 // cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the runtime's last-error
 // state.
 //
 // `rows` and `nv` must be non-zero, `nv` a multiple of 16 (`step::GDN_GATING_NV_MULTIPLE`, the
-// kernel's chunk width), and `rows · nv` at most INT_MAX; checked before any pointer is touched. `a` and `b` are `[rows, nv]` bf16, `a_log` and `dt_bias` `[nv]` f32, `g` and
-// `beta` `[rows, nv]` f32, `sequence` `[slot, q_len, start, 0]` u32 with `1 ≤ q_len ≤ rows`; `g`
-// and `beta` overlap nothing else. No shared memory, so no one-time setup. The launch is
-// asynchronous on `stream`.
+// kernel's chunk width), and `rows · nv` at most INT_MAX; checked before any pointer is touched.
+// `a` and `b` are `[rows, nv]` bf16, `a_log` and `dt_bias` `[nv]` f32, `g` and `beta` `[rows, nv]`
+// f32, `sequence` `[slot, q_len, start, 0]` u32 with `1 ≤ q_len ≤ rows`; `g` and `beta` overlap
+// nothing else. No shared memory, so its one-time setup (`_prepare`, in `PREPARE`) only loads it.
+// The launch is asynchronous on `stream`.
 extern "C" int scratchy_cuda_gdn_gating(const void* a, const void* b, const void* a_log,
                                         const void* dt_bias, const void* sequence, void* g,
                                         void* beta, uint32_t rows, uint32_t nv,

@@ -80,6 +80,19 @@ __global__ __launch_bounds__(NUM_THREADS) void moe_combine_bf16_ker(
 
 }  // namespace
 
+// The kernel's one-time setup, run once per device by `kernels::prepare_all` (`CudaDevice::open`):
+// query its attributes (`cudaFuncGetAttributes`), which loads its module, so a worker's graph
+// capture (`CudaWorker::new`) never loads a kernel mid-capture. It changes nothing on the device.
+//
+// 0 = done; any other value = the cudaError_t of the first query that failed.
+extern "C" int scratchy_cuda_moe_combine_bf16_prepare(void) {
+    cudaFuncAttributes attr;
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_combine_bf16_ker); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    return 0;
+}
+
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t
 // cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the runtime's last-error
@@ -90,7 +103,8 @@ __global__ __launch_bounds__(NUM_THREADS) void moe_combine_bf16_ker(
 // `down_rows · hidden` at most INT_MAX; all are checked before any pointer is touched. `down` is
 // `[down_rows, hidden]` bf16, `pos` `[m · top_k]` u32 (each below `down_rows`; null when not
 // `sorted`), `scores` `[m, top_k]` f32 and `out` `[m, hidden]` bf16, overlapping no input. No
-// shared memory, so no one-time setup. The launch is asynchronous on `stream`.
+// shared memory, so its one-time setup (`_prepare`, in `PREPARE`) only loads it. The launch is
+// asynchronous on `stream`.
 extern "C" int scratchy_cuda_moe_combine_bf16(const void* down, const void* pos,
                                               const void* scores, void* out, uint32_t m,
                                               uint32_t top_k, uint32_t hidden, uint32_t down_rows,

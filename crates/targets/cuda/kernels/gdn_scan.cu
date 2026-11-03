@@ -255,6 +255,19 @@ __global__ __launch_bounds__(kittens::WARP_THREADS) void gdn_rank_one_probe_ker(
 
 }  // namespace
 
+// The kernel's one-time setup, run once per device by `kernels::prepare_all` (`CudaDevice::open`):
+// query its attributes (`cudaFuncGetAttributes`), which loads its module, so a worker's graph
+// capture (`CudaWorker::new`) never loads a kernel mid-capture. It changes nothing on the device.
+//
+// 0 = done; any other value = the cudaError_t of the first query that failed.
+extern "C" int scratchy_cuda_gdn_scan_prepare(void) {
+    cudaFuncAttributes attr;
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_scan_ker); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    return 0;
+}
+
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t
 // cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the runtime's last-error

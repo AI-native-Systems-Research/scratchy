@@ -38,8 +38,8 @@
 // (c) the zero before the padding's bulk stores, and each copy buffer between the previous
 // store's `store_async_read_wait` and the next load.
 //
-// Shared memory: at most 8 warps × 4 KiB of buffer plus a semaphore each, static (under the
-// 48 KiB default), so no one-time setup.
+// Shared memory: at most 8 warps × 4 KiB of buffer plus a semaphore each, static (under the 48 KiB
+// default), so its one-time setup (`_prepare`, in `PREPARE`) only loads it.
 
 #include "kittens.cuh"
 #include "scratchy_ops.cuh"
@@ -235,22 +235,46 @@ int launch_sort(const sort_globals& G, uint32_t chunks, uint32_t pair_ctas, cuda
 
 }  // namespace
 
+// The kernel's one-time setup, run once per device by `kernels::prepare_all` (`CudaDevice::open`):
+// query its attributes (`cudaFuncGetAttributes`), which loads its module, so a worker's graph
+// capture (`CudaWorker::new`) never loads a kernel mid-capture. It changes nothing on the device.
+//
+// 0 = done; any other value = the cudaError_t of the first query that failed.
+extern "C" int scratchy_cuda_moe_sort_prepare(void) {
+    cudaFuncAttributes attr;
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_sort_count_ker<EXPERTS_SMALL>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_sort_offsets_ker<EXPERTS_SMALL>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_sort_count_ker<EXPERTS_LARGE>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_sort_offsets_ker<EXPERTS_LARGE>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_sort_scatter_ker); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    return 0;
+}
+
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t
 // cudaLaunchKernel returned for the first of the three launches that failed (the ones after it
 // are not launched). Nothing here reads or clears the runtime's last-error state.
 //
 // `m` non-zero, `experts` `E` one of 128 and 256 (`op_abi::MOE_EXPERT_COUNTS`), `top_k` in 1..=32
-// (`step::MOE_ROUTE_MAX_TOP_K`), `hidden` a non-zero multiple of 8, `m · top_k` and
-// `m · hidden` at most INT_MAX, and `max_tiles` at least `tape::moe_tiles`' bound
-// `(P + 127 · min(E, P)) / 128` with `max_tiles · 128 · hidden` at most INT_MAX; all are
-// checked before any pointer is touched. The bound is the most tiles any routing pads to, so every
-// row and tile index the kernels form is in its region. `x` is `[m, hidden]` bf16 and `rows`
-// `[max_tiles · 128, hidden]` bf16, 16-byte aligned; `topk_idx` `[P]` i32, each in `[0, E)`;
-// `chunk_hist` `[⌈P / 256⌉, E]`, `counts` `[E]`, `offsets` `[E + 1]`, `tile_expert`
-// `[max_tiles]` and `pos` `[P]` u32, each 16-byte aligned; no output overlaps another or an input.
-// Static shared memory only, so no one-time setup. The launches are asynchronous on `stream`, in
-// order.
+// (`step::MOE_ROUTE_MAX_TOP_K`), `hidden` a non-zero multiple of 8, `m · top_k` and `m · hidden` at
+// most INT_MAX, and `max_tiles` at least `tape::moe_tiles`' bound `(P + 127 · min(E, P)) / 128`
+// with `max_tiles · 128 · hidden` at most INT_MAX; all are checked before any pointer is touched.
+// The bound is the most tiles any routing pads to, so every row and tile index the kernels form is
+// in its region. `x` is `[m, hidden]` bf16 and `rows` `[max_tiles · 128, hidden]` bf16, 16-byte
+// aligned; `topk_idx` `[P]` i32, each in `[0, E)`; `chunk_hist` `[⌈P / 256⌉, E]`, `counts` `[E]`,
+// `offsets` `[E + 1]`, `tile_expert` `[max_tiles]` and `pos` `[P]` u32, each 16-byte aligned; no
+// output overlaps another or an input. Static shared memory only, so its one-time setup
+// (`_prepare`, in `PREPARE`) only loads it. The launches are asynchronous on `stream`, in order.
 extern "C" int scratchy_cuda_moe_sort(const void* x, const void* topk_idx, void* chunk_hist,
                                       void* counts, void* offsets, void* tile_expert, void* pos,
                                       void* rows, uint32_t m, uint32_t experts, uint32_t top_k,

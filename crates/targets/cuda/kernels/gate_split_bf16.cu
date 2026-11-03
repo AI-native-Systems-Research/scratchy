@@ -21,7 +21,8 @@
 // loads are in flight while this head's stores drain.
 //
 // Shared memory: 2 stages × 2 tiles × 8 KiB, plus 1,024 bytes of alignment slack = 33,792 bytes of
-// dynamic shared memory, under the 48 KiB default, so no one-time setup.
+// dynamic shared memory, under the 48 KiB default, so its one-time setup (`_prepare`, in `PREPARE`)
+// only loads it.
 
 #include "kittens.cuh"
 
@@ -103,18 +104,31 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gate_split_bf16_ker(const __gr
 
 }  // namespace
 
+// The kernel's one-time setup, run once per device by `kernels::prepare_all` (`CudaDevice::open`):
+// query its attributes (`cudaFuncGetAttributes`), which loads its module, so a worker's graph
+// capture (`CudaWorker::new`) never loads a kernel mid-capture. It changes nothing on the device.
+//
+// 0 = done; any other value = the cudaError_t of the first query that failed.
+extern "C" int scratchy_cuda_gate_split_bf16_prepare(void) {
+    cudaFuncAttributes attr;
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gate_split_bf16_ker); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    return 0;
+}
+
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value =
 // the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
 // runtime's last-error state.
 //
 // Refused before any pointer is touched: `rows` or `half_cols` zero; `head_dim` not 256
-// (`step::GATE_SPLIT_BF16_HEAD_DIM`, the one head dim the kernel is instantiated for);
-// `half_cols` not a multiple of `head_dim`; `rows · 2·half_cols` above INT_MAX. `qg`, `q` and
-// `gate` must be 16-byte-aligned device pointers to `rows·2·half_cols`, `rows·half_cols` and
-// `rows·half_cols` bf16, no two overlapping. Its dynamic shared memory is under the 48 KiB
-// default, so no one-time setup. The launch is asynchronous on `stream`; the caller owns it and
-// synchronizes.
+// (`step::GATE_SPLIT_BF16_HEAD_DIM`, the one head dim the kernel is instantiated for); `half_cols`
+// not a multiple of `head_dim`; `rows · 2·half_cols` above INT_MAX. `qg`, `q` and `gate` must be
+// 16-byte-aligned device pointers to `rows·2·half_cols`, `rows·half_cols` and `rows·half_cols`
+// bf16, no two overlapping. Its dynamic shared memory is under the 48 KiB default, so its one-time
+// setup (`_prepare`, in `PREPARE`) only loads it. The launch is asynchronous on `stream`; the
+// caller owns it and synchronizes.
 extern "C" int scratchy_cuda_gate_split_bf16(const void* qg, void* q, void* gate, uint32_t rows,
                                              uint32_t half_cols, uint32_t head_dim,
                                              void* stream /* cudaStream_t; null = default */) {

@@ -246,6 +246,12 @@ __global__ __launch_bounds__(ONE_THREADS) void gemm_narrow_bf16_n1_ker(
 //
 // 0 = done; any other value = the cudaError_t of setting the attribute.
 extern "C" int scratchy_cuda_gemm_narrow_bf16_abt_prepare(void) {
+    // The `n = 1` warp-vector kernel needs no attribute; querying its attributes loads it, so a
+    // worker's graph capture never loads it mid-capture.
+    cudaFuncAttributes attr;
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gemm_narrow_bf16_n1_ker); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
     return static_cast<int>(cudaFuncSetAttribute(
         gemm_narrow_bf16_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, NARROW_SMEM_BYTES));
 }

@@ -29,7 +29,7 @@
 // once per head dim (`step::KV_APPEND_BF16_HEAD_DIMS`); the 256 instantiation is the code it was.
 //
 // Static shared memory: 4 warps × 2 vectors × 2 · head_dim bytes plus a semaphore each (8 KiB at
-// 512), so no one-time setup.
+// 512), so its one-time setup (`_prepare`, in `PREPARE`) only loads it.
 
 #include "kittens.cuh"
 
@@ -136,6 +136,22 @@ int launch_kv_append(bf16* kp, bf16* vp, int* sp, bf16* kc, bf16* vc, uint32_t r
 }
 
 }  // namespace
+
+// The kernel's one-time setup, run once per device by `kernels::prepare_all` (`CudaDevice::open`):
+// query its attributes (`cudaFuncGetAttributes`), which loads its module, so a worker's graph
+// capture (`CudaWorker::new`) never loads a kernel mid-capture. It changes nothing on the device.
+//
+// 0 = done; any other value = the cudaError_t of the first query that failed.
+extern "C" int scratchy_cuda_kv_append_bf16_prepare(void) {
+    cudaFuncAttributes attr;
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, kv_append_bf16_ker<HEAD_DIM_SLIDING>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, kv_append_bf16_ker<HEAD_DIM_GLOBAL>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    return 0;
+}
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value =

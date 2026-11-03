@@ -21,7 +21,7 @@
 // 2` bytes, so the output's tail past `rows · hidden` is never written.
 //
 // Shared memory: 4 warps × 8 KiB of buffer plus a semaphore each, static (under the 48 KiB
-// default), so no one-time setup.
+// default), so its one-time setup (`_prepare`, in `PREPARE`) only loads it.
 
 #include "kittens.cuh"
 
@@ -100,6 +100,19 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void embed_bf16_ker(const __grid_co
 
 }  // namespace
 
+// The kernel's one-time setup, run once per device by `kernels::prepare_all` (`CudaDevice::open`):
+// query its attributes (`cudaFuncGetAttributes`), which loads its module, so a worker's graph
+// capture (`CudaWorker::new`) never loads a kernel mid-capture. It changes nothing on the device.
+//
+// 0 = done; any other value = the cudaError_t of the first query that failed.
+extern "C" int scratchy_cuda_embed_bf16_prepare(void) {
+    cudaFuncAttributes attr;
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, embed_bf16_ker); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    return 0;
+}
+
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t
 // cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the runtime's last-error
@@ -109,8 +122,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void embed_bf16_ker(const __grid_co
 // (every row then starts 16-byte aligned and is whole 16-byte units), and `rows · hidden` at most
 // INT_MAX; all are checked before any pointer is touched. `tokens` must be a 4-byte-aligned device
 // pointer to `rows` u32; `table` and `out` 16-byte-aligned device pointers to `vocab·hidden` and
-// `rows·hidden` bf16, `out` overlapping neither input. Static shared memory only, so no one-time
-// setup. The launch is asynchronous on `stream`; the caller owns it and synchronizes.
+// `rows·hidden` bf16, `out` overlapping neither input. Static shared memory only, so its one-time
+// setup (`_prepare`, in `PREPARE`) only loads it. The launch is asynchronous on `stream`; the
+// caller owns it and synchronizes.
 extern "C" int scratchy_cuda_embed_bf16(const void* tokens, const void* table, void* out,
                                         uint32_t rows, uint32_t hidden, uint32_t vocab,
                                         void* stream /* cudaStream_t; null = default stream */) {

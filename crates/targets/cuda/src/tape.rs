@@ -3589,6 +3589,39 @@ mod tests {
         rotary_local: None,
     };
 
+    /// A GEMV whose `k` is off the launcher's 8-wide vector (`k` = 4) validates: `validate` checks
+    /// the spans, and the launcher's own shape rule is what refuses it, at worker build (#1048,
+    /// `tests/tape_player.rs`, `a_launcher_refusal_is_a_worker_error_at_construction`, whose
+    /// fixture this is).
+    #[test]
+    fn a_gemv_off_the_launchers_vector_passes_validate() {
+        let t = CudaTape {
+            bucket_m: 1,
+            arena: ArenaLayout {
+                colour_bytes: &[4096],
+                colour_offsets: &[0],
+                total_bytes: 4096,
+            },
+            input: TapeInput::Hidden(span(0, 4096)),
+            result: span(0, 2),
+            weight_bytes: &[64],
+            steps: &[CudaStep::Gemv(GemmBf16 {
+                a: ArenaOffset(0),
+                b: WeightIx(0),
+                c: ArenaOffset(1024),
+                m: 1,
+                n: 8,
+                k: 4,
+            })],
+            rotary: None,
+            kv: None,
+            gdn: None,
+            moe: None,
+            rotary_local: None,
+        };
+        assert_eq!(t.validate(), Ok(()));
+    }
+
     /// A one-row GEMV tape validates; a GEMV of more than one row, or one in a bucket of more
     /// than one row, is refused: the kernel reads one row of `a`.
     #[test]

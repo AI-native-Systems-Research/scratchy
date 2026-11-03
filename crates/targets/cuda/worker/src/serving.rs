@@ -119,8 +119,9 @@ pub(crate) struct CudaServingWorker {
     chunk: Vec<u32>,
 }
 
-// SAFETY: the worker holds raw CUDA handles (the tape player's stream and device pointers), which
-// are not tied to the thread that made them: the CUDA runtime's primary context is per process,
+// SAFETY: the worker holds raw CUDA handles (the tape player's stream, its graphs and device
+// pointers), which are not tied to the thread that made them (a graph is captured in
+// `ThreadLocal` mode at construction, and launched on any thread after): the CUDA runtime's primary context is per process,
 // and device 0 is current by default on every thread. The engine uses a worker from one thread at
 // a time (`Worker: Send`, not `Sync`), the same reasoning as metal's `MetalWorker`.
 unsafe impl Send for CudaServingWorker {}

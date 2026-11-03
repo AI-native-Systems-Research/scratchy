@@ -113,16 +113,51 @@ int launch(const norm_globals& G, cudaStream_t stream) {
 
 }  // namespace
 
+// The kernel's one-time setup, run once per device by `kernels::prepare_all` (`CudaDevice::open`):
+// query its attributes (`cudaFuncGetAttributes`), which loads its module, so a worker's graph
+// capture (`CudaWorker::new`) never loads a kernel mid-capture. It changes nothing on the device.
+//
+// 0 = done; any other value = the cudaError_t of the first query that failed.
+extern "C" int scratchy_cuda_gdn_rms_norm_gated_prepare(void) {
+    cudaFuncAttributes attr;
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_rms_norm_gated_ker<32>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_rms_norm_gated_ker<64>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_rms_norm_gated_ker<96>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_rms_norm_gated_ker<128>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_rms_norm_gated_ker<160>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_rms_norm_gated_ker<192>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_rms_norm_gated_ker<224>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gdn_rms_norm_gated_ker<256>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    return 0;
+}
+
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t
 // cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the runtime's last-error
 // state.
 //
-// `rows` and `nv` must be non-zero, `head_v` a non-zero multiple of 32 and at most 256,
-// `rows · nv · head_v` at most INT_MAX, and `eps` finite and above 0; all are checked before any
-// pointer is touched. `o` is `[rows, nv · head_v]` f32, `z` and `out` the same shape in bf16, `w`
-// `[head_v]` f32, `sequence` `[slot, q_len, start, 0]` u32 with `q_len ≤ rows`; `out` overlaps no
-// input. No shared memory, so no one-time setup. The launch is asynchronous on `stream`.
+// `rows` and `nv` must be non-zero, `head_v` a non-zero multiple of 32 and at most 256, `rows · nv
+// · head_v` at most INT_MAX, and `eps` finite and above 0; all are checked before any pointer is
+// touched. `o` is `[rows, nv · head_v]` f32, `z` and `out` the same shape in bf16, `w` `[head_v]`
+// f32, `sequence` `[slot, q_len, start, 0]` u32 with `q_len ≤ rows`; `out` overlaps no input. No
+// shared memory, so its one-time setup (`_prepare`, in `PREPARE`) only loads it. The launch is
+// asynchronous on `stream`.
 extern "C" int scratchy_cuda_gdn_rms_norm_gated(const void* o, const void* z, const void* w,
                                                 const void* sequence, void* out, uint32_t rows,
                                                 uint32_t nv, uint32_t head_v, float eps,

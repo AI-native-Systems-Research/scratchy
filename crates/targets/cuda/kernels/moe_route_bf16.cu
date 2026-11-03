@@ -213,6 +213,25 @@ int launch(const globals_of<EXPERTS, GEMMA_PROGRAM>& G, uint32_t m, cudaStream_t
 
 }  // namespace
 
+// The kernel's one-time setup, run once per device by `kernels::prepare_all` (`CudaDevice::open`):
+// query its attributes (`cudaFuncGetAttributes`), which loads its module, so a worker's graph
+// capture (`CudaWorker::new`) never loads a kernel mid-capture. It changes nothing on the device.
+//
+// 0 = done; any other value = the cudaError_t of the first query that failed.
+extern "C" int scratchy_cuda_moe_route_bf16_prepare(void) {
+    cudaFuncAttributes attr;
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_route_bf16_ker<QWEN_EXPERTS, false>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_route_bf16_ker<GEMMA_EXPERTS_SMALL, true>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_route_bf16_ker<GEMMA_EXPERTS_LARGE, true>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    return 0;
+}
+
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t
 // cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the runtime's last-error
@@ -223,8 +242,9 @@ int launch(const globals_of<EXPERTS, GEMMA_PROGRAM>& G, uint32_t m, cudaStream_t
 // 128 or 256 (`op_abi::MOE_EXPERT_COUNTS`) and a non-null `expert_scale`; all are checked before
 // any pointer is touched. `logits` is `[m, experts]` bf16, `expert_scale` (Gemma's; null for Qwen)
 // `[experts]` bf16, `topk_idx` `[m, top_k]` i32 and `scores` `[m, top_k]` f32, the two outputs
-// overlapping nothing. `renorm` is the Qwen program's; `scale` (`hidden^-0.5`) the Gemma
-// program's. No shared memory, so no one-time setup. The launch is asynchronous on `stream`.
+// overlapping nothing. `renorm` is the Qwen program's; `scale` (`hidden^-0.5`) the Gemma program's.
+// No shared memory, so its one-time setup (`_prepare`, in `PREPARE`) only loads it. The launch is
+// asynchronous on `stream`.
 extern "C" int scratchy_cuda_moe_route_bf16(const void* logits, const void* expert_scale,
                                             void* topk_idx, void* scores, uint32_t m,
                                             uint32_t experts, uint32_t top_k, uint32_t renorm,

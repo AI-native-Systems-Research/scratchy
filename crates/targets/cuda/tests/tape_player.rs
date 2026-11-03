@@ -4562,3 +4562,208 @@ fn gemma_attn_two_classes_share_the_pool() {
         "the two-class chain is out of bound, or the classes overlap in the pool"
     );
 }
+
+// ── #1048: each bucket's tape replayed as a CUDA Graph ─────────────
+
+/// What a forward of one worker leaves behind: the result, and the KV pool's K and V and the GDN
+/// state pool's slots when the worker has them, as bits.
+type Leaves = (Vec<u16>, Vec<Vec<u16>>, Vec<Vec<u32>>);
+
+/// One forward to play two ways: a worker's tapes, weights and pools, the bucket, and its input.
+struct Case<'a> {
+    tapes: &'static [CudaTape],
+    table: &'a [DeviceBuffer],
+    pools: (Option<KvPoolConfig>, Option<GdnPoolConfig>),
+    bucket: usize,
+    x: Vec<u16>,
+    positions: Vec<u32>,
+    kv: Option<KvSequence<'a>>,
+    gdn: Option<GdnSequence>,
+}
+
+/// The case's forward on a fresh worker, as the bucket's graph (`launched` false) or as its
+/// per-launch play (`launched` true); then what it leaves. Asserts the forward allocates nothing.
+fn played(device: &CudaDevice, c: &Case<'_>, launched: bool) -> Leaves {
+    let (kv_pool, gdn_pool) = c.pools;
+    let mut worker = CudaWorker::new(device, c.tapes, c.table, kv_pool, gdn_pool).expect("worker");
+    let mut y = vec![0u16; c.tapes[c.bucket].result.bytes as usize / 2];
+    let (x, pos, kv, gdn) = (
+        Input::Hidden(&c.x),
+        &c.positions,
+        c.kv.as_ref(),
+        c.gdn.as_ref(),
+    );
+    let before = device.allocations();
+    let run = match launched {
+        true => worker.forward_launched(c.bucket, x, pos, kv, gdn, &mut y),
+        false => worker.forward(c.bucket, x, pos, kv, gdn, &mut y),
+    };
+    run.expect("the forward");
+    assert_eq!(device.allocations(), before, "a forward allocates nothing");
+    let cache = match kv_pool {
+        Some(_) => [KvHalf::K, KvHalf::V]
+            .into_iter()
+            .flat_map(|h| read_pool(&mut worker, h))
+            .collect(),
+        None => Vec::new(),
+    };
+    let state = match gdn_pool {
+        Some(_) => gdn_snapshot(&mut worker),
+        None => Vec::new(),
+    };
+    (y, cache, state)
+}
+
+/// #1048's first criterion, on one bucket of each tape family the fixtures hold (the MLP block,
+/// the attention layer and its KV cache, the GDN layer and its state, the MoE block, Gemma's MoE
+/// block): the forward replayed as the bucket's CUDA Graph is bit-identical to the same forward
+/// launched step by step, in its result, its KV cache and its GDN state, and allocates nothing.
+/// The graph records the same launches with the same arguments, so no bit may differ.
+#[test]
+fn a_graph_replay_is_the_per_launch_forward_bit_for_bit() {
+    let device = h100();
+    let mlp_w = mlp_table(&device, &mlp_weights());
+    let layer_w = layer_table(&device, &layer_weights());
+    let gdn_w = gdn_table(&device, &gdn_weights());
+    let moe_w = moe_table(&device, &moe_weights());
+    let block_table = [11u32, 3, 14, 0];
+    let m_layer = LAYER_BUCKETS[1].bucket_m as usize;
+    let m_gdn = GDN_BUCKETS[1].bucket_m as usize;
+    let moe_tapes = moe_buckets();
+    let cases = [
+        (
+            "the MLP block, m=256",
+            Case {
+                tapes: &MLP_BUCKETS,
+                table: &mlp_w,
+                pools: (None, None),
+                bucket: 1,
+                x: mlp_input(256),
+                positions: Vec::new(),
+                kv: None,
+                gdn: None,
+            },
+        ),
+        (
+            "the attention layer and its KV cache, m=256",
+            Case {
+                tapes: &LAYER_BUCKETS,
+                table: &layer_w,
+                pools: (POOL, None),
+                bucket: 1,
+                x: layer_input(m_layer, 0x1048),
+                positions: seq_positions(m_layer, 0),
+                kv: Some(KvSequence {
+                    block_table: &block_table[..m_layer / 64],
+                    prefix_len: 0,
+                    q_len: m_layer as u32,
+                }),
+                gdn: None,
+            },
+        ),
+        (
+            "the GDN layer and its state, m=256",
+            Case {
+                tapes: &GDN_BUCKETS,
+                table: &gdn_w,
+                pools: (None, GDN_POOL),
+                bucket: 1,
+                x: gdn_input(m_gdn, 0x1048),
+                positions: Vec::new(),
+                kv: None,
+                gdn: Some(GdnSequence {
+                    slot: 1,
+                    q_len: m_gdn as u32,
+                    fresh: true,
+                }),
+            },
+        ),
+        (
+            "the MoE block, gathered (m=1) and sorted (m=512)",
+            Case {
+                tapes: moe_tapes,
+                table: &moe_w,
+                pools: (None, None),
+                bucket: 1,
+                x: moe_x(Routing::Random, moe_tapes[1].bucket_m as usize, 0x1048),
+                positions: Vec::new(),
+                kv: None,
+                gdn: None,
+            },
+        ),
+        (
+            "the MoE block, m=1",
+            Case {
+                tapes: moe_tapes,
+                table: &moe_w,
+                pools: (None, None),
+                bucket: 0,
+                x: moe_x(Routing::Random, 1, 0x1049),
+                positions: Vec::new(),
+                kv: None,
+                gdn: None,
+            },
+        ),
+    ];
+    let mut pass = true;
+    for (what, case) in &cases {
+        let (graph, launched) = (played(&device, case, false), played(&device, case, true));
+        let result = mismatched_bits(&graph.0, &launched.0);
+        let cache: usize = (graph.1.iter().zip(&launched.1))
+            .map(|(g, l)| mismatched_bits(g, l))
+            .sum();
+        let state = (graph.2.iter().zip(&launched.2))
+            .map(|(g, l)| g.iter().zip(l).filter(|(a, b)| a != b).count())
+            .sum::<usize>();
+        let ok = result == 0 && cache == 0 && state == 0;
+        eprintln!(
+            "graph against per-launch, {what}: result mismatched_bits={result} cache \
+             mismatched_bits={cache} gdn state mismatched_words={state} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "a graph replay differs from its per-launch forward: see the lines above"
+    );
+}
+
+/// A launcher's shape refusal now surfaces when the worker records its graphs, as
+/// `WorkerError::Launch`, naming the bucket and the step, instead of at a forward. A one-row tape
+/// whose GEMV has a `k` the launcher refuses (`k` = 4: `validate` checks the spans, not the GEMV's
+/// 8-wide vector), and nothing runs.
+#[test]
+fn a_launcher_refusal_is_a_worker_error_at_construction() {
+    let device = h100();
+    static BAD: std::sync::OnceLock<[CudaTape; 1]> = std::sync::OnceLock::new();
+    let tapes = BAD.get_or_init(|| {
+        let mut t = whole_arena_tape(4096);
+        t.steps = Box::leak(Box::new([CudaStep::Gemv(
+            scratchy_target_cuda::step::GemmBf16 {
+                a: ArenaOffset(0),
+                b: WeightIx(0),
+                c: ArenaOffset(1024),
+                m: 1,
+                n: 8,
+                k: 4,
+            },
+        )]));
+        t.weight_bytes = Box::leak(Box::new([64]));
+        [t]
+    });
+    let table = [DeviceBuffer::upload(&device, &[0u16; 32]).expect("upload W")];
+    let got = CudaWorker::new(&device, tapes, &table, None, None).err();
+    eprintln!("a refused GEMV at worker build: {got:?}");
+    assert!(
+        matches!(
+            got,
+            Some(WorkerError::Launch {
+                bucket: 0,
+                step: 0,
+                error: scratchy_target_cuda::kernels::KernelError::GemvShape { n: 8, k: 4 },
+            })
+        ),
+        "{got:?}"
+    );
+}

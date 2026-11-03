@@ -53,8 +53,8 @@
 //
 // Shared memory: at rot_dim 64, 4 stages × 2 KiB and the table's 2 KiB box, plus 1,024 bytes of
 // alignment slack = 11,264 bytes; at rot_dim 256, 2 stages × 8 KiB and the table's 8 KiB, plus the
-// slack = 25,600 bytes. Both are dynamic shared memory under the 48 KiB default, so no one-time
-// setup.
+// slack = 25,600 bytes. Both are dynamic shared memory under the 48 KiB default, so its one-time
+// setup (`_prepare`, in `PREPARE`) only loads it.
 //
 // Gemma 4's global layers (#885's 13b-3) rotate 128 of each 512-lane head in the half-head
 // pairing (HF `_compute_proportional_rope_parameters`, metal's `ROPE_PAIR_OFF = HEAD_DIM/2`):
@@ -274,6 +274,25 @@ int launch_rope(bf16* xp, bf16* tp, bf16* op, uint32_t rows, uint32_t cols, uint
 constexpr uint32_t PAIRING_HALF_ROTATED = 0;
 constexpr uint32_t PAIRING_HALF_HEAD = 1;
 
+// The kernel's one-time setup, run once per device by `kernels::prepare_all` (`CudaDevice::open`):
+// query its attributes (`cudaFuncGetAttributes`), which loads its module, so a worker's graph
+// capture (`CudaWorker::new`) never loads a kernel mid-capture. It changes nothing on the device.
+//
+// 0 = done; any other value = the cudaError_t of the first query that failed.
+extern "C" int scratchy_cuda_rope_bf16_prepare(void) {
+    cudaFuncAttributes attr;
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, rope_bf16_ker<64, false>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, rope_bf16_ker<256, false>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, rope_bf16_ker<128, true>); e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    return 0;
+}
+
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value =
 // the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
@@ -286,8 +305,9 @@ constexpr uint32_t PAIRING_HALF_HEAD = 1;
 // already is); a half-head `head_dim` not 512, the instantiation's head; `cols` not a multiple of
 // `head_dim`; `rows · cols` above INT_MAX. `x`, `table` and `out` must be 16-byte-aligned device
 // pointers to `rows·cols`, `rows·rot_dim` and `rows·cols` bf16, `out` overlapping neither input.
-// Its dynamic shared memory is under the 48 KiB default, so no one-time setup. The launch is
-// asynchronous on `stream`; the caller owns it and synchronizes.
+// Its dynamic shared memory is under the 48 KiB default, so its one-time setup (`_prepare`, in
+// `PREPARE`) only loads it. The launch is asynchronous on `stream`; the caller owns it and
+// synchronizes.
 extern "C" int scratchy_cuda_rope_paired_bf16(const void* x, const void* table, void* out,
                                               uint32_t rows, uint32_t cols, uint32_t head_dim,
                                               uint32_t rot_dim, uint32_t pairing,

@@ -2167,3 +2167,54 @@ fn k_regime_quarter_qk_norm_gains_decode_against_one_shot() {
     );
     assert!(pass, "a decode gave a non-finite logit");
 }
+
+/// [`forward`] with each step launched one by one ([`CudaWorker::forward_launched`]), for (s).
+fn forward_launched(
+    worker: &mut CudaWorker<'_>,
+    m: u32,
+    rows: &[u32],
+    prefix_len: u32,
+    seat: Seat,
+) -> Result<Vec<u16>, ForwardError> {
+    let b = bucket(m);
+    let tape = &CUDA_TAPES[b];
+    let kv = KvSequence {
+        block_table: seat.blocks,
+        prefix_len,
+        q_len: rows.len() as u32,
+    };
+    let mut out = vec![0u16; tape.result.bytes as usize / 2];
+    worker.forward_launched(
+        b,
+        Input::TokenIds(&padded(tape, rows)),
+        &positions(tape, prefix_len),
+        Some(&kv),
+        None,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// (s): the bucket's graph replay ([`CudaWorker::forward`]) against each step launched one by one
+/// ([`CudaWorker::forward_launched`]) on the real tapes, #1048: a fresh 300-token prefill in the
+/// m=512 bucket, then one decode in the m=1 bucket, the graph's in [`SEAT_A`] and the launches'
+/// in [`SEAT_B`]. Both real rows of both buckets are the same, bit for bit.
+#[test]
+fn s_a_graph_replay_is_the_per_launch_forward_bit_for_bit() {
+    let r = rig();
+    let mut worker = r.worker();
+    let rows = sequence_rows((Q + 1) as usize);
+    let (prefill, decode) = rows.split_at(Q as usize);
+    let mut ok = true;
+    for (m, rows, prefix_len) in [(512, prefill, 0), (1, decode, Q)] {
+        let graph = forward(&mut worker, m, rows, prefix_len, SEAT_A).expect("the graph replay");
+        let launched = forward_launched(&mut worker, m, rows, prefix_len, SEAT_B)
+            .expect("the per-launch forward");
+        ok &= bit_identical(
+            &format!("(s) graph against per-launch, m={m}"),
+            real(&graph, rows.len()),
+            real(&launched, rows.len()),
+        );
+    }
+    assert!(ok, "a graph replay differs from the per-launch forward");
+}

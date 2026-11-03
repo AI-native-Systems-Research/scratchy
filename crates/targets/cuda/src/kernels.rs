@@ -5,10 +5,10 @@
 //! dimensions and a stream. This module declares them and wraps each in a typed function. It does
 //! not choose how memory or streams are managed: the pointers and the stream are the caller's.
 //!
-//! A kernel whose launch needs a one-time setup (a function attribute such as its dynamic shared
-//! memory size) also exposes a `_prepare` function, listed in [`PREPARE`]. [`prepare_all`] runs
-//! them once, when the device is opened (`runtime::CudaDevice::open`); a launcher never repeats
-//! that setup.
+//! Every kernel also exposes a `_prepare` function, listed in [`PREPARE`]: it sets the kernel's
+//! function attributes (its dynamic shared memory size) or, for a kernel with none, only loads it,
+//! so a worker's graph capture never loads a kernel. [`prepare_all`] runs them once, when the device
+//! is opened (`runtime::CudaDevice::open`); a launcher never repeats that setup.
 
 use std::ffi::c_void;
 use std::fmt;
@@ -22,6 +22,19 @@ const ERR_SHAPE: i32 = -1;
 const ERR_HOST: i32 = -2;
 
 unsafe extern "C" {
+    // The kernels with no attribute to set: each `_prepare` only loads its kernels (#1048), so a
+    // worker's graph capture never loads one mid-capture.
+    fn scratchy_cuda_embed_bf16_prepare() -> i32;
+    fn scratchy_cuda_gate_split_bf16_prepare() -> i32;
+    fn scratchy_cuda_gdn_conv1d_prepare() -> i32;
+    fn scratchy_cuda_gdn_gating_prepare() -> i32;
+    fn scratchy_cuda_gdn_rms_norm_gated_prepare() -> i32;
+    fn scratchy_cuda_gdn_scan_prepare() -> i32;
+    fn scratchy_cuda_kv_append_bf16_prepare() -> i32;
+    fn scratchy_cuda_moe_combine_bf16_prepare() -> i32;
+    fn scratchy_cuda_moe_route_bf16_prepare() -> i32;
+    fn scratchy_cuda_moe_sort_prepare() -> i32;
+    fn scratchy_cuda_rope_bf16_prepare() -> i32;
     fn scratchy_cuda_embed_bf16(
         tokens: *const c_void,
         table: *const c_void,
@@ -617,8 +630,9 @@ impl fmt::Display for KernelError {
 
 impl std::error::Error for KernelError {}
 
-/// Every kernel's one-time setup, by kernel name: a later kernel with a setup of its own adds one
-/// row.
+/// Every kernel's one-time setup, by kernel name: a later kernel adds one row. A kernel with an
+/// attribute to set (its dynamic shared memory) sets it; every other kernel's setup only loads it,
+/// so every kernel any tape launches is loaded before a worker captures its graphs.
 const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gemm_bf16_abt", scratchy_cuda_gemm_bf16_abt_prepare),
     (
@@ -656,14 +670,31 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
         scratchy_cuda_expert_gemm_e128_col64_bf16_prepare,
     ),
     ("expert_gemv_bf16", scratchy_cuda_expert_gemv_bf16_prepare),
+    // Load-only (#1048): these set no attribute, but a worker captures its tapes into CUDA Graphs
+    // at construction, and a kernel the runtime has not loaded must not first load during a
+    // capture. Every kernel a tape can launch is loaded here, when the device opens.
+    ("embed_bf16", scratchy_cuda_embed_bf16_prepare),
+    ("gate_split_bf16", scratchy_cuda_gate_split_bf16_prepare),
+    ("gdn_conv1d", scratchy_cuda_gdn_conv1d_prepare),
+    ("gdn_gating", scratchy_cuda_gdn_gating_prepare),
+    (
+        "gdn_rms_norm_gated",
+        scratchy_cuda_gdn_rms_norm_gated_prepare,
+    ),
+    ("gdn_scan", scratchy_cuda_gdn_scan_prepare),
+    ("kv_append_bf16", scratchy_cuda_kv_append_bf16_prepare),
+    ("moe_combine_bf16", scratchy_cuda_moe_combine_bf16_prepare),
+    ("moe_route_bf16", scratchy_cuda_moe_route_bf16_prepare),
+    ("moe_sort", scratchy_cuda_moe_sort_prepare),
+    ("rope_bf16", scratchy_cuda_rope_bf16_prepare),
 ];
 
 /// Run every kernel's one-time setup on the current device, stopping at the first failure, which
 /// names its kernel. Every launch on that device needs it to have succeeded first.
 pub fn prepare_all() -> Result<(), (&'static str, KernelError)> {
     for &(kernel, prepare) in PREPARE {
-        // SAFETY: a prepare function takes no argument, only sets attributes of its own kernel on
-        // the current device, and returns a `cudaError_t`.
+        // SAFETY: a prepare function takes no argument, only sets or queries attributes of its own
+        // kernels on the current device, and returns a `cudaError_t`.
         match unsafe { prepare() } {
             0 => {}
             code => return Err((kernel, KernelError::Cuda(code))),
@@ -690,7 +721,7 @@ fn check(code: i32, shape: KernelError) -> Result<(), KernelError> {
 /// Refused with [`KernelError::EmbedShape`], before any pointer is touched, unless `rows`,
 /// `hidden` and `vocab` are non-zero and at most `i32::MAX`, `hidden` a multiple of 8
 /// (`step::EMBED_BF16_COLS`), and `rows · hidden` at most `i32::MAX`. A failed launch returns the
-/// launch's own `cudaError_t`. No one-time setup, so it is not in [`PREPARE`].
+/// launch's own `cudaError_t`. Its one-time setup in [`PREPARE`] only loads the kernel.
 ///
 /// # Safety
 ///
@@ -1611,7 +1642,7 @@ pub unsafe fn attn_decode_d512_bf16(
 // THE GDN KERNELS. Four launches make one `GatedDeltaNet` step, in this order on one stream, each
 // reading `[slot, q_len, start, 0]` u32 from `sequence` (`start` 1 on a sequence's first chunk, 0
 // to continue from its slot) and touching only the `q_len` real rows. Each is a ThunderKittens
-// kernel with under 48 KiB of static shared memory, so none is in `PREPARE`.
+// kernel with under 48 KiB of static shared memory; each one's setup in `PREPARE` only loads it.
 
 /// Launch the GDN causal depthwise conv1d, then SiLU: `conv_out[t, c]` (f32) for the real rows of
 /// `x [rows, conv_dim]` (bf16) under the taps `w [conv_dim, kernel]` (f32), the rows before 0 the
@@ -1961,8 +1992,8 @@ pub struct SortRegions {
 /// `op_abi::MOE_EXPERT_COUNTS` (128, 256), `top_k` in `1..=32`, `hidden` a non-zero multiple of 8, `m ·
 /// top_k` and `m · hidden` at most `i32::MAX`, and `max_tiles` at least `tape::moe_tiles`' bound
 /// with `max_tiles · 128 · hidden` at most `i32::MAX`. A failed launch returns the first failing
-/// launch's own `cudaError_t`, the ones after it not launched. No one-time setup, so it is not in
-/// [`PREPARE`].
+/// launch's own `cudaError_t`, the ones after it not launched. Its one-time setup in [`PREPARE`]
+/// only loads its three kernels.
 ///
 /// # Safety
 ///
