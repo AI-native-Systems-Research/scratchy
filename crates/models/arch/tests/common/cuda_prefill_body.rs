@@ -1439,9 +1439,12 @@ fn report(what: &str, step: usize, got: &Snapshot, want: &Snapshot) -> f64 {
 /// GDN layer's conv ring and recurrent state, and the logits. The one-shot of 301 + i tokens is
 /// checked bit-identical, on its last row, to row 300 + i of one 308-token forward, so it is the
 /// one-shot trajectory (k) compares against. Asserted: every value finite, the references
-/// bit-identical, and every teacher-forced decode's logits at cosine ≥ the model's
-/// `TEACHER_FORCED_DECODE_COSINE` (one step's difference, which is (k)'s criterion for one step);
-/// the chain's numbers are printed.
+/// bit-identical, every teacher-forced decode's logits at cosine ≥ the model's
+/// `TEACHER_FORCED_DECODE_COSINE` (one step's difference, which is (k)'s criterion for one step),
+/// and the chain's first step whose greedy token is not the one-shot row's at a near-tie (that
+/// row's top-1 − top-2 margin at most twice the step's max |difference|, P5's and P7's rule; the
+/// user's decision (c), 2026-11-03). The chain's cosines are printed, not gated: each step reads
+/// what earlier decodes wrote, so after the first divergence it follows another trajectory.
 #[test]
 fn k_diag_decode_drift_against_one_shot() {
     let r = rig();
@@ -1461,6 +1464,8 @@ fn k_diag_decode_drift_against_one_shot() {
     // The chain.
     forward(&mut worker, 512, &rows[..Q as usize], 0, SEAT_A).expect("the prefill");
     let mut chain_cos = Vec::new();
+    // The chain's first step whose token is not the one-shot's: (position, near-tie).
+    let mut first_divergence: Option<(usize, bool)> = None;
     for i in 0..DECODES as usize {
         let p = Q as usize + i;
         scan.print(&mut worker, "(k-diag chain)", (rows[p], p), &mut |w| {
@@ -1471,8 +1476,20 @@ fn k_diag_decode_drift_against_one_shot() {
         let got = snapshot(&mut worker, SEAT_A, p, logits);
         let want = reference(&mut worker, i);
         refs_identical &= want.logits[..] == one_shot[p * VOCAB..][..VOCAB];
+        let (token, _) = top1_margin(&got.logits);
+        let (want_token, margin) = top1_margin(&want.logits);
+        let diff = max_diff(&got.logits, &want.logits);
+        if token != want_token && first_divergence.is_none() {
+            first_divergence = Some((p, margin <= 2.0 * diff));
+        }
         chain_cos.push(report("chain", i, &got, &want));
     }
+    let divergence_ok = first_divergence.is_none_or(|(_, tie)| tie);
+    eprintln!(
+        "(k-diag) chain: first step whose token differs from the one-shot's (position, near-tie \
+         when the one-shot margin <= 2 x max|diff|)={first_divergence:?} {}",
+        verdict(divergence_ok)
+    );
     // Teacher-forced: each decode one step off the one-shot trajectory.
     let mut forced_cos = Vec::new();
     for i in 0..DECODES as usize {
@@ -1503,6 +1520,11 @@ fn k_diag_decode_drift_against_one_shot() {
     assert!(
         forced_ok,
         "a teacher-forced decode is below cosine {TEACHER_FORCED_DECODE_COSINE}: one step is wrong"
+    );
+    assert!(
+        divergence_ok,
+        "the chain first picks another token than the one-shot row where that row is not a \
+         near-tie"
     );
 }
 

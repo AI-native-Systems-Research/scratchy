@@ -38,16 +38,22 @@ const HIDDEN: usize = 2048;
 const WEIGHTS: u64 = 523;
 /// The worker's arena: the largest tape's, m=4096 (`cuda_tapes_35b`'s `ARENAS`).
 const ARENA: u64 = 3_617_371_392;
-/// (k) teacher-forced's and (n)'s floor, 0.94 for this MoE model on synthetic weights (the user's
-/// 2026-10-26 decision, #859). Measured at `c5900496`: (k) teacher-forced 0.954839–0.996322, (n)
-/// 0.975492 at P = 319 and 0.951564 at P = 320. No kernel is wrong (#859's diagnosis, pod
-/// `35b-diag`): the decode attention adds keys past 64 in another order than the prefill, within
-/// its bound, and on synthetic weights the router's scores are nearly flat, so that difference
-/// swaps the 8th and 9th experts, each swap moving the hidden state by a whole expert. 0.94 leaves
-/// 0.0116 below the worst value. The real checkpoint's decode stays gated at 0.999 (P8's own row).
-const TEACHER_FORCED_DECODE_COSINE: f64 = 0.94;
-/// (n)'s floor: as [`TEACHER_FORCED_DECODE_COSINE`].
-const BOUNDARY_DECODE_COSINE: f64 = 0.94;
+/// (k) teacher-forced's floor for this MoE model on synthetic weights (#859, the user's 2026-10-26
+/// decision; re-derived 2026-11-03, the user's decision (c), after #1031's GEMV order change). No
+/// kernel is wrong (#859's diagnosis, pod `35b-diag`): the decode attention adds keys past 64 in
+/// another order than the prefill, within its bound, and on synthetic weights the router's scores
+/// are nearly flat, so that difference swaps the 8th and 9th experts, each swap moving the hidden
+/// state by a whole expert. #1031's decode GEMV adds its products in another order than the
+/// prefill GEMM, within the GEMV bound, so every decode projection now differs from the prefill's
+/// by last bits too, and more such swaps happen (`/tmp/v1031rw-diag.md`). Re-derived from the
+/// measurement: the worst value at the rework on the H100, 0.934604 at (k) 303, minus 0.01, gives
+/// 0.92 (it was 0.94 from 0.954839 at `c5900496`). The real checkpoint's decode stays gated at
+/// 0.999 against CUDA's own one-shot and HF-f32's rule (P8's own row), and its routing by P9.
+const TEACHER_FORCED_DECODE_COSINE: f64 = 0.92;
+/// (n)'s floor, as [`TEACHER_FORCED_DECODE_COSINE`] (re-derived 2026-11-03, the user's decision
+/// (c), after #1031's GEMV order change): the worst value at the rework on the H100, 0.911852 at
+/// P = 320, minus 0.01, gives 0.90 (it was 0.94 from 0.951564).
+const BOUNDARY_DECODE_COSINE: f64 = 0.90;
 
 // ── Diagnostic: where a teacher-forced decode leaves the one-shot row (#859) ──
 
