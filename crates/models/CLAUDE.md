@@ -1,12 +1,12 @@
 # crates/models — model crates: arch, quantization, spec, vision
 
 ## OVERVIEW
-Four crates; `arch/` has its own AGENTS.md. This file covers the map plus `quantization/`, `spec/`, `vision/`.
+Four crates; `arch/` has its own CLAUDE.md. This file covers the map plus `quantization/`, `spec/`, `vision/`.
 
 ## WHERE TO LOOK
 | Crate (dir) | Role |
 |-------------|------|
-| `scratchy-models` (arch/) | see `arch/AGENTS.md` |
+| `scratchy-models` (arch/) | see `arch/CLAUDE.md` |
 | `scratchy-quantizations` (quantization/) | presets + quant layer types + GGUF |
 | `scratchy-spec` (spec/) | doc-only lib; feature `mtp = ["scratchy-models/mtp"]` |
 | `scratchy-vision` (vision/) | pure-CPU vision-tower host glue (rope, pos-embed interp, preprocess) |

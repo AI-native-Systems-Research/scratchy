@@ -2,8 +2,7 @@
 
 ## OVERVIEW
 CUDA runtime: GPU tensor/device types, kernel FFI wrappers, layers, the `InstructionEval`
-interpreter, serving worker, and the GPU cost profiles the cuda ISel solver reads. It earned its
-own file because it's the largest single-crate domain (~58k LOC in `src/`, 3 workspace crates here).
+interpreter, serving worker, and the GPU cost profiles the cuda ISel solver reads. 3 workspace crates live here.
 
 ## STRUCTURE
 ```
@@ -11,17 +10,17 @@ cuda/
 ├── build.rs      # LINK only: emits cfg(fa3_built) + rustc-link-lib for the kernel .a files
 ├── builder/      # scratchy-builder-cuda: COMPILE only (nvcc via cudaforge); no runtime code
 ├── cost-sweep/   # scratchy-cost-sweep-cuda: bin gpu_cost_sweep -> profiles/*.csv
-├── csrc/         # CUDA C++ kernels (see csrc/AGENTS.md)
-├── profiles/     # cost_{h100_sm90,l40s_sm89,l4_sm89}.csv (solver CostTable input)
+├── csrc/         # CUDA C++ kernels (see csrc/CLAUDE.md)
+├── profiles/     # per-GPU cost CSVs (solver CostTable input)
 ├── src/          # crate source; lib.rs is the only entry
-└── tests/        # nvidia_smi_round_trip.rs, spyre_weight_load.rs (self-skip without hw/cache)
+└── tests/        # integration tests (self-skip without hw/cache)
 ```
 
 ## WHERE TO LOOK
 | Task | Location |
 |------|----------|
 | New op's cuda arm | `src/eval.rs` (`InstructionEval` match) |
-| Kernel FFI wrapper | `src/kernels.rs` (13.6k LOC, one wrapper per `extern "C"` launcher) |
+| Kernel FFI wrapper | `src/kernels.rs` (one wrapper per `extern "C"` launcher) |
 | Graph capture/replay, bucket pick, SWA/GDN | `src/cuda_worker.rs` (7.5k) |
 | MoE / quant layers | `src/layers_moe.rs`, `src/layers_quant.rs`, `src/weights_quant.rs` |
 | GPU profile select (`SCRATCHY_GPU`) | `src/targets.rs` (`ALL`, `for_name`, `detect`) |

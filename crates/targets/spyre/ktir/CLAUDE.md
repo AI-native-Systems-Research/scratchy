@@ -1,7 +1,7 @@
 # ktir/ — KTIR toolchain (4 crates)
 
 ## OVERVIEW
-KTIR = Spyre's tile IR: built as const data by `#[forward]`, then interpreted (emulator), rewritten (optimizer), or lowered to SuperDSC JSON (superdsc). Earned its file because of the 4-crate dependency graph plus ktir-core (score ~12; core is too small for its own file).
+KTIR = Spyre's tile IR: built as const data by `#[forward]`, then interpreted (emulator), rewritten (optimizer), or lowered to SuperDSC JSON (superdsc). This file also covers ktir-core, which has none of its own.
 
 ## STRUCTURE
 ```
@@ -22,7 +22,7 @@ Dependency direction is load-bearing: superdsc and optimizer must never reach th
 | Affine maps/sets, symbolic bounds | `ktir-core/src/affine.rs` |
 | Op kind enum, attr keys | `ktir-core/src/opkind.rs`, `attrkey.rs` |
 | Fast hashing | `ktir-core/src/fxhash.rs` (`FxHashMap`, used everywhere instead of std HashMap) |
-| Per-crate detail | `ktir-emulator/AGENTS.md`, `ktir-optimizer/AGENTS.md`, `ktir-superdsc/AGENTS.md` |
+| Per-crate detail | `ktir-emulator/CLAUDE.md`, `ktir-optimizer/CLAUDE.md`, `ktir-superdsc/CLAUDE.md` |
 
 ## CONVENTIONS
 - KTIR is **constructed, never parsed**. The affine text parser was deleted from ktir-core; don't bring back a text front door.

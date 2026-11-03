@@ -2,7 +2,7 @@
 
 ## OVERVIEW
 The only producer of the spliced op kinds for the spyre target. It maps each `scratchy-subtile` `SubOp` to a kernel in `crates/targets/spyre/kernels/*.py` and compiles it through the ladder.
-Earned its file: the entry from the spyre target into the ladder; the whole crate is one 2.8k-LOC `src/lib.rs` (score ~14, distinct domain).
+The entry from the spyre target into the ladder; the whole crate is one `src/lib.rs`.
 
 ## WHERE TO LOOK
 | Task | Location (src/lib.rs) |

@@ -3,7 +3,7 @@
 ## OVERVIEW
 Triton `.py` kernel -> TTIR -> KTIR -> SuperDSC, all pure Rust, plus the splice that feeds
 the spyre target. Re-hosted from triton-spyre; `PROVENANCE.md` is the authority on origin and copy rules.
-Earned its file: 5 workspace crates + shared test data, cross-crate rules no single crate states.
+Covers 5 workspace crates + shared test data, and the cross-crate rules no single crate states.
 
 ## STRUCTURE
 ```

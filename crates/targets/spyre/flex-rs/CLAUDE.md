@@ -1,7 +1,7 @@
 # crates/targets/spyre/flex-rs — `flex-rs` (lib `flex_rs`)
 
 ## OVERVIEW
-Native Rust port of the flex C++ allocator/runtime-stream/scheduler slice (134 types / 320 fns / 17 ABI entrypoints) that scratchy's card path needs; ~31k LOC. Earned its file: standalone crate (own version, edition 2024, own `Cargo.lock`), the spyre tree's only working build script (builder/'s is a no-op), and the only FFI boundary to hardware.
+Native Rust port of the flex C++ allocator/runtime-stream/scheduler slice that scratchy's card path needs. A standalone crate (own version, edition 2024, own `Cargo.lock`), the spyre tree's only working build script (builder/'s is a no-op), and the only FFI boundary to hardware.
 
 ## WHERE TO LOOK
 | Task | Location |
@@ -9,7 +9,7 @@ Native Rust port of the flex C++ allocator/runtime-stream/scheduler slice (134 t
 | Every `extern "C"` against senlib + safe handle wrappers | `src/senlib_ffi.rs` |
 | C++ side of that boundary (compiled by build.rs, C++20) | `cxx-shim/senlib_ffi.cpp` |
 | Boundary rationale / provenance ledger | `SENLIB_BOUNDARY.md`, `SENLIB_BOUNDARY_telemetry.md` |
-| Scheduler port (Pf/Vf/Mock, `ResponseWorker`, backpressure, `HardwareSubmit` seam) | `src/scheduler.rs` (8.1k LOC) |
+| Scheduler port (Pf/Vf/Mock, `ResponseWorker`, backpressure, `HardwareSubmit` seam) | `src/scheduler.rs` |
 | Cross-stream RAW/WAR hazard DAG | `src/scheduler/hazards.rs` (`HazardTracker`) |
 | CB completion verdict + capability tokens | `src/scheduler/completion.rs` (`CbRetired`, `QuarantinedBuf`, `cb_verdict`) |
 | Wire format / SBF encoding | `src/control_block_wire.rs`, `src/control_blocks.rs` |

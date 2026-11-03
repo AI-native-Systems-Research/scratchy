@@ -1,17 +1,17 @@
 # scratchy-serving-api
 
 ## OVERVIEW
-Front door: axum OpenAI/Anthropic/Responses server (`serve`), in-process `LLM` for `scr chat`, stack init, tokenizer/detokenizer, chat templates, tool/reasoning parsers. Score ~25 (29 files, ~33k LOC, the highest centrality in serving).
+Front door: axum OpenAI/Anthropic/Responses server (`serve`), in-process `LLM` for `scr chat`, stack init, tokenizer/detokenizer, chat templates, tool/reasoning parsers.
 
 ## WHERE TO LOOK
 | Task | File |
 |------|------|
 | Routes (/v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models, /health) | `server.rs` (`build_router`, `AppState`) |
 | /v1/messages (Anthropic) | `anthropic.rs`; /v1/responses: `responses.rs` |
-| Request lifecycle validate->tokenize->submit->poll->detokenize | `engine.rs` (`AsyncEngine`, 8.4k LOC) |
+| Request lifecycle validate->tokenize->submit->poll->detokenize | `engine.rs` (`AsyncEngine`) |
 | Stack wiring worker->executor->engine, budget triage, KV dtype | `init.rs` (`initialize_stack`, `VllmConfig`) |
 | Offline/in-process API (mirrors `vllm.LLM`) | `llm.rs` |
-| Per-model tool-call stream parsing | `tool_parser.rs` (5.2k LOC, 116 tests) |
+| Per-model tool-call stream parsing | `tool_parser.rs` |
 | `<think>` splitting | `reasoning_parser.rs` |
 | HF Jinja compat on minijinja | `chat_template.rs` + `chat_template/` (`tojson.rs` = CPython json.encoder port) |
 | RAG (`rag` feature) | `augment/` (leann-core HNSW, spnl-core Query IR) |

@@ -1,7 +1,7 @@
 # ktir-superdsc — KTIR -> SuperDSC (SDSC) lowering
 
 ## OVERVIEW
-Featureless leaf crate that lowers KTIR to the SuperDSC JSON wire format for the Spyre card. Third-party producers (IBM/triton-spyre) consume it without scratchy. Score ~22 (huge, Kani proofs, 48 law tests, external consumers).
+Featureless leaf crate that lowers KTIR to the SuperDSC JSON wire format for the Spyre card. Third-party producers (IBM/triton-spyre) consume it without scratchy. Kani proofs and law tests guard it.
 
 ## STRUCTURE
 ```
@@ -9,8 +9,8 @@ src/addr/       typed addressing: Nest, Win, View, DevOff (the only stride math)
 src/emit/       per-node + whole-function lowering, pointwise/reduce assemblers
 src/ir/island/  stable IR data: TileOp (+Kani proofs), TiledOp
 src/ir/bridge/  translations: tile_op_tiled_op (tiler), tiled_op_sdsc_op/ (Bridge 3: attn, matmul/, pointwise, reduce, rmsnorm), span_overflow
-src/sdsc_abstract.rs   ~11k LOC compile-time attention interpreter + Kani harnesses
-tests/          48 zz_* law tests; fixtures/ = vendor JSON goldens
+src/sdsc_abstract.rs   compile-time attention interpreter + Kani harnesses
+tests/          zz_* law tests; fixtures/ = vendor JSON goldens
 ```
 
 ## WHERE TO LOOK

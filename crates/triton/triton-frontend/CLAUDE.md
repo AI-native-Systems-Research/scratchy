@@ -2,12 +2,12 @@
 
 ## OVERVIEW
 Owned, dependency-free compile of `@triton.jit` source to `ttir::Module`, diffed against real Triton's `make_ir`.
-Earned its file: ~10k LOC, the most-imported crate on the ladder (score ~22). `README.md` holds the status table and the "What is left" list.
+The most-imported crate on the ladder. `README.md` holds the status table and the "What is left" list.
 
 ## WHERE TO LOOK
 | Task | Location |
 |------|----------|
-| Public entry | `codegen::{compile, compile_ast, KernelSpec, ArgSpec, parse_dtype}` (`src/codegen.rs`, 2.9k LOC) |
+| Public entry | `codegen::{compile, compile_ast, KernelSpec, ArgSpec, parse_dtype}` (`src/codegen.rs`) |
 | Typing / promotion rules | `src/semantic.rs` (`Val`, `Semantic`) |
 | Target-conditional policy | `src/target.rs` (`Target::div_promotes_narrow_floats`) |
 | Pass pipeline (mirrors Triton `make_ir` order) | `src/opt.rs` (`make_ttir`, folds, `inline_calls`, `cse`) |

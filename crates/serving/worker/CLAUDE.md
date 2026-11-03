@@ -1,12 +1,12 @@
 # scratchy-serving-worker
 
 ## OVERVIEW
-Device workers + executors: one `MetalWorker`/`CudaWorker` in `gpu_worker.rs`, the Spyre worker split across `spyre_*.rs`, uniproc/threadpool/multinode executors, TP groups. Score ~20 (18 files, ~18.5k LOC, backend-gated).
+Device workers + executors: one `MetalWorker`/`CudaWorker` in `gpu_worker.rs`, the Spyre worker split across `spyre_*.rs`, uniproc/threadpool/multinode executors, TP groups. Backend-gated.
 
 ## WHERE TO LOOK
 | Task | File |
 |------|------|
-| Metal/CUDA step, KV/GDN pools, chain layout, spec-decode backend | `src/gpu_worker.rs` (8.3k LOC; `MetalWorkerFactory`, `SeqMmInfo`) |
+| Metal/CUDA step, KV/GDN pools, chain layout, spec-decode backend | `src/gpu_worker.rs` (`MetalWorkerFactory`, `SeqMmInfo`) |
 | Pre-init Metal sizing guard (used by api `init`) | `src/metal_info.rs` |
 | Executors | `src/uniproc.rs`, `src/threadpool.rs`, `src/multinode.rs` (`MultiNodeExecutor`, `ControlMessage`) |
 | TP/PP group resolution | `src/parallel.rs` (`ParallelGroup`, `ResolvedParallelConfig`) |

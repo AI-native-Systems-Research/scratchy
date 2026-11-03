@@ -1,7 +1,7 @@
 # crates/compiler/subtile (scratchy-subtile)
 
 ## OVERVIEW
-The target-neutral IR, tape, and shared passes (reroll, colouring, folding, KV codec) that metal and spyre both use. It's a plain lib, so it can be unit-tested on any host. Score ~22 (15 modules, 16k LOC, 17 integration tests, own build.rs).
+The target-neutral IR, tape, and shared passes (reroll, colouring, folding, KV codec) that metal and spyre both use. It's a plain lib, so it can be unit-tested on any host.
 
 ## FLOW
 `lower::LoweringInput` (plain-data mirror of the macro's Fuf+Assignment) -> `subtile_ir::lower_region` (SSA DAG of `SubOp`) -> `subtile_tape::lower_dag_to_tape` / `reroll_subtile_tape` -> `tape_colouring` / `tape_folding` / `kv_codec` / `sample_rows` -> `handoff` types the targets consume.
@@ -21,7 +21,7 @@ The target-neutral IR, tape, and shared passes (reroll, colouring, folding, KV c
 | Spyre addressing | `addr`, `sdsc_abstract` re-exports | cfg `spyre`, from `ktir-superdsc` |
 
 ## CONVENTIONS
-- Target-ABI facts arrive as const tables (`ColourFacts`, `FusionTable`, `KvCodecFacts`, `SampleRowsFacts`). `subtile_tape.rs:51` keeps a forbidden-token list: grepping for target tokens must return zero hits.
+- Target-ABI facts arrive as const tables (`ColourFacts`, `FusionTable`, `KvCodecFacts`, `SampleRowsFacts`). `subtile_tape.rs` keeps a forbidden-token list: grepping for target tokens must return zero hits.
 - Reroll and tape machinery are deliberately UNGATED so metal doesn't fork it. `spyre` gates only the bundle/SuperDSC re-exports and the attention-geometry door.
 - Sealed handles (`SlotId`, `SlotHandle`, `SlotWritten`, `RopeForm`) are move-only. Double-write, read-before-write, and read-after-free fail to compile.
 - Newtype witnesses replace primitive pairs and bools (e.g. "NOT A `(mult,div)` PAIR"). Keep them typed.
@@ -31,7 +31,7 @@ The target-neutral IR, tape, and shared passes (reroll, colouring, folding, KV c
 
 ## ANTI-PATTERNS
 - Hand-rolled stride or address formulas per model. Every address is an `addr::Nest` at a rank (`addr_shape_drives_addressing.rs`).
-- Allocating inside a loop body (`subtile_tape.rs:606`).
+- Allocating inside a loop body (`subtile_tape.rs`).
 - A second page allocator inside the worker: block tables come from the host only, and a short page list is REFUSED.
 - Constructing `PaddedMq` width and pad separately. `Rung::<31>::baked()` must fail with E0080.
 - Reviving `lower_subtile_tape_to_sengraph`: sengraph is a deleted dead end.

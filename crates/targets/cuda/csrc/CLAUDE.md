@@ -3,7 +3,7 @@
 ## OVERVIEW
 CUDA C++ kernel sources, mostly vLLM/llama.cpp-derived with torch stripped out. The public surface
 is `extern "C"` launchers bound in `../src/kernels.rs`. It's a distinct domain (C++, its own build
-path, about 30k LOC) and the Rust parent doesn't cover it.
+path) and the Rust parent doesn't cover it.
 
 ## STRUCTURE
 ```
@@ -25,8 +25,8 @@ csrc/
 | Link names | `../build.rs` (and `../cost-sweep/build.rs` for its trimmed subset) |
 | GEMM configs for the cost model | `cutlass_standalone_gemm.cu` `CUTLASS_GEMM_CONFIG` families |
 | fp8 tile dispatch | `cutlass_scaled_mm/*_fp8_dispatch.cuh` |
-| Marlin kernel body | `marlin/marlin_template.h` (2k LOC; changes reach marlin_moe too) |
-| GGML K-quant dequant | `quantized.cu` (6k LOC, large grid tables, skim) |
+| Marlin kernel body | `marlin/marlin_template.h` (changes reach marlin_moe too) |
+| GGML K-quant dequant | `quantized.cu` (large grid tables, skim) |
 
 ## CONVENTIONS
 - Launchers take raw pointers + dims + `cudaStream_t` and return int status codes. Native ones use the `scratchy_` prefix.

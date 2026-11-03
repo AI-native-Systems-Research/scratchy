@@ -2,7 +2,7 @@
 
 ## OVERVIEW
 Adapter only. It reshapes our KTIR into `ktir-superdsc`'s `KtirNode` and calls its entry points; every descriptor decision belongs to `ktir-superdsc`.
-Earned its file: distinct domain and the config table three crates share (score ~15).
+Owns the config table three crates share.
 
 ## WHERE TO LOOK
 | Task | Location |

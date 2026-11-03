@@ -1,7 +1,7 @@
 # src/interpreter/metal/
 
 ## OVERVIEW
-Runtime execution: `MetalWorkerPool` checks out workers, each with its own arena and baked MTL4 steps, and drives one forward per checkout. Consumers import it as `scratchy_target_metal::interpreter::metal::*`, and the macro codegen emits those paths verbatim. Score ~17 (12k LOC, high centrality).
+Runtime execution: `MetalWorkerPool` checks out workers, each with its own arena and baked MTL4 steps, and drives one forward per checkout. Consumers import it as `scratchy_target_metal::interpreter::metal::*`, and the macro codegen emits those paths verbatim.
 
 ## WHERE TO LOOK
 | Task | Location |

@@ -1,7 +1,7 @@
 # crates/serving — vLLM-port serving stack
 
 ## OVERVIEW
-Rust port of vLLM's v1 serving path: HTTP/in-process API -> engine core loop -> scheduler -> worker -> target backend. Earned its file as the boundary of 5 crates (~75k LOC) sharing one layering contract.
+Rust port of vLLM's v1 serving path: HTTP/in-process API -> engine core loop -> scheduler -> worker -> target backend. Five crates share one layering contract.
 
 ## STRUCTURE
 ```

@@ -1,7 +1,7 @@
 # crates/compiler
 
 ## OVERVIEW
-Four crates: compile-time forward pipeline (`macros/`), its subtile IR (`subtile/`), the cfg-free op enum (`ir/`), and runtime support that emitted code links against (`.` = `scratchy-forward-compiler`). Earned its file: crate boundary, score ~20.
+Four crates: compile-time forward pipeline (`macros/`), its subtile IR (`subtile/`), the cfg-free op enum (`ir/`), and runtime support that emitted code links against (`.` = `scratchy-forward-compiler`).
 
 ## STRUCTURE
 ```
@@ -9,8 +9,8 @@ compiler/
 ├── src/        # scratchy-forward-compiler: runtime-side types emitted code names
 ├── src/bin/    # probe-weights (feature `probe`)
 ├── ir/         # scratchy-ir: `Instruction` enum + `WeightAccessors`, one file
-├── macros/     # scratchy-forward-compiler-macro: the pipeline (own AGENTS.md)
-├── subtile/    # scratchy-subtile: target-neutral IR/tape passes (own AGENTS.md)
+├── macros/     # scratchy-forward-compiler-macro: the pipeline (own CLAUDE.md)
+├── subtile/    # scratchy-subtile: target-neutral IR/tape passes (own CLAUDE.md)
 └── tests/      # gemma2/phase7 end-to-end - STALE, see NOTES
 ```
 

@@ -1,7 +1,7 @@
 # scratchy-serving-scheduler
 
 ## OVERVIEW
-Port of `vllm/v1/core/sched/*` + `block_pool.py`: `Scheduler` state machine and `SimpleBlockTracker` KV manager (uniform, prefix-cache, hybrid/SWA, recurrent-state modes). Score ~16 (distinct domain; `core.rs` is 9.2k LOC and the file to understand).
+Port of `vllm/v1/core/sched/*` + `block_pool.py`: `Scheduler` state machine and `SimpleBlockTracker` KV manager (uniform, prefix-cache, hybrid/SWA, recurrent-state modes). `core.rs` is the file to understand.
 
 ## WHERE TO LOOK
 | Task | File |

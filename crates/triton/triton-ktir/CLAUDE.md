@@ -2,7 +2,6 @@
 
 ## OVERVIEW
 Behavioural port of the C++ KTDP/KTDF passes. Takes frontend's `ttir::Module` via `from_ttir::convert` and emits `ktir_core` IR.
-Earned its file: ~17k LOC, 12 passes, 141 tests (score ~24).
 
 ## WHERE TO LOOK
 | Task | Location |
@@ -11,7 +10,7 @@ Earned its file: ~17k LOC, 12 passes, 141 tests (score ~24).
 | Mutable IR (deliberate divergence from ktir-core's arena `Copy`) | `src/ir.rs` (`Op`, `OpKind`, `AttrKey`, `Attr`, `IrType`) |
 | TTIR -> our IR | `src/from_ttir.rs` (`OP_SET`, `ATTR_KEYS`, `convert`) |
 | Consumer-contract audit (`ktir_to_superdsc`) | `src/consumer.rs` (`WALKED_OPS`, `READ_ATTRS`, `check`) |
-| Largest pass | `src/passes/to_ktir.rs` (3.7k LOC); `to_ktir::lower` is the door |
+| Largest pass | `src/passes/to_ktir.rs`; `to_ktir::lower` is the door |
 | ktir_core emission | `src/passes/to_ktir_emit.rs` (only callable from `to_ktir::lower`) |
 | Matmul lowering + const-int helpers | `src/passes/dot_to_linalg.rs` |
 | Shared traversal/edit toolkit | `src/passes/walk.rs` |

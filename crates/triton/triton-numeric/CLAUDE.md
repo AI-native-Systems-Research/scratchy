@@ -2,7 +2,7 @@
 
 ## OVERVIEW
 `.py` -> TTIR -> KTIR -> `ktir-emulator`, scored against checked-in torch bytes in `../test-numeric/<config>/`.
-Earned its file: distinct domain with its own test law and the only emulator edge (score ~17).
+Has its own test law and the only emulator edge.
 
 ## WHERE TO LOOK
 | Task | Location |

@@ -1,7 +1,7 @@
 # scratchy-serving-engine
 
 ## OVERVIEW
-Target-neutral engine core: `EngineCore` step loop (scheduler + executor), `EngineCoreClient`, the `Executor`/`Worker`/`WorkerFactory` traits, `InputBatch`, GPU-budget defaults, grammar, spec decode. Score ~18 (16 files, ~14k LOC; traits implemented by worker + targets).
+Target-neutral engine core: `EngineCore` step loop (scheduler + executor), `EngineCoreClient`, the `Executor`/`Worker`/`WorkerFactory` traits, `InputBatch`, GPU-budget defaults, grammar, spec decode. Its traits are implemented by worker + targets.
 
 ## WHERE TO LOOK
 | Task | File |

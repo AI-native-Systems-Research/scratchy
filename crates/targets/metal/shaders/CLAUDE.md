@@ -1,7 +1,7 @@
 # shaders/
 
 ## OVERVIEW
-MSL kernels for the metal backend: 39 `.metal` + 11 `.h` (~21k LOC), plus vendored MLX headers in `mlx_quantized/`, `mlx_steel_attn/`, `mlx_steel_gemm/`. Score ~20 (50 files, its own toolchain and two compile regimes).
+MSL kernels for the metal backend: `.metal` + `.h` files, plus vendored MLX headers in `mlx_quantized/`, `mlx_steel_attn/`, `mlx_steel_gemm/`. It has its own toolchain and two compile regimes.
 
 ## TWO COMPILE REGIMES (split by `#include "baked.h"`)
 | Regime | Compiled by | Specialized by |

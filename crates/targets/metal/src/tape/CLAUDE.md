@@ -1,7 +1,7 @@
 # src/tape/
 
 ## OVERVIEW
-The pure, objc-free half of the crate: the tape data model plus SubtileTape -> `LoweredMetalTape` lowering. `#[forward]` runs this at expansion, and the runtime plays the result. 13 files, ~21k LOC; score ~17 (symbol-dense, high centrality).
+The pure, objc-free half of the crate: the tape data model plus SubtileTape -> `LoweredMetalTape` lowering. `#[forward]` runs this at expansion, and the runtime plays the result.
 
 ## WHERE TO LOOK
 | Task | Location |
@@ -37,4 +37,4 @@ The pure, objc-free half of the crate: the tape data model plus SubtileTape -> `
 - Qwen-MoE roll witness: two f32-bit fields NEVER compare equal by design (step.rs ~154). Don't "fix" it.
 
 ## NOTES
-- `lowering.rs` is 12.8k lines. Navigate with `lsp_symbols`, not linear reads.
+- `lowering.rs` is huge. Navigate with `lsp_symbols`, not linear reads.

@@ -1,7 +1,7 @@
 # scratchy-target-metal
 
 ## OVERVIEW
-Apple-Silicon runtime + tape construction for the metal backend (crate `scratchy-target-metal`); sibling crate `compiler/` (`scratchy-target-metal-compiler`) is the macro-time half. Score ~25 (crate root, 40+ modules, build.rs codegen).
+Apple-Silicon runtime + tape construction for the metal backend (crate `scratchy-target-metal`); sibling crate `compiler/` (`scratchy-target-metal-compiler`) is the macro-time half.
 
 ## STRUCTURE
 ```

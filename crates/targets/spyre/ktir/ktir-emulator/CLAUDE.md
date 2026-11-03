@@ -1,7 +1,7 @@
 # ktir-emulator — KTIR interpreter (CPU + Metal)
 
 ## OVERVIEW
-Rust port of Python `ktir_cpu`. Executes KTIR modules with an LX/HBM memory model, a latency model, and GPU/BLAS offload. Score ~20 (largest crate, own build.rs, shaders, features, ignored timing suites).
+Rust port of Python `ktir_cpu`. Executes KTIR modules with an LX/HBM memory model, a latency model, and GPU/BLAS offload. Own build.rs, shaders, features, and ignored timing suites.
 
 ## WHERE TO LOOK
 | Need | Location |
@@ -12,7 +12,7 @@ Rust port of Python `ktir_cpu`. Executes KTIR modules with an LX/HBM memory mode
 | Cross-core comm | `src/comm.rs` (seam), `src/comm_sched.rs`, `dialects/ktdp_comm.rs` |
 | LX / HBM / core state | `src/machine_state/{memory,context}.rs` (`SpyreMemoryHierarchy`, `CoreContext`, `LxOptions`) |
 | Latency categories | `src/latency.rs`; register them in lockstep with handlers |
-| MSL emit + GEMM tiers | `src/metal.rs` (~7.3k LOC; `MatmulTier` Naive/Simdgroup/Nax, `choose_matmul_backend`) |
+| MSL emit + GEMM tiers | `src/metal.rs` (`MatmulTier` Naive/Simdgroup/Nax, `choose_matmul_backend`) |
 | MTL4 dispatch | `src/metal/mtl4.rs`, a deliberate copy of `scratchy_target_metal::mtl4_dispatch` (target crates must not depend on each other) |
 | AOT shaders | `shaders/*.metal` + `build.rs` (14 metallibs) |
 | Test op builder | `src/test_support.rs`; its twin is `tests/common/mod.rs`, so keep both in sync |

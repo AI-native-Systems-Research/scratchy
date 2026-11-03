@@ -1,13 +1,13 @@
 # scratchy-target-metal-compiler
 
 ## OVERVIEW
-Macro-time lowering: SubtileTape -> metal step tape -> per-bucket `static` tapes as TokenStreams. It's a separate crate so `syn`/`quote` never link into the runtime. Score ~14; earns its own file as a distinct crate boundary that `#[forward]` calls directly.
+Macro-time lowering: SubtileTape -> metal step tape -> per-bucket `static` tapes as TokenStreams. It's a separate crate so `syn`/`quote` never link into the runtime. `#[forward]` calls it directly.
 
 ## WHERE TO LOOK
 | Task | Location |
 |------|----------|
 | Macro entry, per decode canonical | `canonical.rs` `lower_canonical`, `lower_canonical_classed` (`MetalCanonical`, `CanonicalRefusal`, `RollOutcome`) |
-| Opcode lowering core: step records, colouring projection, hazards | `steps_from_tape.rs` (2.9k lines): `assemble`, `cache_live`, `hazard_fences`, `proves` |
+| Opcode lowering core: step records, colouring projection, hazards | `steps_from_tape.rs`: `assemble`, `cache_live`, `hazard_fences`, `proves` |
 | Per-bucket static emission | `static_tape.rs` `bake_bucket_tapes`, `bake_module`, `kv_cap_ladder`, `emit_bucket_barriers_static`, `kernel_ref` |
 | Value -> TokenStream emit helpers | `const_tokens.rs` `const_tokens` |
 | Tape program wrapper | `tape_program.rs` `TapeProgram` |

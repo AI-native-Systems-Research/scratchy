@@ -30,5 +30,5 @@ Reference docs agents must read before touching builds, models, tests or benchma
 - `CLAUDE_CODE_BENCH.md` empty result sections are intentional (each names the task that fills it). Don't delete or fill with guesses.
 
 ## ANTI-PATTERNS
-- Don't duplicate BUILD.md mechanics into READMEs or AGENTS.md; link.
+- Don't duplicate BUILD.md mechanics into READMEs or CLAUDE.md; link.
 - Don't report numbers in docs without the methodology from `BENCHMARKING.md`.

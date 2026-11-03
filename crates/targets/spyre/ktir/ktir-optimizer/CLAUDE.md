@@ -1,7 +1,7 @@
 # ktir-optimizer — KTIR -> KTIR rewrite passes
 
 ## OVERVIEW
-Pure IR passes over `ktir-core` (no features, no other deps). Its only direct dependent is ktir-emulator (feature `optimizer`). Outside crates reach it through the re-export `ktir_emulator::ktir_optimizer` (e.g. `crates/targets/spyre/src/runner.rs` uses `fusion::{Binding, NodeSpec, ProgramSpec}`). Score ~11 (distinct domain, ~9k LOC).
+Pure IR passes over `ktir-core` (no features, no other deps). Its only direct dependent is ktir-emulator (feature `optimizer`). Outside crates reach it through the re-export `ktir_emulator::ktir_optimizer` (e.g. `crates/targets/spyre/src/runner.rs` uses `fusion::{Binding, NodeSpec, ProgramSpec}`).
 
 ## WHERE TO LOOK
 | Pass | File | Entry points |
