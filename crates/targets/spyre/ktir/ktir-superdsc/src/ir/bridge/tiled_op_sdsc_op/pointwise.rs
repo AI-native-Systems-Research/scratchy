@@ -840,16 +840,20 @@ pub fn page_gather_blocks_opspec(
     // ([`ViewFrame::LandedBlocks`]), not a flat frame the bytes are not in. A one-stick landing is
     // the flat frame's own bytes and stays [`ViewFrame::Own`]. The frame changes the DECLARATION
     // only — the landing's per-core starts stay its blocks, as the pinned start test states.
-    let landed =
-        |cols: u32| -> crate::superdsc_opspec::ViewFrame {
-            if cols > df.elems_per_stick() {
-                crate::superdsc_opspec::ViewFrame::LandedBlocks
-            } else {
-                crate::superdsc_opspec::ViewFrame::Own
-            }
-        };
+    let landed = |cols: u32| -> crate::superdsc_opspec::ViewFrame {
+        if cols > df.elems_per_stick() {
+            crate::superdsc_opspec::ViewFrame::LandedBlocks
+        } else {
+            crate::superdsc_opspec::ViewFrame::Own
+        }
+    };
     let args = vec![
-        arg(true, src, ["out", "x", "mb", "y"], crate::superdsc_opspec::ViewFrame::Own)?,
+        arg(
+            true,
+            src,
+            ["out", "x", "mb", "y"],
+            crate::superdsc_opspec::ViewFrame::Own,
+        )?,
         arg(false, dst, ["x", "out", "mb", "y"], landed(cols))?,
     ];
     let mut op = OpSpec {
@@ -982,16 +986,20 @@ pub fn page_gather_page_opspec(
     // ⭐ THE LANDING'S OWN FRAME — same law as the blocks arm above: several sticks wide, the
     // pages' blocks land stick-major and the authority records the ONE stick-major
     // [entries·blocks·rows, cols] they tile, not a flat frame the bytes are not in.
-    let landed =
-        |cols: u32| -> crate::superdsc_opspec::ViewFrame {
-            if cols > df.elems_per_stick() {
-                crate::superdsc_opspec::ViewFrame::LandedBlocks
-            } else {
-                crate::superdsc_opspec::ViewFrame::Own
-            }
-        };
+    let landed = |cols: u32| -> crate::superdsc_opspec::ViewFrame {
+        if cols > df.elems_per_stick() {
+            crate::superdsc_opspec::ViewFrame::LandedBlocks
+        } else {
+            crate::superdsc_opspec::ViewFrame::Own
+        }
+    };
     let args = vec![
-        arg(true, src, ["out", "x", "y", "mb"], crate::superdsc_opspec::ViewFrame::Own)?,
+        arg(
+            true,
+            src,
+            ["out", "x", "y", "mb"],
+            crate::superdsc_opspec::ViewFrame::Own,
+        )?,
         arg(false, dst, ["x", "out", "y", "mb"], landed(cols))?,
     ];
     let mut op = OpSpec {
@@ -2470,8 +2478,7 @@ mod page_gather_blocks_tests {
         )
         .expect("the block gather builds");
         assert!(
-            l.arrangements.borrow()[&act_name(2)]
-                .addr_eq(&StickLayout::row_blocked(1024, 128)),
+            l.arrangements.borrow()[&act_name(2)].addr_eq(&StickLayout::row_blocked(1024, 128)),
             "8 entries' [128, 128] blocks declared as the one stick-major [1024, 128] they tile"
         );
         assert!(
@@ -2503,8 +2510,7 @@ mod page_gather_blocks_tests {
         )
         .expect("the one-block gather builds");
         assert!(
-            l.arrangements.borrow()[&act_name(2)]
-                .addr_eq(&StickLayout::row_blocked(128, 128)),
+            l.arrangements.borrow()[&act_name(2)].addr_eq(&StickLayout::row_blocked(128, 128)),
             "one entry's [128, 128] block declared as the stick-major [128, 128] it is"
         );
     }
@@ -2532,8 +2538,7 @@ mod page_gather_blocks_tests {
         )
         .expect("the page gather builds");
         assert!(
-            l.arrangements.borrow()[&act_name(2)]
-                .addr_eq(&StickLayout::row_blocked(1024, 128)),
+            l.arrangements.borrow()[&act_name(2)].addr_eq(&StickLayout::row_blocked(1024, 128)),
             "one page's 8 [128, 128] blocks declared as the one stick-major [1024, 128] they tile"
         );
     }
@@ -2560,8 +2565,7 @@ mod page_gather_blocks_tests {
         )
         .expect("the one-stick gather builds");
         assert!(
-            l.arrangements.borrow()[&act_name(2)]
-                .addr_eq(&StickLayout::flat(1, 8 * 128 * 64)),
+            l.arrangements.borrow()[&act_name(2)].addr_eq(&StickLayout::flat(1, 8 * 128 * 64)),
             "a one-stick landing is the flat frame's own bytes, at any batch count"
         );
     }
@@ -2617,8 +2621,12 @@ mod page_gather_blocks_tests {
         };
         let src_arg = arg(true, &act_name(1), crate::superdsc_opspec::ViewFrame::Own)
             .expect("the source arg builds");
-        let dst_arg = arg(false, &act_name(2), crate::superdsc_opspec::ViewFrame::LandedBlocks)
-            .expect("the stamped arg builds");
+        let dst_arg = arg(
+            false,
+            &act_name(2),
+            crate::superdsc_opspec::ViewFrame::LandedBlocks,
+        )
+        .expect("the stamped arg builds");
         let op = OpSpec {
             op: OpFunc::Identity,
             is_reduction: false,

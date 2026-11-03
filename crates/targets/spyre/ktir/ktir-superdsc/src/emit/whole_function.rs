@@ -1955,7 +1955,9 @@ fn program_broadcast_chains(
         // rank, the leading run, the sprayed extents, the admission's split frame, both covers
         // — is the FOLDED frame, one statement of the shape for the whole classification.
         let (res_dims, dims, rank): (Option<Vec<i64>>, Vec<i64>, usize) = if rank > 2 {
-            let s = res_dims.as_ref().expect("rank is Some only when res_dims is");
+            let s = res_dims
+                .as_ref()
+                .expect("rank is Some only when res_dims is");
             let keeps = |i: usize| s[i] != 1 || dims.contains(&(i as i64));
             let folded: Vec<i64> = s
                 .iter()
@@ -1966,7 +1968,8 @@ fn program_broadcast_chains(
             let folded_dims: Vec<i64> = dims
                 .iter()
                 .map(|&d| {
-                    d - s.iter()
+                    d - s
+                        .iter()
                         .enumerate()
                         .take(d as usize)
                         .filter(|(i, _)| !keeps(*i))
