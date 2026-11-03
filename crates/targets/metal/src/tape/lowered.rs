@@ -2568,7 +2568,71 @@ pub struct BakedKernel {
     pub function: &'static str,
     pub constants: &'static [ConstantValue],
     /// The metallib of the bake compile that holds the kernel, with the rest of its batch.
-    pub metallib: &'static [u8],
+    pub metallib: &'static BakedMetallib,
     /// The kernel's function in `metallib`.
     pub entry: &'static str,
+}
+
+/// A bake compile's metallib as the binary holds it: one zstd frame, compressed against the
+/// dictionary its build trained on every metallib it baked ([`crate::aot::pack`]). Kernels
+/// specialized on different constants are near-copies of one another, so the build's metallibs
+/// share most of their bytes, which the dictionary holds once.
+#[derive(Clone, Copy, PartialEq, serde::Serialize)]
+pub struct BakedMetallib {
+    pub frame: &'static [u8],
+    pub dictionary: &'static BakedDictionary,
+    /// The metallib's size, decompressed.
+    pub len: usize,
+}
+
+/// The dictionary a build's [`BakedMetallib`]s are compressed against, digested for decompression
+/// once, on the first load of any of them.
+pub struct BakedDictionary {
+    pub bytes: &'static [u8],
+    prepared: std::sync::OnceLock<zstd::dict::DecoderDictionary<'static>>,
+}
+
+impl BakedDictionary {
+    pub const fn new(bytes: &'static [u8]) -> Self {
+        Self {
+            bytes,
+            prepared: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn prepared(&self) -> &zstd::dict::DecoderDictionary<'static> {
+        (self.prepared).get_or_init(|| zstd::dict::DecoderDictionary::copy(self.bytes))
+    }
+}
+
+impl PartialEq for BakedDictionary {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl serde::Serialize for BakedDictionary {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.bytes.serialize(serializer)
+    }
+}
+
+impl BakedMetallib {
+    /// The metallib's bytes.
+    pub fn decompress(&self) -> Result<Box<[u8]>, String> {
+        let dictionary = self.dictionary.prepared();
+        let mut decompressor = zstd::bulk::Decompressor::with_prepared_dictionary(dictionary)
+            .map_err(|e| format!("baked metallib dictionary: {e}"))?;
+        let bytes = decompressor
+            .decompress(self.frame, self.len)
+            .map_err(|e| format!("baked metallib frame: {e}"))?;
+        if bytes.len() != self.len {
+            return Err(format!(
+                "baked metallib: {} bytes decompressed, {} baked",
+                bytes.len(),
+                self.len
+            ));
+        }
+        Ok(bytes.into_boxed_slice())
+    }
 }
