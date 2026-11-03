@@ -24,6 +24,84 @@ pub struct SampleRequest {
     pub expected_output_len: usize,
 }
 
+/// Fixed-length prompts of natural text: `num_requests` slices of exactly `input_len` tokens (as
+/// near as the tokenizer allows: a slice is cut on token boundaries, decoded, and re-encoded), cut
+/// from `corpus` at offsets seeded by `seed`, each with `output_len` answer tokens. The same
+/// prompts for the same corpus, tokenizer and seed, on every engine. Natural text, unlike
+/// [`generate_random`]'s random token IDs, routes a mixture-of-experts model's experts as real
+/// prompts do; a short slice is extended from the corpus, never padded with random tokens.
+pub fn natural_slices(
+    tokenizer: &Tokenizer,
+    corpus: &[u32],
+    num_requests: usize,
+    input_len: usize,
+    output_len: usize,
+    seed: u64,
+) -> Result<Vec<SampleRequest>> {
+    let num_special = tokenizer.num_special_tokens_to_add(false);
+    let want = input_len.saturating_sub(num_special).max(1);
+    anyhow::ensure!(
+        corpus.len() > want * 2,
+        "the natural-text corpus has {} tokens, too few for {want}-token prompts",
+        corpus.len()
+    );
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut samples = Vec::with_capacity(num_requests);
+    for _ in 0..num_requests {
+        let start = rng.random_range(0..corpus.len() - want * 2);
+        // Decoding a token run and encoding it again can merge or split at the edges: take a run,
+        // and lengthen or shorten it from the corpus until it re-encodes to the length.
+        let mut take = want;
+        let mut best: Option<(String, usize)> = None;
+        for _ in 0..12 {
+            let end = (start + take).min(corpus.len());
+            let text = tokenizer
+                .decode(&corpus[start..end], true)
+                .map_err(|e| anyhow::anyhow!("Decode failed: {e}"))?;
+            let got = token_count(tokenizer, &text)?;
+            let off = got.abs_diff(want);
+            if best.as_ref().is_none_or(|(_, b)| off < b.abs_diff(want)) {
+                best = Some((text, got));
+            }
+            if got == want {
+                break;
+            }
+            take = if got < want {
+                take + (want - got)
+            } else {
+                take.saturating_sub(got - want).max(1)
+            };
+        }
+        let (prompt, prompt_len) = best.expect("one slice at least");
+        samples.push(SampleRequest {
+            prompt,
+            prompt_len,
+            expected_output_len: output_len,
+        });
+    }
+    Ok(samples)
+}
+
+/// The natural-text corpus [`natural_slices`] cuts from: every human turn of a ShareGPT file, in
+/// file order, as one run of tokens, up to `max_tokens` of it.
+pub fn sharegpt_corpus(path: &Path, tokenizer: &Tokenizer, max_tokens: usize) -> Result<Vec<u32>> {
+    let conversations = load_sharegpt_conversations(path)?;
+    let mut ids = Vec::new();
+    'all: for turns in &conversations {
+        for (human, _) in turns {
+            let mut t = tokenizer
+                .encode(human, false)
+                .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+            ids.append(&mut t);
+            if ids.len() >= max_tokens {
+                ids.truncate(max_tokens);
+                break 'all;
+            }
+        }
+    }
+    Ok(ids)
+}
+
 /// Load a ShareGPT-format dataset, matching Python's `ShareGPTDataset.sample()`.
 ///
 /// JSON format: `[{"conversations": [{"from": "human", "value": "..."}, {"from": "gpt", "value": "..."}]}]`
@@ -532,6 +610,48 @@ impl Sizer<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// Natural-text prompts are the length asked for, the same for the same seed and different
+    /// for another, and text: whole words in order, not random token IDs. Run with the matrix's
+    /// files (SCR_TEST_TOKENIZER, SCR_TEST_SHAREGPT); skipped without them.
+    #[test]
+    fn natural_slices_are_fixed_length_natural_text() {
+        let (Ok(tok), Ok(sg)) = (
+            std::env::var("SCR_TEST_TOKENIZER"),
+            std::env::var("SCR_TEST_SHAREGPT"),
+        ) else {
+            eprintln!("skipped: set SCR_TEST_TOKENIZER and SCR_TEST_SHAREGPT");
+            return;
+        };
+        let tokenizer = Tokenizer::from_file(Path::new(&tok)).unwrap();
+        let corpus = sharegpt_corpus(Path::new(&sg), &tokenizer, 200_000).unwrap();
+        assert_eq!(corpus.len(), 200_000);
+        // The corpus as text: a natural slice is a run of it, word for word, where random token
+        // IDs would be text no human turn holds.
+        let text = tokenizer.decode(&corpus, true).unwrap();
+        for len in [128usize, 1024, 4096] {
+            let a = natural_slices(&tokenizer, &corpus, 6, len, 64, 7).unwrap();
+            let b = natural_slices(&tokenizer, &corpus, 6, len, 64, 7).unwrap();
+            let c = natural_slices(&tokenizer, &corpus, 6, len, 64, 8).unwrap();
+            assert_eq!(
+                a.iter().map(|p| &p.prompt).collect::<Vec<_>>(),
+                b.iter().map(|p| &p.prompt).collect::<Vec<_>>(),
+                "the same for the same seed"
+            );
+            assert_ne!(a[0].prompt, c[0].prompt, "another seed, other prompts");
+            for p in &a {
+                let off = p.prompt_len.abs_diff(len);
+                assert!(off <= 2, "{len}-token prompt came out {}", p.prompt_len);
+                assert_eq!(p.expected_output_len, 64);
+                let inner = p.prompt.trim();
+                let inner = &inner[..inner.len().min(200)];
+                assert!(
+                    text.contains(inner),
+                    "a run of the corpus's text: {inner:?}"
+                );
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
