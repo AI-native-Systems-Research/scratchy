@@ -57,9 +57,10 @@ jobs:
       # run uses the input scope. Naming zero models is a build-time panic, so
       # the scope is never empty. quant/mlx is always on: MLX affine is what
       # people run on a Mac, and the Gemma 4 26B-A4B drafter that metal's
-      # mtp-heads publishes lives under it. A selected preset replaces a
-      # model's dense emission, so models with an MLX preset ship as MLX and
-      # the rest stay dense.
+      # mtp-heads publishes lives under it. Active presets are arch-wide: an
+      # arch that declares any MLX preset ships only its MLX variants (every
+      # declared preset x every config) and loses its dense/bf16 build; arches
+      # with no MLX preset stay dense.
       - name: Build
         env:
           MODEL_SCOPE: ${{ github.event_name == 'release' && 'model/all' || inputs.model-scope }}
