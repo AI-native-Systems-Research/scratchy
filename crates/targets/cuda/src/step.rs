@@ -112,6 +112,113 @@ pub enum CudaStep {
     /// [`GEMM_NARROW_BF16_MAX_N`]: the operands of [`Self::Gemm`], `kernels/gemm_bf16.cu`'s
     /// template at one 64-column B block (`scratchy_cuda_gemm_col64_bf16_abt`, #924).
     GemmCol64(GemmBf16),
+    /// [`Self::Gemm`] of up to three weights off one input in one launch, lowered from the
+    /// `SiblingMatmuls` fold (#1049): the q/k/v projections, or a GDN layer's `in_proj_qkv` and
+    /// `in_proj_z` (`kernels/gemm_bf16.cu`'s grouped template, `scratchy_cuda_gemm_group_bf16_abt`).
+    /// Each member's output is the bits of its own [`Self::Gemm`].
+    GemmGroup(GemmGroupBf16),
+    /// [`Self::GemmNarrow`] of up to three weights off one input in one launch, lowered from the
+    /// `SiblingMatmuls` fold: a GDN layer's `in_proj_a` and `in_proj_b`
+    /// (`kernels/gemm_narrow_bf16.cu`, `scratchy_cuda_gemm_narrow_group_bf16_abt`). Each member's
+    /// output is the bits of its own [`Self::GemmNarrow`].
+    GemmNarrowGroup(GemmGroupBf16),
+    /// [`Self::Gemv`] of up to three weights off one input in one launch, lowered from the
+    /// `SiblingMatmuls` fold of a one-row bucket (`kernels/gemv_bf16.cu`,
+    /// `scratchy_cuda_gemv_group_bf16_abt`). Each member takes its own K split
+    /// ([`gemv_splits`]), its partials at its own place in the GEMV scratch, so its output is the
+    /// bits of its own [`Self::Gemv`].
+    GemvGroup(GemmGroupBf16),
+}
+
+/// Which kernel a grouped GEMM groups (#1049): the step each member is on its own, and the
+/// grouped step of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupKind {
+    Gemm,
+    GemmNarrow,
+    Gemv,
+}
+
+impl GroupKind {
+    /// A member as the step it is on its own.
+    pub const fn step(self, g: GemmBf16) -> CudaStep {
+        match self {
+            Self::Gemm => CudaStep::Gemm(g),
+            Self::GemmNarrow => CudaStep::GemmNarrow(g),
+            Self::Gemv => CudaStep::Gemv(g),
+        }
+    }
+
+    /// The grouped step of `g`.
+    pub const fn grouped(self, g: GemmGroupBf16) -> CudaStep {
+        match self {
+            Self::Gemm => CudaStep::GemmGroup(g),
+            Self::GemmNarrow => CudaStep::GemmNarrowGroup(g),
+            Self::Gemv => CudaStep::GemvGroup(g),
+        }
+    }
+}
+
+/// One weight of a grouped GEMM ([`GemmGroupBf16`]): `B [n, k]` and its output `C [m, n]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GroupMember {
+    pub b: WeightIx,
+    pub c: ArenaOffset,
+    pub n: u32,
+}
+
+/// Up to three GEMMs `C_i[m, n_i] = A[m, k] · B_i[n_i, k]ᵀ` that share `A`, in one launch: the
+/// `first` member is the fold's driver, the others its siblings in tape order. Each member is the
+/// [`GemmBf16`] [`Self::member`] names, whose kernel shape rule it meets on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GemmGroupBf16 {
+    pub a: ArenaOffset,
+    pub m: u32,
+    pub k: u32,
+    pub first: GroupMember,
+    pub second: GroupMember,
+    pub third: Option<GroupMember>,
+}
+
+impl GemmGroupBf16 {
+    /// The members in order: `first`, `second`, then `third` when there is one.
+    pub const fn members(&self) -> [Option<GroupMember>; 3] {
+        [Some(self.first), Some(self.second), self.third]
+    }
+
+    /// Member `g` as the GEMM it computes.
+    pub const fn member(&self, g: GroupMember) -> GemmBf16 {
+        GemmBf16 {
+            a: self.a,
+            b: g.b,
+            c: g.c,
+            m: self.m,
+            n: g.n,
+            k: self.k,
+        }
+    }
+
+    /// The GEMV scratch bytes of the members before `upto` (`upto` 3: all of them), each at its
+    /// own split ([`gemv_scratch_bytes`]): member `i`'s partials start at the bytes before it.
+    /// `None` on overflow.
+    pub const fn gemv_scratch_before(&self, upto: usize) -> Option<u64> {
+        let members = self.members();
+        let mut total = 0u64;
+        let mut i = 0;
+        while i < upto && i < 3 {
+            if let Some(g) = members[i] {
+                let Some(bytes) = gemv_scratch_bytes(g.n, 1, gemv_splits(g.n, self.k, 1)) else {
+                    return None;
+                };
+                let Some(sum) = total.checked_add(bytes) else {
+                    return None;
+                };
+                total = sum;
+            }
+            i += 1;
+        }
+        Some(total)
+    }
 }
 
 /// The 64-column GEMM's tile `(m, n, k)`: `gemm_bf16.cu`'s template at one 64-column B tile.
@@ -1244,13 +1351,108 @@ impl CudaStep {
             | Self::LayerScale(_)
             | Self::SoftCap(_)
             | Self::RouterNorm(_)
+            | Self::GemmCol64(_)
+            // A grouped GEMV's members each take their own split, at their own place in the
+            // scratch ([`GemmGroupBf16::gemv_scratch_before`]); [`Self::gemv_scratch`] sums them.
+            | Self::GemmGroup(_)
+            | Self::GemmNarrowGroup(_)
+            | Self::GemvGroup(_) => None,
+        }
+    }
+
+    /// The grouped kernel a GEMM step's kernel has (#1049), and the GEMM: `Some` for the tiled
+    /// GEMM, the narrow GEMM and the GEMV, the three a `SiblingMatmuls` fold groups; `None` for
+    /// every other step. Every variant is named, so a new step states whether it groups.
+    pub const fn group_kind(&self) -> Option<(GroupKind, GemmBf16)> {
+        match *self {
+            Self::Gemm(g) => Some((GroupKind::Gemm, g)),
+            Self::GemmNarrow(g) => Some((GroupKind::GemmNarrow, g)),
+            Self::Gemv(g) => Some((GroupKind::Gemv, g)),
+            Self::Embed(_)
+            | Self::RmsNorm(_)
+            | Self::Add(_)
+            | Self::SiluMul(_)
+            | Self::Rope(_)
+            | Self::GateSplit(_)
+            | Self::GateApply(_)
+            | Self::RopeAppend(_)
+            | Self::AttnPrefill(_)
+            | Self::AttnDecode(_)
+            | Self::GatedDeltaNet(_)
+            | Self::RouterLogits(_)
+            | Self::MoeRoute(_)
+            | Self::ExpertSort(_)
+            | Self::ExpertGemm(_)
+            | Self::ExpertGemv(_)
+            | Self::ExpertCombine(_)
+            | Self::GateScale(_)
+            | Self::Scale(_)
+            | Self::RmsNormUnit(_)
+            | Self::GeluMul(_)
+            | Self::LayerScale(_)
+            | Self::SoftCap(_)
+            | Self::RouterNorm(_)
+            | Self::GemmCol64(_)
+            | Self::GemmGroup(_)
+            | Self::GemmNarrowGroup(_)
+            | Self::GemvGroup(_) => None,
+        }
+    }
+
+    /// A grouped GEMM step's kind and group; `None` for every other step.
+    pub const fn group(&self) -> Option<(GroupKind, GemmGroupBf16)> {
+        match *self {
+            Self::GemmGroup(g) => Some((GroupKind::Gemm, g)),
+            Self::GemmNarrowGroup(g) => Some((GroupKind::GemmNarrow, g)),
+            Self::GemvGroup(g) => Some((GroupKind::Gemv, g)),
+            Self::Embed(_)
+            | Self::Gemm(_)
+            | Self::GemmNarrow(_)
+            | Self::Gemv(_)
+            | Self::RmsNorm(_)
+            | Self::Add(_)
+            | Self::SiluMul(_)
+            | Self::Rope(_)
+            | Self::GateSplit(_)
+            | Self::GateApply(_)
+            | Self::RopeAppend(_)
+            | Self::AttnPrefill(_)
+            | Self::AttnDecode(_)
+            | Self::GatedDeltaNet(_)
+            | Self::RouterLogits(_)
+            | Self::MoeRoute(_)
+            | Self::ExpertSort(_)
+            | Self::ExpertGemm(_)
+            | Self::ExpertGemv(_)
+            | Self::ExpertCombine(_)
+            | Self::GateScale(_)
+            | Self::Scale(_)
+            | Self::RmsNormUnit(_)
+            | Self::GeluMul(_)
+            | Self::LayerScale(_)
+            | Self::SoftCap(_)
+            | Self::RouterNorm(_)
             | Self::GemmCol64(_) => None,
         }
     }
 
+    /// The kernel steps the step's launch computes: a grouped GEMM's members, each as the GEMM
+    /// whose bits it writes, in order; every other step itself. `CudaTape::validate` checks each
+    /// part as a step of its own, and a grouped step's members against each other.
+    pub fn parts(&self) -> [Option<CudaStep>; 3] {
+        match self.group() {
+            Some((kind, g)) => g.members().map(|m| m.map(|m| kind.step(g.member(m)))),
+            None => [Some(*self), None, None],
+        }
+    }
+
     /// The GEMV scratch bytes the step writes: [`gemv_scratch_bytes`] of [`Self::gemv_split`], 0
-    /// for a step that is no decode GEMV or runs at one split; `None` on overflow.
+    /// for a step that is no decode GEMV or runs at one split; a grouped GEMV's, the sum of its
+    /// members' (each holds its partials at once); `None` on overflow.
     pub const fn gemv_scratch(&self) -> Option<u64> {
+        if let Self::GemvGroup(g) = self {
+            return g.gemv_scratch_before(3);
+        }
         match self.gemv_split() {
             Some((n, pairs, splits)) => gemv_scratch_bytes(n, pairs, splits),
             None => Some(0),
@@ -1259,9 +1461,13 @@ impl CudaStep {
 
     /// What the step's kernel reads and writes, in bytes; `None` when a byte count overflows
     /// `u64`. Each arm states its own kernel's operands, next to that kernel's registry row:
-    /// `CudaTape::validate` checks a tape against it.
+    /// `CudaTape::validate` checks a tape against it. A grouped GEMM's are its first member's:
+    /// `validate` checks every member's through [`Self::parts`].
     pub const fn extents(&self) -> Option<StepExtents> {
         match *self {
+            Self::GemmGroup(g) | Self::GemmNarrowGroup(g) | Self::GemvGroup(g) => {
+                Self::Gemm(g.member(g.first)).extents()
+            }
             Self::Embed(EmbedBf16 {
                 tokens,
                 table,
@@ -1917,6 +2123,10 @@ impl CudaStep {
             Self::RouterLogits(RouterLogitsBf16 { bundle, .. }) => Some(bundle),
             Self::ExpertGemm(ExpertGemmBf16 { bundle, .. })
             | Self::ExpertGemv(ExpertGemvBf16 { bundle, .. }) => Some(bundle),
+            // A grouped GEMM's first member's; [`Self::weights_mut`] gives every member's.
+            Self::GemmGroup(GemmGroupBf16 { first, .. })
+            | Self::GemmNarrowGroup(GemmGroupBf16 { first, .. })
+            | Self::GemvGroup(GemmGroupBf16 { first, .. }) => Some(&mut first.b),
             Self::Add(_)
             | Self::SiluMul(_)
             | Self::Rope(_)
@@ -1932,6 +2142,25 @@ impl CudaStep {
             | Self::RmsNormUnit(_)
             | Self::GeluMul(_)
             | Self::SoftCap(_) => None,
+        }
+    }
+
+    /// Every weight index the step reads, for the compiler's rewrite: a grouped GEMM's members'
+    /// in order, every other step's [`Self::weight_mut`].
+    pub fn weights_mut(&mut self) -> Vec<&mut WeightIx> {
+        match self {
+            Self::GemmGroup(g) | Self::GemmNarrowGroup(g) | Self::GemvGroup(g) => {
+                let GemmGroupBf16 {
+                    first,
+                    second,
+                    third,
+                    ..
+                } = g;
+                let mut all = vec![&mut first.b, &mut second.b];
+                all.extend(third.as_mut().map(|t| &mut t.b));
+                all
+            }
+            other => other.weight_mut().into_iter().collect(),
         }
     }
 }

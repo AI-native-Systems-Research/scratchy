@@ -83,8 +83,9 @@ fn roles() -> Vec<Option<Role>> {
         *slot = Some(role);
     };
     for tape in CUDA_TAPES {
-        for step in tape.steps {
-            match *step {
+        // A grouped GEMM's members are each a GEMM of their own (#1049, `CudaStep::parts`).
+        for step in tape.steps.iter().flat_map(|s| s.parts().into_iter().flatten()) {
+            match step {
                 CudaStep::Embed(EmbedBf16 { table, hidden, .. }) => {
                     set(table.0, Role::Matrix { k: hidden })
                 }
@@ -160,6 +161,10 @@ fn roles() -> Vec<Option<Role>> {
                 | CudaStep::RmsNormUnit(_)
                 | CudaStep::GeluMul(_)
                 | CudaStep::SoftCap(_) => {}
+                // Read through their members, above.
+                CudaStep::GemmGroup(_) | CudaStep::GemmNarrowGroup(_) | CudaStep::GemvGroup(_) => {
+                    unreachable!("`parts` yields a grouped GEMM's members, never the group")
+                }
             }
         }
     }
@@ -1721,6 +1726,9 @@ fn kinds(s: &CudaStep) -> (&'static str, &'static str) {
         CudaStep::LayerScale(_) => ("LayerScale", "LayerScale"),
         CudaStep::SoftCap(_) => ("SoftCap", "SoftCap"),
         CudaStep::RouterNorm(_) => ("RouterNorm", "RouterNorm"),
+        CudaStep::GemmGroup(_) => ("GemmGroup", "GemvGroup"),
+        CudaStep::GemmNarrowGroup(_) => ("GemmNarrowGroup", "GemmNarrowGroup"),
+        CudaStep::GemvGroup(_) => ("GemvGroup", "GemvGroup"),
     }
 }
 

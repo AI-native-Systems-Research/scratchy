@@ -41,9 +41,9 @@ use crate::step::{
     ATTN_D512_BF16_HEAD_DIM, ATTN_DECODE_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16,
     AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16,
     ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16,
-    MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
-    RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, gemv_splits,
+    GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel,
+    MoeRouteBf16, MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16,
+    RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, gemv_splits,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
@@ -1522,6 +1522,67 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 stream.0,
                             )
                         }
+                    }
+                }
+                CudaStep::GemmGroup(g) => {
+                    let members: Vec<(*const c_void, *mut c_void, u32)> = (g.members().iter())
+                        .flatten()
+                        .map(|m| (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n))
+                        .collect();
+                    // SAFETY: as above, for `a` (`m*k`) and each member's `b` (`n*k`) and `c`
+                    // (`m*n`), which overlap neither `a` nor each other (`validate`).
+                    unsafe {
+                        kernels::gemm_group_bf16_abt(slot(g.a), &members, (g.m, g.k), stream.0)
+                    }
+                }
+                CudaStep::GemmNarrowGroup(g) => {
+                    let members: Vec<(*const c_void, *mut c_void, u32)> = (g.members().iter())
+                        .flatten()
+                        .map(|m| (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n))
+                        .collect();
+                    // SAFETY: as the `GemmGroup` arm's.
+                    unsafe {
+                        kernels::gemm_narrow_group_bf16_abt(
+                            slot(g.a),
+                            &members,
+                            (g.m, g.k),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::GemvGroup(g) => {
+                    let present: Vec<(usize, GroupMember)> = (g.members().iter().enumerate())
+                        .filter_map(|(i, m)| m.map(|m| (i, m)))
+                        .collect();
+                    let members: Vec<(*const c_void, *mut c_void, u32)> = (present.iter())
+                        .map(|(_, m)| (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n))
+                        .collect();
+                    let splits: Vec<u32> = (present.iter())
+                        .map(|(_, m)| gemv_splits(m.n, g.k, 1))
+                        .collect();
+                    // Member `i`'s partials follow the members' before it
+                    // (`GemmGroupBf16::gemv_scratch_before`), null at one split.
+                    let parts: Vec<*mut c_void> = (present.iter().zip(&splits))
+                        .map(|(&(i, _), &sp)| {
+                            (g.gemv_scratch_before(i))
+                                .filter(|_| sp > 1 && !partials.is_null())
+                                .map_or(std::ptr::null_mut(), |before| {
+                                    partials.cast::<u8>().wrapping_add(before as usize).cast()
+                                })
+                        })
+                        .collect();
+                    // SAFETY: as the `Gemv` arm, for `a` (`k`) and each member's `b`, `c` and
+                    // partials: the tape's GEMV scratch holds every member's partials one after
+                    // another (`CudaStep::gemv_scratch`, which `validate` checked), so no two
+                    // members' overlap.
+                    unsafe {
+                        kernels::gemv_group_bf16_abt(
+                            slot(g.a),
+                            &members,
+                            &parts,
+                            (g.k, &splits),
+                            stream.0,
+                        )
                     }
                 }
                 CudaStep::RouterLogits(RouterLogitsBf16 {

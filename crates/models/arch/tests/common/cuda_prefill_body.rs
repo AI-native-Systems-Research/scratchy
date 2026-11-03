@@ -74,8 +74,9 @@ fn roles() -> Vec<Option<Role>> {
         *slot = Some(role);
     };
     for tape in CUDA_TAPES {
-        for step in tape.steps {
-            match *step {
+        // A grouped GEMM's members are each a GEMM of their own (#1049, `CudaStep::parts`).
+        for step in tape.steps.iter().flat_map(|s| s.parts().into_iter().flatten()) {
+            match step {
                 // The embedding table: a `[vocab, hidden]` matrix (a tied lm_head reads it as
                 // one too).
                 CudaStep::Embed(EmbedBf16 { table, hidden, .. }) => {

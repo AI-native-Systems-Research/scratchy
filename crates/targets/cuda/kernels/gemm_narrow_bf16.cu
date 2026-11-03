@@ -101,21 +101,30 @@ static_assert(SMEM_TILES == 139264, "4 stages of two A and one B, three tail til
 constexpr int NARROW_SMEM_BYTES = int(SMEM_TILES) + 1024;
 static_assert(NARROW_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 
-__global__ __launch_bounds__(NUM_THREADS, 1) void gemm_narrow_bf16_ker(
-    const __grid_constant__ narrow_globals g) {
-    extern __shared__ int __shm[];
-    tma_swizzle_allocator al((int*)&__shm[0]);
-    tile(&a_smem)[STAGES][CONSUMER_WARPGROUPS] = al.allocate<tile, STAGES, CONSUMER_WARPGROUPS>();
-    tile(&b_smem)[STAGES] = al.allocate<tile, STAGES>();
-    plain_tile(&a_tail)[CONSUMER_WARPGROUPS] = al.allocate<plain_tile, CONSUMER_WARPGROUPS>();
-    plain_tile& b_tail = al.allocate<plain_tile>();
-    plain_tile(&c_smem)[CONSUMER_WARPGROUPS] = al.allocate<plain_tile, CONSUMER_WARPGROUPS>();
+// A narrow CTA's shared tiles: the A and B ring, the tails and the C tiles, in the order the
+// one-GEMM kernel has always carved them.
+struct narrow_smem {
+    tile (&a_smem)[STAGES][CONSUMER_WARPGROUPS];
+    tile (&b_smem)[STAGES];
+    plain_tile (&a_tail)[CONSUMER_WARPGROUPS];
+    plain_tile& b_tail;
+    plain_tile (&c_smem)[CONSUMER_WARPGROUPS];
+};
+
+// One CTA of one narrow GEMM over `g`'s views and `sm`'s tiles: output rows `128 · row_cta ..`.
+// The grouped kernel runs the same CTA for each member, so each member is its own GEMM's bits.
+__device__ inline void narrow_cta(const narrow_globals& g, const narrow_smem& sm, int row_cta) {
+    auto& a_smem = sm.a_smem;
+    auto& b_smem = sm.b_smem;
+    auto& a_tail = sm.a_tail;
+    plain_tile& b_tail = sm.b_tail;
+    auto& c_smem = sm.c_smem;
 
     // The CTA's first 64-row tile of A and C, and how many of its consumer warpgroups have a real
     // row: the last CTA's second warpgroup may have none (any `m ≤ 64`, decode's `m = 1`
     // included). Such a warpgroup loads, multiplies and stores nothing, so no TMA box lies wholly
     // past the array's edge: the GKE probe measured partly-outside boxes only.
-    const int row_tile0 = blockIdx.x * CONSUMER_WARPGROUPS;
+    const int row_tile0 = row_cta * CONSUMER_WARPGROUPS;
     const int live = min(CONSUMER_WARPGROUPS, (g.m - row_tile0 * TILE + TILE - 1) / TILE);
     const int warpgroupid = threadIdx.x / kittens::WARPGROUP_THREADS;
 
@@ -191,6 +200,46 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gemm_narrow_bf16_ker(
     }
 }
 
+__global__ __launch_bounds__(NUM_THREADS, 1) void gemm_narrow_bf16_ker(
+    const __grid_constant__ narrow_globals g) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    st_bf<TILE, TILE>(&a_smem)[STAGES][CONSUMER_WARPGROUPS] =
+        al.allocate<tile, STAGES, CONSUMER_WARPGROUPS>();
+    st_bf<TILE, TILE>(&b_smem)[STAGES] = al.allocate<tile, STAGES>();
+    st_bf<TILE, TILE, false>(&a_tail)[CONSUMER_WARPGROUPS] =
+        al.allocate<plain_tile, CONSUMER_WARPGROUPS>();
+    st_bf<TILE, TILE, false>& b_tail = al.allocate<plain_tile>();
+    st_bf<TILE, TILE, false>(&c_smem)[CONSUMER_WARPGROUPS] =
+        al.allocate<plain_tile, CONSUMER_WARPGROUPS>();
+    narrow_cta(g, narrow_smem{a_smem, b_smem, a_tail, b_tail, c_smem}, blockIdx.x);
+}
+
+// The grouped narrow GEMM (#1049): up to three narrow GEMMs of one `A`, one launch. Member `i` is
+// `m[i]`, a narrow GEMM's views and counts; the grid's y is the member, its x the row CTA. An
+// absent third member repeats the second's views; the grid has no y for it.
+struct narrow_group_globals {
+    narrow_globals m0;
+    narrow_globals m1;
+    narrow_globals m2;
+};
+
+__global__ __launch_bounds__(NUM_THREADS, 1) void gemm_narrow_group_bf16_ker(
+    const __grid_constant__ narrow_group_globals g) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    st_bf<TILE, TILE>(&a_smem)[STAGES][CONSUMER_WARPGROUPS] =
+        al.allocate<tile, STAGES, CONSUMER_WARPGROUPS>();
+    st_bf<TILE, TILE>(&b_smem)[STAGES] = al.allocate<tile, STAGES>();
+    st_bf<TILE, TILE, false>(&a_tail)[CONSUMER_WARPGROUPS] =
+        al.allocate<plain_tile, CONSUMER_WARPGROUPS>();
+    st_bf<TILE, TILE, false>& b_tail = al.allocate<plain_tile>();
+    st_bf<TILE, TILE, false>(&c_smem)[CONSUMER_WARPGROUPS] =
+        al.allocate<plain_tile, CONSUMER_WARPGROUPS>();
+    const narrow_globals& m = blockIdx.y == 2 ? g.m2 : blockIdx.y == 1 ? g.m1 : g.m0;
+    narrow_cta(m, narrow_smem{a_smem, b_smem, a_tail, b_tail, c_smem}, blockIdx.x);
+}
+
 // M7 (#857): the one-column projection, `c[r] = a[r, :] · b[0, :]` (a shared expert's gate,
 // `n = 1`). C's row stride is 2 bytes, below a tensor map's 16, so this is ThunderKittens' warp
 // vector (PLAN-tk100 §2 S4), not the tile GEMM above: one warp per row, 8 rows per CTA. The row
@@ -256,6 +305,16 @@ extern "C" int scratchy_cuda_gemm_narrow_bf16_abt_prepare(void) {
         gemm_narrow_bf16_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, NARROW_SMEM_BYTES));
 }
 
+// The grouped kernel's one-time setup (#1049): `scratchy_cuda_gemm_narrow_bf16_abt_prepare`'s
+// attribute, which loads it before any graph capture.
+//
+// 0 = done; any other value = the cudaError_t of setting the attribute.
+extern "C" int scratchy_cuda_gemm_narrow_group_bf16_abt_prepare(void) {
+    return static_cast<int>(cudaFuncSetAttribute(gemm_narrow_group_bf16_ker,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 NARROW_SMEM_BYTES));
+}
+
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
 // = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
@@ -308,6 +367,61 @@ extern "C" int scratchy_cuda_gemm_narrow_bf16_abt(const void* a, const void* b, 
         void* args[] = {&G};
         const dim3 grid((m + uint32_t(CTA_ROWS) - 1) / uint32_t(CTA_ROWS)), block(NUM_THREADS);
         return static_cast<int>(cudaLaunchKernel(gemm_narrow_bf16_ker, grid, block, args,
+                                                 NARROW_SMEM_BYTES,
+                                                 static_cast<cudaStream_t>(stream)));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+namespace {
+
+// The tile GEMM's rule, for one narrow member: `n` a non-zero multiple of 8 at most 64 (not the
+// `n = 1` warp-vector form), with the shared `m` and `k`.
+bool narrow_tile_shape(uint32_t m, uint32_t n, uint32_t k) {
+    return m != 0 && m <= uint32_t(INT_MAX) && n != 0 && n % VEC == 0 && n <= MAX_N && k != 0 &&
+           k % VEC == 0 && k <= uint32_t(INT_MAX);
+}
+
+// Member `i`'s views and counts, as `scratchy_cuda_gemm_narrow_bf16_abt` builds them. It can
+// throw (TK's host code).
+narrow_globals narrow_member(const void* a, const void* b, void* c, uint32_t m, uint32_t n,
+                             uint32_t k) {
+    operand_gl ag{static_cast<bf16*>(const_cast<void*>(a)), nullptr, nullptr, size_t(m), size_t(k)};
+    operand_gl bg{static_cast<bf16*>(const_cast<void*>(b)), nullptr, nullptr, size_t(n), size_t(k)};
+    output_gl cg{static_cast<bf16*>(c), nullptr, nullptr, size_t(m), size_t(n)};
+    return narrow_globals{ag, bg, cg, int(m), int(k / uint32_t(TILE)), k % uint32_t(TILE) != 0};
+}
+
+}  // namespace
+
+// As `scratchy_cuda_gemm_narrow_bf16_abt` for `count` (2 or 3) members of one `a [m, k]` (#1049):
+// member `i` is `c[i] [m, n[i]] = a · b[i]ᵀ`, each `n[i]` a non-zero multiple of 8 at most 64 (the
+// tile GEMM's; `n = 1` is refused), checked before any pointer is touched. Each member's output
+// is the bits of its own `scratchy_cuda_gemm_narrow_bf16_abt`.
+// `scratchy_cuda_gemm_narrow_group_bf16_abt_prepare` must have succeeded on the current device.
+extern "C" int scratchy_cuda_gemm_narrow_group_bf16_abt(const void* a, const void* const* b,
+                                                        void* const* c, const uint32_t* n,
+                                                        uint32_t m, uint32_t k, uint32_t count,
+                                                        void* stream /* cudaStream_t */) {
+    if (count < 2 || count > 3) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (!narrow_tile_shape(m, n[i], k)) {
+            return SCRATCHY_CUDA_ERR_SHAPE;
+        }
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        const uint32_t last = count - 1;
+        narrow_group_globals G{narrow_member(a, b[0], c[0], m, n[0], k),
+                               narrow_member(a, b[1], c[1], m, n[1], k),
+                               narrow_member(a, b[last], c[last], m, n[last], k)};
+        void* args[] = {&G};
+        const dim3 grid((m + uint32_t(CTA_ROWS) - 1) / uint32_t(CTA_ROWS), count),
+            block(NUM_THREADS);
+        return static_cast<int>(cudaLaunchKernel(gemm_narrow_group_bf16_ker, grid, block, args,
                                                  NARROW_SMEM_BYTES,
                                                  static_cast<cudaStream_t>(stream)));
     } catch (...) {

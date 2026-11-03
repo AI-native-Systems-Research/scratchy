@@ -21,7 +21,7 @@ use scratchy_subtile::ops::SubOpKind;
 use scratchy_subtile::sample_rows::{ResultRows, SampleRowsFacts};
 use scratchy_subtile::subtile_ir::{EwKind, ExpertBundle, ExpertProj, OpStage, RopeForm, SubOp};
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, OutputAlias};
-use scratchy_subtile::tape_folding::{FoldPattern, FusionTable, GatedKernel};
+use scratchy_subtile::tape_folding::{ColsBand, FoldPattern, FusionTable, GatedKernel};
 use scratchy_subtile::tape_steps::OperandIx;
 
 // ── The colour rule ─────────────────────────────────────────────────
@@ -155,10 +155,32 @@ pub enum CudaFusion {
     /// router's logits (Qwen) or none (Gemma) and their argsort folded into the top-k; the
     /// gathered scores, their scale, softmax or renorm, and the per-expert scale its epilogues.
     MoeRoute,
+    /// Sibling projections off one input in one launch (#1049): the q, k and v projections, a
+    /// GDN layer's `in_proj_qkv` and `in_proj_z`, or its `in_proj_a` and `in_proj_b`
+    /// (`step::CudaStep::GemmGroup`, `GemmNarrowGroup`, `GemvGroup`).
+    SiblingMatmuls,
 }
 
-/// CUDA's fusions, in the order the shared fold pass applies them: one sweep of two patterns. The
-/// `Silu` or `Gelu` a `Mul` reads as its operand 0 folds into that `Mul` (metal's `Gated` row).
+/// The output widths CUDA's sibling-matmul fold groups (#1049), one band per grouped kernel: the
+/// tiled GEMM's and the GEMV's (multiples of `step::GEMM_BF16_TILE`'s 256 columns: q, k, v,
+/// `in_proj_qkv`, `in_proj_z`), and the narrow GEMM's (`in_proj_a` and `in_proj_b`, multiples of
+/// 8 at most `step::GEMM_NARROW_BF16_MAX_N`). A width in neither (Gemma's 64-column ones, a
+/// one-column gate) never groups.
+pub const CUDA_SIBLING_BANDS: &[ColsBand] = &[
+    ColsBand {
+        multiple: crate::step::GEMM_BF16_TILE.1,
+        max: u32::MAX,
+    },
+    ColsBand {
+        multiple: crate::step::GEMM_NARROW_BF16_MULTIPLE,
+        max: crate::step::GEMM_NARROW_BF16_MAX_N,
+    },
+];
+
+/// CUDA's fusions, in the order the shared fold pass applies them: one sweep of three patterns.
+/// Up to three dense matmuls of one band off one input fold into one grouped launch (#1049), but
+/// for a gate or up projection, which the gated row leaves its own. The `Silu` or `Gelu` a `Mul`
+/// reads as its operand 0 folds into that `Mul` (metal's `Gated` row).
 /// A MoE block's top-k folds in the softmax (Qwen's softmax-first routing) and the argsort before
 /// it, and takes as its epilogues the gathered scores, Gemma's `hidden^-0.5` scale (tail stage 0),
 /// a softmax over the picks (Gemma) or their renorm (Qwen) (stage 1), and Gemma's per-expert scale
@@ -171,6 +193,13 @@ pub enum CudaFusion {
 pub const CUDA_FUSIONS: FusionTable<CudaFusion> = FusionTable {
     counted: &[],
     sweeps: &[&[
+        FoldPattern::SiblingMatmuls {
+            matmul: SubOpKind::MatmulTile,
+            max: 3,
+            bands: CUDA_SIBLING_BANDS,
+            gated: &[SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul],
+            kernel: CudaFusion::SiblingMatmuls,
+        },
         FoldPattern::Gated {
             mul: SubOpKind::Mul,
             activations: &[

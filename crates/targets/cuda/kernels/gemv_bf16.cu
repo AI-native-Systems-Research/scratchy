@@ -157,20 +157,17 @@ static_assert(SMEM_VECTORS == 81920, "8 warps, 4 stages, a and 4 rows");
 constexpr int GEMV_SMEM_BYTES = int(SMEM_VECTORS) + 1024;
 static_assert(2 * GEMV_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "two CTAs per SM");
 
-// `ROWS` rows per warp, `WARPS · ROWS` per CTA. A row's sum does not depend on `ROWS` (each row
-// adds its own chunks in ascending K, then `warp::sum`), so every instance gives the same bits.
+// One CTA of one GEMV: column block `block`, K split `split`, pair `p`, over `g`'s views, in the
+// CTA's shared vectors and semaphores. `ROWS` rows per warp, `WARPS · ROWS` per CTA. A row's sum
+// does not depend on `ROWS` (each row adds its own chunks in ascending K, then `warp::sum`), nor
+// on which launch runs the CTA, so every instance and the grouped kernel give the same bits.
 template <bool EXPERT, int ROWS>
-__global__ __launch_bounds__(NUM_THREADS, 2) void gemv_bf16_ker(const __grid_constant__ gemv_globals g) {
-    extern __shared__ int __shm[];
-    shared_allocator<1024> al((int*)&__shm[0]);
-    chunk_sv(&a_s)[WARPS][STAGES] = al.allocate<chunk_sv, WARPS, STAGES>();
-    chunk_sv(&b_s)[WARPS][STAGES][ROWS] = al.allocate<chunk_sv, WARPS, STAGES, ROWS>();
-    __shared__ kittens::semaphore arrived[WARPS][STAGES];
-
+__device__ inline void gemv_cta(const gemv_globals& g, chunk_sv (&a_s)[WARPS][STAGES],
+                                chunk_sv (&b_s)[WARPS][STAGES][ROWS],
+                                kittens::semaphore (&arrived)[WARPS][STAGES], int block,
+                                int split, int p) {
     const int w = kittens::warpid();
-    const int split = blockIdx.y;
-    const int p = blockIdx.z;
-    const int row0 = (blockIdx.x * WARPS + w) * ROWS;
+    const int row0 = (block * WARPS + w) * ROWS;
     const int rows = max(0, min(ROWS, g.n - row0));
     const int c0 = split * g.split_chunks;
     const int count = max(0, min(g.split_chunks, g.chunks - c0));
@@ -243,10 +240,53 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gemv_bf16_ker(const __grid_con
     }
 }
 
-__global__ __launch_bounds__(REDUCE_THREADS) void gemv_reduce_ker(
-    const __grid_constant__ reduce_globals g) {
-    // Rows `32v .. 32v + 32` of the `[S, P · n_pad]` partials, one per lane.
-    const int v = blockIdx.x * REDUCE_WARPS + kittens::warpid();
+// The dense or expert GEMV: the grid is `(column blocks, K splits, pairs)`.
+template <bool EXPERT, int ROWS>
+__global__ __launch_bounds__(NUM_THREADS, 2) void gemv_bf16_ker(const __grid_constant__ gemv_globals g) {
+    extern __shared__ int __shm[];
+    shared_allocator<1024> al((int*)&__shm[0]);
+    chunk_sv(&a_s)[WARPS][STAGES] = al.allocate<chunk_sv, WARPS, STAGES>();
+    chunk_sv(&b_s)[WARPS][STAGES][ROWS] = al.allocate<chunk_sv, WARPS, STAGES, ROWS>();
+    __shared__ kittens::semaphore arrived[WARPS][STAGES];
+    gemv_cta<EXPERT, ROWS>(g, a_s, b_s, arrived, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
+// The grouped GEMV (#1049): up to three dense GEMVs of one `a`, one launch. Member `i` is `m[i]`,
+// a dense GEMV's views and counts, its partials at its own place in the scratch; its CTAs are
+// `start[i] .. start[i + 1]` of the grid's x, `blocks[i]` column blocks by its own K splits. A CTA
+// runs its member's `gemv_cta`, so each member is its own GEMV's bits. An absent third member
+// repeats the second's views and starts at the grid's end, so it owns no CTA.
+struct gemv_group_globals {
+    gemv_globals m0;
+    gemv_globals m1;
+    gemv_globals m2;
+    int start1;
+    int start2;
+    int blocks0;
+    int blocks1;
+    int blocks2;
+};
+
+__global__ __launch_bounds__(NUM_THREADS, 2) void gemv_group_bf16_ker(
+    const __grid_constant__ gemv_group_globals g) {
+    extern __shared__ int __shm[];
+    shared_allocator<1024> al((int*)&__shm[0]);
+    chunk_sv(&a_s)[WARPS][STAGES] = al.allocate<chunk_sv, WARPS, STAGES>();
+    chunk_sv(&b_s)[WARPS][STAGES][ROWS_PER_WARP] =
+        al.allocate<chunk_sv, WARPS, STAGES, ROWS_PER_WARP>();
+    __shared__ kittens::semaphore arrived[WARPS][STAGES];
+    const int x = blockIdx.x;
+    const int member = x >= g.start2 ? 2 : x >= g.start1 ? 1 : 0;
+    const int local = x - (member == 2 ? g.start2 : member == 1 ? g.start1 : 0);
+    const int blocks = member == 2 ? g.blocks2 : member == 1 ? g.blocks1 : g.blocks0;
+    const gemv_globals& m = member == 2 ? g.m2 : member == 1 ? g.m1 : g.m0;
+    gemv_cta<false, ROWS_PER_WARP>(m, a_s, b_s, arrived, local % blocks, local / blocks, 0);
+}
+
+// One warp of the reduce: rows `32v .. 32v + 32` of `g`'s `[S, P · n_pad]` partials, one per lane,
+// added split by split in ascending order. The grouped reduce runs the same warp, so a member's
+// sum is its own reduce's bits.
+__device__ inline void reduce_warp(const reduce_globals& g, int v) {
     if (v * REDUCE_ROWS >= g.partials.cols()) {
         return;
     }
@@ -262,6 +302,35 @@ __global__ __launch_bounds__(REDUCE_THREADS) void gemv_reduce_ker(
     if (col < g.n) {
         g.c[{0, 0, p, col}] = base_types::convertor<bf16, float>::convert(acc[0][0]);
     }
+}
+
+__global__ __launch_bounds__(REDUCE_THREADS) void gemv_reduce_ker(
+    const __grid_constant__ reduce_globals g) {
+    reduce_warp(g, blockIdx.x * REDUCE_WARPS + kittens::warpid());
+}
+
+// The grouped GEMV's reduce: the split members' reduces, one launch. Member `i` is `m[i]`; its
+// warps are `start[i] .. start[i + 1]` of the grid's, and `end` is the last member's end. An
+// absent member repeats the last present one's views and starts at `end`, so it owns no warp.
+struct reduce_group_globals {
+    reduce_globals m0;
+    reduce_globals m1;
+    reduce_globals m2;
+    int start1;
+    int start2;
+    int end;
+};
+
+__global__ __launch_bounds__(REDUCE_THREADS) void gemv_reduce_group_ker(
+    const __grid_constant__ reduce_group_globals g) {
+    const int v = blockIdx.x * REDUCE_WARPS + kittens::warpid();
+    if (v >= g.end) {
+        return;
+    }
+    const int member = v >= g.start2 ? 2 : v >= g.start1 ? 1 : 0;
+    const int start = member == 2 ? g.start2 : member == 1 ? g.start1 : 0;
+    const reduce_globals& m = member == 2 ? g.m2 : member == 1 ? g.m1 : g.m0;
+    reduce_warp(m, v - start);
 }
 
 // `n` rounded up to the 32-row block.
@@ -344,32 +413,116 @@ int launch(gemv_globals G, uint32_t n, uint32_t pairs, uint32_t splits, void* st
     return static_cast<int>(cudaLaunchKernel(gemv_reduce_ker, rgrid, rblock, rargs, 0, s));
 }
 
-// The dense GEMV at `splits`: the shape rule, then the views and the launch.
-int dense(const void* a, const void* b, void* c, void* partials, uint32_t n, uint32_t k,
-          uint32_t splits, void* stream) {
+// The dense GEMV's shape rule at `splits`: the chunks of one split, or 0 when it is refused.
+uint32_t dense_split(void* partials, uint32_t n, uint32_t k, uint32_t splits) {
     if (n == 0 || n > uint32_t(INT_MAX) || k == 0 || k % VEC != 0 || k > uint32_t(INT_MAX)) {
-        return SCRATCHY_CUDA_ERR_SHAPE;
+        return 0;
     }
     const uint32_t chunks = (k + uint32_t(CHUNK) - 1) / uint32_t(CHUNK);
     const uint32_t each = split_chunks(chunks, splits);
     if (each == 0 || (splits > 1 && partials == nullptr) ||
         uint64_t(splits) * uint64_t(padded(n)) > uint64_t(INT_MAX)) {
+        return 0;
+    }
+    return each;
+}
+
+// The dense GEMV's views and counts at `splits`, `each` chunks a split (`dense_split`). Building
+// each view encodes its vector tensor map into host memory; nothing is allocated on the device.
+// Every row stride is `2k` bytes, a multiple of 16. It can throw (TK's host code).
+gemv_globals dense_globals(const void* a, const void* b, void* c, void* partials, uint32_t n,
+                           uint32_t k, uint32_t splits, uint32_t each) {
+    const uint32_t chunks = (k + uint32_t(CHUNK) - 1) / uint32_t(CHUNK);
+    in_gl ag{static_cast<bf16*>(const_cast<void*>(a)), nullptr, nullptr, size_t(1), size_t(k)};
+    weight_gl bg{static_cast<bf16*>(const_cast<void*>(b)), nullptr, size_t(1), size_t(n),
+                 size_t(k)};
+    out_gl cg{static_cast<bf16*>(c), nullptr, nullptr, size_t(1), size_t(n)};
+    partial_gl pg{static_cast<float*>(partials), nullptr, nullptr, size_t(splits),
+                  size_t(padded(n))};
+    idx_gl ig{nullptr, nullptr, nullptr, size_t(1), size_t(1)};
+    return gemv_globals{ag,          bg,        cg,        pg,          ig, int(n), int(padded(n)),
+                        int(chunks), int(each), int(splits), 1};
+}
+
+// The dense GEMV at `splits`: the shape rule, then the views and the launch.
+int dense(const void* a, const void* b, void* c, void* partials, uint32_t n, uint32_t k,
+          uint32_t splits, void* stream) {
+    const uint32_t each = dense_split(partials, n, k, splits);
+    if (each == 0) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
-        // Building each view encodes its vector tensor map into host memory; nothing is allocated
-        // on the device. Every row stride is `2k` bytes, a multiple of 16.
-        in_gl ag{static_cast<bf16*>(const_cast<void*>(a)), nullptr, nullptr, size_t(1), size_t(k)};
-        weight_gl bg{static_cast<bf16*>(const_cast<void*>(b)), nullptr, size_t(1), size_t(n),
-                     size_t(k)};
-        out_gl cg{static_cast<bf16*>(c), nullptr, nullptr, size_t(1), size_t(n)};
-        partial_gl pg{static_cast<float*>(partials), nullptr, nullptr, size_t(splits),
-                      size_t(padded(n))};
-        idx_gl ig{nullptr, nullptr, nullptr, size_t(1), size_t(1)};
-        gemv_globals G{ag,          bg,        cg,        pg,          ig, int(n), int(padded(n)),
-                       int(chunks), int(each), int(splits), 1};
+        gemv_globals G = dense_globals(a, b, c, partials, n, k, splits, each);
         return launch<false>(G, n, 1, splits, stream);
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+// The grouped GEMV (#1049): `count` (2 or 3) dense GEMVs of one `a [1, k]`, member `i` writing
+// `c[i]` from `b[i]` at `splits[i]`, its partials at `partials[i]`. Each member meets the dense
+// GEMV's rule on its own. The main launch runs every member's CTAs at 4 rows per warp, the split
+// launcher's instance; then one reduce over the split members, if any. Each member's output is
+// the bits of its own `scratchy_cuda_gemv_split_bf16_abt` at the same split.
+int group(const void* a, const void* const* b, void* const* c, void* const* partials,
+          const uint32_t* n, uint32_t k, const uint32_t* splits, uint32_t count, void* stream) {
+    if (count < 2 || count > 3) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    uint32_t each[3] = {0, 0, 0};
+    uint64_t ctas = 0, vectors = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        each[i] = dense_split(partials[i], n[i], k, splits[i]);
+        if (each[i] == 0) {
+            return SCRATCHY_CUDA_ERR_SHAPE;
+        }
+        ctas += uint64_t(padded(n[i]) / uint32_t(BLOCK_ROWS)) * splits[i];
+        vectors += splits[i] > 1 ? padded(n[i]) / uint32_t(REDUCE_ROWS) : 0;
+    }
+    if (ctas > uint64_t(INT_MAX) || vectors > uint64_t(INT_MAX)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        gemv_globals m[3] = {
+            dense_globals(a, b[0], c[0], partials[0], n[0], k, splits[0], each[0]),
+            dense_globals(a, b[1], c[1], partials[1], n[1], k, splits[1], each[1]),
+            dense_globals(a, b[count - 1], c[count - 1], partials[count - 1], n[count - 1], k,
+                          splits[count - 1], each[count - 1]),
+        };
+        int blocks[3], start[4] = {0, 0, 0, 0};
+        for (uint32_t i = 0; i < 3; i++) {
+            blocks[i] = int(padded(n[i < count ? i : count - 1]) / uint32_t(BLOCK_ROWS));
+            const int own = i < count ? blocks[i] * int(splits[i]) : 0;
+            start[i + 1] = start[i] + own;
+        }
+        gemv_group_globals G{m[0],     m[1],      m[2],      start[1],
+                             start[2], blocks[0], blocks[1], blocks[2]};
+        void* args[] = {&G};
+        const cudaStream_t s = static_cast<cudaStream_t>(stream);
+        const cudaError_t launched =
+            cudaLaunchKernel(gemv_group_bf16_ker, dim3(start[3]), dim3(NUM_THREADS), args,
+                             GEMV_SMEM_BYTES, s);
+        if (launched != cudaSuccess || vectors == 0) {
+            return static_cast<int>(launched);
+        }
+        // The split members' reduces, in member order; a one-split member owns no warp.
+        reduce_globals r[3] = {
+            {m[0].partials, m[0].c, m[0].n, m[0].n_pad, m[0].splits},
+            {m[1].partials, m[1].c, m[1].n, m[1].n_pad, m[1].splits},
+            {m[2].partials, m[2].c, m[2].n, m[2].n_pad, m[2].splits},
+        };
+        int rstart[4] = {0, 0, 0, 0};
+        for (uint32_t i = 0; i < 3; i++) {
+            const bool split = i < count && splits[i] > 1;
+            rstart[i + 1] = rstart[i] + (split ? int(padded(n[i]) / uint32_t(REDUCE_ROWS)) : 0);
+        }
+        reduce_group_globals R{r[0], r[1], r[2], rstart[1], rstart[2], rstart[3]};
+        void* rargs[] = {&R};
+        const dim3 rgrid((uint32_t(rstart[3]) + REDUCE_WARPS - 1) / REDUCE_WARPS),
+            rblock(REDUCE_THREADS);
+        return static_cast<int>(cudaLaunchKernel(gemv_reduce_group_ker, rgrid, rblock, rargs, 0, s));
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
@@ -455,6 +608,20 @@ extern "C" int scratchy_cuda_gemv_bf16_abt_prepare(void) {
     return static_cast<int>(cudaFuncGetAttributes(&attr, gemv_reduce_ker));
 }
 
+// The grouped GEMV's one-time setup (#1049): the attribute on its main kernel, and a load of its
+// reduce, so no kernel loads mid-capture.
+//
+// 0 = done; any other value = the cudaError_t of the first call that failed.
+extern "C" int scratchy_cuda_gemv_group_bf16_abt_prepare(void) {
+    if (const cudaError_t e = cudaFuncSetAttribute(
+            gemv_group_bf16_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, GEMV_SMEM_BYTES);
+        e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    cudaFuncAttributes attr;
+    return static_cast<int>(cudaFuncGetAttributes(&attr, gemv_reduce_group_ker));
+}
+
 // `scratchy_cuda_gemv_bf16_abt_prepare`'s, for the expert instances.
 extern "C" int scratchy_cuda_expert_gemv_bf16_prepare(void) {
     return static_cast<int>(prepare_instances<true>());
@@ -521,4 +688,19 @@ extern "C" int scratchy_cuda_expert_gemv_split_bf16(
     uint32_t pair_rows, uint32_t splits, void* stream /* cudaStream_t; null = default */) {
     return expert(a, b, topk_idx, c, partials, m, top_k, n, k, experts, expert_rows, pair_rows,
                   splits, stream);
+}
+
+// As `scratchy_cuda_gemv_split_bf16_abt` for `count` (2 or 3) members of one `a [1, k]` (#1049):
+// member `i` writes `c[i] [n[i]]` from `b[i] [n[i], k]` at `splits[i]` K splits, its partials (at
+// `splits[i] > 1`) at `partials[i]`, `splits[i] · n_pad[i]` f32 overlapping no operand nor another
+// member's partials. Each member meets that launcher's rule on its own, checked before any pointer
+// is touched, and its output is that launcher's bits at the same split. Two launches at most: the
+// members' CTAs, then one reduce over the split members.
+// `scratchy_cuda_gemv_group_bf16_abt_prepare` must have succeeded on the current device.
+extern "C" int scratchy_cuda_gemv_group_bf16_abt(const void* a, const void* const* b,
+                                                 void* const* c, void* const* partials,
+                                                 const uint32_t* n, uint32_t k,
+                                                 const uint32_t* splits, uint32_t count,
+                                                 void* stream /* cudaStream_t; null = default */) {
+    return group(a, b, c, partials, n, k, splits, count, stream);
 }

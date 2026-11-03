@@ -138,7 +138,113 @@ struct matmul_template {
     };
 };
 
+// The grouped GEMM (#1049): up to three GEMMs `C_i = A · B_iᵀ` sharing `A`, in one persistent
+// launch. Member `i`'s output tiles are tasks `start_i ..` of the task list, in `matmul_template`'s
+// own order within the member; each task runs `matmul_template`'s producer and consumer on that
+// member's `B` and `C`, the same K loop and WGMMA, so each member is its own GEMM's bits. An absent
+// third member repeats the second's views and owns no task.
+template<int M_BLOCK, int N_BLOCK>
+struct group_layout {
+    using  base_tile      = st_bf<64, 64>;
+    using  global_layout  = gl<bf16, 1, 1, -1, -1, base_tile>;
+    struct globals        { global_layout A, B0, B1, B2, C0, C1, C2; int members; };
+    struct input_block    { base_tile a[M_BLOCK], b[N_BLOCK]; };
+    struct finish_block   { base_tile c[M_BLOCK][N_BLOCK]; };
+    struct common_state   { int2 coord; int member; };
+    struct consumer_state { rt_fl<16, N_BLOCK*base_tile::cols> accum; };
+};
+template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12>
+struct group_template {
+    static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
+    using layout    = group_layout<M_BLOCK, N_BLOCK>;
+    using wide_tile = st_bf<64, 64*N_BLOCK>;
+    using b_stack_tile = st_bf<64*N_BLOCK, 64>;
+    using global_layout = typename layout::global_layout;
+    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
+    __device__ static inline const global_layout& b_of(const typename layout::globals& g, int m) {
+        return m == 2 ? g.B2 : m == 1 ? g.B1 : g.B0;
+    }
+    __device__ static inline const global_layout& c_of(const typename layout::globals& g, int m) {
+        return m == 2 ? g.C2 : m == 1 ? g.C1 : g.C0;
+    }
+    __device__ static inline void common_setup(common_setup_args<layout> args) {
+        const auto& G = args.globals;
+        int Rblocks = G.A.rows() / (M_BLOCK*64);
+        int task_id = args.task_iter*gridDim.x + blockIdx.x;
+        int member = 0;
+        for (; member < G.members; member++) {
+            int tasks = Rblocks * (c_of(G, member).cols() / (N_BLOCK*64));
+            if (task_id < tasks) break;
+            task_id -= tasks;
+        }
+        if (member == G.members) { // no more work to do
+            args.num_iters = -1;
+            return;
+        }
+        // `matmul_template`'s tile order, within the member.
+        int Cblocks = c_of(G, member).cols() / (N_BLOCK*64);
+        int super_rows = (Rblocks/SUPER_M)*SUPER_M,
+            final_rows = Rblocks - super_rows,
+            super_repeat = SUPER_M*Cblocks;
+        if (task_id < super_rows * Cblocks)
+            args.common.coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M,
+                           (task_id%super_repeat)/SUPER_M };
+        else {
+            int remainder_id = task_id - super_rows*Cblocks;
+            args.common.coord = { super_rows + (remainder_id%final_rows), remainder_id/final_rows };
+        }
+        args.common.member = member;
+        args.num_iters = G.A.cols()/64;
+        int id = warpgroup::groupid() == NUM_CONSUMER_WARPS/4 ? 0 : warpgroup::groupid(); // producer sets as 0
+        args.common.coord = { args.common.coord.x*M_BLOCK + id, args.common.coord.y*N_BLOCK };
+    }
+    struct producer {
+        __device__ static void setup(producer_setup_args<layout> args) {
+            warpgroup::decrease_registers<40>(); // decrease registers for producers
+        }
+        __device__ static void load(producer_load_args<layout> args) {
+            if (warpgroup::laneid() == 0) {
+                tma::expect(args.inputs_arrived, args.input);
+                for(int i = 0; i < M_BLOCK; i++)
+                    tma::load_async(args.input.a[i], args.globals.A,
+                                    {args.common.coord.x+i, args.iter}, args.inputs_arrived);
+                for(int i = 0; i < N_BLOCK; i++)
+                    tma::load_async(args.input.b[i], b_of(args.globals, args.common.member),
+                                    {args.common.coord.y+i, args.iter}, args.inputs_arrived);
+            }
+        }
+    };
+    struct consumer {
+        __device__ static void setup(consumer_setup_args<layout> args) {
+            warpgroup::increase_registers<232>(); // increase registers for consumers
+            kittens::warp::zero(args.state.accum);
+        }
+        __device__ static void compute(consumer_compute_args<layout> args) {
+            warpgroup::mma_ABt(
+                args.state.accum,
+                args.input.a[warpgroup::groupid()],
+                reinterpret_cast<b_stack_tile&>(args.input.b)
+            );
+            warpgroup::mma_async_wait();
+            if (warp::laneid() == 0) arrive(args.inputs_finished);
+        }
+        __device__ static void finish(consumer_finish_args<layout> args) {
+            warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
+            warpgroup::sync(warpgroup::groupid()+4);
+            if (warpgroup::laneid() == 0) for(int i = 0; i < N_BLOCK; i++) {
+                tma::store_async(c_of(args.globals, args.common.member),
+                                 args.finish.c[warpgroup::groupid()][i],
+                                 {args.common.coord.x, args.common.coord.y+i});
+                tma::store_async_read_wait();
+            }
+            kittens::warp::zero(args.state.accum);
+            if (warp::laneid() == 0) arrive(args.finish_finished);
+        }
+    };
+};
+
 using gemm_bf16_abt_mmt = matmul_template<2, 4, 8>;
+using gemm_group_bf16_abt_mmt = group_template<2, 4, 8>;
 // One 64-column B block: `rt_fl<16, 64>` accumulators, `a[2]` and `b[1]` input tiles, `c[2][1]`.
 using gemm_col64_bf16_abt_mmt = matmul_template<2, 1, 8>;
 
@@ -160,6 +266,13 @@ extern "C" int scratchy_cuda_gemm_bf16_abt_prepare(void) {
 // `scratchy_cuda_gemm_bf16_abt_prepare`'s, for the 64-column instance.
 extern "C" int scratchy_cuda_gemm_col64_bf16_abt_prepare(void) {
     return static_cast<int>(cudaFuncSetAttribute(kittens::prototype::lcf::kernel<gemm_col64_bf16_abt_mmt>,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 GEMM_BF16_ABT_SMEM_BYTES));
+}
+
+// The grouped instance's (#1049), as `scratchy_cuda_gemm_bf16_abt_prepare`'s.
+extern "C" int scratchy_cuda_gemm_group_bf16_abt_prepare(void) {
+    return static_cast<int>(cudaFuncSetAttribute(kittens::prototype::lcf::kernel<gemm_group_bf16_abt_mmt>,
                                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                  GEMM_BF16_ABT_SMEM_BYTES));
 }
@@ -225,4 +338,50 @@ extern "C" int scratchy_cuda_gemm_col64_bf16_abt(const void* a, const void* b, v
                                                  uint32_t m, uint32_t n, uint32_t k,
                                                  void* stream /* cudaStream_t; null = default */) {
     return launch_abt<gemm_col64_bf16_abt_mmt>(a, b, c, m, n, k, stream);
+}
+
+// As `scratchy_cuda_gemm_bf16_abt` for `count` (2 or 3) members of one `a [m, k]` (#1049): member
+// `i` is `c[i] [m, n[i]] = a · b[i]ᵀ`, each `n[i]` a non-zero multiple of 256 at most INT_MAX
+// (the tiled GEMM's rule, with the shared `m` and `k`), checked before any pointer is touched.
+// Each member's output is the bits of its own `scratchy_cuda_gemm_bf16_abt`.
+// `scratchy_cuda_gemm_group_bf16_abt_prepare` must have succeeded on the current device.
+extern "C" int scratchy_cuda_gemm_group_bf16_abt(const void* a, const void* const* b,
+                                                 void* const* c, const uint32_t* n, uint32_t m,
+                                                 uint32_t k, uint32_t count,
+                                                 void* stream /* cudaStream_t; null = default */) {
+    using mmt = gemm_group_bf16_abt_mmt;
+    constexpr uint32_t M_TILE = mmt::M_BLOCK * 64, N_TILE = mmt::N_BLOCK * 64, K_TILE = 64;
+    constexpr uint32_t DIM_MAX = static_cast<uint32_t>(INT_MAX);
+    if (count < 2 || count > 3 || m == 0 || k == 0 || m % M_TILE != 0 || k % K_TILE != 0 ||
+        m > DIM_MAX || k > DIM_MAX) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (n[i] == 0 || n[i] % N_TILE != 0 || n[i] > DIM_MAX) {
+            return SCRATCHY_CUDA_ERR_SHAPE;
+        }
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        using global_layout = typename mmt::layout::global_layout;
+        using globals       = typename mmt::layout::globals;
+        const uint32_t last = count - 1;
+        const auto weight = [&](uint32_t i) {
+            return global_layout{static_cast<bf16*>(const_cast<void*>(b[i])), nullptr, nullptr,
+                                 size_t(n[i]), size_t(k)};
+        };
+        const auto out = [&](uint32_t i) {
+            return global_layout{static_cast<bf16*>(c[i]), nullptr, nullptr, size_t(m), size_t(n[i])};
+        };
+        global_layout Ag{static_cast<bf16*>(const_cast<void*>(a)), nullptr, nullptr, size_t(m), size_t(k)};
+        globals G{Ag,     weight(0), weight(1), weight(last), out(0), out(1), out(last),
+                  int(count)};
+        void* args[] = {&G};
+        const dim3 grid(H100_SXM_SMS), block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+        return static_cast<int>(cudaLaunchKernel(kittens::prototype::lcf::kernel<mmt>, grid, block,
+                                                 args, GEMM_BF16_ABT_SMEM_BYTES,
+                                                 static_cast<cudaStream_t>(stream)));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
 }

@@ -1161,7 +1161,44 @@ impl CudaTape {
         let scratch = self.gdn_regions(total, &mut regions)?;
         let moe = self.moe_regions(total, &regions)?;
         let gemv = self.gemv_region(total, &regions, moe)?;
-        for (step, s) in self.steps.iter().enumerate() {
+        for (step, whole) in self.steps.iter().enumerate() {
+            self.check_group(step, whole)?;
+            for s in whole.parts().iter().flatten() {
+                self.check_step(step, s, (total, &regions), (scratch, moe, gemv))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A grouped GEMM's members (#1049): two or three, each a GEMM of its own kernel's shape
+    /// (checked as a step of its own by `validate`), whose outputs overlap neither each other nor
+    /// the shared input. Any other step passes.
+    fn check_group(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
+        let parts: Vec<CudaStep> = s.parts().into_iter().flatten().collect();
+        let writes = (parts.iter())
+            .map(|p| p.extents().map(|e| e.writes))
+            .collect::<Option<Vec<ArenaSpan>>>()
+            .ok_or(TapeError::StepOverflow { step })?;
+        for (i, &w) in writes.iter().enumerate() {
+            if writes[..i].iter().any(|&v| overlap(v, w)) {
+                return Err(TapeError::WritesOverlap { step });
+            }
+        }
+        Ok(())
+    }
+
+    /// One kernel step of the `step`-th step, `s` (the step itself, or a grouped GEMM's member):
+    /// its spans aligned and inside the arena, its writes over no read and no region, the GDN,
+    /// MoE and GEMV scratches only its own, its operands the tape's regions, and its weight
+    /// declared at least as large as it reads.
+    fn check_step(
+        &self,
+        step: usize,
+        s: &CudaStep,
+        (total, regions): (u64, &[(Region, ArenaSpan)]),
+        (scratch, moe, gemv): (Option<ArenaSpan>, Option<ArenaSpan>, Option<ArenaSpan>),
+    ) -> Result<(), TapeError> {
+        {
             let e = s.extents().ok_or(TapeError::StepOverflow { step })?;
             let reads = e.reads.iter().flatten();
             let writes = [Some(e.writes), e.second_write];
@@ -1651,6 +1688,10 @@ impl CudaTape {
             | CudaStep::LayerScale(_)
             | CudaStep::SoftCap(_)
             | CudaStep::GemmCol64(_) => Ok(()),
+            // `validate` checks a grouped GEMM through its members ([`CudaStep::parts`]).
+            CudaStep::GemmGroup(_) | CudaStep::GemmNarrowGroup(_) | CudaStep::GemvGroup(_) => {
+                Ok(())
+            }
         }
     }
 

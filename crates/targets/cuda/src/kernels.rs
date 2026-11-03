@@ -243,6 +243,40 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_gemv_bf16_abt_prepare() -> i32;
+    fn scratchy_cuda_gemm_group_bf16_abt_prepare() -> i32;
+    fn scratchy_cuda_gemm_group_bf16_abt(
+        a: *const c_void,
+        b: *const *const c_void,
+        c: *const *mut c_void,
+        n: *const u32,
+        m: u32,
+        k: u32,
+        count: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemm_narrow_group_bf16_abt_prepare() -> i32;
+    fn scratchy_cuda_gemm_narrow_group_bf16_abt(
+        a: *const c_void,
+        b: *const *const c_void,
+        c: *const *mut c_void,
+        n: *const u32,
+        m: u32,
+        k: u32,
+        count: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemv_group_bf16_abt_prepare() -> i32;
+    fn scratchy_cuda_gemv_group_bf16_abt(
+        a: *const c_void,
+        b: *const *const c_void,
+        c: *const *mut c_void,
+        partials: *const *mut c_void,
+        n: *const u32,
+        k: u32,
+        splits: *const u32,
+        count: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemv_split_bf16_abt(
         a: *const c_void,
         b: *const c_void,
@@ -512,6 +546,14 @@ pub enum KernelError {
     /// The split-K GEMV does not take this shape, split count or scratch (a null scratch above
     /// one split); nothing was launched.
     GemvSplit { n: u32, k: u32, splits: u32 },
+    /// A grouped GEMM (#1049) does not take this member count or one of its members' shapes;
+    /// nothing was launched. `n` is each member's (0 past `count`).
+    GroupShape {
+        kernel: &'static str,
+        m: u32,
+        k: u32,
+        n: [u32; 3],
+    },
     /// The decode attention does not take this shape, scale or window; nothing was launched.
     AttnDecodeShape {
         q_heads: u32,
@@ -655,6 +697,9 @@ impl fmt::Display for KernelError {
             KernelError::MoeShape { kernel, dims } => {
                 write!(f, "{kernel} refused shape {dims:?}")
             }
+            KernelError::GroupShape { kernel, m, k, n } => {
+                write!(f, "{kernel} refused shape m={m} k={k} n={n:?}")
+            }
             KernelError::HostException => write!(f, "kernel launcher's host code threw"),
             KernelError::Cuda(code) => write!(f, "CUDA error {code}"),
         }
@@ -703,6 +748,19 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
         scratchy_cuda_expert_gemm_e128_col64_bf16_prepare,
     ),
     ("expert_gemv_bf16", scratchy_cuda_expert_gemv_bf16_prepare),
+    // #1049's grouped GEMMs: the attribute, which loads each before any graph capture.
+    (
+        "gemm_group_bf16_abt",
+        scratchy_cuda_gemm_group_bf16_abt_prepare,
+    ),
+    (
+        "gemm_narrow_group_bf16_abt",
+        scratchy_cuda_gemm_narrow_group_bf16_abt_prepare,
+    ),
+    (
+        "gemv_group_bf16_abt",
+        scratchy_cuda_gemv_group_bf16_abt_prepare,
+    ),
     // Load-only (#1048): these set no attribute, but a worker captures its tapes into CUDA Graphs
     // at construction, and a kernel the runtime has not loaded must not first load during a
     // capture. Every kernel a tape can launch is loaded here, when the device opens.
@@ -1412,6 +1470,141 @@ pub unsafe fn gemm_narrow_bf16_abt(
     // shape before it touches a pointer and catches every C++ exception.
     let code = unsafe { scratchy_cuda_gemm_narrow_bf16_abt(a, b, c, m, n, k, stream) };
     check(code, KernelError::NarrowShape { m, n, k })
+}
+
+/// The members of a grouped GEMM launch (#1049): 2 or 3 `(B, C, n)`, sharing `A`, its `m` and
+/// `k`.
+pub type GroupOperands<'g> = &'g [(*const c_void, *mut c_void, u32)];
+
+/// The member columns of `members` as the launcher reads them, and its refusal.
+fn group_parts(
+    kernel: &'static str,
+    members: GroupOperands<'_>,
+    (m, k): (u32, u32),
+) -> ([*const c_void; 3], [*mut c_void; 3], [u32; 3], KernelError) {
+    let (mut b, mut c, mut n) = ([std::ptr::null(); 3], [std::ptr::null_mut(); 3], [0u32; 3]);
+    for (i, &(bi, ci, ni)) in members.iter().take(3).enumerate() {
+        (b[i], c[i], n[i]) = (bi, ci, ni);
+    }
+    (b, c, n, KernelError::GroupShape { kernel, m, k, n })
+}
+
+/// [`gemm_bf16_abt`] of every member of `members` in one launch (`kernels/gemm_bf16.cu`'s
+/// grouped template): member `i`'s `C_i [m, n_i] = A · B_iᵀ`, each the bits of its own
+/// [`gemm_bf16_abt`]. Asynchronous.
+///
+/// Refused with [`KernelError::GroupShape`], before any pointer is touched, unless there are 2 or
+/// 3 members and each meets [`gemm_bf16_abt`]'s rule with the shared `m` and `k`.
+///
+/// # Safety
+///
+/// As [`gemm_bf16_abt`]'s, for `a` and every member's `b` and `c`; and no member's `c` overlaps
+/// another's.
+pub unsafe fn gemm_group_bf16_abt(
+    a: *const c_void,
+    members: GroupOperands<'_>,
+    (m, k): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let (b, c, n, refused) = group_parts("gemm_group_bf16_abt", members, (m, k));
+    let count = members.len() as u32;
+    // SAFETY: the caller upholds the pointer and stream contract above; the three arrays are
+    // three long; the launcher checks the count and every member's shape before it reads a
+    // pointer, and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_gemm_group_bf16_abt(
+            a,
+            b.as_ptr(),
+            c.as_ptr(),
+            n.as_ptr(),
+            m,
+            k,
+            count,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// [`gemm_narrow_bf16_abt`] of every member of `members` in one launch: member `i`'s
+/// `C_i [m, n_i] = A · B_iᵀ`, each the bits of its own [`gemm_narrow_bf16_abt`]. Asynchronous.
+///
+/// Refused with [`KernelError::GroupShape`], before any pointer is touched, unless there are 2 or
+/// 3 members and each meets [`gemm_narrow_bf16_abt`]'s rule with the shared `m` and `k`, its `n`
+/// a multiple of 8 (not the `n = 1` warp-vector form).
+///
+/// # Safety
+///
+/// As [`gemm_narrow_bf16_abt`]'s, for `a` and every member's `b` and `c`; and no member's `c`
+/// overlaps another's.
+pub unsafe fn gemm_narrow_group_bf16_abt(
+    a: *const c_void,
+    members: GroupOperands<'_>,
+    (m, k): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let (b, c, n, refused) = group_parts("gemm_narrow_group_bf16_abt", members, (m, k));
+    let count = members.len() as u32;
+    // SAFETY: as `gemm_group_bf16_abt`'s.
+    let code = unsafe {
+        scratchy_cuda_gemm_narrow_group_bf16_abt(
+            a,
+            b.as_ptr(),
+            c.as_ptr(),
+            n.as_ptr(),
+            m,
+            k,
+            count,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// [`gemv_split_bf16_abt`] of every member of `members` in two launches at most (the members'
+/// CTAs, then one reduce over the split ones): member `i`'s `c_i [n_i] = a · B_iᵀ` at
+/// `splits[i]`, its partials at `partials[i]`, each the bits of its own [`gemv_split_bf16_abt`]
+/// at that split. Asynchronous.
+///
+/// Refused with [`KernelError::GroupShape`], before any pointer is touched, unless there are 2 or
+/// 3 members, `splits` has one entry per member, and each member meets
+/// [`gemv_split_bf16_abt`]'s rule at its split.
+///
+/// # Safety
+///
+/// As [`gemv_split_bf16_abt`]'s, for `a` and every member's `b`, `c` and partials; no member's
+/// `c` or partials overlaps another's.
+pub unsafe fn gemv_group_bf16_abt(
+    a: *const c_void,
+    members: GroupOperands<'_>,
+    partials: &[*mut c_void],
+    (k, splits): (u32, &[u32]),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let (b, c, n, refused) = group_parts("gemv_group_bf16_abt", members, (1, k));
+    if splits.len() != members.len() || partials.len() != members.len() {
+        return Err(refused);
+    }
+    let (mut s, mut p) = ([1u32; 3], [std::ptr::null_mut(); 3]);
+    for (i, (&si, &pi)) in splits.iter().zip(partials).take(3).enumerate() {
+        (s[i], p[i]) = (si, pi);
+    }
+    let count = members.len() as u32;
+    // SAFETY: as `gemm_group_bf16_abt`'s, and the splits and partials arrays are three long.
+    let code = unsafe {
+        scratchy_cuda_gemv_group_bf16_abt(
+            a,
+            b.as_ptr(),
+            c.as_ptr(),
+            p.as_ptr(),
+            n.as_ptr(),
+            k,
+            s.as_ptr(),
+            count,
+            stream,
+        )
+    };
+    check(code, refused)
 }
 
 /// Launch the bf16 GEMV `c = a · Bᵀ`, the one-row GEMM: `a` is `[1, k]`, `B` `[n, k]` and `c`

@@ -118,6 +118,8 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "RmsNormUnitBf16",
                 "LayerScaleBf16",
                 "SoftCapBf16",
+                "GemmGroupBf16",
+                "GroupMember",
             ],
         },
         ModuleRow {
@@ -580,6 +582,8 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         | CudaStep::RmsNormUnit(_)
         | CudaStep::GeluMul(_)
         | CudaStep::SoftCap(_) => None,
+        // Read through their members ([`CudaStep::parts`]), each a GEMM's `[n, k]`.
+        CudaStep::GemmGroup(_) | CudaStep::GemmNarrowGroup(_) | CudaStep::GemvGroup(_) => None,
     }
 }
 
@@ -626,8 +630,12 @@ pub fn weight_table(
     let n = bindings.len();
     let mut roles: Vec<Option<Role>> = vec![None; n];
     for tape in tapes.iter() {
-        for step in &tape.steps {
-            let Some((WeightIx(ix), role)) = role(step) else {
+        for step in tape
+            .steps
+            .iter()
+            .flat_map(|s| s.parts().into_iter().flatten())
+        {
+            let Some((WeightIx(ix), role)) = role(&step) else {
                 continue;
             };
             let ix = ix as usize;
@@ -770,7 +778,7 @@ pub fn weight_table(
     }
     for tape in tapes.iter_mut() {
         for step in &mut tape.steps {
-            if let Some(w) = step.weight_mut() {
+            for w in step.weights_mut() {
                 w.0 = remap[w.0 as usize] as u32;
             }
         }

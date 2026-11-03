@@ -31,11 +31,11 @@ use scratchy_target_cuda::step::{
     GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX,
     GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_NARROW_BF16_MAX_N,
     GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16,
-    GateScaleBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K,
-    MatmulKernel, MoeRouteBf16, MoeWeight, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
-    ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
-    RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16,
-    SiluMulBf16, SoftCapBf16,
+    GateScaleBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16, GemmGroupBf16, GroupKind,
+    GroupMember, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, MoeWeight,
+    PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16,
+    RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS,
+    SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
@@ -252,7 +252,66 @@ pub fn lower_fused(
         CudaFusion::SiluMul => gated_mul(cx, s, fusion.shape, computes).map(CudaStep::SiluMul),
         CudaFusion::GeluMul => gated_mul(cx, s, fusion.shape, computes).map(CudaStep::GeluMul),
         CudaFusion::MoeRoute => moe_route(cx, s, fusion.shape, computes).map(CudaStep::MoeRoute),
+        CudaFusion::SiblingMatmuls => sibling_matmuls(cx, s, fusion.shape, computes),
     }
+}
+
+/// The `SiblingMatmuls` fold (#1049): the driving `MatmulTile` and the siblings its shape names,
+/// each lowered as the GEMM it is on its own ([`lower_step`]), as one grouped launch of that
+/// kernel. Every member must have lowered to the same kernel over the same `a`, `m` and `k` (the
+/// fold's band picks one kernel; a member that did not is refused, never split apart).
+fn sibling_matmuls(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    shape: FusedShape,
+    computes: &[TapeStep<'_>],
+) -> Result<CudaStep, CanonicalRefusal> {
+    let step = s.step;
+    let FusedShape::SiblingMatmuls { slots } = shape else {
+        return Err(CanonicalRefusal::FusionShape { step });
+    };
+    let mut members = vec![s];
+    for slot in slots.into_iter().flatten() {
+        let sib = (computes.iter().find(|c| c.writes == slot)).ok_or(
+            CanonicalRefusal::ProducerMissing {
+                step,
+                op: s.node.op.name(),
+            },
+        )?;
+        members.push(sib);
+    }
+    let refused = || CanonicalRefusal::FusionShape { step };
+    let lowered = (members.iter())
+        .map(|m| {
+            (lower_step(cx, m, computes)?.as_ref())
+                .and_then(CudaStep::group_kind)
+                .ok_or_else(refused)
+        })
+        .collect::<Result<Vec<(GroupKind, GemmBf16)>, _>>()?;
+    let [(kind, first), rest @ ..] = lowered.as_slice() else {
+        return Err(refused());
+    };
+    let same =
+        (rest.iter()).all(|(k, g)| k == kind && (g.a, g.m, g.k) == (first.a, first.m, first.k));
+    let member = |(_, g): &(GroupKind, GemmBf16)| GroupMember {
+        b: g.b,
+        c: g.c,
+        n: g.n,
+    };
+    let ([second, third @ ..], true) = (rest, same) else {
+        return Err(refused());
+    };
+    if third.len() > 1 {
+        return Err(refused());
+    }
+    Ok(kind.grouped(GemmGroupBf16 {
+        a: first.a,
+        m: first.m,
+        k: first.k,
+        first: member(&lowered[0]),
+        second: member(second),
+        third: third.first().map(member),
+    }))
 }
 
 /// `MatmulTile` as a bf16 GEMM `C[m, n] = A[m, k] · B[n, k]ᵀ`: the tiled GEMM when `n` is a
