@@ -104,6 +104,15 @@ Note the convention for selecting models and quants:
   it. `metal-base` in place of `metal` builds the same engine with a dense KV
   cache and no MTP heads (`metal-base,model/mtp-heads` keeps MTP).
 
+### Prebuilt binary (Homebrew)
+
+On macOS 26.2 or newer (Apple Silicon), skip the build entirely:
+
+```bash
+brew tap scratchy https://github.com/AI-native-Systems-Research/scratchy
+brew install scratchy/scr
+```
+
 ### Deep Dives
 
 - See [`docs/blogs/REUSE.md`](docs/blogs/REUSE.md) — *What does "reuse" mean in
