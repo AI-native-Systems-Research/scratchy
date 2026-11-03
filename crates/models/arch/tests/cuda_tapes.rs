@@ -59,8 +59,8 @@ const DECODE_COLOUR_BYTES: &[u64] = &[
     2048, 2048, 12288, 4096, 32, 32, 4096, 2048, 7168, 7168, 7168, 7168, 2048, 8192, 1024, 1024,
     1024, 4096, 4096, 496640, 4096, 4096, 4096, 4096, 4096, 4096,
 ];
-/// 633,600 bytes before #1031, plus its 49,152-byte GEMV scratch at the end.
-const DECODE_TOTAL: u64 = 682_752;
+/// 633,600 bytes before #1031, plus its 20,480-byte GEMV scratch at the end.
+const DECODE_TOTAL: u64 = 654_080;
 const DECODE_RESULT: ArenaSpan = span(77_312, 496_640);
 const DECODE_IDS: ArenaSpan = span(633_344, 4);
 const DECODE_ROTARY: ArenaSpan = span(598_528, 128);

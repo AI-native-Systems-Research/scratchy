@@ -272,25 +272,36 @@ pub const GEMV_BLOCK_ROWS: u32 = 32;
 pub const GEMV_MAX_SPLITS: u32 = 16;
 /// The CTAs a decode GEMV aims for: two per SM of the H100's 132.
 pub const GEMV_TARGET_CTAS: u32 = 264;
+/// The column blocks (`⌈n / 32⌉ · pairs`) from which a decode GEMV runs at one split: half of
+/// [`GEMV_TARGET_CTAS`]'s resident CTAs, 66. At or above it one split already keeps the GPU busy,
+/// and splitting only adds the reduce launch and a round trip of the partials (#1031's diagnosis:
+/// one split is 10–26% faster on every such shape).
+pub const GEMV_SPLIT_BELOW_BLOCKS: u32 = GEMV_TARGET_CTAS / 4;
 
 /// #1031's split table (`GEMV_SPLITS`), as a function of a decode GEMV's `(n, k)` and its pairs
-/// (1 for the dense GEMV and the router, `m · top_k` for the expert GEMV): the fewest K splits
-/// that put [`GEMV_TARGET_CTAS`] CTAs on the GPU, each split at least 2 chunks long (so its 4-stage
-/// ring has loads to overlap), at most [`GEMV_MAX_SPLITS`]. A pure function of the step's
-/// constant shape, so every launch of a step adds its products in the same order. The dense and
-/// the expert GEMV run one row routine and take this one table; at one pair and the same `(n, k)`
-/// they take the same split, so their rows are the same bits.
+/// (1 for the dense GEMV and the router, `m · top_k` for the expert GEMV): one split from
+/// [`GEMV_SPLIT_BELOW_BLOCKS`] column blocks; below it, the fewest K splits that put
+/// [`GEMV_TARGET_CTAS`] CTAs on the GPU, each split at least 2 chunks long (so its 4-stage ring
+/// has loads to overlap), at most [`GEMV_MAX_SPLITS`]. A pure function of the step's constant
+/// shape, so every launch of a step adds its products in the same order. The dense and the expert
+/// GEMV run one row routine and take this one table; at one pair and the same `(n, k)` they take
+/// the same split, so their rows are the same bits.
 ///
 /// | `(n, k)`, pairs | blocks | split |
 /// |---|---|---|
-/// | 9B `(4096, 4096)`, `(4096, 12288)` | 128 | 3 |
-/// | 9B `(1024, 4096)` | 32 | 8 |
-/// | 0.8B `(4096, 1024)` | 128 | 2 |
+/// | 9B `(4096, 4096)`, `(4096, 12288)`, `(8192, 4096)` | 128, 256 | 1 |
+/// | 9B `(1024, 4096)` | 32 | 4 |
+/// | 0.8B `(4096, 1024)`, `(6144, 1024)` | 128, 192 | 1 |
+/// | 0.8B `(1024, 3584)` | 32 | 5 |
 /// | the lm_heads, `n` ≥ 8448 | ≥ 264 | 1 |
-/// | 35B experts `(512, 2048)` × 8 | 128 | 3 |
-/// | Gemma experts `(704, 2816)` × 8 | 176 | 2 |
+/// | 35B experts `(512, 2048)` × 8 | 128 | 1 |
+/// | Gemma experts `(704, 2816)` × 8 | 176 | 1 |
+/// | the routers, `(256, 2048)` and `(128, 2816)` | 8, 4 | 4 |
 pub const fn gemv_splits(n: u32, k: u32, pairs: u32) -> u32 {
     let blocks = n.div_ceil(GEMV_BLOCK_ROWS) as u64 * pairs as u64;
+    if blocks >= GEMV_SPLIT_BELOW_BLOCKS as u64 {
+        return 1;
+    }
     let chunks = k.div_ceil(GEMV_CHUNK);
     let mut splits = 1u32;
     while blocks * (splits as u64) < GEMV_TARGET_CTAS as u64

@@ -89,8 +89,8 @@ const COLOURS: usize = 29;
 /// Per bucket: the arena's `total_bytes` (with the token ids), the MoE scratch's offset and bytes
 /// (from `logits` to the end of `down`), and its max tiles.
 const ARENAS: [(u32, u64, u64, u64, u32); 5] = [
-    // 763,904 bytes before #1031, plus its 65,536-byte GEMV scratch at the end.
-    (1, 829_440, 705_280, 58_368, 0),
+    // 763,904 bytes before #1031, plus its 32,768-byte GEMV scratch at the end.
+    (1, 796_672, 705_280, 58_368, 0),
     (512, 772_613_632, 359_927_808, 412_683_776, 286),
     (1024, 1_179_007_488, 719_854_592, 459_148_800, 318),
     (2048, 1_991_795_456, 1_439_708_160, 552_079_104, 382),
