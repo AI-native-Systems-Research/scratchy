@@ -2783,10 +2783,18 @@ impl MetalWorker {
         Ok(())
     }
 
-    /// Allocate the draft model's KV pool. Mirrors `initialize_cache`'s
-    /// target-pool path: StorageModePrivate buffers pinned into the
-    /// allocator's shared residency set so attention reads don't race
-    /// the Apple pager.
+    /// The reach a grow maps through for the highest block a step named:
+    /// that block's chunk, rounded up, never past the pool. [`Self::grow_metal_kv_to_cover`]
+    /// calls this for the fp16 pool's stores; the TurboQuant store takes the raw
+    /// group max the same way. LIFTED OUT of the grow so the law is testable:
+    /// the reach is the chunk-aligned named block and nothing past it — main
+    /// computed `max(block, 2·allocated − 1)` here, mapping up to 2× the reach
+    /// (clamped inside the budget) in mapper-sized jumps.
+    fn cover_through(block: usize, num_blocks: usize, blocks_per_chunk: usize) -> usize {
+        ((block.min(num_blocks.saturating_sub(1)) / blocks_per_chunk + 1) * blocks_per_chunk)
+            .min(num_blocks)
+    }
+
     /// Reactive KV (2b): map the KV stores through every block the step names before a forward
     /// derefs them — TurboQuant's through group 0's (`max_full_block`), the chunked fp16 pool's
     /// through every group's (`max_block`) — mapped, wired and zeroed where they must be by
@@ -2859,11 +2867,13 @@ impl MetalWorker {
         // the chunk after the last one the pool holds whole: views of the stores,
         // mapped first through the chunk it grows to. The grow covers exactly the
         // chunks the step's own block tables reach — their max is the whole coloring
-        // this pool can be asked for before the forward runs — and none past them,
-        // so the pool's memory follows the blocks in use and commits nothing the
-        // budget did not fund.
+        // this pool can be asked for before the forward runs — and none past them.
+        // The transient is bounded by one chunk, not by a doubling of what is
+        // mapped: main grew through `max(block, 2·allocated − 1)` here, mapping up
+        // to 2× the reach (inside the budget — both laws clamp at `num_blocks` —
+        // but past what any step had named) and stalling on the mapper in jumps.
         let bpc = scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize;
-        let through = ((max_block.min(kv.num_blocks - 1) / bpc + 1) * bpc).min(kv.num_blocks);
+        let through = Self::cover_through(max_block, kv.num_blocks, bpc);
         if !shared {
             stores
                 .grow_to(through, mapper)
@@ -8512,6 +8522,31 @@ inventory::submit!(&MetalWorkerFactory as &dyn crate::worker_factory::WorkerFact
 #[cfg(all(test, feature = "metal"))]
 mod tests {
     use super::StepSlotMapping;
+
+    /// ⭐ A GROW COVERS THE CHUNK THE NAMED BLOCK NEEDS, AND NOTHING PAST IT. The
+    /// reach is the chunk-aligned highest block a step named, clamped at the pool.
+    /// Main grew through `max(block, 2·allocated − 1)` instead: a step naming
+    /// block 33 of a pool holding 32 (16-block chunks) took 64 blocks — a whole
+    /// doubling past the named chunk. The law is the worker's grow law, lifted
+    /// into `MetalWorker::cover_through` so it can fail.
+    #[test]
+    fn a_grow_covers_the_chunk_the_named_block_needs_and_nothing_past_it() {
+        // The case the doubling got wrong: block 33 needs chunk 3 (48 blocks),
+        // not the 64 of main's growth_target(33) = max(33, 2·32−1) = 63.
+        assert_eq!(super::MetalWorker::cover_through(33, 64, 16), 48);
+        assert_eq!(super::MetalWorker::cover_through(47, 64, 16), 48);
+        // A block at a chunk edge takes exactly its chunk.
+        assert_eq!(super::MetalWorker::cover_through(32, 64, 16), 48);
+        assert_eq!(super::MetalWorker::cover_through(17, 64, 16), 32);
+        // The last block takes the last chunk, exactly.
+        assert_eq!(super::MetalWorker::cover_through(64, 64, 16), 64);
+        assert_eq!(super::MetalWorker::cover_through(63, 64, 16), 64);
+        // A block past the pool clamps to the pool, never past the budget.
+        assert_eq!(super::MetalWorker::cover_through(999, 64, 16), 64);
+        // The grow's own granule: 128-block chunks, as the metal pool uses.
+        assert_eq!(super::MetalWorker::cover_through(255, 384, 128), 256);
+        assert_eq!(super::MetalWorker::cover_through(256, 384, 128), 384);
+    }
 
     /// A slot two sequences write in one step keeps its first writer; the later
     /// write becomes the skip sentinel. A span (unrotated) write of the same
