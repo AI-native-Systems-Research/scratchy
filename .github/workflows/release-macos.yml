@@ -55,11 +55,16 @@ jobs:
 
       # A release is the distributable, so it carries every model; a dispatch
       # run uses the input scope. Naming zero models is a build-time panic, so
-      # the scope is never empty.
+      # the scope is never empty. quant/mlx is always on: MLX affine is what
+      # people run on a Mac, and the Gemma 4 26B-A4B drafter that metal's
+      # mtp-heads publishes lives under it. Active presets are arch-wide: an
+      # arch that declares any MLX preset ships only its MLX variants (every
+      # declared preset x every config) and loses its dense/bf16 build; arches
+      # with no MLX preset stay dense.
       - name: Build
         env:
           MODEL_SCOPE: ${{ github.event_name == 'release' && 'model/all' || inputs.model-scope }}
-        run: cargo build --release -p scratchy-cli --features metal,"$MODEL_SCOPE"
+        run: cargo build --release -p scratchy-cli --features metal,quant/mlx,"$MODEL_SCOPE"
 
       # Import the Developer ID Application certificate into an ephemeral
       # keychain. MACOS_SIGNING_IDENTITY is a repo *variable* (not secret):
