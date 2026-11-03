@@ -94,6 +94,14 @@ fn accuracy(c: &TaskCell) -> Option<f64> {
         .filter(|_| c.thinking_answers.unwrap_or(0) == 0 && !mostly_capped(c))
 }
 
+/// How many times faster scratchy is to its first token than the rival: none where either mostly
+/// ran its answers to their cap, whose requests were not the tasks' answers.
+fn ttft_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
+    (!mostly_capped(c) && !mostly_capped(r))
+        .then(|| times(c.median_ttft_ms, r.median_ttft_ms, true))
+        .flatten()
+}
+
 /// How far apart two cells' mean answers may be, as a share of the longer, for their whole
 /// answers' times to be compared: an engine that stops at EOS where the other runs on (oMLX does,
 /// despite `ignore_eos`) answers in fewer tokens, and its time is no faster for it.
@@ -161,7 +169,7 @@ pub fn tasks_table(m: &Model) -> Element {
     rsx! {
         Table {
             headers: [
-                "workload", "users", "TTFT", "total", "answer tok", "cached tok", "right",
+                "workload", "load", "TTFT", "total", "answer tok", "cached tok", "right",
                 "vs", "TTFT", "total",
             ]
             .map(String::from)
@@ -170,13 +178,20 @@ pub fn tasks_table(m: &Model) -> Element {
                 {
                     let (name, _) = workload_label(&c.workload);
                     let them = rival(m, &c.workload, c.conc);
-                    let ttft = them.and_then(|(_, r)| times(c.median_ttft_ms, r.median_ttft_ms, true));
+                    let ttft = them.and_then(|(_, r)| ttft_times(c, r));
                     let total = them.and_then(|(_, r)| total_times(c, r));
-                    let vs = them.map_or_else(|| "—".to_string(), |(e, _)| e.label().to_string());
+                    // A borrowed rival says which run it is from, as the grid's borrowed engines do.
+                    let vs = them.map_or_else(
+                        || "—".to_string(),
+                        |(e, r)| match &r.borrowed_from {
+                            Some(when) => format!("{} (from {})", e.label(), when.month_day()),
+                            None => e.label().to_string(),
+                        },
+                    );
                     rsx! {
                         TableRow {
                             TableCell { "{name}" }
-                            TableCell { "{c.conc}" }
+                            TableCell { "{load_label(c)}" }
                             if c.measured() {
                                 // A cell where some requests failed covers only the others: marked,
                                 // as the random cells are.
@@ -204,6 +219,77 @@ pub fn tasks_table(m: &Model) -> Element {
              about one length."
         }
     }
+}
+
+/// One dataset overview square: the users count, the workload, and how many times faster
+/// scratchy is to its first token (None where either side has no number).
+pub type GlanceSquare = (u32, String, Option<f64>);
+
+/// The workloads a model's dataset cells cover, in the page's order: the overview's columns.
+pub fn workloads(m: &Model) -> Vec<&str> {
+    let mut ws: Vec<&str> = Engine::Scratchy
+        .tasks(m)
+        .iter()
+        .map(|c| c.workload.as_str())
+        .collect();
+    ws.sort_by_key(|w| ORDER.iter().position(|o| o == w).unwrap_or(ORDER.len()));
+    ws.dedup();
+    ws
+}
+
+/// A cell's load as the page names it: "1 user (base)" for the closed-loop cell the rates are
+/// fractions of, "0.42/s" for an open-loop one, "N users" for a closed-loop one (older runs, and
+/// the accuracy cell).
+pub fn load_label(c: &TaskCell) -> String {
+    match (c.load.as_deref(), c.request_rate) {
+        (Some("base"), _) => "1 user (base)".to_string(),
+        (Some("rate"), Some(r)) => format!("{r:.2}/s"),
+        _ if c.conc == 1 => "1 user".to_string(),
+        _ => format!("{} users", c.conc),
+    }
+}
+
+/// The label of a load key on the overview: the load of scratchy's own cell at that key.
+pub fn key_label(m: &Model, key: u32) -> String {
+    (Engine::Scratchy.tasks(m).iter())
+        .find(|c| c.conc == key && compared(c))
+        .map_or_else(|| key.to_string(), load_label)
+}
+
+/// Whether a cell's numbers are set against a rival's: every open-loop or closed-loop users
+/// cell, not the base, which only scratchy runs.
+fn compared(c: &TaskCell) -> bool {
+    c.load.as_deref() != Some("base")
+}
+
+/// One model's dataset overview map: a square a (load, workload), how many times faster
+/// scratchy is to its first token than the rival, None where either side has no number, and the
+/// rival it is set against (the first that ran any of these cells). The map is shown only with a
+/// rival: scratchy alone has nothing to be faster than.
+pub fn glance_squares(m: &Model) -> Option<(Engine, Vec<GlanceSquare>)> {
+    let ours = Engine::Scratchy.tasks(m);
+    let ws = workloads(m);
+    let mut users: Vec<u32> = ours.iter().filter(|c| compared(c)).map(|c| c.conc).collect();
+    users.sort_unstable();
+    users.dedup();
+    let rival = Engine::RIVALS
+        .into_iter()
+        .find(|&e| e.tasks(m).iter().any(TaskCell::measured))?;
+    let squares = (users.iter())
+        .flat_map(|&u| ws.iter().map(move |&w| (u, w)))
+        .map(|(u, w)| {
+            let mine = ours
+                .iter()
+                .find(|c| c.workload == w && c.conc == u && c.measured());
+            let theirs =
+                (rival.tasks(m).iter()).find(|c| c.workload == w && c.conc == u && c.measured());
+            let r = mine
+                .zip(theirs)
+                .and_then(|(a, b)| ttft_times(a, b));
+            (u, w.to_string(), r)
+        })
+        .collect();
+    Some((rival, squares))
 }
 
 #[cfg(test)]
@@ -243,14 +329,68 @@ mod tests {
             thinking_answers: Some(0),
             capped_answers: Some(capped),
             num_tasks: Some(8),
+            load: None,
+            request_rate: None,
             timed_out: false,
+            borrowed_from: None,
         };
         assert_eq!(total_times(&cell(100.0, 0), &cell(105.0, 0)), Some(1.0));
         assert_eq!(total_times(&cell(100.0, 0), &cell(150.0, 0)), None, "longer");
         assert_eq!(total_times(&cell(100.0, 0), &cell(100.0, 5)), None, "capped");
+        assert_eq!(ttft_times(&cell(100.0, 0), &cell(50.0, 0)), Some(1.0), "any length");
+        assert_eq!(ttft_times(&cell(100.0, 0), &cell(100.0, 5)), None, "a capped rival");
         let mut unknown = cell(100.0, 0);
         unknown.mean_output_tokens = None;
         assert_eq!(total_times(&cell(100.0, 0), &unknown), None, "no length");
+    }
+
+    /// The overview's map of a run that timed scratchy and oMLX TurboQuant on the same tasks: a
+    /// square a users count and workload, how many times faster scratchy is to its first token;
+    /// rag-spans, scratchy's own, has no rival and so no ratio.
+    #[test]
+    fn the_overview_sets_scratchy_against_the_rival_on_each_workload() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-26T043309Z-2a9661c3.json"
+        );
+        let run: super::super::data::Run =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("the oMLX run")).unwrap();
+        let m = &run.models[0];
+        assert_eq!(
+            workloads(m),
+            ["sharegpt", "rag", "rag-spans", "sharegpt-multi-turn"]
+        );
+        let (rival, squares) = glance_squares(m).expect("a rival ran");
+        assert_eq!(rival.key(), "omlx_tq");
+        let at = |u: u32, w: &str| {
+            squares
+                .iter()
+                .find(|(su, sw, _)| *su == u && sw == w)
+                .unwrap()
+                .2
+        };
+        // ShareGPT at 1 user: 167 ms against 280 ms.
+        assert!((at(1, "sharegpt").unwrap() - 280.0 / 167.0).abs() < 0.05);
+        assert!(at(1, "rag-spans").is_none(), "scratchy's own: no rival");
+        assert_eq!(squares.len(), 2 * 4, "two users counts by four workloads");
+    }
+
+    /// A cell is named by its load: the closed-loop base, an open-loop rate, or (older runs, and
+    /// the accuracy cell) a users count.
+    #[test]
+    fn a_cell_is_named_by_its_load() {
+        let cell = |load: Option<&str>, conc: u32, rate: Option<f64>| -> TaskCell {
+            serde_json::from_value(serde_json::json!({
+                "workload": "rag", "conc": conc, "load": load, "request_rate": rate,
+            }))
+            .unwrap()
+        };
+        assert_eq!(load_label(&cell(Some("base"), 0, None)), "1 user (base)");
+        assert_eq!(load_label(&cell(Some("rate"), 2, Some(0.4152))), "0.42/s");
+        assert_eq!(load_label(&cell(None, 4, None)), "4 users", "a run from before rates");
+        assert_eq!(load_label(&cell(None, 1, None)), "1 user");
+        assert!(!compared(&cell(Some("base"), 0, None)), "the base is scratchy's only");
+        assert!(compared(&cell(Some("rate"), 1, Some(0.2))));
     }
 
     #[test]
@@ -287,7 +427,10 @@ mod tests {
             thinking_answers: Some(thinking),
             capped_answers: Some(0),
             num_tasks: Some(4),
+            load: None,
+            request_rate: None,
             timed_out: false,
+            borrowed_from: None,
         };
         assert_eq!(accuracy(&cell(0)), Some(0.5));
         assert_eq!(accuracy(&cell(4)), None);
