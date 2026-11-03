@@ -375,16 +375,34 @@ fn chunk_failure(chunk: &serde_json::Value) -> Option<String> {
         .map(|r| format!("finish_reason {r}"))
 }
 
-/// Whether a streamed chunk is output: it carries a choice, and is neither a keepalive (oMLX's,
-/// `"model": "keepalive"`, sent while it prefills) nor an empty closing chunk (llama.cpp ends
-/// with one: no text, a `finish_reason`). Its text may be empty: oMLX streams gpt-oss's
-/// reasoning tokens as chunks with their text stripped, and they are still the decode.
+/// Whether a streamed chunk is output: it carries a choice, and is none of a keepalive (oMLX's,
+/// `"model": "keepalive"`, sent while it prefills), an empty closing chunk (llama.cpp ends
+/// with one: no text, a `finish_reason`), or a chat delta that only names its role. Its text
+/// may be empty: oMLX streams gpt-oss's reasoning tokens as chunks with their text stripped,
+/// and they are still the decode.
 fn is_progress(chunk: &serde_json::Value) -> bool {
-    if !has_choices(chunk) || chunk["model"] == "keepalive" {
+    if !has_choices(chunk) || chunk["model"] == "keepalive" || only_a_role(chunk) {
         return false;
     }
     let closing = chunk["choices"][0]["finish_reason"].is_string();
     !(closing && chunk_text(chunk).is_none())
+}
+
+/// A chat chunk whose delta names its role and carries nothing generated: how a chat stream
+/// opens, before prefill (OpenAI's API, oMLX), whatever oMLX's keepalive mode (#1051). An oMLX
+/// 0.7.3 chat keepalive is one too, under the request's own model (jundot/omlx#4797), if oMLX
+/// is not run with `--sse-keepalive-mode comment` as the Metal matrix runs it (#1056).
+fn only_a_role(chunk: &serde_json::Value) -> bool {
+    let Some(delta) = chunk["choices"][0]["delta"].as_object() else {
+        return false;
+    };
+    delta.contains_key("role")
+        && chunk_text(chunk).is_none()
+        && delta.iter().all(|(k, v)| match k.as_str() {
+            "role" => true,
+            "content" => v.as_str().is_none_or(str::is_empty),
+            _ => v.is_null(),
+        })
 }
 
 /// The generated text a streamed chunk carries: `text` on the completions API;
@@ -2316,6 +2334,61 @@ mod tests {
         assert_eq!(r.prompt_tokens, Some(120));
     }
 
+    /// A chat stream's TTFT runs to its first token, not to the role chunk it opens with. As oMLX
+    /// 0.7.3 sends it: the role chunk at once, before prefill, then the tokens after it.
+    #[test]
+    fn ttft_runs_to_the_first_token_past_an_opening_role_chunk() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 8192];
+            let _ = s.read(&mut req);
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                        transfer-encoding: chunked\r\n\r\n";
+            s.write_all(head.as_bytes()).unwrap();
+            let mut send = |e: &str| {
+                let event = format!("data: {e}\n\n");
+                s.write_all(format!("{:x}\r\n{event}\r\n", event.len()).as_bytes())
+                    .unwrap();
+                s.flush().unwrap();
+            };
+            send(r#"{"model":"m","choices":[{"index":0,"delta":{"role":"assistant"}}]}"#);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            send(r#"{"model":"m","choices":[{"index":0,"delta":{"content":"Par"}}]}"#);
+            send(
+                r#"{"model":"m","choices":[{"index":0,"delta":{"content":"is"},"finish_reason":"stop"}]}"#,
+            );
+            send("[DONE]");
+            s.write_all(b"0\r\n\r\n").unwrap();
+            s.flush().unwrap();
+            // Half-close, then read until the client hangs up: a body with a proper end keeps its
+            // connection for reuse, so the client must be dropped before this thread is joined.
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+            let _ = std::io::copy(&mut s, &mut std::io::sink());
+        });
+        let mut client = task_client();
+        client.api_url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let r = send_body(
+            &client,
+            &client.api_url,
+            &serde_json::json!({"messages": []}),
+            "t",
+            Instant::now(),
+        );
+        drop(client);
+        server.join().unwrap();
+        assert!(r.success, "failed: {}", r.error);
+        assert_eq!(r.generated_text, "Paris");
+        assert!(
+            r.ttft >= 0.3,
+            "TTFT {:.3} s stopped at the role chunk",
+            r.ttft
+        );
+        assert_eq!(r.chunks, 2);
+    }
+
     /// A stream that breaks off mid-answer failed; one that breaks off only after `[DONE]` finished.
     /// The server here streams one token in a chunked body it closes without the final empty
     /// chunk, so the client's read ends in an error rather than EOF.
@@ -2470,6 +2543,27 @@ mod tests {
         // A last token that comes with its finish_reason is output.
         assert!(is_progress(&c(
             r#"{"model":"m","choices":[{"text":".","finish_reason":"length"}]}"#
+        )));
+    }
+
+    #[test]
+    fn a_chat_stream_opening_role_chunk_is_not_output() {
+        let c = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        // oMLX 0.7.3, chat, granite-4.2-3b, about 2,500 words in: its opening role chunks came at
+        // 6 ms, before prefill, and the first token at 3,516 ms. OpenAI's API opens with the same.
+        assert!(!is_progress(&c(
+            r#"{"model":"granite-4.2-3b-q4-mlx","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#
+        )));
+        assert!(!is_progress(&c(
+            r#"{"model":"granite-4.2-3b-q4-mlx","choices":[{"index":0,"delta":{"role":"assistant"}}]}"#
+        )));
+        // A first token that comes with its role is output.
+        assert!(is_progress(&c(
+            r#"{"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"The"}}]}"#
+        )));
+        // A delta that is not only a role, text or not, is output, as #979 counts it.
+        assert!(is_progress(&c(
+            r#"{"model":"m","choices":[{"index":0,"delta":{"content":""}}]}"#
         )));
     }
 

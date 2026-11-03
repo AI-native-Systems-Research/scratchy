@@ -342,6 +342,14 @@ These favour one side or the other and must travel with any published number.
     qwen3.6-35b-a3b's oMLX cells delivered 62–64% of the tokens asked for. 0.7.3
     takes it (jundot/omlx#4978), and the matrix runs that release; published runs
     on an earlier oMLX still stop at EOS.
+  - From 0.7.3, oMLX sends its prefill keepalive as an ordinary chunk of the request
+    (jundot/omlx#4797), at once and while it prefills, so the matrix runs oMLX with
+    `--sse-keepalive-mode comment` (#1056): a completions keepalive (empty `text`)
+    looks like oMLX's text-stripped gpt-oss reasoning, which is a token, so it is sent
+    as an SSE comment, which `bench serve` skips. A chat stream also opens with a chunk
+    that only names its role, before prefill, whatever the keepalive mode: `bench serve`
+    does not count it as a token (#1051). Before them, every 0.7.3 cell's TTFT read a
+    few ms, and its TPOT took in the prefill.
   - ollama ignores `ignore_eos` too, and mlx-lm sometimes stops short.
   - Such a cell measures less decode than its label says, over shorter answers
     with smaller KV, which flatters tok/s. So the page marks every number from a
