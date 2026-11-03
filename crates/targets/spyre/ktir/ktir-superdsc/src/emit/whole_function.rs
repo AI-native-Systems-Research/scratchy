@@ -6968,14 +6968,16 @@ fn lower_function_folded(
                 &per_op,
                 sym_id_base,
                 Some(layout),
-                headmajor,
                 WalkProof {
                     b_orient,
                     gather: op_gather.map(|(g, _, _)| g),
                     bcast: &bcast_axes,
                     df: op_df,
                 },
-                quantized,
+                BundleFacts {
+                    headmajor,
+                    quantized: &mut *quantized,
+                },
             )?;
             out.append(&mut emitted);
             if let Lowering::BatchTranspose { .. } = program {
@@ -7066,14 +7068,16 @@ fn lower_function_folded(
             &per_op,
             sym_id_base,
             layout,
-            headmajor,
             WalkProof {
                 b_orient,
                 gather: op_gather.map(|(g, _, _)| g),
                 bcast: &bcast_axes,
                 df: op_df,
             },
-            quantized,
+            BundleFacts {
+                headmajor,
+                quantized: &mut *quantized,
+            },
         )?;
         out.append(&mut emitted);
         lowered += 1;
@@ -7873,6 +7877,16 @@ struct WalkProof<'a> {
     df: Df,
 }
 
+/// What the BUNDLE states to one op of the walk — facts no program carries, threaded from the door
+/// that owns the bundle: the head-major o_proj handoff, and the activations the bundle has already
+/// quantized to fp8 ([`QuantizedActivations`]).
+///
+/// [`QuantizedActivations`]: super::ktir_matmul_fp8::QuantizedActivations
+struct BundleFacts<'q> {
+    headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
+    quantized: &'q mut super::ktir_matmul_fp8::QuantizedActivations,
+}
+
 /// Hand ONE op's regions to the body its `Program` names.
 ///
 /// Every body here is unchanged and unaware it is being called per-op rather than per-function:
@@ -7884,9 +7898,8 @@ fn emit_one(
     per_op: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
     proof: WalkProof<'_>,
-    quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
+    bundle: BundleFacts<'_>,
 ) -> Result<Vec<super::EmittedOp>, Error> {
     let WalkProof {
         b_orient,
@@ -7894,6 +7907,10 @@ fn emit_one(
         bcast,
         df,
     } = proof;
+    let BundleFacts {
+        headmajor,
+        quantized,
+    } = bundle;
     // THE FUSED SILU. Reached only through [`program_silu_mul_chains`], which PROVED the five-op
     // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
     // `split_out(.., 2)` reads.

@@ -4837,9 +4837,13 @@ mod walk_on_the_card {
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
-            let ops =
-                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
+            let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                &node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
             let at = format!("B={seqs} walk={walk} hd={hd}");
             // The walk's carried buffers: what a trip writes that a seed before the walk filled.
             let filled: Vec<String> = ops
