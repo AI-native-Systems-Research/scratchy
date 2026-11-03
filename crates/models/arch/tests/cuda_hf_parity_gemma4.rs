@@ -575,9 +575,13 @@ fn diag_p1_prompt_6_rows_and_p3_prompt_3_row_9() {
 
 // ── #933's diagnosis prints, part 2: decode at the bad rows ────────
 
+/// The prompt whose P8 decode row (row 14) fails at the #1031 rework (`/tmp/v1031rw-g4p8.md` §1).
+const DIAG_P5_PROMPT: usize = 5;
+
 /// The (prompt, row) pairs the decode diagnosis runs a second way: prompt 6's rows whose CUDA
-/// error is furthest above HF-bf16's (`/tmp/v933-diag2.md`), and prompt 3's row 9.
-const DIAG_DECODE_ROWS: [(usize, usize); 7] = [
+/// error is furthest above HF-bf16's (`/tmp/v933-diag2.md`), prompt 3's row 9, and prompt 5's row
+/// 14, P8's decode row on prompt 5.
+const DIAG_DECODE_ROWS: [(usize, usize); 8] = [
     (DIAG_P1_PROMPT, 25),
     (DIAG_P1_PROMPT, 30),
     (DIAG_P1_PROMPT, 37),
@@ -585,6 +589,7 @@ const DIAG_DECODE_ROWS: [(usize, usize); 7] = [
     (DIAG_P1_PROMPT, 71),
     (DIAG_P1_PROMPT, 148),
     (DIAG_P3_PROMPT, DIAG_P3_ROW),
+    (DIAG_P5_PROMPT, 14),
 ];
 
 /// #933's diagnosis, part 2, test A (`/tmp/v933-diag2.md`), printed only, nothing gated: each row
@@ -593,15 +598,19 @@ const DIAG_DECODE_ROWS: [(usize, usize); 7] = [
 /// forward of the whole prompt) and the goldens' row `r`. Per row: cosine, RMS and max |·| of
 /// decode − HF-f32, one-shot − HF-f32 and HF-bf16 − HF-f32; cosine and max |·| of decode −
 /// one-shot; each side's argmax; and the first layer whose decode picks differ from the
-/// one-shot's, and how many do. The decode runs the decode attention and the gathered expert
-/// GEMV; the one-shot the prefill attention, the sort and the grouped GEMM.
+/// one-shot's, and how many do; at that layer, the row's f32 rank-8 minus rank-9 router gap
+/// against P9's τ for the prompt (the route rule's `tie`, as `cuda_route_parity_body.rs`'s greedy
+/// "first layer … a router tie" line). The decode runs the decode attention and the gathered
+/// expert GEMV; the one-shot the prefill attention, the sort and the grouped GEMM.
 #[test]
 fn diag_decode_at_the_bad_rows() {
     let r = rig();
-    for prompt in [DIAG_P1_PROMPT, DIAG_P3_PROMPT] {
+    for prompt in [DIAG_P1_PROMPT, DIAG_P3_PROMPT, DIAG_P5_PROMPT] {
         let p = (prompts().iter().find(|p| p.p == prompt))
             .unwrap_or_else(|| panic!("prompt {prompt} in meta.json"));
         let mut c = DecodeCheck::new(&r, M, &p.ids);
+        let picks = (CUDA_TAPES[bucket_of(1)].moe).expect("a MoE scratch").top_k as usize;
+        let route = read_route_of(&format!("route_{prompt}.bin"), p.ids.len(), (LAYERS, picks));
         for &(_, row) in DIAG_DECODE_ROWS.iter().filter(|(q, _)| *q == prompt) {
             assert!(
                 row > 0 && row < p.ids.len(),
@@ -632,6 +641,19 @@ fn diag_decode_at_the_bad_rows() {
                 argmax(&f),
                 argmax(&b)
             );
+            if let Some(layer) = first {
+                let tau = route.tau(layer);
+                let (tie, gap) = route.tie(layer, row, tau);
+                eprintln!(
+                    "diag decode prompt {prompt} row {row}: first differing layer {layer}: f32 \
+                     rank-8 minus rank-9 {gap:.4e} vs tau {tau:.4e}: {} (information only)",
+                    if tie {
+                        "a router tie"
+                    } else {
+                        "NOT a router tie"
+                    }
+                );
+            }
         }
     }
 }
@@ -640,7 +662,15 @@ fn diag_decode_at_the_bad_rows() {
 
 /// The bad rows test A reruns besides prompt 6's minimum row: prompt 6's rows 25, 30, 37, 41, 71
 /// and 148, and prompt 3's row 9 (`/tmp/v933-diag2.md:73-87`).
-const DIAG_A_ROWS: [(usize, usize); 7] = DIAG_DECODE_ROWS;
+const DIAG_A_ROWS: [(usize, usize); 7] = {
+    let mut rows = [(0, 0); 7];
+    let mut i = 0;
+    while i < 7 {
+        rows[i] = DIAG_DECODE_ROWS[i];
+        i += 1;
+    }
+    rows
+};
 
 /// #933's diagnosis, test A (`/tmp/v933-diag2.md:73-87`), printed only, nothing gated. First,
 /// prompt 6's row of CUDA's minimum cosine against HF-f32 (P1's line prints only the value), from
