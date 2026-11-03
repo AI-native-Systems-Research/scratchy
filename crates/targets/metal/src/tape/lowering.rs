@@ -12191,43 +12191,6 @@ mod tests {
     /// `(n / 32, bucket / 16)`, K split the fewest ways from 4 that fill the cores (Qwen3.8-27B's
     /// verify shapes in the 64-row bucket). The M5 class keeps the bf16 twin in every bucket.
     #[test]
-    fn probe_pair_qkvz() {
-        use crate::tape::lowered::GenClass::M5Wide;
-        let p = tp();
-        let mm = |input, output, n| {
-            MetalStep::AffineQmm(AffineMatmul {
-                input: Slot(input),
-                output: Slot(output),
-                layer: LayerId(0),
-                n: NDim(n),
-                k: KDim(5120),
-                group_size: AffineGroupSize(64),
-                bits: AffineBits(4),
-                vector_limit: QmvBatchLimit(10),
-                ends: QmvEnds::default(),
-            })
-        };
-        for bucket_m in [8u32, 16, 64] {
-            let at = BakePoint {
-                class: M5Wide,
-                ..bake_point(bucket_m, Some(&crate::targets::M5_10CORE))
-            };
-            let tape = lower_subtile_tape_to_metal(
-                &row_tape(plain(&[mm(0, 1, 10240), mm(0, 2, 6144)])),
-                &p,
-                at,
-            )
-            .expect("lowers");
-            for (c, f) in tape.commands.iter().zip(tape.barrier_before.iter()) {
-                eprintln!(
-                    "PAIR bucket {bucket_m}: {:?} {:?} {} {:?}",
-                    f, c.command.kernel, c.command.function, c.gate
-                );
-            }
-        }
-    }
-
-    #[test]
     fn a_w4a8_bucket_runs_its_small_m_step_in_a_16_row_w4a8_tile() {
         use crate::quantized::{W4a8Gemm, W4a8SplitK};
         use crate::tape::lowered::GenClass::{M5, M5Wide};
