@@ -34,7 +34,7 @@ on:
     inputs:
       model-scope:
         description: scratchy-cli model feature scope for the smoke build
-        default: model/llama-3.2-3b
+        default: model/qwen3.6-35b-a3b
 
 permissions:
   contents: write # to upload assets to the release
