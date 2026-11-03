@@ -68,6 +68,24 @@ fn weight(device: &Device, n: u32, k: u32, seed: u64) -> Weight {
 
 type Buf = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>;
 
+/// A dispatch run before the one under test (the W4A8 pre-pass): its symbol, constants, buffers,
+/// grid and threads.
+type PrePass<'a> = (&'static str, Vec<ConstantValue>, Vec<(&'a Buf, usize)>, MTLSize, MTLSize);
+
+/// One kernel under test.
+struct Cell {
+    label: String,
+    library: &'static str,
+    symbol: &'static str,
+    constants: Vec<ConstantValue>,
+    grid: MTLSize,
+    threads: MTLSize,
+    /// Two tensors a dispatch: the second's codes at 5-7, its output at 8.
+    pair: bool,
+    /// The W4A8 pre-pass's rows, for a kernel reading its int8 scratch.
+    quant_rows: Option<u32>,
+}
+
 /// Run `symbol` with `constants` (the codes' own appended per layout), its buffers from `bind`
 /// (given the weight's codes buffer), `grid` x `threads`; the output buffer's bf16 bits.
 #[allow(clippy::too_many_arguments)]
@@ -78,7 +96,7 @@ fn run(
     symbol: &'static str,
     constants: &[ConstantValue],
     codes: AffineCodes,
-    pre: &[(&'static str, Vec<ConstantValue>, Vec<(&Buf, usize)>, MTLSize, MTLSize)],
+    pre: &[PrePass<'_>],
     bind: &dyn Fn() -> Vec<(Buf, usize)>,
     out: &Buf,
     out_len: usize,
@@ -128,51 +146,53 @@ fn every_planes_reader_matches_its_rows_twin_bit_for_bit() {
             let y = shared_zeroed(&device, 4 * mu * nu * 2);
             let y2 = shared_zeroed(&device, mu * nu * 4);
             let scratch = shared_zeroed(&device, w4a8_scratch_bytes(m.max(16), k) as usize);
-            // (label, library, symbol, constants, grid, threads, pair, pre-pass rows)
-            let mut cells: Vec<(String, &'static str, &'static str, Vec<ConstantValue>, MTLSize, MTLSize, bool, Option<u32>)> = Vec::new();
+            let mut cells: Vec<Cell> = Vec::new();
+            let mut cell = |label: String, library, symbol, constants, grid, threads, pair, quant_rows| {
+                cells.push(Cell { label, library, symbol, constants, grid, threads, pair, quant_rows })
+            };
             let int = |i: u16, v: u32| ConstantValue::int(i, v as i32);
             if m == 1 {
-                cells.push(("qmv_fast".into(), "quantized_qmv", "affine_qmv_fast_bf16_s_bf16_gs_64_b_4_batch_0",
-                    vec![int(0, k), int(1, n)], size(1, n / 4, 1), size(32, 2, 1), false, None));
+                cell("qmv_fast".into(), "quantized_qmv", "affine_qmv_fast_bf16_s_bf16_gs_64_b_4_batch_0",
+                    vec![int(0, k), int(1, n)], size(1, n / 4, 1), size(32, 2, 1), false, None);
             }
             if (2..=8).contains(&m) || m == 8 {
-                cells.push((format!("qmv_wide m{m}"), "quantized_qmv", "affine_qmv_wide_bf16_s_bf16_gs_64_b_4_nv_4_kl_8_batch_0",
-                    vec![int(0, k), int(1, n), int(7, m)], size(m.div_ceil(4), n / 8, 1), size(32, 2, 1), false, None));
+                cell(format!("qmv_wide m{m}"), "quantized_qmv", "affine_qmv_wide_bf16_s_bf16_gs_64_b_4_nv_4_kl_8_batch_0",
+                    vec![int(0, k), int(1, n), int(7, m)], size(m.div_ceil(4), n / 8, 1), size(32, 2, 1), false, None);
             }
             if m >= 16 {
-                cells.push((format!("qmm_t m{m}"), "quantized_qmm", "affine_qmm_t_bf16_s_bf16_gs_64_b_4_alN_true_batch_0",
-                    vec![int(0, k), int(1, n), int(2, m)], size(n / 32, m.div_ceil(32), 1), size(32, 2, 2), false, None));
+                cell(format!("qmm_t m{m}"), "quantized_qmm", "affine_qmm_t_bf16_s_bf16_gs_64_b_4_alN_true_batch_0",
+                    vec![int(0, k), int(1, n), int(2, m)], size(n / 32, m.div_ceil(32), 1), size(32, 2, 2), false, None);
                 let split = 4u32;
-                cells.push((format!("qmm_t_splitk m{m}"), "quantized_qmm", "affine_qmm_t_splitk_bf16_s_bf16_gs_64_b_4_alN_true",
-                    vec![int(0, k), int(1, n), int(2, m), int(3, k / split)], size(n / 32, m.div_ceil(32), split), size(32, 2, 2), false, None));
+                cell(format!("qmm_t_splitk m{m}"), "quantized_qmm", "affine_qmm_t_splitk_bf16_s_bf16_gs_64_b_4_alN_true",
+                    vec![int(0, k), int(1, n), int(2, m), int(3, k / split)], size(n / 32, m.div_ceil(32), split), size(32, 2, 2), false, None);
             }
             if m == 64 {
-                cells.push(("qmm_t_nax".into(), "quantized_qmm_nax", "affine_qmm_t_nax_bf16_s_bf16_gs_64_b_4_alN_true_batch_0",
-                    vec![int(0, k), int(1, n), int(2, m)], size(n / 64, 1, 1), size(32, 2, 2), false, None));
-                cells.push(("qmm_t_nax_producer".into(), "quantized_qmm_nax", "affine_qmm_t_nax_producer_bf16_s_bf16_gs_64_b_4_alN_true_batch_0",
-                    vec![int(0, k), int(1, n), int(2, m)], size(n / 64, 1, 1), size(32, 5, 1), false, None));
-                cells.push(("w4a8 tiled".into(), "quantized_qmm_nax", "affine_qmm_w4a8_bf16_s_bf16_gs_64_tn_128_nsg_4",
-                    vec![int(0, k), int(1, n), int(2, m)], size(n / 128, m / 32, 1), size(128, 1, 1), false, Some(m)));
+                cell("qmm_t_nax".into(), "quantized_qmm_nax", "affine_qmm_t_nax_bf16_s_bf16_gs_64_b_4_alN_true_batch_0",
+                    vec![int(0, k), int(1, n), int(2, m)], size(n / 64, 1, 1), size(32, 2, 2), false, None);
+                cell("qmm_t_nax_producer".into(), "quantized_qmm_nax", "affine_qmm_t_nax_producer_bf16_s_bf16_gs_64_b_4_alN_true_batch_0",
+                    vec![int(0, k), int(1, n), int(2, m)], size(n / 64, 1, 1), size(32, 5, 1), false, None);
+                cell("w4a8 tiled".into(), "quantized_qmm_nax", "affine_qmm_w4a8_bf16_s_bf16_gs_64_tn_128_nsg_4",
+                    vec![int(0, k), int(1, n), int(2, m)], size(n / 128, m / 32, 1), size(128, 1, 1), false, Some(m));
                 for ks in W4a8SplitK::ALL {
                     let ways = ks.ways();
                     let sym: &'static str = Box::leak(format!("affine_qmm_w4a8_splitk_bf16_s_bf16_gs_64_tn_32_ks_{ways}").into_boxed_str());
-                    cells.push((format!("w4a8 split-K ks{ways}"), "quantized_qmm_nax", sym,
-                        vec![int(0, k), int(1, n), int(2, m)], size(n / 32, m / 32, 1), size(32 * ways, 1, 1), false, Some(m)));
+                    cell(format!("w4a8 split-K ks{ways}"), "quantized_qmm_nax", sym,
+                        vec![int(0, k), int(1, n), int(2, m)], size(n / 32, m / 32, 1), size(32 * ways, 1, 1), false, Some(m));
                 }
             }
             if m == 8 || m == 16 {
                 for ks in W4a8SplitK::ALL {
                     let ways = ks.ways();
                     let sym: &'static str = Box::leak(format!("affine_qmm_w4a8_splitk_bf16_s_bf16_gs_64_tm_16_tn_32_ks_{ways}").into_boxed_str());
-                    cells.push((format!("w4a8 small-M ks{ways} m{m}"), "quantized_qmm_nax", sym,
-                        vec![int(0, k), int(1, n), int(2, m)], size(n / 32, 1, 1), size(32 * ways, 1, 1), false, Some(16)));
+                    cell(format!("w4a8 small-M ks{ways} m{m}"), "quantized_qmm_nax", sym,
+                        vec![int(0, k), int(1, n), int(2, m)], size(n / 32, 1, 1), size(32 * ways, 1, 1), false, Some(16));
                     let pair: &'static str = Box::leak(format!("affine_qmm_w4a8_splitk_pair_bf16_s_bf16_gs_64_tm_16_tn_32_ks_{ways}").into_boxed_str());
-                    cells.push((format!("w4a8 pair ks{ways} m{m}"), "quantized_qmm_nax", pair,
-                        vec![int(0, k), int(1, n), int(2, m), int(9, n)], size(2 * n / 32, 1, 1), size(32 * ways, 1, 1), true, Some(16)));
+                    cell(format!("w4a8 pair ks{ways} m{m}"), "quantized_qmm_nax", pair,
+                        vec![int(0, k), int(1, n), int(2, m), int(9, n)], size(2 * n / 32, 1, 1), size(32 * ways, 1, 1), true, Some(16));
                 }
             }
-            for (label, lib, sym, cs, grid, threads, pair, quant_rows) in cells {
-                let pre: Vec<(&'static str, Vec<ConstantValue>, Vec<(&Buf, usize)>, MTLSize, MTLSize)> = match quant_rows {
+            for Cell { label, library: lib, symbol: sym, constants: cs, grid, threads, pair, quant_rows } in cells {
+                let pre: Vec<PrePass<'_>> = match quant_rows {
                     Some(rows) => {
                         let mut qc = vec![int(0, k), int(2, rows)];
                         qc.extend(AffineCodes::Offset8.constant());

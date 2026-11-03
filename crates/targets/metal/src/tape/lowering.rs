@@ -2323,12 +2323,12 @@ fn pair_w4a8_gemms(
     // gate that pairs with it.
     let mut keep = vec![true; commands.len()];
     let mut run_start = 0;
-    for end in 1..=commands.len() {
-        let closes =
-            end == commands.len() || barrier_before[end] != Fence::None || edges.contains(&end);
-        if !closes {
-            continue;
-        }
+    // A run ends before every command a barrier or a loop edge precedes, and at the tape's end.
+    let ends = (barrier_before.iter().enumerate().skip(1))
+        .filter(|&(at, fence)| *fence != Fence::None || edges.contains(&at))
+        .map(|(at, _)| at)
+        .chain([commands.len()]);
+    for end in ends.collect::<Vec<_>>() {
         for i in run_start..end {
             if !keep[i] || commands[i].command.kernel != KernelId::AffineQmmW4a8 {
                 continue;
