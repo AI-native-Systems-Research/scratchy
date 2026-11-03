@@ -405,6 +405,21 @@ fn error(a: &[f32], b: &[f32]) -> (f64, f64) {
     ((sq / a.len() as f64).sqrt(), max)
 }
 
+/// The `q`-quantile of `|a − b|` (nearest rank: the `⌈q·n⌉`-th smallest), for P8's high
+/// percentile.
+fn abs_quantile(a: &[f32], b: &[f32], q: f64) -> f64 {
+    let mut d: Vec<f64> = (a.iter().zip(b))
+        .map(|(&x, &y)| (f64::from(x) - f64::from(y)).abs())
+        .collect();
+    d.sort_by(f64::total_cmp);
+    let rank = ((q * d.len() as f64).ceil() as usize).clamp(1, d.len().max(1));
+    d.get(rank - 1).copied().unwrap_or(0.0)
+}
+
+/// P8's high percentile of `|row − f32|`, gated against HF-bf16's at the same percentile (the
+/// user's decision 2026-11-03 (c)): the 99.99th, about the 25th largest of a 248,320-logit row.
+const P8_QUANTILE: f64 = 0.9999;
+
 /// The indices of `row`'s `k` highest values, highest first (lowest index on a tie).
 fn top_k(row: &[f32], k: usize) -> Vec<usize> {
     let mut ix: Vec<usize> = (0..row.len()).collect();
@@ -1408,8 +1423,11 @@ fn p7_greedy_via_decode_matches_hf_f32() {
 }
 
 /// P8: for prompts 1-5, prefill the first L − 1 tokens, then decode token L − 1. That row against
-/// HF-f32's last row: cosine under the model's `P1` rule, RMS and max error ≤ 2 × HF-bf16's on that row, the same
-/// top-1 unless the f32 margin is at most twice the row's max noise, top-5 overlap ≥ 4. Against
+/// HF-f32's last row: cosine under the model's `P1` rule, RMS error ≤ 2 × HF-bf16's on that row,
+/// the 99.99th percentile of |error| ([`P8_QUANTILE`]) ≤ 2 × HF-bf16's 99.99th percentile (the
+/// max error is printed, no longer gated: one row's single worst logit against one HF-bf16 run's
+/// is the noisiest statistic, the user's decision 2026-11-03 (c)), the same top-1 unless the f32
+/// margin is at most twice the row's max noise, top-5 overlap ≥ 4. Against
 /// CUDA's own one-shot last row: cosine ≥ 0.999, the same argmax unless near-tie, max |diff|
 /// printed. A one-token prompt has no prefix to prefill, and is skipped, saying so.
 #[test]
@@ -1434,6 +1452,10 @@ fn p8_the_decode_row_matches_hf_f32() {
         let cos = cosine(&row, f32_row);
         let (rms, max) = error(&row, f32_row);
         let (noise_rms, noise_max) = error(bf16_row, f32_row);
+        let (high, noise_high) = (
+            abs_quantile(&row, f32_row, P8_QUANTILE),
+            abs_quantile(bf16_row, f32_row, P8_QUANTILE),
+        );
         let top = top_k(f32_row, 2);
         let margin = f64::from(f32_row[top[0]] - f32_row[top[1]]);
         let tie = margin <= 2.0 * noise_max;
@@ -1452,14 +1474,15 @@ fn p8_the_decode_row_matches_hf_f32() {
         };
         let ok_hf = cos_ok
             && rms <= 2.0 * noise_rms
-            && max <= 2.0 * noise_max
+            && high <= 2.0 * noise_high
             && (same || tie)
             && shared >= 4;
         eprintln!(
             "P8 prompt {} decode row {} vs HF-f32: cosine={cos:.6} (need >= {cos_need}) \
-             RMS={rms:.6e} (HF-bf16 {noise_rms:.6e}) max={max:.6e} (HF-bf16 {noise_max:.6e}) \
-             (need <= 2x each) top-1 same={same} (f32 margin {margin:.4e}, near-tie={tie}) \
-             top-5 shared={shared} (need >= 4) {}",
+             RMS={rms:.6e} (HF-bf16 {noise_rms:.6e}) p99.99={high:.6e} (HF-bf16 \
+             {noise_high:.6e}) (need <= 2x each) max={max:.6e} (HF-bf16 {noise_max:.6e}, \
+             printed) top-1 same={same} (f32 margin {margin:.4e}, near-tie={tie}) top-5 \
+             shared={shared} (need >= 4) {}",
             p.p,
             n - 1,
             verdict(ok_hf)
