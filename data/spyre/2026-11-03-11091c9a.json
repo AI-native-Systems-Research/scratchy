@@ -1,0 +1,596 @@
+{
+  "schema": 1,
+  "date": "2026-11-03",
+  "contexts": {
+    "~123": 128,
+    "~1k": 1061,
+    "~10k": 10091
+  },
+  "torch_spyre": {
+    "measured": "2026-10-19",
+    "host": "not re-run this sweep: every torch cell is the 2026-10-21 sweep's value carried verbatim (that sweep carried the 2026-10-19 measurements, run on nickm4; the reference stack /work/spyre-inference is unchanged since \u2014 HEAD a63dc01, 2026-10-12)",
+    "harness": "carried, not re-measured. The torch side is the reference stack and its checkout has not moved since the 2026-10-19 legs ran, so this sweep re-measured only the scratchy side and carries every torch cell from the 2026-10-21 sweep as-is \u2014 same harness, same prompts, same buckets (vllm bench serve, out=256, rung 1 at --max-concurrency 1 on the len-* sets, batched at --max-concurrency 4/8 on the shared conc-* sets, 2 reps per back-to-back boot, cell = rep 2). Each carried cell says so in its note; the cells the 10-19 sweep itself carried from 10-14 keep that history in their notes. Scratchy ran the same prompts, buckets, serve flags and rep conventions, so the ratios compare like-for-like sweep over sweep."
+  },
+  "triton_scratchy": {
+    "measured": "2026-11-03",
+    "commit": "11091c9aa4be0fcd524da1a1cb93510c3c1880d6",
+    "host": "nickm5 (all legs, one card, one pod)",
+    "harness": "PROVENANCE: the build tree is /work/scratchy on nickm5, its content a git archive of the sweep commit taken from the pod's own /work/scratchy-git checkout, verified byte-identical to the archive by a full diff -r (excluding target/) immediately before the builds fired. One binary per model\u00d7dtype built from that tree (scr-2bfp16 md5 5f3720918b2e65328f1c94063addb5f1, scr-8bfp16 d9061215de988ff7f852ff4804cf2cb8, scr-2bfp8 0004635ec008f37e367321c30cdcf201; fp8 = quant/fp8-dynamic-per-channel on the RedHatAI FP8-dynamic checkpoints), with no SCRATCHY_SDSC_* knobs set \u2014 the sweep measures shipping behavior. scr serve --device spyre, taskset -c 48-95, port 8079, a teardown guard (no live serve, no vfio-device holder, port quiet) before every boot. Rung 1: the frozen sha's own scripts/bench_spyre_rung1.py under the reference venv (copied pod-to-pod from the torch side's), streaming /v1/chat/completions on the sweep's own base prompts (scripts/spyre_rung1_prompts/), 128 output tokens with ignore_eos, 3 reps on distinct prompts, medians; serve-recorded prompt lengths 128/1061/10091, gated to \u00b12% of the bucket by the serve's request-finished lines (every rep recorded its bucket exactly). Batched: vllm bench serve on the shared conc-* sets (123/1024/10300), 16 prompts, --max-concurrency 4/8, --max-num-seqs 4/8, --max-model-len 12288 (2b) / 8704 (8b), 2 reps per back-to-back boot, cell = rep 2 (steady state). The 8b fp16 batched ~10k legs are absent by design as on 10-21 (the serve refuses at boot on the KV budget at max-model-len 34816). The 8b fp8 legs are absent by order: 8b fp8 serve is known broken and was not built this sweep, pending its fix."
+  },
+  "cells": [
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 61.0,
+      "scratchy": 39.52061152085662,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (a 2026-10-14 measurement); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 111.0,
+      "scratchy": 77.7476062066853,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (a 2026-10-14 measurement); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~1k",
+      "torch": 63.0,
+      "scratchy": 57.66729172319174,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (a 2026-10-14 measurement); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~1k",
+      "torch": 458.0,
+      "scratchy": 415.81426095217466,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (a 2026-10-14 measurement); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~10k",
+      "torch": 75.0,
+      "scratchy": 51.6297472640872,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (a 2026-10-14 measurement); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~10k",
+      "torch": 8227.0,
+      "scratchy": 6197.938935365528,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (a 2026-10-14 measurement); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 143.5340106021613,
+      "scratchy": 126.02694146335125,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 256.4256329787895,
+      "scratchy": 176.2947728857398,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~1k",
+      "torch": 148.92181495441963,
+      "scratchy": 151.81350195780396,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~1k",
+      "torch": 946.2668369524181,
+      "scratchy": 903.3069587312639,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~10k",
+      "torch": 164.0,
+      "scratchy": 151.6388338059187,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (a 2026-10-14 measurement); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~10k",
+      "torch": 13035.0,
+      "scratchy": 11119.580485858023,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (a 2026-10-14 measurement); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "itl_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 260.0923891024043,
+      "scratchy": 23.212521569803357,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "ttft_ms",
+      "conc": 1,
+      "context": "~123",
+      "torch": 18845.162497018464,
+      "scratchy": 81.18635881692171,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 75.06679699427502,
+      "scratchy": 48.78894425928593,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 48.76, rep 2 48.79 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 248.04746604058892,
+      "scratchy": 372.87182500585914,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 368.1, rep 2 372.9 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~123",
+      "torch": 53.108930735498134,
+      "scratchy": 74.12553127744576,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 74.13, rep 2 74.13 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~1k",
+      "torch": 67.73924548407176,
+      "scratchy": 45.46413058415055,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 45.5, rep 2 45.46 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~1k",
+      "torch": 385.42302907444537,
+      "scratchy": 582.8730885405093,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 995.2, rep 2 582.9 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~1k",
+      "torch": 57.73269444565062,
+      "scratchy": 84.09393790801286,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 76.54, rep 2 84.09 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~10k",
+      "torch": 208.216346245186,
+      "scratchy": 84.48210754431784,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 83.63, rep 2 84.48 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~10k",
+      "torch": 10323.981421417557,
+      "scratchy": 11817.18253949657,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 1.146e+04, rep 2 1.182e+04 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~10k",
+      "torch": 16.35777221035234,
+      "scratchy": 21.678254154834143,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 21.96, rep 2 21.68 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 62.822039487917785,
+      "scratchy": 58.848400600254536,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 58.83, rep 2 58.85 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 229.24780694302171,
+      "scratchy": 657.920909114182,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 655, rep 2 657.9 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~123",
+      "torch": 124.89122974411147,
+      "scratchy": 115.95459088741565,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 115.9, rep 2 116 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~1k",
+      "torch": 88.88436455060454,
+      "scratchy": 51.79030285216868,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 51.89, rep 2 51.79 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~1k",
+      "torch": 463.98821263574064,
+      "scratchy": 1066.6063949465752,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 1945, rep 2 1067 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~1k",
+      "torch": 86.4408435620205,
+      "scratchy": 143.48940729052364,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 123.8, rep 2 143.5 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~10k",
+      "torch": 370.1270589299098,
+      "scratchy": 131.36995653621852,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 130.2, rep 2 131.4 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~10k",
+      "torch": 12152.477052994072,
+      "scratchy": 22141.73001749441,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 1.336e+04, rep 2 2.214e+04 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~10k",
+      "torch": 18.26699878692647,
+      "scratchy": 24.356587454207386,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 23.92, rep 2 24.36 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 144.39078664735837,
+      "scratchy": 144.93048377335072,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 145, rep 2 144.9 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 476.98079189285636,
+      "scratchy": 920.0559554155916,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 920.1, rep 2 920.1 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~123",
+      "torch": 27.411269814947207,
+      "scratchy": 26.132440133609947,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 26.13, rep 2 26.13 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~1k",
+      "torch": 160.07965710607596,
+      "scratchy": 144.81800934299827,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 144.9, rep 2 144.8 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~1k",
+      "torch": 705.360846943222,
+      "scratchy": 1316.3103715050966,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 2239, rep 2 1316 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~1k",
+      "torch": 24.66752319767196,
+      "scratchy": 26.80269405121495,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 25.08, rep 2 26.8 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 151.56627896095753,
+      "scratchy": 149.79646797291934,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 149.7, rep 2 149.8 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 554.7926330473274,
+      "scratchy": 1594.0093609970063,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 1603, rep 2 1594 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~123",
+      "torch": 51.75575019582286,
+      "scratchy": 48.405883709427656,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 48.39, rep 2 48.41 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~1k",
+      "torch": 173.89633859023817,
+      "scratchy": 148.62271188758314,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 148.5, rep 2 148.6 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~1k",
+      "torch": 789.7606720216572,
+      "scratchy": 2321.771588176489,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 4849, rep 2 2322 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-8b",
+      "dtype": "fp16",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~1k",
+      "torch": 44.96561118621276,
+      "scratchy": 50.93837253193208,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 45.22, rep 2 50.94 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "itl_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 441.8666422020133,
+      "scratchy": 32.3915199842304,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 32.36, rep 2 32.39 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "ttft_ms",
+      "conc": 4,
+      "context": "~123",
+      "torch": 36613.71065303683,
+      "scratchy": 339.91535869427025,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 340, rep 2 339.9 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "tok_s",
+      "conc": 4,
+      "context": "~123",
+      "torch": 6.854060344913208,
+      "scratchy": 106.13294713450442,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 106.1, rep 2 106.1 tok/s; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "itl_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 781.3521216491091,
+      "scratchy": 44.60639366880059,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 44.61, rep 2 44.61 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "ttft_ms",
+      "conc": 8,
+      "context": "~123",
+      "torch": 37016.674472019076,
+      "scratchy": 638.4177065920085,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 643.4, rep 2 638.4 ms; the cell is each side's rep 2 (steady state)."
+    },
+    {
+      "model": "granite-3.1-2b",
+      "dtype": "fp8",
+      "metric": "tok_s",
+      "conc": 8,
+      "context": "~123",
+      "torch": 8.58975543433008,
+      "scratchy": 145.41216752664633,
+      "note": "torch value carried from the 2026-10-21 sweep, which itself carried it (measured 2026-10-19); the reference stack is unchanged since (spyre-inference HEAD a63dc01, 2026-10-12) and was not re-run. Two back-to-back reps on one boot \u2014 scratchy rep 1 145.2, rep 2 145.4 tok/s; the cell is each side's rep 2 (steady state)."
+    }
+  ],
+  "since": "#732\u2013#1047",
+  "target": {
+    "label": "8b moonshot \u00b7 short-context ITL",
+    "model": "granite-3.1-8b",
+    "dtype": "fp16",
+    "metric": "itl_ms",
+    "conc": 1,
+    "context": "~123",
+    "value": 110.0,
+    "why": "the card's measured ceiling: 16.36 GB/token at 149 GB/s, one fp16 matmul across all 32 cores"
+  },
+  "moved": [
+    {
+      "pr": "#999",
+      "what": "torch-spyre's paged attention ported to Triton and run on the card: batched ~10k decode transforms \u2014 2b conc-8 ITL 1173.0 \u2192 131.4 ms (\u221289%, 8.9\u00d7) and conc-4 550.6 \u2192 84.5 ms (\u221285%); throughput 6.26 \u2192 24.36 tok/s at conc 8 (now 1.33\u00d7 AHEAD of torch's 18.3) and 6.55 \u2192 21.68 at conc 4. The sweep's worst square is gone: what was torch 3.16\u00d7 ahead is now scratchy ahead. Sweep-over-sweep across #732\u2013#1047."
+    },
+    {
+      "pr": "#1039, #1041, #1043",
+      "what": "the decode batch's mask reads, carried maximum and ladder-walk proofs: batched mid-context decode improves too \u2014 2b conc-8 ~1k ITL 70.4 \u2192 51.8 ms (\u221226%, now 1.72\u00d7 ahead of torch), 8b conc-8 ~1k 181.4 \u2192 148.6 ms (\u221218%, 1.17\u00d7 ahead), 8b conc-8 ~123 171.6 \u2192 149.8 ms (\u221213%, now ahead of torch's 151.6). Every batched decode square is now at parity or ahead of torch. Sweep-over-sweep across #732\u2013#1047."
+    },
+    {
+      "pr": "#916, #1030, #1035",
+      "what": "pipelined decode under scr serve \u2014 the next step is submitted while the card computes the current one: rung-1 ITL down at 2b ~123 (43.3 \u2192 39.5 ms) and ~10k (59.1 \u2192 51.6), 8b ~123 (132.5 \u2192 126.0) and ~10k (155.6 \u2192 151.6); 2b fp8 rung-1 ITL 27.3 \u2192 23.2 ms (\u221215%, now 11.2\u00d7 torch). Sweep-over-sweep across #732\u2013#1047."
+    },
+    {
+      "pr": "#1016, #1018",
+      "what": "KV pool zeroed with the card's own fill op and prefix/decode rungs built in parallel \u2014 startup 13.5 \u2192 10.0 s and 13.1 \u2192 11.9 s; boot-time only, no cell claim."
+    },
+    {
+      "pr": "regressions",
+      "what": "NAMED: mid-context rung-1 ITL regressed on both models \u2014 2b ~1k 44.8 \u2192 57.7 ms (+29%, torch's lead back to 1.09\u00d7) and 8b ~1k 136.6 \u2192 151.8 ms (+11%, now just behind torch). Short-context prefill drifted up: 2b rung-1 ~123 TTFT 63.0 \u2192 77.8 ms (+23%), 2b fp8 rung-1 TTFT 68.5 \u2192 81.2 ms (+19%), 2b conc-8 ~123 TTFT 570.7 \u2192 657.9 ms (+15%), 2b conc-4 ~123 TTFT +13%; 2b conc-8 ~123 throughput fell 124.9 \u2192 116.0 tok/s (now just under torch's 124.9). The paged-attention release bought the ~10k squares with these short/mid-context costs \u2014 no gate watched them."
+    }
+  ],
+  "levers": [
+    {
+      "lever": "batched prefill (TTFT at conc>1)",
+      "work": "the one remaining wide gap, unchanged by this sweep: 2b conc-8 ~123 658 vs 229 ms (torch 2.87\u00d7 ahead), 8b conc-8 ~1k 2322 vs 790 ms (2.94\u00d7), 2b conc-8 ~1k 1067 vs 464 ms (2.30\u00d7), 8b conc-4 ~123 920 vs 477 ms (1.93\u00d7). Rung-1 prefill is ahead of torch at every bucket; only the batched path lags \u2014 prefill scheduling/admission under concurrency is the front."
+    },
+    {
+      "lever": "rung-1 ~1k decode",
+      "work": "this sweep's regression: 2b 57.7 ms (torch's lead back to 1.09\u00d7 from 1.41\u00d7 ahead-of-torch), 8b 151.8 ms (now 1.02\u00d7 behind torch). The ~123 and ~10k buckets improved, so the cost is specific to the mid bucket."
+    },
+    {
+      "lever": "8b decode floor",
+      "work": "126.0 ms at ~123 against the card's \u2248110 ms floor (16.4 GB/token at 149 GB/s); now 1.14\u00d7 ahead of torch at that square."
+    },
+    {
+      "lever": "8b fp8",
+      "work": "not built this sweep \u2014 8b fp8 serve is known broken and was excluded by order pending the fix; on 10-21 it stood at 74.2 ms rung-1 ITL (3.5\u00d7 torch). The 2b fp8 cells this sweep: 23.2 ms rung-1 (11.2\u00d7 torch), 44.6 ms at conc 8 (17.5\u00d7)."
+    },
+    {
+      "lever": "per-token overhead",
+      "work": "2b fp8 short-context ITL 23.2 ms (\u221215%); the host share between steps shrinks with pipelined decode but is still visible \u2014 compile-time CB replay with the next token chosen on the device."
+    }
+  ],
+  "notes": {
+    "decode": [
+      "Batched decode closed this sweep: every batched decode square is at parity or ahead of torch \u2014 2b is ahead everywhere (up to 2.82\u00d7 at conc-8 ~10k), 8b is ahead at conc-8 both buckets and at parity at conc-4 ~123. The paged-attention port (#999) is the mover: the ~10k squares went from torch 2.65\u00d7/3.16\u00d7 ahead to scratchy ahead (1.33\u00d7 on throughput at conc 8).",
+      "Rung-1 decode split by bucket: ~123 and ~10k improved on both models (2b 43.3 \u2192 39.5 and 59.1 \u2192 51.6 ms; 8b 132.5 \u2192 126.0 and 155.6 \u2192 151.6), but ~1k regressed on both (2b 44.8 \u2192 57.7 ms +29%, 8b 136.6 \u2192 151.8 ms +11%) \u2014 the mid bucket pays for what the ends gained. Short-context parity is a shared floor: both stacks stream 16.4 GB of fp16 weights per token, and one fp16 matmul on this card streams at most ~149 GB/s, so fp16 at one request bottoms out near 110 ms/token."
+    ],
+    "prefill": [
+      "Rung-1 TTFT is ahead of torch at every bucket on both models (2b: 77.8/415.8/6198 vs 111/458/8227 ms; 8b: 176.3/903.3/11120 vs 256.4/946.3/13035 ms), and 2b ~1k and ~10k improved sweep-over-sweep (\u221212%, \u221216%). But short-context rung-1 TTFT drifted up (2b ~123 +23%, 2b fp8 +19%) and the batched TTFT cells still trail torch everywhere by 1.1\u20132.9\u00d7 \u2014 batched prefill is the remaining front."
+    ],
+    "conc": [
+      "Every batched cell is the second of two back-to-back reps on one server boot (rep 1 is reliably the slow rep \u2014 a property of the harness); both reps are recorded in each cell's note. Decode squares prefer itl_ms (per-request median TPOT under that batch); tok_s is recorded alongside for the concurrency view.",
+      "The 8b fp16 batched ~10k squares are unmeasured by design, as on 10-21: the serve refuses at boot \u2014 max-model-len 34816 \u00d7 max-num-seqs 4 needs 545 KV pages against the 16384 MB budget (273 pages); 8b ~10k at this max-model-len fits \u22642 concurrent seqs.",
+      "The 8b fp8 legs are absent by order: 8b fp8 serve is known broken and was not built this sweep, pending its fix. The 2b fp8 legs ran and are recorded.",
+      "The torch side was not re-run: every torch cell is the 2026-10-21 sweep's value carried verbatim (the reference stack's checkout has not moved since the 2026-10-19 legs \u2014 HEAD a63dc01, 2026-10-12), and each cell's note says so. The scratchy side ran the same prompts, buckets, serve flags and rep conventions on nickm5 (10-21 ran on nickm4), so the sweep-over-sweep deltas above are scratchy-side changes on a fixed torch baseline."
+    ],
+    "fp8": [
+      "2b fp8 improved at rung 1 (27.3 \u2192 23.2 ms ITL, \u221215%, now 11.2\u00d7 torch) and at conc 8 (49.7 \u2192 44.6 ms, 17.5\u00d7); its conc-4/8 throughput drifted down ~4\u20136% (106.1/145.4 tok/s) with the short-context TTFT costs, still 15\u201317\u00d7 torch. The 2b fp8 rung-1 TTFT drifted +19% (68.5 \u2192 81.2 ms) \u2014 still 232\u00d7 under torch's 18.8 s.",
+      "The 8b fp8 cells are absent by order: 8b fp8 serve is known broken and was not built this sweep, pending its fix. On 10-21 these cells measured 74.2 ms rung-1 ITL (3.5\u00d7 torch)."
+    ]
+  }
+}
