@@ -968,8 +968,9 @@ impl MetalAllocator {
                     && std::fs::remove_file(meta.meta_json_path()).is_ok()
                 {
                     tracing::warn!(
-                        "aligned-cache: {} stores codes otherwise than this launch reads them; \
-                         storing copies and dropping the sidecar for the next launch to rebuild",
+                        "aligned-cache: {} stores codes otherwise than this launch reads them \
+                         ({len} bytes at {p:#x} read {codes:?}); storing copies and dropping the \
+                         sidecar for the next launch to rebuild",
                         meta.bin.display()
                     );
                 }
