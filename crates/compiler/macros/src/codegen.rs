@@ -15679,7 +15679,12 @@ pub fn emit_model(
     };
 
     #[cfg(feature = "metal")]
-    metal_arena_bytes_statics.push(metal_tape_cmds.into_tokens());
+    metal_arena_bytes_statics.push(metal_tape_cmds.into_tokens().unwrap_or_else(|e| {
+        panic!(
+            "[metal static tape] {}: command table: {e}",
+            model.source_stem
+        )
+    }));
     #[cfg(feature = "metal")]
     {
         let mc = resolved_metal_consts.as_ref().expect("metal consts filled");

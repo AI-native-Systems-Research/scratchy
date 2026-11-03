@@ -178,12 +178,12 @@ pub fn lower_subtile_tape_to_metal(
     let encodes =
         |c: &GatedCommand| writer_binds(c, |k| matches!(k, RuntimeBindingKind::TqPackedK { .. }));
     if p.kv_codec.is_turboquant()
-        && bb.commands.iter().any(writes_kv_cache)
-        && !bb.commands.iter().any(encodes)
+        && bb.commands.iter().any(|c| writes_kv_cache(&c))
+        && !bb.commands.iter().any(|c| encodes(&c))
     {
         return Err(LoweringError::TurboQuantCompressesNothing);
     }
-    let commands = (bb.commands.iter().chain(lh.commands.iter())).copied();
+    let commands = bb.commands.iter().chain(lh.commands.iter());
     Ok(LoweredMetalTape {
         bucket_m: at.bucket_m,
         num_arena_slots: at.num_arena_slots,
@@ -8950,9 +8950,9 @@ mod tests {
             let lowered = lower_subtile_tape_to_metal(&tape, &p, bake_point(1, None))
                 .expect("a one-row fold lowers");
             assert_eq!(lowered.commands.len(), 1, "one command");
-            let one = &lowered.commands[0];
+            let one = &lowered.commands.get(0);
             let (cmd, w) = (&one.command, lower_tq(&p, plain(&[writer]), 1));
-            let writer = &w.commands[0].command;
+            let writer = &w.commands.get(0).command;
             let constant = |c: &LoweredCommand, slot: u16| {
                 c.constants.iter().find(|k| k.index == slot).map(|k| k.bits)
             };
@@ -8996,9 +8996,9 @@ mod tests {
                 KernelId::AttentionDecodeCombine,
             ]
         );
-        let split = &lowered.commands[0].command;
+        let split = &lowered.commands.get(0).command;
         let w = lower_tq(&p, plain(&[writer]), 1);
-        let writer = &w.commands[0].command;
+        let writer = &w.commands.get(0).command;
         let constant = |c: &LoweredCommand, slot: u16| {
             c.constants.iter().find(|k| k.index == slot).map(|k| k.bits)
         };
@@ -9048,7 +9048,6 @@ mod tests {
             lower_tq(&p, plain(&[step]), bucket_m)
                 .commands
                 .iter()
-                .cloned()
                 .collect::<Vec<GatedCommand>>()
         };
         let lowered = |geometry, bucket_m| drafting(geometry, bucket_m, 0);
@@ -9235,7 +9234,7 @@ mod tests {
         };
         let lower = |step: MetalStep| try_lower_tq(&tq_consts(), plain(&[step]), 1);
         let coded = lower(writer(LLAMA_KV, KvWrite::PoolAndPacked)).expect("lowers");
-        let c = &coded.commands[0].command;
+        let c = &coded.commands.get(0).command;
         assert_eq!((c.library, coded.commands.len()), ("kv_append", 1));
         let slot = |i: u16| c.constants.iter().find(|k| k.index == i).map(|k| k.bits);
         let hd = tq_consts().global_head_dim as usize;
@@ -9260,7 +9259,7 @@ mod tests {
         // Plain on a dense model (a coded model refuses a writer that encodes nothing).
         let plain_writer = try_lower_tq(&tp(), plain(&[writer(LLAMA_KV, KvWrite::Pool)]), 1);
         let plain_writer = plain_writer.expect("lowers");
-        let c = &plain_writer.commands[0].command;
+        let c = &plain_writer.commands.get(0).command;
         assert!(c.constants.iter().all(|k| k.index < 10));
         assert!(c.bindings.iter().all(|b| b.index() < 16));
         let k_biased = scratchy_ir::KvOffsets {
@@ -9314,7 +9313,6 @@ mod tests {
             lower_tq(&p, plain(&[step]), bucket_m)
                 .commands
                 .iter()
-                .cloned()
                 .collect::<Vec<GatedCommand>>()
         };
         // A binding as (index, what it binds), the scratch by its region's order.
@@ -9643,9 +9641,9 @@ mod tests {
             ]
         );
         let (fp16, split, combine) = (
-            &tape.commands[1].command,
-            &tape.commands[2].command,
-            &tape.commands[3].command,
+            &tape.commands.get(1).command,
+            &tape.commands.get(2).command,
+            &tape.commands.get(3).command,
         );
         // A threadgroup a (KV head, split) of head_dim threads, its combine one a query
         // head of two simdgroups — head_dim 64's share of every lane's elements.
@@ -9734,7 +9732,7 @@ mod tests {
                 (KernelId::AttentionViaCacheTq, Some(OnlyIfDecodeStep)),
             ]
         );
-        let (fp16, tq) = (&tape.commands[1].command, &tape.commands[2].command);
+        let (fp16, tq) = (&tape.commands.get(1).command, &tape.commands.get(2).command);
         // Same kernel; the plain command's threadgroups count head groups —
         // the baked GQA divisor, 8 heads a group here — while the twin's
         // count heads for the worker's variant division.
@@ -9802,7 +9800,7 @@ mod tests {
         let find = |k| {
             tape.commands
                 .iter()
-                .map(|c| &c.command)
+                .map(|c| c.command)
                 .find(|c| c.kernel == k)
                 .expect("the command")
         };
@@ -9861,9 +9859,9 @@ mod tests {
             ]
         );
         let (fp16, split, combine) = (
-            &tape.commands[1].command,
-            &tape.commands[2].command,
-            &tape.commands[3].command,
+            &tape.commands.get(1).command,
+            &tape.commands.get(2).command,
+            &tape.commands.get(3).command,
         );
         let sinks = |binding_index| Binding::Source {
             ix: SINKS_IX,
@@ -9994,7 +9992,7 @@ mod tests {
             &tq_consts(),
             &causal,
             None,
-            vec![*twin],
+            vec![twin],
             &bake_point(1, None),
             None,
             &mut partials,
@@ -10198,13 +10196,13 @@ mod tests {
                 (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
             ]
         );
-        let (gqa, combine) = (&tape.commands[2].command, &tape.commands[3].command);
+        let (gqa, combine) = (&tape.commands.get(2).command, &tape.commands.get(3).command);
         let twin = MetalModelConsts {
             num_global_kv_heads: 2,
             ..p
         };
         let twin = lower_tq(&twin, rows(), 1);
-        let twin = &twin.commands[2].command;
+        let twin = &twin.commands.get(2).command;
         assert_eq!(twin.kernel, KernelId::AttentionViaCacheTq);
         // 128 blocks of 16 keys: two threadgroups of `ATTN_SPLIT_KEYS`.
         let splits = (128 * p.global_block_size).div_ceil(ATTN_SPLIT_KEYS);
@@ -10305,7 +10303,10 @@ mod tests {
                 (KernelId::AttentionDecodeCombine, None),
             ]
         );
-        let (gqa, combine) = (&verify.commands[1].command, &verify.commands[2].command);
+        let (gqa, combine) = (
+            &verify.commands.get(1).command,
+            &verify.commands.get(2).command,
+        );
         assert_eq!(gqa.dispatch.threadgroups, (4, 4, splits));
         assert_eq!(combine.dispatch.threadgroups, (4, p.num_q_heads, 1));
         assert!((gqa.constants.iter()).any(|k| *k == ConstantValue::uint(22, 1)));
@@ -10362,7 +10363,7 @@ mod tests {
                 KernelId::AttentionDecodeCombine
             ]
         );
-        let fold = &folded.commands[0].command;
+        let fold = &folded.commands.get(0).command;
         assert!(fold.constants.iter().any(|k| k.index == ATTN_FOLD.0));
         // Its splits and the writer's threadgroup.
         let fold_splits = (fold.constants.iter())
@@ -10405,7 +10406,7 @@ mod tests {
                 (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
             ]
         );
-        let (gqa, combine) = (&tape.commands[2].command, &tape.commands[3].command);
+        let (gqa, combine) = (&tape.commands.get(2).command, &tape.commands.get(3).command);
         let splits = (128 * p.global_block_size).div_ceil(ATTN_SPLIT_KEYS);
         assert_eq!(splits, 2);
         assert_eq!(gqa.dispatch.threadgroups, (1, 4, splits));
@@ -10527,7 +10528,10 @@ mod tests {
                 (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
             ]
         );
-        let (gqa, combine) = (&batched.commands[2].command, &batched.commands[3].command);
+        let (gqa, combine) = (
+            &batched.commands.get(2).command,
+            &batched.commands.get(3).command,
+        );
         assert_eq!(gqa.dispatch.threadgroups, (4, 4, splits));
         assert_eq!(combine.dispatch.threadgroups, (4, p.num_q_heads, 1));
         // Every row's partials, or only those of the rows a decode or verify step brings.
@@ -10649,7 +10653,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(kernels(&m5)[0], KernelId::RopeOnceNax);
-        let nax = &m5.commands[1].command;
+        let nax = &m5.commands.get(1).command;
         assert_eq!(
             (
                 nax.library,
@@ -10667,7 +10671,7 @@ mod tests {
 
         let steel = lower(None);
         assert_eq!(kernels(&steel)[0], KernelId::RopeOnceSteel);
-        let attn = &steel.commands[1].command;
+        let attn = &steel.commands.get(1).command;
         assert_eq!(attn.library, "attention_steel_paged");
         assert_eq!(attn.dispatch.threads_per_threadgroup, (128, 1, 1));
         assert_eq!(constant(attn, 7), Some(1024));
@@ -10790,8 +10794,8 @@ mod tests {
             want.push((KernelId::AffineQmmSmallM, Some(OnlyIfSmallMTokens)));
             assert_eq!(gated_steps(&tape), want);
             let (gemm_cmd, small) = (
-                &tape.commands[own.len() - 1].command,
-                &tape.commands[own.len()].command,
+                &tape.commands.get(own.len() - 1).command,
+                &tape.commands.get(own.len()).command,
             );
             // Weights and output; the W4A8 GEMM reads its activation from
             // the pre-pass's scratch (binding 3).
@@ -10872,7 +10876,7 @@ mod tests {
                 [(KernelId::AffineQmvWide, None)],
                 "bucket {bucket_m}"
             );
-            let constants = tape.commands[0].command.constants;
+            let constants = tape.commands.get(0).command.constants;
             assert!(
                 constants.iter().any(|c| c.index == 8) && constants.iter().any(|c| c.index == 10),
                 "bucket {bucket_m}: the matvec takes its norm (8) and residual add (10)"
@@ -10900,7 +10904,7 @@ mod tests {
             .expect("lower_subtile_tape_to_metal")
         }
         for profile in [&crate::targets::M4_10CORE, &crate::targets::M5_10CORE] {
-            let command = &lower_at(profile).commands[0].command;
+            let command = &lower_at(profile).commands.get(0).command;
             assert_eq!(
                 command.kernel,
                 KernelId::AffineQmvWide,
@@ -10912,7 +10916,7 @@ mod tests {
                 "affine_qmv_wide_bf16_s_f16_gs_64_b_4_nv_4_kl_8_batch_0"
             );
         }
-        let command = &lower_at(&crate::targets::M1_MAX).commands[0].command;
+        let command = &lower_at(&crate::targets::M1_MAX).commands.get(0).command;
         assert_eq!(
             command.kernel,
             KernelId::AffineQmvFast,
@@ -10994,11 +10998,14 @@ mod tests {
         );
         // The all-rows command IS the plain matmul's.
         let plain = plain_q_proj(at);
-        assert!(plain.commands.len() == 1 && tape.commands[3].command == plain.commands[0].command);
+        assert!(
+            plain.commands.len() == 1
+                && tape.commands.get(3).command == plain.commands.get(0).command
+        );
         // The gather over the matmul's input, `k` wide, and back over it; one thread per column,
         // walking the sampled rows in order (the rows swap in place). The logits stay at the
         // front: nothing moves them back.
-        let [gather, qmv, restore] = [0, 1, 2].map(|i| tape.commands[i].command);
+        let [gather, qmv, restore] = [0, 1, 2].map(|i| tape.commands.get(i).command);
         for c in [gather, restore] {
             assert!(matches!(
                 c.bindings[0],
@@ -11075,9 +11082,9 @@ mod tests {
             let tape = lower_subtile_tape_to_metal(&rows, &tp(), at).expect("lowers");
             let plain = plain_q_proj(at);
             let n = plain.commands.len();
-            let commands: Vec<GatedCommand> = tape.commands.iter().copied().collect();
+            let commands: Vec<GatedCommand> = tape.commands.iter().collect();
             let (matmul, compact) = commands.split_at(n);
-            let plain_commands: Vec<GatedCommand> = plain.commands.iter().copied().collect();
+            let plain_commands: Vec<GatedCommand> = plain.commands.iter().collect();
             assert!(matmul == plain_commands, "bucket {bucket_m}: plain");
             assert_eq!(matmul.last().map(|c| c.command.kernel), Some(last));
             // The compaction: the gather over the matmul's output, `n` wide.
@@ -11170,7 +11177,7 @@ mod tests {
                 (KernelId::AffineQmmW4a8, None)
             ]
         );
-        let (quant, qmm) = (&tape.commands[0].command, &tape.commands[1].command);
+        let (quant, qmm) = (&tape.commands.get(0).command, &tape.commands.get(1).command);
         assert_eq!(
             quant.bindings,
             [
@@ -11331,7 +11338,7 @@ mod tests {
         let every = at(&MetalStep::TanhSoftCap(Slot(2), Slot(2), width));
         assert_eq!(gated_steps(&every), [(KernelId::TanhSoftCap, None)]);
         assert_eq!(
-            every.commands[0].command.function,
+            every.commands.get(0).command.function,
             "tanh_soft_cap_bf16_specialized"
         );
         let scale = LogitOp::Scale(Scale(0.25));
@@ -11353,7 +11360,7 @@ mod tests {
         ] {
             let tape = at(&MetalStep::SampledLogits(Slot(2), Slot(2), op, width));
             assert_eq!(gated_steps(&tape), [(kernel, None)]);
-            let c = tape.commands[0].command;
+            let c = tape.commands.get(0).command;
             assert_eq!(c.function, function);
             assert_eq!(c.constants, [constant, ConstantValue::uint(6, 1000)]);
             assert_eq!(
@@ -11494,7 +11501,7 @@ mod tests {
                 coded(tq_writer(0, Causal, LLAMA_KV), attention.clone()),
                 64,
             );
-            let own: Vec<&GatedCommand> = tape
+            let own: Vec<GatedCommand> = tape
                 .commands
                 .iter()
                 .filter(|c| [one, plain, reroping].iter().any(|g| c.gate == Some(*g)))
@@ -11515,9 +11522,9 @@ mod tests {
                 |c: &GatedCommand, f: fn(&Binding) -> bool| c.command.bindings.iter().any(f);
             let scratch = |b: &Binding| matches!(b, Binding::RopedKScratch { .. });
             let cos_sin = |b: &Binding| matches!(b, Binding::Source { .. });
-            assert!(binds(own[1], scratch) && !binds(own[1], cos_sin));
-            assert!(!binds(own[2], scratch) && !binds(own[2], cos_sin));
-            assert!(!binds(own[3], scratch) && binds(own[3], cos_sin));
+            assert!(binds(&own[1], scratch) && !binds(&own[1], cos_sin));
+            assert!(!binds(&own[2], scratch) && !binds(&own[2], cos_sin));
+            assert!(!binds(&own[3], scratch) && binds(&own[3], cos_sin));
             assert_eq!(
                 own[2].command.function, own[1].command.function,
                 "the plain twin is the scratch attention's own kernel"
@@ -11569,7 +11576,7 @@ mod tests {
             }
             let lowered = lower_subtile_tape_to_metal(&tape, &p, bake_point(64, None))
                 .expect("lower_subtile_tape_to_metal");
-            let twins: Vec<&GatedCommand> = (lowered.commands.iter())
+            let twins: Vec<GatedCommand> = (lowered.commands.iter())
                 .filter(|c| c.command.kernel == KernelId::AttentionPrefillSdpaPaged)
                 .filter(|c| [plain, reroping].iter().any(|g| c.gate == Some(*g)))
                 .collect();
@@ -11590,7 +11597,7 @@ mod tests {
                 })
             };
             assert!(
-                sinks(twins[0]) && sinks(twins[1]),
+                sinks(&twins[0]) && sinks(&twins[1]),
                 "both twins keep the sinks"
             );
         }
@@ -11953,7 +11960,7 @@ mod tests {
         let vpw = scratchy_layers::turboquant::vals_per_word(bits) as u32;
         let hd = p.head_dim;
         let tape = lower_tq_layer(attention(MetalStep::AttentionViaCache, 0, Interleaved), 1);
-        let writer = tape.commands[0].command;
+        let writer = tape.commands.get(0).command;
         assert_eq!(writer.kernel, KernelId::RopeAppend);
         assert_eq!(
             bound_from(&writer, 16),
