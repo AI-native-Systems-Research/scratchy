@@ -1942,9 +1942,12 @@ const ATTN_SHAPES: &[AttnShape] = &[
     // that advances every k rows with a stride between the copies, so this is named rather
     // than half-addressed". The GQA broadcast at nkvh = 1 sprays the one KV head's keys
     // across the four query heads as a middle axis, a shape the device's pointwise operand
-    // modes cannot address. The (16, 4) and (8, 2) rows all pass, and BOTH executor tests
-    // run (4, 1) green — the executing path never builds this layout — so the refusal is
-    // the door contract's own card-half leg at one KV head. Per the plan's §5 law the fix
+    // modes cannot address. The (16, 4) and (8, 2) rows all pass. BOTH executor tests run
+    // (4, 1) green, but those are EMULATOR legs: `runner.rs:162-193` hands the IRFunctions
+    // to the emulator's fused driver and never calls `for_node` or the door, so a green
+    // executor row proves the KERNEL ARITHMETIC only — the card leg is the door contract
+    // refusing here, and the card cannot lower prefill attention at one KV head. Per the
+    // plan's §5 law the fix
     // lands in the kernel or door as its own job after review, or the floor stays above
     // it: `min_kv_heads_per_rank` is at least 2 until then.
     //
