@@ -188,7 +188,7 @@ fn small_m_steps_in_the_eight_row_bucket_at_qwen38_27b_shapes() {
                     threads: (32 * SMALL_M_SIMDGROUPS, 1),
                 },
             ));
-            if let Some(small) = W4a8Gemm::for_small_m(n, k) {
+            if let Some(small) = W4a8Gemm::for_small_m(n, k, 8) {
                 for (tag, rows) in [("pp16", PAIR_BUCKET), ("pp8", BUCKET)] {
                     cells.push((
                         format!("{tag}+m16k{}", small.simdgroups()),

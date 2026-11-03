@@ -937,6 +937,9 @@ impl W4a8SplitRows {
 /// 17408 x 5120 173 / 151; MLP down 5120 x 17408 210 / 146).
 pub const W4A8_SMALL_M_MIN_WAYS: W4a8SplitK = W4a8SplitK::Ways4;
 
+/// The widest bucket a full row tile's small-M GEMM splits K 8 ways in ([`W4a8Gemm::for_small_m`]).
+pub const W4A8_SMALL_M_EIGHT_WAYS_ROWS: u32 = 8;
+
 /// A dense W4A8 GEMM's kernel: the tiled GEMM, its split-K twin, or the split-K GEMM over the
 /// 16 rows of a small-M step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -992,20 +995,24 @@ impl W4a8Gemm {
     /// where `n` is not a multiple of its 32 columns or K has fewer chunks than the fewest ways.
     /// At 16 rows (`small_m_verify_probe_test`, µs at 4 / 8 ways): k and v 1024 x 5120, 32
     /// tiles, 23.8 / 16.4; gdn z 6144 x 5120, 192 tiles, 52.6 / 58.4.
-    pub fn for_small_m(n: u32, k: u32) -> Option<Self> {
+    pub fn for_small_m(n: u32, k: u32, bucket_m: u32) -> Option<Self> {
         if !n.is_multiple_of(W4A8_SPLIT_K_COLS) {
             return None;
         }
         let tiles = n / W4A8_SPLIT_K_COLS;
         let mut fits = (W4a8SplitK::ALL.into_iter())
             .filter(|s| *s >= W4A8_SMALL_M_MIN_WAYS && s.ways() <= k / 64);
-        // A long-K row tile already at the cores' simdgroups still takes 8 ways: its tiles walk K
+        // In the 8-row bucket (one verify lane), a row tile already at the cores' simdgroups on its
+        // own (gate/up 17408 x 5120, 544 tiles; lm_head, 7760) takes 8 ways, not 4: its tiles walk K
         // in series, and 8 in flight hide the chunk loads 4 do not (`small_m_verify_probe_test`,
-        // 40-core M5 Max, µs at 4 / 8 ways, 8 rows: gate/up 17408 x 5120 111.4 / 109.5,
-        // 16 rows 108.5 / 103.4).
+        // 40-core M5 Max, 8 rows, µs at 4 / 8 ways: gate/up 111.4 / 109.5; down, 160 tiles, 100.8 /
+        // 108.2 keeps 4). Qwen3.8-27B + DFlash2, `scr bench serve`, 64 ShareGPT prompts, 1 request:
+        // 79.5 -> 82.0 tok/s. The 2-lane verify's 64-row bucket keeps 4 (149.2 -> 145.4 at 8).
         let fill = (fits.clone()).find(|s| {
             tiles * s.ways() >= W4A8_SPLIT_K_MIN_SIMDGROUPS
-                && (tiles < W4A8_SPLIT_K_MIN_SIMDGROUPS || s.ways() >= 8)
+                && (bucket_m > W4A8_SMALL_M_EIGHT_WAYS_ROWS
+                    || tiles < W4A8_SPLIT_K_MIN_SIMDGROUPS
+                    || s.ways() >= 8)
         });
         fill.or_else(|| fits.next_back()).map(Self::SmallM)
     }

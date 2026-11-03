@@ -1121,7 +1121,7 @@ fn route_small_m(
     let w4a8 = cmds
         .iter()
         .find(|c| c.command.kernel == KernelId::AffineQmmW4a8);
-    let small_w4a8 = (w4a8.zip(W4a8Gemm::for_small_m(n, k)))
+    let small_w4a8 = (w4a8.zip(W4a8Gemm::for_small_m(n, k, bucket_m)))
         .filter(|_| class == crate::tape::lowered::GenClass::M5Wide);
     if let Some((gemm, kernel)) = small_w4a8 {
         let gemm = gemm.command;
@@ -1151,7 +1151,7 @@ fn route_small_m(
     // rows in the 8-row bucket, µs twin / pre-pass + W4A8 16-row: gate/up 158 / 151, MLP down
     // 170 / 148, o_proj 61 / 53, gdn qkv 97 / 90, gdn z 63 / 53, q+gate 116 / 114, k and v
     // 24 / 17, lm_head 1641 / 1384). The pre-pass is shared by the matmuls of one activation.
-    let short = (W4a8Gemm::for_small_m(n, k)).filter(|_| {
+    let short = (W4a8Gemm::for_small_m(n, k, bucket_m)).filter(|_| {
         class == crate::tape::lowered::GenClass::M5Wide
             && bucket_m <= W4A8_SMALL_M_ROWS
             && matches!(group_size, 64 | 128)
@@ -12081,7 +12081,10 @@ mod tests {
             );
             let (own, small) = (&tape.commands[1].command, &tape.commands[2].command);
             let kernel = W4a8Gemm::SmallM(ways);
-            assert_eq!(kernel, W4a8Gemm::for_small_m(n, k).expect("a 16-row tile"));
+            assert_eq!(
+                kernel,
+                W4a8Gemm::for_small_m(n, k, 64).expect("a 16-row tile")
+            );
             assert_eq!(
                 small.function,
                 kernel.static_name(dtype, scale, 64),
@@ -12149,11 +12152,11 @@ mod tests {
         };
         // (n, k, ways): gate/up, down, gdn z, k/v, lm_head.
         for (n, k, ways) in [
-            (17408, 5120, Ways4),
+            (17408, 5120, Ways8),
             (5120, 17408, Ways4),
             (6144, 5120, Ways4),
             (1024, 5120, Ways8),
-            (248320, 5120, Ways4),
+            (248320, 5120, Ways8),
         ] {
             let tape = lower_subtile_tape_to_metal(&gemm(n, k, 64), &p, at).expect("lowers");
             let case = format!("n {n} k {k}");
@@ -12188,7 +12191,10 @@ mod tests {
                 "{case}"
             );
             let kernel = W4a8Gemm::SmallM(ways);
-            assert_eq!(kernel, W4a8Gemm::for_small_m(n, k).expect("a 16-row tile"));
+            assert_eq!(
+                kernel,
+                W4a8Gemm::for_small_m(n, k, 8).expect("a 16-row tile")
+            );
             assert_eq!(
                 small.function,
                 kernel.static_name(dtype, scale, 64),

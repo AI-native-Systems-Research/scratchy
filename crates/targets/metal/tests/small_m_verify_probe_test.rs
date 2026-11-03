@@ -128,7 +128,7 @@ fn small_m_steps_in_a_w4a8_bucket_at_qwen38_27b_shapes() {
                 ConstantValue::int(2, BUCKET as i32),
             ];
             constants.extend(AffineCodes::Offset8.constant());
-            let picked = W4a8Gemm::for_small_m(n, k);
+            let picked = W4a8Gemm::for_small_m(n, k, BUCKET);
             let mut cells = vec![Cell {
                 tag: "twin".into(),
                 symbol: small_m_kernel_static_name(act, scale, GROUP, twin),
