@@ -6,7 +6,11 @@ import torch
 import torch.nn.functional as F
 
 
-@forward
+# The 16 and 32 rungs hold a 2-4-lane DFlash2 verify (lanes x 8 rows) on decode-shaped kernels,
+# as qwen3-5-moe's do: on the default ladder a 2-lane verify of Qwen3.8-27B ran the 64-row tape,
+# 47.7 ms of GPU a forward (M5 Max) against 38.7 at a lane's 8 rows and Splash's 38.74 ms 2-lane
+# cycle. A head shares its target's rungs.
+@forward(workloads=[1, 2, 4, 8, 16, 32, 64, 512, 1024, 2048, 4096])
 def qwen3_5():
     hidden_states = embed(input_ids, embed_tokens)
     for layer in range(num_hidden_layers):

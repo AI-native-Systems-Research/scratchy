@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT (Apple Inc.)
 //
-// Verbatim vendor of MLX's `QuantizedBlockLoader<T, BROWS, BCOLS, dst_ld,
+// Vendor of MLX's `QuantizedBlockLoader<T, BROWS, BCOLS, dst_ld,
 // reduction_dim, tgp_size, group_size, bits>` and its `dequantize<T, N,
 // bits>` helper from
 // `mlx-source/mlx/backend/metal/kernels/quantized.h:483-689`. Used by
 // `quantized_qmm.metal` to drive the per-K-iter weight-tile loader with
-// the SAME structure as MLX's prebuilt `affine_qmm_t_*` binary.
+// the SAME structure as MLX's prebuilt `affine_qmm_t_*` binary. Scratchy's additions: the
+// offset-8 code read (`offset8`) and the planes code layout (`planes`, `affine_codes.h`).
 //
 // Only `MLX_MTL_CONST` macro is duplicated to keep the file self-
 // contained (matches `quantized.h:13`); the `get_pack_factor` /
@@ -136,8 +137,15 @@ template <
     short tgp_size,
     short group_size,
     short bits,
-    bool offset8 = false>
+    bool offset8 = false,
+    bool planes = false>
 struct QuantizedBlockLoader {
+  // Planes (scratchy, `affine_codes.h`): 4-bit codes regrouped a 64-input chunk at a time, chunk
+  // `c`'s 32 bytes of every one of `planes_n` rows, row after row. A reduction-dim block of
+  // `BCOLS` inputs (half or all of a chunk) of row `r` at input `k` then sits at
+  // `(k / 64 * planes_n + r) * 32 + k % 64 / 2`: the loader keeps `k`, the row and the chunk.
+  static_assert(!planes || (reduction_dim == 1 && bits == 4 && 64 % BCOLS == 0),
+                "planes: a K-major 4-bit block within one 64-input chunk");
   static_assert(
       BCOLS <= group_size,
       "The group size should be larger than the columns");
@@ -169,6 +177,11 @@ struct QuantizedBlockLoader {
   const device uint8_t* src;
   const device T* scales;
   const device T* biases;
+  // Planes: the codes' base, the matrix's rows, this thread's row and its next input.
+  const device uint8_t* planes_base;
+  int planes_n;
+  int planes_row;
+  int planes_k;
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
@@ -177,7 +190,11 @@ struct QuantizedBlockLoader {
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      const device uint8_t* planes_base_ = nullptr,
+      int planes_n_ = 0,
+      int planes_row0_ = 0,
+      int planes_k0_ = 0) thread
       : src_ld(src_ld_),
         tile_stride(
             reduction_dim ? BCOLS_PACKED * bytes_per_pack
@@ -191,7 +208,15 @@ struct QuantizedBlockLoader {
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
         scales(scales_ + bi * src_ld / group_size),
-        biases(biases_ + bi * src_ld / group_size) {}
+        biases(biases_ + bi * src_ld / group_size),
+        planes_base(planes_base_),
+        planes_n(planes_n_),
+        planes_row(planes_row0_ + bi),
+        planes_k(planes_k0_ + bj * pack_factor) {
+    if (planes) {
+      src = planes_base + (int64_t(planes_k / 64) * planes_n + planes_row) * 32 + planes_k % 64 / 2;
+    }
+  }
 
   void load_unsafe() const thread {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
@@ -237,7 +262,12 @@ struct QuantizedBlockLoader {
   }
 
   void next() thread {
-    src += tile_stride;
+    if (planes) {
+      planes_k += BCOLS;
+      src = planes_base + (int64_t(planes_k / 64) * planes_n + planes_row) * 32 + planes_k % 64 / 2;
+    } else {
+      src += tile_stride;
+    }
     if (reduction_dim == 1) {
       if (group_steps > 1) {
         group_step_cnt++;

@@ -317,6 +317,9 @@ pub struct MetalWorker {
     /// The passes of a multi-token-prediction head (a `draft_model` that reads the target's
     /// hidden states), run at the end of a step the engine planned drafts for.
     mtp_drafter: Option<::scratchy_serving_engine::spec_decode::MtpDrafter>,
+    /// Splash's DFlash2 drafter (a `draft_model` that drafts a block a pass), run at the end of a
+    /// step the engine planned drafts for.
+    dflash2: Option<Dflash2>,
     /// Compiled on-GPU token sampler (temperature / top-k / top-p / min-p +
     /// penalties). Cached once at load_model alongside `argmax_kernels`; used
     /// only for non-greedy requests (greedy decode stays on the argmax path).
@@ -356,6 +359,9 @@ pub struct MetalWorker {
     /// The chain buffer and layout `execute_model` laid this step's head passes out in, and whether
     /// the step is behind a speculative one in flight, for `forward_argmax_then`.
     pending_chain: Option<(ChainLayout, Arc<ChainBuffer>, bool)>,
+    /// When the last blocking forward returned: the host's time from there to the next forward's
+    /// start is time the GPU waits on it (logged at debug with each forward's own).
+    last_forward_end: Option<std::time::Instant>,
     /// The chain of the deferred step `forward_argmax_then` committed, back for `execute_model`, and
     /// whether that step is behind a speculative one in flight (as `pending_chain` had it).
     committed_chain: Option<(ChainLayout, Arc<ChainBuffer>, bool)>,
@@ -696,6 +702,17 @@ fn decode_rows(
     scratchy_target_metal::tape::ids::DecodeRows(u32::try_from(rows).unwrap_or(u32::MAX))
 }
 
+// A block drafter's step drafts the lanes the device's verify budget prices: the engine's lane cap
+// is the metal target's.
+#[cfg(feature = "metal")]
+const _: () = assert!(
+    scratchy_serving_engine::spec_decode::BLOCK_LANES
+        == scratchy_target_metal::dflash2::BUDGET_LANES
+        && scratchy_serving_engine::spec_decode::BLOCK_LANES
+            == scratchy_forward_compiler::DFLASH2_BLOCK_LANES,
+    "a block drafter drafts the lanes its verify budget prices and its buckets bake"
+);
+
 /// The drafts a compiled head makes a step's sequences ([`DraftBudget`]): its registration's
 /// counts.
 #[cfg(feature = "metal")]
@@ -703,6 +720,7 @@ fn draft_budget(head: &scratchy_forward_compiler::HeadRegistration) -> DraftBudg
     DraftBudget {
         drafts: usize::from(head.drafts),
         verify_rows: usize::from(head.verify_rows),
+        block: head.drafting == scratchy_forward_compiler::HeadDrafting::Block,
     }
 }
 
@@ -1098,6 +1116,7 @@ impl MetalWorker {
             logprobs_raw: None,
             draft_vocab_suffix: None,
             mtp_drafter: None,
+            dflash2: None,
             sampler_kernels: None,
             sampler_arena: None,
             sampler_logits: None,
@@ -1105,6 +1124,7 @@ impl MetalWorker {
             argmax_slots: Vec::new(),
             deferral: None,
             pending_chain: None,
+            last_forward_end: None,
             committed_chain: None,
             spec_tail: None,
             committed: None,
@@ -1342,10 +1362,12 @@ impl MetalWorker {
                     u32::try_from(max_model_len.max(1)).unwrap_or(u32::MAX),
                 );
                 // The arena's rows beyond one a sequence are the drafts of the sequences that
-                // draft, the most the compiled head's budget drafts a step whatever the width:
+                // draft, the most a compiled head's budget drafts a step whatever the width:
                 // fixed bytes.
-                let draft_rows = scratchy_forward_compiler::head_of(arch)
-                    .map_or(0, |h| draft_budget(&h).draft_rows(usize::MAX));
+                let draft_rows = scratchy_forward_compiler::heads_of(arch)
+                    .map(|h| draft_budget(&h).draft_rows(usize::MAX))
+                    .max()
+                    .unwrap_or(0);
                 let facts = MaxNumSeqsFacts {
                     // Metal reports no device facts — the base constant, the
                     // SAME default as before the resolver existed.
@@ -1536,7 +1558,8 @@ impl MetalWorker {
         let draft = self.draft_model.as_deref();
         let draft_bytes = match draft {
             Some(head) if head.reads_target_hidden() => {
-                target_rung.hosting_scratch_bytes(rows, &pick(head)?.guest(rows))
+                let guest = Self::metal_pick(head, dev, max_m, self.head_block_cap(block_cap))?;
+                target_rung.hosting_scratch_bytes(rows, &guest.guest(rows))
             }
             Some(draft) => pick(draft)?.scratch_bytes(rows),
             None => 0,
@@ -1555,14 +1578,15 @@ impl MetalWorker {
         ) else {
             return Ok(None);
         };
-        let kv = match self.head_reads_target_kv() {
+        let kv = match self.head_reads_target_kv() || self.dflash2.is_some() {
             true => self.kv_cache.as_ref(),
             false => self.draft_kv_cache.as_ref(),
         };
         let kv = kv.ok_or_else(|| {
             ExecutorError::WorkerInit("MTP head: its KV pool is not initialized".into())
         })?;
-        let rung = Self::metal_pick(head, dev, dev.metal_bucket_max_m, kv.max_blocks_per_seq)?;
+        let block_cap = self.head_block_cap(kv.max_blocks_per_seq);
+        let rung = Self::metal_pick(head, dev, dev.metal_bucket_max_m, block_cap)?;
         Ok(Some(rung.guest(dev.max_decode_rows)))
     }
 
@@ -1639,6 +1663,114 @@ impl MetalWorker {
 
     /// Whether the loaded draft is a multi-token-prediction head: it reads the target's hidden
     /// states, so it runs after the target, never beside it.
+    /// Splash's DFlash2 drafter's runtime pieces: its planner over its `budget`, its cycle's cost
+    /// line (its target's verify's and its `model`'s weight bytes), its acceptance kernel
+    /// (`kernels`, its bake) and its rings — every layer's keys and values of a sequence's last
+    /// window of positions, a slot for each sequence the worker holds — sized from its `config`.
+    fn load_dflash2(
+        &self,
+        (budget, model): (DraftBudget, &dyn scratchy_forward_compiler::ScratchyWeights),
+        kernels: &scratchy_target_metal::off_tape::OffTapeKernels,
+        config: &HfModelConfig,
+    ) -> ExecutorResult<Dflash2> {
+        let init = |what: &str| ExecutorError::WorkerInit(format!("DFlash2 drafter: {what}"));
+        let gpu_device = (self.gpu_device.as_ref()).ok_or_else(|| init("no gpu_device"))?;
+        let target = (self.model.as_deref()).ok_or_else(|| init("its target must load first"))?;
+        // The weight bytes of a model's forward at the bucket that holds a cycle's verify rows.
+        let rows = budget.verify_rows as u32;
+        let weight_bytes = |m: &dyn scratchy_forward_compiler::ScratchyWeights| {
+            let rungs = scratchy_target_metal::interpreter::metal::MetalRungs::of(m.metal_rungs())
+                .map_err(|e| init(&format!("its buckets: {e}")))?;
+            (rungs.buckets.iter())
+                .filter(|b| b.bucket_m >= rows)
+                .min_by_key(|b| b.bucket_m)
+                .map(|b| b.weight_bytes)
+                .ok_or_else(|| init(&format!("no bucket holds {rows} verify rows")))
+        };
+        let cost = scratchy_target_metal::dflash2::VerifyLine::of(
+            weight_bytes(target)?,
+            weight_bytes(model)?,
+        );
+        info!(
+            "ScratchyWorker(metal): DFlash2 cycle reads {:.2} GiB of weights and {:.3} GiB a verify row",
+            cost.fixed, cost.per_row
+        );
+        let accept =
+            scratchy_target_metal::dflash2::DraftAcceptKernel::new(&gpu_device.device, kernels)
+                .map_err(|e| init(&format!("acceptance compile: {e:?}")))?
+                .ok_or_else(|| init("its bake has no acceptance kernel"))?;
+        let dflash = config.extra.get("dflash_config");
+        let window = (dflash.and_then(|d| d.get("swa_window_size")))
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| init("its config names no dflash_config.swa_window_size"))?;
+        let taps = (dflash.and_then(|d| d.get("target_layer_ids")))
+            .and_then(|v| v.as_array())
+            .map(|ids| ids.len())
+            .ok_or_else(|| init("its config names no dflash_config.target_layer_ids"))?;
+        let geometry = (config.num_hidden_layers())
+            .zip(config.num_kv_heads())
+            .zip(config.head_dim());
+        let ((layers, kv_heads), head_dim) =
+            geometry.ok_or_else(|| init("its config lacks its layers, KV heads or head dim"))?;
+        let slots = self.max_num_seqs_resolved();
+        let elem_bytes = size_of::<u16>();
+        let slot_bytes = scratchy_target_metal::dflash2::DraftRingPool::slot_bytes(
+            kv_heads,
+            window as usize,
+            head_dim,
+            elem_bytes,
+        );
+        let hidden =
+            (config.hidden_size()).ok_or_else(|| init("its config names no hidden_size"))?;
+        let window_bytes =
+            scratchy_target_metal::dflash2::DraftRingPool::window_bytes(window as usize, hidden);
+        let (device, residency) = (&gpu_device.device, gpu_device.allocator.residency());
+        let rings = scratchy_target_metal::dflash2::DraftRingPool::new(
+            layers,
+            slots,
+            slot_bytes,
+            window_bytes,
+            |bytes| Ok(MetalMem::new_pinned(device, residency, bytes)),
+        )
+        .map_err(|e| init(&format!("rings: {e}")))?;
+        residency.commit();
+        info!(
+            "ScratchyWorker(metal): DFlash2 drafter — {layers} layers' rings of {window} positions \
+             for {slots} sequences, and their context windows ({} MiB)",
+            (2 * layers * slots * slot_bytes + slots * window_bytes) >> 20
+        );
+        let target_kernels =
+            scratchy_target_metal::off_tape::OffTapeKernels::of(target.metal_off_tape())
+                .map_err(|e| init(&format!("its target's off-tape kernels: {e}")))?;
+        let sampling = scratchy_target_metal::dflash2::TargetSamplingKernels::new(
+            &gpu_device.device,
+            target_kernels,
+        )
+        .map_err(|e| init(&format!("its target's policy compile: {e:?}")))?
+        .ok_or_else(|| init("its target baked no policy for its verify rows"))?;
+        Ok(Dflash2 {
+            drafter: ::scratchy_serving_engine::spec_decode::BlockDrafter {
+                budget,
+                max_model_len: self.max_model_len(),
+                window: window as usize,
+            },
+            accept,
+            sampling,
+            rings,
+            slots: RingSlots::new(slots as u32),
+            cycles: HashMap::new(),
+            captured_row_bytes: taps * target.hidden_size() as usize * elem_bytes,
+            cycle_buffer: None,
+            cost,
+            window: scratchy_target_metal::dflash2::WindowLayout {
+                window: window as u32,
+                hidden,
+            },
+            contexts: HashMap::new(),
+            snapshot_windows: None,
+        })
+    }
+
     fn draft_is_head(&self) -> bool {
         (self.draft_model.as_ref()).is_some_and(|m| m.reads_target_hidden())
     }
@@ -1822,11 +1954,14 @@ impl MetalWorker {
             ));
         };
         let model = &self.config.model_path;
-        let head = scratchy_forward_compiler::head_of(arch).ok_or_else(|| {
-            ExecutorError::WorkerInit(format!(
-                "this build compiled no multi-token-prediction head for {arch} ({model})"
-            ))
-        })?;
+        // The head a target's checkpoint carries, or a sidecar file of its conversion.
+        let head = (scratchy_forward_compiler::heads_of(arch))
+            .find(|head| head.checkpoint_prefix.is_some())
+            .ok_or_else(|| {
+                ExecutorError::WorkerInit(format!(
+                    "this build compiled no multi-token-prediction head for {arch} ({model})"
+                ))
+            })?;
         if let Some(prefix) = head.checkpoint_prefix.filter(|p| refs.holds(p)) {
             let mut weights = GpuWeights::empty(allocator);
             let lent = weights.lend(refs, prefix, "", None).map_err(|e| {
@@ -1897,15 +2032,23 @@ impl MetalWorker {
         draft_weights.set_target_dtype(GpuDType::BF16);
         // A multi-token-prediction head carries no embedding or lm_head: lend it the target's,
         // from the target store's refs (same mmap → no second upload).
+        let mut block_budget = None;
         if let Some(head) = scratchy_forward_compiler::draft_head(&draft_arch) {
-            // It drafts over its whole vocabulary until its bake says otherwise (below: a
-            // vocabulary suffix).
-            self.mtp_drafter = Some(::scratchy_serving_engine::spec_decode::MtpDrafter {
-                budget: draft_budget(&head),
-                max_model_len: self.max_model_len(),
-                reads_target_kv: head.reads_target_kv,
-                draft_vocab: None,
-            });
+            match head.drafting {
+                // It drafts over its whole vocabulary until its bake says otherwise (below: a
+                // vocabulary suffix).
+                scratchy_forward_compiler::HeadDrafting::Chained => {
+                    self.mtp_drafter = Some(::scratchy_serving_engine::spec_decode::MtpDrafter {
+                        budget: draft_budget(&head),
+                        max_model_len: self.max_model_len(),
+                        reads_target_kv: head.reads_target_kv,
+                        draft_vocab: None,
+                    });
+                }
+                scratchy_forward_compiler::HeadDrafting::Block => {
+                    block_budget = Some(draft_budget(&head));
+                }
+            }
             let (Some(target), Some(refs)) =
                 (self.model.as_deref(), self.target_tensor_refs.as_ref())
             else {
@@ -2045,6 +2188,11 @@ impl MetalWorker {
                 Some(suffix)
             }
         };
+        // Splash's DFlash2 drafter: its acceptance and its rings, a slot a sequence.
+        if let Some(budget) = block_budget {
+            let drafter = (budget, &*draft_model);
+            self.dflash2 = Some(self.load_dflash2(drafter, draft_off_tape, &draft_hf_config)?);
+        }
         self.draft_model = Some(draft_model);
         // Spec-decode runs the chunked-addressing tape rung: the direct (BPC=0) path has an
         // unresolved interaction with the draft K-step chain on 3B-class+ models (out-of-vocab
@@ -2931,8 +3079,17 @@ impl MetalWorker {
             scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE,
         );
         let (conv, ssm) = dims.slot_bytes(scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE);
-        let unit = scratchy_target_metal::sparse_kv::whole_tile_blocks(&dev.device, [conv, ssm]);
-        (bytes > 0).then_some((bytes, unit))
+        // A DFlash2 drafter's snapshot keeps its context window beside the state (Splash
+        // `QwenStateStorage::acquire` takes a `DFlashContextWindow` with every cached state).
+        let window = self.snapshot_window_bytes();
+        let unit =
+            scratchy_target_metal::sparse_kv::whole_tile_blocks(&dev.device, [conv, ssm, window]);
+        (bytes > 0).then_some((bytes + window, unit))
+    }
+
+    /// A snapshot's DFlash2 context window, in bytes: 0 without a DFlash2 drafter.
+    fn snapshot_window_bytes(&self) -> usize {
+        self.dflash2.as_ref().map_or(0, |d| d.window.bytes())
     }
 
     /// ⭐ HOW A POOL OF `num_gpu_blocks` BLOCKS SHARES ITS BUDGET WITH THE SNAPSHOTS: a block costs
@@ -2966,7 +3123,7 @@ impl MetalWorker {
             true => target_layout.iter().map(|&(bytes, _)| bytes).collect(),
             false => turboquant_stores(model),
         };
-        let draft = (self.draft_model.as_deref()).filter(|_| !self.head_reads_target_kv());
+        let draft = (self.draft_model.as_deref()).filter(|_| self.draft_keeps_kv());
         let dense_draft = draft.is_some_and(|d| !uniform_turboquant(d, bs));
         let draft_block = match draft {
             Some(d) => {
@@ -3002,9 +3159,24 @@ impl MetalWorker {
         (self.mtp_drafter.as_ref()).is_some_and(|d| d.reads_target_kv)
     }
 
+    /// The draft model keeps a paged KV pool of its own: neither an MTP head reading its target's
+    /// KV nor a block drafter, whose rings are its KV.
+    fn draft_keeps_kv(&self) -> bool {
+        !self.head_reads_target_kv() && self.dflash2.is_none()
+    }
+
+    /// The blocks a sequence the head's tape rung must hold for a KV pool of `block_cap`: none for
+    /// a block drafter, which reads no paged KV (its one rung is its ladder's floor).
+    fn head_block_cap(&self, block_cap: usize) -> usize {
+        match self.dflash2 {
+            Some(_) => 0,
+            None => block_cap,
+        }
+    }
+
     fn initialize_draft_cache_metal(&mut self, num_gpu_blocks: usize) -> ExecutorResult<()> {
         // A head reading its target's KV has no pool: its forwards run on the target's.
-        if self.head_reads_target_kv() {
+        if !self.draft_keeps_kv() {
             return Ok(());
         }
         let model = self.draft_model.as_ref().ok_or_else(|| {
@@ -3393,6 +3565,8 @@ fn metal_chain_dispatch(
         gdn_state: None,
         gdn_state_indices: None,
         gdn_is_fresh: None,
+        draft_ring: None,
+        draft: None,
         sampled_rows: None,
         device_inputs: &[],
         deferred: None,
@@ -3712,7 +3886,7 @@ impl MetalWorker {
         kv_pool: ::scratchy_serving_engine::spec_decode::KvPoolHandle,
         req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
         hidden_rows: &[u32],
-        then: Option<&::scratchy_serving_engine::spec_decode::HeadPasses>,
+        then: Option<Then<'_>>,
     ) -> Result<Forwarded, ::scratchy_serving_engine::spec_decode::BackendError> {
         use ::scratchy_serving_engine::spec_decode::{BackendError, KvPoolHandle, ModelHandle};
 
@@ -4026,6 +4200,8 @@ impl MetalWorker {
             gdn_state: gdn_state_ref,
             gdn_state_indices: view_gdn_indices,
             gdn_is_fresh: view_gdn_is_fresh,
+            draft_ring: None,
+            draft: None,
             sampled_rows: view_sampled_rows,
             device_inputs: &device_inputs,
             deferred: deferral.as_ref(),
@@ -4057,8 +4233,33 @@ impl MetalWorker {
             ),
             _ => None,
         };
+        // A block drafter's cycle buffer, for the step's lanes.
+        if let (Some(Then::Block(step)), Some(d)) = (then, self.dflash2.as_mut()) {
+            let rows = d.drafter.budget.drafts as u64 + 1;
+            let lanes = step.verify.len().max(1) as u64;
+            let bytes = scratchy_target_metal::dflash2::CycleLayout::of(lanes, rows).total;
+            if reserve_pinned(&mut d.cycle_buffer, &mtl_device, &residency, bytes as usize) {
+                residency.commit();
+            }
+        }
         let head = match (then, head_device) {
-            (Some(passes), Some(device)) => {
+            (Some(Then::Block(step)), Some(device)) => {
+                Some(HeadEncoder::Block(BlockPassesEncoder {
+                    step,
+                    model: (self.draft_model.as_deref()).ok_or_else(|| {
+                        BackendError::Backend("DFlash2 drafter not loaded".into())
+                    })?,
+                    target: (self.model.as_deref())
+                        .ok_or_else(|| BackendError::Backend("target not loaded".into()))?,
+                    kv_cache: (self.kv_cache.as_ref())
+                        .ok_or_else(|| BackendError::Backend("target kv_cache missing".into()))?,
+                    dflash2: (self.dflash2.as_ref()).ok_or_else(|| {
+                        BackendError::Backend("DFlash2 drafter not loaded".into())
+                    })?,
+                    device,
+                }))
+            }
+            (Some(Then::Mtp(passes)), Some(device)) => {
                 let model = (self.draft_model.as_deref())
                     .ok_or_else(|| BackendError::Backend("MTP head not loaded".into()))?;
                 // An MRoPE head reads a rotary cos/sin row a token in place of its position.
@@ -4081,7 +4282,7 @@ impl MetalWorker {
                     true => (self.kv_cache.as_ref(), StepTables::of(req)),
                     false => (self.draft_kv_cache.as_ref(), StepTables::default()),
                 };
-                Some(HeadPassesEncoder {
+                Some(HeadEncoder::Mtp(Box::new(HeadPassesEncoder {
                     passes,
                     model,
                     target: (self.model.as_deref())
@@ -4098,7 +4299,7 @@ impl MetalWorker {
                     layout,
                     device,
                     behind,
-                })
+                })))
             }
             _ => None,
         };
@@ -4225,12 +4426,13 @@ impl MetalWorker {
         };
         let logprobs_device = mtl_device.clone();
         let followup: scratchy_forward_compiler::MetalForwardFollowup<'_> = Box::new(
-            move |enc,
-                  logits_buf,
-                  hidden_buf,
-                  total_n_actual,
-                  vocab_actual|
-                  -> Result<(), String> {
+            move |enc, outputs| -> Result<(), String> {
+                let scratchy_forward_compiler::FollowupOutputs {
+                    logits: logits_buf,
+                    rows: total_n_actual,
+                    vocab: vocab_actual,
+                    ..
+                } = outputs;
                 // Retain a clone of the logits buffer for the post-forward
                 // sampler (see `logits_capture` above).
                 *logits_capture_cl.borrow_mut() = Some((retained(logits_buf), vocab_actual));
@@ -4307,15 +4509,15 @@ impl MetalWorker {
                 if let Some(pass) = &logprobs {
                     pass.encode(&logprobs_device, enc, logits_addr, out_addr)?;
                 }
-                // The MTP head's passes, reading the tokens just picked and the hidden states.
+                // The head's passes, reading the tokens just picked and what the target left.
                 if let Some(h) = head_cell.borrow_mut().as_mut() {
-                    let hidden = retained(hidden_buf);
-                    let onto = h.encode(enc, &argmax_out_for_closure, &hidden)?;
+                    let onto = h.encode(enc, &argmax_out_for_closure, outputs)?;
                     *head_onto_cell.borrow_mut() = Some(onto);
                 }
                 Ok(())
             },
         );
+        let forward_start = std::time::Instant::now();
         let logits = unsafe {
             model_ref.forward_with_metal_followup(
                 scratchy_target_metal::ForwardCtxHandle::new(&ctx),
@@ -4326,14 +4528,36 @@ impl MetalWorker {
         }
         .map_err(|e| BackendError::Backend(e.0))?;
         let _ = logits; // argmax_out is what we read
+        // A blocking forward's time (its encoding and the GPU's run), and the host's since the last
+        // one returned, which the GPU spent waiting.
+        if deferral.is_none() {
+            let end = std::time::Instant::now();
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            let host = self
+                .last_forward_end
+                .replace(end)
+                .map(|last| ms(forward_start - last));
+            let gpu = scratchy_target_metal::interpreter::metal::last_gpu_span();
+            tracing::debug!(
+                "forward of {} rows: {:.2} ms, gpu {:.3} ms, host {:.2} ms since the last",
+                req.num_tokens,
+                ms(end - forward_start),
+                ms(gpu.0),
+                host.unwrap_or(f64::NAN),
+            );
+        }
         if let Some(deferral) = deferral.as_mut() {
             let in_flight = deferral.take_in_flight().ok_or_else(|| {
                 BackendError::Backend("a deferred forward returned uncommitted".into())
             })?;
             self.committed = Some((in_flight, argmax));
             // The head's worker goes back now: its staging slot outlives this step (`Onto`).
-            self.committed_chain = (head.borrow().as_ref())
-                .and_then(|h| h.buffer.clone().map(|b| (h.layout.clone(), b, h.behind)));
+            self.committed_chain = match head.borrow().as_ref() {
+                Some(HeadEncoder::Mtp(h)) => {
+                    (h.buffer.clone()).map(|b| (h.layout.clone(), b, h.behind))
+                }
+                _ => None,
+            };
             return Ok(Forwarded::default());
         }
 
@@ -4386,13 +4610,14 @@ impl MetalWorker {
             });
         }
         self.sampler_logits = logits_capture.borrow_mut().take();
-        // The drafts, once the command buffer is done; then the head's worker goes back.
-        let drafts = (head.into_inner()).map_or_else(Vec::new, |h| h.drafts());
-        drop(head_onto);
+        // What the passes left, once the command buffer is done; then the head's worker goes back.
+        let onto = head_onto.into_inner();
+        let head = (head.into_inner()).map(|h| h.outcome(onto.as_deref()));
+        drop(onto);
         Ok(Forwarded {
             tokens: out,
             hidden: hidden_capture.into_inner(),
-            drafts,
+            head: head.unwrap_or_default(),
         })
     }
 }
@@ -4404,7 +4629,7 @@ impl MetalWorker {
 struct Forwarded {
     tokens: Vec<u32>,
     hidden: Vec<u8>,
-    drafts: Vec<u32>,
+    head: HeadOutcome,
 }
 
 /// A buffer an encoder hook was handed, kept past the hook.
@@ -4955,6 +5180,574 @@ impl<'a> HeadPassesEncoder<'a> {
     }
 }
 
+/// What a step runs after its target in its command buffer: an MTP head's passes, or a block
+/// drafter's ([`BlockStep`]).
+#[cfg(feature = "metal")]
+#[derive(Clone, Copy)]
+enum Then<'a> {
+    Mtp(&'a ::scratchy_serving_engine::spec_decode::HeadPasses),
+    Block(&'a BlockStep),
+}
+
+/// A block drafter's passes over a step ([`BlockPasses`](::scratchy_serving_engine::spec_decode::BlockPasses)),
+/// with what the worker knows of the step's requests: each sequence's ring slot, each lane's
+/// verify — its policy and its last block's selection — and its next block's policy.
+#[cfg(feature = "metal")]
+struct BlockStep {
+    passes: ::scratchy_serving_engine::spec_decode::BlockPasses,
+    /// The rebuild's forwards, each at most the drafter's widest affordable bucket, with the ring
+    /// slot of each sequence it runs, in its order.
+    rebuilds: Vec<(
+        ::scratchy_serving_engine::spec_decode::block::Rebuild,
+        Vec<u32>,
+    )>,
+    /// The windows the rebuild reads, each given back from its snapshot first.
+    restores: Vec<WindowSnapshot>,
+    /// The snapshots the step saves, each taking its sequence's window as the step finds it.
+    saves: Vec<WindowSnapshot>,
+    /// Each commit's ring slot of each sequence it runs, in its order.
+    commit_slots: Vec<Vec<u32>>,
+    /// Each commit's snapshots whose window its rows complete: copied after it.
+    saved_after: Vec<Vec<WindowSave>>,
+    /// The ring slot of each lane of the block.
+    block_slots: Vec<u32>,
+    /// Each lane's verify of the block it drafted last ([`Cycle`]): its policy, and that block's
+    /// candidates and their probabilities.
+    verify: Vec<scratchy_target_metal::dflash2::VerifyLane>,
+    candidates: Vec<u32>,
+    q_probs: Vec<f32>,
+    /// Each lane's policy for its next block's selection.
+    lane_params: Vec<scratchy_target_metal::dflash2::DraftLaneParams>,
+}
+
+/// A lane's cycle between the step that drafts its block and the one that verifies it (Splash's
+/// one command a cycle, split across two steps here): the block's candidates and their
+/// probabilities, what a sampled lane's acceptance and correction read.
+#[cfg(feature = "metal")]
+struct Cycle {
+    candidates: Vec<u32>,
+    q_probs: Vec<f32>,
+}
+
+/// A ring slot a request (Splash's `DFlashDraftRing` a lane): taken at its first step, given back
+/// when it finishes. A slot's ring holds what its last request committed; a request reads only
+/// the positions it committed itself.
+#[cfg(feature = "metal")]
+struct RingSlots {
+    by_request: HashMap<String, u32>,
+    free: Vec<u32>,
+}
+
+#[cfg(feature = "metal")]
+impl RingSlots {
+    fn new(slots: u32) -> Self {
+        Self {
+            by_request: HashMap::new(),
+            free: (0..slots).rev().collect(),
+        }
+    }
+
+    fn of(&mut self, request: &str) -> Result<u32, String> {
+        if let Some(&slot) = self.by_request.get(request) {
+            return Ok(slot);
+        }
+        let slot = (self.free.pop()).ok_or("every DFlash2 ring slot is taken")?;
+        self.by_request.insert(request.to_owned(), slot);
+        Ok(slot)
+    }
+
+    fn release(&mut self, request: &str) {
+        if let Some(slot) = self.by_request.remove(request) {
+            self.free.push(slot);
+        }
+    }
+}
+
+/// Splash's DFlash2 drafter as the worker runs it: its planner, its acceptance, its target's
+/// policy over a cycle's sampled verify rows, its rings and a slot of them a request, and each
+/// request's cycle in flight.
+#[cfg(feature = "metal")]
+struct Dflash2 {
+    drafter: ::scratchy_serving_engine::spec_decode::BlockDrafter,
+    accept: scratchy_target_metal::dflash2::DraftAcceptKernel,
+    sampling: scratchy_target_metal::dflash2::TargetSamplingKernels,
+    rings: scratchy_target_metal::dflash2::DraftRingPool,
+    slots: RingSlots,
+    /// Each request's cycle: drafted by one step, verified by the next.
+    cycles: HashMap<String, Cycle>,
+    /// A captured row's bytes: the target's hidden state at each layer the drafter reads.
+    captured_row_bytes: usize,
+    /// The cycle's buffer ([`CycleLayout`](scratchy_target_metal::dflash2::CycleLayout)), grown to
+    /// the widest step.
+    cycle_buffer: Option<scratchy_target_metal::residency::Pinned>,
+    /// What a cycle costs by the rows it verifies, which its verify budget prices rows by.
+    cost: scratchy_target_metal::dflash2::VerifyLine,
+    /// A ring slot's context window.
+    window: scratchy_target_metal::dflash2::WindowLayout,
+    /// Each request's admission: where its prefill resumed and the positions it snapshots
+    /// ([`SequenceContext`](::scratchy_serving_engine::spec_decode::block::SequenceContext)).
+    contexts: HashMap<String, (u32, Vec<u32>)>,
+    /// The prefix-cache snapshots' context windows; `None` without snapshots.
+    snapshot_windows: Option<SnapshotWindows>,
+}
+
+/// The context windows of the prefix cache's state snapshots: the GDN state stores' last, a window
+/// a slot from the first snapshot slot's (`from`); `saved`: whether a slot's last save took its
+/// window, which a restore rebuilds rings from only then.
+#[cfg(feature = "metal")]
+struct SnapshotWindows {
+    buffer: scratchy_target_metal::mtl4_dispatch::Buffer,
+    from: usize,
+    saved: Vec<bool>,
+}
+
+/// A snapshot's context window and the ring slot of the sequence it is taken from or given back
+/// to this step (its block in [`SnapshotWindows`]' store).
+#[cfg(feature = "metal")]
+#[derive(Clone, Copy)]
+struct WindowSnapshot {
+    ring_slot: u32,
+    block: usize,
+}
+
+/// A snapshot's window, completed after a commit: its sequence's positions `[from, to)`.
+#[cfg(feature = "metal")]
+#[derive(Clone, Copy)]
+struct WindowSave {
+    snapshot: WindowSnapshot,
+    from: u32,
+    to: u32,
+}
+
+#[cfg(feature = "metal")]
+impl Dflash2 {
+    /// The seed request `req_id`'s kernels draw its uniforms from (`dflash2::draft_uniform`): the
+    /// request's own (Splash's `SamplingConfig::seed`), or one of its id when it sets none.
+    fn seed(
+        req_id: &str,
+        params: Option<&scratchy_core_common::SamplingParams>,
+    ) -> scratchy_target_metal::dflash2::DraftSeed {
+        let unseeded = || u64::from(scratchy_core_common::fnv_seed(req_id, 0));
+        let seed = params.and_then(|p| p.seed).unwrap_or_else(unseeded);
+        scratchy_target_metal::dflash2::DraftSeed::of(seed)
+    }
+
+    /// What `req_id` holds of the worker's: its ring slot and its cycle.
+    fn release(&mut self, req_id: &str) {
+        self.slots.release(req_id);
+        self.cycles.remove(req_id);
+        self.contexts.remove(req_id);
+    }
+}
+
+/// A block drafter's passes over a step ([`BlockStep`]), encoded in its target's command buffer
+/// after the target's forward and sampler: the target's policy over its sampled verify rows, the
+/// acceptance, the commit, then the block draft.
+#[cfg(feature = "metal")]
+struct BlockPassesEncoder<'a> {
+    step: &'a BlockStep,
+    model: &'a dyn scratchy_forward_compiler::ScratchyWeights,
+    /// The target whose command buffer the passes ride, whose arena the drafter's pool is built in.
+    target: &'a dyn scratchy_forward_compiler::ScratchyWeights,
+    /// The target's KV cache: the drafter's forwards read none (its rings are its KV).
+    kv_cache: &'a KvCachePool,
+    dflash2: &'a Dflash2,
+    device: GpuDevice,
+}
+
+#[cfg(feature = "metal")]
+impl<'a> BlockPassesEncoder<'a> {
+    fn rows(&self) -> usize {
+        self.dflash2.drafter.budget.drafts + 1
+    }
+
+    fn layout(&self) -> scratchy_target_metal::dflash2::CycleLayout {
+        let lanes = self.step.verify.len().max(1) as u64;
+        scratchy_target_metal::dflash2::CycleLayout::of(lanes, self.rows() as u64)
+    }
+
+    fn buffer(&self) -> Result<scratchy_target_metal::mtl4_dispatch::Buffer, String> {
+        let pinned = (self.dflash2.cycle_buffer.as_ref())
+            .ok_or("a DFlash2 step without its cycle buffer")?;
+        Ok((**pinned).clone())
+    }
+
+    /// Encode the passes onto `enc` after the target's forward, which picked its tokens into
+    /// `tokens` (one `u32` a sampled row) from its `outputs`' logits and captured its rows.
+    fn encode(
+        &mut self,
+        enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        tokens: &scratchy_target_metal::mtl4_dispatch::Buffer,
+        outputs: scratchy_forward_compiler::FollowupOutputs<'_>,
+    ) -> Result<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>, String> {
+        use ::objc2_metal::MTLBuffer as _;
+        use scratchy_target_metal::interpreter::metal::{DeviceInputInto as Into, DraftInputs};
+        let step = self.step;
+        let captured = (outputs.captured).ok_or("a DFlash2 drafter's target captured no rows")?;
+        let captured = retained(captured);
+        let buffer = self.buffer()?;
+        let block = step.passes.block.as_ref();
+        let lanes = step.verify.len();
+        let rows = self.rows();
+        let layout = self.layout();
+        let base = buffer.gpuAddress();
+        // 1. The target's policy over the sampled lanes' verify rows, then the acceptance: their
+        // inputs written by the host first.
+        if let Some(block) = block {
+            // SAFETY: the buffer holds `layout.total` bytes for the widest step's lanes, and no
+            // command buffer reads it (the step before this one is done).
+            unsafe {
+                let at = |section: u64| {
+                    buffer
+                        .contents()
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(section as usize)
+                };
+                let write = |section: u64, bytes: &[u8]| {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), at(section), bytes.len())
+                };
+                write(layout.lanes, as_bytes(&step.verify));
+                write(layout.drafted, as_bytes(&block.drafted));
+                write(layout.draft_ids, as_bytes(&step.candidates));
+                write(layout.draft_probs, as_bytes(&step.q_probs));
+            }
+            if (step.verify.iter()).any(|l| l.sampling != 0 && l.drafts > 0) {
+                let logits = outputs.logits.gpuAddress();
+                let [mass, search, draw] = layout.sampling(base, logits, tokens.gpuAddress());
+                let tables = [
+                    argument_table(&self.device, &mass)?,
+                    argument_table(&self.device, &search)?,
+                    argument_table(&self.device, &draw)?,
+                ];
+                let tables = [&*tables[0], &*tables[1], &*tables[2]];
+                self.dflash2
+                    .sampling
+                    .encode(enc, tables, (lanes * rows) as u32);
+            }
+            let table = argument_table(&self.device, &layout.accept(base, tokens.gpuAddress()))?;
+            self.dflash2.accept.encode(enc, &table, lanes as u32);
+        }
+        let mut onto: Option<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>> = None;
+        // 2. The rings a restore gives back: each window from its snapshot, then the rings rebuilt
+        // from it (Splash `addDraftRebuild`, Runtime.cpp:1556-1564, ahead of the command's rows).
+        let window = self.dflash2.window;
+        let rings = self.dflash2.rings.windows().buffer();
+        let snapshots = (self.dflash2.snapshot_windows.as_ref()).map(|w| &*w.buffer);
+        let copies = |taken: &[WindowSnapshot], to_ring: bool| -> Result<Vec<_>, String> {
+            let snapshots = snapshots.ok_or("a DFlash2 snapshot without snapshot windows")?;
+            Ok((taken.iter())
+                .map(|t| {
+                    let (ring_at, snapshot_at) = (
+                        t.ring_slot as usize * window.bytes(),
+                        t.block * window.bytes(),
+                    );
+                    let (from, from_at, to, to_at) = match to_ring {
+                        true => (snapshots, snapshot_at, &**rings, ring_at),
+                        false => (&**rings, ring_at, snapshots, snapshot_at),
+                    };
+                    scratchy_target_metal::dflash2::WindowCopy {
+                        from,
+                        from_at,
+                        to,
+                        to_at,
+                        len: window.bytes(),
+                    }
+                })
+                .collect())
+        };
+        if !step.restores.is_empty() {
+            scratchy_target_metal::dflash2::encode_window_copies(
+                enc,
+                &copies(&step.restores, true)?,
+            );
+        }
+        for (rebuild, slots) in &step.rebuilds {
+            let req = rebuild.request();
+            let draft = DraftInputs {
+                ring_slots: slots,
+                lane_params: &[],
+                cycle: false,
+            };
+            let mut ctx = head_ctx(self.kv_cache, &req, &[], Reads::Rebuild);
+            ctx.draft_ring = Some(&self.dflash2.rings);
+            ctx.draft = Some(draft);
+            // SAFETY: every view points at the step's vectors, alive for the call; the forward is
+            // encoded onto `enc`, which the target's command buffer outlives.
+            unsafe { self.play(&mut onto, &ctx, req.num_tokens as u64, enc) }?;
+        }
+        // 3. The snapshots the step saves take their sequences' windows as the step finds them.
+        if !step.saves.is_empty() {
+            scratchy_target_metal::dflash2::encode_window_copies(enc, &copies(&step.saves, false)?);
+        }
+        // 4. The commits over the step's rows: the target's captured rows, and a cycle's retained
+        // counts. After each, the snapshots whose window its rows complete take those rows.
+        let row_bytes = self.dflash2.captured_row_bytes;
+        for ((commit, slots), saved) in (step.passes.commits.iter())
+            .zip(&step.commit_slots)
+            .zip(&step.saved_after)
+        {
+            if !commit.steps.is_empty() {
+                let mut inputs: Vec<DeviceInput> = (commit.hidden_rows.iter())
+                    .map(|&(row, step_row, n)| {
+                        let (row, step_row, n) = (row as usize, step_row as usize, n as usize);
+                        DeviceInput::hidden_rows(captured.clone(), step_row, row, n, row_bytes)
+                    })
+                    .collect();
+                if commit.cycle {
+                    let retained_bytes = lanes * size_of::<u32>();
+                    let at = layout.retained as usize;
+                    inputs.push(DeviceInput::head(
+                        buffer.clone(),
+                        at,
+                        retained_bytes,
+                        Into::DraftRetained,
+                    ));
+                }
+                let req = commit.request();
+                let draft = DraftInputs {
+                    ring_slots: slots,
+                    lane_params: &[],
+                    cycle: commit.cycle,
+                };
+                let mut ctx = head_ctx(self.kv_cache, &req, &inputs, Reads::CacheWrites);
+                ctx.draft_ring = Some(&self.dflash2.rings);
+                ctx.draft = Some(draft);
+                // SAFETY: as the rebuild's.
+                unsafe { self.play(&mut onto, &ctx, req.num_tokens as u64, enc) }?;
+            }
+            let snapshots = snapshots.ok_or("a DFlash2 snapshot without snapshot windows");
+            let rows: Vec<_> = (saved.iter())
+                .flat_map(|s| {
+                    let (ring_at, snapshot_at) = (
+                        s.snapshot.ring_slot as usize * window.bytes(),
+                        s.snapshot.block * window.bytes(),
+                    );
+                    (window.runs(s.from, s.to).into_iter())
+                        .map(move |(at, len)| (ring_at + at, snapshot_at + at, len))
+                })
+                .collect();
+            if !rows.is_empty() {
+                let snapshots = snapshots?;
+                let copies: Vec<_> = (rows.iter())
+                    .map(
+                        |&(from_at, to_at, len)| scratchy_target_metal::dflash2::WindowCopy {
+                            from: rings,
+                            from_at,
+                            to: snapshots,
+                            to_at,
+                            len,
+                        },
+                    )
+                    .collect();
+                scratchy_target_metal::dflash2::encode_window_copies(enc, &copies);
+            }
+        }
+        // 5. The block draft over each lane's next block, its tokens and positions the device's.
+        if let Some(block) = block.filter(|b| b.drafts) {
+            let bytes = lanes * rows * size_of::<u32>();
+            let at = |section: u64| section as usize;
+            let inputs = [
+                DeviceInput::head(buffer.clone(), at(layout.block_ids), bytes, Into::InputIds),
+                DeviceInput::head(
+                    buffer.clone(),
+                    at(layout.block_positions),
+                    bytes,
+                    Into::Positions,
+                ),
+            ];
+            let req = block.request();
+            let draft = DraftInputs {
+                ring_slots: &step.block_slots,
+                lane_params: &step.lane_params,
+                cycle: false,
+            };
+            let mut ctx = head_ctx(self.kv_cache, &req, &inputs, Reads::Result);
+            ctx.draft_ring = Some(&self.dflash2.rings);
+            ctx.draft = Some(draft);
+            // SAFETY: as the rebuild's.
+            unsafe { self.play(&mut onto, &ctx, req.num_tokens as u64, enc) }?;
+        }
+        onto.ok_or_else(|| "a DFlash2 step that plays no drafter forward".into())
+    }
+
+    /// Encode a drafter forward of `num_tokens` rows by `ctx` onto `enc`: the step's first builds
+    /// the drafter's pool in its target's arena; the rest follow it on the same worker.
+    ///
+    /// # Safety
+    /// Same as [`scratchy_forward_compiler::ScratchyWeights::metal_forward_onto`].
+    unsafe fn play(
+        &mut self,
+        onto: &mut Option<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>>,
+        ctx: &scratchy_target_metal::ForwardCtx<'_>,
+        num_tokens: u64,
+        enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+    ) -> Result<(), String> {
+        let handle = scratchy_target_metal::ForwardCtxHandle::new(ctx);
+        match onto {
+            // SAFETY: the caller's.
+            Some(onto) => unsafe { onto.then(handle, num_tokens, enc) },
+            None => {
+                // The drafter's pool is built at its first forward, in the target's arena.
+                let hosted = hosted_by(self.target).map_err(|e| e.to_string())?;
+                self.device.host = Some(Box::new(hosted));
+                // SAFETY: the caller's.
+                *onto = Some(unsafe {
+                    self.model.metal_forward_onto(
+                        handle,
+                        scratchy_target_metal::ForwardDeviceHandle::new(&mut self.device),
+                        num_tokens,
+                        enc,
+                    )
+                }?);
+                Ok(())
+            }
+        }
+    }
+
+    /// Each lane's retained rows and accepted drafts, once the command buffer is done.
+    fn verified(&self) -> Vec<(u32, u32)> {
+        use ::objc2_metal::MTLBuffer as _;
+        let (Some(_), Ok(buffer)) = (self.step.passes.block.as_ref(), self.buffer()) else {
+            return Vec::new();
+        };
+        let layout = self.layout();
+        let lanes = self.step.verify.len();
+        // SAFETY: the buffer holds the retained and accepted counts of `lanes` lanes, written by
+        // the command buffer that is done.
+        let read = |section: u64| unsafe {
+            let at = buffer
+                .contents()
+                .as_ptr()
+                .cast::<u8>()
+                .add(section as usize);
+            std::slice::from_raw_parts(at.cast::<u32>(), lanes).to_vec()
+        };
+        (read(layout.retained).into_iter())
+            .zip(read(layout.accepted))
+            .collect()
+    }
+
+    /// The block draft's selection, a lane's proposals, candidates and candidate probabilities
+    /// (`budget drafts` proposals a lane) and the rows of its block its next verify checks, once
+    /// the command buffer it ran in is done.
+    fn selection(
+        &self,
+        onto: &dyn scratchy_forward_compiler::MetalForwardOnto,
+    ) -> Option<Selection> {
+        use ::objc2_metal::MTLBuffer as _;
+        let block = (self.step.passes.block.as_ref()).filter(|b| b.drafts)?;
+        let selection = onto.draft_selection()?;
+        let proposals = block.lanes.len() * self.dflash2.drafter.budget.drafts;
+        let candidates = proposals * scratchy_target_metal::dflash2::CANDIDATES as usize;
+        // SAFETY: the drafter's outputs hold its bucket's lanes' selection, and the command buffer
+        // that wrote them is done.
+        let read = |buffer: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+                    len: usize| unsafe {
+            std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<u32>(), len).to_vec()
+        };
+        let q_probs = read(selection.q_probs, candidates)
+            .into_iter()
+            .map(f32::from_bits);
+        let verify_rows = read(selection.verify_rows, block.lanes.len());
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let confidence = read(selection.confidence, proposals)
+                .into_iter()
+                .map(f32::from_bits);
+            tracing::debug!("DFlash2 confidence {:?}", confidence.collect::<Vec<f32>>());
+        }
+        Some(Selection {
+            drafts: read(selection.tokens, proposals),
+            candidates: read(selection.candidates, candidates),
+            q_probs: q_probs.collect(),
+            verify_rows,
+        })
+    }
+}
+
+/// A block draft's selection read back ([`BlockPassesEncoder::selection`]).
+#[cfg(feature = "metal")]
+#[derive(Default)]
+struct Selection {
+    drafts: Vec<u32>,
+    candidates: Vec<u32>,
+    q_probs: Vec<f32>,
+    verify_rows: Vec<u32>,
+}
+
+/// `values`' bytes.
+#[cfg(feature = "metal")]
+fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
+    // SAFETY: `T: Copy` plain data, read as the bytes it occupies.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+/// The passes a step runs after its target, as encoded in its command buffer.
+#[cfg(feature = "metal")]
+enum HeadEncoder<'a> {
+    Mtp(Box<HeadPassesEncoder<'a>>),
+    Block(BlockPassesEncoder<'a>),
+}
+
+/// What a step's passes after its target leave for the host: an MTP head's drafts, or a block
+/// drafter's selection and each lane's retained rows and accepted drafts.
+#[cfg(feature = "metal")]
+#[derive(Default)]
+struct HeadOutcome {
+    drafts: Vec<u32>,
+    candidates: Vec<u32>,
+    q_probs: Vec<f32>,
+    verify_rows: Vec<u32>,
+    verified: Vec<(u32, u32)>,
+}
+
+#[cfg(feature = "metal")]
+impl<'a> HeadEncoder<'a> {
+    fn encode(
+        &mut self,
+        enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        tokens: &scratchy_target_metal::mtl4_dispatch::Buffer,
+        outputs: scratchy_forward_compiler::FollowupOutputs<'_>,
+    ) -> Result<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>, String> {
+        match self {
+            Self::Mtp(h) => h.encode(enc, tokens, &retained(outputs.hidden)),
+            Self::Block(b) => b.encode(enc, tokens, outputs),
+        }
+    }
+
+    /// What the passes left, once the command buffer they ran in is done: an MTP head's drafts
+    /// from its chain buffer, a block drafter's from `onto`'s outputs and its cycle buffer.
+    fn outcome(
+        &self,
+        onto: Option<&dyn scratchy_forward_compiler::MetalForwardOnto>,
+    ) -> HeadOutcome {
+        match self {
+            Self::Mtp(h) => HeadOutcome {
+                drafts: h.drafts(),
+                ..HeadOutcome::default()
+            },
+            Self::Block(b) => {
+                let selection = onto.and_then(|onto| b.selection(onto));
+                let Selection {
+                    drafts,
+                    candidates,
+                    q_probs,
+                    verify_rows,
+                } = selection.unwrap_or_default();
+                HeadOutcome {
+                    drafts,
+                    candidates,
+                    q_probs,
+                    verify_rows,
+                    verified: b.verified(),
+                }
+            }
+        }
+    }
+}
+
 /// An MTP head forward's context over `req` on its KV cache, its `device_inputs` landing over the
 /// host's.
 /// A step's block ids by KV group: the full group's at its (page-unified) block size, and each
@@ -5064,6 +5857,8 @@ fn head_ctx<'c>(
         gdn_state: None,
         gdn_state_indices: None,
         gdn_is_fresh: None,
+        draft_ring: None,
+        draft: None,
         sampled_rows: req.sampled_rows.map(|r| view(r, &[r.len()])),
         device_inputs,
         deferred: None,
@@ -6267,8 +7062,15 @@ impl Worker for MetalWorker {
             // they do.
             let (conv_slot, ssm_slot) =
                 dims.slot_bytes(scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE);
+            // A DFlash2 drafter's snapshots keep its context window: one more store, past the GDN
+            // state's, a window a slot. Nothing reads a snapshot's before a save writes it.
+            let window_bytes = match self.gdn_snapshot_cap {
+                0 => 0,
+                _ => self.snapshot_window_bytes(),
+            };
             let layout: Vec<(usize, bool)> = (0..gdn_cfg.num_linear_layers())
                 .flat_map(|_| [(conv_slot, false), (ssm_slot, false)])
+                .chain((window_bytes > 0).then_some((window_bytes, false)))
                 .collect();
             let mapper = self.kv_mapper.clone().ok_or_else(|| {
                 ExecutorError::WorkerInit("GDN state pool before the KvMapper".into())
@@ -6320,6 +7122,13 @@ impl Worker for MetalWorker {
                 self.gdn_snapshot_cap,
                 t_gdn.elapsed(),
             );
+            if let Some(d) = self.dflash2.as_mut().filter(|_| window_bytes > 0) {
+                d.snapshot_windows = Some(SnapshotWindows {
+                    buffer: stores.buffer(2 * gdn_cfg.num_linear_layers()),
+                    from: snapshots_from,
+                    saved: vec![false; self.gdn_snapshot_cap],
+                });
+            }
             self.gdn_state = Some(gdn_pool);
             self.gdn_state_stores = Some(stores);
             self.gdn_snapshots_from = snapshots_from;
@@ -6542,7 +7351,7 @@ impl Worker for MetalWorker {
         // A uniform TurboQuant pool still reserves one fp16 chunk per layer
         // (`initialize_cache`, `initialize_draft_cache_metal`), whatever its block count. A head
         // reading its target's KV builds no pool.
-        let draft_pool = (self.draft_model.as_deref()).filter(|_| !self.head_reads_target_kv());
+        let draft_pool = (self.draft_model.as_deref()).filter(|_| self.draft_keeps_kv());
         let tq_seed = [self.model.as_deref(), draft_pool]
             .into_iter()
             .flatten()
@@ -6568,7 +7377,7 @@ impl Worker for MetalWorker {
         let reach = match self.model.as_deref() {
             Some(target) if target.per_layer_kv_token_elems().is_none() => {
                 let draft = self.draft_model.as_deref();
-                let draft_pb = (draft.filter(|_| !self.head_reads_target_kv()))
+                let draft_pb = (draft.filter(|_| self.draft_keeps_kv()))
                     .map_or(0, |d| draft_block_bytes(d, bs, self.draft_scratch()));
                 let pair = target_block_bytes(target, bs) + draft_pb;
                 kv_left(self.metal_peak_activation_estimate(None, None, Some(budget(total)), 1)?)
@@ -6617,9 +7426,9 @@ impl Worker for MetalWorker {
             let target = self.model.as_ref().expect("model loaded before draft");
             let bs = self.config.block_size;
             let t_pb = target_block_bytes(target.as_ref(), bs);
-            let d_pb = match self.head_reads_target_kv() {
-                true => 0,
-                false => draft_block_bytes(draft.as_ref(), bs, self.draft_scratch()),
+            let d_pb = match self.draft_keeps_kv() {
+                false => 0,
+                true => draft_block_bytes(draft.as_ref(), bs, self.draft_scratch()),
             };
             let denom = t_pb.saturating_add(d_pb).max(1);
             // available * t_pb / (t_pb + d_pb), in u128 to dodge overflow.
@@ -6782,6 +7591,11 @@ impl Worker for MetalWorker {
             if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
                 alloc.release(gdn_slot_key(req_id));
             }
+            // Its DFlash2 ring slot, which the next request to take it overwrites from its first
+            // position on.
+            if let Some(d) = self.dflash2.as_mut() {
+                d.release(req_id);
+            }
         }
         // A preempted request resumes by recomputing from the scheduler's cursor, so its recurrent
         // state must restart from zero like a new request's.
@@ -6792,6 +7606,17 @@ impl Worker for MetalWorker {
             for req_id in preempted {
                 alloc.release(gdn_slot_key(req_id));
                 self.kv_cached_through.remove(req_id);
+            }
+        }
+        // So does its drafter's: it gives back its ring slot and its cycle in flight (the scheduler
+        // dropped its drafts). Its re-admission plans its replay, whose commits, from the snapshot
+        // it resumes at, rebuild the rings it had. Held instead, a ring slot a preempted request
+        // waits on is one a full batch's next request finds taken.
+        if let (Some(d), Some(preempted)) =
+            (self.dflash2.as_mut(), &scheduler_output.preempted_req_ids)
+        {
+            for req_id in preempted {
+                d.release(req_id);
             }
         }
         self.input_batch.update_states(scheduler_output);
@@ -7236,14 +8061,15 @@ impl Worker for MetalWorker {
         // ── Constrained / guided decoding: gather this step's grammar
         // allow-masks ───────────────────────────────────────────────────
         // For every request with an active grammar FSM that will sample a
-        // real token this step, build a dense vocab bitset of its allowed
-        // tokens and record the logits row to mask (`sampled_rows.last_of(i)`).
-        // The mask is dispatched before argmax in `forward_argmax_blocking`
-        // (it `.take()`s `grammar_pending`), and the FSM is advanced with the
-        // sampled token after readback. Skipped (no overhead) when no request
-        // is constrained. Speculative-verify rows are excluded: grammar needs
-        // a host `advance()` between every token, which the K-row verify can't
-        // provide, so a grammar request must not also carry spec drafts.
+        // real token this step, build a dense vocab bitset of each sampled
+        // row's allowed tokens and record the logits row to mask. A verify's
+        // rows take the allow-sets along its drafts (`verify_masks`, Splash's
+        // per-row constraint masks), any other request's one row its current
+        // set. The mask is dispatched before argmax and every sampler, the
+        // block drafter's target policy and acceptance among them (it
+        // `.take()`s `grammar_pending`), and the FSM is advanced with the
+        // committed tokens after readback. Skipped (no overhead) when no
+        // request is constrained.
         #[cfg(feature = "guided-decoding")]
         {
             self.grammar_pending = None;
@@ -7257,23 +8083,23 @@ impl Worker for MetalWorker {
                         if !prepared.req_inputs[i].emits_token {
                             continue;
                         }
-                        // Speculative verify batch → unsupported with grammar.
-                        if !prepared.req_inputs[i].spec_token_ids.is_empty() {
-                            continue;
-                        }
                         let Some(guide) = self.grammar_states.get_mut(req_id) else {
                             continue;
                         };
-                        // `None` => grammar terminated; leave the row unmasked.
-                        let Some(allowed) = guide.allowed_tokens() else {
-                            continue;
-                        };
-                        rows.push(sampled_rows.last_of(i) as u32);
-                        scratchy_target_metal::grammar_mask::push_allow_bitset_row(
-                            &mut allow_bits,
-                            &allowed,
-                            vocab,
-                        );
+                        let masks = guide.verify_masks(&prepared.req_inputs[i].spec_token_ids);
+                        for (row, allowed) in sampled_rows.of_seq(i).zip(masks) {
+                            // `None` => no mask applies (terminated, or thinking); leave the row
+                            // unmasked.
+                            let Some(allowed) = allowed else {
+                                continue;
+                            };
+                            rows.push(row as u32);
+                            scratchy_target_metal::grammar_mask::push_allow_bitset_row(
+                                &mut allow_bits,
+                                &allowed,
+                                vocab,
+                            );
+                        }
                     }
                     if !rows.is_empty() {
                         self.grammar_pending = Some(GrammarMaskHost { rows, allow_bits });
@@ -7390,9 +8216,12 @@ impl Worker for MetalWorker {
         let block_ids_u32: Vec<Vec<u32>> = (attn.block_ids.iter())
             .map(|v| v.iter().map(|&b| b as u32).collect())
             .collect();
-        let prompt_lens: Vec<u32> = (req_ids_in_order.iter())
-            .map(|r| self.input_batch.history(r).0.len() as u32)
-            .collect();
+        let (prompt_lens, history_lens): (Vec<u32>, Vec<u32>) = (req_ids_in_order.iter())
+            .map(|r| {
+                let (prompt, generated) = self.input_batch.history(r);
+                (prompt.len() as u32, (prompt.len() + generated.len()) as u32)
+            })
+            .unzip();
         let step_rows = ::scratchy_serving_engine::spec_decode::StepRows {
             req_ids: &req_ids_in_order,
             input_ids: &input_ids_u32,
@@ -7405,6 +8234,7 @@ impl Worker for MetalWorker {
             block_ids: &block_ids_u32,
             block_size,
             prompt_lens: &prompt_lens,
+            history_lens: &history_lens,
             sampled: &sampled_rows,
         };
         let head_passes = match self.mtp_drafter {
@@ -7428,6 +8258,233 @@ impl Worker for MetalWorker {
             }
             _ => None,
         };
+        // A block drafter's passes over the step, with each request's ring slot, each lane's verify
+        // of the block it drafted last — its policy and that block's selection — and its next
+        // block's policy.
+        // A request's admission plans the rows its prefill captures into the drafter's rings (Splash
+        // `setDraftContextPlan`), whether or not this step drafts.
+        if let Some(d) = self.dflash2.as_mut() {
+            for op in &scheduler_output.recurrent_state.admissions {
+                (d.contexts).insert(op.req_id.clone(), (op.resume, op.save_points.clone()));
+            }
+        }
+        let block_step = match self.dflash2.as_mut() {
+            Some(d) if !scheduler_output.draft_req_ids.is_empty() => {
+                use ::scratchy_serving_engine::spec_decode::block::SequenceContext;
+                let ops = &scheduler_output.recurrent_state;
+                let windows = d.snapshot_windows.as_ref();
+                // A snapshot this step restores gives back its window only if its save took one;
+                // one this step saves takes its sequence's window only at a position the
+                // sequence's plan captures a window for.
+                let restored = |r: &str| {
+                    (ops.restores.iter())
+                        .any(|op| op.req_id == r && windows.is_some_and(|w| w.saved[op.slot]))
+                };
+                let saves: Vec<Vec<u32>> = (req_ids_in_order.iter())
+                    .map(|r| {
+                        let planned = d.contexts.get(r).map_or(&[][..], |(_, p)| &p[..]);
+                        (ops.saves.iter())
+                            .filter(|op| op.req_id == *r && windows.is_some())
+                            .map(|op| op.position)
+                            .filter(|p| planned.contains(p))
+                            .collect()
+                    })
+                    .collect();
+                let contexts: Vec<SequenceContext<'_>> = (req_ids_in_order.iter())
+                    .zip(&saves)
+                    .map(|(r, saves)| {
+                        let (resume, save_points) = d
+                            .contexts
+                            .get(r)
+                            .map_or((0, &[][..]), |(at, p)| (*at, &p[..]));
+                        SequenceContext {
+                            resume,
+                            save_points,
+                            restored: restored(r),
+                            saves,
+                        }
+                    })
+                    .collect();
+                let passes = (d.drafter)
+                    .passes(&step_rows, &scheduler_output.draft_req_ids, &contexts)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("DFlash2: {e}")))?;
+                match passes {
+                    Some(passes) => {
+                        let mut slots_of = |steps: &[usize]| {
+                            (steps.iter())
+                                .map(|&i| d.slots.of(&req_ids_in_order[i]))
+                                .collect::<Result<Vec<u32>, String>>()
+                                .map_err(ExecutorError::WorkerExecution)
+                        };
+                        let rebuild_steps = (passes.rebuild.as_ref()).map_or(&[][..], |r| &r.steps);
+                        let restoring = slots_of(rebuild_steps)?;
+                        // The drafter's device takes its target's prefill cap.
+                        let widest =
+                            (self.metal_prefill_bucket_max_m).map_or(usize::MAX, |m| m as usize);
+                        let rebuilds = (passes.rebuild.iter())
+                            .flat_map(|r| r.chunks(widest))
+                            .map(|chunk| Ok((slots_of(&chunk.steps)?, chunk)))
+                            .map(|r: ExecutorResult<_>| r.map(|(slots, chunk)| (chunk, slots)))
+                            .collect::<ExecutorResult<Vec<_>>>()?;
+                        let commit_slots = (passes.commits.iter())
+                            .map(|c| slots_of(&c.steps))
+                            .collect::<ExecutorResult<Vec<Vec<u32>>>>()?;
+                        let lanes = (passes.block.as_ref()).map_or(&[][..], |b| &b.lanes[..]);
+                        let block_slots = (lanes.iter())
+                            .map(|l| d.slots.of(&req_ids_in_order[l.step]))
+                            .collect::<Result<Vec<u32>, String>>()
+                            .map_err(ExecutorError::WorkerExecution)?;
+                        // The snapshots' windows: a restore's given back before its rebuild, a
+                        // save's taken whole before the first commit, then its sequence's rows up
+                        // to it after the commit that ends there (Splash `copyWindow` before the
+                        // command, its window captures in it: Runtime.cpp:1570-1606, 2701-2709).
+                        let snapshot = |req: &str, at: Option<u32>, ring_slot: u32| {
+                            let from = windows.map_or(0, |w| w.from);
+                            let restore = ops.restores.iter().find(|op| op.req_id == req);
+                            let save = (ops.saves.iter())
+                                .find(|op| op.req_id == req && Some(op.position) == at);
+                            match at {
+                                None => restore,
+                                Some(_) => save,
+                            }
+                            .map(|op| WindowSnapshot {
+                                ring_slot,
+                                block: from + op.slot,
+                            })
+                            .ok_or_else(|| {
+                                ExecutorError::WorkerExecution(format!(
+                                    "DFlash2: {req} has no snapshot op at {at:?}"
+                                ))
+                            })
+                        };
+                        let restores = (rebuild_steps.iter().zip(&restoring))
+                            .map(|(&i, &slot)| snapshot(&req_ids_in_order[i], None, slot))
+                            .collect::<ExecutorResult<Vec<_>>>()?;
+                        let window = d.drafter.window as u32;
+                        let mut taken = Vec::new();
+                        let mut saved_after = Vec::new();
+                        for commit in &passes.commits {
+                            let mut after = Vec::new();
+                            for &(i, at) in &commit.saves {
+                                let req = &req_ids_in_order[i];
+                                let ring_slot =
+                                    (d.slots.of(req)).map_err(ExecutorError::WorkerExecution)?;
+                                let snapshot = snapshot(req, Some(at), ring_slot)?;
+                                let first = step_rows.positions[step_rows.cu_seqlens_q[i] as usize];
+                                taken.push(snapshot);
+                                after.push(WindowSave {
+                                    snapshot,
+                                    from: first.max(at.saturating_sub(window)),
+                                    to: at,
+                                });
+                            }
+                            saved_after.push(after);
+                        }
+                        let rows = d.drafter.budget.drafts as u32 + 1;
+                        let candidates_a_lane = d.drafter.budget.drafts
+                            * scratchy_target_metal::dflash2::CANDIDATES as usize;
+                        let mut step = BlockStep {
+                            passes: ::scratchy_serving_engine::spec_decode::BlockPasses {
+                                rebuild: None,
+                                commits: passes.commits,
+                                block: None,
+                            },
+                            rebuilds,
+                            restores,
+                            saves: taken,
+                            commit_slots,
+                            saved_after,
+                            block_slots,
+                            verify: Vec::new(),
+                            candidates: Vec::new(),
+                            q_probs: Vec::new(),
+                            lane_params: Vec::new(),
+                        };
+                        for lane in lanes {
+                            let req_id = &req_ids_in_order[lane.step];
+                            let params = self.sampling_params_map.get(req_id);
+                            let generated = self.input_batch.history(req_id).1.len() as u32;
+                            let remaining = (params.and_then(|p| p.max_tokens))
+                                .map_or(u32::MAX, |m| m.saturating_sub(generated))
+                                .max(1);
+                            let stops = params.map_or(&[][..], |p| &p.stop_token_ids[..]);
+                            let stop = [0, 1].map(|s| stops.get(s).copied().unwrap_or(u32::MAX));
+                            let temperature = params.map_or(0.0, |p| p.temperature as f32);
+                            let sampling = u32::from(temperature > 0.0);
+                            // A lane verifying no draft keeps its sampler's token, the anchor of
+                            // its next block.
+                            let verify_sampling = u32::from(sampling != 0 && lane.drafts > 0);
+                            tracing::debug!(
+                                "DFlash2 {req_id}: verifies {} drafts, temperature {temperature}, \
+                                 top-k {:?}, top-p {:?}",
+                                lane.drafts,
+                                params.map(|p| p.top_k),
+                                params.map(|p| p.top_p),
+                            );
+                            // The cycle this step verifies: drafted by the step before.
+                            let cycle = match (lane.drafts, d.cycles.remove(req_id)) {
+                                (0, _) => None,
+                                (_, Some(cycle)) => Some(cycle),
+                                (_, None) => {
+                                    return Err(ExecutorError::WorkerExecution(format!(
+                                        "DFlash2: {req_id} verifies a block no step drafted"
+                                    )));
+                                }
+                            };
+                            let Cycle {
+                                candidates,
+                                q_probs,
+                            } = cycle.unwrap_or(Cycle {
+                                candidates: vec![u32::MAX; candidates_a_lane],
+                                q_probs: vec![0.0; candidates_a_lane],
+                            });
+                            step.candidates.extend(candidates);
+                            step.q_probs.extend(q_probs);
+                            let seed = Dflash2::seed(req_id, params);
+                            step.verify
+                                .push(scratchy_target_metal::dflash2::VerifyLane {
+                                    sampled: lane.sampled,
+                                    drafts: lane.drafts,
+                                    position: lane.position,
+                                    remaining,
+                                    stop,
+                                    sampling: verify_sampling,
+                                    top_k: params.map_or(0, |p| p.top_k.max(0) as u32),
+                                    temperature,
+                                    top_p: params.map_or(1.0, |p| p.top_p as f32),
+                                    min_p: params.map_or(0.0, |p| p.min_p as f32),
+                                    exclude_stop: u32::from(params.is_some_and(|p| p.ignore_eos)),
+                                    seed,
+                                });
+                            step.lane_params.push(
+                                scratchy_target_metal::dflash2::DraftLaneParams {
+                                    temperature,
+                                    sampling,
+                                    maximum: rows,
+                                    remaining,
+                                    seed,
+                                    position: lane.position,
+                                    cost: d.cost,
+                                },
+                            );
+                        }
+                        step.passes.block = passes.block;
+                        Some(step)
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        // Every snapshot this step saves keeps its window only if the step takes it: a slot saved
+        // again without one no longer gives back the window an earlier save took.
+        if let Some(w) = (self.dflash2.as_mut()).and_then(|d| d.snapshot_windows.as_mut()) {
+            let taken = (block_step.as_ref()).map_or(&[][..], |b| &b.saves[..]);
+            for op in &scheduler_output.recurrent_state.saves {
+                let block = w.from + op.slot;
+                w.saved[op.slot] = taken.iter().any(|t| t.block == block);
+            }
+        }
         // The head's chain lays out here, where a step behind a speculative one in flight picks
         // into it, with the rest of what depends on that step's outcome.
         self.pending_chain = match &head_passes {
@@ -7455,6 +8512,7 @@ impl Worker for MetalWorker {
             deferral.select = select;
         }
         let mut picked_drafts: Vec<u32> = Vec::new();
+        let mut head_outcome = HeadOutcome::default();
         let phase8_parallel_lockstep = self.draft_model.is_some()
             && !draft_is_head
             && self.draft_kv_cache.is_some()
@@ -7473,11 +8531,26 @@ impl Worker for MetalWorker {
         // command buffer + host wait. Greedy-only / spec / still-prefilling steps
         // prepare nothing → the argmax fast path stands unchanged.
         self.pending_sampler = None;
+        // A block drafter's sampled verify lanes draw their rows by Splash's target policy
+        // (`dflash2_target_sampling`, after this sampler in the step's command buffer, as Splash's
+        // cycle samples them once): this sampler's draws there would be overwritten.
+        let target_sampled: std::collections::HashSet<usize> = (block_step.as_ref())
+            .and_then(|s| {
+                let lanes = s.passes.block.as_ref()?.lanes.iter().zip(&s.verify);
+                Some(
+                    lanes
+                        .filter(|(_, v)| v.sampling != 0)
+                        .map(|(l, _)| l.step)
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
         let mut fused_sample_jobs: Vec<(usize, u32)> = Vec::new();
         for (i, req_id) in req_ids_in_order.iter().enumerate() {
             let req_slice = &prepared.req_inputs[i];
-            if !req_slice.emits_token {
-                continue; // still-prefilling chunk emits no token
+            // A still-prefilling chunk emits no token.
+            if !req_slice.emits_token || target_sampled.contains(&i) {
+                continue;
             }
             let greedy = self
                 .sampling_params_map
@@ -7753,6 +8826,8 @@ impl Worker for MetalWorker {
                             gdn_state: None,
                             gdn_state_indices: None,
                             gdn_is_fresh: None,
+                            draft_ring: None,
+                            draft: None,
                             sampled_rows: None,
                             device_inputs: &[],
                             deferred: None,
@@ -7941,18 +9016,18 @@ impl Worker for MetalWorker {
                 spec9_drafts_final = spec9_drafts_out;
                 v
             } else {
-                let out = self
-                    .forward_argmax_then(
-                        ModelHandle::TARGET,
-                        KvPoolHandle::TARGET,
-                        &req,
-                        &[],
-                        head_passes.as_ref(),
-                    )
+                let then = match (&head_passes, &block_step) {
+                    (Some(passes), _) => Some(Then::Mtp(passes)),
+                    (None, Some(step)) => Some(Then::Block(step)),
+                    (None, None) => None,
+                };
+                let mut out = self
+                    .forward_argmax_then(ModelHandle::TARGET, KvPoolHandle::TARGET, &req, &[], then)
                     .map_err(|e| {
                         ExecutorError::WorkerExecution(format!("spec verify forward: {e}"))
                     })?;
-                picked_drafts = out.drafts;
+                picked_drafts = std::mem::take(&mut out.head.drafts);
+                head_outcome = out.head;
                 out.tokens
             }
         };
@@ -8092,6 +9167,17 @@ impl Worker for MetalWorker {
         // over the K+1 contiguous argmax rows.
         let mut sampled_token_ids: Vec<Vec<u32>> = Vec::with_capacity(num_reqs);
         let mut was_spec_decode: Vec<bool> = Vec::with_capacity(num_reqs);
+        // A block drafter's lanes are accepted on the device (Splash's `decode_accept_dflash`): each
+        // verifying request's retained rows and accepted drafts, its tokens the device's.
+        let device_verified: std::collections::HashMap<usize, (u32, u32)> =
+            (block_step.as_ref().and_then(|s| s.passes.block.as_ref()))
+                .map(|b| {
+                    (b.lanes.iter().zip(&head_outcome.verified))
+                        .filter(|(lane, _)| lane.drafts > 0)
+                        .map(|(lane, &verified)| (lane.step, verified))
+                        .collect()
+                })
+                .unwrap_or_default();
         let mut req_id_to_index: std::collections::HashMap<String, usize> =
             std::collections::HashMap::with_capacity(num_reqs);
         // Non-greedy rows were computed + prepared (`fused_sample_jobs` /
@@ -8133,18 +9219,32 @@ impl Worker for MetalWorker {
                 let rows = sampled_rows.of_seq(i);
                 debug_assert!(rows.end <= total_n as usize);
                 let target_ids = &argmax_slice[rows];
-                let rejection = ::scratchy_serving_engine::spec_decode::greedy_rejection_sample(
-                    target_ids,
-                    &req_slice.spec_token_ids,
-                );
+                let (accepted_tokens, num_accepted_drafts) = match device_verified.get(&i) {
+                    Some(&(retained, accepted)) => {
+                        tracing::debug!(
+                            "DFlash2 {req_id}: accepted {accepted} of {} drafts, retained {retained}",
+                            req_slice.spec_token_ids.len()
+                        );
+                        let retained = (retained as usize).clamp(1, target_ids.len());
+                        (target_ids[..retained].to_vec(), retained - 1)
+                    }
+                    None => {
+                        let rejection =
+                            ::scratchy_serving_engine::spec_decode::greedy_rejection_sample(
+                                target_ids,
+                                &req_slice.spec_token_ids,
+                            );
+                        (rejection.accepted_tokens, rejection.num_accepted_drafts)
+                    }
+                };
                 if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
                     alloc.verified(
                         gdn_slot_key(req_id),
-                        rejection.num_accepted_drafts,
+                        num_accepted_drafts,
                         req_slice.spec_token_ids.len(),
                     );
                 }
-                sampled_token_ids.push(rejection.accepted_tokens);
+                sampled_token_ids.push(accepted_tokens);
                 was_spec_decode.push(true);
             }
         }
@@ -8154,20 +9254,19 @@ impl Worker for MetalWorker {
         self.sampler_logits = None;
 
         // ── 6.65. Constrained / guided decoding: advance grammar FSMs ──
-        // Feed each grammar request its just-sampled (masked) token so the
-        // next step's allow-set reflects it. Only the masked path (non-spec,
-        // single emitted token) is advanced; speculative-verify rows are not
-        // grammar-masked and are left untouched. `advance` returning false
-        // means the sampled token wasn't in the grammar's allow-set — a
-        // mask/FSM desync that should never happen, surfaced as a warning.
+        // Feed each grammar request the tokens it just committed, in order —
+        // a verify's accepted drafts and its correction, any other request's
+        // one token, each from a masked row — so the next step's allow-sets
+        // reflect them. `advance` returning false means a token wasn't in the
+        // grammar's allow-set — a mask/FSM desync that should never happen,
+        // surfaced as a warning.
         #[cfg(feature = "guided-decoding")]
         if !self.grammar_states.is_empty() {
             for (i, req_id) in req_ids_in_order.iter().enumerate() {
-                if was_spec_decode[i] || sampled_token_ids[i].len() != 1 {
+                let Some(guide) = self.grammar_states.get_mut(req_id) else {
                     continue;
-                }
-                if let Some(guide) = self.grammar_states.get_mut(req_id) {
-                    let tok = sampled_token_ids[i][0];
+                };
+                for &tok in &sampled_token_ids[i] {
                     if !guide.advance(tok) {
                         tracing::warn!(
                             "guided-decoding: req {req_id} sampled token {tok} rejected by \
@@ -8213,7 +9312,30 @@ impl Worker for MetalWorker {
                 });
                 Some(drafts.unwrap_or_default())
             }
-            _ => None,
+            // A block drafter's, its block's proposals for each lane that got a token; each
+            // lane's cycle waits for the step that verifies its block.
+            _ => match (self.dflash2.as_mut(), block_step.as_ref()) {
+                (Some(d), Some(step)) => {
+                    let block = (step.passes.block.as_ref()).filter(|b| b.drafts);
+                    let drafts = block.map(|b| {
+                        let candidates = d.drafter.budget.drafts
+                            * scratchy_target_metal::dflash2::CANDIDATES as usize;
+                        for (lane, l) in b.lanes.iter().enumerate() {
+                            let span = |n: usize| lane * n..(lane + 1) * n;
+                            let cycle = Cycle {
+                                candidates: head_outcome.candidates[span(candidates)].to_vec(),
+                                q_probs: head_outcome.q_probs[span(candidates)].to_vec(),
+                            };
+                            d.cycles.insert(req_ids_in_order[l.step].clone(), cycle);
+                        }
+                        let rows = &head_outcome.verify_rows;
+                        d.drafter
+                            .drafts(b, &picked_drafts, rows, &step_rows, &sampled_token_ids)
+                    });
+                    Some(drafts.unwrap_or_default())
+                }
+                _ => None,
+            },
         };
 
         // ── 9. Draft seed bundle ──────────────────────────────

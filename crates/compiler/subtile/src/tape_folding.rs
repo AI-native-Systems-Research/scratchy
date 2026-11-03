@@ -237,6 +237,12 @@ pub struct RoutedBands {
     pub sorted_per_expert: std::ops::Range<f32>,
     /// The pairs per expert from which a bake tiles a groupable bundle's pairs instead.
     pub grouped_per_expert: f32,
+    /// The rows of the widest verify-sized bucket: from a lane's verify (`lane_rows`) through
+    /// them, a bake sorts a groupable bundle's pairs at any density, as a decode plan of lanes ×
+    /// a lane's rows groups every route by expert.
+    pub decode_rows: u32,
+    /// A verify lane's rows, the narrowest bucket a decode plan groups at.
+    pub lane_rows: u32,
 }
 
 impl RoutedBands {
@@ -254,7 +260,8 @@ impl RoutedBands {
         let per_expert = pairs as f32 / experts.get() as f32;
         self.grouped_bundles.contains(&bundle)
             && pairs >= self.grouped_pairs
-            && (self.sorted_per_expert.contains(&per_expert)
+            && ((rows >= self.lane_rows && rows <= self.decode_rows)
+                || self.sorted_per_expert.contains(&per_expert)
                 || per_expert >= self.grouped_per_expert)
     }
 }
@@ -1131,7 +1138,10 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
             Some(w) => self.is_matvec(i, w),
             None => self.ops.kind(i) == anchor,
         };
-        if !self.model.matvec_ends || !anchors || self.absorbed[i].is_some() {
+        // The matvec band bounds a matvec's ends; an anchor that is no matvec (an expert combine,
+        // whose command stores each row itself) takes them at every bucket the pass folds.
+        let bounded = weights.is_some() && !self.model.matvec_ends;
+        if bounded || !anchors || self.absorbed[i].is_some() {
             return Ok(());
         }
         let free = |f: &Self, j: usize| {
@@ -1503,7 +1513,20 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
             })
             .min_by_key(|&j| ops.canonical_rank(j));
         let free = self.absorbed[a].is_none() && self.epilogue[a].is_none();
-        if winner == Some(i) && free && self.fusions[a].is_empty() && self.fusions[i].is_empty() {
+        // The fused command adds where the norm runs: a reader of the sum that runs before the
+        // norm (a DFlash2 target's capture of a layer's output) would read it unwritten.
+        let rank = ops.canonical_rank(i);
+        let read_before = (0..ops.slot.len()).any(|j| {
+            j != i
+                && ops.canonical_rank(j) < rank
+                && (ops.args[j].iter()).any(|arg| matches!(arg, Arg::Op(q) if *q == a))
+        });
+        if winner == Some(i)
+            && free
+            && !read_before
+            && self.fusions[a].is_empty()
+            && self.fusions[i].is_empty()
+        {
             self.absorbed[a] = Some(i);
             let add = ops.slot[a];
             self.record(i, kernel, FusedShape::ResidualNorm { add });
@@ -1887,6 +1910,8 @@ mod tests {
                         grouped_bundles: &[crate::subtile_ir::ExpertBundle::SwitchGlu],
                         sorted_per_expert: 0.5..1.0,
                         grouped_per_expert: 4.0,
+                        decode_rows: 0,
+                        lane_rows: 0,
                     },
                     kernel: Kern::Routed,
                 },

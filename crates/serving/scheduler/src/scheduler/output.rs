@@ -279,9 +279,26 @@ pub struct CachedKvOp {
     pub through: u32,
 }
 
+/// A request with recurrent state, (re)admitted this step: where its prefill resumes and every
+/// position whose state it snapshots on the way, ascending ([`RecurrentPrefixPlan`]). A drafter
+/// whose context a snapshot keeps plans the rows it captures by them (Splash `setDraftContextPlan`,
+/// runtime/engine/Engine.cpp:1129).
+///
+/// [`RecurrentPrefixPlan`]: crate::scheduler::core::RecurrentPrefixPlan
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecurrentAdmissionOp {
+    pub req_id: String,
+    /// The position its prefill resumes at: 0, or the snapshot it restores.
+    pub resume: u32,
+    /// The positions its prefill snapshots, ascending.
+    pub save_points: Vec<u32>,
+}
+
 /// The recurrent-state work of one step (see [`StateSnapshotOp`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecurrentStateOps {
+    /// The requests (re)admitted this step, with the prefill each will run.
+    pub admissions: Vec<RecurrentAdmissionOp>,
     /// The request was just (re)admitted at a prefix-cache hit and this is its first step: its
     /// scan starts from the snapshot, not from its own slot.
     pub restores: Vec<StateSnapshotOp>,

@@ -282,8 +282,8 @@ mod dispatcher;
 
 #[cfg(feature = "metal")]
 pub use dispatcher::{
-    ChainStepHandle, GpuExecutionFailed, MetalChainBody, MetalForwardFollowup, MetalForwardOnto,
-    SampledRowCount,
+    ChainStepHandle, DraftSelection, FollowupOutputs, GpuExecutionFailed, MetalChainBody,
+    MetalForwardFollowup, MetalForwardOnto, SampledRowCount,
 };
 // Backend-neutral contracts — the `ScratchyWeights` trait (its device-runtime
 // forward methods take the neutral `ForwardCtxHandle` / `ForwardDeviceHandle`)
@@ -327,7 +327,10 @@ pub mod arch_registry;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "spyre"))]
 pub use arch_registry::{ArchLoad, ArchTryLoadFn, ScratchyArchRegistration, try_load};
 pub mod heads;
-pub use heads::{HeadRegistration, PublishedDrafter, TargetShape, draft_head, head_of};
+pub use heads::{
+    DFLASH2_BLOCK_LANES, HeadDrafting, HeadRegistration, PublishedDrafter, TargetShape, draft_head,
+    head_of, heads_of,
+};
 // Read-only KTIR bundle resolver — spyre fetches its forward bundle without
 // consuming `GpuWeights` (so the worker keeps the live tensors for the runner).
 #[cfg(feature = "spyre")]

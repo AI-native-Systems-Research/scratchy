@@ -1164,8 +1164,14 @@ template <
     short tgp_size,
     short group_size,
     short bits,
-    bool offset8 = false>
+    bool offset8 = false,
+    bool planes = false>
 struct QuantizedBlockLoader {
+  // Planes (scratchy, `affine_codes.h`): 4-bit codes regrouped a 64-input chunk at a time, chunk
+  // `c`'s 32 bytes of every one of `planes_n` rows, row after row; the loader keeps its row and
+  // next input and addresses each block's codes in their chunk's plane.
+  static_assert(!planes || (reduction_dim == 1 && bits == 4 && 64 % BCOLS == 0),
+                "planes: a K-major 4-bit block within one 64-input chunk");
   static_assert(
       BCOLS <= group_size,
       "The group size should be larger than the columns");
@@ -1196,6 +1202,10 @@ struct QuantizedBlockLoader {
   const device uint8_t* src;
   const device Tsc* scales;
   const device Tsc* biases;
+  const device uint8_t* planes_base;
+  int planes_n;
+  int planes_row;
+  int planes_k;
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
@@ -1204,7 +1214,11 @@ struct QuantizedBlockLoader {
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id,
-      ushort simd_lane_id) thread
+      ushort simd_lane_id,
+      const device uint8_t* planes_base_ = nullptr,
+      int planes_n_ = 0,
+      int planes_row0_ = 0,
+      int planes_k0_ = 0) thread
       : src_ld(src_ld_),
         tile_stride(
             reduction_dim ? BCOLS_PACKED * bytes_per_pack
@@ -1218,7 +1232,15 @@ struct QuantizedBlockLoader {
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
         scales(scales_ + bi * src_ld / group_size),
-        biases(biases_ + bi * src_ld / group_size) {}
+        biases(biases_ + bi * src_ld / group_size),
+        planes_base(planes_base_),
+        planes_n(planes_n_),
+        planes_row(planes_row0_ + bi),
+        planes_k(planes_k0_ + bj * pack_factor) {
+    if (planes) {
+      src = planes_base + (int64_t(planes_k / 64) * planes_n + planes_row) * 32 + planes_k % 64 / 2;
+    }
+  }
 
   void load_unsafe() const thread {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
@@ -1264,7 +1286,12 @@ struct QuantizedBlockLoader {
   }
 
   void next() thread {
-    src += tile_stride;
+    if (planes) {
+      planes_k += BCOLS;
+      src = planes_base + (int64_t(planes_k / 64) * planes_n + planes_row) * 32 + planes_k % 64 / 2;
+    } else {
+      src += tile_stride;
+    }
     if (reduction_dim == 1) {
       if (group_steps > 1) {
         group_step_cnt++;

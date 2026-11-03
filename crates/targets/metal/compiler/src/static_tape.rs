@@ -392,6 +392,7 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
 /// One rung of a bucket's tape: its class, addressing and KV cap.
 struct Rung<'a> {
     profile: &'a MetalTargetProfile,
+    class: GenClass,
     /// The step tape this rung lowers — the wide class's band when the bands fold differently —
     /// and the arena slot count that tape's colouring allocated.
     steps: &'a MetalStepTape,
@@ -412,6 +413,7 @@ fn run_lower(
         rotary: input.rotary,
         block_cap: rung.cap.get(),
         profile: Some(rung.profile),
+        class: rung.class,
     };
     tl::lower_subtile_tape_to_metal(rung.steps, mc, at)
 }
@@ -469,6 +471,7 @@ pub fn bake_bucket_tapes(
         };
         let rung = Rung {
             profile: &profile,
+            class,
             steps,
             num_arena_slots,
             addressing,

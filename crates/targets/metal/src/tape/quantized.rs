@@ -164,6 +164,42 @@ pub const fn qmv_fast_covers(n: u32, k: u32) -> bool {
     n.is_multiple_of(8) && k.is_multiple_of(QMV_FAST_K_STEP)
 }
 
+/// The most output columns a projection runs the row-parallel fast matvec ([`QmvKernel::Fast`]) at
+/// for, at a bucket of up to [`NARROW_MATVEC_ROWS`] rows on a NAX device ([`narrow_matvec`]).
+///
+/// Its grid is a threadgroup a (row, 4 columns), where the wide matvec's is one a (5 rows, 8
+/// columns) and the NAX GEMM's one a 64 x 64 tile: a narrow projection's few columns give those
+/// a handful of threadgroups (the NAX GEMM ONE) and leave the cores idle, while its weights are
+/// small enough that the fast matvec's re-read of them a row comes from cache. M5 Max, µs a
+/// dispatch, DRAM-cold (`narrow_projection_at_verify_buckets`), NAX / wide / fast at 2-32 and at
+/// 64 rows: Qwen3.8-27B's GDN `a`, `b` (48 x 5120) 112 / 12-16 / 7.0-7.7 and 102 / 18 / 13.5;
+/// Qwen3.6-35B-A3B's (32 x 2048) 44 / 6.7-8.4 / 4.9-5.2 and 40 / 10 / 7.7. On a quarter of its
+/// cores (four copies between the same barriers: a 10-core base M5 emulated by width) the fast
+/// matvec stays within ~1.3x of the wide one through 64 columns and 3x ahead of the NAX GEMM
+/// (64 x 5120 at 64 rows: 44 / 32 / 97 fast / wide / NAX); at 128 columns it is 1.5x behind the
+/// wide one (87 / 58 at 64 rows).
+pub const NARROW_MATVEC_COLS: u32 = 64;
+
+/// The most rows a bucket runs a narrow projection's fast matvec at ([`narrow_matvec`]): the
+/// first prefill-shaped bucket, which a model without 16- and 32-row buckets plays its 2-4-lane
+/// verify on (Qwen3.8-27B's default ladder: 8 then 64). Its re-read of the weights a row grows
+/// with the rows, and at the 512-row bucket the NAX GEMM's tiles win (48 x 5120, µs a dispatch,
+/// a quarter of the cores: NAX 124, fast 250; at 128 rows NAX 104, fast 66).
+pub const NARROW_MATVEC_ROWS: u32 = 64;
+
+/// Whether an `n × k` `bits`-bit projection at an `m`-row bucket on a NAX device runs the
+/// row-parallel fast matvec, whatever the bucket's matvec / matmul boundary
+/// ([`get_qmv_batch_limit`]): 4-bit (the width measured), at most [`NARROW_MATVEC_COLS`] columns
+/// the one-row bucket's matvec is the fast one for (not the quad's K band), at 2 to
+/// [`NARROW_MATVEC_ROWS`] rows. Each row's sum is the one-row matvec's: a threadgroup row a row,
+/// its rows apart.
+pub fn narrow_matvec(n: u32, k: u32, bits: u32, m: u32) -> bool {
+    (2..=NARROW_MATVEC_ROWS).contains(&m)
+        && n <= NARROW_MATVEC_COLS
+        && bits == 4
+        && pick_qmv_kernel(n, k, bits) == QmvKernel::Fast
+}
+
 /// The M=1 form — `pick_qmv_kernel_wide` with `m = 1, wide_ok = false`.
 pub fn pick_qmv_kernel(n: u32, k: u32, bits: u32) -> QmvKernel {
     pick_qmv_kernel_wide(n, k, bits, 1, false)
@@ -822,6 +858,250 @@ impl W4a8Tile {
     }
 }
 
+/// The ways a split-K W4A8 GEMM (`affine_qmm_w4a8_splitk_*`) splits K: one 32 x 32 output tile
+/// a threadgroup, this many simdgroups each multiplying every `ways()`-th 64-chunk of it, their
+/// partial tiles summed through threadgroup memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum W4a8SplitK {
+    Ways2,
+    Ways4,
+    Ways8,
+}
+
+impl W4a8SplitK {
+    pub const ALL: [Self; 3] = [Self::Ways2, Self::Ways4, Self::Ways8];
+
+    pub fn ways(self) -> u32 {
+        match self {
+            Self::Ways2 => 2,
+            Self::Ways4 => 4,
+            Self::Ways8 => 8,
+        }
+    }
+}
+
+/// Output columns of a split-K W4A8 threadgroup.
+pub const W4A8_SPLIT_K_COLS: u32 = 32;
+
+/// The simdgroups a W4A8 GEMM's grid keeps in flight before it stops splitting K: 16 a core of
+/// the fewest the wide class holds. The tiled GEMM runs one simdgroup a 32 x 32 output tile over
+/// all of K, so a narrow N or a long K at one row tile leaves a 40-core M5 Max short of loads in
+/// flight (Qwen3.8-27B's 32-row verify, `w4a8_splitk_probe_test`, µs tiled / split: MLP down
+/// 5120 x 17408, 160 simdgroups, 340 / 123 at 4 ways; o_proj 5120 x 6144 100 / 50; k and v
+/// 1024 x 5120, 32 simdgroups, 80 / 18 at 8 ways; gate/up 17408 x 5120, 544, 140 / 140 at 2).
+pub const W4A8_SPLIT_K_MIN_SIMDGROUPS: u32 = 16 * crate::tape::lowered::M5_WIDE_MIN_CORES;
+
+/// The widest one row tile a W4A8 GEMM splits K at: past it the tiled grid's columns alone hide
+/// the loads (the 27B's lm_head, 248320 x 5120, 7760 tiles: 1809 µs tiled, 1616 at 4 ways in the
+/// probe, but within noise in the tape — 1.79 / 1.75 ms — where it is one dispatch a cycle; kept
+/// tiled). A row tile already at [`W4A8_SPLIT_K_MIN_SIMDGROUPS`] but under this still pays for 4
+/// ways, not 2: its tiled simdgroup walks every K chunk in series, and four of them in flight hide
+/// the chunk loads two do not (gate/up 17408 x 5120, 544 tiles, in the probe at 32 rows tiled /
+/// 2 / 4 ways: 145 / 183 / 169 µs, DRAM-cold the weights only; in the 64-row tape, its activation
+/// fresh, 22.07 / 20.75 ms a cycle at 4 ways, 291 / 309 GB/s).
+pub const W4A8_SPLIT_K_MAX_ROW_TILE: u32 = 4096;
+
+/// The most rows a bucket splitting K has: two row tiles. Its grid scales with the step's live
+/// rows, so the split is weighed at one row tile (a 4-way 8-token verify in the 64-row bucket),
+/// and costs little where two run (the probe at 64 rows, tiled / the one-tile pick: down 307 /
+/// 220, gdn qkv 10240 x 5120 137 / 145). At four row tiles and past, the tiled grid's own rows
+/// fill the cores and the split's partial tiles only cost (128 rows: down 366 / 408).
+pub const W4A8_SPLIT_K_MAX_ROWS: u32 = 2 * W4A8_TILE_ROWS;
+
+/// Rows of the small-M step's W4A8 tile ([`W4a8Gemm::SmallM`]): the most tokens a
+/// [`SMALL_M_TOKENS`] step has.
+pub const W4A8_SMALL_M_ROWS: u32 = 16;
+const _: () = assert!(W4A8_SMALL_M_ROWS == *SMALL_M_TOKENS.end());
+
+/// The row tile of a split-K W4A8 GEMM: the bucket's [`W4A8_TILE_ROWS`], or the small-M step's
+/// [`W4A8_SMALL_M_ROWS`] (the shader's two `TM` instantiations).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum W4a8SplitRows {
+    Bucket,
+    SmallM,
+}
+
+impl W4a8SplitRows {
+    pub fn rows(self) -> u32 {
+        match self {
+            Self::Bucket => W4A8_TILE_ROWS,
+            Self::SmallM => W4A8_SMALL_M_ROWS,
+        }
+    }
+}
+
+/// The fewest ways the small-M step's W4A8 tile splits K: its 16 rows give each 64-chunk half
+/// the 32-row tile's multiplies to hide that chunk's loads behind, and at 2 ways it streams short
+/// of 4 even where the grid already fills the cores (`small_m_verify_probe_test`, 40-core M5
+/// Max, 16 rows, µs at 2 / 4 ways: lm_head 248320 x 5120, 7760 tiles, 1626 / 1361; gate/up
+/// 17408 x 5120 173 / 151; MLP down 5120 x 17408 210 / 146).
+pub const W4A8_SMALL_M_MIN_WAYS: W4a8SplitK = W4a8SplitK::Ways4;
+
+/// The widest bucket a full row tile's small-M GEMM splits K 8 ways in ([`W4a8Gemm::for_small_m`]).
+pub const W4A8_SMALL_M_EIGHT_WAYS_ROWS: u32 = 8;
+
+/// A dense W4A8 GEMM's kernel: the tiled GEMM, its split-K twin, or the split-K GEMM over the
+/// 16 rows of a small-M step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum W4a8Gemm {
+    Tiled(W4a8Tile),
+    SplitK(W4a8SplitK),
+    /// [`W4A8_SMALL_M_ROWS`] rows a threadgroup, K split as [`W4a8Gemm::SplitK`]'s: the
+    /// small-M twin of a W4A8 bucket's GEMM on the wide class (`route_small_m`). A
+    /// [`SMALL_M_TOKENS`] step in a 32-row tile pads it at least 2x; the bf16 small-M GEMM
+    /// re-reads its bf16 activation twice a 16-column tile (7 bytes a weight byte, ~2 TB/s from
+    /// cache: Qwen3.8-27B's 16-row verify streamed 281 GB/s on every shape, lm_head included),
+    /// where this tile reads the int8 pre-pass's once a 32-column one.
+    SmallM(W4a8SplitK),
+}
+
+impl W4a8Gemm {
+    /// The kernel of an `n`-column, `k`-deep GEMM in a `bucket_m`-row bucket (a multiple of
+    /// [`W4A8_TILE_ROWS`]) on a chip of `class`: on the wide class, in a bucket of at most
+    /// [`W4A8_SPLIT_K_MAX_ROWS`] whose one row tile is narrower than
+    /// [`W4A8_SPLIT_K_MAX_ROW_TILE`], split K the fewest ways that bring one row tile's grid to
+    /// [`W4A8_SPLIT_K_MIN_SIMDGROUPS`], at least 4 where it already holds them (at most 8, and no
+    /// more than K has 64-chunks); elsewhere the widest tile. Unmeasured below the wide
+    /// class, whose fewer cores the tiled grid fills sooner.
+    pub fn for_shape(
+        tile: W4a8Tile,
+        n: u32,
+        k: u32,
+        bucket_m: u32,
+        class: crate::tape::lowered::GenClass,
+    ) -> Self {
+        let row_tile = n / W4A8_SPLIT_K_COLS;
+        if class != crate::tape::lowered::GenClass::M5Wide
+            || bucket_m > W4A8_SPLIT_K_MAX_ROWS
+            || !n.is_multiple_of(W4A8_SPLIT_K_COLS)
+            || row_tile >= W4A8_SPLIT_K_MAX_ROW_TILE
+        {
+            return Self::Tiled(tile);
+        }
+        let mut fits = W4a8SplitK::ALL.into_iter().filter(|s| s.ways() <= k / 64);
+        let fill = fits.clone().find(|s| {
+            row_tile * s.ways() >= W4A8_SPLIT_K_MIN_SIMDGROUPS
+                && (row_tile < W4A8_SPLIT_K_MIN_SIMDGROUPS || *s >= W4a8SplitK::Ways4)
+        });
+        match fill.or_else(|| fits.next_back()) {
+            Some(split) => Self::SplitK(split),
+            None => Self::Tiled(tile),
+        }
+    }
+
+    /// The small-M step's kernel of an `n`-column, `k`-deep GEMM: split K the fewest ways from
+    /// [`W4A8_SMALL_M_MIN_WAYS`] that bring its one row tile's grid to
+    /// [`W4A8_SPLIT_K_MIN_SIMDGROUPS`] (at most 8, and no more than K has 64-chunks); `None`
+    /// where `n` is not a multiple of its 32 columns or K has fewer chunks than the fewest ways.
+    /// At 16 rows (`small_m_verify_probe_test`, µs at 4 / 8 ways): k and v 1024 x 5120, 32
+    /// tiles, 23.8 / 16.4; gdn z 6144 x 5120, 192 tiles, 52.6 / 58.4.
+    pub fn for_small_m(n: u32, k: u32, bucket_m: u32) -> Option<Self> {
+        if !n.is_multiple_of(W4A8_SPLIT_K_COLS) {
+            return None;
+        }
+        let tiles = n / W4A8_SPLIT_K_COLS;
+        let mut fits = (W4a8SplitK::ALL.into_iter())
+            .filter(|s| *s >= W4A8_SMALL_M_MIN_WAYS && s.ways() <= k / 64);
+        // In the 8-row bucket (one verify lane), every row tile 4 ways already fill takes 8, not 4:
+        // its tiles walk K in series, and 8 in flight hide the chunk loads 4 do not. Qwen3.8-27B +
+        // DFlash2, `scr bench serve`, 64 ShareGPT prompts, 1 request: 79.5 tok/s at 4 ways, 82.0 at
+        // 8 over every such tile, 79.8 at 8 over only the tiles that fill the cores at 1 way (gate/up,
+        // lm_head). The 2-lane verify's 64-row bucket keeps 4 (149.2 -> 145.4 tok/s at 8).
+        let fill = (fits.clone()).find(|s| {
+            tiles * s.ways() >= W4A8_SPLIT_K_MIN_SIMDGROUPS
+                && (bucket_m > W4A8_SMALL_M_EIGHT_WAYS_ROWS
+                    || tiles * W4a8SplitK::Ways4.ways() < W4A8_SPLIT_K_MIN_SIMDGROUPS
+                    || s.ways() >= 8)
+        });
+        fill.or_else(|| fits.next_back()).map(Self::SmallM)
+    }
+
+    pub fn cols(self) -> u32 {
+        match self {
+            Self::Tiled(tile) => tile.cols(),
+            Self::SplitK(_) | Self::SmallM(_) => W4A8_SPLIT_K_COLS,
+        }
+    }
+
+    /// Rows a threadgroup: the bucket's tile, [`W4A8_TILE_ROWS`], or the small-M step's.
+    pub fn rows(self) -> u32 {
+        match self {
+            Self::Tiled(_) | Self::SplitK(_) => W4a8SplitRows::Bucket.rows(),
+            Self::SmallM(_) => W4a8SplitRows::SmallM.rows(),
+        }
+    }
+
+    pub fn simdgroups(self) -> u32 {
+        match self {
+            Self::Tiled(tile) => tile.simdgroups(),
+            Self::SplitK(split) | Self::SmallM(split) => split.ways(),
+        }
+    }
+
+    /// The kernel's symbol: [`qmm_w4a8_static_name`] (dense rows) or
+    /// [`qmm_w4a8_splitk_static_name`] at the kernel's rows.
+    pub fn static_name(
+        self,
+        dtype: DequantDtype,
+        scale_dtype: ScaleDtype,
+        group_size: u32,
+    ) -> &'static str {
+        match self {
+            Self::Tiled(tile) => {
+                qmm_w4a8_static_name(W4a8Rows::Dense, dtype, scale_dtype, group_size, tile)
+            }
+            Self::SplitK(split) => qmm_w4a8_splitk_static_name(
+                dtype,
+                scale_dtype,
+                group_size,
+                split,
+                W4a8SplitRows::Bucket,
+            ),
+            Self::SmallM(split) => qmm_w4a8_splitk_static_name(
+                dtype,
+                scale_dtype,
+                group_size,
+                split,
+                W4a8SplitRows::SmallM,
+            ),
+        }
+    }
+}
+
+/// The paired split-K W4A8 GEMM's symbol (`affine_qmm_w4a8_splitk_pair_*`): two tensors of one
+/// activation in one dispatch, each tile its own tensor's split-K tile. `None` for a tiled kernel,
+/// which has no paired twin.
+pub fn qmm_w4a8_pair_static_name(
+    kernel: W4a8Gemm,
+    dtype: DequantDtype,
+    scale_dtype: ScaleDtype,
+    group_size: u32,
+) -> Option<&'static str> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = (W4a8Gemm, DequantDtype, ScaleDtype, u32);
+    static CACHE: OnceLock<Mutex<HashMap<Key, &'static str>>> = OnceLock::new();
+    let (act, scale) = (dtype.symbol_infix(), scale_dtype.symbol_infix());
+    let name = match kernel {
+        W4a8Gemm::Tiled(_) => return None,
+        W4a8Gemm::SplitK(split) => format!(
+            "affine_qmm_w4a8_splitk_pair_{act}_s_{scale}_gs_{group_size}_tn_{W4A8_SPLIT_K_COLS}_ks_{}",
+            split.ways(),
+        ),
+        W4a8Gemm::SmallM(split) => format!(
+            "affine_qmm_w4a8_splitk_pair_{act}_s_{scale}_gs_{group_size}_tm_{W4A8_SMALL_M_ROWS}_tn_{W4A8_SPLIT_K_COLS}_ks_{}",
+            split.ways(),
+        ),
+    };
+    let mut guard = (CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock())
+        .expect("qmm_w4a8_pair_static_name cache poisoned");
+    Some(
+        guard
+            .entry((kernel, dtype, scale_dtype, group_size))
+            .or_insert_with(|| Box::leak(name.into_boxed_str())),
+    )
+}
+
 /// Scratch the W4A8 pre-pass writes for an `m x k` activation: int8
 /// `xq[m][k]`, then float2 `(scale, scale * sum)` per (row, 64-chunk).
 pub fn w4a8_scratch_bytes(m: u32, k: u32) -> u32 {
@@ -911,6 +1191,42 @@ pub fn qmm_w4a8_static_name(
                     scale_dtype.symbol_infix(),
                     tile.cols(),
                     tile.simdgroups(),
+                )
+                .into_boxed_str(),
+            )
+        })
+}
+
+/// `affine_qmm_w4a8_splitk_<dtype>_s_<scale>_gs_<gs>_tn_32_ks_<ways>` at the bucket's rows,
+/// `..._gs_<gs>_tm_16_tn_32_ks_<ways>` at the small-M step's — dense rows only.
+pub fn qmm_w4a8_splitk_static_name(
+    dtype: DequantDtype,
+    scale_dtype: ScaleDtype,
+    group_size: u32,
+    split: W4a8SplitK,
+    rows: W4a8SplitRows,
+) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = (DequantDtype, ScaleDtype, u32, W4a8SplitK, W4a8SplitRows);
+    static CACHE: OnceLock<Mutex<HashMap<Key, &'static str>>> = OnceLock::new();
+    let tm = match rows {
+        W4a8SplitRows::Bucket => String::new(),
+        W4a8SplitRows::SmallM => format!("_tm_{W4A8_SMALL_M_ROWS}"),
+    };
+    let mut guard = CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("qmm_w4a8_splitk_static_name cache poisoned");
+    guard
+        .entry((dtype, scale_dtype, group_size, split, rows))
+        .or_insert_with(|| {
+            Box::leak(
+                format!(
+                    "affine_qmm_w4a8_splitk_{}_s_{}_gs_{group_size}{tm}_tn_{W4A8_SPLIT_K_COLS}_ks_{}",
+                    dtype.symbol_infix(),
+                    scale_dtype.symbol_infix(),
+                    split.ways(),
                 )
                 .into_boxed_str(),
             )

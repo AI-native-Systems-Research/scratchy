@@ -113,6 +113,9 @@ impl SourceManifest {
                 K::AttnSinks => {
                     return Ok(quote!(#ix => Some(#r::AttnSinks(*self.#base(layer.get()))),));
                 }
+                K::Tensor => {
+                    return Ok(quote!(#ix => Some(#r::Tensor(*self.#base(layer.get()))),));
+                }
                 K::GptOssMoe => quote!(GptOssMoe),
                 K::Marlin
                 | K::Bnb4
@@ -271,6 +274,9 @@ fn decode_barriers(t: &Assembled, flags: &[Fence], m: u64) -> usize {
         gdn_plain: true,
         // A decode step's sequences are one row each.
         gdn_plain_rows: false,
+        draft_cycle: false,
+        // A decode step's sequences are one row each.
+        lane_rows: true,
     };
     let runs = |r: &StepRow| matches!(r, StepRow::Step(_, g) if gate_matches(*g, decode));
     (t.rows.iter().zip(flags))
@@ -407,7 +413,7 @@ pub fn lower_canonical(
         let (flags, _) = b.flags();
         proof(&b, &flags).map(|()| (b, flags))
     };
-    let (rolled_live, unrolled_live) = (rolled.cache_live(), unrolled.cache_live());
+    let (rolled_live, unrolled_live) = (rolled.play_live(), unrolled.play_live());
     let mut cut = match proof(&rolled, &rolled_flags) {
         Ok(()) => Some((
             RollOutcome::Rolled { peel: 0 },
@@ -429,7 +435,7 @@ pub fn lower_canonical(
     if let Some(items) = &tp.layer_rolled {
         match candidate(items) {
             Ok((b, flags)) if cut.as_ref().is_none_or(|c| b.rows.len() < c.1.len()) => {
-                let live = b.cache_live();
+                let live = b.play_live();
                 cut = Some((RollOutcome::LayerClasses, b.rows, flags, b.sites, live));
             }
             Ok(_) => {}
@@ -445,7 +451,7 @@ pub fn lower_canonical(
             };
             match candidate(&items) {
                 Ok((b, flags)) => {
-                    let live = b.cache_live();
+                    let live = b.play_live();
                     cut = Some((RollOutcome::Rolled { peel }, b.rows, flags, b.sites, live));
                     break;
                 }
@@ -454,13 +460,14 @@ pub fn lower_canonical(
         }
     }
     let from = unrolled.rows.len();
-    let (roll, backbone, backbone_barriers, backbone_sites, backbone_cache_live) = cut.unwrap_or((
-        RollOutcome::Unrolled,
-        unrolled.rows,
-        unrolled_flags,
-        unrolled.sites,
-        unrolled_live,
-    ));
+    let (roll, backbone, backbone_barriers, backbone_sites, (backbone_live, lm_head_live)) = cut
+        .unwrap_or((
+            RollOutcome::Unrolled,
+            unrolled.rows,
+            unrolled_flags,
+            unrolled.sites,
+            unrolled_live,
+        ));
     match roll {
         RollOutcome::Unrolled => eprintln!(
             "[m2-roll] {stem} m={m}: NO cut rolls — emitting the un-rolled tape. {}",
@@ -486,10 +493,11 @@ pub fn lower_canonical(
             backbone,
             backbone_barriers,
             backbone_sources: backbone_sites.iter().map(|s| sources.row(s)).collect(),
-            backbone_cache_live,
+            backbone_live,
             lm_head: rolled.lm_rows,
             lm_head_barriers,
             lm_head_sources: rolled.lm_sites.iter().map(|s| sources.row(s)).collect(),
+            lm_head_live,
         },
         colours: colour_count,
         result,

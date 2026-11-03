@@ -47,10 +47,13 @@ mod codegen;
 #[cfg(feature = "cuda")]
 mod concurrency;
 mod config;
+mod draft_capture;
 /// The baked program, as const tokens — see its own header.
 #[cfg(feature = "spyre")]
 mod ktir_tokens;
-pub use config::{selected_config_paths, total_models_emitted, unmatched_build_filter_tags};
+pub use config::{
+    arch_compiled, selected_config_paths, total_models_emitted, unmatched_build_filter_tags,
+};
 mod assignment;
 #[cfg(feature = "cuda")]
 mod cost;
@@ -591,6 +594,12 @@ pub fn compile_carrier(
     // (SigLIP raster, etc.). Decoder mode ignores the arg if set.
 
     // ── Front end: classify ────────────────────────────────────────
+    // A decoder's layer loop captures what a drafter compiled beside it reads (`draft_capture`):
+    // the compiler's, whatever the arch's DSL says.
+    let ast = match mode.prelude {
+        classified::Prelude::Decoder => draft_capture::insert(&ast),
+        classified::Prelude::Vision => ast,
+    };
     let classified = classify::classify_with(&ast, mode.prelude)
         .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))?;
 
@@ -1989,8 +1998,9 @@ pub fn compile_carrier(
             }
         };
         // A variant's multi-token-prediction head facts. The registry carries the arch-wide ones
-        // (every head variant must agree), so a loader knows them before the head loads.
-        #[derive(Debug, PartialEq)]
+        // (every head variant must agree, but for the targets each drafts for, which it unites), so
+        // a loader knows them before the head loads.
+        #[derive(Clone, Debug, PartialEq)]
         struct HeadFacts {
             /// Its forward reads `target_hidden`: it is a head.
             reads_target_hidden: bool,
@@ -2008,6 +2018,8 @@ pub fn compile_carrier(
             /// Its `spec_drafts` and `spec_verify_rows`.
             spec: [u64; 2],
             reads_target_kv: bool,
+            /// It drafts a block a pass: its forward selects its block's drafts.
+            block: bool,
         }
         let head_facts: std::collections::BTreeMap<String, HeadFacts> = solved
             .iter()
@@ -2027,6 +2039,7 @@ pub fn compile_carrier(
                     spec: ["spec_drafts", "spec_verify_rows"]
                         .map(|b| sm.model.bounds.get(b).copied().unwrap_or(0)),
                     reads_target_kv: sm.model.arch.reads_target_kv,
+                    block: (sm.fuf.nodes.iter()).any(|n| n.op == classified::OpKind::DraftSelect),
                 };
                 (sm.mod_name.clone(), facts)
             })
@@ -2078,24 +2091,34 @@ pub fn compile_carrier(
             match heads.first() {
                 None => quote! { ::core::option::Option::None },
                 Some(first) => {
+                    // Its variants may draft for different targets (Splash's DFlash2 drafter for
+                    // Qwen3.6-35B-A3B and for Qwen3.8-27B: one MoE arch, one dense): the head
+                    // drafts for all of them. Every other fact is the arch's, one for all of them.
+                    let same_but_targets = |head: &&HeadFacts| {
+                        HeadFacts {
+                            drafts_for: first.drafts_for.clone(),
+                            ..(*head).clone()
+                        } == **first
+                    };
                     assert!(
-                        heads.iter().all(|head| head == first),
+                        heads.iter().all(same_but_targets),
                         "{arch_ident}: its head variants disagree on where they load lent weights, \
-                         how many lm_head rows they read, whose head they are, where they ship or \
-                         how many tokens they draft ({heads:?}); a loader must know them before \
-                         the head loads"
+                         how many lm_head rows they read, where they ship or how many tokens they \
+                         draft ({heads:?}); a loader must know them before the head loads"
                     );
+                    let drafts_for: std::collections::BTreeSet<&String> =
+                        heads.iter().flat_map(|head| &head.drafts_for).collect();
                     let [arch] = &hf_arches[..] else {
                         panic!("{arch_ident}: a head registers under one identity ({hf_arches:?})");
                     };
                     let HeadFacts {
                         lent: [Some(embed_tokens), lm_head],
                         lm_head_rows,
-                        drafts_for,
                         repo_infix,
                         checkpoint_prefix,
                         spec,
                         reads_target_kv,
+                        block,
                         ..
                     } = first
                     else {
@@ -2111,6 +2134,10 @@ pub fn compile_carrier(
                     let (lm_head, repo_infix, checkpoint_prefix) =
                         (some(lm_head), some(repo_infix), some(checkpoint_prefix));
                     let lm_head_rows = proc_macro2::Literal::u32_unsuffixed(*lm_head_rows as u32);
+                    let drafting = match block {
+                        true => quote! { ::scratchy_forward_compiler::HeadDrafting::Block },
+                        false => quote! { ::scratchy_forward_compiler::HeadDrafting::Chained },
+                    };
                     let [drafts, verify_rows] =
                         spec.map(|v| u8::try_from(v).expect("a head's spec facts fit a u8"));
                     // An absent fact reads 0, and a head that fits no draft in a verify step
@@ -2163,6 +2190,7 @@ pub fn compile_carrier(
                             published: &[#(#published),*],
                             drafts: #drafts,
                             verify_rows: #verify_rows,
+                            drafting: #drafting,
                         })
                     }
                 }

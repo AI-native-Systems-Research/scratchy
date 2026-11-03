@@ -138,6 +138,9 @@ pub enum WeightKind {
     /// added unscaled after qk·sm_scale; the sink column is dropped
     /// before the ·V accumulation.
     AttnSinks,
+    /// A bare tensor read verbatim (`<prefix>`, no `.weight`, dense, never quantized): a DFlash2
+    /// drafter's convolution base kernels and selector codebooks, read whole by Splash's kernels.
+    Tensor,
 }
 
 /// Compile-time mapping from `(TileId, output_slot)` → flat slot
@@ -358,6 +361,8 @@ impl WeightKind {
             // NOTE: no leading `&` — a per-layer plain dense
             // `[num_heads]` GpuTensor, taken verbatim at load.
             Self::AttnSinks => "crate::__gpu::tensor::GpuTensor",
+            // NOTE: no leading `&` — a plain dense GpuTensor, taken verbatim at load.
+            Self::Tensor => "crate::__gpu::tensor::GpuTensor",
         }
     }
 }

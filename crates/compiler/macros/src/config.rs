@@ -599,21 +599,63 @@ fn load_dir_mode(
                 model_feature_enabled(arch, stem)
             })
     };
-    let head_drafts = |stem: &str, json: &serde_json::Value| -> Result<Option<u64>, ConfigError> {
+    // What the heads compiled beside a target config bake into it: the most drafts one of them
+    // carries a sequence (its verify steps hold that many), and the layers whose outputs one reads
+    // (`target_capture_layers`, its arch.json: a path into its own config), which the target
+    // captures. A head that does not compile in this build ([`arch_compiled`]: a metal-only
+    // drafter under cuda) bakes nothing into it.
+    let head_facts = |stem: &str, json: &serde_json::Value| -> Result<HeadFacts, ConfigError> {
+        let mut facts = HeadFacts::default();
         if !mtp_heads || !spec.hf_architectures.is_empty() {
-            return Ok(None);
+            return Ok(facts);
         }
         let this = format!("{arch_name}/{stem}");
         for arch_dir in arch_dirs(configs_root)? {
+            let head_arch = (arch_dir.file_name()).and_then(|n| n.to_str());
+            if !head_arch.is_some_and(arch_compiled) {
+                continue;
+            }
             let head = load_arch_json(&arch_dir)?;
-            let drafts = (head.bound_defaults.iter()).find(|(k, _)| k == "spec_drafts");
-            let heads_this = compiled_head_targets(&head, mtp).any(|(_, t)| *t == this)
-                || (head.checkpoint_of.iter().any(|a| a == arch_name) && carries_head(&head, json));
-            if let (true, Some(&(_, drafts))) = (heads_this, drafts) {
-                return Ok(Some(drafts));
+            let configs: Vec<String> = (compiled_head_targets(&head, mtp))
+                .filter(|(_, t)| *t == this)
+                .map(|(s, _)| s.clone())
+                .collect();
+            let in_checkpoint =
+                head.checkpoint_of.iter().any(|a| a == arch_name) && carries_head(&head, json);
+            if configs.is_empty() && !in_checkpoint {
+                continue;
+            }
+            if let Some(&(_, d)) = (head.bound_defaults.iter()).find(|(k, _)| k == "spec_drafts") {
+                facts.drafts = Some(facts.drafts.map_or(d, |m: u64| m.max(d)));
+            }
+            let Some(path) = &head.target_capture_layers else {
+                continue;
+            };
+            for config in &configs {
+                let head_path = arch_dir.join(format!("{config}.json"));
+                let (_, head_json) = read_json_file(&head_path)?;
+                let layers: Vec<u64> = crate::arch_spec::json_path(&head_json, path)
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.iter().map(|v| v.as_u64()).collect())
+                    .ok_or_else(|| ConfigError::ArchJson {
+                        path: head_path.clone(),
+                        reason: format!("`{path}` must be an array of layer indices"),
+                    })?;
+                match &facts.capture_layers {
+                    Some(other) if *other != layers => {
+                        return Err(ConfigError::ArchJson {
+                            path: head_path,
+                            reason: format!(
+                                "two heads of `{this}` read different target layers \
+                                 ({other:?} and {layers:?}): a target captures one set"
+                            ),
+                        });
+                    }
+                    _ => facts.capture_layers = Some(layers),
+                }
             }
         }
-        Ok(None)
+        Ok(facts)
     };
 
     // Quant scoping. `SCRATCHY_QUANTS=preset1,preset2,...` restricts the
@@ -778,8 +820,14 @@ fn load_dir_mode(
         }
         selected_configs().lock().unwrap().insert(p.clone());
         let (raw, mut json) = read_json_file(p)?;
-        if let (Some(drafts), Some(obj)) = (head_drafts(&stem, &json)?, json.as_object_mut()) {
-            obj.insert("spec_drafts".to_string(), drafts.into());
+        let facts = head_facts(&stem, &json)?;
+        if let Some(obj) = json.as_object_mut() {
+            if let Some(drafts) = facts.drafts {
+                obj.insert("spec_drafts".to_string(), drafts.into());
+            }
+            if let Some(layers) = facts.capture_layers {
+                obj.insert(DRAFT_CAPTURE_LAYERS.to_string(), layers.into());
+            }
         }
         // Dense-base drift surface: `<stem>.overrides.json` deep-merges
         // onto the verbatim checkpoint config (same mechanism the
@@ -957,6 +1005,55 @@ fn model_configs(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
 }
 
 /// Every arch dir under `configs/`.
+/// Arches whose emit compiles only under cuda (no metal surface).
+const CUDA_ONLY_ARCHES: &[&str] = &[
+    "deepseek-v2",
+    "deepseek-v3",
+    "deepseek-v3-flat",
+    "gemma3-mm",
+];
+/// Arches whose emit compiles only under metal: no cuda ISel claims for their ops, so under a cuda
+/// build the solver would find tile claims missing and panic.
+const METAL_ONLY_ARCHES: &[&str] = &[
+    "dflash2",
+    "gemma4-assistant",
+    "glm4-moe",
+    "gpt-oss",
+    "nemotron-h",
+    "nemotron-h-latent",
+    "nemotron-h-mtp",
+];
+/// Arches that also compile for spyre (KTIR). Must agree with the arches `scratchy-models`'
+/// `spyre` feature enables.
+const SPYRE_CAPABLE_ARCHES: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
+
+/// Whether `arch` compiles in this build: its `arch-<name>` feature is on, and so is a backend it
+/// compiles for. `scratchy-models`' build script runs an arch's pipeline only then (its
+/// `src/lib.rs` gates each arch's `pub mod` the same way), and a target bakes in the facts of the
+/// heads that compile beside it alone. Read from Cargo's `CARGO_FEATURE_*`, in the build script's
+/// process.
+pub fn arch_compiled(arch: &str) -> bool {
+    arch_compiled_with(arch, |feature| {
+        let var = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
+        std::env::var(var).is_ok()
+    })
+}
+
+/// [`arch_compiled`] under the features `on` reports.
+fn arch_compiled_with(arch: &str, on: impl Fn(&str) -> bool) -> bool {
+    let (cuda, metal, spyre) = (on("cuda"), on("metal"), on("spyre"));
+    let backend = if CUDA_ONLY_ARCHES.contains(&arch) {
+        cuda
+    } else if METAL_ONLY_ARCHES.contains(&arch) {
+        metal
+    } else if SPYRE_CAPABLE_ARCHES.contains(&arch) {
+        cuda || metal || spyre
+    } else {
+        cuda || metal
+    };
+    on(&format!("arch-{arch}")) && backend
+}
+
 fn arch_dirs(configs_root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     let io = |source| ConfigError::Io {
         path: configs_root.to_path_buf(),
@@ -1080,6 +1177,20 @@ pub fn load_file_with_preset(
 
     let spec = load_arch_json(dir)?;
     model_params_from_json(&merged, &variant_stem, config_path, tracked, &spec)
+}
+
+/// One dense base as the macro's directory walk loads it: its `<stem>.overrides.json` and its
+/// arch's declarations (the `arch.json` beside it) applied, which [`load_file`] leaves out.
+#[cfg(test)]
+pub fn load_file_declared(config_path: &Path) -> Result<ModelParams, ConfigError> {
+    let stem = stem_of(config_path)?;
+    let dir = config_path
+        .parent()
+        .ok_or_else(|| ConfigError::NotADirectory(config_path.to_path_buf()))?;
+    let (_, mut json) = read_json_file(config_path)?;
+    let mut tracked: Vec<PathBuf> = Vec::new();
+    apply_overrides_file(dir, &stem, &mut json, &mut tracked)?;
+    model_params_from_json(&json, &stem, config_path, tracked, &load_arch_json(dir)?)
 }
 
 /// Load one in-checkpoint head base — its TARGET's config through the head arch's own spec
@@ -1485,17 +1596,18 @@ pub struct PublishedDrafter {
 /// What a head knows of its target: the architectures it drafts for — its target config's, named
 /// by its arch's `head_targets` when it has a config of its own (`source_path`'s stem: a quant
 /// variant's base, whose own stem carries its preset); else its config's own (it is its target's,
-/// verbatim) — and, for the variant `source_stem` of the drafter its target drafts with by default
-/// (`published_as`), where it is published and its target's shape.
+/// verbatim) — for the variant `source_stem` of the drafter its target drafts with by default
+/// (`published_as`), where it is published and its target's shape, and the experts its target
+/// routes each row through ([`routed_experts`]).
 fn head_target(
     spec: &crate::arch_spec::DeclaredArchSpec,
     json: &serde_json::Value,
     source_stem: &str,
     source_path: &Path,
-) -> Result<(Vec<String>, Option<PublishedDrafter>), ConfigError> {
+) -> Result<(Vec<String>, Option<PublishedDrafter>, u64), ConfigError> {
     let stem = stem_of(source_path)?;
     let Some((_, target)) = spec.head_targets.iter().find(|(s, _)| *s == stem) else {
-        return Ok((parse_architectures(json), None));
+        return Ok((parse_architectures(json), None, routed_experts(json)));
     };
     let configs = (source_path.parent().and_then(Path::parent))
         .ok_or_else(|| ConfigError::NotADirectory(source_path.to_path_buf()))?;
@@ -1521,7 +1633,17 @@ fn head_target(
             })
         })
         .transpose()?;
-    Ok((parse_architectures(&target_json), published))
+    let experts = routed_experts(&target_json);
+    Ok((parse_architectures(&target_json), published, experts))
+}
+
+/// The experts a target config's MoE layers route among (`num_experts`, under a composite
+/// checkpoint's `text_config`); 0 for a dense target.
+fn routed_experts(json: &serde_json::Value) -> u64 {
+    (json.get("num_experts"))
+        .or_else(|| json.get("text_config")?.get("num_experts"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
 }
 
 fn parse_architectures(json: &serde_json::Value) -> Vec<String> {
@@ -1696,10 +1818,18 @@ fn model_params_from_json(
         })?;
     // A schema that replaces the layer count leaves the block schedule another model's: an MTP
     // head's config is its target's verbatim, so its sets name the target's layers, not the head's.
-    let layer_sets = match bounds.get("num_hidden_layers").copied() == scheduled_layers {
+    let own_layers = bounds.get("num_hidden_layers").copied() == scheduled_layers;
+    let mut layer_sets = match own_layers {
         true => layer_sets,
         false => BTreeMap::new(),
     };
+    // Every decoder's layer loop tests the layers a drafter beside it captures (`draft_capture`),
+    // so every model has the set: empty without a drafter, and empty on another model's layers.
+    let captured = (json.get(DRAFT_CAPTURE_LAYERS).and_then(|v| v.as_array()))
+        .filter(|_| own_layers)
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    layer_sets.insert(DRAFT_CAPTURE_LAYERS.to_string(), LayerSet::of(captured));
     let mut scalars = extract_scalars(json);
     // Arch-declared scalar defaults (`SCALAR_DEFAULTS`): arch-constant
     // floats the checkpoint omits (Gemma-4's `attention_multiplier`).
@@ -1708,18 +1838,27 @@ fn model_params_from_json(
         scalars.entry(k.clone()).or_insert(*v);
     }
     let quantization = parse_quantization(json, source_path)?;
-    let tie_word_embeddings = parse_tie_word_embeddings(json)
-        .or(spec.tie_default)
-        .unwrap_or(false);
+    // An in-checkpoint head reads its target's config, whose `tie_word_embeddings` says where the
+    // TARGET keeps its lm_head (Qwen3.5-0.8B: in its embedding table). The head's lm_head is a
+    // slot of its own the target lends either way (`target.lent_weight_prefix`), never its embedding.
+    let tie_word_embeddings = spec.checkpoint_of.is_empty()
+        && parse_tie_word_embeddings(json)
+            .or(spec.tie_default)
+            .unwrap_or(false);
     // An arch that is a part of another model's checkpoint (an MTP head) registers under the
     // identity it declares, not the architecture its (the whole checkpoint's) config names.
-    let (architectures, (drafts_for, published)) = match spec.hf_architectures.is_empty() {
-        true => (parse_architectures(json), (Vec::new(), None)),
-        false => (
-            spec.hf_architectures.clone(),
-            head_target(spec, json, source_stem, source_path)?,
-        ),
-    };
+    let (architectures, (drafts_for, published, target_experts)) =
+        match spec.hf_architectures.is_empty() {
+            true => (parse_architectures(json), (Vec::new(), None, 0)),
+            false => (
+                spec.hf_architectures.clone(),
+                head_target(spec, json, source_stem, source_path)?,
+            ),
+        };
+    // A head's verify budget prices the expert routes of the rows its target verifies.
+    if target_experts > 0 {
+        bounds.insert("target_num_experts".to_string(), target_experts);
+    }
     let rope_scaling = extract_rope_scaling(json);
     let rope_scaling_hash = json.get("rope_scaling").map(hash_json_value);
     let mrope_section = extract_mrope_section(json);
@@ -2045,6 +2184,7 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
             .transpose()
     };
     spec.borrows = strings("borrows")?;
+    spec.target_capture_layers = as_str("target_capture_layers");
     spec.top_level_weights = strings("top_level_weights")?.unwrap_or_default();
     spec.checkpoint_of = strings("checkpoint_of")?.unwrap_or_default();
     if spec.checkpoint_of.is_empty() != spec.checkpoint_prefix.is_none() {
@@ -2089,6 +2229,20 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
 /// Reserved (non-model) filename for the per-arch declaration file.
 pub(crate) const ARCH_JSON: &str = "arch.json";
 
+/// The layer set of a target's layers whose outputs a head compiled beside it reads, which the
+/// target captures (`capture_hidden`): the head's `target_capture_layers`, written into the
+/// target's config before it parses. Every model has the set, empty unless a head reads some.
+pub(crate) const DRAFT_CAPTURE_LAYERS: &str = "draft_capture_layers";
+
+/// What the heads compiled beside a target config bake into it (`load_dir_mode`'s `head_facts`).
+#[derive(Default)]
+struct HeadFacts {
+    /// The most drafts one of them carries a sequence.
+    drafts: Option<u64>,
+    /// The target layers whose outputs one reads.
+    capture_layers: Option<Vec<u64>>,
+}
+
 /// Every key `load_arch_json` understands. Anything else in an
 /// `arch.json` is a typo or a stale key, and is rejected.
 const ARCH_JSON_KEYS: &[&str] = &[
@@ -2109,6 +2263,7 @@ const ARCH_JSON_KEYS: &[&str] = &[
     "checkpoint_prefix",
     "reads_target_kv",
     "borrows",
+    "target_capture_layers",
     "top_level_weights",
     "scale_dtype",
     "tie_default",
@@ -2262,7 +2417,20 @@ fn parse_params_json(
                 .as_bool()
                 .ok_or_else(|| bad(format!("`params[{i}].replaces` must be a bool")))?,
         };
+        let len_of = obj.get("len_of");
         let source = match (obj.get("from"), obj.get("expr"), obj.get("value")) {
+            (None, None, None) if len_of.is_some() => ParamSource::LenOf(
+                len_of
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| bad(format!("`params[{i}].len_of` must be a string")))?
+                    .to_string(),
+            ),
+            _ if len_of.is_some() => {
+                return Err(bad(format!(
+                    "`params[{i}]` ({name}) needs EXACTLY one of `from` / `expr` / `value` / \
+                     `len_of`"
+                )));
+            }
             (Some(p), None, None) => {
                 let path_str = p
                     .as_str()
@@ -2291,7 +2459,8 @@ fn parse_params_json(
             ),
             _ => {
                 return Err(bad(format!(
-                    "`params[{i}]` ({name}) needs EXACTLY one of `from` / `expr` / `value`"
+                    "`params[{i}]` ({name}) needs EXACTLY one of `from` / `expr` / `value` / \
+                     `len_of`"
                 )));
             }
         };
@@ -2658,6 +2827,14 @@ impl HybridBlock {
 pub struct LayerSet(Vec<u64>);
 
 impl LayerSet {
+    /// The set of `members`, sorted and deduplicated.
+    pub fn of(members: impl IntoIterator<Item = u64>) -> Self {
+        let mut v: Vec<u64> = members.into_iter().collect();
+        v.sort_unstable();
+        v.dedup();
+        Self(v)
+    }
+
     pub fn members(&self) -> &[u64] {
         &self.0
     }
@@ -3446,14 +3623,51 @@ mod tests {
         assert_eq!(mp.bounds["mamba_in_proj_dim"], 18560);
     }
 
+    /// An arch compiles under its `arch-<name>` feature and a backend it compiles for — so the
+    /// metal-only DFlash2 drafter does not under cuda, and bakes no capture into its target there,
+    /// whatever `all` and `mtp` turn on.
+    #[test]
+    fn an_arch_compiles_with_its_feature_and_a_backend_of_its_own() {
+        let build = |features: &'static [&'static str]| move |f: &str| features.contains(&f);
+        let cuda = build(&[
+            "cuda",
+            "arch-dflash2",
+            "arch-qwen3-5-moe",
+            "arch-deepseek-v3",
+        ]);
+        assert!(!arch_compiled_with("dflash2", cuda));
+        assert!(arch_compiled_with("qwen3-5-moe", cuda));
+        assert!(arch_compiled_with("deepseek-v3", cuda));
+        let metal = build(&[
+            "metal",
+            "arch-dflash2",
+            "arch-qwen3-5-moe",
+            "arch-deepseek-v3",
+        ]);
+        assert!(arch_compiled_with("dflash2", metal));
+        assert!(arch_compiled_with("qwen3-5-moe", metal));
+        assert!(!arch_compiled_with("deepseek-v3", metal));
+        let spyre = build(&["spyre", "arch-llama", "arch-qwen3"]);
+        assert!(arch_compiled_with("llama", spyre));
+        assert!(!arch_compiled_with("qwen3", spyre));
+        assert!(
+            !arch_compiled_with("qwen3", build(&["metal"])),
+            "its arch feature is off"
+        );
+    }
+
     /// Qwen3.6's MTP head compiles on its target's config verbatim, whose block schedule names the
     /// target's 40 layers; the head's schema makes it 1. The target keeps its sets; the head gets
-    /// none (a set naming layer 39 would have its fingerprint probe a layer it does not have).
+    /// none (a set naming layer 39 would have its fingerprint probe a layer it does not have) but
+    /// the capture set every decoder's layer loop tests, empty: its target's drafter captures the
+    /// target's layers, not the head's.
     #[test]
     fn a_schema_replacing_the_layer_count_leaves_no_layer_sets() {
         let target_path = repo_model_archs("qwen3-5-moe").join("qwen3.6-35b-a3b.json");
-        let json: serde_json::Value =
+        let mut json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&target_path).expect("read")).expect("json");
+        // What the directory walk writes into a target's config with a drafter beside it.
+        json[DRAFT_CAPTURE_LAYERS] = serde_json::json!([1, 10, 19, 28, 37]);
         let parse = |arch: &str| {
             let spec = load_arch_json(&repo_model_archs(arch)).expect("arch.json");
             model_params_from_json(&json, "qwen3.6-35b-a3b", &target_path, Vec::new(), &spec)
@@ -3463,13 +3677,32 @@ mod tests {
         assert_eq!(target.bounds["num_hidden_layers"], 40);
         let attention = target.layer_sets["attention_layers"].members();
         assert_eq!(attention.last(), Some(&39));
+        let captured = target.layer_sets[DRAFT_CAPTURE_LAYERS].members();
+        assert_eq!(captured, [1, 10, 19, 28, 37]);
         let head = parse("qwen3-5-mtp");
         assert_eq!(head.bounds["num_hidden_layers"], 1);
-        assert!(head.layer_sets.is_empty(), "{:?}", head.layer_sets);
+        let none = BTreeMap::from([(DRAFT_CAPTURE_LAYERS.to_string(), LayerSet::default())]);
+        assert_eq!(head.layer_sets, none);
         assert_eq!(
             head.checkpoint_prefix.as_deref(),
             Some("language_model.mtp")
         );
+    }
+
+    /// Qwen3.5-0.8B ties its lm_head to its embedding; its dense MTP head, read off the same
+    /// config, does not: the target lends the head both apart, so every variant of the head loads
+    /// them from the same places.
+    #[test]
+    fn a_tied_target_lends_its_head_an_untied_lm_head() {
+        let target_path = repo_model_archs("qwen3-5").join("qwen3.5-0.8b.json");
+        let (_, json) = read_json_file(&target_path).expect("json");
+        let parse = |arch: &str| {
+            let spec = load_arch_json(&repo_model_archs(arch)).expect("arch.json");
+            model_params_from_json(&json, "qwen3.5-0.8b", &target_path, Vec::new(), &spec)
+                .expect("parse")
+        };
+        assert!(parse("qwen3-5").tie_word_embeddings);
+        assert!(!parse("qwen3-5-dense-mtp").tie_word_embeddings);
     }
 
     /// The MTP head compiles on exactly the configs of `checkpoint_of` that declare its layers:

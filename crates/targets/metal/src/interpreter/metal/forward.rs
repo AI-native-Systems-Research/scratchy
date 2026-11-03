@@ -138,6 +138,8 @@ pub struct ForwardInputs<'a> {
     /// reads it in place of the static cos/sin cache, with identity
     /// positions). `None` for 1D-rope arches.
     pub mrope_cos_sin: Option<&'a [u8]>,
+    /// A DFlash2 drafter's per-forward inputs; `None` for every other model's forward.
+    pub draft: Option<DraftInputs<'a>>,
     /// Bytes earlier forwards wrote on the device, for this one's runtime inputs.
     pub device_inputs: &'a [DeviceInput],
     /// `Some`: the host does not wait for this forward ([`Deferral`]).
@@ -167,15 +169,37 @@ impl ForwardInputs<'_> {
     }
 }
 
-/// What a forward's caller reads of it.
+/// A DFlash2 drafter's per-forward inputs (`crate::dflash2`): its lanes are the forward's
+/// sequences, in order.
+#[derive(Clone, Copy, Debug)]
+pub struct DraftInputs<'a> {
+    /// `[num_seqs]` u32 — each lane's ring slot.
+    pub ring_slots: &'a [u32],
+    /// `[num_seqs]` — each lane's policy for the cycle (a block draft's selection reads it).
+    pub lane_params: &'a [crate::dflash2::DraftLaneParams],
+    /// The forward is a cycle's context commit over its lanes' verify blocks: the rows each
+    /// retained are a device input (`DeviceInputInto::DraftRetained`), its target's acceptance's.
+    pub cycle: bool,
+}
+
+/// What a forward's caller reads of it: which of its tape's commands it plays
+/// ([`crate::tape::lowered::PlayLive`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ForwardReads {
     /// Its outputs — logits, final hidden states — and its cache writes.
     #[default]
     Outputs,
-    /// Its cache writes alone — KV, recurrent state: its tape plays only the commands they need
-    /// ([`crate::tape::lowered::LoweredMetalTape::cache_live`]).
+    /// Its cache writes alone — KV, recurrent state: its tape plays only the commands they need.
     CacheWrites,
+    /// Its result alone: its tape plays only the commands the result needs. A cache it writes
+    /// besides is written only where those commands write it; one only other commands write is
+    /// left as the forward found it (a DFlash2 drafter's block draft reads its rings and leaves
+    /// their commit to the play of its cache writes after its target's verify).
+    Result,
+    /// A DFlash2 drafter's rings rebuilt from its context window, which a prefix-cache hit
+    /// restored (Splash `DFlashDraft::addContextRebuild`): its tape plays only the window's load
+    /// and the ring writers after it, over the window's rows.
+    Rebuild,
 }
 
 /// A forward the host commits without waiting for it, so the next one is queued while it runs. Its
@@ -289,14 +313,32 @@ pub enum DeviceInputInto {
     RopeRows,
     /// Each sequence's Gated-DeltaNet step code (`gdn_is_fresh`), over the host's.
     GdnSteps,
+    /// A drafter cycle commit's retained counts (`DraftRetained`): its target's acceptance's.
+    DraftRetained,
 }
 
 /// What one command buffer's commit feedback said, once it has said it. The handler sets it once
 /// and no wait consumes it, so every wait on the command buffer, and only on it, sees the same.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Delivered {
-    Ok,
+    /// It ran, for its GPU span.
+    Ok(GpuSpan),
     Err(String),
+}
+
+/// A command buffer's span on the GPU: its commit feedback's `GPUEndTime - GPUStartTime`, the time
+/// the GPU spent on it, apart from the host's encoding and waiting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GpuSpan(pub std::time::Duration);
+
+/// The GPU span of the command buffer last waited for (f64 seconds' bits), for the worker's forward
+/// clock: a forward waits for its command buffer before it returns.
+static LAST_GPU_SPAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The GPU span of the command buffer last waited for in this process.
+pub fn last_gpu_span() -> GpuSpan {
+    let seconds = f64::from_bits(LAST_GPU_SPAN.load(std::sync::atomic::Ordering::Relaxed));
+    GpuSpan(std::time::Duration::from_secs_f64(seconds.max(0.0)))
 }
 
 /// One command buffer's commit feedback, which its handler delivers on a thread of Metal's own,
@@ -371,9 +413,15 @@ impl InFlight {
     /// outputs silently.
     pub fn wait(&self) -> Result<(), ForwardError> {
         crate::mtl4_dispatch::wait_drained(&self.event, self.value);
-        if let Delivered::Err(msg) = self.error.wait() {
-            eprintln!("[scratchy-target-metal] GPU commit error surfaced: {msg}");
-            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
+        match self.error.wait() {
+            Delivered::Err(msg) => {
+                eprintln!("[scratchy-target-metal] GPU commit error surfaced: {msg}");
+                return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
+            }
+            Delivered::Ok(GpuSpan(span)) => LAST_GPU_SPAN.store(
+                span.as_secs_f64().to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            ),
         }
         if !self.kernel_time.is_empty() {
             let cb = KERNEL_TIME_CB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -513,6 +561,14 @@ pub enum ForwardError {
         sampled: crate::tape::ids::SampledRowCount,
         overflow: crate::tape::lowered::LogitsOverflow,
     },
+    /// A forward that reads more than its cache writes, of `num_tokens` rows, whose bucket
+    /// (`bucket_m`) plays its cache writes alone ([`super::MetalBucketSpec::plays_result`]): its
+    /// arena holds none of what the rest of its tape writes.
+    CacheWritesOnly {
+        num_tokens: u32,
+        bucket_m: u32,
+        reads: ForwardReads,
+    },
     /// A step's sequence of no rows, which has no last row to sample.
     EmptySequence(EmptySequence),
 }
@@ -568,6 +624,15 @@ impl std::fmt::Display for ForwardError {
                 sampled.get(),
                 overflow.writes,
                 overflow.holds
+            ),
+            Self::CacheWritesOnly {
+                num_tokens,
+                bucket_m,
+                reads,
+            } => write!(
+                f,
+                "MetalWorkerPool::forward: a forward of {num_tokens} rows reads {reads:?}, but \
+                 its bucket of {bucket_m} plays its cache writes alone"
             ),
             Self::EmptySequence(e) => write!(f, "MetalWorkerPool::forward: {e}"),
         }
