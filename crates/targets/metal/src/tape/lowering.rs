@@ -1716,8 +1716,13 @@ fn quantizing_norm(norm: &GatedCommand, quant: &GatedCommand) -> Option<GatedCom
     let scaling = |c: &LoweredCommand| c.dispatch.m_scaling.map(|s| (s.bucket_m, s.set_axis));
     // The row (2-byte activations) and the row sum's partials in threadgroup memory.
     let fits = 2 * hidden + 4 * threads <= 32768;
+    // The 8-row bucket's small-M pre-pass runs on its small-M steps alone (`OnlyIfSmallMTokens`)
+    // and its norm on every step: the quantizing norm runs on every step too, the scratch it
+    // writes read only on the small-M steps (its other steps' matvecs read the normed rows).
+    let gates = norm.gate == quant.gate
+        || (norm.gate.is_none() && quant.gate == Some(RuntimeGate::OnlyIfSmallMTokens));
     let same = q.kernel == KernelId::AffineW4a8Quant
-        && norm.gate == quant.gate
+        && gates
         && slot(n, normed).is_some_and(|s| slot(q, 0) == Some(s))
         && constant(q, 0) == Some(hidden)
         && constant(n, 0) == Some(n.dispatch.threadgroups.0)
@@ -12409,7 +12414,7 @@ mod tests {
         use crate::quantized::{W4A8_SMALL_M_ROWS, W4a8Gemm, W4a8SplitK};
         use crate::tape::lowered::GenClass::M5Wide;
         use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
-        use W4a8SplitK::{Ways4, Ways8};
+        use W4a8SplitK::Ways8;
         let p = tp();
         let (dtype, scale) = (dequant_dtype_for(&p), scale_dtype_for(&p));
         let gemm = |n, k, group_size| {
@@ -13121,22 +13126,29 @@ mod tests {
                 "{case}"
             );
         }
-        let tape = lower(16);
-        assert!(
-            !(tape.commands.iter()).any(|c| c.command.kernel == Quant),
-            "bucket 16: no W4A8"
-        );
-        // The 8-row bucket: the small-M pre-pass is gated, the norm is not, so it stays.
-        let tape = lower(8);
-        let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.command.kernel).collect();
-        assert_eq!(kinds[0], RmsNorm, "{kinds:?}");
-        assert_eq!(kinds[1], Quant, "{kinds:?}");
-        let p = tp();
-        assert_eq!(
-            tape.commands[0].command.function,
-            rmsnorm_kernel_static_name(&p, scale_dtype_for(&p)),
-            "{kinds:?}"
-        );
+        // The 16- and 8-row buckets: each's small-M pre-pass (`OnlyIfSmallMTokens`) folds into
+        // the ungated norm, which writes the small-M tile's 16-row scratch on every step.
+        for bucket_m in [16, 8] {
+            let tape = lower(bucket_m);
+            let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.command.kernel).collect();
+            let case = format!("bucket {bucket_m}: {kinds:?}");
+            assert_eq!(kinds[0], RmsNorm, "{case}");
+            assert_ne!(kinds[1], Quant, "{case}");
+            let c = &tape.commands[0];
+            let p = tp();
+            assert_eq!(
+                c.command.function,
+                quantizing_symbol(rmsnorm_kernel_static_name(&p, scale_dtype_for(&p)))
+                    .expect("a twin"),
+                "{case}"
+            );
+            assert_eq!(c.gate, None, "{case}: the norm runs on every step");
+            assert!(
+                (c.command.constants.iter())
+                    .any(|v| *v == ConstantValue::uint(6, W4A8_SMALL_M_ROWS)),
+                "{case}: the small-M tile's scratch rows"
+            );
+        }
     }
 
     /// W4A8 matmuls of one activation in a row share its pre-pass, whatever their widths: the
