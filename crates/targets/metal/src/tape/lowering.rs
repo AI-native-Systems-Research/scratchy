@@ -12153,8 +12153,8 @@ mod tests {
         // (n, k, ways): gate/up, down, gdn z, k/v, lm_head.
         for (n, k, ways) in [
             (17408, 5120, Ways8),
-            (5120, 17408, Ways4),
-            (6144, 5120, Ways4),
+            (5120, 17408, Ways8),
+            (6144, 5120, Ways8),
             (1024, 5120, Ways8),
             (248320, 5120, Ways8),
         ] {

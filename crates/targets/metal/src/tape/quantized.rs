@@ -1002,16 +1002,15 @@ impl W4a8Gemm {
         let tiles = n / W4A8_SPLIT_K_COLS;
         let mut fits = (W4a8SplitK::ALL.into_iter())
             .filter(|s| *s >= W4A8_SMALL_M_MIN_WAYS && s.ways() <= k / 64);
-        // In the 8-row bucket (one verify lane), a row tile already at the cores' simdgroups on its
-        // own (gate/up 17408 x 5120, 544 tiles; lm_head, 7760) takes 8 ways, not 4: its tiles walk K
-        // in series, and 8 in flight hide the chunk loads 4 do not (`small_m_verify_probe_test`,
-        // 40-core M5 Max, 8 rows, µs at 4 / 8 ways: gate/up 111.4 / 109.5; down, 160 tiles, 100.8 /
-        // 108.2 keeps 4). Qwen3.8-27B + DFlash2, `scr bench serve`, 64 ShareGPT prompts, 1 request:
-        // 79.5 -> 82.0 tok/s. The 2-lane verify's 64-row bucket keeps 4 (149.2 -> 145.4 at 8).
+        // In the 8-row bucket (one verify lane), every row tile 4 ways already fill takes 8, not 4:
+        // its tiles walk K in series, and 8 in flight hide the chunk loads 4 do not. Qwen3.8-27B +
+        // DFlash2, `scr bench serve`, 64 ShareGPT prompts, 1 request: 79.5 tok/s at 4 ways, 82.0 at
+        // 8 over every such tile, 79.8 at 8 over only the tiles that fill the cores at 1 way (gate/up,
+        // lm_head). The 2-lane verify's 64-row bucket keeps 4 (149.2 -> 145.4 tok/s at 8).
         let fill = (fits.clone()).find(|s| {
             tiles * s.ways() >= W4A8_SPLIT_K_MIN_SIMDGROUPS
                 && (bucket_m > W4A8_SMALL_M_EIGHT_WAYS_ROWS
-                    || tiles < W4A8_SPLIT_K_MIN_SIMDGROUPS
+                    || tiles * W4a8SplitK::Ways4.ways() < W4A8_SPLIT_K_MIN_SIMDGROUPS
                     || s.ways() >= 8)
         });
         fill.or_else(|| fits.next_back()).map(Self::SmallM)
