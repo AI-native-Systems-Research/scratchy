@@ -2010,6 +2010,15 @@ pub enum ViewFrame {
     /// ([`StickLayout::row_blocked_df`]): core `(x, mb)`'s slice starts at row `x·MB + mb` of it,
     /// the row the flat frame's own row-wise ops hand the same core.
     FoldedRows,
+    /// ⭐ A page-gather LANDING several sticks wide: `b` stick-major `[r, c]` blocks written one
+    /// after another (each core's start at its own block, the view's own flat walk). The tensor's
+    /// ONE arrangement is the stick-major `[b·r, c]` those blocks tile — declared so, derived from
+    /// the landing's own extents at the arrangement authority; exact at one block, and at several
+    /// an arrangement no current reader distinguishes from the blocks-one-after-another truth.
+    /// ADDRESSING is not this frame's to change: the view keeps its own walk (a landing's per-core
+    /// starts are its blocks), so it derives no layout of its own and stays classified as `Own`.
+    /// A one-stick landing is the flat frame's own bytes and never carries this frame.
+    LandedBlocks,
 }
 
 #[derive(Clone, Debug)]

@@ -1933,29 +1933,37 @@ const ATTN_SHAPES: &[AttnShape] = &[
         rung: 0,
         rope_appended: true,
     },
-    // ⛔ FINDING (TP phase 1): the (4, 1) rows — granite's tp=8 per-rank shape, ONE KV head
-    // per card — are LEFT OUT: the door contract's layout leg refuses every one of them
-    // (mq 31/7/8 one-pass, the rung-0 continuation, at both head dims) with one refusal,
-    // `triton_ktir_superdsc::layout::for_node` stage "layout": "`linalg.broadcast` adds
-    // dim 1 of a rank-4 tensor — a MIDDLE axis of the flat frame with more than the stick
-    // after it. Row-major that is ROW-REPLICATION AT A STRIDE ... none states an address
-    // that advances every k rows with a stride between the copies, so this is named rather
-    // than half-addressed". The GQA broadcast at nkvh = 1 sprays the one KV head's keys
-    // across the four query heads as a middle axis, a shape the device's pointwise operand
-    // modes cannot address. The (16, 4) and (8, 2) rows all pass. BOTH executor tests run
-    // (4, 1) green, but those are EMULATOR legs: `runner.rs:162-193` hands the IRFunctions
-    // to the emulator's fused driver and never calls `for_node` or the door, so a green
-    // executor row proves the KERNEL ARITHMETIC only — the card leg is the door contract
-    // refusing here, and the card cannot lower prefill attention at one KV head. Per the
-    // plan's §5 law the fix
-    // lands in the kernel or door as its own job after review, or the floor stays above
-    // it: `min_kv_heads_per_rank` is at least 2 until then.
-    //
-    // AttnShape { geom: (4, 1, 64), mq: 31, cap: 256, rung: u32::MAX, rope_appended: true },
-    // AttnShape { geom: (4, 1, 64), mq: 7,  cap: 256, rung: u32::MAX, rope_appended: true },
-    // AttnShape { geom: (4, 1, 64), mq: 8,  cap: 256, rung: u32::MAX, rope_appended: true },
-    // AttnShape { geom: (4, 1, 64), mq: 31, cap: 256, rung: 0,        rope_appended: true },
-    //
+    // The (4, 1) rows — granite's tp=8 per-rank shape, ONE KV head per card — were a named
+    // FINDING (the GQA group spray read as a middle axis); the unit-axis fold in the door's
+    // broadcast classification landed, and they run with the rest.
+    AttnShape {
+        geom: (4, 1, 64),
+        mq: 31,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 64),
+        mq: 7,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 64),
+        mq: 8,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 64),
+        mq: 31,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
     // The same four at head dim 128 (granite-3.1-8b's per-rank shapes).
     AttnShape {
         geom: (16, 4, 128),
@@ -2013,13 +2021,34 @@ const ATTN_SHAPES: &[AttnShape] = &[
         rung: 0,
         rope_appended: true,
     },
-    // The (4, 1, 128) rows: refused by the same layout law as the (4, 1, 64) four above —
-    // see the FINDING comment there.
-    //
-    // AttnShape { geom: (4, 1, 128), mq: 96, cap: 256, rung: u32::MAX, rope_appended: true },
-    // AttnShape { geom: (4, 1, 128), mq: 7,  cap: 256, rung: u32::MAX, rope_appended: true },
-    // AttnShape { geom: (4, 1, 128), mq: 8,  cap: 256, rung: u32::MAX, rope_appended: true },
-    // AttnShape { geom: (4, 1, 128), mq: 96, cap: 256, rung: 0,        rope_appended: true },
+    AttnShape {
+        geom: (4, 1, 128),
+        mq: 96,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 128),
+        mq: 7,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 128),
+        mq: 8,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 128),
+        mq: 96,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
 ];
 
 /// The attention fixture's decode-position model: how many positions the mask says are valid

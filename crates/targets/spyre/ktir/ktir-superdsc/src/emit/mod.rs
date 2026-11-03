@@ -4054,6 +4054,28 @@ pub fn emit_sdsc(
                 let arrangement = match v.frame {
                     crate::superdsc_opspec::ViewFrame::Own
                     | crate::superdsc_opspec::ViewFrame::FoldedRows => own,
+                    // ⭐ THE LANDING'S OWN FRAME — b stick-major [r, c] blocks written one after
+                    // another (a page-gather landing): the tensor's ONE arrangement is the
+                    // stick-major [b·r, c] those blocks tile, derived from the landing's own
+                    // extents — all its elements over its stick dim's extent. Exact at one block;
+                    // at several the true bytes are the blocks one after another, which no current
+                    // reader distinguishes from this frame. ADDRESSING is unchanged (the landing's
+                    // per-core starts are its blocks); a one-stick landing never carries this
+                    // frame, and a view whose extents do not divide keeps `own`.
+                    crate::superdsc_opspec::ViewFrame::LandedBlocks => {
+                        let stick_ext = iter.extent(v.stick) as usize;
+                        let lanes = v.df.elems_per_stick() as usize;
+                        let elems = own.rows * own.cols;
+                        if stick_ext > lanes && elems.is_multiple_of(stick_ext) {
+                            crate::sdsc_abstract::StickLayout::row_blocked_df(
+                                elems / stick_ext,
+                                stick_ext,
+                                v.df,
+                            )
+                        } else {
+                            own
+                        }
+                    }
                     crate::superdsc_opspec::ViewFrame::StickColumns => {
                         own.of_stick_columns().ok_or_else(|| {
                             SuperDscError(format!(

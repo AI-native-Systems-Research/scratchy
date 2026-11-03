@@ -813,7 +813,11 @@ pub fn page_gather_blocks_opspec(
         gather_copy_cores(d, max, 1)
     })?;
     let layout = ["y", "mb", "x", "out"];
-    let arg = |is_input: bool, name: &str, device: [&'static str; 4]| -> Result<_, String> {
+    let arg = |is_input: bool,
+               name: &str,
+               device: [&'static str; 4],
+               frame: crate::superdsc_opspec::ViewFrame|
+     -> Result<_, String> {
         Ok(AnyTensorArg::R4(
             TensorArg::<4>::new(
                 is_input,
@@ -827,12 +831,26 @@ pub fn page_gather_blocks_opspec(
             )
             .map_err(|e| e.0)?
             .with_device_order(device)
-            .map_err(|e| e.0)?,
+            .map_err(|e| e.0)?
+            .with_frame(frame),
         ))
     };
+    // ⭐ THE LANDING'S OWN FRAME — several sticks wide, the landing is stick-major blocks, and the
+    // arrangement authority records the ONE stick-major [entries·rows, cols] they tile
+    // ([`ViewFrame::LandedBlocks`]), not a flat frame the bytes are not in. A one-stick landing is
+    // the flat frame's own bytes and stays [`ViewFrame::Own`]. The frame changes the DECLARATION
+    // only — the landing's per-core starts stay its blocks, as the pinned start test states.
+    let landed =
+        |cols: u32| -> crate::superdsc_opspec::ViewFrame {
+            if cols > df.elems_per_stick() {
+                crate::superdsc_opspec::ViewFrame::LandedBlocks
+            } else {
+                crate::superdsc_opspec::ViewFrame::Own
+            }
+        };
     let args = vec![
-        arg(true, src, ["out", "x", "mb", "y"])?,
-        arg(false, dst, ["x", "out", "mb", "y"])?,
+        arg(true, src, ["out", "x", "mb", "y"], crate::superdsc_opspec::ViewFrame::Own)?,
+        arg(false, dst, ["x", "out", "mb", "y"], landed(cols))?,
     ];
     let mut op = OpSpec {
         op: OpFunc::Identity,
@@ -939,7 +957,11 @@ pub fn page_gather_page_opspec(
         gather_copy_cores(d, max, 1)
     })?;
     let layout = ["mb", "y", "x", "out"];
-    let arg = |is_input: bool, name: &str, device: [&'static str; 4]| -> Result<_, String> {
+    let arg = |is_input: bool,
+               name: &str,
+               device: [&'static str; 4],
+               frame: crate::superdsc_opspec::ViewFrame|
+     -> Result<_, String> {
         Ok(AnyTensorArg::R4(
             TensorArg::<4>::new(
                 is_input,
@@ -953,12 +975,24 @@ pub fn page_gather_page_opspec(
             )
             .map_err(|e| e.0)?
             .with_device_order(device)
-            .map_err(|e| e.0)?,
+            .map_err(|e| e.0)?
+            .with_frame(frame),
         ))
     };
+    // ⭐ THE LANDING'S OWN FRAME — same law as the blocks arm above: several sticks wide, the
+    // pages' blocks land stick-major and the authority records the ONE stick-major
+    // [entries·blocks·rows, cols] they tile, not a flat frame the bytes are not in.
+    let landed =
+        |cols: u32| -> crate::superdsc_opspec::ViewFrame {
+            if cols > df.elems_per_stick() {
+                crate::superdsc_opspec::ViewFrame::LandedBlocks
+            } else {
+                crate::superdsc_opspec::ViewFrame::Own
+            }
+        };
     let args = vec![
-        arg(true, src, ["out", "x", "y", "mb"])?,
-        arg(false, dst, ["x", "out", "y", "mb"])?,
+        arg(true, src, ["out", "x", "y", "mb"], crate::superdsc_opspec::ViewFrame::Own)?,
+        arg(false, dst, ["x", "out", "y", "mb"], landed(cols))?,
     ];
     let mut op = OpSpec {
         op: OpFunc::Identity,
@@ -2177,6 +2211,8 @@ mod stick_runs_tests {
 #[cfg(test)]
 mod page_gather_blocks_tests {
     use super::*;
+    use crate::place::{PlaceId, act_name};
+    use crate::sdsc_abstract::StickLayout;
     use crate::superdsc_opspec::{EntryBase, GatherIndex, PageExtent};
 
     /// ⭐ THE REFERENCE's PROMPT-TRIP PAGE GATHER (granite-3.1-8b's prefill, `sdsc_4` / `sdsc_5`): the
@@ -2392,6 +2428,142 @@ mod page_gather_blocks_tests {
             panic!("an entry of two positions is two blocks' worth of one");
         };
         assert!(m.contains("one `mb` position"), "{m}");
+    }
+
+    /// The layout a gather emits into: the pool `t1`, the landing `t2`, the index stick `t9` —
+    /// each declared to the placement authority, as the walk's own mints do.
+    fn gathered(entries: u32, rows: u32, cols: u32) -> BundleLayout {
+        let l = BundleLayout::default();
+        let flat = || [entries * rows, cols];
+        l.synth(PlaceId::Act(1), &flat());
+        l.synth(PlaceId::Act(2), &flat());
+        l.synth(PlaceId::Act(9), &[1, 32]);
+        l
+    }
+
+    fn index() -> GatherIndex {
+        GatherIndex::of_scratch_rows(act_name(9), PageExtent::of_positions(1), EntryBase::ZERO)
+    }
+
+    /// ⭐ THE LANDING'S OWN FRAME (blocks arm) — a landing several sticks wide is stick-major
+    /// blocks, and the arrangement authority records the ONE stick-major `[b·r, c]` those blocks
+    /// tile, not the flat frame the bytes are not in. The control: the flat frame, stated for the
+    /// same tensor, is now the authority's refusal — the false declaration this landing used to
+    /// make.
+    #[test]
+    fn a_wide_blocks_landing_declares_the_stick_major_frame_of_its_blocks() {
+        let l = gathered(8, 128, 128);
+        let mut sym = 0i64;
+        assemble_page_gather_blocks(
+            "gather_o1",
+            &act_name(1),
+            &act_name(2),
+            index(),
+            PageGatherBlocks {
+                entries: 8,
+                rows: 128,
+                cols: 128,
+                dst_elems: 0,
+            },
+            &mut sym,
+            Some(&l),
+        )
+        .expect("the block gather builds");
+        assert!(
+            l.arrangements.borrow()[&act_name(2)]
+                .addr_eq(&StickLayout::row_blocked(1024, 128)),
+            "8 entries' [128, 128] blocks declared as the one stick-major [1024, 128] they tile"
+        );
+        assert!(
+            l.declare_arrangement(&act_name(2), StickLayout::flat(1, 8 * 128 * 128))
+                .is_err(),
+            "the flat frame the landing's bytes are not in conflicts with the declared one"
+        );
+    }
+
+    /// ⭐ THE LANDING'S OWN FRAME (blocks arm, ONE BLOCK) — the (4, 1, 128) case itself: one
+    /// entry's block, two sticks wide, still declared the stick-major `[r, c]` frame of its block.
+    #[test]
+    fn one_blocks_landing_two_sticks_wide_declares_its_blocks_frame() {
+        let l = gathered(1, 128, 128);
+        let mut sym = 0i64;
+        assemble_page_gather_blocks(
+            "gather_o1",
+            &act_name(1),
+            &act_name(2),
+            index(),
+            PageGatherBlocks {
+                entries: 1,
+                rows: 128,
+                cols: 128,
+                dst_elems: 0,
+            },
+            &mut sym,
+            Some(&l),
+        )
+        .expect("the one-block gather builds");
+        assert!(
+            l.arrangements.borrow()[&act_name(2)]
+                .addr_eq(&StickLayout::row_blocked(128, 128)),
+            "one entry's [128, 128] block declared as the stick-major [128, 128] it is"
+        );
+    }
+
+    /// ⭐ THE LANDING'S OWN FRAME (pages arm) — the same law through the first arm: the pages'
+    /// blocks land stick-major, declared as the ONE stick-major `[entries·blocks·rows, cols]`
+    /// they tile.
+    #[test]
+    fn a_wide_page_landing_declares_the_stick_major_frame_of_its_blocks() {
+        let l = gathered(8, 128, 128);
+        let mut sym = 0i64;
+        assemble_page_gather_page(
+            "gather_o1",
+            &act_name(1),
+            &act_name(2),
+            index(),
+            PageOfBlocks {
+                entries: 1,
+                blocks: 8,
+                rows: 128,
+                cols: 128,
+            },
+            &mut sym,
+            Some(&l),
+        )
+        .expect("the page gather builds");
+        assert!(
+            l.arrangements.borrow()[&act_name(2)]
+                .addr_eq(&StickLayout::row_blocked(1024, 128)),
+            "one page's 8 [128, 128] blocks declared as the one stick-major [1024, 128] they tile"
+        );
+    }
+
+    /// The control: a ONE-STICK landing is the flat frame's own bytes — today's declaration,
+    /// unchanged, at any batch count.
+    #[test]
+    fn a_one_stick_landing_keeps_the_flat_frame() {
+        let l = gathered(8, 128, 64);
+        let mut sym = 0i64;
+        assemble_page_gather_blocks(
+            "gather_o1",
+            &act_name(1),
+            &act_name(2),
+            index(),
+            PageGatherBlocks {
+                entries: 8,
+                rows: 128,
+                cols: 64,
+                dst_elems: 0,
+            },
+            &mut sym,
+            Some(&l),
+        )
+        .expect("the one-stick gather builds");
+        assert!(
+            l.arrangements.borrow()[&act_name(2)]
+                .addr_eq(&StickLayout::flat(1, 8 * 128 * 64)),
+            "a one-stick landing is the flat frame's own bytes, at any batch count"
+        );
     }
 }
 
