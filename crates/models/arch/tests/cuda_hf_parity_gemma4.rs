@@ -132,6 +132,19 @@ fn decode_ids() -> Vec<u32> {
     ids
 }
 
+/// The GEMV scratch of `tape` cut to `steps`: the full tape's region trimmed to the bytes the cut's
+/// own split steps write, `None` when none splits, as `CudaTape::validate` requires (#1031).
+fn cut_gemv_scratch(
+    tape: &CudaTape,
+    steps: &[CudaStep],
+) -> Option<scratchy_target_cuda::tape::ArenaSpan> {
+    let bytes = (steps.iter().filter_map(CudaStep::gemv_scratch))
+        .max()
+        .unwrap_or(0);
+    (tape.gemv_scratch.filter(|_| bytes > 0))
+        .map(|s| scratchy_target_cuda::tape::ArenaSpan { bytes, ..s })
+}
+
 /// [`CUDA_TAPES`], then each of `ms`' tapes cut just after each layer's `MoeRoute` step, its
 /// result that layer's `topk_idx` (`cuda_prefill_gemma4`'s `route_cuts`): cut `l` of `ms[i]` is
 /// tape [`pick_cut`]`(i, l)`. A `'static` list for one worker; every span stays in the same
@@ -146,6 +159,7 @@ fn with_route_cuts(ms: &[u32]) -> &'static [CudaTape] {
             .map(|(i, _)| CudaTape {
                 steps: Box::leak(tape.steps[..=i].to_vec().into_boxed_slice()),
                 result: moe.topk_idx,
+                gemv_scratch: cut_gemv_scratch(tape, &tape.steps[..=i]),
                 ..*tape
             })
             .collect();
@@ -755,6 +769,7 @@ fn hidden_and_route_cuts() -> &'static [CudaTape] {
     let cut = |last: usize, result: ArenaSpan| CudaTape {
         steps: Box::leak(tape.steps[..=last].to_vec().into_boxed_slice()),
         result,
+        gemv_scratch: cut_gemv_scratch(tape, &tape.steps[..=last]),
         ..*tape
     };
     let moe = tape.moe.expect("a MoE scratch");

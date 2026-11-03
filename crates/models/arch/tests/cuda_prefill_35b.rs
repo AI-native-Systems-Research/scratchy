@@ -58,13 +58,28 @@ use scratchy_target_cuda::tape::MoeTape;
 /// 301 decoded, against row 301 of (k)'s one 308-token forward.
 const DIAG_P: usize = 301;
 
+/// The GEMV scratch of `tape` cut to `steps`: the full tape's region trimmed to the bytes the cut's
+/// own split steps write, `None` when none splits, as `CudaTape::validate` requires (#1031).
+fn cut_gemv_scratch(
+    tape: &CudaTape,
+    steps: &[CudaStep],
+) -> Option<scratchy_target_cuda::tape::ArenaSpan> {
+    let bytes = (steps.iter().filter_map(CudaStep::gemv_scratch))
+        .max()
+        .unwrap_or(0);
+    (tape.gemv_scratch.filter(|_| bytes > 0))
+        .map(|s| scratchy_target_cuda::tape::ArenaSpan { bytes, ..s })
+}
+
 /// `tape` cut just after step `last`, its result `out`: a `'static` copy, as
 /// `cuda_narrow_diag_9b`'s (#846). Every span stays in the same arena, so it validates as the
 /// full tape does.
 fn cut(tape: &CudaTape, last: usize, out: ArenaSpan) -> CudaTape {
+    let steps = &tape.steps[..=last];
     CudaTape {
-        steps: Box::leak(tape.steps[..=last].to_vec().into_boxed_slice()),
+        steps: Box::leak(steps.to_vec().into_boxed_slice()),
         result: out,
+        gemv_scratch: cut_gemv_scratch(tape, steps),
         ..*tape
     }
 }
