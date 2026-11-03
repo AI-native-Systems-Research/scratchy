@@ -441,7 +441,7 @@ pub fn n_layer_input_distinct(n: u32) -> LoweringInput {
 ///
 /// Used by `bin/tk_emit_rmsnorm` and the
 /// `launcher_runs_on_zeros_rmsnorm_only` smoke test in
-/// [`crate::launcher`]. The fixture isolates the round protocol of one
+/// `crate::launcher`. The fixture isolates the round protocol of one
 /// op so a deadlock can be pinned to RmsNorm's specific
 /// loader/consumer/storer handshake — versus the 12-op forward, where a
 /// bug anywhere in the orchestrator hangs the whole tape.

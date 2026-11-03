@@ -12,7 +12,7 @@
 /// contains both `_f16_specialized` and `_bf16_specialized` symbols
 /// per kernel; the lowering arms in `lowering::lower_one` consult
 /// `W::METAL_DTYPE` to pick the right symbol when populating
-/// [`LoweredCommand::function`].
+/// `LoweredCommand::function`.
 ///
 /// Llama-3.x ships bf16 on disk, and Apple Silicon (M3+) has hardware
 /// bf16 MMA. Casting

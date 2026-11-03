@@ -95,7 +95,7 @@ pub struct EngineCore {
     /// The executor runs a speculative step scheduled behind one still in flight
     /// ([`Executor::pipelines_speculative_steps`]), as read when it was taken.
     pipelines_speculative: bool,
-    /// Steps scheduled leading ([`SpecPipeline::leads`]) and not yet finalized or abandoned.
+    /// Steps scheduled leading (`SpecPipeline::leads`) and not yet finalized or abandoned.
     leading: usize,
 }
 
@@ -633,7 +633,7 @@ impl EngineCore {
         Some(sched)
     }
 
-    /// Where `sched` stands in the speculative pipeline ([`SpecPipeline`]): behind, when it verifies
+    /// Where `sched` stands in the speculative pipeline (`SpecPipeline`): behind, when it verifies
     /// drafts of a step still unfinalized — its request holds that step's output placeholders
     /// beside its own; leading, when the executor pipelines and `sched` is one request that
     /// verifies drafts and drafts again, with nothing waiting: its next step's drafts are then

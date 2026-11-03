@@ -18,9 +18,9 @@
 //! the GPU: `q_proj` split into N-blocks where each block writes a slice
 //! of Q, then rope → attention reads the *whole* Q assembled from those
 //! slices. The v1 whole-output `Operand::Sub` model couldn't express
-//! that — and is gone (it lives only in [`legacy`] for the few v1-only
-//! carcasses that have not been deleted yet: [`crate::tape`],
-//! [`crate::scheduler`], [`crate::lower::lower`] which are slated for
+//! that — and is gone (it lives only in `legacy` for the few v1-only
+//! carcasses that have not been deleted yet: `crate::tape`,
+//! `crate::scheduler`, `crate::lower::lower` which are slated for
 //! deletion in later staged commits).
 //!
 //! ## Two-tier validation
@@ -1152,7 +1152,7 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     ///
     /// The target extents are a function of the TOKEN COUNT:
     /// `out_rows = m · rows_mult / rows_div`, `out_cols = cols` — the same
-    /// fact [`crate::lower::LoweredOp::Reshape`] carries, threaded here so
+    /// fact `crate::lower::LoweredOp::Reshape` carries, threaded here so
     /// the node's regions can state the TRUE re-laid extents (a per-head
     /// view `[m, heads·hd] → [m·heads, hd]` MULTIPLIES rows; the vision
     /// patch merger DIVIDES). Without it the node understates the output by
@@ -2319,7 +2319,7 @@ pub fn chain_l_sentinel_ramp(hidden: u32) -> Vec<u32> {
 /// ⭐⭐⭐ THE S SEED AT THE LAUNCH'S OWN WIDTH — `[rows, CHAIN_IDX_BLOCK]` u32 words,
 /// row `r` carrying ITS OWN token's pattern (`chain_s_stick_pattern` of
 /// `toks[r.min(n-1)] >> 6`): the seed a batched decode's every row gathers with,
-/// and the same bytes the device's own [`ChainStage`]-table gathers write for the
+/// and the same bytes the device's own `ChainStage`-table gathers write for the
 /// same picks — which is what keeps a host seed idempotent with the device's
 /// writes at every width.
 ///

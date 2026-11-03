@@ -5,27 +5,27 @@
 //! row of a sequence verifying drafts — so on a multi-row step the result matmul (the vocabulary
 //! projection) need only compute those rows, and its output need only hold them: the construct
 //! leaves their logits at the front of its output, in order (Python vLLM's `logits_indices`). A
-//! target that compacts them declares for which weights ([`SampleRowsFacts`]); this pass wraps
+//! target that compacts them declares for which weights ([`SampleRowsFacts`](crate::sample_rows::SampleRowsFacts)); this pass wraps
 //! each such result matmul of a multi-row canonical in one construct (one expansion, no guard):
 //!
-//! 1. [`SubOp::SampleRowsGather`] moves the sampled rows to the front of the activation, in place,
+//! 1. [`SubOp::SampleRowsGather`](crate::subtile_ir::SubOp::SampleRowsGather) moves the sampled rows to the front of the activation, in place,
 //!    and the matmul reads them;
 //! 2. the matmul, of the sampled rows;
-//! 3. [`SubOp::SampleRowsScatter`], in place over the matmul's output: what the target runs after
+//! 3. [`SubOp::SampleRowsScatter`](crate::subtile_ir::SubOp::SampleRowsScatter), in place over the matmul's output: what the target runs after
 //!    it — the gathered activation put back, or, where the matmul ran over every row, the sampled
 //!    rows' logits moved to the front;
-//! 4. [`SubOp::AllRowsMatmul`], the matmul over every row taking over that output — what a step
+//! 4. [`SubOp::AllRowsMatmul`](crate::subtile_ir::SubOp::AllRowsMatmul), the matmul over every row taking over that output — what a step
 //!    that samples every row runs instead of 1–3 (its rows are its sampled rows, in order), and
 //!    never on a step 1–3 run on.
 //!
 //! Whether a bake point slices at all, and on which steps each part runs, is the target's
 //! lowering: the tape states the dataflow, and a part that does not run leaves the buffer it would
 //! rewrite in place as it was. A canonical of one row per sequence is left as it is, and so is one
-//! whose caller reads every row of its result ([`ResultRows::Every`]: an encoder's hidden state); a
+//! whose caller reads every row of its result ([`ResultRows::Every`](crate::sample_rows::ResultRows::Every): an encoder's hidden state); a
 //! multi-row one the construct cannot wrap is refused, since its caller reads the front rows. A
 //! target that samples no rows never calls this.
 //!
-//! The result may be the matmul's logit tail instead ([`logit_tail`]): the construct then
+//! The result may be the matmul's logit tail instead (`logit_tail`): the construct then
 //! takes the matmul's place under it, and the tail reads the construct's end, as it read the
 //! matmul — the sampled rows' logits, at the front.
 

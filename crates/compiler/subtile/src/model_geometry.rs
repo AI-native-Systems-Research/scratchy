@@ -21,10 +21,10 @@
 //! list of models, no list of geometry triples and no list of head dims in any source file.
 //!
 //! THE TWO HALVES:
-//! * [`ModelAttnGeometry`] is the VALUE side — the geometry as the tape carries it, minted once
+//! * [`ModelAttnGeometry`](crate::model_geometry::ModelAttnGeometry) is the VALUE side — the geometry as the tape carries it, minted once
 //!   from the config numbers with the GQA divisibility proven at the mint, so no consumer
 //!   downstream re-derives or re-checks a group size.
-//! * [`with_config_head_dim`] is the DOOR — the only place a head dim becomes a const, with the
+//! * [`with_config_head_dim`](crate::model_geometry::with_config_head_dim) is the DOOR — the only place a head dim becomes a const, with the
 //!   arms the build script generated. Same shape as `sdsc_abstract::with_baked_rung`, which is the
 //!   decode ladder's door. The door and the value side compile on every target.
 

@@ -483,10 +483,10 @@ pub struct Request {
     /// Two things depend on it, and both are wrong-output bugs when it is missing on a backend that
     /// needs it:
     ///
-    /// * blocks are allocated for [`KvExtent::span`] rather than the token count, because a pool whose
+    /// * blocks are allocated for `KvExtent::span` rather than the token count, because a pool whose
     ///   batched write appends every row at ONE slot per step spreads a short request's keys over MORE
     ///   slots than it has tokens;
-    /// * only [`KvExtent::cacheable_tokens`] may be hashed into the prefix cache, because past that
+    /// * only `KvExtent::cacheable_tokens` may be hashed into the prefix cache, because past that
     ///   request's first hole token `t` no longer lives at slot `t`, and a block hashed over it would
     ///   hand a later request the keys of the wrong tokens.
     ///

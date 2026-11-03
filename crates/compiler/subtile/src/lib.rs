@@ -5,7 +5,7 @@
 //! unit-testable on any host — the host-first correctness path runs
 //! here. The proc-macro crate `scratchy-forward-compiler-macro` depends on this
 //! crate and, at expansion time, walks its (internal) solved FUF and
-//! calls the lowering here to build a [`subtile::SubtileGraph`], then
+//! calls the lowering here to build a `subtile::SubtileGraph`, then
 //! emits GPU tape players. This mirrors how `scratchy-forward-compiler-macro`
 //! already runs its own FUF (fusion-synthesis) logic; the subtile IR and
 //! `Fuf`/`Assignment` can't live in the

@@ -280,7 +280,7 @@ pub trait WeightAccessors {
 pub enum Instruction {
     Embed(u32),
     /// `RmsNorm(in_slot, out_slot, layer, hidden_size, m_multiplier)`.
-    /// Weight accessor lives at the tape level — see [`Tape`].
+    /// Weight accessor lives at the tape level — see `Tape`.
     ///
     /// `hidden_size` is the row width the kernel reduces over;
     /// `m_multiplier` is the number of normalization rows per input

@@ -8,7 +8,7 @@
 //! Per-arch concerns (HF arch class, qk-permute, tensor renames,
 //! arch-specific metadata reads) live in each arch's
 //! `configs/quantizations.json` `ggml` entry. The `scratchy-forward-compiler`
-//! macro forwards each field straight into the [`register!`] call it
+//! macro forwards each field straight into the `register!` call it
 //! emits. There are NO per-arch arms in this crate — every per-arch
 //! difference is a static-data record looked up by GGUF arch tag.
 

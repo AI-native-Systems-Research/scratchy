@@ -96,9 +96,9 @@ impl BundleTensor {
 }
 
 /// Kind of weight a tape position consumes. The variant of
-/// the carrying [`Instruction`] determines the *count* and *kind
+/// the carrying `Instruction` determines the *count* and *kind
 /// list*; what the proc-macro records per-instance is the per-arch
-/// base name(s) so the per-arch [`WeightAccessors`] impl can emit
+/// base name(s) so the per-arch `WeightAccessors` impl can emit
 /// the right match arm.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WeightKind {
@@ -230,7 +230,7 @@ impl SlotMap {
 /// parallel to [`LoweringInput::sources`]. The bridge anonymizes sources
 /// to bare shapes; this manifest is how the Tier-B host executor (and
 /// later the GPU tape player) maps `SourceId(i)` back to a concrete
-/// buffer. `Weight` carries the raw [`crate::classified::WeightId`] +
+/// buffer. `Weight` carries the raw `crate::classified::WeightId` +
 /// unrolled index (resolve to a tensor name via the same `Program`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceBinding {

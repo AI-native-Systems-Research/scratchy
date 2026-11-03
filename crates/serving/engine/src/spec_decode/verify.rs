@@ -28,8 +28,8 @@ pub struct RejectionResult {
 /// matching drafts and return the accepted tokens.
 ///
 /// Layout:
-/// - `target_ids[0]` = argmax at the real token position (verifies draft[0])
-/// - `target_ids[i]` = argmax at draft[i-1] position (verifies draft[i])
+/// - `target_ids[0]` = argmax at the real token position (verifies `draft[0]`)
+/// - `target_ids[i]` = argmax at `draft[i-1]` position (verifies `draft[i]`)
 /// - `target_ids[K]` = bonus token (only used if all K drafts accepted)
 pub fn greedy_rejection_sample(target_ids: &[u32], draft_token_ids: &[u32]) -> RejectionResult {
     if draft_token_ids.is_empty() {

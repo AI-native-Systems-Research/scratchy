@@ -46,7 +46,7 @@ pub struct NewRequestData {
     /// Only present on the first scheduling of a request with images.
     pub mm_data: Option<MultimodalData>,
 
-    /// Sparse map of block index → [`BlockKind`] for span-aware hashing/RoPE.
+    /// Sparse map of block index → `BlockKind` for span-aware hashing/RoPE.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub block_annotations: Option<scratchy_core_common::BlockAnnotations>,
 

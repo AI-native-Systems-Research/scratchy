@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! THE TAPE COLOURER — which arena buffer each tape step's output lives in.
 //!
-//! The tape mints a fresh SSA [`SlotId`] per `Compute`. A target realises those slots in an arena
+//! The tape mints a fresh SSA [`SlotId`](crate::subtile_tape::SlotId) per `Compute`. A target realises those slots in an arena
 //! of COLOURS, and two slots may share a colour only if their live ranges are disjoint. A target's
 //! kernels add constraints the tape cannot express: a kernel that writes over an operand needs that
 //! operand's colour, a fused command writes where the step it absorbed lived, and the embedded
-//! hidden IS colour 0. Those are target facts, handed in as a [`ColourFacts`] table and a
-//! [`FoldFacts`] record. The linear scan that honours them is the same for every target.
+//! hidden IS colour 0. Those are target facts, handed in as a [`ColourFacts`](crate::tape_colouring::ColourFacts) table and a
+//! [`FoldFacts`](crate::tape_colouring::FoldFacts) record. The linear scan that honours them is the same for every target.
 //!
 //! The rules:
 //! - order = tape order, and a step's position is its level: a buffer whose last reader is at

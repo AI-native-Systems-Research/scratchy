@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Device-runtime multimodal forward surface: the [`PixelInput`]
 //! interior shape, the [`EmbedPatch`] embed-splice descriptor, and the
-//! [`MultimodalForward`] trait the executor calls at request time.
+//! `MultimodalForward` trait the executor calls at request time.
 //!
 //! These names are referenced by the cross-arch MM registry
-//! (`ScratchyMmRegistration` / `try_load_mm` in [`crate::arch_registry`]),
+//! (`ScratchyMmRegistration` / `try_load_mm` in `crate::arch_registry`),
 //! so they live in the cfg-free compiler alongside it. The trait stays
 //! backend-neutral by taking the live device as a
 //! [`scratchy_tensors::ForwardDeviceHandle`] (the per-arch
