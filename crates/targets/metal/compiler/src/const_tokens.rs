@@ -48,10 +48,10 @@ pub(crate) fn alias_preamble() -> TokenStream {
 fn module_of(ty: &str) -> Result<TokenStream, Error> {
     let m = match ty {
         "KernelId" | "Binding" | "DispatchShape" | "MScaling" | "MScaleAxis" | "RuntimeGate"
-        | "LoweredCommand" | "GatedCommand" | "GemmDims" | "WeightTensor"
-        | "RuntimeBindingKind" | "ActivationWidth" | "LoweredMetalTape" | "ClassedTape"
-        | "GenClass" | "KvAddressing" | "TapeLoop" | "TapeCommands" | "Fence" | "SetAxis"
-        | "LogitsRows" | "RowTile" | "DecodePartials" | "SplitSteps" => {
+        | "LoweredCommand" | "GatedCommand" | "PackedCommand" | "CommandTable" | "GemmDims"
+        | "WeightTensor" | "RuntimeBindingKind" | "ActivationWidth" | "LoweredMetalTape"
+        | "ClassedTape" | "GenClass" | "KvAddressing" | "TapeLoop" | "TapeCommands" | "Fence"
+        | "SetAxis" | "LogitsRows" | "RowTile" | "DecodePartials" | "SplitSteps" => {
             quote!(__tl)
         }
         "ConstantValue" | "ConstantType" | "ConstSlot" => {
@@ -61,7 +61,7 @@ fn module_of(ty: &str) -> Result<TokenStream, Error> {
         | "LogicalBlockIdx" | "SlotInBlock" | "SeqIdx" | "QTokenIdx" | "NumTokens"
         | "BindingIdx" | "HeadDim" | "NumQHeads" | "NumKvHeads" | "RotDim" | "RopePairOff"
         | "BlockSize" | "BlocksPerChunk" | "MaxBlocksPerSeq" | "TqDecodeHeads" | "CommandIx"
-        | "QSize" | "IntermediateSize" | "HiddenSize" | "KDim" | "NDim" | "SplitK"
+        | "PartIx" | "QSize" | "IntermediateSize" | "HiddenSize" | "KDim" | "NDim" | "SplitK"
         | "AttnDebugMode" | "AttnWindow" | "KDimI32" | "NDimI32" | "MDimI32"
         | "KPartitionSizeI32" | "AttnScale" | "RmsNormEps" => {
             quote!(__ti)
@@ -70,6 +70,12 @@ fn module_of(ty: &str) -> Result<TokenStream, Error> {
     };
     Ok(m)
 }
+
+/// The tape types held only behind a `&'static` (a [`TapeCommands`]' table): a value of one is
+/// emitted as a reference to its literal, which `const` promotion makes `'static`.
+///
+/// [`TapeCommands`]: scratchy_target_metal::tape::lowered::TapeCommands
+const HELD_BY_REFERENCE: &[&str] = &["CommandTable"];
 
 /// Emit the const-constructor tokens for `value`.
 pub fn const_tokens<T: Serialize>(value: &T) -> Result<TokenStream, Error> {
@@ -228,7 +234,8 @@ impl ser::Serializer for Emitter {
     fn serialize_struct(self, name: &'static str, _len: usize) -> Result<StructEmit, Error> {
         let m = module_of(name)?;
         let ty = format_ident!("{name}");
-        Ok(StructEmit(quote!(#m::#ty), Vec::new()))
+        let by_reference = HELD_BY_REFERENCE.contains(&name);
+        Ok(StructEmit(quote!(#m::#ty), Vec::new(), by_reference))
     }
     fn serialize_struct_variant(
         self,
@@ -301,7 +308,7 @@ impl ser::SerializeTupleVariant for TupleVariantEmit {
     }
 }
 
-pub struct StructEmit(TokenStream, Vec<(proc_macro2::Ident, TokenStream)>);
+pub struct StructEmit(TokenStream, Vec<(proc_macro2::Ident, TokenStream)>, bool);
 impl ser::SerializeStruct for StructEmit {
     type Ok = TokenStream;
     type Error = Error;
@@ -314,9 +321,14 @@ impl ser::SerializeStruct for StructEmit {
         Ok(())
     }
     fn end(self) -> Result<TokenStream, Error> {
-        let (path, fields) = (self.0, self.1);
+        let (path, fields, by_reference) = (self.0, self.1, self.2);
         let (names, vals): (Vec<_>, Vec<_>) = fields.into_iter().unzip();
-        Ok(quote!(#path { #(#names: #vals),* }))
+        let literal = quote!(#path { #(#names: #vals),* });
+        Ok(if by_reference {
+            quote!(&#literal)
+        } else {
+            literal
+        })
     }
 }
 

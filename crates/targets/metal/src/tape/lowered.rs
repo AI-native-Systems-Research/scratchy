@@ -16,7 +16,7 @@
 
 use crate::tape::constants::ConstantValue;
 use crate::tape::ids::{
-    BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, SourceIx, TqDecodeHeads,
+    BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, PartIx, SourceIx, TqDecodeHeads,
 };
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
@@ -1423,19 +1423,194 @@ pub enum Fence {
     Coherent,
 }
 
+/// One distinct command of a [`CommandTable`], its bulky fields as positions in the table's part
+/// arrays: a model's thousands of distinct commands are combinations of a few hundred constant
+/// sets, dispatch shapes and binding lists and a few dozen kernel symbols, each held once.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize)]
+pub struct PackedCommand {
+    pub kernel: KernelId,
+    /// `(library, function)` in [`CommandTable::symbols`].
+    pub symbol: PartIx,
+    pub constants: PartIx,
+    pub dispatch: PartIx,
+    pub bindings: PartIx,
+    pub gemm_dims: PartIx,
+    pub gate: PartIx,
+}
+
+// A distinct command costs its table fourteen bytes, where the [`GatedCommand`] it packs is 144.
+const _: [(); 14] = [(); std::mem::size_of::<PackedCommand>()];
+
+/// Each distinct command of a model's baked tapes once ([`PackedCommand`]), beside each distinct
+/// value of its bulky fields once. A tape lists [`CommandIx`]es into it ([`TapeCommands`]).
+#[derive(Clone, Copy, serde::Serialize)]
+pub struct CommandTable {
+    pub commands: &'static [PackedCommand],
+    pub symbols: &'static [(&'static str, &'static str)],
+    pub constants: &'static [&'static [ConstantValue]],
+    pub dispatches: &'static [DispatchShape],
+    pub bindings: &'static [&'static [Binding]],
+    pub gemm_dims: &'static [Option<GemmDims>],
+    pub gates: &'static [Option<RuntimeGate>],
+}
+
+impl CommandTable {
+    /// No commands.
+    pub const EMPTY: Self = Self {
+        commands: &[],
+        symbols: &[],
+        constants: &[],
+        dispatches: &[],
+        bindings: &[],
+        gemm_dims: &[],
+        gates: &[],
+    };
+
+    /// The command at `ix`, its fields read out of the part arrays.
+    pub fn get(&self, ix: CommandIx) -> GatedCommand {
+        let p = self.commands[ix.get()];
+        let (library, function) = self.symbols[p.symbol.get()];
+        GatedCommand {
+            command: LoweredCommand {
+                kernel: p.kernel,
+                library,
+                function,
+                constants: self.constants[p.constants.get()],
+                dispatch: self.dispatches[p.dispatch.get()],
+                bindings: self.bindings[p.bindings.get()],
+                gemm_dims: self.gemm_dims[p.gemm_dims.get()],
+            },
+            gate: self.gates[p.gate.get()],
+        }
+    }
+}
+
+/// Each distinct value of one command field, in first-seen order.
+struct Parts<T> {
+    at: std::collections::HashMap<T, PartIx>,
+    values: Vec<T>,
+}
+
+impl<T> Default for Parts<T> {
+    fn default() -> Self {
+        Self {
+            at: Default::default(),
+            values: Vec::new(),
+        }
+    }
+}
+
+impl<T: std::hash::Hash + Eq + Copy> Parts<T> {
+    fn intern(&mut self, value: T) -> Option<PartIx> {
+        if let Some(&ix) = self.at.get(&value) {
+            return Some(ix);
+        }
+        let ix = PartIx::of(self.values.len())?;
+        self.values.push(value);
+        self.at.insert(value, ix);
+        Some(ix)
+    }
+}
+
+/// A [`CommandTable`] being filled: each distinct command interned once, its fields into the part
+/// arrays. The one place a table is built, for a tape lowered at run time ([`baked_commands`]) and
+/// for a model's baked tapes alike.
+#[derive(Default)]
+pub struct CommandTableBuilder {
+    at: std::collections::HashMap<GatedCommand, CommandIx>,
+    commands: Vec<PackedCommand>,
+    symbols: Parts<(&'static str, &'static str)>,
+    constants: Parts<&'static [ConstantValue]>,
+    dispatches: Parts<DispatchShape>,
+    bindings: Parts<&'static [Binding]>,
+    gemm_dims: Parts<Option<GemmDims>>,
+    gates: Parts<Option<RuntimeGate>>,
+}
+
+/// A [`CommandTableBuilder`]'s table, its arrays owned.
+pub struct CommandTableParts {
+    pub commands: Vec<PackedCommand>,
+    pub symbols: Vec<(&'static str, &'static str)>,
+    pub constants: Vec<&'static [ConstantValue]>,
+    pub dispatches: Vec<DispatchShape>,
+    pub bindings: Vec<&'static [Binding]>,
+    pub gemm_dims: Vec<Option<GemmDims>>,
+    pub gates: Vec<Option<RuntimeGate>>,
+}
+
+impl CommandTableBuilder {
+    /// The position of `cmd` in the table, interned on first sight.
+    pub fn intern(&mut self, cmd: GatedCommand) -> Result<CommandIx, TooManyCommands> {
+        if let Some(&ix) = self.at.get(&cmd) {
+            return Ok(ix);
+        }
+        let too_many = TooManyCommands {
+            distinct: self.commands.len() + 1,
+        };
+        let ix = CommandIx::of(self.commands.len()).ok_or(too_many)?;
+        let GatedCommand { command: c, gate } = cmd;
+        let packed = PackedCommand {
+            kernel: c.kernel,
+            symbol: self
+                .symbols
+                .intern((c.library, c.function))
+                .ok_or(too_many)?,
+            constants: self.constants.intern(c.constants).ok_or(too_many)?,
+            dispatch: self.dispatches.intern(c.dispatch).ok_or(too_many)?,
+            bindings: self.bindings.intern(c.bindings).ok_or(too_many)?,
+            gemm_dims: self.gemm_dims.intern(c.gemm_dims).ok_or(too_many)?,
+            gate: self.gates.intern(gate).ok_or(too_many)?,
+        };
+        self.commands.push(packed);
+        self.at.insert(cmd, ix);
+        Ok(ix)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
+    pub fn finish(self) -> CommandTableParts {
+        CommandTableParts {
+            commands: self.commands,
+            symbols: self.symbols.values,
+            constants: self.constants.values,
+            dispatches: self.dispatches.values,
+            bindings: self.bindings.values,
+            gemm_dims: self.gemm_dims.values,
+            gates: self.gates.values,
+        }
+    }
+}
+
+impl CommandTableParts {
+    /// The table, leaked for the life of the process (a tape lowered at run time).
+    pub fn leak(self) -> &'static CommandTable {
+        Box::leak(Box::new(CommandTable {
+            commands: baked(self.commands),
+            symbols: baked(self.symbols),
+            constants: baked(self.constants),
+            dispatches: baked(self.dispatches),
+            bindings: baked(self.bindings),
+            gemm_dims: baked(self.gemm_dims),
+            gates: baked(self.gates),
+        }))
+    }
+}
+
 /// A tape's commands: positions in a command table. The tapes a model bakes share one table
 /// (each distinct command once), so a command every rung runs is stored once and each rung pays
 /// two bytes for it. Compared and hashed by the commands it lists, whatever table holds them.
 #[derive(Clone, Copy, serde::Serialize)]
 pub struct TapeCommands {
-    pub table: &'static [GatedCommand],
+    pub table: &'static CommandTable,
     pub ixs: &'static [CommandIx],
 }
 
 impl TapeCommands {
     /// No commands.
     pub const EMPTY: Self = Self {
-        table: &[],
+        table: &CommandTable::EMPTY,
         ixs: &[],
     };
 
@@ -1447,24 +1622,22 @@ impl TapeCommands {
         self.ixs.is_empty()
     }
 
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'static GatedCommand> + Clone + use<> {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = GatedCommand> + Clone + use<> {
         let table = self.table;
-        self.ixs.iter().map(move |ix| &table[ix.get()])
+        self.ixs.iter().map(move |&ix| table.get(ix))
     }
 
-    pub fn first(&self) -> Option<&'static GatedCommand> {
+    /// The command at `position` of the tape.
+    pub fn get(&self, position: usize) -> GatedCommand {
+        self.table.get(self.ixs[position])
+    }
+
+    pub fn first(&self) -> Option<GatedCommand> {
         self.iter().next()
     }
 
-    pub fn last(&self) -> Option<&'static GatedCommand> {
+    pub fn last(&self) -> Option<GatedCommand> {
         self.iter().last()
-    }
-}
-
-impl std::ops::Index<usize> for TapeCommands {
-    type Output = GatedCommand;
-    fn index(&self, position: usize) -> &GatedCommand {
-        &self.table[self.ixs[position].get()]
     }
 }
 
@@ -1491,19 +1664,11 @@ pub struct TooManyCommands {
 
 /// `v` as a tape holds it: each distinct command once in the table, the list as positions in it.
 pub fn baked_commands(v: Vec<GatedCommand>) -> Result<TapeCommands, TooManyCommands> {
-    let mut table: Vec<GatedCommand> = Vec::new();
-    let mut at = std::collections::HashMap::new();
-    let ixs = (v.iter()).map(|c| {
-        let next = table.len();
-        let position = *at.entry(*c).or_insert_with(|| {
-            table.push(*c);
-            next
-        });
-        CommandIx::of(position).ok_or(TooManyCommands { distinct: next + 1 })
-    });
+    let mut table = CommandTableBuilder::default();
+    let ixs = (v.into_iter()).map(|c| table.intern(c));
     let ixs = baked(ixs.collect::<Result<_, _>>()?);
     Ok(TapeCommands {
-        table: baked(table),
+        table: table.finish().leak(),
         ixs,
     })
 }
@@ -1985,7 +2150,7 @@ impl LoweredMetalTape {
         let mut out = Vec::with_capacity(self.commands.len());
         let cmds = self.commands;
         Self::walk(self.loops, 0..cmds.len(), 0, &mut |pos, off| {
-            out.push(cmds[pos].with_layer_bumped(off))
+            out.push(cmds.get(pos).with_layer_bumped(off))
         });
         out
     }
