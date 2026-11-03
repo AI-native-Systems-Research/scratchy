@@ -999,7 +999,14 @@ impl W4a8Gemm {
         let tiles = n / W4A8_SPLIT_K_COLS;
         let mut fits = (W4a8SplitK::ALL.into_iter())
             .filter(|s| *s >= W4A8_SMALL_M_MIN_WAYS && s.ways() <= k / 64);
-        let fill = (fits.clone()).find(|s| tiles * s.ways() >= W4A8_SPLIT_K_MIN_SIMDGROUPS);
+        // A long-K row tile already at the cores' simdgroups still takes 8 ways: its tiles walk K
+        // in series, and 8 in flight hide the chunk loads 4 do not (`small_m_verify_probe_test`,
+        // 40-core M5 Max, µs at 4 / 8 ways, 8 rows: gate/up 17408 x 5120 111.4 / 109.5,
+        // 16 rows 108.5 / 103.4).
+        let fill = (fits.clone()).find(|s| {
+            tiles * s.ways() >= W4A8_SPLIT_K_MIN_SIMDGROUPS
+                && (tiles < W4A8_SPLIT_K_MIN_SIMDGROUPS || s.ways() >= 8)
+        });
         fill.or_else(|| fits.next_back()).map(Self::SmallM)
     }
 
