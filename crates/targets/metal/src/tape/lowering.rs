@@ -305,7 +305,15 @@ fn sample_rows(
         (Some(a), R::Matmul) => {
             let x = Some(SetAxis::SampledRows(crate::tape::lowered::MScaleAxis::X));
             let ix = w.of(WeightKind::Linear, 0)?;
-            let codes = codes_for(p, profile, class, half_planes, a.bits.get(), a.k.get(), a.group_size.get());
+            let codes = codes_for(
+                p,
+                profile,
+                class,
+                half_planes,
+                a.bits.get(),
+                a.k.get(),
+                a.group_size.get(),
+            );
             let qmv = affine_qmv_command(
                 p,
                 &a,
@@ -2066,7 +2074,8 @@ fn lower(
                     &mut decode_partials,
                     i,
                 )?;
-                let (cmds, rows) = sample_rows(p, step, cmds, bucket_m, w, profile, class, half_planes)?;
+                let (cmds, rows) =
+                    sample_rows(p, step, cmds, bucket_m, w, profile, class, half_planes)?;
                 logits_rows = writes_logits(logits_rows, rows);
                 // Past the sampled rows, a command over their logits other than the logit tail's
                 // (a fold the tail joined) runs over the step's every row: the buffer holds them.
@@ -3443,7 +3452,15 @@ fn lower_one(
                 // single-stream M1 Max (the sweep's per-CB overhead
                 // biased it toward generic).
                 let layer = super::ids::LayerId(*layer + layer_offset);
-                let codes = codes_for(p, profile, gen_class, half_planes, g.bits.get(), g.k.get(), g.group_size.get());
+                let codes = codes_for(
+                    p,
+                    profile,
+                    gen_class,
+                    half_planes,
+                    g.bits.get(),
+                    g.k.get(),
+                    g.group_size.get(),
+                );
                 // MLX gates affine qmv_wide on arch gen >= 15 (quantized.cpp:537-539) —
                 // M3 and later (M4 is gen 16, M5 is gen 17). `affine_qmv_wide_ok` mirrors
                 // that boundary; M1/M2 keep the fold twin.
@@ -3650,7 +3667,15 @@ fn lower_one(
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
                                 m: super::ids::MDimI32(bucket_m as i32),
-                                codes: codes_for(p, profile, gen_class, half_planes, bits_v, k_v, gs),
+                                codes: codes_for(
+                                    p,
+                                    profile,
+                                    gen_class,
+                                    half_planes,
+                                    bits_v,
+                                    k_v,
+                                    gs,
+                                ),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -3690,7 +3715,15 @@ fn lower_one(
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
                                 m: super::ids::MDimI32(bucket_m as i32),
-                                codes: codes_for(p, profile, gen_class, half_planes, bits_v, k_v, gs),
+                                codes: codes_for(
+                                    p,
+                                    profile,
+                                    gen_class,
+                                    half_planes,
+                                    bits_v,
+                                    k_v,
+                                    gs,
+                                ),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -3757,7 +3790,15 @@ fn lower_one(
                                 k_partition_size: super::ids::KPartitionSizeI32(
                                     k_partition_size as i32,
                                 ),
-                                codes: codes_for(p, profile, gen_class, half_planes, bits_v, k_v, gs),
+                                codes: codes_for(
+                                    p,
+                                    profile,
+                                    gen_class,
+                                    half_planes,
+                                    bits_v,
+                                    k_v,
+                                    gs,
+                                ),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {

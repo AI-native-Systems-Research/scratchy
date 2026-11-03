@@ -218,7 +218,10 @@ unsafe fn store_codes(ptr: *mut u8, len: usize, how: StoredCodes) {
 fn codes_to_planes(rows: &[u8], k: usize) -> Vec<u8> {
     use crate::tape::kernel_constants::AFFINE_PLANE_ROW_BYTES as P;
     let row = k / 2;
-    assert!(k.is_multiple_of(64) && rows.len().is_multiple_of(row), "whole 64-input chunks");
+    assert!(
+        k.is_multiple_of(64) && rows.len().is_multiple_of(row),
+        "whole 64-input chunks"
+    );
     let (n, chunks) = (rows.len() / row, k / 64);
     let mut out = vec![0u8; rows.len()];
     for r in 0..n {
@@ -870,7 +873,10 @@ impl MetalAllocator {
     pub fn settle_affine_codes(&self, ptrs: &[*const u8]) {
         let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
         for r in mmaps.iter() {
-            let (lo, hi) = (r.aligned_base as usize, r.aligned_base as usize + r.aligned_capacity);
+            let (lo, hi) = (
+                r.aligned_base as usize,
+                r.aligned_base as usize + r.aligned_capacity,
+            );
             let held = |p: &*const u8| {
                 let src = *p as usize;
                 (lo..hi).contains(&src) || (r.base as usize..r.base as usize + r.len).contains(&src)
@@ -942,7 +948,10 @@ impl MetalAllocator {
                     .checked_sub(r.aligned_base as usize)
                     .filter(|&o| o + len <= r.aligned_capacity)?;
                 let mut stored = r.offset8.lock().expect("offset8 ranges Mutex");
-                let has = stored.get(&off).filter(|(l, _)| *l == len).map(|&(_, how)| how);
+                let has = stored
+                    .get(&off)
+                    .filter(|(l, _)| *l == len)
+                    .map(|&(_, how)| how);
                 // SAFETY: `off + len` is within the region's aligned mapping.
                 let at = unsafe { r.aligned_base.add(off) };
                 Some(match (StoredCodes::of(codes), has, &r.served_from) {
@@ -2485,7 +2494,9 @@ mod tests {
         };
         let mut alloc = MetalAllocator::new(device);
         let (rows, k) = (2usize, 128usize);
-        let codes: Vec<u8> = (0..rows * k / 2).map(|i| (i as u8).wrapping_mul(37)).collect();
+        let codes: Vec<u8> = (0..rows * k / 2)
+            .map(|i| (i as u8).wrapping_mul(37))
+            .collect();
         let a = unsafe {
             alloc
                 .alloc_and_copy_host(codes.as_ptr(), codes.len())
@@ -2499,7 +2510,11 @@ mod tests {
             assert!(alloc.bind_affine_codes(a, codes.len(), planes).is_ok());
             assert_eq!(read(a), want);
         }
-        for other in [AffineCodes::Offset8, AffineCodes::AsWritten, AffineCodes::Planes { k: 64 }] {
+        for other in [
+            AffineCodes::Offset8,
+            AffineCodes::AsWritten,
+            AffineCodes::Planes { k: 64 },
+        ] {
             assert!(matches!(
                 alloc.bind_affine_codes(a, codes.len(), other),
                 Err(AffineCodesBindError::ReadersDisagree { .. })
@@ -2529,7 +2544,14 @@ mod tests {
                 aligned_base: base,
                 aligned_capacity: bytes,
                 tensors: Vec::new(),
-                _mmap: Arc::new(memmap2::MmapOptions::new().len(1).map_anon().unwrap().make_read_only().unwrap()),
+                _mmap: Arc::new(
+                    memmap2::MmapOptions::new()
+                        .len(1)
+                        .map_anon()
+                        .unwrap()
+                        .make_read_only()
+                        .unwrap(),
+                ),
                 _cache_mmap: None,
                 offset8: Arc::default(),
                 settled: Arc::clone(&settled),
@@ -2540,8 +2562,14 @@ mod tests {
         let (target, target_settled) = region(4096);
         let (draft, draft_settled) = region(4096);
         alloc.settle_affine_codes(&[target.wrapping_add(64).cast_const()]);
-        assert!(target_settled.load(Ordering::Acquire), "the target's region settles");
-        assert!(!draft_settled.load(Ordering::Acquire), "the drafter's waits for its own pool");
+        assert!(
+            target_settled.load(Ordering::Acquire),
+            "the target's region settles"
+        );
+        assert!(
+            !draft_settled.load(Ordering::Acquire),
+            "the drafter's waits for its own pool"
+        );
         alloc.settle_affine_codes(&[draft.cast_const()]);
         assert!(draft_settled.load(Ordering::Acquire));
     }
