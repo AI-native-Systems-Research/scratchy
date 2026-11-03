@@ -58,32 +58,6 @@ use scratchy_target_cuda::tape::MoeTape;
 /// 301 decoded, against row 301 of (k)'s one 308-token forward.
 const DIAG_P: usize = 301;
 
-/// The GEMV scratch of `tape` cut to `steps`: the full tape's region trimmed to the bytes the cut's
-/// own split steps write, `None` when none splits, as `CudaTape::validate` requires (#1031).
-fn cut_gemv_scratch(
-    tape: &CudaTape,
-    steps: &[CudaStep],
-) -> Option<scratchy_target_cuda::tape::ArenaSpan> {
-    let bytes = (steps.iter().filter_map(CudaStep::gemv_scratch))
-        .max()
-        .unwrap_or(0);
-    (tape.gemv_scratch.filter(|_| bytes > 0))
-        .map(|s| scratchy_target_cuda::tape::ArenaSpan { bytes, ..s })
-}
-
-/// `tape` cut just after step `last`, its result `out`: a `'static` copy, as
-/// `cuda_narrow_diag_9b`'s (#846). Every span stays in the same arena, so it validates as the
-/// full tape does.
-fn cut(tape: &CudaTape, last: usize, out: ArenaSpan) -> CudaTape {
-    let steps = &tape.steps[..=last];
-    CudaTape {
-        steps: Box::leak(steps.to_vec().into_boxed_slice()),
-        result: out,
-        gemv_scratch: cut_gemv_scratch(tape, steps),
-        ..*tape
-    }
-}
-
 /// One tape's diagnostic cuts: just after its first attention step (model layer 3), its result
 /// that step's output; and just after each MoE layer's routing, its result `topk_idx` (the
 /// router logits stay in the MoE scratch, read back after).
@@ -112,13 +86,6 @@ fn diag_cuts(tape: &CudaTape) -> (CudaTape, Vec<CudaTape>) {
         .map(|(i, _)| cut(tape, i, moe.topk_idx))
         .collect();
     (attn, routes)
-}
-
-/// i32 words from the u16 halves a result holds.
-fn words(halves: &[u16]) -> Vec<i32> {
-    (halves.as_chunks::<2>().0.iter())
-        .map(|&[lo, hi]| (u32::from(lo) | u32::from(hi) << 16) as i32)
-        .collect()
 }
 
 /// How many bf16 steps apart two values are (signed-magnitude ladder: `+0` and `−0` are 0 apart).
