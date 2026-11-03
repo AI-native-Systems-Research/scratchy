@@ -179,6 +179,21 @@ impl Engine {
         self.fields(m).0.as_deref().unwrap_or_default()
     }
 
+    /// Its dataset workloads' cells in a run's model; empty for an engine the tasks axis does not
+    /// record (only scratchy, mlx-lm and the oMLX pair run it).
+    pub fn tasks(self, m: &Model) -> &[super::data::TaskCell] {
+        match self {
+            Engine::Scratchy => &m.tasks,
+            Engine::OmlxTq => &m.tasks_omlx_tq,
+            Engine::Omlx => &m.tasks_omlx,
+            Engine::MlxLm => &m.tasks_mlx_lm,
+            Engine::Splash => &m.tasks_splash,
+            Engine::VllmMetal | Engine::Ollama | Engine::LlamaCpp | Engine::Mistralrs => &None,
+        }
+        .as_deref()
+        .unwrap_or_default()
+    }
+
     pub fn cells(self, m: &Model) -> &[Cell] {
         self.fields(m).1.as_deref().unwrap_or_default()
     }
