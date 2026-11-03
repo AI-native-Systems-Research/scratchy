@@ -64,7 +64,7 @@ jobs:
       - name: Build
         env:
           MODEL_SCOPE: ${{ github.event_name == 'release' && 'model/all' || inputs.model-scope }}
-        run: cargo build --release -p scratchy-cli --features metal,quant/mlx,"$MODEL_SCOPE"
+        run: cargo build --release -p scratchy-cli --features metal,bench,serve,quant/mlx,"$MODEL_SCOPE"
 
       # Import the Developer ID Application certificate into an ephemeral
       # keychain. MACOS_SIGNING_IDENTITY is a repo *variable* (not secret):
