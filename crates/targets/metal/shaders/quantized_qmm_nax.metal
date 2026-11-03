@@ -46,6 +46,8 @@
 #include "metal_nax.h"   // vendors NAXTile + tile_matmad_nax + MPP internals
 #include <metal_stdlib>
 #include "baked.h"
+#include "affine_codes.h"
+AFFINE_CODES_PLANES_DECL;
 #include "gated_act.h"
 
 using namespace metal;
@@ -287,7 +289,7 @@ METAL_FUNC void qmm_t_nax_impl(
     // `BCOLS<=group_size` invariant) so it keeps the inlined path.
     using loader_w_t = mlx::steel::QuantizedBlockLoader<
         T_act, T_scale, BN, BK, BK_padded, /*reduction_dim=*/1,
-        TGP, group_size, bits, offset8>;
+        TGP, group_size, bits, offset8, /*planes=*/AFFINE_CODES_PLANES && bits == 4>;
 
     // ── Outer K loop + M/N alignment dispatch ───────────────────────
     dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
@@ -346,7 +348,9 @@ METAL_FUNC void qmm_t_nax_impl(
                     return;
                 }
                 const device wvec_t* src = (const device wvec_t*)(
-                    w_block + row * K_w + (k0 + col) * bits / 8);
+                    (AFFINE_CODES_PLANES && bits == 4)
+                        ? affine_codes_at(wl_base, y_col + row, k0 + col, N, K)
+                        : w_block + row * K_w + (k0 + col) * bits / 8);
                 uint words[bits];
                 STEEL_PRAGMA_UNROLL
                 for (int i = 0; i < bits / WVEC; ++i) {
@@ -421,7 +425,7 @@ METAL_FUNC void qmm_t_nax_impl(
           } else if constexpr (!nvfp4) {
             // ── Affine: MLX QuantizedBlockLoader-driven K loop ───────
             loader_w_t loader_w(
-                w_block, s_block, b_block, K, Ws, simd_gid, simd_lid);
+                w_block, s_block, b_block, K, Ws, simd_gid, simd_lid, wl_base, N, y_col);
 
             for (int k = 0; k < K; k += BK) {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1331,6 +1335,21 @@ INST_W4A8_ACT_QUANT(swiglu_oai, 2, bf16, bfloat)
 INST_W4A8_ACT_QUANT(relu2, 3, f16, half)
 INST_W4A8_ACT_QUANT(relu2, 3, bf16, bfloat)
 
+
+// The `int4b_format` view of 64-input chunk `c` of `N` rows' codes at `w`, `TN` columns from
+// `col0`: under `AFFINE_CODES_PLANES` the chunk's own plane (`affine_codes.h`, `N` rows of 32
+// bytes, contiguous), else the as-written rows' window at input `c * 64`.
+template <int TN, typename XB, typename Ext>
+inline auto affine_chunk_slice(const device uchar* w, int c, int col0, int N, int K) {
+    if constexpr (AFFINE_CODES_PLANES) {
+        XB P((typename XB::data_handle_type)(w + int64_t(c) * N * AFFINE_PLANE_ROW_BYTES), Ext(64, N));
+        return P.template slice<64, TN>(0, col0);
+    } else {
+        XB B((typename XB::data_handle_type)w, Ext(K, N));
+        return B.template slice<64, TN>(c * 64, col0);
+    }
+}
+
 template <typename T, typename S, int G, int TM, int TN, int NSG>
 METAL_FUNC void qmm_w4a8_impl(
     const device uchar* w, const device S* scales, const device S* biases,
@@ -1356,7 +1375,7 @@ METAL_FUNC void qmm_w4a8_impl(
     }
     for (int c = 0; c < KC; ++c) {
         auto sA = A.template slice<64, TM>(c * 64, row0);
-        auto sB = B.template slice<64, TN>(c * 64, col0);
+        auto sB = affine_chunk_slice<TN, XB, Ext>(w, c, col0, N, K);
         op.run(sA, sB, part);
         const int g = c * 64 / G;
         _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < part.get_capacity(); ++i) {
@@ -1435,7 +1454,7 @@ template <typename T, typename S, int G, int TM, int TN, int KS>
     }
     for (int c = int(sg); c < KC; c += KS) {
         auto sA = A.template slice<64, TM>(c * 64, row0);
-        auto sB = B.template slice<64, TN>(c * 64, col0);
+        auto sB = affine_chunk_slice<TN, XB, Ext>(w, c, col0, N, K);
         op.run(sA, sB, part);
         const int g = c * 64 / G;
         _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < part.get_capacity(); ++i) {
@@ -1533,7 +1552,7 @@ template <typename T, typename S, int G, int TM, int TN, int KS>
     }
     for (int c = int(sg); c < KC; c += KS) {
         auto sA = A.template slice<64, TM>(c * 64, row0);
-        auto sB = B.template slice<64, TN>(c * 64, col0);
+        auto sB = affine_chunk_slice<TN, XB, Ext>(wt, c, col0, N, K);
         op.run(sA, sB, part);
         const int g = c * 64 / G;
         _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < part.get_capacity(); ++i) {

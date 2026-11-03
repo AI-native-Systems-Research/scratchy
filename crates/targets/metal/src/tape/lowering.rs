@@ -155,18 +155,24 @@ pub fn lower_subtile_tape_to_metal(
     p: &MetalModelConsts,
     at: BakePoint<'_>,
 ) -> Result<LoweredMetalTape, LoweringError> {
-    let half = |rows, barriers, sources, live| lower(p, rows, barriers, sources, live, &at);
+    let half = |rows, barriers, sources, live, planes| {
+        lower(p, rows, barriers, sources, live, &at, planes)
+    };
     let (bb, bb_logits) = half(
         &steps.backbone,
         &steps.backbone_barriers,
         &steps.backbone_sources,
         &steps.backbone_live,
+        Planes::Backbone,
     )?;
+    // The lm_head is what a drafter borrows of its target (`LentWeight::LmHead`), read the
+    // device's way there: the tail keeps it so here too.
     let (lh, lh_logits) = half(
         &steps.lm_head,
         &steps.lm_head_barriers,
         &steps.lm_head_sources,
         &steps.lm_head_live,
+        Planes::Never,
     )?;
     let writes_kv_cache = |c: &GatedCommand| {
         writer_binds(c, |k| {
@@ -271,6 +277,8 @@ fn sample_rows(
     bucket_m: u32,
     w: RowSources<'_>,
     profile: Option<&crate::targets::MetalTargetProfile>,
+    class: crate::tape::lowered::GenClass,
+    half_planes: Planes,
 ) -> Result<(Vec<GatedCommand>, Option<LogitsRows>), LoweringError> {
     use crate::tape::lowered::RuntimeGate::{OnlyIfEveryRowSampled, UnlessEveryRowSampled};
     use SampleRowsStep as R;
@@ -297,7 +305,7 @@ fn sample_rows(
         (Some(a), R::Matmul) => {
             let x = Some(SetAxis::SampledRows(crate::tape::lowered::MScaleAxis::X));
             let ix = w.of(WeightKind::Linear, 0)?;
-            let codes = super::kernel_constants::AffineCodes::of(profile, a.bits.get());
+            let codes = codes_for(p, profile, class, half_planes, a.bits.get(), a.k.get(), a.group_size.get());
             let qmv = affine_qmv_command(
                 p,
                 &a,
@@ -372,6 +380,45 @@ fn writes_logits(tape: Option<LogitsRows>, step: Option<LogitsRows>) -> Option<L
         }
         (rows, None) | (None, rows) => rows,
     }
+}
+
+/// How a 4-bit MLX-affine weight's codes are stored for the model `p`, rows of `k` inputs: as the
+/// device stores them ([`AffineCodes::of`]), regrouped into planes ([`AffineCodes::planes`]) on
+/// the wide class's target models, where the W4A8 small-M GEMMs read them (Qwen3.8-27B's verify
+/// shapes, 16 rows, µs as written / planes: gate/up 149 / 139, down 144 / 137, gdn qkv 88 / 80,
+/// lm_head 1356 / 1256; the one-row matvec within ±4%). A drafter's weights keep the device's
+/// storage: a DFlash2 drafter's projections bound planes miscomputed (Qwen3.8-27B, replies
+/// 6-14 of 16 identical), its cause not found. Every reader of one weight lowers in the same
+/// model at the same class, so they agree — but for the lm_head, which a drafter borrows from its
+/// target (`LentWeight::LmHead`) and reads as the device stores it: the tape's lm_head tail
+/// lowers under [`Planes::Never`].
+///
+/// A weight of group size 32 has no W4A8 GEMM, so its small-M steps take the bf16 twin, which
+/// reads the codes as written: it stays offset-8.
+fn codes_for(
+    p: &MetalModelConsts,
+    profile: Option<&crate::targets::MetalTargetProfile>,
+    class: crate::tape::lowered::GenClass,
+    half: Planes,
+    bits: u32,
+    k: u32,
+    group_size: u32,
+) -> super::kernel_constants::AffineCodes {
+    let codes = super::kernel_constants::AffineCodes::of(profile, bits);
+    let planes = half == Planes::Backbone
+        && class == crate::tape::lowered::GenClass::M5Wide
+        && p.draft_selector_rank == 0
+        && matches!(group_size, 64 | 128);
+    if planes { codes.planes(k) } else { codes }
+}
+
+/// Whether a half of a tape may store its weights' codes as planes ([`codes_for`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Planes {
+    /// The backbone: its target model's weights, read by it alone.
+    Backbone,
+    /// The lm_head tail, whose weight a drafter borrows.
+    Never,
 }
 
 /// Whether the sampled rows slice at this bake point: a multi-row bucket whose matmul lowers to
@@ -1037,6 +1084,7 @@ fn route_small_m(
     w: RowSources<'_>,
     profile: Option<&crate::targets::MetalTargetProfile>,
     class: crate::tape::lowered::GenClass,
+    half_planes: Planes,
     splitk_scratch_bytes: &mut u32,
 ) -> Result<Vec<GatedCommand>, LoweringError> {
     use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
@@ -1065,11 +1113,12 @@ fn route_small_m(
     else {
         return Ok(cmds);
     };
-    // The small-M kernel reads the codes as stored, signed (offset-8).
-    let codes = super::kernel_constants::AffineCodes::of(profile, 4);
+    // The small-M kernels read the codes as stored, signed (offset-8). The bf16 twin
+    // (`AffineQmmSmallM`) reads them row-major only: planes codes take the W4A8 tile below.
+    let codes = codes_for(p, profile, class, half_planes, 4, k, group_size);
     let tile = match SmallMTile::for_bucket(bucket_m) {
         Some(tile)
-            if codes == super::kernel_constants::AffineCodes::Offset8
+            if codes.signed()
                 && matches!(group_size, 32 | 64 | 128)
                 && n.is_multiple_of(SMALL_M_TILE_COLS) =>
         {
@@ -1234,6 +1283,11 @@ fn route_small_m(
             )
             .chain([GatedCommand::gated(gemm, OnlyIfSmallMTokens)])
             .collect());
+    }
+    // The bf16 twin reads the codes row-major: a planes weight's small-M step keeps the bucket's
+    // own matmul.
+    if matches!(codes, super::kernel_constants::AffineCodes::Planes { .. }) {
+        return Ok(cmds);
     }
     let small_m = LoweredCommand {
         kernel: KernelId::AffineQmmSmallM,
@@ -1852,6 +1906,7 @@ fn lower(
     sources: &[Vec<RowSource>],
     live_rows: &[PlayLive],
     at: &BakePoint<'_>,
+    half_planes: Planes,
 ) -> Result<(LoweredMetalTape, Option<LogitsRows>), LoweringError> {
     let BakePoint {
         chunked,
@@ -1984,6 +2039,7 @@ fn lower(
                     block_cap,
                     profile,
                     class,
+                    half_planes,
                     m_divisor,
                 )?;
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
@@ -1995,6 +2051,7 @@ fn lower(
                     w,
                     profile,
                     class,
+                    half_planes,
                     &mut splitk_scratch_bytes,
                 )?;
                 let cmds = route_gdn(p, step, cmds, bucket_m);
@@ -2009,7 +2066,7 @@ fn lower(
                     &mut decode_partials,
                     i,
                 )?;
-                let (cmds, rows) = sample_rows(p, step, cmds, bucket_m, w, profile)?;
+                let (cmds, rows) = sample_rows(p, step, cmds, bucket_m, w, profile, class, half_planes)?;
                 logits_rows = writes_logits(logits_rows, rows);
                 // Past the sampled rows, a command over their logits other than the logit tail's
                 // (a fold the tail joined) runs over the step's every row: the buffer holds them.
@@ -2638,6 +2695,8 @@ fn lower_one(
     profile: Option<&crate::targets::MetalTargetProfile>,
     // The chip class the tape serves: the W4A8 GEMM splits K on the wide class.
     gen_class: crate::tape::lowered::GenClass,
+    // Whether this half of the tape may store its weights' codes as planes (`codes_for`).
+    half_planes: Planes,
     // The row-count divisor in force, threaded by `lower()` (1 normally;
     // `vision_merge_factor` after the merger reshape) so post-merge ops
     // dispatch over `bucket_m / m_divisor` rows.
@@ -2685,6 +2744,7 @@ fn lower_one(
                 block_cap,
                 profile,
                 gen_class,
+                half_planes,
                 m_divisor,
             );
         }
@@ -2712,6 +2772,7 @@ fn lower_one(
                     block_cap,
                     profile,
                     gen_class,
+                    half_planes,
                     m_divisor,
                 )
             };
@@ -3362,7 +3423,7 @@ fn lower_one(
             let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
             if is_nax && narrow_matvec(n_v, k_v, bits_v, bucket_m) {
                 let layer = super::ids::LayerId(*layer + layer_offset);
-                let codes = super::kernel_constants::AffineCodes::of(profile, bits_v);
+                let codes = codes_for(p, profile, gen_class, half_planes, bits_v, k_v, gs);
                 affine_qmv_command(
                     p,
                     g,
@@ -3382,7 +3443,7 @@ fn lower_one(
                 // single-stream M1 Max (the sweep's per-CB overhead
                 // biased it toward generic).
                 let layer = super::ids::LayerId(*layer + layer_offset);
-                let codes = super::kernel_constants::AffineCodes::of(profile, g.bits.get());
+                let codes = codes_for(p, profile, gen_class, half_planes, g.bits.get(), g.k.get(), g.group_size.get());
                 // MLX gates affine qmv_wide on arch gen >= 15 (quantized.cpp:537-539) —
                 // M3 and later (M4 is gen 16, M5 is gen 17). `affine_qmv_wide_ok` mirrors
                 // that boundary; M1/M2 keep the fold twin.
@@ -3477,10 +3538,10 @@ fn lower_one(
                 // W4A8 on the matrix unit's int8 lane: a pre-pass quantizes
                 // the activations per (row, 64-chunk) into the shared scratch,
                 // then the GEMM multiplies them against the offset-8 codes.
-                let codes = super::kernel_constants::AffineCodes::of(profile, bits_v);
+                let codes = codes_for(p, profile, gen_class, half_planes, bits_v, k_v, gs);
                 let w4a8_tile = W4a8Tile::for_n(n_v).filter(|_| {
                     matches!(kernel, QmmTKernel::Nax(_))
-                        && codes == super::kernel_constants::AffineCodes::Offset8
+                        && codes.signed()
                         // Offset8 already implies b4 (`for_bits`), but state
                         // it: the W4A8 GEMM multiplies int4 codes on the
                         // matrix unit's int8 lane — a 3-bit or 2-bit
@@ -3589,7 +3650,7 @@ fn lower_one(
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
                                 m: super::ids::MDimI32(bucket_m as i32),
-                                codes: super::kernel_constants::AffineCodes::of(profile, bits_v),
+                                codes: codes_for(p, profile, gen_class, half_planes, bits_v, k_v, gs),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -3629,7 +3690,7 @@ fn lower_one(
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
                                 m: super::ids::MDimI32(bucket_m as i32),
-                                codes: super::kernel_constants::AffineCodes::of(profile, bits_v),
+                                codes: codes_for(p, profile, gen_class, half_planes, bits_v, k_v, gs),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -3696,7 +3757,7 @@ fn lower_one(
                                 k_partition_size: super::ids::KPartitionSizeI32(
                                     k_partition_size as i32,
                                 ),
-                                codes: super::kernel_constants::AffineCodes::of(profile, bits_v),
+                                codes: codes_for(p, profile, gen_class, half_planes, bits_v, k_v, gs),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -4507,6 +4568,9 @@ fn lower_one(
                 function: affine_embed_kernel_static_name(dtype, scale_dtype, gs, bits_v),
                 constants: super::kernel_constants::AffineEmbedConstants {
                     hidden_size: super::ids::HiddenSize(hidden_size),
+                    // A row gather reads each row's codes whole: as the device stores them,
+                    // never planes (its table is its own tensor; a tied lm_head is not 4-bit
+                    // W4A8 here).
                     codes: super::kernel_constants::AffineCodes::of(profile, bits_v),
                 }
                 .into_baked(),
@@ -4591,7 +4655,7 @@ fn lower_one(
                 return Err(LoweringError::OneRowFold { bucket_m });
             }
             let (n, k, gs, bits) = (g.n.get(), g.k.get(), g.group_size.get(), g.bits.get());
-            let codes = super::kernel_constants::AffineCodes::of(profile, bits);
+            let codes = codes_for(p, profile, gen_class, half_planes, bits, k, gs);
             let constants = super::kernel_constants::AffineGatedQmvConstants {
                 qmv: super::kernel_constants::AffineQmvConstants {
                     k: super::ids::KDimI32(k as i32),
@@ -6237,6 +6301,7 @@ fn lower_one(
                 block_cap,
                 profile,
                 gen_class,
+                half_planes,
                 m_divisor,
             )?;
             let layer = layer.get() + layer_offset;
@@ -13949,6 +14014,7 @@ mod tests {
             128,
             None,
             crate::tape::lowered::GenClass::M1,
+            Planes::Backbone,
             1,
         )
         .expect("lower scalar_mul");
@@ -13991,6 +14057,7 @@ mod tests {
             128,
             None,
             crate::tape::lowered::GenClass::M1,
+            Planes::Backbone,
             1,
         )
         .expect("lower")
@@ -14040,6 +14107,7 @@ mod tests {
             /*block_cap=*/ 128,
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
+            Planes::Backbone,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -14132,6 +14200,7 @@ mod tests {
             /*block_cap=*/ 128,
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
+            Planes::Backbone,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -14186,6 +14255,7 @@ mod tests {
             /*block_cap=*/ 128,
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
+            Planes::Backbone,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -14273,6 +14343,7 @@ mod tests {
             /*block_cap=*/ 128,
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
+            Planes::Backbone,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -14349,6 +14420,7 @@ mod tests {
             /*block_cap=*/ 128,
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
+            Planes::Backbone,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -14393,6 +14465,7 @@ mod tests {
             /*block_cap=*/ 128,
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
+            Planes::Backbone,
             /*m_divisor=*/ 1,
         )
         .expect("lower");

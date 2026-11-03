@@ -30,6 +30,8 @@
 #include <metal_simdgroup>
 #include <metal_stdlib>
 #include "baked.h"
+#include "affine_codes.h"
+AFFINE_CODES_PLANES_DECL;
 #include "gated_act.h"
 #include "moe_route.h"
 
@@ -699,7 +701,9 @@ METAL_FUNC void qmv_fast_impl(
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     const device T_scale* gain = nullptr,
-    const device T_act* bias = nullptr) {
+    const device T_act* bias = nullptr,
+    int plane_n = 0,
+    int plane_row0 = 0) {
   constexpr int packs_per_thread = bits == 2 ? 1 : 2;
   constexpr int num_simdgroups = 2;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
@@ -747,8 +751,15 @@ METAL_FUNC void qmv_fast_impl(
       sum = load_vector<T_act, U, values_per_thread, bits>(x, x_thread);
     }
 
+    // Under AFFINE_CODES_PLANES this lane's values_per_thread codes sit in their 64-input plane
+    // (`affine_codes.h`): row `plane_row0 + out_row + row` of `plane_n` (the matrix's rows, which
+    // a view of a block of them — the gated kernel's — names; else `out_vec_size`).
+    const int kk = k + int(simd_lid) * values_per_thread;
     for (int row = 0; row < results_per_simdgroup; row++) {
-      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      auto wl = AFFINE_CODES_PLANES
+          ? affine_codes_at((const device uchar*)w, plane_row0 + out_row + row, kk,
+                            plane_n ? plane_n : out_vec_size, in_vec_size)
+          : (const device uint8_t*)(ws + row * in_vec_size_w);
       const device T_scale* sl = scales + row * in_vec_size_g;
       const device T_scale* bl = biases + row * in_vec_size_g;
 
@@ -1461,7 +1472,9 @@ METAL_FUNC void qmv_wide_impl(
 #pragma unroll
     for (int sc = 0; sc < group_size / sub; sc++) {
       const int k0 = g * group_size + sc * sub;
-      const device uint8_t* wc = wrow + k0 * bits / 8;
+      const device uint8_t* wc = AFFINE_CODES_PLANES
+          ? affine_codes_at((const device uchar*)w, row, k0, OUT_VEC_SIZE, IN_VEC_SIZE)
+          : wrow + k0 * bits / 8;
       U w_dq[sub];
       dequantize<U, sub, bits>(wc, scale, b, w_dq);
 #pragma unroll
@@ -2021,13 +2034,15 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
   const size_t row0 = size_t(tid.y) * BLOCK_ROWS;
   const size_t w_offset = row0 * size_t(IN_VEC_SIZE) * bits / 32;
   const size_t sb_offset = row0 * size_t(IN_VEC_SIZE / group_size);
-  const device uint32_t* w = (up ? up_w : gate_w) + w_offset;
+  // Planes regroup the rows across the matrix: the impl takes the whole matrix and the block's
+  // first row instead of a view starting at it.
+  const device uint32_t* w = (up ? up_w : gate_w) + (AFFINE_CODES_PLANES ? 0 : w_offset);
   const device T_scale* scales = (up ? up_scales : gate_scales) + sb_offset;
   const device T_scale* biases = (up ? up_biases : gate_biases) + sb_offset;
   if (fast) {
     qmv_fast_impl<T_act, T_scale, group_size, bits, threadgroup T_act*, QMV_FAST_ROWS>(
         w, scales, biases, x, rows[up], IN_VEC_SIZE, BLOCK_ROWS, uint3(0), simd_gid % 2, simd_lid,
-        gain);
+        gain, nullptr, OUT_VEC_SIZE, int(row0));
   } else {
     qmv_impl<T_act, T_scale, group_size, bits, threadgroup T_act*>(
         w, scales, biases, x, rows[up], IN_VEC_SIZE, BLOCK_ROWS, uint3(0), simd_gid % 2, simd_lid,

@@ -1873,6 +1873,14 @@ impl ResolvedSources {
                     );
                     let at = allocator
                         .bind_affine_codes(tensor.raw_ptr(), tensor.size_bytes(), codes)
+                        .inspect_err(|e| {
+                            tracing::error!(
+                                "binding {} {which:?} of layer {}: {} reads it {codes:?}: {e}",
+                                W::SOURCES.get(ix.get() as usize).copied().unwrap_or("?"),
+                                layer.0,
+                                c.command.function
+                            )
+                        })
                         .map_err(WorkerError::AffineCodes)?;
                     table.entry((ix, which, layer)).or_insert(at);
                 } else if let Entry::Vacant(v) = table.entry((ix, which, layer)) {

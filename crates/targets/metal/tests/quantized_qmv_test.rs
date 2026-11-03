@@ -1099,6 +1099,7 @@ fn a_narrow_projection_fast_matvec_row_is_the_one_row_bits() {
     let stored: Vec<u8> = match codes {
         AffineCodes::Offset8 => packed.iter().map(|b| b ^ 0x88).collect(),
         AffineCodes::AsWritten => packed.clone(),
+        AffineCodes::Planes { .. } => unreachable!("`AffineCodes::of` never stores planes"),
     };
     let as_bytes =
         |v: &[half::f16]| -> Vec<u8> { v.iter().flat_map(|h| h.to_le_bytes()).collect() };

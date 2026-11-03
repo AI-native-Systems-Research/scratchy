@@ -121,10 +121,17 @@ pub struct ByCodes<T> {
 }
 
 impl<T> ByCodes<T> {
+    /// The kernels reading codes stored as `codes`. A vocabulary suffix reads rows past its
+    /// head's prefix, which planes regroup across: its kernels read the lm_head as the device
+    /// stores 4-bit codes (`MetalAllocator::affine_codes`), never planes — a target whose own
+    /// lm_head binds planes makes that bind refuse (`ReadersDisagree`) before this is asked.
     pub fn get(&self, codes: AffineCodes) -> &T {
         match codes {
             AffineCodes::AsWritten => &self.as_written,
             AffineCodes::Offset8 => &self.offset8,
+            AffineCodes::Planes { .. } => {
+                unreachable!("a vocabulary suffix's codes are never stored planes")
+            }
         }
     }
 
