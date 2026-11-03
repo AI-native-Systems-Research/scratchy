@@ -4073,7 +4073,18 @@ pub fn emit_sdsc(
                                 v.df,
                             )
                         } else {
-                            own
+                            // A stamp/view disagreement, and it is LOUD: the opspec stamped this
+                            // view LandedBlocks from its own cols, and the view's emit-time
+                            // extents say otherwise — one of the two is wrong, and a silent flat
+                            // declaration would hide which.
+                            return Err(SuperDscError(format!(
+                                "op '{op_name}': tensor '{}' is stamped LandedBlocks — a landing \
+                                 several sticks wide, its blocks' frame derived from its own cols \
+                                 — but the view's emit-time extents disagree: a {stick_ext}-element \
+                                 stick axis over {elems} elements is not a whole-stick, \
+                                 several-stick landing",
+                                v.name
+                            )));
                         }
                     }
                     crate::superdsc_opspec::ViewFrame::StickColumns => {
