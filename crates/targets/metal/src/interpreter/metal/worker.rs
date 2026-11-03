@@ -1109,8 +1109,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
             )?;
             bucket_bakings.push(baking);
         }
-        // Every codes operand is now stored the way its readers read it.
-        crate::metal_allocator::signal_affine_codes_settled();
         if let Some(r) = residency {
             r.commit();
         }
@@ -1846,6 +1844,7 @@ impl ResolvedSources {
         tapes: &[LoweredMetalTape],
     ) -> Result<Self, WorkerError> {
         let mut table = HashMap::new();
+        let mut codes_bound = Vec::new();
         for c in tapes.iter().flat_map(LoweredMetalTape::commands_expanded) {
             for b in c.command.bindings {
                 let &Binding::Source {
@@ -1883,6 +1882,7 @@ impl ResolvedSources {
                         })
                         .map_err(WorkerError::AffineCodes)?;
                     table.entry((ix, which, layer)).or_insert(at);
+                    codes_bound.push(tensor.raw_ptr().cast_const());
                 } else if let Entry::Vacant(v) = table.entry((ix, which, layer)) {
                     let tensor = bundle.tensor(which).ok_or(miss(SourceMiss::NoTensor))?;
                     let at = allocator.buffer_for(tensor.raw_ptr());
@@ -1890,6 +1890,9 @@ impl ResolvedSources {
                 }
             }
         }
+        // Every codes range these tapes read is now stored the way they read it: release the
+        // sidecar writers of the regions holding them.
+        allocator.settle_affine_codes(&codes_bound);
         Ok(Self(table))
     }
 

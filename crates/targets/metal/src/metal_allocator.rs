@@ -52,20 +52,8 @@ pub fn signal_weights_load_complete() {
     WEIGHTS_LOAD_COMPLETE.store(true, std::sync::atomic::Ordering::Release);
 }
 
-/// Latch flipped once the tapes have bound their weights, so every 4-bit
-/// code range they read offset-8 has been stored that way
-/// ([`MetalAllocator::store_affine_codes_offset8`]). Sidecar writers wait on
-/// it too, so the cache they persist already holds the stored codes.
-static AFFINE_CODES_SETTLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Called by the pool after it binds its tapes. Idempotent.
-pub fn signal_affine_codes_settled() {
-    AFFINE_CODES_SETTLED.store(true, std::sync::atomic::Ordering::Release);
-}
-
 /// Set by [`join_sidecar_writers`]: no tape will bind after it, so a writer
-/// still waiting on [`AFFINE_CODES_SETTLED`] skips its build rather than
+/// still waiting on its region's [`RegionSettled`] skips its build rather than
 /// persist codes stored in an unknown form.
 static SIDECAR_DRAINING: AtomicBool = AtomicBool::new(false);
 
@@ -201,6 +189,14 @@ impl StoredCodes {
 /// blob and the ranges under this lock.
 type StoredRanges = std::collections::BTreeMap<usize, (usize, StoredCodes)>;
 type Offset8Ranges = Arc<Mutex<StoredRanges>>;
+
+/// Set once a pool whose tapes read a region's codes has bound them ([`MetalAllocator::
+/// settle_affine_codes`]): the region's sidecar writer waits on it, so the cache it persists holds
+/// every range that pool stored. Per region, not per process: a drafter's pool binds its own
+/// region after the target's pool settles, and a process-wide latch released the drafter's
+/// writer before the drafter stored its codes (its sidecar missed them and was rebuilt every
+/// second launch).
+type RegionSettled = Arc<AtomicBool>;
 
 /// Store `len` bytes of as-written codes at `ptr` the way `how` says, in place: XOR 0x88, and
 /// for planes regroup them a 64-input chunk at a time (`affine_codes.h`) through a scratch of
@@ -496,6 +492,8 @@ struct MmapRegion {
     _cache_mmap: Option<Arc<memmap2::Mmap>>,
     /// Code ranges stored past as written in `aligned_buffer` (offset-8, or planes).
     offset8: Offset8Ranges,
+    /// Whether a pool reading the region's codes has bound them ([`RegionSettled`]).
+    settled: RegionSettled,
     /// The sidecar this region was served from, if any. Its mapping is
     /// read-only: a code range its blob does not store offset-8 is bound
     /// from a stored copy, and the sidecar is dropped so the next launch
@@ -863,6 +861,24 @@ impl MetalAllocator {
     /// by [`Self::bind_affine_codes`] reads them as.
     pub fn affine_codes(&self, bits: u32) -> AffineCodes {
         self.affine_codes_target().for_bits(bits)
+    }
+
+    /// After a pool has bound every codes range its tapes read (`ptrs`, through
+    /// [`Self::bind_affine_codes`]): the regions holding them are settled, so their sidecar writers
+    /// may persist them ([`RegionSettled`]). A region no pool binds codes in — a model without
+    /// affine weights — settles when the load completes or the writers drain.
+    pub fn settle_affine_codes(&self, ptrs: &[*const u8]) {
+        let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
+        for r in mmaps.iter() {
+            let (lo, hi) = (r.aligned_base as usize, r.aligned_base as usize + r.aligned_capacity);
+            let held = |p: &*const u8| {
+                let src = *p as usize;
+                (lo..hi).contains(&src) || (r.base as usize..r.base as usize + r.len).contains(&src)
+            };
+            if ptrs.iter().any(held) {
+                r.settled.store(true, Ordering::Release);
+            }
+        }
     }
 
     /// The buffer binding for the MLX-affine packed codes `ptr..ptr + len`,
@@ -1290,6 +1306,7 @@ impl MetalAllocator {
                 _mmap: mmap,
                 _cache_mmap: Some(cache_mmap),
                 offset8: Arc::new(Mutex::new(offset8)),
+                settled: Arc::new(AtomicBool::new(true)),
                 served_from: Some(meta),
             });
         Ok(())
@@ -1311,6 +1328,7 @@ impl MetalAllocator {
         meta: AlignedCacheMeta,
         keepalive: BufKeepAlive,
         offset8: Offset8Ranges,
+        settled: RegionSettled,
     ) {
         let handle = std::thread::spawn(move || {
             let _keepalive = keepalive;
@@ -1320,7 +1338,7 @@ impl MetalAllocator {
             let t_wait = std::time::Instant::now();
             while !((WEIGHTS_LOAD_COMPLETE.load(Ordering::Acquire)
                 || t_wait.elapsed() >= std::time::Duration::from_secs(180))
-                && AFFINE_CODES_SETTLED.load(Ordering::Acquire))
+                && settled.load(Ordering::Acquire))
             {
                 if cache_write_cancelled() {
                     return;
@@ -1715,6 +1733,7 @@ impl MetalAllocator {
         // short-run teardown (see spawn_aligned_cache_writer).
         let writer_keepalive = BufKeepAlive(dst_buffer.clone());
         let offset8: Offset8Ranges = Arc::default();
+        let settled: RegionSettled = Arc::default();
         self.mmaps
             .lock()
             .expect("MetalAllocator mmaps Mutex")
@@ -1728,6 +1747,7 @@ impl MetalAllocator {
                 _mmap: mmap,
                 _cache_mmap: None,
                 offset8: Arc::clone(&offset8),
+                settled: Arc::clone(&settled),
                 served_from: None,
             });
 
@@ -1743,6 +1763,7 @@ impl MetalAllocator {
                 m,
                 writer_keepalive,
                 offset8,
+                settled,
             );
         } else {
             drop(writer_keepalive);
@@ -2484,6 +2505,45 @@ mod tests {
                 Err(AffineCodesBindError::ReadersDisagree { .. })
             ));
         }
+    }
+
+    /// A pool settles only the regions holding codes it bound: a drafter's region waits for the
+    /// drafter's pool, whatever the target's pool settled before it.
+    #[test]
+    fn settling_codes_releases_only_the_regions_that_hold_them() {
+        let Some(device) = try_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let alloc = MetalAllocator::new(device.clone());
+        let region = |bytes: usize| {
+            let buffer = device
+                .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+                .expect("a buffer");
+            let base = buffer.contents().as_ptr().cast::<u8>();
+            let settled: RegionSettled = Arc::default();
+            alloc.mmaps.lock().unwrap().push(MmapRegion {
+                base,
+                len: bytes,
+                aligned_buffer: alloc.weights_residency.pin(buffer),
+                aligned_base: base,
+                aligned_capacity: bytes,
+                tensors: Vec::new(),
+                _mmap: Arc::new(memmap2::MmapOptions::new().len(1).map_anon().unwrap().make_read_only().unwrap()),
+                _cache_mmap: None,
+                offset8: Arc::default(),
+                settled: Arc::clone(&settled),
+                served_from: None,
+            });
+            (base, settled)
+        };
+        let (target, target_settled) = region(4096);
+        let (draft, draft_settled) = region(4096);
+        alloc.settle_affine_codes(&[target.wrapping_add(64).cast_const()]);
+        assert!(target_settled.load(Ordering::Acquire), "the target's region settles");
+        assert!(!draft_settled.load(Ordering::Acquire), "the drafter's waits for its own pool");
+        alloc.settle_affine_codes(&[draft.cast_const()]);
+        assert!(draft_settled.load(Ordering::Acquire));
     }
 
     #[test]
