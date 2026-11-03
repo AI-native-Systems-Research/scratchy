@@ -251,9 +251,14 @@ fn rig() -> Rig {
 impl Rig {
     /// A worker over every tape, with the KV and GDN pools.
     fn worker(&self) -> CudaWorker<'_> {
+        self.worker_over(CUDA_TAPES)
+    }
+
+    /// A worker over `tapes`, [`CUDA_TAPES`] first, with the KV and GDN pools.
+    fn worker_over(&self, tapes: &'static [CudaTape]) -> CudaWorker<'_> {
         CudaWorker::new(
             &self.device,
-            CUDA_TAPES,
+            tapes,
             &self.table,
             Some(KV_POOL),
             Some(GDN_POOL),
@@ -816,6 +821,177 @@ fn top1_margin(row: &[u16]) -> (usize, f32) {
     (first, second.map_or(f32::INFINITY, |s| v(first) - v(s)))
 }
 
+/// The GEMV scratch of `tape` cut to `steps`: the full tape's region trimmed to the bytes the cut's
+/// own split steps write, `None` when none splits, as `CudaTape::validate` requires (#1031).
+fn cut_gemv_scratch(
+    tape: &CudaTape,
+    steps: &[CudaStep],
+) -> Option<scratchy_target_cuda::tape::ArenaSpan> {
+    let bytes = (steps.iter().filter_map(CudaStep::gemv_scratch))
+        .max()
+        .unwrap_or(0);
+    (tape.gemv_scratch.filter(|_| bytes > 0))
+        .map(|s| scratchy_target_cuda::tape::ArenaSpan { bytes, ..s })
+}
+
+/// `tape` cut just after step `last`, its result `out`: a `'static` copy, as
+/// `cuda_narrow_diag_9b`'s (#846). Every span stays in the same arena, so it validates as the
+/// full tape does.
+fn cut(tape: &CudaTape, last: usize, out: ArenaSpan) -> CudaTape {
+    let steps = &tape.steps[..=last];
+    CudaTape {
+        steps: Box::leak(steps.to_vec().into_boxed_slice()),
+        result: out,
+        gemv_scratch: cut_gemv_scratch(tape, steps),
+        ..*tape
+    }
+}
+
+/// i32 words from the u16 halves a result holds.
+fn words(halves: &[u16]) -> Vec<i32> {
+    (halves.as_chunks::<2>().0.iter())
+        .map(|&[lo, hi]| (u32::from(lo) | u32::from(hi) << 16) as i32)
+        .collect()
+}
+
+/// (k) teacher-forced's, (n)'s and (k)'s diagnostic's pick scan, on a MoE model (the 35B, #1031's
+/// confirming print; Gemma's is `cuda_prefill_gemma4_body.rs`'s): the m=512 and m=1 tapes cut
+/// just after each MoE layer's routing (their result that layer's `topk_idx`), after
+/// [`CUDA_TAPES`] in one worker's list, and the one-shot's picks per layer. Empty on a dense
+/// model, whose tapes route nothing: it then prints nothing.
+struct PickScan {
+    tapes: &'static [CudaTape],
+    one_shot: Vec<Vec<i32>>,
+    top_k: usize,
+}
+
+impl PickScan {
+    /// The route cuts of `tape`, its result each MoE layer's `topk_idx`.
+    fn cuts(tape: &CudaTape) -> Vec<CudaTape> {
+        let Some(moe) = tape.moe else {
+            return Vec::new();
+        };
+        (tape.steps.iter().enumerate())
+            .filter(|(_, s)| matches!(s, CudaStep::MoeRoute(_)))
+            .map(|(i, _)| cut(tape, i, moe.topk_idx))
+            .collect()
+    }
+
+    /// [`CUDA_TAPES`], then the m=512 tape's route cuts, then the m=1 tape's.
+    fn tapes() -> &'static [CudaTape] {
+        let mut list = CUDA_TAPES.to_vec();
+        list.extend(Self::cuts(&CUDA_TAPES[bucket(512)]));
+        list.extend(Self::cuts(&CUDA_TAPES[bucket(1)]));
+        Box::leak(list.into_boxed_slice())
+    }
+
+    /// The MoE layers.
+    fn layers(&self) -> usize {
+        self.one_shot.len()
+    }
+
+    /// One forward of `rows` at `prefix_len` in `seat` through `tapes[b]`: the full result.
+    fn run(&self, w: &mut CudaWorker<'_>, b: usize, rows: &[u32], prefix_len: u32, seat: Seat) -> Vec<u16> {
+        let tape = &self.tapes[b];
+        let q = rows.len() as u32;
+        let kv = KvSequence {
+            block_table: seat.blocks,
+            prefix_len,
+            q_len: q,
+        };
+        let gdn = GdnSequence {
+            slot: seat.slot,
+            q_len: q,
+            fresh: prefix_len == 0,
+        };
+        let mut out = vec![0u16; tape.result.bytes as usize / 2];
+        w.forward(
+            b,
+            Input::TokenIds(&padded(tape, rows)),
+            &positions(tape, prefix_len),
+            Some(&kv),
+            Some(&gdn),
+            &mut out,
+        )
+        .unwrap_or_else(|e| panic!("route cut {b}: {e}"));
+        out
+    }
+
+    /// The one-shot picks of `rows` fresh at m=512 in `seat`, per MoE layer. A cut forward
+    /// rewrites the positions it runs with what the full one writes there, so this leaves `seat`'s
+    /// cache and state as a fresh full forward of `rows` would.
+    fn new(w: &mut CudaWorker<'_>, tapes: &'static [CudaTape], rows: &[u32], seat: Seat) -> Self {
+        let layers = (tapes.len() - CUDA_TAPES.len()) / 2;
+        let mut scan = Self {
+            tapes,
+            one_shot: Vec::new(),
+            top_k: CUDA_TAPES[bucket(1)].moe.map_or(0, |m| m.top_k as usize),
+        };
+        scan.one_shot = (0..layers)
+            .map(|l| words(&scan.run(w, CUDA_TAPES.len() + l, rows, 0, seat)))
+            .collect();
+        scan
+    }
+
+    /// A decode of `token` at `p` in [`SEAT_B`], cut after each MoE layer's routing: the first
+    /// layer whose picks are not the one-shot row `p`'s, and how many are not. A GDN layer's
+    /// decode advances its state in place, so before each cut decode `replay` brings `SEAT_B` to
+    /// the state the measured decode starts from (a fresh prefill, then any earlier decodes). The
+    /// measured seat is never touched.
+    fn flips(
+        &self,
+        w: &mut CudaWorker<'_>,
+        (token, p): (u32, usize),
+        replay: &mut dyn FnMut(&mut CudaWorker<'_>),
+    ) -> (Option<usize>, usize) {
+        let picks = |idx: &[i32], row: usize| -> std::collections::BTreeSet<i32> {
+            idx[row * self.top_k..][..self.top_k].iter().copied().collect()
+        };
+        let (mut first, mut count) = (None, 0);
+        for l in 0..self.layers() {
+            replay(w);
+            let b = CUDA_TAPES.len() + self.layers() + l;
+            let got = self.run(w, b, &[token], p as u32, SEAT_B);
+            if picks(&words(&got), 0) != picks(&self.one_shot[l], p) {
+                first = first.or(Some(l));
+                count += 1;
+            }
+        }
+        (first, count)
+    }
+
+    /// The scan's line for the decode `what` of `token` at `p`, on a MoE model ([`Self::flips`]);
+    /// nothing on a dense one.
+    fn print(
+        &self,
+        w: &mut CudaWorker<'_>,
+        what: &str,
+        at: (u32, usize),
+        replay: &mut dyn FnMut(&mut CudaWorker<'_>),
+    ) {
+        if self.layers() == 0 {
+            return;
+        }
+        let (first, count) = self.flips(w, at, replay);
+        eprintln!(
+            "{what} decode at {}: first layer whose decode picks differ from the one-shot's={first:?}, \
+             layers whose picks differ={count} of {} (printed)",
+            at.1,
+            self.layers()
+        );
+    }
+}
+
+/// [`SEAT_B`] fresh with `rows[..from]` prefilled, then `rows[from..p]` decoded one at a time: the
+/// state a decode at `p` starts from in a seat that prefilled `from` tokens ([`PickScan::flips`]'s
+/// replay).
+fn replay_seat_b(w: &mut CudaWorker<'_>, rows: &[u32], from: usize, p: usize) {
+    forward(w, 512, &rows[..from], 0, SEAT_B).expect("the replayed prefill");
+    for (q, &token) in rows.iter().enumerate().take(p).skip(from) {
+        forward(w, 1, &[token], q as u32, SEAT_B).expect("a replayed decode");
+    }
+}
+
 /// (k): 300 fresh tokens prefilled in m=512, then a chain of decodes of positions 300..307 one at a
 /// time, each against row 300 + i of one 308-token m=512 forward in disjoint blocks and slot. Per
 /// step: every logit finite, and the decode's greedy token (argmax) the one-shot row's, unless
@@ -923,13 +1099,18 @@ fn k_chained_decodes_pick_the_one_shot_tokens() {
 #[test]
 fn k_teacher_forced_decodes_agree_with_one_shot_rows() {
     let r = rig();
-    let mut worker = r.worker();
+    let tapes = PickScan::tapes();
+    let mut worker = r.worker_over(tapes);
     let rows = sequence_rows((Q + DECODES) as usize);
+    let scan = PickScan::new(&mut worker, tapes, &rows, SEAT_B);
     let one_shot = forward(&mut worker, 512, &rows, 0, SEAT_B).expect("308 tokens in one forward");
     let mut pass = true;
     for i in 0..DECODES as usize {
         let p = Q as usize + i;
         forward(&mut worker, 512, &rows[..p], 0, SEAT_A).expect("the prefill");
+        scan.print(&mut worker, "(k teacher-forced)", (rows[p], p), &mut |w| {
+            replay_seat_b(w, &rows, p, p)
+        });
         let row = forward(&mut worker, 1, &[rows[p]], p as u32, SEAT_A).expect("the decode");
         let want = &one_shot[p * VOCAB..][..VOCAB];
         let (cos, diff, finite) = (cosine(&row, want), max_diff(&row, want), all_finite(&row));
@@ -1001,9 +1182,20 @@ fn m_decodes_leave_the_prefix_cache_unchanged() {
 #[test]
 fn n_decodes_at_a_block_boundary() {
     let r = rig();
-    let mut worker = r.worker();
+    let tapes = PickScan::tapes();
+    let mut worker = r.worker_over(tapes);
     let rows = sequence_rows(321);
-    let decoded = prefill_then_decode(&mut worker, (&rows[..319], &rows[319..]), SEAT_A);
+    let scan = PickScan::new(&mut worker, tapes, &rows, SEAT_B);
+    forward(&mut worker, 512, &rows[..319], 0, SEAT_A).expect("the prefill");
+    let decoded: Vec<Vec<u16>> = (319..321)
+        .map(|p| {
+            scan.print(&mut worker, "(n)", (rows[p], p), &mut |w| {
+                replay_seat_b(w, &rows, 319, p)
+            });
+            forward(&mut worker, 1, &[rows[p]], p as u32, SEAT_A)
+                .unwrap_or_else(|e| panic!("decode at {p}: {e}"))
+        })
+        .collect();
     let one_shot = forward(&mut worker, 512, &rows, 0, SEAT_B).expect("321 tokens in one forward");
     let mut pass = true;
     for (i, row) in decoded.iter().enumerate() {
@@ -1248,14 +1440,19 @@ fn report(what: &str, step: usize, got: &Snapshot, want: &Snapshot) -> f64 {
 /// GDN layer's conv ring and recurrent state, and the logits. The one-shot of 301 + i tokens is
 /// checked bit-identical, on its last row, to row 300 + i of one 308-token forward, so it is the
 /// one-shot trajectory (k) compares against. Asserted: every value finite, the references
-/// bit-identical, and every teacher-forced decode's logits at cosine ≥ the model's
-/// `TEACHER_FORCED_DECODE_COSINE` (one step's difference, which is (k)'s criterion for one step);
-/// the chain's numbers are printed.
+/// bit-identical, every teacher-forced decode's logits at cosine ≥ the model's
+/// `TEACHER_FORCED_DECODE_COSINE` (one step's difference, which is (k)'s criterion for one step),
+/// and the chain's first step whose greedy token is not the one-shot row's at a near-tie (that
+/// row's top-1 − top-2 margin at most twice the step's max |difference|, P5's and P7's rule; the
+/// user's decision (c), 2026-11-03). The chain's cosines are printed, not gated: each step reads
+/// what earlier decodes wrote, so after the first divergence it follows another trajectory.
 #[test]
 fn k_diag_decode_drift_against_one_shot() {
     let r = rig();
-    let mut worker = r.worker();
+    let tapes = PickScan::tapes();
+    let mut worker = r.worker_over(tapes);
     let rows = sequence_rows((Q + DECODES) as usize);
+    let scan = PickScan::new(&mut worker, tapes, &rows, SEAT_B);
     let one_shot = forward(&mut worker, 512, &rows, 0, SEAT_B).expect("308 tokens in one forward");
     let reference = |worker: &mut CudaWorker<'_>, i: usize| {
         let n = Q as usize + i + 1;
@@ -1268,20 +1465,40 @@ fn k_diag_decode_drift_against_one_shot() {
     // The chain.
     forward(&mut worker, 512, &rows[..Q as usize], 0, SEAT_A).expect("the prefill");
     let mut chain_cos = Vec::new();
+    // The chain's first step whose token is not the one-shot's: (position, near-tie).
+    let mut first_divergence: Option<(usize, bool)> = None;
     for i in 0..DECODES as usize {
         let p = Q as usize + i;
+        scan.print(&mut worker, "(k-diag chain)", (rows[p], p), &mut |w| {
+            replay_seat_b(w, &rows, Q as usize, p)
+        });
         let logits = forward(&mut worker, 1, &[rows[p]], p as u32, SEAT_A).expect("a decode");
         pass &= all_finite(&logits);
         let got = snapshot(&mut worker, SEAT_A, p, logits);
         let want = reference(&mut worker, i);
         refs_identical &= want.logits[..] == one_shot[p * VOCAB..][..VOCAB];
+        let (token, _) = top1_margin(&got.logits);
+        let (want_token, margin) = top1_margin(&want.logits);
+        let diff = max_diff(&got.logits, &want.logits);
+        if token != want_token && first_divergence.is_none() {
+            first_divergence = Some((p, margin <= 2.0 * diff));
+        }
         chain_cos.push(report("chain", i, &got, &want));
     }
+    let divergence_ok = first_divergence.is_none_or(|(_, tie)| tie);
+    eprintln!(
+        "(k-diag) chain: first step whose token differs from the one-shot's (position, near-tie \
+         when the one-shot margin <= 2 x max|diff|)={first_divergence:?} {}",
+        verdict(divergence_ok)
+    );
     // Teacher-forced: each decode one step off the one-shot trajectory.
     let mut forced_cos = Vec::new();
     for i in 0..DECODES as usize {
         let p = Q as usize + i;
         forward(&mut worker, 512, &rows[..p], 0, SEAT_A).expect("the teacher-forced prefill");
+        scan.print(&mut worker, "(k-diag teacher-forced)", (rows[p], p), &mut |w| {
+            replay_seat_b(w, &rows, p, p)
+        });
         let logits = forward(&mut worker, 1, &[rows[p]], p as u32, SEAT_A).expect("a decode");
         pass &= all_finite(&logits);
         let got = snapshot(&mut worker, SEAT_A, p, logits);
@@ -1304,6 +1521,11 @@ fn k_diag_decode_drift_against_one_shot() {
     assert!(
         forced_ok,
         "a teacher-forced decode is below cosine {TEACHER_FORCED_DECODE_COSINE}: one step is wrong"
+    );
+    assert!(
+        divergence_ok,
+        "the chain first picks another token than the one-shot row where that row is not a \
+         near-tie"
     );
 }
 
