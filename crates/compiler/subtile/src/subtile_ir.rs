@@ -867,7 +867,14 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | L::AllRowsMatmul
             | L::Sample { .. }
             | L::EmbedRowGather { .. }
-            | L::ChainStage { .. } => None,
+            | L::ChainStage { .. }
+            | L::CaptureHidden { .. }
+            | L::DraftConv { .. }
+            | L::DraftAttention { .. }
+            | L::DraftContextKv { .. }
+            | L::DraftWindowStore
+            | L::DraftWindowLoad
+            | L::DraftSelect => None,
         }
     }
 
