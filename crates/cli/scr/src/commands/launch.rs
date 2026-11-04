@@ -175,18 +175,76 @@ fn auto_mode_only_env(proxy_url: &str) -> Vec<(&'static str, String)> {
 }
 
 /// The gateway an `--auto-mode-only` session keeps talking to, from the user's
-/// `ANTHROPIC_BASE_URL`. Refused when unset: the proxy would have nowhere to send
-/// the session, and Claude Code's default endpoint is Anthropic's own API,
-/// which a claude.ai login does not reach through a proxy.
-fn user_gateway(base_url: Option<&str>) -> Result<String> {
-    match base_url.map(str::trim).filter(|u| !u.is_empty()) {
-        Some(url) => Ok(url.trim_end_matches('/').to_string()),
-        None => bail!(
-            "--auto-mode-only keeps your session on your own gateway and needs it in \
-             ANTHROPIC_BASE_URL (with its token in ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY). \
-             A claude.ai login cannot go through a local proxy."
+/// `ANTHROPIC_BASE_URL`, the way Claude Code itself resolves it: a settings
+/// file's `env` block outranks the process environment, so the highest of
+/// [`settings_files`] that sets it wins, and the shell's value counts only when
+/// none does. The proxy must forward to the same gateway Claude Code would
+/// talk to, because that is where Claude Code's token for it is meant to go.
+///
+/// Refused when nothing sets it: the proxy would have nowhere to send the
+/// session, and Claude Code's default endpoint is Anthropic's own API, which a
+/// claude.ai login does not reach through a proxy. Also refused when a settings
+/// file and the shell name different gateways, since the user's intent is not
+/// clear and a wrong guess sends a token to a host it was not meant for.
+fn user_gateway(
+    env: Option<&str>,
+    files: &[(std::path::PathBuf, Option<String>)],
+) -> Result<String> {
+    let clean =
+        |u: &str| Some(u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty());
+    let env = env.and_then(clean);
+    let file = files
+        .iter()
+        .find_map(|(path, url)| url.as_deref().and_then(clean).map(|u| (path, u)));
+    match (file, env) {
+        (Some((path, from_file)), Some(from_env)) if from_file != from_env => bail!(
+            "--auto-mode-only found two gateways: ANTHROPIC_BASE_URL is {from_env} in your shell \
+             but {from_file} in {}. Claude Code would use the settings file's, and send that \
+             gateway's token there. Make them match, or remove one, so it is clear which gateway \
+             the session goes to.",
+            path.display()
+        ),
+        (Some((_, url)), _) | (None, Some(url)) => Ok(url),
+        (None, None) => bail!(
+            "--auto-mode-only keeps your session on your own gateway and needs its address in \
+             ANTHROPIC_BASE_URL, in your shell or in a Claude Code settings file ({}), with its \
+             token in ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY. A claude.ai login cannot go \
+             through a local proxy.",
+            files
+                .iter()
+                .map(|(p, _)| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
+}
+
+/// The Claude Code settings files whose `env` block can set the gateway,
+/// highest precedence first (measured on claude 2.1.292): the project's local
+/// file, the project's file, then the user's. Managed policy outranks all three
+/// but is not always a file (macOS profiles, server-managed policy), so it is
+/// not read here.
+fn settings_files(
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut files = vec![
+        cwd.join(".claude/settings.local.json"),
+        cwd.join(".claude/settings.json"),
+    ];
+    files.extend(home.map(|h| h.join(".claude/settings.json")));
+    files
+}
+
+/// `ANTHROPIC_BASE_URL` from a settings file's `env` block, if the file exists
+/// and sets it. An unreadable or malformed file sets nothing.
+fn settings_base_url(path: &std::path::Path) -> Option<String> {
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    json.get("env")?
+        .get("ANTHROPIC_BASE_URL")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// The `--auto-mode-only` half of [`run_launch_claude`]: start the proxy in
@@ -272,6 +330,11 @@ async fn run_auto_mode_only(
         "Launching `{}` in auto mode: session → {gateway}, safety checks → {local_url} \
          (model: {local_model}) via {proxy_url}",
         args.claude_bin
+    );
+    eprintln!(
+        "Note: {local_model} is a weaker judge than Claude's own classifier and allows some \
+         actions it would block (`scr launch claude-eval run` measures how many). This is for \
+         dogfooding, not a safety net."
     );
     // Blocking on the child here would starve nothing — the runtime has other
     // workers — but say so: the proxy runs on those workers while claude runs.
@@ -872,8 +935,18 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     // `--auto-mode-only`: read the user's own gateway before anything else, so a
     // launch that cannot route the session anywhere fails before a model loads.
     let gateway = if args.auto_mode_only {
+        let cwd = std::env::current_dir().context("cannot read the current directory")?;
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let files: Vec<_> = settings_files(&cwd, home.as_deref())
+            .into_iter()
+            .map(|p| {
+                let url = settings_base_url(&p);
+                (p, url)
+            })
+            .collect();
         Some(user_gateway(
             std::env::var("ANTHROPIC_BASE_URL").ok().as_deref(),
+            &files,
         )?)
     } else {
         None
@@ -1470,7 +1543,8 @@ mod tests {
         claude_code_output_budget, claude_code_window, claude_settings_json,
         context_window_from_models, context_window_warning, gen_uuid_v4, ignored_with_server_url,
         is_print_mode, launch_env, provenance_report, resolve_session_inject, serve_argv,
-        session_id_from_args, settings_flag_in_args, user_gateway,
+        session_id_from_args, settings_base_url, settings_files, settings_flag_in_args,
+        user_gateway,
     };
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -1570,11 +1644,99 @@ mod tests {
     #[test]
     fn auto_mode_only_needs_the_users_gateway() {
         assert_eq!(
-            user_gateway(Some("https://gw.example.com/")).unwrap(),
+            user_gateway(Some("https://gw.example.com/"), &[]).unwrap(),
             "https://gw.example.com"
         );
-        assert!(user_gateway(None).is_err());
-        assert!(user_gateway(Some("  ")).is_err());
+        assert!(user_gateway(None, &[]).is_err());
+        assert!(user_gateway(Some("  "), &[]).is_err());
+    }
+
+    /// A settings file's gateway counts the way Claude Code counts it: the
+    /// highest file that sets it wins, and it outranks the shell. Two
+    /// different gateways are refused, naming both.
+    #[test]
+    fn auto_mode_only_reads_the_gateway_from_settings_files() {
+        use std::path::PathBuf;
+        let local = PathBuf::from("/p/.claude/settings.local.json");
+        let user = PathBuf::from("/h/.claude/settings.json");
+
+        // Only a settings file sets it.
+        let files = [
+            (local.clone(), None),
+            (user.clone(), Some("https://gw.example/".into())),
+        ];
+        assert_eq!(user_gateway(None, &files).unwrap(), "https://gw.example");
+
+        // The higher file wins over the lower one.
+        let files = [
+            (local.clone(), Some("https://high.example".into())),
+            (user.clone(), Some("https://low.example".into())),
+        ];
+        assert_eq!(user_gateway(None, &files).unwrap(), "https://high.example");
+
+        // Shell and file agree (trailing slash aside): fine.
+        let files = [(user.clone(), Some("https://gw.example".into()))];
+        assert_eq!(
+            user_gateway(Some("https://gw.example/"), &files).unwrap(),
+            "https://gw.example"
+        );
+
+        // They disagree: refused, and the message names both.
+        let err = user_gateway(Some("https://shell.example"), &files)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("https://shell.example") && err.contains("https://gw.example"),
+            "{err}"
+        );
+        assert!(err.contains("settings.json"), "{err}");
+
+        // Nothing anywhere: the refusal lists the files it looked in.
+        let err = user_gateway(None, &[(local, None)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("settings.local.json"), "{err}");
+    }
+
+    /// Files are read in Claude Code's precedence order, and only an `env`
+    /// block's `ANTHROPIC_BASE_URL` counts.
+    #[test]
+    fn settings_files_are_read_in_precedence_order() {
+        use std::path::Path;
+        let files = settings_files(Path::new("/p"), Some(Path::new("/h")));
+        assert_eq!(
+            files,
+            [
+                Path::new("/p/.claude/settings.local.json"),
+                Path::new("/p/.claude/settings.json"),
+                Path::new("/h/.claude/settings.json"),
+            ]
+        );
+
+        let dir = std::env::temp_dir().join(format!("scr-settings-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let set = write(
+            "set.json",
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://gw.example"}}"#,
+        );
+        let top = write(
+            "top.json",
+            r#"{"ANTHROPIC_BASE_URL":"https://not-env.example"}"#,
+        );
+        let bad = write("bad.json", "not json");
+        assert_eq!(
+            settings_base_url(&set).as_deref(),
+            Some("https://gw.example")
+        );
+        assert_eq!(settings_base_url(&top), None, "only the env block counts");
+        assert_eq!(settings_base_url(&bad), None);
+        assert_eq!(settings_base_url(&dir.join("missing.json")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The local server starts with thinking off when it answers safety checks,
