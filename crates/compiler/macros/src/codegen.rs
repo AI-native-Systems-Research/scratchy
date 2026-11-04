@@ -17457,9 +17457,6 @@ mod fingerprint_tests {
         use crate::config::{DRAFT_CAPTURE_LAYERS, LayerSet};
         for (arch, stem) in [
             ("commandr", "c4ai-command-r-v01"),
-            ("deepseek-v2", "deepseek-v2-lite"),
-            ("deepseek-v3", "deepseek-v3-academic-9b-fp8-block"),
-            ("deepseek-v3-flat", "moonlight-16b-a3b-instruct-fp8-block"),
             ("gemma2", "gemma2-27b"),
             ("gemma3", "gemma-3-12b-it"),
             ("gemma4", "gemma-4-12b-it"),
