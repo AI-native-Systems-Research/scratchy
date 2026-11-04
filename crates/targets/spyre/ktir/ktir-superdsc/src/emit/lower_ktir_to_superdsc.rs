@@ -1864,11 +1864,11 @@ pub(crate) fn pointwise_tile_op_df(
 //  THE PORTED BODIES. Each one is main's, verbatim below its door.
 //
 //  ⭐ EACH IS `pub`, AND THAT IS THE PUBLIC API. The name-keyed dispatch that used to call them is
-//  `scratchy-target-spyre`'s `lower_ktir_to_superdsc::lower`, because two of them ([`attn_at`],
-//  [`rope_at`]) are reached through a model-geometry const door whose match arms are generated from
-//  the CONSUMER's model inventory. A third-party producer picks the body for its node kind and
-//  crosses that door itself — the extraction's two recorded decisions ("the public API takes the
-//  node kind explicitly", and "the caller crosses the geometry door"), made real.
+//  `scratchy-target-spyre`'s `lower_ktir_to_superdsc::lower`, because [`attn_at`] is reached
+//  through a model-geometry const door whose arms are the CONSUMER's model inventory. A third-party
+//  producer picks the body for its node kind and crosses that door itself — the extraction's two
+//  recorded decisions ("the public API takes the node kind explicitly", and "the caller crosses the
+//  geometry door"), made real. (`rope_at` left the door: its head dim is a value now.)
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// THE POINTWISE TABLE: an [`Elementwise`] kind's dxp op-func key and its arity.
@@ -4729,9 +4729,8 @@ pub fn program_tanhsoftcap_cap(f: &IRFunction<'static>) -> Option<f32> {
     Some(cap? as f32)
 }
 
-/// main's `lower_rope_node` (main 8696-9528), waiting for its head dim to become a const —
-/// exactly as main's `LowerRope` was. The caller crosses the value→const boundary at the door's
-/// `rope_at_hd` registry match.
+/// main's `lower_rope_node` (main 8696-9528). The head dim arrives as a VALUE: the lowering is
+/// written once over it, metal's discipline — no per-head-dim monomorphisation door, no registry.
 pub struct RopeAt<'a> {
     pub name: &'a str,
     /// x, cos, sin, out — main's `inputs[0..3]` and `output`.
@@ -4740,6 +4739,8 @@ pub struct RopeAt<'a> {
     pub sin: String,
     pub out: String,
     pub t: u32,
+    /// The rope's head dim, read off the program's own views by the caller.
+    pub head_dim: u32,
     pub mq: u32,
     pub total: u32,
     /// ⭐ THE ROPE-P CLASS TID this rope's `matmul(x, P)` names. One `[hd,hd]` P per DISTINCT rope
@@ -4753,26 +4754,17 @@ pub struct RopeAt<'a> {
     pub rows_are_requests: bool,
 }
 
-/// main's `lower_rope_node` (main 8696-9528) BODY, at its const head dim. Everything below the
-/// `let x = …` binding is main's text.
+/// main's `lower_rope_node` (main 8696-9528) BODY. Everything below the `let x = …` binding is
+/// main's text.
 ///
-/// ⭐⭐ `HD` IS A CONST GENERIC HERE, and that is the point of this function's whole shape.
-///
-/// The head dim is a constant of the MODEL, but this emitter is ONE binary serving every model, so inside
-/// it the value only becomes known when the proc macro runs. That is why `Shape::<0,0,0,0>` and the
-/// `_of(hd, df)` twins existed: an escape hatch for "the const generic cannot be used here". The escape
-/// hatch is what made the head-dim-dependent fork below a RUNTIME branch, and a runtime branch is what no
-/// compile-time guard can hold onto.
-///
-/// The fix is a SINGLE dispatch from the value to the const (see the caller), after which everything here
-/// is const. `shape.rs`'s own module doc asked for exactly this: "any branch on them would have to be
-/// written as a branch on a const, which shows up as a special case in review instead of hiding inside an
-/// offset expression."
-///
-/// What it buys immediately: the collapsed RoPE form and the slab RoPE form become TWO INSTANTIATIONS
-/// rather than two arms of one function, so "a head_dim-128 bundle takes the slab path" is a fact the
-/// compiler knows.
-pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
+/// ⭐ THE HEAD DIM IS A VALUE HERE, and the lowering is written once over it — metal's discipline.
+/// It used to be a const generic, which forced a value→const crossing at every call site: a
+/// monomorphisation registry (`ROPE_HEAD_DIMS`, a hand-written list of shapes) that a new head dim
+/// needed an arm added to. A shape list is what the ladder's rules forbid, so the registry is
+/// deleted and the two head-dim-dependent forks below ask the ONE law
+/// ([`crate::addr::head_major_collapse_valid`]) with the value — a law over `hd` and the
+/// format, not an arm per model config.
+pub fn rope_at(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
     let RopeAt {
         name: _name,
         x,
@@ -4780,6 +4772,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         sin,
         out,
         t,
+        head_dim: hd,
         mq,
         total,
         p_tid,
@@ -4787,7 +4780,6 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         layout,
         rows_are_requests,
     } = a;
-    let hd = HD;
     if hd == 0 || !total.is_multiple_of(hd) {
         return err(format!(
             "RopeRotate t{t}: output cols {total} not a multiple of head_dim {hd}"
@@ -4907,9 +4899,10 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         None
     };
     if let Some(rows) = collapse_rows
-        // ⭐ FROM THE TYPE. `HD` is a const generic now, so this is a compile-time constant and the two
-        // RoPE forms below are two instantiations of this function rather than two runtime arms.
-        .filter(|_| crate::addr::Shape::<HD, 0, 0, 0>::head_major_collapse_valid_here(Df::Fp16))
+        // ⭐ THE ONE LAW, asked with the value: `hd == lanes` at this format. Single-homed in
+        // `addr::shape` (the const-generic entry delegates to the same expression), so there is
+        // one answer and not two.
+        .filter(|_| crate::addr::head_major_collapse_valid(hd, Df::Fp16))
     {
         // ⛔ DECLARE BEFORE USE. This branch (`hd == stick`, the head-major collapse) referenced
         // `rot`/`xc`/`rs` without ever declaring them, so they fell to `resolve_seg_base`'s bump —
@@ -5255,12 +5248,13 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
     // K: 992 -> 32). Mathematically identical work, just not unrolled over rows.
     // Gated to hd==stick (the multi-slab hd>stick case is handled by the slab path above) and to
     // mq>1, so decode (mq==1) never reaches here and its emission is untouched.
-    // ⭐ FROM THE TYPE — `HD` is this function's const generic, so the gate is a compile-time constant.
+    // ⭐ THE ONE LAW, asked with the value (`hd == lanes` at this format) — same expression the
+    // const-generic entry delegates to, single-homed in `addr::shape`.
     // ⛔ AND NOTE THE `mq > 1` TERM IS A *WIDTH* TEST, NOT A KIND TEST: it reads "more than one query row",
     // which is true of a prefill chunk AND of a decode batch. The comment below claims "decode (mq==1)
     // never reaches here", and that is FALSE for a BATCHED decode, whose mq is the batch width. The kind
     // is `rows_are_requests`; the count cannot stand in for it.
-    if mq > 1 && crate::addr::Shape::<HD, 0, 0, 0>::head_major_collapse_valid_here(Df::Fp16) {
+    if mq > 1 && crate::addr::head_major_collapse_valid(hd, Df::Fp16) {
         // Declare the rope intermediates at their TRUE full extent. Without this they are sized by
         // whichever access declares first, which was the per-head `[mq,hd]` matmul — ONE head, so the
         // tensor under-reserved by a factor of `heads` (the exact bump-allocator defect

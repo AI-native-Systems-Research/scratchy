@@ -4103,10 +4103,10 @@ mod production_ktir_dump {
     /// NAMED skip, never a silent one. Everything else must lower or the dump fails.
     fn sdsc_skip_of(name: &str) -> Option<&'static str> {
         match name {
-            // The geometry const door: `rope_at::<HD>` monomorphises on head geometry the
-            // driver would have to state from the fixture's constexprs (`bake_py`'s rope
-            // arm). The KTIR-text leg still covers it.
-            "rope_fwd" => Some("the model-geometry const door (rope_at::<HD>)"),
+            // The rope's geometry entry: `drive_rope` reads it from the fixture's own
+            // constexprs (`bake_py`'s rope arm), which this generic dispatch cannot. The
+            // KTIR-text leg still covers it.
+            "rope_fwd" => Some("the rope geometry entry (drive_rope's constexpr read)"),
             // The paged step's card lowering is not ported: the door refuses both programs by
             // name. The KTIR-text leg covers them.
             // No `Program` variant exists and none is inventable here: the MoE lowers

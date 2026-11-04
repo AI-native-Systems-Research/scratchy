@@ -100,18 +100,16 @@ impl<const HD: u32, const NQH: u32, const NKVH: u32, const CAP: u32> Shape<HD, N
     /// Asking this question with a runtime `hd` demotes a constant to a value, and a value cannot be
     /// guarded at build time — which is why the hd=64 / hd=128 divergence has been a runtime branch
     /// rather than two instantiations, and why every attempt to lock it down had nothing to hold onto.
+    ///
+    /// The lowering is now written once over the head dim as a VALUE (metal's discipline, and the
+    /// shape-list ban's demand): no more per-head-dim monomorphisation door, no `ROPE_HEAD_DIMS`
+    /// registry to edit when a config states a new head dim. So the question IS asked with a value —
+    /// through [`head_major_collapse_valid`], the free function below the impl — the ONE law both
+    /// entries of this pair share. The `Shape::<0,0,0,0>` bypass twin is still deleted and stays
+    /// deleted: the value form is not a second path but the same expression, single-homed there.
     pub const fn head_major_collapse_valid_here(df: Df) -> bool {
-        HD == df.elems_per_stick()
+        head_major_collapse_valid(HD, df)
     }
-
-    // ⛔⛔⛔ THE RUNTIME TWIN IS DELETED. It took the head dim as a VALUE — `Shape::<0,0,0,0>` built and
-    // then bypassed — so every site that used it was a place where a `cargo build` error was
-    // IMPOSSIBLE: a constant the proc macro already knows, demoted to something only a runtime branch
-    // could test. Its own doc said "do not add new callers" and carried a ⏭ to remove it once the
-    // lowering gained `HD` as a const generic. The lowering has, so it is gone, and
-    // [`Self::head_major_collapse_valid_here`] — which reads `HD` off the type — is the only way left
-    // to ask. The predicate can no longer be reached with a value, so it can no longer be answered too
-    // late to matter.
 
     /// GQA group size — how many query heads share one kv head.
     pub const fn gqa() -> Gqa {
@@ -176,3 +174,11 @@ const _: () = assert!(Shape::<128, 32, 8, 128>::head_major_collapse_valid_here(
 const _: () = assert!(!Shape::<64, 32, 8, 128>::head_major_collapse_valid_here(
     Df::Fp8
 ));
+
+/// ⭐ THE COLLAPSE LAW, AT A HEAD DIM KNOWN AS A VALUE — the one place `hd == lanes` may be
+/// written. The rope lowering is written once over the head dim as a value (metal's discipline;
+/// no monomorphisation registry), so it asks the law here; [`Shape::head_major_collapse_valid_here`]
+/// delegates to this same expression for the const-generic callers, making it ONE law, not two.
+pub const fn head_major_collapse_valid(hd: u32, df: Df) -> bool {
+    hd == df.elems_per_stick()
+}

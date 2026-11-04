@@ -280,17 +280,15 @@ fn emit_regions(
                 ),
             });
         }
-        // THE MONOMORPHISATION DOOR. `rope_at::<HD>` is not reachable without the geometry, and
-        // the geometry is a const parameter, so `Program::Rope` is refused here and driven from
-        // `drive_rope` which takes it explicitly. Refused rather than defaulted: a wrong head
-        // count is a silently wrong grouping.
+        // THE GEOMETRY ENTRY. `Program::Rope` is driven from `drive_rope`, which reads the
+        // fixture's own constexpr geometry (head dim, P class, row kind) and nothing else. Refused
+        // here rather than defaulted: a wrong head count is a silently wrong grouping.
         Program::Rope => {
             return Err(Error {
                 stage: "program",
                 message: format!(
-                    "{:?} crosses the model-geometry const door (`rope_at::<HD>`), so it cannot \
-                     be dispatched from a runtime `Program`. Call the generic entry with the \
-                     fixture's own tl.constexpr values",
+                    "{:?} is the rope body, which needs its fixture's own tl.constexpr geometry \
+                     (head dim, P class, rows kind) — drive it from `drive_rope`, which reads them",
                     node.program
                 ),
             });
@@ -311,11 +309,11 @@ fn emit_regions(
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  THE MODEL-GEOMETRY CONST DOOR
 //
-//  `rope_at::<HD>` and `attn_at::<NQH, NKVH, HD>` are const-generic because the head geometry
-//  parameterises the DEVICE layout — GQA grouping, slabs, head strides — so a branch on it is a
-//  branch on a const the compiler can hold onto (`rope_at`'s own doc: "the collapsed RoPE form and
-//  the slab RoPE form become TWO INSTANTIATIONS rather than two arms of one function"). A runtime
-//  `Program` cannot reach them; something has to name the triple.
+//  `attn_at::<NQH, NKVH, HD>` is const-generic because the head geometry parameterises the DEVICE
+//  layout — GQA grouping, slabs, head strides — so a branch on it is a branch on a const the
+//  compiler can hold onto. A runtime `Program` cannot reach it; something has to name the triple.
+//  (`rope_at` no longer crosses this door: it takes the head dim as a VALUE, the lowering written
+//  once over it — one law asked with the value, no per-head-dim registry.)
 //
 //  ⛔ THE VALUES ARE THE FIXTURE'S OWN `tl.constexpr`, READ, NEVER DEFAULTED. `HEAD_DIM`, `H` and
 //  `GQA` are constexpr parameters of the kernels themselves (`attention_flash.py` line 339-343,
@@ -499,6 +497,7 @@ pub fn drive_rope(
         sin: ins[2].name(),
         out: out.name(),
         t: out.tid,
+        head_dim,
         mq,
         total,
         p_tid,
@@ -506,25 +505,10 @@ pub fn drive_rope(
         layout,
         rows_are_requests,
     };
-    // THE DOOR. Enumerated, so a head dim outside the set is a refusal naming it rather than a
-    // monomorphisation nobody asked for; 64/128/256 are the head dims this tree's models state
-    // (`rope.py`'s `HEAD_DIM = 128`, and the crate's own slab path exists for hd > 64).
-    let out = match head_dim {
-        64 => emit::lower_ktir_to_superdsc::rope_at::<64>(a),
-        128 => emit::lower_ktir_to_superdsc::rope_at::<128>(a),
-        256 => emit::lower_ktir_to_superdsc::rope_at::<256>(a),
-        other => {
-            return Err(Error {
-                stage: "geometry",
-                message: format!(
-                    "{name}: head_dim {other} has no `rope_at::<HD>` instantiation here (64, 128, \
-                     256). It is a CONST parameter of the device layout, so a new head dim is a new \
-                     arm in this match — never a runtime value threaded past the door."
-                ),
-            });
-        }
-    };
-    out.map_err(|e| Error {
+    // NO DOOR: `rope_at` takes the head dim as a VALUE — the lowering is written once over it, so
+    // there is no monomorphisation match here and no head-dim set to keep in step with the tree's
+    // configs.
+    emit::lower_ktir_to_superdsc::rope_at(a).map_err(|e| Error {
         stage: "ktir-superdsc",
         message: format!("{e:?}"),
     })

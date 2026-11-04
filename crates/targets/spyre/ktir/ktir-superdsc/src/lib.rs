@@ -29,11 +29,12 @@
 //! ([`ktir_node::BufferId`]) and this crate treats the numbers as keys. It never asks what a buffer
 //! is, which is why the contract needs no trait over the producer's tensor type.
 //!
-//! ⛔ THE ONE DOOR THE CALLER CROSSES IS MONOMORPHISATION. The head dim parameterises the device
-//! layout (slabs, head strides), so it must be `const`, not a value:
-//! [`emit::lower_ktir_to_superdsc::rope_at`]`::<HD>` is the generic entry point and the CALLER
-//! instantiates it from its own model configs. That arm set is the consumer's model inventory, so a
-//! leaf crate must not own it, and it cannot be received as data either.
+//! ⛔ THE ONE DOOR THE CALLER CROSSES IS MONOMORPHISATION, AND ROPE NO LONGER CROSSES IT. The
+//! attention geometry still parameterises the device layout (GQA grouping, head strides), so
+//! [`attn_at`](emit::lower_ktir_to_superdsc) stays const-generic and the caller instantiates it
+//! from its own model configs — that arm set is the consumer's model inventory, so a leaf crate
+//! must not own it. `rope_at` takes the head dim as a VALUE (the lowering written once over it,
+//! one law asked with the value), so it needs no inventory and no crossing.
 //!
 //! ⚠️ NOT YET LEAF-CLEAN: [`emit::EmittedOp`], this crate's own output type, still carries a
 //! consumer's bake plan (`kv_page_fold`, `kv_batched_requests`, `kv_fold_rows`, `kv_page_slots`,

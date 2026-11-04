@@ -3852,7 +3852,6 @@ dependencies = [
  "scratchy-ir",
  "scratchy-spyre-bundle",
  "scratchy-tensors",
- "serde_json",
 ]
 
 [[package]]

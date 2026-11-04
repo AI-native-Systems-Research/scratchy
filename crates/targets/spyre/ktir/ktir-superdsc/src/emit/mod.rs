@@ -46,9 +46,9 @@ pub mod ktir_matmul_fp8;
 /// A PROGRAM THAT WALKS: one constant-trip `scf.for`, its body built once at trip 0 and relaunched
 /// per trip by the card (the paged attention's page walk).
 pub mod loop_fold;
-/// KTIR → SuperDSC: `ibm/main`'s `lower_*_node` bodies with their input door changed. The one that
-/// crosses a model-geometry const door ([`lower_ktir_to_superdsc::rope_at`]) is a public generic
-/// entry point the CALLER instantiates.
+/// KTIR → SuperDSC: `ibm/main`'s `lower_*_node` bodies with their input door changed. The attention
+/// body ([`lower_ktir_to_superdsc::attn_at`]) crosses a model-geometry const door and is a public
+/// generic entry point the CALLER instantiates; the rope body takes its head dim as a value.
 pub mod lower_ktir_to_superdsc;
 pub mod lx_plan;
 /// THE WHOLE-FUNCTION DOOR — walk a multi-op KTIR program in program order and dispatch each

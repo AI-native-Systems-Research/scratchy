@@ -24,7 +24,7 @@
 //! semantic coordinate. A caller never writes a stride, so it cannot omit one.
 
 pub mod shape;
-pub use shape::{Gqa, PadRows, Rows, Shape, Slabs};
+pub use shape::{Gqa, PadRows, Rows, Shape, Slabs, head_major_collapse_valid};
 
 mod window;
 pub use window::Win;

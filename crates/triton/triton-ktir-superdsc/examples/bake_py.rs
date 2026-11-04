@@ -99,10 +99,10 @@ fn main() {
         println!("{}", triton_ktir_superdsc::dump(&node));
     }
 
-    // THE MODEL-GEOMETRY CONST DOOR. `emit_node` refuses `Program::{Rope, Attn}` ON PURPOSE: their
-    // bodies are monomorphised on the head geometry (`rope_at::<HD>`, `attn_at::<NQH, NKVH, HD>`),
-    // which is a CONST parameter, so no runtime `Program` can reach them and defaulting the geometry
-    // would make a wrong head count a silently wrong grouping. `drive_rope` takes it explicitly.
+    // THE MODEL-GEOMETRY ENTRY. `emit_node` refuses `Program::{Rope, Attn}` ON PURPOSE: their
+    // bodies need the head geometry (`rope_at` takes it as a value, `attn_at::<NQH, NKVH, HD>` as
+    // consts), which no runtime `Program` carries, and defaulting the geometry would make a wrong
+    // head count a silently wrong grouping. `drive_rope` takes it explicitly.
     //
     // The values come from the fixture's OWN `tl.constexpr`s -- the same numbers the kernel was
     // compiled against on the leg above, not a second statement of them that could drift.

@@ -3,16 +3,13 @@
 //! and the reason it stays is that it cannot cross.
 //!
 //! ⭐ THE LOWERING ITSELF IS [`ktir_superdsc::emit::lower_ktir_to_superdsc`]. What is left here is
-//! the name-keyed dispatch ([`lower`]) plus the arm that turns a model's head geometry into a
-//! CONST GENERIC.
+//! the name-keyed dispatch ([`lower`]).
 //!
-//! ⛔ THE ARM SET IS A REGISTRY THIS CRATE OWNS OUT LOUD. The head dim is a const generic
-//! (a monomorphisation site), so a value cannot cross — the crate exposes
-//! [`rope_at`](ktir_superdsc::emit::lower_ktir_to_superdsc::rope_at)`::<HD>` as the public
-//! generic entry point and THE CALLER CROSSES THE DOOR through [`rope_at_hd`], a match over
-//! `ROPE_HEAD_DIMS` — every head dim a checked-in model config declares (the same registry
-//! discipline `BundleLayout::rope_class_hds` follows). A head dim with no arm is a loud bake
-//! error naming the registry, answered by a `config.json` or by adding the arm.
+//! ⛔ THERE IS NO GEOMETRY DOOR ANYMORE. `rope_at` takes the head dim as a VALUE — the rope
+//! lowering is written once over it (metal's discipline), so no monomorphisation registry of
+//! head dims exists here, and a model config stating a head dim this tree has never seen lowers
+//! through the same code as every other. The head-dim-dependent device forks inside the lowering
+//! ask the ONE law (`Shape::head_major_collapse_valid`) with that value.
 
 //! ⭐⭐ AND THAT IS ALSO WHY THE MODEL'S AND THE BUNDLE'S OWN FACTS LIVE HERE. [`BundleAttnParams`] is
 //! `ibm/main`'s `lower_one_node` parameter set for the attention path — the head geometry and the
@@ -226,7 +223,7 @@ fn lower_kind(
         Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
         // ⭐ NO DOOR TO CROSS. A transpose's descriptor is parameterised by the two extents its own
         // program states and by nothing about the model, so the arm is the body — unlike `rope`/`attn`
-        // above, whose head geometry has to become const generics on this side.
+        // above, whose attention head geometry has to become const generics on this side.
         Program::Transpose => lk::transpose(name, &r, sym_id_base, layout),
     }
 }
@@ -244,33 +241,11 @@ fn windowed(
     Ok(ops)
 }
 
-/// ⭐ THE CONST-GENERIC REGISTRY — every head dim a checked-in model config declares. The
-/// head dim parameterises the device layout (slabs = head_dim/lanes, and the head-major
-/// collapse is valid only at head_dim == lanes), so it must be a const, not a value; the arms
-/// below are the monomorphisations the workspace's configs need. A config declaring a head dim
-/// outside this set is a loud bake error at [`rope_at_hd`]'s caller — the fix is an arm here.
-const ROPE_HEAD_DIMS: &[u32] = &[32, 64, 72, 128, 192, 256, 512];
-
-/// Cross the value→const boundary for one rope: `Some` for a head dim the registry holds,
-/// `None` for one it does not (the caller refuses, naming the registry).
-fn rope_at_hd(hd: u32, at: lk::RopeAt<'_>) -> Option<Result<Vec<EmittedOp>, Error>> {
-    match hd {
-        32 => Some(rope_at::<32>(at)),
-        64 => Some(rope_at::<64>(at)),
-        72 => Some(rope_at::<72>(at)),
-        128 => Some(rope_at::<128>(at)),
-        192 => Some(rope_at::<192>(at)),
-        256 => Some(rope_at::<256>(at)),
-        512 => Some(rope_at::<512>(at)),
-        _ => None,
-    }
-}
-
-/// ⭐ THE DOOR. main's `lower_rope_node` read `mq`/`total` off a `TileOp` built from the node and its
-/// operand names off `ds_name`. `total` is the node's declared output width and `mq` its row count —
+/// ⭐ THE ROPE ENTRY. main's `lower_rope_node` read `mq`/`total` off a `TileOp` built from the node and
+/// its operand names off `ds_name`. `total` is the node's declared output width and `mq` its row count —
 /// both carried on [`KtirNode::out_shape`], because the program states only their product with
-/// `heads` (see that field). The head dim is the `x` view's own column extent, and it becomes the
-/// const generic through the SAME door main crossed.
+/// `heads` (see that field). The head dim is the `x` view's own column extent, and it crosses as a
+/// VALUE — `rope_at` is written once over it, so no registry and no monomorphisation here.
 fn rope(
     name: &str,
     r: &[Region],
@@ -406,9 +381,6 @@ fn rope_at_geometry(
     // emits the same ops either way, so no program can state it. A rope in a bundle with no attention
     // node has no requests to have rows of, which is main's own `false` at that call site.
     let rows_are_requests = attn_params.is_some_and(|p| p.rows_are_requests);
-    // ⭐⭐ THE ONE PLACE THE HEAD DIM STOPS BEING A VALUE, the same door `lower_one_node` crossed for
-    // the SubtileIR path: the arms are every head dim the workspace's model configs declare, and a
-    // head dim with no arm is a loud bake error answered by a `config.json`.
     if hd == 0 {
         return err(format!("{name}: the `x` view states a zero head dim"));
     }
@@ -428,31 +400,19 @@ fn rope_at_geometry(
                 layout.map(|l| l.rope_class_hds.clone()).unwrap_or_default(),
             ),
         })?;
-    rope_at_hd(
-        hd,
-        lk::RopeAt {
-            name,
-            x: ins[0].name(),
-            cos: ins[1].name(),
-            sin: ins[2].name(),
-            out: out.name(),
-            t: out.tid,
-            mq,
-            total,
-            p_tid,
-            sym_id_base,
-            layout,
-            rows_are_requests,
-        },
-    )
-    .ok_or_else(|| Error {
-        message: format!(
-            "{name}: head_dim {hd} has no const-generic instantiation. The head dim \
-             parameterises the device layout (slabs = head_dim/lanes, and the head-major collapse \
-             is valid only at head_dim == lanes), so it must be a const, not a value. The \
-             instantiation registry is ROPE_HEAD_DIMS = {ROPE_HEAD_DIMS:?}, every head dim a \
-             checked-in model config declares; this head dim belongs to none of them — add the \
-             arm or fix the config.",
-        ),
-    })?
+    rope_at(lk::RopeAt {
+        name,
+        x: ins[0].name(),
+        cos: ins[1].name(),
+        sin: ins[2].name(),
+        out: out.name(),
+        t: out.tid,
+        head_dim: hd,
+        mq,
+        total,
+        p_tid,
+        sym_id_base,
+        layout,
+        rows_are_requests,
+    })
 }
