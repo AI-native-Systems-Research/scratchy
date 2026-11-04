@@ -111,6 +111,10 @@ pub struct DeclaredArchSpec {
     pub reads_target_kv: bool,
     /// The weights a head borrows from its target (`embed_tokens`, `lm_head`); `None`: both.
     pub borrows: Option<Vec<String>>,
+    /// Where a head's own config lists the target layers whose output rows it reads
+    /// (`dflash_config.target_layer_ids`, a DFlash2 drafter's): its target captures those layers'
+    /// outputs (`draft_capture_layers`, the target's layer set). `None`: it reads none of them.
+    pub target_capture_layers: Option<String>,
     /// Weights at the checkpoint's top level beside the decoder root, as `lm_head` is.
     pub top_level_weights: Vec<String>,
     pub tie_default: Option<bool>,
@@ -152,6 +156,9 @@ pub enum ParamSource {
     Expr(String),
     /// `#[value = <int>]` literal.
     Value(u64),
+    /// `len_of = "dotted.path"`: the length of the config's array at the path (a DFlash2 drafter's
+    /// `dflash_config.target_layer_ids`: how many of its target's layers it reads).
+    LenOf(String),
 }
 
 // ── Schema evaluation ───────────────────────────────────────────────
@@ -215,6 +222,12 @@ impl DeclaredArchSpec {
                 ParamSource::Expr(e) => eval_expr(e, bounds)
                     .map_err(|err| format!("params field `{}`: {err}", f.name))?,
                 ParamSource::Value(v) => *v,
+                ParamSource::LenOf(path) => json_path(json, path)
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len() as u64)
+                    .ok_or_else(|| {
+                        format!("params field `{}`: config has no array `{path}`", f.name)
+                    })?,
             };
             bounds.insert(f.name.clone(), v);
         }

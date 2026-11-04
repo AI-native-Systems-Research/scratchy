@@ -394,6 +394,14 @@ impl<'a> Unroller<'a> {
     fn lower_instr(&mut self, instr: &Instr) -> Result<(), UnrollError> {
         match instr {
             Instr::Assign { target, value } => {
+                // An alias (`captured = hidden_states`, the arm of an `if` that runs nothing):
+                // the name binds the local's tile, and no node is pushed.
+                if let Expr::Local(source) = value {
+                    let binding = (self.local_to_tile.get(source).copied())
+                        .ok_or(UnrollError::MissingShape { id: *source })?;
+                    self.local_to_tile.insert(*target, binding);
+                    return Ok(());
+                }
                 let shape = self
                     .inferred
                     .locals

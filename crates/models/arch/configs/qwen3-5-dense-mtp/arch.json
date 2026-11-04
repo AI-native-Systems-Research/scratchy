@@ -1,0 +1,43 @@
+{
+  "_comment": "The Qwen3.5/3.6/3.8 DENSE targets' multi-token-prediction head (Qwen3.8-27B: mlx-community/Qwen3.8-27B-MTP-4bit). It is `qwen3-5-mtp` (whose _comment holds the head's design: the fused embedding/hidden input, its own full-attention layer and KV, the target's embedding and lm_head lent, drafting over a 65536-token vocabulary prefix, `drafter_repo_infix`) with its target's MLP: a dense target's plain SwiGLU (`mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj`, `intermediate_size` wide) in place of the MoE target's routed experts and gated shared expert. Its checkpoint's `model_type` is `qwen3_5_mtp` too; the two heads are told apart by the target they draft for (`checkpoint_of`: `qwen3-5`, whose checkpoints are `Qwen3_5ForConditionalGeneration`, against `qwen3-5-moe`'s `Qwen3_5MoeForConditionalGeneration`), so a build compiling both picks each target's own.",
+  "hf_architectures": [
+    "qwen3_5_mtp"
+  ],
+  "checkpoint_of": [
+    "qwen3-5"
+  ],
+  "checkpoint_prefix": "language_model.mtp",
+  "drafter_repo_infix": "-MTP",
+  "scale_dtype": "bf16",
+  "bound_defaults": {
+    "rms_norm_zero_centered": 1,
+    "spec_drafts": 2,
+    "spec_verify_rows": 8,
+    "spec_wide_window": 4
+  },
+  "decoder_safetensors_prefix": "",
+  "params": [
+    {
+      "name": "num_hidden_layers",
+      "from": "mtp_num_hidden_layers",
+      "replaces": true
+    },
+    {
+      "name": "target_num_hidden_layers",
+      "from": "num_hidden_layers"
+    },
+    {
+      "name": "embed_vocab_size",
+      "from": "vocab_size"
+    },
+    {
+      "name": "target_vocab_size",
+      "from": "vocab_size"
+    },
+    {
+      "name": "vocab_size",
+      "value": 65536,
+      "replaces": true
+    }
+  ]
+}

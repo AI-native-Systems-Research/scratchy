@@ -30,6 +30,8 @@
 #include <metal_simdgroup>
 #include <metal_stdlib>
 #include "baked.h"
+#include "affine_codes.h"
+AFFINE_CODES_PLANES_DECL;
 #include "gated_act.h"
 #include "moe_route.h"
 
@@ -699,7 +701,9 @@ METAL_FUNC void qmv_fast_impl(
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     const device T_scale* gain = nullptr,
-    const device T_act* bias = nullptr) {
+    const device T_act* bias = nullptr,
+    int plane_n = 0,
+    int plane_row0 = 0) {
   constexpr int packs_per_thread = bits == 2 ? 1 : 2;
   constexpr int num_simdgroups = 2;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
@@ -747,8 +751,15 @@ METAL_FUNC void qmv_fast_impl(
       sum = load_vector<T_act, U, values_per_thread, bits>(x, x_thread);
     }
 
+    // Under AFFINE_CODES_PLANES this lane's values_per_thread codes sit in their 64-input plane
+    // (`affine_codes.h`): row `plane_row0 + out_row + row` of `plane_n` (the matrix's rows, which
+    // a view of a block of them — the gated kernel's — names; else `out_vec_size`).
+    const int kk = k + int(simd_lid) * values_per_thread;
     for (int row = 0; row < results_per_simdgroup; row++) {
-      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      auto wl = AFFINE_CODES_PLANES
+          ? affine_codes_at((const device uchar*)w, plane_row0 + out_row + row, kk,
+                            plane_n ? plane_n : out_vec_size, in_vec_size)
+          : (const device uint8_t*)(ws + row * in_vec_size_w);
       const device T_scale* sl = scales + row * in_vec_size_g;
       const device T_scale* bl = biases + row * in_vec_size_g;
 
@@ -1461,7 +1472,9 @@ METAL_FUNC void qmv_wide_impl(
 #pragma unroll
     for (int sc = 0; sc < group_size / sub; sc++) {
       const int k0 = g * group_size + sc * sub;
-      const device uint8_t* wc = wrow + k0 * bits / 8;
+      const device uint8_t* wc = AFFINE_CODES_PLANES
+          ? affine_codes_at((const device uchar*)w, row, k0, OUT_VEC_SIZE, IN_VEC_SIZE)
+          : wrow + k0 * bits / 8;
       U w_dq[sub];
       dequantize<U, sub, bits>(wc, scale, b, w_dq);
 #pragma unroll
@@ -2021,13 +2034,15 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
   const size_t row0 = size_t(tid.y) * BLOCK_ROWS;
   const size_t w_offset = row0 * size_t(IN_VEC_SIZE) * bits / 32;
   const size_t sb_offset = row0 * size_t(IN_VEC_SIZE / group_size);
-  const device uint32_t* w = (up ? up_w : gate_w) + w_offset;
+  // Planes regroup the rows across the matrix: the impl takes the whole matrix and the block's
+  // first row instead of a view starting at it.
+  const device uint32_t* w = (up ? up_w : gate_w) + (AFFINE_CODES_PLANES ? 0 : w_offset);
   const device T_scale* scales = (up ? up_scales : gate_scales) + sb_offset;
   const device T_scale* biases = (up ? up_biases : gate_biases) + sb_offset;
   if (fast) {
     qmv_fast_impl<T_act, T_scale, group_size, bits, threadgroup T_act*, QMV_FAST_ROWS>(
         w, scales, biases, x, rows[up], IN_VEC_SIZE, BLOCK_ROWS, uint3(0), simd_gid % 2, simd_lid,
-        gain);
+        gain, nullptr, OUT_VEC_SIZE, int(row0));
   } else {
     qmv_impl<T_act, T_scale, group_size, bits, threadgroup T_act*>(
         w, scales, biases, x, rows[up], IN_VEC_SIZE, BLOCK_ROWS, uint3(0), simd_gid % 2, simd_lid,
@@ -2277,6 +2292,12 @@ constant constexpr bool COMBINE_RESIDUAL = COMBINE_RESIDUAL_FC_SET && COMBINE_RE
 SCRATCHY_CONSTANT_OPTIONAL(bool, COMBINE_LINEAR_BIAS_FC, 6);
 constant constexpr bool COMBINE_LINEAR_BIAS = COMBINE_LINEAR_BIAS_FC_SET && COMBINE_LINEAR_BIAS_FC;
 
+// 22 (`COMBINE_ROWS_SORTED`): each pair's x row sits where a sorted bake's sort put it — row
+// pos[pair] (buffer(11)) of the rows its gated command wrote in sorted order — not at the pair's
+// own row. Unset: no buffer(11).
+SCRATCHY_CONSTANT_OPTIONAL(bool, COMBINE_ROWS_SORTED_FC, 22);
+constant constexpr bool COMBINE_ROWS_SORTED = COMBINE_ROWS_SORTED_FC_SET && COMBINE_ROWS_SORTED_FC;
+
 // The MoE block's down projection and its weighted combine:
 // `out[n, d] = Σ_k down[n, k, d] · scores[n, k]`, summed in slot order (as `moe_weighted_sum`).
 // Each pair's x row is its own (the gated activation's rows); GATHER_PER_ROW is the top-k.
@@ -2285,6 +2306,7 @@ constant constexpr bool COMBINE_LINEAR_BIAS = COMBINE_LINEAR_BIAS_FC_SET && COMB
 //   buffer(4)   = rhs_indices           buffer(7) = out    [N, out_vec]
 //   buffer(8)   = shared rows, gate-scaled   buffer(9) = the gate, gate-scaled
 //   buffer(10)  = down LINEAR biases [E, out_vec], gpt-oss only
+//   buffer(11)  = pos [N, top_k], each pair's row of x in a sorted bake's order (COMBINE_ROWS_SORTED)
 // Dispatch (N, ceil(out_vec / 4), 1), threadgroup (32, top_k, 1): token n = tid.x (fastest, as
 // the gated kernel's pairs); simdgroup k runs pair (n, k)'s matvec over the 4-row group tid.y, then lanes 0-3 of simdgroup 0 combine the group's
 // rows. A pair row another threadgroup also writes (qmv_impl redoing a tail) gets the same bits.
@@ -2301,13 +2323,15 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     const device T_act*    shared_y    [[buffer(8)]],
     const device T_act*    gate        [[buffer(9)]],
     const device T_act*    down_bias   [[buffer(10)]],
+    const device uint32_t* pos         [[buffer(11)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
   uint n = tid.x;
   uint nk = n * uint(GATHER_PER_ROW) + simd_gid;
+  const uint x_row = COMBINE_ROWS_SORTED ? pos[nk] : nk;
   gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
-      w, scales, biases, x, rhs_indices[nk], y, nk, nk, tid.y / 2, tid.y % 2, simd_lid,
+      w, scales, biases, x, rhs_indices[nk], y, nk, x_row, tid.y / 2, tid.y % 2, simd_lid,
       nullptr);
   threadgroup_barrier(mem_flags::mem_device);
   uint row = tid.y * 4 + simd_lid;

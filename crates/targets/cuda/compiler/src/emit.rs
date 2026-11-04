@@ -128,6 +128,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
             types: &["CudaWeight"],
         },
     ],
+    held_by_reference: &[],
 };
 
 /// The model facts CUDA's lowering reads, from the neutral ones the macro resolved.

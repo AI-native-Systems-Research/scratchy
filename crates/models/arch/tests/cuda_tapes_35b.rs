@@ -8,7 +8,7 @@
 //!
 //! - every emitted tape is, field by field, what CUDA's compiler lowers the same canonicals to
 //!   (`lower_model`), each validates, and the emitted `CUDA_WEIGHTS` is its weight table;
-//! - the buckets are [1, 512, 1024, 2048, 4096], and [2, 4, 8, 64] are left out, as for qwen3.5;
+//! - the buckets are [1, 512, 1024, 2048, 4096], and [2, 4, 8, 16, 32, 64] are left out, as for qwen3.5;
 //! - per bucket, the MoE block's steps: 40 each of RouterLogits, MoeRoute, ExpertCombine and
 //!   GateScale; ExpertSort ×40 and ExpertGemm ×120 at m ≥ 512, or ExpertGemv ×120 and no sort at
 //!   m = 1; SiluMul ×80 (routed and shared); GemmNarrow ×100 (40 `shared_expert_gate`s at n = 1,
@@ -246,7 +246,7 @@ fn the_tapes_are_the_decode_and_prefill_buckets_and_validate() {
             .unwrap_or_else(|e| panic!("m={}: {e}", tape.bucket_m));
     }
     let left: Vec<u32> = CUDA_UNLOWERED.iter().map(|&(m, _)| m).collect();
-    assert_eq!(left, [2, 4, 8, 64], "CUDA_UNLOWERED's buckets");
+    assert_eq!(left, [2, 4, 8, 16, 32, 64], "CUDA_UNLOWERED's buckets");
     for &(m, why) in CUDA_UNLOWERED {
         let want = format!("m = {m} must be a non-zero multiple of 128, the bf16 GEMM's tile");
         assert!(why.contains(&want), "m={m}: {why}");

@@ -36,7 +36,7 @@
 // lanes need not agree on a butterfly total to the last bit, so each lane keeps
 // the norms its own butterfly formed.
 //
-// `conv_out` and `o` are f32; `a`/`b`/`dt_bias` are `T`; `ssm_state` is `half`,
+// `conv_out` and `o` are f32; `a`/`b`/`dt_bias` are `T`; `ssm_state` is `gdn_ssm_t`,
 // cast at its loads and stores (the arithmetic f32), laid out as `gdn_scan_varlen` lays a slot
 // out: its state entry
 // [HV, head_v, head_k] (a model's drafts are kept apart, in their draft lanes).
@@ -91,7 +91,7 @@ template <typename T>
     const device float* conv_out      [[buffer(1)]],
     const device T*     a             [[buffer(2)]],
     const device T*     b             [[buffer(3)]],
-    device       half*  ssm_state     [[buffer(4)]],
+    device       gdn_ssm_t*  ssm_state     [[buffer(4)]],
     const device int*   cu_seqlens    [[buffer(5)]],
     const device GdnSeqSlots* state_indices [[buffer(6)]],
     const device uint*  gdn_step      [[buffer(7)]],
@@ -150,15 +150,15 @@ template <typename T>
   const uint entry_len = HV * Vd * K;
   // The thread's first state row in slot `s`'s entry (the second sits RS rows below).
   auto row_in = [&](int s) { return ssm_state + uint(s) * entry_len + (i_hv * Vd + i_v) * K; };
-  device half* state_row0 = row_in(slot);
-  device half* state_row1 = state_row0 + RS * K;
+  device gdn_ssm_t* state_row0 = row_in(slot);
+  device gdn_ssm_t* state_row1 = state_row0 + RS * K;
   // State fragments in registers, a row each: channels 4*(seg + 8*i) .. +3, i = 0..3 — from the
   // slot, or a restore's snapshot.
   float4 st0[4], st1[4];
   {
-    const device half* start_row0 = row_in(gdn_start_slot(seq_slots, start));
-    const device half4* S0 = (const device half4*)(start_row0 + 4u * seg);
-    const device half4* S1 = (const device half4*)(start_row0 + RS * K + 4u * seg);
+    const device gdn_ssm_t* start_row0 = row_in(gdn_start_slot(seq_slots, start));
+    const device gdn_ssm4_t* S0 = (const device gdn_ssm4_t*)(start_row0 + 4u * seg);
+    const device gdn_ssm4_t* S1 = (const device gdn_ssm4_t*)(start_row0 + RS * K + 4u * seg);
     for (uint i = 0; i < 4; i++) {
       st0[i] = fresh ? float4(0.0f) : float4(S0[8u * i]);
     }
@@ -428,17 +428,17 @@ template <typename T>
     // A save whose row ends this block: both rows' fragments, into its snapshot.
     for (uint j = 0; saves && j < GDN_SAVES; j++) {
       if (saves_through[j] == t1) {
-        device half* snap = row_in(seq_slots.saves[j].y) + 4u * seg;
+        device gdn_ssm_t* snap = row_in(seq_slots.saves[j].y) + 4u * seg;
         for (uint i = 0; i < 4; i++) {
-          ((device half4*)snap)[8u * i] = half4(st0[i]);
-          ((device half4*)(snap + RS * K))[8u * i] = half4(st1[i]);
+          ((device gdn_ssm4_t*)snap)[8u * i] = gdn_ssm4_t(st0[i]);
+          ((device gdn_ssm4_t*)(snap + RS * K))[8u * i] = gdn_ssm4_t(st1[i]);
         }
         // The snapshot is the entry's f16 — a restore loads exactly this. The cold run
         // carries on in registers, so round them through the same store: a prefix-cache
         // hit resumes from what a miss computed, bit for bit.
         for (uint i = 0; i < 4; i++) {
-          st0[i] = float4(half4(st0[i]));
-          st1[i] = float4(half4(st1[i]));
+          st0[i] = float4(gdn_ssm4_t(st0[i]));
+          st1[i] = float4(gdn_ssm4_t(st1[i]));
         }
       }
     }
@@ -448,13 +448,13 @@ template <typename T>
 #undef GDN_PIPE_FETCH
 
   {
-    device half4* S0 = (device half4*)(state_row0 + 4u * seg);
-    device half4* S1 = (device half4*)(state_row1 + 4u * seg);
+    device gdn_ssm4_t* S0 = (device gdn_ssm4_t*)(state_row0 + 4u * seg);
+    device gdn_ssm4_t* S1 = (device gdn_ssm4_t*)(state_row1 + 4u * seg);
     for (uint i = 0; i < 4; i++) {
-      S0[8u * i] = half4(st0[i]);
+      S0[8u * i] = gdn_ssm4_t(st0[i]);
     }
     for (uint i = 0; i < 4; i++) {
-      S1[8u * i] = half4(st1[i]);
+      S1[8u * i] = gdn_ssm4_t(st1[i]);
     }
   }
 }

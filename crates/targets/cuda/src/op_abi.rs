@@ -109,6 +109,15 @@ pub fn cuda_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRule
         // Spyre's token draw and chained head (the spyre bake's mints; CUDA never lowers them):
         // each writes its own fresh buffer, metal's row.
         L::Sample { .. } | L::EmbedRowGather { .. } | L::ChainStage { .. } => FRESH,
+        // A DFlash2 drafter's ops (#1015; metal only, CUDA never lowers them): metal's rows. The
+        // convolution and attention read across; the capture, the context commit, the window
+        // store and load, and the proposals write over their operand 0.
+        L::DraftConv { .. } | L::DraftAttention { .. } => FRESH.reads_across(),
+        L::CaptureHidden { .. }
+        | L::DraftContextKv { .. }
+        | L::DraftWindowStore
+        | L::DraftWindowLoad
+        | L::DraftSelect => FRESH.output(A::Operand(OperandIx(0))),
         // The routed half of a MoE block: in the MoE scratch ([`cuda_moe_write`]), not a colour.
         // Gemma's router norm is `[m, hidden]` bf16 like a colour, but only its router reads it,
         // so it lives in the scratch's router-norm region with the rest of the routing.

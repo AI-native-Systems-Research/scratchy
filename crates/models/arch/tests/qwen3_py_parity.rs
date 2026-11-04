@@ -231,6 +231,8 @@ fn qwen3_py_carrier_parity() {
         gdn_state: None,
         gdn_state_indices: None,
         gdn_is_fresh: None,
+        draft_ring: None,
+        draft: None,
         mm_embeds: None,
         embed_patches: &[],
         vision_rope_cos: None,

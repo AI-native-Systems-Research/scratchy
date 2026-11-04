@@ -47,6 +47,10 @@ pub struct ModuleRow {
 #[derive(Clone, Copy, Debug)]
 pub struct ModuleTable {
     pub rows: &'static [ModuleRow],
+    /// The types the tape holds only behind a `&'static` (metal's `CommandTable`, behind a
+    /// `TapeCommands`): a value of one is emitted as a reference to its literal, which `const`
+    /// promotion makes `'static`.
+    pub held_by_reference: &'static [&'static str],
 }
 
 impl ModuleTable {
@@ -239,7 +243,8 @@ impl<'t> ser::Serializer for Emitter<'t> {
     fn serialize_struct(self, name: &'static str, _len: usize) -> Result<StructEmit<'t>, Error> {
         let m = self.0.module_of(name)?;
         let ty = format_ident!("{name}");
-        Ok(StructEmit(self, quote!(#m::#ty), Vec::new()))
+        let by_reference = self.0.held_by_reference.contains(&name);
+        Ok(StructEmit(self, quote!(#m::#ty), Vec::new(), by_reference))
     }
     fn serialize_struct_variant(
         self,
@@ -316,6 +321,7 @@ pub struct StructEmit<'t>(
     Emitter<'t>,
     TokenStream,
     Vec<(proc_macro2::Ident, TokenStream)>,
+    bool,
 );
 impl ser::SerializeStruct for StructEmit<'_> {
     type Ok = TokenStream;
@@ -329,9 +335,14 @@ impl ser::SerializeStruct for StructEmit<'_> {
         Ok(())
     }
     fn end(self) -> Result<TokenStream, Error> {
-        let (path, fields) = (self.1, self.2);
+        let (path, fields, by_reference) = (self.1, self.2, self.3);
         let (names, vals): (Vec<_>, Vec<_>) = fields.into_iter().unzip();
-        Ok(quote!(#path { #(#names: #vals),* }))
+        let literal = quote!(#path { #(#names: #vals),* });
+        Ok(if by_reference {
+            quote!(&#literal)
+        } else {
+            literal
+        })
     }
 }
 
@@ -395,6 +406,7 @@ mod tests {
                 types: &["Id"],
             },
         ],
+        held_by_reference: &[],
     };
 
     #[test]

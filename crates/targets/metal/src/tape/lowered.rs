@@ -16,7 +16,7 @@
 
 use crate::tape::constants::ConstantValue;
 use crate::tape::ids::{
-    BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, SourceIx, TqDecodeHeads,
+    BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, PartIx, SourceIx, TqDecodeHeads,
 };
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
@@ -407,15 +407,12 @@ pub enum KernelId {
     MoeWeightedSum,
     /// MoE grouped-GEMM prefill: histogram `topk_inds` + padded
     /// exclusive-scan offsets. Single threadgroup. Function constants
-    /// `MG_M` (0) / `MG_NUM_EXPERTS` (1). Bindings `(topk_inds @ 0,
-    /// count @ 1, offset @ 2, total @ 3)`. Symbol `moe_group_offsets`
-    /// in `moe_group.metallib`.
+    /// `MG_M` (0) / `MG_NUM_EXPERTS` (1), and the init's `MG_MPAD_MAX` (2) /
+    /// `MG_SENTINEL` (7): every threadgroup also sentinel-fills its rows of
+    /// `indices_pad` and zeroes its `fill` counters. Bindings `(topk_inds @ 0,
+    /// count @ 1, offset @ 2, total @ 3, num_tokens @ 4, indices_pad @ 5,
+    /// fill @ 6)`. Symbol `moe_group_offsets` in `moe_group.metallib`.
     MoeGroupOffsets,
-    /// MoE grouped-GEMM prefill: sentinel-fill `indices_pad` + zero the
-    /// `fill` counters. Function constants `MG_NUM_EXPERTS` (1) /
-    /// `MG_MPAD_MAX` (2). Bindings `(indices_pad @ 0, fill @ 1)`.
-    /// Symbol `moe_group_init`.
-    MoeGroupInit,
     /// MoE grouped-GEMM prefill: scatter each (token,expert) row to its
     /// padded slot, recording `pos`, `indices_pad`, and the gathered
     /// `x_pad` row. Function constants `MG_M`(0)/`MG_NUM_EXPERTS`(1)/
@@ -500,6 +497,46 @@ pub enum KernelId {
     /// [`Self::AttentionDecodeGqaTq`]'s second pass (`attention_via_cache_v2_combine_*`): merges
     /// each query head's partials into its output.
     AttentionDecodeCombine,
+    /// A verify step's lanes' query rows packed a KV head's group to a 64-row tile
+    /// (`attention_verify_pack_q_*`), for [`Self::AttentionVerifySplit`].
+    AttentionVerifyPack,
+    /// The packed NAX paged attention with its keys split (`..._packed_split<S>`): a threadgroup a
+    /// (split, KV head, sequence), storing token-keyed partials for `AttentionDecodeCombine`.
+    AttentionVerifySplit,
+    // ── Splash's DFlash2 drafter (`dflash2.metal`, `dflash2_select.metal`) ──────────────────────
+    /// A captured layer's rows into their block of the rows a drafter reads (Splash's
+    /// `row_copy`, `QwenTarget::addCapture`): `copy_rows_strided_{f16,bf16}` in
+    /// `elementwise.metal`.
+    CaptureRows,
+    /// One stage of a drafter's dynamic convolution: `draft_conv_<dtype>`.
+    DraftConv,
+    /// A draft attention's q/k norms, RoPE and layouts: `draft_attention_qkv_<dtype>_rope_<r>`.
+    DraftAttentionQkv,
+    /// A draft attention's splits over the ring and the block: `draft_attention_split_<dtype>`.
+    DraftAttentionSplit,
+    /// A draft attention's fixed-order combine: `draft_attention_reduce_<dtype>`.
+    DraftAttentionReduce,
+    /// A draft attention's rows back in row order: `draft_attention_reorder_<dtype>`.
+    DraftAttentionReorder,
+    /// A cycle's context commit of its retained rows: `draft_context_kv_commit_<dtype>_rope_<r>`.
+    DraftContextCommit,
+    /// A prompt's context commit: `prefill_draft_context_kv_<dtype>_rope_<r>`.
+    DraftContextPrefill,
+    /// A cycle's commit of its retained rows into its lanes' context windows:
+    /// `draft_window_store_commit_<dtype>`.
+    DraftWindowStoreCommit,
+    /// A prompt's commit into its sequences' context windows: `prefill_draft_window_store_<dtype>`.
+    DraftWindowStorePrefill,
+    /// A ring rebuild's rows out of its sequences' context windows: `draft_window_load_<dtype>`.
+    DraftWindowLoad,
+    /// A proposal row's sharded top-16: `draft_select_top16_sharded_<dtype>`.
+    DraftSelectTop16,
+    /// The candidates' edge tables: `draft_select_edges_<dtype>`.
+    DraftSelectEdges,
+    /// The walk into the proposals: `draft_select_dflash`.
+    DraftSelectWalk,
+    /// The rows each lane's target verifies: `draft_verify_rows`.
+    DraftVerifyRows,
 }
 
 /// Which sequences of a step a command computes correctly.
@@ -590,7 +627,6 @@ impl KernelId {
             | Self::MoeRoute
             | Self::MoeWeightedSum
             | Self::MoeGroupOffsets
-            | Self::MoeGroupInit
             | Self::MoeGroupScatter
             | Self::MoeGroupScatterQ8
             | Self::MoePerExpertScale
@@ -608,7 +644,25 @@ impl KernelId {
             | Self::RowProgram
             | Self::AttentionViaCacheTq
             | Self::AttentionDecodeGqaTq
-            | Self::AttentionDecodeCombine => SeqScope::AllRows,
+            | Self::AttentionDecodeCombine
+            | Self::AttentionVerifyPack
+            | Self::AttentionVerifySplit
+            // Each lane is a sequence, read through its own ring slot.
+            | Self::CaptureRows
+            | Self::DraftConv
+            | Self::DraftAttentionQkv
+            | Self::DraftAttentionSplit
+            | Self::DraftAttentionReduce
+            | Self::DraftAttentionReorder
+            | Self::DraftContextCommit
+            | Self::DraftContextPrefill
+            | Self::DraftWindowStoreCommit
+            | Self::DraftWindowStorePrefill
+            | Self::DraftWindowLoad
+            | Self::DraftSelectTop16
+            | Self::DraftSelectEdges
+            | Self::DraftSelectWalk
+            | Self::DraftVerifyRows => SeqScope::AllRows,
         }
     }
 }
@@ -761,6 +815,19 @@ pub enum RuntimeGate {
     /// a step that also replays or records, which runs those sequences and
     /// leaves the rest to the simd scan.
     OnlyIfPlainGdnRows,
+    /// Run only on a step whose every sequence holds at most a verify lane's rows
+    /// (`op_abi::METAL_LANE_VERIFY_ROWS`): the Gated-DeltaNet verify command, whose threadgroup
+    /// holds one sequence's rows, at a bucket of more (a 2-4-lane verify's).
+    OnlyIfLaneRows,
+    /// Run on a step one of whose sequences holds more than a verify lane's rows (a short prompt in
+    /// one chunk): the three-command Gated-DeltaNet path the verify command replaces.
+    UnlessLaneRows,
+    /// Run only on a DFlash2 cycle's context commit — a forward whose lanes each hold their
+    /// verify's block and retained a count of it (`ForwardInputs::draft_cycle`): Splash's
+    /// `draft_context_kv_commit`.
+    OnlyIfDraftCycle,
+    /// Run unless the forward is a cycle's commit: a prompt's (`prefill_draft_context_kv`).
+    UnlessDraftCycle,
     /// Run only when every gate in the list matches.
     All(&'static [RuntimeGate]),
     /// Run when some gate in the list matches.
@@ -781,6 +848,43 @@ impl RuntimeGate {
             [only] => *only,
             _ => RuntimeGate::All(baked(all)),
         }
+    }
+
+    /// Whether no step runs both a command gated `self` and one gated `other`: one is the other's
+    /// complement (a twin and the command it replaces), or a list's gates decide it.
+    pub fn excludes(self, other: RuntimeGate) -> bool {
+        use RuntimeGate as G;
+        match (self, other) {
+            (G::All(gates), _) => gates.iter().any(|g| g.excludes(other)),
+            (_, G::All(gates)) => gates.iter().any(|g| self.excludes(*g)),
+            (G::Any(gates), _) => gates.iter().all(|g| g.excludes(other)),
+            (_, G::Any(gates)) => gates.iter().all(|g| self.excludes(*g)),
+            (gate, other) => gate.complement() == Some(other),
+        }
+    }
+
+    /// The gate that runs exactly on the steps this one does not, if one does.
+    fn complement(self) -> Option<RuntimeGate> {
+        use RuntimeGate as G;
+        Some(match self {
+            G::UnlessEveryRowSampled => G::OnlyIfEveryRowSampled,
+            G::OnlyIfEveryRowSampled => G::UnlessEveryRowSampled,
+            G::OnlyIfDecodeStep => G::UnlessDecodeStep,
+            G::UnlessDecodeStep => G::OnlyIfDecodeStep,
+            G::OnlyIfSmallMTokens => G::UnlessSmallMTokens,
+            G::UnlessSmallMTokens => G::OnlyIfSmallMTokens,
+            G::OnlyIfOneSequence => G::UnlessOneSequence,
+            G::UnlessOneSequence => G::OnlyIfOneSequence,
+            G::OnlyIfUnrotatedBlocks => G::UnlessUnrotatedBlocks,
+            G::UnlessUnrotatedBlocks => G::OnlyIfUnrotatedBlocks,
+            G::OnlyIfPlainGdn => G::UnlessPlainGdn,
+            G::UnlessPlainGdn => G::OnlyIfPlainGdn,
+            G::OnlyIfLaneRows => G::UnlessLaneRows,
+            G::UnlessLaneRows => G::OnlyIfLaneRows,
+            G::OnlyIfDraftCycle => G::UnlessDraftCycle,
+            G::UnlessDraftCycle => G::OnlyIfDraftCycle,
+            G::OnlyIfPlainGdnRows | G::All(_) | G::Any(_) => return None,
+        })
     }
 }
 
@@ -949,6 +1053,9 @@ pub enum SourceRef<'w> {
     /// plain dense sink-logit tensor (the single tensor of its bundle,
     /// read through [`WeightTensor::Weight`] like [`Self::CosSin`]).
     AttnSinks(scratchy_tensors::tensor::GpuTensor),
+    /// A bare tensor read verbatim (a DFlash2 drafter's convolution base kernel, selector
+    /// codebook), read through [`WeightTensor::Weight`] like [`Self::CosSin`].
+    Tensor(scratchy_tensors::tensor::GpuTensor),
     /// Mixtral-style MoE: dense router + packed per-expert slabs.
     FusedMoe(&'w scratchy_layers::layers_moe::FusedMoELayer),
     /// Qwen-style MoE with an optional shared expert.
@@ -1016,6 +1123,7 @@ impl SourceRef<'_> {
             (Self::LayerNorm(n), T::Bias) => n.bias,
             (Self::CosSin(t), T::Weight) => Some(t),
             (Self::AttnSinks(t), T::Weight) => Some(t),
+            (Self::Tensor(t), T::Weight) => Some(t),
             (Self::Linear(l @ L::Dense(_)), T::Weight) => Some(l.dense_weight()),
             (Self::Linear(l @ L::Dense(_)), T::Bias) => l.dense_bias(),
             (Self::Linear(l @ L::AffineQuant(_)), T::Weight) => Some(l.affine_weight()),
@@ -1267,6 +1375,9 @@ pub enum RuntimeBindingKind {
     BlockUnrotatedFlags {
         layer: LayerId,
     },
+    /// `[1]` u32 — the in-flight forward's `num_tokens`, written by the pool at every forward's
+    /// start: the MoE sort counts the step's live pairs, `num_tokens · top_k`, not the bucket's.
+    NumTokensU32,
     /// `[1]` u32 — the in-flight forward's sampled rows' count (`SampleIndices`' length): the
     /// rows the lm_head slice gathers and puts back, and the logits rows a compaction keeps.
     NumSampleRowsU32,
@@ -1327,6 +1438,33 @@ pub enum RuntimeBindingKind {
     /// head reads. `LoadRows(TargetHidden)` copies it into an arena slot. Carried on
     /// `ForwardCtx::target_hidden`, written per forward by the worker.
     TargetHidden,
+    // ── A DFlash2 cycle (`crate::dflash2`) ──────────────────────────────────────────────────
+    /// `[num_tokens, slots · hidden]` model-dtype — the rows a target captures for the drafter
+    /// compiled beside it: each captured layer's output rows in its block (`CaptureRows`), which
+    /// the drafter's context commit reads as its `TargetHidden`. Kept past the forward.
+    DraftCapture,
+    /// A drafter's ring keys at `layer`: `[slot][kv head][window][head dim]` model-dtype, the
+    /// pool of every ring slot (`dflash2.metal`).
+    DraftRingKeys {
+        layer: LayerId,
+    },
+    /// A drafter's ring values at `layer`: `[slot][kv head][head dim][window]` model-dtype.
+    DraftRingValues {
+        layer: LayerId,
+    },
+    /// `[num_seqs]` u32 — each lane's ring slot, written per forward by the worker.
+    DraftRingSlots,
+    /// A drafter's context windows: one a ring slot, each its slot's 4-bit context rows
+    /// (`dflash2.metal` `DRAFT_WINDOW_BYTES`), kept across forwards.
+    DraftWindow,
+    /// `[num_seqs]` u32 — the rows of its verify each lane retained (a cycle's acceptance), what
+    /// its context commit writes.
+    DraftRetained,
+    /// `[num_seqs]` [`crate::dflash2::DraftLaneParams`] — each lane's policy for the cycle.
+    DraftLaneParams,
+    /// A region of a drafter's outputs: what its selection writes, its target's acceptance and
+    /// the host read.
+    DraftOutputs(crate::dflash2::DraftOutput),
     /// `[num_tokens, hidden]` model-dtype — the projected vision-encoder
     /// embeddings (`ForwardCtx::mm_embeds`), copied row-blockwise into
     /// the text embedding stream at the image-placeholder rows by
@@ -1423,19 +1561,194 @@ pub enum Fence {
     Coherent,
 }
 
+/// One distinct command of a [`CommandTable`], its bulky fields as positions in the table's part
+/// arrays: a model's thousands of distinct commands are combinations of a few hundred constant
+/// sets, dispatch shapes and binding lists and a few dozen kernel symbols, each held once.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize)]
+pub struct PackedCommand {
+    pub kernel: KernelId,
+    /// `(library, function)` in [`CommandTable::symbols`].
+    pub symbol: PartIx,
+    pub constants: PartIx,
+    pub dispatch: PartIx,
+    pub bindings: PartIx,
+    pub gemm_dims: PartIx,
+    pub gate: PartIx,
+}
+
+// A distinct command costs its table fourteen bytes, where the [`GatedCommand`] it packs is 144.
+const _: [(); 14] = [(); std::mem::size_of::<PackedCommand>()];
+
+/// Each distinct command of a model's baked tapes once ([`PackedCommand`]), beside each distinct
+/// value of its bulky fields once. A tape lists [`CommandIx`]es into it ([`TapeCommands`]).
+#[derive(Clone, Copy, serde::Serialize)]
+pub struct CommandTable {
+    pub commands: &'static [PackedCommand],
+    pub symbols: &'static [(&'static str, &'static str)],
+    pub constants: &'static [&'static [ConstantValue]],
+    pub dispatches: &'static [DispatchShape],
+    pub bindings: &'static [&'static [Binding]],
+    pub gemm_dims: &'static [Option<GemmDims>],
+    pub gates: &'static [Option<RuntimeGate>],
+}
+
+impl CommandTable {
+    /// No commands.
+    pub const EMPTY: Self = Self {
+        commands: &[],
+        symbols: &[],
+        constants: &[],
+        dispatches: &[],
+        bindings: &[],
+        gemm_dims: &[],
+        gates: &[],
+    };
+
+    /// The command at `ix`, its fields read out of the part arrays.
+    pub fn get(&self, ix: CommandIx) -> GatedCommand {
+        let p = self.commands[ix.get()];
+        let (library, function) = self.symbols[p.symbol.get()];
+        GatedCommand {
+            command: LoweredCommand {
+                kernel: p.kernel,
+                library,
+                function,
+                constants: self.constants[p.constants.get()],
+                dispatch: self.dispatches[p.dispatch.get()],
+                bindings: self.bindings[p.bindings.get()],
+                gemm_dims: self.gemm_dims[p.gemm_dims.get()],
+            },
+            gate: self.gates[p.gate.get()],
+        }
+    }
+}
+
+/// Each distinct value of one command field, in first-seen order.
+struct Parts<T> {
+    at: std::collections::HashMap<T, PartIx>,
+    values: Vec<T>,
+}
+
+impl<T> Default for Parts<T> {
+    fn default() -> Self {
+        Self {
+            at: Default::default(),
+            values: Vec::new(),
+        }
+    }
+}
+
+impl<T: std::hash::Hash + Eq + Copy> Parts<T> {
+    fn intern(&mut self, value: T) -> Option<PartIx> {
+        if let Some(&ix) = self.at.get(&value) {
+            return Some(ix);
+        }
+        let ix = PartIx::of(self.values.len())?;
+        self.values.push(value);
+        self.at.insert(value, ix);
+        Some(ix)
+    }
+}
+
+/// A [`CommandTable`] being filled: each distinct command interned once, its fields into the part
+/// arrays. The one place a table is built, for a tape lowered at run time ([`baked_commands`]) and
+/// for a model's baked tapes alike.
+#[derive(Default)]
+pub struct CommandTableBuilder {
+    at: std::collections::HashMap<GatedCommand, CommandIx>,
+    commands: Vec<PackedCommand>,
+    symbols: Parts<(&'static str, &'static str)>,
+    constants: Parts<&'static [ConstantValue]>,
+    dispatches: Parts<DispatchShape>,
+    bindings: Parts<&'static [Binding]>,
+    gemm_dims: Parts<Option<GemmDims>>,
+    gates: Parts<Option<RuntimeGate>>,
+}
+
+/// A [`CommandTableBuilder`]'s table, its arrays owned.
+pub struct CommandTableParts {
+    pub commands: Vec<PackedCommand>,
+    pub symbols: Vec<(&'static str, &'static str)>,
+    pub constants: Vec<&'static [ConstantValue]>,
+    pub dispatches: Vec<DispatchShape>,
+    pub bindings: Vec<&'static [Binding]>,
+    pub gemm_dims: Vec<Option<GemmDims>>,
+    pub gates: Vec<Option<RuntimeGate>>,
+}
+
+impl CommandTableBuilder {
+    /// The position of `cmd` in the table, interned on first sight.
+    pub fn intern(&mut self, cmd: GatedCommand) -> Result<CommandIx, TooManyCommands> {
+        if let Some(&ix) = self.at.get(&cmd) {
+            return Ok(ix);
+        }
+        let too_many = TooManyCommands {
+            distinct: self.commands.len() + 1,
+        };
+        let ix = CommandIx::of(self.commands.len()).ok_or(too_many)?;
+        let GatedCommand { command: c, gate } = cmd;
+        let packed = PackedCommand {
+            kernel: c.kernel,
+            symbol: self
+                .symbols
+                .intern((c.library, c.function))
+                .ok_or(too_many)?,
+            constants: self.constants.intern(c.constants).ok_or(too_many)?,
+            dispatch: self.dispatches.intern(c.dispatch).ok_or(too_many)?,
+            bindings: self.bindings.intern(c.bindings).ok_or(too_many)?,
+            gemm_dims: self.gemm_dims.intern(c.gemm_dims).ok_or(too_many)?,
+            gate: self.gates.intern(gate).ok_or(too_many)?,
+        };
+        self.commands.push(packed);
+        self.at.insert(cmd, ix);
+        Ok(ix)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
+    pub fn finish(self) -> CommandTableParts {
+        CommandTableParts {
+            commands: self.commands,
+            symbols: self.symbols.values,
+            constants: self.constants.values,
+            dispatches: self.dispatches.values,
+            bindings: self.bindings.values,
+            gemm_dims: self.gemm_dims.values,
+            gates: self.gates.values,
+        }
+    }
+}
+
+impl CommandTableParts {
+    /// The table, leaked for the life of the process (a tape lowered at run time).
+    pub fn leak(self) -> &'static CommandTable {
+        Box::leak(Box::new(CommandTable {
+            commands: baked(self.commands),
+            symbols: baked(self.symbols),
+            constants: baked(self.constants),
+            dispatches: baked(self.dispatches),
+            bindings: baked(self.bindings),
+            gemm_dims: baked(self.gemm_dims),
+            gates: baked(self.gates),
+        }))
+    }
+}
+
 /// A tape's commands: positions in a command table. The tapes a model bakes share one table
 /// (each distinct command once), so a command every rung runs is stored once and each rung pays
 /// two bytes for it. Compared and hashed by the commands it lists, whatever table holds them.
 #[derive(Clone, Copy, serde::Serialize)]
 pub struct TapeCommands {
-    pub table: &'static [GatedCommand],
+    pub table: &'static CommandTable,
     pub ixs: &'static [CommandIx],
 }
 
 impl TapeCommands {
     /// No commands.
     pub const EMPTY: Self = Self {
-        table: &[],
+        table: &CommandTable::EMPTY,
         ixs: &[],
     };
 
@@ -1447,24 +1760,22 @@ impl TapeCommands {
         self.ixs.is_empty()
     }
 
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'static GatedCommand> + Clone + use<> {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = GatedCommand> + Clone + use<> {
         let table = self.table;
-        self.ixs.iter().map(move |ix| &table[ix.get()])
+        self.ixs.iter().map(move |&ix| table.get(ix))
     }
 
-    pub fn first(&self) -> Option<&'static GatedCommand> {
+    /// The command at `position` of the tape.
+    pub fn get(&self, position: usize) -> GatedCommand {
+        self.table.get(self.ixs[position])
+    }
+
+    pub fn first(&self) -> Option<GatedCommand> {
         self.iter().next()
     }
 
-    pub fn last(&self) -> Option<&'static GatedCommand> {
+    pub fn last(&self) -> Option<GatedCommand> {
         self.iter().last()
-    }
-}
-
-impl std::ops::Index<usize> for TapeCommands {
-    type Output = GatedCommand;
-    fn index(&self, position: usize) -> &GatedCommand {
-        &self.table[self.ixs[position].get()]
     }
 }
 
@@ -1491,19 +1802,11 @@ pub struct TooManyCommands {
 
 /// `v` as a tape holds it: each distinct command once in the table, the list as positions in it.
 pub fn baked_commands(v: Vec<GatedCommand>) -> Result<TapeCommands, TooManyCommands> {
-    let mut table: Vec<GatedCommand> = Vec::new();
-    let mut at = std::collections::HashMap::new();
-    let ixs = (v.iter()).map(|c| {
-        let next = table.len();
-        let position = *at.entry(*c).or_insert_with(|| {
-            table.push(*c);
-            next
-        });
-        CommandIx::of(position).ok_or(TooManyCommands { distinct: next + 1 })
-    });
+    let mut table = CommandTableBuilder::default();
+    let ixs = (v.into_iter()).map(|c| table.intern(c));
     let ixs = baked(ixs.collect::<Result<_, _>>()?);
     Ok(TapeCommands {
-        table: baked(table),
+        table: table.finish().leak(),
         ixs,
     })
 }
@@ -1710,11 +2013,24 @@ impl RuntimeBindingKind {
             Self::TqNormsV { layer } => Self::TqNormsV {
                 layer: layer.advance(by),
             },
-            Self::InputIds
+            Self::DraftRingKeys { layer } => Self::DraftRingKeys {
+                layer: layer.advance(by),
+            },
+            Self::DraftRingValues { layer } => Self::DraftRingValues {
+                layer: layer.advance(by),
+            },
+            Self::DraftCapture
+            | Self::DraftRingSlots
+            | Self::DraftWindow
+            | Self::DraftRetained
+            | Self::DraftLaneParams
+            | Self::DraftOutputs(_)
+            | Self::InputIds
             | Self::Positions
             | Self::CuSeqlensQ
             | Self::SeqUsedK
             | Self::SpanIds
+            | Self::NumTokensU32
             | Self::NumSampleRowsU32
             | Self::SampleIndices
             | Self::GdnStateIndices
@@ -1985,7 +2301,7 @@ impl LoweredMetalTape {
         let mut out = Vec::with_capacity(self.commands.len());
         let cmds = self.commands;
         Self::walk(self.loops, 0..cmds.len(), 0, &mut |pos, off| {
-            out.push(cmds[pos].with_layer_bumped(off))
+            out.push(cmds.get(pos).with_layer_bumped(off))
         });
         out
     }
@@ -2004,13 +2320,13 @@ impl LoweredMetalTape {
         out
     }
 
-    /// `cache_live`, expanded in lockstep with [`Self::commands_expanded`]: every iteration of a
-    /// loop's body runs whole. A command past the mask runs.
-    pub fn cache_live_expanded(&self) -> Vec<bool> {
+    /// `live`, expanded in lockstep with [`Self::commands_expanded`]: every iteration of a loop's
+    /// body runs whole. A command past the mask runs in every play.
+    pub fn live_expanded(&self) -> Vec<PlayLive> {
         let mut out = Vec::with_capacity(self.commands.len());
-        let live = self.cache_live;
+        let live = self.live;
         Self::walk(self.loops, 0..self.commands.len(), 0, &mut |pos, _| {
-            out.push(live.get(pos).copied().unwrap_or(true))
+            out.push(live.get(pos).copied().unwrap_or(PlayLive::EVERY))
         });
         out
     }
@@ -2241,12 +2557,56 @@ pub struct LoweredMetalTape {
     /// The rows of the logits buffer (the terminal slot) the tape's commands write: what the
     /// buffer holds beyond the rows a step samples ([`Self::logits_slot_rows`]).
     pub logits_rows: LogitsRows,
-    /// Per command, whether a forward reading only its cache writes plays it
-    /// ([`crate::interpreter::metal::ForwardReads::CacheWrites`]): what a KV or recurrent-state
-    /// write needs, from the metal compiler's liveness walk over the rows. Off for the lm_head,
-    /// the attention and MLP past a model's last KV writer, and a projection only they read (the
-    /// Q a rope append rotates beside the K and V it writes); on for every cache write.
-    pub cache_live: &'static [bool],
+    /// Per command, the plays of its forward short of the whole that play it ([`PlayLive`]).
+    pub live: &'static [PlayLive],
+}
+
+/// The plays of its forward a command runs in besides the whole forward
+/// ([`crate::interpreter::metal::ForwardReads`]), from the metal compiler's liveness walks over
+/// the rows: what a play's reads need.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct PlayLive {
+    /// What a KV or recurrent-state write needs (`ForwardReads::CacheWrites`). Off for the
+    /// lm_head, the attention and MLP past a model's last KV writer, and a projection only they
+    /// read (the Q a rope append rotates beside the K and V it writes); on for every cache write.
+    pub cache_writes: bool,
+    /// What the forward's result needs (`ForwardReads::Result`).
+    pub result: bool,
+    /// What rebuilding a DFlash2 drafter's rings from its context window needs
+    /// (`ForwardReads::Rebuild`): the window's load and the ring writers after it, never the
+    /// commit's rows before its window.
+    pub rebuild: bool,
+}
+
+impl PlayLive {
+    /// A command every play runs.
+    pub const EVERY: Self = Self {
+        cache_writes: true,
+        result: true,
+        rebuild: true,
+    };
+
+    /// Whether a forward its caller reads `reads` of plays the command.
+    pub fn plays(self, reads: crate::interpreter::metal::ForwardReads) -> bool {
+        use crate::interpreter::metal::ForwardReads as R;
+        match reads {
+            // Every command but a rebuild's own: the window's load, which a whole forward's
+            // commit has the exact rows of.
+            R::Outputs => self.cache_writes || self.result || !self.rebuild,
+            R::CacheWrites => self.cache_writes,
+            R::Result => self.result,
+            R::Rebuild => self.rebuild,
+        }
+    }
+
+    /// Whichever plays either runs in.
+    pub fn or(self, other: Self) -> Self {
+        Self {
+            cache_writes: self.cache_writes || other.cache_writes,
+            result: self.result || other.result,
+            rebuild: self.rebuild || other.rebuild,
+        }
+    }
 }
 
 /// Errors produced by the lowering pass. Every step kind lowers (the
@@ -2568,7 +2928,71 @@ pub struct BakedKernel {
     pub function: &'static str,
     pub constants: &'static [ConstantValue],
     /// The metallib of the bake compile that holds the kernel, with the rest of its batch.
-    pub metallib: &'static [u8],
+    pub metallib: &'static BakedMetallib,
     /// The kernel's function in `metallib`.
     pub entry: &'static str,
+}
+
+/// A bake compile's metallib as the binary holds it: one zstd frame, compressed against the
+/// dictionary its build trained on every metallib it baked ([`crate::aot::pack`]). Kernels
+/// specialized on different constants are near-copies of one another, so the build's metallibs
+/// share most of their bytes, which the dictionary holds once.
+#[derive(Clone, Copy, PartialEq, serde::Serialize)]
+pub struct BakedMetallib {
+    pub frame: &'static [u8],
+    pub dictionary: &'static BakedDictionary,
+    /// The metallib's size, decompressed.
+    pub len: usize,
+}
+
+/// The dictionary a build's [`BakedMetallib`]s are compressed against, digested for decompression
+/// once, on the first load of any of them.
+pub struct BakedDictionary {
+    pub bytes: &'static [u8],
+    prepared: std::sync::OnceLock<zstd::dict::DecoderDictionary<'static>>,
+}
+
+impl BakedDictionary {
+    pub const fn new(bytes: &'static [u8]) -> Self {
+        Self {
+            bytes,
+            prepared: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn prepared(&self) -> &zstd::dict::DecoderDictionary<'static> {
+        (self.prepared).get_or_init(|| zstd::dict::DecoderDictionary::copy(self.bytes))
+    }
+}
+
+impl PartialEq for BakedDictionary {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl serde::Serialize for BakedDictionary {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.bytes.serialize(serializer)
+    }
+}
+
+impl BakedMetallib {
+    /// The metallib's bytes.
+    pub fn decompress(&self) -> Result<Box<[u8]>, String> {
+        let dictionary = self.dictionary.prepared();
+        let mut decompressor = zstd::bulk::Decompressor::with_prepared_dictionary(dictionary)
+            .map_err(|e| format!("baked metallib dictionary: {e}"))?;
+        let bytes = decompressor
+            .decompress(self.frame, self.len)
+            .map_err(|e| format!("baked metallib frame: {e}"))?;
+        if bytes.len() != self.len {
+            return Err(format!(
+                "baked metallib: {} bytes decompressed, {} baked",
+                bytes.len(),
+                self.len
+            ));
+        }
+        Ok(bytes.into_boxed_slice())
+    }
 }

@@ -27,6 +27,14 @@ struct GdnSeqSlots {
 
 static_assert(sizeof(GdnSeqSlots) == 24, "GdnSeqSlots is the host's 6-word record");
 
+// The ssm state entry's element type every GDN kernel loads and stores (`gdn_decode`, `gdn_verify`,
+// `gdn_scan_varlen`, `gdn_scan_pipelined`): `scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE`,
+// whose pool the worker allocates. f32, so a sequence's state carries no per-step rounding: f16
+// rounded it every step, and Qwen3.8-27B + DFlash2 accepted 3.38 tokens a cycle against 3.48 at f32
+// (16 ShareGPT prompts, 1 request, greedy).
+typedef float gdn_ssm_t;
+typedef float4 gdn_ssm4_t;
+
 // A sequence's saves.
 constant constexpr uint GDN_SAVES = 2u;
 

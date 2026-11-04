@@ -50,6 +50,9 @@ struct RequestResult {
     cached_tokens: Option<usize>,
     /// `usage.prompt_tokens`, where the server sent it.
     prompt_tokens: Option<usize>,
+    /// The stream's last `finish_reason`, where it sent one: `length` for an answer that ran to
+    /// its cap. A span query's stream carries no usage, so this is how its capped answers show.
+    finish_reason: Option<String>,
 }
 
 impl RequestResult {
@@ -67,6 +70,7 @@ impl RequestResult {
             error,
             cached_tokens: None,
             prompt_tokens: None,
+            finish_reason: None,
         }
     }
 
@@ -220,6 +224,7 @@ fn send_body(
     let mut usage_completion_tokens: Option<usize> = None;
     let mut cached_tokens: Option<usize> = None;
     let mut prompt_tokens: Option<usize> = None;
+    let mut finish_reason: Option<String> = None;
     let mut chunks = 0usize;
     let mut generated_text = String::new();
     let mut last_choices_time: Option<Instant> = None;
@@ -274,6 +279,9 @@ fn send_body(
                     }
                     if let Some(n) = parsed["usage"]["prompt_tokens"].as_u64() {
                         prompt_tokens = Some(n as usize);
+                    }
+                    if let Some(r) = parsed["choices"][0]["finish_reason"].as_str() {
+                        finish_reason = Some(r.to_string());
                     }
                     if let Some(text) = chunk_text(&parsed) {
                         generated_text.push_str(text);
@@ -337,6 +345,7 @@ fn send_body(
         error: String::new(),
         cached_tokens,
         prompt_tokens,
+        finish_reason,
     }
 }
 
@@ -375,16 +384,34 @@ fn chunk_failure(chunk: &serde_json::Value) -> Option<String> {
         .map(|r| format!("finish_reason {r}"))
 }
 
-/// Whether a streamed chunk is output: it carries a choice, and is neither a keepalive (oMLX's,
-/// `"model": "keepalive"`, sent while it prefills) nor an empty closing chunk (llama.cpp ends
-/// with one: no text, a `finish_reason`). Its text may be empty: oMLX streams gpt-oss's
-/// reasoning tokens as chunks with their text stripped, and they are still the decode.
+/// Whether a streamed chunk is output: it carries a choice, and is none of a keepalive (oMLX's,
+/// `"model": "keepalive"`, sent while it prefills), an empty closing chunk (llama.cpp ends
+/// with one: no text, a `finish_reason`), or a chat delta that only names its role. Its text
+/// may be empty: oMLX streams gpt-oss's reasoning tokens as chunks with their text stripped,
+/// and they are still the decode.
 fn is_progress(chunk: &serde_json::Value) -> bool {
-    if !has_choices(chunk) || chunk["model"] == "keepalive" {
+    if !has_choices(chunk) || chunk["model"] == "keepalive" || only_a_role(chunk) {
         return false;
     }
     let closing = chunk["choices"][0]["finish_reason"].is_string();
     !(closing && chunk_text(chunk).is_none())
+}
+
+/// A chat chunk whose delta names its role and carries nothing generated: how a chat stream
+/// opens, before prefill (OpenAI's API, oMLX), whatever oMLX's keepalive mode (#1051). An oMLX
+/// 0.7.3 chat keepalive is one too, under the request's own model (jundot/omlx#4797), if oMLX
+/// is not run with `--sse-keepalive-mode comment` as the Metal matrix runs it (#1056).
+fn only_a_role(chunk: &serde_json::Value) -> bool {
+    let Some(delta) = chunk["choices"][0]["delta"].as_object() else {
+        return false;
+    };
+    delta.contains_key("role")
+        && chunk_text(chunk).is_none()
+        && delta.iter().all(|(k, v)| match k.as_str() {
+            "role" => true,
+            "content" => v.as_str().is_none_or(str::is_empty),
+            _ => v.is_null(),
+        })
 }
 
 /// The generated text a streamed chunk carries: `text` on the completions API;
@@ -758,6 +785,8 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
         "request_throughput": num_success as f64 / total_time,
+        // The rate offered, open loop; null for `inf`, a closed loop.
+        "request_rate": args.request_rate.is_finite().then_some(args.request_rate),
         "output_throughput": total_output_tokens as f64 / total_time,
         "total_token_throughput": (total_input_tokens + total_output_tokens) as f64 / total_time,
         "peak_output_throughput": peak_output_tps,
@@ -1364,9 +1393,33 @@ fn print_turn_table(stats: &[TurnStats], pcts: &[f64]) {
     }
 }
 
-/// `random` / `sharegpt`: one streamed completion per prompt, open loop.
+/// The most tokens of natural text the `natural` dataset reads from its corpus: enough distinct
+/// slices for any run, and a few seconds to tokenize, of a 670 MB ShareGPT file.
+const NATURAL_CORPUS_TOKENS: usize = 2_000_000;
+
+/// `random` / `sharegpt` / `natural`: one streamed completion per prompt, open loop.
 fn run_prompts(args: &BenchServeArgs, client: &Arc<Client>, tokenizer: &Tokenizer) -> Result<Run> {
-    let prompt_entries = if args.dataset_name == ServeDataset::Sharegpt {
+    // The natural-text corpus, once, for the measured prompts and the warmups alike.
+    let natural = if args.dataset_name == ServeDataset::Natural {
+        let path = (args.dataset_path.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("--dataset-path is required for natural dataset"))?;
+        eprintln!("Loading the natural-text corpus from {path}...");
+        let corpus = datasets::sharegpt_corpus(Path::new(path), tokenizer, NATURAL_CORPUS_TOKENS)?;
+        eprintln!("Loaded {} tokens of natural text", corpus.len());
+        Some(corpus)
+    } else {
+        None
+    };
+    let prompt_entries = if let Some(corpus) = &natural {
+        datasets::natural_slices(
+            tokenizer,
+            corpus,
+            args.num_prompts,
+            args.input_len,
+            args.output_len,
+            args.seed,
+        )?
+    } else if args.dataset_name == ServeDataset::Sharegpt {
         let dataset_path = args
             .dataset_path
             .as_ref()
@@ -1398,16 +1451,27 @@ fn run_prompts(args: &BenchServeArgs, client: &Arc<Client>, tokenizer: &Tokenize
     };
 
     // Random-token throwaways for ShareGPT too: any other sample of the file
-    // could be one of the measured ones.
-    let throwaway = datasets::generate_random(
-        tokenizer,
-        1 + args.num_warmups,
-        args.input_len,
-        args.output_len,
-        args.random_range_ratio,
-        args.random_prefix_len,
-        datasets::throwaway_seed(args.seed),
-    )?;
+    // could be one of the measured ones. Natural text's are natural slices from a disjoint seed.
+    let throwaway = if let Some(corpus) = &natural {
+        datasets::natural_slices(
+            tokenizer,
+            corpus,
+            1 + args.num_warmups,
+            args.input_len,
+            args.output_len,
+            datasets::throwaway_seed(args.seed),
+        )?
+    } else {
+        datasets::generate_random(
+            tokenizer,
+            1 + args.num_warmups,
+            args.input_len,
+            args.output_len,
+            args.random_range_ratio,
+            args.random_prefix_len,
+            datasets::throwaway_seed(args.seed),
+        )?
+    };
     let send_throwaway = |i: usize, request_id: &str| {
         let p = &throwaway[i];
         let output_len = p.expected_output_len.min(args.output_len);
@@ -1433,6 +1497,7 @@ fn run_prompts(args: &BenchServeArgs, client: &Arc<Client>, tokenizer: &Tokenize
 
     let benchmark_start = Instant::now();
     let mut handles = Vec::with_capacity(num_prompts);
+    let output_cap = args.sharegpt_max_output_len.unwrap_or(usize::MAX);
 
     for (i, entry) in prompt_entries.into_iter().enumerate() {
         wait_until(benchmark_start, cumulative_delays[i]);
@@ -1454,7 +1519,7 @@ fn run_prompts(args: &BenchServeArgs, client: &Arc<Client>, tokenizer: &Tokenize
             let result = send_request(
                 &client,
                 &entry.prompt,
-                entry.expected_output_len,
+                entry.expected_output_len.min(output_cap),
                 &request_id,
                 benchmark_start,
             );
@@ -1658,8 +1723,9 @@ fn run_tasks(
         api_url,
         model: model.to_string(),
         api_key: args.api_key.clone(),
-        // Answers end on their own: a task's tokens are what it took.
-        ignore_eos: false,
+        // Answers end on their own, a task's tokens what it took; or with --timed-answers each is
+        // forced to its task's answer length, so engines' total times are like for like.
+        ignore_eos: args.timed_answers,
         temperature: Some(args.temperature.unwrap_or(0.0)),
         top_p: args.top_p,
         top_k: args.top_k,
@@ -1723,7 +1789,18 @@ fn run_tasks(
         std::fs::write(path, serde_json::to_string_pretty(&rows)?)?;
     }
     let count = |t: &str| datasets::token_count(tokenizer, t).unwrap_or(0);
-    let json = task_metrics(&results, &tasks, &count, total_time, &dataset, args.seed);
+    let pcts: Vec<f64> = (args.metric_percentiles.split(','))
+        .filter_map(|p| p.trim().parse().ok())
+        .collect();
+    let mut json = task_metrics(&results, &tasks, &count, total_time, &dataset, args.seed);
+    add_task_percentiles(&mut json, &results, &tasks, &count, &pcts);
+    add_task_requests(&mut json, &results, args.request_rate);
+    // Forced answers are no reading of accuracy, and every one ran to its length by design.
+    json["timed_answers"] = serde_json::json!(args.timed_answers);
+    if args.timed_answers {
+        json["accuracy"] = serde_json::Value::Null;
+        json["capped_answers"] = serde_json::Value::Null;
+    }
     print_task_summary(&dataset, &json);
     write_results(args, model, &json)
 }
@@ -1743,10 +1820,15 @@ fn task_body(
             "input": t.spans_input.clone().unwrap_or(serde_json::Value::Null),
         }})
     } else {
+        let max_tokens = if args.timed_answers {
+            t.timed_tokens()
+        } else {
+            t.max_tokens
+        };
         let mut b = serde_json::json!({
             "model": client.model,
             "messages": t.messages,
-            "max_tokens": t.max_tokens,
+            "max_tokens": max_tokens,
             "stream": true,
             "stream_options": {"include_usage": true},
         });
@@ -1796,11 +1878,16 @@ fn task_metrics(
     let out: Vec<usize> = ok.iter().map(|(r, _)| answer_tokens(r)).collect();
     let total_out: usize = out.iter().sum();
     let mean = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
+    // Answers that ran to their cap rather than ending on their own: the server's `length`, or
+    // where it sent no reason, the token count.
+    let capped = |r: &RequestResult, t: &crate::workloads::Task| match r.finish_reason.as_deref() {
+        Some(why) => why == "length",
+        None => answer_tokens(r) >= t.max_tokens,
+    };
     // Over every task sent that has a right answer (null for a workload with none: chat turns,
     // the shared-prefix questions). A request that failed scores wrong, as does an answer that ran
     // to its cap, whose text may hold the answer somewhere in a ramble that never gave it. Over
     // the answered only, an engine that failed the hard tasks would score higher.
-    let capped = |r: &RequestResult, t: &crate::workloads::Task| answer_tokens(r) >= t.max_tokens;
     let accuracy = mean(
         &(results.iter().zip(tasks))
             .filter(|(_, t)| t.score.scored())
@@ -1819,6 +1906,7 @@ fn task_metrics(
     let thought = (ok.iter())
         .filter(|(r, _)| opens_as_thought(&r.generated_text))
         .count();
+    let capped = ok.iter().filter(|(r, t)| capped(r, t)).count();
     let cached: Vec<f64> = (ok.iter())
         .filter_map(|(r, _)| r.cached_tokens.map(|c| c as f64))
         .collect();
@@ -1828,6 +1916,8 @@ fn task_metrics(
     serde_json::json!({
         "dataset": dataset,
         "task_seed": seed,
+        // Tasks sent, the denominator of accuracy: at 8 a task is 12.5 points of it.
+        "num_tasks": results.len(),
         "duration": total_time,
         "completed": ok.len(),
         "failed": results.len() - ok.len(),
@@ -1849,7 +1939,72 @@ fn task_metrics(
         "mean_cached_tokens": mean(&cached),
         "accuracy": accuracy,
         "thinking_answers": thought,
+        "capped_answers": capped,
     })
+}
+
+/// Every `--metric-percentiles` percentile of a dataset workload's TTFT, TPOT and end-to-end
+/// latency, over the requests that answered, as `p<N>_<metric>_ms`, the keys the random and
+/// ShareGPT workloads write: the spread across requests, not only the middle and the tail.
+fn add_task_percentiles(
+    json: &mut serde_json::Value,
+    results: &[RequestResult],
+    tasks: &[crate::workloads::Task],
+    count_tokens: &dyn Fn(&str) -> usize,
+    pcts: &[f64],
+) {
+    let ok: Vec<&RequestResult> = (results.iter().zip(tasks))
+        .filter(|(r, _)| r.success)
+        .map(|(r, _)| r)
+        .collect();
+    let answer_tokens = |r: &RequestResult| {
+        if r.output_tokens > 0 {
+            r.output_tokens
+        } else {
+            count_tokens(&r.generated_text)
+        }
+    };
+    let sorted = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v
+    };
+    let series = [
+        ("ttft", sorted(ok.iter().map(|r| r.ttft).collect())),
+        (
+            "tpot",
+            sorted(
+                (ok.iter())
+                    .filter(|r| answer_tokens(r) > 1)
+                    .map(|r| (r.e2el - r.ttft) / (answer_tokens(r) - 1) as f64)
+                    .collect(),
+            ),
+        ),
+        ("e2el", sorted(ok.iter().map(|r| r.e2el).collect())),
+    ];
+    for (name, v) in &series {
+        for &p in pcts {
+            let at = (!v.is_empty()).then(|| percentile(v, p) * 1000.0);
+            json[format!("p{}_{name}_ms", p_word(p))] = serde_json::json!(at);
+        }
+    }
+}
+
+/// Each request's send time (seconds from the cell's start), TTFT and end-to-end time, in
+/// request order, ms rounded to 0.1; null where it failed. The send times tell an arrival's effect
+/// from the engine's: a closed loop's users fall into lockstep and arrive in bursts, an open
+/// loop's on its schedule. Also the cell's offered rate (null for `inf`, a closed loop).
+fn add_task_requests(json: &mut serde_json::Value, results: &[RequestResult], rate: f64) {
+    let ms = |v: f64| (v * 10_000.0).round() / 10.0;
+    let ok = |r: &RequestResult, v: f64| r.success.then(|| ms(v));
+    json["request_rate"] = serde_json::json!(rate.is_finite().then_some(rate));
+    json["start_times"] = serde_json::json!(
+        results
+            .iter()
+            .map(|r| (r.start_time * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>()
+    );
+    json["ttfts_ms"] = serde_json::json!(results.iter().map(|r| ok(r, r.ttft)).collect::<Vec<_>>());
+    json["e2els_ms"] = serde_json::json!(results.iter().map(|r| ok(r, r.e2el)).collect::<Vec<_>>());
 }
 
 /// Whether an answer opens as reasoning rather than the answer: a think tag, or the openings the
@@ -2172,6 +2327,54 @@ mod tests {
         assert!(spans.get("messages").is_none());
     }
 
+    /// --timed-answers forces each request to its task's answer length, the same on every engine:
+    /// a RAG task's 64 tokens rather than its 256-token cap, with ignore_eos; a span query cannot
+    /// take it, so its answer still ends on its own.
+    #[test]
+    fn a_timed_request_is_forced_to_its_tasks_answer_length() {
+        let args = <BenchServeArgs as clap::Parser>::try_parse_from([
+            "serve",
+            "--dataset-name",
+            "rag",
+            "--timed-answers",
+        ])
+        .unwrap();
+        assert!(args.timed_answers);
+        let mut client = task_client();
+        client.ignore_eos = args.timed_answers;
+        let t = rag("Paris");
+        assert_eq!(t.timed_tokens(), crate::workloads::RAG_TIMED_TOKENS);
+        let chat = task_body(&client, &args, &t, false);
+        assert_eq!(chat["max_tokens"], crate::workloads::RAG_TIMED_TOKENS);
+        assert_eq!(chat["ignore_eos"], true, "forced to its length");
+        let spans = task_body(&client, &args, &t, true);
+        assert!(spans.get("ignore_eos").is_none() && spans["g"].get("ignore_eos").is_none());
+        // A conversation turn is timed at its recorded reply's length.
+        let reply = |t: &str| t.split_whitespace().count();
+        let turns = vec![("hi".to_string(), "one two three".to_string())];
+        let turn = &crate::workloads::chat_tasks(&turns, &reply)[0];
+        assert_eq!(turn.timed_tokens(), 3);
+    }
+
+    /// A cell keeps each request's send time, TTFT and end-to-end time, null where it failed, and
+    /// its offered rate (null in a closed loop), so an arrival's effect can be told from an
+    /// engine's; a timed cell records no accuracy, its answers forced.
+    #[test]
+    fn a_cell_keeps_each_requests_send_time() {
+        let mut ok = req(4, 4, 0.1, 0.5);
+        ok.start_time = 0.25;
+        let failed = RequestResult::failed(1.5, 2.0, "boom".into());
+        let mut j = serde_json::json!({});
+        add_task_requests(&mut j, &[ok, failed], 2.0);
+        assert_eq!(j["request_rate"], 2.0);
+        assert_eq!(j["start_times"], serde_json::json!([0.25, 1.5]));
+        assert_eq!(j["ttfts_ms"], serde_json::json!([100.0, null]));
+        assert_eq!(j["e2els_ms"], serde_json::json!([500.0, null]));
+        let mut closed = serde_json::json!({});
+        add_task_requests(&mut closed, &[], f64::INFINITY);
+        assert!(closed["request_rate"].is_null(), "inf is a closed loop");
+    }
+
     /// A dataset workload's metrics: accuracy over every task sent, a failed request or a capped
     /// answer scoring wrong; cached prompt tokens from the server's usage (null where it sent
     /// none); and the failed and empty answers counted apart.
@@ -2193,9 +2396,17 @@ mod tests {
             RequestResult::failed(0.0, 1.0, "timed out".into()),
         ];
         let tasks = vec![rag("Paris"), rag("Paris"), rag("Paris")];
-        let j = task_metrics(&results, &tasks, tokenizer, 1.0, "musique", 7);
+        let mut j = task_metrics(&results, &tasks, tokenizer, 1.0, "musique", 7);
+        add_task_percentiles(&mut j, &results, &tasks, tokenizer, &[25.0, 50.0, 99.5]);
+        assert_eq!(
+            j["p25_ttft_ms"], 100.0,
+            "every requested percentile, as the others write it"
+        );
+        assert_eq!(j["p50_e2el_ms"], 500.0);
+        assert!(j.get("p99.5_tpot_ms").is_some());
         assert_eq!(j["completed"], 2);
         assert_eq!(j["failed"], 1);
+        assert_eq!(j["num_tasks"], 3);
         assert_eq!(j["accuracy"], 1.0 / 3.0, "the failed request scores wrong");
         assert_eq!(j["mean_cached_tokens"], 60.0);
         assert_eq!(j["mean_prompt_tokens"], 100.0);
@@ -2203,6 +2414,7 @@ mod tests {
         assert_eq!(j["task_seed"], 7);
         assert_eq!(j["empty_answers"], 0);
         assert_eq!(j["thinking_answers"], 0);
+        assert_eq!(j["capped_answers"], 0);
         let thinking = vec![answered("We need to answer: what is the capital?", 9, None)];
         let j = task_metrics(&thinking, &tasks[..1], tokenizer, 1.0, "musique", 7);
         assert_eq!(j["thinking_answers"], 1);
@@ -2221,6 +2433,13 @@ mod tests {
             j["accuracy"], 0.0,
             "counted from its text, it ran to its cap"
         );
+        // A span answer has no usage: its cap shows in the server's finish reason, not its count.
+        let mut span = answered("The question asks", 0, None);
+        span.finish_reason = Some("length".into());
+        let mut ended = answered("Paris", 0, None);
+        ended.finish_reason = Some("stop".into());
+        let j = task_metrics(&[span, ended], &tasks[..2], tokenizer, 1.0, "musique", 7);
+        assert_eq!(j["capped_answers"], 1);
     }
 
     /// The shared-prefix warmups share no prompt with a measured question: drawn from the same
@@ -2314,6 +2533,66 @@ mod tests {
         assert_eq!(r.output_tokens, 2);
         assert_eq!(r.cached_tokens, Some(96));
         assert_eq!(r.prompt_tokens, Some(120));
+        assert_eq!(
+            r.finish_reason.as_deref(),
+            Some("stop"),
+            "the usage chunk has no choice"
+        );
+    }
+
+    /// A chat stream's TTFT runs to its first token, not to the role chunk it opens with. As oMLX
+    /// 0.7.3 sends it: the role chunk at once, before prefill, then the tokens after it.
+    #[test]
+    fn ttft_runs_to_the_first_token_past_an_opening_role_chunk() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 8192];
+            let _ = s.read(&mut req);
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                        transfer-encoding: chunked\r\n\r\n";
+            s.write_all(head.as_bytes()).unwrap();
+            let mut send = |e: &str| {
+                let event = format!("data: {e}\n\n");
+                s.write_all(format!("{:x}\r\n{event}\r\n", event.len()).as_bytes())
+                    .unwrap();
+                s.flush().unwrap();
+            };
+            send(r#"{"model":"m","choices":[{"index":0,"delta":{"role":"assistant"}}]}"#);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            send(r#"{"model":"m","choices":[{"index":0,"delta":{"content":"Par"}}]}"#);
+            send(
+                r#"{"model":"m","choices":[{"index":0,"delta":{"content":"is"},"finish_reason":"stop"}]}"#,
+            );
+            send("[DONE]");
+            s.write_all(b"0\r\n\r\n").unwrap();
+            s.flush().unwrap();
+            // Half-close, then read until the client hangs up: a body with a proper end keeps its
+            // connection for reuse, so the client must be dropped before this thread is joined.
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+            let _ = std::io::copy(&mut s, &mut std::io::sink());
+        });
+        let mut client = task_client();
+        client.api_url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let r = send_body(
+            &client,
+            &client.api_url,
+            &serde_json::json!({"messages": []}),
+            "t",
+            Instant::now(),
+        );
+        drop(client);
+        server.join().unwrap();
+        assert!(r.success, "failed: {}", r.error);
+        assert_eq!(r.generated_text, "Paris");
+        assert!(
+            r.ttft >= 0.3,
+            "TTFT {:.3} s stopped at the role chunk",
+            r.ttft
+        );
+        assert_eq!(r.chunks, 2);
     }
 
     /// A stream that breaks off mid-answer failed; one that breaks off only after `[DONE]` finished.
@@ -2379,6 +2658,7 @@ mod tests {
             error: String::new(),
             cached_tokens: None,
             prompt_tokens: None,
+            finish_reason: None,
         }
     }
 
@@ -2455,6 +2735,11 @@ mod tests {
         assert!(!is_progress(&c(
             r#"{"model":"keepalive","choices":[{"text":"","finish_reason":null}]}"#
         )));
+        // From 0.7.3 its keepalive carries the real model name and reads as output, the same as
+        // the gpt-oss chunk above: the Metal matrix serves oMLX with `--sse-keepalive-mode comment`.
+        assert!(is_progress(&c(
+            r#"{"model":"gpt-oss","choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}"#
+        )));
         // llama.cpp's empty closing chunk, and a usage-only chunk: not output.
         assert!(!is_progress(&c(
             r#"{"model":"m","choices":[{"text":"","finish_reason":"stop"}]}"#
@@ -2465,6 +2750,27 @@ mod tests {
         // A last token that comes with its finish_reason is output.
         assert!(is_progress(&c(
             r#"{"model":"m","choices":[{"text":".","finish_reason":"length"}]}"#
+        )));
+    }
+
+    #[test]
+    fn a_chat_stream_opening_role_chunk_is_not_output() {
+        let c = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        // oMLX 0.7.3, chat, granite-4.2-3b, about 2,500 words in: its opening role chunks came at
+        // 6 ms, before prefill, and the first token at 3,516 ms. OpenAI's API opens with the same.
+        assert!(!is_progress(&c(
+            r#"{"model":"granite-4.2-3b-q4-mlx","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#
+        )));
+        assert!(!is_progress(&c(
+            r#"{"model":"granite-4.2-3b-q4-mlx","choices":[{"index":0,"delta":{"role":"assistant"}}]}"#
+        )));
+        // A first token that comes with its role is output.
+        assert!(is_progress(&c(
+            r#"{"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"The"}}]}"#
+        )));
+        // A delta that is not only a role, text or not, is output, as #979 counts it.
+        assert!(is_progress(&c(
+            r#"{"model":"m","choices":[{"index":0,"delta":{"content":""}}]}"#
         )));
     }
 

@@ -24,11 +24,24 @@
 
 use std::collections::HashSet;
 
+use ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations;
 use scratchy_subtile::subtile_ir::{
     EwKind, GainConvention, Range, Region, SubOp, SubtileIR, SubtileNode, TensorId, TensorRegion,
     TensorShape,
 };
-use scratchy_target_spyre::ktir_superdsc_door::lower as door_lower;
+use scratchy_target_spyre::ktir_superdsc_door::{BundleAttnParams, lower as bundle_lower};
+
+/// One program through the production door as a bundle of its own — the fp8 quantize set starts
+/// empty, which is what a one-program bundle's is.
+fn door_lower(
+    k: &ktir_superdsc::ktir_node::KtirNode,
+    sym: &mut i64,
+    layout: Option<&ktir_superdsc::placement::BundleLayout>,
+    attn: Option<BundleAttnParams>,
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, ktir_superdsc::emit::lower_ktir_to_superdsc::Error>
+{
+    bundle_lower(k, sym, layout, attn, &mut QuantizedActivations::default())
+}
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::compute_bundle_layout;
 use scratchy_triton_splice::PagedRows;
 
@@ -1248,10 +1261,11 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
         // Each program through the door under the SAME layout, symbol counters
         // threaded in bundle order (the door's names are per-bundle).
         let mut s_sym = 0i64;
+        let mut s_fp8 = QuantizedActivations::default();
         for s_op in &spliced_ops {
             let s_ktir = s_op.ktir.as_ref().expect("spliced op carries its program");
-            let _emitted =
-                door_lower(s_ktir, &mut s_sym, Some(&layout), None).unwrap_or_else(|e| {
+            let _emitted = bundle_lower(s_ktir, &mut s_sym, Some(&layout), None, &mut s_fp8)
+                .unwrap_or_else(|e| {
                     panic!(
                         "spliced program lowered (mq={mq} k={k} n={n}): {}",
                         e.message
@@ -1854,6 +1868,187 @@ const ATTN_SHAPES: &[AttnShape] = &[
         rung: 0,
         rope_appended: true,
     },
+    // ⭐ THE PER-RANK GEOMETRIES (TP phase 1): granite's 32/8 head split sharded over the
+    // KV heads — tp=2 holds (16, 4), tp=4 (8, 2), tp=8 (4, 1), at both head dims. The
+    // PREFILL rows only, mirroring the four prefill classes above at each geometry: the
+    // one-pass rung (m=31 at hd 64, m=96 at hd 128), the ladder's bottom rung m=7 (the
+    // per-row causal arm under Triton's 16-byte descriptor floor), the descriptor law's
+    // boundary m=8 (staying ON the one-pass arm), and the continuation at rung 0 (the
+    // swept prefix beside the causal new block). Decode `mq == 1` rows are NOT added at
+    // `nkvh < 8`: production decode always takes the BATCHED kernel, and the per-sequence
+    // decode kernel's `< 8` branch is a known door refusal out of this phase's scope.
+    AttnShape {
+        geom: (16, 4, 64),
+        mq: 31,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (16, 4, 64),
+        mq: 7,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (16, 4, 64),
+        mq: 8,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (16, 4, 64),
+        mq: 31,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (8, 2, 64),
+        mq: 31,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (8, 2, 64),
+        mq: 7,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (8, 2, 64),
+        mq: 8,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (8, 2, 64),
+        mq: 31,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    // The (4, 1) rows — granite's tp=8 per-rank shape, ONE KV head per card — were a named
+    // FINDING (the GQA group spray read as a middle axis); the unit-axis fold in the door's
+    // broadcast classification landed, and they run with the rest.
+    AttnShape {
+        geom: (4, 1, 64),
+        mq: 31,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 64),
+        mq: 7,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 64),
+        mq: 8,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 64),
+        mq: 31,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    // The same four at head dim 128 (granite-3.1-8b's per-rank shapes).
+    AttnShape {
+        geom: (16, 4, 128),
+        mq: 96,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (16, 4, 128),
+        mq: 7,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (16, 4, 128),
+        mq: 8,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (16, 4, 128),
+        mq: 96,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (8, 2, 128),
+        mq: 96,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (8, 2, 128),
+        mq: 7,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (8, 2, 128),
+        mq: 8,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (8, 2, 128),
+        mq: 96,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 128),
+        mq: 96,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 128),
+        mq: 7,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 128),
+        mq: 8,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (4, 1, 128),
+        mq: 96,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
 ];
 
 /// The attention fixture's decode-position model: how many positions the mask says are valid
@@ -2260,6 +2455,43 @@ fn spliced_paged_step_executes_the_real_programs() {
     ] {
         execute_one_paged_step(s, cached);
     }
+    // ⭐ THE PER-RANK GEOMETRIES (TP phase 1): the SAME prefill chunk shapes — the first
+    // chunk (nothing cached), a chunk over a cached prefix crossing into the second page,
+    // the prefix-free rung over a cached prefix, and the prefix-free rung over a two-page
+    // pool — at granite's per-rank shapes (16, 4) / (8, 2) / (4, 1) at BOTH head dims.
+    // The chunk rung is the geometry's own head dim's (m=31 at hd 64, m=96 at hd 128),
+    // the rung the card bakes for that model.
+    let per_rank_step = |nqh: u32, nkvh: u32, hd: u32| AttnShape {
+        geom: (nqh, nkvh, hd),
+        mq: if hd == 64 { 31 } else { 96 },
+        cap: P,
+        rung: u32::MAX,
+        rope_appended: true,
+    };
+    for (nqh, nkvh) in [(16u32, 4u32), (8, 2), (4, 1)] {
+        for hd in [64u32, 128] {
+            let base = per_rank_step(nqh, nkvh, hd);
+            for (s, cached) in [
+                // The first prompt chunk: nothing cached.
+                (base, 0),
+                // A chunk over a cached prefix, its rows crossing into the second page.
+                (
+                    AttnShape {
+                        cap: 2 * P,
+                        rung: 0,
+                        ..base
+                    },
+                    at(0, P / 2 + 8),
+                ),
+                // The prefix-free rung running a chunk over a cached prefix.
+                (base, at(0, P - base.mq - 5)),
+                // The same over a TWO-PAGE pool.
+                (AttnShape { cap: 2 * P, ..base }, at(0, P - base.mq - 5)),
+            ] {
+                execute_one_paged_step(s, cached);
+            }
+        }
+    }
 }
 
 /// `n` values uniform in `[-amp, amp)` from a fixed LCG — a stimulus both sides read as the same
@@ -2507,6 +2739,39 @@ fn spliced_decode_batch_executes_the_real_programs() {
         (at_hd(1, 1, 128), vec![100]),
     ] {
         execute_one_decode_batch(s, &contexts);
+    }
+    // ⭐ THE PER-RANK GEOMETRIES (TP phase 1): the SAME chunkings — 4 sequences over the
+    // 64-page walk, the 4-page rung, 2 sequences on the 2-page and 1-page rungs, and a
+    // batch of one deep and short — at granite's per-rank shapes (16, 4) / (8, 2) / (4, 1)
+    // at BOTH head dims. Production decode always takes the BATCHED kernel, so these are
+    // the rows TP's per-rank decode actually runs; a refusal or divergence here is a
+    // finding against `min_kv_heads_per_rank`, never a loosened row.
+    let per_rank = |nqh: u32, nkvh: u32, hd: u32, seqs: u32, walk: u32| AttnShape {
+        geom: (nqh, nkvh, hd),
+        mq: seqs,
+        cap: 64 * P,
+        rung: walk * P,
+        rope_appended: true,
+    };
+    for (nqh, nkvh) in [(16u32, 4u32), (8, 2), (4, 1)] {
+        for hd in [64u32, 128] {
+            for (s, contexts) in [
+                (per_rank(nqh, nkvh, hd, 4, 64), vec![150usize, 40, 100]),
+                (per_rank(nqh, nkvh, hd, 4, 4), vec![150, 40, 100]),
+                (per_rank(nqh, nkvh, hd, 2, 2), vec![100, 30]),
+                (per_rank(nqh, nkvh, hd, 2, 1), vec![100, 30]),
+                (
+                    AttnShape {
+                        rung: 0,
+                        ..per_rank(nqh, nkvh, hd, 1, 64)
+                    },
+                    vec![4000],
+                ),
+                (per_rank(nqh, nkvh, hd, 1, 1), vec![100]),
+            ] {
+                execute_one_decode_batch(s, &contexts);
+            }
+        }
     }
 }
 

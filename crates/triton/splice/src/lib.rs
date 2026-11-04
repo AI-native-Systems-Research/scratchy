@@ -433,6 +433,18 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
              host routing, or its own by-name refusal); reaching the splice means the \
              routing changed, and the fix is a family function plus a kernel",
         ),
+        // A DFlash2 drafter's ops and its target's capture: Splash's kernels, ported as
+        // Metal opcode lowerings alone.
+        SubOp::CaptureHidden { .. }
+        | SubOp::DraftConv { .. }
+        | SubOp::DraftAttention { .. }
+        | SubOp::DraftContextKv { .. }
+        | SubOp::DraftWindowStore
+        | SubOp::DraftWindowLoad
+        | SubOp::DraftSelect => TritonKernelRow::Refused(
+            "a DFlash2 drafter's op (or its target's capture): its kernels are Splash's, \
+             lowered on Metal alone — a spyre drafter needs its kernels first",
+        ),
     }
 }
 
@@ -4148,12 +4160,13 @@ mod production_ktir_dump {
         let ops = match program_of(name) {
             // The door's walk, whatever the program computes: the body at trip 0, marked for the
             // card's relaunch.
-            _ if flat.is_some() => {
-                Ok(
-                    ktir_superdsc::emit::whole_function::lower_walk(node, Some(&layout), &mut sym)
-                        .map_err(|e| format!("{name}: {e:?}"))?,
-                )
-            }
+            _ if flat.is_some() => Ok(ktir_superdsc::emit::whole_function::lower_walk(
+                node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .map_err(|e| format!("{name}: {e:?}"))?),
             // The door's `windowed(...)`-wrapped whole-function kinds.
             Program::Elementwise(_)
             | Program::SiluMul
@@ -4161,14 +4174,22 @@ mod production_ktir_dump {
             | Program::ScalarMul
             | Program::Sample
             | Program::PagedAttn
-            | Program::PagedKvWrite => {
-                windowed(lower_function(node, Some(&layout), &mut sym, None))
-            }
+            | Program::PagedKvWrite => windowed(lower_function(
+                node,
+                Some(&layout),
+                &mut sym,
+                None,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )),
             // The door's unwrapped whole-function kinds.
-            Program::Matmul | Program::LmLast => {
-                Ok(lower_function(node, Some(&layout), &mut sym, None)
-                    .map_err(|e| format!("{name}: {e:?}"))?)
-            }
+            Program::Matmul | Program::LmLast => Ok(lower_function(
+                node,
+                Some(&layout),
+                &mut sym,
+                None,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .map_err(|e| format!("{name}: {e:?}"))?),
             Program::RmsNormUnit => windowed(lk::rmsnorm_unit(
                 lk_name,
                 node,
@@ -4362,9 +4383,13 @@ mod walk_on_the_card {
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
-            let ops =
-                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("mq={mq} blocks={blocks} hd={hd}: {}", e.message));
+            let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                &node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .unwrap_or_else(|e| panic!("mq={mq} blocks={blocks} hd={hd}: {}", e.message));
             let out = ktir_superdsc::place::act_name((node.bindings.len() - 1) as u32);
             assert!(
                 ops.iter().any(|e| e
@@ -4392,8 +4417,13 @@ mod walk_on_the_card {
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
         allocate_paged_cache(&node, &layout).expect("the cache allocates");
         let mut sym = 0i64;
-        let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-            .unwrap_or_else(|e| panic!("the walk lowers: {}", e.message));
+        let ops = ktir_superdsc::emit::whole_function::lower_walk(
+            &node,
+            Some(&layout),
+            &mut sym,
+            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+        )
+        .unwrap_or_else(|e| panic!("the walk lowers: {}", e.message));
         let named = |prefix: &str| -> Vec<&ktir_superdsc::emit::EmittedOp> {
             ops.iter()
                 .filter(|e| e.op_name.starts_with(prefix))
@@ -4469,9 +4499,13 @@ mod walk_on_the_card {
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
-            let ops =
-                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("hd {hd}: the walk lowers: {}", e.message));
+            let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                &node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .unwrap_or_else(|e| panic!("hd {hd}: the walk lowers: {}", e.message));
             let lx = |name: &str| layout.lx_core_local(name);
             let div = ops
                 .iter()
@@ -4573,8 +4607,13 @@ mod walk_on_the_card {
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
         allocate_paged_cache(&node, &layout).expect("the cache allocates");
         let mut sym = 0i64;
-        let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-            .unwrap_or_else(|e| panic!("the batched walk lowers: {}", e.message));
+        let ops = ktir_superdsc::emit::whole_function::lower_walk(
+            &node,
+            Some(&layout),
+            &mut sym,
+            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+        )
+        .unwrap_or_else(|e| panic!("the batched walk lowers: {}", e.message));
         let marked: Vec<usize> = (0..ops.len()).filter(|&i| ops[i].walk.is_some()).collect();
         let (first, last) = (marked[0], *marked.last().expect("a body"));
         assert_eq!(
@@ -4619,9 +4658,13 @@ mod walk_on_the_card {
                     .unwrap_or_else(|e| panic!("{at}: {e:?}"));
                 allocate_paged_cache(&node, &layout).expect("the cache allocates");
                 let mut sym = 0i64;
-                let ops =
-                    ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                        .unwrap_or_else(|e| panic!("{at}: {}", e.message));
+                let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                    &node,
+                    Some(&layout),
+                    &mut sym,
+                    &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+                )
+                .unwrap_or_else(|e| panic!("{at}: {}", e.message));
                 assert_eq!(
                     ops.iter().any(|e| e.walk.is_some()),
                     c.num_chunks > 1,
@@ -4692,9 +4735,13 @@ mod walk_on_the_card {
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
-            let ops =
-                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
+            let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                &node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
             let at = format!("B={seqs} hd={hd}");
             assert!(
                 ops.iter()
@@ -4744,9 +4791,13 @@ mod walk_on_the_card {
                     triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
                 allocate_paged_cache(&node, &layout).expect("the cache allocates");
                 let mut sym = 0i64;
-                let ops =
-                    ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                        .unwrap_or_else(|e| panic!("{at}: {}", e.message));
+                let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                    &node,
+                    Some(&layout),
+                    &mut sym,
+                    &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+                )
+                .unwrap_or_else(|e| panic!("{at}: {}", e.message));
                 let body: Vec<_> = ops.iter().filter(|e| e.walk.is_some()).collect();
                 assert_eq!(body.len(), 22, "{at}: the chunk's ops");
                 let named = |prefix: &str| -> Vec<&&ktir_superdsc::emit::EmittedOp> {
@@ -4798,9 +4849,13 @@ mod walk_on_the_card {
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
-            let ops =
-                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
+            let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                &node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
             let at = format!("B={seqs} walk={walk} hd={hd}");
             // The walk's carried buffers: what a trip writes that a seed before the walk filled.
             let filled: Vec<String> = ops
@@ -4868,6 +4923,7 @@ mod walk_on_the_card {
                         &node,
                         Some(&layout),
                         &mut sym,
+                        &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
                     )
                     .unwrap_or_else(|e| panic!("B={seqs} walk={walk} hd={hd}: {}", e.message));
                     ops.iter().filter(|e| e.op_name.starts_with(prefix)).count() as u32
@@ -4940,9 +4996,13 @@ mod walk_on_the_card {
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
-            let ops =
-                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
+            let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                &node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
             let at = format!("B={seqs} walk={walk} hd={hd}");
             // `out` is the kernel's last parameter.
             let out = ktir_superdsc::place::act_name((node.bindings.len() - 1) as u32);
@@ -4984,9 +5044,13 @@ mod walk_on_the_card {
             layout.frames.insert(0, [seqs, 32 * hd]);
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
-            let ops =
-                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
+            let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                &node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
             let at = format!("B={seqs} walk={walk} hd={hd} rows/page={}", c.rows_per_page);
             let reads_query = |e: &&ktir_superdsc::emit::EmittedOp| {
                 e.arg_bindings
@@ -5025,9 +5089,13 @@ mod walk_on_the_card {
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
-            let ops =
-                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
+            let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                &node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
             let at = format!("B={seqs} walk={walk} hd={hd}");
             let copies: Vec<_> = ops
                 .iter()
@@ -5078,8 +5146,13 @@ mod walk_on_the_card {
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
         allocate_paged_cache(&node, &layout).expect("the cache allocates");
         let mut sym = 0i64;
-        let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-            .unwrap_or_else(|e| panic!("the one-chunk batch lowers: {}", e.message));
+        let ops = ktir_superdsc::emit::whole_function::lower_walk(
+            &node,
+            Some(&layout),
+            &mut sym,
+            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+        )
+        .unwrap_or_else(|e| panic!("the one-chunk batch lowers: {}", e.message));
         assert!(ops.iter().all(|e| e.walk.is_none()));
     }
 
@@ -5103,9 +5176,13 @@ mod walk_on_the_card {
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
-            let ops =
-                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("mq={mq}: the walk lowers: {}", e.message));
+            let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                &node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .unwrap_or_else(|e| panic!("mq={mq}: the walk lowers: {}", e.message));
             let marked: Vec<usize> = (0..ops.len()).filter(|&i| ops[i].walk.is_some()).collect();
             let (first, last) = (marked[0], *marked.last().expect("a body"));
             assert_eq!(
@@ -5197,8 +5274,13 @@ mod walk_on_the_card {
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
         allocate_paged_cache(&node, &layout).expect("the cache allocates");
         let mut sym = 0i64;
-        let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-            .unwrap_or_else(|e| panic!("the hd128 walk lowers: {}", e.message));
+        let ops = ktir_superdsc::emit::whole_function::lower_walk(
+            &node,
+            Some(&layout),
+            &mut sym,
+            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+        )
+        .unwrap_or_else(|e| panic!("the hd128 walk lowers: {}", e.message));
         let pages: Vec<&ktir_superdsc::emit::EmittedOp> = ops
             .iter()
             .filter(|e| e.op_name.starts_with("gather_o"))
@@ -5275,9 +5357,13 @@ mod walk_on_the_card {
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
-            let ops =
-                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("mq={mq}: the prompt walk lowers: {}", e.message));
+            let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                &node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .unwrap_or_else(|e| panic!("mq={mq}: the prompt walk lowers: {}", e.message));
             let outside = |prefix: &str| {
                 ops.iter()
                     .filter(|e| e.walk.is_none() && e.op_name.starts_with(prefix))
@@ -5301,8 +5387,13 @@ mod walk_on_the_card {
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let lower = || {
                 let mut sym = 0i64;
-                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("mq={mq} hd={hd}: the walk lowers: {}", e.message))
+                ktir_superdsc::emit::whole_function::lower_walk(
+                    &node,
+                    Some(&layout),
+                    &mut sym,
+                    &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+                )
+                .unwrap_or_else(|e| panic!("mq={mq} hd={hd}: the walk lowers: {}", e.message))
             };
             let shape =
                 |ops: &[ktir_superdsc::emit::EmittedOp]| -> Vec<(String, Vec<(String, u32)>)> {
@@ -5369,9 +5460,13 @@ mod walk_on_the_card {
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
-            let ops =
-                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("mq={mq}: the walk lowers: {}", e.message));
+            let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                &node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .unwrap_or_else(|e| panic!("mq={mq}: the walk lowers: {}", e.message));
             let body: Vec<_> = ops.iter().filter(|e| e.walk.is_some()).cloned().collect();
             let walk = body[0].walk.expect("a walk");
             assert_eq!(walk.trips, 4, "mq={mq}: four pages, four trips");
@@ -5433,9 +5528,13 @@ mod walk_on_the_card {
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
             allocate_paged_cache(&node, &layout).expect("the cache allocates");
             let mut sym = 0i64;
-            let ops =
-                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-                    .unwrap_or_else(|e| panic!("mq={mq} hd={hd}: the walk lowers: {}", e.message));
+            let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                &node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .unwrap_or_else(|e| panic!("mq={mq} hd={hd}: the walk lowers: {}", e.message));
             let lx = |name: &str| layout.lx_core_local(name);
             let body: Vec<_> = ops.iter().filter(|e| e.walk.is_some()).collect();
             assert_eq!(body.len(), trip, "mq={mq} hd={hd}: the trip's ops");
@@ -5554,8 +5653,13 @@ mod walk_on_the_card {
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
         allocate_paged_cache(&node, &layout).expect("the cache allocates");
         let mut sym = 0i64;
-        let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-            .unwrap_or_else(|e| panic!("the hd128 prompt walk lowers: {}", e.message));
+        let ops = ktir_superdsc::emit::whole_function::lower_walk(
+            &node,
+            Some(&layout),
+            &mut sym,
+            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+        )
+        .unwrap_or_else(|e| panic!("the hd128 prompt walk lowers: {}", e.message));
         let first_body = ops.iter().position(|e| e.walk.is_some()).expect("a body");
         let last_body = ops.iter().rposition(|e| e.walk.is_some()).expect("a body");
         let named = |prefix: &str| -> Vec<usize> {
@@ -5719,6 +5823,7 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
             Some(&layout),
             &mut sym,
             None,
+            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
         ) else {
             panic!("{stored}: an add over two pages in blocks lowered");
         };
@@ -5734,8 +5839,13 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("places");
         allocate_paged_cache(&node, &layout).expect("the cache allocates");
         let mut sym = 0i64;
-        let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-            .unwrap_or_else(|e| panic!("the one-block walk lowers: {}", e.message));
+        let ops = ktir_superdsc::emit::whole_function::lower_walk(
+            &node,
+            Some(&layout),
+            &mut sym,
+            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+        )
+        .unwrap_or_else(|e| panic!("the one-block walk lowers: {}", e.message));
         assert!(!ops.is_empty() && ops.iter().all(|e| e.walk.is_none()));
     }
 
@@ -5778,10 +5888,13 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the write places");
         allocate_paged_cache(&node, &layout).expect("the cache allocates");
         let mut sym = 0i64;
-        ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
-            .unwrap_or_else(|e| {
-                panic!("t={t} nkvh={nkvh} hd={hd}: the write lowers: {}", e.message)
-            })
+        ktir_superdsc::emit::whole_function::lower_walk(
+            &node,
+            Some(&layout),
+            &mut sym,
+            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+        )
+        .unwrap_or_else(|e| panic!("t={t} nkvh={nkvh} hd={hd}: the write lowers: {}", e.message))
     }
 
     /// ⭐ A HEAD TWO STICKS WIDE IS WRITTEN WHOLE, one index entry per row. The pool is row-outermost,

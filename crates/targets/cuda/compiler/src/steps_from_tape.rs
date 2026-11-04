@@ -189,7 +189,14 @@ pub fn lower_step(
         | L::AllRowsMatmul
         | L::Sample { .. }
         | L::EmbedRowGather { .. }
-        | L::ChainStage { .. } => Err(CanonicalRefusal::NotLowered {
+        | L::ChainStage { .. }
+        | L::CaptureHidden { .. }
+        | L::DraftConv { .. }
+        | L::DraftAttention { .. }
+        | L::DraftContextKv { .. }
+        | L::DraftWindowStore
+        | L::DraftWindowLoad
+        | L::DraftSelect => Err(CanonicalRefusal::NotLowered {
             step: s.step,
             op: op.name(),
         }),

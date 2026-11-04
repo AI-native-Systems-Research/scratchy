@@ -122,6 +122,7 @@ fn a_pass_past_the_prefix_picks_what_the_whole_vocabulary_picks() {
         let stored: Vec<u32> = match codes_read {
             AffineCodes::AsWritten => words.clone(),
             AffineCodes::Offset8 => words.iter().map(|w| w ^ 0x8888_8888).collect(),
+            AffineCodes::Planes { .. } => unreachable!("a vocabulary suffix never reads planes"),
         };
         let codes = shared_slice(&device, &stored);
         let qmv_pipelines: Vec<Box<_>> = (keys.qmv.get(codes_read).iter())

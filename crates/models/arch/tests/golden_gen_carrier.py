@@ -286,12 +286,15 @@ BLOCK_TYPE_CHARS = {
 def derive_layer_sets(cfg, bounds):
     """config.rs derive_layer_sets: hybrid_override_pattern (string or
     list of chars) wins, then layers_block_type, then layer_types (only
-    when every entry is a block type). Fills / checks num_hidden_layers."""
+    when every entry is a block type). Fills / checks num_hidden_layers.
+    Every model has `draft_capture_layers` (config.rs DRAFT_CAPTURE_LAYERS):
+    empty unless a drafter compiled beside it reads some of its layers."""
+    captured = {"draft_capture_layers": list(cfg.get("draft_capture_layers", []))}
     pattern = cfg.get("hybrid_override_pattern")
     if pattern is None:
         types = cfg.get("layers_block_type") or cfg.get("layer_types")
         if not isinstance(types, list) or not all(t in BLOCK_TYPE_CHARS for t in types):
-            return {}
+            return captured
         pattern = [BLOCK_TYPE_CHARS[t] for t in types]
     pattern = list(pattern)
     if not pattern or not all(c in PATTERN_BLOCKS for c in pattern):
@@ -299,7 +302,8 @@ def derive_layer_sets(cfg, bounds):
     n = bounds.setdefault("num_hidden_layers", len(pattern))
     if n != len(pattern):
         raise ValueError(f"block schedule names {len(pattern)} layers, num_hidden_layers is {n}")
-    return {name: [l for l, c in enumerate(pattern) if c == ch] for ch, name in PATTERN_BLOCKS.items()}
+    sets = {name: [l for l, c in enumerate(pattern) if c == ch] for ch, name in PATTERN_BLOCKS.items()}
+    return sets | captured
 
 
 def eval_params(arch, cfg, bounds):
@@ -1422,6 +1426,11 @@ def gate_apply(attn, gate):
 def gate_scale(routed, shared_y, g):
     """out = routed + shared_y * sigmoid(g); g is [T, 1] row-broadcast."""
     return routed + shared_y * torch.sigmoid(g)
+
+
+def capture_hidden(x):
+    """A layer's output rows copied out for a drafter; the forward reads them unchanged."""
+    return x
 
 
 # ── MoE (cuda kernels.rs topk_softmax / topk_noaux_tc + layers_moe.rs

@@ -31,6 +31,7 @@
 //! the crate's argument pack and hands it straight to the generic entry point.
 
 use ktir_superdsc::emit::EmittedOp;
+use ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations;
 use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{
     Error, Region, err, regions, rope_at, split_out,
@@ -94,13 +95,11 @@ pub struct BundleAttnParams {
 /// folds a row-blocked pointwise family into one whole-view descriptor (see
 /// `whole_function::row_tiled_family`).
 ///
-/// ⛔ THE fp8 ACTIVATION-QUANTIZE DEDUP IS NOT THREADED THROUGH THE WALK, AND THAT IS STATED
-/// RATHER THAN SILENT. The per-`Program` matmul arm took main's per-BUNDLE dedup set, so q/k/v
-/// reading one rms output quantized it once; the walk states its set per op (see `emit_one`'s
-/// Matmul arm), so each fp8 matmul node emits its own quantize chain — same numerics, more ops,
-/// until the set is threaded across the walk's calls. This door no longer takes the set: a
-/// parameter nothing reads is a lie about behavior, and the follow-up that threads the dedup
-/// adds it where it is consumed.
+/// ⭐ THE fp8 ACTIVATION-QUANTIZE DEDUP IS THE BUNDLE'S, AND IT IS THREADED HERE. `quantized` is
+/// one [`QuantizedActivations`] per bundle pass, so q/k/v reading one rms output quantize it once
+/// and gate/up another once — main's per-BUNDLE set, which the walk dropped when the matmuls moved
+/// onto it and now takes back. Every buffer a program WRITES is forgotten before it lowers and again
+/// after ([`lk::written_buffers`]), so a held quantize only ever names the bytes a later matmul reads.
 ///
 /// `attn_params` is [`BundleAttnParams`] — main's own remaining parameters, for the two bodies whose
 /// device laws need a fact no program states.
@@ -109,6 +108,29 @@ pub fn lower(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     attn_params: Option<BundleAttnParams>,
+    quantized: &mut QuantizedActivations,
+) -> Result<Vec<EmittedOp>, Error> {
+    // ⛔ WHAT THIS PROGRAM WRITES IS NOT THE QUANTIZE ANY EARLIER PROGRAM TOOK, before it lowers
+    // (a matmul reading what its own program wrote reads the new bytes) and after (no later matmul
+    // may reuse a chain over bytes this program replaced).
+    let written = lk::written_buffers(k)?;
+    for &t in &written {
+        quantized.written(t);
+    }
+    let ops = lower_kind(k, sym_id_base, layout, attn_params, quantized);
+    for &t in &written {
+        quantized.written(t);
+    }
+    ops
+}
+
+/// [`lower`]'s dispatch, by the program's kind.
+fn lower_kind(
+    k: &KtirNode,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+    attn_params: Option<BundleAttnParams>,
+    quantized: &mut QuantizedActivations,
 ) -> Result<Vec<EmittedOp>, Error> {
     // The name is still the program's identity for the emulator (which keys functions by it) and for
     // the descriptor suffixes, so it is READ — but nothing is parsed out of it.
@@ -117,7 +139,7 @@ pub fn lower(
     // itself does — the top-level `regions` reading below stops at the loop. Whatever it computes:
     // the loop is the program's shape, not its kind.
     if ktir_superdsc::emit::loop_fold::walks(k) {
-        return lower_walk(k, layout, sym_id_base);
+        return lower_walk(k, layout, sym_id_base, quantized);
     }
     let r = regions(k)?;
     // ⭐⭐⭐ ON THE TYPE, NOT ON THE NAME. This was `match name.split('_').next()`, so a program's kind
@@ -130,21 +152,49 @@ pub fn lower(
         // (`subtile_ir.rs`'s set); for the rest the guard is a no-op at
         // corner 0, and it makes a corner that ever reaches one a build error naming the op, not a
         // piece written at the buffer base.
-        Program::Elementwise(_) => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
-        Program::SiluMul => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
-        Program::RmsNorm => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
-        Program::ScalarMul => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
+        Program::Elementwise(_) => windowed(
+            name,
+            &r,
+            lower_function(k, layout, sym_id_base, None, quantized),
+        ),
+        Program::SiluMul => windowed(
+            name,
+            &r,
+            lower_function(k, layout, sym_id_base, None, quantized),
+        ),
+        Program::RmsNorm => windowed(
+            name,
+            &r,
+            lower_function(k, layout, sym_id_base, None, quantized),
+        ),
+        Program::ScalarMul => windowed(
+            name,
+            &r,
+            lower_function(k, layout, sym_id_base, None, quantized),
+        ),
         // ⭐ THE TOKEN DRAW — the whole-function walk, like every pointwise kind:
         // a straight-line body of whole-row reduces, equality compares and staged-table
         // multiplies over generic ops, whole-tensor at corner 0 (the splice's own
         // region guard refuses a windowed one). No door fact is read off the program.
-        Program::Sample => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
+        Program::Sample => windowed(
+            name,
+            &r,
+            lower_function(k, layout, sym_id_base, None, quantized),
+        ),
         // The KV write is its stores of loaded rows through the write-rows table — the walk's
         // scatter of a parameter's rows (`lk::load_scatters`), as for any program.
-        Program::PagedKvWrite => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
+        Program::PagedKvWrite => windowed(
+            name,
+            &r,
+            lower_function(k, layout, sym_id_base, None, quantized),
+        ),
         // A walk was lowered above; a one-block walk states no loop (the front end promotes a
         // one-trip `scf.for` to its body) and is the straight-line program it reads as.
-        Program::PagedAttn => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
+        Program::PagedAttn => windowed(
+            name,
+            &r,
+            lower_function(k, layout, sym_id_base, None, quantized),
+        ),
         // ⭐ THE CHAINED HEAD'S ROW PRODUCTION — the same no-door-to-cross shape as the
         // transpose: the three legs (slab gather, restickify transpose, row gather) are
         // parameterised by the extents its own regions state. See [`lk::embed_row_gather`]
@@ -175,11 +225,11 @@ pub fn lower(
         // `TransposeB` and `OperandOrigin::Staged`; the walk reads the orientation off the op's own
         // `indexing_maps` (`whole_function::matmul_b_orientation`) and states the operands' origin
         // as windows — the facts the spurious-pad drop in `matmul_oriented` discriminates on.
-        Program::Matmul => lower_function(k, layout, sym_id_base, None),
+        Program::Matmul => lower_function(k, layout, sym_id_base, None, quantized),
         // The last-row extraction is a PURE COPY (loads and stores only); the walk's own LmLast
         // arm keys on the stated `Program` and refuses a copy that grew a compute op rather than
         // half-lowering it.
-        Program::LmLast => lower_function(k, layout, sym_id_base, None),
+        Program::LmLast => lower_function(k, layout, sym_id_base, None, quantized),
         Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
         // ⭐ NO DOOR TO CROSS. A transpose's descriptor is parameterised by the two extents its own
         // program states and by nothing about the model, so the arm is the body — unlike `rope`/`attn`

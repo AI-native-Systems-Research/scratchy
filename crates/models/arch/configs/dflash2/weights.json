@@ -1,0 +1,36 @@
+{
+  "__packed_concats__": {
+    "self_attn.qkv_proj": ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
+    "self_attn.kv_proj": ["self_attn.k_proj", "self_attn.v_proj"]
+  },
+
+  "embed_tokens": ["vocab_size", "hidden_size"],
+  "lm_head": ["hidden_size", "vocab_size"],
+  "fc": ["backbone_hidden_size", "hidden_size"],
+  "hidden_norm": ["hidden_size"],
+  "norm": ["hidden_size"],
+  "input_layernorm": ["hidden_size"],
+  "post_attention_layernorm": ["hidden_size"],
+
+  "attention_conv.kernel_projection": ["hidden_size", "draft_dynamic_size"],
+  "attention_conv.base_kernel": ["draft_conv_base_size"],
+  "mlp_conv.kernel_projection": ["hidden_size", "draft_dynamic_size"],
+  "mlp_conv.base_kernel": ["draft_conv_base_size"],
+
+  "self_attn.q_proj": ["hidden_size", "draft_attention_size"],
+  "self_attn.k_proj": ["hidden_size", "num_key_value_heads * head_dim"],
+  "self_attn.v_proj": ["hidden_size", "num_key_value_heads * head_dim"],
+  "self_attn.qkv_proj": ["hidden_size", "draft_qkv_size"],
+  "self_attn.kv_proj": ["hidden_size", "draft_kv_size"],
+  "self_attn.o_proj": ["draft_attention_size", "hidden_size"],
+  "self_attn.q_norm": ["head_dim"],
+  "self_attn.k_norm": ["head_dim"],
+
+  "mlp.gate_proj": ["hidden_size", "intermediate_size"],
+  "mlp.up_proj": ["hidden_size", "intermediate_size"],
+  "mlp.down_proj": ["intermediate_size", "hidden_size"],
+
+  "candidate_selector.hidden_projection": ["hidden_size", "selector_rank"],
+  "candidate_selector.predecessor_codebook": ["draft_codebook_size"],
+  "candidate_selector.successor_codebook": ["draft_codebook_size"]
+}

@@ -277,6 +277,10 @@ mod green_gate {
             gdn_state_indices: None,
             #[cfg(feature = "metal")]
             gdn_is_fresh: None,
+            #[cfg(feature = "metal")]
+            draft_ring: None,
+            #[cfg(feature = "metal")]
+            draft: None,
             device_inputs: &[],
             deferred: None,
             reads: scratchy_target_metal::ForwardReads::Outputs,

@@ -4054,6 +4054,42 @@ pub fn emit_sdsc(
                 let arrangement = match v.frame {
                     crate::superdsc_opspec::ViewFrame::Own
                     | crate::superdsc_opspec::ViewFrame::FoldedRows => own,
+                    // ⭐ THE LANDING'S OWN FRAME — a page-gather landing of ONE block, several
+                    // sticks wide: the tensor's ONE arrangement is the stick-major [r, c] that
+                    // block is, derived from the landing's own extents — all its elements over
+                    // its stick dim's extent. A landing of SEVERAL blocks never carries this
+                    // frame (the stamp sites keep it `Own`): its bytes are blocks-one-after-
+                    // another, which no `StickKind` states — the walk carries that frame as
+                    // `batch_blocks` / `BatchFrame::Blocks` — and declaring it stick-major here
+                    // would contradict the batched transpose's read of the same tensor, which
+                    // the arrangement authority refuses. ADDRESSING is unchanged (the landing's
+                    // per-core starts are its blocks); a one-stick landing never carries this
+                    // frame, and a view whose extents do not divide keeps `own`.
+                    crate::superdsc_opspec::ViewFrame::LandedBlocks => {
+                        let stick_ext = iter.extent(v.stick) as usize;
+                        let lanes = v.df.elems_per_stick() as usize;
+                        let elems = own.rows * own.cols;
+                        if stick_ext > lanes && elems.is_multiple_of(stick_ext) {
+                            crate::sdsc_abstract::StickLayout::row_blocked_df(
+                                elems / stick_ext,
+                                stick_ext,
+                                v.df,
+                            )
+                        } else {
+                            // A stamp/view disagreement, and it is LOUD: the opspec stamped this
+                            // view LandedBlocks from its own cols, and the view's emit-time
+                            // extents say otherwise — one of the two is wrong, and a silent flat
+                            // declaration would hide which.
+                            return Err(SuperDscError(format!(
+                                "op '{op_name}': tensor '{}' is stamped LandedBlocks — a one-block \
+                                 landing several sticks wide, its blocks' frame derived from its \
+                                 own cols — but the view's emit-time extents disagree: a \
+                                 {stick_ext}-element stick axis over {elems} elements is not a \
+                                 whole-stick, several-stick landing",
+                                v.name
+                            )));
+                        }
+                    }
                     crate::superdsc_opspec::ViewFrame::StickColumns => {
                         own.of_stick_columns().ok_or_else(|| {
                             SuperDscError(format!(

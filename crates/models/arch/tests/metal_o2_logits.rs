@@ -543,6 +543,8 @@ fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) 
             .as_ref()
             .map(|_| view(&s.gdn_indices, &[s.gdn_indices.len()], DType::I32)),
         gdn_is_fresh: l.gdn.as_ref().map(|_| view(&s.gdn_fresh, &[1], u32t)),
+        draft_ring: None,
+        draft: None,
         sampled_rows: Some(view(&s.sampled_rows, &[1], u32t)),
         device_inputs: &[],
         deferred: None,
