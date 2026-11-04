@@ -18,7 +18,7 @@
 
 use crate::tape::facts::{
     attention, base, drafter, final_logit_softcap, gdn, geometry, intermediate, kernel_drafts,
-    pair_off, query_heads, reroped, rope_on_read, vision, vocab,
+    pair_off, query_heads, reroped, rope_on_read, target, vision, vocab,
 };
 use crate::tape::ids::ArenaSlotIdx as Slot;
 use crate::tape::ids::{QSize, RowStride, SourceIx};
@@ -32,7 +32,7 @@ use crate::tape::step::{
     RotaryTables, RotatedRows, RouterInput, RowSource, RowsDivisor, RowsPerToken, SampleRowsStep,
     SampledMatmul, Scale, StepRow, UnaryAct, UngatedAct,
 };
-use scratchy_ir::facts::{AttnClass, ModelFacts};
+use scratchy_ir::facts::{AttnClass, Fact, ModelFacts};
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
 use scratchy_subtile::subtile_ir::ExpertBody;
@@ -60,10 +60,10 @@ use crate::quantized::{
 use crate::specialized_pipeline_cache::ConstantValue;
 
 use crate::tape::lowered::{
-    Binding, DecodePartials, DispatchShape, Fact, Fence, GatedCommand, GemmDims, IntoBaked,
-    KernelId, LogitsRows, LoweredCommand, LoweredMetalTape, LoweringError, MScaleAxis, MScaling,
-    MetalDtype, PlayLive, RowTile, RuntimeBindingKind, RuntimeGate, SetAxis, SplitSteps,
-    WeightTensor, baked, baked_commands,
+    Binding, DecodePartials, DispatchShape, Fence, GatedCommand, GemmDims, IntoBaked, KernelId,
+    LogitsRows, LoweredCommand, LoweredMetalTape, LoweringError, MScaleAxis, MScaling, MetalDtype,
+    PlayLive, RowTile, RuntimeBindingKind, RuntimeGate, SetAxis, SplitSteps, WeightTensor, baked,
+    baked_commands,
 };
 
 /// Where one bucket's tape is baked: the bucket, its two halves' tape
@@ -6828,7 +6828,7 @@ fn lower_one<M: ModelFacts>(
                     RuntimeBindingKind::VisionPosEmbeds,
                 ),
                 RowsExtern::TargetHidden => (
-                    M::TARGET_HIDDEN_WIDTH.get(),
+                    target::<M>()?.hidden().get(),
                     RuntimeBindingKind::TargetHidden,
                 ),
             };
@@ -7278,7 +7278,7 @@ fn draft_select_constants<M: ModelFacts>(
         candidates: CANDIDATES,
         rank: drafter::<M>()?.selector_rank().get(),
         shards: SAMPLING_SHARDS,
-        verify: VerifyRows::of_target(M::TARGET_ROUTING == TargetRouting::Experts),
+        verify: VerifyRows::of_target(target::<M>()?.routing() == TargetRouting::Experts),
         lanes,
     }
     .into_baked())

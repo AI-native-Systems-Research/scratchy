@@ -6,10 +6,11 @@
 //! `None` there, and a step that reads it is a [`LoweringError::ModelLacks`] naming the group:
 //! never a zero standing in for the absent fact.
 
-use super::lowered::{Fact, LoweringError};
+use super::lowered::LoweringError;
+use scratchy_ir::facts::Fact;
 use scratchy_ir::facts::{
     Attention, AttnClass, Drafter, Gdn, HeadGeometry, IntermediateSize, KvRope, ModelFacts,
-    RopePairing, SoftCap, Vision, VocabSize,
+    RopePairing, SoftCap, Target, Vision, VocabSize,
 };
 
 /// The decoder's attention.
@@ -92,6 +93,11 @@ pub(crate) fn final_logit_softcap<M: ModelFacts>() -> Result<SoftCap, LoweringEr
     M::FINAL_LOGIT_SOFTCAP.ok_or(LoweringError::ModelLacks(Fact::FinalLogitSoftcap))
 }
 
+/// The target a head reads.
+pub(crate) fn target<M: ModelFacts>() -> Result<Target, LoweringError> {
+    M::TARGET.ok_or(LoweringError::ModelLacks(Fact::Target))
+}
+
 /// The vocabulary.
 pub(crate) fn vocab<M: ModelFacts>() -> Result<VocabSize, LoweringError> {
     M::VOCAB_SIZE.ok_or(LoweringError::ModelLacks(Fact::VocabSize))
@@ -108,7 +114,7 @@ pub(crate) mod fixtures {
         Attention, AttnScale, AttnWindow, BlockSize, CaptureSlots, ConvDim, ConvKernel, Drafter,
         Gdn, GdnHeadDim, GdnHeads, HeadDim, HeadGeometry, HiddenSize, IntermediateSize, KvHeads,
         KvLayers, KvRope, Mrope, NormWeightOffset, NumDrafts, QueryHeads, RmsNormEps, RopePairing,
-        RotDim, ScaleDtype, SoftCap, TargetRouting, Vision, VocabSize,
+        RotDim, ScaleDtype, SoftCap, Vision, VocabSize,
     };
     use scratchy_ir::facts::{AttnClass, ModelFacts};
     use scratchy_ir::{KvCodec, TqBits};
@@ -135,8 +141,7 @@ pub(crate) mod fixtures {
         pub(crate) spec_drafts: Option<NumDrafts>,
         pub(crate) drafter: Option<Drafter>,
         pub(crate) capture_slots: Option<CaptureSlots>,
-        pub(crate) target_hidden: HiddenSize,
-        pub(crate) target_routing: TargetRouting,
+        pub(crate) target: Option<scratchy_ir::facts::Target>,
         pub(crate) quant: Option<scratchy_ir::facts::Quantization>,
         pub(crate) moe: Option<scratchy_ir::facts::Moe>,
         pub(crate) max_positions: Option<scratchy_ir::facts::MaxPositions>,
@@ -171,8 +176,7 @@ pub(crate) mod fixtures {
                 const SPEC_DRAFTS: ::core::option::Option<::scratchy_ir::facts::NumDrafts> = $facts.spec_drafts;
                 const DRAFTER: ::core::option::Option<::scratchy_ir::facts::Drafter> = $facts.drafter;
                 const CAPTURE_SLOTS: ::core::option::Option<::scratchy_ir::facts::CaptureSlots> = $facts.capture_slots;
-                const TARGET_HIDDEN_WIDTH: ::scratchy_ir::facts::HiddenSize = $facts.target_hidden;
-                const TARGET_ROUTING: ::scratchy_ir::facts::TargetRouting = $facts.target_routing;
+                const TARGET: ::core::option::Option<::scratchy_ir::facts::Target> = $facts.target;
                 const QUANT: ::core::option::Option<::scratchy_ir::facts::Quantization> = $facts.quant;
                 const MOE: ::core::option::Option<::scratchy_ir::facts::Moe> = $facts.moe;
                 const MAX_POSITIONS: ::core::option::Option<::scratchy_ir::facts::MaxPositions> =
@@ -306,8 +310,7 @@ pub(crate) mod fixtures {
         spec_drafts: None,
         drafter: None,
         capture_slots: None,
-        target_hidden: HiddenSize::new(2048),
-        target_routing: TargetRouting::Dense,
+        target: None,
         quant: None,
         moe: None,
         max_positions: None,
@@ -327,4 +330,73 @@ pub(crate) mod fixtures {
     };
     pub(crate) struct Tq;
     facts_type!(impl[] Tq = TQ);
+}
+
+/// The laws between facts ([`scratchy_ir::facts::laws`]), each refusing the model that breaks it.
+#[cfg(test)]
+mod laws {
+    use super::fixtures::{TP, TestFacts, Tp, facts_type};
+    use scratchy_ir::facts::{
+        HiddenSize, KvCodec, Mrope, RopeTheta, Target, TargetRouting, TqBits, VocabPrefix,
+        VocabSize, WideWindow, laws,
+    };
+
+    /// The fixtures' decoder breaks no law.
+    #[test]
+    fn the_fixture_decoder_is_lawful() {
+        laws::<Tp>();
+    }
+
+    /// MRoPE's three sections are pairs of a 64-lane rot window: 3 pairs fill 6 of its lanes.
+    #[test]
+    #[should_panic(expected = "MRoPE's sections are half each class's rot window")]
+    fn mrope_sections_that_do_not_fill_the_rot_window_are_refused() {
+        struct Short;
+        facts_type!(impl[] Short = TestFacts {
+            mrope: Some(Mrope::new([1, 1, 1], RopeTheta::new(1e4))),
+            ..TP
+        });
+        laws::<Short>();
+    }
+
+    /// A TurboQuant KV cache codes an attention's keys: a body without attention has none.
+    #[test]
+    #[should_panic(expected = "a TurboQuant KV cache is an attention's")]
+    fn a_turboquant_cache_without_attention_is_refused() {
+        struct Coded;
+        facts_type!(impl[] Coded = TestFacts {
+            attention: None,
+            kv_codec: KvCodec::TurboQuant(TqBits::new(4)),
+            ..TP
+        });
+        laws::<Coded>();
+    }
+
+    /// A head that reads its target chains drafts between passes: one stating none is no head.
+    #[test]
+    #[should_panic(expected = "a head reading its target states its drafts")]
+    fn a_head_without_drafts_is_refused() {
+        struct Head;
+        facts_type!(impl[] Head = TestFacts {
+            target: Some(Target::new(HiddenSize::new(2048), TargetRouting::Dense)),
+            ..TP
+        });
+        laws::<Head>();
+    }
+
+    /// A head over a vocabulary prefix reads the rest at its verify rows: it must state them.
+    #[test]
+    #[should_panic(expected = "a head over a vocabulary prefix states its verify rows")]
+    fn a_prefix_head_without_verify_rows_is_refused() {
+        struct Prefix;
+        facts_type!(impl[] Prefix = TestFacts {
+            vocab_prefix: Some(VocabPrefix::new(
+                VocabSize::new(65_536),
+                VocabSize::new(248_320),
+                WideWindow::new(4),
+            )),
+            ..TP
+        });
+        laws::<Prefix>();
+    }
 }

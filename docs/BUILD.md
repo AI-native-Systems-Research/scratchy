@@ -139,6 +139,30 @@ cargo build -p scratchy-cli --features metal,model/qwen2.5-7b
 all) is implied automatically by any of that arch's `<stem>` features — you
 essentially never name it directly.
 
+### Two feature tables: scratchy-models and its stage 1
+
+Each selected canonical's facts are a type (`scratchy_ir::facts::ModelFacts`), and the
+metal bake inside scratchy-models' build script is generic over it. A type that build
+script is generic over must exist when the script is compiled, so a build-dependency
+generates them first: **`scratchy-model-facts`** (`crates/models/facts/`), whose own
+build script runs the same front end over the same scope ("stage 1").
+
+Its scope is its own features, so it carries **the same feature table**: every
+scratchy-models feature `F` forwards `scratchy-model-facts/F`, and
+`crates/models/facts/Cargo.toml` declares `F` enabling what `F` enables in
+scratchy-models — among plain features (`all` → its stems, a stem → its
+`arch-<name>`) and `scratchy-forward-compiler-macro/*` pipeline features — so the
+crate selects the same canonicals built alone. `check_feature_parity` (its build
+script) fails the build on any drift between the two tables, naming the feature.
+Stage 2 finds each canonical's type by name (`FactsDispatch`) and panics on a
+canonical stage 1 did not generate, so the parity check is what keeps the two stages'
+sets equal.
+
+Adding a model or arch therefore edits **both** manifests: the `<stem>` /
+`arch-<name>` entry in `crates/models/arch/Cargo.toml` (with its
+`"scratchy-model-facts/<feature>"` forward) and the mirrored entry in
+`crates/models/facts/Cargo.toml`.
+
 ## `-Fquant/<...>` — which quantization a model compiles as
 
 One Cargo feature per preset, named `<preset>` — no `quant-` text prefix,

@@ -19,7 +19,7 @@ use scratchy_target_metal::tape::ids::{
     HeadDim, MaxBlocksPerSeq, NumKvHeads, NumQHeads, TqDecodeHeads,
 };
 use scratchy_target_metal::tape::lowered::{
-    CommandTableBuilder, Fact, GatedCommand, GenClass, KernelId, KvAddressing, LoweredMetalTape,
+    CommandTableBuilder, GatedCommand, GenClass, KernelId, KvAddressing, LoweredMetalTape,
     LoweringError, MetalDtype, TapeCommands,
 };
 
@@ -296,7 +296,7 @@ fn metal_bake_file(bytes: &[u8], extension: &str) -> TokenStream {
     }
     quote! { include_bytes!(concat!(env!("OUT_DIR"), "/", #name)) }
 }
-use scratchy_ir::facts::{AttnClass, DEFAULT_KV_PAGE, ModelFacts};
+use scratchy_ir::facts::{AttnClass, DEFAULT_KV_PAGE, Fact, ModelFacts};
 use scratchy_target_metal::aot;
 use scratchy_target_metal::specialized_pipeline_cache::PipelineKey;
 use scratchy_target_metal::tape::constants::TapeVariant;

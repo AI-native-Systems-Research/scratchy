@@ -121,7 +121,7 @@ pub enum Refused {
     /// A quantized canonical's shared-fused expert bank whose widths its quantization does not
     /// declare at this layer: the two build stages disagree about the canonical's banks.
     UndeclaredExpertWidths {
-        base: String,
+        bank: scratchy_ir::facts::ExpertBank,
     },
     /// The minted token draw: a spliced Triton kernel only the spyre bake mints, so a
     /// metal tape carries no Sample node by construction — one that does is a wiring bug named
@@ -656,6 +656,22 @@ impl Recording<'_> {
         }
     }
 
+    /// The routed-expert bank a weight binding reads ([`ExpertBank::of`], the derivation the
+    /// quantization's width table is keyed by): its bundle weight and its unroll index.
+    ///
+    /// [`ExpertBank::of`]: scratchy_ir::facts::ExpertBank::of
+    fn bank(&self, i: usize, e: usize) -> Result<scratchy_ir::facts::ExpertBank, StepRefusal> {
+        match &self.l.bindings[e] {
+            SourceBinding::Weight { id, index }
+            | SourceBinding::WeightScale { id, index }
+            | SourceBinding::BundleTensor { id, index, .. } => {
+                let layer = index.map(|u| u32::try_from(u.0).expect("a layer fits u32"));
+                Ok(scratchy_ir::facts::ExpertBank::of(*id, layer))
+            }
+            _ => Err(self.no(i, Refused::NotAWeight(e))),
+        }
+    }
+
     fn site(&self, i: usize, kind: WeightKind, e: usize) -> Result<Vec<WeightSlot>, StepRefusal> {
         Ok(vec![WeightSlot {
             kind,
@@ -957,9 +973,9 @@ impl Recording<'_> {
         let step = match declared {
             None => raw,
             Some(q) => {
-                let base = self.base(j, e)?;
-                let declared = (q.experts(&base, layer.0))
-                    .ok_or_else(|| self.no(j, Refused::UndeclaredExpertWidths { base }))?;
+                let bank = self.bank(j, e)?;
+                let declared = (q.experts(bank))
+                    .ok_or_else(|| self.no(j, Refused::UndeclaredExpertWidths { bank }))?;
                 let widths = match self.expert_body(j)? {
                     ExpertBody::Gated(_) => declared.gated(),
                     ExpertBody::Ungated(_) => declared.ungated(),
@@ -2970,7 +2986,7 @@ mod tests {
     /// A construct's rows fence as ONE: the first on every member's accesses, the rest always.
     #[test]
     fn a_constructs_rows_fence_as_one() {
-        use Fence::{Coherent, None as No, Ordered};
+        use Fence::{Coherent, None as No};
         // Alone, row 1 has nothing pending to fence on; row 2 reads row 0's write.
         let alone = [
             sig(&[], &[1], None),

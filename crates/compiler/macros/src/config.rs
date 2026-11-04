@@ -1071,16 +1071,30 @@ fn arch_dirs(configs_root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
 
 /// Whether a checkpoint config carries the in-checkpoint head `head` (`checkpoint_of`): it declares
 /// the head's layers — the config field the head's `num_hidden_layers` replaces its target's from
-/// (`mtp_num_hidden_layers`) — above zero.
+/// (`mtp_num_hidden_layers`) — above zero, and its vocabulary holds the prefix a head drafting
+/// over one reads.
 fn carries_head(head: &crate::arch_spec::DeclaredArchSpec, json: &serde_json::Value) -> bool {
+    use crate::arch_spec::{ParamSource, json_path};
     let json = normalize_hf_config(json, &head.config_aliases);
-    head.params.iter().any(|f| {
-        let crate::arch_spec::ParamSource::From { path, .. } = &f.source else {
+    let declares_layers = head.params.iter().any(|f| {
+        let ParamSource::From { path, .. } = &f.source else {
             return false;
         };
-        let layers = crate::arch_spec::json_path(&json, path).and_then(|v| v.as_u64());
+        let layers = json_path(&json, path).and_then(|v| v.as_u64());
         f.name == "num_hidden_layers" && f.replaces && layers.is_some_and(|n| n > 0)
-    })
+    });
+    // A head drafting over a fixed prefix of its target's vocabulary (a replacing `vocab_size`
+    // value: Qwen3.5's 65536 rows) heads only a target whose vocabulary holds that prefix. On a
+    // smaller one (a parity-tiny target's 512 tokens) its logits would read lm_head rows the
+    // target does not have.
+    let target_vocab = json_path(&json, "vocab_size").and_then(|v| v.as_u64());
+    let holds_prefix = head.params.iter().all(|f| match f.source {
+        ParamSource::Value(rows) if f.name == "vocab_size" && f.replaces => {
+            target_vocab.is_some_and(|v| v >= rows)
+        }
+        _ => true,
+    });
+    declares_layers && holds_prefix
 }
 
 /// Load a single config.json as a dense-base ModelParams.
@@ -3705,9 +3719,10 @@ mod tests {
         assert!(!parse("qwen3-5-dense-mtp").tie_word_embeddings);
     }
 
-    /// The MTP head compiles on exactly the configs of `checkpoint_of` that declare its layers:
-    /// every Qwen3.5/3.6 MoE checkpoint, the 122B's among them; a MoE checkpoint of another family
-    /// declares none.
+    /// The MTP head compiles on exactly the configs of `checkpoint_of` that declare its layers and
+    /// whose vocabulary holds its 65536-row prefix: every Qwen3.5/3.6 MoE checkpoint, the 122B's
+    /// among them, but not the parity-tiny one (512 tokens, which the prefix would read past); a
+    /// MoE checkpoint of another family declares none.
     #[test]
     fn the_mtp_head_compiles_on_the_moe_configs_that_carry_it() {
         let head = load_arch_json(&repo_model_archs("qwen3-5-mtp")).expect("arch.json");
@@ -3725,7 +3740,12 @@ mod tests {
             carried
         };
         for (stem, carried) in carries("qwen3-5-moe") {
-            assert!(carried, "{stem} declares its MTP layers");
+            let tiny = stem.ends_with("-parity-tiny");
+            assert_eq!(
+                carried, !tiny,
+                "{stem} declares its MTP layers; it carries the head unless its vocabulary is \
+                 smaller than the head's prefix"
+            );
         }
         assert!(
             carries("qwen3-5-moe")

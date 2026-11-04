@@ -7605,13 +7605,11 @@ enum BackboneLayout {
 /// nodes via [`last_non_splice_node`] — those are
 /// appended by lowering passes but aren't the body's actual terminal.
 /// The model's `METAL_OFF_TAPE` static: its argmax, grammar mask and sampler kernels baked for its
-/// logits `width` and `dtype`, and — `head`, a multi-token-prediction head's drafts a step and the
-/// width of the hidden rows its passes read — its chain between passes
-/// (`scratchy_target_metal::off_tape`).
+/// logits `width` and `dtype`, and — for a head (`M::TARGET`): its drafts a step and the width
+/// of the hidden rows its passes read — its chain between passes (`scratchy_target_metal::off_tape`).
 #[cfg(feature = "metal")]
 fn metal_off_tape_tokens<M: scratchy_ir::facts::ModelFacts>(
     width: u64,
-    head: Option<scratchy_ir::facts::NumDrafts>,
     vocab_suffix: Option<scratchy_target_metal::off_tape::VocabSuffix>,
 ) -> TokenStream {
     use scratchy_ir::facts::{AttnClass, DEFAULT_KV_PAGE};
@@ -7628,11 +7626,11 @@ fn metal_off_tape_tokens<M: scratchy_ir::facts::ModelFacts>(
     // An MRoPE head reads a cos/sin row a token in place of its position: its rot window. The
     // kernel's 0 is the 1-D positions' path.
     let mrope_rot = mrope_rows::<M>().map_or(0, |(_, rot)| rot.get());
-    let head = head.map(|drafts| MtpChainConstants {
-        hidden: HiddenSize(
-            u32::try_from(M::TARGET_HIDDEN_WIDTH.get()).expect("hidden width fits u32"),
+    let head = M::TARGET.map(|target| MtpChainConstants {
+        hidden: HiddenSize(u32::try_from(target.hidden().get()).expect("hidden width fits u32")),
+        drafts: NumDrafts(
+            (M::SPEC_DRAFTS.expect("the facts' laws: a head states its drafts")).get(),
         ),
-        drafts: NumDrafts(drafts.get()),
         rope: RotDim(mrope_rot),
     });
     // A draft block: its anchor row and its drafts.
@@ -7773,6 +7771,8 @@ fn metal_vocab_suffix<M: scratchy_ir::facts::ModelFacts>()
 -> Option<scratchy_target_metal::off_tape::VocabSuffix> {
     let vocab = M::VOCAB_PREFIX?;
     let lm_head = M::QUANT?.lm_head()?;
+    let verify_rows =
+        M::SPEC_VERIFY_ROWS.expect("the facts' laws: a head over a prefix states its rows");
     let (group, bits) = (lm_head.group().get(), lm_head.bits().get());
     let fits = |v: usize| u32::try_from(v).expect("a vocabulary fits u32");
     Some(scratchy_target_metal::off_tape::VocabSuffix {
@@ -7782,7 +7782,7 @@ fn metal_vocab_suffix<M: scratchy_ir::facts::ModelFacts>()
         bits,
         group,
         scale: M::SCALE_DTYPE,
-        verify_rows: vocab.verify_rows().get(),
+        verify_rows: verify_rows.get(),
         window: vocab.window().get(),
     })
 }
@@ -8043,35 +8043,37 @@ fn kv_codec_for(
     }
 }
 
-/// A canonical's `VOCAB_PREFIX`: `Some` for a multi-token-prediction head whose vocabulary
-/// (`vocab_size`) is a proper prefix of its target's (`target_vocab_size`). Such a head declares
-/// the rows a pass over the rest reads (`spec_verify_rows`, `spec_wide_window`).
+/// A canonical's `VOCAB_PREFIX`: `Some` for a multi-token-prediction head that states its
+/// target's vocabulary (`target_vocab_size`) and drafts over less of it (`vocab_size`, the
+/// prefix). A head over its target's whole vocabulary has no prefix; one stating more than its
+/// target's is refused by `VocabPrefix::new`'s law. Such a head declares the window a pass over
+/// the rest widens to (`spec_wide_window`); its rows are its verify rows (`SPEC_VERIFY_ROWS`,
+/// which the facts' laws require of it).
 fn vocab_prefix_facts(model: &ModelParams) -> TokenStream {
     let f = quote! { ::scratchy_ir::facts };
-    let (prefix, target) = match (
-        model.bounds.get("vocab_size"),
-        model.bounds.get("target_vocab_size"),
-    ) {
-        (Some(&prefix), Some(&target)) if prefix < target => (prefix, target),
-        _ => return quote! { ::core::option::Option::None },
+    let Some(&target) = model.bounds.get("target_vocab_size") else {
+        return quote! { ::core::option::Option::None };
     };
     let stem = &model.source_stem;
-    let rows = |name: &str| {
-        let v = *(model.bounds.get(name)).unwrap_or_else(|| {
+    let bound = |name: &str| {
+        *(model.bounds.get(name)).unwrap_or_else(|| {
             panic!("`{stem}`: a head drafting over a vocabulary prefix declares its `{name}`")
-        });
-        proc_macro2::Literal::u32_unsuffixed(
-            u32::try_from(v).unwrap_or_else(|_| panic!("`{stem}`: {name} fits u32")),
-        )
+        })
     };
-    let (verify_rows, window) = (rows("spec_verify_rows"), rows("spec_wide_window"));
+    let prefix = bound("vocab_size");
+    if prefix == target {
+        return quote! { ::core::option::Option::None };
+    }
+    let window = proc_macro2::Literal::u32_unsuffixed(
+        u32::try_from(bound("spec_wide_window"))
+            .unwrap_or_else(|_| panic!("`{stem}`: spec_wide_window fits u32")),
+    );
     let vocab = |v: u64| proc_macro2::Literal::usize_unsuffixed(v as usize);
     let (prefix, target) = (vocab(prefix), vocab(target));
     quote! {
         ::core::option::Option::Some(#f::VocabPrefix::new(
             #f::VocabSize::new(#prefix),
             #f::VocabSize::new(#target),
-            #f::VerifyRows::new(#verify_rows),
             #f::WideWindow::new(#window),
         ))
     }
@@ -8090,6 +8092,7 @@ pub(crate) fn canonical_facts_body(
         tp_world_size,
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
+        fuf_reads_target_hidden(fuf),
     )
     .1;
     let quant = quant_facts(program, fuf, model);
@@ -8145,13 +8148,16 @@ fn moe_facts(model: &ModelParams) -> TokenStream {
         "n_routed_experts" => quote! { #f::RouterKind::GlmSigmoid },
         _ => quote! { #f::RouterKind::QwenShared },
     };
-    let (Some(&per_token), Some(&inter)) = (
-        b.get("num_experts_per_tok"),
-        b.get("moe_intermediate_size")
-            .or_else(|| b.get("intermediate_size")),
-    ) else {
-        return none;
+    let required = |key: &str, alt: Option<&str>| {
+        *(b.get(key).or_else(|| alt.and_then(|a| b.get(a)))).unwrap_or_else(|| {
+            panic!(
+                "`{}` routes {experts} experts and states no `{key}`",
+                model.source_stem
+            )
+        })
     };
+    let per_token = required("num_experts_per_tok", None);
+    let inter = required("moe_intermediate_size", Some("intermediate_size"));
     let lit = |v: u64| proc_macro2::Literal::u64_unsuffixed(v);
     let (experts, per_token, inter) = (lit(experts), lit(per_token), lit(inter));
     let shared = match b
@@ -8184,13 +8190,13 @@ fn moe_facts(model: &ModelParams) -> TokenStream {
         scalar("routed_scaling_factor", quote! { RoutedScale })
             .filter(|_| model.scalars.get("routed_scaling_factor") != Some(&1.0)),
     );
-    let activation = some_or_none(match model.expert_activation {
-        crate::config::ExpertActivation::Silu => Some(quote! { #f::ExpertActivation::GatedSilu }),
-        crate::config::ExpertActivation::Relu2 => {
-            Some(quote! { #f::ExpertActivation::UngatedRelu2 })
+    let activation = match &model.expert_activation {
+        crate::config::ExpertActivation::Silu => quote! { #f::ExpertActivation::GatedSilu },
+        crate::config::ExpertActivation::Relu2 => quote! { #f::ExpertActivation::UngatedRelu2 },
+        crate::config::ExpertActivation::Unrealized(act) => {
+            quote! { #f::ExpertActivation::Unrealized(#act) }
         }
-        crate::config::ExpertActivation::Unrealized(_) => None,
-    });
+    };
     let swiglu_limit = some_or_none(scalar("swiglu_limit", quote! { SwigluLimit }));
     quote! {
         ::core::option::Option::Some(#f::Moe::new(
@@ -8213,6 +8219,7 @@ fn moe_facts(model: &ModelParams) -> TokenStream {
 /// unroll index, 0 without one).
 fn quant_facts(program: &Program, fuf: &Fuf, model: &ModelParams) -> TokenStream {
     use crate::quantization::{StorageFormat, affine_moe_expert_bits, affine_role_widths};
+    use scratchy_ir::facts::ExpertBank;
     use scratchy_subtile::subtile_ir::{ExpertBody, GatedAct, UngatedAct};
     let Some(qc) = model.quantization.as_ref() else {
         return quote! { ::core::option::Option::None };
@@ -8258,7 +8265,9 @@ fn quant_facts(program: &Program, fuf: &Fuf, model: &ModelParams) -> TokenStream
         });
         quote! { [#(#each),*] }
     };
-    let mut keys: Vec<(String, u32)> = fuf
+    // Each bank a MoE reads, keyed as the bake looks it up (`ExpertBank::of`: its bundle weight
+    // and the layer it is unrolled at). Its widths are its accessor base's at that layer.
+    let mut banks: Vec<(ExpertBank, String)> = fuf
         .nodes
         .iter()
         .filter(|n| n.op == OpKind::Moe)
@@ -8269,26 +8278,42 @@ fn quant_facts(program: &Program, fuf: &Fuf, model: &ModelParams) -> TokenStream
             })
         })
         .map(|(id, index)| {
+            let layer = index.map(|u| u32::try_from(u.0).expect("a layer fits u32"));
             let mut base = program.weights.path(id).join("_");
             if let Some(pos) = base.rfind('_')
                 && base[pos + 1..].parse::<u32>().is_ok()
             {
                 base.truncate(pos);
             }
-            (base, index.map_or(0, |u| u.0 as u32))
+            (ExpertBank::of(id.0, layer), base)
         })
         .collect();
-    keys.sort();
-    keys.dedup();
-    let experts = keys.iter().map(|(base, layer)| {
-        let gated = widths(base, *layer, ExpertBody::Gated(GatedAct::Silu));
-        let ungated = widths(base, *layer, ExpertBody::Ungated(UngatedAct::Relu2));
-        let layer = lit(*layer);
-        quote! { #f::ExpertWidths::new(#base, #layer, #gated, #ungated) }
+    banks.sort();
+    banks.dedup();
+    let experts = banks.iter().map(|(bank, base)| {
+        let gated = widths(base, bank.layer(), ExpertBody::Gated(GatedAct::Silu));
+        let ungated = widths(base, bank.layer(), ExpertBody::Ungated(UngatedAct::Relu2));
+        let (weight, layer) = (lit(bank.weight()), lit(bank.layer()));
+        quote! {
+            #f::ExpertWidths::new(
+                #f::ExpertBank::of(#weight, ::core::option::Option::Some(#layer)),
+                #gated,
+                #ungated,
+            )
+        }
     });
     quote! {
         ::core::option::Option::Some(#f::Quantization::new(#embed, #lm_head, &[#(#experts),*]))
     }
+}
+
+/// Whether a body reads its target's final hidden rows (`RowsExtern::TargetHidden`): a head.
+fn fuf_reads_target_hidden(fuf: &Fuf) -> bool {
+    fuf.nodes.iter().any(|n| {
+        n.op == crate::classified::OpKind::LoadRows(
+            scratchy_forward_compiler::RowsExtern::TargetHidden,
+        )
+    })
 }
 
 fn emit_canonical_params_impl(
@@ -8296,6 +8321,7 @@ fn emit_canonical_params_impl(
     tp_world_size: u8,
     uses_rotary: bool,
     kv_layers: &KvCacheLayers,
+    reads_target_hidden: bool,
 ) -> (TokenStream, TokenStream) {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
@@ -8982,10 +9008,16 @@ fn emit_canonical_params_impl(
             none.clone()
         };
         let capture = positive_or_none(quote! { CaptureSlots }, draft_capture_slots as usize);
-        let routing = if target_routes_experts {
-            quote! { #f::TargetRouting::Experts }
-        } else {
-            quote! { #f::TargetRouting::Dense }
+        // A head's target: present exactly on a body that reads its target's hidden rows.
+        let target = match reads_target_hidden {
+            true => {
+                let routing = match target_routes_experts {
+                    true => quote! { #f::TargetRouting::Experts },
+                    false => quote! { #f::TargetRouting::Dense },
+                };
+                some(quote! { #f::Target::new(#f::HiddenSize::new(#target_hidden), #routing) })
+            }
+            false => none.clone(),
         };
         quote! {
             const ATTENTION: ::core::option::Option<#f::Attention> = #attention;
@@ -9006,8 +9038,7 @@ fn emit_canonical_params_impl(
             const SPEC_DRAFTS: ::core::option::Option<#f::NumDrafts> = #spec;
             const DRAFTER: ::core::option::Option<#f::Drafter> = #drafter;
             const CAPTURE_SLOTS: ::core::option::Option<#f::CaptureSlots> = #capture;
-            const TARGET_HIDDEN_WIDTH: #f::HiddenSize = #f::HiddenSize::new(#target_hidden);
-            const TARGET_ROUTING: #f::TargetRouting = #routing;
+            const TARGET: ::core::option::Option<#f::Target> = #target;
         }
     };
 
@@ -11582,7 +11613,6 @@ fn dump_wavefront_mega<D: crate::FactsDispatch>(
             asn: decode_asn_check,
             inferred,
             bounds: decode_bounds,
-            model,
             prefix: crate::to_wavefront::PrefixCapacity::new(cap),
             num_tokens: primary_m,
         })
@@ -13632,7 +13662,6 @@ fn dump_wavefront_mega<D: crate::FactsDispatch>(
                     asn: decode_asn_check,
                     inferred,
                     bounds: decode_bounds,
-                    model,
                     prefix: crate::to_wavefront::PrefixCapacity::new(
                         std::num::NonZeroU32::new(cap).expect("cap bucket is non-zero"),
                     ),
@@ -13702,7 +13731,6 @@ fn dump_wavefront_mega<D: crate::FactsDispatch>(
                     asn: decode_asn_check,
                     inferred,
                     bounds: decode_bounds,
-                    model,
                     prefix: crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     num_tokens: seqs,
                 }) {
@@ -13937,7 +13965,6 @@ fn dump_wavefront_mega<D: crate::FactsDispatch>(
                     asn: decode_asn_check,
                     inferred,
                     bounds: decode_bounds,
-                    model,
                     // Prefill and decode model the SAME resident prefix-KV cache, so
                     // they MUST share ONE capacity — the KTIR emulator bakes a STATIC
                     // `[prefix_len, kv]` cache + a `[1, prefix_len]` runtime length mask,
@@ -14069,7 +14096,6 @@ fn dump_wavefront_mega<D: crate::FactsDispatch>(
                     asn: decode_asn_check,
                     inferred,
                     bounds: decode_bounds,
-                    model,
                     prefix: crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     num_tokens: m,
                 }) {
@@ -14207,7 +14233,6 @@ fn dump_wavefront_mega<D: crate::FactsDispatch>(
                 asn: decode_asn_check,
                 inferred,
                 bounds: decode_bounds,
-                model,
                 prefix: crate::to_wavefront::PrefixCapacity::new(prefix_len),
                 num_tokens: decode_mq,
             }) {
@@ -14678,7 +14703,6 @@ pub(crate) struct Bridge<'a> {
     pub(crate) asn: Option<&'a crate::assignment::Assignment>,
     pub(crate) inferred: &'a crate::shape::Inferred,
     pub(crate) bounds: &'a BTreeMap<String, u64>,
-    pub(crate) model: &'a ModelParams,
     pub(crate) prefix: crate::to_wavefront::PrefixCapacity,
     pub(crate) num_tokens: u32,
 }
@@ -14691,7 +14715,6 @@ impl scratchy_ir::facts::FactsVisitor for Bridge<'_> {
             self.asn,
             self.inferred,
             self.bounds,
-            self.model,
             self.prefix,
             self.num_tokens,
         )
@@ -14799,9 +14822,6 @@ impl scratchy_ir::facts::FactsVisitor for BakeBucketTapes<'_, '_> {
 #[cfg(feature = "metal")]
 struct OffTapeStatics {
     terminal_row: TerminalRow,
-    /// Whether its body reads its target's hidden rows: a multi-token-prediction head, whose
-    /// passes chain on the device.
-    reads_target_hidden: bool,
 }
 
 #[cfg(feature = "metal")]
@@ -14809,14 +14829,10 @@ impl scratchy_ir::facts::FactsVisitor for OffTapeStatics {
     type Out = [TokenStream; 2];
     fn visit<M: scratchy_ir::facts::ModelFacts>(self) -> Self::Out {
         let suffix = metal_vocab_suffix::<M>();
-        let head = match self.reads_target_hidden {
-            true => Some(M::SPEC_DRAFTS.expect("an MTP head's spec_drafts")),
-            false => None,
-        };
         let width = terminal_width::<M>(self.terminal_row);
         [
             metal_tq_codebook_tokens::<M>(),
-            metal_off_tape_tokens::<M>(width, head, suffix),
+            metal_off_tape_tokens::<M>(width, suffix),
         ]
     }
 }
@@ -14877,10 +14893,9 @@ impl scratchy_ir::facts::FactsVisitor for MropeRows {
     }
 }
 
-/// The largest bucket a canonical runs, and whether its body reads its target's hidden rows.
+/// The largest bucket a canonical runs.
 struct ExternExtents {
     max_m: u64,
-    reads_target_hidden: bool,
 }
 
 /// The bytes of each per-forward extern buffer a canonical's worker binds, at its largest bucket
@@ -14894,7 +14909,7 @@ struct ExternBytes {
     /// Vision position embeddings, host-interpolated and added to the patch-embed output: model
     /// dtype `[max_m, embed]`.
     vision_posemb: u64,
-    /// An MTP head's target's final hidden rows: model dtype `[max_m, TARGET_HIDDEN_WIDTH]` —
+    /// A head's target's final hidden rows: model dtype `[max_m, Target::hidden]` —
     /// which a drafter of its own width (Gemma 4's assistant) reads and exports at.
     target_hidden: u64,
     /// A text decoder's multimodal splice: model dtype `[max_m, hidden]`.
@@ -14917,12 +14932,11 @@ impl scratchy_ir::facts::FactsVisitor for ExternExtents {
         let rows = |width: Option<u64>, elem: u64| width.map_or(0, |w| max_m * w * elem);
         let vision = M::VISION;
         let hidden = text_hidden::<M>().map(|h| h.get() as u64);
-        let target_hidden = M::TARGET_HIDDEN_WIDTH.get() as u64;
         ExternBytes {
             vision_freqs: rows(vision.map(|v| u64::from(v.head_dim().get() / 2)), 4),
             vision_pixels: rows(vision.map(|v| v.in_features().get() as u64), 2),
             vision_posemb: rows(vision.and_then(|v| v.embed()).map(|e| e.get() as u64), 2),
-            target_hidden: rows(self.reads_target_hidden.then_some(target_hidden), 2),
+            target_hidden: rows(M::TARGET.map(|t| t.hidden().get() as u64), 2),
             mm_embeds: rows(hidden, 2),
             mm_dst_rows: max_m * 4,
             mrope_cos_sin: rows(mrope_rows::<M>().map(|(_, rot)| u64::from(rot.get())), 2),
@@ -15046,7 +15060,6 @@ pub fn emit_model<D: crate::FactsDispatch>(
                         asn: None,
                         inferred,
                         bounds: &bounds,
-                        model,
                         prefix: crate::to_wavefront::PrefixCapacity::new(
                             std::num::NonZeroU32::new(8192).expect("8192 != 0"),
                         ),
@@ -15164,7 +15177,6 @@ pub fn emit_model<D: crate::FactsDispatch>(
                 asn: None,
                 inferred,
                 bounds: &bounds,
-                model,
                 prefix: crate::to_wavefront::PrefixCapacity::new(
                     std::num::NonZeroU32::new(8192).unwrap(),
                 ),
@@ -15526,6 +15538,7 @@ pub fn emit_model<D: crate::FactsDispatch>(
         tp_world_size,
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
+        fuf_reads_target_hidden(fuf),
     );
     // Per-canonical: alias the generic `Instruction<Weights>` for
     // the slice element type AND glob-import the variant
@@ -15701,7 +15714,6 @@ pub fn emit_model<D: crate::FactsDispatch>(
             asn: None,
             inferred,
             bounds: &bounds,
-            model,
             prefix,
             num_tokens: m as u32,
         }) {
@@ -16323,17 +16335,7 @@ pub fn emit_model<D: crate::FactsDispatch>(
         proc_macro2::Literal::u32_unsuffixed(max_m as u32)
     };
 
-    // Vision runtime-extern buffer sizes (bytes), baked from the largest
-    // bucket + vision geometry. Zero (→ alloc's 16-byte floor) on
-    // non-vision arches (the `vision_*` bounds are absent in text
-    // configs). `freqs` is f32 `[total_L, vision_head_dim/2]`; `pixels`
-    // is the model dtype (bf16) `[num_tokens, vision_in_features]`.
-    // An MTP head's body reads its target's final hidden rows (`RowsExtern::TargetHidden`).
-    let reads_target_hidden = fuf.nodes.iter().any(|n| {
-        n.op == crate::classified::OpKind::LoadRows(
-            scratchy_forward_compiler::RowsExtern::TargetHidden,
-        )
-    });
+    // The runtime extern buffers' sizes (bytes), from the largest bucket and the model's facts.
     let ExternBytes {
         vision_freqs,
         vision_pixels,
@@ -16346,7 +16348,6 @@ pub fn emit_model<D: crate::FactsDispatch>(
         draft_rows,
     } = canonical_facts.visit(ExternExtents {
         max_m: num_tokens_points.iter().copied().max().unwrap_or(0),
-        reads_target_hidden,
     });
     let [
         vision_freqs_bytes_lit,
@@ -16491,10 +16492,7 @@ pub fn emit_model<D: crate::FactsDispatch>(
     }));
     #[cfg(feature = "metal")]
     {
-        metal_arena_bytes_statics.extend(canonical_facts.visit(OffTapeStatics {
-            terminal_row,
-            reads_target_hidden,
-        }));
+        metal_arena_bytes_statics.extend(canonical_facts.visit(OffTapeStatics { terminal_row }));
     }
     let metal_emission = quote! {
         #(#metal_arena_bytes_statics)*
@@ -17954,7 +17952,7 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let ts = emit_canonical_params_impl(&m, 1, false, &every_layer(&m))
+        let ts = emit_canonical_params_impl(&m, 1, false, &every_layer(&m), false)
             .0
             .to_string();
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
@@ -17984,7 +17982,7 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let ts = emit_canonical_params_impl(&m, 2, false, &every_layer(&m))
+        let ts = emit_canonical_params_impl(&m, 2, false, &every_layer(&m), false)
             .0
             .to_string();
         assert!(
@@ -18026,7 +18024,7 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let ts = emit_canonical_params_impl(&m, 8, false, &every_layer(&m))
+        let ts = emit_canonical_params_impl(&m, 8, false, &every_layer(&m), false)
             .0
             .to_string();
         // 32 / 8 = 4

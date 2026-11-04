@@ -16,7 +16,7 @@ no per-arch crates — everything below lives under `crates/models/arch/`.
 
 ```
 crates/models/arch/
-  Cargo.toml               # arch-<name> + <stem> features (quant presets live on scratchy-quantizations instead); default = []
+  Cargo.toml               # arch-<name> + <stem> features, each forwarding scratchy-model-facts/<feature> (quant presets live on scratchy-quantizations instead); default = []
   scratchy-forwards.rs     # build script — runs the #[forward] pipeline per arch
   src/lib.rs               # #[cfg(feature="arch-<name>")] pub mod <arch>;  (includes OUT_DIR emit)
   dsl/<arch>.py            # one @forward / @vision_forward(...) def — the math
@@ -324,7 +324,13 @@ checked in under two arch dirs — the vision-arch/base-arch checkpoint-reuse
 case — does it need disambiguating: `<stem>-text-only` for the base arch's
 copy, plain `<arch>-<stem>` for any other collision; added to that arch's
 bare-`<arch>` list and to `all`) — nothing else makes the config
-reachable. No passthrough is needed on `crates/cli/scr/Cargo.toml`'s side —
+reachable. Every such feature also forwards `"scratchy-model-facts/<feature>"`, and
+`crates/models/facts/Cargo.toml` mirrors it (enabling the same `arch-<name>`, listed
+under the same `<arch>` and `all`): the stage-1 crate that generates each canonical's
+facts type selects from its own features, and its `check_feature_parity` fails the build
+on any drift between the two tables (see [BUILD.md](BUILD.md), "Two feature tables"). The
+`arch-<name>` feature of step 1 is mirrored there the same way. No passthrough is needed on
+`crates/cli/scr/Cargo.toml`'s side —
 it reaches every scratchy-models feature via the `model` dependency alias
 (`model = { package = "scratchy-models", ... }`).
 

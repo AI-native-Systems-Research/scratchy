@@ -49,12 +49,13 @@ use scratchy_subtile::subtile_ir::{
 use crate::assignment::Assignment;
 use crate::classified::{ExternKind, OpKind, UnrollIndex};
 use crate::codegen::weight_kind_accessor_method;
-use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::quantization::StorageFormat;
 use crate::shape::Inferred;
 use crate::weight_vocab::{WeightKind, WeightSlot, eval_shape_with, gemm_nk_from_fuf};
-use scratchy_ir::facts::{AttnClass, ExpertActivation, ModelFacts, Moe, RouterKind, TopKScores};
+use scratchy_ir::facts::{
+    AttnClass, ExpertActivation, Fact, ModelFacts, Moe, RouterKind, TopKScores,
+};
 
 /// Why a FUF couldn't be lowered to a wavefront `LoweringInput`. Always
 /// surfaced (logged by the drive), never papered over.
@@ -76,14 +77,15 @@ pub enum BridgeError {
         op: OpKind,
         detail: &'static str,
     },
-    /// A required model scalar (e.g. `rms_norm_eps`) was absent.
-    MissingScalar { key: &'static str },
     /// A required integer bound (e.g. `head_dim`) was absent.
     MissingBound { key: &'static str },
-    /// An attention tile on a body whose facts state no attention (`ModelFacts::ATTENTION`).
-    NoAttention { tile: TileId, op: OpKind },
-    /// A MoE tile on a model whose facts state no MoE (`ModelFacts::MOE`).
-    NoMoe { tile: TileId, op: OpKind },
+    /// A tile reading a fact group the model's facts do not state (an attention tile on a body
+    /// without attention, a MoE tile without `MOE`, …): the graph and the facts disagree.
+    ModelLacks {
+        tile: TileId,
+        op: OpKind,
+        fact: Fact,
+    },
     /// The FUF produced no result op (empty, or the last tile wasn't a
     /// value-producing op).
     NoResult,
@@ -104,7 +106,7 @@ pub enum BridgeError {
     /// or the front-end swap silently drops coverage the solver had.
     NoMetalRealization { tile: TileId, detail: &'static str },
     /// A MoE's config declares an expert activation no expert body realizes.
-    UnrealizedExpertActivation { tile: TileId },
+    UnrealizedExpertActivation { tile: TileId, act: &'static str },
 }
 
 impl BridgeError {
@@ -139,16 +141,10 @@ impl std::fmt::Display for BridgeError {
             Self::MalformedOp { tile, op, detail } => {
                 write!(f, "tile {} op {op:?}: {detail}", tile.0)
             }
-            Self::MissingScalar { key } => write!(f, "model scalar `{key}` missing"),
             Self::MissingBound { key } => write!(f, "config bound `{key}` missing"),
-            Self::NoAttention { tile, op } => write!(
+            Self::ModelLacks { tile, op, fact } => write!(
                 f,
-                "tile {} op {op:?}: an attention tile, and the model's facts state no attention",
-                tile.0
-            ),
-            Self::NoMoe { tile, op } => write!(
-                f,
-                "tile {} op {op:?}: a MoE tile, and the model's facts state no MoE",
+                "tile {} op {op:?}: the tile reads {fact:?}, which the model's facts do not state",
                 tile.0
             ),
             Self::NoResult => write!(f, "FUF produced no result op"),
@@ -161,10 +157,10 @@ impl std::fmt::Display for BridgeError {
             Self::NoMetalRealization { tile, detail } => {
                 write!(f, "tile {}: {detail}", tile.0)
             }
-            Self::UnrealizedExpertActivation { tile } => write!(
+            Self::UnrealizedExpertActivation { tile, act } => write!(
                 f,
-                "tile {} moe_block: the config declares an expert activation no expert body \
-                 realizes (a gated `silu` bank or an ungated `relu2` one)",
+                "tile {} moe_block: the config declares expert activation `{act}`, which no \
+                 expert body realizes (a gated `silu` bank or an ungated `relu2` one)",
                 tile.0
             ),
             Self::UnsupportedWeight { tile, detail } => {
@@ -226,7 +222,6 @@ impl Producer {
 struct Builder<'a> {
     fuf: &'a Fuf,
     inferred: &'a Inferred,
-    model: &'a ModelParams,
     /// Folded `w + scalar` gain offsets, keyed by the ADD tile id.
     /// A consuming rmsnorm carries the value as `gain_offset`; the
     /// declared-offset case (kernel const) records 0.0.
@@ -517,9 +512,11 @@ impl<'a> Builder<'a> {
 fn expert_body(tile: TileId, moe: Moe) -> Result<ExpertBody, BridgeError> {
     use scratchy_subtile::subtile_ir::{GatedAct, UngatedAct};
     match moe.activation() {
-        Some(ExpertActivation::GatedSilu) => Ok(ExpertBody::Gated(GatedAct::Silu)),
-        Some(ExpertActivation::UngatedRelu2) => Ok(ExpertBody::Ungated(UngatedAct::Relu2)),
-        None => Err(BridgeError::UnrealizedExpertActivation { tile }),
+        ExpertActivation::GatedSilu => Ok(ExpertBody::Gated(GatedAct::Silu)),
+        ExpertActivation::UngatedRelu2 => Ok(ExpertBody::Ungated(UngatedAct::Relu2)),
+        ExpertActivation::Unrealized(act) => {
+            Err(BridgeError::UnrealizedExpertActivation { tile, act })
+        }
     }
 }
 
@@ -617,7 +614,6 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
     asn: Option<&Assignment>,
     inferred: &Inferred,
     bounds: &BTreeMap<String, u64>,
-    model: &ModelParams,
     prefix_len: PrefixCapacity,
     num_tokens: u32,
 ) -> Result<LoweredDecode, BridgeError> {
@@ -653,7 +649,6 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
         .map(|(_, full)| carried(full));
     let mut bx = Builder {
         fuf,
-        model,
         gain_offsets: HashMap::new(),
         norm_gain_add_tiles: HashMap::new(),
         geom_global,
@@ -785,7 +780,7 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
                 let gain_offset = gain_tile
                     .and_then(|t| bx.gain_offsets.get(&t).copied())
                     .unwrap_or(0.0)
-                    + crate::codegen::norm_weight_runtime_offset(bx.model);
+                    + M::NORM_WEIGHT_OFFSET.get();
                 // The (1+w) convention is CARRIED, not dropped and not folded into the weights at
                 // load: folding would make the loaded gain disagree with the checkpoint, so every
                 // consumer that re-reads it (dumps, the numeric reference, a second target) would
@@ -984,7 +979,11 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
                 } else {
                     bx.geom_global.or(bx.geom)
                 }
-                .ok_or(BridgeError::NoAttention { tile, op: node.op })?
+                .ok_or(BridgeError::ModelLacks {
+                    tile,
+                    op: node.op,
+                    fact: Fact::Attention,
+                })?
                 .hd();
                 let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
                 let (cos_k, sin_k) = bx.cos_sin(k_cols, local_rope);
@@ -1034,7 +1033,11 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
             OpKind::KvAppend => {
                 let head_dim = bx
                     .geom
-                    .ok_or(BridgeError::NoAttention { tile, op: node.op })?
+                    .ok_or(BridgeError::ModelLacks {
+                        tile,
+                        op: node.op,
+                        fact: Fact::Attention,
+                    })?
                     .hd();
                 let k = bx.input_at(tile, 0)?;
                 let v = bx.input_at(tile, 1)?;
@@ -1071,7 +1074,11 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
             | OpKind::SlidingAttention
             | OpKind::SinkAttention
             | OpKind::SinkSlidingAttention => {
-                let scale = (bx.scale).ok_or(BridgeError::NoAttention { tile, op: node.op })?;
+                let scale = (bx.scale).ok_or(BridgeError::ModelLacks {
+                    tile,
+                    op: node.op,
+                    fact: Fact::Attention,
+                })?;
                 let is_sink = matches!(
                     node.op,
                     OpKind::SinkAttention | OpKind::SinkSlidingAttention
@@ -1110,8 +1117,11 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
                     let v = bx.input_at(tile, 2)?;
                     let idx = bx.push_op(
                         SubOp::EncoderAttn {
-                            geom: (bx.geom)
-                                .ok_or(BridgeError::NoAttention { tile, op: node.op })?,
+                            geom: (bx.geom).ok_or(BridgeError::ModelLacks {
+                                tile,
+                                op: node.op,
+                                fact: Fact::Attention,
+                            })?,
                             scale: scale.get(),
                         },
                         vec![q, k, v],
@@ -1130,9 +1140,11 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
                 let valid_len = bx.prefix_len;
                 // The mask, the model's window on a sliding tile (`attention_mask`).
                 let mask = attention_mask::<M>(tile, node.op)?;
-                let base_geom = bx
-                    .geom
-                    .ok_or(BridgeError::NoAttention { tile, op: node.op })?;
+                let base_geom = bx.geom.ok_or(BridgeError::ModelLacks {
+                    tile,
+                    op: node.op,
+                    fact: Fact::Attention,
+                })?;
                 let geom = match mask {
                     AttnMask::Causal => bx.geom_global.unwrap_or(base_geom),
                     AttnMask::SlidingWindow { .. } => base_geom,
@@ -1166,7 +1178,11 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
             OpKind::RopeQuery => {
                 let head_dim = bx
                     .geom
-                    .ok_or(BridgeError::NoAttention { tile, op: node.op })?
+                    .ok_or(BridgeError::ModelLacks {
+                        tile,
+                        op: node.op,
+                        fact: Fact::Attention,
+                    })?
                     .hd();
                 let q = bx.input_at(tile, 0)?;
                 let q_cols = bx.out_cols(tile, 0, "rope_query q cols")?;
@@ -1190,7 +1206,11 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
             // shared_attention(q, kv_cache[layer], block_table): AttnDecode over the cache's
             // prefix segments alone — the step appends no K/V.
             OpKind::SharedAttention | OpKind::SharedSlidingAttention => {
-                let scale = (bx.scale).ok_or(BridgeError::NoAttention { tile, op: node.op })?;
+                let scale = (bx.scale).ok_or(BridgeError::ModelLacks {
+                    tile,
+                    op: node.op,
+                    fact: Fact::Attention,
+                })?;
                 let q = bx.input_at(tile, 0)?;
                 let layer = kv_cache_index(node).ok_or(BridgeError::MalformedOp {
                     tile,
@@ -1199,9 +1219,11 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
                 })?;
                 // The mask, as the attention arm states it (`attention_mask`).
                 let mask = attention_mask::<M>(tile, node.op)?;
-                let base_geom = bx
-                    .geom
-                    .ok_or(BridgeError::NoAttention { tile, op: node.op })?;
+                let base_geom = bx.geom.ok_or(BridgeError::ModelLacks {
+                    tile,
+                    op: node.op,
+                    fact: Fact::Attention,
+                })?;
                 let geom = match mask {
                     AttnMask::Causal => bx.geom_global.unwrap_or(base_geom),
                     AttnMask::SlidingWindow { .. } => base_geom,
@@ -1240,9 +1262,12 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
                     .filter(|n| n.op == OpKind::CaptureHidden)
                     .map(|n| n.id)
                     .collect();
-                let declared = (bx.model.layer_sets.get(crate::config::DRAFT_CAPTURE_LAYERS))
-                    .map_or(0, |s| s.members().len());
-                if captures.len() != declared {
+                let declared = M::CAPTURE_SLOTS.ok_or(BridgeError::ModelLacks {
+                    tile,
+                    op: node.op,
+                    fact: Fact::CaptureSlots,
+                })?;
+                if captures.len() != declared.get() as usize {
                     return Err(BridgeError::MalformedOp {
                         tile,
                         op: node.op,
@@ -1275,7 +1300,11 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
             OpKind::DraftAttention | OpKind::DraftContextKv => {
                 let head_dim = bx
                     .geom
-                    .ok_or(BridgeError::NoAttention { tile, op: node.op })?
+                    .ok_or(BridgeError::ModelLacks {
+                        tile,
+                        op: node.op,
+                        fact: Fact::Attention,
+                    })?
                     .hd();
                 let layer = node
                     .inputs
@@ -1405,7 +1434,11 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
                 // = num_experts; GLM-4 = n_routed_experts with Qwen-style on-disk naming,
                 // switch_mlp + shared_experts, routed sigmoid+bias as DeepSeek's noaux_tc at
                 // n_group=1), its counts and widths.
-                let moe = M::MOE.ok_or(BridgeError::NoMoe { tile, op: node.op })?;
+                let moe = M::MOE.ok_or(BridgeError::ModelLacks {
+                    tile,
+                    op: node.op,
+                    fact: Fact::Moe,
+                })?;
                 let (router_flavor, num_experts) = (moe.router(), moe.experts().get());
                 let top_k = moe.per_token().get();
                 let moe_inter = moe.intermediate().get() as u32;
@@ -1605,7 +1638,11 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
                     bundle_src(bx, ew.0, ew.1, tensor, rows, cols)
                 };
                 // The model's MoE facts: its counts and the experts' width.
-                let moe = M::MOE.ok_or(BridgeError::NoMoe { tile, op: node.op })?;
+                let moe = M::MOE.ok_or(BridgeError::ModelLacks {
+                    tile,
+                    op: node.op,
+                    fact: Fact::Moe,
+                })?;
                 let (num_experts, top_k) = (moe.experts().get(), moe.per_token().get());
                 let moe_inter = moe.intermediate().get() as u32;
                 // The EXPERT bundle's storage — the SECOND weight edge in
@@ -1705,7 +1742,11 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
                         detail: "gptoss_moe without a weight input",
                     })?;
                 // The model's MoE facts: its counts and the experts' width.
-                let moe = M::MOE.ok_or(BridgeError::NoMoe { tile, op: node.op })?;
+                let moe = M::MOE.ok_or(BridgeError::ModelLacks {
+                    tile,
+                    op: node.op,
+                    fact: Fact::Moe,
+                })?;
                 let (num_experts, top_k) = (moe.experts().get(), moe.per_token().get());
                 let moe_inter = moe.intermediate().get() as u32;
                 let (group_size, bits) = match crate::weight_vocab::weight_storage_of(node) {
@@ -1772,21 +1813,16 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
             }
             OpKind::TanhSoftCap => {
                 let x = bx.input_at(tile, 0)?;
-                // The cap is a MODEL CONSTANT (`final_logit_softcapping`, HF
-                // naming) — the only models that emit a `tanh_softcap(...)` tile
-                // are the capping ones, so it is present whenever this arm runs.
-                // Read at the same site every other model-const scalar is (the
-                // parsed `scalars` table, which hoists nested `text_config`),
-                // and carried on the op so the tape holds it — metal/cuda bake
-                // it into kernels and spyre binds it as a registry const.
-                let cap = bx
-                    .model
-                    .scalars
-                    .get("final_logit_softcapping")
-                    .copied()
-                    .ok_or(BridgeError::MissingScalar {
-                        key: "final_logit_softcapping",
-                    })? as f32;
+                // The cap is a MODEL CONSTANT (`M::FINAL_LOGIT_SOFTCAP`): only the capping
+                // models emit a `tanh_softcap(...)` tile. Carried on the op so the tape holds
+                // it — metal/cuda bake it into kernels and spyre binds it as a registry const.
+                let cap = (M::FINAL_LOGIT_SOFTCAP)
+                    .ok_or(BridgeError::ModelLacks {
+                        tile,
+                        op: node.op,
+                        fact: Fact::FinalLogitSoftcap,
+                    })?
+                    .get();
                 let idx = bx.push_op(SubOp::TanhSoftCap { cap }, vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
@@ -1942,7 +1978,7 @@ pub fn lower_decode_to_wavefront<M: ModelFacts>(
                     _ => None,
                 });
                 if let Some(v) = scalar {
-                    let declared = crate::codegen::norm_weight_runtime_offset(bx.model) as f64;
+                    let declared = f64::from(M::NORM_WEIGHT_OFFSET.get());
                     // The declared offset the `RmsNorm` arm adds to every
                     // norm → 0 here, so it counts once. Any other offset is
                     // DATA the consuming rmsnorm carries (Gemma's

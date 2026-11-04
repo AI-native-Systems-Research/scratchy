@@ -18,6 +18,7 @@ use crate::tape::constants::ConstantValue;
 use crate::tape::ids::{
     BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, PartIx, SourceIx, TqDecodeHeads,
 };
+use scratchy_ir::facts::Fact;
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
 ///
@@ -2607,29 +2608,6 @@ impl PlayLive {
             rebuild: self.rebuild || other.rebuild,
         }
     }
-}
-
-/// A group of model facts a canonical may lack ([`scratchy_ir::facts::ModelFacts`]'s `Option`s).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fact {
-    /// `ATTENTION`: a decoder's attention.
-    Attention,
-    /// `Attention::window`: the window of a model's sliding layers.
-    SlidingWindow,
-    /// `VISION`: a vision tower's encoder.
-    Vision,
-    /// `GDN`: Gated-DeltaNet layers.
-    Gdn,
-    /// `DRAFTER`: a DFlash2 drafter's geometry.
-    Drafter,
-    /// `INTERMEDIATE_SIZE`: a feed-forward.
-    IntermediateSize,
-    /// `VOCAB_SIZE`: an lm_head.
-    VocabSize,
-    /// `FINAL_LOGIT_SOFTCAP`: a tanh cap on the final logits.
-    FinalLogitSoftcap,
-    /// `MAX_POSITIONS`: the positions a paged KV pool's block table is sized for.
-    MaxPositions,
 }
 
 /// Errors produced by the lowering pass. Every step kind lowers (the

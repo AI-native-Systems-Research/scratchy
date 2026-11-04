@@ -56,6 +56,23 @@ macro_rules! positive {
     )*};
 }
 
+/// Query heads per kv head. Only [`HeadGeometry::new`] mints one, dividing it out once after
+/// proving the division exact; a reader holds one and never builds one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Gqa(u32);
+
+impl Gqa {
+    /// The group of `kv_heads` over `q_heads`: called by [`HeadGeometry::new`] alone, past its
+    /// divisibility law.
+    const fn of(q_heads: QueryHeads, kv_heads: KvHeads) -> Self {
+        Self(q_heads.get() / kv_heads.get())
+    }
+    /// The group as a number.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// A finite `f32` scalar. `f32` is never a const parameter, so a scalar fact is an associated
 /// const of this type; the constructor refuses NaN and infinity.
 macro_rules! scalar {
@@ -87,9 +104,6 @@ positive! {
     HeadDim(u32),
     /// The leading lanes of a head that rotary rotates (`partial_rotary_factor · head_dim`).
     RotDim(u32),
-    /// Query heads per kv head. Never constructed by a reader: [`HeadGeometry::new`] divides it
-    /// out once, after proving the division exact.
-    Gqa(u32),
     /// Positions per paged-KV block.
     BlockSize(u32),
     /// The residual stream's width (`hidden_size`).
@@ -271,6 +285,30 @@ pub enum TargetRouting {
     Experts,
 }
 
+/// What a head reads of the target it drafts for: the width of the target's hidden rows (its
+/// `target_hidden` extern), and how the target routes the rows it verifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Target {
+    hidden: HiddenSize,
+    routing: TargetRouting,
+}
+
+impl Target {
+    /// The target's facts, as its head reads them.
+    pub const fn new(hidden: HiddenSize, routing: TargetRouting) -> Self {
+        Self { hidden, routing }
+    }
+    /// The width of one of its hidden rows (`backbone_hidden_size`; a DFlash2 drafter's captured
+    /// layers side by side).
+    pub const fn hidden(self) -> HiddenSize {
+        self.hidden
+    }
+    /// How it routes the rows it verifies.
+    pub const fn routing(self) -> TargetRouting {
+        self.routing
+    }
+}
+
 /// One attention class's head geometry, with its GQA group divided out once, here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HeadGeometry {
@@ -307,7 +345,7 @@ impl HeadGeometry {
             head_dim,
             rot_dim,
             block_size,
-            gqa: Gqa::new(q_heads.get() / kv_heads.get()),
+            gqa: Gqa::of(q_heads, kv_heads),
         }
     }
     /// The query heads.
@@ -598,6 +636,9 @@ pub enum ExpertActivation {
     GatedSilu,
     /// Nemotron-H's ungated relu² `SwitchMLP`: `relu(up · x)²`.
     UngatedRelu2,
+    /// An activation the config declares and no expert body realizes (its name, as declared): a
+    /// MoE step that reads it refuses, naming it.
+    Unrealized(&'static str),
 }
 
 /// How a MoE's router scores and weights its experts.
@@ -626,17 +667,13 @@ impl MoeRouter {
 /// What a MoE's routed experts compute between their projections.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MoeBody {
-    activation: Option<ExpertActivation>,
+    activation: ExpertActivation,
     swiglu_limit: Option<SwigluLimit>,
 }
 
 impl MoeBody {
-    /// The body: `activation` is `None` for one the config declares and no expert body realizes
-    /// (a MoE step that reads it refuses); `swiglu_limit` the clamp a config states.
-    pub const fn new(
-        activation: Option<ExpertActivation>,
-        swiglu_limit: Option<SwigluLimit>,
-    ) -> Self {
+    /// The body: its declared `activation`, and `swiglu_limit` the clamp a config states.
+    pub const fn new(activation: ExpertActivation, swiglu_limit: Option<SwigluLimit>) -> Self {
         Self {
             activation,
             swiglu_limit,
@@ -706,8 +743,8 @@ impl Moe {
     pub const fn routed_scale(self) -> Option<RoutedScale> {
         self.router.routed_scale
     }
-    /// The experts' activation; `None` for a declared one no expert body realizes.
-    pub const fn activation(self) -> Option<ExpertActivation> {
+    /// The experts' declared activation.
+    pub const fn activation(self) -> ExpertActivation {
         self.body.activation
     }
     /// The SwiGLU-OAI clamp, for a MoE whose config states one.
@@ -757,18 +794,14 @@ impl Drafter {
 pub struct VocabPrefix {
     prefix: VocabSize,
     target: VocabSize,
-    verify_rows: VerifyRows,
     window: WideWindow,
 }
 
 impl VocabPrefix {
-    /// The head's prefix of its target's vocabulary, refused unless it is a proper prefix.
-    pub const fn new(
-        prefix: VocabSize,
-        target: VocabSize,
-        verify_rows: VerifyRows,
-        window: WideWindow,
-    ) -> Self {
+    /// The head's prefix of its target's vocabulary, refused unless it is a proper prefix. The
+    /// rows a suffix pass reads are the head's verify rows (`ModelFacts::SPEC_VERIFY_ROWS`, which
+    /// [`ModelFacts::LAWS`] requires of a head with a prefix).
+    pub const fn new(prefix: VocabSize, target: VocabSize, window: WideWindow) -> Self {
         assert!(
             prefix.get() < target.get(),
             "a VocabPrefix is shorter than its target's vocabulary"
@@ -776,7 +809,6 @@ impl VocabPrefix {
         Self {
             prefix,
             target,
-            verify_rows,
             window,
         }
     }
@@ -791,10 +823,6 @@ impl VocabPrefix {
     /// The rows of its target's lm_head past the prefix.
     pub const fn suffix_rows(self) -> usize {
         self.target.get() - self.prefix.get()
-    }
-    /// The rows a suffix pass reads at most (`spec_verify_rows`).
-    pub const fn verify_rows(self) -> VerifyRows {
-        self.verify_rows
     }
     /// The rows of the wide verify window (`spec_wide_window`).
     pub const fn window(self) -> WideWindow {
@@ -869,30 +897,27 @@ impl AffineStorage {
 /// `None` for a projection the quantization declares no width of its own for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ExpertWidths {
-    base: &'static str,
-    layer: u32,
+    bank: ExpertBank,
     gated: [Option<AffineBits>; 3],
     ungated: [Option<AffineBits>; 3],
 }
 
 impl ExpertWidths {
-    /// The widths of bank `base` (its accessor path joined by `_`) at `layer`.
+    /// The widths of `bank`.
     pub const fn new(
-        base: &'static str,
-        layer: u32,
+        bank: ExpertBank,
         gated: [Option<AffineBits>; 3],
         ungated: [Option<AffineBits>; 3],
     ) -> Self {
         Self {
-            base,
-            layer,
+            bank,
             gated,
             ungated,
         }
     }
-    /// Whether these are bank `base`'s at `layer`.
-    pub fn is(self, base: &str, layer: u32) -> bool {
-        self.base == base && self.layer == layer
+    /// The bank these are the widths of.
+    pub const fn bank(self) -> ExpertBank {
+        self.bank
     }
     /// A gated body's projection widths: gate, up, down.
     pub const fn gated(self) -> [Option<AffineBits>; 3] {
@@ -901,6 +926,34 @@ impl ExpertWidths {
     /// An ungated body's: none, fc1, fc2.
     pub const fn ungated(self) -> [Option<AffineBits>; 3] {
         self.ungated
+    }
+}
+
+/// One routed-expert bank of a layer: its bundle weight's id in the program's weight table, and
+/// the layer it is unrolled at. Every stage runs the same front end over the same program, so the
+/// id names one weight in each; [`ExpertBank::of`] is the one derivation both stages call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExpertBank {
+    weight: u32,
+    layer: u32,
+}
+
+impl ExpertBank {
+    /// The bank weight `weight` is, read at unroll index `index` (an un-unrolled weight is layer 0's).
+    pub const fn of(weight: u32, index: Option<u32>) -> Self {
+        let layer = match index {
+            Some(layer) => layer,
+            None => 0,
+        };
+        Self { weight, layer }
+    }
+    /// The bank weight's program id.
+    pub const fn weight(self) -> u32 {
+        self.weight
+    }
+    /// The layer it is read at.
+    pub const fn layer(self) -> u32 {
+        self.layer
     }
 }
 
@@ -935,16 +988,15 @@ impl Quantization {
     pub const fn lm_head(self) -> Option<AffineStorage> {
         self.lm_head
     }
-    /// Bank `base`'s declared widths at `layer`; `None` for a bank and layer the quantization
-    /// states nothing of.
-    pub fn experts(self, base: &str, layer: u32) -> Option<ExpertWidths> {
-        self.experts.iter().copied().find(|e| e.is(base, layer))
+    /// `bank`'s declared widths; `None` for a bank the quantization states nothing of.
+    pub fn experts(self, bank: ExpertBank) -> Option<ExpertWidths> {
+        self.experts.iter().copied().find(|e| e.bank == bank)
     }
 }
 
 /// ⭐ ONE CANONICAL'S FACTS. Implemented once per canonical by a generated type; every lowering is
 /// generic over it and reads `M::FACT`.
-pub trait ModelFacts {
+pub trait ModelFacts: Sized {
     /// The decoder's attention; `None` for a body without one.
     const ATTENTION: Option<Attention>;
     /// The residual stream's width.
@@ -979,10 +1031,8 @@ pub trait ModelFacts {
     const DRAFTER: Option<Drafter>;
     /// The blocks of captured rows a drafter compiled beside this target reads.
     const CAPTURE_SLOTS: Option<CaptureSlots>;
-    /// The width of a `target_hidden` row a head reads.
-    const TARGET_HIDDEN_WIDTH: HiddenSize;
-    /// Whether a head's target routes its verify rows through experts.
-    const TARGET_ROUTING: TargetRouting;
+    /// What a head reads of its target, for a head (a body reading its target's hidden rows).
+    const TARGET: Option<Target>;
     /// The quantization of a quantized canonical: `None` for a dense one.
     const QUANT: Option<Quantization>;
     /// The mixture-of-experts layers' facts, for a model with routed experts.
@@ -994,11 +1044,12 @@ pub trait ModelFacts {
     /// A head's prefix of its target's vocabulary, for a head drafting over one.
     const VOCAB_PREFIX: Option<VocabPrefix>;
 
-    /// Every fact, evaluated. An associated const is evaluated only where it is read, so the
-    /// generator names this beside each canonical (`const _: () = <T as ModelFacts>::LAWS;`): each
-    /// constructor's law is then checked when stage 1 compiles, for every selected canonical,
-    /// whatever stage 2 reads.
+    /// Every fact, evaluated, and the laws between facts. An associated const is evaluated only
+    /// where it is read, so the generator names this beside each canonical
+    /// (`const _: () = <T as ModelFacts>::LAWS;`): each constructor's law, and each law below, is
+    /// then checked when stage 1 compiles, for every selected canonical, whatever stage 2 reads.
     const LAWS: () = {
+        laws::<Self>();
         let _ = Self::ATTENTION;
         let _ = Self::HIDDEN_SIZE;
         let _ = Self::INTERMEDIATE_SIZE;
@@ -1016,14 +1067,82 @@ pub trait ModelFacts {
         let _ = Self::SPEC_DRAFTS;
         let _ = Self::DRAFTER;
         let _ = Self::CAPTURE_SLOTS;
-        let _ = Self::TARGET_HIDDEN_WIDTH;
-        let _ = Self::TARGET_ROUTING;
+        let _ = Self::TARGET;
         let _ = Self::QUANT;
         let _ = Self::MOE;
         let _ = Self::MAX_POSITIONS;
         let _ = Self::SPEC_VERIFY_ROWS;
         let _ = Self::VOCAB_PREFIX;
     };
+}
+
+/// The laws between a canonical's facts, which no one constructor sees: [`ModelFacts::LAWS`]
+/// checks them for every generated canonical when stage 1 compiles.
+pub const fn laws<M: ModelFacts>() {
+    // A TurboQuant KV cache codes an attention's keys and values.
+    if let KvCodec::TurboQuant(_) = M::KV_CODEC {
+        assert!(
+            M::ATTENTION.is_some(),
+            "ModelFacts: a TurboQuant KV cache is an attention's"
+        );
+    }
+    // MRoPE's sections split each class's rot window: their pairs fill it exactly.
+    if let Some(mrope) = M::MROPE {
+        let Some(attention) = M::ATTENTION else {
+            panic!("ModelFacts: MRoPE rotates an attention's heads");
+        };
+        let [t, h, w] = mrope.section();
+        let pairs = t + h + w;
+        assert!(
+            2 * pairs == attention.class(AttnClass::Sliding).rot_dim().get()
+                && 2 * pairs == attention.class(AttnClass::Full).rot_dim().get(),
+            "ModelFacts: MRoPE's sections are half each class's rot window"
+        );
+    }
+    // A head drafts: what it reads of its target chains its drafts between passes.
+    if M::TARGET.is_some() {
+        assert!(
+            M::SPEC_DRAFTS.is_some(),
+            "ModelFacts: a head reading its target states its drafts"
+        );
+    }
+    // A head drafting over a vocabulary prefix reads the suffix at its verify rows.
+    if M::VOCAB_PREFIX.is_some() {
+        assert!(
+            M::SPEC_VERIFY_ROWS.is_some(),
+            "ModelFacts: a head over a vocabulary prefix states its verify rows"
+        );
+    }
+}
+
+/// A [`ModelFacts`] group or optional fact a step reads, named when the model lacks it: the step
+/// and the model's facts disagree about what the model is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fact {
+    /// `ATTENTION`: a decoder's attention.
+    Attention,
+    /// `Attention::window`: the window of a model's sliding layers.
+    SlidingWindow,
+    /// `VISION`: a vision tower's encoder.
+    Vision,
+    /// `GDN`: Gated-DeltaNet layers.
+    Gdn,
+    /// `DRAFTER`: a DFlash2 drafter's geometry.
+    Drafter,
+    /// `INTERMEDIATE_SIZE`: a feed-forward.
+    IntermediateSize,
+    /// `VOCAB_SIZE`: an lm_head.
+    VocabSize,
+    /// `FINAL_LOGIT_SOFTCAP`: a tanh cap on the final logits.
+    FinalLogitSoftcap,
+    /// `MAX_POSITIONS`: the positions a paged KV pool's block table is sized for.
+    MaxPositions,
+    /// `MOE`: routed experts.
+    Moe,
+    /// `CAPTURE_SLOTS`: the layers a target captures for its DFlash2 drafter.
+    CaptureSlots,
+    /// `TARGET`: the target a head reads.
+    Target,
 }
 
 /// What runs once a canonical's facts are a type: the consumer of `scratchy-model-facts`'
@@ -1044,6 +1163,13 @@ pub trait FactsVisitor {
 pub trait FactsDispatch: Sync {
     /// Run `visitor` at the facts of canonical `canonical` of arch `arch` (its `configs/<arch>/`
     /// dir name, `-` → `_`); `None` for a canonical stage 1 did not generate.
+    ///
+    /// The lookup is by name because stage 2 learns its canonicals when its build script runs:
+    /// no type can name them earlier. What keeps the two stages' sets equal is that both run the
+    /// same front end (`carrier_facts`) over the same scope, which `scratchy-model-facts`'
+    /// `check_feature_parity` holds to scratchy-models' features; stage 2 asserts every canonical
+    /// it emits is found here (`emit_model`'s `Generated` visit), so a miss is a build panic
+    /// naming the canonical, never a silent skip.
     fn dispatch<V: FactsVisitor>(&self, arch: &str, canonical: &str, visitor: V) -> Option<V::Out>;
 }
 
@@ -1127,16 +1253,24 @@ mod tests {
     fn a_banks_declared_widths_are_found_at_its_own_layer() {
         const FOUR: Option<AffineBits> = Some(AffineBits::new(4));
         const EIGHT: Option<AffineBits> = Some(AffineBits::new(8));
+        const MLP: u32 = 7;
         const EXPERTS: &[ExpertWidths] = &[
-            ExpertWidths::new("mlp", 0, [FOUR; 3], [None, FOUR, FOUR]),
-            ExpertWidths::new("mlp", 1, [FOUR, FOUR, EIGHT], [None, FOUR, EIGHT]),
+            ExpertWidths::new(ExpertBank::of(MLP, Some(0)), [FOUR; 3], [None, FOUR, FOUR]),
+            ExpertWidths::new(
+                ExpertBank::of(MLP, Some(1)),
+                [FOUR, FOUR, EIGHT],
+                [None, FOUR, EIGHT],
+            ),
         ];
         let q = Quantization::new(None, None, EXPERTS);
-        let layer1 = q.experts("mlp", 1).expect("layer 1's widths");
+        let layer1 = q
+            .experts(ExpertBank::of(MLP, Some(1)))
+            .expect("layer 1's widths");
         assert_eq!(layer1.gated(), [FOUR, FOUR, EIGHT]);
         assert_eq!(layer1.ungated(), [None, FOUR, EIGHT]);
-        assert!(q.experts("mlp", 2).is_none());
-        assert!(q.experts("moe", 0).is_none());
+        assert!(q.experts(ExpertBank::of(MLP, Some(2))).is_none());
+        assert!(q.experts(ExpertBank::of(MLP + 1, Some(0))).is_none());
+        assert_eq!(ExpertBank::of(MLP, None), ExpertBank::of(MLP, Some(0)));
     }
 
     /// A head whose vocabulary is its target's whole vocabulary drafts over no prefix.
@@ -1146,7 +1280,6 @@ mod tests {
         VocabPrefix::new(
             VocabSize::new(262_144),
             VocabSize::new(262_144),
-            VerifyRows::new(8),
             WideWindow::new(16),
         );
     }
