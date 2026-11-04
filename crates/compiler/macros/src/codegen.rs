@@ -8060,6 +8060,24 @@ fn kv_codec_for(
     }
 }
 
+/// A canonical's `impl ModelFacts` body: the fill's facts half, from the same arguments
+/// [`emit_model`] passes the fill.
+pub(crate) fn canonical_facts_body(
+    model: &ModelParams,
+    tp_world_size: u8,
+    fuf: &Fuf,
+) -> TokenStream {
+    emit_canonical_params_impl(
+        model,
+        tp_world_size,
+        fuf_uses_rotary(fuf),
+        &KvCacheLayers::of(fuf),
+        #[cfg(feature = "metal")]
+        &mut None,
+    )
+    .1
+}
+
 fn emit_canonical_params_impl(
     model: &ModelParams,
     tp_world_size: u8,
@@ -8071,7 +8089,7 @@ fn emit_canonical_params_impl(
     #[cfg(feature = "metal")] metal_consts_out: &mut Option<
         scratchy_target_metal::tape::model_consts::MetalModelConsts,
     >,
-) -> TokenStream {
+) -> (TokenStream, TokenStream) {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
     let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
@@ -8489,7 +8507,12 @@ fn emit_canonical_params_impl(
                     model.source_stem,
                     t + h + w,
                 );
-                return quote! { compile_error!(#msg); };
+                // The facts body refuses the same way: a `compile_error!` is an item, so it
+                // stands inside the generated impl too.
+                return (
+                    quote! { compile_error!(#msg); },
+                    quote! { compile_error!(#msg); },
+                );
             }
             let t_lit = proc_macro2::Literal::u32_unsuffixed(t);
             let h_lit = proc_macro2::Literal::u32_unsuffixed(h);
@@ -8578,6 +8601,208 @@ fn emit_canonical_params_impl(
         None => quote! { ::core::option::Option::None },
     };
 
+    // ⭐ THE SAME FILL, AS `ModelFacts` CONSTS: the body of `impl ModelFacts for <canonical>`,
+    // from the same locals the `CanonicalParams` consts above are emitted from. Each fact is a
+    // newtype built by its `const fn` constructor, so every law (GQA divisibility, a rot window
+    // inside its head, a positive extent) is evaluated when the generated impl compiles. A fact
+    // the model lacks is `None`, never the zero or `-1` the value consts above use for absence.
+    let facts_body = {
+        let f = quote! { ::scratchy_ir::facts };
+        let some = |t: TokenStream| quote! { ::core::option::Option::Some(#t) };
+        let none = quote! { ::core::option::Option::None };
+        let u32_lit = proc_macro2::Literal::u32_unsuffixed;
+        let usize_lit = proc_macro2::Literal::usize_unsuffixed;
+        let f32_lit = proc_macro2::Literal::f32_suffixed;
+        let geometry = |nkvh: u32, hd: u32, rot: u32, block: u32| {
+            let (nqh, nkvh, hd, rot, block) = (
+                u32_lit(num_q_heads),
+                u32_lit(nkvh),
+                u32_lit(hd),
+                u32_lit(rot),
+                u32_lit(block),
+            );
+            quote! {
+                #f::HeadGeometry::new(
+                    #f::QueryHeads::new(#nqh),
+                    #f::KvHeads::new(#nkvh),
+                    #f::HeadDim::new(#hd),
+                    #f::RotDim::new(#rot),
+                    #f::BlockSize::new(#block),
+                )
+            }
+        };
+        // A vision-only body's text consts carry its tower's numbers (see `is_vision_only`); it has
+        // no decoder attention, and its tower's geometry is `VISION`'s.
+        let attention = if !is_vision_only && head_dim > 0 {
+            let sliding = geometry(num_kv_heads, head_dim, rot_dim_val, base_block_size);
+            let full = geometry(
+                num_global_kv_heads,
+                global_head_dim,
+                global_rot_dim,
+                resolved_global_block_size,
+            );
+            let scale = f32_lit(attn_scale);
+            let window = if sliding_window >= 0 {
+                let w = u32_lit(sliding_window as u32);
+                some(quote! { #f::AttnWindow::new(#w) })
+            } else {
+                none.clone()
+            };
+            let pairing = if rope_proportional {
+                quote! { #f::RopePairing::Proportional }
+            } else {
+                quote! { #f::RopePairing::Standard }
+            };
+            let kv_rope = if uses_rotary {
+                quote! { #f::KvRope::OnRead }
+            } else {
+                quote! { #f::KvRope::AtWrite }
+            };
+            some(quote! {
+                #f::Attention::new(#sliding, #full, #f::AttnScale::new(#scale), #window, #pairing, #kv_rope)
+            })
+        } else {
+            none.clone()
+        };
+        let positive_or_none = |ty: TokenStream, v: usize| {
+            if v > 0 {
+                let v = usize_lit(v);
+                some(quote! { #f::#ty::new(#v) })
+            } else {
+                none.clone()
+            }
+        };
+        let intermediate = positive_or_none(quote! { IntermediateSize }, intermediate_size);
+        let vocab = positive_or_none(quote! { VocabSize }, vocab_size_for_const);
+        let hidden = usize_lit(hidden_size_for_const);
+        let target_hidden = usize_lit(target_hidden_width);
+        let eps = f32_lit(rms_norm_eps(model));
+        let offset = f32_lit(norm_weight_runtime_offset(model));
+        let final_softcap = if final_logit_softcapping != 0.0 {
+            let c = f32_lit(final_logit_softcapping);
+            some(quote! { #f::SoftCap::new(#c) })
+        } else {
+            none.clone()
+        };
+        let mrope = match model.mrope_section {
+            Some(s) => {
+                let s = s.map(u32_lit);
+                some(quote! { #f::MropeSection::new([#(#s),*]) })
+            }
+            None => none.clone(),
+        };
+        let codec = match kv_codec {
+            scratchy_forward_compiler::KvCodec::Dense => quote! { #f::KvCodec::Dense },
+            scratchy_forward_compiler::KvCodec::TurboQuant(bits) => {
+                let b = u32_lit(bits.get());
+                quote! { #f::KvCodec::TurboQuant(#f::TqBits::new(#b)) }
+            }
+        };
+        let kv_layers_facts = match kv_layers.proper_subset(num_hidden_layers) {
+            Some(layers) => {
+                let layers = layers.iter().map(|&l| u32_lit(l));
+                some(quote! { #f::KvLayers::new(&[#(#layers),*]) })
+            }
+            None => none.clone(),
+        };
+        let scale_dtype = if scale_dtype_is_bf16 {
+            quote! { #f::ScaleDtype::Bf16 }
+        } else {
+            quote! { #f::ScaleDtype::F16 }
+        };
+        let vision = if vision_num_heads > 0 {
+            let (heads, hd, inf) = (
+                u32_lit(vision_num_heads),
+                u32_lit(vision_head_dim),
+                usize_lit(vision_in_features),
+            );
+            let pairing = if vision_rope_interleaved {
+                quote! { #f::VisionRopePairing::Interleaved }
+            } else {
+                quote! { #f::VisionRopePairing::RotateHalf }
+            };
+            let scale = f32_lit(vision_attn_scale);
+            let grid = positive_or_none(quote! { PatchGridSide }, vision_patch_grid_side as usize);
+            let pool = positive_or_none(quote! { PoolKernel }, vision_pool_kernel as usize);
+            some(quote! {
+                #f::Vision::new(
+                    #f::QueryHeads::new(#heads),
+                    #f::HeadDim::new(#hd),
+                    #f::InFeatures::new(#inf),
+                    #pairing,
+                    #f::AttnScale::new(#scale),
+                    #grid,
+                    #pool,
+                )
+            })
+        } else {
+            none.clone()
+        };
+        let gdn = if gdn_num_k_heads > 0 {
+            let (kh, vh, kd, vd, ck, cd) = (
+                u32_lit(gdn_num_k_heads),
+                u32_lit(gdn_num_v_heads),
+                u32_lit(gdn_head_k_dim),
+                u32_lit(gdn_head_v_dim),
+                u32_lit(gdn_conv_kernel),
+                usize_lit(gdn_conv_dim),
+            );
+            some(quote! {
+                #f::Gdn::new(
+                    #f::GdnHeads::new(#kh),
+                    #f::GdnHeads::new(#vh),
+                    #f::GdnHeadDim::new(#kd),
+                    #f::GdnHeadDim::new(#vd),
+                    #f::ConvKernel::new(#ck),
+                    #f::ConvDim::new(#cd),
+                )
+            })
+        } else {
+            none.clone()
+        };
+        let spec = positive_or_none(quote! { NumDrafts }, spec_drafts as usize);
+        let drafter = if draft_selector_rank > 0 {
+            let (g, r, m) = (
+                u32_lit(draft_conv_group),
+                u32_lit(draft_selector_rank),
+                u32_lit(draft_mask_token),
+            );
+            some(quote! {
+                #f::Drafter::new(#f::ConvGroup::new(#g), #f::SelectorRank::new(#r), #f::TokenId::new(#m))
+            })
+        } else {
+            none.clone()
+        };
+        let capture = positive_or_none(quote! { CaptureSlots }, draft_capture_slots as usize);
+        let routing = if target_routes_experts {
+            quote! { #f::TargetRouting::Experts }
+        } else {
+            quote! { #f::TargetRouting::Dense }
+        };
+        quote! {
+            const ATTENTION: ::core::option::Option<#f::Attention> = #attention;
+            const HIDDEN_SIZE: #f::HiddenSize = #f::HiddenSize::new(#hidden);
+            const INTERMEDIATE_SIZE: ::core::option::Option<#f::IntermediateSize> = #intermediate;
+            const VOCAB_SIZE: ::core::option::Option<#f::VocabSize> = #vocab;
+            const RMS_NORM_EPS: #f::RmsNormEps = #f::RmsNormEps::new(#eps);
+            const NORM_WEIGHT_OFFSET: #f::NormWeightOffset = #f::NormWeightOffset::new(#offset);
+            const FINAL_LOGIT_SOFTCAP: ::core::option::Option<#f::SoftCap> = #final_softcap;
+            const MROPE_SECTION: ::core::option::Option<#f::MropeSection> = #mrope;
+            const KV_CODEC: #f::KvCodec = #codec;
+            const KV_CACHE_LAYERS: ::core::option::Option<#f::KvLayers> = #kv_layers_facts;
+            // No arch overrides the metal element dtype.
+            const METAL_DTYPE: #f::MetalDtype = #f::MetalDtype::Bf16;
+            const SCALE_DTYPE: #f::ScaleDtype = #scale_dtype;
+            const VISION: ::core::option::Option<#f::Vision> = #vision;
+            const GDN: ::core::option::Option<#f::Gdn> = #gdn;
+            const SPEC_DRAFTS: ::core::option::Option<#f::NumDrafts> = #spec;
+            const DRAFTER: ::core::option::Option<#f::Drafter> = #drafter;
+            const CAPTURE_SLOTS: ::core::option::Option<#f::CaptureSlots> = #capture;
+            const TARGET_HIDDEN_WIDTH: #f::HiddenSize = #f::HiddenSize::new(#target_hidden);
+            const TARGET_ROUTING: #f::TargetRouting = #routing;
+        }
+    };
+
     #[cfg(feature = "metal")]
     {
         use scratchy_target_metal::interpreter::metal::{MetalDtype, ScaleDtype};
@@ -8637,7 +8862,7 @@ fn emit_canonical_params_impl(
         });
     }
 
-    quote! {
+    let canonical_params_impl = quote! {
         // `CanonicalParams` is backend-agnostic — the trait, its
         // associated `const`s, and every callsite (`<W as
         // CanonicalParams>::HEAD_DIM`) live in `scratchy-forward-compiler` with
@@ -8700,7 +8925,8 @@ fn emit_canonical_params_impl(
             #mrope_section_tokens
             #scale_dtype_override
         }
-    }
+    };
+    (canonical_params_impl, facts_body)
 }
 
 /// The one-slot-per-sequence recurrent-state geometry of a hybrid arch's
@@ -14851,7 +15077,8 @@ pub fn emit_model(
     let mut resolved_metal_consts: Option<
         scratchy_target_metal::tape::model_consts::MetalModelConsts,
     > = None;
-    let canonical_params_impl = emit_canonical_params_impl(
+    // The facts body is stage 1's (`canonical_facts`); this crate's emission takes the impl.
+    let (canonical_params_impl, _) = emit_canonical_params_impl(
         model,
         tp_world_size,
         fuf_uses_rotary(fuf),
@@ -17400,6 +17627,7 @@ mod tests {
             #[cfg(feature = "metal")]
             &mut None,
         )
+        .0
         .to_string();
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
@@ -17436,6 +17664,7 @@ mod tests {
             #[cfg(feature = "metal")]
             &mut None,
         )
+        .0
         .to_string();
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 16"),
@@ -17484,6 +17713,7 @@ mod tests {
             #[cfg(feature = "metal")]
             &mut None,
         )
+        .0
         .to_string();
         // 32 / 8 = 4
         assert!(

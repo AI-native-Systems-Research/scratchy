@@ -1,0 +1,567 @@
+[package]
+name = "scratchy-model-facts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stage 1 of the two-stage model build: one type per selected canonical implementing ModelFacts, so the lowerings scratchy-models' build script runs are generic over a model's facts as compile-time constants."
+
+[features]
+# ⭐ EXACTLY scratchy-models' feature names, each forwarded from there one-for-one
+# (`F = [..., "scratchy-model-facts/F"]`). The front end selects arches, models, heads and backends
+# from its build script's `CARGO_FEATURE_*` env, so this crate's build script sees the env
+# scratchy-forwards.rs sees and generates facts for exactly the canonicals stage 2 emits. A feature
+# scratchy-models forwards to the pipeline lib (`scratchy-forward-compiler-macro/<backend>`) forwards
+# the same here, so this crate builds alone. The build script refuses any drift between the two
+# tables (`check_feature_parity`).
+arch-commandr = []
+arch-deepseek-v2 = []
+arch-deepseek-v3 = []
+arch-deepseek-v3-flat = []
+arch-gemma2 = []
+arch-gemma3 = []
+arch-gemma3-mm = ["arch-gemma3", "vision"]
+arch-gemma4 = []
+arch-gemma4-moe = []
+arch-glm4-moe = []
+arch-gpt-oss = []
+arch-granite = []
+arch-llama = []
+arch-locateanything = ["arch-qwen2", "vision"]
+arch-mistral = []
+arch-mixtral = []
+arch-modernbert = []
+arch-nemotron-h = []
+arch-nemotron-h-latent = []
+arch-nemotron-h-mtp = []
+arch-phi3 = []
+arch-qwen2 = []
+arch-qwen2-5-vl = ["arch-qwen2", "vision"]
+arch-qwen2-moe = []
+arch-qwen2-vl = ["arch-qwen2", "vision"]
+arch-qwen3 = []
+arch-qwen3-5 = []
+arch-qwen3-5-moe = []
+arch-qwen3-5-mtp = []
+arch-qwen3-5-dense-mtp = []
+arch-gemma4-assistant = []
+arch-dflash2 = []
+arch-qwen3-5-vl = ["arch-qwen3-5", "vision"]
+arch-qwen3-moe = []
+vision = []
+all-arches = [
+    "arch-commandr",
+    "arch-deepseek-v2",
+    "arch-deepseek-v3",
+    "arch-deepseek-v3-flat",
+    "arch-gemma2",
+    "arch-gemma3",
+    "arch-gemma3-mm",
+    "arch-gemma4",
+    "arch-gemma4-moe",
+    "arch-glm4-moe",
+    "arch-gpt-oss",
+    "arch-granite",
+    "arch-llama",
+    "arch-locateanything",
+    "arch-mistral",
+    "arch-mixtral",
+    "arch-modernbert",
+    "arch-nemotron-h",
+    "arch-nemotron-h-latent",
+    "arch-nemotron-h-mtp",
+    "arch-phi3",
+    "arch-qwen2",
+    "arch-qwen2-5-vl",
+    "arch-qwen2-moe",
+    "arch-qwen2-vl",
+    "arch-qwen3",
+    "arch-qwen3-5",
+    "arch-qwen3-5-moe",
+    "arch-qwen3-5-mtp",
+    "arch-qwen3-5-dense-mtp",
+    "arch-gemma4-assistant",
+    "arch-dflash2",
+    "arch-qwen3-5-vl",
+    "arch-qwen3-moe",
+]
+c4ai-command-r-v01 = ["arch-commandr"]
+c4ai-command-r-v01-parity-tiny = ["arch-commandr"]
+command-r-1-layer = ["arch-commandr"]
+deepseek-v2-lite = ["arch-deepseek-v2"]
+deepseek-v2-lite-parity-tiny = ["arch-deepseek-v2"]
+deepseek-v3-academic-9b-fp8-block = ["arch-deepseek-v3"]
+deepseek-v3-academic-9b = ["arch-deepseek-v3"]
+deepseek-v3-tiny = ["arch-deepseek-v3"]
+kimi-k2-tiny = ["arch-deepseek-v3"]
+moonlight-16b-a3b-instruct-fp8-block = ["arch-deepseek-v3-flat"]
+moonlight-16b-a3b-instruct = ["arch-deepseek-v3-flat"]
+gemma2-27b = ["arch-gemma2"]
+gemma2-27b-parity-tiny = ["arch-gemma2"]
+gemma2-2b = ["arch-gemma2"]
+gemma2-9b = ["arch-gemma2"]
+gemma-3-12b-it-parity-tiny = ["arch-gemma3"]
+gemma-3-12b-it-text-only = ["arch-gemma3"]
+gemma-3-1b-it = ["arch-gemma3"]
+gemma-3-27b-it-text-only = ["arch-gemma3"]
+gemma-3-4b-it-text-only = ["arch-gemma3"]
+gemma-3-12b-it = ["arch-gemma3-mm"]
+gemma-3-27b-it = ["arch-gemma3-mm"]
+gemma-3-4b-it = ["arch-gemma3-mm"]
+gemma-3-4b-it-parity-tiny = ["arch-gemma3-mm"]
+gemma-4-12b-it = ["arch-gemma4"]
+gemma-4-12b-it-parity-tiny = ["arch-gemma4"]
+gemma-4-12b-it-parity-tiny-allglobal = ["arch-gemma4"]
+gemma-4-31b-it = ["arch-gemma4"]
+gemma-4-26b-a4b-it = ["arch-gemma4-moe"]
+gemma-4-26b-a4b-it-class-tiny = ["arch-gemma4-moe"]
+gemma-4-26b-a4b-it-parity-tiny = ["arch-gemma4-moe"]
+gemma-4-26b-a4b-it-parity-tiny30 = ["arch-gemma4-moe"]
+gemma-4-26b-a4b-it-parity-tiny30p6 = ["arch-gemma4-moe"]
+gemma-4-26b-a4b-it-parity-tiny30p6w = ["arch-gemma4-moe"]
+"glm-4.5-air" = ["arch-glm4-moe"]
+"glm-4.5-air-parity-tiny" = ["arch-glm4-moe"]
+gpt-oss-120b = ["arch-gpt-oss"]
+gpt-oss-120b-3bit = ["arch-gpt-oss"]
+gpt-oss-120b-parity-tiny = ["arch-gpt-oss"]
+gpt-oss-20b = ["arch-gpt-oss"]
+"granite-3.0-2b-base" = ["arch-granite"]
+"granite-3.0-2b-base-parity-tiny" = ["arch-granite"]
+"granite-3.0-2b-instruct" = ["arch-granite"]
+"granite-3.0-8b-base" = ["arch-granite"]
+"granite-3.0-8b-instruct" = ["arch-granite"]
+"granite-3.1-2b-base" = ["arch-granite"]
+"granite-3.1-2b-instruct" = ["arch-granite"]
+"granite-3.1-8b-base" = ["arch-granite"]
+"granite-3.1-8b-instruct" = ["arch-granite"]
+"granite-3.2-2b-instruct" = ["arch-granite"]
+"granite-3.2-8b-instruct" = ["arch-granite"]
+"granite-3.3-2b-base" = ["arch-granite"]
+"granite-3.3-2b-instruct" = ["arch-granite"]
+"granite-3.3-8b-base" = ["arch-granite"]
+"granite-3.3-8b-instruct" = ["arch-granite"]
+"granite-4.1-30b-base" = ["arch-granite"]
+"granite-4.1-30b" = ["arch-granite"]
+"granite-4.1-3b-base" = ["arch-granite"]
+"granite-4.1-3b" = ["arch-granite"]
+"granite-4.1-8b-base" = ["arch-granite"]
+"granite-4.1-8b" = ["arch-granite"]
+"granite-4.2-30b" = ["arch-granite"]
+"granite-4.2-3b" = ["arch-granite"]
+"granite-4.2-8b" = ["arch-granite"]
+"micro-g3.3-8b-instruct-1b" = ["arch-granite"]
+llama-2-13b = ["arch-llama"]
+llama-2-13b-parity-tiny = ["arch-llama"]
+llama-2-70b = ["arch-llama"]
+llama-2-7b = ["arch-llama"]
+llama-3-70b = ["arch-llama"]
+llama-3-8b = ["arch-llama"]
+"llama-3.1-70b" = ["arch-llama"]
+"llama-3.1-8b" = ["arch-llama"]
+"llama-3.2-1b" = ["arch-llama"]
+"llama-3.2-3b" = ["arch-llama"]
+smollm2-135m = ["arch-llama"]
+smollm2-360m = ["arch-llama"]
+"tinyllama-1.1b" = ["arch-llama"]
+locateanything-3b = ["arch-locateanything"]
+locateanything-3b-parity-tiny = ["arch-locateanything"]
+"mistral-7b-instruct-v0.3" = ["arch-mistral"]
+"mistral-7b-instruct-v0.3-parity-tiny" = ["arch-mistral"]
+"mistral-7b-v0.2" = ["arch-mistral"]
+mistral-nemo-instruct-2407 = ["arch-mistral"]
+mixtral-1-layer = ["arch-mixtral"]
+mixtral-1-layer-parity-tiny = ["arch-mixtral"]
+"mixtral-8x7b-instruct-v0.1" = ["arch-mixtral"]
+modernbert-base-1-layer = ["arch-modernbert"]
+modernbert-base-1-layer-parity-tiny = ["arch-modernbert"]
+modernbert-base = ["arch-modernbert"]
+nemotron-3-nano-30b-a3b = ["arch-nemotron-h"]
+nemotron-3-nano-30b-a3b-mamba-parity-tiny = ["arch-nemotron-h"]
+nemotron-3-nano-30b-a3b-parity-tiny = ["arch-nemotron-h"]
+nemotron-3-super-120b-a12b = ["arch-nemotron-h-latent"]
+nemotron-3-super-120b-a12b-parity-tiny = ["arch-nemotron-h-latent"]
+phi-3-5-mini-instruct = ["arch-phi3"]
+phi-3-5-mini-instruct-parity-tiny = ["arch-phi3"]
+phi-3-medium-128k-instruct = ["arch-phi3"]
+phi-3-medium-4k-instruct = ["arch-phi3"]
+phi-3-mini-128k-instruct = ["arch-phi3"]
+phi-3-mini-4k-instruct = ["arch-phi3"]
+phi-4-mini-instruct = ["arch-phi3"]
+phi-4-mini-reasoning = ["arch-phi3"]
+phi-4-reasoning-plus = ["arch-phi3"]
+phi-4-reasoning = ["arch-phi3"]
+phi-4 = ["arch-phi3"]
+locateanything-3b-text-only = ["arch-qwen2"]
+"qwen2-0.5b" = ["arch-qwen2"]
+"qwen2-1.5b" = ["arch-qwen2"]
+qwen2-72b = ["arch-qwen2"]
+qwen2-7b = ["arch-qwen2"]
+qwen2-7b-parity-tiny = ["arch-qwen2"]
+qwen2-vl-2b-mlx-text-only = ["arch-qwen2"]
+qwen2-vl-2b = ["arch-qwen2"]
+"qwen2.5-0.5b" = ["arch-qwen2"]
+"qwen2.5-1.5b" = ["arch-qwen2"]
+"qwen2.5-14b" = ["arch-qwen2"]
+"qwen2.5-32b" = ["arch-qwen2"]
+"qwen2.5-3b" = ["arch-qwen2"]
+"qwen2.5-72b" = ["arch-qwen2"]
+"qwen2.5-7b" = ["arch-qwen2"]
+"qwen2.5-vl-3b-mlx-text-only" = ["arch-qwen2"]
+"qwen2.5-vl-3b" = ["arch-qwen2"]
+"qwen2.5-vl-3b-instruct" = ["arch-qwen2-5-vl"]
+"qwen2.5-vl-3b-instruct-parity-tiny" = ["arch-qwen2-5-vl"]
+"qwen2.5-vl-3b-mlx" = ["arch-qwen2-5-vl"]
+"qwen2.5-vl-72b-instruct" = ["arch-qwen2-5-vl"]
+"qwen2.5-vl-7b-instruct" = ["arch-qwen2-5-vl"]
+slimed-qwen-3 = ["arch-qwen2-moe"]
+slimed-qwen-3-parity-tiny = ["arch-qwen2-moe"]
+qwen2-vl-2b-instruct = ["arch-qwen2-vl"]
+qwen2-vl-2b-instruct-parity-tiny = ["arch-qwen2-vl"]
+qwen2-vl-2b-mlx = ["arch-qwen2-vl"]
+qwen2-vl-72b-instruct = ["arch-qwen2-vl"]
+qwen2-vl-7b-instruct = ["arch-qwen2-vl"]
+"qwen3-0.6b-parity-tiny" = ["arch-qwen3"]
+"qwen3-0.6b-bnb-4bit" = ["arch-qwen3"]
+"qwen3-0.6b" = ["arch-qwen3"]
+"qwen3-1.7b" = ["arch-qwen3"]
+qwen3-4b = ["arch-qwen3"]
+qwen3-8b = ["arch-qwen3"]
+"qwen3.5-0.8b" = ["arch-qwen3-5"]
+"qwen3.5-0.8b-parity-tiny" = ["arch-qwen3-5"]
+"qwen3.5-9b-text-only" = ["arch-qwen3-5"]
+"qwen3.6-27b-text-only" = ["arch-qwen3-5"]
+"qwen3.8-27b-text-only" = ["arch-qwen3-5"]
+"qwen3.5-122b-a10b" = ["arch-qwen3-5-moe"]
+"qwen3.5-35b-a3b" = ["arch-qwen3-5-moe"]
+"qwen3.5-35b-a3b-parity-tiny" = ["arch-qwen3-5-moe"]
+"qwen3.6-35b-a3b" = ["arch-qwen3-5-moe"]
+gemma-4-26b-a4b-it-assistant = ["arch-gemma4-assistant"]
+gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant = ["arch-gemma4-assistant"]
+"qwen3.6-35b-a3b-dflash2" = ["arch-dflash2"]
+"qwen3.8-27b-dflash2" = ["arch-dflash2"]
+"qwen3.5-9b" = ["arch-qwen3-5-vl"]
+"qwen3.5-9b-parity-tiny" = ["arch-qwen3-5-vl"]
+"qwen3.6-27b" = ["arch-qwen3-5-vl"]
+"qwen3.8-27b" = ["arch-qwen3-5-vl"]
+qwen3-30b-a3b-instruct-2507 = ["arch-qwen3-moe"]
+qwen3-30b-a3b-instruct-2507-parity-tiny = ["arch-qwen3-moe"]
+qwen3-moe-1-layer = ["arch-qwen3-moe"]
+commandr = ["c4ai-command-r-v01", "c4ai-command-r-v01-parity-tiny", "command-r-1-layer"]
+deepseek-v2 = ["deepseek-v2-lite", "deepseek-v2-lite-parity-tiny"]
+deepseek-v3 = ["deepseek-v3-academic-9b-fp8-block", "deepseek-v3-academic-9b", "deepseek-v3-tiny", "kimi-k2-tiny"]
+deepseek-v3-flat = ["moonlight-16b-a3b-instruct-fp8-block", "moonlight-16b-a3b-instruct"]
+gemma2 = ["gemma2-27b", "gemma2-27b-parity-tiny", "gemma2-2b", "gemma2-9b"]
+gemma3 = [
+    "gemma-3-12b-it-parity-tiny",
+    "gemma-3-12b-it-text-only",
+    "gemma-3-1b-it",
+    "gemma-3-27b-it-text-only",
+    "gemma-3-4b-it-text-only",
+]
+gemma3-mm = ["gemma-3-12b-it", "gemma-3-27b-it", "gemma-3-4b-it", "gemma-3-4b-it-parity-tiny"]
+gemma4 = ["gemma-4-12b-it", "gemma-4-12b-it-parity-tiny", "gemma-4-12b-it-parity-tiny-allglobal", "gemma-4-31b-it"]
+gemma4-moe = ["gemma-4-26b-a4b-it", "gemma-4-26b-a4b-it-parity-tiny", "gemma-4-12b-it-parity-tiny-allglobal"]
+glm4-moe = ["glm-4.5-air", "glm-4.5-air-parity-tiny"]
+gpt-oss = ["gpt-oss-120b", "gpt-oss-120b-3bit", "gpt-oss-120b-parity-tiny", "gpt-oss-20b"]
+granite = [
+    "granite-3.0-2b-base",
+    "granite-3.0-2b-base-parity-tiny",
+    "granite-3.0-2b-instruct",
+    "granite-3.0-8b-base",
+    "granite-3.0-8b-instruct",
+    "granite-3.1-2b-base",
+    "granite-3.1-2b-instruct",
+    "granite-3.1-8b-base",
+    "granite-3.1-8b-instruct",
+    "granite-3.2-2b-instruct",
+    "granite-3.2-8b-instruct",
+    "granite-3.3-2b-base",
+    "granite-3.3-2b-instruct",
+    "granite-3.3-8b-base",
+    "granite-3.3-8b-instruct",
+    "granite-4.1-30b-base",
+    "granite-4.1-30b",
+    "granite-4.1-3b-base",
+    "granite-4.1-3b",
+    "granite-4.1-8b-base",
+    "granite-4.1-8b",
+    "granite-4.2-30b",
+    "granite-4.2-3b",
+    "granite-4.2-8b",
+    "micro-g3.3-8b-instruct-1b",
+]
+llama = [
+    "llama-2-13b",
+    "llama-2-13b-parity-tiny",
+    "llama-2-70b",
+    "llama-2-7b",
+    "llama-3-70b",
+    "llama-3-8b",
+    "llama-3.1-70b",
+    "llama-3.1-8b",
+    "llama-3.2-1b",
+    "llama-3.2-3b",
+    "smollm2-135m",
+    "smollm2-360m",
+    "tinyllama-1.1b",
+]
+locateanything = ["locateanything-3b", "locateanything-3b-parity-tiny"]
+mistral = ["mistral-7b-instruct-v0.3", "mistral-7b-instruct-v0.3-parity-tiny", "mistral-7b-v0.2", "mistral-nemo-instruct-2407"]
+mixtral = ["mixtral-1-layer", "mixtral-1-layer-parity-tiny", "mixtral-8x7b-instruct-v0.1"]
+modernbert = ["modernbert-base-1-layer", "modernbert-base-1-layer-parity-tiny", "modernbert-base"]
+nemotron-h = ["nemotron-3-nano-30b-a3b", "nemotron-3-nano-30b-a3b-mamba-parity-tiny", "nemotron-3-nano-30b-a3b-parity-tiny"]
+nemotron-h-latent = ["nemotron-3-super-120b-a12b", "nemotron-3-super-120b-a12b-parity-tiny"]
+phi3 = [
+    "phi-3-5-mini-instruct",
+    "phi-3-5-mini-instruct-parity-tiny",
+    "phi-3-medium-128k-instruct",
+    "phi-3-medium-4k-instruct",
+    "phi-3-mini-128k-instruct",
+    "phi-3-mini-4k-instruct",
+    "phi-4-mini-instruct",
+    "phi-4-mini-reasoning",
+    "phi-4-reasoning-plus",
+    "phi-4-reasoning",
+    "phi-4",
+]
+qwen2 = [
+    "locateanything-3b-text-only",
+    "qwen2-0.5b",
+    "qwen2-1.5b",
+    "qwen2-72b",
+    "qwen2-7b",
+    "qwen2-vl-2b-mlx-text-only",
+    "qwen2-vl-2b",
+    "qwen2.5-0.5b",
+    "qwen2.5-1.5b",
+    "qwen2.5-14b",
+    "qwen2.5-32b",
+    "qwen2.5-3b",
+    "qwen2.5-72b",
+    "qwen2.5-7b",
+    "qwen2.5-vl-3b-mlx-text-only",
+    "qwen2.5-vl-3b",
+    "qwen2-7b-parity-tiny",
+]
+qwen2-5-vl = [
+    "qwen2.5-vl-3b-instruct",
+    "qwen2.5-vl-3b-instruct-parity-tiny",
+    "qwen2.5-vl-3b-mlx",
+    "qwen2.5-vl-72b-instruct",
+    "qwen2.5-vl-7b-instruct",
+]
+qwen2-moe = ["slimed-qwen-3", "slimed-qwen-3-parity-tiny"]
+qwen2-vl = [
+    "qwen2-vl-2b-instruct",
+    "qwen2-vl-2b-instruct-parity-tiny",
+    "qwen2-vl-2b-mlx",
+    "qwen2-vl-72b-instruct",
+    "qwen2-vl-7b-instruct",
+]
+qwen3 = [
+    "qwen3-0.6b-parity-tiny",
+    "qwen3-0.6b-bnb-4bit",
+    "qwen3-0.6b",
+    "qwen3-1.7b",
+    "qwen3-4b",
+    "qwen3-8b",
+]
+qwen3-5 = [
+    "qwen3.5-0.8b",
+    "qwen3.5-0.8b-parity-tiny",
+    "qwen3.5-9b-text-only",
+    "qwen3.6-27b-text-only",
+    "qwen3.8-27b-text-only",
+]
+qwen3-5-moe = ["qwen3.5-122b-a10b", "qwen3.5-35b-a3b", "qwen3.5-35b-a3b-parity-tiny", "qwen3.6-35b-a3b"]
+gemma4-assistant = ["gemma-4-26b-a4b-it-assistant", "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant"]
+dflash2 = ["qwen3.6-35b-a3b-dflash2", "qwen3.8-27b-dflash2"]
+qwen3-5-vl = ["qwen3.5-9b", "qwen3.5-9b-parity-tiny", "qwen3.6-27b", "qwen3.8-27b"]
+qwen3-moe = ["qwen3-30b-a3b-instruct-2507", "qwen3-30b-a3b-instruct-2507-parity-tiny", "qwen3-moe-1-layer"]
+all = [
+    "c4ai-command-r-v01",
+    "c4ai-command-r-v01-parity-tiny",
+    "command-r-1-layer",
+    "deepseek-v2-lite",
+    "deepseek-v2-lite-parity-tiny",
+    "deepseek-v3-academic-9b-fp8-block",
+    "deepseek-v3-academic-9b",
+    "deepseek-v3-tiny",
+    "kimi-k2-tiny",
+    "moonlight-16b-a3b-instruct-fp8-block",
+    "moonlight-16b-a3b-instruct",
+    "gemma2-27b",
+    "gemma2-27b-parity-tiny",
+    "gemma2-2b",
+    "gemma2-9b",
+    "gemma-3-12b-it-parity-tiny",
+    "gemma-3-12b-it-text-only",
+    "gemma-3-1b-it",
+    "gemma-3-27b-it-text-only",
+    "gemma-3-4b-it-text-only",
+    "gemma-3-12b-it",
+    "gemma-3-27b-it",
+    "gemma-3-4b-it",
+    "gemma-3-4b-it-parity-tiny",
+    "gemma-4-12b-it",
+    "gemma-4-12b-it-parity-tiny",
+    "gemma-4-12b-it-parity-tiny-allglobal",
+    "gemma-4-31b-it",
+    "gemma-4-26b-a4b-it",
+    "gemma-4-26b-a4b-it-parity-tiny",
+    "glm-4.5-air",
+    "glm-4.5-air-parity-tiny",
+    "gpt-oss-120b",
+    "gpt-oss-120b-3bit",
+    "gpt-oss-120b-parity-tiny",
+    "gpt-oss-20b",
+    "granite-3.0-2b-base",
+    "granite-3.0-2b-base-parity-tiny",
+    "granite-3.0-2b-instruct",
+    "granite-3.0-8b-base",
+    "granite-3.0-8b-instruct",
+    "granite-3.1-2b-base",
+    "granite-3.1-2b-instruct",
+    "granite-3.1-8b-base",
+    "granite-3.1-8b-instruct",
+    "granite-3.2-2b-instruct",
+    "granite-3.2-8b-instruct",
+    "granite-3.3-2b-base",
+    "granite-3.3-2b-instruct",
+    "granite-3.3-8b-base",
+    "granite-3.3-8b-instruct",
+    "granite-4.1-30b-base",
+    "granite-4.1-30b",
+    "granite-4.1-3b-base",
+    "granite-4.1-3b",
+    "granite-4.1-8b-base",
+    "granite-4.1-8b",
+    "granite-4.2-30b",
+    "granite-4.2-3b",
+    "granite-4.2-8b",
+    "micro-g3.3-8b-instruct-1b",
+    "llama-2-13b",
+    "llama-2-13b-parity-tiny",
+    "llama-2-7b",
+    "llama-3-70b",
+    "llama-3-8b",
+    "llama-3.1-70b",
+    "llama-3.1-8b",
+    "llama-3.2-1b",
+    "llama-3.2-3b",
+    "smollm2-135m",
+    "smollm2-360m",
+    "tinyllama-1.1b",
+    "locateanything-3b",
+    "locateanything-3b-parity-tiny",
+    "mistral-7b-instruct-v0.3",
+    "mistral-7b-instruct-v0.3-parity-tiny",
+    "mistral-nemo-instruct-2407",
+    "mixtral-1-layer",
+    "mixtral-1-layer-parity-tiny",
+    "mixtral-8x7b-instruct-v0.1",
+    "modernbert-base-1-layer",
+    "modernbert-base-1-layer-parity-tiny",
+    "modernbert-base",
+    "nemotron-3-nano-30b-a3b",
+    "nemotron-3-nano-30b-a3b-mamba-parity-tiny",
+    "nemotron-3-nano-30b-a3b-parity-tiny",
+    "nemotron-3-super-120b-a12b",
+    "nemotron-3-super-120b-a12b-parity-tiny",
+    "phi-3-5-mini-instruct",
+    "phi-3-5-mini-instruct-parity-tiny",
+    "phi-3-medium-128k-instruct",
+    "phi-3-medium-4k-instruct",
+    "phi-3-mini-128k-instruct",
+    "phi-3-mini-4k-instruct",
+    "phi-4-mini-instruct",
+    "phi-4-mini-reasoning",
+    "phi-4-reasoning-plus",
+    "phi-4-reasoning",
+    "phi-4",
+    "locateanything-3b-text-only",
+    "qwen2-0.5b",
+    "qwen2-1.5b",
+    "qwen2-72b",
+    "qwen2-7b",
+    "qwen2-vl-2b-mlx-text-only",
+    "qwen2-vl-2b",
+    "qwen2.5-0.5b",
+    "qwen2.5-1.5b",
+    "qwen2.5-14b",
+    "qwen2.5-32b",
+    "qwen2.5-3b",
+    "qwen2.5-72b",
+    "qwen2.5-7b",
+    "qwen2.5-vl-3b-mlx-text-only",
+    "qwen2.5-vl-3b",
+    "qwen2-7b-parity-tiny",
+    "qwen2.5-vl-3b-instruct",
+    "qwen2.5-vl-3b-instruct-parity-tiny",
+    "qwen2.5-vl-3b-mlx",
+    "qwen2.5-vl-72b-instruct",
+    "qwen2.5-vl-7b-instruct",
+    "slimed-qwen-3",
+    "slimed-qwen-3-parity-tiny",
+    "qwen2-vl-2b-instruct",
+    "qwen2-vl-2b-instruct-parity-tiny",
+    "qwen2-vl-2b-mlx",
+    "qwen2-vl-72b-instruct",
+    "qwen2-vl-7b-instruct",
+    "qwen3-0.6b-parity-tiny",
+    "qwen3-0.6b-bnb-4bit",
+    "qwen3-0.6b",
+    "qwen3-1.7b",
+    "qwen3-4b",
+    "qwen3-8b",
+    "qwen3.5-0.8b",
+    "qwen3.5-0.8b-parity-tiny",
+    "qwen3.5-9b-text-only",
+    "qwen3.6-27b-text-only",
+    "qwen3.8-27b-text-only",
+    "qwen3.5-122b-a10b",
+    "qwen3.5-35b-a3b",
+    "qwen3.5-35b-a3b-parity-tiny",
+    "qwen3.6-35b-a3b",
+    "gemma-4-26b-a4b-it-assistant",
+    "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant",
+    "qwen3.6-35b-a3b-dflash2",
+    "qwen3.8-27b-dflash2",
+    "qwen3.5-9b",
+    "qwen3.5-9b-parity-tiny",
+    "qwen3.6-27b",
+    "qwen3.8-27b",
+    "qwen3-30b-a3b-instruct-2507",
+    "qwen3-30b-a3b-instruct-2507-parity-tiny",
+    "qwen3-moe-1-layer",
+]
+mtp-heads = [
+    "arch-qwen3-5-mtp",
+    "arch-qwen3-5-dense-mtp",
+    "arch-nemotron-h-mtp",
+    "arch-gemma4-assistant",
+    "arch-dflash2",
+]
+mtp = ["mtp-heads"]
+cuda = ["scratchy-forward-compiler-macro/cuda"]
+metal = ["scratchy-forward-compiler-macro/metal"]
+nccl = ["cuda", "scratchy-forward-compiler-macro/nccl"]
+spyre-hw = ["spyre", "scratchy-forward-compiler-macro/spyre-hw"]
+spyre-emu = ["spyre", "scratchy-forward-compiler-macro/spyre-emu"]
+turboquant = ["scratchy-forward-compiler-macro/turboquant"]
+spyre = ["scratchy-forward-compiler-macro/spyre"]
+hf-completions = []
+
+[dependencies]
+# The trait the generated types implement, and the newtypes their consts are built from.
+scratchy-ir = { path = "../../compiler/ir" }
+
+[build-dependencies]
+# The shared carrier enumeration and front end + fill (`carrier_facts`).
+scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
+# Quant scope, read as scratchy-forwards.rs reads it (`enabled_presets()`).
+scratchy-quantizations = { path = "../quantization" }
+proc-macro2 = "1"
+quote = "1"
+rayon = { workspace = true }
+# The build script checks this table against scratchy-models' (`check_feature_parity`).
+toml = "0.8"

@@ -13,7 +13,9 @@
 //! (metal/cuda/…) is forwarded onto it so the emit matches what we then compile.
 use proc_macro2::{Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 use rayon::prelude::*;
-use scratchy_forward_compiler_macro::{compile_carrier, parse_python_file, render_tokens};
+use scratchy_forward_compiler_macro::{
+    CarrierTarget, compile_carrier, render_tokens, scope_compiled_carriers,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -66,45 +68,6 @@ fn reroot_crate(ts: TokenStream, mod_name: &str) -> TokenStream {
     out.into_iter().collect()
 }
 
-/// The quant presets enabled for one arch: its `quantizations.json`
-/// ∩ the enabled preset features (no `quant-` prefix on scratchy-quantizations,
-/// same reasoning as `<stem>` having no `model-` prefix on this crate).
-/// Quant scope lives on scratchy-quantizations, not this crate (so
-/// `crates/cli/scr/Cargo.toml` can alias it `quant`, distinct from this
-/// crate's `model` alias — Cargo forbids aliasing the same crate twice), so
-/// this reads `scratchy_quantizations::enabled_presets()` (a build-dependency call,
-/// baked in at scratchy-quantizations' OWN compile time via `cfg!`) instead
-/// of this crate's own `CARGO_FEATURE_QUANT_*`, which no longer exist.
-fn enabled_quants(
-    qpath: &Path,
-    enabled_presets: &std::collections::HashSet<&'static str>,
-) -> Vec<String> {
-    // Only watch the file if it EXISTS. `rerun-if-changed` on a missing path
-    // makes cargo rerun the build script on every build — and 6 arches (the
-    // vision ones + modernbert) ship no quantizations.json. Adds/removes of the
-    // file are still caught: emit_arch watches the whole `configs/<arch>/` dir.
-    if qpath.is_file() {
-        println!("cargo:rerun-if-changed={}", qpath.display());
-    }
-    let mut enabled: Vec<String> = Vec::new();
-    if let Ok(text) = std::fs::read_to_string(qpath)
-        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
-        && let Some(arr) = json.get("quantizations").and_then(|v| v.as_array())
-    {
-        for entry in arr {
-            let name = match entry {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Object(o) if o.len() == 1 => o.keys().next().unwrap().clone(),
-                _ => continue,
-            };
-            if enabled_presets.contains(name.as_str()) {
-                enabled.push(name);
-            }
-        }
-    }
-    enabled
-}
-
 /// Write `$OUT_DIR/hf_registry.rs`, the shell-completion candidate list
 /// `src/lib.rs` includes and `compiled_hf_registry()` returns.
 ///
@@ -135,21 +98,9 @@ fn write_hf_registry_file(out_dir: &Path, ids: &[String]) {
 /// against its configs (`configs/<arch>/`), write `$OUT_DIR/<mod>.rs`. Called
 /// concurrently across arches — must not mutate global state (e.g. env). The
 /// quant scoping (SCRATCHY_QUANTS) is set once in `main` before the fan-out.
-fn emit_arch(dsl_path: &Path, configs_dir: &Path, out_dir: &Path, mod_name: &str) {
-    println!("cargo:rerun-if-changed={}", dsl_path.display());
-    // Watch the dir itself (its mtime bumps on add/remove) plus each file.
-    println!("cargo:rerun-if-changed={}", configs_dir.display());
-    if let Ok(rd) = std::fs::read_dir(configs_dir) {
-        for e in rd.flatten() {
-            println!("cargo:rerun-if-changed={}", e.path().display());
-        }
-    }
-
-    let dsl = std::fs::read_to_string(dsl_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", dsl_path.display()));
-    let carrier =
-        parse_python_file(&dsl).unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
-    let tokens = compile_carrier(carrier, configs_dir)
+fn emit_arch(target: &CarrierTarget, out_dir: &Path) {
+    let mod_name = target.mod_name.as_str();
+    let tokens = compile_carrier(target.carrier(), &target.configs_dir)
         .unwrap_or_else(|e| panic!("forward pipeline ({mod_name}): {e}"));
     // Re-root the emit under `pub mod <mod>` (see reroot_crate).
     let tokens = reroot_crate(tokens, mod_name);
@@ -311,11 +262,6 @@ fn main() {
         println!("cargo:rerun-if-env-changed={name}");
     }
 
-    // Each arch is a `dsl/<arch>.py` DSL carrier paired with a
-    // `configs/<arch>/` dir; emit the ones whose `arch-<name>` feature is on AND
-    // a backend they support is on. Sorted for deterministic output.
-    let dsl_dir = manifest.join("dsl");
-    println!("cargo:rerun-if-changed={}", dsl_dir.display());
     // A head that prefills at its target's chunk width must have every rung its target has, or a
     // chunk at a rung it lacks panics at runtime: refuse the build instead, before any expansion.
     // Every head is checked, selected or not, so every arch.json the check reads is watched (dsl/
@@ -331,67 +277,23 @@ fn main() {
     }
     scratchy_forward_compiler_macro::check_head_ladders(&manifest)
         .unwrap_or_else(|e| panic!("head ladder: {e}"));
-    let mut dsl_files: Vec<PathBuf> = std::fs::read_dir(&dsl_dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".py"))
-        })
-        .collect();
-    dsl_files.sort();
 
-    // (dsl_path, mod_name, configs_dir) for each arch that passes the feature +
-    // backend gates.
-    let targets: Vec<(PathBuf, String, PathBuf)> = dsl_files
-        .iter()
-        .filter_map(|dsl_path| {
-            let arch = dsl_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_suffix(".py"))?
-                .to_string();
-            // Its `arch-<name>` feature and a backend it compiles for, as the `pub mod <name>`
-            // cfg in src/lib.rs has it: never the pipeline of an arch whose mod won't compile.
-            if !scratchy_forward_compiler_macro::arch_compiled(&arch) {
-                return None;
-            }
-            let mod_name = arch.replace('-', "_");
-            let configs_dir = manifest.join("configs").join(&arch);
-            Some((dsl_path.clone(), mod_name, configs_dir))
-        })
+    // The arches this build compiles, with the quant scope set once, before the
+    // rayon fan-out below reads it: the same enumeration stage 1
+    // (scratchy-model-facts) generates its types from.
+    let enabled_presets = scratchy_quantizations::enabled_presets()
+        .into_iter()
         .collect();
-
-    // Set SCRATCHY_QUANTS ONCE to the global union of enabled presets. config.rs
-    // intersects it with each arch's own quantizations.json, so the per-arch
-    // result is identical to setting it per arch — but doing it once lets us emit
-    // arches in parallel below without a set_var data race.
-    let enabled_presets: std::collections::HashSet<&'static str> =
-        scratchy_quantizations::enabled_presets()
-            .into_iter()
-            .collect();
-    let quant_union: BTreeSet<String> = targets
-        .iter()
-        .flat_map(|(_, _, cfg)| enabled_quants(&cfg.join("quantizations.json"), &enabled_presets))
-        .collect();
-    let quants = quant_union.iter().cloned().collect::<Vec<_>>().join(",");
-    // SAFETY: set once here, before the rayon fan-out reads it; no other thread
-    // mutates the environment. `set_var` is unsafe on 2024.
-    unsafe {
-        std::env::set_var("SCRATCHY_QUANTS", &quants);
-    }
+    let carriers = scope_compiled_carriers(&manifest, &enabled_presets);
 
     // Emit arches in parallel. compile_carrier is itself rayon-parallel over
     // models, so this is nested (arch × model) work-stealing across all cores —
     // recovering the cross-crate parallelism the per-arch crate split used to get
     // from cargo, in one process.
-    targets
+    carriers
+        .targets
         .par_iter()
-        .for_each(|(dsl_path, mod_name, configs_dir)| {
-            emit_arch(dsl_path, configs_dir, &out_dir, mod_name);
-        });
+        .for_each(|target| emit_arch(target, &out_dir));
     #[cfg(feature = "metal")]
     write_metal_bake(&out_dir);
     bake_tokenizers(&out_dir);
@@ -415,11 +317,12 @@ fn main() {
         // `configs/` uses `-` exclusively (never `_`), so this reverses
         // cleanly back to the original hyphenated identifier
         // `resolve_arch_tag`'s candidate rewrites need to split on.
-        let hf_registry_targets: Vec<(String, PathBuf)> = targets
+        let hf_registry_targets: Vec<(String, PathBuf)> = carriers
+            .targets
             .iter()
-            .map(|(_, mod_name, configs_dir)| (mod_name.replace('_', "-"), configs_dir.clone()))
+            .map(|t| (t.mod_name.replace('_', "-"), t.configs_dir.clone()))
             .collect();
-        hf_registry_build::resolve_hf_registry(&hf_registry_targets, &quant_union, &repo_root)
+        hf_registry_build::resolve_hf_registry(&hf_registry_targets, &carriers.quants, &repo_root)
     };
     #[cfg(not(feature = "hf-completions"))]
     let hf_ids = Vec::<String>::new();

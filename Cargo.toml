@@ -43,6 +43,7 @@ members = [
     # hooks it in without a second copy of the lowering.
     "crates/triton/splice",
     "crates/models/arch",
+    "crates/models/facts",
     "crates/models/vision",
     "crates/models/quantization",
     "crates/models/spec",

@@ -25,6 +25,9 @@ use scratchy_tensors::tensor::MAX_DIMS;
 // backend feature.
 pub use scratchy_layers::turboquant::{DenseReason, KvCodec, KvGeometry, TqBits, codec_for};
 use scratchy_tensors::{MetalDtype, ScaleDtype};
+
+/// A canonical's facts as a type ([`facts::ModelFacts`]): what every lowering is generic over.
+pub mod facts;
 // The `GpuTensor`, `AffineQuantEmbedding` (in `scratchy-quantizations`), and
 // `scratchy_layers` layer structs are referenced exclusively through
 // fully-qualified paths (`::scratchy_tensors::tensor::GpuTensor`,

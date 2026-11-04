@@ -40,6 +40,9 @@ use syn::Ident;
 mod alias_rules;
 mod arch_spec;
 mod ast;
+/// The carriers a build compiles: one enumeration both build stages read.
+mod carriers;
+pub use carriers::{CarrierTarget, CompiledCarriers, scope_compiled_carriers};
 mod cfg;
 mod classified;
 mod classify;
@@ -569,12 +572,48 @@ impl CompileMode {
     };
 }
 
+/// One canonical's facts, as stage 1 (`scratchy-model-facts`) generates its type from them.
+pub struct CanonicalFacts {
+    /// The canonical's module name (`canonical_for`'s ident): the key stage 2 dispatches on.
+    pub name: String,
+    /// The `impl ModelFacts` body: one `const` per fact.
+    pub body: proc_macro2::TokenStream,
+}
+
+/// Which stage of the two-stage build a carrier runs for. Both run the same front end; they part
+/// once the canonicals are known.
+enum Stage<'o> {
+    /// Stage 2 (scratchy-models' build script): emit every model.
+    Emit,
+    /// Stage 1 (scratchy-model-facts' build script): each canonical's facts, nothing emitted.
+    Facts(&'o mut Vec<CanonicalFacts>),
+}
+
 /// The whole pipeline: a parsed `dsl/<arch>.py` carrier, compiled against
 /// its arch's `configs/<arch>/` directory — in vision mode for a
 /// `@vision_forward` carrier, decoder mode for `@forward`.
 pub fn compile_carrier(
     carrier: PythonCarrier,
     models_dir: &std::path::Path,
+) -> syn::Result<proc_macro2::TokenStream> {
+    run_carrier(carrier, models_dir, Stage::Emit)
+}
+
+/// Stage 1: the facts of every canonical a carrier compiles, from the same front end
+/// [`compile_carrier`] runs — the canonicals, their dedup and their fill are that pipeline's own.
+pub fn carrier_facts(
+    carrier: PythonCarrier,
+    models_dir: &std::path::Path,
+) -> syn::Result<Vec<CanonicalFacts>> {
+    let mut facts = Vec::new();
+    run_carrier(carrier, models_dir, Stage::Facts(&mut facts))?;
+    Ok(facts)
+}
+
+fn run_carrier(
+    carrier: PythonCarrier,
+    models_dir: &std::path::Path,
+    stage: Stage<'_>,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let args = &ForwardArgs::from_carrier(&carrier);
     let mode = if carrier.vision {
@@ -1712,6 +1751,22 @@ pub fn compile_carrier(
     // `#variants`).
     let canonical_for: std::collections::HashMap<usize, Ident> =
         compute_canonical_variants(&solved);
+
+    // ⭐ STAGE 1 STOPS HERE: the canonicals are known, so each one's facts are the fill's, from the
+    // same `(model, tp, FUF)` its stage-2 emission reads. Nothing is emitted.
+    if let Stage::Facts(out) = stage {
+        for (idx, sm) in solved.iter().enumerate() {
+            let canonical = &canonical_for[&idx];
+            if *canonical != sm.mod_name.as_str() {
+                continue;
+            }
+            out.push(CanonicalFacts {
+                name: sm.mod_name.clone(),
+                body: codegen::canonical_facts_body(sm.model, sm.tp_world_size, &sm.fuf),
+            });
+        }
+        return Ok(quote! {});
+    }
 
     // The affine rows each emitted variant's fingerprint gate carries,
     // keyed by module name. Populated as canonicals emit and read when

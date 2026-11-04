@@ -3643,6 +3643,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-model-facts"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "rayon",
+ "scratchy-forward-compiler-macro",
+ "scratchy-ir",
+ "scratchy-quantizations",
+ "toml",
+]
+
+[[package]]
 name = "scratchy-models"
 version = "0.1.0"
 dependencies = [
@@ -3657,6 +3670,7 @@ dependencies = [
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-macro",
  "scratchy-layers",
+ "scratchy-model-facts",
  "scratchy-quantizations",
  "scratchy-target-cuda",
  "scratchy-target-metal",
