@@ -12,10 +12,9 @@
 //! ```
 //!
 //! The conv ring and the draft lanes' records are **f32** everywhere (every
-//! `gdn_*` kernel, metal's and cuda's, reads and writes them as
-//! `device float*`); the ssm state's element dtype is the worker's to declare
-//! (`ssm_dtype` — metal's kernels read and write it as `device half`, cuda's
-//! as `device float`), its arithmetic f32 either way. The slot a sequence owns is
+//! `gdn_*` kernel reads and writes them as `device float*`); the ssm state's
+//! element dtype is the worker's to declare (`ssm_dtype` — metal's kernels read
+//! and write it as `device half`), its arithmetic f32 either way. The slot a sequence owns is
 //! decided host-side by the forward compiler's `GdnSlotAllocator`;
 //! the per-step `state_indices` tensor (one slot id per batched sequence) is
 //! built by the worker and consumed by the kernels.
@@ -27,8 +26,8 @@
 //! takes the model's global layer index directly) while not wasting the large
 //! `ssm_state` allocation on full-attention layers.
 //!
-//! Like `KvCachePool` the buffer-allocation is a caller-supplied closure (cuda
-//! wraps `driver::mem_alloc`, metal wraps `device.new_buffer`); the layout /
+//! Like `KvCachePool` the buffer-allocation is a caller-supplied closure (metal
+//! wraps `device.new_buffer`); the layout /
 //! sizing / accessor logic is backend-neutral.
 //!
 //! **Checkpoints (speculative decoding).** A verify step runs a sequence's last token and its

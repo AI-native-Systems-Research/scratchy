@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 
 pub const PROVIDER_NAME: &str = "scratchy";
 pub const DEFAULT_MODEL: &str = "mlx-community/Qwen2.5-3B-Instruct-4bit";
-// `auto` lets the compiled-in backend factory claim it (metal / cuda / spyre all
+// `auto` lets the compiled-in backend factory claim it (metal / spyre both
 // match `auto`), so a spyre-only build serves the TUI without erroring on a
 // hard-coded `metal`. `GOOSE_SCRATCHY_DEVICE` overrides for explicit selection.
 const DEFAULT_DEVICE: &str = "auto";

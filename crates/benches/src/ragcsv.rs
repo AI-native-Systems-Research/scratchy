@@ -14,7 +14,6 @@ use std::time::Instant;
 
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
-use scratchy_core_config::{CudaGraphConfig, CudaGraphMode};
 use scratchy_serving_api::llm::{ChatMessage, LLM, LLMBuilder, SamplingParams};
 
 use crate::args::BenchRagcsvArgs;
@@ -299,7 +298,6 @@ fn build_llm(args: &BenchRagcsvArgs) -> Result<LLM> {
         .gpu_memory_utilization(args.gpu_memory_utilization)
         .max_num_seqs(args.max_num_seqs)
         .block_size(args.block_size)
-        .enforce_eager(args.enforce_eager)
         .enable_prefix_caching(true);
 
     builder = builder.max_num_batched_tokens(8192);
@@ -311,17 +309,6 @@ fn build_llm(args: &BenchRagcsvArgs) -> Result<LLM> {
     }
     if let Some(ref gguf) = args.gguf_file {
         builder = builder.gguf_file(gguf);
-    }
-    if !args.enforce_eager {
-        let sizes = CudaGraphConfig::parse_sizes("auto");
-        if !sizes.is_empty() {
-            builder = builder.cuda_graph_config(CudaGraphConfig {
-                enabled: true,
-                mode: CudaGraphMode::default(),
-                capture_sizes: sizes,
-                num_warmups: 3,
-            });
-        }
     }
     builder.build()
 }

@@ -26,7 +26,6 @@ use anyhow::Result;
 
 use scratchy_core_common::EngineCoreRequest;
 pub use scratchy_core_common::SamplingParams;
-use scratchy_core_config::CudaGraphConfig;
 use scratchy_serving_engine::core_client::{EngineCoreClient, InprocClient};
 use scratchy_serving_engine::engine_core::StepOutcome;
 
@@ -224,7 +223,7 @@ impl LLMBuilder {
         }
     }
 
-    /// Set the device ("cpu", "cuda:0", "metal", "auto").
+    /// Set the device ("cpu", "metal", "spyre", "auto").
     pub fn device(mut self, device: impl Into<String>) -> Self {
         self.config.device = device.into();
         self
@@ -295,39 +294,15 @@ impl LLMBuilder {
         self
     }
 
-    /// Set the number of GPUs for tensor parallelism.
+    /// Set the tensor-parallel degree (only 1 is supported).
     pub fn tensor_parallel_size(mut self, n: usize) -> Self {
         self.config.tensor_parallel_size = n;
         self
     }
 
-    /// Set the number of GPU stages for pipeline parallelism.
+    /// Set the pipeline-parallel degree (only 1 is supported).
     pub fn pipeline_parallel_size(mut self, n: usize) -> Self {
         self.config.pipeline_parallel_size = n;
-        self
-    }
-
-    /// Set the number of nodes for multi-node TP.
-    pub fn num_nodes(mut self, n: usize) -> Self {
-        self.config.num_nodes = n;
-        self
-    }
-
-    /// Set this node's rank (0 = master).
-    pub fn node_rank(mut self, rank: usize) -> Self {
-        self.config.node_rank = rank;
-        self
-    }
-
-    /// Set the master address for multi-node NCCL rendezvous.
-    pub fn master_addr(mut self, addr: &str) -> Self {
-        self.config.master_addr = addr.to_string();
-        self
-    }
-
-    /// Set the master port for multi-node NCCL rendezvous.
-    pub fn master_port(mut self, port: u16) -> Self {
-        self.config.master_port = port;
         self
     }
 
@@ -337,24 +312,12 @@ impl LLMBuilder {
         self
     }
 
-    /// Disable CUDA graph capture and run all steps eagerly.
-    pub fn enforce_eager(mut self, eager: bool) -> Self {
-        self.config.enforce_eager = eager;
-        self
-    }
-
     /// Set an explicit chat template override. Accepts either inline
     /// Jinja or a path to a `tokenizer_config.json` / `.jinja` file.
     /// Used to inject a template for GGUFs (e.g. mmnga's Moonlight)
     /// whose metadata dropped the field.
     pub fn chat_template(mut self, tpl: impl Into<String>) -> Self {
         self.config.chat_template = Some(tpl.into());
-        self
-    }
-
-    /// Set the CUDA graph configuration for decode acceleration.
-    pub fn cuda_graph_config(mut self, config: CudaGraphConfig) -> Self {
-        self.config.cuda_graph_config = Some(config);
         self
     }
 

@@ -2,8 +2,8 @@
 //! Hashable view of an [`Instruction`] for backbone introspection
 //! (`scr model info`).
 //!
-//! `Instruction` lives behind `cfg(feature = "cuda")`. None of that
-//! is useful when the consumer wants to:
+//! `Instruction<W>` is generic over the weights type and carries live
+//! weight references. None of that is useful when the consumer wants to:
 //! - tell two backbones apart for fusion-hunting
 //! - hash a backbone for equivalence-class grouping
 //! - print a backbone as ASCII without needing a live `&Weights`
@@ -174,12 +174,6 @@ impl InstructionInfo for Instruction {
             }
             Instruction::Add(delta_slot, residual_slot) => {
                 ("Add", vec![F::Slot(delta_slot), F::Slot(residual_slot)])
-            }
-            #[cfg(feature = "nccl")]
-            Instruction::AllReduce(slot) => ("AllReduce", vec![F::Slot(slot)]),
-            #[cfg(feature = "nccl")]
-            Instruction::AllGather(in_slot, out_slot) => {
-                ("AllGather", vec![F::Slot(in_slot), F::Slot(out_slot)])
             }
             Instruction::ScalarMul(in_slot, out_slot, scale) => (
                 "ScalarMul",
@@ -603,16 +597,6 @@ impl InstructionInfo for Instruction {
                     F::RopeCosSin,
                     F::ConstU32(head_dim),
                     F::ConstBool(use_logits_soft_cap),
-                ],
-            ),
-            #[cfg(fa3_built)]
-            Instruction::FlashAttention3Decode(in_slot, out_slot, layer, head_dim) => (
-                "FlashAttention3Decode",
-                vec![
-                    F::Slot(in_slot),
-                    F::Slot(out_slot),
-                    F::Layer(layer),
-                    F::ConstU32(head_dim),
                 ],
             ),
             Instruction::FlashInferAttentionPrefill(
@@ -1250,9 +1234,9 @@ impl InstructionInfo for Instruction {
                 ],
             ),
             // MLX-affine int4 family. `AffineQmm` is the metal-only
-            // quantized matmul; CUDA `eval` is `unreachable!`, but the
-            // variant is unconditional on `Instruction<W>` so info.rs
-            // must cover it under either backend. `SiluMul` is the
+            // quantized matmul; the variant is unconditional on
+            // `Instruction<W>` so info.rs must cover it under every
+            // backend. `SiluMul` is the
             // P3-P4 C4a fused activation that pairs with two
             // `AffineQmm`s on the q-MLP decomposed branch.
             Instruction::AffineQmm(
@@ -1414,11 +1398,9 @@ pub struct BucketDump {
 #[derive(Clone, Debug)]
 pub struct VariantDump {
     pub variant_stem: &'static str,
-    /// Tensor-parallel world size this variant was compiled for. At
-    /// `--features nccl` the macro emits one `VariantDump` per (model,
-    /// tp) tuple in `{1, 2, 4, 8}`; at default `--features cuda` only
-    /// tp=1 is emitted. `scr model info` displays this on each row
-    /// and includes it in its substring filter as `tp=N`.
+    /// Tensor-parallel world size this variant was compiled for (always
+    /// 1 today). `scr model info` displays this on each row and includes
+    /// it in its substring filter as `tp=N`.
     pub tp_world_size: u8,
     pub buckets: Vec<BucketDump>,
 }

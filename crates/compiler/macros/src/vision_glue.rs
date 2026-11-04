@@ -4,7 +4,7 @@
 //! For each `#[vision_forward]` variant module the macro emits, this
 //! module produces:
 //!
-//! - `impl scratchy_target_cuda::VisionArchWeights for Weights` baking
+//! - `impl crate::__gpu::VisionArchWeights for Weights` baking
 //!   the variant's [`scratchy_vision::VisionConfig`] from
 //!   `vision_*` bounds + `vision_norm_eps` scalar, forwarding
 //!   `pixel_pack` to the user-supplied free fn, and forwarding
@@ -12,10 +12,8 @@
 //! - `fn try_load_mm(...)` — d_model fingerprint (the only
 //!   per-variant geometric difference within a VL family),
 //!   patch_embed 5D-conv flatten, then `Weights::load(...)` and
-//!   wrap in `scratchy_target_cuda::VisionWrapper`.
-//! - `inventory::submit!` rows for tp ∈ {1, 2, 4, 8} (2/4/8 under
-//!   `#[cfg(feature = "nccl")]`). Vision is replicated per-rank;
-//!   the same `try_load_mm` runs at every rank.
+//!   wrap in `crate::__gpu::VisionWrapper`.
+//! - one `inventory::submit!` row at tp = 1.
 //!
 //! Net: per-arch crates carry no `MultimodalForward` impl, no
 //! `try_load_mm`, no `inventory::submit!` rows. The DSL body and a
@@ -409,52 +407,12 @@ pub fn emit_per_variant(
             try_load_mm(gw, stream, max_model_len, tp_rank, hf)
         }
 
-        // Vision is replicated per-rank — register at every tp size
-        // so the worker's `try_load_mm` finds us regardless of
-        // `tp_world_size`. Each rank loads the full `visual.*`
-        // weights independently and runs `vision_forward` to
-        // produce identical mm_embeds; the post-Embed
-        // `SpliceMmEmbeds` D2D-copies them into placeholder rows
-        // AFTER the vocab-parallel AllReduce.
         ::scratchy_forward_compiler::inventory::submit! {
             ::scratchy_forward_compiler::ScratchyMmRegistration {
                 arch_name: #arch_name_lit,
                 hf_arches: &[#(#hf_arch_lits),*],
                 gguf_archs: &[],
                 tp_world_size: 1,
-                try_load_mm: __try_load_mm_erased,
-                mm_metadata: #processor,
-            }
-        }
-        #[cfg(feature = "nccl")]
-        ::scratchy_forward_compiler::inventory::submit! {
-            ::scratchy_forward_compiler::ScratchyMmRegistration {
-                arch_name: #arch_name_lit,
-                hf_arches: &[#(#hf_arch_lits),*],
-                gguf_archs: &[],
-                tp_world_size: 2,
-                try_load_mm: __try_load_mm_erased,
-                mm_metadata: #processor,
-            }
-        }
-        #[cfg(feature = "nccl")]
-        ::scratchy_forward_compiler::inventory::submit! {
-            ::scratchy_forward_compiler::ScratchyMmRegistration {
-                arch_name: #arch_name_lit,
-                hf_arches: &[#(#hf_arch_lits),*],
-                gguf_archs: &[],
-                tp_world_size: 4,
-                try_load_mm: __try_load_mm_erased,
-                mm_metadata: #processor,
-            }
-        }
-        #[cfg(feature = "nccl")]
-        ::scratchy_forward_compiler::inventory::submit! {
-            ::scratchy_forward_compiler::ScratchyMmRegistration {
-                arch_name: #arch_name_lit,
-                hf_arches: &[#(#hf_arch_lits),*],
-                gguf_archs: &[],
-                tp_world_size: 8,
                 try_load_mm: __try_load_mm_erased,
                 mm_metadata: #processor,
             }

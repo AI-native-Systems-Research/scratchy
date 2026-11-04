@@ -30,7 +30,7 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo test --release -p vllm-e2e --features e2e,cuda \
+//! cargo test --release -p scratchy-e2e --features e2e,metal \
 //!     --test e_qwen2_vl -- --ignored --test-threads=1
 //! ```
 
@@ -207,9 +207,8 @@ async fn test_qwen2_vl_image_max_tokens() {
 // ===========================================================================
 
 /// **Bug 1 reproducer.** Single fresh-prefill MM-bearing request whose
-/// `total_tokens` lands on a captured prefill-graph size. Without the
-/// `!req_has_mm` gate in `cuda_worker.rs`, replay skips
-/// `run_mm_vision_forward` + the `Embed` splice and the decoder gets
+/// `total_tokens` lands on a captured prefill-graph size. If a replayed
+/// path skips the vision forward + the `Embed` splice and the decoder gets
 /// placeholder tokens with no visual content — producing fluent nonsense
 /// unrelated to the actual image (the original symptom: "a person on a
 /// skateboard" for a red circle).
@@ -410,123 +409,6 @@ async fn test_qwen2_vl_bug3_same_image_twice_cached_prefix() {
     );
     assert_coherent_text(second, 8);
 }
-
-// ===========================================================================
-// TP=2 tests (Phase F) — require 2 CUDA GPUs + NCCL
-// ===========================================================================
-//
-// Scratchy's text decoder macro fanout emits a TP=2 variant for Qwen2-VL-2B
-// (12 Q heads, 2 KV heads, 8960 inter — all divisible by 2). The vision
-// encoder is replicated per-rank (each rank loads the full `visual.*`
-// weights and runs `vision_forward` independently). The mm_embeds splice
-// runs post-AllReduce via `Instruction::SpliceMmEmbeds`, so at tp>1 the
-// D2D overwrite isn't summed × tp.
-//
-// Run on nick3 (2× L40S):
-//   cargo test --release -p vllm-e2e --features e2e,cuda,nccl \
-//       --test e_qwen2_vl test_cuda_tp2 -- --ignored --test-threads=1
-
-#[cfg(feature = "nccl")]
-async fn start_qwen2_vl_tp2() -> (TestServer, Client) {
-    let server = TestServer::builder(TestModels::QWEN2_VL_2B_INSTRUCT)
-        .with_tensor_parallel_size(2)
-        .start()
-        .await
-        .expect("TP=2 Qwen2-VL-2B server should start");
-    let client = Client::new(server.base_url());
-    (server, client)
-}
-
-/// Sanity: TP=2 server starts, text-only chat works. Validates the
-/// text-decoder TP fanout alone — if this fails, Phase F can't work
-/// regardless of what the MM path does.
-#[cfg(feature = "nccl")]
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn test_cuda_tp2_qwen2_vl_text_only() {
-    let (_server, client) = start_qwen2_vl_tp2().await;
-    let request = ChatCompletionRequest {
-        messages: vec![user_msg("What is the capital of France?")],
-        max_tokens: Some(32),
-        temperature: Some(0.0),
-        ..default_chat_request()
-    };
-    let resp = client.chat_completion(&request).await.unwrap();
-    assert_valid_chat_response(&resp);
-    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
-    assert_coherent_text(text, 4);
-    assert!(
-        text.to_lowercase().contains("paris"),
-        "TP=2 text-only should answer 'Paris', got: {text:?}",
-    );
-}
-
-/// TP=2 image-bearing chat (Bug 1 analog). Exercises the full
-/// Phase F pipeline: vision encoder runs replicated per-rank,
-/// mm_embeds produced identically on both ranks, post-AllReduce
-/// splice overwrites the reduced embedding at patch rows. If the
-/// splice ran pre-AllReduce the AllReduce-sum would multiply
-/// mm_embeds × 2 and the response would be fluent nonsense.
-#[cfg(feature = "nccl")]
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn test_cuda_tp2_qwen2_vl_single_image() {
-    let (_server, client) = start_qwen2_vl_tp2().await;
-    let red = load_fixture_b64("red_circle_224.png");
-    let request = ChatCompletionRequest {
-        messages: vec![user_msg_with_image(
-            "Describe this image. What color and shape do you see?",
-            &red,
-        )],
-        max_tokens: Some(48),
-        temperature: Some(0.0),
-        ..default_chat_request()
-    };
-    let resp = client.chat_completion(&request).await.unwrap();
-    assert_valid_chat_response(&resp);
-    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
-    assert_coherent_text(text, 4);
-    assert_mentions_any(text, &["red", "circle", "round"], "TP=2 / single image");
-}
-
-/// TP=2 two-distinguishable-images (Bug 2 analog). Guards against
-/// both the original per-image-hash bug AND against any TP-specific
-/// cache-key regression. Also exercises the mm_data lifecycle
-/// across two sequential requests on the same TP=2 server.
-#[cfg(feature = "nccl")]
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn test_cuda_tp2_qwen2_vl_two_images() {
-    let (_server, client) = start_qwen2_vl_tp2().await;
-    let red = load_fixture_b64("red_circle_224.png");
-    let blue = load_fixture_b64("blue_square_224.png");
-
-    let mk = |b64: &str| ChatCompletionRequest {
-        messages: vec![user_msg_with_image(
-            "Describe this image. What color and shape do you see?",
-            b64,
-        )],
-        max_tokens: Some(48),
-        temperature: Some(0.0),
-        ..default_chat_request()
-    };
-
-    let resp_a = client.chat_completion(&mk(&red)).await.unwrap();
-    let text_a = resp_a.choices[0].message.content.as_deref().unwrap_or("");
-    assert_coherent_text(text_a, 4);
-    assert_mentions_any(text_a, &["red", "circle", "round"], "TP=2 / image A");
-
-    let resp_b = client.chat_completion(&mk(&blue)).await.unwrap();
-    let text_b = resp_b.choices[0].message.content.as_deref().unwrap_or("");
-    assert_coherent_text(text_b, 4);
-    assert_mentions_any(
-        text_b,
-        &["blue", "square", "rectangle"],
-        "TP=2 / image B (would describe red circle if KV was reused)",
-    );
-}
-
-// ===========================================================================
 
 /// Text-only chat after an image-bearing chat on the same server. Guards
 /// against MM-specific code paths bleeding into the text path

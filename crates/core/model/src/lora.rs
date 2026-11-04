@@ -2,8 +2,8 @@
 //! LoRA (Low-Rank Adaptation) adapter config parsing.
 //!
 //! Supports parsing PEFT-format adapter_config.json.
-//! Actual weight loading is backend-specific (today: `scratchy-serving-cuda`
-//! only; the metal path through `MetalWorker` doesn't yet wire LoRA).
+//! Actual weight loading is backend-specific; no backend wires LoRA today
+//! (the metal path through `MetalWorker` doesn't yet).
 
 use std::path::Path;
 

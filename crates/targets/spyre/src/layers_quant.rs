@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Spyre (host) quantized-linear LOADER surface — the `-Fspyre` peer of
-//! `crates/targets/cuda/src/layers_quant.rs`.
+//! Spyre (host) quantized-linear LOADER surface.
 //!
 //! The payload TYPES (`MarlinLinear` / `Bnb4bitLinear` / `Fp8Linear` /
 //! `Fp8BlockLinear`) are NEUTRAL — they live in `scratchy-layers` and hold
 //! `GpuTensor` handles that, under `-Fspyre`, wrap host pointers behind
 //! [`crate::SpyreAllocator`]. An inherent `impl <Type>` here would be an
 //! orphan (E0116), so the `GpuWeights`-bound loaders are extension trait
-//! methods on the neutral types — exactly the shape cuda uses (`MarlinLoadOps`
-//! / `Fp8LoadOps` / `Fp8BlockLoadOps` / `Bnb4bitLoadOps`), with byte-identical
-//! method names and signatures so the `#[forward]` macro's shared
+//! methods on the neutral types (`MarlinLoadOps` / `Fp8LoadOps` /
+//! `Fp8BlockLoadOps` / `Bnb4bitLoadOps`), with method names and signatures
+//! matching the macro's emitted calls so the `#[forward]` macro's shared
 //! `Weights::load` body type-checks under spyre with no special-casing.
 //!
 //! Spyre is a host fp16 backend that loads weights allocator-generically
@@ -23,9 +22,8 @@
 //! a precise "not yet implemented" message rather than a compile error.
 //!
 //! The on-disk quant-format SPEC types (`MarlinFormat` / `GptqLayout`) and the
-//! BNB code tables (`NF4_CODE` / `FP4_CODE`) are NOT in `scratchy-layers` (they
-//! were cuda-local), and spyre may not depend on `targets/cuda`, so they are
-//! re-defined here verbatim — the macro names them by path
+//! BNB code tables (`NF4_CODE` / `FP4_CODE`) are NOT in `scratchy-layers`, so
+//! they are defined here — the macro names them by path
 //! (`crate::__gpu::layers_quant::MarlinFormat`, `::GptqLayout`, `::NF4_CODE`,
 //! `::upload_bnb_code`, …), so they must resolve in THIS module.
 
@@ -54,8 +52,7 @@ impl AffineQuantEmbeddingOps for AffineQuantEmbedding {
 }
 
 // ---------------------------------------------------------------------------
-// Quant-format spec types (mirrored from targets/cuda — spyre can't depend on
-// targets/cuda, and these aren't in the neutral scratchy-layers leaf).
+// Quant-format spec types (not in the neutral scratchy-layers leaf).
 // ---------------------------------------------------------------------------
 
 /// GPTQ on-disk layout passed by `#[forward]`-emitted `Weights::load` bodies
@@ -64,7 +61,6 @@ impl AffineQuantEmbeddingOps for AffineQuantEmbedding {
 /// Both variants would end up at the same repack with the same `[K/8, N]`
 /// uint4b8 packed weight; the layout only selects which tensor names the
 /// loader reads (and whether it transposes the bytes on the CPU first).
-/// Mirror of `scratchy_target_cuda::layers_quant::GptqLayout`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GptqLayout {
     /// AutoGPTQ native: `.qweight [K/8, N]`, `.scales [num_groups, N]`,
@@ -78,7 +74,6 @@ pub enum GptqLayout {
 /// Unified runtime quant-format spec. The macro threads the variant's knobs
 /// through a single [`MarlinLinear::load`] / [`MarlinLinear::load_concat`] call
 /// per accessor, with `MarlinFormat` as the only per-variant difference.
-/// Mirror of `scratchy_target_cuda::layers_quant::MarlinFormat`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarlinFormat {
     /// AutoAWQ 4-bit — `.qweight [K, N/8]` + `.qzeros` + `.scales`.
@@ -93,16 +88,15 @@ pub enum MarlinFormat {
 }
 
 // ---------------------------------------------------------------------------
-// Marlin workspace (host stub — Marlin's barrier-lock buffer is a CUDA notion;
-// Spyre has no such kernel yet, so allocating one is a clean runtime error).
+// Marlin workspace (host stub — Marlin's barrier-lock buffer belongs to a GPU
+// kernel; Spyre has no such kernel yet, so allocating one is a clean runtime error).
 // ---------------------------------------------------------------------------
 
 /// Allocate the shared Marlin workspace buffer. On the Spyre host backend
 /// there is no Marlin GEMM kernel yet, so this is a recoverable error — the
 /// `marlin_prelude` that calls it is only ever emitted for a quantized model,
-/// which Spyre doesn't load. Signature mirrors
-/// `scratchy_target_cuda::layers_quant::alloc_marlin_workspace`
-/// (`stream` is `LoadStream` = `()` host under `-Fspyre`).
+/// which Spyre doesn't load. `stream` is `LoadStream` = `()` host under
+/// `-Fspyre`.
 pub fn alloc_marlin_workspace(_num_sm: i32, _stream: LoadStream) -> Result<GpuTensor> {
     anyhow::bail!("scratchy-target-spyre: alloc_marlin_workspace not yet implemented")
 }
@@ -112,8 +106,7 @@ pub fn alloc_marlin_workspace(_num_sm: i32, _stream: LoadStream) -> Result<GpuTe
 // ---------------------------------------------------------------------------
 
 /// AWQ/GPTQ/CT → Marlin loaders on [`MarlinLinear`]. Method names + signatures
-/// match `scratchy_target_cuda::layers_quant::MarlinLoadOps` exactly so the
-/// macro's emitted `MarlinLinear::load(...)` / `load_concat(...)` calls resolve.
+/// match what the macro emits, so its `MarlinLinear::load(...)` / `load_concat(...)` calls resolve.
 pub trait MarlinLoadOps {
     fn load(
         weights: &mut GpuWeights,
@@ -254,7 +247,7 @@ impl MarlinLoadOps for MarlinLinear {
 // ---------------------------------------------------------------------------
 
 /// FP8 (per-tensor / per-channel) loaders on [`Fp8Linear`]. Method names +
-/// signatures match `scratchy_target_cuda::layers_quant::Fp8LoadOps`.
+/// signatures match the macro's emitted calls.
 pub trait Fp8LoadOps {
     fn load(weights: &mut GpuWeights, prefix: &str, output_dtype: DType) -> Result<Self>
     where
@@ -330,7 +323,7 @@ impl Fp8LoadOps for Fp8Linear {
 // ---------------------------------------------------------------------------
 
 /// FP8 block-scaled loaders on [`Fp8BlockLinear`]. Method names + signatures
-/// match `scratchy_target_cuda::layers_quant::Fp8BlockLoadOps`.
+/// match the macro's emitted calls.
 pub trait Fp8BlockLoadOps {
     fn load(weights: &mut GpuWeights, prefix: &str, output_dtype: DType) -> Result<Self>
     where
@@ -364,7 +357,6 @@ impl Fp8BlockLoadOps for Fp8BlockLinear {
 
 /// BNB 4-bit packing type. Selects the 16-entry lookup table the dequant
 /// kernel consults — `NF4` (quantiles of N(0,1)) or `FP4` (E2M1 float values).
-/// Mirror of `scratchy_target_cuda::layers_quant::BnbQuantType`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BnbQuantType {
     NF4,
@@ -372,7 +364,7 @@ pub enum BnbQuantType {
 }
 
 /// NF4 code table — 16 quantiles of the standard normal distribution, rescaled
-/// to `[-1, 1]`. Straight from bitsandbytes; fixed forever. Mirror of cuda's.
+/// to `[-1, 1]`. Straight from bitsandbytes; fixed forever.
 #[allow(clippy::excessive_precision)]
 pub const NF4_CODE: [f32; 16] = [
     -1.0,
@@ -393,7 +385,7 @@ pub const NF4_CODE: [f32; 16] = [
     1.0,
 ];
 
-/// FP4 code table — E2M1 floats used by bitsandbytes FP4 quant. Mirror of cuda's.
+/// FP4 code table — E2M1 floats used by bitsandbytes FP4 quant.
 pub const FP4_CODE: [f32; 16] = [
     0.0, 0.0625, 8.0, 12.0, 4.0, 6.0, 2.0, 3.0, -0.0, -0.0625, -8.0, -12.0, -4.0, -6.0, -2.0, -3.0,
 ];
@@ -401,16 +393,14 @@ pub const FP4_CODE: [f32; 16] = [
 /// Upload the 16-entry NF4/FP4 lookup table. On the Spyre host backend there
 /// is no BNB dequant kernel yet, so this is a recoverable error — the
 /// `bnb4_prelude` that calls it is only emitted for a BNB-quantized model,
-/// which Spyre doesn't load. Signature mirrors
-/// `scratchy_target_cuda::layers_quant::upload_bnb_code` (`stream` is
-/// `LoadStream` = `()` host under `-Fspyre`).
+/// which Spyre doesn't load. `stream` is `LoadStream` = `()` host under
+/// `-Fspyre`.
 pub fn upload_bnb_code(_code: &[f32; 16], _stream: LoadStream) -> Result<GpuTensor> {
     anyhow::bail!("scratchy-target-spyre: upload_bnb_code not yet implemented")
 }
 
 /// Allocate the per-model shared BNB dequant scratch buffer. Recoverable error
-/// on Spyre (no BNB dequant kernel yet). Signature mirrors
-/// `scratchy_target_cuda::layers_quant::alloc_bnb_dequant_scratch`.
+/// on Spyre (no BNB dequant kernel yet).
 pub fn alloc_bnb_dequant_scratch(
     _max_elements: usize,
     _dtype: DType,
@@ -420,7 +410,7 @@ pub fn alloc_bnb_dequant_scratch(
 }
 
 /// BitsAndBytes 4-bit loaders on [`Bnb4bitLinear`]. Method names + signatures
-/// match `scratchy_target_cuda::layers_quant::Bnb4bitLoadOps`.
+/// match the macro's emitted calls.
 pub trait Bnb4bitLoadOps {
     #[allow(clippy::too_many_arguments)]
     fn load(

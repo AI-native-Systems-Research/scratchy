@@ -36,8 +36,8 @@ use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 /// and the build fails at `add_request_hybrid` until the new field is supplied. Forgetting the swap or
 /// the pop is no longer expressible.
 ///
-/// ⭐ The Struct-of-Arrays LAYOUT IS PRESERVED DELIBERATELY: `fast_path_info` hands the cuda graph path
-/// `&[Vec<usize>]` and `&[usize]` directly, which an array-of-structs cannot do without allocating on
+/// ⭐ The Struct-of-Arrays LAYOUT IS PRESERVED DELIBERATELY: `fast_path_info` hands a replay over every
+/// slot `&[Vec<usize>]` and `&[usize]` directly, which an array-of-structs cannot do without allocating on
 /// the decode hot path. The guard is about the motions, not the layout.
 macro_rules! per_slot_fields {
     // `$(#[$m:meta])*` and not `#[doc = $d:expr]`: a two-line doc comment is TWO `#[doc]` attributes,
@@ -85,8 +85,7 @@ per_slot_fields! {
     req_ids: String,
     /// How many of this request's tokens are in the KV block pool. Every step
     /// [`InputBatch::prepare_inputs`] builds sets it to the scheduler's `num_computed_tokens`, and
-    /// [`InputBatch::commit_step`] advances it past the step — what the cuda graph fast path and spyre
-    /// read in between.
+    /// [`InputBatch::commit_step`] advances it past the step — what spyre reads in between.
     tokens_in_pool: usize,
     /// Block table (full/global KV-cache group block ids), REPLACED wholesale each step.
     block_tables: Vec<usize>,
@@ -1192,7 +1191,7 @@ mod tests {
     }
 
     /// Rows come out in SLOT order, whatever order the scheduler listed them in — the order a replay
-    /// over every slot (the cuda graph fast path) assumes.
+    /// over every slot assumes.
     #[test]
     fn rows_are_in_slot_order() {
         let mut batch = InputBatch::new();

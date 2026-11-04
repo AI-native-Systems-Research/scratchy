@@ -5,9 +5,8 @@
 //! `SchedulerOutput` to all remote follower nodes via TCP before each
 //! forward step.
 //!
-//! TCP is used for the control plane (scheduler output broadcast).
-//! NCCL is used only for the data plane (model forward-pass collectives).
-//! This matches Python vLLM's `mp` backend architecture.
+//! TCP carries the control plane (scheduler output broadcast). This matches
+//! Python vLLM's `mp` backend architecture.
 
 use anyhow::Context;
 use scratchy_serving_engine::error::{EngineError, EngineResult};
@@ -30,7 +29,7 @@ pub enum ControlMessage {
         num_gpu_blocks: usize,
         num_cpu_blocks: usize,
     },
-    /// Warm up / compile the model (CUDA graph capture).
+    /// Warm up / compile the model.
     Warmup,
     /// Shut down the remote worker loop.
     Shutdown,
@@ -63,9 +62,7 @@ impl ControlMessage {
 /// Wraps a local executor and broadcasts scheduler outputs to all remote
 /// follower nodes via TCP before each local `execute_model` call.
 ///
-/// The TCP control channel carries serialized `ControlMessage`s. NCCL
-/// collectives in the model forward pass synchronize the actual tensor
-/// data between ranks.
+/// The TCP control channel carries serialized `ControlMessage`s.
 pub struct MultiNodeExecutor {
     inner: Box<dyn Executor>,
     channel: TcpControlChannel,
@@ -91,7 +88,7 @@ impl Executor for MultiNodeExecutor {
         // Broadcast to all followers so they start their forward pass.
         let msg = ControlMessage::ExecuteModel(Box::new(scheduler_output.clone()));
         self.broadcast_msg(&msg)?;
-        // Execute locally — NCCL collectives in the model synchronize ranks.
+        // Execute locally.
         self.inner.execute_model(scheduler_output)
     }
 

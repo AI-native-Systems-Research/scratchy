@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Backend-neutral GPU memory-budget + prefill-bucket helpers.
 //!
-//! Pure index/arithmetic logic shared by the CUDA and Metal `Worker`
-//! implementations. Lives in `scratchy-serving-engine` (which neither the CUDA
-//! runtime nor the worker crate cycle through) so both backends can reach it
-//! without a dependency cycle.
+//! Pure index/arithmetic logic shared by the `Worker` implementations. Lives
+//! in `scratchy-serving-engine` (which the worker crate does not cycle
+//! through) so every backend can reach it without a dependency cycle.
 
 use scratchy_core_config::SchedulerConfig;
 
@@ -14,7 +13,7 @@ use scratchy_core_config::SchedulerConfig;
 /// LAST resort: a backend that knows its own batched-decode width answers
 /// first ([`Worker::max_num_seqs_override`]), and the device-tier table
 /// ([`SchedulerConfig::batch_defaults`]) answers before this on backends
-/// whose ladders track `max_num_seqs` (cuda/metal).
+/// whose ladders track `max_num_seqs` (metal).
 ///
 /// [`Worker::max_num_seqs_override`]: crate::worker::Worker::max_num_seqs_override
 pub const BASE_MAX_NUM_SEQS: usize = SchedulerConfig::DEFAULT_MAX_NUM_SEQS;
@@ -29,8 +28,7 @@ pub const KV_FLOOR_BYTES: usize = 1 << 30;
 /// Everything the shared unset-`--max-num-seqs` resolver needs. A backend
 /// builds this at the END of `load_model` (weights resident, the model's
 /// GDN config answerable) and nothing else — the resolver is backend-neutral
-/// arithmetic, so metal and cuda can never drift into near-copies of each
-/// other again.
+/// arithmetic, so backends can never drift into near-copies of each other.
 #[derive(Debug, Clone)]
 pub struct MaxNumSeqsFacts {
     /// Device total memory + name, when the backend can query them — feeds
@@ -47,7 +45,7 @@ pub struct MaxNumSeqsFacts {
     /// TIER half of the resolution) — the tier answer then survives as-is.
     pub device_budget_bytes: Option<usize>,
     /// What this process already holds at the end of `load_model` (metal:
-    /// `currentAllocatedSize`; cuda: `total − free` from `mem_get_info`).
+    /// `currentAllocatedSize`).
     pub allocated_bytes: usize,
     /// Peak activation estimate the OOM guard's flag-hint path uses — the
     /// prefill-bucket arena (or full-ladder peak), rung scratch, and the
@@ -182,8 +180,6 @@ pub fn resolve_served_context(
 ///   requested = total_memory * gpu_memory_utilization
 ///   non_kv_cache = weights_and_overhead + peak_activations + 150 MiB
 ///   available_kv_bytes = requested - non_kv_cache
-///
-/// This is the exact logic used in `CudaWorker::determine_available_memory`.
 pub fn compute_available_kv_bytes(
     total_memory: usize,
     weights_and_overhead: usize,
@@ -204,7 +200,7 @@ pub struct PrefillBucketSelection {
     /// `max_num_batched_tokens` to it so a single forward never exceeds it.
     pub max_bucket_m: u32,
     /// Activation footprint of the selected bucket (the cost actually paid):
-    /// on Metal the colored arena bytes, on CUDA the capture working set.
+    /// on Metal the colored arena bytes.
     pub arena_bytes: u64,
     /// Bytes left for the KV cache after the fixed allocations and the
     /// selected activation footprint.
@@ -216,7 +212,7 @@ pub struct PrefillBucketSelection {
 /// candidate ladder for every backend; each backend supplies its own
 /// per-bucket activation cost (`bucket_costs`, `(bucket_m, bytes)`) and applies
 /// the result to its own mechanism (Metal: the pre-reserved colored arena that
-/// trades off against KV; CUDA: which graph shapes to capture). The policy:
+/// trades off against KV). The policy:
 /// the activation footprint may use up to `arena_fraction` of the headroom left
 /// after the fixed (weights + recurrent-state reserve + redundancy)
 /// allocations; the KV cache gets the rest. The smallest bucket is always kept

@@ -40,7 +40,7 @@ pub(crate) fn solo_step_is_decode(
 }
 
 /// CONTINUOUS BATCHING (#45) execute_model for the sendnn PAGED session. Consumes
-/// the scheduler's batched `SchedulerOutput` like the cuda/metal gpu_worker:
+/// the scheduler's batched `SchedulerOutput` like the metal gpu_worker:
 ///   • PREFILL (scheduled_new_reqs + cached chunks with n>1): each request's chunk
 ///     runs as its OWN multi-row `predict_perrow` over THAT request's scheduler
 ///     blocks (rows = consecutive prompt positions, causal self-attention).
@@ -146,7 +146,7 @@ impl Worker for SpyreWorker {
 
     /// 🛑 THE DECODE READS ONE BLOCK TABLE, SO HYBRID SWA KV MUST STAY OFF — the trait's own
     /// contract (`worker.rs`: "a worker whose decode reads a single block table ... must run on
-    /// the uniform single-pool layout"). CUDA overrides this for the same reason.
+    /// the uniform single-pool layout").
     ///
     /// ⛔⭐⭐ THE GEMMA-4-12B fp8 GARBAGE-OUTPUT DEFECT, FOUND (2026-10-05). `SpyreWorker`
     /// inherited the trait default `true`, so the engine handed gemma-4 the HYBRID scheduler
@@ -251,7 +251,7 @@ impl Worker for SpyreWorker {
     }
 
     /// THE WIDEST CONCURRENCY ONE DECODE LAUNCH CAN EXPRESS — the widest baked decode rung. A CAP, not a
-    /// refusal (cuda's rule): a capped run stays on the batched path, where without the cap the
+    /// refusal: a capped run stays on the batched path, where without the cap the
     /// scheduler admits past the ladder and the step refuses.
     fn max_num_seqs_override(&self) -> Option<usize> {
         #[cfg(feature = "spyre-hw")]
@@ -390,7 +390,7 @@ impl Worker for SpyreWorker {
                 .map_or(&[], |g| g.as_slice());
             let resumed = cr.resumed_req_ids.contains(id);
             // ⭐ INTO THE ONE STORE, REPLACING. `InputBatch::update_blocks` is the backend-neutral
-            // per-request block table cuda and metal already use, and its own doc carries the rule: the
+            // per-request block table metal already uses, and its own doc carries the rule: the
             // scheduler ships the FULL table every step, so this REPLACES rather than appends. That is
             // also exactly what a RESUMED request needs — its old blocks were freed and re-allocated.
             if !ids.is_empty() {

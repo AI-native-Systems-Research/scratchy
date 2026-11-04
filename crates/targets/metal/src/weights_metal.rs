@@ -53,17 +53,13 @@ impl MetalWeightsExt for GpuWeights<crate::MetalAllocator> {
         name: &str,
         dst: *mut u8,
     ) -> Result<(usize, Vec<usize>, DType)> {
-        // Metal has no precast pipeline, so this is always the host path.
-        let (ptr, size_bytes, dtype, shape) = match self.take_upload_src(name)? {
-            UploadSrc::Host {
-                ptr,
-                bytes,
-                dtype,
-                shape,
-                ..
-            } => (ptr, bytes, dtype, shape),
-            _ => unreachable!("metal take_upload_src is always Host (no precast)"),
-        };
+        let UploadSrc {
+            ptr,
+            bytes: size_bytes,
+            dtype,
+            shape,
+            ..
+        } = self.take_upload_src(name)?;
         // Parallel memcpy via rayon — saturates Apple Silicon system bandwidth
         // (~3x vs a single-threaded copy on the gate_up pack hot path).
         // SAFETY: `ptr`/`dst` are valid for `size_bytes`; chunks are

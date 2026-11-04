@@ -33,7 +33,7 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 
-# Large directories (but keep third_party - needed for build)
+# Large directories
 .claude/
 deeptools/
 

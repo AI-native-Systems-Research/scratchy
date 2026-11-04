@@ -55,7 +55,7 @@ pub struct BenchLatencyArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL", value_delimiter = ',')]
     pub models: Vec<String>,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
+    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -143,15 +143,6 @@ pub struct BenchLatencyArgs {
     #[arg(long)]
     pub output_json: Option<String>,
 
-    /// Disable CUDA graphs and run all steps eagerly.
-    /// Default: false (CUDA graphs enabled on CUDA devices).
-    #[arg(long)]
-    pub enforce_eager: bool,
-
-    /// Comma-separated list of batch sizes to capture as CUDA graphs.
-    #[arg(long, default_value = "auto")]
-    pub cuda_graph_sizes: String,
-
     /// Sampling temperature (0 = greedy, >0 = random sampling).
     #[arg(long, default_value_t = 1.0)]
     pub temperature: f64,
@@ -197,7 +188,7 @@ pub struct BenchThroughputArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
+    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -268,14 +259,6 @@ pub struct BenchThroughputArgs {
     /// Do not detokenize responses.
     #[arg(long)]
     pub disable_detokenize: bool,
-
-    /// Disable CUDA graphs and run all steps eagerly.
-    #[arg(long)]
-    pub enforce_eager: bool,
-
-    /// Comma-separated list of batch sizes to capture as CUDA graphs.
-    #[arg(long, default_value = "auto")]
-    pub cuda_graph_sizes: String,
 
     /// Disable prefix caching.
     #[arg(long)]
@@ -642,7 +625,7 @@ pub struct BenchStartupArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    /// Device: "cpu", "metal", "spyre", or "auto".
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -705,14 +688,6 @@ pub struct BenchStartupArgs {
     /// Path to write JSON results.
     #[arg(long)]
     pub output_json: Option<String>,
-
-    /// Disable CUDA graphs and run all steps eagerly.
-    #[arg(long)]
-    pub enforce_eager: bool,
-
-    /// Comma-separated list of batch sizes to capture as CUDA graphs.
-    #[arg(long, default_value = "auto")]
-    pub cuda_graph_sizes: String,
 
     #[command(flatten)]
     pub exec_opts: crate::startup_exec::args::ExecArgs,
@@ -845,7 +820,7 @@ pub struct BenchSpansArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    /// Device: "cpu", "metal", "spyre", or "auto".
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -898,10 +873,6 @@ pub struct BenchSpansArgs {
     #[arg(long)]
     pub gguf_file: Option<String>,
 
-    /// Disable CUDA graphs (use eager mode).
-    #[arg(long)]
-    pub enforce_eager: bool,
-
     /// Log level.
     #[arg(long, default_value = "warn")]
     pub log_level: String,
@@ -949,7 +920,7 @@ pub struct BenchNiahArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    /// Device: "cpu", "metal", "spyre", or "auto".
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -997,10 +968,6 @@ pub struct BenchNiahArgs {
     #[arg(long)]
     pub gguf_file: Option<String>,
 
-    /// Disable CUDA graphs and run all steps eagerly.
-    #[arg(long)]
-    pub enforce_eager: bool,
-
     /// Log level.
     #[arg(long, default_value = "warn")]
     pub log_level: String,
@@ -1040,7 +1007,7 @@ pub struct BenchRulerArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    /// Device: "cpu", "metal", "spyre", or "auto".
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -1114,10 +1081,6 @@ pub struct BenchRulerArgs {
     #[arg(long)]
     pub gguf_file: Option<String>,
 
-    /// Disable CUDA graphs and run all steps eagerly.
-    #[arg(long)]
-    pub enforce_eager: bool,
-
     /// Log level.
     #[arg(long, default_value = "warn")]
     pub log_level: String,
@@ -1170,7 +1133,7 @@ pub struct BenchRagcsvArgs {
     #[arg(long)]
     pub grading_model: Option<String>,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    /// Device: "cpu", "metal", "spyre", or "auto".
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -1213,10 +1176,6 @@ pub struct BenchRagcsvArgs {
     /// Specific GGUF filename to download from a HuggingFace repo.
     #[arg(long)]
     pub gguf_file: Option<String>,
-
-    /// Disable CUDA graphs and run all steps eagerly.
-    #[arg(long)]
-    pub enforce_eager: bool,
 
     /// Log level.
     #[arg(long, default_value = "warn")]
@@ -1261,7 +1220,7 @@ pub struct BenchMultihopArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    /// Device: "cpu", "metal", "spyre", or "auto".
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -1304,10 +1263,6 @@ pub struct BenchMultihopArgs {
     /// Specific GGUF filename to download from a HuggingFace repo.
     #[arg(long)]
     pub gguf_file: Option<String>,
-
-    /// Disable CUDA graphs and run all steps eagerly.
-    #[arg(long)]
-    pub enforce_eager: bool,
 
     /// Log level.
     #[arg(long, default_value = "warn")]
@@ -1352,7 +1307,7 @@ pub struct BenchMusiqueArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    /// Device: "cpu", "metal", "spyre", or "auto".
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -1395,10 +1350,6 @@ pub struct BenchMusiqueArgs {
     /// Specific GGUF filename to download from a HuggingFace repo.
     #[arg(long)]
     pub gguf_file: Option<String>,
-
-    /// Disable CUDA graphs and run all steps eagerly.
-    #[arg(long)]
-    pub enforce_eager: bool,
 
     /// Log level.
     #[arg(long, default_value = "warn")]
@@ -1444,7 +1395,7 @@ pub struct BenchHotpotqaArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    /// Device: "cpu", "metal", "spyre", or "auto".
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -1487,10 +1438,6 @@ pub struct BenchHotpotqaArgs {
     /// Specific GGUF filename to download from a HuggingFace repo.
     #[arg(long)]
     pub gguf_file: Option<String>,
-
-    /// Disable CUDA graphs and run all steps eagerly.
-    #[arg(long)]
-    pub enforce_eager: bool,
 
     /// Log level.
     #[arg(long, default_value = "warn")]
@@ -1535,7 +1482,7 @@ pub struct BenchMsmarcoArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    /// Device: "cpu", "metal", "spyre", or "auto".
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -1578,10 +1525,6 @@ pub struct BenchMsmarcoArgs {
     /// Specific GGUF filename to download from a HuggingFace repo.
     #[arg(long)]
     pub gguf_file: Option<String>,
-
-    /// Disable CUDA graphs and run all steps eagerly.
-    #[arg(long)]
-    pub enforce_eager: bool,
 
     /// Log level.
     #[arg(long, default_value = "warn")]
@@ -1626,7 +1569,7 @@ pub struct BenchLongbenchArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    /// Device: "cpu", "metal", "spyre", or "auto".
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -1674,10 +1617,6 @@ pub struct BenchLongbenchArgs {
     /// Specific GGUF filename to download from a HuggingFace repo.
     #[arg(long)]
     pub gguf_file: Option<String>,
-
-    /// Disable CUDA graphs and run all steps eagerly.
-    #[arg(long)]
-    pub enforce_eager: bool,
 
     /// Disable prefix caching (for debugging).
     #[arg(long)]

@@ -10,7 +10,7 @@
 //! own `configs/<name>/`, and writes the emitted modules to
 //! `$OUT_DIR/<mod>.rs`, which `src/lib.rs` wraps in `pub mod <mod>` and
 //! `include!`s. The pipeline lib is a build-dependency; the backend feature
-//! (metal/cuda/…) is forwarded onto it so the emit matches what we then compile.
+//! (metal/spyre/…) is forwarded onto it so the emit matches what we then compile.
 use proc_macro2::{Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 use rayon::prelude::*;
 use scratchy_forward_compiler_macro::{compile_carrier, parse_python_file, render_tokens};
@@ -288,7 +288,6 @@ fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     for name in [
-        "SCRATCHY_GPU",
         // Spyre/KTIR bundle knobs read at emit time by `dump_wavefront_mega`:
         // they bake the decode row count and prefill width into the embedded KTIR
         // bundle, so a change must re-run this build script (which regenerates the

@@ -17,9 +17,8 @@
 - **Per-target surface = opcode lowering only.** A new arch touches
   metal/spyre only if it introduces a new opcode, and then only one emitter
   arm per target plus one registry row.
-- **No instruction selection** for spyre or metal — the tape comes straight
-  from the fused forward. ISel (`solver`, `cost`, the `impl Implementation`
-  blocks) is cuda-gated and stays that way.
+- **No instruction selection** — the tape comes straight from the fused
+  forward.
 - No new env-var behavior toggles; no `#[allow]`; no weakening tests
   ([`docs/TESTING.md`](docs/TESTING.md) says which tests stay tests, and what weakening one means).
 
@@ -45,7 +44,7 @@ every quant preset gets its own `<preset>` feature (`quant/<preset>`,
 
 ## Build
 ```bash
-# The CLI you run. Pick ONE backend: metal (macOS) or cuda. Add serve for HTTP.
+# The CLI you run. Pick ONE backend: metal (macOS) or spyre. Add serve for HTTP.
 # Name at least one model — this fails loudly (build-time panic) otherwise.
 cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
 ```
@@ -60,7 +59,7 @@ cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
   `-Fquant/<preset>` only if the change is quant-specific. Never build
   `model/<arch>` or `model/all` just to test one thing — that forward-expands
   every config in scope (minutes-to-hours, OOM risk on a laptop).
-- `cuda` and `metal` are mutually exclusive.
+- `metal` and `spyre` are mutually exclusive.
 - Multimodal (vision arches + the `image`/`scratchy-vision` decode stack) is
   opt-in via the `multimodal` feature on `scratchy-cli` (on by default
   there) — a plain `chat`-only build never compiles image/png/zune-jpeg/etc.
@@ -69,33 +68,30 @@ cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
   HTTP server, i.e. the `serve` feature + `scr serve ... --kv-cache-dtype ...`).
 
 ## Verify like CI before opening a build / deps / codegen PR
-`.github/workflows/rust.yml`: the **linux-cuda** job runs
-`cargo clippy --workspace --features cuda,scratchy-models/all,scratchy-models/mtp
+`.github/workflows/rust.yml`: the **linux-workspace** job runs
+`cargo clippy --workspace --features spyre,scratchy-models/granite-3.1-8b-instruct
 --exclude scratchy-target-metal --exclude scratchy-target-metal-compiler
--- -D warnings` (both depend unconditionally on Apple-only `objc2` — the
+-- -D warnings` with `SCRATCHY_SKIP_SENDNN_CXX=1` (the runner has no Spyre SDK;
+check/clippy don't link the C++ shim). Both metal crates are excluded because
+they depend unconditionally on Apple-only `objc2` — the
 compiler crate via its own edge to scratchy-target-metal — and `--workspace`
 builds every member as a root regardless of `--features`, so excluding only
 one of the two still drags `objc2` onto Linux); the **macOS** job
 runs `cargo clippy -p scratchy-models --features metal,all,mtp,turboquant -- -D warnings`
 + kernel tests (`mtp` adds the multi-token-prediction head of every model whose
 checkpoint carries one: heads have no configs of their own, so `all` alone
-compiles none). It sets `SCRATCHY_GPU=h100`, `CUDA_COMPUTE_CAP=90`,
-`SCRATCHY_SKIP_CUDA_KERNELS=1` (so `scratchy-builder-cuda`'s build script doesn't
-need a GPU/nvcc). Both `all` runs are the full-scope case —
+compiles none). The macOS `all` run is the full-scope case —
 expect it to be slow (every config, every arch) and RAM-heavy; that's expected
 CI-scale cost, not a regression.
 
-Reproduce the **x86_64** linux-cuda gate in a container (Apple Silicon runs it
-amd64-emulated — slow but faithful; a native aarch64 run is faster but not the
-CI arch):
+Reproduce the **x86_64** linux-workspace gate in a container (Apple Silicon
+runs it amd64-emulated — slow but faithful; a native aarch64 run is faster but
+not the CI arch):
 ```bash
 docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
-  -e SCRATCHY_GPU=h100 -e CUDA_COMPUTE_CAP=90 -e SCRATCHY_SKIP_CUDA_KERNELS=1 \
-  nvidia/cuda:12.9.1-devel-ubuntu22.04 bash -c '
-    apt-get update -qq && apt-get install -y -qq curl git pkg-config libssl-dev ca-certificates >/dev/null 2>&1
-    curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy >/dev/null 2>&1
-    export PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH
-    cargo clippy --workspace --features cuda,scratchy-models/all,scratchy-models/mtp \
+  -e SCRATCHY_SKIP_SENDNN_CXX=1 rust:1-bookworm bash -c '
+    rustup component add clippy >/dev/null 2>&1
+    cargo clippy --workspace --features spyre,scratchy-models/granite-3.1-8b-instruct \
       --exclude scratchy-target-metal \
       --exclude scratchy-target-metal-compiler -- -D warnings'
 ```

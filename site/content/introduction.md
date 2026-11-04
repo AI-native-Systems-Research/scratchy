@@ -13,8 +13,8 @@ pipeline at expansion time, so **everything is a constant** — complex analysis
 becomes arithmetic, and the optimizer gets enough constants to cut register
 pressure in the kernels that matter.
 
-Scratchy's initial design point is [IBM Spyre AIU], but it also supports NVIDIA
-CUDA and Apple Silicon.
+Scratchy's initial design point is [IBM Spyre AIU], but it also supports Apple
+Silicon.
 
 [IBM Spyre AIU]: https://research.ibm.com/blog/spyre-for-z
 
@@ -41,7 +41,7 @@ cargo build -F metal,model/llama-3.2-3b,quant/mlx --release
     -q "why is the sky blue?"
 ```
 
-Pick exactly one backend: `-Fmetal` (macOS), `-Fcuda` (CUDA toolkit), or
+Pick exactly one backend: `-Fmetal` (macOS) or
 `-Fspyre` (Spyre toolkit). See [Building](BUILD.md) for the full feature-scoping
 mechanics.
 

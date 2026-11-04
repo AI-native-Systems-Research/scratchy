@@ -457,7 +457,7 @@ impl SwitchGluExpertsOps for SwitchGluExpertsLayer {
             hidden_size,
             group_size,
             bits,
-            // Native INT4 (Marlin) expert path is cuda-only; metal dequants.
+            // No native INT4 (Marlin) expert path on metal; it dequants.
             marlin_w1: None,
             marlin_w2: None,
             marlin_w1_scales: None,

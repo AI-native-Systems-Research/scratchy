@@ -203,7 +203,6 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         builder = builder.gpu_memory_utilization(f);
     }
     builder = builder.tensor_parallel_size(args.tensor_parallel_size);
-    builder = builder.enforce_eager(args.enforce_eager);
     if let Some(ref tpl) = args.chat_template {
         builder = builder.chat_template(tpl.clone());
     }
