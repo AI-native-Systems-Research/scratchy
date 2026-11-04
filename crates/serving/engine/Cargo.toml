@@ -7,7 +7,6 @@ description = "Engine core loop and request lifecycle for vLLM Rust port"
 
 [features]
 default = []
-multiproc = ["scratchy-serving-transport/multiproc"]
 guided-decoding = ["dep:llguidance", "dep:serde_json", "dep:toktrie", "dep:toktrie_hf_tokenizers"]
 
 [dependencies]

@@ -15,7 +15,6 @@ guided-decoding = ["scratchy-serving-api/guided-decoding"]
 multimodal = ["scratchy-serving-api/multimodal"]
 tls = ["scratchy-serving-api/tls"]
 metrics = ["scratchy-serving-api/metrics"]
-multiproc = ["scratchy-serving-api/multiproc"]
 
 [dependencies]
 # HTTP client
