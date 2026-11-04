@@ -66,6 +66,19 @@ fn reroot_crate(ts: TokenStream, mod_name: &str) -> TokenStream {
     out.into_iter().collect()
 }
 
+/// Lossy FORWARD-only feature/env name mangle: non-alphanumeric → `_`, upper.
+fn envify(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// The quant presets enabled for one arch: its `quantizations.json`
 /// ∩ the enabled preset features (no `quant-` prefix on scratchy-quantizations,
 /// same reasoning as `<stem>` having no `model-` prefix on this crate).
