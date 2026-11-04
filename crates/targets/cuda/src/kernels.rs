@@ -75,6 +75,29 @@ unsafe extern "C" {
         gain_offset: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_add_rms_norm_bf16(
+        a: *const c_void,
+        b: *const c_void,
+        gain: *const c_void,
+        sum: *mut c_void,
+        y: *mut c_void,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_norm_add_bf16(
+        x: *const c_void,
+        gain: *const c_void,
+        residual: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_rms_norm_unit_bf16(
         x: *const c_void,
         y: *mut c_void,
@@ -723,6 +746,7 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
         scratchy_cuda_gemm_narrow_bf16_abt_prepare,
     ),
     ("gemv_bf16_abt", scratchy_cuda_gemv_bf16_abt_prepare),
+    // Every form of `rms_norm_bf16.cu`: the norm, the unit norm, and #1049's add-norm folds.
     ("rms_norm_bf16", scratchy_cuda_rms_norm_bf16_prepare),
     ("add_bf16", scratchy_cuda_add_bf16_prepare),
     ("silu_mul_bf16", scratchy_cuda_silu_mul_bf16_prepare),
@@ -927,6 +951,58 @@ pub unsafe fn rms_norm_bf16(
     // shape before it touches a pointer.
     let code =
         unsafe { scratchy_cuda_rms_norm_bf16(x, gain, y, rows, cols, eps, gain_offset, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the bf16 add and RMSNorm in one (#1049, `kernels/rms_norm_bf16.cu`'s `ADD_NORM` form):
+/// `sum = a + b`, then `y` the norm of `sum` as [`rms_norm_bf16`] computes it, both `[rows,
+/// cols]`. The bits of [`add_bf16`] then [`rms_norm_bf16`] of its output. Asynchronous; the shape
+/// rule is the row kernels'.
+///
+/// # Safety
+///
+/// `a`, `b`, `sum` and `y` must be 16-byte-aligned device pointers to at least `rows·cols` bf16
+/// elements each and `gain` to `cols`, valid for the whole kernel, with `sum` and `y` overlapping
+/// neither each other nor an input. `stream` must be a live `cudaStream_t` of the current device,
+/// or null for the default stream.
+pub unsafe fn add_rms_norm_bf16(
+    (a, b): (*const c_void, *const c_void),
+    gain: *const c_void,
+    (sum, y): (*mut c_void, *mut c_void),
+    (rows, cols): (u32, u32),
+    (eps, gain_offset): (f32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_add_rms_norm_bf16(a, b, gain, sum, y, rows, cols, eps, gain_offset, stream)
+    };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the bf16 RMSNorm and residual add in one (#1049, `kernels/rms_norm_bf16.cu`'s
+/// `NORM_ADD` form): `out = residual + bf16(norm(x))`, the norm as [`rms_norm_bf16`] computes it.
+/// The bits of [`rms_norm_bf16`] then [`add_bf16`] of its output and `residual`. Asynchronous; the
+/// shape rule is the row kernels'.
+///
+/// # Safety
+///
+/// `x`, `residual` and `out` must be 16-byte-aligned device pointers to at least `rows·cols` bf16
+/// elements each and `gain` to `cols`, valid for the whole kernel, with `out` overlapping neither
+/// input. `stream` must be a live `cudaStream_t` of the current device, or null for the default
+/// stream.
+pub unsafe fn norm_add_bf16(
+    (x, residual): (*const c_void, *const c_void),
+    gain: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    (eps, gain_offset): (f32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_norm_add_bf16(x, gain, residual, out, rows, cols, eps, gain_offset, stream)
+    };
     check(code, KernelError::RowShape { rows, cols })
 }
 

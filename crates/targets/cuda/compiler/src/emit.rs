@@ -49,8 +49,9 @@ use scratchy_subtile::handoff::{
 };
 use scratchy_target_cuda::op_abi::CUDA_GEMM_COL64_ARCHS;
 use scratchy_target_cuda::step::{
-    CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16, GemmBf16,
-    LayerScaleBf16, MoeRouteBf16, MoeWeight, RmsNormBf16, RouterLogitsBf16, gdn_conv_dim,
+    AddRmsNormBf16, CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16,
+    GemmBf16, LayerScaleBf16, MoeRouteBf16, MoeWeight, NormAddBf16, RmsNormBf16, RouterLogitsBf16,
+    gdn_conv_dim,
 };
 use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
@@ -120,6 +121,8 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "SoftCapBf16",
                 "GemmGroupBf16",
                 "GroupMember",
+                "AddRmsNormBf16",
+                "NormAddBf16",
             ],
         },
         ModuleRow {
@@ -488,9 +491,15 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             Some((b, Role::Bf16([u64::from(n), u64::from(k)], 2)))
         }
         CudaStep::RmsNorm(RmsNormBf16 { gain, cols, .. })
-        | CudaStep::RouterNorm(RmsNormBf16 { gain, cols, .. }) => {
-            Some((gain, Role::Bf16([u64::from(cols), 0], 1)))
-        }
+        | CudaStep::RouterNorm(RmsNormBf16 { gain, cols, .. })
+        | CudaStep::AddRmsNorm(AddRmsNormBf16 {
+            norm: RmsNormBf16 { gain, cols, .. },
+            ..
+        })
+        | CudaStep::NormAdd(NormAddBf16 {
+            norm: RmsNormBf16 { gain, cols, .. },
+            ..
+        }) => Some((gain, Role::Bf16([u64::from(cols), 0], 1))),
         CudaStep::LayerScale(LayerScaleBf16 { scale, .. }) => Some((scale, Role::Param([1, 0], 1))),
         CudaStep::MoeRoute(MoeRouteBf16 {
             expert_scale: Some(ix),

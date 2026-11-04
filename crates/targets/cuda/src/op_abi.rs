@@ -168,6 +168,12 @@ pub enum CudaFusion {
     /// GDN layer's `in_proj_qkv` and `in_proj_z`, or its `in_proj_a` and `in_proj_b`
     /// (`step::CudaStep::GemmGroup`, `GemmNarrowGroup`, `GemvGroup`).
     SiblingMatmuls,
+    /// A residual add and the RMSNorm reading it in one launch (#1049, Qwen's `norm(add(..))`;
+    /// `step::CudaStep::AddRmsNorm`): the sum and the norm both written.
+    AddRmsNorm,
+    /// An RMSNorm and the residual add it alone feeds in one launch (#1049, Gemma's
+    /// `add(norm(o), residual)`; `step::CudaStep::NormAdd`).
+    NormAdd,
 }
 
 /// The output widths CUDA's sibling-matmul fold groups (#1049), one band per grouped kernel: the
@@ -186,10 +192,14 @@ pub const CUDA_SIBLING_BANDS: &[ColsBand] = &[
     },
 ];
 
-/// CUDA's fusions, in the order the shared fold pass applies them: one sweep of three patterns.
+/// CUDA's fusions, in the order the shared fold pass applies them: one sweep of five patterns.
 /// Up to three dense matmuls of one band off one input fold into one grouped launch (#1049), but
 /// for a gate or up projection, which the gated row leaves its own. The `Silu` or `Gelu` a `Mul`
-/// reads as its operand 0 folds into that `Mul` (metal's `Gated` row).
+/// reads as its operand 0 folds into that `Mul` (metal's `Gated` row). An RMSNorm only an add
+/// reads folds into that add (metal's `NormAdd`), and an add folds into the first norm reading it
+/// (metal's `ResidualNorm`) when no `NormAdd` took it: the sweep meets an add before its readers,
+/// so Gemma's three norm-then-add pairs a layer take `NormAdd`, and Qwen's add-then-norm pairs
+/// `ResidualNorm` (#1049).
 /// A MoE block's top-k folds in the softmax (Qwen's softmax-first routing) and the argsort before
 /// it, and takes as its epilogues the gathered scores, Gemma's `hidden^-0.5` scale (tail stage 0),
 /// a softmax over the picks (Gemma) or their renorm (Qwen) (stage 1), and Gemma's per-expert scale
@@ -223,6 +233,16 @@ pub const CUDA_FUSIONS: FusionTable<CudaFusion> = FusionTable {
                     fused: CudaFusion::GeluMul,
                 },
             ],
+        },
+        FoldPattern::NormAdd {
+            add: SubOpKind::Add,
+            norm: SubOpKind::RmsNorm,
+            kernel: CudaFusion::NormAdd,
+        },
+        FoldPattern::ResidualNorm {
+            norm: SubOpKind::RmsNorm,
+            add: SubOpKind::Add,
+            kernel: CudaFusion::AddRmsNorm,
         },
         FoldPattern::Route {
             top_k: SubOpKind::RouteTopK,

@@ -25,17 +25,17 @@ use scratchy_subtile::tape_folding::{FusedShape, Fusion};
 use scratchy_target_cuda::op_abi::{CUDA_GROUPED_EXPERTS, CudaFusion, MOE_EXPERT_COUNTS};
 use scratchy_target_cuda::step::{
     ADD_BF16_COLS, ATTN_BF16_HEAD_DIMS, ATTN_DECODE_BF16_MAX_GROUP, ATTN_PREFILL_BF16_ROWS,
-    ATTN_WINDOW_MULTIPLE, AddBf16, AttnPrefillBf16, CudaStep, EMBED_BF16_COLS, EmbedBf16,
-    ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16,
+    ATTN_WINDOW_MULTIPLE, AddBf16, AddRmsNormBf16, AttnPrefillBf16, CudaStep, EMBED_BF16_COLS,
+    EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16,
     GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS, GATE_SPLIT_BF16_HEAD_DIM,
     GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX,
     GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_NARROW_BF16_MAX_N,
     GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16,
     GateScaleBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16, GemmGroupBf16, GroupKind,
     GroupMember, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, MoeWeight,
-    PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16,
-    RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS,
-    SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    NormAddBf16, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE,
+    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
+    SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
@@ -260,7 +260,85 @@ pub fn lower_fused(
         CudaFusion::GeluMul => gated_mul(cx, s, fusion.shape, computes).map(CudaStep::GeluMul),
         CudaFusion::MoeRoute => moe_route(cx, s, fusion.shape, computes).map(CudaStep::MoeRoute),
         CudaFusion::SiblingMatmuls => sibling_matmuls(cx, s, fusion.shape, computes),
+        CudaFusion::AddRmsNorm => add_rms_norm(cx, s, fusion.shape, computes),
+        CudaFusion::NormAdd => norm_add(cx, s, fusion.shape, computes),
     }
+}
+
+/// The `AddRmsNorm` fold (#1049): the driving `RmsNorm` and the `Add` its shape names, each
+/// lowered as the step it is on its own ([`lower_step`]), as one launch writing both. The norm
+/// must read the add's output whole: anything else is refused, never split apart.
+fn add_rms_norm(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    shape: FusedShape,
+    computes: &[TapeStep<'_>],
+) -> Result<CudaStep, CanonicalRefusal> {
+    let step = s.step;
+    let FusedShape::ResidualNorm { add: slot } = shape else {
+        return Err(CanonicalRefusal::FusionShape { step });
+    };
+    let refused = || CanonicalRefusal::FusionShape { step };
+    let add_step = absorbed_step(s, slot, computes)?;
+    let (Some(CudaStep::RmsNorm(norm)), Some(CudaStep::Add(add))) = (
+        lower_step(cx, s, computes)?,
+        lower_step(cx, add_step, computes)?,
+    ) else {
+        return Err(refused());
+    };
+    if norm.x != add.out || (norm.rows, norm.cols) != (add.rows, add.cols) {
+        return Err(refused());
+    }
+    Ok(CudaStep::AddRmsNorm(AddRmsNormBf16 {
+        a: add.a,
+        b: add.b,
+        sum: add.out,
+        norm,
+    }))
+}
+
+/// The `NormAdd` fold (#1049): the driving `Add` and the `RmsNorm` its shape names, each lowered
+/// as the step it is on its own, as one launch: the norm's output is the add's, and the add's
+/// other operand its residual. The add must read the norm's output whole.
+fn norm_add(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    shape: FusedShape,
+    computes: &[TapeStep<'_>],
+) -> Result<CudaStep, CanonicalRefusal> {
+    let step = s.step;
+    let FusedShape::NormAdd { norm: slot, .. } = shape else {
+        return Err(CanonicalRefusal::FusionShape { step });
+    };
+    let refused = || CanonicalRefusal::FusionShape { step };
+    let norm_step = absorbed_step(s, slot, computes)?;
+    let (Some(CudaStep::Add(add)), Some(CudaStep::RmsNorm(norm))) = (
+        lower_step(cx, s, computes)?,
+        lower_step(cx, norm_step, computes)?,
+    ) else {
+        return Err(refused());
+    };
+    // The add's other operand is the residual: the fold read the norm as one of the two.
+    let residual = if add.a == norm.y { add.b } else { add.a };
+    if (add.a != norm.y && add.b != norm.y) || (norm.rows, norm.cols) != (add.rows, add.cols) {
+        return Err(refused());
+    }
+    Ok(CudaStep::NormAdd(NormAddBf16 {
+        norm: RmsNormBf16 { y: add.out, ..norm },
+        residual,
+    }))
+}
+
+/// The step a fold driven at `s` absorbed, the one writing `slot`.
+fn absorbed_step<'c, 'a>(
+    s: &TapeStep<'_>,
+    slot: SlotId,
+    computes: &'c [TapeStep<'a>],
+) -> Result<&'c TapeStep<'a>, CanonicalRefusal> {
+    (computes.iter().find(|c| c.writes == slot)).ok_or(CanonicalRefusal::ProducerMissing {
+        step: s.step,
+        op: s.node.op.name(),
+    })
 }
 
 /// The `SiblingMatmuls` fold (#1049): the driving `MatmulTile` and the siblings its shape names,

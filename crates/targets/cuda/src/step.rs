@@ -128,6 +128,47 @@ pub enum CudaStep {
     /// ([`gemv_splits`]), its partials at its own place in the GEMV scratch, so its output is the
     /// bits of its own [`Self::Gemv`].
     GemvGroup(GemmGroupBf16),
+    /// `sum = a + b`, then `y = rmsnorm(sum)`, in one launch, lowered from the `AddRmsNorm` fold
+    /// of an `Elementwise(Add)` into the `RmsNorm` reading it (#1049, Qwen's residual add and the
+    /// next norm; `kernels/rms_norm_bf16.cu`, `scratchy_cuda_add_rms_norm_bf16`). Both outputs
+    /// are the bits of today's [`Self::Add`] then [`Self::RmsNorm`].
+    AddRmsNorm(AddRmsNormBf16),
+    /// `out = residual + rmsnorm(x)` in one launch, lowered from the `NormAdd` fold of an
+    /// `RmsNorm` into the `Elementwise(Add)` it alone feeds (#1049, Gemma's post-norms;
+    /// `kernels/rms_norm_bf16.cu`, `scratchy_cuda_norm_add_bf16`): the bits of today's
+    /// [`Self::RmsNorm`] then [`Self::Add`].
+    NormAdd(NormAddBf16),
+}
+
+/// `sum = a + b` (one f32 add, rounded once), then `y` the [`RmsNormBf16`] of `sum`: `a`, `b`,
+/// `sum` and `y` `[rows, cols]` arena slots, `gain` the norm's `[cols]` weight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AddRmsNormBf16 {
+    pub a: ArenaOffset,
+    pub b: ArenaOffset,
+    pub sum: ArenaOffset,
+    pub norm: RmsNormBf16,
+}
+
+impl AddRmsNormBf16 {
+    /// The add the fold absorbed.
+    pub const fn add(&self) -> AddBf16 {
+        AddBf16 {
+            a: self.a,
+            b: self.b,
+            out: self.sum,
+            rows: self.norm.rows,
+            cols: self.norm.cols,
+        }
+    }
+}
+
+/// `out = residual + bf16(`[`RmsNormBf16`]`(x))`, the sum in f32 and rounded once: `norm.y` is
+/// the add's output (the norm's own is never written), `residual` the add's other operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct NormAddBf16 {
+    pub norm: RmsNormBf16,
+    pub residual: ArenaOffset,
 }
 
 /// Which kernel a grouped GEMM groups (#1049): the step each member is on its own, and the
@@ -1356,7 +1397,9 @@ impl CudaStep {
             // scratch ([`GemmGroupBf16::gemv_scratch_before`]); [`Self::gemv_scratch`] sums them.
             | Self::GemmGroup(_)
             | Self::GemmNarrowGroup(_)
-            | Self::GemvGroup(_) => None,
+            | Self::GemvGroup(_)
+            | Self::AddRmsNorm(_)
+            | Self::NormAdd(_) => None,
         }
     }
 
@@ -1395,7 +1438,9 @@ impl CudaStep {
             | Self::GemmCol64(_)
             | Self::GemmGroup(_)
             | Self::GemmNarrowGroup(_)
-            | Self::GemvGroup(_) => None,
+            | Self::GemvGroup(_)
+            | Self::AddRmsNorm(_)
+            | Self::NormAdd(_) => None,
         }
     }
 
@@ -1432,7 +1477,9 @@ impl CudaStep {
             | Self::LayerScale(_)
             | Self::SoftCap(_)
             | Self::RouterNorm(_)
-            | Self::GemmCol64(_) => None,
+            | Self::GemmCol64(_)
+            | Self::AddRmsNorm(_)
+            | Self::NormAdd(_) => None,
         }
     }
 
@@ -1533,6 +1580,57 @@ impl CudaStep {
                 };
                 Some(StepExtents {
                     reads: [Some(span(x, xb)), None, None, None],
+                    writes: span(y, xb),
+                    second_write: None,
+                    weight: Some(WeightRead {
+                        ix: gain,
+                        bytes: gb,
+                    }),
+                    kv: None,
+                    gdn: None,
+                    in_place: false,
+                })
+            }
+            // The norm's gain and both inputs; the sum, then the norm.
+            Self::AddRmsNorm(f) => {
+                let RmsNormBf16 {
+                    gain,
+                    y,
+                    rows,
+                    cols,
+                    ..
+                } = f.norm;
+                let (Some(xb), Some(gb)) = (bf16_bytes(rows, cols), bf16_bytes(1, cols)) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [Some(span(f.a, xb)), Some(span(f.b, xb)), None, None],
+                    writes: span(f.sum, xb),
+                    second_write: Some(span(y, xb)),
+                    weight: Some(WeightRead {
+                        ix: gain,
+                        bytes: gb,
+                    }),
+                    kv: None,
+                    gdn: None,
+                    in_place: false,
+                })
+            }
+            // The norm's input and gain and the residual; the add's output, the norm's `y`.
+            Self::NormAdd(NormAddBf16 { norm, residual }) => {
+                let RmsNormBf16 {
+                    x,
+                    gain,
+                    y,
+                    rows,
+                    cols,
+                    ..
+                } = norm;
+                let (Some(xb), Some(gb)) = (bf16_bytes(rows, cols), bf16_bytes(1, cols)) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [Some(span(x, xb)), Some(span(residual, xb)), None, None],
                     writes: span(y, xb),
                     second_write: None,
                     weight: Some(WeightRead {
@@ -2116,7 +2214,15 @@ impl CudaStep {
             | Self::GemmNarrow(GemmBf16 { b, .. })
             | Self::Gemv(GemmBf16 { b, .. }) => Some(b),
             Self::RmsNorm(RmsNormBf16 { gain, .. })
-            | Self::RouterNorm(RmsNormBf16 { gain, .. }) => Some(gain),
+            | Self::RouterNorm(RmsNormBf16 { gain, .. })
+            | Self::AddRmsNorm(AddRmsNormBf16 {
+                norm: RmsNormBf16 { gain, .. },
+                ..
+            })
+            | Self::NormAdd(NormAddBf16 {
+                norm: RmsNormBf16 { gain, .. },
+                ..
+            }) => Some(gain),
             Self::LayerScale(LayerScaleBf16 { scale, .. }) => Some(scale),
             Self::MoeRoute(MoeRouteBf16 { expert_scale, .. }) => expert_scale.as_mut(),
             Self::GatedDeltaNet(GatedDeltaNetBf16 { bundle, .. }) => Some(bundle),

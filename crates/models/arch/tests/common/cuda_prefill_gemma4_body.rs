@@ -23,7 +23,7 @@ use scratchy_target_cuda::runtime::{
     KvSequence,
 };
 use scratchy_target_cuda::step::{
-    AttnPrefillBf16, CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GainConvention, GemmBf16,
+    AddRmsNormBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GainConvention, GemmBf16, NormAddBf16,
     LayerScaleBf16, MoeRouteBf16, MoeWeight, RmsNormBf16, RouterLogitsBf16, expert_bank,
 };
 use scratchy_target_cuda::tape::{ArenaSpan, CudaTape, KvClass, KvTape};
@@ -99,6 +99,14 @@ fn roles() -> Vec<Option<Role>> {
                     GainConvention::Scale => set(gain.0, Role::Gain),
                     GainConvention::OnePlusScale => {
                         panic!("weight {}: a zero-centred gain", gain.0)
+                    }
+                },
+                // #1049's add-norm folds: their norm's gain.
+                CudaStep::AddRmsNorm(AddRmsNormBf16 { norm, .. })
+                | CudaStep::NormAdd(NormAddBf16 { norm, .. }) => match norm.convention {
+                    GainConvention::Scale => set(norm.gain.0, Role::Gain),
+                    GainConvention::OnePlusScale => {
+                        panic!("weight {}: a zero-centred gain", norm.gain.0)
                     }
                 },
                 CudaStep::RouterNorm(RmsNormBf16 { gain, .. }) => set(gain.0, Role::RouterScale),
@@ -1729,6 +1737,8 @@ fn kinds(s: &CudaStep) -> (&'static str, &'static str) {
         CudaStep::GemmGroup(_) => ("GemmGroup", "GemvGroup"),
         CudaStep::GemmNarrowGroup(_) => ("GemmNarrowGroup", "GemmNarrowGroup"),
         CudaStep::GemvGroup(_) => ("GemvGroup", "GemvGroup"),
+        CudaStep::AddRmsNorm(_) => ("AddRmsNorm", "AddRmsNorm"),
+        CudaStep::NormAdd(_) => ("NormAdd", "NormAdd"),
     }
 }
 

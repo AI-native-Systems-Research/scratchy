@@ -20,6 +20,7 @@ use common::numerics::{
     soft_cap_bound, soft_cap_reference, widen,
 };
 use scratchy_target_cuda::kernels::{KernelError, add_bf16, rms_norm_bf16, silu_mul_bf16};
+use scratchy_target_cuda::kernels::{add_rms_norm_bf16, norm_add_bf16};
 use scratchy_target_cuda::kernels::{
     gelu_mul_bf16, layer_scale_bf16, rms_norm_unit_bf16, scale_bf16, soft_cap_bf16,
 };
@@ -980,4 +981,117 @@ fn gemma_pointwise_kernels_repeat_bit_identically() {
     );
     pass &= ok;
     assert!(pass, "a Gemma row kernel's repeat differs");
+}
+
+/// The two launches #1049's add-norm folds replace, run one after the other on the default stream:
+/// [`add_bf16`] of `a` and `b`, then [`rms_norm_bf16`] of the sum (`ADD_NORM`), or
+/// [`rms_norm_bf16`] of `a`, then [`add_bf16`] of its output and `b` (`NORM_ADD`). Returns the
+/// chain's two outputs: the sum (or the norm) and the norm (or the sum).
+fn run_chain(
+    device: &CudaDevice,
+    norm_first: bool,
+    (a, b, g): (&[u16], &[u16], &[u16]),
+    dims: (u32, u32),
+) -> (Vec<u16>, Vec<u16>) {
+    let up = |v: &[u16]| DeviceBuffer::upload(device, v).expect("upload");
+    let (ab, bb, gb) = (up(a), up(b), up(g));
+    let (first, second) = (output(device, a.len()), output(device, a.len()));
+    let null = std::ptr::null_mut();
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `a`, `b`, `first` and `second` hold
+    // rows·cols elements and `g` cols; each output is its own allocation; null is the default
+    // stream, so the second launch reads the first's output after it is written.
+    unsafe {
+        if norm_first {
+            rms_norm_bf16(ab.ptr(), gb.ptr(), first.ptr(), dims, EPS, SCALE, null)
+                .expect("rms_norm_bf16 launch");
+            add_bf16(first.ptr(), bb.ptr(), second.ptr(), dims, null).expect("add_bf16 launch");
+        } else {
+            add_bf16(ab.ptr(), bb.ptr(), first.ptr(), dims, null).expect("add_bf16 launch");
+            rms_norm_bf16(
+                first.ptr(),
+                gb.ptr(),
+                second.ptr(),
+                dims,
+                EPS,
+                ONE_PLUS_SCALE,
+                null,
+            )
+            .expect("rms_norm_bf16 launch");
+        }
+    }
+    (result(&first, a.len()).0, result(&second, a.len()).0)
+}
+
+/// `add_rms_norm_bf16` writes the bits of `add_bf16` then `rms_norm_bf16` (#1049), both its
+/// outputs, with each output's tail intact; and `norm_add_bf16` the bits of `rms_norm_bf16` then
+/// `add_bf16`. At one row (decode), a 16-row block, a partial row block and a partial last
+/// column tile.
+#[test]
+fn the_add_norm_folds_are_their_chains_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for (rows, cols) in [(1usize, 1024usize), (16, 2816), (7, 1000), (300, 4096)] {
+        let seed = (rows as u64) << 32 | cols as u64;
+        let a = bf16_inputs(rows * cols, 0x0FAD_0000 ^ seed);
+        let b = bf16_inputs(rows * cols, 0x0FAD_1000 ^ seed);
+        let dims = (rows as u32, cols as u32);
+        let up = |v: &[u16]| DeviceBuffer::upload(&device, v).expect("upload");
+        let null = std::ptr::null_mut();
+
+        let g = centred_gains(cols, 0x0FAD_2000 ^ seed);
+        let (sum_chain, norm_chain) = run_chain(&device, false, (&a, &b, &g), dims);
+        let (ab, bb, gb) = (up(&a), up(&b), up(&g));
+        let (sum, y) = (output(&device, a.len()), output(&device, a.len()));
+        // SAFETY: as `run_chain`'s; `sum` and `y` are two allocations.
+        unsafe {
+            add_rms_norm_bf16(
+                (ab.ptr(), bb.ptr()),
+                gb.ptr(),
+                (sum.ptr(), y.ptr()),
+                dims,
+                (EPS, ONE_PLUS_SCALE),
+                null,
+            )
+        }
+        .expect("add_rms_norm_bf16 launch");
+        let ((sum, sum_tail), (y, y_tail)) = (result(&sum, a.len()), result(&y, a.len()));
+        let (ms, my) = (
+            mismatched_bits(&sum, &sum_chain),
+            mismatched_bits(&y, &norm_chain),
+        );
+        let ok = ms == 0 && my == 0 && sum_tail && y_tail;
+        eprintln!(
+            "add_rms_norm_bf16 rows={rows} cols={cols}: sum mismatched_bits={ms} norm \
+             mismatched_bits={my} tails_intact={} {}",
+            sum_tail && y_tail,
+            verdict(ok)
+        );
+        pass &= ok;
+
+        let g = bf16_inputs(cols, 0x0FAD_3000 ^ seed);
+        let (_, sum_chain) = run_chain(&device, true, (&a, &b, &g), dims);
+        let (ab, bb, gb) = (up(&a), up(&b), up(&g));
+        let out = output(&device, a.len());
+        // SAFETY: as `run_chain`'s; `out` is its own allocation.
+        unsafe {
+            norm_add_bf16(
+                (ab.ptr(), bb.ptr()),
+                gb.ptr(),
+                out.ptr(),
+                dims,
+                (EPS, SCALE),
+                null,
+            )
+        }
+        .expect("norm_add_bf16 launch");
+        let (out, tail) = result(&out, a.len());
+        let m = mismatched_bits(&out, &sum_chain);
+        let ok = m == 0 && tail;
+        eprintln!(
+            "norm_add_bf16 rows={rows} cols={cols}: mismatched_bits={m} tail_intact={tail} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "an add-norm fold differs from its chain");
 }

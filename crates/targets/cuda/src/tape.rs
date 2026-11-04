@@ -1678,6 +1678,8 @@ impl CudaTape {
             | CudaStep::GemmNarrow(_)
             | CudaStep::RmsNorm(_)
             | CudaStep::Add(_)
+            | CudaStep::AddRmsNorm(_)
+            | CudaStep::NormAdd(_)
             | CudaStep::SiluMul(_)
             | CudaStep::GateSplit(_)
             | CudaStep::GateApply(_)

@@ -42,8 +42,8 @@ use crate::step::{
     AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16,
     ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
     GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel,
-    MoeRouteBf16, MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16,
-    RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, gemv_splits,
+    MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16,
+    RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, gemv_splits,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
@@ -1745,6 +1745,37 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             (rows, cols),
                             norm.eps(),
                             convention.offset(),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::AddRmsNorm(f) => {
+                    let n = f.norm;
+                    let gain = weights[n.gain.0 as usize].ptr();
+                    // SAFETY: as above, for `a`, `b`, `sum` and `y` (`rows*cols` each) and `gain`
+                    // (`cols`); `sum` and `y` overlap neither each other nor an input (`validate`).
+                    unsafe {
+                        kernels::add_rms_norm_bf16(
+                            (slot(f.a), slot(f.b)),
+                            gain,
+                            (slot(f.sum), slot(n.y)),
+                            (n.rows, n.cols),
+                            (n.eps(), n.convention.offset()),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::NormAdd(NormAddBf16 { norm: n, residual }) => {
+                    let gain = weights[n.gain.0 as usize].ptr();
+                    // SAFETY: as above, for `x`, `residual` and `y` (`rows*cols` each) and `gain`
+                    // (`cols`).
+                    unsafe {
+                        kernels::norm_add_bf16(
+                            (slot(n.x), slot(residual)),
+                            gain,
+                            slot(n.y),
+                            (n.rows, n.cols),
+                            (n.eps(), n.convention.offset()),
                             stream.0,
                         )
                     }

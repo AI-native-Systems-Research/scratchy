@@ -86,6 +86,8 @@ fn roles() -> Vec<Option<Role>> {
                 | CudaStep::GemmNarrow(GemmBf16 { b, k, .. })
                 | CudaStep::Gemv(GemmBf16 { b, k, .. }) => set(b.0, Role::Matrix { k }),
                 CudaStep::RmsNorm(n) => set(n.gain.0, Role::Gain),
+                // #1049's add-norm fold: its norm's gain.
+                CudaStep::AddRmsNorm(f) => set(f.norm.gain.0, Role::Gain),
                 CudaStep::GatedDeltaNet(GatedDeltaNetBf16 {
                     bundle,
                     num_k_heads,
