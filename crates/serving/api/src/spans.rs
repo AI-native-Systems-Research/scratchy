@@ -155,20 +155,29 @@ const PROBE_QUERY: &str = "\u{2063}probe\u{2063}";
 /// Render a conversation prefix, without the generation prompt, as the head of the prompt it
 /// grows into.
 ///
-/// A prefix holding no user turn (a span query's leading system message) has no render of its
-/// own under a template that requires a user query: Qwen 3.5, 3.6 and 3.8 end in
-/// `raise_exception('No user query found in messages.')`. Such a prefix is rendered as the head
-/// of the conversation with one user turn after it: that render, less the turn, which is the
-/// text a second user turn adds after it. A prefix the template renders as it is, and every
-/// prefix holding a user turn, renders as it is.
+/// A prefix the template renders renders as it is. A prefix it refuses has no render of its own
+/// but may still open a prompt it accepts: Qwen 3.5, 3.6 and 3.8 refuse any conversation holding
+/// no user query (`raise_exception('No user query found in messages.')`), counting neither a
+/// system message nor a user turn that is only a `<tool_response>`, and a span query's first
+/// message is its system prompt. Such a prefix is rendered as the head of the conversation with
+/// one user turn after it: that render, less the turn, which is the text a second user turn adds
+/// after it. Where that does not hold (a probe render is refused too, or the turn is not such a
+/// suffix) the prefix is refused by name, carrying the template's own refusal. A query the
+/// template refuses whole still fails, at the generation-prompt render of the whole conversation.
 fn render_prefix(
     template: &crate::chat_template::ChatTemplate,
     messages: &[TemplateMessage],
 ) -> ServeResult<String> {
     let refused = match template.apply_simple(messages, false) {
         Ok(rendered) => return Ok(rendered),
-        Err(e) if messages.iter().all(|m| m.role != "user") => e,
-        Err(e) => return Err(e),
+        Err(e) => e,
+    };
+    let unknown = |why: &str| {
+        ServeError::Validation(format!(
+            "the chat template does not render this span query's first {} message(s) on their \
+             own ({refused}), and {why}, so the head of the prompt they open is not known",
+            messages.len()
+        ))
     };
     let probe = TemplateMessage {
         role: "user".to_string(),
@@ -176,17 +185,21 @@ fn render_prefix(
     };
     let mut probed = messages.to_vec();
     probed.push(probe.clone());
-    let one = template.apply_simple(&probed, false)?;
+    let one = (template.apply_simple(&probed, false)).map_err(|e| {
+        unknown(&format!(
+            "it does not render them with a user turn after ({e})"
+        ))
+    })?;
     probed.push(probe);
-    let two = template.apply_simple(&probed, false)?;
+    let two = (template.apply_simple(&probed, false)).map_err(|e| {
+        unknown(&format!(
+            "it does not render them with two user turns after ({e})"
+        ))
+    })?;
     let turn = (two.strip_prefix(one.as_str()))
         .filter(|turn| turn.contains(PROBE_QUERY) && one.ends_with(turn))
         .ok_or_else(|| {
-            ServeError::Validation(format!(
-                "a span query opens with no user turn, which this chat template does not render \
-                 ({refused}), and a user turn after it does not render as a suffix of the \
-                 conversation before it, so the head of the prompt is not known"
-            ))
+            unknown("a user turn after them does not render as a suffix of the conversation")
         })?;
     Ok(one[..one.len() - turn.len()].to_string())
 }
@@ -1099,10 +1112,11 @@ mod tests {
     }
 
     /// ChatML with Qwen 3.5/3.6's user-query check (its `chat_template.jinja`, lines 67-80): a
-    /// conversation holding no user turn raises.
+    /// conversation holding no user query raises, and a user turn that is only a
+    /// `<tool_response>` is not a query.
     const QWEN_USER_QUERY_CHATML: &str = "\
 {%- set ns = namespace(no_query=true) %}\
-{%- for message in messages %}{%- if message.role == 'user' %}{%- set ns.no_query = false %}{%- endif %}{%- endfor %}\
+{%- for message in messages %}{%- if message.role == 'user' and not (message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}{%- set ns.no_query = false %}{%- endif %}{%- endfor %}\
 {%- if ns.no_query %}{{- raise_exception('No user query found in messages.') }}{%- endif %}\
 {%- for message in messages %}{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}{%- endfor %}\
 {%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}";
@@ -1158,15 +1172,52 @@ mod tests {
         );
     }
 
-    /// The probe is reached only for a prefix the template refuses: a template that renders a
-    /// lone system message gives that render, and a refused prefix holding a user turn still
-    /// fails, by the template's own message.
-    #[test]
-    fn render_prefix_renders_as_is_where_the_template_does() {
-        let msg = |role: &str, content: &str| TemplateMessage {
+    fn msg(role: &str, content: &str) -> TemplateMessage {
+        TemplateMessage {
             role: role.to_string(),
             content: content.to_string(),
-        };
+        }
+    }
+
+    /// A user turn that is only a `<tool_response>` is not a query to Qwen's check either: a
+    /// prefix of a system message and one renders as the head of the prompt it opens.
+    #[test]
+    fn a_tool_response_turn_is_no_user_query_to_the_prefix_render() {
+        let qwen =
+            crate::chat_template::ChatTemplate::new(QWEN_USER_QUERY_CHATML.to_string()).unwrap();
+        let tool = "<tool_response>42</tool_response>";
+        assert_eq!(
+            render_prefix(&qwen, &[msg("system", "S"), msg("user", tool)]).unwrap(),
+            format!("<|im_start|>system\nS<|im_end|>\n<|im_start|>user\n{tool}<|im_end|>\n")
+        );
+    }
+
+    /// A template that refuses the prefix and also refuses two user turns in a row (a role
+    /// alternation check) gives no head: the refusal names the span query's own prefix and
+    /// carries both the template's refusals, never the alternation error alone.
+    #[test]
+    fn render_prefix_refuses_by_name_where_a_probe_render_is_refused() {
+        let alternates = crate::chat_template::ChatTemplate::new(
+            "{%- if messages[-1].role != 'user' %}{{ raise_exception('No user query') }}{% endif %}\
+             {%- for m in messages %}{%- if loop.index0 > 0 and m.role == messages[loop.index0 - 1].role %}\
+             {{ raise_exception('roles must alternate') }}{% endif %}[{{ m.content }}]{% endfor %}"
+                .to_string(),
+        )
+        .unwrap();
+        let err = render_prefix(&alternates, &[msg("system", "S")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("first 1 message(s)"), "{err}");
+        assert!(err.contains("No user query"), "{err}");
+        assert!(err.contains("two user turns after"), "{err}");
+        assert!(err.contains("roles must alternate"), "{err}");
+    }
+
+    /// The probe is reached only for a prefix the template refuses: a template that renders a
+    /// lone system message gives that render, and a template refusing every conversation fails
+    /// with its own message.
+    #[test]
+    fn render_prefix_renders_as_is_where_the_template_does() {
         let system = [msg("system", "S")];
         let plain = crate::chat_template::ChatTemplate::new(
             "{% for m in messages %}[{{ m.role }}]{{ m.content }}{% endfor %}".to_string(),
@@ -1199,13 +1250,11 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
-        let system = [TemplateMessage {
-            role: "system".to_string(),
-            content: "S".to_string(),
-        }];
-        let err = render_prefix(&rewrites, &system).unwrap_err().to_string();
+        let err = render_prefix(&rewrites, &[msg("system", "S")])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("No user query"), "{err}");
-        assert!(err.contains("head of the prompt is not known"), "{err}");
+        assert!(err.contains("does not render as a suffix"), "{err}");
     }
 
     /// Verify the fix is a no-op when no consolidation occurs (different roles).
