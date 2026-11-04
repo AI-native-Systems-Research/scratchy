@@ -798,9 +798,8 @@ fn glance(sweep: &Sweep) -> Element {
                                          many times faster triton-scratchy is than torch-spyre. Blue \
                                          faster, red slower, the middle step within noise. Hover a \
                                          square for its ratio; a striped square is a cell the sweep did \
-                                         not measure. The batch rows past one are new and still filling \
-                                         in; a decode grid's batch-8 square comes from the sweep's \
-                                         throughput (tok/s) cell there, the unit batched decode measures."
+                                         not measure. A batched decode square the sweep has no ITL \
+                                         cell for falls back to its throughput (tok/s) cell there."
                                     }
                                     {glance_maps(&rows, &stems, "minmax(0, 11.5rem)", true, |row, model| rsx! {
                                         for (metric, name) in metrics {
@@ -815,8 +814,9 @@ fn glance(sweep: &Sweep) -> Element {
                                         p { "Time to first token as prompts grow, fp16: a row per \
                                              batch, the requests decoded at once (1, 4, 8). Blue \
                                              fill where triton-scratchy is ahead, red where it is \
-                                             behind; each fill carries its × factor. Batches past one \
-                                             are not yet measured." }
+                                             behind; each fill carries its × factor. A panel whose \
+                                             axis ends early stops at the longest context the sweep \
+                                             measured at that batch." }
                                         {spark_panel(sweep, Dtype::Fp16, Metric::Ttft)}
                                     }
                                 }
@@ -827,8 +827,9 @@ fn glance(sweep: &Sweep) -> Element {
                                         p { "triton-scratchy against torch-spyre as context grows, \
                                              fp16: a row per batch, the requests decoded at once (1, \
                                              4, 8). Blue fill where triton-scratchy is ahead, red \
-                                             where it is behind; each fill carries its × factor. \
-                                             Batches past one are not yet measured." }
+                                             where it is behind; each fill carries its × factor. A \
+                                             panel whose axis ends early stops at the longest context \
+                                             the sweep measured at that batch." }
                                         {spark_panel(sweep, Dtype::Fp16, Metric::Itl)}
                                     }
                                 }
