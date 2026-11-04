@@ -395,20 +395,31 @@ extern "C" int scratchy_cuda_gemm_group_bf16_abt_prepare(void) {
                                                  GEMM_BF16_ABT_SMEM_BYTES));
 }
 
+// `scratchy_cuda_gemm_bf16_abt_prepare`'s attribute on `mmt`'s instance. One call per instance:
+// the 128- and 64-column instances take different `globals` types, so no braced list holds both.
+template <typename mmt>
+static cudaError_t gate_up_smem() {
+    return cudaFuncSetAttribute(kittens::prototype::lcf::kernel<mmt>,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                GEMM_BF16_ABT_SMEM_BYTES);
+}
+
 // The gate/up instances' (#1049), as `scratchy_cuda_gemm_bf16_abt_prepare`'s, for both
 // activations at both column blocks.
+//
+// 0 = done; any other value = the cudaError_t of the first call that failed.
 extern "C" int scratchy_cuda_gate_up_gemm_bf16_prepare(void) {
-    for (auto ker : {kittens::prototype::lcf::kernel<gate_up_silu_mmt>,
-                     kittens::prototype::lcf::kernel<gate_up_gelu_mmt>,
-                     kittens::prototype::lcf::kernel<gate_up_silu_col64_mmt>,
-                     kittens::prototype::lcf::kernel<gate_up_gelu_col64_mmt>}) {
-        const cudaError_t e = cudaFuncSetAttribute(ker, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                   GEMM_BF16_ABT_SMEM_BYTES);
-        if (e != cudaSuccess) {
-            return static_cast<int>(e);
-        }
+    cudaError_t e = gate_up_smem<gate_up_silu_mmt>();
+    if (e == cudaSuccess) {
+        e = gate_up_smem<gate_up_gelu_mmt>();
     }
-    return 0;
+    if (e == cudaSuccess) {
+        e = gate_up_smem<gate_up_silu_col64_mmt>();
+    }
+    if (e == cudaSuccess) {
+        e = gate_up_smem<gate_up_gelu_col64_mmt>();
+    }
+    return static_cast<int>(e);
 }
 
 // The launch of `mmt`'s instance, the shape rule its tile's: `m`, `n` and `k` non-zero multiples

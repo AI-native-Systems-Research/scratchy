@@ -72,6 +72,7 @@
 // once per instance by `_prepare` (in `PREPARE`). The semaphores are static.
 
 #include "kittens.cuh"
+#include "scratchy_ops.cuh"
 
 #include <climits>
 #include <cstdint>
