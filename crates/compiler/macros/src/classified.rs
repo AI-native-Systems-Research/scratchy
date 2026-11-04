@@ -24,9 +24,9 @@ pub struct LocalId(pub u32);
 /// A weight reference, identified by its dotted path. Two DSL
 /// reads of `self_attn.q_proj[layer]` resolve to the same `WeightId`
 /// (indexing is stored on the expression, not on the id).
-pub use scratchy_subtile::handoff::WeightId;
+pub use scratchy_tensors::compiler_ids::WeightId;
 
-pub use scratchy_subtile::handoff::UnrollIndex;
+pub use scratchy_tensors::compiler_ids::UnrollIndex;
 
 /// The fixed enum of non-weight parameters. Every model uses the
 /// same names and shapes for these; the `#[forward]` /
@@ -179,35 +179,93 @@ impl ExternKind {
     /// body and `input_ids` is unrecognized in a vision body, both
     /// raising classify-time errors per the strict-DSL rule.
     pub fn from_name_for(name: &str, prelude: Prelude) -> Option<Self> {
-        match (prelude, name) {
-            (Prelude::Decoder, "input_ids") => Some(Self::InputIds),
-            (Prelude::Decoder, "positions") => Some(Self::Positions),
-            (Prelude::Decoder, "rotary") => Some(Self::Rotary),
-            (Prelude::Decoder, "rotary_local") => Some(Self::RotaryLocal),
-            (Prelude::Decoder, "block_table") => Some(Self::BlockTable),
-            (Prelude::Decoder, "kv_cache") => Some(Self::KvCache),
-            (Prelude::Decoder, "target_hidden") => Some(Self::TargetHidden),
-            (Prelude::Vision, "pixels") => Some(Self::Pixels),
-            (Prelude::Vision, "cu_seqlens") => Some(Self::CuSeqlens),
-            (Prelude::Vision, "cos") => Some(Self::Cos),
-            (Prelude::Vision, "sin") => Some(Self::Sin),
-            (Prelude::Vision, "grid_thw") => Some(Self::GridThw),
-            (Prelude::Vision, "max_seqlen") => Some(Self::MaxSeqlen),
-            (Prelude::Vision, "cu_seqlens_full") => Some(Self::CuSeqlensFull),
-            (Prelude::Vision, "cu_seqlens_window") => Some(Self::CuSeqlensWindow),
-            (Prelude::Vision, "max_seqlen_full") => Some(Self::MaxSeqlenFull),
-            (Prelude::Vision, "max_seqlen_window") => Some(Self::MaxSeqlenWindow),
-            (Prelude::Vision, "window_index") => Some(Self::WindowIndex),
-            (Prelude::Vision, "reverse_indices") => Some(Self::ReverseIndices),
-            (Prelude::Vision, "position_ids") => Some(Self::PositionIds),
-            (Prelude::Vision, "pos_embeds") => Some(Self::PosEmbeds),
-            _ => None,
+        Self::ALL
+            .into_iter()
+            .find(|k| k.prelude() == prelude && k.name() == name)
+    }
+
+    /// Every extern.
+    const ALL: [Self; 21] = [
+        Self::InputIds,
+        Self::Positions,
+        Self::Rotary,
+        Self::RotaryLocal,
+        Self::BlockTable,
+        Self::KvCache,
+        Self::TargetHidden,
+        Self::Pixels,
+        Self::CuSeqlens,
+        Self::Cos,
+        Self::Sin,
+        Self::GridThw,
+        Self::MaxSeqlen,
+        Self::CuSeqlensFull,
+        Self::CuSeqlensWindow,
+        Self::MaxSeqlenFull,
+        Self::MaxSeqlenWindow,
+        Self::WindowIndex,
+        Self::ReverseIndices,
+        Self::PositionIds,
+        Self::PosEmbeds,
+    ];
+
+    /// The prelude whose bodies may read this extern.
+    fn prelude(self) -> Prelude {
+        match self {
+            Self::InputIds
+            | Self::Positions
+            | Self::Rotary
+            | Self::RotaryLocal
+            | Self::BlockTable
+            | Self::KvCache
+            | Self::TargetHidden => Prelude::Decoder,
+            Self::Pixels
+            | Self::CuSeqlens
+            | Self::Cos
+            | Self::Sin
+            | Self::GridThw
+            | Self::MaxSeqlen
+            | Self::CuSeqlensFull
+            | Self::CuSeqlensWindow
+            | Self::MaxSeqlenFull
+            | Self::MaxSeqlenWindow
+            | Self::WindowIndex
+            | Self::ReverseIndices
+            | Self::PositionIds
+            | Self::PosEmbeds => Prelude::Vision,
+        }
+    }
+
+    /// The name a body reads this extern by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::InputIds => "input_ids",
+            Self::Positions => "positions",
+            Self::Rotary => "rotary",
+            Self::RotaryLocal => "rotary_local",
+            Self::BlockTable => "block_table",
+            Self::KvCache => "kv_cache",
+            Self::TargetHidden => "target_hidden",
+            Self::Pixels => "pixels",
+            Self::CuSeqlens => "cu_seqlens",
+            Self::Cos => "cos",
+            Self::Sin => "sin",
+            Self::GridThw => "grid_thw",
+            Self::MaxSeqlen => "max_seqlen",
+            Self::CuSeqlensFull => "cu_seqlens_full",
+            Self::CuSeqlensWindow => "cu_seqlens_window",
+            Self::MaxSeqlenFull => "max_seqlen_full",
+            Self::MaxSeqlenWindow => "max_seqlen_window",
+            Self::WindowIndex => "window_index",
+            Self::ReverseIndices => "reverse_indices",
+            Self::PositionIds => "position_ids",
+            Self::PosEmbeds => "pos_embeds",
         }
     }
 
     /// The extern a body names a host-staged row source by.
-    pub fn of_rows(source: scratchy_forward_compiler::RowsExtern) -> Self {
-        use scratchy_forward_compiler::RowsExtern;
+    pub fn of_rows(source: scratchy_tensors::compiler_ids::RowsExtern) -> Self {
+        use scratchy_tensors::compiler_ids::RowsExtern;
         match source {
             RowsExtern::Pixels => Self::Pixels,
             RowsExtern::PosEmbeds => Self::PosEmbeds,
@@ -412,9 +470,8 @@ pub enum OpKind {
     /// `Instruction::Embed::eval` inline splice.
     ///
     /// CONSTRUCTED ONLY by `tp_lowering::insert_mm_splices`, which is
-    /// metal-gated — under `spyre` alone this variant is reached
-    /// (matched, never built) and that is EXPECTED.
-    #[cfg_attr(feature = "spyre", expect(dead_code))]
+    /// metal-gated: the op exists on that target only.
+    #[cfg(feature = "metal")]
     MmEmbedSplice,
     /// Broadcast-add of a learned per-feature bias vector across the
     /// batch/token dimensions: `bias_add(x: [..., D], b: [D]) -> [..., D]`.
@@ -562,7 +619,7 @@ pub enum OpKind {
     /// lowering pass writes `outputs[0]` directly (same pattern as
     /// `AllGather` and `MmEmbedSplice`), so `apply_signature` rejects
     /// this OpKind.
-    LoadRows(scratchy_forward_compiler::RowsExtern),
+    LoadRows(scratchy_tensors::compiler_ids::RowsExtern),
     /// Row-permutation gather: `out = embedding_gather(x, indices)`.
     /// `x` is a rank-2 tile `[L, N]` (any inner-dim factorization);
     /// `indices` is a vision-prelude extern of `[`[`ExternKind::WindowIndex`]`
@@ -741,6 +798,7 @@ impl OpKind {
             Self::AllGather => "all_gather",
             // Lowering-pass-only op kind — see `OpKind::MmEmbedSplice`
             // doc-comment. No DSL surface.
+            #[cfg(feature = "metal")]
             Self::MmEmbedSplice => "mm_embed_splice",
             // Lowering-pass-only op kind — see `OpKind::LoadRows` doc-comment. No DSL surface.
             Self::LoadRows(_) => "load_rows",
@@ -773,7 +831,7 @@ pub struct Program {
     /// head_dim]`). The synthesizer inserts a `Reshape` Stmt and
     /// records the target shape here; the second inference pass
     /// reads this map to typecheck the synthesized statement.
-    pub reshape_targets: std::collections::HashMap<LocalId, Vec<crate::shape::Dim>>,
+    pub reshape_targets: std::collections::HashMap<LocalId, Vec<crate::dim::Dim>>,
     /// Prelude this program was classified under. `Decoder` for
     /// text-side `#[forward]`, `Vision` for `#[vision_forward]`.
     /// Threaded into codegen for prelude-specific decisions —
@@ -872,17 +930,36 @@ pub fn rename_dotted_under(renames: &[(String, String)], dotted: &str) -> String
 #[derive(Clone, Debug, Default)]
 pub struct LocalTable {
     entries: Vec<Ident>,
+    /// Each local's binding line in its carrier file; `None` for one no DSL statement binds (a loop
+    /// variable, an `if`'s merge, a compiler pass's insertion).
+    lines: Vec<Option<u32>>,
 }
 
 impl LocalTable {
     pub fn push(&mut self, name: Ident) -> LocalId {
+        self.push_at(name, None)
+    }
+
+    /// [`Self::push`], for a local a DSL statement at `line` binds.
+    pub fn push_at(&mut self, name: Ident, line: Option<u32>) -> LocalId {
         let id = LocalId(self.entries.len() as u32);
         self.entries.push(name);
+        self.lines.push(line);
         id
     }
 
     pub fn name(&self, id: LocalId) -> &Ident {
         &self.entries[id.0 as usize]
+    }
+
+    /// The carrier line that binds `id`, if a DSL statement does.
+    pub fn line(&self, id: LocalId) -> Option<u32> {
+        self.lines[id.0 as usize]
+    }
+
+    /// Every local the program binds, in binding order.
+    pub fn ids(&self) -> impl Iterator<Item = LocalId> + use<> {
+        (0..self.entries.len() as u32).map(LocalId)
     }
 }
 
@@ -936,8 +1013,9 @@ impl WeightTable {
             .any(|p| p.len() > prefix.len() && p.iter().zip(prefix).all(|(s, t)| s == t))
     }
 
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    /// Every weight the program reads, in interning order.
+    pub fn ids(&self) -> impl Iterator<Item = WeightId> + use<> {
+        (0..self.entries.len() as u32).map(WeightId)
     }
 
     /// The weight whose path is exactly `segments`, if the program has one.

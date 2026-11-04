@@ -808,6 +808,7 @@ pub fn lower_decode_to_wavefront(
             // the splice's output slot so downstream tiles read the
             // same `EmbeddedHidden` source. No op is emitted
             // — this op is structurally absent from the megakernel.
+            #[cfg(feature = "metal")]
             OpKind::MmEmbedSplice => {
                 let upstream = bx.input_at(tile, 0)?;
                 let producer = match upstream {
@@ -1321,8 +1322,11 @@ pub fn lower_decode_to_wavefront(
                     .filter(|n| n.op == OpKind::CaptureHidden)
                     .map(|n| n.id)
                     .collect();
-                let declared = (bx.model.layer_sets.get(crate::config::DRAFT_CAPTURE_LAYERS))
-                    .map_or(0, |s| s.members().len());
+                let declared = (bx
+                    .model
+                    .layer_sets
+                    .get(crate::draft_capture::DRAFT_CAPTURE_LAYERS))
+                .map_or(0, |s| s.members().len());
                 if captures.len() != declared {
                     return Err(BridgeError::MalformedOp {
                         tile,

@@ -40,6 +40,7 @@ mod ktir_tokens;
 pub use config::{
     arch_compiled, selected_config_paths, total_models_emitted, unmatched_build_filter_tags,
 };
+mod dim;
 mod emit;
 mod fuf;
 mod interpreter_codegen;
@@ -66,6 +67,9 @@ mod rows_lowering;
 mod shape;
 mod to_wavefront;
 mod tp_lowering;
+mod typed_shapes;
+#[cfg(test)]
+mod typed_shapes_tests;
 // ⭐ THE ONE PRODUCER OF THE MODEL'S WEIGHT ACCESSOR SET, for every target.
 //
 // It used to be gated `all(feature = "spyre", not(feature = "metal"))` because metal derived
@@ -625,8 +629,8 @@ pub fn compile_carrier(
                 .map(|i| i + 1 < seg.len() && seg[i + 1..].chars().all(|c| c.is_ascii_digit()))
                 .unwrap_or(false)
         }
-        for id in 0..classified.weights.len() {
-            let path = classified.weights.path(classified::WeightId(id as u32));
+        for id in classified.weights.ids() {
+            let path = classified.weights.path(id);
             let Some(leaf) = path.last() else { continue };
             if !ends_in_underscore_digit(leaf) {
                 continue;
@@ -1039,6 +1043,48 @@ pub fn compile_carrier(
                     ));
                 }
             };
+            // TRANSITIONAL — deleted with `shape.rs`'s solver in phase C of the
+            // shapes-as-Rust-types plan (issue #1086), when the trace becomes the shapes' source.
+            // Until then an arch whose carrier the typed-Rust emit pass typed traces its program,
+            // and every local the classifier bound must have the shape `shape::infer` closed for
+            // this model, evaluated under its bounds.
+            if let Some(parity) = typed_shapes::check_parity(
+                &arch_name,
+                &classified,
+                &model_inferred.locals,
+                &model.bounds,
+            ) {
+                if let Some(m) = parity.mismatches.first() {
+                    return Err(syn::Error::new(
+                        args.span,
+                        format!(
+                            "typed shapes [{}]: {} locals disagree with shape::infer ({} \
+                             shaped by both); first: `{}` (local {}, {}): traced {:?}, inferred {:?}",
+                            model.source_stem,
+                            parity.mismatches.len(),
+                            parity.compared,
+                            m.name,
+                            m.local.0,
+                            m.line
+                                .map_or("inserted by the compiler".to_string(), |l| format!(
+                                    "line {l}"
+                                )),
+                            m.traced,
+                            m.inferred,
+                        ),
+                    ));
+                }
+                if !parity.recovered.is_empty() {
+                    println!(
+                        "cargo:warning=typed shapes [{}]: reshape recovery added {} locals the \
+                         typed program cannot name ({:?}); each becomes an explicit DSL reshape or \
+                         a weights.json fix",
+                        model.source_stem,
+                        parity.recovered.len(),
+                        parity.recovered.iter().map(|l| l.0).collect::<Vec<_>>(),
+                    );
+                }
+            }
             let model_cfg = cfg::build_cfg(&model_prog, model).map_err(|e| {
                 syn::Error::new(args.span, format!("cfg [{}]: {e}", model.source_stem))
             })?;

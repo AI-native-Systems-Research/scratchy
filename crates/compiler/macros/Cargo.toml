@@ -55,6 +55,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The model facts (`scratchy_ir::model_facts`) the fill builds on every target.
 scratchy-ir = { path = "../ir" }
+scratchy-tensors = { path = "../../tensors" }
 # PD-wavefront (task T2b): the subtile-wavefront IR + lowering +
 # scheduler + host tape player live in this normal (Mac-testable) lib
 # crate. `to_wavefront.rs` here translates the solved FUF + `Assignment`
@@ -90,3 +91,12 @@ scratchy-target-spyre = { path = "../../targets/spyre", default-features = false
 # The IR types the baked program is CONSTRUCTED from — this crate renders them as const tokens, so
 # it names the same types the lowering built. Dependency-free.
 ktir-core = { path = "../../targets/spyre/ktir/ktir-core", optional = true }
+
+# The build script compiles the crate's own front end (parser, classifier, weights manifest) by path
+# to run the typed-Rust emit pass (`build.rs`): these are what those files use. The compiler ids
+# they share live in scratchy-tensors, beneath the rest of the compiler.
+[build-dependencies]
+syn = { version = "3", features = ["full"] }
+proc-macro2 = "1"
+serde_json = { workspace = true }
+scratchy-tensors = { path = "../../tensors" }

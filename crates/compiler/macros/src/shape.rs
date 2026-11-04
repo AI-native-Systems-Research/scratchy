@@ -32,39 +32,9 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::classified::{Expr, ExternKind, LocalId, OpKind, Program, Stmt, WeightId};
+pub use crate::dim::{Dim, DimVar, Shape, canonical_mul};
 
 // ── Types ─────────────────────────────────────────────────────────
-
-/// A dimension expression.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Dim {
-    /// Concrete integer literal.
-    Lit(u64),
-    /// Named bound — resolves to a config.json integer per-model.
-    Bound(String),
-    /// Product of subterms. Canonically flattened: no nested Mul.
-    Mul(Vec<Dim>),
-    /// Quotient: `numerator / denominator`. Surfaced today only by
-    /// DSL-authored reshape arithmetic (`num_tokens /
-    /// vision_merge_factor`). The Solver treats it as concrete:
-    /// `unify` checks structural equality, `walk` / `close_dim`
-    /// recurse into both children. `eval_closed_dim` evaluates by
-    /// integer division (caller's responsibility to ensure the
-    /// dividend is exactly divisible at runtime — the merger
-    /// reshape's `total_l / spatial_merge_size**2` is always
-    /// exact).
-    Div(Box<Dim>, Box<Dim>),
-    /// Unresolved variable. Must be resolved before inference
-    /// completes or shape inference reports an error.
-    Var(DimVar),
-}
-
-/// Fresh-var id. Allocated by the [`Solver`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DimVar(u32);
-
-/// A tensor shape — an ordered sequence of dims.
-pub type Shape = Vec<Dim>;
 
 /// The solver state: union-find over dim variables plus
 /// concrete bindings.
@@ -209,55 +179,6 @@ fn dims_structurally_equal(a: &Dim, b: &Dim) -> bool {
         // A Lit(1) is identity for Mul — don't worry about that here,
         // canonical_mul handles it.
         _ => false,
-    }
-}
-
-/// Flatten and sort a Mul's children to a canonical form. Single-
-/// element products collapse to their inner dim.
-pub fn canonical_mul(mut children: Vec<Dim>) -> Dim {
-    // Flatten nested Muls.
-    let mut flat = Vec::with_capacity(children.len());
-    for c in children.drain(..) {
-        match c {
-            Dim::Mul(inner) => flat.extend(inner),
-            other => flat.push(other),
-        }
-    }
-    // Drop Lit(1)s.
-    flat.retain(|d| !matches!(d, Dim::Lit(1)));
-    // Deterministic ordering for canonicalization.
-    flat.sort_by(dim_cmp);
-    match flat.len() {
-        0 => Dim::Lit(1),
-        1 => flat.pop().unwrap(),
-        _ => Dim::Mul(flat),
-    }
-}
-
-fn dim_cmp(a: &Dim, b: &Dim) -> std::cmp::Ordering {
-    // Bound < Lit < Mul < Var ordering, breaking ties within each.
-    use std::cmp::Ordering;
-    fn rank(d: &Dim) -> u8 {
-        match d {
-            Dim::Bound(_) => 0,
-            Dim::Lit(_) => 1,
-            Dim::Mul(_) => 2,
-            Dim::Div(_, _) => 3,
-            Dim::Var(_) => 4,
-        }
-    }
-    match rank(a).cmp(&rank(b)) {
-        Ordering::Equal => match (a, b) {
-            (Dim::Bound(x), Dim::Bound(y)) => x.cmp(y),
-            (Dim::Lit(x), Dim::Lit(y)) => x.cmp(y),
-            (Dim::Mul(x), Dim::Mul(y)) => x.len().cmp(&y.len()),
-            // Div ordering is opaque (no internal order needed for
-            // canonicalization; only one Div per merger reshape today).
-            (Dim::Div(_, _), Dim::Div(_, _)) => Ordering::Equal,
-            (Dim::Var(x), Dim::Var(y)) => x.0.cmp(&y.0),
-            _ => unreachable!(),
-        },
-        other => other,
     }
 }
 
@@ -516,6 +437,7 @@ pub fn apply_signature_with_geometry(
         // post-FUF-build with outputs[0] == inputs[0], so reaching
         // this arm via `apply_signature` is fine: sig_unary_elementwise
         // re-unifies and agrees.
+        #[cfg(feature = "metal")]
         OpKind::MmEmbedSplice => sig_unary_elementwise(solver, inputs, op),
         // LoadRows has no FUF inputs (the runtime tile is built from the source's
         // `ForwardCtx` view). The materialize_rows pass writes `outputs[0] =
@@ -1428,6 +1350,7 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Concat => &[],
         OpKind::GateScale => &[],
         // MmEmbedSplice takes one activation input, no tensor weight.
+        #[cfg(feature = "metal")]
         OpKind::MmEmbedSplice => &[],
         // LoadRows has zero FUF inputs (the tile is materialized from the source's
         // `ForwardCtx` view at runtime), so no weight-arg ranks.

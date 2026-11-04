@@ -28,7 +28,11 @@ use std::collections::BTreeSet;
 use proc_macro2::{Ident, Span};
 
 use crate::ast::{Ast, BoolExpr, BoundExpr, Expr, InSet, Stmt};
-use crate::config::DRAFT_CAPTURE_LAYERS;
+
+/// The layer set of a target's layers whose outputs a head compiled beside it reads, which the
+/// target captures (`capture_hidden`): the head's `target_capture_layers`, written into the
+/// target's config before it parses. Every model has the set, empty unless a head reads some.
+pub(crate) const DRAFT_CAPTURE_LAYERS: &str = "draft_capture_layers";
 
 /// The loop bound a decoder layer loop runs to.
 const LAYER_COUNT: &str = "num_hidden_layers";
@@ -88,10 +92,12 @@ fn capture(ivar: &Ident, carried: &str) -> Stmt {
                 op: ident(CAPTURE_OP),
                 args: vec![carried.clone()],
             },
+            line: None,
         }],
         else_body: vec![Stmt::Assign {
             target: ident(CAPTURE_LOCAL),
             value: carried,
+            line: None,
         }],
     }
 }

@@ -726,11 +726,12 @@ impl Parser {
         }
         let value = lower_expr(&value, self.span)?;
         match lhs {
-            PyExpr::Name(n, _) => Ok(Some(Stmt::Assign {
+            PyExpr::Name(n, at) => Ok(Some(Stmt::Assign {
                 target: ident(&n, self.span),
                 value,
+                line: Some(at.line),
             })),
-            PyExpr::Tuple(elts, _) => {
+            PyExpr::Tuple(elts, at) => {
                 let targets = elts
                     .iter()
                     .map(|el| match el {
@@ -741,7 +742,11 @@ impl Parser {
                         )),
                     })
                     .collect::<Result<_, _>>()?;
-                Ok(Some(Stmt::AssignTuple { targets, value }))
+                Ok(Some(Stmt::AssignTuple {
+                    targets,
+                    value,
+                    line: Some(at.line),
+                }))
             }
             other => Err(err(
                 other.at(),
@@ -1491,6 +1496,7 @@ mod tests {
             Stmt::Assign {
                 target,
                 value: Expr::Call { op, args },
+                ..
             } => {
                 assert_eq!(target.to_string(), "x");
                 assert_eq!(op.to_string(), "foo");
@@ -1504,7 +1510,7 @@ mod tests {
     fn assign_tuple() {
         let ast = body("(q, k, v) = rope(q, k, v, pos)");
         match &ast.statements[0] {
-            Stmt::AssignTuple { targets, value } => {
+            Stmt::AssignTuple { targets, value, .. } => {
                 let names: Vec<String> = targets.iter().map(|i| i.to_string()).collect();
                 assert_eq!(names, vec!["q", "k", "v"]);
                 assert!(matches!(value, Expr::Call { .. }));
@@ -1942,7 +1948,7 @@ mod tests {
         let ast = parse("@forward\ndef f():\n    x = gemm(a, w.p[layer])\n    return x\n");
         assert_eq!(ast.statements.len(), 1);
         match &ast.statements[0] {
-            Stmt::Assign { target, value } => {
+            Stmt::Assign { target, value, .. } => {
                 assert_eq!(target.to_string(), "x");
                 assert!(matches!(value, Expr::Call { .. }));
             }

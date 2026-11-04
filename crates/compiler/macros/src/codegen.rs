@@ -7050,11 +7050,11 @@ struct CanonicalLowered {
 /// Gemm (tp=1) or its AllGather wrapper (tp>1) for decoders, the
 /// merger MLP's bias_add for vision encoders.
 fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
-    fuf.nodes.iter().rev().find(|n| {
-        !matches!(
-            n.op,
-            crate::classified::OpKind::MmEmbedSplice | crate::classified::OpKind::LoadRows(_)
-        )
+    fuf.nodes.iter().rev().find(|n| match n.op {
+        #[cfg(feature = "metal")]
+        crate::classified::OpKind::MmEmbedSplice => false,
+        crate::classified::OpKind::LoadRows(_) => false,
+        _ => true,
     })
 }
 
@@ -7806,8 +7806,10 @@ fn fill_canonical_params(
     let draft_conv_group = *model.bounds.get("conv_group_size").unwrap_or(&0) as u32;
     let draft_selector_rank = *model.bounds.get("selector_rank").unwrap_or(&0) as u32;
     let draft_mask_token = *model.bounds.get("mask_token_id").unwrap_or(&0) as u32;
-    let draft_capture_slots = (model.layer_sets.get(crate::config::DRAFT_CAPTURE_LAYERS))
-        .map_or(0, |s| s.members().len() as u32);
+    let draft_capture_slots = (model
+        .layer_sets
+        .get(crate::draft_capture::DRAFT_CAPTURE_LAYERS))
+    .map_or(0, |s| s.members().len() as u32);
 
     // Vision-tower constants. Set in `#[vision_forward]` configs via
     // `vision_num_heads` / `vision_head_dim` bounds; absent in text
@@ -14303,8 +14305,8 @@ pub fn emit_model(
                 }
             )
         });
-        let weight_paths: Vec<Vec<String>> = (0..program.weights.len())
-            .map(|i| program.weights.path(WeightId(i as u32)).to_vec())
+        let weight_paths: Vec<Vec<String>> = (program.weights.ids())
+            .map(|id| program.weights.path(id).to_vec())
             .collect();
         let embed_base = weight_paths
             .iter()
@@ -15000,8 +15002,10 @@ pub fn emit_model(
     let (draft_capture_bytes_lit, draft_rows_lit, captured_rows) = {
         let max_m = num_tokens_points.iter().copied().max().unwrap_or(0);
         let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(0);
-        let slots = (model.layer_sets.get(crate::config::DRAFT_CAPTURE_LAYERS))
-            .map_or(0, |s| s.members().len() as u64);
+        let slots = (model
+            .layer_sets
+            .get(crate::draft_capture::DRAFT_CAPTURE_LAYERS))
+        .map_or(0, |s| s.members().len() as u64);
         let rows = *model.bounds.get("spec_drafts").unwrap_or(&0) + 1;
         let bytes = max_m * slots * hidden_size * 2;
         // What a step's followup gets of them, from the worker's runtime bindings: they, or none
@@ -17589,7 +17593,8 @@ mod fingerprint_tests {
     /// and one whose drafter reads layer 1 captures that layer and no other.
     #[test]
     fn every_decoder_arch_hosts_a_drafter_capture() {
-        use crate::config::{DRAFT_CAPTURE_LAYERS, LayerSet};
+        use crate::config::LayerSet;
+        use crate::draft_capture::DRAFT_CAPTURE_LAYERS;
         for (arch, stem) in [
             ("commandr", "c4ai-command-r-v01"),
             ("gemma2", "gemma2-27b"),

@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::draft_capture::DRAFT_CAPTURE_LAYERS;
 use crate::quantization::QuantizationConfig;
 
 /// One model's parameters, loaded from one `config.json`.
@@ -2155,11 +2156,6 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
 
 /// Reserved (non-model) filename for the per-arch declaration file.
 pub(crate) const ARCH_JSON: &str = "arch.json";
-
-/// The layer set of a target's layers whose outputs a head compiled beside it reads, which the
-/// target captures (`capture_hidden`): the head's `target_capture_layers`, written into the
-/// target's config before it parses. Every model has the set, empty unless a head reads some.
-pub(crate) const DRAFT_CAPTURE_LAYERS: &str = "draft_capture_layers";
 
 /// What the heads compiled beside a target config bake into it (`load_dir_mode`'s `head_facts`).
 #[derive(Default)]

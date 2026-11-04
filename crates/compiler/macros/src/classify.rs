@@ -16,7 +16,7 @@ use crate::classified::{
     BoolPred, Bound, Expr, ExternKind, LocalId, LocalTable, OpKind, Prelude, Program, Stmt,
     WeightTable,
 };
-use crate::shape::{Dim, canonical_mul};
+use crate::dim::{Dim, canonical_mul};
 
 pub type ClassifyResult<T> = Result<T, syn::Error>;
 
@@ -90,7 +90,11 @@ impl Ctx {
 
     fn classify_stmt(&mut self, stmt: &ast::Stmt) -> ClassifyResult<Stmt> {
         match stmt {
-            ast::Stmt::Assign { target, value } => {
+            ast::Stmt::Assign {
+                target,
+                value,
+                line,
+            } => {
                 // `out = reshape(source, [d0, d1, ...])` is the only
                 // place an `ast::Expr::Reshape` is admitted. We
                 // intercept here (before `classify_expr`) so the
@@ -108,7 +112,7 @@ impl Ctx {
                 } = value
                 {
                     let source = self.classify_expr(source)?;
-                    let id = self.bind(target.clone());
+                    let id = self.bind(target.clone(), *line);
                     let dims: Vec<Dim> = target_shape.iter().map(dimspec_to_dim).collect();
                     self.reshape_targets.insert(id, dims);
                     return Ok(Stmt::Assign {
@@ -122,12 +126,19 @@ impl Ctx {
                 // Classify RHS first so that `x = f(x)` reads the
                 // previous binding of `x`, not the new one.
                 let value = self.classify_expr(value)?;
-                let id = self.bind(target.clone());
+                let id = self.bind(target.clone(), *line);
                 Ok(Stmt::Assign { target: id, value })
             }
-            ast::Stmt::AssignTuple { targets, value } => {
+            ast::Stmt::AssignTuple {
+                targets,
+                value,
+                line,
+            } => {
                 let value = self.classify_expr(value)?;
-                let ids = targets.iter().map(|t| self.bind(t.clone())).collect();
+                let ids = targets
+                    .iter()
+                    .map(|t| self.bind(t.clone(), *line))
+                    .collect();
                 Ok(Stmt::AssignTuple {
                     targets: ids,
                     value,
@@ -279,7 +290,7 @@ impl Ctx {
             // binding of this name. Use `bind` so reads after the
             // If resolve to this merge id.
             let ident = syn::Ident::new(name, proc_macro2::Span::call_site());
-            let merge_id = self.bind(ident);
+            let merge_id = self.bind(ident, None);
             merge_carry.push((merge_id, then_final, else_final));
         }
 
@@ -497,9 +508,9 @@ impl Ctx {
     /// Introduce a fresh local binding shadowing any previous
     /// binding of the same name. Used by assignment statements —
     /// the new binding outlives the statement.
-    fn bind(&mut self, ident: Ident) -> LocalId {
+    fn bind(&mut self, ident: Ident, line: Option<u32>) -> LocalId {
         let name = ident.to_string();
-        let id = self.locals.push(ident);
+        let id = self.locals.push_at(ident, line);
         // Replace the top of the stack so shadowing is observable
         // to subsequent reads at this scope depth.
         let stack = self.scope.entry(name).or_default();
@@ -975,7 +986,7 @@ mod tests {
         //   input_layernorm, post_attention_layernorm = 2
         //   embed_tokens, norm, lm_head = 3
         //   TOTAL = 12.
-        assert_eq!(p.weights.len(), 12, "unique weights interned");
+        assert_eq!(p.weights.ids().count(), 12, "unique weights interned");
     }
 
     // ── Vision prelude routing (G.3) ─────────────────────────────

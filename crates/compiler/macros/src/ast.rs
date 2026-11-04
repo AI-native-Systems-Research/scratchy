@@ -18,9 +18,19 @@ pub struct Ast {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     /// `name = expr`
-    Assign { target: Ident, value: Expr },
+    Assign {
+        target: Ident,
+        value: Expr,
+        /// The statement's line in its carrier file; `None` for one a compiler pass inserted.
+        line: Option<u32>,
+    },
     /// `(a, b, c) = expr` — tuple destructuring assignment.
-    AssignTuple { targets: Vec<Ident>, value: Expr },
+    AssignTuple {
+        targets: Vec<Ident>,
+        value: Expr,
+        /// As [`Stmt::Assign`]'s.
+        line: Option<u32>,
+    },
     /// `for ivar in range(<bound>):` — symbolic trip count.
     For {
         ivar: Ident,

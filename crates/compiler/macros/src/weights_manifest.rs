@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::shape::{Dim, Shape, canonical_mul};
+use crate::dim::{Dim, Shape, canonical_mul};
 
 /// Parsed `weights.json`. Keys are dotted weight paths (e.g.
 /// `"self_attn.q_proj"`), values are symbolic shapes (`Vec<Dim>`).
@@ -419,7 +419,7 @@ fn parse_dim(s: &str) -> Result<Dim, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shape::Dim;
+    use crate::dim::Dim;
 
     #[test]
     fn parses_single_bound() {
