@@ -465,8 +465,9 @@ int dense(const void* a, const void* b, void* c, void* partials, uint32_t n, uin
 // GEMV's rule on its own. The main launch runs every member's CTAs at 4 rows per warp, the split
 // launcher's instance; then one reduce over the split members, if any. Each member's output is
 // the bits of its own `scratchy_cuda_gemv_split_bf16_abt` at the same split.
-int group(const void* a, const void* const* b, void* const* c, void* const* partials,
-          const uint32_t* n, uint32_t k, const uint32_t* splits, uint32_t count, void* stream) {
+int launch_group(const void* a, const void* const* b, void* const* c, void* const* partials,
+                 const uint32_t* n, uint32_t k, const uint32_t* splits, uint32_t count,
+                 void* stream) {
     if (count < 2 || count > 3) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
@@ -702,5 +703,5 @@ extern "C" int scratchy_cuda_gemv_group_bf16_abt(const void* a, const void* cons
                                                  const uint32_t* n, uint32_t k,
                                                  const uint32_t* splits, uint32_t count,
                                                  void* stream /* cudaStream_t; null = default */) {
-    return group(a, b, c, partials, n, k, splits, count, stream);
+    return launch_group(a, b, c, partials, n, k, splits, count, stream);
 }
