@@ -437,27 +437,119 @@ fn rows(v: &[f32]) -> impl Iterator<Item = &[f32]> {
 /// picks per token; empty for a dense model, whose tape has no routing.
 fn route_cut_tapes() -> (&'static [scratchy_target_cuda::tape::CudaTape], usize) {
     static CUTS: OnceLock<(&'static [scratchy_target_cuda::tape::CudaTape], usize)> = OnceLock::new();
-    *CUTS.get_or_init(|| {
-        let full = &CUDA_TAPES[bucket()];
-        let mut top_k = 0;
-        let cuts: Vec<scratchy_target_cuda::tape::CudaTape> = (full.steps.iter().enumerate())
-            .filter_map(|(i, s)| match *s {
-                scratchy_target_cuda::step::CudaStep::MoeRoute(MoeRouteBf16 {
-                    top_k: k, ..
-                }) => {
-                    let moe = full.moe.expect("a routing tape has a MoE scratch");
-                    top_k = k as usize;
-                    Some(scratchy_target_cuda::tape::CudaTape {
-                        steps: Box::leak(full.steps[..=i].to_vec().into_boxed_slice()),
-                        result: moe.topk_idx,
-                        ..*full
-                    })
-                }
-                _ => None,
-            })
+    *CUTS.get_or_init(|| route_cuts_of(&CUDA_TAPES[bucket()]))
+}
+
+/// `full` cut just after each `MoeRoute` step, its result that layer's `topk_idx`, and the picks
+/// per token; empty for a tape with no routing. A cut keeps only the GEMV scratch its own steps
+/// write, as `CudaTape::validate` requires (#1031).
+fn route_cuts_of(
+    full: &'static scratchy_target_cuda::tape::CudaTape,
+) -> (&'static [scratchy_target_cuda::tape::CudaTape], usize) {
+    use scratchy_target_cuda::step::CudaStep;
+    let mut top_k = 0;
+    let cuts: Vec<scratchy_target_cuda::tape::CudaTape> = (full.steps.iter().enumerate())
+        .filter_map(|(i, s)| match *s {
+            CudaStep::MoeRoute(MoeRouteBf16 { top_k: k, .. }) => {
+                let moe = full.moe.expect("a routing tape has a MoE scratch");
+                top_k = k as usize;
+                let steps = &full.steps[..=i];
+                let bytes = (steps.iter().filter_map(CudaStep::gemv_scratch))
+                    .max()
+                    .unwrap_or(0);
+                Some(scratchy_target_cuda::tape::CudaTape {
+                    steps: Box::leak(steps.to_vec().into_boxed_slice()),
+                    result: moe.topk_idx,
+                    gemv_scratch: (full.gemv_scratch.filter(|_| bytes > 0))
+                        .map(|s| scratchy_target_cuda::tape::ArenaSpan { bytes, ..s }),
+                    ..*full
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    (Box::leak(cuts.into_boxed_slice()), top_k)
+}
+
+/// P8's decode routing (the user's decision 2026-11-03 (ii)): one worker over [`CUDA_TAPES`], the
+/// m=512 tape's route cuts and the m=1 tape's, for the first MoE layer whose decode picks differ
+/// from CUDA's one-shot's. `None` on a dense model, which routes nothing.
+struct DecodeRoutes<'r> {
+    worker: CudaWorker<'r>,
+    tapes: &'static [scratchy_target_cuda::tape::CudaTape],
+    layers: usize,
+    top_k: usize,
+}
+
+impl<'r> DecodeRoutes<'r> {
+    fn new(r: &'r Rig) -> Option<Self> {
+        let one = (CUDA_TAPES.iter().position(|t| t.bucket_m == 1)).expect("the m=1 tape");
+        let (prefill, top_k) = route_cuts_of(&CUDA_TAPES[bucket()]);
+        let (decode, _) = route_cuts_of(&CUDA_TAPES[one]);
+        if prefill.is_empty() {
+            return None;
+        }
+        assert_eq!(prefill.len(), decode.len(), "MoE layers per tape");
+        let mut list = CUDA_TAPES.to_vec();
+        list.extend_from_slice(prefill);
+        list.extend_from_slice(decode);
+        let tapes: &'static [scratchy_target_cuda::tape::CudaTape] =
+            Box::leak(list.into_boxed_slice());
+        let worker = CudaWorker::new(&r.device, tapes, &r.weights, Some(KV_POOL), GDN_POOL)
+            .unwrap_or_else(|e| panic!("CudaWorker::new over the tapes and the route cuts: {e}"));
+        Some(Self {
+            worker,
+            tapes,
+            layers: prefill.len(),
+            top_k,
+        })
+    }
+
+    /// Picks of row `row` from a cut forward's `topk_idx` result.
+    fn picks(&self, out: &[u16], row: usize) -> BTreeSet<i32> {
+        let idx: Vec<i32> = (out.as_chunks::<2>().0.iter())
+            .map(|&[lo, hi]| (u32::from(lo) | u32::from(hi) << 16) as i32)
             .collect();
-        (Box::leak(cuts.into_boxed_slice()), top_k)
-    })
+        idx[row * self.top_k..][..self.top_k].iter().copied().collect()
+    }
+
+    /// Tape `b` of the list run on `ids` at `prefix_len` in `seat`: the whole result.
+    fn run(&mut self, b: usize, ids: &[u32], prefix_len: u32, seat: (&[u32], u32)) -> Vec<u16> {
+        let tape = &self.tapes[b];
+        let q = ids.len() as u32;
+        let mut padded = vec![0u32; tape.bucket_m as usize];
+        padded[..ids.len()].copy_from_slice(ids);
+        let positions: Vec<u32> = (prefix_len..prefix_len + tape.bucket_m).collect();
+        let kv = KvSequence {
+            block_table: seat.0,
+            prefix_len,
+            q_len: q,
+        };
+        let gdn = GDN_POOL.map(|_| GdnSequence {
+            slot: seat.1,
+            q_len: q,
+            fresh: prefix_len == 0,
+        });
+        let mut out = vec![0u16; tape.result.bytes as usize / 2];
+        (self.worker.forward(b, Input::TokenIds(&padded), &positions, Some(&kv), gdn.as_ref(), &mut out))
+            .unwrap_or_else(|e| panic!("route cut {b}: {e}"));
+        out
+    }
+
+    /// The first MoE layer whose decode of `ids[n - 1]` at `n - 1` (after a fresh prefill of
+    /// `ids[..n - 1]`) picks other experts than one fresh forward of `ids` does on its last row,
+    /// in [`SEAT_A`]; `None` when no layer does. Each cut decode re-prefills first: a cut decode
+    /// writes the cache of the layers it ran.
+    fn first_differing(&mut self, ids: &[u32]) -> Option<usize> {
+        let (n, base) = (ids.len(), CUDA_TAPES.len());
+        (0..self.layers).find(|&l| {
+            let one_shot = self.run(base + l, ids, 0, SEAT_A);
+            let want = self.picks(&one_shot, n - 1);
+            self.run(bucket(), &ids[..n - 1], 0, SEAT_A);
+            let decoded = self.run(base + self.layers + l, &ids[n - 1..], (n - 1) as u32, SEAT_A);
+            self.picks(&decoded, 0) != want
+        })
+    }
 }
 
 /// One row's expert picks against HF-f32's, walked over every layer under P9's rule: the layers
@@ -1429,11 +1521,18 @@ fn p7_greedy_via_decode_matches_hf_f32() {
 /// is the noisiest statistic, the user's decision 2026-11-03 (c)), the same top-1 unless the f32
 /// margin is at most twice the row's max noise, top-5 overlap ≥ 4. Against
 /// CUDA's own one-shot last row: cosine ≥ 0.999, the same argmax unless near-tie, max |diff|
-/// printed. A one-token prompt has no prefix to prefill, and is skipped, saying so.
+/// printed. On a MoE model, a row that fails either is excused when the first layer whose decode
+/// expert picks differ from CUDA's one-shot's is a router near-tie under P9's rule (f32 rank-8
+/// minus rank-9 gap ≤ τ, `cuda_route_rule.rs`), printed as excused (the user's decision
+/// 2026-11-03 (ii)); a row whose first difference is not at a tie, or with no differing pick,
+/// still fails. A dense model has no picks: nothing changes there. A one-token prompt has no
+/// prefix to prefill, and is skipped, saying so.
 #[test]
 fn p8_the_decode_row_matches_hf_f32() {
     let r = rig();
     let mut w = r.worker();
+    // Built at the first failing row only: a second worker's arena is not paid on a passing run.
+    let mut routes: Option<Option<DecodeRoutes<'_>>> = None;
     let mut pass = true;
     for p in prompts().iter().take(5) {
         let n = p.ids.len();
@@ -1498,7 +1597,42 @@ fn p8_the_decode_row_matches_hf_f32() {
             n - 1,
             verdict(ok_own)
         );
-        pass &= ok_hf && ok_own;
+        // The user's decision 2026-11-03 (ii): a MoE row whose first differing expert pick from
+        // CUDA's one-shot is at a router near-tie (P9's rule) is excused, and says so.
+        let routes = match ok_hf && ok_own {
+            true => None,
+            false => routes.get_or_insert_with(|| DecodeRoutes::new(&r)).as_mut(),
+        };
+        let excused = match routes {
+            Some(routes) => match routes.first_differing(&p.ids) {
+                Some(layer) => {
+                    let route =
+                        read_route_of(&format!("route_{}.bin", p.p), n, (routes.layers, routes.top_k));
+                    let tau = route.tau(layer);
+                    let (tie, gap) = route.tie(layer, n - 1, tau);
+                    eprintln!(
+                        "P8 prompt {} decode row {}: {}: first differing pick at layer {layer} {} a \
+                         router tie, gap {gap:.4e} vs tau {tau:.4e}",
+                        p.p,
+                        n - 1,
+                        if tie { "excused" } else { "NOT excused" },
+                        if tie { "is" } else { "is not" }
+                    );
+                    tie
+                }
+                None => {
+                    eprintln!(
+                        "P8 prompt {} decode row {}: NOT excused: no expert pick differs from the \
+                         one-shot's",
+                        p.p,
+                        n - 1
+                    );
+                    false
+                }
+            },
+            None => false,
+        };
+        pass &= (ok_hf && ok_own) || excused;
     }
     assert!(
         pass,
