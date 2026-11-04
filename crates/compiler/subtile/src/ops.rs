@@ -160,7 +160,7 @@ macro_rules! for_each_subop {
                 gemm_w = [none];
             VarlenAttention [SubOp::VarlenAttention { .. }] arity = (|n| n == 3), cols = [in0],
                 rows = [in0], gemm_w = [none];
-            EncoderAttn [SubOp::EncoderAttn { .. }] arity = (|n| n == 3), cols = [in0],
+            EncoderAttn [SubOp::EncoderAttn] arity = (|n| n == 3), cols = [in0],
                 rows = [in0], gemm_w = [none];
             GatedDeltaNet [SubOp::GatedDeltaNet] arity = (|n| n == 5), cols = [in1], rows = [in0],
                 gemm_w = [none];

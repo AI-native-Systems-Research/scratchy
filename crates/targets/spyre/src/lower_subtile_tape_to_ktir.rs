@@ -688,7 +688,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::EmbeddingGather { .. }
         | SubOp::VisionRope
         | SubOp::VarlenAttention { .. }
-        | SubOp::EncoderAttn { .. }
+        | SubOp::EncoderAttn
         | SubOp::GatedDeltaNet
         | SubOp::Mamba2 { .. }
         | SubOp::KvAppend { .. }

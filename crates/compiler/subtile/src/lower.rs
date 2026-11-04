@@ -212,7 +212,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::EmbeddingGather { .. }
             | O::VisionRope
             | O::VarlenAttention { .. }
-            | O::EncoderAttn { .. }
+            | O::EncoderAttn
             | O::GatedDeltaNet
             | O::Mamba2 { .. }
             | O::CaptureHidden { .. }
