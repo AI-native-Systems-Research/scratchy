@@ -1289,10 +1289,12 @@ pub fn lower_decode_to_wavefront(
             // draft_context_kv(kv, k_norm, positions, rotary): the drafter's ring ops at the layer
             // their norms index.
             OpKind::DraftAttention | OpKind::DraftContextKv => {
-                let head_dim = bx
-                    .geom
-                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?
-                    .hd();
+                // The one model-facts record, as every other attention arm reads it; a body
+                // with no attention states head_dim 0, refused by name as before.
+                let head_dim = bx.model_consts.head_dim;
+                if head_dim == 0 {
+                    return Err(BridgeError::MissingBound { key: "head_dim" });
+                }
                 let layer = node
                     .inputs
                     .iter()
@@ -1308,7 +1310,7 @@ pub fn lower_decode_to_wavefront(
                         op: node.op,
                         detail: "draft ring op without a layer-indexed norm",
                     })?;
-                let (cos, sin) = bx.cos_sin(head_dim.get(), false);
+                let (cos, sin) = bx.cos_sin(head_dim, false);
                 let norms = match node.op {
                     OpKind::DraftAttention => 1..3,
                     _ => 1..2,

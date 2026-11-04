@@ -67,6 +67,13 @@ pub fn fixture_model_consts(h: u32, kv: u32, hd: u32) -> MetalModelConsts {
         gdn_conv_kernel: 0,
         gdn_conv_dim: 0,
         spec_drafts: 0,
+        draft_conv_group: 0,
+        draft_selector_rank: 0,
+        draft_mask_token: 0,
+        draft_capture_slots: 0,
+        target_hidden_width: 0,
+        target_routes_experts: false,
+        vocab_size: 0,
     }
 }
 

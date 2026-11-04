@@ -204,6 +204,13 @@ impl MetalModelConsts {
         gdn_conv_kernel: 0,
         gdn_conv_dim: 0,
         spec_drafts: 0,
+        draft_conv_group: 0,
+        draft_selector_rank: 0,
+        draft_mask_token: 0,
+        draft_capture_slots: 0,
+        target_hidden_width: 0,
+        target_routes_experts: false,
+        vocab_size: 0,
     };
 
     /// The runtime driver's constructor: every field is the same-named
