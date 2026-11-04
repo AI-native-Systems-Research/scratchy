@@ -489,6 +489,26 @@ pub fn chart(spec: &Chart, label: &str, mount: &str, scale: Option<&str>) -> Ele
 /// The overview's ratio scale.
 const GLANCE_SCALE: &str = "scale-glance";
 
+thread_local! { static GLANCES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+
+/// Starts a page's glance count again, so each build numbers its glances from the first.
+pub fn new_page() {
+    GLANCES.with(|n| n.set(0));
+}
+
+/// A glance's scale id: `scale-glance`, then `scale-glance-2`, `-3` for each later glance on the
+/// page ([`new_page`]), so no two share one. Counted per thread: a page is built on one.
+fn glance_scale_id() -> String {
+    let n = GLANCES.with(|n| {
+        n.set(n.get() + 1);
+        n.get()
+    });
+    match n {
+        1 => GLANCE_SCALE.to_string(),
+        n => format!("{GLANCE_SCALE}-{n}"),
+    }
+}
+
 /// The ratio heatmaps' colour scale, upright: RATIO_STEPS fastest at the top,
 /// labelled at the ends and the middle. Carbon's heatmap only draws its legend
 /// as a bar underneath.
@@ -710,7 +730,8 @@ pub fn glance_maps(
         columns.len()
     );
     rsx! {
-        div { style: "display: flex; gap: 2rem",
+        // The block a mini map finds its scale in: the page can hold several, one a section.
+        div { "data-glance": "", style: "display: flex; gap: 2rem",
             div { style: "{grid}",
                 for row in rows {
                     div { style: "grid-column: 1 / -1; display: grid; grid-template-columns: subgrid",
@@ -733,7 +754,9 @@ pub fn glance_maps(
                     }
                 }
             }
-            if scale { {ratio_scale(ScaleFit::Beside, GLANCE_SCALE)} }
+            // Its own id, the page's nth glance's: the minis inside find it by their block
+            // (charts.js), whose id they carry, so several glances can share a page.
+            if scale { {ratio_scale(ScaleFit::Beside, &glance_scale_id())} }
         }
     }
 }
