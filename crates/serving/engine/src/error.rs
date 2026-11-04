@@ -22,11 +22,6 @@ pub enum EngineError {
     #[error("engine is shut down")]
     Shutdown,
 
-    /// Protocol/transport error.
-    #[cfg(feature = "multiproc")]
-    #[error("transport error: {0}")]
-    Transport(#[from] scratchy_serving_transport::transport::TransportError),
-
     /// Configuration error.
     #[error("configuration error: {0}")]
     Config(String),
