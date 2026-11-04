@@ -608,7 +608,7 @@ pub enum AttnMask {
 
 impl AttnMask {
     /// The sliding window size, for every consumer that only needs the number.
-    pub fn window(self) -> Option<std::num::NonZeroU32> {
+    pub const fn window(self) -> Option<std::num::NonZeroU32> {
         match self {
             AttnMask::Causal => None,
             AttnMask::SlidingWindow { window } => Some(window),

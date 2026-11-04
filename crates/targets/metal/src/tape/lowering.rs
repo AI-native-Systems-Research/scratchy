@@ -20,7 +20,6 @@ use crate::tape::ids::ArenaSlotIdx as Slot;
 use crate::tape::ids::{QSize, RowStride, SourceIx};
 use crate::tape::kernel_bindings::{CosSinTable, source};
 use crate::tape::kernel_constants::{QueryRows, norm_threads};
-use scratchy_subtile::model_consts::MetalModelConsts;
 use crate::tape::step::{
     AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertBundle,
     ExpertMatmul, ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize,
@@ -31,6 +30,7 @@ use crate::tape::step::{
 };
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
+use scratchy_subtile::model_consts::{KvClass, MetalModelConsts};
 use scratchy_subtile::subtile_ir::ExpertBody;
 
 /// Value passed as `ATTN_BLOCKS_PER_CHUNK` to the attention reader's
@@ -731,6 +731,8 @@ fn tq_stage_command<const IS_K: bool>(
     pass: super::kernel_constants::TqStagePass,
     bits: TqBits,
 ) -> LoweredCommand {
+    // The class's own geometry — the ONE law; `is_global` names the layers this staging serves.
+    let geo = p.attn_geometry(KvClass::from(is_global));
     let (ror_rd, ror_po, ror_on, _) = if IS_K {
         rope_on_read_params(p, is_global)
     } else {
@@ -751,9 +753,9 @@ fn tq_stage_command<const IS_K: bool>(
             p.metal_dtype,
         ),
         constants: super::kernel_constants::TqStageConstants {
-            head_dim: super::ids::HeadDim(p.global_head_dim),
-            num_kv_heads: super::ids::NumKvHeads(p.num_global_kv_heads),
-            block_size: super::ids::BlockSize(p.global_block_size),
+            head_dim: super::ids::HeadDim(geo.hd),
+            num_kv_heads: super::ids::NumKvHeads(geo.nkvh),
+            block_size: super::ids::BlockSize(geo.block_size),
             blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
             bits: super::ids::TqCodeBits(bits.get()),
             rot_dim: ror_rd,
@@ -765,7 +767,7 @@ fn tq_stage_command<const IS_K: bool>(
         }
         .into_baked(),
         dispatch: DispatchShape {
-            threadgroups: (1, p.num_global_kv_heads, bucket_m),
+            threadgroups: (1, geo.nkvh, bucket_m),
             threads_per_threadgroup: (32, 1, 1),
             m_scaling: None,
         },
@@ -796,7 +798,7 @@ fn tq_rotate_command(
         library: "attention",
         function,
         constants: super::kernel_constants::TqRotateRowsConstants {
-            head_dim: super::ids::HeadDim(p.global_head_dim),
+            head_dim: super::ids::HeadDim(p.attn_geometry(KvClass::Global).hd),
             num_q_heads: super::ids::NumQHeads(p.num_q_heads),
         }
         .into_baked(),
@@ -1619,14 +1621,17 @@ fn decode_attention_per_kv_head(
         attention,
         MetalStep::AttnPackedKv(_, _, _, _, AttnMask::Causal, _)
     );
-    let hd = p.global_head_dim;
+    // The full causal class's head dim — the ONE geometry law, keyed by the class the walk
+    // already selected (`full`): the split kernel's partials are laid out at that class's pair.
+    let geo = p.attn_geometry(if full { KvClass::Global } else { KvClass::Base });
+    let hd = geo.hd;
     let lane_stride = |c: &LoweredCommand| {
         (c.constants.iter())
             .find(|k| k.index == 9)
             .is_none_or(|pair_off| pair_off.bits % (hd / 32) == 0)
     };
     let takes = |c: &LoweredCommand| c.kernel == KernelId::AttentionViaCacheTq && lane_stride(c);
-    let group = p.num_q_heads / p.num_global_kv_heads.max(1);
+    let group = geo.nqh / geo.nkvh;
     let keys = at.block_cap.saturating_mul(p.global_block_size);
     let splits = keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS);
     // A row's partials are `[num_q_heads, splits, 2 + D]` f32s. Every row's, a wide prefill
@@ -1637,7 +1642,7 @@ fn decode_attention_per_kv_head(
     let bucket_partials = u64::from(at.bucket_m) * row_partials;
     let geometry = p.kv_codec == KvCodec::TurboQuant(TqBits::new(4))
         && (1..=GQA_HEADS).contains(&group)
-        && p.num_q_heads == group * p.num_global_kv_heads
+        && geo.nqh == group * geo.nkvh
         // The head dims the split's simdgroup tiling steps: head_dim/32 simdgroups in whole key
         // groups of 8, 4 or 2 — {64, 128, 256, 512} and nothing between (the kernel's
         // `NSG % SG` assert backs the same set at the bake).
@@ -1695,7 +1700,7 @@ fn decode_attention_per_kv_head(
             ),
             constants: baked(split_constants),
             dispatch: DispatchShape {
-                threadgroups: (x, p.num_global_kv_heads, splits + writer),
+                threadgroups: (x, geo.nkvh, splits + writer),
                 threads_per_threadgroup: (hd, 1, 1),
                 ..command.dispatch
             },
@@ -2418,11 +2423,8 @@ fn rope_on_read_params(
     if !p.rope_on_read {
         return (None, None, None, None);
     }
-    let (rd, hd) = if is_global {
-        (p.global_rot_dim, p.global_head_dim)
-    } else {
-        (p.rot_dim, p.head_dim)
-    };
+    let geo = p.attn_geometry(KvClass::from(is_global));
+    let (rd, hd) = (geo.rot_dim, geo.hd);
     let pair_off = if is_global && p.rope_proportional {
         hd / 2
     } else {
@@ -4795,18 +4797,12 @@ fn lower_one(
             // sliding tiles use the base consts (256 / 8 / full).
             // Identity on uniform models.
             let is_global = *class == AttnMask::Causal;
-            let (hd, n_kv, rd, bs) = if is_global {
-                (
-                    p.global_head_dim,
-                    p.num_global_kv_heads,
-                    p.global_rot_dim,
-                    // Page-unified GLOBAL block size — the slot_mapping for a
-                    // full layer is encoded with this bs (Gemma4: 32).
-                    p.global_block_size,
-                )
-            } else {
-                (p.head_dim, p.num_kv_heads, p.rot_dim, p.block_size)
-            };
+            // The class's own geometry — the ONE law
+            // ([`MetalModelConsts::attn_geometry`], keyed by the mask); the page a full layer
+            // runs at is page-unified UP to the sliding page (Gemma4: 32 vs 16), which the
+            // class's own `block_size` already states.
+            let geo = p.attn_geometry(KvClass::of(*class));
+            let (n_kv, hd, rd, bs) = (geo.nkvh, geo.hd, geo.rot_dim, geo.block_size);
             // Rotation pairing: standard NeoX pairs lane i with
             // i + rot_dim/2 INSIDE the rot window (full rope and
             // HF-style partial rope, e.g. Qwen3.5 rot 64 of 256).
@@ -4883,14 +4879,10 @@ fn lower_one(
                 return Err(LoweringError::UnrotatedWriterOffset { index: w.index });
             }
             let codec = kv_writer_codec(p, *write, *offsets, LayerId(*layer), layer_offset, w)?;
-            let (hd, n_kv, bs) = match class {
-                AttnMask::Causal => (
-                    p.global_head_dim,
-                    p.num_global_kv_heads,
-                    p.global_block_size,
-                ),
-                AttnMask::SlidingWindow { .. } => (p.head_dim, p.num_kv_heads, p.block_size),
-            };
+            // The class's own geometry — the ONE law, keyed by the mask
+            // ([`KvClass::of`]): head dim, kv heads, rot window and page together.
+            let geo = p.attn_geometry(KvClass::of(*class));
+            let (n_kv, hd, bs) = (geo.nkvh, geo.hd, geo.block_size);
             LoweredCommand {
                 kernel: KernelId::KvAppend,
                 library: "kv_append",
@@ -4948,18 +4940,11 @@ fn lower_one(
                 "metal lowering: RopeAppendNormed is NeoX-only (the matcher \
                  requires OpKind::RopeAppend)"
             );
-            // Same geometry-class selection as the RopeAppend arm.
+            // Same geometry-class selection as the RopeAppend arm — the ONE geometry law
+            // ([`MetalModelConsts::attn_geometry`], keyed by the mask).
             let is_global = *class == AttnMask::Causal;
-            let (hd, n_kv, rd, bs) = if is_global {
-                (
-                    p.global_head_dim,
-                    p.num_global_kv_heads,
-                    p.global_rot_dim,
-                    p.global_block_size,
-                )
-            } else {
-                (p.head_dim, p.num_kv_heads, p.rot_dim, p.block_size)
-            };
+            let geo = p.attn_geometry(KvClass::of(*class));
+            let (n_kv, hd, rd, bs) = (geo.nkvh, geo.hd, geo.rot_dim, geo.block_size);
             assert!(
                 hd <= 512,
                 "metal lowering: RopeAppendNormed threadgroup staging is sized \
@@ -5037,14 +5022,17 @@ fn lower_one(
             // error per layer on Llama-3.2 decode and produced
             // degenerate output after the first decode token).
             let n_q_heads = p.num_q_heads;
+            // The GLOBAL class's geometry — `attention()` tiles are the global class's on
+            // hybrid arches (identity on uniform ones): the ONE law, no inline pair.
+            let geo = p.attn_geometry(KvClass::Global);
             // One threadgroup serves the largest divisor of the GQA group
             // (`TqDecodeHeads::largest_group`), so the walk reads each key
             // once for the whole group instead of once per query head; the
             // threadgroups count drops to the KV heads' head groups.
             let served = super::ids::TqDecodeHeads::largest_group(
-                super::ids::HeadDim(p.global_head_dim),
+                super::ids::HeadDim(geo.hd),
                 super::ids::NumQHeads(n_q_heads),
-                super::ids::NumKvHeads(p.num_global_kv_heads),
+                super::ids::NumKvHeads(geo.nkvh),
             );
             LoweredCommand {
                 kernel: KernelId::AttentionViaCache,
@@ -5059,9 +5047,9 @@ fn lower_one(
                     // hybrid sliding/global arches (Gemma4: 512×1kv);
                     // GLOBAL_* default to the base values on uniform
                     // models, so this is identity for Llama/Qwen.
-                    head_dim: super::ids::HeadDim(p.global_head_dim),
-                    num_q_heads: super::ids::NumQHeads(p.num_q_heads),
-                    num_kv_heads: super::ids::NumKvHeads(p.num_global_kv_heads),
+                    head_dim: super::ids::HeadDim(geo.hd),
+                    num_q_heads: super::ids::NumQHeads(geo.nqh),
+                    num_kv_heads: super::ids::NumKvHeads(geo.nkvh),
                     attn_scale: super::ids::AttnScale(p.attn_scale),
                     // GLOBAL class block size — vLLM page-unifies the full
                     // class UP to the sliding page (Gemma4: 32 vs sliding 16).
@@ -5075,12 +5063,7 @@ fn lower_one(
                     rot_dim: ror_rd,
                     pair_off: ror_po,
                     rope_on_read: ror_on,
-                    pair_coresident: pair_coresident_param(
-                        ror_rd,
-                        ror_po,
-                        ror_on,
-                        p.global_head_dim,
-                    ),
+                    pair_coresident: pair_coresident_param(ror_rd, ror_po, ror_on, geo.hd),
                     // gpt-oss sinks: the const mirrors the binding's presence
                     // (the 0/1 master switch the shader gates its column on).
                     sinks: w.sinks().map(|_| 1),
@@ -5140,15 +5123,13 @@ fn lower_one(
                 !sliding || p.sliding_window > 0,
                 "SlidingAttentionPrefillPaged lowered with SLIDING_WINDOW <= 0"
             );
+            // The class's own geometry — the ONE law ([`KvClass::from`]: the sliding tile is
+            // the base class's); the window is the class's own fact beside it.
+            let geo = p.attn_geometry(KvClass::from(!sliding));
             let (head_dim, num_kv_heads, block_size, window) = if sliding {
-                (p.head_dim, p.num_kv_heads, p.block_size, p.sliding_window)
+                (geo.hd, geo.nkvh, geo.block_size, p.sliding_window)
             } else {
-                (
-                    p.global_head_dim,
-                    p.num_global_kv_heads,
-                    p.global_block_size,
-                    0,
-                )
+                (geo.hd, geo.nkvh, geo.block_size, 0)
             };
             // ── hd512 UNFUSED attention (gemma4 GLOBAL class, head_dim 512) ──
             // The fused gqa_shared kernel is O(T²) and slow for head_dim 512

@@ -79,7 +79,86 @@ pub struct MetalModelConsts {
     pub vocab_size: usize,
 }
 
+/// ⭐ THE TWO KV GEOMETRIES A MODEL HOLDS — a hybrid-attention arch (gemma-4: sliding layers
+/// beside every-6th global ones) states two `(nkvh, hd)` pairs, and every lowering that picks
+/// one states WHICH. Not a `bool`: `local`/`global` are negations of each other and both are in
+/// scope at every construction site — the exact shape that lets one land in the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvClass {
+    /// The windowed (sliding) layers' — the model's BASE pair (`num_kv_heads`, `head_dim`).
+    Base,
+    /// The full causal layers' — the model's GLOBAL pair (`num_global_kv_heads`,
+    /// `global_head_dim`).
+    Global,
+}
+
+/// The class's own geometry, as [`MetalModelConsts::attn_geometry`] states it — the head dim,
+/// kv heads, rot window and page a class owns, beside its query head count. Named fields, never
+/// a tuple: a reader states which fact it takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvGeometry {
+    /// The class's query head count (every class's own).
+    pub nqh: u32,
+    /// The class's kv head count — the GQA divisibility law at the fill proves it divides
+    /// `nqh`, so it is at least one and no reader re-defends a zero.
+    pub nkvh: u32,
+    /// The class's head dim.
+    pub hd: u32,
+    /// The class's rot window.
+    pub rot_dim: u32,
+    /// The class's page size.
+    pub block_size: u32,
+}
+
+impl From<bool> for KvClass {
+    /// The class a site's own `is_global` bool names — the bridge for metal's arms that carry
+    /// the class as a bool today. The mask-keyed [`KvClass::of`] is the preferred spelling; a
+    /// site that has the mask never needs this.
+    fn from(is_global: bool) -> Self {
+        if is_global { Self::Global } else { Self::Base }
+    }
+}
+
+impl KvClass {
+    /// The class of a mask — the ONE statement of which pair a layer's attention takes: a
+    /// windowed mask is a base-pair layer's, the causal mask a global-pair layer's. Both
+    /// targets' selections go through here ([`MetalModelConsts::attn_geometry`]).
+    pub const fn of(mask: crate::subtile_ir::AttnMask) -> Self {
+        if mask.window().is_some() {
+            Self::Base
+        } else {
+            Self::Global
+        }
+    }
+}
+
 impl MetalModelConsts {
+    /// ⭐ THE CLASS'S ATTENTION GEOMETRY — every fact a class owns, the ONE statement of the
+    /// two-geometry law every target's lowering reads: a windowed class (sliding layers,
+    /// gemma-4's shape) takes the base facts, the full causal class the global ones; the query
+    /// head count is every class's own. Stated here — on the one struct every lowering already
+    /// reads — so no lowering re-derives it as an inline `if`, and spyre and metal cannot
+    /// disagree about which facts a class takes. The class's head dim, kv heads, rot window and
+    /// page travel TOGETHER: a site that has a [`KvClass`] in scope branches on nothing.
+    pub const fn attn_geometry(&self, class: KvClass) -> KvGeometry {
+        match class {
+            KvClass::Base => KvGeometry {
+                nqh: self.num_q_heads,
+                nkvh: self.num_kv_heads,
+                hd: self.head_dim,
+                rot_dim: self.rot_dim,
+                block_size: self.block_size,
+            },
+            KvClass::Global => KvGeometry {
+                nqh: self.num_q_heads,
+                nkvh: self.num_global_kv_heads,
+                hd: self.global_head_dim,
+                rot_dim: self.global_rot_dim,
+                block_size: self.global_block_size,
+            },
+        }
+    }
+
     /// The value that travels with a `compile_error!` token stream on an expansion-refused
     /// path: the emitted tokens never compile, so NO field of this value is ever read. It
     /// exists only so a refusal can return the same `(TokenStream, Self)` type as the success
