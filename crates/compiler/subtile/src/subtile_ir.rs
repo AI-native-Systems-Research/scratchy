@@ -607,6 +607,14 @@ pub enum AttnMask {
 }
 
 impl AttnMask {
+    /// The attention class a layer of this mask reads: the one mapping from a mask to a class.
+    pub fn class(self) -> scratchy_ir::model_facts::AttnClass {
+        match self {
+            AttnMask::Causal => scratchy_ir::model_facts::AttnClass::Full,
+            AttnMask::SlidingWindow { .. } => scratchy_ir::model_facts::AttnClass::Sliding,
+        }
+    }
+
     /// The sliding window size, for every consumer that only needs the number.
     pub fn window(self) -> Option<std::num::NonZeroU32> {
         match self {

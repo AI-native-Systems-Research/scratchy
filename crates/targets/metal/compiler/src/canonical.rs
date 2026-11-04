@@ -15,6 +15,7 @@
 
 use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
+use scratchy_ir::model_facts::ModelFacts;
 use scratchy_subtile::handoff::{LoweredDecode, SlotMap, WeightKind, WeightSlot};
 use scratchy_subtile::kv_codec::{KvCodecError, expand_kv_codec};
 use scratchy_subtile::sample_rows::{ResultRows, SampleRowsError, expand_sample_rows};
@@ -29,7 +30,6 @@ use scratchy_target_metal::op_abi::{
 };
 use scratchy_target_metal::tape::ids::{ArenaSlotIdx, SourceIx};
 use scratchy_target_metal::tape::lowered::Fence;
-use scratchy_target_metal::tape::model_consts::MetalModelConsts;
 use scratchy_target_metal::tape::step::{
     AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, LayerId, MetalStepTape,
     RotaryTables, RowSource,
@@ -290,7 +290,7 @@ fn decode_barriers(t: &Assembled, flags: &[Fence], m: u64) -> usize {
 pub fn lower_canonical(
     l: &LoweredDecode,
     facts: &MetalStepFacts<'_>,
-    consts: &MetalModelConsts,
+    consts: &ModelFacts,
     at: CanonicalAt<'_>,
     sources: &mut SourceManifest,
     fusions: &FusionTable<MetalFusion>,
@@ -307,9 +307,9 @@ pub fn lower_canonical(
         return Err(CanonicalRefusal::Guards { bucket });
     }
     // Metal's TurboQuant: the codec steps its declared facts insert.
-    // Only on a model built with it (`MetalModelConsts::kv_codec`): a dense model runs none.
+    // Only on a model built with it (`ModelFacts::kv_codec`): a dense model runs none.
     let coded;
-    let l = if consts.kv_codec.is_turboquant() {
+    let l = if consts.kv_codec().is_turboquant() {
         coded = expand_kv_codec(l, &METAL_KV_CODEC).map_err(CanonicalRefusal::KvCodec)?;
         &coded
     } else {
@@ -339,7 +339,7 @@ pub fn lower_canonical(
         matvec_ends: m <= u64::from(scratchy_target_metal::tape::quantized::QMV_MATVEC_BAND_ROWS),
         matvec_norms: m == 1,
         row_programs: m <= u64::from(scratchy_target_metal::tape::quantized::QMV_MATVEC_BAND_ROWS),
-        hidden_out: consts.spec_drafts > 0,
+        hidden_out: consts.spec_drafts().is_some(),
     };
     // Metal's barriers drain everything in flight: independent branches run between the same ones.
     // A fused command reads what its fold absorbed and writes its epilogues, so the folds the tape
@@ -388,8 +388,8 @@ pub fn lower_canonical(
         colours: &colours,
         folds: &folds,
         facts,
-        hidden: HiddenSize(consts.hidden_size as u32),
-        intermediate: IntermediateSize(consts.intermediate_size as u32),
+        hidden: HiddenSize(consts.hidden().get() as u32),
+        intermediate: (consts.intermediate()).map(|i| IntermediateSize(i.get() as u32)),
         bucket_m: m as u32,
     }
     .records()
@@ -528,7 +528,7 @@ pub struct ClassedCanonical {
 pub fn lower_canonical_classed(
     l: &LoweredDecode,
     facts: &MetalStepFacts<'_>,
-    consts: &MetalModelConsts,
+    consts: &ModelFacts,
     at: CanonicalAt<'_>,
     sources: &mut SourceManifest,
 ) -> Result<ClassedCanonical, CanonicalRefusal> {

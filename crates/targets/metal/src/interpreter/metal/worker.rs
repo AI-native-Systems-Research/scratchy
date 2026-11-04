@@ -2375,9 +2375,45 @@ mod tests {
         let device = device.device.clone();
         let cache =
             SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
-        let p = crate::tape::model_consts::MetalModelConsts {
-            metal_dtype: MetalDtype::F16,
-            ..crate::tape::model_consts::MetalModelConsts::from_canonical::<TestWeights>()
+        // `TestWeights`' geometry, at f16: the sampled-rows commands read the dtype alone.
+        let p = {
+            use scratchy_ir::model_facts::{
+                Attention, AttnScale, BlockSize, FactsParts, HeadDim, HeadGeometry, HiddenSize,
+                IntermediateSize, KvHeads, KvRope, ModelFacts, NormWeightOffset, QueryHeads,
+                RmsNormEps, Rope, RopePairing, RotDim, ScaleDtype,
+            };
+            let class = HeadGeometry::new(
+                QueryHeads::new(32),
+                KvHeads::new(4),
+                HeadDim::new(64),
+                RotDim::new(64),
+                BlockSize::new(16),
+            );
+            ModelFacts::new(FactsParts {
+                metal_dtype: MetalDtype::F16,
+                scale_dtype: ScaleDtype::F16,
+                hidden: HiddenSize::new(2048),
+                intermediate: Some(IntermediateSize::new(5632)),
+                vocab: None,
+                eps: RmsNormEps::new(1e-5),
+                norm_offset: NormWeightOffset::new(0.0),
+                final_softcap: None,
+                kv_codec: scratchy_ir::KvCodec::Dense,
+                attention: Some(Attention::new(
+                    class,
+                    class,
+                    AttnScale::new(0.125),
+                    None,
+                    None,
+                    Rope::new(RopePairing::Standard, KvRope::AtWrite, None),
+                )),
+                vision: None,
+                gdn: None,
+                drafter: None,
+                spec_drafts: None,
+                capture_slots: None,
+                target: None,
+            })
         };
         // Decodes, then verifies (every row sampled), then short prefix-hit chunks, then long
         // chunks.

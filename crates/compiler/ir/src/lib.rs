@@ -25,6 +25,9 @@ use scratchy_tensors::tensor::MAX_DIMS;
 // backend feature.
 pub use scratchy_layers::turboquant::{DenseReason, KvCodec, KvGeometry, TqBits, codec_for};
 use scratchy_tensors::{MetalDtype, ScaleDtype};
+
+pub mod model_facts;
+
 // The `GpuTensor`, `AffineQuantEmbedding` (in `scratchy-quantizations`), and
 // `scratchy_layers` layer structs are referenced exclusively through
 // fully-qualified paths (`::scratchy_tensors::tensor::GpuTensor`,
@@ -1096,7 +1099,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// (vLLM's default); per-canonical override only if a model
     /// chooses a different paging size. This is the SLIDING-class block
     /// size on hybrid arches (see [`Self::GLOBAL_BLOCK_SIZE`]).
-    const BLOCK_SIZE: u32 = 16;
+    const BLOCK_SIZE: u32 = model_facts::DEFAULT_KV_PAGE.get();
 
     /// Paged-KV-cache block stride for the GLOBAL (full-attention) layer
     /// class on hybrid sliding/global arches. vLLM's group-shared KV

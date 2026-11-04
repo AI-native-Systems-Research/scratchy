@@ -296,11 +296,11 @@ fn metal_bake_file(bytes: &[u8], extension: &str) -> TokenStream {
     }
     quote! { include_bytes!(concat!(env!("OUT_DIR"), "/", #name)) }
 }
+use scratchy_ir::model_facts::ModelFacts;
 use scratchy_target_metal::aot;
 use scratchy_target_metal::specialized_pipeline_cache::PipelineKey;
 use scratchy_target_metal::tape::constants::TapeVariant;
 use scratchy_target_metal::tape::lowering as tl;
-use scratchy_target_metal::tape::model_consts::MetalModelConsts;
 use scratchy_target_metal::tape::step::{MetalStepTape, RotaryTables};
 use scratchy_target_metal::tape::targets::MetalTargetProfile;
 
@@ -402,7 +402,7 @@ struct Rung<'a> {
 }
 
 fn run_lower(
-    mc: &MetalModelConsts,
+    mc: &ModelFacts,
     input: &BucketLowerInput<'_>,
     rung: &Rung<'_>,
 ) -> Result<LoweredMetalTape, LoweringError> {
@@ -432,17 +432,22 @@ fn run_lower(
 ///
 /// [`ClassedTape::rung`]: scratchy_target_metal::tape::lowered::ClassedTape::rung
 pub fn bake_bucket_tapes(
-    mc: &MetalModelConsts,
+    mc: &ModelFacts,
     input: &BucketLowerInput<'_>,
     pool: &mut CommandPool,
 ) -> Result<TokenStream, BakeDefect> {
     let classes = [GenClass::M1, GenClass::Mid, GenClass::M5, GenClass::M5Wide];
-    let candidates: Vec<TqDecodeHeads> = TqDecodeHeads::candidates(
-        HeadDim(mc.global_head_dim),
-        NumQHeads(mc.num_q_heads),
-        NumKvHeads(mc.num_global_kv_heads),
-    )
-    .collect();
+    // The TurboQuant decode's head groups the global class admits; a model without attention
+    // decodes no attention, so it bakes none.
+    let candidates: Vec<TqDecodeHeads> = match mc.attention() {
+        Some(a) => TqDecodeHeads::candidates(
+            HeadDim(a.global().head_dim().get()),
+            NumQHeads(a.q_heads().get()),
+            NumKvHeads(a.global().kv_heads().get()),
+        )
+        .collect(),
+        None => Vec::new(),
+    };
     let mut entries: Vec<TokenStream> = Vec::new();
     let mut body_statics: Vec<TokenStream> = Vec::new();
     // Dedupe: identical bodies share ONE hoisted static — every labelled variant would otherwise
@@ -542,7 +547,7 @@ pub fn bake_bucket_tapes(
         };
         for tq_heads in heads {
             let variant = TapeVariant { cap, tq_heads };
-            pool.name_kernels(tape.commands, mc.metal_dtype, variant)?;
+            pool.name_kernels(tape.commands, mc.metal_dtype(), variant)?;
             let class_toks = tok("class", crate::const_tokens::const_tokens(&class))?;
             let addressing_toks =
                 tok("addressing", crate::const_tokens::const_tokens(&addressing))?;

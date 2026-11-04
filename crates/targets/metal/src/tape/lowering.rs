@@ -16,11 +16,14 @@
 //! The match over [`MetalStep`] is exhaustive: a new step kind fails to
 //! compile here (E0004) until its arm exists.
 
+use crate::tape::facts::{
+    attention, base, class, drafter, final_softcap, gdn, global, intermediate, kernel_drafts,
+    kernel_window, proportional, q_heads, rope_on_read, target, vision, vocab,
+};
 use crate::tape::ids::ArenaSlotIdx as Slot;
 use crate::tape::ids::{QSize, RowStride, SourceIx};
 use crate::tape::kernel_bindings::{CosSinTable, source};
 use crate::tape::kernel_constants::{QueryRows, norm_threads};
-use crate::tape::model_consts::MetalModelConsts;
 use crate::tape::step::{
     AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertBundle,
     ExpertMatmul, ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize,
@@ -29,6 +32,7 @@ use crate::tape::step::{
     RotaryTables, RotatedRows, RouterInput, RowSource, RowsDivisor, RowsPerToken, SampleRowsStep,
     SampledMatmul, Scale, StepRow, UnaryAct, UngatedAct,
 };
+use scratchy_ir::model_facts::{AttnClass, ModelFacts};
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
 use scratchy_subtile::subtile_ir::ExpertBody;
@@ -114,10 +118,10 @@ impl<'a> RowSources<'a> {
     }
 
     /// The table the row's rope reads: its site's first cos/sin, or MRoPE's per-forward one.
-    fn cos_sin(self, p: &MetalModelConsts) -> Result<CosSinTable, LoweringError> {
-        match p.mrope {
-            true => Ok(CosSinTable::Mrope),
-            false => self.of(WeightKind::CosSin, 0).map(CosSinTable::Static),
+    fn cos_sin(self, p: &ModelFacts) -> Result<CosSinTable, LoweringError> {
+        match p.attention().and_then(|a| a.mrope()) {
+            Some(_) => Ok(CosSinTable::Mrope),
+            None => self.of(WeightKind::CosSin, 0).map(CosSinTable::Static),
         }
     }
 
@@ -152,7 +156,7 @@ impl<'a> RowSources<'a> {
 /// offending half and surfaces the per-half index.
 pub fn lower_subtile_tape_to_metal(
     steps: &MetalStepTape,
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     at: BakePoint<'_>,
 ) -> Result<LoweredMetalTape, LoweringError> {
     let half = |rows, barriers, sources, live, planes| {
@@ -185,7 +189,7 @@ pub fn lower_subtile_tape_to_metal(
     // A KV writer encodes when it binds the packed store.
     let encodes =
         |c: &GatedCommand| writer_binds(c, |k| matches!(k, RuntimeBindingKind::TqPackedK { .. }));
-    if p.kv_codec.is_turboquant()
+    if p.kv_codec().is_turboquant()
         && bb.commands.iter().any(|c| writes_kv_cache(&c))
         && !bb.commands.iter().any(|c| encodes(&c))
     {
@@ -271,7 +275,7 @@ fn writes_cache(c: &GatedCommand) -> bool {
 /// on a step that samples fewer the sampled rows' logits move to the front. Every other step's
 /// commands pass through.
 fn sample_rows(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     step: &MetalStep,
     plain: Vec<GatedCommand>,
     bucket_m: u32,
@@ -404,7 +408,7 @@ fn writes_logits(tape: Option<LogitsRows>, step: Option<LogitsRows>) -> Option<L
 /// A weight of group size 32 has no W4A8 GEMM, so its small-M steps take the bf16 twin, which
 /// reads the codes as written: it stays offset-8.
 fn codes_for(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     profile: Option<&crate::targets::MetalTargetProfile>,
     class: crate::tape::lowered::GenClass,
     half: Planes,
@@ -415,7 +419,7 @@ fn codes_for(
     let codes = super::kernel_constants::AffineCodes::of(profile, bits);
     let planes = half == Planes::Backbone
         && class == crate::tape::lowered::GenClass::M5Wide
-        && p.draft_selector_rank == 0
+        && p.drafter().is_none()
         && matches!(group_size, 64 | 128);
     if planes { codes.planes(k) } else { codes }
 }
@@ -450,7 +454,7 @@ fn slices(plain: &[GatedCommand], bucket_m: u32) -> bool {
 /// just the gathered sampled rows, one threadgroup row each, instead of sweeping the
 /// `⌈bucket_m/32⌉` qmm_t tiles.
 fn affine_qmv_command(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     g: &AffineMatmul,
     rows: u32,
     set_axis: Option<SetAxis>,
@@ -592,7 +596,7 @@ const PUT_BACK: (KernelId, [&str; 2]) = (
 /// The step's sampled rows of `slot` to its front, in order, in place: row `i` swapped with
 /// sampled row `i` — the lm_head slice's input, or every row's logits compacted.
 pub(crate) fn gather_sampled_rows_command(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     slot: Slot,
     row_stride: RowStride,
 ) -> LoweredCommand {
@@ -601,7 +605,7 @@ pub(crate) fn gather_sampled_rows_command(
 
 /// The gather undone over `slot`, in place: row `i` swapped back to sampled row `i`.
 pub(crate) fn put_sampled_rows_back_command(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     slot: Slot,
     row_stride: RowStride,
 ) -> LoweredCommand {
@@ -609,7 +613,7 @@ pub(crate) fn put_sampled_rows_back_command(
 }
 
 fn sample_slice_command(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     slot: Slot,
     row_stride: RowStride,
     (kernel, [f16_symbol, bf16_symbol]): (KernelId, [&'static str; 2]),
@@ -620,7 +624,7 @@ fn sample_slice_command(
     LoweredCommand {
         kernel,
         library: "sample_rows",
-        function: pick_specialized_symbol(f16_symbol, bf16_symbol, p.metal_dtype),
+        function: pick_specialized_symbol(f16_symbol, bf16_symbol, p.metal_dtype()),
         constants: super::kernel_constants::SampleRowsConstants { row_stride }.into_baked(),
         dispatch: DispatchShape {
             threadgroups: (row_stride.get().div_ceil(THREADS_PER_TG), 1, 1),
@@ -683,7 +687,7 @@ impl TqOperands {
     /// The operands a KV writer with `offsets` caches, each bias bound from the row's site `w`
     /// — refused where a K bias has no rotary table to rotate it by.
     fn of(
-        p: &MetalModelConsts,
+        p: &ModelFacts,
         offsets: KvOffsets,
         layer: LayerId,
         w: RowSources<'_>,
@@ -707,7 +711,7 @@ impl TqOperands {
             k: TqOperand(bias(k)?),
             v: TqOperand(bias(v)?),
         };
-        if ops.k.0.is_some() && !p.rope_on_read {
+        if ops.k.0.is_some() && !rope_on_read(p)? {
             return Err(LoweringError::TurboQuantOffsetUnbound { index: w.index });
         }
         Ok(ops)
@@ -722,7 +726,7 @@ impl TqOperands {
 /// width, num_kv_heads, num_seqs) is overridden by the worker per forward; the
 /// baked shape is a placeholder.
 fn tq_stage_command<const IS_K: bool>(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     layer: u32,
     operand: TqOperand<IS_K>,
     is_global: bool,
@@ -730,7 +734,8 @@ fn tq_stage_command<const IS_K: bool>(
     bucket_m: u32,
     pass: super::kernel_constants::TqStagePass,
     bits: TqBits,
-) -> LoweredCommand {
+) -> Result<LoweredCommand, LoweringError> {
+    let global = global(p)?;
     let (ror_rd, ror_po, ror_on, _) = if IS_K {
         rope_on_read_params(p, is_global)
     } else {
@@ -742,18 +747,18 @@ fn tq_stage_command<const IS_K: bool>(
         rope_on_read: table.filter(|_| IS_K),
     });
     bindings.extend(operand.0.map(|b| b.bias_binding(10)));
-    LoweredCommand {
+    Ok(LoweredCommand {
         kernel: KernelId::TqStageRotated,
         library: "attention",
         function: pick_specialized_symbol(
             "tq_stage_rotated_f16",
             "tq_stage_rotated_bf16",
-            p.metal_dtype,
+            p.metal_dtype(),
         ),
         constants: super::kernel_constants::TqStageConstants {
-            head_dim: super::ids::HeadDim(p.global_head_dim),
-            num_kv_heads: super::ids::NumKvHeads(p.num_global_kv_heads),
-            block_size: super::ids::BlockSize(p.global_block_size),
+            head_dim: super::ids::HeadDim(global.head_dim().get()),
+            num_kv_heads: super::ids::NumKvHeads(global.kv_heads().get()),
+            block_size: super::ids::BlockSize(global.page().get()),
             blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
             bits: super::ids::TqCodeBits(bits.get()),
             rot_dim: ror_rd,
@@ -765,43 +770,44 @@ fn tq_stage_command<const IS_K: bool>(
         }
         .into_baked(),
         dispatch: DispatchShape {
-            threadgroups: (1, p.num_global_kv_heads, bucket_m),
+            threadgroups: (1, global.kv_heads().get(), bucket_m),
             threads_per_threadgroup: (32, 1, 1),
             m_scaling: None,
         },
         bindings: baked(bindings),
         gemm_dims: None,
-    }
+    })
 }
 
 /// TurboQuant prefill: rotate the attention's q rows into the codebook domain
 /// in place (`inverse` false, R·q), or its output rows back (`inverse`, Rᵀ·o).
 fn tq_rotate_command(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     rows: Slot,
     inverse: bool,
     bucket_m: u32,
-) -> LoweredCommand {
+) -> Result<LoweredCommand, LoweringError> {
+    let (global, q_heads) = (global(p)?, q_heads(p)?);
     let function = if inverse {
         pick_specialized_symbol(
             "tq_unrotate_rows_f16",
             "tq_unrotate_rows_bf16",
-            p.metal_dtype,
+            p.metal_dtype(),
         )
     } else {
-        pick_specialized_symbol("tq_rotate_rows_f16", "tq_rotate_rows_bf16", p.metal_dtype)
+        pick_specialized_symbol("tq_rotate_rows_f16", "tq_rotate_rows_bf16", p.metal_dtype())
     };
-    LoweredCommand {
+    Ok(LoweredCommand {
         kernel: KernelId::TqRotateRows,
         library: "attention",
         function,
         constants: super::kernel_constants::TqRotateRowsConstants {
-            head_dim: super::ids::HeadDim(p.global_head_dim),
-            num_q_heads: super::ids::NumQHeads(p.num_q_heads),
+            head_dim: super::ids::HeadDim(global.head_dim().get()),
+            num_q_heads: super::ids::NumQHeads(q_heads),
         }
         .into_baked(),
         dispatch: DispatchShape {
-            threadgroups: (bucket_m, p.num_q_heads, 1),
+            threadgroups: (bucket_m, q_heads, 1),
             threads_per_threadgroup: (32, 1, 1),
             m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                 set_axis: None,
@@ -811,7 +817,7 @@ fn tq_rotate_command(
         },
         bindings: super::kernel_bindings::TqRotateRowsBindingSet { rows }.into_baked(),
         gemm_dims: None,
-    }
+    })
 }
 
 /// `Binding::Runtime`s for `kinds`, bound from index `first`.
@@ -830,7 +836,7 @@ fn runtime_at(first: u8, kinds: impl IntoIterator<Item = RuntimeBindingKind>) ->
 /// adds from 16 (`kv_writer.h`'s `KV_WRITER_TQ_BUFFERS`). `None` for a writer that writes the pool alone.
 /// The coded layers are the GLOBAL class (every layer on uniform arches).
 fn kv_writer_codec(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     write: KvWrite,
     offsets: KvOffsets,
     layer: LayerId,
@@ -999,8 +1005,8 @@ fn roped_k_bytes(dims: [u32; 5], block_cap: u32) -> Result<u32, LoweringError> {
 }
 
 /// The model's TurboQuant code width: a codec step lowers only on a model built with the codec.
-fn tq_bits(p: &MetalModelConsts) -> Result<TqBits, LoweringError> {
-    match p.kv_codec {
+fn tq_bits(p: &ModelFacts) -> Result<TqBits, LoweringError> {
+    match p.kv_codec() {
         KvCodec::TurboQuant(bits) => Ok(bits),
         KvCodec::Dense => Err(LoweringError::CodecStepOnDenseModel),
     }
@@ -1085,7 +1091,7 @@ fn route_by_sequence_count(
 /// matmul whose ends were folded into it (its input's norm, its bias, scale or
 /// residual add) has none: its own matvec runs on every step.
 fn route_small_m(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     step: &MetalStep,
     cmds: Vec<GatedCommand>,
     bucket_m: u32,
@@ -1347,10 +1353,10 @@ struct GdnStepsKnown {
 }
 
 impl GdnStepsKnown {
-    fn at(p: &MetalModelConsts, bucket_m: u32) -> Self {
+    fn at(p: &ModelFacts, bucket_m: u32) -> Self {
         Self {
             decode: (bucket_m == 1).then_some(true),
-            plain: (p.spec_drafts == 0).then_some(true),
+            plain: p.spec_drafts().is_none().then_some(true),
         }
     }
 
@@ -1425,20 +1431,21 @@ impl GdnStepsKnown {
 /// bucket only it), the rest the conv, scan and norm. The norm that follows reads the scan's `o`
 /// scratch, so the scan sits between the two.
 fn route_gdn(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     step: &MetalStep,
     cmds: Vec<GatedCommand>,
     bucket_m: u32,
-) -> Vec<GatedCommand> {
+) -> Result<Vec<GatedCommand>, LoweringError> {
     use crate::tape::ids::BucketM;
     use crate::tape::lowered::{MScaleAxis, MScaling, RuntimeGate};
     if !matches!(step, MetalStep::GatedDeltaNet(..) | MetalStep::Mamba2(..)) {
-        return cmds;
+        return Ok(cmds);
     }
+    let gdn = gdn(p)?;
     let known = GdnStepsKnown::at(p, bucket_m);
     let decodes = cmds.iter().any(|c| c.command.library == "gdn_decode");
-    let hv = p.gdn_head_v_dim;
-    let pipelines = p.gdn_head_k_dim == 128 && hv.is_multiple_of(GDN_PIPE_ROWS);
+    let hv = gdn.v_dim().get();
+    let pipelines = gdn.k_dim().get() == 128 && hv.is_multiple_of(GDN_PIPE_ROWS);
     let simd = gdn_scan_simd_static_name(dequant_dtype_for(p));
     // A plain step's scan: the simd scan's geometry (0-4) and Mamba-2's selective form (5-7), not
     // its drafts (8) nor their lanes.
@@ -1454,7 +1461,7 @@ fn route_gdn(
                 .collect(),
         ),
         dispatch: DispatchShape {
-            threadgroups: (p.gdn_num_v_heads * hv / GDN_PIPE_ROWS, 1, 1),
+            threadgroups: (gdn.v_heads().get() * hv / GDN_PIPE_ROWS, 1, 1),
             threads_per_threadgroup: (128, 1, 1),
             m_scaling: Some(MScaling {
                 axis: MScaleAxis::Z,
@@ -1549,7 +1556,7 @@ fn route_gdn(
             c.gate = lane_gate(c.gate, RuntimeGate::UnlessLaneRows);
         }
     }
-    out
+    Ok(out)
 }
 
 /// The keys of the rung's KV cap one threadgroup of `attention_decode_gqa_tq` takes.
@@ -1602,7 +1609,7 @@ const fn combine_threads(hd: u32) -> u32 {
 /// are computed in keeps the twin — a wide prefill bucket carrying the gated decode row
 /// (gemma-4's 4096-token buckets at 4.3 GiB) is the case that refuses.
 fn decode_attention_per_kv_head(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     step: &MetalStep,
     sinks: Option<SourceIx>,
     cmds: Vec<GatedCommand>,
@@ -1619,38 +1626,42 @@ fn decode_attention_per_kv_head(
         attention,
         MetalStep::AttnPackedKv(_, _, _, _, AttnMask::Causal, _)
     );
-    let hd = p.global_head_dim;
+    if !full {
+        return Ok(cmds);
+    }
+    let (global, q_heads) = (global(p)?, q_heads(p)?);
+    let hd = global.head_dim().get();
     let lane_stride = |c: &LoweredCommand| {
         (c.constants.iter())
             .find(|k| k.index == 9)
             .is_none_or(|pair_off| pair_off.bits % (hd / 32) == 0)
     };
     let takes = |c: &LoweredCommand| c.kernel == KernelId::AttentionViaCacheTq && lane_stride(c);
-    let group = p.num_q_heads / p.num_global_kv_heads.max(1);
-    let keys = at.block_cap.saturating_mul(p.global_block_size);
+    // The query heads a KV head serves, exact by `HeadGeometry`'s law.
+    let group = global.gqa();
+    let keys = at.block_cap.saturating_mul(global.page().get());
     let splits = keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS);
     // A row's partials are `[num_q_heads, splits, 2 + D]` f32s. Every row's, a wide prefill
     // bucket carrying the gated decode row can push past the u32 the kernel's offsets are
     // computed in — gemma-4's 4096-token prefill buckets land at 4.3 GiB — and such a bucket
     // keeps the twin.
-    let row_partials = u64::from(p.num_q_heads) * u64::from(splits) * (u64::from(hd) + 2) * 4;
+    let row_partials = u64::from(q_heads) * u64::from(splits) * (u64::from(hd) + 2) * 4;
     let bucket_partials = u64::from(at.bucket_m) * row_partials;
-    let geometry = p.kv_codec == KvCodec::TurboQuant(TqBits::new(4))
+    let geometry = p.kv_codec() == KvCodec::TurboQuant(TqBits::new(4))
         && (1..=GQA_HEADS).contains(&group)
-        && p.num_q_heads == group * p.num_global_kv_heads
         // The head dims the split's simdgroup tiling steps: head_dim/32 simdgroups in whole key
         // groups of 8, 4 or 2 — {64, 128, 256, 512} and nothing between (the kernel's
         // `NSG % SG` assert backs the same set at the bake).
         && matches!(hd, 64 | 128 | 256 | 512)
-        && p.global_block_size.is_multiple_of(8)
+        && global.page().get().is_multiple_of(8)
         && bucket_partials <= u32::MAX as u64
         && (sinks.is_none() || at.bucket_m <= SINKS_SPLIT_MAX_BUCKET_M);
-    if !full || !geometry || !cmds.iter().any(|c| takes(&c.command)) {
+    if !geometry || !cmds.iter().any(|c| takes(&c.command)) {
         return Ok(cmds);
     }
     let row_bytes = row_partials as u32;
     let scratch = scratch_at(SPLIT_PARTIALS_SLOT, 0);
-    let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.metal_dtype);
+    let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.metal_dtype());
     let mut out = Vec::with_capacity(cmds.len() + 1);
     for GatedCommand { command, gate } in cmds {
         if !takes(&command) {
@@ -1695,7 +1706,7 @@ fn decode_attention_per_kv_head(
             ),
             constants: baked(split_constants),
             dispatch: DispatchShape {
-                threadgroups: (x, p.num_global_kv_heads, splits + writer),
+                threadgroups: (x, global.kv_heads().get(), splits + writer),
                 threads_per_threadgroup: (hd, 1, 1),
                 ..command.dispatch
             },
@@ -1718,7 +1729,7 @@ fn decode_attention_per_kv_head(
             ),
             constants: baked(constants),
             dispatch: DispatchShape {
-                threadgroups: (x, p.num_q_heads, 1),
+                threadgroups: (x, q_heads, 1),
                 threads_per_threadgroup: (combine_threads(hd), 1, 1),
                 ..command.dispatch
             },
@@ -1908,7 +1919,7 @@ fn advance_shape(rows: &[StepRow], times: u32, m_divisor: &mut u32) {
 ///
 /// Beside the tape, what its sampled rows' steps write of the logits (`None`: it has none).
 fn lower(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     rows: &[StepRow],
     barriers_in: &[Fence],
     sources: &[Vec<RowSource>],
@@ -2062,7 +2073,7 @@ fn lower(
                     half_planes,
                     &mut splitk_scratch_bytes,
                 )?;
-                let cmds = route_gdn(p, step, cmds, bucket_m);
+                let cmds = route_gdn(p, step, cmds, bucket_m)?;
                 let cmds = route_draft_commit(step, cmds);
                 let cmds = decode_attention_per_kv_head(
                     p,
@@ -2399,15 +2410,15 @@ fn update_shape_state(step: &MetalStep, m_divisor: &mut u32) {
 
 /// Spans rope-on-read: per-attention-arm rotary params for the kernel
 /// fn-consts (rot_dim/pair_off/rope_on_read) + the BindingSet's
-/// `rope_on_read` flag. Returns all-`None` when `p.rope_on_read` is
-/// false (non-spans → byte-identical lowering). `is_global` selects the
+/// `rope_on_read` flag. Returns all-`None` when the attention does not rope on read
+/// (non-spans → byte-identical lowering). `is_global` selects the
 /// layer class: GLOBAL arms (`AttentionViaCache`/`AttentionPrefillPaged`)
 /// use `GLOBAL_ROT_DIM` + proportional pairing; SLIDING arms use the
 /// base `ROT_DIM` with full-NeoX `rot_dim/2` pairing. MUST match how
 /// `rope_append` rotated that layer (lowering.rs ~2339).
 #[allow(clippy::type_complexity)]
 fn rope_on_read_params(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     is_global: bool,
 ) -> (
     Option<super::ids::RotDim>,
@@ -2415,19 +2426,19 @@ fn rope_on_read_params(
     Option<u32>,
     Option<bool>,
 ) {
-    if !p.rope_on_read {
-        return (None, None, None, None);
-    }
-    let (rd, hd) = if is_global {
-        (p.global_rot_dim, p.global_head_dim)
-    } else {
-        (p.rot_dim, p.head_dim)
+    // A model whose keys are rotated at write (or that has no attention) re-ropes nothing.
+    let a = match p.attention() {
+        Some(a) if a.kv_rope() == scratchy_ir::model_facts::KvRope::OnRead => a,
+        _ => return (None, None, None, None),
     };
-    let pair_off = if is_global && p.rope_proportional {
-        hd / 2
-    } else {
-        rd / 2
-    };
+    let class = if is_global { a.global() } else { a.base() };
+    let (rd, hd) = (class.rot_dim().get(), class.head_dim().get());
+    let pair_off =
+        if is_global && a.pairing() == scratchy_ir::model_facts::RopePairing::Proportional {
+            hd / 2
+        } else {
+            rd / 2
+        };
     (
         Some(super::ids::RotDim(rd)),
         Some(super::ids::RopePairOff(pair_off)),
@@ -2441,14 +2452,15 @@ fn rope_on_read_params(
 /// through that sequence's own block-table row, so it is right for any number
 /// of sequences; it leaves grid Z alone (see `MScaling::set_axis`).
 fn sdpa_paged_command(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
+    q_heads: u32,
     constants: super::kernel_constants::AttentionPrefillPagedConstants,
     bindings: super::kernel_bindings::AttentionPrefillPagedBindingSet,
     bucket_m: u32,
 ) -> LoweredCommand {
     use crate::tape::kernel_identity::{AttentionSdpaPagedBf16, AttentionSdpaPagedF16};
     let dispatch = DispatchShape {
-        threadgroups: (p.num_q_heads, bucket_m, 1),
+        threadgroups: (q_heads, bucket_m, 1),
         threads_per_threadgroup: (1024, 1, 1),
         m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
             set_axis: None,
@@ -2456,7 +2468,7 @@ fn sdpa_paged_command(
             bucket_m: super::ids::BucketM(bucket_m),
         }),
     };
-    match p.metal_dtype {
+    match p.metal_dtype() {
         crate::tape::lowered::MetalDtype::Bf16 => {
             LoweredCommand::for_kernel::<AttentionSdpaPagedBf16>(constants, bindings, dispatch)
         }
@@ -2475,9 +2487,7 @@ const VERIFY_TILE_ROWS: u32 = 64;
 /// The geometry of a layer class a verify lane attention lowers at.
 struct VerifyLaneShape<'a> {
     dtype_tag: &'a str,
-    head_dim: u32,
-    num_kv_heads: u32,
-    block_size: u32,
+    class: scratchy_ir::model_facts::HeadGeometry,
     bucket_m: u32,
 }
 
@@ -2491,14 +2501,18 @@ struct VerifyLaneShape<'a> {
 /// lanes fit the tile, and the bucket's partials and packed rows stay small (at most
 /// [`VERIFY_TILE_ROWS`] rows: the scratch scales with them). `None` keeps the plain twin alone.
 fn verify_lane_attention(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     s: VerifyLaneShape<'_>,
     plain: &LoweredCommand,
     moe_scratch_bytes: &mut u32,
 ) -> Option<[LoweredCommand; 3]> {
     use crate::tape::lowered::{MScaleAxis, MScaling, SetAxis};
-    let gqa = p.num_q_heads / s.num_kv_heads.max(1);
-    let (split_sym, pack_sym) = match (s.dtype_tag, s.head_dim, s.block_size) {
+    // The class's query heads per KV head, exact by `HeadGeometry`'s law.
+    let (q_heads, num_kv_heads) = (s.class.q_heads().get(), s.class.kv_heads().get());
+    let gqa = s.class.gqa();
+    let scale = p.attention()?.scale().get();
+    let (split_sym, pack_sym) = match (s.dtype_tag, s.class.head_dim().get(), s.class.page().get())
+    {
         ("bf16", 256, 16) => (
             "attention_steel_nax_paged_bf16_bq64_bk32_bd256_wm4_wn2_bs16_packed_split4",
             "attention_verify_pack_q_bf16_bd256",
@@ -2511,16 +2525,15 @@ fn verify_lane_attention(
     };
     const _: () = assert!(VERIFY_SPLITS == 4, "the instantiated split count");
     let fits = gqa * crate::op_abi::METAL_LANE_VERIFY_ROWS <= VERIFY_TILE_ROWS
-        && p.num_q_heads == gqa * s.num_kv_heads
         && s.bucket_m <= VERIFY_TILE_ROWS;
     if !fits {
         return None;
     }
-    let (hd, m) = (s.head_dim, s.bucket_m);
+    let (hd, m) = (s.class.head_dim().get(), s.bucket_m);
     // Packed rows, a sequence's tile per KV head (a step brings at most a sequence a row), then
     // the partials, a row's per query head and split.
-    let packed_bytes = m * s.num_kv_heads * VERIFY_TILE_ROWS * hd * 2;
-    let partials_bytes = m * p.num_q_heads * VERIFY_SPLITS * (hd + 2) * 4;
+    let packed_bytes = m * num_kv_heads * VERIFY_TILE_ROWS * hd * 2;
+    let partials_bytes = m * q_heads * VERIFY_SPLITS * (hd + 2) * 4;
     *moe_scratch_bytes = (*moe_scratch_bytes).max(packed_bytes + partials_bytes);
     let packed = scratch_at(1, 0);
     let by_seqs = Some(MScaling {
@@ -2535,7 +2548,7 @@ fn verify_lane_attention(
         kernel: KernelId::AttentionVerifyPack,
         function: pack_sym,
         dispatch: DispatchShape {
-            threadgroups: (VERIFY_TILE_ROWS, s.num_kv_heads, m),
+            threadgroups: (VERIFY_TILE_ROWS, num_kv_heads, m),
             threads_per_threadgroup: (hd, 1, 1),
             m_scaling: by_seqs,
         },
@@ -2553,7 +2566,7 @@ fn verify_lane_attention(
         kernel: KernelId::AttentionVerifySplit,
         function: split_sym,
         dispatch: DispatchShape {
-            threadgroups: (VERIFY_SPLITS, s.num_kv_heads, m),
+            threadgroups: (VERIFY_SPLITS, num_kv_heads, m),
             m_scaling: by_seqs,
             ..plain.dispatch
         },
@@ -2571,22 +2584,22 @@ fn verify_lane_attention(
         function: pick_specialized_symbol(
             "attention_via_cache_v2_combine_f16_specialized",
             "attention_via_cache_v2_combine_bf16_specialized",
-            p.metal_dtype,
+            p.metal_dtype(),
         ),
         // The combine's own slots (`attention.metal`): the geometry and ATTN_SPLITS, ATTN_TQ unset.
         constants: baked(vec![
             ConstantValue::uint(0, hd),
-            ConstantValue::uint(1, p.num_q_heads),
-            ConstantValue::uint(2, s.num_kv_heads),
-            ConstantValue::float(3, p.attn_scale),
-            ConstantValue::uint(4, s.block_size),
+            ConstantValue::uint(1, q_heads),
+            ConstantValue::uint(2, num_kv_heads),
+            ConstantValue::float(3, scale),
+            ConstantValue::uint(4, s.class.page().get()),
             ConstantValue::kv_cap(5),
             ConstantValue::uint(6, crate::BLOCKS_PER_CHUNK),
             ConstantValue::int(7, 0),
             ConstantValue::uint(18, VERIFY_SPLITS),
         ]),
         dispatch: DispatchShape {
-            threadgroups: (m, p.num_q_heads, 1),
+            threadgroups: (m, q_heads, 1),
             threads_per_threadgroup: (combine_threads(hd), 1, 1),
             m_scaling: Some(MScaling {
                 axis: MScaleAxis::X,
@@ -2603,14 +2616,9 @@ fn verify_lane_attention(
 /// The steel/NAX paged prefill attention's grid: one threadgroup per
 /// (BQ-block of queries, q head), and one Z-layer per sequence
 /// (`tid.z = seq_idx`) so a BQ-block never straddles a sequence boundary.
-fn steel_paged_dispatch(
-    p: &MetalModelConsts,
-    bucket_m: u32,
-    bq: u32,
-    threads: u32,
-) -> DispatchShape {
+fn steel_paged_dispatch(q_heads: u32, bucket_m: u32, bq: u32, threads: u32) -> DispatchShape {
     DispatchShape {
-        threadgroups: (bucket_m.div_ceil(bq), p.num_q_heads, 1),
+        threadgroups: (bucket_m.div_ceil(bq), q_heads, 1),
         threads_per_threadgroup: (threads, 1, 1),
         m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
             set_axis: Some(crate::tape::lowered::SetAxis::Seqs(
@@ -2686,7 +2694,7 @@ fn pair_coresident_param(
 /// picked `SplitK`. The worker uses it to size the shared scratch
 /// buffer that `Binding::Scratch` resolves against.
 fn lower_one(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     chunked: bool,
     inst: &MetalStep,
     w: RowSources<'_>,
@@ -2851,7 +2859,7 @@ fn lower_one(
             function: pick_specialized_symbol(
                 "embed_f16_specialized",
                 "embed_bf16_specialized",
-                p.metal_dtype,
+                p.metal_dtype(),
             ),
             constants: super::kernel_constants::EmbedConstants {
                 bucket_m: super::ids::BucketM(bucket_m),
@@ -2923,11 +2931,11 @@ fn lower_one(
                 // the kernel needs T*heads RMSNORM_M rows.
                 bucket_m: super::ids::BucketM(bucket_m * *m_multiplier),
                 // Per-instruction `hidden_size` — for the standard
-                // residual-stream norm this is `p.hidden_size`; for
-                // per-head q_norm/k_norm (Qwen3) it's `p.head_dim`.
+                // residual-stream norm this is the hidden size; for
+                // per-head q_norm/k_norm (Qwen3) it's the head dim.
                 q_size: super::ids::QSize(*hidden_size),
-                rms_norm_eps: super::ids::RmsNormEps(p.rms_norm_eps),
-                weight_offset: p.norm_weight_offset,
+                rms_norm_eps: super::ids::RmsNormEps(p.eps().get()),
+                weight_offset: p.norm_offset().get(),
             }
             .into_baked(),
             // Dispatch: `bucket_m * m_multiplier` threadgroups at
@@ -2968,7 +2976,7 @@ fn lower_one(
         // ── Scalar-offset RMSNorm (Gemma `rmsnorm(x, weight + 1.0)`) ─
         // Identical to `RmsNorm` except the `(1 + w)` offset rides the
         // instruction's `offset` field (the DSL's explicit `+ 1.0`),
-        // not the global `p.norm_weight_offset`. `hidden_size` /
+        // not the model's norm offset. `hidden_size` /
         // `m_multiplier` are baked by `ScalarOffsetRmsNormImpl::fan_out`
         // (residual = HIDDEN_SIZE/1; per-head q/k = head_dim/num_heads).
         I::ScalarOffsetRmsNorm(
@@ -2985,7 +2993,7 @@ fn lower_one(
             constants: super::kernel_constants::RmsNormConstants {
                 bucket_m: super::ids::BucketM(bucket_m * *m_multiplier),
                 q_size: super::ids::QSize(*hidden_size),
-                rms_norm_eps: super::ids::RmsNormEps(p.rms_norm_eps),
+                rms_norm_eps: super::ids::RmsNormEps(p.eps().get()),
                 weight_offset: *offset,
             }
             .into_baked(),
@@ -3033,7 +3041,7 @@ fn lower_one(
             function: pick_specialized_symbol(
                 "rmsnorm_unit_f16_specialized",
                 "rmsnorm_unit_bf16_specialized",
-                p.metal_dtype,
+                p.metal_dtype(),
             ),
             // The unit kernel declares fn-consts 0..2 only (no
             // WEIGHT_OFFSET slot 3); RmsNormConstants sets 0..3 and the
@@ -3041,7 +3049,7 @@ fn lower_one(
             constants: super::kernel_constants::RmsNormConstants {
                 bucket_m: super::ids::BucketM(bucket_m * *m_multiplier),
                 q_size: super::ids::QSize(*hidden_size),
-                rms_norm_eps: super::ids::RmsNormEps(p.rms_norm_eps),
+                rms_norm_eps: super::ids::RmsNormEps(p.eps().get()),
                 weight_offset: 0.0,
             }
             .into_baked(),
@@ -3077,12 +3085,14 @@ fn lower_one(
             function: pick_specialized_symbol(
                 "scalar_weight_mul_f16_specialized",
                 "scalar_weight_mul_bf16_specialized",
-                p.metal_dtype,
+                p.metal_dtype(),
             ),
             constants: &[],
             dispatch: {
-                let mut d =
-                    DispatchShape::dispatch_1d(eff_m * (p.hidden_size as u32), THREADS_PER_GROUP);
+                let mut d = DispatchShape::dispatch_1d(
+                    eff_m * (p.hidden().get() as u32),
+                    THREADS_PER_GROUP,
+                );
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
                     set_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -3125,11 +3135,11 @@ fn lower_one(
                     bucket_m: super::ids::BucketM(bucket_m),
                     // Per-instruction hidden_size — see I::RmsNorm
                     // arm. FusedAddRmsNorm is always on the residual
-                    // stream so it's always `p.hidden_size`, but
+                    // stream so it's always the hidden size, but
                     // we plumb it through the field for uniformity.
                     q_size: super::ids::QSize(*hidden_size),
-                    rms_norm_eps: super::ids::RmsNormEps(p.rms_norm_eps),
-                    weight_offset: p.norm_weight_offset,
+                    rms_norm_eps: super::ids::RmsNormEps(p.eps().get()),
+                    weight_offset: p.norm_offset().get(),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -3167,7 +3177,7 @@ fn lower_one(
         // `add(delta, residual)` then `rmsnorm(·, weight + offset)` —
         // gemma3's sandwich norms write the `+ 1.0` explicitly, so the
         // offset rides the instruction field instead of the global
-        // `p.norm_weight_offset`. Always on the residual stream
+        // the model's norm offset. Always on the residual stream
         // (HIDDEN_SIZE; m=1) — residual adds are never per-head.
         I::FusedAddRmsNormWithOffset(
             Slot(delta_slot),
@@ -3180,14 +3190,14 @@ fn lower_one(
             function: fused_add_rmsnorm_kernel_static_name(p, scale_dtype_for(p)),
             constants: super::kernel_constants::RmsNormConstants {
                 bucket_m: super::ids::BucketM(bucket_m),
-                q_size: super::ids::QSize(p.hidden_size as u32),
-                rms_norm_eps: super::ids::RmsNormEps(p.rms_norm_eps),
+                q_size: super::ids::QSize(p.hidden().get() as u32),
+                rms_norm_eps: super::ids::RmsNormEps(p.eps().get()),
                 weight_offset: *offset,
             }
             .into_baked(),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
-                threads_per_threadgroup: (norm_threads(QSize(p.hidden_size as u32)), 1, 1),
+                threads_per_threadgroup: (norm_threads(QSize(p.hidden().get() as u32)), 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                     set_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -3272,8 +3282,8 @@ fn lower_one(
                 constants: super::kernel_constants::RmsNormConstants {
                     bucket_m: super::ids::BucketM(bucket_m),
                     q_size: super::ids::QSize(*hidden_size),
-                    rms_norm_eps: super::ids::RmsNormEps(p.rms_norm_eps),
-                    weight_offset: p.norm_weight_offset,
+                    rms_norm_eps: super::ids::RmsNormEps(p.eps().get()),
+                    weight_offset: p.norm_offset().get(),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -3872,7 +3882,7 @@ fn lower_one(
         // writes `silu(gate) * up` into out_slot. `width` (per-row
         // element count) rides on the instruction — baked at macro
         // time from the claim's solved gate/up Gemm N, NOT from
-        // `p.intermediate_size`: one model can carry SwiGLU blocks
+        // the model's intermediate size: one model can carry SwiGLU blocks
         // of different widths (Qwen3.5-MoE's 512-wide shared expert
         // vs a dense MLP), and a zero/mismatched global bound made
         // this dispatch a silent no-op.
@@ -3933,7 +3943,7 @@ fn lower_one(
         // shapes, same dispatch, gelu_tanh activation.
         I::GeluMul(Slot(gate_slot), Slot(up_slot), Slot(out_slot)) => {
             let dtype = dequant_dtype_for(p);
-            let n = bucket_m * (p.intermediate_size as u32);
+            let n = bucket_m * (intermediate(p)?.get() as u32);
             LoweredCommand {
                 kernel: KernelId::GeluMul,
                 library: "silu_mul",
@@ -3974,7 +3984,7 @@ fn lower_one(
             let dtype = dequant_dtype_for(p);
             // out is [M, num_heads * head_dim]; one thread per element,
             // m_scaling rescales the X axis to the runtime token count.
-            let n = bucket_m * (p.num_q_heads * p.head_dim);
+            let n = bucket_m * (base(p)?.q_width() as u32);
             LoweredCommand {
                 kernel: KernelId::GateApply,
                 library: "gate_apply",
@@ -4015,7 +4025,7 @@ fn lower_one(
         //    runtime/model/QwenTarget.cpp `addCapture`) ──
         I::CaptureHidden(Slot(input), capture) => {
             let dtype = dequant_dtype_for(p);
-            let hidden = p.hidden_size as u32;
+            let hidden = p.hidden().get() as u32;
             let n = eff_m * hidden;
             LoweredCommand {
                 kernel: KernelId::CaptureRows,
@@ -4044,9 +4054,9 @@ fn lower_one(
         }
         I::DraftConv(c) => {
             let dtype = dequant_dtype_for(p);
-            let g = draft_geometry(p);
+            let g = draft_geometry(p)?;
             let layer = LayerId(c.layer.0 + layer_offset);
-            let groups = (g.rows * p.hidden_size as u32).div_ceil(THREADS_PER_GROUP);
+            let groups = (g.rows * p.hidden().get() as u32).div_ceil(THREADS_PER_GROUP);
             let arena = |slot: Slot, binding_index| Binding::ArenaSlot {
                 slot: slot.0,
                 binding_index,
@@ -4055,7 +4065,7 @@ fn lower_one(
                 kernel: KernelId::DraftConv,
                 library: "dflash2",
                 function: draft_pick(dtype, "draft_conv_f16", "draft_conv_bf16"),
-                constants: draft_constants(p, c.residual.is_some()),
+                constants: draft_constants(p, c.residual.is_some())?,
                 dispatch: draft_lanes_grid(groups, g, bucket_m, 1),
                 bindings: baked(vec![
                     arena(c.input, 0),
@@ -4070,7 +4080,7 @@ fn lower_one(
         }
         I::DraftAttention(Slot(qkv), Slot(out), LayerId(layer)) => {
             let dtype = dequant_dtype_for(p);
-            let g = draft_geometry(p);
+            let g = draft_geometry(p)?;
             let layer = LayerId(*layer + layer_offset);
             let act = draft_act_bytes(p);
             let s = crate::dflash2::AttentionScratch::at(g, super::ids::BucketM(bucket_m), act);
@@ -4083,7 +4093,7 @@ fn lower_one(
                 kind,
                 binding_index,
             };
-            let constants = draft_constants(p, true);
+            let constants = draft_constants(p, true)?;
             let rope = w.of(WeightKind::CosSin, 0)?;
             // Splash's prepare dispatch: a group per 256 value elements, at least one per
             // (row, head) norm task.
@@ -4186,9 +4196,9 @@ fn lower_one(
         }
         I::DraftContextKv(Slot(kv), LayerId(layer)) => {
             let dtype = dequant_dtype_for(p);
-            let g = draft_geometry(p);
+            let g = draft_geometry(p)?;
             let layer = LayerId(*layer + layer_offset);
-            let constants = draft_constants(p, true);
+            let constants = draft_constants(p, true)?;
             let runtime = |kind, binding_index| Binding::Runtime {
                 kind,
                 binding_index,
@@ -4258,14 +4268,14 @@ fn lower_one(
         }
         I::DraftWindowStore(Slot(context)) | I::DraftWindowLoad(Slot(context)) => {
             let dtype = dequant_dtype_for(p);
-            let constants = draft_constants(p, true);
+            let constants = draft_constants(p, true)?;
             let runtime = |kind, binding_index| Binding::Runtime {
                 kind,
                 binding_index,
             };
             // One simdgroup per row and 64-value group, eight to a threadgroup (Splash's
             // SPLASH_DRAFT_CONTEXT_SIMDGROUPS).
-            let groups = (p.hidden_size as u32).div_ceil(64);
+            let groups = (p.hidden().get() as u32).div_ceil(64);
             let dispatch = draft_tasks((eff_m * groups).div_ceil(8), bucket_m);
             let head = [
                 Binding::ArenaSlot {
@@ -4320,11 +4330,11 @@ fn lower_one(
         }
         I::DraftSelect(Slot(logits), Slot(selector)) => {
             let dtype = dequant_dtype_for(p);
-            let g = draft_geometry(p);
+            let g = draft_geometry(p)?;
             let s = crate::dflash2::SelectScratch::at(g, super::ids::BucketM(bucket_m));
             *moe_scratch_bytes = (*moe_scratch_bytes).max(s.total as u32);
             let lanes = g.lanes(super::ids::BucketM(bucket_m)).max(1) as u32;
-            let constants = draft_select_constants(p, lanes);
+            let constants = draft_select_constants(p, lanes)?;
             let scratch = |at: u64, binding_index| Binding::MoeScratch {
                 binding_index,
                 byte_offset: at as u32,
@@ -4452,7 +4462,7 @@ fn lower_one(
             // `row = gid / cols` in the shader. One thread per output
             // element, m_scaling rescales X to the runtime token count
             // (cols stays hidden_size, so the row index is M-invariant).
-            let cols = p.hidden_size as u32;
+            let cols = p.hidden().get() as u32;
             let n = bucket_m * cols;
             LoweredCommand {
                 kernel: KernelId::GateScale,
@@ -4499,15 +4509,15 @@ fn lower_one(
             let dtype = dequant_dtype_for(p);
             // Each output is [M, num_heads * head_dim]; one thread per
             // output element writes both the query and gate halves.
-            let n = bucket_m * (p.num_q_heads * p.head_dim);
+            let n = bucket_m * (base(p)?.q_width() as u32);
             LoweredCommand {
                 kernel: KernelId::GateSplit,
                 library: "gate_split",
                 function: gate_split_static_name(dtype),
                 constants: super::kernel_constants::GateSplitConstants {
                     n: super::ids::HiddenSize(n),
-                    head_dim: p.head_dim,
-                    num_heads: p.num_q_heads,
+                    head_dim: base(p)?.head_dim().get(),
+                    num_heads: q_heads(p)?,
                 }
                 .into_baked(),
                 dispatch: {
@@ -4585,7 +4595,7 @@ fn lower_one(
             );
             // AffineEmbed reads rows of the step's width (the residual-stream width, or a
             // drafter's target's through its target's table) — NOT `Q_SIZE` (= num_q_heads *
-            // head_dim). Llama-3.x / Qwen2.5 have hidden==Q_SIZE so the pre-existing `p.q_size`
+            // head_dim). Llama-3.x / Qwen2.5 have hidden==Q_SIZE so the pre-existing query width
             // worked by coincidence; Qwen3-30B-A3B has hidden=2048, Q_SIZE=4096 — the wrong
             // width yielded out-of-bounds `gindex` into scales and garbage embed output (silent,
             // no fault).
@@ -4689,7 +4699,7 @@ fn lower_one(
                 bucket_m,
                 w.of(WeightKind::Linear, 0)?,
                 layer_offset,
-            )
+            )?
         }
         I::AffineGatedQmv(g, act) => {
             if bucket_m != 1 {
@@ -4768,7 +4778,7 @@ fn lower_one(
                 bucket_m,
                 w.of(WeightKind::Linear, 0)?,
                 layer_offset,
-            )
+            )?
         }
 
         // ── RoPE + KV cache append ─────────────────────────────────
@@ -4795,30 +4805,27 @@ fn lower_one(
             // sliding tiles use the base consts (256 / 8 / full).
             // Identity on uniform models.
             let is_global = *class == AttnMask::Causal;
-            let (hd, n_kv, rd, bs) = if is_global {
-                (
-                    p.global_head_dim,
-                    p.num_global_kv_heads,
-                    p.global_rot_dim,
-                    // Page-unified GLOBAL block size — the slot_mapping for a
-                    // full layer is encoded with this bs (Gemma4: 32).
-                    p.global_block_size,
-                )
-            } else {
-                (p.head_dim, p.num_kv_heads, p.rot_dim, p.block_size)
-            };
+            // The global class's page is page-unified: the slot_mapping for a full layer is
+            // encoded with it (Gemma4: 32).
+            let geometry = self::class(p, class.class())?;
+            let (hd, n_kv, rd, bs) = (
+                geometry.head_dim().get(),
+                geometry.kv_heads().get(),
+                geometry.rot_dim().get(),
+                geometry.page().get(),
+            );
             // Rotation pairing: standard NeoX pairs lane i with
             // i + rot_dim/2 INSIDE the rot window (full rope and
             // HF-style partial rope, e.g. Qwen3.5 rot 64 of 256).
             // Gemma4's proportional rope (mlx `ProportionalRoPE`)
             // instead rotates the first rot_dim/2 lanes of EACH
             // head half — lane i pairs with i + head_dim/2.
-            let pair_off = if is_global && p.rope_proportional {
+            let pair_off = if is_global && proportional(p)? {
                 hd / 2
             } else {
                 rd / 2
             };
-            let n_q_heads = p.num_q_heads;
+            let n_q_heads = q_heads(p)?;
             let query_only = *write == KvWrite::None;
             // The query alone binds its slot, the rotary table and the positions.
             let bound = |b: &Binding| !query_only || matches!(b.index(), 0 | 3 | 4);
@@ -4828,11 +4835,11 @@ fn lower_one(
                 function: pick_specialized_symbol(
                     "rope_append_f16_specialized",
                     "rope_append_bf16_specialized",
-                    p.metal_dtype,
+                    p.metal_dtype(),
                 ),
                 constants: super::kernel_constants::RopeAppendConstants {
                     head_dim: super::ids::HeadDim(hd),
-                    num_q_heads: super::ids::NumQHeads(p.num_q_heads),
+                    num_q_heads: super::ids::NumQHeads(q_heads(p)?),
                     num_kv_heads: super::ids::NumKvHeads(n_kv),
                     rot_dim: super::ids::RotDim(rd),
                     block_size: super::ids::BlockSize(bs),
@@ -4840,7 +4847,7 @@ fn lower_one(
                     pair_off: super::ids::RopePairOff(pair_off),
                     // Spans: store relocatable K unrotated (skip K-rotation
                     // for flagged blocks). None → byte-identical when off.
-                    rope_on_read: if p.rope_on_read { Some(1) } else { None },
+                    rope_on_read: if rope_on_read(p)? { Some(1) } else { None },
                     tq: codec.as_ref().map(|(c, _)| *c),
                     query_only,
                 }
@@ -4883,18 +4890,20 @@ fn lower_one(
                 return Err(LoweringError::UnrotatedWriterOffset { index: w.index });
             }
             let codec = kv_writer_codec(p, *write, *offsets, LayerId(*layer), layer_offset, w)?;
-            let (hd, n_kv, bs) = match class {
-                AttnMask::Causal => (
-                    p.global_head_dim,
-                    p.num_global_kv_heads,
-                    p.global_block_size,
-                ),
-                AttnMask::SlidingWindow { .. } => (p.head_dim, p.num_kv_heads, p.block_size),
-            };
+            let geometry = self::class(p, class.class())?;
+            let (hd, n_kv, bs) = (
+                geometry.head_dim().get(),
+                geometry.kv_heads().get(),
+                geometry.page().get(),
+            );
             LoweredCommand {
                 kernel: KernelId::KvAppend,
                 library: "kv_append",
-                function: pick_specialized_symbol("kv_append_f16", "kv_append_bf16", p.metal_dtype),
+                function: pick_specialized_symbol(
+                    "kv_append_f16",
+                    "kv_append_bf16",
+                    p.metal_dtype(),
+                ),
                 constants: super::kernel_constants::KvAppendConstants {
                     head_dim: super::ids::HeadDim(hd),
                     num_kv_heads: super::ids::NumKvHeads(n_kv),
@@ -4950,27 +4959,24 @@ fn lower_one(
             );
             // Same geometry-class selection as the RopeAppend arm.
             let is_global = *class == AttnMask::Causal;
-            let (hd, n_kv, rd, bs) = if is_global {
-                (
-                    p.global_head_dim,
-                    p.num_global_kv_heads,
-                    p.global_rot_dim,
-                    p.global_block_size,
-                )
-            } else {
-                (p.head_dim, p.num_kv_heads, p.rot_dim, p.block_size)
-            };
+            let geometry = self::class(p, class.class())?;
+            let (hd, n_kv, rd, bs) = (
+                geometry.head_dim().get(),
+                geometry.kv_heads().get(),
+                geometry.rot_dim().get(),
+                geometry.page().get(),
+            );
             assert!(
                 hd <= 512,
                 "metal lowering: RopeAppendNormed threadgroup staging is sized \
                  for head_dim <= 512 (got {hd})"
             );
-            let pair_off = if is_global && p.rope_proportional {
+            let pair_off = if is_global && proportional(p)? {
                 hd / 2
             } else {
                 rd / 2
             };
-            let n_q_heads = p.num_q_heads;
+            let n_q_heads = q_heads(p)?;
             LoweredCommand {
                 kernel: KernelId::RopeAppendNormed,
                 library: "rope",
@@ -4983,10 +4989,10 @@ fn lower_one(
                     block_size: super::ids::BlockSize(bs),
                     blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
                     pair_off: super::ids::RopePairOff(pair_off),
-                    rms_norm_eps: super::ids::RmsNormEps(p.rms_norm_eps),
-                    weight_offset: p.norm_weight_offset,
+                    rms_norm_eps: super::ids::RmsNormEps(p.eps().get()),
+                    weight_offset: p.norm_offset().get(),
                     // Spans: store relocatable K NORMED-but-unrotated.
-                    rope_on_read: if p.rope_on_read { Some(1) } else { None },
+                    rope_on_read: if rope_on_read(p)? { Some(1) } else { None },
                     tq: codec.as_ref().map(|(c, _)| *c),
                 }
                 .into_baked(),
@@ -5036,15 +5042,15 @@ fn lower_one(
             // (the v1 2-pass-softmax kernel accumulated bf16 rounding
             // error per layer on Llama-3.2 decode and produced
             // degenerate output after the first decode token).
-            let n_q_heads = p.num_q_heads;
+            let n_q_heads = q_heads(p)?;
             // One threadgroup serves the largest divisor of the GQA group
             // (`TqDecodeHeads::largest_group`), so the walk reads each key
             // once for the whole group instead of once per query head; the
             // threadgroups count drops to the KV heads' head groups.
             let served = super::ids::TqDecodeHeads::largest_group(
-                super::ids::HeadDim(p.global_head_dim),
+                super::ids::HeadDim(global(p)?.head_dim().get()),
                 super::ids::NumQHeads(n_q_heads),
-                super::ids::NumKvHeads(p.num_global_kv_heads),
+                super::ids::NumKvHeads(global(p)?.kv_heads().get()),
             );
             LoweredCommand {
                 kernel: KernelId::AttentionViaCache,
@@ -5052,21 +5058,21 @@ fn lower_one(
                 function: pick_specialized_symbol(
                     "attention_via_cache_v2_f16_specialized",
                     "attention_via_cache_v2_bf16_specialized",
-                    p.metal_dtype,
+                    p.metal_dtype(),
                 ),
                 constants: super::kernel_constants::AttentionViaCacheConstants {
                     // `attention()` tiles are the GLOBAL class on
                     // hybrid sliding/global arches (Gemma4: 512×1kv);
                     // GLOBAL_* default to the base values on uniform
                     // models, so this is identity for Llama/Qwen.
-                    head_dim: super::ids::HeadDim(p.global_head_dim),
-                    num_q_heads: super::ids::NumQHeads(p.num_q_heads),
-                    num_kv_heads: super::ids::NumKvHeads(p.num_global_kv_heads),
-                    attn_scale: super::ids::AttnScale(p.attn_scale),
+                    head_dim: super::ids::HeadDim(global(p)?.head_dim().get()),
+                    num_q_heads: super::ids::NumQHeads(q_heads(p)?),
+                    num_kv_heads: super::ids::NumKvHeads(global(p)?.kv_heads().get()),
+                    attn_scale: super::ids::AttnScale(attention(p)?.scale().get()),
                     // GLOBAL class block size — vLLM page-unifies the full
                     // class UP to the sliding page (Gemma4: 32 vs sliding 16).
                     // Defaults to BLOCK_SIZE on uniform arches.
-                    block_size: super::ids::BlockSize(p.global_block_size),
+                    block_size: super::ids::BlockSize(global(p)?.page().get()),
                     blocks_per_chunk: super::ids::BlocksPerChunk(attention_blocks_per_chunk(
                         chunked,
                     )),
@@ -5079,7 +5085,7 @@ fn lower_one(
                         ror_rd,
                         ror_po,
                         ror_on,
-                        p.global_head_dim,
+                        global(p)?.head_dim().get(),
                     ),
                     // gpt-oss sinks: the const mirrors the binding's presence
                     // (the 0/1 master switch the shader gates its column on).
@@ -5136,17 +5142,25 @@ fn lower_one(
             // window. A windowed tile kernel skips K-tiles wholly older than the window, making
             // windowed prefill O(T·window).
             let sliding = matches!(inst, I::SlidingAttentionPrefillPaged(..));
-            debug_assert!(
-                !sliding || p.sliding_window > 0,
-                "SlidingAttentionPrefillPaged lowered with SLIDING_WINDOW <= 0"
-            );
+            let class = self::class(
+                p,
+                match sliding {
+                    true => AttnClass::Sliding,
+                    false => AttnClass::Full,
+                },
+            )?;
             let (head_dim, num_kv_heads, block_size, window) = if sliding {
-                (p.head_dim, p.num_kv_heads, p.block_size, p.sliding_window)
+                (
+                    class.head_dim().get(),
+                    class.kv_heads().get(),
+                    class.page().get(),
+                    kernel_window(p)?,
+                )
             } else {
                 (
-                    p.global_head_dim,
-                    p.num_global_kv_heads,
-                    p.global_block_size,
+                    class.head_dim().get(),
+                    class.kv_heads().get(),
+                    class.page().get(),
                     0,
                 )
             };
@@ -5192,7 +5206,7 @@ fn lower_one(
             // The unfused kernels read sequence 0 only (`seq_used[0]`,
             // `cu_seqlens_q[1] - cu_seqlens_q[0]`): they serve single-sequence
             // steps, and the paged attention below the rest.
-            let steel_dtype_tag: &str = match p.metal_dtype {
+            let steel_dtype_tag: &str = match p.metal_dtype() {
                 crate::tape::lowered::MetalDtype::Bf16 => "bf16",
                 _ => "f16",
             };
@@ -5217,14 +5231,14 @@ fn lower_one(
             let hd512_unfused = HD512_UNFUSED_CONTINUATION_OK
                 && !sliding
                 && head_dim > 256
-                && p.rope_on_read
+                && rope_on_read(p)?
                 && nax_kernel.is_none()
                 && steel_wide_kernel.is_none();
             let unfused = if hd512_unfused {
                 use crate::specialized_pipeline_cache::ConstantValue as CV;
                 let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
                 let (rd, po, _on, _bind) = rope_on_read_params(p, !sliding);
-                let nh = p.num_q_heads;
+                let nh = q_heads(p)?;
                 let nkv = num_kv_heads.max(1);
                 let gqa = nh / nkv;
                 let hd = head_dim;
@@ -5411,7 +5425,10 @@ fn lower_one(
                         library: "attention_causal_softmax",
                         function: "causal_softmax_prod_bf16",
                         // SOFT_SPAN_BLOCK = span_ids block size (gather's `bs`).
-                        constants: baked(vec![CV::float(1, p.attn_scale), CV::uint(3, bs)]),
+                        constants: baked(vec![
+                            CV::float(1, attention(p)?.scale().get()),
+                            CV::uint(3, bs),
+                        ]),
                         // One 64-thread threadgroup per row (== the kernel's
                         // SOFT_T): cooperative row max/sum, not one thread
                         // streaming kv_len serially ×3 passes.
@@ -5554,7 +5571,7 @@ fn lower_one(
             let steel_symbol = steel_paged_symbol(steel_dtype_tag, head_dim);
             // Chunked-prefill long-context correctness (the launch-claude bug):
             // the steel/NAX/gqa_shared paged prefill reads pre-roped K from the
-            // rope-once-to-scratch buffer (`p.rope_on_read` is the universal
+            // rope-once-to-scratch buffer (rope-on-read is the universal
             // default). That scratch + the `RopeOnce*` grid MUST cover the WHOLE
             // sequence a continuation chunk attends (computed prefix + new), not
             // just one prefill bucket — else the attention reads past the scratch
@@ -5588,7 +5605,7 @@ fn lower_one(
             // the rope-once scratch. Taken only where no steel-family kernel has
             // an instantiation (head_dim 512 over pages other than 32, or
             // buckets below BQ_STEEL).
-            let gqa = p.num_q_heads / num_kv_heads.max(1);
+            let gqa = q_heads(p)? / num_kv_heads.max(1);
             let use_gqa_shared = !sliding
                 && !use_steel
                 && (8..=32).contains(&gqa)
@@ -5602,7 +5619,7 @@ fn lower_one(
             // nax_spans/steel_spans below.
             // No rope-once pair where the unfused attention serves
             // single-sequence steps.
-            let rope_once = p.rope_on_read && unfused.is_none();
+            let rope_once = rope_on_read(p)? && unfused.is_none();
             let gqa_shared_spans = use_gqa_shared && rope_once;
             let nax_spans = use_nax && rope_once;
             let steel_spans = use_steel && !use_nax && rope_once;
@@ -5621,9 +5638,9 @@ fn lower_one(
                 // The class's: GLOBAL or SLIDING on hybrid arches; identity on uniform
                 // models (see the decode arm note).
                 head_dim: super::ids::HeadDim(head_dim),
-                num_q_heads: super::ids::NumQHeads(p.num_q_heads),
+                num_q_heads: super::ids::NumQHeads(q_heads(p)?),
                 num_kv_heads: super::ids::NumKvHeads(num_kv_heads),
-                attn_scale: super::ids::AttnScale(p.attn_scale),
+                attn_scale: super::ids::AttnScale(attention(p)?.scale().get()),
                 // The class's block size (page-unified; Gemma4 global: 32).
                 block_size: super::ids::BlockSize(block_size),
                 // Prefill kernels (steel + sdpa paged) stay at the standard
@@ -5710,8 +5727,9 @@ fn lower_one(
                 self_only: None,
                 ..constants
             };
+            let q_heads = q_heads(p)?;
             let sdpa_paged =
-                |constants, bindings| sdpa_paged_command(p, constants, bindings, bucket_m);
+                |constants, bindings| sdpa_paged_command(p, q_heads, constants, bindings, bucket_m);
             // GQA-cooperative fallback: when steel can't take the shape (head_dim
             // 512 has no steel instantiation — TG memory) AND the GQA ratio is
             // high, the per-(q_head, query) sdpa_vector kernel re-streams
@@ -5752,7 +5770,7 @@ fn lower_one(
                     library,
                     function,
                     constants: constants.into_baked(),
-                    dispatch: steel_paged_dispatch(p, bucket_m, bq_steel, threads),
+                    dispatch: steel_paged_dispatch(q_heads, bucket_m, bq_steel, threads),
                     bindings: bindings.into_baked(),
                     gemm_dims: None,
                 };
@@ -5803,7 +5821,7 @@ fn lower_one(
                                 ),
                         )
                     };
-                    let elem_bytes = match p.metal_dtype {
+                    let elem_bytes = match p.metal_dtype() {
                         crate::tape::lowered::MetalDtype::Bf16 => 2u32,
                         _ => 2u32,
                     };
@@ -5855,9 +5873,7 @@ fn lower_one(
                                 p,
                                 VerifyLaneShape {
                                     dtype_tag: steel_dtype_tag,
-                                    head_dim,
-                                    num_kv_heads,
-                                    block_size,
+                                    class,
                                     bucket_m,
                                 },
                                 &plain,
@@ -5880,7 +5896,7 @@ fn lower_one(
                         function: pick_specialized_symbol(
                             "attention_prefill_sdpa_gqa_shared_f16_specialized",
                             "attention_prefill_sdpa_gqa_shared_bf16_specialized",
-                            p.metal_dtype,
+                            p.metal_dtype(),
                         ),
                         constants: constants.into_baked(),
                         dispatch: DispatchShape {
@@ -5972,19 +5988,15 @@ fn lower_one(
         // `ATTN_WINDOW` function constant carries `p.sliding_window`
         // (the decode kernel skips keys with `kv_len-1 - k >= window`).
         I::SlidingAttentionViaCache(Slot(q_slot), Slot(out_slot), LayerId(layer), _pairing) => {
-            debug_assert!(
-                p.sliding_window > 0,
-                "SlidingAttentionViaCache lowered with SLIDING_WINDOW <= 0"
-            );
             // Spans rope-on-read (SLIDING class). All-None when !ROPE_ON_READ.
             let (ror_rd, ror_po, ror_on, ror_bind) = rope_on_read_params(p, false);
-            let n_q_heads = p.num_q_heads;
+            let n_q_heads = q_heads(p)?;
             // The sliding class serves its own GQA group per threadgroup
             // (the global arm's note), on the sliding geometry.
             let served = super::ids::TqDecodeHeads::largest_group(
-                super::ids::HeadDim(p.head_dim),
+                super::ids::HeadDim(base(p)?.head_dim().get()),
                 super::ids::NumQHeads(n_q_heads),
-                super::ids::NumKvHeads(p.num_kv_heads),
+                super::ids::NumKvHeads(base(p)?.kv_heads().get()),
             );
             LoweredCommand {
                 kernel: KernelId::AttentionViaCache,
@@ -5992,22 +6004,27 @@ fn lower_one(
                 function: pick_specialized_symbol(
                     "attention_via_cache_v2_f16_specialized",
                     "attention_via_cache_v2_bf16_specialized",
-                    p.metal_dtype,
+                    p.metal_dtype(),
                 ),
                 constants: super::kernel_constants::AttentionViaCacheConstants {
-                    head_dim: super::ids::HeadDim(p.head_dim),
-                    num_q_heads: super::ids::NumQHeads(p.num_q_heads),
-                    num_kv_heads: super::ids::NumKvHeads(p.num_kv_heads),
-                    attn_scale: super::ids::AttnScale(p.attn_scale),
-                    block_size: super::ids::BlockSize(p.block_size),
+                    head_dim: super::ids::HeadDim(base(p)?.head_dim().get()),
+                    num_q_heads: super::ids::NumQHeads(q_heads(p)?),
+                    num_kv_heads: super::ids::NumKvHeads(base(p)?.kv_heads().get()),
+                    attn_scale: super::ids::AttnScale(attention(p)?.scale().get()),
+                    block_size: super::ids::BlockSize(base(p)?.page().get()),
                     blocks_per_chunk: super::ids::BlocksPerChunk(attention_blocks_per_chunk(
                         chunked,
                     )),
-                    window: super::ids::AttnWindow(p.sliding_window),
+                    window: super::ids::AttnWindow(kernel_window(p)?),
                     rot_dim: ror_rd,
                     pair_off: ror_po,
                     rope_on_read: ror_on,
-                    pair_coresident: pair_coresident_param(ror_rd, ror_po, ror_on, p.head_dim),
+                    pair_coresident: pair_coresident_param(
+                        ror_rd,
+                        ror_po,
+                        ror_on,
+                        base(p)?.head_dim().get(),
+                    ),
                     // gpt-oss sinks: the const mirrors the binding's presence.
                     sinks: w.sinks().map(|_| 1),
                     heads: served,
@@ -6043,7 +6060,7 @@ fn lower_one(
             function: pick_specialized_symbol(
                 "residual_add_f16_specialized",
                 "residual_add_bf16_specialized",
-                p.metal_dtype,
+                p.metal_dtype(),
             ),
             // Token-parallel kernel reads element count from dispatch
             // shape; no function constants.
@@ -6081,7 +6098,7 @@ fn lower_one(
             function: pick_specialized_symbol(
                 "scalar_mul_f16_specialized",
                 "scalar_mul_bf16_specialized",
-                p.metal_dtype,
+                p.metal_dtype(),
             ),
             constants: super::kernel_constants::ScalarMulConstants {
                 scale: *scale,
@@ -6094,7 +6111,7 @@ fn lower_one(
             // `embed * embedding_multiplier` and `branch *
             // residual_multiplier` muls.
             //
-            // The previous `bucket_m * p.q_size` scaled only the first
+            // The previous `bucket_m * query width` scaled only the first
             // `Q_SIZE` columns of each row. For granite that is 4096 of
             // vocab=49159 — ~89% of every logits row kept its raw
             // `logits_scaling`× magnitude, so argmax was dominated by the
@@ -6102,7 +6119,7 @@ fn lower_one(
             // on longer prompts argmax→token 0 (the shared bos=eos=pad id)
             // → an immediate EOS stop → empty output. A PARTIAL scalar-
             // multiply is NOT argmax-invariant. `activation_broadcast`
-            // takes a typed `ActivationWidth`, so passing `p.q_size` here
+            // takes a typed `ActivationWidth`, so passing the query width here
             // is now a COMPILE error — the bug is unrepresentable, not
             // guarded at runtime.
             dispatch: DispatchShape::activation_broadcast(
@@ -6134,18 +6151,12 @@ fn lower_one(
         I::SampledLogits(Slot(in_slot), Slot(out_slot), op, width) => {
             let width = width.get();
             let (kernel, symbols, constants, [input, output]) = match op {
-                LogitOp::SoftCap => {
-                    debug_assert!(
-                        p.final_logit_softcapping > 0.0,
-                        "a sampled soft cap lowered with FINAL_LOGIT_SOFTCAPPING <= 0"
-                    );
-                    (
-                        KernelId::TanhSoftCap,
-                        ["tanh_soft_cap_sampled_f16", "tanh_soft_cap_sampled_bf16"],
-                        ConstantValue::float(1, p.final_logit_softcapping),
-                        [0, 1],
-                    )
-                }
+                LogitOp::SoftCap => (
+                    KernelId::TanhSoftCap,
+                    ["tanh_soft_cap_sampled_f16", "tanh_soft_cap_sampled_bf16"],
+                    ConstantValue::float(1, final_softcap(p)?.get()),
+                    [0, 1],
+                ),
                 LogitOp::Scale(Scale(scale)) => (
                     KernelId::ScalarMul,
                     ["scalar_mul_sampled_f16", "scalar_mul_sampled_bf16"],
@@ -6157,7 +6168,7 @@ fn lower_one(
             LoweredCommand {
                 kernel,
                 library: "elementwise",
-                function: pick_specialized_symbol(f16, bf16, p.metal_dtype),
+                function: pick_specialized_symbol(f16, bf16, p.metal_dtype()),
                 constants: baked(vec![constants, ConstantValue::uint(6, width)]),
                 dispatch: DispatchShape {
                     threadgroups: (width.div_ceil(THREADS_PER_GROUP), bucket_m, 1),
@@ -6190,21 +6201,17 @@ fn lower_one(
         // exact-thread dispatch like `Add` — a one-row bucket's, whose
         // row is the one it samples.
         I::TanhSoftCap(Slot(in_slot), Slot(out_slot), width) => {
-            debug_assert!(
-                p.final_logit_softcapping > 0.0,
-                "TanhSoftCap lowered with FINAL_LOGIT_SOFTCAPPING <= 0"
-            );
             LoweredCommand {
                 kernel: KernelId::TanhSoftCap,
                 library: "elementwise",
                 function: pick_specialized_symbol(
                     "tanh_soft_cap_f16_specialized",
                     "tanh_soft_cap_bf16_specialized",
-                    p.metal_dtype,
+                    p.metal_dtype(),
                 ),
                 // Slot 1: elementwise.metal's fn-const indices are
                 // file-scoped (slot 0 = BIAS_ADD_NUM_COLS).
-                constants: baked(vec![ConstantValue::float(1, p.final_logit_softcapping)]),
+                constants: baked(vec![ConstantValue::float(1, final_softcap(p)?.get())]),
                 // Final logit softcap runs over the logits row (`width` =
                 // vocab). Same typed broadcast as the granite ScalarMul:
                 // passing head geometry is a compile error.
@@ -6253,7 +6260,7 @@ fn lower_one(
                 function: pick_specialized_symbol(
                     "bias_add_f16_specialized",
                     "bias_add_bf16_specialized",
-                    p.metal_dtype,
+                    p.metal_dtype(),
                 ),
                 constants: baked(vec![ConstantValue::uint(0, *n)]),
                 dispatch: {
@@ -6298,12 +6305,12 @@ fn lower_one(
             let ops = TqOperands::of(p, *offsets, *layer, w)?;
             let global = *class == AttnMask::Causal;
             // Span blocks of K re-rope with the attention class's table.
-            let table = w.rotary(p.rope_on_read.then_some(global))?;
+            let table = w.rotary(rope_on_read(p)?.then_some(global))?;
             let layer = layer.get() + layer_offset;
             // A row new for one sequence can be a prefix hit for another in the same step: the
             // step's new rows stage first, the cached rows after.
             use super::kernel_constants::TqStagePass;
-            return Ok([TqStagePass::New, TqStagePass::Cached]
+            return [TqStagePass::New, TqStagePass::Cached]
                 .map(|pass| match operand {
                     KvOperand::K => {
                         tq_stage_command(p, layer, ops.k, global, table, bucket_m, pass, bits)
@@ -6312,11 +6319,12 @@ fn lower_one(
                         tq_stage_command(p, layer, ops.v, global, table, bucket_m, pass, bits)
                     }
                 })
-                .to_vec());
+                .into_iter()
+                .collect();
         }
         I::RotateRows(rows, which) => {
             let inverse = *which == RotatedRows::Output;
-            return Ok(vec![tq_rotate_command(p, *rows, inverse, bucket_m)]);
+            return Ok(vec![tq_rotate_command(p, *rows, inverse, bucket_m)?]);
         }
         // The decode attention of its class, reading the packed store.
         I::AttnPackedKv(q, out, layer, pairing, class, offsets) => {
@@ -6346,8 +6354,8 @@ fn lower_one(
                 m_divisor,
             )?;
             let layer = layer.get() + layer_offset;
-            let twin =
-                |c: &LoweredCommand| tq_attention_command(c, layer, ops, bits, p.num_q_heads);
+            let q_heads = q_heads(p)?;
+            let twin = |c: &LoweredCommand| tq_attention_command(c, layer, ops, bits, q_heads);
             return Ok(via_cache.first().map(twin).into_iter().collect());
         }
         I::Moe(block, step) => {
@@ -6388,12 +6396,11 @@ fn lower_one(
             let global_layer = *layer + layer_offset;
             let layer_id = LayerId(global_layer);
             let dtype = dequant_dtype_for(p);
-            let nk = p.gdn_num_k_heads;
-            let nv = p.gdn_num_v_heads;
-            let hk = p.gdn_head_k_dim;
-            let hv = p.gdn_head_v_dim;
-            let kernel = p.gdn_conv_kernel;
-            let conv_dim = p.gdn_conv_dim as u32;
+            let g = gdn(p)?;
+            let (nk, nv) = (g.k_heads().get(), g.v_heads().get());
+            let (hk, hv) = (g.k_dim().get(), g.v_dim().get());
+            let kernel = g.conv_kernel().get();
+            let conv_dim = g.conv_dim().get() as u32;
             let value_dim = nv * hv;
             let scale = (hk as f32).powf(-0.5);
 
@@ -6430,7 +6437,7 @@ fn lower_one(
                 let mut constants = scan_constants();
                 constants.extend([
                     ConstantValue::uint(5, kernel),
-                    ConstantValue::float(6, p.rms_norm_eps),
+                    ConstantValue::float(6, p.eps().get()),
                 ]);
                 constants.extend_from_slice(extra);
                 let mut bindings = vec![
@@ -6511,17 +6518,17 @@ fn lower_one(
                 && hv == 128
                 && kernel <= 8
                 && (2..=crate::op_abi::METAL_VERIFY_ROWS).contains(&bucket_m)
-                && p.spec_drafts < GDN_VERIFY_ROWS
-                && seq_rows + p.spec_drafts < 32
+                && kernel_drafts(p) < GDN_VERIFY_ROWS
+                && seq_rows + kernel_drafts(p) < 32
                 && seq_rows * (2 * hk + 2 * hv) * 4
-                    + (2 * seq_rows + p.spec_drafts + 1 + 3 * seq_rows) * 4
+                    + (2 * seq_rows + kernel_drafts(p) + 1 + 3 * seq_rows) * 4
                     <= 32768)
                 .then(|| {
                     let rows = [
                         ConstantValue::uint(7, seq_rows),
-                        ConstantValue::uint(8, p.spec_drafts),
+                        ConstantValue::uint(8, kernel_drafts(p)),
                     ];
-                    let lanes = p.spec_drafts > 0;
+                    let lanes = p.spec_drafts().is_some();
                     // The q and k channels' conv state, written once every value head's
                     // threadgroup has read their seed: the command after, a barrier apart, a
                     // threadgroup a (sequence, key head).
@@ -6559,6 +6566,7 @@ fn lower_one(
             // 1. Causal depthwise conv1d (+SiLU), varlen + stateful.
             cmds.push(recurrent_conv(
                 p,
+                g,
                 arena(qkv_slot, 1),
                 weight(WeightTensor::GdnConv1d, 2),
                 layer_id,
@@ -6570,6 +6578,7 @@ fn lower_one(
             // 2. The gating and the delta-rule scan → o (f32 scratch).
             cmds.extend(recurrent_scan(
                 p,
+                g,
                 ScanForm::DeltaRule {
                     a: *a_slot,
                     b: *b_slot,
@@ -6610,9 +6619,10 @@ fn lower_one(
         // columns. A decode step is the same commands over one row a sequence.
         I::Mamba2(Slot(zx_slot), Slot(out_slot), LayerId(layer)) => {
             let layer_id = super::ids::LayerId(*layer + layer_offset);
-            let (groups, heads) = (p.gdn_num_k_heads, p.gdn_num_v_heads);
-            let conv_dim = p.gdn_conv_dim as u32;
-            let d_inner = heads * p.gdn_head_v_dim;
+            let g = gdn(p)?;
+            let (groups, heads) = (g.k_heads().get(), g.v_heads().get());
+            let conv_dim = g.conv_dim().get() as u32;
+            let d_inner = heads * g.v_dim().get();
             // The in-projection row: z [d_inner] | xBC [conv_dim] | dt [heads].
             let row = d_inner + conv_dim + heads;
             let ix = w.of(WeightKind::GatedDeltaNet, 0)?;
@@ -6625,6 +6635,7 @@ fn lower_one(
             *moe_scratch_bytes = (*moe_scratch_bytes).max(layout.total);
             let mut cmds = vec![recurrent_conv(
                 p,
+                g,
                 zx(1),
                 weight(WeightTensor::GdnConv1d, 2),
                 layer_id,
@@ -6640,6 +6651,7 @@ fn lower_one(
             )];
             cmds.extend(recurrent_scan(
                 p,
+                g,
                 ScanForm::Selective {
                     zx: *zx_slot,
                     dt: ColumnSlice {
@@ -6686,13 +6698,13 @@ fn lower_one(
                 kernel: KernelId::VisionLayerNorm,
                 library: "vision_layernorm",
                 function: vision_layernorm_static_name(
-                    p.metal_dtype,
+                    p.metal_dtype(),
                     norm_gain_dtype(p, WeightKind::RmsNorm),
                 ),
                 constants: baked(vec![
                     ConstantValue::uint(0, eff_m),
                     ConstantValue::uint(1, width.get()),
-                    ConstantValue::float(2, p.rms_norm_eps),
+                    ConstantValue::float(2, p.eps().get()),
                     ConstantValue::uint(3, 0),
                 ]),
                 dispatch: DispatchShape {
@@ -6735,13 +6747,13 @@ fn lower_one(
                 kernel: KernelId::VisionLayerNorm,
                 library: "vision_layernorm",
                 function: vision_layernorm_static_name(
-                    p.metal_dtype,
+                    p.metal_dtype(),
                     norm_gain_dtype(p, WeightKind::LayerNorm),
                 ),
                 constants: baked(vec![
                     ConstantValue::uint(0, eff_m),
                     ConstantValue::uint(1, width.get()),
-                    ConstantValue::float(2, p.rms_norm_eps),
+                    ConstantValue::float(2, p.eps().get()),
                     ConstantValue::uint(3, 1),
                 ]),
                 dispatch: DispatchShape {
@@ -6790,7 +6802,7 @@ fn lower_one(
             LoweredCommand {
                 kernel: KernelId::VisionGelu,
                 library: "activation",
-                function: pick_specialized_symbol(f16, bf16, p.metal_dtype),
+                function: pick_specialized_symbol(f16, bf16, p.metal_dtype()),
                 constants: gelu_constants(n_elems),
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
@@ -6825,7 +6837,7 @@ fn lower_one(
             LoweredCommand {
                 kernel: KernelId::ConcatRows,
                 library: "elementwise",
-                function: concat_rows_static_name(p.metal_dtype),
+                function: concat_rows_static_name(p.metal_dtype()),
                 constants: super::kernel_constants::ConcatRowsConstants {
                     elements: super::ids::ElementCount(n_elems),
                     width: *width,
@@ -6869,19 +6881,21 @@ fn lower_one(
         I::LoadRows(Slot(out_slot), source) => {
             use scratchy_ir::RowsExtern;
             let (width, kind) = match source {
-                RowsExtern::Pixels => (p.vision_in_features, RuntimeBindingKind::Pixels),
+                RowsExtern::Pixels => (vision(p)?.in_features().get(), RuntimeBindingKind::Pixels),
                 // VISION_Q_SIZE (= vision_num_heads * vision_head_dim) is the residual-stream
                 // width the interpolated positional embedding is added to.
-                RowsExtern::PosEmbeds => (p.vision_q_size, RuntimeBindingKind::VisionPosEmbeds),
+                RowsExtern::PosEmbeds => {
+                    (vision(p)?.q_width(), RuntimeBindingKind::VisionPosEmbeds)
+                }
                 RowsExtern::TargetHidden => {
-                    (p.target_hidden_width, RuntimeBindingKind::TargetHidden)
+                    (target(p)?.hidden().get(), RuntimeBindingKind::TargetHidden)
                 }
             };
             let n_elems = eff_m * width as u32;
             LoweredCommand {
                 kernel: KernelId::LoadRows,
                 library: "elementwise",
-                function: copy_rows_static_name(p.metal_dtype),
+                function: copy_rows_static_name(p.metal_dtype()),
                 constants: super::kernel_constants::CopyRowsConstants {
                     elements: super::ids::ElementCount(n_elems),
                 }
@@ -6921,13 +6935,13 @@ fn lower_one(
         // across threadgroups). Faithful to the cuda
         // `Instruction::VisionRope` eval (rotate_half on `[L, H, D]`).
         I::VisionRope(Slot(q_slot), Slot(k_slot), Slot(q_out_slot), Slot(k_out_slot)) => {
-            let hd = p.vision_head_dim;
-            let nh = p.vision_num_heads;
+            let hd = vision(p)?.head_dim().get();
+            let nh = vision(p)?.heads().get();
             // N_ELEMS guard = L * H * D = eff_m * VISION_Q_SIZE (rope is
             // a per-block op, so eff_m == bucket_m). m_scaling rescales
             // the grid to the live num_tokens; the function-constant
             // guard caps it at the baked bucket level.
-            let n_elems = eff_m * p.vision_q_size as u32;
+            let n_elems = eff_m * vision(p)?.q_width() as u32;
             let consts = || {
                 vec![
                     ConstantValue::uint(0, hd),
@@ -6944,10 +6958,12 @@ fn lower_one(
                 });
                 d
             };
+            let interleaved =
+                vision(p)?.pairing() == scratchy_ir::model_facts::VisionRopePairing::Interleaved;
             let rope_cmd = |out_slot: u32, in_slot: u32| LoweredCommand {
                 kernel: KernelId::VisionRope,
                 library: "vision_rope_2d",
-                function: vision_rope_2d_static_name(p.metal_dtype, p.vision_rope_interleaved),
+                function: vision_rope_2d_static_name(p.metal_dtype(), interleaved),
                 constants: baked(consts()),
                 dispatch: dispatch(),
                 bindings: baked(vec![
@@ -6998,18 +7014,18 @@ fn lower_one(
         // consts (`head_dim`/`num_attention_heads`/`attn_scale`), not
         // the vision ones.
         I::EncoderAttention(Slot(q_slot), Slot(k_slot), Slot(v_slot), Slot(out_slot)) => {
-            let hd = p.head_dim;
-            let nh = p.num_q_heads;
+            let hd = base(p)?.head_dim().get();
+            let nh = q_heads(p)?;
             LoweredCommand {
                 kernel: KernelId::VisionVarlenAttn,
                 library: "vision_varlen_attn",
-                function: vision_varlen_attn_static_name(p.metal_dtype),
+                function: vision_varlen_attn_static_name(p.metal_dtype()),
                 constants: baked(vec![
                     ConstantValue::uint(0, hd),
                     ConstantValue::uint(1, nh),
                     ConstantValue::uint(2, bucket_m),
                     ConstantValue::uint(3, eff_m),
-                    ConstantValue::float(4, p.attn_scale),
+                    ConstantValue::float(4, attention(p)?.scale().get()),
                 ]),
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(eff_m * nh, 64);
@@ -7061,12 +7077,12 @@ fn lower_one(
                 CuSeqlens::VisionFull => RuntimeBindingKind::VisionCuSeqlensFull,
                 CuSeqlens::VisionWindow => RuntimeBindingKind::VisionCuSeqlensWindow,
             };
-            let hd = p.vision_head_dim;
-            let nh = p.vision_num_heads;
+            let hd = vision(p)?.head_dim().get();
+            let nh = vision(p)?.heads().get();
             LoweredCommand {
                 kernel: KernelId::VisionVarlenAttn,
                 library: "vision_varlen_attn",
-                function: vision_varlen_attn_static_name(p.metal_dtype),
+                function: vision_varlen_attn_static_name(p.metal_dtype()),
                 constants: baked(vec![
                     ConstantValue::uint(0, hd),
                     ConstantValue::uint(1, nh),
@@ -7076,7 +7092,7 @@ fn lower_one(
                     // VA_N_TOKENS guard (= bucket_m; m_scaling shrinks the
                     // grid to live num_tokens, the guard caps the tail).
                     ConstantValue::uint(3, eff_m),
-                    ConstantValue::float(4, p.vision_attn_scale),
+                    ConstantValue::float(4, vision(p)?.scale().get()),
                 ]),
                 dispatch: {
                     // 1 thread per (query token, head); 64 threads/tg.
@@ -7132,7 +7148,7 @@ fn lower_one(
             LoweredCommand {
                 kernel: KernelId::EmbeddingGather,
                 library: "embedding_gather",
-                function: embedding_gather_static_name(p.metal_dtype),
+                function: embedding_gather_static_name(p.metal_dtype()),
                 constants: super::kernel_constants::EmbeddingGatherConstants {
                     elements: super::ids::ElementCount(n_elems),
                     width: *width,
@@ -7188,11 +7204,11 @@ fn lower_one(
         // row's destination. HIDDEN_SIZE is the residual width (the `Embed`
         // arm's; mm_embeds rows are HIDDEN_SIZE wide).
         I::SpliceMmEmbeds(Slot(slot)) => {
-            let hidden = p.hidden_size as u32;
+            let hidden = p.hidden().get() as u32;
             LoweredCommand {
                 kernel: KernelId::MmEmbedSplice,
                 library: "elementwise",
-                function: mm_embed_splice_static_name(p.metal_dtype),
+                function: mm_embed_splice_static_name(p.metal_dtype()),
                 constants: super::kernel_constants::MmEmbedSpliceConstants {
                     hidden: HiddenSize(hidden),
                 }
@@ -7265,57 +7281,69 @@ fn draft_pick(dtype: DequantDtype, f16: &'static str, bf16: &'static str) -> &'s
 
 /// The drafter's geometry its kernels index by: its block (its drafts and their anchor) and its
 /// attention's heads.
-fn draft_geometry(p: &MetalModelConsts) -> crate::dflash2::DraftGeometry {
-    crate::dflash2::DraftGeometry {
-        rows: p.spec_drafts + 1,
-        query_heads: p.num_q_heads,
-        kv_heads: p.num_kv_heads,
-        head_dim: p.head_dim,
-    }
+fn draft_geometry(p: &ModelFacts) -> Result<crate::dflash2::DraftGeometry, LoweringError> {
+    let base = base(p)?;
+    Ok(crate::dflash2::DraftGeometry {
+        rows: kernel_drafts(p) + 1,
+        query_heads: base.q_heads().get(),
+        kv_heads: base.kv_heads().get(),
+        head_dim: base.head_dim().get(),
+    })
 }
 
 /// The activation's bytes per element.
-fn draft_act_bytes(p: &MetalModelConsts) -> u64 {
+fn draft_act_bytes(p: &ModelFacts) -> u64 {
     match dequant_dtype_for(p) {
         DequantDtype::F16 | DequantDtype::Bf16 => 2,
     }
 }
 
 /// Every `dflash2.metal` command's constants (`DraftConstants`); `finish` is a convolution's stage.
-fn draft_constants(p: &MetalModelConsts, finish: bool) -> &'static [ConstantValue] {
-    let g = draft_geometry(p);
-    super::kernel_constants::DraftConstants {
+fn draft_constants(
+    p: &ModelFacts,
+    finish: bool,
+) -> Result<&'static [ConstantValue], LoweringError> {
+    let g = draft_geometry(p)?;
+    Ok(super::kernel_constants::DraftConstants {
         rows: g.rows,
         query_heads: g.query_heads,
         kv_heads: g.kv_heads,
         head_dim: g.head_dim,
-        window: p.sliding_window.max(0) as u32,
+        // The kernel's ABI spells "no sliding window" as 0.
+        window: p
+            .attention()
+            .and_then(|a| a.window())
+            .map_or(0, |w| w.get()),
         splits: crate::dflash2::ATTENTION_SPLITS,
-        hidden: p.hidden_size as u32,
-        conv_group: p.draft_conv_group,
+        hidden: p.hidden().get() as u32,
+        conv_group: drafter(p)?.conv_group().get(),
         conv_finish: u32::from(finish),
-        rms_eps: p.rms_norm_eps,
-        scale: p.attn_scale,
+        rms_eps: p.eps().get(),
+        scale: attention(p)?.scale().get(),
     }
-    .into_baked()
+    .into_baked())
 }
 
 /// Every `dflash2_select.metal` command's constants at a bucket of `lanes` lanes
 /// (`DraftSelectConstants`): Splash's selector, and its verify rows' model, its target's
 /// ([`VerifyRows::of_target`](crate::dflash2::VerifyRows::of_target)).
-fn draft_select_constants(p: &MetalModelConsts, lanes: u32) -> &'static [ConstantValue] {
+fn draft_select_constants(
+    p: &ModelFacts,
+    lanes: u32,
+) -> Result<&'static [ConstantValue], LoweringError> {
     use crate::dflash2::{CANDIDATES, PROPOSALS, SAMPLING_SHARDS, VerifyRows};
-    super::kernel_constants::DraftSelectConstants {
-        vocab: p.vocab_size as u32,
-        rows: draft_geometry(p).rows,
+    use scratchy_ir::model_facts::TargetRouting;
+    Ok(super::kernel_constants::DraftSelectConstants {
+        vocab: vocab(p)?.get() as u32,
+        rows: draft_geometry(p)?.rows,
         positions: PROPOSALS,
         candidates: CANDIDATES,
-        rank: p.draft_selector_rank,
+        rank: drafter(p)?.selector_rank().get(),
         shards: SAMPLING_SHARDS,
-        verify: VerifyRows::of_target(p.target_routes_experts),
+        verify: VerifyRows::of_target(target(p)?.routing() == TargetRouting::Experts),
         lanes,
     }
-    .into_baked()
+    .into_baked())
 }
 
 /// A drafter grid of `x` groups by the bucket's lanes (set to the step's sequences) by `z`, of 256
@@ -7402,7 +7430,7 @@ fn pick_specialized_symbol(
         // AWQ/GPTQ dequant kernels have a different binding contract
         // (packed u32 weights + group scales) so a single dtype
         // substitution can't model them — surfaced as a panic for
-        // clarity since `p.metal_dtype = Int4` is unreachable today.
+        // clarity since a metal dtype of Int4 is unreachable today.
         MetalDtype::Int4 => {
             panic!("metal lowering: Int4 dtype not yet wired through kernel symbol picker")
         }
@@ -7554,10 +7582,10 @@ fn gdn_rms_norm_gated_simd_static_name(dtype: DequantDtype) -> &'static str {
 ///
 /// Reading one as the other is a bit-reinterpretation, not a rounding
 /// error: an f16 0.575 read as bf16 is 7.3e-05.
-fn norm_gain_dtype(p: &MetalModelConsts, bundle: WeightKind) -> ScaleDtype {
+fn norm_gain_dtype(p: &ModelFacts, bundle: WeightKind) -> ScaleDtype {
     match bundle {
         WeightKind::RmsNorm => scale_dtype_for(p),
-        WeightKind::LayerNorm => match p.metal_dtype {
+        WeightKind::LayerNorm => match p.metal_dtype() {
             MetalDtype::F16 => ScaleDtype::F16,
             MetalDtype::Bf16 => ScaleDtype::Bf16,
             MetalDtype::Int4 => {
@@ -7601,7 +7629,7 @@ fn gelu_constants(n: u32) -> &'static [ConstantValue] {
 /// are identical across activations.
 #[allow(clippy::too_many_arguments)]
 fn fused_gate_up_mul_cmd(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     in_slot: u32,
     out_slot: u32,
     layer: u32,
@@ -7609,8 +7637,8 @@ fn fused_gate_up_mul_cmd(
     bucket_m: u32,
     ix: SourceIx,
     layer_offset: u32,
-) -> LoweredCommand {
-    let inter = p.intermediate_size as u32;
+) -> Result<LoweredCommand, LoweringError> {
+    let inter = intermediate(p)?.get() as u32;
     let (threadgroups, threads_per_threadgroup) = if bucket_m == 1 {
         // Decode (MLX gemv port): blockM = BM*SM*TM = 4 outputs per
         // threadgroup, 256 threads/group = BN*SN = 8 simdgroups × 32 lanes.
@@ -7629,35 +7657,35 @@ fn fused_gate_up_mul_cmd(
         pick_specialized_symbol(
             "fused_gate_up_silu_mul_decode_f16_specialized",
             "fused_gate_up_silu_mul_decode_bf16_specialized",
-            p.metal_dtype,
+            p.metal_dtype(),
         )
     } else {
         pick_specialized_symbol(
             "fused_gate_up_silu_mul_gemm_steel_f16_specialized",
             "fused_gate_up_silu_mul_gemm_steel_bf16_specialized",
-            p.metal_dtype,
+            p.metal_dtype(),
         )
     };
     let constants: Vec<ConstantValue> = if bucket_m == 1 {
         super::kernel_constants::FusedGateUpSiluMulDecodeConstants {
             bucket_m: super::ids::BucketM(bucket_m),
-            intermediate_size: super::ids::IntermediateSize(p.intermediate_size as u32),
+            intermediate_size: super::ids::IntermediateSize(inter),
             // gate/up gemm K-dim = MLP input width = HIDDEN_SIZE, not
             // Q_SIZE (differ when head_dim != hidden/heads, e.g. Qwen3.5).
-            q_size: super::ids::QSize(p.hidden_size as u32),
+            q_size: super::ids::QSize(p.hidden().get() as u32),
             is_gelu,
         }
         .into()
     } else {
         super::kernel_constants::FusedGateUpSiluMulPrefillConstants {
             bucket_m: super::ids::BucketM(bucket_m),
-            intermediate_size: super::ids::IntermediateSize(p.intermediate_size as u32),
-            q_size: super::ids::QSize(p.hidden_size as u32),
+            intermediate_size: super::ids::IntermediateSize(inter),
+            q_size: super::ids::QSize(p.hidden().get() as u32),
             is_gelu,
         }
         .into()
     };
-    LoweredCommand {
+    Ok(LoweredCommand {
         kernel: KernelId::FusedGateUpSiluMul,
         library: "fused_gate_up_silu_mul",
         function,
@@ -7692,7 +7720,7 @@ fn fused_gate_up_mul_cmd(
             ),
         ]),
         gemm_dims: None,
-    }
+    })
 }
 
 fn embedding_gather_static_name(dtype: MetalDtype) -> &'static str {
@@ -7707,7 +7735,7 @@ fn embedding_gather_static_name(dtype: MetalDtype) -> &'static str {
 
 /// `vision_rope_2d.metal` host-name picker. `interleaved` selects the
 /// adjacent-pair (GPT-J / MoonViT) entry points over the NeoX
-/// rotate_half ones — driven by `p.vision_rope_interleaved` (the
+/// rotate_half ones — driven by the vision tower's rope pairing (the
 /// `vision_rope_style` config key).
 fn vision_rope_2d_static_name(dtype: MetalDtype, interleaved: bool) -> &'static str {
     match (dtype, interleaved) {
@@ -7765,12 +7793,12 @@ fn mm_embed_splice_static_name(dtype: MetalDtype) -> &'static str {
 /// `qmm_t_kernel_static_name` consume). Same two cases either way —
 /// the duplicate enum exists because the kernel-dispatcher crate
 /// can't depend on lowering types.
-fn dequant_dtype_for(p: &MetalModelConsts) -> DequantDtype {
-    match p.metal_dtype {
+fn dequant_dtype_for(p: &ModelFacts) -> DequantDtype {
+    match p.metal_dtype() {
         MetalDtype::F16 => DequantDtype::F16,
         MetalDtype::Bf16 => DequantDtype::Bf16,
         MetalDtype::Int4 => panic!(
-            "metal lowering: MetalStep::AffineQmm requires p.metal_dtype \
+            "metal lowering: MetalStep::AffineQmm requires p.metal_dtype() \
              ∈ {{F16, Bf16}} (the activation dtype); got Int4"
         ),
     }
@@ -7778,11 +7806,11 @@ fn dequant_dtype_for(p: &MetalModelConsts) -> DequantDtype {
 
 /// Scale-storage dtype the kernel reads `*.scales` / `*.biases` device
 /// pointers as — the on-disk dtype for the affine quant per-group
-/// params. Reads `p.scale_dtype`, populated from each arch's
+/// params. Reads `p.scale_dtype()`, populated from each arch's
 /// quantization manifest (default F16; Qwen3 family overrides to BF16
 /// because their mlx-community 4bit checkpoints ship BF16 scales).
-fn scale_dtype_for(p: &MetalModelConsts) -> ScaleDtype {
-    p.scale_dtype
+fn scale_dtype_for(p: &ModelFacts) -> ScaleDtype {
+    p.scale_dtype()
 }
 
 /// Bindings shared by every `MetalStep::AffineQmm` lowering's qmv
@@ -7857,9 +7885,9 @@ fn elem_size_bytes(dtype: DequantDtype) -> u32 {
 /// Mirrors P10b's in-register cast pattern: RMSNorm gains stay in their on-disk
 /// dtype on the device, the kernel reads them through a `T_scale`
 /// pointer and casts to `T_act` in registers.
-fn rmsnorm_kernel_static_name(p: &MetalModelConsts, scale_dtype: ScaleDtype) -> &'static str {
+fn rmsnorm_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtype) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype, scale_dtype) {
+    match (p.metal_dtype(), scale_dtype) {
         (MetalDtype::F16, S::F16) => "rmsnorm_f16_s_f16_specialized",
         (MetalDtype::Bf16, S::F16) => "rmsnorm_bf16_s_f16_specialized",
         (MetalDtype::F16, S::Bf16) => "rmsnorm_f16_s_bf16_specialized",
@@ -7875,12 +7903,9 @@ fn rmsnorm_kernel_static_name(p: &MetalModelConsts, scale_dtype: ScaleDtype) -> 
 /// Symbol naming: `fused_add_rmsnorm_<T_act>_s_<T_scale>_specialized`,
 /// matching the `INST_FUSED_ARN` instantiations in
 /// `shaders/fused_add_rmsnorm.metal`.
-fn fused_add_rmsnorm_kernel_static_name(
-    p: &MetalModelConsts,
-    scale_dtype: ScaleDtype,
-) -> &'static str {
+fn fused_add_rmsnorm_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtype) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype, scale_dtype) {
+    match (p.metal_dtype(), scale_dtype) {
         (MetalDtype::F16, S::F16) => "fused_add_rmsnorm_f16_s_f16_specialized",
         (MetalDtype::Bf16, S::F16) => "fused_add_rmsnorm_bf16_s_f16_specialized",
         (MetalDtype::F16, S::Bf16) => "fused_add_rmsnorm_f16_s_bf16_specialized",
@@ -7896,12 +7921,12 @@ fn fused_add_rmsnorm_kernel_static_name(
 /// bucket's is the one-row gemv; a multi-row bucket's the per-row variant (`gemv_normed_rows_*`),
 /// one threadgroup per (row block, token).
 fn normed_gemv_kernel_static_name(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     scale_dtype: ScaleDtype,
     bucket_m: super::ids::BucketM,
 ) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype, scale_dtype, bucket_m.0 == 1) {
+    match (p.metal_dtype(), scale_dtype, bucket_m.0 == 1) {
         (MetalDtype::F16, S::F16, true) => "gemv_normed_f16_s_f16",
         (MetalDtype::Bf16, S::F16, true) => "gemv_normed_bf16_s_f16",
         (MetalDtype::F16, S::Bf16, true) => "gemv_normed_f16_s_bf16",
@@ -7916,9 +7941,9 @@ fn normed_gemv_kernel_static_name(
     }
 }
 
-fn row_program_kernel_static_name(p: &MetalModelConsts, scale_dtype: ScaleDtype) -> &'static str {
+fn row_program_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtype) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype, scale_dtype) {
+    match (p.metal_dtype(), scale_dtype) {
         (MetalDtype::F16, S::F16) => "row_program_f16_s_f16",
         (MetalDtype::Bf16, S::F16) => "row_program_bf16_s_f16",
         (MetalDtype::F16, S::Bf16) => "row_program_f16_s_bf16",
@@ -7932,12 +7957,9 @@ fn row_program_kernel_static_name(p: &MetalModelConsts, scale_dtype: ScaleDtype)
 /// `MetalStep::NormAddScalarMul` symbol — the norm-THEN-add mirror
 /// of `fused_add_rmsnorm_kernel_static_name`; same dtype enumeration,
 /// same `fused_add_rmsnorm` library.
-fn norm_add_scalar_mul_kernel_static_name(
-    p: &MetalModelConsts,
-    scale_dtype: ScaleDtype,
-) -> &'static str {
+fn norm_add_scalar_mul_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtype) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype, scale_dtype) {
+    match (p.metal_dtype(), scale_dtype) {
         (MetalDtype::F16, S::F16) => "norm_add_scalar_mul_f16_s_f16_specialized",
         (MetalDtype::Bf16, S::F16) => "norm_add_scalar_mul_bf16_s_f16_specialized",
         (MetalDtype::F16, S::Bf16) => "norm_add_scalar_mul_f16_s_bf16_specialized",
@@ -7951,12 +7973,9 @@ fn norm_add_scalar_mul_kernel_static_name(
 /// `MetalStep::RopeAppendNormed` symbol — same dtype enumeration as
 /// the rmsnorm/fused_add_rmsnorm families (T_scale = on-disk gain
 /// dtype), `rope` library.
-fn rope_append_normed_kernel_static_name(
-    p: &MetalModelConsts,
-    scale_dtype: ScaleDtype,
-) -> &'static str {
+fn rope_append_normed_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtype) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype, scale_dtype) {
+    match (p.metal_dtype(), scale_dtype) {
         (MetalDtype::F16, S::F16) => "rope_append_normed_f16_s_f16_specialized",
         (MetalDtype::Bf16, S::F16) => "rope_append_normed_bf16_s_f16_specialized",
         (MetalDtype::F16, S::Bf16) => "rope_append_normed_f16_s_bf16_specialized",
@@ -8056,7 +8075,8 @@ impl ColumnSlice {
 /// `GDN_CONV_BLOCK`-token block) — grid (num_seqs[set via set_axis=X], ceil(conv_dim/tg_y),
 /// ceil(bucket_m/GDN_CONV_BLOCK) [scaled by num_tokens]; blocks past a sequence's end early out).
 fn recurrent_conv(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
+    g: scratchy_ir::model_facts::Gdn,
     input: Binding,
     conv_w: Binding,
     layer: super::ids::LayerId,
@@ -8070,11 +8090,11 @@ fn recurrent_conv(
         kind,
         binding_index,
     };
-    let conv_dim = p.gdn_conv_dim as u32;
+    let conv_dim = g.conv_dim().get() as u32;
     let mut constants = vec![
         ConstantValue::uint(0, conv_dim),
-        ConstantValue::uint(1, p.gdn_conv_kernel),
-        ConstantValue::uint(5, p.spec_drafts),
+        ConstantValue::uint(1, g.conv_kernel().get()),
+        ConstantValue::uint(5, kernel_drafts(p)),
     ];
     let mut bindings = vec![
         Binding::MoeScratch {
@@ -8089,7 +8109,7 @@ fn recurrent_conv(
         runtime(RuntimeBindingKind::GdnIsFresh, 6),
     ];
     // A model that drafts checkpoints its verify rows in their sequences' draft lanes.
-    if p.spec_drafts > 0 {
+    if p.spec_drafts().is_some() {
         bindings.push(runtime(RuntimeBindingKind::GdnConvLanes { layer }, 8));
     }
     // The no-race contract: the block must cover the seed window (kernel − 1 entries), so
@@ -8097,7 +8117,7 @@ fn recurrent_conv(
     // verify step's rows (drafts + 1), so only the thread that reads the lane's checkpoint
     // (a replay's seed) writes it.
     assert!(
-        p.gdn_conv_kernel <= GDN_CONV_BLOCK + 1 && GDN_CONV_BLOCK > p.spec_drafts,
+        g.conv_kernel().get() <= GDN_CONV_BLOCK + 1 && GDN_CONV_BLOCK > kernel_drafts(p),
         "the conv's token block must cover the seed window (kernel - 1) and a verify step's \
          rows (drafts + 1)"
     );
@@ -8175,7 +8195,8 @@ enum ScanForm {
 /// (1-D over `[num_tokens · heads]`, scaling X), then the per-thread scan, always its `_f32`
 /// instantiation (all its I/O is f32 scratch). Both scans: grid Z = num_seqs.
 fn recurrent_scan(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
+    g: scratchy_ir::model_facts::Gdn,
     form: ScanForm,
     bucket_m: u32,
     (ix, layer): (SourceIx, super::ids::LayerId),
@@ -8183,8 +8204,8 @@ fn recurrent_scan(
 ) -> Vec<LoweredCommand> {
     use crate::tape::ids::BucketM;
     use crate::tape::lowered::{MScaleAxis, MScaling};
-    let (nk, nv) = (p.gdn_num_k_heads, p.gdn_num_v_heads);
-    let (hk, hv) = (p.gdn_head_k_dim, p.gdn_head_v_dim);
+    let (nk, nv) = (g.k_heads().get(), g.v_heads().get());
+    let (hk, hv) = (g.k_dim().get(), g.v_dim().get());
     let dtype = dequant_dtype_for(p);
     let (a, b, dt) = match form {
         ScanForm::DeltaRule { a, b } => (a, b, None),
@@ -8210,7 +8231,7 @@ fn recurrent_scan(
         ConstantValue::uint(2, hk),
         ConstantValue::uint(3, hv),
         ConstantValue::float(4, (hk as f32).powf(-0.5)),
-        ConstantValue::uint(GDN_SCAN_DRAFTS_SLOT, p.spec_drafts),
+        ConstantValue::uint(GDN_SCAN_DRAFTS_SLOT, kernel_drafts(p)),
     ];
     scan_constants.extend(dt.map(|_| ConstantValue::boolean(5, true)));
     let state = [
@@ -8235,7 +8256,7 @@ fn recurrent_scan(
         let mut bindings = vec![scratch(0, layout.o), scratch(1, layout.conv_out)];
         bindings.extend(inputs.into_iter().chain(state).chain(tail.iter().copied()));
         bindings.extend(dt.map(|_| weight(WeightTensor::GdnSkip, skip)));
-        if p.spec_drafts > 0 {
+        if p.spec_drafts().is_some() {
             bindings.push(runtime(RuntimeBindingKind::GdnSsmLanes { layer }, skip + 1));
         }
         LoweredCommand {
@@ -8338,7 +8359,7 @@ const NORM_ROWS_PER_TG: u32 = 4;
 /// non-power-of-two width, or one outside [32, 256]) keeps the threadgroup form and its
 /// covering dispatch.
 fn recurrent_norm(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     (width, per_token): (u32, u32),
     bucket_m: u32,
     [out, z, norm_w]: [Binding; 3],
@@ -8351,7 +8372,7 @@ fn recurrent_norm(
     let mut constants = vec![
         ConstantValue::uint(0, width),
         ConstantValue::uint(1, rows),
-        ConstantValue::float(2, p.rms_norm_eps),
+        ConstantValue::float(2, p.eps().get()),
     ];
     if let Some(stride) = z_stride {
         constants.extend([
@@ -8526,24 +8547,24 @@ impl MoeScratchLayout {
     }
 }
 
-fn softmax_precise_symbol(p: &MetalModelConsts) -> &'static str {
-    match p.metal_dtype {
+fn softmax_precise_symbol(p: &ModelFacts) -> &'static str {
+    match p.metal_dtype() {
         MetalDtype::F16 => "block_softmax_precise_float16",
         MetalDtype::Bf16 => "block_softmax_precise_bfloat16",
         MetalDtype::Int4 => panic!(),
     }
 }
 
-fn take_along_axis_symbol(p: &MetalModelConsts) -> &'static str {
-    match p.metal_dtype {
+fn take_along_axis_symbol(p: &ModelFacts) -> &'static str {
+    match p.metal_dtype() {
         MetalDtype::F16 => "take_along_axis_2d_contig_float16",
         MetalDtype::Bf16 => "take_along_axis_2d_contig_bfloat16",
         MetalDtype::Int4 => panic!(),
     }
 }
 
-fn moe_weighted_sum_symbol(p: &MetalModelConsts) -> &'static str {
-    match p.metal_dtype {
+fn moe_weighted_sum_symbol(p: &ModelFacts) -> &'static str {
+    match p.metal_dtype() {
         MetalDtype::F16 => "moe_weighted_sum_float16",
         MetalDtype::Bf16 => "moe_weighted_sum_bfloat16",
         MetalDtype::Int4 => panic!(),
@@ -8555,9 +8576,9 @@ fn moe_weighted_sum_symbol(p: &MetalModelConsts) -> &'static str {
 /// Qwen2-MoE E=60, Qwen3-MoE E=128; Qwen3.5-MoE E=256 needs the
 /// `bn=64` (N_PER_BLOCK=256) instantiation. The router input is
 /// router-probs (Qwen) or router-logits (Mixtral), both in
-/// p.metal_dtype.
-fn argpartition_symbol(p: &MetalModelConsts, num_experts: u32) -> &'static str {
-    match (p.metal_dtype, num_experts > 128) {
+/// p.metal_dtype().
+fn argpartition_symbol(p: &ModelFacts, num_experts: u32) -> &'static str {
+    match (p.metal_dtype(), num_experts > 128) {
         (MetalDtype::F16, false) => "c_arg_block_sort_float16_uint32_bn32_tn4",
         (MetalDtype::Bf16, false) => "c_arg_block_sort_bfloat16_uint32_bn32_tn4",
         (MetalDtype::F16, true) => "c_arg_block_sort_float16_uint32_bn64_tn4",
@@ -8569,8 +8590,8 @@ fn argpartition_symbol(p: &MetalModelConsts, num_experts: u32) -> &'static str {
 }
 
 /// The routing kernel over `num_experts`: the argsort's dtype and threadgroup.
-fn moe_route_symbol(p: &MetalModelConsts, num_experts: u32) -> &'static str {
-    match (p.metal_dtype, num_experts > 128) {
+fn moe_route_symbol(p: &ModelFacts, num_experts: u32) -> &'static str {
+    match (p.metal_dtype(), num_experts > 128) {
         (MetalDtype::F16, false) => "moe_route_float16_bn32",
         (MetalDtype::Bf16, false) => "moe_route_bfloat16_bn32",
         (MetalDtype::F16, true) => "moe_route_float16_bn64",
@@ -8835,7 +8856,7 @@ struct MoeScratch {
 }
 
 impl MoeScratch {
-    fn of(b: &MoeBlock, bucket_m: u32, p: &MetalModelConsts, moe_scratch_bytes: &mut u32) -> Self {
+    fn of(b: &MoeBlock, bucket_m: u32, p: &ModelFacts, moe_scratch_bytes: &mut u32) -> Self {
         let elem = elem_size_bytes(dequant_dtype_for(p));
         let groups = crate::op_abi::METAL_GROUPED_EXPERTS.contains(&b.bundle);
         // `bucket_m*top_k` counts token–expert pairs; under 64 nothing sorts (mlx-lm's floor).
@@ -8855,7 +8876,7 @@ impl MoeScratch {
         // A lane's verify sorts on every bank (Splash's decode plan); the 2-4-lane verifies wider
         // buckets carry are only a block drafter's target's (`draft_capture_slots`), so only its
         // bake sorts there: another model keeps its own ladder at those buckets.
-        let lanes = if p.draft_capture_slots > 0 {
+        let lanes = if p.capture_slots().is_some() {
             METAL_LANE_VERIFY_ROWS..=METAL_DECODE_GROUPED_ROWS
         } else {
             METAL_LANE_VERIFY_ROWS..=METAL_LANE_VERIFY_ROWS
@@ -8922,7 +8943,7 @@ fn arena_at(binding_index: u8, slot: u32) -> Binding {
 /// Lower one step of a MoE block: its command(s) at the block's scratch layout for this bake.
 /// A gathered bake's sort and unsort emit none — their readers bind what they view.
 fn lower_moe_step(
-    p: &MetalModelConsts,
+    p: &ModelFacts,
     b: &MoeBlock,
     step: MoeStep,
     w: RowSources<'_>,
@@ -9419,7 +9440,7 @@ fn lower_moe_step(
         }
         S::Scale(scale) => {
             let (f16, bf16) = ("scalar_mul_f16_specialized", "scalar_mul_bf16_specialized");
-            let symbol = pick_specialized_symbol(f16, bf16, p.metal_dtype);
+            let symbol = pick_specialized_symbol(f16, bf16, p.metal_dtype());
             let bindings = vec![s.at(0, R::TopKScores), s.at(1, R::TopKScores)];
             let shape = rows_1d(pairs, THREADS_PER_GROUP, A::X);
             let constants = super::kernel_constants::ScalarMulConstants {
@@ -9437,7 +9458,7 @@ fn lower_moe_step(
             )]
         }
         S::Renorm => {
-            let symbol = match p.metal_dtype {
+            let symbol = match p.metal_dtype() {
                 MetalDtype::F16 => "topk_renorm_float16",
                 MetalDtype::Bf16 => "topk_renorm_bfloat16",
                 MetalDtype::Int4 => panic!("topk_renorm: int4 unreachable"),
@@ -9555,7 +9576,7 @@ fn lower_moe_step(
             } else {
                 (
                     KernelId::MoeGroupScatter,
-                    moe_group_scatter_symbol(p.metal_dtype),
+                    moe_group_scatter_symbol(p.metal_dtype()),
                     arena_at(2, x),
                     hidden.min(256),
                 )
@@ -9877,7 +9898,7 @@ fn lower_moe_step(
                 MoeGrouping::Grouped => (s.l.mpad_max, None),
             };
             let n = rows * inter;
-            let symbol = pick_specialized_symbol("relu2_f16", "relu2_bf16", p.metal_dtype);
+            let symbol = pick_specialized_symbol("relu2_f16", "relu2_bf16", p.metal_dtype());
             let shape = grid((n.div_ceil(256), 1, 1), (256, 1, 1), m_scaling);
             let bindings = vec![s.at(0, R::ExpertUp), s.at(1, R::ExpertUp)];
             let kernel = KernelId::VisionGelu;
@@ -9907,8 +9928,8 @@ fn lower_moe_step(
 }
 
 /// `moe_per_expert_scale_{float16,bfloat16}` symbol picker.
-fn moe_per_expert_scale_symbol(p: &MetalModelConsts) -> &'static str {
-    match p.metal_dtype {
+fn moe_per_expert_scale_symbol(p: &ModelFacts) -> &'static str {
+    match p.metal_dtype() {
         MetalDtype::F16 => "moe_per_expert_scale_float16",
         MetalDtype::Bf16 => "moe_per_expert_scale_bfloat16",
         MetalDtype::Int4 => panic!("moe_per_expert_scale: int4 unreachable"),
@@ -9921,19 +9942,112 @@ mod tests {
     use crate::tape::ids::DecodeRows;
     use scratchy_ir::CanonicalParams;
 
-    fn tp() -> MetalModelConsts {
-        MetalModelConsts::from_canonical::<TestParams>()
+    use scratchy_ir::model_facts::{
+        Attention, AttnScale, AttnWindow, BlockSize, ConvDim, ConvKernel, FactsParts, Gdn,
+        GdnHeadDim, GdnHeads, HeadDim, HeadGeometry, HiddenSize, IntermediateSize, KvHeads, KvRope,
+        NormWeightOffset, NumDrafts, QueryHeads, RmsNormEps, Rope, RopePairing, RotDim, ScaleDtype,
+        SoftCap,
+    };
+
+    /// A class's geometry: `q` query heads over `kv` kv heads of `hd`, `rot` lanes rotated, pages
+    /// of `page`.
+    const fn geom(q: u32, kv: u32, hd: u32, rot: u32, page: u32) -> HeadGeometry {
+        HeadGeometry::new(
+            QueryHeads::new(q),
+            KvHeads::new(kv),
+            HeadDim::new(hd),
+            RotDim::new(rot),
+            BlockSize::new(page),
+        )
+    }
+
+    /// The Llama-1B-like decoder's one class: 32 query heads over 4 kv heads of 64, every lane
+    /// rotated, 16-position pages.
+    const TP_GEOM: HeadGeometry = geom(32, 4, 64, 64, 16);
+
+    /// An attention of `base` and `global` classes at the fixtures' scale (1/8), its sliding
+    /// layers' `window`, its keys roped per `kv_rope`.
+    fn attn(
+        base: HeadGeometry,
+        global: HeadGeometry,
+        window: Option<u32>,
+        kv_rope: KvRope,
+    ) -> Attention {
+        Attention::new(
+            base,
+            global,
+            AttnScale::new(0.125),
+            None,
+            window.map(AttnWindow::new),
+            Rope::new(RopePairing::Standard, kv_rope, None),
+        )
+    }
+
+    /// A test model's attention.
+    fn a(p: &ModelFacts) -> Attention {
+        p.attention().expect("a test model with attention")
+    }
+
+    /// `p` with `f` applied to its parts, its laws checked again.
+    fn with(p: ModelFacts, f: impl FnOnce(&mut FactsParts)) -> ModelFacts {
+        let mut parts = p.parts();
+        f(&mut parts);
+        ModelFacts::new(parts)
+    }
+
+    /// `p` with its attention restated ([`attn`]).
+    fn with_attention(
+        p: ModelFacts,
+        base: HeadGeometry,
+        global: HeadGeometry,
+        window: Option<u32>,
+        kv_rope: KvRope,
+    ) -> ModelFacts {
+        with(p, |x| {
+            x.attention = Some(attn(base, global, window, kv_rope))
+        })
+    }
+
+    /// A Gated-DeltaNet geometry at a 4-wide convolution.
+    fn gdn_at(nk: u32, nv: u32, hk: u32, hv: u32) -> Gdn {
+        Gdn::new(
+            GdnHeads::new(nk),
+            GdnHeads::new(nv),
+            GdnHeadDim::new(hk),
+            GdnHeadDim::new(hv),
+            ConvKernel::new(4),
+            ConvDim::new(2 * (nk * hk) as usize + (nv * hv) as usize),
+        )
+    }
+
+    /// The lowering tests' model: a Llama-1B-like decoder, bf16, dense KV.
+    fn tp() -> ModelFacts {
+        ModelFacts::new(FactsParts {
+            metal_dtype: MetalDtype::Bf16,
+            scale_dtype: ScaleDtype::F16,
+            hidden: HiddenSize::new(2048),
+            intermediate: Some(IntermediateSize::new(8192)),
+            vocab: None,
+            eps: RmsNormEps::new(1e-5),
+            norm_offset: NormWeightOffset::new(0.0),
+            final_softcap: None,
+            kv_codec: KvCodec::Dense,
+            attention: Some(attn(TP_GEOM, TP_GEOM, None, KvRope::AtWrite)),
+            vision: None,
+            gdn: None,
+            drafter: None,
+            spec_drafts: None,
+            capture_slots: None,
+            target: None,
+        })
     }
 
     /// The code width the TurboQuant fixture is built at.
     const TQ_BITS: TqBits = TqBits::new(4);
 
     /// `tp()` built with the `turboquant` feature: its KV codec is TurboQuant.
-    fn tq_consts() -> MetalModelConsts {
-        MetalModelConsts {
-            kv_codec: KvCodec::TurboQuant(TQ_BITS),
-            ..tp()
-        }
+    fn tq_consts() -> ModelFacts {
+        with(tp(), |x| x.kv_codec = KvCodec::TurboQuant(TQ_BITS))
     }
     /// The sliding class every test here binds — one window size, the
     /// gemma value, because these tests assert STRUCTURE (which step a
@@ -9950,7 +10064,7 @@ mod tests {
 
     /// Minimal `CanonicalParams` impl for lowering-shape tests. No
     /// kernel actually runs — `lower_one` just inspects the variant
-    /// fields and `p.metal_dtype`. Pinned to bf16 to match the
+    /// fields and `p.metal_dtype()`. Pinned to bf16 to match the
     /// canonical Llama-3.x configuration the macro emits.
     struct TestParams;
     impl CanonicalParams for TestParams {
@@ -10029,11 +10143,8 @@ mod tests {
     }
 
     /// [`tq_consts`] with [`SW`]'s window: what [`sliding_sinks_tape`] lowers under.
-    fn sliding_tq_consts() -> MetalModelConsts {
-        MetalModelConsts {
-            sliding_window: 1024,
-            ..tq_consts()
-        }
+    fn sliding_tq_consts() -> ModelFacts {
+        with_attention(tq_consts(), TP_GEOM, TP_GEOM, Some(1024), KvRope::AtWrite)
     }
 
     /// A layer's KV writer whose K and V carry `offsets`.
@@ -10281,12 +10392,12 @@ mod tests {
         lower_tq(&tq_consts(), rows, bucket_m)
     }
 
-    fn lower_tq(p: &MetalModelConsts, rows: Vec<StepRow>, bucket_m: u32) -> LoweredMetalTape {
+    fn lower_tq(p: &ModelFacts, rows: Vec<StepRow>, bucket_m: u32) -> LoweredMetalTape {
         try_lower_tq(p, rows, bucket_m).expect("lower_subtile_tape_to_metal")
     }
 
     fn try_lower_tq(
-        p: &MetalModelConsts,
+        p: &ModelFacts,
         rows: Vec<StepRow>,
         bucket_m: u32,
     ) -> Result<LoweredMetalTape, LoweringError> {
@@ -10330,10 +10441,13 @@ mod tests {
             ),
             // Head_dim 192 — a dim between the split's steps — keeps the fold twin.
             (
-                MetalModelConsts {
-                    global_head_dim: 192,
-                    ..tq_consts()
-                },
+                with_attention(
+                    tq_consts(),
+                    TP_GEOM,
+                    geom(32, 4, 192, 64, 16),
+                    None,
+                    KvRope::AtWrite,
+                ),
                 KvWrite::PoolAndPacked,
                 packed.clone(),
             ),
@@ -10403,7 +10517,7 @@ mod tests {
             assert!(bound(i), "binding {i}");
         }
         assert_eq!((bound(20), bound(22)), (true, false));
-        let splits = (128 * p.global_block_size).div_ceil(ATTN_SPLIT_KEYS);
+        let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
         assert_eq!(split.dispatch.threadgroups.2, splits + 1);
         let two = lower_subtile_tape_to_metal(&tape, &p, bake_point(2, None));
         assert!(matches!(
@@ -10428,15 +10542,10 @@ mod tests {
             UnlessPlainGdn,
         };
         let drafting = |(nk, nv, hk, hv): (u32, u32, u32, u32), bucket_m, spec_drafts| {
-            let p = MetalModelConsts {
-                gdn_num_k_heads: nk,
-                gdn_num_v_heads: nv,
-                gdn_head_k_dim: hk,
-                gdn_head_v_dim: hv,
-                gdn_conv_dim: 2 * (nk * hk) as usize + (nv * hv) as usize,
-                spec_drafts,
-                ..tp()
-            };
+            let p = with(tp(), |x| {
+                x.gdn = Some(gdn_at(nk, nv, hk, hv));
+                x.spec_drafts = (spec_drafts > 0).then(|| NumDrafts::new(spec_drafts));
+            });
             let step =
                 MetalStep::GatedDeltaNet(Slot(0), Slot(1), Slot(2), Slot(3), Slot(4), LayerId(0));
             lower_tq(&p, plain(&[step]), bucket_m)
@@ -10535,8 +10644,9 @@ mod tests {
         assert_eq!(
             constants(0)[5..],
             [
-                ConstantValue::uint(5, tp().gdn_conv_kernel),
-                ConstantValue::float(6, tp().rms_norm_eps)
+                // `gdn_at`'s convolution width.
+                ConstantValue::uint(5, 4),
+                ConstantValue::float(6, tp().eps().get())
             ]
         );
         assert_eq!(
@@ -10631,7 +10741,7 @@ mod tests {
         let c = &coded.commands.get(0).command;
         assert_eq!((c.library, coded.commands.len()), ("kv_append", 1));
         let slot = |i: u16| c.constants.iter().find(|k| k.index == i).map(|k| k.bits);
-        let hd = tq_consts().global_head_dim as usize;
+        let hd = a(&tq_consts()).global().head_dim().get() as usize;
         assert_eq!(
             (10..15).map(slot).collect::<Vec<_>>(),
             [
@@ -10694,15 +10804,16 @@ mod tests {
         use ConstantValue as C;
         use WeightTensor as T;
         let lowered = |(groups, heads, state, head_dim): (u32, u32, u32, u32), bucket_m| {
-            let p = MetalModelConsts {
-                gdn_num_k_heads: groups,
-                gdn_num_v_heads: heads,
-                gdn_head_k_dim: state,
-                gdn_head_v_dim: head_dim,
-                gdn_conv_kernel: 4,
-                gdn_conv_dim: (heads * head_dim + 2 * groups * state) as usize,
-                ..tp()
-            };
+            let p = with(tp(), |x| {
+                x.gdn = Some(Gdn::new(
+                    GdnHeads::new(groups),
+                    GdnHeads::new(heads),
+                    GdnHeadDim::new(state),
+                    GdnHeadDim::new(head_dim),
+                    ConvKernel::new(4),
+                    ConvDim::new((heads * head_dim + 2 * groups * state) as usize),
+                ))
+            });
             let step = MetalStep::Mamba2(Slot(0), Slot(1), LayerId(0));
             lower_tq(&p, plain(&[step]), bucket_m)
                 .commands
@@ -10830,7 +10941,7 @@ mod tests {
                 [
                     C::uint(0, 64),
                     C::uint(1, bucket_m * 2),
-                    C::float(2, tp().rms_norm_eps),
+                    C::float(2, tp().eps().get()),
                     C::uint(3, 328),
                     C::uint(4, 2),
                     C::boolean(5, true),
@@ -10940,7 +11051,7 @@ mod tests {
     /// command buffer.
     #[test]
     fn dense_codec_lowers_no_turboquant_commands() {
-        assert_eq!(tp().kv_codec, KvCodec::Dense);
+        assert_eq!(tp().kv_codec(), KvCodec::Dense);
         for (attention, bucket_m) in [
             (attention(MetalStep::AttentionViaCache, 0, Interleaved), 1),
             (attention(MetalStep::AttentionPrefillPaged, 0, NeoX), 64),
@@ -10977,14 +11088,13 @@ mod tests {
     /// fp16, so nothing would write the packed stores its factory provisions.
     #[test]
     fn turboquant_that_compresses_nothing_does_not_lower() {
-        let p = MetalModelConsts {
-            global_head_dim: 512,
-            num_global_kv_heads: 1,
-            global_block_size: 32,
-            global_rot_dim: 128,
-            sliding_window: 1024,
-            ..tq_consts()
-        };
+        let p = with_attention(
+            tq_consts(),
+            TP_GEOM,
+            geom(32, 1, 512, 128, 32),
+            Some(1024),
+            KvRope::AtWrite,
+        );
         let rows = plain(&[
             tq_writer(1, SW, LLAMA_KV),
             attention(MetalStep::SlidingAttentionViaCache, 1, Interleaved),
@@ -11041,15 +11151,15 @@ mod tests {
         );
         // A threadgroup a (KV head, split) of head_dim threads, its combine one a query
         // head of two simdgroups — head_dim 64's share of every lane's elements.
-        let splits = (128 * p.global_block_size).div_ceil(ATTN_SPLIT_KEYS);
+        let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
         assert_eq!(
             (
                 split.dispatch.threadgroups,
                 split.dispatch.threads_per_threadgroup
             ),
             (
-                (1, p.num_global_kv_heads, splits),
-                (p.global_head_dim, 1, 1)
+                (1, a(&p).global().kv_heads().get(), splits),
+                (a(&p).global().head_dim().get(), 1, 1)
             )
         );
         assert_eq!(
@@ -11057,7 +11167,7 @@ mod tests {
                 combine.dispatch.threadgroups,
                 combine.dispatch.threads_per_threadgroup
             ),
-            ((1, p.num_q_heads, 1), (64, 1, 1))
+            ((1, a(&p).q_heads().get(), 1), (64, 1, 1))
         );
         let bits = TQ_BITS.get();
         // The split keeps the twin's constants — the plain set's less its baked heads (slot
@@ -11435,17 +11545,17 @@ mod tests {
                 "one tape per class"
             );
         }
-        assert_eq!(p.num_q_heads / p.num_kv_heads, 8);
+        assert_eq!(a(&p).q_heads().get() / a(&p).base().kv_heads().get(), 8);
         // The plain command bakes the largest group divisor — 8 heads at
         // head_dim 64 — so its threadgroups count head groups, not heads; the
         // twin keeps the undivided count for the variant's division.
         let (x, y, z) = fp16.dispatch.threadgroups;
-        assert_eq!(y, p.num_q_heads / 8);
+        assert_eq!(y, a(&p).q_heads().get() / 8);
         assert_eq!(
             (fp16.constants.iter()).find(|k| k.index == 16),
             Some(&ConstantValue::uint(16, 8))
         );
-        assert_eq!(tq.dispatch.threadgroups, (x, p.num_q_heads, z));
+        assert_eq!(tq.dispatch.threadgroups, (x, a(&p).q_heads().get(), z));
         assert_eq!(tq.constants.last(), Some(&ConstantValue::tq_heads(16)));
         let bound_heads = |c: &LoweredCommand| {
             (c.constants.iter()).any(|k| k.ty == super::super::constants::ConstantType::TqHeads)
@@ -11456,9 +11566,9 @@ mod tests {
         );
         for (cores, heads) in [(8, 4), (16, 2), (32, 1)] {
             let served_heads = TqDecodeHeads::for_group(
-                HeadDim(p.global_head_dim),
-                NumQHeads(p.num_q_heads),
-                NumKvHeads(p.num_global_kv_heads),
+                HeadDim(a(&p).global().head_dim().get()),
+                NumQHeads(a(&p).q_heads().get()),
+                NumKvHeads(a(&p).global().kv_heads().get()),
                 GpuCores(cores),
             );
             assert_eq!(served_heads, TqDecodeHeads(heads), "{cores} cores");
@@ -11568,12 +11678,13 @@ mod tests {
     #[test]
     fn turboquant_decode_serves_each_kv_heads_query_heads_together() {
         use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
-        let p = MetalModelConsts {
-            global_head_dim: 256,
-            num_global_kv_heads: 4,
-            global_block_size: 16,
-            ..tq_consts()
-        };
+        let p = with_attention(
+            tq_consts(),
+            TP_GEOM,
+            geom(32, 4, 256, 64, 16),
+            None,
+            KvRope::AtWrite,
+        );
         let rows = || {
             coded(
                 tq_writer(0, Causal, LLAMA_KV),
@@ -11591,15 +11702,12 @@ mod tests {
             ]
         );
         let (gqa, combine) = (&tape.commands.get(2).command, &tape.commands.get(3).command);
-        let twin = MetalModelConsts {
-            num_global_kv_heads: 2,
-            ..p
-        };
+        let twin = with_attention(p, TP_GEOM, geom(32, 2, 256, 64, 16), None, KvRope::AtWrite);
         let twin = lower_tq(&twin, rows(), 1);
         let twin = &twin.commands.get(2).command;
         assert_eq!(twin.kernel, KernelId::AttentionViaCacheTq);
         // 128 blocks of 16 keys: two threadgroups of `ATTN_SPLIT_KEYS`.
-        let splits = (128 * p.global_block_size).div_ceil(ATTN_SPLIT_KEYS);
+        let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
         assert_eq!(splits, 2);
         assert_eq!(
             (
@@ -11633,7 +11741,7 @@ mod tests {
             (combine.function, combine.dispatch.threadgroups),
             (
                 "attention_via_cache_v2_combine_bf16_specialized",
-                (1, p.num_q_heads, 1)
+                (1, a(&p).q_heads().get(), 1)
             )
         );
         assert_eq!(combine.dispatch.threads_per_threadgroup, (128, 1, 1));
@@ -11643,7 +11751,7 @@ mod tests {
             *combine.bindings,
             out_and_signs.copied().chain([partials]).collect::<Vec<_>>()
         );
-        let row = p.num_q_heads * splits * (2 + p.global_head_dim) * 4;
+        let row = a(&p).q_heads().get() * splits * (2 + a(&p).global().head_dim().get()) * 4;
         let steps = SplitSteps::Decode;
         assert_eq!(
             tape.decode_partials,
@@ -11669,10 +11777,13 @@ mod tests {
         // A head dim between the tiling's steps keeps the twin: 192's six simdgroups do not
         // tile into whole key groups.
         let between = lower_tq(
-            &MetalModelConsts {
-                global_head_dim: 192,
-                ..tq_consts()
-            },
+            &with_attention(
+                tq_consts(),
+                TP_GEOM,
+                geom(32, 4, 192, 64, 16),
+                None,
+                KvRope::AtWrite,
+            ),
             rows(),
             1,
         );
@@ -11702,7 +11813,7 @@ mod tests {
             &verify.commands.get(2).command,
         );
         assert_eq!(gqa.dispatch.threadgroups, (4, 4, splits));
-        assert_eq!(combine.dispatch.threadgroups, (4, p.num_q_heads, 1));
+        assert_eq!(combine.dispatch.threadgroups, (4, a(&p).q_heads().get(), 1));
         assert!((gqa.constants.iter()).any(|k| *k == ConstantValue::uint(22, 1)));
         assert!((gqa.bindings.iter()).any(|b| b.index() == 23));
         let steps = SplitSteps::Every;
@@ -11777,13 +11888,13 @@ mod tests {
     #[test]
     fn turboquant_decode_takes_groups_below_the_matrix_rows() {
         use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
-        let p = MetalModelConsts {
-            global_head_dim: 128,
-            num_q_heads: 28,
-            num_global_kv_heads: 4,
-            global_block_size: 16,
-            ..tq_consts()
-        };
+        let p = with_attention(
+            tq_consts(),
+            geom(28, 4, 64, 64, 16),
+            geom(28, 4, 128, 64, 16),
+            None,
+            KvRope::AtWrite,
+        );
         let rows = || {
             coded(
                 tq_writer(0, Causal, LLAMA_KV),
@@ -11801,13 +11912,13 @@ mod tests {
             ]
         );
         let (gqa, combine) = (&tape.commands.get(2).command, &tape.commands.get(3).command);
-        let splits = (128 * p.global_block_size).div_ceil(ATTN_SPLIT_KEYS);
+        let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
         assert_eq!(splits, 2);
         assert_eq!(gqa.dispatch.threadgroups, (1, 4, splits));
         assert_eq!(gqa.dispatch.threads_per_threadgroup, (128, 1, 1));
-        assert_eq!(combine.dispatch.threadgroups, (1, p.num_q_heads, 1));
+        assert_eq!(combine.dispatch.threadgroups, (1, a(&p).q_heads().get(), 1));
         assert_eq!(combine.dispatch.threads_per_threadgroup, (128, 1, 1));
-        let row = p.num_q_heads * splits * (2 + p.global_head_dim) * 4;
+        let row = a(&p).q_heads().get() * splits * (2 + a(&p).global().head_dim().get()) * 4;
         let steps = SplitSteps::Decode;
         assert_eq!(
             tape.decode_partials,
@@ -11820,29 +11931,24 @@ mod tests {
             tape.scratch_bytes(None)[crate::tape::lowered::ScratchKind::Moe],
             row
         );
-        // A group that does not divide the query heads evenly cannot fill the
-        // fragments' rows — 29 over 4 — so it stays on the twin.
+        // A group that does not divide the query heads evenly — 29 over 4 — is no geometry at all:
+        // its constructor refuses it, so no lowering is handed one.
+        assert!(std::panic::catch_unwind(|| geom(29, 4, 128, 64, 16)).is_err());
         let kernels = |tape: &LoweredMetalTape| {
             (tape.commands.iter())
                 .map(|c| c.command.kernel)
                 .collect::<Vec<_>>()
         };
-        let ragged = MetalModelConsts {
-            num_q_heads: 29,
-            ..p
-        };
-        let ragged = kernels(&lower_tq(&ragged, rows(), 1));
-        assert!(ragged.contains(&KernelId::AttentionViaCacheTq));
-        assert!(!ragged.contains(&KernelId::AttentionDecodeGqaTq));
         // granite-3.3-2b (head_dim 64, GQA 4) takes it too: its two simdgroups form one key
         // group of two — the butterfly, the span keys and the fragments step the same tiling —
         // and the combine narrows to two simdgroups of threads.
-        let granite = MetalModelConsts {
-            global_head_dim: 64,
-            num_q_heads: 32,
-            num_global_kv_heads: 8,
-            ..p
-        };
+        let granite = with_attention(
+            p,
+            geom(32, 4, 64, 64, 16),
+            geom(32, 8, 64, 64, 16),
+            None,
+            KvRope::AtWrite,
+        );
         let granite = lower_tq(&granite, rows(), 1);
         let granite_split = (granite.commands.iter())
             .find(|c| c.command.kernel == KernelId::AttentionDecodeGqaTq)
@@ -11860,10 +11966,13 @@ mod tests {
         );
         // The head dims between the tiling's steps stay on the twin: 192's six simdgroups do
         // not tile into whole key groups of 8, 4 or 2.
-        let between = MetalModelConsts {
-            global_head_dim: 192,
-            ..p
-        };
+        let between = with_attention(
+            p,
+            geom(28, 4, 64, 64, 16),
+            geom(28, 4, 192, 64, 16),
+            None,
+            KvRope::AtWrite,
+        );
         let between = kernels(&lower_tq(&between, rows(), 1));
         assert!(between.contains(&KernelId::AttentionViaCacheTq));
         assert!(!between.contains(&KernelId::AttentionDecodeGqaTq));
@@ -11885,10 +11994,13 @@ mod tests {
             )
         };
         let biased = lower_tq(
-            &MetalModelConsts {
-                rope_on_read: true,
-                ..p
-            },
+            &with_attention(
+                p,
+                geom(28, 4, 64, 64, 16),
+                geom(28, 4, 128, 64, 16),
+                None,
+                KvRope::OnRead,
+            ),
             biased_rows(),
             1,
         );
@@ -11927,9 +12039,9 @@ mod tests {
             &batched.commands.get(3).command,
         );
         assert_eq!(gqa.dispatch.threadgroups, (4, 4, splits));
-        assert_eq!(combine.dispatch.threadgroups, (4, p.num_q_heads, 1));
+        assert_eq!(combine.dispatch.threadgroups, (4, a(&p).q_heads().get(), 1));
         // Every row's partials, or only those of the rows a decode or verify step brings.
-        let row = p.num_q_heads * splits * (2 + p.global_head_dim) * 4;
+        let row = a(&p).q_heads().get() * splits * (2 + a(&p).global().head_dim().get()) * 4;
         let steps = SplitSteps::Decode;
         assert_eq!(
             batched.decode_partials,
@@ -11959,14 +12071,13 @@ mod tests {
     /// a decode bucket fits and takes the split.
     #[test]
     fn turboquant_decode_refuses_buckets_whose_partials_do_not_fit() {
-        let p = MetalModelConsts {
-            global_head_dim: 512,
-            num_q_heads: 32,
-            num_global_kv_heads: 4,
-            global_block_size: 256,
-            global_rot_dim: 128,
-            ..tq_consts()
-        };
+        let p = with_attention(
+            tq_consts(),
+            TP_GEOM,
+            geom(32, 4, 512, 128, 256),
+            None,
+            KvRope::AtWrite,
+        );
         let rows = || {
             coded(
                 tq_writer(0, Causal, LLAMA_KV),
@@ -11978,7 +12089,7 @@ mod tests {
                 .map(|c| c.command.kernel)
                 .collect::<Vec<_>>()
         };
-        let splits = (128 * p.global_block_size)
+        let splits = (128 * a(&p).global().page().get())
             .div_ceil(ATTN_SPLIT_KEYS)
             .clamp(1, ATTN_MAX_SPLITS);
         assert_eq!(splits, ATTN_MAX_SPLITS);
@@ -11989,7 +12100,7 @@ mod tests {
         assert!(decode.contains(&KernelId::AttentionDecodeGqaTq));
         assert_eq!(
             lower_tq(&p, rows(), 8).scratch_bytes(None)[crate::tape::lowered::ScratchKind::Moe],
-            8 * p.num_q_heads * splits * (2 + p.global_head_dim) * 4
+            8 * a(&p).q_heads().get() * splits * (2 + a(&p).global().head_dim().get()) * 4
         );
     }
 
@@ -12022,14 +12133,13 @@ mod tests {
     /// sliding arm ran them.
     #[test]
     fn sliding_prefill_lowers_through_the_one_paged_prefill_arm() {
-        let p = MetalModelConsts {
-            head_dim: 256,
-            num_kv_heads: 8,
-            block_size: 16,
-            sliding_window: 1024,
-            rope_on_read: true,
-            ..tp()
-        };
+        let p = with_attention(
+            tp(),
+            geom(32, 8, 256, 64, 16),
+            TP_GEOM,
+            Some(1024),
+            KvRope::OnRead,
+        );
         let rows = plain(&[attention(MetalStep::SlidingAttentionPrefillPaged, 0, NeoX)]);
         let lower = |profile| {
             lower_subtile_tape_to_metal(&row_tape(rows.clone()), &p, bake_point(64, profile))
@@ -12082,14 +12192,13 @@ mod tests {
             All, OnlyIfLaneRows, OnlyIfOneSequence, UnlessLaneRows, UnlessOneSequence,
             UnlessUnrotatedBlocks,
         };
-        let p = MetalModelConsts {
-            num_q_heads: 24,
-            global_head_dim: 256,
-            num_global_kv_heads: 4,
-            global_block_size: 16,
-            rope_on_read: true,
-            ..tp()
-        };
+        let p = with_attention(
+            tp(),
+            geom(24, 4, 64, 64, 16),
+            geom(24, 4, 256, 64, 16),
+            None,
+            KvRope::OnRead,
+        );
         let rows = plain(&[attention(MetalStep::AttentionPrefillPaged, 0, NeoX)]);
         let lower = |bucket, profile| {
             lower_subtile_tape_to_metal(&row_tape(rows.clone()), &p, bake_point(bucket, profile))
@@ -12153,14 +12262,13 @@ mod tests {
     #[test]
     fn hybrid_turboquant_compresses_global_layers_only() {
         use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
-        let p = MetalModelConsts {
-            global_head_dim: 512,
-            num_global_kv_heads: 1,
-            global_block_size: 32,
-            global_rot_dim: 128,
-            sliding_window: 1024,
-            ..tq_consts()
-        };
+        let p = with_attention(
+            tq_consts(),
+            TP_GEOM,
+            geom(32, 1, 512, 128, 32),
+            Some(1024),
+            KvRope::AtWrite,
+        );
         let global_writer = tq_writer(0, Causal, LLAMA_KV);
         let sliding_writer = tq_writer(1, SW, LLAMA_KV);
         let global = attention(MetalStep::AttentionViaCache, 0, Interleaved);
@@ -12183,10 +12291,7 @@ mod tests {
         let sliding_attention = attention(MetalStep::SlidingAttentionPrefillPaged, 1, NeoX);
         // A sliding layer lowers as it would in a dense model; alone in a tape
         // it compresses nothing, which a TurboQuant model's tape may not do.
-        let dense = MetalModelConsts {
-            kv_codec: KvCodec::Dense,
-            ..p
-        };
+        let dense = with(p, |x| x.kv_codec = KvCodec::Dense);
         let fp16 = |i: MetalStep| gated_steps(&lower_tq(&dense, plain(&[i]), 64));
         // A TurboQuant'd attention compresses its layer's writer's operands, so
         // its own commands are read off a tape that has the writer.
@@ -13329,8 +13434,7 @@ mod tests {
     #[test]
     fn the_logit_tail_runs_over_the_sampled_rows() {
         use crate::tape::lowered::ActivationWidth;
-        let mut p = tp();
-        p.final_logit_softcapping = 30.0;
+        let p = with(tp(), |x| x.final_softcap = Some(SoftCap::new(30.0)));
         let width = ActivationWidth::of_cols(1000);
         let at = |step: &MetalStep| {
             let tape = row_tape(plain(std::slice::from_ref(step)));
@@ -13446,7 +13550,7 @@ mod tests {
                 (reropes, pass)
             })
             .collect();
-        let ror = tp().rope_on_read;
+        let ror = a(&tp()).kv_rope() == KvRope::OnRead;
         assert_eq!(
             staged,
             [
@@ -13484,11 +13588,7 @@ mod tests {
             OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessDecodeStep, UnlessOneSequence,
             UnlessUnrotatedBlocks,
         };
-        let p = MetalModelConsts {
-            rope_on_read: true,
-            sliding_window: 512,
-            ..tq_consts()
-        };
+        let p = with_attention(tq_consts(), TP_GEOM, TP_GEOM, Some(512), KvRope::OnRead);
         let one = RuntimeGate::All(&[UnlessDecodeStep, OnlyIfOneSequence]);
         let plain = RuntimeGate::All(&[UnlessDecodeStep, UnlessOneSequence, UnlessUnrotatedBlocks]);
         let reroping =
@@ -13547,11 +13647,7 @@ mod tests {
         use crate::tape::lowered::RuntimeGate::{
             OnlyIfUnrotatedBlocks, UnlessDecodeStep, UnlessOneSequence, UnlessUnrotatedBlocks,
         };
-        let p = MetalModelConsts {
-            rope_on_read: true,
-            sliding_window: 512,
-            ..tq_consts()
-        };
+        let p = with_attention(tq_consts(), TP_GEOM, TP_GEOM, Some(512), KvRope::OnRead);
         let plain = RuntimeGate::All(&[UnlessDecodeStep, UnlessOneSequence, UnlessUnrotatedBlocks]);
         let reroping =
             RuntimeGate::All(&[UnlessDecodeStep, UnlessOneSequence, OnlyIfUnrotatedBlocks]);
@@ -13628,15 +13724,16 @@ mod tests {
             let plain_gate =
                 RuntimeGate::and(step_gate, &[UnlessOneSequence, UnlessUnrotatedBlocks]);
             let reroping = RuntimeGate::and(step_gate, &[UnlessOneSequence, OnlyIfUnrotatedBlocks]);
-            let p = MetalModelConsts {
-                rope_on_read: true,
-                global_head_dim: 512,
-                num_global_kv_heads: 2,
-                global_block_size: 32,
-                global_rot_dim: 128,
-                kv_codec: codec,
-                ..tp()
-            };
+            let p = with(
+                with_attention(
+                    tp(),
+                    TP_GEOM,
+                    geom(32, 2, 512, 128, 32),
+                    None,
+                    KvRope::OnRead,
+                ),
+                |x| x.kv_codec = codec,
+            );
             let attention = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
             let writer = tq_writer(0, Causal, LLAMA_KV);
             // A dense model's tape carries the layer as written; a coded one's, as the codec
@@ -13711,15 +13808,16 @@ mod tests {
         }) {
             let one = RuntimeGate::and(step_gate, &[OnlyIfOneSequence]);
             let rest = RuntimeGate::and(step_gate, &[UnlessOneSequence]);
-            let p = MetalModelConsts {
-                rope_on_read: true,
-                global_head_dim: 512,
-                num_global_kv_heads: kv_heads,
-                global_block_size: 16,
-                global_rot_dim: 128,
-                kv_codec: codec,
-                ..tp()
-            };
+            let p = with(
+                with_attention(
+                    tp(),
+                    TP_GEOM,
+                    geom(32, kv_heads, 512, 128, 16),
+                    None,
+                    KvRope::OnRead,
+                ),
+                |x| x.kv_codec = codec,
+            );
             let attention = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
             let writer = tq_writer(0, Causal, LLAMA_KV);
             // A dense model's tape carries the layer as written; a coded one's, as the codec
@@ -13752,10 +13850,7 @@ mod tests {
     #[test]
     fn a_row_zero_command_without_a_reroping_per_row_twin_is_refused() {
         use crate::tape::lowered::SeqScope;
-        let p = MetalModelConsts {
-            rope_on_read: true,
-            ..tq_consts()
-        };
+        let p = with_attention(tq_consts(), TP_GEOM, TP_GEOM, None, KvRope::OnRead);
         let attention = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
         let tape = lower_tq(&p, coded(tq_writer(0, Causal, LLAMA_KV), attention), 64);
         let cmds: Vec<GatedCommand> = tape
@@ -13814,10 +13909,7 @@ mod tests {
     #[test]
     fn turboquant_restores_a_biased_writers_offsets() {
         use scratchy_ir::{BiasStorage, KvOffset, KvOffsets};
-        let p = MetalModelConsts {
-            rope_on_read: true,
-            ..tq_consts()
-        };
+        let p = with_attention(tq_consts(), TP_GEOM, TP_GEOM, None, KvRope::OnRead);
         let qwen2 = KvOffsets {
             k: KvOffset::LinearBias(BiasStorage::Affine),
             v: KvOffset::LinearBias(BiasStorage::Affine),
@@ -13913,10 +14005,7 @@ mod tests {
         // sinks on): the split serves full attention only, so the twin keeps the biases.
         let sinks = lower_subtile_tape_to_metal(
             &sliding_sinks_tape_of(qwen2),
-            &MetalModelConsts {
-                sliding_window: 1024,
-                ..p
-            },
+            &with_attention(tq_consts(), TP_GEOM, TP_GEOM, Some(1024), KvRope::OnRead),
             bake_point(1, None),
         )
         .expect("lower_subtile_tape_to_metal");
@@ -13959,7 +14048,7 @@ mod tests {
         // vpw comes from `vals_per_word` (10 at bits=3 — no straddling), not
         // `32 / bits`, which only agrees with it by floor-division coincidence.
         let vpw = scratchy_layers::turboquant::vals_per_word(bits) as u32;
-        let hd = p.head_dim;
+        let hd = a(&p).base().head_dim().get();
         let tape = lower_tq_layer(attention(MetalStep::AttentionViaCache, 0, Interleaved), 1);
         let writer = tape.commands.get(0).command;
         assert_eq!(writer.kernel, KernelId::RopeAppend);
@@ -14004,7 +14093,7 @@ mod tests {
             k: KvOffset::LinearBias(BiasStorage::Dense),
             v: KvOffset::Centered,
         };
-        assert!(!tp().rope_on_read);
+        assert_eq!(a(&tp()).kv_rope(), KvRope::AtWrite);
         assert!(matches!(
             try_lower_tq(
                 &tq_consts(),
@@ -14081,7 +14170,7 @@ mod tests {
     }
 
     /// `step` lowered alone at `bucket_m` for a model of `p`. Pure-CPU.
-    fn lower_alone(p: &MetalModelConsts, step: &MetalStep, bucket_m: u32) -> Vec<LoweredCommand> {
+    fn lower_alone(p: &ModelFacts, step: &MetalStep, bucket_m: u32) -> Vec<LoweredCommand> {
         let (mut scratch, mut moe, mut roped_k, mut unfused) = (0u32, 0u32, 0u32, 0u32);
         lower_one(
             p,
@@ -14109,10 +14198,7 @@ mod tests {
     /// reached a padding row and spliced its destination lane (0) onto row 0.
     #[test]
     fn the_embed_splice_dispatches_whole_rows() {
-        let p = MetalModelConsts {
-            hidden_size: 2688,
-            ..tp()
-        };
+        let p = with(tp(), |x| x.hidden = HiddenSize::new(2688));
         let cmds = lower_alone(&p, &MetalStep::SpliceMmEmbeds(Slot(0)), 8);
         let d = cmds[0].dispatch;
         assert_eq!(d.threadgroups, (2688u32.div_ceil(256), 8, 1));

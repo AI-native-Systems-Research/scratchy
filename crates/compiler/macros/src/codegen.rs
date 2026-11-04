@@ -7611,7 +7611,7 @@ enum BackboneLayout {
 #[cfg(feature = "metal")]
 fn metal_off_tape_tokens(
     width: u64,
-    mc: &scratchy_target_metal::tape::model_consts::MetalModelConsts,
+    mc: &scratchy_ir::model_facts::ModelFacts,
     head: Option<(u32, u32)>,
     vocab_suffix: Option<scratchy_target_metal::off_tape::VocabSuffix>,
 ) -> TokenStream {
@@ -7621,32 +7621,42 @@ fn metal_off_tape_tokens(
     use scratchy_target_metal::tape::ids::{BlockSize, HiddenSize, LogitsWidth, NumDrafts, RotDim};
     use scratchy_target_metal::tape::kernel_constants::{DraftAcceptConstants, MtpChainConstants};
     let width = u32::try_from(width).expect("logits width fits u32");
-    // The chain advances the full-context group's slots (KV group 0).
-    let block_size = BlockSize(mc.global_block_size);
+    use scratchy_ir::model_facts::DEFAULT_KV_PAGE;
+    // The chain advances the full-context group's slots (KV group 0), at the global class's page;
+    // a model without attention has no page of its own, and takes the default one.
+    let page = mc
+        .attention()
+        .map_or(DEFAULT_KV_PAGE, |a| a.global().page());
+    let block_size = BlockSize(page.get());
+    // A draft block: its anchor row and its drafts.
+    let block_rows = 1 + mc.spec_drafts().map_or(0, |d| d.get());
     let head = head.map(|(drafts, hidden)| MtpChainConstants {
         hidden: HiddenSize(hidden),
         drafts: NumDrafts(drafts),
-        // An MRoPE head reads a cos/sin row a token in place of its position.
-        rope: RotDim(if mc.mrope { mc.rot_dim } else { 0 }),
+        // An MRoPE head reads a cos/sin row a token in place of its position, its rot window
+        // wide. The kernel's ABI spells the 1-D positions' path as 0.
+        rope: RotDim(
+            (mc.attention())
+                .filter(|a| a.mrope().is_some())
+                .map_or(0, |a| a.base().rot_dim().get()),
+        ),
     });
     let keys = OffTape::keys(
         LogitsWidth(width),
-        mc.metal_dtype,
+        mc.metal_dtype(),
         block_size,
         head,
-        mc.spec_drafts > 0,
+        mc.spec_drafts().is_some(),
         vocab_suffix,
         // A DFlash2 drafter (its block and the token its proposal rows embed), or a target one
         // drafts for (the rows a lane of its verify holds: the drafter's block).
-        match (mc.draft_selector_rank > 0, mc.draft_capture_slots > 0) {
-            (true, _) => Dflash2Role::Drafter(DraftAcceptConstants {
-                rows: mc.spec_drafts + 1,
-                mask: mc.draft_mask_token,
+        match (mc.drafter(), mc.capture_slots()) {
+            (Some(drafter), _) => Dflash2Role::Drafter(DraftAcceptConstants {
+                rows: block_rows,
+                mask: drafter.mask_token().get(),
             }),
-            (false, true) => Dflash2Role::Target {
-                block_rows: mc.spec_drafts + 1,
-            },
-            (false, false) => Dflash2Role::None,
+            (None, Some(_)) => Dflash2Role::Target { block_rows },
+            (None, None) => Dflash2Role::None,
         },
     );
     let ids = keys.map(|key| scratchy_target_metal_compiler::static_tape::kernel_ref(&key));
@@ -7768,7 +7778,7 @@ fn metal_vocab_suffix(
     program: &Program,
     fuf: &crate::fuf::Fuf,
     model: &crate::config::ModelParams,
-    mc: &scratchy_target_metal::tape::model_consts::MetalModelConsts,
+    mc: &scratchy_ir::model_facts::ModelFacts,
 ) -> Option<scratchy_target_metal::off_tape::VocabSuffix> {
     let (&prefix, &all) = (
         model.bounds.get("vocab_size")?,
@@ -7796,10 +7806,10 @@ fn metal_vocab_suffix(
     Some(scratchy_target_metal::off_tape::VocabSuffix {
         prefix: fits(prefix),
         rows: fits(all - prefix),
-        hidden: fits(mc.hidden_size as u64),
+        hidden: fits(mc.hidden().get() as u64),
         bits,
         group,
-        scale: mc.scale_dtype,
+        scale: mc.scale_dtype(),
         verify_rows: fits(verify_rows),
         window: fits(window),
     })
@@ -7808,15 +7818,15 @@ fn metal_vocab_suffix(
 /// The model's `METAL_TQ_CODEBOOK`: its TurboQuant codebook at the global head dim, computed here
 /// (`None` for a dense KV cache).
 #[cfg(feature = "metal")]
-fn metal_tq_codebook_tokens(
-    kv_codec: scratchy_forward_compiler::KvCodec,
-    global_head_dim: u32,
-) -> TokenStream {
+fn metal_tq_codebook_tokens(mc: &scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     use scratchy_target_metal::turboquant::TqCodebook;
-    let codebook = match kv_codec {
+    let codebook = match mc.kv_codec() {
         scratchy_forward_compiler::KvCodec::Dense => quote!(::core::option::Option::None),
         scratchy_forward_compiler::KvCodec::TurboQuant(bits) => {
-            let cb = TqCodebook::compute(global_head_dim as usize, bits);
+            // The global class's head: the codebook rotates the full layers' keys.
+            let attention =
+                (mc.attention()).expect("ModelFacts::new: a TurboQuant KV codec is an attention's");
+            let cb = TqCodebook::compute(attention.global().head_dim().get() as usize, bits);
             let table = |t: &[f32]| {
                 let words = t.iter().map(|v| v.to_bits());
                 quote!(&[#(f32::from_bits(#words)),*])
@@ -8060,17 +8070,26 @@ fn kv_codec_for(
     }
 }
 
+/// Whether a body reads its target's final hidden rows (`RowsExtern::TargetHidden`): a head.
+fn fuf_reads_target_hidden(fuf: &Fuf) -> bool {
+    fuf.nodes.iter().any(|n| {
+        n.op == crate::classified::OpKind::LoadRows(
+            scratchy_forward_compiler::RowsExtern::TargetHidden,
+        )
+    })
+}
+
 fn emit_canonical_params_impl(
     model: &ModelParams,
     tp_world_size: u8,
     uses_rotary: bool,
     kv_layers: &KvCacheLayers,
+    // Whether the body reads its target's hidden rows (a head): the facts state its target then.
+    #[cfg(feature = "metal")] reads_target_hidden: bool,
     // Filled with the SAME values the impl's consts are emitted from —
     // one derivation, two consumers (the impl tokens and the macro-side
     // tape bake). Built in this fn so drift is impossible.
-    #[cfg(feature = "metal")] metal_consts_out: &mut Option<
-        scratchy_target_metal::tape::model_consts::MetalModelConsts,
-    >,
+    #[cfg(feature = "metal")] metal_facts_out: &mut Option<scratchy_ir::model_facts::ModelFacts>,
 ) -> TokenStream {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
@@ -8406,7 +8425,7 @@ fn emit_canonical_params_impl(
         .bounds
         .get("block_size")
         .map(|&v| v as u32)
-        .unwrap_or(16);
+        .unwrap_or(scratchy_ir::model_facts::DEFAULT_KV_PAGE.get());
     let sliding_per_token = num_kv_heads * head_dim; // base class == sliding on gemma4
     let global_per_token = num_global_kv_heads * global_head_dim;
     let uniform_page =
@@ -8580,61 +8599,110 @@ fn emit_canonical_params_impl(
 
     #[cfg(feature = "metal")]
     {
-        use scratchy_target_metal::interpreter::metal::{MetalDtype, ScaleDtype};
-        use scratchy_target_metal::tape::model_consts::MetalModelConsts;
-        *metal_consts_out = Some(MetalModelConsts {
-            // No arch override exists for METAL_DTYPE — the trait
-            // default is the universal value.
-            metal_dtype: MetalDtype::Bf16,
-            scale_dtype: if scale_dtype_is_bf16 {
-                ScaleDtype::Bf16
-            } else {
-                ScaleDtype::F16
-            },
-            head_dim,
-            global_head_dim,
-            num_q_heads,
-            num_kv_heads,
-            num_global_kv_heads,
-            q_size,
-            hidden_size: hidden_size_for_const,
-            intermediate_size,
-            attn_scale,
-            sliding_window,
-            final_logit_softcapping,
-            rms_norm_eps: rms_norm_eps(model),
-            norm_weight_offset: norm_weight_runtime_offset(model),
-            block_size: base_block_size,
-            global_block_size: resolved_global_block_size,
-            rot_dim: rot_dim_val,
-            global_rot_dim,
-            rope_on_read: uses_rotary,
-            rope_proportional,
-            mrope: model.mrope_section.is_some(),
-            kv_codec,
-            vision_num_heads,
-            vision_head_dim,
-            vision_q_size,
-            vision_in_features,
-            vision_rope_interleaved,
-            vision_attn_scale,
-            vision_patch_grid_side,
-            vision_pool_kernel,
-            gdn_num_k_heads,
-            gdn_num_v_heads,
-            gdn_head_k_dim,
-            gdn_head_v_dim,
-            gdn_conv_kernel,
-            gdn_conv_dim,
-            spec_drafts,
-            draft_conv_group,
-            draft_selector_rank,
-            draft_mask_token,
-            draft_capture_slots,
-            target_hidden_width,
-            target_routes_experts,
-            vocab_size: vocab_size_for_const,
+        use scratchy_ir::model_facts as mf;
+        let positive = |v: u32| (v > 0).then_some(v);
+        // A decoder's attention. A vision-only body's text consts above carry its tower's numbers
+        // (`is_vision_only`); it has no decoder attention, and its tower is `vision`.
+        let attention = (!is_vision_only && head_dim > 0).then(|| {
+            let class = |kv_heads: u32, head_dim: u32, rot_dim: u32, page: u32| {
+                mf::HeadGeometry::new(
+                    mf::QueryHeads::new(num_q_heads),
+                    mf::KvHeads::new(kv_heads),
+                    mf::HeadDim::new(head_dim),
+                    mf::RotDim::new(rot_dim),
+                    mf::BlockSize::new(page),
+                )
+            };
+            mf::Attention::new(
+                class(num_kv_heads, head_dim, rot_dim_val, base_block_size),
+                class(
+                    num_global_kv_heads,
+                    global_head_dim,
+                    global_rot_dim,
+                    resolved_global_block_size,
+                ),
+                mf::AttnScale::new(attn_scale),
+                (attn_softcap != 0.0).then(|| mf::SoftCap::new(attn_softcap)),
+                (u32::try_from(sliding_window).ok())
+                    .and_then(positive)
+                    .map(mf::AttnWindow::new),
+                mf::Rope::new(
+                    match rope_proportional {
+                        true => mf::RopePairing::Proportional,
+                        false => mf::RopePairing::Standard,
+                    },
+                    match uses_rotary {
+                        true => mf::KvRope::OnRead,
+                        false => mf::KvRope::AtWrite,
+                    },
+                    model.mrope_section.map(mf::MropeSection::new),
+                ),
+            )
         });
+        let vision = positive(vision_num_heads).map(|heads| {
+            mf::Vision::new(
+                mf::QueryHeads::new(heads),
+                mf::HeadDim::new(vision_head_dim),
+                mf::InFeatures::new(vision_in_features),
+                match vision_rope_interleaved {
+                    true => mf::VisionRopePairing::Interleaved,
+                    false => mf::VisionRopePairing::RotateHalf,
+                },
+                mf::AttnScale::new(vision_attn_scale),
+                positive(vision_patch_grid_side).map(mf::PatchGridSide::new),
+                positive(vision_pool_kernel).map(mf::PoolKernel::new),
+            )
+        });
+        let gdn = RecurrentDims::of(model).map(|d| {
+            mf::Gdn::new(
+                mf::GdnHeads::new(d.num_k_heads),
+                mf::GdnHeads::new(d.num_v_heads),
+                mf::GdnHeadDim::new(d.head_k_dim),
+                mf::GdnHeadDim::new(d.head_v_dim),
+                mf::ConvKernel::new(d.conv_kernel),
+                mf::ConvDim::new(d.conv_dim as usize),
+            )
+        });
+        let drafter = positive(draft_selector_rank).map(|rank| {
+            mf::Drafter::new(
+                mf::ConvGroup::new(draft_conv_group),
+                mf::SelectorRank::new(rank),
+                mf::TokenId::new(draft_mask_token),
+            )
+        });
+        let target = reads_target_hidden.then(|| {
+            mf::Target::new(
+                mf::HiddenSize::new(target_hidden_width),
+                match target_routes_experts {
+                    true => mf::TargetRouting::Experts,
+                    false => mf::TargetRouting::Dense,
+                },
+            )
+        });
+        *metal_facts_out = Some(mf::ModelFacts::new(mf::FactsParts {
+            // No arch overrides the metal element dtype.
+            metal_dtype: mf::MetalDtype::Bf16,
+            scale_dtype: match scale_dtype_is_bf16 {
+                true => mf::ScaleDtype::Bf16,
+                false => mf::ScaleDtype::F16,
+            },
+            hidden: mf::HiddenSize::new(hidden_size_for_const),
+            intermediate: (intermediate_size > 0)
+                .then(|| mf::IntermediateSize::new(intermediate_size)),
+            vocab: (vocab_size_for_const > 0).then(|| mf::VocabSize::new(vocab_size_for_const)),
+            eps: mf::RmsNormEps::new(rms_norm_eps(model)),
+            norm_offset: mf::NormWeightOffset::new(norm_weight_runtime_offset(model)),
+            final_softcap: (final_logit_softcapping != 0.0)
+                .then(|| mf::SoftCap::new(final_logit_softcapping)),
+            kv_codec,
+            attention,
+            vision,
+            gdn,
+            drafter,
+            spec_drafts: positive(spec_drafts).map(mf::NumDrafts::new),
+            capture_slots: positive(draft_capture_slots).map(mf::CaptureSlots::new),
+            target,
+        }));
     }
 
     quote! {
@@ -14848,16 +14916,16 @@ pub fn emit_model(
     // The alias keeps every static-slice row short instead of
     // repeating `::scratchy_forward_compiler::Instruction::<Weights>::Variant(…)`.
     #[cfg(feature = "metal")]
-    let mut resolved_metal_consts: Option<
-        scratchy_target_metal::tape::model_consts::MetalModelConsts,
-    > = None;
+    let mut resolved_metal_facts: Option<scratchy_ir::model_facts::ModelFacts> = None;
     let canonical_params_impl = emit_canonical_params_impl(
         model,
         tp_world_size,
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
         #[cfg(feature = "metal")]
-        &mut resolved_metal_consts,
+        fuf_reads_target_hidden(fuf),
+        #[cfg(feature = "metal")]
+        &mut resolved_metal_facts,
     );
     // Per-canonical: alias the generic `Instruction<Weights>` for
     // the slice element type AND glob-import the variant
@@ -15101,7 +15169,7 @@ pub fn emit_model(
             },
             moe_expert_bits: quant.map(|_| &widths as &mc3::MoeExpertBits<'_>),
         };
-        let mc = resolved_metal_consts.as_ref().expect("metal consts filled");
+        let mc = resolved_metal_facts.as_ref().expect("metal facts filled");
         let buckets: Vec<u64> = (bucket_points.iter().zip(&bucket_canonical))
             .filter(|&(_, c)| c == canonical)
             .map(|(wp, _)| wp.num_tokens)
@@ -15347,9 +15415,9 @@ pub fn emit_model(
     #[cfg(feature = "metal")]
     let metal_cap_ladder = {
         use scratchy_target_metal::tape::ids::{BlockSize, MaxPositions};
-        let mc = resolved_metal_consts
+        let mc = resolved_metal_facts
             .as_ref()
-            .expect("emit_canonical_params_impl fills metal consts under -Fmetal");
+            .expect("emit_canonical_params_impl fills the metal facts under -Fmetal");
         let max_pos = KvCacheLayers::of(fuf).any().then(|| {
             let max_pos = model.bounds.get("max_position_embeddings").copied();
             max_pos
@@ -15362,9 +15430,16 @@ pub fn emit_model(
                     )
                 })
         });
+        // The pool's page is the base class's; a model without attention reads no pool (its
+        // `max_pos` is `None`), and its ladder is the floor whatever the page.
+        let page = mc
+            .attention()
+            .map_or(scratchy_ir::model_facts::DEFAULT_KV_PAGE, |a| {
+                a.base().page()
+            });
         let ladder = scratchy_target_metal_compiler::static_tape::kv_cap_ladder(
             max_pos,
-            BlockSize(mc.block_size),
+            BlockSize(page.get()),
         );
         eprintln!(
             "[metal bake] {}: KV cap rungs {ladder:?}",
@@ -15544,9 +15619,9 @@ pub fn emit_model(
         // every fact baked; the pool picks one. See static_tape.rs.
         #[cfg(feature = "metal")]
         let tapes_static_toks = {
-            let mc = resolved_metal_consts
+            let mc = resolved_metal_facts
                 .as_ref()
-                .expect("emit_canonical_params_impl fills metal consts under -Fmetal");
+                .expect("emit_canonical_params_impl fills the metal facts under -Fmetal");
             // A canonical metal has no kernel for (`[m2-eq] … REFUSED`: it has no steps) bakes NO
             // variants, so `MetalWorkerPool::for_buckets` refuses at load (`NoRung`), naming
             // the bucket. Baking its empty step tape instead would build VALID empty-command tapes:
@@ -15701,11 +15776,7 @@ pub fn emit_model(
     // configs). `freqs` is f32 `[total_L, vision_head_dim/2]`; `pixels`
     // is the model dtype (bf16) `[num_tokens, vision_in_features]`.
     // An MTP head's body reads its target's final hidden rows (`RowsExtern::TargetHidden`).
-    let reads_target_hidden = fuf.nodes.iter().any(|n| {
-        n.op == crate::classified::OpKind::LoadRows(
-            scratchy_forward_compiler::RowsExtern::TargetHidden,
-        )
-    });
+    let reads_target_hidden = fuf_reads_target_hidden(fuf);
     // The width of those rows (the `TargetHidden` extern's): its target's hidden size — which a
     // drafter of its own width (Gemma 4's assistant) reads and exports at, its passes chained at.
     let target_hidden_width: u64 = model
@@ -15920,8 +15991,8 @@ pub fn emit_model(
     }));
     #[cfg(feature = "metal")]
     {
-        let mc = resolved_metal_consts.as_ref().expect("metal consts filled");
-        metal_arena_bytes_statics.push(metal_tq_codebook_tokens(mc.kv_codec, mc.global_head_dim));
+        let mc = resolved_metal_facts.as_ref().expect("metal facts filled");
+        metal_arena_bytes_statics.push(metal_tq_codebook_tokens(mc));
         // A multi-token-prediction head (its body reads the target's hidden rows) chains its
         // passes on the device.
         let head = reads_target_hidden.then(|| {
@@ -17398,6 +17469,8 @@ mod tests {
             false,
             &every_layer(&m),
             #[cfg(feature = "metal")]
+            false,
+            #[cfg(feature = "metal")]
             &mut None,
         )
         .to_string();
@@ -17433,6 +17506,8 @@ mod tests {
             2,
             false,
             &every_layer(&m),
+            #[cfg(feature = "metal")]
+            false,
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -17481,6 +17556,8 @@ mod tests {
             8,
             false,
             &every_layer(&m),
+            #[cfg(feature = "metal")]
+            false,
             #[cfg(feature = "metal")]
             &mut None,
         )
