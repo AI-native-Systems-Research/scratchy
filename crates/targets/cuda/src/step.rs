@@ -148,7 +148,16 @@ pub enum CudaStep {
     /// `ExpertActivation` fold of a one-row bucket (#1049, `kernels/gemv_bf16.cu`'s expert gate/up
     /// GEMV): the bits of the two [`Self::ExpertGemv`]s then the activation's step.
     ExpertGateUpAct(ExpertGateUpActBf16),
+    /// A one-row bucket's [`Self::GatedDeltaNet`] in one launch (#1049,
+    /// `kernels/gdn_decode.cu`): its operands, its conv, gating, scan and gated norm as the four
+    /// kernels compute them at one token, so its output, conv ring and state are their bits. The
+    /// intermediates stay in shared memory: it reads and writes no GDN scratch.
+    GdnDecode(GatedDeltaNetBf16),
 }
+
+/// The value heads per key head the one-launch GDN decode takes (`kernels/gdn_decode.cu`): one CTA
+/// per key head owns its value heads, `nv / nk` of them; qwen3.5's are 1 (0.8B) and 2 (9B, 35B).
+pub const GDN_DECODE_MAX_HEADS: u32 = 4;
 
 /// The activation a gate/up step applies (`kernels/scratchy_ops.cuh`'s op struct): SwiGLU's
 /// `silu_mul` or GeGLU's `gelu_tanh_mul`, the op of [`CudaStep::SiluMul`] or [`CudaStep::GeluMul`].
@@ -1531,7 +1540,8 @@ impl CudaStep {
             | Self::AddRmsNorm(_)
             | Self::NormAdd(_)
             | Self::GateUpAct(_)
-            | Self::ExpertGateUpAct(_) => None,
+            | Self::ExpertGateUpAct(_)
+            | Self::GdnDecode(_) => None,
         }
     }
 
@@ -1574,7 +1584,8 @@ impl CudaStep {
             | Self::AddRmsNorm(_)
             | Self::NormAdd(_)
             | Self::GateUpAct(_)
-            | Self::ExpertGateUpAct(_) => None,
+            | Self::ExpertGateUpAct(_)
+            | Self::GdnDecode(_) => None,
         }
     }
 
@@ -1615,7 +1626,8 @@ impl CudaStep {
             | Self::AddRmsNorm(_)
             | Self::NormAdd(_)
             | Self::GateUpAct(_)
-            | Self::ExpertGateUpAct(_) => None,
+            | Self::ExpertGateUpAct(_)
+            | Self::GdnDecode(_) => None,
         }
     }
 
@@ -1993,6 +2005,16 @@ impl CudaStep {
                     kv: Some((layer, KvUse::Read)),
                     gdn: None,
                     in_place: false,
+                })
+            }
+            // The GDN step's reads and its output; no scratch (`kernels/gdn_decode.cu`).
+            Self::GdnDecode(g) => {
+                let Some(e) = Self::GatedDeltaNet(g).extents() else {
+                    return None;
+                };
+                Some(StepExtents {
+                    second_write: None,
+                    ..e
                 })
             }
             Self::GatedDeltaNet(
@@ -2416,7 +2438,8 @@ impl CudaStep {
             }) => Some(gain),
             Self::LayerScale(LayerScaleBf16 { scale, .. }) => Some(scale),
             Self::MoeRoute(MoeRouteBf16 { expert_scale, .. }) => expert_scale.as_mut(),
-            Self::GatedDeltaNet(GatedDeltaNetBf16 { bundle, .. }) => Some(bundle),
+            Self::GatedDeltaNet(GatedDeltaNetBf16 { bundle, .. })
+            | Self::GdnDecode(GatedDeltaNetBf16 { bundle, .. }) => Some(bundle),
             Self::RouterLogits(RouterLogitsBf16 { bundle, .. }) => Some(bundle),
             Self::ExpertGemm(ExpertGemmBf16 { bundle, .. })
             | Self::ExpertGemv(ExpertGemvBf16 { bundle, .. })

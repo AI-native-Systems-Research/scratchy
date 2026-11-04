@@ -112,6 +112,7 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::NormAdd(_) => "NormAdd",
             CudaStep::GateUpAct(_) => "GateUpAct",
             CudaStep::ExpertGateUpAct(_) => "ExpertGateUpAct",
+            CudaStep::GdnDecode(_) => "GdnDecode",
         };
         *h.entry(kind).or_default() += 1;
     }

@@ -300,6 +300,31 @@ unsafe extern "C" {
         count: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gdn_decode_prepare() -> i32;
+    fn scratchy_cuda_gdn_decode(
+        qkv: *const c_void,
+        a: *const c_void,
+        b: *const c_void,
+        z: *const c_void,
+        w: *const c_void,
+        a_log: *const c_void,
+        dt_bias: *const c_void,
+        norm: *const c_void,
+        conv_state: *mut c_void,
+        conv_slot_elems: u64,
+        ssm_state: *mut c_void,
+        ssm_slot_elems: u64,
+        sequence: *const c_void,
+        out: *mut c_void,
+        nk: u32,
+        nv: u32,
+        head_k: u32,
+        head_v: u32,
+        kernel: u32,
+        scale: f32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gate_up_gemv_bf16_prepare() -> i32;
     fn scratchy_cuda_gate_up_gemv_bf16(
         a: *const c_void,
@@ -626,6 +651,14 @@ pub enum KernelError {
         kernel: &'static str,
         dims: [u32; 4],
     },
+    /// The one-launch GDN decode (#1049) does not take this geometry, its state strides, its
+    /// scale or its eps; nothing was launched.
+    GdnDecodeShape {
+        nk: u32,
+        nv: u32,
+        head_v: u32,
+        kernel: u32,
+    },
     /// The decode attention does not take this shape, scale or window; nothing was launched.
     AttnDecodeShape {
         q_heads: u32,
@@ -772,6 +805,16 @@ impl fmt::Display for KernelError {
             KernelError::GroupShape { kernel, m, k, n } => {
                 write!(f, "{kernel} refused shape m={m} k={k} n={n:?}")
             }
+            KernelError::GdnDecodeShape {
+                nk,
+                nv,
+                head_v,
+                kernel,
+            } => write!(
+                f,
+                "GDN decode refused nk={nk} nv={nv} head_v={head_v} conv kernel={kernel}, or its \
+                 state strides, scale or eps"
+            ),
             KernelError::GateUpShape { kernel, dims } => {
                 write!(f, "{kernel} refused [m, n, k, splits] {dims:?}")
             }
@@ -840,6 +883,8 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     // #1049's gate/up GEMVs (dense and expert) and GEMMs: the attribute on each instance, and a
     // load of the GEMV's reduces.
     ("gate_up_gemv_bf16", scratchy_cuda_gate_up_gemv_bf16_prepare),
+    // #1049's one-launch GDN decode: static shared memory only, so a load of every instance.
+    ("gdn_decode", scratchy_cuda_gdn_decode_prepare),
     ("gate_up_gemm_bf16", scratchy_cuda_gate_up_gemm_bf16_prepare),
     // Load-only (#1048): these set no attribute, but a worker captures its tapes into CUDA Graphs
     // at construction, and a kernel the runtime has not loaded must not first load during a
@@ -2255,6 +2300,80 @@ pub unsafe fn gdn_scan(
             nv,
             head_k,
             head_v,
+        },
+    )
+}
+
+/// The operands of [`gdn_decode`]: the token's `qkv`, `a`, `b` and `z`, the bundle's conv taps,
+/// `a_log`, `dt_bias` and norm gain, and the output.
+pub struct GdnDecodeOperands {
+    pub qkv: *const c_void,
+    pub a: *const c_void,
+    pub b: *const c_void,
+    pub z: *const c_void,
+    pub w: *const c_void,
+    pub a_log: *const c_void,
+    pub dt_bias: *const c_void,
+    pub norm: *const c_void,
+    pub out: *mut c_void,
+}
+
+/// The one-launch GDN decode (#1049, `kernels/gdn_decode.cu`): [`gdn_conv1d`], [`gdn_gating`],
+/// [`gdn_scan`] and [`gdn_rms_norm_gated`] at one row, in one launch, their output, ring and state
+/// bits. `dims` is `(nk, nv, head_k, head_v, kernel)`. Asynchronous.
+///
+/// Refused with [`KernelError::GdnDecodeShape`], before any pointer is touched, unless the four
+/// launchers take the geometry at one row, `head_v` is 128 or 256, `nv / nk` at most
+/// [`crate::step::GDN_DECODE_MAX_HEADS`] dividing 16, and `scale` and `eps` finite and positive.
+///
+/// # Safety
+///
+/// As the four launchers' at `rows = 1`, for the operands, `sequence` (`q_len` 1) and the two
+/// state buffers (`slot_elems` apart per slot).
+pub unsafe fn gdn_decode(
+    o: &GdnDecodeOperands,
+    (conv_state, conv_slot_elems): (*mut c_void, u64),
+    (ssm_state, ssm_slot_elems): (*mut c_void, u64),
+    sequence: *const c_void,
+    (nk, nv, head_k, head_v, kernel): (u32, u32, u32, u32, u32),
+    (scale, eps): (f32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // geometry before it touches a pointer and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_gdn_decode(
+            o.qkv,
+            o.a,
+            o.b,
+            o.z,
+            o.w,
+            o.a_log,
+            o.dt_bias,
+            o.norm,
+            conv_state,
+            conv_slot_elems,
+            ssm_state,
+            ssm_slot_elems,
+            sequence,
+            o.out,
+            nk,
+            nv,
+            head_k,
+            head_v,
+            kernel,
+            scale,
+            eps,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GdnDecodeShape {
+            nk,
+            nv,
+            head_v,
+            kernel,
         },
     )
 }

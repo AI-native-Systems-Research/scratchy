@@ -1968,3 +1968,103 @@ fn the_gating_refuses_a_width_off_16() {
     );
     assert!(ok, "the gating took a width that is not a multiple of 16");
 }
+
+/// #1049's one-launch GDN decode is the four launches bit for bit at one row: the bf16 output, the
+/// conv ring and the state of the slot, for both geometries (one value head per key head, and two),
+/// fresh (the pool NaN-poisoned, so a read of the slot would show) and continued from a slot the
+/// four launches filled with 300 tokens; every other slot bit-unchanged.
+#[test]
+fn the_gdn_decode_fold_is_its_four_launches_bit_for_bit() {
+    use scratchy_target_cuda::kernels::{GdnDecodeOperands, gdn_decode};
+    let device = h100();
+    let mut pass = true;
+    for d in [G08, G9] {
+        let bu = bundle(d, 0xDEC5);
+        let bb = upload_bundle(&device, &bu);
+        for prior in [0usize, 300] {
+            let x = inputs(d, prior + 1, 0xDEC6 ^ (prior as u64) << 16);
+            let (chain, fused) = (
+                Pool::new(&device, d, NAN_F32),
+                Pool::new(&device, d, NAN_F32),
+            );
+            if prior > 0 {
+                let c = chunk(&x, d, 0, prior, prior);
+                for p in [&chain, &fused] {
+                    run_step(&device, p, &bb, d, &c, (3, true)).expect("the prefix");
+                }
+            }
+            let fresh = prior == 0;
+            let tok = chunk(&x, d, prior, 1, 1);
+            let before = fused.snapshot();
+            let want = run_step(&device, &chain, &bb, d, &tok, (3, fresh)).expect("the four");
+            let seq = up_u32(&device, &[3, 1, u32::from(fresh), 0]);
+            let (qkv, a, b, z) = (
+                up(&device, &tok.qkv),
+                up(&device, &tok.a),
+                up(&device, &tok.b),
+                up(&device, &tok.z),
+            );
+            let out = up(&device, &vec![NAN_BF16; d.value_dim()]);
+            let l = fused.layout;
+            let operands = GdnDecodeOperands {
+                qkv: qkv.ptr(),
+                a: a.ptr(),
+                b: b.ptr(),
+                z: z.ptr(),
+                w: bb.w.ptr(),
+                a_log: bb.a_log.ptr(),
+                dt_bias: bb.dt_bias.ptr(),
+                norm: bb.norm.ptr(),
+                out: out.ptr(),
+            };
+            let dims = (
+                d.nk as u32,
+                d.nv as u32,
+                d.head_k as u32,
+                d.head_v as u32,
+                d.conv_kernel as u32,
+            );
+            // SAFETY: as `run_step`'s at one row: every buffer holds what the launcher's contract
+            // names, the pool `SLOTS` slots of its layout and slot 3 below it, `q_len` 1; null is
+            // the default stream, which the downloads below wait for.
+            let launched = unsafe {
+                gdn_decode(
+                    &operands,
+                    (fused.conv.ptr(), l.conv_elems_per_slot() as u64),
+                    (fused.ssm.ptr(), l.ssm_elems_per_slot() as u64),
+                    seq.ptr(),
+                    dims,
+                    (gdn_scale(d.head_k as u32), EPS),
+                    std::ptr::null_mut(),
+                )
+            };
+            if let Err(e) = launched {
+                eprintln!("gdn_decode {} prior={prior}: refused: {e} FAIL", name(d));
+                pass = false;
+                continue;
+            }
+            let got = out.download().expect("download out");
+            let out_bad = mismatched(&got, &want.out);
+            let differ = |x: Vec<f32>, y: Vec<f32>| {
+                (bits_of(&x).iter().zip(bits_of(&y)))
+                    .filter(|(p, q)| **p != *q)
+                    .count()
+            };
+            let ring = differ(fused.conv_slot(3), chain.conv_slot(3));
+            let state = differ(fused.ssm_slot(3), chain.ssm_slot(3));
+            let others = fused.others_changed(&before, 3);
+            let ok = out_bad + ring + state + others == 0;
+            eprintln!(
+                "gdn_decode {} prior={prior}: out_mismatched={out_bad} ring_mismatched_bits={ring} \
+                 state_mismatched_bits={state} other_slots_changed={others} {}",
+                name(d),
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "the one-launch GDN decode differs from its four launches"
+    );
+}

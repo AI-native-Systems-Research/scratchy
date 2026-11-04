@@ -1747,6 +1747,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     let pool = gdn.expect("`new` made a pool for a GDN tape");
                     Self::gated_delta_net(&g, pool, slot, weights, stream)
                 }
+                CudaStep::GdnDecode(g) => {
+                    let pool = gdn.expect("`new` made a pool for a GDN tape");
+                    Self::gdn_decode(&g, pool, slot, weights, stream)
+                }
                 CudaStep::RmsNorm(
                     norm @ RmsNormBf16 {
                         x,
@@ -2207,6 +2211,62 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
 
     /// A GDN step's four launches, in order on the stream: conv1d, gating, scan, gated norm. Each
     /// reads the GDN sequence region this forward uploaded; the first that fails stops the rest.
+    /// Enqueue the one-launch GDN decode (#1049, `kernels::gdn_decode`) of a one-row GDN step:
+    /// [`Self::gated_delta_net`]'s operands, bundle parts and state buffers, no scratch.
+    fn gdn_decode(
+        g: &GatedDeltaNetBf16,
+        pool: &GdnPool,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        weights: &[DeviceBuffer],
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        let Some(bundle) = g.bundle_layout() else {
+            return Err(KernelError::GdnDecodeShape {
+                nk: g.num_k_heads,
+                nv: g.num_v_heads,
+                head_v: g.head_v,
+                kernel: g.conv_kernel,
+            });
+        };
+        let w = weights[g.bundle.0 as usize].ptr();
+        let wat = |off: u64| {
+            let off = usize::try_from(off).expect("a bundle offset fits the host's usize");
+            w.wrapping_byte_add(off).cast_const()
+        };
+        let (conv_state, ssm_state) = pool.layer_ptrs(g.layer as usize);
+        let layout = pool.layout;
+        let operands = kernels::GdnDecodeOperands {
+            qkv: slot(g.qkv).cast_const(),
+            a: slot(g.a).cast_const(),
+            b: slot(g.b).cast_const(),
+            z: slot(g.z).cast_const(),
+            w: wat(bundle.conv1d),
+            a_log: wat(bundle.a_log),
+            dt_bias: wat(bundle.dt_bias),
+            norm: wat(bundle.norm),
+            out: slot(g.out),
+        };
+        // SAFETY: as `gated_delta_net`'s, for the step's arena operands (`extents`) and bundle,
+        // and the layer's state buffers at the pool's own strides.
+        unsafe {
+            kernels::gdn_decode(
+                &operands,
+                (conv_state, layout.conv_elems_per_slot() as u64),
+                (ssm_state, layout.ssm_elems_per_slot() as u64),
+                slot(g.sequence).cast_const(),
+                (
+                    g.num_k_heads,
+                    g.num_v_heads,
+                    g.head_k,
+                    g.head_v,
+                    g.conv_kernel,
+                ),
+                (g.scale(), g.eps()),
+                stream.0,
+            )
+        }
+    }
+
     fn gated_delta_net(
         g: &GatedDeltaNetBf16,
         pool: &GdnPool,

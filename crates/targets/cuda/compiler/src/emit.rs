@@ -518,6 +518,15 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             head_v,
             conv_kernel,
             ..
+        })
+        | CudaStep::GdnDecode(GatedDeltaNetBf16 {
+            bundle,
+            num_k_heads,
+            num_v_heads,
+            head_k,
+            head_v,
+            conv_kernel,
+            ..
         }) => {
             // `validate` sized the bundle, so its conv width fits; `u32::MAX` never matches a
             // checkpoint's.

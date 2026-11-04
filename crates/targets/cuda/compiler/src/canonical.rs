@@ -1494,7 +1494,9 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     let bundles: BTreeMap<u32, u64> = (steps.iter())
         .flat_map(|s| s.parts().into_iter().flatten())
         .filter_map(|s| match s {
-            CudaStep::GatedDeltaNet(g) => Some((g.bundle.0, g.bundle_layout()?.bytes)),
+            CudaStep::GatedDeltaNet(g) | CudaStep::GdnDecode(g) => {
+                Some((g.bundle.0, g.bundle_layout()?.bytes))
+            }
             CudaStep::RouterLogits(_) | CudaStep::ExpertGemm(_) | CudaStep::ExpertGemv(_) => {
                 let w = s.extents()?.weight?;
                 Some((w.ix.0, w.bytes))
@@ -1528,7 +1530,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     // lowered with the first's geometry.
     let gdn = arena.gdn.and_then(|r| {
         steps.iter().find_map(|s| match s {
-            CudaStep::GatedDeltaNet(g) => Some(CanonicalGdn {
+            CudaStep::GatedDeltaNet(g) | CudaStep::GdnDecode(g) => Some(CanonicalGdn {
                 layers: gdn_layers.clone(),
                 num_k_heads: g.num_k_heads,
                 num_v_heads: g.num_v_heads,

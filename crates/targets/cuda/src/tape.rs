@@ -1233,7 +1233,7 @@ impl CudaTape {
             // step reads or writes it. A write over it is refused as a write over a region, a
             // read of it as a step using it that is not the tape's GDN step.
             if let Some(scratch) = scratch
-                && !matches!(s, CudaStep::GatedDeltaNet(_))
+                && !matches!(s, CudaStep::GatedDeltaNet(_) | CudaStep::GdnDecode(_))
             {
                 for &write in [Some(e.writes), e.second_write].iter().flatten() {
                     if overlap(scratch, write) {
@@ -1598,7 +1598,21 @@ impl CudaTape {
                     false => Err(TapeError::KvStepGeometry { step }),
                 }
             }
+            // The one-launch decode (#1049) is the GDN step's geometry and sequence, and reads
+            // or writes no scratch, so its scratch offset is the tape's (it names one).
             CudaStep::GatedDeltaNet(
+                g @ GatedDeltaNetBf16 {
+                    sequence,
+                    scratch,
+                    num_k_heads,
+                    num_v_heads,
+                    head_k,
+                    head_v,
+                    conv_kernel,
+                    ..
+                },
+            )
+            | CudaStep::GdnDecode(
                 g @ GatedDeltaNetBf16 {
                     sequence,
                     scratch,

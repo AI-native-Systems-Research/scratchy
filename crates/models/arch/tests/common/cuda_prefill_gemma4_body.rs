@@ -152,7 +152,9 @@ fn roles() -> Vec<Option<Role>> {
                     ),
                     MoeWeight::Bundle => panic!("weight {}: a Qwen MoE bundle", bundle.0),
                 },
-                CudaStep::GatedDeltaNet(_) => panic!("a GDN layer in a Gemma tape"),
+                CudaStep::GatedDeltaNet(_) | CudaStep::GdnDecode(_) => {
+                    panic!("a GDN layer in a Gemma tape")
+                }
                 // The steps that read no weight.
                 CudaStep::Add(_)
                 | CudaStep::SiluMul(_)
@@ -1745,6 +1747,7 @@ fn kinds(s: &CudaStep) -> (&'static str, &'static str) {
         CudaStep::NormAdd(_) => ("NormAdd", "NormAdd"),
         CudaStep::GateUpAct(_) => ("GateUpAct", "GateUpAct"),
         CudaStep::ExpertGateUpAct(_) => ("ExpertGateUpAct", "ExpertGateUpAct"),
+        CudaStep::GdnDecode(_) => ("GdnDecode", "GdnDecode"),
     }
 }
 

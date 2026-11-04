@@ -96,6 +96,15 @@ fn roles() -> Vec<Option<Role>> {
                     head_v,
                     conv_kernel,
                     ..
+                })
+                | CudaStep::GdnDecode(GatedDeltaNetBf16 {
+                    bundle,
+                    num_k_heads,
+                    num_v_heads,
+                    head_k,
+                    head_v,
+                    conv_kernel,
+                    ..
                 }) => set(
                     bundle.0,
                     Role::Bundle {
