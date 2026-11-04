@@ -256,9 +256,32 @@ pub fn write_rows(
     Ok(w)
 }
 
-/// The query row index: the forward's `rows` query rows, in order.
+/// ⭐ A QUERY ROW INDEX THAT IS CONSECUTIVE BY CONSTRUCTION. The prefill kernel under Triton's
+/// 8-row scatter floor reads and writes its rows as the one tile at `query_row_index[0]`
+/// (`page_attn_head_major_prefill.py`, `out_tile.store([first, 0], attn)`), which is the rows the
+/// index names only when they are consecutive. The only way to make one is [`Self::of`], the
+/// forward's rows in order from 0, so the kernel's assumption is a property of the type, not a
+/// comment (#1038).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryRowIndex {
+    rows: u32,
+}
+
+impl QueryRowIndex {
+    /// The forward's `rows` query rows, `0..rows`, in order.
+    pub const fn of(step: &PagedStep) -> Self {
+        Self { rows: step.rows }
+    }
+
+    /// The staged words: `0, 1, …, rows - 1`.
+    pub fn words(self) -> Vec<i32> {
+        (0..self.rows as i32).collect()
+    }
+}
+
+/// The query row index: the forward's `rows` query rows, in order ([`QueryRowIndex`]).
 pub fn query_rows(step: &PagedStep) -> Vec<i32> {
-    (0..step.rows as i32).collect()
+    QueryRowIndex::of(step).words()
 }
 
 /// `kv_row_pool`: `[pages, nkvh, 1]`, page `p`'s kv head `kv` at folded-cache row `p · nkvh + kv`.
@@ -346,6 +369,10 @@ pub fn batch_sources(
     let chunking = step.batch().ok_or_else(|| {
         PagedStepError("batch_sources: this bundle's rows are one sequence's, not a batch".into())
     })?;
+    // ⛔ THE LIVE SEQUENCES ARE ROWS `0..n`, THE PADDING `n..b`. The kernel stores its output as the
+    // first `b` rows of `out`, row `s` sequence `s`'s (`out[:num_seqs].copy_(attn)`), and the
+    // worker reads sequence `s`'s token from launch slot `s`; this staging is what makes the two
+    // the same rows — `rep` below names sequence `s` at row `s` and a pad row as row 0 (#1038).
     let (b, n) = (step.rows as usize, seqs.len());
     if n == 0 || n > b {
         return Err(PagedStepError(format!(

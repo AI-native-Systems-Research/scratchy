@@ -40,6 +40,9 @@ scratchy-vision = { path = "../../models/vision", optional = true }
 anyhow = "1"
 tracing = "0.1"
 memmap2 = "0.9"
+# Baked metallibs are embedded as zstd frames against one dictionary trained on the build's
+# metallibs (`aot::pack`), and decompressed when their library loads (`BakedMetallib`).
+zstd = { version = "0.14", default-features = false, features = ["zdict_builder"] }
 rayon = { workspace = true }
 rand = { workspace = true }
 libc = "0.2"
@@ -76,6 +79,8 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTL4CommandEncoder",
     "MTL4CommandQueue",
     "MTL4CommitFeedback",
+    # The commit feedback's GPU start and end times (CFTimeInterval): a forward's GPU span.
+    "objc2-core-foundation",
     "MTL4Compiler",
     "MTL4ComputeCommandEncoder",
     "MTL4ComputePipeline",

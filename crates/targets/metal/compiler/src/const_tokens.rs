@@ -38,6 +38,8 @@ pub const METAL_MODULES: ModuleTable = ModuleTable {
                 "RuntimeGate",
                 "LoweredCommand",
                 "GatedCommand",
+                "PackedCommand",
+                "CommandTable",
                 "GemmDims",
                 "WeightTensor",
                 "RuntimeBindingKind",
@@ -54,6 +56,7 @@ pub const METAL_MODULES: ModuleTable = ModuleTable {
                 "RowTile",
                 "DecodePartials",
                 "SplitSteps",
+                "PlayLive",
             ],
         },
         ModuleRow {
@@ -86,6 +89,7 @@ pub const METAL_MODULES: ModuleTable = ModuleTable {
                 "MaxBlocksPerSeq",
                 "TqDecodeHeads",
                 "CommandIx",
+                "PartIx",
                 "QSize",
                 "IntermediateSize",
                 "HiddenSize",
@@ -102,7 +106,14 @@ pub const METAL_MODULES: ModuleTable = ModuleTable {
                 "RmsNormEps",
             ],
         },
+        ModuleRow {
+            alias: "__td",
+            path: "::scratchy_target_metal::dflash2",
+            types: &["DraftOutput"],
+        },
     ],
+    // `CommandTable` is held only behind a `TapeCommands`' `&'static` (#1061).
+    held_by_reference: &["CommandTable"],
 };
 
 /// The `use … as __tl;` lines the emitted metal tape names its types through.

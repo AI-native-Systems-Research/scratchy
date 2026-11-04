@@ -1,0 +1,170 @@
+name: Release (macOS)
+
+# Publishing a GitHub Release builds the `scr` CLI for macOS arm64 (metal),
+# signs it with the Developer ID Application certificate, notarizes it with
+# Apple's notarytool, and attaches it to that release as a tar.gz.
+#
+# Notarizing a bare CLI: Apple accepts only .zip/.dmg/.pkg submissions, so the
+# signed binary is zipped and submitted; the notarization ticket is keyed to
+# the binary's cdhash, so the tar.gz we ship clears Gatekeeper's online ticket
+# lookup on first run. Stapling can't attach to a tarball and isn't needed.
+#
+# workflow_dispatch exists to exercise the whole signing chain without
+# publishing a release (it skips the upload step); its input narrows the model
+# scope so the smoke run doesn't forward-expand every config.
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   MACOS_CERTIFICATE          base64 of the Developer ID Application .p12
+#   MACOS_CERTIFICATE_PWD      that .p12's export password
+#   APPLE_ID                   the Apple ID of the team member notarizing
+#   APPLE_APP_SPECIFIC_PASSWD  an app-specific password for that Apple ID
+#                              (appleid.apple.com → Sign-In and Security)
+#   APPLE_TEAM_ID              the 10-character Team ID (same page of the
+#                              developer portal as the signing identity)
+# Required repo *variable* (not secret — it appears in the signature):
+#   MACOS_SIGNING_IDENTITY  e.g. "Developer ID Application: ACME Inc (TEAMID12345)"
+#
+# No PAT anywhere: the tap lives in this repo, so the formula update is
+# committed with the built-in github token.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      model-scope:
+        description: scratchy-cli model feature scope for the smoke build
+        default: model/qwen3.6-35b-a3b
+
+permissions:
+  contents: write # to upload assets to the release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-macos:
+    name: macos-arm64 (signed + notarized scr)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos
+
+      # A release is the distributable, so it carries every model; a dispatch
+      # run uses the input scope. Naming zero models is a build-time panic, so
+      # the scope is never empty. quant/mlx is always on: MLX affine is what
+      # people run on a Mac, and the Gemma 4 26B-A4B drafter that metal's
+      # mtp-heads publishes lives under it. Active presets are arch-wide: an
+      # arch that declares any MLX preset ships only its MLX variants (every
+      # declared preset x every config) and loses its dense/bf16 build; arches
+      # with no MLX preset stay dense.
+      - name: Build
+        env:
+          MODEL_SCOPE: ${{ github.event_name == 'release' && 'model/all' || inputs.model-scope }}
+        run: cargo build --release -p scratchy-cli --features metal,bench,serve,multimodal,quant/mlx,"$MODEL_SCOPE"
+
+      # Import the Developer ID Application certificate into an ephemeral
+      # keychain. MACOS_SIGNING_IDENTITY is a repo *variable* (not secret):
+      # e.g. "Developer ID Application: ACME Inc (TEAMID12345)".
+      - name: Import signing certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          set -euo pipefail
+          CERTFILE="$(mktemp -d)/certificate.p12"
+          KEYCHAIN="$(mktemp -d)/build.keychain-db"
+          KEYCHAIN_PWD="$(openssl rand -hex 32)"
+
+          echo -n "$MACOS_CERTIFICATE" | base64 --decode -o "$CERTFILE"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security import "$CERTFILE" -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Codesign
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          codesign --force --timestamp --options runtime \
+            -s "$MACOS_SIGNING_IDENTITY" target/release/scr
+          codesign --verify --strict --verbose=2 target/release/scr
+          codesign -dv --verbose=2 target/release/scr
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN:-}" ] && [ -f "$KEYCHAIN" ]; then
+            security delete-keychain "$KEYCHAIN"
+          fi
+
+      # Zip + submit: the notarization ticket attaches to the binary itself, so
+      # the tar.gz packaged next is covered. --wait fails the step on any
+      # verdict other than Accepted; on failure the history dump carries the
+      # submission id needed for `xcrun notarytool log <id>`. Credentials are
+      # an Apple ID + app-specific password + Team ID (no App Store Connect
+      # API key) — notarytool requires the team id on this route.
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          STAGE="$(mktemp -d)"
+          ditto -c -k --keepParent target/release/scr "$STAGE/scr.zip"
+          if ! xcrun notarytool submit "$STAGE/scr.zip" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_APP_SPECIFIC_PASSWD" \
+                --team-id "$APPLE_TEAM_ID" \
+                --wait; then
+            xcrun notarytool history \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWD" \
+              --team-id "$APPLE_TEAM_ID" || true
+            exit 1
+          fi
+          rm -rf "$STAGE"
+
+      - name: Package
+        env:
+          TAG: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -czf "dist/scr-${TAG}-macos-arm64.tar.gz" -C target/release scr
+          shasum -a 256 "dist/scr-${TAG}-macos-arm64.tar.gz" | tee "dist/scr-${TAG}-macos-arm64.tar.gz.sha256"
+
+      - name: Upload to the release
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/* --clobber
+
+      # Rewrite this repo's own Formula/scr.rb (the tap lives here — see the
+      # formula's header comment) with this release's tag and sha256, and
+      # commit it to main. The built-in github token does it: same repo, no
+      # PAT. If main ever gets branch protection that rejects these pushes,
+      # the fallback is a GitHub App token, not a PAT.
+      - name: Update Homebrew formula
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          SHA256="$(cut -d' ' -f1 "dist/scr-${TAG}-macos-arm64.tar.gz.sha256")"
+          sed -i '' -e "s/__VERSION__/$TAG/g" -e "s/__SHA256__/$SHA256/g" Formula/scr.rb
+          git config user.name "scratchy-release-bot"
+          git config user.email "noreply@github.com"
+          git add Formula/scr.rb
+          git commit -m "chore(release): scr $TAG on the homebrew tap"
+          git push origin HEAD:main

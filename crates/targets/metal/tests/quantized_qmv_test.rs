@@ -1070,3 +1070,143 @@ fn affine_qmv_b4_offset8_codes_match_as_written() {
         );
     }
 }
+
+/// A narrow projection at a bucket of up to 64 rows on NAX (`narrow_matvec`: Qwen3.8-27B's
+/// Gated-DeltaNet `a` / `b`, 48 x 5120) runs the fast matvec over the bucket's rows, a threadgroup
+/// row a row: each row is the bits the one-row matvec gives it alone, at every row count it serves
+/// (2-64 rows), with the tape's offset-8 codes. Against the NAX GEMM those buckets ran before —
+/// which sums K in 64-wide matrix-unit tiles, another order — and the CPU reference, every
+/// element is within the qmv tests' bf16 accumulation noise floor.
+#[test]
+fn a_narrow_projection_fast_matvec_row_is_the_one_row_bits() {
+    use scratchy_target_metal::quantized::{
+        NaxDequant, QmmTKernel, narrow_matvec, qmm_t_dispatch_shape, qmm_t_kernel_name,
+    };
+    let Some(dev) = detect_device() else {
+        eprintln!("skipping: no Metal 4 GPU");
+        return;
+    };
+    if !scratchy_target_metal::targets::is_nax_capable(dev.profile.generation) {
+        eprintln!("skipping: no NAX matrix unit");
+        return;
+    }
+    let device = dev.device;
+    let (n, k, gs) = (48usize, 5120usize, 64usize);
+    let m_max = 64usize;
+    let (packed, scales, biases, x) = make_inputs_bf16(0x27BA_B5EED, n, k, m_max, gs);
+    // The tape's codes on this chip: offset-8 (`AffineCodes::of`), stored XOR 0x88.
+    let codes = AffineCodes::of(Some(&dev.profile), 4);
+    let stored: Vec<u8> = match codes {
+        AffineCodes::Offset8 => packed.iter().map(|b| b ^ 0x88).collect(),
+        AffineCodes::AsWritten => packed.clone(),
+        AffineCodes::Planes { .. } => unreachable!("`AffineCodes::of` never stores planes"),
+    };
+    let as_bytes =
+        |v: &[half::f16]| -> Vec<u8> { v.iter().flat_map(|h| h.to_le_bytes()).collect() };
+    let w_buf = buffer_from_bytes(&device, &stored);
+    let s_buf = buffer_from_bytes(&device, &as_bytes(&scales));
+    let b_buf = buffer_from_bytes(&device, &as_bytes(&biases));
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let size = |t: (u32, u32, u32)| MTLSize {
+        width: t.0 as usize,
+        height: t.1 as usize,
+        depth: t.2 as usize,
+    };
+    let fast_name = qmv_kernel_name(
+        QmvKernel::Fast,
+        DequantDtype::Bf16,
+        ScaleDtype::F16,
+        gs as u32,
+        4,
+        false,
+    );
+    let fast = baked_pipeline(
+        &device,
+        "quantized_qmv",
+        &fast_name,
+        [
+            ConstantValue::int(0, k as i32),
+            ConstantValue::int(1, n as i32),
+        ]
+        .into_iter()
+        .chain(codes.constant())
+        .collect(),
+    )
+    .expect("qmv_fast pipeline");
+    // The fast matvec over `rows` rows of x from row `from`.
+    let run_fast = |from: usize, rows: usize| -> Vec<u16> {
+        let x_buf = buffer_from_bytes(&device, &x_bytes[from * k * 2..(from + rows) * k * 2]);
+        let y_buf = zeroed_buffer(&device, rows * n * 2);
+        let (tg, tpg) = qmv_dispatch_shape(QmvKernel::Fast, rows as u32, n as u32, 1);
+        assert!(common::dispatch_threadgroups(
+            &device,
+            &fast,
+            &[&w_buf, &s_buf, &b_buf, &x_buf, &y_buf],
+            size(tg),
+            size(tpg),
+        ));
+        read_buffer_bf16(&y_buf, rows * n)
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    let alone: Vec<u16> = (0..m_max).flat_map(|r| run_fast(r, 1)).collect();
+    let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m_max, n, k, gs);
+    for m in [2usize, 4, 8, 13, 16, 27, 32, 45, 64] {
+        assert!(
+            narrow_matvec(n as u32, k as u32, 4, m as u32),
+            "{m} rows: the fast matvec's"
+        );
+        assert_eq!(run_fast(0, m), alone[..m * n], "{m} rows: the one-row bits");
+        let nax = QmmTKernel::Nax(NaxDequant::Loader);
+        let nax_pso = baked_pipeline(
+            &device,
+            "quantized_qmm_nax",
+            &qmm_t_kernel_name(
+                nax,
+                DequantDtype::Bf16,
+                ScaleDtype::F16,
+                gs as u32,
+                4,
+                false,
+            ),
+            [
+                ConstantValue::int(0, k as i32),
+                ConstantValue::int(1, n as i32),
+                ConstantValue::int(2, m as i32),
+            ]
+            .into_iter()
+            .chain(codes.constant())
+            .collect(),
+        )
+        .expect("qmm_t nax pipeline");
+        let x_buf = buffer_from_bytes(&device, &x_bytes[..m * k * 2]);
+        let y_buf = zeroed_buffer(&device, m * n * 2);
+        let (tg, tpg) = qmm_t_dispatch_shape(nax, m as u32, n as u32, 1);
+        assert!(common::dispatch_threadgroups(
+            &device,
+            &nax_pso,
+            &[&w_buf, &s_buf, &b_buf, &x_buf, &y_buf],
+            size(tg),
+            size(tpg),
+        ));
+        let gemm = read_buffer_bf16(&y_buf, m * n);
+        let fast_rows: Vec<half::bf16> = alone[..m * n]
+            .iter()
+            .map(|&b| half::bf16::from_bits(b))
+            .collect();
+        for (tag, got) in [("fast", &fast_rows), ("nax", &gemm)] {
+            let (idx, mv, ev, err, allowed) =
+                worst_abs_error_vs_noise_floor(got, &expected[..m * n], k, 0.5);
+            assert!(
+                err <= allowed,
+                "{m} rows, {tag}: abs_err={err:.5} at {idx} (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+            );
+        }
+        let (idx, mv, ev, err, allowed) = worst_abs_error_vs_noise_floor(&fast_rows, &gemm, k, 0.5);
+        assert!(
+            err <= allowed,
+            "{m} rows, fast vs nax: abs_err={err:.5} at {idx} (allowed {allowed:.5}; fast={mv}, nax={ev})"
+        );
+    }
+}

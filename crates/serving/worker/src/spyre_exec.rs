@@ -212,16 +212,25 @@ impl Worker for SpyreWorker {
         Ok(8usize << 30)
     }
 
-    /// ONE SCHEDULER BLOCK'S BYTES — a pool page ([`Loaded::pool_stride_bytes`]) prorated to
-    /// `block_size` tokens of its `PAGE_SLOTS`. `None` on the emulator.
+    /// ONE SCHEDULER BLOCK'S BYTES — a pool page ([`Loaded::pool_stride_bytes`]). `None` on the
+    /// emulator.
+    ///
+    /// ⛔ A BLOCK IS A PAGE, CHECKED HERE. The scheduler's `slot = block · block_size + offset` and
+    /// the worker's page map address the same cells only at `block_size == PAGE_SLOTS`, which
+    /// [`required_block_size`](scratchy_serving_engine::worker_factory::WorkerFactory::required_block_size)
+    /// demands at init. A pool sized from any other block would hold the wrong page count, so a
+    /// mismatched caller is a panic naming both, not a prorated byte count.
     fn kv_block_bytes(&self, block_size: usize) -> Option<usize> {
+        let page_slots = scratchy_target_spyre::paged_step::PAGE_SLOTS as usize;
+        assert_eq!(
+            block_size, page_slots,
+            "spyre: the scheduler's KV block is {block_size} token(s); the pool's page is \
+             {page_slots} slots, and a block must be one page"
+        );
         self.model
             .as_ref()
             .and_then(|m| m.pool_stride_bytes)
-            .map(|page| {
-                let slots = scratchy_target_spyre::paged_step::PAGE_SLOTS as u64;
-                (page / slots * block_size as u64) as usize
-            })
+            .map(|page| page as usize)
     }
 
     /// ⭐ THE POOL'S PAGE COUNT, so every block id the scheduler hands out is a page this pool has —

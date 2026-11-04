@@ -30,6 +30,30 @@ pub fn compiled_hf_registry() -> &'static [&'static str] {
 // checkpoints of those models (`scratchy_core_model::baked_tokenizer`).
 include!(concat!(env!("OUT_DIR"), "/baked_tokenizers.rs"));
 
+#[cfg(test)]
+mod baked_tokenizer_tables {
+    use scratchy_core_model::baked_tokenizer::BakedTokenizer;
+
+    /// Checkpoints whose `tokenizer.json`s bake the same tables (fine-tunes of one base) share one
+    /// embedded copy of them: two baked tokenizers with equal tables point at the same bytes.
+    #[test]
+    fn equal_tables_are_embedded_once() {
+        let baked: Vec<_> =
+            scratchy_forward_compiler::inventory::iter::<BakedTokenizer>().collect();
+        for (i, a) in baked.iter().enumerate() {
+            for b in &baked[i + 1..] {
+                assert!(
+                    a.tables.0 != b.tables.0 || std::ptr::eq(a.tables, b.tables),
+                    "{} and {} embed the same {}-byte tables twice",
+                    a.digest,
+                    b.digest,
+                    a.tables.0.len(),
+                );
+            }
+        }
+    }
+}
+
 // Every baked metal kernel the arches below name (`crate::__metal_bake::K_<key>`), each once,
 // beside the metallibs holding them — baked by the build script after it emits every arch.
 #[cfg(feature = "metal")]
@@ -134,6 +158,9 @@ pub mod qwen3_5;
 #[path = "arch/qwen3_5_moe.rs"]
 pub mod qwen3_5_moe;
 
+#[cfg(all(feature = "arch-qwen3-5-dense-mtp", feature = "metal"))]
+#[path = "arch/qwen3_5_dense_mtp.rs"]
+pub mod qwen3_5_dense_mtp;
 #[cfg(all(feature = "arch-qwen3-5-mtp", feature = "metal"))]
 #[path = "arch/qwen3_5_mtp.rs"]
 pub mod qwen3_5_mtp;
@@ -141,6 +168,10 @@ pub mod qwen3_5_mtp;
 #[cfg(all(feature = "arch-gemma4-assistant", feature = "metal"))]
 #[path = "arch/gemma4_assistant.rs"]
 pub mod gemma4_assistant;
+
+#[cfg(all(feature = "arch-dflash2", feature = "metal"))]
+#[path = "arch/dflash2.rs"]
+pub mod dflash2;
 
 #[cfg(all(feature = "arch-qwen3-5-vl", feature = "metal"))]
 #[path = "arch/qwen3_5_vl.rs"]

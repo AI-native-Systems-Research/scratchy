@@ -2,7 +2,7 @@
 //! Emit ONE arch's forward, for any arch, on any host — a verification tool.
 //!
 //! `scratchy-models`' build script gates each arch on a backend
-//! (`SPYRE_CAPABLE` / `CUDA_ONLY` in `scratchy-forwards.rs`, mirroring the
+//! (`scratchy_forward_compiler_macro::arch_compiled`, mirroring the
 //! `pub mod` cfgs in its `src/lib.rs`), so on a machine with neither a CUDA
 //! toolchain nor macOS only `llama` and `granite` can be built at all. That
 //! makes the other 23 arches' codegen unverifiable via `cargo check` there,

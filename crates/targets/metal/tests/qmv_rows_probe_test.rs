@@ -4,7 +4,8 @@
 //! `ModelFoldFacts::matvec_norms` (the norm folds on the one-row bucket alone) was measured on:
 //! base M5, the plain wide matvec at 3-4 rows costs what one row costs, while normalizing on load
 //! makes it ALU-bound (Qwen3.6's 248k-row lm_head at 4 rows 2137 vs 3302 µs; one row 2131 vs
-//! 2134). Rerun it on a new chip before moving the fold. Each cell is µs a dispatch over one
+//! 2134). Rerun it on a new chip before moving the fold. Alongside it, a narrow projection's
+//! kernels by bucket rows (`narrow_projection_at_verify_buckets`). Each cell is µs a dispatch over one
 //! command buffer of `ITERS` dispatches a barrier apart, the weights rotated over copies past the
 //! system cache, best of 3.
 //!
@@ -309,5 +310,345 @@ fn qmv_wide_against_small_m_twin_by_bucket() {
             line += &format!("  {tag} {us:8.1}");
         }
         println!("{line}   ({:.1} MB of codes)", bytes as f64 / 1e6);
+    }
+}
+
+/// What folding a layer's RMSNorm into the projections reading it buys on a 40-core chip emulated by
+/// width (columns / 4 on a 10-core base M5): µs a group, min / median / max of `ROUNDS`, at the bucket's
+/// rows, DRAM-cold. Each consumer set runs as the tape runs it, every member between the same barriers:
+/// - `norm + plain`: the RMSNorm, a barrier, then the plain wide matvecs;
+/// - `normed`: the wide matvecs normalizing their input as they load it (`QmvEnds::norm`), no norm.
+///
+/// The sets are Qwen3.6-35B-A3B's: the GDN input norm's readers (qkv, z, a, b) and the post-attention
+/// norm's weight-carrying readers (shared gate, up). NAX devices only.
+#[test]
+#[ignore = "measurement probe, not an assertion: run with --ignored --nocapture"]
+fn norm_folded_into_its_readers_on_a_chip_emulated_by_width() {
+    use scratchy_target_metal::tape::ids::{BucketM, QSize, RmsNormEps};
+    use scratchy_target_metal::tape::kernel_constants::RmsNormConstants;
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    if !scratchy_target_metal::targets::is_nax_capable(di.profile.generation) {
+        eprintln!("skipping: no NAX matrix unit");
+        return;
+    }
+    let device = di.device.clone();
+    let cores = scratchy_target_metal::device::gpu_cores(&device)
+        .expect("the device's GPU cores")
+        .get() as usize;
+    let width = 40 / cores;
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
+    let codes = AffineCodes::of(Some(&di.profile), 4);
+    let hidden = 2048u32;
+    let normed = QmvEnds {
+        norm: Some(RowNorm {
+            layer: LayerId(0),
+            eps: Eps(1e-6),
+            offset: GainOffset(0.0),
+        }),
+        ..QmvEnds::default()
+    };
+    println!(
+        "µs a group, min/median/max of {ROUNDS} rounds, a 40-core chip emulated by width on {cores} cores \
+         (columns / {width})"
+    );
+    let sets: &[(&str, &[u32])] = &[
+        ("gdn input norm: qkv | z | a | b", &[8192, 4096, 32, 32]),
+        ("post-attention norm: shared gate | up", &[512, 512]),
+    ];
+    for &(name, columns) in sets {
+        for rows in [3u32, 4] {
+            // Each member at the emulated width (a narrow one at its own).
+            let ns: Vec<u32> = columns
+                .iter()
+                .map(|&n| {
+                    if n / width as u32 >= 32 {
+                        n / width as u32
+                    } else {
+                        n
+                    }
+                })
+                .collect();
+            let bytes: usize = ns.iter().map(|&n| (n * hidden / 2) as usize).sum();
+            let copies = ROTATED_BYTES / bytes + 1;
+            let iters = ((1usize << 30) / bytes).clamp(48, 4096);
+            let weights: Vec<Vec<_>> = (0..copies)
+                .map(|c| {
+                    ns.iter()
+                        .map(|&n| {
+                            let words = (n * hidden / 8) as usize;
+                            let codes: Vec<u32> = (0..words as u32)
+                                .map(|i| i.wrapping_mul(2654435761).wrapping_add(c as u32))
+                                .collect();
+                            let groups = (n * hidden / GROUP) as usize;
+                            (
+                                shared_slice(&device, &codes),
+                                shared_slice(&device, &bf16_row(groups, 0.002)),
+                                shared_slice(&device, &bf16_row(groups, -0.015)),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            let x = shared_slice(&device, &bf16_row(4 * hidden as usize, 0.5));
+            let xn = shared_zeroed(&device, 4 * hidden as usize * 2);
+            let gain = shared_slice(&device, &bf16_row(hidden as usize, 0.1));
+            let ys: Vec<_> = ns
+                .iter()
+                .map(|&n| shared_zeroed(&device, 4 * n as usize * 2))
+                .collect();
+            let matvec = |n: u32, ends: QmvEnds| {
+                let kernel = pick_qmv_kernel_wide(n, hidden, 4, rows, true);
+                let name =
+                    qmv_kernel_static_name(kernel, DequantDtype::Bf16, ScaleDtype::Bf16, 4, GROUP);
+                let mut constants: Vec<ConstantValue> = AffineQmvWideConstants {
+                    k: KDimI32(hidden as i32),
+                    n: NDimI32(n as i32),
+                    m: MDimI32(rows as i32),
+                    codes,
+                }
+                .into();
+                constants.extend(Vec::<ConstantValue>::from(ends));
+                let pso = baked_build(&cache, &PipelineKey::new("quantized_qmv", name, constants))
+                    .expect(name);
+                (pso, qmv_dispatch_shape(kernel, rows, n, 1))
+            };
+            let plain: Vec<_> = ns.iter().map(|&n| matvec(n, QmvEnds::default())).collect();
+            let folded: Vec<_> = ns.iter().map(|&n| matvec(n, normed)).collect();
+            let norm_constants: Vec<ConstantValue> = RmsNormConstants {
+                bucket_m: BucketM(rows),
+                q_size: QSize(hidden),
+                rms_norm_eps: RmsNormEps(1e-6),
+                weight_offset: 0.0,
+            }
+            .into();
+            let norm_name = "rmsnorm_bf16_s_bf16_specialized";
+            let norm = baked_build(
+                &cache,
+                &PipelineKey::new("rmsnorm", norm_name, norm_constants),
+            )
+            .expect(norm_name);
+            // 0: the norm, a barrier, the plain readers; 1: the readers normalizing on load.
+            let time = |cell: usize| {
+                let mut batch = Mtl4DispatchBatch::begin(&device).expect("mtl4 batch");
+                for i in 0..iters {
+                    let copy = &weights[i % copies];
+                    if cell == 0 {
+                        batch.encode(
+                            &norm,
+                            &[(&xn, 0), (&x, 1), (&gain, 2)],
+                            &[],
+                            &[],
+                            &[],
+                            size((rows, 1, 1)),
+                            size((1024, 1, 1)),
+                        );
+                        batch.barrier();
+                    }
+                    let readers = if cell == 0 { &plain } else { &folded };
+                    for (((pso, (grid, threads)), (w, scales, biases)), y) in
+                        readers.iter().zip(copy).zip(&ys)
+                    {
+                        let input = if cell == 0 { &xn } else { &x };
+                        let binds = [
+                            (w, 0),
+                            (scales, 1),
+                            (biases, 2),
+                            (input, 3),
+                            (y, 4),
+                            (&gain, 15),
+                        ];
+                        batch.encode(pso, &binds, &[], &[], &[], size(*grid), size(*threads));
+                    }
+                    batch.barrier();
+                }
+                let t0 = std::time::Instant::now();
+                batch.commit(true);
+                t0.elapsed().as_secs_f64() * 1e6 / iters as f64
+            };
+            let mut samples = [Vec::new(), Vec::new()];
+            for round in 0..=ROUNDS {
+                for (cell, s) in samples.iter_mut().enumerate() {
+                    let us = time(cell);
+                    if round > 0 {
+                        s.push(us);
+                    }
+                }
+            }
+            println!("{name}, {rows} rows (columns {ns:?}):");
+            for (tag, s) in ["norm + plain", "normed"].iter().zip(&mut samples) {
+                s.sort_by(f64::total_cmp);
+                println!(
+                    "    {tag:<14} {:8.1} {:8.1} {:8.1}",
+                    s[0],
+                    s[s.len() / 2],
+                    s[s.len() - 1]
+                );
+            }
+        }
+    }
+}
+
+/// Narrow projections (`n`, `k`): Qwen3.8-27B's GDN `a` / `b` (48 x 5120), Qwen3.6-35B-A3B's
+/// (32 x 2048), and wider ones, to find where the row-parallel fast matvec stops paying
+/// (`quantized::NARROW_MATVEC_COLS`).
+const NARROW_SHAPES: &[(u32, u32)] = &[(48, 5120), (64, 5120), (96, 5120), (128, 5120), (32, 2048)];
+
+/// Dispatches per timed command buffer of `narrow_projection_at_verify_buckets` at up to 32 rows:
+/// enough that its batch, of ~10 µs dispatches, holds the GPU's clock up (at a few hundred the
+/// cells split between two clock bands, 7 and 70 µs).
+const NARROW_ITERS: usize = 2000;
+
+/// A narrow projection by bucket rows (`quantized::narrow_matvec`): the NAX GEMM (one 64 x 64 tile
+/// a threadgroup: at 48 columns ONE threadgroup through 64 rows), the small-M twin, the wide matvec
+/// and the row-parallel fast matvec. µs a dispatch, DRAM-cold, best of `ROUNDS` alternating rounds,
+/// at full width (`/1`) and with four copies between the same barriers (`/4`: a quarter of the
+/// cores, a 10-core base M5 emulated by width on a 40-core M5 Max). NAX devices only.
+#[test]
+#[ignore = "measurement probe, not an assertion: run with --ignored --nocapture"]
+fn narrow_projection_at_verify_buckets() {
+    use scratchy_target_metal::tape::quantized::{
+        NaxDequant, QmmTKernel, SMALL_M_SIMDGROUPS, SMALL_M_TILE_COLS, SmallMTile,
+        qmm_t_dispatch_shape, qmm_t_kernel_static_name, small_m_kernel_static_name,
+    };
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    if !scratchy_target_metal::targets::is_nax_capable(di.profile.generation) {
+        eprintln!("skipping: no NAX matrix unit");
+        return;
+    }
+    let device = di.device.clone();
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
+    let codes = AffineCodes::of(Some(&di.profile), 4);
+    for &(n, k) in NARROW_SHAPES {
+        let bytes = (n * k / 2) as usize;
+        let copies = ROTATED_BYTES / bytes + 1;
+        let groups = (n * k / GROUP) as usize;
+        let weights: Vec<_> = (0..copies)
+            .map(|c| {
+                let codes: Vec<u32> = (0..bytes as u32 / 4)
+                    .map(|i| i.wrapping_mul(2654435761).wrapping_add(c as u32))
+                    .collect();
+                (
+                    shared_slice(&device, &codes),
+                    shared_slice(&device, &bf16_row(groups, 0.002)),
+                    shared_slice(&device, &bf16_row(groups, -0.015)),
+                )
+            })
+            .collect();
+        let x = shared_slice(&device, &bf16_row(2048 * k as usize, 0.5));
+        let ys: Vec<_> = (0..4)
+            .map(|_| shared_zeroed(&device, 2048 * n as usize * 2))
+            .collect();
+        let (k_dim, n_dim) = (KDimI32(k as i32), NDimI32(n as i32));
+        for (width, m) in [1usize, 4]
+            .into_iter()
+            .flat_map(|w| [2u32, 8, 16, 32, 64, 128, 512, 2048].map(|m| (w, m)))
+        {
+            let mut cells = Vec::new();
+            let nax = QmmTKernel::Nax(NaxDequant::Loader);
+            let name = qmm_t_kernel_static_name(
+                nax,
+                DequantDtype::Bf16,
+                ScaleDtype::Bf16,
+                4,
+                GROUP,
+                n.is_multiple_of(64),
+            );
+            let c: Vec<ConstantValue> = AffineQmmTConstants {
+                k: k_dim,
+                n: n_dim,
+                m: MDimI32(m as i32),
+                codes,
+            }
+            .into();
+            let pso =
+                baked_build(&cache, &PipelineKey::new("quantized_qmm_nax", name, c)).expect(name);
+            cells.push(("nax".to_string(), pso, qmm_t_dispatch_shape(nax, m, n, 1)));
+            if let Some(tile) =
+                SmallMTile::for_bucket(m).filter(|_| n.is_multiple_of(SMALL_M_TILE_COLS))
+            {
+                let name =
+                    small_m_kernel_static_name(DequantDtype::Bf16, ScaleDtype::Bf16, GROUP, tile);
+                let c: Vec<ConstantValue> = AffineQmmTConstants {
+                    k: k_dim,
+                    n: n_dim,
+                    m: MDimI32(m as i32),
+                    codes,
+                }
+                .into();
+                let pso = baked_build(&cache, &PipelineKey::new("quantized_qmm_nax", name, c))
+                    .expect(name);
+                cells.push((
+                    "twin".to_string(),
+                    pso,
+                    (
+                        (n / SMALL_M_TILE_COLS, m.div_ceil(tile.rows()), 1),
+                        (32 * SMALL_M_SIMDGROUPS, 1, 1),
+                    ),
+                ));
+            }
+            for kernel in [pick_qmv_kernel_wide(n, k, 4, m, true), QmvKernel::Fast] {
+                let name =
+                    qmv_kernel_static_name(kernel, DequantDtype::Bf16, ScaleDtype::Bf16, 4, GROUP);
+                let c: Vec<ConstantValue> = match kernel {
+                    QmvKernel::Wide { .. } => AffineQmvWideConstants {
+                        k: k_dim,
+                        n: n_dim,
+                        m: MDimI32(m as i32),
+                        codes,
+                    }
+                    .into(),
+                    _ => AffineQmvConstants {
+                        k: k_dim,
+                        n: n_dim,
+                        codes,
+                    }
+                    .into(),
+                };
+                let pso =
+                    baked_build(&cache, &PipelineKey::new("quantized_qmv", name, c)).expect(name);
+                cells.push((
+                    format!("{kernel:?}"),
+                    pso,
+                    qmv_dispatch_shape(kernel, m, n, 1),
+                ));
+            }
+            // Fewer dispatches as rows grow: a batch stays ~10-100 ms.
+            let iters = (NARROW_ITERS * 32 / m.max(32) as usize).max(64);
+            let time = |pso, (grid, threads)| {
+                let mut batch = Mtl4DispatchBatch::begin(&device).expect("mtl4 batch");
+                for i in 0..iters {
+                    // `width` copies between the same barriers: a chip of 1/width the cores.
+                    for c in 0..width {
+                        let (w, scales, biases) = &weights[(i * width + c) % copies];
+                        let binds = [(w, 0), (scales, 1), (biases, 2), (&x, 3), (&ys[c], 4)];
+                        batch.encode(pso, &binds, &[], &[], &[], size(grid), size(threads));
+                    }
+                    batch.barrier();
+                }
+                let t0 = std::time::Instant::now();
+                batch.commit(true);
+                t0.elapsed().as_secs_f64() * 1e6 / iters as f64
+            };
+            let mut best = vec![f64::MAX; cells.len()];
+            for round in 0..=ROUNDS {
+                for (b, (_, pso, shape)) in best.iter_mut().zip(&cells) {
+                    let us = time(pso, *shape);
+                    if round > 0 {
+                        *b = b.min(us);
+                    }
+                }
+            }
+            let mut line = format!("{n}x{k} /{width} m={m:<3}");
+            for ((tag, _, (grid, _)), us) in cells.iter().zip(&best) {
+                line += &format!("  {tag} {grid:?} {us:7.1}");
+            }
+            println!("{line}");
+        }
     }
 }

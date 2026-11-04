@@ -15,7 +15,9 @@ The operands are theirs, in their order:
   the page of block slot `j` of sequence `s`;
 * `mask_by_chunk` `[num_chunks, blocks_per_chunk, num_seqs, 1, 1, block_size]`, their mask with its kv
   axis broadcast (`mask_bs_bb.expand(...)` over `num_kv_heads`), held at one row per (slot, sequence);
-* `out`, whose first `num_seqs` rows the kernel stores (`out[:num_seqs].copy_(attn)`).
+* `out`, whose first `num_seqs` rows the kernel stores (`out[:num_seqs].copy_(attn)`). Row `s` is
+  sequence `s`'s, so a batch's live sequences sit in rows `0..n` and its padded ones after them:
+  `paged_step::batch_sources` stages the rows that way and refuses any other count.
 
 `ROWS_PER_PAGE` is 1, or `num_kv_heads` for a chunk of fewer than 8 entries (below).
 
