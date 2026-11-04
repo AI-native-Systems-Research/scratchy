@@ -14572,6 +14572,7 @@ pub fn emit_model(
                 inferred,
                 &bounds,
                 model,
+                &resolved_metal_consts,
                 crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap()),
                 wp.num_tokens as u32,
             ) {
@@ -15096,7 +15097,7 @@ pub fn emit_model(
         let prefix =
             crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
         let l = match crate::to_wavefront::lower_decode_to_wavefront(
-            fuf, None, inferred, &bounds, model, prefix, m as u32,
+            fuf, None, inferred, &bounds, model, &resolved_metal_consts, prefix, m as u32,
         ) {
             Ok(l) => l,
             // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
