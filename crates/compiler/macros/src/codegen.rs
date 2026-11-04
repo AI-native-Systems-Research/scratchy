@@ -8681,11 +8681,11 @@ fn emit_canonical_params_impl(
                 const NUM_KV_HEADS: u32 = #num_kv_heads_lit;
                 const NUM_GLOBAL_KV_HEADS: u32 = #num_global_kv_heads_lit;
                 assert!(
-                    NUM_KV_HEADS > 0 && NUM_Q_HEADS % NUM_KV_HEADS == 0,
+                    NUM_KV_HEADS > 0 && NUM_Q_HEADS.is_multiple_of(NUM_KV_HEADS),
                     #base_msg
                 );
                 assert!(
-                    NUM_GLOBAL_KV_HEADS > 0 && NUM_Q_HEADS % NUM_GLOBAL_KV_HEADS == 0,
+                    NUM_GLOBAL_KV_HEADS > 0 && NUM_Q_HEADS.is_multiple_of(NUM_GLOBAL_KV_HEADS),
                     #global_msg
                 );
             };
