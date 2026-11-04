@@ -14,7 +14,7 @@
 //! expansion — so the instantiations cannot be emitted by the macro that knows the geometry. They
 //! are emitted by [`build.rs`](../build.rs) instead, which reads the same `config.json` files the
 //! macro will read and writes their geometries out as literal tokens. This module turns those
-//! literals into the two value→const doors the lowering dispatches through.
+//! literals into the value→const door the lowering dispatches through.
 //!
 //! Nothing here is written by hand. Dropping a `config.json` into
 //! `crates/models/arch/<arch>/configs/` re-runs the build script and adds its geometry; there is no
@@ -24,15 +24,13 @@
 //! * [`ModelAttnGeometry`] is the VALUE side — the geometry as the tape carries it, minted once
 //!   from the config numbers with the GQA divisibility proven at the mint, so no consumer
 //!   downstream re-derives or re-checks a group size.
-//! * `with_config_attn_geometry` / [`with_config_head_dim`] are the DOORS — the only places a
-//!   geometry value becomes a const, with the arms the build script generated. Same shape as
-//!   `sdsc_abstract::with_baked_rung`, which is the decode ladder's door. The attention-geometry
-//!   door hands its body the SuperDSC emitter's `AttnGeometry` witness, so it compiles under
-//!   `spyre` only; the head-dim door and the value side compile on every target.
+//! * [`with_config_head_dim`] is the DOOR — the only place a head dim becomes a const, with the
+//!   arms the build script generated. Same shape as `sdsc_abstract::with_baked_rung`, which is the
+//!   decode ladder's door. The door and the value side compile on every target.
 
-// The build script's output: `GEOMETRY_SOURCE_STEMS` plus the two callback macros
-// `for_each_config_attn_geometry!` / `for_each_config_head_dim!`, whose bodies are the literals it
-// parsed out of the model configs. Included before the doors below, which invoke them.
+// The build script's output: `GEOMETRY_SOURCE_STEMS` plus the callback macro
+// `for_each_config_head_dim!`, whose body is the head dims it parsed out of the model configs.
+// Included before the door below, which invokes it.
 include!(concat!(env!("OUT_DIR"), "/config_geometry.rs"));
 
 /// A COUNT along one head axis of a model. Distinct types, so a query-head count cannot be handed
@@ -152,52 +150,8 @@ impl std::fmt::Display for ModelAttnGeometry {
     }
 }
 
-/// What the SDSC lowering runs once its geometry is a const — the consumer side of
-/// [`with_config_attn_geometry`]. The method is generic over the three consts because that is the
-/// whole point of the door: the body receives the geometry AS CONSTS, with the
-/// [`AttnGeometry`](crate::sdsc_abstract::AttnGeometry) witness that spends the divisibility proof,
-/// so every layout term it derives is the compiler's arithmetic.
-///
-/// Only under `spyre`: the witness is the SuperDSC emitter's own type, and the emitter is the
-/// door's only consumer.
-#[cfg(feature = "spyre")]
-pub trait OnAttnGeometry {
-    /// What the dispatch produces.
-    type Out;
-    /// The arm's body, at the geometry the configs declared.
-    fn on_geometry<const NQH: u32, const NKVH: u32, const HD: u32>(
-        self,
-        geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
-    ) -> Self::Out;
-}
-
-/// ⭐ THE VALUE→CONST DOOR FOR A MODEL'S ATTENTION GEOMETRY. The arms are the geometries the build
-/// script parsed out of `crates/models/arch/*/configs/*.json`, one per distinct triple.
-///
-/// `None` is a geometry no config in this workspace declares — the caller refuses the bake, loudly,
-/// naming the geometry and the configs that were read. The fix is a `config.json`, never an edit
-/// here: there is no list in this file to grow.
-#[cfg(feature = "spyre")]
-pub fn with_config_attn_geometry<C: OnAttnGeometry>(
-    geometry: ModelAttnGeometry,
-    consumer: C,
-) -> Option<C::Out> {
-    macro_rules! geometry_arms {
-        ($(($nqh:literal, $nkvh:literal, $hd:literal)),* $(,)?) => {
-            match (geometry.nqh().get(), geometry.nkvh().get(), geometry.hd().get()) {
-                $(($nqh, $nkvh, $hd) => Some(consumer.on_geometry(
-                    crate::sdsc_abstract::AttnGeometry::<$nqh, $nkvh, $hd>::minted(),
-                )),)*
-                _ => None,
-            }
-        };
-    }
-    for_each_config_attn_geometry!(geometry_arms)
-}
-
 /// What a head-dim-parameterised lowering runs once its head dim is a const — the consumer side of
-/// [`with_config_head_dim`], and the same discipline as `OnAttnGeometry` (the attention-geometry
-/// door's, under `spyre`).
+/// [`with_config_head_dim`].
 pub trait OnHeadDim {
     /// What the dispatch produces.
     type Out;
@@ -210,12 +164,16 @@ pub trait OnHeadDim {
 /// `global_head_dim`, and MLA's `qk_rope_head_dim`.
 ///
 /// `None` is a head dim no config declares; the caller refuses, loudly. A model whose rotary runs
-/// at a width this workspace has never seen arrives as a `config.json`, not as an edit here.
+/// at a width this workspace has never seen arrives as a `config.json`, not as an edit here. Each
+/// arm's const passes through [`scratchy_ir::model_facts::HeadDim::new`], so rustc checks the
+/// positive-head-dim law at every instantiation.
 pub fn with_config_head_dim<C: OnHeadDim>(head_dim: HeadDim, consumer: C) -> Option<C::Out> {
     macro_rules! head_dim_arms {
         ($($hd:literal),* $(,)?) => {
             match head_dim.get() {
-                $($hd => Some(consumer.on_head_dim::<$hd>()),)*
+                $($hd => Some(consumer.on_head_dim::<{
+                    scratchy_ir::model_facts::HeadDim::new($hd).get()
+                }>()),)*
                 _ => None,
             }
         };

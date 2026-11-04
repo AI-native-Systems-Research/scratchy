@@ -83,7 +83,7 @@ pub mod placement;
 /// selectors), with the region table and both of its compile-time disjointness proofs. The
 /// producer↔lowering ABI: a caller has to agree with these numbers to bind anything.
 pub mod reserved_tids;
-/// Geometry LAW types (`AttnGeometry` & friends): the typed device facts every address in a
+/// Geometry LAW types (`Rung` & friends): the typed device facts every address in a
 /// descriptor is derived from. Mutually recursive with [`addr`] — that pair is one unit.
 pub mod sdsc_abstract;
 /// The shared build-time error for the SuperDSC emitter. A leaf below [`superdsc_opspec`] so the

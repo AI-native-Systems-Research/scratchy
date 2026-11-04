@@ -7,13 +7,13 @@
 //! expansion, with the runtime playing the emitted statics.
 pub mod constants;
 pub mod continuation_witness;
+pub mod facts;
 pub mod ids;
 pub mod kernel_bindings;
 pub mod kernel_constants;
 pub mod kernel_identity;
 pub mod lowered;
 pub mod lowering;
-pub mod model_consts;
 pub mod quantized;
 pub mod step;
 pub mod targets;

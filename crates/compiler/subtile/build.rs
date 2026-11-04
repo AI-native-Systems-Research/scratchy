@@ -2,7 +2,7 @@
 //! Build script for `scratchy-subtile`.
 //!
 //! Reads every model `config.json` in the workspace and writes the
-//! geometries they declare into `$OUT_DIR/config_geometry.rs` — see
+//! head dims they declare into `$OUT_DIR/config_geometry.rs` — see
 //! [`emit_config_geometry`] and `src/model_geometry.rs`.
 
 fn main() {
@@ -22,16 +22,13 @@ fn main() {
 //
 //  That is what this does. It parses every model config in the workspace, applies the same implicit
 //  derivations the macro's config loader applies (`head_dim` from the MLA summands or from
-//  `hidden_size / num_attention_heads`, `num_key_value_heads` defaulting to `num_attention_heads`),
-//  and writes the resulting geometries out as literal tokens. Dropping a new `config.json` into
+//  `hidden_size / num_attention_heads`), and writes the resulting head dims out as literal tokens.
+//  Dropping a new `config.json` into
 //  `crates/models/arch/<arch>/configs/` re-runs this script and yields a new instantiation, with no
 //  edit to any file a human wrote.
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// One model's attention geometry as its config declares it: query heads, kv heads, head dim.
-type Geometry = (u64, u64, u64);
-
-/// Write `$OUT_DIR/config_geometry.rs` — the literal geometries `src/model_geometry.rs` turns into
+/// Write `$OUT_DIR/config_geometry.rs` — the literal head dims `src/model_geometry.rs` turns into
 /// const-generic instantiations.
 fn emit_config_geometry() {
     // Naming any `rerun-if-changed` turns off cargo's default "re-run on any package change", so
@@ -60,7 +57,6 @@ fn emit_config_geometry() {
     }
 
     let mut stems: Vec<String> = Vec::new();
-    let mut geometries: Vec<Geometry> = Vec::new();
     let mut head_dims: Vec<u64> = Vec::new();
     for dir in &config_dirs {
         let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
@@ -83,49 +79,13 @@ fn emit_config_geometry() {
                 panic!("scratchy-subtile: cannot read {}: {e}", path.display())
             });
             // A malformed config is the config loader's error to report, with its own path and
-            // span. Skipping it here means its geometry is simply absent, and the emitter's door
+            // span. Skipping it here means its head dims are simply absent, and the emitter's door
             // then refuses that model by name — never a wrong instantiation.
             let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
                 continue;
             };
             let bounds = geometry_bounds(&json);
             let mut used = false;
-            if let (Some(&nqh), Some(&nkvh), Some(&hd)) = (
-                bounds.get("num_attention_heads"),
-                bounds.get("num_key_value_heads"),
-                bounds.get("head_dim"),
-            ) {
-                // A pair whose kv-head count does not divide the query-head count has no GQA
-                // grouping, so `AttnGeometry` cannot be named at it — its `GQA` const refuses. Such
-                // a config yields no arm; baking it is then a loud refusal at the door, rather than
-                // a const-evaluation failure that would stop this crate compiling at all.
-                if nqh > 0 && nkvh > 0 && hd > 0 && nqh % nkvh == 0 {
-                    geometries.push((nqh, nkvh, hd));
-                    used = true;
-                }
-            }
-            // The GLOBAL attention class of a per-layer-class model (Gemma-4: global layers run
-            // `global_head_dim` with `num_global_key_value_heads`). The macro's config loader
-            // derives the same defaults (`num_global_key_value_heads` ← `num_key_value_heads`,
-            // `global_head_dim` ← `head_dim`), so a uniform-geometry model reproduces the base
-            // triple here — deduped away — while a dual-class model yields its second triple. The
-            // door must know BOTH: an AttnDecode node carries its own class's geometry, and a
-            // global-class node whose triple has no arm is a bake refusal, not a fallback.
-            let g_kv = bounds
-                .get("num_global_key_value_heads")
-                .or_else(|| bounds.get("num_key_value_heads"));
-            let g_hd = bounds
-                .get("global_head_dim")
-                .or_else(|| bounds.get("head_dim"));
-            #[expect(clippy::collapsible_if)]
-            if let (Some(&nqh), Some(&gkvh), Some(&ghd)) =
-                (bounds.get("num_attention_heads"), g_kv, g_hd)
-            {
-                if nqh > 0 && gkvh > 0 && ghd > 0 && nqh % gkvh == 0 {
-                    geometries.push((nqh, gkvh, ghd));
-                    used = true;
-                }
-            }
             // Every head dim a rotary op of this model can carry. `head_dim` is the decoder's;
             // `global_head_dim` is the second head dim of a per-layer-class model (Gemma-4's global
             // layers), and `qk_rope_head_dim` is MLA's rope width.
@@ -142,8 +102,6 @@ fn emit_config_geometry() {
             }
         }
     }
-    geometries.sort_unstable();
-    geometries.dedup();
     head_dims.sort_unstable();
     head_dims.dedup();
     stems.sort();
@@ -152,25 +110,12 @@ fn emit_config_geometry() {
     let mut out = String::new();
     out.push_str("// @generated by scratchy-subtile/build.rs — DO NOT EDIT.\n");
     out.push_str("// Every literal below was parsed out of a model config.json.\n\n");
-    out.push_str("/// The model stems whose `config.json` produced the geometries below.\n");
+    out.push_str("/// The model stems whose `config.json` produced the head dims below.\n");
     out.push_str("pub const GEOMETRY_SOURCE_STEMS: &[&str] = &[\n");
     for s in &stems {
         out.push_str(&format!("    {s:?},\n"));
     }
     out.push_str("];\n\n");
-
-    // ⭐ THE ATTENTION-GEOMETRY MACRO CARRIES ITS DOOR'S GATE. `with_config_attn_geometry` hands its
-    // body the SuperDSC emitter's `AttnGeometry` witness, so it compiles only under `spyre`; an
-    // ungated macro would be `unused_macros` on a metal/cuda build and fail `-D warnings`. The
-    // attribute is written into the generated file rather than decided here, so the gate is the
-    // crate's own `cfg(feature = "spyre")`, read where the file is compiled.
-    out.push_str("#[cfg(feature = \"spyre\")]\n");
-    out.push_str("macro_rules! for_each_config_attn_geometry {\n");
-    out.push_str("    ($emit:ident) => {\n        $emit! {\n");
-    for (nqh, nkvh, hd) in &geometries {
-        out.push_str(&format!("            ({nqh}, {nkvh}, {hd}),\n"));
-    }
-    out.push_str("        }\n    };\n}\n\n");
 
     out.push_str("macro_rules! for_each_config_head_dim {\n");
     out.push_str("    ($emit:ident) => {\n        $emit! {\n");
@@ -203,7 +148,7 @@ fn arch_root() -> std::path::PathBuf {
             Some(p) => dir = p,
             None => panic!(
                 "scratchy-subtile: no `crates/models/arch` above {} — the emitter's const-generic \
-                 geometries are read from the model configs there",
+                 head dims are read from the model configs there",
                 manifest.display()
             ),
         }
@@ -247,25 +192,6 @@ fn geometry_bounds(json: &serde_json::Value) -> std::collections::BTreeMap<Strin
         && hidden % heads == 0
     {
         flat.insert("head_dim".into(), hidden / heads);
-    }
-    if !flat.contains_key("num_key_value_heads")
-        && let Some(&heads) = flat.get("num_attention_heads")
-    {
-        flat.insert("num_key_value_heads".into(), heads);
-    }
-    // The same per-class defaults `apply_generic_bound_defaults` applies to the macro's own bounds:
-    // a uniform-geometry arch declares neither `global_*` key, and the global class then IS the base
-    // class — default these so the global-geometry arm above dedups onto the base one rather than
-    // being silently absent.
-    if !flat.contains_key("global_head_dim")
-        && let Some(&hd) = flat.get("head_dim")
-    {
-        flat.insert("global_head_dim".to_string(), hd);
-    }
-    if !flat.contains_key("num_global_key_value_heads")
-        && let Some(&kv) = flat.get("num_key_value_heads")
-    {
-        flat.insert("num_global_key_value_heads".to_string(), kv);
     }
     flat
 }
