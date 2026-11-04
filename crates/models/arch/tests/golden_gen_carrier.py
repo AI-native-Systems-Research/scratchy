@@ -2407,10 +2407,15 @@ def write_vision_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, carrier
     return ckpt_dir
 
 
-def forward(fn):
+def forward(fn=None, *, workloads=None, sk_buckets=None):
     """`@forward` under torch is the identity — the decorator carries
-    compile-time metadata only."""
-    return fn
+    compile-time metadata only: bare, or called with the bake's bucket
+    ladder (`workloads`, `sk_buckets`), which shapes no math."""
+    if fn is not None:
+        return fn
+    def deco(f):
+        return f
+    return deco
 
 
 def vision_forward(*, workloads=None, sk_buckets=None, processor=None, pixel_pack=None):
@@ -2597,7 +2602,9 @@ def main():
         # never recomputes an explicit key, so pinning a derived bound
         # changes downstream op classification (gemma3's m=2 tape lost
         # its global-rope ops while the accessor kept `self.rotary`).
-        for k in REDERIVABLE:
+        # Sorted: a set's iteration order varies with each process's string hashing, and this
+        # order is the emitted config.json's.
+        for k in sorted(REDERIVABLE):
             if k in TINY_BOUNDS and k in shrunk:
                 cfg[k] = shrunk[k]
         # gemma4's dual-class geometry: the global q/kv projection widths
