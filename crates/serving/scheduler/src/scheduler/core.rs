@@ -345,9 +345,16 @@ pub struct SimpleBlockTracker {
     /// The next `free_seq` to hand out.
     next_free_seq: u64,
 
-    /// How the worker backs the hybrid path's blocks with memory — declared
-    /// when the tracker is built ([`Self::with_kv_backing`]).
+    /// How the worker backs the KV blocks with memory — declared when the
+    /// tracker is built ([`Self::with_kv_backing`]).
     kv_backing: KvBacking,
+
+    /// Under [`KvBacking::OnFirstUse`] on the uniform path, the blocks freed
+    /// since they were handed out, least recently freed first. A step that named
+    /// a block mapped it, so these are the free blocks the worker has backed, and
+    /// `free_queue` keeps only the never-used ones. Stale entries (the block was
+    /// touched for reuse since) are skipped on pop, as there.
+    backed_free: VecDeque<usize>,
 
     /// Hybrid prefix cache: namespaced per group. `(group_id, block_hash) ->
     /// block_id`. A full group and a sliding group with identical token content
@@ -570,6 +577,7 @@ impl SimpleBlockTracker {
             free_seq: Vec::new(),
             next_free_seq: 1,
             kv_backing: KvBacking::Allocated,
+            backed_free: VecDeque::new(),
             hybrid_hash_to_id: HashMap::new(),
             hybrid_id_to_key: HashMap::new(),
             hybrid_req_hashes: HashMap::new(),
@@ -728,11 +736,13 @@ impl SimpleBlockTracker {
         self
     }
 
-    /// DECLARE HOW THE WORKER BACKS THE HYBRID PATH'S BLOCKS WITH MEMORY. Under
+    /// DECLARE HOW THE WORKER BACKS THE KV BLOCKS WITH MEMORY. Under
     /// [`KvBacking::OnFirstUse`] a never-used block past what the worker last
     /// reported backed ([`KVCacheManagerOps::set_kv_backed`]) is handed out
     /// only once no cached one is left, so the prefix cache never maps memory
-    /// of its own; nothing is backed until the first report.
+    /// of its own; nothing is backed until the first report. The uniform path
+    /// needs no report: a freed block was named by a step, so it is backed,
+    /// and goes before a never-used one ([`Self::allocate_fresh_blocks`]).
     ///
     /// ⛔ DECLARED, NOT INFERRED from whether a report has arrived, which is
     /// false until a step has run (see [`scratchy_core_common::KvAddressing`]).
@@ -1014,6 +1024,14 @@ impl SimpleBlockTracker {
     /// Sharing its budget with recurrent-state snapshots, the pool first maps what the
     /// allocation needs ([`Self::make_room_for_kv`]), and before each pop that would evict a
     /// cached block grows instead while there is room ([`Self::grow_before_evicting`]).
+    ///
+    /// ⭐ A WORKER THAT MAPS ITS KV ON FIRST USE ([`KvBacking::OnFirstUse`]) MAPS IT THROUGH THE
+    /// HIGHEST BLOCK A STEP NAMES, AT LEAST DOUBLING EACH TIME. A never-used block then costs memory
+    /// a freed one does not, so a freed block, cached or not, goes first, least recently freed
+    /// first ([`Self::backed_free`]); a never-used one only once none is left, as the hybrid
+    /// path's `pop_free` does. Without it, distinct prompts one at a time each took fresh IDs, and
+    /// a 36 GB M3 Pro mapped gpt-oss-20b's KV through block 16415, about 262k tokens, and ran out
+    /// of GPU memory.
     fn allocate_fresh_blocks(&mut self, count: usize) -> Option<Vec<usize>> {
         if self.available_blocks() < count {
             return None;
@@ -1023,7 +1041,10 @@ impl SimpleBlockTracker {
         let mut ids = Vec::with_capacity(count);
         while ids.len() < count {
             self.grow_before_evicting();
-            let block_id = self.free_queue.pop_front()?;
+            let block_id = match self.backed_free.pop_front() {
+                Some(b) => b,
+                None => self.free_queue.pop_front()?,
+            };
 
             // Skip stale entries: blocks reclaimed via touch() have ref_cnt > 0, and a granule
             // released to the snapshots leaves its blocks' entries behind.
@@ -1226,6 +1247,17 @@ impl SimpleBlockTracker {
                 "block {b} of released granule {g} is held"
             );
             self.evict_cached(b);
+        }
+    }
+
+    /// The queue a block freed on the uniform path joins: [`Self::backed_free`] under
+    /// [`KvBacking::OnFirstUse`], ahead of the never-used blocks, else `free_queue` with them.
+    /// Not while snapshots share the budget: those map granules of their own (the worker declares
+    /// [`KvBacking::Allocated`] then).
+    fn freed_queue(&mut self) -> &mut VecDeque<usize> {
+        match self.kv_backing {
+            KvBacking::OnFirstUse if self.recurrent.is_none() => &mut self.backed_free,
+            _ => &mut self.free_queue,
         }
     }
 
@@ -2260,7 +2292,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                     self.ref_cnt[bid] -= 1;
                     if self.ref_cnt[bid] == 0 {
                         self.num_free_blocks += 1;
-                        self.free_queue.push_back(bid);
+                        self.freed_queue().push_back(bid);
                         if let Some(rec) = self.recurrent.as_mut() {
                             rec.give_back(bid);
                         }
@@ -2362,7 +2394,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                     self.ref_cnt[bid] -= 1;
                     if self.ref_cnt[bid] == 0 {
                         self.num_free_blocks += 1;
-                        self.free_queue.push_front(bid);
+                        self.freed_queue().push_front(bid);
                         if let Some(rec) = self.recurrent.as_mut() {
                             rec.give_back(bid);
                         }
@@ -4641,6 +4673,80 @@ mod tests {
         tracker.allocate_slots(&req, 32, 0, &[]);
         tracker.free("r1");
         assert!((tracker.usage() - 0.0).abs() < f64::EPSILON);
+    }
+
+    /// Distinct prompts one at a time, as the Metal grid sends them, each 4 blocks. A worker
+    /// that maps its KV on first use (`KvBacking::OnFirstUse`) maps it through the highest block ID
+    /// handed out, so with caching on that is what the requests have needed: a cached block it has
+    /// backed goes before one it would have to map, not 4 fresh blocks per request across the pool.
+    #[test]
+    fn requests_one_at_a_time_reach_only_the_blocks_they_need() {
+        let mut tracker =
+            SimpleBlockTracker::with_caching(1000, 16).with_kv_backing(KvBacking::OnFirstUse);
+        let mut highest = 0;
+        for r in 0..40u32 {
+            let prompt: Vec<u32> = (0..64).map(|t| r * 1000 + t).collect();
+            let req = Request::new(
+                format!("r{r}"),
+                prompt,
+                SamplingParams {
+                    max_tokens: Some(1),
+                    ..Default::default()
+                },
+                1.0,
+                0,
+                0,
+                None,
+            );
+            let groups = tracker.allocate_slots(&req, 64, 0, &[]).unwrap();
+            highest = highest.max(groups[0].iter().copied().max().unwrap());
+            tracker.seal(&req);
+            tracker.free(&req.request_id);
+        }
+        // One request at a time holds 4 blocks. Taking fresh IDs every time, 40 of them reach 159.
+        assert!(highest < 8, "reached block {highest}");
+        // The cache keeps what fits in what is mapped: the last request's prompt is still a hit.
+        let last: Vec<u32> = (0..64).map(|t| 39 * 1000 + t).collect();
+        let again = Request::new(
+            "again".into(),
+            last,
+            SamplingParams {
+                max_tokens: Some(1),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        );
+        assert!(tracker.get_computed_blocks(&again).0 > 0);
+    }
+
+    /// Without a worker that maps on first use, every block is backed from the start, and the
+    /// uniform path keeps vLLM's order: a fresh block before a cached one, so the cache lasts.
+    #[test]
+    fn allocated_kv_keeps_the_cache_ahead_of_fresh_blocks() {
+        let mut tracker = SimpleBlockTracker::with_caching(1000, 16);
+        let mut ids = Vec::new();
+        for r in 0..3u32 {
+            let prompt: Vec<u32> = (0..64).map(|t| r * 1000 + t).collect();
+            let req = Request::new(
+                format!("r{r}"),
+                prompt,
+                SamplingParams {
+                    max_tokens: Some(1),
+                    ..Default::default()
+                },
+                1.0,
+                0,
+                0,
+                None,
+            );
+            ids.extend(tracker.allocate_slots(&req, 64, 0, &[]).unwrap()[0].clone());
+            tracker.seal(&req);
+            tracker.free(&req.request_id);
+        }
+        assert_eq!(ids, (0..12).collect::<Vec<_>>());
     }
 
     #[test]
