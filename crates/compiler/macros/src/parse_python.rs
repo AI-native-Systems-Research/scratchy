@@ -2076,7 +2076,8 @@ mod tests {
             std::fs::read_to_string(root.join("crates/models/arch/dsl/qwen3.py")).unwrap();
         let py_carrier = parse_python_file(&py_text).expect("python parse");
         let py_tokens =
-            crate::compile_carrier(py_carrier, &configs_dir).expect("python-costume pipeline");
+            crate::compile_carrier(py_carrier, &configs_dir, &scratchy_model_facts::StageOne)
+                .expect("python-costume pipeline");
 
         let mut py_rendered = String::with_capacity(1 << 20);
         crate::render_tokens(py_tokens, &mut py_rendered);
@@ -2084,13 +2085,16 @@ mod tests {
         // Non-vacuity guard: model selection reads `CARGO_FEATURE_*`
         // ambient env vars (they belong to the scratchy-models crate,
         // so they are only set when the test is invoked as
-        // `env 'CARGO_FEATURE_QWEN3_0.6B=1' cargo test ...`). Without
-        // this check, an unscoped run emits an EMPTY token stream and
-        // the test passes having verified nothing.
+        // `env 'CARGO_FEATURE_QWEN3_0.6B=1' SCRATCHY_QUANTS= cargo test ...`).
+        // Without this check, an unscoped run emits an EMPTY token stream
+        // and the test passes having verified nothing. The emission's
+        // lowerings run at stage 1's types (the dev-dependency selects
+        // qwen3-0.6b, its quant scope empty), so the run scopes quants the
+        // same way: `SCRATCHY_QUANTS` empty, the dense model alone.
         assert!(
             py_rendered.len() > 100_000,
             "qwen3 emission is {} bytes — model selection filtered everything out. \
-             Run with `env 'CARGO_FEATURE_QWEN3_0.6B=1' cargo test -p \
+             Run with `env 'CARGO_FEATURE_QWEN3_0.6B=1' SCRATCHY_QUANTS= cargo test -p \
              scratchy-forward-compiler-macro --features metal --lib parse_python`",
             py_rendered.len(),
         );

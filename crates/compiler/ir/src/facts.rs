@@ -137,6 +137,11 @@ scalar! {
     NormWeightOffset,
 }
 
+/// The paged-KV block a model is configured with when its config states no `block_size` (vLLM's
+/// default), and the page a kernel keyed by a page size takes on a canonical without attention,
+/// which pages nothing.
+pub const DEFAULT_KV_PAGE: BlockSize = BlockSize::new(16);
+
 /// The MRoPE section split `[T, H, W]`: the rotary pairs the time, height and width axes own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MropeSection([u32; 3]);
@@ -599,4 +604,75 @@ pub trait FactsVisitor {
     type Out;
     /// The visitor's body, at one canonical's facts.
     fn visit<M: ModelFacts>(self) -> Self::Out;
+}
+
+/// ⭐ A BUILD'S CANONICAL TYPES, AS ITS PIPELINE REACHES THEM: `scratchy-model-facts`' `StageOne`.
+/// The pipeline crate is that crate's build-dependency, so it cannot name it; it takes one of
+/// these instead, and runs every lowering that reads a model fact behind a [`FactsVisitor`] at the
+/// canonical's own type.
+pub trait FactsDispatch: Sync {
+    /// Run `visitor` at the facts of canonical `canonical` of arch `arch` (its `configs/<arch>/`
+    /// dir name, `-` → `_`); `None` for a canonical stage 1 did not generate.
+    fn dispatch<V: FactsVisitor>(&self, arch: &str, canonical: &str, visitor: V) -> Option<V::Out>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn geometry(nqh: u32, nkvh: u32, hd: u32, rot: u32) -> HeadGeometry {
+        HeadGeometry::new(
+            QueryHeads::new(nqh),
+            KvHeads::new(nkvh),
+            HeadDim::new(hd),
+            RotDim::new(rot),
+            BlockSize::new(16),
+        )
+    }
+
+    /// The GQA group is divided out once, exactly: qwen2.5-7b's 28 query heads over 4 kv heads
+    /// are groups of 7.
+    #[test]
+    fn a_dividing_kv_head_count_has_its_group() {
+        let g = geometry(28, 4, 128, 128);
+        assert_eq!(g.gqa().get(), 7);
+        assert_eq!((g.q_width(), g.kv_width()), (28 * 128, 4 * 128));
+    }
+
+    /// A kv-head count that does not divide the query heads (29 over 4) has no GQA grouping —
+    /// attention over it would read another head's keys — so it is not a geometry. This is the
+    /// refusal the lowerings no longer make at runtime: no lowering can be handed one.
+    #[test]
+    #[should_panic(expected = "the kv-head count divides the query-head count")]
+    fn a_kv_head_count_that_does_not_divide_has_no_geometry() {
+        geometry(29, 4, 128, 128);
+    }
+
+    /// A rot window wider than its head rotates lanes the head does not have.
+    #[test]
+    #[should_panic(expected = "the rot window fits its head")]
+    fn a_rot_window_wider_than_its_head_has_no_geometry() {
+        geometry(32, 8, 64, 128);
+    }
+
+    /// A zero extent is no extent.
+    #[test]
+    #[should_panic(expected = "KvHeads is a positive quantity")]
+    fn a_zero_kv_head_count_has_no_value() {
+        KvHeads::new(0);
+    }
+
+    /// The two classes of one attention project the same query heads.
+    #[test]
+    #[should_panic(expected = "both classes attend with the same query heads")]
+    fn classes_disagreeing_about_query_heads_are_no_attention() {
+        Attention::new(
+            geometry(32, 8, 64, 64),
+            geometry(16, 8, 64, 64),
+            AttnScale::new(0.125),
+            None,
+            RopePairing::Standard,
+            KvRope::AtWrite,
+        );
+    }
 }

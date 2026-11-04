@@ -100,8 +100,12 @@ fn write_hf_registry_file(out_dir: &Path, ids: &[String]) {
 /// quant scoping (SCRATCHY_QUANTS) is set once in `main` before the fan-out.
 fn emit_arch(target: &CarrierTarget, out_dir: &Path) {
     let mod_name = target.mod_name.as_str();
-    let tokens = compile_carrier(target.carrier(), &target.configs_dir)
-        .unwrap_or_else(|e| panic!("forward pipeline ({mod_name}): {e}"));
+    let tokens = compile_carrier(
+        target.carrier(),
+        &target.configs_dir,
+        &scratchy_model_facts::StageOne,
+    )
+    .unwrap_or_else(|e| panic!("forward pipeline ({mod_name}): {e}"));
     // Re-root the emit under `pub mod <mod>` (see reroot_crate).
     let tokens = reroot_crate(tokens, mod_name);
 

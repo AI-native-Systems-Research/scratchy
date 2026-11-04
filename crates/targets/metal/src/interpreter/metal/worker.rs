@@ -2375,10 +2375,13 @@ mod tests {
         let device = device.device.clone();
         let cache =
             SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
-        let p = crate::tape::model_consts::MetalModelConsts {
-            metal_dtype: MetalDtype::F16,
-            ..crate::tape::model_consts::MetalModelConsts::from_canonical::<TestWeights>()
-        };
+        use crate::tape::facts::fixtures::{TP, TestFacts, facts_type};
+        facts_type!(
+            P = TestFacts {
+                metal_dtype: MetalDtype::F16,
+                ..TP
+            }
+        );
         // Decodes, then verifies (every row sampled), then short prefix-hit chunks, then long
         // chunks.
         let q_lens: Vec<u32> = [
@@ -2408,8 +2411,8 @@ mod tests {
         let width = row_stride.get();
         let bucket_m = 512;
         let slot = crate::tape::ids::ArenaSlotIdx(0);
-        let gather = crate::tape::lowering::gather_sampled_rows_command(&p, slot, row_stride);
-        let scatter = crate::tape::lowering::put_sampled_rows_back_command(&p, slot, row_stride);
+        let gather = crate::tape::lowering::gather_sampled_rows_command::<P>(slot, row_stride);
+        let scatter = crate::tape::lowering::put_sampled_rows_back_command::<P>(slot, row_stride);
         // `(row, the row it holds)`. Gather: row i holds sampled row i.
         // Scatter: sampled row i holds row i. Both: every row holds itself.
         let at = |i: usize| sampled[i] as usize;

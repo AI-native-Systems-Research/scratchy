@@ -22,7 +22,7 @@ cuda = ["dep:scratchy-target-cuda"]
 # `Instruction` variants (`SynthGateUpSiluMul`, `AffineEmbed`) are
 # visible to the macro's match arms — they're gated
 # `#[cfg(feature = "metal")]` in `scratchy-forward-compiler::instr`.
-metal = ["dep:scratchy-ir", "scratchy-ir/metal", 
+metal = ["scratchy-ir/metal",
     "dep:scratchy-target-metal",
     "dep:scratchy-target-metal-compiler",
     "scratchy-forward-compiler/metal",
@@ -64,7 +64,8 @@ turboquant = []
 [dependencies]
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-scratchy-ir = { path = "../ir", optional = true }
+# `FactsVisitor` / `ModelFacts`: every stage-2 lowering is generic over a canonical's facts.
+scratchy-ir = { path = "../ir" }
 scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
 # PD-wavefront (task T2b): the subtile-wavefront IR + lowering +
 # scheduler + host tape player live in this normal (Mac-testable) lib
@@ -101,3 +102,9 @@ scratchy-target-spyre = { path = "../../targets/spyre", default-features = false
 # The IR types the baked program is CONSTRUCTED from — this crate renders them as const tokens, so
 # it names the same types the lowering built. Dependency-free.
 ktir-core = { path = "../../targets/spyre/ktir/ktir-core", optional = true }
+
+[dev-dependencies]
+# The pipeline tests that drive a whole emission need stage 1's canonical types, as the
+# scratchy-models build script does (`StageOne`). A dev-dependency cycle (stage 1 build-depends on
+# this crate), which Cargo allows; the features select the canonicals the test emits.
+scratchy-model-facts = { path = "../../models/facts", features = ["metal", "qwen3-0.6b"] }

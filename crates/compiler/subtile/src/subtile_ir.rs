@@ -614,6 +614,16 @@ impl AttnMask {
             AttnMask::SlidingWindow { window } => Some(window),
         }
     }
+
+    /// ⭐ THE ONE MASK → CLASS LAW: a windowed layer is its model's sliding class, the causal
+    /// mask its full class. Every target selects a layer's head geometry by it
+    /// ([`Attention::class`](scratchy_ir::facts::Attention::class)).
+    pub const fn class(self) -> scratchy_ir::facts::AttnClass {
+        match self {
+            AttnMask::Causal => scratchy_ir::facts::AttnClass::Full,
+            AttnMask::SlidingWindow { .. } => scratchy_ir::facts::AttnClass::Sliding,
+        }
+    }
 }
 
 // ── The mixture-of-experts vocabulary ──────────────────────────────

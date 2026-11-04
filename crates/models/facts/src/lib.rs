@@ -7,7 +7,18 @@
 //! crate as a build-dependency, so every lowering it runs is generic over a model's facts and
 //! monomorphised for the selected canonicals only. See `build.rs`.
 
-use scratchy_ir::facts::FactsVisitor;
+use scratchy_ir::facts::{FactsDispatch, FactsVisitor};
+
+/// This build's canonical types, as the pipeline reaches them: [`dispatch`] behind
+/// [`FactsDispatch`], which the pipeline crate takes (it is this crate's build-dependency, so it
+/// cannot name this one).
+pub struct StageOne;
+
+impl FactsDispatch for StageOne {
+    fn dispatch<V: FactsVisitor>(&self, arch: &str, canonical: &str, visitor: V) -> Option<V::Out> {
+        dispatch(arch, canonical, visitor)
+    }
+}
 
 /// One selected canonical in [`dispatch`]'s table: its key, and the visitor instantiated at its
 /// type.

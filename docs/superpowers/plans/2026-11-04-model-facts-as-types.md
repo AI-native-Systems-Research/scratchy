@@ -43,10 +43,16 @@ alone.
    private fields and a `get()` accessor. `CanonicalParams`' raw consts become `ModelFacts`
    newtype consts. All readers (cuda `eval.rs`, metal runtime) take `.get()` at their own seam.
 2. **Stage-1 crate** + delegated runtime impl: one fill, two stages.
-3. **Metal bake generic over `M`**: `lower_subtile_tape_to_metal`, `bake_bucket_tapes`,
-   `lower_canonical_classed` and the off-tape statics take `M`. All ~290 `p.<field>` reads become
-   `M::<FACT>`. `KvClass` selection becomes a type (`M::Base` / `M::Global` geometry), not a
-   `bool`/mask branch. **`MetalModelConsts` is deleted.**
+3. **Metal bake generic over `M`** (done): `lower_subtile_tape_to_metal`, `bake_bucket_tapes`,
+   `lower_canonical_classed` and the off-tape statics take `M`. Every `p.<field>` read is now
+   `M::<FACT>`. A layer's geometry is `Attention::class(mask.class())`, the one mask → class law
+   in subtile (`AttnMask::class`), with no `is_global` branch. Runtime checks the types now prove
+   are deleted (GQA divisibility in the split and verify paths). A step reading a fact group its
+   canonical lacks is `LoweringError::ModelLacks(Fact)`, never a zero. **`MetalModelConsts` is
+   deleted.** `emit_model` reaches stage 1 through `FactsDispatch` (`scratchy_model_facts::
+   StageOne`), and asserts on every target that stage 1 generated its canonical. Tests lower at
+   test types (`tape::facts::fixtures`: a `TestFacts` record made a type by `facts_type!`;
+   value-parameterized cases are const-generic test types, e.g. `GdnAt<NK, NV, HK, HV, DRAFTS>`).
 4. **Quant facts as types** (`Q: QuantFacts`: affine bits/group, MoE expert widths, scale dtype).
 5. **Spyre onto the same `M`**: `AttnGeometry<NQH, NKVH, HD>` / `Shape<HD, NQH, NKVH, CAP>` /
    `Rung<MQ>` become `Shape<M, R>`. The `build.rs` geometry door in subtile and its config scan

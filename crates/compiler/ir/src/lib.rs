@@ -1099,7 +1099,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// (vLLM's default); per-canonical override only if a model
     /// chooses a different paging size. This is the SLIDING-class block
     /// size on hybrid arches (see [`Self::GLOBAL_BLOCK_SIZE`]).
-    const BLOCK_SIZE: u32 = 16;
+    const BLOCK_SIZE: u32 = facts::DEFAULT_KV_PAGE.get();
 
     /// Paged-KV-cache block stride for the GLOBAL (full-attention) layer
     /// class on hybrid sliding/global arches. vLLM's group-shared KV

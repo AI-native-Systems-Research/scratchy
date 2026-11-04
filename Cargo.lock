@@ -3606,6 +3606,7 @@ dependencies = [
  "rayon",
  "scratchy-forward-compiler",
  "scratchy-ir",
+ "scratchy-model-facts",
  "scratchy-subtile",
  "scratchy-target-cuda",
  "scratchy-target-metal",

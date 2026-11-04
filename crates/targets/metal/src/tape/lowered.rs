@@ -1482,7 +1482,7 @@ pub enum RuntimeBindingKind {
     /// with identity positions (`positions[t] = t`) it lets the unmodified
     /// 1D `rope_append_*`/fused-qkv-rope kernels read the correct row
     /// without an in-kernel band-split (option (b)). The lowering binds it in
-    /// place of the static cos/sin source when `MetalModelConsts::mrope`; the macro
+    /// place of the static cos/sin source when the model states an MRoPE split (`ModelFacts::MROPE_SECTION`); the macro
     /// forward builds + writes it per forward via `ForwardInputs`. 16-byte
     /// placeholder on 1D-rope arches (never bound).
     MropeCosSin,
@@ -2609,10 +2609,34 @@ impl PlayLive {
     }
 }
 
+/// A group of model facts a canonical may lack ([`scratchy_ir::facts::ModelFacts`]'s `Option`s).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fact {
+    /// `ATTENTION`: a decoder's attention.
+    Attention,
+    /// `Attention::window`: the window of a model's sliding layers.
+    SlidingWindow,
+    /// `VISION`: a vision tower's encoder.
+    Vision,
+    /// `GDN`: Gated-DeltaNet layers.
+    Gdn,
+    /// `DRAFTER`: a DFlash2 drafter's geometry.
+    Drafter,
+    /// `INTERMEDIATE_SIZE`: a feed-forward.
+    IntermediateSize,
+    /// `VOCAB_SIZE`: an lm_head.
+    VocabSize,
+    /// `FINAL_LOGIT_SOFTCAP`: a tanh cap on the final logits.
+    FinalLogitSoftcap,
+}
+
 /// Errors produced by the lowering pass. Every step kind lowers (the
 /// match over `MetalStep` is exhaustive), so these are malformed tapes.
 #[derive(Debug)]
 pub enum LoweringError {
+    /// A step reads a group of facts its canonical does not have: the tape and the model's facts
+    /// disagree about what the model is.
+    ModelLacks(Fact),
     /// A `StepRow::Loop` whose body overran the step tape: the body
     /// extended past the end of the slice.
     /// Indicates malformed codegen — every tape the macro produces
@@ -2703,6 +2727,10 @@ pub enum RungScratch {
 impl std::fmt::Display for LoweringError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ModelLacks(fact) => write!(
+                f,
+                "a step reads the model's {fact:?} facts, and its canonical has none"
+            ),
             Self::MalformedLoop {
                 index,
                 count,

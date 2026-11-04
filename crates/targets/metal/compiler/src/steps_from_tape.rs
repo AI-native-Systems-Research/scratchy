@@ -116,6 +116,8 @@ pub enum Refused {
     CodecUnanchored,
     /// A sample-rows step whose construct holds no matmul.
     NoSampledMatmul,
+    /// A gated feed-forward on a canonical whose facts state no feed-forward width.
+    NoIntermediate,
     /// The minted token draw: a spliced Triton kernel only the spyre bake mints, so a
     /// metal tape carries no Sample node by construction — one that does is a wiring bug named
     /// here, not a missing lowering to write.
@@ -443,7 +445,8 @@ pub struct Recording<'a> {
     pub folds: &'a TapeFolds<MetalFusion>,
     pub facts: &'a MetalStepFacts<'a>,
     pub hidden: W,
-    pub intermediate: Inter,
+    /// The feed-forward's inner width; `None` for a canonical without one.
+    pub intermediate: Option<Inter>,
     /// The canonical's rows: its codec guards' realization.
     pub bucket_m: u32,
 }
@@ -1782,7 +1785,9 @@ impl Recording<'_> {
                 Ok(em(step, &[gate_slot, up_slot], &[out], Vec::new()))
             }
             _ => {
-                let step = MetalStep::SiluMul(gate_slot, up_slot, out, self.intermediate);
+                let inter = (self.intermediate)
+                    .ok_or_else(|| canonical_refusal(Refused::NoIntermediate))?;
+                let step = MetalStep::SiluMul(gate_slot, up_slot, out, inter);
                 Ok(em(step, &[gate_slot, up_slot], &[out], Vec::new()))
             }
         }

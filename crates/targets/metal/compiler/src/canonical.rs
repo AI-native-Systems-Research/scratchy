@@ -15,6 +15,7 @@
 
 use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
+use scratchy_ir::facts::ModelFacts;
 use scratchy_subtile::handoff::{LoweredDecode, SlotMap, WeightKind, WeightSlot};
 use scratchy_subtile::kv_codec::{KvCodecError, expand_kv_codec};
 use scratchy_subtile::sample_rows::{ResultRows, SampleRowsError, expand_sample_rows};
@@ -29,7 +30,6 @@ use scratchy_target_metal::op_abi::{
 };
 use scratchy_target_metal::tape::ids::{ArenaSlotIdx, SourceIx};
 use scratchy_target_metal::tape::lowered::Fence;
-use scratchy_target_metal::tape::model_consts::MetalModelConsts;
 use scratchy_target_metal::tape::step::{
     AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, LayerId, MetalStepTape,
     RotaryTables, RowSource,
@@ -287,10 +287,9 @@ fn decode_barriers(t: &Assembled, flags: &[Fence], m: u64) -> usize {
 /// Lower one decode canonical: step tape (its weights interned into the model's `sources`),
 /// colours and arena. `fusions` is the fold table this lowering runs under — the routed band
 /// a chip class takes ([`lower_canonical_classed`]).
-pub fn lower_canonical(
+pub fn lower_canonical<M: ModelFacts>(
     l: &LoweredDecode,
     facts: &MetalStepFacts<'_>,
-    consts: &MetalModelConsts,
     at: CanonicalAt<'_>,
     sources: &mut SourceManifest,
     fusions: &FusionTable<MetalFusion>,
@@ -307,9 +306,9 @@ pub fn lower_canonical(
         return Err(CanonicalRefusal::Guards { bucket });
     }
     // Metal's TurboQuant: the codec steps its declared facts insert.
-    // Only on a model built with it (`MetalModelConsts::kv_codec`): a dense model runs none.
+    // Only on a model built with it (`ModelFacts::KV_CODEC`): a dense model runs none.
     let coded;
-    let l = if consts.kv_codec.is_turboquant() {
+    let l = if M::KV_CODEC.is_turboquant() {
         coded = expand_kv_codec(l, &METAL_KV_CODEC).map_err(CanonicalRefusal::KvCodec)?;
         &coded
     } else {
@@ -339,7 +338,7 @@ pub fn lower_canonical(
         matvec_ends: m <= u64::from(scratchy_target_metal::tape::quantized::QMV_MATVEC_BAND_ROWS),
         matvec_norms: m == 1,
         row_programs: m <= u64::from(scratchy_target_metal::tape::quantized::QMV_MATVEC_BAND_ROWS),
-        hidden_out: consts.spec_drafts > 0,
+        hidden_out: M::SPEC_DRAFTS.is_some(),
     };
     // Metal's barriers drain everything in flight: independent branches run between the same ones.
     // A fused command reads what its fold absorbed and writes its epilogues, so the folds the tape
@@ -388,8 +387,8 @@ pub fn lower_canonical(
         colours: &colours,
         folds: &folds,
         facts,
-        hidden: HiddenSize(consts.hidden_size as u32),
-        intermediate: IntermediateSize(consts.intermediate_size as u32),
+        hidden: HiddenSize(M::HIDDEN_SIZE.get() as u32),
+        intermediate: M::INTERMEDIATE_SIZE.map(|i| IntermediateSize(i.get() as u32)),
         bucket_m: m as u32,
     }
     .records()
@@ -525,14 +524,13 @@ pub struct ClassedCanonical {
 /// target chip decides — its per-threadgroup routing hides behind cores a Max-scale M5 has and a
 /// 10-core one does not (PR #847's A/B and its base-M5 review). A model with no routing ops
 /// cannot tell the bands apart, so it lowers once.
-pub fn lower_canonical_classed(
+pub fn lower_canonical_classed<M: ModelFacts>(
     l: &LoweredDecode,
     facts: &MetalStepFacts<'_>,
-    consts: &MetalModelConsts,
     at: CanonicalAt<'_>,
     sources: &mut SourceManifest,
 ) -> Result<ClassedCanonical, CanonicalRefusal> {
-    let narrow = lower_canonical(l, facts, consts, at, sources, &METAL_FUSIONS_NARROW)?;
+    let narrow = lower_canonical::<M>(l, facts, at, sources, &METAL_FUSIONS_NARROW)?;
     let routed = l
         .input
         .ops
@@ -541,7 +539,7 @@ pub fn lower_canonical_classed(
     if !routed {
         return Ok(ClassedCanonical { narrow, wide: None });
     }
-    let wide = lower_canonical(l, facts, consts, at, sources, &METAL_FUSIONS)?;
+    let wide = lower_canonical::<M>(l, facts, at, sources, &METAL_FUSIONS)?;
     // The bands folding the same step tape (the fold refused at this bucket) need one lowering:
     // `narrow` serves every class.
     let wide = (wide.steps != narrow.steps).then_some(wide);

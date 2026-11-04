@@ -270,7 +270,7 @@ pub enum GuardRun {
 }
 
 /// The runtime gate each codec guard runs under on metal. The codec is the model's, fixed at
-/// build (`MetalModelConsts::kv_codec`): a dense model inserts no codec step, so a coded one's
+/// build (`ModelFacts::KV_CODEC`): a dense model inserts no codec step, so a coded one's
 /// guards only ask whether the step is a decode step.
 pub const METAL_GUARD_GATES: GuardGates<GuardRun> = GuardGates {
     codec: GuardRun::Gated(None),
