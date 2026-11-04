@@ -121,7 +121,7 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         }
         // The un-rotated writer only reads K and V; its K output IS its K operand.
         L::KvAppend { .. } => FRESH.output(A::Operand(OperandIx(0))),
-        L::MatmulTile { .. } | L::VarlenAttention { .. } | L::EncoderAttn { .. } => {
+        L::MatmulTile { .. } | L::VarlenAttention { .. } | L::EncoderAttn => {
             FRESH.reads_across()
         }
         // Splash's drafter: a convolution reads the row before each row of a block, an attention

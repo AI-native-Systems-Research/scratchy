@@ -2285,7 +2285,7 @@ impl Recording<'_> {
                     Vec::new(),
                 )
             }
-            L::EncoderAttn { .. } => {
+            L::EncoderAttn => {
                 let out = out()?;
                 let [q, k, v] = [self.read(i, 0)?, self.read(i, 1)?, self.read(i, 2)?];
                 em(
