@@ -7772,8 +7772,6 @@ fn metal_off_tape_tokens<M: scratchy_ir::facts::ModelFacts>(
 /// its prefix, and drafts over the prefix alone.
 #[cfg(feature = "metal")]
 fn metal_vocab_suffix<M: scratchy_ir::facts::ModelFacts>(
-    program: &Program,
-    fuf: &crate::fuf::Fuf,
     model: &crate::config::ModelParams,
 ) -> Option<scratchy_target_metal::off_tape::VocabSuffix> {
     let (&prefix, &all) = (
@@ -7790,14 +7788,10 @@ fn metal_vocab_suffix<M: scratchy_ir::facts::ModelFacts>(
         })
     };
     let (verify_rows, window) = (bound("spec_verify_rows"), bound("spec_wide_window"));
-    let lm_head = lent_weight_prefix(
-        program,
-        fuf,
-        model,
-        scratchy_forward_compiler::LentWeight::LmHead,
-    )?;
-    let method = &model.quantization.as_ref()?.method;
-    let (group, bits) = crate::quantization::affine_role_widths(program, method, &lm_head, None)?;
+    // The lm_head's affine storage, as the canonical's quantization states it: a head whose
+    // lm_head is stored otherwise drafts over its prefix alone.
+    let lm_head = M::QUANT?.lm_head()?;
+    let (group, bits) = (lm_head.group().get(), lm_head.bits().get());
     let fits = |v: u64| u32::try_from(v).expect("a vocabulary fits u32");
     Some(scratchy_target_metal::off_tape::VocabSuffix {
         prefix: fits(prefix),
@@ -8070,17 +8064,110 @@ fn kv_codec_for(
 /// A canonical's `impl ModelFacts` body: the fill's facts half, from the same arguments
 /// [`emit_model`] passes the fill.
 pub(crate) fn canonical_facts_body(
+    program: &Program,
     model: &ModelParams,
     tp_world_size: u8,
     fuf: &Fuf,
 ) -> TokenStream {
-    emit_canonical_params_impl(
+    let facts = emit_canonical_params_impl(
         model,
         tp_world_size,
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
     )
-    .1
+    .1;
+    let quant = quant_facts(program, fuf, model);
+    quote! {
+        #facts
+        const QUANT: ::core::option::Option<::scratchy_ir::facts::Quantization> = #quant;
+    }
+}
+
+/// A canonical's `QUANT` fact: `None` for a dense canonical; else its embedding table's and
+/// lm_head's MLX-affine storage, and every routed-expert bank's declared projection widths by
+/// layer. These are the quantization facts a bake reads beyond each weight's own storage (which
+/// its op carries), derived here once: the embed's from its op's storage, the lm_head's by
+/// `affine_role_widths` on the prefix it loads from, a bank's by `affine_moe_expert_bits` at the
+/// key a recorder asks (its weight's accessor path joined by `_`, a trailing index dropped; its
+/// unroll index, 0 without one).
+fn quant_facts(program: &Program, fuf: &Fuf, model: &ModelParams) -> TokenStream {
+    use crate::quantization::{StorageFormat, affine_moe_expert_bits, affine_role_widths};
+    use scratchy_subtile::subtile_ir::{ExpertBody, GatedAct, UngatedAct};
+    let Some(qc) = model.quantization.as_ref() else {
+        return quote! { ::core::option::Option::None };
+    };
+    let f = quote! { ::scratchy_ir::facts };
+    let lit = proc_macro2::Literal::u32_unsuffixed;
+    let some_or_none = |t: Option<TokenStream>| match t {
+        Some(t) => quote! { ::core::option::Option::Some(#t) },
+        None => quote! { ::core::option::Option::None },
+    };
+    let storage = |(group, bits): (u32, u32)| {
+        let (group, bits) = (lit(group), lit(bits));
+        quote! { #f::AffineStorage::new(#f::AffineGroupSize::new(#group), #f::AffineBits::new(#bits)) }
+    };
+    let embed =
+        fuf.nodes.iter().find_map(
+            |n| match (n.op, crate::weight_vocab::weight_storage_of(n)) {
+                (OpKind::Embed, Some(StorageFormat::Affine { group_size, bits })) => {
+                    Some((*group_size, *bits))
+                }
+                _ => None,
+            },
+        );
+    let lm_head = lent_weight_prefix(
+        program,
+        fuf,
+        model,
+        scratchy_forward_compiler::LentWeight::LmHead,
+    )
+    .and_then(|prefix| affine_role_widths(program, &qc.method, &prefix, None));
+    let (embed, lm_head) = (
+        some_or_none(embed.map(storage)),
+        some_or_none(lm_head.map(storage)),
+    );
+    let widths = |base: &str, layer: u32, body| {
+        let at = Some(UnrollIndex(u64::from(layer)));
+        let bits = affine_moe_expert_bits(program, &qc.method, base, at, body);
+        let each = bits.map_or([None; 3], |b| b.projections()).map(|w| {
+            some_or_none(w.map(|w| {
+                let w = lit(w);
+                quote! { #f::AffineBits::new(#w) }
+            }))
+        });
+        quote! { [#(#each),*] }
+    };
+    let mut keys: Vec<(String, u32)> = fuf
+        .nodes
+        .iter()
+        .filter(|n| n.op == OpKind::Moe)
+        .filter_map(|n| {
+            n.inputs.iter().find_map(|i| match i {
+                FufInput::Weight { id, index, .. } => Some((*id, *index)),
+                _ => None,
+            })
+        })
+        .map(|(id, index)| {
+            let mut base = program.weights.path(id).join("_");
+            if let Some(pos) = base.rfind('_')
+                && base[pos + 1..].parse::<u32>().is_ok()
+            {
+                base.truncate(pos);
+            }
+            (base, index.map_or(0, |u| u.0 as u32))
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    let experts = keys.iter().map(|(base, layer)| {
+        let gated = widths(base, *layer, ExpertBody::Gated(GatedAct::Silu));
+        let ungated = widths(base, *layer, ExpertBody::Ungated(UngatedAct::Relu2));
+        let layer = lit(*layer);
+        quote! { #f::ExpertWidths::new(#base, #layer, #gated, #ungated) }
+    });
+    quote! {
+        ::core::option::Option::Some(#f::Quantization::new(#embed, #lm_head, &[#(#experts),*]))
+    }
 }
 
 fn emit_canonical_params_impl(
@@ -14494,6 +14581,18 @@ impl scratchy_ir::facts::FactsVisitor for LowerCanonical<'_, '_> {
     }
 }
 
+/// Whether the canonical's embedding table is stored MLX-affine (`Quantization::embed`).
+#[cfg(feature = "metal")]
+struct EmbedAffine;
+
+#[cfg(feature = "metal")]
+impl scratchy_ir::facts::FactsVisitor for EmbedAffine {
+    type Out = bool;
+    fn visit<M: scratchy_ir::facts::ModelFacts>(self) -> bool {
+        matches!(M::QUANT, Some(q) if q.embed().is_some())
+    }
+}
+
 /// The KV cap rungs a canonical bakes: its positions' ladder at its KV page (the config's own; a
 /// canonical without attention pages nothing and takes the default page).
 #[cfg(feature = "metal")]
@@ -14535,8 +14634,6 @@ impl scratchy_ir::facts::FactsVisitor for BakeBucketTapes<'_, '_> {
 /// kernels (argmax, sampler, the MTP / DFlash2 chain).
 #[cfg(feature = "metal")]
 struct OffTapeStatics<'a> {
-    program: &'a Program,
-    fuf: &'a Fuf,
     model: &'a ModelParams,
     logits_width: u64,
     head: Option<(u32, u32)>,
@@ -14546,7 +14643,7 @@ struct OffTapeStatics<'a> {
 impl scratchy_ir::facts::FactsVisitor for OffTapeStatics<'_> {
     type Out = [TokenStream; 2];
     fn visit<M: scratchy_ir::facts::ModelFacts>(self) -> Self::Out {
-        let suffix = metal_vocab_suffix::<M>(self.program, self.fuf, self.model);
+        let suffix = metal_vocab_suffix::<M>(self.model);
         [
             metal_tq_codebook_tokens::<M>(),
             metal_off_tape_tokens::<M>(self.logits_width, self.head, suffix),
@@ -15307,7 +15404,6 @@ pub fn emit_model<D: crate::FactsDispatch>(
         canonical_lowered.iter_mut()
     {
         use crate::weight_bindings::{EmbedStorage, MlpPacking, WeightAbi};
-        use scratchy_target_metal::tape::step as st;
         use scratchy_target_metal_compiler::canonical as mc3;
         let (m, stem) = (canonical.num_tokens, &model.source_stem);
         let bounds = bounds_for_wp(model, *canonical, tp_world_size);
@@ -15330,15 +15426,6 @@ pub fn emit_model<D: crate::FactsDispatch>(
                 continue;
             }
         };
-        let embed_quant = fuf.nodes.iter().find_map(|n| {
-            match (n.op, crate::weight_vocab::weight_storage_of(n)) {
-                (
-                    OpKind::Embed,
-                    Some(crate::quantization::StorageFormat::Affine { group_size, bits }),
-                ) => Some((st::AffineGroupSize(*group_size), st::AffineBits(*bits))),
-                _ => None,
-            }
-        });
         let fused_mlp = l.input.ops.iter().all(|od| {
             !matches!(
                 od.op,
@@ -15363,27 +15450,15 @@ pub fn emit_model<D: crate::FactsDispatch>(
             .into_iter()
             .filter(|b| program.weights.has_subtree(&[b, "shared_expert"]))
             .collect();
-        let quant = model.quantization.as_ref();
-        let widths = |base: &str, layer: st::LayerId, body| {
-            let qc = quant.expect("MoE widths are read for a quantized model only");
-            let at = Some(UnrollIndex(layer.0 as u64));
-            let bits =
-                crate::quantization::affine_moe_expert_bits(program, &qc.method, base, at, body);
-            bits.map_or([None; 3], |b| {
-                b.projections().map(|w| w.map(st::AffineBits))
-            })
-        };
         let facts = mc3::MetalStepFacts {
             weight_paths: &weight_paths,
             dsl_shared_expert_bases: &dsl_shared_expert_bases,
             embed_base: &embed_base,
-            embed_quant,
             mlp: if fused_mlp {
                 mc3::MlpForm::Packed
             } else {
                 mc3::MlpForm::Split
             },
-            moe_expert_bits: quant.map(|_| &widths as &mc3::MoeExpertBits<'_>),
         };
         let buckets: Vec<u64> = (bucket_points.iter().zip(&bucket_canonical))
             .filter(|&(_, c)| c == canonical)
@@ -15428,9 +15503,9 @@ pub fn emit_model<D: crate::FactsDispatch>(
             } else {
                 MlpPacking::Split
             },
-            embed: match embed_quant {
-                Some(_) => EmbedStorage::AffineQuant,
-                None => EmbedStorage::Dense,
+            embed: match canonical_facts.visit(EmbedAffine) {
+                true => EmbedStorage::AffineQuant,
+                false => EmbedStorage::Dense,
             },
         };
         let synth = crate::weight_bindings::from_tape(&l, program, abi)
@@ -16208,8 +16283,6 @@ pub fn emit_model<D: crate::FactsDispatch>(
             (drafts, hidden)
         });
         metal_arena_bytes_statics.extend(canonical_facts.visit(OffTapeStatics {
-            program,
-            fuf,
             model,
             logits_width,
             head,

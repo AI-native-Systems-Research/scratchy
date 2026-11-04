@@ -1782,7 +1782,12 @@ fn run_carrier<D: FactsDispatch>(
                 }
                 out.push(CanonicalFacts {
                     name: sm.mod_name.clone(),
-                    body: codegen::canonical_facts_body(sm.model, sm.tp_world_size, &sm.fuf),
+                    body: codegen::canonical_facts_body(
+                        &sm.prog,
+                        sm.model,
+                        sm.tp_world_size,
+                        &sm.fuf,
+                    ),
                 });
             }
             return Ok(quote! {});

@@ -118,6 +118,11 @@ pub enum Refused {
     NoSampledMatmul,
     /// A gated feed-forward on a canonical whose facts state no feed-forward width.
     NoIntermediate,
+    /// A quantized canonical's shared-fused expert bank whose widths its quantization does not
+    /// declare at this layer: the two build stages disagree about the canonical's banks.
+    UndeclaredExpertWidths {
+        base: String,
+    },
     /// The minted token draw: a spliced Triton kernel only the spyre bake mints, so a
     /// metal tape carries no Sample node by construction — one that does is a wiring bug named
     /// here, not a missing lowering to write.
@@ -447,6 +452,9 @@ pub struct Recording<'a> {
     pub hidden: W,
     /// The feed-forward's inner width; `None` for a canonical without one.
     pub intermediate: Option<Inter>,
+    /// The canonical's quantization (`ModelFacts::QUANT`): its embedding's storage, its expert banks'
+    /// declared widths. `None` for a dense canonical.
+    pub quant: Option<scratchy_ir::facts::Quantization>,
     /// The canonical's rows: its codec guards' realization.
     pub bucket_m: u32,
 }
@@ -940,14 +948,23 @@ impl Recording<'_> {
         };
         let raw = at(st::ExpertWidth::OpUniform(op_bits));
         // A shared-fused projection's own width, as the quantization declares it per layer.
+        // A shared-fused bank of a quantized canonical takes the widths its quantization
+        // declares per layer (`Quantization::experts`, a table the canonical's type carries).
         let declared = match bundle {
-            ExpertBundle::SharedFused => self.facts.moe_expert_bits,
+            ExpertBundle::SharedFused => self.quant,
             ExpertBundle::SwitchGlu | ExpertBundle::Fused | ExpertBundle::GptOss => None,
         };
         let step = match declared {
             None => raw,
-            Some(w) => {
-                let widths = w(&self.base(j, e)?, layer, self.expert_body(j)?);
+            Some(q) => {
+                let base = self.base(j, e)?;
+                let declared = (q.experts(&base, layer.0))
+                    .ok_or_else(|| self.no(j, Refused::UndeclaredExpertWidths { base }))?;
+                let widths = match self.expert_body(j)? {
+                    ExpertBody::Gated(_) => declared.gated(),
+                    ExpertBody::Ungated(_) => declared.ungated(),
+                }
+                .map(|w| w.map(|w| Bits(w.get())));
                 let own = match proj {
                     ExpertProj::Gate => widths[0],
                     ExpertProj::Up => widths[1],
@@ -1066,9 +1083,10 @@ impl Recording<'_> {
         let base = self.facts.embed_base.to_string();
         // The embedding table's rows: a drafter reading its target's table writes its target's.
         let width = st::ActivationWidth::of_cols(self.l.input.sources[e].cols);
-        let (embed, kind) = match self.facts.embed_quant {
-            Some((gs, bits)) => (
-                MetalStep::AffineEmbed(zero, gs, bits, width),
+        let embed_storage = self.quant.and_then(|q| q.embed());
+        let (embed, kind) = match embed_storage {
+            Some(s) => (
+                MetalStep::AffineEmbed(zero, Gs(s.group().get()), Bits(s.bits().get()), width),
                 WeightKind::AffineQuantEmbedding,
             ),
             None => (MetalStep::Embed(zero, width), WeightKind::Embedding),

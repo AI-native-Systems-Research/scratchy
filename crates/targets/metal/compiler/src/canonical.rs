@@ -19,7 +19,6 @@ use scratchy_ir::facts::ModelFacts;
 use scratchy_subtile::handoff::{LoweredDecode, SlotMap, WeightKind, WeightSlot};
 use scratchy_subtile::kv_codec::{KvCodecError, expand_kv_codec};
 use scratchy_subtile::sample_rows::{ResultRows, SampleRowsError, expand_sample_rows};
-use scratchy_subtile::subtile_ir::ExpertBody;
 use scratchy_subtile::tape_colouring::{Colour, ColourCount, ColourError, colour_tape};
 use scratchy_subtile::tape_folding::{FoldError, FusionTable, ModelFoldFacts, fold_tape};
 use scratchy_subtile::wave_schedule::wave_order;
@@ -31,8 +30,7 @@ use scratchy_target_metal::op_abi::{
 use scratchy_target_metal::tape::ids::{ArenaSlotIdx, SourceIx};
 use scratchy_target_metal::tape::lowered::Fence;
 use scratchy_target_metal::tape::step::{
-    AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, LayerId, MetalStepTape,
-    RotaryTables, RowSource,
+    HiddenSize, IntermediateSize, MetalStepTape, RotaryTables, RowSource,
 };
 
 use crate::steps_from_tape::{
@@ -179,17 +177,8 @@ pub struct MetalStepFacts<'a> {
     pub dsl_shared_expert_bases: &'a [String],
     /// The embedding table's accessor base (the embed weight is not a tape source).
     pub embed_base: &'a str,
-    /// The embedding's MLX-affine storage; `None` = dense.
-    pub embed_quant: Option<(AffineGroupSize, AffineBits)>,
     pub mlp: MlpForm,
-    /// A MoE layer's routed-expert projection widths, gate/up/down (`None` = the op's own).
-    /// `None` altogether for an unquantized model: its MoE bits are never repacked.
-    pub moe_expert_bits: Option<&'a MoeExpertBits<'a>>,
 }
-
-/// A MoE layer's routed-expert projection widths, gate/up/down (`None` = the op's own), for the
-/// bank under accessor base `base` at a layer, its projections those of the expert body's form.
-pub type MoeExpertBits<'f> = dyn Fn(&str, LayerId, ExpertBody) -> [Option<AffineBits>; 3] + 'f;
 
 /// Which canonical this is, for the log and the refusals.
 #[derive(Clone, Copy)]
@@ -389,6 +378,7 @@ pub fn lower_canonical<M: ModelFacts>(
         facts,
         hidden: HiddenSize(M::HIDDEN_SIZE.get() as u32),
         intermediate: M::INTERMEDIATE_SIZE.map(|i| IntermediateSize(i.get() as u32)),
+        quant: M::QUANT,
         bucket_m: m as u32,
     }
     .records()

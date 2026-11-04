@@ -526,6 +526,146 @@ impl Drafter {
     }
 }
 
+/// The bits an MLX-affine weight packs each element in: one of the widths the affine kernels are
+/// instantiated for (2, 3, 4, 5, 6, 8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AffineBits(u32);
+
+impl AffineBits {
+    /// The width, refused unless the affine kernels take it.
+    pub const fn new(bits: u32) -> Self {
+        assert!(
+            matches!(bits, 2 | 3 | 4 | 5 | 6 | 8),
+            "AffineBits: an affine width is 2, 3, 4, 5, 6 or 8 bits"
+        );
+        Self(bits)
+    }
+    /// The width as a number.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// The elements an MLX-affine weight shares one scale and bias across: one of the groups the
+/// affine kernels are instantiated for (32, 64, 128).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AffineGroupSize(u32);
+
+impl AffineGroupSize {
+    /// The group, refused unless the affine kernels take it.
+    pub const fn new(group: u32) -> Self {
+        assert!(
+            matches!(group, 32 | 64 | 128),
+            "AffineGroupSize: an affine group is 32, 64 or 128 elements"
+        );
+        Self(group)
+    }
+    /// The group as a number.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// One weight's MLX-affine storage: its group and its width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AffineStorage {
+    group: AffineGroupSize,
+    bits: AffineBits,
+}
+
+impl AffineStorage {
+    /// The storage.
+    pub const fn new(group: AffineGroupSize, bits: AffineBits) -> Self {
+        Self { group, bits }
+    }
+    /// Its group.
+    pub const fn group(self) -> AffineGroupSize {
+        self.group
+    }
+    /// Its width.
+    pub const fn bits(self) -> AffineBits {
+        self.bits
+    }
+}
+
+/// One routed-expert bank's declared projection widths at one layer, as its quantization states
+/// them: `gated` for a gated body (gate, up, down), `ungated` for an ungated one (none, fc1, fc2).
+/// `None` for a projection the quantization declares no width of its own for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExpertWidths {
+    base: &'static str,
+    layer: u32,
+    gated: [Option<AffineBits>; 3],
+    ungated: [Option<AffineBits>; 3],
+}
+
+impl ExpertWidths {
+    /// The widths of bank `base` (its accessor path joined by `_`) at `layer`.
+    pub const fn new(
+        base: &'static str,
+        layer: u32,
+        gated: [Option<AffineBits>; 3],
+        ungated: [Option<AffineBits>; 3],
+    ) -> Self {
+        Self {
+            base,
+            layer,
+            gated,
+            ungated,
+        }
+    }
+    /// Whether these are bank `base`'s at `layer`.
+    pub fn is(self, base: &str, layer: u32) -> bool {
+        self.base == base && self.layer == layer
+    }
+    /// A gated body's projection widths: gate, up, down.
+    pub const fn gated(self) -> [Option<AffineBits>; 3] {
+        self.gated
+    }
+    /// An ungated body's: none, fc1, fc2.
+    pub const fn ungated(self) -> [Option<AffineBits>; 3] {
+        self.ungated
+    }
+}
+
+/// A quantized canonical's quantization: what the bake reads of it beyond each weight's own
+/// storage (which its op carries).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Quantization {
+    embed: Option<AffineStorage>,
+    lm_head: Option<AffineStorage>,
+    experts: &'static [ExpertWidths],
+}
+
+impl Quantization {
+    /// The quantization: the embedding table's and the lm_head's MLX-affine storage (`None`:
+    /// stored otherwise), and every routed-expert bank's declared widths by layer.
+    pub const fn new(
+        embed: Option<AffineStorage>,
+        lm_head: Option<AffineStorage>,
+        experts: &'static [ExpertWidths],
+    ) -> Self {
+        Self {
+            embed,
+            lm_head,
+            experts,
+        }
+    }
+    /// The embedding table's affine storage.
+    pub const fn embed(self) -> Option<AffineStorage> {
+        self.embed
+    }
+    /// The lm_head's affine storage.
+    pub const fn lm_head(self) -> Option<AffineStorage> {
+        self.lm_head
+    }
+    /// Bank `base`'s declared widths at `layer`; `None` for a bank and layer the quantization
+    /// states nothing of.
+    pub fn experts(self, base: &str, layer: u32) -> Option<ExpertWidths> {
+        self.experts.iter().copied().find(|e| e.is(base, layer))
+    }
+}
+
 /// ⭐ ONE CANONICAL'S FACTS. Implemented once per canonical by a generated type; every lowering is
 /// generic over it and reads `M::FACT`.
 pub trait ModelFacts {
@@ -567,6 +707,8 @@ pub trait ModelFacts {
     const TARGET_HIDDEN_WIDTH: HiddenSize;
     /// Whether a head's target routes its verify rows through experts.
     const TARGET_ROUTING: TargetRouting;
+    /// The quantization of a quantized canonical: `None` for a dense one.
+    const QUANT: Option<Quantization>;
 
     /// Every fact, evaluated. An associated const is evaluated only where it is read, so the
     /// generator names this beside each canonical (`const _: () = <T as ModelFacts>::LAWS;`): each
@@ -592,6 +734,7 @@ pub trait ModelFacts {
         let _ = Self::CAPTURE_SLOTS;
         let _ = Self::TARGET_HIDDEN_WIDTH;
         let _ = Self::TARGET_ROUTING;
+        let _ = Self::QUANT;
     };
 }
 
@@ -674,5 +817,37 @@ mod tests {
             RopePairing::Standard,
             KvRope::AtWrite,
         );
+    }
+
+    /// An affine width no kernel is instantiated for is no width.
+    #[test]
+    #[should_panic(expected = "an affine width is 2, 3, 4, 5, 6 or 8 bits")]
+    fn an_affine_width_no_kernel_takes_is_refused() {
+        AffineBits::new(7);
+    }
+
+    /// An affine group no kernel is instantiated for is no group.
+    #[test]
+    #[should_panic(expected = "an affine group is 32, 64 or 128 elements")]
+    fn an_affine_group_no_kernel_takes_is_refused() {
+        AffineGroupSize::new(48);
+    }
+
+    /// A bank's declared widths are found at its own `(base, layer)` and nowhere else: an
+    /// OptiQ-style layer whose down projection is wider than its section default.
+    #[test]
+    fn a_banks_declared_widths_are_found_at_its_own_layer() {
+        const FOUR: Option<AffineBits> = Some(AffineBits::new(4));
+        const EIGHT: Option<AffineBits> = Some(AffineBits::new(8));
+        const EXPERTS: &[ExpertWidths] = &[
+            ExpertWidths::new("mlp", 0, [FOUR; 3], [None, FOUR, FOUR]),
+            ExpertWidths::new("mlp", 1, [FOUR, FOUR, EIGHT], [None, FOUR, EIGHT]),
+        ];
+        let q = Quantization::new(None, None, EXPERTS);
+        let layer1 = q.experts("mlp", 1).expect("layer 1's widths");
+        assert_eq!(layer1.gated(), [FOUR, FOUR, EIGHT]);
+        assert_eq!(layer1.ungated(), [None, FOUR, EIGHT]);
+        assert!(q.experts("mlp", 2).is_none());
+        assert!(q.experts("moe", 0).is_none());
     }
 }

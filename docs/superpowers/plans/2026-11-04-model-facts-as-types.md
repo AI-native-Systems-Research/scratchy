@@ -53,7 +53,15 @@ alone.
    StageOne`), and asserts on every target that stage 1 generated its canonical. Tests lower at
    test types (`tape::facts::fixtures`: a `TestFacts` record made a type by `facts_type!`;
    value-parameterized cases are const-generic test types, e.g. `GdnAt<NK, NV, HK, HV, DRAFTS>`).
-4. **Quant facts as types** (`Q: QuantFacts`: affine bits/group, MoE expert widths, scale dtype).
+4. **Quant facts as types** (done): `ModelFacts::QUANT: Option<Quantization>`, `Some` exactly for
+   a quantized canonical. It holds the embedding table's and the lm_head's `AffineStorage`
+   (`AffineGroupSize` and `AffineBits`, each refused unless a kernel is instantiated for it) and
+   every routed-expert bank's declared widths by `(base, layer)` as a `&'static [ExpertWidths]`
+   table. Stage 1 derives them once, the derivations `emit_model` ran at bake time. The bake reads
+   them off `M`: the recorder's affine embed, its shared-fused expert widths (a missing key is a
+   refusal, not a fallback), the head's vocabulary suffix and the weights struct's embed storage.
+   The `MoeExpertBits` closure over the program and `MetalStepFacts::embed_quant` are deleted. A
+   weight's own storage (each matmul's group and bits) stays on its op, beside its `n`/`k`.
 5. **Spyre onto the same `M`**: `AttnGeometry<NQH, NKVH, HD>` / `Shape<HD, NQH, NKVH, CAP>` /
    `Rung<MQ>` become `Shape<M, R>`. The `build.rs` geometry door in subtile and its config scan
    are deleted, because the stage-1 crate is that door for every fact.

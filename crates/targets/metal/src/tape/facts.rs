@@ -137,6 +137,7 @@ pub(crate) mod fixtures {
         pub(crate) capture_slots: Option<CaptureSlots>,
         pub(crate) target_hidden: HiddenSize,
         pub(crate) target_routing: TargetRouting,
+        pub(crate) quant: Option<scratchy_ir::facts::Quantization>,
     }
 
     /// `facts_type!(Name = record)`: a type whose `ModelFacts` are the record's.
@@ -168,6 +169,7 @@ pub(crate) mod fixtures {
                 const CAPTURE_SLOTS: ::core::option::Option<::scratchy_ir::facts::CaptureSlots> = $facts.capture_slots;
                 const TARGET_HIDDEN_WIDTH: ::scratchy_ir::facts::HiddenSize = $facts.target_hidden;
                 const TARGET_ROUTING: ::scratchy_ir::facts::TargetRouting = $facts.target_routing;
+                const QUANT: ::core::option::Option<::scratchy_ir::facts::Quantization> = $facts.quant;
             }
         };
     }
@@ -295,6 +297,7 @@ pub(crate) mod fixtures {
         capture_slots: None,
         target_hidden: HiddenSize::new(2048),
         target_routing: TargetRouting::Dense,
+        quant: None,
     };
     pub(crate) struct Tp;
     facts_type!(impl[] Tp = TP);
