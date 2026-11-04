@@ -124,6 +124,14 @@ positive! {
     InFeatures(usize),
     /// An MLA width (`kv_lora_rank`, the q/k nope and rope dims, the value head dim).
     MlaDim(usize),
+    /// The rows a head's verify step holds at most (`spec_verify_rows`).
+    VerifyRows(u32),
+    /// The rows a head's wide verify window spans (`spec_wide_window`).
+    WideWindow(u32),
+    /// How many routed experts a MoE layer holds.
+    Experts(u32),
+    /// How many experts each token is routed to.
+    ExpertsPerToken(u32),
 }
 
 scalar! {
@@ -135,6 +143,10 @@ scalar! {
     RmsNormEps,
     /// The offset an RMSNorm adds to its stored gain (`1.0` for a zero-centered gain).
     NormWeightOffset,
+    /// The factor a router multiplies its renormalized scores by (`routed_scaling_factor`).
+    RoutedScale,
+    /// The clamp of a SwiGLU-OAI expert body (`swiglu_limit`, gpt-oss).
+    SwigluLimit,
 }
 
 /// The paged-KV block a model is configured with when its config states no `block_size` (vLLM's
@@ -142,17 +154,60 @@ scalar! {
 /// which pages nothing.
 pub const DEFAULT_KV_PAGE: BlockSize = BlockSize::new(16);
 
-/// The MRoPE section split `[T, H, W]`: the rotary pairs the time, height and width axes own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct MropeSection([u32; 3]);
+/// A rotary embedding's base frequency (`rope_theta`).
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct RopeTheta(f64);
 
-impl MropeSection {
-    /// The split as the config states it.
-    pub const fn new(section: [u32; 3]) -> Self {
-        Self(section)
+impl RopeTheta {
+    /// The base, refused unless finite and positive.
+    pub const fn new(theta: f64) -> Self {
+        assert!(
+            theta.is_finite() && theta > 0.0,
+            "RopeTheta is a finite, positive base"
+        );
+        Self(theta)
+    }
+    /// The base as a number.
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+/// An MRoPE model's rope: the section split `[T, H, W]` (the rotary pairs the time, height and
+/// width axes own) and the base its per-token cos/sin rows are built at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mrope {
+    section: [u32; 3],
+    theta: RopeTheta,
+}
+
+impl Mrope {
+    /// The split and base as the config states them.
+    pub const fn new(section: [u32; 3], theta: RopeTheta) -> Self {
+        Self { section, theta }
     }
     /// The split.
-    pub const fn get(self) -> [u32; 3] {
+    pub const fn section(self) -> [u32; 3] {
+        self.section
+    }
+    /// The base.
+    pub const fn theta(self) -> RopeTheta {
+        self.theta
+    }
+}
+
+/// The positions a model is configured to attend over (`max_position_embeddings`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MaxPositions(u32);
+
+impl MaxPositions {
+    /// The positions, refused at zero.
+    pub const fn new(positions: u32) -> Self {
+        assert!(positions > 0, "MaxPositions is a positive quantity");
+        Self(positions)
+    }
+    /// The positions as a number.
+    pub const fn get(self) -> u32 {
         self.0
     }
 }
@@ -367,32 +422,54 @@ pub struct Vision {
     heads: QueryHeads,
     head_dim: HeadDim,
     in_features: InFeatures,
+    embed: Option<HiddenSize>,
     pairing: VisionRopePairing,
     scale: AttnScale,
+    pool: VisionPool,
+}
+
+/// A vision tower's post-encoder average pool, for a tower that pools (Gemma 3's projector).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VisionPool {
     patch_grid_side: Option<PatchGridSide>,
-    pool_kernel: Option<PoolKernel>,
+    kernel: Option<PoolKernel>,
+}
+
+impl VisionPool {
+    /// The pool: the patch grid's side, and its kernel (= stride).
+    pub const fn new(patch_grid_side: Option<PatchGridSide>, kernel: Option<PoolKernel>) -> Self {
+        Self {
+            patch_grid_side,
+            kernel,
+        }
+    }
 }
 
 impl Vision {
-    /// The encoder's facts.
+    /// The encoder's facts: `embed` is the tower's own width (`vision_embed_dim`), for a tower whose
+    /// config states one.
     pub const fn new(
         heads: QueryHeads,
         head_dim: HeadDim,
         in_features: InFeatures,
+        embed: Option<HiddenSize>,
         pairing: VisionRopePairing,
         scale: AttnScale,
-        patch_grid_side: Option<PatchGridSide>,
-        pool_kernel: Option<PoolKernel>,
+        pool: VisionPool,
     ) -> Self {
         Self {
             heads,
             head_dim,
             in_features,
+            embed,
             pairing,
             scale,
-            patch_grid_side,
-            pool_kernel,
+            pool,
         }
+    }
+    /// The tower's own width: what its patch embedding and position embeddings write.
+    pub const fn embed(self) -> Option<HiddenSize> {
+        self.embed
     }
     /// The encoder's heads (plain MHA: as many kv heads as query heads).
     pub const fn heads(self) -> QueryHeads {
@@ -420,11 +497,11 @@ impl Vision {
     }
     /// The patch grid's side, for a tower that pools after its encoder.
     pub const fn patch_grid_side(self) -> Option<PatchGridSide> {
-        self.patch_grid_side
+        self.pool.patch_grid_side
     }
     /// The post-encoder pool's kernel.
     pub const fn pool_kernel(self) -> Option<PoolKernel> {
-        self.pool_kernel
+        self.pool.kernel
     }
 }
 
@@ -491,6 +568,154 @@ impl Gdn {
     }
 }
 
+/// Which config key names a MoE's routed experts, and so how its router scores them: Mixtral's
+/// `num_local_experts` (top-k, then softmax over the chosen), GLM-4's `n_routed_experts` (sigmoid
+/// keys with a bias), Qwen's `num_experts` (softmax over every expert, then top-k).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RouterKind {
+    /// `num_local_experts`.
+    Mixtral,
+    /// `n_routed_experts`.
+    GlmSigmoid,
+    /// `num_experts`.
+    QwenShared,
+}
+
+/// Whether a router renormalizes its top-k scores (`norm_topk_prob`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TopKScores {
+    /// The scores as routed.
+    AsRouted,
+    /// The top-k scores renormalized to sum to one.
+    Renormalized,
+}
+
+/// The activation a MoE's routed experts apply between their projections, as the config declares
+/// it (`mlp_hidden_act`, else `hidden_act`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExpertActivation {
+    /// A gated SiLU bank: `silu(gate · x) * (up · x)`.
+    GatedSilu,
+    /// Nemotron-H's ungated relu² `SwitchMLP`: `relu(up · x)²`.
+    UngatedRelu2,
+}
+
+/// How a MoE's router scores and weights its experts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MoeRouter {
+    kind: RouterKind,
+    scores: TopKScores,
+    routed_scale: Option<RoutedScale>,
+}
+
+impl MoeRouter {
+    /// The router; `routed_scale` is `None` for the identity scale.
+    pub const fn new(
+        kind: RouterKind,
+        scores: TopKScores,
+        routed_scale: Option<RoutedScale>,
+    ) -> Self {
+        Self {
+            kind,
+            scores,
+            routed_scale,
+        }
+    }
+}
+
+/// What a MoE's routed experts compute between their projections.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MoeBody {
+    activation: Option<ExpertActivation>,
+    swiglu_limit: Option<SwigluLimit>,
+}
+
+impl MoeBody {
+    /// The body: `activation` is `None` for one the config declares and no expert body realizes
+    /// (a MoE step that reads it refuses); `swiglu_limit` the clamp a config states.
+    pub const fn new(
+        activation: Option<ExpertActivation>,
+        swiglu_limit: Option<SwigluLimit>,
+    ) -> Self {
+        Self {
+            activation,
+            swiglu_limit,
+        }
+    }
+}
+
+/// A mixture-of-experts layer's facts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Moe {
+    experts: Experts,
+    per_token: ExpertsPerToken,
+    intermediate: IntermediateSize,
+    shared_intermediate: Option<IntermediateSize>,
+    router: MoeRouter,
+    body: MoeBody,
+}
+
+impl Moe {
+    /// The MoE, refused when it routes each token to more experts than it holds.
+    pub const fn new(
+        experts: Experts,
+        per_token: ExpertsPerToken,
+        intermediate: IntermediateSize,
+        shared_intermediate: Option<IntermediateSize>,
+        router: MoeRouter,
+        body: MoeBody,
+    ) -> Self {
+        assert!(
+            per_token.get() <= experts.get(),
+            "Moe: a token is routed to no more experts than the layer holds"
+        );
+        Self {
+            experts,
+            per_token,
+            intermediate,
+            shared_intermediate,
+            router,
+            body,
+        }
+    }
+    /// The routed experts.
+    pub const fn experts(self) -> Experts {
+        self.experts
+    }
+    /// The experts each token is routed to.
+    pub const fn per_token(self) -> ExpertsPerToken {
+        self.per_token
+    }
+    /// A routed expert's intermediate width (`moe_intermediate_size`, else `intermediate_size`).
+    pub const fn intermediate(self) -> IntermediateSize {
+        self.intermediate
+    }
+    /// The shared expert's intermediate width, for a MoE with one.
+    pub const fn shared_intermediate(self) -> Option<IntermediateSize> {
+        self.shared_intermediate
+    }
+    /// How the router scores the experts.
+    pub const fn router(self) -> RouterKind {
+        self.router.kind
+    }
+    /// Whether the router renormalizes its top-k scores.
+    pub const fn scores(self) -> TopKScores {
+        self.router.scores
+    }
+    /// The factor the renormalized scores are multiplied by; `None` for the identity.
+    pub const fn routed_scale(self) -> Option<RoutedScale> {
+        self.router.routed_scale
+    }
+    /// The experts' activation; `None` for a declared one no expert body realizes.
+    pub const fn activation(self) -> Option<ExpertActivation> {
+        self.body.activation
+    }
+    /// The SwiGLU-OAI clamp, for a MoE whose config states one.
+    pub const fn swiglu_limit(self) -> Option<SwigluLimit> {
+        self.body.swiglu_limit
+    }
+}
+
 /// A DFlash2 drafter's own geometry (Splash's `DFlashDraftLayout`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Drafter {
@@ -523,6 +748,57 @@ impl Drafter {
     /// `dflash_config.mask_token_id`: what its block's proposal rows embed.
     pub const fn mask_token(self) -> TokenId {
         self.mask_token
+    }
+}
+
+/// A head drafting over a prefix of its target's vocabulary: its own logits are the prefix, and
+/// a pass reads the rest of its target's lm_head past it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VocabPrefix {
+    prefix: VocabSize,
+    target: VocabSize,
+    verify_rows: VerifyRows,
+    window: WideWindow,
+}
+
+impl VocabPrefix {
+    /// The head's prefix of its target's vocabulary, refused unless it is a proper prefix.
+    pub const fn new(
+        prefix: VocabSize,
+        target: VocabSize,
+        verify_rows: VerifyRows,
+        window: WideWindow,
+    ) -> Self {
+        assert!(
+            prefix.get() < target.get(),
+            "a VocabPrefix is shorter than its target's vocabulary"
+        );
+        Self {
+            prefix,
+            target,
+            verify_rows,
+            window,
+        }
+    }
+    /// The head's own vocabulary (`vocab_size`).
+    pub const fn prefix(self) -> VocabSize {
+        self.prefix
+    }
+    /// Its target's vocabulary (`target_vocab_size`).
+    pub const fn target(self) -> VocabSize {
+        self.target
+    }
+    /// The rows of its target's lm_head past the prefix.
+    pub const fn suffix_rows(self) -> usize {
+        self.target.get() - self.prefix.get()
+    }
+    /// The rows a suffix pass reads at most (`spec_verify_rows`).
+    pub const fn verify_rows(self) -> VerifyRows {
+        self.verify_rows
+    }
+    /// The rows of the wide verify window (`spec_wide_window`).
+    pub const fn window(self) -> WideWindow {
+        self.window
     }
 }
 
@@ -683,8 +959,8 @@ pub trait ModelFacts {
     const NORM_WEIGHT_OFFSET: NormWeightOffset;
     /// The tanh cap on the final logits.
     const FINAL_LOGIT_SOFTCAP: Option<SoftCap>;
-    /// The MRoPE split, for a model whose rope reads per-axis positions.
-    const MROPE_SECTION: Option<MropeSection>;
+    /// The MRoPE split and base, for a model whose rope reads per-axis positions.
+    const MROPE: Option<Mrope>;
     /// How the KV cache is stored.
     const KV_CODEC: KvCodec;
     /// The layers holding KV, when not every layer does.
@@ -709,6 +985,14 @@ pub trait ModelFacts {
     const TARGET_ROUTING: TargetRouting;
     /// The quantization of a quantized canonical: `None` for a dense one.
     const QUANT: Option<Quantization>;
+    /// The mixture-of-experts layers' facts, for a model with routed experts.
+    const MOE: Option<Moe>;
+    /// The positions the model attends over, for a model whose config states them.
+    const MAX_POSITIONS: Option<MaxPositions>;
+    /// The rows a head's verify step holds at most, for a head.
+    const SPEC_VERIFY_ROWS: Option<VerifyRows>;
+    /// A head's prefix of its target's vocabulary, for a head drafting over one.
+    const VOCAB_PREFIX: Option<VocabPrefix>;
 
     /// Every fact, evaluated. An associated const is evaluated only where it is read, so the
     /// generator names this beside each canonical (`const _: () = <T as ModelFacts>::LAWS;`): each
@@ -722,7 +1006,7 @@ pub trait ModelFacts {
         let _ = Self::RMS_NORM_EPS;
         let _ = Self::NORM_WEIGHT_OFFSET;
         let _ = Self::FINAL_LOGIT_SOFTCAP;
-        let _ = Self::MROPE_SECTION;
+        let _ = Self::MROPE;
         let _ = Self::KV_CODEC;
         let _ = Self::KV_CACHE_LAYERS;
         let _ = Self::METAL_DTYPE;
@@ -735,6 +1019,10 @@ pub trait ModelFacts {
         let _ = Self::TARGET_HIDDEN_WIDTH;
         let _ = Self::TARGET_ROUTING;
         let _ = Self::QUANT;
+        let _ = Self::MOE;
+        let _ = Self::MAX_POSITIONS;
+        let _ = Self::SPEC_VERIFY_ROWS;
+        let _ = Self::VOCAB_PREFIX;
     };
 }
 
@@ -849,5 +1137,17 @@ mod tests {
         assert_eq!(layer1.ungated(), [None, FOUR, EIGHT]);
         assert!(q.experts("mlp", 2).is_none());
         assert!(q.experts("moe", 0).is_none());
+    }
+
+    /// A head whose vocabulary is its target's whole vocabulary drafts over no prefix.
+    #[test]
+    #[should_panic(expected = "a VocabPrefix is shorter than its target's vocabulary")]
+    fn a_prefix_as_long_as_its_targets_vocabulary_is_refused() {
+        VocabPrefix::new(
+            VocabSize::new(262_144),
+            VocabSize::new(262_144),
+            VerifyRows::new(8),
+            WideWindow::new(16),
+        );
     }
 }

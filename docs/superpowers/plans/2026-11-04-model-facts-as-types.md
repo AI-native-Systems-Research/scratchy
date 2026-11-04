@@ -62,7 +62,26 @@ alone.
    refusal, not a fallback), the head's vocabulary suffix and the weights struct's embed storage.
    The `MoeExpertBits` closure over the program and `MetalStepFacts::embed_quant` are deleted. A
    weight's own storage (each matmul's group and bits) stays on its op, beside its `n`/`k`.
-5. **Spyre onto the same `M`**: `AttnGeometry<NQH, NKVH, HD>` / `Shape<HD, NQH, NKVH, CAP>` /
+5. **Every stage around the metal lowering reads `M`** (done; review on #1081):
+   - The DSL→tape bridge (`lower_decode_to_wavefront<M>`) runs behind `FactsDispatch`: eps is
+     `M::RMS_NORM_EPS`, the scale and the per-op geometry come from `M::ATTENTION`'s classes, the
+     sliding window from `Attention::window` (`attention_mask::<M>`). The `f32::NAN` scale
+     stand-in, `geom_pair`, `sliding_window_bound` and `NoHeadGrouping` are deleted; an attention
+     or MoE tile on a model without the group is `BridgeError::NoAttention` / `NoMoe`.
+   - `ModelFacts::MOE: Option<Moe>`: experts, experts a token (≤ experts), the expert and shared
+     widths, the router (`RouterKind`, `TopKScores`, routed scale) and the body (activation,
+     gpt-oss's swiglu limit). The bridge's MoE arms fill the ops from it; its `RouterFlavor`
+     copy of the router kind is deleted.
+   - `emit_model` reads `M` for the KV cap ladder (`M::MAX_POSITIONS`, `kv_cap_ladder::<M>`; a
+     pool-reading model without positions is `ModelLacks(Fact::MaxPositions)`), a drafter's
+     result bucket (`M::DRAFTER`, `M::SPEC_VERIFY_ROWS`), every extern buffer's bytes
+     (`ExternExtents`: vision, target hidden, multimodal splice, MRoPE rows, draft capture), the
+     terminal row's width and the MRoPE rows' section, theta and rot window. Metal's
+     `ids::MaxPositions` copy is deleted.
+   - What stays a value: the per-op geometry and scale on the subtile attention ops
+     (`ModelAttnGeometry`), now minted only from `M`. Metal never reads them; spyre's
+     const-geometry door and the host reference do, so the carrier goes with phase 6.
+6. **Spyre onto the same `M`**: `AttnGeometry<NQH, NKVH, HD>` / `Shape<HD, NQH, NKVH, CAP>` /
    `Rung<MQ>` become `Shape<M, R>`. The `build.rs` geometry door in subtile and its config scan
    are deleted, because the stage-1 crate is that door for every fact.
 

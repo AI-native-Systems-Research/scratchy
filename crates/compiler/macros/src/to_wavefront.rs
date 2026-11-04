@@ -53,9 +53,8 @@ use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::quantization::StorageFormat;
 use crate::shape::Inferred;
-use crate::weight_vocab::{
-    WeightKind, WeightSlot, attention_scale_for, eval_shape_with, gemm_nk_from_fuf,
-};
+use crate::weight_vocab::{WeightKind, WeightSlot, eval_shape_with, gemm_nk_from_fuf};
+use scratchy_ir::facts::{AttnClass, ExpertActivation, ModelFacts, Moe, RouterKind, TopKScores};
 
 /// Why a FUF couldn't be lowered to a wavefront `LoweringInput`. Always
 /// surfaced (logged by the drive), never papered over.
@@ -81,15 +80,10 @@ pub enum BridgeError {
     MissingScalar { key: &'static str },
     /// A required integer bound (e.g. `head_dim`) was absent.
     MissingBound { key: &'static str },
-    /// The config's kv-head count does not divide its query-head count, so the model has no GQA
-    /// grouping at all. Refused HERE, at the one place the three numbers are read, rather than
-    /// papered over downstream by a `max(1)` that yields a group size whose attention reads another
-    /// head's keys — fluent wrong output, never a fault.
-    NoHeadGrouping {
-        num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-    },
+    /// An attention tile on a body whose facts state no attention (`ModelFacts::ATTENTION`).
+    NoAttention { tile: TileId, op: OpKind },
+    /// A MoE tile on a model whose facts state no MoE (`ModelFacts::MOE`).
+    NoMoe { tile: TileId, op: OpKind },
     /// The FUF produced no result op (empty, or the last tile wasn't a
     /// value-producing op).
     NoResult,
@@ -110,7 +104,7 @@ pub enum BridgeError {
     /// or the front-end swap silently drops coverage the solver had.
     NoMetalRealization { tile: TileId, detail: &'static str },
     /// A MoE's config declares an expert activation no expert body realizes.
-    UnrealizedExpertActivation { tile: TileId, act: String },
+    UnrealizedExpertActivation { tile: TileId },
 }
 
 impl BridgeError {
@@ -147,15 +141,15 @@ impl std::fmt::Display for BridgeError {
             }
             Self::MissingScalar { key } => write!(f, "model scalar `{key}` missing"),
             Self::MissingBound { key } => write!(f, "config bound `{key}` missing"),
-            Self::NoHeadGrouping {
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-            } => write!(
+            Self::NoAttention { tile, op } => write!(
                 f,
-                "config declares num_attention_heads={num_q_heads}, \
-                 num_key_value_heads={num_kv_heads}, head_dim={head_dim} — the kv-head count does \
-                 not divide the query-head count, so this model has no GQA grouping to emit"
+                "tile {} op {op:?}: an attention tile, and the model's facts state no attention",
+                tile.0
+            ),
+            Self::NoMoe { tile, op } => write!(
+                f,
+                "tile {} op {op:?}: a MoE tile, and the model's facts state no MoE",
+                tile.0
             ),
             Self::NoResult => write!(f, "FUF produced no result op"),
             Self::UnknownGainConvention { tile, offset } => write!(
@@ -167,10 +161,10 @@ impl std::fmt::Display for BridgeError {
             Self::NoMetalRealization { tile, detail } => {
                 write!(f, "tile {}: {detail}", tile.0)
             }
-            Self::UnrealizedExpertActivation { tile, act } => write!(
+            Self::UnrealizedExpertActivation { tile } => write!(
                 f,
-                "tile {} moe_block: the config declares expert activation `{act}`, which no \
-                 expert body realizes (a gated `silu` bank or an ungated `relu2` one)",
+                "tile {} moe_block: the config declares an expert activation no expert body \
+                 realizes (a gated `silu` bank or an ungated `relu2` one)",
                 tile.0
             ),
             Self::UnsupportedWeight { tile, detail } => {
@@ -267,7 +261,8 @@ struct Builder<'a> {
     /// grouping already proven, rather than three integers this builder could pair up wrongly.
     geom: Option<ModelAttnGeometry>,
     eps: f32,
-    scale: f32,
+    /// The attention's softmax scale; `None` for a body without attention.
+    scale: Option<scratchy_ir::facts::AttnScale>,
     m: u32,
     /// Modeled prefix length for the KV-cache `Source` rows (structural;
     /// the host eval / GPU player binds the real length at run time).
@@ -277,20 +272,6 @@ struct Builder<'a> {
     /// The construct being expanded, while its ops are pushed.
     expanding: Option<ExpansionId>,
     expansions: u32,
-}
-
-/// Which config key names the routed experts, and which routing math orders the top-k — the
-/// discriminator `moe_block`'s expansion reads off the model bounds. Mirrors the ISel impls'
-/// `applies_to` gates (Mixtral / Qwen / GLM-4), so bridge and solver can never disagree on the
-/// family a config belongs to.
-enum RouterFlavor {
-    /// `num_local_experts` — top-k then softmax over the chosen (Mixtral).
-    Mixtral,
-    /// `num_experts` — softmax over every expert, then top-k (Qwen; renorm per config).
-    QwenShared,
-    /// `n_routed_experts` — sigmoid + e_score_correction_bias keys pick the top-k, the unbiased
-    /// sigmoids gathered as scores (GLM-4 / DeepSeek-V3 `noaux_tc` at `n_group = 1`).
-    GlmSigmoid,
 }
 
 /// The expert half of a MoE block, which every router shares.
@@ -531,30 +512,38 @@ impl<'a> Builder<'a> {
     }
 }
 
-/// The sliding window extent every sliding-attention tile reads — the one
-/// source every target already trusts (`model.bounds["sliding_window"]`).
-/// A sliding tile on a model with no such bound is a config error, named
-/// here so it cannot become a default window that silently attends the
-/// wrong span.
-fn sliding_window_bound(
-    tile: TileId,
-    model: &ModelParams,
-    op: OpKind,
-) -> Result<std::num::NonZeroU32, BridgeError> {
-    Ok(
-        std::num::NonZeroU32::new(model.bounds.get("sliding_window").copied().ok_or(
-            BridgeError::MalformedOp {
-                tile,
-                op,
-                detail: "a sliding-attention tile, but the model config carries no \
-                         `sliding_window` bound",
-            },
-        )? as u32)
-        .expect(
-            "`sliding_window` = 0 is not a window; NonZeroU32::new returns None \
-             only for 0, and a config with 0 is malformed",
-        ),
-    )
+/// The expert body a MoE's declared activation is: never a default the checkpoint did not state
+/// (a relu² bank read as gated SiLU computes garbage).
+fn expert_body(tile: TileId, moe: Moe) -> Result<ExpertBody, BridgeError> {
+    use scratchy_subtile::subtile_ir::{GatedAct, UngatedAct};
+    match moe.activation() {
+        Some(ExpertActivation::GatedSilu) => Ok(ExpertBody::Gated(GatedAct::Silu)),
+        Some(ExpertActivation::UngatedRelu2) => Ok(ExpertBody::Ungated(UngatedAct::Relu2)),
+        None => Err(BridgeError::UnrealizedExpertActivation { tile }),
+    }
+}
+
+/// The mask of an attention tile of kind `op`: a sliding kind's is its model's sliding window
+/// (`Attention::window`), every other kind's the causal mask. A sliding tile on a model that
+/// states no window is named here, so it cannot become a default window that silently attends
+/// the wrong span.
+fn attention_mask<M: ModelFacts>(tile: TileId, op: OpKind) -> Result<AttnMask, BridgeError> {
+    match op {
+        OpKind::SlidingAttention
+        | OpKind::SinkSlidingAttention
+        | OpKind::SharedSlidingAttention => {
+            let window =
+                (M::ATTENTION.and_then(|a| a.window())).ok_or(BridgeError::MalformedOp {
+                    tile,
+                    op,
+                    detail: "a sliding-attention tile, but the model states no sliding window",
+                })?;
+            let window = std::num::NonZeroU32::new(window.get())
+                .expect("an AttnWindow is positive (its constructor's law)");
+            Ok(AttnMask::SlidingWindow { window })
+        }
+        _ => Ok(AttnMask::Causal),
+    }
 }
 
 /// Pull the kv-cache extern's layer index out of an attention /
@@ -620,7 +609,7 @@ impl PrefixCapacity {
 /// `prefix_len` ([`PrefixCapacity`]) models the KV-cache prefix rows for the
 /// attention `Source` segments (structural only — the real length binds at run
 /// time); the decode and prefill bundles of one model MUST share it.
-pub fn lower_decode_to_wavefront(
+pub fn lower_decode_to_wavefront<M: ModelFacts>(
     fuf: &Fuf,
     // `None` = tape-authoritative mode (M2b step 3): the walk needs no
     // solver assignment — `Some` adds the coverage sanity check the
@@ -635,19 +624,10 @@ pub fn lower_decode_to_wavefront(
     // Unwrap the typed capacity to the raw row count once, at the boundary; the
     // rest of the bridge keeps using a plain `u32`.
     let prefix_len = prefix_len.get();
-    // The SAME eps resolver instruction selection uses (rms_norm_eps →
-    // layer_norm_eps → vision_norm_eps → the 1e-5 default) — one
-    // source of truth, always resolvable.
-    let eps = crate::codegen::rms_norm_eps(model);
-    // Encoder/LayerNorm-class canonicals may omit head_dim; the scale
-    // is only consumed at attention ops — default NaN and refuse there.
-    let scale = if model.bounds.contains_key("head_dim")
-        || model.scalars.contains_key("query_pre_attn_scalar")
-    {
-        attention_scale_for(model)
-    } else {
-        f32::NAN
-    };
+    // The model's facts, off its type: the norm epsilon, and the attention's scale and classes.
+    let eps = M::RMS_NORM_EPS.get();
+    let attention = M::ATTENTION;
+    let scale = attention.map(|a| a.scale());
     let mut b = bounds.clone();
     // num_tokens (= query rows m): 1 = decode, >1 = batched prefill. The op row
     // dim threads through OpDesc.m / the EmbeddedHidden + cos_sin sources — NOT
@@ -655,68 +635,22 @@ pub fn lower_decode_to_wavefront(
     // overriding the bound + m here yields a valid m-row graph.
     let m = num_tokens.max(1);
     b.insert("num_tokens".into(), m as u64);
-    // ⭐ THE PARSE BOUNDARY from the model's `config.json` to the head geometry as a value. The
-    // three numbers are read here, once, and immediately fused into one `ModelAttnGeometry` whose
-    // mint divides out the GQA group size and refuses a kv-head count that does not divide the
-    // query-head count. Downstream — the tape, the lowering, the device addresses — never sees them
-    // apart again, and never re-divides.
-    // Attention geometry is OPTIONAL at entry: vision canonicals carry
-    // no head_dim and never reach the decode-attention arms (which
-    // refuse on None).
-    let geom_pair: Option<(ModelAttnGeometry, Option<ModelAttnGeometry>)> =
-        if b.contains_key("head_dim") {
-            let head_dim = HeadDim::new(b["head_dim"] as u32);
-            let num_q_heads = QueryHeads::new(b.get("num_attention_heads").copied().ok_or(
-                BridgeError::MissingBound {
-                    key: "num_attention_heads",
-                },
-            )? as u32);
-            let num_kv_heads = KvHeads::new(b.get("num_key_value_heads").copied().ok_or(
-                BridgeError::MissingBound {
-                    key: "num_key_value_heads",
-                },
-            )? as u32);
-            let geom = ModelAttnGeometry::mint(num_q_heads, num_kv_heads, head_dim).ok_or(
-                BridgeError::NoHeadGrouping {
-                    num_q_heads: num_q_heads.get(),
-                    num_kv_heads: num_kv_heads.get(),
-                    head_dim: head_dim.get(),
-                },
-            )?;
-            let geom_global = {
-                let g_hd = b.get("global_head_dim").copied().map(|v| v as u32);
-                let g_kv = b
-                    .get("num_global_key_value_heads")
-                    .copied()
-                    .map(|v| v as u32);
-                match (g_hd, g_kv) {
-                    (Some(g_hd), Some(g_kv))
-                        if g_hd != head_dim.get() || g_kv != num_kv_heads.get() =>
-                    {
-                        Some(
-                            ModelAttnGeometry::mint(
-                                num_q_heads,
-                                KvHeads::new(g_kv),
-                                HeadDim::new(g_hd),
-                            )
-                            .ok_or(BridgeError::NoHeadGrouping {
-                                num_q_heads: num_q_heads.get(),
-                                num_kv_heads: g_kv,
-                                head_dim: g_hd,
-                            })?,
-                        )
-                    }
-                    _ => None,
-                }
-            };
-            Some((geom, geom_global))
-        } else {
-            None
-        };
-    let (geom, geom_global) = match geom_pair {
-        Some((g, gg)) => (Some(g), gg),
-        None => (None, None),
+    // The head geometry the ops carry, from the attention's classes: the sliding (base) class's,
+    // and the full class's where it differs (Gemma 4's 512 × 2 kv heads beside 256 × 8). A body
+    // without attention (a vision tower) has none, and never reaches an attention arm.
+    let carried = |g: scratchy_ir::facts::HeadGeometry| {
+        ModelAttnGeometry::mint(
+            QueryHeads::new(g.q_heads().get()),
+            KvHeads::new(g.kv_heads().get()),
+            HeadDim::new(g.head_dim().get()),
+        )
+        .expect("a HeadGeometry's kv heads divide its query heads (its constructor's law)")
     };
+    let geom = attention.map(|a| carried(a.class(AttnClass::Sliding)));
+    let geom_global = attention
+        .map(|a| (a.class(AttnClass::Sliding), a.class(AttnClass::Full)))
+        .filter(|(s, f)| (s.head_dim(), s.kv_heads()) != (f.head_dim(), f.kv_heads()))
+        .map(|(_, full)| carried(full));
     let mut bx = Builder {
         fuf,
         model,
@@ -1050,7 +984,7 @@ pub fn lower_decode_to_wavefront(
                 } else {
                     bx.geom_global.or(bx.geom)
                 }
-                .ok_or(BridgeError::MissingBound { key: "head_dim" })?
+                .ok_or(BridgeError::NoAttention { tile, op: node.op })?
                 .hd();
                 let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
                 let (cos_k, sin_k) = bx.cos_sin(k_cols, local_rope);
@@ -1100,7 +1034,7 @@ pub fn lower_decode_to_wavefront(
             OpKind::KvAppend => {
                 let head_dim = bx
                     .geom
-                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?
+                    .ok_or(BridgeError::NoAttention { tile, op: node.op })?
                     .hd();
                 let k = bx.input_at(tile, 0)?;
                 let v = bx.input_at(tile, 1)?;
@@ -1137,9 +1071,7 @@ pub fn lower_decode_to_wavefront(
             | OpKind::SlidingAttention
             | OpKind::SinkAttention
             | OpKind::SinkSlidingAttention => {
-                if bx.scale.is_nan() {
-                    return Err(BridgeError::MissingBound { key: "head_dim" });
-                }
+                let scale = (bx.scale).ok_or(BridgeError::NoAttention { tile, op: node.op })?;
                 let is_sink = matches!(
                     node.op,
                     OpKind::SinkAttention | OpKind::SinkSlidingAttention
@@ -1174,17 +1106,13 @@ pub fn lower_decode_to_wavefront(
                             detail: "sink attention requires a kv_cache — decoder-only op",
                         });
                     }
-                    if bx.scale.is_nan() {
-                        return Err(BridgeError::MissingBound { key: "head_dim" });
-                    }
                     let k = bx.input_at(tile, 1)?;
                     let v = bx.input_at(tile, 2)?;
                     let idx = bx.push_op(
                         SubOp::EncoderAttn {
-                            geom: bx
-                                .geom
-                                .ok_or(BridgeError::MissingBound { key: "head_dim" })?,
-                            scale: bx.scale,
+                            geom: (bx.geom)
+                                .ok_or(BridgeError::NoAttention { tile, op: node.op })?,
+                            scale: scale.get(),
                         },
                         vec![q, k, v],
                     );
@@ -1200,27 +1128,11 @@ pub fn lower_decode_to_wavefront(
                 // row arrives via the separate k/v segments). The GPU mask
                 // binds the real length from the runtime DecodePosition arg.
                 let valid_len = bx.prefix_len;
-                // ⭐ THE WINDOW SIZE, from the model's own bounds (the
-                // helper's doc states the law). A placeholder `1` on the
-                // causal arms never escapes the mask construction below.
-                let window = if matches!(
-                    node.op,
-                    OpKind::SlidingAttention | OpKind::SinkSlidingAttention
-                ) {
-                    sliding_window_bound(tile, bx.model, node.op)?
-                } else {
-                    // Causal: unused below; a placeholder value that never escapes.
-                    std::num::NonZeroU32::new(1).expect("1 is nonzero")
-                };
-                let mask = match node.op {
-                    OpKind::SlidingAttention | OpKind::SinkSlidingAttention => {
-                        AttnMask::SlidingWindow { window }
-                    }
-                    _ => AttnMask::Causal,
-                };
+                // The mask, the model's window on a sliding tile (`attention_mask`).
+                let mask = attention_mask::<M>(tile, node.op)?;
                 let base_geom = bx
                     .geom
-                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?;
+                    .ok_or(BridgeError::NoAttention { tile, op: node.op })?;
                 let geom = match mask {
                     AttnMask::Causal => bx.geom_global.unwrap_or(base_geom),
                     AttnMask::SlidingWindow { .. } => base_geom,
@@ -1244,7 +1156,7 @@ pub fn lower_decode_to_wavefront(
                     attn_inputs.push(s);
                 }
                 let idx = bx.push_op(
-                    SubOp::attn_decode(geom, scale, valid_len, mask),
+                    SubOp::attn_decode(geom, scale.get(), valid_len, mask),
                     attn_inputs,
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
@@ -1254,7 +1166,7 @@ pub fn lower_decode_to_wavefront(
             OpKind::RopeQuery => {
                 let head_dim = bx
                     .geom
-                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?
+                    .ok_or(BridgeError::NoAttention { tile, op: node.op })?
                     .hd();
                 let q = bx.input_at(tile, 0)?;
                 let q_cols = bx.out_cols(tile, 0, "rope_query q cols")?;
@@ -1278,31 +1190,18 @@ pub fn lower_decode_to_wavefront(
             // shared_attention(q, kv_cache[layer], block_table): AttnDecode over the cache's
             // prefix segments alone — the step appends no K/V.
             OpKind::SharedAttention | OpKind::SharedSlidingAttention => {
-                if bx.scale.is_nan() {
-                    return Err(BridgeError::MissingBound { key: "head_dim" });
-                }
+                let scale = (bx.scale).ok_or(BridgeError::NoAttention { tile, op: node.op })?;
                 let q = bx.input_at(tile, 0)?;
                 let layer = kv_cache_index(node).ok_or(BridgeError::MalformedOp {
                     tile,
                     op: node.op,
                     detail: "shared attention missing kv_cache extern index",
                 })?;
-                // ⭐ THE WINDOW SIZE — the same bound the attention arm
-                // reads (`sliding_window_bound`); a placeholder `1` on the
-                // causal arm never escapes the mask construction below.
-                let window = if matches!(node.op, OpKind::SharedSlidingAttention) {
-                    sliding_window_bound(tile, bx.model, node.op)?
-                } else {
-                    // Causal: unused below; a placeholder value that never escapes.
-                    std::num::NonZeroU32::new(1).expect("1 is nonzero")
-                };
-                let mask = match node.op {
-                    OpKind::SharedSlidingAttention => AttnMask::SlidingWindow { window },
-                    _ => AttnMask::Causal,
-                };
+                // The mask, as the attention arm states it (`attention_mask`).
+                let mask = attention_mask::<M>(tile, node.op)?;
                 let base_geom = bx
                     .geom
-                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?;
+                    .ok_or(BridgeError::NoAttention { tile, op: node.op })?;
                 let geom = match mask {
                     AttnMask::Causal => bx.geom_global.unwrap_or(base_geom),
                     AttnMask::SlidingWindow { .. } => base_geom,
@@ -1312,7 +1211,7 @@ pub fn lower_decode_to_wavefront(
                 // and the cache this attention reads is its own class's.
                 let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
                 let idx = bx.push_op(
-                    SubOp::attn_decode(geom, bx.scale, bx.prefix_len, mask),
+                    SubOp::attn_decode(geom, scale.get(), bx.prefix_len, mask),
                     vec![q, InputRef::Ext(pk), InputRef::Ext(pv)],
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
@@ -1376,7 +1275,7 @@ pub fn lower_decode_to_wavefront(
             OpKind::DraftAttention | OpKind::DraftContextKv => {
                 let head_dim = bx
                     .geom
-                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?
+                    .ok_or(BridgeError::NoAttention { tile, op: node.op })?
                     .hd();
                 let layer = node
                     .inputs
@@ -1502,53 +1401,22 @@ pub fn lower_decode_to_wavefront(
                         op: OpKind::Moe,
                         detail: "moe_block without a weight input",
                     })?;
-                let b = &bx.bounds;
-                // Variant discriminators mirror the metal impls'
-                // applies_to: Mixtral = num_local_experts; Qwen-shared =
-                // num_experts; GLM-4 = n_routed_experts with Qwen-style
-                // on-disk naming (switch_mlp + shared_experts), routed
-                // sigmoid+bias (DeepSeek's noaux_tc at n_group=1).
-                let (router_flavor, num_experts) = if let Some(&n) = b.get("num_local_experts") {
-                    (RouterFlavor::Mixtral, n as u32)
-                } else if let Some(&n) = b.get("n_routed_experts") {
-                    (RouterFlavor::GlmSigmoid, n as u32)
-                } else if let Some(&n) = b.get("num_experts") {
-                    (RouterFlavor::QwenShared, n as u32)
-                } else {
-                    return Err(BridgeError::MissingBound { key: "num_experts" });
-                };
-                let top_k =
-                    b.get("num_experts_per_tok")
-                        .copied()
-                        .ok_or(BridgeError::MissingBound {
-                            key: "num_experts_per_tok",
-                        })? as u32;
-                let moe_inter = b
-                    .get("moe_intermediate_size")
-                    .or_else(|| b.get("intermediate_size"))
-                    .copied()
-                    .ok_or(BridgeError::MissingBound {
-                        key: "moe_intermediate_size",
-                    })? as u32;
-                let shared_inter = b
-                    .get("shared_expert_intermediate_size")
-                    .copied()
-                    .unwrap_or(0) as u32;
-                let norm_topk = b.get("norm_topk_prob").copied().unwrap_or(0) != 0;
+                // The model's MoE facts: its router's kind (Mixtral = num_local_experts; Qwen-shared
+                // = num_experts; GLM-4 = n_routed_experts with Qwen-style on-disk naming,
+                // switch_mlp + shared_experts, routed sigmoid+bias as DeepSeek's noaux_tc at
+                // n_group=1), its counts and widths.
+                let moe = M::MOE.ok_or(BridgeError::NoMoe { tile, op: node.op })?;
+                let (router_flavor, num_experts) = (moe.router(), moe.experts().get());
+                let top_k = moe.per_token().get();
+                let moe_inter = moe.intermediate().get() as u32;
+                let norm_topk = moe.scores() == TopKScores::Renormalized;
                 // The experts' body is the config's declared activation's: never a default the
                 // checkpoint did not state (a relu² bank read as gated SiLU computes garbage).
-                let body = bx.model.expert_activation.body().map_err(|act| {
-                    let act = act.to_string();
-                    BridgeError::UnrealizedExpertActivation { tile, act }
-                })?;
+                let body = expert_body(tile, moe)?;
                 // noaux_tc's `routed_scaling_factor` multiplies the renormalized scores last
-                // (mlx `group_expert_select`); 1.0 (GLM-4.5) is the identity and emits nothing.
-                let routed_scale = bx
-                    .model
-                    .scalars
-                    .get("routed_scaling_factor")
-                    .map(|&f| f as f32)
-                    .filter(|&f| f != 1.0);
+                // (mlx `group_expert_select`); the identity (GLM-4.5's 1.0) is no fact, and emits
+                // nothing.
+                let routed_scale = moe.routed_scale().map(|s| s.get());
                 let (group_size, bits) = match crate::weight_vocab::weight_storage_of(node) {
                     Some(crate::quantization::StorageFormat::Affine { group_size, bits }) => {
                         (*group_size, *bits)
@@ -1567,29 +1435,33 @@ pub fn lower_decode_to_wavefront(
                 // Nemotron-H: sigmoid+bias keys pick the top-k, the UNBIASED sigmoids gathered,
                 // renormalised and scaled by the routed scaling factor.
                 let (router, bundle) = match router_flavor {
-                    RouterFlavor::QwenShared | RouterFlavor::GlmSigmoid => {
+                    RouterKind::QwenShared | RouterKind::GlmSigmoid => {
                         (RouterBundle::SharedFused, ExpertBundle::SharedFused)
                     }
-                    RouterFlavor::Mixtral => (RouterBundle::Fused, ExpertBundle::Fused),
+                    RouterKind::Mixtral => (RouterBundle::Fused, ExpertBundle::Fused),
                 };
                 bx.expand();
                 let lg = bx.push_op(SubOp::RouterLogits { experts, router }, vec![x, w]);
-                let shared = std::num::NonZeroU32::new(shared_inter)
-                    .filter(|_| !matches!(router_flavor, RouterFlavor::Mixtral));
+                let shared = (moe.shared_intermediate())
+                    .filter(|_| !matches!(router_flavor, RouterKind::Mixtral))
+                    .map(|s| {
+                        std::num::NonZeroU32::new(s.get() as u32)
+                            .expect("an IntermediateSize is positive (its constructor's law)")
+                    });
                 let lg = match router_flavor {
-                    RouterFlavor::QwenShared => bx.push(SubOp::RouteSoftmax, &[lg]),
-                    RouterFlavor::GlmSigmoid => bx.push_op(
+                    RouterKind::QwenShared => bx.push(SubOp::RouteSoftmax, &[lg]),
+                    RouterKind::GlmSigmoid => bx.push_op(
                         SubOp::RouteSigmoidBias { router },
                         vec![InputRef::Op(lg), w],
                     ),
-                    RouterFlavor::Mixtral => lg,
+                    RouterKind::Mixtral => lg,
                 };
                 let indices = bx.route_top_k(lg, k);
                 let scores = bx.push(SubOp::RouteGatherScores, &[lg, indices]);
                 let scores = match (router_flavor, norm_topk) {
-                    (RouterFlavor::QwenShared, true) => bx.push(SubOp::RouteRenorm, &[scores]),
-                    (RouterFlavor::QwenShared, false) => scores,
-                    (RouterFlavor::GlmSigmoid, norm) => {
+                    (RouterKind::QwenShared, true) => bx.push(SubOp::RouteRenorm, &[scores]),
+                    (RouterKind::QwenShared, false) => scores,
+                    (RouterKind::GlmSigmoid, norm) => {
                         let scores = match norm {
                             true => bx.push(SubOp::RouteRenorm, &[scores]),
                             false => scores,
@@ -1599,7 +1471,7 @@ pub fn lower_decode_to_wavefront(
                             None => scores,
                         }
                     }
-                    (RouterFlavor::Mixtral, _) => bx.push(SubOp::RouteSoftmax, &[scores]),
+                    (RouterKind::Mixtral, _) => bx.push(SubOp::RouteSoftmax, &[scores]),
                 };
                 let hidden = bx.out_cols(tile, 0, "moe_block output")?;
                 let experts = Experts {
@@ -1732,26 +1604,10 @@ pub fn lower_decode_to_wavefront(
                 let expert_src = |bx: &mut Builder, tensor: BundleTensor, rows: u32, cols: u32| {
                     bundle_src(bx, ew.0, ew.1, tensor, rows, cols)
                 };
-                let b = &bx.bounds;
-                let num_experts = b
-                    .get("num_experts")
-                    .or_else(|| b.get("num_local_experts"))
-                    .copied()
-                    .ok_or(BridgeError::MissingBound { key: "num_experts" })?
-                    as u32;
-                let top_k =
-                    b.get("num_experts_per_tok")
-                        .copied()
-                        .ok_or(BridgeError::MissingBound {
-                            key: "num_experts_per_tok",
-                        })? as u32;
-                let moe_inter = b
-                    .get("moe_intermediate_size")
-                    .or_else(|| b.get("intermediate_size"))
-                    .copied()
-                    .ok_or(BridgeError::MissingBound {
-                        key: "moe_intermediate_size",
-                    })? as u32;
+                // The model's MoE facts: its counts and the experts' width.
+                let moe = M::MOE.ok_or(BridgeError::NoMoe { tile, op: node.op })?;
+                let (num_experts, top_k) = (moe.experts().get(), moe.per_token().get());
+                let moe_inter = moe.intermediate().get() as u32;
                 // The EXPERT bundle's storage — the SECOND weight edge in
                 // DSL order (router first, switch_glu second); mixed-bit
                 // presets quantize the router differently. Mirrors the
@@ -1848,26 +1704,10 @@ pub fn lower_decode_to_wavefront(
                         op: OpKind::GptOssMoe,
                         detail: "gptoss_moe without a weight input",
                     })?;
-                let b = &bx.bounds;
-                let num_experts =
-                    b.get("num_local_experts")
-                        .copied()
-                        .ok_or(BridgeError::MissingBound {
-                            key: "num_local_experts",
-                        })? as u32;
-                let top_k =
-                    b.get("num_experts_per_tok")
-                        .copied()
-                        .ok_or(BridgeError::MissingBound {
-                            key: "num_experts_per_tok",
-                        })? as u32;
-                let moe_inter = b
-                    .get("moe_intermediate_size")
-                    .or_else(|| b.get("intermediate_size"))
-                    .copied()
-                    .ok_or(BridgeError::MissingBound {
-                        key: "moe_intermediate_size",
-                    })? as u32;
+                // The model's MoE facts: its counts and the experts' width.
+                let moe = M::MOE.ok_or(BridgeError::NoMoe { tile, op: node.op })?;
+                let (num_experts, top_k) = (moe.experts().get(), moe.per_token().get());
+                let moe_inter = moe.intermediate().get() as u32;
                 let (group_size, bits) = match crate::weight_vocab::weight_storage_of(node) {
                     Some(crate::quantization::StorageFormat::Affine { group_size, bits }) => {
                         (*group_size, *bits)
@@ -1886,14 +1726,12 @@ pub fn lower_decode_to_wavefront(
                 // refused here at build time rather than silently computed
                 // with the wrong clamp. The upgrade path if a second consumer
                 // appears is a `CanonicalParams` scalar.
-                let limit = bx.model.scalars.get("swiglu_limit").copied().ok_or(
-                    BridgeError::MalformedOp {
-                        tile,
-                        op: OpKind::GptOssMoe,
-                        detail: "gptoss_moe requires a `swiglu_limit` config scalar",
-                    },
-                )?;
-                if limit != 7.0 {
+                let limit = moe.swiglu_limit().ok_or(BridgeError::MalformedOp {
+                    tile,
+                    op: OpKind::GptOssMoe,
+                    detail: "gptoss_moe requires a `swiglu_limit` config scalar",
+                })?;
+                if limit.get() != 7.0 {
                     return Err(BridgeError::MalformedOp {
                         tile,
                         op: OpKind::GptOssMoe,

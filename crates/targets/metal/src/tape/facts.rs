@@ -107,8 +107,8 @@ pub(crate) mod fixtures {
     use scratchy_ir::facts::{
         Attention, AttnScale, AttnWindow, BlockSize, CaptureSlots, ConvDim, ConvKernel, Drafter,
         Gdn, GdnHeadDim, GdnHeads, HeadDim, HeadGeometry, HiddenSize, IntermediateSize, KvHeads,
-        KvLayers, KvRope, MropeSection, NormWeightOffset, NumDrafts, QueryHeads, RmsNormEps,
-        RopePairing, RotDim, ScaleDtype, SoftCap, TargetRouting, Vision, VocabSize,
+        KvLayers, KvRope, Mrope, NormWeightOffset, NumDrafts, QueryHeads, RmsNormEps, RopePairing,
+        RotDim, ScaleDtype, SoftCap, TargetRouting, Vision, VocabSize,
     };
     use scratchy_ir::facts::{AttnClass, ModelFacts};
     use scratchy_ir::{KvCodec, TqBits};
@@ -125,7 +125,7 @@ pub(crate) mod fixtures {
         pub(crate) eps: RmsNormEps,
         pub(crate) norm_offset: NormWeightOffset,
         pub(crate) final_softcap: Option<SoftCap>,
-        pub(crate) mrope: Option<MropeSection>,
+        pub(crate) mrope: Option<Mrope>,
         pub(crate) kv_codec: KvCodec,
         pub(crate) kv_layers: Option<KvLayers>,
         pub(crate) metal_dtype: MetalDtype,
@@ -138,6 +138,10 @@ pub(crate) mod fixtures {
         pub(crate) target_hidden: HiddenSize,
         pub(crate) target_routing: TargetRouting,
         pub(crate) quant: Option<scratchy_ir::facts::Quantization>,
+        pub(crate) moe: Option<scratchy_ir::facts::Moe>,
+        pub(crate) max_positions: Option<scratchy_ir::facts::MaxPositions>,
+        pub(crate) verify_rows: Option<scratchy_ir::facts::VerifyRows>,
+        pub(crate) vocab_prefix: Option<scratchy_ir::facts::VocabPrefix>,
     }
 
     /// `facts_type!(Name = record)`: a type whose `ModelFacts` are the record's.
@@ -157,7 +161,7 @@ pub(crate) mod fixtures {
                 const RMS_NORM_EPS: ::scratchy_ir::facts::RmsNormEps = $facts.eps;
                 const NORM_WEIGHT_OFFSET: ::scratchy_ir::facts::NormWeightOffset = $facts.norm_offset;
                 const FINAL_LOGIT_SOFTCAP: ::core::option::Option<::scratchy_ir::facts::SoftCap> = $facts.final_softcap;
-                const MROPE_SECTION: ::core::option::Option<::scratchy_ir::facts::MropeSection> = $facts.mrope;
+                const MROPE: ::core::option::Option<::scratchy_ir::facts::Mrope> = $facts.mrope;
                 const KV_CODEC: ::scratchy_ir::facts::KvCodec = $facts.kv_codec;
                 const KV_CACHE_LAYERS: ::core::option::Option<::scratchy_ir::facts::KvLayers> = $facts.kv_layers;
                 const METAL_DTYPE: ::scratchy_ir::facts::MetalDtype = $facts.metal_dtype;
@@ -170,6 +174,13 @@ pub(crate) mod fixtures {
                 const TARGET_HIDDEN_WIDTH: ::scratchy_ir::facts::HiddenSize = $facts.target_hidden;
                 const TARGET_ROUTING: ::scratchy_ir::facts::TargetRouting = $facts.target_routing;
                 const QUANT: ::core::option::Option<::scratchy_ir::facts::Quantization> = $facts.quant;
+                const MOE: ::core::option::Option<::scratchy_ir::facts::Moe> = $facts.moe;
+                const MAX_POSITIONS: ::core::option::Option<::scratchy_ir::facts::MaxPositions> =
+                    $facts.max_positions;
+                const SPEC_VERIFY_ROWS: ::core::option::Option<::scratchy_ir::facts::VerifyRows> =
+                    $facts.verify_rows;
+                const VOCAB_PREFIX: ::core::option::Option<::scratchy_ir::facts::VocabPrefix> =
+                    $facts.vocab_prefix;
             }
         };
     }
@@ -298,6 +309,10 @@ pub(crate) mod fixtures {
         target_hidden: HiddenSize::new(2048),
         target_routing: TargetRouting::Dense,
         quant: None,
+        moe: None,
+        max_positions: None,
+        verify_rows: None,
+        vocab_prefix: None,
     };
     pub(crate) struct Tp;
     facts_type!(impl[] Tp = TP);

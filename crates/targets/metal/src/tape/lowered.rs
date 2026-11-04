@@ -2628,6 +2628,8 @@ pub enum Fact {
     VocabSize,
     /// `FINAL_LOGIT_SOFTCAP`: a tanh cap on the final logits.
     FinalLogitSoftcap,
+    /// `MAX_POSITIONS`: the positions a paged KV pool's block table is sized for.
+    MaxPositions,
 }
 
 /// Errors produced by the lowering pass. Every step kind lowers (the

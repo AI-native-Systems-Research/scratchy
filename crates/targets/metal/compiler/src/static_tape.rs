@@ -16,10 +16,10 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_target_metal::tape::ids::{
-    BlockSize, HeadDim, MaxBlocksPerSeq, MaxPositions, NumKvHeads, NumQHeads, TqDecodeHeads,
+    HeadDim, MaxBlocksPerSeq, NumKvHeads, NumQHeads, TqDecodeHeads,
 };
 use scratchy_target_metal::tape::lowered::{
-    CommandTableBuilder, GatedCommand, GenClass, KernelId, KvAddressing, LoweredMetalTape,
+    CommandTableBuilder, Fact, GatedCommand, GenClass, KernelId, KvAddressing, LoweredMetalTape,
     LoweringError, MetalDtype, TapeCommands,
 };
 
@@ -296,7 +296,7 @@ fn metal_bake_file(bytes: &[u8], extension: &str) -> TokenStream {
     }
     quote! { include_bytes!(concat!(env!("OUT_DIR"), "/", #name)) }
 }
-use scratchy_ir::facts::{AttnClass, ModelFacts};
+use scratchy_ir::facts::{AttnClass, DEFAULT_KV_PAGE, ModelFacts};
 use scratchy_target_metal::aot;
 use scratchy_target_metal::specialized_pipeline_cache::PipelineKey;
 use scratchy_target_metal::tape::constants::TapeVariant;
@@ -335,24 +335,40 @@ pub struct BucketLowerInput<'a> {
     pub cap_ladder: &'a [MaxBlocksPerSeq],
 }
 
+/// Whether a model's tapes read a paged KV pool: a property of its graph (any layer storing KV),
+/// not of its config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvPool {
+    /// Some step reads the pool's block table.
+    Read,
+    /// No step does: a vision tower, an encoder, Splash's DFlash2 drafter (whose rings are its KV).
+    Unread,
+}
+
 /// ⭐ THE KV CAP LADDER: the block-table capacities (blocks per sequence) a model's tapes bake,
 /// ascending. The decode ladder's shape (`ActiveCap::decode_ladder`): power-of-two rungs — here
 /// from one KV chunk ([`BLOCKS_PER_CHUNK`](scratchy_target_metal::BLOCKS_PER_CHUNK) blocks) — under
-/// the ceiling, every block `max_positions` fills at `block_size`, which is the top rung. The pool
-/// runs on the smallest rung that holds its capacity and refuses a capacity above the top. A model
-/// with no KV cache (`None`: a vision tower, an encoder) has no step that reads the cap, so its one
-/// rung is the floor.
-pub fn kv_cap_ladder(
-    max_positions: Option<MaxPositions>,
-    block_size: BlockSize,
-) -> Vec<MaxBlocksPerSeq> {
+/// the ceiling, every block the model's positions (`M::MAX_POSITIONS`) fill at its sliding class's
+/// page, which is the top rung. The pool runs on the smallest rung that holds its capacity and
+/// refuses a capacity above the top. A model whose tapes read no pool ([`KvPool::Unread`]) has no
+/// step that reads the cap, so its one rung is the floor; one that reads it and states no
+/// positions has no top, and is refused.
+pub fn kv_cap_ladder<M: ModelFacts>(pool: KvPool) -> Result<Vec<MaxBlocksPerSeq>, LoweringError> {
     let floor = scratchy_target_metal::BLOCKS_PER_CHUNK;
-    let top = max_positions
-        .map_or(0, |p| p.get().div_ceil(block_size.get().max(1)))
-        .max(floor);
+    let page = M::ATTENTION.map_or(DEFAULT_KV_PAGE, |a| {
+        a.class(AttnClass::Sliding).block_size()
+    });
+    let top = match pool {
+        KvPool::Unread => floor,
+        KvPool::Read => {
+            let positions =
+                M::MAX_POSITIONS.ok_or(LoweringError::ModelLacks(Fact::MaxPositions))?;
+            positions.get().div_ceil(page.get()).max(floor)
+        }
+    };
     let rungs = std::iter::successors(Some(floor), |r| r.checked_mul(2));
     let rungs = rungs.take_while(|&r| r < top).chain([top]);
-    rungs.map(MaxBlocksPerSeq).collect()
+    Ok(rungs.map(MaxBlocksPerSeq).collect())
 }
 
 /// A bucket's MTL4 barrier flags as a `static`.

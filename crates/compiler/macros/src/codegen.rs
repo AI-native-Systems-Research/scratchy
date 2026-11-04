@@ -7611,7 +7611,7 @@ enum BackboneLayout {
 #[cfg(feature = "metal")]
 fn metal_off_tape_tokens<M: scratchy_ir::facts::ModelFacts>(
     width: u64,
-    head: Option<(u32, u32)>,
+    head: Option<scratchy_ir::facts::NumDrafts>,
     vocab_suffix: Option<scratchy_target_metal::off_tape::VocabSuffix>,
 ) -> TokenStream {
     use scratchy_ir::facts::{AttnClass, DEFAULT_KV_PAGE};
@@ -7627,13 +7627,12 @@ fn metal_off_tape_tokens<M: scratchy_ir::facts::ModelFacts>(
     let block_size = BlockSize(page.get());
     // An MRoPE head reads a cos/sin row a token in place of its position: its rot window. The
     // kernel's 0 is the 1-D positions' path.
-    let mrope_rot = match (M::MROPE_SECTION, M::ATTENTION) {
-        (Some(_), Some(a)) => a.class(AttnClass::Sliding).rot_dim().get(),
-        _ => 0,
-    };
-    let head = head.map(|(drafts, hidden)| MtpChainConstants {
-        hidden: HiddenSize(hidden),
-        drafts: NumDrafts(drafts),
+    let mrope_rot = mrope_rows::<M>().map_or(0, |(_, rot)| rot.get());
+    let head = head.map(|drafts| MtpChainConstants {
+        hidden: HiddenSize(
+            u32::try_from(M::TARGET_HIDDEN_WIDTH.get()).expect("hidden width fits u32"),
+        ),
+        drafts: NumDrafts(drafts.get()),
         rope: RotDim(mrope_rot),
     });
     // A draft block: its anchor row and its drafts.
@@ -7764,44 +7763,27 @@ fn metal_off_tape_tokens<M: scratchy_ir::facts::ModelFacts>(
     }
 }
 
-/// A multi-token-prediction head drafting over a prefix of its target's vocabulary — its logits
-/// `vocab_size` wide, its target's `target_vocab_size` — whose lm_head is MLX-affine: the rest of
-/// its target's lm_head (`scratchy_target_metal::off_tape::VocabSuffix`), at the widths its
-/// lm_head is quantized to, a pass reading at most its `spec_verify_rows` rows. `None` for any
-/// other model; a head whose lm_head is stored otherwise (a dense bf16 build) has no kernel past
-/// its prefix, and drafts over the prefix alone.
+/// A multi-token-prediction head drafting over a prefix of its target's vocabulary
+/// (`M::VOCAB_PREFIX`) whose lm_head is MLX-affine: the rest of its target's lm_head
+/// (`scratchy_target_metal::off_tape::VocabSuffix`), at the widths its lm_head is quantized to.
+/// `None` for any other model; a head whose lm_head is stored otherwise (a dense bf16 build) has
+/// no kernel past its prefix, and drafts over the prefix alone.
 #[cfg(feature = "metal")]
-fn metal_vocab_suffix<M: scratchy_ir::facts::ModelFacts>(
-    model: &crate::config::ModelParams,
-) -> Option<scratchy_target_metal::off_tape::VocabSuffix> {
-    let (&prefix, &all) = (
-        model.bounds.get("vocab_size")?,
-        model.bounds.get("target_vocab_size")?,
-    );
-    if all <= prefix {
-        return None;
-    }
-    let stem = &model.source_stem;
-    let bound = |name: &str| {
-        *(model.bounds.get(name)).unwrap_or_else(|| {
-            panic!("`{stem}`: a head drafting over a vocabulary prefix declares its `{name}`")
-        })
-    };
-    let (verify_rows, window) = (bound("spec_verify_rows"), bound("spec_wide_window"));
-    // The lm_head's affine storage, as the canonical's quantization states it: a head whose
-    // lm_head is stored otherwise drafts over its prefix alone.
+fn metal_vocab_suffix<M: scratchy_ir::facts::ModelFacts>()
+-> Option<scratchy_target_metal::off_tape::VocabSuffix> {
+    let vocab = M::VOCAB_PREFIX?;
     let lm_head = M::QUANT?.lm_head()?;
     let (group, bits) = (lm_head.group().get(), lm_head.bits().get());
-    let fits = |v: u64| u32::try_from(v).expect("a vocabulary fits u32");
+    let fits = |v: usize| u32::try_from(v).expect("a vocabulary fits u32");
     Some(scratchy_target_metal::off_tape::VocabSuffix {
-        prefix: fits(prefix),
-        rows: fits(all - prefix),
-        hidden: fits(M::HIDDEN_SIZE.get() as u64),
+        prefix: fits(vocab.prefix().get()),
+        rows: fits(vocab.suffix_rows()),
+        hidden: fits(M::HIDDEN_SIZE.get()),
         bits,
         group,
         scale: M::SCALE_DTYPE,
-        verify_rows: fits(verify_rows),
-        window: fits(window),
+        verify_rows: vocab.verify_rows().get(),
+        window: vocab.window().get(),
     })
 }
 
@@ -8061,6 +8043,40 @@ fn kv_codec_for(
     }
 }
 
+/// A canonical's `VOCAB_PREFIX`: `Some` for a multi-token-prediction head whose vocabulary
+/// (`vocab_size`) is a proper prefix of its target's (`target_vocab_size`). Such a head declares
+/// the rows a pass over the rest reads (`spec_verify_rows`, `spec_wide_window`).
+fn vocab_prefix_facts(model: &ModelParams) -> TokenStream {
+    let f = quote! { ::scratchy_ir::facts };
+    let (prefix, target) = match (
+        model.bounds.get("vocab_size"),
+        model.bounds.get("target_vocab_size"),
+    ) {
+        (Some(&prefix), Some(&target)) if prefix < target => (prefix, target),
+        _ => return quote! { ::core::option::Option::None },
+    };
+    let stem = &model.source_stem;
+    let rows = |name: &str| {
+        let v = *(model.bounds.get(name)).unwrap_or_else(|| {
+            panic!("`{stem}`: a head drafting over a vocabulary prefix declares its `{name}`")
+        });
+        proc_macro2::Literal::u32_unsuffixed(
+            u32::try_from(v).unwrap_or_else(|_| panic!("`{stem}`: {name} fits u32")),
+        )
+    };
+    let (verify_rows, window) = (rows("spec_verify_rows"), rows("spec_wide_window"));
+    let vocab = |v: u64| proc_macro2::Literal::usize_unsuffixed(v as usize);
+    let (prefix, target) = (vocab(prefix), vocab(target));
+    quote! {
+        ::core::option::Option::Some(#f::VocabPrefix::new(
+            #f::VocabSize::new(#prefix),
+            #f::VocabSize::new(#target),
+            #f::VerifyRows::new(#verify_rows),
+            #f::WideWindow::new(#window),
+        ))
+    }
+}
+
 /// A canonical's `impl ModelFacts` body: the fill's facts half, from the same arguments
 /// [`emit_model`] passes the fill.
 pub(crate) fn canonical_facts_body(
@@ -8077,9 +8093,114 @@ pub(crate) fn canonical_facts_body(
     )
     .1;
     let quant = quant_facts(program, fuf, model);
+    let moe = moe_facts(model);
+    let f = quote! { ::scratchy_ir::facts };
+    let bound = |key: &str, ty: TokenStream| match model.bounds.get(key) {
+        Some(&v) => {
+            let v = proc_macro2::Literal::u32_unsuffixed(
+                u32::try_from(v)
+                    .unwrap_or_else(|_| panic!("`{}`: {key} fits u32", model.source_stem)),
+            );
+            quote! { ::core::option::Option::Some(#f::#ty::new(#v)) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+    let max_positions = bound("max_position_embeddings", quote! { MaxPositions });
+    let verify_rows = bound("spec_verify_rows", quote! { VerifyRows });
+    let vocab_prefix = vocab_prefix_facts(model);
     quote! {
         #facts
-        const QUANT: ::core::option::Option<::scratchy_ir::facts::Quantization> = #quant;
+        const QUANT: ::core::option::Option<#f::Quantization> = #quant;
+        const MOE: ::core::option::Option<#f::Moe> = #moe;
+        const MAX_POSITIONS: ::core::option::Option<#f::MaxPositions> = #max_positions;
+        const SPEC_VERIFY_ROWS: ::core::option::Option<#f::VerifyRows> = #verify_rows;
+        const VOCAB_PREFIX: ::core::option::Option<#f::VocabPrefix> = #vocab_prefix;
+    }
+}
+
+/// A canonical's `MOE` fact: `None` for a model without routed experts. The routed-expert count is
+/// read from the one key the config names it by, which also says how its router scores
+/// (`num_local_experts`: Mixtral, `n_routed_experts`: GLM-4, `num_experts`: Qwen); a config naming
+/// two is refused, so no reader can take a different one.
+fn moe_facts(model: &ModelParams) -> TokenStream {
+    let f = quote! { ::scratchy_ir::facts };
+    let none = quote! { ::core::option::Option::None };
+    let b = &model.bounds;
+    let named: Vec<(&str, u64)> = ["num_local_experts", "n_routed_experts", "num_experts"]
+        .into_iter()
+        .filter_map(|k| b.get(k).map(|&v| (k, v)))
+        .filter(|&(_, v)| v > 0)
+        .collect();
+    let (key, experts) = match named[..] {
+        [] => return none,
+        [one] => one,
+        _ => panic!(
+            "`{}` names its routed experts by more than one key ({named:?}): which router scores \
+             them is ambiguous",
+            model.source_stem
+        ),
+    };
+    let router = match key {
+        "num_local_experts" => quote! { #f::RouterKind::Mixtral },
+        "n_routed_experts" => quote! { #f::RouterKind::GlmSigmoid },
+        _ => quote! { #f::RouterKind::QwenShared },
+    };
+    let (Some(&per_token), Some(&inter)) = (
+        b.get("num_experts_per_tok"),
+        b.get("moe_intermediate_size")
+            .or_else(|| b.get("intermediate_size")),
+    ) else {
+        return none;
+    };
+    let lit = |v: u64| proc_macro2::Literal::u64_unsuffixed(v);
+    let (experts, per_token, inter) = (lit(experts), lit(per_token), lit(inter));
+    let shared = match b
+        .get("shared_expert_intermediate_size")
+        .copied()
+        .unwrap_or(0)
+    {
+        0 => none.clone(),
+        s => {
+            let s = lit(s);
+            quote! { ::core::option::Option::Some(#f::IntermediateSize::new(#s)) }
+        }
+    };
+    let scores = match b.get("norm_topk_prob").copied().unwrap_or(0) != 0 {
+        true => quote! { #f::TopKScores::Renormalized },
+        false => quote! { #f::TopKScores::AsRouted },
+    };
+    let scalar = |key: &str, ty: TokenStream| {
+        (model.scalars.get(key).map(|&v| v as f32)).map(|v| {
+            let v = proc_macro2::Literal::f32_suffixed(v);
+            quote! { #f::#ty::new(#v) }
+        })
+    };
+    let some_or_none = |t: Option<TokenStream>| match t {
+        Some(t) => quote! { ::core::option::Option::Some(#t) },
+        None => quote! { ::core::option::Option::None },
+    };
+    // The identity scale (GLM-4.5's 1.0) scales nothing.
+    let routed_scale = some_or_none(
+        scalar("routed_scaling_factor", quote! { RoutedScale })
+            .filter(|_| model.scalars.get("routed_scaling_factor") != Some(&1.0)),
+    );
+    let activation = some_or_none(match model.expert_activation {
+        crate::config::ExpertActivation::Silu => Some(quote! { #f::ExpertActivation::GatedSilu }),
+        crate::config::ExpertActivation::Relu2 => {
+            Some(quote! { #f::ExpertActivation::UngatedRelu2 })
+        }
+        crate::config::ExpertActivation::Unrealized(_) => None,
+    });
+    let swiglu_limit = some_or_none(scalar("swiglu_limit", quote! { SwigluLimit }));
+    quote! {
+        ::core::option::Option::Some(#f::Moe::new(
+            #f::Experts::new(#experts),
+            #f::ExpertsPerToken::new(#per_token),
+            #f::IntermediateSize::new(#inter),
+            #shared,
+            #f::MoeRouter::new(#router, #scores, #routed_scale),
+            #f::MoeBody::new(#activation, #swiglu_limit),
+        ))
     }
 }
 
@@ -8258,15 +8379,9 @@ fn emit_canonical_params_impl(
 
     // attention_multiplier (Granite override) → query_pre_attn_scalar
     // (Gemma2) → 1/sqrt(head_dim). Default 0.0 if no attention path.
-    let attn_scale: f32 = if let Some(s) = model.scalars.get("attention_multiplier") {
-        *s as f32
-    } else if let Some(q) = model.scalars.get("query_pre_attn_scalar") {
-        (*q as f32).powf(-0.5)
-    } else if head_dim > 0 {
-        1.0_f32 / (head_dim as f32).sqrt()
-    } else {
-        0.0
-    };
+    // The one scale derivation (`attention_scale_for`); `CanonicalParams`' value const spells a
+    // body without attention 0.0.
+    let attn_scale: f32 = crate::weight_vocab::attention_scale_for(model).unwrap_or(0.0);
     let attn_softcap: f32 = model
         .scalars
         .get("attn_logit_softcapping")
@@ -8770,10 +8885,16 @@ fn emit_canonical_params_impl(
         } else {
             none.clone()
         };
+        // The base the per-token MRoPE rows are built at: `rope_theta`, a scalar or a bound,
+        // else HF's 10000.
         let mrope = match model.mrope_section {
             Some(s) => {
                 let s = s.map(u32_lit);
-                some(quote! { #f::MropeSection::new([#(#s),*]) })
+                let theta = (model.scalars.get("rope_theta").copied())
+                    .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+                    .unwrap_or(10000.0);
+                let theta = proc_macro2::Literal::f64_suffixed(theta);
+                some(quote! { #f::Mrope::new([#(#s),*], #f::RopeTheta::new(#theta)) })
             }
             None => none.clone(),
         };
@@ -8810,15 +8931,16 @@ fn emit_canonical_params_impl(
             let scale = f32_lit(vision_attn_scale);
             let grid = positive_or_none(quote! { PatchGridSide }, vision_patch_grid_side as usize);
             let pool = positive_or_none(quote! { PoolKernel }, vision_pool_kernel as usize);
+            let embed = positive_or_none(quote! { HiddenSize }, vision_embed_dim);
             some(quote! {
                 #f::Vision::new(
                     #f::QueryHeads::new(#heads),
                     #f::HeadDim::new(#hd),
                     #f::InFeatures::new(#inf),
+                    #embed,
                     #pairing,
                     #f::AttnScale::new(#scale),
-                    #grid,
-                    #pool,
+                    #f::VisionPool::new(#grid, #pool),
                 )
             })
         } else {
@@ -8873,7 +8995,7 @@ fn emit_canonical_params_impl(
             const RMS_NORM_EPS: #f::RmsNormEps = #f::RmsNormEps::new(#eps);
             const NORM_WEIGHT_OFFSET: #f::NormWeightOffset = #f::NormWeightOffset::new(#offset);
             const FINAL_LOGIT_SOFTCAP: ::core::option::Option<#f::SoftCap> = #final_softcap;
-            const MROPE_SECTION: ::core::option::Option<#f::MropeSection> = #mrope;
+            const MROPE: ::core::option::Option<#f::Mrope> = #mrope;
             const KV_CODEC: #f::KvCodec = #codec;
             const KV_CACHE_LAYERS: ::core::option::Option<#f::KvLayers> = #kv_layers_facts;
             // No arch overrides the metal element dtype.
@@ -11371,7 +11493,7 @@ fn fuf_row_local_tail_op(op: OpKind) -> bool {
 // read inside the spyre cfg block below; without that feature the
 // function still lowers + reports stats but consumes none of them.
 #[cfg_attr(not(feature = "spyre"), allow(unused_variables))]
-fn dump_wavefront_mega(
+fn dump_wavefront_mega<D: crate::FactsDispatch>(
     program: &Program,
     model: &ModelParams,
     fuf: &Fuf,
@@ -11381,6 +11503,8 @@ fn dump_wavefront_mega(
     backbone_slots: &[Vec<WeightSlot>],
     lm_head_slots: &[Vec<WeightSlot>],
     bb_bucket_id: u32,
+    // Where the canonical's facts are a type: the bridge runs at it.
+    canonical_facts: &CanonicalFactsAt<'_, D>,
     // Out: under `-Fspyre` the embedded `pub const KTIR_BUNDLE` token stream
     // (spliced into the per-model module); empty under cuda/metal.
     ktir_bundle_out: &mut proc_macro2::TokenStream,
@@ -11453,15 +11577,15 @@ fn dump_wavefront_mega(
         .filter(|&v| v >= 1)
         .unwrap_or(1);
     let lower_at = |cap: std::num::NonZeroU32| {
-        crate::to_wavefront::lower_decode_to_wavefront(
+        canonical_facts.visit(Bridge {
             fuf,
-            decode_asn_check,
+            asn: decode_asn_check,
             inferred,
-            decode_bounds,
+            bounds: decode_bounds,
             model,
-            crate::to_wavefront::PrefixCapacity::new(cap),
-            primary_m,
-        )
+            prefix: crate::to_wavefront::PrefixCapacity::new(cap),
+            num_tokens: primary_m,
+        })
     };
     #[cfg_attr(not(feature = "spyre"), allow(unused_mut))]
     let mut first = lower_at(prefix_len);
@@ -13503,17 +13627,17 @@ fn dump_wavefront_mega(
             caps.sort_unstable();
             caps.dedup();
             for cap in caps {
-                let lwd = match crate::to_wavefront::lower_decode_to_wavefront(
+                let lwd = match canonical_facts.visit(Bridge {
                     fuf,
-                    decode_asn_check,
+                    asn: decode_asn_check,
                     inferred,
-                    decode_bounds,
+                    bounds: decode_bounds,
                     model,
-                    crate::to_wavefront::PrefixCapacity::new(
+                    prefix: crate::to_wavefront::PrefixCapacity::new(
                         std::num::NonZeroU32::new(cap).expect("cap bucket is non-zero"),
                     ),
-                    primary_m,
-                ) {
+                    num_tokens: primary_m,
+                }) {
                     Ok(l) => l,
                     Err(e) => panic!("[wavefront] {stem}: decode (cap={cap}) NOT LOWERED — {e}"),
                 };
@@ -13573,15 +13697,15 @@ fn dump_wavefront_mega(
                 .into_iter()
                 .rev()
             {
-                match crate::to_wavefront::lower_decode_to_wavefront(
+                match canonical_facts.visit(Bridge {
                     fuf,
-                    decode_asn_check,
+                    asn: decode_asn_check,
                     inferred,
-                    decode_bounds,
+                    bounds: decode_bounds,
                     model,
-                    crate::to_wavefront::PrefixCapacity::new(prefix_len),
-                    seqs,
-                ) {
+                    prefix: crate::to_wavefront::PrefixCapacity::new(prefix_len),
+                    num_tokens: seqs,
+                }) {
                     Ok(lwd_b) => {
                         emit_bundle(
                             &lwd_b,
@@ -13808,30 +13932,30 @@ fn dump_wavefront_mega(
         let per_rung: Vec<Result<RungBake, (u32, String)>> = {
             use rayon::prelude::*;
             prefill_rung_widths.par_iter().map(|&pl| -> Result<RungBake, (u32, String)> {
-            let lowered = to_wavefront::lower_decode_to_wavefront(
-                fuf,
-                decode_asn_check,
-                inferred,
-                decode_bounds,
-                model,
-                // Prefill and decode model the SAME resident prefix-KV cache, so
-                // they MUST share ONE capacity — the KTIR emulator bakes a STATIC
-                // `[prefix_len, kv]` cache + a `[1, prefix_len]` runtime length mask,
-                // and the worker reads that mask width as the bundle's max context
-                // (`b.capacity`). A prefill baked at a smaller capacity than the
-                // decode makes the worker reject any prompt longer than that capacity
-                // (`positions 0..N exceed bundle prefix capacity`). The prior default
-                // used `1` — a host-grown-sengraph optimization (valid_len-1=0 drops
-                // the prefix seg on silicon, where the host passes exactly `valid`
-                // rows at runtime so the template size is immaterial). But the KTIR
-                // cache is NOT host-grown; at prefix_len=1 the prompt can never
-                // exceed 1 token. Use the resident capacity for BOTH paths (paged and
-                // default), matching the decode bundle: at start=0 the runtime mask
-                // keeps 0 prefix rows so the prompt still attends only itself
-                // causally, and chunk k attends the k*mq rows written so far.
-                crate::to_wavefront::PrefixCapacity::new(prefix_len),
-                pl,
-            );
+            let lowered = canonical_facts.visit(Bridge {
+                    fuf,
+                    asn: decode_asn_check,
+                    inferred,
+                    bounds: decode_bounds,
+                    model,
+                    // Prefill and decode model the SAME resident prefix-KV cache, so
+                    // they MUST share ONE capacity — the KTIR emulator bakes a STATIC
+                    // `[prefix_len, kv]` cache + a `[1, prefix_len]` runtime length mask,
+                    // and the worker reads that mask width as the bundle's max context
+                    // (`b.capacity`). A prefill baked at a smaller capacity than the
+                    // decode makes the worker reject any prompt longer than that capacity
+                    // (`positions 0..N exceed bundle prefix capacity`). The prior default
+                    // used `1` — a host-grown-sengraph optimization (valid_len-1=0 drops
+                    // the prefix seg on silicon, where the host passes exactly `valid`
+                    // rows at runtime so the template size is immaterial). But the KTIR
+                    // cache is NOT host-grown; at prefix_len=1 the prompt can never
+                    // exceed 1 token. Use the resident capacity for BOTH paths (paged and
+                    // default), matching the decode bundle: at start=0 the runtime mask
+                    // keeps 0 prefix rows so the prompt still attends only itself
+                    // causally, and chunk k attends the k*mq rows written so far.
+                    prefix: crate::to_wavefront::PrefixCapacity::new(prefix_len),
+                    num_tokens: pl,
+                });
             match lowered {
                 Ok(lwd_p) => {
                     let (r, fx) = emit_bundle_deferred(
@@ -13940,15 +14064,15 @@ fn dump_wavefront_mega(
                 .collect();
             let asked = scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_rungs(&baked);
             for &m in &asked {
-                match crate::to_wavefront::lower_decode_to_wavefront(
+                match canonical_facts.visit(Bridge {
                     fuf,
-                    decode_asn_check,
+                    asn: decode_asn_check,
                     inferred,
-                    decode_bounds,
+                    bounds: decode_bounds,
                     model,
-                    crate::to_wavefront::PrefixCapacity::new(prefix_len),
-                    m,
-                ) {
+                    prefix: crate::to_wavefront::PrefixCapacity::new(prefix_len),
+                    num_tokens: m,
+                }) {
                     Ok(lwd_p) => {
                         emit_bundle(
                             &lwd_p,
@@ -14077,34 +14201,34 @@ fn dump_wavefront_mega(
         } else {
             CB_BATCH_TEMPLATE
         };
-        let (_cb_decode_graph, mut cb_decode_groups): (String, GroupGraphs) =
-            match crate::to_wavefront::lower_decode_to_wavefront(
+        let (_cb_decode_graph, mut cb_decode_groups): (String, GroupGraphs) = match canonical_facts
+            .visit(Bridge {
                 fuf,
-                decode_asn_check,
+                asn: decode_asn_check,
                 inferred,
-                decode_bounds,
+                bounds: decode_bounds,
                 model,
-                crate::to_wavefront::PrefixCapacity::new(prefix_len),
-                decode_mq,
-            ) {
-                Ok(lwd_cb) => {
-                    let (_m, _n, sg, groups) = emit_bundle(
-                        &lwd_cb,
-                        format!("ktir_decode_cb_{stem_id}"),
-                        prefix_len.get(),
-                        Some(("s0", decode_mq)),
-                        None,
-                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                        // The CB sengraph's rows are a batch SYMBOL the DEM resolves at runtime, not
-                        // a baked request count.
-                        1,
-                    );
-                    (sg, groups)
-                }
-                Err(e) => {
-                    panic!("[wavefront] {stem}: CB decode (m={decode_mq}) NOT LOWERED — {e}")
-                }
-            };
+                prefix: crate::to_wavefront::PrefixCapacity::new(prefix_len),
+                num_tokens: decode_mq,
+            }) {
+            Ok(lwd_cb) => {
+                let (_m, _n, sg, groups) = emit_bundle(
+                    &lwd_cb,
+                    format!("ktir_decode_cb_{stem_id}"),
+                    prefix_len.get(),
+                    Some(("s0", decode_mq)),
+                    None,
+                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                    // The CB sengraph's rows are a batch SYMBOL the DEM resolves at runtime, not
+                    // a baked request count.
+                    1,
+                );
+                (sg, groups)
+            }
+            Err(e) => {
+                panic!("[wavefront] {stem}: CB decode (m={decode_mq}) NOT LOWERED — {e}")
+            }
+        };
 
         // DEFAULT-MODE OVERRIDE: replace the offline_decoder CB-decode groups with
         // the single static-SDPA default-mode graph (emitted from the m=1 decode
@@ -14545,6 +14669,35 @@ impl<D: crate::FactsDispatch> CanonicalFactsAt<'_, D> {
     }
 }
 
+/// The DSL→tape bridge ([`lower_decode_to_wavefront`]) at a canonical's facts: its arguments,
+/// run by `CanonicalFactsAt::visit`.
+///
+/// [`lower_decode_to_wavefront`]: crate::to_wavefront::lower_decode_to_wavefront
+pub(crate) struct Bridge<'a> {
+    pub(crate) fuf: &'a Fuf,
+    pub(crate) asn: Option<&'a crate::assignment::Assignment>,
+    pub(crate) inferred: &'a crate::shape::Inferred,
+    pub(crate) bounds: &'a BTreeMap<String, u64>,
+    pub(crate) model: &'a ModelParams,
+    pub(crate) prefix: crate::to_wavefront::PrefixCapacity,
+    pub(crate) num_tokens: u32,
+}
+
+impl scratchy_ir::facts::FactsVisitor for Bridge<'_> {
+    type Out = Result<scratchy_subtile::handoff::LoweredDecode, crate::to_wavefront::BridgeError>;
+    fn visit<M: scratchy_ir::facts::ModelFacts>(self) -> Self::Out {
+        crate::to_wavefront::lower_decode_to_wavefront::<M>(
+            self.fuf,
+            self.asn,
+            self.inferred,
+            self.bounds,
+            self.model,
+            self.prefix,
+            self.num_tokens,
+        )
+    }
+}
+
 /// The two build stages agree that a canonical exists: stage 2 emits nothing stage 1 has no type
 /// for, on every target.
 struct Generated;
@@ -14593,23 +14746,34 @@ impl scratchy_ir::facts::FactsVisitor for EmbedAffine {
     }
 }
 
-/// The KV cap rungs a canonical bakes: its positions' ladder at its KV page (the config's own; a
-/// canonical without attention pages nothing and takes the default page).
+/// The KV cap rungs a canonical bakes ([`kv_cap_ladder`]), given whether its graph reads a pool.
+///
+/// [`kv_cap_ladder`]: scratchy_target_metal_compiler::static_tape::kv_cap_ladder
 #[cfg(feature = "metal")]
-struct CapLadder(Option<scratchy_target_metal::tape::ids::MaxPositions>);
+struct CapLadder(scratchy_target_metal_compiler::static_tape::KvPool);
 
 #[cfg(feature = "metal")]
 impl scratchy_ir::facts::FactsVisitor for CapLadder {
-    type Out = Vec<scratchy_target_metal::tape::ids::MaxBlocksPerSeq>;
+    type Out = Result<
+        Vec<scratchy_target_metal::tape::ids::MaxBlocksPerSeq>,
+        scratchy_target_metal::tape::lowered::LoweringError,
+    >;
     fn visit<M: scratchy_ir::facts::ModelFacts>(self) -> Self::Out {
-        use scratchy_ir::facts::{AttnClass, DEFAULT_KV_PAGE};
-        let page = M::ATTENTION.map_or(DEFAULT_KV_PAGE, |a| {
-            a.class(AttnClass::Sliding).block_size()
-        });
-        scratchy_target_metal_compiler::static_tape::kv_cap_ladder(
-            self.0,
-            scratchy_target_metal::tape::ids::BlockSize(page.get()),
-        )
+        scratchy_target_metal_compiler::static_tape::kv_cap_ladder::<M>(self.0)
+    }
+}
+
+/// The largest bucket a DFlash2 drafter's block draft plays at: the smallest that holds its
+/// target's verify rows (`M::SPEC_VERIFY_ROWS`) for every lane a step drafts. `None` — every
+/// bucket plays its result — for a model that is no drafter, or states no verify rows.
+struct PlaysResultThrough<'a>(&'a [u64]);
+
+impl scratchy_ir::facts::FactsVisitor for PlaysResultThrough<'_> {
+    type Out = Option<u64>;
+    fn visit<M: scratchy_ir::facts::ModelFacts>(self) -> Option<u64> {
+        M::DRAFTER?;
+        let rows = u64::from(M::SPEC_VERIFY_ROWS?.get()) * DFLASH2_BLOCK_LANES;
+        self.0.iter().copied().filter(|&m| m >= rows).min()
     }
 }
 
@@ -14633,21 +14797,141 @@ impl scratchy_ir::facts::FactsVisitor for BakeBucketTapes<'_, '_> {
 /// The canonical's off-tape statics at its facts: its TurboQuant codebook and its off-tape
 /// kernels (argmax, sampler, the MTP / DFlash2 chain).
 #[cfg(feature = "metal")]
-struct OffTapeStatics<'a> {
-    model: &'a ModelParams,
-    logits_width: u64,
-    head: Option<(u32, u32)>,
+struct OffTapeStatics {
+    terminal_row: TerminalRow,
+    /// Whether its body reads its target's hidden rows: a multi-token-prediction head, whose
+    /// passes chain on the device.
+    reads_target_hidden: bool,
 }
 
 #[cfg(feature = "metal")]
-impl scratchy_ir::facts::FactsVisitor for OffTapeStatics<'_> {
+impl scratchy_ir::facts::FactsVisitor for OffTapeStatics {
     type Out = [TokenStream; 2];
     fn visit<M: scratchy_ir::facts::ModelFacts>(self) -> Self::Out {
-        let suffix = metal_vocab_suffix::<M>(self.model);
+        let suffix = metal_vocab_suffix::<M>();
+        let head = match self.reads_target_hidden {
+            true => Some(M::SPEC_DRAFTS.expect("an MTP head's spec_drafts")),
+            false => None,
+        };
+        let width = terminal_width::<M>(self.terminal_row);
         [
             metal_tq_codebook_tokens::<M>(),
-            metal_off_tape_tokens::<M>(self.logits_width, self.head, suffix),
+            metal_off_tape_tokens::<M>(width, head, suffix),
         ]
+    }
+}
+
+/// What one row of a forward's terminal slot holds: a decoder's logits, or an encoder's hidden
+/// state (ModernBERT, every `#[vision_forward]` body: no lm_head).
+#[derive(Clone, Copy)]
+enum TerminalRow {
+    Logits,
+    Hidden,
+}
+
+/// The residual width of a model's text rows: `None` for a vision tower (a body with a tower and
+/// no decoder attention), whose `HIDDEN_SIZE` is its tower's width and which has no text rows.
+fn text_hidden<M: scratchy_ir::facts::ModelFacts>() -> Option<scratchy_ir::facts::HiddenSize> {
+    match (M::ATTENTION, M::VISION) {
+        (None, Some(_)) => None,
+        _ => Some(M::HIDDEN_SIZE),
+    }
+}
+
+/// The width of one terminal row ([`TerminalRow`]): the vocabulary, or the text hidden width; 0
+/// when the model has neither (a vision tower's terminal).
+fn terminal_width<M: scratchy_ir::facts::ModelFacts>(row: TerminalRow) -> u64 {
+    let width = match row {
+        TerminalRow::Logits => M::VOCAB_SIZE.map(|v| v.get()),
+        TerminalRow::Hidden => text_hidden::<M>().map(|h| h.get()),
+    };
+    width.map_or(0, |w| w as u64)
+}
+
+/// [`terminal_width`] at the canonical's facts.
+struct TerminalWidth(TerminalRow);
+
+impl scratchy_ir::facts::FactsVisitor for TerminalWidth {
+    type Out = u64;
+    fn visit<M: scratchy_ir::facts::ModelFacts>(self) -> u64 {
+        terminal_width::<M>(self.0)
+    }
+}
+
+/// An MRoPE decoder's facts and the rot window its per-token cos/sin rows span (its sliding
+/// class's: Qwen3.5's 0.25·256 = 64). `None` on a 1D-rope model, whose rope reads the positions.
+fn mrope_rows<M: scratchy_ir::facts::ModelFacts>()
+-> Option<(scratchy_ir::facts::Mrope, scratchy_ir::facts::RotDim)> {
+    use scratchy_ir::facts::AttnClass;
+    let rot = M::ATTENTION?.class(AttnClass::Sliding).rot_dim();
+    Some((M::MROPE?, rot))
+}
+
+/// [`mrope_rows`] at the canonical's facts.
+struct MropeRows;
+
+impl scratchy_ir::facts::FactsVisitor for MropeRows {
+    type Out = Option<(scratchy_ir::facts::Mrope, scratchy_ir::facts::RotDim)>;
+    fn visit<M: scratchy_ir::facts::ModelFacts>(self) -> Self::Out {
+        mrope_rows::<M>()
+    }
+}
+
+/// The largest bucket a canonical runs, and whether its body reads its target's hidden rows.
+struct ExternExtents {
+    max_m: u64,
+    reads_target_hidden: bool,
+}
+
+/// The bytes of each per-forward extern buffer a canonical's worker binds, at its largest bucket
+/// — 0 for one its forward never reads (`alloc`'s 16-byte floor covers the placeholder) — and the
+/// rows of a DFlash2 drafter's block.
+struct ExternBytes {
+    /// Vision rope freqs: f32 `[max_m, head_dim/2]`.
+    vision_freqs: u64,
+    /// Vision pixels: model dtype `[max_m, in_features]`.
+    vision_pixels: u64,
+    /// Vision position embeddings, host-interpolated and added to the patch-embed output: model
+    /// dtype `[max_m, embed]`.
+    vision_posemb: u64,
+    /// An MTP head's target's final hidden rows: model dtype `[max_m, TARGET_HIDDEN_WIDTH]` —
+    /// which a drafter of its own width (Gemma 4's assistant) reads and exports at.
+    target_hidden: u64,
+    /// A text decoder's multimodal splice: model dtype `[max_m, hidden]`.
+    mm_embeds: u64,
+    /// The splice's destination rows: u32 `[max_m]`.
+    mm_dst_rows: u64,
+    /// An MRoPE decoder's per-token cos/sin rows ([`mrope_rows`]): model dtype `[max_m, rot]`.
+    mrope_cos_sin: u64,
+    /// The rows a target captures for its DFlash2 drafter: model dtype
+    /// `[max_m, CAPTURE_SLOTS · hidden]`.
+    draft_capture: u64,
+    /// A draft block's rows: its drafts and their anchor.
+    draft_rows: u64,
+}
+
+impl scratchy_ir::facts::FactsVisitor for ExternExtents {
+    type Out = ExternBytes;
+    fn visit<M: scratchy_ir::facts::ModelFacts>(self) -> ExternBytes {
+        let max_m = self.max_m;
+        let rows = |width: Option<u64>, elem: u64| width.map_or(0, |w| max_m * w * elem);
+        let vision = M::VISION;
+        let hidden = text_hidden::<M>().map(|h| h.get() as u64);
+        let target_hidden = M::TARGET_HIDDEN_WIDTH.get() as u64;
+        ExternBytes {
+            vision_freqs: rows(vision.map(|v| u64::from(v.head_dim().get() / 2)), 4),
+            vision_pixels: rows(vision.map(|v| v.in_features().get() as u64), 2),
+            vision_posemb: rows(vision.and_then(|v| v.embed()).map(|e| e.get() as u64), 2),
+            target_hidden: rows(self.reads_target_hidden.then_some(target_hidden), 2),
+            mm_embeds: rows(hidden, 2),
+            mm_dst_rows: max_m * 4,
+            mrope_cos_sin: rows(mrope_rows::<M>().map(|(_, rot)| u64::from(rot.get())), 2),
+            draft_capture: rows(
+                M::CAPTURE_SLOTS.and_then(|s| Some(u64::from(s.get()) * hidden?)),
+                2,
+            ),
+            draft_rows: 1 + M::SPEC_DRAFTS.map_or(0, |d| u64::from(d.get())),
+        }
     }
 }
 
@@ -14756,18 +15040,19 @@ pub fn emit_model<D: crate::FactsDispatch>(
                 let bounds = bounds_for_wp(model, wp, tp_world_size);
                 // Tape-authoritative: no assignment (there is no solve under
                 // spyre), exactly as the bucket-folding lowering below.
-                crate::to_wavefront::lower_decode_to_wavefront(
-                    fuf,
-                    None,
-                    inferred,
-                    &bounds,
-                    model,
-                    crate::to_wavefront::PrefixCapacity::new(
-                        std::num::NonZeroU32::new(8192).expect("8192 != 0"),
-                    ),
-                    wp.num_tokens as u32,
-                )
-                .ok()
+                canonical_facts
+                    .visit(Bridge {
+                        fuf,
+                        asn: None,
+                        inferred,
+                        bounds: &bounds,
+                        model,
+                        prefix: crate::to_wavefront::PrefixCapacity::new(
+                            std::num::NonZeroU32::new(8192).expect("8192 != 0"),
+                        ),
+                        num_tokens: wp.num_tokens as u32,
+                    })
+                    .ok()
             });
         let tw = lowered.as_ref().map(|l| {
             crate::weight_bindings::from_tape(
@@ -14874,15 +15159,17 @@ pub fn emit_model<D: crate::FactsDispatch>(
             HashMap::new();
         for (bi, wp) in bucket_points.iter().enumerate() {
             let bounds = bounds_for_wp(model, *wp, tp_world_size);
-            let fp = match crate::to_wavefront::lower_decode_to_wavefront(
+            let fp = match canonical_facts.visit(Bridge {
                 fuf,
-                None,
+                asn: None,
                 inferred,
-                &bounds,
+                bounds: &bounds,
                 model,
-                crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap()),
-                wp.num_tokens as u32,
-            ) {
+                prefix: crate::to_wavefront::PrefixCapacity::new(
+                    std::num::NonZeroU32::new(8192).unwrap(),
+                ),
+                num_tokens: wp.num_tokens as u32,
+            }) {
                 Ok(l) => {
                     let m = wp.num_tokens as u32;
                     // A canonical realizes its codec guards at its own rows
@@ -15409,9 +15696,15 @@ pub fn emit_model<D: crate::FactsDispatch>(
         let bounds = bounds_for_wp(model, *canonical, tp_world_size);
         let prefix =
             crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
-        let l = match crate::to_wavefront::lower_decode_to_wavefront(
-            fuf, None, inferred, &bounds, model, prefix, m as u32,
-        ) {
+        let l = match canonical_facts.visit(Bridge {
+            fuf,
+            asn: None,
+            inferred,
+            bounds: &bounds,
+            model,
+            prefix,
+            num_tokens: m as u32,
+        }) {
             Ok(l) => l,
             // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
             // so the bake bakes NO variants and the pool refuses at load. Anything else has no
@@ -15564,6 +15857,7 @@ pub fn emit_model<D: crate::FactsDispatch>(
                             &cl.backbone.weight_slots,
                             &cl.lm_head.weight_slots,
                             bb_bucket_id,
+                            &canonical_facts,
                             &mut ktir_bundle_const,
                         );
                     }
@@ -15709,20 +16003,13 @@ pub fn emit_model<D: crate::FactsDispatch>(
     // The KV cap rungs every bucket bakes, topped by every block the model's positions fill.
     #[cfg(feature = "metal")]
     let metal_cap_ladder = {
-        use scratchy_target_metal::tape::ids::MaxPositions;
-        let max_pos = KvCacheLayers::of(fuf).any().then(|| {
-            let max_pos = model.bounds.get("max_position_embeddings").copied();
-            max_pos
-                .and_then(|p| u32::try_from(p).ok())
-                .map(MaxPositions)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "model `{}`: no u32 max_position_embeddings to top the KV cap ladder",
-                        model.source_stem
-                    )
-                })
-        });
-        let ladder = canonical_facts.visit(CapLadder(max_pos));
+        use scratchy_target_metal_compiler::static_tape::KvPool;
+        let pool = match KvCacheLayers::of(fuf).any() {
+            true => KvPool::Read,
+            false => KvPool::Unread,
+        };
+        let ladder = (canonical_facts.visit(CapLadder(pool)))
+            .unwrap_or_else(|e| panic!("model `{}`: the KV cap ladder: {e}", model.source_stem));
         eprintln!(
             "[metal bake] {}: KV cap rungs {ladder:?}",
             model.source_stem
@@ -15737,19 +16024,7 @@ pub fn emit_model<D: crate::FactsDispatch>(
     // lm_head's logits, a vocabulary a row, above all — are never written there.
     // The rows are a lane's (`spec_verify_rows`) times the lanes a step drafts
     // (`scratchy_serving_engine::spec_decode::BLOCK_LANES`, Splash's SPLASH_MAXIMUM_BATCH_WIDTH).
-    let plays_result_through = match model.bounds.get("selector_rank") {
-        Some(&rank) if rank > 0 => {
-            (model.bounds.get("spec_verify_rows").copied()).and_then(|rows| {
-                let rows = rows * DFLASH2_BLOCK_LANES;
-                num_tokens_points
-                    .iter()
-                    .copied()
-                    .filter(|&m| m >= rows)
-                    .min()
-            })
-        }
-        _ => None,
-    };
+    let plays_result_through = canonical_facts.visit(PlaysResultThrough(&num_tokens_points));
     let commit_tiles: HashSet<TileId> = {
         let mut live: HashSet<TileId> = HashSet::new();
         let mut todo: Vec<TileId> = (fuf.nodes.iter())
@@ -16059,15 +16334,21 @@ pub fn emit_model<D: crate::FactsDispatch>(
             scratchy_forward_compiler::RowsExtern::TargetHidden,
         )
     });
-    // The width of those rows (the `TargetHidden` extern's): its target's hidden size — which a
-    // drafter of its own width (Gemma 4's assistant) reads and exports at, its passes chained at.
-    let target_hidden_width: u64 = model
-        .bounds
-        .get("backbone_hidden_size")
-        .or_else(|| model.bounds.get("hidden_size"))
-        .copied()
-        .unwrap_or(0);
-    let (
+    let ExternBytes {
+        vision_freqs,
+        vision_pixels,
+        vision_posemb,
+        target_hidden,
+        mm_embeds,
+        mm_dst_rows,
+        mrope_cos_sin,
+        draft_capture,
+        draft_rows,
+    } = canonical_facts.visit(ExternExtents {
+        max_m: num_tokens_points.iter().copied().max().unwrap_or(0),
+        reads_target_hidden,
+    });
+    let [
         vision_freqs_bytes_lit,
         vision_pixels_bytes_lit,
         vision_posemb_bytes_lit,
@@ -16075,78 +16356,26 @@ pub fn emit_model<D: crate::FactsDispatch>(
         mm_embeds_bytes_lit,
         mm_dst_rows_bytes_lit,
         mrope_cos_sin_bytes_lit,
-    ) = {
-        let max_m = num_tokens_points.iter().copied().max().unwrap_or(0);
-        let vis_head_dim = model.bounds.get("vision_head_dim").copied().unwrap_or(0);
-        let vis_in_features = model.bounds.get("vision_in_features").copied().unwrap_or(0);
-        let vis_embed_dim = model.bounds.get("vision_embed_dim").copied().unwrap_or(0);
-        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(0);
-        let freqs_bytes = max_m * (vis_head_dim / 2) * 4;
-        let pixels_bytes = max_m * vis_in_features * 2;
-        // pos_embeds: model-dtype (bf16) `[num_tokens, vision_embed_dim]`,
-        // host-interpolated and added to the patch-embed output.
-        let posemb_bytes = max_m * vis_embed_dim * 2;
-        // target_hidden (MTP heads): model-dtype `[num_tokens, target_hidden_width]`, the
-        // target's final hidden rows. Zero unless the body reads the extern.
-        let target_hidden_bytes = match reads_target_hidden {
-            true => max_m * target_hidden_width * 2,
-            false => 0,
-        };
-        // mm splice (text decoder): mm_embeds = bf16 `[max_m, hidden]`;
-        // mm_dst_rows = u32 `[max_m]`. Zero on non-MM arches.
-        let mm_embeds_bytes = max_m * hidden_size * 2;
-        let mm_dst_rows_bytes = max_m * 4;
-        // MRoPE cos/sin override (MRoPE text decoders only): model-dtype
-        // (f16/bf16 → 2 bytes) `[max_m, rot_dim]`. 0 on 1D-rope arches
-        // (the `resolve_bindings` swap never fires, so the buffer is
-        // never bound — `alloc`'s 16-byte floor covers the placeholder).
-        // `rot_dim = partial_rotary_factor * head_dim` (Qwen3.5: 0.25*256
-        // = 64), mirroring the rope-cache builder / `ROT_DIM` fn-const.
-        let mrope_cos_sin_bytes = if model.mrope_section.is_some() {
-            let head_dim = *model.bounds.get("head_dim").unwrap_or(&0);
-            let rot_dim = model
-                .scalars
-                .get("partial_rotary_factor")
-                .copied()
-                .filter(|&f| (f - 1.0).abs() > 1e-9)
-                .map(|f| (f * head_dim as f64).round() as u64)
-                .unwrap_or(head_dim);
-            max_m * rot_dim * 2
-        } else {
-            0
-        };
-        (
-            proc_macro2::Literal::u64_unsuffixed(freqs_bytes),
-            proc_macro2::Literal::u64_unsuffixed(pixels_bytes),
-            proc_macro2::Literal::u64_unsuffixed(posemb_bytes),
-            proc_macro2::Literal::u64_unsuffixed(target_hidden_bytes),
-            proc_macro2::Literal::u64_unsuffixed(mm_embeds_bytes),
-            proc_macro2::Literal::u64_unsuffixed(mm_dst_rows_bytes),
-            proc_macro2::Literal::u64_unsuffixed(mrope_cos_sin_bytes),
-        )
+        draft_capture_bytes_lit,
+        draft_rows_lit,
+    ] = [
+        vision_freqs,
+        vision_pixels,
+        vision_posemb,
+        target_hidden,
+        mm_embeds,
+        mm_dst_rows,
+        mrope_cos_sin,
+        draft_capture,
+        draft_rows,
+    ]
+    .map(proc_macro2::Literal::u64_unsuffixed);
+    // What a step's followup gets of the rows a target captures for its DFlash2 drafter, from the
+    // worker's runtime bindings: they, or none on a model no drafter reads.
+    let (captured_runtime, captured_rows) = match draft_capture > 0 {
+        true => (quote! { runtime }, quote! { Some(&*runtime.draft_capture) }),
+        false => (quote! { _ }, quote! { None }),
     };
-    // The rows a target captures for its DFlash2 drafter (model dtype, `[max_m, slots · hidden]`;
-    // 0 on a model no drafter reads), and a drafter's block (its drafts and their anchor).
-    let (draft_capture_bytes_lit, draft_rows_lit, captured_rows) = {
-        let max_m = num_tokens_points.iter().copied().max().unwrap_or(0);
-        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(0);
-        let slots = (model.layer_sets.get(crate::config::DRAFT_CAPTURE_LAYERS))
-            .map_or(0, |s| s.members().len() as u64);
-        let rows = *model.bounds.get("spec_drafts").unwrap_or(&0) + 1;
-        let bytes = max_m * slots * hidden_size * 2;
-        // What a step's followup gets of them, from the worker's runtime bindings: they, or none
-        // on a model no drafter reads.
-        let captured_rows = match bytes > 0 {
-            true => (quote! { runtime }, quote! { Some(&*runtime.draft_capture) }),
-            false => (quote! { _ }, quote! { None }),
-        };
-        (
-            proc_macro2::Literal::u64_unsuffixed(bytes),
-            proc_macro2::Literal::u64_unsuffixed(rows),
-            captured_rows,
-        )
-    };
-    let (captured_runtime, captured_rows) = captured_rows;
 
     // Width of ONE row of the terminal arena slot, baked at
     // macro-expansion time: the metal forward shapes its returned
@@ -16160,10 +16389,11 @@ pub fn emit_model<D: crate::FactsDispatch>(
     // there would stride rows by ~65x the real row and read past the
     // slot. Vision-only encoders carry no vocab at all and would get
     // 0. Cuda builds skip the constant entirely.
-    let logits_width = match layout {
-        BackboneLayout::Decoder { .. } => model.bounds.get("vocab_size").copied().unwrap_or(0),
-        BackboneLayout::Encoder => model.bounds.get("hidden_size").copied().unwrap_or(0),
+    let terminal_row = match layout {
+        BackboneLayout::Decoder { .. } => TerminalRow::Logits,
+        BackboneLayout::Encoder => TerminalRow::Hidden,
     };
+    let logits_width = canonical_facts.visit(TerminalWidth(terminal_row));
     let vocab_size_lit = proc_macro2::Literal::u64_unsuffixed(logits_width);
     // The rows of the terminal slot a forward leaves for its caller: a decoder's logits of the
     // rows its step samples, at the front; an encoder's hidden state at every row.
@@ -16189,23 +16419,11 @@ pub fn emit_model<D: crate::FactsDispatch>(
     // MRoPE (Qwen3.5-VL): the per-token rotary cos/sin rows a forward reads in place of the
     // position-indexed cache, built on the host from its positions (`metal_rope_rows`); `None` on
     // 1D-rope arches, whose rope reads the positions.
-    let metal_rope_rows_fn: proc_macro2::TokenStream = match model.mrope_section {
-        Some([t, h, w]) => {
-            let head_dim = *model.bounds.get("head_dim").unwrap_or(&0);
-            let rot_dim_val = model
-                .scalars
-                .get("partial_rotary_factor")
-                .copied()
-                .filter(|&f| (f - 1.0).abs() > 1e-9)
-                .map(|f| (f * head_dim as f64).round() as u32)
-                .unwrap_or(head_dim as u32);
-            let rope_theta_val: f64 = model
-                .scalars
-                .get("rope_theta")
-                .copied()
-                .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-                .unwrap_or(10000.0);
-            let rope_theta_lit = proc_macro2::Literal::f64_unsuffixed(rope_theta_val);
+    let metal_rope_rows_fn: proc_macro2::TokenStream = match canonical_facts.visit(MropeRows) {
+        Some((mrope, rot_dim)) => {
+            let [t, h, w] = mrope.section();
+            let rot_dim_val = rot_dim.get();
+            let rope_theta_lit = proc_macro2::Literal::f64_unsuffixed(mrope.theta().get());
             let t_lit = proc_macro2::Literal::u32_unsuffixed(t);
             let h_lit = proc_macro2::Literal::u32_unsuffixed(h);
             let w_lit = proc_macro2::Literal::u32_unsuffixed(w);
@@ -16273,19 +16491,9 @@ pub fn emit_model<D: crate::FactsDispatch>(
     }));
     #[cfg(feature = "metal")]
     {
-        // A multi-token-prediction head (its body reads the target's hidden rows) chains its
-        // passes on the device.
-        let head = reads_target_hidden.then(|| {
-            let drafts = model.bounds.get("spec_drafts").copied();
-            let drafts =
-                u32::try_from(drafts.expect("an MTP head's spec_drafts")).expect("drafts fit u32");
-            let hidden = u32::try_from(target_hidden_width).expect("hidden width fits u32");
-            (drafts, hidden)
-        });
         metal_arena_bytes_statics.extend(canonical_facts.visit(OffTapeStatics {
-            model,
-            logits_width,
-            head,
+            terminal_row,
+            reads_target_hidden,
         }));
     }
     let metal_emission = quote! {

@@ -16721,7 +16721,7 @@ mod tests {
         let model = crate::config::load_file(&path).expect("load llama-3.2-1b");
 
         let expected_scale = 1.0_f32 / (*model.bounds.get("head_dim").unwrap() as f32).sqrt();
-        assert_eq!(attention_scale_for(&model), expected_scale);
+        assert_eq!(attention_scale_for(&model), Some(expected_scale));
         assert_eq!(attention_softcap_for(&model), 0.0);
     }
 
@@ -16755,7 +16755,7 @@ mod tests {
             expert_activation: crate::config::ExpertActivation::Silu,
         };
 
-        let scale = attention_scale_for(&model);
+        let scale = attention_scale_for(&model).expect("an attention model's scale");
         // scale = 256^-0.5 = 1/16 = 0.0625. Exact in f32.
         assert_eq!(scale, 0.0625_f32);
         assert_eq!(attention_softcap_for(&model), 50.0_f32);

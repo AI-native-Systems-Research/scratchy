@@ -119,9 +119,9 @@ impl<'a> RowSources<'a> {
 
     /// The table the row's rope reads: its site's first cos/sin, or MRoPE's per-forward one.
     fn cos_sin<M: ModelFacts>(self) -> Result<CosSinTable, LoweringError> {
-        match M::MROPE_SECTION.is_some() {
-            true => Ok(CosSinTable::Mrope),
-            false => self.of(WeightKind::CosSin, 0).map(CosSinTable::Static),
+        match M::MROPE {
+            Some(_) => Ok(CosSinTable::Mrope),
+            None => self.of(WeightKind::CosSin, 0).map(CosSinTable::Static),
         }
     }
 

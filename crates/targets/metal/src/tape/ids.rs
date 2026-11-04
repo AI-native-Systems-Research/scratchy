@@ -286,8 +286,6 @@ u32_newtype!(
     /// Block-table fanout per sequence: the KV cap rung a tape is baked for.
     #[derive(PartialOrd, Ord)]
     MaxBlocksPerSeq,
-    /// The positions a model attends over (`max_position_embeddings`): the top KV cap rung.
-    MaxPositions,
     /// Hidden / Q-projection size (`W::Q_SIZE` — `num_q_heads * head_dim`).
     QSize,
     /// MLP intermediate size (`W::INTERMEDIATE_SIZE`).

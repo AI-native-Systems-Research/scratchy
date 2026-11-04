@@ -170,20 +170,18 @@ pub use scratchy_subtile::handoff::SlotMap;
 ///   2. Gemma2's `query_pre_attn_scalar` — convention is
 ///      `scale = query_pre_attn_scalar.powf(-0.5)`.
 ///   3. Fallback `1 / sqrt(head_dim)` for Llama / Qwen2 / Qwen3.
-pub(crate) fn attention_scale_for(model: &crate::config::ModelParams) -> f32 {
+///
+/// `None` for a body with none of the three (no attention). The ONE derivation: the fill takes its
+/// `ATTN_SCALE` and the `Attention` fact's scale from here.
+pub(crate) fn attention_scale_for(model: &crate::config::ModelParams) -> Option<f32> {
     if let Some(s) = model.scalars.get("attention_multiplier") {
-        return *s as f32;
+        return Some(*s as f32);
     }
     match model.scalars.get("query_pre_attn_scalar") {
-        Some(q) => (*q as f32).powf(-0.5),
-        None => {
-            let head_dim_f = *model
-                .bounds
-                .get("head_dim")
-                .expect("attention emit: head_dim missing from model config")
-                as f32;
-            1.0 / head_dim_f.sqrt()
-        }
+        Some(q) => Some((*q as f32).powf(-0.5)),
+        None => (model.bounds.get("head_dim").copied())
+            .filter(|&hd| hd > 0)
+            .map(|hd| 1.0 / (hd as f32).sqrt()),
     }
 }
 /// The [`StorageFormat`] of the first weight input of `node`, or
