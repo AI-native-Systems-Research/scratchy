@@ -808,7 +808,11 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
             .model_tag
             .clone()
             .or_else(|| args.model.clone())
-            .context("a model is required: `scr launch claude <MODEL>`, or `--best-model`/`-A`")?,
+            .context(if cfg!(feature = "metal") {
+                "a model is required: `scr launch claude <MODEL>`, or `--best-model`/`-A`"
+            } else {
+                "a model is required: `scr launch claude <MODEL>`"
+            })?,
     };
 
     // Launch owns `--settings`: it is how the server under test is made to
@@ -1483,10 +1487,10 @@ mod tests {
         LaunchClaudeArgs::try_parse_from(argv).expect("launch args should parse")
     }
 
-    /// `-A` and `-a <MODEL>` / `-a=<MODEL>` parse with no positional model, and
-    /// both refuse one: `--best-model` picks the model, so a second source is a
-    /// typo. The old `--auto-mode` spelling is gone, so "auto mode" means only
-    /// Claude Code's permission mode.
+    /// `-A` parses with no positional model and refuses one: `--best-model`
+    /// picks the model, so a second source is a typo. Neither the old
+    /// `--auto-mode` spelling nor `-a` exists any more.
+    #[cfg(feature = "metal")]
     #[test]
     fn best_model_flags_parse_without_a_model() {
         use clap::Parser as _;
@@ -1495,25 +1499,22 @@ mod tests {
         assert!(parse(&["claude", "-A"]).unwrap().best_model);
         assert!(parse(&["claude", "--best-model"]).unwrap().best_model);
         assert!(parse(&["claude", "--auto-mode"]).is_err());
-        for argv in [
-            &["claude", "-a", "mlx-community/Qwen3.5-9B-4bit"][..],
-            &["claude", "-a=mlx-community/Qwen3.5-9B-4bit"][..],
-        ] {
-            let args = parse(argv).unwrap();
-            assert_eq!(
-                args.best_model_override.as_deref(),
-                Some("mlx-community/Qwen3.5-9B-4bit")
-            );
-            assert_eq!(args.model_tag, None);
-        }
-
+        assert!(parse(&["claude", "-a", "m"]).is_err());
         assert!(parse(&["claude", "my-model", "-A"]).is_err());
-        assert!(parse(&["claude", "-m", "my-model", "-a", "other"]).is_err());
         // The pick is for a server launch starts, so an external one refuses it.
         let url = "--server-url=http://127.0.0.1:8000";
         assert!(parse(&["claude", "-A", url]).is_err());
-        assert!(parse(&["claude", "-a", "m", url]).is_err());
         assert!(parse(&["claude", "m", url]).is_ok());
+    }
+
+    /// Without `metal`, `--best-model` is not a flag at all, rather than one
+    /// that fails at run time.
+    #[cfg(not(feature = "metal"))]
+    #[test]
+    fn best_model_is_absent_without_metal() {
+        use clap::Parser as _;
+        assert!(LaunchClaudeArgs::try_parse_from(["claude", "--best-model"]).is_err());
+        assert!(LaunchClaudeArgs::try_parse_from(["claude", "-A"]).is_err());
     }
 
     /// `--auto-mode-only` combines with every way of naming the local model.
@@ -1521,9 +1522,9 @@ mod tests {
     fn auto_mode_only_combines_with_each_model_source() {
         use clap::Parser as _;
         let parse = |argv: &[&str]| LaunchClaudeArgs::try_parse_from(argv).unwrap();
+        #[cfg(feature = "metal")]
         assert!(parse(&["claude", "--auto-mode-only", "-A"]).auto_mode_only);
-        assert!(parse(&["claude", "--auto-mode-only", "--best-model"]).auto_mode_only);
-        assert!(parse(&["claude", "--auto-mode-only", "-a=m"]).auto_mode_only);
+        assert!(parse(&["claude", "--auto-mode-only", "-m", "m"]).auto_mode_only);
         assert!(parse(&["claude", "--auto-mode-only", "m"]).auto_mode_only);
         assert!(!parse(&["claude", "m"]).auto_mode_only);
     }

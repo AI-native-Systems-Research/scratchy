@@ -2,7 +2,8 @@
 // Copyright contributors to the vLLM project
 
 //! `scr launch claude --best-model` (`-A`) — pick the model to serve from this
-//! Mac's memory class instead of naming one. Metal only.
+//! Mac's memory class instead of naming one. Metal only: the flag exists only
+//! in a `metal` build.
 //!
 //! The pick is the biggest quantized checkpoint in [`TIERS`] whose memory floor
 //! the machine clears AND whose config this binary compiled in: a model the
@@ -16,9 +17,6 @@
 //! GPU funds, where a per-tier guess would either waste it or ask for more than
 //! fits and be refused. The compressed TurboQuant KV cache a `metal` build
 //! compiles in is what stretches that window.
-//!
-//! `-a <MODEL>` keeps the `--best-model` settings but serves `<MODEL>` instead
-//! of the pick.
 
 use std::process::Command;
 
@@ -167,17 +165,23 @@ fn detect() -> Result<Gpu> {
     })
 }
 
-/// Resolve `--best-model` for `args`: `None` when neither `-A` nor `-a` was
-/// given, otherwise the model to serve.
-pub(crate) fn resolve(args: &LaunchClaudeArgs) -> Result<Option<String>> {
-    if !args.best_model && args.best_model_override.is_none() {
-        return Ok(None);
+/// Whether `--best-model` was given. Always false in a build without `metal`,
+/// where the flag does not exist.
+pub(crate) fn asked(args: &LaunchClaudeArgs) -> bool {
+    #[cfg(feature = "metal")]
+    return args.best_model;
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = args;
+        false
     }
-    if !cfg!(feature = "metal") {
-        bail!(
-            "--best-model picks a model for this Mac's GPU, and this build has no metal backend. \
-             Rebuild with `--features metal`."
-        );
+}
+
+/// Resolve `--best-model` for `args`: `None` when it was not given, otherwise
+/// the model to serve.
+pub(crate) fn resolve(args: &LaunchClaudeArgs) -> Result<Option<String>> {
+    if !asked(args) {
+        return Ok(None);
     }
     if args.device == "cpu" {
         bail!("--best-model sizes the model to the GPU; it has nothing to size with --device cpu");
@@ -185,21 +189,12 @@ pub(crate) fn resolve(args: &LaunchClaudeArgs) -> Result<Option<String>> {
     let gpu = detect()?;
     let mem_gib = gpu.mem_bytes as f64 / GIB as f64;
 
-    if let Some(model) = &args.best_model_override {
-        eprintln!(
-            "scratchy best model: {} ({mem_gib:.0} GiB) → {model} (from -a; context sized by the \
-             server to what the KV cache holds)",
-            gpu.name
-        );
-        return Ok(Some(model.clone()));
-    }
-
     let compiled = super::model::compiled_variant_stems();
     let pick = pick(gpu.mem_bytes, &compiled).map_err(|tier| {
         anyhow::anyhow!(
             "--best-model picked {} for {} ({mem_gib:.0} GiB), but this binary does not compile \
              it in. Build it with:\n  {}\nor name a model this build has: `scr launch claude \
-             -a <MODEL>`.",
+             <MODEL>`.",
             tier.model,
             gpu.name,
             build_line(tier),

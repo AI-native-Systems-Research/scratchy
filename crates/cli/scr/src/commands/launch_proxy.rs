@@ -208,15 +208,19 @@ async fn handle(
     let proxy2 = proxy.clone();
     let result = tokio::task::spawn_blocking(move || {
         let started = std::time::Instant::now();
-        let (to, result) = route(&proxy2, &method, &path, &headers, &body);
+        // Parsed once: routing reads it, and so does the log line.
+        let json = serde_json::from_slice::<Value>(&body).ok();
+        let model = json
+            .as_ref()
+            .and_then(|j| j.get("model")?.as_str().map(str::to_string));
+        let (to, result) = route(&proxy2, &method, &path, &headers, &body, json);
         if let Some(log) = &proxy2.log {
-            let model = serde_json::from_slice::<Value>(&body).ok();
             let error = result.as_ref().err().map(|e| format!("{e:#}"));
             let line = LogLine {
                 to,
                 method: &method,
                 path: &path,
-                model: model.as_ref().and_then(|m| m["model"].as_str()),
+                model: model.as_deref(),
                 outcome: match (&result, &error) {
                     (Ok(resp), _) => Ok(resp.status().as_u16()),
                     (Err(_), Some(e)) => Err(e.as_str()),
@@ -256,8 +260,10 @@ fn route(
     path: &str,
     headers: &HeaderMap,
     body: &[u8],
+    json: Option<Value>,
 ) -> (&'static str, Result<Response>) {
-    if let Some(local_body) = classifier_body(method, path, body, &proxy.routes.local_model) {
+    let local_body = json.and_then(|j| classifier_json(method, path, j, &proxy.routes.local_model));
+    if let Some(local_body) = local_body {
         let url = format!("{}{}", proxy.routes.local, path);
         let local_headers = [
             ("content-type", "application/json"),
@@ -283,17 +289,23 @@ fn route(
     )
 }
 
-/// The body to send the local server, when `body` is a classifier check: a
-/// `POST /v1/messages` naming [`CLASSIFIER_MODEL`]. `None` means forward the
-/// request to the gateway untouched.
-fn classifier_body(method: &Method, path: &str, body: &[u8], local_model: &str) -> Option<Vec<u8>> {
+/// The body to send the local server, when `json` (the request body, already
+/// parsed) is a classifier check: a `POST /v1/messages` naming
+/// [`CLASSIFIER_MODEL`]. `None` means forward the request to the gateway
+/// untouched. A body that is not JSON never gets here, so it goes to the
+/// gateway too.
+fn classifier_json(
+    method: &Method,
+    path: &str,
+    mut json: Value,
+    local_model: &str,
+) -> Option<Vec<u8>> {
     if method != Method::POST
         || !path.starts_with("/v1/messages")
         || path.starts_with("/v1/messages/")
     {
         return None;
     }
-    let mut json: Value = serde_json::from_slice(body).ok()?;
     if json.get("model").and_then(Value::as_str) != Some(CLASSIFIER_MODEL) {
         return None;
     }
@@ -399,14 +411,14 @@ fn stream_reader(
 
 #[cfg(test)]
 mod tests {
-    use super::{CLASSIFIER_MODEL, FORMAT_REMINDER, Method, classifier_body};
+    use super::{CLASSIFIER_MODEL, FORMAT_REMINDER, Method, classifier_json};
     use serde_json::{Value, json};
 
     fn check(body: &Value) -> Option<Value> {
-        classifier_body(
+        classifier_json(
             &Method::POST,
             "/v1/messages?beta=true",
-            &serde_json::to_vec(body).unwrap(),
+            body.clone(),
             "local-model",
         )
         .map(|b| serde_json::from_slice(&b).unwrap())
@@ -458,21 +470,19 @@ mod tests {
     }
 
     /// Everything that is not a classifier check stays on the gateway: the main
-    /// session, other models, other routes, and bodies that are not JSON.
+    /// session, other models and other routes. (A body that is not JSON is
+    /// covered end to end in `routes_each_request_to_its_upstream`.)
     #[test]
     fn everything_else_stays_on_the_gateway() {
         let main = json!({ "model": "claude-opus-5-5", "messages": [] });
         assert!(check(&main).is_none());
         assert!(check(&json!({ "messages": [] })).is_none());
 
-        let classifier =
-            serde_json::to_vec(&json!({ "model": CLASSIFIER_MODEL, "messages": [] })).unwrap();
-        assert!(classifier_body(&Method::GET, "/v1/messages", &classifier, "m").is_none());
-        assert!(
-            classifier_body(&Method::POST, "/v1/messages/count_tokens", &classifier, "m").is_none()
-        );
-        assert!(classifier_body(&Method::POST, "/v1/models", &classifier, "m").is_none());
-        assert!(classifier_body(&Method::POST, "/v1/messages", b"not json", "m").is_none());
+        let classifier = json!({ "model": CLASSIFIER_MODEL, "messages": [] });
+        let at = |method: &Method, path| classifier_json(method, path, classifier.clone(), "m");
+        assert!(at(&Method::GET, "/v1/messages").is_none());
+        assert!(at(&Method::POST, "/v1/messages/count_tokens").is_none());
+        assert!(at(&Method::POST, "/v1/models").is_none());
     }
 
     /// What a stand-in upstream received: one entry per request.
