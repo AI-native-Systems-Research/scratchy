@@ -125,9 +125,6 @@ indexmap = { version = "2", features = ["serde"] }
 bytes = "1"
 rand = "0.9"
 
-# ZeroMQ
-zeromq = "0.6"
-
 # Tokenizer. default-features=false drops the training-only defaults, since we
 # only ever infer: `progressbar` (training progress bars) and `esaxx_fast` (the
 # C++ suffix array the Unigram *trainer* uses — encode/decode never reach it).

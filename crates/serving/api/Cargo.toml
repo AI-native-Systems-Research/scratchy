@@ -48,7 +48,6 @@ metrics = ["prometheus"]
 #
 # No-op without `serve` (everything it gates lives in modules `serve` owns).
 tool-spans = []
-multiproc = ["scratchy-serving-engine/multiproc"]
 rag = ["spnl-core/rag", "dep:leann-core", "dep:ndarray", "dep:ureq"]
 
 [dependencies]

@@ -4,9 +4,7 @@
 //! Engine core client: the interface between the API server and the engine
 //! core.
 //!
-//! The client abstracts over different communication modes:
-//! - **In-process**: Direct function calls to `EngineCore` (no IPC).
-//! - **Multi-process**: ZMQ sockets to a background `EngineCore` process.
+//! The client runs `EngineCore` in-process: direct function calls, no IPC.
 //!
 //! Port of: `vllm/v1/engine/core_client.py`
 
@@ -25,14 +23,13 @@ use crate::executor::{Executor, ModelRunnerOutput};
 
 /// The interface between the API server front-end and the engine core.
 ///
-/// Subclasses handle different communication modes (in-process, ZMQ, etc.).
+/// Implemented in-process (direct calls into `EngineCore`).
 ///
 /// Port of: `vllm/v1/engine/core_client.py::EngineCoreClient`
 pub trait EngineCoreClient {
     /// Get the output from the latest engine step.
     ///
     /// For the in-process client, this runs a step and returns the outputs.
-    /// For the multi-process client, this receives outputs from ZMQ.
     ///
     /// See [`StepOutcome`] — a stall is a VARIANT, not a flag, so a step loop cannot reach the
     /// outputs without deciding what it does when nothing happened.

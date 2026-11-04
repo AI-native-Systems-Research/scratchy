@@ -46,8 +46,7 @@ use crate::spec_decode::{
 /// The inner loop of the vLLM engine.
 ///
 /// Manages the scheduler, dispatches work to the executor, and produces
-/// outputs. This struct is protocol-agnostic — it can be used in-process
-/// or wrapped with ZMQ sockets for multi-process operation.
+/// outputs. It runs in-process, called directly by the API server.
 ///
 /// Port of: `vllm/v1/engine/core.py::EngineCore`
 pub struct EngineCore {
@@ -1226,8 +1225,7 @@ impl EngineCore {
             // 2. Step the engine.
             match self.step() {
                 Ok(StepOutcome::Progressed { outputs, .. }) => {
-                    // In a real implementation, outputs would be sent over ZMQ.
-                    // For now, they are returned via the step() call above.
+                    // Outputs are returned via the step() call above.
                     let _ = outputs;
                 }
                 // This loop's `process_input` callback CAN change the engine's state between steps
