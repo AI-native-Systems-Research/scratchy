@@ -75,7 +75,8 @@ impl Score {
     pub(crate) fn score(&self, response: &str) -> f64 {
         match self {
             Score::None => 0.0,
-            // Run apart, by `run_tasks`: never reached through here.
+            // Scored by running its tests, which `run_task_tests` does apart: `task_metrics` scores
+            // it 0.0 here, and `tested_accuracy` then sets the cell's accuracy from the tests.
             Score::Tests(_) => 0.0,
             // Each source scored as its own benchmark scores it ([`crate::scoring`]), whether or
             // not this task has aliases.

@@ -1790,7 +1790,8 @@ fn run_tasks(
     }
     // A coding exercise's answers, run against its tests once each, after timing: None where the
     // machine cannot run them.
-    let tested = run_task_tests(args, &results, &tasks);
+    let count = |t: &str| datasets::token_count(tokenizer, t).unwrap_or(0);
+    let tested = run_task_tests(args, &results, &tasks, &count);
     if let Some(path) = &args.save_answers {
         let rows: Vec<serde_json::Value> = (results.iter().zip(tasks.iter()).enumerate())
             .map(|(i, (r, t))| {
@@ -1811,7 +1812,6 @@ fn run_tasks(
             .collect();
         std::fs::write(path, serde_json::to_string_pretty(&rows)?)?;
     }
-    let count = |t: &str| datasets::token_count(tokenizer, t).unwrap_or(0);
     let pcts: Vec<f64> = (args.metric_percentiles.split(','))
         .filter_map(|p| p.trim().parse().ok())
         .collect();
@@ -1837,6 +1837,31 @@ fn run_tasks(
     write_results(args, model, &json)
 }
 
+/// Whether an answer ran to its cap rather than ending on its own: the server's `length`, or where
+/// it sent no reason, its answer tokens (its usage count, or counted from its text where it sent
+/// none, as a span query's stream does). One rule, for accuracy, `capped_answers` and whether a
+/// coding answer's tests run.
+fn ran_to_cap(
+    r: &RequestResult,
+    t: &crate::workloads::Task,
+    count_tokens: &dyn Fn(&str) -> usize,
+) -> bool {
+    match r.finish_reason.as_deref() {
+        Some(why) => why == "length",
+        None => answer_tokens(r, count_tokens) >= t.max_tokens,
+    }
+}
+
+/// An answer's tokens: the server's usage count, or counted from its text where it sent none (a
+/// span query's stream carries no usage).
+fn answer_tokens(r: &RequestResult, count_tokens: &dyn Fn(&str) -> usize) -> usize {
+    if r.output_tokens > 0 {
+        r.output_tokens
+    } else {
+        count_tokens(&r.generated_text)
+    }
+}
+
 /// Each coding answer run against its exercise's tests (`polyglot`), in order: Some(passed), or
 /// None for a task that is not a coding exercise or a request that did not answer. None as a
 /// whole where the machine has no Python or no sandbox to run them in.
@@ -1844,6 +1869,7 @@ fn run_task_tests(
     args: &BenchServeArgs,
     results: &[RequestResult],
     tasks: &[crate::workloads::Task],
+    count_tokens: &dyn Fn(&str) -> usize,
 ) -> Option<Vec<Option<bool>>> {
     use crate::workloads::Score;
     // Forced answers are cut off at their length: no reading to run.
@@ -1860,10 +1886,7 @@ fn run_task_tests(
     eprintln!("Running each answer's tests...");
     // An answer that ran to its cap is wrong without running it, as for the text-scored workloads:
     // a file cut off mid-way is no answer, whatever of it passes.
-    let capped = |r: &RequestResult, t: &crate::workloads::Task| match r.finish_reason.as_deref() {
-        Some(why) => why == "length",
-        None => r.output_tokens >= t.max_tokens,
-    };
+    let capped = |r: &RequestResult, t: &crate::workloads::Task| ran_to_cap(r, t, count_tokens);
     Some(
         (results.iter().zip(tasks))
             .map(|(r, t)| match &t.score {
@@ -1952,13 +1975,7 @@ fn task_metrics(
     };
     let ms = |v: &[f64], p: f64| (!v.is_empty()).then(|| percentile(v, p) * 1000.0);
     // A span query's stream carries no usage, so its answer tokens are counted here.
-    let answer_tokens = |r: &RequestResult| {
-        if r.output_tokens > 0 {
-            r.output_tokens
-        } else {
-            count_tokens(&r.generated_text)
-        }
-    };
+    let answer_tokens = |r: &RequestResult| answer_tokens(r, count_tokens);
     let ttft = sorted(ok.iter().map(|(r, _)| r.ttft).collect());
     let e2el = sorted(ok.iter().map(|(r, _)| r.e2el).collect());
     let tpot = sorted(
@@ -1970,12 +1987,7 @@ fn task_metrics(
     let out: Vec<usize> = ok.iter().map(|(r, _)| answer_tokens(r)).collect();
     let total_out: usize = out.iter().sum();
     let mean = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
-    // Answers that ran to their cap rather than ending on their own: the server's `length`, or
-    // where it sent no reason, the token count.
-    let capped = |r: &RequestResult, t: &crate::workloads::Task| match r.finish_reason.as_deref() {
-        Some(why) => why == "length",
-        None => answer_tokens(r) >= t.max_tokens,
-    };
+    let capped = |r: &RequestResult, t: &crate::workloads::Task| ran_to_cap(r, t, count_tokens);
     // Over every task sent that has a right answer (null for a workload with none: chat turns,
     // the shared-prefix questions). A request that failed scores wrong, as does an answer that ran
     // to its cap, whose text may hold the answer somewhere in a ramble that never gave it. Over
@@ -2049,13 +2061,7 @@ fn add_task_percentiles(
         .filter(|(r, _)| r.success)
         .map(|(r, _)| r)
         .collect();
-    let answer_tokens = |r: &RequestResult| {
-        if r.output_tokens > 0 {
-            r.output_tokens
-        } else {
-            count_tokens(&r.generated_text)
-        }
-    };
+    let answer_tokens = |r: &RequestResult| answer_tokens(r, count_tokens);
     let sorted = |mut v: Vec<f64>| {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v
@@ -2577,6 +2583,30 @@ mod tests {
         ])
         .unwrap();
         assert!(shared_prefix_workload(&none, &text).1.is_none());
+    }
+
+    /// A server that sends neither usage nor a finish reason: an answer whose text runs to its cap
+    /// counts as capped, as `capped_answers` counts it, so its tests are not run, and one that
+    /// ended short of its cap is not.
+    #[test]
+    fn a_capped_answer_with_no_usage_is_capped_for_its_tests_too() {
+        let words = |t: &str| t.split_whitespace().count();
+        let task = rag("Paris");
+        let mut ramble = req(0, 1, 0.1, 0.5);
+        ramble.generated_text = "and ".repeat(task.max_tokens);
+        let mut short = req(0, 1, 0.1, 0.5);
+        short.generated_text = "Paris".into();
+        assert!(ran_to_cap(&ramble, &task, &words), "counted from its text");
+        assert!(!ran_to_cap(&short, &task, &words));
+        let j = task_metrics(
+            &[ramble],
+            std::slice::from_ref(&task),
+            &words,
+            1.0,
+            "musique",
+            7,
+        );
+        assert_eq!(j["capped_answers"], 1, "the cell counts it the same way");
     }
 
     /// A coding cell's accuracy is over every task sent, a failed request scoring wrong; it is

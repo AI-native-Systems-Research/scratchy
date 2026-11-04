@@ -14,8 +14,11 @@
 //!   written. Prompts only: a patch is scored in the repo's own environment, minutes a task.
 //!
 //! A Polyglot answer is model-written code, run on the machine benchmarking it. It runs under
-//! `sandbox-exec` (no network, no file writes outside its own temporary directory), isolated from
-//! the user's Python setup (`-I`), and stopped after [`TEST_TIMEOUT`].
+//! `sandbox-exec` under a deny-default profile ([`SANDBOX_PROFILE`]: no network, no exec but the
+//! interpreter, no fork, no reads or writes outside its own temporary directory and Python's own
+//! files), isolated from the user's Python setup (`-I`), and stopped after [`TEST_TIMEOUT`] or
+//! past [`TEST_MEMORY`]. It passes only on the tests' own report ([`RUN_TESTS`]), never on how the
+//! run exited.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -273,14 +276,14 @@ pub(crate) struct TestRunner {
 }
 
 /// The sandbox an answer's tests run in: everything denied but what an interpreter running
-/// `unittest` needs. It reads only its own directory, the interpreter's files and the system's
-/// (`system.sb`: dyld, the shared cache, the system libraries); it writes only its own directory;
-/// it execs only the interpreter, so it reaches no other binary, and with no Mach lookups beyond
-/// `system.sb`'s, no service that would write for it (cfprefsd, launchd, the pasteboard).
+/// `unittest` needs. It reads, or even stats, only its own directory, the interpreter's files and
+/// the system's (`system.sb`: dyld, the shared cache, the system libraries); it writes only its
+/// own directory; it execs only the interpreter, so it reaches no other binary, and with no Mach
+/// lookups beyond `system.sb`'s, no service that would write for it (cfprefsd, launchd, the
+/// pasteboard).
 const SANDBOX_PROFILE: &str = "(version 1)\n(deny default)\n(import \"system.sb\")\n\
      (allow process-exec (literal (param \"PYTHON\")))\n\
      (allow file-read* (subpath (param \"WORK\")) (subpath (param \"PYTHON_HOME\")))\n\
-     (allow file-read-metadata)\n\
      (allow file-write* (subpath (param \"WORK\")) (literal \"/dev/null\"))\n\
      (allow sysctl-read)\n";
 
@@ -298,12 +301,55 @@ const PROBE: &str = "import ctypes, os, sys, unittest\n\
      ctypes.CDLL(None)._NSGetExecutablePath(b, ctypes.byref(n))\n\
      print(os.path.realpath(b.value.decode()))\nprint(os.path.realpath(sys.base_prefix))\n";
 
-/// The test runner: loads the exercise's test module from the work directory and exits 0 only
-/// when every test ran and passed.
-const RUN_TESTS: &str = "import os, sys, unittest\nd = sys.argv[1]\nsys.path.insert(0, d)\n\
-     os.chdir(d)\nsuite = unittest.defaultTestLoader.loadTestsFromName(sys.argv[2])\n\
-     r = unittest.TextTestRunner(stream=open(os.devnull, 'w')).run(suite)\n\
-     sys.exit(0 if r.wasSuccessful() and r.testsRun > 0 else 1)\n";
+/// The test runner, given the work directory, the test module and where to report. It reads a
+/// one-run token on stdin, loads the exercise's test module (which imports the answer), puts back
+/// any of `unittest`'s classes the answer changed as it loaded, runs the tests, and only then
+/// writes its report ([`RESULT_FILE`]): the token, then the
+/// tests run, failures, errors, skips, expected failures and unexpected successes. An answer that
+/// ends the run as it loads (`sys.exit(0)`, `os._exit(0)`, `raise SystemExit`) or raises from
+/// anywhere writes no report, so it fails, whatever its exit code; the runner then leaves at once
+/// (`os._exit`), so no exit handler the answer set runs after the report. This stops an answer passing by
+/// accident, or by an obvious patch; an answer written to find the token in the runner's own frame
+/// on purpose is out of reach of any in-process check, and still runs only in the sandbox.
+const RUN_TESTS: &str = "import os, sys, unittest\n\
+     token = sys.stdin.readline().strip()\nsys.stdin.close()\n\
+     d, name, out = sys.argv[1], sys.argv[2], sys.argv[3]\ndel sys.argv[1:]\n\
+     sys.path.insert(0, d)\nos.chdir(d)\n\
+     kept = [(c, dict(vars(c))) for c in (unittest.TestCase, unittest.TestSuite,\n\
+         unittest.TestResult, unittest.TextTestResult, unittest.TextTestRunner)]\n\
+     def run():\n\
+     \x20   try:\n\
+     \x20       suite = unittest.defaultTestLoader.loadTestsFromName(name)\n\
+     \x20       for c, attrs in kept:\n\
+     \x20           for k in set(vars(c)) - set(attrs):\n\
+     \x20               delattr(c, k)\n\
+     \x20           for k, v in attrs.items():\n\
+     \x20               if vars(c).get(k) is not v:\n\
+     \x20                   setattr(c, k, v)\n\
+     \x20       return unittest.TextTestRunner(stream=open(os.devnull, 'w')).run(suite)\n\
+     \x20   except BaseException:\n\
+     \x20       return None\n\
+     r = run()\n\
+     if r is not None:\n\
+     \x20   with open(out, 'w') as f:\n\
+     \x20       f.write(' '.join(map(str, [token, r.testsRun, len(r.failures), len(r.errors),\n\
+     \x20           len(r.skipped), len(r.expectedFailures), len(r.unexpectedSuccesses)])))\n\
+     os._exit(0)\n";
+
+/// Where [`RUN_TESTS`] writes its report, in the work directory.
+const RESULT_FILE: &str = "_scr_result";
+
+/// Whether [`RUN_TESTS`]' report says every test ran and passed: this run's `token`, at least one
+/// test run, and no failure, error, skip, expected failure or unexpected success (no exercise
+/// skips or expects a failure, so one is the answer's doing).
+fn reported_pass(report: &str, token: &str) -> bool {
+    let mut fields = report.split_whitespace();
+    if fields.next() != Some(token) {
+        return false;
+    }
+    let counts: Option<Vec<usize>> = fields.map(|f| f.parse().ok()).collect();
+    matches!(counts.as_deref(), Some([run, 0, 0, 0, 0, 0]) if *run > 0)
+}
 
 impl TestRunner {
     /// `python` (a path, or a name on `PATH`) under `/usr/bin/sandbox-exec`, once it has run the
@@ -333,7 +379,7 @@ impl TestRunner {
         };
         let work = WorkDir::new().ok()?;
         let ok = runner
-            .run(&work.0, &["-c", "import unittest"], TEST_TIMEOUT)
+            .run(&work.0, &["-c", "import unittest"], TEST_TIMEOUT, "")
             .ok()?;
         ok.then_some(runner)
     }
@@ -355,17 +401,27 @@ impl TestRunner {
         }
         std::fs::write(dir.join("_scr_run_tests.py"), RUN_TESTS)?;
         let script = dir.join("_scr_run_tests.py");
-        let script = script.to_string_lossy();
-        let work_dir = dir.to_string_lossy();
-        self.run(&dir, &[&script, &work_dir, exercise.test_module()], limit)
-            .with_context(|| format!("running {}'s tests", exercise.name))
+        let report = dir.join(RESULT_FILE);
+        let (script, work_dir, out) = (
+            script.to_string_lossy(),
+            dir.to_string_lossy(),
+            report.to_string_lossy(),
+        );
+        // A token this run alone knows, so a report the answer wrote is not the runner's.
+        let token = format!("{:032x}", rand::random::<u128>());
+        let args = [&*script, &*work_dir, exercise.test_module(), &*out];
+        self.run(&dir, &args, limit, &token)
+            .with_context(|| format!("running {}'s tests", exercise.name))?;
+        let report = std::fs::read_to_string(&report).unwrap_or_default();
+        Ok(reported_pass(&report, &token))
     }
 
-    /// Run the interpreter (`-I -B`, then `args`) in `dir` under the sandbox, stopped after `limit`:
-    /// whether it exited 0. It runs in a process group of its own, under memory and process
-    /// limits, and the whole group is killed when it ends or times out, so nothing it forked
-    /// outlives it into the next cells' timing.
-    fn run(&self, dir: &Path, args: &[&str], limit: Duration) -> Result<bool> {
+    /// Run the interpreter (`-I -B`, then `args`) in `dir` under the sandbox, with `input` on its
+    /// stdin, stopped after `limit`: whether it exited 0. It runs in a process group of its own,
+    /// its memory watched, and the whole group is killed when it ends or times out, so nothing it
+    /// forked outlives it into the next cells' timing.
+    fn run(&self, dir: &Path, args: &[&str], limit: Duration, input: &str) -> Result<bool> {
+        use std::io::Write;
         use std::os::unix::process::CommandExt;
         let profile = dir.join("_scr.sb");
         std::fs::write(&profile, SANDBOX_PROFILE)?;
@@ -382,12 +438,17 @@ impl TestRunner {
             .args(["-I", "-B"])
             .args(args)
             .current_dir(dir)
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .process_group(0);
         let mut child = cmd.spawn()?;
         let group = child.id() as libc::pid_t;
+        // One short line, far under the pipe's buffer: written whole before the child reads it.
+        // A child that exited first leaves a broken pipe, which is its failure, not the runner's.
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "{input}");
+        }
         let start = std::time::Instant::now();
         let passed = loop {
             if let Some(status) = child.try_wait()? {
@@ -601,9 +662,38 @@ mod tests {
         )
     }
 
+    /// An answer passes only on its tests' own report, not on how the run exited: one that ends the
+    /// run as it loads (`sys.exit(0)`, `os._exit(0)`, `raise SystemExit`) never ran a test, and
+    /// one that switches off `unittest`'s asserts as it loads is tested with them back on.
+    #[test]
+    fn an_answer_that_exits_or_patches_the_tests_fails() {
+        let Some(runner) = TestRunner::find("python3") else {
+            eprintln!("skipped: no python3 or sandbox-exec");
+            return;
+        };
+        let e = exercise();
+        for (trick, answer) in [
+            ("sys.exit(0)", "import sys\nsys.exit(0)"),
+            ("os._exit(0)", "import os\nos._exit(0)"),
+            ("raise SystemExit", "raise SystemExit"),
+            (
+                "a wrong add with assertEqual switched off",
+                "import unittest\nunittest.TestCase.assertEqual = lambda *a, **k: None\n\
+                 def add(a, b):\n    return 0",
+            ),
+        ] {
+            let answer = format!("```python\n{answer}\n```");
+            assert!(!runner.passes(&e, &answer).unwrap(), "{trick} passed");
+        }
+        // The same right answer still passes once the tests are back as they were.
+        let right = "```python\nimport unittest\nunittest.TestCase.assertEqual = lambda *a, **k: None\n\
+                     def add(a, b):\n    return a + b\n```";
+        assert!(runner.passes(&e, right).unwrap());
+    }
+
     /// The sandbox denies by default: an answer can reach no Mach service that writes for it
     /// (`defaults write`, through cfprefsd), exec nothing but the interpreter, submit no launchd
-    /// job, and read nothing outside its work directory and Python's own files.
+    /// job, and read or stat nothing outside its work directory and Python's own files.
     #[test]
     fn an_answer_reaches_nothing_outside_its_directory() {
         let Some(runner) = TestRunner::find("python3") else {
@@ -662,6 +752,15 @@ mod tests {
         assert!(
             !runner.passes(&e, &reads).unwrap(),
             "the home directory was read"
+        );
+        // Nor can it stat a path there: whether a file exists, its size or its times.
+        let stats = format!(
+            "```python\nimport os\nos.stat({:?})\ndef add(a, b):\n    return a + b\n```",
+            home.join(".ssh").display().to_string()
+        );
+        assert!(
+            !runner.passes(&e, &stats).unwrap(),
+            "a path outside was stat'd"
         );
     }
 
