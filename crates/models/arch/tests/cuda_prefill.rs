@@ -63,7 +63,7 @@ const HIDDEN: usize = 1024;
 /// The weight buffers: the 266 the tapes read (the tied lm_head reads the embedding table's).
 const WEIGHTS: u64 = 266;
 /// The worker's arena: the largest tape's, m=4096.
-const ARENA: u64 = 2_585_035_776;
+const ARENA: u64 = 2_593_424_384;
 /// (n)'s floor: each decode at the block boundary against the same row of one forward.
 const BOUNDARY_DECODE_COSINE: f64 = 0.999;
 /// (k) teacher-forced's floor, #830.

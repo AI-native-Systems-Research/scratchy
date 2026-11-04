@@ -76,15 +76,25 @@ fn plan(name: &str, input: LoweringInput) -> CudaPlan {
 }
 
 /// None of the shared fixtures has a `Silu` read by a `Mul` (the layers use the pre-fused
-/// `SiluMul`), so CUDA's one fold absorbs nothing in any of them.
+/// `SiluMul`), so CUDA's gated fold absorbs nothing in any of them. The layers' residual adds fold
+/// into the norm that reads them (#1049's `AddRmsNorm`): one layer's mid-layer add (op 8, into
+/// norm 9), and each of three layers' adds but the last. Nothing else is absorbed.
 #[test]
-fn plan_canonical_folds_nothing_in_a_fixture_with_no_silu_into_mul() {
+fn plan_canonical_folds_only_the_residual_norms_in_the_shared_fixtures() {
+    let want: [(&str, &[(usize, usize)]); 2] = [
+        ("one_layer", &[(8, 9)]),
+        (
+            "n_layer(3)",
+            &[(8, 9), (14, 15), (23, 24), (29, 30), (38, 39)],
+        ),
+    ];
     for (name, input) in fixtures() {
         let p = plan(name, input);
-        assert!(
-            p.folds.absorbed_ops().is_empty(),
-            "{name}: no Silu feeds a Mul, yet the fold pass absorbed {:?}",
-            p.folds.absorbed_ops()
+        let absorbed = (want.iter().find(|(n, _)| *n == name)).map_or(&[][..], |(_, a)| *a);
+        assert_eq!(
+            p.folds.absorbed_ops(),
+            absorbed,
+            "{name}: only the residual norms fold"
         );
         assert!(
             p.colouring.count().get() >= 1,
@@ -385,14 +395,15 @@ fn mlp_block() -> LoweredDecode {
     })
 }
 
-/// The shared fold pass, under CUDA's table, folds the MLP's `Silu` (op 3) into its `Mul` (op 4)
-/// and nothing else, as the `SiluMul` kernel with the projections apart; the lowered tape has one
-/// launch fewer than the block has ops.
+/// The shared fold pass, under CUDA's table, folds the MLP's `Silu` (op 3) and its gate and up
+/// projections (ops 1 and 2) into its `Mul` (op 4) and nothing else, as the gate/up kernel
+/// (`CUDA_FOLD_PROJECTIONS`, #1049); the lowered tape has three launches fewer than the block has
+/// ops.
 #[test]
-fn the_silu_folds_into_the_mul_it_gates() {
+fn the_silu_and_its_projections_fold_into_the_mul_it_gates() {
     let l = mlp_block();
     let p = plan_canonical(&l, FACTS, AT).expect("plan_canonical on the MLP block");
-    assert_eq!(p.folds.absorbed_ops(), [(3, 4)]);
+    assert_eq!(p.folds.absorbed_ops(), [(1, 4), (2, 4), (3, 4)]);
     assert!(p.folds.epilogue_ops().is_empty());
     let slots: Vec<_> = (p.tape.instrs().iter())
         .filter_map(|i| match i {
@@ -410,17 +421,22 @@ fn the_silu_folds_into_the_mul_it_gates() {
         panic!("expected one fold, got {fusions:?}");
     };
     assert_eq!(*driver, slots[4]);
-    assert_eq!(fusion.kernel, CudaFusion::SiluMul);
+    assert_eq!(fusion.kernel, CudaFusion::GateUpSiluMul);
     assert_eq!(
         fusion.shape,
         FusedShape::Gated {
             activation: slots[3],
-            gate: None,
-            up: None
+            gate: Some(slots[1]),
+            up: Some(slots[2])
         }
     );
     let c = lower_canonical(&l, FACTS, AT).expect("the MLP block lowers");
-    assert_eq!(c.steps.len(), 6, "seven ops, one absorbed: {:?}", c.steps);
+    assert_eq!(c.steps.len(), 4, "seven ops, three absorbed: {:?}", c.steps);
+    assert!(
+        matches!(c.steps[1], CudaStep::GateUpAct(_)),
+        "the gate/up launch: {:?}",
+        c.steps[1]
+    );
 }
 
 /// A one-row GEMM over the embedded hidden: `x [1, k] · W` (`W` the IR's `[k, n]`).

@@ -1708,6 +1708,32 @@ use scratchy_target_cuda::tape::ArenaOffset;
 /// The decode position the layer-0 diagnostic follows: (k)'s first step.
 const DIAG_P: usize = 300;
 
+/// The m=512 chain each one-row fold replaces, as m=1 kinds (#1049): the experts' gate/up GEMV is
+/// the gate's and the up's gathered GEMVs and the activation. A kind not listed is itself.
+const FUSED_CHAINS: [(&str, &[&str]); 1] =
+    [("ExpertGateUpAct", &["ExpertGemv", "ExpertGemv", "GeluMul"])];
+
+/// The m=512 chain of an m=1 step of kind `k`: [`FUSED_CHAINS`]' entry, else `k` itself.
+fn fused_chain(k: &'static str) -> Vec<&'static str> {
+    (FUSED_CHAINS.iter())
+        .find(|(f, _)| *f == k)
+        .map_or_else(|| vec![k], |(_, chain)| chain.to_vec())
+}
+
+/// The steps the step-by-step check compares, decode against one-shot (#1049): every m=1 step
+/// with the m=512 step its chain ends at (a fused step's output is its chain's last step's), so
+/// each pair writes the same values. `k_diag_layer0_step_by_step_decode_against_one_shot` asserted
+/// first that the chains pair the m=512 steps one to one.
+fn paired_steps(one: &CudaTape, s1: &[usize], s512: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let mut at = 0;
+    let mut ends = Vec::with_capacity(s1.len());
+    for &i in s1 {
+        at += fused_chain(kinds(&one.steps[i]).0).len();
+        ends.push(s512[at - 1]);
+    }
+    (s1.to_vec(), ends)
+}
+
 /// A step's kind, and the kind of its m=1 counterpart: the m=512 tape's GEMMs are the m=1 tape's
 /// GEMVs, its prefill attention the decode's, its grouped expert GEMM the gathered GEMV.
 fn kinds(s: &CudaStep) -> (&'static str, &'static str) {
@@ -1936,10 +1962,14 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
     let k1: Vec<&str> = s1.iter().map(|&i| kinds(&one.steps[i]).0).collect();
     let k512: Vec<&str> = s512.iter().map(|&i| kinds(&many.steps[i]).1).collect();
     eprintln!("(k-diag0) layer 0's m=1 steps {k1:?}");
+    // A one-row fold (#1049, the experts' `ExpertGateUpAct`) is the m=512 chain it replaces:
+    // the decode tape's steps, each fused one spelled as that chain, pair the prefill's one to one.
+    let chain1: Vec<&str> = (k1.iter()).flat_map(|&k| fused_chain(k)).collect();
     assert_eq!(
-        k1, k512,
-        "layer 0's m=512 steps, as their m=1 kinds, pair one to one"
+        chain1, k512,
+        "layer 0's m=512 steps, as their m=1 kinds, pair one to one with the m=1 steps' chains"
     );
+    let (s1, s512) = paired_steps(one, &s1, &s512);
     let extents = |t: &CudaTape, i: usize| t.steps[i].extents().expect("the step's extents");
     let mut list = CUDA_TAPES.to_vec();
     list.extend(s1.iter().map(|&i| cut(one, i, extents(one, i).writes)));

@@ -37,7 +37,8 @@ use std::path::PathBuf;
 use scratchy_models::gemma4_moe::gemma_4_26b_a4b_it::{CUDA_TAPES, CUDA_UNLOWERED, CUDA_WEIGHTS};
 use scratchy_subtile::handoff::TargetModelInput;
 use scratchy_target_cuda::step::{
-    AttnPrefillBf16, CudaStep, GemmBf16, MatmulKernel, MoeWeight, RopePairing, RouteProgram,
+    AttnPrefillBf16, CudaStep, GateUpKernel, GatedOp, GemmBf16, MatmulKernel, MoeWeight,
+    RopePairing, RouteProgram,
 };
 use scratchy_target_cuda::tape::{ArenaSpan, CudaTape, KvClass};
 use scratchy_target_cuda::weights::CudaWeight;
@@ -77,14 +78,14 @@ const DENSE_INTER: u32 = 2112;
 const CAP: f32 = 30.0;
 
 /// The steps every bucket shares, whatever its kernels.
-const COMMON_STEPS: [(&str, usize); 16] = [
-    ("Add", 90),
+const COMMON_STEPS: [(&str, usize); 15] = [
     ("Embed", 1),
     ("ExpertCombine", 30),
-    ("GeluMul", 60),
+    ("GateUpAct", 30),
     ("LayerScale", 30),
     ("MoeRoute", 30),
-    ("RmsNorm", 271),
+    ("NormAdd", 90),
+    ("RmsNorm", 181),
     ("RmsNormUnit", 30),
     ("Rope", 30),
     ("RopeAppend", 30),
@@ -93,38 +94,41 @@ const COMMON_STEPS: [(&str, usize); 16] = [
     ("Scale", 1),
     ("SoftCap", 1),
     ("AttnSteps", 30),
-    ("ExpertSteps", 90),
 ];
-/// The decode tape's own steps: its GEMMs are GEMVs, its experts gathered.
-const DECODE_STEPS: [(&str, usize); 4] = [
+/// The decode tape's own steps: its GEMMs are GEMVs, its experts gathered, their gate and up one
+/// launch with the activation.
+const DECODE_STEPS: [(&str, usize); 6] = [
     ("AttnDecode", 30),
-    ("ExpertGemv", 90),
-    ("Gemv", 121),
+    ("ExpertGateUpAct", 30),
+    ("ExpertGemv", 30),
+    ("ExpertSteps", 30),
+    ("Gemv", 61),
     ("GemvGroup", 30),
 ];
-/// Every prefill tape's own steps: its experts sorted, then the grouped GEMM; the dense gate and
-/// up on the 64-column GEMM.
-const PREFILL_STEPS: [(&str, usize); 6] = [
+/// Every prefill tape's own steps: its experts sorted, then the grouped GEMM and the experts'
+/// activation; the dense gate and up one launch with theirs (on the 64-column tile).
+const PREFILL_STEPS: [(&str, usize); 7] = [
     ("AttnPrefill", 30),
     ("ExpertGemm", 90),
     ("ExpertSort", 30),
+    ("ExpertSteps", 90),
+    ("GeluMul", 30),
     ("Gemm", 61),
-    ("GemmCol64", 60),
     ("GemmGroup", 30),
 ];
-const DECODE_STEP_COUNT: usize = 935;
-const PREFILL_STEP_COUNT: usize = 965;
-const COLOURS: usize = 23;
+const DECODE_STEP_COUNT: usize = 725;
+const PREFILL_STEP_COUNT: usize = 815;
+const COLOURS: usize = 24;
 
 /// Per bucket: the arena's `total_bytes` (with the token ids), the MoE scratch's offset and bytes
 /// (from `logits` to the end of the router-norm rows), and its max tiles.
 const ARENAS: [(u32, u64, u64, u64, u32); 5] = [
-    // 753,408 bytes before #1031, plus its 65,536-byte GEMV scratch at the end.
-    (1, 818_944, 667_904, 85_248, 0),
-    (512, 659_471_104, 341_183_232, 318_285_824, 159),
-    (1024, 1_067_166_464, 682_365_696, 384_796_672, 191),
-    (2048, 1_882_557_440, 1_364_730_624, 517_818_624, 255),
-    (4096, 3_513_339_392, 2_729_460_480, 783_862_528, 383),
+    // 759,040 bytes before the GEMV scratch, plus its 65,536 bytes at the end.
+    (1, 824_576, 673_536, 85_248, 0),
+    (512, 662_354_688, 344_066_816, 318_285_824, 159),
+    (1024, 1_072_933_632, 688_132_864, 384_796_672, 191),
+    (2048, 1_894_091_776, 1_376_264_960, 517_818_624, 255),
+    (4096, 3_536_408_064, 2_752_529_152, 783_862_528, 383),
 ];
 
 /// The weight table: 627 entries naming the checkpoint's 657 text tensors (each expert bank names
@@ -322,6 +326,19 @@ fn every_tape_has_the_predicted_steps() {
             match *step {
                 CudaStep::GemmCol64(GemmBf16 { n, k, .. }) => {
                     assert_eq!((n, k), (DENSE_INTER, HIDDEN), "m={m}: a dense gate or up")
+                }
+                // The dense gate and up folded into one launch (#1049): on the 64-column kernel
+                // above one row, the GEMV at one row.
+                CudaStep::GateUpAct(g) => {
+                    let kernel = match m {
+                        1 => GateUpKernel::Gemv,
+                        _ => GateUpKernel::GemmCol64,
+                    };
+                    assert_eq!(
+                        (g.gate.n, g.gate.k, g.kernel, g.act),
+                        (DENSE_INTER, HIDDEN, kernel, GatedOp::Gelu),
+                        "m={m}: the dense gate and up"
+                    );
                 }
                 CudaStep::RouterLogits(r) => {
                     let kernel = match m {

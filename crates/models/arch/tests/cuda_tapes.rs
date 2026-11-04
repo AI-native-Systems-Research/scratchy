@@ -40,52 +40,52 @@ const LAYERS: u32 = 24;
 const KV_LAYERS: &[u32] = &[3, 7, 11, 15, 19, 23];
 
 /// Steps per tape, every bucket.
-const STEPS: usize = 321;
+const STEPS: usize = 225;
 const DECODE_STEPS: [(&str, usize); 13] = [
-    ("Add", 48),
+    ("AddRmsNorm", 48),
     ("AttnDecode", 6),
     ("Embed", 1),
     ("GateApply", 6),
     ("GateSplit", 6),
-    ("GatedDeltaNet", 18),
+    ("GateUpAct", 24),
+    ("GdnDecode", 18),
     ("GemmNarrowGroup", 18),
-    ("Gemv", 97),
+    ("Gemv", 49),
     ("GemvGroup", 24),
-    ("RmsNorm", 61),
+    ("RmsNorm", 13),
     ("Rope", 6),
     ("RopeAppend", 6),
-    ("SiluMul", 24),
 ];
 const DECODE_COLOUR_BYTES: &[u64] = &[
-    2048, 2048, 12288, 4096, 32, 32, 4096, 2048, 7168, 7168, 7168, 7168, 2048, 8192, 1024, 1024,
-    1024, 4096, 4096, 496640, 4096, 4096, 4096, 4096, 4096, 4096,
+    2048, 2048, 12288, 4096, 32, 32, 4096, 2048, 2048, 7168, 7168, 7168, 7168, 2048, 8192, 1024,
+    1024, 1024, 4096, 4096, 496640, 4096, 4096, 4096, 4096, 4096, 4096,
 ];
-/// 633,600 bytes before #1031, plus its 20,480-byte GEMV scratch at the end.
-const DECODE_TOTAL: u64 = 654_080;
-const DECODE_RESULT: ArenaSpan = span(77_312, 496_640);
-const DECODE_IDS: ArenaSpan = span(633_344, 4);
-const DECODE_ROTARY: ArenaSpan = span(598_528, 128);
+/// 635,648 bytes before the GEMV scratch, plus its 20,480 bytes at the end.
+const DECODE_TOTAL: u64 = 656_128;
+const DECODE_RESULT: ArenaSpan = span(79_360, 496_640);
+const DECODE_IDS: ArenaSpan = span(635_392, 4);
+const DECODE_ROTARY: ArenaSpan = span(600_576, 128);
 /// The block table, the slot mapping, the sequence.
-const DECODE_KV: [ArenaSpan; 3] = [span(598_784, 512), span(599_296, 4), span(599_552, 8)];
+const DECODE_KV: [ArenaSpan; 3] = [span(600_832, 512), span(601_344, 4), span(601_600, 8)];
 /// The GDN sequence, the GDN scratch.
-const DECODE_GDN: [ArenaSpan; 2] = [span(599_808, 16), span(600_064, 33_280)];
+const DECODE_GDN: [ArenaSpan; 2] = [span(601_856, 16), span(602_112, 33_280)];
 
 const PREFILL_STEPS: [(&str, usize); 13] = [
-    ("Add", 48),
+    ("AddRmsNorm", 48),
     ("Embed", 1),
     ("AttnPrefill", 6),
     ("GateApply", 6),
     ("GateSplit", 6),
+    ("GateUpAct", 24),
     ("GatedDeltaNet", 18),
-    ("Gemm", 97),
+    ("Gemm", 49),
     ("GemmGroup", 24),
     ("GemmNarrowGroup", 18),
-    ("RmsNorm", 61),
+    ("RmsNorm", 13),
     ("Rope", 6),
     ("RopeAppend", 6),
-    ("SiluMul", 24),
 ];
-const COLOURS: usize = 26;
+const COLOURS: usize = 27;
 
 /// Per bucket: the arena's `total_bytes` before the token ids (#812's), colour 0 (the embedded
 /// hidden), the result span. The token ids, `4·bucket_m` bytes, sit at that total, and the arena
@@ -93,32 +93,32 @@ const COLOURS: usize = 26;
 const ARENAS: [(u32, u64, ArenaSpan, ArenaSpan); 4] = [
     (
         512,
-        323_128_320,
+        324_176_896,
         span(0, 1_048_576),
-        span(39_354_368, 254_279_680),
+        span(40_402_944, 254_279_680),
     ),
     (
         1024,
-        646_255_616,
+        648_352_768,
         span(0, 2_097_152),
-        span(78_708_736, 508_559_360),
+        span(80_805_888, 508_559_360),
     ),
     (
         2048,
-        1_292_510_208,
+        1_296_704_512,
         span(0, 4_194_304),
-        span(157_417_472, 1_017_118_720),
+        span(161_611_776, 1_017_118_720),
     ),
     (
         4096,
-        2_585_019_392,
+        2_593_408_000,
         span(0, 8_388_608),
-        span(314_834_944, 2_034_237_440),
+        span(323_223_552, 2_034_237_440),
     ),
 ];
 
 /// Per bucket, the arena's `total_bytes` with the token ids.
-const TOTALS: [u64; 4] = [323_130_368, 646_259_712, 1_292_518_400, 2_585_035_776];
+const TOTALS: [u64; 4] = [324_178_944, 648_356_864, 1_296_712_704, 2_593_424_384];
 
 /// The weight table: 266 entries from the checkpoint's 320 decoder tensors (247 bf16 tensors, 18
 /// GDN bundles of four, the embedding table).

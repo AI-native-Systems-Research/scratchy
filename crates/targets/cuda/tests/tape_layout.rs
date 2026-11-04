@@ -385,15 +385,14 @@ fn the_mlp_numbers() {
     assert_eq!(MLP_M128.arena.total_bytes, 4456448);
     let [
         CudaStep::RmsNorm(n),
-        CudaStep::Gemm(gate),
-        CudaStep::Gemm(up),
-        CudaStep::SiluMul(sm),
+        CudaStep::GateUpAct(gu),
         CudaStep::Gemm(down),
         CudaStep::Add(y),
     ] = *MLP_M256.steps
     else {
-        panic!("the MLP's steps are norm, gemm, gemm, silu_mul, gemm, add");
+        panic!("the MLP's steps are norm, gate/up and silu_mul in one launch (#1049), gemm, add");
     };
+    let (gate, up, sm) = (gu.gate, gu.up, gu.activation());
     assert_eq!((n.eps(), n.convention), (EPS, GainConvention::OnePlusScale));
     assert_eq!((gate.a, up.a), (n.y, n.y), "both projections read n");
     assert_eq!((sm.gate, sm.up), (gate.c, up.c), "silu(gate) · up");
@@ -2345,6 +2344,16 @@ fn a_gemma_moe_block_lowers_in_both_modes() {
                 CudaStep::ExpertGemv(g) => {
                     experts += 1;
                     assert_eq!(g.weight, MoeWeight::Own, "m={m}");
+                }
+                // At one row the gate and up GEMVs and the GeGLU are one launch (#1049).
+                CudaStep::ExpertGateUpAct(g) => {
+                    gelus += 1;
+                    experts += 2;
+                    assert_eq!(g.act, scratchy_target_cuda::step::GatedOp::Gelu, "m={m}");
+                    assert_eq!(
+                        (g.gate.weight, g.up.weight),
+                        (MoeWeight::Own, MoeWeight::Own)
+                    );
                 }
                 CudaStep::ExpertGemm(g) => {
                     experts += 1;

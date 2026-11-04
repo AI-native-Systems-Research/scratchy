@@ -444,7 +444,9 @@ fn n_direct(device: &CudaDevice, tape: &CudaTape, x: &[u16], g: &[u16]) -> Vec<u
 /// Both buckets of one worker, each stage against its own GPU input: `n_direct` against the norm
 /// reference; `gate` and `up` against the GEMMs of `n_direct` (so a wrong norm step in the tape
 /// shows up there, the norm kernel being deterministic); `a` against SiluMul of `gate` and `up`;
-/// `d` against the GEMM of `a`; `y` bit-exactly against the add of `d` and `x`.
+/// `d` against the GEMM of `a`; `y` bit-exactly against the add of `d` and `x`. `gate` and `up`
+/// are the fused step's projections, recomputed by the GEMM kernel alone from `n_direct` (#1049:
+/// the `GateUpAct` launch keeps them in registers).
 #[test]
 fn the_mlp_block_matches_the_cpu_reference_in_each_bucket() {
     let device = h100();
@@ -462,8 +464,8 @@ fn the_mlp_block_matches_the_cpu_reference_in_each_bucket() {
         let n = n_direct(&device, tape, &x, &w.g);
         let n_ref = rms_norm_reference(&x, &w.g, (m, MLP_H), f64::from(EPS), 1.0);
         pass &= check_rows("n_direct = RmsNorm(x, g)", &n, &n_ref, (m, MLP_H));
-        let gate = read(&mut worker, colour(tape, 2));
-        let up = read(&mut worker, colour(tape, 3));
+        let gate = gate_up_direct(&device, tape, &n, &w.wg, false);
+        let up = gate_up_direct(&device, tape, &n, &w.wu, true);
         let a = read(&mut worker, colour(tape, 5));
         let d = read(&mut worker, colour(tape, 1));
         pass &= check_stage("gate = n·Wgᵀ", &gate, &n, &w.wg, (m, MLP_I, MLP_H));
@@ -543,18 +545,18 @@ fn the_mlp_worker_allocates_once_and_no_forward_allocates() {
     assert!(identical, "a bucket's result changed between forwards");
 }
 
-/// [`MLP_M256`]'s steps with its down GEMM (step 4) reading weight 9, which the tape does not
-/// declare.
-static BAD_WEIGHT_STEPS: [CudaStep; 6] = {
+/// [`MLP_M256`]'s steps with its down GEMM (step 2, after the norm and the one gate/up launch,
+/// #1049) reading weight 9, which the tape does not declare.
+static BAD_WEIGHT_STEPS: [CudaStep; 4] = {
     let s = MLP_M256.steps;
-    let down = match s[4] {
+    let down = match s[2] {
         CudaStep::Gemm(mut down) => {
             down.b = WeightIx(9);
             CudaStep::Gemm(down)
         }
-        _ => panic!("MLP_M256's step 4 is its down GEMM"),
+        _ => panic!("MLP_M256's step 2 is its down GEMM"),
     };
-    [s[0], s[1], s[2], s[3], down, s[5]]
+    [s[0], s[1], down, s[3]]
 };
 
 static BAD_WEIGHT: [CudaTape; 1] = [CudaTape {
@@ -575,7 +577,7 @@ fn a_tape_reading_an_undeclared_weight_is_refused_before_any_allocation() {
     let want = Err(WorkerError::Tape {
         bucket: 0,
         error: TapeError::WeightIndex {
-            step: 4,
+            step: 2,
             ix: 9,
             weights: 5,
         },
@@ -1160,6 +1162,41 @@ fn k_direct(device: &CudaDevice, tape: &CudaTape, n: &[u16], wk: &[u16]) -> Vec<
     }
     .expect("gemm_bf16_abt launch");
     out.download().expect("download k")
+}
+
+/// The tape's gate (or, with `up`, up) projection of `n`, run by the GEMM kernel alone on device
+/// copies: the bits the fused `GateUpAct` step's activation reads, which it never stores.
+fn gate_up_direct(
+    device: &CudaDevice,
+    tape: &CudaTape,
+    n: &[u16],
+    w: &[u16],
+    up: bool,
+) -> Vec<u16> {
+    let CudaStep::GateUpAct(step) = tape.steps[1] else {
+        panic!("step 1 is the gate/up launch");
+    };
+    let g = if up { step.up } else { step.gate };
+    let (nb, wb) = (
+        DeviceBuffer::upload(device, n).expect("upload n"),
+        DeviceBuffer::upload(device, w).expect("upload the weight"),
+    );
+    let out = DeviceBuffer::upload(device, &vec![0; (g.m * g.n) as usize]).expect("upload out");
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `n` holds m·k, the weight n·k and `out`
+    // m·n elements; `out` is its own allocation; null is the default stream.
+    unsafe {
+        gemm_bf16_abt(
+            nb.ptr(),
+            wb.ptr(),
+            out.ptr(),
+            g.m,
+            g.n,
+            g.k,
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("gemm_bf16_abt launch");
+    out.download().expect("download the projection")
 }
 
 /// The tape's rope of `qn`, run by the rope kernel alone on device copies, with the tape's table:

@@ -9,12 +9,16 @@
 //! colour 0, the forward's input.
 //!
 //! Colours: 0 `x`, 1 `n`, 2 `gate`, 3 `up`, 4 `s` (the absorbed `Silu`'s, which no step writes or
-//! reads), 5 `a`, 6 `y`. `d` reuses colour 1: `n` is dead after the up GEMM.
+//! reads), 5 `a`, 6 `y`. `d` reuses colour 1: `n` is dead after the up GEMM. The gate and up
+//! GEMMs and the activation are one launch (#1049's `GateUpAct`), which writes only `a`; `gate`
+//! and `up` keep the colours the colourer gives the absorbed projections.
 
 use scratchy_subtile::handoff::LoweredDecode;
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
-use scratchy_target_cuda::step::{AddBf16, CudaStep, GemmBf16, RmsNormBf16, SiluMulBf16};
+use scratchy_target_cuda::step::{
+    AddBf16, CudaStep, GateUpActBf16, GateUpKernel, GatedOp, GemmBf16, RmsNormBf16,
+};
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, TapeInput, WeightIx,
 };
@@ -116,13 +120,29 @@ const fn norm(x: u64, y: u64, rows: u32) -> CudaStep {
     })
 }
 
-const fn silu_mul(gate: u64, up: u64, out: u64, rows: u32) -> CudaStep {
-    CudaStep::SiluMul(SiluMulBf16 {
-        gate: ArenaOffset(gate),
-        up: ArenaOffset(up),
+/// The gate and up GEMMs of `n` (into the colours `gate` and `up`) and `silu(gate) · up` into
+/// `out`, as one launch.
+const fn gate_up(n: u64, (gate, up): (u64, u64), out: u64, rows: u32) -> CudaStep {
+    CudaStep::GateUpAct(GateUpActBf16 {
+        gate: GemmBf16 {
+            a: ArenaOffset(n),
+            b: WeightIx(2),
+            c: ArenaOffset(gate),
+            m: rows,
+            n: I,
+            k: H,
+        },
+        up: GemmBf16 {
+            a: ArenaOffset(n),
+            b: WeightIx(3),
+            c: ArenaOffset(up),
+            m: rows,
+            n: I,
+            k: H,
+        },
         out: ArenaOffset(out),
-        rows,
-        cols: I,
+        kernel: GateUpKernel::Gemm,
+        act: GatedOp::Silu,
     })
 }
 
@@ -152,9 +172,7 @@ pub static MLP_M128: CudaTape = CudaTape {
     weight_bytes: MLP_WEIGHT_BYTES,
     steps: &[
         norm(0, 262144, 128),
-        gemm(262144, 2, 524288, 128, I, H),
-        gemm(262144, 3, 1441792, 128, I, H),
-        silu_mul(524288, 1441792, 3276800, 128),
+        gate_up(262144, (524288, 1441792), 3276800, 128),
         gemm(3276800, 4, 262144, 128, H, I),
         add(262144, 0, 4194304, 128),
     ],
@@ -180,9 +198,7 @@ pub static MLP_M256: CudaTape = CudaTape {
     weight_bytes: MLP_WEIGHT_BYTES,
     steps: &[
         norm(0, 524288, 256),
-        gemm(524288, 2, 1048576, 256, I, H),
-        gemm(524288, 3, 2883584, 256, I, H),
-        silu_mul(1048576, 2883584, 6553600, 256),
+        gate_up(524288, (1048576, 2883584), 6553600, 256),
         gemm(6553600, 4, 524288, 256, H, I),
         add(524288, 0, 8388608, 256),
     ],

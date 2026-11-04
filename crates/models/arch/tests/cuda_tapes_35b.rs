@@ -57,40 +57,45 @@ const TOP_K: u32 = 8;
 const INTER: u32 = 512;
 
 /// The steps every bucket shares, whatever its kernels.
-const COMMON_STEPS: [(&str, usize); 15] = [
-    ("Add", 80),
+const COMMON_STEPS: [(&str, usize); 14] = [
+    ("AddRmsNorm", 80),
     ("Embed", 1),
     ("ExpertCombine", 40),
     ("GateApply", 10),
     ("GateScale", 40),
     ("GateSplit", 10),
-    ("GatedDeltaNet", 30),
+    ("GateUpAct", 40),
     ("GemmNarrow", 40),
     ("GemmNarrowGroup", 30),
     ("MoeRoute", 40),
-    ("RmsNorm", 101),
+    ("RmsNorm", 21),
     ("Rope", 10),
     ("RopeAppend", 10),
     ("RouterLogits", 40),
-    ("SiluMul", 80),
 ];
-/// The decode tape's own steps: its GEMMs are GEMVs, its experts gathered.
-const DECODE_STEPS: [(&str, usize); 4] = [
+/// The decode tape's own steps: its GEMMs are GEMVs, its experts gathered, their gate and up one
+/// launch with the activation, and its GDN layers one launch each.
+const DECODE_STEPS: [(&str, usize); 6] = [
     ("AttnDecode", 10),
-    ("ExpertGemv", 120),
-    ("Gemv", 161),
+    ("ExpertGateUpAct", 40),
+    ("ExpertGemv", 40),
+    ("GdnDecode", 30),
+    ("Gemv", 81),
     ("GemvGroup", 40),
 ];
-/// Every prefill tape's own steps: its experts sorted, then the grouped GEMM.
-const PREFILL_STEPS: [(&str, usize); 5] = [
+/// Every prefill tape's own steps: its experts sorted, then the grouped GEMM and the routed
+/// experts' activation.
+const PREFILL_STEPS: [(&str, usize); 7] = [
     ("AttnPrefill", 10),
     ("ExpertGemm", 120),
     ("ExpertSort", 40),
-    ("Gemm", 161),
+    ("GatedDeltaNet", 30),
+    ("Gemm", 81),
     ("GemmGroup", 40),
+    ("SiluMul", 40),
 ];
-const DECODE_STEP_COUNT: usize = 893;
-const PREFILL_STEP_COUNT: usize = 933;
+const DECODE_STEP_COUNT: usize = 653;
+const PREFILL_STEP_COUNT: usize = 773;
 const COLOURS: usize = 29;
 
 /// Per bucket: the arena's `total_bytes` (with the token ids), the MoE scratch's offset and bytes

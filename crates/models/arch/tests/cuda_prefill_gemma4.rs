@@ -38,7 +38,7 @@ const VOCAB: usize = 262_144;
 const WEIGHTS: u64 = 627;
 const WEIGHT_BYTES: u64 = 50_466_283_580;
 /// The worker's arena: the largest tape's, m=4096 (`cuda_tapes_gemma4`'s `ARENAS`).
-const ARENA: u64 = 3_513_339_392;
+const ARENA: u64 = 3_536_408_064;
 /// The KV pool at [`KV_POOL`]'s 72 blocks: `72 · 64 · 225,280` bytes.
 const KV_POOL_BYTES: u64 = 1_038_090_240;
 /// The model's layers; the sliding layers' window, in keys (`sliding_window`), and how many of

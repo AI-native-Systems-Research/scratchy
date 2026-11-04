@@ -423,20 +423,59 @@ mod tests {
     use scratchy_subtile::tape_colouring::{Outputs, Reads, Residency};
 
     /// The tables declare exactly CUDA's fused kernels, the grouped GEMMs (`SiblingMatmuls`, #1049),
-    /// `SiluMul`, `GeluMul` and `MoeRoute`, and no sliced `lm_head`: any other pattern, or a sampled
+    /// `SiluMul`, `GeluMul`, their gate/up forms, the add-norm folds, `MoeRoute`, and at one row
+    /// the experts' gate/up (#1049), and no sliced `lm_head`: any other pattern, or a sampled
     /// weight, would ask the shared passes for a kernel CUDA does not have. The sibling fold groups
     /// up to three dense matmuls in `CUDA_SIBLING_BANDS`, leaving a gate or up projection (a matmul
-    /// a `Silu`, `Gelu` or `Mul` reads) to the gated fold. The routing fold takes the softmax as its
-    /// one pre (Qwen), and as its tail Gemma's scale (stage 0), a softmax or a renorm (stage 1) and
-    /// Gemma's per-expert scale (stage 2), nothing at stage 3.
+    /// a `Silu`, `Gelu` or `Mul` reads) to the gated fold, which folds it in under
+    /// `CUDA_FOLD_PROJECTIONS`. `NormAdd` comes before `ResidualNorm`. The routing fold takes the
+    /// softmax as its one pre (Qwen), and as its tail Gemma's scale (stage 0), a softmax or a renorm
+    /// (stage 1) and Gemma's per-expert scale (stage 2), nothing at stage 3. The one-row table is
+    /// the every-bucket sweep, then the experts' `ExpertActivation`.
     #[test]
-    fn cuda_declares_the_sibling_matmuls_silu_mul_and_moe_route_folds_and_no_sampled_rows() {
-        assert!(CUDA_FUSIONS.counted.is_empty());
-        assert!(CUDA_FUSIONS.rows.is_none());
+    fn cuda_declares_its_folds_per_bucket_and_no_sampled_rows() {
+        for table in [&CUDA_FUSIONS, &CUDA_FUSIONS_ONE_ROW] {
+            assert!(table.counted.is_empty());
+            assert!(table.rows.is_none());
+        }
         assert!(CUDA_SAMPLE_ROWS.weights.is_empty());
+        // The one-row table has the experts' sweep; every other bucket's has the one sweep.
+        assert_eq!(cuda_fusions(1).sweeps.len(), 2);
+        for m in [2, 512, 4096] {
+            assert_eq!(cuda_fusions(m).sweeps.len(), 1, "m={m}");
+        }
         let [sweep] = CUDA_FUSIONS.sweeps else {
             panic!("expected one sweep, got {}", CUDA_FUSIONS.sweeps.len());
         };
+        let [first, experts] = CUDA_FUSIONS_ONE_ROW.sweeps else {
+            panic!(
+                "expected two one-row sweeps, got {}",
+                CUDA_FUSIONS_ONE_ROW.sweeps.len()
+            );
+        };
+        assert_eq!(
+            first.len(),
+            sweep.len(),
+            "the one-row table's first sweep is the sweep"
+        );
+        let [
+            FoldPattern::ExpertActivation {
+                act,
+                matmul: expert_matmul,
+                kernel: expert_kernel,
+            },
+        ] = experts
+        else {
+            panic!("expected one ExpertActivation pattern, got {experts:?}");
+        };
+        assert_eq!(
+            (*act, *expert_matmul, *expert_kernel),
+            (
+                SubOpKind::ExpertGatedAct,
+                SubOpKind::ExpertMatmul,
+                CudaFusion::ExpertGateUpAct
+            )
+        );
         let [
             FoldPattern::SiblingMatmuls {
                 matmul,
@@ -446,6 +485,16 @@ mod tests {
                 kernel: siblings,
             },
             FoldPattern::Gated { mul, activations },
+            FoldPattern::NormAdd {
+                add: na_add,
+                norm: na_norm,
+                kernel: na_kernel,
+            },
+            FoldPattern::ResidualNorm {
+                norm: rn_norm,
+                add: rn_add,
+                kernel: rn_kernel,
+            },
             FoldPattern::Route {
                 top_k,
                 sort,
@@ -456,8 +505,19 @@ mod tests {
             },
         ] = sweep
         else {
-            panic!("expected one SiblingMatmuls, one Gated and one Route pattern, got {sweep:?}");
+            panic!(
+                "expected one SiblingMatmuls, Gated, NormAdd, ResidualNorm and Route pattern, got \
+                 {sweep:?}"
+            );
         };
+        assert_eq!(
+            (*na_add, *na_norm, *na_kernel),
+            (SubOpKind::Add, SubOpKind::RmsNorm, CudaFusion::NormAdd)
+        );
+        assert_eq!(
+            (*rn_norm, *rn_add, *rn_kernel),
+            (SubOpKind::RmsNorm, SubOpKind::Add, CudaFusion::AddRmsNorm)
+        );
         assert_eq!((*matmul, *max), (SubOpKind::MatmulTile, 3));
         assert_eq!(
             *bands,
@@ -480,10 +540,10 @@ mod tests {
         };
         assert_eq!(silu.activation, SubOpKind::Silu);
         assert_eq!(silu.split, CudaFusion::SiluMul);
-        assert_eq!(silu.fused, CudaFusion::SiluMul);
+        assert_eq!(silu.fused, CudaFusion::GateUpSiluMul);
         assert_eq!(gelu.activation, SubOpKind::Gelu);
         assert_eq!(gelu.split, CudaFusion::GeluMul);
-        assert_eq!(gelu.fused, CudaFusion::GeluMul);
+        assert_eq!(gelu.fused, CudaFusion::GateUpGeluMul);
         assert_eq!(
             (*top_k, *sort, *gather),
             (
