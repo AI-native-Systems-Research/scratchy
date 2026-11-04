@@ -300,6 +300,49 @@ unsafe extern "C" {
         count: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gate_up_gemv_bf16_prepare() -> i32;
+    fn scratchy_cuda_gate_up_gemv_bf16(
+        a: *const c_void,
+        gate: *const c_void,
+        up: *const c_void,
+        c: *mut c_void,
+        partials: *mut c_void,
+        n: u32,
+        k: u32,
+        splits: u32,
+        act: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_expert_gate_up_gemv_bf16(
+        a: *const c_void,
+        gate: *const c_void,
+        up: *const c_void,
+        topk_idx: *const c_void,
+        c: *mut c_void,
+        partials: *mut c_void,
+        m: u32,
+        top_k: u32,
+        n: u32,
+        k: u32,
+        experts: u32,
+        expert_rows: u32,
+        splits: u32,
+        act: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gate_up_gemm_bf16_prepare() -> i32;
+    fn scratchy_cuda_gate_up_gemm_bf16(
+        a: *const c_void,
+        gate: *const c_void,
+        up: *const c_void,
+        c: *mut c_void,
+        m: u32,
+        n: u32,
+        k: u32,
+        act: u32,
+        col64: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemv_split_bf16_abt(
         a: *const c_void,
         b: *const c_void,
@@ -577,6 +620,12 @@ pub enum KernelError {
         k: u32,
         n: [u32; 3],
     },
+    /// A gate/up launch (#1049) does not take this shape, split or activation; nothing was
+    /// launched. `dims` is `[m, n, k, splits]` (`m` the pairs for the expert form).
+    GateUpShape {
+        kernel: &'static str,
+        dims: [u32; 4],
+    },
     /// The decode attention does not take this shape, scale or window; nothing was launched.
     AttnDecodeShape {
         q_heads: u32,
@@ -723,6 +772,9 @@ impl fmt::Display for KernelError {
             KernelError::GroupShape { kernel, m, k, n } => {
                 write!(f, "{kernel} refused shape m={m} k={k} n={n:?}")
             }
+            KernelError::GateUpShape { kernel, dims } => {
+                write!(f, "{kernel} refused [m, n, k, splits] {dims:?}")
+            }
             KernelError::HostException => write!(f, "kernel launcher's host code threw"),
             KernelError::Cuda(code) => write!(f, "CUDA error {code}"),
         }
@@ -785,6 +837,10 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
         "gemv_group_bf16_abt",
         scratchy_cuda_gemv_group_bf16_abt_prepare,
     ),
+    // #1049's gate/up GEMVs (dense and expert) and GEMMs: the attribute on each instance, and a
+    // load of the GEMV's reduces.
+    ("gate_up_gemv_bf16", scratchy_cuda_gate_up_gemv_bf16_prepare),
+    ("gate_up_gemm_bf16", scratchy_cuda_gate_up_gemm_bf16_prepare),
     // Load-only (#1048): these set no attribute, but a worker captures its tapes into CUDA Graphs
     // at construction, and a kernel the runtime has not loaded must not first load during a
     // capture. Every kernel a tape can launch is loaded here, when the device opens.
@@ -1681,6 +1737,115 @@ pub unsafe fn gemv_group_bf16_abt(
         )
     };
     check(code, refused)
+}
+
+/// The gate/up GEMV (#1049, `kernels/gemv_bf16.cu`): `c [n] = act(bf16(a · gateᵀ), bf16(a ·
+/// upᵀ))`, rounded once, `act` a [`crate::step::GatedOp`] code. The bits of
+/// [`gemv_split_bf16_abt`] of the gate and the up at `splits`, then [`silu_mul_bf16`] (or
+/// [`gelu_mul_bf16`]). Asynchronous.
+///
+/// Refused with [`KernelError::GateUpShape`], before any pointer is touched, unless each of the
+/// gate and the up meets [`gemv_split_bf16_abt`]'s rule at `splits` and `act` is a code.
+///
+/// # Safety
+///
+/// As [`gemv_split_bf16_abt`]'s for `a`, `gate`, `up` and `c`; at `splits > 1`, `partials` holds
+/// `2 · splits · n_pad` f32 (`n_pad` `n` rounded up to 32), overlapping no operand.
+pub unsafe fn gate_up_gemv_bf16(
+    (a, gate, up): (*const c_void, *const c_void, *const c_void),
+    (c, partials): (*mut c_void, *mut c_void),
+    (n, k, splits): (u32, u32, u32),
+    act: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape, split and code before it touches a pointer and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_gate_up_gemv_bf16(a, gate, up, c, partials, n, k, splits, act, stream)
+    };
+    check(
+        code,
+        KernelError::GateUpShape {
+            kernel: "gate_up_gemv_bf16",
+            dims: [1, n, k, splits],
+        },
+    )
+}
+
+/// The expert gate/up GEMV (#1049): per pair `p`, `c[p] = act(bf16(a[p / top_k] · gate_eᵀ),
+/// bf16(a[p / top_k] · up_eᵀ))`, `e = topk_idx[p]`, `gate` and `up` expert 0's `[n, k]` of two
+/// slabs `expert_rows` rows apart per expert. The bits of [`expert_gemv_split_bf16`] of each, then
+/// the activation. Asynchronous; refused with [`KernelError::GateUpShape`] unless each meets that
+/// launcher's rule with token rows and `act` is a code.
+///
+/// # Safety
+///
+/// As [`expert_gemv_split_bf16`]'s for `a`, each slab, `topk_idx` and `c`; at `splits > 1`,
+/// `partials` holds `2 · splits · m · top_k · n` f32, overlapping no operand.
+pub unsafe fn expert_gate_up_gemv_bf16(
+    (a, gate, up, topk_idx): (*const c_void, *const c_void, *const c_void, *const c_void),
+    (c, partials): (*mut c_void, *mut c_void),
+    (m, top_k, n, k): (u32, u32, u32, u32),
+    (experts, expert_rows, splits): (u32, u32, u32),
+    act: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `gate_up_gemv_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_expert_gate_up_gemv_bf16(
+            a,
+            gate,
+            up,
+            topk_idx,
+            c,
+            partials,
+            m,
+            top_k,
+            n,
+            k,
+            experts,
+            expert_rows,
+            splits,
+            act,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GateUpShape {
+            kernel: "expert_gate_up_gemv_bf16",
+            dims: [m.saturating_mul(top_k), n, k, splits],
+        },
+    )
+}
+
+/// The gate/up GEMM (#1049, `kernels/gemm_bf16.cu`): `c [m, n] = act(bf16(a · gateᵀ), bf16(a ·
+/// upᵀ))`, rounded once. At `col64` false the bits of [`gemm_bf16_abt`] of each, then the
+/// activation, under that GEMM's rule; at `col64` true [`gemm_col64_bf16_abt`]'s bits and rule.
+/// Asynchronous; refused with [`KernelError::GateUpShape`] before any pointer is touched.
+///
+/// # Safety
+///
+/// As [`gemm_bf16_abt`]'s for `a`, `gate`, `up` (each `[n, k]`) and `c`.
+pub unsafe fn gate_up_gemm_bf16(
+    (a, gate, up): (*const c_void, *const c_void, *const c_void),
+    c: *mut c_void,
+    (m, n, k): (u32, u32, u32),
+    (act, col64): (u32, bool),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape and codes before it touches a pointer and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_gate_up_gemm_bf16(a, gate, up, c, m, n, k, act, u32::from(col64), stream)
+    };
+    check(
+        code,
+        KernelError::GateUpShape {
+            kernel: "gate_up_gemm_bf16",
+            dims: [m, n, k, 1],
+        },
+    )
 }
 
 /// Launch the bf16 GEMV `c = a · Bᵀ`, the one-row GEMM: `a` is `[1, k]`, `B` `[n, k]` and `c`

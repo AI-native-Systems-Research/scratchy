@@ -26,16 +26,17 @@ use scratchy_target_cuda::op_abi::{CUDA_GROUPED_EXPERTS, CudaFusion, MOE_EXPERT_
 use scratchy_target_cuda::step::{
     ADD_BF16_COLS, ATTN_BF16_HEAD_DIMS, ATTN_DECODE_BF16_MAX_GROUP, ATTN_PREFILL_BF16_ROWS,
     ATTN_WINDOW_MULTIPLE, AddBf16, AddRmsNormBf16, AttnPrefillBf16, CudaStep, EMBED_BF16_COLS,
-    EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16,
-    GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS, GATE_SPLIT_BF16_HEAD_DIM,
-    GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX,
-    GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_NARROW_BF16_MAX_N,
+    EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGemmBf16, ExpertGemvBf16,
+    ExpertProjection, ExpertSortBf16, GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS,
+    GATE_SPLIT_BF16_HEAD_DIM, GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
+    GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_NARROW_BF16_MAX_N,
     GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16,
-    GateScaleBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16, GemmGroupBf16, GroupKind,
-    GroupMember, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, MoeWeight,
-    NormAddBf16, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE,
-    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
-    SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    GateScaleBf16, GateSplitBf16, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp,
+    GemmBf16, GemmGroupBf16, GroupKind, GroupMember, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K,
+    MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, RMS_NORM_BF16_COLS,
+    ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16,
+    RopeBf16, RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS,
+    SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
@@ -262,7 +263,121 @@ pub fn lower_fused(
         CudaFusion::SiblingMatmuls => sibling_matmuls(cx, s, fusion.shape, computes),
         CudaFusion::AddRmsNorm => add_rms_norm(cx, s, fusion.shape, computes),
         CudaFusion::NormAdd => norm_add(cx, s, fusion.shape, computes),
+        CudaFusion::GateUpSiluMul => gate_up_act(cx, s, fusion.shape, computes, GatedOp::Silu),
+        CudaFusion::GateUpGeluMul => gate_up_act(cx, s, fusion.shape, computes, GatedOp::Gelu),
+        CudaFusion::ExpertGateUpAct => expert_gate_up_act(cx, s, fusion.shape, computes),
     }
+}
+
+/// The `Gated` fold with its projections folded in (#1049): the `Mul`, its activation and the gate
+/// and up `MatmulTile`s its shape names, each lowered as the step it is on its own
+/// ([`lower_step`], [`gated_mul`]), as one launch. Both projections must have lowered to the same
+/// GEMM kernel (the tiled, 64-column or GEMV one) over one `a`, `m`, `n` and `k`, and the
+/// activation must read their outputs; anything else is refused, never split apart.
+fn gate_up_act(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    shape: FusedShape,
+    computes: &[TapeStep<'_>],
+    act: GatedOp,
+) -> Result<CudaStep, CanonicalRefusal> {
+    let step = s.step;
+    let FusedShape::Gated {
+        activation,
+        gate: Some(gate),
+        up: Some(up),
+    } = shape
+    else {
+        return Err(CanonicalRefusal::FusionShape { step });
+    };
+    let refused = || CanonicalRefusal::FusionShape { step };
+    let split = FusedShape::Gated {
+        activation,
+        gate: None,
+        up: None,
+    };
+    let mul = gated_mul(cx, s, split, computes)?;
+    let kernel = |g: &TapeStep<'_>| match lower_step(cx, g, computes)? {
+        Some(CudaStep::Gemm(g)) => Ok((GateUpKernel::Gemm, g)),
+        Some(CudaStep::GemmCol64(g)) => Ok((GateUpKernel::GemmCol64, g)),
+        Some(CudaStep::Gemv(g)) => Ok((GateUpKernel::Gemv, g)),
+        Some(_) | None => Err(refused()),
+    };
+    let (gk, gate) = kernel(absorbed_step(s, gate, computes)?)?;
+    let (uk, up) = kernel(absorbed_step(s, up, computes)?)?;
+    let same = gk == uk && (gate.a, gate.m, gate.n, gate.k) == (up.a, up.m, up.n, up.k);
+    if !same || (mul.gate, mul.up) != (gate.c, up.c) {
+        return Err(refused());
+    }
+    Ok(CudaStep::GateUpAct(GateUpActBf16 {
+        gate,
+        up,
+        out: mul.out,
+        kernel: gk,
+        act,
+    }))
+}
+
+/// The `ExpertActivation` fold of the one-row bucket (#1049): the `ExpertGatedAct` and the gate
+/// and up `ExpertMatmul`s its shape names, each lowered as the step it is on its own, as one
+/// launch. Both must be the gathered expert GEMV over the token rows, of one bundle layout and
+/// geometry, and the activation SwiGLU or GeGLU over their regions.
+fn expert_gate_up_act(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    shape: FusedShape,
+    computes: &[TapeStep<'_>],
+) -> Result<CudaStep, CanonicalRefusal> {
+    let step = s.step;
+    let FusedShape::ExpertGated { gate, up } = shape else {
+        return Err(CanonicalRefusal::FusionShape { step });
+    };
+    let refused = || CanonicalRefusal::FusionShape { step };
+    let (act, mul) = match lower_step(cx, s, computes)? {
+        Some(CudaStep::SiluMul(m)) => (GatedOp::Silu, m),
+        Some(CudaStep::GeluMul(m)) => (GatedOp::Gelu, m),
+        Some(_) | None => return Err(refused()),
+    };
+    let gemv = |g: &TapeStep<'_>| match lower_step(cx, g, computes)? {
+        Some(CudaStep::ExpertGemv(g)) => Ok(g),
+        Some(_) | None => Err(refused()),
+    };
+    let gate = gemv(absorbed_step(s, gate, computes)?)?;
+    let up = gemv(absorbed_step(s, up, computes)?)?;
+    // Each may read its own weight (a fixture's gate and up are two sources until the weight
+    // table merges a model's into one bank): the worker reads each slab from its own, so only
+    // the layout, the rows and the geometry must agree.
+    let pair = |g: &ExpertGemvBf16| {
+        let ExpertGemvBf16 {
+            a,
+            rows,
+            weight,
+            topk_idx,
+            m,
+            top_k,
+            experts,
+            hidden,
+            inter,
+            ..
+        } = *g;
+        (
+            a,
+            rows,
+            weight,
+            topk_idx,
+            (m, top_k, experts, hidden, inter),
+        )
+    };
+    let projections = (gate.proj, up.proj) == (ExpertProjection::Gate, ExpertProjection::Up);
+    if !projections || pair(&gate) != pair(&up) || (mul.gate, mul.up) != (gate.c, up.c) {
+        return Err(refused());
+    }
+    Ok(CudaStep::ExpertGateUpAct(ExpertGateUpActBf16 {
+        gate,
+        up,
+        out: mul.out,
+        act,
+    }))
 }
 
 /// The `AddRmsNorm` fold (#1049): the driving `RmsNorm` and the `Add` its shape names, each

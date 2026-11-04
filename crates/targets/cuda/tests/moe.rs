@@ -2325,3 +2325,91 @@ fn the_split_expert_gemv_is_the_split_gemv_per_pair() {
         "a split expert GEMV differs from the split GEMV: see the lines above"
     );
 }
+
+/// #1049's expert gate/up GEMV is its chain bit for bit: the gathered expert GEMV of the gate,
+/// then of the up, then the activation, at m = 1 over Qwen's interleaved bundle layout (the gate and
+/// up of expert `e` adjacent, so each slab's stride is `2n` rows) and the 35B's and Gemma's shapes,
+/// for SwiGLU and GeGLU, on 8 distinct experts and on one repeated expert; the output's tail intact.
+#[test]
+fn the_expert_gate_up_fold_is_its_chain_bit_for_bit() {
+    use scratchy_target_cuda::kernels::{
+        expert_gate_up_gemv_bf16, expert_gemv_split_bf16, gelu_mul_bf16, silu_mul_bf16,
+    };
+    use scratchy_target_cuda::step::{GatedOp, gemv_scratch_bytes, gemv_splits};
+    let device = h100();
+    let mut pass = true;
+    for (experts, n, k) in [(256usize, 512usize, 2048usize), (128, 704, 2816)] {
+        for (case, topk_idx) in [
+            ("distinct", vec![3u32, 120, 17, 127, 0, 64, 99, 5]),
+            ("repeated", vec![42u32; TOP_K]),
+        ] {
+            for act in [GatedOp::Silu, GatedOp::Gelu] {
+                let pairs = TOP_K;
+                let seed = (n as u64) << 32 ^ k as u64;
+                let a = up(&device, &bf16_inputs(k, 0xE6A7_0000 ^ seed));
+                // `[experts, 2n, k]`: per expert, the gate's `n` rows then the up's.
+                let bank = up(
+                    &device,
+                    &bf16_inputs(experts * 2 * n * k, 0xE6A7_1000 ^ seed),
+                );
+                let ib = up_u32(&device, &topk_idx);
+                let (gate, upw) = (bank.ptr(), bank.ptr().wrapping_byte_add(n * k * 2));
+                let out = || up(&device, &vec![SENTINEL; pairs * n + TAIL]);
+                let (gc, uc, chain, fused) = (out(), out(), out(), out());
+                let (nu, ku, pu) = (n as u32, k as u32, pairs as u32);
+                let splits = gemv_splits(nu, ku, pu);
+                let one = gemv_scratch_bytes(nu, pu, splits).expect("scratch bytes") as usize;
+                let partials = up(&device, &vec![0u16; (2 * one).max(2) / 2 + 128]);
+                let dims = (1, TOP_K as u32, nu, ku);
+                let null = std::ptr::null_mut();
+                // SAFETY: cudaMalloc pointers are 256-byte aligned; `a` holds k bf16, the bank
+                // experts·2n·k with each slab's experts `2n` rows apart, `topk_idx` 8 u32 below
+                // `experts`, every output its own allocation of 8·n and the tail, the partials
+                // both projections' at the split; null is the default stream, which orders the
+                // chain and the downloads below wait for.
+                unsafe {
+                    for (b, c) in [(gate, &gc), (upw, &uc)] {
+                        expert_gemv_split_bf16(
+                            (a.ptr(), b, ib.ptr()),
+                            (c.ptr(), partials.ptr()),
+                            dims,
+                            (experts as u32, 2 * nu),
+                            (false, splits),
+                            null,
+                        )
+                        .expect("the chain's expert GEMV");
+                    }
+                    let rows = (pu, nu);
+                    match act {
+                        GatedOp::Silu => silu_mul_bf16(gc.ptr(), uc.ptr(), chain.ptr(), rows, null),
+                        GatedOp::Gelu => gelu_mul_bf16(gc.ptr(), uc.ptr(), chain.ptr(), rows, null),
+                    }
+                    .expect("the chain's activation");
+                    expert_gate_up_gemv_bf16(
+                        (a.ptr(), gate, upw, ib.ptr()),
+                        (fused.ptr(), partials.ptr()),
+                        dims,
+                        (experts as u32, 2 * nu, splits),
+                        act.code(),
+                        null,
+                    )
+                    .expect("the fused launch");
+                }
+                let (want, got) = (
+                    chain.download().expect("download"),
+                    fused.download().expect("download"),
+                );
+                let tail = got[pairs * n..].iter().all(|&v| v == SENTINEL);
+                let mismatched = mismatched_bits(&got[..pairs * n], &want[..pairs * n]);
+                let ok = mismatched == 0 && tail;
+                eprintln!(
+                    "expert_gate_up {case} {act:?} experts={experts} n={n} k={k} splits={splits}: \
+                     mismatched_bits={mismatched} tail_intact={tail} {}",
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(pass, "an expert gate/up fold differs from its chain");
+}

@@ -39,11 +39,12 @@ use crate::kernels::{self, KernelError};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
     ATTN_D512_BF16_HEAD_DIM, ATTN_DECODE_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16,
-    AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16,
-    ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel,
-    MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16,
-    RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, gemv_splits,
+    AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGemmBf16,
+    ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
+    GateUpKernel, GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS,
+    MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, RmsNormBf16, RmsNormUnitBf16,
+    RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    gemv_splits,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
@@ -1669,6 +1670,39 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 CudaStep::ExpertSort(sort) => Self::expert_sort(&sort, slot, stream),
                 CudaStep::ExpertGemm(g) => Self::expert_gemm(&g, slot, weights, stream),
                 CudaStep::ExpertGemv(g) => Self::expert_gemv(&g, slot, partials, weights, stream),
+                CudaStep::GateUpAct(g) => {
+                    let (gate, up) = (
+                        weights[g.gate.b.0 as usize].ptr(),
+                        weights[g.up.b.0 as usize].ptr(),
+                    );
+                    let (GemmBf16 { a, m, n, k, .. }, act) = (g.gate, g.act.code());
+                    // SAFETY: as above, for `a` (`m*k`), `gate` and `up` (`n*k` each) and `out`
+                    // (`m*n`); at one row the scratch holds both projections' partials
+                    // (`GateUpActBf16::gemv_scratch`, which `validate` checked).
+                    unsafe {
+                        match g.kernel {
+                            GateUpKernel::Gemv => kernels::gate_up_gemv_bf16(
+                                (slot(a), gate, up),
+                                (slot(g.out), partials),
+                                (n, k, gemv_splits(n, k, 1)),
+                                act,
+                                stream.0,
+                            ),
+                            GateUpKernel::Gemm | GateUpKernel::GemmCol64 => {
+                                kernels::gate_up_gemm_bf16(
+                                    (slot(a), gate, up),
+                                    slot(g.out),
+                                    (m, n, k),
+                                    (act, g.kernel == GateUpKernel::GemmCol64),
+                                    stream.0,
+                                )
+                            }
+                        }
+                    }
+                }
+                CudaStep::ExpertGateUpAct(g) => {
+                    Self::expert_gate_up(&g, slot, partials, weights, stream)
+                }
                 CudaStep::ExpertCombine(ExpertCombineBf16 {
                     down,
                     pos,
@@ -2381,6 +2415,56 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 (g.m, g.top_k, n, k),
                 (g.experts, expert_rows),
                 (g.rows == PairRows::Pair, splits),
+                stream.0,
+            )
+        }
+    }
+
+    /// Enqueue the expert gate/up GEMV (#1049, `kernels::expert_gate_up_gemv_bf16`): the gate's
+    /// and the up's [`Self::expert_slab`]s of one bundle, at the split each would take on its own.
+    fn expert_gate_up(
+        g: &ExpertGateUpActBf16,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        partials: *mut c_void,
+        weights: &[DeviceBuffer],
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        let (n, k) = g.gate.n_k();
+        let pairs = g.gate.m.saturating_mul(g.gate.top_k);
+        let refused = KernelError::GateUpShape {
+            kernel: "expert_gate_up_gemv_bf16",
+            dims: [pairs, n, k, 0],
+        };
+        let slab = |e: &ExpertGemvBf16| {
+            Self::expert_slab(
+                weights,
+                (e.bundle, e.weight),
+                e.proj,
+                (e.experts, e.hidden, e.inter),
+            )
+        };
+        let (Some((gate, rows)), Some((up, up_rows))) = (slab(&g.gate), slab(&g.up)) else {
+            return Err(refused);
+        };
+        if rows != up_rows {
+            return Err(refused);
+        }
+        let splits = gemv_splits(n, k, pairs);
+        // SAFETY: as `expert_gemv`'s, for both slabs (each inside the bundle's gate/up part) and
+        // the scratch (both projections' partials, `ExpertGateUpActBf16::gemv_scratch`, which
+        // `validate` checked).
+        unsafe {
+            kernels::expert_gate_up_gemv_bf16(
+                (
+                    slot(g.gate.a).cast_const(),
+                    gate,
+                    up,
+                    slot(g.gate.topk_idx).cast_const(),
+                ),
+                (slot(g.out), partials),
+                (g.gate.m, g.gate.top_k, n, k),
+                (g.gate.experts, rows, splits),
+                g.act.code(),
                 stream.0,
             )
         }

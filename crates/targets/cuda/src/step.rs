@@ -138,6 +138,136 @@ pub enum CudaStep {
     /// `kernels/rms_norm_bf16.cu`, `scratchy_cuda_norm_add_bf16`): the bits of today's
     /// [`Self::RmsNorm`] then [`Self::Add`].
     NormAdd(NormAddBf16),
+    /// `out = act(bf16(a · gateᵀ), bf16(a · upᵀ))` in one launch, lowered from the `Gated` fold
+    /// with its projections folded in (#1049): a dense SwiGLU or GeGLU MLP's gate and up GEMMs
+    /// and their activation (`kernels/gemv_bf16.cu`'s gate/up GEMV at one row,
+    /// `kernels/gemm_bf16.cu`'s gate/up GEMM otherwise). The bits of the two GEMMs (or GEMVs)
+    /// then [`Self::SiluMul`] (or [`Self::GeluMul`]).
+    GateUpAct(GateUpActBf16),
+    /// The routed experts' gate and up GEMVs and their activation in one launch, lowered from the
+    /// `ExpertActivation` fold of a one-row bucket (#1049, `kernels/gemv_bf16.cu`'s expert gate/up
+    /// GEMV): the bits of the two [`Self::ExpertGemv`]s then the activation's step.
+    ExpertGateUpAct(ExpertGateUpActBf16),
+}
+
+/// The activation a gate/up step applies (`kernels/scratchy_ops.cuh`'s op struct): SwiGLU's
+/// `silu_mul` or GeGLU's `gelu_tanh_mul`, the op of [`CudaStep::SiluMul`] or [`CudaStep::GeluMul`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum GatedOp {
+    Silu,
+    Gelu,
+}
+
+impl GatedOp {
+    /// The launchers' code for it (`kernels/gemv_bf16.cu`'s `ACT_SILU`, `ACT_GELU`).
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Silu => 0,
+            Self::Gelu => 1,
+        }
+    }
+
+    /// The activation step of `m` on its own.
+    pub const fn step(self, m: SiluMulBf16) -> CudaStep {
+        match self {
+            Self::Silu => CudaStep::SiluMul(m),
+            Self::Gelu => CudaStep::GeluMul(m),
+        }
+    }
+}
+
+/// `out [m, n] = act(bf16(a · gateᵀ), bf16(a · upᵀ))`: `gate` and `up` are the GEMMs it folds,
+/// each a [`GemmBf16`] over the same `a`, `m`, `n` and `k` (their `c` the colours today's two
+/// launches write, which this one never writes); `kernel` the step each would be on its own, the
+/// same for both ([`CudaStep::Gemm`], [`CudaStep::GemmCol64`] or [`CudaStep::Gemv`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GateUpActBf16 {
+    pub gate: GemmBf16,
+    pub up: GemmBf16,
+    pub out: ArenaOffset,
+    pub kernel: GateUpKernel,
+    pub act: GatedOp,
+}
+
+/// Which GEMM kernel a gate/up step's projections are on their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum GateUpKernel {
+    Gemm,
+    GemmCol64,
+    Gemv,
+}
+
+impl GateUpKernel {
+    /// The step `g` is on its own.
+    pub const fn step(self, g: GemmBf16) -> CudaStep {
+        match self {
+            Self::Gemm => CudaStep::Gemm(g),
+            Self::GemmCol64 => CudaStep::GemmCol64(g),
+            Self::Gemv => CudaStep::Gemv(g),
+        }
+    }
+}
+
+impl GateUpActBf16 {
+    /// The activation it folds, over the projections' colours.
+    pub const fn activation(&self) -> SiluMulBf16 {
+        SiluMulBf16 {
+            gate: self.gate.c,
+            up: self.up.c,
+            out: self.out,
+            rows: self.gate.m,
+            cols: self.gate.n,
+        }
+    }
+
+    /// The bytes of GEMV scratch the fused GEMV writes: the gate's partials, then the up's, each
+    /// at its own split ([`gemv_scratch_bytes`]); 0 for the GEMMs. `None` on overflow.
+    pub const fn gemv_scratch(&self) -> Option<u64> {
+        let GateUpKernel::Gemv = self.kernel else {
+            return Some(0);
+        };
+        let (n, k) = (self.gate.n, self.gate.k);
+        let Some(one) = gemv_scratch_bytes(n, 1, gemv_splits(n, k, 1)) else {
+            return None;
+        };
+        one.checked_mul(2)
+    }
+}
+
+/// The routed experts' gate and up GEMVs and their activation: `gate` and `up` the two
+/// [`ExpertGemvBf16`]s it folds (the MoE scratch's gate and up regions, which this launch never
+/// writes), `out` the activation rows, `act` the activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpertGateUpActBf16 {
+    pub gate: ExpertGemvBf16,
+    pub up: ExpertGemvBf16,
+    pub out: ArenaOffset,
+    pub act: GatedOp,
+}
+
+impl ExpertGateUpActBf16 {
+    /// The activation it folds, over the gate and up regions.
+    pub const fn activation(&self) -> SiluMulBf16 {
+        SiluMulBf16 {
+            gate: self.gate.c,
+            up: self.up.c,
+            out: self.out,
+            rows: self.gate.m * self.gate.top_k,
+            cols: self.gate.inter,
+        }
+    }
+
+    /// The GEMV scratch the fused launch writes: the gate's partials, then the up's.
+    pub const fn gemv_scratch(&self) -> Option<u64> {
+        let (n, k) = self.gate.n_k();
+        let Some(pairs) = self.gate.m.checked_mul(self.gate.top_k) else {
+            return None;
+        };
+        let Some(one) = gemv_scratch_bytes(n, pairs, gemv_splits(n, k, pairs)) else {
+            return None;
+        };
+        one.checked_mul(2)
+    }
 }
 
 /// `sum = a + b` (one f32 add, rounded once), then `y` the [`RmsNormBf16`] of `sum`: `a`, `b`,
@@ -1399,7 +1529,9 @@ impl CudaStep {
             | Self::GemmNarrowGroup(_)
             | Self::GemvGroup(_)
             | Self::AddRmsNorm(_)
-            | Self::NormAdd(_) => None,
+            | Self::NormAdd(_)
+            | Self::GateUpAct(_)
+            | Self::ExpertGateUpAct(_) => None,
         }
     }
 
@@ -1440,7 +1572,9 @@ impl CudaStep {
             | Self::GemmNarrowGroup(_)
             | Self::GemvGroup(_)
             | Self::AddRmsNorm(_)
-            | Self::NormAdd(_) => None,
+            | Self::NormAdd(_)
+            | Self::GateUpAct(_)
+            | Self::ExpertGateUpAct(_) => None,
         }
     }
 
@@ -1479,7 +1613,9 @@ impl CudaStep {
             | Self::RouterNorm(_)
             | Self::GemmCol64(_)
             | Self::AddRmsNorm(_)
-            | Self::NormAdd(_) => None,
+            | Self::NormAdd(_)
+            | Self::GateUpAct(_)
+            | Self::ExpertGateUpAct(_) => None,
         }
     }
 
@@ -1487,10 +1623,26 @@ impl CudaStep {
     /// whose bits it writes, in order; every other step itself. `CudaTape::validate` checks each
     /// part as a step of its own, and a grouped step's members against each other.
     pub fn parts(&self) -> [Option<CudaStep>; 3] {
-        match self.group() {
-            Some((kind, g)) => g.members().map(|m| m.map(|m| kind.step(g.member(m)))),
-            None => [Some(*self), None, None],
+        if let Some((kind, g)) = self.group() {
+            return g.members().map(|m| m.map(|m| kind.step(g.member(m))));
         }
+        // A gate/up step's GEMMs, each its own kernel step, then the activation over their
+        // colours: what the chain it folds computes, each part checked as that step.
+        if let Self::GateUpAct(g) = self {
+            return [
+                Some(g.kernel.step(g.gate)),
+                Some(g.kernel.step(g.up)),
+                Some(g.act.step(g.activation())),
+            ];
+        }
+        if let Self::ExpertGateUpAct(g) = self {
+            return [
+                Some(Self::ExpertGemv(g.gate)),
+                Some(Self::ExpertGemv(g.up)),
+                Some(g.act.step(g.activation())),
+            ];
+        }
+        [Some(*self), None, None]
     }
 
     /// The GEMV scratch bytes the step writes: [`gemv_scratch_bytes`] of [`Self::gemv_split`], 0
@@ -1499,6 +1651,12 @@ impl CudaStep {
     pub const fn gemv_scratch(&self) -> Option<u64> {
         if let Self::GemvGroup(g) = self {
             return g.gemv_scratch_before(3);
+        }
+        if let Self::GateUpAct(g) = self {
+            return g.gemv_scratch();
+        }
+        if let Self::ExpertGateUpAct(g) = self {
+            return g.gemv_scratch();
         }
         match self.gemv_split() {
             Some((n, pairs, splits)) => gemv_scratch_bytes(n, pairs, splits),
@@ -1589,6 +1747,39 @@ impl CudaStep {
                     kv: None,
                     gdn: None,
                     in_place: false,
+                })
+            }
+            // The projections' input; the activation's output. The weights are each part's
+            // (`validate` checks every part's through [`Self::parts`]), the first one here.
+            Self::GateUpAct(g) => {
+                let (Some(ab), Some(cb), Some(bb)) = (
+                    bf16_bytes(g.gate.m, g.gate.k),
+                    bf16_bytes(g.gate.m, g.gate.n),
+                    bf16_bytes(g.gate.n, g.gate.k),
+                ) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [Some(span(g.gate.a, ab)), None, None, None],
+                    writes: span(g.out, cb),
+                    second_write: None,
+                    weight: Some(WeightRead {
+                        ix: g.gate.b,
+                        bytes: bb,
+                    }),
+                    kv: None,
+                    gdn: None,
+                    in_place: false,
+                })
+            }
+            // The token rows and the picks; the activation rows.
+            Self::ExpertGateUpAct(g) => {
+                let Some(e) = Self::ExpertGemv(g.gate).extents() else {
+                    return None;
+                };
+                Some(StepExtents {
+                    writes: span(g.out, e.writes.bytes),
+                    ..e
                 })
             }
             // The norm's gain and both inputs; the sum, then the norm.
@@ -2228,7 +2419,16 @@ impl CudaStep {
             Self::GatedDeltaNet(GatedDeltaNetBf16 { bundle, .. }) => Some(bundle),
             Self::RouterLogits(RouterLogitsBf16 { bundle, .. }) => Some(bundle),
             Self::ExpertGemm(ExpertGemmBf16 { bundle, .. })
-            | Self::ExpertGemv(ExpertGemvBf16 { bundle, .. }) => Some(bundle),
+            | Self::ExpertGemv(ExpertGemvBf16 { bundle, .. })
+            | Self::ExpertGateUpAct(ExpertGateUpActBf16 {
+                gate: ExpertGemvBf16 { bundle, .. },
+                ..
+            }) => Some(bundle),
+            // The gate's; [`Self::weights_mut`] gives the up's too.
+            Self::GateUpAct(GateUpActBf16 {
+                gate: GemmBf16 { b, .. },
+                ..
+            }) => Some(b),
             // A grouped GEMM's first member's; [`Self::weights_mut`] gives every member's.
             Self::GemmGroup(GemmGroupBf16 { first, .. })
             | Self::GemmNarrowGroup(GemmGroupBf16 { first, .. })
@@ -2265,6 +2465,10 @@ impl CudaStep {
                 let mut all = vec![&mut first.b, &mut second.b];
                 all.extend(third.as_mut().map(|t| &mut t.b));
                 all
+            }
+            Self::GateUpAct(GateUpActBf16 { gate, up, .. }) => vec![&mut gate.b, &mut up.b],
+            Self::ExpertGateUpAct(ExpertGateUpActBf16 { gate, up, .. }) => {
+                vec![&mut gate.bundle, &mut up.bundle]
             }
             other => other.weight_mut().into_iter().collect(),
         }

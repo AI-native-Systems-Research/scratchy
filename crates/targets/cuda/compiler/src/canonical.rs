@@ -30,8 +30,8 @@ use scratchy_subtile::subtile_tape::{Instr, SubtileTape, lower_dag_to_tape};
 use scratchy_subtile::tape_colouring::{Colour, ColourError, TapeColouring, colour_tape};
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, StepRole, TapeFolds, fold_tape};
 use scratchy_target_cuda::op_abi::{
-    CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_EXPERT_TILE_ROWS, CUDA_FUSIONS, CUDA_RESULT_ROWS,
-    CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion,
+    CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_EXPERT_TILE_ROWS, CUDA_FOLD_PROJECTIONS,
+    CUDA_RESULT_ROWS, CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion, cuda_fusions,
 };
 use scratchy_target_cuda::step::{
     CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GDN_SEQUENCE_BYTES, gdn_scratch,
@@ -1373,17 +1373,18 @@ pub fn plan_canonical(
             .map_err(|e| CanonicalRefusal::Graph(format!("{stem} m={m}: {e}")))?;
         lower_dag_to_tape(&valid)
     };
-    // The facts only gate patterns. CUDA's one pattern, `Gated`, reads `fold_projections` alone,
-    // and CUDA has no kernel that folds the gate and up projections in, so every fact is off.
+    // The facts only gate patterns. CUDA's `Gated` reads `fold_projections` alone, which is
+    // CUDA's const fact (#1049): the gate/up kernels take every bucket. The one-row bucket's table
+    // folds the routed experts' gate and up too (`cuda_fusions`).
     let model = ModelFoldFacts {
-        fold_projections: false,
+        fold_projections: CUDA_FOLD_PROJECTIONS,
         matvec_ends: false,
         matvec_norms: false,
         row_programs: false,
         hidden_out: false,
     };
-    let folds =
-        fold_tape(&graph, &tape, &lowered, &CUDA_FUSIONS, model).map_err(CanonicalRefusal::Fold)?;
+    let folds = fold_tape(&graph, &tape, &lowered, cuda_fusions(m), model)
+        .map_err(CanonicalRefusal::Fold)?;
     let colouring = colour_tape(
         &graph,
         &tape,
@@ -1488,8 +1489,10 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         None => TapeInput::Hidden(span(Colour::ZERO)),
     };
     // A GDN or MoE step's bundle is a `[1, 1]` source in the IR; on the device it is the packed
-    // bundle of the step's geometry (`gdn_bundle`, `moe_bundle`), which its extents read.
+    // bundle of the step's geometry (`gdn_bundle`, `moe_bundle`), which its extents read. A fused
+    // step's are its parts' (#1049: the expert gate/up GEMV's two expert GEMVs).
     let bundles: BTreeMap<u32, u64> = (steps.iter())
+        .flat_map(|s| s.parts().into_iter().flatten())
         .filter_map(|s| match s {
             CudaStep::GatedDeltaNet(g) => Some((g.bundle.0, g.bundle_layout()?.bytes)),
             CudaStep::RouterLogits(_) | CudaStep::ExpertGemm(_) | CudaStep::ExpertGemv(_) => {

@@ -1680,6 +1680,9 @@ impl CudaTape {
             | CudaStep::Add(_)
             | CudaStep::AddRmsNorm(_)
             | CudaStep::NormAdd(_)
+            // Checked through their parts ([`CudaStep::parts`]).
+            | CudaStep::GateUpAct(_)
+            | CudaStep::ExpertGateUpAct(_)
             | CudaStep::SiluMul(_)
             | CudaStep::GateSplit(_)
             | CudaStep::GateApply(_)

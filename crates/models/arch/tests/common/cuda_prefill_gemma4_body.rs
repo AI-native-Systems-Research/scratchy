@@ -169,9 +169,13 @@ fn roles() -> Vec<Option<Role>> {
                 | CudaStep::RmsNormUnit(_)
                 | CudaStep::GeluMul(_)
                 | CudaStep::SoftCap(_) => {}
-                // Read through their members, above.
-                CudaStep::GemmGroup(_) | CudaStep::GemmNarrowGroup(_) | CudaStep::GemvGroup(_) => {
-                    unreachable!("`parts` yields a grouped GEMM's members, never the group")
+                // Read through their members or parts, above.
+                CudaStep::GemmGroup(_)
+                | CudaStep::GemmNarrowGroup(_)
+                | CudaStep::GemvGroup(_)
+                | CudaStep::GateUpAct(_)
+                | CudaStep::ExpertGateUpAct(_) => {
+                    unreachable!("`parts` yields a fused step's parts, never the fused step")
                 }
             }
         }
@@ -1739,6 +1743,8 @@ fn kinds(s: &CudaStep) -> (&'static str, &'static str) {
         CudaStep::GemvGroup(_) => ("GemvGroup", "GemvGroup"),
         CudaStep::AddRmsNorm(_) => ("AddRmsNorm", "AddRmsNorm"),
         CudaStep::NormAdd(_) => ("NormAdd", "NormAdd"),
+        CudaStep::GateUpAct(_) => ("GateUpAct", "GateUpAct"),
+        CudaStep::ExpertGateUpAct(_) => ("ExpertGateUpAct", "ExpertGateUpAct"),
     }
 }
 

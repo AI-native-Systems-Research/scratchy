@@ -161,11 +161,18 @@ static_assert(2 * GEMV_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "two CTAs per S
 // CTA's shared vectors and semaphores. `ROWS` rows per warp, `WARPS · ROWS` per CTA. A row's sum
 // does not depend on `ROWS` (each row adds its own chunks in ascending K, then `warp::sum`), nor
 // on which launch runs the CTA, so every instance and the grouped kernel give the same bits.
+//
+// `gemv_dots` is the CTA's arithmetic: each of the warp's rows' partial sums, in every lane, rows
+// past `n` (and a split past the row's chunks) +0. `gemv_cta` stores them; the gate/up GEMV
+// (#1049) runs `gemv_dots` twice, on the gate's views and then the up's, before it stores. `j0` is
+// the ring index of the call's first load: 0 for the first call, which initialises the
+// semaphores; the second continues the ring where the first ended, so no semaphore is initialised
+// twice and each stage's phase follows its loads.
 template <bool EXPERT, int ROWS>
-__device__ inline void gemv_cta(const gemv_globals& g, chunk_sv (&a_s)[WARPS][STAGES],
-                                chunk_sv (&b_s)[WARPS][STAGES][ROWS],
-                                kittens::semaphore (&arrived)[WARPS][STAGES], int block,
-                                int split, int p) {
+__device__ inline void gemv_dots(const gemv_globals& g, chunk_sv (&a_s)[WARPS][STAGES],
+                                 chunk_sv (&b_s)[WARPS][STAGES][ROWS],
+                                 kittens::semaphore (&arrived)[WARPS][STAGES], int block,
+                                 int split, int p, int j0, float (&dot)[ROWS]) {
     const int w = kittens::warpid();
     const int row0 = (block * WARPS + w) * ROWS;
     const int rows = max(0, min(ROWS, g.n - row0));
@@ -184,15 +191,15 @@ __device__ inline void gemv_cta(const gemv_globals& g, chunk_sv (&a_s)[WARPS][ST
         warp::zero(acc[r]);
     }
     if (rows > 0 && count > 0) {
-        if (warp::laneid() == 0) {
+        if (j0 == 0 && warp::laneid() == 0) {
             for (int s = 0; s < STAGES; s++) {
                 init_semaphore(arrived[w][s], 0, 1);
             }
         }
         __syncwarp();
-        // Chunk `j` of the split (`c0 + j` of the row) into stage `j % STAGES`.
+        // Chunk `j` of the split (`c0 + j` of the row) into stage `(j0 + j) % STAGES`.
         const auto issue = [&](int j) {
-            const int s = j % STAGES;
+            const int s = (j0 + j) % STAGES;
             warp::tma::expect_bytes(arrived[w][s], uint32_t((1 + rows) * sizeof(chunk_sv)));
             warp::tma::load_async(a_s[w][s], g.a, {0, 0, a_row, c0 + j}, arrived[w][s]);
             for (int r = 0; r < rows; r++) {
@@ -204,8 +211,8 @@ __device__ inline void gemv_cta(const gemv_globals& g, chunk_sv (&a_s)[WARPS][ST
             issue(j);
         }
         for (int j = 0; j < count; j++) {
-            const int s = j % STAGES;
-            wait(arrived[w][s], (j / STAGES) % 2);
+            const int s = (j0 + j) % STAGES;
+            wait(arrived[w][s], ((j0 + j) / STAGES) % 2);
             warp::load(x, a_s[w][s]);
 #pragma unroll
             for (int r = 0; r < ROWS; r++) {
@@ -222,22 +229,44 @@ __device__ inline void gemv_cta(const gemv_globals& g, chunk_sv (&a_s)[WARPS][ST
             }
         }
     }
-    // Each row's partial, in every lane; lane 0 stores it. The rows past `n` (and a split past the
-    // row's chunks) are +0, stored only into the scratch so the reduce reads written values.
+    // Each row's partial, in every lane.
 #pragma unroll
     for (int r = 0; r < ROWS; r++) {
-        const float dot = warp::sum(acc[r]);
+        dot[r] = warp::sum(acc[r]);
+    }
+}
+
+// One CTA of one GEMV, `gemv_dots` then the store: lane 0 stores each row's partial. The rows
+// past `n` (and a split past the row's chunks) are +0, stored only into the scratch so the reduce
+// reads written values.
+template <bool EXPERT, int ROWS>
+__device__ inline void gemv_cta(const gemv_globals& g, chunk_sv (&a_s)[WARPS][STAGES],
+                                chunk_sv (&b_s)[WARPS][STAGES][ROWS],
+                                kittens::semaphore (&arrived)[WARPS][STAGES], int block,
+                                int split, int p) {
+    float dot[ROWS];
+    gemv_dots<EXPERT, ROWS>(g, a_s, b_s, arrived, block, split, p, 0, dot);
+    const int row0 = (block * WARPS + kittens::warpid()) * ROWS;
+    const int rows = max(0, min(ROWS, g.n - row0));
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
         const int row = row0 + r;
         if (warp::laneid() == 0) {
             if (g.splits == 1) {
                 if (r < rows) {
-                    g.c[{0, 0, p, row}] = base_types::convertor<bf16, float>::convert(dot);
+                    g.c[{0, 0, p, row}] = base_types::convertor<bf16, float>::convert(dot[r]);
                 }
             } else {
-                g.partials[{0, 0, split, p * g.n_pad + row}] = dot;
+                g.partials[{0, 0, split, p * g.n_pad + row}] = dot[r];
             }
         }
     }
+}
+
+// `x` as the bf16 a GEMV stores, widened back (exact): the rounding the gate's and the up's own
+// launches made before the activation read them.
+__device__ inline float stored_bf16(float x) {
+    return base_types::convertor<float, bf16>::convert(base_types::convertor<bf16, float>::convert(x));
 }
 
 // The dense or expert GEMV: the grid is `(column blocks, K splits, pairs)`.
@@ -331,6 +360,92 @@ __global__ __launch_bounds__(REDUCE_THREADS) void gemv_reduce_group_ker(
     const int start = member == 2 ? g.start2 : member == 1 ? g.start1 : 0;
     const reduce_globals& m = member == 2 ? g.m2 : member == 1 ? g.m1 : g.m0;
     reduce_warp(m, v - start);
+}
+
+// The gate/up GEMV (#1049): `c = OP(bf16(a · gateᵀ), bf16(a · upᵀ))` per row, the gate's and the
+// up's GEMVs in one CTA. `gate` and `up` are each a GEMV's views and counts (dense, or a MoE
+// bundle's gate and up slabs), at the same split, the output `gate.c` `[P, n]` bf16. Each row's two
+// sums are `gemv_dots`' bits, so each is its own GEMV's sum; at one split, lane 0 rounds both to
+// bf16 (the stores the two GEMVs made), applies `OP` (`silu_mul_bf16.cu`'s op struct, on the same
+// f32 values) and rounds once; above one split it stores both partials, and `gate_up_reduce_ker`
+// finishes. The up pass's loads continue the gate pass's ring (`gemv_dots`' `j0`).
+struct gate_up_globals {
+    gemv_globals gate;
+    gemv_globals up;
+};
+
+template <bool EXPERT, typename OP>
+__global__ __launch_bounds__(NUM_THREADS, 2) void gate_up_gemv_ker(
+    const __grid_constant__ gate_up_globals g) {
+    extern __shared__ int __shm[];
+    shared_allocator<1024> al((int*)&__shm[0]);
+    chunk_sv(&a_s)[WARPS][STAGES] = al.allocate<chunk_sv, WARPS, STAGES>();
+    chunk_sv(&b_s)[WARPS][STAGES][ROWS_PER_WARP] =
+        al.allocate<chunk_sv, WARPS, STAGES, ROWS_PER_WARP>();
+    __shared__ kittens::semaphore arrived[WARPS][STAGES];
+    const int block = blockIdx.x, split = blockIdx.y, p = blockIdx.z;
+    float gate[ROWS_PER_WARP], up[ROWS_PER_WARP];
+    gemv_dots<EXPERT, ROWS_PER_WARP>(g.gate, a_s, b_s, arrived, block, split, p, 0, gate);
+    // Every lane has read the gate's last stage (its loop's last `__syncwarp`), so the up's loads
+    // may take the ring's next stages. A warp with no rows ran no loads, and runs none now.
+    const int c0 = split * g.gate.split_chunks;
+    const int count = max(0, min(g.gate.split_chunks, g.gate.chunks - c0));
+    gemv_dots<EXPERT, ROWS_PER_WARP>(g.up, a_s, b_s, arrived, block, split, p, count, up);
+    const int row0 = (block * WARPS + kittens::warpid()) * ROWS_PER_WARP;
+    const int rows = max(0, min(ROWS_PER_WARP, g.gate.n - row0));
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        const int row = row0 + r;
+        if (warp::laneid() == 0) {
+            if (g.gate.splits == 1) {
+                if (r < rows) {
+                    const float act = OP::template op<float>(stored_bf16(gate[r]), stored_bf16(up[r]));
+                    g.gate.c[{0, 0, p, row}] = base_types::convertor<bf16, float>::convert(act);
+                }
+            } else {
+                g.gate.partials[{0, 0, split, p * g.gate.n_pad + row}] = gate[r];
+                g.up.partials[{0, 0, split, p * g.up.n_pad + row}] = up[r];
+            }
+        }
+    }
+}
+
+// The gate/up GEMV's reduce: `reduce_warp`'s sums of the gate's and the up's partials, each
+// rounded to bf16 through a bf16 vector (`warp::copy`, the reduce's own rounding), widened back,
+// then `OP` through TK's vector map and the one store. `gate.c` is the output.
+struct gate_up_reduce_globals {
+    reduce_globals gate;
+    reduce_globals up;
+};
+
+template <typename OP>
+__global__ __launch_bounds__(REDUCE_THREADS) void gate_up_reduce_ker(
+    const __grid_constant__ gate_up_reduce_globals g) {
+    const int v = blockIdx.x * REDUCE_WARPS + kittens::warpid();
+    if (v * REDUCE_ROWS >= g.gate.partials.cols()) {
+        return;
+    }
+    reduce_rv gate, up, part;
+    rv_bf<REDUCE_ROWS> rounded;
+    warp::zero(gate);
+    warp::zero(up);
+    for (int s = 0; s < g.gate.splits; s++) {
+        warp::load(part, g.gate.partials, {0, 0, s, v});
+        warp::add(gate, gate, part);
+        warp::load(part, g.up.partials, {0, 0, s, v});
+        warp::add(up, up, part);
+    }
+    warp::copy(rounded, gate);
+    warp::copy(gate, rounded);
+    warp::copy(rounded, up);
+    warp::copy(up, rounded);
+    warp::bin_op<OP>(gate, gate, up);
+    const int rr = v * REDUCE_ROWS + warp::laneid();
+    const int p = rr / g.gate.n_pad;
+    const int col = rr % g.gate.n_pad;
+    if (col < g.gate.n) {
+        g.gate.c[{0, 0, p, col}] = base_types::convertor<bf16, float>::convert(gate[0][0]);
+    }
 }
 
 // `n` rounded up to the 32-row block.
@@ -568,6 +683,112 @@ int expert(const void* a, const void* b, const void* topk_idx, void* c, void* pa
     }
 }
 
+// The gate/up GEMV's activation (#1049): 0 SwiGLU (`scratchy::ops::silu_mul`), 1 GeGLU
+// (`scratchy::ops::gelu_tanh_mul`), as `step::GatedOp`; any other value is refused.
+constexpr uint32_t ACT_SILU = 0;
+constexpr uint32_t ACT_GELU = 1;
+
+// The gate/up GEMV's launches on `G`'s gate and up views (each a GEMV of the same `n`, `pairs`
+// and split): the fused CTAs, then at `splits > 1` the fused reduce, on `stream`.
+template <bool EXPERT, typename OP>
+int launch_gate_up(gate_up_globals G, uint32_t n, uint32_t pairs, uint32_t splits,
+                   void* stream) {
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    void* args[] = {&G};
+    const dim3 grid(padded(n) / uint32_t(BLOCK_ROWS), splits, pairs), block(NUM_THREADS);
+    const cudaError_t launched =
+        cudaLaunchKernel(gate_up_gemv_ker<EXPERT, OP>, grid, block, args, GEMV_SMEM_BYTES, s);
+    if (launched != cudaSuccess || splits == 1) {
+        return static_cast<int>(launched);
+    }
+    gate_up_reduce_globals R{
+        {G.gate.partials, G.gate.c, int(n), int(padded(n)), int(splits)},
+        {G.up.partials, G.up.c, int(n), int(padded(n)), int(splits)},
+    };
+    void* rargs[] = {&R};
+    const uint32_t vectors = pairs * padded(n) / uint32_t(REDUCE_ROWS);
+    const dim3 rgrid((vectors + REDUCE_WARPS - 1) / REDUCE_WARPS), rblock(REDUCE_THREADS);
+    return static_cast<int>(cudaLaunchKernel(gate_up_reduce_ker<OP>, rgrid, rblock, rargs, 0, s));
+}
+
+// `launch_gate_up` at the activation `act` names.
+template <bool EXPERT>
+int launch_gate_up_act(uint32_t act, const gate_up_globals& G, uint32_t n, uint32_t pairs,
+                       uint32_t splits, void* stream) {
+    return act == ACT_SILU
+               ? launch_gate_up<EXPERT, scratchy::ops::silu_mul>(G, n, pairs, splits, stream)
+               : launch_gate_up<EXPERT, scratchy::ops::gelu_tanh_mul>(G, n, pairs, splits, stream);
+}
+
+// The dense gate/up GEMV: each of the gate and the up meets the dense GEMV's rule at `splits`,
+// with its partials at `partials` (the gate's) and `partials` past the gate's `splits · n_pad`
+// f32 (the up's).
+int dense_gate_up(const void* a, const void* gate, const void* up, void* c, void* partials,
+                  uint32_t n, uint32_t k, uint32_t splits, uint32_t act, void* stream) {
+    const uint32_t each = dense_split(partials, n, k, splits);
+    if (each == 0 || (act != ACT_SILU && act != ACT_GELU)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        float* up_partials =
+            partials == nullptr ? nullptr
+                                : static_cast<float*>(partials) + size_t(splits) * padded(n);
+        gate_up_globals G{dense_globals(a, gate, c, partials, n, k, splits, each),
+                          dense_globals(a, up, c, up_partials, n, k, splits, each)};
+        return launch_gate_up_act<false>(act, G, n, 1, splits, stream);
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+// The expert gate/up GEMV: `expert`'s rule for the gate's and the up's slabs of one bank (each
+// `[experts, expert_rows, k]` at its own base), the token rows read (`pair_rows` 0), the gate's
+// partials at `partials` and the up's past them.
+int expert_gate_up(const void* a, const void* gate, const void* up, const void* topk_idx, void* c,
+                   void* partials, uint32_t m, uint32_t top_k, uint32_t n, uint32_t k,
+                   uint32_t experts, uint32_t expert_rows, uint32_t splits, uint32_t act,
+                   void* stream) {
+    const uint64_t pairs = uint64_t(m) * uint64_t(top_k);
+    if (m == 0 || top_k == 0 || top_k > MAX_TOP_K || pairs > uint64_t(MAX_GRID_Z) || n == 0 ||
+        n % 64 != 0 || k == 0 || k % 64 != 0 ||
+        (experts != EXPERTS_SMALL && experts != EXPERTS_LARGE) || expert_rows < n ||
+        uint64_t(m) * uint64_t(k) > uint64_t(INT_MAX) || pairs * uint64_t(n) > uint64_t(INT_MAX) ||
+        uint64_t(experts) * uint64_t(expert_rows) * uint64_t(k) > uint64_t(INT_MAX) ||
+        (act != ACT_SILU && act != ACT_GELU)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    const uint32_t chunks = (k + uint32_t(CHUNK) - 1) / uint32_t(CHUNK);
+    const uint32_t each = split_chunks(chunks, splits);
+    if (each == 0 || (splits > 1 && partials == nullptr) ||
+        uint64_t(splits) * pairs * uint64_t(padded(n)) > uint64_t(INT_MAX)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        const size_t run = size_t(pairs * padded(n));
+        const auto view = [&](const void* b, void* p) {
+            in_gl ag{static_cast<bf16*>(const_cast<void*>(a)), nullptr, nullptr, size_t(m),
+                     size_t(k)};
+            weight_gl bg{static_cast<bf16*>(const_cast<void*>(b)), nullptr, size_t(experts),
+                         size_t(expert_rows), size_t(k)};
+            out_gl cg{static_cast<bf16*>(c), nullptr, nullptr, size_t(pairs), size_t(n)};
+            partial_gl pg{static_cast<float*>(p), nullptr, nullptr, size_t(splits), run};
+            idx_gl ig{static_cast<int*>(const_cast<void*>(topk_idx)), nullptr, nullptr,
+                      size_t(1), size_t(pairs)};
+            return gemv_globals{ag,        bg,          cg,         pg,         ig,
+                                int(n),    int(padded(n)), int(chunks), int(each), int(splits),
+                                int(top_k)};
+        };
+        float* up_partials =
+            partials == nullptr ? nullptr : static_cast<float*>(partials) + size_t(splits) * run;
+        gate_up_globals G{view(gate, partials), view(up, up_partials)};
+        return launch_gate_up_act<true>(act, G, n, uint32_t(pairs), splits, stream);
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
 }  // namespace
 
 namespace {
@@ -626,6 +847,31 @@ extern "C" int scratchy_cuda_gemv_group_bf16_abt_prepare(void) {
 // `scratchy_cuda_gemv_bf16_abt_prepare`'s, for the expert instances.
 extern "C" int scratchy_cuda_expert_gemv_bf16_prepare(void) {
     return static_cast<int>(prepare_instances<true>());
+}
+
+// The gate/up GEMVs' one-time setup (#1049): the attribute on the four fused kernels (dense and
+// expert, each activation), and a load of the two fused reduces, so no kernel loads mid-capture.
+//
+// 0 = done; any other value = the cudaError_t of the first call that failed.
+extern "C" int scratchy_cuda_gate_up_gemv_bf16_prepare(void) {
+    for (auto ker : {gate_up_gemv_ker<false, scratchy::ops::silu_mul>,
+                     gate_up_gemv_ker<false, scratchy::ops::gelu_tanh_mul>,
+                     gate_up_gemv_ker<true, scratchy::ops::silu_mul>,
+                     gate_up_gemv_ker<true, scratchy::ops::gelu_tanh_mul>}) {
+        const cudaError_t e =
+            cudaFuncSetAttribute(ker, cudaFuncAttributeMaxDynamicSharedMemorySize, GEMV_SMEM_BYTES);
+        if (e != cudaSuccess) {
+            return static_cast<int>(e);
+        }
+    }
+    cudaFuncAttributes attr;
+    for (auto ker : {gate_up_reduce_ker<scratchy::ops::silu_mul>,
+                     gate_up_reduce_ker<scratchy::ops::gelu_tanh_mul>}) {
+        if (const cudaError_t e = cudaFuncGetAttributes(&attr, ker); e != cudaSuccess) {
+            return static_cast<int>(e);
+        }
+    }
+    return 0;
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
@@ -704,4 +950,33 @@ extern "C" int scratchy_cuda_gemv_group_bf16_abt(const void* a, const void* cons
                                                  const uint32_t* splits, uint32_t count,
                                                  void* stream /* cudaStream_t; null = default */) {
     return launch_group(a, b, c, partials, n, k, splits, count, stream);
+}
+
+// The gate/up GEMV (#1049): `c [n] = act(bf16(a · gateᵀ), bf16(a · upᵀ))`, rounded once, `act`
+// `ACT_SILU` (SwiGLU's `silu_mul`) or `ACT_GELU` (GeGLU's `gelu_tanh_mul`). The bits of
+// `scratchy_cuda_gemv_split_bf16_abt` of the gate and of the up at `splits`, then
+// `scratchy_cuda_silu_mul_bf16` (or `_gelu_`) of the two. Return codes as the GEMV's; each of
+// `gate` and `up` meets `scratchy_cuda_gemv_split_bf16_abt`'s rule at `splits`, and `act` is one of
+// the two, checked before any pointer is touched. At `splits > 1`, `partials` holds
+// `2 · splits · n_pad` f32 (the gate's, then the up's). Two launches at most.
+// `scratchy_cuda_gate_up_gemv_bf16_prepare` must have succeeded on the current device.
+extern "C" int scratchy_cuda_gate_up_gemv_bf16(const void* a, const void* gate, const void* up,
+                                               void* c, void* partials, uint32_t n, uint32_t k,
+                                               uint32_t splits, uint32_t act,
+                                               void* stream /* cudaStream_t; null = default */) {
+    return dense_gate_up(a, gate, up, c, partials, n, k, splits, act, stream);
+}
+
+// The expert gate/up GEMV (#1049): per pair `p`, `c[p] = act(bf16(a[p / top_k] · gate_eᵀ),
+// bf16(a[p / top_k] · up_eᵀ))`, `e = topk_idx[p]`, `gate` and `up` expert 0's blocks of two
+// `[experts, expert_rows, k]` slabs (the bank's gate and up, `expert_rows` apart). The bits of
+// `scratchy_cuda_expert_gemv_split_bf16` of the gate and of the up, then the activation. Return
+// codes and rule as `scratchy_cuda_expert_gemv_split_bf16`'s with `pair_rows` 0, and `act` as
+// `scratchy_cuda_gate_up_gemv_bf16`'s; `partials` holds `2 · splits · m · top_k · n` f32.
+extern "C" int scratchy_cuda_expert_gate_up_gemv_bf16(
+    const void* a, const void* gate, const void* up, const void* topk_idx, void* c, void* partials,
+    uint32_t m, uint32_t top_k, uint32_t n, uint32_t k, uint32_t experts, uint32_t expert_rows,
+    uint32_t splits, uint32_t act, void* stream /* cudaStream_t; null = default */) {
+    return expert_gate_up(a, gate, up, topk_idx, c, partials, m, top_k, n, k, experts, expert_rows,
+                          splits, act, stream);
 }

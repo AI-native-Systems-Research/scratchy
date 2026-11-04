@@ -123,6 +123,10 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "GroupMember",
                 "AddRmsNormBf16",
                 "NormAddBf16",
+                "GateUpActBf16",
+                "GateUpKernel",
+                "GatedOp",
+                "ExpertGateUpActBf16",
             ],
         },
         ModuleRow {
@@ -594,6 +598,9 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         | CudaStep::SoftCap(_) => None,
         // Read through their members ([`CudaStep::parts`]), each a GEMM's `[n, k]`.
         CudaStep::GemmGroup(_) | CudaStep::GemmNarrowGroup(_) | CudaStep::GemvGroup(_) => None,
+        // Read through their parts ([`CudaStep::parts`]): the two GEMMs (or expert GEMVs) each
+        // fold.
+        CudaStep::GateUpAct(_) | CudaStep::ExpertGateUpAct(_) => None,
     }
 }
 

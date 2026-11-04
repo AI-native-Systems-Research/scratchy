@@ -25,6 +25,7 @@
 
 #include "kittens.cuh"
 #include "prototype.cuh"
+#include "scratchy_ops.cuh"
 
 #include <climits>
 #include <cstdint>
@@ -243,7 +244,124 @@ struct group_template {
     };
 };
 
+// The gate/up GEMM (#1049): `C = OP(bf16(A · Gᵀ), bf16(A · Uᵀ))`, the gate's and the up's GEMMs
+// in one launch, `OP` the activation's op struct (`scratchy::ops::silu_mul` or `gelu_tanh_mul`,
+// `silu_mul_bf16.cu`'s). `matmul_template`'s lcf producer and consumer at half its column block
+// (`N_BLOCK = 2`, 128 columns), so each consumer's two `rt_fl<16, 128>` accumulators hold what one
+// `rt_fl<16, 256>` holds in the plain GEMM and the 232-register budget stands. Per K step the
+// producer loads `A`'s two row tiles and two column tiles of each of `G` and `U`; each consumer
+// runs one `mma_ABt` per accumulator, the plain GEMM's K loop and WGMMA K order, so each sum is the
+// gate's (the up's) own GEMM's bits on that 128-column half of its 256-column tile. The finish
+// stores each accumulator into its own finish tile (`warpgroup::store`, the rounding the two GEMMs'
+// stores make), loads both back to f32 registers (exact), applies `OP` by TK's map, and stores the
+// result for one TMA store. The finish tiles are written by the consumer and read by TMA only:
+// no WGMMA reads them, so no async-proxy fence is needed.
+template<int M_BLOCK, int N_BLOCK>
+struct gate_up_layout {
+    using  base_tile      = st_bf<64, 64>;
+    using  global_layout  = gl<bf16, 1, 1, -1, -1, base_tile>;
+    struct globals        { global_layout A, G, U, C; };
+    struct input_block    { base_tile a[M_BLOCK], g[N_BLOCK], u[N_BLOCK]; };
+    struct finish_block   { base_tile g[M_BLOCK][N_BLOCK], u[M_BLOCK][N_BLOCK]; };
+    struct common_state   { int2 coord; };
+    struct consumer_state { rt_fl<16, N_BLOCK*base_tile::cols> gate, up; };
+};
+template<typename OP, int _M_BLOCK=2, int _N_BLOCK=2, int _SUPER_M=12>
+struct gate_up_template {
+    static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
+    using layout    = gate_up_layout<M_BLOCK, N_BLOCK>;
+    using wide_tile = st_bf<64, 64*N_BLOCK>;
+    using b_stack_tile = st_bf<64*N_BLOCK, 64>;
+    using acc_tile = rt_fl<16, N_BLOCK*64>;
+    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
+    // `matmul_template`'s tile order.
+    __device__ static inline void common_setup(common_setup_args<layout> args) {
+        int Rblocks = args.globals.C.rows() / (M_BLOCK*64), Cblocks = args.globals.C.cols() / (N_BLOCK*64);
+        int super_rows = (Rblocks/SUPER_M)*SUPER_M,
+            final_rows = Rblocks - super_rows,
+            super_repeat = SUPER_M*Cblocks;
+        int task_id = args.task_iter*gridDim.x + blockIdx.x;
+        if (task_id < super_rows * Cblocks)
+            args.common.coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M,
+                           (task_id%super_repeat)/SUPER_M };
+        else if (task_id < Rblocks*Cblocks) {
+            int remainder_id = task_id - super_rows*Cblocks;
+            args.common.coord = { super_rows + (remainder_id%final_rows), remainder_id/final_rows };
+        }
+        else { // Id is too high, no more work to do
+            args.num_iters = -1;
+            return;
+        }
+        args.num_iters = args.globals.A.cols()/64;
+        int id = warpgroup::groupid() == NUM_CONSUMER_WARPS/4 ? 0 : warpgroup::groupid(); // producer sets as 0
+        args.common.coord = { args.common.coord.x*M_BLOCK + id, args.common.coord.y*N_BLOCK };
+    }
+    struct producer {
+        __device__ static void setup(producer_setup_args<layout> args) {
+            warpgroup::decrease_registers<40>(); // decrease registers for producers
+        }
+        __device__ static void load(producer_load_args<layout> args) {
+            if (warpgroup::laneid() == 0) {
+                tma::expect(args.inputs_arrived, args.input);
+                for(int i = 0; i < M_BLOCK; i++)
+                    tma::load_async(args.input.a[i], args.globals.A,
+                                    {args.common.coord.x+i, args.iter}, args.inputs_arrived);
+                for(int i = 0; i < N_BLOCK; i++) {
+                    tma::load_async(args.input.g[i], args.globals.G,
+                                    {args.common.coord.y+i, args.iter}, args.inputs_arrived);
+                    tma::load_async(args.input.u[i], args.globals.U,
+                                    {args.common.coord.y+i, args.iter}, args.inputs_arrived);
+                }
+            }
+        }
+    };
+    struct consumer {
+        __device__ static void setup(consumer_setup_args<layout> args) {
+            warpgroup::increase_registers<232>(); // increase registers for consumers
+            kittens::warp::zero(args.state.gate);
+            kittens::warp::zero(args.state.up);
+        }
+        __device__ static void compute(consumer_compute_args<layout> args) {
+            warpgroup::mma_ABt(args.state.gate, args.input.a[warpgroup::groupid()],
+                               reinterpret_cast<b_stack_tile&>(args.input.g));
+            warpgroup::mma_ABt(args.state.up, args.input.a[warpgroup::groupid()],
+                               reinterpret_cast<b_stack_tile&>(args.input.u));
+            warpgroup::mma_async_wait();
+            if (warp::laneid() == 0) arrive(args.inputs_finished);
+        }
+        __device__ static void finish(consumer_finish_args<layout> args) {
+            const int c = warpgroup::groupid();
+            wide_tile& g = reinterpret_cast<wide_tile&>(args.finish.g[c]);
+            wide_tile& u = reinterpret_cast<wide_tile&>(args.finish.u[c]);
+            warpgroup::store(g, args.state.gate);
+            warpgroup::store(u, args.state.up);
+            warpgroup::sync(c+4);
+            warpgroup::load(args.state.gate, g);
+            warpgroup::load(args.state.up, u);
+            kittens::warp::bin_map<OP>(args.state.gate, args.state.gate, args.state.up);
+            // Every warp of the consumer has read `g` before it is overwritten.
+            warpgroup::sync(c+4);
+            warpgroup::store(g, args.state.gate);
+            warpgroup::sync(c+4);
+            if (warpgroup::laneid() == 0) for(int i = 0; i < N_BLOCK; i++) {
+                tma::store_async(args.globals.C, args.finish.g[c][i],
+                                 {args.common.coord.x, args.common.coord.y+i});
+                tma::store_async_read_wait(); // wait that store is finished before reusing finish memory
+            }
+            kittens::warp::zero(args.state.gate);
+            kittens::warp::zero(args.state.up);
+            if (warp::laneid() == 0) arrive(args.finish_finished);
+        }
+    };
+};
+
 using gemm_bf16_abt_mmt = matmul_template<2, 4, 8>;
+using gate_up_silu_mmt = gate_up_template<scratchy::ops::silu_mul, 2, 2, 8>;
+using gate_up_gelu_mmt = gate_up_template<scratchy::ops::gelu_tanh_mul, 2, 2, 8>;
+// One 64-column block per accumulator: the 64-column GEMM's (`gemm_col64_bf16_abt_mmt`) shapes,
+// Gemma's 2112-column dense MLP.
+using gate_up_silu_col64_mmt = gate_up_template<scratchy::ops::silu_mul, 2, 1, 8>;
+using gate_up_gelu_col64_mmt = gate_up_template<scratchy::ops::gelu_tanh_mul, 2, 1, 8>;
 using gemm_group_bf16_abt_mmt = group_template<2, 4, 8>;
 // One 64-column B block: `rt_fl<16, 64>` accumulators, `a[2]` and `b[1]` input tiles, `c[2][1]`.
 using gemm_col64_bf16_abt_mmt = matmul_template<2, 1, 8>;
@@ -275,6 +393,22 @@ extern "C" int scratchy_cuda_gemm_group_bf16_abt_prepare(void) {
     return static_cast<int>(cudaFuncSetAttribute(kittens::prototype::lcf::kernel<gemm_group_bf16_abt_mmt>,
                                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                  GEMM_BF16_ABT_SMEM_BYTES));
+}
+
+// The gate/up instances' (#1049), as `scratchy_cuda_gemm_bf16_abt_prepare`'s, for both
+// activations at both column blocks.
+extern "C" int scratchy_cuda_gate_up_gemm_bf16_prepare(void) {
+    for (auto ker : {kittens::prototype::lcf::kernel<gate_up_silu_mmt>,
+                     kittens::prototype::lcf::kernel<gate_up_gelu_mmt>,
+                     kittens::prototype::lcf::kernel<gate_up_silu_col64_mmt>,
+                     kittens::prototype::lcf::kernel<gate_up_gelu_col64_mmt>}) {
+        const cudaError_t e = cudaFuncSetAttribute(ker, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                   GEMM_BF16_ABT_SMEM_BYTES);
+        if (e != cudaSuccess) {
+            return static_cast<int>(e);
+        }
+    }
+    return 0;
 }
 
 // The launch of `mmt`'s instance, the shape rule its tile's: `m`, `n` and `k` non-zero multiples
@@ -384,4 +518,60 @@ extern "C" int scratchy_cuda_gemm_group_bf16_abt(const void* a, const void* cons
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
+}
+
+// The launch of the gate/up instance `mmt` under `rule`'s shape rule (the plain GEMM instance whose
+// bits each accumulator gives): `m`, `n` and `k` non-zero multiples of its tile, none above INT_MAX.
+template <typename mmt, typename rule>
+static int launch_gate_up(const void* a, const void* gate, const void* up, void* c, uint32_t m,
+                          uint32_t n, uint32_t k, void* stream) {
+    constexpr uint32_t M_TILE = rule::M_BLOCK * 64, N_TILE = rule::N_BLOCK * 64, K_TILE = 64;
+    constexpr uint32_t DIM_MAX = static_cast<uint32_t>(INT_MAX);
+    if (m == 0 || n == 0 || k == 0 || m % M_TILE != 0 || n % N_TILE != 0 || k % K_TILE != 0 ||
+        m > DIM_MAX || n > DIM_MAX || k > DIM_MAX) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        using global_layout = typename mmt::layout::global_layout;
+        using globals       = typename mmt::layout::globals;
+        const auto view = [&](const void* p, uint32_t rows, uint32_t cols) {
+            return global_layout{static_cast<bf16*>(const_cast<void*>(p)), nullptr, nullptr,
+                                 size_t(rows), size_t(cols)};
+        };
+        globals G{view(a, m, k), view(gate, n, k), view(up, n, k), view(c, m, n)};
+        void* args[] = {&G};
+        const dim3 grid(H100_SXM_SMS), block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+        return static_cast<int>(cudaLaunchKernel(kittens::prototype::lcf::kernel<mmt>, grid, block,
+                                                 args, GEMM_BF16_ABT_SMEM_BYTES,
+                                                 static_cast<cudaStream_t>(stream)));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+// The gate/up GEMM (#1049): `c [m, n] = act(bf16(a · gateᵀ), bf16(a · upᵀ))`, rounded once, `act`
+// 0 for SwiGLU's `silu_mul`, 1 for GeGLU's `gelu_tanh_mul`. At `col64` 0, the bits of
+// `scratchy_cuda_gemm_bf16_abt` of the gate and of the up, then `scratchy_cuda_silu_mul_bf16` (or
+// `_gelu_`) of the two, under that GEMM's shape rule (`m`, `n` and `k` non-zero multiples of 128,
+// 256 and 64); at `col64` 1, `scratchy_cuda_gemm_col64_bf16_abt`'s bits and rule (128, 64, 64).
+// None above INT_MAX, `act` and `col64` 0 or 1, all checked before any pointer is touched. Return
+// codes as `scratchy_cuda_gemm_bf16_abt`'s. `gate` and `up` are `[n, k]`, `c` overlapping no
+// input. `scratchy_cuda_gate_up_gemm_bf16_prepare` must have succeeded on the current device.
+extern "C" int scratchy_cuda_gate_up_gemm_bf16(const void* a, const void* gate, const void* up,
+                                               void* c, uint32_t m, uint32_t n, uint32_t k,
+                                               uint32_t act, uint32_t col64,
+                                               void* stream /* cudaStream_t; null = default */) {
+    if (act > 1 || col64 > 1) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    if (col64 == 1) {
+        return act == 0 ? launch_gate_up<gate_up_silu_col64_mmt, gemm_col64_bf16_abt_mmt>(
+                              a, gate, up, c, m, n, k, stream)
+                        : launch_gate_up<gate_up_gelu_col64_mmt, gemm_col64_bf16_abt_mmt>(
+                              a, gate, up, c, m, n, k, stream);
+    }
+    return act == 0
+               ? launch_gate_up<gate_up_silu_mmt, gemm_bf16_abt_mmt>(a, gate, up, c, m, n, k, stream)
+               : launch_gate_up<gate_up_gelu_mmt, gemm_bf16_abt_mmt>(a, gate, up, c, m, n, k, stream);
 }

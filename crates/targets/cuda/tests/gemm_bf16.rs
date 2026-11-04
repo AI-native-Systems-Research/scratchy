@@ -16,7 +16,11 @@ use scratchy_target_cuda::kernels::gemm_col64_bf16_abt;
 use scratchy_target_cuda::kernels::{
     KernelError, gemm_bf16_abt, gemm_narrow_bf16_abt, gemv_bf16_abt,
 };
+use scratchy_target_cuda::kernels::{
+    gate_up_gemm_bf16, gate_up_gemv_bf16, gelu_mul_bf16, silu_mul_bf16,
+};
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
+use scratchy_target_cuda::step::GatedOp;
 
 /// `(M, N, K)`, each a multiple of the kernel's (128, 256, 64).
 const SHAPES: &[(u32, u32, u32, &str)] = &[
@@ -1173,4 +1177,128 @@ fn the_split_gemv_bandwidth_is_recorded() {
             line.join(", ")
         );
     }
+}
+
+/// Which chain a gate/up case folds: the plain GEMM's, the 64-column GEMM's, or the GEMV's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GateUpChain {
+    Gemm,
+    Col64,
+    Gemv,
+}
+
+/// The chain #1049's gate/up fold replaces, on the default stream: the gate's and the up's GEMMs
+/// (or GEMVs, at the split each takes on its own), then the activation `act` over their outputs.
+///
+/// # Safety
+///
+/// As the launchers'; `a`, `g`, `u` hold `m·k`, `n·k` and `n·k` bf16, `gc`, `uc` and `out` `m·n`.
+unsafe fn gate_up_chain(
+    chain: GateUpChain,
+    (a, g, u): (&DeviceBuffer, &DeviceBuffer, &DeviceBuffer),
+    (gc, uc, out, partials): (&DeviceBuffer, &DeviceBuffer, &DeviceBuffer, &DeviceBuffer),
+    (m, n, k): (u32, u32, u32),
+    act: GatedOp,
+) {
+    let null = std::ptr::null_mut();
+    // SAFETY: the caller's contract; the default stream orders the launches.
+    unsafe {
+        for (b, c) in [(g, gc), (u, uc)] {
+            match chain {
+                GateUpChain::Gemm => gemm_bf16_abt(a.ptr(), b.ptr(), c.ptr(), m, n, k, null),
+                GateUpChain::Col64 => {
+                    gemm_col64_bf16_abt(a.ptr(), b.ptr(), c.ptr(), (m, n, k), null)
+                }
+                GateUpChain::Gemv => match gemv_splits(n, k, 1) {
+                    1 => gemv_bf16_abt(a.ptr(), b.ptr(), c.ptr(), (n, k), null),
+                    s => gemv_split_bf16_abt(
+                        (a.ptr(), b.ptr(), c.ptr()),
+                        partials.ptr(),
+                        (n, k, s),
+                        null,
+                    ),
+                },
+            }
+            .expect("the chain's GEMM");
+        }
+        match act {
+            GatedOp::Silu => silu_mul_bf16(gc.ptr(), uc.ptr(), out.ptr(), (m, n), null),
+            GatedOp::Gelu => gelu_mul_bf16(gc.ptr(), uc.ptr(), out.ptr(), (m, n), null),
+        }
+        .expect("the chain's activation");
+    }
+}
+
+/// #1049's gate/up GEMV and GEMM are their chains bit for bit: the gate's and the up's GEMMs (or
+/// GEMVs) then the activation, for SwiGLU and GeGLU, at the decode shapes (the 0.8B's and 9B's
+/// MLP, which split, and Gemma's 2112-column one), a prefill shape of each GEMM, and the output's
+/// tail intact.
+#[test]
+fn the_gate_up_fold_is_its_chain_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for (chain, (m, n, k)) in [
+        (GateUpChain::Gemv, (1, 3584, 1024)),
+        (GateUpChain::Gemv, (1, 12288, 4096)),
+        (GateUpChain::Gemv, (1, 2112, 2816)),
+        (GateUpChain::Gemm, (512, 3584, 1024)),
+        (GateUpChain::Gemm, (256, 1024, 512)),
+        (GateUpChain::Col64, (512, 2112, 2816)),
+    ] {
+        for act in [GatedOp::Silu, GatedOp::Gelu] {
+            let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+            let seed = (u64::from(n) << 32) ^ u64::from(k) ^ u64::from(m) << 48;
+            let up_buf = |v: &[u16]| DeviceBuffer::upload(&device, v).expect("upload");
+            let a = up_buf(&bf16_inputs(mu * ku, 0x6A7E_0000 ^ seed));
+            let g = up_buf(&bf16_inputs(nu * ku, 0x6A7E_1000 ^ seed));
+            let u = up_buf(&bf16_inputs(nu * ku, 0x6A7E_2000 ^ seed));
+            let out_buf = || up_buf(&vec![SENTINEL; mu * nu + TAIL]);
+            let (gc, uc, chain_out, fused) = (out_buf(), out_buf(), out_buf(), out_buf());
+            // Room for both projections' partials at the GEMVs' largest split (16 × n_pad).
+            let partials = up_buf(&vec![0u16; 2 * 2 * 16 * (nu + 32)]);
+            // SAFETY: cudaMalloc pointers are 256-byte aligned; every buffer holds what its
+            // launcher reads or writes; the outputs are their own allocations; null is the
+            // default stream, which the downloads below wait for.
+            unsafe {
+                gate_up_chain(
+                    chain,
+                    (&a, &g, &u),
+                    (&gc, &uc, &chain_out, &partials),
+                    (m, n, k),
+                    act,
+                );
+                match chain {
+                    GateUpChain::Gemv => gate_up_gemv_bf16(
+                        (a.ptr(), g.ptr(), u.ptr()),
+                        (fused.ptr(), partials.ptr()),
+                        (n, k, gemv_splits(n, k, 1)),
+                        act.code(),
+                        std::ptr::null_mut(),
+                    ),
+                    GateUpChain::Gemm | GateUpChain::Col64 => gate_up_gemm_bf16(
+                        (a.ptr(), g.ptr(), u.ptr()),
+                        fused.ptr(),
+                        (m, n, k),
+                        (act.code(), chain == GateUpChain::Col64),
+                        std::ptr::null_mut(),
+                    ),
+                }
+            }
+            .expect("the fused launch");
+            let (want, got) = (
+                chain_out.download().expect("download"),
+                fused.download().expect("download"),
+            );
+            let tail = got[mu * nu..].iter().all(|&x| x == SENTINEL);
+            let mismatched = mismatched_bits(&got[..mu * nu], &want[..mu * nu]);
+            let ok = mismatched == 0 && tail;
+            eprintln!(
+                "gate_up {chain:?} {act:?} m={m} n={n} k={k}: mismatched_bits={mismatched} \
+                 tail_intact={tail} {}",
+                if ok { "PASS" } else { "FAIL" }
+            );
+            pass &= ok;
+        }
+    }
+    assert!(pass, "a gate/up fold differs from its chain");
 }

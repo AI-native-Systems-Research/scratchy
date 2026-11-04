@@ -174,6 +174,30 @@ pub enum CudaFusion {
     /// An RMSNorm and the residual add it alone feeds in one launch (#1049, Gemma's
     /// `add(norm(o), residual)`; `step::CudaStep::NormAdd`).
     NormAdd,
+    /// SwiGLU's gate and up projections and `silu(gate) · up` in one launch (#1049,
+    /// `step::CudaStep::GateUpAct`): the `Gated` fold with its projections folded in.
+    GateUpSiluMul,
+    /// GeGLU's, `gelu_tanh(gate) · up` (#1049, `step::CudaStep::GateUpAct`).
+    GateUpGeluMul,
+    /// A routed expert's gate and up GEMVs and its activation in one launch, at the one-row bucket
+    /// (#1049, `step::CudaStep::ExpertGateUpAct`).
+    ExpertGateUpAct,
+}
+
+/// Whether CUDA folds a gated MLP's gate and up projections into its activation
+/// (`ModelFoldFacts::fold_projections`), at every bucket (#1049): the gate/up GEMV and GEMM
+/// (`step::CudaStep::GateUpAct`) take every dense SwiGLU and GeGLU shape CUDA lowers.
+pub const CUDA_FOLD_PROJECTIONS: bool = true;
+
+/// The fusion table of a bucket of `m` rows (#1049): [`CUDA_FUSIONS`] at every bucket, and at the
+/// one-row bucket [`CUDA_FUSIONS_ONE_ROW`], which also folds a routed expert's gate and up GEMVs
+/// into its activation. A prefill bucket's experts keep their grouped GEMMs (#1050).
+pub const fn cuda_fusions(m: u64) -> &'static FusionTable<CudaFusion> {
+    if m == 1 {
+        &CUDA_FUSIONS_ONE_ROW
+    } else {
+        &CUDA_FUSIONS
+    }
 }
 
 /// The output widths CUDA's sibling-matmul fold groups (#1049), one band per grouped kernel: the
@@ -205,61 +229,79 @@ pub const CUDA_SIBLING_BANDS: &[ColsBand] = &[
 /// a softmax over the picks (Gemma) or their renorm (Qwen) (stage 1), and Gemma's per-expert scale
 /// (stage 2): metal's `Route` row, without its sigmoid and bias routings and its last scale.
 ///
-/// `fused` repeats `split`: CUDA's `ModelFoldFacts` never sets `fold_projections`, so the shared
-/// pass always picks `split`, and the gate and up GEMMs stay launches of their own. A `Gated` fold
-/// with its projections folded in is refused at lowering (`CanonicalRefusal::FusionShape`); one
-/// kernel for the gate and up GEMMs is a later GEMM-epilogue issue.
+/// Under [`CUDA_FOLD_PROJECTIONS`] the shared pass picks `fused`: the gate and up GEMMs fold into
+/// the activation's launch (#1049). `split` is the activation alone, the kernel a `Gated` fold
+/// whose projections stay apart lowers to.
 pub const CUDA_FUSIONS: FusionTable<CudaFusion> = FusionTable {
     counted: &[],
-    sweeps: &[&[
-        FoldPattern::SiblingMatmuls {
-            matmul: SubOpKind::MatmulTile,
-            max: 3,
-            bands: CUDA_SIBLING_BANDS,
-            gated: &[SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul],
-            kernel: CudaFusion::SiblingMatmuls,
-        },
-        FoldPattern::Gated {
-            mul: SubOpKind::Mul,
-            activations: &[
-                GatedKernel {
-                    activation: SubOpKind::Silu,
-                    split: CudaFusion::SiluMul,
-                    fused: CudaFusion::SiluMul,
-                },
-                GatedKernel {
-                    activation: SubOpKind::Gelu,
-                    split: CudaFusion::GeluMul,
-                    fused: CudaFusion::GeluMul,
-                },
-            ],
-        },
-        FoldPattern::NormAdd {
-            add: SubOpKind::Add,
-            norm: SubOpKind::RmsNorm,
-            kernel: CudaFusion::NormAdd,
-        },
-        FoldPattern::ResidualNorm {
-            norm: SubOpKind::RmsNorm,
-            add: SubOpKind::Add,
-            kernel: CudaFusion::AddRmsNorm,
-        },
-        FoldPattern::Route {
-            top_k: SubOpKind::RouteTopK,
-            sort: SubOpKind::RouteArgsort,
-            pre: &[SubOpKind::RouteSoftmax],
-            gather: SubOpKind::RouteGatherScores,
-            tail: &[
-                &[SubOpKind::RouteScale],
-                &[SubOpKind::RouteSoftmax, SubOpKind::RouteRenorm],
-                &[SubOpKind::RouteExpertScale],
-                &[],
-            ],
-            kernel: CudaFusion::MoeRoute,
-        },
-    ]],
+    sweeps: &[CUDA_SWEEP],
     rows: None,
 };
+
+/// [`CUDA_FUSIONS`] and, after its sweep, a routed expert's gate and up GEMVs folded into its
+/// activation (metal's `ExpertActivation` row, #1049): the one-row bucket's table
+/// ([`cuda_fusions`]).
+pub const CUDA_FUSIONS_ONE_ROW: FusionTable<CudaFusion> = FusionTable {
+    counted: &[],
+    sweeps: &[
+        CUDA_SWEEP,
+        &[FoldPattern::ExpertActivation {
+            act: SubOpKind::ExpertGatedAct,
+            matmul: SubOpKind::ExpertMatmul,
+            kernel: CudaFusion::ExpertGateUpAct,
+        }],
+    ],
+    rows: None,
+};
+
+/// The sweep every CUDA bucket folds by ([`CUDA_FUSIONS`]).
+const CUDA_SWEEP: &[FoldPattern<CudaFusion>] = &[
+    FoldPattern::SiblingMatmuls {
+        matmul: SubOpKind::MatmulTile,
+        max: 3,
+        bands: CUDA_SIBLING_BANDS,
+        gated: &[SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul],
+        kernel: CudaFusion::SiblingMatmuls,
+    },
+    FoldPattern::Gated {
+        mul: SubOpKind::Mul,
+        activations: &[
+            GatedKernel {
+                activation: SubOpKind::Silu,
+                split: CudaFusion::SiluMul,
+                fused: CudaFusion::GateUpSiluMul,
+            },
+            GatedKernel {
+                activation: SubOpKind::Gelu,
+                split: CudaFusion::GeluMul,
+                fused: CudaFusion::GateUpGeluMul,
+            },
+        ],
+    },
+    FoldPattern::NormAdd {
+        add: SubOpKind::Add,
+        norm: SubOpKind::RmsNorm,
+        kernel: CudaFusion::NormAdd,
+    },
+    FoldPattern::ResidualNorm {
+        norm: SubOpKind::RmsNorm,
+        add: SubOpKind::Add,
+        kernel: CudaFusion::AddRmsNorm,
+    },
+    FoldPattern::Route {
+        top_k: SubOpKind::RouteTopK,
+        sort: SubOpKind::RouteArgsort,
+        pre: &[SubOpKind::RouteSoftmax],
+        gather: SubOpKind::RouteGatherScores,
+        tail: &[
+            &[SubOpKind::RouteScale],
+            &[SubOpKind::RouteSoftmax, SubOpKind::RouteRenorm],
+            &[SubOpKind::RouteExpertScale],
+            &[],
+        ],
+        kernel: CudaFusion::MoeRoute,
+    },
+];
 
 // ── The MoE block ───────────────────────────────────────────────────
 

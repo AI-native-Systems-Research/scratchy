@@ -246,6 +246,8 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::GemvGroup(_) => "GemvGroup",
             CudaStep::AddRmsNorm(_) => "AddRmsNorm",
             CudaStep::NormAdd(_) => "NormAdd",
+            CudaStep::GateUpAct(_) => "GateUpAct",
+            CudaStep::ExpertGateUpAct(_) => "ExpertGateUpAct",
         };
         *h.entry(kind).or_default() += 1;
         match step {
