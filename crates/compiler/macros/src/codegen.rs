@@ -8601,11 +8601,16 @@ fn emit_canonical_params_impl(
             num_q_heads,
             num_kv_heads,
             num_global_kv_heads,
-            // ⭐ DERIVED ONCE, HERE — the division the const assert beside this fill proves
-            // exact (num_q_heads % num_global_kv_heads == 0); the splice reads it as
-            // NUM_QUERIES_PER_KV and never re-derives it. 0 stands in only where there is no
-            // attention body (head_dim == 0), the same stand-in the assert's emission uses.
-            global_queries_per_kv: if num_global_kv_heads > 0 {
+            // ⭐ DERIVED ONCE, HERE — the plain division the GQA law's const assert below
+            // proves exact (num_q_heads % num_global_kv_heads == 0); the splice reads it as
+            // NUM_QUERIES_PER_KV and never re-derives it. The assert is emitted only for an
+            // attention body (`head_dim > 0`, the gate right under this fill), and this arm
+            // uses that same gate: the division is safe exactly where the assert vouches for
+            // it. The no-attention body (`head_dim == 0`, vision) has no GQA group; gating
+            // the field on that head-dim zero is the parked "absence as a type" item, held
+            // here as an explicit `head_dim > 0` arm rather than a 0-queries sentinel — the
+            // same ruling `from_canonical` and the fixture fill already follow.
+            global_queries_per_kv: if head_dim > 0 {
                 num_q_heads / num_global_kv_heads
             } else {
                 0
@@ -11262,8 +11267,10 @@ fn dump_wavefront_mega(
             decode_asn_check,
             inferred,
             decode_bounds,
-            model,
-            model_consts,
+            crate::to_wavefront::ModelFacts {
+                params: model,
+                consts: model_consts,
+            },
             crate::to_wavefront::PrefixCapacity::new(cap),
             primary_m,
         )
@@ -13319,8 +13326,10 @@ fn dump_wavefront_mega(
                     decode_asn_check,
                     inferred,
                     decode_bounds,
-                    model,
-                    model_consts,
+                    crate::to_wavefront::ModelFacts {
+                        params: model,
+                        consts: model_consts,
+                    },
                     crate::to_wavefront::PrefixCapacity::new(
                         std::num::NonZeroU32::new(cap).expect("cap bucket is non-zero"),
                     ),
@@ -13390,8 +13399,10 @@ fn dump_wavefront_mega(
                     decode_asn_check,
                     inferred,
                     decode_bounds,
-                    model,
-                    model_consts,
+                    crate::to_wavefront::ModelFacts {
+                        params: model,
+                        consts: model_consts,
+                    },
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     seqs,
                 ) {
@@ -13626,8 +13637,10 @@ fn dump_wavefront_mega(
                 decode_asn_check,
                 inferred,
                 decode_bounds,
-                model,
-                model_consts,
+                crate::to_wavefront::ModelFacts {
+                    params: model,
+                    consts: model_consts,
+                },
                 // Prefill and decode model the SAME resident prefix-KV cache, so
                 // they MUST share ONE capacity — the KTIR emulator bakes a STATIC
                 // `[prefix_len, kv]` cache + a `[1, prefix_len]` runtime length mask,
@@ -13759,8 +13772,10 @@ fn dump_wavefront_mega(
                     decode_asn_check,
                     inferred,
                     decode_bounds,
-                    model,
-                    model_consts,
+                    crate::to_wavefront::ModelFacts {
+                        params: model,
+                        consts: model_consts,
+                    },
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     m,
                 ) {
@@ -13898,8 +13913,10 @@ fn dump_wavefront_mega(
                 decode_asn_check,
                 inferred,
                 decode_bounds,
-                model,
-                model_consts,
+                crate::to_wavefront::ModelFacts {
+                    params: model,
+                    consts: model_consts,
+                },
                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
                 decode_mq,
             ) {
@@ -14452,8 +14469,10 @@ pub fn emit_model(
                     None,
                     inferred,
                     &bounds,
-                    model,
-                    &resolved_metal_consts,
+                    crate::to_wavefront::ModelFacts {
+                        params: model,
+                        consts: &resolved_metal_consts,
+                    },
                     crate::to_wavefront::PrefixCapacity::new(
                         std::num::NonZeroU32::new(8192).expect("8192 != 0"),
                     ),
@@ -14571,8 +14590,10 @@ pub fn emit_model(
                 None,
                 inferred,
                 &bounds,
-                model,
-                &resolved_metal_consts,
+                crate::to_wavefront::ModelFacts {
+                    params: model,
+                    consts: &resolved_metal_consts,
+                },
                 crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap()),
                 wp.num_tokens as u32,
             ) {
@@ -15097,7 +15118,16 @@ pub fn emit_model(
         let prefix =
             crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
         let l = match crate::to_wavefront::lower_decode_to_wavefront(
-            fuf, None, inferred, &bounds, model, &resolved_metal_consts, prefix, m as u32,
+            fuf,
+            None,
+            inferred,
+            &bounds,
+            crate::to_wavefront::ModelFacts {
+                params: model,
+                consts: &resolved_metal_consts,
+            },
+            prefix,
+            m as u32,
         ) {
             Ok(l) => l,
             // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,

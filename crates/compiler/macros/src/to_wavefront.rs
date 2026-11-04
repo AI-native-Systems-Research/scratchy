@@ -592,6 +592,19 @@ impl PrefixCapacity {
     }
 }
 
+/// One model, described once. `ModelParams` (the config the solver and the
+/// bounds read) and `MetalModelConsts` (the model-facts record the lowering
+/// reads) are two projections of ONE expansion-time fill —
+/// `emit_canonical_params_impl` mints both from the same numbers. Bundled
+/// here so the pair travels to the bridge as a single value and can never be
+/// passed mismatched (a consts record from another model beside its params).
+pub struct ModelFacts<'a> {
+    /// The config record: bounds, scalars, source stem.
+    pub params: &'a ModelParams,
+    /// The one model-facts struct the fill minted for this expansion.
+    pub consts: &'a MetalModelConsts,
+}
+
 /// Translate a solved decode FUF into a wavefront `LoweringInput`.
 ///
 /// `asn` is the `num_tokens = 1` (decode) [`Assignment`]; `bounds` is the
@@ -607,11 +620,14 @@ pub fn lower_decode_to_wavefront(
     asn: Option<&Assignment>,
     inferred: &Inferred,
     bounds: &BTreeMap<String, u64>,
-    model: &ModelParams,
-    model_consts: &MetalModelConsts,
+    facts: ModelFacts<'_>,
     prefix_len: PrefixCapacity,
     num_tokens: u32,
 ) -> Result<LoweredDecode, BridgeError> {
+    let ModelFacts {
+        params: model,
+        consts: model_consts,
+    } = facts;
     // Unwrap the typed capacity to the raw row count once, at the boundary; the
     // rest of the bridge keeps using a plain `u32`.
     let prefix_len = prefix_len.get();
