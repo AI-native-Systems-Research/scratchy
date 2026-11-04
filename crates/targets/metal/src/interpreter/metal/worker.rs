@@ -2375,46 +2375,8 @@ mod tests {
         let device = device.device.clone();
         let cache =
             SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
-        // `TestWeights`' geometry, at f16: the sampled-rows commands read the dtype alone.
-        let p = {
-            use scratchy_ir::model_facts::{
-                Attention, AttnScale, BlockSize, FactsParts, HeadDim, HeadGeometry, HiddenSize,
-                IntermediateSize, KvHeads, KvRope, ModelFacts, NormWeightOffset, QueryHeads,
-                RmsNormEps, Rope, RopePairing, RotDim, ScaleDtype,
-            };
-            let class = HeadGeometry::new(
-                QueryHeads::new(32),
-                KvHeads::new(4),
-                HeadDim::new(64),
-                RotDim::new(64),
-                BlockSize::new(16),
-            );
-            ModelFacts::new(FactsParts {
-                metal_dtype: MetalDtype::F16,
-                scale_dtype: ScaleDtype::F16,
-                hidden: HiddenSize::new(2048),
-                intermediate: Some(IntermediateSize::new(5632)),
-                vocab: None,
-                eps: RmsNormEps::new(1e-5),
-                norm_offset: NormWeightOffset::new(0.0),
-                final_softcap: None,
-                kv_codec: scratchy_ir::KvCodec::Dense,
-                attention: Some(Attention::new(
-                    class,
-                    class,
-                    AttnScale::new(0.125),
-                    None,
-                    None,
-                    Rope::new(RopePairing::Standard, KvRope::AtWrite, None),
-                )),
-                vision: None,
-                gdn: None,
-                drafter: None,
-                spec_drafts: None,
-                capture_slots: None,
-                target: None,
-            })
-        };
+        // `TestWeights`' facts: the sampled-rows commands read the dtype alone.
+        let p = <TestWeights as CanonicalParams>::FACTS;
         // Decodes, then verifies (every row sampled), then short prefix-hit chunks, then long
         // chunks.
         let q_lens: Vec<u32> = [
@@ -2517,20 +2479,20 @@ mod tests {
         linear_layer: LinearLayer,
     }
     impl CanonicalParams for TestWeights {
-        const HEAD_DIM: u32 = 64;
-        const NUM_Q_HEADS: u32 = 32;
-        const NUM_KV_HEADS: u32 = 4;
-        const Q_SIZE: usize = 2048;
-        const KV_SIZE: usize = 256;
-        const INTERMEDIATE_SIZE: usize = 5632;
-        const ATTN_SCALE: f32 = 0.125;
-        const ATTN_SOFTCAP: f32 = 0.0;
-        const SLIDING_WINDOW: i32 = -1;
+        // Pinned to f16, the MPS GEMM path the smoke tests below assert on.
+        const FACTS: scratchy_ir::model_facts::ModelFacts = crate::tape::facts::llama_like(
+            32,
+            4,
+            64,
+            5632,
+            2048,
+            0.125,
+            scratchy_ir::model_facts::MetalDtype::F16,
+        );
         const KV_LORA_RANK: usize = 0;
         const QK_NOPE_HEAD_DIM: usize = 0;
         const QK_ROPE_HEAD_DIM: usize = 0;
         const V_HEAD_DIM: usize = 0;
-        const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
         const QK_HEAD_DIM: usize = 0;
         const MLA_ATTN_SCALE: f32 = 0.0;
         // Pin the smoke tests to the f16 / MPS GEMM path. The

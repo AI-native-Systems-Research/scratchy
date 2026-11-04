@@ -78,12 +78,17 @@ are; one derived from the other is the same number twice and is not emitted.
   `PREFILL_TILE_Q`, `HAS_BIAS_ADD`, `HAS_MOE`).
 - **TP:** `ModelFacts` is a canonical's facts **at its tensor-parallel width** (heads sharded), as
   `CanonicalParams` is today (the fill takes `tp_world_size`). Spyre TP reads exactly that.
-- Storage: tables (KV cache layers) are `&'static` in the emitted const and owned at build time
-  (`Cow<'static, [u32]>`), so one type serves both, and `ModelFacts` is `Clone`, not `Copy`. The
-  table's law (strictly ascending layers) runs in both paths: the `const fn` on the borrowed slice in
-  the emitted const, and the same check on the owned value when the bake builds it, which fails the
-  build naming the law. A test covers the owned path (a descending table panics) as well as the
-  borrowed one.
+- Storage (amended in phase 2, auditer-approved): tables (KV cache layers) are `KvLayers(&'static
+  [u32])`, so `ModelFacts` stays `Copy` and one type serves both the bake and the emitted const.
+  - The first form, an owned `Cow<'static, [u32]>`, cannot compile on stable: a trait default that
+    reads `Self::FACTS` fails with E0493 ("destructor ... cannot be evaluated at compile-time",
+    rust-lang/rust#133214) as soon as any field of `FACTS` has a destructor.
+  - `KvLayers::new` is a `const fn` that refuses a table that is not strictly ascending.
+  - The fill gets its `'static` table from `Vec::leak`: once per canonical, in the build-script
+    process only.
+  - The law runs through that one constructor on both paths: the bake's leaked slice and the emitted
+    const's literal slice. A test passes a descending table through the same constructor and
+    expects the panic.
 
 ### One source: `CanonicalParams::FACTS`
 
@@ -148,10 +153,10 @@ are; one derived from the other is the same number twice and is not emitted.
    result is reported in the PR.
 3. **The metal runtime reads `W::FACTS`,** with the `const` assertions above. `MetalModelConsts`,
    `model_consts.rs` and `from_canonical` are deleted.
-4. **Kernel-ABI laws as `const` assertions on emitted commands.** For each ABI law phase 0 finds, the
+4. **REPLACED by `2026-11-04-shapes-as-rust-types.md`.** (Was: kernel-ABI laws as `const` assertions on emitted commands.) For each ABI law phase 0 finds, the
    kernel's constants type gets a `const fn` check, and the emitted command constants are emitted
    inside `const { … }`.
-5. **Cross-step shape laws as `const` assertions** for the independently derived ones phase 0 finds.
+5. **REPLACED by `2026-11-04-shapes-as-rust-types.md`.** (Was: cross-step shape laws as `const` assertions) for the independently derived ones phase 0 finds.
    Each step's operand extents and its arena slot are emitted as consts beside the tape, with
    `const { assert!(..) }` over them. For each law found to be "the same number twice", the doc records
    the code that derives both sides (file:line), so a later change that makes them independent knows

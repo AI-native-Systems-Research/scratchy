@@ -9944,9 +9944,8 @@ mod tests {
 
     use scratchy_ir::model_facts::{
         Attention, AttnScale, AttnWindow, BlockSize, ConvDim, ConvKernel, FactsParts, Gdn,
-        GdnHeadDim, GdnHeads, HeadDim, HeadGeometry, HiddenSize, IntermediateSize, KvHeads, KvRope,
-        NormWeightOffset, NumDrafts, QueryHeads, RmsNormEps, Rope, RopePairing, RotDim, ScaleDtype,
-        SoftCap,
+        GdnHeadDim, GdnHeads, HeadDim, HeadGeometry, HiddenSize, KvHeads, KvRope, NumDrafts,
+        QueryHeads, Rope, RopePairing, RotDim, SoftCap,
     };
 
     /// A class's geometry: `q` query heads over `kv` kv heads of `hd`, `rot` lanes rotated, pages
@@ -10021,25 +10020,11 @@ mod tests {
     }
 
     /// The lowering tests' model: a Llama-1B-like decoder, bf16, dense KV.
+    const TP: ModelFacts =
+        crate::tape::facts::llama_like(32, 4, 64, 8192, 2048, 0.125, MetalDtype::Bf16);
+
     fn tp() -> ModelFacts {
-        ModelFacts::new(FactsParts {
-            metal_dtype: MetalDtype::Bf16,
-            scale_dtype: ScaleDtype::F16,
-            hidden: HiddenSize::new(2048),
-            intermediate: Some(IntermediateSize::new(8192)),
-            vocab: None,
-            eps: RmsNormEps::new(1e-5),
-            norm_offset: NormWeightOffset::new(0.0),
-            final_softcap: None,
-            kv_codec: KvCodec::Dense,
-            attention: Some(attn(TP_GEOM, TP_GEOM, None, KvRope::AtWrite)),
-            vision: None,
-            gdn: None,
-            drafter: None,
-            spec_drafts: None,
-            capture_slots: None,
-            target: None,
-        })
+        TP
     }
 
     /// The code width the TurboQuant fixture is built at.
@@ -10068,24 +10053,11 @@ mod tests {
     /// canonical Llama-3.x configuration the macro emits.
     struct TestParams;
     impl CanonicalParams for TestParams {
-        const HEAD_DIM: u32 = 64;
-        const NUM_Q_HEADS: u32 = 32;
-        const NUM_KV_HEADS: u32 = 4;
-        const Q_SIZE: usize = 2048;
-        // Residual-stream width. For this Llama-1B-like shape hidden==Q_SIZE.
-        // AffineEmbed (and other residual-width arms) read `HIDDEN_SIZE`, so it
-        // must be pinned here — the trait default of 0 would zero those dispatches.
-        const HIDDEN_SIZE: usize = 2048;
-        const KV_SIZE: usize = 256;
-        const INTERMEDIATE_SIZE: usize = 8192;
-        const ATTN_SCALE: f32 = 0.125;
-        const ATTN_SOFTCAP: f32 = 0.0;
-        const SLIDING_WINDOW: i32 = -1;
+        const FACTS: scratchy_ir::model_facts::ModelFacts = TP;
         const KV_LORA_RANK: usize = 0;
         const QK_NOPE_HEAD_DIM: usize = 0;
         const QK_ROPE_HEAD_DIM: usize = 0;
         const V_HEAD_DIM: usize = 0;
-        const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
         const QK_HEAD_DIM: usize = 0;
         const MLA_ATTN_SCALE: f32 = 0.0;
         const METAL_DTYPE: MetalDtype = MetalDtype::Bf16;

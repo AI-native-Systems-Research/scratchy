@@ -993,20 +993,24 @@ pub const fn unpack_moe_expert_bits(packed: u32) -> (u32, u32, u32) {
 /// model constants without storing them on every variant instance.
 /// Defaults to 0 / 0.0 / -1 for fields the canonical doesn't use.
 pub trait CanonicalParams: WeightAccessors {
-    const HEAD_DIM: u32;
-    const NUM_Q_HEADS: u32;
-    const NUM_KV_HEADS: u32;
-    const Q_SIZE: usize;
-    const KV_SIZE: usize;
-    const INTERMEDIATE_SIZE: usize;
-    const ATTN_SCALE: f32;
-    const ATTN_SOFTCAP: f32;
-    const SLIDING_WINDOW: i32;
+    /// ⭐ THE CANONICAL'S FACTS, typed ([`model_facts::ModelFacts`]): the one source every numeric
+    /// const below that has a fact is derived from ([`model_facts::raw`]). The generated impl states
+    /// only this and the consts no fact covers (the MLA dims and the target/build knobs).
+    const FACTS: model_facts::ModelFacts;
+    const HEAD_DIM: u32 = model_facts::raw::head_dim(Self::FACTS);
+    const NUM_Q_HEADS: u32 = model_facts::raw::num_q_heads(Self::FACTS);
+    const NUM_KV_HEADS: u32 = model_facts::raw::num_kv_heads(Self::FACTS);
+    const Q_SIZE: usize = model_facts::raw::q_size(Self::FACTS);
+    const KV_SIZE: usize = model_facts::raw::kv_size(Self::FACTS);
+    const INTERMEDIATE_SIZE: usize = model_facts::raw::intermediate_size(Self::FACTS);
+    const ATTN_SCALE: f32 = model_facts::raw::attn_scale(Self::FACTS);
+    const ATTN_SOFTCAP: f32 = model_facts::raw::attn_softcap(Self::FACTS);
+    const SLIDING_WINDOW: i32 = model_facts::raw::sliding_window(Self::FACTS);
     const KV_LORA_RANK: usize;
     const QK_NOPE_HEAD_DIM: usize;
     const QK_ROPE_HEAD_DIM: usize;
     const V_HEAD_DIM: usize;
-    const FINAL_LOGIT_SOFTCAPPING: f32;
+    const FINAL_LOGIT_SOFTCAPPING: f32 = model_facts::raw::final_logit_softcapping(Self::FACTS);
     /// `qk_nope_head_dim + qk_rope_head_dim` (MlaAttention).
     const QK_HEAD_DIM: usize;
     /// MlaAttention scale: `1/sqrt(qk_head_dim)` w/ YaRN correction.
@@ -1020,58 +1024,58 @@ pub trait CanonicalParams: WeightAccessors {
     /// rotary pair through the section that owns it. Default `None` so
     /// existing arches need no override; Qwen2-VL sets it via the
     /// proc-macro emit path. Plan: `~/.claude/plans/distributed-mapping-map.md`.
-    const MROPE_SECTION: Option<[u32; 3]> = None;
+    const MROPE_SECTION: Option<[u32; 3]> = model_facts::raw::mrope_section(Self::FACTS);
     /// How this model's KV cache is stored, fixed when it is built. The metal
     /// lowering injects the TurboQuant commands, the RuntimeFactory provisions
     /// the packed stores, and the worker sizes and grows the KV pool, all from
     /// this one value — so the tape, its buffers and the pool always agree.
-    const KV_CODEC: KvCodec = KvCodec::Dense;
+    const KV_CODEC: KvCodec = Self::FACTS.kv_codec();
     /// The layers that hold KV, ascending, when not every layer does: a
     /// recurrent hybrid's attention layers (its Mamba / Gated-DeltaNet layers
     /// keep recurrent state instead). The KV pool holds tensors for these
     /// layers only and its budget counts them; the TurboQuant store provisions
     /// none for the others. `None`: every layer holds KV.
-    const KV_CACHE_LAYERS: Option<&'static [u32]> = None;
+    const KV_CACHE_LAYERS: Option<&'static [u32]> = model_facts::raw::kv_cache_layers(Self::FACTS);
     /// Vision-tower attention head count. Vision encoders run plain
     /// MHA (`num_kv_heads == num_heads`); only one head dim is needed.
     /// Default 0 for text-only arches that never produce
     /// `OpKind::VarlenAttention` / `OpKind::VisionRope` tiles, so the
     /// matching `Instruction` variants stay registered but unreachable.
     /// Set by `#[vision_forward]` from the vision config.
-    const VISION_NUM_HEADS: u32 = 0;
+    const VISION_NUM_HEADS: u32 = model_facts::raw::vision_num_heads(Self::FACTS);
 
     /// Vision-tower attention head dimension. Same defaults / set-by
     /// rule as [`Self::VISION_NUM_HEADS`].
-    const VISION_HEAD_DIM: u32 = 0;
+    const VISION_HEAD_DIM: u32 = model_facts::raw::vision_head_dim(Self::FACTS);
     /// `vision_num_heads * vision_head_dim` — the rank-2 last-dim of
     /// q/k/v at the FUF level (the kernel internally reshapes to
     /// rank-3). Same defaults / set-by rule as
     /// [`Self::VISION_NUM_HEADS`].
-    const VISION_Q_SIZE: usize = 0;
+    const VISION_Q_SIZE: usize = model_facts::raw::vision_q_size(Self::FACTS);
     /// Vision patch-embed input width = `in_chans * temporal_patch_size
     /// * patch_size²` (Qwen3.5-VL: 3·2·16² = 1536). The rank-2 last-dim
     /// of the `pixels` extern; the metal `LoadRows(Pixels)` arm uses it to
     /// size the copy-into-arena dispatch. Same defaults / set-by rule as
     /// [`Self::VISION_NUM_HEADS`] (0 on non-vision arches).
-    const VISION_IN_FEATURES: usize = 0;
+    const VISION_IN_FEATURES: usize = model_facts::raw::vision_in_features(Self::FACTS);
     /// Vision 2D-RoPE pairing convention: `false` = GPT-NeoX
     /// rotate_half (every Qwen-VL tower), `true` = adjacent-pair
     /// GPT-J style (MoonViT / LocateAnything). Set from the optional
     /// `vision_rope_style` config key ("interleaved_xy"); selects the
     /// `vision_rope_2d[_interleaved]` kernel entry point at lowering.
-    const VISION_ROPE_INTERLEAVED: bool = false;
+    const VISION_ROPE_INTERLEAVED: bool = model_facts::raw::vision_rope_interleaved(Self::FACTS);
     /// Vision-tower softmax scale: `1 / sqrt(vision_head_dim)`. Same
     /// defaults / set-by rule as [`Self::VISION_NUM_HEADS`].
-    const VISION_ATTN_SCALE: f32 = 0.0;
+    const VISION_ATTN_SCALE: f32 = model_facts::raw::vision_attn_scale(Self::FACTS);
     /// Patch-grid side length (square): `vision_image_size / vision_patch_size`.
     /// Used by `Instruction::AvgPool2d` to convert flat row index
     /// `[L = ph * ph]` → `(row, col)` and walk the k² source cells per
     /// output. Defaults to 0 for arches that never emit `OpKind::AvgPool2d`.
-    const VISION_PATCH_GRID_SIDE: u32 = 0;
+    const VISION_PATCH_GRID_SIDE: u32 = model_facts::raw::vision_patch_grid_side(Self::FACTS);
     /// Stride / kernel size of the post-encoder average pool (Gemma3-MM
     /// projector: k=4 over a 64×64 patch grid → 16×16 = 256 tokens). The
     /// pool is non-overlapping, so stride == kernel. Defaults to 0.
-    const VISION_POOL_KERNEL: u32 = 0;
+    const VISION_POOL_KERNEL: u32 = model_facts::raw::vision_pool_kernel(Self::FACTS);
 
     /// RmsNorm epsilon — read from `rms_norm_eps` in the model
     /// config at macro-expand time. The metal `rmsnorm_*_specialized`
@@ -1080,7 +1084,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// from `RmsNorm.eps` on the loaded layer struct (same value,
     /// same source). Default is the value Llama / Qwen / Phi
     /// canonically use; per-canonical macro impls override.
-    const RMS_NORM_EPS: f32 = 1e-5;
+    const RMS_NORM_EPS: f32 = Self::FACTS.eps().get();
 
     /// Zero-centered RMSNorm gain offset (Gemma / Qwen3.5): the effective
     /// gain applied by the standard `RmsNorm` / `FusedAddRmsNorm` metal
@@ -1091,7 +1095,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// (`gdn_rms_norm_gated`) is a separate kernel and is NOT affected —
     /// its gain is stored as the true value. Per-canonical macro impls
     /// override from the config's `norm_weight_offset` field.
-    const NORM_WEIGHT_OFFSET: f32 = 0.0;
+    const NORM_WEIGHT_OFFSET: f32 = Self::FACTS.norm_offset().get();
 
     /// Paged-KV-cache block stride (the `block_size` function
     /// constant `attention_via_cache_*_specialized` and
@@ -1099,7 +1103,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// (vLLM's default); per-canonical override only if a model
     /// chooses a different paging size. This is the SLIDING-class block
     /// size on hybrid arches (see [`Self::GLOBAL_BLOCK_SIZE`]).
-    const BLOCK_SIZE: u32 = model_facts::DEFAULT_KV_PAGE.get();
+    const BLOCK_SIZE: u32 = model_facts::raw::block_size(Self::FACTS);
 
     /// Paged-KV-cache block stride for the GLOBAL (full-attention) layer
     /// class on hybrid sliding/global arches. vLLM's group-shared KV
@@ -1112,7 +1116,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// makes both blocks `32768` elems. Defaults to `BLOCK_SIZE` →
     /// uniform-geometry models compile unchanged. The metal lowering
     /// feeds this to the full-attention + full-layer KV-write arms.
-    const GLOBAL_BLOCK_SIZE: u32 = Self::BLOCK_SIZE;
+    const GLOBAL_BLOCK_SIZE: u32 = model_facts::raw::global_block_size(Self::FACTS);
 
     // ── Gated-DeltaNet (Qwen3.5 / Qwen3-Next linear attention) ──────
     // Per-layer GDN dims the `Instruction::GatedDeltaNet` eval reads as
@@ -1122,32 +1126,32 @@ pub trait CanonicalParams: WeightAccessors {
     // `linear_key_head_dim` / `linear_value_head_dim` /
     // `linear_conv_kernel_dim` config keys. `GDN_CONV_DIM` =
     // `2·(num_k_heads·head_k_dim) + num_v_heads·head_v_dim`.
-    const GDN_NUM_K_HEADS: u32 = 0;
-    const GDN_NUM_V_HEADS: u32 = 0;
-    const GDN_HEAD_K_DIM: u32 = 0;
-    const GDN_HEAD_V_DIM: u32 = 0;
-    const GDN_CONV_KERNEL: u32 = 0;
-    const GDN_CONV_DIM: usize = 0;
+    const GDN_NUM_K_HEADS: u32 = model_facts::raw::gdn_num_k_heads(Self::FACTS);
+    const GDN_NUM_V_HEADS: u32 = model_facts::raw::gdn_num_v_heads(Self::FACTS);
+    const GDN_HEAD_K_DIM: u32 = model_facts::raw::gdn_head_k_dim(Self::FACTS);
+    const GDN_HEAD_V_DIM: u32 = model_facts::raw::gdn_head_v_dim(Self::FACTS);
+    const GDN_CONV_KERNEL: u32 = model_facts::raw::gdn_conv_kernel(Self::FACTS);
+    const GDN_CONV_DIM: usize = model_facts::raw::gdn_conv_dim(Self::FACTS);
     /// The drafts each sequence of a speculative verify step carries: an MTP head's (its
     /// arch.json), and the target's whose head this build compiles. 0 without one.
-    const SPEC_DRAFTS: u32 = 0;
+    const SPEC_DRAFTS: u32 = model_facts::raw::spec_drafts(Self::FACTS);
 
     // ── A DFlash2 drafter's geometry (Splash's DFlashDraftLayout), 0 for every other model ──
     /// The channels each dynamic-convolution weight covers (`dflash_config.conv_group_size`).
-    const DRAFT_CONV_GROUP: u32 = 0;
+    const DRAFT_CONV_GROUP: u32 = model_facts::raw::draft_conv_group(Self::FACTS);
     /// The rank of its selector's codebooks (`dflash_config.selector_rank`).
-    const DRAFT_SELECTOR_RANK: u32 = 0;
+    const DRAFT_SELECTOR_RANK: u32 = model_facts::raw::draft_selector_rank(Self::FACTS);
     /// The token its block's proposal rows embed (`dflash_config.mask_token_id`).
-    const DRAFT_MASK_TOKEN: u32 = 0;
+    const DRAFT_MASK_TOKEN: u32 = model_facts::raw::draft_mask_token(Self::FACTS);
     /// The width of a `target_hidden` row a head reads: its target's hidden size, or a DFlash2
     /// drafter's every captured layer's side by side (`backbone_hidden_size`).
-    const TARGET_HIDDEN_WIDTH: usize = Self::HIDDEN_SIZE;
+    const TARGET_HIDDEN_WIDTH: usize = model_facts::raw::target_hidden_width(Self::FACTS);
     /// Whether a head's target routes each row it verifies through experts of its own
     /// (`target_num_experts`): what a DFlash2 drafter's verify budget prices.
-    const TARGET_ROUTES_EXPERTS: bool = false;
+    const TARGET_ROUTES_EXPERTS: bool = model_facts::raw::target_routes_experts(Self::FACTS);
     /// The blocks of a target's captured rows: the layers a drafter compiled beside it reads
     /// (`draft_capture_layers`), 0 when none does.
-    const DRAFT_CAPTURE_SLOTS: u32 = 0;
+    const DRAFT_CAPTURE_SLOTS: u32 = model_facts::raw::draft_capture_slots(Self::FACTS);
 
     /// A block-table row stride (in u32s) for callers with no KV pool to read
     /// one from: kernel tests, and the metal TurboQuant dequant grid before a
@@ -1165,7 +1169,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// Partial-rope rotation dim — for models where only the first
     /// `ROT_DIM` of `HEAD_DIM` get rotary applied (Qwen2-VL, GPT-J).
     /// Default equals `HEAD_DIM` (full rope, the common case).
-    const ROT_DIM: u32 = Self::HEAD_DIM;
+    const ROT_DIM: u32 = model_facts::raw::rot_dim(Self::FACTS);
 
     /// Per-layer-class attention geometry for hybrid sliding/global
     /// architectures whose two classes differ in dims (Gemma4: sliding
@@ -1177,16 +1181,16 @@ pub trait CanonicalParams: WeightAccessors {
     /// `NUM_KV_HEADS` to the sliding arms. Defaults equal the base
     /// values — uniform-geometry models compile unchanged. Sourced
     /// from config `global_head_dim` / `num_global_key_value_heads`.
-    const GLOBAL_HEAD_DIM: u32 = Self::HEAD_DIM;
+    const GLOBAL_HEAD_DIM: u32 = model_facts::raw::global_head_dim(Self::FACTS);
     /// See [`Self::GLOBAL_HEAD_DIM`].
-    const NUM_GLOBAL_KV_HEADS: u32 = Self::NUM_KV_HEADS;
+    const NUM_GLOBAL_KV_HEADS: u32 = model_facts::raw::num_global_kv_heads(Self::FACTS);
     /// Partial-rope rotation dim for the GLOBAL class (Gemma4:
     /// proportional rope rotates 128 of 512). Defaults to the global
     /// head_dim (full rope).
-    const GLOBAL_ROT_DIM: u32 = Self::GLOBAL_HEAD_DIM;
+    const GLOBAL_ROT_DIM: u32 = model_facts::raw::global_rot_dim(Self::FACTS);
     /// `num_q_heads * global_head_dim` — the global-class Q/attn-out
     /// row width (Gemma4: 16×512 = 8192 vs sliding 16×256 = 4096).
-    const GLOBAL_Q_SIZE: usize = Self::Q_SIZE;
+    const GLOBAL_Q_SIZE: usize = model_facts::raw::global_q_size(Self::FACTS);
     /// Gemma4 "proportional" partial rope on the GLOBAL class (config
     /// `global_partial_rotary_factor`): rotation pairs span the FULL
     /// head's halves — lane `i < GLOBAL_ROT_DIM/2` pairs with `i +
@@ -1194,7 +1198,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// GLOBAL_ROT_DIM/2` like standard HF partial rotary (Qwen3.5).
     /// The metal RopeAppend arm keys the kernel's pairing offset on
     /// this. False everywhere else.
-    const ROPE_PROPORTIONAL: bool = false;
+    const ROPE_PROPORTIONAL: bool = model_facts::raw::rope_proportional(Self::FACTS);
 
     /// Spans / position-independent KV caching capability. When true,
     /// `BlockKind::Relocatable` (span) blocks are stored with K
@@ -1209,7 +1213,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// the lowering is byte-identical to the no-spans path (the rope-on-
     /// read constants/buffers are omitted and dead-eliminate in-shader).
     /// Set true only for models/deployments that opt into spans.
-    const ROPE_ON_READ: bool = false;
+    const ROPE_ON_READ: bool = model_facts::raw::rope_on_read(Self::FACTS);
 
     /// Element dtype the metal backend should run this canonical in.
     /// Picks between the `_f16_specialized` / `_bf16_specialized`
@@ -1223,7 +1227,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// range over deep layer chains and produced incoherent outputs
     /// on Llama-3.x. The default is `Bf16` now; arches that ship
     /// fp16 on disk (rare) override.
-    const METAL_DTYPE: MetalDtype = MetalDtype::Bf16;
+    const METAL_DTYPE: MetalDtype = Self::FACTS.metal_dtype();
 
     /// `hidden_size` (residual-stream width) — distinct from
     /// `Q_SIZE = num_q_heads * head_dim`. On Llama / Qwen2.5 these
@@ -1237,7 +1241,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// Default value is invalid (0) so unset arches surface as
     /// compile-time-detectable bad values rather than silent
     /// corruption.
-    const HIDDEN_SIZE: usize = 0;
+    const HIDDEN_SIZE: usize = model_facts::raw::hidden_size(Self::FACTS);
 
     /// Vocabulary size — the lm_head Gemm's output dim. Used by the
     /// generic `Instruction::Gemm` arm to identify the lm_head call
@@ -1249,7 +1253,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// token at multi-token prefill → garbage activations → NaN logits.
     /// `n == VOCAB_SIZE` is the unambiguous test. Default 0 so non-MoE
     /// arches still hit the legacy `INTERMEDIATE_SIZE` fallback.
-    const VOCAB_SIZE: usize = 0;
+    const VOCAB_SIZE: usize = model_facts::raw::vocab_size(Self::FACTS);
 
     /// On-disk storage dtype for `*.scales` / `*.biases` tensors on
     /// mlx-affine-b4 checkpoints. The affine quant Metal kernels
@@ -1266,7 +1270,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// majority-of-checkpoints convention; per-arch macro overrides
     /// flip it to BF16 (Qwen3 family). Sourced from the manifest's
     /// `scale_dtype` field on the matched `mlx-affine-*` preset.
-    const SCALE_DTYPE: ScaleDtype = ScaleDtype::F16;
+    const SCALE_DTYPE: ScaleDtype = Self::FACTS.scale_dtype();
 
     // ── Backend-capability flags ────────────────────────────────
     //

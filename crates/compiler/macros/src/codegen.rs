@@ -8070,6 +8070,216 @@ fn kv_codec_for(
     }
 }
 
+/// A canonical's facts as the expression its generated `CanonicalParams::FACTS` states: every
+/// group through its own constructor, so the emitted const re-checks each law when rustc evaluates
+/// it. The one serializer of the value the fill built (and the metal bake read).
+fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
+    use scratchy_ir::model_facts::{
+        Attention, AttnClass, KvRope, RopePairing, TargetRouting, Vision, VisionRopePairing,
+    };
+    let m = quote! { ::scratchy_forward_compiler::model_facts };
+    let u32_ = |v: u32| proc_macro2::Literal::u32_unsuffixed(v);
+    let usize_ = |v: usize| proc_macro2::Literal::usize_unsuffixed(v);
+    // Every float through its bits: the emitted value is the fill's value exactly.
+    let f32_ = |v: f32| {
+        let b = proc_macro2::Literal::u32_suffixed(v.to_bits());
+        quote! { f32::from_bits(#b) }
+    };
+    let opt = |t: Option<TokenStream>| match t {
+        Some(t) => quote! { ::core::option::Option::Some(#t) },
+        None => quote! { ::core::option::Option::None },
+    };
+    let geometry = |g: scratchy_ir::model_facts::HeadGeometry| {
+        let (q, kv, hd, rot, page) = (
+            u32_(g.q_heads().get()),
+            u32_(g.kv_heads().get()),
+            u32_(g.head_dim().get()),
+            u32_(g.rot_dim().get()),
+            u32_(g.page().get()),
+        );
+        quote! {
+            #m::HeadGeometry::new(
+                #m::QueryHeads::new(#q),
+                #m::KvHeads::new(#kv),
+                #m::HeadDim::new(#hd),
+                #m::RotDim::new(#rot),
+                #m::BlockSize::new(#page),
+            )
+        }
+    };
+    let attention = opt(f.attention().map(|a: Attention| {
+        let (base, global) = (
+            geometry(a.class(AttnClass::Sliding)),
+            geometry(a.class(AttnClass::Full)),
+        );
+        let scale = f32_(a.scale().get());
+        let softcap = opt(a.softcap().map(|c| {
+            let c = f32_(c.get());
+            quote! { #m::SoftCap::new(#c) }
+        }));
+        let window = opt(a.window().map(|w| {
+            let w = u32_(w.get());
+            quote! { #m::AttnWindow::new(#w) }
+        }));
+        let pairing = match a.pairing() {
+            RopePairing::Standard => quote! { #m::RopePairing::Standard },
+            RopePairing::Proportional => quote! { #m::RopePairing::Proportional },
+        };
+        let kv_rope = match a.kv_rope() {
+            KvRope::AtWrite => quote! { #m::KvRope::AtWrite },
+            KvRope::OnRead => quote! { #m::KvRope::OnRead },
+        };
+        let mrope = opt(a.mrope().map(|s| {
+            let s = s.get().map(u32_);
+            quote! { #m::MropeSection::new([#(#s),*]) }
+        }));
+        quote! {
+            #m::Attention::new(
+                #base,
+                #global,
+                #m::AttnScale::new(#scale),
+                #softcap,
+                #window,
+                #m::Rope::new(#pairing, #kv_rope, #mrope),
+            )
+        }
+    }));
+    let vision = opt(f.vision().map(|v: Vision| {
+        let (heads, hd, inf) = (
+            u32_(v.heads().get()),
+            u32_(v.head_dim().get()),
+            usize_(v.in_features().get()),
+        );
+        let pairing = match v.pairing() {
+            VisionRopePairing::RotateHalf => quote! { #m::VisionRopePairing::RotateHalf },
+            VisionRopePairing::Interleaved => quote! { #m::VisionRopePairing::Interleaved },
+        };
+        let scale = f32_(v.scale().get());
+        let grid = opt(v.patch_grid_side().map(|s| {
+            let s = u32_(s.get());
+            quote! { #m::PatchGridSide::new(#s) }
+        }));
+        let pool = opt(v.pool_kernel().map(|k| {
+            let k = u32_(k.get());
+            quote! { #m::PoolKernel::new(#k) }
+        }));
+        quote! {
+            #m::Vision::new(
+                #m::QueryHeads::new(#heads),
+                #m::HeadDim::new(#hd),
+                #m::InFeatures::new(#inf),
+                #pairing,
+                #m::AttnScale::new(#scale),
+                #grid,
+                #pool,
+            )
+        }
+    }));
+    let gdn = opt(f.gdn().map(|g| {
+        let (kh, vh, kd, vd, ck, cd) = (
+            u32_(g.k_heads().get()),
+            u32_(g.v_heads().get()),
+            u32_(g.k_dim().get()),
+            u32_(g.v_dim().get()),
+            u32_(g.conv_kernel().get()),
+            usize_(g.conv_dim().get()),
+        );
+        quote! {
+            #m::Gdn::new(
+                #m::GdnHeads::new(#kh),
+                #m::GdnHeads::new(#vh),
+                #m::GdnHeadDim::new(#kd),
+                #m::GdnHeadDim::new(#vd),
+                #m::ConvKernel::new(#ck),
+                #m::ConvDim::new(#cd),
+            )
+        }
+    }));
+    let drafter = opt(f.drafter().map(|d| {
+        let (g, r, t) = (
+            u32_(d.conv_group().get()),
+            u32_(d.selector_rank().get()),
+            u32_(d.mask_token().get()),
+        );
+        quote! {
+            #m::Drafter::new(#m::ConvGroup::new(#g), #m::SelectorRank::new(#r), #m::TokenId::new(#t))
+        }
+    }));
+    let target = opt(f.target().map(|t| {
+        let hidden = usize_(t.hidden().get());
+        let routing = match t.routing() {
+            TargetRouting::Dense => quote! { #m::TargetRouting::Dense },
+            TargetRouting::Experts => quote! { #m::TargetRouting::Experts },
+        };
+        quote! { #m::Target::new(#m::HiddenSize::new(#hidden), #routing) }
+    }));
+    let kv_layers = opt(f.kv_layers().map(|l| {
+        let l = l.get().iter().map(|&v| u32_(v));
+        quote! { #m::KvLayers::new(&[#(#l),*]) }
+    }));
+    let kv_codec = match f.kv_codec() {
+        scratchy_ir::KvCodec::Dense => quote! { ::scratchy_forward_compiler::KvCodec::Dense },
+        scratchy_ir::KvCodec::TurboQuant(bits) => {
+            let b = u32_(bits.get());
+            quote! {
+                ::scratchy_forward_compiler::KvCodec::TurboQuant(::scratchy_forward_compiler::TqBits::new(#b))
+            }
+        }
+    };
+    let metal_dtype = match f.metal_dtype() {
+        scratchy_ir::model_facts::MetalDtype::Bf16 => quote! { #m::MetalDtype::Bf16 },
+        scratchy_ir::model_facts::MetalDtype::F16 => quote! { #m::MetalDtype::F16 },
+        scratchy_ir::model_facts::MetalDtype::Int4 => quote! { #m::MetalDtype::Int4 },
+    };
+    let scale_dtype = match f.scale_dtype() {
+        scratchy_ir::model_facts::ScaleDtype::Bf16 => quote! { #m::ScaleDtype::Bf16 },
+        scratchy_ir::model_facts::ScaleDtype::F16 => quote! { #m::ScaleDtype::F16 },
+    };
+    let hidden = usize_(f.hidden().get());
+    let intermediate = opt(f.intermediate().map(|i| {
+        let i = usize_(i.get());
+        quote! { #m::IntermediateSize::new(#i) }
+    }));
+    let vocab = opt(f.vocab().map(|v| {
+        let v = usize_(v.get());
+        quote! { #m::VocabSize::new(#v) }
+    }));
+    let (eps, offset) = (f32_(f.eps().get()), f32_(f.norm_offset().get()));
+    let final_softcap = opt(f.final_softcap().map(|c| {
+        let c = f32_(c.get());
+        quote! { #m::SoftCap::new(#c) }
+    }));
+    let spec_drafts = opt(f.spec_drafts().map(|d| {
+        let d = u32_(d.get());
+        quote! { #m::NumDrafts::new(#d) }
+    }));
+    let capture_slots = opt(f.capture_slots().map(|s| {
+        let s = u32_(s.get());
+        quote! { #m::CaptureSlots::new(#s) }
+    }));
+    quote! {
+        #m::ModelFacts::new(#m::FactsParts {
+            metal_dtype: #metal_dtype,
+            scale_dtype: #scale_dtype,
+            hidden: #m::HiddenSize::new(#hidden),
+            intermediate: #intermediate,
+            vocab: #vocab,
+            eps: #m::RmsNormEps::new(#eps),
+            norm_offset: #m::NormWeightOffset::new(#offset),
+            final_softcap: #final_softcap,
+            kv_codec: #kv_codec,
+            kv_layers: #kv_layers,
+            attention: #attention,
+            vision: #vision,
+            gdn: #gdn,
+            drafter: #drafter,
+            spec_drafts: #spec_drafts,
+            capture_slots: #capture_slots,
+            target: #target,
+        })
+    }
+}
+
 /// Whether a body reads its target's final hidden rows (`RowsExtern::TargetHidden`): a head.
 fn fuf_reads_target_hidden(fuf: &Fuf) -> bool {
     fuf.nodes.iter().any(|n| {
@@ -8085,12 +8295,8 @@ fn emit_canonical_params_impl(
     uses_rotary: bool,
     kv_layers: &KvCacheLayers,
     // Whether the body reads its target's hidden rows (a head): the facts state its target then.
-    #[cfg(feature = "metal")] reads_target_hidden: bool,
-    // Filled with the SAME values the impl's consts are emitted from —
-    // one derivation, two consumers (the impl tokens and the macro-side
-    // tape bake). Built in this fn so drift is impossible.
-    #[cfg(feature = "metal")] metal_facts_out: &mut Option<scratchy_ir::model_facts::ModelFacts>,
-) -> TokenStream {
+    reads_target_hidden: bool,
+) -> (TokenStream, scratchy_ir::model_facts::ModelFacts) {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
     let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
@@ -8110,29 +8316,12 @@ fn emit_canonical_params_impl(
         0
     };
     let q_size = (num_q_heads as usize) * (head_dim as usize);
-    let kv_size = (num_kv_heads as usize) * (head_dim as usize);
     let kv_lora_rank = *model.bounds.get("kv_lora_rank").unwrap_or(&0) as usize;
     let qk_nope_head_dim = *model.bounds.get("qk_nope_head_dim").unwrap_or(&0) as usize;
     let qk_rope_head_dim = *model.bounds.get("qk_rope_head_dim").unwrap_or(&0) as usize;
     let v_head_dim = *model.bounds.get("v_head_dim").unwrap_or(&0) as usize;
     let qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
 
-    // Gated-DeltaNet (Qwen3.5 / Qwen3-Next) per-layer dims. Absent (→ 0,
-    // matching the trait defaults) for every non-hybrid arch. The metal
-    // `lower_one(GatedDeltaNet)` arm reads these as `W::GDN_*` to size
-    // the conv1d / gating / scan / gated-RMSNorm dispatch grids and the
-    // op-scratch layout; the cuda eval reads them too. Not divided by
-    // `tp` — GDN tensor-parallel partitioning is a separate concern and
-    // bring-up is TP=1 (where the division is a no-op anyway).
-    let RecurrentDims {
-        num_k_heads: gdn_num_k_heads,
-        num_v_heads: gdn_num_v_heads,
-        head_k_dim: gdn_head_k_dim,
-        head_v_dim: gdn_head_v_dim,
-        conv_kernel: gdn_conv_kernel,
-        conv_dim,
-    } = RecurrentDims::of(model).unwrap_or_default();
-    let gdn_conv_dim = conv_dim as usize;
     let spec_drafts = *model.bounds.get("spec_drafts").unwrap_or(&0) as u32;
     // A DFlash2 drafter's geometry (its arch.json params), and the blocks of the rows a target
     // captures for one.
@@ -8251,11 +8440,6 @@ fn emit_canonical_params_impl(
         q_size
     };
 
-    let head_dim_lit = proc_macro2::Literal::u32_unsuffixed(head_dim);
-    let num_q_heads_lit = proc_macro2::Literal::u32_unsuffixed(num_q_heads);
-    let num_kv_heads_lit = proc_macro2::Literal::u32_unsuffixed(num_kv_heads);
-    let q_size_lit = proc_macro2::Literal::usize_unsuffixed(q_size);
-    let kv_size_lit = proc_macro2::Literal::usize_unsuffixed(kv_size);
     // HIDDEN_SIZE = residual stream width = config.json `hidden_size`.
     // Distinct from Q_SIZE on GQA arches with head_dim != hidden/num_heads.
     // Vision-only bodies fall back to `vision_embed_dim` (not q_size) so
@@ -8270,17 +8454,14 @@ fn emit_canonical_params_impl(
         } else {
             q_size
         });
-    let hidden_size_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size_for_const);
     // A head's `target_hidden` rows: a DFlash2 drafter's captured layers side by side, else its
     // target's hidden width.
     let target_hidden_width =
         (model.bounds.get("backbone_hidden_size")).map_or(hidden_size_for_const, |&w| w as usize);
-    let target_hidden_width_lit = proc_macro2::Literal::usize_unsuffixed(target_hidden_width);
     let target_routes_experts = model
         .bounds
         .get("target_num_experts")
         .is_some_and(|&n| n > 0);
-    let intermediate_size_lit = proc_macro2::Literal::usize_unsuffixed(intermediate_size);
     // VOCAB_SIZE: lm_head output dim. Read from the verbatim HF config
     // (`vocab_size` bound). Used by the generic `Instruction::Gemm` arm
     // to identify lm_head and apply the last-token-per-seq narrow
@@ -8292,30 +8473,11 @@ fn emit_canonical_params_impl(
         .copied()
         .map(|v| v as usize)
         .unwrap_or(0);
-    let vocab_size_lit = proc_macro2::Literal::usize_unsuffixed(vocab_size_for_const);
     let kv_lora_rank_lit = proc_macro2::Literal::usize_unsuffixed(kv_lora_rank);
     let qk_nope_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_nope_head_dim);
     let qk_rope_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_rope_head_dim);
     let v_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(v_head_dim);
     let qk_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_head_dim);
-    let gdn_num_k_heads_lit = proc_macro2::Literal::u32_unsuffixed(gdn_num_k_heads);
-    let gdn_num_v_heads_lit = proc_macro2::Literal::u32_unsuffixed(gdn_num_v_heads);
-    let gdn_head_k_dim_lit = proc_macro2::Literal::u32_unsuffixed(gdn_head_k_dim);
-    let gdn_head_v_dim_lit = proc_macro2::Literal::u32_unsuffixed(gdn_head_v_dim);
-    let gdn_conv_kernel_lit = proc_macro2::Literal::u32_unsuffixed(gdn_conv_kernel);
-    let gdn_conv_dim_lit = proc_macro2::Literal::usize_unsuffixed(gdn_conv_dim);
-    let spec_drafts_lit = proc_macro2::Literal::u32_unsuffixed(spec_drafts);
-    let draft_conv_group_lit = proc_macro2::Literal::u32_unsuffixed(draft_conv_group);
-    let draft_selector_rank_lit = proc_macro2::Literal::u32_unsuffixed(draft_selector_rank);
-    let draft_mask_token_lit = proc_macro2::Literal::u32_unsuffixed(draft_mask_token);
-    let draft_capture_slots_lit = proc_macro2::Literal::u32_unsuffixed(draft_capture_slots);
-    let norm_weight_offset_lit =
-        proc_macro2::Literal::f32_suffixed(norm_weight_runtime_offset(model));
-    // RMSNorm eps from config (Qwen3.5: 1e-6). Without this the metal
-    // `RmsNorm`/`FusedAddRmsNorm`/`gdn_rms_norm_gated` kernels fall back to
-    // the trait default 1e-5, which visibly drifts on outlier-dominated
-    // (massive-activation) residual streams where mean(x^2) ~ eps.
-    let rms_norm_eps_lit = proc_macro2::Literal::f32_suffixed(rms_norm_eps(model));
     // Rotary dim for the metal rope kernel's `ROT_DIM` fn-const. Mirrors
     // the rope-cache builder (codegen.rs ~2758): `partial_rotary_factor
     // * head_dim` for partial-rope arches (Qwen3.5: 0.25*256 = 64), else
@@ -8329,7 +8491,6 @@ fn emit_canonical_params_impl(
         .filter(|&f| (f - 1.0).abs() > 1e-9)
         .map(|f| (f * head_dim as f64).round() as u32)
         .unwrap_or(head_dim);
-    let rot_dim_lit = proc_macro2::Literal::u32_unsuffixed(rot_dim_val);
     // Per-layer-class geometry for hybrid sliding/global arches whose
     // classes differ in dims (Gemma4: sliding 256×8kv full-rope vs
     // global 512×1kv proportional-rope-128). Config keys
@@ -8382,33 +8543,12 @@ fn emit_canonical_params_impl(
         rot_dim_val,
         head_dim,
     );
-    let global_q_size: usize = (num_q_heads as usize) * (global_head_dim as usize);
-    let global_head_dim_lit = proc_macro2::Literal::u32_unsuffixed(global_head_dim);
-    let num_global_kv_heads_lit = proc_macro2::Literal::u32_unsuffixed(num_global_kv_heads);
-    let global_rot_dim_lit = proc_macro2::Literal::u32_unsuffixed(global_rot_dim);
-    let global_q_size_lit = proc_macro2::Literal::usize_unsuffixed(global_q_size);
     // Proportional rope marker — same predicate that routes the
     // rotary cache builder to `new_proportional_from_gpuweights`.
     // Drives the metal rope kernel's pairing offset (lane i pairs
     // with i + head_dim/2, not i + rot_dim/2).
     let rope_proportional = global_rot_dim != global_head_dim
         && model.scalars.contains_key("global_partial_rotary_factor");
-    let rope_proportional_tokens: proc_macro2::TokenStream = if rope_proportional {
-        quote! { const ROPE_PROPORTIONAL: bool = true; }
-    } else {
-        quote! {}
-    };
-    // Rope-on-read is the universal default for every rope-using model
-    // (position-independent KV: store K unrotated for span blocks, re-rope on
-    // read; the bit-31 bitmap keeps non-span blocks read-as-is). No opt-in —
-    // it tracks rope presence. Must agree with `ScratchyWeights::rope_on_read()`
-    // (lib.rs), which the metal worker reads to flag block_table/slot_mapping
-    // bit 31. No-rope models get the trait default (false).
-    let rope_on_read_tokens: proc_macro2::TokenStream = if uses_rotary {
-        quote! { const ROPE_ON_READ: bool = true; }
-    } else {
-        quote! {}
-    };
     // GLOBAL_BLOCK_SIZE override — vLLM's hybrid-KV page-size unification
     // (`unify_kv_cache_spec_page_size`, kv_cache_utils.py:944:
     // `new_block_size = block_size * ratio`). When the full (global) and
@@ -8421,11 +8561,12 @@ fn emit_canonical_params_impl(
     // direction); equal pages → no emit (default = BLOCK_SIZE). The reverse
     // direction (sliding smaller) would scale BLOCK_SIZE instead and is not
     // emitted by any current arch — guarded loudly below.
-    let base_block_size: u32 = model
-        .bounds
-        .get("block_size")
-        .map(|&v| v as u32)
-        .unwrap_or(scratchy_ir::model_facts::DEFAULT_KV_PAGE.get());
+    // The base class's KV page is the paged pool's (`DEFAULT_KV_PAGE`, the runtime's
+    // `BLOCK_SIZE`): a page is how the pool slices its cache, and no checkpoint states it. A
+    // config's `block_size` is the model's own field: LocateAnything's (`"block_size": 6`) is its
+    // SDLM block-diffusion generation window (nvidia/LocateAnything-3B `modeling_qwen2.py:1168`,
+    // read only by `mask_sdpa_utils.py`'s attention masks), not a KV page.
+    let base_block_size: u32 = scratchy_ir::model_facts::DEFAULT_KV_PAGE.get();
     let sliding_per_token = num_kv_heads * head_dim; // base class == sliding on gemma4
     let global_per_token = num_global_kv_heads * global_head_dim;
     let uniform_page =
@@ -8444,15 +8585,6 @@ fn emit_canonical_params_impl(
         );
         base_block_size * (sliding_per_token / global_per_token)
     } else {
-        base_block_size
-    };
-    let global_block_size_override: proc_macro2::TokenStream = if uniform_page {
-        // Uniform page (or no distinct global class) — keep the default.
-        quote! {}
-    } else if global_per_token < sliding_per_token {
-        let lit = proc_macro2::Literal::u32_unsuffixed(resolved_global_block_size);
-        quote! { const GLOBAL_BLOCK_SIZE: u32 = #lit; }
-    } else {
         // Sliding is the smaller page — vLLM would scale BLOCK_SIZE (sliding)
         // up, leaving GLOBAL_BLOCK_SIZE == BLOCK_SIZE. No current arch hits
         // this; fail loud rather than silently mis-unify.
@@ -8462,64 +8594,7 @@ fn emit_canonical_params_impl(
             model.source_stem, sliding_per_token, global_per_token,
         );
     };
-    let attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(attn_scale);
-    let attn_softcap_lit = proc_macro2::Literal::f32_unsuffixed(attn_softcap);
-    let sliding_window_lit = proc_macro2::Literal::i32_unsuffixed(sliding_window);
-    let final_logit_softcapping_lit = proc_macro2::Literal::f32_unsuffixed(final_logit_softcapping);
     let mla_attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(mla_attn_scale);
-    let vision_num_heads_lit = proc_macro2::Literal::u32_unsuffixed(vision_num_heads);
-    let vision_head_dim_lit = proc_macro2::Literal::u32_unsuffixed(vision_head_dim);
-    let vision_q_size_lit = proc_macro2::Literal::usize_unsuffixed(vision_q_size);
-    let vision_in_features_lit = proc_macro2::Literal::usize_unsuffixed(vision_in_features);
-    let vision_attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(vision_attn_scale);
-    let vision_patch_grid_side_lit = proc_macro2::Literal::u32_unsuffixed(vision_patch_grid_side);
-    let vision_pool_kernel_lit = proc_macro2::Literal::u32_unsuffixed(vision_pool_kernel);
-    let vision_rope_interleaved_lit = if vision_rope_interleaved {
-        quote! { true }
-    } else {
-        quote! { false }
-    };
-
-    // MRoPE section override. `Some([t, h, w])` only when the
-    // config carries `rope_scaling.mrope_section` (Qwen2-VL /
-    // Qwen2.5-VL); every text-only arch keeps the default `None`
-    // and the rope kernel takes the legacy 1D-positions fast path.
-    // Sum-equals-`head_dim/2` is checked here (panic at expansion
-    // time, not at runtime) — text decode of a misconfigured
-    // multimodal variant never compiles past this guard.
-    let mrope_section_tokens = match model.mrope_section {
-        Some([t, h, w]) => {
-            // mrope bands cover the ROTARY half, not the full head_dim
-            // half — Qwen3.5 uses partial rotary (factor 0.25 → rotary_dim
-            // = 64, half = 32 = [11,11,10]); Qwen2-VL is full (factor
-            // absent → rotary_dim = head_dim).
-            let rotary_dim = model
-                .scalars
-                .get("partial_rotary_factor")
-                .copied()
-                .filter(|&f| (f - 1.0).abs() > 1e-9)
-                .map(|f| (f * head_dim as f64).round() as u32)
-                .unwrap_or(head_dim);
-            let pair_count = rotary_dim / 2;
-            if t + h + w != pair_count {
-                let msg = format!(
-                    "model `{}`: rope_scaling.mrope_section [{t}, {h}, {w}] sums to {} \
-                     but rotary_dim/2 = {pair_count} (rotary_dim {rotary_dim}). Fix the config.",
-                    model.source_stem,
-                    t + h + w,
-                );
-                return quote! { compile_error!(#msg); };
-            }
-            let t_lit = proc_macro2::Literal::u32_unsuffixed(t);
-            let h_lit = proc_macro2::Literal::u32_unsuffixed(h);
-            let w_lit = proc_macro2::Literal::u32_unsuffixed(w);
-            quote! {
-                const MROPE_SECTION: ::core::option::Option<[u32; 3]> =
-                    ::core::option::Option::Some([#t_lit, #h_lit, #w_lit]);
-            }
-        }
-        None => quote! {},
-    };
 
     // SCALE_DTYPE override — only matters under `--features metal`.
     // mlx-community 4bit convention (probed across cached HF snapshots):
@@ -8549,16 +8624,6 @@ fn emit_canonical_params_impl(
         );
         is_bf16_scale || is_nvfp4
     };
-    let scale_dtype_override = if scale_dtype_is_bf16 {
-        quote! {
-            #[cfg(feature = "metal")]
-            const SCALE_DTYPE:
-                ::scratchy_target_metal::interpreter::metal::ScaleDtype =
-                ::scratchy_target_metal::interpreter::metal::ScaleDtype::Bf16;
-        }
-    } else {
-        quote! {}
-    };
 
     // TurboQuant KV bit-width policy (Metal). 3-bit (~4.7x) is validated
     // coherent for the Llama family; outlier-heavy KV (Qwen-class massive
@@ -8572,33 +8637,10 @@ fn emit_canonical_params_impl(
         scratchy_forward_compiler::TqBits::new(if rides_3bit { 3 } else { 4 })
     };
     let kv_codec = kv_codec_for(model, head_dim, global_head_dim, kv_layers, tq_bits);
-    let kv_codec_tokens = match kv_codec {
-        scratchy_forward_compiler::KvCodec::Dense => {
-            quote! { ::scratchy_forward_compiler::KvCodec::Dense }
-        }
-        scratchy_forward_compiler::KvCodec::TurboQuant(bits) => {
-            let bits_lit = proc_macro2::Literal::u32_unsuffixed(bits.get());
-            quote! {
-                ::scratchy_forward_compiler::KvCodec::TurboQuant(
-                    ::scratchy_forward_compiler::TqBits::new(#bits_lit),
-                )
-            }
-        }
-    };
 
     let num_hidden_layers = *model.bounds.get("num_hidden_layers").unwrap_or(&0) as usize;
-    let kv_cache_layers_tokens = match kv_layers.proper_subset(num_hidden_layers) {
-        Some(layers) => {
-            let layers = layers
-                .iter()
-                .map(|&l| proc_macro2::Literal::u32_unsuffixed(l));
-            quote! { ::core::option::Option::Some(&[#(#layers),*]) }
-        }
-        None => quote! { ::core::option::Option::None },
-    };
 
-    #[cfg(feature = "metal")]
-    {
+    let facts = {
         use scratchy_ir::model_facts as mf;
         let positive = |v: u32| (v > 0).then_some(v);
         // A decoder's attention. A vision-only body's text consts above carry its tower's numbers
@@ -8679,7 +8721,11 @@ fn emit_canonical_params_impl(
                 },
             )
         });
-        *metal_facts_out = Some(mf::ModelFacts::new(mf::FactsParts {
+        // The layers holding KV, when a proper subset: leaked once, in this build-script process,
+        // so the bake's facts hold the same `'static` table the emitted const states.
+        let kv_layers = (kv_layers.proper_subset(num_hidden_layers))
+            .map(|layers| mf::KvLayers::new(Vec::leak(layers.to_vec())));
+        mf::ModelFacts::new(mf::FactsParts {
             // No arch overrides the metal element dtype.
             metal_dtype: mf::MetalDtype::Bf16,
             scale_dtype: match scale_dtype_is_bf16 {
@@ -8695,6 +8741,7 @@ fn emit_canonical_params_impl(
             final_softcap: (final_logit_softcapping != 0.0)
                 .then(|| mf::SoftCap::new(final_logit_softcapping)),
             kv_codec,
+            kv_layers,
             attention,
             vision,
             gdn,
@@ -8702,10 +8749,13 @@ fn emit_canonical_params_impl(
             spec_drafts: positive(spec_drafts).map(mf::NumDrafts::new),
             capture_slots: positive(draft_capture_slots).map(mf::CaptureSlots::new),
             target,
-        }));
-    }
+        })
+    };
+    // One value, two consumers: the impl's `FACTS` (serialized) and the caller's bake.
+    let facts_tokens = model_facts_tokens(facts);
 
-    quote! {
+    (
+        quote! {
         // `CanonicalParams` is backend-agnostic — the trait, its
         // associated `const`s, and every callsite (`<W as
         // CanonicalParams>::HEAD_DIM`) live in `scratchy-forward-compiler` with
@@ -8714,61 +8764,18 @@ fn emit_canonical_params_impl(
         // struct) or `cfg(feature = "metal")` (where `Weights` is
         // the ZST emitted in `emit_weights_struct`).
         impl ::scratchy_forward_compiler::CanonicalParams for Weights {
-            const HEAD_DIM: u32 = #head_dim_lit;
-            const NUM_Q_HEADS: u32 = #num_q_heads_lit;
-            const NUM_KV_HEADS: u32 = #num_kv_heads_lit;
-            const Q_SIZE: usize = #q_size_lit;
-            const KV_SIZE: usize = #kv_size_lit;
-            const HIDDEN_SIZE: usize = #hidden_size_lit;
-            const VOCAB_SIZE: usize = #vocab_size_lit;
-            const INTERMEDIATE_SIZE: usize = #intermediate_size_lit;
-            const ATTN_SCALE: f32 = #attn_scale_lit;
-            const ATTN_SOFTCAP: f32 = #attn_softcap_lit;
-            const SLIDING_WINDOW: i32 = #sliding_window_lit;
-            const KV_CODEC: ::scratchy_forward_compiler::KvCodec = #kv_codec_tokens;
-            const KV_CACHE_LAYERS: ::core::option::Option<&'static [u32]> = #kv_cache_layers_tokens;
+            const FACTS: ::scratchy_forward_compiler::model_facts::ModelFacts = #facts_tokens;
+            // The MLA dims: no fact covers them yet (no metal or spyre path reads them).
             const KV_LORA_RANK: usize = #kv_lora_rank_lit;
             const QK_NOPE_HEAD_DIM: usize = #qk_nope_head_dim_lit;
             const QK_ROPE_HEAD_DIM: usize = #qk_rope_head_dim_lit;
             const V_HEAD_DIM: usize = #v_head_dim_lit;
-            const FINAL_LOGIT_SOFTCAPPING: f32 = #final_logit_softcapping_lit;
             const QK_HEAD_DIM: usize = #qk_head_dim_lit;
             const MLA_ATTN_SCALE: f32 = #mla_attn_scale_lit;
-            const GDN_NUM_K_HEADS: u32 = #gdn_num_k_heads_lit;
-            const GDN_NUM_V_HEADS: u32 = #gdn_num_v_heads_lit;
-            const GDN_HEAD_K_DIM: u32 = #gdn_head_k_dim_lit;
-            const GDN_HEAD_V_DIM: u32 = #gdn_head_v_dim_lit;
-            const GDN_CONV_KERNEL: u32 = #gdn_conv_kernel_lit;
-            const GDN_CONV_DIM: usize = #gdn_conv_dim_lit;
-            const SPEC_DRAFTS: u32 = #spec_drafts_lit;
-            const DRAFT_CONV_GROUP: u32 = #draft_conv_group_lit;
-            const DRAFT_SELECTOR_RANK: u32 = #draft_selector_rank_lit;
-            const DRAFT_MASK_TOKEN: u32 = #draft_mask_token_lit;
-            const TARGET_HIDDEN_WIDTH: usize = #target_hidden_width_lit;
-            const TARGET_ROUTES_EXPERTS: bool = #target_routes_experts;
-            const DRAFT_CAPTURE_SLOTS: u32 = #draft_capture_slots_lit;
-            const NORM_WEIGHT_OFFSET: f32 = #norm_weight_offset_lit;
-            const RMS_NORM_EPS: f32 = #rms_norm_eps_lit;
-            const ROT_DIM: u32 = #rot_dim_lit;
-            const GLOBAL_HEAD_DIM: u32 = #global_head_dim_lit;
-            const NUM_GLOBAL_KV_HEADS: u32 = #num_global_kv_heads_lit;
-            const GLOBAL_ROT_DIM: u32 = #global_rot_dim_lit;
-            const GLOBAL_Q_SIZE: usize = #global_q_size_lit;
-            #rope_proportional_tokens
-            #rope_on_read_tokens
-            #global_block_size_override
-            const VISION_NUM_HEADS: u32 = #vision_num_heads_lit;
-            const VISION_HEAD_DIM: u32 = #vision_head_dim_lit;
-            const VISION_Q_SIZE: usize = #vision_q_size_lit;
-            const VISION_IN_FEATURES: usize = #vision_in_features_lit;
-            const VISION_ROPE_INTERLEAVED: bool = #vision_rope_interleaved_lit;
-            const VISION_ATTN_SCALE: f32 = #vision_attn_scale_lit;
-            const VISION_PATCH_GRID_SIDE: u32 = #vision_patch_grid_side_lit;
-            const VISION_POOL_KERNEL: u32 = #vision_pool_kernel_lit;
-            #mrope_section_tokens
-            #scale_dtype_override
         }
-    }
+        },
+        facts,
+    )
 }
 
 /// The one-slot-per-sequence recurrent-state geometry of a hybrid arch's
@@ -14915,18 +14922,15 @@ pub fn emit_model(
     // Per-canonical CanonicalParams impl + Instruction type alias.
     // The alias keeps every static-slice row short instead of
     // repeating `::scratchy_forward_compiler::Instruction::<Weights>::Variant(…)`.
-    #[cfg(feature = "metal")]
-    let mut resolved_metal_facts: Option<scratchy_ir::model_facts::ModelFacts> = None;
-    let canonical_params_impl = emit_canonical_params_impl(
+    let (canonical_params_impl, model_facts) = emit_canonical_params_impl(
         model,
         tp_world_size,
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
-        #[cfg(feature = "metal")]
         fuf_reads_target_hidden(fuf),
-        #[cfg(feature = "metal")]
-        &mut resolved_metal_facts,
     );
+    #[cfg(feature = "metal")]
+    let resolved_metal_facts = Some(model_facts);
     // Per-canonical: alias the generic `Instruction<Weights>` for
     // the slice element type AND glob-import the variant
     // constructors so each static-slice row reads `Embed(...)` /
@@ -17404,6 +17408,7 @@ mod tests {
     use super::*;
     use crate::weight_vocab::WeightAccessor;
     use quote::format_ident;
+    use scratchy_ir::model_facts::raw;
 
     /// Helper: build a minimal `ModelParams` from raw bound values
     /// for canonical-params shard tests. Only the fields
@@ -17459,37 +17464,99 @@ mod tests {
     /// single-rank build (which is every per-arch-crate build under
     /// `--features cuda` until activation lands).
     #[test]
+    fn the_generated_impl_states_facts_and_no_derived_const() {
+        // Every const `CanonicalParams` derives from `FACTS` (`model_facts::raw`): a generated impl
+        // that restated one would be a second source beside `FACTS`, overriding the default.
+        const DERIVED: &[&str] = &[
+            "HEAD_DIM",
+            "NUM_Q_HEADS",
+            "NUM_KV_HEADS",
+            "Q_SIZE",
+            "KV_SIZE",
+            "INTERMEDIATE_SIZE",
+            "ATTN_SCALE",
+            "ATTN_SOFTCAP",
+            "SLIDING_WINDOW",
+            "FINAL_LOGIT_SOFTCAPPING",
+            "MROPE_SECTION",
+            "KV_CODEC",
+            "KV_CACHE_LAYERS",
+            "VISION_NUM_HEADS",
+            "VISION_HEAD_DIM",
+            "VISION_Q_SIZE",
+            "VISION_IN_FEATURES",
+            "VISION_ROPE_INTERLEAVED",
+            "VISION_ATTN_SCALE",
+            "VISION_PATCH_GRID_SIDE",
+            "VISION_POOL_KERNEL",
+            "RMS_NORM_EPS",
+            "NORM_WEIGHT_OFFSET",
+            "BLOCK_SIZE",
+            "GLOBAL_BLOCK_SIZE",
+            "GDN_NUM_K_HEADS",
+            "GDN_NUM_V_HEADS",
+            "GDN_HEAD_K_DIM",
+            "GDN_HEAD_V_DIM",
+            "GDN_CONV_KERNEL",
+            "GDN_CONV_DIM",
+            "SPEC_DRAFTS",
+            "DRAFT_CONV_GROUP",
+            "DRAFT_SELECTOR_RANK",
+            "DRAFT_MASK_TOKEN",
+            "TARGET_HIDDEN_WIDTH",
+            "TARGET_ROUTES_EXPERTS",
+            "DRAFT_CAPTURE_SLOTS",
+            "ROT_DIM",
+            "GLOBAL_HEAD_DIM",
+            "NUM_GLOBAL_KV_HEADS",
+            "GLOBAL_ROT_DIM",
+            "GLOBAL_Q_SIZE",
+            "ROPE_PROPORTIONAL",
+            "ROPE_ON_READ",
+            "METAL_DTYPE",
+            "HIDDEN_SIZE",
+            "VOCAB_SIZE",
+            "SCALE_DTYPE",
+        ];
+        let m = shard_test_model(32, 8, 128, 11008);
+        let ts = emit_canonical_params_impl(&m, 1, false, &every_layer(&m), false)
+            .0
+            .to_string();
+        assert!(ts.contains("const FACTS"), "the impl states FACTS: {ts}");
+        for name in DERIVED {
+            assert!(
+                !ts.contains(&format!("const {name} :")),
+                "the generated impl restates {name}, which CanonicalParams derives from FACTS: {ts}"
+            );
+        }
+    }
+
+    #[test]
     fn canonical_params_at_tp_eq_1_is_identity() {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let ts = emit_canonical_params_impl(
-            &m,
-            1,
-            false,
-            &every_layer(&m),
-            #[cfg(feature = "metal")]
-            false,
-            #[cfg(feature = "metal")]
-            &mut None,
-        )
-        .to_string();
+        let facts = emit_canonical_params_impl(&m, 1, false, &every_layer(&m), false).1;
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
-            ts.contains("NUM_Q_HEADS : u32 = 32"),
-            "tp=1 must keep NUM_Q_HEADS = 32; got {ts}"
+            raw::num_q_heads(facts) == 32,
+            "tp=1 must keep NUM_Q_HEADS = 32; got {}",
+            raw::num_q_heads(facts)
         );
         assert!(
-            ts.contains("NUM_KV_HEADS : u32 = 32"),
-            "tp=1 must keep NUM_KV_HEADS = 32; got {ts}"
+            raw::num_kv_heads(facts) == 32,
+            "tp=1 must keep NUM_KV_HEADS = 32; got {}",
+            raw::num_kv_heads(facts)
         );
         assert!(
-            ts.contains("INTERMEDIATE_SIZE : usize = 11008"),
-            "tp=1 must keep INTERMEDIATE_SIZE = 11008; got {ts}"
+            raw::intermediate_size(facts) == 11008,
+            "tp=1 must keep INTERMEDIATE_SIZE = 11008; got {}",
+            raw::intermediate_size(facts)
         );
         assert!(
-            ts.contains("Q_SIZE : usize = 4096"),
-            "tp=1 must keep Q_SIZE = 4096; got {ts}"
+            raw::q_size(facts) == 4096,
+            "tp=1 must keep Q_SIZE = 4096; got {}",
+            raw::q_size(facts)
         );
     }
 
@@ -17501,42 +17568,38 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let ts = emit_canonical_params_impl(
-            &m,
-            2,
-            false,
-            &every_layer(&m),
-            #[cfg(feature = "metal")]
-            false,
-            #[cfg(feature = "metal")]
-            &mut None,
-        )
-        .to_string();
+        let facts = emit_canonical_params_impl(&m, 2, false, &every_layer(&m), false).1;
         assert!(
-            ts.contains("NUM_Q_HEADS : u32 = 16"),
-            "tp=2 must shard NUM_Q_HEADS to 16; got {ts}"
+            raw::num_q_heads(facts) == 16,
+            "tp=2 must shard NUM_Q_HEADS to 16; got {}",
+            raw::num_q_heads(facts)
         );
         assert!(
-            ts.contains("NUM_KV_HEADS : u32 = 16"),
-            "tp=2 must shard NUM_KV_HEADS to 16; got {ts}"
+            raw::num_kv_heads(facts) == 16,
+            "tp=2 must shard NUM_KV_HEADS to 16; got {}",
+            raw::num_kv_heads(facts)
         );
         assert!(
-            ts.contains("INTERMEDIATE_SIZE : usize = 5504"),
-            "tp=2 must shard INTERMEDIATE_SIZE to 5504; got {ts}"
+            raw::intermediate_size(facts) == 5504,
+            "tp=2 must shard INTERMEDIATE_SIZE to 5504; got {}",
+            raw::intermediate_size(facts)
         );
         // Q_SIZE = (32/2) * 128 = 2048
         assert!(
-            ts.contains("Q_SIZE : usize = 2048"),
-            "tp=2 must compute Q_SIZE from sharded heads to 2048; got {ts}"
+            raw::q_size(facts) == 2048,
+            "tp=2 must compute Q_SIZE from sharded heads to 2048; got {}",
+            raw::q_size(facts)
         );
         assert!(
-            ts.contains("KV_SIZE : usize = 2048"),
-            "tp=2 must compute KV_SIZE from sharded heads to 2048; got {ts}"
+            raw::kv_size(facts) == 2048,
+            "tp=2 must compute KV_SIZE from sharded heads to 2048; got {}",
+            raw::kv_size(facts)
         );
         // HEAD_DIM is per-head and never sharded.
         assert!(
-            ts.contains("HEAD_DIM : u32 = 128"),
-            "tp=2 must keep HEAD_DIM = 128; got {ts}"
+            raw::head_dim(facts) == 128,
+            "tp=2 must keep HEAD_DIM = 128; got {}",
+            raw::head_dim(facts)
         );
     }
 
@@ -17551,31 +17614,24 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let ts = emit_canonical_params_impl(
-            &m,
-            8,
-            false,
-            &every_layer(&m),
-            #[cfg(feature = "metal")]
-            false,
-            #[cfg(feature = "metal")]
-            &mut None,
-        )
-        .to_string();
+        let facts = emit_canonical_params_impl(&m, 8, false, &every_layer(&m), false).1;
         // 32 / 8 = 4
         assert!(
-            ts.contains("NUM_Q_HEADS : u32 = 4"),
-            "tp=8 must shard NUM_Q_HEADS to 4; got {ts}"
+            raw::num_q_heads(facts) == 4,
+            "tp=8 must shard NUM_Q_HEADS to 4; got {}",
+            raw::num_q_heads(facts)
         );
         // 8 / 8 = 1
         assert!(
-            ts.contains("NUM_KV_HEADS : u32 = 1"),
-            "tp=8 must shard NUM_KV_HEADS to 1; got {ts}"
+            raw::num_kv_heads(facts) == 1,
+            "tp=8 must shard NUM_KV_HEADS to 1; got {}",
+            raw::num_kv_heads(facts)
         );
         // 14336 / 8 = 1792
         assert!(
-            ts.contains("INTERMEDIATE_SIZE : usize = 1792"),
-            "tp=8 must shard INTERMEDIATE_SIZE to 1792; got {ts}"
+            raw::intermediate_size(facts) == 1792,
+            "tp=8 must shard INTERMEDIATE_SIZE to 1792; got {}",
+            raw::intermediate_size(facts)
         );
     }
 

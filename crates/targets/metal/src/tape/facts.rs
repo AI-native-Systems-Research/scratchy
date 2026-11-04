@@ -101,3 +101,55 @@ pub(crate) fn proportional(p: &ModelFacts) -> Result<bool, LoweringError> {
 pub(crate) fn kernel_window(p: &ModelFacts) -> Result<i32, LoweringError> {
     window(p).map(|w| w.get() as i32)
 }
+
+/// A test model's facts: a Llama-like decoder, one attention class of `q` query heads over `kv` kv
+/// heads of `hd` (every lane rotated, 16-position pages) at softmax scale `scale`, a dense
+/// feed-forward of `intermediate`, residual stream `hidden`, dense KV, f16 norm gains.
+#[cfg(test)]
+pub(crate) const fn llama_like(
+    q: u32,
+    kv: u32,
+    hd: u32,
+    intermediate: usize,
+    hidden: usize,
+    scale: f32,
+    metal_dtype: scratchy_ir::model_facts::MetalDtype,
+) -> ModelFacts {
+    use scratchy_ir::model_facts::{
+        AttnScale, BlockSize, FactsParts, HeadDim, HiddenSize, KvHeads, NormWeightOffset,
+        QueryHeads, RmsNormEps, Rope, RopePairing, RotDim, ScaleDtype,
+    };
+    let class = HeadGeometry::new(
+        QueryHeads::new(q),
+        KvHeads::new(kv),
+        HeadDim::new(hd),
+        RotDim::new(hd),
+        BlockSize::new(16),
+    );
+    ModelFacts::new(FactsParts {
+        metal_dtype,
+        scale_dtype: ScaleDtype::F16,
+        hidden: HiddenSize::new(hidden),
+        intermediate: Some(IntermediateSize::new(intermediate)),
+        vocab: None,
+        eps: RmsNormEps::new(1e-5),
+        norm_offset: NormWeightOffset::new(0.0),
+        final_softcap: None,
+        kv_codec: scratchy_ir::KvCodec::Dense,
+        kv_layers: None,
+        attention: Some(Attention::new(
+            class,
+            class,
+            AttnScale::new(scale),
+            None,
+            None,
+            Rope::new(RopePairing::Standard, KvRope::AtWrite, None),
+        )),
+        vision: None,
+        gdn: None,
+        drafter: None,
+        spec_drafts: None,
+        capture_slots: None,
+        target: None,
+    })
+}

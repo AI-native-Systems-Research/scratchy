@@ -127,6 +127,31 @@ impl TokenId {
 /// The KV page of a model whose config states none (`block_size`): the paged pool's default.
 pub const DEFAULT_KV_PAGE: BlockSize = BlockSize::new(16);
 
+/// The layers that hold a KV cache, when they are a proper subset of the decoder's (a hybrid's
+/// attention layers among its recurrent ones). `'static` on both paths: the emitted const's table is
+/// a literal, and the bake's is leaked once per canonical by the fill, in the build-script process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KvLayers(&'static [u32]);
+
+impl KvLayers {
+    /// The table, refused unless strictly ascending.
+    pub const fn new(layers: &'static [u32]) -> Self {
+        let mut i = 1;
+        while i < layers.len() {
+            assert!(
+                layers[i - 1] < layers[i],
+                "KvLayers: the layers are strictly ascending"
+            );
+            i += 1;
+        }
+        Self(layers)
+    }
+    /// The layers.
+    pub const fn get(self) -> &'static [u32] {
+        self.0
+    }
+}
+
 /// One attention class's head geometry. Its constructor divides the GQA group out once, after
 /// proving the division exact, so no reader re-checks it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -572,6 +597,8 @@ pub struct FactsParts {
     pub norm_offset: NormWeightOffset,
     pub final_softcap: Option<SoftCap>,
     pub kv_codec: KvCodec,
+    /// The layers holding KV, when not every layer does.
+    pub kv_layers: Option<KvLayers>,
     pub attention: Option<Attention>,
     pub vision: Option<Vision>,
     pub gdn: Option<Gdn>,
@@ -665,6 +692,360 @@ impl ModelFacts {
     /// What a head reads of its target.
     pub const fn target(self) -> Option<Target> {
         self.0.target
+    }
+    /// The layers holding KV, when not every layer does.
+    pub const fn kv_layers(self) -> Option<KvLayers> {
+        self.0.kv_layers
+    }
+}
+
+/// ⭐ THE RAW SPELLINGS: the facts as `CanonicalParams`' numeric consts spell them, for the readers that
+/// still take numbers (the runtime, cuda's interpreter): `0` (or `-1`, `0.0`, `false`) where the model
+/// lacks the group. The one place these spellings are derived; `CanonicalParams`' defaults call them.
+///
+/// A vision-only body's text consts are its tower's (the fill's long-standing rule): its head dim,
+/// heads and query width are the tower's, its residual stream the tower's embedding.
+pub mod raw {
+    use super::*;
+
+    /// `HEAD_DIM`: the base class's, else the tower's.
+    pub const fn head_dim(f: ModelFacts) -> u32 {
+        match (f.0.attention, f.0.vision) {
+            (Some(a), _) => a.base.head_dim.get(),
+            (None, Some(v)) => v.head_dim.get(),
+            (None, None) => 0,
+        }
+    }
+    /// `NUM_Q_HEADS`: the decoder's, else the tower's.
+    pub const fn num_q_heads(f: ModelFacts) -> u32 {
+        match (f.0.attention, f.0.vision) {
+            (Some(a), _) => a.base.q_heads.get(),
+            (None, Some(v)) => v.heads.get(),
+            (None, None) => 0,
+        }
+    }
+    /// `NUM_KV_HEADS`: the base class's.
+    pub const fn num_kv_heads(f: ModelFacts) -> u32 {
+        match f.0.attention {
+            Some(a) => a.base.kv_heads.get(),
+            None => 0,
+        }
+    }
+    /// `Q_SIZE`: the decoder's query width, else the tower's.
+    pub const fn q_size(f: ModelFacts) -> usize {
+        match (f.0.attention, f.0.vision) {
+            (Some(a), _) => a.base.q_width(),
+            (None, Some(v)) => v.q_width(),
+            (None, None) => 0,
+        }
+    }
+    /// `KV_SIZE`: one K or V projection's width, the base class's.
+    pub const fn kv_size(f: ModelFacts) -> usize {
+        match f.0.attention {
+            Some(a) => a.base.kv_heads.get() as usize * a.base.head_dim.get() as usize,
+            None => 0,
+        }
+    }
+    /// `INTERMEDIATE_SIZE`.
+    pub const fn intermediate_size(f: ModelFacts) -> usize {
+        match f.0.intermediate {
+            Some(i) => i.get(),
+            None => 0,
+        }
+    }
+    /// `ATTN_SCALE`.
+    pub const fn attn_scale(f: ModelFacts) -> f32 {
+        match f.0.attention {
+            Some(a) => a.scale.get(),
+            None => 0.0,
+        }
+    }
+    /// `ATTN_SOFTCAP`.
+    pub const fn attn_softcap(f: ModelFacts) -> f32 {
+        match f.0.attention {
+            Some(Attention {
+                softcap: Some(c), ..
+            }) => c.get(),
+            _ => 0.0,
+        }
+    }
+    /// `SLIDING_WINDOW`: `-1` without sliding layers.
+    pub const fn sliding_window(f: ModelFacts) -> i32 {
+        match f.0.attention {
+            Some(Attention {
+                window: Some(w), ..
+            }) => w.get() as i32,
+            _ => -1,
+        }
+    }
+    /// `FINAL_LOGIT_SOFTCAPPING`.
+    pub const fn final_logit_softcapping(f: ModelFacts) -> f32 {
+        match f.0.final_softcap {
+            Some(c) => c.get(),
+            None => 0.0,
+        }
+    }
+    /// `MROPE_SECTION`.
+    pub const fn mrope_section(f: ModelFacts) -> Option<[u32; 3]> {
+        match f.0.attention {
+            Some(Attention {
+                rope: Rope { mrope: Some(s), .. },
+                ..
+            }) => Some(s.get()),
+            _ => None,
+        }
+    }
+    /// `KV_CACHE_LAYERS`.
+    pub const fn kv_cache_layers(f: ModelFacts) -> Option<&'static [u32]> {
+        match f.0.kv_layers {
+            Some(l) => Some(l.get()),
+            None => None,
+        }
+    }
+    /// `VISION_NUM_HEADS`.
+    pub const fn vision_num_heads(f: ModelFacts) -> u32 {
+        match f.0.vision {
+            Some(v) => v.heads.get(),
+            None => 0,
+        }
+    }
+    /// `VISION_HEAD_DIM`.
+    pub const fn vision_head_dim(f: ModelFacts) -> u32 {
+        match f.0.vision {
+            Some(v) => v.head_dim.get(),
+            None => 0,
+        }
+    }
+    /// `VISION_Q_SIZE`.
+    pub const fn vision_q_size(f: ModelFacts) -> usize {
+        match f.0.vision {
+            Some(v) => v.q_width(),
+            None => 0,
+        }
+    }
+    /// `VISION_IN_FEATURES`.
+    pub const fn vision_in_features(f: ModelFacts) -> usize {
+        match f.0.vision {
+            Some(v) => v.in_features.get(),
+            None => 0,
+        }
+    }
+    /// `VISION_ROPE_INTERLEAVED`.
+    pub const fn vision_rope_interleaved(f: ModelFacts) -> bool {
+        matches!(
+            f.0.vision,
+            Some(Vision {
+                pairing: VisionRopePairing::Interleaved,
+                ..
+            })
+        )
+    }
+    /// `VISION_ATTN_SCALE`.
+    pub const fn vision_attn_scale(f: ModelFacts) -> f32 {
+        match f.0.vision {
+            Some(v) => v.scale.get(),
+            None => 0.0,
+        }
+    }
+    /// `VISION_PATCH_GRID_SIDE`.
+    pub const fn vision_patch_grid_side(f: ModelFacts) -> u32 {
+        match f.0.vision {
+            Some(Vision {
+                patch_grid_side: Some(s),
+                ..
+            }) => s.get(),
+            _ => 0,
+        }
+    }
+    /// `VISION_POOL_KERNEL`.
+    pub const fn vision_pool_kernel(f: ModelFacts) -> u32 {
+        match f.0.vision {
+            Some(Vision {
+                pool_kernel: Some(k),
+                ..
+            }) => k.get(),
+            _ => 0,
+        }
+    }
+    /// `BLOCK_SIZE`: the base class's page, else the default.
+    pub const fn block_size(f: ModelFacts) -> u32 {
+        match f.0.attention {
+            Some(a) => a.base.page.get(),
+            None => DEFAULT_KV_PAGE.get(),
+        }
+    }
+    /// `GLOBAL_BLOCK_SIZE`: the global class's page, else the default.
+    pub const fn global_block_size(f: ModelFacts) -> u32 {
+        match f.0.attention {
+            Some(a) => a.global.page.get(),
+            None => DEFAULT_KV_PAGE.get(),
+        }
+    }
+    /// `GDN_NUM_K_HEADS`.
+    pub const fn gdn_num_k_heads(f: ModelFacts) -> u32 {
+        match f.0.gdn {
+            Some(g) => g.k_heads.get(),
+            None => 0,
+        }
+    }
+    /// `GDN_NUM_V_HEADS`.
+    pub const fn gdn_num_v_heads(f: ModelFacts) -> u32 {
+        match f.0.gdn {
+            Some(g) => g.v_heads.get(),
+            None => 0,
+        }
+    }
+    /// `GDN_HEAD_K_DIM`.
+    pub const fn gdn_head_k_dim(f: ModelFacts) -> u32 {
+        match f.0.gdn {
+            Some(g) => g.k_dim.get(),
+            None => 0,
+        }
+    }
+    /// `GDN_HEAD_V_DIM`.
+    pub const fn gdn_head_v_dim(f: ModelFacts) -> u32 {
+        match f.0.gdn {
+            Some(g) => g.v_dim.get(),
+            None => 0,
+        }
+    }
+    /// `GDN_CONV_KERNEL`.
+    pub const fn gdn_conv_kernel(f: ModelFacts) -> u32 {
+        match f.0.gdn {
+            Some(g) => g.conv_kernel.get(),
+            None => 0,
+        }
+    }
+    /// `GDN_CONV_DIM`.
+    pub const fn gdn_conv_dim(f: ModelFacts) -> usize {
+        match f.0.gdn {
+            Some(g) => g.conv_dim.get(),
+            None => 0,
+        }
+    }
+    /// `SPEC_DRAFTS`.
+    pub const fn spec_drafts(f: ModelFacts) -> u32 {
+        match f.0.spec_drafts {
+            Some(d) => d.get(),
+            None => 0,
+        }
+    }
+    /// `DRAFT_CONV_GROUP`.
+    pub const fn draft_conv_group(f: ModelFacts) -> u32 {
+        match f.0.drafter {
+            Some(d) => d.conv_group.get(),
+            None => 0,
+        }
+    }
+    /// `DRAFT_SELECTOR_RANK`.
+    pub const fn draft_selector_rank(f: ModelFacts) -> u32 {
+        match f.0.drafter {
+            Some(d) => d.selector_rank.get(),
+            None => 0,
+        }
+    }
+    /// `DRAFT_MASK_TOKEN`.
+    pub const fn draft_mask_token(f: ModelFacts) -> u32 {
+        match f.0.drafter {
+            Some(d) => d.mask_token.get(),
+            None => 0,
+        }
+    }
+    /// `TARGET_HIDDEN_WIDTH`: a head's target's, else the model's own hidden width.
+    pub const fn target_hidden_width(f: ModelFacts) -> usize {
+        match f.0.target {
+            Some(t) => t.hidden.get(),
+            None => f.0.hidden.get(),
+        }
+    }
+    /// `TARGET_ROUTES_EXPERTS`.
+    pub const fn target_routes_experts(f: ModelFacts) -> bool {
+        matches!(
+            f.0.target,
+            Some(Target {
+                routing: TargetRouting::Experts,
+                ..
+            })
+        )
+    }
+    /// `DRAFT_CAPTURE_SLOTS`.
+    pub const fn draft_capture_slots(f: ModelFacts) -> u32 {
+        match f.0.capture_slots {
+            Some(s) => s.get(),
+            None => 0,
+        }
+    }
+    /// `ROT_DIM`: the base class's, else `HEAD_DIM`.
+    pub const fn rot_dim(f: ModelFacts) -> u32 {
+        match f.0.attention {
+            Some(a) => a.base.rot_dim.get(),
+            None => head_dim(f),
+        }
+    }
+    /// `GLOBAL_HEAD_DIM`: the global class's, else `HEAD_DIM`.
+    pub const fn global_head_dim(f: ModelFacts) -> u32 {
+        match f.0.attention {
+            Some(a) => a.global.head_dim.get(),
+            None => head_dim(f),
+        }
+    }
+    /// `NUM_GLOBAL_KV_HEADS`: the global class's.
+    pub const fn num_global_kv_heads(f: ModelFacts) -> u32 {
+        match f.0.attention {
+            Some(a) => a.global.kv_heads.get(),
+            None => 0,
+        }
+    }
+    /// `GLOBAL_ROT_DIM`: the global class's, else `GLOBAL_HEAD_DIM`.
+    pub const fn global_rot_dim(f: ModelFacts) -> u32 {
+        match f.0.attention {
+            Some(a) => a.global.rot_dim.get(),
+            None => global_head_dim(f),
+        }
+    }
+    /// `GLOBAL_Q_SIZE`: the global class's query width, else `Q_SIZE`.
+    pub const fn global_q_size(f: ModelFacts) -> usize {
+        match f.0.attention {
+            Some(a) => a.global.q_width(),
+            None => q_size(f),
+        }
+    }
+    /// `ROPE_PROPORTIONAL`.
+    pub const fn rope_proportional(f: ModelFacts) -> bool {
+        matches!(
+            f.0.attention,
+            Some(Attention {
+                rope: Rope {
+                    pairing: RopePairing::Proportional,
+                    ..
+                },
+                ..
+            })
+        )
+    }
+    /// `ROPE_ON_READ`.
+    pub const fn rope_on_read(f: ModelFacts) -> bool {
+        matches!(
+            f.0.attention,
+            Some(Attention {
+                rope: Rope {
+                    kv_rope: KvRope::OnRead,
+                    ..
+                },
+                ..
+            })
+        )
+    }
+    /// `HIDDEN_SIZE`.
+    pub const fn hidden_size(f: ModelFacts) -> usize {
+        f.0.hidden.get()
+    }
+    /// `VOCAB_SIZE`.
+    pub const fn vocab_size(f: ModelFacts) -> usize {
+        match f.0.vocab {
+            Some(v) => v.get(),
+            None => 0,
+        }
     }
 }
 
@@ -785,6 +1166,22 @@ mod tests {
         );
     }
 
+    /// A hybrid's attention layers, ascending, are a KV table.
+    #[test]
+    fn an_ascending_layer_table_is_a_kv_table() {
+        const LAYERS: KvLayers = KvLayers::new(&[3, 7, 11]);
+        assert_eq!(LAYERS.get(), [3, 7, 11]);
+    }
+
+    /// A descending table is refused by the one constructor both the bake's leaked table and the
+    /// emitted const's literal go through.
+    #[test]
+    #[should_panic(expected = "KvLayers: the layers are strictly ascending")]
+    fn a_descending_layer_table_is_refused() {
+        let leaked: &'static [u32] = Vec::leak(vec![7, 3]);
+        KvLayers::new(leaked);
+    }
+
     /// Gemma 4's classes differ in kv heads and head dim, never in query heads.
     #[test]
     #[should_panic(expected = "both classes project the same query heads")]
@@ -810,6 +1207,7 @@ mod tests {
             norm_offset: NormWeightOffset::new(0.0),
             final_softcap: None,
             kv_codec,
+            kv_layers: None,
             attention,
             vision: None,
             gdn: None,

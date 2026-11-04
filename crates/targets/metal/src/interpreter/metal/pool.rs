@@ -2476,20 +2476,19 @@ mod tests {
         rmsnorm_layer: RmsNorm,
     }
     impl CanonicalParams for TestWeights {
-        const HEAD_DIM: u32 = 64;
-        const NUM_Q_HEADS: u32 = 32;
-        const NUM_KV_HEADS: u32 = 4;
-        const Q_SIZE: usize = 2048;
-        const KV_SIZE: usize = 256;
-        const INTERMEDIATE_SIZE: usize = 5632;
-        const ATTN_SCALE: f32 = 0.125;
-        const ATTN_SOFTCAP: f32 = 0.0;
-        const SLIDING_WINDOW: i32 = -1;
+        const FACTS: scratchy_ir::model_facts::ModelFacts = crate::tape::facts::llama_like(
+            32,
+            4,
+            64,
+            5632,
+            2048,
+            0.125,
+            scratchy_ir::model_facts::MetalDtype::Bf16,
+        );
         const KV_LORA_RANK: usize = 0;
         const QK_NOPE_HEAD_DIM: usize = 0;
         const QK_ROPE_HEAD_DIM: usize = 0;
         const V_HEAD_DIM: usize = 0;
-        const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
         const QK_HEAD_DIM: usize = 0;
         const MLA_ATTN_SCALE: f32 = 0.0;
     }
