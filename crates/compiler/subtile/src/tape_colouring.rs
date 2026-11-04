@@ -650,7 +650,6 @@ fn steps_of<'a>(
 mod tests {
     use super::*;
     use crate::lower::{ArchOp, GemmWeight, InputRef, LoweringInput, OpDesc};
-    use crate::model_geometry::HeadDim;
     use crate::subtile_ir::{
         EwKind, GainConvention, RowScale, SourceShape, ValidatedGraph, lower_region,
     };
@@ -935,7 +934,7 @@ mod tests {
                 op(NORM, 1, vec![Op(1), Ext(2)]),
                 op(view(RowScale::Times(k(1)), 128), 1, vec![Op(2)]),
                 op(
-                    SubOp::rope_rotate(HeadDim::new(64)),
+                    SubOp::rope_rotate(crate::subtile_ir::AttnMask::Causal),
                     1,
                     vec![Op(3), Ext(3), Ext(4)],
                 ),

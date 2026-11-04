@@ -1750,11 +1750,10 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{TURBOQUANT_SHAPED_CODEC, front_end_lowered, one_layer_input_shaped};
+    use crate::fixtures::{TURBOQUANT_SHAPED_CODEC, fixture_model_consts, front_end_lowered, one_layer_input_shaped};
     use crate::handoff::{Expansion, ExpansionId};
     use crate::kv_codec::expand_kv_codec;
     use crate::lower::{ArchOp, GemmWeight, InputRef, LoweringInput, OpDesc};
-    use crate::model_geometry::HeadDim;
     use crate::subtile_ir::{
         AttnMask, EwKind, GainConvention, RopeFormTag, RowScale, SourceShape, ValidatedGraph,
         lower_region,
@@ -2848,7 +2847,6 @@ mod tests {
             let rows = RowScale::Times(std::num::NonZeroU32::new(heads).unwrap());
             op(SubOp::Reshape { rows, cols }, 1, vec![Op(x)])
         };
-        let head_dim = HeadDim::new(64);
         let mut v = vec![
             gemm(128, vec![Ext(0), Ext(1)]),
             gemm(128, vec![Ext(0), Ext(2)]),
@@ -2856,13 +2854,13 @@ mod tests {
             view(2, 64, 0),
             op(RMS, 1, vec![Op(3), Ext(4)]),
             view(1, 128, 4),
-            op(SubOp::rope_rotate(head_dim), 1, vec![Op(5), Ext(6), Ext(7)]),
+            op(SubOp::rope_rotate(AttnMask::Causal), 1, vec![Op(5), Ext(6), Ext(7)]),
             view(2, 64, 1),
             op(RMS, 1, vec![Op(7), Ext(5)]),
             view(1, 128, 8),
             op(SubOp::RmsNormUnit { eps: 1e-6 }, 1, vec![Op(2)]),
             op(
-                SubOp::rope_append(head_dim, 0, AttnMask::Causal, RopeFormTag::NeoX),
+                SubOp::rope_append(0, AttnMask::Causal, RopeFormTag::NeoX),
                 1,
                 vec![Op(9), Ext(6), Ext(7), Op(10), Ext(8), Ext(9)],
             ),
@@ -2957,7 +2955,7 @@ mod tests {
         let mut input = one_layer_input_shaped(256, 64, 512, 64);
         input.ops.iter_mut().for_each(|od| od.m = 1);
         let lowered = front_end_lowered(input);
-        let mut l = expand_kv_codec(&lowered, &TURBOQUANT_SHAPED_CODEC).expect("expands");
+        let mut l = expand_kv_codec(&lowered, &fixture_model_consts(256, 64, 64), &TURBOQUANT_SHAPED_CODEC).expect("expands");
         let at = |name| l.input.ops.iter().position(|od| od.op.name() == name);
         let (rotate, writer) = (at("RopeRotate").unwrap(), at("RopeAppend").unwrap());
         let (k, v) = (writer + 1, writer + 2);
@@ -3033,7 +3031,7 @@ mod tests {
             for x in [0, 5, 6] {
                 input.sources[x].rows = m;
             }
-            expand_kv_codec(&front_end_lowered(input), &TURBOQUANT_SHAPED_CODEC).expect("expands")
+            expand_kv_codec(&front_end_lowered(input), &fixture_model_consts(256, 64, 64), &TURBOQUANT_SHAPED_CODEC).expect("expands")
         };
         let l = coded(1);
         let at = |name| l.input.ops.iter().position(|od| od.op.name() == name);

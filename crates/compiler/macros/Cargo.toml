@@ -73,6 +73,9 @@ scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
 # proc-macro crate can't export the IR types, so they live in a normal
 # crate it calls.
 scratchy-subtile = { path = "../subtile" }
+# The shared model-facts struct's dtype fields (`MetalModelConsts`, filled once per expansion
+# for every target from `emit_canonical_params_impl`).
+scratchy-tensors = { path = "../../tensors" }
 syn = { version = "3", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"

@@ -300,7 +300,7 @@ use scratchy_target_metal::aot;
 use scratchy_target_metal::specialized_pipeline_cache::PipelineKey;
 use scratchy_target_metal::tape::constants::TapeVariant;
 use scratchy_target_metal::tape::lowering as tl;
-use scratchy_target_metal::tape::model_consts::MetalModelConsts;
+use scratchy_subtile::model_consts::MetalModelConsts;
 use scratchy_target_metal::tape::step::{MetalStepTape, RotaryTables};
 use scratchy_target_metal::tape::targets::MetalTargetProfile;
 

@@ -39,7 +39,7 @@ use scratchy_subtile::handoff::{BundleTensor, Expansion, ExpansionId};
 use scratchy_subtile::lower::{
     AffineInt4, ArchOp, ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc,
 };
-use scratchy_subtile::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
+use scratchy_subtile::model_consts::MetalModelConsts;
 use scratchy_subtile::subtile_ir::{
     AttnMask, DraftConvStage, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention,
     GatedAct, NumExperts, RopeFormTag, RouterBundle, RowScale, SharedExpertBound, SourceShape,
@@ -54,7 +54,7 @@ use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::quantization::StorageFormat;
 use crate::shape::Inferred;
 use crate::weight_vocab::{
-    WeightKind, WeightSlot, attention_scale_for, eval_shape_with, gemm_nk_from_fuf,
+    WeightKind, WeightSlot, eval_shape_with, gemm_nk_from_fuf,
 };
 
 /// Why a FUF couldn't be lowered to a wavefront `LoweringInput`. Always
@@ -81,15 +81,6 @@ pub enum BridgeError {
     MissingScalar { key: &'static str },
     /// A required integer bound (e.g. `head_dim`) was absent.
     MissingBound { key: &'static str },
-    /// The config's kv-head count does not divide its query-head count, so the model has no GQA
-    /// grouping at all. Refused HERE, at the one place the three numbers are read, rather than
-    /// papered over downstream by a `max(1)` that yields a group size whose attention reads another
-    /// head's keys — fluent wrong output, never a fault.
-    NoHeadGrouping {
-        num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-    },
     /// The FUF produced no result op (empty, or the last tile wasn't a
     /// value-producing op).
     NoResult,
@@ -147,16 +138,6 @@ impl std::fmt::Display for BridgeError {
             }
             Self::MissingScalar { key } => write!(f, "model scalar `{key}` missing"),
             Self::MissingBound { key } => write!(f, "config bound `{key}` missing"),
-            Self::NoHeadGrouping {
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-            } => write!(
-                f,
-                "config declares num_attention_heads={num_q_heads}, \
-                 num_key_value_heads={num_kv_heads}, head_dim={head_dim} — the kv-head count does \
-                 not divide the query-head count, so this model has no GQA grouping to emit"
-            ),
             Self::NoResult => write!(f, "FUF produced no result op"),
             Self::UnknownGainConvention { tile, offset } => write!(
                 f,
@@ -239,10 +220,12 @@ struct Builder<'a> {
     gain_offsets: HashMap<u32, f32>,
     /// Per rmsnorm OP index: the folded gain-Add's tile id.
     norm_gain_add_tiles: HashMap<usize, u32>,
-    /// The GLOBAL attention class's geometry on hybrid arches whose
-    /// global dims differ from the base (Gemma4 hd512); `None` when
-    /// uniform — `OpKind::Attention` ops use it when present.
-    geom_global: Option<ModelAttnGeometry>,
+    /// ⭐ THE ONE MODEL-FACTS STRUCT — the same value `emit_canonical_params_impl` filled once
+    /// for this expansion. Every attention fact the bridge stamps (heads, kv heads, head dim,
+    /// window, scale) is read from it, selected by the op's class exactly as metal selects:
+    /// sliding arms read `head_dim`/`num_kv_heads`, full arms read `global_head_dim`/
+    /// `num_global_kv_heads`. No geometry value is minted or carried beside it.
+    model_consts: &'a MetalModelConsts,
     bounds: BTreeMap<String, u64>, // model bounds + num_tokens=1
     sources: Vec<SourceShape>,
     bindings: Vec<SourceBinding>,
@@ -263,11 +246,7 @@ struct Builder<'a> {
     /// Prefix KV-cache source pair `(prefix_k, prefix_v)` per kv-cache
     /// extern index (one per layer).
     prefix: HashMap<(u64, u32), (usize, usize)>,
-    /// The model's head geometry, minted once at the bounds parse below — one value, with its GQA
-    /// grouping already proven, rather than three integers this builder could pair up wrongly.
-    geom: Option<ModelAttnGeometry>,
     eps: f32,
-    scale: f32,
     m: u32,
     /// Modeled prefix length for the KV-cache `Source` rows (structural;
     /// the host eval / GPU player binds the real length at run time).
@@ -629,6 +608,7 @@ pub fn lower_decode_to_wavefront(
     inferred: &Inferred,
     bounds: &BTreeMap<String, u64>,
     model: &ModelParams,
+    model_consts: &MetalModelConsts,
     prefix_len: PrefixCapacity,
     num_tokens: u32,
 ) -> Result<LoweredDecode, BridgeError> {
@@ -639,90 +619,23 @@ pub fn lower_decode_to_wavefront(
     // layer_norm_eps → vision_norm_eps → the 1e-5 default) — one
     // source of truth, always resolvable.
     let eps = crate::codegen::rms_norm_eps(model);
-    // Encoder/LayerNorm-class canonicals may omit head_dim; the scale
-    // is only consumed at attention ops — default NaN and refuse there.
-    let scale = if model.bounds.contains_key("head_dim")
-        || model.scalars.contains_key("query_pre_attn_scalar")
-    {
-        attention_scale_for(model)
-    } else {
-        f32::NAN
-    };
-    let mut b = bounds.clone();
+
     // num_tokens (= query rows m): 1 = decode, >1 = batched prefill. The op row
     // dim threads through OpDesc.m / the EmbeddedHidden + cos_sin sources — NOT
     // the solver Assignment (which only tiles N/K, num_tokens-independent) — so
     // overriding the bound + m here yields a valid m-row graph.
     let m = num_tokens.max(1);
+    let mut b = bounds.clone();
     b.insert("num_tokens".into(), m as u64);
-    // ⭐ THE PARSE BOUNDARY from the model's `config.json` to the head geometry as a value. The
-    // three numbers are read here, once, and immediately fused into one `ModelAttnGeometry` whose
-    // mint divides out the GQA group size and refuses a kv-head count that does not divide the
-    // query-head count. Downstream — the tape, the lowering, the device addresses — never sees them
-    // apart again, and never re-divides.
-    // Attention geometry is OPTIONAL at entry: vision canonicals carry
-    // no head_dim and never reach the decode-attention arms (which
-    // refuse on None).
-    let geom_pair: Option<(ModelAttnGeometry, Option<ModelAttnGeometry>)> =
-        if b.contains_key("head_dim") {
-            let head_dim = HeadDim::new(b["head_dim"] as u32);
-            let num_q_heads = QueryHeads::new(b.get("num_attention_heads").copied().ok_or(
-                BridgeError::MissingBound {
-                    key: "num_attention_heads",
-                },
-            )? as u32);
-            let num_kv_heads = KvHeads::new(b.get("num_key_value_heads").copied().ok_or(
-                BridgeError::MissingBound {
-                    key: "num_key_value_heads",
-                },
-            )? as u32);
-            let geom = ModelAttnGeometry::mint(num_q_heads, num_kv_heads, head_dim).ok_or(
-                BridgeError::NoHeadGrouping {
-                    num_q_heads: num_q_heads.get(),
-                    num_kv_heads: num_kv_heads.get(),
-                    head_dim: head_dim.get(),
-                },
-            )?;
-            let geom_global = {
-                let g_hd = b.get("global_head_dim").copied().map(|v| v as u32);
-                let g_kv = b
-                    .get("num_global_key_value_heads")
-                    .copied()
-                    .map(|v| v as u32);
-                match (g_hd, g_kv) {
-                    (Some(g_hd), Some(g_kv))
-                        if g_hd != head_dim.get() || g_kv != num_kv_heads.get() =>
-                    {
-                        Some(
-                            ModelAttnGeometry::mint(
-                                num_q_heads,
-                                KvHeads::new(g_kv),
-                                HeadDim::new(g_hd),
-                            )
-                            .ok_or(BridgeError::NoHeadGrouping {
-                                num_q_heads: num_q_heads.get(),
-                                num_kv_heads: g_kv,
-                                head_dim: g_hd,
-                            })?,
-                        )
-                    }
-                    _ => None,
-                }
-            };
-            Some((geom, geom_global))
-        } else {
-            None
-        };
-    let (geom, geom_global) = match geom_pair {
-        Some((g, gg)) => (Some(g), gg),
-        None => (None, None),
-    };
+    // The GQA divisibility law is NOT re-checked here: the struct's fill states it once, at
+    // expansion, as a compile error naming the config (see `emit_canonical_params_impl`) — a
+    // value check in a second place is a runtime refusal of a fact the bake already knows.
     let mut bx = Builder {
         fuf,
         model,
         gain_offsets: HashMap::new(),
         norm_gain_add_tiles: HashMap::new(),
-        geom_global,
+        model_consts,
         inferred,
         bounds: b,
         sources: Vec::new(),
@@ -732,9 +645,7 @@ pub fn lower_decode_to_wavefront(
         weight_src: HashMap::new(),
         cos_sin: BTreeMap::new(),
         prefix: HashMap::new(),
-        geom,
         eps,
-        scale,
         m,
         prefix_len,
         op_expansion: Vec::new(),
@@ -1036,22 +947,15 @@ pub fn lower_decode_to_wavefront(
                         }
                     )
                 });
-                // ⭐ THE HEAD DIM IS THE ROTARY CLASS'S OWN, NOT THE MODEL'S. A hybrid-attention
-                // arch (gemma-4) binds TWO rotary externs: `rotary_local` names the BASE class
-                // (`bx.geom`) and plain `rotary` names the GLOBAL one (`bx.geom_global`, head_dim
-                // 512 where the base is 256). This used to stamp `bx.geom.hd()` on every rope
-                // node, so a global layer's 512-wide head rotated as two 256-wide heads with a
-                // 256-half pairing — a rotation the consumer's own geometry contradicts. The
-                // class selection mirrors the attention arm's (`AttnMask::Causal ⇒ geom_global`):
-                // the base class never has a global twin (its geometry IS the model's), and a
-                // global twin exists exactly when the two classes differ.
-                let head_dim = if local_rope {
-                    bx.geom
-                } else {
-                    bx.geom_global.or(bx.geom)
-                }
-                .ok_or(BridgeError::MissingBound { key: "head_dim" })?
-                .hd();
+                // ⭐ THE ROTARY CLASS IS CARRIED, NOT THE HEAD-DIM NUMBER. A hybrid-attention
+                // arch (gemma-4) binds TWO rotary externs: `rotary_local` names the BASE
+                // (sliding) class and plain `rotary` names the GLOBAL one — head_dim 512 where
+                // the base is 256. The rope op carries its attention CLASS (`AttnMask`), and every
+                // consumer reads that class's geometry off the model-facts struct — the same
+                // selection the attention arm makes for its own op. The class is stamped `Causal`
+                // here and the consuming attention arm BACKPATCHES it to `SlidingWindow` for
+                // sliding layers (the discipline `RopeAppend`'s class already follows), so a
+                // global layer's 512-wide head never rotates as two 256-wide heads.
                 let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
                 let (cos_k, sin_k) = bx.cos_sin(k_cols, local_rope);
                 // E.12 — RopeAppend writes rotated K and V into the
@@ -1063,7 +967,7 @@ pub fn lower_decode_to_wavefront(
                 // writes must be THIS class's.
                 let (pk, pv) = bx.prefix_for(layer as u64, k_cols);
                 let qi = bx.push_op(
-                    SubOp::rope_rotate(head_dim),
+                    SubOp::rope_rotate(AttnMask::Causal),
                     vec![q, InputRef::Ext(cos_q), InputRef::Ext(sin_q)],
                 );
                 let pairing = match node.op {
@@ -1073,7 +977,7 @@ pub fn lower_decode_to_wavefront(
                 let ki = bx.push_op(
                     // `Causal` by default; the consuming attention arm backpatches
                     // `SlidingWindow` for sliding layers.
-                    SubOp::rope_append(head_dim, layer, AttnMask::Causal, pairing),
+                    SubOp::rope_append(layer, AttnMask::Causal, pairing),
                     vec![
                         k,
                         InputRef::Ext(cos_k),
@@ -1098,10 +1002,6 @@ pub fn lower_decode_to_wavefront(
             // attention's new-K edge, as a rope writer's is); V passes
             // through aliasing its projection, as under rope_append.
             OpKind::KvAppend => {
-                let head_dim = bx
-                    .geom
-                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?
-                    .hd();
                 let k = bx.input_at(tile, 0)?;
                 let v = bx.input_at(tile, 1)?;
                 let layer = kv_cache_index(node).ok_or(BridgeError::MalformedOp {
@@ -1118,7 +1018,7 @@ pub fn lower_decode_to_wavefront(
                 let ki = bx.push_op(
                     // `Causal` by default; the consuming attention arm backpatches
                     // `SlidingWindow` for sliding layers.
-                    SubOp::kv_append(head_dim, layer, AttnMask::Causal),
+                    SubOp::kv_append(layer, AttnMask::Causal),
                     vec![k, v, InputRef::Ext(pk), InputRef::Ext(pv)],
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(ki));
@@ -1137,7 +1037,7 @@ pub fn lower_decode_to_wavefront(
             | OpKind::SlidingAttention
             | OpKind::SinkAttention
             | OpKind::SinkSlidingAttention => {
-                if bx.scale.is_nan() {
+                if bx.model_consts.head_dim == 0 {
                     return Err(BridgeError::MissingBound { key: "head_dim" });
                 }
                 let is_sink = matches!(
@@ -1174,20 +1074,12 @@ pub fn lower_decode_to_wavefront(
                             detail: "sink attention requires a kv_cache — decoder-only op",
                         });
                     }
-                    if bx.scale.is_nan() {
+                    if bx.model_consts.head_dim == 0 {
                         return Err(BridgeError::MissingBound { key: "head_dim" });
                     }
                     let k = bx.input_at(tile, 1)?;
                     let v = bx.input_at(tile, 2)?;
-                    let idx = bx.push_op(
-                        SubOp::EncoderAttn {
-                            geom: bx
-                                .geom
-                                .ok_or(BridgeError::MissingBound { key: "head_dim" })?,
-                            scale: bx.scale,
-                        },
-                        vec![q, k, v],
-                    );
+                    let idx = bx.push_op(SubOp::EncoderAttn, vec![q, k, v]);
                     bx.produced.insert((tile.0, 0), Producer::Op(idx));
                     result = Some(idx);
                     continue;
@@ -1218,20 +1110,29 @@ pub fn lower_decode_to_wavefront(
                     }
                     _ => AttnMask::Causal,
                 };
-                let base_geom = bx
-                    .geom
-                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?;
-                let geom = match mask {
-                    AttnMask::Causal => bx.geom_global.unwrap_or(base_geom),
-                    AttnMask::SlidingWindow { .. } => base_geom,
+                // ⭐ THE CLASS'S OWN KV WIDTH, OFF THE MODEL-FACTS STRUCT — metal's
+                // selection law (sliding arm ⇒ base pair, full arm ⇒ global pair). A
+                // hybrid model's sliding and global layers have different kv widths, and
+                // the cache this attention reads is the one its own class's RopeAppend
+                // wrote. On a uniform model the two pairs are the same numbers.
+                let (nkvh, hd) = if mask.window().is_some() {
+                    (bx.model_consts.num_kv_heads, bx.model_consts.head_dim)
+                } else {
+                    (
+                        bx.model_consts.num_global_kv_heads,
+                        bx.model_consts.global_head_dim,
+                    )
                 };
-                // The prefix cache at THIS layer's class width — a hybrid model's
-                // sliding and global layers have different kv widths, and the cache
-                // this attention reads is the one its own class's RopeAppend wrote.
-                let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
+                let (pk, pv) = bx.prefix_for(layer, nkvh * hd);
                 if let AttnMask::SlidingWindow { window } = mask {
-                    // The k-rope for a sliding layer targets the LOCAL
-                    // geometry class.
+                    // The q-rope AND k-rope of a sliding layer target the LOCAL
+                    // geometry class — both carry the class every consumer selects
+                    // the head dim by, so both must be patched.
+                    if let InputRef::Op(qi) = q
+                        && let SubOp::RopeRotate { attn, .. } = &mut bx.ops[qi].op
+                    {
+                        *attn = AttnMask::SlidingWindow { window };
+                    }
                     if let InputRef::Op(ri) = k
                         && let SubOp::RopeAppend { attn, .. } | SubOp::KvAppend { attn, .. } =
                             &mut bx.ops[ri].op
@@ -1244,7 +1145,7 @@ pub fn lower_decode_to_wavefront(
                     attn_inputs.push(s);
                 }
                 let idx = bx.push_op(
-                    SubOp::attn_decode(geom, scale, valid_len, mask),
+                    SubOp::attn_decode(valid_len, mask),
                     attn_inputs,
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
@@ -1252,10 +1153,6 @@ pub fn lower_decode_to_wavefront(
             }
             // rope_query(q, positions, rotary): the query's rotation alone — no K, no cache write.
             OpKind::RopeQuery => {
-                let head_dim = bx
-                    .geom
-                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?
-                    .hd();
                 let q = bx.input_at(tile, 0)?;
                 let q_cols = bx.out_cols(tile, 0, "rope_query q cols")?;
                 let local_rope = node.inputs.iter().any(|inp| {
@@ -1269,7 +1166,7 @@ pub fn lower_decode_to_wavefront(
                 });
                 let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
                 let idx = bx.push_op(
-                    SubOp::rope_rotate(head_dim),
+                    SubOp::rope_rotate(AttnMask::Causal),
                     vec![q, InputRef::Ext(cos_q), InputRef::Ext(sin_q)],
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
@@ -1278,7 +1175,7 @@ pub fn lower_decode_to_wavefront(
             // shared_attention(q, kv_cache[layer], block_table): AttnDecode over the cache's
             // prefix segments alone — the step appends no K/V.
             OpKind::SharedAttention | OpKind::SharedSlidingAttention => {
-                if bx.scale.is_nan() {
+                if bx.model_consts.head_dim == 0 {
                     return Err(BridgeError::MissingBound { key: "head_dim" });
                 }
                 let q = bx.input_at(tile, 0)?;
@@ -1300,19 +1197,21 @@ pub fn lower_decode_to_wavefront(
                     OpKind::SharedSlidingAttention => AttnMask::SlidingWindow { window },
                     _ => AttnMask::Causal,
                 };
-                let base_geom = bx
-                    .geom
-                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?;
-                let geom = match mask {
-                    AttnMask::Causal => bx.geom_global.unwrap_or(base_geom),
-                    AttnMask::SlidingWindow { .. } => base_geom,
+                // THE CLASS'S OWN KV WIDTH, off the model-facts struct by metal's
+                // selection law (sliding arm reads the base pair, full arm the global
+                // pair). A hybrid model's classes have different kv widths, and the
+                // cache this attention reads is its own class's.
+                let (nkvh, hd) = if mask.window().is_some() {
+                    (bx.model_consts.num_kv_heads, bx.model_consts.head_dim)
+                } else {
+                    (
+                        bx.model_consts.num_global_kv_heads,
+                        bx.model_consts.global_head_dim,
+                    )
                 };
-                // The prefix cache at THIS layer's class width — a hybrid
-                // model's sliding and global layers have different kv widths,
-                // and the cache this attention reads is its own class's.
-                let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
+                let (pk, pv) = bx.prefix_for(layer, nkvh * hd);
                 let idx = bx.push_op(
-                    SubOp::attn_decode(geom, bx.scale, bx.prefix_len, mask),
+                    SubOp::attn_decode(bx.prefix_len, mask),
                     vec![q, InputRef::Ext(pk), InputRef::Ext(pv)],
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));

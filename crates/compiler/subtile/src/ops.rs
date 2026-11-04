@@ -34,7 +34,6 @@
 //!   - `[nz f]` — the op's own non-zero count field `f` (`.get()`);
 //!   - `[pairs in0 k]` / `[pairs f k]` — `(token, expert)` pair rows laid out `[m, k·w]`, `w` the
 //!     width of operand 0 or of the op's field `f`, `k` the op's top-k field;
-//!   - `[q_width g]` — the query width of the op's head geometry field `g`.
 //! - `rows` is the same shape of fact for the output ROW count — which op row law a step obeys:
 //!   - `[in0]` — shape-preserving: output rows = `inputs[0]`'s REGISTERED rows. The token count
 //!     `m` and the true row count diverge exactly once a per-head `Reshape` view enters the chain
@@ -114,7 +113,7 @@ macro_rules! for_each_subop {
             // `[num_heads]` sinks weight source (gpt-oss attention
             // sinks — a 6th input read as a weight, not a K/V pair).
             AttnDecode [SubOp::AttnDecode { .. }] arity = (|n| (n >= 3 && n % 2 == 1) || n == 6),
-                cols = [q_width geom], rows = [in0], gemm_w = [none];
+                cols = [in0], rows = [in0], gemm_w = [none];
             TanhSoftCap [SubOp::TanhSoftCap { .. }] arity = (|n| n == 1), cols = [in0],
                 rows = [in0], gemm_w = [none];
             RmsNormUnit [SubOp::RmsNormUnit { .. }] arity = (|n| n == 1), cols = [in0],
@@ -161,7 +160,7 @@ macro_rules! for_each_subop {
                 gemm_w = [none];
             VarlenAttention [SubOp::VarlenAttention { .. }] arity = (|n| n == 3), cols = [in0],
                 rows = [in0], gemm_w = [none];
-            EncoderAttn [SubOp::EncoderAttn { .. }] arity = (|n| n == 3), cols = [q_width geom],
+            EncoderAttn [SubOp::EncoderAttn { .. }] arity = (|n| n == 3), cols = [in0],
                 rows = [in0], gemm_w = [none];
             GatedDeltaNet [SubOp::GatedDeltaNet] arity = (|n| n == 5), cols = [in1], rows = [in0],
                 gemm_w = [none];
@@ -267,9 +266,6 @@ macro_rules! __out_cols_pat {
     ($kind:ident, $pat:pat, [field $f:ident]) => {
         $crate::subtile_ir::SubOp::$kind { $f, .. }
     };
-    ($kind:ident, $pat:pat, [q_width $g:ident]) => {
-        $crate::subtile_ir::SubOp::$kind { $g, .. }
-    };
     ($kind:ident, $pat:pat, [nz $f:ident]) => {
         $crate::subtile_ir::SubOp::$kind { $f, .. }
     };
@@ -301,9 +297,6 @@ macro_rules! __out_cols_body {
     };
     ($w:ident, [field $f:ident]) => {
         *$f
-    };
-    ($w:ident, [q_width $g:ident]) => {
-        $g.q_width()
     };
     ($w:ident, [nz $f:ident]) => {
         $f.get()

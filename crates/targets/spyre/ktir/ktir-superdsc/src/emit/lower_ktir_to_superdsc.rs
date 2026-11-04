@@ -4280,9 +4280,8 @@ pub fn scalarmul(
 
 /// The `[rows, cols]` of the FIRST window the program takes of one parameter's buffer — its access
 /// tile's own `Shape`, which is stated whatever its corner is made of.
-/// PUBLIC for the door: the geometry mint reads a program's head dim here, the same way rope's
-/// head dim is read — the door (`ktir_superdsc_door::attn`) mints `ModelAttnGeometry` off the
-/// program's own views because a hybrid model's bundle carries more than one.
+/// PUBLIC for the door: rope reads a program's head dim here — off the program's own views,
+/// because a hybrid model's bundle carries more than one.
 pub fn param_first_tile(f: &IRFunction<'static>, ptr: &Ssa) -> Option<(u32, u32)> {
     param_tiles(f, ptr).find_map(shape_2d)
 }
@@ -4730,8 +4729,9 @@ pub fn program_tanhsoftcap_cap(f: &IRFunction<'static>) -> Option<f32> {
     Some(cap? as f32)
 }
 
-/// main's `lower_rope_node` (main 8696-9528), waiting for its head dim to become a const — the
-/// consumer side of `with_config_head_dim`, exactly as main's `LowerRope` was.
+/// main's `lower_rope_node` (main 8696-9528), waiting for its head dim to become a const —
+/// exactly as main's `LowerRope` was. The caller crosses the value→const boundary at the door's
+/// `rope_at_hd` registry match.
 pub struct RopeAt<'a> {
     pub name: &'a str,
     /// x, cos, sin, out — main's `inputs[0..3]` and `output`.

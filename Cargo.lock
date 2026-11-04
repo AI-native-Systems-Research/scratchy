@@ -3611,6 +3611,7 @@ dependencies = [
  "scratchy-target-metal",
  "scratchy-target-metal-compiler",
  "scratchy-target-spyre",
+ "scratchy-tensors",
  "serde_json",
  "syn 3.0.9",
  "tracing",
@@ -3850,6 +3851,7 @@ dependencies = [
  "scratchy-forward-compiler",
  "scratchy-ir",
  "scratchy-spyre-bundle",
+ "scratchy-tensors",
  "serde_json",
 ]
 

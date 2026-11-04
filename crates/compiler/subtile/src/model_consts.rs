@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The model facts the tape construction reads — as a VALUE.
+//! The model facts the target lowerings read — as a VALUE, ONE struct for every target.
 //!
-//! The construction fns were generic over `W: CanonicalParams` and read
-//! associated consts. The `#[forward]` macro holds the same facts as
-//! *values* at expansion (associated consts cannot be implemented from
-//! them), so the fns take this struct instead: the runtime driver builds
-//! it via [`MetalModelConsts::from_canonical`] (a const-for-const copy),
-//! the macro builds it from `ModelParams` directly, and both call the
-//! ONE construction implementation.
+//! This module is a PURE MOVE of metal's `tape::model_consts` (the struct metal's lowering was
+//! already written once over) to this target-neutral crate, so that spyre reads the SAME struct
+//! from the SAME fill site instead of carrying its own geometry beside it. The `#[forward]`
+//! macro fills it once at expansion (see `codegen.rs`'s `emit_canonical_params_impl`); the
+//! runtime driver builds it via [`MetalModelConsts::from_canonical`] (a const-for-const copy);
+//! both targets' lowerings take it as a parameter and are written ONCE over whatever it holds.
 //!
 //! Field names mirror the `CanonicalParams` consts one-for-one so the
 //! `W::X → p.x` refactor is a mechanical rename with nothing to
 //! re-derive or transpose.
+//!
+//! The name keeps its metal origin on purpose: it is ONE struct under ONE name (no alias, no
+//! spyre twin), and the name says where its lowering discipline came from.
 
 use scratchy_tensors::{MetalDtype, ScaleDtype};
 
@@ -24,6 +26,10 @@ pub struct MetalModelConsts {
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
     pub num_global_kv_heads: u32,
+    /// The FULL (causal/global) class's GQA group size — `num_q_heads / num_global_kv_heads`,
+    /// divided ONCE at the fill, right after the law's const assert proves it exact. The splice's
+    /// `NUM_QUERIES_PER_KV` constexpr reads it; no lowering re-derives the division.
+    pub global_queries_per_kv: u32,
     pub q_size: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -74,6 +80,53 @@ pub struct MetalModelConsts {
 }
 
 impl MetalModelConsts {
+    /// The value that travels with a `compile_error!` token stream on an expansion-refused
+    /// path: the emitted tokens never compile, so NO field of this value is ever read. It
+    /// exists only so a refusal can return the same `(TokenStream, Self)` type as the success
+    /// path — it is not a default, constructs nothing, and is unreachable in any build that
+    /// does not already fail.
+    pub const COMPILE_ERROR: Self = Self {
+        metal_dtype: MetalDtype::Bf16,
+        scale_dtype: ScaleDtype::Bf16,
+        head_dim: 0,
+        global_head_dim: 0,
+        num_q_heads: 0,
+        num_kv_heads: 0,
+        num_global_kv_heads: 0,
+        global_queries_per_kv: 0,
+        q_size: 0,
+        hidden_size: 0,
+        intermediate_size: 0,
+        attn_scale: 0.0,
+        sliding_window: 0,
+        final_logit_softcapping: 0.0,
+        rms_norm_eps: 0.0,
+        norm_weight_offset: 0.0,
+        block_size: 0,
+        global_block_size: 0,
+        rot_dim: 0,
+        global_rot_dim: 0,
+        rope_on_read: false,
+        rope_proportional: false,
+        mrope: false,
+        kv_codec: scratchy_ir::KvCodec::Dense,
+        vision_num_heads: 0,
+        vision_head_dim: 0,
+        vision_q_size: 0,
+        vision_in_features: 0,
+        vision_rope_interleaved: false,
+        vision_attn_scale: 0.0,
+        vision_patch_grid_side: 0,
+        vision_pool_kernel: 0,
+        gdn_num_k_heads: 0,
+        gdn_num_v_heads: 0,
+        gdn_head_k_dim: 0,
+        gdn_head_v_dim: 0,
+        gdn_conv_kernel: 0,
+        gdn_conv_dim: 0,
+        spec_drafts: 0,
+    };
+
     /// The runtime driver's constructor: every field is the same-named
     /// `CanonicalParams` const. A field this misses is a compile error
     /// here, not a wrong value downstream.
@@ -86,6 +139,11 @@ impl MetalModelConsts {
             num_q_heads: W::NUM_Q_HEADS,
             num_kv_heads: W::NUM_KV_HEADS,
             num_global_kv_heads: W::NUM_GLOBAL_KV_HEADS,
+            global_queries_per_kv: if W::NUM_GLOBAL_KV_HEADS == 0 {
+                0
+            } else {
+                W::NUM_Q_HEADS / W::NUM_GLOBAL_KV_HEADS
+            },
             q_size: W::Q_SIZE,
             hidden_size: W::HIDDEN_SIZE,
             intermediate_size: W::INTERMEDIATE_SIZE,

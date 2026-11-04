@@ -182,17 +182,25 @@ impl std::fmt::Display for KvCodecError {
 /// ⛔ A GEOMETRY THE KERNELS DO NOT TAKE CODES NOTHING: the op list comes back as it was.
 pub fn expand_kv_codec(
     l: &LoweredDecode,
+    model_consts: &crate::model_consts::MetalModelConsts,
     facts: &KvCodecFacts,
 ) -> Result<LoweredDecode, KvCodecError> {
     let ops = &l.input.ops;
-    // A writer states the model's base head dim, an attention its class's.
+    // A writer or attention states its CLASS, and the class's head dim is the model's own fact:
+    // the sliding arms read `head_dim`, the full arms `global_head_dim` — the selection rule the
+    // lowerings share. A uniform model has global == base, so nothing changes for it.
+    let class_hd = |attn: AttnMask| {
+        if attn.window().is_some() {
+            model_consts.head_dim
+        } else {
+            model_consts.global_head_dim
+        }
+    };
     let mut dims: Vec<u32> = ops
         .iter()
         .filter_map(|od| match od.op {
-            SubOp::RopeAppend { head_dim, .. } | SubOp::KvAppend { head_dim, .. } => {
-                Some(head_dim.get())
-            }
-            SubOp::AttnDecode { geom, .. } => Some(geom.hd().get()),
+            SubOp::RopeAppend { attn, .. } | SubOp::KvAppend { attn, .. } => Some(class_hd(attn)),
+            SubOp::AttnDecode { mask, .. } => Some(class_hd(mask)),
             _ => None,
         })
         .collect();
@@ -511,7 +519,8 @@ impl Expander<'_> {
 mod tests {
     use super::*;
     use crate::fixtures::{
-        TURBOQUANT_SHAPED_CODEC as FACTS, front_end_lowered as lowered, one_layer_input_shaped,
+        TURBOQUANT_SHAPED_CODEC as FACTS, fixture_model_consts, front_end_lowered as lowered,
+        one_layer_input_shaped,
     };
     use crate::lower::GemmWeight;
     use crate::subtile_ir::{EwKind, SourceShape};
@@ -536,7 +545,6 @@ mod tests {
     /// attention twinned onto them; off decode steps its K and V stage for the attention.
     #[test]
     fn an_unrotated_writer_encodes_its_cache_halves_alone() {
-        use crate::model_geometry::HeadDim;
         use crate::subtile_ir::AttnMask;
         let unrotated = |m: u32| {
             let mut input = one_layer_input_shaped(256, 64, 512, 64);
@@ -547,7 +555,7 @@ mod tests {
                 inputs: vec![InputRef::Op(1)],
             };
             input.ops[5] = OpDesc {
-                op: SubOp::kv_append(HeadDim::new(64), 0, AttnMask::Causal),
+                op: SubOp::kv_append(0, AttnMask::Causal),
                 m,
                 inputs: vec![
                     InputRef::Op(2),
@@ -557,7 +565,7 @@ mod tests {
                 ],
             };
             input.ops.iter_mut().for_each(|od| od.m = m);
-            expand_kv_codec(&lowered(input), &FACTS).expect("expands")
+            expand_kv_codec(&lowered(input), &fixture_model_consts(256, 64, 64), &FACTS).expect("expands")
         };
         use InputRef::{Ext, Op};
         let l = unrotated(1);
@@ -597,7 +605,7 @@ mod tests {
     /// takes over the attention's output and reads the writer's two encodes.
     #[test]
     fn decode_encodes_after_the_writer_and_twins_the_attention() {
-        let l = expand_kv_codec(&layer(64, 1), &FACTS).expect("expands");
+        let l = expand_kv_codec(&layer(64, 1), &fixture_model_consts(256, 64, 64), &FACTS).expect("expands");
         let s = shape(&l);
         assert_eq!(
             s[4..11],
@@ -642,7 +650,7 @@ mod tests {
         let sinks = input.sources.len();
         input.sources.push(SourceShape { rows: 1, cols: 4 });
         input.ops[6].inputs.push(InputRef::Ext(sinks));
-        let x = expand_kv_codec(&lowered(input), &FACTS).expect("expands");
+        let x = expand_kv_codec(&lowered(input), &fixture_model_consts(256, 64, 64), &FACTS).expect("expands");
         use InputRef::{Ext, Op};
         // The dense anchor keeps all six of its inputs under `UnlessCodecDecode`…
         assert_eq!(
@@ -663,7 +671,7 @@ mod tests {
     /// attention, which reads the rotated rows; its output rotated back, then the packed twin.
     #[test]
     fn prefill_stages_rotates_and_twins_the_attention() {
-        let l = expand_kv_codec(&layer(64, 2), &FACTS).expect("expands");
+        let l = expand_kv_codec(&layer(64, 2), &fixture_model_consts(256, 64, 64), &FACTS).expect("expands");
         let s = shape(&l);
         assert_eq!(
             s[5..15],
@@ -699,15 +707,12 @@ mod tests {
     #[test]
     fn a_writer_without_a_cache_reader_is_still_encoded() {
         let mut l = layer(64, 1);
-        let SubOp::AttnDecode { geom, scale, .. } = l.input.ops[6].op else {
-            panic!("op 6 is the fixture's attention");
-        };
         l.input.ops[6] = OpDesc {
-            op: SubOp::EncoderAttn { geom, scale },
+            op: SubOp::EncoderAttn,
             m: 1,
             inputs: vec![InputRef::Op(4), InputRef::Op(5), InputRef::Op(3)],
         };
-        let x = expand_kv_codec(&l, &FACTS).expect("expands");
+        let x = expand_kv_codec(&l, &fixture_model_consts(256, 64, 64), &FACTS).expect("expands");
         assert_eq!(
             shape(&x)[5..9],
             [
@@ -725,7 +730,8 @@ mod tests {
     fn an_unsupported_head_dim_codes_nothing() {
         for (h, hd) in [(384, 96), (2048, 1024)] {
             let l = lowered(one_layer_input_shaped(h, hd, 512, hd));
-            let x = expand_kv_codec(&l, &FACTS).expect("passes through");
+            // The graph's OWN head dim, so the refusal is the codec's, not a consts mismatch.
+            let x = expand_kv_codec(&l, &fixture_model_consts(h, hd, hd), &FACTS).expect("passes through");
             assert_eq!(shape(&x), shape(&l), "head dim {hd}");
         }
     }
@@ -754,7 +760,11 @@ mod tests {
         l.input.sources.extend(second.sources);
         l.input.ops.extend(second.ops);
         let l = lowered(l.input);
-        let x = expand_kv_codec(&l, &FACTS).expect("expands");
+        // The hybrid's OWN classes: the causal layer runs hd 64, the sliding one hd 128 — the
+        // two dims are what make the graph hybrid at all (one dim would code both classes).
+        let mut hybrid_consts = fixture_model_consts(256, 64, 64);
+        hybrid_consts.head_dim = 128;
+        let x = expand_kv_codec(&l, &hybrid_consts, &FACTS).expect("expands");
         let count = |name| x.input.ops.iter().filter(|od| od.op.name() == name).count();
         assert_eq!((count("KvEncode"), count("AttnPackedKv")), (2, 1));
         let coded = x.input.ops.iter().zip(&x.op_expansion);
@@ -792,7 +802,7 @@ mod tests {
         };
         insert(&mut input, 4, biased);
         input.ops[6].inputs[0] = InputRef::Op(4);
-        let x = expand_kv_codec(&lowered(input), &FACTS).expect("expands");
+        let x = expand_kv_codec(&lowered(input), &fixture_model_consts(256, 64, 64), &FACTS).expect("expands");
         let encodes: Vec<_> = x
             .input
             .ops
@@ -817,7 +827,7 @@ mod tests {
     fn an_attention_without_its_writer_does_not_expand() {
         let mut l = layer(64, 1);
         l.input.ops[6].inputs[3] = InputRef::Op(2);
-        match expand_kv_codec(&l, &FACTS) {
+        match expand_kv_codec(&l, &fixture_model_consts(256, 64, 64), &FACTS) {
             Err(KvCodecError::NoWriter { op: 6, name }) => assert_eq!(name, "AttnDecode"),
             other => panic!("expected NoWriter at op 6, got {other:?}"),
         }

@@ -2375,9 +2375,9 @@ mod tests {
         let device = device.device.clone();
         let cache =
             SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
-        let p = crate::tape::model_consts::MetalModelConsts {
+        let p = scratchy_subtile::model_consts::MetalModelConsts {
             metal_dtype: MetalDtype::F16,
-            ..crate::tape::model_consts::MetalModelConsts::from_canonical::<TestWeights>()
+            ..scratchy_subtile::model_consts::MetalModelConsts::from_canonical::<TestWeights>()
         };
         // Decodes, then verifies (every row sampled), then short prefix-hit chunks, then long
         // chunks.

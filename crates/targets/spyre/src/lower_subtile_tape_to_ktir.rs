@@ -239,6 +239,7 @@ pub(crate) fn scalar_mul_weight_folds<F: RopeForm>(
 /// Returns `(attn node, W_q tid, W_k tid, √scale)` — one entry per foldable attention node.
 pub(crate) fn attn_scale_weight_folds<F: RopeForm>(
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
 ) -> Vec<(SubtileId, u32, u32, f32)> {
     let _pc = crate::pc::Pc::start("foldscan");
     crate::pc::count("foldscan", ir.nodes.len() as u64);
@@ -300,14 +301,16 @@ pub(crate) fn attn_scale_weight_folds<F: RopeForm>(
     };
     let mut folds = Vec::new();
     for node in &ir.nodes {
-        let SubOp::AttnDecode { scale, .. } = &node.op else {
+        let SubOp::AttnDecode { .. } = &node.op else {
             continue;
         };
+        // The scale is the model's own fact, off the one struct (the op no longer carries it).
+        let scale = model_consts.attn_scale;
         // inputs = [q, prefix_k, prefix_v, new_k, new_v] — the walk is the two live sides.
         let [q, _prefix_k, _prefix_v, new_k, _new_v] = node.inputs.as_slice() else {
             continue;
         };
-        if *scale == 1.0 {
+        if scale == 1.0 {
             continue;
         }
         let Some(w_q) = projection_weight(ir, q, node.id, &is_fp8_weight, &shared) else {
@@ -351,9 +354,12 @@ pub(crate) fn attn_scale_weight_folds<F: RopeForm>(
 /// census, the golden's source pre-scaling) takes this union. A fold entry keyed on an
 /// AttnDecode reaching the aliasing sites would point the attention's OUTPUT placement at the
 /// query's bytes, so those sites keep their own recognizer rather than filtering this list.
-pub(crate) fn weight_scale_folds<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<(SubtileId, u32, f32)> {
+pub(crate) fn weight_scale_folds<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
+) -> Vec<(SubtileId, u32, f32)> {
     let mut folds = scalar_mul_weight_folds(ir);
-    for (id, w_q, w_k, sqrt_scale) in attn_scale_weight_folds(ir) {
+    for (id, w_q, w_k, sqrt_scale) in attn_scale_weight_folds(ir, model_consts) {
         folds.push((id, w_q, sqrt_scale));
         folds.push((id, w_k, sqrt_scale));
     }
@@ -621,6 +627,9 @@ fn ktir_only(k: ktir_superdsc::ktir_node::KtirNode) -> EmittedOp {
 pub(crate) fn lower_one_node<F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
+    // The model's own facts — the ONE struct every lowering reads (the attention's class numbers
+    // and scale, the rope arm's head dim).
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     // Sweep KV extent for AttnDecode (paged-attn ladder rung); FULL ⇒ full cap. See main's
     // `lower_attn_node`.
     active_cap: ActiveCap,
@@ -770,13 +779,13 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::RmsNormUnit { .. }
         | SubOp::ScalarWeightMul
         | SubOp::Reshape { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower_all(node, ir, model_consts, rows_are_requests) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
         }
         SubOp::MatmulTile { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower_all(node, ir, model_consts, rows_are_requests) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -805,7 +814,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             node.output.tensor.index() as u32,
         )),
         SubOp::Elementwise(_) | SubOp::SiluMul => {
-            match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower(node, ir, model_consts, rows_are_requests) {
                 Ok(e) => Ops(vec![e]),
                 Err(reason) => Unhandled(reason),
             }
@@ -820,7 +829,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // the tail's ScalarMul and TanhSoftCap get), which is `lower_all`'s
         // interception.
         SubOp::Sample { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower_all(node, ir, model_consts, rows_are_requests) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -839,13 +848,13 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // the split's own lowering emitted (`lower_all`'s interception), so the
         // one-op path is only for the norms that are NOT a sandwich seat.
         SubOp::RmsNorm { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower_all(node, ir, model_consts, rows_are_requests) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
         }
         SubOp::RopeRotate { .. } => {
-            match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower(node, ir, model_consts, rows_are_requests) {
                 Ok(e) => Ops(vec![e]),
                 Err(reason) => Unhandled(reason),
             }
@@ -853,7 +862,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // ⭐ A KV WRITER LOWERS TO ITS ROTATION AND ITS PAGED WRITE — `lower_all` emits both, the
         // scatter into the pools right after the rotation it stores.
         SubOp::RopeAppend { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower_all(node, ir, model_consts, rows_are_requests) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -875,38 +884,34 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             {
                 return HostRouted("ScalarMulWeightFold");
             }
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower_all(node, ir, model_consts, rows_are_requests) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
         }
         SubOp::AttnDecode { .. } => {
-            // ⭐ THE PAGED WALK READS ITS POOLS, ITS GEOMETRY AND ITS SCALE OFF THE NODE, and the
-            // rung's walk off `active_cap` — the splice states every one as the kernel's constexprs.
-            // ⭐⭐⭐ THE SCALE, REWRITTEN TO 1.0 WHEN ITS FOLD APPLIES. The program is the ONE
+            // ⭐ THE PAGED WALK READS ITS POOLS AND ITS GEOMETRY OFF THE ONE MODEL-FACTS STRUCT
+            // (the class's numbers, selected by the op's mask), and the rung's walk off
+            // `active_cap` — the splice states every one as the kernel's constexprs.
+            // ⭐⭐⭐ THE SCALE, STATED AS 1.0 WHEN ITS FOLD APPLIES. The program is the ONE
             // carrier of the scale (the kernel states it as its `SCALE` constexpr and the door
-            // reads that value back), so rewriting it HERE — at the boundary where the program
-            // is minted — is the single edit that reaches every consumer: the door sees 1.0 and
+            // reads that value back), so stating it HERE — at the boundary where the program is
+            // minted — is the single edit that reaches every consumer: the door sees 1.0 and
             // emits no `qs`/`new_k_scaled` multiplies, the emulator interprets `qk · 1.0` over
             // the pre-scaled weights the fold staged, and the registry census skips the node's
             // arm. The REAL multiplier meanwhile rides the fold list into the staged W_q/W_k
-            // bytes, where `(q·√s)·(k·√s)ᵀ` reproduces `(q·kᵀ)·s` exactly.
-            let mut folded_node;
-            let node_ref: &SubtileNode<F> = if attn_scale_weight_folds(ir)
+            // bytes, where `(q·√s)·(k·√s)ᵀ` reproduces `(q·kᵀ)·s` exactly. (The op no longer
+            // carries the scale to rewrite in a cloned node — the EFFECTIVE value is stated to
+            // the splice, which owns the constexpr.)
+            let folded = attn_scale_weight_folds(ir, model_consts)
                 .iter()
-                .any(|(id, ..)| *id == node.id)
-            {
-                folded_node = node.clone();
-                if let SubOp::AttnDecode { scale, .. } = &mut folded_node.op {
-                    *scale = 1.0;
-                }
-                &folded_node
-            } else {
-                node
-            };
+                .any(|(id, ..)| *id == node.id);
+            let scale = if folded { 1.0 } else { model_consts.attn_scale };
             match scratchy_triton_splice::lower_attn(
-                node_ref,
+                node,
                 ir,
+                model_consts,
+                scale,
                 active_cap,
                 scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
             ) {
@@ -943,6 +948,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
 /// program instead. The WHOLE lowering is [`lower_graph_to_superdsc`] below; this is its first half.
 pub fn lower_graph_to_ktir<F: RopeForm>(
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     weight_ids: &std::collections::HashSet<u32>,
     // Swept KV extent for the decode attention (paged-attn ladder rung); FULL ⇒ full cap (byte-identical).
     active_cap: ActiveCap,
@@ -960,6 +966,7 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // rather than a bool, so there is one spelling of "the layer structure" and not two).
     let bundle_layout = compute_bundle_layout(
         ir,
+        model_consts,
         weight_ids,
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
         &[],
@@ -978,7 +985,7 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // once — see `lower_subtile_tape_to_superdsc`.) MatmulTile's Err is still a hard
     // stop; everything else collects into the worklist/host-routed sets below.
     for node in &ir.nodes {
-        match lower_one_node(node, ir, active_cap, rows_are_requests) {
+        match lower_one_node(node, ir, model_consts, active_cap, rows_are_requests) {
             NodeLowering::Ops(v) => ops.extend(v),
             NodeLowering::Unhandled(s) => {
                 // A MALFORMED matmul is an immediate hard stop (it must never bake);
@@ -1018,12 +1025,13 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
 /// `lower_matmul_node`'s `_quantized`). `ktir_groups_via_superdsc` mints them at exactly this grain for exactly this reason.
 pub fn lower_graph_to_superdsc<F: RopeForm>(
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
 ) -> Result<(Vec<EmittedOp>, BundleLayout), SuperDscError> {
     let (programs, mut bundle_layout) =
-        lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests)?;
+        lower_graph_to_ktir(ir, model_consts, weight_ids, active_cap, rows_are_requests)?;
     // The fact no KTIR states, read off the graph's own `AttnDecode` nodes and this walk's own
     // parameters — the same call `lower_subtile_tape_to_ktir`'s re-rolled walk makes.
     let attn_params = attn_bundle_params(ir, rows_are_requests);
@@ -1315,6 +1323,7 @@ pub(crate) fn tensor_shapes_of_ir<F: RopeForm>(
 /// the rows are a decode batch, whose chunking of that walk the batched kernel reads.
 pub fn paged_step_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     active_cap: ActiveCap,
     paged_rows: scratchy_triton_splice::PagedRows,
 ) -> Result<Option<crate::wiring::PagedStep>, SuperDscError> {
@@ -1322,8 +1331,15 @@ pub fn paged_step_of_ir<F: RopeForm>(
     let slots = scratchy_triton_splice::PAGE_SLOTS;
     let mut out: Option<crate::wiring::PagedStep> = None;
     for n in &ir.nodes {
-        let SubOp::AttnDecode { geom, .. } = &n.op else {
+        let SubOp::AttnDecode { mask, .. } = &n.op else {
             continue;
+        };
+        // The class's kv-head count off the one struct, by the mask's class — the selection
+        // rule every lowering shares (sliding arms the base pair, full arms the global one).
+        let nkvh = if mask.window().is_some() {
+            model_consts.num_kv_heads
+        } else {
+            model_consts.num_global_kv_heads
         };
         let cache = n.inputs.get(1).ok_or_else(|| {
             SuperDscError(format!(
@@ -1354,7 +1370,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
             pages,
             page_slots: slots,
             rows: mq,
-            nkvh: geom.nkvh().get(),
+            nkvh,
             walk,
             paged_rows,
         };
@@ -1386,6 +1402,7 @@ pub fn graph_wiring<F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     paged_rows: scratchy_triton_splice::PagedRows,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
 ) -> Result<BundleWiring, SuperDscError> {
     // ⛔ A REGISTRY, NOT A PLACEMENT — the wiring reads ONE kind of thing off the layout: the
     // registries ([`WiringRegistries`]). The placement pass [`compute_bundle_layout`] computed
@@ -1399,31 +1416,45 @@ pub fn graph_wiring<F: RopeForm>(
     // card.
     let _ = weight_ids;
     let registries = WiringRegistries {
-        scalarmul_scales: crate::lower_subtile_tape_to_superdsc::bundle_registry(ir, paged_rows)?,
+        scalarmul_scales: crate::lower_subtile_tape_to_superdsc::bundle_registry(
+            ir,
+            model_consts,
+            paged_rows,
+        )?,
         // Same rule as the placement pass's own field: the fold list the worker applies to
         // staged bytes at load, keyed by weight tid (the `SubtileId` half is a placement-pass
         // fact and does not ship).
-        weight_scale_folds: weight_scale_folds(ir)
+        weight_scale_folds: weight_scale_folds(ir, model_consts)
             .into_iter()
             .map(|(_, tid, scale)| (tid, scale))
             .collect(),
         // ⭐ THE CLASS REGISTRIES, here too — the door resolves a rope/attn program's P/identity
         // class through these, and this pass lowers through the door. Same shared helper, same
         // tape, so the wiring's answer and the placement pass's cannot disagree.
-        rope_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(ir.nodes.iter().filter_map(
-            |n| match &n.op {
-                SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
-                    Some(head_dim.get())
-                }
+        // The classes' head dims off the one struct, by each op's own class — the selection
+        // rule every lowering shares: sliding arms read `head_dim`, full arms `global_head_dim`.
+        rope_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(
+            ir.nodes.iter().filter_map(|n| match &n.op {
+                SubOp::RopeRotate { attn, .. } | SubOp::RopeAppend { attn, .. } => Some(
+                    if attn.window().is_some() {
+                        model_consts.head_dim
+                    } else {
+                        model_consts.global_head_dim
+                    },
+                ),
                 _ => None,
-            },
-        )),
-        attn_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(ir.nodes.iter().filter_map(
-            |n| match &n.op {
-                SubOp::AttnDecode { geom, .. } => Some(geom.hd().get()),
+            }),
+        ),
+        attn_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(
+            ir.nodes.iter().filter_map(|n| match &n.op {
+                SubOp::AttnDecode { mask, .. } => Some(if mask.window().is_some() {
+                    model_consts.head_dim
+                } else {
+                    model_consts.global_head_dim
+                }),
                 _ => None,
-            },
-        )),
+            }),
+        ),
     };
     // ⭐ EVERY NODE IS LOWERED ON ITS OWN, so they are lowered IN PARALLEL and folded IN ORDER. Each
     // node's arm is a pure function of the node and the graph (the kernel memos it reaches are
@@ -1445,7 +1476,7 @@ pub fn graph_wiring<F: RopeForm>(
         ir.nodes
             .par_iter()
             .map(|node| {
-                let ops = match lower_one_node(node, ir, ActiveCap::FULL, false) {
+                let ops = match lower_one_node(node, ir, model_consts, ActiveCap::FULL, false) {
                     NodeLowering::Ops(v) => v,
                     // A host-routed op runs off the device, so it has no program and binds nothing. It
                     // still occupies a position in the node order, so it contributes an empty entry.
@@ -1532,7 +1563,7 @@ pub fn graph_wiring<F: RopeForm>(
     // union of its matmul consumers' view regions (the widen keeps the tied embed
     // weight's STATED cols at the pad while the host stages the real vocab region).
     let tensor_shapes: Vec<(u32, u32)> = tensor_shapes_of_ir(ir)?;
-    let paged = paged_step_of_ir(ir, active_cap, paged_rows)?;
+    let paged = paged_step_of_ir(ir, model_consts, active_cap, paged_rows)?;
     let attn_mask = match (mask, paged) {
         (Some((mid, cap)), Some(p)) => {
             // The step's three sources are RESERVED tids (their shapes are the paged step's own
@@ -1595,7 +1626,7 @@ pub fn graph_wiring<F: RopeForm>(
         nodes,
         num_sources: ir.num_sources,
         result_tensor: ir.result.index() as u32,
-        result_dtype: result_dtype_of_ir(ir)?,
+        result_dtype: result_dtype_of_ir(ir, model_consts)?,
         tensor_shapes,
         attn_mask,
         paged,
@@ -1836,6 +1867,7 @@ pub fn chain_of_ir<F: RopeForm>(ir: &SubtileIR<F>) -> crate::wiring::ChainFact {
 /// sample kernel itself compiles once.
 pub fn staggered_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
 ) -> Result<
     std::collections::BTreeMap<u32, ktir_superdsc::element_arrangement::ElementArrangement>,
     SuperDscError,
@@ -1846,7 +1878,7 @@ pub fn staggered_of_ir<F: RopeForm>(
         .iter()
         .filter(|n| matches!(n.op, SubOp::Sample { .. }))
     {
-        let ops = match lower_one_node(node, ir, ActiveCap::FULL, false) {
+        let ops = match lower_one_node(node, ir, model_consts, ActiveCap::FULL, false) {
             NodeLowering::Ops(v) => v,
             NodeLowering::HostRouted(_) => continue,
             NodeLowering::Unhandled(why) => return Err(SuperDscError(why)),
@@ -1987,13 +2019,14 @@ pub fn sample_seat_of_ir<F: RopeForm>(
 /// on exactly that fact, never on the op's name.
 pub fn result_dtype_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
 ) -> Result<scratchy_tensors::DType, SuperDscError> {
     let node = ir
         .nodes
         .iter()
         .find(|n| n.output.tensor == ir.result)
         .expect("validate demands the result is an op output, so it has a writer");
-    let dfs = scratchy_triton_splice::operand_dfs(node, ir)
+    let dfs = scratchy_triton_splice::operand_dfs(node, ir, model_consts)
         .map_err(|e| SuperDscError(format!("the result's dtype: {e}")))?;
     let Some(dfs) = dfs else {
         return Ok(scratchy_tensors::DType::F16);
@@ -2037,8 +2070,9 @@ pub fn result_dtype_of_ir<F: RopeForm>(
 pub fn node_output_on_f16_stick<F: RopeForm>(
     node: &scratchy_subtile::subtile_ir::SubtileNode<F>,
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
 ) -> bool {
-    let dfs = match scratchy_triton_splice::operand_dfs(node, ir) {
+    let dfs = match scratchy_triton_splice::operand_dfs(node, ir, model_consts) {
         Ok(Some(dfs)) => dfs,
         // A native op, or a spliced ROW without a kernel signature (attention,
         // whose widths are the door's statement): the f16 stick.
@@ -2071,6 +2105,7 @@ pub fn node_output_on_f16_stick<F: RopeForm>(
 pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     tape: &scratchy_subtile::subtile_tape::SubtileTape,
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     weight_ids: &std::collections::HashSet<u32>,
     // Swept KV extent for the decode attention (paged-attn ladder rung); FULL ⇒ full cap (byte-identical).
     // The driver calls this once per rung with a different `active_cap`; every rung shares the SAME
@@ -2109,6 +2144,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // boundaries to know which (class, iteration) launches must stay in one bank.
     let mut bundle_layout = compute_bundle_layout(
         ir,
+        model_consts,
         weight_ids,
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
         &per_layer_ext,
@@ -2524,7 +2560,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                         group_weight_banks[seg].insert(p.bank);
                     }
                 }
-                match lower_one_node(n, ir, active_cap, rows_are_requests) {
+                match lower_one_node(n, ir, model_consts, active_cap, rows_are_requests) {
                     NodeLowering::Ops(v) => {
                         if seg == 0 {
                             prefix.extend(v);
@@ -3439,23 +3475,21 @@ mod attn_scale_weight_fold_tests {
     /// UP-multiplier on the projection weights), so an emptiness observed here is the switch's
     /// own refusal, never the gate's; granite's real 1/64 is pinned on the refusal side in
     /// `lower_subtile_tape_to_superdsc` and the models crate.
+    /// The tests' model facts: the fixture struct at the graph's own attention scale — the one
+    /// fact `attn_scale_weight_folds` / `weight_scale_folds` read off the struct.
+    fn fold_consts(scale: f32) -> scratchy_subtile::model_consts::MetalModelConsts {
+        let mut c = scratchy_subtile::fixtures::fixture_model_consts(16, 8, 8);
+        c.attn_scale = scale;
+        c
+    }
+
     fn attn_graph(
-        scale: f32,
         q_unroped: bool,
         k_unroped: bool,
         shared_w_q: bool,
         shared_q_product: bool,
         shared_roped_q: bool,
     ) -> SubtileIR {
-        // granite's own geometry through the same mint the config path uses, scaled down: the
-        // recognizer reads only `scale`, so the geometry is inert — it just has to exist.
-        let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
-            scratchy_subtile::model_geometry::QueryHeads::new(2),
-            scratchy_subtile::model_geometry::KvHeads::new(1),
-            scratchy_subtile::model_geometry::HeadDim::new(8),
-        )
-        .expect("2 query heads over 1 kv head, head_dim 8, mints");
-        let hd = scratchy_subtile::model_geometry::HeadDim::new(8);
         let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
         let sources = vec![
             shape(1, 8),  // 0: x (hidden 8)
@@ -3490,7 +3524,7 @@ mod attn_scale_weight_fold_tests {
             },
             // 1: q_rot = rope_rotate(q, cos, sin)
             OpDesc {
-                op: SubOp::rope_rotate(hd),
+                op: SubOp::rope_rotate(scratchy_subtile::subtile_ir::AttnMask::Causal),
                 m: 1,
                 inputs: vec![InputRef::Op(0), InputRef::Ext(6), InputRef::Ext(7)],
             },
@@ -3506,7 +3540,6 @@ mod attn_scale_weight_fold_tests {
             // 3: k_rot = rope_append(k, cos, sin, v, prefix_k, prefix_v) — writing the paged cache
             OpDesc {
                 op: SubOp::rope_append(
-                    hd,
                     0,
                     scratchy_subtile::subtile_ir::AttnMask::Causal,
                     scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
@@ -3523,12 +3556,7 @@ mod attn_scale_weight_fold_tests {
             },
             // 4: attn = AttnDecode(q_rot, prefix_k, prefix_v, k_rot, v)
             OpDesc {
-                op: SubOp::attn_decode(
-                    geom,
-                    scale,
-                    33,
-                    scratchy_subtile::subtile_ir::AttnMask::Causal,
-                ),
+                op: SubOp::attn_decode(33, scratchy_subtile::subtile_ir::AttnMask::Causal),
                 m: 1,
                 inputs: vec![
                     q_ref,
@@ -3589,14 +3617,14 @@ mod attn_scale_weight_fold_tests {
     /// (√4.0 = 2.0): the one class the f16 floor gate permits.
     #[test]
     fn the_attention_scale_folds_into_both_projection_weights() {
-        let ir = attn_graph(4.0, false, false, false, false, false);
+        let ir = attn_graph(false, false, false, false, false);
         assert_eq!(
-            attn_scale_weight_folds(&ir),
+            attn_scale_weight_folds(&ir, &fold_consts(4.0)),
             vec![(SubtileId::from_index(4), 1, 2, 2.0f32)],
             "the fold names W_q (source 1) and W_k (source 2), each at √scale"
         );
         assert_eq!(
-            weight_scale_folds(&ir),
+            weight_scale_folds(&ir, &fold_consts(4.0)),
             vec![
                 (SubtileId::from_index(4), 1, 2.0f32),
                 (SubtileId::from_index(4), 2, 2.0f32),
@@ -3613,13 +3641,6 @@ mod attn_scale_weight_fold_tests {
     #[test]
     fn the_fp8_attention_folds_into_the_dequant_rows() {
         let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
-        let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
-            scratchy_subtile::model_geometry::QueryHeads::new(2),
-            scratchy_subtile::model_geometry::KvHeads::new(1),
-            scratchy_subtile::model_geometry::HeadDim::new(8),
-        )
-        .expect("2 query heads over 1 kv head, head_dim 8, mints");
-        let hd = scratchy_subtile::model_geometry::HeadDim::new(8);
         let input = LoweringInput {
             sources: vec![
                 shape(1, 8),  // 0: x
@@ -3643,7 +3664,7 @@ mod attn_scale_weight_fold_tests {
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1), InputRef::Ext(2)],
                 },
                 OpDesc {
-                    op: SubOp::rope_rotate(hd),
+                    op: SubOp::rope_rotate(scratchy_subtile::subtile_ir::AttnMask::Causal),
                     m: 1,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(8), InputRef::Ext(9)],
                 },
@@ -3657,7 +3678,6 @@ mod attn_scale_weight_fold_tests {
                 },
                 OpDesc {
                     op: SubOp::rope_append(
-                        hd,
                         0,
                         scratchy_subtile::subtile_ir::AttnMask::Causal,
                         scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
@@ -3673,12 +3693,7 @@ mod attn_scale_weight_fold_tests {
                     ],
                 },
                 OpDesc {
-                    op: SubOp::attn_decode(
-                        geom,
-                        4.0,
-                        33,
-                        scratchy_subtile::subtile_ir::AttnMask::Causal,
-                    ),
+                    op: SubOp::attn_decode(33, scratchy_subtile::subtile_ir::AttnMask::Causal),
                     m: 1,
                     inputs: vec![
                         InputRef::Op(1),
@@ -3695,7 +3710,7 @@ mod attn_scale_weight_fold_tests {
         let nb = std::num::NonZeroU32::new(8192).expect("8192 != 0");
         let ir = scratchy_subtile::subtile_ir::lower_region(&input, nb);
         assert_eq!(
-            attn_scale_weight_folds(&ir),
+            attn_scale_weight_folds(&ir, &fold_consts(4.0)),
             vec![(SubtileId::from_index(4), 2, 4, 2.0f32)],
             "the fp8 fold targets the ws dequant rows (sources 2 and 4), never the quantized \
              payloads (1 and 3)"
@@ -3706,9 +3721,9 @@ mod attn_scale_weight_fold_tests {
     /// `matmul → rope → attention` chain, stated as a shape, and a non-rope producer is not it.
     #[test]
     fn an_unroped_query_refuses_the_fold() {
-        let ir = attn_graph(4.0, true, false, false, false, false);
+        let ir = attn_graph(true, false, false, false, false);
         assert!(
-            attn_scale_weight_folds(&ir).is_empty(),
+            attn_scale_weight_folds(&ir, &fold_consts(4.0)).is_empty(),
             "a non-rope producer of q must keep its multiplies as ops"
         );
     }
@@ -3717,9 +3732,9 @@ mod attn_scale_weight_fold_tests {
     /// scaling only W_q would leave the scores at `q·kᵀ·(s/√s)`.
     #[test]
     fn an_unroped_key_refuses_the_whole_fold() {
-        let ir = attn_graph(4.0, false, true, false, false, false);
+        let ir = attn_graph(false, true, false, false, false);
         assert!(
-            attn_scale_weight_folds(&ir).is_empty(),
+            attn_scale_weight_folds(&ir, &fold_consts(4.0)).is_empty(),
             "a non-rope producer of new_k must refuse the whole fold, not fold W_q alone"
         );
     }
@@ -3728,9 +3743,9 @@ mod attn_scale_weight_fold_tests {
     /// per-consumer scale cannot ride it.
     #[test]
     fn a_shared_projection_table_refuses_the_fold() {
-        let ir = attn_graph(4.0, false, false, true, false, false);
+        let ir = attn_graph(false, false, true, false, false);
         assert!(
-            attn_scale_weight_folds(&ir).is_empty(),
+            attn_scale_weight_folds(&ir, &fold_consts(4.0)).is_empty(),
             "a weight another matmul reads must keep its multiplies as ops"
         );
     }
@@ -3738,9 +3753,9 @@ mod attn_scale_weight_fold_tests {
     /// A second reader of the projection's product needs the UNSCALED product.
     #[test]
     fn a_second_reader_of_the_projection_product_refuses_the_fold() {
-        let ir = attn_graph(4.0, false, false, false, true, false);
+        let ir = attn_graph(false, false, false, true, false);
         assert!(
-            attn_scale_weight_folds(&ir).is_empty(),
+            attn_scale_weight_folds(&ir, &fold_consts(4.0)).is_empty(),
             "a shared projection product must keep its multiplies as ops"
         );
     }
@@ -3749,9 +3764,9 @@ mod attn_scale_weight_fold_tests {
     /// tensor's value, which is its whole point.
     #[test]
     fn a_second_reader_of_the_roped_query_refuses_the_fold() {
-        let ir = attn_graph(4.0, false, false, false, false, true);
+        let ir = attn_graph(false, false, false, false, true);
         assert!(
-            attn_scale_weight_folds(&ir).is_empty(),
+            attn_scale_weight_folds(&ir, &fold_consts(4.0)).is_empty(),
             "a shared roped query must keep its multiplies as ops"
         );
     }
@@ -3760,9 +3775,9 @@ mod attn_scale_weight_fold_tests {
     /// afterward, which is what makes the recognition idempotent.
     #[test]
     fn a_scale_of_one_folds_nothing() {
-        let ir = attn_graph(1.0, false, false, false, false, false);
+        let ir = attn_graph(false, false, false, false, false);
         assert!(
-            attn_scale_weight_folds(&ir).is_empty(),
+            attn_scale_weight_folds(&ir, &fold_consts(1.0)).is_empty(),
             "a scale of 1.0 multiplies nothing and must fold nothing"
         );
     }

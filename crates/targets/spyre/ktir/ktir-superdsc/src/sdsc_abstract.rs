@@ -331,9 +331,8 @@ impl<const MQ: u32> Rung<MQ> {
 ///   and those arms only name ladder widths.
 ///
 /// [`of_bundle`](Self::of_bundle) is the ONE parse boundary from a runtime `(mq, rows_are_requests)`
-/// pair to the law — the same boundary discipline as the geometry door
-/// (`scratchy_subtile::model_geometry::with_config_attn_geometry`): a decode width the ladder does not bake
-/// is a refusal (`None` → a loud bake error at the caller), never a silent pad.
+/// pair to the law: a decode width the ladder does not bake is a refusal (`None` → a loud bake
+/// error at the caller), never a silent pad.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PaddedMq {
     mq: QueryRowCount,
@@ -398,76 +397,6 @@ impl PaddedMq {
     }
 }
 
-/// ⭐⭐⭐⭐⭐ THE MODEL'S ATTENTION-HEAD GEOMETRY, AS A TYPE — `AttnGeometry<NQH, NKVH, HD>` can only
-/// be named at a (query-head count, kv-head count, head-dim) triple whose GQA grouping exists.
-///
-/// scratchy is a per-model compiler: `arch-<name>`/`<stem>` (scratchy-models)
-/// and `<preset>` (scratchy-quantizations) Cargo features pin the model set
-/// at cargo-build time, the
-/// `#[forward]` macro expands with the full geometry known, and the SuperDSC lowering runs DURING
-/// that expansion — so the head counts are bake-time constants of the bundle, exactly like the
-/// decode width [`Rung`] carries. This is their carrier: three const generics on one ZST, so a
-/// geometry conflation (an nqh/nkvh transposition, a head dim from another model) is a BUILD error
-/// where a trio of `u32` parameters would bake cleanly and garble on-card.
-///
-/// * [`GQA`](Self::GQA) is the group size WITH ITS PROOF: a triple where `NKVH` does not divide
-///   `NQH` (or either count is zero) fails const evaluation, so a non-dividing pair is a type that
-///   does not instantiate. There is no runtime arm left to fudge one — `(nqh / nkvh.max(1)).max(1)`
-///   was that arm, and at a non-dividing pair it yields a plausible group size whose attention
-///   reads another head's keys: fluent wrong output, never a fault.
-/// * [`minted`](Self::minted) is the only constructor and it spends the proof, so HOLDING a value
-///   of this type is holding the divisibility fact.
-/// * the counts leave through doors that carry their own facts: [`nqh_nz`](Self::nqh_nz) is the
-///   `NonZeroU32` the head iterators ([`QueryHead::all`], [`KvHead::all`]) take, nonzero by the
-///   same const evaluation, so no call site discharges an `Option` for a question the type already
-///   answered.
-///
-/// The value→const boundary is `scratchy_subtile::model_geometry::with_config_attn_geometry` — the same
-/// door discipline as [`PaddedMq::of_bundle`]'s decode ladder: the tape carries a
-/// `ModelAttnGeometry` because the emitter crate is one
-/// binary serving every model, and the door's arm is where the number the macro parsed from the
-/// model config meets the type. Its arms are GENERATED from the model configs in scope, so a
-/// geometry no config declares is a loud bake error, answered by a `config.json`.
-///
-/// [`crate::addr::Shape`] is the ADDRESS-side face of the same facts (it hands out nests; its
-/// fourth parameter is the KV capacity, which today still reaches the emitter as a value); this
-/// type is the EMITTER-side carrier that travels through `assemble_attn`'s signature.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct AttnGeometry<const NQH: u32, const NKVH: u32, const HD: u32>(());
-
-impl<const NQH: u32, const NKVH: u32, const HD: u32> AttnGeometry<NQH, NKVH, HD> {
-    /// The GQA group size, `NQH / NKVH` — evaluating it IS the divisibility proof.
-    pub(crate) const GQA: u32 = {
-        assert!(
-            NQH >= 1,
-            "AttnGeometry: a model has at least one query head"
-        );
-        assert!(NKVH >= 1, "AttnGeometry: a model has at least one kv head");
-        assert!(
-            NQH.is_multiple_of(NKVH),
-            "AttnGeometry: NKVH must divide NQH — a non-dividing pair has no GQA grouping, so it \
-             is not a geometry the attention emitter can name"
-        );
-        NQH / NKVH
-    };
-
-    /// The only constructor. Naming a triple through here evaluates [`GQA`](Self::GQA), so every
-    /// held value carries the proof.
-    pub const fn minted() -> AttnGeometry<NQH, NKVH, HD> {
-        let _proof: u32 = Self::GQA;
-        AttnGeometry(())
-    }
-
-    /// The query-head count, spent as a value.
-    pub const fn nqh(self) -> u32 {
-        NQH
-    }
-
-    /// The kv-head count, spent as a value.
-    pub const fn nkvh(self) -> u32 {
-        NKVH
-    }
-}
 
 /// ⭐ WHAT A DECODE DISPATCH ARM RUNS with the const width it named — the consumer side of
 /// [`with_baked_rung`]. The method is generic over `MQ` because that is the whole point of the

@@ -504,8 +504,11 @@ pub fn weight_segment_parity(ledger: &[(String, u64, Vec<u64>)]) -> Result<(), S
 /// re-rolled bake and then panicked in the wiring on a layout nobody reads. Any fact this
 /// needs must stay a pure walk — a placement-derived input would rebuild that refusal one
 /// field at a time.
-pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
-    let weight_scale_folds = crate::lower_subtile_tape_to_ktir::weight_scale_folds(ir);
+pub(crate) fn scalar_registry<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
+) -> Vec<f32> {
+    let weight_scale_folds = crate::lower_subtile_tape_to_ktir::weight_scale_folds(ir, model_consts);
     // ⭐ EXCEPT THE WEIGHT-FOLDED ONES: a multiplier that commutes into its matmul's weight
     //    never becomes a device op, so its scale never enters this registry either — the
     //    worker applies it to the staged weight bytes instead. The skip is by NODE, not by
@@ -554,8 +557,12 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
             // floor `0.0` (the running sum and output start at it, and `-relu(scores_max -
             // tile_max)` floors at it), and its max seed `-inf`. A weight-folded attention runs at `SCALE = 1.0` (its √scale rides
             // W_q/W_k) and still states the multiply, so its 1.0 is the value it reads.
-            SubOp::AttnDecode { scale, .. } => {
-                let multiplier = if folded_node(node.id) { 1.0 } else { *scale };
+            SubOp::AttnDecode { .. } => {
+                let multiplier = if folded_node(node.id) {
+                    1.0
+                } else {
+                    model_consts.attn_scale
+                };
                 for v in [multiplier, 0.0, f32::NEG_INFINITY] {
                     push_scale(v, &mut scalarmul_scales);
                 }
@@ -619,13 +626,15 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
 /// door's refusal, never a silent slot.
 pub fn bundle_registry<F: RopeForm>(
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     paged_rows: scratchy_triton_splice::PagedRows,
 ) -> Result<Vec<f32>, SuperDscError> {
     use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
-    let mut registry = scalar_registry(ir);
+    let mut registry = scalar_registry(ir, model_consts);
     let rows_are_requests = paged_rows == scratchy_triton_splice::PagedRows::Batch;
     for node in &ir.nodes {
-        let NodeLowering::Ops(ops) = lower_one_node(node, ir, ActiveCap::FULL, rows_are_requests)
+        let NodeLowering::Ops(ops) =
+            lower_one_node(node, ir, model_consts, ActiveCap::FULL, rows_are_requests)
         else {
             continue;
         };
@@ -681,15 +690,12 @@ pub fn bundle_registry<F: RopeForm>(
 /// f16 image twice.
 ///
 /// Returns whether anything was staged — `false` leaves the caller free to use the
-/// original node.
+/// original node. (An `AttnDecode` states no scalar of its own anymore — its scale is the
+/// model-facts struct's, and the golden stages the struct copy it evals with.)
 fn stage_registry_scalars<F: RopeForm>(op: &mut SubOp<F>) -> bool {
     let stage = |v: &mut f32| *v = half::f16::from_f32(*v).to_f32();
     match op {
         SubOp::ScalarMul { scale } => {
-            stage(scale);
-            true
-        }
-        SubOp::AttnDecode { scale, .. } => {
             stage(scale);
             true
         }
@@ -744,6 +750,7 @@ pub fn kv_pool_tids<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<u32> {
 
 pub fn compute_bundle_layout<F: RopeForm>(
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     weight_ids: &std::collections::HashSet<u32>,
     // ⭐ THE LAYER STRUCTURE, so the weight segment can be split into BANKS at a LAYER boundary —
     // see [`bank_weight_segment`]. ONE MAP PER ATTENTION CLASS (a hybrid model's classes have
@@ -788,7 +795,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     let kernel_dfs: std::collections::BTreeMap<u32, Df> = {
         let mut m: std::collections::BTreeMap<u32, Df> = Default::default();
         for n in &ir.nodes {
-            let Some(dfs) = scratchy_triton_splice::operand_dfs(n, ir).ok().flatten() else {
+            let Some(dfs) = scratchy_triton_splice::operand_dfs(n, ir, model_consts).ok().flatten() else {
                 continue;
             };
             for &(tid, df) in &dfs {
@@ -880,7 +887,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // and the placement alias below key on `scalarmul_folds` and never on the union — an
     // attention fold's node STAYS (at scale 1.0), its output is a real intermediate, and
     // aliasing it to the query's bytes would hand every attention consumer the query buffer.
-    let weight_scale_folds = crate::lower_subtile_tape_to_ktir::weight_scale_folds(ir);
+    let weight_scale_folds =
+        crate::lower_subtile_tape_to_ktir::weight_scale_folds(ir, model_consts);
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     let n_nodes = ir.nodes.len();
     let mut first_def: std::collections::BTreeMap<u32, usize> = Default::default();
@@ -1083,11 +1091,17 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // program's class off `BundleLayout::rope_class_hds` and the worker's load-time bind builds
     // each class's table from the same list the macro bakes into the wiring — so THIS loop's set
     // (via the shared `rope_p_class_hds` helper) is the one source of truth for all three.
+    // The classes' head dims off the one struct, by each op's own class — the selection rule
+    // every lowering shares: sliding arms read `head_dim`, full arms `global_head_dim`.
     let rope_class_hds = ktir_superdsc::reserved_tids::rope_p_class_hds(
         ir.nodes.iter().filter_map(|n| match &n.op {
-            SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
-                Some(head_dim.get())
-            }
+            SubOp::RopeRotate { attn, .. } | SubOp::RopeAppend { attn, .. } => Some(
+                if attn.window().is_some() {
+                    model_consts.head_dim
+                } else {
+                    model_consts.global_head_dim
+                },
+            ),
             _ => None,
         }),
     );
@@ -1161,7 +1175,11 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // worker's load-time bind builds each class's table from.
     let attn_class_hds = ktir_superdsc::reserved_tids::rope_p_class_hds(
         ir.nodes.iter().filter_map(|n| match &n.op {
-            SubOp::AttnDecode { geom, .. } => Some(geom.hd().get()),
+            SubOp::AttnDecode { mask, .. } => Some(if mask.window().is_some() {
+                model_consts.head_dim
+            } else {
+                model_consts.global_head_dim
+            }),
             _ => None,
         }),
     );
@@ -1466,7 +1484,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    only the placement: a `[1,1]` worker-bound const per scale in seg0 (ACTIVATION,
     //    exactly like ATTN_SCALE). The pointwise `mul` the door lowers reads the index here →
     //    the const TID it multiplies by; the worker binds each `t{tid}=[scale]`.
-    let scalarmul_scales = bundle_registry(ir, paged_rows)?;
+    let scalarmul_scales = bundle_registry(ir, model_consts, paged_rows)?;
     for i in 0..scalarmul_scales.len() {
         let a = SegRole::Activation.segment();
         let off = seg_bytes[a];
@@ -1492,8 +1510,12 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    in the intermediate segment, which neither a layer's launch nor a walk's relaunch shifts
     //    (the KV segment moves with every layer). `PagedStep::card_placements` is
     //    the one statement of what they are and how big — the card stagers stage within it.
-    if let Some(step) =
-        crate::lower_subtile_tape_to_ktir::paged_step_of_ir(ir, ActiveCap::FULL, paged_rows)?
+    if let Some(step) = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
+        ir,
+        model_consts,
+        ActiveCap::FULL,
+        paged_rows,
+    )?
     {
         for (tid, seat, size) in step.card_placements() {
             let role = match seat {
@@ -2270,13 +2292,24 @@ pub fn dbg_synth_val(id: usize, j: usize) -> f32 {
 /// d<half — an index collision, not a pass). Keyed by source tid; a tid shared by
 /// rope nodes of different `head_dim` would be an IR inconsistency (the bridge
 /// memoizes tables by `(cols, local)`, so one tid is one `(width, hd)` table).
-pub fn rope_table_periods<F: RopeForm>(ir: &SubtileIR<F>) -> std::collections::HashMap<u32, usize> {
+pub fn rope_table_periods<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
+) -> std::collections::HashMap<u32, usize> {
     ir.nodes
         .iter()
         .filter_map(|n| match &n.op {
-            SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
-                Some((n, head_dim.get() as usize / 2))
-            }
+            // The class's head dim off the one struct, by the op's own class — the selection
+            // rule every lowering shares: sliding arms read `head_dim`, full arms the global one.
+            SubOp::RopeRotate { attn, .. } | SubOp::RopeAppend { attn, .. } => Some((
+                n,
+                (if attn.window().is_some() {
+                    model_consts.head_dim
+                } else {
+                    model_consts.global_head_dim
+                }) as usize
+                    / 2,
+            )),
             _ => None,
         })
         .flat_map(|(n, half)| {
@@ -2309,10 +2342,11 @@ const FP8_SYNTH_SCALE: f32 = 512.0;
 /// would hide it on both sides.
 pub fn staged_rope_rows<F: RopeForm>(
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     rotary_cos: &[(u32, crate::wiring::RotaryKind)],
     rotary_sin: &[(u32, crate::wiring::RotaryKind)],
 ) -> Result<std::collections::HashMap<u32, Vec<f32>>, String> {
-    let rope_table_half = rope_table_periods(ir);
+    let rope_table_half = rope_table_periods(ir, model_consts);
     let mut out = std::collections::HashMap::new();
     for (classes, want_cos) in [(rotary_cos, true), (rotary_sin, false)] {
         for &(tid, kind) in classes {
@@ -2517,6 +2551,7 @@ impl StagedWeightView<'_> {
 /// `weight_ids`.
 fn stage_synth_weights<F: RopeForm>(
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     weight_ids: &std::collections::HashSet<u32>,
     only: Option<&std::collections::HashSet<u64>>,
 ) -> StagedWeights {
@@ -2542,7 +2577,8 @@ fn stage_synth_weights<F: RopeForm>(
     }
     // ── The fold pre-scales: the same lists the staging states ──
     let sm_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
-    let attn_folds = crate::lower_subtile_tape_to_ktir::attn_scale_weight_folds(ir);
+    let attn_folds =
+        crate::lower_subtile_tape_to_ktir::attn_scale_weight_folds(ir, model_consts);
     let fold_scale = |tid: u32| -> f32 {
         sm_folds
             .iter()
@@ -2709,6 +2745,7 @@ fn stage_synth_weights<F: RopeForm>(
 /// cannot be skipped by forgetting to set one.
 pub(crate) fn eval_golden_buffers<F: RopeForm>(
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     staged_rope: &std::collections::HashMap<u32, Vec<f32>>,
     // The staged bytes the per-node materialization decodes — the SAME
     // product the emulator binds (see [`StagedWeightView`]). The fold
@@ -2734,7 +2771,8 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     // real program (1.0) — so the golden evaluates it at 1.0 over the pre-scaled W_q/W_k
     // (in the staged bytes), which is bit-for-bit the folded bundle's contract.
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
-    let attn_folds = crate::lower_subtile_tape_to_ktir::attn_scale_weight_folds(ir);
+    let attn_folds =
+        crate::lower_subtile_tape_to_ktir::attn_scale_weight_folds(ir, model_consts);
     let folded_node = |id: scratchy_subtile::subtile_ir::SubtileId| {
         scalarmul_folds.iter().any(|(fold_id, _, _)| *fold_id == id)
     };
@@ -2762,7 +2800,7 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     // decode keeps the period-`half` pattern per [`rope_table_periods`] —
     // there the tables are one row and the pattern agrees with the run-time
     // staging by construction.
-    let rope_table_half = rope_table_periods(ir);
+    let rope_table_half = rope_table_periods(ir, model_consts);
     // ⭐ WEIGHT SOURCES STAY EMPTY — materialized per node from the staged
     // bytes (see `weights`), never held as f32 beyond the node reading them;
     // a source the covering slice does not bind stays empty with its readers
@@ -2932,7 +2970,9 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     let off_f16_sticks: std::collections::HashSet<u64> = ir
         .nodes
         .iter()
-        .filter(|n| !crate::lower_subtile_tape_to_ktir::node_output_on_f16_stick(n, ir))
+        .filter(|n| !crate::lower_subtile_tape_to_ktir::node_output_on_f16_stick(
+            n, ir, model_consts,
+        ))
         .map(|n| n.output.tensor.index() as u64)
         .collect();
     for node in &ir.nodes {
@@ -2977,17 +3017,18 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
         // card's own DLF16 landings for those sticks are the EMULATOR's model
         // (`comm_sched::rmsnorm_scalar_sticks` → `Tile::compute_dlf16`), never the
         // reference's.
-        let mut attn_node;
-        let mut staged_node;
-        let node_ref = if let SubOp::AttnDecode { .. } = &node.op
+        // A weight-folded attention evaluates at the folded scale 1.0 over the pre-scaled
+        // W_q/W_k the staging minted — the op carries no scale to rewrite in a cloned node
+        // anymore, so the EVAL'S OWN consts copy states it (the struct is `Copy`).
+        let mut eval_consts = *model_consts;
+        if let SubOp::AttnDecode { .. } = &node.op
             && attn_folds.iter().any(|(id, ..)| *id == node.id)
         {
-            attn_node = node.clone();
-            if let SubOp::AttnDecode { scale, .. } = &mut attn_node.op {
-                *scale = 1.0;
-            }
-            &attn_node
-        } else {
+            eval_consts.attn_scale = 1.0;
+        }
+        let eval_consts = &eval_consts;
+        let mut staged_node;
+        let node_ref = {
             staged_node = node.clone();
             if stage_registry_scalars(&mut staged_node.op) {
                 &staged_node
@@ -2995,7 +3036,7 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
                 node
             }
         };
-        let mut out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &bufs);
+        let mut out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, eval_consts, &bufs);
         // The fp8 matmul's quant model (see the closures above): the ideal product over
         // the ROUND-TRIPPED payload, then the ws mulf — fold included — on the result.
         // The payload swap is temporary and per node: `eval_node` reads `inputs[1]` and
@@ -3015,7 +3056,7 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
             if !saved_weights.iter().any(|(t, _)| *t == w_tid) {
                 let saved = std::mem::take(&mut bufs[w_tid]);
                 bufs[w_tid] = saved.iter().map(|v| e4m3_rt(*v)).collect();
-                out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &bufs);
+                out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, eval_consts, &bufs);
                 bufs[w_tid] = saved;
             }
             let ws_eff = half::f16::from_f32(
@@ -3190,6 +3231,7 @@ fn region_slice(
 #[cfg(feature = "spyre-emu")]
 fn teacher_forced_walk<F: RopeForm>(
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     golden: &mut [Vec<f32>],
     emu: &std::collections::HashMap<u64, Vec<f32>>,
     tainted: &std::collections::HashSet<u32>,
@@ -3208,7 +3250,8 @@ fn teacher_forced_walk<F: RopeForm>(
 ) -> (Vec<Vec<f32>>, Vec<TeacherForcedRow>) {
     let nsrc = ir.num_sources as usize;
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
-    let attn_folds = crate::lower_subtile_tape_to_ktir::attn_scale_weight_folds(ir);
+    let attn_folds =
+        crate::lower_subtile_tape_to_ktir::attn_scale_weight_folds(ir, model_consts);
     let folded_node = |id: scratchy_subtile::subtile_ir::SubtileId| {
         scalarmul_folds.iter().any(|(fold_id, _, _)| *fold_id == id)
     };
@@ -3267,7 +3310,9 @@ fn teacher_forced_walk<F: RopeForm>(
     let off_f16_sticks: std::collections::HashSet<u64> = ir
         .nodes
         .iter()
-        .filter(|n| !crate::lower_subtile_tape_to_ktir::node_output_on_f16_stick(n, ir))
+        .filter(|n| !crate::lower_subtile_tape_to_ktir::node_output_on_f16_stick(
+            n, ir, model_consts,
+        ))
         .map(|n| n.output.tensor.index() as u64)
         .collect();
     let mut rows: Vec<TeacherForcedRow> = Vec::new();
@@ -3281,17 +3326,18 @@ fn teacher_forced_walk<F: RopeForm>(
         if covering.is_some_and(|c| !c.contains(&(node.output.tensor.index() as u64))) {
             continue;
         }
-        let mut attn_node;
-        let mut staged_node;
-        let node_ref = if let SubOp::AttnDecode { .. } = &node.op
+        // A weight-folded attention evaluates at the folded scale 1.0 over the pre-scaled
+        // W_q/W_k the staging minted — the op carries no scale to rewrite in a cloned node
+        // anymore, so the EVAL'S OWN consts copy states it (the struct is `Copy`).
+        let mut eval_consts = *model_consts;
+        if let SubOp::AttnDecode { .. } = &node.op
             && attn_folds.iter().any(|(id, ..)| *id == node.id)
         {
-            attn_node = node.clone();
-            if let SubOp::AttnDecode { scale, .. } = &mut attn_node.op {
-                *scale = 1.0;
-            }
-            &attn_node
-        } else {
+            eval_consts.attn_scale = 1.0;
+        }
+        let eval_consts = &eval_consts;
+        let mut staged_node;
+        let node_ref = {
             staged_node = node.clone();
             if stage_registry_scalars(&mut staged_node.op) {
                 &staged_node
@@ -3323,7 +3369,7 @@ fn teacher_forced_walk<F: RopeForm>(
                 tf[w] = vals;
             }
         }
-        let mut tf_out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &tf);
+        let mut tf_out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, eval_consts, &tf);
         if let SubOp::MatmulTile {
             weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
             ..
@@ -3336,7 +3382,7 @@ fn teacher_forced_walk<F: RopeForm>(
             if !saved_weights.iter().any(|(t, _)| *t == w_tid) {
                 let saved = std::mem::take(&mut tf[w_tid]);
                 tf[w_tid] = saved.iter().map(|v| e4m3_rt(*v)).collect();
-                tf_out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &tf);
+                tf_out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, eval_consts, &tf);
                 tf[w_tid] = saved;
             }
             let ws_eff = half::f16::from_f32(
@@ -3486,6 +3532,7 @@ fn teacher_forced_walk<F: RopeForm>(
 
 pub fn write_eval_golden<F: RopeForm>(
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     weight_ids: &std::collections::HashSet<u32>,
     dir: &std::path::Path,
     staged_rope: &std::collections::HashMap<u32, Vec<f32>>,
@@ -3496,9 +3543,9 @@ pub fn write_eval_golden<F: RopeForm>(
     // The full-depth staging (`None` — the DBG oracle states the whole
     // graph's law), with the golden materializing each node's weights from
     // it per node: the same product, the same values, no all-weights f32.
-    let staged = stage_synth_weights(ir, weight_ids, None);
+    let staged = stage_synth_weights(ir, model_consts, weight_ids, None);
     let view = staged.view();
-    let bufs = eval_golden_buffers(ir, staged_rope, &view, None);
+    let bufs = eval_golden_buffers(ir, model_consts, staged_rope, &view, None);
     // The scales manifest's skip set — the same folded-node predicate the walk used.
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     let folded_node = |id: scratchy_subtile::subtile_ir::SubtileId| {
@@ -3664,6 +3711,7 @@ pub struct GateRung<'a> {
 pub fn numeric_gate<F: RopeForm>(
     groups: &[bundle::LaunchGroup<'static>],
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     weight_ids: &std::collections::HashSet<u32>,
     // ⭐ THE RUNG UNDER TEST — see [`GateRung`]: the fingerprint every message
     // names and the capacity the decode mask stages, one fact.
@@ -3889,7 +3937,7 @@ pub fn numeric_gate<F: RopeForm>(
         bytes: mut emu_weights,
         gemm,
         scale_rows,
-    } = stage_synth_weights(ir, weight_ids, covering);
+    } = stage_synth_weights(ir, model_consts, weight_ids, covering);
     // ⭐ THE LOAD-TIME CONSTANTS — resident bytes at their TRUE dtypes, staged
     // into the session exactly as the worker stages them at load: each entry's
     // kind names the ONE builder (`LoadConst::build`) both legs call, so a
@@ -3909,7 +3957,7 @@ pub fn numeric_gate<F: RopeForm>(
     // merged map (see `staggered_of_ir`'s doc for why lowering the Sample node alone states
     // it), so the bytes this gate stages into the emulator are the worker's bytes: a table the
     // propagation marked is staged ALREADY PERMUTED by the same builder both legs call.
-    let staggered = crate::lower_subtile_tape_to_ktir::staggered_of_ir(ir).map_err(|e| e.0)?;
+    let staggered = crate::lower_subtile_tape_to_ktir::staggered_of_ir(ir, model_consts).map_err(|e| e.0)?;
     let load_consts =
         crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir, &staggered).map_err(|e| e.0)?;
     let load_const_tids: std::collections::HashSet<u32> =
@@ -3967,7 +4015,7 @@ pub fn numeric_gate<F: RopeForm>(
     //    keeping the prefix region's rows valid (the reference's own key set) ──
     // The rope cos/sin sources stage at their runtime contract — period-`half`,
     // per [`rope_table_periods`] — not as flat noise.
-    let rope_table_half = rope_table_periods(ir);
+    let rope_table_half = rope_table_periods(ir, model_consts);
     // ⭐ THE PREFILL ROPE ROWS — ONE LAW, BOTH LEGS (`staged_rope_rows`'s doc):
     // this product feeds the emulator's probe binds below AND the golden's
     // source buffers (`eval_golden_buffers`), so a staging defect cannot hide
@@ -3975,7 +4023,7 @@ pub fn numeric_gate<F: RopeForm>(
     // synth below — its tables are one row, where the periodic pattern and
     // the run-time staging agree by construction.
     let staged_rope: std::collections::HashMap<u32, Vec<f32>> = match prefill {
-        Some(pg) => staged_rope_rows(ir, &pg.rotary_cos, &pg.rotary_sin)?,
+        Some(pg) => staged_rope_rows(ir, model_consts, &pg.rotary_cos, &pg.rotary_sin)?,
         None => Default::default(),
     };
     // ⭐ THE PAGED STEP, STAGED BY THE WORKER'S OWN LAW (`crate::paged_step`). The gate's one step
@@ -3991,12 +4039,19 @@ pub fn numeric_gate<F: RopeForm>(
     // chunk's rows are one sequence's (the bake's `rows_are_requests`).
     let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
         ir,
+        model_consts,
         rung.active_cap,
         scratchy_triton_splice::PagedRows::of_requests(prefill.is_none()),
     )
     .map_err(|e| e.0)?;
     let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
-        SubOp::AttnDecode { geom, .. } => Some(geom.hd().get() as usize),
+        SubOp::AttnDecode { mask, .. } => Some(
+            (if mask.window().is_some() {
+                model_consts.head_dim
+            } else {
+                model_consts.global_head_dim
+            }) as usize,
+        ),
         _ => None,
     });
     let pool_tids: std::collections::HashSet<u32> = ir
@@ -4216,7 +4271,7 @@ pub fn numeric_gate<F: RopeForm>(
     // ── Compare at the floor, against the in-memory reference ──
     // `mut`: the teacher-forced walk borrows the golden's staged sources
     // through it (pointer-swapped per node, restored before return).
-    let mut eval_bufs = eval_golden_buffers(ir, &staged_rope, &view, covering);
+    let mut eval_bufs = eval_golden_buffers(ir, model_consts, &staged_rope, &view, covering);
     const CLEAN_TOL: f32 = 5e-3;
     // The fp8 chains' slack over CLEAN_TOL: the quant model makes the e4m3 grid and
     // the ws mulf COMMON to both sides and the f16-stick model puts every exchanged
@@ -4336,7 +4391,7 @@ pub fn numeric_gate<F: RopeForm>(
     // exactly (64/64 lanes); this states the same law for the rung's ANSWER,
     // post-re-point: the result compares EXACTLY (tolerance 0).
     let result_is_index = matches!(
-        crate::lower_subtile_tape_to_ktir::result_dtype_of_ir(ir),
+        crate::lower_subtile_tape_to_ktir::result_dtype_of_ir(ir, model_consts),
         Ok(scratchy_tensors::DType::I32) | Ok(scratchy_tensors::DType::U32)
     );
     for &(tid, _) in &compare {
@@ -4427,7 +4482,7 @@ pub fn numeric_gate<F: RopeForm>(
     //    tolerance — the pre-split rule — so no compared tensor escapes
     //    judgment.
     let (walk_tf, split) =
-        teacher_forced_walk(ir, &mut eval_bufs, &out, &tainted, &folded, &view, covering);
+        teacher_forced_walk(ir, model_consts, &mut eval_bufs, &out, &tainted, &folded, &view, covering);
     drop(walk_tf);
     let mut local_by_tid: std::collections::HashMap<u64, f32> =
         std::collections::HashMap::with_capacity(split.len());
@@ -4493,6 +4548,7 @@ pub fn numeric_gate<F: RopeForm>(
                 .collect();
             let (tf, _rows) = teacher_forced_walk(
                 ir,
+                model_consts,
                 &mut eval_bufs,
                 &overlay,
                 &tainted,
@@ -7861,10 +7917,12 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
 ) -> Result<RolledSuperDsc, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
         ir,
+        model_consts,
         weight_ids,
         active_cap,
         rows_are_requests,
@@ -8062,6 +8120,13 @@ mod tests {
         );
     }
     use super::*;
+
+    /// The tests' model facts: the fixture struct, uniform (global == base). Tests whose
+    /// graphs state an attention scale override `attn_scale` locally.
+    fn consts() -> scratchy_subtile::model_consts::MetalModelConsts {
+        scratchy_subtile::fixtures::fixture_model_consts(64, 32, 64)
+    }
+
     use scratchy_subtile::lower::GemmWeight;
     // ⛔ THIS WHOLE MODULE WAS DEAD. `matmul_opspec`/`matmul_dims`/`matmul_split_map`/
     // `reduce_opspec_df` moved out of this file into `ir::bridge::tiled_op_sdsc_op::{matmul,reduce}`
@@ -8247,6 +8312,7 @@ mod tests {
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
         let layout = compute_bundle_layout(
             &ir,
+            &consts(),
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
@@ -8364,6 +8430,7 @@ mod tests {
         mint_sample(&mut minted, SampleRows::All);
         let l_plain = compute_bundle_layout(
             &plain,
+            &consts(),
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
@@ -8371,6 +8438,7 @@ mod tests {
         .expect("plain lays out");
         let l_minted = compute_bundle_layout(
             &minted,
+            &consts(),
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
@@ -8467,6 +8535,7 @@ mod tests {
         mint_sample(&mut minted, SampleRows::All);
         let layout = compute_bundle_layout(
             &minted,
+            &consts(),
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
@@ -8788,7 +8857,7 @@ mod tests {
             let (_, ir) = build(m);
             // t1 is the lm_head weight; t0 is the activation source.
             let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-            lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
+            lower_graph_to_superdsc(&ir, &consts(), &weight_ids, ActiveCap::FULL, false)
                 .map(|(ops, _)| ops.into_iter().map(|e| e.op_name).collect::<Vec<_>>())
         };
         // m>1 (prefill): the tail FOLDS — the splice's `lmlast.py` extraction (its own program,
@@ -8831,12 +8900,13 @@ mod tests {
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
         let layout = compute_bundle_layout(
             &ir,
+            &consts(),
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
         .expect("the tail's layout mints");
-        let mut programs = scratchy_triton_splice::lower_all(&node, &ir, false)
+        let mut programs = scratchy_triton_splice::lower_all(&node, &ir, &consts(), false)
             .expect("the splice's fold mints the tail");
         let extract = programs
             .iter_mut()
@@ -8915,6 +8985,7 @@ mod tests {
         let ir = build(GemmWeight::Fp8Dynamic);
         let layout = compute_bundle_layout(
             &ir,
+            &consts(),
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
@@ -8929,6 +9000,7 @@ mod tests {
         let ir = build(GemmWeight::Dense);
         let layout = compute_bundle_layout(
             &ir,
+            &consts(),
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
@@ -9008,7 +9080,7 @@ mod tests {
             op_output: Vec::new(),
         };
         let weight_ids: std::collections::HashSet<u32> = [1u32, 3u32].into_iter().collect();
-        let (ops, _layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
+        let (ops, _layout) = lower_graph_to_superdsc(&ir, &consts(), &weight_ids, ActiveCap::FULL, false)
             .expect("two-fp8-matmul lowering");
         let quantizes = ops
             .iter()
@@ -9091,7 +9163,7 @@ mod tests {
     fn the_residual_scalarmul_folds_into_the_weight_and_off_the_tape() {
         let scale = 2.0f32; // an UP-multiplier — the f16 floor gate's permitted class
         let (ir, weight_ids) = residual_chain_fixture(scale);
-        let (ops, layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
+        let (ops, layout) = lower_graph_to_superdsc(&ir, &consts(), &weight_ids, ActiveCap::FULL, false)
             .expect("the folded residual shape lowers");
 
         // (a) the ScalarMul is GONE — no program carries its name, and the walk emitted the two
@@ -9161,7 +9233,7 @@ mod tests {
     fn a_downscale_fold_refuses_at_the_f16_floor_and_stays_on_the_tape() {
         let scale = 0.130_417_02f32; // granite's residual_multiplier, as it appears in the dsl
         let (ir, weight_ids) = residual_chain_fixture(scale);
-        let (ops, layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
+        let (ops, layout) = lower_graph_to_superdsc(&ir, &consts(), &weight_ids, ActiveCap::FULL, false)
             .expect("the refused residual shape still lowers");
 
         // (a) the ScalarMul STAYS — three programs, exactly one of them the pointwise mul.
@@ -9635,6 +9707,7 @@ mod tests {
         // with no layer classes, an over-cap weight segment is un-bankable and un-spillable.
         let err = compute_bundle_layout(
             &ir,
+            &consts(),
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
@@ -9651,6 +9724,7 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
+            &consts(),
         )
         .expect("the wiring is a registry and never runs the budget pass");
         assert_eq!(

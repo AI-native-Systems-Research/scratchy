@@ -170,7 +170,7 @@ fn run_tail(
 ) -> (Vec<f32>, Vec<f32>) {
     let weight_ids = std::collections::HashSet::new();
     let (ops, _layout) =
-        superdsc::lower_graph_to_ktir(ir, &weight_ids, superdsc::ActiveCap::FULL, false)
+        superdsc::lower_graph_to_ktir(ir, &consts(), &weight_ids, superdsc::ActiveCap::FULL, false)
             .unwrap_or_else(|e| panic!("lower the lm-head tail: {e:?}"));
     // The window is stated EXPLICITLY: this hand-lowered test graph minted no LX
     // pins, so the budget its fused segments run under is zero (auditor ruling
@@ -205,6 +205,12 @@ fn run_tail(
     (result, raw)
 }
 
+/// The tests' model facts — granite-2b's uniform geometry (the file's graphs are 1 head ×
+/// hd 64, inert to the head counts; only the head dim reaches the rope rows).
+fn consts() -> scratchy_subtile::model_consts::MetalModelConsts {
+    scratchy_subtile::fixtures::fixture_model_consts(2048, 512, 64)
+}
+
 #[test]
 fn the_prefill_lm_head_tail_extracts_the_last_row() {
     // m=7 (prefill-shaped, m>1), hidden=512 (a whole-stick multiple, 8 sticks),
@@ -219,13 +225,13 @@ fn the_prefill_lm_head_tail_extracts_the_last_row() {
     let gamma = synth(1, hidden as usize);
     let golden_srcs: Vec<Vec<f32>> = vec![x.clone(), gamma.clone(), w_fuf];
     let refs: Vec<&[f32]> = golden_srcs.iter().map(|v| v.as_slice()).collect();
-    let bufs = scratchy_subtile::subtile_ir::eval_dag(&ir, &refs);
+    let bufs = scratchy_subtile::subtile_ir::eval_dag(&ir, &consts(), &refs);
     let golden = bufs[ir.result.index()].clone();
 
     // The fold must have fired: lower and check for the lmlast program.
     let weight_ids = std::collections::HashSet::new();
     let (ops, _layout) =
-        superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
+        superdsc::lower_graph_to_ktir(&ir, &consts(), &weight_ids, superdsc::ActiveCap::FULL, false)
             .unwrap_or_else(|e| panic!("lower the lm-head tail: {e:?}"));
     let lmlast: Vec<&str> = ops
         .iter()
@@ -292,7 +298,7 @@ fn the_tail_extracts_the_last_real_row_not_the_pad_row() {
     let real_ir = tail_ir(n_real, hidden, vocab);
     let golden_srcs: Vec<Vec<f32>> = vec![real.clone(), gamma.clone(), w_fuf];
     let refs: Vec<&[f32]> = golden_srcs.iter().map(|v| v.as_slice()).collect();
-    let bufs = scratchy_subtile::subtile_ir::eval_dag(&real_ir, &refs);
+    let bufs = scratchy_subtile::subtile_ir::eval_dag(&real_ir, &consts(), &refs);
     let golden = bufs[real_ir.result.index()].clone();
 
     let session_srcs: Vec<Vec<f32>> = vec![x, gamma, w_disk];
@@ -320,12 +326,12 @@ fn the_tail_at_m1_still_matches_the_reference() {
     let gamma = synth(1, hidden as usize);
     let golden_srcs: Vec<Vec<f32>> = vec![x.clone(), gamma.clone(), w_fuf];
     let refs: Vec<&[f32]> = golden_srcs.iter().map(|v| v.as_slice()).collect();
-    let bufs = scratchy_subtile::subtile_ir::eval_dag(&ir, &refs);
+    let bufs = scratchy_subtile::subtile_ir::eval_dag(&ir, &consts(), &refs);
     let golden = bufs[ir.result.index()].clone();
 
     let weight_ids = std::collections::HashSet::new();
     let (ops, _layout) =
-        superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
+        superdsc::lower_graph_to_ktir(&ir, &consts(), &weight_ids, superdsc::ActiveCap::FULL, false)
             .unwrap_or_else(|e| panic!("lower the m=1 tail: {e:?}"));
     let lmlast: Vec<&str> = ops
         .iter()
@@ -363,7 +369,6 @@ fn the_tail_at_m1_still_matches_the_reference() {
 fn the_fold_refuses_a_width_collision_that_feeds_the_result_through_rope() {
     // m=7 rows, hidden=128, q width == result width == 64 (1 head × hd 64).
     let (m, hidden, qw) = (7u32, 128u32, 64u32);
-    let hd = 64u32;
 
     // t0 x [m, hidden]; t1 Wq [hidden, qw]; t2 cos [m, qw]; t3 sin [m, qw];
     // t4 q [m, qw]; t5 roped q [m, qw] (the RESULT — same width as q).
@@ -420,7 +425,7 @@ fn the_fold_refuses_a_width_collision_that_feeds_the_result_through_rope() {
         nodes.push(mk(
             1 + ri as usize,
             SubOp::RopeRotate {
-                head_dim: scratchy_subtile::model_geometry::HeadDim::new(hd),
+                attn: scratchy_subtile::subtile_ir::AttnMask::Causal,
                 _form: std::marker::PhantomData,
             },
             vec![row(4, ri), row(2, ri), row(3, ri)],
@@ -439,7 +444,7 @@ fn the_fold_refuses_a_width_collision_that_feeds_the_result_through_rope() {
     // but its chain to the result passes through RoPE.
     let weight_ids = std::collections::HashSet::new();
     let (ops, _layout) =
-        superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
+        superdsc::lower_graph_to_ktir(&ir, &consts(), &weight_ids, superdsc::ActiveCap::FULL, false)
             .unwrap_or_else(|e| panic!("lower the collision graph: {e:?}"));
     let lmlast: Vec<&str> = ops
         .iter()

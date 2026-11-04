@@ -10,12 +10,13 @@ use scratchy_subtile::subtile_ir::{
 fn main() {
     let ir = probe_ir();
     let node = &ir.nodes[0];
+    let consts = scratchy_subtile::fixtures::fixture_model_consts(2048, 512, 64);
     let t0 = Instant::now();
-    let _a = scratchy_triton_splice::lower(node, &ir, false)
+    let _a = scratchy_triton_splice::lower(node, &ir, &consts, false)
         .unwrap_or_else(|e| panic!("first compile: {e}"));
     let d0 = t0.elapsed();
     let t1 = Instant::now();
-    let _b = scratchy_triton_splice::lower(node, &ir, false)
+    let _b = scratchy_triton_splice::lower(node, &ir, &consts, false)
         .unwrap_or_else(|e| panic!("second compile: {e}"));
     let d1 = t1.elapsed();
     println!(

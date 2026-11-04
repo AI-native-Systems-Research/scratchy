@@ -466,10 +466,12 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
 pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
+    // The model's own facts — the ONE struct every lowering reads (the rope arm's head dim).
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     // Whether this bundle's rows are separate requests (the lm-head fold's own fact).
     rows_are_requests: bool,
 ) -> Result<EmittedOp, String> {
-    lower_one(node, ir, rows_are_requests)
+    lower_one(node, ir, model_consts, rows_are_requests)
 }
 
 /// The prefill lm-head tail predicate, stated ONCE — every consumer of the fold
@@ -533,6 +535,7 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
 pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     rows_are_requests: bool,
 ) -> Result<Vec<EmittedOp>, String> {
     // ── THE HEAD-NORM SANDWICH'S THREE SEATS — the split (head) is where the fused
@@ -564,7 +567,7 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
     if let SubOp::MatmulTile { .. } = &node.op
         && is_prefill_lm_head_tail
     {
-        return lower_prefill_lm_head_fold(node, ir);
+        return lower_prefill_lm_head_fold(node, ir, model_consts);
     }
     // ⭐ THE LOGITS SCALARMUL IS THE TAIL'S SECOND HALF — main's own law
     // (`lower_scalarmul_node(&node_at_one_row(node), …)` under the same
@@ -577,7 +580,7 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
         && is_prefill_lm_head_tail
     {
         let at_m1 = node_at_one_row(node);
-        return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
+        return lower_one(&at_m1, ir, model_consts, rows_are_requests).map(|e| vec![e]);
     }
     // ⭐ AND THE LOGITS TANH-SOFTCAP IS THE TAIL'S THIRD KIND — the same
     // `node_at_one_row` law (main gives TanhSoftCap the fold ScalarMul has): the
@@ -587,7 +590,7 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
         && is_prefill_lm_head_tail
     {
         let at_m1 = node_at_one_row(node);
-        return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
+        return lower_one(&at_m1, ir, model_consts, rows_are_requests).map(|e| vec![e]);
     }
     // ⭐ AND THE TOKEN DRAW'S ROW INPUT IS THE FOLDED TAIL'S ONE ROW — the same
     // `node_at_one_row` law the tail's ScalarMul and TanhSoftCap get: the mint
@@ -600,18 +603,18 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
         && ir.tensors[node.inputs[0].tensor.index()].rows > 1
     {
         let at_m1 = node_at_one_row(node);
-        return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
+        return lower_one(&at_m1, ir, model_consts, rows_are_requests).map(|e| vec![e]);
     }
     // ⭐ A KV WRITER IS TWO PROGRAMS: the rotation (`rope.py`, the node's own output) and the paged
     // write that scatters the rotated K and the V into the pools (`reshape_and_cache_head_major.py`) — spyre-
     // inference's `do_kv_cache_update`, run before the step's attention reads the pages.
     if let SubOp::RopeAppend { .. } = &node.op {
         return Ok(vec![
-            lower_one(node, ir, rows_are_requests)?,
-            lower_kv_write(node, ir)?,
+            lower_one(node, ir, model_consts, rows_are_requests)?,
+            lower_kv_write(node, ir, model_consts)?,
         ]);
     }
-    lower_one(node, ir, rows_are_requests).map(|e| vec![e])
+    lower_one(node, ir, model_consts, rows_are_requests).map(|e| vec![e])
 }
 
 /// Main's own `node_at_one_row`, verbatim law: slice the FIRST row (the region's
@@ -1034,6 +1037,7 @@ pub fn tensor_feeds_result_through_row_local_ops<F: scratchy_subtile::subtile_ir
 fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     rows_are_requests: bool,
 ) -> Result<EmittedOp, String> {
     // ⛔ THE ROUTING IS `lower_one_node`'s EXHAUSTIVE MATCH, and a `Refused` row here
@@ -1257,7 +1261,7 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
             node.inputs.len()
         ));
     }
-    let spec = kernel_spec(node, ir, file, entry)?;
+    let spec = kernel_spec(node, ir, model_consts, file, entry)?;
     let m = compile_kernel(src, &spec, &grid(node, ir)?)?;
     let k = mint(node, m, program, default_bindings(node))?;
     let name = format!("{}_s{}", program_stem(node, program), node.id.index());
@@ -1289,6 +1293,7 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
 fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
 ) -> Result<Vec<EmittedOp>, String> {
     use scratchy_subtile::subtile_ir::Region as SubRegion;
 
@@ -1400,7 +1405,7 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
         *w = one_row(w);
     }
     at_m1.output = one_row(&at_m1.output);
-    let matmul = lower_one(&at_m1, ir, false)?;
+    let matmul = lower_one(&at_m1, ir, model_consts, false)?;
 
     Ok(vec![extract, matmul])
 }
@@ -1735,6 +1740,13 @@ pub use triton_ktir_superdsc::layout::allocate_paged_cache;
 pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
+    // The model's own facts — the ONE struct every lowering reads. This splice attends only the
+    // FULL class (a sliding window is refused below), so its numbers are the global pair.
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
+    // The EFFECTIVE attention scale: the struct's `attn_scale`, or 1.0 when the weight fold
+    // applies — the caller owns the fold list and states the rewrite here, at the boundary where
+    // the program (the scale's ONE carrier) is minted.
+    scale: f32,
     active_cap: ktir_superdsc::ktir_node::ActiveCap,
     paged_rows: PagedRows,
 ) -> Result<EmittedOp, String> {
@@ -1761,8 +1773,6 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // the model's 16-bit dtype). The op states none of them either, so none reaches here today; a
     // field added for one is a compile error at this line rather than an attention run without it.
     let SubOp::AttnDecode {
-        geom,
-        scale,
         valid_len: _,
         layout: _,
         producer,
@@ -1803,7 +1813,13 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             node.output.tensor.index()
         ));
     }
-    let (nqh, nkvh, hd) = (geom.nqh().get(), geom.nkvh().get(), geom.hd().get());
+    // The class's numbers off the one struct, by the mask's class — the selection rule metal
+    // states. This arm has already refused the sliding window, so the class is the FULL one.
+    let (nqh, nkvh, hd) = (
+        model_consts.num_q_heads,
+        model_consts.num_global_kv_heads,
+        model_consts.global_head_dim,
+    );
     let mq = node.output.region.rows.len;
     let kv_width = nkvh * hd;
     let pages = pool_pages(ir, &node.inputs[1], kv_width, "K")?;
@@ -1861,7 +1877,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             ("BLOCKS_PER_CHUNK", chunking.blocks_per_chunk),
             ("NUM_CHUNKS", chunking.num_chunks),
             ("NUM_KV_HEADS", nkvh),
-            ("NUM_QUERIES_PER_KV", nqh / nkvh),
+            ("NUM_QUERIES_PER_KV", model_consts.global_queries_per_kv),
             ("BLOCK_SIZE", PAGE_SLOTS),
             ("HEAD_SIZE", hd),
             ("NUM_PAGES", pages),
@@ -1871,7 +1887,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
         }
         signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-        constexprs.insert("SCALE".to_string(), Val::Float(f64::from(*scale)));
+        constexprs.insert("SCALE".to_string(), Val::Float(f64::from(scale)));
         let spec = KernelSpec {
             kernel: entry.to_string(),
             signature,
@@ -1933,7 +1949,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
     }
     signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-    constexprs.insert("SCALE".to_string(), Val::Float(f64::from(*scale)));
+    constexprs.insert("SCALE".to_string(), Val::Float(f64::from(scale)));
     let spec = KernelSpec {
         kernel: entry.to_string(),
         signature,
@@ -1972,6 +1988,9 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
 pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
+    // The model's own facts — the ONE struct every lowering reads; the writer's class (its
+    // `attn`) selects the pair, exactly as the attention's `mask` selects its own.
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
 ) -> Result<EmittedOp, String> {
     let row = kv_write_row();
     let (src, file, entry, program) = match &row {
@@ -1983,10 +2002,17 @@ pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
         } => (*src, *file, *entry, *program),
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
     };
-    let SubOp::RopeAppend { head_dim, .. } = &node.op else {
+    let SubOp::RopeAppend { attn, .. } = &node.op else {
         return Err(
             "triton splice: lower_kv_write called on a node that is not a RopeAppend".to_string(),
         );
+    };
+    // The class's pair off the one struct, by the writer's own class — the same selection every
+    // lowering makes: sliding arms read `head_dim`/`num_kv_heads`, full arms the global pair.
+    let (nkvh, hd) = if attn.window().is_some() {
+        (model_consts.num_kv_heads, model_consts.head_dim)
+    } else {
+        (model_consts.num_global_kv_heads, model_consts.global_head_dim)
     };
     if node.inputs.len() < 6 {
         return Err(format!(
@@ -1996,15 +2022,13 @@ pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
             node.inputs.len()
         ));
     }
-    let hd = head_dim.get();
     let (rows, kv_width) = (node.output.region.rows.len, node.output.region.cols.len);
-    if hd == 0 || !kv_width.is_multiple_of(hd) {
+    if kv_width != nkvh * hd {
         return Err(format!(
-            "triton splice: RopeAppend t{}: its {kv_width}-column K is not whole heads of {hd}",
+            "triton splice: RopeAppend t{}: its {kv_width}-column K is not the class's              {nkvh} heads of {hd} — the node's extents disagree with the model's own facts",
             node.output.tensor.index()
         ));
     }
-    let nkvh = kv_width / hd;
     whole(ir, &node.output, rows, kv_width, "rotated K")?;
     whole(ir, &node.inputs[3], rows, kv_width, "V")?;
     let pages = pool_pages(ir, &node.inputs[4], kv_width, "K")?;
@@ -2100,6 +2124,7 @@ fn rebind(
 fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     file: &str,
     entry: &str,
 ) -> Result<KernelSpec, String> {
@@ -2419,13 +2444,18 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // agreement by construction.
             ce("SCALE", Val::Float(f64::from(*scale)))?;
         }
-        (SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. }, "rope_fwd") => {
+        (SubOp::RopeRotate { attn, .. } | SubOp::RopeAppend { attn, .. }, "rope_fwd") => {
             // The door's contract, stated from the node's own facts: total = the output's
             // declared width (`heads * hd`), heads = total / hd, mq = the output's rows —
-            // the same derivation `KtirFunc::rope`'s views state. The builder's own
-            // refusal (`total` not a whole number of `hd`-wide heads) is mirrored here
-            // as an `Err`: the node is malformed, and no kernel can state it.
-            let hd = head_dim.get();
+            // the same derivation `KtirFunc::rope`'s views state. `hd` is the class's own
+            // head dim, off the one model-facts struct (the same selection every lowering
+            // makes); the refusal (`total` not a whole number of `hd`-wide heads) is
+            // mirrored here as an `Err`: the node is malformed, and no kernel can state it.
+            let hd = if attn.window().is_some() {
+                model_consts.head_dim
+            } else {
+                model_consts.global_head_dim
+            };
             let total = c;
             if hd == 0 || total % hd != 0 {
                 return Err(format!(
@@ -3098,6 +3128,7 @@ fn default_bindings<F: scratchy_subtile::subtile_ir::RopeForm>(
 pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
 ) -> Result<Option<Vec<(u32, Df)>>, String> {
     // Attention is a Spliced ROW but not a `lower_one` kernel (its door-order
     // bindings and mask slot are `lower_attn`'s); its widths are the door's
@@ -3164,7 +3195,7 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
     else {
         return Ok(None);
     };
-    let spec = kernel_spec(node, ir, file, entry)?;
+    let spec = kernel_spec(node, ir, model_consts, file, entry)?;
     let module = triton_frontend::py::parser::parse(src)
         .map_err(|e| format!("triton splice: {file}: {e}"))?;
     let f = module

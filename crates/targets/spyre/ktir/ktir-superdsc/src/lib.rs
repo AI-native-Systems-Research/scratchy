@@ -29,11 +29,10 @@
 //! ([`ktir_node::BufferId`]) and this crate treats the numbers as keys. It never asks what a buffer
 //! is, which is why the contract needs no trait over the producer's tensor type.
 //!
-//! ⛔ THE ONE DOOR THE CALLER CROSSES IS MONOMORPHISATION. Head counts and head dim parameterise the
-//! device layout (GQA grouping, slabs, head strides), so they must be `const`, not values:
-//! [`emit::lower_ktir_to_superdsc::attn_at`]`::<NQH, NKVH, HD>` and
-//! [`emit::lower_ktir_to_superdsc::rope_at`]`::<HD>` are generic entry points and the CALLER
-//! instantiates them from its own model configs. That arm set is the consumer's model inventory, so a
+//! ⛔ THE ONE DOOR THE CALLER CROSSES IS MONOMORPHISATION. The head dim parameterises the device
+//! layout (slabs, head strides), so it must be `const`, not a value:
+//! [`emit::lower_ktir_to_superdsc::rope_at`]`::<HD>` is the generic entry point and the CALLER
+//! instantiates it from its own model configs. That arm set is the consumer's model inventory, so a
 //! leaf crate must not own it, and it cannot be received as data either.
 //!
 //! ⚠️ NOT YET LEAF-CLEAN: [`emit::EmittedOp`], this crate's own output type, still carries a
@@ -83,8 +82,8 @@ pub mod placement;
 /// selectors), with the region table and both of its compile-time disjointness proofs. The
 /// producer↔lowering ABI: a caller has to agree with these numbers to bind anything.
 pub mod reserved_tids;
-/// Geometry LAW types (`AttnGeometry` & friends): the typed device facts every address in a
-/// descriptor is derived from. Mutually recursive with [`addr`] — that pair is one unit.
+/// Geometry LAW types: the typed device facts every address in a descriptor is derived from.
+/// Mutually recursive with [`addr`] — that pair is one unit.
 pub mod sdsc_abstract;
 /// The shared build-time error for the SuperDSC emitter. A leaf below [`superdsc_opspec`] so the
 /// typed witnesses and the wire/lowering layer raise the SAME error without a module cycle.

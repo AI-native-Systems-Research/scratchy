@@ -29,7 +29,7 @@ use scratchy_target_metal::op_abi::{
 };
 use scratchy_target_metal::tape::ids::{ArenaSlotIdx, SourceIx};
 use scratchy_target_metal::tape::lowered::Fence;
-use scratchy_target_metal::tape::model_consts::MetalModelConsts;
+use scratchy_subtile::model_consts::MetalModelConsts;
 use scratchy_target_metal::tape::step::{
     AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, LayerId, MetalStepTape,
     RotaryTables, RowSource,
@@ -310,7 +310,7 @@ pub fn lower_canonical(
     // Only on a model built with it (`MetalModelConsts::kv_codec`): a dense model runs none.
     let coded;
     let l = if consts.kv_codec.is_turboquant() {
-        coded = expand_kv_codec(l, &METAL_KV_CODEC).map_err(CanonicalRefusal::KvCodec)?;
+        coded = expand_kv_codec(l, consts, &METAL_KV_CODEC).map_err(CanonicalRefusal::KvCodec)?;
         &coded
     } else {
         l

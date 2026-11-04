@@ -222,6 +222,12 @@ fn synth(id: usize, n: usize) -> Vec<f32> {
 /// sources. `eval_dag` executes the UN-fused sandwich (the reshape is the identity on
 /// the host), so agreement is exactly the claim the fusion makes: the windowed norm
 /// over head windows of the original tensor IS the sandwich's value.
+/// The tests' model facts — granite-2b's uniform geometry (the file's graphs are 1 head ×
+/// hd 64, inert to the head counts; only the head dim reaches the rope rows).
+fn consts() -> scratchy_subtile::model_consts::MetalModelConsts {
+    scratchy_subtile::fixtures::fixture_model_consts(2048, 512, 64)
+}
+
 #[test]
 fn windowed_rmsnorm_matches_the_unfused_sandwich() {
     // m>1 (prefill-style, the stick-major regime the block-alignment law is about)
@@ -250,7 +256,7 @@ fn windowed_rmsnorm_matches_the_unfused_sandwich() {
                 })
                 .collect();
             let refs: Vec<&[f32]> = srcs.iter().map(|v| v.as_slice()).collect();
-            let bufs = scratchy_subtile::subtile_ir::eval_dag(&ir, &refs);
+            let bufs = scratchy_subtile::subtile_ir::eval_dag(&ir, &consts(), &refs);
             let sink = ir.result.index();
             // The sandwich's RAW output (the flatten-back's tensor) and the sink that
             // reads it — comparing BOTH pins the windowed write itself, not just a
@@ -262,7 +268,7 @@ fn windowed_rmsnorm_matches_the_unfused_sandwich() {
             // The fused lowering: one WindowedRmsNorm program + the sink's elementwise.
             let weight_ids = std::collections::HashSet::new();
             let (ops, _layout) =
-                superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
+                superdsc::lower_graph_to_ktir(&ir, &consts(), &weight_ids, superdsc::ActiveCap::FULL, false)
                     .unwrap_or_else(|e| {
                         panic!("lower the sandwich (m={m}, H={heads}, D={d}): {e:?}")
                     });
@@ -370,7 +376,7 @@ fn a_whole_row_rmsnorm_never_enters_the_windowed_path() {
     };
     let weight_ids = std::collections::HashSet::new();
     let (ops, _layout) =
-        superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
+        superdsc::lower_graph_to_ktir(&ir, &consts(), &weight_ids, superdsc::ActiveCap::FULL, false)
             .expect("lower the granite-shaped norm");
     for e in &ops {
         let k = e.ktir.as_ref().expect("the norm carries its program");
@@ -406,7 +412,7 @@ fn an_extra_consumer_of_the_split_refuses_the_fusion() {
         let ir = sandwich_ir(m, heads, d, gain, true);
         let weight_ids = std::collections::HashSet::new();
         let (ops, _layout) =
-            superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
+            superdsc::lower_graph_to_ktir(&ir, &consts(), &weight_ids, superdsc::ActiveCap::FULL, false)
                 .expect("lower the refused sandwich");
         // NO windowed program was minted...
         for e in &ops {

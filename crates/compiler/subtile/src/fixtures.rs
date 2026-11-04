@@ -11,10 +11,61 @@ use crate::handoff::{LoweredDecode, SourceBinding};
 use crate::kv_codec::CodecGuard::{Codec, CodecDecode, CodecNotDecode, UnlessCodecDecode};
 use crate::kv_codec::{After, Before, CodecAround, CodecHeadDims, Guarded, KvCodecFacts};
 use crate::lower::{InputRef, LoweringInput, OpDesc};
-use crate::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
+use crate::model_consts::MetalModelConsts;
 use crate::subtile_ir::{
     AttnMask, EwKind, GainConvention, KvOperand, RopeFormTag, SourceShape, SubOp,
 };
+
+/// The fixtures' model consts: a UNIFORM model (global == base), so every attention class
+/// selects the same numbers and the fixtures' numerics are exactly what they were when the ops
+/// carried them. `h`/`kv`/`hd` are [`one_layer_input_shaped`]'s own parameters.
+pub fn fixture_model_consts(h: u32, kv: u32, hd: u32) -> MetalModelConsts {
+    MetalModelConsts {
+        metal_dtype: scratchy_tensors::MetalDtype::F16,
+        scale_dtype: scratchy_tensors::ScaleDtype::F16,
+        head_dim: hd,
+        global_head_dim: hd,
+        num_q_heads: h / hd,
+        num_kv_heads: kv / hd,
+        num_global_kv_heads: kv / hd,
+        global_queries_per_kv: if kv / hd == 0 {
+            0
+        } else {
+            (h / hd) / (kv / hd)
+        },
+        q_size: h as usize,
+        hidden_size: h as usize,
+        intermediate_size: 0,
+        attn_scale: 1.0 / (hd as f32).sqrt(),
+        sliding_window: 0,
+        final_logit_softcapping: 0.0,
+        rms_norm_eps: 1e-5,
+        norm_weight_offset: 0.0,
+        block_size: 0,
+        global_block_size: 0,
+        rot_dim: hd,
+        global_rot_dim: hd,
+        rope_on_read: false,
+        rope_proportional: false,
+        mrope: false,
+        kv_codec: scratchy_ir::KvCodec::Dense,
+        vision_num_heads: 0,
+        vision_head_dim: 0,
+        vision_q_size: 0,
+        vision_in_features: 0,
+        vision_rope_interleaved: false,
+        vision_attn_scale: 0.0,
+        vision_patch_grid_side: 0,
+        vision_pool_kernel: 0,
+        gdn_num_k_heads: 0,
+        gdn_num_v_heads: 0,
+        gdn_head_k_dim: 0,
+        gdn_head_v_dim: 0,
+        gdn_conv_kernel: 0,
+        gdn_conv_dim: 0,
+        spec_drafts: 0,
+    }
+}
 
 /// Minimal one-layer Llama-3.2-1B-style decode forward.
 ///
@@ -55,13 +106,12 @@ pub fn one_layer_input() -> LoweringInput {
 /// mlp) be exercised at a second head_dim (e.g. hd=128) with no bespoke
 /// fixture — the per-layer composition test for model-generality.
 pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput {
-    let scale = 1.0f32 / (hd as f32).sqrt();
-    let head_dim = HeadDim::new(hd);
-    // The fixture's geometry, through the same mint the real config path uses: a `(h, kv, hd)` trio
-    // whose kv-head count does not divide its query-head count is not a model, and the fixture
-    // cannot name one.
-    let geom = ModelAttnGeometry::mint(QueryHeads::new(h / hd), KvHeads::new(kv / hd), head_dim)
-        .expect("one_layer_input_shaped: h/hd must be a multiple of kv/hd");
+    // A `(h, kv, hd)` trio whose kv-head count does not divide its query-head count is not a
+    // model, and the fixture cannot name one.
+    assert!(
+        kv / hd != 0 && (h / hd) % (kv / hd) == 0,
+        "one_layer_input_shaped: h/hd must be a multiple of kv/hd"
+    );
     LoweringInput {
         exported: None,
         sources: vec![
@@ -133,14 +183,14 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             },
             // 4: q' = rope(q)
             OpDesc {
-                op: SubOp::rope_rotate(head_dim),
+                op: SubOp::rope_rotate(AttnMask::Causal),
                 m: 1,
                 inputs: vec![InputRef::Op(1), InputRef::Ext(5), InputRef::Ext(6)],
             },
             // 5: k' = rope_append(k, cos, sin, v, prefix_k, prefix_v)
             //    (rotate K + write rotated K / un-roped V to layer 0 cache)
             OpDesc {
-                op: SubOp::rope_append(head_dim, 0, AttnMask::Causal, RopeFormTag::NeoX),
+                op: SubOp::rope_append(0, AttnMask::Causal, RopeFormTag::NeoX),
                 m: 1,
                 inputs: vec![
                     InputRef::Op(2),
@@ -157,7 +207,7 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
                 // Llama-3.2-1B GQA: 32 q-heads, 8 kv-heads. valid_len 2: decode_position=1 →
                 // 1 prefix row + 1 new = 2 valid positions. Decoupled from the cache TENSOR
                 // capacity (sources 7,8 may be sized larger).
-                op: SubOp::attn_decode(geom, scale, 2, AttnMask::Causal),
+                op: SubOp::attn_decode(2, AttnMask::Causal),
                 m: 1,
                 inputs: vec![
                     InputRef::Op(4),
@@ -533,7 +583,7 @@ pub fn rope_rotate_only_input() -> LoweringInput {
             }, // 2  sin
         ],
         ops: vec![OpDesc {
-            op: SubOp::rope_rotate(HeadDim::new(head_dim)),
+            op: SubOp::rope_rotate(AttnMask::Causal),
             m: 1,
             inputs: vec![InputRef::Ext(0), InputRef::Ext(1), InputRef::Ext(2)],
         }],

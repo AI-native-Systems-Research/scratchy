@@ -170,6 +170,11 @@ pub use scratchy_subtile::handoff::SlotMap;
 ///   2. Gemma2's `query_pre_attn_scalar` — convention is
 ///      `scale = query_pre_attn_scalar.powf(-0.5)`.
 ///   3. Fallback `1 / sqrt(head_dim)` for Llama / Qwen2 / Qwen3.
+// ⭐ CUDA-TEST-ONLY NOW: the ONE scale derivation is the model-facts fill
+// (`emit_canonical_params_impl`'s `attn_scale`), which every target reads off the struct; the
+// cuda attention-scalar tests still pin this spelling of the law directly. Same gating as the
+// import in `impl_lib.rs` (whose comment records the same dead-under-spyre/metal history).
+#[cfg(any(test, feature = "cuda"))]
 pub(crate) fn attention_scale_for(model: &crate::config::ModelParams) -> f32 {
     if let Some(s) = model.scalars.get("attention_multiplier") {
         return *s as f32;

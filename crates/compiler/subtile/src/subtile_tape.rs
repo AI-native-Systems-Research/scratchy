@@ -2693,7 +2693,6 @@ pub fn play_skeleton(tape: &SubtileTape) -> Vec<PlayStep> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
     use crate::subtile_ir::{
         EwKind, KvCacheLayout, KvCacheProducer, NeoX, Range, Region, SoftmaxStateId, SubOp,
         SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape,
@@ -3088,9 +3087,6 @@ pub(crate) mod tests {
         let attn: SubtileNode<NeoX> = SubtileNode {
             id: SubtileId(0),
             op: SubOp::AttnDecode {
-                geom: ModelAttnGeometry::mint(QueryHeads::new(1), KvHeads::new(1), HeadDim::new(4))
-                    .expect("1 kv head divides 1 query head"),
-                scale: 0.5,
                 valid_len: 4,
                 layout: KvCacheLayout::for_cache_tensors(TensorId(1), TensorId(1)),
                 producer: KvCacheProducer::pre_populated_ext(),
@@ -3524,7 +3520,18 @@ pub(crate) mod tests {
     fn hybrid_class_chain() -> SubtileIR<NeoX> {
         use crate::subtile_ir::KvCacheLayout;
         // Pattern S S G | S S G — layer → class head dim.
-        let hd_of = |layer: u32| if layer % 3 == 2 { 512 } else { 256 };
+        // The class selector is the op's `attn`, as every lowering reads it: the sliding
+        // arms the small geometry, the full arms the global one. (The fixture's tensors are
+        // toy-shaped — the classes' head dims live on the model-facts struct, not the op.)
+        let class_of = |layer: u32| {
+            if layer % 3 == 2 {
+                crate::subtile_ir::AttnMask::Causal
+            } else {
+                crate::subtile_ir::AttnMask::SlidingWindow {
+                    window: std::num::NonZeroU32::new(1024).unwrap(),
+                }
+            }
+        };
         // sources, contiguous at the front (num_sources covers all of them):
         // 0 = x; 1..7 = W_0..W_5; 7 = cos; 8 = sin; 9..15 = pk_0..pk_5; 15..21 = pv_0..pv_5.
         // (The rope's operand list is [k, cos, sin, v, prefix_k, prefix_v] — the cache
@@ -3560,9 +3567,8 @@ pub(crate) mod tests {
             nodes.push(SubtileNode {
                 id: SubtileId(1 + 2 * layer),
                 op: SubOp::RopeAppend {
-                    head_dim: HeadDim::new(hd_of(layer)),
                     layer,
-                    attn: crate::subtile_ir::AttnMask::Causal,
+                    attn: class_of(layer),
                     pairing: crate::subtile_ir::RopeFormTag::NeoX,
                     layout: KvCacheLayout::for_cache_tensors(
                         TensorId(9 + layer),
@@ -3704,18 +3710,18 @@ pub(crate) mod tests {
             "the two tables together cover every layer exactly once"
         );
         // And each table's layers are same-class: their rope head dims agree.
-        let hd = |n: u32| match &g.nodes[n as usize].op {
-            SubOp::RopeAppend { head_dim, .. } => head_dim.get(),
+        let class = |n: u32| match &g.nodes[n as usize].op {
+            SubOp::RopeAppend { attn, .. } => std::mem::discriminant(attn),
             _ => panic!("not a rope node"),
         };
         for t in [&t0, &t1] {
-            let hds: Vec<u32> = t.iter().map(|&n| hd(n)).collect();
+            let classes: Vec<_> = t.iter().map(|&n| class(n)).collect();
             assert!(
-                hds.iter().all(|&h| h == hds[0]),
-                "one class per table: {hds:?}"
+                classes.iter().all(|&c| c == classes[0]),
+                "one class per table: {classes:?}"
             );
         }
-        assert_ne!(hd(t0[0]), hd(t1[0]), "the two bodies are the two classes");
+        assert_ne!(class(t0[0]), class(t1[0]), "the two bodies are the two classes");
         // The weight gather: each body's mul External carries its class's weight ids.
         let weight_table = |body: &Vec<&Instr>| -> Vec<u32> {
             body.iter()

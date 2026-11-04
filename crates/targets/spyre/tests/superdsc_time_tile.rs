@@ -46,6 +46,12 @@ use std::collections::BTreeMap;
 //    (OpFunc::name()), turning a wrong name into a `cargo build`/test failure —
 //    NOT a runtime crash. (Observed 2026-06-25: "multiply" → must be "mul";
 //    "gelu" → must be "gelufwd".)
+/// The tests' model facts — granite-2b's uniform geometry (this file's graphs are matmuls,
+/// inert to every attention fact).
+fn consts() -> scratchy_subtile::model_consts::MetalModelConsts {
+    scratchy_subtile::fixtures::fixture_model_consts(2048, 512, 64)
+}
+
 #[test]
 fn opfunc_names_are_dxp_recognized() {
     // The dxp-recognized opFunc names this emitter can produce (verified on-card
@@ -1026,10 +1032,10 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
     let ir = single_matmul_ir(64, 16384, 2048);
     let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
     let (programs, layout) =
-        superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, true)
+        superdsc::lower_graph_to_ktir(&ir, &consts(), &weight_ids, superdsc::ActiveCap::FULL, true)
             .expect("KTIR for a 64x16384x2048 matmul");
     let (dscs, _) =
-        superdsc::lower_graph_to_superdsc(&ir, &weight_ids, superdsc::ActiveCap::FULL, true)
+        superdsc::lower_graph_to_superdsc(&ir, &consts(), &weight_ids, superdsc::ActiveCap::FULL, true)
             .expect("SuperDSC for a 64x16384x2048 matmul");
     let [e] = &dscs[..] else {
         panic!(

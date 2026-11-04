@@ -13,7 +13,7 @@ pub mod kernel_constants;
 pub mod kernel_identity;
 pub mod lowered;
 pub mod lowering;
-pub mod model_consts;
+
 pub mod quantized;
 pub mod step;
 pub mod targets;

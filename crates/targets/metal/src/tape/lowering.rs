@@ -20,7 +20,7 @@ use crate::tape::ids::ArenaSlotIdx as Slot;
 use crate::tape::ids::{QSize, RowStride, SourceIx};
 use crate::tape::kernel_bindings::{CosSinTable, source};
 use crate::tape::kernel_constants::{QueryRows, norm_threads};
-use crate::tape::model_consts::MetalModelConsts;
+use scratchy_subtile::model_consts::MetalModelConsts;
 use crate::tape::step::{
     AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertBundle,
     ExpertMatmul, ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize,

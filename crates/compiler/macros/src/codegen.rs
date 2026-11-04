@@ -7611,7 +7611,7 @@ enum BackboneLayout {
 #[cfg(feature = "metal")]
 fn metal_off_tape_tokens(
     width: u64,
-    mc: &scratchy_target_metal::tape::model_consts::MetalModelConsts,
+    mc: &scratchy_subtile::model_consts::MetalModelConsts,
     head: Option<(u32, u32)>,
     vocab_suffix: Option<scratchy_target_metal::off_tape::VocabSuffix>,
 ) -> TokenStream {
@@ -7768,7 +7768,7 @@ fn metal_vocab_suffix(
     program: &Program,
     fuf: &crate::fuf::Fuf,
     model: &crate::config::ModelParams,
-    mc: &scratchy_target_metal::tape::model_consts::MetalModelConsts,
+    mc: &scratchy_subtile::model_consts::MetalModelConsts,
 ) -> Option<scratchy_target_metal::off_tape::VocabSuffix> {
     let (&prefix, &all) = (
         model.bounds.get("vocab_size")?,
@@ -8065,13 +8065,11 @@ fn emit_canonical_params_impl(
     tp_world_size: u8,
     uses_rotary: bool,
     kv_layers: &KvCacheLayers,
-    // Filled with the SAME values the impl's consts are emitted from —
-    // one derivation, two consumers (the impl tokens and the macro-side
-    // tape bake). Built in this fn so drift is impossible.
-    #[cfg(feature = "metal")] metal_consts_out: &mut Option<
-        scratchy_target_metal::tape::model_consts::MetalModelConsts,
-    >,
-) -> TokenStream {
+    // ⭐ ONE FILL, EVERY TARGET, RETURNED BY VALUE: the SAME values the impl's consts are
+    // emitted from — one derivation, two consumers (the impl tokens and the macro-side tape
+    // bakes, metal's and spyre's alike). Built in this fn so drift is impossible, and RETURNED
+    // so no caller holds an Option over a fact that always exists.
+) -> (TokenStream, scratchy_subtile::model_consts::MetalModelConsts) {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
     let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
@@ -8489,7 +8487,12 @@ fn emit_canonical_params_impl(
                     model.source_stem,
                     t + h + w,
                 );
-                return quote! { compile_error!(#msg); };
+                return (
+                    quote! { compile_error!(#msg); },
+                    // The tokens above fail the build; the paired value is never read
+                    // (see `MetalModelConsts::COMPILE_ERROR`).
+                    scratchy_subtile::model_consts::MetalModelConsts::COMPILE_ERROR,
+                );
             }
             let t_lit = proc_macro2::Literal::u32_unsuffixed(t);
             let h_lit = proc_macro2::Literal::u32_unsuffixed(h);
@@ -8578,11 +8581,13 @@ fn emit_canonical_params_impl(
         None => quote! { ::core::option::Option::None },
     };
 
-    #[cfg(feature = "metal")]
-    {
-        use scratchy_target_metal::interpreter::metal::{MetalDtype, ScaleDtype};
-        use scratchy_target_metal::tape::model_consts::MetalModelConsts;
-        *metal_consts_out = Some(MetalModelConsts {
+    // ⭐ THE ONE FILL, FOR EVERY TARGET — not `#[cfg(feature = "metal")]`. The struct is the
+    // shared model-facts record metal's lowering reads; spyre's lowering reads the same value
+    // from this same site, so there is exactly one fill per expansion and no per-target twin.
+    let model_consts = {
+        use scratchy_subtile::model_consts::MetalModelConsts;
+        use scratchy_tensors::{MetalDtype, ScaleDtype};
+        MetalModelConsts {
             // No arch override exists for METAL_DTYPE — the trait
             // default is the universal value.
             metal_dtype: MetalDtype::Bf16,
@@ -8596,6 +8601,15 @@ fn emit_canonical_params_impl(
             num_q_heads,
             num_kv_heads,
             num_global_kv_heads,
+            // ⭐ DERIVED ONCE, HERE — the division the const assert beside this fill proves
+            // exact (num_q_heads % num_global_kv_heads == 0); the splice reads it as
+            // NUM_QUERIES_PER_KV and never re-derives it. 0 stands in only where there is no
+            // attention body (head_dim == 0), the same stand-in the assert's emission uses.
+            global_queries_per_kv: if num_global_kv_heads > 0 {
+                num_q_heads / num_global_kv_heads
+            } else {
+                0
+            },
             q_size,
             hidden_size: hidden_size_for_const,
             intermediate_size,
@@ -8634,10 +8648,48 @@ fn emit_canonical_params_impl(
             target_hidden_width,
             target_routes_experts,
             vocab_size: vocab_size_for_const,
-        });
-    }
+        }
+    };
 
-    quote! {
+    // ⭐ THE GQA DIVISIBILITY LAW, STATED ONCE AT THE FILL. A kv-head count that does not divide
+    // the query-head count has no GQA grouping at all — the arithmetic that would paper over it
+    // reads another head's keys. Emitted as a const assert over the same numbers the struct
+    // carries (a compile error naming the config's own numbers); NOT re-checked as a value at any
+    // lower door. Both classes: the base pair and the global pair. Vision canonicals (head_dim 0)
+    // never reach the attention arms, so the assert is emitted only for an attention body.
+    let gqa_law = if head_dim > 0 {
+        let base_msg = format!(
+            "config `{}` declares num_attention_heads={}, num_key_value_heads={}, head_dim={} — \
+             the kv-head count does not divide the query-head count, so this model has no GQA \
+             grouping to emit",
+            model.source_stem, num_q_heads, num_kv_heads, head_dim
+        );
+        let global_msg = format!(
+            "config `{}` declares num_attention_heads={}, num_global_key_value_heads={}, \
+             global_head_dim={} — the global kv-head count does not divide the query-head \
+             count, so this model has no GQA grouping to emit",
+            model.source_stem, num_q_heads, num_global_kv_heads, global_head_dim
+        );
+        quote! {
+            const _: () = {
+                const NUM_Q_HEADS: u32 = #num_q_heads_lit;
+                const NUM_KV_HEADS: u32 = #num_kv_heads_lit;
+                const NUM_GLOBAL_KV_HEADS: u32 = #num_global_kv_heads_lit;
+                assert!(
+                    NUM_KV_HEADS > 0 && NUM_Q_HEADS % NUM_KV_HEADS == 0,
+                    #base_msg
+                );
+                assert!(
+                    NUM_GLOBAL_KV_HEADS > 0 && NUM_Q_HEADS % NUM_GLOBAL_KV_HEADS == 0,
+                    #global_msg
+                );
+            };
+        }
+    } else {
+        quote! {}
+    };
+    let canonical_params_impl = quote! {
+        #gqa_law
         // `CanonicalParams` is backend-agnostic — the trait, its
         // associated `const`s, and every callsite (`<W as
         // CanonicalParams>::HEAD_DIM`) live in `scratchy-forward-compiler` with
@@ -8700,7 +8752,8 @@ fn emit_canonical_params_impl(
             #mrope_section_tokens
             #scale_dtype_override
         }
-    }
+    };
+    (canonical_params_impl, model_consts)
 }
 
 /// The one-slot-per-sequence recurrent-state geometry of a hybrid arch's
@@ -11128,6 +11181,10 @@ fn dump_wavefront_mega(
     backbone_slots: &[Vec<WeightSlot>],
     lm_head_slots: &[Vec<WeightSlot>],
     bb_bucket_id: u32,
+    // ⭐ THE ONE MODEL-FACTS STRUCT — the same value `emit_canonical_params_impl` filled once
+    // for this expansion. Metal's lowering reads it; spyre's wavefront bridge and splice read
+    // their attention facts (heads, kv heads, head dim, window, scale) from it too.
+    model_consts: &scratchy_subtile::model_consts::MetalModelConsts,
     // Out: under `-Fspyre` the embedded `pub const KTIR_BUNDLE` token stream
     // (spliced into the per-model module); empty under cuda/metal.
     ktir_bundle_out: &mut proc_macro2::TokenStream,
@@ -11206,6 +11263,7 @@ fn dump_wavefront_mega(
             inferred,
             decode_bounds,
             model,
+            model_consts,
             crate::to_wavefront::PrefixCapacity::new(cap),
             primary_m,
         )
@@ -11748,6 +11806,7 @@ fn dump_wavefront_mega(
                     &weight_ids,
                     active_cap,
                     scratchy_target_spyre::paged_step::PagedRows::of_requests(rows_are_requests),
+                    model_consts,
                 ) {
                     Ok(w) => w,
                     Err(e) => panic!("[spyre] {base}: wiring not lowerable — {}", e.0),
@@ -11824,6 +11883,7 @@ fn dump_wavefront_mega(
                                 active_cap, // decode: FULL (sk_bucket rungs land below). prefill: NONE for a
                                 // start==0 chunk, FULL for the continuation bundle.
                                 rows_are_requests,
+                                model_consts,
                             ) {
                                 Ok(rolled) => {
                                     // ⭐ AND THE PARITY LEDGER'S ENTRY FOR THIS BUNDLE — the
@@ -12167,6 +12227,7 @@ fn dump_wavefront_mega(
                                                         &weight_ids,
                                                         rung,
                                                         rows_are_requests,
+                                                        model_consts,
                                                     ) {
                                                         // Same device split as the ceiling rung above: the
                                                         // card bakes the ROLLED body, the emulator the
@@ -12545,12 +12606,13 @@ fn dump_wavefront_mega(
                                                 let staged_rope = prefill_classes
                                                     .as_ref()
                                                     .map(|(_, cs, sn)| {
-                                                        superdsc::staged_rope_rows(&krg, cs, sn)
+                                                        superdsc::staged_rope_rows(&krg, model_consts, cs, sn)
                                                             .unwrap_or_default()
                                                     })
                                                     .unwrap_or_default();
                                                 match superdsc::write_eval_golden(
                                                     &krg,
+                                                    model_consts,
                                                     &weight_ids,
                                                     &dbg,
                                                     &staged_rope,
@@ -12648,6 +12710,7 @@ fn dump_wavefront_mega(
                                                                 match superdsc::numeric_gate(
                                                                     &twin_groups,
                                                                     &krg,
+                                                                    model_consts,
                                                                     &weight_ids,
                                                                     &gate_rung,
                                                                     prefill,
@@ -12668,6 +12731,7 @@ fn dump_wavefront_mega(
                                                                         superdsc::numeric_gate(
                                                                             groups,
                                                                             &krg,
+                                                                            model_consts,
                                                                             &weight_ids,
                                                                             &gate_rung,
                                                                             prefill,
@@ -13256,6 +13320,7 @@ fn dump_wavefront_mega(
                     inferred,
                     decode_bounds,
                     model,
+                    model_consts,
                     crate::to_wavefront::PrefixCapacity::new(
                         std::num::NonZeroU32::new(cap).expect("cap bucket is non-zero"),
                     ),
@@ -13326,6 +13391,7 @@ fn dump_wavefront_mega(
                     inferred,
                     decode_bounds,
                     model,
+                    model_consts,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     seqs,
                 ) {
@@ -13561,6 +13627,7 @@ fn dump_wavefront_mega(
                 inferred,
                 decode_bounds,
                 model,
+                model_consts,
                 // Prefill and decode model the SAME resident prefix-KV cache, so
                 // they MUST share ONE capacity — the KTIR emulator bakes a STATIC
                 // `[prefix_len, kv]` cache + a `[1, prefix_len]` runtime length mask,
@@ -13693,6 +13760,7 @@ fn dump_wavefront_mega(
                     inferred,
                     decode_bounds,
                     model,
+                    model_consts,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     m,
                 ) {
@@ -13831,6 +13899,7 @@ fn dump_wavefront_mega(
                 inferred,
                 decode_bounds,
                 model,
+                model_consts,
                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
                 decode_mq,
             ) {
@@ -14358,6 +14427,14 @@ pub fn emit_model(
     // is already target-neutral (`crate::__gpu::layers::*`, where `__gpu` is
     // the per-target alias), so the same fields compile and load on any
     // backend.
+    // ⭐ THE ONE FILL, BY VALUE — not metal-gated: metal's lowering and spyre's read the same
+    // struct, and no caller holds an Option over a fact that always exists.
+    let (canonical_params_impl, resolved_metal_consts) = emit_canonical_params_impl(
+        model,
+        tp_world_size,
+        fuf_uses_rotary(fuf),
+        &KvCacheLayers::of(fuf),
+    );
     #[cfg(all(feature = "spyre", not(feature = "metal")))]
     let (weights, weights_affine_rows) = {
         let lowered = sfufs
@@ -14376,6 +14453,7 @@ pub fn emit_model(
                     inferred,
                     &bounds,
                     model,
+                    &resolved_metal_consts,
                     crate::to_wavefront::PrefixCapacity::new(
                         std::num::NonZeroU32::new(8192).expect("8192 != 0"),
                     ),
@@ -14847,18 +14925,6 @@ pub fn emit_model(
     // Per-canonical CanonicalParams impl + Instruction type alias.
     // The alias keeps every static-slice row short instead of
     // repeating `::scratchy_forward_compiler::Instruction::<Weights>::Variant(…)`.
-    #[cfg(feature = "metal")]
-    let mut resolved_metal_consts: Option<
-        scratchy_target_metal::tape::model_consts::MetalModelConsts,
-    > = None;
-    let canonical_params_impl = emit_canonical_params_impl(
-        model,
-        tp_world_size,
-        fuf_uses_rotary(fuf),
-        &KvCacheLayers::of(fuf),
-        #[cfg(feature = "metal")]
-        &mut resolved_metal_consts,
-    );
     // Per-canonical: alias the generic `Instruction<Weights>` for
     // the slice element type AND glob-import the variant
     // constructors so each static-slice row reads `Embed(...)` /
@@ -15101,7 +15167,7 @@ pub fn emit_model(
             },
             moe_expert_bits: quant.map(|_| &widths as &mc3::MoeExpertBits<'_>),
         };
-        let mc = resolved_metal_consts.as_ref().expect("metal consts filled");
+        let mc = &resolved_metal_consts;
         let buckets: Vec<u64> = (bucket_points.iter().zip(&bucket_canonical))
             .filter(|&(_, c)| c == canonical)
             .map(|(wp, _)| wp.num_tokens)
@@ -15201,6 +15267,7 @@ pub fn emit_model(
                             &cl.backbone.weight_slots,
                             &cl.lm_head.weight_slots,
                             bb_bucket_id,
+                            &resolved_metal_consts,
                             &mut ktir_bundle_const,
                         );
                     }
@@ -15347,9 +15414,7 @@ pub fn emit_model(
     #[cfg(feature = "metal")]
     let metal_cap_ladder = {
         use scratchy_target_metal::tape::ids::{BlockSize, MaxPositions};
-        let mc = resolved_metal_consts
-            .as_ref()
-            .expect("emit_canonical_params_impl fills metal consts under -Fmetal");
+        let mc = &resolved_metal_consts;
         let max_pos = KvCacheLayers::of(fuf).any().then(|| {
             let max_pos = model.bounds.get("max_position_embeddings").copied();
             max_pos
@@ -15544,9 +15609,7 @@ pub fn emit_model(
         // every fact baked; the pool picks one. See static_tape.rs.
         #[cfg(feature = "metal")]
         let tapes_static_toks = {
-            let mc = resolved_metal_consts
-                .as_ref()
-                .expect("emit_canonical_params_impl fills metal consts under -Fmetal");
+            let mc = &resolved_metal_consts;
             // A canonical metal has no kernel for (`[m2-eq] … REFUSED`: it has no steps) bakes NO
             // variants, so `MetalWorkerPool::for_buckets` refuses at load (`NoRung`), naming
             // the bucket. Baking its empty step tape instead would build VALID empty-command tapes:
@@ -15920,7 +15983,7 @@ pub fn emit_model(
     }));
     #[cfg(feature = "metal")]
     {
-        let mc = resolved_metal_consts.as_ref().expect("metal consts filled");
+        let mc = &resolved_metal_consts;
         metal_arena_bytes_statics.push(metal_tq_codebook_tokens(mc.kv_codec, mc.global_head_dim));
         // A multi-token-prediction head (its body reads the target's hidden rows) chains its
         // passes on the device.
@@ -17392,12 +17455,11 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let ts = emit_canonical_params_impl(
+        let (ts, _) = emit_canonical_params_impl(
             &m,
             1,
             false,
             &every_layer(&m),
-            #[cfg(feature = "metal")]
             &mut None,
         )
         .to_string();
@@ -17428,12 +17490,11 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let ts = emit_canonical_params_impl(
+        let (ts, _) = emit_canonical_params_impl(
             &m,
             2,
             false,
             &every_layer(&m),
-            #[cfg(feature = "metal")]
             &mut None,
         )
         .to_string();
@@ -17476,12 +17537,11 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let ts = emit_canonical_params_impl(
+        let (ts, _) = emit_canonical_params_impl(
             &m,
             8,
             false,
             &every_layer(&m),
-            #[cfg(feature = "metal")]
             &mut None,
         )
         .to_string();

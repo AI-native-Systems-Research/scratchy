@@ -54,6 +54,18 @@ use scratchy_triton_splice::PagedRows;
 /// The kernel states its sum ceiling-safe for the f16 the ladder
 /// runs it in (`rmsnorm.py`'s module doc — LegalizeTypes erases any widening), so every
 /// width is splicable and byte-compared.
+/// The tests' default model facts: granite-3.1-2b's uniform geometry (32 q heads, 8 kv heads,
+/// head_dim 64) — the numbers every non-attention graph in this file is inert to, and the class
+/// pair the attention/rope rows override per shape.
+fn consts() -> scratchy_subtile::model_consts::MetalModelConsts {
+    scratchy_subtile::fixtures::fixture_model_consts(2048, 512, 64)
+}
+
+/// The model facts of one attention/rope geometry: `(nqh, nkvh, hd)`, uniform (global == base).
+fn consts_for(nqh: u32, nkvh: u32, hd: u32) -> scratchy_subtile::model_consts::MetalModelConsts {
+    scratchy_subtile::fixtures::fixture_model_consts(nqh * hd, nkvh * hd, hd)
+}
+
 const SHAPES: &[(u32, u32)] = &[
     (1, 2048),
     (1, 4096),
@@ -70,13 +82,13 @@ fn spliced_rmsnorm_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
+        let layout = compute_bundle_layout(&ir, &consts(), &weight_ids, PagedRows::Sequence, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles the kernel for this node. Every width is
         // splicable (the kernel's ceiling-safe pre-scale), so an Err here is a broken row.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower(node, &ir, false)
+        let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), false)
             .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
 
         // ⛔ THE NAME LAW — `rmsnorm_s{id}`, the law the bundle's own consumers key on.
@@ -120,7 +132,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
         // collected the convention's own 1.0 alongside the epsilon, or the door's
         // slot lookup fails as a registry desync (the test's own control on the
         // wiring, not an assertion here: the door refuses below).
-        let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
+        let layout = compute_bundle_layout(&ir, &consts(), &weight_ids, PagedRows::Sequence, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
         assert!(
             layout
@@ -132,7 +144,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
 
         // The splice — the row compiles the oneplus entry for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower(node, &ir, false)
+        let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), false)
             .unwrap_or_else(|e| panic!("splice compiled the oneplus row m={m} c={c}: {e}"));
 
         // ⛔ THE NAME LAW — the SAME stem as the Scale row: the convention differs
@@ -185,7 +197,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
         // push is gated on the node's own convention, so a Scale-only model's
         // registry is byte-identical to the form before the row existed.
         let scale_ir = rmsnorm_ir(m, c, GainConvention::Scale);
-        let scale_layout = compute_bundle_layout(&scale_ir, &weight_ids, PagedRows::Sequence, &[])
+        let scale_layout = compute_bundle_layout(&scale_ir, &consts(), &weight_ids, PagedRows::Sequence, &[])
             .unwrap_or_else(|e| panic!("scale layout minted m={m} c={c}: {e}"));
         assert!(
             !scale_layout
@@ -242,7 +254,7 @@ fn spliced_silumul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
+        let layout = compute_bundle_layout(&ir, &consts(), &weight_ids, PagedRows::Sequence, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles the kernel for this node, at EVERY rung: a
@@ -250,7 +262,7 @@ fn spliced_silumul_lowers_through_the_door() {
         // the kernel (the `rows_per_block` law), so an Err here is a broken row or a
         // broken block law.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower(node, &ir, false)
+        let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), false)
             .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
 
         // ⛔ THE NAME LAW — `silumul_s{id}`.
@@ -328,11 +340,11 @@ fn a_column_chunked_silumul_splices_through_the_door() {
     chunked.nodes[0].output = window(2);
 
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-    let layout = compute_bundle_layout(&chunked, &weight_ids, PagedRows::Sequence, &[])
+    let layout = compute_bundle_layout(&chunked, &consts(), &weight_ids, PagedRows::Sequence, &[])
         .unwrap_or_else(|e| panic!("layout minted for the chunked node: {e}"));
 
     // The splice — the chunked node compiles (the kernels state `C_START`).
-    let spliced = scratchy_triton_splice::lower(&chunked.nodes[0], &chunked, false)
+    let spliced = scratchy_triton_splice::lower(&chunked.nodes[0], &chunked, &consts(), false)
         .unwrap_or_else(|e| panic!("splice compiled the chunked node: {e}"));
     assert_eq!(
         spliced.op_name,
@@ -357,7 +369,7 @@ fn a_column_chunked_silumul_splices_through_the_door() {
     // THE CONTROL: the whole-tensor node at the same total width still splices — the
     // discrimination is by REGION, never by width.
     let whole_node = &ir.nodes[0];
-    let spliced = scratchy_triton_splice::lower(whole_node, &ir, false)
+    let spliced = scratchy_triton_splice::lower(whole_node, &ir, &consts(), false)
         .expect("the whole-tensor node compiles");
     assert_eq!(
         spliced.op_name,
@@ -413,7 +425,7 @@ fn spliced_elementwise_lowers_through_the_door() {
             let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
             // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
+            let layout = compute_bundle_layout(&ir, &consts(), &weight_ids, PagedRows::Sequence, &[])
                 .unwrap_or_else(|e| panic!("layout minted {kind:?} m={m} c={c}: {e}"));
 
             // The splice — the row compiles the kernel for this node at every
@@ -421,7 +433,7 @@ fn spliced_elementwise_lowers_through_the_door() {
             // inside the kernel (the `rows_per_block` law), so an Err here is a
             // broken row or a broken block law.
             let node = &ir.nodes[0];
-            let spliced = scratchy_triton_splice::lower(node, &ir, false)
+            let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), false)
                 .unwrap_or_else(|e| panic!("splice compiled {kind:?} m={m} c={c}: {e}"));
 
             // ⛔ THE NAME LAW — the producer's own stem law (`add_s{id}`,
@@ -516,12 +528,12 @@ fn spliced_dense_matmul_lowers_through_the_door() {
 
         // The layout the tape walk computes for this graph (`rows_are_requests:
         // true` is the decode/batched shape).
-        let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
+        let layout = compute_bundle_layout(&ir, &consts(), &weight_ids, PagedRows::Sequence, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the row compiles the kernel for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower(node, &ir, true)
+        let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), true)
             .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
 
         // ⛔ THE NAME LAW — `matmul_s{id}`.
@@ -574,7 +586,7 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
 
     let ir = matmul_ir(m, k, n);
     let node = &ir.nodes[0];
-    let spliced = scratchy_triton_splice::lower(node, &ir, true)
+    let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), true)
         .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
     let k_node = spliced
         .ktir
@@ -685,7 +697,7 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
 
     let ir = elementwise_ir(m, c, kind);
     let node = &ir.nodes[0];
-    let spliced = scratchy_triton_splice::lower(node, &ir, false)
+    let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), false)
         .unwrap_or_else(|e| panic!("splice compiled {kind:?} m={m} c={c}: {e}"));
     let k_node = spliced
         .ktir
@@ -782,7 +794,7 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
 
     let ir = elementwise_ir(m, c, EwKind::Gelu);
     let node = &ir.nodes[0];
-    let spliced = scratchy_triton_splice::lower(node, &ir, false)
+    let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), false)
         .unwrap_or_else(|e| panic!("splice compiled gelu m={m} c={c}: {e}"));
     let k_node = spliced
         .ktir
@@ -874,12 +886,12 @@ fn spliced_scalarmul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
+        let layout = compute_bundle_layout(&ir, &consts(), &weight_ids, PagedRows::Sequence, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles `scalarmul.py` for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower(node, &ir, false)
+        let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), false)
             .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
 
         // ⛔ THE NAME LAW — `scalarmul_s{id}`.
@@ -923,7 +935,7 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
     let scale = 0.022_097_087f32;
     let ir = scalarmul_ir(1, LOGITS_COLS, scale);
     let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
-    let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
+    let layout = compute_bundle_layout(&ir, &consts(), &weight_ids, PagedRows::Sequence, &[])
         .unwrap_or_else(|e| panic!("layout minted for the chunked logits: {e}"));
 
     // ONE symbol counter across the bundle, the way the bake threads it — chunk k's
@@ -945,7 +957,7 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
         chunked.nodes[0].output = window(1);
 
         // The splice — every chunk compiles (`C_START` states the corner).
-        let spliced = scratchy_triton_splice::lower(&chunked.nodes[0], &chunked, false)
+        let spliced = scratchy_triton_splice::lower(&chunked.nodes[0], &chunked, &consts(), false)
             .unwrap_or_else(|e| {
                 panic!("splice compiled chunk {chunk_idx} (c_start {c_start}): {e}")
             });
@@ -1036,7 +1048,7 @@ fn a_prompt_chunks_rope_does_not_grow_with_its_rows() {
     // it); `rope_ir`'s tall `[mq·heads, hd]` node states ONE head of `mq·heads` positions.
     let ops_at = |mq: u32, heads: u32| {
         let ir = rope_plane_ir(mq, heads, 64);
-        let spliced = scratchy_triton_splice::lower(&ir.nodes[0], &ir, false)
+        let spliced = scratchy_triton_splice::lower(&ir.nodes[0], &ir, &consts(), false)
             .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads}: {e}"));
         let k = spliced.ktir.expect("spliced op carries its program");
         let ops = k.func.ops_deep();
@@ -1070,7 +1082,7 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
     // is tall row p·heads + h, column d), so the staging below is unchanged.
     let ir = rope_plane_ir(mq, heads, hd);
     let node = &ir.nodes[0];
-    let spliced = scratchy_triton_splice::lower(node, &ir, false)
+    let spliced = scratchy_triton_splice::lower(node, &ir, &consts_for(heads, heads, hd), false)
         .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}"));
     let k_node = spliced
         .ktir
@@ -1195,13 +1207,13 @@ fn batched_decode_odd_vocab_lm_head_splices() {
     let ir = matmul_ir(m, k, n);
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-    let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
+    let layout = compute_bundle_layout(&ir, &consts(), &weight_ids, PagedRows::Sequence, &[])
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
     // The splice — the odd vocab must compile at ANY row count (PlanCorelets'
     // SingleCorelet re-patterning), never refuse.
     let node = &ir.nodes[0];
-    let spliced = scratchy_triton_splice::lower(node, &ir, true)
+    let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), true)
         .unwrap_or_else(|e| panic!("odd vocab must splice at any row count: {e}"));
     assert_eq!(
         spliced.op_name,
@@ -1244,12 +1256,12 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
     for &(mq, k, n) in &[(31u32, 2048u32, 49_155u32), (8u32, 2048u32, 49_155u32)] {
         let ir = matmul_ir(mq, k, n);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
+        let layout = compute_bundle_layout(&ir, &consts(), &weight_ids, PagedRows::Sequence, &[])
             .unwrap_or_else(|e| panic!("layout minted mq={mq} k={k} n={n}: {e}"));
 
         // The splice — `lower_all` takes the fold route for this shape.
         let node = &ir.nodes[0];
-        let spliced_ops = scratchy_triton_splice::lower_all(node, &ir, false)
+        let spliced_ops = scratchy_triton_splice::lower_all(node, &ir, &consts(), false)
             .unwrap_or_else(|e| panic!("splice folded mq={mq} k={k} n={n}: {e}"));
         assert_eq!(
             spliced_ops.len(),
@@ -1307,12 +1319,12 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
+        let layout = compute_bundle_layout(&ir, &consts(), &weight_ids, PagedRows::Sequence, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the Fp8Dynamic row compiles the kernel for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower(node, &ir, true)
+        let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), true)
             .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
 
         // ⛔ THE NAME LAW — `matmul_s{id}` (fp8 shares dense's `Program::Matmul`).
@@ -1370,7 +1382,7 @@ fn spliced_fp8_matmul_executes_the_real_program() {
 fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
     let ir = matmul_fp8_ir(m, k, n);
     let node = &ir.nodes[0];
-    let spliced = scratchy_triton_splice::lower(node, &ir, true)
+    let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), true)
         .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
     let k_node = spliced
         .ktir
@@ -1585,9 +1597,15 @@ fn spliced_rope_lowers_through_the_door() {
             let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
             // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
-                .unwrap_or_else(|e| {
-                    panic!(
+            let layout = compute_bundle_layout(
+                &ir,
+                &consts_for(heads, heads, hd),
+                &weight_ids,
+                PagedRows::Sequence,
+                &[],
+            )
+            .unwrap_or_else(|e| {
+                panic!(
                         "layout minted mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}"
                     )
                 });
@@ -1596,8 +1614,13 @@ fn spliced_rope_lowers_through_the_door() {
             // no rope-specific refusal (the historical builder's own `total % hd` refusal is
             // mirrored as an Err, not a fallthrough), so an Err here is a broken row.
             let node = &ir.nodes[0];
-            let spliced = scratchy_triton_splice::lower(node, &ir, rows_are_requests)
-                .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}"));
+            let spliced = scratchy_triton_splice::lower(
+                node,
+                &ir,
+                &consts_for(heads, heads, hd),
+                rows_are_requests,
+            )
+            .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}"));
 
             // ⛔ THE NAME LAW — `rope_s{id}`.
             assert_eq!(
@@ -1655,7 +1678,7 @@ fn rope_plane_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
     let node = SubtileNode {
         id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
         op: SubOp::RopeRotate {
-            head_dim: scratchy_subtile::model_geometry::HeadDim::new(hd),
+            attn: scratchy_subtile::subtile_ir::AttnMask::Causal,
             _form: std::marker::PhantomData,
         },
         inputs: vec![whole(0), whole(1), whole(2)],
@@ -1699,7 +1722,7 @@ fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
     let node = SubtileNode {
         id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
         op: SubOp::RopeRotate {
-            head_dim: scratchy_subtile::model_geometry::HeadDim::new(hd),
+            attn: scratchy_subtile::subtile_ir::AttnMask::Causal,
             _form: std::marker::PhantomData,
         },
         inputs: vec![whole(0), whole(1), whole(2)],
@@ -2068,7 +2091,7 @@ const ATTN_VALID_LEN: u32 = 33;
 /// op before it writing the SAME cache sources, which is what makes `lower_region` bind
 /// `KvCacheProducer::SameForwardRopeAppend` (its `k_cache_producer_node` map). `valid_len`
 /// rides the op (`SubOp::attn_decode`'s own field) at the value production threads.
-fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
+fn attn_ir(s: AttnShape) -> SubtileIR {
     let (nqh, nkvh, hd) = s.geom;
     let q_width = nqh * hd;
     let kv_width = nkvh * hd;
@@ -2119,8 +2142,6 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
     // law; `valid_len` is threaded as production threads it.
     let attn_op = scratchy_subtile::lower::OpDesc {
         op: scratchy_subtile::subtile_ir::SubOp::attn_decode(
-            attn_geometry(s.geom).expect("granite's geometry mints"),
-            scale,
             valid_len,
             scratchy_subtile::subtile_ir::AttnMask::Causal,
         ),
@@ -2147,7 +2168,6 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
                 // 0: k' = rope_append(k, cos, sin, v, prefix_k, prefix_v)
                 scratchy_subtile::lower::OpDesc {
                     op: scratchy_subtile::subtile_ir::SubOp::rope_append(
-                        scratchy_subtile::model_geometry::HeadDim::new(hd),
                         0,
                         scratchy_subtile::subtile_ir::AttnMask::Causal,
                         scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
@@ -2182,23 +2202,13 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
     }
 }
 
-/// granite's geometry, through the same mint the config path uses.
-fn attn_geometry(
-    geom: (u32, u32, u32),
-) -> Option<scratchy_subtile::model_geometry::ModelAttnGeometry> {
-    scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
-        scratchy_subtile::model_geometry::QueryHeads::new(geom.0),
-        scratchy_subtile::model_geometry::KvHeads::new(geom.1),
-        scratchy_subtile::model_geometry::HeadDim::new(geom.2),
-    )
-}
 
 /// spyre-inference's paged kernels attend causally, so a sliding-window attention (gemma's local
 /// layers) is refused by name rather than run as causal.
 #[test]
 fn a_sliding_window_attention_is_refused() {
     let s = ATTN_SHAPES[0];
-    let mut ir = attn_ir(s, 0.015625);
+    let mut ir = attn_ir(s);
     let node = ir.nodes.last_mut().expect("the attention");
     let scratchy_subtile::subtile_ir::SubOp::AttnDecode { mask, .. } = &mut node.op else {
         panic!("the last node is the attention");
@@ -2207,7 +2217,7 @@ fn a_sliding_window_attention_is_refused() {
         window: std::num::NonZeroU32::new(4096).expect("a window"),
     };
     let node = ir.nodes.last().expect("the attention");
-    let Err(e) = scratchy_triton_splice::lower_attn(node, &ir, s.active_cap(), PagedRows::Sequence)
+    let Err(e) = scratchy_triton_splice::lower_attn(node, &ir, &consts_for(s.geom.0, s.geom.1, s.geom.2), 0.015625, s.active_cap(), PagedRows::Sequence)
     else {
         panic!("a sliding window must be refused");
     };
@@ -2232,10 +2242,10 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
     };
     // 16 pages (a 2048-position context): the ceiling rung walks all 16 and a chunk gathers 16.
     let small = at_pages(16);
-    let ir = attn_ir(small, 0.015625);
+    let ir = attn_ir(small);
     let node = ir.nodes.last().expect("the attention");
     let Err(e) =
-        scratchy_triton_splice::lower_attn(node, &ir, small.active_cap(), PagedRows::Batch)
+        scratchy_triton_splice::lower_attn(node, &ir, &consts_for(32, 8, 64), 0.015625, small.active_cap(), PagedRows::Batch)
     else {
         panic!("a chunk gathering the whole pool must be refused");
     };
@@ -2246,9 +2256,9 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
     );
     // 64 pages: a chunk takes 32 of them, so the same one-request decode splices.
     let big = at_pages(64);
-    let ir = attn_ir(big, 0.015625);
+    let ir = attn_ir(big);
     let node = ir.nodes.last().expect("the attention");
-    scratchy_triton_splice::lower_attn(node, &ir, big.active_cap(), PagedRows::Batch)
+    scratchy_triton_splice::lower_attn(node, &ir, &consts_for(32, 8, 64), 0.015625, big.active_cap(), PagedRows::Batch)
         .expect("a pool wider than one chunk splices");
 }
 
@@ -2256,11 +2266,11 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
 fn the_paged_attention_splices_with_its_contract() {
     for &s in ATTN_SHAPES {
         let scale = if s.geom.2 == 64 { 0.015625 } else { 0.0078125 };
-        let ir = attn_ir(s, scale);
+        let ir = attn_ir(s);
         let node = ir.nodes.last().unwrap();
         let at = format!("geom={:?} mq={} rung={}", s.geom, s.mq, s.rung);
         let spliced =
-            scratchy_triton_splice::lower_attn(node, &ir, s.active_cap(), PagedRows::Sequence);
+            scratchy_triton_splice::lower_attn(node, &ir, &consts_for(s.geom.0, s.geom.1, s.geom.2), scale, s.active_cap(), PagedRows::Sequence);
         // ⛔ A PRE-POPULATED CACHE IS REFUSED: the walk reads the step's keys from the pools, and
         // only this forward's RopeAppend scatters them there.
         if !s.rope_appended {
@@ -2517,16 +2527,16 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
 
     let (nqh, nkvh, hd) = s.geom;
     let scale = if hd == 64 { 0.015625f32 } else { 0.0078125 };
-    let ir = attn_ir(s, scale);
+    let ir = attn_ir(s);
     let (rope, attn) = (&ir.nodes[0], &ir.nodes[1]);
     let at = format!(
         "geom={:?} mq={} cap={} cached={cached}",
         s.geom, s.mq, s.cap
     );
-    let mut programs = scratchy_triton_splice::lower_all(rope, &ir, false)
+    let mut programs = scratchy_triton_splice::lower_all(rope, &ir, &consts_for(nqh, nkvh, hd), false)
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
     programs.push(
-        scratchy_triton_splice::lower_attn(attn, &ir, s.active_cap(), PagedRows::Sequence)
+        scratchy_triton_splice::lower_attn(attn, &ir, &consts_for(s.geom.0, s.geom.1, s.geom.2), scale, s.active_cap(), PagedRows::Sequence)
             .unwrap_or_else(|e| panic!("the walk spliced {at}: {e}")),
     );
     assert_eq!(programs.len(), 3, "{at}: rope, KV write, walk");
@@ -2576,6 +2586,7 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
     // blocks are the pool's pages REVERSED.
     let step = scratchy_target_spyre::lower_subtile_tape_to_ktir::paged_step_of_ir(
         &ir,
+        &consts_for(s.geom.0, s.geom.1, s.geom.2),
         s.active_cap(),
         PagedRows::Sequence,
     )
@@ -2782,16 +2793,16 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
 
     let (nqh, nkvh, hd) = s.geom;
     let scale = if hd == 64 { 0.015625f32 } else { 0.0078125 };
-    let ir = attn_ir(s, scale);
+    let ir = attn_ir(s);
     let (rope, attn) = (&ir.nodes[0], &ir.nodes[1]);
     let at = format!(
         "geom={:?} B={} cap={} rung={} contexts={contexts:?}",
         s.geom, s.mq, s.cap, s.rung
     );
-    let mut programs = scratchy_triton_splice::lower_all(rope, &ir, true)
+    let mut programs = scratchy_triton_splice::lower_all(rope, &ir, &consts_for(nqh, nkvh, hd), true)
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
     programs.push(
-        scratchy_triton_splice::lower_attn(attn, &ir, s.active_cap(), PagedRows::Batch)
+        scratchy_triton_splice::lower_attn(attn, &ir, &consts_for(s.geom.0, s.geom.1, s.geom.2), scale, s.active_cap(), PagedRows::Batch)
             .unwrap_or_else(|e| panic!("the batched walk spliced {at}: {e}")),
     );
     assert_eq!(programs.len(), 3, "{at}: rope, KV write, batched walk");
@@ -2848,6 +2859,7 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
 
     let step = scratchy_target_spyre::lower_subtile_tape_to_ktir::paged_step_of_ir(
         &ir,
+        &consts_for(s.geom.0, s.geom.1, s.geom.2),
         s.active_cap(),
         PagedRows::Batch,
     )
@@ -3008,7 +3020,7 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
         for gain in [GainConvention::Scale, GainConvention::OnePlusScale] {
             let ir = rmsnorm_ir(m, c, gain);
             let node = &ir.nodes[0];
-            let spliced = scratchy_triton_splice::lower(node, &ir, false)
+            let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), false)
                 .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
             let f = spliced
                 .ktir
@@ -3056,7 +3068,7 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
     for &(m, c) in SHAPES {
         let ir = rmsnormunit_ir(m, c);
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower(node, &ir, false)
+        let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), false)
             .unwrap_or_else(|e| panic!("splice compiled the unit row m={m} c={c}: {e}"));
         let f = spliced
             .ktir
@@ -3081,7 +3093,7 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
     // The negative control: a program with no norm recognizes on NEITHER side.
     let ir = silumul_ir(1, 4096);
     let node = &ir.nodes[0];
-    let spliced = scratchy_triton_splice::lower(node, &ir, false)
+    let spliced = scratchy_triton_splice::lower(node, &ir, &consts(), false)
         .unwrap_or_else(|e| panic!("splice compiled the silumul control: {e}"));
     let f = spliced
         .ktir
@@ -3138,10 +3150,10 @@ fn a_paged_walks_program_does_not_grow_with_its_rows() {
             rung: 0,
             rope_appended: true,
         };
-        let ir = attn_ir(s, 0.015625);
+        let ir = attn_ir(s);
         let node = ir.nodes.last().unwrap();
         let spliced =
-            scratchy_triton_splice::lower_attn(node, &ir, s.active_cap(), PagedRows::Sequence)
+            scratchy_triton_splice::lower_attn(node, &ir, &consts_for(s.geom.0, s.geom.1, s.geom.2), 0.015625, s.active_cap(), PagedRows::Sequence)
                 .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
         spliced
             .ktir
