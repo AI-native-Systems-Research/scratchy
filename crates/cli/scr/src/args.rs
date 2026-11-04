@@ -92,7 +92,78 @@ pub struct LaunchArgs {
 pub enum LaunchSubcommand {
     /// Launch Claude Code against a locally-served model via the Anthropic
     /// Messages API (`/v1/messages`).
-    Claude(LaunchClaudeArgs),
+    Claude(Box<LaunchClaudeArgs>),
+    /// Score a local model on Claude Code's auto-mode safety checks, through
+    /// the proxy `launch claude --auto-mode-only` runs. No command is executed.
+    ClaudeEval(ClaudeEvalArgs),
+}
+
+/// Arguments for `scr launch claude-eval`.
+#[derive(Parser, Debug)]
+pub struct ClaudeEvalArgs {
+    #[command(subcommand)]
+    pub command: ClaudeEvalCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ClaudeEvalCommand {
+    /// Save the template: the first recorded safety-check request in a
+    /// `scripts/cc_trace.py record` corpus. It holds Anthropic's security
+    /// prompt, so keep it under the gitignored `bench_results/`.
+    Template {
+        /// The corpus directory `cc_trace.py record --out` wrote.
+        trace: std::path::PathBuf,
+        /// Where to save it.
+        #[arg(default_value = "bench_results/automode/template.json")]
+        out: std::path::PathBuf,
+    },
+    /// Give every unlabelled case Claude Code's own verdict, through your
+    /// gateway.
+    Label {
+        #[command(flatten)]
+        files: ClaudeEvalFiles,
+        /// Your gateway (default: ANTHROPIC_BASE_URL).
+        #[arg(long, env = "ANTHROPIC_BASE_URL")]
+        gateway: String,
+        /// Your gateway's token (default: ANTHROPIC_AUTH_TOKEN).
+        #[arg(long, env = "ANTHROPIC_AUTH_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        /// The classifier that labels. The default is the model Claude Code
+        /// sends its safety checks under when nothing configures it (seen in
+        /// its recorded check requests and debug log), so the expected verdict
+        /// is the one Claude Code would get.
+        #[arg(long, default_value = "claude-sonnet-5")]
+        model: String,
+        /// Relabel cases that already have a verdict.
+        #[arg(long)]
+        relabel: bool,
+    },
+    /// Score a local scratchy against the labels. Fails on any false allow.
+    Run {
+        #[command(flatten)]
+        files: ClaudeEvalFiles,
+        /// The local scratchy server, started with
+        /// `--default-chat-template-kwargs '{"enable_thinking": false}'`.
+        #[arg(long, default_value = "http://127.0.0.1:8000")]
+        local: String,
+        /// Write per-case results here (keep it under bench_results/).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+}
+
+/// The two files `label` and `run` read.
+#[derive(clap::Args, Debug)]
+pub struct ClaudeEvalFiles {
+    /// The cases (one JSON object per line).
+    #[arg(long, default_value = "scripts/automode_cases.jsonl")]
+    pub cases: std::path::PathBuf,
+    /// One recorded safety-check request (see `template`).
+    #[arg(long, default_value = "bench_results/automode/template.json")]
+    pub template: std::path::PathBuf,
+    /// Seconds to wait for each check.
+    #[arg(long, default_value_t = 600)]
+    pub timeout: u64,
 }
 
 /// Arguments for `scr launch claude`.

@@ -462,7 +462,7 @@ fn served_context_window(base_url: &str, auth_token: &str) -> Option<usize> {
 
 /// The id the server serves its model under, from `/v1/models`, or `None` when
 /// it cannot say.
-fn served_model_id(base_url: &str, auth_token: &str) -> Option<String> {
+pub(crate) fn served_model_id(base_url: &str, auth_token: &str) -> Option<String> {
     let client = crate::http::RemoteClient::with_timeout(auth_token, CONTEXT_WINDOW_TIMEOUT);
     let models = client.get_json(&format!("{base_url}/v1/models")).ok()?;
     let id = models

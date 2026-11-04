@@ -107,7 +107,43 @@ async fn run() -> anyhow::Result<()> {
         Commands::Launch(cmd) => {
             use crate::args::LaunchSubcommand;
             match cmd.command {
-                LaunchSubcommand::Claude(args) => commands::launch::run_launch_claude(args).await,
+                LaunchSubcommand::Claude(args) => commands::launch::run_launch_claude(*args).await,
+                LaunchSubcommand::ClaudeEval(args) => {
+                    use crate::args::ClaudeEvalCommand as E;
+                    use commands::launch_eval as eval;
+                    let secs = std::time::Duration::from_secs;
+                    match args.command {
+                        E::Template { trace, out } => eval::run_template(&trace, &out),
+                        E::Label {
+                            files,
+                            gateway,
+                            token,
+                            model,
+                            relabel,
+                        } => {
+                            eval::run_label(
+                                &files.cases,
+                                &files.template,
+                                gateway.trim_end_matches('/').to_string(),
+                                token,
+                                &model,
+                                relabel,
+                                secs(files.timeout),
+                            )
+                            .await
+                        }
+                        E::Run { files, local, out } => {
+                            eval::run_run(
+                                &files.cases,
+                                &files.template,
+                                local.trim_end_matches('/').to_string(),
+                                out.as_deref(),
+                                secs(files.timeout),
+                            )
+                            .await
+                        }
+                    }
+                }
             }
         }
         #[cfg(feature = "bench")]

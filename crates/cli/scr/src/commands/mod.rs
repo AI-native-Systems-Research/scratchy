@@ -23,6 +23,8 @@ pub mod launch;
 #[cfg(feature = "claude")]
 pub mod launch_best_model;
 #[cfg(feature = "claude")]
+pub mod launch_eval;
+#[cfg(feature = "claude")]
 pub mod launch_proxy;
 pub mod model;
 #[cfg(any(feature = "cuda", feature = "metal"))]
