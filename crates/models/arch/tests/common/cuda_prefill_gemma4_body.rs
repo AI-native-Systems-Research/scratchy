@@ -1939,7 +1939,7 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
         .expect("layer 0's RopeAppend");
     let mut through_append = true;
     let first_gemv = (s1.iter())
-        .position(|&i| matches!(one.steps[i], CudaStep::Gemv(_)))
+        .position(|&i| matches!(one.steps[i], CudaStep::Gemv(_) | CudaStep::GemvGroup(_)))
         .expect("layer 0's projections");
     let mut gemvs_bounded = true;
     let (mut cache_same, mut attention_ok, mut picks_same) = (None, None, None);
@@ -1962,6 +1962,20 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
             .iter()
             .map(|s| s.map(|(x, _)| read_span(&mut w, x)))
             .collect();
+        // A grouped GEMV's members, each with its own output (#1049): read before the m=512 cut.
+        let members: Vec<(GemmBf16, Vec<u16>)> = match a {
+            CudaStep::GemvGroup(g) => (g.members().into_iter().flatten())
+                .map(|m| g.member(m))
+                .map(|g| {
+                    let c = ArenaSpan {
+                        offset: g.c,
+                        bytes: u64::from(g.m) * u64::from(g.n) * 2,
+                    };
+                    (g, read_span(&mut w, c))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         run(
             &mut w,
             (tapes, CUDA_TAPES.len() + s1.len() + j),
@@ -1999,6 +2013,21 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
             let cmp = numerics::compare(&y, &x, &b[..n * k], 1, n, k);
             eprintln!("(k-diag0) step {j} GEMV against f64 on its own input: {}", cmp.line());
             gemvs_bounded &= cmp.pass();
+        }
+        if j <= append
+            && matches!(a, CudaStep::GemvGroup(_))
+            && let Some((x, _)) = pair(0)
+        {
+            for (i, (g, y)) in members.iter().enumerate() {
+                let b = host_weights()[g.b.0 as usize].as_ref().expect("the GEMV's weight");
+                let (n, k) = (g.n as usize, g.k as usize);
+                let cmp = numerics::compare(y, &x, &b[..n * k], 1, n, k);
+                eprintln!(
+                    "(k-diag0) step {j} grouped GEMV member {i} against f64 on its own input: {}",
+                    cmp.line()
+                );
+                gemvs_bounded &= cmp.pass();
+            }
         }
         eprintln!(
             "(k-diag0) step {j} (m=1 step {i1} {}, m=512 step {i5} {}): {in_line}; {out_line}",

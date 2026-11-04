@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use scratchy_subtile::handoff::TargetModelInput;
-use scratchy_target_cuda::step::{AttnPrefillBf16, CudaStep, EmbedBf16, GemmBf16};
+use scratchy_target_cuda::step::{
+    AttnPrefillBf16, CudaStep, EmbedBf16, GemmBf16, GemmGroupBf16,
+};
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, CudaTape, TapeInput, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
 use scratchy_target_cuda_compiler::emit::{lower_model, model_facts};
@@ -210,7 +212,10 @@ fn the_decode_tape_has_the_predicted_layout() {
     assert_eq!([gdn.sequence, gdn.scratch], DECODE_GDN, "GDN regions");
     for (i, step) in tape.steps.iter().enumerate() {
         match *step {
-            CudaStep::Gemv(GemmBf16 { m, .. }) | CudaStep::GemmNarrow(GemmBf16 { m, .. }) => {
+            CudaStep::Gemv(GemmBf16 { m, .. })
+            | CudaStep::GemmNarrow(GemmBf16 { m, .. })
+            | CudaStep::GemvGroup(GemmGroupBf16 { m, .. })
+            | CudaStep::GemmNarrowGroup(GemmGroupBf16 { m, .. }) => {
                 assert_eq!(m, 1, "step {i}");
             }
             CudaStep::AttnDecode(AttnPrefillBf16 {
