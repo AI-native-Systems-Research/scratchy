@@ -17486,14 +17486,8 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let (ts, _) = emit_canonical_params_impl(
-            &m,
-            1,
-            false,
-            &every_layer(&m),
-            &mut None,
-        )
-        .to_string();
+        let (ts, _) = emit_canonical_params_impl(&m, 1, false, &every_layer(&m));
+        let ts = ts.to_string();
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 32"),
@@ -17521,14 +17515,8 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let (ts, _) = emit_canonical_params_impl(
-            &m,
-            2,
-            false,
-            &every_layer(&m),
-            &mut None,
-        )
-        .to_string();
+        let (ts, _) = emit_canonical_params_impl(&m, 2, false, &every_layer(&m));
+        let ts = ts.to_string();
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 16"),
             "tp=2 must shard NUM_Q_HEADS to 16; got {ts}"
@@ -17568,14 +17556,8 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let (ts, _) = emit_canonical_params_impl(
-            &m,
-            8,
-            false,
-            &every_layer(&m),
-            &mut None,
-        )
-        .to_string();
+        let (ts, _) = emit_canonical_params_impl(&m, 8, false, &every_layer(&m));
+        let ts = ts.to_string();
         // 32 / 8 = 4
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 4"),
@@ -18594,6 +18576,9 @@ mod fingerprint_tests {
     /// TurboQuant threshold reads their bytes — Nano's 6 and Super's 8 attention layers of 2 KV
     /// heads x 128 are 6 and 8 KiB/token, below `MIN_KV_BYTES_PER_TOKEN`, where every one of
     /// their 52 / 88 layers would read as 52 / 88 KiB. Layers that all hold KV are no subset.
+    /// `scratchy_ir` is an optional dep the `metal` feature enables (as on main), so this runs
+    /// in the metal scope alone — the scope it always ran in, not a widening or a weakening.
+    #[cfg(feature = "metal")]
     #[test]
     fn a_recurrent_hybrids_kv_layers_are_its_attention_layers() {
         use scratchy_ir::{DenseReason, KvGeometry, TqBits, codec_for};
