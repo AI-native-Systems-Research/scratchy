@@ -155,7 +155,7 @@ fn the_tapes_are_the_decode_and_prefill_buckets_and_validate() {
 #[test]
 fn the_buckets_below_the_gemm_tile_are_left_out_and_named() {
     let ms: Vec<u32> = CUDA_UNLOWERED.iter().map(|&(m, _)| m).collect();
-    assert_eq!(ms, [2, 4, 8, 64], "CUDA_UNLOWERED's buckets");
+    assert_eq!(ms, [2, 4, 8, 16, 32, 64], "CUDA_UNLOWERED's buckets");
     for &(m, why) in CUDA_UNLOWERED {
         let want = format!("m = {m} must be a non-zero multiple of 128, the bf16 GEMM's tile");
         assert!(why.contains(&want), "m={m}: {why}");
