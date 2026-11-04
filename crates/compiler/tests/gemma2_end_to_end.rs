@@ -103,16 +103,3 @@ fn every_gemma2_config_was_compiled() {
     let _: usize = gemma2_9b::NUM_TILES;
     let _: usize = gemma2_27b::NUM_TILES;
 }
-
-// `every_workload_bucket_solved_for_gemma2_2b` and
-// `gemma2_predicted_us_is_finite_and_monotonic_in_m` used to read
-// per-bucket `m_<N>::PREDICTED_US`. The cost-monotonicity invariant
-// (prefill ≫ decode) lives in `solver::tests::
-// prefill_cost_dwarfs_decode_cost`, which calls `solve()` directly
-// for `llama-3.2-1b` — gemma2 shares the same cost model, so the
-// llama-side check is a sufficient regression guard for the silent-
-// drop-to-zero bug class. The per-bucket `m_X[_sk_Y]` stub modules
-// are no longer emitted (~9k lines saved workspace-wide).
-
-#[test]
-fn arch_level_weights_enum_and_dispatch_exist_for_gemma2() {}
