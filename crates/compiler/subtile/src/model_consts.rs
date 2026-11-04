@@ -139,10 +139,15 @@ impl MetalModelConsts {
             num_q_heads: W::NUM_Q_HEADS,
             num_kv_heads: W::NUM_KV_HEADS,
             num_global_kv_heads: W::NUM_GLOBAL_KV_HEADS,
-            global_queries_per_kv: if W::NUM_GLOBAL_KV_HEADS == 0 {
-                0
-            } else {
+            // A plain division: the GQA law's const assert (the one this fill's own doc names)
+            // proves `num_global_kv_heads >= 1` for every attention body, so the division is
+            // exact and safe. The no-attention body (`head_dim == 0`, vision) has no GQA group;
+            // gating the field on that head-dim zero is the parked "absence as a type" item,
+            // held here as an explicit `head_dim > 0` arm rather than a 0-queries sentinel.
+            global_queries_per_kv: if W::HEAD_DIM > 0 {
                 W::NUM_Q_HEADS / W::NUM_GLOBAL_KV_HEADS
+            } else {
+                0
             },
             q_size: W::Q_SIZE,
             hidden_size: W::HIDDEN_SIZE,

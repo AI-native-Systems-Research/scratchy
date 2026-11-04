@@ -20,6 +20,13 @@ use crate::subtile_ir::{
 /// selects the same numbers and the fixtures' numerics are exactly what they were when the ops
 /// carried them. `h`/`kv`/`hd` are [`one_layer_input_shaped`]'s own parameters.
 pub fn fixture_model_consts(h: u32, kv: u32, hd: u32) -> MetalModelConsts {
+    // The same law `one_layer_input_shaped` asserts for its own trio: every fixture that reaches
+    // this fill is an attention body, so `kv / hd >= 1` and the GQA division below is exact.
+    // A no-attention body (`hd == 0`) is not a fixture and does not reach here.
+    assert!(
+        hd > 0 && kv / hd > 0,
+        "fixture_model_consts fills an attention body: kv/hd must be at least 1"
+    );
     MetalModelConsts {
         metal_dtype: scratchy_tensors::MetalDtype::F16,
         scale_dtype: scratchy_tensors::ScaleDtype::F16,
@@ -28,11 +35,7 @@ pub fn fixture_model_consts(h: u32, kv: u32, hd: u32) -> MetalModelConsts {
         num_q_heads: h / hd,
         num_kv_heads: kv / hd,
         num_global_kv_heads: kv / hd,
-        global_queries_per_kv: if kv / hd == 0 {
-            0
-        } else {
-            (h / hd) / (kv / hd)
-        },
+        global_queries_per_kv: (h / hd) / (kv / hd),
         q_size: h as usize,
         hidden_size: h as usize,
         intermediate_size: 0,
@@ -109,7 +112,7 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
     // A `(h, kv, hd)` trio whose kv-head count does not divide its query-head count is not a
     // model, and the fixture cannot name one.
     assert!(
-        kv / hd != 0 && (h / hd) % (kv / hd) == 0,
+        kv / hd != 0 && (h / hd).is_multiple_of(kv / hd),
         "one_layer_input_shaped: h/hd must be a multiple of kv/hd"
     );
     LoweringInput {
