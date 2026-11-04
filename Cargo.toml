@@ -126,7 +126,7 @@ bytes = "1"
 rand = "0.9"
 
 # ZeroMQ
-zeromq = "0.6"
+zeromq = "0.7"
 
 # Tokenizer. default-features=false drops the training-only defaults, since we
 # only ever infer: `progressbar` (training progress bars) and `esaxx_fast` (the
