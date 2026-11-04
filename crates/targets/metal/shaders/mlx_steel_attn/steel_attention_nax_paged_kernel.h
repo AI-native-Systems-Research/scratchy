@@ -677,7 +677,9 @@ template <
     int WM,
     int WN,
     int BLOCK_SIZE_,
-    typename AccumType = float>
+    typename AccumType = float,
+    bool PACKED = false,
+    int SPLITS = 0>
 [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]]
 void attention_nax_paged_wide(
     device T*          O            [[buffer(0)]],
@@ -691,33 +693,52 @@ void attention_nax_paged_wide(
     const device uint* span_ids     [[buffer(8)]],
     // gpt-oss attention sinks (NAXP_SINKS): see `attention_nax_paged`.
     const device T*    sinks        [[buffer(9)]],
+    // SPLITS: the partials `attention_via_cache_v2_combine` merges, [token][q_head][SPLITS][2 + BD]
+    // floats — the row's max (natural-log units), its exp sum, its unnormalized O.
+    device float*      partials     [[buffer(10)]],
     uint simd_lane_id  [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]]) { // clang-format on
   using namespace mpp::tensor_ops;
   using Ext = dextents<int32_t, 2>;
+  static_assert(SPLITS == 0 || PACKED, "a split tile is a packed one");
 
   const uint seq_idx    = tid.z;
   const uint q_head_idx = tid.y;
   const uint gqa_factor = NAXP_NUM_Q_HEADS / NAXP_NUM_KV_HEADS;
-  const uint kv_head_idx = q_head_idx / gqa_factor;
+  // PACKED (a verify step's lanes, `attention_verify_pack_q`): a threadgroup a (KV head, sequence),
+  // its Q tile the group's query heads' rows packed — row r is head r >> 3's token r & 7.
+  const uint kv_head_idx = PACKED ? tid.y : q_head_idx / gqa_factor;
+  static_assert(!PACKED || (NAXP_NUM_Q_HEADS / NAXP_NUM_KV_HEADS * 8u <= uint(BQ) &&
+                            NAXP_WINDOW == 0 && !NAXP_ROPE_ON_READ_SET && !NAXP_SINKS_SET),
+                "a packed tile holds the group's 8-row lanes: full attention, no spans, no sinks");
 
   const uint seq_start     = cu_seqlens_q[seq_idx];
   const uint seq_end       = cu_seqlens_q[seq_idx + 1];
   const uint new_q_for_seq = seq_end - seq_start;
   const uint kv_len        = seq_used_k[seq_idx];
   const uint prefix_len    = kv_len - new_q_for_seq;
-  const uint q_block_base  = tid.x * uint(BQ);
+  // SPLITS: grid x is the split of the keys, one Q tile a sequence.
+  const uint split = SPLITS > 0 ? tid.x : 0u;
+  const uint q_block_base  = SPLITS > 0 ? 0u : tid.x * uint(BQ);
   const uint global_q_base = seq_start + q_block_base;
 
   if (q_block_base >= new_q_for_seq) {
     return;
   }
-  const uint q_tile_rows = min(uint(BQ), new_q_for_seq - q_block_base);
+  const uint q_tile_rows =
+      PACKED ? gqa_factor * 8u : min(uint(BQ), new_q_for_seq - q_block_base);
 
   const int Q_stride_tok = int(NAXP_NUM_Q_HEADS) * BD;
-  Q += int(global_q_base) * Q_stride_tok + int(q_head_idx) * BD;
-  O += int(global_q_base) * Q_stride_tok + int(q_head_idx) * BD;
+  // The Q tile's row stride: a token's heads, or a packed tile's one row.
+  const int q_stride = PACKED ? BD : Q_stride_tok;
+  if (PACKED) {
+    Q += int((seq_idx * NAXP_NUM_KV_HEADS + kv_head_idx) * uint(BQ)) * BD;
+    O += int(seq_start) * Q_stride_tok + int(kv_head_idx * gqa_factor) * BD;
+  } else {
+    Q += int(global_q_base) * Q_stride_tok + int(q_head_idx) * BD;
+    O += int(global_q_base) * Q_stride_tok + int(q_head_idx) * BD;
+  }
 
   const int kv_blk_stride  = int(NAXP_NUM_KV_HEADS) * BLOCK_SIZE_ * BD;
   const int kv_head_off    = int(kv_head_idx) * (BLOCK_SIZE_ * BD);
@@ -748,8 +769,8 @@ void attention_nax_paged_wide(
   const short lim_rows_q = short(int(q_tile_rows) - int(tm));
   // A warp past the tile's rows still runs its ops (its block meets every step): it reads the
   // tile's first rows and stores nothing.
-  const device T* Qw = Q + (lim_rows_q > 0 ? int(tm) : 0) * Q_stride_tok;
-  O += tm * Q_stride_tok + wn * DW;
+  const device T* Qw = Q + (lim_rows_q > 0 ? int(tm) : 0) * q_stride;
+  O += (PACKED ? 0 : tm * Q_stride_tok) + wn * DW;
 
   const short2 simd_coord = otile_t::NAXFrag_t::get_coord();
   const short sm = simd_coord.y;
@@ -770,9 +791,11 @@ void attention_nax_paged_wide(
 
   // Causal/window iteration bounds (absolute K-axis coords), shared by the threadgroup (its warps
   // meet every step): the Q tile rows are [prefix_len + q_block_base, ... + q_tile_rows).
-  const int abs_q_min = int(prefix_len) + int(q_block_base) + int(tm);
+  // A packed tile's rows are its lanes' tokens: row r at prefix_len + (r & 7), the last at kv_len.
+  const int abs_q_min = int(prefix_len) + (PACKED ? 0 : int(q_block_base) + int(tm));
   const int abs_q_first = int(prefix_len) + int(q_block_base);
-  const int abs_q_max_excl = abs_q_first + int(q_tile_rows);
+  const int abs_q_max_excl =
+      PACKED ? int(prefix_len + new_q_for_seq) : abs_q_first + int(q_tile_rows);
   const int kv_tiles_total = int((kv_len + uint(BK) - 1u) / uint(BK));
   int kb_lim = (abs_q_max_excl + BK - 1) / BK;
   if (kb_lim > kv_tiles_total) kb_lim = kv_tiles_total;
@@ -790,6 +813,13 @@ void attention_nax_paged_wide(
       const int span_kb = (int(sf) - 1) / int(BK);
       if (span_kb > kb_start) { kb_start = span_kb; }
     }
+  }
+
+  if (SPLITS > 0) {
+    const int n = kb_lim - kb_start;
+    const int s0 = kb_start + int(split) * n / SPLITS;
+    kb_lim = kb_start + int(split + 1) * n / SPLITS;
+    kb_start = s0;
   }
 
   // The first row of the `KQ`-key group `g`'s page, for K (pre-roped scratch for spans, else the
@@ -821,7 +851,7 @@ void attention_nax_paged_wide(
 
   // Tensor extents bound the rows the ops read: Q past the tile's rows and V past kv_len read as 0.
   tensor<device T, Ext, tensor_inline> q_rows(
-      (device T*)Qw, Ext(Q_stride_tok, max(min(int(lim_rows_q), int(kU)), 1)));
+      (device T*)Qw, Ext(q_stride, max(min(int(lim_rows_q), int(kU)), 1)));
   auto q_slice = [&](int d) { return q_rows.template slice<DW, dynamic_extent>(d, 0); };
   auto k_slice = [&](int g, int d) {
     tensor<device T, Ext, tensor_inline> k((device T*)(resolve_k(g) + d), Ext(BD, KQ));
@@ -902,7 +932,8 @@ void attention_nax_paged_wide(
           for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
             STEEL_PRAGMA_UNROLL
             for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
-              const int r = abs_q_min + sm + ii * stile_t::kFragRowsJump;
+              const int row = sm + ii * stile_t::kFragRowsJump;
+              const int r = PACKED ? int(prefix_len) + ((int(tm) + row) & 7) : abs_q_min + row;
               const int c = key0 + ik * kU + sn + jj;
               const auto loc = ii * stile_t::kFragThrCols + jj;
               const bool dead = c >= int(kv_len) || r < c ||
@@ -920,6 +951,14 @@ void attention_nax_paged_wide(
       for (short i = 0; i < kRowsPT; ++i) new_max[i] = max_score[i];
       Stile.template row_reduce<NMaxOp>(new_max);
       Stile.template row_bin_op<NExpSubOp>(new_max);
+      // A split's keys can all lie past a row's position (a short context's last split): its masked
+      // scores at the seed max exp2 to 1. Such a row has no key yet; it takes no weight.
+      if (SPLITS > 0) {
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < stile_t::kElemsPerTile; e++) {
+          Stile.elems()[e] = new_max[(e % 8) / 4] == neg_inf ? AccumType(0) : Stile.elems()[e];
+        }
+      }
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < kRowsPT; ++i) {
         factor[i] = fast::exp2(max_score[i] - new_max[i]);
@@ -950,6 +989,35 @@ void attention_nax_paged_wide(
     }
   }
 
+  if (SPLITS > 0) {
+    // Store this split's partials, a live row's (a lane's token, a group's head) only. The max is
+    // exp2-domain here and natural-log in the combine (exp(m_s − m) == exp2(m2_s − m2)); the sum
+    // Σ exp2(s − m2) is the same value in either base.
+    constexpr uint row_len = uint(BD) + 2u;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < 2; i++) {
+      const uint r = uint(tm + sm + i * 8);
+      if (r < q_tile_rows && (r & 7u) < new_q_for_seq) {
+        const uint token = seq_start + (r & 7u);
+        const uint head = kv_head_idx * gqa_factor + (r >> 3);
+        device float* p =
+            partials + ((token * NAXP_NUM_Q_HEADS + head) * uint(SPLITS) + split) * row_len;
+        if (wn == 0 && sn == 0) {
+          p[0] = float(max_score[i]) * M_LN2_F;
+          p[1] = float(sum_score[i]);
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < DW / kU; j++) {
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < 4; jj++) {
+            p[2 + wn * DW + j * kU + sn + jj] = float(Oc[j * 8 + i * 4 + jj]);
+          }
+        }
+      }
+    }
+    return;
+  }
+
   // ----- normalize + store -------------------------------------------------
   // Attention sinks (gpt-oss): the denominator gains the extra column's
   // weight, exp2(sink − rowmax) ≤ 1 by the seed, contributing no V.
@@ -968,10 +1036,52 @@ void attention_nax_paged_wide(
   STEEL_PRAGMA_UNROLL
   for (uint16_t i = 0; i < Oc.get_capacity(); ++i) Otile.elems()[i] = Oc[i] * rcp[(i % 8) / 4];
 
+  if (PACKED) {
+    // Row r = tm + sm + 8i: token r & 7 of query head r >> 3; a token past the lane's is padding.
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < DW / kU; j++) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < 2; i++) {
+        const uint r = uint(tm + sm + i * 8);
+        if (r < q_tile_rows && (r & 7u) < new_q_for_seq) {
+          device T* o = O + int(r & 7u) * Q_stride_tok + int(r >> 3) * BD + j * kU + sn;
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < 4; jj++) {
+            o[jj] = static_cast<T>(Otile.frag_at(0, j)[i * 4 + jj]);
+          }
+        }
+      }
+    }
+    return;
+  }
   if (lim_rows_q < BQ) {
     if (lim_rows_q <= 0) return;
     Otile.store_rows(O, Q_stride_tok, lim_rows_q);
   } else {
     Otile.store(O, Q_stride_tok);
   }
+}
+
+// A verify step's Q rows packed for the PACKED `attention_nax_paged_wide`: Qp[seq][kv_head][r][BD],
+// row r = hl * 8 + t holding query head kv_head * gqa + hl's token t of the sequence (zero past the
+// sequence's tokens, and past the group's heads up to the tile's 64 rows).
+// Grid: threadgroups (64, num_kv_heads, seqs), threads (BD, 1, 1).
+template <typename T, int BD>
+[[kernel, max_total_threads_per_threadgroup(BD)]]
+void attention_verify_pack_q(
+    device T*          Qp           [[buffer(0)]],
+    const device T*    Q            [[buffer(1)]],
+    const device uint* cu_seqlens_q [[buffer(2)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint d [[thread_index_in_threadgroup]]) {
+  const uint r = tid.x, kvh = tid.y, seq = tid.z;
+  const uint gqa = NAXP_NUM_Q_HEADS / NAXP_NUM_KV_HEADS;
+  const uint start = cu_seqlens_q[seq];
+  const uint nq = cu_seqlens_q[seq + 1] - start;
+  const uint hl = r >> 3, t = r & 7u;
+  T v = T(0);
+  if (hl < gqa && t < nq) {
+    v = Q[((start + t) * NAXP_NUM_Q_HEADS + kvh * gqa + hl) * uint(BD) + d];
+  }
+  Qp[((seq * NAXP_NUM_KV_HEADS + kvh) * 64u + r) * uint(BD) + d] = v;
 }

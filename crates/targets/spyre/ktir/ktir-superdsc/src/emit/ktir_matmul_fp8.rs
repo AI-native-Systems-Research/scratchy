@@ -46,6 +46,61 @@ pub(crate) struct Fp8Facts {
     pub out_tid: u32,
 }
 
+/// ⭐⭐⭐ THE ACTIVATIONS A BUNDLE HAS QUANTIZED, so far in program order — what lets every fp8
+/// matmul on one activation share ONE quantize chain (granite's q/k/v read one rms output, gate/up
+/// another: three chains become one, two become one).
+///
+/// The chain is a pure function of the activation's bytes, so a later matmul on the same buffer
+/// reuses the chain's `afp8`/`ascale` (both keyed by the activation's id, [`Fp8Facts::a_tid`]) —
+/// PROVIDED NOTHING HAS WRITTEN THE BUFFER SINCE. That proviso is the whole contract, so it is this
+/// type's, not the caller's: [`Self::written`] forgets a buffer, and the bundle walk calls it for
+/// every buffer a program stores, before and after that program lowers. A reuse can therefore only
+/// name a quantize of the bytes the matmul reads.
+///
+/// ⛔ AND THE GEOMETRY IS PART OF THE FACT. The chain's tensors are sized `[m, k]` (and laid out
+/// per pair), so a second matmul reading the same buffer at another row count or width would read
+/// a quantize of other bytes. That is refused by name rather than reused.
+///
+/// One per bundle lowering pass: a pass that lowers each program alone (a test, a standalone
+/// kernel) starts each from [`Self::default`], which is exactly that program's bundle.
+#[derive(Clone, Debug, Default)]
+pub struct QuantizedActivations {
+    held: std::collections::HashMap<u32, QuantGeometry>,
+}
+
+/// The extents one activation quantize chain was emitted at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuantGeometry {
+    m: u32,
+    k: u32,
+    pairs: u32,
+}
+
+impl QuantizedActivations {
+    /// Whether the chain for `a_tid` at this geometry must be EMITTED (`true`, and it is now held),
+    /// or is already held from an earlier matmul of this bundle (`false`, reuse its tensors).
+    fn first(&mut self, a_tid: u32, g: QuantGeometry) -> Result<bool, SuperDscError> {
+        match self.held.get(&a_tid) {
+            None => {
+                self.held.insert(a_tid, g);
+                Ok(true)
+            }
+            Some(&held) if held == g => Ok(false),
+            Some(held) => Err(SuperDscError(format!(
+                "fp8 quantize t{a_tid}: quantized at m={} k={} over {} pair(s) earlier in this \
+                 bundle and read again at m={} k={} over {} pair(s) — the chain's tensors are sized \
+                 by the first, so a reuse would read a quantize of other bytes",
+                held.m, held.k, held.pairs, g.m, g.k, g.pairs
+            ))),
+        }
+    }
+
+    /// Forget `tid`: a program wrote it, so its held quantize names bytes that are gone.
+    pub fn written(&mut self, tid: u32) {
+        self.held.remove(&tid);
+    }
+}
+
 /// ⭐⭐⭐ THE SHARED W8A8 ACTIVATION QUANTIZE — the first half of every fp8 matmul door
 /// (`matmul_fp8_descriptors`'s own body, extracted): `abs → amax → floor → scale → clamp →
 /// zero-pad → qfp8ch`, over the `[m, k]` activation, ONE scale per token row. The EXPERT door
@@ -72,7 +127,7 @@ pub(crate) fn fp8_quantize_descriptors(
     pairs: u32,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    quantized: &mut std::collections::HashSet<String>,
+    quantized: &mut QuantizedActivations,
 ) -> Result<Vec<EmittedOp>, SuperDscError> {
     // fp8 W8A8 PREFILL (m>1). torch-spyre's `quantize_fp8_with_scale`
     // (decompositions.py:966) takes `scale` as an input computed by the CALLER via native `torch.abs` +
@@ -170,13 +225,14 @@ pub(crate) fn fp8_quantize_descriptors(
         let neg448 = rbo(&crate::place::act_name(FP8_NEG448_TID));
         let inv448 = rbo(&crate::place::act_name(FP8_INV448_TID));
         let mut ops: Vec<EmittedOp> = Vec::new();
-        // SHARE the activation quantize across matmuls that read the SAME activation. `insert` returns false
-        // when this activation (`a_name`) was already quantized earlier in the bundle (e.g. K/V after Q, or
-        // Up after Gate — the expert door's gate/up pair is the same law) — in that case skip re-emitting
-        // the whole abs→amax→scale→clamp→qfp8ch chain and reuse its `afp8`/`ascale` (both named by
-        // `a_name`); only the per-matmul legs stay per-matmul. (The chain is a launch/op cost paid ONCE
-        // per distinct activation instead of once per matmul.)
-        let already_quantized = !quantized.insert(a_name.clone());
+        // SHARE the activation quantize across matmuls that read the SAME activation. `first` says
+        // whether this activation (`facts.a_tid`, at this geometry) still needs its chain, or was
+        // quantized earlier in the bundle with nothing written to it since ([`QuantizedActivations`]):
+        // K/V after Q, or Up after Gate (the expert door's gate/up pair is the same law). On reuse
+        // the whole abs→amax→scale→clamp→qfp8ch chain is skipped and its `afp8`/`ascale` (both keyed
+        // by `a_tid`) are read back; only the per-matmul legs stay per-matmul. (The chain is a
+        // launch/op cost paid ONCE per distinct activation instead of once per matmul.)
+        let already_quantized = !quantized.first(facts.a_tid, QuantGeometry { m, k, pairs })?;
         if !already_quantized {
             // `absx`'s ONLY consumer is the MAX-reduce right below (never a matmul) — same bug class as
             // rmsnorm's `sq16` (see rmsnorm.rs): a shape-driven RowBlocked handle would make it stickmajor-
@@ -541,7 +597,7 @@ pub(crate) fn matmul_fp8_descriptors(
     n: u32,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    quantized: &mut std::collections::HashSet<String>,
+    quantized: &mut QuantizedActivations,
 ) -> Result<Vec<EmittedOp>, SuperDscError> {
     let mut ops = fp8_quantize_descriptors(facts, m, k, 1, sym_id_base, layout, quantized)?;
     let stk = Fp16::ELEMS_PER_STICK; // 64
@@ -705,6 +761,49 @@ mod tests {
         }
     }
 
+    /// ⭐⭐⭐ ONE CHAIN PER ACTIVATION, AND NEVER ACROSS A WRITE. A second matmul on the held
+    /// activation emits only its own legs; once the activation's buffer is written the next matmul
+    /// quantizes the new bytes; a reuse at another row count is refused rather than reading a
+    /// quantize sized for the first.
+    #[test]
+    fn a_held_quantize_is_shared_until_its_activation_is_written() {
+        let (m, k, n) = (1u32, 256, 128);
+        let l = fp8_layout(m, k, n);
+        let chain = |ops: &[EmittedOp]| {
+            ops.iter()
+                .filter(|o| o.op_name.ends_with("fq_qspt_op") || o.op_name.ends_with("fq_afp8_op"))
+                .count()
+        };
+        let mms = |ops: &[EmittedOp]| ops.iter().filter(|o| o.op_name.ends_with("fq_mm")).count();
+        let mut q = QuantizedActivations::default();
+        let first = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut q)
+            .expect("the first matmul emits");
+        assert_eq!(
+            (chain(&first), mms(&first)),
+            (2, 1),
+            "the first matmul quantizes t7"
+        );
+        let second = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut q)
+            .expect("the second matmul emits");
+        assert_eq!(
+            (chain(&second), mms(&second)),
+            (0, 1),
+            "the second matmul on t7 reuses its quantize and keeps its own matmul"
+        );
+        q.written(7);
+        let after = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut q)
+            .expect("the matmul after the write emits");
+        assert_eq!(chain(&after), 2, "a written t7 is quantized again");
+        let refused = matmul_fp8_descriptors(&facts(), 2, k, n, &mut 0, Some(&l), &mut q)
+            .err()
+            .expect("t7 held at m=1 and read at m=2 is refused");
+        assert!(
+            refused.0.contains("m=1") && refused.0.contains("m=2"),
+            "{}",
+            refused.0
+        );
+    }
+
     /// ⭐⭐⭐⭐⭐ THE QUANT-CHAIN REDUCE AT AN LX-OVERFLOWING GEOMETRY STAYS SINGLE-SHOT.
     ///
     /// This is the gemma-4-12b fp8 prefill blocker's own shape class: `m=1024, k=16384`. The OLD
@@ -723,7 +822,7 @@ mod tests {
     fn the_quant_reduce_at_an_lx_overflowing_geometry_stays_single_shot() {
         let (m, k, n) = (1024u32, 16384, 128);
         let l = fp8_layout(m, k, n);
-        let mut quantized = std::collections::HashSet::new();
+        let mut quantized = QuantizedActivations::default();
         let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
             .expect("the wide-geometry fp8 chain emits");
         // The chain's ONE reduce — the fused quantscalepertokenfp8 — must be single-shot.
@@ -765,7 +864,7 @@ mod tests {
     fn the_quant_reduce_at_a_fused_overflowing_geometry_emits_partials() {
         let (m, k, n) = (71u32, 15360, 3840);
         let l = fp8_layout(m, k, n);
-        let mut quantized = std::collections::HashSet::new();
+        let mut quantized = QuantizedActivations::default();
         let ops = fp8_quantize_descriptors(&facts(), m, k, 1, &mut 0, Some(&l), &mut quantized)
             .expect("the fused-overflowing fp8 quant chain emits");
         assert!(
@@ -803,7 +902,7 @@ mod tests {
     fn the_quant_chain_at_a_fitting_geometry_is_one_fused_op() {
         let (m, k, n) = (32u32, 2048, 128);
         let l = fp8_layout(m, k, n);
-        let mut quantized = std::collections::HashSet::new();
+        let mut quantized = QuantizedActivations::default();
         let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
             .expect("the fitting-geometry fp8 chain emits");
         assert!(
@@ -850,7 +949,7 @@ mod tests {
             "2112 rounds up to the next whole 128-elem stick"
         );
         let l = fp8_layout(m, k, n);
-        let mut quantized = std::collections::HashSet::new();
+        let mut quantized = QuantizedActivations::default();
         let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
             .expect("the 2112-wide fp8 chain emits (the 26b wall is gone)");
         // The zero-fill exists (the `sub(448,448)` broadcast), and only ONE such op.
@@ -897,7 +996,7 @@ mod tests {
     fn an_aligned_k_emits_no_pad_op_and_no_widened_reservation() {
         let (m, k, n) = (32u32, 2048, 128);
         let l = fp8_layout(m, k, n);
-        let mut quantized = std::collections::HashSet::new();
+        let mut quantized = QuantizedActivations::default();
         let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
             .expect("the aligned-geometry fp8 chain emits");
         assert!(
@@ -927,7 +1026,7 @@ mod tests {
     fn the_26b_n2112_packed_kernel_out_stick() {
         let (m, k, n) = (1u32, 2816, 2112);
         let l = fp8_layout(m, k, n);
-        let mut quantized = std::collections::HashSet::new();
+        let mut quantized = QuantizedActivations::default();
         let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
             .expect("the n=2112 packed-kernel fp8 chain emits (the 26b gate gemm wall is gone)");
         assert!(
@@ -987,7 +1086,7 @@ mod tests {
         );
         let (k_pad, cl_reach) = (pairs * inn_pad, (pairs - 1) * inn + inn_pad);
         let l = fp8_layout(m, k, n);
-        let mut quantized = std::collections::HashSet::new();
+        let mut quantized = QuantizedActivations::default();
         let ops = fp8_quantize_descriptors(&facts(), m, k, pairs, &mut 0, Some(&l), &mut quantized)
             .expect("the per-pair tail emits at the 26b DOWN geometry");
         // EIGHT converts, named per pair.
@@ -1091,7 +1190,7 @@ mod tests {
         let (m, pairs, inn, n) = (1u32, 8u32, 2816u32, 128u32);
         let k = pairs * inn;
         let l = fp8_layout(m, k, n);
-        let mut quantized = std::collections::HashSet::new();
+        let mut quantized = QuantizedActivations::default();
         let ops = fp8_quantize_descriptors(&facts(), m, k, pairs, &mut 0, Some(&l), &mut quantized)
             .expect("the aligned-inn pair chain emits");
         assert_eq!(
@@ -1135,7 +1234,7 @@ mod tests {
     #[test]
     fn the_per_pair_tail_refuses_a_non_whole_lane_count_and_pads_per_slot_at_prefill() {
         let l = fp8_layout(1, 9, 128);
-        let mut quantized = std::collections::HashSet::new();
+        let mut quantized = QuantizedActivations::default();
         let e = fp8_quantize_descriptors(&facts(), 1, 9, 2, &mut 0, Some(&l), &mut quantized);
         assert!(
             e.is_err(),
@@ -1152,7 +1251,7 @@ mod tests {
         );
         let (k_pad, cl_reach) = (pairs * inn_pad, (pairs - 1) * inn + inn_pad);
         let l2 = fp8_layout(m, k, 128);
-        let mut quantized2 = std::collections::HashSet::new();
+        let mut quantized2 = QuantizedActivations::default();
         let ops2 =
             fp8_quantize_descriptors(&facts(), m, k, pairs, &mut 0, Some(&l2), &mut quantized2)
                 .expect("the half-stick tail emits at m>1 — the per-slot §4.5 arms");
@@ -1252,7 +1351,7 @@ mod tests {
         // And the positive control: the same m=2 at an ALIGNED inn (1024, a whole fp8 stick)
         // EMITS — one whole-tensor convert, the m-generic form the prefill door consumes.
         let l3 = fp8_layout(2, 2048, 128);
-        let mut quantized3 = std::collections::HashSet::new();
+        let mut quantized3 = QuantizedActivations::default();
         let ops =
             fp8_quantize_descriptors(&facts(), 2, 2048, 2, &mut 0, Some(&l3), &mut quantized3)
                 .expect("the aligned-inn pair chain emits at m=2");

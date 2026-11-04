@@ -9,8 +9,9 @@ pub use scratchy_layers::gdn_state::*;
 
 use scratchy_tensors::DType;
 
-/// The ssm state's element dtype the metal GDN kernels read and write: `device half*` in
-/// `gdn_decode`, `gdn_scan_varlen` and `gdn_scan_pipelined`, cast at the buffer boundary — the
-/// scan's arithmetic stays f32; the store's rounding is the state's per-step quantization. The
-/// worker allocates the pool with this, and the shaders match it.
-pub const GDN_SSM_STATE_DTYPE: DType = DType::F16;
+/// The ssm state's element dtype the metal GDN kernels read and write: `gdn_ssm_t` in
+/// `gdn_state.h` (`gdn_decode`, `gdn_verify`, `gdn_scan_varlen`, `gdn_scan_pipelined`), cast at
+/// the buffer boundary — the scan's arithmetic is f32. The worker allocates the pool with this,
+/// and the shaders match it. f32: an f16 state rounds every step's sums, which cost Qwen3.8-27B +
+/// DFlash2 3% acceptance (3.48 -> 3.38 tokens a cycle, 16 ShareGPT prompts, greedy).
+pub const GDN_SSM_STATE_DTYPE: DType = DType::F32;

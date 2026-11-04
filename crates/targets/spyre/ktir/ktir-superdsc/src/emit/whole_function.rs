@@ -1936,6 +1936,51 @@ fn program_broadcast_chains(
                 f.name
             ));
         };
+        // ⭐⭐⭐ THE FOLD: A UNIT-EXTENT RESULT AXIS THE BROADCAST DOES NOT SPRAY IS INVISIBLE TO
+        // THE FLAT FRAME. The flat frame folds every axis but the last into its rows, so a
+        // result axis of extent 1 that is NOT in `Dimensions` moves no element and names no
+        // address — it is a restatement of the same flat tensor. The (4, 1) GQA form is the
+        // case: at one KV head the kv axis arrives as a kept leading `1` on the SOURCE (the
+        // collapse keeps it, extent 1 needs no spray) and the broadcast states only the group
+        // spray, `Dimensions=[1]` over `[1, G, m, block]` — dim 1 of a rank-4 result, a middle
+        // axis this door refused by name. Folded, the unit kv axis vanishes and the SAME
+        // broadcast is the leading run over the rank-2 source — the `[2, G, m, block]`
+        // (`Dimensions=[0, 1]`) form the door already admits at two KV heads, the row-split
+        // the flat frame states either way. An axis IN `Dimensions` is never folded, sprayed
+        // or not: a spray of one is a stated broadcast and keeps its own refusal; and the fold
+        // is scoped to rank > 2 — the rank-2 arms read `[1]`/`[0]` as the tile's own two axes
+        // and keep their law verbatim. The source's matching unit axes fold with the result's
+        // (the walk-back resolves the source's own frame and its covers are proved on flat
+        // counts — rows, numel — which a unit axis cannot change), and every read below — the
+        // rank, the leading run, the sprayed extents, the admission's split frame, both covers
+        // — is the FOLDED frame, one statement of the shape for the whole classification.
+        let (res_dims, dims, rank): (Option<Vec<i64>>, Vec<i64>, usize) = if rank > 2 {
+            let s = res_dims
+                .as_ref()
+                .expect("rank is Some only when res_dims is");
+            let keeps = |i: usize| s[i] != 1 || dims.contains(&(i as i64));
+            let folded: Vec<i64> = s
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| keeps(*i))
+                .map(|(_, &e)| e)
+                .collect();
+            let folded_dims: Vec<i64> = dims
+                .iter()
+                .map(|&d| {
+                    d - s
+                        .iter()
+                        .enumerate()
+                        .take(d as usize)
+                        .filter(|(i, _)| !keeps(*i))
+                        .count() as i64
+                })
+                .collect();
+            let rank = folded.len();
+            (Some(folded), folded_dims, rank)
+        } else {
+            (res_dims, dims.to_vec(), rank)
+        };
         // Mutable because the Y ADMISSION below re-states a leading multi-row spray's axis and
         // flat flag after the walk-back has resolved the source's own row count.
         // ⭐ A RUN OF LEADING AXES IS ONE LEADING AXIS OF THE FLAT FRAME: the flat frame folds every
@@ -1947,7 +1992,7 @@ fn program_broadcast_chains(
             && !dims.is_empty()
             && dims.len() < rank
             && dims.iter().enumerate().all(|(i, &d)| d == i as i64);
-        let (mut axis, mut flat) = match (rank, dims) {
+        let (mut axis, mut flat) = match (rank, dims.as_slice()) {
             (_, [1]) if rank <= 2 => (BcastAxis::Col, false),
             (_, [0]) if rank <= 2 => (BcastAxis::Mb, false),
             (r, [d]) if r > 2 && *d as usize == r - 1 => (BcastAxis::Col, true),
@@ -2324,19 +2369,11 @@ fn program_broadcast_chains(
                 // resolved REGION (`elementwise_broadcast`'s want check + the frame law) before
                 // any operand is built. Everything else about a leading multi-row spray really is
                 // row-replication and is refused by name below.
-                let res_shape = bc
-                    .attributes
-                    .iter()
-                    .find_map(|(k, v)| match (k, v) {
-                        (AttrKey::Shape, Attr::IntList(s)) => Some(s.to_vec()),
-                        _ => None,
-                    })
-                    .or_else(|| {
-                        bc.result_type
-                            .as_ref()
-                            .and_then(|t| t.dims().map(|d| d.to_vec()))
-                    });
-                let Some(s) = res_shape else {
+                // THE FOLDED FRAME — the same frame the classification read (a unit non-spray
+                // axis is invisible to the flat frame, so the split is proved in the folded
+                // one; re-reading the attribute here would state the pre-fold shape and the
+                // two statements of the split would disagree by exactly the folded axes).
+                let Some(s) = res_dims.clone() else {
                     return err(format!(
                         "{}: `linalg.broadcast` sprays a rank > 2 source of {} flat rows down its \
                          LEADING axis but states no shaped result, so the row-split frame — the \
@@ -3757,13 +3794,20 @@ pub fn staggered_sources(
     Ok(marked)
 }
 
+///
+/// `quantized` is the bundle's fp8 activation-quantize set ([`QuantizedActivations`]): an fp8 matmul
+/// on an activation an earlier program of the bundle already quantized reuses that chain. A caller
+/// lowering one program alone passes a fresh one.
+///
+/// [`QuantizedActivations`]: super::ktir_matmul_fp8::QuantizedActivations
 pub fn lower_function(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     sym_id_base: &mut i64,
     headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
+    quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
 ) -> Result<Vec<super::EmittedOp>, Error> {
-    lower_function_folded(k, layout, sym_id_base, headmajor, None)
+    lower_function_folded(k, layout, sym_id_base, headmajor, None, quantized)
 }
 
 /// ⭐ A PROGRAM THAT WALKS — one constant-trip `scf.for`, the paged attention's page walk — through
@@ -3780,6 +3824,7 @@ pub fn lower_walk(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     sym_id_base: &mut i64,
+    quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
 ) -> Result<Vec<super::EmittedOp>, Error> {
     let flat = super::loop_fold::flatten(k)?;
     let (node, fold) = match &flat {
@@ -3789,18 +3834,27 @@ pub fn lower_walk(
     // ⭐ torch-spyre plans LX before it emits ([`super::lx_plan`]): a probe lowering learns how every
     // op slices every tensor, and the plan keeps in LX what every op hands out alike.
     let Some(layout) = layout else {
-        return lower_function_folded(node, None, sym_id_base, None, fold);
+        return lower_function_folded(node, None, sym_id_base, None, fold, quantized);
     };
     super::lx_plan::plan(node, layout, |probe| {
+        // The probe is a dry run: it learns the slicing from the set as the real lowering will
+        // see it, and leaves the bundle's set as it found it.
         let mut sym = *sym_id_base;
-        lower_function_folded(node, Some(probe), &mut sym, None, fold)
+        lower_function_folded(
+            node,
+            Some(probe),
+            &mut sym,
+            None,
+            fold,
+            &mut quantized.clone(),
+        )
     })?;
     let probed = node
         .minted
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
-    let ops = lower_function_folded(node, Some(layout), sym_id_base, None, fold);
+    let ops = lower_function_folded(node, Some(layout), sym_id_base, None, fold, quantized);
     // The plan's division is this program's alone: every other function of the bundle divides as
     // its own ops do.
     layout.lx_division.set(None);
@@ -3832,6 +3886,7 @@ fn lower_function_folded(
     sym_id_base: &mut i64,
     headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
     fold: Option<&super::loop_fold::LoopFold>,
+    quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
 ) -> Result<Vec<super::EmittedOp>, Error> {
     let f = &k.func;
     let mut out = Vec::new();
@@ -4977,8 +5032,7 @@ fn lower_function_folded(
                             })?,
                         );
                         gather_carried[gi] = true;
-                        // A block one stick wide is the flat frame's own bytes.
-                        if c > stick as u32 {
+                        if let Some(c) = block_landing_cols(c, stick) {
                             batch_blocks.insert(tid, c);
                         }
                         inter.insert(
@@ -5110,7 +5164,8 @@ fn lower_function_folded(
                             })?,
                         );
                         gather_carried[gi] = true;
-                        if b > 1 {
+                        // A one-block landing several sticks wide is still a block landing.
+                        if let Some(c) = block_landing_cols(c, stick) {
                             batch_blocks.insert(tid, c);
                         }
                         inter.insert(
@@ -6950,12 +7005,15 @@ fn lower_function_folded(
                 &per_op,
                 sym_id_base,
                 Some(layout),
-                headmajor,
                 WalkProof {
                     b_orient,
                     gather: op_gather.map(|(g, _, _)| g),
                     bcast: &bcast_axes,
                     df: op_df,
+                },
+                BundleFacts {
+                    headmajor,
+                    quantized: &mut *quantized,
                 },
             )?;
             out.append(&mut emitted);
@@ -7047,12 +7105,15 @@ fn lower_function_folded(
             &per_op,
             sym_id_base,
             layout,
-            headmajor,
             WalkProof {
                 b_orient,
                 gather: op_gather.map(|(g, _, _)| g),
                 bcast: &bcast_axes,
                 df: op_df,
+            },
+            BundleFacts {
+                headmajor,
+                quantized: &mut *quantized,
             },
         )?;
         out.append(&mut emitted);
@@ -7538,6 +7599,17 @@ fn row_major_region(tid: u32, rows: u32, layout: &BundleLayout) -> Region {
     }
 }
 
+/// ⭐ THE `batch_blocks` INSERT LAW — a page-gather landing registers its block structure by its
+/// OWN COLS, never by its batch extent: a landing several sticks wide is still a block landing at
+/// ONE block (granite's tp=8 per-rank K page, `[1, 128, 128]` — one KV head's block, two sticks
+/// wide), and a one-stick landing is the flat frame's own bytes at ANY batch count. The batch
+/// extent is not an input — that is the law. The wiring — both page-gather arms insert through
+/// this — is pinned by the golden door rows: the `(4, 1, 128)` rows refuse without the blocks
+/// arm's call and pass with it.
+fn block_landing_cols(cols: u32, stick: i64) -> Option<u32> {
+    (cols > stick as u32).then_some(cols)
+}
+
 /// A minted stick-major `[rows, sticks · stick]` buffer's region.
 fn stick_major_region(tid: u32, rows: u32, sticks: u32, layout: &BundleLayout) -> Region {
     let cols = sticks * crate::work::FP16_ELEMS_PER_STICK;
@@ -7853,6 +7925,16 @@ struct WalkProof<'a> {
     df: Df,
 }
 
+/// What the BUNDLE states to one op of the walk — facts no program carries, threaded from the door
+/// that owns the bundle: the head-major o_proj handoff, and the activations the bundle has already
+/// quantized to fp8 ([`QuantizedActivations`]).
+///
+/// [`QuantizedActivations`]: super::ktir_matmul_fp8::QuantizedActivations
+struct BundleFacts<'q> {
+    headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
+    quantized: &'q mut super::ktir_matmul_fp8::QuantizedActivations,
+}
+
 /// Hand ONE op's regions to the body its `Program` names.
 ///
 /// Every body here is unchanged and unaware it is being called per-op rather than per-function:
@@ -7864,8 +7946,8 @@ fn emit_one(
     per_op: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
     proof: WalkProof<'_>,
+    bundle: BundleFacts<'_>,
 ) -> Result<Vec<super::EmittedOp>, Error> {
     let WalkProof {
         b_orient,
@@ -7873,6 +7955,10 @@ fn emit_one(
         bcast,
         df,
     } = proof;
+    let BundleFacts {
+        headmajor,
+        quantized,
+    } = bundle;
     // THE FUSED SILU. Reached only through [`program_silu_mul_chains`], which PROVED the five-op
     // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
     // `split_out(.., 2)` reads.
@@ -7999,10 +8085,6 @@ fn emit_one(
     };
     Ok(match program {
         Program::Matmul => {
-            // The fp8 activation-quantize dedup set is per-BUNDLE. One op at a time here, so a
-            // fresh set is correct for an fp16 program; an fp8 one needs it threaded across ops and
-            // that is not yet done, so it is stated rather than silently per-op.
-            let mut q = std::collections::HashSet::new();
             // ⛔ THE ORIENTATION IS PROVEN, NEVER DEFAULTED. `b_orient` is `Some` exactly when
             // `program` is `Node(Program::Matmul)`, which is this arm — but a default here would be
             // the silent wrong contraction at `k == n`, so the impossible case refuses by name.
@@ -8019,7 +8101,8 @@ fn emit_one(
                 per_op,
                 sym_id_base,
                 layout,
-                &mut q,
+                // The BUNDLE's set, threaded from the door: q/k/v on one rms output quantize it once.
+                quantized,
                 super::lower_ktir_to_superdsc::MatmulProof {
                     b,
                     // This door's operands are WINDOWS of the caller's parameters — the fact the
@@ -8594,12 +8677,15 @@ mod broadcast_chain_tests {
         }
     }
 
-    /// ⭐ THE FLAT `Mb` ADMITTED FORM — a one-flat-row source sprayed down a leading axis, the
-    /// `[1, 64] -> [8, 1, 64]` vector-on-rows the rank-2 `Mb` always was, stated in the flat
-    /// frame. This is the control that the leading-axis law below is a ONE-ROW law and not a
-    /// blanket refusal of `Dimensions=[0]`.
+    /// ⭐ THE ONE-ROW VECTOR ON ROWS, FOLDED TO THE RANK-2 `Mb` IT ALWAYS WAS — the
+    /// `[1, 64] -> [8, 1, 64]` vector-on-rows: the unit non-spray axis (the `1` between the
+    /// spray and the stick) is invisible to the flat frame, so the fold restates the result as
+    /// the rank-2 `[8, 64]` over `Dimensions=[0]` and the classification is the rank-2 `Mb`
+    /// verbatim — the rmsnorm gain's own class, not the flat presentation. This is the class
+    /// the byte-identical bundle guard owns: the source `[1, 64]` region is the same row
+    /// vector either way, so the emitted operand is the same bytes.
     #[test]
-    fn the_rank3_leading_one_row_source_is_flat_mb() {
+    fn the_rank3_one_row_vector_folds_to_the_rank2_mb() {
         let f = chain3(
             &[1, 64],
             Relay::Expand(&[1, 1, 64]),
@@ -8614,10 +8700,105 @@ mod broadcast_chain_tests {
         assert_eq!(
             b.axis,
             BcastAxis::Mb,
-            "`Dimensions=[0]` is the leading axis"
+            "`Dimensions=[0]` is the leading axis, folded or not"
         );
-        assert!(b.flat, "the rank-3 form is the FLAT Mb");
+        assert!(
+            !b.flat,
+            "the fold restates `[8, 1, 64]` as the rank-2 `[8, 64]`: the rank-2 `Mb`, not the \
+             flat presentation"
+        );
         assert_eq!(b.src, Ssa(0), "the consumer reads the rank-2 SOURCE");
+    }
+
+    /// ⭐⭐⭐ THE (4, 1) GQA FORM, FOLDED — the prefill keys spray at ONE KV head per card:
+    /// the load `[31, 128]`, the kv axis kept as a leading `1` on the source (extent 1 needs
+    /// no spray), the broadcast stating only the group spray `Dimensions=[1]` over
+    /// `[1, 4, 31, 128]` — the middle-axis shape this door refused by name before the fold.
+    /// Folded, the unit kv axis vanishes and the SAME broadcast is the leading run over the
+    /// rank-2 source — admitted as the row-split, with the CONTROL that the (8, 2) form (the
+    /// kv axis a real spray, `Dimensions=[0, 1]`) is the same class at twice the count.
+    #[test]
+    fn the_unit_kv_axis_folds_and_the_gqa_spray_is_the_row_split() {
+        let f = chain3(
+            &[31, 128],
+            Relay::Expand(&[1, 1, 31, 128]),
+            &[1, 31, 128],
+            &[1, 4, 31, 128],
+            &[1],
+        );
+        let (map, _) = program_broadcast_chains(&f).expect("the (4,1) GQA keys chain");
+        let b = map
+            .get(&Ssa(4))
+            .expect("the broadcast's result is what a consumer names");
+        assert_eq!(
+            b.axis,
+            BcastAxis::Y(super::super::lower_ktir_to_superdsc::Spray::outer(4)),
+            "the unit kv axis folds away and the group spray is the leading run over the \
+             rank-2 source — the row-split, the (8,2) form's own class"
+        );
+        assert!(
+            !b.flat,
+            "the admission cleared the flat flag — the source is the `[mb, out]` tile"
+        );
+        assert_eq!(
+            b.src,
+            Ssa(0),
+            "the walk-back reaches the rank-2 SOURCE (the keys load), not the plumbing"
+        );
+        // CONTROL — the (8, 2) form: the same chain with the kv axis a real spray, the class
+        // the fold extends to one KV head.
+        let f = chain3(
+            &[31, 128],
+            Relay::Expand(&[1, 1, 31, 128]),
+            &[31, 128],
+            &[2, 4, 31, 128],
+            &[0, 1],
+        );
+        let (map, _) = program_broadcast_chains(&f).expect("the (8,2) GQA keys chain");
+        assert_eq!(
+            map[&Ssa(4)].axis,
+            BcastAxis::Y(super::super::lower_ktir_to_superdsc::Spray::outer(8)),
+            "two KV heads spray kv and group together — the admitted leading run"
+        );
+    }
+
+    /// ⛔ A UNIT AXIS IN `Dimensions` IS NOT FOLDED — `[256, 256] -> [256, 1, 256]` over
+    /// `Dimensions=[1]`: the sprayed axis's own extent is 1, a stated broadcast however
+    /// degenerate, and the fold leaves it exactly where it is. The inner-spray arm reads the
+    /// extent, finds one, and refuses by name — the degenerate-spray refusal stays.
+    #[test]
+    fn a_unit_axis_in_dimensions_is_not_folded_and_the_spray_of_one_stays_refused() {
+        let m = refusal3(
+            &[256, 256],
+            Relay::Reshape(&[256, 1, 256]),
+            &[256, 256],
+            &[256, 1, 256],
+            &[1],
+        );
+        assert!(
+            m.contains("a spray of one is no broadcast"),
+            "the in-`Dimensions` unit axis keeps its degenerate-spray refusal: {m}"
+        );
+    }
+
+    /// ⛔ THE FOLD IS SCOPED TO RANK > 2 — `[8] -> [8, 1]` over `Dimensions=[1]`: a rank-2
+    /// result whose TRAILING axis is unit and not sprayed. The rank-2 arms read `[1]` as the
+    /// stick axis of the tile itself, verbatim; folding the unit axis would renumber the
+    /// spray to `[0]` and misread a per-row scalar as a row vector, so the scoping is a law
+    /// and not an implementation detail.
+    #[test]
+    fn a_rank2_unit_nonspray_axis_is_not_folded() {
+        let f = chain3(&[8], Relay::Expand(&[8, 1]), &[8], &[8, 1], &[1]);
+        let (map, _) = program_broadcast_chains(&f).expect("the rank-2 stick spray's own chain");
+        let b = map
+            .get(&Ssa(4))
+            .expect("the broadcast's result is what a consumer names");
+        assert_eq!(
+            b.axis,
+            BcastAxis::Col,
+            "`Dimensions=[1]` at rank 2 is the stick axis, unit trailing axis or not"
+        );
+        assert!(!b.flat, "the rank-2 arms carry no flat flag");
     }
 
     /// ⭐⭐⭐ THE AXIS JUST BEFORE THE STICK — THE MASK ADD, `[256, 256] -> [256, 1, 256] ->
@@ -9546,6 +9727,40 @@ mod equal_mask_tests {
         assert!(
             masks.by_retype.is_empty(),
             "a cmpf whose i1 has two consumers does not fold"
+        );
+    }
+}
+
+/// ⭐ THE `batch_blocks` INSERT LAW, on its own — both page-gather arms insert through
+/// [`block_landing_cols`], and the law is the COLS a landing has, never its batch extent. The
+/// wiring is pinned end-to-end by the golden door rows (the `(4, 1, 128)` rows refuse without the
+/// blocks arm's call); these pin the decision itself, so a future edit that re-keys the insert on
+/// the batch extent fails HERE, not on the card.
+#[cfg(test)]
+mod block_landing_law_tests {
+    use super::*;
+
+    /// The (4, 1, 128) case itself: ONE block, two sticks wide — still a block landing, registered
+    /// by its cols. This is the insert the old `b > 1` guard dropped, and the (4, 1, 128) door rows
+    /// refused on.
+    #[test]
+    fn one_block_two_sticks_wide_is_registered() {
+        let stick = i64::from(crate::work::FP16_ELEMS_PER_STICK);
+        assert_eq!(
+            block_landing_cols(128, stick),
+            Some(128),
+            "a `[1, 128, 128]` landing's block is 128 wide — a block landing at one block"
+        );
+    }
+
+    /// A one-stick landing is the flat frame's own bytes at ANY batch count — nothing to register.
+    #[test]
+    fn one_stick_wide_is_the_flat_frames_own_bytes() {
+        let stick = i64::from(crate::work::FP16_ELEMS_PER_STICK);
+        assert_eq!(
+            block_landing_cols(64, stick),
+            None,
+            "a block one stick wide is the flat frame's own bytes, at any batch count"
         );
     }
 }

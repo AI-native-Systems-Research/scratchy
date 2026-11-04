@@ -23,7 +23,8 @@ use crate::specialized_pipeline_cache::{
 use crate::stream::MetalStreamError;
 use crate::tape::constants::{TapeVariant, UnboundConstant};
 use crate::tape::lowered::{
-    BakedKernel, KernelId, LoweredCommand, LoweredMetalTape, MetalDtype, baked,
+    BakedDictionary, BakedKernel, BakedMetallib, KernelId, LoweredCommand, LoweredMetalTape,
+    MetalDtype, baked,
 };
 
 /// A library whose kernels compile only in the bake ([`bake`]).
@@ -326,18 +327,67 @@ fn guarded_headers(library: &str) -> Vec<String> {
     out
 }
 
+/// A build's metallibs as its binary holds them ([`BakedMetallib`]): one dictionary, trained on
+/// them all, and each metallib's zstd frame against it.
+pub struct Packed {
+    pub dictionary: Vec<u8>,
+    pub frames: Vec<Vec<u8>>,
+}
+
+/// The dictionary [`pack`] trains holds at most this much: the bytes a build's metallibs share.
+const DICTIONARY: usize = 1 << 20;
+
+/// The samples [`pack`] trains on are the metallibs cut to this size, so one metallib alone is
+/// samples enough.
+const SAMPLE: usize = 4 << 10;
+
+/// The zstd level [`pack`] compresses at: the dictionary carries the shared bytes, and higher
+/// levels save under a fifth more for several times the build time.
+const LEVEL: i32 = 3;
+
+/// `metallibs`, packed ([`Packed`]). Training on too few bytes for a dictionary (a kernel test's
+/// one small kernel) leaves it empty: each frame then stands alone.
+pub fn pack(metallibs: &[&[u8]]) -> Packed {
+    let all = metallibs.concat();
+    let samples: Vec<usize> = all.chunks(SAMPLE).map(<[u8]>::len).collect();
+    let dictionary = zstd::dict::from_continuous(&all, &samples, DICTIONARY).unwrap_or_default();
+    let frames = (metallibs.par_iter())
+        .map(|metallib| {
+            zstd::bulk::Compressor::with_dictionary(LEVEL, &dictionary)
+                .and_then(|mut c| c.compress(metallib))
+                .unwrap_or_else(|e| panic!("bake: compress a metallib: {e}"))
+        })
+        .collect();
+    Packed { dictionary, frames }
+}
+
 /// `keys`' kernels, baked, as the statics a baked tape holds
 /// ([`ClassedTape::kernels`](crate::tape::lowered::ClassedTape::kernels)) — for kernels lowered or
 /// dispatched outside the macro (kernel tests).
 pub fn baked_kernels(keys: &[PipelineKey]) -> Vec<BakedKernel> {
     let bake = bake(keys);
+    let mut metallibs: Vec<&Arc<[u8]>> = bake.kernels.iter().map(|k| &k.metallib).collect();
+    metallibs.sort_by_key(|m| Arc::as_ptr(m).cast::<u8>());
+    metallibs.dedup_by_key(|m| Arc::as_ptr(m).cast::<u8>());
+    let packed = pack(&metallibs.iter().map(|m| &***m).collect::<Vec<_>>());
+    let dictionary = &*Box::leak(Box::new(BakedDictionary::new(baked(packed.dictionary))));
+    let by_ptr: HashMap<*const u8, &'static BakedMetallib> = (metallibs.iter().zip(packed.frames))
+        .map(|(m, frame)| {
+            let metallib = BakedMetallib {
+                frame: baked(frame),
+                dictionary,
+                len: m.len(),
+            };
+            (Arc::as_ptr(m).cast::<u8>(), &*Box::leak(Box::new(metallib)))
+        })
+        .collect();
     let kernels = keys.iter().zip(bake.kernels);
     kernels
         .map(|(key, kernel)| BakedKernel {
             library: key.library_name,
             function: key.kernel_name,
             constants: baked(key.constants.clone()),
-            metallib: baked(kernel.metallib.to_vec()),
+            metallib: by_ptr[&Arc::as_ptr(&kernel.metallib).cast::<u8>()],
             entry: Box::leak(kernel.entry.into_boxed_str()),
         })
         .collect()
@@ -459,5 +509,68 @@ fn msl_literal(c: &ConstantValue) -> String {
             "bake: constant slot {} is bound to its tape variant; `bake_keys` resolves it",
             c.index
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BakedDictionary, BakedMetallib, baked, pack};
+
+    /// Each of `metallibs`, packed then decompressed.
+    fn round_trip(metallibs: &[&[u8]]) -> (usize, Vec<Box<[u8]>>) {
+        let packed = pack(metallibs);
+        let size = packed.dictionary.len() + packed.frames.iter().map(Vec::len).sum::<usize>();
+        let dictionary = &*Box::leak(Box::new(BakedDictionary::new(baked(packed.dictionary))));
+        let bytes = (metallibs.iter().zip(packed.frames))
+            .map(|(m, frame)| {
+                let metallib = BakedMetallib {
+                    frame: baked(frame),
+                    dictionary,
+                    len: m.len(),
+                };
+                metallib.decompress().expect("decompress a packed metallib")
+            })
+            .collect();
+        (size, bytes)
+    }
+
+    /// Kernels specialized on different constants: one body, a few bytes apart.
+    #[test]
+    fn near_copies_pack_to_about_one_and_decompress_exactly() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let body: Vec<u8> = (0..64 << 10)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let copies: Vec<Vec<u8>> = (0..16u8)
+            .map(|i| {
+                let mut copy = body.clone();
+                for at in [100, 9_000, 40_000] {
+                    copy[at] = i;
+                }
+                copy
+            })
+            .collect();
+        let metallibs: Vec<&[u8]> = copies.iter().map(Vec::as_slice).collect();
+        let (size, bytes) = round_trip(&metallibs);
+        assert!(bytes.iter().map(|b| &**b).eq(metallibs.iter().copied()));
+        assert!(
+            size < 2 * body.len(),
+            "16 near-copies of {} bytes packed to {size}",
+            body.len()
+        );
+    }
+
+    /// Too few bytes to train on: no dictionary, and the frame stands alone.
+    #[test]
+    fn one_small_metallib_packs_without_a_dictionary() {
+        let metallib: &[u8] = b"a kernel test's one small metallib";
+        assert!(pack(&[metallib]).dictionary.is_empty());
+        let (_, bytes) = round_trip(&[metallib]);
+        assert_eq!(&*bytes[0], metallib);
     }
 }

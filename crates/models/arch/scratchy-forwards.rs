@@ -14,7 +14,7 @@
 use proc_macro2::{Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 use rayon::prelude::*;
 use scratchy_forward_compiler_macro::{compile_carrier, parse_python_file, render_tokens};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 // Gated on `hf-completions` (on by default for `scratchy-cli` builds; opt out
@@ -64,19 +64,6 @@ fn reroot_crate(ts: TokenStream, mod_name: &str) -> TokenStream {
         }
     }
     out.into_iter().collect()
-}
-
-/// Lossy FORWARD-only feature/env name mangle: non-alphanumeric → `_`, upper.
-fn envify(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 /// The quant presets enabled for one arch: its `quantizations.json`
@@ -194,22 +181,6 @@ fn write_if_changed(out: &Path, text: &str) {
     }
 }
 
-/// Arches whose emit only compiles under metal. Kept in sync with src/lib.rs
-/// gates.
-const METAL_ONLY: &[&str] = &[
-    "gemma4-assistant",
-    "glm4-moe",
-    "gpt-oss",
-    "nemotron-h",
-    "nemotron-h-latent",
-    "nemotron-h-mtp",
-];
-/// Arches that additionally support the spyre (KTIR) backend.
-///
-/// Must agree with the arches `Cargo.toml`'s `spyre` feature enables; an arch listed there but not here
-/// is dropped by the `supported` gate below before its configs are read.
-const SPYRE_CAPABLE: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
-
 /// A checkpoint config's identity for matching: its architecture and shape (hidden size, layers,
 /// vocab size; the text decoder's when `text_config` nests it).
 fn config_shape(path: &Path) -> Option<(String, u64, u64, u64)> {
@@ -256,8 +227,7 @@ fn bake_tokenizers(out_dir: &Path) {
         .flatten()
         .flatten()
         .map(|snapshot| snapshot.path());
-    let mut baked = BTreeSet::new();
-    let mut code = String::new();
+    let mut bakes = BTreeMap::new();
     for snapshot in snapshots {
         let tokenizer = snapshot.join("tokenizer.json");
         if !config_shape(&snapshot.join("config.json")).is_some_and(|s| compiled.contains(&s)) {
@@ -266,21 +236,32 @@ fn bake_tokenizers(out_dir: &Path) {
         let Some(digest) = scratchy_core_model::baked_tokenizer::cached_digest(&tokenizer) else {
             continue;
         };
-        if !baked.insert(digest.clone()) {
+        if bakes.contains_key(&digest) {
             continue;
         }
         let json = std::fs::read_to_string(&tokenizer).expect("read a cached tokenizer.json");
-        let bake = match scratchy_core_model::baked_tokenizer::bake(&json, &digest) {
-            Ok(bake) => bake,
-            Err(why) => {
-                println!("cargo:warning={} is not baked: {why}", tokenizer.display());
-                continue;
+        match scratchy_core_model::baked_tokenizer::bake(&json, &digest) {
+            Ok(bake) => {
+                bakes.insert(digest, bake);
             }
-        };
-        write_if_changed_bytes(
-            &out_dir.join(format!("tokenizer-{digest}.bin")),
-            &bake.tables,
-        );
+            Err(why) => println!("cargo:warning={} is not baked: {why}", tokenizer.display()),
+        }
+    }
+    // Checkpoints whose `tokenizer.json`s differ only outside the BPE model (fine-tunes of one
+    // base) bake the same tables: they share one copy, named by the first digest baking it.
+    let mut tables: BTreeMap<&[u8], String> = BTreeMap::new();
+    let mut code = String::new();
+    for (digest, bake) in &bakes {
+        let owner = tables.entry(bake.tables.as_slice()).or_insert_with(|| {
+            let owner = format!("TOKENIZER_TABLES_{}", digest.to_uppercase());
+            write_if_changed_bytes(&out_dir.join(format!("tokenizer-{digest}.bin")), &bake.tables);
+            code += &format!(
+                "static {owner}: ::scratchy_core_model::baked_tokenizer::Aligned<[u8; {len}]> = \
+                 ::scratchy_core_model::baked_tokenizer::Aligned(*include_bytes!(concat!(env!(\"OUT_DIR\"), \"/tokenizer-{digest}.bin\")));\n",
+                len = bake.tables.len(),
+            );
+            owner
+        });
         write_if_changed(
             &out_dir.join(format!("tokenizer-{digest}.json")),
             &bake.pipeline,
@@ -289,7 +270,7 @@ fn bake_tokenizers(out_dir: &Path) {
             "::scratchy_forward_compiler::inventory::submit! {{\n    \
              ::scratchy_core_model::baked_tokenizer::BakedTokenizer {{\n        \
              digest: \"{digest}\",\n        \
-             tables: &::scratchy_core_model::baked_tokenizer::Aligned(*include_bytes!(concat!(env!(\"OUT_DIR\"), \"/tokenizer-{digest}.bin\"))),\n        \
+             tables: &{owner},\n        \
              pipeline: include_str!(concat!(env!(\"OUT_DIR\"), \"/tokenizer-{digest}.json\")),\n    \
              }}\n}}\n"
         );
@@ -328,8 +309,6 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    let metal = std::env::var("CARGO_FEATURE_METAL").is_ok();
-    let spyre = std::env::var("CARGO_FEATURE_SPYRE").is_ok();
 
     // Each arch is a `dsl/<arch>.py` DSL carrier paired with a
     // `configs/<arch>/` dir; emit the ones whose `arch-<name>` feature is on AND
@@ -373,20 +352,9 @@ fn main() {
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".py"))?
                 .to_string();
-            // Feature gate: `arch-<name>` → CARGO_FEATURE_ARCH_<ENVIFY(name)>.
-            if std::env::var(format!("CARGO_FEATURE_ARCH_{}", envify(&arch))).is_err() {
-                return None;
-            }
-            // Backend gate: mirror the `pub mod <name>` cfg in src/lib.rs, so we
-            // never run the pipeline for an arch whose mod won't be compiled.
-            let supported = if METAL_ONLY.contains(&arch.as_str()) {
-                metal
-            } else if SPYRE_CAPABLE.contains(&arch.as_str()) {
-                metal || spyre
-            } else {
-                metal
-            };
-            if !supported {
+            // Its `arch-<name>` feature and a backend it compiles for, as the `pub mod <name>`
+            // cfg in src/lib.rs has it: never the pipeline of an arch whose mod won't compile.
+            if !scratchy_forward_compiler_macro::arch_compiled(&arch) {
                 return None;
             }
             let mod_name = arch.replace('-', "_");

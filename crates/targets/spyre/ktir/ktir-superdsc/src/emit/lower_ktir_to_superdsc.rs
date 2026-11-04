@@ -1552,6 +1552,36 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
 
 /// Every view a `ktdp.store` writes through — the program's OUTPUT buffers. A store's second operand
 /// is the access tile it writes, and that tile's first operand is the view.
+/// Every buffer this program WRITES — the parameter behind every `ktdp.store`'s view, at any depth
+/// (a walk's body stores too) and through a direct or an indirect tile alike. What a bundle walk
+/// tells [`super::ktir_matmul_fp8::QuantizedActivations::written`], so a held fp8 quantize never
+/// outlives the bytes it was taken of.
+pub fn written_buffers(k: &KtirNode) -> Result<Vec<u32>, Error> {
+    let deep = k.func.ops_deep();
+    let def = |v: Option<&Ssa>| v.and_then(|v| deep.iter().find(|o| o.result == Some(*v)));
+    let mut out = Vec::new();
+    for st in deep.iter().filter(|o| o.op_type == OpKind::KtdpStore) {
+        // ⛔ A STORE WHOSE BUFFER CANNOT BE NAMED IS REFUSED, NOT SKIPPED: a skipped one is a write
+        // the held quantize never hears of, and the next matmul would read a stale scale.
+        let tid = def(st.operands.get(1))
+            .and_then(|tile| def(tile.operands.first()))
+            .and_then(|view| view.operands.first())
+            .and_then(|ptr| k.func.arguments.iter().position(|(a, _)| a == ptr))
+            .and_then(|i| k.bindings.get(i))
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: a `ktdp.store` whose tile does not resolve to a parameter's view — the \
+                     buffer it writes cannot be named",
+                    k.func.name
+                ),
+            })?;
+        out.push(tid.get());
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
 fn store_views(f: &IRFunction<'static>) -> std::collections::HashSet<Ssa> {
     let tile_view: std::collections::HashMap<Ssa, Ssa> = f
         .operations
@@ -5611,7 +5641,7 @@ pub fn matmul(
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    quantized: &mut std::collections::HashSet<String>,
+    quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
     headmajor: Option<HeadmajorOproj>,
 ) -> Result<Vec<EmittedOp>, Error> {
     matmul_oriented(
@@ -5668,7 +5698,7 @@ pub fn matmul_oriented(
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    quantized: &mut std::collections::HashSet<String>,
+    quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
     proof: MatmulProof,
 ) -> Result<Vec<EmittedOp>, Error> {
     let outs: Vec<Region> = r.iter().copied().filter(|x| x.is_out).collect();

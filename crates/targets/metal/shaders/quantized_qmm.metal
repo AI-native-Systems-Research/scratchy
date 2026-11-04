@@ -68,6 +68,8 @@
 #include <metal_simdgroup_matrix>
 #include <metal_stdlib>
 #include "baked.h"
+#include "affine_codes.h"
+AFFINE_CODES_PLANES_DECL;
 
 // MLX steel/gemm vendor — pulls in `BlockMMA<T, U, BM, BN, BK, WM, WN, ...>`.
 // Used by qmm_t_impl_inline below to drive the inner MMA loop with the
@@ -207,7 +209,10 @@ METAL_FUNC void qmm_t_impl_inline(
     const int              K_eff,
     uint  simd_group_id,
     uint  simd_lane_id,
-    uint3 tgid)
+    uint3 tgid,
+    // Planes: `w` is the matrix's base and the block reads its inputs from `k0` (split-K's
+    // partition start); a row-major `w` arrives shifted to it instead.
+    const int              k0 = 0)
 {
   // bits=8 rides the same MLX QuantizedBlockLoader path (taken when
   // T_compute == T_scale); the hand-inlined mixed-compute W loader
@@ -320,7 +325,8 @@ METAL_FUNC void qmm_t_impl_inline(
       /* tgp_size = */ TGP,
       /* group_size = */ loader_gs,
       /* bits = */ bits,
-      /* offset8 = */ offset8>;
+      /* offset8 = */ offset8,
+      /* planes = */ AFFINE_CODES_PLANES && bits == 4>;
   loader_w_t loader_w(
       (const device uint8_t*)w_block,
       s_block,
@@ -328,7 +334,11 @@ METAL_FUNC void qmm_t_impl_inline(
       /*src_ld=*/K,
       reinterpret_cast<threadgroup T_scale*>(Ws),
       simd_group_id,
-      simd_lane_id);
+      simd_lane_id,
+      wl_base,
+      N,
+      c_col,
+      k0);
 
   // ── BlockMMA — VERBATIM MLX `BlockMMA<T_compute, T_act, BM, BN, BK,
   //    WM, WN, transpose_a=false, transpose_b=true, lda_tgp, ldb_tgp,
@@ -405,11 +415,15 @@ METAL_FUNC void qmm_t_impl_inline(
   auto load_w_inline = [&](int kk, bool n_unsafe) {
     threadgroup T_compute* Ws_dst_inline =
         Ws + bi_w * BK_padded + bj_w * pack_factor;
-    const device uint8_t* W_src_inline =
-        w_block + bi_w * K_w + bj_w * bytes_per_pack;
+    const int k_inline = k0 + kk * BK + int(bj_w) * pack_factor;
+    const device uint8_t* W_src_inline = (AFFINE_CODES_PLANES && bits == 4)
+        ? affine_codes_at(wl_base, c_col + int(bi_w), k_inline, N, K)
+        : w_block + bi_w * K_w + bj_w * bytes_per_pack;
     const device T_scale* Sc_row_inline = s_block + bi_w * K_g;
     const device T_scale* Bs_row_inline = b_block + bi_w * K_g;
-    W_src_inline += kk * BCOLS_PACKED * bytes_per_pack;
+    if (!(AFFINE_CODES_PLANES && bits == 4)) {
+      W_src_inline += kk * BCOLS_PACKED * bytes_per_pack;
+    }
     // NVFP4 group_size (16) is smaller than BK (32), so a BK column-
     // block spans two scale groups; index the scale generally by the
     // thread's absolute K offset. The general formula reduces to the
@@ -699,7 +713,10 @@ template <typename T_act, typename T_compute, typename T_scale,
 
   const device T_act*   x_shift = x + k_start;
   const device uint8_t* wl      = (const device uint8_t*)w;
-  wl += int64_t(k_start) * bytes_per_pack / pack_factor;
+  constexpr bool planes = AFFINE_CODES_PLANES && bits == 4;
+  if (!planes) {
+    wl += int64_t(k_start) * bytes_per_pack / pack_factor;
+  }
   const device T_scale* scales_shift = scales + k_start / group_size;
   const device T_scale* biases_shift = biases + k_start / group_size;
   device T_act*         y_shift      = y + int64_t(tgid.z) * split_k_partition_stride;
@@ -719,7 +736,7 @@ template <typename T_act, typename T_compute, typename T_scale,
       Xs, Ws, out_scratch,
       QMM_K, QMM_N, QMM_M,
       /*K_eff=*/QMM_K_PARTITION_SIZE,
-      simd_group_id, simd_lane_id, tgid);
+      simd_group_id, simd_lane_id, tgid, planes ? k_start : 0);
   } else {
   qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N>(
       (const device uint32_t*)wl,
@@ -730,7 +747,7 @@ template <typename T_act, typename T_compute, typename T_scale,
       Xs, Ws, out_scratch,
       QMM_K, QMM_N, QMM_M,
       /*K_eff=*/QMM_K_PARTITION_SIZE,
-      simd_group_id, simd_lane_id, tgid);
+      simd_group_id, simd_lane_id, tgid, planes ? k_start : 0);
   }
 }
 

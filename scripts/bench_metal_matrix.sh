@@ -290,7 +290,38 @@ DEFAULT_ENGINES=""       # scratchy alone; --full: oMLX
 PINS=()
 UNPINNED=0
 SCALING=1
-SCALE_AXES="grid"
+# The default sweep is real dataset tasks (the tasks axis); --random runs the random-token grid.
+SCALE_AXES="tasks"
+# The dataset workloads, by run kind: a quick run's small set, a full run's five.
+# Each runs at every --scale-grid-conc users count. rag-spans, scratchy's own passage reuse,
+# runs on scratchy only, next to rag.
+WORKLOADS="sharegpt,rag,sharegpt-multi-turn"
+# LongBench is not among them: its shortest prompts run to 32k tokens, past the grid's 8k
+# (#939), so not one of its tasks fits. `--workloads longbench --scale-grid-input ...,32768`
+# still runs it.
+(( FULL )) && WORKLOADS="sharegpt,rag,sharegpt-multi-turn,shared-prefix,shared-prefix-control"
+WORKLOADS_SCRATCHY="rag-spans"
+# --full: one more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count,
+# where a task is 1 point of accuracy rather than a quick cell's 12.5. Its timing is not compared.
+ACCURACY_TASKS=0
+(( FULL )) && ACCURACY_TASKS=100
+# Its limit: 100 RAG tasks take about 25 minutes at 1 user on an 8B model, and minutes at the
+# largest users count, so --cell-timeout-s's 10 would cut it short. Still a limit, for a hung server.
+ACCURACY_TIMEOUT_S=2400
+# A task cell's sample: this many rounds of its users count, and at least TASK_MIN_PROMPTS (a
+# conversation of sharegpt-multi-turn is four of them).
+TASK_MIN_PROMPTS=8
+# The grid's prompts: fixed-length slices of natural text (bench serve --dataset-name natural, cut
+# from the ShareGPT file's human turns), not random token IDs, which route a mixture-of-experts
+# model's experts unlike any real prompt; three of the small set's four models are MoE.
+GRID_DATASET="natural"
+# The ShareGPT file vLLM's benchmarks use, downloaded once, at a pinned revision.
+SHAREGPT_URL="https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/192ab2185289094fc556ec8ce5ce1e8e587154ca/ShareGPT_V3_unfiltered_cleaned_split.json"
+SHAREGPT_PATH="${HOME}/.cache/scr-bench/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json"
+# Thinking off for every dataset request, on every engine, so a short answer cap is not spent
+# inside a thought. A span query takes no template kwargs; its answers are counted apart.
+TASK_TEMPLATE_KWARGS='{"enable_thinking":false}'
+cell_scratchy=""         # set while scratchy's own sweep runs: its workloads too
 SCALE_CONC="1,2,4"
 SCALE_INPUT="128,512,2048,8192"
 SCALE_OUTPUT="16,64,256,1024"
@@ -349,6 +380,8 @@ while [[ $# -gt 0 ]]; do
         --scaling)           SCALING=1; shift ;;
         --no-scaling)        SCALING=0; shift ;;
         --scale-axes)        SCALE_AXES="$2"; shift 2 ;;
+        --random)            SCALE_AXES="grid"; shift ;;   # the random-token grid, not datasets
+        --workloads)         WORKLOADS="$2"; shift 2 ;;
         --scale-conc)        SCALE_CONC="$2"; shift 2 ;;
         --scale-input)       SCALE_INPUT="$2"; shift 2 ;;
         --scale-output)      SCALE_OUTPUT="$2"; shift 2 ;;
@@ -399,6 +432,18 @@ for i in "${!MODELS[@]}"; do
     MODELS[i]="${hit}"
 done
 (( OFFLINE )) && export HF_HUB_OFFLINE=1
+# The ShareGPT file the sharegpt workloads read, and the grid's natural-text prompts are cut from,
+# downloaded once, at its pinned revision.
+needs_sharegpt=0
+[[ ",${SCALE_AXES}," == *",tasks,"* && ",${WORKLOADS}," == *",sharegpt"* ]] && needs_sharegpt=1
+[[ ",${SCALE_AXES}," == *",grid,"* && "${GRID_DATASET}" == natural ]] && needs_sharegpt=1
+if (( SCALING && needs_sharegpt )) && [[ ! -s "${SHAREGPT_PATH}" ]]; then
+    (( OFFLINE )) && { echo "--offline, and no ShareGPT file at ${SHAREGPT_PATH}" >&2; exit 2; }
+    mkdir -p "$(dirname "${SHAREGPT_PATH}")"
+    echo "downloading ShareGPT (about 670 MB, once) to ${SHAREGPT_PATH}"
+    curl -fsSL -o "${SHAREGPT_PATH}.part" "${SHAREGPT_URL}" && mv "${SHAREGPT_PATH}.part" "${SHAREGPT_PATH}" \
+        || { echo "ShareGPT download failed" >&2; exit 2; }
+fi
 
 if (( MLX_AUTO )) && [[ -z "${MLX_PYTHON}" ]]; then
     for py in ${VIRTUAL_ENV:+"${VIRTUAL_ENV}/bin/python"} python3; do
@@ -618,6 +663,8 @@ done
 PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
 export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB MODELS_GIVEN
+TASK_MAX_PROMPT=$(tr ',' '\n' <<<"${SCALE_GRID_INPUT}" | sort -n | tail -1)
+export WORKLOADS WORKLOADS_SCRATCHY TASK_MAX_PROMPT TASK_MIN_PROMPTS GRID_DATASET ACCURACY_TASKS SHAREGPT_URL
 export STARTED_UTC PERCENTILES PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
        SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS SCALE_REPEATS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S CELL_HANG_TOK_S RESUME MODELS_FULL
@@ -694,6 +741,16 @@ json.dump({
                  "min_prompts_per_cell": int(e["SCALE_NUM_PROMPTS"]),
                  "min_rounds_per_cell": int(e["SCALE_ROUNDS"]),
                  "repeats_per_cell": int(e["SCALE_REPEATS"]),
+                 # The dataset workloads the tasks axis ran, and how: every engine got the same
+                 # tasks, sampled by a seed of the model, workload and users count.
+                 "workloads": [w for w in e["WORKLOADS"].split(",") if w] if "tasks" in e["SCALE_AXES"] else None,
+                 "workloads_scratchy": [w for w in e["WORKLOADS_SCRATCHY"].split(",") if w] if "tasks" in e["SCALE_AXES"] else None,
+                 "task_max_prompt": int(e["TASK_MAX_PROMPT"]) if "tasks" in e["SCALE_AXES"] else None,
+                 "task_min_prompts": int(e["TASK_MIN_PROMPTS"]),
+                 # The grid's prompts: natural text, or random token IDs.
+                 "grid_dataset": e["GRID_DATASET"],
+                 "accuracy_tasks": int(e["ACCURACY_TASKS"]) or None,
+                 "sharegpt": e["SHAREGPT_URL"],
                  "concurrency_is": "offered (--max-concurrency), not the effective decode batch"},
              "comparison": {row.split("|")[0]: row.split("|")[2] == "1"
                             for row in e["ENGINE_INFO"].splitlines()[1:]},
@@ -868,7 +925,9 @@ omlx_model()    { echo "$2"; }
 omlx_tq_model() { echo "$2"; }
 omlx_serve() { # base-dir PAR
     local x=""; (( $2 )) && x=" --max-concurrent-requests $2"
-    echo "${OMLX_BIN} serve --base-path $1 --model-dir ${RAW}/omlx-models --host 127.0.0.1 --port ${PORT} --paged-ssd-cache-dir $1/ssd-cache${x}"
+    # Prefill keepalives as SSE comments: since 0.7.3 (jundot/omlx#4797) its default keepalive
+    # chunks carry the real model name, and bench serve would time the first one as the first token.
+    echo "${OMLX_BIN} serve --base-path $1 --model-dir ${RAW}/omlx-models --host 127.0.0.1 --port ${PORT} --paged-ssd-cache-dir $1/ssd-cache --sse-keepalive-mode comment${x}"
 }
 omlx_home()   { [[ "$1" == omlx_tq ]] && echo "${RAW}/omlx-home-tq" || echo "${RAW}/omlx-home"; }
 # A variant's home once its model is done: its SSD cache is that model's prompts alone, and reached
@@ -930,6 +989,8 @@ axis_size() { # axis
         conc)   par=$(max_of "${CONC_LIST}"); ctx=$(( SCALE_BASE_INPUT + SCALE_BASE_OUTPUT )) ;;
         input)  ctx=$(( $(max_of "${SCALE_INPUT}") + SCALE_BASE_OUTPUT )) ;;
         output) ctx=$(( SCALE_BASE_INPUT + $(max_of "${SCALE_OUTPUT}") )) ;;
+        tasks)  par=$(max_of "${GRID_CONC_LIST}")
+                ctx=$(( $(task_max_prompt) + 512 )) ;;
         grid)   par=$(max_of "${GRID_CONC_LIST}")
                 ctx=$(( $(max_of "${SCALE_GRID_INPUT}") + $(max_of "${SCALE_GRID_OUTPUT}") )) ;;
         *)      return 1 ;;
@@ -972,6 +1033,22 @@ footprint_bytes() { # pid -> bytes, or nothing if it has gone
 # every repeat, so a cell measured on a throttled Mac can be told from one that was not.
 # A pmset that fails prints "unread" instead, so it is not taken for a cool Mac.
 therm_now() { pmset -g therm 2>/dev/null || echo unread; }
+# Write a cell's thermal state into its JSON ($1), before ($2) and after ($3) it, as numbers, each
+# "Name = N" line: {} where pmset reports no warning, null where it could not be read.
+therm_record() { # json before after
+    [[ -f "$1" ]] || return 0
+    python3 - "$1" "$2" "$3" <<'PY' || true
+import json, re, sys
+p, before, after = sys.argv[1:4]
+def therm(text):
+    if text.strip() == "unread":
+        return None
+    return {k.strip(): int(v) for k, v in re.findall(r"^\s*([A-Za-z0-9_ ]+?)\s*=\s*(\d+)\s*$", text, re.M)}
+j = json.load(open(p))
+j["thermal"] = {"before": therm(before), "after": therm(after)}
+json.dump(j, open(p, "w"), indent=2)
+PY
+}
 mem_sampler() { # pid out
     local p b s
     exec >/dev/null; echo   # a refused log line in the forked buffer must not reach tree_pids (cleanup)
@@ -1040,6 +1117,10 @@ sys.exit(not j.get("completed") or any(j.get(k) for k in ("failed", "timed_out",
         echo "$(numbers "${out_json}") · kept (--resume)"
         return 0
     fi
+    # The grid's prompts are natural text (GRID_DATASET); every other axis keeps random tokens.
+    local -a data=()
+    [[ "$2" == grid && "${GRID_DATASET}" == natural ]] \
+        && data=(--dataset-name natural --dataset-path "${SHAREGPT_PATH}")
     local mem="${out_json%.json}.mem" sampler="" therm_before therm_after
     rm -f "${mem}"
     therm_before="$(therm_now)"
@@ -1051,7 +1132,7 @@ sys.exit(not j.get("completed") or any(j.get(k) for k in ("failed", "timed_out",
     { perl -e 'alarm shift; exec @ARGV' "${limit}" \
         "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${cell_model:-${id}}" \
         ${cell_tok:+--tokenizer "${cell_tok}"} \
-        --num-prompts "${n}" --input-len "$4" --output-len "$5" \
+        ${data[@]+"${data[@]}"} --num-prompts "${n}" --input-len "$4" --output-len "$5" \
         --max-concurrency "$6" --temperature 0 --seed "${seed}" --num-warmups "${warmups}" \
         --percentile-metrics ttft,tpot,e2el --metric-percentiles "${PERCENTILES}" --save-detailed \
         --output-json "${out_json}" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1; } 2>/dev/null || rc=$?
@@ -1115,18 +1196,98 @@ PY2
     fi
     # Every repeat's file now exists, a failed or timed-out one's too: the Mac's thermal state
     # around it goes in, so a cell measured on a throttled Mac can be told from one that was not.
-    [[ -f "${out_json}" ]] && python3 - "${out_json}" "${therm_before}" "${therm_after}" <<'PY' || true
-import json, re, sys
-p, before, after = sys.argv[1:4]
-def therm(text):
-    """pmset -g therm as numbers, each "Name = N" line: {} where it reports no warning, None where
-    pmset could not be read (therm_now's "unread")."""
-    if text.strip() == "unread":
-        return None
-    return {k.strip(): int(v) for k, v in re.findall(r"^\s*([A-Za-z0-9_ ]+?)\s*=\s*(\d+)\s*$", text, re.M)}
-j = json.load(open(p))
-j["thermal"] = {"before": therm(before), "after": therm(after)}
-json.dump(j, open(p, "w"), indent=2)
+    therm_record "${out_json}" "${therm_before}" "${therm_after}"
+}
+# A dataset workload's longest prompt this Mac holds: the grid's longest prompt, so a dataset run
+# asks no more of memory than the random grid does.
+task_max_prompt() { max_of "${SCALE_GRID_INPUT}"; }
+# One dataset cell: workload W at C users, written to "<prefix>.tasks-<W>@<C>.json". Its tasks
+# are sampled by a seed of the model, workload and users count, the same on every engine, so a
+# cell never meets a prompt an earlier cell on this server cached.
+run_task_cell() { # prefix workload conc
+    if (( cells_hung )); then
+        (( cells_dead )) && return 0
+        serve_down
+        if "${cell_restart}"; then
+            cells_hung=0
+            echo "    (server restarted)"
+        else
+            cells_dead=1
+            echo "    server would not restart; skipping this sweep's remaining cells"
+            return 0
+        fi
+    fi
+    local out_json="$1.tasks-$2@$3.json" seed rc=0 w="$2"
+    local n=$(( $3 * SCALE_ROUNDS > TASK_MIN_PROMPTS ? $3 * SCALE_ROUNDS : TASK_MIN_PROMPTS ))
+    local -a extra=() chat=() timed=(--timed-answers)
+    seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:tasks:$2:$3" | cksum | cut -d' ' -f1)
+    case "${w}" in
+        sharegpt)              extra=(--dataset-name sharegpt --dataset-path "${SHAREGPT_PATH}" --sharegpt-max-output-len 256) ;;
+        sharegpt-multi-turn)   extra=(--dataset-name sharegpt-multi-turn --dataset-path "${SHAREGPT_PATH}")
+                               n=$(( n / 4 > 2 ? n / 4 : 2 )) ;;   # conversations, of 4 turns each
+        rag|rag-spans)         extra=(--dataset-name "${w}" --rag-source musique) ;;
+        rag-accuracy)          extra=(--dataset-name rag --rag-source musique); n="${ACCURACY_TASKS}"; timed=() ;;
+        longbench)             extra=(--dataset-name longbench --output-len 256) ;;
+        shared-prefix)         extra=(--dataset-name shared-prefix) ;;
+        shared-prefix-control) extra=(--dataset-name shared-prefix --no-reuse) ;;
+        *)                     echo "    unknown workload ${w}, skipped" >&2; return 0 ;;
+    esac
+    # sharegpt single-turn stays a completions request, timed as every suite times it; the others
+    # are chat, with answers ending on their own and thinking off.
+    [[ "${w}" != sharegpt ]] && chat=(--chat-template-kwargs "${TASK_TEMPLATE_KWARGS}")
+    printf '    %-28s conc %-3s ' "tasks=${w}@$3" "$3"
+    local mem="${out_json%.json}.mem" sampler=""
+    rm -f "${mem}"
+    [[ -n "${srv}" ]] && { mem_sampler "${srv}" "${mem}" & sampler=$!; }
+    local limit="${CELL_TIMEOUT_S}" therm_before therm_after
+    if [[ "${w}" == rag-accuracy ]]; then limit="${ACCURACY_TIMEOUT_S}"; fi
+    therm_before="$(therm_now)"
+    { perl -e 'alarm shift; exec @ARGV' "${limit}" \
+        "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${cell_model:-${id}}" \
+        ${cell_tok:+--tokenizer "${cell_tok}"} "${extra[@]}" ${chat[@]+"${chat[@]}"} \
+        --num-prompts "${n}" --max-concurrency "$3" ${timed[@]+"${timed[@]}"} --temperature 0 --seed "${seed}" \
+        --num-warmups "${SCALE_WARMUPS}" --max-prompt-tokens "$(task_max_prompt)" \
+        --percentile-metrics ttft,tpot,e2el --metric-percentiles "${PERCENTILES}" \
+        --output-json "${out_json}" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1; } 2>/dev/null || rc=$?
+    therm_after="$(therm_now)"
+    [[ -n "${sampler}" ]] && { kill "${sampler}" 2>/dev/null; wait "${sampler}" 2>/dev/null; } || true
+    [[ -s "${mem}" && -f "${out_json}" ]] && python3 - "${out_json}" "${mem}" <<'PY' || true
+import json, statistics, sys
+j, mib = json.load(open(sys.argv[1])), [float(x) for x in open(sys.argv[2]) if x.strip()]
+j["server_mem_peak_mib"], j["server_mem_median_mib"] = max(mib), statistics.median(mib)
+json.dump(j, open(sys.argv[1], "w"), indent=2)
+PY
+    # The Mac's thermal state around the cell, as the grid's cells have it.
+    therm_record "${out_json}" "${therm_before}" "${therm_after}"
+    if (( rc == 142 )); then
+        cells_hung=1
+        echo "timed out after ${limit}s"
+        python3 -c 'import json, sys; json.dump({"completed": 0, "failed": int(sys.argv[2]), "timed_out": True}, open(sys.argv[1], "w"), indent=2)' "${out_json}" "${n}"
+        therm_record "${out_json}" "${therm_before}" "${therm_after}"
+    elif (( rc )); then
+        cells_hung=1
+        echo "failed (see ${RAW}/cells-${stem}.log)"
+    else
+        task_numbers "${out_json}"
+        # With answers ending on their own, a short answer is no sign of a dead server: a dead
+        # one fails its requests, or answers one with no tokens at all.
+        if python3 -c 'import json, sys; j = json.load(open(sys.argv[1])); sys.exit(0 if (j.get("failed") or j.get("empty_answers")) else 1)' "${out_json}" 2>/dev/null; then
+            cells_hung=1
+            echo "    failed or empty answers (see ${RAW}/cells-${stem}.log)"
+        fi
+    fi
+}
+task_numbers() { # dataset-cell json -> one human line
+    python3 - "$1" <<'PY' 2>/dev/null || echo "no result"
+import json, sys
+j = json.load(open(sys.argv[1]))
+f = lambda k, spec: "-" if j.get(k) is None else format(j[k], spec)
+acc = "" if j.get("accuracy") is None else f" · {j['accuracy'] * 100:.0f}% right"
+bad = f" · {j['failed']} FAILED" if j.get("failed") else ""
+capped = f" · {j['capped_answers']} capped" if j.get("capped_answers") else ""
+print(f"TTFT p50 {f('median_ttft_ms', '.0f')} ms · E2E p50 {f('median_e2el_ms', '.0f')} ms"
+      f" · {f('mean_output_tokens', '.0f')} answer tok · {f('mean_cached_tokens', '.0f')} cached tok"
+      f"{acc} · {j['completed']} ok{capped}{bad}")
 PY
 }
 run_scale_cells() { # prefix restart-function full-length [axes]
@@ -1135,6 +1296,16 @@ run_scale_cells() { # prefix restart-function full-length [axes]
     local prefix="$1" axes=",${4:-${SCALE_AXES}}," x o
     cell_restart="$2"; cell_full_length="$3"; cells_hung=0; cells_dead=0
     local -a xs os
+    if [[ "${axes}" == *",tasks,"* ]]; then
+        local w c; local -a ws cs
+        IFS=',' read -r -a ws <<<"${WORKLOADS}${cell_scratchy:+,${WORKLOADS_SCRATCHY}}"
+        IFS=',' read -r -a cs <<<"${GRID_CONC_LIST}"
+        # Fewest users first, as the grid does: every workload at 1 user is in hand before a
+        # larger users count can run a server out of memory.
+        for c in "${cs[@]}"; do for w in "${ws[@]}"; do run_task_cell "${prefix}" "${w}" "${c}"; done; done
+        # --full's accuracy cell, at the largest users count: the fewest seconds for its tasks.
+        if (( ACCURACY_TASKS > 0 )); then run_task_cell "${prefix}" rag-accuracy "${cs[${#cs[@]}-1]}"; fi
+    fi
     if [[ "${axes}" == *",conc,"* ]]; then
         IFS=',' read -r -a xs <<<"${CONC_LIST}"
         for x in "${xs[@]}"; do run_cell "${prefix}" conc "${x}" "${SCALE_BASE_INPUT}" "${SCALE_BASE_OUTPUT}" "${x}"; done
@@ -1410,7 +1581,7 @@ PY
         | awk -v c="${cap:-0}" 'NF && (c == 0 || $1 <= c)' | sort -nu | paste -sd, -)
     [[ -n "${GRID_CONC_LIST}" ]] || GRID_CONC_LIST=${BASE_CONC}
 
-    feats="metal,serve,bench,model/$(model_preset "${stem}")${quant:+,quant/${quant}}"
+    feats="metal,serve,bench-datasets,model/$(model_preset "${stem}")${quant:+,quant/${quant}}"
     build_secs=""; bytes=""; built=1
     if (( ! SKIP_BUILD )); then
         echo "--- build -F ${feats}"
@@ -1569,7 +1740,9 @@ PY
                 for ax in "${scratchy_axes[@]}"; do
                     echo "--- scaling sweep, scratchy ${ax}"
                     if scratchy_up; then
+                        cell_scratchy=1   # scratchy's own workloads too (WORKLOADS_SCRATCHY)
                         run_scale_cells "${RAW}/scale-${stem}" scratchy_up 1 "${ax}"
+                        cell_scratchy=""
                     else
                         echo "    server never became ready — ${RAW}/serve-${stem}.log" >&2
                     fi
@@ -1631,11 +1804,15 @@ def requests(reps):
     """Every request of a cell's repeats, from bench serve's --save-detailed: parallel arrays in
     request order, ms. A timing is null where it was never seen: the request failed, or (TTFT
     and TPOT) all its tokens came in one chunk, which bench serve leaves out of them too."""
-    out = {k: [] for k in ("rep", "ttft_ms", "tpot_ms", "e2el_ms", "output_tokens")}
+    out = {k: [] for k in ("rep", "start_s", "ttft_ms", "tpot_ms", "e2el_ms", "output_tokens")}
     for r, j in enumerate(reps):
-        for t, e2, n, ch, err in zip(j["ttfts"], j["latencies"], j["output_lens"], j["chunks"], j["errors"]):
+        starts = j.get("start_times") or [None] * len(j["ttfts"])
+        for s0, t, e2, n, ch, err in zip(starts, j["ttfts"], j["latencies"], j["output_lens"], j["chunks"], j["errors"]):
             ok, streamed = not err, not (n > 1 and ch <= 1)
             out["rep"].append(r)
+            # When it was sent, seconds from its repeat's start: a closed loop's users send in
+            # bursts, so an arrival's effect can be told from an engine's.
+            out["start_s"].append(None if s0 is None else round(s0, 3))
             out["ttft_ms"].append(round(t * 1000, 1) if ok and streamed else None)
             out["tpot_ms"].append(round((e2 - t) * 1000 / (n - 1), 2) if ok and streamed and n > 1 else None)
             out["e2el_ms"].append(round(e2 * 1000, 1) if ok else None)
@@ -1689,6 +1866,21 @@ def scaling(engine):
             cell["requests"] = requests(reps)
         cells.append(cell)
     return cells or None
+# What a dataset cell keeps: the serving metrics, then what a task measures.
+TASK_KEEP = KEEP + ["dataset", "task_seed", "num_tasks", "timed_answers",
+                    "start_times", "ttfts_ms", "e2els_ms", "mean_output_tokens", "mean_prompt_tokens", "mean_cached_tokens",
+                    "accuracy", "empty_answers", "thinking_answers", "capped_answers"]
+TASK_CELL = re.compile(r"\.tasks-([a-z0-9-]+)@(\d+)\.json$")
+def tasks(engine):
+    cells = []
+    for p in sorted(glob.glob(os.path.join(raw, f"scale{engine}-{stem}.tasks-*.json"))):
+        m = TASK_CELL.search(p)
+        if not m or not (j := load(os.path.basename(p))):
+            continue
+        workload, users = m.groups()
+        cells.append({"workload": workload, "conc": int(users),
+                      **{k: v for k, v in j.items() if k in TASK_KEEP or PCT.fullmatch(k)}})
+    return cells or None
 def parity_ties():
     """From the gate's log: {prompt: [gap, ...]} for each prompt that passed as a near-tie."""
     p = os.path.join(raw, f"parity-{stem}.log")
@@ -1707,6 +1899,7 @@ d = json.load(open(js))
 keys = env["ENGINE_KEYS"].split()
 engines = {f"cache_ladder_{k}": load(f"exec-{k}-{stem}.json") for k in keys}
 engines |= {f"scaling_{k}": scaling(f"-{k}") for k in keys}
+engines |= {f"tasks_{k}": tasks(f"-{k}") for k in keys}
 def revision(repo):
     """Which version of a Hugging Face repo's files this run used: the snapshot
     already downloaded, else (llama.cpp keeps its own cache) the repo's main at
@@ -1753,6 +1946,8 @@ d["models"].append({
     "cache_ladder": load(f"exec-{stem}.json"),
     "warm_serving": metrics(load(f"serve-{stem}.json")),
     "scaling": scaling(""),
+    # The dataset workloads' cells, per workload and users count (the tasks axis).
+    "tasks": tasks(""),
     "engine_models": served,
     # null = no engine declined; else per engine key, why it refused the model.
     "engine_declined": declined or None,

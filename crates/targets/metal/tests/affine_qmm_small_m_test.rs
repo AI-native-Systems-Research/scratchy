@@ -17,8 +17,9 @@ use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::quantized::{
     DequantDtype, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4A8_GROUPED_TILE, W4A8_TILE_ROWS,
-    W4a8Act, W4a8Rows, W4a8Tile, qmm_w4a8_static_name, small_m_kernel_static_name,
-    w4a8_act_quant_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
+    W4a8Act, W4a8Gemm, W4a8Rows, W4a8SplitK, W4a8Tile, qmm_w4a8_static_name,
+    small_m_kernel_static_name, w4a8_act_quant_static_name, w4a8_quant_static_name,
+    w4a8_scratch_bytes,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -112,7 +113,7 @@ struct Gemm {
 #[derive(Clone, Copy)]
 enum Kernel {
     SmallM(SmallMTile),
-    W4a8(W4a8Tile),
+    W4a8(W4a8Gemm),
 }
 
 /// The activation the W4A8 pre-pass hands the GEMM: each (row, 64-chunk)
@@ -131,7 +132,8 @@ fn int8_chunks(x: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
+/// The GEMM's output rows, checked against the host reference.
+fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) -> Vec<f32> {
     let (m, n, k, gs) = (g.m, g.n, g.k, g.group_size);
     let mut rng = Rng(0x5eed ^ (m * 7919 + n * 31 + k) as u64);
     // MLX affine: 8 codes per u32, the low nibble first, stored offset-8
@@ -201,7 +203,15 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
         shared(device, &biases_h),
         shared(device, &x_h),
     );
-    let y_buf = shared(device, &vec![0u16; g.bucket_m * n]);
+    // The bucket's rows, then sentinel rows out to a 16-row tile: a kernel stores none of them.
+    const SENTINEL: u16 = 0x7fc1;
+    let y_rows = g.bucket_m.max(16);
+    let y_buf = shared(
+        device,
+        &(0..y_rows * n)
+            .map(|i| if i < g.bucket_m * n { 0 } else { SENTINEL })
+            .collect::<Vec<u16>>(),
+    );
     let mut batch = Mtl4DispatchBatch::begin(device).expect("mtl4");
     let name = match g.kernel {
         Kernel::SmallM(tile) => {
@@ -229,13 +239,31 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
             );
             name
         }
-        Kernel::W4a8(tile) => {
+        Kernel::W4a8(kernel) => {
+            // A bucket short of the kernel's row tile (the 8-row bucket's 16-row tile) runs its
+            // pre-pass at the tile's rows, as the tape bakes it: the scratch's layout is the
+            // tile's. The scratch starts as garbage, so rows past the step's are whatever it held.
+            let scratch_rows = (g.bucket_m as u32).max(kernel.rows());
             let scratch = shared(
                 device,
-                &vec![0u8; w4a8_scratch_bytes(g.bucket_m as u32, k as u32) as usize],
+                &vec![0xa5u8; w4a8_scratch_bytes(scratch_rows, k as u32) as usize],
             );
+            let quant_consts = vec![
+                ConstantValue::int(0, k as i32),
+                ConstantValue::int(1, n as i32),
+                ConstantValue::int(2, scratch_rows as i32),
+            ];
+            let quant = baked_build(
+                cache,
+                &PipelineKey::new(
+                    "quantized_qmm_nax",
+                    w4a8_quant_static_name(W4a8Rows::Dense, g.act.act()),
+                    quant_consts,
+                ),
+            )
+            .expect("pipeline");
             batch.encode(
-                &pipeline(w4a8_quant_static_name(W4a8Rows::Dense, g.act.act())),
+                &quant,
                 &[(&x_buf, 0), (&scratch, 1)],
                 &[],
                 &[],
@@ -244,13 +272,7 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
                 size(128, 1),
             );
             batch.barrier();
-            let name = qmm_w4a8_static_name(
-                W4a8Rows::Dense,
-                g.act.act(),
-                g.scale.scale(),
-                gs as u32,
-                tile,
-            );
+            let name = kernel.static_name(g.act.act(), g.scale.scale(), gs as u32);
             batch.encode(
                 &pipeline(name),
                 &[
@@ -264,20 +286,23 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
                 &[],
                 &[],
                 size(
-                    n / tile.cols() as usize,
-                    m.div_ceil(W4A8_TILE_ROWS as usize),
+                    n / kernel.cols() as usize,
+                    m.div_ceil(kernel.rows() as usize),
                 ),
-                size(32 * tile.simdgroups() as usize, 1),
+                size(32 * kernel.simdgroups() as usize, 1),
             );
             name
         }
     };
     batch.commit(true);
-    let got: Vec<f32> =
-        unsafe { std::slice::from_raw_parts(y_buf.contents().as_ptr() as *const u16, m * n) }
-            .iter()
-            .map(|&b| g.act.value(b))
-            .collect();
+    let all =
+        unsafe { std::slice::from_raw_parts(y_buf.contents().as_ptr() as *const u16, y_rows * n) };
+    assert!(
+        all[g.bucket_m * n..].iter().all(|&b| b == SENTINEL),
+        "{name} m={m} n={n} k={k}: stored past the bucket's {} rows",
+        g.bucket_m
+    );
+    let got: Vec<f32> = all[..m * n].iter().map(|&b| g.act.value(b)).collect();
 
     // f32 accumulation over K products of magnitude ≲ 1, then one rounding
     // to the activation dtype.
@@ -295,6 +320,7 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
         got[at],
         want[at]
     );
+    got
 }
 
 fn with_nax(body: impl FnOnce(&Device, &SpecializedPipelineCache)) {
@@ -394,8 +420,152 @@ fn w4a8_across_dtypes_group_sizes_and_tiles() {
                                 bucket_m: 64,
                                 n,
                                 k: 1024,
-                                kernel: Kernel::W4a8(tile),
+                                kernel: Kernel::W4a8(W4a8Gemm::Tiled(tile)),
                             },
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// The split-K W4A8 GEMM (`affine_qmm_w4a8_splitk_*`) at every split, both group sizes and every
+/// dtype pairing, against the host reference and against the tiled GEMM over the same inputs: a
+/// partial row tile, a full bucket, and K = 1088 (17 chunks, which no split divides). Each output
+/// is the tiled GEMM's f32 chunk sum reassociated — each of the `ways` simdgroups sums its own
+/// chunks, then the partial tiles pairwise — so the two agree to the f32 sum's rounding (a few
+/// f32 ulp of the outputs' peak), which the one rounding to the activation dtype can turn into
+/// one ulp of the output (`eps` of it), never more.
+#[test]
+fn w4a8_split_k_matches_the_tiled_gemm() {
+    with_nax(|device, cache| {
+        for (act, scale) in [
+            (Dtype::Bf16, Dtype::Bf16),
+            (Dtype::Bf16, Dtype::F16),
+            (Dtype::F16, Dtype::F16),
+            (Dtype::F16, Dtype::Bf16),
+        ] {
+            for group_size in [64, 128] {
+                for split in W4a8SplitK::ALL {
+                    for (m, k) in [(13, 1024usize), (64, 1024), (45, 1088)] {
+                        if !k.is_multiple_of(group_size) {
+                            continue;
+                        }
+                        let gemm = |kernel| Gemm {
+                            act,
+                            scale,
+                            group_size,
+                            m,
+                            bucket_m: 64,
+                            n: 192,
+                            k,
+                            kernel: Kernel::W4a8(kernel),
+                        };
+                        let split_k = run(device, cache, &gemm(W4a8Gemm::SplitK(split)));
+                        let tiled = run(device, cache, &gemm(W4a8Gemm::Tiled(W4a8Tile::Cols64)));
+                        // f32 reassociation: a few ulp of f32 at the outputs' scale.
+                        let peak = tiled.iter().fold(0f32, |p, v| p.max(v.abs()));
+                        for (i, (a, b)) in split_k.iter().zip(&tiled).enumerate() {
+                            assert!(
+                                (a - b).abs() <= b.abs().max(a.abs()) * act.eps() + peak * 1e-6,
+                                "{split:?} gs {group_size} m {m} k {k} {act:?}/{scale:?} at {i}: \
+                                 split {a} tiled {b}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// The small-M step's 16-row W4A8 GEMM (`W4a8Gemm::SmallM`, `affine_qmm_w4a8_splitk_*_tm_16_*`)
+/// at every split, both group sizes and every dtype pairing, at the small-M steps' live rows in
+/// the 64-row bucket and K = 1088 that no split divides: against the host reference, and BIT FOR
+/// BIT against the 32-row split-K GEMM of the same split over the same pre-pass. An element's sum
+/// is the same at either tile (each simdgroup's chunks in order, then the pairwise reduction), so
+/// the rows both cover agree exactly.
+#[test]
+fn w4a8_small_m_tile_is_the_split_k_gemm_bits() {
+    with_nax(|device, cache| {
+        for (act, scale) in [
+            (Dtype::Bf16, Dtype::Bf16),
+            (Dtype::Bf16, Dtype::F16),
+            (Dtype::F16, Dtype::F16),
+            (Dtype::F16, Dtype::Bf16),
+        ] {
+            for group_size in [64, 128] {
+                for split in W4a8SplitK::ALL {
+                    for (m, k) in [(4, 1024usize), (9, 1024), (16, 1024), (13, 1088)] {
+                        if !k.is_multiple_of(group_size) {
+                            continue;
+                        }
+                        let gemm = |kernel| Gemm {
+                            act,
+                            scale,
+                            group_size,
+                            m,
+                            bucket_m: 64,
+                            n: 192,
+                            k,
+                            kernel: Kernel::W4a8(kernel),
+                        };
+                        let small = run(device, cache, &gemm(W4a8Gemm::SmallM(split)));
+                        let bucket = run(device, cache, &gemm(W4a8Gemm::SplitK(split)));
+                        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                        assert_eq!(
+                            bits(&small),
+                            bits(&bucket),
+                            "{split:?} gs {group_size} m {m} k {k} {act:?}/{scale:?}"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// The small-M step's 16-row W4A8 GEMM in the 8-row bucket (`W4a8Gemm::SmallM`, `M` = 8 < the
+/// tile's 16): its pre-pass baked at the tile's 16 rows, the scratch's rows past the step's left
+/// as garbage, the GEMM storing the bucket's rows alone. Every split, both group sizes, every
+/// dtype pairing, the small-M steps' 4 to 8 rows and K = 1088 that no split divides: against the
+/// host reference, and BIT FOR BIT against the same GEMM in the 64-row bucket over the same
+/// rows. A row's sum reads its own int8 row and chunk scales alone, so the rows the tile
+/// multiplies past the step's change none of it; the 8 rows past the bucket's it never stores
+/// (the output buffer is the bucket's).
+#[test]
+fn w4a8_small_m_tile_in_the_eight_row_bucket_is_the_tile_bits() {
+    with_nax(|device, cache| {
+        for (act, scale) in [
+            (Dtype::Bf16, Dtype::Bf16),
+            (Dtype::Bf16, Dtype::F16),
+            (Dtype::F16, Dtype::F16),
+            (Dtype::F16, Dtype::Bf16),
+        ] {
+            for group_size in [64, 128] {
+                for split in W4a8SplitK::ALL {
+                    for (m, k) in [(4, 1024usize), (7, 1024), (8, 1024), (8, 1088)] {
+                        if !k.is_multiple_of(group_size) {
+                            continue;
+                        }
+                        let gemm = |bucket_m| Gemm {
+                            act,
+                            scale,
+                            group_size,
+                            m,
+                            bucket_m,
+                            n: 192,
+                            k,
+                            kernel: Kernel::W4a8(W4a8Gemm::SmallM(split)),
+                        };
+                        let eight = run(device, cache, &gemm(8));
+                        let wide = run(device, cache, &gemm(64));
+                        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                        assert_eq!(
+                            bits(&eight),
+                            bits(&wide),
+                            "{split:?} gs {group_size} m {m} k {k} {act:?}/{scale:?}"
                         );
                     }
                 }

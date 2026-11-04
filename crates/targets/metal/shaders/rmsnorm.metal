@@ -4,6 +4,7 @@
 #include <metal_stdlib>
 #include "baked.h"
 #include "row_sum.h"
+#include "norm_w4a8_quant.h"
 using namespace metal;
 
 /// `RmsNormConstants`, compiled in: 0 = M (uint), 1 = N/HIDDEN_SIZE (uint), 2 = EPS (float).
@@ -17,6 +18,9 @@ SCRATCHY_CONSTANT(float, RMSNORM_WEIGHT_OFFSET, 3);
 // RMSNORM_THREADS-th from its index — are a count the compiler knows, and load together.
 SCRATCHY_CONSTANT(uint,  RMSNORM_THREADS,       4);
 constant constexpr uint RMSNORM_PER_THREAD = (RMSNORM_HIDDEN_SIZE + RMSNORM_THREADS - 1) / RMSNORM_THREADS;
+// The quantizing kernels (`rmsnorm_w4a8q_*`) only: the rows of the W4A8 scratch the norm's GEMMs
+// read (`QMM_M` of the pre-pass it replaces), its chunk scales past them.
+SCRATCHY_CONSTANT_OPTIONAL(uint, RMSNORM_W4A8_ROWS, 6);
 
 // Template form (`<T_act, T_scale>`): same in-register cast pattern as
 // the affine quant kernels (`shaders/quantized_*.metal`). The kernel
@@ -122,3 +126,59 @@ template <typename T_act>
 
 INST_RMSNORM_UNIT(f16,  half)
 INST_RMSNORM_UNIT(bf16, bfloat)
+
+/// `rmsnorm_specialized_impl`, and the W4A8 pre-pass over its output (`affine_w4a8_quant`) in the
+/// same threadgroup: the row it stores, rounded through `T_act`, is kept in threadgroup memory and
+/// quantized from there into the scratch (`norm_w4a8_quant.h`) — the same bytes the pre-pass
+/// writes from the stored row. The bf16 output is still written: other consumers read it.
+///
+/// Bindings: `rmsnorm_specialized_impl`'s, and buffer(3) = the W4A8 scratch (written).
+template <typename T_act, typename T_scale>
+[[kernel]] void rmsnorm_w4a8q_impl(
+    device       T_act*   output  [[buffer(0)]],
+    device const T_act*   input   [[buffer(1)]],
+    device const T_scale* weight  [[buffer(2)]],
+    device       uchar*   scratch [[buffer(3)]],
+    uint gid     [[threadgroup_position_in_grid]],
+    uint tid     [[thread_position_in_threadgroup]]
+) {
+    if (gid >= RMSNORM_M) return;
+
+    threadgroup float shared_sum[RMSNORM_THREADS];
+    threadgroup T_act normed[RMSNORM_HIDDEN_SIZE];
+
+    float vals[RMSNORM_PER_THREAD];
+    float local_sum = 0.0f;
+    for (uint k = 0; k < RMSNORM_PER_THREAD; ++k) {
+        const uint i = tid + k * RMSNORM_THREADS;
+        if (i < RMSNORM_HIDDEN_SIZE) {
+            vals[k] = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
+            local_sum += vals[k] * vals[k];
+        }
+    }
+    const float sum_sq = row_sum(local_sum, tid, RMSNORM_THREADS, shared_sum);
+
+    float rms = sqrt(sum_sq / float(RMSNORM_HIDDEN_SIZE) + RMSNORM_EPS);
+
+    for (uint k = 0; k < RMSNORM_PER_THREAD; ++k) {
+        const uint i = tid + k * RMSNORM_THREADS;
+        if (i < RMSNORM_HIDDEN_SIZE) {
+            float w = float(weight[i]) + RMSNORM_WEIGHT_OFFSET;
+            const T_act y = T_act((vals[k] / rms) * w);
+            output[gid * RMSNORM_HIDDEN_SIZE + i] = y;
+            normed[i] = y;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    norm_w4a8_quant_row(normed, scratch, gid, RMSNORM_HIDDEN_SIZE, RMSNORM_W4A8_ROWS, tid,
+                        RMSNORM_THREADS);
+}
+
+#define INST_RMSNORM_W4A8Q(act_tag, act_type, scale_tag, scale_type)            \
+  SCRATCHY_KERNEL(rmsnorm_w4a8q_##act_tag##_s_##scale_tag##_specialized,         \
+                  rmsnorm_w4a8q_impl<act_type, scale_type>)
+
+INST_RMSNORM_W4A8Q(f16,  half,   f16, half)
+INST_RMSNORM_W4A8Q(bf16, bfloat, f16, half)
+INST_RMSNORM_W4A8Q(bf16, bfloat, bf16, bfloat)
+INST_RMSNORM_W4A8Q(f16,  half,   bf16, bfloat)

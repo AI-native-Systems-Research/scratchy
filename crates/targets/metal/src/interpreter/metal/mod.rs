@@ -41,14 +41,14 @@ pub use pipelines::{GEMV_ROWS, PipelineLookupError, SpecializedPipelines};
 /// [`crate::BLOCKS_PER_CHUNK`].
 pub use crate::BLOCKS_PER_CHUNK;
 pub use forward::{
-    Deferral, DeviceInput, DeviceInputInto, ForwardError, ForwardInputs, ForwardReads, InFlight,
-    build_mrope_cos_sin_override,
+    Deferral, DeviceInput, DeviceInputInto, DraftInputs, ForwardError, ForwardInputs, ForwardReads,
+    GpuSpan, InFlight, build_mrope_cos_sin_override, last_gpu_span,
 };
 pub use pool::{
     FoldBand, MetalBucketSpec, MetalRungs, MetalWorkerPool, Onto, PickedRung, PoolBuildError,
     PooledWorker, RuntimeFactory, TqGroup, WorkerGuard, host_guest, pick_rung,
 };
-pub use runtime::RuntimeBindings;
+pub use runtime::{DraftRuntimeBuffers, RuntimeBindings};
 pub use worker::{
     Activation, ArenaLayout, ArenaRanks, ArenaRole, ArenaShare, BoundBuffer, BucketBaking,
     BucketStep, ByRank, GuestArena, HostArena, HostPart, Hosting, MetalWorker, Rank,

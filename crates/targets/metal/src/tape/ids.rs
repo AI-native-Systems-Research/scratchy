@@ -216,6 +216,24 @@ impl CommandIx {
     }
 }
 
+/// A position in one of a command table's part arrays
+/// ([`crate::tape::lowered::CommandTable`]): two bytes per command field, where the field itself
+/// would be up to thirty-two plus load-time fixups. A table holds no more distinct parts of one
+/// kind than distinct commands, so whatever a [`CommandIx`] indexes, a part index does too.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, serde::Serialize)]
+pub struct PartIx(pub u16);
+
+impl PartIx {
+    /// The index of the part at `position` of its array; `None` past the last index.
+    pub fn of(position: usize) -> Option<Self> {
+        u16::try_from(position).ok().map(Self)
+    }
+
+    pub fn get(self) -> usize {
+        usize::from(self.0)
+    }
+}
+
 macro_rules! i32_newtype {
     ($($(#[$m:meta])* $name:ident),* $(,)?) => {$(
         $(#[$m])*

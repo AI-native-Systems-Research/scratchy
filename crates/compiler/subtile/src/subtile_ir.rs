@@ -790,7 +790,10 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
     /// layer-carrying op in the body measures that.
     pub fn layer_index(&self) -> Option<u32> {
         match self {
-            SubOp::RopeAppend { layer, .. } | SubOp::KvAppend { layer, .. } => Some(*layer),
+            SubOp::RopeAppend { layer, .. }
+            | SubOp::KvAppend { layer, .. }
+            | SubOp::DraftAttention { layer, .. }
+            | SubOp::DraftContextKv { layer } => Some(*layer),
             _ => None,
         }
     }
@@ -954,6 +957,16 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             }
             SubOp::GateSplit { half_cols } => half_cols.hash(h),
             SubOp::Concat { cols } => cols.hash(h),
+            // A capture's slot is its layer's place among the captured layers, which are spaced
+            // unevenly: class, so each keeps its own body.
+            SubOp::CaptureHidden { slot, slots } => (slot, slots).hash(h),
+            SubOp::DraftConv { stage } => stage.hash(h),
+            // `layer` is per-layer identity, not class.
+            SubOp::DraftAttention { width, .. } => width.hash(h),
+            SubOp::DraftContextKv { .. }
+            | SubOp::DraftWindowStore
+            | SubOp::DraftWindowLoad
+            | SubOp::DraftSelect => {}
             SubOp::LoadRows { source, width } => {
                 source.hash(h);
                 width.hash(h);
@@ -968,6 +981,70 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             }
         }
     }
+}
+
+/// Which stage of a DFlash2 drafter's dynamic convolution a [`SubOp::DraftConv`] runs (Splash
+/// `ops::DraftConvolutionStage`): before its attention or MLP, or after it, adding the residual.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DraftConvStage {
+    Prepare,
+    Residual,
+}
+
+impl DraftConvStage {
+    /// The stage's index into the base kernel's and the dynamic weights' stages (Splash
+    /// `draft_conv_phase`'s `kind`).
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Prepare => 0,
+            Self::Residual => 1,
+        }
+    }
+}
+
+/// The rows a draft convolution reads ([`draft_conv_reference`]).
+pub struct DraftConvRows<'a> {
+    pub x: &'a [f32],
+    pub dynamic: &'a [f32],
+    pub base: &'a [f32],
+    pub residual: Option<&'a [f32]>,
+}
+
+/// Splash's `draft_conv_phase` (runtime/metal/kernels/decode/draft.metal) on the host: over each
+/// lane's block of `SPLASH_DRAFT_QUERY_ROWS` rows, channel `c` of row `r` is
+/// `x[r][c]·(base[2s][c] + dyn[r][2s·g + c/16]) + x[r-1][c]·(base[2s+1][c] + dyn[r][(2s+1)·g + c/16])`
+/// (the second term only past a block's first row), `s` the stage and `g` the channel groups,
+/// plus the residual in the finishing stage.
+pub fn draft_conv_reference(
+    rows: &DraftConvRows<'_>,
+    stage: DraftConvStage,
+    m: usize,
+    hidden: usize,
+    dyn_width: usize,
+) -> Vec<f32> {
+    const BLOCK: usize = 8;
+    const TAPS: usize = 2;
+    let groups = dyn_width / (2 * TAPS);
+    let group = hidden / groups;
+    let kind = stage.index();
+    let mut out = vec![0f32; m * hidden];
+    for r in 0..m {
+        for c in 0..hidden {
+            let tap = |t: usize| {
+                rows.base[(kind * TAPS + t) * hidden + c]
+                    + rows.dynamic[r * dyn_width + (kind * TAPS + t) * groups + c / group]
+            };
+            let mut v = rows.x[r * hidden + c] * tap(0);
+            if r % BLOCK > 0 {
+                v += rows.x[(r - 1) * hidden + c] * tap(1);
+            }
+            if let Some(res) = rows.residual {
+                v += res[r * hidden + c];
+            }
+            out[r * hidden + c] = v;
+        }
+    }
+    out
 }
 
 /// The ops whose lowering binds a witness, as a front end states them.
@@ -1239,6 +1316,37 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// Qwen3.5-MoE shared-expert combine: `out = routed + shared · σ(g)`, `g` a `[m, 1]`
     /// row-broadcast. `inputs` = `[routed, shared, g]`.
     GateScale,
+    // ── Splash's DFlash2 drafter (~/git/splash runtime/model/DFlashDraft.cpp) ──────────────
+    /// A layer's output rows copied into block `slot` of the `slots` blocks a drafter reads of
+    /// its target (Splash `QwenTarget::addCapture`). `inputs` = `[x]`; the output is `x`.
+    CaptureHidden { slot: u32, slots: u32 },
+    /// One stage of a DFlash2 drafter's dynamic convolution (Splash `draft_conv`): each channel
+    /// of a block row and of the row before it in its lane's block, weighted by the stage's base
+    /// kernel plus the channel group's dynamic weight. `inputs` = `[x, dynamic, base]`, or
+    /// `[x, dynamic, base, residual]` for [`DraftConvStage::Residual`], which adds it.
+    DraftConv { stage: DraftConvStage },
+    /// A DFlash2 drafter's attention at `layer` (Splash `draft_attention_qkv`, `_bf16_split`,
+    /// `_bf16_reduce`, `_reorder`): each block row's query, normed and roped, over the layer's
+    /// ring and the block's own rows, every one of which it sees. `inputs` =
+    /// `[qkv, q_norm, k_norm, cos, sin]`; output `width` columns.
+    DraftAttention { layer: u32, width: u32 },
+    /// A DFlash2 drafter's context commit at `layer` (Splash `draft_context_kv_commit`,
+    /// `prefill_draft_context_kv`): each row's keys, normed and roped, and its values, written into
+    /// the layer's ring at the row's position. `inputs` = `[kv, k_norm, cos, sin]`; the output is
+    /// `kv`.
+    DraftContextKv { layer: u32 },
+    /// A DFlash2 drafter's commit of its context rows into the lane's context window at their
+    /// positions, 4-bit (Splash `DFlashContextWindow`, `addWindowStore`). `inputs` = `[context]`;
+    /// the output is `context`.
+    DraftWindowStore,
+    /// The context rows of the forward's positions out of the lane's context window, written
+    /// over `context` (Splash `addWindowLoad`): a ring rebuild's alone. `inputs` = `[context]`;
+    /// the output is `context`, loaded.
+    DraftWindowLoad,
+    /// A DFlash2 drafter's proposals (Splash `draft_select_top16_sharded`, `draft_select_edges`,
+    /// `draft_select_dflash`, `draft_verify_rows`). `inputs` =
+    /// `[logits, selector, predecessor_codebook, successor_codebook]`; the output is `logits`.
+    DraftSelect,
     /// Host-staged rows: the runtime buffer `source` names (patchified pixels, interpolated
     /// position embeddings, a target model's hidden states) lands in this op's slot. NO
     /// inputs; output `[T, width]`.
@@ -3476,6 +3584,39 @@ pub fn eval_node<F: RopeForm>(
              single node's output is not a function of its operands alone",
             node.op.name()
         ),
+        SubOp::DraftAttention { .. }
+        | SubOp::DraftContextKv { .. }
+        | SubOp::DraftWindowStore
+        | SubOp::DraftWindowLoad => panic!(
+            "{} has no host reference: the drafter's ring is runtime-ambient per layer and its \
+             rows' positions a runtime input, so a node's output is not a function of its \
+             operands alone",
+            node.op.name()
+        ),
+        SubOp::DraftSelect => panic!(
+            "SubOp::DraftSelect has no host reference: its anchors, sampling policies and uniforms \
+             are runtime inputs, and its proposals land in the drafter's runtime outputs"
+        ),
+        // The capture's copy lands outside the graph; the forward reads `x` unchanged.
+        SubOp::CaptureHidden { .. } => gather(&node.inputs[0], graph, bufs).0,
+        SubOp::DraftConv { stage } => {
+            let (x, rows, hidden) = gather(&node.inputs[0], graph, bufs);
+            let (dynamic, _, dyn_width) = gather(&node.inputs[1], graph, bufs);
+            let (base, _, _) = gather(&node.inputs[2], graph, bufs);
+            let residual = node.inputs.get(3).map(|r| gather(r, graph, bufs).0);
+            draft_conv_reference(
+                &DraftConvRows {
+                    x: &x,
+                    dynamic: &dynamic,
+                    base: &base,
+                    residual: residual.as_deref(),
+                },
+                stage,
+                rows as usize,
+                hidden as usize,
+                dyn_width as usize,
+            )
+        }
         expansion_ops!() => panic!(
             "{} has no host reference: the router and expert weights arrive as opaque \
              bundle sources, a KV codec's packed stores as runtime buffers, and the sampled \
@@ -4089,6 +4230,13 @@ pub fn lower_region(
             SubOp::GateApply => SubOp::GateApply,
             SubOp::Concat { cols } => SubOp::Concat { cols },
             SubOp::GateScale => SubOp::GateScale,
+            SubOp::CaptureHidden { slot, slots } => SubOp::CaptureHidden { slot, slots },
+            SubOp::DraftConv { stage } => SubOp::DraftConv { stage },
+            SubOp::DraftAttention { layer, width } => SubOp::DraftAttention { layer, width },
+            SubOp::DraftContextKv { layer } => SubOp::DraftContextKv { layer },
+            SubOp::DraftWindowStore => SubOp::DraftWindowStore,
+            SubOp::DraftWindowLoad => SubOp::DraftWindowLoad,
+            SubOp::DraftSelect => SubOp::DraftSelect,
             SubOp::LoadRows { source, width } => SubOp::LoadRows { source, width },
             SubOp::EmbeddingGather { indices_kind } => SubOp::EmbeddingGather { indices_kind },
             SubOp::VisionRope => SubOp::VisionRope,

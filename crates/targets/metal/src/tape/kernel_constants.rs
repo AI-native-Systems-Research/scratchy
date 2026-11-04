@@ -694,31 +694,74 @@ impl From<AttentionPrefillPagedConstants> for Vec<ConstantValue> {
 /// [`GenClass::stores_affine_b4_offset8`](crate::tape::lowered::GenClass::stores_affine_b4_offset8)
 /// target every 4-bit weight's codes are stored XOR 0x88; every kernel
 /// that reads them carries this, and on `Offset8` gets `AFFINE_CODES_OFFSET8`
-/// (slot 5) to XOR them back.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// (slot 5) to XOR them back. `Planes` is offset-8 codes regrouped a 64-input chunk at a
+/// time (`affine_codes.h`: chunk `c`'s 32 bytes of every row, row after row), which a kernel
+/// reads under `AFFINE_CODES_PLANES` (slot 24) as well; `k` is the rows' input count, which
+/// the store needs to regroup them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AffineCodes {
     AsWritten,
     Offset8,
+    Planes { k: u32 },
 }
+
+/// The bytes of a 64-input chunk of one 4-bit row: the unit [`AffineCodes::Planes`] regroups.
+pub const AFFINE_PLANE_ROW_BYTES: usize = 32;
+
+/// `AFFINE_CODES_PLANES`' constant slot (`affine_codes.h`).
+pub const AFFINE_CODES_PLANES_SLOT: ConstSlot = ConstSlot(24);
 
 impl AffineCodes {
     pub fn of(profile: Option<&crate::targets::MetalTargetProfile>, bits: u32) -> Self {
         AffineCodesTarget::of(profile).for_bits(bits)
     }
 
-    /// Slot 5, set only on `Offset8` so every other pipeline keeps its key.
+    /// Slot 5, set on `Offset8` and `Planes`, so every other pipeline keeps its key.
     pub fn constant(self) -> Option<ConstantValue> {
         match self {
-            AffineCodes::Offset8 => Some(ConstantValue::boolean(ConstSlot(5), true)),
+            AffineCodes::Offset8 | AffineCodes::Planes { .. } => {
+                Some(ConstantValue::boolean(ConstSlot(5), true))
+            }
             AffineCodes::AsWritten => None,
         }
     }
 
+    /// Every constant a kernel reading codes stored this way takes: slot 5 on offset-8 storage,
+    /// and slot 24 besides on planes.
+    pub fn constants(self) -> impl Iterator<Item = ConstantValue> {
+        let planes = matches!(self, AffineCodes::Planes { .. })
+            .then(|| ConstantValue::boolean(AFFINE_CODES_PLANES_SLOT, true));
+        self.constant().into_iter().chain(planes)
+    }
+
+    /// Signed (q - 8) codes: offset-8, as planes or not — what the matrix-unit kernels read.
+    pub fn signed(self) -> bool {
+        matches!(self, AffineCodes::Offset8 | AffineCodes::Planes { .. })
+    }
+
+    /// The same codes regrouped into planes, for rows of `k` inputs: offset-8 storage only
+    /// (the planes kernels read signed codes), whole 64-input chunks only.
+    pub fn planes(self, k: u32) -> Self {
+        match self {
+            AffineCodes::Offset8 if k.is_multiple_of(64) => AffineCodes::Planes { k },
+            codes => codes,
+        }
+    }
+
     /// What a command whose kernel reads codes declares, from its baked
-    /// constants (slot 5 is `bool` only on such kernels).
+    /// constants (slot 5 is `bool` only on such kernels; slot 24 likewise, with its input
+    /// count at slot 0, `QMM_K` / `IN_VEC_SIZE`).
     pub fn of_constants(constants: &[ConstantValue]) -> Self {
+        let has = |c: ConstantValue| constants.contains(&c);
+        let planes = ConstantValue::boolean(AFFINE_CODES_PLANES_SLOT, true);
         match AffineCodes::Offset8.constant() {
-            Some(c) if constants.contains(&c) => AffineCodes::Offset8,
+            Some(c) if has(c) && has(planes) => {
+                let k = (constants.iter()).find(|v| v.index == 0).map(|v| v.bits);
+                AffineCodes::Planes {
+                    k: k.expect("a planes reader names its input count at slot 0"),
+                }
+            }
+            Some(c) if has(c) => AffineCodes::Offset8,
             _ => AffineCodes::AsWritten,
         }
     }
@@ -765,7 +808,7 @@ impl From<AffineQmvConstants> for Vec<ConstantValue> {
             ConstantValue::int(ConstSlot(0), c.k.get()),
             ConstantValue::int(ConstSlot(1), c.n.get()),
         ];
-        v.extend(c.codes.constant());
+        v.extend(c.codes.constants());
         v
     }
 }
@@ -982,6 +1025,9 @@ pub struct AffineCombineQmvConstants {
     /// residual add (`COMBINE_GATE_SCALE` / `COMBINE_RESIDUAL`). Unset when it stores the sum alone.
     pub gate_scale: bool,
     pub residual: bool,
+    /// Whether each pair's down input row is where a sorted bake's sort put it, read through its
+    /// `pos` at buffer 11 (slot 22, `COMBINE_ROWS_SORTED`).
+    pub sorted_rows: bool,
 }
 
 impl From<AffineCombineQmvConstants> for Vec<ConstantValue> {
@@ -995,6 +1041,10 @@ impl From<AffineCombineQmvConstants> for Vec<ConstantValue> {
         v.extend(
             c.residual
                 .then(|| ConstantValue::boolean(ConstSlot(19), true)),
+        );
+        v.extend(
+            c.sorted_rows
+                .then(|| ConstantValue::boolean(ConstSlot(22), true)),
         );
         v
     }
@@ -1017,7 +1067,7 @@ impl From<AffineQmvWideConstants> for Vec<ConstantValue> {
             ConstantValue::int(ConstSlot(1), c.n.get()),
             ConstantValue::int(ConstSlot(7), c.m.get()),
         ];
-        v.extend(c.codes.constant());
+        v.extend(c.codes.constants());
         v
     }
 }
@@ -1186,7 +1236,7 @@ impl From<AffineQmmTConstants> for Vec<ConstantValue> {
             ConstantValue::int(ConstSlot(1), c.n.get()),
             ConstantValue::int(ConstSlot(2), c.m.get()),
         ];
-        v.extend(c.codes.constant());
+        v.extend(c.codes.constants());
         v
     }
 }
@@ -1213,7 +1263,7 @@ impl From<AffineQmmTSplitKConstants> for Vec<ConstantValue> {
             ConstantValue::int(ConstSlot(2), c.m.get()),
             ConstantValue::int(ConstSlot(3), c.k_partition_size.get()),
         ];
-        v.extend(c.codes.constant());
+        v.extend(c.codes.constants());
         v
     }
 }
@@ -1308,7 +1358,7 @@ pub struct AffineEmbedConstants {
 impl From<AffineEmbedConstants> for Vec<ConstantValue> {
     fn from(c: AffineEmbedConstants) -> Self {
         let mut v = vec![ConstantValue::uint(ConstSlot(0), c.hidden_size.get())];
-        v.extend(c.codes.constant());
+        v.extend(c.codes.constants());
         v
     }
 }
@@ -1457,5 +1507,145 @@ pub struct ChainAdvanceConstants {
 impl From<ChainAdvanceConstants> for Vec<ConstantValue> {
     fn from(c: ChainAdvanceConstants) -> Self {
         vec![ConstantValue::uint(ConstSlot(0), c.block_size.get())]
+    }
+}
+
+// ── Splash's DFlash2 drafter (`dflash2.metal`, `dflash2_select.metal`) ─────────────────────────
+
+/// `dflash2_target_sampling.metal`'s constants (`TSAMPLE_*`, slots 0-1): a target's logits width
+/// and its drafter's block.
+pub struct TargetSamplingConstants {
+    pub vocab: crate::tape::ids::LogitsWidth,
+    pub rows: u32,
+}
+
+impl From<TargetSamplingConstants> for Vec<ConstantValue> {
+    fn from(c: TargetSamplingConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.vocab.get()),
+            ConstantValue::uint(ConstSlot(1), c.rows),
+        ]
+    }
+}
+
+/// `dflash2_accept.metal`'s constants (`ACCEPT_*`, slots 0-1): a drafter's block and the token
+/// its proposal rows embed.
+#[derive(Clone, Copy, Debug)]
+pub struct DraftAcceptConstants {
+    pub rows: u32,
+    pub mask: u32,
+}
+
+impl From<DraftAcceptConstants> for Vec<ConstantValue> {
+    fn from(c: DraftAcceptConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.rows),
+            ConstantValue::uint(ConstSlot(1), c.mask),
+        ]
+    }
+}
+
+/// `dflash2_capture.metal`'s constants (`CAPTURE_*`, slots 0-3): a target layer's output rows
+/// into block `slot` of `slots` of the captured rows.
+pub struct CaptureConstants {
+    pub hidden: u32,
+    pub slot: u32,
+    pub slots: u32,
+    /// The bucket's elements: its rows times `hidden`.
+    pub elements: u32,
+}
+
+impl From<CaptureConstants> for Vec<ConstantValue> {
+    fn from(c: CaptureConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.hidden),
+            ConstantValue::uint(ConstSlot(1), c.slot),
+            ConstantValue::uint(ConstSlot(2), c.slots),
+            ConstantValue::uint(ConstSlot(3), c.elements),
+        ]
+    }
+}
+
+/// Every `dflash2.metal` kernel's constants: the drafter's geometry and the convolution stage a
+/// `draft_conv` runs (`DRAFT_*`, slots 0-10; every kernel of the shader sets every slot).
+pub struct DraftConstants {
+    pub rows: u32,
+    pub query_heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub window: u32,
+    pub splits: u32,
+    pub hidden: u32,
+    pub conv_group: u32,
+    /// 0: the convolution's preparing stage; 1: its finishing stage (and every other kernel).
+    pub conv_finish: u32,
+    pub rms_eps: f32,
+    pub scale: f32,
+}
+
+impl From<DraftConstants> for Vec<ConstantValue> {
+    fn from(c: DraftConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.rows),
+            ConstantValue::uint(ConstSlot(1), c.query_heads),
+            ConstantValue::uint(ConstSlot(2), c.kv_heads),
+            ConstantValue::uint(ConstSlot(3), c.head_dim),
+            ConstantValue::uint(ConstSlot(4), c.window),
+            ConstantValue::uint(ConstSlot(5), c.splits),
+            ConstantValue::uint(ConstSlot(6), c.hidden),
+            ConstantValue::uint(ConstSlot(7), c.conv_group),
+            ConstantValue::uint(ConstSlot(8), c.conv_finish),
+            ConstantValue::float(ConstSlot(9), c.rms_eps),
+            ConstantValue::float(ConstSlot(10), c.scale),
+        ]
+    }
+}
+
+/// Every `dflash2_select.metal` kernel's constants (`SELECT_*`, slots 0-31).
+pub struct DraftSelectConstants {
+    pub vocab: u32,
+    pub rows: u32,
+    pub positions: u32,
+    pub candidates: u32,
+    pub rank: u32,
+    pub shards: u32,
+    pub verify: crate::dflash2::VerifyRows,
+    pub lanes: u32,
+}
+
+impl From<DraftSelectConstants> for Vec<ConstantValue> {
+    fn from(c: DraftSelectConstants) -> Self {
+        use crate::dflash2::{PROPOSALS, VERIFY_COST_SEED, VerifyRows};
+        // Every row leaves the budget's slots unread.
+        let (every_row, slope, intercepts, cost) = match c.verify {
+            VerifyRows::EveryRow => (true, 0.0, [0.0; PROPOSALS as usize], VERIFY_COST_SEED),
+            VerifyRows::Budget {
+                slope,
+                intercepts,
+                cost,
+            } => (false, slope, intercepts, cost),
+        };
+        let mut v = vec![
+            ConstantValue::uint(ConstSlot(0), c.vocab),
+            ConstantValue::uint(ConstSlot(1), c.rows),
+            ConstantValue::uint(ConstSlot(2), c.positions),
+            ConstantValue::uint(ConstSlot(3), c.candidates),
+            ConstantValue::uint(ConstSlot(4), c.rank),
+            ConstantValue::uint(ConstSlot(5), c.shards),
+            ConstantValue::float(ConstSlot(6), slope),
+        ];
+        v.extend(
+            (7u16..)
+                .zip(intercepts)
+                .map(|(s, x)| ConstantValue::float(ConstSlot(s), x)),
+        );
+        v.push(ConstantValue::uint(ConstSlot(14), c.lanes));
+        v.push(ConstantValue::boolean(ConstSlot(15), every_row));
+        v.extend(
+            (16u16..)
+                .zip(cost.0.into_iter().flatten())
+                .map(|(s, x)| ConstantValue::float(ConstSlot(s), x)),
+        );
+        v
     }
 }

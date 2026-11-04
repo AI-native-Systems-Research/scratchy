@@ -34,7 +34,7 @@
 // and the three agree to f32 rounding, not to the bit.)
 //
 // Its state contract is theirs (`gdn_state.h`, `scratchy_layers::gdn_state`): the slot's conv
-// ring (f32) and ssm entry (`half`, arithmetic f32), a verify step's draft lane — `k + 1` conv
+// ring (f32) and ssm entry (`gdn_ssm_t`, arithmetic f32), a verify step's draft lane — `k + 1` conv
 // checkpoints and two record areas of `k + 1` rows — and the step code's start, drafts, record
 // area and lane. A sequence's rows are at most GDN_VER_ROWS (the bucket's, at most 8).
 //
@@ -160,7 +160,7 @@ template <typename T>
     const device T*     b             [[buffer(4)]],
     const device T*     conv_w        [[buffer(5)]],
     device       float* conv_state    [[buffer(6)]],
-    device       half*  ssm_state     [[buffer(7)]],
+    device       gdn_ssm_t*  ssm_state     [[buffer(7)]],
     const device int*   cu_seqlens    [[buffer(8)]],
     const device GdnSeqSlots* state_indices [[buffer(9)]],
     const device uint*  gdn_step      [[buffer(10)]],
@@ -316,7 +316,7 @@ template <typename T>
     for (uint j = 0; j < BATCH; j++) {
       const uint d = (j0 + j) * SIMDGROUPS + simd_gid;
       dv[j] = d;
-      const device half* row = ssm_state + start_slot * SSM_SLOT_LEN + (i_hv * Vd + dv[j]) * K;
+      const device gdn_ssm_t* row = ssm_state + start_slot * SSM_SLOT_LEN + (i_hv * Vd + dv[j]) * K;
       for (uint i = 0; i < NPT; i++) {
         st[j][i] = fresh ? 0.0f : float(row[lane * NPT + i]);
       }
@@ -353,16 +353,16 @@ template <typename T>
       // them would have left it in the slot.
       for (uint j = 0; j < BATCH; j++) {
         for (uint i = 0; i < NPT; i++) {
-          st[j][i] = float(half(st[j][i]));
+          st[j][i] = float(gdn_ssm_t(st[j][i]));
         }
       }
     }
     if (drafts > 0u && start != 0u) {
       // A verify step leaves the state it starts from in the slot (a slot start's is there).
       for (uint j = 0; j < BATCH; j++) {
-        device half* row = ssm_state + uint(slot) * SSM_SLOT_LEN + (i_hv * Vd + dv[j]) * K;
+        device gdn_ssm_t* row = ssm_state + uint(slot) * SSM_SLOT_LEN + (i_hv * Vd + dv[j]) * K;
         for (uint i = 0; i < NPT; i++) {
-          row[lane * NPT + i] = half(st[j][i]);
+          row[lane * NPT + i] = gdn_ssm_t(st[j][i]);
         }
       }
     }
@@ -405,10 +405,10 @@ template <typename T>
       for (uint sv = 0; sv < GDN_SAVES; sv++) {
         if (gdn_saves_after(saves_through, sv, int(t))) {
           for (uint j = 0; j < BATCH; j++) {
-            device half* snap = ssm_state + uint(seq_slots.saves[sv].y) * SSM_SLOT_LEN +
+            device gdn_ssm_t* snap = ssm_state + uint(seq_slots.saves[sv].y) * SSM_SLOT_LEN +
                                 (i_hv * Vd + dv[j]) * K;
             for (uint i = 0; i < NPT; i++) {
-              snap[lane * NPT + i] = half(st[j][i]);
+              snap[lane * NPT + i] = gdn_ssm_t(st[j][i]);
               st[j][i] = float(snap[lane * NPT + i]);
             }
           }
@@ -418,9 +418,9 @@ template <typename T>
     // Any step but a verify step leaves its last row's state in the slot.
     if (drafts == 0u) {
       for (uint j = 0; j < BATCH; j++) {
-        device half* row = ssm_state + uint(slot) * SSM_SLOT_LEN + (i_hv * Vd + dv[j]) * K;
+        device gdn_ssm_t* row = ssm_state + uint(slot) * SSM_SLOT_LEN + (i_hv * Vd + dv[j]) * K;
         for (uint i = 0; i < NPT; i++) {
-          row[lane * NPT + i] = half(st[j][i]);
+          row[lane * NPT + i] = gdn_ssm_t(st[j][i]);
         }
       }
     }
@@ -468,7 +468,7 @@ template <typename T>
     const device T*     b             [[buffer(4)]],
     const device T*     conv_w        [[buffer(5)]],
     device       float* conv_state    [[buffer(6)]],
-    device       half*  ssm_state     [[buffer(7)]],
+    device       gdn_ssm_t*  ssm_state     [[buffer(7)]],
     const device int*   cu_seqlens    [[buffer(8)]],
     const device GdnSeqSlots* state_indices [[buffer(9)]],
     const device uint*  gdn_step      [[buffer(10)]],

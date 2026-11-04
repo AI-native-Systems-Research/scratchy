@@ -15,14 +15,12 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use scratchy_target_metal::tape::constants::ConstantValue;
 use scratchy_target_metal::tape::ids::{
-    BlockSize, CommandIx, HeadDim, MaxBlocksPerSeq, MaxPositions, NumKvHeads, NumQHeads,
-    TqDecodeHeads,
+    BlockSize, HeadDim, MaxBlocksPerSeq, MaxPositions, NumKvHeads, NumQHeads, TqDecodeHeads,
 };
 use scratchy_target_metal::tape::lowered::{
-    Binding, DispatchShape, GatedCommand, GenClass, KernelId, KvAddressing, LoweredCommand,
-    LoweredMetalTape, LoweringError, MetalDtype, TapeCommands,
+    CommandTableBuilder, GatedCommand, GenClass, KernelId, KvAddressing, LoweredMetalTape,
+    LoweringError, MetalDtype, TapeCommands,
 };
 
 /// ⭐ EVERY DISTINCT COMMAND OF ONE MODEL'S BAKED TAPES, SPELLED ONCE.
@@ -33,14 +31,18 @@ use scratchy_target_metal::tape::lowered::{
 /// Deduping whole bodies only helps when NOTHING differs, so one constant forked a full copy of
 /// the tape and rustc's single-threaded front end paid for every token of it.
 ///
-/// Each distinct command is one entry of the model's command table (`__tape_cmds::TABLE`),
-/// serialized once; a body lists [`CommandIx`]es into it, so a command every rung shares is stored
-/// once and each rung pays two bytes for it. A model with more distinct commands than a
-/// [`CommandIx`] indexes refuses the bake.
+/// Each distinct command is one entry of the model's command table (`__tape_cmds::TABLE`, a
+/// [`CommandTable`](scratchy_target_metal::tape::lowered::CommandTable)), interned by the same
+/// builder a tape lowered at run time is ([`CommandTableBuilder`]); a body lists
+/// [`CommandIx`](scratchy_target_metal::tape::ids::CommandIx)es
+/// into it, so a command every rung shares is stored once and each rung pays two bytes for it. A
+/// model with more distinct commands than a command index addresses refuses the bake.
 ///
 /// So are the bulky parts of the commands: a model's thousands of commands are combinations of a
-/// few hundred constant sets, a few hundred dispatch shapes and a few dozen binding lists, each
-/// spelled once as its own `const` the commands name.
+/// few hundred constant sets, a few hundred dispatch shapes, a few dozen binding lists and kernel
+/// symbols, each held once in the table's part arrays and named by a two-byte index — so a
+/// command is a few bytes, not the pointers and inline shapes it reads as, and the binary carries
+/// no load-time fixup for it.
 ///
 /// So is each distinct kernel of a baked library the commands name for any variant
 /// ([`aot::baked_library`]): one entry of the model's kernel table (`__tape_cmds::KERNELS`), naming
@@ -48,98 +50,19 @@ use scratchy_target_metal::tape::lowered::{
 /// `__metal_bake` module ([`kernel_ref`]).
 #[derive(Default)]
 pub struct CommandPool {
-    index: std::collections::HashMap<GatedCommand, CommandIx>,
-    table: Vec<TokenStream>,
-    constants: Parts<&'static [ConstantValue]>,
-    dispatches: Parts<DispatchShape>,
-    bindings: Parts<&'static [Binding]>,
+    table: CommandTableBuilder,
     named_kernels: std::collections::HashSet<PipelineKey>,
     kernels: Vec<PipelineKey>,
 }
 
-/// Each distinct value of one command field, as a `const` of its own.
-struct Parts<T> {
-    index: std::collections::HashMap<T, proc_macro2::Ident>,
-    items: Vec<TokenStream>,
-}
-
-impl<T> Default for Parts<T> {
-    fn default() -> Self {
-        Self {
-            index: Default::default(),
-            items: Vec::new(),
-        }
-    }
-}
-
-impl<T: std::hash::Hash + Eq + Copy + serde::Serialize> Parts<T> {
-    /// The `const` (`<prefix><n>: <ty>`) spelling `value`.
-    fn name(&mut self, value: T, prefix: &str, ty: TokenStream) -> Result<TokenStream, BakeDefect> {
-        if let Some(id) = self.index.get(&value) {
-            return Ok(quote!(#id));
-        }
-        let id = quote::format_ident!("{prefix}{}", self.items.len());
-        let toks = crate::const_tokens::const_tokens(&value)
-            .map_err(|e| BakeDefect(format!("serialize {prefix}: {e}")))?;
-        self.items
-            .push(quote! { pub(super) const #id: #ty = #toks; });
-        self.index.insert(value, id.clone());
-        Ok(quote!(#id))
-    }
-}
-
 impl CommandPool {
-    fn intern(&mut self, cmd: &GatedCommand) -> Result<TokenStream, BakeDefect> {
-        let ix = match self.index.get(cmd) {
-            Some(&ix) => ix,
-            None => {
-                let ix = CommandIx::of(self.table.len()).ok_or_else(|| {
-                    BakeDefect(format!(
-                        "more than {} distinct commands: a command index cannot address them",
-                        self.table.len()
-                    ))
-                })?;
-                let GatedCommand { command, gate } = *cmd;
-                let LoweredCommand {
-                    kernel,
-                    library,
-                    function,
-                    constants,
-                    dispatch,
-                    bindings,
-                    gemm_dims,
-                } = command;
-                let constants =
-                    (self.constants).name(constants, "CS", quote!(&[__tc::ConstantValue]))?;
-                let dispatch = self
-                    .dispatches
-                    .name(dispatch, "DS", quote!(__tl::DispatchShape))?;
-                let bindings = (self.bindings).name(bindings, "BS", quote!(&[__tl::Binding]))?;
-                let tok = |r: Result<TokenStream, crate::const_tokens::Error>| {
-                    r.map_err(|e| BakeDefect(format!("serialize command: {e}")))
-                };
-                let kernel = tok(crate::const_tokens::const_tokens(&kernel))?;
-                let gemm_dims = tok(crate::const_tokens::const_tokens(&gemm_dims))?;
-                let gate = tok(crate::const_tokens::const_tokens(&gate))?;
-                let id = quote::format_ident!("C{}", ix.0);
-                self.table.push(quote! {
-                    pub(super) const #id: __tl::GatedCommand = __tl::GatedCommand {
-                        command: __tl::LoweredCommand {
-                            kernel: #kernel,
-                            library: #library,
-                            function: #function,
-                            constants: #constants,
-                            dispatch: #dispatch,
-                            bindings: #bindings,
-                            gemm_dims: #gemm_dims,
-                        },
-                        gate: #gate,
-                    };
-                });
-                self.index.insert(*cmd, ix);
-                ix
-            }
-        };
+    fn intern(&mut self, cmd: GatedCommand) -> Result<TokenStream, BakeDefect> {
+        let ix = self.table.intern(cmd).map_err(|e| {
+            BakeDefect(format!(
+                "more than {} distinct commands: a command index cannot address them",
+                e.distinct - 1
+            ))
+        })?;
         let ix = proc_macro2::Literal::u16_unsuffixed(ix.0);
         Ok(quote! { I(#ix) })
     }
@@ -166,36 +89,85 @@ impl CommandPool {
 
     /// The `__tape_cmds` module the model's tape statics reference, and `METAL_KERNELS`, the
     /// model's baked kernels its buckets name. Emit it once, beside them.
-    pub fn into_tokens(self) -> TokenStream {
+    pub fn into_tokens(self) -> Result<TokenStream, BakeDefect> {
         // A model metal lowers no tape for (a dense MoE has no metal realization) names nothing.
         if self.table.is_empty() && self.kernels.is_empty() {
-            return quote! {
+            return Ok(quote! {
                 #[cfg(feature = "metal")]
                 static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] = &[];
-            };
+            });
         }
+        let parts = self.table.finish();
         let aliases = crate::const_tokens::alias_preamble();
-        let table = self.table;
-        let len = proc_macro2::Literal::usize_unsuffixed(table.len());
-        let ids = (0..table.len()).map(|i| quote::format_ident!("C{i}"));
+        let array = |name: &str, values: Vec<TokenStream>, ty: TokenStream| {
+            let (id, len) = (
+                quote::format_ident!("{name}"),
+                proc_macro2::Literal::usize_unsuffixed(values.len()),
+            );
+            quote! { static #id: [#ty; #len] = [ #(#values),* ]; }
+        };
+        fn each<T: serde::Serialize>(values: &[T]) -> Result<Vec<TokenStream>, BakeDefect> {
+            (values.iter())
+                .map(|v| {
+                    crate::const_tokens::const_tokens(v)
+                        .map_err(|e| BakeDefect(format!("serialize command table: {e}")))
+                })
+                .collect()
+        }
+        let symbols = (parts.symbols.iter())
+            .map(|(library, function)| quote! { (#library, #function) })
+            .collect();
+        let statics = [
+            array(
+                "COMMANDS",
+                each(&parts.commands)?,
+                quote!(__tl::PackedCommand),
+            ),
+            array("SYMBOLS", symbols, quote!((&str, &str))),
+            array(
+                "CONSTANTS",
+                each(&parts.constants)?,
+                quote!(&[__tc::ConstantValue]),
+            ),
+            array(
+                "DISPATCHES",
+                each(&parts.dispatches)?,
+                quote!(__tl::DispatchShape),
+            ),
+            array("BINDINGS", each(&parts.bindings)?, quote!(&[__tl::Binding])),
+            array(
+                "GEMM_DIMS",
+                each(&parts.gemm_dims)?,
+                quote!(Option<__tl::GemmDims>),
+            ),
+            array(
+                "GATES",
+                each(&parts.gates)?,
+                quote!(Option<__tl::RuntimeGate>),
+            ),
+        ];
         let kernels: Vec<TokenStream> = self.kernels.iter().map(kernel_ref).collect();
         let kernels_len = proc_macro2::Literal::usize_unsuffixed(kernels.len());
-        let parts = (self.constants.items.iter())
-            .chain(&self.dispatches.items)
-            .chain(&self.bindings.items);
-        quote! {
+        Ok(quote! {
             #[cfg(feature = "metal")]
             mod __tape_cmds {
                 #aliases
-                #(#parts)*
-                #(#table)*
-                pub(super) static TABLE: [__tl::GatedCommand; #len] = [ #(#ids),* ];
+                #(#statics)*
+                pub(super) static TABLE: __tl::CommandTable = __tl::CommandTable {
+                    commands: &COMMANDS,
+                    symbols: &SYMBOLS,
+                    constants: &CONSTANTS,
+                    dispatches: &DISPATCHES,
+                    bindings: &BINDINGS,
+                    gemm_dims: &GEMM_DIMS,
+                    gates: &GATES,
+                };
                 pub(super) static KERNELS: [__tl::BakedKernel; #kernels_len] = [ #(#kernels),* ];
             }
             #[cfg(feature = "metal")]
             static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] =
                 &__tape_cmds::KERNELS;
-        }
+        })
     }
 }
 
@@ -233,22 +205,53 @@ pub fn bake_module() -> TokenStream {
         bake.compiled
     );
     let mut metallibs = std::collections::HashMap::new();
-    let mut statics = Vec::new();
-    for ((name, key), kernel) in names.iter().zip(&keys).zip(&bake.kernels) {
-        let next = metallibs.len();
-        let lib = *(metallibs.entry(std::sync::Arc::as_ptr(&kernel.metallib).cast::<u8>()))
-            .or_insert_with(|| {
-                let (lib, bytes) = (
-                    quote::format_ident!("M{next}"),
-                    metallib_file(&kernel.metallib),
-                );
-                let len = proc_macro2::Literal::usize_unsuffixed(kernel.metallib.len());
-                // The bytes ARE the static (an array, not a `&[u8]` to an anonymous allocation):
-                // the models' kernel tables copy these kernels, and each codegen unit that holds a
-                // copy would otherwise embed its own copy of the anonymous bytes.
-                statics.push(quote! { static #lib: [u8; #len] = *#bytes; });
-                next
-            });
+    let mut distinct: Vec<&[u8]> = Vec::new();
+    let lib_of: Vec<usize> = (bake.kernels.iter())
+        .map(|kernel| {
+            *(metallibs.entry(std::sync::Arc::as_ptr(&kernel.metallib).cast::<u8>()))
+                .or_insert_with(|| {
+                    distinct.push(&kernel.metallib);
+                    distinct.len() - 1
+                })
+        })
+        .collect();
+    if distinct.is_empty() {
+        return TokenStream::new();
+    }
+    let packed = aot::pack(&distinct);
+    eprintln!(
+        "[metal bake] {} metallibs, {} bytes packed to {} (dictionary {})",
+        distinct.len(),
+        distinct.iter().map(|m| m.len()).sum::<usize>(),
+        packed.frames.iter().map(Vec::len).sum::<usize>() + packed.dictionary.len(),
+        packed.dictionary.len(),
+    );
+    // The bytes ARE the statics (arrays, not `&[u8]`s to anonymous allocations): the models'
+    // kernel tables copy these kernels, and each codegen unit that holds a copy would otherwise
+    // embed its own copy of the anonymous bytes.
+    let (dictionary, dictionary_len) = (
+        metal_bake_file(&packed.dictionary, "dict"),
+        proc_macro2::Literal::usize_unsuffixed(packed.dictionary.len()),
+    );
+    let mut statics = vec![quote! {
+        static DICTIONARY_BYTES: [u8; #dictionary_len] = *#dictionary;
+        static DICTIONARY: __tl::BakedDictionary = __tl::BakedDictionary::new(&DICTIONARY_BYTES);
+    }];
+    for (i, (metallib, frame)) in distinct.iter().zip(&packed.frames).enumerate() {
+        let (lib, frame_id) = (quote::format_ident!("M{i}"), quote::format_ident!("F{i}"));
+        let bytes = metal_bake_file(frame, "metallib.zst");
+        let frame_len = proc_macro2::Literal::usize_unsuffixed(frame.len());
+        let len = proc_macro2::Literal::usize_unsuffixed(metallib.len());
+        statics.push(quote! {
+            static #frame_id: [u8; #frame_len] = *#bytes;
+            static #lib: __tl::BakedMetallib = __tl::BakedMetallib {
+                frame: &#frame_id,
+                dictionary: &DICTIONARY,
+                len: #len,
+            };
+        });
+    }
+    for (((name, key), kernel), lib) in names.iter().zip(&keys).zip(&bake.kernels).zip(lib_of) {
         let (id, metallib) = (
             quote::format_ident!("{name}"),
             quote::format_ident!("M{lib}"),
@@ -266,9 +269,6 @@ pub fn bake_module() -> TokenStream {
             };
         });
     }
-    if statics.is_empty() {
-        return TokenStream::new();
-    }
     quote! {
         use ::scratchy_target_metal::tape::constants as __tc;
         use ::scratchy_target_metal::tape::lowered as __tl;
@@ -276,21 +276,21 @@ pub fn bake_module() -> TokenStream {
     }
 }
 
-/// `metallib` as a file under the build's `OUT_DIR`, named by its content (models sharing a batch
-/// share the file), and the `include_bytes!` that embeds it: rustc reads the bytes rather than
-/// lexing them as a literal.
-fn metallib_file(metallib: &[u8]) -> TokenStream {
+/// `bytes` (a packed metallib's frame or the dictionary) as a file under the build's `OUT_DIR`,
+/// named by its content and `extension`, and the `include_bytes!` that embeds it: rustc reads the
+/// bytes rather than lexing them as a literal.
+fn metal_bake_file(bytes: &[u8], extension: &str) -> TokenStream {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let out = std::env::var("OUT_DIR").expect("the metal bake writes its metallibs under OUT_DIR");
     let fnv = |h: u64, &b: &u8| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
-    let hash = metallib.iter().fold(0xcbf2_9ce4_8422_2325, fnv);
-    let name = format!("metal-bake/{hash:016x}-{}.metallib", metallib.len());
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325, fnv);
+    let name = format!("metal-bake/{hash:016x}-{}.{extension}", bytes.len());
     let path = std::path::Path::new(&out).join(&name);
     if !path.exists() {
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("{}.{seq}.tmp", std::process::id()));
         std::fs::create_dir_all(path.parent().expect("metal-bake dir"))
-            .and_then(|()| std::fs::write(&tmp, metallib))
+            .and_then(|()| std::fs::write(&tmp, bytes))
             .and_then(|()| std::fs::rename(&tmp, &path))
             .unwrap_or_else(|e| panic!("metal bake: write {}: {e}", path.display()));
     }
@@ -392,6 +392,7 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
 /// One rung of a bucket's tape: its class, addressing and KV cap.
 struct Rung<'a> {
     profile: &'a MetalTargetProfile,
+    class: GenClass,
     /// The step tape this rung lowers — the wide class's band when the bands fold differently —
     /// and the arena slot count that tape's colouring allocated.
     steps: &'a MetalStepTape,
@@ -412,6 +413,7 @@ fn run_lower(
         rotary: input.rotary,
         block_cap: rung.cap.get(),
         profile: Some(rung.profile),
+        class: rung.class,
     };
     tl::lower_subtile_tape_to_metal(rung.steps, mc, at)
 }
@@ -469,6 +471,7 @@ pub fn bake_bucket_tapes(
         };
         let rung = Rung {
             profile: &profile,
+            class,
             steps,
             num_arena_slots,
             addressing,

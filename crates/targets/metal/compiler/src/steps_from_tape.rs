@@ -20,8 +20,8 @@ use scratchy_subtile::handoff::{
 use scratchy_subtile::kv_codec::CodecGuard;
 use scratchy_subtile::lower::{GemmWeight, InputRef};
 use scratchy_subtile::subtile_ir::{
-    AttnMask, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention, RopeFormTag, RowScale,
-    SubOp, SubtileIR, SubtileId,
+    AttnMask, DraftConvStage, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention,
+    RopeFormTag, RowScale, SubOp, SubtileIR, SubtileId,
 };
 use scratchy_subtile::subtile_tape::SlotId;
 use scratchy_subtile::tape_colouring::{Colour, ColourCount, Residency, TapeColouring};
@@ -33,7 +33,7 @@ use scratchy_target_metal::op_abi::{
     GuardRun, METAL_ELIDABLE, MetalFusion, MoeWrite, metal_colour_rule, metal_guard_gates,
     moe_write, rope_append_weight_site,
 };
-use scratchy_target_metal::tape::lowered::{Fence, RuntimeGate};
+use scratchy_target_metal::tape::lowered::{Fence, PlayLive, RuntimeGate};
 use scratchy_target_metal::tape::step::{
     self as st, AffineBits as Bits, AffineGroupSize as Gs, ArenaSlotIdx as Slot, HiddenSize as W,
     IntermediateSize as Inter, LayerId, MetalStep, MoeRegion, MoeRows, MoeStep,
@@ -332,10 +332,16 @@ pub struct HazardSig {
     /// The KV codec's staging buffer — ONE location, written by every stage, read by a coded
     /// attention.
     codec_staging: Access,
+    /// A DFlash2 drafter's context window (`draft_window_store`, `draft_window_load`) — ONE
+    /// location, the lanes' windows: written by a commit's store, read by the load after it.
+    draft_window: Access,
     /// The construct the row was expanded from: its rows fence as one.
     group: Option<ExpansionId>,
     /// A view or a loop marker: dispatches nothing, fences nothing, and is not bookkept.
     metadata: bool,
+    /// It computes the forward's result (the result op's row, or a row of its construct): what a
+    /// play of the result alone reads.
+    result: bool,
 }
 
 /// How a row touches a location, ordered by how much it conflicts with.
@@ -386,8 +392,10 @@ fn roped_attention(rope: Emission, attention: Emission) -> Emission {
         state_w: r.state_w || a.state_w,
         op_scratch: r.op_scratch.max(a.op_scratch),
         codec_staging: r.codec_staging.max(a.codec_staging),
+        draft_window: r.draft_window.max(a.draft_window),
         group: a.group,
         metadata: false,
+        result: r.result || a.result,
     };
     let step = MetalStep::RopedAttention(Box::new(st::RopedAttention {
         writer: rope.step,
@@ -1095,6 +1103,7 @@ impl Recording<'_> {
         };
         if let Some(e) = &mut e {
             e.lm_head = self.lm_head(i);
+            e.sig.result = self.result(i);
             if let Some(x) = self.l.op_expansion[i] {
                 e.sig.group = Some(x.id);
                 match x.guard.map(|g| metal_guard_gates(self.bucket_m).gate(g)) {
@@ -1105,6 +1114,18 @@ impl Recording<'_> {
             }
         }
         Ok(e)
+    }
+
+    /// Whether op `i`'s row computes the forward's result: the result op's own row, the fold
+    /// writing the result when it is that fold's epilogue, or a row of the result's construct.
+    fn result(&self, i: usize) -> bool {
+        let r = self.l.input.result;
+        let writes_it = match self.folds.role(self.steps.slot[r]) {
+            StepRole::Epilogue { of } => self.steps.slot[i] == of,
+            _ => i == r,
+        };
+        let id = |j: usize| self.l.op_expansion[j].map(|e| e.id);
+        writes_it || (id(r).is_some() && id(i) == id(r))
     }
 
     /// The lm_head half: the forward's result matmul, and the sampled rows around it (the
@@ -2291,6 +2312,80 @@ impl Recording<'_> {
                 e.sig.state_w = true;
                 e
             }
+            // Splash's drafter. The ring is the drafter's KV: a context commit writes its layer's,
+            // an attention reads it, so the barrier walk orders the two and the cache play keeps
+            // the commit.
+            L::CaptureHidden { slot, slots } => {
+                let input = self.read(i, 0)?;
+                let step = S::CaptureHidden(input, st::CaptureSlot { slot, slots });
+                em(step, &[input], &[], Vec::new())
+            }
+            L::DraftConv { stage } => {
+                let (input, dynamic, out) = (self.read(i, 0)?, self.read(i, 1)?, out()?);
+                let base = self.source_arg(i, 2)?;
+                let residual = match stage {
+                    DraftConvStage::Prepare => None,
+                    DraftConvStage::Residual => Some(self.read(i, 3)?),
+                };
+                let reads: Vec<Slot> = [input, dynamic].into_iter().chain(residual).collect();
+                let step = S::DraftConv(st::DraftConv {
+                    input,
+                    dynamic,
+                    residual,
+                    output: out,
+                    layer: self.layer(base),
+                });
+                em(
+                    step,
+                    &reads,
+                    &[out],
+                    self.site(i, WeightKind::Tensor, base)?,
+                )
+            }
+            L::DraftAttention { layer, .. } => {
+                let (qkv, out, layer) = (self.read(i, 0)?, out()?, LayerId(layer));
+                let mut sites = self.site(i, WeightKind::RmsNorm, self.source_arg(i, 1)?)?;
+                sites.extend(self.site(i, WeightKind::RmsNorm, self.source_arg(i, 2)?)?);
+                sites.push(self.rotary(i));
+                let mut e = em(S::DraftAttention(qkv, out, layer), &[qkv], &[out], sites);
+                // Its grouped queries, block keys and values and split partials.
+                e.sig.op_scratch = Access::Write;
+                e.sig.kv_r = Some(layer);
+                e
+            }
+            L::DraftContextKv { layer } => {
+                let (kv, layer) = (self.read(i, 0)?, LayerId(layer));
+                let mut sites = self.site(i, WeightKind::RmsNorm, self.source_arg(i, 1)?)?;
+                sites.push(self.rotary(i));
+                let mut e = em(S::DraftContextKv(kv, layer), &[kv], &[], sites);
+                e.sig.kv_w = Some(layer);
+                e
+            }
+            // The window is ONE location, the lanes' windows. A store reads its context rows; a
+            // load writes its rows over them, reading the window alone: in a rebuild, which plays
+            // no store, nothing before it computes them.
+            L::DraftWindowStore => {
+                let context = self.read(i, 0)?;
+                let mut e = em(S::DraftWindowStore(context), &[context], &[], Vec::new());
+                e.sig.draft_window = Access::Write;
+                e
+            }
+            L::DraftWindowLoad => {
+                let context = self.read(i, 0)?;
+                let mut e = em(S::DraftWindowLoad(context), &[], &[context], Vec::new());
+                e.sig.draft_window = Access::Read;
+                e
+            }
+            L::DraftSelect => {
+                let (logits, selector) = (self.read(i, 0)?, self.read(i, 1)?);
+                let mut sites = self.site(i, WeightKind::Tensor, self.source_arg(i, 2)?)?;
+                sites.extend(self.site(i, WeightKind::Tensor, self.source_arg(i, 3)?)?);
+                let step = S::DraftSelect(logits, selector);
+                let mut e = em(step, &[logits, selector], &[], sites);
+                // Its shard partials and edge tables.
+                e.sig.op_scratch = Access::Write;
+                e
+            }
             L::Mamba2 { .. } => {
                 let (out, zxbcdt) = (out()?, self.read(i, 0)?);
                 let e = self.weight_of(i)?;
@@ -2464,9 +2559,14 @@ pub struct Assembled {
 }
 
 impl Assembled {
-    /// The backbone rows a forward that reads only its cache writes runs ([`cache_live`]).
-    pub fn cache_live(&self) -> Vec<bool> {
-        cache_live(&self.rows, &self.sigs)
+    /// The plays short of the whole forward that run each row ([`play_live`]): the backbone's
+    /// rows, then the lm_head's, walked as ONE stream.
+    pub fn play_live(&self) -> (Vec<PlayLive>, Vec<PlayLive>) {
+        let rows: Vec<StepRow> = self.rows.iter().chain(&self.lm_rows).cloned().collect();
+        let sigs: Vec<HazardSig> = self.sigs.iter().chain(&self.lm_sigs).cloned().collect();
+        let mut live = play_live(&rows, &sigs);
+        let lm = live.split_off(self.rows.len());
+        (live, lm)
     }
 
     /// The fences of the backbone and the lm_head, walked as ONE stream: the lm_head's
@@ -2547,56 +2647,119 @@ pub fn assemble(
     Ok(out)
 }
 
-/// THE CACHE-ONLY PLAY: whether each row runs in a forward whose caller reads only its cache
-/// writes (KV, recurrent state) — none of its outputs. Walked backwards from those writes: a row
-/// runs if it writes a cache, or writes a location a running row after it reads before anything
-/// overwrites it. A KV writer needs only what its write reads (`kv_w_reads`: a rope append's K and
-/// V), so the Q it rotates — and the projection, split and norm making it — run only if something
-/// else reads them. The op scratch and the codec staging are one location each; a row writing one
-/// is taken to read it too. A loop's body runs whole: its rows serve every iteration, whose cache
-/// writes the last iteration's dead tail does not tell apart.
-pub fn cache_live(rows: &[StepRow], sigs: &[HazardSig]) -> Vec<bool> {
+/// THE PLAYS SHORT OF THE WHOLE FORWARD: whether each row runs in a forward whose caller reads
+/// only its cache writes (KV, recurrent state, a drafter's context window), in one whose caller
+/// reads only its result, and in one that rebuilds a DFlash2 drafter's rings from its window
+/// ([`PlayLive`]). Each is [`live_from`] its play's roots. A rebuild's window comes from outside
+/// the forward (the prefix-cache state it restores, Splash `addContextRebuild`), so no row writing
+/// it runs there: the rings' writers run from the window's load alone.
+pub fn play_live(rows: &[StepRow], sigs: &[HazardSig]) -> Vec<PlayLive> {
+    // The window's store and its load are each one play's alone: a commit's layers read the rows
+    // its store took, exact, and a rebuild's the rows its load reads back.
+    let window_w = |s: &HazardSig| s.draft_window == Access::Write;
+    let window_r = |s: &HazardSig| s.draft_window == Access::Read;
+    let cache_root = |s: &HazardSig| s.kv_w.is_some() || s.state_w || window_w(s);
+    let cache_writes = live_from(rows, sigs, cache_root, window_r);
+    let result = live_from(rows, sigs, |s| s.result, window_r);
+    let rebuild = live_from(rows, sigs, |s| s.kv_w.is_some(), window_w);
+    (cache_writes.into_iter().zip(result).zip(rebuild))
+        .map(|((cache_writes, result), rebuild)| PlayLive {
+            cache_writes,
+            result,
+            rebuild,
+        })
+        .collect()
+}
+
+/// Whether each row runs in a play that reads what its `root` rows write. Walked backwards from
+/// them: a row runs if it is a root, or writes a location a running row after it reads before
+/// anything overwrites it. A KV writer that is no root but runs for its KV needs only what its
+/// write reads (`kv_w_reads`: a rope append's K and V), so the Q it rotates — and the projection,
+/// split and norm making it — run only if something else reads them. The op scratch and the codec
+/// staging are one location each; a row writing one is taken to read it too.
+///
+/// A loop runs as a unit: whole if any of its rows (a nested loop's included) is a root or writes
+/// a location a running row after the loop reads, else not at all. Its rows serve every iteration,
+/// whose writes the last iteration's dead tail does not tell apart.
+///
+/// A `cut` row never runs, and what it writes is the play's input: a location only cut rows
+/// write is read from outside the forward.
+pub fn live_from(
+    rows: &[StepRow],
+    sigs: &[HazardSig],
+    root: impl Fn(&HazardSig) -> bool,
+    cut: impl Fn(&HazardSig) -> bool,
+) -> Vec<bool> {
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     enum Loc {
         Slot(Slot),
         OpScratch,
         CodecStaging,
+        DraftWindow,
     }
-    let mut in_loop = vec![false; rows.len()];
+    let writes = |s: &HazardSig| -> Vec<Loc> {
+        (s.writes.iter().map(|&w| Loc::Slot(w)))
+            .chain((s.op_scratch == Access::Write).then_some(Loc::OpScratch))
+            .chain((s.codec_staging == Access::Write).then_some(Loc::CodecStaging))
+            .chain((s.draft_window == Access::Write).then_some(Loc::DraftWindow))
+            .collect()
+    };
+    // The marker of the outermost loop holding each row: markers precede their bodies, so an
+    // outer loop claims its rows before a loop nested in it.
+    let mut outermost: Vec<Option<usize>> = vec![None; rows.len()];
     for (at, row) in rows.iter().enumerate() {
         if let StepRow::Loop { body, .. } = row {
             let end = (at + 1 + body.0 as usize).min(rows.len());
-            in_loop[at + 1..end].iter_mut().for_each(|r| *r = true);
+            (outermost[at + 1..end].iter_mut())
+                .filter(|o| o.is_none())
+                .for_each(|o| *o = Some(at));
         }
     }
     let shared = |a: Access, loc| (a != Access::Untouched).then_some(loc);
     let mut needed: HashSet<Loc> = HashSet::new();
     let mut live = vec![false; rows.len()];
-    for i in (0..rows.len()).rev() {
+    // Runs row `i`: what it writes is no longer needed before it, what it reads is.
+    let run = |i: usize, whole: bool, needed: &mut HashSet<Loc>, live: &mut [bool]| {
         let s = &sigs[i];
-        if s.metadata {
-            continue;
-        }
-        let writes: Vec<Loc> = (s.writes.iter().map(|&w| Loc::Slot(w)))
-            .chain((s.op_scratch == Access::Write).then_some(Loc::OpScratch))
-            .chain((s.codec_staging == Access::Write).then_some(Loc::CodecStaging))
-            .collect();
-        let read = writes.iter().any(|w| needed.contains(w));
-        let writes_cache = s.kv_w.is_some() || s.state_w;
-        if !(in_loop[i] || read || writes_cache) {
-            continue;
-        }
         live[i] = true;
-        writes.iter().for_each(|w| {
+        writes(s).iter().for_each(|w| {
             needed.remove(w);
         });
-        let reads = match (&s.kv_w_reads, in_loop[i] || read) {
+        let reads = match (&s.kv_w_reads, whole) {
             (Some(kv), false) => kv.as_slice(),
             _ => s.reads.as_slice(),
         };
         needed.extend(reads.iter().map(|&r| Loc::Slot(r)));
         needed.extend(shared(s.op_scratch, Loc::OpScratch));
         needed.extend(shared(s.codec_staging, Loc::CodecStaging));
+        needed.extend(shared(s.draft_window, Loc::DraftWindow));
+    };
+    let mut i = rows.len();
+    while i > 0 {
+        i -= 1;
+        if let Some(marker) = outermost[i] {
+            // `i` is the loop's last row: the walk meets it first.
+            let body = marker + 1..=i;
+            let runs = body.clone().any(|r| {
+                let s = &sigs[r];
+                !s.metadata && !cut(s) && (root(s) || writes(s).iter().any(|w| needed.contains(w)))
+            });
+            if runs {
+                for r in body.rev().filter(|&r| !sigs[r].metadata && !cut(&sigs[r])) {
+                    run(r, true, &mut needed, &mut live);
+                }
+            }
+            i = marker;
+            continue;
+        }
+        let s = &sigs[i];
+        if s.metadata || cut(s) {
+            continue;
+        }
+        let read = writes(s).iter().any(|w| needed.contains(w));
+        if read || root(s) {
+            run(i, read, &mut needed, &mut live);
+        }
     }
     live
 }
@@ -2655,6 +2818,7 @@ struct Pending {
     kv_r: HashSet<LayerId>,
     op_scratch: Access,
     codec_staging: Access,
+    draft_window: Access,
 }
 
 impl Pending {
@@ -2667,7 +2831,8 @@ impl Pending {
         let raw = s.reads.iter().any(|x| self.w.contains(x))
             || s.kv_r.is_some_and(|l| self.kv_w.contains(&l))
             || (s.op_scratch == Access::Read && self.op_scratch == Access::Write)
-            || (s.codec_staging == Access::Read && self.codec_staging == Access::Write);
+            || (s.codec_staging == Access::Read && self.codec_staging == Access::Write)
+            || (s.draft_window == Access::Read && self.draft_window == Access::Write);
         if raw {
             return Some(Fence::Coherent);
         }
@@ -2677,6 +2842,7 @@ impl Pending {
         // the row may read what the pending write left there.
         if s.op_scratch == Access::Write && self.op_scratch == Access::Write
             || s.codec_staging == Access::Write && self.codec_staging == Access::Write
+            || s.draft_window == Access::Write && self.draft_window == Access::Write
         {
             return Some(Fence::Coherent);
         }
@@ -2687,7 +2853,8 @@ impl Pending {
             || s.kv_w
                 .is_some_and(|l| self.kv_w.contains(&l) || self.kv_r.contains(&l))
             || (s.op_scratch == Access::Write && self.op_scratch == Access::Read)
-            || (s.codec_staging == Access::Write && self.codec_staging == Access::Read);
+            || (s.codec_staging == Access::Write && self.codec_staging == Access::Read)
+            || (s.draft_window == Access::Write && self.draft_window == Access::Read);
         waw_war.then_some(Fence::Ordered)
     }
 
@@ -2698,6 +2865,7 @@ impl Pending {
         self.kv_r.extend(s.kv_r);
         self.op_scratch = self.op_scratch.max(s.op_scratch);
         self.codec_staging = self.codec_staging.max(s.codec_staging);
+        self.draft_window = self.draft_window.max(s.draft_window);
     }
 }
 
@@ -2814,10 +2982,40 @@ mod tests {
         );
     }
 
+    fn cache_writes(rows: &[StepRow], sigs: &[HazardSig]) -> Vec<bool> {
+        play_live(rows, sigs)
+            .iter()
+            .map(|p| p.cache_writes)
+            .collect()
+    }
+
+    fn result(rows: &[StepRow], sigs: &[HazardSig]) -> Vec<bool> {
+        play_live(rows, sigs).iter().map(|p| p.result).collect()
+    }
+
+    fn steps(n: usize) -> Vec<StepRow> {
+        vec![StepRow::Step(MetalStep::SpliceMmEmbeds(Slot(0)), None); n]
+    }
+
+    fn marker() -> HazardSig {
+        HazardSig {
+            metadata: true,
+            ..HazardSig::default()
+        }
+    }
+
+    fn looped(iters: u32, body: u32) -> StepRow {
+        StepRow::Loop {
+            iters: st::LoopIters(iters),
+            body: st::BodyLen(body),
+            stride: st::LayerStride(1),
+        }
+    }
+
     /// A forward reading only its cache writes runs what they need and no more: the rope append
     /// writing the KV needs K and V — their projections, the norm and the projection under those —
     /// but not the Q it rotates beside them, its split, nor the attention and MLP after it. A row
-    /// writing a recurrent state runs, and so do the rows its reads need; a loop's body runs whole.
+    /// writing a recurrent state runs, and so do the rows its reads need.
     #[test]
     fn a_cache_only_forward_runs_what_its_cache_writes_need() {
         let rope = |q, k, v| HazardSig {
@@ -2839,39 +3037,107 @@ mod tests {
             sig(&[8], &[9], None),
             sig(&[9], &[10], None),
         ];
-        let rows = vec![StepRow::Step(MetalStep::SpliceMmEmbeds(Slot(0)), None); sigs.len()];
-        let live = cache_live(&rows, &sigs);
         let want = [
             true, true, false, true, true, false, true, false, false, false,
         ];
-        assert_eq!(live, want);
+        assert_eq!(cache_writes(&steps(sigs.len()), &sigs), want);
 
-        // A recurrent state's writer runs, with what it reads; a loop's body runs whole.
+        // A recurrent state's writer runs, with what it reads. Row 0's and row 3's writes are read
+        // by nothing that runs.
         let state = HazardSig {
             state_w: true,
             ..sig(&[2], &[3], None)
         };
-        // Row 0's and row 3's writes are read by nothing that runs; row 5 is a loop's body.
         let sigs = [
             sig(&[0], &[9], None),
             sig(&[1], &[2], None),
             state,
             sig(&[7], &[8], None),
-            HazardSig {
-                metadata: true,
-                ..HazardSig::default()
-            },
-            sig(&[4], &[5], None),
-            sig(&[5], &[6], None),
         ];
-        let mut rows = vec![StepRow::Step(MetalStep::SpliceMmEmbeds(Slot(0)), None); sigs.len()];
-        rows[4] = StepRow::Loop {
-            iters: st::LoopIters(2),
-            body: st::BodyLen(1),
-            stride: st::LayerStride(1),
+        assert_eq!(
+            cache_writes(&steps(sigs.len()), &sigs),
+            [false, true, true, false]
+        );
+    }
+
+    /// A loop runs as a unit: whole — every row of it, the Q a rope append in it rotates included
+    /// — when one of its rows writes a cache or a location a running row after it reads; not at all
+    /// when none does, though a row before it writes what it reads.
+    #[test]
+    fn a_loop_runs_whole_or_not_at_all() {
+        let kv = HazardSig {
+            kv_w: Some(LayerId(0)),
+            kv_w_reads: Some(vec![Slot(3)]),
+            ..sig(&[2, 3], &[], None)
         };
-        let live = cache_live(&rows, &sigs);
-        assert_eq!(live, [false, true, true, false, false, true, false]);
+        // 0 -> 1 -> 2; a loop writing KV from 2 (2 -> 3, then its writer); 4 -> 5; a loop over 5
+        // (5 -> 6 -> 5) no running row reads; 1 -> 7, its last read nowhere.
+        let sigs = [
+            sig(&[0], &[1], None),
+            sig(&[1], &[2], None),
+            marker(),
+            sig(&[2], &[3], None),
+            kv,
+            sig(&[4], &[5], None),
+            marker(),
+            sig(&[5], &[6], None),
+            sig(&[6], &[5], None),
+            sig(&[1], &[7], None),
+        ];
+        let mut rows = steps(sigs.len());
+        rows[2] = looped(2, 2);
+        rows[6] = looped(3, 2);
+        assert_eq!(
+            cache_writes(&rows, &sigs),
+            [
+                true, true, false, true, true, false, false, false, false, false
+            ]
+        );
+    }
+
+    /// A forward reading only its result runs what the result needs — through a loop it reads —
+    /// and no cache writer it does not read: Splash's drafter's block draft leaves its context
+    /// loop's ring commit and the projection only that loop reads to the play of its cache writes,
+    /// which runs them and nothing of the block.
+    #[test]
+    fn a_result_only_forward_runs_what_its_result_needs() {
+        let commit = HazardSig {
+            kv_w: Some(LayerId(0)),
+            ..sig(&[2], &[], None)
+        };
+        let attention = HazardSig {
+            kv_r: Some(LayerId(0)),
+            ..sig(&[4], &[4], None)
+        };
+        let select = HazardSig {
+            result: true,
+            op_scratch: Access::Write,
+            ..sig(&[5], &[], None)
+        };
+        // fc and norm over the target's rows (0 -> 1); the context loop (1 -> 2, its commit); the
+        // embedding (3 -> 4); the block loop (4 -> 4, reading the ring); the head (4 -> 5); select.
+        let sigs = [
+            sig(&[0], &[1], None),
+            marker(),
+            sig(&[1], &[2], None),
+            commit,
+            sig(&[3], &[4], None),
+            marker(),
+            attention,
+            sig(&[4], &[5], None),
+            select,
+        ];
+        let mut rows = steps(sigs.len());
+        rows[1] = looped(6, 2);
+        rows[5] = looped(6, 1);
+        assert_eq!(
+            result(&rows, &sigs),
+            [false, false, false, false, true, false, true, true, true]
+        );
+        assert_eq!(
+            cache_writes(&rows, &sigs),
+            [true, false, true, true, false, false, false, false, false]
+        );
     }
 
     /// The class is the point: a WAW fence orders (Ordered), a RAW fence must
