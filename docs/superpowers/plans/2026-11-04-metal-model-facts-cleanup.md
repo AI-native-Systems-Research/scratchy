@@ -323,6 +323,27 @@ every fact-reading fn is instantiated for every model. Phase 3's runtime change 
 instead of the raw consts, with `ModelLacks` where a group is absent. The table row "a runtime path
 needs a group" ships nothing in this PR, and this section is the record of why.
 
+**Corrections found in phase 3** (audited). This inventory is how the plan meets its goal, so it
+does not narrow the goal.
+- **The first row is wrong.** `constants_for<W>` sits inside `pipelines.rs`'s `#[cfg(test)] mod
+  tests`; only tests call it, and production `pipeline_for_command<W>` reads no fact. It reads
+  `W::FACTS` typed, and its attention and MLP arms `expect()` the group: a test helper gets no
+  production error variant.
+- **The inventory missed the emitted metal runtime.** `codegen.rs` emits `#[cfg(feature = "metal")]`
+  code into scratchy-models that read raw consts. They are the metal runtime, and phase 3 moves
+  them to `FACTS`:
+
+| emitted site (main `codegen.rs`) | read | phase 3 |
+|---|---|---|
+| `:4776` the metal loader's norm-gain pin | `SCALE_DTYPE` | `FACTS.scale_dtype()` |
+| `:15951` `metal_rope_rows` | `METAL_DTYPE` | `FACTS.metal_dtype()` |
+| `:16035-16041` `METAL_RUNGS.tq` | `GLOBAL_HEAD_DIM`, `NUM_Q_HEADS`, `NUM_GLOBAL_KV_HEADS` | `TqGroup::of(FACTS)`: the attention's global class, `None` without attention. `MetalRungs.tq` and `PickedRung.tq_heads` become `Option`s and flow into `TapeVariant.tq_heads`, already an `Option` |
+| `:16305` the TQ provision's KV layers | `KV_CACHE_LAYERS` | `FACTS.kv_layers()` |
+| `:16352-16353` `TqPool` | `GLOBAL_BLOCK_SIZE`, `NUM_GLOBAL_KV_HEADS` | the attention's global class, under the TurboQuant codebook, which `ModelFacts::new`'s law gives an attention |
+| `:16380` `span_ids` | `GLOBAL_BLOCK_SIZE` | the global class's page; no labels without attention |
+| `:16917` hidden-state rows | `HIDDEN_SIZE` | `FACTS.hidden()` |
+| `:16937` logits dtype | `METAL_DTYPE` | `FACTS.metal_dtype()` |
+
 ### What phases 4 and 5 ship, from this inventory
 
 - **Phase 4 (K):**

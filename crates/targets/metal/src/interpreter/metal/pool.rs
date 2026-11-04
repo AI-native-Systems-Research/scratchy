@@ -498,13 +498,32 @@ pub struct TqGroup {
     pub kv_heads: NumKvHeads,
 }
 
+impl TqGroup {
+    /// A model's decode group: its attention's global class, the layers a TurboQuant KV cache
+    /// compresses. `None` for a model without attention.
+    pub const fn of(facts: scratchy_ir::model_facts::ModelFacts) -> Option<Self> {
+        match facts.attention() {
+            Some(attention) => {
+                let global = attention.global();
+                Some(Self {
+                    head_dim: HeadDim(global.head_dim().get()),
+                    q_heads: NumQHeads(global.q_heads().get()),
+                    kv_heads: NumKvHeads(global.kv_heads().get()),
+                })
+            }
+            None => None,
+        }
+    }
+}
+
 /// A model's baked tape rungs: what a caller picks the rung its pool runs on from
 /// ([`pick_rung`]) — before the pool exists (the KV pool's block-table width, the memory budget)
 /// as the pool itself does.
 #[derive(Clone, Copy)]
 pub struct MetalRungs {
     pub buckets: &'static [MetalBucketSpec],
-    pub tq: TqGroup,
+    /// The decode group ([`TqGroup::of`]); `None` for a model without attention.
+    pub tq: Option<TqGroup>,
     /// Its arena slots by size, as a guest and as a host ([`ArenaRanks`]).
     pub ranks: ArenaRanks,
 }
@@ -513,8 +532,9 @@ pub struct MetalRungs {
 /// the tape each kept bucket runs.
 pub struct PickedRung<'a> {
     pub cap: MaxBlocksPerSeq,
-    /// The query heads one TurboQuant decode threadgroup serves on this device.
-    pub tq_heads: TqDecodeHeads,
+    /// The query heads one TurboQuant decode threadgroup serves on this device; `None` for a
+    /// model without attention.
+    pub tq_heads: Option<TqDecodeHeads>,
     pub tapes: Vec<(&'a MetalBucketSpec, &'a ClassedTape)>,
     /// The model's arena ranks, which it shares an arena with another model's by.
     pub ranks: ArenaRanks,
@@ -525,7 +545,7 @@ impl PickedRung<'_> {
     pub fn variant(&self) -> TapeVariant {
         TapeVariant {
             cap: self.cap,
-            tq_heads: Some(self.tq_heads),
+            tq_heads: self.tq_heads,
         }
     }
 }
@@ -675,11 +695,14 @@ pub fn pick_rung(
         buckets.push(smallest);
     }
     let need = MaxBlocksPerSeq(u32::try_from(block_cap).unwrap_or(u32::MAX));
-    let tq_heads = TqDecodeHeads::for_group(tq.head_dim, tq.q_heads, tq.kv_heads, gpu_cores);
+    let tq_heads =
+        tq.map(|g| TqDecodeHeads::for_group(g.head_dim, g.q_heads, g.kv_heads, gpu_cores));
+    // A tape with TurboQuant decode attention serves only the device's group, and a model without
+    // attention has none for it to serve.
     let serves = |t: &&ClassedTape| {
         t.gen_class == gen_class
             && t.addressing == addressing
-            && t.tq_heads.is_none_or(|h| h == tq_heads)
+            && t.tq_heads.is_none_or(|h| tq_heads == Some(h))
     };
     let no_rung = |s: &MetalBucketSpec| PoolBuildError::NoRung {
         bucket_m: s.bucket_m,
@@ -698,7 +721,7 @@ pub fn pick_rung(
     tracing::info!(
         target: "scratchy-target-metal",
         gpu_cores = gpu_cores.get(),
-        tq_decode_heads = tq_heads.get(),
+        tq_decode_heads = tq_heads.map(TqDecodeHeads::get),
         kv_cap_rung = cap.get(),
         buckets = tapes.len(),
         "baked tape rung"
@@ -2076,14 +2099,22 @@ fn begin_step<W: CanonicalParams>(
             pipeline,
         });
     }
-    worker.worker.tq_dequant_max_blocks.store(
-        live_block_width(inputs, W::BLOCK_SIZE.min(W::GLOBAL_BLOCK_SIZE)),
-        Relaxed,
-    );
-    worker.worker.unrotated_blocks.store(
-        step_has_unrotated_blocks(inputs, W::GLOBAL_BLOCK_SIZE),
-        Relaxed,
-    );
+    // The paged-attention steps' widths, over the classes' pages. Only an attention's steps read
+    // them; a model without one has neither pages nor those steps.
+    if let Some(attention) = W::FACTS.attention() {
+        let (base, global) = (
+            attention.base().page().get(),
+            attention.global().page().get(),
+        );
+        worker
+            .worker
+            .tq_dequant_max_blocks
+            .store(live_block_width(inputs, base.min(global)), Relaxed);
+        worker
+            .worker
+            .unrotated_blocks
+            .store(step_has_unrotated_blocks(inputs, global), Relaxed);
+    }
     let plain = |c: &u32| crate::gdn_state::GdnStep::decode(*c).is_plain();
     worker.worker.gdn_plain.store(
         inputs
@@ -3844,11 +3875,7 @@ mod tests {
     fn test_rungs(specs: &[MetalBucketSpec], ranks: ArenaRanks) -> &'static MetalRungs {
         Box::leak(Box::new(MetalRungs {
             buckets: Box::leak(specs.to_vec().into_boxed_slice()),
-            tq: TqGroup {
-                head_dim: HeadDim(TestWeights::GLOBAL_HEAD_DIM),
-                q_heads: NumQHeads(TestWeights::NUM_Q_HEADS),
-                kv_heads: NumKvHeads(TestWeights::NUM_GLOBAL_KV_HEADS),
-            },
+            tq: TqGroup::of(TestWeights::FACTS),
             ranks,
         }))
     }

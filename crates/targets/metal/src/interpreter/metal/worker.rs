@@ -1604,7 +1604,7 @@ fn bake_bucket<W: CanonicalParams>(
             // custom kernels on the same per-step dispatch plumbing as every other compute
             // kernel — no MPS (it rejects BFloat16), no classic command buffer.
             let (pipeline, shape) = pipelines
-                .pipeline_for_gemm(W::METAL_DTYPE, dims)
+                .pipeline_for_gemm(W::FACTS.metal_dtype(), dims)
                 .map_err(WorkerError::PipelineLookup)?;
             // Binding contract: buffer(0) = output, buffer(1) = input, buffer(2) = weight.
             let bindings_for_cmd: Vec<(Buffer, u64, u64)> = vec![
@@ -2175,8 +2175,7 @@ fn same_pipeline(a: &ComputePipelineState, b: &ComputePipelineState) -> bool {
 mod tests {
     use super::*;
     use crate::interpreter::metal::lowered::{
-        Binding, DispatchShape, LoweredCommand, MetalDtype, RuntimeBindingKind, SourceRef,
-        WeightTensor,
+        Binding, DispatchShape, LoweredCommand, RuntimeBindingKind, SourceRef, WeightTensor,
     };
     use crate::specialized_pipeline_cache::{ConstantValue, SpecializedPipelineCache};
     use scratchy_ir::CanonicalParams;
@@ -2479,7 +2478,6 @@ mod tests {
         linear_layer: LinearLayer,
     }
     impl CanonicalParams for TestWeights {
-        // Pinned to f16, the MPS GEMM path the smoke tests below assert on.
         const FACTS: scratchy_ir::model_facts::ModelFacts = crate::tape::facts::llama_like(
             32,
             4,
@@ -2487,6 +2485,10 @@ mod tests {
             5632,
             2048,
             0.125,
+            // Pin the smoke tests to the f16 / MPS GEMM path. The
+            // `worker_routes_gemm_step` / `worker_interleaves_gemm_with_icb`
+            // tests below assert specifically on the MPS GEMM branch. The
+            // bf16 dispatch GEMM routing has its own coverage in the e2e tests.
             scratchy_ir::model_facts::MetalDtype::F16,
         );
         const KV_LORA_RANK: usize = 0;
@@ -2495,11 +2497,6 @@ mod tests {
         const V_HEAD_DIM: usize = 0;
         const QK_HEAD_DIM: usize = 0;
         const MLA_ATTN_SCALE: f32 = 0.0;
-        // Pin the smoke tests to the f16 / MPS GEMM path. The
-        // `worker_routes_gemm_step` / `worker_interleaves_gemm_with_icb`
-        // tests below assert specifically on the MPS GEMM branch. The
-        // bf16 dispatch GEMM routing has its own coverage in the e2e tests.
-        const METAL_DTYPE: MetalDtype = MetalDtype::F16;
     }
 
     // `WeightAccessors` is a supertrait of `CanonicalParams` (every method defaults). The
@@ -2748,9 +2745,13 @@ mod tests {
 
         // Two buckets: M=1 (decode) and M=8 (small prefill).
         let tapes = vec![build_synthetic_tape(1), build_synthetic_tape(8)];
-        let pipelines =
-            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
-                .expect("pipelines");
+        let pipelines = crate::aot::tape_pipelines(
+            &device,
+            &tapes,
+            TestWeights::FACTS.metal_dtype(),
+            TEST_VARIANT,
+        )
+        .expect("pipelines");
         let arena_layout: ArenaLayout = vec![4 * 1024, 4 * 1024];
 
         let worker = MetalWorker::<TestWeights>::new(
@@ -2906,9 +2907,13 @@ mod tests {
         let (weights, allocator) = build_test_weights();
         let runtime = empty_runtime(&device, 1);
         let tapes = vec![build_synthetic_tape(1)];
-        let pipelines =
-            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
-                .expect("pipelines");
+        let pipelines = crate::aot::tape_pipelines(
+            &device,
+            &tapes,
+            TestWeights::FACTS.metal_dtype(),
+            TEST_VARIANT,
+        )
+        .expect("pipelines");
         let build = |layout: &ArenaLayout,
                      tapes: &[LoweredMetalTape],
                      share: &ArenaShare,
@@ -3008,9 +3013,13 @@ mod tests {
         let runtime = empty_runtime(&device, 1);
 
         let tapes = vec![build_synthetic_tape(1)]; // num_arena_slots = 2
-        let pipelines =
-            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
-                .expect("pipelines");
+        let pipelines = crate::aot::tape_pipelines(
+            &device,
+            &tapes,
+            TestWeights::FACTS.metal_dtype(),
+            TEST_VARIANT,
+        )
+        .expect("pipelines");
 
         // Layout has only 1 slot — should error.
         let bad_layout: ArenaLayout = vec![4 * 1024];
@@ -3118,9 +3127,13 @@ mod tests {
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
         };
-        let pipelines =
-            crate::aot::tape_pipelines(&device, &[tape], TestWeights::METAL_DTYPE, TEST_VARIANT)
-                .expect("pipelines");
+        let pipelines = crate::aot::tape_pipelines(
+            &device,
+            &[tape],
+            TestWeights::FACTS.metal_dtype(),
+            TEST_VARIANT,
+        )
+        .expect("pipelines");
 
         let worker = MetalWorker::<TestWeights>::new(
             device,
@@ -3211,9 +3224,13 @@ mod tests {
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
         };
-        let pipelines =
-            crate::aot::tape_pipelines(&device, &[tape], TestWeights::METAL_DTYPE, TEST_VARIANT)
-                .expect("pipelines");
+        let pipelines = crate::aot::tape_pipelines(
+            &device,
+            &[tape],
+            TestWeights::FACTS.metal_dtype(),
+            TEST_VARIANT,
+        )
+        .expect("pipelines");
 
         let worker = MetalWorker::<TestWeights>::new(
             device,
@@ -3338,9 +3355,13 @@ mod tests {
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
         };
-        let pipelines =
-            crate::aot::tape_pipelines(&device, &[tape], TestWeights::METAL_DTYPE, TEST_VARIANT)
-                .expect("pipelines");
+        let pipelines = crate::aot::tape_pipelines(
+            &device,
+            &[tape],
+            TestWeights::FACTS.metal_dtype(),
+            TEST_VARIANT,
+        )
+        .expect("pipelines");
 
         let worker = MetalWorker::<TestWeights>::new(
             device,

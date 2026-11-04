@@ -10060,7 +10060,6 @@ mod tests {
         const V_HEAD_DIM: usize = 0;
         const QK_HEAD_DIM: usize = 0;
         const MLA_ATTN_SCALE: f32 = 0.0;
-        const METAL_DTYPE: MetalDtype = MetalDtype::Bf16;
     }
     // `WeightAccessors` is a supertrait of `CanonicalParams`; every method
     // has a default `unreachable!` body, and the lowering-shape tests never

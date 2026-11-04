@@ -874,7 +874,8 @@ fn target_block_bytes(
         // (group 0) layers at the global geometry, `full_block_size` tokens each.
         let tq = scratchy_target_metal::interpreter::metal::MetalRungs::of(model.metal_rungs())
             .expect("a metal model's baked rungs are MetalRungs")
-            .tq;
+            .tq
+            .expect("ModelFacts::new: a TurboQuant KV codec is an attention's");
         let num_global = layout.layer_to_group.iter().filter(|&&g| g == 0).count();
         return shared_pages
             + layout.full_block_size()

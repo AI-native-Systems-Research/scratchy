@@ -4773,7 +4773,7 @@ fn emit_weights_struct(
                 // standard HF bf16 export feeding an `_s_f16_` Llama arm) — the
                 // mlx zero-copy gain path is preserved on the matching case.
                 gw.set_rmsnorm_scale_dtype(
-                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::SCALE_DTYPE,
+                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.scale_dtype(),
                 );
                 #packed_splits_prelude
                 #(#lets)*
@@ -8289,14 +8289,16 @@ fn fuf_reads_target_hidden(fuf: &Fuf) -> bool {
     })
 }
 
-fn emit_canonical_params_impl(
+/// A canonical's facts at `tp_world_size`, from its config, and the six MLA consts no fact covers
+/// yet, as its `CanonicalParams` impl states them.
+fn fill_canonical_params(
     model: &ModelParams,
     tp_world_size: u8,
     uses_rotary: bool,
     kv_layers: &KvCacheLayers,
     // Whether the body reads its target's hidden rows (a head): the facts state its target then.
     reads_target_hidden: bool,
-) -> (TokenStream, scratchy_ir::model_facts::ModelFacts) {
+) -> (scratchy_ir::model_facts::ModelFacts, TokenStream) {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
     let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
@@ -8751,11 +8753,26 @@ fn emit_canonical_params_impl(
             target,
         })
     };
-    // One value, two consumers: the impl's `FACTS` (serialized) and the caller's bake.
-    let facts_tokens = model_facts_tokens(facts);
-
     (
+        facts,
         quote! {
+            const KV_LORA_RANK: usize = #kv_lora_rank_lit;
+            const QK_NOPE_HEAD_DIM: usize = #qk_nope_head_dim_lit;
+            const QK_ROPE_HEAD_DIM: usize = #qk_rope_head_dim_lit;
+            const V_HEAD_DIM: usize = #v_head_dim_lit;
+            const QK_HEAD_DIM: usize = #qk_head_dim_lit;
+            const MLA_ATTN_SCALE: f32 = #mla_attn_scale_lit;
+        },
+    )
+}
+
+/// A canonical's `CanonicalParams` impl: its `facts` serialized as `FACTS`, and `mla_consts`.
+fn emit_canonical_params_impl(
+    facts: scratchy_ir::model_facts::ModelFacts,
+    mla_consts: &TokenStream,
+) -> TokenStream {
+    let facts_tokens = model_facts_tokens(facts);
+    quote! {
         // `CanonicalParams` is backend-agnostic — the trait, its
         // associated `const`s, and every callsite (`<W as
         // CanonicalParams>::HEAD_DIM`) live in `scratchy-forward-compiler` with
@@ -8766,16 +8783,9 @@ fn emit_canonical_params_impl(
         impl ::scratchy_forward_compiler::CanonicalParams for Weights {
             const FACTS: ::scratchy_forward_compiler::model_facts::ModelFacts = #facts_tokens;
             // The MLA dims: no fact covers them yet (no metal or spyre path reads them).
-            const KV_LORA_RANK: usize = #kv_lora_rank_lit;
-            const QK_NOPE_HEAD_DIM: usize = #qk_nope_head_dim_lit;
-            const QK_ROPE_HEAD_DIM: usize = #qk_rope_head_dim_lit;
-            const V_HEAD_DIM: usize = #v_head_dim_lit;
-            const QK_HEAD_DIM: usize = #qk_head_dim_lit;
-            const MLA_ATTN_SCALE: f32 = #mla_attn_scale_lit;
+            #mla_consts
         }
-        },
-        facts,
-    )
+    }
 }
 
 /// The one-slot-per-sequence recurrent-state geometry of a hybrid arch's
@@ -14922,15 +14932,15 @@ pub fn emit_model(
     // Per-canonical CanonicalParams impl + Instruction type alias.
     // The alias keeps every static-slice row short instead of
     // repeating `::scratchy_forward_compiler::Instruction::<Weights>::Variant(…)`.
-    let (canonical_params_impl, model_facts) = emit_canonical_params_impl(
+    // One value, two consumers: the impl's `FACTS` (serialized) and the metal bake.
+    let (model_facts, mla_consts) = fill_canonical_params(
         model,
         tp_world_size,
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
         fuf_reads_target_hidden(fuf),
     );
-    #[cfg(feature = "metal")]
-    let resolved_metal_facts = Some(model_facts);
+    let canonical_params_impl = emit_canonical_params_impl(model_facts, &mla_consts);
     // Per-canonical: alias the generic `Instruction<Weights>` for
     // the slice element type AND glob-import the variant
     // constructors so each static-slice row reads `Embed(...)` /
@@ -15173,7 +15183,7 @@ pub fn emit_model(
             },
             moe_expert_bits: quant.map(|_| &widths as &mc3::MoeExpertBits<'_>),
         };
-        let mc = resolved_metal_facts.as_ref().expect("metal facts filled");
+        let mc = &model_facts;
         let buckets: Vec<u64> = (bucket_points.iter().zip(&bucket_canonical))
             .filter(|&(_, c)| c == canonical)
             .map(|(wp, _)| wp.num_tokens)
@@ -15419,9 +15429,7 @@ pub fn emit_model(
     #[cfg(feature = "metal")]
     let metal_cap_ladder = {
         use scratchy_target_metal::tape::ids::{BlockSize, MaxPositions};
-        let mc = resolved_metal_facts
-            .as_ref()
-            .expect("emit_canonical_params_impl fills the metal facts under -Fmetal");
+        let mc = &model_facts;
         let max_pos = KvCacheLayers::of(fuf).any().then(|| {
             let max_pos = model.bounds.get("max_position_embeddings").copied();
             max_pos
@@ -15623,9 +15631,7 @@ pub fn emit_model(
         // every fact baked; the pool picks one. See static_tape.rs.
         #[cfg(feature = "metal")]
         let tapes_static_toks = {
-            let mc = resolved_metal_facts
-                .as_ref()
-                .expect("emit_canonical_params_impl fills the metal facts under -Fmetal");
+            let mc = &model_facts;
             // A canonical metal has no kernel for (`[m2-eq] … REFUSED`: it has no steps) bakes NO
             // variants, so `MetalWorkerPool::for_buckets` refuses at load (`NoRung`), naming
             // the bucket. Baking its empty step tape instead would build VALID empty-command tapes:
@@ -15948,7 +15954,7 @@ pub fn emit_model(
                             #rot_dim_lit2 as usize,
                             #rope_theta_lit,
                             [#t_lit, #h_lit, #w_lit],
-                            <Weights as ::scratchy_forward_compiler::CanonicalParams>::METAL_DTYPE,
+                            <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.metal_dtype(),
                         ),
                     )
                 }
@@ -15995,7 +16001,7 @@ pub fn emit_model(
     }));
     #[cfg(feature = "metal")]
     {
-        let mc = resolved_metal_facts.as_ref().expect("metal facts filled");
+        let mc = &model_facts;
         metal_arena_bytes_statics.push(metal_tq_codebook_tokens(mc));
         // A multi-token-prediction head (its body reads the target's hidden rows) chains its
         // passes on the device.
@@ -16030,17 +16036,9 @@ pub fn emit_model(
         pub static METAL_RUNGS: ::scratchy_target_metal::interpreter::metal::MetalRungs =
             ::scratchy_target_metal::interpreter::metal::MetalRungs {
                 buckets: METAL_BUCKETS,
-                tq: ::scratchy_target_metal::interpreter::metal::TqGroup {
-                    head_dim: ::scratchy_target_metal::tape::ids::HeadDim(
-                        <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_HEAD_DIM,
-                    ),
-                    q_heads: ::scratchy_target_metal::tape::ids::NumQHeads(
-                        <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_Q_HEADS,
-                    ),
-                    kv_heads: ::scratchy_target_metal::tape::ids::NumKvHeads(
-                        <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_GLOBAL_KV_HEADS,
-                    ),
-                },
+                tq: ::scratchy_target_metal::interpreter::metal::TqGroup::of(
+                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS,
+                ),
                 // Checked against the buckets as this static compiles: every slot of every bucket
                 // ranked once, and no bucket's final hidden states among the hosting ranks.
                 ranks: ::scratchy_target_metal::interpreter::metal::ArenaRanks::new(
@@ -16299,10 +16297,16 @@ pub fn emit_model(
                 // `is_global[L]` = (group_of(L) == 0): group 0 is always the
                 // full-context group (see `compute_hybrid_kv_layout`); uniform →
                 // all-zero map → all-true. A recurrent hybrid's layers that hold
-                // no KV (`KV_CACHE_LAYERS`) get no store.
+                // no KV (`FACTS.kv_layers()`) get no store.
                 let __tq_nb = ctx.kv_cache.num_blocks;
-                let __tq_kv_layers =
-                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::KV_CACHE_LAYERS;
+                let __tq_kv_layers = <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS
+                    .kv_layers()
+                    .map(::scratchy_forward_compiler::model_facts::KvLayers::get);
+                // The attention's global class: the full layers' pages and kv heads. `None` for a
+                // model without attention, which has neither.
+                let __global = <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS
+                    .attention()
+                    .map(|a| a.global());
                 let __tq_is_global: ::std::vec::Vec<bool> = ctx
                     .kv_cache
                     .layer_to_group_u32()
@@ -16344,13 +16348,15 @@ pub fn emit_model(
                                      its target's, which shares it",
                                 );
                             }
+                            let global = __global
+                                .expect("ModelFacts::new: a TurboQuant KV codec is an attention's");
                             ::scratchy_target_metal::turboquant::build_tq_provision(
                                 &__tq_allocator,
                                 ::scratchy_target_metal::turboquant::TqPool {
                                     is_global: &__tq_is_global,
                                     num_blocks: __tq_nb,
-                                    block_size: <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_BLOCK_SIZE as usize,
-                                    num_kv_heads: <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_GLOBAL_KV_HEADS as usize,
+                                    block_size: global.page().get() as usize,
+                                    num_kv_heads: global.kv_heads().get() as usize,
                                     blocks_per_chunk: ::scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize,
                                 },
                                 codebook,
@@ -16376,10 +16382,7 @@ pub fn emit_model(
                             // `GLOBAL_BLOCK_SIZE` tokens. All-zero unless the
                             // request carries Relocatable spans.
                             span_ids: alloc(
-                                __bt_stride
-                                    * <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_BLOCK_SIZE
-                                        as u64
-                                    * 4,
+                                __global.map_or(0, |g| __bt_stride * g.page().get() as u64 * 4),
                             ),
                             block_tables: (0..num_kv_groups)
                                 .map(|_| alloc(__bt_rows * __bt_stride * 4))
@@ -16914,7 +16917,7 @@ pub fn emit_model(
                         // before the worker goes back to the pool and its arena is reused.
                         if let Some(h) = ctx.hidden_out {
                             let row_bytes =
-                                <Weights as ::scratchy_forward_compiler::CanonicalParams>::HIDDEN_SIZE * 2;
+                                <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.hidden().get() * 2;
                             let hidden = worker.arena[spec.backbone_slot as usize].contents();
                             let mut out = h.out.borrow_mut();
                             out.clear();
@@ -16934,7 +16937,7 @@ pub fn emit_model(
                         let vocab = METAL_VOCAB_SIZE as usize;
                         let shape = [rows, vocab];
                         let bytes = rows * vocab * 2; // bf16/f16 — both 2 bytes
-                        let dtype = match <Weights as ::scratchy_forward_compiler::CanonicalParams>::METAL_DTYPE {
+                        let dtype = match <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.metal_dtype() {
                             ::scratchy_target_metal::interpreter::metal::MetalDtype::F16 =>
                                 crate::__gpu::dtype::DType::F16,
                             ::scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 =>
@@ -17519,9 +17522,8 @@ mod tests {
             "SCALE_DTYPE",
         ];
         let m = shard_test_model(32, 8, 128, 11008);
-        let ts = emit_canonical_params_impl(&m, 1, false, &every_layer(&m), false)
-            .0
-            .to_string();
+        let (facts, mla) = fill_canonical_params(&m, 1, false, &every_layer(&m), false);
+        let ts = emit_canonical_params_impl(facts, &mla).to_string();
         assert!(ts.contains("const FACTS"), "the impl states FACTS: {ts}");
         for name in DERIVED {
             assert!(
@@ -17536,7 +17538,7 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = emit_canonical_params_impl(&m, 1, false, &every_layer(&m), false).1;
+        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), false).0;
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
             raw::num_q_heads(facts) == 32,
@@ -17568,7 +17570,7 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = emit_canonical_params_impl(&m, 2, false, &every_layer(&m), false).1;
+        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), false).0;
         assert!(
             raw::num_q_heads(facts) == 16,
             "tp=2 must shard NUM_Q_HEADS to 16; got {}",
@@ -17614,7 +17616,7 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let facts = emit_canonical_params_impl(&m, 8, false, &every_layer(&m), false).1;
+        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), false).0;
         // 32 / 8 = 4
         assert!(
             raw::num_q_heads(facts) == 4,
