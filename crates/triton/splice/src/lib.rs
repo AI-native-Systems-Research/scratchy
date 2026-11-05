@@ -5500,7 +5500,7 @@ mod walk_on_the_card {
                         e.op_name
                     )
                 });
-                let page_bytes = u64::from(PAGE_SLOTS) * u64::from(hd as u32) * 2;
+                let page_bytes = u64::from(SCHEDULER_BLOCK_TOKENS) * u64::from(hd as u32) * 2;
                 assert!(
                     footprint >= page_bytes,
                     "mq={mq} hd={hd}: {}: the landing {dst} reserves {footprint} B, less than the \
