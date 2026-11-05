@@ -142,7 +142,7 @@ fn the_landing_frame_is_the_reshape_law_over_the_domain_grid() {
                             // the stored per-entry rows are the division the law guarantees exact
                             assert_eq!(
                                 per_entry.get(),
-                                (t_rows / entries) as u32,
+                                t_rows / entries,
                                 "{to:?} sticks {sticks} entries {entries}"
                             );
                             assert_eq!(gw.elems(), w as u32);

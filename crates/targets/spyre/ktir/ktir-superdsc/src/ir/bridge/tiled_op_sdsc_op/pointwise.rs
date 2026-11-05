@@ -2135,7 +2135,7 @@ mod index_select_tests {
     use super::*;
     use crate::place::{PlaceId, act_name};
     use crate::sdsc_abstract::StickLayout;
-    use crate::superdsc_opspec::{EntryBase, GatherIndex, PageExtent};
+    use crate::superdsc_opspec::EntryBase;
 
     /// ⭐ THE REFERENCE's PROMPT-TRIP PAGE GATHER (granite-3.1-8b's prefill, `sdsc_4` / `sdsc_5`): the
     /// whole `[8, 128, 128]` page in one op on one core, its one entry the page — read row-major as
