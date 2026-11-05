@@ -2150,7 +2150,8 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
                 scratchy_subtile::lower::OpDesc {
                     op: scratchy_subtile::subtile_ir::SubOp::rope_append(
                         attention,
-                        scratchy_ir::model_facts::HeadDim::new(hd),
+                        // A uniform fixture: the base class states the same head dim.
+                        scratchy_subtile::subtile_ir::RopeClass::Base,
                         0,
                         scratchy_subtile::subtile_ir::AttnMask::Causal,
                         scratchy_subtile::subtile_ir::RopeFormTag::NeoX,

@@ -2694,7 +2694,6 @@ pub fn play_skeleton(tape: &SubtileTape) -> Vec<PlayStep> {
 pub(crate) mod tests {
     use crate::fixtures::fixture_attention;
     use super::*;
-    use scratchy_ir::model_facts::HeadDim;
     use crate::subtile_ir::{
         EwKind, KvCacheLayout, KvCacheProducer, NeoX, Range, Region, SoftmaxStateId, SubOp,
         SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape,
@@ -3547,14 +3546,24 @@ pub(crate) mod tests {
     // ── Re-roll by class ──────────────────────────────────────────
     //
     // A hybrid-attention-shaped fixture: 2 cells of [S, S, G] (6 layers), each layer
-    // `r_{k+1} = mul(rope_append(r_k, layer=k, hd=class), W_k)` — the RopeAppend names the
-    // layer (its `layer` field is what `layer_slices` reads) and its head dim is the CLASS
-    // (256 for S, 512 for G, exactly gemma-4's two attention geometries). Every layer also
+    // `r_{k+1} = mul(rope_append(r_k, layer=k, class), W_k)` — the RopeAppend names the
+    // layer (its `layer` field is what `layer_slices` reads) and its rope class selects
+    // the CLASS's head dim off the hybrid facts (256 for S, 512 for G, exactly gemma-4's
+    // two attention geometries). Every layer also
     // reads its own external weight W_k, and a trailing suffix consumes r_6.
     fn hybrid_class_chain() -> SubtileIR<NeoX> {
         use crate::subtile_ir::KvCacheLayout;
-        // Pattern S S G | S S G — layer → class head dim.
-        let hd_of = |layer: u32| if layer % 3 == 2 { 512 } else { 256 };
+        // Pattern S S G | S S G — layer → class head dim (256 for S, 512 for G, stated
+        // by the hybrid facts' two classes). The hybrid facts the classes read off,
+        // and the rope class each layer binds:
+        let attention = crate::fixtures::hybrid_attention(256, 512);
+        let rope_of = |layer: u32| {
+            if layer % 3 == 2 {
+                crate::subtile_ir::RopeClass::Global
+            } else {
+                crate::subtile_ir::RopeClass::Base
+            }
+        };
         // sources, contiguous at the front (num_sources covers all of them):
         // 0 = x; 1..7 = W_0..W_5; 7 = cos; 8 = sin; 9..15 = pk_0..pk_5; 15..21 = pv_0..pv_5.
         // (The rope's operand list is [k, cos, sin, v, prefix_k, prefix_v] — the cache
@@ -3590,8 +3599,8 @@ pub(crate) mod tests {
             nodes.push(SubtileNode {
                 id: SubtileId(1 + 2 * layer),
                 op: SubOp::RopeAppend {
-                    attention: fixture_attention(),
-                    head_dim: HeadDim::new(hd_of(layer)),
+                    attention,
+                    rope: rope_of(layer),
                     layer,
                     attn: crate::subtile_ir::AttnMask::Causal,
                     pairing: crate::subtile_ir::RopeFormTag::NeoX,
@@ -3737,7 +3746,7 @@ pub(crate) mod tests {
         );
         // And each table's layers are same-class: their rope head dims agree.
         let hd = |n: u32| match &g.nodes[n as usize].op {
-            SubOp::RopeAppend { head_dim, .. } => head_dim.get(),
+            SubOp::RopeAppend { attention, rope, .. } => rope.head_dim(*attention).get(),
             _ => panic!("not a rope node"),
         };
         for t in [&t0, &t1] {

@@ -188,13 +188,13 @@ pub fn expand_kv_codec(
     facts: &KvCodecFacts,
 ) -> Result<LoweredDecode, KvCodecError> {
     let ops = &l.input.ops;
-    // A writer states the model's base head dim, an attention its class's.
+    // A writer states the model's base head dim (the rope class's, off the op's
+    // own attention facts), an attention its class's.
     let mut dims: Vec<u32> = ops
         .iter()
         .filter_map(|od| match od.op {
-            SubOp::RopeAppend { head_dim, .. } | SubOp::KvAppend { head_dim, .. } => {
-                Some(head_dim.get())
-            }
+            SubOp::RopeAppend { attention, rope, .. } => Some(rope.head_dim(attention).get()),
+            SubOp::KvAppend { head_dim, .. } => Some(head_dim.get()),
             SubOp::AttnDecode { mask, attention, .. } => {
                 Some(attention.class(mask.class()).head_dim().get())
             }

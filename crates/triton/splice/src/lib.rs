@@ -1998,7 +1998,7 @@ pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
     };
     let SubOp::RopeAppend {
         attention,
-        head_dim,
+        rope,
         attn,
         ..
     } = &node.op
@@ -2015,10 +2015,11 @@ pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
             node.inputs.len()
         ));
     }
-    // The class's head count off the op's own attention facts (minted at the bridge), not a
-    // division of the region's width — the region's law is CHECKED against it below.
+    // The class's facts off the op's own attention value (minted at the bridge): the head
+    // dim is the rope class's own, the head count the mask class's — never a division of
+    // the region's width, which is CHECKED against them below.
     let g = attention.class(attn.class());
-    let (hd, nkvh) = (head_dim.get(), g.kv_heads().get());
+    let (hd, nkvh) = (rope.head_dim(*attention).get(), g.kv_heads().get());
     let (rows, kv_width) = (node.output.region.rows.len, node.output.region.cols.len);
     if hd == 0 || kv_width != nkvh * hd {
         return Err(format!(
@@ -2441,13 +2442,18 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // agreement by construction.
             ce("SCALE", Val::Float(f64::from(*scale)))?;
         }
-        (SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. }, "rope_fwd") => {
+        (SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. }, "rope_fwd") => {
             // The door's contract, stated from the node's own facts: total = the output's
             // declared width (`heads * hd`), heads = total / hd, mq = the output's rows —
             // the same derivation `KtirFunc::rope`'s views state. The builder's own
             // refusal (`total` not a whole number of `hd`-wide heads) is mirrored here
-            // as an `Err`: the node is malformed, and no kernel can state it.
-            let hd = head_dim.get();
+            // as an `Err`: the node is malformed, and no kernel can state it. The rotate
+            // states its dim; the append's is its rope class's own, off its attention.
+            let hd = match &node.op {
+                SubOp::RopeRotate { head_dim, .. } => head_dim.get(),
+                SubOp::RopeAppend { attention, rope, .. } => rope.head_dim(*attention).get(),
+                _ => unreachable!("the arm's pattern binds one of the two rope kinds"),
+            };
             let total = c;
             if hd == 0 || total % hd != 0 {
                 return Err(format!(

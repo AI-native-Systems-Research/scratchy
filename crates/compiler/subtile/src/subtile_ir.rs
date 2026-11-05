@@ -288,11 +288,12 @@ pub enum RopeFormTag {
 // ── KvCacheLayout ────────────────────────────────────────────────────
 //
 // The per-model K/V cache dims (`num_kv_heads`, `head_dim`, …) are NOT
-// duplicated here: they already live on the lowered IR ops
-// (`SubOp::AttnDecode { num_kv_heads, head_dim, … }`,
-// `SubOp::RopeAppend { head_dim, … }`), stamped from `model.bounds` in
-// `to_wavefront`. The lowering consumes those op fields directly.
-// `KvCacheLayout` is just the sealed pair of cache TensorIds the
+// duplicated here: the attention-reading ops carry the model's attention
+// facts (`SubOp::AttnDecode { attention, .. }`,
+// `SubOp::RopeAppend { attention, rope, .. }`) — ONE `Attention` value minted
+// at the bridge off `ModelFacts`, with the rope's head dim the rope class's
+// own off those facts. The lowering reads the class geometry off the op's own
+// value. `KvCacheLayout` is just the sealed pair of cache TensorIds the
 // producer (`RopeAppend`) writes and the consumer (`AttnDecode`) reads.
 
 /// **`KvCacheLayout`** — sealed witness naming the K-cache (or V-cache)
@@ -620,6 +621,33 @@ impl AttnMask {
         match self {
             AttnMask::Causal => None,
             AttnMask::SlidingWindow { window } => Some(window),
+        }
+    }
+}
+
+/// Which rotary class a rope op binds — the rotary extern the graph names for its layer:
+/// `rotary_local` (the BASE class) or plain `rotary` (the GLOBAL one).
+///
+/// ⛔ NOT A SECOND `HeadDim`. The rope's head dim is the class's own, and the class this op
+/// binds is selected at the bridge by the extern the graph names — a fact INDEPENDENT of the
+/// layer's [`AttnMask`] (a graph may name `rotary_local` on a full layer; the bridge's two
+/// selections mirror each other on every shipped model but no law ties them). So the op
+/// carries the CLASS, and the dim reads off its own [`Attention`] — never a bare second copy
+/// of a number the facts already hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RopeClass {
+    /// The base class (`rotary_local`).
+    Base,
+    /// The global class (plain `rotary`).
+    Global,
+}
+
+impl RopeClass {
+    /// The class's head dim, read off the op's own attention facts.
+    pub fn head_dim(self, attention: Attention) -> HeadDim {
+        match self {
+            RopeClass::Base => attention.base().head_dim(),
+            RopeClass::Global => attention.global().head_dim(),
         }
     }
 }
@@ -954,14 +982,17 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             SubOp::RmsNormReduce { eps, .. } | SubOp::RmsNormUnit { eps } => eps.to_bits().hash(h),
             SubOp::RmsNormApply { gain, .. } => std::mem::discriminant(gain).hash(h),
             SubOp::RopeRotate { head_dim, .. } => head_dim.get().hash(h),
-            // `layer` and `layout`'s cache tensors are per-layer IDENTITY, not class.
+            // `layer` and `layout`'s cache tensors are per-layer IDENTITY, not class. The
+            // rope's head dim hashes as the NUMBER the class states — the same input the
+            // bare field hashed, so the re-roll tables are unchanged.
             SubOp::RopeAppend {
-                head_dim,
+                attention,
+                rope,
                 attn,
                 pairing,
                 ..
             } => {
-                head_dim.get().hash(h);
+                rope.head_dim(*attention).get().hash(h);
                 std::mem::discriminant(attn).hash(h);
                 pairing.hash(h);
             }
@@ -1100,17 +1131,18 @@ impl<F: RopeForm> SubOp<F, Arch> {
     }
 
     /// `RopeAppend` for `layer`: the cache tensors it writes are bound by [`lower_region`].
-    /// `attention` is the model's attention facts, minted at the bridge — the op carries them.
+    /// `attention` is the model's attention facts, minted at the bridge — the op carries them,
+    /// and the rope's head dim is `rope`'s class off those facts.
     pub const fn rope_append(
         attention: Attention,
-        head_dim: HeadDim,
+        rope: RopeClass,
         layer: u32,
         attn: AttnMask,
         pairing: RopeFormTag,
     ) -> Self {
         SubOp::RopeAppend {
             attention,
-            head_dim,
+            rope,
             layer,
             attn,
             pairing,
@@ -1273,7 +1305,11 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// cache write are GPU-only. `inputs` = `[K, cos, sin, V, K_cache, V_cache]`.
     RopeAppend {
         attention: Attention,
-        head_dim: HeadDim,
+        /// The rotary class this layer's rope binds — the extern the graph names for it
+        /// (`rotary_local` = [`RopeClass::Base`], plain `rotary` = [`RopeClass::Global`]).
+        /// The head dim it runs at is this class's own, read off `attention` — never a
+        /// second bare dim on the op.
+        rope: RopeClass,
         layer: u32,
         /// The class of the layer whose K/V this appends — the value its attention's `mask`
         /// carries. On a hybrid sliding/global arch it selects the rotary table and head
@@ -2993,6 +3029,81 @@ pub fn eval_dag<F: RopeForm>(graph: &SubtileIR<F>, sources: &[&[f32]]) -> Vec<Ve
 /// SCALE constexpr and the scalar registry read): a weight-folded
 /// `AttnDecode` evaluates at `FoldedIntoWeights`, whose √scale rides the
 /// staged W_q/W_k, everything else at `InKernel`.
+/// The shared host eval of a rotation — `RopeRotate` and `RopeAppend`'s rotation-only
+/// golden (the append's V input + paged-cache write are GPU-only). `hd` is the op's head
+/// dim: the rotate's own field, the append's rope class off its attention facts.
+fn rope_eval<F: RopeForm>(
+    node: &SubtileNode<F>,
+    graph: &SubtileIR<F>,
+    bufs: &[Vec<f32>],
+    head_dim: u32,
+) -> Vec<f32> {
+    let out_rows = node.output.region.rows.len;
+    let out_cols = node.output.region.cols.len;
+    let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
+    let (cos, cr, cc) = gather(&node.inputs[1], graph, bufs);
+    let (sin, sr, sc) = gather(&node.inputs[2], graph, bufs);
+    debug_assert_eq!((xr, xc), (out_rows, out_cols), "rope shape");
+    let hd = head_dim as usize;
+    let half = hd / 2;
+    let (rows, cols) = (xr as usize, xc as usize);
+    debug_assert_eq!(cols % hd, 0, "rope cols not a multiple of head_dim");
+    debug_assert!(cc as usize >= hd && sc as usize >= hd, "rope cos/sin width");
+    let heads = cols / hd;
+    // ⭐ ROW- AND HEAD-ALIGNED TABLE READS, BY THE SOURCE'S OWN SHAPE. A real
+    // tape's cos/sin source is `[m, cols]` — one row per query row, each the
+    // row's own position's table tiled across heads to the rope's full width
+    // (`to_wavefront`'s `cos_sin` pushes exactly that shape, and both runtimes
+    // stage it: `rope_cos_sin_kind(position[row])` then `tile_rotary_row`) — so
+    // row `r`'s rotation reads row `r`'s table at the head's own slice. The old
+    // `cos[d]`-for-every-row form is right only at m == 1 (one row, and the
+    // period-half probe synth makes even a wrong read agree); at m > 1 it
+    // rotates every row by ROW 0's angles. A `[1, hd]` source (the fixtures'
+    // single head table) stays broadcast across rows and heads. Any other
+    // width has no staging law — panic rather than silently misread.
+    let table_row = |tr: usize, r: usize| if tr == 1 { 0 } else { r };
+    let table_base = |tc: usize, h: usize| {
+        if tc == cols {
+            h * hd
+        } else if tc == hd {
+            0
+        } else {
+            panic!(
+                "rope cos/sin source width {tc} is neither the rope's own width \
+                 ({cols}) nor one head_dim ({hd}) — no staging law to read it by"
+            )
+        }
+    };
+    let mut out = x.clone();
+    for r in 0..rows {
+        let (crow, srow) = (table_row(cr as usize, r), table_row(sr as usize, r));
+        for h in 0..heads {
+            let base = r * cols + h * hd;
+            let (coff, soff) = (
+                crow * cc as usize + table_base(cc as usize, h),
+                srow * sc as usize + table_base(sc as usize, h),
+            );
+            for d in 0..half {
+                let x0 = x[base + d];
+                let x1 = x[base + half + d];
+                // Apply the cos/sin table ELEMENT-WISE (cos[base + d] for the first
+                // half, cos[base + half + d] for the second), matching the SuperDSC
+                // on-card RoPE (`out = x*cos + rotate_half(x)*sin`, where the pointwise
+                // mul reads the full [hd] table per element). For REAL rope_cos_sin
+                // tables the two halves are duplicated (cos[d+half]==cos[d]), so this
+                // is a NO-OP for every real run; it only matters when cos/sin are NOT
+                // duplicated (the selftest's synthetic sources), where the old
+                // `cos[d]`-for-both form made the eval_dag golden diverge from the
+                // faithful on-card lowering (the spurious t341 RopeRotate cos≈0.45
+                // selftest artifact).
+                out[base + d] = x0 * cos[coff + d] - x1 * sin[soff + d];
+                out[base + half + d] = x0 * sin[soff + half + d] + x1 * cos[coff + half + d];
+            }
+        }
+    }
+    out
+}
+
 pub fn eval_node<F: RopeForm>(
     node: &SubtileNode<F>,
     graph: &SubtileIR<F>,
@@ -3425,71 +3536,14 @@ pub fn eval_node<F: RopeForm>(
         SubOp::KvAppend { .. } => gather(&node.inputs[0], graph, bufs).0,
         // RopeAppend's host eval is rotation only (identical to RopeRotate);
         // its V input + the paged-cache write are GPU-only.
-        SubOp::RopeRotate { head_dim, _form: _ } | SubOp::RopeAppend { head_dim, .. } => {
-            let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
-            let (cos, cr, cc) = gather(&node.inputs[1], graph, bufs);
-            let (sin, sr, sc) = gather(&node.inputs[2], graph, bufs);
-            debug_assert_eq!((xr, xc), (out_rows, out_cols), "rope shape");
-            let hd = head_dim.get() as usize;
-            let half = hd / 2;
-            let (rows, cols) = (xr as usize, xc as usize);
-            debug_assert_eq!(cols % hd, 0, "rope cols not a multiple of head_dim");
-            debug_assert!(cc as usize >= hd && sc as usize >= hd, "rope cos/sin width");
-            let heads = cols / hd;
-            // ⭐ ROW- AND HEAD-ALIGNED TABLE READS, BY THE SOURCE'S OWN SHAPE. A real
-            // tape's cos/sin source is `[m, cols]` — one row per query row, each the
-            // row's own position's table tiled across heads to the rope's full width
-            // (`to_wavefront`'s `cos_sin` pushes exactly that shape, and both runtimes
-            // stage it: `rope_cos_sin_kind(position[row])` then `tile_rotary_row`) — so
-            // row `r`'s rotation reads row `r`'s table at the head's own slice. The old
-            // `cos[d]`-for-every-row form is right only at m == 1 (one row, and the
-            // period-half probe synth makes even a wrong read agree); at m > 1 it
-            // rotates every row by ROW 0's angles. A `[1, hd]` source (the fixtures'
-            // single head table) stays broadcast across rows and heads. Any other
-            // width has no staging law — panic rather than silently misread.
-            let table_row = |tr: usize, r: usize| if tr == 1 { 0 } else { r };
-            let table_base = |tc: usize, h: usize| {
-                if tc == cols {
-                    h * hd
-                } else if tc == hd {
-                    0
-                } else {
-                    panic!(
-                        "rope cos/sin source width {tc} is neither the rope's own width \
-                         ({cols}) nor one head_dim ({hd}) — no staging law to read it by"
-                    )
-                }
-            };
-            let mut out = x.clone();
-            for r in 0..rows {
-                let (crow, srow) = (table_row(cr as usize, r), table_row(sr as usize, r));
-                for h in 0..heads {
-                    let base = r * cols + h * hd;
-                    let (coff, soff) = (
-                        crow * cc as usize + table_base(cc as usize, h),
-                        srow * sc as usize + table_base(sc as usize, h),
-                    );
-                    for d in 0..half {
-                        let x0 = x[base + d];
-                        let x1 = x[base + half + d];
-                        // Apply the cos/sin table ELEMENT-WISE (cos[base + d] for the first
-                        // half, cos[base + half + d] for the second), matching the SuperDSC
-                        // on-card RoPE (`out = x*cos + rotate_half(x)*sin`, where the pointwise
-                        // mul reads the full [hd] table per element). For REAL rope_cos_sin
-                        // tables the two halves are duplicated (cos[d+half]==cos[d]), so this
-                        // is a NO-OP for every real run; it only matters when cos/sin are NOT
-                        // duplicated (the selftest's synthetic sources), where the old
-                        // `cos[d]`-for-both form made the eval_dag golden diverge from the
-                        // faithful on-card lowering (the spurious t341 RopeRotate cos≈0.45
-                        // selftest artifact).
-                        out[base + d] = x0 * cos[coff + d] - x1 * sin[soff + d];
-                        out[base + half + d] =
-                            x0 * sin[soff + half + d] + x1 * cos[coff + half + d];
-                    }
-                }
-            }
-            out
+        SubOp::RopeRotate { head_dim, _form: _ } => {
+            rope_eval(node, graph, bufs, head_dim.get())
         }
+        SubOp::RopeAppend {
+            attention,
+            rope,
+            ..
+        } => rope_eval(node, graph, bufs, rope.head_dim(attention).get()),
         SubOp::Mean => {
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
             debug_assert_eq!(out_cols, 1, "mean output must be [m, 1]");
@@ -4194,7 +4248,7 @@ pub fn lower_region(
             SubOp::RopeRotate { head_dim, _form } => SubOp::RopeRotate { head_dim, _form },
             SubOp::RopeAppend {
                 attention,
-                head_dim,
+                rope,
                 layer,
                 attn,
                 pairing,
@@ -4233,7 +4287,7 @@ pub fn lower_region(
                 k_cache_producer_node.insert(k_cache_t, nodes.len() as u32);
                 SubOp::RopeAppend {
                     attention,
-                    head_dim,
+                    rope,
                     layer,
                     attn,
                     pairing,
@@ -4737,9 +4791,19 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
     for node in &graph.nodes {
         new_id_for_old.push(next_new_id);
         match node.op {
-            SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
+            SubOp::RopeRotate { head_dim, .. } => {
                 let total_cols = node.output.region.cols.len;
                 let head_dim_nz = std::num::NonZeroU32::new(head_dim.get())
+                    .expect("head_tile_rope: head_dim must be non-zero");
+                next_new_id += head_blocks(total_cols, nb, head_dim_nz).len() as u32;
+            }
+            SubOp::RopeAppend {
+                attention,
+                rope,
+                ..
+            } => {
+                let total_cols = node.output.region.cols.len;
+                let head_dim_nz = std::num::NonZeroU32::new(rope.head_dim(attention).get())
                     .expect("head_tile_rope: head_dim must be non-zero");
                 next_new_id += head_blocks(total_cols, nb, head_dim_nz).len() as u32;
             }
@@ -4791,7 +4855,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
             }
             SubOp::RopeAppend {
                 attention,
-                head_dim,
+                rope,
                 layer,
                 attn,
                 pairing,
@@ -4808,7 +4872,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 let kcache_in = node.inputs[4];
                 let vcache_in = node.inputs[5];
                 let total_cols = node.output.region.cols.len;
-                let head_dim_nz = std::num::NonZeroU32::new(head_dim.get())
+                let head_dim_nz = std::num::NonZeroU32::new(rope.head_dim(attention).get())
                     .expect("head_tile_rope: head_dim must be non-zero");
                 let k_col_start = k_in.region.cols.start;
                 let v_col_start = v_in.region.cols.start;
@@ -4818,7 +4882,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                         id: SubtileId(nodes.len() as u32),
                         op: SubOp::RopeAppend {
                             attention,
-                            head_dim,
+                            rope,
                             layer,
                             attn,
                             pairing,
@@ -5429,7 +5493,8 @@ mod tests {
                 OpDesc {
                     op: SubOp::rope_append(
                         attention,
-                        HeadDim::new(hd),
+                        // A uniform fixture: the base class states the same head dim.
+                        RopeClass::Base,
                         0,
                         AttnMask::Causal,
                         RopeFormTag::NeoX,

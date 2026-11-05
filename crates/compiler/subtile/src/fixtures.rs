@@ -13,7 +13,7 @@ use crate::kv_codec::{After, Before, CodecAround, CodecHeadDims, Guarded, KvCode
 use crate::lower::{InputRef, LoweringInput, OpDesc};
 use scratchy_ir::model_facts::HeadDim;
 use crate::subtile_ir::{
-    AttnMask, EwKind, GainConvention, KvOperand, RopeFormTag, SourceShape, SubOp,
+    AttnMask, EwKind, GainConvention, KvOperand, RopeClass, RopeFormTag, SourceShape, SubOp,
 };
 use scratchy_ir::model_facts::{
     AttnScale, Attention, BlockSize, HeadGeometry, KvHeads, QueryHeads, RotDim, Rope, KvRope,
@@ -140,7 +140,9 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             OpDesc {
                 op: SubOp::rope_append(
                     one_layer_attention(h, kv, hd),
-                    head_dim,
+                    // A uniform fixture: both classes state the same head dim, so the
+                    // rope class is the base either way.
+                    RopeClass::Base,
                     0,
                     AttnMask::Causal,
                     RopeFormTag::NeoX,
@@ -287,6 +289,21 @@ pub fn one_layer_attention(h: u32, kv: u32, hd: u32) -> Attention {
         group,
         group,
         AttnScale::new(1.0 / (hd as f32).sqrt()),
+        None,
+        None,
+        Rope::new(RopePairing::Standard, KvRope::AtWrite, None),
+    )
+}
+
+/// The fixture `Attention` for a hybrid model: the same heads in both classes (the facts'
+/// own law — only the kv side may differ), the base class at `base_hd` and the global at
+/// `global_hd` (gemma-4's shape — two rotary classes, so a rope op's
+/// [`RopeClass`](crate::subtile_ir::RopeClass) selects a real dim).
+pub fn hybrid_attention(base_hd: u32, global_hd: u32) -> Attention {
+    Attention::new(
+        fixture_head_geometry(8 * base_hd, 2 * base_hd, base_hd),
+        fixture_head_geometry(8 * global_hd, 2 * global_hd, global_hd),
+        AttnScale::new(1.0 / (base_hd as f32).sqrt()),
         None,
         None,
         Rope::new(RopePairing::Standard, KvRope::AtWrite, None),

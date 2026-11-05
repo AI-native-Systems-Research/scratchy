@@ -2865,7 +2865,7 @@ mod tests {
             view(1, 128, 8),
             op(SubOp::RmsNormUnit { eps: 1e-6 }, 1, vec![Op(2)]),
             op(
-                SubOp::rope_append(one_layer_attention(256, 64, 64), head_dim, 0, AttnMask::Causal, RopeFormTag::NeoX),
+                SubOp::rope_append(one_layer_attention(256, 64, 64), crate::subtile_ir::RopeClass::Base, 0, AttnMask::Causal, RopeFormTag::NeoX),
                 1,
                 vec![Op(9), Ext(6), Ext(7), Op(10), Ext(8), Ext(9)],
             ),

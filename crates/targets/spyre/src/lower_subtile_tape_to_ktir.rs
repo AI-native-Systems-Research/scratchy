@@ -1412,9 +1412,8 @@ pub fn graph_wiring<F: RopeForm>(
         // tape, so the wiring's answer and the placement pass's cannot disagree.
         rope_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(ir.nodes.iter().filter_map(
             |n| match &n.op {
-                SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
-                    Some(head_dim.get())
-                }
+                SubOp::RopeRotate { head_dim, .. } => Some(head_dim.get()),
+                SubOp::RopeAppend { attention, rope, .. } => Some(rope.head_dim(*attention).get()),
                 _ => None,
             },
         )),
@@ -3505,7 +3504,7 @@ mod attn_scale_weight_fold_tests {
             OpDesc {
                 op: SubOp::rope_append(
                     attention,
-                    hd,
+                    scratchy_subtile::subtile_ir::RopeClass::Base,
                     0,
                     scratchy_subtile::subtile_ir::AttnMask::Causal,
                     scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
@@ -3647,7 +3646,7 @@ mod attn_scale_weight_fold_tests {
                 OpDesc {
                     op: SubOp::rope_append(
                         attention,
-                        hd,
+                        scratchy_subtile::subtile_ir::RopeClass::Base,
                         0,
                         scratchy_subtile::subtile_ir::AttnMask::Causal,
                         scratchy_subtile::subtile_ir::RopeFormTag::NeoX,

@@ -964,11 +964,12 @@ pub fn lower_decode_to_wavefront(
                 // global twin (its geometry IS the model's), and the facts' global class equals
                 // the base exactly when the two classes do.
                 let attention = attn()?;
-                let head_dim = if local_rope {
-                    attention.base().head_dim()
+                let rope = if local_rope {
+                    scratchy_subtile::subtile_ir::RopeClass::Base
                 } else {
-                    attention.global().head_dim()
+                    scratchy_subtile::subtile_ir::RopeClass::Global
                 };
+                let head_dim = rope.head_dim(attention);
                 let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
                 let (cos_k, sin_k) = bx.cos_sin(k_cols, local_rope);
                 // E.12 — RopeAppend writes rotated K and V into the
@@ -990,7 +991,7 @@ pub fn lower_decode_to_wavefront(
                 let ki = bx.push_op(
                     // `Causal` by default; the consuming attention arm backpatches
                     // `SlidingWindow` for sliding layers.
-                    SubOp::rope_append(attention, head_dim, layer, AttnMask::Causal, pairing),
+                    SubOp::rope_append(attention, rope, layer, AttnMask::Causal, pairing),
                     vec![
                         k,
                         InputRef::Ext(cos_k),

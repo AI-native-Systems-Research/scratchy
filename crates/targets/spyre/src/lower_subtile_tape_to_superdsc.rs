@@ -1095,9 +1095,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // (via the shared `rope_p_class_hds` helper) is the one source of truth for all three.
     let rope_class_hds = ktir_superdsc::reserved_tids::rope_p_class_hds(
         ir.nodes.iter().filter_map(|n| match &n.op {
-            SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
-                Some(head_dim.get())
-            }
+            SubOp::RopeRotate { head_dim, .. } => Some(head_dim.get()),
+            SubOp::RopeAppend { attention, rope, .. } => Some(rope.head_dim(*attention).get()),
             _ => None,
         }),
     );
@@ -2284,8 +2283,9 @@ pub fn rope_table_periods<F: RopeForm>(ir: &SubtileIR<F>) -> std::collections::H
     ir.nodes
         .iter()
         .filter_map(|n| match &n.op {
-            SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
-                Some((n, head_dim.get() as usize / 2))
+            SubOp::RopeRotate { head_dim, .. } => Some((n, head_dim.get() as usize / 2)),
+            SubOp::RopeAppend { attention, rope, .. } => {
+                Some((n, rope.head_dim(*attention).get() as usize / 2))
             }
             _ => None,
         })
