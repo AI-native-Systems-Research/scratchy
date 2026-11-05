@@ -1811,11 +1811,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // softmax scale at the site the weight fold decided: `InKernel` is the model's own scale,
     // `FoldedIntoWeights` the 1.0 the node runs at once √scale rides its W_q/W_k.
     let g = attention.class(mask.class());
-    let (nqh, nkvh, hd) = (
-        g.q_heads().get(),
-        g.kv_heads().get(),
-        g.head_dim().get(),
-    );
+    let (nqh, nkvh, hd) = (g.q_heads().get(), g.kv_heads().get(), g.head_dim().get());
     let scale = scale_site.scale(*attention);
     let mq = node.output.region.rows.len;
     let kv_width = nkvh * hd;

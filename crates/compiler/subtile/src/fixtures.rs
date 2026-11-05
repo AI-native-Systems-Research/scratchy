@@ -11,13 +11,13 @@ use crate::handoff::{LoweredDecode, SourceBinding};
 use crate::kv_codec::CodecGuard::{Codec, CodecDecode, CodecNotDecode, UnlessCodecDecode};
 use crate::kv_codec::{After, Before, CodecAround, CodecHeadDims, Guarded, KvCodecFacts};
 use crate::lower::{InputRef, LoweringInput, OpDesc};
-use scratchy_ir::model_facts::HeadDim;
 use crate::subtile_ir::{
     AttnMask, EwKind, GainConvention, KvOperand, RopeClass, RopeFormTag, SourceShape, SubOp,
 };
+use scratchy_ir::model_facts::HeadDim;
 use scratchy_ir::model_facts::{
-    AttnScale, Attention, BlockSize, HeadGeometry, KvHeads, QueryHeads, RotDim, Rope, KvRope,
-    RopePairing,
+    Attention, AttnScale, BlockSize, HeadGeometry, KvHeads, KvRope, QueryHeads, Rope, RopePairing,
+    RotDim,
 };
 
 /// Minimal one-layer Llama-3.2-1B-style decode forward.
@@ -740,9 +740,7 @@ pub fn buf_byte_sizes(input: &LoweringInput) -> Vec<usize> {
         // disagree silently.
         let cols = desc
             .op
-            .out_cols(|k| {
-                shape_for(desc.inputs[k], &op_shapes, &input.sources).1
-            });
+            .out_cols(|k| shape_for(desc.inputs[k], &op_shapes, &input.sources).1);
         op_shapes.push((m, cols));
         out.push((m as usize) * (cols as usize) * 2);
     }

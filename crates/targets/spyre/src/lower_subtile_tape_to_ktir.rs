@@ -353,9 +353,7 @@ pub(crate) fn attn_scale_weight_folds<F: RopeForm>(
 /// census, the golden's source pre-scaling) takes this union. A fold entry keyed on an
 /// AttnDecode reaching the aliasing sites would point the attention's OUTPUT placement at the
 /// query's bytes, so those sites keep their own recognizer rather than filtering this list.
-pub(crate) fn weight_scale_folds<F: RopeForm>(
-    ir: &SubtileIR<F>,
-) -> Vec<(SubtileId, u32, f32)> {
+pub(crate) fn weight_scale_folds<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<(SubtileId, u32, f32)> {
     let mut folds = scalar_mul_weight_folds(ir);
     for (id, w_q, w_k, sqrt_scale) in attn_scale_weight_folds(ir) {
         folds.push((id, w_q, sqrt_scale));
@@ -1321,7 +1319,10 @@ pub fn paged_step_of_ir<F: RopeForm>(
     let slots = scratchy_triton_splice::PAGE_SLOTS;
     let mut out: Option<crate::wiring::PagedStep> = None;
     for n in &ir.nodes {
-        let SubOp::AttnDecode { mask, attention, .. } = &n.op else {
+        let SubOp::AttnDecode {
+            mask, attention, ..
+        } = &n.op
+        else {
             continue;
         };
         let cache = n.inputs.get(1).ok_or_else(|| {
@@ -1398,8 +1399,7 @@ pub fn graph_wiring<F: RopeForm>(
     // card.
     let _ = weight_ids;
     let registries = WiringRegistries {
-        scalarmul_scales:
-            crate::lower_subtile_tape_to_superdsc::bundle_registry(ir, paged_rows)?,
+        scalarmul_scales: crate::lower_subtile_tape_to_superdsc::bundle_registry(ir, paged_rows)?,
         // Same rule as the placement pass's own field: the fold list the worker applies to
         // staged bytes at load, keyed by weight tid (the `SubtileId` half is a placement-pass
         // fact and does not ship).
@@ -1411,13 +1411,15 @@ pub fn graph_wiring<F: RopeForm>(
         // class through these, and this pass lowers through the door. Same shared helper, same
         // tape, so the wiring's answer and the placement pass's cannot disagree.
         rope_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(
-            ir.nodes.iter().filter_map(|n| n.op.rope_head_dim().map(|d| d.get())),
+            ir.nodes
+                .iter()
+                .filter_map(|n| n.op.rope_head_dim().map(|d| d.get())),
         ),
         attn_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(ir.nodes.iter().filter_map(
             |n| match &n.op {
-                SubOp::AttnDecode { mask, attention, .. } => {
-                    Some(attention.class(mask.class()).head_dim().get())
-                }
+                SubOp::AttnDecode {
+                    mask, attention, ..
+                } => Some(attention.class(mask.class()).head_dim().get()),
                 _ => None,
             },
         )),
@@ -3517,7 +3519,11 @@ mod attn_scale_weight_fold_tests {
             },
             // 4: attn = AttnDecode(q_rot, prefix_k, prefix_v, k_rot, v)
             OpDesc {
-                op: SubOp::attn_decode(attention, 33, scratchy_subtile::subtile_ir::AttnMask::Causal),
+                op: SubOp::attn_decode(
+                    attention,
+                    33,
+                    scratchy_subtile::subtile_ir::AttnMask::Causal,
+                ),
                 m: 1,
                 inputs: vec![
                     q_ref,
@@ -3658,7 +3664,11 @@ mod attn_scale_weight_fold_tests {
                     ],
                 },
                 OpDesc {
-                    op: SubOp::attn_decode(attention, 33, scratchy_subtile::subtile_ir::AttnMask::Causal),
+                    op: SubOp::attn_decode(
+                        attention,
+                        33,
+                        scratchy_subtile::subtile_ir::AttnMask::Causal,
+                    ),
                     m: 1,
                     inputs: vec![
                         InputRef::Op(1),

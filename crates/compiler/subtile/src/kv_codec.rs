@@ -195,9 +195,9 @@ pub fn expand_kv_codec(
         .filter_map(|od| match od.op {
             SubOp::RopeAppend { .. } => od.op.rope_head_dim().map(|d| d.get()),
             SubOp::KvAppend { head_dim, .. } => Some(head_dim.get()),
-            SubOp::AttnDecode { mask, attention, .. } => {
-                Some(attention.class(mask.class()).head_dim().get())
-            }
+            SubOp::AttnDecode {
+                mask, attention, ..
+            } => Some(attention.class(mask.class()).head_dim().get()),
             _ => None,
         })
         .collect();
@@ -516,8 +516,8 @@ impl Expander<'_> {
 mod tests {
     use super::*;
     use crate::fixtures::{
-        TURBOQUANT_SHAPED_CODEC as FACTS, front_end_lowered as lowered,
-        one_layer_attention, one_layer_input_shaped,
+        TURBOQUANT_SHAPED_CODEC as FACTS, front_end_lowered as lowered, one_layer_attention,
+        one_layer_input_shaped,
     };
     use crate::lower::GemmWeight;
     use crate::subtile_ir::{EwKind, SourceShape};
@@ -542,8 +542,8 @@ mod tests {
     /// attention twinned onto them; off decode steps its K and V stage for the attention.
     #[test]
     fn an_unrotated_writer_encodes_its_cache_halves_alone() {
-        use scratchy_ir::model_facts::HeadDim;
         use crate::subtile_ir::AttnMask;
+        use scratchy_ir::model_facts::HeadDim;
         let attention = one_layer_attention(256, 64, 64);
         let unrotated = |m: u32| {
             let mut input = one_layer_input_shaped(256, 64, 512, 64);
@@ -604,8 +604,7 @@ mod tests {
     /// takes over the attention's output and reads the writer's two encodes.
     #[test]
     fn decode_encodes_after_the_writer_and_twins_the_attention() {
-        let l = expand_kv_codec(&layer(64, 1), &FACTS)
-            .expect("expands");
+        let l = expand_kv_codec(&layer(64, 1), &FACTS).expect("expands");
         let s = shape(&l);
         assert_eq!(
             s[4..11],
@@ -671,8 +670,7 @@ mod tests {
     /// attention, which reads the rotated rows; its output rotated back, then the packed twin.
     #[test]
     fn prefill_stages_rotates_and_twins_the_attention() {
-        let l = expand_kv_codec(&layer(64, 2), &FACTS)
-            .expect("expands");
+        let l = expand_kv_codec(&layer(64, 2), &FACTS).expect("expands");
         let s = shape(&l);
         assert_eq!(
             s[5..15],
@@ -718,8 +716,7 @@ mod tests {
             m: 1,
             inputs: vec![InputRef::Op(4), InputRef::Op(5), InputRef::Op(3)],
         };
-        let x = expand_kv_codec(&l, &FACTS)
-            .expect("expands");
+        let x = expand_kv_codec(&l, &FACTS).expect("expands");
         assert_eq!(
             shape(&x)[5..9],
             [
@@ -737,8 +734,7 @@ mod tests {
     fn an_unsupported_head_dim_codes_nothing() {
         for (h, hd) in [(384, 96), (2048, 1024)] {
             let l = lowered(one_layer_input_shaped(h, hd, 512, hd));
-            let x = expand_kv_codec(&l, &FACTS)
-                .expect("passes through");
+            let x = expand_kv_codec(&l, &FACTS).expect("passes through");
             assert_eq!(shape(&x), shape(&l), "head dim {hd}");
         }
     }

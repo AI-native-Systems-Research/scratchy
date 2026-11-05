@@ -2203,11 +2203,10 @@ fn a_sliding_window_attention_is_refused() {
     let Err(e) = scratchy_triton_splice::lower_attn(
         node,
         &ir,
-                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+        scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
         s.active_cap(),
         PagedRows::Sequence,
-    )
-    else {
+    ) else {
         panic!("a sliding window must be refused");
     };
     assert!(e.contains("sliding window"), "{e}");
@@ -2233,15 +2232,13 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
     let small = at_pages(16);
     let ir = attn_ir(small, 0.015625);
     let node = ir.nodes.last().expect("the attention");
-    let Err(e) =
-        scratchy_triton_splice::lower_attn(
+    let Err(e) = scratchy_triton_splice::lower_attn(
         node,
         &ir,
-                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+        scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
         small.active_cap(),
         PagedRows::Batch,
-    )
-    else {
+    ) else {
         panic!("a chunk gathering the whole pool must be refused");
     };
     assert!(
@@ -2256,11 +2253,11 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
     scratchy_triton_splice::lower_attn(
         node,
         &ir,
-                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+        scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
         big.active_cap(),
         PagedRows::Batch,
     )
-        .expect("a pool wider than one chunk splices");
+    .expect("a pool wider than one chunk splices");
 }
 
 #[test]
@@ -2270,14 +2267,13 @@ fn the_paged_attention_splices_with_its_contract() {
         let ir = attn_ir(s, scale);
         let node = ir.nodes.last().unwrap();
         let at = format!("geom={:?} mq={} rung={}", s.geom, s.mq, s.rung);
-        let spliced =
-            scratchy_triton_splice::lower_attn(
-        node,
-        &ir,
-                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
-        s.active_cap(),
-        PagedRows::Sequence,
-    );
+        let spliced = scratchy_triton_splice::lower_attn(
+            node,
+            &ir,
+            scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+            s.active_cap(),
+            PagedRows::Sequence,
+        );
         // ⛔ A PRE-POPULATED CACHE IS REFUSED: the walk reads the step's keys from the pools, and
         // only this forward's RopeAppend scatters them there.
         if !s.rope_appended {
@@ -2544,13 +2540,13 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
     programs.push(
         scratchy_triton_splice::lower_attn(
-        attn,
-        &ir,
-                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
-        s.active_cap(),
-        PagedRows::Sequence,
-    )
-            .unwrap_or_else(|e| panic!("the walk spliced {at}: {e}")),
+            attn,
+            &ir,
+            scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+            s.active_cap(),
+            PagedRows::Sequence,
+        )
+        .unwrap_or_else(|e| panic!("the walk spliced {at}: {e}")),
     );
     assert_eq!(programs.len(), 3, "{at}: rope, KV write, walk");
     let walk = programs[2]
@@ -2815,13 +2811,13 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
     programs.push(
         scratchy_triton_splice::lower_attn(
-        attn,
-        &ir,
-                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
-        s.active_cap(),
-        PagedRows::Batch,
-    )
-            .unwrap_or_else(|e| panic!("the batched walk spliced {at}: {e}")),
+            attn,
+            &ir,
+            scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+            s.active_cap(),
+            PagedRows::Batch,
+        )
+        .unwrap_or_else(|e| panic!("the batched walk spliced {at}: {e}")),
     );
     assert_eq!(programs.len(), 3, "{at}: rope, KV write, batched walk");
     let walk = programs[2]
@@ -3169,15 +3165,14 @@ fn a_paged_walks_program_does_not_grow_with_its_rows() {
         };
         let ir = attn_ir(s, 0.015625);
         let node = ir.nodes.last().unwrap();
-        let spliced =
-            scratchy_triton_splice::lower_attn(
-        node,
-        &ir,
-                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
-        s.active_cap(),
-        PagedRows::Sequence,
-    )
-                .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
+        let spliced = scratchy_triton_splice::lower_attn(
+            node,
+            &ir,
+            scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+            s.active_cap(),
+            PagedRows::Sequence,
+        )
+        .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
         spliced
             .ktir
             .expect("spliced op carries its program")

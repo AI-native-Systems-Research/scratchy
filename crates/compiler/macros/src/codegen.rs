@@ -10670,7 +10670,10 @@ fn dump_wavefront_mega(
     // no op that reads them — the bridge's one presence check refuses any that appear —
     // so this bake needs no facts of its own.
     // The config params and the typed facts are ONE model — the bridge takes them together.
-    let bridge = to_wavefront::BridgeModel { params: model, facts };
+    let bridge = to_wavefront::BridgeModel {
+        params: model,
+        facts,
+    };
     // Structural prefix-KV-cache rows (== modeled valid_len). MUST be >= 1:
     // with 0 the cache Source is [0, kvdim] and the AttnDecode's prefix read
     // (`rows..1`) overruns it — `SubtileIR rejected by validate(): node N input
@@ -11330,9 +11333,7 @@ fn dump_wavefront_mega(
                             // splits it into one sibling loop per class; `reroll_subtile_tape`
                             // remains the single-class roll every other model takes, byte-identical.
                             let tape_rolled = reroll_layer_classes(&tape_unrolled, &krg)
-                                .unwrap_or_else(|| {
-                                    reroll_subtile_tape(&tape_unrolled, &krg)
-                                });
+                                .unwrap_or_else(|| reroll_subtile_tape(&tape_unrolled, &krg));
                             match superdsc::lower_subtile_tape_to_superdsc(
                                 &tape_rolled,
                                 &krg,
@@ -14262,7 +14263,12 @@ pub fn emit_model(
         let prefix =
             crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
         let l = match crate::to_wavefront::lower_decode_to_wavefront(
-            fuf, inferred, &bounds, &bridge_model, prefix, m as u32,
+            fuf,
+            inferred,
+            &bounds,
+            &bridge_model,
+            prefix,
+            m as u32,
         ) {
             Ok(l) => l,
             // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
@@ -16619,8 +16625,8 @@ mod tests {
                 }
             }
         }
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../models/arch/configs");
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/arch/configs");
         let mut paths = Vec::new();
         walk(&root, &mut paths);
         paths.sort();
@@ -16631,7 +16637,9 @@ mod tests {
             let facts = fill_canonical_params(&model, 1, false, &every_layer(&model), None).0;
             // A body with no decoder attention (a vision tower, a drafter head) states
             // no scale — the law is over the configs that do.
-            let Some(attention) = facts.attention() else { continue };
+            let Some(attention) = facts.attention() else {
+                continue;
+            };
             stated += 1;
             assert_eq!(
                 attention.scale().get().to_bits(),

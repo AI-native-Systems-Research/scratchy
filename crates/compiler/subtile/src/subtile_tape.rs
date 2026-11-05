@@ -2692,8 +2692,8 @@ pub fn play_skeleton(tape: &SubtileTape) -> Vec<PlayStep> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::fixtures::fixture_attention;
     use super::*;
+    use crate::fixtures::fixture_attention;
     use crate::subtile_ir::{
         EwKind, KvCacheLayout, KvCacheProducer, NeoX, Range, Region, SoftmaxStateId, SubOp,
         SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape,
@@ -3653,8 +3653,7 @@ pub(crate) mod tests {
         let g = hybrid_class_chain();
         let valid = crate::subtile_ir::ValidatedGraph::new(&g).expect("validates");
         let tape = lower_dag_to_tape(&valid);
-        let rolled =
-            reroll_layer_classes(&tape, &g).expect("the hybrid chain must split by class");
+        let rolled = reroll_layer_classes(&tape, &g).expect("the hybrid chain must split by class");
         let instrs = rolled.instrs();
         // TWO sibling loops.
         let opens: Vec<usize> = instrs

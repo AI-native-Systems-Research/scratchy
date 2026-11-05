@@ -869,7 +869,9 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
     pub fn rope_head_dim(&self) -> Option<HeadDim> {
         match self {
             SubOp::RopeRotate { head_dim, .. } => Some(*head_dim),
-            SubOp::RopeAppend { attention, rope, .. } => Some(rope.head_dim(*attention)),
+            SubOp::RopeAppend {
+                attention, rope, ..
+            } => Some(rope.head_dim(*attention)),
             _ => None,
         }
     }
@@ -1166,7 +1168,12 @@ impl<F: RopeForm> SubOp<F, Arch> {
 
     /// `KvAppend` for `layer`: the cache tensors it writes are bound by [`lower_region`].
     /// `attention` is the model's attention facts, minted at the bridge — the op carries them.
-    pub const fn kv_append(attention: Attention, head_dim: HeadDim, layer: u32, attn: AttnMask) -> Self {
+    pub const fn kv_append(
+        attention: Attention,
+        head_dim: HeadDim,
+        layer: u32,
+        attn: AttnMask,
+    ) -> Self {
         SubOp::KvAppend {
             attention,
             head_dim,
@@ -1422,7 +1429,11 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// `_bf16_reduce`, `_reorder`): each block row's query, normed and roped, over the layer's
     /// ring and the block's own rows, every one of which it sees. `inputs` =
     /// `[qkv, q_norm, k_norm, cos, sin]`; output `width` columns.
-    DraftAttention { attention: Attention, layer: u32, width: u32 },
+    DraftAttention {
+        attention: Attention,
+        layer: u32,
+        width: u32,
+    },
     /// A DFlash2 drafter's context commit at `layer` (Splash `draft_context_kv_commit`,
     /// `prefill_draft_context_kv`): each row's keys, normed and roped, and its values, written into
     /// the layer's ring at the row's position. `inputs` = `[kv, k_norm, cos, sin]`; the output is
@@ -3753,7 +3764,9 @@ pub fn eval_node<F: RopeForm>(
             node.op.name()
         ),
 
-        SubOp::AttnDecode { mask, attention, .. } => {
+        SubOp::AttnDecode {
+            mask, attention, ..
+        } => {
             // ⭐ THE WINDOW IS ON THE TAPE, so a sliding-window layer HAS a host
             // reference: the window bound is `window` positions back from the
             // query's own, the same left-edge every sliding kernel reads. Without
@@ -4189,9 +4202,7 @@ pub fn lower_region(
         // hand it a lookup rather than in0 alone.
         let out_cols = desc
             .op
-            .out_cols(|k| {
-                resolve(desc.inputs[k], &op_tensor, &op_cols, &tensors).2
-            });
+            .out_cols(|k| resolve(desc.inputs[k], &op_tensor, &op_cols, &tensors).2);
         // ⭐ TRUE OUTPUT ROW COUNT — `desc.m` is the TOKEN count, and the two diverge
         // exactly once a Reshape view enters the chain. The bridge stamps every op's
         // `m` with the token count (it never rescales through a per-head view), so the
@@ -4368,8 +4379,18 @@ pub fn lower_region(
             SubOp::GateScale => SubOp::GateScale,
             SubOp::CaptureHidden { slot, slots } => SubOp::CaptureHidden { slot, slots },
             SubOp::DraftConv { stage } => SubOp::DraftConv { stage },
-            SubOp::DraftAttention { attention, layer, width } => SubOp::DraftAttention { attention, layer, width },
-            SubOp::DraftContextKv { attention, layer } => SubOp::DraftContextKv { attention, layer },
+            SubOp::DraftAttention {
+                attention,
+                layer,
+                width,
+            } => SubOp::DraftAttention {
+                attention,
+                layer,
+                width,
+            },
+            SubOp::DraftContextKv { attention, layer } => {
+                SubOp::DraftContextKv { attention, layer }
+            }
             SubOp::DraftWindowStore => SubOp::DraftWindowStore,
             SubOp::DraftWindowLoad => SubOp::DraftWindowLoad,
             SubOp::DraftSelect => SubOp::DraftSelect,
@@ -6236,10 +6257,8 @@ mod tests {
                 ),
             )
         };
-        let window = || {
-            AttnMask::SlidingWindow {
-                window: std::num::NonZeroU32::new(1024).expect("1024 is nonzero"),
-            }
+        let window = || AttnMask::SlidingWindow {
+            window: std::num::NonZeroU32::new(1024).expect("1024 is nonzero"),
         };
         let key = |op: &SubOp<NeoX, Arch>| -> u64 {
             let mut h = std::collections::hash_map::DefaultHasher::new();

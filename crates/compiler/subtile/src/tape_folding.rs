@@ -1751,18 +1751,18 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
 mod tests {
     use super::*;
     use crate::fixtures::{
-    TURBOQUANT_SHAPED_CODEC, front_end_lowered, one_layer_attention, one_layer_input_shaped,
-};
+        TURBOQUANT_SHAPED_CODEC, front_end_lowered, one_layer_attention, one_layer_input_shaped,
+    };
     use crate::handoff::{Expansion, ExpansionId};
     use crate::kv_codec::expand_kv_codec;
     use crate::lower::{ArchOp, GemmWeight, InputRef, LoweringInput, OpDesc};
-    use scratchy_ir::model_facts::HeadDim;
     use crate::subtile_ir::{
         AttnMask, EwKind, GainConvention, RopeFormTag, RowScale, SourceShape, ValidatedGraph,
         lower_region,
     };
     use crate::subtile_tape::{Instr, lower_dag_to_tape};
     use InputRef::{Ext, Op};
+    use scratchy_ir::model_facts::HeadDim;
 
     /// A neutral kernel identity per fold.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2865,7 +2865,13 @@ mod tests {
             view(1, 128, 8),
             op(SubOp::RmsNormUnit { eps: 1e-6 }, 1, vec![Op(2)]),
             op(
-                SubOp::rope_append(one_layer_attention(256, 64, 64), crate::subtile_ir::RopeClass::Base, 0, AttnMask::Causal, RopeFormTag::NeoX),
+                SubOp::rope_append(
+                    one_layer_attention(256, 64, 64),
+                    crate::subtile_ir::RopeClass::Base,
+                    0,
+                    AttnMask::Causal,
+                    RopeFormTag::NeoX,
+                ),
                 1,
                 vec![Op(9), Ext(6), Ext(7), Op(10), Ext(8), Ext(9)],
             ),

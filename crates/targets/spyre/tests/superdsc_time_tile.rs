@@ -1026,20 +1026,10 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
     let ir = single_matmul_ir(64, 16384, 2048);
     let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
     let (programs, layout) =
-        superdsc::lower_graph_to_ktir(
-        &ir,
-        &weight_ids,
-        superdsc::ActiveCap::FULL,
-        true,
-    )
+        superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, true)
             .expect("KTIR for a 64x16384x2048 matmul");
     let (dscs, _) =
-        superdsc::lower_graph_to_superdsc(
-        &ir,
-        &weight_ids,
-        superdsc::ActiveCap::FULL,
-        true,
-    )
+        superdsc::lower_graph_to_superdsc(&ir, &weight_ids, superdsc::ActiveCap::FULL, true)
             .expect("SuperDSC for a 64x16384x2048 matmul");
     let [e] = &dscs[..] else {
         panic!(

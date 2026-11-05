@@ -268,9 +268,9 @@ fn attn_q_width<F: crate::subtile_ir::RopeForm, S: crate::subtile_ir::OpStage>(
     op: &crate::subtile_ir::SubOp<F, S>,
 ) -> u32 {
     match op {
-        crate::subtile_ir::SubOp::AttnDecode { mask, attention, .. } => {
-            attention.class(mask.class()).q_width() as u32
-        }
+        crate::subtile_ir::SubOp::AttnDecode {
+            mask, attention, ..
+        } => attention.class(mask.class()).q_width() as u32,
         crate::subtile_ir::SubOp::EncoderAttn { attention } => attention.base().q_width() as u32,
         _ => unreachable!("attn_q_width: the registry routes only the two attention ops here"),
     }

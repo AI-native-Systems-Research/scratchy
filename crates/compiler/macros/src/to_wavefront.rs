@@ -35,6 +35,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use scratchy_ir::model_facts::ModelFacts;
 use scratchy_subtile::handoff::{BundleTensor, Expansion, ExpansionId};
 use scratchy_subtile::lower::{
     AffineInt4, ArchOp, ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc,
@@ -44,7 +45,6 @@ use scratchy_subtile::subtile_ir::{
     GatedAct, NumExperts, RopeFormTag, RouterBundle, RowScale, SharedExpertBound, SourceShape,
     SubOp, TopK,
 };
-use scratchy_ir::model_facts::ModelFacts;
 
 use crate::classified::{ExternKind, OpKind, UnrollIndex};
 use crate::codegen::weight_kind_accessor_method;
@@ -269,7 +269,6 @@ struct Experts {
 }
 
 impl<'a> Builder<'a> {
-
     fn push_op(&mut self, op: ArchOp, inputs: Vec<InputRef>) -> usize {
         let idx = self.ops.len();
         self.ops.push(OpDesc {
@@ -1142,10 +1141,7 @@ pub fn lower_decode_to_wavefront(
                 if let Some(s) = sinks {
                     attn_inputs.push(s);
                 }
-                let idx = bx.push_op(
-                    SubOp::attn_decode(attention, valid_len, mask),
-                    attn_inputs,
-                );
+                let idx = bx.push_op(SubOp::attn_decode(attention, valid_len, mask), attn_inputs);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
