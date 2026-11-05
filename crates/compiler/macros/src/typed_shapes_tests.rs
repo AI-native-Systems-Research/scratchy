@@ -565,7 +565,7 @@ fn typed_carrier_rebundled(
 fn redeclare_role(
     stem: &str,
     bundle: &str,
-    role: &str,
+    role: crate::bundles::BundleRole,
     dims: &[&str],
 ) -> Result<crate::shape::Inferred, String> {
     typed_carrier_rebundled(
@@ -598,7 +598,7 @@ fn a_misdeclared_expert_bank_fails_the_typed_compile_and_names_the_line() {
         redeclare_role(
             "qwen3-moe",
             "mlp",
-            "down",
+            crate::bundles::BundleRole::Down,
             &["num_experts", "hidden_size", "moe_intermediate_size"],
         ),
         &[
@@ -621,7 +621,7 @@ fn a_misdeclared_mixer_conv_fails_the_typed_compile_and_names_the_line() {
         redeclare_role(
             "qwen3-5",
             "linear_attn",
-            "conv",
+            crate::bundles::BundleRole::Conv,
             &["hidden_size", "linear_conv_kernel_dim"],
         ),
         &[
@@ -641,7 +641,12 @@ fn a_misdeclared_mamba_norm_fails_the_typed_compile_and_names_the_line() {
         "nemotron-h types"
     );
     refused(
-        redeclare_role("nemotron-h", "mamba", "norm", &["hidden_size"]),
+        redeclare_role(
+            "nemotron-h",
+            "mamba",
+            crate::bundles::BundleRole::Norm,
+            &["hidden_size"],
+        ),
         &[
             "crates/models/arch/dsl/nemotron-h.py:27: y = mamba2(zxbcdt, mamba[layer])",
             "W1<typed_shapes::Mul<typed_shapes::MambaHeadDim, typed_shapes::MambaNumHeads>>",
@@ -793,11 +798,24 @@ fn fixture_header(fixture: &serde_json::Value) -> crate::bundles::Header {
         .collect()
 }
 
-/// Every derived bundle is the checkpoint's: each bundle of each fixture, read from its public
-/// checkpoint's safetensors header by the loader's layouts (`bundles::role_in_checkpoint`:
-/// per-expert banks stacked, a fused gate/up split, MXFP4 blocks, a conv's singleton axis
-/// dropped), equals the bundle the model's config derives, under its bounds; and a fixture names
-/// every bundle its model derives. Every carrier that passes a bundle has a fixture.
+/// A fixture's MLX-affine group sizes: its checkpoint config's `quantization` (none for a dense
+/// checkpoint).
+fn fixture_groups(fixture: &serde_json::Value) -> crate::bundles::GroupSizes {
+    let q = &fixture["quantization"];
+    crate::bundles::GroupSizes {
+        default: q["group_size"].as_u64(),
+        modules: (q.as_object().into_iter().flatten())
+            .filter_map(|(m, v)| Some((m.clone(), v.get("group_size")?.as_u64()?)))
+            .collect(),
+    }
+}
+
+/// Every derived bundle is the checkpoint's: each bundle of each fixture — the header of a
+/// checkpoint a metal loader takes — read by the bundle table's names and storage, the loaders'
+/// own (`bundles::role_in_checkpoint` over `scratchy_tensors::bundle_roles`: MLX-affine banks
+/// pre-stacked or per expert, a fused shared gate/up, a conv's singleton axis), equals the bundle
+/// the model's config derives, under its bounds; and a fixture names every bundle its model
+/// derives. Every carrier that passes a bundle has a fixture.
 #[test]
 fn every_derived_bundle_is_its_checkpoints() {
     let fixtures = bundle_header_fixtures();
@@ -817,7 +835,12 @@ fn every_derived_bundle_is_its_checkpoints() {
             let derived = (derived.get(bundle))
                 .unwrap_or_else(|| panic!("{name}: its config derives no bundle `{bundle}`"));
             let eval = |d: &crate::dim::Dim| crate::shape::eval_closed_dim(d, &bounds);
-            if let Err(wrong) = derived.check(&header, prefix.as_str().unwrap(), eval) {
+            if let Err(wrong) = derived.check(
+                &header,
+                &fixture_groups(fixture),
+                prefix.as_str().unwrap(),
+                eval,
+            ) {
                 panic!("{name}: `{bundle}`:\n  {}", wrong.join("\n  "));
             }
         }
@@ -849,7 +872,7 @@ fn a_bundle_role_with_swapped_dims_is_refused_against_its_checkpoint() {
         let derived = derived_bundles(&carrier, &model).unwrap();
         for (bundle, prefix) in fixture["bundles"].as_object().unwrap() {
             let derived = &derived[bundle];
-            for (at, role) in derived.kind.roles().into_iter().enumerate() {
+            for (at, role) in derived.kind.roles().iter().map(|r| r.name()).enumerate() {
                 let shape = &derived.roles[at];
                 let n = shape.len();
                 if n < 2 || eval(&shape[n - 1]) == eval(&shape[n - 2]) {
@@ -858,7 +881,12 @@ fn a_bundle_role_with_swapped_dims_is_refused_against_its_checkpoint() {
                 let mut swapped = derived.clone();
                 swapped.roles[at].swap(n - 1, n - 2);
                 let wrong = swapped
-                    .check(&header, prefix.as_str().unwrap(), eval)
+                    .check(
+                        &header,
+                        &fixture_groups(&fixture),
+                        prefix.as_str().unwrap(),
+                        eval,
+                    )
                     .expect_err(&format!("{name}: `{bundle}.{role}` swapped is refused"));
                 assert!(
                     wrong.len() == 1 && wrong[0].starts_with(&format!("`{role}`")),
@@ -889,7 +917,13 @@ fn every_bundle_carrier_config_sizes_its_loaders() {
                 continue;
             }
             for (path, bundle) in &derived {
-                for (role, shape) in bundle.kind.roles().into_iter().zip(&bundle.roles) {
+                for (role, shape) in bundle
+                    .kind
+                    .roles()
+                    .iter()
+                    .map(|r| r.name())
+                    .zip(&bundle.roles)
+                {
                     for d in shape {
                         assert!(
                             crate::shape::eval_closed_dim(d, &model.bounds).is_some(),

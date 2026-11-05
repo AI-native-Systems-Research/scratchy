@@ -1,0 +1,197 @@
+{
+ "repo": "mlx-community/Qwen3.5-122B-A10B-4bit",
+ "configs": [
+  "qwen3-5-moe/qwen3.5-122b-a10b"
+ ],
+ "head": false,
+ "bundles": {
+  "mlp": "language_model.model.layers.0.mlp",
+  "linear_attn": "language_model.model.layers.0.linear_attn"
+ },
+ "quantization": {
+  "group_size": 64,
+  "bits": 4,
+  "mode": "affine"
+ },
+ "tensors": {
+  "language_model.model.layers.0.linear_attn.A_log": [
+   64
+  ],
+  "language_model.model.layers.0.linear_attn.conv1d.weight": [
+   12288,
+   4,
+   1
+  ],
+  "language_model.model.layers.0.linear_attn.dt_bias": [
+   64
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_a.biases": [
+   64,
+   48
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_a.scales": [
+   64,
+   48
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_a.weight": [
+   64,
+   384
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_b.biases": [
+   64,
+   48
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_b.scales": [
+   64,
+   48
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_b.weight": [
+   64,
+   384
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_qkv.biases": [
+   12288,
+   48
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_qkv.scales": [
+   12288,
+   48
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_qkv.weight": [
+   12288,
+   384
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_z.biases": [
+   8192,
+   48
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_z.scales": [
+   8192,
+   48
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_z.weight": [
+   8192,
+   384
+  ],
+  "language_model.model.layers.0.linear_attn.norm.weight": [
+   128
+  ],
+  "language_model.model.layers.0.linear_attn.out_proj.biases": [
+   3072,
+   128
+  ],
+  "language_model.model.layers.0.linear_attn.out_proj.scales": [
+   3072,
+   128
+  ],
+  "language_model.model.layers.0.linear_attn.out_proj.weight": [
+   3072,
+   1024
+  ],
+  "language_model.model.layers.0.mlp.gate.biases": [
+   256,
+   48
+  ],
+  "language_model.model.layers.0.mlp.gate.scales": [
+   256,
+   48
+  ],
+  "language_model.model.layers.0.mlp.gate.weight": [
+   256,
+   384
+  ],
+  "language_model.model.layers.0.mlp.shared_expert.down_proj.biases": [
+   3072,
+   16
+  ],
+  "language_model.model.layers.0.mlp.shared_expert.down_proj.scales": [
+   3072,
+   16
+  ],
+  "language_model.model.layers.0.mlp.shared_expert.down_proj.weight": [
+   3072,
+   128
+  ],
+  "language_model.model.layers.0.mlp.shared_expert.gate_proj.biases": [
+   1024,
+   48
+  ],
+  "language_model.model.layers.0.mlp.shared_expert.gate_proj.scales": [
+   1024,
+   48
+  ],
+  "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight": [
+   1024,
+   384
+  ],
+  "language_model.model.layers.0.mlp.shared_expert.up_proj.biases": [
+   1024,
+   48
+  ],
+  "language_model.model.layers.0.mlp.shared_expert.up_proj.scales": [
+   1024,
+   48
+  ],
+  "language_model.model.layers.0.mlp.shared_expert.up_proj.weight": [
+   1024,
+   384
+  ],
+  "language_model.model.layers.0.mlp.shared_expert_gate.biases": [
+   1,
+   48
+  ],
+  "language_model.model.layers.0.mlp.shared_expert_gate.scales": [
+   1,
+   48
+  ],
+  "language_model.model.layers.0.mlp.shared_expert_gate.weight": [
+   1,
+   384
+  ],
+  "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases": [
+   256,
+   3072,
+   16
+  ],
+  "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales": [
+   256,
+   3072,
+   16
+  ],
+  "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight": [
+   256,
+   3072,
+   128
+  ],
+  "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": [
+   256,
+   1024,
+   48
+  ],
+  "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": [
+   256,
+   1024,
+   48
+  ],
+  "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": [
+   256,
+   1024,
+   384
+  ],
+  "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases": [
+   256,
+   1024,
+   48
+  ],
+  "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales": [
+   256,
+   1024,
+   48
+  ],
+  "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": [
+   256,
+   1024,
+   384
+  ]
+ }
+}

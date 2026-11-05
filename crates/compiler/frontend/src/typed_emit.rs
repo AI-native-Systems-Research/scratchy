@@ -162,9 +162,9 @@ pub fn emit(c: &Carrier<'_>, base_bounds: &mut BTreeSet<String>) -> Result<Strin
         let field = field_name(path);
         // A bundle: one field per role, each at its derived shape.
         let typed: Vec<(String, &crate::dim::Shape)> = match bundles.get(&dotted) {
-            Some(bundle) => (bundle.kind.roles().into_iter())
+            Some(bundle) => (bundle.kind.roles().iter())
                 .zip(&bundle.roles)
-                .map(|(role, shape)| (format!("{field}_{role}"), shape))
+                .map(|(role, shape)| (format!("{field}_{}", role.name()), shape))
                 .collect(),
             None => {
                 let declared = c.manifest.lookup(path).ok_or_else(|| {
@@ -707,19 +707,18 @@ impl Cx<'_, '_> {
                     // A bundle is its kind's constructor over its roles: its signature relates
                     // them. It is no weight of the program's (its roles are the checkpoint's).
                     Some(bundle) => {
-                        use crate::bundles::BundleArg;
-                        let roles = |roles: &[&str]| -> Vec<String> {
-                            roles.iter().map(|r| format!("w.{field}_{r}")).collect()
-                        };
-                        let args: Vec<String> = (bundle.kind.args().iter())
+                        use crate::bundles::{BundleArg, BundleRole, args, constructor};
+                        let role = |r: &BundleRole| format!("w.{field}_{}", r.name());
+                        let args: Vec<String> = (args(bundle.kind).iter())
                             .map(|arg| match arg {
-                                BundleArg::Role(role) => format!("w.{field}_{role}"),
+                                BundleArg::Role(r) => role(r),
                                 BundleArg::Part(ctor, parts) => {
-                                    format!("ops::{ctor}({})", roles(parts).join(", "))
+                                    let parts: Vec<String> = parts.iter().map(role).collect();
+                                    format!("ops::{ctor}({})", parts.join(", "))
                                 }
                             })
                             .collect();
-                        format!("ops::{}({})", bundle.kind.name(), args.join(", "))
+                        format!("ops::{}({})", constructor(bundle.kind), args.join(", "))
                     }
                     None => format!("tr.weight({}, w.{field})", id.0),
                 }

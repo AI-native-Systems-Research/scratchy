@@ -825,13 +825,15 @@ impl BundleDims {
                 accessor.name
             )
         });
-        let role = |name: &str| -> Option<Vec<usize>> {
-            let at = bundle.kind.roles().iter().position(|r| *r == name)?;
+        use crate::bundles::BundleRole as R;
+        let role = |role: R| -> Option<Vec<usize>> {
+            let at = bundle.kind.roles().iter().position(|r| *r == role)?;
             let dims = (bundle.roles[at].iter())
                 .map(|d| {
                     let v = crate::shape::eval_closed_dim(d, &model.bounds).unwrap_or_else(|| {
                         panic!(
-                            "`{path}.{name}`: {d:?} names a bound `{}` lacks",
+                            "`{path}.{}`: {d:?} names a bound `{}` lacks",
+                            role.name(),
                             model.source_stem
                         )
                     });
@@ -842,9 +844,12 @@ impl BundleDims {
         };
         let pair = |s: Vec<usize>| (s[0], s[1]);
         Self {
-            router: role("router").or_else(|| role("proj")).map(pair),
-            bank: role("up").map(|s| (s[0], s[1], s[2])),
-            shared: role("shared_gate").map(|s| s[1]),
+            router: (role(R::Router))
+                .or_else(|| role(R::GptOssRouter))
+                .or_else(|| role(R::Proj))
+                .map(pair),
+            bank: role(R::Up).map(|s| (s[0], s[1], s[2])),
+            shared: role(R::SharedGate).map(|s| s[1]),
         }
     }
 
