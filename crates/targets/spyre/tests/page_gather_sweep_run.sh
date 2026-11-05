@@ -49,7 +49,13 @@ TREE=$2
 LOG=$3
 # ROOT/TREE/LOG go in as POSITIONAL args — never spliced into the single-quoted body (a splice
 # of only some of them leaves the rest unset inside, and the runner once walked an empty ROOT).
+# The runner own identity, logged in the verdict-log header — its git sha and its own md5,
+# SEPARATE from the cells' dump sha the verdict lines carry.
+RUNNER_SHA=$(git -C "$(dirname "$0")" rev-parse --short HEAD 2>/dev/null || echo unknown)
+RUNNER_MD5=$(md5sum < "$0" 2>/dev/null | cut -c1-32 || echo unknown)
+echo "# RUNNER sha=$RUNNER_SHA md5=$RUNNER_MD5 argv=$*" >> "$LOG"
 exec flock /work/.spyre-bake.lock bash -c '
+set -uo pipefail
 ROOT=$1; TREE=$2; LOG=$3
 export PATH=/work/.cargo/bin:$PATH
 export LD_LIBRARY_PATH=/opt/ibm/spyre/senlib/lib:/opt/ibm/spyre/runtime/lib:/opt/ibm/spyre/deeptools/lib
@@ -222,27 +228,46 @@ else:
 PY
 }
 
-find "$ROOT" -mindepth 1 -maxdepth 1 -type d 2>&1 | sort | while read -r c; do run_cell "$c"; done
+# ⛔ THE CELL LIST, BUILT ONCE — the run loop and the count read the SAME list, and a ROOT
+# that is not a dir or holds no cell dirs fails HERE, before anything runs.
+[ -d "$ROOT" ] || { echo "PAGE_GATHER_SWEEP_RUN_INCOMPLETE — not a dir: $ROOT" >&2; exit 1; }
+cell_list=$(find "$ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
+if [ -z "$cell_list" ]; then
+  echo "PAGE_GATHER_SWEEP_RUN_INCOMPLETE — no cell dirs in $ROOT" >&2
+  exit 1
+fi
+echo "$cell_list" | while read -r c; do run_cell "$c"; done
 
 # ⛔ A VERDICT OVER NOTHING FAILS: no DONE unless every cell dir holds a bundle and every
-# bundle carries a verdict line. Printed counts: VERDICTS=<distinct verdicted runnable cells>
-# CELLS=<cells with group_0> MISSING=<cell dirs with no bundle> TOTAL=<all cell dirs>.
-cells=0; runnable=0; missing=0; verdicts=0
-for c in "$ROOT"/*/; do
-  [ -d "$c" ] || continue
-  cells=$((cells + 1))
-  if [ -d "$c/group_0" ]; then
-    runnable=$((runnable + 1))
-    if grep -q "^VERDICT $(basename "$c") " "$LOG" 2>/dev/null; then
-      verdicts=$((verdicts + 1))
-    fi
-  else
+# bundle holds a PASS at ITS OWN STAMP (sha + group_0 md5 — a stale line from another sha or
+# another dump counts for nothing; only PASS is success). Kinds are counted per cell from the
+# LAST verdict line at its stamp.
+pass=0; firstwrong=0; notrun=0; fenced=0; runnable=0; missing=0; total=0
+for c in $cell_list; do
+  total=$((total + 1))
+  if [ ! -d "$c/group_0" ]; then
     missing=$((missing + 1))
+    continue
   fi
+  runnable=$((runnable + 1))
+  eval "$(python3 - "$c" <<"PY"
+import json, sys
+c = json.load(open(sys.argv[1] + "/cell.json"))
+print("stamp=sha=%s md5=%s" % (c["sha"], c["group_0_md5"]))
+PY
+)"
+  name=$(basename "$c")
+  kind=$(grep "^VERDICT $name " "$LOG" 2>/dev/null | grep -F "$stamp" | tail -1 | awk "{print \$3}")
+  case "$kind" in
+    PASS) pass=$((pass + 1));;
+    FIRST-WRONG) firstwrong=$((firstwrong + 1));;
+    NOT-RUN) notrun=$((notrun + 1));;
+    FENCED) fenced=$((fenced + 1));;
+  esac
 done
-echo "VERDICTS=$verdicts CELLS=$runnable MISSING=$missing TOTAL=$cells"
-if [ "$cells" -eq 0 ] || [ "$missing" -gt 0 ] || [ "$verdicts" -lt "$runnable" ]; then
-  echo "PAGE_GATHER_SWEEP_RUN_INCOMPLETE — a verdict over nothing FAILS" >&2
+echo "PASS=$pass FIRST-WRONG=$firstwrong NOT-RUN=$notrun FENCED=$fenced CELLS=$runnable MISSING=$missing TOTAL=$total"
+if [ "$missing" -gt 0 ] || [ "$pass" -lt "$runnable" ]; then
+  echo "PAGE_GATHER_SWEEP_RUN_INCOMPLETE — every runnable cell needs a PASS at its own stamp" >&2
   exit 1
 fi
 echo PAGE_GATHER_SWEEP_RUN_DONE
