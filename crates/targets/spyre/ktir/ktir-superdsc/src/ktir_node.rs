@@ -702,8 +702,6 @@ pub enum Scratch {
     GatheredRowMajor,
     /// The index run a chained gather copies per page.
     IndexRun,
-    /// The `i`th doubling of a piece-split gather's index.
-    ScaledIndex(u8),
     /// A head-major pair's stick-major blocks.
     HeadMajorBlocks,
     /// A head-major pair's middle frame.

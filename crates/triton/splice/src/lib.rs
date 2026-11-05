@@ -1440,7 +1440,7 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// A whole page gathered as ONE index entry (the prompt kernel's `k_pages.index_select(0,
 /// page_idx)`, every kv head) — 128 KB at 8 kv heads × 64 head dims, 256 KB at 128 — is gathered in
 /// one op, as torch-spyre's compiled prefill gathers it
-/// ([`ktir_superdsc::ir::bridge::tiled_op_sdsc_op::page_gather_page_opspec`]).
+/// ([`ktir_superdsc::ir::bridge::tiled_op_sdsc_op::index_select_opspec`]).
 pub const PAGE_SLOTS: u32 = 128;
 
 /// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
@@ -5341,8 +5341,8 @@ mod walk_on_the_card {
                 .expect("one dsc");
             assert_eq!(
                 dsc["N_"],
-                serde_json::json!({"name_": "n", "mb_": 8, "x_": PAGE_SLOTS, "out_": 128, "y_": 1}),
-                "{}: one [BLOCK, 128] block an entry",
+                serde_json::json!({"name_": "n", "mb_": 8, "y_": 1, "x_": PAGE_SLOTS, "out_": 128}),
+                "{}: one [BLOCK, 128] block an entry — the one op's `blocks == 1` case",
                 e.op_name
             );
             assert_eq!(
@@ -5360,11 +5360,12 @@ mod walk_on_the_card {
             assert_eq!(
                 orders,
                 [
-                    &serde_json::json!(["out", "x", "mb", "y"]),
+                    &serde_json::json!(["out", "x", "y", "mb"]),
                     &serde_json::json!(["mb"]),
-                    &serde_json::json!(["x", "out", "mb", "y"]),
+                    &serde_json::json!(["x", "out", "y", "mb"]),
                 ],
-                "{}: the page read row-major through its index, landed stick-major",
+                "{}: the page read row-major through its index, landed stick-major — at one block \
+                 an entry the one op's orders, the same bytes the split form's spelled",
                 e.op_name
             );
         }

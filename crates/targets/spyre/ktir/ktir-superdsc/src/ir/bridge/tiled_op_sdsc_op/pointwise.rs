@@ -748,202 +748,57 @@ pub fn assemble_page_gather_copy(
         .map_err(|e| format!("assemble_page_gather_copy {op_name}: {e}"))
 }
 
-/// What a [`page_gather_blocks_opspec`] moves: `entries` index entries, each one `[rows, cols]` block
-/// of the gathered value, landed `dst_elems` into the destination.
+/// What an [`index_select_opspec`] moves: `entries` index entries, each `blocks` row-major
+/// `[rows, cols]` blocks of the gathered value, landed `dst_elems` into the destination.
 #[derive(Clone, Copy, Debug)]
-pub struct PageGatherBlocks {
+pub struct IndexSelectPage {
     pub entries: u32,
+    pub blocks: u32,
     pub rows: u32,
     pub cols: u32,
     pub dst_elems: u32,
 }
 
-/// ⭐ torch-spyre's PAGE GATHER INTO STICK-MAJOR BLOCKS — `identity` over `N_ {mb: entries, x: rows,
-/// out: cols, y: 1}`, `mb` split one whole entry a core, each entry one `[rows, cols]` block of the
-/// gathered value. The value is read row-major (`['out','x','mb','y']` innermost-first: a row's
-/// sticks together, the paged cache's row-outermost block) and the block lands stick-major
-/// (`['x','out','mb','y']`: stick column `c`'s `rows` rows together), so a block several sticks wide
-/// is relaid by the gather itself. The reference's compiled decode trip gathers each kv head's page
-/// so, one head a core, straight into the LX its Kᵀ restickify and its value contraction read
-/// (`numWkSlicesPerDim_ {mb: 8}`, `Tensor1 ['out','x','mb','y']`, `Tensor2 ['x','out','mb','y']`).
+/// ⭐ THE ONE GATHER — `index_select` over a paged cache's folded dim 0 (the reference's
+/// `page_attn_head_major_prefill.py`: `kv.index_select(0, page_ids)`), for ANY entry size, page
+/// count and head width. An `identity` over `N_ {mb: entries, y: blocks, x: rows, out: cols}`,
+/// the index on `mb` (one position an entry, so `skip_addr` is the entry's whole `y·x·out`
+/// plane): one entry on one core as the reference's compiled gathers are (its `sdsc_4` /
+/// `sdsc_5`: `N_ {mb: 8, x: 128, y: 128, out: 1, i: 1}`, the index on the size-one `i`,
+/// `numWkSlicesPerDim_ {}`), and several entries (a decode batch's chunk) one a core. The value
+/// is read as the reference reads it — row-major, `['out','x','y','mb']` innermost-first — and
+/// each `[rows, cols]` block lands stick-major (`['x','out','y','mb']`), one after another, the
+/// frame the trip's batched restickify and contractions read a block of at its base.
 ///
-/// One entry is one `mb` position ([`GatherIndex::page`] 1), so `skip_addr` is the unpinned `x·out`:
-/// one block. Only `mb` is split ([`gather_copy_cores`]'s law).
-pub fn page_gather_blocks_opspec(
+/// The landing is HBM, so no LX law bounds an entry's size. The ONE bound is the op's own index
+/// stick — `entries` ≤ [`crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP`] (32, one int32 stick) —
+/// which is this op's domain, not a device refusal: the walk composes around it by chunking
+/// (one op a run of entries, each at its own [`crate::superdsc_opspec::EntryBase`] and
+/// `dst_elems` landing offset), never by refusing an entry count.
+pub fn index_select_opspec(
     src: &str,
     dst: &str,
     gather: crate::superdsc_opspec::GatherIndex,
-    PageGatherBlocks {
-        entries,
-        rows,
-        cols,
-        dst_elems,
-    }: PageGatherBlocks,
-) -> Result<OpSpec, String> {
-    let df = Df::Fp16;
-    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
-    if gather.page.get() != 1 {
-        return Err(format!(
-            "page_gather_blocks_opspec('{src}' -> '{dst}'): an entry is one `mb` position — one \
-             [{rows}, {cols}] block — and the index states {} positions an entry",
-            gather.page.get()
-        ));
-    }
-    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-    if entries == 0 || entries > cap || rows == 0 {
-        return Err(format!(
-            "page_gather_blocks_opspec('{src}' -> '{dst}'): {entries} entries of {rows} rows — one \
-             op gathers one to {cap} whole blocks (its index is one stick)"
-        ));
-    }
-    let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
-        name,
-        size,
-        is_reduction: false,
-        is_stick,
-        df,
-    };
-    let dims = [
-        dim("mb", entries, false),
-        dim("x", rows, false),
-        dim("out", cols, true),
-        dim("y", 1, false),
-    ];
-    let plan = crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |d, max| {
-        gather_copy_cores(d, max, 1)
-    })?;
-    let layout = ["y", "mb", "x", "out"];
-    let arg = |is_input: bool,
-               name: &str,
-               device: [&'static str; 4],
-               frame: crate::superdsc_opspec::ViewFrame|
-     -> Result<_, String> {
-        Ok(AnyTensorArg::R4(
-            TensorArg::<4>::new(
-                is_input,
-                name.to_string(),
-                Role::Output,
-                [Scale::Active; 4],
-                plan.iter_syms(layout),
-                layout,
-                "out",
-                Allocation::Hbm,
-            )
-            .map_err(|e| e.0)?
-            .with_device_order(device)
-            .map_err(|e| e.0)?
-            .with_frame(frame),
-        ))
-    };
-    // ⭐ THE LANDING'S OWN FRAME — a landing of ONE block several sticks wide is stick-major
-    // blocks, and the arrangement authority records the ONE stick-major [rows, cols] it tiles
-    // ([`ViewFrame::LandedBlocks`]), not a flat frame the bytes are not in. A landing of
-    // SEVERAL blocks is NOT stated by any stick layout — its bytes are blocks-one-after-another,
-    // a frame the walk carries as `batch_blocks` / `BatchFrame::Blocks` — so it keeps
-    // [`ViewFrame::Own`]: stamping it `LandedBlocks` would declare the batched transpose's read
-    // of it wrong, and the arrangement authority refuses the conflict. A one-stick landing is
-    // the flat frame's own bytes and also stays [`ViewFrame::Own`]. The frame changes the
-    // DECLARATION only — the landing's per-core starts stay its blocks, as the pinned start
-    // test states.
-    let landed = |cols: u32| -> crate::superdsc_opspec::ViewFrame {
-        if entries == 1 && cols > df.elems_per_stick() {
-            crate::superdsc_opspec::ViewFrame::LandedBlocks
-        } else {
-            crate::superdsc_opspec::ViewFrame::Own
-        }
-    };
-    let args = vec![
-        arg(
-            true,
-            src,
-            ["out", "x", "mb", "y"],
-            crate::superdsc_opspec::ViewFrame::Own,
-        )?,
-        arg(false, dst, ["x", "out", "mb", "y"], landed(cols))?,
-    ];
-    let mut op = OpSpec {
-        op: OpFunc::Identity,
-        is_reduction: false,
-        iter: plan,
-        args,
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    };
-    op.attach_gather_index(gather, 0).ok_or_else(|| {
-        format!(
-            "page_gather_blocks_opspec('{src}' -> '{dst}'): the index declaration does not fit this \
-             op — its dims are [mb, x, out, y], so the paged axis must be `mb`"
-        )
-    })?;
-    if dst_elems > 0
-        && let Some(o) = op.args.last_mut()
-    {
-        o.set_offset_elems(dst_elems);
-    }
-    Ok(op)
-}
-
-/// [`page_gather_blocks_opspec`] + `emit_sdsc_tiled`.
-pub fn assemble_page_gather_blocks(
-    op_name: &str,
-    src: &str,
-    dst: &str,
-    gather: crate::superdsc_opspec::GatherIndex,
-    blocks: PageGatherBlocks,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
-    let op = page_gather_blocks_opspec(src, dst, gather, blocks)?;
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .map_err(|e| format!("assemble_page_gather_blocks {op_name}: {e}"))
-}
-
-/// The pages of a [`page_gather_page_opspec`]: `entries` pages, each `blocks` row-major `[rows, cols]`
-/// blocks one after another (a paged cache's page of `blocks` kv heads).
-#[derive(Clone, Copy, Debug)]
-pub struct PageOfBlocks {
-    pub entries: u32,
-    pub blocks: u32,
-    pub rows: u32,
-    pub cols: u32,
-}
-
-/// ⭐ torch-spyre's PROMPT-TRIP PAGE GATHER — the whole page in ONE op, its one index entry selecting
-/// the page and every kv head's block of it read inside the op (the reference's compiled prefill,
-/// `sdsc_4` / `sdsc_5`: `N_ {mb: 8, x: 128, y: 128, out: 1, i: 1}`, the index on the size-one `i`,
-/// `numWkSlicesPerDim_ {}`). Here an `identity` over `N_ {mb: entries, y: blocks, x: rows, out: cols}`,
-/// the index on `mb` (one position an entry, so `skip_addr` is the whole page, `y·x·out`): one entry
-/// on one core as the reference's is, and several pages (a decode batch's chunk) one a core. The value is read as the reference reads it — row-major,
-/// `['out','x','y','mb']` innermost-first (its `['y','x','mb','out','i']`) — and lands one kv head's
-/// block after another, each stick-major (`['x','out','y','mb']`), the frame the trip's batched
-/// restickify and contractions read a block of at its base.
-pub fn page_gather_page_opspec(
-    src: &str,
-    dst: &str,
-    gather: crate::superdsc_opspec::GatherIndex,
-    PageOfBlocks {
+    IndexSelectPage {
         entries,
         blocks,
         rows,
         cols,
-    }: PageOfBlocks,
+        dst_elems,
+    }: IndexSelectPage,
 ) -> Result<OpSpec, String> {
     let df = Df::Fp16;
     crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
     let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
     if entries == 0 || entries > cap {
         return Err(format!(
-            "page_gather_page_opspec('{src}' -> '{dst}'): {entries} pages — one op gathers one to \
-             {cap} (its index is one stick)"
+            "index_select_opspec('{src}' -> '{dst}'): {entries} entries — one op gathers one to \
+             {cap} (its index is one stick); the walk chunks past it"
         ));
     }
     if gather.page.get() != 1 || blocks == 0 || rows == 0 {
         return Err(format!(
-            "page_gather_page_opspec('{src}' -> '{dst}'): one entry is one page of {blocks} \
+            "index_select_opspec('{src}' -> '{dst}'): one entry is one page of {blocks} \
              [{rows}, {cols}] blocks — one `mb` position — and the index states {} positions an \
              entry",
             gather.page.get()
@@ -988,13 +843,13 @@ pub fn page_gather_page_opspec(
             .with_frame(frame),
         ))
     };
-    // ⭐ THE LANDING'S OWN FRAME — same law as the blocks arm above: a landing of ONE block
-    // (entries·blocks == 1) several sticks wide lands stick-major and the authority records the
-    // ONE stick-major [rows, cols] it tiles. A landing of SEVERAL blocks is NOT stated by any
-    // stick layout — its bytes are blocks-one-after-another, a frame the walk carries as
-    // `batch_blocks` / `BatchFrame::Blocks` — so it keeps [`ViewFrame::Own`]: stamping it
-    // `LandedBlocks` would declare the batched transpose's read of it wrong, and the arrangement
-    // authority refuses the conflict.
+    // ⭐ THE LANDING'S OWN FRAME — a landing of ONE block (entries·blocks == 1) several sticks
+    // wide lands stick-major and the authority records the ONE stick-major [rows, cols] it
+    // tiles. A landing of SEVERAL blocks is NOT stated by any stick layout — its bytes are
+    // blocks-one-after-another, a frame the walk carries as `batch_blocks` / `BatchFrame::Blocks`
+    // — so it keeps [`ViewFrame::Own`]: stamping it `LandedBlocks` would declare the batched
+    // transpose's read of it wrong, and the arrangement authority refuses the conflict. The
+    // frame changes the DECLARATION only — the landing's per-core starts stay its blocks.
     let landed = |cols: u32| -> crate::superdsc_opspec::ViewFrame {
         if entries * blocks == 1 && cols > df.elems_per_stick() {
             crate::superdsc_opspec::ViewFrame::LandedBlocks
@@ -1024,27 +879,32 @@ pub fn page_gather_page_opspec(
     };
     op.attach_gather_index(gather, 0).ok_or_else(|| {
         format!(
-            "page_gather_page_opspec('{src}' -> '{dst}'): the index declaration does not fit this \
+            "index_select_opspec('{src}' -> '{dst}'): the index declaration does not fit this \
              op — its dims are [mb, y, x, out], so the paged axis must be `mb`"
         )
     })?;
+    if dst_elems > 0
+        && let Some(o) = op.args.last_mut()
+    {
+        o.set_offset_elems(dst_elems);
+    }
     Ok(op)
 }
 
-/// [`page_gather_page_opspec`] + `emit_sdsc_tiled`.
-pub fn assemble_page_gather_page(
+/// [`index_select_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_index_select(
     op_name: &str,
     src: &str,
     dst: &str,
     gather: crate::superdsc_opspec::GatherIndex,
-    page: PageOfBlocks,
+    page: IndexSelectPage,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp, String> {
-    let op = page_gather_page_opspec(src, dst, gather, page)?;
+    let op = index_select_opspec(src, dst, gather, page)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .map_err(|e| format!("assemble_page_gather_page {op_name}: {e}"))
+        .map_err(|e| format!("assemble_index_select {op_name}: {e}"))
 }
 
 /// What a [`expand_blocks_opspec`] copies: `batch` stick-major `[rows, cols]` blocks, each `group`
@@ -2226,7 +2086,7 @@ mod stick_runs_tests {
 }
 
 #[cfg(test)]
-mod page_gather_blocks_tests {
+mod index_select_tests {
     use super::*;
     use crate::place::{PlaceId, act_name};
     use crate::sdsc_abstract::StickLayout;
@@ -2242,15 +2102,16 @@ mod page_gather_blocks_tests {
             PageExtent::of_positions(1),
             EntryBase::ZERO,
         );
-        let op = page_gather_page_opspec(
+        let op = index_select_opspec(
             "Tensor0",
             "Tensor1",
             gather,
-            PageOfBlocks {
+            IndexSelectPage {
                 entries: 1,
                 blocks: 8,
                 rows: 128,
                 cols: 128,
+                dst_elems: 0,
             },
         )
         .expect("the page gather builds");
@@ -2291,7 +2152,7 @@ mod page_gather_blocks_tests {
     }
 
     fn pages(entries: u32) -> Result<OpSpec, String> {
-        page_gather_page_opspec(
+        index_select_opspec(
             "Tensor0",
             "Tensor1",
             GatherIndex::of_scratch_rows(
@@ -2299,11 +2160,12 @@ mod page_gather_blocks_tests {
                 PageExtent::of_positions(1),
                 EntryBase::ZERO,
             ),
-            PageOfBlocks {
+            IndexSelectPage {
                 entries,
                 blocks: 8,
                 rows: 128,
                 cols: 64,
+                dst_elems: 0,
             },
         )
     }
@@ -2329,16 +2191,18 @@ mod page_gather_blocks_tests {
     }
 
     /// One op's index is one 32-word stick: a chunk of 32 pages gathers in one op, and 33 is refused
-    /// by name — never handed to a copy form the card has not run.
+    /// by name — the walk's chunking composes around the cap, so nothing past it reaches a form the
+    /// card has not run.
     #[test]
-    fn more_pages_than_one_index_stick_are_refused() {
+    fn more_entries_than_one_index_stick_are_refused() {
         assert!(pages(32).is_ok(), "32 pages, one index stick");
         let e = pages(33).expect_err("33 pages");
-        assert!(e.contains("33 pages"), "{e}");
+        assert!(e.contains("33 entries"), "{e}");
     }
 
     /// ⭐ THE REFERENCE's K PAGE GATHER (granite-3.1-8b's decode trip, `sdsc_6`): eight kv heads'
-    /// `[128, 128]` blocks, one a core, read row-major and landed stick-major.
+    /// `[128, 128]` blocks, one a core, read row-major and landed stick-major — the
+    /// one-block-an-entry frame, the `blocks == 1` case of the one op.
     #[test]
     fn the_gather_lands_each_entrys_block_stick_major() {
         let gather = GatherIndex::of_scratch_rows(
@@ -2346,12 +2210,13 @@ mod page_gather_blocks_tests {
             PageExtent::of_positions(1),
             EntryBase::ZERO,
         );
-        let op = page_gather_blocks_opspec(
+        let op = index_select_opspec(
             "Tensor0",
             "Tensor1",
             gather,
-            PageGatherBlocks {
+            IndexSelectPage {
                 entries: 8,
+                blocks: 1,
                 rows: 128,
                 cols: 128,
                 dst_elems: 0,
@@ -2363,13 +2228,13 @@ mod page_gather_blocks_tests {
         let v = serde_json::to_value(&sdsc).expect("the op serializes");
         assert_eq!(
             v["numWkSlicesPerDim_"],
-            serde_json::json!({"mb": 8, "x": 1, "out": 1, "y": 1}),
+            serde_json::json!({"mb": 8, "y": 1, "x": 1, "out": 1}),
             "one entry a core"
         );
         let dsc = &v["dscs_"][0]["gather_o1"];
         assert_eq!(
             dsc["N_"],
-            serde_json::json!({"name_": "n", "mb_": 8, "x_": 128, "out_": 128, "y_": 1})
+            serde_json::json!({"name_": "n", "mb_": 8, "y_": 1, "x_": 128, "out_": 128})
         );
         let alloc: Vec<&serde_json::Value> = dsc["scheduleTree_"]
             .as_array()
@@ -2386,15 +2251,10 @@ mod page_gather_blocks_tests {
         assert_eq!(
             side(0),
             (
-                serde_json::json!(["out", "x", "mb", "y"]),
+                serde_json::json!(["out", "x", "y", "mb"]),
                 serde_json::json!("value_tensor")
             ),
             "the page read row-major, a row's two sticks together"
-        );
-        assert_eq!(
-            alloc[0]["maxDimSizes_"],
-            serde_json::json!([-1, -1, 1, -1]),
-            "one `mb` position an entry: skip_addr is one block"
         );
         assert_eq!(
             side(1),
@@ -2403,7 +2263,7 @@ mod page_gather_blocks_tests {
         assert_eq!(
             side(2),
             (
-                serde_json::json!(["x", "out", "mb", "y"]),
+                serde_json::json!(["x", "out", "y", "mb"]),
                 serde_json::json!("no_indirection")
             ),
             "each block landed stick-major, a stick column's rows together"
@@ -2427,7 +2287,7 @@ mod page_gather_blocks_tests {
         }
     }
 
-    /// An entry is one block, so an index stating several positions an entry is refused.
+    /// An entry is one `mb` position, so an index stating several positions an entry is refused.
     #[test]
     fn an_entry_of_several_positions_is_refused() {
         let gather = GatherIndex::of_scratch_rows(
@@ -2435,16 +2295,55 @@ mod page_gather_blocks_tests {
             PageExtent::of_positions(2),
             EntryBase::ZERO,
         );
-        let blocks = PageGatherBlocks {
+        let blocks = IndexSelectPage {
             entries: 8,
+            blocks: 1,
             rows: 128,
             cols: 128,
             dst_elems: 0,
         };
-        let Err(m) = page_gather_blocks_opspec("Tensor0", "Tensor1", gather, blocks) else {
+        let Err(m) = index_select_opspec("Tensor0", "Tensor1", gather, blocks) else {
             panic!("an entry of two positions is two blocks' worth of one");
         };
         assert!(m.contains("one `mb` position"), "{m}");
+    }
+
+    /// ⭐ A CHUNK LANDS AT ITS OFFSET — the walk chunks entries past one index stick, and each
+    /// chunk's op lands `dst_elems` into the SAME destination: its destination binding starts
+    /// exactly that many elements in, so the chunks tile the landing with no permute and no copy
+    /// between them.
+    #[test]
+    fn a_chunk_lands_at_its_dst_elems_offset() {
+        let l = gathered(8, 128, 128);
+        let dst_offset = |entries: u32, dst_elems: u32| -> u32 {
+            let mut sym = 0i64;
+            let op = assemble_index_select(
+                "gather_o1",
+                &act_name(1),
+                &act_name(2),
+                index(),
+                IndexSelectPage {
+                    entries,
+                    blocks: 1,
+                    rows: 128,
+                    cols: 128,
+                    dst_elems,
+                },
+                &mut sym,
+                Some(&l),
+            )
+            .expect("the chunk gather builds");
+            op.arg_bindings
+                .last()
+                .expect("a destination binding")
+                .offset_elems
+        };
+        assert_eq!(dst_offset(8, 0), 0, "the first chunk lands at the base");
+        assert_eq!(
+            dst_offset(1, 7 * 128 * 128),
+            7 * 128 * 128,
+            "the last chunk lands seven blocks of entries in, inside the same landing"
+        );
     }
 
     /// The layout a gather emits into: the pool `t1`, the landing `t2`, the index stick `t9` —
@@ -2462,27 +2361,28 @@ mod page_gather_blocks_tests {
         GatherIndex::of_scratch_rows(act_name(9), PageExtent::of_positions(1), EntryBase::ZERO)
     }
 
-    /// ⭐ THE LANDING'S OWN FRAME (blocks arm) — the measured law, both halves. A wide landing
-    /// of ONE block is stick-major and the authority records the stick-major `[r, c]` it is. A
-    /// wide landing of SEVERAL blocks is NOT stated by any stick layout — its bytes are
-    /// blocks-one-after-another, a frame the walk carries as `batch_blocks` / `BatchFrame::Blocks`
-    /// — so it keeps the view's own flat frame: stamping it stick-major would contradict the
-    /// batched transpose's read of the same tensor, and the authority refuses the conflict. These
-    /// two tests were first added on the premise that no reader distinguishes the several-block
-    /// landing's bytes; the splice walks falsified that premise — the reader is the authority's
-    /// own conflict check — and they now pin the measured law. A correction, not a weakening.
+    /// ⭐ THE LANDING'S OWN FRAME — the measured law, both halves. A wide landing of ONE block is
+    /// stick-major and the authority records the stick-major `[r, c]` it is. A wide landing of
+    /// SEVERAL blocks is NOT stated by any stick layout — its bytes are blocks-one-after-another,
+    /// a frame the walk carries as `batch_blocks` / `BatchFrame::Blocks` — so it keeps the view's
+    /// own flat frame: stamping it stick-major would contradict the batched transpose's read of
+    /// the same tensor, and the authority refuses the conflict. These two tests were first added
+    /// on the premise that no reader distinguishes the several-block landing's bytes; the splice
+    /// walks falsified that premise — the reader is the authority's own conflict check — and they
+    /// now pin the measured law. A correction, not a weakening.
     #[test]
     fn a_wide_blocks_landing_declares_the_stick_major_frame_of_its_blocks() {
         // ONE block, two sticks wide: the (4, 1, 128) case itself — stick-major, declared so.
         let l = gathered(1, 128, 128);
         let mut sym = 0i64;
-        assemble_page_gather_blocks(
+        assemble_index_select(
             "gather_o1",
             &act_name(1),
             &act_name(2),
             index(),
-            PageGatherBlocks {
+            IndexSelectPage {
                 entries: 1,
+                blocks: 1,
                 rows: 128,
                 cols: 128,
                 dst_elems: 0,
@@ -2505,13 +2405,14 @@ mod page_gather_blocks_tests {
         // declaration it must NOT make is the authority's refusal.
         let l = gathered(8, 128, 128);
         let mut sym = 0i64;
-        assemble_page_gather_blocks(
+        assemble_index_select(
             "gather_o1",
             &act_name(1),
             &act_name(2),
             index(),
-            PageGatherBlocks {
+            IndexSelectPage {
                 entries: 8,
+                blocks: 1,
                 rows: 128,
                 cols: 128,
                 dst_elems: 0,
@@ -2533,19 +2434,20 @@ mod page_gather_blocks_tests {
         );
     }
 
-    /// ⭐ THE LANDING'S OWN FRAME (blocks arm, ONE BLOCK) — the (4, 1, 128) case itself: one
-    /// entry's block, two sticks wide, still declared the stick-major `[r, c]` frame of its block.
+    /// ⭐ THE LANDING'S OWN FRAME (ONE BLOCK) — the (4, 1, 128) case itself: one entry's block,
+    /// two sticks wide, still declared the stick-major `[r, c]` frame of its block.
     #[test]
     fn one_blocks_landing_two_sticks_wide_declares_its_blocks_frame() {
         let l = gathered(1, 128, 128);
         let mut sym = 0i64;
-        assemble_page_gather_blocks(
+        assemble_index_select(
             "gather_o1",
             &act_name(1),
             &act_name(2),
             index(),
-            PageGatherBlocks {
+            IndexSelectPage {
                 entries: 1,
+                blocks: 1,
                 rows: 128,
                 cols: 128,
                 dst_elems: 0,
@@ -2560,26 +2462,28 @@ mod page_gather_blocks_tests {
         );
     }
 
-    /// ⭐ THE LANDING'S OWN FRAME (pages arm) — the same measured law through the first arm,
-    /// both halves: a wide landing of ONE block in total (`entries·blocks == 1`) declares the
-    /// stick-major `[r, c]` it is; a wide landing of SEVERAL blocks keeps the view's own flat
-    /// frame, its bytes blocks-one-after-another (a frame the walk carries as `batch_blocks` /
-    /// `BatchFrame::Blocks`), and the stick-major declaration is the authority's refusal.
+    /// ⭐ THE LANDING'S OWN FRAME (a page of several blocks) — the same measured law through the
+    /// page shape, both halves: a wide landing of ONE block in total (`entries·blocks == 1`)
+    /// declares the stick-major `[r, c]` it is; a wide landing of SEVERAL blocks keeps the view's
+    /// own flat frame, its bytes blocks-one-after-another (a frame the walk carries as
+    /// `batch_blocks` / `BatchFrame::Blocks`), and the stick-major declaration is the authority's
+    /// refusal.
     #[test]
     fn a_wide_page_landing_declares_the_stick_major_frame_of_its_blocks() {
         // ONE block in total: one entry, one block, two sticks wide — stick-major, declared so.
         let l = gathered(1, 128, 128);
         let mut sym = 0i64;
-        assemble_page_gather_page(
+        assemble_index_select(
             "gather_o1",
             &act_name(1),
             &act_name(2),
             index(),
-            PageOfBlocks {
+            IndexSelectPage {
                 entries: 1,
                 blocks: 1,
                 rows: 128,
                 cols: 128,
+                dst_elems: 0,
             },
             &mut sym,
             Some(&l),
@@ -2593,16 +2497,17 @@ mod page_gather_blocks_tests {
         // SEVERAL blocks: one entry, 8 blocks, two sticks wide — the view's own flat frame.
         let l = gathered(8, 128, 128);
         let mut sym = 0i64;
-        assemble_page_gather_page(
+        assemble_index_select(
             "gather_o1",
             &act_name(1),
             &act_name(2),
             index(),
-            PageOfBlocks {
+            IndexSelectPage {
                 entries: 1,
                 blocks: 8,
                 rows: 128,
                 cols: 128,
+                dst_elems: 0,
             },
             &mut sym,
             Some(&l),
@@ -2627,13 +2532,14 @@ mod page_gather_blocks_tests {
     fn a_one_stick_landing_keeps_the_flat_frame() {
         let l = gathered(8, 128, 64);
         let mut sym = 0i64;
-        assemble_page_gather_blocks(
+        assemble_index_select(
             "gather_o1",
             &act_name(1),
             &act_name(2),
             index(),
-            PageGatherBlocks {
+            IndexSelectPage {
                 entries: 8,
+                blocks: 1,
                 rows: 128,
                 cols: 64,
                 dst_elems: 0,
@@ -2666,16 +2572,16 @@ mod page_gather_blocks_tests {
         // anyway, exactly the disagreement the arm must refuse.
         let dims = [
             dim("mb", 2, false),
+            dim("y", 1, false),
             dim("x", 32, false),
             dim("out", 64, true),
-            dim("y", 1, false),
         ];
         let plan =
             crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |d, max| {
                 gather_copy_cores(d, max, 1)
             })
             .expect("the plan divides");
-        let layout = ["y", "mb", "x", "out"];
+        let layout = ["mb", "y", "x", "out"];
         let arg = |is_input: bool,
                    name: &str,
                    frame: crate::superdsc_opspec::ViewFrame|
@@ -2692,7 +2598,7 @@ mod page_gather_blocks_tests {
                     Allocation::Hbm,
                 )
                 .map_err(|e| e.0)?
-                .with_device_order(["x", "out", "mb", "y"])
+                .with_device_order(["x", "out", "y", "mb"])
                 .map_err(|e| e.0)?
                 .with_frame(frame),
             ))
