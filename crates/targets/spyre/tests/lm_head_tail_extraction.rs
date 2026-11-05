@@ -420,7 +420,7 @@ fn the_fold_refuses_a_width_collision_that_feeds_the_result_through_rope() {
         nodes.push(mk(
             1 + ri as usize,
             SubOp::RopeRotate {
-                head_dim: scratchy_subtile::model_geometry::HeadDim::new(hd),
+                head_dim: scratchy_ir::model_facts::HeadDim::new(hd),
                 _form: std::marker::PhantomData,
             },
             vec![row(4, ri), row(2, ri), row(3, ri)],

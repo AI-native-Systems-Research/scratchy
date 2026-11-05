@@ -701,7 +701,7 @@ mod tests {
             KernelId::RmsNorm | KernelId::FusedAddRmsNorm => {
                 crate::tape::kernel_constants::RmsNormConstants {
                     bucket_m: crate::tape::ids::BucketM(bucket_m),
-                    q_size: crate::tape::ids::QSize(base().q_width() as u32),
+                    q_size: crate::tape::ids::QSize(base().q_width()),
                     rms_norm_eps: crate::tape::ids::RmsNormEps(facts.eps().get()),
                     weight_offset: facts.norm_offset().get(),
                 }
@@ -710,12 +710,12 @@ mod tests {
             KernelId::FusedGateUpSiluMul if bucket_m == 1 => vec![
                 ConstantValue::uint(3, bucket_m),
                 ConstantValue::uint(4, intermediate()),
-                ConstantValue::uint(5, base().q_width() as u32),
+                ConstantValue::uint(5, base().q_width()),
             ],
             KernelId::FusedGateUpSiluMul => vec![
                 ConstantValue::uint(6, bucket_m),
                 ConstantValue::uint(7, intermediate()),
-                ConstantValue::uint(8, base().q_width() as u32),
+                ConstantValue::uint(8, base().q_width()),
             ],
             KernelId::Embed => vec![
                 ConstantValue::uint(0, bucket_m),

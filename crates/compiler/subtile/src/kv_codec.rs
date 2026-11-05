@@ -180,19 +180,24 @@ impl std::fmt::Display for KvCodecError {
 /// Insert `facts`' codec steps around every coded KV writer and attention of `l`.
 ///
 /// ⛔ A GEOMETRY THE KERNELS DO NOT TAKE CODES NOTHING: the op list comes back as it was.
+/// `attention` is the model's attention facts — a codec codes an attention's keys and values,
+/// so a body it runs on always has them; a body without attention holds no coded writer and
+/// comes back as it was.
 pub fn expand_kv_codec(
     l: &LoweredDecode,
     facts: &KvCodecFacts,
 ) -> Result<LoweredDecode, KvCodecError> {
     let ops = &l.input.ops;
-    // A writer states the model's base head dim, an attention its class's.
+    // A writer states the model's base head dim (the rope class's, off the op's
+    // own attention facts), an attention its class's.
     let mut dims: Vec<u32> = ops
         .iter()
         .filter_map(|od| match od.op {
-            SubOp::RopeAppend { head_dim, .. } | SubOp::KvAppend { head_dim, .. } => {
-                Some(head_dim.get())
-            }
-            SubOp::AttnDecode { geom, .. } => Some(geom.hd().get()),
+            SubOp::RopeAppend { .. } => od.op.rope_head_dim().map(|d| d.get()),
+            SubOp::KvAppend { head_dim, .. } => Some(head_dim.get()),
+            SubOp::AttnDecode {
+                mask, attention, ..
+            } => Some(attention.class(mask.class()).head_dim().get()),
             _ => None,
         })
         .collect();
@@ -511,7 +516,8 @@ impl Expander<'_> {
 mod tests {
     use super::*;
     use crate::fixtures::{
-        TURBOQUANT_SHAPED_CODEC as FACTS, front_end_lowered as lowered, one_layer_input_shaped,
+        TURBOQUANT_SHAPED_CODEC as FACTS, front_end_lowered as lowered, one_layer_attention,
+        one_layer_input_shaped,
     };
     use crate::lower::GemmWeight;
     use crate::subtile_ir::{EwKind, SourceShape};
@@ -536,8 +542,9 @@ mod tests {
     /// attention twinned onto them; off decode steps its K and V stage for the attention.
     #[test]
     fn an_unrotated_writer_encodes_its_cache_halves_alone() {
-        use crate::model_geometry::HeadDim;
         use crate::subtile_ir::AttnMask;
+        use scratchy_ir::model_facts::HeadDim;
+        let attention = one_layer_attention(256, 64, 64);
         let unrotated = |m: u32| {
             let mut input = one_layer_input_shaped(256, 64, 512, 64);
             // The query as projected; K and V written as projected.
@@ -547,7 +554,7 @@ mod tests {
                 inputs: vec![InputRef::Op(1)],
             };
             input.ops[5] = OpDesc {
-                op: SubOp::kv_append(HeadDim::new(64), 0, AttnMask::Causal),
+                op: SubOp::kv_append(attention, HeadDim::new(64), 0, AttnMask::Causal),
                 m,
                 inputs: vec![
                     InputRef::Op(2),
@@ -699,11 +706,13 @@ mod tests {
     #[test]
     fn a_writer_without_a_cache_reader_is_still_encoded() {
         let mut l = layer(64, 1);
-        let SubOp::AttnDecode { geom, scale, .. } = l.input.ops[6].op else {
+        let SubOp::AttnDecode { .. } = l.input.ops[6].op else {
             panic!("op 6 is the fixture's attention");
         };
         l.input.ops[6] = OpDesc {
-            op: SubOp::EncoderAttn { geom, scale },
+            op: SubOp::EncoderAttn {
+                attention: one_layer_attention(256, 64, 64),
+            },
             m: 1,
             inputs: vec![InputRef::Op(4), InputRef::Op(5), InputRef::Op(3)],
         };
@@ -735,7 +744,7 @@ mod tests {
     #[test]
     fn a_hybrid_arch_codes_its_declared_class_only() {
         let mut l = layer(64, 1);
-        let mut second = one_layer_input_shaped(256, 128, 512, 128);
+        let mut second = one_layer_input_shaped(512, 128, 512, 128);
         let (s0, o0) = (l.input.sources.len(), l.input.ops.len());
         let shift = |r: &mut InputRef| match r {
             InputRef::Op(j) => *j += o0,
@@ -753,6 +762,11 @@ mod tests {
         }
         l.input.sources.extend(second.sources);
         l.input.ops.extend(second.ops);
+        // The two classes' facts ride their own ops now: the 64-head layer's
+        // writer and attention carry its uniform trio, the 128-head sliding
+        // layer's its own — each op reads its class's geometry off itself, so
+        // the codec still sees the two head dims (64 Causal, 128 sliding) the
+        // hybrid's single threaded value used to state.
         let l = lowered(l.input);
         let x = expand_kv_codec(&l, &FACTS).expect("expands");
         let count = |name| x.input.ops.iter().filter(|od| od.op.name() == name).count();

@@ -10649,6 +10649,9 @@ fn fuf_row_local_tail_op(op: OpKind) -> bool {
 fn dump_wavefront_mega(
     program: &Program,
     model: &ModelParams,
+    // The model's facts (#1083): the one source of the attention geometry and scale this
+    // bake lowers by — resolved once below, never re-read from a config or a bound.
+    facts: &scratchy_ir::model_facts::ModelFacts,
     fuf: &Fuf,
     inferred: &crate::shape::Inferred,
     decode_bounds: &BTreeMap<String, u64>,
@@ -10661,6 +10664,16 @@ fn dump_wavefront_mega(
 ) {
     use crate::to_wavefront;
     let stem = model.source_stem.as_str();
+    // ⭐ THE MODEL'S ATTENTION FACTS ride the ops themselves now, minted once at the
+    // bridge: every consumer below (the rolls, the wiring, the SuperDSC lowering) reads
+    // the op's own value. A canonical stating no attention facts (a vision tower) holds
+    // no op that reads them — the bridge's one presence check refuses any that appear —
+    // so this bake needs no facts of its own.
+    // The config params and the typed facts are ONE model — the bridge takes them together.
+    let bridge = to_wavefront::BridgeModel {
+        params: model,
+        facts,
+    };
     // Structural prefix-KV-cache rows (== modeled valid_len). MUST be >= 1:
     // with 0 the cache Source is [0, kvdim] and the AttnDecode's prefix read
     // (`rows..1`) overruns it — `SubtileIR rejected by validate(): node N input
@@ -10715,7 +10728,7 @@ fn dump_wavefront_mega(
             fuf,
             inferred,
             decode_bounds,
-            model,
+            &bridge,
             crate::to_wavefront::PrefixCapacity::new(cap),
             primary_m,
         )
@@ -12758,7 +12771,7 @@ fn dump_wavefront_mega(
                     fuf,
                     inferred,
                     decode_bounds,
-                    model,
+                    &bridge,
                     crate::to_wavefront::PrefixCapacity::new(
                         std::num::NonZeroU32::new(cap).expect("cap bucket is non-zero"),
                     ),
@@ -12827,7 +12840,7 @@ fn dump_wavefront_mega(
                     fuf,
                     inferred,
                     decode_bounds,
-                    model,
+                    &bridge,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     seqs,
                 ) {
@@ -13061,7 +13074,7 @@ fn dump_wavefront_mega(
                 fuf,
                 inferred,
                 decode_bounds,
-                model,
+                &bridge,
                 // Prefill and decode model the SAME resident prefix-KV cache, so
                 // they MUST share ONE capacity — the KTIR emulator bakes a STATIC
                 // `[prefix_len, kv]` cache + a `[1, prefix_len]` runtime length mask,
@@ -13192,7 +13205,7 @@ fn dump_wavefront_mega(
                     fuf,
                     inferred,
                     decode_bounds,
-                    model,
+                    &bridge,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     m,
                 ) {
@@ -13329,7 +13342,7 @@ fn dump_wavefront_mega(
                 fuf,
                 inferred,
                 decode_bounds,
-                model,
+                &bridge,
                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
                 decode_mq,
             ) {
@@ -13831,6 +13844,24 @@ pub fn emit_model(
     let mut tape_accessors_for_struct: Option<Vec<WeightAccessor>> = None;
     #[cfg(feature = "metal")]
     let (mut weights, mut weights_affine_rows) = emit_struct(None);
+    // ⭐ THE MODEL'S FACTS (#1083), computed ONCE here and threaded to every consumer below:
+    // the bridge calls (the spyre weight struct, metal's tape fingerprint, metal's canonical
+    // lowering) and the per-canonical `CanonicalParams` impl. Every fact is a field of this
+    // one value; nothing below re-reads a config or a bound for a fact it states.
+    let (model_facts, mla_consts) = fill_canonical_params(
+        model,
+        tp_world_size,
+        fuf_uses_rotary(fuf),
+        &KvCacheLayers::of(fuf),
+        fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
+    );
+    // The config params and the typed facts are ONE model — the bridge takes them together.
+    // (Its readers below are the metal/spyre bridge calls; a cuda-only build lowers no tape.)
+    #[cfg(any(feature = "metal", feature = "spyre"))]
+    let bridge_model = crate::to_wavefront::BridgeModel {
+        params: model,
+        facts: &model_facts,
+    };
     // THE MODEL'S WEIGHT BINDING, from the tape both backends lower.
     //
     // `accessors_from_tape` reads only `LoweredDecode.bindings` + the op that
@@ -13851,7 +13882,7 @@ pub fn emit_model(
                     fuf,
                     inferred,
                     &bounds,
-                    model,
+                    &bridge_model,
                     crate::to_wavefront::PrefixCapacity::new(
                         std::num::NonZeroU32::new(8192).expect("8192 != 0"),
                     ),
@@ -13947,7 +13978,7 @@ pub fn emit_model(
                 fuf,
                 inferred,
                 &bounds,
-                model,
+                &bridge_model,
                 crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap()),
                 wp.num_tokens as u32,
             ) {
@@ -14063,14 +14094,8 @@ pub fn emit_model(
     // Per-canonical CanonicalParams impl + Instruction type alias.
     // The alias keeps every static-slice row short instead of
     // repeating `::scratchy_forward_compiler::Instruction::<Weights>::Variant(…)`.
-    // One value, two consumers: the impl's `FACTS` (serialized) and the metal bake.
-    let (model_facts, mla_consts) = fill_canonical_params(
-        model,
-        tp_world_size,
-        fuf_uses_rotary(fuf),
-        &KvCacheLayers::of(fuf),
-        fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
-    );
+    // One value, two consumers: the impl's `FACTS` (serialized) and the metal bake — the
+    // `model_facts` hoisted above the bridge calls, computed once for both.
     let canonical_params_impl = emit_canonical_params_impl(model_facts, &mla_consts);
     // Per-canonical: alias the generic `Instruction<Weights>` for
     // the slice element type AND glob-import the variant
@@ -14238,7 +14263,12 @@ pub fn emit_model(
         let prefix =
             crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
         let l = match crate::to_wavefront::lower_decode_to_wavefront(
-            fuf, inferred, &bounds, model, prefix, m as u32,
+            fuf,
+            inferred,
+            &bounds,
+            &bridge_model,
+            prefix,
+            m as u32,
         ) {
             Ok(l) => l,
             // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
@@ -14406,6 +14436,7 @@ pub fn emit_model(
                 dump_wavefront_mega(
                     program,
                     model,
+                    &model_facts,
                     fuf,
                     inferred,
                     &decode_bounds,
@@ -16541,6 +16572,112 @@ mod tests {
     fn every_layer(m: &ModelParams) -> KvCacheLayers {
         let layers = m.bounds.get("num_hidden_layers").copied().unwrap_or(1) as u32;
         KvCacheLayers((0..layers).collect())
+    }
+
+    /// ⭐ THE SCALE LAW, over EVERY checked-in config: the fill's `Attention::scale()`
+    /// states main's `attention_scale_for` value BIT FOR BIT. The oracle below is a
+    /// frozen copy of that deleted fn (verified identical to 64fd901475's), and the
+    /// value under test is the REAL fill — `fill_canonical_params` →
+    /// `attention().scale()` — over every `configs/<arch>/<stem>.json` the tree checks
+    /// in, walked from the tree (never a hand list, never a named model). The loop
+    /// also proves the fill's `head_dim > 0 … else 0.0` arm never fires for an
+    /// attention model: the oracle has no 0.0 arm, so a config where it did would
+    /// fail the bit comparison here.
+    #[test]
+    fn the_fill_states_the_frozen_scale_bit_for_bit_over_every_config() {
+        // FROZEN: main's `weight_vocab::attention_scale_for`, transcribed expression
+        // for expression. Priority, by the config key itself: `attention_multiplier`
+        // (a direct override) → `query_pre_attn_scalar.powf(-0.5)` → `1/sqrt(head_dim)`.
+        fn frozen_attention_scale_for(model: &ModelParams) -> f32 {
+            if let Some(s) = model.scalars.get("attention_multiplier") {
+                return *s as f32;
+            }
+            match model.scalars.get("query_pre_attn_scalar") {
+                Some(q) => (*q as f32).powf(-0.5),
+                None => {
+                    let head_dim_f = *model
+                        .bounds
+                        .get("head_dim")
+                        .expect("attention scale: head_dim missing from model config")
+                        as f32;
+                    1.0 / head_dim_f.sqrt()
+                }
+            }
+        }
+        // Every checked-in stem config: walk the arch configs dir, keeping model
+        // stems and dropping the dir's own metadata (arch spec, quantization and
+        // weights manifests, drift fragments). `load_file_declared` is the loader
+        // the build's walk uses for one stem — arch spec and overrides applied, so
+        // what loads here is what a build compiles.
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read the arch configs dir") {
+                let path = entry.expect("config entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "json")
+                    && !matches!(
+                        path.file_name().and_then(|n| n.to_str()),
+                        Some("arch.json") | Some("quantizations.json") | Some("weights.json")
+                    )
+                    && !path.to_string_lossy().ends_with(".overrides.json")
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/arch/configs");
+        let mut paths = Vec::new();
+        walk(&root, &mut paths);
+        paths.sort();
+        let mut stated = 0usize;
+        for path in &paths {
+            let model = crate::config::load_file_declared(path)
+                .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+            let facts = fill_canonical_params(&model, 1, false, &every_layer(&model), None).0;
+            // A body with no decoder attention (a vision tower, a drafter head) states
+            // no scale — the law is over the configs that do.
+            let Some(attention) = facts.attention() else {
+                continue;
+            };
+            stated += 1;
+            assert_eq!(
+                attention.scale().get().to_bits(),
+                frozen_attention_scale_for(&model).to_bits(),
+                "{}: the fill states a scale the frozen formula does not",
+                model.source_stem
+            );
+            // And both scale SITES state their law over the REAL filled value.
+            assert_eq!(
+                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel
+                    .scale(attention)
+                    .to_bits(),
+                attention.scale().get().to_bits(),
+                "{}: InKernel states the model's own scale",
+                model.source_stem
+            );
+            assert_eq!(
+                scratchy_subtile::subtile_ir::AttnScaleSite::FoldedIntoWeights
+                    .scale(attention)
+                    .to_bits(),
+                1.0f32.to_bits(),
+                "{}: FoldedIntoWeights states exactly 1.0",
+                model.source_stem
+            );
+        }
+        // ⛔ NOT VACUOUS: the walk must find the tree's attention stems, or the law
+        // above ran over nothing. The stated count is the MEASURED result (the floor
+        // is only the trap for a broken walk).
+        eprintln!(
+            "scale law: {stated} attention configs of {} checked-in stems",
+            paths.len()
+        );
+        assert!(
+            stated >= 100,
+            "the scale law ran over only {stated} attention configs of {} stems — the walk \
+             is wrong, not the tree",
+            paths.len()
+        );
     }
 
     /// `emit_canonical_params_impl` at `tp_world_size = 1` is

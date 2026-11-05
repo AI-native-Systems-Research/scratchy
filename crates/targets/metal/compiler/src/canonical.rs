@@ -303,6 +303,10 @@ pub fn lower_canonical(
         rows,
     } = at;
     let guards = |m: u64| metal_guard_gates(m as u32);
+    // ⭐ THE MODEL'S ATTENTION FACTS ride the ops themselves now, minted once at the
+    // bridge: the codec, the tape program and its rolls read the op's own value, so a
+    // canonical needs no attention facts of its own — a vision-tower canonical lowers
+    // with none.
     if let Some(&bucket) = buckets.iter().find(|&&b| guards(b) != guards(m)) {
         return Err(CanonicalRefusal::Guards { bucket });
     }

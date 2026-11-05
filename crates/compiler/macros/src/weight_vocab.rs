@@ -62,28 +62,6 @@ pub use scratchy_subtile::handoff::WeightSlot;
 
 pub use scratchy_subtile::handoff::SlotMap;
 
-/// Softmax scale for one attention call. Priority order:
-///   1. Granite's `attention_multiplier` — a direct override (no
-///      transform); the HF config already stores the final scale.
-///   2. Gemma2's `query_pre_attn_scalar` — convention is
-///      `scale = query_pre_attn_scalar.powf(-0.5)`.
-///   3. Fallback `1 / sqrt(head_dim)` for Llama / Qwen2 / Qwen3.
-pub(crate) fn attention_scale_for(model: &crate::config::ModelParams) -> f32 {
-    if let Some(s) = model.scalars.get("attention_multiplier") {
-        return *s as f32;
-    }
-    match model.scalars.get("query_pre_attn_scalar") {
-        Some(q) => (*q as f32).powf(-0.5),
-        None => {
-            let head_dim_f = *model
-                .bounds
-                .get("head_dim")
-                .expect("attention emit: head_dim missing from model config")
-                as f32;
-            1.0 / head_dim_f.sqrt()
-        }
-    }
-}
 /// The [`StorageFormat`] of the first weight input of `node`, or
 /// `None` if the node has no weight inputs. Every Gemm tile in the
 /// FUF carries exactly one `FufInput::Weight`; non-Gemm tiles return

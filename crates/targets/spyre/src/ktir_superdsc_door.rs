@@ -424,7 +424,7 @@ fn rope_at_geometry(
             ),
         })?;
     scratchy_subtile::model_geometry::with_config_head_dim(
-        scratchy_subtile::model_geometry::HeadDim::new(hd),
+        scratchy_ir::model_facts::HeadDim::new(hd),
         RopeAt(lk::RopeAt {
             name,
             x: ins[0].name(),
