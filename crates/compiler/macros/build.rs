@@ -84,10 +84,12 @@ fn emit_carrier(
     let dsl = arch_root.join("dsl").join(format!("{stem}.py"));
     let configs = arch_root.join("configs").join(stem);
     println!("cargo:rerun-if-changed={}", dsl.display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        configs.join("weights.json").display()
-    );
+    // Only a file that exists: a missing watched path reruns this script on every build. The
+    // configs directory (`carrier_facts`) catches one added later.
+    let weights_json = configs.join("weights.json");
+    if weights_json.exists() {
+        println!("cargo:rerun-if-changed={}", weights_json.display());
+    }
     let source =
         std::fs::read_to_string(&dsl).map_err(|e| format!("read {}: {e}", dsl.display()))?;
     let carrier =

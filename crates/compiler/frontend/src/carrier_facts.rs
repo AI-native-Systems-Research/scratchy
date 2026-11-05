@@ -18,7 +18,12 @@ pub fn carrier_facts(
 ) -> typed_emit::CarrierFacts {
     let configs_dir = arch_root.join("configs").join(stem);
     let arch_json = configs_dir.join("arch.json");
-    read_files.push(arch_json.clone());
+    // Only a file that exists: cargo reruns a build script watching a missing path on every build
+    // (a carrier without arch.json rebuilt the compiler, and every crate below it, each time). The
+    // configs directory, watched below, catches one added later.
+    if arch_json.exists() {
+        read_files.push(arch_json.clone());
+    }
     let read = |path: &std::path::Path| -> serde_json::Value {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("carrier facts: read {}: {e}", path.display()));
