@@ -167,10 +167,25 @@ impl PolarQuantizer {
     pub fn scale(&self) -> f32 {
         self.scale
     }
+    /// What an encoder digitizes and measures against: the `2^bits - 1` boundaries, then the
+    /// `2^bits` centroids (the levels whose length [`Self::quantize`] corrects the norm by).
+    pub fn encode_table(&self) -> Vec<f32> {
+        self.boundaries
+            .iter()
+            .chain(&self.centroids)
+            .copied()
+            .collect()
+    }
 
     /// Quantize one vector. Port of `PolarQuantizer.quantize`: f32 norm, unit,
     /// randomized-Hadamard rotation, divide by `scale` to lift coords to
     /// N(0,1), then digitize against the (unscaled) N(0,1) boundaries.
+    ///
+    /// The norm returned is the vector's own divided by its codes' decoded length,
+    /// `|centroids[idx]| * scale`: rounding to the levels leaves a decoded unit vector a little
+    /// short of 1, by an amount its codes decide, so the plain norm would shrink every vector by
+    /// its own factor and bias each key's attention score by it. Stored this way, a vector
+    /// decodes at its own length.
     pub fn quantize(&self, x: &[f32]) -> (Vec<u8>, f32) {
         debug_assert_eq!(x.len(), self.dim);
         let norm = x
@@ -198,7 +213,17 @@ impl PolarQuantizer {
                 }
                 k
             })
-            .collect();
+            .collect::<Vec<u8>>();
+        let decoded = idx
+            .iter()
+            .map(|&i| {
+                let c = self.centroids[i as usize] as f64;
+                c * c
+            })
+            .sum::<f64>()
+            .sqrt() as f32
+            * self.scale;
+        let norm = if decoded > 0.0 { norm / decoded } else { norm };
         (idx, norm)
     }
 
@@ -632,6 +657,40 @@ mod tests {
             }
             if bits == 4 {
                 assert!(mean > 0.99, "4-bit cosine {mean}");
+            }
+        }
+    }
+
+    /// A vector decodes at its own length, at every width and head_dim the metal path provisions.
+    /// With the plain norm stored, every decoded vector fell short by its codes' own factor
+    /// (`|centroids[idx]| / sqrt(dim)`, a few tenths of a percent at 4 bits and more below), which
+    /// on granite-4.2-3b cost 7 of 100 MuSiQue answers against a dense KV cache. The test first
+    /// shows that shortfall is there for the plain norm, then that the stored norm removes it.
+    #[test]
+    fn decoded_vectors_keep_their_length() {
+        for dim in [64usize, 128, 256, 512] {
+            for bits in 1..=4u32 {
+                let q = PolarQuantizer::new(dim, bits, 42);
+                let mut rng = Lcg(0xC0FFEE ^ dim as u64 ^ u64::from(bits));
+                let (mut short, mut worst) = (0.0f64, 0.0f64);
+                for _ in 0..64 {
+                    let v: Vec<f32> = (0..dim).map(|_| rng.next_f32()).collect();
+                    let len =
+                        |x: &[f32]| x.iter().map(|&a| f64::from(a).powi(2)).sum::<f64>().sqrt();
+                    let (idx, stored) = q.quantize(&v);
+                    let plain = len(&v) as f32;
+                    // The plain norm decodes short: the codes' decoded length is under 1.
+                    short = short.max(1.0 - len(&q.dequantize(&idx, plain)) / len(&v));
+                    worst = worst.max((len(&q.dequantize(&idx, stored)) / len(&v) - 1.0).abs());
+                }
+                assert!(
+                    short > 1e-3,
+                    "dim {dim} bits {bits}: plain norm should decode short ({short})"
+                );
+                assert!(
+                    worst < 1e-5,
+                    "dim {dim} bits {bits}: decoded length off by {worst}"
+                );
             }
         }
     }

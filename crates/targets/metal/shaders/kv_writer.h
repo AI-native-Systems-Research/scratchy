@@ -14,7 +14,7 @@
 // table a rotated K bias uses (24). Every KV writer (rope.metal, kv_append.metal) binds it alike.
 #define KV_WRITER_TQ_BUFFERS(T)                                                  \
     device const float* tq_signs      [[buffer(16)]],                            \
-    device const float* tq_boundaries [[buffer(17)]],                            \
+    device const float* tq_encode_table [[buffer(17)]],                            \
     device       uint*  tq_packed_k   [[buffer(18)]],                            \
     device       float* tq_norms_k    [[buffer(19)]],                            \
     device       uint*  tq_packed_v   [[buffer(20)]],                            \
@@ -37,7 +37,7 @@ template <typename T>
 inline void kv_row_encode(float k, float v, uint d, uint dim, uint num_kv, uint kv_head,
                           uint slot_raw, uint pos, uint bits, uint vals_per_word, uint packed_dim,
                           uint k_offset, uint v_offset, uint rot_dim, uint pair_off,
-                          device const float* signs, device const float* boundaries,
+                          device const float* signs, device const float* table,
                           device uint* packed_k, device float* norms_k, device uint* packed_v,
                           device float* norms_v, device const T* k_bias, device const T* v_bias,
                           device const T* cos_sin, threadgroup float* scratch,
@@ -52,6 +52,6 @@ inline void kv_row_encode(float k, float v, uint d, uint dim, uint num_kv, uint 
                                             pair_off, pos, unrotated, d)
                              : 0.0f;
     tq_encode<2>({k - k_off, v - v_off}, d, dim, bits, vals_per_word, packed_dim, 1u << bits, signs,
-                 boundaries, {packed_k + store * packed_dim, packed_v + store * packed_dim},
+                 table, {packed_k + store * packed_dim, packed_v + store * packed_dim},
                  {norms_k + store, norms_v + store}, scratch, codes);
 }
