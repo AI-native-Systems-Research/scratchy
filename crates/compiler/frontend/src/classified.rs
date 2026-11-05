@@ -490,13 +490,10 @@ pub enum OpKind {
     /// Shape view — reinterprets a tensor under a different rank
     /// without moving or copying data. Element count is preserved;
     /// the codegen maps to `OwnedTensor::reshape` / `TensorView::reshape`
-    /// (metadata-only). Today Reshape tiles are **synthesized by
-    /// shape inference** when an op expects a factor of the
-    /// producer's last dim (e.g. per-head rmsnorm expects `[D]` but
-    /// upstream gemm produces `[..., heads * D]`). The target shape
-    /// is stored in [`Program::reshape_targets`] keyed by the new
-    /// local's id; inference re-reads it when typechecking the
-    /// synthesized statement. Not yet exposed to DSL authors via
+    /// (metadata-only). A DSL `reshape(x, [..])` classifies to it (e.g. a per-head rmsnorm's
+    /// `[num_tokens * heads, D]` view of a gemm's `[num_tokens, heads * D]`); the target shape
+    /// is stored in [`Program::reshape_targets`] keyed by the new local's id, and the typed-Rust
+    /// emit pass types it as the structural regrouping it names. Not exposed to DSL authors via
     /// `from_name` — add an entry there if a future pattern needs
     /// explicit user-written reshape.
     Reshape,
@@ -617,8 +614,7 @@ pub enum OpKind {
     ///
     /// No DSL surface — `from_name` deliberately omits it. The
     /// lowering pass writes `outputs[0]` directly (same pattern as
-    /// `AllGather` and `MmEmbedSplice`), so `apply_signature` rejects
-    /// this OpKind.
+    /// `AllGather` and `MmEmbedSplice`); no typed signature names it.
     LoadRows(scratchy_tensors::compiler_ids::RowsExtern),
     /// Row-permutation gather: `out = embedding_gather(x, indices)`.
     /// `x` is a rank-2 tile `[L, N]` (any inner-dim factorization);
@@ -716,9 +712,9 @@ impl OpKind {
             "sub" => Some(Self::Sub),
             "mean" => Some(Self::Mean),
             "bias_add" => Some(Self::BiasAdd),
-            // `Reshape` is synthesized by shape inference, not DSL-
-            // writable today. Intentionally not listed in `from_name`;
-            // add the arm if a future pattern needs explicit reshape.
+            // `Reshape` is the DSL's `reshape(x, [..])` expression
+            // (`ast::Expr::Reshape`), never a call by name: not listed
+            // in `from_name`.
             "mla_split" => Some(Self::MlaSplit),
             "mla_attention" => Some(Self::MlaAttention),
             "moe_block" => Some(Self::Moe),
@@ -819,18 +815,11 @@ pub struct Program {
     /// Path segments for each WeightId (for diagnostics and
     /// runtime weight lookup).
     pub weights: WeightTable,
-    /// Target shapes for synthesized `Reshape` statements. Keyed by
-    /// the LocalId of the reshape's output (the newly-introduced
-    /// fresh local). Empty for DSL programs with no shape-mismatch
-    /// recoveries.
-    ///
-    /// Populated by `shape::infer` when a per-axis-factor mismatch
-    /// between a weight's declared shape and its consumer's inferred
-    /// shape is detected (e.g. Qwen3's per-head `q_norm` of shape
-    /// `[head_dim]` applied to a gemm output of shape `[..., heads *
-    /// head_dim]`). The synthesizer inserts a `Reshape` Stmt and
-    /// records the target shape here; the second inference pass
-    /// reads this map to typecheck the synthesized statement.
+    /// Target shapes of the DSL's `Reshape` statements, keyed by the
+    /// LocalId of the reshape's output (e.g. Qwen3's per-head
+    /// `q_norm` view, `[num_tokens * heads, head_dim]`, of a gemm's
+    /// `[num_tokens, heads * head_dim]`). The typed-Rust emit pass
+    /// types each as the regrouping it names.
     pub reshape_targets: std::collections::HashMap<LocalId, Vec<crate::dim::Dim>>,
     /// `x = as_dim(y, <bound>)`: each such `x`, an alias of `y` whose width is stated as `<bound>`.
     /// No tile, no shape change: a model compiles through one only where the two widths are equal

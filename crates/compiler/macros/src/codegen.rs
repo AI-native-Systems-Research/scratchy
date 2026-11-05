@@ -7771,17 +7771,52 @@ pub(crate) fn target_width(
     program: &Program,
     inferred: &crate::shape::Inferred,
 ) -> scratchy_ir::model_facts::TargetWidth {
+    use crate::classified::{Expr, LocalId, Stmt};
     use crate::dim::Dim;
     let bound = |d: &Dim, name: &str| matches!(d, Dim::Bound(b) if b == name);
-    for (local, stated) in &program.dim_casts {
-        let own = (inferred.locals.get(local)).and_then(|shape| shape.last());
+    // Each cast's source: the local `x = as_dim(y, ..)` reads.
+    fn sources(
+        stmts: &[Stmt],
+        casts: &std::collections::HashSet<LocalId>,
+        out: &mut Vec<(LocalId, LocalId)>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Assign {
+                    target,
+                    value: Expr::Local(source),
+                } if casts.contains(target) => out.push((*target, *source)),
+                Stmt::For { body, .. } => sources(body, casts, out),
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    sources(then_body, casts, out);
+                    sources(else_body, casts, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let casts = program.dim_casts.keys().copied().collect();
+    let mut cast_sources = Vec::new();
+    sources(&program.statements, &casts, &mut cast_sources);
+    assert_eq!(
+        cast_sources.len(),
+        program.dim_casts.len(),
+        "as_dim: every cast reads one local"
+    );
+    for (local, source) in cast_sources {
+        let stated = &program.dim_casts[&local];
+        let own = (inferred.locals.get(&source)).and_then(|shape| shape.last());
         assert!(
             own.is_some_and(|d| bound(d, "hidden_size")) && bound(stated, "backbone_hidden_size"),
             "as_dim: `{}` (line {}) states {own:?} as {stated:?}; the one cast a model's facts \
              hold is a head's hidden width as its target's (`hidden_size` as \
              `backbone_hidden_size`)",
-            program.locals.name(*local),
-            (program.locals.line(*local)).map_or("?".to_string(), |l| l.to_string()),
+            program.locals.name(local),
+            (program.locals.line(local)).map_or("?".to_string(), |l| l.to_string()),
         );
     }
     match program.dim_casts.is_empty() {
@@ -13847,7 +13882,7 @@ pub fn emit_model(
     fuf: &Fuf,
     workloads: &WorkloadPoints,
     manifest: &crate::weights_manifest::WeightsManifest,
-    // Shape inference for this arch — threaded only so the PD-wavefront
+    // The arch's traced shapes — threaded only so the PD-wavefront
     // macro-emission (`dump_wavefront_mega`) can resolve weight shapes;
     // unused on the normal codegen path.
     inferred: &crate::shape::Inferred,
@@ -14757,7 +14792,7 @@ pub fn emit_model(
                 let node = fuf.get(tile_id);
                 let shape = &node.outputs[out_slot as usize];
                 let dims = crate::weight_vocab::eval_shape_with(shape, &bp_bounds)
-                    .expect("shape inference left a Var in a tile output — codegen invariant");
+                    .expect("a tile output names a bound the model lacks — codegen invariant");
                 // f16 = 2 bytes/element; metal kernels are f16-only.
                 if logits_tiles.contains(&(tile_id, out_slot)) {
                     let row: u64 = dims.iter().skip(1).product();
@@ -17608,19 +17643,7 @@ mod fingerprint_tests {
         let mut program = crate::classify::classify_with(ast, crate::classified::Prelude::Decoder)
             .expect("classify");
         program.weight_leaf_renames = model.arch.weight_leaf_renames.clone();
-        let manifest =
-            crate::weights_manifest::load_or_empty(&arch_configs(arch)).expect("manifest");
-        // The production drive's reshape recovery (lib.rs): gemma-3/4's
-        // per-head QK-norm needs the hints applied before shapes close, and
-        // each model recovers against its OWN bounds.
-        let inferred = match crate::shape::infer(&program, &manifest, &model.bounds) {
-            Ok(inf) => inf,
-            Err(crate::shape::ShapeError::ReshapeRecovery { hints }) => {
-                crate::shape::apply_reshape_hints(&mut program, &hints);
-                crate::shape::infer(&program, &manifest, &model.bounds).expect("shapes 2")
-            }
-            Err(e) => panic!("shapes: {e}"),
-        };
+        let inferred = crate::typed_bodies::trace_carrier_program(arch, &program);
         let cfg = crate::cfg::build_cfg(&program, model).expect("cfg");
         let mut fuf = crate::fuf::unroll(&cfg, &inferred).expect("unroll");
         fuf.annotate_storage_formats(&program, model);

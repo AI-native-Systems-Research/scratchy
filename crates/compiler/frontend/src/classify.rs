@@ -22,7 +22,7 @@ pub type ClassifyResult<T> = Result<T, syn::Error>;
 
 /// Convert a parser-produced [`ast::DimSpec`] into a [`Dim`]. `Lit` /
 /// `Bound` map directly; `Mul` flattens into [`Dim::Mul`] via
-/// `canonical_mul` (matching the form `apply_reshape_hints` produces);
+/// `canonical_mul` (the order the typed `Mul` is written in);
 /// `Div` becomes [`Dim::Div`] — kept symbolic until codegen folds the
 /// numerator + closes the denominator against the per-model `bounds`.
 fn dimspec_to_dim(s: &ast::DimSpec) -> Dim {
@@ -42,6 +42,20 @@ fn dimspec_to_dim(s: &ast::DimSpec) -> Dim {
 #[allow(dead_code)]
 pub fn classify(ast: &ast::Ast) -> ClassifyResult<Program> {
     classify_with(ast, Prelude::Decoder)
+}
+
+/// The program a carrier compiles to: a decoder's with the compiler's drafter capture
+/// (`draft_capture`), classified under the carrier's prelude. The ONE construction of it: the build
+/// script types this program and the bake lowers it, and the bake reads each local's shape from the
+/// typed program's trace by its `LocalId`, so both must hold the same program.
+pub fn carrier_program(carrier: &crate::parse_python::PythonCarrier) -> ClassifyResult<Program> {
+    match carrier.vision {
+        true => classify_with(&carrier.ast, Prelude::Vision),
+        false => classify_with(
+            &crate::draft_capture::insert(&carrier.ast),
+            Prelude::Decoder,
+        ),
+    }
 }
 
 /// Classify the AST against a specific prelude. The prelude selects
@@ -76,10 +90,9 @@ struct Ctx {
     /// For-loops push their induction variable and pop it on exit.
     scope: HashMap<String, Vec<LocalId>>,
     prelude: Prelude,
-    /// DSL-authored reshape targets accumulated during classify.
-    /// Identical surface to `shape::apply_reshape_hints`'s synthesized
-    /// reshapes — both flow into `Program::reshape_targets` keyed by
-    /// the producing `LocalId`. See [`Ctx::classify_stmt`] for the
+    /// DSL-authored reshape targets accumulated during classify; they
+    /// flow into `Program::reshape_targets` keyed by the producing
+    /// `LocalId`. See [`Ctx::classify_stmt`] for the
     /// `ast::Expr::Reshape` Assign-arm intercept.
     reshape_targets: HashMap<LocalId, Vec<Dim>>,
     /// `x = as_dim(y, <bound>)`s accumulated during classify (`Program::dim_casts`).
@@ -104,11 +117,9 @@ impl Ctx {
                 // target shape can be threaded into
                 // `program.reshape_targets` keyed by the freshly
                 // bound `LocalId`. The classified Stmt drops the
-                // explicit shape and becomes a Reshape OpKind call —
-                // identical surface to the synthesized form from
-                // `shape::apply_reshape_hints`, so every downstream
-                // pass (CFG / FUF / shape::infer / solver / codegen)
-                // already knows how to handle it.
+                // explicit shape and becomes a Reshape OpKind call,
+                // which every downstream pass (typed emit / CFG / FUF /
+                // codegen) handles.
                 if let ast::Expr::Reshape {
                     source,
                     target_shape,
@@ -1098,8 +1109,7 @@ mod tests {
     #[test]
     fn dsl_authored_reshape_records_target_shape() {
         // `reshape(x, [num_tokens, vision_embed_dim])` — the G.5.c
-        // "literal-or-bound" surface. The classified Stmt must match
-        // the shape of `apply_reshape_hints`'s synthesized form: a
+        // "literal-or-bound" surface. The classified Stmt is a
         // Reshape OpKind call with the source as its only arg, plus
         // an entry in `program.reshape_targets` keyed by the new
         // local. Bound names round-trip as `Dim::Bound(name)`,

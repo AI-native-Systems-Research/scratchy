@@ -38,10 +38,11 @@ crates/models/arch/
   verbatim — don't edit by hand. Different model sizes under the same
   architecture get one file each.
 
-- **`weights.json`** — shape of every weight that the compiler's
-  dataflow-driven shape inference cannot pin (or would pin
-  incorrectly). Expressed as products of bound names from the
-  config.json vocabulary. Example for Qwen3, where `q_norm` / `k_norm`
+- **`weights.json`** — the exact shape of every weight the DSL reads.
+  The typed-Rust emit pass types each weight by it, and rustc checks
+  every use of the weight in the DSL against that type when the compiler
+  builds. Shapes are expressed as products and sums of bound names from
+  the config.json vocabulary. Example for Qwen3, where `q_norm` / `k_norm`
   are per-head RMS norms of shape `[head_dim]`:
 
   ```json

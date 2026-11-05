@@ -61,15 +61,17 @@ pub use render::render_tokens;
 /// kernels resolve in, baked once the models are emitted.
 #[cfg(feature = "metal")]
 pub use scratchy_target_metal_compiler::static_tape::bake_module as metal_bake_module;
+#[cfg(test)]
+mod frontend_tests;
 mod rows_lowering;
 mod shape;
 mod to_wavefront;
 mod tp_lowering;
+#[cfg(test)]
+mod typed_bodies;
 mod typed_shapes;
 #[cfg(test)]
 mod typed_shapes_tests;
-#[cfg(test)]
-mod frontend_tests;
 // ⭐ THE ONE PRODUCER OF THE MODEL'S WEIGHT ACCESSOR SET, for every target.
 //
 // It used to be gated `all(feature = "spyre", not(feature = "metal"))` because metal derived
@@ -510,7 +512,13 @@ pub fn compile_carrier(
         CompileMode::DECODER
     };
     let name_span = args.span;
-    let PythonCarrier { ast, arch_name, .. } = carrier;
+    // ── Front end: classify ────────────────────────────────────────
+    // The program the build script typed (`classify::carrier_program`, the one construction): a
+    // decoder's layer loop captures what a drafter compiled beside it reads (`draft_capture`), the
+    // compiler's, whatever the arch's DSL says.
+    let classified = classify::carrier_program(&carrier)
+        .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))?;
+    let PythonCarrier { arch_name, .. } = carrier;
 
     // `pixel_pack = path::to::fn` is OPTIONAL under VISION mode.
     // When unset, the trait's default `pixel_pack` (which delegates
@@ -520,23 +528,7 @@ pub fn compile_carrier(
     // Override only for arches with different patch ordering
     // (SigLIP raster, etc.). Decoder mode ignores the arg if set.
 
-    // ── Front end: classify ────────────────────────────────────────
-    // A decoder's layer loop captures what a drafter compiled beside it reads (`draft_capture`):
-    // the compiler's, whatever the arch's DSL says.
-    let ast = match mode.prelude {
-        classified::Prelude::Decoder => draft_capture::insert(&ast),
-        classified::Prelude::Vision => ast,
-    };
-    let classified = classify::classify_with(&ast, mode.prelude)
-        .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))?;
-
     // ── Load configs + manifest + target ──────────────────────────
-    // Shape inference needs both the arch's `weights.json` manifest
-    // (for declared weight shapes) and one model's bounds (for
-    // numerical-equivalence anchoring). The prober's cross-size
-    // validation guarantees every model's bounds resolve the
-    // manifest's formulas consistently, so any one model's bounds
-    // suffice — we use the first (alphabetical) model.
     // THE arch's declarations: `configs/<arch>/arch.json`. Facts about
     // an arch that aren't derivable from a verbatim HF config.json live
     // in that file, alongside the configs they describe — not in the
@@ -605,10 +597,7 @@ pub fn compile_carrier(
     // ⛔ NOT FROM `models[0]` — THESE DRIFT BETWEEN SIBLINGS, exactly as the vision layout above
     // does. gemma-3-12b nests its decoder under `language_model`; gemma-3-1b does not. Taking the
     // prefix from whichever config sorts first gave 1b the 12b prefix in any build containing
-    // both, its weight paths then missed the manifest, shape inference fell into reshape
-    // RECOVERY, and `apply_reshape_hints` inserted two reshapes per layer — 708 FUF nodes alone
-    // against 760 alongside 12b, for the same model. Output stayed correct (the inserted
-    // reshapes are no-ops) so nothing caught it; the tape just silently grew.
+    // both, and its weight paths then missed the checkpoint's tensors.
     //
     // They are set per MODEL below, on that model's own clone of the program.
 
@@ -660,121 +649,33 @@ pub fn compile_carrier(
         }
     }
 
-    // Shape inference may flag reshape-recoverable mismatches (e.g.
-    // per-head QK-norm in Qwen3/Gemma3). Catch those, synthesize the
-    // Reshape stmts into `classified`, and retry — downstream passes
-    // (CFG, FUF, solver, codegen) see a program with explicit reshape
-    // tiles. Bounded to one recovery pass: a clean hint set resolves
-    // on the second pass. Anything that doesn't is a compiler bug
-    // we'd rather surface than loop on.
-    // ⛔ RECOVER ON A COPY. This pass exists to VALIDATE (the unresolved-weight diagnostic below);
-    // it runs once, against `models[0].bounds`, and it used to synthesize its reshape hints into
-    // the SHARED `classified` that every model then clones. So whichever config happened to sort
-    // first decided the program structure for all of them: gemma-3-12b needs the per-head QK-norm
-    // recovery and gemma-3-1b does not, and `gemma-3-12b-it` sorts before `gemma-3-1b-it`, so a
-    // build containing both gave 1b TWO EXTRA RESHAPES PER LAYER — 707 FUF nodes alone against
-    // 759 alongside 12b, for the same model with identical bounds. The output stayed correct (the
-    // inserted reshapes are no-ops), so only the tape size showed it.
-    //
-    // Every model re-infers on its own clone below and recovers against its OWN bounds, so the
-    // shared program must stay pristine.
-    let infer_bounds = &models[0].bounds;
-    let mut rep_prog = classified.clone();
-    let inferred = match shape::infer(&rep_prog, &manifest, infer_bounds) {
-        Ok(inf) => inf,
-        Err(shape::ShapeError::ReshapeRecovery { hints }) => {
-            shape::apply_reshape_hints(&mut rep_prog, &hints);
-            shape::infer(&rep_prog, &manifest, infer_bounds).map_err(|e| {
-                // ── Guard G6: enrich the post-reshape-recovery mismatch.
-                // Pure diagnostic — same hard error, richer message. When
-                // the second-pass failure is a Mismatch, name the producer
-                // local(s) recovery rewrote (the prime suspect, e.g. `kvg`),
-                // the two conflicting dims, and the sibling-flatten-back
-                // hint that this failure mode usually means was missed.
-                let detail = match &e {
-                    shape::ShapeError::Mismatch { lhs, rhs } => {
-                        let producers: Vec<String> = hints
-                            .iter()
-                            .map(|h| classified.locals.name(h.producer_local).to_string())
-                            .collect::<std::collections::BTreeSet<_>>()
-                            .into_iter()
-                            .collect();
-                        format!(
-                            "\n  the two dims that won't reconcile: `{lhs}` vs `{rhs}`\
-                             \n  reshape recovery rewrote producer local(s): {prod}\
-                             \n  HINT: a producer feeding BOTH a weighted per-head norm AND a \
-                             weightless `rmsnorm_unit` (k_eq_v V-norm) needs a flatten-back for \
-                             the UNIT-norm sibling too — see \
-                             shape.rs::rmsnorm_unit_sibling_flatten_backs. If this is a new \
-                             reshape pattern, the unit/sibling consumer's output was left in the \
-                             per-head `[rows, {lhs}]` view while a downstream consumer expects the \
-                             flat `[rows, {lhs} * <heads>]` view.",
-                            lhs = shape::show_dim_pub(lhs),
-                            rhs = shape::show_dim_pub(rhs),
-                            prod = if producers.is_empty() {
-                                "(none)".to_string()
-                            } else {
-                                producers.join(", ")
-                            },
-                        )
-                    }
-                    _ => String::new(),
-                };
-                syn::Error::new(
-                    args.span,
-                    format!("shape infer (after reshape recovery): {e}{detail}"),
-                )
-            })?
-        }
-        Err(e) => {
-            return Err(syn::Error::new(args.span, format!("shape infer: {e}")));
-        }
-    };
-
-    // ── Guard G1: every referenced weight accessor must resolve ───────
-    // A referenced `Expr::Weight` whose CLOSED shape is empty (rank 0)
-    // was pinned by NEITHER the manifest NOR dataflow — it interned to
-    // zero real weight edges (shape.rs installs `Vec::new()` and no op
-    // signature grew it). Bundle-struct args (router/experts/moe/mlp/
-    // linear_attn) get no dataflow rank, so for them a missing manifest
-    // entry is silently fatal downstream (the op gets 0 weight inputs →
-    // no solver candidates → a red-herring "tile N op Mul unclaimed").
-    // Turn it into a precise source error. The `!shape.is_empty()`
-    // exemption is load-bearing: `.bias` args (gemma3-mm) are pinned to
-    // rank-1 by dataflow and the manifest declares only the parent stem,
-    // so they must stay exempt.
-    {
-        let mut unresolved: Vec<String> = Vec::new();
-        for (wid, shape) in &inferred.weights {
-            if !shape.is_empty() {
-                continue; // dataflow- or manifest-pinned → fine
-            }
-            let dotted = classified.weights.path(*wid).join(".");
-            if manifest.entries.contains_key(&dotted) {
-                continue; // declared (marker family or explicit leaf) → fine
-            }
-            unresolved.push(dotted);
-        }
-        if !unresolved.is_empty() {
-            unresolved.sort();
-            unresolved.dedup();
-            let first = unresolved.first().cloned().unwrap_or_default();
-            return Err(syn::Error::new(
-                args.span,
-                format!(
-                    "[{arch}] weight accessor(s) not declared in configs/weights.json: {names}. \
-                     Each resolved to zero weight edges (no manifest entry and no dataflow-pinned \
-                     shape), so the op consuming it has no weight inputs and the solver will fail \
-                     downstream with an unrelated unclaimed-tile error. Declare each in \
-                     {wjpath} — a marker/bundle family as \
-                     `\"{first}\": [\"hidden_size\"]`, or the explicit leaf shape.",
-                    arch = arch_name,
-                    names = unresolved.join(", "),
-                    wjpath = models_dir.join("weights.json").display(),
-                    first = first,
-                ),
-            ));
-        }
+    // The arch's shapes: its typed program's trace, every local, weight and nested value at the
+    // shape its type states, which rustc checked when this crate compiled (`typed_shapes`). They
+    // are symbolic in the bounds, so one trace serves every model of the arch.
+    let inferred = typed_shapes::traced(&arch_name).ok_or_else(|| {
+        syn::Error::new(
+            args.span,
+            format!(
+                "[{arch_name}] has no typed program: the build script types every carrier under \
+                 crates/models/arch/dsl/, and this one is not among them"
+            ),
+        )
+    })?;
+    // The trace is keyed by `LocalId`: it must be of this very program, or each local would read
+    // another's shape.
+    let names: Vec<String> = (classified.locals.ids())
+        .map(|id| classified.locals.name(id).to_string())
+        .collect();
+    if !inferred.locals_of(&names) {
+        return Err(syn::Error::new(
+            args.span,
+            format!(
+                "[{arch_name}] the typed program's trace is of another program ({} locals) than \
+                 the one lowered here ({}): both must be `classify::carrier_program`'s",
+                inferred.program.len(),
+                names.len()
+            ),
+        ));
     }
 
     // ⛔ DETECTION ONLY, AND THAT IS THE WHOLE POINT. A metal build runs no solver, so the
@@ -852,12 +753,10 @@ pub fn compile_carrier(
     // per-variant `load` never split them.
     struct SolvedModel<'a> {
         model: &'a config::ModelParams,
-        /// Shapes inferred from THIS model's bounds — never the
-        /// arch-level `models[0]` inference (see the unroll site).
-        inferred: shape::Inferred,
-        /// The classified body THIS model was lowered against, with
-        /// its own reshape recovery applied. Emission must read the
-        /// same program the FUF was built from.
+        /// The arch's shapes, its typed program's trace: symbolic in the bounds, so every model's.
+        inferred: &'a shape::Inferred,
+        /// The classified body THIS model was lowered against, with its own identity regroupings
+        /// erased. Emission must read the same program the FUF was built from.
         prog: classified::Program,
         fuf: fuf::Fuf,
         workloads: crate::workload::WorkloadPoints,
@@ -997,100 +896,22 @@ pub fn compile_carrier(
                 format!("{}_tp{}", model.source_stem, tp_world_size)
             };
 
-            // 🛑 PER-MODEL shape inference, over a PER-MODEL copy of the
-            // classified body.
-            //
-            // The arch-level `inferred` is computed from
-            // `models[0].bounds` — whichever config sorts FIRST — and
-            // feeding it to a sibling's unroll bakes the first config's
-            // geometry into that sibling's FUF. Observed: compiling
-            // `gemma-3-1b` (text-only, hidden 1152 / 26 layers) beside
-            // `gemma-3-4b` drove the 4b's FUF from 992 tiles to 924
-            // with a reordered q/k norm pair, and the 4b then emitted
-            // fluent garbage.
-            //
-            // Reshape RECOVERY has the same shape of bug one level
-            // down: it MUTATES the program, and models of one arch do
-            // not need the same hints (the 1b needs none; the 4b needs
-            // two). Recovering into the shared body would let whichever
-            // model recovered first rewrite its siblings. So each model
-            // recovers into its OWN clone, and that clone is what its
-            // cfg / FUF / solve / emit all read.
+            // Each model lowers its OWN copy of the classified body, which its cfg / FUF / solve /
+            // emit all read: the per-model rewrites below (the identity regroupings erased) must
+            // not reach a sibling's.
             let mut model_prog = classified.clone();
             if matches!(mode.prelude, classified::Prelude::Decoder) {
                 model_prog.decoder_safetensors_prefix = model.arch.decoder_prefix.clone();
             }
             model_prog.weight_leaf_renames = model.arch.weight_leaf_renames.clone();
-            let model_inferred = match shape::infer(&model_prog, &manifest, &model.bounds) {
-                Ok(inf) => inf,
-                Err(shape::ShapeError::ReshapeRecovery { hints }) => {
-                    shape::apply_reshape_hints(&mut model_prog, &hints);
-                    shape::infer(&model_prog, &manifest, &model.bounds).map_err(|e| {
-                        syn::Error::new(
-                            args.span,
-                            format!(
-                                "shape infer after reshape recovery [{}]: {e}",
-                                model.source_stem
-                            ),
-                        )
-                    })?
-                }
-                Err(e) => {
-                    return Err(syn::Error::new(
-                        args.span,
-                        format!("shape infer [{}]: {e}", model.source_stem),
-                    ));
-                }
-            };
-            // TRANSITIONAL — deleted with `shape.rs`'s solver in phase C of the
-            // shapes-as-Rust-types plan (issue #1086), when the trace becomes the shapes' source.
-            // Until then an arch whose carrier the typed-Rust emit pass typed traces its program,
-            // and every local the classifier bound must have the shape `shape::infer` closed for
-            // this model, evaluated under its bounds.
-            if let Some(parity) = typed_shapes::check_parity(
-                &arch_name,
-                &classified,
-                &model_inferred.locals,
-                &model.bounds,
-            ) {
-                if let Some(m) = parity.mismatches.first() {
-                    return Err(syn::Error::new(
-                        args.span,
-                        format!(
-                            "typed shapes [{}]: {} locals disagree with shape::infer ({} \
-                             shaped by both); first: `{}` (local {}, {}): traced {:?}, inferred {:?}",
-                            model.source_stem,
-                            parity.mismatches.len(),
-                            parity.compared,
-                            m.name,
-                            m.local.0,
-                            m.line
-                                .map_or("inserted by the compiler".to_string(), |l| format!(
-                                    "line {l}"
-                                )),
-                            m.traced,
-                            m.inferred,
-                        ),
-                    ));
-                }
-                if !parity.recovered.is_empty() {
-                    println!(
-                        "cargo:warning=typed shapes [{}]: reshape recovery added {} locals the \
-                         typed program cannot name ({:?}); each becomes an explicit DSL reshape or \
-                         a weights.json fix",
-                        model.source_stem,
-                        parity.recovered.len(),
-                        parity.recovered.iter().map(|l| l.0).collect::<Vec<_>>(),
-                    );
-                }
-            }
+            let model_inferred = &inferred;
             // A regrouping that is the identity for this model (a split by a factor of 1) is its
             // source's view: no node.
-            shape::erase_identity_regroupings(&mut model_prog, &model_inferred, &model.bounds);
+            shape::erase_identity_regroupings(&mut model_prog, model_inferred, &model.bounds);
             let model_cfg = cfg::build_cfg(&model_prog, model).map_err(|e| {
                 syn::Error::new(args.span, format!("cfg [{}]: {e}", model.source_stem))
             })?;
-            let mut model_fuf = fuf::unroll(&model_cfg, &model_inferred).map_err(|e| {
+            let mut model_fuf = fuf::unroll(&model_cfg, model_inferred).map_err(|e| {
                 syn::Error::new(args.span, format!("unroll [{}]: {e}", model.source_stem))
             })?;
             model_fuf.annotate_storage_formats(&model_prog, model);
@@ -1220,7 +1041,7 @@ pub fn compile_carrier(
             &sm.fuf,
             &sm.workloads,
             &manifest,
-            &sm.inferred,
+            sm.inferred,
             canonical_override.as_ref(),
             sm.tp_world_size,
             mode.emit_arch_dispatch,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The symbolic dimension: a config bound, a literal, or a product or quotient of those, and the one
 //! canonical order products are written in. The vocabulary every shape in the compiler is spelled
-//! in, shared by the classifier, the weights manifest, the shape solver and the typed-Rust emit pass.
+//! in, shared by the classifier, the weights manifest and the typed-Rust emit pass.
 
 /// A dimension expression.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -14,9 +14,7 @@ pub enum Dim {
     Mul(Vec<Dim>),
     /// Quotient: `numerator / denominator`. Surfaced today only by
     /// DSL-authored reshape arithmetic (`num_tokens /
-    /// vision_merge_factor`). The Solver treats it as concrete:
-    /// `unify` checks structural equality, `walk` / `close_dim`
-    /// recurse into both children. `eval_closed_dim` evaluates by
+    /// vision_merge_factor`), as the typed `Div<A, B>`. `eval_closed_dim` evaluates by
     /// integer division (caller's responsibility to ensure the
     /// dividend is exactly divisible at runtime — the merger
     /// reshape's `total_l / spatial_merge_size**2` is always
@@ -25,14 +23,7 @@ pub enum Dim {
     /// Sum of terms: a packed projection's width, its parts side by side (`gdn_conv_dim`, a
     /// Mamba-2 `in_proj`'s). Canonically flattened like `Mul`: no nested `Add`.
     Add(Vec<Dim>),
-    /// Unresolved variable. Must be resolved before inference
-    /// completes or shape inference reports an error.
-    Var(DimVar),
 }
-
-/// Fresh-var id. Allocated by the [`Solver`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DimVar(pub u32);
 
 /// A tensor shape — an ordered sequence of dims.
 pub type Shape = Vec<Dim>;
@@ -88,7 +79,6 @@ fn dim_cmp(a: &Dim, b: &Dim) -> std::cmp::Ordering {
             Dim::Mul(_) => 2,
             Dim::Add(_) => 3,
             Dim::Div(_, _) => 4,
-            Dim::Var(_) => 5,
         }
     }
     match rank(a).cmp(&rank(b)) {
@@ -99,7 +89,6 @@ fn dim_cmp(a: &Dim, b: &Dim) -> std::cmp::Ordering {
             // Div ordering is opaque (no internal order needed for
             // canonicalization; only one Div per merger reshape today).
             (Dim::Div(_, _), Dim::Div(_, _)) => Ordering::Equal,
-            (Dim::Var(x), Dim::Var(y)) => x.0.cmp(&y.0),
             _ => unreachable!(),
         },
         other => other,

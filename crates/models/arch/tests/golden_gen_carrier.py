@@ -842,8 +842,8 @@ def embed(ids, table):
 
 
 def gemm(x, w):
-    """DSL gemm: w is in the manifest's [K, N] orientation (shape.rs
-    `sig_gemm` unifies x's last dim with w[0]). The [out, in] HF layout
+    """DSL gemm: w is in the manifest's [K, N] orientation (the typed
+    signature `gemm(x: [T, K], w: [K, N])`). The [out, in] HF layout
     is a load-time transpose the Rust side owns — the synthetic
     checkpoint writer mirrors it there, not here."""
     return x @ w

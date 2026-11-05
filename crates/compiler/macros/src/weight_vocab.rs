@@ -32,7 +32,6 @@ pub fn eval_dim_with(dim: &Dim, bounds: &BTreeMap<String, u64>) -> Option<u64> {
             let d = eval_dim_with(den, bounds)?;
             n.checked_div(d)
         }
-        Dim::Var(_) => None,
     }
 }
 

@@ -8,12 +8,18 @@
 //! link this crate itself, whose compile needs the script's output.
 
 use scratchy_forward_compiler_frontend::{
-    classified, classify, dim, draft_capture, hf_config, parse_python, typed_emit, weights_manifest,
+    carrier_facts, classify, parse_python, typed_emit, weights_manifest,
 };
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     emit_typed_carriers();
+    // The compiler this crate builds with: its tests type a program of their own the way this
+    // script's output is typed (`src/typed_bodies.rs`).
+    println!(
+        "cargo:rustc-env=TYPED_SHAPES_RUSTC={}",
+        std::env::var("RUSTC").expect("RUSTC")
+    );
 }
 
 /// Write `$OUT_DIR/typed_carriers.rs`: every carrier under `crates/models/arch/dsl/` as typed
@@ -86,21 +92,16 @@ fn emit_carrier(
         std::fs::read_to_string(&dsl).map_err(|e| format!("read {}: {e}", dsl.display()))?;
     let carrier =
         parse_python::parse_python_file(&source).map_err(|e| format!("{}: {e}", dsl.display()))?;
-    let prelude = if carrier.vision {
-        classified::Prelude::Vision
-    } else {
-        classified::Prelude::Decoder
-    };
-    // The program the bake classifies: a decoder's with the compiler's drafter capture.
-    let ast = match prelude {
-        classified::Prelude::Decoder => draft_capture::insert(&carrier.ast),
-        classified::Prelude::Vision => carrier.ast,
-    };
-    let program = classify::classify_with(&ast, prelude)
+    // The program the bake lowers, by the one construction both use.
+    let program = classify::carrier_program(&carrier)
         .map_err(|e| format!("classify {}: {e}", dsl.display()))?;
     let manifest = weights_manifest::load_or_empty(&configs)
         .map_err(|e| format!("{}: {e:?}", configs.display()))?;
-    let facts = carrier_facts(arch_root, stem, carrier.vision);
+    let mut read = Vec::new();
+    let facts = carrier_facts::carrier_facts(arch_root, stem, carrier.vision, &mut read);
+    for path in read {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     let module = stem.replace('-', "_");
     let file = format!("crates/models/arch/dsl/{stem}.py");
     let emitted = typed_emit::emit(
@@ -118,103 +119,3 @@ fn emit_carrier(
     Ok((emitted, carrier.arch_name, module))
 }
 
-
-/// What the carrier `stem`'s configs and arch.json say about its derived dims, by the config rules
-/// the config loader uses (`hf_config`): each gated rule's flag over every config of the carrier (a
-/// head's: each config of the archs it ships in that carries it), and its arch.json `expr` params.
-fn carrier_facts(
-    arch_root: &std::path::Path,
-    stem: &str,
-    vision: bool,
-) -> typed_emit::CarrierFacts {
-    let configs_dir = arch_root.join("configs").join(stem);
-    let arch_json = configs_dir.join("arch.json");
-    println!("cargo:rerun-if-changed={}", arch_json.display());
-    let read = |path: &std::path::Path| -> serde_json::Value {
-        let text = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("typed emit: read {}: {e}", path.display()));
-        serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("typed emit: parse {}: {e}", path.display()))
-    };
-    let facts = match arch_json.exists() {
-        true => hf_config::arch_facts(&read(&arch_json))
-            .unwrap_or_else(|e| panic!("typed emit: {}: {e}", arch_json.display())),
-        false => hf_config::ArchFacts::default(),
-    };
-    let model_configs = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
-        println!("cargo:rerun-if-changed={}", dir.display());
-        let mut paths: Vec<_> = (std::fs::read_dir(dir).into_iter().flatten().flatten())
-            .map(|e| e.path())
-            .filter(|p| {
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                name.ends_with(".json")
-                    && !name.ends_with(".overrides.json")
-                    && !matches!(name, "weights.json" | "quantizations.json" | "arch.json")
-            })
-            .collect();
-        paths.sort();
-        paths
-    };
-    let mut configs: Vec<(std::path::PathBuf, serde_json::Value)> = model_configs(&configs_dir)
-        .into_iter()
-        .map(|p| {
-            let j = read(&p);
-            (p, j)
-        })
-        .collect();
-    if configs.is_empty() {
-        for target in &facts.checkpoint_of {
-            for p in model_configs(&arch_root.join("configs").join(target)) {
-                let json = read(&p);
-                if hf_config::carries_head(&facts.params, &facts.config_aliases, &json) {
-                    configs.push((p, json));
-                }
-            }
-        }
-    }
-    for (p, _) in &configs {
-        println!("cargo:rerun-if-changed={}", p.display());
-    }
-    // The config loader reads a gated rule's flag on the decoder path only (a vision tower's
-    // bounds are its own `vision_*`): a vision carrier resolves none, and naming one is refused.
-    let mut gated = std::collections::BTreeMap::new();
-    for flag in (dim::DERIVED_DIMS.iter())
-        .filter_map(|d| d.rule.gate_flag())
-        .filter(|_| !vision)
-    {
-        let mut sides: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
-        for (p, json) in &configs {
-            let v = hf_config::flag_value(json, &facts.config_aliases, &facts.bound_defaults, flag);
-            let name = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            sides.entry(v).or_default().push(name);
-        }
-        let resolved = match sides.len() {
-            0 | 1 => Ok(sides.keys().next().copied().unwrap_or(0)),
-            _ => Err(format!(
-                "the configs disagree on `{flag}`: {}",
-                (sides.iter())
-                    .map(|(v, names)| format!("{v} in {}", names.join(", ")))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            )),
-        };
-        gated.insert(flag.to_string(), resolved);
-    }
-    let exprs = (facts.params.iter())
-        .filter_map(|f| match &f.source {
-            hf_config::ParamSource::Expr(e) => Some((f.name.clone(), e)),
-            _ => None,
-        })
-        .map(|(name, e)| {
-            let parsed = hf_config::ParamExpr::parse(e).unwrap_or_else(|err| {
-                panic!("typed emit: {}: param `{name}`: {err}", arch_json.display())
-            });
-            (name, parsed)
-        })
-        .collect();
-    typed_emit::CarrierFacts { gated, exprs }
-}

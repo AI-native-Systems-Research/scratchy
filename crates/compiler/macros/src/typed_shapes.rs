@@ -9,15 +9,14 @@
 //! `x`'s last dim equals `w`'s first, and rustc checks it where a carrier calls it: a shape error
 //! in a carrier is a type error at the generated line, which names the carrier's file and line.
 //!
-//! The emitted functions also RUN: [`Trace`] records, per [`LocalId`], the shape each binding's
-//! type states. That record is the carrier's shapes, symbolic in its config's bounds. Until phase
-//! C of the shapes-as-Rust-types plan (issue #1086) makes it the source, the bake checks it against
-//! `shape::infer`'s ([`check_parity`]).
+//! The emitted functions also RUN: [`Trace`] records the shape each binding's, weight's and nested
+//! value's type states. That record ([`traced`]) is the carrier's shapes, symbolic in its config's
+//! bounds, and every later pass reads it: rustc's type checker is the one shape checker.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use crate::classified::LocalId;
+use crate::classified::{LocalId, WeightId};
 use crate::dim::{Dim, canonical_add, canonical_mul};
 
 /// A dim as a type: the symbolic [`Dim`] it stands for.
@@ -42,7 +41,7 @@ macro_rules! bounds {
         }
         impl DimType for $marker {
             fn dim() -> Dim {
-                Dim::Bound($name.to_string())
+                Dim::Bound(<Self as Bound>::NAME.to_string())
             }
         }
     )*};
@@ -176,6 +175,18 @@ impl<T: DimType> Traced for Tokens<T> {
     }
 }
 
+impl<D: DimType> Traced for W1<D> {
+    fn shape() -> Vec<Dim> {
+        vec![D::dim()]
+    }
+}
+
+impl<K: DimType, N: DimType> Traced for W2<K, N> {
+    fn shape() -> Vec<Dim> {
+        vec![K::dim(), N::dim()]
+    }
+}
+
 /// A tuple of traced values, bound to as many locals.
 pub trait TracedTuple<const N: usize> {
     /// Each element's shape, in order.
@@ -194,25 +205,76 @@ impl<A: Traced, B: Traced, C: Traced> TracedTuple<3> for (A, B, C) {
     }
 }
 
-/// The shapes a run of an emitted carrier bound, per local.
+/// The shapes a run of an emitted carrier states: every local it binds, every weight it reads, and
+/// every value an expression computes inside a statement (a nested call, an elementwise product).
 #[derive(Debug, Default)]
 pub struct Trace {
-    shapes: HashMap<LocalId, Vec<Dim>>,
+    shapes: std::cell::RefCell<Shapes>,
+}
+
+/// [`Trace`]'s record.
+#[derive(Debug, Default, Clone)]
+pub struct Shapes {
+    /// Each local's shape.
+    pub locals: HashMap<LocalId, Vec<Dim>>,
+    /// Each weight's, as its type declares it.
+    pub weights: HashMap<WeightId, Vec<Dim>>,
+    /// Each nested value's: keyed by the statement's (first) target and the value's place among the
+    /// statement's nested values, in the order they are computed (an operand before its user).
+    pub nested: HashMap<(LocalId, u32), Vec<Dim>>,
+    /// The program it was emitted from: each of its locals' names, by `LocalId`. The trace is keyed
+    /// by those ids, so a reader holds the same program ([`Self::locals_of`]).
+    pub program: Vec<String>,
+}
+
+impl Shapes {
+    /// Whether `names` (each local's name, by `LocalId`) are the program the trace was emitted
+    /// from: its ids mean the same locals.
+    pub fn locals_of<S: AsRef<str>>(&self, names: &[S]) -> bool {
+        self.program.len() == names.len()
+            && (self.program.iter())
+                .zip(names)
+                .all(|(a, b)| a == b.as_ref())
+    }
 }
 
 impl Trace {
     /// Record `value`'s shape as local `id`'s, and pass it on.
-    pub fn bind<A: Traced>(&mut self, id: u32, value: A) -> A {
-        self.shapes.insert(LocalId(id), A::shape());
+    pub fn bind<A: Traced>(&self, id: u32, value: A) -> A {
+        self.shapes
+            .borrow_mut()
+            .locals
+            .insert(LocalId(id), A::shape());
         value
     }
 
     /// [`Self::bind`], for a tuple bound to the locals `ids`.
-    pub fn bind_tuple<const N: usize, A: TracedTuple<N>>(&mut self, ids: [u32; N], value: A) -> A {
+    pub fn bind_tuple<const N: usize, A: TracedTuple<N>>(&self, ids: [u32; N], value: A) -> A {
+        let mut shapes = self.shapes.borrow_mut();
         for (id, shape) in ids.into_iter().zip(A::shapes()) {
-            self.shapes.insert(LocalId(id), shape);
+            shapes.locals.insert(LocalId(id), shape);
         }
         value
+    }
+
+    /// Record weight `id`'s declared shape, and pass it on.
+    pub fn weight<A: Traced>(&self, id: u32, value: A) -> A {
+        self.shapes
+            .borrow_mut()
+            .weights
+            .insert(WeightId(id), A::shape());
+        value
+    }
+
+    /// Record `value`'s shape as the `n`th nested value of the statement binding local `target`.
+    pub fn nested<A: Traced>(&self, target: u32, n: u32, value: A) -> A {
+        (self.shapes.borrow_mut().nested).insert((LocalId(target), n), A::shape());
+        value
+    }
+
+    /// Record the program the trace is of: each of its locals' names, by `LocalId`.
+    pub fn program(&self, locals: &[&str]) {
+        self.shapes.borrow_mut().program = locals.iter().map(|l| l.to_string()).collect();
     }
 
     /// A loop's body, run once: its locals' shapes are their types', the same every iteration.
@@ -220,9 +282,9 @@ impl Trace {
         0..1
     }
 
-    /// The shapes recorded, per local.
-    pub fn shapes(&self) -> &HashMap<LocalId, Vec<Dim>> {
-        &self.shapes
+    /// The shapes recorded.
+    pub fn into_shapes(self) -> Shapes {
+        self.shapes.into_inner()
     }
 }
 
@@ -794,88 +856,13 @@ pub mod ops {
 // `typed_program`, which names each carrier's traced function by its arch.
 include!(concat!(env!("OUT_DIR"), "/typed_carriers.rs"));
 
-/// A traced shape and `shape::infer`'s for the same local, under one model's bounds.
-#[derive(Debug)]
-pub struct ParityMismatch {
-    pub local: LocalId,
-    pub name: String,
-    pub line: Option<u32>,
-    pub traced: Option<Vec<Dim>>,
-    pub inferred: Option<Vec<Dim>>,
-}
-
-/// TRANSITIONAL — deleted with `shape.rs`'s solver in phase C, when the trace becomes the source.
-///
-/// The carrier `arch`'s traced shapes against `inferred` (what `shape::infer` closed for one model),
-/// local by local, each evaluated under `bounds` with `num_tokens` set. A local `inferred` shapes
-/// that `classified` never bound is one reshape recovery added, which the trace (over the
-/// classifier's program) cannot name: those are returned apart, as `recovered`.
-///
-/// `None` when `arch` has no typed program.
-pub fn check_parity(
-    arch: &str,
-    classified: &crate::classified::Program,
-    inferred: &HashMap<LocalId, Vec<Dim>>,
-    bounds: &BTreeMap<String, u64>,
-) -> Option<Parity> {
+/// The shapes of the carrier whose arch is `arch`: its typed program, run. `None` when the emit
+/// pass typed no carrier of that arch.
+pub fn traced(arch: &str) -> Option<Shapes> {
     let forward = typed_program(arch)?;
-    let mut trace = Trace::default();
-    forward(&mut trace);
-    // A row count no bound equals, so a dim that confused rows with features shows.
-    const NUM_TOKENS: u64 = 7919;
-    let mut bounds = bounds.clone();
-    bounds.insert(NumTokens::NAME.to_string(), NUM_TOKENS);
-    let eval = |shape: &Vec<Dim>| -> Option<Vec<u64>> {
-        shape
-            .iter()
-            .map(|d| crate::shape::eval_closed_dim(d, &bounds))
-            .collect()
-    };
-    let mut mismatches = Vec::new();
-    let mut compared = 0;
-    for id in classified.locals.ids() {
-        let traced = trace.shapes().get(&id);
-        let inferred = inferred.get(&id);
-        let agree = match (traced, inferred) {
-            (Some(t), Some(i)) => {
-                compared += 1;
-                eval(t).is_some() && eval(t) == eval(i)
-            }
-            (None, None) => true,
-            _ => false,
-        };
-        if !agree {
-            mismatches.push(ParityMismatch {
-                local: id,
-                name: classified.locals.name(id).to_string(),
-                line: classified.locals.line(id),
-                traced: traced.cloned(),
-                inferred: inferred.cloned(),
-            });
-        }
-    }
-    let bound: std::collections::HashSet<LocalId> = classified.locals.ids().collect();
-    let mut recovered: Vec<LocalId> = (inferred.keys())
-        .filter(|id| !bound.contains(id))
-        .copied()
-        .collect();
-    recovered.sort_by_key(|id| id.0);
-    Some(Parity {
-        compared,
-        mismatches,
-        recovered,
-    })
-}
-
-/// [`check_parity`]'s verdict.
-#[derive(Debug)]
-pub struct Parity {
-    /// How many locals both sides shaped, and so were compared.
-    pub compared: usize,
-    /// Every local whose shapes differ, or that one side shaped and the other did not.
-    pub mismatches: Vec<ParityMismatch>,
-    /// The locals reshape recovery added: none of the classifier's, so outside the trace.
-    pub recovered: Vec<LocalId>,
+    let trace = Trace::default();
+    forward(&trace);
+    Some(trace.into_shapes())
 }
 
 #[cfg(test)]

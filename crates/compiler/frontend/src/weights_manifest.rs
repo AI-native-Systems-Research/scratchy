@@ -8,8 +8,8 @@
 //! `probe-weights` bin in the `scratchy-forward-compiler` crate by probing a
 //! representative checkpoint's safetensors headers.
 //!
-//! Shape inference uses this manifest to anchor weight shapes that
-//! dataflow can't pin by itself (the canonical example: Qwen3/Gemma3
+//! The typed-Rust emit pass types every weight by this manifest, so
+//! rustc checks the DSL's use of it against the declaration (the canonical example: Qwen3/Gemma3
 //! per-head `q_norm` of shape `[head_dim]`, where a naïve op-signature
 //! inference would resolve to `[heads * head_dim]` via the upstream
 //! gemm). Unlike the old `weight_conventions.rs` table, the manifest
@@ -118,7 +118,7 @@ impl WeightsManifest {
 
     /// Empty manifest — used when an arch directory has no
     /// `weights.json` yet (arches predating the probe workflow).
-    /// Shape inference falls back to its dataflow-only behavior.
+    /// The typed emit refuses any weight it would have to type.
     pub fn empty() -> Self {
         Self::default()
     }

@@ -98,9 +98,6 @@ pub fn dim_type(dim: &Dim, bounds: &mut BTreeSet<String>) -> Result<String, Stri
             dim_type(n, bounds)?,
             dim_type(d, bounds)?
         )),
-        Dim::Var(_) => Err(format!(
-            "the typed emit has no type for the dim `{dim:?}` yet"
-        )),
     }
 }
 
@@ -198,7 +195,8 @@ pub fn emit(c: &Carrier<'_>, base_bounds: &mut BTreeSet<String>) -> Result<Strin
          \x20   /// The weights it reads, at their declared shapes.\n\
          \x20   pub struct Weights {{\n{weights}    }}\n\n\
          \x20   /// `{file}`'s program, statement for statement.\n\
-         \x20   pub fn forward<T: DimType>(tr: &mut Trace) {{\n\
+         \x20   pub fn forward<T: DimType>(tr: &Trace) {{\n\
+         \x20       tr.program(&[{locals}]);\n\
          \x20       let inputs = Inputs::<T, {input_widths}>::declared();\n\
          \x20       let w = Weights {{\n{init}        }};\n{body}    }}\n\
          }}\n",
@@ -206,6 +204,10 @@ pub fn emit(c: &Carrier<'_>, base_bounds: &mut BTreeSet<String>) -> Result<Strin
         module = c.module,
         body = cx.out,
         input_widths = INPUT_BOUNDS.map(marker).join(", "),
+        locals = (c.program.locals.ids())
+            .map(|id| format!("{:?}", c.program.locals.name(id).to_string()))
+            .collect::<Vec<_>>()
+            .join(", "),
     ))
 }
 
@@ -337,7 +339,7 @@ pub fn emit_dispatch(carriers: &[(String, String)]) -> String {
         .collect();
     format!(
         "/// The traced function of the carrier whose arch is `arch`, if the emit pass typed it.\n\
-         pub fn typed_program(arch: &str) -> Option<fn(&mut Trace)> {{\n\
+         pub fn typed_program(arch: &str) -> Option<fn(&Trace)> {{\n\
          \x20   match arch {{\n{arms}        _ => None,\n    }}\n}}\n\n\
          /// The derived dims of the carrier whose arch is `arch`, each as its type states it.\n\
          #[cfg(test)]\n\
@@ -516,7 +518,7 @@ impl Cx<'_, '_> {
                 self.line(depth, &text);
             }
             Stmt::Assign { target, value } => {
-                let e = self.expr(value)?;
+                let e = self.top(value, *target)?;
                 let text = format!(
                     "let {} = tr.bind({}, {e});{}",
                     self.binder(*target),
@@ -526,10 +528,10 @@ impl Cx<'_, '_> {
                 self.line(depth, &text);
             }
             Stmt::AssignTuple { targets, value } => {
-                let e = self.expr(value)?;
+                let first = targets.first().ok_or("an empty tuple assignment")?;
+                let e = self.top(value, *first)?;
                 let binders: Vec<String> = targets.iter().map(|t| self.binder(*t)).collect();
                 let ids: Vec<String> = targets.iter().map(|t| t.0.to_string()).collect();
-                let first = targets.first().ok_or("an empty tuple assignment")?;
                 let text = format!(
                     "let ({}) = tr.bind_tuple([{}], {e});{}",
                     binders.join(", "),
@@ -647,17 +649,42 @@ impl Cx<'_, '_> {
             "let {}: {ty} = tr.bind({}, ops::{op}({}));{}",
             self.binder(target),
             target.0,
-            self.expr(source)?,
+            self.expr(source, &mut Nest::of(target))?,
             self.origin(target)
         ))
     }
 
-    fn expr(&self, e: &Expr) -> Result<String, String> {
+    /// A statement's value, binding local `target` (a tuple's first): its operands each go through
+    /// [`Self::expr`], so the trace records every nested value under `target`.
+    fn top(&self, e: &Expr, target: LocalId) -> Result<String, String> {
+        let mut nest = Nest::of(target);
+        match e {
+            Expr::Call { .. } | Expr::Mul { .. } => self.value(e, &mut nest),
+            _ => self.expr(e, &mut nest),
+        }
+    }
+
+    /// `e`, an operand inside a statement: a call or product is recorded as the statement's next
+    /// nested value, after its own operands.
+    fn expr(&self, e: &Expr, nest: &mut Nest) -> Result<String, String> {
+        match e {
+            Expr::Call { .. } | Expr::Mul { .. } => {
+                let value = self.value(e, nest)?;
+                let n = nest.next;
+                nest.next += 1;
+                Ok(format!("tr.nested({}, {n}, {value})", nest.target.0))
+            }
+            _ => self.value(e, nest),
+        }
+    }
+
+    fn value(&self, e: &Expr, nest: &mut Nest) -> Result<String, String> {
         Ok(match e {
             Expr::Local(id) => format!("l{}", id.0),
             Expr::Extern { kind, .. } => format!("inputs.{}", kind.name()),
             Expr::Weight { id, .. } => {
-                format!("w.{}", field_name(self.c.program.weights.path(*id)))
+                let field = field_name(self.c.program.weights.path(*id));
+                format!("tr.weight({}, w.{field})", id.0)
             }
             // A sum with a scalar operand offsets the tensor (Gemma's `(1 + w)` norm weight).
             Expr::Call { op, args }
@@ -666,11 +693,15 @@ impl Cx<'_, '_> {
                     && (is_scalar(a) || is_scalar(b)) =>
             {
                 let (x, s) = if is_scalar(b) { (a, b) } else { (b, a) };
-                format!("ops::offset({}, {})", self.expr(x)?, self.expr(s)?)
+                format!(
+                    "ops::offset({}, {})",
+                    self.expr(x, nest)?,
+                    self.expr(s, nest)?
+                )
             }
             Expr::Call { op, args } => {
                 let args = (args.iter())
-                    .map(|a| self.expr(a))
+                    .map(|a| self.expr(a, nest))
                     .collect::<Result<Vec<_>, _>>()?;
                 let name = (ARITY_FORMS.iter())
                     .find(|(o, arity, _)| o == op && *arity == args.len())
@@ -687,13 +718,37 @@ impl Cx<'_, '_> {
             }
             // A product with a scalar operand scales the tensor; two tensors multiply elementwise.
             Expr::Mul { lhs, rhs } => match (is_scalar(lhs), is_scalar(rhs)) {
-                (false, true) => format!("ops::scale({}, {})", self.expr(lhs)?, self.expr(rhs)?),
-                (true, false) => format!("ops::scale({}, {})", self.expr(rhs)?, self.expr(lhs)?),
-                _ => format!("ops::mul({}, {})", self.expr(lhs)?, self.expr(rhs)?),
+                (false, true) => format!(
+                    "ops::scale({}, {})",
+                    self.expr(lhs, nest)?,
+                    self.expr(rhs, nest)?
+                ),
+                (true, false) => format!(
+                    "ops::scale({}, {})",
+                    self.expr(rhs, nest)?,
+                    self.expr(lhs, nest)?
+                ),
+                _ => format!(
+                    "ops::mul({}, {})",
+                    self.expr(lhs, nest)?,
+                    self.expr(rhs, nest)?
+                ),
             },
             Expr::ScalarLit(_) | Expr::SqrtBound(_) | Expr::ConfigScalar { .. } => {
                 "Scalar".to_string()
             }
         })
+    }
+}
+
+/// Where a statement's nested values are recorded: its target, and the next value's place.
+struct Nest {
+    target: LocalId,
+    next: u32,
+}
+
+impl Nest {
+    fn of(target: LocalId) -> Self {
+        Self { target, next: 0 }
     }
 }

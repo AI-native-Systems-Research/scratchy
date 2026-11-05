@@ -4,14 +4,12 @@
 
 mod draft_capture {
     use crate::ast::{Ast, Stmt};
-    use crate::draft_capture::{DRAFT_CAPTURE_LAYERS, insert};
     use crate::cfg::build_cfg;
     use crate::classified::OpKind;
-    use crate::classify::classify;
     use crate::config::{self, LayerSet, ModelParams};
+    use crate::draft_capture::{DRAFT_CAPTURE_LAYERS, insert};
     use crate::fuf::{Fuf, FufInput, unroll};
     use crate::parse_python::parse_body;
-    use crate::shape::infer;
     use std::path::PathBuf;
 
     /// A decoder: an embedding, a layer loop carrying `hidden_states`, the final norm and head.
@@ -36,9 +34,8 @@ mod draft_capture {
     }
 
     fn unroll_ast(ast: &Ast, params: &ModelParams) -> Fuf {
-        let program = classify(ast).expect("classify");
         let manifest = crate::weights_manifest::WeightsManifest::llama_test_conventions();
-        let inferred = infer(&program, &manifest, &Default::default()).expect("infer");
+        let (program, inferred) = crate::typed_bodies::trace_ast(ast, DECODER, &manifest);
         let cfg = build_cfg(&program, params).expect("build cfg");
         unroll(&cfg, &inferred).expect("unroll")
     }

@@ -9,6 +9,7 @@
 //! that crate's build script runs the emit pass on it before the macro crate compiles.
 
 pub mod ast;
+pub mod carrier_facts;
 pub mod classified;
 pub mod classify;
 pub mod dim;

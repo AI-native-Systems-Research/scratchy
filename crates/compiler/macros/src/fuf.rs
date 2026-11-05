@@ -152,6 +152,11 @@ pub enum UnrollError {
     MissingShape {
         id: LocalId,
     },
+    /// A value nested in the statement binding `target` (its `n`th) has no traced shape.
+    MissingNestedShape {
+        target: LocalId,
+        n: u32,
+    },
 }
 
 impl std::fmt::Display for UnrollError {
@@ -162,6 +167,11 @@ impl std::fmt::Display for UnrollError {
             }
             Self::UnsupportedCfgShape(s) => write!(f, "unsupported CFG shape: {s}"),
             Self::MissingShape { id } => write!(f, "no inferred shape for local {:?}", id.0),
+            Self::MissingNestedShape { target, n } => write!(
+                f,
+                "no traced shape for nested value {n} of the statement binding local {:?}",
+                target.0
+            ),
         }
     }
 }
@@ -227,6 +237,7 @@ pub fn unroll(cfg: &Cfg, inferred: &Inferred) -> Result<Fuf, UnrollError> {
         nodes: Vec::new(),
         local_to_tile: HashMap::new(),
         loop_vars: HashMap::new(),
+        nest: (LocalId(0), 0),
     };
     u.walk(cfg.entry)?;
     Ok(Fuf { nodes: u.nodes })
@@ -243,6 +254,9 @@ struct Unroller<'a> {
     /// Current concrete value of each for-loop induction variable.
     /// Populated at loop entry, popped at exit.
     loop_vars: HashMap<LocalId, u64>,
+    /// The statement being lowered (its first target) and how many of its nested values are
+    /// pushed: the key of the next one's traced shape (`Inferred::nested`).
+    nest: (LocalId, u32),
 }
 
 impl<'a> Unroller<'a> {
@@ -408,11 +422,12 @@ impl<'a> Unroller<'a> {
                     .get(target)
                     .cloned()
                     .ok_or(UnrollError::MissingShape { id: *target })?;
+                self.nest = (*target, 0);
                 let (op, inputs) = match value {
                     Expr::Call { op, args } => {
                         let inputs = args
                             .iter()
-                            .map(|a| self.resolve_arg(a).map(|(inp, _)| inp))
+                            .map(|a| self.resolve_arg(a))
                             .collect::<Result<Vec<_>, _>>()?;
                         (*op, inputs)
                     }
@@ -421,8 +436,8 @@ impl<'a> Unroller<'a> {
                     // the `ScalarMulImpl` (or a future tensor×tensor
                     // fusion) claims.
                     Expr::Mul { lhs, rhs } => {
-                        let (l, _) = self.resolve_arg(lhs)?;
-                        let (r, _) = self.resolve_arg(rhs)?;
+                        let l = self.resolve_arg(lhs)?;
+                        let r = self.resolve_arg(rhs)?;
                         (OpKind::Mul, vec![l, r])
                     }
                     other => {
@@ -436,6 +451,10 @@ impl<'a> Unroller<'a> {
                 Ok(())
             }
             Instr::AssignTuple { targets, value } => {
+                let first = targets.first().ok_or_else(|| {
+                    UnrollError::UnsupportedCfgShape("an empty tuple assignment".into())
+                })?;
+                self.nest = (*first, 0);
                 let inputs = self.resolve_args_from_expr(value)?;
                 let op = match value {
                     Expr::Call { op, .. } => *op,
@@ -472,111 +491,61 @@ impl<'a> Unroller<'a> {
         match expr {
             Expr::Call { args, .. } => args
                 .iter()
-                .map(|a| self.resolve_arg(a).map(|(inp, _shape)| inp))
+                .map(|a| self.resolve_arg(a))
                 .collect::<Result<Vec<_>, _>>(),
             _ => unreachable!("RHS must be a Call; caller checks"),
         }
     }
 
-    /// Turn a classified Expr that appears as an op arg into a
-    /// `FufInput` plus the resolved shape of that input.
-    ///
-    /// The shape is load-bearing: nested calls push helper tiles
-    /// whose output shape must be correct so downstream cost
-    /// functions can evaluate them. A Mul tile whose operands came
-    /// from nested Calls, for example, feeds a downstream GEMM —
-    /// if the Mul's output shape is empty, the GEMM's cost returns
-    /// None and the solver errors out.
-    fn resolve_arg(&mut self, expr: &Expr) -> Result<(FufInput, Shape), UnrollError> {
+    /// Turn a classified Expr that appears as an op arg into a `FufInput`. A nested call or
+    /// product becomes a helper tile at the shape its type states (the trace's), so downstream
+    /// cost functions can evaluate it.
+    fn resolve_arg(&mut self, expr: &Expr) -> Result<FufInput, UnrollError> {
         match expr {
             Expr::Local(id) => {
                 let &(tile, slot) = self
                     .local_to_tile
                     .get(id)
                     .ok_or(UnrollError::MissingLocal { id: *id })?;
-                let shape = self.nodes[tile.0 as usize]
-                    .outputs
-                    .get(slot as usize)
-                    .cloned()
-                    .unwrap_or_default();
-                Ok((FufInput::Tile { id: tile, slot }, shape))
+                Ok(FufInput::Tile { id: tile, slot })
             }
             Expr::Extern { kind, index } => {
                 let index = index
                     .map(|lid| self.loop_var_value(lid))
                     .transpose()?
                     .map(UnrollIndex);
-                let shape = crate::shape::extern_shape(*kind);
-                Ok((FufInput::Extern { kind: *kind, index }, shape))
+                Ok(FufInput::Extern { kind: *kind, index })
             }
             Expr::Weight { id, index } => {
                 let index = index
                     .map(|lid| self.loop_var_value(lid))
                     .transpose()?
                     .map(UnrollIndex);
-                let shape = self.inferred.weights.get(id).cloned().unwrap_or_default();
-                Ok((
-                    FufInput::Weight {
-                        id: *id,
-                        index,
-                        storage: StorageFormat::Dense,
-                    },
-                    shape,
-                ))
+                Ok(FufInput::Weight {
+                    id: *id,
+                    index,
+                    storage: StorageFormat::Dense,
+                })
             }
             Expr::Call { op, args } => {
-                // Nested call — promote it to its own tile. Compute
-                // its output shape via the op's signature so the
-                // FUF carries real shapes for downstream cost
-                // evaluation.
-                let resolved: Vec<(FufInput, Shape)> = args
+                let inputs: Vec<FufInput> = args
                     .iter()
                     .map(|a| self.resolve_arg(a))
                     .collect::<Result<_, _>>()?;
-                let (inputs, input_shapes): (Vec<FufInput>, Vec<Shape>) =
-                    resolved.into_iter().unzip();
-                let mut throwaway = crate::shape::Solver::new();
-                let sig = crate::shape::apply_signature_with_geometry(
-                    &mut throwaway,
-                    *op,
-                    &input_shapes,
-                    self.inferred.hybrid_attention_geometry,
-                )
-                .map_err(|e| {
-                    UnrollError::UnsupportedCfgShape(format!("nested {} shape: {e}", op.as_str()))
-                })?;
-                let out_shape = sig.output.clone();
-                let tile_id = self.push_tile(*op, inputs, vec![sig.output]);
-                Ok((
-                    FufInput::Tile {
-                        id: tile_id,
-                        slot: 0,
-                    },
-                    out_shape,
-                ))
+                let shape = self.nested_shape()?;
+                let id = self.push_tile(*op, inputs, vec![shape]);
+                Ok(FufInput::Tile { id, slot: 0 })
             }
+            // Elementwise multiplication (DSL's `*`, e.g. `gate * up`).
             Expr::Mul { lhs, rhs } => {
-                // Elementwise multiplication (DSL's `*`, e.g.
-                // `gate * up`). Output shape equals either operand;
-                // we take the left operand's shape since shape
-                // inference has already unified the two.
-                let (l, l_shape) = self.resolve_arg(lhs)?;
-                let (r, _r_shape) = self.resolve_arg(rhs)?;
-                let tile_id = self.push_tile(OpKind::Mul, vec![l, r], vec![l_shape.clone()]);
-                Ok((
-                    FufInput::Tile {
-                        id: tile_id,
-                        slot: 0,
-                    },
-                    l_shape,
-                ))
+                let l = self.resolve_arg(lhs)?;
+                let r = self.resolve_arg(rhs)?;
+                let shape = self.nested_shape()?;
+                let id = self.push_tile(OpKind::Mul, vec![l, r], vec![shape]);
+                Ok(FufInput::Tile { id, slot: 0 })
             }
-            Expr::ScalarLit(v) => {
-                // Scalar literal — rides along as a tile input with
-                // an empty shape (rank-0) so shape inference treats
-                // it as a broadcastable scalar.
-                Ok((FufInput::Scalar(*v), Shape::new()))
-            }
+            // Scalar literal — rides along as a tile input (rank-0, a broadcastable scalar).
+            Expr::ScalarLit(v) => Ok(FufInput::Scalar(*v)),
             Expr::SqrtBound(_) => unreachable!(
                 "Expr::SqrtBound should have been folded to Expr::ScalarLit by \
                  cfg.rs::fold_scalars before reaching the unroller"
@@ -586,6 +555,14 @@ impl<'a> Unroller<'a> {
                  cfg.rs::fold_scalars before reaching the unroller"
             ),
         }
+    }
+
+    /// The traced shape of the statement's next nested value.
+    fn nested_shape(&mut self) -> Result<Shape, UnrollError> {
+        let (target, n) = self.nest;
+        self.nest.1 += 1;
+        (self.inferred.nested.get(&(target, n)).cloned())
+            .ok_or(UnrollError::MissingNestedShape { target, n })
     }
 
     fn loop_var_value(&self, id: LocalId) -> Result<u64, UnrollError> {
@@ -613,16 +590,9 @@ impl<'a> Unroller<'a> {
 mod tests {
     use super::*;
     use crate::cfg::build_cfg;
-    use crate::classify::classify;
     use crate::config::{self, ModelParams};
-    use crate::parse_python::parse_body;
-    use crate::shape::{Dim, infer};
+    use crate::shape::Dim;
     use std::path::PathBuf;
-
-    fn classify_src(src: &str) -> crate::classified::Program {
-        let ast = parse_body(src).expect("parse DSL");
-        classify(&ast).expect("classify")
-    }
 
     fn llama_3_2_1b_params() -> ModelParams {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -633,15 +603,12 @@ mod tests {
         config::load_file(&path).expect("load config")
     }
 
-    /// Glue helper: classify → infer shapes → build CFG → unroll.
+    /// Glue helper: classify → type and trace the shapes → build CFG → unroll.
     fn unroll_src(src: &str, params: &ModelParams) -> Fuf {
-        let program = classify_src(src);
-        let inferred = infer(
-            &program,
+        let (program, inferred) = crate::typed_bodies::trace_body(
+            src,
             &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
-            &std::collections::BTreeMap::new(),
-        )
-        .expect("infer");
+        );
         let cfg = build_cfg(&program, params).expect("build cfg");
         unroll(&cfg, &inferred).expect("unroll")
     }
@@ -748,8 +715,7 @@ mod tests {
                         | Dim::Bound(_)
                         | Dim::Mul(_)
                         | Dim::Add(_)
-                        | Dim::Div(_, _)
-                        | Dim::Var(_) => {}
+                        | Dim::Div(_, _) => {}
                     }
                 }
             }

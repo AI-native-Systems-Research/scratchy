@@ -2,46 +2,48 @@
 //! The typed-Rust emit pass and its signatures, against the carriers and configs on disk: the
 //! checks that name an arch, kept out of the two modules that must name none.
 
-use crate::typed_shapes::check_parity;
-
-/// Phase A's gate 1, on every config of the arch the emit pass typed (the bake checks it on
-/// the configs a build selects; this, on all of them): the classifier's every local has the
-/// shape `shape::infer` closes for that config, and reshape recovery adds none.
+/// Every classifier local of the typed llama but its loop variable has a traced shape, and every
+/// config's program unrolls from them.
 #[test]
-fn the_typed_llama_traces_what_shape_infer_closes_for_every_config() {
-    let program = typed_carrier_parity("llama", 13);
-    // Every local the classifier bound but the loop variable is shaped by both sides.
-    assert_eq!(program.1, program.0.locals.ids().count() - 1);
+fn the_typed_llama_shapes_every_local_and_unrolls_on_every_config() {
+    let (program, shaped) = typed_carrier_unrolls("llama", 13);
+    assert_eq!(shaped, program.locals.ids().count() - 1);
 }
 
-/// Phase B's parity on Gemma 4 (per-class attention, its per-head norms as explicit reshapes):
-/// every config, every classifier local, and no reshape recovery left.
+/// Gemma 4 (per-class attention, its per-head norms as explicit reshapes) unrolls from its trace
+/// on every config.
 #[test]
-fn the_typed_gemma4_traces_what_shape_infer_closes_for_every_config() {
-    typed_carrier_parity("gemma4", 4);
+fn the_typed_gemma4_unrolls_on_every_config() {
+    typed_carrier_unrolls("gemma4", 4);
 }
 
-/// Gate 1 on every config of the typed carrier `stem` (`configs` of them): the classifier's every
-/// local has the shape `shape::infer` closes for that config, and recovery adds no reshape. The
-/// classified program and the fewest locals any config compared.
-fn typed_carrier_parity(stem: &str, configs: usize) -> (crate::classified::Program, usize) {
+/// The typed carrier `stem` (`configs` of them) as the bake lowers it: its trace shapes every local
+/// the classifier binds but a loop variable, and every config's program (its identity regroupings
+/// erased) unrolls from that trace, every nested value found. The classified program and how many
+/// locals the trace shapes.
+fn typed_carrier_unrolls(stem: &str, configs: usize) -> (crate::classified::Program, usize) {
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let source = std::fs::read_to_string(arch.join(format!("dsl/{stem}.py"))).expect("carrier");
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
-    // The program the bake classifies: a decoder's with the compiler's drafter capture.
-    let (ast, prelude) = match carrier.vision {
-        true => (carrier.ast.clone(), crate::classified::Prelude::Vision),
-        false => (
-            crate::draft_capture::insert(&carrier.ast),
-            crate::classified::Prelude::Decoder,
-        ),
-    };
-    let program = crate::classify::classify_with(&ast, prelude).unwrap();
-    let configs_dir = arch.join("configs").join(stem);
-    let manifest = crate::weights_manifest::load_or_empty(&configs_dir).expect("manifest");
+    // The program the bake lowers.
+    let program = crate::classify::carrier_program(&carrier).unwrap();
+    let inferred = crate::typed_shapes::traced(&carrier.arch_name)
+        .unwrap_or_else(|| panic!("{stem} has a typed program"));
+    assert!(
+        inferred.locals_of(&local_names(&program)),
+        "{stem}: the trace is of the program the bake lowers"
+    );
+    let loop_vars = loop_vars(&program.statements);
+    let unshaped: Vec<String> = (program.locals.ids())
+        .filter(|id| !inferred.locals.contains_key(id) && !loop_vars.contains(id))
+        .map(|id| program.locals.name(id).to_string())
+        .collect();
+    assert!(
+        unshaped.is_empty(),
+        "{stem}: no traced shape for {unshaped:?}"
+    );
     let models = carrier_models(&arch, stem, carrier.vision);
     assert_eq!(models.len(), configs, "{stem}'s configs");
-    let mut fewest = usize::MAX;
     for (cfg, _, model) in models {
         let model = model.unwrap_or_else(|e| panic!("{cfg}: {e:?}"));
         let mut prog = program.clone();
@@ -49,29 +51,61 @@ fn typed_carrier_parity(stem: &str, configs: usize) -> (crate::classified::Progr
             prog.decoder_safetensors_prefix = model.arch.decoder_prefix.clone();
         }
         prog.weight_leaf_renames = model.arch.weight_leaf_renames.clone();
-        let inferred = crate::shape::infer(&prog, &manifest, &model.bounds)
-            .unwrap_or_else(|e| panic!("{cfg}: shape::infer, reshape recovery included: {e}"));
-        let parity = check_parity(
-            &carrier.arch_name,
-            &program,
-            &inferred.locals,
-            &model.bounds,
-        )
-        .unwrap_or_else(|| panic!("{stem} has a typed program"));
-        assert!(
-            parity.mismatches.is_empty(),
-            "{cfg}: {:#?}",
-            parity.mismatches
-        );
-        assert!(parity.recovered.is_empty(), "{cfg}: {:?}", parity.recovered);
-        assert!(parity.compared > 0, "{cfg}: nothing compared");
-        fewest = fewest.min(parity.compared);
-        eprintln!(
-            "{cfg}: {} locals, 0 reshape-recovery hints",
-            parity.compared
-        );
+        crate::shape::erase_identity_regroupings(&mut prog, &inferred, &model.bounds);
+        let cfg_ = crate::cfg::build_cfg(&prog, &model).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        let fuf = crate::fuf::unroll(&cfg_, &inferred).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        assert!(!fuf.nodes.is_empty(), "{cfg}: nothing unrolled");
     }
-    (program, fewest)
+    (program, inferred.locals.len())
+}
+
+/// Each of `program`'s locals' names, by `LocalId`.
+fn local_names(program: &crate::classified::Program) -> Vec<String> {
+    (program.locals.ids())
+        .map(|id| program.locals.name(id).to_string())
+        .collect()
+}
+
+/// The trace knows the program it is of: llama's is of the program the bake lowers (the drafter
+/// capture inserted), and not of the program its DSL alone classifies to, whose locals it would
+/// misname.
+#[test]
+fn a_trace_is_of_its_own_program_only() {
+    let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
+    let source = std::fs::read_to_string(arch.join("dsl/llama.py")).expect("llama.py");
+    let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
+    let inferred = crate::typed_shapes::traced(&carrier.arch_name).expect("typed");
+    let lowered = crate::classify::carrier_program(&carrier).unwrap();
+    assert!(inferred.locals_of(&local_names(&lowered)));
+    let written = crate::classify::classify(&carrier.ast).unwrap();
+    assert_ne!(local_names(&written), local_names(&lowered));
+    assert!(!inferred.locals_of(&local_names(&written)));
+}
+
+/// Every loop variable the program binds.
+fn loop_vars(
+    stmts: &[crate::classified::Stmt],
+) -> std::collections::HashSet<crate::classified::LocalId> {
+    use crate::classified::Stmt;
+    let mut out = std::collections::HashSet::new();
+    for s in stmts {
+        match s {
+            Stmt::For { ivar, body, .. } => {
+                out.insert(*ivar);
+                out.extend(loop_vars(body));
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                out.extend(loop_vars(then_body));
+                out.extend(loop_vars(else_body));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Every name a carrier or a model config goes by: the `dsl/` file stems and the config stems.
@@ -123,33 +157,6 @@ fn the_emit_pass_and_its_signatures_name_no_arch_or_model() {
     }
 }
 
-/// The parity check sees a difference: one local's inferred shape changed is a mismatch naming it.
-#[test]
-fn a_changed_shape_is_a_parity_mismatch() {
-    let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
-    let source = std::fs::read_to_string(arch.join("dsl/llama.py")).expect("llama.py");
-    let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
-    let ast = crate::draft_capture::insert(&carrier.ast);
-    let program =
-        crate::classify::classify_with(&ast, crate::classified::Prelude::Decoder).unwrap();
-    let configs_dir = arch.join("configs/llama");
-    let manifest = crate::weights_manifest::load_or_empty(&configs_dir).expect("manifest");
-    let model = crate::config::load_file_declared(&configs_dir.join("llama-3.2-1b.json")).unwrap();
-    let mut inferred = crate::shape::infer(&program, &manifest, &model.bounds)
-        .unwrap()
-        .locals;
-    // The first rank-2 local's features become 1, which no feature width of the model is.
-    let changed = *(inferred.iter())
-        .filter(|(_, s)| s.len() == 2)
-        .map(|(id, _)| id)
-        .min_by_key(|id| id.0)
-        .expect("a rank-2 local");
-    inferred.get_mut(&changed).unwrap()[1] = crate::dim::Dim::Lit(1);
-    let parity = check_parity(&carrier.arch_name, &program, &inferred, &model.bounds).unwrap();
-    let mismatched: Vec<_> = parity.mismatches.iter().map(|m| m.local).collect();
-    assert_eq!(mismatched, vec![changed]);
-}
-
 /// The reshapes a program still carries, nested blocks included.
 fn reshapes(stmts: &[crate::classified::Stmt]) -> usize {
     use crate::classified::{Expr, OpKind, Stmt};
@@ -176,13 +183,10 @@ fn gemma4_reshapes_left(config: &str) -> (usize, usize) {
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let source = std::fs::read_to_string(arch.join("dsl/gemma4.py")).expect("gemma4.py");
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
-    let ast = crate::draft_capture::insert(&carrier.ast);
-    let mut program =
-        crate::classify::classify_with(&ast, crate::classified::Prelude::Decoder).unwrap();
+    let mut program = crate::classify::carrier_program(&carrier).unwrap();
     let configs_dir = arch.join("configs/gemma4");
-    let manifest = crate::weights_manifest::load_or_empty(&configs_dir).expect("manifest");
     let model = crate::config::load_file_declared(&configs_dir.join(config)).unwrap();
-    let inferred = crate::shape::infer(&program, &manifest, &model.bounds).unwrap();
+    let inferred = crate::typed_shapes::traced(&carrier.arch_name).expect("typed");
     let before = reshapes(&program.statements);
     crate::shape::erase_identity_regroupings(&mut program, &inferred, &model.bounds);
     (before, reshapes(&program.statements))
@@ -201,16 +205,16 @@ fn a_real_split_is_kept() {
     assert_eq!(gemma4_reshapes_left("gemma-4-31b-it.json"), (9, 9));
 }
 
-/// Phase B parity on gemma4-moe: Gemma 4's attention plus the fused sparse block.
+/// gemma4-moe (Gemma 4's attention plus the fused sparse block) unrolls from its trace.
 #[test]
-fn the_typed_gemma4_moe_traces_what_shape_infer_closes_for_every_config() {
-    typed_carrier_parity("gemma4-moe", 6);
+fn the_typed_gemma4_moe_unrolls_on_every_config() {
+    typed_carrier_unrolls("gemma4-moe", 6);
 }
 
-/// Phase B parity on gemma4-assistant: concat, the shared attentions, the target's rows.
+/// gemma4-assistant (concat, the shared attentions, the target's rows) unrolls from its trace.
 #[test]
-fn the_typed_gemma4_assistant_traces_what_shape_infer_closes_for_every_config() {
-    typed_carrier_parity("gemma4-assistant", 2);
+fn the_typed_gemma4_assistant_unrolls_on_every_config() {
+    typed_carrier_unrolls("gemma4-assistant", 2);
 }
 
 /// Every model config of the carrier `stem` (`vision` for a `@vision_forward` one), as the config
@@ -287,106 +291,6 @@ fn carriers(arch: &std::path::Path) -> Vec<(String, bool)> {
             )
         })
         .collect()
-}
-
-/// Phase B's census (#1086's main risk), before any carrier is typed: per carrier, every weight
-/// dim whose dataflow form `shape::infer` closed differs from its `weights.json` declaration while
-/// the two agree in value under a config's bounds (an alias rustc's symbolic equality refuses), and
-/// every reshape-recovery hint, over each of the carrier's configs. A report, so not run by default:
-/// `cargo test -p scratchy-forward-compiler-macro --features metal --lib census -- --ignored
-/// --nocapture`.
-#[test]
-#[ignore]
-fn census_aliases_and_reshape_hints() {
-    use crate::classified::Prelude;
-    use std::collections::BTreeSet;
-    let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
-    for (stem, vision) in carriers(&arch) {
-        let source = std::fs::read_to_string(arch.join("dsl").join(format!("{stem}.py"))).unwrap();
-        let carrier = crate::parse_python::parse_python_file(&source).unwrap();
-        let prelude = if vision {
-            Prelude::Vision
-        } else {
-            Prelude::Decoder
-        };
-        let ast = match prelude {
-            Prelude::Decoder => crate::draft_capture::insert(&carrier.ast),
-            Prelude::Vision => carrier.ast.clone(),
-        };
-        let program = crate::classify::classify_with(&ast, prelude).unwrap();
-        let configs_dir = arch.join("configs").join(&stem);
-        let manifest = crate::weights_manifest::load_or_empty(&configs_dir).unwrap();
-        let mut aliases: BTreeSet<String> = BTreeSet::new();
-        let mut hinted: Vec<String> = Vec::new();
-        let mut failed: Vec<String> = Vec::new();
-        let mut configs = 0;
-        for (cfg, _, model) in carrier_models(&arch, &stem, vision) {
-            let Ok(model) = model else {
-                failed.push(format!("{cfg}: config {:?}", model.err()));
-                continue;
-            };
-            configs += 1;
-            let mut prog = program.clone();
-            if prelude == Prelude::Decoder {
-                prog.decoder_safetensors_prefix = model.arch.decoder_prefix.clone();
-            }
-            prog.weight_leaf_renames = model.arch.weight_leaf_renames.clone();
-            let inferred = match crate::shape::infer(&prog, &manifest, &model.bounds) {
-                Ok(i) => i,
-                Err(crate::shape::ShapeError::ReshapeRecovery { hints }) => {
-                    hinted.push(format!("{cfg}: {} hints", hints.len()));
-                    crate::shape::apply_reshape_hints(&mut prog, &hints);
-                    match crate::shape::infer(&prog, &manifest, &model.bounds) {
-                        Ok(i) => i,
-                        Err(e) => {
-                            failed.push(format!("{cfg}: after recovery {e}"));
-                            continue;
-                        }
-                    }
-                }
-                Err(e) => {
-                    failed.push(format!("{cfg}: {e}"));
-                    continue;
-                }
-            };
-            for (wid, shape) in &inferred.weights {
-                let path = prog.weights.path(*wid);
-                let Some(declared) = manifest.lookup(path) else {
-                    continue;
-                };
-                for (pos, (got, want)) in shape.iter().zip(declared).enumerate() {
-                    if got == want {
-                        continue;
-                    }
-                    let eval = |d| crate::shape::eval_closed_dim(d, &model.bounds);
-                    if eval(got).is_some() && eval(got) == eval(want) {
-                        aliases.insert(format!(
-                            "{}[{pos}]: {} vs declared {}",
-                            path.join("."),
-                            crate::shape::show_dim_pub(got),
-                            crate::shape::show_dim_pub(want)
-                        ));
-                    }
-                }
-            }
-        }
-        eprintln!(
-            "== {stem} ({}): {configs} configs, {} aliases, {} configs with reshape hints, {} failed",
-            if vision { "vision" } else { "decoder" },
-            aliases.len(),
-            hinted.len(),
-            failed.len()
-        );
-        for a in &aliases {
-            eprintln!("   alias {a}");
-        }
-        for h in &hinted {
-            eprintln!("   hints {h}");
-        }
-        for f in &failed {
-            eprintln!("   failed {f}");
-        }
-    }
 }
 
 /// Every config's bounds as the config loader derives them, one `carrier/config name=value` line
@@ -501,26 +405,25 @@ fn every_derived_alias_equals_the_config_loaders_value() {
     assert!(checked > 0, "no typed carrier names a derived dim");
 }
 
-/// Phase B parity on the qwen3.5 MTP heads (their targets' configs that carry them): the gate, the
-/// shared expert, and the target's rows at the target's width.
+/// The qwen3.5 MTP heads (the gate, the shared expert, and the target's rows at the target's
+/// width) unroll from their traces on their targets' configs that carry them.
 #[test]
-fn the_typed_qwen3_5_mtp_heads_trace_what_shape_infer_closes_for_every_config() {
-    typed_carrier_parity("qwen3-5-mtp", 4);
-    typed_carrier_parity("qwen3-5-dense-mtp", 5);
+fn the_typed_qwen3_5_mtp_heads_unroll_on_every_config() {
+    typed_carrier_unrolls("qwen3-5-mtp", 4);
+    typed_carrier_unrolls("qwen3-5-dense-mtp", 5);
 }
 
-/// Phase B parity on qwen2-vl's vision tower: the 2-D rope, per-image attention, and the merge's
-/// structural regrouping (`group_rows`), on every vision config.
+/// qwen2-vl's vision tower (the 2-D rope, per-image attention, and the merge's structural
+/// regrouping, `group_rows`) unrolls from its trace on every vision config.
 #[test]
-fn the_typed_qwen2_vl_traces_what_shape_infer_closes_for_every_config() {
-    typed_carrier_parity("qwen2-vl", 5);
+fn the_typed_qwen2_vl_unrolls_on_every_config() {
+    typed_carrier_unrolls("qwen2-vl", 5);
 }
 
-/// Phase B's gate: every carrier under `dsl/` (the build script's scan, so a new carrier is
-/// covered unnamed) traces what `shape::infer` closes, on every config it compiles for, with no
-/// reshape-recovery hint.
+/// Every carrier under `dsl/` (the build script's scan, so a new carrier is covered unnamed) is
+/// typed, and unrolls from its trace on every config it compiles for.
 #[test]
-fn every_typed_carrier_traces_what_shape_infer_closes_for_every_config() {
+fn every_typed_carrier_unrolls_on_every_config() {
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let carriers = carriers(&arch);
     assert_eq!(carriers.len(), 34, "the carriers under dsl/");
@@ -530,16 +433,16 @@ fn every_typed_carrier_traces_what_shape_infer_closes_for_every_config() {
         let n = carrier_models(&arch, stem, *vision).len();
         assert!(n > 0, "{stem}: no config compiles it");
         // Every carrier's verdict, not just the first failure's.
-        if std::panic::catch_unwind(|| typed_carrier_parity(stem, n)).is_err() {
+        if std::panic::catch_unwind(|| typed_carrier_unrolls(stem, n)).is_err() {
             failed.push(stem.clone());
         }
         configs += n;
     }
-    assert!(failed.is_empty(), "parity fails on {failed:?}");
+    assert!(failed.is_empty(), "unrolling fails on {failed:?}");
     eprintln!("{} carriers, {configs} configs", carriers.len());
 }
 
-/// The qwen3.5 MoE MTP head's program and one target config that carries it, inferred.
+/// The qwen3.5 MoE MTP head's program, its trace, and one target config that carries it.
 fn mtp_head_on_its_target() -> (
     crate::classified::Program,
     crate::shape::Inferred,
@@ -548,17 +451,13 @@ fn mtp_head_on_its_target() -> (
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let source = std::fs::read_to_string(arch.join("dsl/qwen3-5-mtp.py")).expect("carrier");
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
-    let ast = crate::draft_capture::insert(&carrier.ast);
-    let program =
-        crate::classify::classify_with(&ast, crate::classified::Prelude::Decoder).unwrap();
-    let manifest =
-        crate::weights_manifest::load_or_empty(&arch.join("configs/qwen3-5-mtp")).unwrap();
+    let program = crate::classify::carrier_program(&carrier).unwrap();
     let (_, _, model) = carrier_models(&arch, "qwen3-5-mtp", false)
         .into_iter()
         .next()
         .expect("a target config carries the head");
     let model = model.unwrap();
-    let inferred = crate::shape::infer(&program, &manifest, &model.bounds).unwrap();
+    let inferred = crate::typed_shapes::traced(&carrier.arch_name).expect("typed");
     (program, inferred, model)
 }
 
@@ -591,7 +490,9 @@ fn an_as_dim_whose_widths_agree_compiles() {
 fn an_as_dim_whose_widths_differ_is_refused() {
     let (program, inferred, mut model) = mtp_head_on_its_target();
     let hidden = model.bounds["hidden_size"];
-    model.bounds.insert("backbone_hidden_size".to_string(), hidden + 1);
+    model
+        .bounds
+        .insert("backbone_hidden_size".to_string(), hidden + 1);
     let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         head_facts(&program, &inferred, &model)
     }))
@@ -599,5 +500,98 @@ fn an_as_dim_whose_widths_differ_is_refused() {
     let why = (refused.downcast_ref::<&str>().map(|s| s.to_string()))
         .or_else(|| refused.downcast_ref::<String>().cloned())
         .unwrap_or_default();
-    assert!(why.contains("a head lent its target's width is that width"), "{why}");
+    assert!(
+        why.contains("a head lent its target's width is that width"),
+        "{why}"
+    );
+}
+
+/// Llama's carrier (its text edited by `edit`) and its `weights.json` (edited by `declare`), through
+/// the emit pass and rustc as the build script and this crate's compile take it: the trace, or
+/// rustc's errors.
+fn typed_llama(
+    edit: impl Fn(&str) -> String,
+    declare: impl Fn(&mut crate::weights_manifest::WeightsManifest),
+) -> Result<crate::shape::Inferred, String> {
+    let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
+    let written = std::fs::read_to_string(arch.join("dsl/llama.py")).expect("llama.py");
+    let source = edit(&written);
+    let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
+    let program = crate::classify::carrier_program(&carrier).unwrap();
+    let mut manifest =
+        crate::weights_manifest::load_or_empty(&arch.join("configs/llama")).expect("manifest");
+    declare(&mut manifest);
+    let facts = scratchy_forward_compiler_frontend::carrier_facts::carrier_facts(
+        &arch,
+        "llama",
+        false,
+        &mut Vec::new(),
+    );
+    crate::typed_bodies::typed(
+        &program,
+        &source,
+        "crates/models/arch/dsl/llama.py",
+        &manifest,
+        &facts,
+    )
+}
+
+/// The rustc errors of a program that must not compile, with what each must name.
+fn refused(typed: Result<crate::shape::Inferred, String>, names: &[&str]) {
+    let errors = typed.expect_err("the typed compile refuses it");
+    assert!(
+        errors.contains("error[E0308]: mismatched types"),
+        "{errors}"
+    );
+    for name in names {
+        assert!(errors.contains(name), "the error names `{name}`:\n{errors}");
+    }
+}
+
+/// The types reject a wrong carrier: `q_proj` written where `k_proj` belongs (`llama.py:15`) fails
+/// the typed compile, and rustc names the carrier's line where the two widths meet (the attention,
+/// `llama.py:18`, the first that reads `k`) and both widths. Llama as written compiles through the
+/// same path, so the refusal is the edit's.
+#[test]
+fn a_wrong_dsl_line_fails_the_typed_compile_and_names_the_line() {
+    let k_proj = "k = gemm(normed, self_attn.k_proj[layer])";
+    assert!(
+        typed_llama(str::to_string, |_| {}).is_ok(),
+        "llama as written types"
+    );
+    refused(
+        typed_llama(
+            |s| {
+                assert!(s.contains(k_proj));
+                s.replace(k_proj, "k = gemm(normed, self_attn.q_proj[layer])")
+            },
+            |_| {},
+        ),
+        &[
+            "crates/models/arch/dsl/llama.py:18: attn = attention(",
+            "NumKeyValueHeads",
+            "NumAttentionHeads",
+        ],
+    );
+}
+
+/// The types reject a wrong `weights.json`: `mlp.down_proj` declared `[hidden_size, hidden_size]`
+/// (its rows are the MLP's width) fails the typed compile at the carrier's line that reads it
+/// (`llama.py:25`), naming both widths.
+#[test]
+fn a_misdeclared_weight_width_fails_the_typed_compile_and_names_the_line() {
+    use crate::dim::Dim;
+    let hidden = Dim::Bound("hidden_size".to_string());
+    refused(
+        typed_llama(str::to_string, |m| {
+            let down = m.entries.get_mut("mlp.down_proj").expect("declared");
+            assert_eq!(down[0], Dim::Bound("intermediate_size".to_string()));
+            *down = vec![hidden.clone(), hidden.clone()];
+        }),
+        &[
+            "crates/models/arch/dsl/llama.py:25: down = gemm(gate * up, mlp.down_proj[layer])",
+            "IntermediateSize",
+            "HiddenSize",
+        ],
+    );
 }

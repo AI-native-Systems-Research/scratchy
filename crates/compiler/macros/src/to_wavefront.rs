@@ -63,8 +63,8 @@ pub enum BridgeError {
     /// FUF op kind outside the coarse Llama-3.2 decode set.
     UnsupportedOp { tile: TileId, op: OpKind },
     /// A tile's (or an upstream tile's) output didn't close to a
-    /// concrete shape under `bounds` — shape inference left a `Var`, or
-    /// a dim referenced a missing config bound.
+    /// concrete shape under `bounds`: a dim referenced a missing config
+    /// bound.
     UnresolvedShape { tile: TileId, what: &'static str },
     /// A tile referenced a `(TileId, slot)` the walk hadn't produced —
     /// FUF not in ascending-id topological order, or a bad slot.

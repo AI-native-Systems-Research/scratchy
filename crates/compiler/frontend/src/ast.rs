@@ -135,9 +135,7 @@ pub enum Expr {
     /// for `classify` to thread into [`Program::reshape_targets`]
     /// keyed by the producing `LocalId`; the classified form drops
     /// the target list and becomes
-    /// `Expr::Call { op: OpKind::Reshape, args: [source] }`,
-    /// matching the synthesized-reshape shape from
-    /// `shape::apply_reshape_hints`.
+    /// `Expr::Call { op: OpKind::Reshape, args: [source] }`.
     ///
     /// G.5.c surface admitted literals and bare bound names. G.5.f.a
     /// extended each [`DimSpec`] to a binary tree over `*` and `/`
