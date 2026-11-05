@@ -43,12 +43,18 @@
 # sweep with a FENCED verdict and a non-zero exit. The r32-c128-e2-b0 fence of the main sweep is
 # unexplained; a fence here is a result, not a line to log past.
 set -uo pipefail
-ROOT=$1; TREE=$2; LOG=$3
+[ $# -eq 3 ] || { echo "usage: page_gather_sweep_run.sh <sweep-root> <tree-with-bundle_run_dev> <log>" >&2; exit 2; }
+ROOT=$(cd "$1" && pwd) || exit 80
+TREE=$2
+LOG=$3
+# ROOT/TREE/LOG go in as POSITIONAL args — never spliced into the single-quoted body (a splice
+# of only some of them leaves the rest unset inside, and the runner once walked an empty ROOT).
 exec flock /work/.spyre-bake.lock bash -c '
+ROOT=$1; TREE=$2; LOG=$3
 export PATH=/work/.cargo/bin:$PATH
 export LD_LIBRARY_PATH=/opt/ibm/spyre/senlib/lib:/opt/ibm/spyre/runtime/lib:/opt/ibm/spyre/deeptools/lib
 export DEEPTOOLS_PATH=/opt/ibm/spyre/deeptools/share
-cd '"$TREE"' || exit 80
+cd "$TREE" || exit 80
 
 # The card NAMED fence signatures — checked after every compile and run; the first one aborts
 # the sweep (a bare "fence" matches nothing here: only the signatures the card itself prints).
@@ -216,6 +222,28 @@ else:
 PY
 }
 
-find "$ROOT" -mindepth 1 -maxdepth 1 -type d | sort | while read -r c; do run_cell "$c"; done
+find "$ROOT" -mindepth 1 -maxdepth 1 -type d 2>&1 | sort | while read -r c; do run_cell "$c"; done
+
+# ⛔ A VERDICT OVER NOTHING FAILS: no DONE unless every cell dir holds a bundle and every
+# bundle carries a verdict line. Printed counts: VERDICTS=<distinct verdicted runnable cells>
+# CELLS=<cells with group_0> MISSING=<cell dirs with no bundle> TOTAL=<all cell dirs>.
+cells=0; runnable=0; missing=0; verdicts=0
+for c in "$ROOT"/*/; do
+  [ -d "$c" ] || continue
+  cells=$((cells + 1))
+  if [ -d "$c/group_0" ]; then
+    runnable=$((runnable + 1))
+    if grep -q "^VERDICT $(basename "$c") " "$LOG" 2>/dev/null; then
+      verdicts=$((verdicts + 1))
+    fi
+  else
+    missing=$((missing + 1))
+  fi
+done
+echo "VERDICTS=$verdicts CELLS=$runnable MISSING=$missing TOTAL=$cells"
+if [ "$cells" -eq 0 ] || [ "$missing" -gt 0 ] || [ "$verdicts" -lt "$runnable" ]; then
+  echo "PAGE_GATHER_SWEEP_RUN_INCOMPLETE — a verdict over nothing FAILS" >&2
+  exit 1
+fi
 echo PAGE_GATHER_SWEEP_RUN_DONE
-'
+' _ "$ROOT" "$TREE" "$LOG"
