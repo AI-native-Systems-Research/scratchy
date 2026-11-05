@@ -31,10 +31,13 @@
 //! `index_select` and `reshape` as the reference states them — AT THE FRAME'S OWN RANK. Rank-2
 //! `[T, w]`: the one stick-column law (torch-spyre `tensors_and_layouts.md` — a device layout
 //! is row-major with the stick dim last, so a host `[T, w]` sits as `[w/64, T, 64]`). Rank-3/4:
-//! the entry axis — the indirectly-indexed dim — sits at device position 0, a hardware
-//! requirement (torch-spyre `nonstick_dim_order.py`), each `[rows, cols]` block behind it
-//! carrying the rank-2 law, blocks one after another (the frame the walk carries as
-//! `batch_blocks`). The fills name the source element — (page, row) in two runs, col in the
+//! OUR INTERMEDIATE'S OWN CONTRACT with its readers — the entry axis outermost, each
+//! `[rows, cols]` block behind it carrying the rank-2 law, blocks one after another, the frame
+//! `whole_function` registers as `batch_blocks` for its consumers (the batched transpose reads
+//! a block at its base). NOT torch-spyre's default rank-3 layout (its
+//! `tensors_and_layouts.md` example `[5,100,150]` → `[100,3,5,64]` is neither this nor the
+//! folded image), and not a hardware requirement: the end-to-end proof of the contract is the
+//! D3 bundle gate plus card chat on 4 models. The fills name the source element — (page, row) in two runs, col in the
 //! third — so the first wrong element is reported with its position.
 //!
 //! ## The fence protocol
@@ -106,9 +109,11 @@ impl Frame {
     /// The landing REGION's declared two-D extent — `[rows, cols]` stick-major, the region the
     /// emitter mints for the value (rank-3/4 fold their entry and block axes into the rows; a
     /// rank-2 frame is its own two-D form). NOT the byte order: at rank ≥ 3 the landing's BYTES
-    /// are per-block stick-major, blocks one after another (the entry axis at device position 0
-    /// — the walk carries the frame as `batch_blocks`), so the runner decodes by the frame's own
-    /// rank, never by this folded extent. At rank 2 (or one block) the two coincide.
+    /// are per-block stick-major, blocks one after another — OUR INTERMEDIATE'S OWN CONTRACT
+    /// with its readers, the frame `whole_function` registers as `batch_blocks` (proved
+    /// end-to-end by the D3 bundle gate plus card chat on 4 models) — so the runner decodes by
+    /// the frame's own rank, never by this folded extent. At rank 2 (or one block) the two
+    /// coincide.
     fn rows_cols(self, entries: u64, slab: u64) -> (u64, u64) {
         match self {
             Frame::Blocks { rows, cols } => (entries * rows, cols),

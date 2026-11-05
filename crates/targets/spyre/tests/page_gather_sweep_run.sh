@@ -20,13 +20,15 @@
 #     D = (c/64)·(T·64) + t·64 + (c%64).
 #   A restickify cell reads the one whole stick permute's destination — the frame's own stick
 #   column — and the same law decodes it (the permute's contract IS that law).
-# * rank-3 [E, R, C] / rank-4 [E, B, R, C]: the indirectly-indexed entry axis sits at device
-#   position 0 — a HARDWARE requirement, not a hint (torch-spyre _inductor/nonstick_dim_order.py:
-#   "The indirectly-indexed dimension of a gather value tensor must sit at device position 0") —
-#   and each [R, C] block behind it carries the rank-2 law, the blocks one after another:
+# * rank-3 [E, R, C] / rank-4 [E, B, R, C]: OUR INTERMEDIATE'S OWN CONTRACT with its readers —
+#   the entry axis outermost, each [R, C] block behind it carrying the rank-2 law, the blocks
+#   one after another, the frame whole_function registers as batch_blocks for its consumers:
 #     D = e·(B·R·C) + blk·(R·C) + (c/64)·(R·64) + r·64 + (c%64).
+#   NOT torch-spyre's default rank-3 layout (its tensors_and_layouts.md example [5,100,150] ->
+#   [100,3,5,64] is neither this nor the folded image) and not a hardware requirement; the
+#   end-to-end proof of the contract is the D3 bundle gate plus card chat on 4 models.
 #   FOLDING E·R into one row axis (the rank-2 law over [E·R, C]) disagrees with this at E > 1
-#   and C > 64 — the decoder must not fold; the emitter's per-block landing is the lawful one.
+#   and C > 64 — the decoder must not fold; the per-block landing is the contract.
 #
 # The pool is staged as its own device image (row-outermost: row-major pages, `raw:` — the fills
 # are IEEE fp16 bits moved verbatim, no codec), the landing read back verbatim (`raw:`), and three
@@ -166,8 +168,9 @@ if pr_e.size < n or pr_f.size < n or c_e.size < n:
 #   rank-2 [T, w]:  D = (c//64)·(T·64) + t·64 + (c%64)
 #     (torch-spyre tensors_and_layouts.md:178-189 — the one stick-column law)
 #   rank-3 [E, R, C] / rank-4 [E, B, R, C]: the entry axis — the indirectly-indexed
-#   dim — sits at device position 0, a hardware requirement (torch-spyre
-#   nonstick_dim_order.py), and each [R, C] block behind it carries the rank-2 law,
+#   dim — is outermost: OUR INTERMEDIATE OWN CONTRACT with its readers, the frame
+#   whole_function registers as batch_blocks (proved end-to-end by the D3 bundle gate
+#   plus card chat on 4 models), and each [R, C] block behind it carries the rank-2 law,
 #   blocks one after another:
 #     D = e·(B·R·C) + blk·(R·C) + (c//64)·(R·64) + r·64 + (c%64)
 # The decoder maps each device offset D back to the source element it must hold.
