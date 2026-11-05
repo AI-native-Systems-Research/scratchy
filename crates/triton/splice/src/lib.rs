@@ -1441,7 +1441,32 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// page_idx)`, every kv head) — 128 KB at 8 kv heads × 64 head dims, 256 KB at 128 — is gathered in
 /// one op, as torch-spyre's compiled prefill gathers it
 /// ([`ktir_superdsc::ir::bridge::tiled_op_sdsc_op::index_select_opspec`]).
-pub const PAGE_SLOTS: u32 = 128;
+///
+/// ⭐ A TYPED REFERENCE INPUT, NOT A DERIVATION: this is the block size of the serving step we
+/// port, minted ONCE here. The reference's own law for the value — a multiple of 64
+/// (`_BLOCK_SIZE_MULTIPLE`, the 128-byte fp16 stick), measured-throughput argmax — is cited,
+/// not re-derived: we port the step, we do not redesign its block. Every reader (the splice's
+/// walk and write, the worker, `required_block_size`) reads this one value; the pool's page
+/// ([`PagedKvPool::POOL_PAGE_SLOTS`]) is a DIFFERENT quantity that happens to be a whole
+/// multiple of it — the relation is asserted below.
+pub const SCHEDULER_BLOCK_TOKENS: u32 = 128;
+
+/// The relation between the two page quantities: a pool page is a WHOLE NUMBER of
+/// scheduler blocks, so the block→page mapping stays whole (the block==page assert in
+/// `spyre_exec.rs` and the whole-page window law both rely on it). Today k=2 — a
+/// measured POLICY choice, see `PagedKvPool::POOL_PAGE_SLOTS`'s own rationale.
+const _: () = assert!(
+    (ktir_superdsc::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS as u64)
+        .is_multiple_of(SCHEDULER_BLOCK_TOKENS as u64),
+    "PagedKvPool::POOL_PAGE_SLOTS must be a whole number of SCHEDULER_BLOCK_TOKENS — \
+     otherwise a scheduler block straddles a pool page and the block→page mapping \
+     the write and the walk rely on is not whole"
+);
+
+/// ⏳ RENAMED to [`SCHEDULER_BLOCK_TOKENS`] — the scheduler's block is a different
+/// quantity from the pool's page and now wears a different name. Every reader is
+/// being swept to the new name; this spelling is deleted by that sweep.
+pub const PAGE_SLOTS: u32 = SCHEDULER_BLOCK_TOKENS;
 
 /// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
 pub const INT32_STICK: u32 = 32;

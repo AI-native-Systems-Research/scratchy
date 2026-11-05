@@ -10552,18 +10552,22 @@ const DFLASH2_BLOCK_LANES: u64 = scratchy_forward_compiler::DFLASH2_BLOCK_LANES 
 // core's 2 MiB LX. This constant is now only the COLLISION-FREE CEILING
 // on that derivation — the largest width the emu will ever bake.
 //
-// CRITICAL: the prefill tape width is symbolized to `s0` BY VALUE
-// (`symbolicize_seq` flips every concrete dim == prefill_m → s0), so it MUST
-// NOT equal any structural model dim, else a non-seq dim is wrongly
-// symbolized (e.g. m=32 collides with head_dim/2=32 → the RoPE rotate-half
-// StridedSlice output `[rows, heads, 32]` becomes `[s0, heads, s0]`, which
-// flex rejects at graphOptimizer.cpp:2865). 31 is prime + ≤32 (LX-safe) +
-// collides with no common dim (head_dim 64/128, half 32/64, n_heads, hidden,
-// intermediate, block_size 64). `symbolicize_seq` guards the collision and
-// names the fix; `KTIR_PREFILL_LEN` overrides (must also be collision-free).
-// Referenced only inside dump_wavefront_mega's `#[cfg(feature = "spyre")]`
-// block and by the pinned test below — dead in a non-spyre LIB build (the
-// `not(test)` leg keeps the expectation satisfied exactly where it's true).
+// CRITICAL: a by-value symbolization consumer (every concrete dim ==
+// prefill_m → `s0`) must not see the width equal any structural model dim,
+// else a non-seq dim is wrongly symbolized (the measured refusal was the
+// m=32 == head_dim/2 collision: the RoPE rotate-half StridedSlice output
+// `[rows, heads, 32]` became `[s0, heads, s0]`, which flex rejected at
+// graphOptimizer.cpp:2865). That consumer is HISTORICAL — it lived in the
+// deleted sengraph/offline_decoder path; in this tree `seq_sym`'s value
+// half is constructed and never destructured, so the emu's KTIR tape is
+// fully CONCRETE and PREFILL_LX_SAFE stands as the collision-free ceiling
+// for whichever symbolic consumer returns. 31 is prime + ≤32 (LX-safe) +
+// collides with no common dim (head_dim 64/128, half 32/64, n_heads,
+// hidden, intermediate, block_size 64). `KTIR_PREFILL_LEN` overrides (must
+// also be collision-free). Referenced only inside dump_wavefront_mega's
+// `#[cfg(feature = "spyre")]` block and by the pinned test below — dead in
+// a non-spyre LIB build (the `not(test)` leg keeps the expectation
+// satisfied exactly where it's true).
 #[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
 const PREFILL_LX_SAFE: u32 = 31;
 /// SuperDSC PREFILL WIDTH LADDER, ASCENDING. Each rung is baked as its own prefill bundle and
@@ -10572,10 +10576,10 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// m=31 → 69 ms ⇒ ~42 ms + ~0.7 ms/row), so one width is wrong both ways — too narrow re-pays
 /// the fixed term on every extra chunk, too wide computes padding rows that carry no tokens.
 ///
-/// `2^k − 1` by construction: `symbolicize_seq` rewrites every concrete dim equal to the tape
-/// width into `s0`, so a width equal to a structural dim would symbolize a NON-seq dim (see
-/// [`PREFILL_LX_SAFE`]'s note on m=32 == head_dim/2). These values collide with none of the
-/// power-of-two dims (head_dim, block_size, cap, hidden, intermediate).
+/// `2^k − 1` by construction: a by-value symbolization of the tape width would wrongly
+/// symbolize an equal NON-seq dim (see [`PREFILL_LX_SAFE`]'s note on m=32 == head_dim/2).
+/// These values collide with none of the power-of-two dims (head_dim, block_size, cap,
+/// hidden, intermediate).
 ///
 /// The 63-row ceiling is GONE (2026-07-29): the new-token block is now folded as `mq_pad/64`
 /// stick-wide sub-blocks, so a chunk may span more than one stick. 96 is HARDWARE-PROVEN.
@@ -10586,8 +10590,8 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// 80 sits between 63 and 96 to halve the worst-case padding in that gap.
 ///
 /// `2^k − 1` is no longer required: this ladder is the SuperDSC bake's alone, and that prefill
-/// tape is CONCRETE (`seq_sym` is forced to `None` below), so `symbolicize_seq` never runs on
-/// it. That is why 128 may equal granite-8b's head_dim here.
+/// tape is CONCRETE (`seq_sym` is forced to `None` below), so nothing symbolizes it by value.
+/// That is why 128 may equal granite-8b's head_dim here.
 ///
 /// Rungs that fail to lower for a given model FAIL THE BUILD, so this list is a promise:
 /// every admitted rung bakes or nothing does.

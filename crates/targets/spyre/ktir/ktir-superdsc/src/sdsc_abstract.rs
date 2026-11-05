@@ -4784,7 +4784,20 @@ impl PagedKvPool {
     /// widest baked rung, and make a page DENSER instead of BIGGER (a 4-bit KV cache gives four times
     /// the positions for the same bytes — TurboQuant is already in-tree for metal). Then this goes back
     /// up and the win comes with it.
-    pub const PAGE_SLOTS: usize = 256;
+    ///
+    /// ⭐ A MEASURED POLICY, NOT A DERIVATION: 256 is chosen on the measurements above
+    /// (64/128/256 slots cost 39.5/39.0/42.0 ms at eight requests; the 1024-slot page
+    /// measured a genuine 3.25× on device compute, but its DEFAULT pool became 3.84 GB —
+    /// larger than the weights — and was reverted). A DISTINCT QUANTITY from the
+    /// scheduler's block (the splice's `SCHEDULER_BLOCK_TOKENS`, the reference's own
+    /// 128): a pool page is a WHOLE NUMBER of scheduler blocks (k=2 today), a relation
+    /// asserted in the splice where both are in scope.
+    pub const POOL_PAGE_SLOTS: usize = 256;
+
+    /// ⏳ RENAMED to [`Self::POOL_PAGE_SLOTS`] — the pool's sweep page is a different
+    /// quantity from the scheduler's block and now wears a different name. Every reader
+    /// is being swept to the new name; this spelling is deleted by that sweep.
+    pub const PAGE_SLOTS: usize = Self::POOL_PAGE_SLOTS;
 
     /// ⭐ THE WIDEST PREFILL CHUNK — the baked row count of the prefix-capable prefill bundle, and
     /// therefore the number of slots ONE continuation chunk's cache write actually touches.
