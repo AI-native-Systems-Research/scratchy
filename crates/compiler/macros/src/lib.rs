@@ -58,10 +58,15 @@ mod render;
 /// The build script's other half: `compile_carrier` makes the tokens,
 /// `render_tokens` turns them into the text rustc reads.
 pub use render::render_tokens;
-/// The build script's last step: the crate-root `__metal_bake` module every emitted model's baked
-/// kernels resolve in, baked once the models are emitted.
-#[cfg(feature = "metal")]
-pub use scratchy_target_metal_compiler::static_tape::bake_module as metal_bake_module;
+/// The build script's last step: the crate-root module every emitted model's baked kernels
+/// resolve in, baked once the models are emitted — `None` when the selected target bakes no
+/// kernels at build time.
+pub fn kernel_bake_module() -> Option<proc_macro2::TokenStream> {
+    #[cfg(feature = "metal")]
+    return Some(scratchy_target_metal_compiler::static_tape::bake_module());
+    #[cfg(not(feature = "metal"))]
+    None
+}
 mod rows_lowering;
 mod shape;
 mod to_wavefront;

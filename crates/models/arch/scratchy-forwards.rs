@@ -161,15 +161,17 @@ fn emit_arch(dsl_path: &Path, configs_dir: &Path, out_dir: &Path, mod_name: &str
 
 /// Write `$OUT_DIR/metal_bake.rs`: the crate-root `__metal_bake` module (`src/lib.rs`) the
 /// emitted models' baked kernels resolve in — every kernel the arches named, baked once. Runs
-/// after every arch is emitted.
-#[cfg(feature = "metal")]
-fn write_metal_bake(out_dir: &Path) {
+/// after every arch is emitted. A target that bakes no kernels writes nothing, and `src/lib.rs`
+/// sees no `baked_kernels` cfg.
+fn write_kernel_bake(out_dir: &Path) {
+    println!("cargo::rustc-check-cfg=cfg(baked_kernels)");
+    let Some(tokens) = scratchy_forward_compiler_macro::kernel_bake_module() else {
+        return;
+    };
     let mut rendered = String::with_capacity(1 << 20);
-    render_tokens(
-        scratchy_forward_compiler_macro::metal_bake_module(),
-        &mut rendered,
-    );
+    render_tokens(tokens, &mut rendered);
     write_if_changed(&out_dir.join("metal_bake.rs"), &rendered);
+    println!("cargo::rustc-cfg=baked_kernels");
 }
 
 /// Write `text` to `out` only when it changed, so a build-script rerun with identical output
@@ -342,6 +344,16 @@ fn main() {
         .collect();
     dsl_files.sort();
 
+    let arch_names: Vec<String> = dsl_files
+        .iter()
+        .filter_map(|p| p.file_stem().and_then(|n| n.to_str()))
+        .map(|n| format!("\"{n}\""))
+        .collect();
+    println!(
+        "cargo::rustc-check-cfg=cfg(compiled_arch, values({}))",
+        arch_names.join(", ")
+    );
+
     // (dsl_path, mod_name, configs_dir) for each arch that passes the feature +
     // backend gates.
     let targets: Vec<(PathBuf, String, PathBuf)> = dsl_files
@@ -357,6 +369,8 @@ fn main() {
             if !scratchy_forward_compiler_macro::arch_compiled(&arch) {
                 return None;
             }
+            // The same answer gates `pub mod <name>` in src/lib.rs, so the two cannot drift.
+            println!("cargo::rustc-cfg=compiled_arch=\"{arch}\"");
             let mod_name = arch.replace('-', "_");
             let configs_dir = manifest.join("configs").join(&arch);
             Some((dsl_path.clone(), mod_name, configs_dir))
@@ -391,8 +405,7 @@ fn main() {
         .for_each(|(dsl_path, mod_name, configs_dir)| {
             emit_arch(dsl_path, configs_dir, &out_dir, mod_name);
         });
-    #[cfg(feature = "metal")]
-    write_metal_bake(&out_dir);
+    write_kernel_bake(&out_dir);
     bake_tokenizers(&out_dir);
 
     // Shell-completion registry. Resolving it needs the network, so it happens
