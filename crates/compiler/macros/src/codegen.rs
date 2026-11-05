@@ -13176,10 +13176,33 @@ fn dump_wavefront_mega(
         // bake decode graphs at several mq ∈ MQ_DEM_SAFE and have the worker pick the
         // smallest that holds the live batch (C=1 → mq=2, large batch → mq=96). Until that
         // lands, change `DECODE_MQ` below for an 8-way concurrent server.
-        const DECODE_MQ: u32 = 2; // PAGED prefill+decode mq = CB batch axis default (chat-optimal; see note)
         // DEM/DSM-safe mq values, on-card verified (dd2 SENTIENT, nblk=4). MUST stay
         // sorted; every entry has been observed to CompileGraph + Predict coherently.
         const MQ_DEM_SAFE: [u32; 4] = [2, 4, 8, 96];
+        // The smallest DEM-safe mq that holds `min_rows` rows: the law DECODE_MQ
+        // FOLLOWS from, and the same answer the dynamic-mq path gives the live
+        // batch (worker picks the smallest safe mq ≥ the live request count).
+        // Reads MQ_DEM_SAFE ascending, so the table's sorted-order law is its
+        // precondition (asserted below).
+        const fn smallest_dem_safe_mq(min_rows: u32) -> u32 {
+            let mut i = 0;
+            while i < MQ_DEM_SAFE.len() {
+                if MQ_DEM_SAFE[i] >= min_rows {
+                    return MQ_DEM_SAFE[i];
+                }
+                i += 1;
+            }
+            panic!("MQ_DEM_SAFE holds no mq >= the minimal decode row count");
+        }
+        // Incremental decode carries ONE new token per sequence, and the device
+        // already build-refuses mq=1 (unit-axis Reshape vs symbolic-batch
+        // collision, graphOptimizer.cpp:5422 — see the guard note above), so the
+        // minimal lawful decode row count is 2: 1 real token + 1 pad.
+        const MINIMAL_DECODE_ROWS: u32 = 2;
+        // PAGED prefill+decode mq = CB batch axis default (chat-optimal; see note).
+        // DERIVED, not picked: the smallest DEM-safe mq ≥ the minimal decode row
+        // count — identical for every model (min{mq ∈ {2,4,8,96} : mq ≥ 2} = 2).
+        const DECODE_MQ: u32 = smallest_dem_safe_mq(MINIMAL_DECODE_ROWS);
         const fn mq_is_dem_safe(mq: u32) -> bool {
             // const-fn linear scan (arrays aren't const-iterable on stable).
             let mut i = 0;
@@ -13201,10 +13224,23 @@ fn dump_wavefront_mega(
         );
         const _: () = assert!(
             mq_is_dem_safe(DECODE_MQ),
-            "DECODE_MQ is not a DEM/DSM-safe static-paged mq. Only {{2,4,8,96}} are on-card PROVEN \
-             (dd2). DECODE_MQ=2 is the minimal incremental-decode width (1 real token + 1 pad) and \
-             the proven decode roofline lever (~10.7× over mq=96). To use another value, pick from \
-             MQ_DEM_SAFE; a SMALLER decode mq is faster (decode COMPUTE scales ~linearly in mq)."
+            "DECODE_MQ (smallest DEM-safe mq ≥ MINIMAL_DECODE_ROWS) is not in MQ_DEM_SAFE — \
+             the derivation and the table have drifted apart."
+        );
+        // smallest_dem_safe_mq reads MQ_DEM_SAFE ascending; pin that ordering.
+        const _: () = assert!(
+            {
+                let mut i = 1;
+                let mut sorted = true;
+                while i < MQ_DEM_SAFE.len() {
+                    if MQ_DEM_SAFE[i - 1] >= MQ_DEM_SAFE[i] {
+                        sorted = false;
+                    }
+                    i += 1;
+                }
+                sorted
+            },
+            "MQ_DEM_SAFE must stay strictly ascending: smallest_dem_safe_mq scans it in order."
         );
         // Batched-prefill bundle: the worker runs the prompt through it (one m=N
         // forward per chunk), keeping the m=1 decode bundle for the generation
