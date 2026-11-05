@@ -1019,10 +1019,6 @@ impl WeightTable {
             .collect()
     }
 
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     /// Every weight the program reads, in interning order.
     pub fn ids(&self) -> impl Iterator<Item = WeightId> + use<> {
         (0..self.entries.len() as u32).map(WeightId)
