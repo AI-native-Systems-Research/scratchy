@@ -7177,6 +7177,9 @@ fn metal_off_tape_tokens(
                 window,
             } = suffix;
             use scratchy_target_metal::tape::quantized::ScaleDtype;
+            // Minted in a const context: a width or group no kernel is instantiated for fails the
+            // build.
+            let (bits, group) = (bits.get(), group.get());
             let scale = match scale {
                 ScaleDtype::F16 => {
                     quote!(::scratchy_target_metal::tape::quantized::ScaleDtype::F16)
@@ -7194,8 +7197,8 @@ fn metal_off_tape_tokens(
                     prefix: #prefix,
                     rows: #rows,
                     hidden: #hidden,
-                    bits: #bits,
-                    group: #group,
+                    bits: const { ::scratchy_target_metal::tape::ids::AffineBits::of(#bits) },
+                    group: const { ::scratchy_target_metal::tape::ids::AffineGroupSize::of(#group) },
                     scale: #scale,
                     verify_rows: #verify_rows,
                     window: #window,
@@ -7282,12 +7285,17 @@ fn metal_vocab_suffix(
     let method = &model.quantization.as_ref()?.method;
     let (group, bits) = crate::quantization::affine_role_widths(program, method, &lm_head, None)?;
     let fits = |v: u64| u32::try_from(v).expect("a vocabulary fits u32");
+    use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
     Some(scratchy_target_metal::off_tape::VocabSuffix {
         prefix: fits(prefix),
         rows: fits(all - prefix),
         hidden: fits(mc.hidden().get() as u64),
-        bits,
-        group,
+        bits: AffineBits::new(bits).unwrap_or_else(|| {
+            panic!("the lm_head's {bits}-bit width is one no affine kernel is instantiated for")
+        }),
+        group: AffineGroupSize::new(group).unwrap_or_else(|| {
+            panic!("the lm_head's group of {group} is one no affine kernel is instantiated for")
+        }),
         scale: mc.scale_dtype(),
         verify_rows: fits(verify_rows),
         window: fits(window),
@@ -14361,12 +14369,24 @@ pub fn emit_model(
                 continue;
             }
         };
+        // A preset's widths and groups are the kernels' (`quantization`'s preset check refuses
+        // any other), so each mints.
+        let affine_group = |g: u32| {
+            st::AffineGroupSize::new(g).unwrap_or_else(|| {
+                panic!("an affine group of {g}, which no kernel is instantiated for")
+            })
+        };
+        let affine_bits = |b: u32| {
+            st::AffineBits::new(b).unwrap_or_else(|| {
+                panic!("an affine width of {b} bits, which no kernel is instantiated for")
+            })
+        };
         let embed_quant = fuf.nodes.iter().find_map(|n| {
             match (n.op, crate::weight_vocab::weight_storage_of(n)) {
                 (
                     OpKind::Embed,
                     Some(crate::quantization::StorageFormat::Affine { group_size, bits }),
-                ) => Some((st::AffineGroupSize(*group_size), st::AffineBits(*bits))),
+                ) => Some((affine_group(*group_size), affine_bits(*bits))),
                 _ => None,
             }
         });
@@ -14400,9 +14420,7 @@ pub fn emit_model(
             let at = Some(UnrollIndex(layer.0 as u64));
             let bits =
                 crate::quantization::affine_moe_expert_bits(program, &qc.method, base, at, body);
-            bits.map_or([None; 3], |b| {
-                b.projections().map(|w| w.map(st::AffineBits))
-            })
+            bits.map_or([None; 3], |b| b.projections().map(|w| w.map(affine_bits)))
         };
         let facts = mc3::MetalStepFacts {
             weight_paths: &weight_paths,

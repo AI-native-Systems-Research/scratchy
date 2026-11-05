@@ -22,7 +22,7 @@ use crate::tape::ids::{
     AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, ElementCount,
     HeadDim, HiddenSize, IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, NDim,
     NDimI32, NumExperts, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, RowStride,
-    SplitK, TopK, TqCodeBits, TqDecodeHeads,
+    SplitK, StagedHeadDim, TopK, TqCodeBits, TqDecodeHeads,
 };
 use crate::tape::lowered::ActivationWidth;
 
@@ -203,7 +203,8 @@ impl From<EmbeddingGatherConstants> for Vec<ConstantValue> {
 /// specialized`). Slots 0..6 identical to [`RopeAppendConstants`];
 /// 7 = norm eps, 8 = norm gain offset (Gemma4 full gains -> 0.0).
 pub struct RopeAppendNormedConstants {
-    pub head_dim: HeadDim,
+    /// Staged whole in threadgroup memory: no wider than the staging holds.
+    pub head_dim: StagedHeadDim,
     pub num_q_heads: NumQHeads,
     pub num_kv_heads: NumKvHeads,
     pub rot_dim: RotDim,
@@ -262,7 +263,7 @@ impl From<RopeAppendNormedConstants> for Vec<ConstantValue> {
         if let Some(ror) = c.rope_on_read {
             v.push(ConstantValue::uint(ConstSlot(9), ror));
         }
-        RopeTqConstants::push(c.tq, c.head_dim, &mut v);
+        RopeTqConstants::push(c.tq, c.head_dim.head_dim(), &mut v);
         v
     }
 }

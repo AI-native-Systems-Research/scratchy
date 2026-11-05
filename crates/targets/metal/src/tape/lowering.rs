@@ -316,7 +316,7 @@ fn sample_rows(
                 half_planes,
                 a.bits.get(),
                 a.k.get(),
-                a.group_size.get(),
+                a.group_size,
             );
             let qmv = affine_qmv_command(
                 p,
@@ -414,13 +414,13 @@ fn codes_for(
     half: Planes,
     bits: u32,
     k: u32,
-    group_size: u32,
+    group: AffineGroupSize,
 ) -> super::kernel_constants::AffineCodes {
     let codes = super::kernel_constants::AffineCodes::of(profile, bits);
     let planes = half == Planes::Backbone
         && class == crate::tape::lowered::GenClass::M5Wide
         && p.drafter().is_none()
-        && matches!(group_size, 64 | 128);
+        && group.nax().is_some();
     if planes { codes.planes(k) } else { codes }
 }
 
@@ -464,7 +464,7 @@ fn affine_qmv_command(
     kernel: QmvKernel,
     end_weights: Vec<Binding>,
 ) -> LoweredCommand {
-    let (n, k, bits) = (g.n.get(), g.k.get(), g.bits.get());
+    let (n, k) = (g.n.get(), g.k.get());
     let (tg, tpg) = qmv_dispatch_shape(kernel, rows, n, /*B=*/ 1);
     let (kernel_id, constants) = match kernel {
         QmvKernel::Quad { .. } => (
@@ -541,7 +541,7 @@ fn affine_qmv_command(
     LoweredCommand {
         kernel: kernel_id,
         library: "quantized_qmv",
-        function: qmv_kernel_static_name(kernel, dtype, scale_dtype, bits, g.group_size.get()),
+        function: qmv_kernel_static_name(kernel, dtype, scale_dtype, g.bits, g.group_size),
         constants,
         dispatch: DispatchShape {
             threadgroups: tg,
@@ -1113,8 +1113,8 @@ fn route_small_m(
         layer,
         n: NDim(n),
         k: KDim(k),
-        group_size: AffineGroupSize(group_size),
-        bits: AffineBits(4),
+        group_size: group,
+        bits: AffineBits::B4,
         ends:
             QmvEnds {
                 norm: None,
@@ -1127,17 +1127,12 @@ fn route_small_m(
     else {
         return Ok(cmds);
     };
+    let group_size = group.get();
     // The small-M kernels read the codes as stored, signed (offset-8). The bf16 twin
     // (`AffineQmmSmallM`) reads them row-major only: planes codes take the W4A8 tile below.
-    let codes = codes_for(p, profile, class, half_planes, 4, k, group_size);
+    let codes = codes_for(p, profile, class, half_planes, 4, k, group);
     let tile = match SmallMTile::for_bucket(bucket_m) {
-        Some(tile)
-            if codes.signed()
-                && matches!(group_size, 32 | 64 | 128)
-                && n.is_multiple_of(SMALL_M_TILE_COLS) =>
-        {
-            tile
-        }
+        Some(tile) if codes.signed() && n.is_multiple_of(SMALL_M_TILE_COLS) => tile,
         _ => return Ok(cmds),
     };
     // The twin pays where the bucket's own matvec streams the weights more than once. The wide
@@ -1217,7 +1212,7 @@ fn route_small_m(
     let short = (W4a8Gemm::for_small_m(n, k, bucket_m)).filter(|_| {
         class == crate::tape::lowered::GenClass::M5Wide
             && bucket_m <= W4A8_SMALL_M_ROWS
-            && matches!(group_size, 64 | 128)
+            && group.nax().is_some()
             && k.is_multiple_of(64)
     });
     if let Some(kernel) = short {
@@ -3421,8 +3416,8 @@ fn lower_one(
                 layer: LayerId(layer),
                 n: NDim(n),
                 k: KDim(k),
-                group_size: AffineGroupSize(group_size),
-                bits: AffineBits(bits),
+                group_size: group,
+                bits: width_bits,
                 vector_limit: QmvBatchLimit(vector_limit),
                 ends: _,
             } = g;
@@ -3430,8 +3425,8 @@ fn lower_one(
             let scale_dtype = scale_dtype_for(p);
             let n_v = *n;
             let k_v = *k;
-            let bits_v = *bits;
-            let gs = *group_size;
+            let (group, width_bits) = (*group, *width_bits);
+            let (bits_v, gs) = (width_bits.get(), group.get());
             let vl = *vector_limit;
 
             // A narrow projection at a bucket of up to 64 rows on the matrix unit's chips runs the
@@ -3442,7 +3437,7 @@ fn lower_one(
             let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
             if is_nax && narrow_matvec(n_v, k_v, bits_v, bucket_m) {
                 let layer = super::ids::LayerId(*layer + layer_offset);
-                let codes = codes_for(p, profile, gen_class, half_planes, bits_v, k_v, gs);
+                let codes = codes_for(p, profile, gen_class, half_planes, bits_v, k_v, group);
                 affine_qmv_command(
                     p,
                     g,
@@ -3469,7 +3464,7 @@ fn lower_one(
                     half_planes,
                     g.bits.get(),
                     g.k.get(),
-                    g.group_size.get(),
+                    g.group_size,
                 );
                 // MLX gates affine qmv_wide on arch gen >= 15 (quantized.cpp:537-539) —
                 // M3 and later (M4 is gen 16, M5 is gen 17). `affine_qmv_wide_ok` mirrors
@@ -3525,12 +3520,9 @@ fn lower_one(
                 // MLX's own qdot bits==3 shifts are vendored into
                 // metal_nax.h's dequantize), and 2-bit likewise
                 // (`_b_2_`: 4 codes per byte, none straddling).
-                // SplitK stays b4-only, so any non-b4 SplitK pick
-                // downgrades to Standard.
-                let kernel = match pick_qmm_t_kernel(bucket_m, n_v, k_v, /*B=*/ 1, gs, is_nax) {
-                    QmmTKernel::SplitK { .. } if *bits != 4 => QmmTKernel::Standard,
-                    k => k,
-                };
+                // SplitK stays b4-only: the picker takes it only for an int4 width.
+                let kernel =
+                    pick_qmm_t_kernel(bucket_m, n_v, k_v, /*B=*/ 1, group, width_bits, is_nax);
                 // NAX tile is 64×64 so align check uses 64; Standard/SplitK use 32.
                 let aligned_n = match kernel {
                     QmmTKernel::Nax(_) => n_v.is_multiple_of(64),
@@ -3565,7 +3557,7 @@ fn lower_one(
                 // W4A8 on the matrix unit's int8 lane: a pre-pass quantizes
                 // the activations per (row, 64-chunk) into the shared scratch,
                 // then the GEMM multiplies them against the offset-8 codes.
-                let codes = codes_for(p, profile, gen_class, half_planes, bits_v, k_v, gs);
+                let codes = codes_for(p, profile, gen_class, half_planes, bits_v, k_v, group);
                 let w4a8_tile = W4a8Tile::for_n(n_v).filter(|_| {
                     matches!(kernel, QmmTKernel::Nax(_))
                         && codes.signed()
@@ -3574,7 +3566,7 @@ fn lower_one(
                         // matrix unit's int8 lane — a 3-bit or 2-bit
                         // bitstream would misalign there.
                         && bits_v == 4
-                        && matches!(gs, 64 | 128)
+                        && group.nax().is_some()
                         && k_v.is_multiple_of(64)
                         && bucket_m.is_multiple_of(W4A8_TILE_ROWS)
                 });
@@ -3669,8 +3661,8 @@ fn lower_one(
                                 kernel,
                                 dtype,
                                 scale_dtype,
-                                bits_v,
-                                gs,
+                                width_bits,
+                                group,
                                 aligned_n,
                             ),
                             constants: super::kernel_constants::AffineQmmTConstants {
@@ -3684,7 +3676,7 @@ fn lower_one(
                                     half_planes,
                                     bits_v,
                                     k_v,
-                                    gs,
+                                    group,
                                 ),
                             }
                             .into_baked(),
@@ -3717,8 +3709,8 @@ fn lower_one(
                                 dtype,
                                 compute_dtype,
                                 scale_dtype,
-                                bits_v,
-                                gs,
+                                width_bits,
+                                group,
                                 aligned_n,
                             ),
                             constants: super::kernel_constants::AffineQmmTConstants {
@@ -3732,7 +3724,7 @@ fn lower_one(
                                     half_planes,
                                     bits_v,
                                     k_v,
-                                    gs,
+                                    group,
                                 ),
                             }
                             .into_baked(),
@@ -3758,6 +3750,7 @@ fn lower_one(
                     QmmTKernel::SplitK {
                         split_k,
                         k_partition_size,
+                        ..
                     } => {
                         // Two commands:
                         //   (1) qmm_t_splitk writes the `[split_k, M, N]`
@@ -3781,8 +3774,8 @@ fn lower_one(
                                 dtype,
                                 compute_dtype,
                                 scale_dtype,
-                                bits_v,
-                                gs,
+                                width_bits,
+                                group,
                                 aligned_n,
                             ),
                             // SplitK needs FOUR function constants:
@@ -3807,7 +3800,7 @@ fn lower_one(
                                     half_planes,
                                     bits_v,
                                     k_v,
-                                    gs,
+                                    group,
                                 ),
                             }
                             .into_baked(),
@@ -4574,25 +4567,11 @@ fn lower_one(
         //   buffer(0) packed weight   buffer(1) scales   buffer(2) biases
         //   buffer(3) input_ids       buffer(4) out (arena[out_slot])
         // hidden_size rides as `[[function_constant(0)]]`.
-        I::AffineEmbed(Slot(out_slot), AffineGroupSize(group_size), AffineBits(bits), width) => {
+        I::AffineEmbed(Slot(out_slot), group_size, bits, width) => {
             let dtype = dequant_dtype_for(p);
             let scale_dtype = scale_dtype_for(p);
-            let bits_v = *bits;
-            let gs = *group_size;
-            assert!(
-                matches!(bits_v, 2 | 3 | 4 | 8),
-                "AffineEmbed: only bits ∈ {{2, 3, 4, 8}} is wired (4-bit default; \
-                 8-bit for MLX-native mixed/dynamic quant like OptiQ whose \
-                 embed_tokens is 8-bit; 3-bit for GLM-4.5-Air-3bit's quantized \
-                 embed; 2-bit for gpt-oss-mlx-2Bit's quantized embed); got \
-                 bits={bits_v}"
-            );
-            assert!(
-                matches!(gs, 32 | 64 | 128),
-                "AffineEmbed: only group_size ∈ {{32, 64, 128}} is wired \
-                 (mlx-community uses gs=64 for every Llama/Qwen/Gemma 4bit); \
-                 got gs={gs}"
-            );
+            let (group, width_bits) = (*group_size, *bits);
+            let bits_v = width_bits.get();
             // AffineEmbed reads rows of the step's width (the residual-stream width, or a
             // drafter's target's through its target's table) — NOT `Q_SIZE` (= num_q_heads *
             // head_dim). Llama-3.x / Qwen2.5 have hidden==Q_SIZE so the pre-existing query width
@@ -4616,7 +4595,7 @@ fn lower_one(
             LoweredCommand {
                 kernel: KernelId::AffineEmbed,
                 library: "quantized_dequantize",
-                function: affine_embed_kernel_static_name(dtype, scale_dtype, gs, bits_v),
+                function: affine_embed_kernel_static_name(dtype, scale_dtype, group, width_bits),
                 constants: super::kernel_constants::AffineEmbedConstants {
                     hidden_size: super::ids::HiddenSize(hidden_size),
                     // A row gather reads each row's codes whole: as the device stores them,
@@ -4706,7 +4685,7 @@ fn lower_one(
                 return Err(LoweringError::OneRowFold { bucket_m });
             }
             let (n, k, gs, bits) = (g.n.get(), g.k.get(), g.group_size.get(), g.bits.get());
-            let codes = codes_for(p, profile, gen_class, half_planes, bits, k, gs);
+            let codes = codes_for(p, profile, gen_class, half_planes, bits, k, g.group_size);
             let constants = super::kernel_constants::AffineGatedQmvConstants {
                 qmv: super::kernel_constants::AffineQmvConstants {
                     k: super::ids::KDimI32(k as i32),
@@ -4966,11 +4945,8 @@ fn lower_one(
                 geometry.rot_dim().get(),
                 geometry.page().get(),
             );
-            assert!(
-                hd <= 512,
-                "metal lowering: RopeAppendNormed threadgroup staging is sized \
-                 for head_dim <= 512 (got {hd})"
-            );
+            let staged = super::ids::StagedHeadDim::new(hd)
+                .ok_or(LoweringError::UnstagedHeadDim { head_dim: hd })?;
             let pair_off = if is_global && proportional(p)? {
                 hd / 2
             } else {
@@ -4982,7 +4958,7 @@ fn lower_one(
                 library: "rope",
                 function: rope_append_normed_kernel_static_name(p, scale_dtype_for(p)),
                 constants: super::kernel_constants::RopeAppendNormedConstants {
-                    head_dim: super::ids::HeadDim(hd),
+                    head_dim: staged,
                     num_q_heads: super::ids::NumQHeads(n_q_heads),
                     num_kv_heads: super::ids::NumKvHeads(n_kv),
                     rot_dim: super::ids::RotDim(rd),
@@ -6573,7 +6549,7 @@ fn lower_one(
                 layout.conv_out,
                 None,
                 bucket_m,
-            ));
+            )?);
 
             // 2. The gating and the delta-rule scan → o (f32 scratch).
             cmds.extend(recurrent_scan(
@@ -6648,7 +6624,7 @@ fn lower_one(
                     weight(WeightTensor::GdnConvBias, 7),
                 )),
                 bucket_m,
-            )];
+            )?];
             cmds.extend(recurrent_scan(
                 p,
                 g,
@@ -7997,17 +7973,10 @@ fn rope_append_normed_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtype
 fn affine_embed_kernel_static_name(
     dtype: DequantDtype,
     scale_dtype: ScaleDtype,
-    group_size: u32,
-    bits: u32,
+    group_size: AffineGroupSize,
+    bits: AffineBits,
 ) -> &'static str {
-    assert!(
-        matches!(group_size, 32 | 64 | 128),
-        "affine_embed_kernel_static_name: unsupported group_size={group_size} — only 32/64/128"
-    );
-    assert!(
-        matches!(bits, 2 | 3 | 4 | 8),
-        "affine_embed_kernel_static_name: unsupported bits={bits} — only 2/3/4/8 instantiated"
-    );
+    let (group_size, bits) = (group_size.get(), bits.get());
     let (d, s) = (dequant_infix(dtype), scale_infix(scale_dtype));
     leak_symbol(format!("affine_embed_{d}_s_{s}_gs_{group_size}_b_{bits}"))
 }
@@ -8072,8 +8041,8 @@ impl ColumnSlice {
 /// A recurrent mixer's causal depthwise conv1d (+SiLU), varlen + stateful (`gdn_conv1d_varlen`),
 /// into the f32 scratch `conv_out`: over GDN's qkv rows, or over the `xBC` column slice of
 /// Mamba-2's in-projection rows with its conv bias (`sliced`). One thread a (sequence, channel,
-/// `GDN_CONV_BLOCK`-token block) — grid (num_seqs[set via set_axis=X], ceil(conv_dim/tg_y),
-/// ceil(bucket_m/GDN_CONV_BLOCK) [scaled by num_tokens]; blocks past a sequence's end early out).
+/// [`GdnConvBlock`](super::ids::GdnConvBlock)-token block) — grid (num_seqs[set via set_axis=X], ceil(conv_dim/tg_y),
+/// ceil(bucket_m/block) [scaled by num_tokens]; blocks past a sequence's end early out).
 fn recurrent_conv(
     p: &ModelFacts,
     g: scratchy_ir::model_facts::Gdn,
@@ -8083,7 +8052,7 @@ fn recurrent_conv(
     conv_out: u32,
     sliced: Option<(ColumnSlice, Binding)>,
     bucket_m: u32,
-) -> LoweredCommand {
+) -> Result<LoweredCommand, LoweringError> {
     use crate::tape::ids::BucketM;
     use crate::tape::lowered::{MScaleAxis, MScaling};
     let runtime = |kind, binding_index| Binding::Runtime {
@@ -8112,35 +8081,26 @@ fn recurrent_conv(
     if p.spec_drafts().is_some() {
         bindings.push(runtime(RuntimeBindingKind::GdnConvLanes { layer }, 8));
     }
-    // The no-race contract: the block must cover the seed window (kernel − 1 entries), so
-    // blocks past a sequence's head seed from `x` alone and never read the seed ring, and a
-    // verify step's rows (drafts + 1), so only the thread that reads the lane's checkpoint
-    // (a replay's seed) writes it.
-    assert!(
-        g.conv_kernel().get() <= GDN_CONV_BLOCK + 1 && GDN_CONV_BLOCK > kernel_drafts(p),
-        "the conv's token block must cover the seed window (kernel - 1) and a verify step's \
-         rows (drafts + 1)"
-    );
+    // The no-race contract is the block's type (`GdnConvBlock::covering`).
+    let (kernel, drafts) = (g.conv_kernel().get(), kernel_drafts(p));
+    let block = super::ids::GdnConvBlock::covering(kernel, drafts)
+        .ok_or(LoweringError::GdnConvBlockShort { kernel, drafts })?;
     if let Some((slice, bias)) = sliced {
         constants.extend(slice.constants(2));
         constants.push(ConstantValue::boolean(4, true));
         bindings.push(bias);
     }
-    constants.push(ConstantValue::uint(6, GDN_CONV_BLOCK));
+    constants.push(ConstantValue::uint(6, block.get()));
     let tg_y = conv_dim.clamp(1, THREADS_PER_GROUP);
-    LoweredCommand {
+    Ok(LoweredCommand {
         kernel: KernelId::GatedDeltaNet,
         library: "gdn_conv1d_varlen",
         function: gdn_conv1d_varlen_static_name(dequant_dtype_for(p)),
         constants: baked(constants),
         dispatch: DispatchShape {
-            threadgroups: (
-                1,
-                conv_dim.div_ceil(tg_y),
-                bucket_m.div_ceil(GDN_CONV_BLOCK),
-            ),
+            threadgroups: (1, conv_dim.div_ceil(tg_y), bucket_m.div_ceil(block.get())),
             threads_per_threadgroup: (1, tg_y, 1),
-            // Z scales with the step's tokens (one layer per GDN_CONV_BLOCK of them, always at
+            // Z scales with the step's tokens (one layer per block of them, always at
             // least any one sequence's blocks — blocks past a sequence's end early out); set_axis
             // SETS X = num_seqs.
             m_scaling: Some(MScaling {
@@ -8151,16 +8111,8 @@ fn recurrent_conv(
         },
         bindings: baked(bindings),
         gemm_dims: None,
-    }
+    })
 }
-
-/// The conv's tokens a thread owns (`GDN_CONV_BLOCK`, its baked constant slot 6): the token-block
-/// parallelism of `gdn_conv1d_varlen` — the grid's Z is the step's rows over it, each thread
-/// walking its block with the causal window in registers. Locked per model in [`recurrent_conv`]
-/// to at least the seed window (`kernel − 1` entries) and a verify step's rows: block 0 is then
-/// the one thread that reads the seed ring and the one that writes the new ring, blocks past a
-/// sequence's head seed from `x` alone, and only block 0 touches the draft lanes.
-const GDN_CONV_BLOCK: u32 = 32;
 
 /// The scans' constant slot of the drafts each sequence of a verify step carries
 /// (`GDN_SCAN_DRAFTS`): what a plain step's kernels, which keep no draft state, do not take.
@@ -8647,17 +8599,10 @@ fn affine_gather_qmv_kernel(
     k_in: u32,
     dtype: DequantDtype,
     scale_dtype: ScaleDtype,
-    group_size: u32,
-    bits: u32,
+    group_size: AffineGroupSize,
+    bits: AffineBits,
 ) -> (KernelId, &'static str) {
-    assert!(
-        matches!(group_size, 32 | 64 | 128),
-        "affine_gather_qmv_kernel: unsupported group_size={group_size} — only 32/64/128 instantiated"
-    );
-    assert!(
-        matches!(bits, 2 | 3 | 4 | 8),
-        "affine_gather_qmv_kernel: unsupported bits={bits} — only 2/3/4/8 instantiated"
-    );
+    let (group_size, bits) = (group_size.get(), bits.get());
     // MLX-native mixed/dynamic quant (OptiQ) ships 8-bit experts on the
     // sensitive edge layers; the `_b_{bits}` suffix selects the matching
     // gather-qmv monomorphization.
@@ -8689,18 +8634,11 @@ fn affine_gather_qmm_t_symbol(
     dtype: DequantDtype,
     compute_dtype: DequantDtype,
     scale_dtype: ScaleDtype,
-    group_size: u32,
+    group_size: AffineGroupSize,
     aligned_n: bool,
-    bits: u32,
+    bits: AffineBits,
 ) -> &'static str {
-    assert!(
-        matches!(group_size, 32 | 64 | 128),
-        "affine_gather_qmm_t_symbol: unsupported group_size={group_size} — only 32/64/128"
-    );
-    assert!(
-        matches!(bits, 2 | 3 | 4 | 8),
-        "affine_gather_qmm_t_symbol: unsupported bits={bits} — only 2/3/4/8 instantiated"
-    );
+    let (group_size, bits) = (group_size.get(), bits.get());
     let (d, s) = (dequant_infix(dtype), scale_infix(scale_dtype));
     let aln = if aligned_n { "true" } else { "false" };
     if bits == 4
@@ -8720,22 +8658,15 @@ fn affine_gather_qmm_t_symbol(
 
 /// Symbol for the MoE grouped expert GEMM on NAX (quantized_qmm_nax).
 /// Only the aligned_N=true variants — NAX is dispatched only when
-/// N % 64 == 0. gs ∈ {64, 128} (NAX has no gs=32).
+/// N % 64 == 0, at a [`NaxGroupSize`] (NAX has no gs=32).
 fn affine_gather_qmm_t_nax_symbol(
     dequant: NaxDequant,
     dtype: DequantDtype,
     scale_dtype: ScaleDtype,
-    group_size: u32,
-    bits: u32,
+    group_size: super::ids::NaxGroupSize,
+    bits: AffineBits,
 ) -> &'static str {
-    assert!(
-        matches!(group_size, 64 | 128),
-        "affine_gather_qmm_t_nax_symbol: unsupported group_size={group_size} — NAX gather is gs 64/128 only"
-    );
-    assert!(
-        matches!(bits, 2 | 3 | 4 | 8),
-        "affine_gather_qmm_t_nax_symbol: unsupported bits={bits} — only 2/3/4/8 instantiated"
-    );
+    let (group_size, bits) = (group_size.get(), bits.get());
     let (d, s) = (dequant_infix(dtype), scale_infix(scale_dtype));
     let stem = dequant.symbol_stem();
     leak_symbol(format!(
@@ -8801,9 +8732,9 @@ fn moe_w4a8(b: &MoeBlock, at: MoeBake, s: &MoeScratch) -> bool {
     s.grouping == MoeGrouping::Grouped
         && at.is_nax
         && b.quant.widths.uniform().is_some_and(|w| {
-            at.codes.for_bits(w.0) == super::kernel_constants::AffineCodes::Offset8
+            at.codes.for_bits(w.get()) == super::kernel_constants::AffineCodes::Offset8
         })
-        && matches!(b.quant.group_size.0, 64 | 128)
+        && b.quant.group_size.nax().is_some()
         && hidden.is_multiple_of(64.max(W4A8_GROUPED_TILE.cols()))
         && inter.is_multiple_of(64.max(W4A8_GROUPED_TILE.cols()))
         && s.l.mpad_max.is_multiple_of(W4A8_TILE_ROWS)
@@ -9207,7 +9138,7 @@ fn lower_moe_step(
                          bytes: &mut u32| {
         let (routed, route) = routed_here(routing, 4 * 128);
         let mut commands = each_step(route.as_slice(), bytes)?;
-        let (AffineGroupSize(gs), bits) = (first.group_size, first.width.bits().0);
+        let (gs, bits) = (first.group_size, first.width.bits());
         let (kernel, symbol) = gather_kernel(GatherQmv::GateUpAct, inter, hidden, gs, bits);
         let mut bindings = expert_weights(first.proj, first.layer, 0)?.to_vec();
         let (x, norm, gain) = normed_rows(&s, 3, first.rows)?;
@@ -9230,7 +9161,7 @@ fn lower_moe_step(
         };
         let shape = grid((pairs, inter.div_ceil(8), 1), (32, 4, 1), scaling);
         let gather = AffineGatherQmvConstants {
-            qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
+            qmv: qmv(inter, hidden, at.codes.for_bits(bits.get())),
             rows: rows_read(&s, first.rows),
         };
         // A sorted bake's same-expert pairs are adjacent already, their repeat reads cache hits.
@@ -9628,7 +9559,7 @@ fn lower_moe_step(
             rows,
             layer: l,
             proj,
-            group_size: AffineGroupSize(gs),
+            group_size: gs,
             width,
         }) => {
             let (n_out, k_in) = match proj {
@@ -9641,8 +9572,8 @@ fn lower_moe_step(
                 ExpertProj::Down => R::ExpertDown,
             };
             let weights = expert_weights(proj, l, 0)?;
-            let bits = width.bits().0;
-            let codes = at.codes.for_bits(bits);
+            let bits = width.bits();
+            let codes = at.codes.for_bits(bits.get());
             let dims: Vec<ConstantValue> = [C::int(0, k_in as i32), C::int(1, n_out as i32)]
                 .into_iter()
                 .chain(codes.constant())
@@ -9670,7 +9601,7 @@ fn lower_moe_step(
                 let gemm = cmd(
                     KernelId::AffineGatherQmmW4a8,
                     "quantized_qmm_nax",
-                    qmm_w4a8_static_name(W4a8Rows::Grouped, dtype, scale_dtype, gs, tile),
+                    qmm_w4a8_static_name(W4a8Rows::Grouped, dtype, scale_dtype, gs.get(), tile),
                     constants,
                     grid(
                         (n_out / tile.cols(), mpad / W4A8_TILE_ROWS, 1),
@@ -9686,11 +9617,8 @@ fn lower_moe_step(
                 // bits=3 rides NAX like 4/8: the loader's index math is
                 // bits=3-exact and metal_nax.h carries the dequantize
                 // branch; bits=2 likewise (4 codes per byte).
-                let use_nax = at.is_nax
-                    && n_out.is_multiple_of(64)
-                    && matches!(gs, 64 | 128)
-                    && matches!(bits, 2 | 3 | 4 | 8);
-                let (kernel, library, symbol, tile, threads) = if use_nax {
+                let nax = gs.nax().filter(|_| at.is_nax && n_out.is_multiple_of(64));
+                let (kernel, library, symbol, tile, threads) = if let Some(gs) = nax {
                     // Rows the experts multiply: the bucket's token × expert pairs.
                     let pairs = at.bucket_m * b.top_k.0;
                     let dequant = NaxDequant::for_shape(pairs, n_out, k_in);
@@ -9713,12 +9641,14 @@ fn lower_moe_step(
                     // b4 only: the mixed-compute W loader is
                     // nibble-specialized, and the symbol builder falls back
                     // to same-compute for any other width.
-                    let compute_dtype =
-                        if at.f16_compute && bits == 4 && matches!(dtype, DequantDtype::Bf16) {
-                            DequantDtype::F16
-                        } else {
-                            dtype
-                        };
+                    let compute_dtype = if at.f16_compute
+                        && bits == AffineBits::B4
+                        && matches!(dtype, DequantDtype::Bf16)
+                    {
+                        DequantDtype::F16
+                    } else {
+                        dtype
+                    };
                     let symbol = affine_gather_qmm_t_symbol(
                         dtype,
                         compute_dtype,
@@ -9834,7 +9764,7 @@ fn lower_moe_step(
             commands
         }
         S::DownCombine(down, Slot(out), ends) => {
-            let (AffineGroupSize(gs), bits) = (down.group_size, down.width.bits().0);
+            let (gs, bits) = (down.group_size, down.width.bits());
             let (kernel, symbol) = gather_kernel(GatherQmv::DownCombine, hidden, inter, gs, bits);
             let mut bindings = expert_weights(ExpertProj::Down, down.layer, 0)?.to_vec();
             let (x, indices) = (rows_of(&s, 3, down.rows)?, s.at(4, R::TopKIndices));
@@ -9850,7 +9780,7 @@ fn lower_moe_step(
             // Tokens fastest, as the gate/up's pairs.
             let shape = grid((bucket_m, hidden.div_ceil(4), 1), (32, k, 1), ms(A::X));
             let mut constants: Vec<ConstantValue> = AffineCombineQmvConstants {
-                qmv: qmv(hidden, inter, at.codes.for_bits(bits)),
+                qmv: qmv(hidden, inter, at.codes.for_bits(bits.get())),
                 top_k: b.top_k,
                 gate_scale: ends.gate_scale.is_some(),
                 residual: ends.residual,
@@ -12307,7 +12237,7 @@ mod tests {
                 layer: LayerId(0),
                 n: NDim(3072),
                 k: KDim(8192),
-                bits: AffineBits(bits),
+                bits: AffineBits::new(bits).unwrap(),
                 vector_limit: QmvBatchLimit(10),
                 ..q_proj()
             })
@@ -12442,7 +12372,7 @@ mod tests {
                 layer: LayerId(0),
                 n: NDim(n),
                 k: KDim(5120),
-                bits: AffineBits(bits),
+                bits: AffineBits::new(bits).unwrap(),
                 vector_limit: QmvBatchLimit(10),
                 ..q_proj()
             })
@@ -12510,8 +12440,8 @@ mod tests {
                 layer: LayerId(0),
                 n: NDim(n),
                 k: KDim(k),
-                group_size: AffineGroupSize(64),
-                bits: AffineBits(4),
+                group_size: AffineGroupSize::new(64).unwrap(),
+                bits: AffineBits::new(4).unwrap(),
                 vector_limit: QmvBatchLimit(10),
                 ends: QmvEnds::default(),
             })]))
@@ -12604,8 +12534,8 @@ mod tests {
                 layer: LayerId(0),
                 n: NDim(n),
                 k: KDim(k),
-                group_size: AffineGroupSize(group_size),
-                bits: AffineBits(4),
+                group_size: AffineGroupSize::new(group_size).unwrap(),
+                bits: AffineBits::new(4).unwrap(),
                 vector_limit: QmvBatchLimit(10),
                 ends: QmvEnds::default(),
             })]))
@@ -12729,7 +12659,7 @@ mod tests {
                 layer: LayerId(0),
                 n: NDim(n),
                 k: KDim(2048),
-                bits: AffineBits(4),
+                bits: AffineBits::new(4).unwrap(),
                 vector_limit: QmvBatchLimit(10),
                 ..q_proj()
             })
@@ -12814,8 +12744,8 @@ mod tests {
             layer: LayerId(3),
             n: NDim(2048),
             k: KDim(2048),
-            group_size: AffineGroupSize(64),
-            bits: AffineBits(4),
+            group_size: AffineGroupSize::new(64).unwrap(),
+            bits: AffineBits::new(4).unwrap(),
             vector_limit: QmvBatchLimit(18),
             ends: QmvEnds::default(),
         }
@@ -13036,8 +12966,8 @@ mod tests {
             layer: LayerId(0),
             n: NDim(3072),
             k: KDim(8192),
-            group_size: AffineGroupSize(gs),
-            bits: AffineBits(bits),
+            group_size: AffineGroupSize::new(gs).unwrap(),
+            bits: AffineBits::new(bits).unwrap(),
             vector_limit: QmvBatchLimit(10),
             ends: QmvEnds::default(),
         };
@@ -13160,8 +13090,8 @@ mod tests {
                 layer: LayerId(0),
                 n: NDim(n),
                 k: KDim(k),
-                group_size: AffineGroupSize(64),
-                bits: AffineBits(4),
+                group_size: AffineGroupSize::new(64).unwrap(),
+                bits: AffineBits::new(4).unwrap(),
                 vector_limit: QmvBatchLimit(10),
                 ends: QmvEnds::default(),
             })]))
@@ -13221,8 +13151,8 @@ mod tests {
                 layer: LayerId(0),
                 n: NDim(n),
                 k: KDim(k),
-                group_size: AffineGroupSize(64),
-                bits: AffineBits(4),
+                group_size: AffineGroupSize::new(64).unwrap(),
+                bits: AffineBits::new(4).unwrap(),
                 vector_limit: QmvBatchLimit(10),
                 ends: QmvEnds::default(),
             })
@@ -13350,8 +13280,8 @@ mod tests {
                     layer: LayerId(0),
                     n: NDim(n),
                     k: KDim(2048),
-                    group_size: AffineGroupSize(64),
-                    bits: AffineBits(4),
+                    group_size: AffineGroupSize::new(64).unwrap(),
+                    bits: AffineBits::new(4).unwrap(),
                     vector_limit: QmvBatchLimit(10),
                     ends: QmvEnds::default(),
                 }),
@@ -14539,8 +14469,8 @@ mod tests {
     fn affine_embed_lowers_to_single_command_with_2d_dispatch() {
         let inst = MetalStep::AffineEmbed(
             /*out_slot=*/ Slot(0),
-            AffineGroupSize(64),
-            AffineBits(4),
+            AffineGroupSize::new(64).unwrap(),
+            AffineBits::new(4).unwrap(),
             crate::tape::lowered::ActivationWidth::of_cols(2048),
         );
         let bucket_m = 32u32;
@@ -14651,7 +14581,7 @@ mod tests {
         };
         use crate::tape::step::{ExpertQuant, ExpertWidths, MoeBlock, RouterInput};
         use scratchy_subtile::subtile_ir::{ExpertBundle, RouterBundle};
-        let four = AffineBits(4);
+        let four = AffineBits::new(4).unwrap();
         MoeBlock {
             experts: NumExperts(experts),
             top_k: TopK(8),
@@ -14662,7 +14592,7 @@ mod tests {
             bundle: ExpertBundle::SharedFused,
             input: RouterInput::Raw,
             quant: ExpertQuant {
-                group_size: AffineGroupSize(64),
+                group_size: AffineGroupSize::new(64).unwrap(),
                 widths: ExpertWidths {
                     gate: Some(four),
                     up: four,
@@ -14708,7 +14638,7 @@ mod tests {
         };
         use crate::tape::step::{ExpertQuant, ExpertWidths, MoeBlock, RouterInput};
         use scratchy_subtile::subtile_ir::{ExpertBundle, RouterBundle};
-        let three = AffineBits(3);
+        let three = AffineBits::new(3).unwrap();
         MoeBlock {
             experts: NumExperts(128),
             top_k: TopK(4),
@@ -14719,7 +14649,7 @@ mod tests {
             bundle: ExpertBundle::GptOss,
             input: RouterInput::Raw,
             quant: ExpertQuant {
-                group_size: AffineGroupSize(64),
+                group_size: AffineGroupSize::new(64).unwrap(),
                 widths: ExpertWidths {
                     gate: Some(three),
                     up: three,
@@ -14769,12 +14699,12 @@ mod tests {
         let lower = |step| {
             lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("a GptOss step lowers")
         };
-        let three = AffineBits(3);
+        let three = AffineBits::new(3).unwrap();
         let gate = ExpertMatmul {
             rows: MoeRows::Tokens(Slot(1)),
             layer: LayerId(0),
             proj: ExpertProj::Gate,
-            group_size: AffineGroupSize(64),
+            group_size: AffineGroupSize::new(64).unwrap(),
             width: ExpertWidth::OpUniform(three),
         };
 
@@ -14824,7 +14754,7 @@ mod tests {
             rows: MoeRows::Scratch(MoeRegion::ExpertGate),
             layer: LayerId(0),
             proj: ExpertProj::Down,
-            group_size: AffineGroupSize(64),
+            group_size: AffineGroupSize::new(64).unwrap(),
             width: ExpertWidth::OpUniform(three),
         };
         let commands = lower(MoeStep::DownCombine(down, Slot(2), CombineEnds::default()));
@@ -14886,12 +14816,12 @@ mod tests {
         };
         let lower =
             |step| lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("a W4A8 step lowers");
-        let four = AffineBits(4);
+        let four = AffineBits::new(4).unwrap();
         let gate = ExpertMatmul {
             rows: MoeRows::Tokens(Slot(1)),
             layer: LayerId(0),
             proj: ExpertProj::Gate,
-            group_size: AffineGroupSize(64),
+            group_size: AffineGroupSize::new(64).unwrap(),
             width: ExpertWidth::OpUniform(four),
         };
 
@@ -14950,7 +14880,7 @@ mod tests {
             rows: MoeRows::Scratch(MoeRegion::ExpertGate),
             layer: LayerId(0),
             proj: ExpertProj::Down,
-            group_size: AffineGroupSize(64),
+            group_size: AffineGroupSize::new(64).unwrap(),
             width: ExpertWidth::OpUniform(four),
         };
         let commands = lower(MoeStep::DownCombine(down, Slot(2), CombineEnds::default()));
@@ -14993,7 +14923,7 @@ mod tests {
         use crate::tape::ids::{AffineBits, AffineGroupSize};
         use crate::tape::step::{ExpertMatmul, ExpertWidth, MoeRows, MoeStep};
         use scratchy_subtile::subtile_ir::ExpertProj;
-        let four = AffineBits(4);
+        let four = AffineBits::new(4).unwrap();
         let block = qwen_moe_block(128);
         let tokens = MoeRows::Tokens(Slot(1));
         let p = tp();
@@ -15026,7 +14956,7 @@ mod tests {
                 rows: tokens,
                 layer: LayerId(0),
                 proj: ExpertProj::Gate,
-                group_size: AffineGroupSize(64),
+                group_size: AffineGroupSize::new(64).unwrap(),
                 width: ExpertWidth::OpUniform(four),
             };
             let (grouping, copy) = sorted_rows(bucket_m);
@@ -15062,11 +14992,11 @@ mod tests {
             bundle: ExpertBundle::SharedFused,
             input: RouterInput::Raw,
             quant: ExpertQuant {
-                group_size: AffineGroupSize(64),
+                group_size: AffineGroupSize::new(64).unwrap(),
                 widths: ExpertWidths {
                     gate: None,
-                    up: AffineBits(4),
-                    down: AffineBits(2),
+                    up: AffineBits::new(4).unwrap(),
+                    down: AffineBits::new(2).unwrap(),
                 },
             },
         }
@@ -15086,8 +15016,8 @@ mod tests {
             rows: MoeRows::Tokens(Slot(1)),
             layer: LayerId(0),
             proj: ExpertProj::Up,
-            group_size: AffineGroupSize(64),
-            width: ExpertWidth::Declared(AffineBits(4)),
+            group_size: AffineGroupSize::new(64).unwrap(),
+            width: ExpertWidth::Declared(AffineBits::new(4).unwrap()),
         };
         let lower = |step, bucket_m| {
             let at = MoeBake {

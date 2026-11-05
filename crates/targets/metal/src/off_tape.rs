@@ -18,7 +18,9 @@ use crate::sampling::{CastDtype, SamplerStage};
 use crate::shader_cache::{ComputePipelineState, Device, Library, load_baked_library};
 use crate::specialized_pipeline_cache::{ConstantValue, PipelineKey};
 use crate::stream::MetalStreamError;
-use crate::tape::ids::{BitsetWords, BlockSize, KDimI32, LogitsWidth, MDimI32, NDimI32};
+use crate::tape::ids::{
+    AffineBits, AffineGroupSize, BitsetWords, BlockSize, KDimI32, LogitsWidth, MDimI32, NDimI32,
+};
 use crate::tape::kernel_constants::{
     AffineCodes, AffineQmvConstants, AffineQmvWideConstants, ArgmaxConstants,
     ChainAdvanceConstants, DraftAcceptConstants, GrammarMaskConstants, LogprobsConstants,
@@ -41,8 +43,8 @@ pub struct VocabSuffix {
     pub prefix: u32,
     pub rows: u32,
     pub hidden: u32,
-    pub bits: u32,
-    pub group: u32,
+    pub bits: AffineBits,
+    pub group: AffineGroupSize,
     pub scale: ScaleDtype,
     pub verify_rows: u32,
     pub window: u32,
@@ -52,15 +54,15 @@ impl VocabSuffix {
     /// The matvec of `m` rows (`1..=verify_rows`) over the suffix.
     pub fn qmv_kernel(self, m: u32) -> QmvKernel {
         match m {
-            1 => pick_qmv_kernel(self.rows, self.hidden, self.bits),
-            _ => pick_qmv_kernel_wide(self.rows, self.hidden, self.bits, m, true),
+            1 => pick_qmv_kernel(self.rows, self.hidden, self.bits.get()),
+            _ => pick_qmv_kernel_wide(self.rows, self.hidden, self.bits.get(), m, true),
         }
     }
 
     /// The bytes of one lm_head row of its codes, and of its scales (and biases).
     pub fn row_bytes(self) -> (usize, usize) {
-        let codes = self.hidden as usize * self.bits as usize / 8;
-        let scales = (self.hidden / self.group) as usize * self.scale.as_dtype().size_bytes();
+        let codes = self.hidden as usize * self.bits.get() as usize / 8;
+        let scales = (self.hidden / self.group.get()) as usize * self.scale.as_dtype().size_bytes();
         (codes, scales)
     }
 
