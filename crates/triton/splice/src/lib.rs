@@ -1440,7 +1440,7 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// A whole page gathered as ONE index entry (the prompt kernel's `k_pages.index_select(0,
 /// page_idx)`, every kv head) — 128 KB at 8 kv heads × 64 head dims, 256 KB at 128 — is gathered in
 /// one op, as torch-spyre's compiled prefill gathers it
-/// ([`ktir_superdsc::ir::bridge::tiled_op_sdsc_op::page_gather_page_opspec`]).
+/// ([`ktir_superdsc::ir::bridge::tiled_op_sdsc_op::index_select_opspec`]).
 pub const PAGE_SLOTS: u32 = 128;
 
 /// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
@@ -5341,8 +5341,8 @@ mod walk_on_the_card {
                 .expect("one dsc");
             assert_eq!(
                 dsc["N_"],
-                serde_json::json!({"name_": "n", "mb_": 8, "x_": PAGE_SLOTS, "out_": 128, "y_": 1}),
-                "{}: one [BLOCK, 128] block an entry",
+                serde_json::json!({"name_": "n", "mb_": 8, "y_": 1, "x_": PAGE_SLOTS, "out_": 128}),
+                "{}: one [BLOCK, 128] block an entry — the one op's `blocks == 1` case",
                 e.op_name
             );
             assert_eq!(
@@ -5360,11 +5360,12 @@ mod walk_on_the_card {
             assert_eq!(
                 orders,
                 [
-                    &serde_json::json!(["out", "x", "mb", "y"]),
+                    &serde_json::json!(["out", "x", "y", "mb"]),
                     &serde_json::json!(["mb"]),
-                    &serde_json::json!(["x", "out", "mb", "y"]),
+                    &serde_json::json!(["x", "out", "y", "mb"]),
                 ],
-                "{}: the page read row-major through its index, landed stick-major",
+                "{}: the page read row-major through its index, landed stick-major — at one block \
+                 an entry the one op's orders, the same bytes the split form's spelled",
                 e.op_name
             );
         }
@@ -5386,6 +5387,84 @@ mod walk_on_the_card {
             ops.iter().any(|e| e.op_name.starts_with("scatter")),
             "the output row is scattered to its query row"
         );
+    }
+
+    /// ⭐ A PREFILL TRIP'S PAGE-GATHER LANDING IS HBM, NOT LX — the placement fact the one
+    /// `index_select` gather's "no LX law bounds a whole-page entry's size" rests on (the deleted
+    /// 64 KiB sub-row bound's territory), shown in the emitted bundle rather than stated: every
+    /// in-body page-gather op's destination is a SYNTHETIC of the Intermediate segment
+    /// (`BundleLayout::synth`, its footprint reserved there), pinned NOWHERE in the scratchpad —
+    /// neither core-locally nor op-locally (`lx_core_local`/`lx_op_local`). An entry's size is
+    /// bounded by HBM, so no compose-around is owed for a page the pool holds.
+    ///
+    /// The DECODE trip is a separate front: its whole body — page gathers included — the
+    /// scratchpad plan pins in LX beside the compute, and the plan's own window guard is the
+    /// build-time bound that trip answers to; this test does not speak for it.
+    #[test]
+    fn a_prefill_trips_page_gather_lands_in_hbm_not_lx() {
+        for (mq, blocks, hd) in [(128i128, 4i128, 64i128), (128, 4, 128), (512, 4, 64)] {
+            let node = walk_at(mq, blocks, hd);
+            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            let mut sym = 0i64;
+            let ops = ktir_superdsc::emit::whole_function::lower_walk(
+                &node,
+                Some(&layout),
+                &mut sym,
+                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+            )
+            .unwrap_or_else(|e| panic!("mq={mq} hd={hd}: the walk lowers: {}", e.message));
+            // The ONE gather's in-body ops — `gather_o{tid}` / `gather{chunk}_o{tid}` with the
+            // trip's walk flag — not the head-major staging path's `gather{c}_{i}_o{tid}` copies
+            // and not the query row's gather before the body, both separate fronts.
+            let one_gather = |name: &str| {
+                let Some(rest) = name.strip_prefix("gather") else {
+                    return false;
+                };
+                let Some((mid, _tid)) = rest.split_once("_o") else {
+                    return false;
+                };
+                mid.is_empty() || mid.chars().all(|c| c.is_ascii_digit())
+            };
+            let gathers: Vec<&ktir_superdsc::emit::EmittedOp> = ops
+                .iter()
+                .filter(|e| one_gather(&e.op_name) && e.walk.is_some())
+                .collect();
+            assert!(
+                !gathers.is_empty(),
+                "mq={mq} hd={hd}: the trip gathers its pages"
+            );
+            for e in gathers {
+                let dsts: Vec<&str> = e
+                    .arg_bindings
+                    .iter()
+                    .filter(|a| !a.is_input)
+                    .map(|a| a.buffer.as_str())
+                    .collect();
+                assert_eq!(dsts.len(), 1, "mq={mq} hd={hd}: {}: one landing", e.op_name);
+                let dst = dsts[0];
+                assert!(
+                    !layout.lx_core_local(dst) && !layout.lx_op_local(dst),
+                    "mq={mq} hd={hd}: {}: the landing {dst} is pinned in the LX scratchpad",
+                    e.op_name
+                );
+                let synth = layout.synth.borrow();
+                let footprint = *synth.sizes.get(dst).unwrap_or_else(|| {
+                    panic!(
+                        "mq={mq} hd={hd}: {}: the landing {dst} is no HBM synthetic of the \
+                         Intermediate segment",
+                        e.op_name
+                    )
+                });
+                let page_bytes = u64::from(PAGE_SLOTS) * u64::from(hd as u32) * 2;
+                assert!(
+                    footprint >= page_bytes,
+                    "mq={mq} hd={hd}: {}: the landing {dst} reserves {footprint} B, less than the \
+                     {page_bytes} B one page holds",
+                    e.op_name
+                );
+            }
+        }
     }
 
     /// ⭐ A PROMPT CHUNK'S ROWS MOVE IN ONE OP EACH. torch-spyre's compiled prefill gathers all 512

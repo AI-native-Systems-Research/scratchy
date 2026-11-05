@@ -4956,7 +4956,7 @@ fn lower_function_folded(
                         }
                         continue;
                     }
-                    let (g, page_sticks) = page_gather_of(f, gathers[gi])?;
+                    let (g, entries, plane) = page_gather_of(f, gathers[gi])?;
                     // ⭐ A CHAINED INDEX runs as its two gathers: the run of index words is copied
                     // first, through the position table, into a scratch stick the gather then reads.
                     let g = match g.via {
@@ -4992,228 +4992,184 @@ fn lower_function_folded(
                         }
                         None => g,
                     };
-                    // ⭐ PAGES OF BLOCKS, ONE ENTRY A PAGE, IN ONE OP — torch-spyre's prompt-trip page
-                    // gather (and a decode batch's chunk of pages, one a core): each entry selects a
-                    // page, its kv heads' blocks are read inside the op, and each lands stick-major,
-                    // one after another — so no piece, no scaled index and no permute follows.
-                    if let &[b, r, c] = to.as_slice()
-                        && b > i64::from(g.entries)
-                        && b % i64::from(g.entries) == 0
-                        && c % stick == 0
-                        // Landed stick-major: the frame a multi-stick page is read in (`page_to_sticks`,
-                        // as the one-block-an-entry gather below requires), and at one stick the
-                        // row-major frame's own bytes.
-                        && (page_to_sticks || c == stick)
-                    {
-                        let (b, r, c) = (b as u32, r as u32, c as u32);
-                        let tid = mint_inter(k, layout, floor, res);
-                        let dst = stick_major_region(tid, b * r, c / stick as u32, layout);
-                        out.push(
-                            crate::ir::bridge::tiled_op_sdsc_op::assemble_page_gather_page(
-                                &format!("gather_o{tid}"),
-                                &crate::place::act_name(g.value_tid),
-                                &dst.name(),
-                                crate::superdsc_opspec::GatherIndex::of_scratch_rows(
-                                    crate::place::act_name(g.index_tid),
-                                    crate::superdsc_opspec::PageExtent::of_positions(1),
-                                    g.first_entry,
-                                ),
-                                crate::ir::bridge::tiled_op_sdsc_op::PageOfBlocks {
-                                    entries: g.entries,
-                                    blocks: b / g.entries,
-                                    rows: r,
-                                    cols: c,
+                    // ⭐ THE ONE PAGE GATHER — `index_select` over the folded cache's dim 0 (the
+                    // reference's `page_attn_head_major_prefill.py`: `kv.index_select(0,
+                    // page_ids).reshape(...)`), for ANY entry size, page count and head width. One
+                    // index entry selects one position of the pool and delivers its whole plane,
+                    // and the consumer's own frame `to` states the landing: its last dim `w`,
+                    // whole sticks (a plane of the folded cache is whole sticks — its
+                    // `[num_pages, block, sticks, eps]` layout, stick dim last); a rank ≥ 3
+                    // `[..., blocks, rows, w]` states `rows × w` blocks, a rank-2 `[T, w]` states
+                    // none, so each gathered entry's plane is one block. Each `[rows, w]` block
+                    // lands stick-major one after another (`batch_blocks`), the frame the trip's
+                    // batched restickify and contractions read a block of at its base — so no
+                    // piece and no scaled index follows, and a permute follows only where the
+                    // frame is rank-2 over several multi-stick entries (below).
+                    // ⭐ THE GATHER'S OWN TYPED VIEW, MINTED ONCE — the entries and plane at the
+                    // gather's own fold ([`page_gather_of`]), the landing frame off the reshape's
+                    // `to` against them: every extent the op takes is a TYPE from here down
+                    // (GatherEntries, NonZeroU32, StickExtent, LandingOffset), and the ways a
+                    // frame is outside this gather's domain refuse THERE, by name, and nothing
+                    // downstream re-checks them. Entries past one op's index stick
+                    // (`CopyDims::ENTRIES_PER_OP`, 32 — the op's own domain, not a device
+                    // refusal) are chunked one op a run by the frame's own leg iterator, each
+                    // at its own entry base and landing offset: no entry count or size is
+                    // refused.
+                    let frame = crate::superdsc_opspec::LandingFrame::of(&to, plane, entries)
+                        .map_err(|e| Error {
+                            message: format!("{}: `{:?}` {}", f.name, op.op_type, e),
+                        })?;
+                    // ⭐ THE CHUNK LEGS EVERY FRAME SHARES — one op a run of one index stick
+                    // (the frame's own [`LandingFrame::legs`]: each run at its own entry base,
+                    // the gather's own first entry plus the run's start, both whole sticks, and
+                    // its own landing offset, whole blocks in).
+                    let mut chunk_legs = |frame: crate::superdsc_opspec::LandingFrame,
+                                      land_tid: u32,
+                                      land_name: &str,
+                                      page_of: &dyn Fn(
+                        crate::superdsc_opspec::GatherEntries,
+                        crate::superdsc_opspec::LandingOffset,
+                    ) -> crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage|
+                     -> Result<(), Error> {
+                        let mut emitted = 0u32;
+                        for (run_start, run, offset) in frame.legs() {
+                            let base = g.first_entry.plus_entries(run_start.entries()).map_err(
+                                |message| Error {
+                                    message: format!("{}: {message}", f.name),
                                 },
-                                sym_id_base,
-                                Some(layout),
-                            )
-                            .map_err(|message| Error {
-                                message: format!("{}: {message}", f.name),
-                            })?,
-                        );
-                        gather_carried[gi] = true;
-                        if let Some(c) = block_landing_cols(c, stick) {
-                            batch_blocks.insert(tid, c);
+                            )?;
+                            out.push(
+                                crate::ir::bridge::tiled_op_sdsc_op::assemble_index_select(
+                                    &format!(
+                                        "gather{}_o{land_tid}",
+                                        if emitted == 0 {
+                                            String::new()
+                                        } else {
+                                            emitted.to_string()
+                                        }
+                                    ),
+                                    &crate::place::act_name(g.value_tid),
+                                    land_name,
+                                    crate::superdsc_opspec::OnePositionIndex::of_scratch_rows(
+                                        crate::place::act_name(g.index_tid),
+                                        base,
+                                    ),
+                                    page_of(run, offset),
+                                    sym_id_base,
+                                    Some(layout),
+                                )
+                                .map_err(|message| Error {
+                                    message: format!("{}: {message}", f.name),
+                                })?,
+                            );
+                            emitted += run.get();
                         }
-                        inter.insert(
-                            res,
-                            Region {
-                                is_out: false,
-                                ..dst
-                            },
-                        );
-                        continue;
-                    }
-                    // ⭐ AN ENTRY PAST dxp's CHUNK BOUND is copied in pieces through its index
-                    // scaled by the piece count — doubled, `addi32toi32(x, x)`, into a scratch
-                    // stick, so no constant is placed (the walk's body reads none).
-                    let Some(pieces) = super::lower_ktir_to_superdsc::gather_pieces(page_sticks)
-                    else {
-                        return err(format!(
-                            "{}: a gathered entry of {page_sticks} sticks splits into no power of \
-                             two of whole-stick pieces under the one-stick sub-row copy's {}-byte \
-                             entry bound",
-                            f.name,
-                            super::lower_ktir_to_superdsc::SUB_ROW_GATHER_ENTRY_BYTES_MAX
-                        ));
+                        Ok(())
                     };
-                    let g = if pieces > 1 {
-                        if g.first_entry != crate::superdsc_opspec::EntryBase::ZERO {
-                            return err(format!(
-                                "{}: a gathered entry split in {pieces} pieces reads its index at \
-                                 entry {} — the doubling reads the index stick at its base",
-                                f.name,
-                                g.first_entry.entries()
-                            ));
-                        }
-                        // The integer ops' device width, the chained index run's own
-                        // ([`super::lower_ktir_to_superdsc::INDEX_RUN_WORDS`]).
-                        let words = super::lower_ktir_to_superdsc::INDEX_RUN_WORDS;
-                        let index_stick = |tid: u32, is_out: bool| Region {
-                            tid,
-                            v_rows: 1,
-                            v_cols: words,
-                            r_start: 0,
-                            c_start: 0,
-                            r_len: 1,
-                            c_len: words,
-                            r_cover: (0, 1),
-                            c_cover: (0, words),
-                            is_out,
-                            is_fp8: false,
-                            band: None,
-                        };
-                        // The doubling reads the index's first `words` words: the page id and
-                        // the rest of its stick — inside the table's card pitch of a stick a
-                        // score row, and refused by name where the placement is shorter.
-                        let placed = layout.placements.get(&g.index_tid).map_or(0, |p| p.size);
-                        if placed < u64::from(words) * 4 {
-                            return err(format!(
-                                "{}: a gathered entry split in {pieces} pieces scales its index \
-                                 t{} by `addi32toi32` over {words} words, and t{} is placed in \
-                                 {placed} bytes",
-                                f.name, g.index_tid, g.index_tid
-                            ));
-                        }
-                        let mut scaled = index_stick(g.index_tid, false);
-                        for halving in 0..pieces.trailing_zeros() {
-                            let tid = mint_scratch(
-                                k,
-                                layout,
-                                floor,
-                                src,
-                                Scratch::ScaledIndex(halving as u8),
+                    match frame {
+                        // ⭐ THE RANK-2 FRAME, RESTICKIFIED — a `[T, w]` read of several gathered
+                        // planes wider than one stick. The card frame of a `[T, w]` tensor is ONE
+                        // stick column over all `T` rows, while the gather lands each entry's
+                        // blocks stick-major one after another — the same bytes exactly when there
+                        // is one block or one stick (a single entry, or `w` one stick wide, where
+                        // the landing IS the frame and nothing follows). Otherwise the entries
+                        // land as ONE-ROW blocks — row-major `[T, w]`, the same bytes the op
+                        // reads — and one whole stick permute restickifies them into the frame's
+                        // own column: the restickify the consumer's reshape used to perform (the
+                        // deleted `page_to_sticks` arm), stated here at the landing that needs it.
+                        crate::superdsc_opspec::LandingFrame::Restickify { t_rows, w, .. } => {
+                            // The landing: one-row blocks — each entry's plane as `t_rows /
+                            // entries` blocks of `[1, w]`, a stick-major one-row block being that
+                            // row's own bytes — so the whole landing is row-major `[T, w]` in a
+                            // minted scratch. The frame: one stick column over all `T` rows, the
+                            // same buffer every rank-2 `[T, w]` value holds, one whole permute
+                            // away.
+                            let land_tid =
+                                mint_scratch(k, layout, floor, res, Scratch::GatherLanding);
+                            layout.synth(
+                                crate::place::PlaceId::Act(land_tid),
+                                &[t_rows.get(), w.elems()],
                             );
-                            layout.synth_df(
-                                crate::place::PlaceId::Act(tid),
-                                &[1, words],
-                                crate::superdsc_opspec::Df::SenUint32,
-                            );
-                            out.extend(super::lower_ktir_to_superdsc::int_binary(
+                            let land = Region {
+                                tid: land_tid,
+                                v_rows: t_rows.get(),
+                                v_cols: w.elems(),
+                                r_start: 0,
+                                c_start: 0,
+                                r_len: t_rows.get(),
+                                c_len: w.elems(),
+                                r_cover: (0, t_rows.get()),
+                                c_cover: (0, w.elems()),
+                                is_out: true,
+                                is_fp8: false,
+                                band: None,
+                            };
+                            let land_name = land.name();
+                            chunk_legs(frame, land_tid, &land_name, &|run, offset| {
+                                crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage::of_run(
+                                    frame, run, offset,
+                                )
+                            })?;
+                            let tid = mint_inter(k, layout, floor, res);
+                            let dst =
+                                stick_major_region(tid, t_rows.get(), w.stick_count(), layout);
+                            out.push(permute(
                                 f.name,
-                                super::lower_ktir_to_superdsc::IntBinary::Add,
-                                &[scaled, scaled, index_stick(tid, true)],
-                                &[],
+                                &Region {
+                                    is_out: false,
+                                    ..land
+                                },
+                                &dst,
+                                Permuted::whole((t_rows.get(), w.stick_count())),
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
                                 sym_id_base,
                                 Some(layout),
                             )?);
-                            scaled = index_stick(tid, false);
-                        }
-                        Gather {
-                            index_tid: scaled.tid,
-                            ..g
-                        }
-                    } else {
-                        g
-                    };
-                    // ⭐ ONE BLOCK AN ENTRY, READ STICK-MAJOR — a page read as `[B, R, C·stick]`
-                    // whose `B` blocks are its `B` index entries: each entry's row-major block lands
-                    // stick-major as it is gathered, one entry a core (torch-spyre's compiled page
-                    // gather), so no permute follows.
-                    if page_to_sticks
-                        && pieces == 1
-                        && let &[b, r, c] = to.as_slice()
-                        && b == i64::from(g.entries)
-                        && c > stick
-                        && c % stick == 0
-                    {
-                        let (b, r, c) = (b as u32, r as u32, c as u32);
-                        let tid = mint_inter(k, layout, floor, res);
-                        let dst = stick_major_region(tid, b * r, c / stick as u32, layout);
-                        out.push(
-                            crate::ir::bridge::tiled_op_sdsc_op::assemble_page_gather_blocks(
-                                &format!("gather_o{tid}"),
-                                &crate::place::act_name(g.value_tid),
-                                &dst.name(),
-                                crate::superdsc_opspec::GatherIndex::of_scratch_rows(
-                                    crate::place::act_name(g.index_tid),
-                                    crate::superdsc_opspec::PageExtent::of_positions(1),
-                                    g.first_entry,
-                                ),
-                                crate::ir::bridge::tiled_op_sdsc_op::PageGatherBlocks {
-                                    entries: b,
-                                    rows: r,
-                                    cols: c,
-                                    dst_elems: 0,
+                            inter.insert(
+                                res,
+                                Region {
+                                    is_out: false,
+                                    ..dst
                                 },
-                                sym_id_base,
-                                Some(layout),
-                            )
-                            .map_err(|message| Error {
-                                message: format!("{}: {message}", f.name),
-                            })?,
-                        );
-                        gather_carried[gi] = true;
-                        // A one-block landing several sticks wide is still a block landing.
-                        if let Some(c) = block_landing_cols(c, stick) {
-                            batch_blocks.insert(tid, c);
+                            );
                         }
-                        inter.insert(
-                            res,
-                            Region {
-                                is_out: false,
-                                ..dst
-                            },
-                        );
-                        continue;
+                        // ⭐ THE DIRECT LANDING — rank ≥ 3 `[..., blocks, rows, w]` (each entry
+                        // `blocks` stick-major `[rows, w]` blocks, one after another — the frame
+                        // the trip's batched restickify and contractions read a block of at its
+                        // base) or a rank-2 `[T, w]` whose landing IS the frame's own bytes (one
+                        // stick column, per-entry one-stick blocks).
+                        frame => {
+                            let w = frame.width();
+                            let landing_rows = frame.landing_rows();
+                            let tid = mint_inter(k, layout, floor, res);
+                            let dst =
+                                stick_major_region(tid, landing_rows, w.stick_count(), layout);
+                            let land_name = dst.name();
+                            chunk_legs(frame, tid, &land_name, &|run, offset| {
+                                crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage::of_run(
+                                    frame, run, offset,
+                                )
+                            })?;
+                            // A rank ≥ 3 frame stated its blocks, so the landing registers them;
+                            // a rank-2 frame stated none, and its landing — one stick column,
+                            // per-entry one-stick blocks, or the restickified column above — is
+                            // the flat frame's own bytes.
+                            if matches!(frame, crate::superdsc_opspec::LandingFrame::Blocks { .. })
+                                && let Some(c) = block_landing_cols(w.elems(), stick)
+                            {
+                                batch_blocks.insert(tid, c);
+                            }
+                            inter.insert(
+                                res,
+                                Region {
+                                    is_out: false,
+                                    ..dst
+                                },
+                            );
+                        }
                     }
-                    let [rows, cols] = flat_frame(&from);
-                    if cols != crate::work::FP16_ELEMS_PER_STICK {
-                        return err(format!(
-                            "{}: a page gather's rows are {cols} wide — the gathered copy lands \
-                             a slab as one-stick sub-rows, the stick-major frame its consumers \
-                             read only at one stick",
-                            f.name
-                        ));
-                    }
-                    let tid = mint_inter(k, layout, floor, src);
-                    layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
-                    let r = Region {
-                        tid,
-                        v_rows: rows,
-                        v_cols: cols,
-                        r_start: 0,
-                        c_start: 0,
-                        r_len: rows,
-                        c_len: cols,
-                        r_cover: (0, rows),
-                        c_cover: (0, cols),
-                        is_out: true,
-                        is_fp8: false,
-                        band: None,
-                    };
-                    out.extend(super::lower_ktir_to_superdsc::page_gather(
-                        f.name,
-                        &g,
-                        (page_sticks, pieces),
-                        &r,
-                        sym_id_base,
-                        Some(layout),
-                    )?);
                     gather_carried[gi] = true;
-                    let r = Region { is_out: false, ..r };
-                    inter.insert(src, r);
-                    r
+                    continue;
                 }
                 None => match region_for_operand(k, src)?.or_else(|| inter.get(&src).copied()) {
                     Some(r) => Region { is_out: false, ..r },
@@ -5225,63 +5181,6 @@ fn lower_function_folded(
                     }
                 },
             };
-            // ⭐ A ROW-OUTERMOST PAGE READ IN A MULTI-STICK FRAME — kv heads two sticks wide: the
-            // page gather lands its slabs as one-stick rows, and the frame holds each row's sticks a
-            // row block apart, so the card permutes the landing (the `restickify` torch-spyre's
-            // stickification inserts where a consumer reads another layout). A rank-3
-            // `[B, R, C·stick]` read is `B` blocks a batched op takes one at a time — a batched
-            // transpose's input, a batched contraction's kernel — so each block is permuted on its
-            // own, into blocks one after another ([`batch_blocks`]).
-            if page_to_sticks && let Some((rows, sticks)) = stick_major_split(&to, &from) {
-                let Some(layout) = layout else {
-                    return err(format!(
-                        "{}: a stick permute needs a `BundleLayout` to hold its result",
-                        f.name
-                    ));
-                };
-                let tid = mint_inter(k, layout, floor, res);
-                let dst = stick_major_region(tid, rows, sticks, layout);
-                let blocks = match to.as_slice() {
-                    [b, _, _] => *b as u32,
-                    _ => 1,
-                };
-                if blocks > 1 {
-                    for b in 0..blocks {
-                        out.push(permute(
-                            f.name,
-                            &source,
-                            &dst,
-                            Permuted {
-                                rows: rows / blocks,
-                                sticks,
-                                block: Some(b),
-                            },
-                            crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
-                            sym_id_base,
-                            Some(layout),
-                        )?);
-                    }
-                    batch_blocks.insert(tid, sticks * crate::work::FP16_ELEMS_PER_STICK);
-                } else {
-                    out.push(permute(
-                        f.name,
-                        &source,
-                        &dst,
-                        Permuted::whole((rows, sticks)),
-                        crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
-                        sym_id_base,
-                        Some(layout),
-                    )?);
-                }
-                inter.insert(
-                    res,
-                    Region {
-                        is_out: false,
-                        ..dst
-                    },
-                );
-                continue;
-            }
             // The same bytes, in the frame the result is held in — the frame its consumers read
             // (a `[1, 2048]` gathered query row is the `[8, 4, 64]` batched dot's `[32, 64]`; a
             // per-row column stays one value per stick row, [`value_frame`]).
@@ -7605,7 +7504,8 @@ fn row_major_region(tid: u32, rows: u32, layout: &BundleLayout) -> Region {
 /// wide), and a one-stick landing is the flat frame's own bytes at ANY batch count. The batch
 /// extent is not an input — that is the law. The wiring — both page-gather arms insert through
 /// this — is pinned by the golden door rows: the `(4, 1, 128)` rows refuse without the blocks
-/// arm's call and pass with it.
+/// arm's call and pass with it. A RANK-2 frame states no blocks, so its landing registers none
+/// (the call sites gate on the frame's rank): its landing is the flat frame's own bytes.
 fn block_landing_cols(cols: u32, stick: i64) -> Option<u32> {
     (cols > stick as u32).then_some(cols)
 }
@@ -7855,7 +7755,21 @@ fn same_card_bytes(from: &[i64], to: &[i64]) -> bool {
 /// `page_sticks` one-stick sub-rows long. [`gathers_of`] reads every gather as one entry per ROW
 /// (the embedding's row gather); a page gather's tile states fewer entries than rows, and its own
 /// shape says how many.
-fn page_gather_of(f: &IRFunction<'static>, g: Gather) -> Result<(Gather, u32), Error> {
+/// ⭐ THE GATHER'S OWN FOLD, WHERE THE TYPED VIEW IS MINTED — the entries and the plane off
+/// the tile itself, as a `NonZeroU32` and a [`PagePlane`], so the walk below holds types and
+/// mints nothing: a gather of no entries, or a plane of no sticks, refuses HERE, by name,
+/// at the one place the program's view is read.
+fn page_gather_of(
+    f: &IRFunction<'static>,
+    g: Gather,
+) -> Result<
+    (
+        Gather,
+        std::num::NonZeroU32,
+        crate::superdsc_opspec::PagePlane,
+    ),
+    Error,
+> {
     let Some(tile) = f.operations.iter().find(|o| o.result == Some(g.tile)) else {
         return err(format!(
             "{}: the gather's tile states no defining op",
@@ -7881,7 +7795,16 @@ fn page_gather_of(f: &IRFunction<'static>, g: Gather) -> Result<(Gather, u32), E
             f.name
         ));
     };
-    let entries = dims[d] as u32;
+    let entries = u32::try_from(dims[d])
+        .ok()
+        .and_then(std::num::NonZeroU32::new)
+        .ok_or_else(|| Error {
+            message: format!(
+                "{}: the gather's tile states {} entries — a gather of no entries has no \
+                     plane to re-frame",
+                f.name, dims[d]
+            ),
+        })?;
     let slab: i64 = dims
         .iter()
         .enumerate()
@@ -7889,14 +7812,31 @@ fn page_gather_of(f: &IRFunction<'static>, g: Gather) -> Result<(Gather, u32), E
         .map(|(_, x)| *x)
         .product();
     let stick = crate::work::FP16_ELEMS_PER_STICK as i64;
-    if d != 0 || slab % stick != 0 {
+    if d != 0 || slab <= 0 || slab % stick != 0 {
         return err(format!(
             "{}: a page gather selects whole contiguous slabs along its LEADING dim, each a whole \
              number of sticks — this tile's indirect dim is {d} and its slab {slab} elements",
             f.name
         ));
     }
-    Ok((Gather { entries, ..g }, (slab / stick) as u32))
+    let sticks = u32::try_from(slab / stick)
+        .ok()
+        .and_then(std::num::NonZeroU32::new)
+        .ok_or_else(|| Error {
+            message: format!(
+                "{}: the gather's tile states a plane of {} sticks — no non-zero u32 plane holds it",
+                f.name,
+                slab / stick
+            ),
+        })?;
+    Ok((
+        Gather {
+            entries: entries.get(),
+            ..g
+        },
+        entries,
+        crate::superdsc_opspec::PagePlane::of_sticks(sticks),
+    ))
 }
 
 /// WHAT ONLY THE WALK CAN STATE about one op. Threaded rather than re-derived, because [`emit_one`]
