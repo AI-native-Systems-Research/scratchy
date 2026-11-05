@@ -28,9 +28,10 @@ pub mod lower;
 /// work-divided SuperDSC (SDSC) bundle DeepTools' `dxp_standalone --bundle`
 /// compiles — the perf path that OWNS the 32-core work-division. (The old
 /// `lower_subtile_tape_to_sengraph` peer was DELETED — sengraph is a dead end.)
-/// The model's head geometry as types, and the head-dim value→const door whose arms the build
-/// script generated from `crates/models/arch/*/configs/*.json`. Always compiled: the tape carries a
-/// [`model_geometry::ModelAttnGeometry`] on every attention node, whatever the target.
+/// The head-dim value→const door whose arms the build script generated from
+/// `crates/models/arch/*/configs/*.json`, typed on `scratchy_ir::model_facts::HeadDim`. Always
+/// compiled: the value side of the geometry is the facts' own [`Attention`], threaded from the
+/// bake, whatever the target (scratchy_ir::model_facts::Attention).
 pub mod model_geometry;
 pub mod subtile_ir;
 // ⭐ THE SuperDSC DEVICE FACTS, FROM THE `ktir-superdsc` LEAF CRATE: the typed SuperDSC IR

@@ -217,6 +217,11 @@ impl HeadGeometry {
     pub const fn q_width(self) -> usize {
         self.q_heads.get() as usize * self.head_dim.get() as usize
     }
+    /// `kv_heads · head_dim` — one K or V projection's column count, narrower than
+    /// [`q_width`](Self::q_width) by exactly the GQA group size.
+    pub const fn kv_width(self) -> usize {
+        self.kv_heads.get() as usize * self.head_dim.get() as usize
+    }
 }
 
 /// An MRoPE section: the rotary pairs the temporal, height and width bands take.

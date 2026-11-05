@@ -2692,8 +2692,9 @@ pub fn play_skeleton(tape: &SubtileTape) -> Vec<PlayStep> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::fixtures::fixture_attention;
     use super::*;
-    use crate::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
+    use scratchy_ir::model_facts::HeadDim;
     use crate::subtile_ir::{
         EwKind, KvCacheLayout, KvCacheProducer, NeoX, Range, Region, SoftmaxStateId, SubOp,
         SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape,
@@ -3088,14 +3089,12 @@ pub(crate) mod tests {
         let attn: SubtileNode<NeoX> = SubtileNode {
             id: SubtileId(0),
             op: SubOp::AttnDecode {
-                geom: ModelAttnGeometry::mint(QueryHeads::new(1), KvHeads::new(1), HeadDim::new(4))
-                    .expect("1 kv head divides 1 query head"),
-                scale: 0.5,
                 valid_len: 4,
                 layout: KvCacheLayout::for_cache_tensors(TensorId(1), TensorId(1)),
                 producer: KvCacheProducer::pre_populated_ext(),
                 softmax_state: SoftmaxStateId::new(0),
                 mask: crate::subtile_ir::AttnMask::Causal,
+                attention: fixture_attention(),
             },
             inputs: vec![
                 TensorRegion {
@@ -3378,6 +3377,37 @@ pub(crate) mod tests {
         assert_eq!(cell_layer_lengths(&[1, 2, 3, 4]), vec![4]);
     }
 
+    /// ⭐ A TOWER-ONLY GRAPH NEEDS NO ATTENTION FACTS (S1). The vision-tower shape: no op in
+    /// the graph reads attention facts, so no `Attention` value exists anywhere in scope (the
+    /// bridge states `attention: None` for such a canonical and mints nothing). Every shared
+    /// pass — validate → tape → re-roll → host eval — runs over the graph with no attention
+    /// value at all; this is the proof the old `attention().unwrap_or_else(panic)` sites are
+    /// gone: there is nothing left for a tower canonical to be missing.
+    #[test]
+    fn tower_only_graph_lowers_through_every_shared_pass() {
+        let g = per_layer_weight_chain();
+        let valid = crate::subtile_ir::ValidatedGraph::new(&g).expect("tower-only graph validates");
+        let tape = lower_dag_to_tape(&valid);
+        let rerolled = reroll_subtile_tape(&tape, &g);
+        assert!(
+            !rerolled.instrs().is_empty(),
+            "the tower-only tape re-rolls to a non-empty tape"
+        );
+        // Host eval over the same graph: the chain is silu(x)·W_0·W_1·W_2 (the fixture's
+        // leading embed is a silu), from x=1, W=[2,3,4].
+        let src = vec![1.0f32; 4];
+        let w0 = vec![2.0f32; 4];
+        let w1 = vec![3.0f32; 4];
+        let w2 = vec![4.0f32; 4];
+        let bufs = crate::subtile_ir::eval_dag(&g, &[&src, &w0, &w1, &w2]);
+        let out = crate::subtile_ir::result_buffer(&g, &bufs);
+        let expected = 1.0f32 / (1.0 + (-1.0f32).exp()) * 2.0 * 3.0 * 4.0;
+        assert!(
+            out.iter().all(|v| (*v - expected).abs() < 1e-6),
+            "tower-only eval must run with no attention facts in scope: {out:?}"
+        );
+    }
+
     /// THE GATHER PROOF (un-riggable): after re-roll, the single loop
     /// body's External weight read carries the per-iteration table
     /// `[W_0, W_1, W_2] = [2, 3, 4]` — NOT just W_0 baked in. This is the
@@ -3560,6 +3590,7 @@ pub(crate) mod tests {
             nodes.push(SubtileNode {
                 id: SubtileId(1 + 2 * layer),
                 op: SubOp::RopeAppend {
+                    attention: fixture_attention(),
                     head_dim: HeadDim::new(hd_of(layer)),
                     layer,
                     attn: crate::subtile_ir::AttnMask::Causal,
@@ -3613,7 +3644,8 @@ pub(crate) mod tests {
         let g = hybrid_class_chain();
         let valid = crate::subtile_ir::ValidatedGraph::new(&g).expect("validates");
         let tape = lower_dag_to_tape(&valid);
-        let rolled = reroll_layer_classes(&tape, &g).expect("the hybrid chain must split by class");
+        let rolled =
+            reroll_layer_classes(&tape, &g).expect("the hybrid chain must split by class");
         let instrs = rolled.instrs();
         // TWO sibling loops.
         let opens: Vec<usize> = instrs

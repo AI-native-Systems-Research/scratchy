@@ -1655,7 +1655,7 @@ fn rope_plane_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
     let node = SubtileNode {
         id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
         op: SubOp::RopeRotate {
-            head_dim: scratchy_subtile::model_geometry::HeadDim::new(hd),
+            head_dim: scratchy_ir::model_facts::HeadDim::new(hd),
             _form: std::marker::PhantomData,
         },
         inputs: vec![whole(0), whole(1), whole(2)],
@@ -1699,7 +1699,7 @@ fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
     let node = SubtileNode {
         id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
         op: SubOp::RopeRotate {
-            head_dim: scratchy_subtile::model_geometry::HeadDim::new(hd),
+            head_dim: scratchy_ir::model_facts::HeadDim::new(hd),
             _form: std::marker::PhantomData,
         },
         inputs: vec![whole(0), whole(1), whole(2)],
@@ -2117,10 +2117,12 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
     };
     // The attention op desc. The prefix region binding comes from `lower_region`'s own slice
     // law; `valid_len` is threaded as production threads it.
+    // granite's geometry as the facts' `Attention` (uniform classes): the op carries only
+    // its class, and every consumer reads the class's numbers off this one value.
+    let attention = scratchy_subtile::fixtures::attention_at(nqh, nkvh, hd, scale);
     let attn_op = scratchy_subtile::lower::OpDesc {
         op: scratchy_subtile::subtile_ir::SubOp::attn_decode(
-            attn_geometry(s.geom).expect("granite's geometry mints"),
-            scale,
+            attention,
             valid_len,
             scratchy_subtile::subtile_ir::AttnMask::Causal,
         ),
@@ -2147,7 +2149,8 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
                 // 0: k' = rope_append(k, cos, sin, v, prefix_k, prefix_v)
                 scratchy_subtile::lower::OpDesc {
                     op: scratchy_subtile::subtile_ir::SubOp::rope_append(
-                        scratchy_subtile::model_geometry::HeadDim::new(hd),
+                        attention,
+                        scratchy_ir::model_facts::HeadDim::new(hd),
                         0,
                         scratchy_subtile::subtile_ir::AttnMask::Causal,
                         scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
@@ -2182,17 +2185,6 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
     }
 }
 
-/// granite's geometry, through the same mint the config path uses.
-fn attn_geometry(
-    geom: (u32, u32, u32),
-) -> Option<scratchy_subtile::model_geometry::ModelAttnGeometry> {
-    scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
-        scratchy_subtile::model_geometry::QueryHeads::new(geom.0),
-        scratchy_subtile::model_geometry::KvHeads::new(geom.1),
-        scratchy_subtile::model_geometry::HeadDim::new(geom.2),
-    )
-}
-
 /// spyre-inference's paged kernels attend causally, so a sliding-window attention (gemma's local
 /// layers) is refused by name rather than run as causal.
 #[test]
@@ -2207,7 +2199,13 @@ fn a_sliding_window_attention_is_refused() {
         window: std::num::NonZeroU32::new(4096).expect("a window"),
     };
     let node = ir.nodes.last().expect("the attention");
-    let Err(e) = scratchy_triton_splice::lower_attn(node, &ir, s.active_cap(), PagedRows::Sequence)
+    let Err(e) = scratchy_triton_splice::lower_attn(
+        node,
+        &ir,
+                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+        s.active_cap(),
+        PagedRows::Sequence,
+    )
     else {
         panic!("a sliding window must be refused");
     };
@@ -2235,7 +2233,13 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
     let ir = attn_ir(small, 0.015625);
     let node = ir.nodes.last().expect("the attention");
     let Err(e) =
-        scratchy_triton_splice::lower_attn(node, &ir, small.active_cap(), PagedRows::Batch)
+        scratchy_triton_splice::lower_attn(
+        node,
+        &ir,
+                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+        small.active_cap(),
+        PagedRows::Batch,
+    )
     else {
         panic!("a chunk gathering the whole pool must be refused");
     };
@@ -2248,7 +2252,13 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
     let big = at_pages(64);
     let ir = attn_ir(big, 0.015625);
     let node = ir.nodes.last().expect("the attention");
-    scratchy_triton_splice::lower_attn(node, &ir, big.active_cap(), PagedRows::Batch)
+    scratchy_triton_splice::lower_attn(
+        node,
+        &ir,
+                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+        big.active_cap(),
+        PagedRows::Batch,
+    )
         .expect("a pool wider than one chunk splices");
 }
 
@@ -2260,7 +2270,13 @@ fn the_paged_attention_splices_with_its_contract() {
         let node = ir.nodes.last().unwrap();
         let at = format!("geom={:?} mq={} rung={}", s.geom, s.mq, s.rung);
         let spliced =
-            scratchy_triton_splice::lower_attn(node, &ir, s.active_cap(), PagedRows::Sequence);
+            scratchy_triton_splice::lower_attn(
+        node,
+        &ir,
+                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+        s.active_cap(),
+        PagedRows::Sequence,
+    );
         // ⛔ A PRE-POPULATED CACHE IS REFUSED: the walk reads the step's keys from the pools, and
         // only this forward's RopeAppend scatters them there.
         if !s.rope_appended {
@@ -2526,7 +2542,13 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
     let mut programs = scratchy_triton_splice::lower_all(rope, &ir, false)
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
     programs.push(
-        scratchy_triton_splice::lower_attn(attn, &ir, s.active_cap(), PagedRows::Sequence)
+        scratchy_triton_splice::lower_attn(
+        attn,
+        &ir,
+                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+        s.active_cap(),
+        PagedRows::Sequence,
+    )
             .unwrap_or_else(|e| panic!("the walk spliced {at}: {e}")),
     );
     assert_eq!(programs.len(), 3, "{at}: rope, KV write, walk");
@@ -2791,7 +2813,13 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
     let mut programs = scratchy_triton_splice::lower_all(rope, &ir, true)
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
     programs.push(
-        scratchy_triton_splice::lower_attn(attn, &ir, s.active_cap(), PagedRows::Batch)
+        scratchy_triton_splice::lower_attn(
+        attn,
+        &ir,
+                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+        s.active_cap(),
+        PagedRows::Batch,
+    )
             .unwrap_or_else(|e| panic!("the batched walk spliced {at}: {e}")),
     );
     assert_eq!(programs.len(), 3, "{at}: rope, KV write, batched walk");
@@ -3141,7 +3169,13 @@ fn a_paged_walks_program_does_not_grow_with_its_rows() {
         let ir = attn_ir(s, 0.015625);
         let node = ir.nodes.last().unwrap();
         let spliced =
-            scratchy_triton_splice::lower_attn(node, &ir, s.active_cap(), PagedRows::Sequence)
+            scratchy_triton_splice::lower_attn(
+        node,
+        &ir,
+                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+        s.active_cap(),
+        PagedRows::Sequence,
+    )
                 .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
         spliced
             .ktir

@@ -504,8 +504,11 @@ pub fn weight_segment_parity(ledger: &[(String, u64, Vec<u64>)]) -> Result<(), S
 /// re-rolled bake and then panicked in the wiring on a layout nobody reads. Any fact this
 /// needs must stay a pure walk — a placement-derived input would rebuild that refusal one
 /// field at a time.
-pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
-    let weight_scale_folds = crate::lower_subtile_tape_to_ktir::weight_scale_folds(ir);
+pub(crate) fn scalar_registry<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Vec<f32> {
+    let weight_scale_folds =
+        crate::lower_subtile_tape_to_ktir::weight_scale_folds(ir);
     // ⭐ EXCEPT THE WEIGHT-FOLDED ONES: a multiplier that commutes into its matmul's weight
     //    never becomes a device op, so its scale never enters this registry either — the
     //    worker applies it to the staged weight bytes instead. The skip is by NODE, not by
@@ -554,8 +557,15 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
             // floor `0.0` (the running sum and output start at it, and `-relu(scores_max -
             // tile_max)` floors at it), and its max seed `-inf`. A weight-folded attention runs at `SCALE = 1.0` (its √scale rides
             // W_q/W_k) and still states the multiply, so its 1.0 is the value it reads.
-            SubOp::AttnDecode { scale, .. } => {
-                let multiplier = if folded_node(node.id) { 1.0 } else { *scale };
+            SubOp::AttnDecode { attention, .. } => {
+                // The model's scale at the site the fold decided: 1.0 when the node's √scale
+                // rides W_q/W_k, the model's own multiplier otherwise.
+                let multiplier = if folded_node(node.id) {
+                    scratchy_subtile::subtile_ir::AttnScaleSite::FoldedIntoWeights
+                        .scale(*attention)
+                } else {
+                    scratchy_subtile::subtile_ir::AttnScaleSite::InKernel.scale(*attention)
+                };
                 for v in [multiplier, 0.0, f32::NEG_INFINITY] {
                     push_scale(v, &mut scalarmul_scales);
                 }
@@ -625,7 +635,8 @@ pub fn bundle_registry<F: RopeForm>(
     let mut registry = scalar_registry(ir);
     let rows_are_requests = paged_rows == scratchy_triton_splice::PagedRows::Batch;
     for node in &ir.nodes {
-        let NodeLowering::Ops(ops) = lower_one_node(node, ir, ActiveCap::FULL, rows_are_requests)
+        let NodeLowering::Ops(ops) =
+            lower_one_node(node, ir, ActiveCap::FULL, rows_are_requests)
         else {
             continue;
         };
@@ -689,10 +700,8 @@ fn stage_registry_scalars<F: RopeForm>(op: &mut SubOp<F>) -> bool {
             stage(scale);
             true
         }
-        SubOp::AttnDecode { scale, .. } => {
-            stage(scale);
-            true
-        }
+        // AttnDecode carries no scale of its own (the model's facts hold it, and the program
+        // states it as its SCALE constexpr) — there is no field here to stage.
         SubOp::RmsNorm { eps, .. } => {
             stage(eps);
             true
@@ -880,7 +889,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // and the placement alias below key on `scalarmul_folds` and never on the union — an
     // attention fold's node STAYS (at scale 1.0), its output is a real intermediate, and
     // aliasing it to the query's bytes would hand every attention consumer the query buffer.
-    let weight_scale_folds = crate::lower_subtile_tape_to_ktir::weight_scale_folds(ir);
+    let weight_scale_folds =
+        crate::lower_subtile_tape_to_ktir::weight_scale_folds(ir);
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     let n_nodes = ir.nodes.len();
     let mut first_def: std::collections::BTreeMap<u32, usize> = Default::default();
@@ -1161,7 +1171,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // worker's load-time bind builds each class's table from.
     let attn_class_hds = ktir_superdsc::reserved_tids::rope_p_class_hds(
         ir.nodes.iter().filter_map(|n| match &n.op {
-            SubOp::AttnDecode { geom, .. } => Some(geom.hd().get()),
+            SubOp::AttnDecode { mask, attention, .. } => Some(attention.class(mask.class()).head_dim().get()),
             _ => None,
         }),
     );
@@ -2977,25 +2987,27 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
         // card's own DLF16 landings for those sticks are the EMULATOR's model
         // (`comm_sched::rmsnorm_scalar_sticks` → `Tile::compute_dlf16`), never the
         // reference's.
-        let mut attn_node;
         let mut staged_node;
-        let node_ref = if let SubOp::AttnDecode { .. } = &node.op
+        // ⭐ THE SCALE AT ITS STATED SITE, the same typed [`AttnScaleSite`] the splice's SCALE
+        // constexpr and the scalar registry read: a weight-folded attention evaluates at
+        // 1.0 in-kernel (its √scale rides the staged W_q/W_k), and evaluating the model's
+        // own scale over the pre-scaled sources would double-apply the multiplier. The
+        // model's own `Attention` is passed through untouched.
+        let (node_ref, scale_site) = if let SubOp::AttnDecode { .. } = &node.op
             && attn_folds.iter().any(|(id, ..)| *id == node.id)
         {
-            attn_node = node.clone();
-            if let SubOp::AttnDecode { scale, .. } = &mut attn_node.op {
-                *scale = 1.0;
-            }
-            &attn_node
+            (node, scratchy_subtile::subtile_ir::AttnScaleSite::FoldedIntoWeights)
         } else {
             staged_node = node.clone();
             if stage_registry_scalars(&mut staged_node.op) {
-                &staged_node
+                (&staged_node, scratchy_subtile::subtile_ir::AttnScaleSite::InKernel)
             } else {
-                node
+                (node, scratchy_subtile::subtile_ir::AttnScaleSite::InKernel)
             }
         };
-        let mut out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &bufs);
+        let mut out = scratchy_subtile::subtile_ir::eval_node(
+            node_ref, ir, scale_site, &bufs,
+        );
         // The fp8 matmul's quant model (see the closures above): the ideal product over
         // the ROUND-TRIPPED payload, then the ws mulf — fold included — on the result.
         // The payload swap is temporary and per node: `eval_node` reads `inputs[1]` and
@@ -3015,7 +3027,9 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
             if !saved_weights.iter().any(|(t, _)| *t == w_tid) {
                 let saved = std::mem::take(&mut bufs[w_tid]);
                 bufs[w_tid] = saved.iter().map(|v| e4m3_rt(*v)).collect();
-                out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &bufs);
+                out = scratchy_subtile::subtile_ir::eval_node(
+                    node_ref, ir, scale_site, &bufs,
+                );
                 bufs[w_tid] = saved;
             }
             let ws_eff = half::f16::from_f32(
@@ -3281,22 +3295,19 @@ fn teacher_forced_walk<F: RopeForm>(
         if covering.is_some_and(|c| !c.contains(&(node.output.tensor.index() as u64))) {
             continue;
         }
-        let mut attn_node;
         let mut staged_node;
-        let node_ref = if let SubOp::AttnDecode { .. } = &node.op
+        // A weight-folded attention evaluates at its stated site (1.0), the same typed law
+        // the golden's own walk above states.
+        let (node_ref, scale_site) = if let SubOp::AttnDecode { .. } = &node.op
             && attn_folds.iter().any(|(id, ..)| *id == node.id)
         {
-            attn_node = node.clone();
-            if let SubOp::AttnDecode { scale, .. } = &mut attn_node.op {
-                *scale = 1.0;
-            }
-            &attn_node
+            (node, scratchy_subtile::subtile_ir::AttnScaleSite::FoldedIntoWeights)
         } else {
             staged_node = node.clone();
             if stage_registry_scalars(&mut staged_node.op) {
-                &staged_node
+                (&staged_node, scratchy_subtile::subtile_ir::AttnScaleSite::InKernel)
             } else {
-                node
+                (node, scratchy_subtile::subtile_ir::AttnScaleSite::InKernel)
             }
         };
         // The source relay: the golden's staged sources move into `tf` for
@@ -3323,7 +3334,8 @@ fn teacher_forced_walk<F: RopeForm>(
                 tf[w] = vals;
             }
         }
-        let mut tf_out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &tf);
+        let mut tf_out =
+            scratchy_subtile::subtile_ir::eval_node(node_ref, ir, scale_site, &tf);
         if let SubOp::MatmulTile {
             weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
             ..
@@ -3336,7 +3348,9 @@ fn teacher_forced_walk<F: RopeForm>(
             if !saved_weights.iter().any(|(t, _)| *t == w_tid) {
                 let saved = std::mem::take(&mut tf[w_tid]);
                 tf[w_tid] = saved.iter().map(|v| e4m3_rt(*v)).collect();
-                tf_out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &tf);
+                tf_out = scratchy_subtile::subtile_ir::eval_node(
+                    node_ref, ir, scale_site, &tf,
+                );
                 tf[w_tid] = saved;
             }
             let ws_eff = half::f16::from_f32(
@@ -3909,7 +3923,8 @@ pub fn numeric_gate<F: RopeForm>(
     // merged map (see `staggered_of_ir`'s doc for why lowering the Sample node alone states
     // it), so the bytes this gate stages into the emulator are the worker's bytes: a table the
     // propagation marked is staged ALREADY PERMUTED by the same builder both legs call.
-    let staggered = crate::lower_subtile_tape_to_ktir::staggered_of_ir(ir).map_err(|e| e.0)?;
+    let staggered =
+        crate::lower_subtile_tape_to_ktir::staggered_of_ir(ir).map_err(|e| e.0)?;
     let load_consts =
         crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir, &staggered).map_err(|e| e.0)?;
     let load_const_tids: std::collections::HashSet<u32> =
@@ -3996,7 +4011,7 @@ pub fn numeric_gate<F: RopeForm>(
     )
     .map_err(|e| e.0)?;
     let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
-        SubOp::AttnDecode { geom, .. } => Some(geom.hd().get() as usize),
+        SubOp::AttnDecode { mask, attention, .. } => Some(attention.class(mask.class()).head_dim().get() as usize),
         _ => None,
     });
     let pool_tids: std::collections::HashSet<u32> = ir
@@ -4427,7 +4442,15 @@ pub fn numeric_gate<F: RopeForm>(
     //    tolerance — the pre-split rule — so no compared tensor escapes
     //    judgment.
     let (walk_tf, split) =
-        teacher_forced_walk(ir, &mut eval_bufs, &out, &tainted, &folded, &view, covering);
+        teacher_forced_walk(
+            ir,
+            &mut eval_bufs,
+            &out,
+            &tainted,
+            &folded,
+            &view,
+            covering,
+        );
     drop(walk_tf);
     let mut local_by_tid: std::collections::HashMap<u64, f32> =
         std::collections::HashMap::with_capacity(split.len());

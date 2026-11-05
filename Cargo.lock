@@ -3714,6 +3714,7 @@ dependencies = [
  "ktir-superdsc",
  "libc",
  "rayon",
+ "scratchy-ir",
  "scratchy-layers",
  "scratchy-quantizations",
  "scratchy-spyre-bundle",
@@ -3742,6 +3743,7 @@ version = "0.1.0"
 dependencies = [
  "ktir-core",
  "ktir-superdsc",
+ "scratchy-ir",
  "scratchy-subtile",
  "serde_json",
  "triton-frontend",

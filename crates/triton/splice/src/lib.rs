@@ -98,7 +98,9 @@ use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::{BufferId, Elementwise, KtirNode, Program};
 use ktir_superdsc::superdsc_opspec::Df;
 use scratchy_subtile::lower::GemmWeight;
-use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SubOp, SubtileIR, SubtileNode};
+use scratchy_subtile::subtile_ir::{
+    AttnScaleSite, EwKind, GainConvention, SubOp, SubtileIR, SubtileNode,
+};
 
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
@@ -1736,6 +1738,7 @@ pub use triton_ktir_superdsc::layout::allocate_paged_cache;
 pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
+    scale_site: AttnScaleSite,
     active_cap: ktir_superdsc::ktir_node::ActiveCap,
     paged_rows: PagedRows,
 ) -> Result<EmittedOp, String> {
@@ -1762,13 +1765,12 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // the model's 16-bit dtype). The op states none of them either, so none reaches here today; a
     // field added for one is a compile error at this line rather than an attention run without it.
     let SubOp::AttnDecode {
-        geom,
-        scale,
         valid_len: _,
         layout: _,
         producer,
         softmax_state: _,
         mask,
+        attention,
     } = &node.op
     else {
         return Err(
@@ -1804,7 +1806,16 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             node.output.tensor.index()
         ));
     }
-    let (nqh, nkvh, hd) = (geom.nqh().get(), geom.nkvh().get(), geom.hd().get());
+    // The class's geometry off the op's own attention facts (minted at the bridge), and the
+    // softmax scale at the site the weight fold decided: `InKernel` is the model's own scale,
+    // `FoldedIntoWeights` the 1.0 the node runs at once √scale rides its W_q/W_k.
+    let g = attention.class(mask.class());
+    let (nqh, nkvh, hd) = (
+        g.q_heads().get(),
+        g.kv_heads().get(),
+        g.head_dim().get(),
+    );
+    let scale = scale_site.scale(*attention);
     let mq = node.output.region.rows.len;
     let kv_width = nkvh * hd;
     let pages = pool_pages(ir, &node.inputs[1], kv_width, "K")?;
@@ -1872,7 +1883,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
         }
         signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-        constexprs.insert("SCALE".to_string(), Val::Float(f64::from(*scale)));
+        constexprs.insert("SCALE".to_string(), Val::Float(f64::from(scale)));
         let spec = KernelSpec {
             kernel: entry.to_string(),
             signature,
@@ -1934,7 +1945,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
     }
     signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-    constexprs.insert("SCALE".to_string(), Val::Float(f64::from(*scale)));
+    constexprs.insert("SCALE".to_string(), Val::Float(f64::from(scale)));
     let spec = KernelSpec {
         kernel: entry.to_string(),
         signature,

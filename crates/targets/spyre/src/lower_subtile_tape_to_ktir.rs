@@ -300,14 +300,16 @@ pub(crate) fn attn_scale_weight_folds<F: RopeForm>(
     };
     let mut folds = Vec::new();
     for node in &ir.nodes {
-        let SubOp::AttnDecode { scale, .. } = &node.op else {
+        let SubOp::AttnDecode { attention, .. } = &node.op else {
             continue;
         };
         // inputs = [q, prefix_k, prefix_v, new_k, new_v] — the walk is the two live sides.
         let [q, _prefix_k, _prefix_v, new_k, _new_v] = node.inputs.as_slice() else {
             continue;
         };
-        if *scale == 1.0 {
+        // The model's scale at this node's class, off the facts.
+        let scale = attention.scale().get();
+        if scale == 1.0 {
             continue;
         }
         let Some(w_q) = projection_weight(ir, q, node.id, &is_fp8_weight, &shared) else {
@@ -351,7 +353,9 @@ pub(crate) fn attn_scale_weight_folds<F: RopeForm>(
 /// census, the golden's source pre-scaling) takes this union. A fold entry keyed on an
 /// AttnDecode reaching the aliasing sites would point the attention's OUTPUT placement at the
 /// query's bytes, so those sites keep their own recognizer rather than filtering this list.
-pub(crate) fn weight_scale_folds<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<(SubtileId, u32, f32)> {
+pub(crate) fn weight_scale_folds<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Vec<(SubtileId, u32, f32)> {
     let mut folds = scalar_mul_weight_folds(ir);
     for (id, w_q, w_k, sqrt_scale) in attn_scale_weight_folds(ir) {
         folds.push((id, w_q, sqrt_scale));
@@ -881,32 +885,27 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             }
         }
         SubOp::AttnDecode { .. } => {
-            // ⭐ THE PAGED WALK READS ITS POOLS, ITS GEOMETRY AND ITS SCALE OFF THE NODE, and the
-            // rung's walk off `active_cap` — the splice states every one as the kernel's constexprs.
-            // ⭐⭐⭐ THE SCALE, REWRITTEN TO 1.0 WHEN ITS FOLD APPLIES. The program is the ONE
-            // carrier of the scale (the kernel states it as its `SCALE` constexpr and the door
-            // reads that value back), so rewriting it HERE — at the boundary where the program
-            // is minted — is the single edit that reaches every consumer: the door sees 1.0 and
-            // emits no `qs`/`new_k_scaled` multiplies, the emulator interprets `qk · 1.0` over
-            // the pre-scaled weights the fold staged, and the registry census skips the node's
-            // arm. The REAL multiplier meanwhile rides the fold list into the staged W_q/W_k
-            // bytes, where `(q·√s)·(k·√s)ᵀ` reproduces `(q·kᵀ)·s` exactly.
-            let mut folded_node;
-            let node_ref: &SubtileNode<F> = if attn_scale_weight_folds(ir)
+            // ⭐ THE PAGED WALK READS ITS POOLS AND ITS GEOMETRY OFF THE FACTS, and the rung's
+            // walk off `active_cap` — the splice states every one as the kernel's constexprs.
+            // ⭐⭐⭐ THE SCALE'S SITE, DECIDED WHERE THE FOLD COLLECTOR DECIDES. When the fold
+            // applies, the program is the ONE carrier of the fact (the kernel states it as its
+            // `SCALE` constexpr and the door reads that value back): `FoldedIntoWeights` states
+            // 1.0 there — the door emits no `qs`/`new_k_scaled` multiplies and the emulator
+            // interprets `qk · 1.0` over the pre-scaled weights the fold staged — while the
+            // real multiplier rides the fold list into the staged W_q/W_k bytes, where
+            // `(q·√s)·(k·√s)ᵀ` reproduces `(q·kᵀ)·s` exactly.
+            let folded = attn_scale_weight_folds(ir)
                 .iter()
-                .any(|(id, ..)| *id == node.id)
-            {
-                folded_node = node.clone();
-                if let SubOp::AttnDecode { scale, .. } = &mut folded_node.op {
-                    *scale = 1.0;
-                }
-                &folded_node
+                .any(|(id, ..)| *id == node.id);
+            let scale_site = if folded {
+                scratchy_subtile::subtile_ir::AttnScaleSite::FoldedIntoWeights
             } else {
-                node
+                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel
             };
             match scratchy_triton_splice::lower_attn(
-                node_ref,
+                node,
                 ir,
+                scale_site,
                 active_cap,
                 scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
             ) {
@@ -1322,7 +1321,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
     let slots = scratchy_triton_splice::PAGE_SLOTS;
     let mut out: Option<crate::wiring::PagedStep> = None;
     for n in &ir.nodes {
-        let SubOp::AttnDecode { geom, .. } = &n.op else {
+        let SubOp::AttnDecode { mask, attention, .. } = &n.op else {
             continue;
         };
         let cache = n.inputs.get(1).ok_or_else(|| {
@@ -1354,7 +1353,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
             pages,
             page_slots: slots,
             rows: mq,
-            nkvh: geom.nkvh().get(),
+            nkvh: attention.class(mask.class()).kv_heads().get(),
             walk,
             paged_rows,
         };
@@ -1399,7 +1398,8 @@ pub fn graph_wiring<F: RopeForm>(
     // card.
     let _ = weight_ids;
     let registries = WiringRegistries {
-        scalarmul_scales: crate::lower_subtile_tape_to_superdsc::bundle_registry(ir, paged_rows)?,
+        scalarmul_scales:
+            crate::lower_subtile_tape_to_superdsc::bundle_registry(ir, paged_rows)?,
         // Same rule as the placement pass's own field: the fold list the worker applies to
         // staged bytes at load, keyed by weight tid (the `SubtileId` half is a placement-pass
         // fact and does not ship).
@@ -1420,7 +1420,9 @@ pub fn graph_wiring<F: RopeForm>(
         )),
         attn_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(ir.nodes.iter().filter_map(
             |n| match &n.op {
-                SubOp::AttnDecode { geom, .. } => Some(geom.hd().get()),
+                SubOp::AttnDecode { mask, attention, .. } => {
+                    Some(attention.class(mask.class()).head_dim().get())
+                }
                 _ => None,
             },
         )),
@@ -3447,15 +3449,11 @@ mod attn_scale_weight_fold_tests {
         shared_q_product: bool,
         shared_roped_q: bool,
     ) -> SubtileIR {
-        // granite's own geometry through the same mint the config path uses, scaled down: the
-        // recognizer reads only `scale`, so the geometry is inert — it just has to exist.
-        let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
-            scratchy_subtile::model_geometry::QueryHeads::new(2),
-            scratchy_subtile::model_geometry::KvHeads::new(1),
-            scratchy_subtile::model_geometry::HeadDim::new(8),
-        )
-        .expect("2 query heads over 1 kv head, head_dim 8, mints");
-        let hd = scratchy_subtile::model_geometry::HeadDim::new(8);
+        // granite's own geometry as the facts' `Attention` (uniform classes, 2 query heads
+        // over 1 kv head at head_dim 8), scaled down: the fold reads only the facts' scale,
+        // so the geometry is inert — it just has to exist.
+        let attention = scratchy_subtile::fixtures::attention_at(2, 1, 8, scale);
+        let hd = scratchy_ir::model_facts::HeadDim::new(8);
         let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
         let sources = vec![
             shape(1, 8),  // 0: x (hidden 8)
@@ -3506,6 +3504,7 @@ mod attn_scale_weight_fold_tests {
             // 3: k_rot = rope_append(k, cos, sin, v, prefix_k, prefix_v) — writing the paged cache
             OpDesc {
                 op: SubOp::rope_append(
+                    attention,
                     hd,
                     0,
                     scratchy_subtile::subtile_ir::AttnMask::Causal,
@@ -3523,12 +3522,7 @@ mod attn_scale_weight_fold_tests {
             },
             // 4: attn = AttnDecode(q_rot, prefix_k, prefix_v, k_rot, v)
             OpDesc {
-                op: SubOp::attn_decode(
-                    geom,
-                    scale,
-                    33,
-                    scratchy_subtile::subtile_ir::AttnMask::Causal,
-                ),
+                op: SubOp::attn_decode(attention, 33, scratchy_subtile::subtile_ir::AttnMask::Causal),
                 m: 1,
                 inputs: vec![
                     q_ref,
@@ -3613,13 +3607,8 @@ mod attn_scale_weight_fold_tests {
     #[test]
     fn the_fp8_attention_folds_into_the_dequant_rows() {
         let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
-        let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
-            scratchy_subtile::model_geometry::QueryHeads::new(2),
-            scratchy_subtile::model_geometry::KvHeads::new(1),
-            scratchy_subtile::model_geometry::HeadDim::new(8),
-        )
-        .expect("2 query heads over 1 kv head, head_dim 8, mints");
-        let hd = scratchy_subtile::model_geometry::HeadDim::new(8);
+        let attention = scratchy_subtile::fixtures::attention_at(2, 1, 8, 4.0);
+        let hd = scratchy_ir::model_facts::HeadDim::new(8);
         let input = LoweringInput {
             sources: vec![
                 shape(1, 8),  // 0: x
@@ -3657,6 +3646,7 @@ mod attn_scale_weight_fold_tests {
                 },
                 OpDesc {
                     op: SubOp::rope_append(
+                        attention,
                         hd,
                         0,
                         scratchy_subtile::subtile_ir::AttnMask::Causal,
@@ -3673,12 +3663,7 @@ mod attn_scale_weight_fold_tests {
                     ],
                 },
                 OpDesc {
-                    op: SubOp::attn_decode(
-                        geom,
-                        4.0,
-                        33,
-                        scratchy_subtile::subtile_ir::AttnMask::Causal,
-                    ),
+                    op: SubOp::attn_decode(attention, 33, scratchy_subtile::subtile_ir::AttnMask::Causal),
                     m: 1,
                     inputs: vec![
                         InputRef::Op(1),
