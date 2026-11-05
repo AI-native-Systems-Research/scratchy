@@ -171,6 +171,10 @@ pub enum ExpertWeight {
     Dense,
     /// MLX-affine packed experts, as the checkpoint declares them.
     Affine(ExpertQuant),
+    /// compressed-tensors fp8-dynamic experts ([`GemmWeight::Fp8Dynamic`]'s counterpart): each
+    /// expert's per-channel fp8 weight and its `weight_scale`. `inputs` = `[rows, routing, bundle,
+    /// scale]`, the scale bound as an affine bank's.
+    Fp8Dynamic,
 }
 
 /// An op as the front end states it: THE op vocabulary [`SubOp`] at its [`Arch`] stage, before
