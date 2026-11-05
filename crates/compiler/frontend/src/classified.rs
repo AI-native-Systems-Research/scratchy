@@ -156,7 +156,7 @@ pub enum ExternKind {
 /// [`Prelude::Vision`].
 ///
 /// The two preludes are disjoint, but the downstream IR
-/// ([`Program`], [`crate::fuf::Fuf`]) shares one type and one
+/// ([`Program`], the macro crate's `fuf::Fuf`) shares one type and one
 /// pipeline — preludes only influence what NAMES the parser /
 /// classifier accept on input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -832,6 +832,10 @@ pub struct Program {
     /// records the target shape here; the second inference pass
     /// reads this map to typecheck the synthesized statement.
     pub reshape_targets: std::collections::HashMap<LocalId, Vec<crate::dim::Dim>>,
+    /// `x = as_dim(y, <bound>)`: each such `x`, an alias of `y` whose width is stated as `<bound>`.
+    /// No tile, no shape change: a model compiles through one only where the two widths are equal
+    /// (the bake checks it), and the typed program types `x` at `<bound>`.
+    pub dim_casts: std::collections::HashMap<LocalId, crate::dim::Dim>,
     /// Prelude this program was classified under. `Decoder` for
     /// text-side `#[forward]`, `Vision` for `#[vision_forward]`.
     /// Threaded into codegen for prelude-specific decisions —
@@ -1162,6 +1166,7 @@ mod tests {
             locals: LocalTable::default(),
             weights: WeightTable::default(),
             reshape_targets: Default::default(),
+            dim_casts: Default::default(),
             prelude: Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: pairs

@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::classified::{Expr, ExternKind, LocalId, OpKind, Program, Stmt, WeightId};
-pub use crate::dim::{Dim, DimVar, Shape, canonical_mul};
+pub use crate::dim::{Dim, DimVar, Shape, canonical_add, canonical_mul};
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -125,6 +125,7 @@ impl Solver {
                 let walked: Vec<Dim> = children.iter().map(|c| self.walk(c)).collect();
                 canonical_mul(walked)
             }
+            Dim::Add(terms) => canonical_add(terms.iter().map(|t| self.walk(t)).collect()),
             Dim::Div(num, den) => {
                 let n = self.walk(num);
                 let d = self.walk(den);
@@ -152,6 +153,11 @@ impl Solver {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(canonical_mul(cs))
             }
+            Dim::Add(ts) => Ok(canonical_add(
+                ts.iter()
+                    .map(|t| self.close_dim(t))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
             Dim::Div(num, den) => {
                 let n = self.close_dim(&num)?;
                 let d = self.close_dim(&den)?;
@@ -170,7 +176,7 @@ fn dims_structurally_equal(a: &Dim, b: &Dim) -> bool {
     match (a, b) {
         (Dim::Lit(x), Dim::Lit(y)) => x == y,
         (Dim::Bound(x), Dim::Bound(y)) => x == y,
-        (Dim::Mul(x), Dim::Mul(y)) => {
+        (Dim::Mul(x), Dim::Mul(y)) | (Dim::Add(x), Dim::Add(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| dims_structurally_equal(p, q))
         }
         (Dim::Div(n1, d1), Dim::Div(n2, d2)) => {
@@ -263,6 +269,10 @@ fn show_dim(d: &Dim) -> String {
         Dim::Lit(n) => n.to_string(),
         Dim::Bound(n) => n.clone(),
         Dim::Mul(cs) => cs.iter().map(show_dim).collect::<Vec<_>>().join(" * "),
+        Dim::Add(ts) => format!(
+            "({})",
+            ts.iter().map(show_dim).collect::<Vec<_>>().join(" + ")
+        ),
         Dim::Div(num, den) => format!("({} / {})", show_dim(num), show_dim(den)),
         Dim::Var(v) => format!("?{}", v.0),
     }
@@ -1602,6 +1612,9 @@ pub(crate) fn eval_closed_dim(
         Dim::Mul(factors) => factors
             .iter()
             .try_fold(1u64, |acc, f| eval_closed_dim(f, bounds).map(|v| acc * v)),
+        Dim::Add(terms) => terms
+            .iter()
+            .try_fold(0u64, |acc, t| eval_closed_dim(t, bounds).map(|v| acc + v)),
         Dim::Div(num, den) => {
             let n = eval_closed_dim(num, bounds)?;
             let d = eval_closed_dim(den, bounds)?;
@@ -2014,6 +2027,56 @@ pub fn apply_reshape_hints(program: &mut Program, hints: &[ReshapeHint]) {
         // just use the already-introduced reshape binding.
         rewrite_and_insert(&mut program.statements, producer, new_local, &mut false);
     }
+}
+
+/// Erase every regrouping that is the identity for one model: a `reshape` of a local whose source
+/// and target have the same per-axis extents under `bounds` (a split or merge by a factor of 1, as
+/// a single global KV head makes) becomes an alias of its source, which binds the source's tile
+/// and pushes no node. Keyed only on the evaluated extents. The typed program keeps the
+/// regrouping, so rustc still checks it whatever the factor; this is the per-model view of it.
+pub fn erase_identity_regroupings(
+    program: &mut Program,
+    inferred: &Inferred,
+    bounds: &std::collections::BTreeMap<String, u64>,
+) {
+    // The row count is the forward's, not the config's: any one nonzero count shows whether an
+    // axis's extent is the other's, since both sides scale by the same rows.
+    let mut bounds = bounds.clone();
+    bounds.insert("num_tokens".to_string(), 7919);
+    let extents = |id: &LocalId| -> Option<Vec<u64>> {
+        (inferred.locals.get(id)?.iter())
+            .map(|d| eval_closed_dim(d, &bounds))
+            .collect()
+    };
+    fn walk(stmts: &mut [Stmt], identity: &dyn Fn(LocalId, LocalId) -> bool) {
+        for s in stmts {
+            match s {
+                Stmt::Assign { target, value } => {
+                    if let Expr::Call {
+                        op: OpKind::Reshape,
+                        args,
+                    } = value
+                        && let [Expr::Local(source)] = args.as_slice()
+                        && identity(*source, *target)
+                    {
+                        *value = Expr::Local(*source);
+                    }
+                }
+                Stmt::AssignTuple { .. } => {}
+                Stmt::For { body, .. } => walk(body, identity),
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    walk(then_body, identity);
+                    walk(else_body, identity);
+                }
+            }
+        }
+    }
+    let identity = |source: LocalId, target: LocalId| matches!((extents(&source), extents(&target)), (Some(a), Some(b)) if a == b);
+    walk(&mut program.statements, &identity);
 }
 
 /// Recurse through stmts. Whenever a stmt reads `producer`, rewrite

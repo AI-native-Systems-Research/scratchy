@@ -133,49 +133,13 @@ pub struct DeclaredArchSpec {
     pub params: Vec<ParamField>,
 }
 
-/// One `struct Params` field: the bound it defines + where its value
-/// comes from.
-#[derive(Clone, Debug)]
-pub struct ParamField {
-    pub name: String,
-    pub source: ParamSource,
-    /// Overwrite the harvested bound of the same name instead of filling it only when absent:
-    /// an MTP head's config carries its target's `num_hidden_layers` beside its own
-    /// `mtp_num_hidden_layers`, and the head's model has the latter.
-    pub replaces: bool,
-}
-
-#[derive(Clone, Debug)]
-pub enum ParamSource {
-    /// `#[from = "dotted.path"]` into the verbatim config.json
-    /// (numeric segments index arrays), with an optional
-    /// `default = <int>` for configs that omit the key.
-    From { path: String, default: Option<u64> },
-    /// `#[expr = "a * b / c"]` over previously-declared fields and
-    /// integer literals (left-assoc, `*`/`/` bind tighter, parens).
-    Expr(String),
-    /// `#[value = <int>]` literal.
-    Value(u64),
-    /// `len_of = "dotted.path"`: the length of the config's array at the path (a DFlash2 drafter's
-    /// `dflash_config.target_layer_ids`: how many of its target's layers it reads).
-    LenOf(String),
-}
+pub use crate::hf_config::{ParamField, ParamSource};
 
 // ── Schema evaluation ───────────────────────────────────────────────
 
-/// Dotted-path lookup into a JSON value: segments descend objects;
+/// Dotted-path lookup into a JSON value (`crate::hf_config::json_path`): segments descend objects;
 /// all-digit segments index arrays (`"merge_kernel_size.0"`).
-pub fn json_path<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
-    let mut cur = root;
-    for seg in path.split('.') {
-        cur = if seg.bytes().all(|b| b.is_ascii_digit()) && cur.is_array() {
-            cur.get(seg.parse::<usize>().ok()?)?
-        } else {
-            cur.get(seg)?
-        };
-    }
-    Some(cur)
-}
+pub use crate::hf_config::json_path;
 
 impl DeclaredArchSpec {
     /// The decoder tree's safetensors root — the ONE resolution of
@@ -235,124 +199,9 @@ impl DeclaredArchSpec {
     }
 }
 
-/// Minimal integer expression evaluator for `#[expr]`: identifiers
-/// (earlier fields), integer literals, `+ - * /`, parentheses.
+/// An `#[expr]` field's value: the shared grammar (`crate::hf_config::ParamExpr`), evaluated.
 fn eval_expr(src: &str, env: &std::collections::BTreeMap<String, u64>) -> Result<u64, String> {
-    struct P<'a> {
-        toks: Vec<&'a str>,
-        pos: usize,
-    }
-    fn tokenize(s: &str) -> Vec<&str> {
-        let mut out = Vec::new();
-        let mut start = None::<usize>;
-        for (i, c) in s.char_indices() {
-            if c.is_alphanumeric() || c == '_' {
-                if start.is_none() {
-                    start = Some(i);
-                }
-            } else {
-                if let Some(st) = start.take() {
-                    out.push(&s[st..i]);
-                }
-                if !c.is_whitespace() {
-                    out.push(&s[i..i + c.len_utf8()]);
-                }
-            }
-        }
-        if let Some(st) = start {
-            out.push(&s[st..]);
-        }
-        out
-    }
-    impl<'a> P<'a> {
-        fn peek(&self) -> Option<&'a str> {
-            self.toks.get(self.pos).copied()
-        }
-        fn next(&mut self) -> Option<&'a str> {
-            let t = self.peek();
-            self.pos += 1;
-            t
-        }
-    }
-    fn atom(p: &mut P, env: &std::collections::BTreeMap<String, u64>) -> Result<u64, String> {
-        match p.next() {
-            Some("(") => {
-                let v = sum(p, env)?;
-                if p.next() != Some(")") {
-                    return Err("expected `)`".to_string());
-                }
-                Ok(v)
-            }
-            // `sqrt(x)` — exact integer square root (errors when the
-            // argument isn't a perfect square; pooling kernels etc.
-            // are exact by construction).
-            Some("sqrt") => {
-                if p.next() != Some("(") {
-                    return Err("sqrt: expected `(`".to_string());
-                }
-                let v = sum(p, env)?;
-                if p.next() != Some(")") {
-                    return Err("sqrt: expected `)`".to_string());
-                }
-                let r = (v as f64).sqrt().round() as u64;
-                if r * r != v {
-                    return Err(format!("sqrt({v}) is not an integer"));
-                }
-                Ok(r)
-            }
-            Some(t) if t.bytes().all(|b| b.is_ascii_digit()) => {
-                t.parse().map_err(|e| format!("bad int `{t}`: {e}"))
-            }
-            Some(t) => env
-                .get(t)
-                .copied()
-                .ok_or_else(|| format!("unknown field `{t}` (declare it earlier in Params)")),
-            None => Err("unexpected end of expression".to_string()),
-        }
-    }
-    fn prod(p: &mut P, env: &std::collections::BTreeMap<String, u64>) -> Result<u64, String> {
-        let mut v = atom(p, env)?;
-        while matches!(p.peek(), Some("*") | Some("/")) {
-            let op = p.next().unwrap();
-            let r = atom(p, env)?;
-            v = match op {
-                "*" => v * r,
-                // `/` is FLOOR division (HF-config arithmetic like
-                // `(x + 7) / 8 * 8` rounding needs it; exact cases
-                // are unaffected).
-                _ => {
-                    if r == 0 {
-                        return Err(format!("{v} / 0"));
-                    }
-                    v / r
-                }
-            };
-        }
-        Ok(v)
-    }
-    fn sum(p: &mut P, env: &std::collections::BTreeMap<String, u64>) -> Result<u64, String> {
-        let mut v = prod(p, env)?;
-        while matches!(p.peek(), Some("+") | Some("-")) {
-            let op = p.next().unwrap();
-            let r = prod(p, env)?;
-            v = match op {
-                "+" => v + r,
-                _ => v
-                    .checked_sub(r)
-                    .ok_or_else(|| format!("{v} - {r} underflows"))?,
-            };
-        }
-        Ok(v)
-    }
-    let mut p = P {
-        toks: tokenize(src),
-        pos: 0,
-    };
-    let v = sum(&mut p, env)?;
-    if p.peek().is_some() {
-        return Err(format!("trailing tokens after expression in `{src}`"));
-    }
-    Ok(v)
+    crate::hf_config::ParamExpr::parse(src)?.eval(env)
 }
 
 #[cfg(test)]

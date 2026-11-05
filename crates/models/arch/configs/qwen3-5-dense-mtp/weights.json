@@ -1,23 +1,23 @@
 {
   "embed_tokens": [
     "embed_vocab_size",
-    "hidden_size"
+    "backbone_hidden_size"
   ],
   "lm_head": [
-    "hidden_size",
+    "backbone_hidden_size",
     "vocab_size"
   ],
   "norm": [
     "hidden_size"
   ],
   "pre_fc_norm_embedding": [
-    "hidden_size"
+    "backbone_hidden_size"
   ],
   "pre_fc_norm_hidden": [
-    "hidden_size"
+    "backbone_hidden_size"
   ],
   "fc": [
-    "2 * hidden_size",
+    "2 * backbone_hidden_size",
     "hidden_size"
   ],
   "input_layernorm": [

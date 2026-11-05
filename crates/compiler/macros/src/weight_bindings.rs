@@ -690,6 +690,7 @@ mod tests {
             locals: Default::default(),
             weights,
             reshape_targets: Default::default(),
+            dim_casts: Default::default(),
             prelude: Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),

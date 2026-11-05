@@ -1,10 +1,10 @@
 {
-  "embed_tokens": ["embed_vocab_size", "hidden_size"],
-  "lm_head": ["hidden_size", "vocab_size"],
+  "embed_tokens": ["embed_vocab_size", "backbone_hidden_size"],
+  "lm_head": ["backbone_hidden_size", "vocab_size"],
   "norm": ["hidden_size"],
-  "pre_fc_norm_embedding": ["hidden_size"],
-  "pre_fc_norm_hidden": ["hidden_size"],
-  "fc": ["2 * hidden_size", "hidden_size"],
+  "pre_fc_norm_embedding": ["backbone_hidden_size"],
+  "pre_fc_norm_hidden": ["backbone_hidden_size"],
+  "fc": ["2 * backbone_hidden_size", "hidden_size"],
   "input_layernorm": ["hidden_size"],
   "post_attention_layernorm": ["hidden_size"],
 

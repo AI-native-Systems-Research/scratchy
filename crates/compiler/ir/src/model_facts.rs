@@ -562,17 +562,42 @@ pub enum TargetRouting {
     Experts,
 }
 
+/// How a head's width stands to its target's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TargetWidth {
+    /// The head's own: it reads its target's rows through a projection of its own, so the two
+    /// widths are unrelated (a DFlash2 drafter, an assistant).
+    Own,
+    /// Its target's: the head states its own rows at its target's width (the DSL's `as_dim`, an
+    /// in-checkpoint head reading its target's lent lm_head), so [`ModelFacts::new`] holds the
+    /// two equal.
+    Lent,
+}
+
 /// What a head reads of the target it drafts for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Target {
     hidden: HiddenSize,
     routing: TargetRouting,
+    width: TargetWidth,
 }
 
 impl Target {
-    /// The target, as its head reads it.
+    /// The target, as a head at its own width reads it.
     pub const fn new(hidden: HiddenSize, routing: TargetRouting) -> Self {
-        Self { hidden, routing }
+        Self {
+            hidden,
+            routing,
+            width: TargetWidth::Own,
+        }
+    }
+    /// The target, as a head lent its width reads it ([`TargetWidth::Lent`]).
+    pub const fn lent(hidden: HiddenSize, routing: TargetRouting) -> Self {
+        Self {
+            hidden,
+            routing,
+            width: TargetWidth::Lent,
+        }
     }
     /// The width of one of its hidden rows.
     pub const fn hidden(self) -> HiddenSize {
@@ -581,6 +606,10 @@ impl Target {
     /// How it routes the rows it verifies.
     pub const fn routing(self) -> TargetRouting {
         self.routing
+    }
+    /// How the head's width stands to this one.
+    pub const fn width(self) -> TargetWidth {
+        self.width
     }
 }
 
@@ -614,12 +643,24 @@ pub struct ModelFacts(FactsParts);
 
 impl ModelFacts {
     /// The facts, refused when its groups break a law between them: a TurboQuant KV codec codes an
-    /// attention's keys and values, so it needs an attention.
+    /// attention's keys and values, so it needs an attention; a head lent its target's width
+    /// ([`TargetWidth::Lent`]) is that width.
     pub const fn new(parts: FactsParts) -> Self {
         if let KvCodec::TurboQuant(_) = parts.kv_codec {
             assert!(
                 parts.attention.is_some(),
                 "ModelFacts: a TurboQuant KV codec is an attention's"
+            );
+        }
+        if let Some(Target {
+            hidden,
+            width: TargetWidth::Lent,
+            ..
+        }) = parts.target
+        {
+            assert!(
+                parts.hidden.get() == hidden.get(),
+                "ModelFacts: a head lent its target's width is that width"
             );
         }
         Self(parts)
@@ -1223,5 +1264,34 @@ mod tests {
     #[should_panic(expected = "a TurboQuant KV codec is an attention's")]
     fn a_turboquant_codec_without_attention_is_refused() {
         ModelFacts::new(parts(None, KvCodec::TurboQuant(crate::TqBits::new(4))));
+    }
+
+    fn head_of(target: Target) -> ModelFacts {
+        ModelFacts::new(FactsParts {
+            target: Some(target),
+            ..parts(None, KvCodec::Dense)
+        })
+    }
+
+    /// An in-checkpoint head states its rows at its target's width (`as_dim`): at the head's own
+    /// width, it holds.
+    #[test]
+    fn a_head_lent_its_targets_width_at_that_width_holds() {
+        let facts = head_of(Target::lent(HiddenSize::new(2048), TargetRouting::Experts));
+        assert_eq!(facts.target().map(Target::width), Some(TargetWidth::Lent));
+    }
+
+    /// A head lent its target's width that is not its own is refused.
+    #[test]
+    #[should_panic(expected = "a head lent its target's width is that width")]
+    fn a_head_lent_another_width_is_refused() {
+        head_of(Target::lent(HiddenSize::new(4096), TargetRouting::Experts));
+    }
+
+    /// A drafter reads its target's rows through its own projection: the widths may differ.
+    #[test]
+    fn a_head_at_its_own_width_may_differ_from_its_target() {
+        let facts = head_of(Target::new(HiddenSize::new(16384), TargetRouting::Experts));
+        assert_eq!(facts.target().map(Target::width), Some(TargetWidth::Own));
     }
 }

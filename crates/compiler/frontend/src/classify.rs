@@ -60,6 +60,7 @@ pub fn classify_with(ast: &ast::Ast, prelude: Prelude) -> ClassifyResult<Program
         locals: cx.locals,
         weights: cx.weights,
         reshape_targets: cx.reshape_targets,
+        dim_casts: cx.dim_casts,
         prelude,
         decoder_safetensors_prefix: None,
         weight_leaf_renames: Vec::new(),
@@ -81,6 +82,8 @@ struct Ctx {
     /// the producing `LocalId`. See [`Ctx::classify_stmt`] for the
     /// `ast::Expr::Reshape` Assign-arm intercept.
     reshape_targets: HashMap<LocalId, Vec<Dim>>,
+    /// `x = as_dim(y, <bound>)`s accumulated during classify (`Program::dim_casts`).
+    dim_casts: HashMap<LocalId, Dim>,
 }
 
 impl Ctx {
@@ -121,6 +124,31 @@ impl Ctx {
                             op: OpKind::Reshape,
                             args: vec![source],
                         },
+                    });
+                }
+                // `x = as_dim(y, <bound>)`: an alias of the local `y`, its width stated as the
+                // bound (`Program::dim_casts`). Admitted only as an assignment's whole RHS.
+                if let ast::Expr::Call { op, args } = value
+                    && op == "as_dim"
+                {
+                    let [source, ast::Expr::Var(bound)] = args.as_slice() else {
+                        return Err(syn::Error::new(
+                            proc_macro2::Span::call_site(),
+                            "`as_dim(x, <bound>)` takes a local and a config bound",
+                        ));
+                    };
+                    let source = self.classify_expr(source)?;
+                    if !matches!(source, Expr::Local(_)) {
+                        return Err(syn::Error::new(
+                            proc_macro2::Span::call_site(),
+                            "`as_dim(x, <bound>)` casts a local",
+                        ));
+                    }
+                    let id = self.bind(target.clone(), *line);
+                    self.dim_casts.insert(id, Dim::Bound(bound.to_string()));
+                    return Ok(Stmt::Assign {
+                        target: id,
+                        value: source,
                     });
                 }
                 // Classify RHS first so that `x = f(x)` reads the

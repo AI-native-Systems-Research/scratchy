@@ -22,6 +22,7 @@ default = []
 # visible to the macro's match arms — they're gated
 # `#[cfg(feature = "metal")]` in `scratchy-forward-compiler::instr`.
 metal = ["scratchy-ir/metal",
+    "scratchy-forward-compiler-frontend/metal",
     "dep:scratchy-target-metal",
     "dep:scratchy-target-metal-compiler",
     "scratchy-forward-compiler/metal",
@@ -77,6 +78,9 @@ rayon = { workspace = true }
 # scope. scratchy-forward-compiler must NOT depend on scratchy-forward-compiler-macro
 # back (the re-export of the proc-macro was dropped to break the cycle).
 scratchy-forward-compiler = { path = ".." }
+# The front end (parser, classifier, dims, config rules, weights manifest, typed-Rust emit pass): its
+# own crate so the build script below and this crate share one compile of it.
+scratchy-forward-compiler-frontend = { path = "../frontend" }
 
 # Backend-specific dependencies (enabled by features)
 scratchy-target-metal = { path = "../../targets/metal", optional = true }
@@ -92,11 +96,12 @@ scratchy-target-spyre = { path = "../../targets/spyre", default-features = false
 # it names the same types the lowering built. Dependency-free.
 ktir-core = { path = "../../targets/spyre/ktir/ktir-core", optional = true }
 
-# The build script compiles the crate's own front end (parser, classifier, weights manifest) by path
-# to run the typed-Rust emit pass (`build.rs`): these are what those files use. The compiler ids
-# they share live in scratchy-tensors, beneath the rest of the compiler.
+# The build script runs the front end's typed-Rust emit pass (`build.rs`) over the carriers: the same
+# front-end crate this crate depends on, the same host build of it.
 [build-dependencies]
-syn = { version = "3", features = ["full"] }
-proc-macro2 = "1"
+scratchy-forward-compiler-frontend = { path = "../frontend" }
 serde_json = { workspace = true }
-scratchy-tensors = { path = "../../tensors" }
+
+# The front end's test fixtures, for this crate's tests.
+[dev-dependencies]
+scratchy-forward-compiler-frontend = { path = "../frontend", features = ["test-support"] }

@@ -22,6 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::draft_capture::DRAFT_CAPTURE_LAYERS;
+use crate::hf_config::{extract_bounds, normalize_hf_config};
 use crate::quantization::QuantizationConfig;
 
 /// One model's parameters, loaded from one `config.json`.
@@ -1020,15 +1021,11 @@ fn arch_dirs(configs_root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
 /// Whether a checkpoint config carries the in-checkpoint head `head` (`checkpoint_of`): it declares
 /// the head's layers — the config field the head's `num_hidden_layers` replaces its target's from
 /// (`mtp_num_hidden_layers`) — above zero.
-fn carries_head(head: &crate::arch_spec::DeclaredArchSpec, json: &serde_json::Value) -> bool {
-    let json = normalize_hf_config(json, &head.config_aliases);
-    head.params.iter().any(|f| {
-        let crate::arch_spec::ParamSource::From { path, .. } = &f.source else {
-            return false;
-        };
-        let layers = crate::arch_spec::json_path(&json, path).and_then(|v| v.as_u64());
-        f.name == "num_hidden_layers" && f.replaces && layers.is_some_and(|n| n > 0)
-    })
+pub(crate) fn carries_head(
+    head: &crate::arch_spec::DeclaredArchSpec,
+    json: &serde_json::Value,
+) -> bool {
+    crate::hf_config::carries_head(&head.params, &head.config_aliases, json)
 }
 
 /// Load a single config.json as a dense-base ModelParams.
@@ -1131,6 +1128,21 @@ pub fn load_file_with_preset(
 /// arch's declarations (the `arch.json` beside it) applied, which [`load_file`] leaves out.
 #[cfg(test)]
 pub fn load_file_declared(config_path: &Path) -> Result<ModelParams, ConfigError> {
+    load_file_declared_mode(config_path, ConfigMode::Decoder)
+}
+
+/// [`load_file_declared`] for a `@vision_forward` carrier's config: its `vision_*` bounds derived
+/// as [`load_dir_vision`] derives them.
+#[cfg(test)]
+pub(crate) fn load_file_declared_vision(config_path: &Path) -> Result<ModelParams, ConfigError> {
+    load_file_declared_mode(config_path, ConfigMode::Vision)
+}
+
+#[cfg(test)]
+fn load_file_declared_mode(
+    config_path: &Path,
+    mode: ConfigMode,
+) -> Result<ModelParams, ConfigError> {
     let stem = stem_of(config_path)?;
     let dir = config_path
         .parent()
@@ -1138,7 +1150,8 @@ pub fn load_file_declared(config_path: &Path) -> Result<ModelParams, ConfigError
     let (_, mut json) = read_json_file(config_path)?;
     let mut tracked: Vec<PathBuf> = Vec::new();
     apply_overrides_file(dir, &stem, &mut json, &mut tracked)?;
-    model_params_from_json(&json, &stem, config_path, tracked, &load_arch_json(dir)?)
+    let spec = load_arch_json(dir)?;
+    model_params_from_json_mode(&json, &stem, config_path, tracked, mode, &spec)
 }
 
 /// Load one in-checkpoint head base — its TARGET's config through the head arch's own spec
@@ -1420,72 +1433,6 @@ fn stem_of(path: &Path) -> Result<String, ConfigError> {
         })
 }
 
-/// Build a `ModelParams` from an already-parsed JSON value (possibly
-/// the result of deep-merging a dense base with a quantization
-/// preset + per-size overrides). `source_stem` is the variant name
-/// that ends up on the generated Weights enum variant + inventory
-/// registration. `source_path` points at the dense base for
-/// synthesized variants; `extra_tracked_paths` carries the preset +
-/// override files so the `#[forward]` macro can `include_str!` them
-/// for cargo change detection.
-/// Normalize an HF `config.json` for macro consumption. VL-wrapper
-/// checkpoints (Qwen3.5 / Qwen3.5-MoE / …) nest the text decoder's
-/// fields under `text_config`, and newer transformers nest rotary
-/// params under `rope_parameters` — while the per-field readers
-/// (`extract_bounds`, `extract_scalars`, `extract_mrope_section`, …)
-/// all consume the flat single-decoder view. Hoist both levels.
-///
-/// An explicit top-level field always wins (hoisting never
-/// overwrites), and `vision_config` deliberately stays nested — the
-/// vision glue owns that subtree. The `configs/` files themselves are
-/// VERBATIM copies of the HF checkpoint configs (fetched by
-/// `probe-weights`); this normalization is the macro's job, never an
-/// edit to the json.
-fn normalize_hf_config(
-    json: &serde_json::Value,
-    aliases: &[(String, String)],
-) -> serde_json::Value {
-    let mut out = json.clone();
-    let Some(obj) = out.as_object_mut() else {
-        return out;
-    };
-    if let Some(text) = obj.get("text_config").cloned()
-        && let Some(text_obj) = text.as_object()
-    {
-        for (k, v) in text_obj {
-            obj.entry(k.clone()).or_insert(v.clone());
-        }
-    }
-    if let Some(rope) = obj.get("rope_parameters").cloned()
-        && let Some(rope_obj) = rope.as_object()
-    {
-        for (k, v) in rope_obj {
-            obj.entry(k.clone()).or_insert(v.clone());
-        }
-    }
-    // Arch-declared key aliases (`CONFIG_ALIASES` on the carrier mod):
-    // when the standard key `.0` is absent, read it from the arch's
-    // alternate spelling `.1`. The alt spelling may be a DOTTED PATH
-    // (`rope_parameters.full_attention.rope_theta`) — newer
-    // transformers nests rope scalars per attention class — resolved
-    // via `json_path`. Alias, don't rename: the config stays verbatim
-    // and an explicit standard-name field still wins. Resolve every
-    // alt against a snapshot taken AFTER the hoists above so paths may
-    // reference hoisted subtrees.
-    if !aliases.is_empty() {
-        let snapshot = serde_json::Value::Object(obj.clone());
-        for (std_key, alt_key) in aliases {
-            if obj.contains_key(std_key) {
-                continue;
-            }
-            if let Some(v) = crate::arch_spec::json_path(&snapshot, alt_key) {
-                obj.insert(std_key.clone(), v.clone());
-            }
-        }
-    }
-    out
-}
-
 fn model_params_from_json_mode(
     json: &serde_json::Value,
     source_stem: &str,
@@ -1733,6 +1680,19 @@ fn model_params_from_json(
             path: source_path.to_path_buf(),
             limit: limit.clone(),
         });
+    }
+    // A gated derived dim's flag, by the one rule the macros crate's build script reads it with
+    // (`hf_config::flag_value`: the config's, else the arch's default, else 0), so the width this
+    // model derives and the width its carrier's typed program states agree.
+    for flag in crate::dim::DERIVED_DIMS
+        .iter()
+        .filter_map(|d| d.rule.gate_flag())
+    {
+        let v =
+            crate::hf_config::flag_value(json, &spec.config_aliases, &spec.bound_defaults, flag);
+        if v != 0 {
+            bounds.insert(flag.to_string(), v);
+        }
     }
     derive_implicit_bounds(&mut bounds);
     // Arch-declared bound defaults (zero-centered norms, sliding
@@ -2100,21 +2060,20 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     spec.checkpoint_prefix = as_str("checkpoint_prefix");
     spec.reads_target_kv = json.get("reads_target_kv").and_then(|v| v.as_bool()) == Some(true);
     let strings = |key: &str| -> Result<Option<Vec<String>>, ConfigError> {
-        json.get(key)
-            .map(|v| {
-                (v.as_array())
-                    .and_then(|a| a.iter().map(|s| s.as_str().map(str::to_string)).collect())
-                    .ok_or_else(|| ConfigError::ArchJson {
-                        path: path.clone(),
-                        reason: format!("`{key}` must be an array of strings"),
-                    })
-            })
-            .transpose()
+        crate::hf_config::string_list(&json, key).map_err(|reason| ConfigError::ArchJson {
+            path: path.clone(),
+            reason,
+        })
     };
     spec.borrows = strings("borrows")?;
     spec.target_capture_layers = as_str("target_capture_layers");
     spec.top_level_weights = strings("top_level_weights")?.unwrap_or_default();
-    spec.checkpoint_of = strings("checkpoint_of")?.unwrap_or_default();
+    // The facts the bounds read, by the one reader the macros crate's build script shares.
+    let facts = crate::hf_config::arch_facts(&json).map_err(|reason| ConfigError::ArchJson {
+        path: path.clone(),
+        reason,
+    })?;
+    spec.checkpoint_of = facts.checkpoint_of;
     if spec.checkpoint_of.is_empty() != spec.checkpoint_prefix.is_none() {
         return Err(ConfigError::ArchJson {
             path: path.clone(),
@@ -2142,11 +2101,11 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
         spec.scale_dtype = Some(s);
     }
 
-    spec.bound_defaults = str_u64_pairs(&path, &json, "bound_defaults")?;
+    spec.bound_defaults = facts.bound_defaults;
     spec.scalar_defaults = str_f64_pairs(&path, &json, "scalar_defaults")?;
-    spec.config_aliases = str_str_pairs(&path, &json, "config_aliases")?;
+    spec.config_aliases = facts.config_aliases;
     spec.weight_leaf_renames = str_str_pairs(&path, &json, "weight_leaf_renames")?;
-    spec.params = parse_params_json(&path, &json)?;
+    spec.params = facts.params;
 
     // Typos must not silently no-op — the failure mode the token
     // surface was careful about, kept here.
@@ -2230,30 +2189,6 @@ fn check_enum(path: &Path, key: &str, got: &str, allowed: &[&str]) -> Result<(),
 
 /// `{"a": 1, "b": 2}` → sorted `[(a,1), (b,2)]`. Sorted so the emit is
 /// order-stable regardless of how the file was written.
-fn str_u64_pairs(
-    path: &Path,
-    json: &serde_json::Value,
-    key: &str,
-) -> Result<Vec<(String, u64)>, ConfigError> {
-    let Some(obj) = json.get(key) else {
-        return Ok(Vec::new());
-    };
-    let obj = obj.as_object().ok_or_else(|| ConfigError::ArchJson {
-        path: path.to_path_buf(),
-        reason: format!("`{key}` must be an object"),
-    })?;
-    let mut out: Vec<(String, u64)> = Vec::with_capacity(obj.len());
-    for (k, v) in obj {
-        let n = v.as_u64().ok_or_else(|| ConfigError::ArchJson {
-            path: path.to_path_buf(),
-            reason: format!("`{key}.{k}` must be a non-negative integer"),
-        })?;
-        out.push((k.clone(), n));
-    }
-    out.sort();
-    Ok(out)
-}
-
 fn str_f64_pairs(
     path: &Path,
     json: &serde_json::Value,
@@ -2283,23 +2218,10 @@ fn str_str_pairs(
     json: &serde_json::Value,
     key: &str,
 ) -> Result<Vec<(String, String)>, ConfigError> {
-    let Some(obj) = json.get(key) else {
-        return Ok(Vec::new());
-    };
-    let obj = obj.as_object().ok_or_else(|| ConfigError::ArchJson {
+    crate::hf_config::object_str_pairs(json, key).map_err(|reason| ConfigError::ArchJson {
         path: path.to_path_buf(),
-        reason: format!("`{key}` must be an object"),
-    })?;
-    let mut out: Vec<(String, String)> = Vec::with_capacity(obj.len());
-    for (k, v) in obj {
-        let s = v.as_str().ok_or_else(|| ConfigError::ArchJson {
-            path: path.to_path_buf(),
-            reason: format!("`{key}.{k}` must be a string"),
-        })?;
-        out.push((k.clone(), s.to_string()));
-    }
-    out.sort();
-    Ok(out)
+        reason,
+    })
 }
 
 /// The `params` schema: an ORDERED array, because `expr` fields read
@@ -2307,95 +2229,6 @@ fn str_str_pairs(
 /// declaration order). A JSON object would not preserve that order,
 /// so this is a list of `{"name": …, <source>}` entries with exactly
 /// one source key each.
-fn parse_params_json(
-    path: &Path,
-    json: &serde_json::Value,
-) -> Result<Vec<crate::arch_spec::ParamField>, ConfigError> {
-    use crate::arch_spec::{ParamField, ParamSource};
-    let Some(v) = json.get("params") else {
-        return Ok(Vec::new());
-    };
-    let arr = v.as_array().ok_or_else(|| ConfigError::ArchJson {
-        path: path.to_path_buf(),
-        reason: "`params` must be an array (order matters: `expr` reads earlier fields)"
-            .to_string(),
-    })?;
-    let bad = |reason: String| ConfigError::ArchJson {
-        path: path.to_path_buf(),
-        reason,
-    };
-    let mut out = Vec::with_capacity(arr.len());
-    for (i, f) in arr.iter().enumerate() {
-        let obj = f
-            .as_object()
-            .ok_or_else(|| bad(format!("`params[{i}]` must be an object")))?;
-        let name = obj
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| bad(format!("`params[{i}]` has no string `name`")))?
-            .to_string();
-        let replaces = match obj.get("replaces") {
-            None => false,
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| bad(format!("`params[{i}].replaces` must be a bool")))?,
-        };
-        let len_of = obj.get("len_of");
-        let source = match (obj.get("from"), obj.get("expr"), obj.get("value")) {
-            (None, None, None) if len_of.is_some() => ParamSource::LenOf(
-                len_of
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| bad(format!("`params[{i}].len_of` must be a string")))?
-                    .to_string(),
-            ),
-            _ if len_of.is_some() => {
-                return Err(bad(format!(
-                    "`params[{i}]` ({name}) needs EXACTLY one of `from` / `expr` / `value` / \
-                     `len_of`"
-                )));
-            }
-            (Some(p), None, None) => {
-                let path_str = p
-                    .as_str()
-                    .ok_or_else(|| bad(format!("`params[{i}].from` must be a string")))?
-                    .to_string();
-                let default = match obj.get("default") {
-                    None => None,
-                    Some(d) => Some(
-                        d.as_u64()
-                            .ok_or_else(|| bad(format!("`params[{i}].default` must be an int")))?,
-                    ),
-                };
-                ParamSource::From {
-                    path: path_str,
-                    default,
-                }
-            }
-            (None, Some(e), None) => ParamSource::Expr(
-                e.as_str()
-                    .ok_or_else(|| bad(format!("`params[{i}].expr` must be a string")))?
-                    .to_string(),
-            ),
-            (None, None, Some(v)) => ParamSource::Value(
-                v.as_u64()
-                    .ok_or_else(|| bad(format!("`params[{i}].value` must be an int")))?,
-            ),
-            _ => {
-                return Err(bad(format!(
-                    "`params[{i}]` ({name}) needs EXACTLY one of `from` / `expr` / `value` / \
-                     `len_of`"
-                )));
-            }
-        };
-        out.push(ParamField {
-            name,
-            source,
-            replaces,
-        });
-    }
-    Ok(out)
-}
-
 /// Extract `mrope_section` as a fixed `[u32; 3]`, from a TOP-LEVEL
 /// `mrope_section` first, else `rope_scaling.mrope_section`. Returns
 /// `None` when absent (every text-only arch) or malformed (<3 entries).
@@ -2604,28 +2437,6 @@ fn deep_merge(base: &mut serde_json::Value, overlay: &serde_json::Value) {
             *slot = overlay_val.clone();
         }
     }
-}
-
-/// Every top-level integer field becomes a bound. Anything else
-/// (strings, bools, floats, nested objects) is ignored — the DSL
-/// only quantifies over integers.
-fn extract_bounds(json: &serde_json::Value) -> BTreeMap<String, u64> {
-    json.as_object()
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| {
-                    // Integers → as-is. Booleans → 0/1 (HF stores
-                    // model config booleans like `norm_topk_prob`,
-                    // `tie_word_embeddings`, `use_qk_norm` here; the
-                    // bounds map is the only u64 table downstream
-                    // consumers read).
-                    v.as_u64()
-                        .map(|n| (k.clone(), n))
-                        .or_else(|| v.as_bool().map(|b| (k.clone(), b as u64)))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Every top-level number field (int OR float) becomes a scalar.
@@ -2870,33 +2681,6 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
     {
         bounds.insert("head_dim".to_string(), hidden / heads);
     }
-    // MLA projection out-dims referenced by the deepseek crates'
-    // weights.json shape exprs — pure arithmetic over the verbatim
-    // checkpoint fields. `q_proj_out` is q_proj's (or q_b_proj's,
-    // under Q-LoRA) output width; `kv_a_proj_out` is the compressed
-    // KV + rope-K width; `kv_lora_out` is kv_b_proj's decompressed
-    // output; `attn_out` is o_proj's input (heads · v_head_dim,
-    // consumed by the non-flat deepseek-v3 manifest). Explicit
-    // values (synthetic test configs) always win.
-    if let (Some(&heads), Some(&nope), Some(&rope), Some(&vhd)) = (
-        bounds.get("num_attention_heads"),
-        bounds.get("qk_nope_head_dim"),
-        bounds.get("qk_rope_head_dim"),
-        bounds.get("v_head_dim"),
-    ) {
-        bounds
-            .entry("q_proj_out".to_string())
-            .or_insert(heads * (nope + rope));
-        bounds
-            .entry("kv_lora_out".to_string())
-            .or_insert(heads * (nope + vhd));
-        bounds.entry("attn_out".to_string()).or_insert(heads * vhd);
-        if let Some(&kv_lora_rank) = bounds.get("kv_lora_rank") {
-            bounds
-                .entry("kv_a_proj_out".to_string())
-                .or_insert(kv_lora_rank + rope);
-        }
-    }
     if !bounds.contains_key("num_key_value_heads")
         && let Some(&heads) = bounds.get("num_attention_heads")
     {
@@ -2926,44 +2710,7 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
     // Geometry dims referenced by weights.json shape exprs — pure
     // arithmetic over checkpoint fields, derived here so the configs/
     // files stay verbatim HF copies. Explicit values always win.
-    if !bounds.contains_key("attn_q_dim")
-        && let (Some(&heads), Some(&hd)) =
-            (bounds.get("num_attention_heads"), bounds.get("head_dim"))
-    {
-        bounds.insert("attn_q_dim".to_string(), heads * hd);
-    }
-    if !bounds.contains_key("q_gate_dim")
-        && let Some(&q) = bounds.get("attn_q_dim")
-    {
-        // `attn_output_gate` (Qwen3.5 family) doubles q_proj's output:
-        // per head `[query | gate]`.
-        let gate = bounds.get("attn_output_gate").copied().unwrap_or(0) != 0;
-        bounds.insert("q_gate_dim".to_string(), if gate { 2 * q } else { q });
-    }
-    if !bounds.contains_key("kv_dim")
-        && let (Some(&kvh), Some(&hd)) = (bounds.get("num_key_value_heads"), bounds.get("head_dim"))
-    {
-        bounds.insert("kv_dim".to_string(), kvh * hd);
-    }
-    if !bounds.contains_key("gdn_value_dim")
-        && let (Some(&vh), Some(&vd)) = (
-            bounds.get("linear_num_value_heads"),
-            bounds.get("linear_value_head_dim"),
-        )
-    {
-        bounds.insert("gdn_value_dim".to_string(), vh * vd);
-    }
-    // Gated-DeltaNet conv channel count: q and k at key width plus v
-    // at value width (`in_proj_qkv`'s output / `conv1d`'s channels).
-    if !bounds.contains_key("gdn_conv_dim")
-        && let (Some(&kh), Some(&kd), Some(&vdim)) = (
-            bounds.get("linear_num_key_heads"),
-            bounds.get("linear_key_head_dim"),
-            bounds.get("gdn_value_dim"),
-        )
-    {
-        bounds.insert("gdn_conv_dim".to_string(), 2 * kh * kd + vdim);
-    }
+    crate::dim::derive_dims(bounds, crate::dim::DeriveStage::Implicit);
 }
 
 /// Arch-AGNOSTIC bound defaults applied to every parsed config
@@ -3002,22 +2749,7 @@ fn apply_generic_bound_defaults(bounds: &mut BTreeMap<String, u64>) {
     // defaults above so uniform-geometry arches (where those fall back
     // to `head_dim` / `num_key_value_heads`) resolve these identically
     // to `attn_q_dim` / `kv_dim`. Explicit config values always win.
-    if !bounds.contains_key("q_global_dim")
-        && let (Some(&heads), Some(&ghd)) = (
-            bounds.get("num_attention_heads"),
-            bounds.get("global_head_dim"),
-        )
-    {
-        bounds.insert("q_global_dim".to_string(), heads * ghd);
-    }
-    if !bounds.contains_key("k_global_dim")
-        && let (Some(&gkvh), Some(&ghd)) = (
-            bounds.get("num_global_key_value_heads"),
-            bounds.get("global_head_dim"),
-        )
-    {
-        bounds.insert("k_global_dim".to_string(), gkvh * ghd);
-    }
+    crate::dim::derive_dims(bounds, crate::dim::DeriveStage::AfterDefaults);
 }
 
 /// Normalize a file stem into a valid Rust identifier:

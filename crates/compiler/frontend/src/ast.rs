@@ -82,7 +82,7 @@ pub enum InSet {
     /// A closed list of integer literals written in the DSL.
     Lit(Vec<u64>),
     /// A layer set the model's config derives
-    /// ([`crate::config::ModelParams::layer_sets`]), resolved per model.
+    /// (the macro crate's `config::ModelParams::layer_sets`), resolved per model.
     Named(Ident),
 }
 

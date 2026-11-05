@@ -950,6 +950,11 @@ def recip_scalar(v):
     return 1.0 / v
 
 
+def as_dim(x, *_bound):
+    """`as_dim(x, <bound>)`: `x`'s width stated as another bound — the same rows."""
+    return x
+
+
 def concat(a, b):
     """Two row sets side by side (shape.rs `sig_concat`: [T, D] ⧺ [T, D])."""
     return torch.cat([a, b], dim=-1)

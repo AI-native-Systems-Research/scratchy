@@ -7462,6 +7462,7 @@ pub fn fuf_uses_rotary(fuf: &Fuf) -> bool {
 /// TurboQuant threshold does NOT count them: its `num_layers` input stays `num_hidden_layers`,
 /// the input it was calibrated against — re-classifying existing models' codec is a policy
 /// change and belongs in its own PR, not a side effect of a new arch.
+#[derive(Default)]
 pub struct KvCacheLayers(Vec<u32>);
 
 impl KvCacheLayers {
@@ -7551,7 +7552,8 @@ fn kv_codec_for(
 /// it. The one serializer of the value the fill built (and the metal bake read).
 fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     use scratchy_ir::model_facts::{
-        Attention, AttnClass, KvRope, RopePairing, TargetRouting, Vision, VisionRopePairing,
+        Attention, AttnClass, KvRope, RopePairing, TargetRouting, TargetWidth, Vision,
+        VisionRopePairing,
     };
     let m = quote! { ::scratchy_forward_compiler::model_facts };
     let u32_ = |v: u32| proc_macro2::Literal::u32_unsuffixed(v);
@@ -7687,7 +7689,11 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
             TargetRouting::Dense => quote! { #m::TargetRouting::Dense },
             TargetRouting::Experts => quote! { #m::TargetRouting::Experts },
         };
-        quote! { #m::Target::new(#m::HiddenSize::new(#hidden), #routing) }
+        let ctor = match t.width() {
+            TargetWidth::Own => quote! { new },
+            TargetWidth::Lent => quote! { lent },
+        };
+        quote! { #m::Target::#ctor(#m::HiddenSize::new(#hidden), #routing) }
     }));
     let kv_layers = opt(f.kv_layers().map(|l| {
         let l = l.get().iter().map(|&v| u32_(v));
@@ -7756,6 +7762,34 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     }
 }
 
+/// How a head's width stands to its target's, from its program's `as_dim` casts: a head that
+/// states its rows at its target's width (`as_dim(<head-wide>, backbone_hidden_size)`) is lent it,
+/// and [`ModelFacts::new`](scratchy_ir::model_facts::ModelFacts::new) holds the two equal; a head
+/// with no cast reads its target through its own projection. A cast of any other two widths has
+/// no fact for that law to read, so it is refused.
+pub(crate) fn target_width(
+    program: &Program,
+    inferred: &crate::shape::Inferred,
+) -> scratchy_ir::model_facts::TargetWidth {
+    use crate::dim::Dim;
+    let bound = |d: &Dim, name: &str| matches!(d, Dim::Bound(b) if b == name);
+    for (local, stated) in &program.dim_casts {
+        let own = (inferred.locals.get(local)).and_then(|shape| shape.last());
+        assert!(
+            own.is_some_and(|d| bound(d, "hidden_size")) && bound(stated, "backbone_hidden_size"),
+            "as_dim: `{}` (line {}) states {own:?} as {stated:?}; the one cast a model's facts \
+             hold is a head's hidden width as its target's (`hidden_size` as \
+             `backbone_hidden_size`)",
+            program.locals.name(*local),
+            (program.locals.line(*local)).map_or("?".to_string(), |l| l.to_string()),
+        );
+    }
+    match program.dim_casts.is_empty() {
+        true => scratchy_ir::model_facts::TargetWidth::Own,
+        false => scratchy_ir::model_facts::TargetWidth::Lent,
+    }
+}
+
 /// Whether a body reads its target's final hidden rows (`RowsExtern::TargetHidden`): a head.
 fn fuf_reads_target_hidden(fuf: &Fuf) -> bool {
     fuf.nodes.iter().any(|n| {
@@ -7767,13 +7801,14 @@ fn fuf_reads_target_hidden(fuf: &Fuf) -> bool {
 
 /// A canonical's facts at `tp_world_size`, from its config, and the six MLA consts no fact covers
 /// yet, as its `CanonicalParams` impl states them.
-fn fill_canonical_params(
+pub(crate) fn fill_canonical_params(
     model: &ModelParams,
     tp_world_size: u8,
     uses_rotary: bool,
     kv_layers: &KvCacheLayers,
-    // Whether the body reads its target's hidden rows (a head): the facts state its target then.
-    reads_target_hidden: bool,
+    // For a body that reads its target's hidden rows (a head), how its width stands to its
+    // target's ([`target_width`]): the facts state its target then.
+    target: Option<scratchy_ir::model_facts::TargetWidth>,
 ) -> (scratchy_ir::model_facts::ModelFacts, TokenStream) {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
@@ -8192,14 +8227,18 @@ fn fill_canonical_params(
                 mf::TokenId::new(draft_mask_token),
             )
         });
-        let target = reads_target_hidden.then(|| {
-            mf::Target::new(
+        let target = target.map(|width| {
+            let (hidden, routing) = (
                 mf::HiddenSize::new(target_hidden_width),
                 match target_routes_experts {
                     true => mf::TargetRouting::Experts,
                     false => mf::TargetRouting::Dense,
                 },
-            )
+            );
+            match width {
+                mf::TargetWidth::Own => mf::Target::new(hidden, routing),
+                mf::TargetWidth::Lent => mf::Target::lent(hidden, routing),
+            }
         });
         // The layers holding KV, when a proper subset: leaked once, in this build-script process,
         // so the bake's facts hold the same `'static` table the emitted const states.
@@ -14102,7 +14141,7 @@ pub fn emit_model(
         tp_world_size,
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
-        fuf_reads_target_hidden(fuf),
+        fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
     );
     let canonical_params_impl = emit_canonical_params_impl(model_facts, &mla_consts);
     // Per-canonical: alias the generic `Instruction<Weights>` for
@@ -16589,7 +16628,7 @@ mod tests {
             "SCALE_DTYPE",
         ];
         let m = shard_test_model(32, 8, 128, 11008);
-        let (facts, mla) = fill_canonical_params(&m, 1, false, &every_layer(&m), false);
+        let (facts, mla) = fill_canonical_params(&m, 1, false, &every_layer(&m), None);
         let ts = emit_canonical_params_impl(facts, &mla).to_string();
         assert!(ts.contains("const FACTS"), "the impl states FACTS: {ts}");
         for name in DERIVED {
@@ -16605,7 +16644,7 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), false).0;
+        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), None).0;
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
             raw::num_q_heads(facts) == 32,
@@ -16637,7 +16676,7 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), false).0;
+        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), None).0;
         assert!(
             raw::num_q_heads(facts) == 16,
             "tp=2 must shard NUM_Q_HEADS to 16; got {}",
@@ -16683,7 +16722,7 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), false).0;
+        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), None).0;
         // 32 / 8 = 4
         assert!(
             raw::num_q_heads(facts) == 4,
@@ -18302,6 +18341,7 @@ mod fingerprint_tests {
             locals: Default::default(),
             weights,
             reshape_targets: Default::default(),
+            dim_casts: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),

@@ -1,110 +1,64 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Before the crate compiles, runs the typed-Rust emit pass (`src/typed_emit.rs`) over the
+//! Before the crate compiles, runs the typed-Rust emit pass (the front end's `typed_emit`) over the
 //! carriers, writing `$OUT_DIR/typed_carriers.rs`, which `src/typed_shapes.rs` includes: so the
 //! crate's own compile type-checks each carrier's shapes.
 //!
-//! The emit pass reads the program the crate's own front end builds, so this script compiles the
-//! crate's parser and classifier from the crate's own files, by path: one source, compiled into
-//! the crate and into this script. The script cannot link the crate itself, whose compile needs
-//! this script's output.
+//! The emit pass reads the program the front end builds: the `scratchy-forward-compiler-frontend`
+//! crate, which this crate depends on too, so the two share one compile of it. The script cannot
+//! link this crate itself, whose compile needs the script's output.
 
-#[path = "src/ast.rs"]
-pub mod ast;
-#[path = "src/classified.rs"]
-pub mod classified;
-#[path = "src/classify.rs"]
-pub mod classify;
-#[path = "src/dim.rs"]
-pub mod dim;
-#[path = "src/draft_capture.rs"]
-pub mod draft_capture;
-#[path = "src/parse_python.rs"]
-pub mod parse_python;
-#[path = "src/typed_emit.rs"]
-pub mod typed_emit;
-#[path = "src/weights_manifest.rs"]
-pub mod weights_manifest;
-
-/// The crate files this script compiles: a change to any re-runs it.
-const SHARED: [&str; 8] = [
-    "src/ast.rs",
-    "src/classified.rs",
-    "src/classify.rs",
-    "src/dim.rs",
-    "src/draft_capture.rs",
-    "src/parse_python.rs",
-    "src/typed_emit.rs",
-    "src/weights_manifest.rs",
-];
-
-/// The carriers the emit pass runs on. Phase A of the shapes-as-Rust-types plan (issue #1086) is a
-/// spike on one carrier; phase B runs every carrier under `crates/models/arch/dsl/`.
-const CARRIERS: [&str; 1] = ["llama"];
+use scratchy_forward_compiler_frontend::{
+    classified, classify, dim, draft_capture, hf_config, parse_python, typed_emit, weights_manifest,
+};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     emit_typed_carriers();
 }
 
-/// Write `$OUT_DIR/typed_carriers.rs`: every carrier in [`CARRIERS`] as typed Rust, the marker of
-/// every bound they and the op signatures name, and `typed_program`.
+/// Write `$OUT_DIR/typed_carriers.rs`: every carrier under `crates/models/arch/dsl/` as typed
+/// Rust, the marker of every bound they and the op signatures name, and `typed_program`. A carrier
+/// the emit pass cannot type fails the build, every such carrier named at once.
 fn emit_typed_carriers() {
     use std::path::PathBuf;
-    for f in SHARED {
-        println!("cargo:rerun-if-changed={f}");
-    }
     let manifest_dir =
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let arch_root = manifest_dir.join("../../models/arch");
+    let dsl_dir = arch_root.join("dsl");
+    println!("cargo:rerun-if-changed={}", dsl_dir.display());
+    let mut stems: Vec<String> = (std::fs::read_dir(&dsl_dir))
+        .unwrap_or_else(|e| panic!("typed emit: read {}: {e}", dsl_dir.display()))
+        .map(|e| e.unwrap_or_else(|e| panic!("typed emit: {}: {e}", dsl_dir.display())))
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            Some(name.strip_suffix(".py")?.to_string())
+        })
+        .collect();
+    stems.sort();
     let mut bounds = std::collections::BTreeSet::new();
     let mut modules = String::new();
     let mut dispatch = Vec::new();
-    for stem in CARRIERS {
-        let dsl = arch_root.join("dsl").join(format!("{stem}.py"));
-        let configs = arch_root.join("configs").join(stem);
-        println!("cargo:rerun-if-changed={}", dsl.display());
-        println!(
-            "cargo:rerun-if-changed={}",
-            configs.join("weights.json").display()
+    let mut refused = Vec::new();
+    for stem in &stems {
+        match emit_carrier(&arch_root, stem, &mut bounds) {
+            Ok((emitted, arch, module)) => {
+                modules.push_str(&emitted);
+                dispatch.push((arch, module));
+            }
+            Err(why) => refused.push(why),
+        }
+    }
+    if !refused.is_empty() {
+        panic!(
+            "typed emit: {} of {} carriers do not type:\n{}",
+            refused.len(),
+            stems.len(),
+            refused.join("\n")
         );
-        let source = std::fs::read_to_string(&dsl)
-            .unwrap_or_else(|e| panic!("typed emit: read {}: {e}", dsl.display()));
-        let carrier = parse_python::parse_python_file(&source)
-            .unwrap_or_else(|e| panic!("typed emit: {}: {e}", dsl.display()));
-        let prelude = if carrier.vision {
-            classified::Prelude::Vision
-        } else {
-            classified::Prelude::Decoder
-        };
-        // The program the bake classifies: a decoder's with the compiler's drafter capture.
-        let ast = match prelude {
-            classified::Prelude::Decoder => draft_capture::insert(&carrier.ast),
-            classified::Prelude::Vision => carrier.ast,
-        };
-        let program = classify::classify_with(&ast, prelude)
-            .unwrap_or_else(|e| panic!("typed emit: classify {}: {e}", dsl.display()));
-        let manifest = weights_manifest::load_or_empty(&configs)
-            .unwrap_or_else(|e| panic!("typed emit: {}: {e:?}", configs.display()));
-        let module = stem.replace('-', "_");
-        let file = format!("crates/models/arch/dsl/{stem}.py");
-        let emitted = typed_emit::emit(
-            &typed_emit::Carrier {
-                module: &module,
-                arch: &carrier.arch_name,
-                file: &file,
-                source: &source,
-                program: &program,
-                manifest: &manifest,
-            },
-            &mut bounds,
-        )
-        .unwrap_or_else(|e| panic!("typed emit: {e}"));
-        modules.push_str(&emitted);
-        dispatch.push((carrier.arch_name.clone(), module));
     }
     let out = format!(
         "// @generated by scratchy-forward-compiler-macro/build.rs from the carriers — DO NOT EDIT.\n\n{}\n{}\n{}",
-        typed_emit::emit_markers(&bounds),
+        typed_emit::emit_markers(&bounds).unwrap_or_else(|e| panic!("typed emit: {e}")),
         modules,
         typed_emit::emit_dispatch(&dispatch),
     );
@@ -114,3 +68,153 @@ fn emit_typed_carriers() {
         .unwrap_or_else(|e| panic!("typed emit: write {}: {e}", dst.display()));
 }
 
+/// The carrier `stem` (`dsl/<stem>.py` over `configs/<stem>/`) as typed Rust, with its arch name
+/// and module; adds the bounds it names to `bounds`.
+fn emit_carrier(
+    arch_root: &std::path::Path,
+    stem: &str,
+    bounds: &mut std::collections::BTreeSet<String>,
+) -> Result<(String, String, String), String> {
+    let dsl = arch_root.join("dsl").join(format!("{stem}.py"));
+    let configs = arch_root.join("configs").join(stem);
+    println!("cargo:rerun-if-changed={}", dsl.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        configs.join("weights.json").display()
+    );
+    let source =
+        std::fs::read_to_string(&dsl).map_err(|e| format!("read {}: {e}", dsl.display()))?;
+    let carrier =
+        parse_python::parse_python_file(&source).map_err(|e| format!("{}: {e}", dsl.display()))?;
+    let prelude = if carrier.vision {
+        classified::Prelude::Vision
+    } else {
+        classified::Prelude::Decoder
+    };
+    // The program the bake classifies: a decoder's with the compiler's drafter capture.
+    let ast = match prelude {
+        classified::Prelude::Decoder => draft_capture::insert(&carrier.ast),
+        classified::Prelude::Vision => carrier.ast,
+    };
+    let program = classify::classify_with(&ast, prelude)
+        .map_err(|e| format!("classify {}: {e}", dsl.display()))?;
+    let manifest = weights_manifest::load_or_empty(&configs)
+        .map_err(|e| format!("{}: {e:?}", configs.display()))?;
+    let facts = carrier_facts(arch_root, stem, carrier.vision);
+    let module = stem.replace('-', "_");
+    let file = format!("crates/models/arch/dsl/{stem}.py");
+    let emitted = typed_emit::emit(
+        &typed_emit::Carrier {
+            module: &module,
+            arch: &carrier.arch_name,
+            file: &file,
+            source: &source,
+            program: &program,
+            manifest: &manifest,
+            facts: &facts,
+        },
+        bounds,
+    )?;
+    Ok((emitted, carrier.arch_name, module))
+}
+
+
+/// What the carrier `stem`'s configs and arch.json say about its derived dims, by the config rules
+/// the config loader uses (`hf_config`): each gated rule's flag over every config of the carrier (a
+/// head's: each config of the archs it ships in that carries it), and its arch.json `expr` params.
+fn carrier_facts(
+    arch_root: &std::path::Path,
+    stem: &str,
+    vision: bool,
+) -> typed_emit::CarrierFacts {
+    let configs_dir = arch_root.join("configs").join(stem);
+    let arch_json = configs_dir.join("arch.json");
+    println!("cargo:rerun-if-changed={}", arch_json.display());
+    let read = |path: &std::path::Path| -> serde_json::Value {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("typed emit: read {}: {e}", path.display()));
+        serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("typed emit: parse {}: {e}", path.display()))
+    };
+    let facts = match arch_json.exists() {
+        true => hf_config::arch_facts(&read(&arch_json))
+            .unwrap_or_else(|e| panic!("typed emit: {}: {e}", arch_json.display())),
+        false => hf_config::ArchFacts::default(),
+    };
+    let model_configs = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+        println!("cargo:rerun-if-changed={}", dir.display());
+        let mut paths: Vec<_> = (std::fs::read_dir(dir).into_iter().flatten().flatten())
+            .map(|e| e.path())
+            .filter(|p| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                name.ends_with(".json")
+                    && !name.ends_with(".overrides.json")
+                    && !matches!(name, "weights.json" | "quantizations.json" | "arch.json")
+            })
+            .collect();
+        paths.sort();
+        paths
+    };
+    let mut configs: Vec<(std::path::PathBuf, serde_json::Value)> = model_configs(&configs_dir)
+        .into_iter()
+        .map(|p| {
+            let j = read(&p);
+            (p, j)
+        })
+        .collect();
+    if configs.is_empty() {
+        for target in &facts.checkpoint_of {
+            for p in model_configs(&arch_root.join("configs").join(target)) {
+                let json = read(&p);
+                if hf_config::carries_head(&facts.params, &facts.config_aliases, &json) {
+                    configs.push((p, json));
+                }
+            }
+        }
+    }
+    for (p, _) in &configs {
+        println!("cargo:rerun-if-changed={}", p.display());
+    }
+    // The config loader reads a gated rule's flag on the decoder path only (a vision tower's
+    // bounds are its own `vision_*`): a vision carrier resolves none, and naming one is refused.
+    let mut gated = std::collections::BTreeMap::new();
+    for flag in (dim::DERIVED_DIMS.iter())
+        .filter_map(|d| d.rule.gate_flag())
+        .filter(|_| !vision)
+    {
+        let mut sides: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
+        for (p, json) in &configs {
+            let v = hf_config::flag_value(json, &facts.config_aliases, &facts.bound_defaults, flag);
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            sides.entry(v).or_default().push(name);
+        }
+        let resolved = match sides.len() {
+            0 | 1 => Ok(sides.keys().next().copied().unwrap_or(0)),
+            _ => Err(format!(
+                "the configs disagree on `{flag}`: {}",
+                (sides.iter())
+                    .map(|(v, names)| format!("{v} in {}", names.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )),
+        };
+        gated.insert(flag.to_string(), resolved);
+    }
+    let exprs = (facts.params.iter())
+        .filter_map(|f| match &f.source {
+            hf_config::ParamSource::Expr(e) => Some((f.name.clone(), e)),
+            _ => None,
+        })
+        .map(|(name, e)| {
+            let parsed = hf_config::ParamExpr::parse(e).unwrap_or_else(|err| {
+                panic!("typed emit: {}: param `{name}`: {err}", arch_json.display())
+            });
+            (name, parsed)
+        })
+        .collect();
+    typed_emit::CarrierFacts { gated, exprs }
+}

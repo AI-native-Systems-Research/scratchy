@@ -2,7 +2,7 @@
 //! dependencies.
 //!
 //! THE DECISION, recorded: this crate parses Triton kernels the way the torch carriers
-//! are parsed (`crates/compiler/macros/src/parse_python.rs`) -- a lexer and a
+//! are parsed (`crates/compiler/frontend/src/parse_python.rs`) -- a lexer and a
 //! recursive-descent parser for a strict subset, in this crate, with every error a
 //! [`crate::Error`] naming the construct and its `line:col`. It replaced the vendored
 //! third-party parser crate, which pulled 44 lockfile versions for a parse step whose

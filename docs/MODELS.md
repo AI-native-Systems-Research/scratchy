@@ -364,7 +364,7 @@ def <arch>():
 `@forward` takes optional `workloads=[...]` / `sk_buckets=[...]` overrides of
 the default bucket ladders. The file is a strict subset of Python: the
 compiler parses it and never runs it, and anything outside the dialect
-(documented in `crates/compiler/macros/src/parse_python.rs`) is a build
+(documented in `crates/compiler/frontend/src/parse_python.rs`) is a build
 error with a `line:col`.
 
 The DSL body expresses the forward pass as pure math — `embed`,
@@ -407,7 +407,7 @@ aliases.
   latent projections, etc.) — every entry is a claim that dataflow
   can't derive this one.
 - **Don't** put cross-arch weight shapes in
-  `crates/compiler/macros/src/weights_manifest.rs`. It's reserved for
+  `crates/compiler/frontend/src/weights_manifest.rs`. It's reserved for
   truly universal conventions (e.g. `embed_tokens`, `lm_head`) —
   everything arch-specific lives in the arch's `weights.json`.
 - **Don't** edit `scratchy-serving-worker/src/gpu_worker.rs` for a new arch.

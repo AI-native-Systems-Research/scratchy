@@ -126,7 +126,7 @@ impl WeightsManifest {
     /// Test helper: build a manifest from a literal list of
     /// (dotted-path, shape-formula-strings). Parses each formula
     /// via the same path as [`load_file`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_literals(entries: &[(&str, &[&str])]) -> Self {
         let mut out = BTreeMap::new();
         for (path, dims) in entries {
@@ -147,7 +147,7 @@ impl WeightsManifest {
     /// shapes every Llama/Qwen2/Gemma2/Granite test body exercises.
     /// Exposed for test call sites; real macro runs load a per-arch
     /// `weights.json` off disk instead.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn llama_test_conventions() -> Self {
         Self::from_literals(&[
             ("embed_tokens", &["vocab_size", "hidden_size"]),
@@ -589,5 +589,70 @@ mod tests {
         let err = load_file(&path).expect_err("dim=7 is out of range");
         let msg = format!("{err}");
         assert!(msg.contains("dim must be 0 or 1"), "got: {msg}");
+    }
+
+    /// Every `<prefix>.bias` in `manifest` whose declaration is not one dim equal to the declared
+    /// `<prefix>`'s last (its output width), or whose `<prefix>` is undeclared.
+    fn biases_off_their_weight(manifest: &WeightsManifest) -> Vec<String> {
+        (manifest.entries.iter())
+            .filter_map(|(key, bias)| {
+                let prefix = key.strip_suffix(".bias")?;
+                let out = (manifest.entries.get(prefix)).and_then(|w| w.last());
+                let agrees = out.is_some_and(|out| bias.as_slice() == std::slice::from_ref(out));
+                (!agrees).then(|| format!("{key}: {bias:?} vs `{prefix}`'s {out:?}"))
+            })
+            .collect()
+    }
+
+    /// A bias states its weight's output width a second time, so the two must agree in every
+    /// checked-in `weights.json`, typed carrier or not: fixing a weight's declaration without its
+    /// bias's is a failure here.
+    #[test]
+    fn every_declared_bias_is_its_weights_output_width() {
+        let configs =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch/configs");
+        let mut checked = 0;
+        let mut drift = Vec::new();
+        for dir in std::fs::read_dir(&configs).expect("configs") {
+            let path = dir.expect("entry").path().join("weights.json");
+            if !path.exists() {
+                continue;
+            }
+            let manifest = load_file(&path).expect("manifest");
+            checked += (manifest.entries.keys())
+                .filter(|k| k.ends_with(".bias"))
+                .count();
+            drift.extend(
+                (biases_off_their_weight(&manifest).into_iter())
+                    .map(|d| format!("{}: {d}", path.display())),
+            );
+        }
+        assert!(
+            checked > 0,
+            "no bias declarations under {}",
+            configs.display()
+        );
+        assert!(drift.is_empty(), "{drift:#?}");
+    }
+
+    /// The check fires: a bias left at its weight's old width, and a bias with no weight.
+    #[test]
+    fn a_bias_off_its_weights_output_width_is_reported() {
+        let agree = WeightsManifest::from_literals(&[
+            ("q_proj", &["hidden_size", "head_dim * num_attention_heads"]),
+            ("q_proj.bias", &["head_dim * num_attention_heads"]),
+        ]);
+        assert!(biases_off_their_weight(&agree).is_empty());
+        let drifted = WeightsManifest::from_literals(&[
+            ("q_proj", &["hidden_size", "head_dim * num_attention_heads"]),
+            ("q_proj.bias", &["hidden_size"]),
+            ("orphan.bias", &["hidden_size"]),
+        ]);
+        let found = biases_off_their_weight(&drifted);
+        assert_eq!(found.len(), 2, "{found:#?}");
+        assert!(
+            found[0].starts_with("orphan.bias") && found[1].starts_with("q_proj.bias"),
+            "{found:#?}"
+        );
     }
 }

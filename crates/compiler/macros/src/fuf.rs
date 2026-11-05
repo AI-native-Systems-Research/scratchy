@@ -747,6 +747,7 @@ mod tests {
                         Dim::Lit(_)
                         | Dim::Bound(_)
                         | Dim::Mul(_)
+                        | Dim::Add(_)
                         | Dim::Div(_, _)
                         | Dim::Var(_) => {}
                     }

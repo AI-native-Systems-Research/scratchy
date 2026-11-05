@@ -3397,6 +3397,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-forward-compiler-frontend"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "scratchy-tensors",
+ "serde_json",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "scratchy-forward-compiler-macro"
 version = "0.1.0"
 dependencies = [
@@ -3405,6 +3415,7 @@ dependencies = [
  "quote",
  "rayon",
  "scratchy-forward-compiler",
+ "scratchy-forward-compiler-frontend",
  "scratchy-ir",
  "scratchy-subtile",
  "scratchy-target-metal",
