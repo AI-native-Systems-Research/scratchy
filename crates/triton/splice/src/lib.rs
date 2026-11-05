@@ -2455,7 +2455,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 .expect("the arm's pattern binds one of the two rope kinds")
                 .get();
             let total = c;
-            if hd == 0 || total % hd != 0 {
+            if total % hd != 0 {
                 return Err(format!(
                     "triton splice: rope t{}: {total} cols is not a whole number of \
                      {hd}-wide heads",

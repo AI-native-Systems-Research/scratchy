@@ -76,6 +76,17 @@ positive! {
     InFeatures(usize),
 }
 
+impl HeadDim {
+    /// The width as a non-zero — the constructor already refused zero, so no
+    /// caller needs to re-check the law this type states.
+    pub const fn nonzero(self) -> std::num::NonZeroU32 {
+        match std::num::NonZeroU32::new(self.0) {
+            Some(nz) => nz,
+            None => panic!("HeadDim is a positive quantity"),
+        }
+    }
+}
+
 /// A finite `f32`: the constructor refuses NaN and infinity, and, where `$positive`, a value not
 /// above zero.
 macro_rules! scalar {

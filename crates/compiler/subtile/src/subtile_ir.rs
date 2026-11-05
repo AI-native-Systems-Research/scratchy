@@ -4808,8 +4808,8 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 let head_dim_nz = node
                     .op
                     .rope_head_dim()
-                    .and_then(|d| std::num::NonZeroU32::new(d.get()))
-                    .expect("head_tile_rope: head_dim must be non-zero");
+                    .expect("the arm binds one of the two rope kinds")
+                    .nonzero();
                 next_new_id += head_blocks(total_cols, nb, head_dim_nz).len() as u32;
             }
             _ => next_new_id += 1,
@@ -4829,8 +4829,8 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 let head_dim_nz = node
                     .op
                     .rope_head_dim()
-                    .and_then(|d| std::num::NonZeroU32::new(d.get()))
-                    .expect("head_tile_rope: head_dim must be non-zero");
+                    .expect("the arm binds one of the two rope kinds")
+                    .nonzero();
                 let q_col_start = q_in.region.cols.start;
                 let out_col_start = node.output.region.cols.start;
                 for blk in head_blocks(total_cols, nb, head_dim_nz) {
@@ -4883,8 +4883,8 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 let head_dim_nz = node
                     .op
                     .rope_head_dim()
-                    .and_then(|d| std::num::NonZeroU32::new(d.get()))
-                    .expect("head_tile_rope: head_dim must be non-zero");
+                    .expect("the arm binds one of the two rope kinds")
+                    .nonzero();
                 let k_col_start = k_in.region.cols.start;
                 let v_col_start = v_in.region.cols.start;
                 let out_col_start = node.output.region.cols.start;
