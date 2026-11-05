@@ -501,13 +501,34 @@ impl CompileMode {
     };
 }
 
+/// A carrier pipeline failure. [`CarrierError::Config`] carries the failing config's stem
+/// as a FIELD — the build script names the config without parsing message text, and
+/// compile_carrier is called once per ARCH, so this (not the build script's own wrap) is
+/// where the per-config stem enters.
+#[derive(Debug)]
+pub enum CarrierError {
+    /// An arch-level failure, before any config: classification, the arch's declarations.
+    Arch(syn::Error),
+    /// One config's failure: the stem and the pass's own error.
+    Config { stem: String, source: syn::Error },
+}
+
+impl std::fmt::Display for CarrierError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CarrierError::Arch(e) => write!(f, "{e}"),
+            CarrierError::Config { stem, source } => write!(f, "{stem}: {source}"),
+        }
+    }
+}
+
 /// The whole pipeline: a parsed `dsl/<arch>.py` carrier, compiled against
 /// its arch's `configs/<arch>/` directory — in vision mode for a
 /// `@vision_forward` carrier, decoder mode for `@forward`.
 pub fn compile_carrier(
     carrier: PythonCarrier,
     models_dir: &std::path::Path,
-) -> syn::Result<proc_macro2::TokenStream> {
+) -> Result<proc_macro2::TokenStream, CarrierError> {
     let args = &ForwardArgs::from_carrier(&carrier);
     let mode = if carrier.vision {
         CompileMode::VISION
@@ -520,7 +541,8 @@ pub fn compile_carrier(
     // decoder's layer loop captures what a drafter compiled beside it reads (`draft_capture`), the
     // compiler's, whatever the arch's DSL says.
     let classified = classify::carrier_program(&carrier)
-        .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))?;
+        .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))
+        .map_err(CarrierError::Arch)?;
     let PythonCarrier { arch_name, .. } = carrier;
 
     // `pixel_pack = path::to::fn` is OPTIONAL under VISION mode.
@@ -538,12 +560,14 @@ pub fn compile_carrier(
     // DSL, which declares only the arch's MATH. Missing file → an arch
     // that declares nothing (every fact derivable), which is the
     // common case.
-    let spec = config::load_arch_json(models_dir).map_err(|e| {
-        syn::Error::new(
-            name_span,
-            format!("models_dir `{}`: {e}", models_dir.display()),
-        )
-    })?;
+    let spec = config::load_arch_json(models_dir)
+        .map_err(|e| {
+            syn::Error::new(
+                name_span,
+                format!("models_dir `{}`: {e}", models_dir.display()),
+            )
+        })
+        .map_err(CarrierError::Arch)?;
     let models = match mode.prelude {
         // `#[vision_forward]` configs are verbatim VL-wrapper HF
         // checkpoints; the vision loader derives the `vision_*`
@@ -558,7 +582,8 @@ pub fn compile_carrier(
             name_span,
             format!("models_dir `{}`: {e}", models_dir.display()),
         )
-    })?;
+    })
+    .map_err(CarrierError::Arch)?;
     if models.is_empty() {
         // A `<stem>`/`quant-*`/arch selection filtering out every model in
         // this dir is OK — emit an empty crate so a build scoped to (say)
@@ -579,17 +604,19 @@ pub fn compile_carrier(
         if has_any_config {
             return Ok(quote! {});
         }
-        return Err(syn::Error::new(
+        return Err(CarrierError::Arch(syn::Error::new(
             name_span,
             format!("no *.json configs in {}", models_dir.display()),
-        ));
+        )));
     }
-    let manifest = weights_manifest::load_or_empty(models_dir).map_err(|e| {
-        syn::Error::new(
-            name_span,
-            format!("weights.json in {}: {e}", models_dir.display()),
-        )
-    })?;
+    let manifest = weights_manifest::load_or_empty(models_dir)
+        .map_err(|e| {
+            syn::Error::new(
+                name_span,
+                format!("weights.json in {}: {e}", models_dir.display()),
+            )
+        })
+        .map_err(CarrierError::Arch)?;
 
     // Per-arch declarations (resolved with per-checkpoint drift in
     // `config::resolve_arch_spec`) flow to codegen through the
@@ -655,22 +682,24 @@ pub fn compile_carrier(
     // The arch's shapes: its typed program's trace, every local, weight and nested value at the
     // shape its type states, which rustc checked when this crate compiled (`typed_shapes`). They
     // are symbolic in the bounds, so one trace serves every model of the arch.
-    let inferred = typed_shapes::traced(&arch_name).ok_or_else(|| {
-        syn::Error::new(
-            args.span,
-            format!(
-                "[{arch_name}] has no typed program: the build script types every carrier under \
-                 crates/models/arch/dsl/, and this one is not among them"
-            ),
-        )
-    })?;
+    let inferred = typed_shapes::traced(&arch_name)
+        .ok_or_else(|| {
+            syn::Error::new(
+                args.span,
+                format!(
+                    "[{arch_name}] has no typed program: the build script types every carrier under \
+                     crates/models/arch/dsl/, and this one is not among them"
+                ),
+            )
+        })
+        .map_err(CarrierError::Arch)?;
     // The trace is keyed by `LocalId`: it must be of this very program, or each local would read
     // another's shape.
     let names: Vec<String> = (classified.locals.ids())
         .map(|id| classified.locals.name(id).to_string())
         .collect();
     if !inferred.locals_of(&names) {
-        return Err(syn::Error::new(
+        return Err(CarrierError::Arch(syn::Error::new(
             args.span,
             format!(
                 "[{arch_name}] the typed program's trace is of another program ({} locals) than \
@@ -678,7 +707,7 @@ pub fn compile_carrier(
                 inferred.program.len(),
                 names.len()
             ),
-        ));
+        )));
     }
 
     // ⛔ DETECTION ONLY, AND THAT IS THE WHOLE POINT. A metal build runs no solver, so the
@@ -689,12 +718,14 @@ pub fn compile_carrier(
     // Compile-time profile only — does NOT require Metal 4 (unlike the runtime
     // `detect_device()`), so models build on non-Metal-4 hosts.
     #[cfg(feature = "metal")]
-    scratchy_target_metal::device::detect_metal_profile().ok_or_else(|| {
-        syn::Error::new(
-            name_span,
-            "No Metal device detected. Metal backend requires macOS with Apple Silicon.",
-        )
-    })?;
+    scratchy_target_metal::device::detect_metal_profile()
+        .ok_or_else(|| {
+            syn::Error::new(
+                name_span,
+                "No Metal device detected. Metal backend requires macOS with Apple Silicon.",
+            )
+        })
+        .map_err(CarrierError::Arch)?;
 
     #[cfg(not(any(feature = "metal", feature = "spyre")))]
     compile_error!(
@@ -911,19 +942,26 @@ pub fn compile_carrier(
             // A regrouping that is the identity for this model (a split by a factor of 1) is its
             // source's view: no node.
             shape::erase_identity_regroupings(&mut model_prog, model_inferred, &model.bounds);
-            let model_cfg = cfg::build_cfg(&model_prog, model).map_err(|e| {
-                syn::Error::new(args.span, format!("cfg [{}]: {e}", model.source_stem))
-            })?;
-            let mut model_fuf = fuf::unroll(&model_cfg, model_inferred).map_err(|e| {
-                syn::Error::new(args.span, format!("unroll [{}]: {e}", model.source_stem))
-            })?;
+            let model_cfg =
+                cfg::build_cfg(&model_prog, model).map_err(|e| CarrierError::Config {
+                    stem: model.source_stem.clone(),
+                    source: syn::Error::new(args.span, format!("cfg: {e}")),
+                })?;
+            let mut model_fuf =
+                fuf::unroll(&model_cfg, model_inferred).map_err(|e| CarrierError::Config {
+                    stem: model.source_stem.clone(),
+                    source: syn::Error::new(args.span, format!("unroll: {e}")),
+                })?;
             model_fuf.annotate_storage_formats(&model_prog, model);
             // A drafter reading its target's KV reads, at every layer, the target layer its class
             // reads: its configs name them.
             if model.arch.reads_target_kv {
-                model_fuf.read_target_kv(model).map_err(|e| {
-                    syn::Error::new(args.span, format!("target KV [{}]: {e}", model.source_stem))
-                })?;
+                model_fuf
+                    .read_target_kv(model)
+                    .map_err(|e| CarrierError::Config {
+                        stem: model.source_stem.clone(),
+                        source: syn::Error::new(args.span, format!("target KV: {e}")),
+                    })?;
             }
             // Tensor-parallel lowering pass. At tp=1 (every existing
             // SolvedModel until task #7's canonical fanout lands) this is
@@ -1062,13 +1100,17 @@ pub fn compile_carrier(
         // Canonicals only: a shim's `Weights` IS its canonical's (same dedup signature, so the
         // same glue byte for byte), and a second impl for that type is E0119.
         let vision_glue = if is_canonical && matches!(mode.prelude, classified::Prelude::Vision) {
-            let processor = args.processor.as_ref().ok_or_else(|| {
-                syn::Error::new(
-                    args.span,
-                    "#[vision_forward] missing required `processor = path::PROCESSOR` arg \
+            let processor = args
+                .processor
+                .as_ref()
+                .ok_or_else(|| {
+                    syn::Error::new(
+                        args.span,
+                        "#[vision_forward] missing required `processor = path::PROCESSOR` arg \
                      (path to a `pub const PROCESSOR: scratchy_vision::MmMetadata`)",
-                )
-            })?;
+                    )
+                })
+                .map_err(CarrierError::Arch)?;
             vision_glue::emit_per_variant(
                 sm.model,
                 &arch_name,
@@ -1501,7 +1543,8 @@ pub fn compile_carrier(
             name_span,
             gdn_runtime_config_tokens,
             head_registration,
-        )?
+        )
+        .map_err(CarrierError::Arch)?
     } else {
         proc_macro2::TokenStream::new()
     };

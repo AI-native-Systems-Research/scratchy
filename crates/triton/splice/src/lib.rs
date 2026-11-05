@@ -265,8 +265,8 @@ pub fn elementwise_row(kind: EwKind) -> TritonKernelRow {
              and there is no `erf` op to decompose with — the realization is a kernel \
              family of its own",
         ),
-        // No elementwise kernel for squared ReLU in `elementwise.py`; the arch using it
-        // (Nemotron-H) is not spyre-capable.
+        // No elementwise kernel for squared ReLU in `elementwise.py` — an arch using it
+        // (Nemotron-H) fails the build at this row, by name.
         EwKind::Relu2 => TritonKernelRow::Refused(
             "relu2: no squared-ReLU kernel in the elementwise family — a realization is a \
              new `elementwise.py` entry",

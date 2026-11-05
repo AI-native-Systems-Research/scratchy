@@ -955,15 +955,12 @@ fn model_configs(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     Ok(configs)
 }
 
-/// Arches that also compile for spyre (KTIR). Must agree with the arches `scratchy-models`'
-/// `spyre` feature enables.
-const SPYRE_CAPABLE_ARCHES: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
-
-/// Whether `arch` compiles in this build: its `arch-<name>` feature is on, and so is a backend it
-/// compiles for. `scratchy-models`' build script runs an arch's pipeline only then (its
-/// `src/lib.rs` gates each arch's `pub mod` the same way), and a target bakes in the facts of the
-/// heads that compile beside it alone. Read from Cargo's `CARGO_FEATURE_*`, in the build script's
-/// process.
+/// Whether `arch` compiles in this build: its `arch-<name>` feature is on, and so is a
+/// backend. `scratchy-models`' build script runs an arch's pipeline only then (its
+/// `src/lib.rs` gates each arch's `pub mod` the same way), and a target bakes in the facts
+/// of the heads that compile beside it alone. Read from Cargo's `CARGO_FEATURE_*`, in the
+/// build script's process. Whether an arch ACTUALLY lowers is each lowering's verdict —
+/// an op with no spyre lowering is a build error naming it, not a silent skip here.
 pub fn arch_compiled(arch: &str) -> bool {
     arch_compiled_with(arch, |feature| {
         let var = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
@@ -973,9 +970,7 @@ pub fn arch_compiled(arch: &str) -> bool {
 
 /// [`arch_compiled`] under the features `on` reports.
 fn arch_compiled_with(arch: &str, on: impl Fn(&str) -> bool) -> bool {
-    let spyre = SPYRE_CAPABLE_ARCHES.contains(&arch) && on("spyre");
-    let backend = on("metal") || spyre;
-    on(&format!("arch-{arch}")) && backend
+    on(&format!("arch-{arch}")) && (on("metal") || on("spyre"))
 }
 
 /// Every arch dir under `configs/`.
@@ -3254,27 +3249,87 @@ mod tests {
         assert_eq!(mp.bounds["mamba_in_proj_dim"], 18560);
     }
 
-    /// An arch compiles under its `arch-<name>` feature and a backend it compiles for — so the
-    /// metal-only DFlash2 drafter does not under cuda, and bakes no capture into its target there,
-    /// whatever `all` and `mtp` turn on.
+    /// An arch compiles under its `arch-<name>` feature and a backend — the ONE law, no
+    /// capability list. The arch name comes from `configs/` (the tree is the list), never
+    /// a literal, so the test cannot shadow it.
     #[test]
     fn an_arch_compiles_with_its_feature_and_a_backend_of_its_own() {
-        let build = |features: &'static [&'static str]| move |f: &str| features.contains(&f);
-        let metal = build(&["metal", "arch-dflash2", "arch-qwen3-5-moe", "arch-llama"]);
-        assert!(arch_compiled_with("dflash2", metal));
-        assert!(arch_compiled_with("qwen3-5-moe", metal));
-        assert!(arch_compiled_with("llama", metal));
-        let spyre = build(&["spyre", "arch-dflash2", "arch-llama", "arch-qwen3"]);
+        let configs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/arch/configs");
+        let arch = arch_dirs(&configs)
+            .expect("walk configs/")
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .expect("dir name")
+                    .to_string()
+            })
+            .next()
+            .expect("at least one arch dir");
+        let feature = format!("arch-{arch}");
+        let with = |backend: &'static str| {
+            let f = feature.clone();
+            move |feat: &str| feat == backend || feat == f
+        };
+        assert!(arch_compiled_with(&arch, with("metal")));
+        assert!(arch_compiled_with(&arch, with("spyre")));
+        // Both backends off: not compiled, whatever the arch feature.
+        let neither = {
+            let f = feature.clone();
+            move |feat: &str| feat == f
+        };
+        assert!(!arch_compiled_with(&arch, neither));
+        // Its arch feature off: not compiled, whatever the backend.
+        let no_arch_feature = |feat: &str| feat == "metal";
         assert!(
-            !arch_compiled_with("dflash2", spyre),
-            "a metal-only arch does not compile under spyre"
-        );
-        assert!(arch_compiled_with("llama", spyre));
-        assert!(!arch_compiled_with("qwen3", spyre));
-        assert!(
-            !arch_compiled_with("qwen3", build(&["metal"])),
+            !arch_compiled_with(&arch, no_arch_feature),
             "its arch feature is off"
         );
+    }
+
+    /// C4: `arch_compiled*` names no arch. The capability mechanism is the lowerings'
+    /// by-name refusals, so the two functions' own source must carry no arch-name
+    /// string — a list sneaking back in fails here.
+    #[test]
+    fn arch_compiled_names_no_arch() {
+        let src = fs::read_to_string(format!("{}/src/config.rs", env!("CARGO_MANIFEST_DIR")))
+            .expect("read own source");
+        let start = src
+            .find("pub fn arch_compiled(")
+            .expect("arch_compiled is defined");
+        let with = src[start..]
+            .find("fn arch_compiled_with(")
+            .map(|i| start + i)
+            .expect("arch_compiled_with follows");
+        let end = src[with..]
+            .find("\n}\n")
+            .map(|i| with + i)
+            .expect("arch_compiled_with closes");
+        let body = &src[start..end];
+        for arch in ["llama", "granite", "gemma4", "gemma4-moe"] {
+            assert!(
+                !body.contains(&format!("\"{arch}\"")),
+                "arch_compiled* names {arch} — the capability list is back"
+            );
+        }
+    }
+
+    /// The tree law: EVERY arch dir under `configs/` compiles under `spyre` when its
+    /// `arch-<name>` feature is on — the build script's target filter admits it, and what
+    /// happens next (lowering or a named refusal) is the lowering's verdict. No name is
+    /// written here; the tree is the list.
+    #[test]
+    fn every_arch_in_the_tree_compiles_under_spyre_with_its_feature_on() {
+        let configs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/arch/configs");
+        for dir in arch_dirs(&configs).expect("walk configs/") {
+            let arch = dir.file_name().and_then(|s| s.to_str()).expect("dir name");
+            let feature = format!("arch-{arch}");
+            let spyre = move |feat: &str| feat == "spyre" || feat == feature;
+            assert!(
+                arch_compiled_with(arch, spyre),
+                "{arch} compiles under spyre with its feature on"
+            );
+        }
     }
 
     /// Qwen3.6's MTP head compiles on its target's config verbatim, whose block schedule names the

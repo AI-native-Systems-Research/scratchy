@@ -54,6 +54,40 @@ mod baked_tokenizer_tables {
     }
 }
 
+/// C4, the gate-agreement law: every `arch-*` gate in this file spells ONE backend law —
+/// `any(feature = "metal", feature = "spyre")` — read off the actual cfg tokens, so the
+/// two copies of the arch law (this file and `arch_compiled_with` in the macros crate)
+/// can never drift again, and a future arch gate that narrows to one backend fails here.
+/// `__metal_bake` is not an arch gate (baked metallibs have no spyre consumer) and is
+/// exempt.
+#[cfg(test)]
+mod arch_gate_agreement {
+    /// The one lawful backend clause every arch gate carries.
+    const BACKEND: &str = r#"any(feature = "metal", feature = "spyre")"#;
+
+    #[test]
+    fn every_arch_gate_spells_the_one_backend_law() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("read own source");
+        for line in src.lines() {
+            let Some(cfg) = line.trim().strip_prefix("#[cfg(") else {
+                continue;
+            };
+            let Some(cfg) = cfg.strip_suffix(")]") else {
+                continue;
+            };
+            if !cfg.contains("arch-") {
+                continue; // `__metal_bake`'s bare backend gate, and non-arch cfgs
+            }
+            assert!(
+                cfg.contains(&format!(", {BACKEND}")),
+                "an arch gate does not spell the one backend law: {line}\n\
+                 every arch gate is `all(feature = \"arch-<name>\", {BACKEND})`"
+            );
+        }
+    }
+}
+
 // Every baked metal kernel the arches below name (`crate::__metal_bake::K_<key>`), each once,
 // beside the metallibs holding them — baked by the build script after it emits every arch.
 #[cfg(feature = "metal")]
@@ -61,15 +95,15 @@ mod __metal_bake {
     include!(concat!(env!("OUT_DIR"), "/metal_bake.rs"));
 }
 
-#[cfg(all(feature = "arch-commandr", feature = "metal"))]
+#[cfg(all(feature = "arch-commandr", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/commandr.rs"]
 pub mod commandr;
 
-#[cfg(all(feature = "arch-gemma2", feature = "metal"))]
+#[cfg(all(feature = "arch-gemma2", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/gemma2.rs"]
 pub mod gemma2;
 
-#[cfg(all(feature = "arch-gemma3", feature = "metal"))]
+#[cfg(all(feature = "arch-gemma3", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/gemma3.rs"]
 pub mod gemma3;
 
@@ -81,11 +115,11 @@ pub mod gemma4;
 #[path = "arch/gemma4_moe.rs"]
 pub mod gemma4_moe;
 
-#[cfg(all(feature = "arch-glm4-moe", feature = "metal"))]
+#[cfg(all(feature = "arch-glm4-moe", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/glm4_moe.rs"]
 pub mod glm4_moe;
 
-#[cfg(all(feature = "arch-gpt-oss", feature = "metal"))]
+#[cfg(all(feature = "arch-gpt-oss", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/gpt_oss.rs"]
 pub mod gpt_oss;
 
@@ -97,86 +131,107 @@ pub mod granite;
 #[path = "arch/llama.rs"]
 pub mod llama;
 
-#[cfg(all(feature = "arch-locateanything", feature = "metal"))]
+#[cfg(all(
+    feature = "arch-locateanything",
+    any(feature = "metal", feature = "spyre")
+))]
 #[path = "arch/locateanything.rs"]
 pub mod locateanything;
 
-#[cfg(all(feature = "arch-mistral", feature = "metal"))]
+#[cfg(all(feature = "arch-mistral", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/mistral.rs"]
 pub mod mistral;
 
-#[cfg(all(feature = "arch-mixtral", feature = "metal"))]
+#[cfg(all(feature = "arch-mixtral", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/mixtral.rs"]
 pub mod mixtral;
 
-#[cfg(all(feature = "arch-modernbert", feature = "metal"))]
+#[cfg(all(feature = "arch-modernbert", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/modernbert.rs"]
 pub mod modernbert;
 
-#[cfg(all(feature = "arch-nemotron-h", feature = "metal"))]
+#[cfg(all(feature = "arch-nemotron-h", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/nemotron_h.rs"]
 pub mod nemotron_h;
 
-#[cfg(all(feature = "arch-nemotron-h-latent", feature = "metal"))]
+#[cfg(all(
+    feature = "arch-nemotron-h-latent",
+    any(feature = "metal", feature = "spyre")
+))]
 #[path = "arch/nemotron_h_latent.rs"]
 pub mod nemotron_h_latent;
 
-#[cfg(all(feature = "arch-nemotron-h-mtp", feature = "metal"))]
+#[cfg(all(
+    feature = "arch-nemotron-h-mtp",
+    any(feature = "metal", feature = "spyre")
+))]
 #[path = "arch/nemotron_h_mtp.rs"]
 pub mod nemotron_h_mtp;
 
-#[cfg(all(feature = "arch-phi3", feature = "metal"))]
+#[cfg(all(feature = "arch-phi3", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/phi3.rs"]
 pub mod phi3;
 
-#[cfg(all(feature = "arch-qwen2", feature = "metal"))]
+#[cfg(all(feature = "arch-qwen2", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/qwen2.rs"]
 pub mod qwen2;
 
-#[cfg(all(feature = "arch-qwen2-5-vl", feature = "metal"))]
+#[cfg(all(feature = "arch-qwen2-5-vl", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/qwen2_5_vl.rs"]
 pub mod qwen2_5_vl;
 
-#[cfg(all(feature = "arch-qwen2-moe", feature = "metal"))]
+#[cfg(all(feature = "arch-qwen2-moe", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/qwen2_moe.rs"]
 pub mod qwen2_moe;
 
-#[cfg(all(feature = "arch-qwen2-vl", feature = "metal"))]
+#[cfg(all(feature = "arch-qwen2-vl", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/qwen2_vl.rs"]
 pub mod qwen2_vl;
 
-#[cfg(all(feature = "arch-qwen3", feature = "metal"))]
+#[cfg(all(feature = "arch-qwen3", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/qwen3.rs"]
 pub mod qwen3;
 
-#[cfg(all(feature = "arch-qwen3-5", feature = "metal"))]
+#[cfg(all(feature = "arch-qwen3-5", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/qwen3_5.rs"]
 pub mod qwen3_5;
 
-#[cfg(all(feature = "arch-qwen3-5-moe", feature = "metal"))]
+#[cfg(all(
+    feature = "arch-qwen3-5-moe",
+    any(feature = "metal", feature = "spyre")
+))]
 #[path = "arch/qwen3_5_moe.rs"]
 pub mod qwen3_5_moe;
 
-#[cfg(all(feature = "arch-qwen3-5-dense-mtp", feature = "metal"))]
+#[cfg(all(
+    feature = "arch-qwen3-5-dense-mtp",
+    any(feature = "metal", feature = "spyre")
+))]
 #[path = "arch/qwen3_5_dense_mtp.rs"]
 pub mod qwen3_5_dense_mtp;
-#[cfg(all(feature = "arch-qwen3-5-mtp", feature = "metal"))]
+#[cfg(all(
+    feature = "arch-qwen3-5-mtp",
+    any(feature = "metal", feature = "spyre")
+))]
 #[path = "arch/qwen3_5_mtp.rs"]
 pub mod qwen3_5_mtp;
 
-#[cfg(all(feature = "arch-gemma4-assistant", feature = "metal"))]
+#[cfg(all(
+    feature = "arch-gemma4-assistant",
+    any(feature = "metal", feature = "spyre")
+))]
 #[path = "arch/gemma4_assistant.rs"]
 pub mod gemma4_assistant;
 
-#[cfg(all(feature = "arch-dflash2", feature = "metal"))]
+#[cfg(all(feature = "arch-dflash2", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/dflash2.rs"]
 pub mod dflash2;
 
-#[cfg(all(feature = "arch-qwen3-5-vl", feature = "metal"))]
+#[cfg(all(feature = "arch-qwen3-5-vl", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/qwen3_5_vl.rs"]
 pub mod qwen3_5_vl;
 
-#[cfg(all(feature = "arch-qwen3-moe", feature = "metal"))]
+#[cfg(all(feature = "arch-qwen3-moe", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/qwen3_moe.rs"]
 pub mod qwen3_moe;
 
@@ -190,18 +245,21 @@ pub mod qwen3_moe;
 // every image and a VL model answers as if it were text-only. Referencing each
 // vision arch's `PROCESSOR` from a `#[used]` anchor forces the module object
 // into the final link, so its `inventory::submit!`s actually register.
-#[cfg(all(feature = "arch-qwen2-vl", feature = "metal"))]
+#[cfg(all(feature = "arch-qwen2-vl", any(feature = "metal", feature = "spyre")))]
 #[used]
 static _FORCE_MM_QWEN2_VL: &scratchy_vision::MmMetadata = &qwen2_vl::PROCESSOR;
 
-#[cfg(all(feature = "arch-qwen2-5-vl", feature = "metal"))]
+#[cfg(all(feature = "arch-qwen2-5-vl", any(feature = "metal", feature = "spyre")))]
 #[used]
 static _FORCE_MM_QWEN2_5_VL: &scratchy_vision::MmMetadata = &qwen2_5_vl::PROCESSOR;
 
-#[cfg(all(feature = "arch-qwen3-5-vl", feature = "metal"))]
+#[cfg(all(feature = "arch-qwen3-5-vl", any(feature = "metal", feature = "spyre")))]
 #[used]
 static _FORCE_MM_QWEN3_5_VL: &scratchy_vision::MmMetadata = &qwen3_5_vl::PROCESSOR;
 
-#[cfg(all(feature = "arch-locateanything", feature = "metal"))]
+#[cfg(all(
+    feature = "arch-locateanything",
+    any(feature = "metal", feature = "spyre")
+))]
 #[used]
 static _FORCE_MM_LOCATEANYTHING: &scratchy_vision::MmMetadata = &locateanything::PROCESSOR;

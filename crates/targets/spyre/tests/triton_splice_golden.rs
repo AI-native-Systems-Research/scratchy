@@ -376,8 +376,8 @@ const EW_SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096),
 
 /// Every `EwKind` the splice has a row for. The kinds the door refuses
 /// (Gelu/QuickGelu/GeluErf) and the kind the splice itself refuses (Relu2 —
-/// Nemotron-H is not spyre-capable) are absent: they have no descriptor
-/// chain, so a door comparison would pin nothing.
+/// an arch using it fails the build at that row, by name) are absent: they
+/// have no descriptor chain, so a door comparison would pin nothing.
 const EW_KINDS: &[EwKind] = &[
     EwKind::Add,
     EwKind::BiasAdd,
