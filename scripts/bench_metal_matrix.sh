@@ -107,7 +107,9 @@
 # --resume, with the same --out-dir and flags as a run that died (a full disk, a
 # crash, a kill), keeps every scaling cell that run finished cleanly and measures
 # only the rest; the build, parity gate and startup ladder run again (minutes).
-# Without it a rerun measures, and overwrites, every cell. The JSON records it.
+# Without it a rerun measures, and overwrites, every cell. The JSON records it. --resume refuses a
+# directory whose cells were loaded the other way (stacked against --open-loop): the two name their
+# cells alike.
 # --open-loop times the cells open loop, on a Poisson schedule at fixed rates, instead of stacked
 # users (docs/BENCHMARKING.md): each dataset workload at fractions of scratchy's own 1-user rate,
 # and the grid above 1 user at scratchy's 1-user rate at each shape. Off by default: every cell
@@ -566,6 +568,18 @@ JSON="${OUT_DIR}/${slug}-${stamp}-$(git -C "${ROOT}" rev-parse HEAD | cut -c1-8)
 mkdir -p "${RAW}"
 
 die() { echo "error: $*" >&2; exit 1; }
+# How this directory's cells were loaded, stacked or open loop: the two modes name their cells
+# alike (tasks-<w>@1.json is 1 user stacked, rate step 1 open loop), so --resume keeps another
+# mode's cells as this one's. Written by every run, after --resume has checked it; a directory
+# from before this file was written has no record, so --resume trusts it as before.
+LOAD_MODE_FILE="${RAW}/load-mode"
+load_mode="stacked"; (( OPEN_LOOP )) && load_mode="open-loop"
+if (( RESUME )) && [[ -s "${LOAD_MODE_FILE}" ]]; then
+    was="$(<"${LOAD_MODE_FILE}")"
+    [[ "${was}" == "${load_mode}" ]] \
+        || die "--resume: ${RAW} holds ${was} cells, and this run is ${load_mode}. Resume it with the same flags (--open-loop on or off as before), or give a new --out-dir."
+fi
+echo "${load_mode}" >"${LOAD_MODE_FILE}"
 command -v cargo >/dev/null || die "cargo not on PATH"
 [[ "$(uname -s)" == "Darwin" ]] || die "this runner is for Apple Silicon; use the spyre runner elsewhere"
 
