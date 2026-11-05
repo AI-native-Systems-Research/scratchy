@@ -10670,6 +10670,43 @@ const _: () = assert!(
      WRITE_SLACK is derived from it, and a padded chunk write that overruns by more than the \
      slack corrupts the next kv head's keys"
 );
+// ⛔ THE LADDER'S OWN SHAPE LAWS (the table is POLICY — measured cost-law discretization,
+// see the rung notes above — so what is checked is its structure, not its values):
+// strictly ascending (the bake and the worker's rung choice both walk it in order); the
+// top rung is the pool's whole-page window (PREFILL_WINDOW_PAGES · PAGE_SLOTS, itself
+// PREFILL_CHUNK_SLOTS); the TOP THREE rungs are whole-page or half-page spans (a chunk
+// at them starts at a page or half-page boundary, so no padded write straddles a page);
+// every rung positive.
+#[cfg(feature = "spyre")]
+const _: () = assert!(
+    {
+        use scratchy_subtile::sdsc_abstract::PagedKvPool;
+        let page = PagedKvPool::PAGE_SLOTS as u32;
+        let mut ok = true;
+        let mut i = 0;
+        while i < PREFILL_RUNGS.len() {
+            if PREFILL_RUNGS[i] == 0
+                || (i > 0 && PREFILL_RUNGS[i - 1] >= PREFILL_RUNGS[i])
+            {
+                ok = false;
+            }
+            i += 1;
+        }
+        let n = PREFILL_RUNGS.len();
+        let top = PREFILL_RUNGS[n - 1];
+        let half_page = page / 2;
+        ok
+            && top as usize
+                == PagedKvPool::PREFILL_WINDOW_PAGES * PagedKvPool::PAGE_SLOTS
+            && top as usize == PagedKvPool::PREFILL_CHUNK_SLOTS
+            && PREFILL_RUNGS[n - 1].is_multiple_of(half_page)
+            && PREFILL_RUNGS[n - 2].is_multiple_of(half_page)
+            && PREFILL_RUNGS[n - 3].is_multiple_of(half_page)
+    },
+    "PREFILL_RUNGS must be strictly ascending, positive, topped at the pool's whole-page \
+     window (PREFILL_WINDOW_PAGES · PAGE_SLOTS == PREFILL_CHUNK_SLOTS), with its top three \
+     rungs whole-page or half-page spans"
+);
 
 // ── THE EMU'S ONE BAKED PREFILL WIDTH, DERIVED FROM THE MODEL'S OWN fp8 GEMMS ──
 //
