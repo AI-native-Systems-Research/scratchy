@@ -108,6 +108,11 @@
 # crash, a kill), keeps every scaling cell that run finished cleanly and measures
 # only the rest; the build, parity gate and startup ladder run again (minutes).
 # Without it a rerun measures, and overwrites, every cell. The JSON records it.
+# --open-loop times the cells open loop, on a Poisson schedule at fixed rates, instead of stacked
+# users (docs/BENCHMARKING.md): each dataset workload at fractions of scratchy's own 1-user rate,
+# and the grid above 1 user at scratchy's 1-user rate at each shape. Off by default: every cell
+# runs stacked, each user sending its next request when its last answer returns. The JSON records
+# which (config.scaling.open_loop).
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -262,6 +267,7 @@ OFFLINE=0
 SKIP_BUILD=0
 FAIL_FAST=0
 RESUME=0
+OPEN_LOOP=0             # --open-loop: Poisson arrivals at fixed rates, not stacked users
 PARITY_GIVEN=0          # --parity: force the mlx-lm parity gate in a scratchy-only run
 OUT_DIR=""
 KV_CACHE_DTYPE=""
@@ -311,7 +317,7 @@ ACCURACY_TIMEOUT_S=2400
 # A task cell's sample: this many rounds of its users count, and at least TASK_MIN_PROMPTS (a
 # conversation of sharegpt-multi-turn is four of them).
 TASK_MIN_PROMPTS=8
-# The load a task cell offers: open loop, each request at its time on a Poisson schedule
+# With --open-loop, the load a task cell offers: each request at its time on a Poisson schedule
 # (bench serve's --request-rate, --burstiness 1), not a closed loop whose users send the moment
 # their last answer returns. A closed loop's users fall into lockstep: an engine that batches
 # finishes its users together and gets them back as a burst, so its TTFT measured the loop's
@@ -323,7 +329,7 @@ TASK_RATE_STEPS="0.5,1"                   # quick: 2 rates; --full: 4
 # from the ShareGPT file's human turns), not random token IDs, which route a mixture-of-experts
 # model's experts unlike any real prompt; three of the small set's four models are MoE.
 GRID_DATASET="natural"
-# The grid open loop above 1 user: a cell at u users offers GRID_LOAD x the rate of scratchy's
+# With --open-loop, the grid open loop above 1 user: a cell at u users offers GRID_LOAD x the rate of scratchy's
 # own 1-user cell at the same prompt and answer length (closed loop: one user has no lockstep), a
 # Poisson schedule, the same rate on every engine; u is only its cap in flight. The rate is not
 # scaled up by u: on an M3 Pro, granite-4.2-3b at 1024-token prompts and 4 users, u x 0.5 x the
@@ -420,6 +426,7 @@ while [[ $# -gt 0 ]]; do
         --skip-build)        SKIP_BUILD=1; shift ;;
         --fail-fast)         FAIL_FAST=1; shift ;;
         --resume)            RESUME=1; shift ;;
+        --open-loop)         OPEN_LOOP=1; shift ;;
         --parity)            PARITY_GIVEN=1; shift ;;
         --full)              shift ;;   # read before the defaults above
         --out-dir)           OUT_DIR="$2"; shift 2 ;;
@@ -681,7 +688,7 @@ PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
 export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB MODELS_GIVEN
 TASK_MAX_PROMPT=$(tr ',' '\n' <<<"${SCALE_GRID_INPUT}" | sort -n | tail -1)
-export WORKLOADS WORKLOADS_SCRATCHY TASK_MAX_PROMPT TASK_MIN_PROMPTS TASK_RATE_STEPS GRID_DATASET GRID_LOAD ACCURACY_TASKS SHAREGPT_URL
+export WORKLOADS WORKLOADS_SCRATCHY TASK_MAX_PROMPT TASK_MIN_PROMPTS OPEN_LOOP TASK_RATE_STEPS GRID_DATASET GRID_LOAD ACCURACY_TASKS SHAREGPT_URL
 export STARTED_UTC PERCENTILES PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
        SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS SCALE_REPEATS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S CELL_HANG_TOK_S RESUME MODELS_FULL
@@ -764,14 +771,16 @@ json.dump({
                  "workloads_scratchy": [w for w in e["WORKLOADS_SCRATCHY"].split(",") if w] if "tasks" in e["SCALE_AXES"] else None,
                  "task_max_prompt": int(e["TASK_MAX_PROMPT"]) if "tasks" in e["SCALE_AXES"] else None,
                  "task_min_prompts": int(e["TASK_MIN_PROMPTS"]),
-                 # The task cells' offered loads, open loop: these fractions of scratchy's 1-user
-                 # closed-loop rate (its "base" cell), the same on every engine.
+                 # Whether the cells ran open loop (--open-loop) or stacked (the default).
+                 "open_loop": e["OPEN_LOOP"] == "1",
+                 # With --open-loop, the task cells' offered loads: these fractions of scratchy's
+                 # 1-user closed-loop rate (its "base" cell), the same on every engine.
                  "task_rate_steps": [float(x) for x in e["TASK_RATE_STEPS"].split(",") if x]
-                                    if "tasks" in e["SCALE_AXES"] else None,
-                 # The grid's prompts, and its load above 1 user: open loop at this x scratchy's
-                 # 1-user rate at each shape, the users count only its cap.
+                                    if "tasks" in e["SCALE_AXES"] and e["OPEN_LOOP"] == "1" else None,
+                 # The grid's prompts, and with --open-loop its load above 1 user: open loop at
+                 # this x scratchy's 1-user rate at each shape, the users count only its cap.
                  "grid_dataset": e["GRID_DATASET"],
-                 "grid_load": float(e["GRID_LOAD"]),
+                 "grid_load": float(e["GRID_LOAD"]) if e["OPEN_LOOP"] == "1" else None,
                  "accuracy_tasks": int(e["ACCURACY_TASKS"]) or None,
                  "sharegpt": e["SHAREGPT_URL"],
                  "concurrency_is": "offered (--max-concurrency), not the effective decode batch"},
@@ -1135,13 +1144,13 @@ run_rep() { # prefix axis rung input output conc repeat
     # a ramp-up and a drain, and fewer requests than users never fill it.
     local n=$(( $6 * SCALE_ROUNDS > SCALE_NUM_PROMPTS ? $6 * SCALE_ROUNDS : SCALE_NUM_PROMPTS ))
     seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:$2:$3${tag}" | cksum | cut -d' ' -f1)
-    # The grid's prompts are natural text; its cells above 1 user are open loop, at the rate of
-    # scratchy's own 1-user cell at this shape scaled to the users count (GRID_LOAD).
+    # The grid's prompts are natural text. With --open-loop its cells above 1 user are open loop,
+    # at the rate of scratchy's own 1-user cell at this shape (GRID_LOAD x it); stacked otherwise.
     local -a data=() pace=()
     if [[ "$2" == grid ]]; then
         [[ "${GRID_DATASET}" == natural ]] \
             && data=(--dataset-name natural --dataset-path "${SHAREGPT_PATH}")
-        if (( $6 > 1 )); then
+        if (( OPEN_LOOP && $6 > 1 )); then
             local base_json="${RAW}/scale-${stem}.grid-$4x$5@1.json" rate
             rate=$(grid_rate "${base_json}")
             if [[ -z "${rate}" ]]; then
@@ -1272,7 +1281,8 @@ print(f"{base * float(sys.argv[2]):.4f}" if base > 0 else "")' "$1" "${GRID_LOAD
 }
 # A task cell's offered load, for "<prefix>.tasks-<workload>@<key>.json": "base", 1 user closed
 # loop (the base rate, scratchy's only); "rate:<i>", the i-th of TASK_RATE_STEPS, open loop at
-# that fraction of the base rate; or a users count, closed loop (the --full accuracy cell).
+# that fraction of the base rate; or a users count, closed loop (every cell without --open-loop,
+# and the --full accuracy cell).
 run_task_cell() { # prefix workload load
     local load="$3" key conc rate="" timed=1 base_json
     case "${load}" in
@@ -1285,7 +1295,7 @@ run_task_cell() { # prefix workload load
                     printf '    %-28s no base rate measured (%s); skipped\n' "tasks=$2@${key}" "${base_json##*/}"
                     return 0
                 fi ;;
-        *)      key="${load}"; conc="${load}"; timed=0 ;;
+        *)      key="${load}"; conc="${load}" ;;
     esac
     if (( cells_hung )); then
         (( cells_dead )) && return 0
@@ -1391,18 +1401,24 @@ run_scale_cells() { # prefix restart-function full-length [axes]
         local w c; local -a ws cs
         IFS=',' read -r -a ws <<<"${WORKLOADS}${cell_scratchy:+,${WORKLOADS_SCRATCHY}}"
         IFS=',' read -r -a cs <<<"${GRID_CONC_LIST}"
-        local -a steps; IFS=',' read -r -a steps <<<"${TASK_RATE_STEPS}"
-        # scratchy's 1-user closed-loop cells first: the base rate every engine's rates are
-        # fractions of, measured once, on scratchy. The other engines read it.
-        if [[ -n "${cell_scratchy}" ]]; then
-            for w in "${ws[@]}"; do run_task_cell "${prefix}" "${w}" base; done
+        if (( OPEN_LOOP )); then
+            local -a steps; IFS=',' read -r -a steps <<<"${TASK_RATE_STEPS}"
+            # scratchy's 1-user closed-loop cells first: the base rate every engine's rates are
+            # fractions of, measured once, on scratchy. The other engines read it.
+            if [[ -n "${cell_scratchy}" ]]; then
+                for w in "${ws[@]}"; do run_task_cell "${prefix}" "${w}" base; done
+            fi
+            # Then each rate, lowest first: every workload at the lightest load is in hand before
+            # a heavier one can run a server out of memory.
+            local i
+            for i in "${!steps[@]}"; do
+                for w in "${ws[@]}"; do run_task_cell "${prefix}" "${w}" "rate:$(( i + 1 ))"; done
+            done
+        else
+            # Stacked: fewest users first, as the grid does, so every workload at 1 user is in
+            # hand before a larger users count can run a server out of memory.
+            for c in "${cs[@]}"; do for w in "${ws[@]}"; do run_task_cell "${prefix}" "${w}" "${c}"; done; done
         fi
-        # Then each rate, lowest first: every workload at the lightest load is in hand before a
-        # heavier one can run a server out of memory.
-        local i
-        for i in "${!steps[@]}"; do
-            for w in "${ws[@]}"; do run_task_cell "${prefix}" "${w}" "rate:$(( i + 1 ))"; done
-        done
         # --full's accuracy cell, at the largest users count: the fewest seconds for its tasks.
         if (( ACCURACY_TASKS > 0 )); then run_task_cell "${prefix}" rag-accuracy "${cs[${#cs[@]}-1]}"; fi
     fi
@@ -1977,17 +1993,15 @@ def tasks(engine):
         m = TASK_CELL.search(p)
         if not m or not (j := load(os.path.basename(p))):
             continue
-        workload, load = m.groups()
-        # A cell's load: "base", the 1-user closed-loop cell the rates are fractions of; a rate
-        # step (1, 2, ...) of TASK_RATE_STEPS, open loop; or, for rag-accuracy, its users count.
-        # conc is the step (0 for base), so a cell is keyed by workload and load as before.
-        if load == "base":
-            step = 0
-        else:
-            step = int(load)
-        cells.append({"workload": workload, "conc": step,
-                      "load": "base" if load == "base" else
-                              ("users" if workload == "rag-accuracy" else "rate"),
+        workload, key = m.groups()
+        # A cell's load: "base", the 1-user closed-loop cell the rates are fractions of; with
+        # --open-loop, a rate step (1, 2, ...) of TASK_RATE_STEPS; or a users count, stacked (every
+        # cell without --open-loop, and rag-accuracy). conc is the step (0 for base) or the users
+        # count, so a cell is keyed by workload and load as before.
+        step = 0 if key == "base" else int(key)
+        kind = ("base" if key == "base" else
+                "rate" if env["OPEN_LOOP"] == "1" and workload != "rag-accuracy" else "users")
+        cells.append({"workload": workload, "conc": step, "load": kind,
                       **{k: v for k, v in j.items() if k in TASK_KEEP or PCT.fullmatch(k)}})
     return cells or None
 def parity_ties():

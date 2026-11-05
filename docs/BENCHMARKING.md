@@ -421,19 +421,22 @@ A run whose validity checks fail prints them and exits non-zero. That is
 intentional: a FROZEN rep that faulted no more than COLD did not measure a frozen
 start, and reporting it would be worse than reporting nothing.
 
-### Dataset cells: open loop at fixed rates
+### Dataset cells: open loop at fixed rates (`--open-loop`)
 
-The matrix's real-dataset cells (`--scale-axes tasks`, its default sweep) time each engine
-**open loop**: requests arrive on a Poisson schedule (`bench serve --request-rate R`, gamma
-inter-arrivals with `--burstiness 1`), at rates set before the run, the same for every engine.
-They are not run closed loop, each user sending its next request the moment its last answer
-returns: a closed loop's users fall into lockstep. An engine that batches its users finishes them
+By default the matrix's real-dataset cells (`--scale-axes tasks`, its default sweep) are sent
+**stacked**, at 1, 2 and 4 users: each user sends its next request the moment its last answer
+returns. With `--open-loop`, the matrix times each engine **open loop** instead: requests arrive
+on a Poisson schedule (`bench serve --request-rate R`, gamma inter-arrivals with
+`--burstiness 1`), at rates set before the run, the same for every engine. The run file records
+which (`config.scaling.open_loop`).
+
+Why it's there: stacked users fall into lockstep. An engine that batches its users finishes them
 together and gets them back as a burst every round, so one prompt prefills alone and the rest
 queue behind it. Its TTFT then measures the loop's synchronization, not its prefill: on a base M5
 the closed-loop grid read scratchy 0.70× to 0.81× of oMLX at 4 users and short prompts, though
 scratchy is 1.24× to 2.6× faster to its first token at 1 user on every model.
 
-**The rule, per model and workload:**
+**The rule, per model and workload, with `--open-loop`:**
 - **Base rate:** scratchy's own 1-user closed-loop request rate on that model and workload, a
   `base` cell measured first: completed requests over its duration. Measured on scratchy alone,
   and read by every other engine.
@@ -454,24 +457,26 @@ scored on timed cells; `--full`'s `rag-accuracy` cell scores it, its answers run
 loop. A span query (`rag-spans`, scratchy's own row) cannot be forced: its answers end on their
 own, so its total time is scratchy's alone and is not compared.
 
-**Timeouts:** an open-loop cell's limit adds its arrival schedule's own span (its requests over the
+**Timeouts:** with `--open-loop`, a cell's limit adds its arrival schedule's own span (its requests over the
 rate), so a low rate is not taken for a hung server: 16 tasks at 0.03/s take 534 s before any is
 served.
 
-**Recorded:** each cell's offered `request_rate`, and per request its send time
+**Recorded:** each cell's offered `request_rate` (null when stacked), and per request its send time
 (`start_times`, seconds from the cell's start), TTFT and end-to-end time, so an arrival's
 effect can be told from an engine's from the run file alone.
 
-### The grid: natural text, open loop above 1 user
+### The grid: natural text, and open loop above 1 user with `--open-loop`
 
 The diagnostic grid (`--random`, prompts × answers × users) keeps its fixed shapes, for long
-prompts, regressions and attribution, but changes two things:
+prompts, regressions and attribution. Its prompts are natural text, and with `--open-loop` its
+cells above 1 user run open loop:
 
 - **Natural text, not random token IDs.** Each prompt is a slice of exactly its length of real
   text (`bench serve --dataset-name natural`: the ShareGPT file's human turns, cut at seeded
   offsets, the same prompts on every engine). Random token IDs route a mixture-of-experts model's
   experts unlike any real prompt, and three of the small set's four models are MoE.
-- **Open loop above 1 user.** A cell at *u* users offers `GRID_LOAD` (1) × the rate of scratchy's
+- **Open loop above 1 user (`--open-loop`).** Without it, every grid cell is stacked, *u* users
+  at once. With it, a cell at *u* users offers `GRID_LOAD` (1) × the rate of scratchy's
   own 1-user cell at the same prompt and answer length, on a Poisson schedule; *u* is only its cap
   in flight. The 1-user cells stay closed loop: one user has no lockstep, and they are the base
   rates. Every engine is offered scratchy's rates, so the comparison is at the same load; an engine
