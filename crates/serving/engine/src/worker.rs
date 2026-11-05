@@ -276,7 +276,7 @@ pub trait Worker: Send {
 
     /// The tokens the engine stops a request on (`EngineCoreConfig::eos_token_ids`), handed over
     /// once, as the engine is built, before its first step. A worker that applies guided grammars
-    /// ends them on these ([`crate::grammar::build_parser_factory`]), so a finished grammar allows
+    /// ends them on these (`crate::grammar::build_parser_factory`), so a finished grammar allows
     /// what stops the request. No default: a worker that applies grammars must keep them.
     fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]);
 

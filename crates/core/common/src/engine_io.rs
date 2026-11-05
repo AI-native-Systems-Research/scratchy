@@ -142,7 +142,7 @@ pub struct EngineCoreRequest {
     #[serde(skip)]
     pub mm_data: Option<MultimodalData>,
 
-    /// Sparse map of block index → [`BlockKind`] for span-aware block hashing.
+    /// Sparse map of block index → `BlockKind` for span-aware block hashing.
     /// Produced by `/v1/query/execute`; `None` for normal requests.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub block_annotations: Option<crate::request::BlockAnnotations>,

@@ -24,9 +24,9 @@
 //!
 //! | site | transfers | launch |
 //! |---|---|---|
-//! | [`Site::Device`] (a baked `init_binary`) | yes | yes |
-//! | [`Site::Host`] (a CPU kernel: embed gather, rotary, mask fill) | no | a direct call |
-//! | a weight load ([`Site::Host`], output `ToDevice`) | h2d only | none |
+//! | [`Site::Device`](crate::host_tape::Site::Device) (a baked `init_binary`) | yes | yes |
+//! | [`Site::Host`](crate::host_tape::Site::Host) (a CPU kernel: embed gather, rotary, mask fill) | no | a direct call |
+//! | a weight load ([`Site::Host`](crate::host_tape::Site::Host), output `ToDevice`) | h2d only | none |
 //!
 //! That last row is why weight loading is not a special phase: it is a kernel
 //! whose launcher happens to do an h2d and nothing else. There is no privileged
@@ -35,13 +35,13 @@
 //! # What is on the tape vs inside a kernel is a LOWERING decision
 //!
 //! Moving the mask fill from the CPU into a device program changes that step's
-//! [`Step::site`] and [`Step::kernel`] and NOTHING ELSE — not this type, not the
+//! [`Step::site`](crate::host_tape::Step::site) and [`Step::kernel`](crate::host_tape::Step::kernel) and NOTHING ELSE — not this type, not the
 //! player. That is the whole point of the split: the boundary can move as the
 //! lowering improves, and the runtime never learns about it.
 //!
 //! # Transfers are STATED, never inferred
 //!
-//! Each operand carries the movement it needs ([`Operand::transfer`]), baked by
+//! Each operand carries the movement it needs ([`Operand::transfer`](crate::host_tape::Operand::transfer)), baked by
 //! the lowering. The launcher obeys; it does not consult a residency model, or
 //! compare anything, or decide. A residency mistake is then a WRONG CONSTANT
 //! visible in generated code — not emergent runtime behaviour. (Chosen over

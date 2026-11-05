@@ -3,7 +3,7 @@
 //! positional operands.
 //!
 //! Every pass that keys a target decision on the tape's steps reads the tape the same way: a step
-//! writes one [`SlotId`], performs its node's [`SubOp`] (the op is where a target's facts are
+//! writes one [`SlotId`](crate::subtile_tape::SlotId), performs its node's [`SubOp`](crate::subtile_ir::SubOp) (the op is where a target's facts are
 //! keyed) for one source op of the `LoweringInput` the graph was lowered from, and reads each
 //! operand either from an earlier step or from a graph source. This is that reading, once, for the
 //! colourer and the folder.

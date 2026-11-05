@@ -252,13 +252,13 @@ pub struct SimpleBlockTracker {
     ///
     /// ⛔ SET ONCE PER `schedule()`, NOT DERIVED PER REQUEST. A value derived while allocating would be read by
     /// the requests allocated before the one that raised it, which is the very window this closes.
-    /// [`KvSlotSpan::NONE`] unless [`Self::addressing`] says this backend shares one write slot.
+    /// `KvSlotSpan::NONE` unless [`Self::addressing`] says this backend shares one write slot.
     step_reach: scratchy_core_common::KvSlotSpan,
     /// HOW THIS BACKEND ADDRESSES ITS KV — declared when the tracker is built.
     ///
     /// ⛔ IT WAS INFERRED FROM `kv_pool_reach.is_some()`, WHICH IS FALSE UNTIL THE WORKER'S FIRST REPORT, so
     /// every allocation before that got the token-addressed arithmetic on a backend that shares a write slot.
-    /// See [`KvAddressing`] for the measurement.
+    /// See `KvAddressing` for the measurement.
     addressing: scratchy_core_common::KvAddressing,
 
     /// Per-block reference count. ref_cnt > 0 means allocated (possibly shared).
@@ -954,7 +954,7 @@ impl SimpleBlockTracker {
         self.hash_all_blocks_bs(all_tokens, annotations, mm, self.block_size)
     }
 
-    /// Like [`hash_all_blocks`] but with an explicit `block_size` — needed on
+    /// Like `hash_all_blocks` but with an explicit `block_size` — needed on
     /// the hybrid path where each group has its own block size (gemma4: full
     /// group 32, sliding groups 16).
     fn hash_all_blocks_bs(

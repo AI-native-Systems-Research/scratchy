@@ -569,6 +569,30 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # A doc link that names a moved or renamed item fails here, so the `//!` maps the CLAUDE.md
+  # routing points into can't silently go stale. Only `broken_intra_doc_links` is denied: other
+  # rustdoc warnings (private-item links, unescaped brackets) are pre-existing debt.
+  # shortcut: featureless crates only; the ktir-*/triton-* crates still carry ~300 broken links
+  # and the backend crates need a feature, add them to the list as their links are fixed.
+  doc-links:
+    name: Rustdoc intra-doc links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: doc-links
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo doc (deny broken intra-doc links)
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
+        run: cargo doc --no-deps --document-private-items
+          -p scratchy-core-common -p scratchy-core-config -p scratchy-core-model -p hf-hub-downloader
+          -p scratchy-serving-scheduler -p scratchy-serving-transport -p scratchy-serving-engine
+          -p scratchy-serving-worker -p scratchy-forward-compiler -p scratchy-ir -p scratchy-subtile
+          -p scratchy-quantizations -p scratchy-tensors -p scratchy-vision -p scratchy-bench
+
   scripts:
     name: Python scripts
     runs-on: ubuntu-latest

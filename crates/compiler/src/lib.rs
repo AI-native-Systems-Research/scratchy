@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Runtime support types the `#[forward]`-emitted code depends on:
-//! most importantly [`ForwardCtx`], the ambient-args bundle the
+//! most importantly `ForwardCtx`, the ambient-args bundle the
 //! emitted forward fn takes, and the [`Instruction`] enum the
 //! generated tape rows construct.
 //!
 //! The `#[forward]` / `#[vision_forward]` attribute macros live in
-//! [`scratchy_forward_compiler_macro`] — consumer crates import them
+//! `scratchy_forward_compiler_macro` — consumer crates import them
 //! directly:
 //!
 //! ```ignore

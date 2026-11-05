@@ -3,20 +3,20 @@
 //!
 //! A target's kernels fuse: a residual add into the norm that reads it, an activation into the
 //! multiply it gates, a query rotation into the rope that appends K/V. WHICH fusions a target has
-//! is a target fact, declared as a [`FusionTable`]: the patterns that apply, in which order, over
+//! is a target fact, declared as a [`FusionTable`](crate::tape_folding::FusionTable): the patterns that apply, in which order, over
 //! which op kinds, and the fused command each fold becomes. Facts about one model (whether its
-//! projections fold) arrive as [`ModelFoldFacts`]. The matching that honours them is the same for
+//! projections fold) arrive as [`ModelFoldFacts`](crate::tape_folding::ModelFoldFacts). The matching that honours them is the same for
 //! every target and lives here.
 //!
 //! The pass reads the UNROLLED tape — a step's operands are the tape's dataflow, its op is its
 //! source provenance — and decides for every step: kept, absorbed into another step's fused
 //! command, an epilogue another step's command writes, or the driver of fusions. The decisions are
-//! an overlay keyed on the [`SlotId`] each step writes. The tape itself is untouched, so the
+//! an overlay keyed on the [`SlotId`](crate::subtile_tape::SlotId) each step writes. The tape itself is untouched, so the
 //! re-roll and the layer-loop search see exactly the tape they saw before.
 //!
 //! The rules:
 //! - fusion legality counts CONSUMERS: every step operand, plus one for the result — except the
-//!   operands a table declares are not dataflow ([`CountedOperands`]);
+//!   operands a table declares are not dataflow ([`CountedOperands`](crate::tape_folding::CountedOperands));
 //! - patterns apply in SWEEPS: a sweep walks the steps in source-op order and, at each step,
 //!   applies every pattern of the sweep driven by that step's kind, in table order; a later sweep
 //!   sees what an earlier one absorbed;

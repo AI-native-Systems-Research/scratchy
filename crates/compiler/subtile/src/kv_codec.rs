@@ -6,7 +6,7 @@
 //! attention either reads that store directly (its packed twin) or reads it staged back into the
 //! codec's rotated domain, its query rotated in and its output rotated back. WHICH steps, in WHICH
 //! order, under WHICH runtime guard, and which classes and head dims are coded, are the target's
-//! facts ([`KvCodecFacts`]); inserting them is this one pass over the front end's op list. A
+//! facts ([`KvCodecFacts`](crate::kv_codec::KvCodecFacts)); inserting them is this one pass over the front end's op list. A
 //! target without a codec never calls it.
 //!
 //! The inserted ops are expansion ops (`expansion_ops!`): a writer and its encodes are one

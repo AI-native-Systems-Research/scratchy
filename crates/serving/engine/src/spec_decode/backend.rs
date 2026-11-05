@@ -152,8 +152,8 @@ pub struct ForwardArgmaxRequest<'a> {
 
 /// Primitive the backend exposes for spec decode.
 ///
-/// Backends MUST implement [`forward_argmax_blocking`]. The async pair
-/// ([`submit_forward_argmax`] + [`await_forward_argmax`]) defaults to
+/// Backends MUST implement `forward_argmax_blocking`. The async pair
+/// (`submit_forward_argmax` + `await_forward_argmax`) defaults to
 /// `NotImplemented` and is overridden in phase 8 of the refactor where
 /// target verify overlaps with the draft chain on parallel command
 /// buffers / streams.
@@ -200,7 +200,7 @@ pub trait SpecDecodeBackend {
 
     /// Block on a previously-submitted forward+argmax. Default impl
     /// returns `NotImplemented` — only meaningful if the backend
-    /// overrides [`submit_forward_argmax`].
+    /// overrides `submit_forward_argmax`.
     fn await_forward_argmax(&mut self, _handle: ForwardHandle) -> Result<Vec<u32>, BackendError> {
         Err(BackendError::NotImplemented("await_forward_argmax"))
     }

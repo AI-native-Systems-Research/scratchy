@@ -839,7 +839,7 @@ impl TapeBuilder<state::InsideLoop> {
     /// for a carried slot whose pre-loop seed already consumed its original
     /// `SlotHandle`. The body writes the carried slot once per emission (the
     /// loop re-runs it); the page is reused, so the next iteration's
-    /// [`carried_in`] reads it. Loop re-roll only.
+    /// `carried_in` reads it. Loop re-roll only.
     pub fn carried_handle(&self, slot: SlotId) -> SlotHandle {
         SlotHandle {
             slot,
@@ -865,7 +865,7 @@ impl TapeBuilder<state::InsideLoop> {
         }
     }
 
-    /// Free a per-iteration body slot INSIDE the loop (see [`alloc_slot`]).
+    /// Free a per-iteration body slot INSIDE the loop (see `alloc_slot`).
     pub fn free_slot(&mut self, w: SlotWritten) {
         self.instrs.push(Instr::FreeSlot { slot: w.slot });
     }
