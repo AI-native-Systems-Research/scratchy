@@ -166,6 +166,8 @@ pub fn tasks_table(m: &Model) -> Element {
     let mut cells: Vec<&TaskCell> = ours.iter().collect();
     let rank = |w: &str| ORDER.iter().position(|o| *o == w).unwrap_or(ORDER.len());
     cells.sort_by_key(|c| (rank(&c.workload), c.conc));
+    // The open-loop note, only where the run timed its cells open loop (`--open-loop`).
+    let open_loop = ours.iter().any(|c| c.load.as_deref() == Some("rate"));
     rsx! {
         Table {
             headers: [
@@ -217,6 +219,15 @@ pub fn tasks_table(m: &Model) -> Element {
              than {FIRM_ACCURACY_TASKS} tasks, where one task moves it by 100/n points, so it is \
              indicative only. The second total ratio is shown only where both engines' answers were \
              about one length."
+        }
+        if open_loop {
+            p { style: "font-size: 0.875rem",
+                "Load: an open-loop cell offers its requests at a fixed rate, a fraction of scratchy's \
+                 own one-user rate on that model and workload (1 user (base)), and every engine is \
+                 offered the same rate. Engines are compared at equal traffic: one slower than \
+                 scratchy at one user is offered more than it gets through alone, so it queues, and \
+                 its first token comes later."
+            }
         }
     }
 }
