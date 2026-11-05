@@ -36,9 +36,11 @@ pub fn workload_label(w: &str) -> (&'static str, &'static str) {
         ),
         "polyglot" => (
             "Coding, Polyglot",
-            "Aider's Python exercises, each answer run against its unit tests (pass@1); answers run \
-             to each model's own length, so its time to first token compares across engines and its \
-             total time does not. Aider-derived prompts: not comparable with Aider's published scores",
+            "Aider's Python exercises, each answer run against its unit tests, then each failed one \
+             asked again with its tests' errors, as Aider's benchmark does: right is the first try, \
+             then by the last; the tries after the first are untimed. Answers run to each model's own \
+             length, so its time to first token compares across engines and its total time does not. \
+             Aider-derived prompts: not comparable with Aider's published scores",
         ),
         "swe-bench" => (
             "Coding, SWE-bench",
@@ -149,10 +151,16 @@ fn right(c: &TaskCell) -> String {
     let Some(a) = accuracy(c) else {
         return "—".to_string();
     };
-    match c.num_tasks {
-        Some(n) if n >= FIRM_ACCURACY_TASKS => format!("{} of {n}", pct(Some(a))),
-        Some(n) => format!("~{} of {n}", pct(Some(a))),
+    let firm = c.num_tasks.is_some_and(|n| n >= FIRM_ACCURACY_TASKS);
+    let mark = if firm { "" } else { "~" };
+    let whole = match c.num_tasks {
+        Some(n) => format!("{mark}{} of {n}", pct(Some(a))),
         None => format!("~{}", pct(Some(a))),
+    };
+    // A coding cell's last try, where it had more than its first: over the same tasks.
+    match c.accuracy_by_try.as_deref() {
+        Some(by @ [_, .., last]) => format!("{whole}, {mark}{} by try {}", pct(Some(*last)), by.len()),
+        _ => whole,
     }
 }
 
@@ -323,6 +331,23 @@ mod tests {
         assert_eq!(right(&c), "~38%", "a run from before the count");
     }
 
+    /// A coding cell that asked its failed answers again says what the last try reached: try 1 is
+    /// the cell's own accuracy, the one compared, and the tries after it are named.
+    #[test]
+    fn a_coding_cells_accuracy_says_what_its_tries_reached() {
+        let mut c: TaskCell = serde_json::from_value(serde_json::json!({
+            "workload": "polyglot", "conc": 1, "completed": 8, "accuracy": 0.25,
+            "thinking_answers": 0, "capped_answers": 0, "num_tasks": 8,
+            "accuracy_by_try": [0.25, 0.5],
+        }))
+        .unwrap();
+        assert_eq!(right(&c), "~25% of 8, ~50% by try 2");
+        c.accuracy_by_try = Some(vec![0.25]);
+        assert_eq!(right(&c), "~25% of 8", "one try is the cell alone");
+        c.accuracy_by_try = None;
+        assert_eq!(right(&c), "~25% of 8");
+    }
+
     /// The whole answer's time is set against the rival's only at about the same answer length,
     /// and neither mostly capped; the first token's always is.
     #[test]
@@ -341,6 +366,7 @@ mod tests {
             thinking_answers: Some(0),
             capped_answers: Some(capped),
             num_tasks: Some(8),
+            accuracy_by_try: None,
             load: None,
             request_rate: None,
             timed_out: false,
@@ -439,6 +465,7 @@ mod tests {
             thinking_answers: Some(thinking),
             capped_answers: Some(0),
             num_tasks: Some(4),
+            accuracy_by_try: None,
             load: None,
             request_rate: None,
             timed_out: false,

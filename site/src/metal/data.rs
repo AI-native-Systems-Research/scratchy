@@ -584,6 +584,10 @@ pub struct TaskCell {
     /// from before it was recorded.
     #[serde(default)]
     pub num_tasks: Option<u32>,
+    /// A coding cell's accuracy after each try, the first its own `accuracy`: each failed answer
+    /// asked again, untimed, with its tests' errors. None in runs from before, and with one try.
+    #[serde(default)]
+    pub accuracy_by_try: Option<Vec<f64>>,
     #[serde(default)]
     pub timed_out: bool,
     /// When the run this cell was borrowed from was made: a quick run's rival numbers, from the

@@ -530,6 +530,13 @@ pub struct BenchServeArgs {
     #[arg(long, default_value = "python3")]
     pub coding_python: String,
 
+    /// `polyglot`: how many tries each exercise gets, as Aider's benchmark gives them. The first
+    /// is the timed cell's; each failed answer is then asked again, untimed, with its tests'
+    /// errors and Aider's text asking for a fix, until it passes or this many have been tried.
+    /// 1 asks nothing again.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=10))]
+    pub coding_tries: u32,
+
     /// `shared-prefix`: tokens in each group's shared system prompt.
     #[arg(long, default_value_t = 2048)]
     pub shared_prefix_len: usize,

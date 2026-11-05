@@ -5,7 +5,10 @@
 //!
 //! - **Polyglot**, the Python exercises of Aider's polyglot benchmark (34 Exercism problems), with
 //!   Aider's instructions and addendum word for word, and scored by running each answer against
-//!   the exercise's own unit tests: pass@1, one attempt, no second round with the test errors.
+//!   the exercise's own unit tests. The timed answer is the first try; then, as Aider's
+//!   benchmark does, each that failed is asked again with its tests' errors and Aider's
+//!   test_failures text (`--coding-tries`, 2 by default), untimed, its accuracy after each try
+//!   recorded beside the first's.
 //!   Aider-derived, not Aider's own run: no system prompt, this crate's own request for the whole
 //!   file, and the answer's last fenced block taken as its code, where Aider sends its `whole`
 //!   format's prompts and takes the block named for the file. Its scores are not comparable with
@@ -313,7 +316,7 @@ const PROBE: &str = "import ctypes, os, sys, unittest\n\
 /// on purpose is out of reach of any in-process check, and still runs only in the sandbox.
 const RUN_TESTS: &str = "import os, sys, unittest\n\
      token = sys.stdin.readline().strip()\nsys.stdin.close()\n\
-     d, name, out = sys.argv[1], sys.argv[2], sys.argv[3]\ndel sys.argv[1:]\n\
+     d, name, out, errs = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]\ndel sys.argv[1:]\n\
      sys.path.insert(0, d)\nos.chdir(d)\n\
      kept = [(c, dict(vars(c))) for c in (unittest.TestCase, unittest.TestSuite,\n\
          unittest.TestResult, unittest.TextTestResult, unittest.TextTestRunner)]\n\
@@ -326,8 +329,11 @@ const RUN_TESTS: &str = "import os, sys, unittest\n\
      \x20           for k, v in attrs.items():\n\
      \x20               if vars(c).get(k) is not v:\n\
      \x20                   setattr(c, k, v)\n\
-     \x20       return unittest.TextTestRunner(stream=open(os.devnull, 'w')).run(suite)\n\
+     \x20       return unittest.TextTestRunner(stream=open(errs, 'w')).run(suite)\n\
      \x20   except BaseException:\n\
+     \x20       import traceback\n\
+     \x20       with open(errs, 'w') as f:\n\
+     \x20           traceback.print_exc(file=f)\n\
      \x20       return None\n\
      r = run()\n\
      if r is not None:\n\
@@ -338,6 +344,71 @@ const RUN_TESTS: &str = "import os, sys, unittest\n\
 
 /// Where [`RUN_TESTS`] writes its report, in the work directory.
 const RESULT_FILE: &str = "_scr_result";
+
+/// Where [`RUN_TESTS`] writes the tests' errors as unittest reports them, or the traceback of an
+/// answer that would not load. Only what a retry sends back: whether it passed is the report's.
+const ERRORS_FILE: &str = "_scr_errors";
+
+/// How much of a failed run's errors a retry sends back: their end, where unittest puts the
+/// failures and the line that failed.
+pub(crate) const RETRY_ERRORS: usize = 4096;
+
+/// Aider's text after the test errors on a retry (`benchmark/prompts.py`'s `test_failures`), word
+/// for word.
+const AIDER_TEST_FAILURES: &str = "\n####\n\nSee the testing errors above.\n\
+     The tests are correct, don't try and change them.\n\
+     Fix the code in {file_list} to resolve the errors.\n";
+
+/// What one run of an answer's tests found: whether it passed, and if not why, as the tests said
+/// it ([`ERRORS_FILE`]), its work directory taken out, or that they timed out.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Outcome {
+    pub(crate) passed: bool,
+    pub(crate) errors: String,
+}
+
+/// unittest's `Ran N tests in 0.012s` without its time: `Ran N tests`.
+fn strip_run_time(text: &str) -> String {
+    (text.lines())
+        .map(|l| match (l.strip_prefix("Ran "), l.rfind(" in ")) {
+            (Some(_), Some(at)) if l.ends_with('s') => &l[..at],
+            _ => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + if text.ends_with('\n') { "\n" } else { "" }
+}
+
+/// A coding task's next try, as Aider's benchmark asks it: the conversation so far, the answer
+/// as the model sent it, then the tests' errors (their last [`RETRY_ERRORS`] bytes) and Aider's
+/// test_failures text naming the file. None for a task that is not a coding exercise.
+pub(crate) fn retry_task(
+    t: &crate::workloads::Task,
+    answer: &str,
+    errors: &str,
+) -> Option<crate::workloads::Task> {
+    let crate::workloads::Score::Tests(e) = &t.score else {
+        return None;
+    };
+    let mut cut = errors.len().saturating_sub(RETRY_ERRORS);
+    while !errors.is_char_boundary(cut) {
+        cut += 1;
+    }
+    let mut messages = t.messages.clone();
+    messages.push(serde_json::json!({"role": "assistant", "content": answer}));
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": format!(
+            "{}{}",
+            &errors[cut..],
+            AIDER_TEST_FAILURES.replace("{file_list}", &e.solution)
+        ),
+    }));
+    Some(crate::workloads::Task {
+        messages,
+        ..t.clone()
+    })
+}
 
 /// Whether [`RUN_TESTS`]' report says every test ran and passed: this run's `token`, at least one
 /// test run, and no failure, error, skip, expected failure or unexpected success (no exercise
@@ -388,11 +459,22 @@ impl TestRunner {
     /// the tests in a temporary directory, run there under the sandbox, stopped after
     /// [`TEST_TIMEOUT`]. A run that cannot start (the directory, the interpreter) is an error,
     /// not a failed answer.
-    pub(crate) fn passes(&self, exercise: &Exercise, answer: &str) -> Result<bool> {
-        self.passes_within(exercise, answer, TEST_TIMEOUT)
+    #[cfg(test)]
+    fn passes(&self, exercise: &Exercise, answer: &str) -> Result<bool> {
+        Ok(self.test(exercise, answer)?.passed)
     }
 
+    #[cfg(test)]
     fn passes_within(&self, exercise: &Exercise, answer: &str, limit: Duration) -> Result<bool> {
+        Ok(self.test_within(exercise, answer, limit)?.passed)
+    }
+
+    /// [`passes`](Self::passes), with why it failed: what a retry sends back.
+    pub(crate) fn test(&self, exercise: &Exercise, answer: &str) -> Result<Outcome> {
+        self.test_within(exercise, answer, TEST_TIMEOUT)
+    }
+
+    fn test_within(&self, exercise: &Exercise, answer: &str, limit: Duration) -> Result<Outcome> {
         let work = WorkDir::new()?;
         let dir = work.0.clone();
         std::fs::write(dir.join(&exercise.solution), answer_code(answer))?;
@@ -402,18 +484,35 @@ impl TestRunner {
         std::fs::write(dir.join("_scr_run_tests.py"), RUN_TESTS)?;
         let script = dir.join("_scr_run_tests.py");
         let report = dir.join(RESULT_FILE);
-        let (script, work_dir, out) = (
+        let errors = dir.join(ERRORS_FILE);
+        let (script, work_dir, out, errs) = (
             script.to_string_lossy(),
             dir.to_string_lossy(),
             report.to_string_lossy(),
+            errors.to_string_lossy(),
         );
         // A token this run alone knows, so a report the answer wrote is not the runner's.
         let token = format!("{:032x}", rand::random::<u128>());
-        let args = [&*script, &*work_dir, exercise.test_module(), &*out];
+        let args = [&*script, &*work_dir, exercise.test_module(), &*out, &*errs];
+        let start = std::time::Instant::now();
         self.run(&dir, &args, limit, &token)
             .with_context(|| format!("running {}'s tests", exercise.name))?;
         let report = std::fs::read_to_string(&report).unwrap_or_default();
-        Ok(reported_pass(&report, &token))
+        let passed = reported_pass(&report, &token);
+        let errors = if passed {
+            String::new()
+        } else if start.elapsed() >= limit {
+            "Tests timed out!".to_string()
+        } else {
+            // Paths as the answer's own directory, and no run time, as Aider's are
+            // (`cleanup_test_output`): nothing of this machine's, the same text on every run.
+            let text = std::fs::read_to_string(&errors).unwrap_or_default();
+            let text = text
+                .replace(&format!("{work_dir}/"), "")
+                .replace(&*work_dir, ".");
+            strip_run_time(&text)
+        };
+        Ok(Outcome { passed, errors })
     }
 
     /// Run the interpreter (`-I -B`, then `args`) in `dir` under the sandbox, with `input` on its
@@ -647,6 +746,88 @@ mod tests {
             "stopped, and failed"
         );
         assert!(start.elapsed() < limit + Duration::from_secs(3));
+    }
+
+    /// A failed answer's second try is Aider's: the conversation so far, the answer as sent back,
+    /// then the tests' errors with Aider's test_failures text naming the file. The errors are cut
+    /// to their end, and the run's own work directory taken out of them.
+    #[test]
+    fn a_retry_sends_the_tests_errors_back_as_aider_does() {
+        let t = polyglot_task(
+            "Add two numbers.\n",
+            "def add(a, b):\n    pass\n",
+            exercise(),
+        );
+        let answer = "```python\ndef add(a, b):\n    return a - b\n```";
+        let errors = format!("{}AssertionError: -1 != 3\n", "x".repeat(RETRY_ERRORS * 2));
+        let again = retry_task(&t, answer, &errors).expect("a coding task");
+        assert_eq!(
+            again.messages.len(),
+            3,
+            "the prompt, the answer, the errors"
+        );
+        assert_eq!(again.messages[0], t.messages[0]);
+        assert_eq!(again.messages[1]["role"], "assistant");
+        assert_eq!(again.messages[1]["content"], answer);
+        let p = again.messages[2]["content"].as_str().unwrap();
+        assert!(p.contains("AssertionError: -1 != 3\n"), "the errors' end");
+        assert!(p.len() < RETRY_ERRORS + 400, "cut to their end");
+        assert!(p.ends_with(
+            "\n####\n\nSee the testing errors above.\nThe tests are correct, don't try and change them.\n\
+             Fix the code in adder.py to resolve the errors.\n"
+        ));
+        assert_eq!(again.max_tokens, t.max_tokens);
+        assert!(again.score.scored(), "scored by the same tests");
+        // A third try carries the whole conversation on.
+        let third = retry_task(&again, answer, "still wrong").unwrap();
+        assert_eq!(third.messages.len(), 5);
+        // A task with no tests to rerun has no retry.
+        let chat = crate::workloads::Task {
+            score: crate::workloads::Score::None,
+            ..t.clone()
+        };
+        assert!(retry_task(&chat, answer, "").is_none());
+    }
+
+    /// A failed run says why, as unittest reports it, with the work directory taken out; a pass
+    /// says nothing.
+    #[test]
+    fn a_failed_answers_outcome_carries_the_tests_errors() {
+        let Some(runner) = TestRunner::find("python3") else {
+            eprintln!("skipped: no python3 or sandbox-exec");
+            return;
+        };
+        let e = exercise();
+        let wrong = runner
+            .test(&e, "```python\ndef add(a, b):\n    return a - b\n```")
+            .unwrap();
+        assert!(!wrong.passed);
+        assert!(wrong.errors.contains("AssertionError"), "{}", wrong.errors);
+        assert!(
+            !wrong.errors.contains("scr-polyglot-"),
+            "no work directory: {}",
+            wrong.errors
+        );
+        assert!(
+            wrong.errors.contains("Ran 1 test\n"),
+            "no time, as Aider's: {}",
+            wrong.errors
+        );
+        let broken = runner.test(&e, "```python\ndef add(a, b)\n```").unwrap();
+        assert!(broken.errors.contains("SyntaxError"), "{}", broken.errors);
+        let right = runner
+            .test(&e, "```python\ndef add(a, b):\n    return a + b\n```")
+            .unwrap();
+        assert!(right.passed && right.errors.is_empty());
+        // A hang says it timed out, as Aider's does.
+        let hang = runner
+            .test_within(
+                &e,
+                "```python\nwhile True:\n    pass\n```",
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        assert_eq!(hang.errors, "Tests timed out!");
     }
 
     /// A right answer, its tests passing, with `escape` run at import: the answer passes only if

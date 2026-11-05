@@ -310,6 +310,11 @@ ACCURACY_TASKS=0
 # Its limit: 100 RAG tasks take about 25 minutes at 1 user on an 8B model, and minutes at the
 # largest users count, so --cell-timeout-s's 10 would cut it short. Still a limit, for a hung server.
 ACCURACY_TIMEOUT_S=2400
+# A Polyglot exercise's tries, as Aider's benchmark gives it two: the timed first, then once more
+# with its tests' errors where it failed. --coding-tries N gives N, 1 for the first alone.
+CODING_TRIES=2
+# A try's limit: a 2,048-token answer at a slow Mac's 20 tok/s, and its tests' 60 s.
+CODING_RETRY_S=165
 # A task cell's sample: this many rounds of its users count, and at least TASK_MIN_PROMPTS (a
 # conversation of sharegpt-multi-turn is four of them).
 TASK_MIN_PROMPTS=8
@@ -373,6 +378,7 @@ while [[ $# -gt 0 ]]; do
         --settle-s)          SETTLE_S="$2"; shift 2 ;;
         --ready-timeout-s)   READY_TIMEOUT_S="$2"; shift 2 ;;
         --cell-timeout-s)    CELL_TIMEOUT_S="$2"; shift 2 ;;
+        --coding-tries)      CODING_TRIES="$2"; shift 2 ;;
         --cell-hang-tok-s)   CELL_HANG_TOK_S="$2"; shift 2 ;;
         --serve-args)        SERVE_ARGS="$2"; shift 2 ;;
         --seed)              SEED="$2"; shift 2 ;;
@@ -412,6 +418,7 @@ while [[ $# -gt 0 ]]; do
         *)                   echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
+[[ "${CODING_TRIES}" =~ ^([1-9]|10)$ ]] || { echo "--coding-tries takes 1 to 10, not ${CODING_TRIES}" >&2; exit 2; }
 # Every Mac runs the small set; its memory picks only the grid's prompts (below).
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 MODELS_DEFAULT="${MODELS_SMALL}"   # the large set runs by name (--models large)
@@ -666,7 +673,7 @@ PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
 export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB MODELS_GIVEN
 TASK_MAX_PROMPT=$(tr ',' '\n' <<<"${SCALE_GRID_INPUT}" | sort -n | tail -1)
-export WORKLOADS WORKLOADS_SCRATCHY TASK_MAX_PROMPT TASK_MIN_PROMPTS GRID_DATASET ACCURACY_TASKS SHAREGPT_URL
+export WORKLOADS WORKLOADS_SCRATCHY TASK_MAX_PROMPT TASK_MIN_PROMPTS GRID_DATASET ACCURACY_TASKS CODING_TRIES SHAREGPT_URL
 export STARTED_UTC PERCENTILES PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
        SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS SCALE_REPEATS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S CELL_HANG_TOK_S RESUME MODELS_FULL
@@ -752,6 +759,8 @@ json.dump({
                  # The grid's prompts: natural text, or random token IDs.
                  "grid_dataset": e["GRID_DATASET"],
                  "accuracy_tasks": int(e["ACCURACY_TASKS"]) or None,
+                 # A Polyglot exercise's tries: the timed first, then each failed one asked again.
+                 "coding_tries": int(e["CODING_TRIES"]),
                  "sharegpt": e["SHAREGPT_URL"],
                  "concurrency_is": "offered (--max-concurrency), not the effective decode batch"},
              "comparison": {row.split("|")[0]: row.split("|")[2] == "1"
@@ -1234,8 +1243,10 @@ run_task_cell() { # prefix workload conc
         shared-prefix-control) extra=(--dataset-name shared-prefix --no-reuse) ;;
         # The tests need only the standard library: the system python3, not the mlx venv, so a Mac
         # without mlx still scores them.
-        # Scored by its tests, so its answers run free: a forced length cuts a solution off.
-        polyglot)              extra=(--dataset-name polyglot --coding-python /usr/bin/python3); timed=() ;;
+        # Scored by its tests, so its answers run free: a forced length cuts a solution off. Each
+        # failed answer is then asked again with its tests' errors, as Aider's benchmark does,
+        # untimed: CODING_TRIES tries in all, the first the timed cell's.
+        polyglot)              extra=(--dataset-name polyglot --coding-python /usr/bin/python3 --coding-tries "${CODING_TRIES}"); timed=() ;;
         swe-bench)             extra=(--dataset-name swe-bench) ;;
         *)                     echo "    unknown workload ${w}, skipped" >&2; return 0 ;;
     esac
@@ -1248,6 +1259,9 @@ run_task_cell() { # prefix workload conc
     [[ -n "${srv}" ]] && { mem_sampler "${srv}" "${mem}" & sampler=$!; }
     local limit="${CELL_TIMEOUT_S}" therm_before therm_after
     if [[ "${w}" == rag-accuracy ]]; then limit="${ACCURACY_TIMEOUT_S}"; fi
+    # Polyglot's tries after the first run one at a time once it is timed, each an answer and its
+    # tests: up to CODING_RETRY_S more a task a try, so a server that answers is not cut off.
+    if [[ "${w}" == polyglot ]]; then limit=$(( limit + n * (CODING_TRIES - 1) * CODING_RETRY_S )); fi
     therm_before="$(therm_now)"
     { perl -e 'alarm shift; exec @ARGV' "${limit}" \
         "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${cell_model:-${id}}" \
@@ -1876,7 +1890,9 @@ def scaling(engine):
 # What a dataset cell keeps: the serving metrics, then what a task measures.
 TASK_KEEP = KEEP + ["dataset", "task_seed", "num_tasks", "timed_answers",
                     "start_times", "ttfts_ms", "e2els_ms", "mean_output_tokens", "mean_prompt_tokens", "mean_cached_tokens",
-                    "accuracy", "empty_answers", "thinking_answers", "capped_answers"]
+                    "accuracy", "empty_answers", "thinking_answers", "capped_answers",
+                    # A coding cell's tries: accuracy after each, and each task's try that passed.
+                    "tests_run", "coding_tries", "accuracy_by_try", "passed_at_try"]
 TASK_CELL = re.compile(r"\.tasks-([a-z0-9-]+)@(\d+)\.json$")
 def tasks(engine):
     cells = []

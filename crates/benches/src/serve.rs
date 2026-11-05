@@ -1791,7 +1791,8 @@ fn run_tasks(
     // A coding exercise's answers, run against its tests once each, after timing: None where the
     // machine cannot run them.
     let count = |t: &str| datasets::token_count(tokenizer, t).unwrap_or(0);
-    let tested = run_task_tests(args, &results, &tasks, &count);
+    let run = run_task_tests(args, &results, &tasks, &count);
+    let tested = run.as_ref().map(|(_, passed, _)| passed.clone());
     if let Some(path) = &args.save_answers {
         let rows: Vec<serde_json::Value> = (results.iter().zip(tasks.iter()).enumerate())
             .map(|(i, (r, t))| {
@@ -1825,6 +1826,35 @@ fn run_tasks(
         let accuracy = tested_accuracy(&json, tested.as_deref());
         json["accuracy"] = serde_json::json!(accuracy);
         json["tests_run"] = serde_json::json!(tested.is_some());
+        // Then each failed answer asked again with its tests' errors, as Aider's benchmark does,
+        // untimed and after the cell: `accuracy` stays the first try's, which every engine's
+        // timed cell is, and the tries' accuracy goes beside it.
+        if let Some((runner, passed, errors)) = run.filter(|_| args.coding_tries > 1) {
+            eprintln!(
+                "Asking each failed answer again, up to {} tries...",
+                args.coding_tries
+            );
+            let answers: Vec<&str> = results.iter().map(|r| r.generated_text.as_str()).collect();
+            let send = |t: &crate::workloads::Task| {
+                let r = send_body(&client, &client.api_url, &body(t), "retry", Instant::now());
+                let capped = ran_to_cap(&r, t, &count);
+                r.success.then_some((r.generated_text, capped))
+            };
+            let test = |e: &crate::coding::Exercise, answer: &str| match runner.test(e, answer) {
+                Ok(o) => Some(o),
+                Err(err) => {
+                    eprintln!("  {}: tests did not run: {err:#}", e.name);
+                    None
+                }
+            };
+            let tries = args.coding_tries as usize;
+            let by = retry_failed(&tasks, &answers, &passed, &errors, tries, send, test);
+            json["coding_tries"] = serde_json::json!(tries);
+            json["accuracy_by_try"] = serde_json::json!(accuracy_by_try(&json, &by, tries));
+            // Each task's try that passed, null where none did or it was never judged.
+            json["passed_at_try"] =
+                serde_json::json!(by.iter().map(|p| p.flatten()).collect::<Vec<_>>());
+        }
     }
     // Forced answers are no reading of accuracy, and every one ran to its length by design: a
     // timed coding answer is cut off at its length, so its tests are no reading either.
@@ -1870,7 +1900,7 @@ fn run_task_tests(
     results: &[RequestResult],
     tasks: &[crate::workloads::Task],
     count_tokens: &dyn Fn(&str) -> usize,
-) -> Option<Vec<Option<bool>>> {
+) -> Option<(crate::coding::TestRunner, Vec<Option<bool>>, Vec<String>)> {
     use crate::workloads::Score;
     // Forced answers are cut off at their length: no reading to run.
     if args.timed_answers || !tasks.iter().any(|t| matches!(t.score, Score::Tests(_))) {
@@ -1887,18 +1917,95 @@ fn run_task_tests(
     // An answer that ran to its cap is wrong without running it, as for the text-scored workloads:
     // a file cut off mid-way is no answer, whatever of it passes.
     let capped = |r: &RequestResult, t: &crate::workloads::Task| ran_to_cap(r, t, count_tokens);
+    // Each answer's outcome, and its tests' errors where it failed on them: what a retry sends
+    // back. A capped answer has none, and is asked again no more than a failed request.
+    let (passed, errors) = (results.iter().zip(tasks))
+        .map(|(r, t)| match &t.score {
+            Score::Tests(_) if r.success && capped(r, t) => (Some(false), String::new()),
+            Score::Tests(e) if r.success => match runner.test(e, &r.generated_text) {
+                Ok(o) => (Some(o.passed), o.errors),
+                Err(err) => {
+                    eprintln!("  {}: tests did not run: {err:#}", e.name);
+                    (None, String::new())
+                }
+            },
+            _ => (None, String::new()),
+        })
+        .unzip();
+    Some((runner, passed, errors))
+}
+
+/// Each coding task's try that passed, after the timed first: Some(Some(k)) where try k passed,
+/// Some(None) where none of `tries` did, None where it was never judged (a request that failed, a
+/// test that did not start). A task whose first answer failed on its tests is asked again, one
+/// task at a time and untimed, by `send` (its answer, and whether it ran to its cap), with
+/// [`crate::coding::retry_task`]'s conversation, until it passes or the tries run out. An
+/// answer that ran to its cap, or a retry's request that failed, ends its tries wrong.
+fn retry_failed(
+    tasks: &[crate::workloads::Task],
+    answers: &[&str],
+    first: &[Option<bool>],
+    first_errors: &[String],
+    tries: usize,
+    send: impl Fn(&crate::workloads::Task) -> Option<(String, bool)>,
+    test: impl Fn(&crate::coding::Exercise, &str) -> Option<crate::coding::Outcome>,
+) -> Vec<Option<Option<usize>>> {
+    (tasks.iter().enumerate())
+        .map(|(i, t)| {
+            let passed = first[i]?;
+            if passed {
+                return Some(Some(1));
+            }
+            let crate::workloads::Score::Tests(e) = &t.score else {
+                return Some(None);
+            };
+            // A first answer with no errors to send back ran to its cap: wrong, not asked again.
+            if first_errors[i].is_empty() {
+                return Some(None);
+            }
+            let (mut task, mut answer, mut errors) =
+                (t.clone(), answers[i].to_string(), first_errors[i].clone());
+            for k in 2..=tries {
+                let Some(next) = crate::coding::retry_task(&task, &answer, &errors) else {
+                    return Some(None);
+                };
+                let Some((reply, capped)) = send(&next) else {
+                    return Some(None);
+                };
+                if capped {
+                    return Some(None);
+                }
+                let o = test(e, &reply)?;
+                if o.passed {
+                    return Some(Some(k));
+                }
+                (task, answer, errors) = (next, reply, o.errors);
+            }
+            Some(None)
+        })
+        .collect()
+}
+
+/// A coding cell's accuracy after each of `tries`, over every task sent: the tasks that passed by
+/// that try ([`retry_failed`]). None where a task's first try was never judged and its request
+/// did not fail, as [`tested_accuracy`] has it.
+fn accuracy_by_try(
+    json: &serde_json::Value,
+    by: &[Option<Option<usize>>],
+    tries: usize,
+) -> Option<Vec<f64>> {
+    let sent = json["num_tasks"].as_u64()? as usize;
+    let failed = json["failed"].as_u64().unwrap_or(0) as usize;
+    if by.iter().flatten().count() + failed < sent {
+        return None;
+    }
     Some(
-        (results.iter().zip(tasks))
-            .map(|(r, t)| match &t.score {
-                Score::Tests(_) if r.success && capped(r, t) => Some(false),
-                Score::Tests(e) if r.success => match runner.passes(e, &r.generated_text) {
-                    Ok(p) => Some(p),
-                    Err(err) => {
-                        eprintln!("  {}: tests did not run: {err:#}", e.name);
-                        None
-                    }
-                },
-                _ => None,
+        (1..=tries)
+            .map(|k| {
+                let passed = (by.iter().flatten())
+                    .filter(|p| p.is_some_and(|at| at <= k))
+                    .count();
+                passed as f64 / sent.max(1) as f64
             })
             .collect(),
     )
@@ -2607,6 +2714,82 @@ mod tests {
             7,
         );
         assert_eq!(j["capped_answers"], 1, "the cell counts it the same way");
+    }
+
+    /// A coding cell's accuracy after each try, each over every task sent: try 2 adds the tasks
+    /// whose second answer passed to those whose first did. None where try 1's tests did not all
+    /// run, as for the cell's own accuracy.
+    #[test]
+    fn a_coding_cells_accuracy_counts_each_try() {
+        let j = |failed: u64| serde_json::json!({"num_tasks": 4, "failed": failed});
+        // Passed on try 1, on try 2, never, never.
+        let tries = [Some(Some(1)), Some(Some(2)), Some(None), Some(None)];
+        assert_eq!(accuracy_by_try(&j(0), &tries, 2), Some(vec![0.25, 0.5]));
+        // A failed request is wrong on every try.
+        let tries = [Some(Some(1)), None, Some(Some(2)), Some(None)];
+        assert_eq!(
+            accuracy_by_try(&j(1), &tries, 3),
+            Some(vec![0.25, 0.5, 0.5])
+        );
+        // A test that did not start: no accuracy at any try.
+        assert_eq!(accuracy_by_try(&j(0), &tries, 2), None);
+    }
+
+    /// The failed answers, and only they, are asked again, each with its own errors, until one
+    /// passes or the tries run out; an answer that ran to its cap is wrong without being asked.
+    #[test]
+    fn a_failed_answer_is_asked_again_until_it_passes() {
+        use crate::coding::Outcome;
+        let ex = |name: &str| crate::coding::Exercise {
+            name: name.into(),
+            solution: format!("{name}.py"),
+            files: vec![(format!("{name}_test.py"), String::new())],
+        };
+        let task = |name: &str| crate::coding::polyglot_task("Do it.\n", "pass\n", ex(name));
+        let tasks = vec![task("a"), task("b"), task("c")];
+        let first = vec![Some(true), Some(false), Some(false)];
+        let answers = ["A1", "B1", "C1"];
+        let sent = std::cell::RefCell::new(Vec::new());
+        // b passes at its second answer; c never does.
+        let send = |t: &crate::workloads::Task| {
+            let name = match &t.score {
+                crate::workloads::Score::Tests(e) => e.name.clone(),
+                _ => unreachable!(),
+            };
+            let errors = t.messages.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            sent.borrow_mut()
+                .push((name.clone(), t.messages.len(), errors));
+            let n = sent.borrow().iter().filter(|(s, ..)| *s == name).count();
+            Some((format!("{}{}", name.to_uppercase(), n + 1), false))
+        };
+        let test = |e: &crate::coding::Exercise, answer: &str| {
+            Some(Outcome {
+                passed: e.name == "b" && answer == "B2",
+                errors: format!("{answer} failed"),
+            })
+        };
+        let first_errors = vec![String::new(), "B1 failed".into(), "C1 failed".into()];
+        let tries = retry_failed(&tasks, &answers, &first, &first_errors, 3, send, test);
+        assert_eq!(tries, vec![Some(Some(1)), Some(Some(2)), Some(None)]);
+        let sent = sent.into_inner();
+        let asked: Vec<(&str, usize)> = sent.iter().map(|(n, m, _)| (n.as_str(), *m)).collect();
+        assert_eq!(
+            asked,
+            [("b", 3), ("c", 3), ("c", 5)],
+            "a never again, b once, c twice"
+        );
+        assert!(sent[1].2.starts_with("C1 failed"), "its own errors");
+        assert!(
+            sent[2].2.starts_with("C2 failed"),
+            "the last answer's errors"
+        );
+        // One try is the first alone: nothing is asked again.
+        let none = |_: &crate::workloads::Task| -> Option<(String, bool)> { panic!("asked") };
+        let tries = retry_failed(&tasks, &answers, &first, &first_errors, 1, none, test);
+        assert_eq!(tries, vec![Some(Some(1)), Some(None), Some(None)]);
     }
 
     /// A coding cell's accuracy is over every task sent, a failed request scoring wrong; it is
