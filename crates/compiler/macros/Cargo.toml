@@ -21,7 +21,7 @@ default = []
 # `Instruction` variants (`SynthGateUpSiluMul`, `AffineEmbed`) are
 # visible to the macro's match arms — they're gated
 # `#[cfg(feature = "metal")]` in `scratchy-forward-compiler::instr`.
-metal = ["dep:scratchy-ir", "scratchy-ir/metal", 
+metal = ["scratchy-ir/metal",
     "dep:scratchy-target-metal",
     "dep:scratchy-target-metal-compiler",
     "scratchy-forward-compiler/metal",
@@ -53,7 +53,8 @@ turboquant = []
 [dependencies]
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-scratchy-ir = { path = "../ir", optional = true }
+# The model facts (`scratchy_ir::model_facts`) the fill builds on every target.
+scratchy-ir = { path = "../ir" }
 # PD-wavefront (task T2b): the subtile-wavefront IR + lowering +
 # scheduler + host tape player live in this normal (Mac-testable) lib
 # crate. `to_wavefront.rs` here translates the solved FUF + `Assignment`

@@ -1500,11 +1500,12 @@ impl BatchChunking {
     /// ⛔ `seqs` AND `nkvh` ARE COUNTS, ONE OR MORE. Both divide here, so a zero is a panic at BAKE
     /// and not a wrong answer — `seqs` has divided since this function existed (`CORES / seqs`) and
     /// `nkvh` since the fold was added (`GATHER_FLOOR.div_ceil(seqs · rows_per_page)`). Every
-    /// producer already has them non-zero by type (`AttnGeometry::nkvh` is a `NonZero`, a bundle's
-    /// rows are its baked width), so the clamps below are not a tolerance for zero: they keep this
-    /// `const fn` TOTAL, so a malformed step is a wrong chunking a test can catch rather than a
-    /// build that dies inside a `const` evaluation. The honest end state is a `NonZeroU32` pair in
-    /// the signature; that waits on `PagedStep`'s fields, which the bake's codegen quotes as `u32`.
+    /// producer already has them non-zero (`ModelAttnGeometry::mint` refuses a zero kv-head count,
+    /// a bundle's rows are its baked width), so the clamps below are not a tolerance for zero: they
+    /// keep this `const fn` TOTAL, so a malformed step is a wrong chunking a test can catch rather
+    /// than a build that dies inside a `const` evaluation. The honest end state is a `NonZeroU32`
+    /// pair in the signature; that waits on `PagedStep`'s fields, which the bake's codegen quotes
+    /// as `u32`.
     pub const fn of(seqs: u32, blocks: u32, nkvh: u32) -> BatchChunking {
         let seqs = if seqs < 1 { 1 } else { seqs };
         let theirs = {
@@ -4676,9 +4677,9 @@ mod walk_on_the_card {
 
     /// ⛔ `BatchChunking::of` IS TOTAL — `seqs` and `nkvh` both divide in it, so a zero would be a
     /// panic inside a `const` evaluation at BAKE rather than a wrong answer a test could catch. No
-    /// producer passes zero (`AttnGeometry::nkvh` is a `NonZero`, a rung's rows are its baked
-    /// width), which is exactly why this is pinned: the invariant lives in the callers today, so
-    /// nothing but this test stops the function from dying if one ever slips.
+    /// producer passes zero (`ModelAttnGeometry::mint` refuses a zero kv-head count, a rung's rows
+    /// are its baked width), which is exactly why this is pinned: the invariant lives in the
+    /// callers today, so nothing but this test stops the function from dying if one ever slips.
     #[test]
     fn the_chunking_is_total_at_zero_counts() {
         for (seqs, blocks, nkvh) in [(0u32, 4u32, 8u32), (2, 4, 0), (0, 0, 0), (1, 0, 8)] {

@@ -18,30 +18,30 @@
 //!
 //! ## RmsNorm / FusedAddRmsNorm
 //! - `0`: `M` (uint) — bucket token count
-//! - `1`: `N`/`HIDDEN_SIZE` (uint) — `W::Q_SIZE`
-//! - `2`: `EPS` (float) — `W::RMS_NORM_EPS` (from model config)
+//! - `1`: `N`/`HIDDEN_SIZE` (uint) — the attention base class's `q_width()`
+//! - `2`: `EPS` (float) — `W::FACTS.eps()` (from model config)
 //!
 //! ## FusedGateUpSiluMul
 //! - `0`: `M` (uint)
-//! - `1`: `N`/`INTERMEDIATE_SIZE` (uint) — `W::INTERMEDIATE_SIZE`
-//! - `2`: `K`/`HIDDEN_SIZE` (uint)         — `W::Q_SIZE`
+//! - `1`: `N`/`INTERMEDIATE_SIZE` (uint) — `W::FACTS.intermediate()`
+//! - `2`: `K`/`HIDDEN_SIZE` (uint)         — the base class's `q_width()`
 //!
 //! ## Embed
-//! - `0`: `HIDDEN_SIZE` (uint) — `W::Q_SIZE`
+//! - `0`: `HIDDEN_SIZE` (uint) — `W::FACTS.hidden()`
 //!
 //! ## RopeAppend
 //! - `0`: `HEAD_DIM` (uint)
 //! - `1`: `NUM_Q_HEADS` (uint)
 //! - `2`: `NUM_KV_HEADS` (uint)
-//! - `3`: `ROT_DIM` (uint) — `W::ROT_DIM`; equals `HEAD_DIM` for full rope
-//! - `4`: `BLOCK_SIZE` (uint) — `W::BLOCK_SIZE`
+//! - `3`: `ROT_DIM` (uint) — the base class's `rot_dim()`; equals `HEAD_DIM` for full rope
+//! - `4`: `BLOCK_SIZE` (uint) — the base class's `page()`
 //!
 //! ## AttentionViaCache
 //! - `0`: `HEAD_DIM` (uint)
 //! - `1`: `NUM_Q_HEADS` (uint)
 //! - `2`: `NUM_KV_HEADS` (uint)
-//! - `3`: `ATTN_SCALE` (float) — `W::ATTN_SCALE`
-//! - `4`: `BLOCK_SIZE` (uint) — `W::BLOCK_SIZE`
+//! - `3`: `ATTN_SCALE` (float) — the attention's `scale()`
+//! - `4`: `BLOCK_SIZE` (uint) — the base class's `page()`
 //! - `5`: `MAX_BLOCKS_PER_SEQ` (uint) — `W::MAX_BLOCKS_PER_SEQ`
 //!
 //! ## AttentionPrefillSdpaPaged
@@ -134,22 +134,10 @@ impl GemmBody {
     pub const ALL: [Self; 3] = [Self::Tile, Self::Blocked, Self::Nax];
 }
 
-// `KernelExtras` and friends used to live here. Every field has been
-// promoted to a `CanonicalParams` constant (`RMS_NORM_EPS`,
-// `BLOCK_SIZE`, `MAX_BLOCKS_PER_SEQ`, `PREFILL_TILE_Q`, `ROT_DIM`)
-// because the macro reads them from the model JSON at compile time
-// and emits the per-canonical impl. The lowering pass reads from
-// `W::*` directly when populating `LoweredCommand::constants`, so
-// production code never needs a runtime kernel→constants match.
-//
-// The legacy `kernel_msl_names` / `constants_for` runtime match
-// tables, which used to dispatch from `(KernelId, dtype, bucket_m)`
-// to `(library, function, constants)` as a separate hop after the
-// lowering pass had already picked a `KernelId`, are gone — the
-// lowering arms in `lowering.rs` now bake those choices into
-// `LoweredCommand` directly. Test-only stand-ins live in the
-// `tests` module below; new kernels add one arm in `lower_one`,
-// no second match table to keep in sync.
+// The lowering bakes each command's library, function and constants onto its `LoweredCommand`
+// from the model's `ModelFacts`, so no runtime kernel→constants match exists. The `tests`
+// module's `kernel_msl_names` / `constants_for` are test-only stand-ins; a new kernel adds one arm
+// in `lower_one`.
 
 /// High-level wrapper around [`SpecializedPipelineCache`] that knows
 /// the function-constant index layout for every [`KernelId`].
@@ -698,25 +686,36 @@ mod tests {
         kernel: KernelId,
         bucket_m: u32,
     ) -> Result<Vec<ConstantValue>, PipelineLookupError> {
+        let facts = W::FACTS;
+        // The attention's base class, which every probe model has.
+        let attention = || {
+            (facts.attention()).expect("constants_for: an attention kernel's model has attention")
+        };
+        let base = || attention().base();
+        let intermediate = || {
+            (facts.intermediate())
+                .expect("constants_for: an MLP kernel's model has an MLP")
+                .get() as u32
+        };
         let cv = match kernel {
             KernelId::RmsNorm | KernelId::FusedAddRmsNorm => {
                 crate::tape::kernel_constants::RmsNormConstants {
                     bucket_m: crate::tape::ids::BucketM(bucket_m),
-                    q_size: crate::tape::ids::QSize(W::Q_SIZE as u32),
-                    rms_norm_eps: crate::tape::ids::RmsNormEps(W::RMS_NORM_EPS),
-                    weight_offset: W::NORM_WEIGHT_OFFSET,
+                    q_size: crate::tape::ids::QSize(base().q_width() as u32),
+                    rms_norm_eps: crate::tape::ids::RmsNormEps(facts.eps().get()),
+                    weight_offset: facts.norm_offset().get(),
                 }
                 .into()
             }
             KernelId::FusedGateUpSiluMul if bucket_m == 1 => vec![
                 ConstantValue::uint(3, bucket_m),
-                ConstantValue::uint(4, W::INTERMEDIATE_SIZE as u32),
-                ConstantValue::uint(5, W::Q_SIZE as u32),
+                ConstantValue::uint(4, intermediate()),
+                ConstantValue::uint(5, base().q_width() as u32),
             ],
             KernelId::FusedGateUpSiluMul => vec![
                 ConstantValue::uint(6, bucket_m),
-                ConstantValue::uint(7, W::INTERMEDIATE_SIZE as u32),
-                ConstantValue::uint(8, W::Q_SIZE as u32),
+                ConstantValue::uint(7, intermediate()),
+                ConstantValue::uint(8, base().q_width() as u32),
             ],
             KernelId::Embed => vec![
                 ConstantValue::uint(0, bucket_m),
@@ -725,14 +724,14 @@ mod tests {
                 // head_dim == hidden/num_heads (Llama/Qwen2/Qwen3); Qwen3.5
                 // has head_dim=256 so Q_SIZE(2048) != HIDDEN_SIZE(1024) and
                 // using Q_SIZE reads the wrong (out-of-bounds) table rows.
-                ConstantValue::uint(1, W::HIDDEN_SIZE as u32),
+                ConstantValue::uint(1, facts.hidden().get() as u32),
             ],
             KernelId::RopeAppend => vec![
-                ConstantValue::uint(0, W::HEAD_DIM),
-                ConstantValue::uint(1, W::NUM_Q_HEADS),
-                ConstantValue::uint(2, W::NUM_KV_HEADS),
-                ConstantValue::uint(3, W::ROT_DIM),
-                ConstantValue::uint(4, W::BLOCK_SIZE),
+                ConstantValue::uint(0, base().head_dim().get()),
+                ConstantValue::uint(1, base().q_heads().get()),
+                ConstantValue::uint(2, base().kv_heads().get()),
+                ConstantValue::uint(3, base().rot_dim().get()),
+                ConstantValue::uint(4, base().page().get()),
                 // Slots 5/6 = `ROPE_BLOCKS_PER_CHUNK` / `ROPE_PAIR_OFF`.
                 // The specialized rope writer references both unconditionally,
                 // so the MTL4 build must bake them (else indeterminate consts
@@ -740,15 +739,15 @@ mod tests {
                 // Mirrors `RopeAppendConstants` (`kernel_constants.rs`):
                 // standard NeoX pairs lane i with i + rot_dim/2.
                 ConstantValue::uint(5, crate::BLOCKS_PER_CHUNK),
-                ConstantValue::uint(6, W::ROT_DIM / 2),
+                ConstantValue::uint(6, base().rot_dim().get() / 2),
             ],
             KernelId::AttentionViaCache | KernelId::AttentionPrefillSdpaPaged => {
                 let mut v = vec![
-                    ConstantValue::uint(0, W::HEAD_DIM),
-                    ConstantValue::uint(1, W::NUM_Q_HEADS),
-                    ConstantValue::uint(2, W::NUM_KV_HEADS),
-                    ConstantValue::float(3, W::ATTN_SCALE),
-                    ConstantValue::uint(4, W::BLOCK_SIZE),
+                    ConstantValue::uint(0, base().head_dim().get()),
+                    ConstantValue::uint(1, base().q_heads().get()),
+                    ConstantValue::uint(2, base().kv_heads().get()),
+                    ConstantValue::float(3, attention().scale().get()),
+                    ConstantValue::uint(4, base().page().get()),
                     ConstantValue::uint(5, W::MAX_BLOCKS_PER_SEQ),
                     // Slots 6/7 = `ATTN_BLOCKS_PER_CHUNK` / `ATTN_WINDOW`. Both
                     // are read unconditionally by the sdpa-paged + via-cache
@@ -767,9 +766,9 @@ mod tests {
                     v.push(ConstantValue::uint(
                         16,
                         crate::tape::ids::TqDecodeHeads::largest_group(
-                            crate::tape::ids::HeadDim(W::HEAD_DIM),
-                            crate::tape::ids::NumQHeads(W::NUM_Q_HEADS),
-                            crate::tape::ids::NumKvHeads(W::NUM_KV_HEADS),
+                            crate::tape::ids::HeadDim(base().head_dim().get()),
+                            crate::tape::ids::NumQHeads(base().q_heads().get()),
+                            crate::tape::ids::NumKvHeads(base().kv_heads().get()),
                         )
                         .get(),
                     ));
@@ -948,20 +947,19 @@ mod tests {
     /// standing up a Metal device or a real model variant.
     struct TinyLlamaProbe;
     impl CanonicalParams for TinyLlamaProbe {
-        const HEAD_DIM: u32 = 64;
-        const NUM_Q_HEADS: u32 = 32;
-        const NUM_KV_HEADS: u32 = 4;
-        const Q_SIZE: usize = 2048;
-        const KV_SIZE: usize = 256;
-        const INTERMEDIATE_SIZE: usize = 5632;
-        const ATTN_SCALE: f32 = 0.125;
-        const ATTN_SOFTCAP: f32 = 0.0;
-        const SLIDING_WINDOW: i32 = -1;
+        const FACTS: scratchy_ir::model_facts::ModelFacts = crate::tape::facts::llama_like(
+            32,
+            4,
+            64,
+            5632,
+            2048,
+            0.125,
+            scratchy_ir::model_facts::MetalDtype::Bf16,
+        );
         const KV_LORA_RANK: usize = 0;
         const QK_NOPE_HEAD_DIM: usize = 0;
         const QK_ROPE_HEAD_DIM: usize = 0;
         const V_HEAD_DIM: usize = 0;
-        const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
         const QK_HEAD_DIM: usize = 0;
         const MLA_ATTN_SCALE: f32 = 0.0;
     }
@@ -973,21 +971,19 @@ mod tests {
     /// hits the same shape on a 3-GiB checkpoint.
     struct Llama32Probe;
     impl CanonicalParams for Llama32Probe {
-        const HEAD_DIM: u32 = 128;
-        const NUM_Q_HEADS: u32 = 24;
-        const NUM_KV_HEADS: u32 = 8;
-        const Q_SIZE: usize = 3072;
-        const KV_SIZE: usize = 1024;
-        const INTERMEDIATE_SIZE: usize = 8192;
-        // 1 / sqrt(128) ≈ 0.08838834764831845
-        const ATTN_SCALE: f32 = 0.088388347;
-        const ATTN_SOFTCAP: f32 = 0.0;
-        const SLIDING_WINDOW: i32 = -1;
+        const FACTS: scratchy_ir::model_facts::ModelFacts = crate::tape::facts::llama_like(
+            24,
+            8,
+            128,
+            8192,
+            3072,
+            0.088388347,
+            scratchy_ir::model_facts::MetalDtype::Bf16,
+        );
         const KV_LORA_RANK: usize = 0;
         const QK_NOPE_HEAD_DIM: usize = 0;
         const QK_ROPE_HEAD_DIM: usize = 0;
         const V_HEAD_DIM: usize = 0;
-        const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
         const QK_HEAD_DIM: usize = 0;
         const MLA_ATTN_SCALE: f32 = 0.0;
     }
@@ -1002,21 +998,19 @@ mod tests {
     /// is correct at this specific (HEAD_DIM=64, GQA 4:1) shape.
     struct Llama32_1BProbe;
     impl CanonicalParams for Llama32_1BProbe {
-        const HEAD_DIM: u32 = 64;
-        const NUM_Q_HEADS: u32 = 32;
-        const NUM_KV_HEADS: u32 = 8;
-        const Q_SIZE: usize = 2048;
-        const KV_SIZE: usize = 512;
-        const INTERMEDIATE_SIZE: usize = 8192;
-        // 1 / sqrt(64) = 0.125
-        const ATTN_SCALE: f32 = 0.125;
-        const ATTN_SOFTCAP: f32 = 0.0;
-        const SLIDING_WINDOW: i32 = -1;
+        const FACTS: scratchy_ir::model_facts::ModelFacts = crate::tape::facts::llama_like(
+            32,
+            8,
+            64,
+            8192,
+            2048,
+            0.125,
+            scratchy_ir::model_facts::MetalDtype::Bf16,
+        );
         const KV_LORA_RANK: usize = 0;
         const QK_NOPE_HEAD_DIM: usize = 0;
         const QK_ROPE_HEAD_DIM: usize = 0;
         const V_HEAD_DIM: usize = 0;
-        const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
         const QK_HEAD_DIM: usize = 0;
         const MLA_ATTN_SCALE: f32 = 0.0;
         const METAL_DTYPE: crate::interpreter::metal::MetalDtype =

@@ -194,7 +194,7 @@ pub struct RuntimeBindings {
     /// table (Qwen3.5-VL text decoder). Shared storage; the pool
     /// overwrites `contents()` each forward with the band-split rows the
     /// macro forward builds. Bound at the rope kernel's cos/sin slot in
-    /// place of the static cos/sin source when `MetalModelConsts::mrope`.
+    /// place of the static cos/sin source when the attention has an MRoPE section (`Attention::mrope`).
     /// 16-byte placeholder on 1D-rope arches.
     pub mrope_cos_sin: Buffer,
     /// i32 cu_seqlens for Qwen2.5-VL full-attention layers
