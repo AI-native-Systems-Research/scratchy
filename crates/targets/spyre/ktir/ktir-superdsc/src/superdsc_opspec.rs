@@ -2893,7 +2893,7 @@ impl EntryBase {
 /// [`Self::chunks`], one `SenUint32` stick of entries at a time, so `entries == 0` and
 /// `entries > ENTRIES_PER_OP` are UNWRITABLE: every `GatherEntries` is 1..=32 by construction
 /// (the vendor's ceiling on one gather op's index — one 128-B stick of entries,
-/// `CopyDims::ENTRIES_PER_OP`, which a const assert in `sdsc_abstract` ties to this same
+/// `CopyDims::ENTRIES_PER_OP`, which `sdsc_abstract` defines AS this same
 /// stick). The walk composes past the ceiling by chunking, never by refusing an entry count.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GatherEntries(NonZeroU32);
@@ -2904,16 +2904,19 @@ impl GatherEntries {
     /// multiple of the stick in), so the chunk leg's base and its length are stated together and
     /// a partial or over-long run has no spelling.
     pub fn chunks(total: NonZeroU32) -> impl Iterator<Item = (EntryBase, GatherEntries)> {
-        let cap = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
-        (0..total.get().div_ceil(cap)).map(move |i| {
-            let start = i * cap;
-            let n = (total.get() - start).min(cap);
-            // SAFETY-of-law, not of-memory: `n` is `min(remaining, cap)` with `remaining >= 1`,
-            // and `cap >= 1`, so `n >= 1` — a zero run cannot be minted.
-            (
-                EntryBase(start),
-                GatherEntries(NonZeroU32::new(n).expect("a chunk is never empty")),
-            )
+        const CAP: NonZeroU32 = match NonZeroU32::new(<SenUint32 as DataFormat>::ELEMS_PER_STICK) {
+            Some(c) => c,
+            None => panic!("an index stick holds at least one entry"),
+        };
+        // `remaining` is a NonZeroU32 for every run the loop yields, so `remaining.min(CAP)` —
+        // two non-zeros — is non-zero by type: an empty run has no spelling.
+        let mut start = 0u32;
+        std::iter::from_fn(move || {
+            let remaining = NonZeroU32::new(total.get() - start)?;
+            let n = remaining.min(CAP);
+            let run = (EntryBase(start), GatherEntries(n));
+            start += n.get();
+            Some(run)
         })
     }
 
@@ -3042,15 +3045,14 @@ impl LandingFrame {
                 })?;
                 Ok(LandingFrame::Flat { entries, rows, w })
             } else {
-                // The rank-2 law guarantees this division exact and nonzero: `total =
-                // entries · slab` with `slab % w == 0`, so one entry's one-row blocks are
-                // `slab / w` — at least one (the plane re-frames at all), and at most the
-                // plane's own stick count (so it fits a u32).
-                let rows = NonZeroU32::new(
-                    u32::try_from(slab / width)
-                        .expect("the rank-2 law's one-row blocks fit a u32 (slab/w ≤ sticks)"),
-                )
-                .expect("the rank-2 law lands each entry a nonzero whole number of one-row blocks");
+                // One entry's one-row blocks are `slab / w`: exact because `slab % w == 0` was
+                // checked above. A zero or over-u32 count is refused through the door's own
+                // FrameError, the same one the flat arm uses; there is no panic path here.
+                let rows = nz(slab / width).ok_or_else(|| FrameError::CrossesEntry {
+                    entries: entries.get(),
+                    slab,
+                    frame: to.to_vec(),
+                })?;
                 Ok(LandingFrame::Restickify {
                     entries,
                     t_rows,

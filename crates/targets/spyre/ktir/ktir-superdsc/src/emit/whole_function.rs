@@ -7819,14 +7819,16 @@ fn page_gather_of(
             f.name
         ));
     }
-    let sticks = std::num::NonZeroU32::new(u32::try_from(slab / stick).map_err(|_| Error {
-        message: format!(
-            "{}: the gather's tile states a plane of {} sticks — no u32 plane holds it",
-            f.name,
-            slab / stick
-        ),
-    })?)
-    .expect("a positive stick count is nonzero");
+    let sticks = u32::try_from(slab / stick)
+        .ok()
+        .and_then(std::num::NonZeroU32::new)
+        .ok_or_else(|| Error {
+            message: format!(
+                "{}: the gather's tile states a plane of {} sticks — no non-zero u32 plane holds it",
+                f.name,
+                slab / stick
+            ),
+        })?;
     Ok((
         Gather {
             entries: entries.get(),
