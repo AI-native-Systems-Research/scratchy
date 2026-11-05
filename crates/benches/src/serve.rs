@@ -1743,12 +1743,24 @@ fn run_tasks(
 
     let pb = progress_bar(args, tasks.len());
     let semaphore = args.max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
+    // Open loop at a finite --request-rate: each unit starts at its time on a Poisson schedule
+    // (gamma, --burstiness), not when a user's last answer returns, so the users' requests do not
+    // fall into lockstep (a closed loop's synchronized bursts measured the loop, not the engine).
+    // --max-concurrency stays a cap. A conversation's start is its arrival; its turns follow one
+    // another. At the default `inf` every unit is due at once, as before.
+    let arrivals = generate_request_delays(
+        units.len(),
+        args.request_rate,
+        args.burstiness,
+        args.seed.wrapping_add(42),
+    );
     let start = Instant::now();
     // A thread per unit, holding one concurrency slot: a conversation's turns go one after
     // another, each once the one before it has answered.
     let mut handles = Vec::with_capacity(units.len());
     let mut first = 0;
-    for unit in &units {
+    for (u, unit) in units.iter().enumerate() {
+        wait_until(start, arrivals[u]);
         let bodies: Vec<_> = unit
             .iter()
             .map(|t| task_body(&client, args, t, spans))
@@ -2354,6 +2366,29 @@ mod tests {
         let turns = vec![("hi".to_string(), "one two three".to_string())];
         let turn = &crate::workloads::chat_tasks(&turns, &reply)[0];
         assert_eq!(turn.timed_tokens(), 3);
+    }
+
+    /// Open loop at a finite rate: the units are due on a Poisson schedule spread over about
+    /// (n - 1) / rate seconds, in order, not all at once; at `inf` all are due at once.
+    #[test]
+    fn open_loop_arrivals_spread_the_requests_out() {
+        let at = generate_request_delays(8, 4.0, 1.0, 42);
+        assert_eq!(at.len(), 8);
+        assert_eq!(at[0], 0.0);
+        assert!(at.windows(2).all(|w| w[0] <= w[1]), "in order");
+        assert!(
+            (at[7] - 7.0 / 4.0).abs() < 1e-9,
+            "spread over (n - 1) / rate"
+        );
+        assert!(
+            at.windows(2).any(|w| (w[1] - w[0] - 0.25).abs() > 0.01),
+            "Poisson, not even"
+        );
+        assert!(
+            generate_request_delays(8, f64::INFINITY, 1.0, 42)
+                .iter()
+                .all(|&t| t == 0.0)
+        );
     }
 
     /// A cell keeps each request's send time, TTFT and end-to-end time, null where it failed, and
