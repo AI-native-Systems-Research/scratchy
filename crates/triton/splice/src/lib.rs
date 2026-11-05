@@ -1416,9 +1416,9 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 //  their kernels, operand for operand.
 //
 //  * the K and V CACHE TENSORS the layout names ARE THE POOLS, read head-major as
-//    `[pages, nkvh, PAGE_SLOTS, hd]` — the same bytes as the cache's `[cap, nkvh·hd]`, so the
+//    `[pages, nkvh, SCHEDULER_BLOCK_TOKENS, hd]` — the same bytes as the cache's `[cap, nkvh·hd]`, so the
 //    graph's own tensors carry the pages and nothing is re-allocated;
-//  * a PAGE is the scheduler's KV block ([`PAGE_SLOTS`] slots, the block size the worker hands
+//  * a PAGE is the scheduler's KV block ([`SCHEDULER_BLOCK_TOKENS`] slots, the block size the worker hands
 //    the engine), so a block id the scheduler allocates IS a page of these pools;
 //  * the PAGE INDEX TABLE, the MASK STACK, the QUERY ROW INDEX, `kv_row_pool` and the KV WRITE
 //    INDEX are the step's host sources — tensors at RESERVED tids ([`PagedStepTids`]), filled from
@@ -1463,10 +1463,6 @@ const _: () = assert!(
      the write and the walk rely on is not whole"
 );
 
-/// ⏳ RENAMED to [`SCHEDULER_BLOCK_TOKENS`] — the scheduler's block is a different
-/// quantity from the pool's page and now wears a different name. Every reader is
-/// being swept to the new name; this spelling is deleted by that sweep.
-pub const PAGE_SLOTS: u32 = SCHEDULER_BLOCK_TOKENS;
 
 /// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
 pub const INT32_STICK: u32 = 32;
@@ -1663,7 +1659,7 @@ pub fn kv_write_row() -> TritonKernelRow {
     }
 }
 
-/// The pool a cache tensor is: `pages` of `PAGE_SLOTS` slots at `kv_width = nkvh · hd` per slot.
+/// The pool a cache tensor is: `pages` of `SCHEDULER_BLOCK_TOKENS` slots at `kv_width = nkvh · hd` per slot.
 /// Refused unless the cache is exactly that — a whole number of pages of the stated width.
 fn pool_pages<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
@@ -1672,17 +1668,17 @@ fn pool_pages<F: scratchy_subtile::subtile_ir::RopeForm>(
     what: &str,
 ) -> Result<u32, String> {
     let t = &ir.tensors[cache.tensor.index()];
-    if t.cols != kv_width || t.rows == 0 || !t.rows.is_multiple_of(PAGE_SLOTS) {
+    if t.cols != kv_width || t.rows == 0 || !t.rows.is_multiple_of(SCHEDULER_BLOCK_TOKENS) {
         return Err(format!(
             "triton splice: the {what} cache t{} is [{}, {}], which is not a whole number of \
-             {PAGE_SLOTS}-slot pages at {kv_width} columns — the pool it is read as is \
-             [pages, nkvh, {PAGE_SLOTS}, hd] over exactly those bytes",
+             {SCHEDULER_BLOCK_TOKENS}-slot pages at {kv_width} columns — the pool it is read as is \
+             [pages, nkvh, {SCHEDULER_BLOCK_TOKENS}, hd] over exactly those bytes",
             cache.tensor.index(),
             t.rows,
             t.cols
         ));
     }
-    Ok(t.rows / PAGE_SLOTS)
+    Ok(t.rows / SCHEDULER_BLOCK_TOKENS)
 }
 
 /// A region that is its whole tensor, `rows × cols` — what a kernel viewing the tensor from corner
@@ -1725,13 +1721,13 @@ fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
 ///
 /// Blocks past a sequence's length carry a fully-masked tile, so a walk wider than the context costs
 /// time, never correctness; a walk NARROWER than the context drops keys. So the walk is also the reach
-/// of the rung: a step whose positions end at or below `walk · PAGE_SLOTS` can run on it, whatever its
+/// of the rung: a step whose positions end at or below `walk · SCHEDULER_BLOCK_TOKENS` can run on it, whatever its
 /// start — the mask stack, not the rung, says which of the walked keys each row attends. The splice
 /// bakes it and the wiring states it (`PagedStep::walk`) from this one function.
 pub fn walk_pages(pages: u32, mq: u32, active_cap: ktir_superdsc::ktir_node::ActiveCap) -> u32 {
-    let swept = active_cap.resolve(pages * PAGE_SLOTS, ktir_superdsc::sdsc_abstract::POOL_STICK);
+    let swept = active_cap.resolve(pages * SCHEDULER_BLOCK_TOKENS, ktir_superdsc::sdsc_abstract::POOL_STICK);
     let walked = if swept == 0 { mq } else { swept };
-    walked.div_ceil(PAGE_SLOTS).min(pages)
+    walked.div_ceil(SCHEDULER_BLOCK_TOKENS).min(pages)
 }
 
 /// ⭐ THE WALK RUNGS — spyre-inference's `SpyreAttnBucketer` (`spyre_attn_bucketer.py`, 297fc48): its
@@ -1861,7 +1857,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         // (torch-spyre#4033), and their per-sequence LOOP — one launch a sequence — serves that step
         // instead. We have no per-sequence loop: one rung is one launch, so the only honest answer
         // is this refusal, by name. It needs a pool of at most `CORES` pages to fire, i.e. a context
-        // of at most `CORES · PAGE_SLOTS` positions, and the one config in scope that small
+        // of at most `CORES · SCHEDULER_BLOCK_TOKENS` positions, and the one config in scope that small
         // (tinyllama-1.1b, 2048) bakes no spyre decode at all (its head is untied). PORTING their
         // loop is what admits such a pool.
         let chunking = BatchChunking::of(mq, blocks, nkvh);
@@ -1896,7 +1892,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             ("NUM_CHUNKS", chunking.num_chunks),
             ("NUM_KV_HEADS", nkvh),
             ("NUM_QUERIES_PER_KV", nqh / nkvh),
-            ("BLOCK_SIZE", PAGE_SLOTS),
+            ("BLOCK_SIZE", SCHEDULER_BLOCK_TOKENS),
             ("HEAD_SIZE", hd),
             ("NUM_PAGES", pages),
             ("ROWS_PER_PAGE", chunking.rows_per_page),
@@ -1955,7 +1951,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         ("NUM_HEADS", nqh),
         ("NUM_KV_HEADS", nkvh),
         ("HEAD_SIZE", hd),
-        ("BLOCK_SIZE", PAGE_SLOTS),
+        ("BLOCK_SIZE", SCHEDULER_BLOCK_TOKENS),
         ("NUM_PAGES", pages),
         ("NUM_BLOCKS", blocks),
     ];
@@ -2076,7 +2072,7 @@ pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
         ("T", rows),
         ("NUM_KV_HEADS", nkvh),
         ("HEAD_SIZE", hd),
-        ("NUM_ROWS", pages * nkvh * PAGE_SLOTS),
+        ("NUM_ROWS", pages * nkvh * SCHEDULER_BLOCK_TOKENS),
     ] {
         signature.insert(k.to_string(), ArgSpec::Constexpr);
         constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
@@ -3876,7 +3872,7 @@ mod production_ktir_dump {
                 ("NUM_HEADS", Val::Int(32)),
                 ("NUM_KV_HEADS", Val::Int(8)),
                 ("HEAD_SIZE", Val::Int(hd)),
-                ("BLOCK_SIZE", Val::Int(i128::from(PAGE_SLOTS))),
+                ("BLOCK_SIZE", Val::Int(i128::from(SCHEDULER_BLOCK_TOKENS))),
                 ("NUM_PAGES", Val::Int(pages)),
                 ("NUM_BLOCKS", Val::Int(blocks)),
                 ("SCALE", Val::Float(0.125)),
@@ -3935,7 +3931,7 @@ mod production_ktir_dump {
                         ("NUM_CHUNKS", Val::Int(i128::from(c.num_chunks))),
                         ("NUM_KV_HEADS", Val::Int(8)),
                         ("NUM_QUERIES_PER_KV", Val::Int(4)),
-                        ("BLOCK_SIZE", Val::Int(i128::from(PAGE_SLOTS))),
+                        ("BLOCK_SIZE", Val::Int(i128::from(SCHEDULER_BLOCK_TOKENS))),
                         ("HEAD_SIZE", Val::Int(hd)),
                         ("NUM_PAGES", Val::Int(2048)),
                         ("ROWS_PER_PAGE", Val::Int(i128::from(c.rows_per_page))),
@@ -3973,7 +3969,7 @@ mod production_ktir_dump {
                         ("T", Val::Int(t)),
                         ("NUM_KV_HEADS", Val::Int(nkvh)),
                         ("HEAD_SIZE", Val::Int(hd)),
-                        ("NUM_ROWS", Val::Int(4 * nkvh * i128::from(PAGE_SLOTS))),
+                        ("NUM_ROWS", Val::Int(4 * nkvh * i128::from(SCHEDULER_BLOCK_TOKENS))),
                     ],
                 ),
                 vec![1],
@@ -4401,7 +4397,7 @@ mod production_ktir_dump {
 }
 
 /// ⭐ THE PAGE WALK ON THE CARD — spyre-inference's page walk at granite-3.1-2b's own pool (2048 pages of
-/// [`PAGE_SLOTS`] slots, 32 query heads over 8 kv heads at head dim 64), through the card's walk lowering
+/// [`SCHEDULER_BLOCK_TOKENS`] slots, 32 query heads over 8 kv heads at head dim 64), through the card's walk lowering
 /// (`whole_function::lower_walk`): the loop becomes ONE body built at trip 0 that the card relaunches
 /// once per trip, and every fact of that relaunch is read off the program.
 #[cfg(test)]
@@ -4444,7 +4440,7 @@ mod walk_on_the_card {
             ("NUM_HEADS", 32),
             ("NUM_KV_HEADS", 8),
             ("HEAD_SIZE", hd),
-            ("BLOCK_SIZE", i128::from(PAGE_SLOTS)),
+            ("BLOCK_SIZE", i128::from(SCHEDULER_BLOCK_TOKENS)),
             ("NUM_PAGES", 2048),
             ("NUM_BLOCKS", blocks),
         ];
@@ -4654,7 +4650,7 @@ mod walk_on_the_card {
             ("NUM_CHUNKS", c.num_chunks),
             ("NUM_KV_HEADS", 8),
             ("NUM_QUERIES_PER_KV", 4),
-            ("BLOCK_SIZE", PAGE_SLOTS),
+            ("BLOCK_SIZE", SCHEDULER_BLOCK_TOKENS),
             ("HEAD_SIZE", hd),
             ("NUM_PAGES", 2048),
             ("ROWS_PER_PAGE", c.rows_per_page),
@@ -5389,7 +5385,7 @@ mod walk_on_the_card {
                 .expect("one dsc");
             assert_eq!(
                 dsc["N_"],
-                serde_json::json!({"name_": "n", "mb_": 8, "y_": 1, "x_": PAGE_SLOTS, "out_": 128}),
+                serde_json::json!({"name_": "n", "mb_": 8, "y_": 1, "x_": SCHEDULER_BLOCK_TOKENS, "out_": 128}),
                 "{}: one [BLOCK, 128] block an entry — the one op's `blocks == 1` case",
                 e.op_name
             );
@@ -5762,9 +5758,9 @@ mod walk_on_the_card {
                     e.op_name
                 );
             }
-            // The mask, `[P, PAGE_SLOTS]` of the stick-major stack of `blocks` tiles: one add a
+            // The mask, `[P, SCHEDULER_BLOCK_TOKENS]` of the stick-major stack of `blocks` tiles: one add a
             // stick plane, each reading that plane of the mask.
-            let adds: Vec<_> = (0..PAGE_SLOTS / 64)
+            let adds: Vec<_> = (0..SCHEDULER_BLOCK_TOKENS / 64)
                 .map(|c| {
                     let e = named(&format!("add{c}_o"));
                     assert_eq!(e.len(), 1, "mq={mq} hd={hd}: plane {c}'s mask add");
@@ -5817,7 +5813,7 @@ mod walk_on_the_card {
     /// and the output back after it (each head's row laid row-major, scattered into the output laid
     /// row-major and back: three), so each contraction is ONE op over every query head, its kernel the kv
     /// head's block expanded once per query head of its group, and nothing re-lays a head on a trip.
-    /// Each page (8 kv heads × [`PAGE_SLOTS`] slots × 128, 256 KB) is gathered in ONE op, as the
+    /// Each page (8 kv heads × [`SCHEDULER_BLOCK_TOKENS`] slots × 128, 256 KB) is gathered in ONE op, as the
     /// reference's compiled prefill gathers it (`sdsc_4` / `sdsc_5`): its one entry the page, every kv
     /// head's block landed stick-major — no pieces, no scaled page id, no permute on the trip.
     #[test]
@@ -5842,7 +5838,7 @@ mod walk_on_the_card {
         };
         let stick = 64u32;
         assert_eq!(
-            PAGE_SLOTS / stick,
+            SCHEDULER_BLOCK_TOKENS / stick,
             2,
             "a page two sticks wide, as the head is"
         );
@@ -6044,7 +6040,7 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
             ("T", t),
             ("NUM_KV_HEADS", nkvh),
             ("HEAD_SIZE", hd),
-            ("NUM_ROWS", 4 * nkvh * i128::from(PAGE_SLOTS)),
+            ("NUM_ROWS", 4 * nkvh * i128::from(SCHEDULER_BLOCK_TOKENS)),
         ] {
             signature.insert(k.to_string(), ArgSpec::Constexpr);
             constexprs.insert(k.to_string(), Val::Int(v));

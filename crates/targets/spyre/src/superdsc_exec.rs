@@ -5933,7 +5933,7 @@ impl Executor {
     pub fn pmask_slots(&self) -> Option<usize> {
         let nm = bundle::PlaceId::Act(crate::lower_subtile_tape_to_superdsc::ATTN_MASK_TID);
         let slots = (self.places.get(&nm)?.size / 2) as usize;
-        let per_page = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS;
+        let per_page = scratchy_subtile::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS;
         (slots != 0 && slots.is_multiple_of(per_page)).then_some(slots)
     }
 

@@ -26,7 +26,7 @@ use ktir_superdsc::sdsc_abstract::{
 };
 
 const POOL_STICK: u32 = ktir_superdsc::sdsc_abstract::POOL_STICK;
-const PER_PAGE: u32 = PagedKvPool::PAGE_SLOTS as u32;
+const PER_PAGE: u32 = PagedKvPool::POOL_PAGE_SLOTS as u32;
 /// `-(f16::MAX / 2)` = −32752.0 — the mask's −∞, spelled as a literal (`f16::to_f32` is not const).
 const MASK_NEG: f32 = -32752.0;
 

@@ -229,7 +229,7 @@ fn resolve_num_layers(hf_config: &HfModelConfig) -> usize {
 /// 🛑 THIS FUNCTION USED TO BE THE DISAGREEMENT. It answered with a literal `64` under
 /// `#[cfg(feature = "spyre")]` and a comment justifying it by the shape of a pool that had since been
 /// rebuilt: "the PagedAttn ops HARD-CODE `block_size`=64 (the pool is `[nblk, 64, nkv, hd]`)". The
-/// superdsc pool's page is `PagedKvPool::PAGE_SLOTS` = 256. The mismatch was inert only because the
+/// superdsc pool's page is `PagedKvPool::POOL_PAGE_SLOTS` = 256. The mismatch was inert only because the
 /// worker IGNORED the scheduler's block ids and allocated pages from a free list of its own — which is
 /// the same "two allocators for one resource" that made prefix caching impossible. Ask the backend.
 fn effective_block_size(configured: usize, device: &str) -> usize {

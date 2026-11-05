@@ -188,11 +188,11 @@ impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFacto
 
     /// The pool's page IS the KV block, so the scheduler's `slot = block_id * block_size + offset` and
     /// the worker's page map address the same cells. Sourced from the page the forward's attention
-    /// walks (`paged_step::PAGE_SLOTS`, its kernels' `BLOCK_SIZE`), the one constant the bake sized
+    /// walks (`paged_step::SCHEDULER_BLOCK_TOKENS`, its kernels' `BLOCK_SIZE`), the one constant the bake sized
     /// the pools by.
     fn required_block_size(&self) -> Option<scratchy_core_common::KvBlockTokens> {
         scratchy_core_common::KvBlockTokens::new(
-            scratchy_target_spyre::paged_step::PAGE_SLOTS as usize,
+            scratchy_target_spyre::paged_step::SCHEDULER_BLOCK_TOKENS as usize,
         )
     }
 

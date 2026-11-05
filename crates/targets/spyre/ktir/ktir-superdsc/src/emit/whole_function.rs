@@ -2579,7 +2579,7 @@ fn program_broadcast_chains(
 /// the same offsets, addressed as the flat frame states them.
 ///
 /// A rank > 2 broadcast's source is a full tile (the `[256, 4]` running max of a
-/// `[256, 4, PAGE_SLOTS]` score tile), and the flat frame's law is that a rank-N tile and its
+/// `[256, 4, POOL_PAGE_SLOTS]` score tile), and the flat frame's law is that a rank-N tile and its
 /// `[prod(leading..=second-last), last]` flattening are the SAME BYTES: element `(b, g)` at flat
 /// index `b·G + g` is flat row `b·G + g`'s scalar. So the operand the consumer addresses — one
 /// element per flat row (`Col`) or one flat row of the result's width (`Mb`) — is the source

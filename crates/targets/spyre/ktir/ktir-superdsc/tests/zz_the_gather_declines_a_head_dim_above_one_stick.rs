@@ -110,7 +110,7 @@ fn a_head_dim_above_one_stick_gets_no_gather_at_any_rung_or_width() {
          window two strided runs"
     );
 
-    // `ActiveCap::decode_ladder`'s rungs: the interior ones plus the PAGE_SLOTS ceiling, i.e. every
+    // `ActiveCap::decode_ladder`'s rungs: the interior ones plus the POOL_PAGE_SLOTS ceiling, i.e. every
     // `nb` a fold pass can sweep. Widths are the baked decode rungs the 8b run reported ready.
     for cap in [64u32, 128, 256] {
         for mq in [1u32, 2, 4, 8, 16, 32] {

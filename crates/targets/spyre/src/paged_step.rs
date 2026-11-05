@@ -35,8 +35,6 @@ use crate::wiring::PagedStep;
 pub use scratchy_triton_splice::{
     BatchChunking, PagedRows, SCHEDULER_BLOCK_TOKENS, walk_buckets, walk_pages,
 };
-/// ⏳ The pre-rename spelling, re-exported until the reader sweep deletes it.
-pub use scratchy_triton_splice::PAGE_SLOTS;
 
 /// `finfo(float16).min` — spyre-inference's masked additive value: finite, so a fully-masked tile's
 /// row maximum stays finite and its weights vanish under the running maximum.
@@ -116,8 +114,8 @@ pub fn prove_ladder_walks(
 /// 104832 positions, 819 pages. `None` when not one page fits.
 pub fn pool_slots(context_slots: u32, kv_slot_bytes: u64) -> Option<std::num::NonZeroU32> {
     let fit = scratchy_spyre_bundle::MAX_SEGMENT_BYTES / kv_slot_bytes.max(1);
-    let fit_pages = u32::try_from(fit / u64::from(PAGE_SLOTS)).unwrap_or(u32::MAX);
-    let slots = context_slots.min(fit_pages.saturating_mul(PAGE_SLOTS));
+    let fit_pages = u32::try_from(fit / u64::from(SCHEDULER_BLOCK_TOKENS)).unwrap_or(u32::MAX);
+    let slots = context_slots.min(fit_pages.saturating_mul(SCHEDULER_BLOCK_TOKENS));
     std::num::NonZeroU32::new(slots)
 }
 
@@ -867,10 +865,10 @@ mod tests {
         // whole pages (819 of 128 slots).
         let p = pool_slots(ctx, slot(40, 8, 128)).expect("a page fits");
         assert_eq!(p.get(), 104_832);
-        assert!(p.get().is_multiple_of(PAGE_SLOTS), "whole pages");
+        assert!(p.get().is_multiple_of(SCHEDULER_BLOCK_TOKENS), "whole pages");
         assert!(u64::from(p.get()) * slot(40, 8, 128) <= scratchy_spyre_bundle::MAX_SEGMENT_BYTES);
         assert!(
-            u64::from(p.get() + PAGE_SLOTS) * slot(40, 8, 128)
+            u64::from(p.get() + SCHEDULER_BLOCK_TOKENS) * slot(40, 8, 128)
                 > scratchy_spyre_bundle::MAX_SEGMENT_BYTES
         );
         // A context shorter than the pool would hold is the pool.

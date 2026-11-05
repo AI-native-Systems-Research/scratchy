@@ -8,7 +8,7 @@ use ktir_superdsc::sdsc_abstract::{ChunkScratch, PagedKvPool};
 
 const NKVH: usize = 8;
 const STICK: u64 = 64;
-const PAGE_SLOTS: u64 = PagedKvPool::PAGE_SLOTS as u64;
+const POOL_PAGE_SLOTS: u64 = PagedKvPool::POOL_PAGE_SLOTS as u64;
 
 /// For destination element `(kvh, dest_in_head)` of a gather whose entry order is `coord`, the
 /// `(page, element in that page's plane)` it is copied from: the entry it falls in names its source
@@ -39,7 +39,7 @@ fn each_kv_head_gathers_whole_chunk_kernels_at_every_admitted_head_dim() {
         let hbe = chunk.plane().head_block_elems();
         for kvh in 0..NKVH as u64 {
             for sl in 0..slots {
-                let (page, s) = (sl / PAGE_SLOTS, sl % PAGE_SLOTS);
+                let (page, s) = (sl / POOL_PAGE_SLOTS, sl % POOL_PAGE_SLOTS);
                 for d in 0..hd {
                     // Kᵗ: slot sticks outermost, in the chunk and in the page alike.
                     let k_dest = (sl / STICK) * (hd * STICK) + d * STICK + sl % STICK;
@@ -53,7 +53,7 @@ fn each_kv_head_gathers_whole_chunk_kernels_at_every_admitted_head_dim() {
                     // over the WHOLE chunk in the scratch.
                     let v_dest = (d / STICK) * (slots * STICK) + sl * STICK + d % STICK;
                     let v_src =
-                        kvh * hbe + (d / STICK) * (PAGE_SLOTS * STICK) + s * STICK + d % STICK;
+                        kvh * hbe + (d / STICK) * (POOL_PAGE_SLOTS * STICK) + s * STICK + d % STICK;
                     assert_eq!(
                         source_of(chunk, |e| chunk.value_entry_coord(e), kvh, v_dest),
                         (page, v_src),

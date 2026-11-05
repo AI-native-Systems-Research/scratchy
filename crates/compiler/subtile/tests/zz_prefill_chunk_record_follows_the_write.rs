@@ -13,7 +13,7 @@
 //!   * 731-token prompt: three step-backs of 32 ⇒ history ended at 827, position at 731.
 //! The extra slots are marked valid and hold whatever the pool held before, so a softmax attends
 //! real-looking keys the request never said — fluent output that drifts, worse the longer the prompt,
-//! and non-monotone in length because whether a chunk straddles a page depends on `total % PAGE_SLOTS`.
+//! and non-monotone in length because whether a chunk straddles a page depends on `total % POOL_PAGE_SLOTS`.
 //!
 //! WHAT THIS ASSERTS is the one value that is only right if both sides agree: after replaying the
 //! worker's chunk loop through the REAL placement functions, the history must end EXACTLY at the token
@@ -80,7 +80,7 @@ fn a_prompts_history_ends_exactly_at_its_token_count() {
 fn b_the_slot_past_the_last_token_is_not_valid() {
     for cap_m in [64usize, 96, 128, 256, 384, 512] {
         // The lengths that cross a page boundary are the ones that step back; 260..280 and 510..530
-        // straddle the first and second boundaries at PAGE_SLOTS == 256.
+        // straddle the first and second boundaries at POOL_PAGE_SLOTS == 256.
         for total in (1usize..=40)
             .chain(250..290)
             .chain(500..540)

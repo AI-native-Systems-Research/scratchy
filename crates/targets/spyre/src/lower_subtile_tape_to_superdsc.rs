@@ -3635,7 +3635,7 @@ pub fn write_eval_golden<F: RopeForm>(
 /// gate's softmax has always summed. See the decode golden's view in [`numeric_gate`].
 #[cfg(feature = "spyre-emu")]
 pub const GATE_DECODE_CONTEXT: u32 =
-    10 * scratchy_triton_splice::PAGE_SLOTS + scratchy_triton_splice::PAGE_SLOTS / 2;
+    10 * scratchy_triton_splice::SCHEDULER_BLOCK_TOKENS + scratchy_triton_splice::SCHEDULER_BLOCK_TOKENS / 2;
 
 #[cfg(feature = "spyre-emu")]
 pub struct PrefillGate {

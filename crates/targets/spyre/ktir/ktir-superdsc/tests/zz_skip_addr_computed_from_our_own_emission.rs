@@ -24,10 +24,10 @@ use ktir_superdsc::superdsc_opspec::{KernelAxis, PageExtent, SdscFoldSet};
 /// Granite-3.1-2b's KV geometry, the bundle this work targets.
 const NKVH: i64 = 8;
 const HD: i64 = 64;
-const PAGE_SLOTS: i64 = 256;
+const POOL_PAGE_SLOTS: i64 = 256;
 
 /// One layer's page in ELEMENTS — what one index step must advance by.
-const LAYER_PAGE_ELEMS: i64 = NKVH * HD * PAGE_SLOTS;
+const LAYER_PAGE_ELEMS: i64 = NKVH * HD * POOL_PAGE_SLOTS;
 
 /// dxp's `getBufferCapacityForNodePerDim`, reimplemented over the JSON we emit.
 ///
@@ -206,7 +206,7 @@ fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
 /// ⛔⛔⛔ AND THIS IS THE TEST THAT WAS MISSING, WHICH IS WHY A PLANE-SIZED PIN SHIPPED. The measurement
 /// above is over [`GatherScratch`] — the window-granular door, which the batched path stopped emitting
 /// when the gather went page-granular. It stayed GREEN while the live door's pin was a whole page PLANE,
-/// i.e. `nkvh * PAGE_SLOTS / POOL_STICK` = 32× the unit the host's entries are counted in. A green test
+/// i.e. `nkvh * POOL_PAGE_SLOTS / POOL_STICK` = 32× the unit the host's entries are counted in. A green test
 /// over a dead door is not coverage; it is a divergence pinned as correct.
 ///
 /// Two facts, from the one emission:
@@ -405,7 +405,7 @@ fn pinning_the_entry_dim_makes_skip_addr_one_entrys_size() {
 #[test]
 fn a_per_kv_head_operand_is_short_of_a_layer_page_by_exactly_nkvh() {
     // What one score op's KV operand covers today: one kv head's `[hd, page_slots]`.
-    let per_head_elems = HD * PAGE_SLOTS;
+    let per_head_elems = HD * POOL_PAGE_SLOTS;
     assert_eq!(
         LAYER_PAGE_ELEMS / per_head_elems,
         NKVH,
@@ -416,7 +416,7 @@ fn a_per_kv_head_operand_is_short_of_a_layer_page_by_exactly_nkvh() {
     // unpinned per-core extents must multiply to a whole layer-page. Anything less and the index
     // walks a fraction of a page per step.
     assert_eq!(
-        NKVH * HD * PAGE_SLOTS,
+        NKVH * HD * POOL_PAGE_SLOTS,
         LAYER_PAGE_ELEMS,
         "the operand must span (nkvh, hd, page_slots) for skip_addr to equal one layer-page"
     );

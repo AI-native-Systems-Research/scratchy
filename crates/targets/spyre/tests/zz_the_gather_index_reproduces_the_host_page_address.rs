@@ -168,11 +168,11 @@ fn skip_addr_must_equal_one_layer_page_so_the_operand_must_span_one() {
     // The pool geometry, in the terms the emitter has to satisfy.
     const NKVH: u64 = 8;
     const HD: u64 = 64;
-    const PAGE_SLOTS: u64 = 256;
+    const POOL_PAGE_SLOTS: u64 = 256;
     const BYTES_PER_ELEM: u64 = 2; // fp16 KV
 
     // One layer's page, as the pool lays it out.
-    let layer_page_bytes = NKVH * HD * PAGE_SLOTS * BYTES_PER_ELEM;
+    let layer_page_bytes = NKVH * HD * POOL_PAGE_SLOTS * BYTES_PER_ELEM;
 
     // A whole page across every layer — what `page_stride_bytes` is.
     let page_stride = ITERS as u64 * layer_page_bytes;
@@ -187,7 +187,7 @@ fn skip_addr_must_equal_one_layer_page_so_the_operand_must_span_one() {
     );
 
     // ⛔ AND THE OPERAND MUST SPAN IT. A single kv head's Kᵀ window is this much smaller:
-    let one_kv_head_window = HD * PAGE_SLOTS * BYTES_PER_ELEM;
+    let one_kv_head_window = HD * POOL_PAGE_SLOTS * BYTES_PER_ELEM;
     assert_eq!(
         layer_page_bytes / one_kv_head_window,
         NKVH,
@@ -472,10 +472,10 @@ fn the_index_is_flat_over_the_scratch_rows_one_block_per_pass() {
 ///
 /// ## The defect this is the gate on
 /// A paged decode rung bakes a LADDER of bodies (`ActiveCap::decode_ladder`: interior rungs 64 / 128 …
-/// plus the `PAGE_SLOTS` ceiling), and `Executor::select_body_paged` picks one from the LIVE context
+/// plus the `POOL_PAGE_SLOTS` ceiling), and `Executor::select_body_paged` picks one from the LIVE context
 /// length. The host cannot know which: `DecodeRung::swept` is filled by `codegen` from the CEILING body
 /// ("`cap` IS this body's swept extent: `bfp` is the CEILING rung"), one value per BATCH WIDTH. So the
-/// index table is built for `PAGE_SLOTS / 64` windows while the body that reads it sweeps
+/// index table is built for `POOL_PAGE_SLOTS / 64` windows while the body that reads it sweeps
 /// `active_cap / 64` — at a short prompt, 4 against 1.
 ///
 /// With the window as a MINOR row coordinate that mismatch moved every row but kv head 0's: the host
@@ -498,12 +498,12 @@ fn the_row_of_a_coordinate_does_not_depend_on_how_many_windows_the_scratch_holds
     // THE HOST's scratch — the rung's CEILING sweep, which is what `DecodeRung::swept` carries.
     let ceiling = GatherScratch::of_fold_pass(
         pool,
-        SlotWindow::count_in(SlotCount::new(PagedKvPool::PAGE_SLOTS as u32)),
+        SlotWindow::count_in(SlotCount::new(PagedKvPool::POOL_PAGE_SLOTS as u32)),
         mq,
     )
     .expect("the ceiling sweep admits the flat copy");
     // THE LAUNCHED BODY's scratch, at each interior ladder rung a short context selects.
-    for cap in [64u32, 128, PagedKvPool::PAGE_SLOTS as u32] {
+    for cap in [64u32, 128, PagedKvPool::POOL_PAGE_SLOTS as u32] {
         let body = GatherScratch::of_fold_pass(pool, SlotWindow::count_in(SlotCount::new(cap)), mq)
             .expect("an interior rung admits the flat copy");
         assert!(

@@ -10677,7 +10677,7 @@ const _: () = assert!(
 // ⛔ THE LADDER'S OWN SHAPE LAWS (the table is POLICY — measured cost-law discretization,
 // see the rung notes above — so what is checked is its structure, not its values):
 // strictly ascending (the bake and the worker's rung choice both walk it in order); the
-// top rung is the pool's whole-page window (PREFILL_WINDOW_PAGES · PAGE_SLOTS, itself
+// top rung is the pool's whole-page window (PREFILL_WINDOW_PAGES · POOL_PAGE_SLOTS, itself
 // PREFILL_CHUNK_SLOTS); the TOP THREE rungs are whole-page or half-page spans (a chunk
 // at them starts at a page or half-page boundary, so no padded write straddles a page);
 // every rung positive.
@@ -10685,7 +10685,7 @@ const _: () = assert!(
 const _: () = assert!(
     {
         use scratchy_subtile::sdsc_abstract::PagedKvPool;
-        let page = PagedKvPool::PAGE_SLOTS as u32;
+        let page = PagedKvPool::POOL_PAGE_SLOTS as u32;
         let mut ok = true;
         let mut i = 0;
         while i < PREFILL_RUNGS.len() {
@@ -10701,14 +10701,14 @@ const _: () = assert!(
         let half_page = page / 2;
         ok
             && top as usize
-                == PagedKvPool::PREFILL_WINDOW_PAGES * PagedKvPool::PAGE_SLOTS
+                == PagedKvPool::PREFILL_WINDOW_PAGES * PagedKvPool::POOL_PAGE_SLOTS
             && top as usize == PagedKvPool::PREFILL_CHUNK_SLOTS
             && PREFILL_RUNGS[n - 1].is_multiple_of(half_page)
             && PREFILL_RUNGS[n - 2].is_multiple_of(half_page)
             && PREFILL_RUNGS[n - 3].is_multiple_of(half_page)
     },
     "PREFILL_RUNGS must be strictly ascending, positive, topped at the pool's whole-page \
-     window (PREFILL_WINDOW_PAGES · PAGE_SLOTS == PREFILL_CHUNK_SLOTS), with its top three \
+     window (PREFILL_WINDOW_PAGES · POOL_PAGE_SLOTS == PREFILL_CHUNK_SLOTS), with its top three \
      rungs whole-page or half-page spans"
 );
 
@@ -10962,11 +10962,11 @@ fn dump_wavefront_mega(
     // before every `lower_decode_to_wavefront` call so decode + prefill can never
     // be baked at diverging capacities.
     //
-    // The page is the one the forward's attention walks (`paged_step::PAGE_SLOTS`, compiled only
+    // The page is the one the forward's attention walks (`paged_step::SCHEDULER_BLOCK_TOKENS`, compiled only
     // under `spyre`); a build without that target has no pool to round to, and never calls this
     // function (its one call is gated on `cfg!(feature = "spyre")`).
     #[cfg(feature = "spyre")]
-    let page_slots = scratchy_target_spyre::paged_step::PAGE_SLOTS;
+    let page_slots = scratchy_target_spyre::paged_step::SCHEDULER_BLOCK_TOKENS;
     #[cfg(not(feature = "spyre"))]
     let page_slots = 1u32;
     let prefix_len: std::num::NonZeroU32 = model
@@ -11184,7 +11184,7 @@ fn dump_wavefront_mega(
         // an assumed list. The one-request rung is the bundle already stamped into `superdsc_fp`, so
         // every path that predates the ladder is unchanged; wider rungs only ever add entries.
         // (seqs, active_cap, body_fp, OWN load_consts) — the swept extent rides along so the worker
-        // can tighten its mask-coverage guard from `PAGE_SLOTS * pages` to the real
+        // can tighten its mask-coverage guard from `POOL_PAGE_SLOTS * pages` to the real
         // `active_cap * pages`, and the consts are THIS RUNG'S OWN KINDS (staged at the rung's own
         // `rows` — the ten uniform `[rows, 1]` tables' stick heads are per-width, Finding 1's
         // compounding half: the single-request wiring's rows=1 kinds staged into a rows=N rung
@@ -11840,7 +11840,7 @@ fn dump_wavefront_mega(
                                             // is a rung, so each step walks the fewest pages that
                                             // reach its context.
                                             let pool_pages =
-                                                cap / scratchy_target_spyre::paged_step::PAGE_SLOTS;
+                                                cap / scratchy_target_spyre::paged_step::SCHEDULER_BLOCK_TOKENS;
                                             let ceiling_walk =
                                                 scratchy_target_spyre::paged_step::walk_pages(
                                                     pool_pages,
@@ -11855,7 +11855,7 @@ fn dump_wavefront_mega(
                                                 // `select_body` compares the live context against.
                                                 // A page walk's rung is the slots its walk reaches.
                                                 active_cap: superdsc::bundle::SweptCols::new(
-                                                    ceiling_walk * scratchy_target_spyre::paged_step::PAGE_SLOTS,
+                                                    ceiling_walk * scratchy_target_spyre::paged_step::SCHEDULER_BLOCK_TOKENS,
                                                 ),
                                                 bodies: rung_fps(&body_fps),
                                                 bodies_fused: std::borrow::Cow::Owned(
@@ -11909,7 +11909,7 @@ fn dump_wavefront_mega(
                                                     }
                                                 })
                                                 .map(|b| {
-                                                    let slots = b * scratchy_target_spyre::paged_step::PAGE_SLOTS;
+                                                    let slots = b * scratchy_target_spyre::paged_step::SCHEDULER_BLOCK_TOKENS;
                                                     (
                                                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::new(slots),
                                                         slots,

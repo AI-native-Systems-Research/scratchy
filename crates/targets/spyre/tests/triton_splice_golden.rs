@@ -2220,7 +2220,7 @@ fn a_sliding_window_attention_is_refused() {
 /// at most 4096 positions. A pool past that (granite's own) splices.
 #[test]
 fn a_pool_no_bigger_than_a_chunk_is_refused() {
-    const P: u32 = scratchy_triton_splice::PAGE_SLOTS;
+    const P: u32 = scratchy_triton_splice::SCHEDULER_BLOCK_TOKENS;
     let at_pages = |pages: u32| AttnShape {
         geom: (32, 8, 64),
         mq: 1,
@@ -2361,7 +2361,7 @@ fn the_paged_attention_splices_with_its_contract() {
 /// block straight from its sources; the rotation itself has its own goldens. Every step's blocks
 /// are the pool's pages REVERSED, and the multi-page shapes run a TWO-PAGE pool, so the walk's pages
 /// come through the table and not at their block's own index. Pools and contexts are stated in
-/// pages of `PAGE_SLOTS`, so each shape keeps its place against the page boundaries.
+/// pages of `SCHEDULER_BLOCK_TOKENS`, so each shape keeps its place against the page boundaries.
 ///
 /// ⛔ AND IT IS THE KERNEL'S OWN OPS THAT RUN: each shape asserts none of the emulator's native
 /// attention recognizers claims the walk, so a pass here is the kernel's arithmetic.
@@ -2369,7 +2369,7 @@ fn the_paged_attention_splices_with_its_contract() {
 #[cfg(feature = "spyre-emu")]
 fn spliced_paged_step_executes_the_real_programs() {
     // One page, and a position in pages.
-    const P: u32 = scratchy_triton_splice::PAGE_SLOTS;
+    const P: u32 = scratchy_triton_splice::SCHEDULER_BLOCK_TOKENS;
     let at = |pages: u32, offset: u32| (pages * P + offset) as usize;
     // (shape, cached positions before the step)
     for (s, cached) in [
@@ -2710,7 +2710,7 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
 #[test]
 #[cfg(feature = "spyre-emu")]
 fn spliced_decode_batch_executes_the_real_programs() {
-    const P: u32 = scratchy_triton_splice::PAGE_SLOTS;
+    const P: u32 = scratchy_triton_splice::SCHEDULER_BLOCK_TOKENS;
     let at_hd = |seqs: u32, walk: u32, hd: u32| AttnShape {
         geom: (32, 8, hd),
         mq: seqs,

@@ -25,7 +25,7 @@ const STICK: u32 = 64; // the fold sweeps one 64-slot block at a time
 const NQH: u32 = 32;
 const MQ: u32 = 8; // a bs=8 decode batch: the rows ARE requests
 const GQA: u32 = 4;
-const PAGE_SLOTS: u32 = 256;
+const POOL_PAGE_SLOTS: u32 = 256;
 
 fn act(n: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
     Stk::<RowBlockedTag>::new(n, StickLayout::row_blocked(rows as usize, cols as usize)).unwrap()
@@ -166,7 +166,7 @@ fn print_what_the_shipped_fold_score_op_addresses() {
         SharedKernelBmmForm::of_attn_rows(true, QueryRowCount::of_mq(MQ)),
         &act("t_qs", MQ, HD),
         DevOff::ZERO,
-        &ker("t_kct", HD, PAGE_SLOTS),
+        &ker("t_kct", HD, POOL_PAGE_SLOTS),
         DevOff::ZERO,
         &act("t_sc", NQH * MQ, STICK),
         DevOff::ZERO,
