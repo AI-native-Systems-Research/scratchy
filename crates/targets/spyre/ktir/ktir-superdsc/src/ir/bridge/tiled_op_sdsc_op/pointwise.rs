@@ -769,29 +769,27 @@ pub struct IndexSelectPage {
 impl IndexSelectPage {
     /// ⭐ THE ONLY CONSTRUCTOR — one chunk leg's page: the frame's own extents
     /// at the run the chunk iterator hands, `offset` whole blocks into the
-    /// landing. `entries` is the gather's TOTAL entry count (the fact the frame
-    /// was minted against); the run is the ≤-one-index-stick slice this op
-    /// gathers. The restickify's one-row blocks are the entry's own share of
-    /// the row-major landing (`t_rows / entries`), a division the frame law
-    /// guarantees exact.
+    /// landing (both straight off [`LandingFrame::legs`]). Infallible: every
+    /// extent the page states is already proved by the frame — the restickify's
+    /// one-row blocks are the variant's own stored per-entry rows, and the
+    /// single-block rows of the flat and restickify landings are the ONE block
+    /// those frames state.
     pub fn of_run(
         frame: crate::superdsc_opspec::LandingFrame,
-        entries: std::num::NonZeroU32,
         run: crate::superdsc_opspec::GatherEntries,
         offset: crate::superdsc_opspec::LandingOffset,
-    ) -> Result<Self, String> {
+    ) -> Self {
         use crate::superdsc_opspec::LandingFrame;
         use std::num::NonZeroU32;
-        let one = |x: u32, what: &str| -> Result<NonZeroU32, String> {
-            NonZeroU32::new(x).ok_or_else(|| {
-                format!("the gather's {what} is 0 — the landing frame's own law forbids it")
-            })
-        };
-        Ok(match frame {
+        // The ONE block the flat and restickify landings state — bound to a name that says
+        // one, not the type's minimum (which is the same 1).
+        let one = NonZeroU32::new(1).expect("one is nonzero");
+        match frame {
             LandingFrame::Blocks {
                 blocks,
                 rows,
                 w,
+                ..
             } => IndexSelectPage {
                 entries: run,
                 blocks,
@@ -799,21 +797,21 @@ impl IndexSelectPage {
                 cols: w,
                 dst: offset,
             },
-            LandingFrame::Flat { rows, w } => IndexSelectPage {
+            LandingFrame::Flat { rows, w, .. } => IndexSelectPage {
                 entries: run,
-                blocks: NonZeroU32::MIN,
+                blocks: one,
                 rows,
                 cols: w,
                 dst: offset,
             },
-            LandingFrame::Restickify { t_rows, w } => IndexSelectPage {
+            LandingFrame::Restickify { rows, w, .. } => IndexSelectPage {
                 entries: run,
-                blocks: one(t_rows.get() / entries.get(), "blocks an entry")?,
-                rows: NonZeroU32::MIN,
+                blocks: rows,
+                rows: one,
                 cols: w,
                 dst: offset,
             },
-        })
+        }
     }
 }
 

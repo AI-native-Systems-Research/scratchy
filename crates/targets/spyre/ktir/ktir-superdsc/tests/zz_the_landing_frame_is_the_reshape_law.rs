@@ -26,7 +26,7 @@ use std::num::NonZeroU32;
 const STICK: u64 = 64;
 
 fn plane(sticks: u32) -> PagePlane {
-    PagePlane::of_sticks(sticks).expect("a nonzero plane")
+    PagePlane::of_sticks(nz(sticks))
 }
 
 fn nz(n: u32) -> NonZeroU32 {
@@ -110,6 +110,7 @@ fn the_landing_frame_is_the_reshape_law_over_the_domain_grid() {
                                 blocks: b,
                                 rows: r,
                                 w: gw,
+                                ..
                             }),
                         ) => {
                             assert_eq!(b.get(), blocks, "{to:?} sticks {sticks} entries {entries}");
@@ -118,16 +119,22 @@ fn the_landing_frame_is_the_reshape_law_over_the_domain_grid() {
                         }
                         (
                             Expected::Flat { rows },
-                            Ok(LandingFrame::Flat { rows: r, w: gw }),
+                            Ok(LandingFrame::Flat { rows: r, w: gw, .. }),
                         ) => {
                             assert_eq!(r.get(), rows, "{to:?} sticks {sticks} entries {entries}");
                             assert_eq!(gw.elems(), w as u32);
                         }
                         (
                             Expected::Restickify { t_rows },
-                            Ok(LandingFrame::Restickify { t_rows: t, w: gw }),
+                            Ok(LandingFrame::Restickify { t_rows: t, rows: per_entry, w: gw, .. }),
                         ) => {
                             assert_eq!(t.get(), t_rows, "{to:?} sticks {sticks} entries {entries}");
+                            // the stored per-entry rows are the division the law guarantees exact
+                            assert_eq!(
+                                per_entry.get(),
+                                (t_rows / entries) as u32,
+                                "{to:?} sticks {sticks} entries {entries}"
+                            );
                             assert_eq!(gw.elems(), w as u32);
                         }
                         (exp, got) => panic!(
@@ -138,6 +145,18 @@ fn the_landing_frame_is_the_reshape_law_over_the_domain_grid() {
             }
         }
     }
+}
+
+/// ⭐ A DIM NO LANDING CAN HOLD is its own named refusal — a negative dim, or a stated extent
+/// whose product overflows — never folded into the two shape refusals.
+#[test]
+fn a_dim_no_landing_holds_refuses_by_name() {
+    let err = LandingFrame::of(&[-4, 128], plane(2), nz(4)).expect_err("-4 rows");
+    assert!(matches!(err, FrameError::NotStatable { dim: -4 }), "{err:?}");
+    let huge = i64::MAX;
+    let err = LandingFrame::of(&[huge, huge, 128], plane(2), nz(2))
+        .expect_err("a product that overflows");
+    assert!(matches!(err, FrameError::NotStatable { .. }), "{err:?}");
 }
 
 /// The width the frame lands: whole sticks by construction — a sub-stick width

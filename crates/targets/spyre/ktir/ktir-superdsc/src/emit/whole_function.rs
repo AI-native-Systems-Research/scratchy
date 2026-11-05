@@ -4956,7 +4956,7 @@ fn lower_function_folded(
                         }
                         continue;
                     }
-                    let (g, page_sticks) = page_gather_of(f, gathers[gi])?;
+                    let (g, entries, plane) = page_gather_of(f, gathers[gi])?;
                     // ⭐ A CHAINED INDEX runs as its two gathers: the run of index words is copied
                     // first, through the position table, into a scratch stick the gather then reads.
                     let g = match g.via {
@@ -4995,41 +4995,26 @@ fn lower_function_folded(
                     // ⭐ THE ONE PAGE GATHER — `index_select` over the folded cache's dim 0 (the
                     // reference's `page_attn_head_major_prefill.py`: `kv.index_select(0,
                     // page_ids).reshape(...)`), for ANY entry size, page count and head width. One
-                    // index entry selects one position of the pool and delivers its whole plane —
-                    // `page_sticks` sticks — and the consumer's own frame `to` states the landing:
-                    // its last dim `w`, whole sticks (a plane of the folded cache is whole sticks —
-                    // its `[num_pages, block, sticks, eps]` layout, stick dim last); a rank ≥ 3
+                    // index entry selects one position of the pool and delivers its whole plane,
+                    // and the consumer's own frame `to` states the landing: its last dim `w`,
+                    // whole sticks (a plane of the folded cache is whole sticks — its
+                    // `[num_pages, block, sticks, eps]` layout, stick dim last); a rank ≥ 3
                     // `[..., blocks, rows, w]` states `rows × w` blocks, a rank-2 `[T, w]` states
                     // none, so each gathered entry's plane is one block. Each `[rows, w]` block
                     // lands stick-major one after another (`batch_blocks`), the frame the trip's
                     // batched restickify and contractions read a block of at its base — so no
                     // piece and no scaled index follows, and a permute follows only where the
-                    // frame is rank-2 over several multi-stick entries (below). Entries past one
-                    // op's index
-                    // stick (`CopyDims::ENTRIES_PER_OP`, 32 — the op's own domain, not a device
-                    // refusal) are chunked one op a run, each at its own entry base and landing
-                    // offset: no entry count or size is refused.
-                    // ⭐ THE GATHER'S OWN TYPED VIEW, MINTED ONCE HERE — where the program's
-                    // view is read. The plane off the tile, the landing frame off the reshape's
-                    // `to` against it: every extent the op takes is a TYPE from here down
-                    // (GatherEntries, NonZeroU32, StickExtent, LandingOffset), and the two ways
-                    // a frame is outside this gather's domain refuse HERE, by name, and nothing
+                    // frame is rank-2 over several multi-stick entries (below).
+                    // ⭐ THE GATHER'S OWN TYPED VIEW, MINTED ONCE — the entries and plane at the
+                    // gather's own fold ([`page_gather_of`]), the landing frame off the reshape's
+                    // `to` against them: every extent the op takes is a TYPE from here down
+                    // (GatherEntries, NonZeroU32, StickExtent, LandingOffset), and the ways a
+                    // frame is outside this gather's domain refuse THERE, by name, and nothing
                     // downstream re-checks them. Entries past one op's index stick
                     // (`CopyDims::ENTRIES_PER_OP`, 32 — the op's own domain, not a device
-                    // refusal) are chunked one op a run by the type's own iterator, each at its
-                    // own entry base and landing offset: no entry count or size is refused.
-                    let entries = std::num::NonZeroU32::new(g.entries).ok_or_else(|| Error {
-                        message: format!(
-                            "{}: `{:?}` re-frames a gather of 0 entries — no plane to re-frame",
-                            f.name, op.op_type
-                        ),
-                    })?;
-                    let plane = crate::superdsc_opspec::PagePlane::of_sticks(page_sticks).ok_or_else(|| Error {
-                        message: format!(
-                            "{}: `{:?}` re-frames a gather whose plane is 0 sticks — no plane to                              re-frame",
-                            f.name, op.op_type
-                        ),
-                    })?;
+                    // refusal) are chunked one op a run by the frame's own leg iterator, each
+                    // at its own entry base and landing offset: no entry count or size is
+                    // refused.
                     let frame =
                         crate::superdsc_opspec::LandingFrame::of(&to, plane, entries).map_err(
                             |e| Error {
@@ -5039,24 +5024,20 @@ fn lower_function_folded(
                                 ),
                             },
                         )?;
-                    // ⭐ THE CHUNK LEGS EVERY FRAME SHARES — one op a run of one index stick,
-                    // each at its own entry base (the gather's own first entry plus the run's
-                    // start, both whole sticks) and its own landing offset (whole blocks in).
+                    // ⭐ THE CHUNK LEGS EVERY FRAME SHARES — one op a run of one index stick
+                    // (the frame's own [`LandingFrame::legs`]: each run at its own entry base,
+                    // the gather's own first entry plus the run's start, both whole sticks, and
+                    // its own landing offset, whole blocks in).
                     let mut chunk_legs = |frame: crate::superdsc_opspec::LandingFrame,
                                       land_tid: u32,
                                       land_name: &str,
                                       page_of: &dyn Fn(
                         crate::superdsc_opspec::GatherEntries,
                         crate::superdsc_opspec::LandingOffset,
-                    )
-                        -> Result<
-                        crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage,
-                        String,
-                    >|
+                    ) -> crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage|
                      -> Result<(), Error> {
-                        let block_elems = frame.elems_per_entry(entries);
                         let mut emitted = 0u32;
-                        for (run_start, run) in crate::superdsc_opspec::GatherEntries::chunks(entries) {
+                        for (run_start, run, offset) in frame.legs() {
                             let base = g.first_entry.plus_entries(run_start.entries()).map_err(
                                 |message| Error {
                                     message: format!("{}: {message}", f.name),
@@ -5078,13 +5059,7 @@ fn lower_function_folded(
                                         crate::place::act_name(g.index_tid),
                                         base,
                                     ),
-                                    page_of(run, crate::superdsc_opspec::LandingOffset::after(
-                                        emitted,
-                                        block_elems,
-                                    ))
-                                    .map_err(|message| Error {
-                                        message: format!("{}: {message}", f.name),
-                                    })?,
+                                    page_of(run, offset),
                                     sym_id_base,
                                     Some(layout),
                                 )
@@ -5107,7 +5082,7 @@ fn lower_function_folded(
                         // reads — and one whole stick permute restickifies them into the frame's
                         // own column: the restickify the consumer's reshape used to perform (the
                         // deleted `page_to_sticks` arm), stated here at the landing that needs it.
-                        crate::superdsc_opspec::LandingFrame::Restickify { t_rows, w } => {
+                        crate::superdsc_opspec::LandingFrame::Restickify { t_rows, w, .. } => {
                             // The landing: one-row blocks — each entry's plane as `t_rows /
                             // entries` blocks of `[1, w]`, a stick-major one-row block being that
                             // row's own bytes — so the whole landing is row-major `[T, w]` in a
@@ -5134,7 +5109,7 @@ fn lower_function_folded(
                             let land_name = land.name();
                             chunk_legs(frame, land_tid, &land_name, &|run, offset| {
                                 crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage::of_run(
-                                    frame, entries, run, offset,
+                                    frame, run, offset,
                                 )
                             })?;
                             let tid = mint_inter(k, layout, floor, res);
@@ -5166,13 +5141,13 @@ fn lower_function_folded(
                         // stick column, per-entry one-stick blocks).
                         frame => {
                             let w = frame.width();
-                            let landing_rows = frame.landing_rows(entries);
+                            let landing_rows = frame.landing_rows();
                             let tid = mint_inter(k, layout, floor, res);
                             let dst = stick_major_region(tid, landing_rows, w.stick_count(), layout);
                             let land_name = dst.name();
                             chunk_legs(frame, tid, &land_name, &|run, offset| {
                                 crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage::of_run(
-                                    frame, entries, run, offset,
+                                    frame, run, offset,
                                 )
                             })?;
                             // A rank ≥ 3 frame stated its blocks, so the landing registers them;
@@ -7782,7 +7757,14 @@ fn same_card_bytes(from: &[i64], to: &[i64]) -> bool {
 /// `page_sticks` one-stick sub-rows long. [`gathers_of`] reads every gather as one entry per ROW
 /// (the embedding's row gather); a page gather's tile states fewer entries than rows, and its own
 /// shape says how many.
-fn page_gather_of(f: &IRFunction<'static>, g: Gather) -> Result<(Gather, u32), Error> {
+/// ⭐ THE GATHER'S OWN FOLD, WHERE THE TYPED VIEW IS MINTED — the entries and the plane off
+/// the tile itself, as a `NonZeroU32` and a [`PagePlane`], so the walk below holds types and
+/// mints nothing: a gather of no entries, or a plane of no sticks, refuses HERE, by name,
+/// at the one place the program's view is read.
+fn page_gather_of(
+    f: &IRFunction<'static>,
+    g: Gather,
+) -> Result<(Gather, std::num::NonZeroU32, crate::superdsc_opspec::PagePlane), Error> {
     let Some(tile) = f.operations.iter().find(|o| o.result == Some(g.tile)) else {
         return err(format!(
             "{}: the gather's tile states no defining op",
@@ -7808,7 +7790,18 @@ fn page_gather_of(f: &IRFunction<'static>, g: Gather) -> Result<(Gather, u32), E
             f.name
         ));
     };
-    let entries = dims[d] as u32;
+    let entries = u32::try_from(dims[d])
+        .ok()
+        .and_then(std::num::NonZeroU32::new)
+        .ok_or_else(|| {
+            Error {
+                message: format!(
+                    "{}: the gather's tile states {} entries — a gather of no entries has no \
+                     plane to re-frame",
+                    f.name, dims[d]
+                ),
+            }
+        })?;
     let slab: i64 = dims
         .iter()
         .enumerate()
@@ -7816,14 +7809,31 @@ fn page_gather_of(f: &IRFunction<'static>, g: Gather) -> Result<(Gather, u32), E
         .map(|(_, x)| *x)
         .product();
     let stick = crate::work::FP16_ELEMS_PER_STICK as i64;
-    if d != 0 || slab % stick != 0 {
+    if d != 0 || slab <= 0 || slab % stick != 0 {
         return err(format!(
             "{}: a page gather selects whole contiguous slabs along its LEADING dim, each a whole \
              number of sticks — this tile's indirect dim is {d} and its slab {slab} elements",
             f.name
         ));
     }
-    Ok((Gather { entries, ..g }, (slab / stick) as u32))
+    let sticks = std::num::NonZeroU32::new(
+        u32::try_from(slab / stick).map_err(|_| Error {
+            message: format!(
+                "{}: the gather's tile states a plane of {} sticks — no u32 plane holds it",
+                f.name,
+                slab / stick
+            ),
+        })?,
+    )
+    .expect("a positive stick count is nonzero");
+    Ok((
+        Gather {
+            entries: entries.get(),
+            ..g
+        },
+        entries,
+        crate::superdsc_opspec::PagePlane::of_sticks(sticks),
+    ))
 }
 
 /// WHAT ONLY THE WALK CAN STATE about one op. Threaded rather than re-derived, because [`emit_one`]
