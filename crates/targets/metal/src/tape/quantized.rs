@@ -1412,32 +1412,6 @@ pub fn qmm_n_kernel_name(
     format!("affine_qmm_n_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_0")
 }
 
-/// `&'static str` view of [`qmm_n_kernel_name`] for the lowering pass.
-pub fn qmm_n_kernel_static_name(
-    dtype: DequantDtype,
-    scale_dtype: ScaleDtype,
-    bits: Int4Bits,
-    group_size: AffineGroupSize,
-) -> &'static str {
-    let group_size = group_size.get();
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
-    type Key = (DequantDtype, ScaleDtype, u32);
-    static CACHE: OnceLock<std::sync::Mutex<HashMap<Key, &'static str>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = cache
-        .lock()
-        .expect("qmm_n_kernel_static_name cache poisoned");
-    let key = (dtype, scale_dtype, group_size);
-    if let Some(&v) = guard.get(&key) {
-        return v;
-    }
-    let owned = qmm_n_kernel_name(dtype, scale_dtype, group_size, bits.get());
-    let leaked: &'static str = Box::leak(owned.into_boxed_str());
-    guard.insert(key, leaked);
-    leaked
-}
-
 /// Threadgroup grid + threads-per-group for qmm_n. Matches MLX
 /// `quantized.cpp:720-721`: bm=bn=32, wm=wn=2 → group (32, 2, 2);
 /// grid `(ceil(N/32), ceil(M/32), B)`.
@@ -1541,41 +1515,6 @@ pub fn qvm_kernel_name(
             format!("affine_qvm_split_k_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}")
         }
     }
-}
-
-/// `&'static str` view of [`qvm_kernel_name`] for the lowering pass.
-pub fn qvm_kernel_static_name(
-    kernel: QvmKernel,
-    dtype: DequantDtype,
-    scale_dtype: ScaleDtype,
-    bits: Int4Bits,
-    group_size: AffineGroupSize,
-) -> &'static str {
-    let group_size = group_size.get();
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
-    type Key = (
-        std::mem::Discriminant<QvmKernel>,
-        DequantDtype,
-        ScaleDtype,
-        u32,
-    );
-    static CACHE: OnceLock<std::sync::Mutex<HashMap<Key, &'static str>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().expect("qvm_kernel_static_name cache poisoned");
-    let key = (
-        std::mem::discriminant(&kernel),
-        dtype,
-        scale_dtype,
-        group_size,
-    );
-    if let Some(&v) = guard.get(&key) {
-        return v;
-    }
-    let owned = qvm_kernel_name(kernel, dtype, scale_dtype, group_size, bits.get());
-    let leaked: &'static str = Box::leak(owned.into_boxed_str());
-    guard.insert(key, leaked);
-    leaked
 }
 
 #[cfg(test)]

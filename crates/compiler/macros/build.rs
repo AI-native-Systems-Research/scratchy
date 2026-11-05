@@ -98,7 +98,7 @@ fn emit_carrier(
     let manifest = weights_manifest::load_or_empty(&configs)
         .map_err(|e| format!("{}: {e:?}", configs.display()))?;
     let mut read = Vec::new();
-    let facts = carrier_facts::carrier_facts(arch_root, stem, carrier.vision, &mut read);
+    let facts = carrier_facts::carrier_facts(arch_root, stem, carrier.vision, &program, &mut read);
     for path in read {
         println!("cargo:rerun-if-changed={}", path.display());
     }
@@ -118,4 +118,3 @@ fn emit_carrier(
     )?;
     Ok((emitted, carrier.arch_name, module))
 }
-

@@ -9,6 +9,11 @@
 //! `x`'s last dim equals `w`'s first, and rustc checks it where a carrier calls it: a shape error
 //! in a carrier is a type error at the generated line, which names the carrier's file and line.
 //!
+//! A weight bundle the DSL passes whole to one op (a MoE's experts, a recurrent mixer's weights)
+//! is its roles, each a [`W1`]/[`W2`]/[`W3`] at its shape `bundles::derive` derives, passed to its
+//! kind's constructor ([`ops::routed_experts`], [`ops::mamba2_mixer`], …): the constructor's
+//! signature relates the roles to each other, and the op's to its activations.
+//!
 //! The emitted functions also RUN: [`Trace`] records the shape each binding's, weight's and nested
 //! value's type states. That record ([`traced`]) is the carrier's shapes, symbolic in its config's
 //! bounds, and every later pass reads it: rustc's type checker is the one shape checker.
@@ -109,8 +114,10 @@ pub struct Tokens<T>(PhantomData<T>);
 pub struct W1<D>(PhantomData<D>);
 /// A rank-2 weight `[K, N]`.
 pub struct W2<K, N>(PhantomData<(K, N)>);
+/// An expert bank `[E, K, N]`: `E` experts' `[K, N]` weights.
+pub struct W3<E, K, N>(PhantomData<(E, K, N)>);
 
-phantom_copy!(Act<T, D>, Tokens<T>, W1<D>, W2<K, N>);
+phantom_copy!(Act<T, D>, Tokens<T>, W1<D>, W2<K, N>, W3<E, K, N>);
 
 /// A weight at the shape its type declares.
 pub trait Declared {
@@ -129,6 +136,48 @@ impl<K, N> Declared for W2<K, N> {
         Self(PhantomData)
     }
 }
+
+impl<E, K, N> Declared for W3<E, K, N> {
+    fn declared() -> Self {
+        Self(PhantomData)
+    }
+}
+
+/// A weight bundle, typed by its roles (derived: `bundles::derive`): routed experts over the
+/// residual width `D` (the input their router reads and their weighted sum's width).
+pub struct Experts<D>(PhantomData<D>);
+/// Routed experts whose router reads width `H` and whose banks run at width `L` (a latent MoE's
+/// latent; `L = H` for one that runs on its input).
+pub struct LatentExperts<H, L>(PhantomData<(H, L)>);
+/// A router of its own over `E` experts, reading width `D`.
+pub struct ScaledRouter<D, E>(PhantomData<(D, E)>);
+/// `E` unrouted expert banks over width `D`.
+pub struct ExpertBank<D, E>(PhantomData<(D, E)>);
+/// A SwiGLU MLP over width `D` (a shared expert).
+pub struct Swiglu<D>(PhantomData<D>);
+/// `E` experts' biases over inner width `I` and output width `D`.
+pub struct ExpertBiases<E, I, D>(PhantomData<(E, I, D)>);
+/// A Gated-DeltaNet mixer's weights: a conv over `C` channels, `Hv` value heads of width `Vd`.
+pub struct GdnMixer<C, Hv, Vd>(PhantomData<(C, Hv, Vd)>);
+/// A Mamba-2 mixer's weights: a conv over `C` channels, `Nh` heads, inner width `Di`.
+pub struct MambaMixer<C, Di, Nh>(PhantomData<(C, Di, Nh)>);
+
+phantom_copy!(
+    Experts<D>,
+    LatentExperts<H, L>,
+    ScaledRouter<D, E>,
+    ExpertBank<D, E>,
+    Swiglu<D>,
+    ExpertBiases<E, I, D>,
+    GdnMixer<C, Hv, Vd>,
+    MambaMixer<C, Di, Nh>,
+);
+
+/// Routed experts a block of width `D` runs on its input: SwiGLU experts at `D`, or un-gated ones
+/// whose banks run at the router's width.
+pub trait RoutedAt<D> {}
+impl<D> RoutedAt<D> for Experts<D> {}
+impl<D> RoutedAt<D> for LatentExperts<D, D> {}
 
 /// An `if`'s merge: both arms produce the same type, which is the law that their bindings agree.
 /// The trace runs both arms, so each arm's locals are recorded; which arm a layer takes changes no
@@ -355,10 +404,128 @@ impl<T, Px, Rh, Bh, Ve> Inputs<T, Px, Rh, Bh, Ve> {
 /// The op signatures, each named as its `OpKind` is in a carrier.
 pub mod ops {
     use super::{Act, Add, BlockTable, CuSeqlens, Div, KvCache, Lit, MaxSeqlen, Mul, PhantomData};
+    use super::{ExpertBank, ExpertBiases, Experts, GdnMixer, LatentExperts, MambaMixer};
     use super::{
         HiddenSize, KvLoraRank, NumAttentionHeads, QkNopeHeadDim, QkRopeHeadDim, VHeadDim,
     };
-    use super::{Rotary, RowIndex, Scalar, Tokens, W1, W2};
+    use super::{Rotary, RowIndex, Scalar, Tokens, W1, W2, W3};
+    use super::{RoutedAt, ScaledRouter, Swiglu};
+
+    // ── Weight bundles: each kind's constructor over its roles (derived by `bundles::derive`,
+    // `BundleKind::args`), whose signature is the law between them. ──
+
+    /// Routed SwiGLU experts: `router: [D, E]`, `gate`, `up: [E, D, I]`, `down: [E, I, D]`.
+    pub fn routed_experts<D, E, I>(
+        _router: W2<D, E>,
+        _gate: W3<E, D, I>,
+        _up: W3<E, D, I>,
+        _down: W3<E, I, D>,
+    ) -> Experts<D> {
+        Experts(PhantomData)
+    }
+
+    /// [`routed_experts`] with a per-expert score correction `[E]`.
+    pub fn corrected_experts<D, E, I>(
+        _router: W2<D, E>,
+        _correction: W1<E>,
+        _gate: W3<E, D, I>,
+        _up: W3<E, D, I>,
+        _down: W3<E, I, D>,
+    ) -> Experts<D> {
+        Experts(PhantomData)
+    }
+
+    /// [`routed_experts`] and a shared SwiGLU expert at `D` ([`swiglu`]) scaled by a sigmoid gate
+    /// `[D, 1]`.
+    pub fn gated_shared_experts<D, E, I>(
+        _router: W2<D, E>,
+        _gate: W3<E, D, I>,
+        _up: W3<E, D, I>,
+        _down: W3<E, I, D>,
+        _shared: Swiglu<D>,
+        _shared_scale: W2<D, Lit<1>>,
+    ) -> Experts<D> {
+        Experts(PhantomData)
+    }
+
+    /// A SwiGLU MLP over width `D` of inner width `S`: `gate`, `up: [D, S]`, `down: [S, D]`.
+    pub fn swiglu<D, S>(_gate: W2<D, S>, _up: W2<D, S>, _down: W2<S, D>) -> Swiglu<D> {
+        Swiglu(PhantomData)
+    }
+
+    /// Un-gated experts: a router `[H, E]` and its correction `[E]`, banks `up: [E, L, I]`,
+    /// `down: [E, I, L]` at width `L`.
+    pub fn ungated_experts<H, L, E, I>(
+        _router: W2<H, E>,
+        _correction: W1<E>,
+        _up: W3<E, L, I>,
+        _down: W3<E, I, L>,
+    ) -> LatentExperts<H, L> {
+        LatentExperts(PhantomData)
+    }
+
+    /// Routed SwiGLU experts with a router bias `[E]` and per-expert biases ([`expert_biases`]).
+    pub fn biased_experts<D, E, I>(
+        _router: W2<D, E>,
+        _router_bias: W1<E>,
+        _gate: W3<E, D, I>,
+        _up: W3<E, D, I>,
+        _down: W3<E, I, D>,
+        _biases: ExpertBiases<E, I, D>,
+    ) -> Experts<D> {
+        Experts(PhantomData)
+    }
+
+    /// `E` experts' biases: `[E, I]` on gate and up, `[E, D]` on down.
+    pub fn expert_biases<E, I, D>(
+        _gate_bias: W2<E, I>,
+        _up_bias: W2<E, I>,
+        _down_bias: W2<E, D>,
+    ) -> ExpertBiases<E, I, D> {
+        ExpertBiases(PhantomData)
+    }
+
+    /// A router of its own: `proj: [D, E]`, the input's scale `[D]`, a per-expert scale `[E]`.
+    pub fn scaled_router<D, E>(
+        _proj: W2<D, E>,
+        _scale: W1<D>,
+        _per_expert_scale: W1<E>,
+    ) -> ScaledRouter<D, E> {
+        ScaledRouter(PhantomData)
+    }
+
+    /// Unrouted SwiGLU banks: `gate`, `up: [E, D, I]`, `down: [E, I, D]`.
+    pub fn expert_bank<D, E, I>(
+        _gate: W3<E, D, I>,
+        _up: W3<E, D, I>,
+        _down: W3<E, I, D>,
+    ) -> ExpertBank<D, E> {
+        ExpertBank(PhantomData)
+    }
+
+    /// A Gated-DeltaNet mixer: its conv `[C, K]` (K taps), `A_log` and `dt_bias` per value head
+    /// `[Hv]`, and the gated norm over one value head `[Vd]`.
+    pub fn gated_delta_net_mixer<C, K, Hv, Vd>(
+        _conv: W2<C, K>,
+        _a_log: W1<Hv>,
+        _dt_bias: W1<Hv>,
+        _norm: W1<Vd>,
+    ) -> GdnMixer<C, Hv, Vd> {
+        GdnMixer(PhantomData)
+    }
+
+    /// A Mamba-2 mixer: its conv `[C, K]` and its bias `[C]`, `A_log`, `D` and `dt_bias` per head
+    /// `[Nh]`, and the gated norm over the inner width `[Di]`.
+    pub fn mamba2_mixer<C, K, Nh, Di>(
+        _conv: W2<C, K>,
+        _conv_bias: W1<C>,
+        _a_log: W1<Nh>,
+        _d: W1<Nh>,
+        _dt_bias: W1<Nh>,
+        _norm: W1<Di>,
+    ) -> MambaMixer<C, Di, Nh> {
+        MambaMixer(PhantomData)
+    }
 
     /// `embed(ids: [T], table: [V, D]) -> [T, D]`.
     pub fn embed<T, V, D>(_ids: Tokens<T>, _table: W2<V, D>) -> Act<T, D> {
@@ -456,13 +623,13 @@ pub mod ops {
     }
 
     /// `gemma_moe(router_in: [T, D], expert_in: [T, D], router, experts) -> [T, D]`: the sparse
-    /// block routes off one row set and runs the experts on the other, both the residual width,
-    /// its two weight bundles declared at it.
-    pub fn gemma_moe<T, D>(
+    /// block routes off one row set and runs the experts on the other, both the residual width;
+    /// its router routes over its banks' `E` experts.
+    pub fn gemma_moe<T, D, E>(
         _router_in: Act<T, D>,
         expert_in: Act<T, D>,
-        _router: W1<D>,
-        _experts: W1<D>,
+        _router: ScaledRouter<D, E>,
+        _experts: ExpertBank<D, E>,
     ) -> Act<T, D> {
         expert_in
     }
@@ -523,7 +690,7 @@ pub mod ops {
 
     /// `moe_block(x: [T, D], experts) -> [T, D]`: the routed experts over the residual width, their
     /// bundle declared at it.
-    pub fn moe_block<T, D>(x: Act<T, D>, _experts: W1<D>) -> Act<T, D> {
+    pub fn moe_block<T, D, B: RoutedAt<D>>(x: Act<T, D>, _experts: B) -> Act<T, D> {
         x
     }
 
@@ -533,7 +700,7 @@ pub mod ops {
     pub fn latent_moe_block<T, H, L>(
         _router_in: Act<T, H>,
         expert_in: Act<T, L>,
-        _experts: W1<H>,
+        _experts: LatentExperts<H, L>,
     ) -> Act<T, L> {
         expert_in
     }
@@ -611,7 +778,7 @@ pub mod ops {
 
     /// `gptoss_moe(x: [T, D], mlp) -> [T, D]`: a fused routed MoE with per-expert biases, its bundle at the
     /// router's width.
-    pub fn gptoss_moe<T, D>(x: Act<T, D>, _mlp: W1<D>) -> Act<T, D> {
+    pub fn gptoss_moe<T, D>(x: Act<T, D>, _mlp: Experts<D>) -> Act<T, D> {
         x
     }
 
@@ -636,12 +803,12 @@ pub mod ops {
     /// is `in_proj_qkv`'s packed row, the kernel's split: q and k at key width (`2 · Kd · Hk`),
     /// then v at value width (`Hv · Vd`); `z` is one value row, `a` and `b` one scalar per value
     /// head. A sum is written in [`canonical_add`]'s order (the value width first).
-    pub fn gated_delta_net<T, Kd, Hk, Hv, Vd, D>(
+    pub fn gated_delta_net<T, Kd, Hk, Hv, Vd>(
         _qkv: Act<T, GdnQkv<Kd, Hk, Hv, Vd>>,
         z: Act<T, Mul<Hv, Vd>>,
         _a: Act<T, Hv>,
         _b: Act<T, Hv>,
-        _linear_attn: W1<D>,
+        _linear_attn: GdnMixer<GdnQkv<Kd, Hk, Hv, Vd>, Hv, Vd>,
     ) -> Act<T, Mul<Hv, Vd>> {
         z
     }
@@ -649,9 +816,9 @@ pub mod ops {
     /// `mamba2(zxbcdt, mamba) -> [T, Di]`: a Mamba-2 mixer. `zxbcdt` is `in_proj`'s packed row,
     /// the kernel's split: the conv channels `C` (`xBC`), the gate `z` at `Di` (`mamba_d_inner`)
     /// and one `dt` per head (`Nh`), in [`canonical_add`]'s order.
-    pub fn mamba2<T, C, Di, Nh, D>(
+    pub fn mamba2<T, C, Di, Nh>(
         _zxbcdt: Act<T, Add<C, Add<Di, Nh>>>,
-        _mamba: W1<D>,
+        _mamba: MambaMixer<C, Di, Nh>,
     ) -> Act<T, Di> {
         Act(PhantomData)
     }

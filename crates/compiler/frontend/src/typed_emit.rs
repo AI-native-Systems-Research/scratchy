@@ -22,6 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 
+use crate::bundles::Bundle;
 use crate::classified::{Expr, LocalId, OpKind, Program, Stmt};
 use crate::dim::{DERIVED_DIMS, DerivedRule, Dim, canonical_add, canonical_mul};
 use crate::hf_config::ParamExpr;
@@ -121,11 +122,24 @@ pub struct Carrier<'a> {
 
 /// What a carrier's configs and arch.json say about the derived dims its weights name: each gated
 /// rule's flag, resolved over every one of its configs (`Err` naming the configs on each side when
-/// they disagree), and its arch.json `params` `expr` formulas.
-#[derive(Debug, Default)]
+/// they disagree), its arch.json `params` `expr` formulas, and the weight bundles its program
+/// passes whole to an op, derived from its configs (`Err` when they cannot be, or disagree).
+#[derive(Debug)]
 pub struct CarrierFacts {
     pub gated: BTreeMap<String, Result<u64, String>>,
     pub exprs: BTreeMap<String, ParamExpr>,
+    pub bundles: Result<BTreeMap<String, Bundle>, String>,
+}
+
+impl Default for CarrierFacts {
+    /// No configs: no flags, formulas or bundles.
+    fn default() -> Self {
+        Self {
+            gated: BTreeMap::new(),
+            exprs: BTreeMap::new(),
+            bundles: Ok(BTreeMap::new()),
+        }
+    }
 }
 
 /// The carrier's module: its `Weights`, typed from its manifest, and `forward`, its program over
@@ -133,8 +147,10 @@ pub struct CarrierFacts {
 pub fn emit(c: &Carrier<'_>, base_bounds: &mut BTreeSet<String>) -> Result<String, String> {
     let mut named: BTreeSet<String> = BTreeSet::new();
     let bounds = &mut named;
+    let bundles = (c.facts.bundles.as_ref()).map_err(|e| format!("{}: {e}", c.file))?;
     let mut cx = Cx {
         c,
+        bundles,
         reads: HashSet::new(),
         named: HashSet::new(),
         carried: HashSet::new(),
@@ -146,38 +162,35 @@ pub fn emit(c: &Carrier<'_>, base_bounds: &mut BTreeSet<String>) -> Result<Strin
     let mut weights = String::new();
     for id in c.program.weights.ids() {
         let path = c.program.weights.path(id);
+        let dotted = path.join(".");
         let field = field_name(path);
-        let declared = (c.manifest.lookup(path).cloned()).ok_or_else(|| {
-            format!(
-                "{}: the weight `{}` has no `weights.json` declaration to type it by",
-                c.file,
-                path.join(".")
-            )
-        })?;
-        let dims = (declared.iter())
-            .map(|d| dim_type(d, bounds))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("{}: weight `{}`: {e}", c.file, path.join(".")))?;
-        let ty = match dims.as_slice() {
-            [d] => format!("W1<{d}>"),
-            [k, n] => format!("W2<{k}, {n}>"),
-            _ => {
-                return Err(format!(
-                    "{}: weight `{}` is rank {}; the typed emit has rank 1 and 2",
-                    c.file,
-                    path.join("."),
-                    dims.len()
-                ));
+        // A bundle: one field per role, each at its derived shape.
+        let typed: Vec<(String, &crate::dim::Shape)> = match bundles.get(&dotted) {
+            Some(bundle) => (bundle.kind.roles().into_iter())
+                .zip(&bundle.roles)
+                .map(|(role, shape)| (format!("{field}_{role}"), shape))
+                .collect(),
+            None => {
+                let declared = c.manifest.lookup(path).ok_or_else(|| {
+                    format!(
+                        "{}: the weight `{dotted}` has no `weights.json` declaration to type it by",
+                        c.file
+                    )
+                })?;
+                vec![(field.clone(), declared)]
             }
         };
-        if let Some(other) = cx.fields.insert(field.clone(), path.join(".")) {
-            return Err(format!(
-                "{}: the weights `{other}` and `{}` both spell the field `{field}`",
-                c.file,
-                path.join(".")
-            ));
+        for (field, declared) in typed {
+            let ty = weight_type(declared, bounds)
+                .map_err(|e| format!("{}: weight `{dotted}` (`{field}`): {e}", c.file))?;
+            if let Some(other) = cx.fields.insert(field.clone(), dotted.clone()) {
+                return Err(format!(
+                    "{}: the weights `{other}` and `{dotted}` both spell the field `{field}`",
+                    c.file
+                ));
+            }
+            let _ = writeln!(weights, "        pub {field}: {ty},");
         }
-        let _ = writeln!(weights, "        pub {field}: {ty},");
     }
     let init: String = (cx.fields.keys())
         .map(|f| format!("            {f}: Declared::declared(),\n"))
@@ -188,8 +201,8 @@ pub fn emit(c: &Carrier<'_>, base_bounds: &mut BTreeSet<String>) -> Result<Strin
     named.extend(INPUT_BOUNDS.map(str::to_string));
     let aliases = carrier_aliases(c, named, base_bounds)?;
     Ok(format!(
-        "/// `{file}`, typed: its weights as `weights.json` declares them, and its program over the\n\
-         /// op signatures.\n\
+        "/// `{file}`, typed: its weights as `weights.json` declares them (its bundles as its configs\n\
+         /// derive them), and its program over the op signatures.\n\
          pub mod {module} {{\n\
          \x20   use super::*;\n\n{aliases}\
          \x20   /// The weights it reads, at their declared shapes.\n\
@@ -370,6 +383,27 @@ const STATED_WIDTHS: [(OpKind, &[&str], usize); 1] = [
     (OpKind::AvgPool2d, &["vision_pool_factor"], 2),
 ];
 
+/// A weight's type at its declared shape: `W1<D>`, `W2<K, N>`, or an expert bank's `W3<E, K, N>`.
+fn weight_type(
+    declared: &crate::dim::Shape,
+    bounds: &mut BTreeSet<String>,
+) -> Result<String, String> {
+    let dims = (declared.iter())
+        .map(|d| dim_type(d, bounds))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(match dims.as_slice() {
+        [d] => format!("W1<{d}>"),
+        [k, n] => format!("W2<{k}, {n}>"),
+        [e, k, n] => format!("W3<{e}, {k}, {n}>"),
+        _ => {
+            return Err(format!(
+                "rank {}; the typed emit has ranks 1 to 3",
+                dims.len()
+            ));
+        }
+    })
+}
+
 /// A weight's field in `Weights`: its dotted path, `_`-joined, in snake case (a checkpoint's
 /// `attn.Wo` is `attn_wo`). [`emit`] refuses two weights that spell one field.
 fn field_name<S: AsRef<str>>(path: &[S]) -> String {
@@ -387,6 +421,8 @@ fn is_scalar(e: &Expr) -> bool {
 
 struct Cx<'a, 'c> {
     c: &'a Carrier<'c>,
+    /// The weight bundles the program passes whole to an op, derived from its configs.
+    bundles: &'a BTreeMap<String, Bundle>,
     /// Every local some expression reads.
     reads: HashSet<LocalId>,
     /// Every local the emitted code names: those read, a loop's carried-out bindings, and an
@@ -683,8 +719,28 @@ impl Cx<'_, '_> {
             Expr::Local(id) => format!("l{}", id.0),
             Expr::Extern { kind, .. } => format!("inputs.{}", kind.name()),
             Expr::Weight { id, .. } => {
-                let field = field_name(self.c.program.weights.path(*id));
-                format!("tr.weight({}, w.{field})", id.0)
+                let path = self.c.program.weights.path(*id);
+                let field = field_name(path);
+                match self.bundles.get(&path.join(".")) {
+                    // A bundle is its kind's constructor over its roles: its signature relates
+                    // them. It is no weight of the program's (its roles are the checkpoint's).
+                    Some(bundle) => {
+                        use crate::bundles::BundleArg;
+                        let roles = |roles: &[&str]| -> Vec<String> {
+                            roles.iter().map(|r| format!("w.{field}_{r}")).collect()
+                        };
+                        let args: Vec<String> = (bundle.kind.args().iter())
+                            .map(|arg| match arg {
+                                BundleArg::Role(role) => format!("w.{field}_{role}"),
+                                BundleArg::Part(ctor, parts) => {
+                                    format!("ops::{ctor}({})", roles(parts).join(", "))
+                                }
+                            })
+                            .collect();
+                        format!("ops::{}({})", bundle.kind.name(), args.join(", "))
+                    }
+                    None => format!("tr.weight({}, w.{field})", id.0),
+                }
             }
             // A sum with a scalar operand offsets the tensor (Gemma's `(1 + w)` norm weight).
             Expr::Call { op, args }

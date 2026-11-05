@@ -49,6 +49,7 @@ pub(crate) fn trace_carrier_program(stem: &str, program: &Program) -> Inferred {
         &arch,
         stem,
         carrier.vision,
+        program,
         &mut Vec::new(),
     );
     typed(program, &source, &file, &manifest, &facts)

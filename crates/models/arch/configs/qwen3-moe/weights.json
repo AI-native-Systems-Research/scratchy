@@ -10,9 +10,6 @@
     "hidden_size",
     "vocab_size"
   ],
-  "mlp": [
-    "hidden_size"
-  ],
   "norm": [
     "hidden_size"
   ],

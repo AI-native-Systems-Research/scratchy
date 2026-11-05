@@ -28,7 +28,8 @@ use syn::Ident;
 
 // The front end, at the paths the passes here name it by (`crate::classified`, ...).
 use scratchy_forward_compiler_frontend::{
-    ast, classified, classify, dim, draft_capture, hf_config, parse_python, weights_manifest,
+    ast, bundles, classified, classify, dim, draft_capture, hf_config, parse_python,
+    weights_manifest,
 };
 mod arch_spec;
 mod cfg;
@@ -62,9 +63,9 @@ pub use render::render_tokens;
 #[cfg(feature = "metal")]
 pub use scratchy_target_metal_compiler::static_tape::bake_module as metal_bake_module;
 #[cfg(test)]
-mod frontend_tests;
-#[cfg(test)]
 mod checkpoint_tests;
+#[cfg(test)]
+mod frontend_tests;
 mod rows_lowering;
 mod shape;
 mod to_wavefront;

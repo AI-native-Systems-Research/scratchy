@@ -127,41 +127,17 @@ pub struct ModelParams {
     pub expert_activation: ExpertActivation,
 }
 
-/// The activation a MoE's routed experts apply to their in-projection, as the config declares it:
-/// `mlp_hidden_act` (Nemotron-H's key) else `hidden_act`, else HF's `PretrainedConfig` default,
-/// `"silu"` (DeepSeek-V3's configs omit it). Which expert body a MoE block lowers to is this
-/// fact's — a gated SiLU bank, or Nemotron-H's ungated relu² `SwitchMLP` — so a body the
-/// config does not declare can never be picked silently; an activation no expert body realizes
-/// is refused when a MoE op reads it (a dense model never does).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ExpertActivation {
-    Silu,
-    Relu2,
-    /// Declared, but no expert body realizes it — the declared name, for the refusal.
-    Unrealized(String),
-}
+pub use crate::bundles::ExpertActivation;
 
-impl ExpertActivation {
-    /// The expert body this activation is — or, `Err`, the declared name no body realizes.
-    pub fn body(&self) -> Result<scratchy_subtile::subtile_ir::ExpertBody, &str> {
-        use scratchy_subtile::subtile_ir::{ExpertBody, GatedAct, UngatedAct};
-        match self {
-            Self::Silu => Ok(ExpertBody::Gated(GatedAct::Silu)),
-            Self::Relu2 => Ok(ExpertBody::Ungated(UngatedAct::Relu2)),
-            Self::Unrealized(act) => Err(act),
-        }
-    }
-}
-
-fn parse_expert_activation(json: &serde_json::Value) -> ExpertActivation {
-    let act = json
-        .get("mlp_hidden_act")
-        .or_else(|| json.get("hidden_act"))
-        .and_then(|v| v.as_str());
+/// The expert body `act` is — or, `Err`, the declared name no body realizes.
+pub fn expert_body(
+    act: &ExpertActivation,
+) -> Result<scratchy_subtile::subtile_ir::ExpertBody, &str> {
+    use scratchy_subtile::subtile_ir::{ExpertBody, GatedAct, UngatedAct};
     match act {
-        None | Some("silu") => ExpertActivation::Silu,
-        Some("relu2") => ExpertActivation::Relu2,
-        Some(other) => ExpertActivation::Unrealized(other.to_string()),
+        ExpertActivation::Silu => Ok(ExpertBody::Gated(GatedAct::Silu)),
+        ExpertActivation::Relu2 => Ok(ExpertBody::Ungated(UngatedAct::Relu2)),
+        ExpertActivation::Unrealized(act) => Err(act),
     }
 }
 
@@ -1755,7 +1731,7 @@ fn model_params_from_json(
     let rope_scaling_hash = json.get("rope_scaling").map(hash_json_value);
     let mrope_section = extract_mrope_section(json);
     let arch = resolve_arch_spec(spec, json, source_stem);
-    let expert_activation = parse_expert_activation(json);
+    let expert_activation = ExpertActivation::of(json);
 
     apply_generic_bound_defaults(&mut bounds);
 
@@ -1887,7 +1863,7 @@ fn vision_params_from_json(
         }
     }
 
-    let expert_activation = parse_expert_activation(json);
+    let expert_activation = ExpertActivation::of(json);
     apply_generic_bound_defaults(&mut bounds);
 
     Ok(ModelParams {
@@ -3862,7 +3838,7 @@ mod tests {
     /// refusal rather than read as SiLU.
     #[test]
     fn expert_activation_reads_the_declared_activation() {
-        let act = |v: serde_json::Value| parse_expert_activation(&v);
+        let act = |v: serde_json::Value| ExpertActivation::of(&v);
         assert_eq!(act(serde_json::json!({})), ExpertActivation::Silu);
         assert_eq!(
             act(serde_json::json!({"hidden_act": "silu"})),
@@ -3877,6 +3853,6 @@ mod tests {
             gelu,
             ExpertActivation::Unrealized("gelu_pytorch_tanh".to_string())
         );
-        assert_eq!(gelu.body(), Err("gelu_pytorch_tanh"));
+        assert_eq!(expert_body(&gelu), Err("gelu_pytorch_tanh"));
     }
 }

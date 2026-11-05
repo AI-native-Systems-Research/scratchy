@@ -765,7 +765,7 @@ fn moe_affine_plan(
     else {
         return (None, None);
     };
-    let body = model.expert_activation.body().unwrap_or_else(|act| {
+    let body = crate::config::expert_body(&model.expert_activation).unwrap_or_else(|act| {
         panic!(
             "{}: the config declares expert activation `{act}`, which no expert body realizes",
             model.name
@@ -794,58 +794,112 @@ fn moe_affine_plan(
     (Some((group_size, expert)), gate_bits)
 }
 
-/// The width of the rows a MoE accessor's experts read: the `moe_block` reading the accessor's
-/// weight, at its output (a latent MoE's expert space). `None` when no such op closes to a shape.
-fn moe_expert_width(fuf: &Fuf, model: &ModelParams, accessor: &WeightAccessor) -> Option<usize> {
-    let (src, _) = accessor.source_weights[0];
-    let node = fuf.nodes.iter().find(|n| {
-        n.op == OpKind::Moe
-            && n.inputs
-                .iter()
-                .any(|i| matches!(i, FufInput::Weight { id, .. } if *id == src))
-    })?;
-    // The row count is the workload's (`num_tokens`); the width is a model bound.
-    let width = node.outputs.first()?.last()?.clone();
-    let dims = crate::weight_vocab::eval_shape_with(&vec![width], &model.bounds)?;
-    dims.first().map(|&d| d as usize)
+/// A bundle loader's dims, each its derived role's (`bundles::derive`, from the op that reads the
+/// bundle and the model's config) evaluated under the model's bounds: the bake emits them as the
+/// loader's constants, the same bundle rustc typed against the ops (`typed_shapes`) and the tests
+/// hold to the checkpoints (`every_derived_bundle_is_its_checkpoints`).
+#[derive(Clone, Copy, Debug)]
+struct BundleDims {
+    /// A router's `[width, experts]` (a scaled router's projection's).
+    router: Option<(usize, usize)>,
+    /// An expert bank's `[experts, width, inner]` (its up projection's).
+    bank: Option<(usize, usize, usize)>,
+    /// The shared experts' total inner width, if the bundle holds them.
+    shared: Option<usize>,
 }
 
-fn read_deepseek_moe_cfg(model: &ModelParams) -> DeepSeekMoeCfg {
+impl BundleDims {
+    /// The bundle `accessor` reads (its one source weight's), derived.
+    fn of(accessor: &WeightAccessor, program: &Program, model: &ModelParams) -> Self {
+        let (src, _) = accessor.source_weights[0];
+        let path = program.weights.path(src).join(".");
+        let config = crate::bundles::BundleConfig {
+            bounds: &model.bounds,
+            activation: &model.expert_activation,
+        };
+        let derived = crate::bundles::derive(program, &config)
+            .unwrap_or_else(|e| panic!("`{}`: its bundles: {e}", model.source_stem));
+        let bundle = derived.get(&path).unwrap_or_else(|| {
+            panic!(
+                "accessor `{}`: `{path}` is no bundle an op reads whole, to size its loader by",
+                accessor.name
+            )
+        });
+        let role = |name: &str| -> Option<Vec<usize>> {
+            let at = bundle.kind.roles().iter().position(|r| *r == name)?;
+            let dims = (bundle.roles[at].iter())
+                .map(|d| {
+                    let v = crate::shape::eval_closed_dim(d, &model.bounds).unwrap_or_else(|| {
+                        panic!(
+                            "`{path}.{name}`: {d:?} names a bound `{}` lacks",
+                            model.source_stem
+                        )
+                    });
+                    v as usize
+                })
+                .collect();
+            Some(dims)
+        };
+        let pair = |s: Vec<usize>| (s[0], s[1]);
+        Self {
+            router: role("router").or_else(|| role("proj")).map(pair),
+            bank: role("up").map(|s| (s[0], s[1], s[2])),
+            shared: role("shared_gate").map(|s| s[1]),
+        }
+    }
+
+    fn router(self, accessor: &WeightAccessor) -> (usize, usize) {
+        (self.router)
+            .unwrap_or_else(|| panic!("accessor `{}`: its bundle has no router", accessor.name))
+    }
+
+    fn bank(self, accessor: &WeightAccessor) -> (usize, usize, usize) {
+        (self.bank).unwrap_or_else(|| {
+            panic!(
+                "accessor `{}`: its bundle has no expert bank",
+                accessor.name
+            )
+        })
+    }
+}
+
+/// The experts a token routes to (`num_experts_per_tok`): routing, a model bound.
+fn routed_top_k(model: &ModelParams) -> usize {
+    let k = model.bounds.get("num_experts_per_tok").unwrap_or_else(|| {
+        panic!(
+            "model `{}` states no `num_experts_per_tok` for its MoE",
+            model.source_stem
+        )
+    });
+    *k as usize
+}
+
+/// A DeepSeek MoE loader's constants: its dims from its derived bundle ([`BundleDims`]), its
+/// routing knobs (`norm_topk_prob`, `routed_scaling_factor`, the scoring, the expert groups) from
+/// the model's config, read at expansion.
+fn read_deepseek_moe_cfg(
+    model: &ModelParams,
+    dims: BundleDims,
+    accessor: &WeightAccessor,
+) -> DeepSeekMoeCfg {
     let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
     let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
-    let n_routed_experts = v
-        .get("n_routed_experts")
-        .and_then(|x| x.as_u64())
-        .map(|x| x as usize)
-        .unwrap_or_else(|| model.bounds.get("n_routed_experts").copied().unwrap_or(64) as usize);
-    let n_shared_experts = v
-        .get("n_shared_experts")
-        .and_then(|x| x.as_u64())
-        .map(|x| x as usize)
-        .unwrap_or_else(|| model.bounds.get("n_shared_experts").copied().unwrap_or(2) as usize);
-    let top_k = v
-        .get("num_experts_per_tok")
-        .and_then(|x| x.as_u64())
-        .map(|x| x as usize)
-        .unwrap_or_else(|| {
-            model
-                .bounds
-                .get("num_experts_per_tok")
-                .copied()
-                .unwrap_or(6) as usize
-        });
-    let moe_intermediate_size = v
-        .get("moe_intermediate_size")
-        .and_then(|x| x.as_u64())
-        .map(|x| x as usize)
-        .unwrap_or_else(|| {
-            model
-                .bounds
-                .get("moe_intermediate_size")
-                .copied()
-                .unwrap_or(1536) as usize
-        });
-    let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize;
+    let (hidden_size, n_routed_experts) = dims.router(accessor);
+    let (_, _, moe_intermediate_size) = dims.bank(accessor);
+    // The shared experts' total inner width is that many experts' inner widths.
+    let shared = dims.shared.unwrap_or_else(|| {
+        panic!(
+            "accessor `{}`: a DeepSeek MoE bundle holds shared experts",
+            accessor.name
+        )
+    });
+    assert!(
+        shared.is_multiple_of(moe_intermediate_size),
+        "accessor `{}`: shared width {shared} is no whole number of {moe_intermediate_size}-wide experts",
+        accessor.name
+    );
+    let n_shared_experts = shared / moe_intermediate_size;
+    let top_k = routed_top_k(model);
     let norm_topk_prob = v
         .get("norm_topk_prob")
         .and_then(|x| x.as_bool())
@@ -1238,7 +1292,7 @@ fn plan_field_load(
             prefixes.len(),
         );
         let prefix = prefixes.into_iter().next().unwrap();
-        let cfg = read_deepseek_moe_cfg(model);
+        let cfg = read_deepseek_moe_cfg(model, BundleDims::of(accessor, program, model), accessor);
         return FieldLoad::DeepSeekV2Fp8BlockMoe {
             prefix,
             n_routed_experts: cfg.n_routed_experts,
@@ -1263,7 +1317,7 @@ fn plan_field_load(
             prefixes.len(),
         );
         let prefix = prefixes.into_iter().next().unwrap();
-        let cfg = read_deepseek_moe_cfg(model);
+        let cfg = read_deepseek_moe_cfg(model, BundleDims::of(accessor, program, model), accessor);
         return FieldLoad::DeepSeekV2GgmlMoe {
             prefix,
             n_routed_experts: cfg.n_routed_experts,
@@ -1288,32 +1342,9 @@ fn plan_field_load(
             prefixes.len(),
         );
         let prefix = prefixes.into_iter().next().unwrap();
-        let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
-        let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
-        let num_experts = v
-            .get("num_local_experts")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or_else(|| {
-                model.bounds.get("num_local_experts").copied().unwrap_or(8) as usize
-            });
-        let top_k = v
-            .get("num_experts_per_tok")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or_else(|| {
-                model
-                    .bounds
-                    .get("num_experts_per_tok")
-                    .copied()
-                    .unwrap_or(2) as usize
-            });
-        let intermediate_size = model
-            .bounds
-            .get("intermediate_size")
-            .copied()
-            .unwrap_or(14336) as usize;
-        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(4096) as usize;
+        let dims = BundleDims::of(accessor, program, model);
+        let (num_experts, hidden_size, intermediate_size) = dims.bank(accessor);
+        let top_k = routed_top_k(model);
         // Probe storage format: if expert weights are MLX-affine int4
         // (mlx-community 4bit Mixtral / Qwen-MoE), emit the metal
         // `load_affine` call site; otherwise emit cuda `load`.
@@ -1344,52 +1375,11 @@ fn plan_field_load(
             prefixes.len(),
         );
         let prefix = prefixes.into_iter().next().unwrap();
-        let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
-        let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
-        // `n_routed_experts` on the sigmoid-routed configs (GLM-4.5, Nemotron-H).
-        let num_experts = v
-            .get("num_experts")
-            .or_else(|| v.get("n_routed_experts"))
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or_else(|| model.bounds.get("num_experts").copied().unwrap_or(60) as usize);
-        let top_k = v
-            .get("num_experts_per_tok")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or_else(|| {
-                model
-                    .bounds
-                    .get("num_experts_per_tok")
-                    .copied()
-                    .unwrap_or(4) as usize
-            });
-        let moe_intermediate_size = v
-            .get("moe_intermediate_size")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or_else(|| {
-                model
-                    .bounds
-                    .get("moe_intermediate_size")
-                    .copied()
-                    .unwrap_or(1408) as usize
-            });
-        let shared_expert_intermediate_size = v
-            .get("shared_expert_intermediate_size")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or_else(|| {
-                model
-                    .bounds
-                    .get("shared_expert_intermediate_size")
-                    .copied()
-                    .unwrap_or(0) as usize
-            });
-        // The experts' own width: the model's hidden size, or a latent MoE's narrower expert space
-        // (the op's output is the experts' input — see `sig_moe`).
-        let hidden_size = moe_expert_width(fuf, model, accessor)
-            .unwrap_or_else(|| model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize);
+        let dims = BundleDims::of(accessor, program, model);
+        // The experts' own width: the model's hidden size, or a latent MoE's narrower expert space.
+        let (num_experts, hidden_size, moe_intermediate_size) = dims.bank(accessor);
+        let top_k = routed_top_k(model);
+        let shared_expert_intermediate_size = dims.shared.unwrap_or(0);
         let only_src = accessor.source_weights[0].0;
         // Single-owner rule (mirrors `MetalSharedFusedMoeImpl::fan_out`):
         // when the DSL claims `<moe>.shared_expert.*` leaves in the
@@ -1423,8 +1413,7 @@ fn plan_field_load(
             prefixes.len(),
         );
         let prefix = prefixes.into_iter().next().unwrap();
-        let num_experts = model.bounds.get("num_experts").copied().unwrap_or(128) as usize;
-        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2816) as usize;
+        let (hidden_size, num_experts) = BundleDims::of(accessor, program, model).router(accessor);
         // `router.proj`'s storage, resolved by the same law the fingerprint's
         // affine bit map uses — `affine_role_widths` on the accessor's
         // `{prefix}.proj` role, honoring the preset's `bits_overrides`
@@ -1469,18 +1458,9 @@ fn plan_field_load(
             prefixes.len(),
         );
         let prefix = prefixes.into_iter().next().unwrap();
-        let num_experts = model.bounds.get("num_experts").copied().unwrap_or(128) as usize;
-        let top_k = model
-            .bounds
-            .get("num_experts_per_tok")
-            .copied()
-            .unwrap_or(8) as usize;
-        let moe_intermediate_size = model
-            .bounds
-            .get("moe_intermediate_size")
-            .copied()
-            .unwrap_or(704) as usize;
-        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2816) as usize;
+        let (num_experts, hidden_size, moe_intermediate_size) =
+            BundleDims::of(accessor, program, model).bank(accessor);
+        let top_k = routed_top_k(model);
         let only_src = accessor.source_weights[0].0;
         // Resolve at THIS accessor's unrolled layer index so MLX-native
         // mixed/dynamic quant (OptiQ) gives each layer's experts their own
@@ -1526,36 +1506,9 @@ fn plan_field_load(
             prefixes.len(),
         );
         let prefix = prefixes.into_iter().next().unwrap();
-        let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
-        let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
-        let num_experts = v
-            .get("num_local_experts")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or_else(|| {
-                model
-                    .bounds
-                    .get("num_local_experts")
-                    .copied()
-                    .unwrap_or(128) as usize
-            });
-        let top_k = v
-            .get("num_experts_per_tok")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or_else(|| {
-                model
-                    .bounds
-                    .get("num_experts_per_tok")
-                    .copied()
-                    .unwrap_or(4) as usize
-            });
-        let intermediate_size = model
-            .bounds
-            .get("intermediate_size")
-            .copied()
-            .unwrap_or(2880) as usize;
-        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2880) as usize;
+        let (num_experts, hidden_size, intermediate_size) =
+            BundleDims::of(accessor, program, model).bank(accessor);
+        let top_k = routed_top_k(model);
         // Op-keyed arm (the `GptOssMoe` op selects it), so like GemmaSwitchGlu
         // it MUST tolerate the Dense/verbatim config and default its storage
         // params rather than panic — that config never becomes the
@@ -1610,92 +1563,19 @@ fn plan_field_load(
             prefixes.len(),
         );
         let prefix = prefixes.into_iter().next().unwrap();
-        // Read MoE params from the model config JSON.
-        let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
-        let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
-        let n_routed_experts = v
-            .get("n_routed_experts")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or_else(|| {
-                model.bounds.get("n_routed_experts").copied().unwrap_or(64) as usize
-            });
-        let n_shared_experts = v
-            .get("n_shared_experts")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or_else(|| model.bounds.get("n_shared_experts").copied().unwrap_or(2) as usize);
-        let top_k = v
-            .get("num_experts_per_tok")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or_else(|| {
-                model
-                    .bounds
-                    .get("num_experts_per_tok")
-                    .copied()
-                    .unwrap_or(6) as usize
-            });
-        let moe_intermediate_size = v
-            .get("moe_intermediate_size")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or_else(|| {
-                model
-                    .bounds
-                    .get("moe_intermediate_size")
-                    .copied()
-                    .unwrap_or(1536) as usize
-            });
-        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize;
-        let norm_topk_prob = v
-            .get("norm_topk_prob")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false);
-        let routed_scaling_factor = v
-            .get("routed_scaling_factor")
-            .and_then(|x| x.as_f64())
-            .map(|x| x as f32)
-            .unwrap_or_else(|| {
-                model
-                    .scalars
-                    .get("routed_scaling_factor")
-                    .copied()
-                    .unwrap_or(1.0) as f32
-            });
-        // sigmoid routing when scoring_func="sigmoid" AND topk_method="noaux_tc"
-        // (DeepSeek V3 / Kimi K2). Matches Python vLLM's condition.
-        let use_sigmoid = v
-            .get("scoring_func")
-            .and_then(|x| x.as_str())
-            .map(|s| s == "sigmoid")
-            .unwrap_or(false)
-            && v.get("topk_method")
-                .and_then(|x| x.as_str())
-                .map(|s| s == "noaux_tc")
-                .unwrap_or(false);
-        let n_expert_group = v
-            .get("n_group")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or(0);
-        let topk_group = v
-            .get("topk_group")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize)
-            .unwrap_or(0);
+        let cfg = read_deepseek_moe_cfg(model, BundleDims::of(accessor, program, model), accessor);
         return FieldLoad::DeepSeekV2Moe {
             prefix,
-            n_routed_experts,
-            n_shared_experts,
-            top_k,
-            moe_intermediate_size,
-            hidden_size,
-            norm_topk_prob,
-            routed_scaling_factor,
-            use_sigmoid,
-            n_expert_group,
-            topk_group,
+            n_routed_experts: cfg.n_routed_experts,
+            n_shared_experts: cfg.n_shared_experts,
+            top_k: cfg.top_k,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+            hidden_size: cfg.hidden_size,
+            norm_topk_prob: cfg.norm_topk_prob,
+            routed_scaling_factor: cfg.routed_scaling_factor,
+            use_sigmoid: cfg.use_sigmoid,
+            n_expert_group: cfg.n_expert_group,
+            topk_group: cfg.topk_group,
         };
     }
 
@@ -2147,7 +2027,7 @@ fn expert_input_probe(
     model: &ModelParams,
 ) -> Option<ExpertInputProbe> {
     use scratchy_subtile::subtile_ir::ExpertBody;
-    let body = model.expert_activation.body().ok()?;
+    let body = crate::config::expert_body(&model.expert_activation).ok()?;
     if !matches!(body, ExpertBody::Ungated(_)) {
         return None;
     }
@@ -16564,6 +16444,44 @@ fn emit_shim_model(
         };
     };
     (tokens, shim_affine_rows)
+}
+
+/// No bundle loader is sized off the config: `plan_field_load` (and the DeepSeek MoE reader it
+/// calls) reads none of the config keys a bundle's dims could come from, so every dim it emits is
+/// [`BundleDims`]', its derived bundle's roles evaluated under the model's bounds.
+#[cfg(test)]
+#[test]
+fn no_bundle_loader_reads_a_dim_from_the_config() {
+    let src = include_str!("codegen.rs");
+    let body = |name: &str| -> &str {
+        let start = src
+            .find(&format!("\nfn {name}("))
+            .unwrap_or_else(|| panic!("fn {name}"));
+        let end = src[start + 1..]
+            .find("\n}\n")
+            .map_or(src.len(), |e| start + 1 + e);
+        &src[start..end]
+    };
+    let keys = [
+        "num_experts",
+        "num_local_experts",
+        "n_routed_experts",
+        "n_shared_experts",
+        "moe_intermediate_size",
+        "intermediate_size",
+        "shared_expert_intermediate_size",
+        "hidden_size",
+    ];
+    for name in ["plan_field_load", "read_deepseek_moe_cfg"] {
+        let text = body(name);
+        for key in keys {
+            let read = format!("get(\"{key}\")");
+            assert!(
+                !text.contains(&read),
+                "`{name}` reads `{key}` off the config"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

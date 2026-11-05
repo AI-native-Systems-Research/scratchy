@@ -10,9 +10,6 @@
     "hidden_size",
     "vocab_size"
   ],
-  "mlp": [
-    "hidden_size"
-  ],
   "mlp.shared_expert.gate_proj": [
     "hidden_size",
     "n_shared_experts * moe_intermediate_size"

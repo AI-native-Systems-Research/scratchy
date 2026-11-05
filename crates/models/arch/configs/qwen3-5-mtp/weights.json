@@ -15,7 +15,6 @@
   "self_attn.q_norm": ["head_dim"],
   "self_attn.k_norm": ["head_dim"],
 
-  "mlp": ["hidden_size"],
   "mlp.shared_expert.gate_proj": ["hidden_size", "shared_expert_intermediate_size"],
   "mlp.shared_expert.up_proj": ["hidden_size", "shared_expert_intermediate_size"],
   "mlp.shared_expert.down_proj": ["shared_expert_intermediate_size", "hidden_size"],

@@ -3,15 +3,17 @@
 //! the typed-Rust emit pass reads ([`typed_emit::CarrierFacts`]), for the build script and for a
 //! test that types a program of its own.
 
-use crate::{dim, hf_config, typed_emit};
+use crate::{bundles, classified::Program, dim, hf_config, typed_emit};
 
 /// What the carrier `stem`'s configs and arch.json say about its derived dims, by the config rules
 /// the config loader uses (`hf_config`): each gated rule's flag over every config of the carrier (a
-/// head's: each config of the archs it ships in that carries it), and its arch.json `expr` params.
+/// head's: each config of the archs it ships in that carries it), its arch.json `expr` params, and
+/// the weight bundles `program` passes whole to an op, derived from every config alike.
 pub fn carrier_facts(
     arch_root: &std::path::Path,
     stem: &str,
     vision: bool,
+    program: &Program,
     read_files: &mut Vec<std::path::PathBuf>,
 ) -> typed_emit::CarrierFacts {
     let configs_dir = arch_root.join("configs").join(stem);
@@ -104,5 +106,41 @@ pub fn carrier_facts(
             (name, parsed)
         })
         .collect();
-    typed_emit::CarrierFacts { gated, exprs }
+    // The bundles every config derives, as the config loader reads each (normalized under the
+    // arch's aliases): one typed carrier holds them, so the configs must agree.
+    let mut derived: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut agreed = None;
+    for (p, json) in &configs {
+        let json = hf_config::normalize_hf_config(json, &facts.config_aliases);
+        let bounds = hf_config::extract_bounds(&json);
+        let activation = bundles::ExpertActivation::of(&json);
+        let config = bundles::BundleConfig {
+            bounds: &bounds,
+            activation: &activation,
+        };
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let found = bundles::derive(program, &config);
+        derived.entry(format!("{found:?}")).or_default().push(name);
+        agreed.get_or_insert(found);
+    }
+    let bundles = match (derived.len(), agreed) {
+        (0, _) | (_, None) => Ok(Default::default()),
+        (1, Some(found)) => found,
+        _ => Err(format!(
+            "its configs derive different weight bundles: {}",
+            (derived.iter())
+                .map(|(b, names)| format!("{} derive {b}", names.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )),
+    };
+    typed_emit::CarrierFacts {
+        gated,
+        exprs,
+        bundles,
+    }
 }

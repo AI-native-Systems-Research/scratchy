@@ -57,6 +57,18 @@ crates/models/arch/
   entries, dataflow pins everything and `weights.json` is empty or
   absent.
 
+  A weight the DSL passes whole to one op (`moe_block(x, mlp[layer])`,
+  `gated_delta_net(.., linear_attn[layer])`, `mamba2(.., mamba[layer])`)
+  is a bundle, and is never declared here: the op names its kind and the
+  config's own keys its roles' shapes (`bundles::derive` — the routed
+  expert count as `num_local_experts`, `n_routed_experts` or
+  `num_experts` spells it, the expert width, a shared expert the DSL does
+  not state as ops of its own, the experts' activation). The emit pass
+  passes the roles to the kind's constructor, whose signature relates
+  them to each other and to the op's activations; the bake sizes the
+  bundle's loader by the same derivation, and a test holds it to real
+  checkpoints (`tests/bundle_headers/`).
+
 - **`arch.json`** (optional) — the arch's own declarations: everything
   about it that is **not** derivable from a verbatim `config.json` plus
   the DSL body, and that is the same across every size. The DSL file

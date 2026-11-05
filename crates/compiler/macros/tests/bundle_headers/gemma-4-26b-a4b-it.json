@@ -1,0 +1,13 @@
+{
+  "repo": "google/gemma-4-26b-a4b-it",
+  "configs": ["gemma4-moe/gemma-4-26b-a4b-it"],
+  "head": false,
+  "bundles": {"router": "model.language_model.layers.0.router", "experts.switch_glu": "model.language_model.layers.0"},
+  "tensors": {
+    "model.language_model.layers.0.experts.down_proj": [128, 2816, 704],
+    "model.language_model.layers.0.experts.gate_up_proj": [128, 1408, 2816],
+    "model.language_model.layers.0.router.per_expert_scale": [128],
+    "model.language_model.layers.0.router.proj.weight": [128, 2816],
+    "model.language_model.layers.0.router.scale": [2816]
+  }
+}

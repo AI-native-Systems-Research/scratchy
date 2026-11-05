@@ -26,8 +26,5 @@
 
   "mlp.gate_proj": ["hidden_size", "intermediate_size"],
   "mlp.up_proj": ["hidden_size", "intermediate_size"],
-  "mlp.down_proj": ["intermediate_size", "hidden_size"],
-
-  "router": ["hidden_size"],
-  "experts.switch_glu": ["hidden_size"]
+  "mlp.down_proj": ["intermediate_size", "hidden_size"]
 }
