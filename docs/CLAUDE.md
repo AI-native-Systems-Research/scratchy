@@ -6,7 +6,7 @@ Reference docs agents must read before touching builds, models, tests or benchma
 ## WHERE TO LOOK
 | Question | Doc |
 |----------|-----|
-| Feature scoping, cuda two-step build, air-gap, metal-base | `BUILD.md` |
+| Feature scoping, air-gap, metal-base | `BUILD.md` |
 | `#[forward]` pipeline, passes, tapes | `COMPILER.md` |
 | New arch layout contract / recipe | `MODELS.md` (then `crates/models/arch/dsl/CLAUDE.md` checklist) |
 | Test tiers T1–T5, protected tests, what "weakening" means | `TESTING.md` |
@@ -18,7 +18,6 @@ Reference docs agents must read before touching builds, models, tests or benchma
 | Essays | `blogs/` |
 
 ## FACTS NOT IN ROOT CLAUDE.md
-- cuda = two cargo invocations: build `scratchy-builder-cuda` kernels first (`SCRATCHY_GPU`, `CUDA_COMPUTE_CAP`), then the binary.
 - `hf-completions` is default; air-gapped builds use `--no-default-features`.
 - TurboQuant KV is fixed at build time (on with `metal`); `metal-base` = dense KV, no MTP.
 - Protected T5 zones: GPU numerics, wire surface, scheduler dynamics, e2e, spyre flex-rs allocator.

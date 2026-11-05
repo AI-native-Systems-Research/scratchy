@@ -10,7 +10,7 @@ ktir-optimizer/  IR->IR passes            (deps: ktir-core)
 ktir-emulator/   CPU/Metal interpreter     (deps: ktir-core, ktir-optimizer[default], objc2[metal])
 ktir-superdsc/   KTIR -> SuperDSC lowering (deps: ktir-core, serde, serde_json, half)
 ```
-Dependency direction is load-bearing: superdsc and optimizer must never reach the emulator (objc2 is Apple-only and breaks linux-cuda).
+Dependency direction is load-bearing: superdsc and optimizer must never reach the emulator (objc2 is Apple-only and breaks the linux jobs).
 
 ## WHERE TO LOOK
 | Need | Location |

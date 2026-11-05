@@ -22,7 +22,7 @@ Native Rust port of the flex C++ allocator/runtime-stream/scheduler slice that s
 ## CONVENTIONS
 - Each module doc cites the C++ files it ports and a "Recorded divergences" list; keep both current when the port changes behavior.
 - Links ONLY senlib + flightlog + a fixed boost set. Never `libflex.so`, never `sendnn_*`. Link flags are emitted even when the compile is skipped, so a real link fails loudly.
-- Env: `FLEX_RS_SPYRE_ROOT` (default `/opt/ibm/spyre`), `BOOST_LIB` (default `/usr/lib64`), `SCRATCHY_SKIP_SENDNN_CXX=1` (skip shim compile; check/clippy only; CI linux-cuda sets it).
+- Env: `FLEX_RS_SPYRE_ROOT` (default `/opt/ibm/spyre`), `BOOST_LIB` (default `/usr/lib64`), `SCRATCHY_SKIP_SENDNN_CXX=1` (skip shim compile; check/clippy only; CI linux-workspace sets it).
 - Capability tokens with private fields make misuse unwritable: `CbRetired` has exactly two constructors (`from_completion`, `never_submitted`, named so grep finds each bypass); `QuarantinedBuf` has no accessor or `Deref`.
 - Pure decision split from diagnostics (`cb_verdict` vs `eval_cb_complete_status`) so the decision is Kani-provable. Proofs sit in a `#[cfg(kani)]` child module (`src/scheduler/completion/kani_proofs.rs`). They run only under the kani toolchain.
 - Tests touching env go through `config_test_lock`/`EnvGuard`.

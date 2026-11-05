@@ -29,4 +29,4 @@ Macro-time lowering: SubtileTape -> metal step tape -> per-bucket `static` tapes
 ## ANTI-PATTERNS
 - 🛑 KNOWN DEFECT (`steps_from_tape.rs` ~605): the accessor base drops trailing `_<digits>`, so Qwen2-VL's `visual.merger.mlp.0`/`.2` collapse into one accessor. The fix belongs at accessor-name generation, not at keeping the numeral there. Read the comment before touching it.
 - Refuse (`StepRefusal`/`BakeDefect`/`CanonicalRefusal`) rather than emit a best-effort tape.
-- Linux CI excludes this crate along with `scratchy-target-metal`, because objc2 is reached through it. Never make this crate a dependency of anything on the linux-cuda graph.
+- Linux CI excludes this crate along with `scratchy-target-metal`, because objc2 is reached through it. Never make this crate a dependency of anything on the linux build graph.

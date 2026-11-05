@@ -16,7 +16,7 @@ Layer structs, weight loading, KV/GDN pools, rotary math and TurboQuant codec â€
 | Layered vision/text loaders | `src/loaders.rs` |
 
 ## CONVENTIONS
-- This crate names no backend. Kernel-calling `forward` and backend-bound `load` live in target crates as `*Ops` / `*Ext` extension traits (e.g. `CudaRotaryExt`).
+- This crate names no backend. Kernel-calling `forward` and backend-bound `load` live in target crates as `*Ops` / `*Ext` extension traits (e.g. spyre's `CudaRotaryExt`, a legacy name).
 - Allocation through a caller-supplied `alloc_buffer` closure.
 - Re-exports `scratchy_tensors::{device_allocator, dtype, tensor}` so it can serve as the backend-less `__gpu` alias (module mirror).
 - Pools are generic over `M: PoolMemory`, hold raw GPU pointers; every view has a `// SAFETY:` (pool owns memory, view borrows `&self`).
@@ -25,7 +25,7 @@ Layer structs, weight loading, KV/GDN pools, rotary math and TurboQuant codec â€
 - GDN pool: one slot per resident sequence, not token blocks.
 
 ## ANTI-PATTERNS
-- No backend runtime methods or cfg(cuda/metal) here (guarded by `crates/tensors/tests/cfg_neutrality.rs`).
+- No backend runtime methods or cfg(metal) here (guarded by `crates/tensors/tests/cfg_neutrality.rs`).
 - KV: co-resident layers never write the same physical block; never read stale chunk-table entries after `drop_chunks`; always keep chunk 0 (`keep.max(1)`); vision codegen never emits paged-attention reads.
 - GDN: non-GDN codegen never emits a `GatedDeltaNet` read (panics by contract).
 - weights: never cast integer weights; never examine unlisted `TensorRefs` rows (test `an_unlisted_tensor_is_never_examined`); don't resolve lm_head prefix aliasing (variants bake the prefix).

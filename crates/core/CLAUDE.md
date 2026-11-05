@@ -7,7 +7,7 @@ Four crates every other layer depends on: shared types (`common`), configs (`con
 | Crate (dir) | Role | Key files |
 |-------------|------|-----------|
 | `scratchy-core-common` (common/) | flat re-exports: engine IO, KV, request, sampling, telemetry | `src/kv.rs`, `src/engine_io.rs`, `src/request.rs`, `src/sampling.rs`, `src/telemetry*` |
-| `scratchy-core-config` (config/) | `CacheConfig`, `KVCacheConfig`, `compute_hybrid_kv_layout`, `SchedulerConfig`, `CudaGraphConfig`, `SpansConfig` | `src/lib.rs` |
+| `scratchy-core-config` (config/) | `CacheConfig`, `KVCacheConfig`, `compute_hybrid_kv_layout`, `SchedulerConfig`, `SpansConfig` | `src/lib.rs` |
 | `hf-hub-downloader` (hf-hub-downloader/) | replaces the `hf-hub` crate; HF cache layout | `src/`, `tests/live_hub.rs` |
 | `scratchy-core-model` (model/) | `SafeTensorsIndex`, `HfModelConfig`, baked tokenizer, hub resolve, embedding, LoRA | `src/weight.rs`, `src/baked_tokenizer.rs`, `src/hub.rs`, `src/lora.rs` |
 

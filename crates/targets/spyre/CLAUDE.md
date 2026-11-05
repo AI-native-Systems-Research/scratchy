@@ -44,7 +44,7 @@ spyre/
 - Test names are full-sentence laws; `zz_` prefix groups attention/address-law pins.
 
 ## ANTI-PATTERNS
-- Pulling flex-rs into a cuda/metal/emit-only build. A new card-only example without `required-features = ["spyre-hw"]` in Cargo.toml.
+- Pulling flex-rs into a metal/emit-only build. A new card-only example without `required-features = ["spyre-hw"]` in Cargo.toml.
 - A `bridge::x_y` module that both translates and transforms. `subtile_tape_tile_op` is pure syntax: no row-count branches, no decomposition. Composite ops (RmsNorm, RoPE, AttnDecode) decompose only in `tiled_op_sdsc_op`/the emitter.
 - The emitter reading the `#[forward]` shell. Printing KTIR text instead of constructing `IRFunction`s. Naming tensors by `format!("t{id}")`.
 - Re-adding a `lower_ktir_to_superdsc` module here (name collision with the real lowering in ktir-superdsc).

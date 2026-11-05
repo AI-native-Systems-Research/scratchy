@@ -18,12 +18,11 @@ compiler/
 - macro -> forward-compiler -> ir. NEVER forward-compiler -> macro (cycle; the re-export was dropped for this).
 - forward-compiler has NO edge to `scratchy-target-metal` (metal depends UP on compiler); MTL4 types come via `objc2`/`objc2-metal` directly.
 - `subtile` -> forward-compiler is dev-dep only (cpu_golden). Non-test subtile code never names it.
-- `nccl` here forwards only `scratchy-ir/nccl`: keeps CUDA C ABI symbols out of the macro's host .so.
 
 ## WHERE TO LOOK
 | Task | Location |
 |------|----------|
-| New CUDA interpreter op | `ir/src/lib.rs` `Instruction` (closed, scalar-only fields). Metal/spyre tape ops are `SubOp` in `subtile/` |
+| New tape op | `SubOp` in `subtile/` (not `ir`'s `Instruction`) |
 | KV offsets / layer stride | `ir/src/lib.rs` `KvOffsets` - stride is NOT always 1 |
 | Weight trait emitted code impls | `src/dispatcher.rs` `ScratchyWeights`, `BoundWeight`, `HfFingerprint` |
 | Metal chain/followup surface | `src/dispatcher.rs` `MetalForwardOnto`, `MetalChainBody` (cfg metal) |
@@ -37,10 +36,9 @@ compiler/
 
 ## CONVENTIONS
 - `Instruction` lives in `ir` but stays re-exported here: emitted code spells `::scratchy_forward_compiler::Instruction`.
-- Features select the backend (`cuda`/`metal`/`spyre`/`spyre-hw`); `cuda` implies `vision`. `default = []`.
-- `ir/`, `macros/`, `.` build.rs files are identical: emit `cfg(fa3_built)` when `CUDA_ARCH` or nvidia-smi says sm >= 90.
+- Features select the backend (`metal`/`spyre`/`spyre-hw`). `default = []`.
 - `is_gemm` is CARRIED, never inferred (dispatcher.rs). No one names a weight by string - use `BoundWeight`.
-- Unsafe forward methods carry Safety docblocks (live CUDA device, arena-slot invariants); keep them current.
+- Unsafe forward methods carry Safety docblocks (arena-slot invariants); keep them current.
 
 ## ANTI-PATTERNS
 - Do not add a dep from here to the macro crate or to `scratchy-target-metal`.

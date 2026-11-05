@@ -1,12 +1,12 @@
 # scratchy-serving-worker
 
 ## OVERVIEW
-Device workers + executors: one `MetalWorker`/`CudaWorker` in `gpu_worker.rs`, the Spyre worker split across `spyre_*.rs`, uniproc/threadpool/multinode executors, TP groups. Backend-gated.
+Device workers + executors: `MetalWorker` in `gpu_worker.rs`, the Spyre worker split across `spyre_*.rs`, uniproc/threadpool/multinode executors, TP groups. Backend-gated.
 
 ## WHERE TO LOOK
 | Task | File |
 |------|------|
-| Metal/CUDA step, KV/GDN pools, chain layout, spec-decode backend | `src/gpu_worker.rs` (`MetalWorkerFactory`, `SeqMmInfo`) |
+| Metal step, KV/GDN pools, chain layout, spec-decode backend | `src/gpu_worker.rs` (`MetalWorkerFactory`, `SeqMmInfo`) |
 | Pre-init Metal sizing guard (used by api `init`) | `src/metal_info.rs` |
 | Executors | `src/uniproc.rs`, `src/threadpool.rs`, `src/multinode.rs` (`MultiNodeExecutor`, `ControlMessage`) |
 | TP/PP group resolution | `src/parallel.rs` (`ParallelGroup`, `ResolvedParallelConfig`) |
@@ -14,10 +14,8 @@ Device workers + executors: one `MetalWorker`/`CudaWorker` in `gpu_worker.rs`, t
 | `error`/`worker`/`worker_factory`/`input_batch` | re-export shims over serving-engine; edit engine instead |
 
 ## CONVENTIONS
-- Module gates: `gpu_worker`/`gpu_worker_base` = `any(cuda, metal)`; `metal_info` = `metal`; `spyre_*` = `any(spyre, spyre-hw)`. `gpu_worker.rs` is cfg-mutexed: nearly every item carries `#[cfg(feature = "metal")]`/cuda, and imports follow the cfg of the code that uses them.
-- `build.rs` emits `cfg(fa3_built)` when `CUDA_ARCH>=90` or nvidia-smi reports sm_90+. It mirrors `scratchy-builder-cuda`'s `detect_cuda_arch`, so change both together.
-- `extern crate scratchy_builder_cuda as _` exists only to run its build.rs (`.a` link). Not dead code.
-- Spyre rides the neutral seam (scratchy-layers `GpuWeights`, scratchy-tensors `DType`, scratchy-subtile `DeviceWidth`) and NEVER touches target-cuda.
+- Module gates: `gpu_worker`/`gpu_worker_base` = `metal`; `metal_info` = `metal`; `spyre_*` = `any(spyre, spyre-hw)`. `gpu_worker.rs` is cfg-mutexed: nearly every item carries `#[cfg(feature = "metal")]`, and imports follow the cfg of the code that uses them.
+- Spyre rides the neutral seam (scratchy-layers `GpuWeights`, scratchy-tensors `DType`, scratchy-subtile `DeviceWidth`).
 - `spyre-hw` must not pull `spyre-emu`/ktir-emulator (objc2 breaks Linux card builds); gate per path, "NOT `cfg(not(spyre-hw))`".
 - Every raw MTLBuffer/arena pointer use carries a `// SAFETY:` comment; keep that up when adding unsafe.
 

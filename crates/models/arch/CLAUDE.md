@@ -10,7 +10,6 @@ Build script expands each enabled `dsl/<arch>.py` against `configs/<arch>/` into
 | Hub registry for shell completions | `hf_registry_build.rs` (only build-time network I/O) |
 | Feature tables (per stem/arch/`all`) | `Cargo.toml` |
 | Arch module cfg gates, `compiled_hf_registry()` | `src/lib.rs` |
-| Backend availability tables | `CUDA_ONLY`, `METAL_ONLY`, `SPYRE_CAPABLE` in `scratchy-forwards.rs` |
 | Universal carrier-vs-tape gate | `tests/carrier_parity.rs` + `tests/goldens/<arch>-<stem>/` |
 | Metal bit-exact logits oracle | `tests/metal_o2_logits.rs` (`#[ignore]`) |
 | Other gates | `qwen3_py_parity.rs`, `gemma4_router_affine_fingerprint.rs`, `spyre_weight_folds.rs` |
@@ -29,7 +28,7 @@ Build script expands each enabled `dsl/<arch>.py` against `configs/<arch>/` into
 
 ## ANTI-PATTERNS
 - `src/lib.rs` `#![allow]`s are scoped to generated code; don't extend.
-- Don't emit an arch for a backend that can't compile it (bad metal code / ISel panic) — gate via the tables.
+- Don't emit an arch for a backend that can't compile it (bad metal code / bake failure) — gate it in the `Cargo.toml` feature tables.
 - Unmatched `SCRATCHY_BUILD_FILTER` tag panics by design.
 - Expert-pruned checkpoints (REAP) are dropped from the registry deliberately.
 - carrier_parity must run with NO quant features (unless testing a preset).

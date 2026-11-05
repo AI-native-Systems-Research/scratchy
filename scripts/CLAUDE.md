@@ -13,7 +13,6 @@
 | Expand one arch's `#[forward]` without cargo build | `emit-arch.sh <arch> <stem> [--rerooted]` |
 | macOS CI locally | `act-local.sh` |
 | macOS job skip / lock gate | `ci-macos-scope.sh changed <base> <head>` / `lock` |
-| linux-cuda clippy gate | `ci-linux-cuda-clippy.sh` |
 | Batched-decode correctness | `metal-batch-gate.sh` (granite-3.3-8b) |
 | Batched prefill is real? | `verify_prefill_real.sh` |
 | Goldens | `generate_golden_refs.py`, `generate_mlx_goldens.py`, `generate_chat_template_goldens.py` |

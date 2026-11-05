@@ -29,7 +29,7 @@ Four crates; `arch/` has its own CLAUDE.md. This file covers the map plus `quant
 - Quant scope is compile-time cfg only (`enabled_presets`), never env reads.
 - Vision: arch names never appear in compiler/serving; each arch declares `pub const PROCESSOR: MmMetadata`, baked via `#[vision_forward(processor = ...)]`.
 - Vision host fns cite the exact upstream Python they mirror (HF / mlx-vlm); keep that when adding.
-- `scratchy-vision` `cuda/metal/nccl` features are inert symmetry toggles; device helpers live in `scratchy-target-cuda::vision_device`.
+- `scratchy-vision`'s `metal` feature is an inert symmetry toggle.
 - `image` crate: jpeg/png/webp only, default-features off.
 
 ## ANTI-PATTERNS

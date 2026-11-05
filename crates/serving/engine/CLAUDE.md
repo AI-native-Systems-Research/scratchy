@@ -17,7 +17,7 @@ Target-neutral engine core: `EngineCore` step loop (scheduler + executor), `Engi
 
 ## CONVENTIONS
 - Nothing here names a backend: execution goes through `Box<dyn Executor>` / `Box<dyn Worker>`. Backend code belongs in serving-worker or `targets/*`.
-- `spec_decode` is always compiled; only `grammar` is gated (`guided-decoding`). `multiproc` only forwards to transport.
+- `spec_decode` is always compiled; only `grammar` is gated (`guided-decoding`).
 - Drafts flow worker -> `ModelRunnerOutput.draft_token_ids` -> engine -> scheduler. The engine never runs draft GPU work itself.
 - `ProposerConfig::{Ngram, DraftModel, Mtp}` is the single selector; add proposers there.
 

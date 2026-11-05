@@ -17,9 +17,8 @@
 | Architecture guard | `tests/cfg_neutrality.rs` |
 
 ## CONVENTIONS
-- No CUDA/Metal types in signatures. Backend facts enter via trait seams or the opaque lifetime-carrying handles, recovered with `unsafe as_ref/as_mut`.
-- Only cfg gate: `cuda` feature switches `LoadStream` (`CUstream` vs `()`).
-- `cudarc` features must match every consumer (`dynamic-linking` + `cuda-version-from-build-system`); mixing in `dynamic-loading` panics cudarc's build script.
+- No Metal/spyre types in signatures. Backend facts enter via trait seams or the opaque lifetime-carrying handles, recovered with `unsafe as_ref/as_mut`.
+- No cfg gates: `LoadStream` is `()`.
 - `memmap2` is here only for `register_mmap`'s signature.
 - `GpuTensor` is contiguous row-major, owns nothing; lifetime belongs to the region (weights/arena/KV pool).
 - `DeviceAllocator` is used monomorphized, never `dyn`.
@@ -28,12 +27,10 @@
 ## ANTI-PATTERNS
 - `cfg_neutrality.rs`: no `cfg(feature = "cuda"/"metal")` in neutral zones (incl. `crates/models`, `crates/tensors`); neutral code must not name `scratchy_target_cuda`, `scratchy_serving_cuda`, `CudaGraph`. Dispatch via trait/registry seams.
 - `WeightSource` is frozen: object-safe, no allocator/precast/streaming methods.
-- `adopt_raw` / `alloc_and_copy_device` are cuda-only hooks (`unreachable!` default); calling them on metal is a bug.
 - Handle `as_ref/as_mut`: `T` must be the exact concrete type the handle was built from; no aliasing the `&mut`.
 - Don't cast bf16 disk weights to fp16 (exponent clipping → garbage, e.g. Llama-3.x on metal).
 
 ## COMMANDS
 ```bash
 cargo test -p scratchy-tensors                     # incl. cfg_neutrality guard
-cargo build -p scratchy-tensors --features cuda
 ```

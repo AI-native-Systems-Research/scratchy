@@ -18,7 +18,7 @@ In-process server + HTTP client harness and ~40 protected (T5) e2e test files ru
 - Use `skip_if_no_gpu!` at test start; pick models via `TestModels` tiers (small tier first).
 - Names: `e<n>_*` = phase-numbered suites, `e_<topic>` = topic suites. Follow the neighbor you extend.
 - Start the server through `TestServer` builder, never a spawned `scr` process.
-- Default features: guided-decoding, metrics, multimodal, tls; opt-in `otel`, `rag`, `multiproc`, `nccl`. `metal` pulls scratchy-target-metal only to probe Metal 4 availability.
+- Default features: guided-decoding, metrics, multimodal, tls; opt-in `otel`, `rag`. `metal` pulls scratchy-target-metal only to probe Metal 4 availability.
 - Some doc comments still say `-p vllm-e2e`; the package is `scratchy-e2e`.
 
 ## ANTI-PATTERNS
@@ -28,5 +28,4 @@ In-process server + HTTP client harness and ~40 protected (T5) e2e test files ru
 ## COMMANDS
 ```bash
 cargo test -p scratchy-e2e --features e2e,metal --test <file> -- --ignored --test-threads=1
-cargo test -p scratchy-e2e --features e2e,cuda  --test <file> -- --ignored
 ```

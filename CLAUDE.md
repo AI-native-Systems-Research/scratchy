@@ -1,6 +1,6 @@
 # Building & verifying scratchy
 
-Rust LLM inference engine. A Python-DSL model + weights compile at build time into static instruction tapes. These are played on metal (Apple, Metal 4), cuda, or spyre (IBM). Serving is a vLLM port.
+Rust LLM inference engine. A Python-DSL model + weights compile at build time into static instruction tapes. These are played on metal (Apple, Metal 4) or spyre (IBM). The old CUDA backend was removed (#721). Serving is a vLLM port.
 
 ## Architecture invariants
 
@@ -107,7 +107,7 @@ See [`README.md`](README.md) (Building), [`docs/BUILD.md`](docs/BUILD.md), and
 ./
 ├── crates/compiler/     # build-time forward pipeline: macros (NOT a proc-macro), ir, subtile
 ├── crates/models/       # arch (DSL + configs/<arch>/<stem>.json), quantization, spec, vision
-├── crates/targets/      # metal | cuda | spyre (+ spyre/ktir, spyre/flex-rs)
+├── crates/targets/      # metal | spyre (+ spyre/ktir, spyre/flex-rs)
 ├── crates/triton/       # Triton .py -> TTIR -> KTIR -> SuperDSC ladder (re-hosted from triton-spyre)
 ├── crates/serving/      # scheduler, transport -> engine -> worker -> api
 ├── crates/core/         # common, config, hf-hub-downloader, model (weights, baked tokenizer)
@@ -119,22 +119,20 @@ See [`README.md`](README.md) (Building), [`docs/BUILD.md`](docs/BUILD.md), and
 ├── scripts/             # bench, CI, golden, emit-arch tooling
 ├── site/                # benchmark site (own Cargo.lock, out of workspace)
 ├── docs/                # BUILD, MODELS, TESTING (authoritative docs)
-└── third_party/, tools/ # vendored flash-attn shims; small leaf utilities
+└── tools/               # small leaf utilities
 ```
 
 ## WHERE TO LOOK
 | Task | Location | Notes |
 |------|----------|-------|
 | Add model / arch | `crates/models/arch/`, `docs/MODELS.md` | then the checklist in `crates/models/arch/dsl/CLAUDE.md` |
-| Arch build pipeline / feature tables | `crates/models/arch/scratchy-forwards.rs` | `CUDA_ONLY`/`METAL_ONLY`/`SPYRE_CAPABLE` |
+| Arch build pipeline | `crates/models/arch/scratchy-forwards.rs` | feature tables in `crates/models/arch/Cargo.toml` |
 | Quant preset | `crates/models/quantization/presets/`, `configs/<arch>/quantizations.json` | |
 | Forward codegen | `crates/compiler/macros/src/` | quick check: `scripts/emit-arch.sh` |
 | New tape op (metal/spyre) | `crates/compiler/subtile/src/subtile_ir.rs` `SubOp` + one row in `ops.rs` | then the exhaustive matches in metal `compiler/src/steps_from_tape.rs`, `src/op_abi.rs` and spyre `lower_subtile_tape_to_{ktir,superdsc}.rs`; the build lists any you missed |
-| New CUDA interpreter op | `crates/compiler/ir/src/lib.rs` `Instruction` | + its arm in `crates/targets/cuda/src/eval.rs`, emitted by `crates/compiler/macros/src/impl_lib.rs` |
 | Shared passes (reroll, colouring, KV codec) | `crates/compiler/subtile/` | target ABI = const tables |
 | Metal lowering / runtime / shaders | `crates/targets/metal/src/tape/`, `src/interpreter/metal/`, `shaders/` | |
 | Metal macro-time tapes | `crates/targets/metal/compiler/` | |
-| CUDA kernels / profiles | `crates/targets/cuda/csrc/`, `crates/targets/cuda/profiles/` | |
 | Spyre lowering / bake | `crates/targets/spyre/src/` | KTIR -> SuperDSC in `ktir/ktir-superdsc` |
 | Spyre hardware FFI | `crates/targets/spyre/flex-rs/` | sole `extern "C"` boundary |
 | HTTP / chat API | `crates/serving/api/` | `serve` feature gates axum |
@@ -144,7 +142,7 @@ See [`README.md`](README.md) (Building), [`docs/BUILD.md`](docs/BUILD.md), and
 
 ## CONVENTIONS
 - Dep direction: macro -> forward-compiler -> ir. Never the reverse. Target crates never depend on each other: `ktir-emulator/src/metal/mtl4.rs` copies `mtl4_dispatch`, so fix bugs in both.
-- Feature exclusivity: `cuda`/`metal`/`spyre` give a `compile_error!`. `spyre-hw` (card) and `spyre-emu` (emulator) are siblings, and neither is a fallback for the other.
+- Feature exclusivity: `metal`/`spyre` give a `compile_error!`. `spyre-hw` (card) and `spyre-emu` (emulator) are siblings, and neither is a fallback for the other.
 - Workers register via `inventory::submit!` and are kept alive by `extern crate ... as _` anchors. Removing an anchor leaves an empty registry.
 - Generated code names `scratchy_target_*` module paths verbatim. Renaming them breaks codegen.
 - Serving and `crates/triton` are ports: keep the SPDX header + "Port of:" docs and `PROVENANCE.md`.
@@ -152,11 +150,11 @@ See [`README.md`](README.md) (Building), [`docs/BUILD.md`](docs/BUILD.md), and
 
 ## ANTI-PATTERNS (THIS PROJECT)
 - `.commandBuffer()`: Metal 4 only (banned in `clippy.toml` and by the metal build.rs).
-- `ktir-superdsc` must not gain deps/features beyond ktir-core, half, serde, serde_json. flex-rs or objc2 in a cuda/metal/emit-only build breaks CI.
+- `ktir-superdsc` must not gain deps/features beyond ktir-core, half, serde, serde_json. flex-rs or objc2 in a metal/emit-only build breaks CI.
 - Never compile spyre/triton crates in macOS jobs (`scripts/ci-macos-scope.sh lock`).
 - Never build the `tool-spans` api feature (known broken). Never hand-edit `site/data` JSON, marlin generated kernels, or `crates/serving/api/src/chat_template/hf_renders.rs`.
 - No per-model tokenizer lists or benchmark hacks (see `crates/models/arch/dsl/CLAUDE.md`).
-- Existing crate-level `#![allow]`s (cuda, tensors, metal lib, macros/subtile `dead_code`) are legacy and set no precedent.
+- Existing crate-level `#![allow]`s (tensors, metal lib, macros/subtile `dead_code`) are legacy and set no precedent.
 - A missing golden is a failure, never a skip.
 
 ## COMMANDS
@@ -174,7 +172,7 @@ python3 -m unittest discover -s scripts/tests
 
 ## NOTES
 - Adding an arch DSL: bump the count in `crates/compiler/macros/tests/arch_declarations.rs`.
-- `SCRATCHY_SKIP_CUDA_KERNELS=1` / `SCRATCHY_SKIP_SENDNN_CXX=1` are for check/clippy only. Linking fails with them.
+- `SCRATCHY_SKIP_SENDNN_CXX=1` is for check/clippy only. Linking fails with them.
 - Spyre bake on a host without dxp needs `SCRATCHY_PLAN_ONLY_BAKE=1`.
 - macOS SDK >= 26.2 is required (metal build panics otherwise).
 - Kani for subtile needs `--features spyre`. Without it, Kani silently finds zero harnesses.
@@ -186,7 +184,6 @@ Claude Code loads these when it works in that directory.
 - compiler: `crates/compiler/`, `compiler/macros/`, `compiler/subtile/`
 - serving: `crates/serving/`, `serving/{api,engine,scheduler,worker}/`
 - metal: `crates/targets/metal/`, `metal/compiler/`, `metal/shaders/`, `metal/src/tape/`, `metal/src/interpreter/metal/`
-- cuda: `crates/targets/cuda/`, `cuda/csrc/`
 - spyre: `crates/targets/spyre/`, `spyre/flex-rs/`, `spyre/ktir/`, `ktir/{ktir-emulator,ktir-optimizer,ktir-superdsc}/`
 - triton: `crates/triton/`, `triton/{splice,triton-frontend,triton-ktir,triton-ktir-superdsc,triton-numeric}/`
 
