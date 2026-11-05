@@ -3560,13 +3560,10 @@ pub fn eval_node<F: RopeForm>(
         SubOp::KvAppend { .. } => gather(&node.inputs[0], graph, bufs).0,
         // RopeAppend's host eval is rotation only (identical to RopeRotate);
         // its V input + the paged-cache write are GPU-only.
-        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => {
-            let head_dim = node
-                .op
-                .rope_head_dim()
-                .expect("the arm binds one of the two rope kinds");
-            rope_eval(node, graph, bufs, head_dim.get())
-        }
+        SubOp::RopeRotate { head_dim, .. } => rope_eval(node, graph, bufs, head_dim.get()),
+        SubOp::RopeAppend {
+            attention, rope, ..
+        } => rope_eval(node, graph, bufs, rope.head_dim(attention).get()),
         SubOp::Mean => {
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
             debug_assert_eq!(out_cols, 1, "mean output must be [m, 1]");
@@ -4824,14 +4821,16 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
     for node in &graph.nodes {
         new_id_for_old.push(next_new_id);
         match node.op {
-            SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => {
+            SubOp::RopeRotate { head_dim, .. } => {
                 let total_cols = node.output.region.cols.len;
-                let head_dim_nz = node
-                    .op
-                    .rope_head_dim()
-                    .expect("the arm binds one of the two rope kinds")
-                    .nonzero();
-                next_new_id += head_blocks(total_cols, nb, head_dim_nz).len() as u32;
+                next_new_id += head_blocks(total_cols, nb, head_dim.nonzero()).len() as u32;
+            }
+            SubOp::RopeAppend {
+                attention, rope, ..
+            } => {
+                let total_cols = node.output.region.cols.len;
+                next_new_id +=
+                    head_blocks(total_cols, nb, rope.head_dim(attention).nonzero()).len() as u32;
             }
             _ => next_new_id += 1,
         }
