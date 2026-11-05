@@ -5009,100 +5009,59 @@ fn lower_function_folded(
                     // stick (`CopyDims::ENTRIES_PER_OP`, 32 — the op's own domain, not a device
                     // refusal) are chunked one op a run, each at its own entry base and landing
                     // offset: no entry count or size is refused.
-                    let slab = u64::from(page_sticks) * stick as u64;
-                    let total = to.iter().map(|&d| u64::try_from(d).unwrap_or(0)).product::<u64>();
-                    let w = to.last().copied().unwrap_or(0) as u64;
-                    if w == 0 || !w.is_multiple_of(stick as u64) {
-                        return err(format!(
-                            "{}: `{:?}` reads the gathered pages {w} wide — a plane of the folded \
-                             cache is whole sticks (its `[num_pages, block, sticks, eps]` layout, \
-                             stick dim last), so a frame not a whole number of {}-element sticks \
-                             wide is outside this gather's domain",
-                            f.name,
-                            op.op_type,
-                            crate::work::FP16_ELEMS_PER_STICK
-                        ));
-                    }
-                    // ⭐ THE RANK-2 FRAME, RESTICKIFIED — a `[T, w]` read of several gathered
-                    // planes wider than one stick. The card frame of a `[T, w]` tensor is ONE
-                    // stick column over all `T` rows, while the gather lands each entry's blocks
-                    // stick-major one after another — the same bytes exactly when there is one
-                    // block or one stick (a single entry, or `w` one stick wide, where the
-                    // landing IS the frame and nothing follows). Otherwise the entries land as
-                    // ONE-ROW blocks — row-major `[T, w]`, the same bytes the op reads — and one
-                    // whole stick permute restickifies them into the frame's own column: the
-                    // restickify the consumer's reshape used to perform (the deleted
-                    // `page_to_sticks` arm), stated here at the landing that needs it.
-                    let restickify = to.len() < 3 && g.entries > 1 && w > stick as u64;
-                    let r = if to.len() >= 3 {
-                        u64::try_from(to[to.len() - 2]).unwrap_or(0)
-                    } else {
-                        slab / w
-                    };
-                    let blocks = if to.len() >= 3 {
-                        total / (r * w)
-                    } else {
-                        u64::from(g.entries)
-                    };
-                    if r == 0 || !slab.is_multiple_of(r * w) || blocks != u64::from(g.entries) * (slab / (r * w))
-                    {
-                        return err(format!(
-                            "{}: `{:?}` re-frames {} gathered planes of {slab} elements as {to:?} — \
-                             the frame crosses a gathered entry: `index_select` keeps the entry axis \
-                             whole (the reference reshapes the gathered `[entries, slab]` keeping \
-                             dim 0), so each entry's plane must be a whole number of the frame's \
-                             `[{r}, {w}]` blocks",
-                            f.name,
-                            op.op_type,
-                            g.entries
-                        ));
-                    }
-                    let u32_of = |x: u64, what: &str| -> Result<u32, Error> {
-                        u32::try_from(x).map_err(|_| Error {
-                            message: format!(
-                                "{}: the gather's {what} ({x}) does not fit the op's 32-bit \
-                                 extents",
-                                f.name
-                            ),
-                        })
-                    };
-                    if restickify {
-                        // The landing: one-row blocks — each entry's plane as `slab / w` blocks
-                        // of `[1, w]`, a stick-major one-row block being that row's own bytes —
-                        // so the whole landing is row-major `[T, w]` in a minted scratch. The
-                        // frame: one stick column over all `T` rows, the same buffer every
-                        // rank-2 `[T, w]` value holds, one whole permute away.
-                        let bpe = u32_of(slab / w, "blocks an entry")?;
-                        let w32 = u32_of(w, "block width")?;
-                        let t_rows = u32_of(total / w, "landing rows")?;
-                        let sticks = u32_of(w / stick as u64, "landing sticks")?;
-                        let land_tid =
-                            mint_scratch(k, layout, floor, res, Scratch::GatherLanding);
-                        layout.synth(crate::place::PlaceId::Act(land_tid), &[t_rows, w32]);
-                        let land = Region {
-                            tid: land_tid,
-                            v_rows: t_rows,
-                            v_cols: w32,
-                            r_start: 0,
-                            c_start: 0,
-                            r_len: t_rows,
-                            c_len: w32,
-                            r_cover: (0, t_rows),
-                            c_cover: (0, w32),
-                            is_out: true,
-                            is_fp8: false,
-                            band: None,
-                        };
-                        let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+                    // ⭐ THE GATHER'S OWN TYPED VIEW, MINTED ONCE HERE — where the program's
+                    // view is read. The plane off the tile, the landing frame off the reshape's
+                    // `to` against it: every extent the op takes is a TYPE from here down
+                    // (GatherEntries, NonZeroU32, StickExtent, LandingOffset), and the two ways
+                    // a frame is outside this gather's domain refuse HERE, by name, and nothing
+                    // downstream re-checks them. Entries past one op's index stick
+                    // (`CopyDims::ENTRIES_PER_OP`, 32 — the op's own domain, not a device
+                    // refusal) are chunked one op a run by the type's own iterator, each at its
+                    // own entry base and landing offset: no entry count or size is refused.
+                    let entries = std::num::NonZeroU32::new(g.entries).ok_or_else(|| Error {
+                        message: format!(
+                            "{}: `{:?}` re-frames a gather of 0 entries — no plane to re-frame",
+                            f.name, op.op_type
+                        ),
+                    })?;
+                    let plane = crate::superdsc_opspec::PagePlane::of_sticks(page_sticks).ok_or_else(|| Error {
+                        message: format!(
+                            "{}: `{:?}` re-frames a gather whose plane is 0 sticks — no plane to                              re-frame",
+                            f.name, op.op_type
+                        ),
+                    })?;
+                    let frame =
+                        crate::superdsc_opspec::LandingFrame::of(&to, plane, entries).map_err(
+                            |e| Error {
+                                message: format!(
+                                    "{}: `{:?}` {}",
+                                    f.name, op.op_type, e
+                                ),
+                            },
+                        )?;
+                    // ⭐ THE CHUNK LEGS EVERY FRAME SHARES — one op a run of one index stick,
+                    // each at its own entry base (the gather's own first entry plus the run's
+                    // start, both whole sticks) and its own landing offset (whole blocks in).
+                    let mut chunk_legs = |frame: crate::superdsc_opspec::LandingFrame,
+                                      land_tid: u32,
+                                      land_name: &str,
+                                      page_of: &dyn Fn(
+                        crate::superdsc_opspec::GatherEntries,
+                        crate::superdsc_opspec::LandingOffset,
+                    )
+                        -> Result<
+                        crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage,
+                        String,
+                    >|
+                     -> Result<(), Error> {
+                        let block_elems = frame.elems_per_entry(entries);
                         let mut emitted = 0u32;
-                        while emitted < g.entries {
-                            let n = cap.min(g.entries - emitted);
-                            let base = crate::superdsc_opspec::EntryBase::of_entries(
-                                g.first_entry.entries() + emitted,
-                            )
-                            .map_err(|message| Error {
-                                message: format!("{}: {message}", f.name),
-                            })?;
+                        for (run_start, run) in crate::superdsc_opspec::GatherEntries::chunks(entries) {
+                            let base = g.first_entry.plus_entries(run_start.entries()).map_err(
+                                |message| Error {
+                                    message: format!("{}: {message}", f.name),
+                                },
+                            )?;
                             out.push(
                                 crate::ir::bridge::tiled_op_sdsc_op::assemble_index_select(
                                     &format!(
@@ -5114,22 +5073,18 @@ fn lower_function_folded(
                                         }
                                     ),
                                     &crate::place::act_name(g.value_tid),
-                                    &land.name(),
-                                    crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                                    land_name,
+                                    crate::superdsc_opspec::OnePositionIndex::of_scratch_rows(
                                         crate::place::act_name(g.index_tid),
-                                        crate::superdsc_opspec::PageExtent::of_positions(1),
                                         base,
                                     ),
-                                    crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage {
-                                        entries: n,
-                                        blocks: bpe,
-                                        rows: 1,
-                                        cols: w32,
-                                        dst_elems: u32_of(
-                                            u64::from(emitted) * u64::from(bpe) * w,
-                                            "landing offset",
-                                        )?,
-                                    },
+                                    page_of(run, crate::superdsc_opspec::LandingOffset::after(
+                                        emitted,
+                                        block_elems,
+                                    ))
+                                    .map_err(|message| Error {
+                                        message: format!("{}: {message}", f.name),
+                                    })?,
                                     sym_id_base,
                                     Some(layout),
                                 )
@@ -5137,102 +5092,110 @@ fn lower_function_folded(
                                     message: format!("{}: {message}", f.name),
                                 })?,
                             );
-                            emitted += n;
+                            emitted += run.get();
                         }
-                        let tid = mint_inter(k, layout, floor, res);
-                        let dst = stick_major_region(tid, t_rows, sticks, layout);
-                        out.push(permute(
-                            f.name,
-                            &Region {
-                                is_out: false,
-                                ..land
-                            },
-                            &dst,
-                            Permuted::whole((t_rows, sticks)),
-                            crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
-                            sym_id_base,
-                            Some(layout),
-                        )?);
-                        gather_carried[gi] = true;
-                        inter.insert(
-                            res,
-                            Region {
-                                is_out: false,
-                                ..dst
-                            },
-                        );
-                        continue;
-                    }
-                    let bpe = u32_of(slab / (r * w), "blocks an entry")?;
-                    let r = u32_of(r, "block rows")?;
-                    let w32 = u32_of(w, "block width")?;
-                    let tid = mint_inter(k, layout, floor, res);
-                    let dst = stick_major_region(
-                        tid,
-                        u32_of(blocks * u64::from(r), "landing rows")?,
-                        u32_of(w / stick as u64, "landing sticks")?,
-                        layout,
-                    );
-                    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-                    let mut emitted = 0u32;
-                    while emitted < g.entries {
-                        let n = cap.min(g.entries - emitted);
-                        let base = crate::superdsc_opspec::EntryBase::of_entries(
-                            g.first_entry.entries() + emitted,
-                        )
-                        .map_err(|message| Error {
-                            message: format!("{}: {message}", f.name),
-                        })?;
-                        out.push(
-                            crate::ir::bridge::tiled_op_sdsc_op::assemble_index_select(
-                                &format!(
-                                    "gather{}_o{tid}",
-                                    if emitted == 0 {
-                                        String::new()
-                                    } else {
-                                        emitted.to_string()
-                                    }
-                                ),
-                                &crate::place::act_name(g.value_tid),
-                                &dst.name(),
-                                crate::superdsc_opspec::GatherIndex::of_scratch_rows(
-                                    crate::place::act_name(g.index_tid),
-                                    crate::superdsc_opspec::PageExtent::of_positions(1),
-                                    base,
-                                ),
-                                crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage {
-                                    entries: n,
-                                    blocks: bpe,
-                                    rows: r,
-                                    cols: w32,
-                                    dst_elems: u32_of(
-                                        u64::from(emitted) * u64::from(bpe) * u64::from(r) * w,
-                                        "landing offset",
-                                    )?,
+                        Ok(())
+                    };
+                    match frame {
+                        // ⭐ THE RANK-2 FRAME, RESTICKIFIED — a `[T, w]` read of several gathered
+                        // planes wider than one stick. The card frame of a `[T, w]` tensor is ONE
+                        // stick column over all `T` rows, while the gather lands each entry's
+                        // blocks stick-major one after another — the same bytes exactly when there
+                        // is one block or one stick (a single entry, or `w` one stick wide, where
+                        // the landing IS the frame and nothing follows). Otherwise the entries
+                        // land as ONE-ROW blocks — row-major `[T, w]`, the same bytes the op
+                        // reads — and one whole stick permute restickifies them into the frame's
+                        // own column: the restickify the consumer's reshape used to perform (the
+                        // deleted `page_to_sticks` arm), stated here at the landing that needs it.
+                        crate::superdsc_opspec::LandingFrame::Restickify { t_rows, w } => {
+                            // The landing: one-row blocks — each entry's plane as `t_rows /
+                            // entries` blocks of `[1, w]`, a stick-major one-row block being that
+                            // row's own bytes — so the whole landing is row-major `[T, w]` in a
+                            // minted scratch. The frame: one stick column over all `T` rows, the
+                            // same buffer every rank-2 `[T, w]` value holds, one whole permute
+                            // away.
+                            let land_tid =
+                                mint_scratch(k, layout, floor, res, Scratch::GatherLanding);
+                            layout.synth(crate::place::PlaceId::Act(land_tid), &[t_rows.get(), w.elems()]);
+                            let land = Region {
+                                tid: land_tid,
+                                v_rows: t_rows.get(),
+                                v_cols: w.elems(),
+                                r_start: 0,
+                                c_start: 0,
+                                r_len: t_rows.get(),
+                                c_len: w.elems(),
+                                r_cover: (0, t_rows.get()),
+                                c_cover: (0, w.elems()),
+                                is_out: true,
+                                is_fp8: false,
+                                band: None,
+                            };
+                            let land_name = land.name();
+                            chunk_legs(frame, land_tid, &land_name, &|run, offset| {
+                                crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage::of_run(
+                                    frame, entries, run, offset,
+                                )
+                            })?;
+                            let tid = mint_inter(k, layout, floor, res);
+                            let dst = stick_major_region(tid, t_rows.get(), w.stick_count(), layout);
+                            out.push(permute(
+                                f.name,
+                                &Region {
+                                    is_out: false,
+                                    ..land
                                 },
+                                &dst,
+                                Permuted::whole((t_rows.get(), w.stick_count())),
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
                                 sym_id_base,
                                 Some(layout),
-                            )
-                            .map_err(|message| Error {
-                                message: format!("{}: {message}", f.name),
-                            })?,
-                        );
-                        emitted += n;
+                            )?);
+                            inter.insert(
+                                res,
+                                Region {
+                                    is_out: false,
+                                    ..dst
+                                },
+                            );
+                        }
+                        // ⭐ THE DIRECT LANDING — rank ≥ 3 `[..., blocks, rows, w]` (each entry
+                        // `blocks` stick-major `[rows, w]` blocks, one after another — the frame
+                        // the trip's batched restickify and contractions read a block of at its
+                        // base) or a rank-2 `[T, w]` whose landing IS the frame's own bytes (one
+                        // stick column, per-entry one-stick blocks).
+                        frame => {
+                            let w = frame.width();
+                            let landing_rows = frame.landing_rows(entries);
+                            let tid = mint_inter(k, layout, floor, res);
+                            let dst = stick_major_region(tid, landing_rows, w.stick_count(), layout);
+                            let land_name = dst.name();
+                            chunk_legs(frame, tid, &land_name, &|run, offset| {
+                                crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage::of_run(
+                                    frame, entries, run, offset,
+                                )
+                            })?;
+                            // A rank ≥ 3 frame stated its blocks, so the landing registers them;
+                            // a rank-2 frame stated none, and its landing — one stick column,
+                            // per-entry one-stick blocks, or the restickified column above — is
+                            // the flat frame's own bytes.
+                            if matches!(
+                                frame,
+                                crate::superdsc_opspec::LandingFrame::Blocks { .. }
+                            ) && let Some(c) = block_landing_cols(w.elems(), stick)
+                            {
+                                batch_blocks.insert(tid, c);
+                            }
+                            inter.insert(
+                                res,
+                                Region {
+                                    is_out: false,
+                                    ..dst
+                                },
+                            );
+                        }
                     }
                     gather_carried[gi] = true;
-                    // A rank ≥ 3 frame stated its blocks, so the landing registers them; a rank-2
-                    // frame stated none, and its landing — one stick column, per-entry one-stick
-                    // blocks, or the restickified column above — is the flat frame's own bytes.
-                    if to.len() >= 3 && let Some(c) = block_landing_cols(w32, stick) {
-                        batch_blocks.insert(tid, c);
-                    }
-                    inter.insert(
-                        res,
-                        Region {
-                            is_out: false,
-                            ..dst
-                        },
-                    );
                     continue;
                 }
                 None => match region_for_operand(k, src)?.or_else(|| inter.get(&src).copied()) {

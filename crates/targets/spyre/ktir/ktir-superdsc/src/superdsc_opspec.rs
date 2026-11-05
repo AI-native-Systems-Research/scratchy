@@ -2889,7 +2889,290 @@ impl EntryBase {
     }
 }
 
-/// ⭐⭐⭐⭐⭐ A GATHER'S INDEX RUN — a stick-aligned START plus a COUNT OF WHOLE `SenUint32` STICKS.
+/// ⭐ THE ENTRIES ONE `index_select` OP GATHERS — minted ONLY by chunking a run at
+/// [`Self::chunks`], one `SenUint32` stick of entries at a time, so `entries == 0` and
+/// `entries > ENTRIES_PER_OP` are UNWRITABLE: every `GatherEntries` is 1..=32 by construction
+/// (the vendor's ceiling on one gather op's index — one 128-B stick of entries,
+/// `CopyDims::ENTRIES_PER_OP`, which a const assert in `sdsc_abstract` ties to this same
+/// stick). The walk composes past the ceiling by chunking, never by refusing an entry count.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GatherEntries(NonZeroU32);
+
+impl GatherEntries {
+    /// THE ONLY CONSTRUCTOR — the runs a total entry count chunks into at one index stick a run.
+    /// Each run carries its own [`EntryBase`] (whole sticks by construction: every run starts a
+    /// multiple of the stick in), so the chunk leg's base and its length are stated together and
+    /// a partial or over-long run has no spelling.
+    pub fn chunks(total: NonZeroU32) -> impl Iterator<Item = (EntryBase, GatherEntries)> {
+        let cap = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
+        (0..total.get().div_ceil(cap)).map(move |i| {
+            let start = i * cap;
+            let n = (total.get() - start).min(cap);
+            // SAFETY-of-law, not of-memory: `n` is `min(remaining, cap)` with `remaining >= 1`,
+            // and `cap >= 1`, so `n >= 1` — a zero run cannot be minted.
+            (
+                EntryBase(start),
+                GatherEntries(NonZeroU32::new(n).expect("a chunk is never empty")),
+            )
+        })
+    }
+
+    /// The run's entry count — the ONE site the u32 reaches a device descriptor
+    /// (`dim("mb", ..)`), nowhere else.
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// ⭐ ONE GATHERED ENTRY'S PLANE, in whole fp16 sticks — `sticks · 64` elements by construction,
+/// so a sub-stick or zero plane has no spelling. What `page_gather_of` reads off the tile
+/// (`slab / stick`), typed at the one place the program's view is minted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PagePlane {
+    sticks: NonZeroU32,
+}
+
+impl PagePlane {
+    /// The plane's stick count, straight off the tile's own slab law (a whole number of sticks
+    /// or the tile was already refused, by name, at `page_gather_of`).
+    pub fn of_sticks(sticks: u32) -> Option<Self> {
+        NonZeroU32::new(sticks).map(|sticks| PagePlane { sticks })
+    }
+
+    /// The plane's element count — `sticks · <Fp16 as DataFormat>::ELEMS_PER_STICK`.
+    pub const fn elems(self) -> u64 {
+        self.sticks.get() as u64 * <Fp16 as DataFormat>::ELEMS_PER_STICK as u64
+    }
+}
+
+/// ⭐ THE CONSUMER'S LANDING FRAME — the reshape's `to`, typed ONCE against the plane it
+/// re-frames. `index_select` keeps the entry axis whole (the reference reshapes the gathered
+/// `[entries, slab]` keeping dim 0), so the frame must tile each entry's plane into whole
+/// blocks; the two ways it can not are the type's own two errors, and NOTHING downstream
+/// re-checks them — the variants make the refused shapes unrepresentable.
+#[derive(Clone, Copy, Debug)]
+pub enum LandingFrame {
+    /// Rank ≥ 3 `[..., blocks, rows, w]` — each entry is `blocks` stick-major `[rows, w]`
+    /// blocks, landed one after another (`batch_blocks`: the only frame that registers them).
+    Blocks {
+        /// Blocks ONE ENTRY lands.
+        blocks: NonZeroU32,
+        rows: NonZeroU32,
+        w: StickExtent<Fp16>,
+    },
+    /// Rank-2 `[T, w]` with one entry or a one-stick width — the landing IS the frame's own
+    /// bytes (a single stick column), no permute follows.
+    Flat { rows: NonZeroU32, w: StickExtent<Fp16> },
+    /// Rank-2 `[T, w]`, several entries, `w` wider than one stick — each entry lands as
+    /// one-row blocks (row-major `[T, w]`) and ONE whole-stick `RowToStick` permute
+    /// restickifies the landing into the frame's own column.
+    Restickify { t_rows: NonZeroU32, w: StickExtent<Fp16> },
+}
+
+impl LandingFrame {
+    /// ⭐ THE ONE PLACE THE PROGRAM'S VIEW IS READ — the reshape's `to` dims against the
+    /// gather's own plane and entry count. The two remaining refusals of the gather live HERE
+    /// and nowhere else:
+    /// * [`FrameError::NotWholeSticks`] — the frame's last dim is not a whole number of
+    ///   fp16 sticks (a plane of the folded cache is whole sticks, stick dim last);
+    /// * [`FrameError::CrossesEntry`] — the frame does not tile each entry's plane into
+    ///   whole `[rows, w]` blocks (a zero row count, a plane not divisible by the block, or
+    ///   a stated block count that disagrees with `entries · plane / block`).
+    pub fn of(to: &[i64], plane: PagePlane, entries: NonZeroU32) -> Result<Self, FrameError> {
+        let stick = <Fp16 as DataFormat>::ELEMS_PER_STICK as u64;
+        let slab = plane.elems();
+        let total: u64 = to.iter().map(|&d| u64::try_from(d).unwrap_or(0)).product();
+        let width = to.last().copied().unwrap_or(0);
+        let width = u64::try_from(width).unwrap_or(0);
+        if width == 0 || !width.is_multiple_of(stick) || width > u32::MAX as u64 {
+            return Err(FrameError::NotWholeSticks {
+                width,
+                stick: stick as u32,
+            });
+        }
+        let w = StickExtent::<Fp16>::new(width as u32).map_err(|_| FrameError::NotWholeSticks {
+            width,
+            stick: stick as u32,
+        })?;
+        let nz = |x: u64| NonZeroU32::new(u32::try_from(x).unwrap_or(0));
+        if to.len() < 3 {
+            // Rank-2 `[T, w]`: each entry's plane is `slab / w` one-row blocks — `r` rows a
+            // block never enters; the block is the row.
+            if !slab.is_multiple_of(width) {
+                return Err(FrameError::CrossesEntry {
+                    entries: entries.get(),
+                    slab,
+                    frame: to.to_vec(),
+                });
+            }
+            let t_rows = nz(total / width)
+                .ok_or_else(|| FrameError::CrossesEntry {
+                    entries: entries.get(),
+                    slab,
+                    frame: to.to_vec(),
+                })?;
+            if entries.get() == 1 || width == stick {
+                let rows = nz(slab / width).ok_or_else(|| FrameError::CrossesEntry {
+                    entries: entries.get(),
+                    slab,
+                    frame: to.to_vec(),
+                })?;
+                Ok(LandingFrame::Flat { rows, w })
+            } else {
+                Ok(LandingFrame::Restickify { t_rows, w })
+            }
+        } else {
+            // Rank ≥ 3: the frame's own `[..., blocks, rows, w]`, each entry `slab / (rows·w)`
+            // blocks — the stated blocks must agree with the entries it re-frames.
+            let rows = to[to.len() - 2];
+            let rows = u64::try_from(rows).unwrap_or(0);
+            let block = rows.checked_mul(width).filter(|b| *b > 0);
+            let Some(block) = block else {
+                return Err(FrameError::CrossesEntry {
+                    entries: entries.get(),
+                    slab,
+                    frame: to.to_vec(),
+                });
+            };
+            let blocks_per_entry = slab
+                .checked_div(block)
+                .filter(|_| slab.is_multiple_of(block));
+            let Some(blocks_per_entry) = blocks_per_entry else {
+                return Err(FrameError::CrossesEntry {
+                    entries: entries.get(),
+                    slab,
+                    frame: to.to_vec(),
+                });
+            };
+            if total != blocks_per_entry * entries.get() as u64 * block {
+                return Err(FrameError::CrossesEntry {
+                    entries: entries.get(),
+                    slab,
+                    frame: to.to_vec(),
+                });
+            }
+            let blocks = nz(blocks_per_entry).ok_or_else(|| FrameError::CrossesEntry {
+                entries: entries.get(),
+                slab,
+                frame: to.to_vec(),
+            })?;
+            let rows = nz(rows).ok_or_else(|| FrameError::CrossesEntry {
+                entries: entries.get(),
+                slab,
+                frame: to.to_vec(),
+            })?;
+            Ok(LandingFrame::Blocks { blocks, rows, w })
+        }
+    }
+
+    /// The elements ONE entry lands — `blocks · rows · w` (the restickify's one-row blocks are
+    /// `t_rows / entries` of them, one entry's share of the row-major landing) — the unit the
+    /// chunk legs step the landing offset by.
+    pub fn elems_per_entry(self, entries: NonZeroU32) -> u32 {
+        match self {
+            LandingFrame::Blocks { blocks, rows, w } => blocks.get() * rows.get() * w.elems(),
+            LandingFrame::Flat { rows, w } => rows.get() * w.elems(),
+            LandingFrame::Restickify { t_rows, w } => (t_rows.get() / entries.get()) * w.elems(),
+        }
+    }
+
+    /// The landing's ROW count — `blocks · rows` over every entry (the restickify's row-major
+    /// `[T, w]` rows; the flat's one stick column over all `T`).
+    pub fn landing_rows(self, entries: NonZeroU32) -> u32 {
+        match self {
+            LandingFrame::Blocks { blocks, rows, .. } => blocks.get() * rows.get() * entries.get(),
+            LandingFrame::Flat { rows, .. } => rows.get() * entries.get(),
+            LandingFrame::Restickify { t_rows, .. } => t_rows.get(),
+        }
+    }
+
+    /// The frame's width — the landing's column extent in elements.
+    pub fn width(self) -> StickExtent<Fp16> {
+        match self {
+            LandingFrame::Blocks { w, .. } | LandingFrame::Flat { w, .. } | LandingFrame::Restickify { w, .. } => w,
+        }
+    }
+}
+
+/// ⭐ THE LANDING OFFSET — whole landed blocks into the destination, minted ONLY as
+/// [`Self::after`] by the chunk leg (`prior` entries already landed, each `block_elems`), so a
+/// raw `dst_elems` — or a mid-block offset — is unwritable. `after(0, _)` is the first leg's
+/// `ZERO`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LandingOffset(u32);
+
+impl LandingOffset {
+    /// `prior` entries already landed, each landing `block_elems` elements.
+    pub fn after(prior: u32, block_elems: u32) -> Self {
+        LandingOffset(prior * block_elems)
+    }
+
+    /// The offset in elements — the device descriptor's `offset_elems`.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// ⭐ THE PAGE AN `index_select` TAKES — ONE POSITION along the folded axis (the reference's
+/// own `kv.index_select(0, page_ids)`: an entry is one page). The only constructor mints the
+/// one-position page itself, so the opspec's old `gather.page.get() != 1` refusal is a type:
+/// a multi-position page cannot be handed to this op.
+#[derive(Clone, Debug)]
+pub struct OnePositionIndex {
+    name: String,
+    base: EntryBase,
+}
+
+impl OnePositionIndex {
+    /// The gather index one `index_select` states — one position a page, `base` entries into
+    /// the index buffer (the chunk leg's own base).
+    pub fn of_scratch_rows(name: String, base: EntryBase) -> Self {
+        OnePositionIndex { name, base }
+    }
+
+    /// The device-side [`GatherIndex`] this is.
+    pub fn gather_index(self) -> GatherIndex {
+        GatherIndex::of_scratch_rows(self.name, PageExtent::single_position(), self.base)
+    }
+}
+
+/// The two ways a program's landing frame can be outside the gather's domain — the ONE error
+/// of the program-view mint ([`LandingFrame::of`]), named, with nothing downstream re-checking
+/// either.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// The frame's last dim is not a whole number of fp16 sticks.
+    NotWholeSticks { width: u64, stick: u32 },
+    /// The frame does not tile each gathered entry's plane into whole `[rows, w]` blocks —
+    /// `index_select` keeps the entry axis whole, so each entry's plane must be a whole
+    /// number of the frame's blocks.
+    CrossesEntry { entries: u32, slab: u64, frame: Vec<i64> },
+}
+
+impl core::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FrameError::NotWholeSticks { width, stick } => write!(
+                f,
+                "reads the gathered pages {width} wide — a plane of the folded cache is whole \
+                 sticks (its `[num_pages, block, sticks, eps]` layout, stick dim last), so a \
+                 frame not a whole number of {stick}-element sticks wide is outside this \
+                 gather's domain"
+            ),
+            FrameError::CrossesEntry { entries, slab, frame } => write!(
+                f,
+                "re-frames {entries} gathered planes of {slab} elements as {frame:?} — the \
+                 frame crosses a gathered entry: `index_select` keeps the entry axis whole \
+                 (the reference reshapes the gathered `[entries, slab]` keeping dim 0), so \
+                 each entry's plane must be a whole number of the frame's blocks"
+            ),
+        }
+    }
+}
+
+
+
+
 ///
 /// ⛔ THE RUN IS NAMED IN STICKS, AND THAT IS THE WHOLE TYPE. The index tensor reaches the L3LU IBR
 /// as ONE transfer "in the granularity of one stick" (`L3DlOpsScheduler::fillTransferMulticastInfo`),

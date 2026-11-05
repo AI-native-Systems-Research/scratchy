@@ -7851,6 +7851,15 @@ impl GatherScratch {
 /// own stick, and the `page` the op pins IS the `page` the index declares. The two refusals above
 /// become statements about a value that cannot be built wrongly rather than checks on three that can:
 /// `out == POOL_STICK` by construction and `page | mb` because `sub_rows == rows * entry_page`.
+// ⛔ TIED to the index's own stick, in BOTH directions: `CopyDims::ENTRIES_PER_OP` is spelled
+// as the `SenUint32` stick, and `GatherEntries`'s chunk iterator (superdsc_opspec) runs in that
+// same stick because it cannot see this module (layered above it), so the two must be the SAME
+// number. This assert is what keeps a future edit of either side from silently parting them.
+const _: () = assert!(
+    CopyDims::ENTRIES_PER_OP
+        == <crate::superdsc_opspec::SenUint32 as crate::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CopyDims {
     mb: u32,
@@ -7873,6 +7882,7 @@ impl CopyDims {
     /// index is one stick wide is the whole invariant.
     pub const ENTRIES_PER_OP: u32 =
         <crate::superdsc_opspec::SenUint32 as crate::superdsc_opspec::DataFormat>::ELEMS_PER_STICK;
+
 
     /// The copy's `mb` extent — one-stick sub-rows of THIS op's run of the pass.
     pub const fn mb(self) -> u32 {

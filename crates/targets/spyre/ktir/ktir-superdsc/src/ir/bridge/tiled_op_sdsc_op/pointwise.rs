@@ -748,15 +748,73 @@ pub fn assemble_page_gather_copy(
         .map_err(|e| format!("assemble_page_gather_copy {op_name}: {e}"))
 }
 
-/// What an [`index_select_opspec`] moves: `entries` index entries, each `blocks` row-major
-/// `[rows, cols]` blocks of the gathered value, landed `dst_elems` into the destination.
+/// What an [`index_select_opspec`] moves — EVERY extent a TYPE, built only from a
+/// [`LandingFrame`](crate::superdsc_opspec::LandingFrame) plus the chunk iterator, so no
+/// u32 field can be stated raw: `entries` is one run of the chunking
+/// ([`GatherEntries`](crate::superdsc_opspec::GatherEntries), 1..=one index stick by
+/// construction), `blocks`/`rows` are non-zero, `cols` is whole sticks
+/// ([`StickExtent<Fp16>`](crate::superdsc_opspec::StickExtent)), and `dst` is whole landed
+/// blocks ([`LandingOffset`](crate::superdsc_opspec::LandingOffset)). The zero/cap,
+/// zero-block/row and stick-multiple checks the opspec used to carry are UNWRITABLE now,
+/// not re-checked.
 #[derive(Clone, Copy, Debug)]
 pub struct IndexSelectPage {
-    pub entries: u32,
-    pub blocks: u32,
-    pub rows: u32,
-    pub cols: u32,
-    pub dst_elems: u32,
+    pub entries: crate::superdsc_opspec::GatherEntries,
+    pub blocks: std::num::NonZeroU32,
+    pub rows: std::num::NonZeroU32,
+    pub cols: crate::superdsc_opspec::StickExtent<crate::superdsc_opspec::Fp16>,
+    pub dst: crate::superdsc_opspec::LandingOffset,
+}
+
+impl IndexSelectPage {
+    /// ⭐ THE ONLY CONSTRUCTOR — one chunk leg's page: the frame's own extents
+    /// at the run the chunk iterator hands, `offset` whole blocks into the
+    /// landing. `entries` is the gather's TOTAL entry count (the fact the frame
+    /// was minted against); the run is the ≤-one-index-stick slice this op
+    /// gathers. The restickify's one-row blocks are the entry's own share of
+    /// the row-major landing (`t_rows / entries`), a division the frame law
+    /// guarantees exact.
+    pub fn of_run(
+        frame: crate::superdsc_opspec::LandingFrame,
+        entries: std::num::NonZeroU32,
+        run: crate::superdsc_opspec::GatherEntries,
+        offset: crate::superdsc_opspec::LandingOffset,
+    ) -> Result<Self, String> {
+        use crate::superdsc_opspec::LandingFrame;
+        use std::num::NonZeroU32;
+        let one = |x: u32, what: &str| -> Result<NonZeroU32, String> {
+            NonZeroU32::new(x).ok_or_else(|| {
+                format!("the gather's {what} is 0 — the landing frame's own law forbids it")
+            })
+        };
+        Ok(match frame {
+            LandingFrame::Blocks {
+                blocks,
+                rows,
+                w,
+            } => IndexSelectPage {
+                entries: run,
+                blocks,
+                rows,
+                cols: w,
+                dst: offset,
+            },
+            LandingFrame::Flat { rows, w } => IndexSelectPage {
+                entries: run,
+                blocks: NonZeroU32::MIN,
+                rows,
+                cols: w,
+                dst: offset,
+            },
+            LandingFrame::Restickify { t_rows, w } => IndexSelectPage {
+                entries: run,
+                blocks: one(t_rows.get() / entries.get(), "blocks an entry")?,
+                rows: NonZeroU32::MIN,
+                cols: w,
+                dst: offset,
+            },
+        })
+    }
 }
 
 /// ⭐ THE ONE GATHER — `index_select` over a paged cache's folded dim 0 (the reference's
@@ -783,32 +841,16 @@ pub struct IndexSelectPage {
 pub fn index_select_opspec(
     src: &str,
     dst: &str,
-    gather: crate::superdsc_opspec::GatherIndex,
+    gather: crate::superdsc_opspec::OnePositionIndex,
     IndexSelectPage {
         entries,
         blocks,
         rows,
         cols,
-        dst_elems,
+        dst: page_dst,
     }: IndexSelectPage,
 ) -> Result<OpSpec, String> {
     let df = Df::Fp16;
-    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
-    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-    if entries == 0 || entries > cap {
-        return Err(format!(
-            "index_select_opspec('{src}' -> '{dst}'): {entries} entries — one op gathers one to \
-             {cap} (its index is one stick); the walk chunks past it"
-        ));
-    }
-    if gather.page.get() != 1 || blocks == 0 || rows == 0 {
-        return Err(format!(
-            "index_select_opspec('{src}' -> '{dst}'): one entry is one page of {blocks} \
-             [{rows}, {cols}] blocks — one `mb` position — and the index states {} positions an \
-             entry",
-            gather.page.get()
-        ));
-    }
     let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
         name,
         size,
@@ -817,10 +859,10 @@ pub fn index_select_opspec(
         df,
     };
     let dims = [
-        dim("mb", entries, false),
-        dim("y", blocks, false),
-        dim("x", rows, false),
-        dim("out", cols, true),
+        dim("mb", entries.get(), false),
+        dim("y", blocks.get(), false),
+        dim("x", rows.get(), false),
+        dim("out", cols.elems(), true),
     ];
     let plan = crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |d, max| {
         gather_copy_cores(d, max, 1)
@@ -855,8 +897,10 @@ pub fn index_select_opspec(
     // — so it keeps [`ViewFrame::Own`]: stamping it `LandedBlocks` would declare the batched
     // transpose's read of it wrong, and the arrangement authority refuses the conflict. The
     // frame changes the DECLARATION only — the landing's per-core starts stay its blocks.
-    let landed = |cols: u32| -> crate::superdsc_opspec::ViewFrame {
-        if entries * blocks == 1 && cols > df.elems_per_stick() {
+    let landed = |cols: crate::superdsc_opspec::StickExtent<
+        crate::superdsc_opspec::Fp16,
+    >| -> crate::superdsc_opspec::ViewFrame {
+        if entries.get() * blocks.get() == 1 && cols.elems() > df.elems_per_stick() {
             crate::superdsc_opspec::ViewFrame::LandedBlocks
         } else {
             crate::superdsc_opspec::ViewFrame::Own
@@ -882,16 +926,16 @@ pub fn index_select_opspec(
         indirect: None,
         coordinate_mask: None,
     };
-    op.attach_gather_index(gather, 0).ok_or_else(|| {
+    op.attach_gather_index(gather.gather_index(), 0).ok_or_else(|| {
         format!(
             "index_select_opspec('{src}' -> '{dst}'): the index declaration does not fit this \
              op — its dims are [mb, y, x, out], so the paged axis must be `mb`"
         )
     })?;
-    if dst_elems > 0
+    if page_dst.get() > 0
         && let Some(o) = op.args.last_mut()
     {
-        o.set_offset_elems(dst_elems);
+        o.set_offset_elems(page_dst.get());
     }
     Ok(op)
 }
@@ -901,7 +945,7 @@ pub fn assemble_index_select(
     op_name: &str,
     src: &str,
     dst: &str,
-    gather: crate::superdsc_opspec::GatherIndex,
+    gather: crate::superdsc_opspec::OnePositionIndex,
     page: IndexSelectPage,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
@@ -2102,9 +2146,8 @@ mod index_select_tests {
     /// the reference reads it, landed one kv head's stick-major block after another.
     #[test]
     fn the_whole_page_is_gathered_in_one_op() {
-        let gather = GatherIndex::of_scratch_rows(
+        let gather = crate::superdsc_opspec::OnePositionIndex::of_scratch_rows(
             "Tensor9".into(),
-            PageExtent::of_positions(1),
             EntryBase::ZERO,
         );
         let op = index_select_opspec(
@@ -2112,11 +2155,11 @@ mod index_select_tests {
             "Tensor1",
             gather,
             IndexSelectPage {
-                entries: 1,
-                blocks: 8,
-                rows: 128,
-                cols: 128,
-                dst_elems: 0,
+                entries: run(1),
+                blocks: nz(8),
+                rows: nz(128),
+                cols: stick(128),
+                dst: crate::superdsc_opspec::LandingOffset::after(0, 0),
             },
         )
         .expect("the page gather builds");
@@ -2160,17 +2203,16 @@ mod index_select_tests {
         index_select_opspec(
             "Tensor0",
             "Tensor1",
-            GatherIndex::of_scratch_rows(
+            crate::superdsc_opspec::OnePositionIndex::of_scratch_rows(
                 "Tensor9".into(),
-                PageExtent::of_positions(1),
                 EntryBase::ZERO,
             ),
             IndexSelectPage {
-                entries,
-                blocks: 8,
-                rows: 128,
-                cols: 64,
-                dst_elems: 0,
+                entries: run(entries),
+                blocks: nz(8),
+                rows: nz(128),
+                cols: stick(64),
+                dst: crate::superdsc_opspec::LandingOffset::after(0, 0),
             },
         )
     }
@@ -2195,14 +2237,14 @@ mod index_select_tests {
         );
     }
 
-    /// One op's index is one 32-word stick: a chunk of 32 pages gathers in one op, and 33 is refused
-    /// by name — the walk's chunking composes around the cap, so nothing past it reaches a form the
-    /// card has not run.
+    /// One op's index is one 32-word stick — the cap the old `entries > 32` refusal checked is
+    /// now [`GatherEntries`](crate::superdsc_opspec::GatherEntries)'s own construction law: a run
+    /// past one stick is unwritable, and the walk's chunking composes around it (the
+    /// `GatherEntries::chunks` law test, n = 1..=200). Nothing is refused here because nothing
+    /// out of domain can be BUILT.
     #[test]
-    fn more_entries_than_one_index_stick_are_refused() {
+    fn thirty_two_pages_gather_in_one_op() {
         assert!(pages(32).is_ok(), "32 pages, one index stick");
-        let e = pages(33).expect_err("33 pages");
-        assert!(e.contains("33 entries"), "{e}");
     }
 
     /// ⭐ THE REFERENCE's K PAGE GATHER (granite-3.1-8b's decode trip, `sdsc_6`): eight kv heads'
@@ -2210,9 +2252,8 @@ mod index_select_tests {
     /// one-block-an-entry frame, the `blocks == 1` case of the one op.
     #[test]
     fn the_gather_lands_each_entrys_block_stick_major() {
-        let gather = GatherIndex::of_scratch_rows(
+        let gather = crate::superdsc_opspec::OnePositionIndex::of_scratch_rows(
             "Tensor9".into(),
-            PageExtent::of_positions(1),
             EntryBase::ZERO,
         );
         let op = index_select_opspec(
@@ -2220,11 +2261,11 @@ mod index_select_tests {
             "Tensor1",
             gather,
             IndexSelectPage {
-                entries: 8,
-                blocks: 1,
-                rows: 128,
-                cols: 128,
-                dst_elems: 0,
+                entries: run(8),
+                blocks: nz(1),
+                rows: nz(128),
+                cols: stick(128),
+                dst: crate::superdsc_opspec::LandingOffset::after(0, 0),
             },
         )
         .expect("the block gather builds");
@@ -2292,25 +2333,18 @@ mod index_select_tests {
         }
     }
 
-    /// An entry is one `mb` position, so an index stating several positions an entry is refused.
+    /// An entry is one `mb` position — the law the old `gather.page != 1` refusal checked is now
+    /// [`OnePositionIndex`](crate::superdsc_opspec::OnePositionIndex)'s own construction: the
+    /// type has no multi-position spelling, so an index stating several positions an entry
+    /// cannot be handed to this op. Nothing is refused here because nothing out of domain can
+    /// be BUILT.
     #[test]
-    fn an_entry_of_several_positions_is_refused() {
-        let gather = GatherIndex::of_scratch_rows(
+    fn the_index_is_one_position_by_type() {
+        let g = crate::superdsc_opspec::OnePositionIndex::of_scratch_rows(
             "Tensor9".into(),
-            PageExtent::of_positions(2),
             EntryBase::ZERO,
         );
-        let blocks = IndexSelectPage {
-            entries: 8,
-            blocks: 1,
-            rows: 128,
-            cols: 128,
-            dst_elems: 0,
-        };
-        let Err(m) = index_select_opspec("Tensor0", "Tensor1", gather, blocks) else {
-            panic!("an entry of two positions is two blocks' worth of one");
-        };
-        assert!(m.contains("one `mb` position"), "{m}");
+        assert_eq!(g.gather_index().page.get(), 1);
     }
 
     /// ⭐ A CHUNK LANDS AT ITS OFFSET — the walk chunks entries past one index stick, and each
@@ -2320,7 +2354,9 @@ mod index_select_tests {
     #[test]
     fn a_chunk_lands_at_its_dst_elems_offset() {
         let l = gathered(8, 128, 128);
-        let dst_offset = |entries: u32, dst_elems: u32| -> u32 {
+        // The offset is whole landed blocks by type: the last chunk of an 8-entry gather is
+        // `LandingOffset::after(7, ...)` — seven entries already landed, each one block.
+        let dst_offset = |entries: u32, dst: crate::superdsc_opspec::LandingOffset| -> u32 {
             let mut sym = 0i64;
             let op = assemble_index_select(
                 "gather_o1",
@@ -2328,11 +2364,11 @@ mod index_select_tests {
                 &act_name(2),
                 index(),
                 IndexSelectPage {
-                    entries,
-                    blocks: 1,
-                    rows: 128,
-                    cols: 128,
-                    dst_elems,
+                    entries: run(entries),
+                    blocks: nz(1),
+                    rows: nz(128),
+                    cols: stick(128),
+                    dst,
                 },
                 &mut sym,
                 Some(&l),
@@ -2343,9 +2379,13 @@ mod index_select_tests {
                 .expect("a destination binding")
                 .offset_elems
         };
-        assert_eq!(dst_offset(8, 0), 0, "the first chunk lands at the base");
         assert_eq!(
-            dst_offset(1, 7 * 128 * 128),
+            dst_offset(8, crate::superdsc_opspec::LandingOffset::after(0, 128 * 128)),
+            0,
+            "the first chunk lands at the base"
+        );
+        assert_eq!(
+            dst_offset(1, crate::superdsc_opspec::LandingOffset::after(7, 128 * 128)),
             7 * 128 * 128,
             "the last chunk lands seven blocks of entries in, inside the same landing"
         );
@@ -2362,8 +2402,24 @@ mod index_select_tests {
         l
     }
 
-    fn index() -> GatherIndex {
-        GatherIndex::of_scratch_rows(act_name(9), PageExtent::of_positions(1), EntryBase::ZERO)
+    fn index() -> crate::superdsc_opspec::OnePositionIndex {
+        crate::superdsc_opspec::OnePositionIndex::of_scratch_rows(act_name(9), EntryBase::ZERO)
+    }
+
+    /// One run of the chunk iterator — the only spelling a test (or the walk) holds entries in.
+    fn run(n: u32) -> crate::superdsc_opspec::GatherEntries {
+        crate::superdsc_opspec::GatherEntries::chunks(std::num::NonZeroU32::new(n).unwrap())
+            .next()
+            .unwrap()
+            .1
+    }
+
+    fn nz(n: u32) -> std::num::NonZeroU32 {
+        std::num::NonZeroU32::new(n).unwrap()
+    }
+
+    fn stick(c: u32) -> crate::superdsc_opspec::StickExtent<crate::superdsc_opspec::Fp16> {
+        crate::superdsc_opspec::StickExtent::new(c).unwrap()
     }
 
     /// ⭐ THE LANDING'S OWN FRAME — the measured law, both halves. A wide landing of ONE block is
@@ -2386,11 +2442,11 @@ mod index_select_tests {
             &act_name(2),
             index(),
             IndexSelectPage {
-                entries: 1,
-                blocks: 1,
-                rows: 128,
-                cols: 128,
-                dst_elems: 0,
+                entries: run(1),
+                blocks: nz(1),
+                rows: nz(128),
+                cols: stick(128),
+                dst: crate::superdsc_opspec::LandingOffset::after(0, 0),
             },
             &mut sym,
             Some(&l),
@@ -2416,11 +2472,11 @@ mod index_select_tests {
             &act_name(2),
             index(),
             IndexSelectPage {
-                entries: 8,
-                blocks: 1,
-                rows: 128,
-                cols: 128,
-                dst_elems: 0,
+                entries: run(8),
+                blocks: nz(1),
+                rows: nz(128),
+                cols: stick(128),
+                dst: crate::superdsc_opspec::LandingOffset::after(0, 0),
             },
             &mut sym,
             Some(&l),
@@ -2451,11 +2507,11 @@ mod index_select_tests {
             &act_name(2),
             index(),
             IndexSelectPage {
-                entries: 1,
-                blocks: 1,
-                rows: 128,
-                cols: 128,
-                dst_elems: 0,
+                entries: run(1),
+                blocks: nz(1),
+                rows: nz(128),
+                cols: stick(128),
+                dst: crate::superdsc_opspec::LandingOffset::after(0, 0),
             },
             &mut sym,
             Some(&l),
@@ -2484,11 +2540,11 @@ mod index_select_tests {
             &act_name(2),
             index(),
             IndexSelectPage {
-                entries: 1,
-                blocks: 1,
-                rows: 128,
-                cols: 128,
-                dst_elems: 0,
+                entries: run(1),
+                blocks: nz(1),
+                rows: nz(128),
+                cols: stick(128),
+                dst: crate::superdsc_opspec::LandingOffset::after(0, 0),
             },
             &mut sym,
             Some(&l),
@@ -2508,11 +2564,11 @@ mod index_select_tests {
             &act_name(2),
             index(),
             IndexSelectPage {
-                entries: 1,
-                blocks: 8,
-                rows: 128,
-                cols: 128,
-                dst_elems: 0,
+                entries: run(1),
+                blocks: nz(8),
+                rows: nz(128),
+                cols: stick(128),
+                dst: crate::superdsc_opspec::LandingOffset::after(0, 0),
             },
             &mut sym,
             Some(&l),
@@ -2543,11 +2599,11 @@ mod index_select_tests {
             &act_name(2),
             index(),
             IndexSelectPage {
-                entries: 8,
-                blocks: 1,
-                rows: 128,
-                cols: 64,
-                dst_elems: 0,
+                entries: run(8),
+                blocks: nz(1),
+                rows: nz(128),
+                cols: stick(64),
+                dst: crate::superdsc_opspec::LandingOffset::after(0, 0),
             },
             &mut sym,
             Some(&l),
