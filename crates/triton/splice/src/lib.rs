@@ -1502,12 +1502,13 @@ impl BatchChunking {
     /// ⛔ `seqs` AND `nkvh` ARE COUNTS, ONE OR MORE. Both divide here, so a zero is a panic at BAKE
     /// and not a wrong answer — `seqs` has divided since this function existed (`CORES / seqs`) and
     /// `nkvh` since the fold was added (`GATHER_FLOOR.div_ceil(seqs · rows_per_page)`). Every
-    /// producer already has them non-zero (`ModelAttnGeometry::mint` refuses a zero kv-head count,
-    /// a bundle's rows are its baked width), so the clamps below are not a tolerance for zero: they
-    /// keep this `const fn` TOTAL, so a malformed step is a wrong chunking a test can catch rather
-    /// than a build that dies inside a `const` evaluation. The honest end state is a `NonZeroU32`
-    /// pair in the signature; that waits on `PagedStep`'s fields, which the bake's codegen quotes
-    /// as `u32`.
+    /// producer already has them non-zero (`nkvh` is the attention facts' class head count, minted
+    /// at the bridge off `ModelFacts` — a non-zero `kv_heads` is a law of the facts' own mint —
+    /// and a bundle's rows are its baked width), so the clamps below are not a tolerance for zero:
+    /// they keep this `const fn` TOTAL, so a malformed step is a wrong chunking a test can catch
+    /// rather than a build that dies inside a `const` evaluation. The honest end state is a
+    /// `NonZeroU32` pair in the signature; that waits on `PagedStep`'s fields, which the bake's
+    /// codegen quotes as `u32`.
     pub const fn of(seqs: u32, blocks: u32, nkvh: u32) -> BatchChunking {
         let seqs = if seqs < 1 { 1 } else { seqs };
         let theirs = {
@@ -1995,7 +1996,13 @@ pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
         } => (*src, *file, *entry, *program),
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
     };
-    let SubOp::RopeAppend { head_dim, .. } = &node.op else {
+    let SubOp::RopeAppend {
+        attention,
+        head_dim,
+        attn,
+        ..
+    } = &node.op
+    else {
         return Err(
             "triton splice: lower_kv_write called on a node that is not a RopeAppend".to_string(),
         );
@@ -2008,15 +2015,18 @@ pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
             node.inputs.len()
         ));
     }
-    let hd = head_dim.get();
+    // The class's head count off the op's own attention facts (minted at the bridge), not a
+    // division of the region's width — the region's law is CHECKED against it below.
+    let g = attention.class(attn.class());
+    let (hd, nkvh) = (head_dim.get(), g.kv_heads().get());
     let (rows, kv_width) = (node.output.region.rows.len, node.output.region.cols.len);
-    if hd == 0 || !kv_width.is_multiple_of(hd) {
+    if hd == 0 || kv_width != nkvh * hd {
         return Err(format!(
-            "triton splice: RopeAppend t{}: its {kv_width}-column K is not whole heads of {hd}",
+            "triton splice: RopeAppend t{}: its {kv_width}-column K is not the class's \
+             {nkvh} whole heads of {hd}",
             node.output.tensor.index()
         ));
     }
-    let nkvh = kv_width / hd;
     whole(ir, &node.output, rows, kv_width, "rotated K")?;
     whole(ir, &node.inputs[3], rows, kv_width, "V")?;
     let pages = pool_pages(ir, &node.inputs[4], kv_width, "K")?;
