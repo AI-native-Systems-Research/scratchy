@@ -208,7 +208,6 @@ fn compiled_variant_stems() -> Vec<String> {
     .collect()
 }
 
-
 pub(crate) fn hf_cache_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("HF_HOME") {
         return PathBuf::from(dir).join("hub");
