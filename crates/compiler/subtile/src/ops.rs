@@ -34,7 +34,9 @@
 //!   - `[nz f]` — the op's own non-zero count field `f` (`.get()`);
 //!   - `[pairs in0 k]` / `[pairs f k]` — `(token, expert)` pair rows laid out `[m, k·w]`, `w` the
 //!     width of operand 0 or of the op's field `f`, `k` the op's top-k field;
-//!   - `[q_width g]` — the query width of the op's head geometry field `g`.
+//!   - `[q_width_masked attention mask]` — the query width of the attention class the op's
+//!     mask names (the class off the op's own `attention` facts);
+//!   - `[q_width_base attention]` — the query width of the op's base attention class.
 //! - `rows` is the same shape of fact for the output ROW count — which op row law a step obeys:
 //!   - `[in0]` — shape-preserving: output rows = `inputs[0]`'s REGISTERED rows. The token count
 //!     `m` and the true row count diverge exactly once a per-head `Reshape` view enters the chain
@@ -114,7 +116,7 @@ macro_rules! for_each_subop {
             // `[num_heads]` sinks weight source (gpt-oss attention
             // sinks — a 6th input read as a weight, not a K/V pair).
             AttnDecode [SubOp::AttnDecode { .. }] arity = (|n| (n >= 3 && n % 2 == 1) || n == 6),
-                cols = [q_width attn], rows = [in0], gemm_w = [none];
+                cols = [q_width_masked attention mask], rows = [in0], gemm_w = [none];
             TanhSoftCap [SubOp::TanhSoftCap { .. }] arity = (|n| n == 1), cols = [in0],
                 rows = [in0], gemm_w = [none];
             RmsNormUnit [SubOp::RmsNormUnit { .. }] arity = (|n| n == 1), cols = [in0],
@@ -161,7 +163,8 @@ macro_rules! for_each_subop {
                 gemm_w = [none];
             VarlenAttention [SubOp::VarlenAttention { .. }] arity = (|n| n == 3), cols = [in0],
                 rows = [in0], gemm_w = [none];
-            EncoderAttn [SubOp::EncoderAttn { .. }] arity = (|n| n == 3), cols = [q_width attn],
+            EncoderAttn [SubOp::EncoderAttn { .. }] arity = (|n| n == 3),
+                cols = [q_width_base attention],
                 rows = [in0], gemm_w = [none];
             GatedDeltaNet [SubOp::GatedDeltaNet] arity = (|n| n == 5), cols = [in1], rows = [in0],
                 gemm_w = [none];
@@ -260,22 +263,6 @@ macro_rules! for_each_subop {
     };
 }
 
-/// The `[q_width attn]` law: an attention op's output width is its class's own query width —
-/// `AttnDecode` the class its mask names, `EncoderAttn` the base pair (a mask-less encoder reads
-/// its own layer's class, which is the base). Routed to only by the registry's two attention
-/// rows; any other op reaching here is a registry wiring defect, named as such.
-fn attn_q_width<F: crate::subtile_ir::RopeForm, S: crate::subtile_ir::OpStage>(
-    op: &crate::subtile_ir::SubOp<F, S>,
-) -> u32 {
-    match op {
-        crate::subtile_ir::SubOp::AttnDecode {
-            mask, attention, ..
-        } => attention.class(mask.class()).q_width() as u32,
-        crate::subtile_ir::SubOp::EncoderAttn { attention } => attention.base().q_width() as u32,
-        _ => unreachable!("attn_q_width: the registry routes only the two attention ops here"),
-    }
-}
-
 // ── Derived: output width ───────────────────────────────────────────
 // The arm's pattern and body come from one row's `cols` class; a field-reading class binds the
 // row's own field name in the pattern, so no arm needs a nested match.
@@ -283,8 +270,11 @@ macro_rules! __out_cols_pat {
     ($kind:ident, $pat:pat, [field $f:ident]) => {
         $crate::subtile_ir::SubOp::$kind { $f, .. }
     };
-    ($kind:ident, $pat:pat, [q_width attn]) => {
-        $pat
+    ($kind:ident, $pat:pat, [q_width_masked $a:ident $m:ident]) => {
+        $crate::subtile_ir::SubOp::$kind { $a, $m, .. }
+    };
+    ($kind:ident, $pat:pat, [q_width_base $a:ident]) => {
+        $crate::subtile_ir::SubOp::$kind { $a, .. }
     };
     ($kind:ident, $pat:pat, [nz $f:ident]) => {
         $crate::subtile_ir::SubOp::$kind { $f, .. }
@@ -318,8 +308,11 @@ macro_rules! __out_cols_body {
     ($w:ident, $s:expr, [field $f:ident]) => {
         *$f
     };
-    ($w:ident, $s:expr, [q_width attn]) => {
-        $crate::ops::attn_q_width($s)
+    ($w:ident, $s:expr, [q_width_masked $a:ident $m:ident]) => {
+        $a.class($m.class()).q_width() as u32
+    };
+    ($w:ident, $s:expr, [q_width_base $a:ident]) => {
+        $a.base().q_width() as u32
     };
     ($w:ident, $s:expr, [nz $f:ident]) => {
         $f.get()
@@ -440,8 +433,8 @@ macro_rules! __derive_registry {
             /// `k`; a row declaring `[in0]`/`[in1]` calls it, the other classes never do.
             /// Taking a LOOKUP rather than just `in0_cols` is what lets this serve every
             /// consumer: GDN's width comes from operand 1. The two attention ops'
-            /// `[q_width attn]` class reads the class's own query width off the op's own
-            /// attention facts, minted at the bridge.
+            /// `[q_width_masked]`/`[q_width_base]` classes read the class's own query
+            /// width off the op's own attention facts, minted at the bridge.
             pub fn out_cols(&self, operand_cols: impl Fn(usize) -> u32) -> u32 {
                 use $crate::subtile_ir::{EwKind, SubOp};
                 match self {
