@@ -4847,11 +4847,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 let cos_in = node.inputs[1];
                 let sin_in = node.inputs[2];
                 let total_cols = node.output.region.cols.len;
-                let head_dim_nz = node
-                    .op
-                    .rope_head_dim()
-                    .expect("the arm binds one of the two rope kinds")
-                    .nonzero();
+                let head_dim_nz = head_dim.nonzero();
                 let q_col_start = q_in.region.cols.start;
                 let out_col_start = node.output.region.cols.start;
                 for blk in head_blocks(total_cols, nb, head_dim_nz) {
@@ -4901,11 +4897,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 let kcache_in = node.inputs[4];
                 let vcache_in = node.inputs[5];
                 let total_cols = node.output.region.cols.len;
-                let head_dim_nz = node
-                    .op
-                    .rope_head_dim()
-                    .expect("the arm binds one of the two rope kinds")
-                    .nonzero();
+                let head_dim_nz = rope.head_dim(attention).nonzero();
                 let k_col_start = k_in.region.cols.start;
                 let v_col_start = v_in.region.cols.start;
                 let out_col_start = node.output.region.cols.start;

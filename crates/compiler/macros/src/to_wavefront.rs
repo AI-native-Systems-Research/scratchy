@@ -1126,7 +1126,7 @@ pub fn lower_decode_to_wavefront(
                 // The prefix cache at THIS layer's class width — a hybrid model's
                 // sliding and global layers have different kv widths, and the cache
                 // this attention reads is the one its own class's RopeAppend wrote.
-                let (pk, pv) = bx.prefix_for(layer, geom.kv_width() as u32);
+                let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
                 if let AttnMask::SlidingWindow { window } = mask {
                     // The k-rope for a sliding layer targets the LOCAL
                     // geometry class.
@@ -1196,7 +1196,7 @@ pub fn lower_decode_to_wavefront(
                 // The prefix cache at THIS layer's class width — a hybrid
                 // model's sliding and global layers have different kv widths,
                 // and the cache this attention reads is its own class's.
-                let (pk, pv) = bx.prefix_for(layer, geom.kv_width() as u32);
+                let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
                 let idx = bx.push_op(
                     SubOp::attn_decode(attention, bx.prefix_len, mask),
                     vec![q, InputRef::Ext(pk), InputRef::Ext(pv)],

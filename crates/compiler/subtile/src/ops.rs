@@ -309,10 +309,10 @@ macro_rules! __out_cols_body {
         *$f
     };
     ($w:ident, $s:expr, [q_width_masked $a:ident $m:ident]) => {
-        $a.class($m.class()).q_width() as u32
+        $a.class($m.class()).q_width()
     };
     ($w:ident, $s:expr, [q_width_base $a:ident]) => {
-        $a.base().q_width() as u32
+        $a.base().q_width()
     };
     ($w:ident, $s:expr, [nz $f:ident]) => {
         $f.get()

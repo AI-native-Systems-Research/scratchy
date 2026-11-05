@@ -3977,7 +3977,7 @@ fn lower_one(
             let dtype = dequant_dtype_for(p);
             // out is [M, num_heads * head_dim]; one thread per element,
             // m_scaling rescales the X axis to the runtime token count.
-            let n = bucket_m * (base(p)?.q_width() as u32);
+            let n = bucket_m * base(p)?.q_width();
             LoweredCommand {
                 kernel: KernelId::GateApply,
                 library: "gate_apply",
@@ -4502,7 +4502,7 @@ fn lower_one(
             let dtype = dequant_dtype_for(p);
             // Each output is [M, num_heads * head_dim]; one thread per
             // output element writes both the query and gate halves.
-            let n = bucket_m * (base(p)?.q_width() as u32);
+            let n = bucket_m * base(p)?.q_width();
             LoweredCommand {
                 kernel: KernelId::GateSplit,
                 library: "gate_split",
