@@ -226,7 +226,7 @@ impl SpecializedPipelines {
 }
 
 /// A dense GEMM's pipeline key at `dtype` and `dims` for `body`, keyed on its `(M, N, K)` (the
-/// simdgroup bodies' constants 0 / 1 / 2; the lowering has them on `LoweredCommand.gemm_dims`).
+/// simdgroup bodies' constants 0 / 1 / 2; the lowering has them on `LoweredCommand.gemm`).
 /// Up to [`GEMV_MAX_ROWS`] rows of at least [`GEMV_ROWS`] outputs are matrix-vector products:
 /// MLX's GEMV per row (`gemv_{f16,bf16}_specialized`), a threadgroup of 256 threads per
 /// [`GEMV_ROWS`] outputs of every row, each weight slice loaded once for all of them.

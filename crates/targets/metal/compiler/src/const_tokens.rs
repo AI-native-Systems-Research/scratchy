@@ -50,9 +50,10 @@ fn module_of(ty: &str) -> Result<TokenStream, Error> {
     let m = match ty {
         "KernelId" | "Binding" | "DispatchShape" | "MScaling" | "MScaleAxis" | "RuntimeGate"
         | "LoweredCommand" | "GatedCommand" | "PackedCommand" | "CommandTable" | "GemmDims"
-        | "WeightTensor" | "RuntimeBindingKind" | "ActivationWidth" | "LoweredMetalTape"
-        | "ClassedTape" | "GenClass" | "KvAddressing" | "TapeLoop" | "TapeCommands" | "Fence"
-        | "SetAxis" | "LogitsRows" | "RowTile" | "DecodePartials" | "SplitSteps" | "PlayLive" => {
+        | "Gemm" | "GemmWeight" | "GemmEntry" | "GemmAt" | "PackedLayer" | "WeightTensor"
+        | "RuntimeBindingKind" | "ActivationWidth" | "LoweredMetalTape" | "ClassedTape"
+        | "GenClass" | "KvAddressing" | "TapeLoop" | "TapeCommands" | "Fence" | "SetAxis"
+        | "LogitsRows" | "RowTile" | "DecodePartials" | "SplitSteps" | "PlayLive" => {
             quote!(__tl)
         }
         "ConstantValue" | "ConstantType" | "ConstSlot" => {
@@ -392,7 +393,7 @@ mod tests {
                         binding_index: 1,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             },
             gate: Some(RuntimeGate::OnlyIfDecodeStep),
         }

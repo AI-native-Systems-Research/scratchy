@@ -60,10 +60,10 @@ use crate::quantized::{
 use crate::specialized_pipeline_cache::ConstantValue;
 
 use crate::tape::lowered::{
-    Binding, DecodePartials, DispatchShape, Fence, GatedCommand, GemmDims, IntoBaked, KernelId,
-    LogitsRows, LoweredCommand, LoweredMetalTape, LoweringError, MScaleAxis, MScaling, MetalDtype,
-    PlayLive, RowTile, RuntimeBindingKind, RuntimeGate, SetAxis, SplitSteps, WeightTensor, baked,
-    baked_commands,
+    Binding, DecodePartials, DispatchShape, Fence, GatedCommand, Gemm, GemmDims, GemmWeight,
+    IntoBaked, KernelId, LogitsRows, LoweredCommand, LoweredMetalTape, LoweringError, MScaleAxis,
+    MScaling, MetalDtype, PlayLive, RowTile, RuntimeBindingKind, RuntimeGate, SetAxis, SplitSteps,
+    WeightTensor, baked, baked_commands,
 };
 
 /// Where one bucket's tape is baked: the bucket, its two halves' tape
@@ -549,7 +549,7 @@ fn affine_qmv_command(
             m_scaling,
         },
         bindings: baked(bindings),
-        gemm_dims: None,
+        gemm: None,
     }
 }
 
@@ -645,7 +645,7 @@ fn sample_slice_command(
                 binding_index: 2,
             },
         ]),
-        gemm_dims: None,
+        gemm: None,
     }
 }
 
@@ -775,7 +775,7 @@ fn tq_stage_command<const IS_K: bool>(
             m_scaling: None,
         },
         bindings: baked(bindings),
-        gemm_dims: None,
+        gemm: None,
     })
 }
 
@@ -816,7 +816,7 @@ fn tq_rotate_command(
             }),
         },
         bindings: super::kernel_bindings::TqRotateRowsBindingSet { rows }.into_baked(),
-        gemm_dims: None,
+        gemm: None,
     })
 }
 
@@ -1249,7 +1249,7 @@ fn route_small_m(
                 },
                 Binding::Scratch { binding_index: 1 },
             ]),
-            gemm_dims: None,
+            gemm: None,
         };
         let mut bindings =
             affine_qmm_bindings(in_slot, out_slot, layer, w.of(WeightKind::Linear, 0)?);
@@ -1281,7 +1281,7 @@ fn route_small_m(
                 m_scaling: scaling,
             },
             bindings: baked(bindings),
-            gemm_dims: None,
+            gemm: None,
         };
         // The pre-pass first, so the next matmul of the activation reads its scratch as it is.
         return Ok([GatedCommand::gated(quant, OnlyIfSmallMTokens)]
@@ -1329,7 +1329,7 @@ fn route_small_m(
             layer,
             w.of(WeightKind::Linear, 0)?,
         )),
-        gemm_dims: None,
+        gemm: None,
     };
     Ok(cmds
         .into_iter()
@@ -1478,7 +1478,7 @@ fn route_gdn(
                 .copied()
                 .collect(),
         ),
-        gemm_dims: None,
+        gemm: None,
     };
     let decoded = |d: bool, q: bool| decodes && d && q;
     let piped = |d: bool, q: bool| pipelines && !d && q;
@@ -1729,7 +1729,7 @@ fn decode_attention_per_kv_head(
                 ..command.dispatch
             },
             bindings: baked(kept.chain([scratch]).chain(sinks).collect()),
-            gemm_dims: None,
+            gemm: None,
         };
         let gated = |command| GatedCommand { command, gate };
         out.extend([gated(attention), gated(combine)]);
@@ -2603,7 +2603,7 @@ fn verify_lane_attention(
             }),
         },
         bindings: baked(vec![out, scratch_at(SPLIT_PARTIALS_SLOT, packed_bytes)]),
-        gemm_dims: None,
+        gemm: None,
     };
     Some([pack, split, combine])
 }
@@ -2843,7 +2843,7 @@ fn lower_one(
                     }),
                 },
                 bindings: baked(bindings),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -2895,7 +2895,7 @@ fn lower_one(
                     binding_index: 2,
                 },
             ]),
-            gemm_dims: None,
+            gemm: None,
         },
 
         // ── Standalone RMSNorm ─────────────────────────────────────
@@ -2965,7 +2965,7 @@ fn lower_one(
                     2,
                 ),
             ]),
-            gemm_dims: None,
+            gemm: None,
         },
 
         // ── Scalar-offset RMSNorm (Gemma `rmsnorm(x, weight + 1.0)`) ─
@@ -3017,7 +3017,7 @@ fn lower_one(
                     2,
                 ),
             ]),
-            gemm_dims: None,
+            gemm: None,
         },
 
         // ── Unit-gain RMSNorm (mlx RMSNormNoScale — Gemma4 v_norm) ─
@@ -3067,7 +3067,7 @@ fn lower_one(
                     binding_index: 1,
                 },
             ]),
-            gemm_dims: None,
+            gemm: None,
         },
 
         // ── Multiply by a loaded [1]-shaped weight (Gemma4 layer_scalar) ─
@@ -3111,7 +3111,7 @@ fn lower_one(
                     2,
                 ),
             ]),
-            gemm_dims: None,
+            gemm: None,
         },
 
         // ── Fused residual-add + RMSNorm ───────────────────────────
@@ -3164,7 +3164,7 @@ fn lower_one(
                         2,
                     ),
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -3215,7 +3215,7 @@ fn lower_one(
                     2,
                 ),
             ]),
-            gemm_dims: None,
+            gemm: None,
         },
 
         // ── Gemma4 post-FFN tail: rmsnorm → add → scalar_weight_mul ─
@@ -3258,7 +3258,7 @@ fn lower_one(
                         3,
                     ),
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
         I::NormAddScalarMul(
@@ -3321,7 +3321,7 @@ fn lower_one(
                         4,
                     ),
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -3331,16 +3331,16 @@ fn lower_one(
             SampledMatmul::Dense(Slot(in_slot), Slot(out_slot), LayerId(layer), NDim(n), KDim(k)),
             _,
         ) => {
-            // The worker reads `gemm_dims` and dispatches the kernel
+            // The worker reads `gemm.dims` and dispatches the kernel
             // `pipeline_for_gemm` picks for them (M/N/K baked into
             // function constants), so this tile-shape hint is a
             // placeholder; the GEMM bake picks its own grid.
             // `eff_m` shrinks by the merge factor for the merger's
             // post-reshape GEMMs (`[num_tokens / vision_merge_factor,
             // vision_merge_hidden]`); == bucket_m everywhere else. The
-            // bf16 GEMM path bakes M from `gemm_dims.m` (m_scaling is
+            // bf16 GEMM path bakes M from `gemm.dims.m` (m_scaling is
             // forced None for it in the worker), so the divisor MUST land
-            // on `gemm_dims.m`, not just the placeholder dispatch.
+            // on `gemm.dims.m`, not just the placeholder dispatch.
             let tg_x = eff_m.div_ceil(GEMM_TILE_M);
             let tg_y = (*n).div_ceil(GEMM_TILE_N);
             LoweredCommand {
@@ -3370,17 +3370,18 @@ fn lower_one(
                         slot: *in_slot,
                         binding_index: 1,
                     },
-                    source(
-                        w.of(WeightKind::Linear, 0)?,
-                        WeightTensor::Weight,
-                        super::ids::LayerId(*layer + layer_offset),
-                        2,
-                    ),
                 ]),
-                gemm_dims: Some(GemmDims {
-                    m: eff_m,
-                    n: *n,
-                    k: *k,
+                gemm: Some(Gemm {
+                    dims: GemmDims {
+                        m: eff_m,
+                        n: *n,
+                        k: *k,
+                    },
+                    weight: GemmWeight {
+                        ix: w.of(WeightKind::Linear, 0)?,
+                        which: WeightTensor::Weight,
+                        layer: super::ids::LayerId(*layer + layer_offset),
+                    },
                 }),
             }
         }
@@ -3615,7 +3616,7 @@ fn lower_one(
                             },
                             Binding::Scratch { binding_index: 1 },
                         ]),
-                        gemm_dims: None,
+                        gemm: None,
                     };
                     let mut bindings = affine_qmm_bindings(
                         *in_slot,
@@ -3647,7 +3648,7 @@ fn lower_one(
                             m_scaling: rows(),
                         },
                         bindings: baked(bindings),
-                        gemm_dims: None,
+                        gemm: None,
                     };
                     return Ok(vec![quant, gemm]);
                 }
@@ -3696,7 +3697,7 @@ fn lower_one(
                                 super::ids::LayerId(*layer + layer_offset),
                                 w.of(WeightKind::Linear, 0)?,
                             )),
-                            gemm_dims: None,
+                            gemm: None,
                         }
                     }
                     QmmTKernel::Standard => {
@@ -3744,7 +3745,7 @@ fn lower_one(
                                 super::ids::LayerId(*layer + layer_offset),
                                 w.of(WeightKind::Linear, 0)?,
                             )),
-                            gemm_dims: None,
+                            gemm: None,
                         }
                     }
                     QmmTKernel::SplitK {
@@ -3819,7 +3820,7 @@ fn lower_one(
                                 super::ids::LayerId(*layer + layer_offset),
                                 w.of(WeightKind::Linear, 0)?,
                             )),
-                            gemm_dims: None,
+                            gemm: None,
                         };
 
                         // splitk_reduce_sum: bindings (0=output → out_slot,
@@ -3856,7 +3857,7 @@ fn lower_one(
                                 },
                                 Binding::Scratch { binding_index: 1 },
                             ]),
-                            gemm_dims: None,
+                            gemm: None,
                         };
                         return Ok(vec![qmm_t_cmd, reduce_cmd]);
                     }
@@ -3924,7 +3925,7 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -3968,7 +3969,7 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -4009,7 +4010,7 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -4042,7 +4043,7 @@ fn lower_one(
                         binding_index: 1,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
         I::DraftConv(c) => {
@@ -4068,7 +4069,7 @@ fn lower_one(
                     arena(c.residual.unwrap_or(c.input), 3),
                     arena(c.output, 4),
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
         I::DraftAttention(Slot(qkv), Slot(out), LayerId(layer)) => {
@@ -4129,7 +4130,7 @@ fn lower_one(
                         scratch(s.query_keys, 6),
                         scratch(s.query_values, 7),
                     ]),
-                    gemm_dims: None,
+                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftAttentionSplit,
@@ -4151,7 +4152,7 @@ fn lower_one(
                         scratch(s.query_values, 6),
                         scratch(s.partials, 7),
                     ]),
-                    gemm_dims: None,
+                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftAttentionReduce,
@@ -4164,7 +4165,7 @@ fn lower_one(
                     constants,
                     dispatch: draft_lanes_grid(g.kv_heads, g, bucket_m, 1),
                     bindings: baked(vec![scratch(s.queries, 0), scratch(s.partials, 1)]),
-                    gemm_dims: None,
+                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftAttentionReorder,
@@ -4183,7 +4184,7 @@ fn lower_one(
                             binding_index: 1,
                         },
                     ]),
-                    gemm_dims: None,
+                    gemm: None,
                 },
             ]);
         }
@@ -4235,7 +4236,7 @@ fn lower_one(
                             ])
                             .collect(),
                     ),
-                    gemm_dims: None,
+                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftContextPrefill,
@@ -4255,7 +4256,7 @@ fn lower_one(
                             ])
                             .collect(),
                     ),
-                    gemm_dims: None,
+                    gemm: None,
                 },
             ]);
         }
@@ -4287,7 +4288,7 @@ fn lower_one(
                     constants,
                     dispatch,
                     bindings: baked(head.iter().chain(tail).copied().collect()),
-                    gemm_dims: None,
+                    gemm: None,
                 };
             let rows = [
                 runtime(RuntimeBindingKind::CuSeqlensQ, 4),
@@ -4370,7 +4371,7 @@ fn lower_one(
                         scratch(s.partial_ids, 1),
                         scratch(s.partial_values, 2),
                     ]),
-                    gemm_dims: None,
+                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftSelectEdges,
@@ -4406,7 +4407,7 @@ fn lower_one(
                         runtime(RuntimeBindingKind::InputIds, 7),
                         runtime(RuntimeBindingKind::NumTokensU32, 8),
                     ]),
-                    gemm_dims: None,
+                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftSelectWalk,
@@ -4424,7 +4425,7 @@ fn lower_one(
                         runtime(RuntimeBindingKind::DraftLaneParams, 6),
                         runtime(RuntimeBindingKind::NumTokensU32, 7),
                     ]),
-                    gemm_dims: None,
+                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftVerifyRows,
@@ -4442,7 +4443,7 @@ fn lower_one(
                         runtime(RuntimeBindingKind::DraftLaneParams, 2),
                         runtime(RuntimeBindingKind::NumTokensU32, 3),
                     ]),
-                    gemm_dims: None,
+                    gemm: None,
                 },
             ]);
         }
@@ -4493,7 +4494,7 @@ fn lower_one(
                         binding_index: 3,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -4536,7 +4537,7 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -4641,7 +4642,7 @@ fn lower_one(
                         binding_index: 4,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -4740,7 +4741,7 @@ fn lower_one(
                     m_scaling: None,
                 },
                 bindings: baked(bindings),
-                gemm_dims: None,
+                gemm: None,
             }
         }
         // Dense GeGLU (Gemma3 text MLP) — same fused gate/up GEMM +
@@ -4853,7 +4854,7 @@ fn lower_one(
                     .chain(codec.into_iter().flat_map(|(_, b)| b))
                     .collect(),
                 ),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -4910,7 +4911,7 @@ fn lower_one(
                     .chain(codec.into_iter().flat_map(|(_, b)| b))
                     .collect(),
                 ),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -4998,7 +4999,7 @@ fn lower_one(
                     .chain(codec.into_iter().flat_map(|(_, b)| b))
                     .collect(),
                 ),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -5091,7 +5092,7 @@ fn lower_one(
                     query_rows: QueryRows::for_bucket(bucket_m),
                 }
                 .into_baked(),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -5292,7 +5293,7 @@ fn lower_one(
                             binding_index: 1,
                         },
                     ]),
-                    gemm_dims: None,
+                    gemm: None,
                 });
                 // 2. gather K (rope-on-read) → Kdense [nkv,max_kv,hd].
                 cmds.push(LoweredCommand {
@@ -5316,7 +5317,7 @@ fn lower_one(
                         rt(RuntimeBindingKind::SeqUsedK, 3),
                         cossin(4),
                     ]),
-                    gemm_dims: None,
+                    gemm: None,
                 });
                 // 3. gather V (transposed copy) → Vdense_T [nkv,hd,max_kv].
                 cmds.push(LoweredCommand {
@@ -5337,7 +5338,7 @@ fn lower_one(
                         rt(RuntimeBindingKind::KvCacheV { layer: lid }, 2),
                         rt(RuntimeBindingKind::SeqUsedK, 3),
                     ]),
-                    gemm_dims: None,
+                    gemm: None,
                 });
                 // 4. per head: QKᵀ (NAX GEMM, N=kv_len@seq_used) → softmax → PV.
                 for h in 0..nh {
@@ -5394,7 +5395,7 @@ fn lower_one(
                             rt(RuntimeBindingKind::SpanIds, 4),
                             rt(RuntimeBindingKind::CuSeqlensQ, 5),
                         ]),
-                        gemm_dims: None,
+                        gemm: None,
                     });
                     cmds.push(LoweredCommand {
                         kernel: KernelId::AttnCausalSoftmax,
@@ -5419,7 +5420,7 @@ fn lower_one(
                             rt(RuntimeBindingKind::CuSeqlensQ, 2),
                             rt(RuntimeBindingKind::SpanIds, 3),
                         ]),
-                        gemm_dims: None,
+                        gemm: None,
                     });
                     // PV: NAX matmul2d (M5+) or simdgroup steel (pre-M5). Both
                     // C=A@B^T with K=kv_len read from seq_used at runtime.
@@ -5470,7 +5471,7 @@ fn lower_one(
                             rt(RuntimeBindingKind::SpanIds, 4),
                             rt(RuntimeBindingKind::CuSeqlensQ, 5),
                         ]),
-                        gemm_dims: None,
+                        gemm: None,
                     });
                 }
                 // 5. O [nh,Lq,hd] head-major → [Lq,nh,hd] token-major into out_slot.
@@ -5487,7 +5488,7 @@ fn lower_one(
                         },
                         scr(out_head_off, 1),
                     ]),
-                    gemm_dims: None,
+                    gemm: None,
                 });
                 Some(cmds)
             } else {
@@ -5748,7 +5749,7 @@ fn lower_one(
                     constants: constants.into_baked(),
                     dispatch: steel_paged_dispatch(q_heads, bucket_m, bq_steel, threads),
                     bindings: bindings.into_baked(),
-                    gemm_dims: None,
+                    gemm: None,
                 };
                 if roped_k_scratch {
                     // Three commands: (1) RopeOnce{Nax,Steel} ropes the cache's K
@@ -5833,7 +5834,7 @@ fn lower_one(
                             table: w.table(!sliding)?,
                         }
                         .into_baked(),
-                        gemm_dims: None,
+                        gemm: None,
                     };
                     let plain = LoweredCommand {
                         constants: plain_constants.into_baked(),
@@ -5888,7 +5889,7 @@ fn lower_one(
                             }),
                         },
                         bindings: bindings.into_baked(),
-                        gemm_dims: None,
+                        gemm: None,
                     }
                 };
                 let attn_cmd = gqa_shared(constants, bindings);
@@ -5940,7 +5941,7 @@ fn lower_one(
                             table: w.table(!sliding)?,
                         }
                         .into_baked(),
-                        gemm_dims: None,
+                        gemm: None,
                     };
                     let plain = gqa_shared(plain_constants, bindings_for(false, false));
                     let reroping = gqa_shared(reroping_constants, bindings_for(false, true));
@@ -6025,7 +6026,7 @@ fn lower_one(
                     query_rows: QueryRows::for_bucket(bucket_m),
                 }
                 .into_baked(),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -6064,7 +6065,7 @@ fn lower_one(
                     binding_index: 1,
                 },
             ]),
-            gemm_dims: None,
+            gemm: None,
         },
 
         // ── Scalar-multiply broadcast ──────────────────────────────
@@ -6116,7 +6117,7 @@ fn lower_one(
                 // constant on the specialized pipeline (Phase 5.B);
                 // no runtime binding needed.
             ]),
-            gemm_dims: None,
+            gemm: None,
         },
 
         // ── The logit tail over the sampled rows (Gemma's soft cap, Granite's scale) ──
@@ -6165,7 +6166,7 @@ fn lower_one(
                         binding_index: output,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -6206,7 +6207,7 @@ fn lower_one(
                         binding_index: 1,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -6271,7 +6272,7 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -6453,7 +6454,7 @@ fn lower_one(
                         }),
                     },
                     bindings: baked(bindings),
-                    gemm_dims: None,
+                    gemm: None,
                 }
             };
 
@@ -6704,7 +6705,7 @@ fn lower_one(
                     source(ix, WeightTensor::Weight, layer_id, 2),
                     source(ix, WeightTensor::Weight, layer_id, 3),
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -6753,7 +6754,7 @@ fn lower_one(
                     source(ix, WeightTensor::Weight, layer_id, 2),
                     source(ix, WeightTensor::Bias, layer_id, 3),
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -6799,7 +6800,7 @@ fn lower_one(
                         binding_index: 1,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -6842,7 +6843,7 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -6895,7 +6896,7 @@ fn lower_one(
                         binding_index: 1,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -6956,7 +6957,7 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             };
             return Ok(vec![
                 rope_cmd(*q_out_slot, *q_slot),
@@ -7034,7 +7035,7 @@ fn lower_one(
                         binding_index: 4,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -7102,7 +7103,7 @@ fn lower_one(
                         binding_index: 4,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -7153,7 +7154,7 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
 
@@ -7212,7 +7213,7 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }
         }
     };
@@ -7695,7 +7696,7 @@ fn fused_gate_up_mul_cmd(
                 2,
             ),
         ]),
-        gemm_dims: None,
+        gemm: None,
     })
 }
 
@@ -8110,7 +8111,7 @@ fn recurrent_conv(
             }),
         },
         bindings: baked(bindings),
-        gemm_dims: None,
+        gemm: None,
     })
 }
 
@@ -8222,7 +8223,7 @@ fn recurrent_scan(
                 m_scaling: seqs,
             },
             bindings: baked(bindings),
-            gemm_dims: None,
+            gemm: None,
         }
     };
     if hk.is_multiple_of(32) && hv.is_multiple_of(4) {
@@ -8273,7 +8274,7 @@ fn recurrent_scan(
             weight(WeightTensor::GdnALog, 4),
             weight(WeightTensor::GdnDtBias, 5),
         ]),
-        gemm_dims: None,
+        gemm: None,
     };
     let inputs = [scratch(2, layout.g), scratch(3, layout.beta)];
     let tgx = hv.clamp(1, THREADS_PER_GROUP);
@@ -8380,7 +8381,7 @@ fn recurrent_norm(
             z,
             norm_w,
         ]),
-        gemm_dims: None,
+        gemm: None,
     }
 }
 
@@ -8701,7 +8702,7 @@ fn make_moe_command(
         constants: baked(constants),
         dispatch,
         bindings: baked(bindings),
-        gemm_dims: None,
+        gemm: None,
     }
 }
 
@@ -9237,7 +9238,7 @@ fn lower_moe_step(
                 arena_at(1, x),
                 source(router()?, WeightTensor::GemmaRouterScale, layer(&l), 2),
             ]),
-            gemm_dims: None,
+            gemm: None,
         }],
         // One row, a norm folded in: its own pre-norm, the router scale binding as the norm's
         // gain, or the RMSNorm whose rows it reads, that norm's gain (its row's `RmsNorm` weight).
@@ -9288,7 +9289,7 @@ fn lower_moe_step(
                     ),
                     source(gain.0, gain.1, layer(&gain.2), 3),
                 ]),
-                gemm_dims: None,
+                gemm: None,
             }]
         }
         S::RouterLogits(rows, l, _) => {
@@ -9300,15 +9301,18 @@ fn lower_moe_step(
                 function: "",
                 constants: &[],
                 dispatch: grid(tiles, (GEMM_TILE_M, GEMM_TILE_N, 1), ms(A::X)),
-                bindings: baked(vec![
-                    s.at(0, R::RouterLogits),
-                    rows_at(&s, 1, rows)?,
-                    source(router()?, gate, layer(&l), 2),
-                ]),
-                gemm_dims: Some(GemmDims {
-                    m: bucket_m,
-                    n: e,
-                    k: router_in,
+                bindings: baked(vec![s.at(0, R::RouterLogits), rows_at(&s, 1, rows)?]),
+                gemm: Some(Gemm {
+                    dims: GemmDims {
+                        m: bucket_m,
+                        n: e,
+                        k: router_in,
+                    },
+                    weight: GemmWeight {
+                        ix: router()?,
+                        which: gate,
+                        layer: layer(&l),
+                    },
                 }),
             }]
         }
@@ -14198,7 +14202,7 @@ mod tests {
             }
             _ => panic!("bindings[4]: expected out_slot ArenaSlot"),
         }
-        assert!(cmd.gemm_dims.is_none());
+        assert!(cmd.gemm.is_none());
     }
 
     /// At a bucket_m where `pick_qmm_t_kernel` returns `Standard`
@@ -14252,7 +14256,7 @@ mod tests {
         assert_eq!(cmd.dispatch.threadgroups, (2048 / 32, 512 / 32, 1));
         assert_eq!(cmd.dispatch.threads_per_threadgroup, (32, 2, 2));
         assert_eq!(cmd.bindings.len(), 5);
-        assert!(cmd.gemm_dims.is_none());
+        assert!(cmd.gemm.is_none());
     }
 
     /// At a bucket_m where `pick_qmm_t_kernel` returns SplitK
@@ -14414,7 +14418,7 @@ mod tests {
             }
             _ => panic!("bindings[2]: expected up_slot ArenaSlot"),
         }
-        assert!(cmd.gemm_dims.is_none());
+        assert!(cmd.gemm.is_none());
     }
 
     /// Unaligned-N Llama-1B-style lm_head (N=128256 — 128256 % 32 = 0
@@ -14567,7 +14571,7 @@ mod tests {
             }
             _ => panic!("bindings[4]: expected out_slot ArenaSlot"),
         }
-        assert!(cmd.gemm_dims.is_none());
+        assert!(cmd.gemm.is_none());
     }
 
     /// The router reads the token rows it routes in every bake: a sorted bake's sort runs after
@@ -15061,7 +15065,10 @@ mod tests {
             MoeStep::RouterLogits(MoeRows::Tokens(Slot(2)), LayerId(0), None),
             8,
         );
-        assert_eq!(router[0].gemm_dims.map(|g| (g.n, g.k)), Some((512, 4096)));
+        assert_eq!(
+            router[0].gemm.map(|g| (g.dims.n, g.dims.k)),
+            Some((512, 4096))
+        );
     }
 
     fn binding_index(b: &Binding) -> u8 {

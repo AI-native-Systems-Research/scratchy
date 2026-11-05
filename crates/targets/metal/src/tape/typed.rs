@@ -4,9 +4,10 @@
 //! Each model's bake emits one [`Source`] marker per weight family its tapes bind: the family's
 //! [`SourceIx`] and the typed handle (`scratchy_tensors::typed::W2<K, N, _>`, …) its `Weights`
 //! field holds, reached through [`Source::at`] — the resolver's one path to it. A dense GEMM's
-//! entry of the command table states its weight's dims as its slot's [`GemmSlot`] dims, read off
-//! the handle, and each binding of a typed family's weight states its index as its slot's. So the
-//! loader (the field's type), the tape (the GEMM's dims) and the kernel (picked and baked from
+//! record (`Gemm`: its dims and the weight it reads, which nothing else of the command names)
+//! takes the weight's index and dims from its slot's one [`GemmSlot::WEIGHT`], read off the
+//! handle; each binding of a typed family's tensor states its index as its slot's. So the loader
+//! (the field's type), the tape (the GEMM's weight and dims) and the kernel (picked and baked from
 //! those dims) read one type, and rustc checks they agree.
 //!
 //! What rustc refuses, each refusal one edit from the version it accepts. (ii) A GEMM's dims are
@@ -37,7 +38,8 @@
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.lm_head }
 //! # }
-//! assert_eq!((<LmHead as GemmSlot>::N, <LmHead as GemmSlot>::K), (128256, 2048));
+//! let w = <LmHead as GemmSlot>::WEIGHT;
+//! assert_eq!((w.ix, w.n, w.k), (SourceIx(0), 128256, 2048));
 //! ```
 //!
 //! ```compile_fail,E0277
@@ -57,7 +59,7 @@
 //! #     const IX: SourceIx = SourceIx(1);
 //! #     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.norm }
 //! # }
-//! const N: u32 = <Norm as GemmSlot>::N;
+//! let w = <Norm as GemmSlot>::WEIGHT;
 //! ```
 //!
 //! (iii) A slot whose handle is not the type of the field it reaches — `lm_head` declared
@@ -128,14 +130,24 @@ pub trait Source {
     fn at(model: &Self::Model, layer: LayerId) -> &Self::Handle;
 }
 
-/// A GEMM's weight dims, read off its slot's handle: `N` (output columns) and `K` (the inner
-/// dim). Only a slot whose handle is a rank-2 weight has them.
+/// A GEMM's weight, as its slot states it: the slot's index and the handle's dims, `n` (output
+/// columns) and `k` (the inner dim).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GemmSlotWeight {
+    pub ix: SourceIx,
+    pub n: u32,
+    pub k: u32,
+}
+
+/// A slot a GEMM reads: only a slot whose handle is a rank-2 weight has a [`GemmSlotWeight`].
 pub trait GemmSlot {
-    const N: u32;
-    const K: u32;
+    const WEIGHT: GemmSlotWeight;
 }
 
 impl<S: Source<Handle: Shape2>> GemmSlot for S {
-    const N: u32 = <<S::Handle as Shape2>::N as Dim>::N;
-    const K: u32 = <<S::Handle as Shape2>::K as Dim>::N;
+    const WEIGHT: GemmSlotWeight = GemmSlotWeight {
+        ix: S::IX,
+        n: <<S::Handle as Shape2>::N as Dim>::N,
+        k: <<S::Handle as Shape2>::K as Dim>::N,
+    };
 }
