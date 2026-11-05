@@ -33,6 +33,10 @@ default = ["chat", "model?/hf-completions"]
 # running a model locally. Pulls scratchy-serving-api (WITHOUT its `serve`
 # feature, so no axum), which brings scratchy-serving-worker with it.
 chat = ["dep:scratchy-serving-api"]
+# Naming a model pulls the forward compiler's neutral `BackboneDumpRegistration`
+# registry, so `scr model info` and stem completion walk whatever variants the
+# selected backend registered — the same command on every backend.
+model = ["dep:model", "dep:scratchy-forward-compiler"]
 # The OpenAI/Anthropic HTTP server ON TOP of the engine: `scr serve` (and the
 # offline `batch` command). Adds axum/tower via scratchy-serving-api/serve.
 # Pulls `guided-decoding` too: OpenAI's `response_format: json_schema` /
@@ -50,9 +54,8 @@ bench = ["scratchy-bench"]
 # The bench dataset loaders that read parquet (2WikiMQA, HotpotQA, MS MARCO), for `scr bench
 # serve --dataset-name rag --rag-source two-wiki|hotpotqa`.
 bench-datasets = ["bench", "scratchy-bench/datasets"]
-# `dep:scratchy-forward-compiler` + `scratchy-forward-compiler/metal` surface
-# `BackboneDumpRegistration` + `Instruction::normalize` so
-# `scr model info` works on metal builds. Backends enable the ENGINE (via scratchy-serving-api/
+# `scratchy-forward-compiler?/metal` lowers the variants the dump registry walks
+# (see `model`). Backends enable the ENGINE (via scratchy-serving-api/
 # <backend>), not the HTTP server — a backend is only meaningful with local
 # inference.
 #
@@ -76,7 +79,7 @@ bench-datasets = ["bench", "scratchy-bench/datasets"]
 #
 # `metal-base` alone builds the same engine with a dense KV cache and no MTP
 # heads; add `model/mtp-heads` back for drafting over a dense cache.
-metal-base = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal"]
+metal-base = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "scratchy-forward-compiler?/metal"]
 metal = ["metal-base", "model?/turboquant", "model?/mtp-heads"]
 # IBM Spyre, BASE tier: the target crate and the `SubtileIR -> KTIR` producer, no
 # GPU toolchain and NO device — neither a card nor the host emulator. On its own it

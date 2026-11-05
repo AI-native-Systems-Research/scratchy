@@ -18,8 +18,6 @@
 //! stdout is a tty, headers print in bold and trailing metadata in
 //! a dim style — set `NO_COLOR` to opt out.
 
-#![cfg(feature = "metal")]
-
 use std::io::{self, BufWriter, IsTerminal, Write};
 
 use scratchy_forward_compiler::{

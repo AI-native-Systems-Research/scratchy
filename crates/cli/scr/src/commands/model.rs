@@ -197,7 +197,7 @@ pub async fn run_model_names(args: crate::args::NamesArgs) -> anyhow::Result<()>
 ///
 /// NOT offered for `-m`: a stem is a config file name, not a model argument, and
 /// suggesting one there would send the user down a path that cannot resolve.
-#[cfg(all(feature = "model", feature = "metal"))]
+#[cfg(feature = "model")]
 fn compiled_variant_stems() -> Vec<String> {
     scratchy_forward_compiler::inventory::iter::<
         scratchy_forward_compiler::BackboneDumpRegistration,
@@ -208,12 +208,6 @@ fn compiled_variant_stems() -> Vec<String> {
     .collect()
 }
 
-/// No backend compiled in means no backbones were emitted, so there are no
-/// stems to report (`scr model info` does not exist in such a build either).
-#[cfg(all(feature = "model", not(feature = "metal")))]
-fn compiled_variant_stems() -> Vec<String> {
-    Vec::new()
-}
 
 pub(crate) fn hf_cache_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("HF_HOME") {
