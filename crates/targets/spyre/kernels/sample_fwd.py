@@ -189,9 +189,9 @@ own precondition.
 THE SENTINEL LAW (all-NaN row): a NaN lane never wins an ordered max and
 never satisfies an ordered equality, so an all-NaN row leaves the one-hot on
 the PAD lanes, where the host stages ginc = G, binc = 64 and linc = BLOCK —
-idx = G·4096 + 64·64 + 64 = PAD_V + 4160, past the last real lane. The
-consumer treats idx > V as the loud refusal (the host argmax answers token 0
-over the same row; that divergence is #666, recorded, not reconciled). A
+idx = G·4096 + 64·64 + 64 (`sample_sentinel`; PAD_V + 4160 at every pad of
+whole 4096-lane groups), past the last real lane. The worker's readback treats idx >= V as the loud refusal (#666):
+the card's draw is the only pick, so every path refuses the same row. A
 finite row can never reach the pad lanes.
 """
 
