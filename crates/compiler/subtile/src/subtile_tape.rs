@@ -3745,9 +3745,12 @@ pub(crate) mod tests {
             "the two tables together cover every layer exactly once"
         );
         // And each table's layers are same-class: their rope head dims agree.
-        let hd = |n: u32| match &g.nodes[n as usize].op {
-            SubOp::RopeAppend { attention, rope, .. } => rope.head_dim(*attention).get(),
-            _ => panic!("not a rope node"),
+        let hd = |n: u32| {
+            g.nodes[n as usize]
+                .op
+                .rope_head_dim()
+                .expect("not a rope node")
+                .get()
         };
         for t in [&t0, &t1] {
             let hds: Vec<u32> = t.iter().map(|&n| hd(n)).collect();

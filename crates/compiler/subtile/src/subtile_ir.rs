@@ -861,6 +861,19 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
         }
     }
 
+    /// The rope head dim this op runs at — `RopeRotate`'s own field, `RopeAppend`'s rope class
+    /// off the op's own attention facts. `None` for every non-rope op.
+    ///
+    /// ONE reader for every consumer of that fact (the KV codec, the head tiler, the splices,
+    /// the class registries): no site re-matches the two rope kinds to re-derive it.
+    pub fn rope_head_dim(&self) -> Option<HeadDim> {
+        match self {
+            SubOp::RopeRotate { head_dim, .. } => Some(*head_dim),
+            SubOp::RopeAppend { attention, rope, .. } => Some(rope.head_dim(*attention)),
+            _ => None,
+        }
+    }
+
     /// [`Self::reroll_class_key`] with the weight STORAGE masked: two nodes hash equal iff they
     /// are the same program at any bit width / group size.
     ///
@@ -3536,14 +3549,13 @@ pub fn eval_node<F: RopeForm>(
         SubOp::KvAppend { .. } => gather(&node.inputs[0], graph, bufs).0,
         // RopeAppend's host eval is rotation only (identical to RopeRotate);
         // its V input + the paged-cache write are GPU-only.
-        SubOp::RopeRotate { head_dim, _form: _ } => {
+        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => {
+            let head_dim = node
+                .op
+                .rope_head_dim()
+                .expect("the arm binds one of the two rope kinds");
             rope_eval(node, graph, bufs, head_dim.get())
         }
-        SubOp::RopeAppend {
-            attention,
-            rope,
-            ..
-        } => rope_eval(node, graph, bufs, rope.head_dim(attention).get()),
         SubOp::Mean => {
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
             debug_assert_eq!(out_cols, 1, "mean output must be [m, 1]");
@@ -4791,19 +4803,12 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
     for node in &graph.nodes {
         new_id_for_old.push(next_new_id);
         match node.op {
-            SubOp::RopeRotate { head_dim, .. } => {
+            SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => {
                 let total_cols = node.output.region.cols.len;
-                let head_dim_nz = std::num::NonZeroU32::new(head_dim.get())
-                    .expect("head_tile_rope: head_dim must be non-zero");
-                next_new_id += head_blocks(total_cols, nb, head_dim_nz).len() as u32;
-            }
-            SubOp::RopeAppend {
-                attention,
-                rope,
-                ..
-            } => {
-                let total_cols = node.output.region.cols.len;
-                let head_dim_nz = std::num::NonZeroU32::new(rope.head_dim(attention).get())
+                let head_dim_nz = node
+                    .op
+                    .rope_head_dim()
+                    .and_then(|d| std::num::NonZeroU32::new(d.get()))
                     .expect("head_tile_rope: head_dim must be non-zero");
                 next_new_id += head_blocks(total_cols, nb, head_dim_nz).len() as u32;
             }
@@ -4821,7 +4826,10 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 let cos_in = node.inputs[1];
                 let sin_in = node.inputs[2];
                 let total_cols = node.output.region.cols.len;
-                let head_dim_nz = std::num::NonZeroU32::new(head_dim.get())
+                let head_dim_nz = node
+                    .op
+                    .rope_head_dim()
+                    .and_then(|d| std::num::NonZeroU32::new(d.get()))
                     .expect("head_tile_rope: head_dim must be non-zero");
                 let q_col_start = q_in.region.cols.start;
                 let out_col_start = node.output.region.cols.start;
@@ -4872,7 +4880,10 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 let kcache_in = node.inputs[4];
                 let vcache_in = node.inputs[5];
                 let total_cols = node.output.region.cols.len;
-                let head_dim_nz = std::num::NonZeroU32::new(rope.head_dim(attention).get())
+                let head_dim_nz = node
+                    .op
+                    .rope_head_dim()
+                    .and_then(|d| std::num::NonZeroU32::new(d.get()))
                     .expect("head_tile_rope: head_dim must be non-zero");
                 let k_col_start = k_in.region.cols.start;
                 let v_col_start = v_in.region.cols.start;

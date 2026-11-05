@@ -1410,13 +1410,9 @@ pub fn graph_wiring<F: RopeForm>(
         // ⭐ THE CLASS REGISTRIES, here too — the door resolves a rope/attn program's P/identity
         // class through these, and this pass lowers through the door. Same shared helper, same
         // tape, so the wiring's answer and the placement pass's cannot disagree.
-        rope_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(ir.nodes.iter().filter_map(
-            |n| match &n.op {
-                SubOp::RopeRotate { head_dim, .. } => Some(head_dim.get()),
-                SubOp::RopeAppend { attention, rope, .. } => Some(rope.head_dim(*attention).get()),
-                _ => None,
-            },
-        )),
+        rope_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(
+            ir.nodes.iter().filter_map(|n| n.op.rope_head_dim().map(|d| d.get())),
+        ),
         attn_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(ir.nodes.iter().filter_map(
             |n| match &n.op {
                 SubOp::AttnDecode { mask, attention, .. } => {

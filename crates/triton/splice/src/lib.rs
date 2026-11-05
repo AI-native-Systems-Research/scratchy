@@ -2449,11 +2449,11 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // refusal (`total` not a whole number of `hd`-wide heads) is mirrored here
             // as an `Err`: the node is malformed, and no kernel can state it. The rotate
             // states its dim; the append's is its rope class's own, off its attention.
-            let hd = match &node.op {
-                SubOp::RopeRotate { head_dim, .. } => head_dim.get(),
-                SubOp::RopeAppend { attention, rope, .. } => rope.head_dim(*attention).get(),
-                _ => unreachable!("the arm's pattern binds one of the two rope kinds"),
-            };
+            let hd = node
+                .op
+                .rope_head_dim()
+                .expect("the arm's pattern binds one of the two rope kinds")
+                .get();
             let total = c;
             if hd == 0 || total % hd != 0 {
                 return Err(format!(

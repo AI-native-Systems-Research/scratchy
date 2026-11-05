@@ -193,7 +193,7 @@ pub fn expand_kv_codec(
     let mut dims: Vec<u32> = ops
         .iter()
         .filter_map(|od| match od.op {
-            SubOp::RopeAppend { attention, rope, .. } => Some(rope.head_dim(attention).get()),
+            SubOp::RopeAppend { .. } => od.op.rope_head_dim().map(|d| d.get()),
             SubOp::KvAppend { head_dim, .. } => Some(head_dim.get()),
             SubOp::AttnDecode { mask, attention, .. } => {
                 Some(attention.class(mask.class()).head_dim().get())

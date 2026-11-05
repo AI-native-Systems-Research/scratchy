@@ -1094,11 +1094,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // each class's table from the same list the macro bakes into the wiring — so THIS loop's set
     // (via the shared `rope_p_class_hds` helper) is the one source of truth for all three.
     let rope_class_hds = ktir_superdsc::reserved_tids::rope_p_class_hds(
-        ir.nodes.iter().filter_map(|n| match &n.op {
-            SubOp::RopeRotate { head_dim, .. } => Some(head_dim.get()),
-            SubOp::RopeAppend { attention, rope, .. } => Some(rope.head_dim(*attention).get()),
-            _ => None,
-        }),
+        ir.nodes.iter().filter_map(|n| n.op.rope_head_dim().map(|d| d.get())),
     );
     for (class, &hd) in rope_class_hds.iter().enumerate() {
         let tid = ktir_superdsc::reserved_tids::rope_p_class_tid(class);
@@ -2282,13 +2278,7 @@ pub fn dbg_synth_val(id: usize, j: usize) -> f32 {
 pub fn rope_table_periods<F: RopeForm>(ir: &SubtileIR<F>) -> std::collections::HashMap<u32, usize> {
     ir.nodes
         .iter()
-        .filter_map(|n| match &n.op {
-            SubOp::RopeRotate { head_dim, .. } => Some((n, head_dim.get() as usize / 2)),
-            SubOp::RopeAppend { attention, rope, .. } => {
-                Some((n, rope.head_dim(*attention).get() as usize / 2))
-            }
-            _ => None,
-        })
+        .filter_map(|n| n.op.rope_head_dim().map(|d| (n, d.get() as usize / 2)))
         .flat_map(|(n, half)| {
             n.inputs[1..3]
                 .iter()
