@@ -770,11 +770,16 @@ pub struct IndexSelectPage {
 /// each `[rows, cols]` block lands stick-major (`['x','out','y','mb']`), one after another, the
 /// frame the trip's batched restickify and contractions read a block of at its base.
 ///
-/// The landing is HBM, so no LX law bounds an entry's size. The ONE bound is the op's own index
-/// stick — `entries` ≤ [`crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP`] (32, one int32 stick) —
-/// which is this op's domain, not a device refusal: the walk composes around it by chunking
-/// (one op a run of entries, each at its own [`crate::superdsc_opspec::EntryBase`] and
-/// `dst_elems` landing offset), never by refusing an entry count.
+/// The landing goes where the scratchpad plan places it — HBM for a prefill trip's whole-page
+/// landing (shown by the splice's placement test: the in-body page gathers' destinations are
+/// Intermediate-segment synthetics, pinned nowhere in LX), and the decode trip's whole body —
+/// page gathers included — is LX by that trip's own plan, whose window guard is the build-time
+/// bound that a plan placing an entry there must satisfy. No LX law is stated BY THIS OP: the
+/// ONE bound is the op's own index stick — `entries` ≤
+/// [`crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP`] (32, one int32 stick) — which is this op's
+/// domain, not a device refusal: the walk composes around it by chunking (one op a run of
+/// entries, each at its own [`crate::superdsc_opspec::EntryBase`] and `dst_elems` landing
+/// offset), never by refusing an entry count.
 pub fn index_select_opspec(
     src: &str,
     dst: &str,

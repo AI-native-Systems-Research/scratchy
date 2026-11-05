@@ -5003,7 +5003,9 @@ fn lower_function_folded(
                     // none, so each gathered entry's plane is one block. Each `[rows, w]` block
                     // lands stick-major one after another (`batch_blocks`), the frame the trip's
                     // batched restickify and contractions read a block of at its base — so no
-                    // piece, no scaled index and no permute follows. Entries past one op's index
+                    // piece and no scaled index follows, and a permute follows only where the
+                    // frame is rank-2 over several multi-stick entries (below). Entries past one
+                    // op's index
                     // stick (`CopyDims::ENTRIES_PER_OP`, 32 — the op's own domain, not a device
                     // refusal) are chunked one op a run, each at its own entry base and landing
                     // offset: no entry count or size is refused.
@@ -5021,17 +5023,17 @@ fn lower_function_folded(
                             crate::work::FP16_ELEMS_PER_STICK
                         ));
                     }
-                    if to.len() < 3 && g.entries > 1 && w > stick as u64 {
-                        return err(format!(
-                            "{}: `{:?}` reads {} gathered planes as a rank-2 frame {w} wide — the \
-                             card frame of a `[rows, {w}]` tensor is stick-major, which \
-                             interleaves the entries' stick planes; state the frame's blocks (a \
-                             rank ≥ 3 `[..., blocks, rows, {w}]`) so each entry's blocks land whole",
-                            f.name,
-                            op.op_type,
-                            g.entries
-                        ));
-                    }
+                    // ⭐ THE RANK-2 FRAME, RESTICKIFIED — a `[T, w]` read of several gathered
+                    // planes wider than one stick. The card frame of a `[T, w]` tensor is ONE
+                    // stick column over all `T` rows, while the gather lands each entry's blocks
+                    // stick-major one after another — the same bytes exactly when there is one
+                    // block or one stick (a single entry, or `w` one stick wide, where the
+                    // landing IS the frame and nothing follows). Otherwise the entries land as
+                    // ONE-ROW blocks — row-major `[T, w]`, the same bytes the op reads — and one
+                    // whole stick permute restickifies them into the frame's own column: the
+                    // restickify the consumer's reshape used to perform (the deleted
+                    // `page_to_sticks` arm), stated here at the landing that needs it.
+                    let restickify = to.len() < 3 && g.entries > 1 && w > stick as u64;
                     let r = if to.len() >= 3 {
                         u64::try_from(to[to.len() - 2]).unwrap_or(0)
                     } else {
@@ -5064,6 +5066,103 @@ fn lower_function_folded(
                             ),
                         })
                     };
+                    if restickify {
+                        // The landing: one-row blocks — each entry's plane as `slab / w` blocks
+                        // of `[1, w]`, a stick-major one-row block being that row's own bytes —
+                        // so the whole landing is row-major `[T, w]` in a minted scratch. The
+                        // frame: one stick column over all `T` rows, the same buffer every
+                        // rank-2 `[T, w]` value holds, one whole permute away.
+                        let bpe = u32_of(slab / w, "blocks an entry")?;
+                        let w32 = u32_of(w, "block width")?;
+                        let t_rows = u32_of(total / w, "landing rows")?;
+                        let sticks = u32_of(w / stick as u64, "landing sticks")?;
+                        let land_tid =
+                            mint_scratch(k, layout, floor, res, Scratch::RelayoutMid);
+                        layout.synth(crate::place::PlaceId::Act(land_tid), &[t_rows, w32]);
+                        let land = Region {
+                            tid: land_tid,
+                            v_rows: t_rows,
+                            v_cols: w32,
+                            r_start: 0,
+                            c_start: 0,
+                            r_len: t_rows,
+                            c_len: w32,
+                            r_cover: (0, t_rows),
+                            c_cover: (0, w32),
+                            is_out: true,
+                            is_fp8: false,
+                            band: None,
+                        };
+                        let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+                        let mut emitted = 0u32;
+                        while emitted < g.entries {
+                            let n = cap.min(g.entries - emitted);
+                            let base = crate::superdsc_opspec::EntryBase::of_entries(
+                                g.first_entry.entries() + emitted,
+                            )
+                            .map_err(|message| Error {
+                                message: format!("{}: {message}", f.name),
+                            })?;
+                            out.push(
+                                crate::ir::bridge::tiled_op_sdsc_op::assemble_index_select(
+                                    &format!(
+                                        "gather{}_o{land_tid}",
+                                        if emitted == 0 {
+                                            String::new()
+                                        } else {
+                                            emitted.to_string()
+                                        }
+                                    ),
+                                    &crate::place::act_name(g.value_tid),
+                                    &land.name(),
+                                    crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                                        crate::place::act_name(g.index_tid),
+                                        crate::superdsc_opspec::PageExtent::of_positions(1),
+                                        base,
+                                    ),
+                                    crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage {
+                                        entries: n,
+                                        blocks: bpe,
+                                        rows: 1,
+                                        cols: w32,
+                                        dst_elems: u32_of(
+                                            u64::from(emitted) * u64::from(bpe) * w,
+                                            "landing offset",
+                                        )?,
+                                    },
+                                    sym_id_base,
+                                    Some(layout),
+                                )
+                                .map_err(|message| Error {
+                                    message: format!("{}: {message}", f.name),
+                                })?,
+                            );
+                            emitted += n;
+                        }
+                        let tid = mint_inter(k, layout, floor, res);
+                        let dst = stick_major_region(tid, t_rows, sticks, layout);
+                        out.push(permute(
+                            f.name,
+                            &Region {
+                                is_out: false,
+                                ..land
+                            },
+                            &dst,
+                            Permuted::whole((t_rows, sticks)),
+                            crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                            sym_id_base,
+                            Some(layout),
+                        )?);
+                        gather_carried[gi] = true;
+                        inter.insert(
+                            res,
+                            Region {
+                                is_out: false,
+                                ..dst
+                            },
+                        );
+                        continue;
+                    }
                     let bpe = u32_of(slab / (r * w), "blocks an entry")?;
                     let r = u32_of(r, "block rows")?;
                     let w32 = u32_of(w, "block width")?;
@@ -5121,7 +5220,10 @@ fn lower_function_folded(
                         emitted += n;
                     }
                     gather_carried[gi] = true;
-                    if let Some(c) = block_landing_cols(w32, stick) {
+                    // A rank ≥ 3 frame stated its blocks, so the landing registers them; a rank-2
+                    // frame stated none, and its landing — one stick column, per-entry one-stick
+                    // blocks, or the restickified column above — is the flat frame's own bytes.
+                    if to.len() >= 3 && let Some(c) = block_landing_cols(w32, stick) {
                         batch_blocks.insert(tid, c);
                     }
                     inter.insert(
@@ -7466,7 +7568,8 @@ fn row_major_region(tid: u32, rows: u32, layout: &BundleLayout) -> Region {
 /// wide), and a one-stick landing is the flat frame's own bytes at ANY batch count. The batch
 /// extent is not an input — that is the law. The wiring — both page-gather arms insert through
 /// this — is pinned by the golden door rows: the `(4, 1, 128)` rows refuse without the blocks
-/// arm's call and pass with it.
+/// arm's call and pass with it. A RANK-2 frame states no blocks, so its landing registers none
+/// (the call sites gate on the frame's rank): its landing is the flat frame's own bytes.
 fn block_landing_cols(cols: u32, stick: i64) -> Option<u32> {
     (cols > stick as u32).then_some(cols)
 }
