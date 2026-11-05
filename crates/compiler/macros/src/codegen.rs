@@ -16580,8 +16580,8 @@ mod tests {
     #[test]
     fn the_fill_states_the_frozen_scale_bit_for_bit_over_every_config() {
         // FROZEN: main's `weight_vocab::attention_scale_for`, transcribed expression
-        // for expression. Priority: granite's `attention_multiplier` (a direct
-        // override) → gemma's `query_pre_attn_scalar.powf(-0.5)` → `1/sqrt(head_dim)`.
+        // for expression. Priority, by the config key itself: `attention_multiplier`
+        // (a direct override) → `query_pre_attn_scalar.powf(-0.5)` → `1/sqrt(head_dim)`.
         fn frozen_attention_scale_for(model: &ModelParams) -> f32 {
             if let Some(s) = model.scalars.get("attention_multiplier") {
                 return *s as f32;
