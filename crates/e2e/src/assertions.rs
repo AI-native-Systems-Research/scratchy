@@ -342,8 +342,8 @@ pub fn check_logprobs_close(golden: &GoldenResult, engine: &EngineOutput, prompt
 /// decode steps that a strict 10-position exact-match bar isn't
 /// physically achievable against `bitsandbytes.matmul_4bit` (a
 /// fused-dequant-GEMM that accumulates in a different order than
-/// scratchy's dequant-then-cuBLAS-GEMM, beyond the ULP-level bf16
-/// noise AWQ/GPTQ see).
+/// scratchy's dequant-then-GEMM, beyond the ULP-level bf16 noise
+/// AWQ/GPTQ see).
 pub fn check_logprobs_close_with_threshold(
     golden: &GoldenResult,
     engine: &EngineOutput,

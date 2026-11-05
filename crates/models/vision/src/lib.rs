@@ -200,8 +200,7 @@ impl VisionConfig {
     /// [`Self::build_rope_cos_sin_bf16`] but emits the raw angles
     /// `theta = pos * inv_freq` instead of their cos/sin — the metal
     /// `vision_rope_2d` kernel reads `freqs` and computes cos/sin
-    /// internally, whereas the cuda `vision_rope_apply` kernel consumes
-    /// the precomputed cos/sin from `build_rope_cos_sin_bf16`.
+    /// internally.
     pub fn build_rope_freqs_f32(&self, grid_thw: &[(u32, u32, u32)], total_l: usize) -> Vec<f32> {
         let head_dim = self.head_dim();
         let half_rot = head_dim / 2;
@@ -545,19 +544,6 @@ impl VisionConfig {
     }
 } // impl VisionConfig (patch flatten)
 
-// ── K-pad to multiple of 8 ─────────────────────────────────────────
-//
-// cuBLAS BF16 GEMM rejects K=3420 (Qwen2.5-VL-3B intermediate_size)
-// with `CUBLAS_STATUS_INTERNAL_ERROR`; padding K to the next multiple
-// of 8 lands the GEMM on an algo cuBLAS supports. Tail columns are
-// zero so `out[i, j] = sum_k input[i, k] * weight[j, k]` is unchanged
-// when the activation feeds zeros into those padded columns (paired
-// with the activation-side packer at the call site).
-
-// CUDA device-side vision helpers (`pad_linear_k_to_mult8`) live in
-// `scratchy-target-cuda::vision_device` — they name CUDA runtime
-// types, kept out of this backend-neutral host-glue crate.
-
 // ── Slice helpers ──────────────────────────────────────────────────
 
 pub fn f32_to_bf16(v: f32) -> u16 {
@@ -710,7 +696,7 @@ fn invert_permutation(perm: &[u32]) -> Vec<u32> {
 /// row permutation over an f32 table. Used for the metal `freqs`
 /// angle extern on windowed towers (Qwen2.5-VL): the `vision_rope_2d`
 /// kernel reads per-token angle rows, so window-permuted tokens need
-/// window-permuted rows exactly like the cuda cos/sin tables.
+/// window-permuted rows.
 pub fn permute_rows_block_grouped_f32(
     src: &[f32],
     total_l: usize,

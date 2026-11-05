@@ -310,8 +310,6 @@ mod green_gate {
             draft_ring: None,
             #[cfg(feature = "metal")]
             draft: None,
-            #[cfg(feature = "nccl")]
-            tp_group: None,
             device_inputs: &[],
             deferred: None,
             reads: scratchy_target_metal::ForwardReads::Outputs,

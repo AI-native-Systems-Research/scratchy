@@ -696,7 +696,7 @@ impl SpyreWorker {
 
         // Load on-disk weights into a host GpuWeights, then resolve the compiled
         // arch through scratchy's registry (fingerprint) — exactly like the
-        // cuda/metal workers. NO stem-glob, NO ~/.cache read: the matched
+        // metal worker. NO stem-glob, NO ~/.cache read: the matched
         // ScratchyWeights carries the macro-embedded KTIR bundle.
         let _t_gw = std::time::Instant::now();
         let mut gw = GpuWeights::from_dir(&model_dir, SpyreAllocator::new())
@@ -726,7 +726,7 @@ impl SpyreWorker {
         // Fetch the embedded KTIR bundle (spyre's forward representation) for THIS
         // checkpoint — READ-ONLY (fingerprint sniff), leaving every tensor in `gw`
         // for the destructive byte extraction below. spyre's typed `Weights::load`
-        // is real (it builds the same fielded struct cuda/metal do), but the KTIR
+        // is real (it builds the same fielded struct metal does), but the KTIR
         // runner streams raw weights, so the worker takes spyre's forward path
         // here instead. The fingerprint (`gw` shapes + `hf_fp`) discriminates
         // variants: an arch registers many distinct base models (llama-2-13b …
@@ -742,7 +742,7 @@ impl SpyreWorker {
         // bundle could come from one and the weights from another.
         //
         // `try_load` runs the GENERATED `Weights::load` — the same loader
-        // cuda/metal use — and the bundle, the weight binding and the embed
+        // metal uses — and the bundle, the weight binding and the embed
         // table are all read off THAT model.
         let _t_try = std::time::Instant::now();
         let model = scratchy_forward_compiler::try_load(

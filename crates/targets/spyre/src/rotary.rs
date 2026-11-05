@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// The rotary loader mirrors cuda/metal's multi-arg `new_*` signatures.
+// The rotary loader's `new_*` constructors take many args.
 #![allow(clippy::too_many_arguments)]
 //! Rotary positional embedding cache — Spyre (host/KTIR) runtime half.
 //!
@@ -14,15 +14,14 @@
 //! exactly as the metal `load` body does.
 //!
 //! The macro additionally brings [`CudaRotaryExt`] into scope
-//! (`use crate::__gpu::rotary::CudaRotaryExt as _;`) so the cuda-shaped load
-//! body's path-syntax `RotaryCache::new_*_from_stream(...)` calls resolve under
-//! every target. Spyre keeps the trait name (the macro imports it by that name)
-//! and mirrors the cuda method set, but the stream-based constructors are
-//! genuinely stream/device-bound — Spyre has no CUDA stream — so they
+//! (`use crate::__gpu::rotary::CudaRotaryExt as _;`) so the load body's
+//! path-syntax `RotaryCache::new_*_from_stream(...)` calls resolve. Spyre keeps
+//! the trait name (the macro imports it by that name), but the stream-based
+//! constructors are stream/device-bound — Spyre has no device stream — so they
 //! `anyhow::bail!` with a recoverable error. The working host path is the
 //! `*_from_gpuweights` inherent constructors; a Spyre `load` never reaches the
 //! `*_from_stream` arms (it emits the GpuWeights-based ones), but they must
-//! still type-check so the shared cuda-shaped body compiles.
+//! still type-check so the shared load body compiles.
 
 // Re-export the neutral rotary types/config (RotaryCache, *RopeScaling, …) so
 // `crate::__gpu::rotary::RotaryCache` resolves. The glob also brings them into
@@ -33,22 +32,22 @@ use crate::dtype::DType;
 use anyhow::Result;
 
 /// Spyre [`RotaryCache`] stream-based constructors. Extension trait over the
-/// neutral type, mirroring `scratchy_target_cuda::rotary::CudaRotaryExt` so the
-/// macro-emitted load body's `use crate::__gpu::rotary::CudaRotaryExt as _;`
-/// resolves under `-Fspyre` (bring it into scope with that import).
+/// neutral type so the macro-emitted load body's
+/// `use crate::__gpu::rotary::CudaRotaryExt as _;` resolves under `-Fspyre`
+/// (bring it into scope with that import).
 ///
-/// Spyre is a host backend with no CUDA stream, so the `*_from_stream`
+/// Spyre is a host backend with no device stream, so the `*_from_stream`
 /// constructors here are not the working load path — the macro's spyre body
 /// builds the cache through the neutral `RotaryCache::new_*_from_gpuweights`
 /// inherent constructors (allocator-generic host trig + `WeightSource` upload).
-/// These trait methods exist for signature parity with the cuda surface and
+/// These trait methods exist so the shared load body type-checks and
 /// return a recoverable [`anyhow::Error`] if ever called on Spyre.
 pub trait CudaRotaryExt: Sized {
-    /// Build the cos/sin cache (cuda: on GPU via the device's default stream).
+    /// Build the cos/sin cache on a device stream.
     /// Not the Spyre host path — use `RotaryCache::new_from_gpuweights`.
     ///
     /// # Safety
-    /// Mirrors the cuda signature; the Spyre body performs no unsafe work.
+    /// The Spyre body performs no unsafe work.
     unsafe fn new_from_stream(
         head_dim: usize,
         max_pos: usize,
@@ -62,7 +61,7 @@ pub trait CudaRotaryExt: Sized {
     /// Not the Spyre host path.
     ///
     /// # Safety
-    /// Mirrors the cuda signature; the Spyre body performs no unsafe work.
+    /// The Spyre body performs no unsafe work.
     unsafe fn new_longrope_from_stream(
         head_dim: usize,
         max_pos: usize,
@@ -77,7 +76,7 @@ pub trait CudaRotaryExt: Sized {
     /// Not the Spyre host path.
     ///
     /// # Safety
-    /// Mirrors the cuda signature; the Spyre body performs no unsafe work.
+    /// The Spyre body performs no unsafe work.
     unsafe fn new_partial_longrope_from_stream(
         head_dim: usize,
         rotary_dim: usize,
@@ -93,7 +92,7 @@ pub trait CudaRotaryExt: Sized {
     /// Not the Spyre host path.
     ///
     /// # Safety
-    /// Mirrors the cuda signature; the Spyre body performs no unsafe work.
+    /// The Spyre body performs no unsafe work.
     unsafe fn new_yarn_from_stream(
         rope_head_dim: usize,
         max_pos: usize,
@@ -107,7 +106,7 @@ pub trait CudaRotaryExt: Sized {
     /// Not the Spyre host path — use `RotaryCache::new_partial_from_gpuweights`.
     ///
     /// # Safety
-    /// Mirrors the cuda signature; the Spyre body performs no unsafe work.
+    /// The Spyre body performs no unsafe work.
     unsafe fn new_partial_from_stream(
         head_dim: usize,
         rotary_dim: usize,

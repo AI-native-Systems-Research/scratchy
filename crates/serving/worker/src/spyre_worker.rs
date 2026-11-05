@@ -23,7 +23,7 @@
 // Force the linker to keep every compiled arch crate (and thus its
 // `ScratchyArchRegistration` `inventory::submit!`) — otherwise the model crates,
 // referenced only via the inventory registry, get dead-stripped and `try_load`
-// finds an empty registry. (The cuda/metal path does the same in `gpu_worker`,
+// finds an empty registry. (The metal path does the same in `gpu_worker`,
 // which isn't compiled under spyre.)
 extern crate scratchy_models as _;
 
@@ -89,8 +89,8 @@ pub struct SpyreWorker {
     pub(crate) seating: Option<(crate::spyre_types::RungId, Vec<String>)>,
     /// ⭐ THE HOST'S PER-REQUEST BLOCK TABLE, IN THE STRUCT THE ENGINE ALREADY DEFINES FOR IT.
     ///
-    /// `InputBatch` (`crates/serving/engine/src/input_batch.rs`) is backend-neutral and is what cuda and
-    /// metal store their block tables in; its `update_blocks` carries the rule a private copy in this
+    /// `InputBatch` (`crates/serving/engine/src/input_batch.rs`) is backend-neutral and is what metal
+    /// stores its block tables in; its `update_blocks` carries the rule a private copy in this
     /// worker got wrong — *"The scheduler ships the FULL table each step, so this REPLACES (not
     /// appends)"*. This path used to keep its own `Vec<usize>` per request (and before that, pages the
     /// worker ALLOCATED ITSELF from a free list, which is what made a prefix-cache hit meaningless).
@@ -103,8 +103,8 @@ pub struct SpyreWorker {
     /// WHAT FRACTION OF THE CARD THIS RUN MAY SPEND — `--gpu-memory-utilization`, as the CLI gave it.
     ///
     /// ⛔ SPYRE IGNORED THIS FLAG ENTIRELY, because its KV budget was a constant and a constant has no
-    /// fraction to take. cuda and metal both size from `total_memory * utilization`, so the flag meant
-    /// something on two backends out of three.
+    /// fraction to take. Metal sizes from `total_memory * utilization`, so the flag meant
+    /// something on one backend and not the other.
     pub(crate) gpu_memory_utilization: f64,
 }
 
@@ -157,8 +157,8 @@ impl SpyreWorker {
 
 /// Spyre / KTIR backend factory. Registered with `inventory::submit!` so the
 /// backend-neutral `create_worker` (engine's `WorkerFactory` registry) finds it
-/// without naming `SpyreWorker` — the same seam cuda/metal register through. In
-/// a spyre-only build (mutually exclusive with cuda/metal) `"auto"` resolves
+/// without naming `SpyreWorker` — the same seam metal registers through. In
+/// a spyre build (mutually exclusive with metal) `"auto"` resolves
 /// here, so `scr chat` without an explicit `--device` serves on spyre.
 pub struct SpyreWorkerFactory;
 

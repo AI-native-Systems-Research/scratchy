@@ -34,9 +34,8 @@ use scratchy_tensors::{DeviceAllocator, GpuWeightsHandle, LoadStream};
 /// The weight parameter is the allocator-erased [`GpuWeightsHandle`] — the
 /// macro-emitted closure recovers the concrete `&mut GpuWeights<A>` the
 /// per-variant `Weights::load` loaders need. The stream parameter is the
-/// backend-neutral [`LoadStream`] (cuda `CUstream`; `()` elsewhere), not the
-/// cuda-only `CUstream` type, so the signature is identical across backends and
-/// a third target slots into the same registry.
+/// backend-neutral [`LoadStream`] (`()` on metal and spyre), so the signature
+/// is identical across backends and a new target slots into the same registry.
 pub type ArchTryLoadFn = fn(
     GpuWeightsHandle<'_>,
     LoadStream,
@@ -94,8 +93,8 @@ pub struct ScratchyArchRegistration {
     /// variant, …).
     pub try_load: ArchTryLoadFn,
     /// Read-only accessor for this arch's embedded KTIR bundle — spyre's forward
-    /// representation (the peer of cuda's `FORWARD_TABLE` / metal's
-    /// `METAL_BUCKETS`). `Some` under `-Fspyre`, `None` under cuda/metal (whose
+    /// representation (the peer of metal's `METAL_BUCKETS`). `Some` under
+    /// `-Fspyre`, `None` under metal (whose
     /// forward runs through device kernels, not a bundle). Returned as a neutral
     /// `&dyn Any` (this cfg-free crate cannot name the spyre `KtirBundle`); the
     /// spyre worker downcasts it.
@@ -263,7 +262,7 @@ pub fn resolve_mm_metadata(hf_arches: &[String]) -> Option<&'static ScratchyMmRe
 ///   entry.
 ///
 /// Returning them as data rather than a collapsed `Option` is what lets every
-/// caller — the metal main and draft paths, cuda, spyre — map each to its own
+/// caller — the metal main and draft paths, spyre — map each to its own
 /// error without re-deriving the registry filter.
 pub enum ArchLoad {
     Loaded(Box<dyn ScratchyWeights>),

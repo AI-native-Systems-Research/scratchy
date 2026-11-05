@@ -48,22 +48,22 @@ and every tile of every operation must fit. Overflow it and you don't
 get an error message; you get `DtException 1535` on the card, minutes
 later, about a tile you can no longer inspect. Because scratchy knows
 every tile size at compile time, that fault is a `cargo build` error on
-your laptop instead. CUDA and Apple Silicon are also supported, and
-were the easier cases.
+your laptop instead. Apple Silicon is also supported, and was the
+easier case.
 
 ## Key Numbers
 
-- Very small AoT binaries, e.g. 30Mi for Metal, 100Mi for Spyre, 250Mi for Cuda.
+- Very small AoT binaries, e.g. 30Mi for Metal, 100Mi for Spyre.
 - Very small docker images, e.g. 330Mi for Spyre.
 - Fast startup time, e.g. 300ms warm startup on Apple Silicon *independent of model size*; 12s for 8B on Spyre.
-- 25 architectures in 1,580 lines of DSL; supporting Spyre took about as much Rust as supporting CUDA, and cost *zero* lines of model code.
+- 25 architectures in 1,580 lines of DSL; supporting Spyre cost *zero* lines of model code.
 
 ## Getting Started
 
 Install a recent [Rust toolchain](https://rustup.rs/). Then, pick your
 target via [feature
 flag](https://doc.rust-lang.org/cargo/reference/features.html):
-`-Fcuda` requires the CUDA build toolkit; `-Fmetal` requires macOS 26.2
+`-Fmetal` requires macOS 26.2
 or newer (and its Xcode SDK);
 `-Fspyre` requires the Spyre build toolkit.  For example, you can
 compile support for Apple Silicon, the Llama 3.2 3B models, and the
@@ -100,7 +100,7 @@ Note the convention for selecting models and quants:
   build wants `--no-default-features`. See [`docs/BUILD.md`](docs/BUILD.md).
 - TurboQuant KV-cache compression is **on with `metal`**, for every model
   whose geometry takes it (the build names the ones that stay dense); off for
-  cuda and spyre, and fixed at build time: `--kv-cache-dtype` can only assert
+  spyre, and fixed at build time: `--kv-cache-dtype` can only assert
   it. `metal-base` in place of `metal` builds the same engine with a dense KV
   cache and no MTP heads (`metal-base,model/mtp-heads` keeps MTP).
 

@@ -96,7 +96,7 @@ impl CacheableTokens {
 /// that is not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum KvAddressing {
-    /// Key `n` lives at slot `n`: cuda, metal, and every backend whose pool is indexed by token. The
+    /// Key `n` lives at slot `n`: metal, and every backend whose pool is indexed by token. The
     /// default, so a backend that says nothing keeps the arithmetic it always had.
     #[default]
     ByToken,
@@ -244,7 +244,7 @@ impl KvSlotSpan {
     /// appends one decode token leaves the shallow row exactly one page short. So the three terms are maxed —
     /// `writing` is NOT added to `reach`, because `reach` already contains the deepest row's append.
     ///
-    /// `reach` is [`KvSlotSpan::NONE`] on every token-addressed backend (cuda/metal), and the arithmetic is then
+    /// `reach` is [`KvSlotSpan::NONE`] on every token-addressed backend (metal), and the arithmetic is then
     /// exactly what it always was for them.
     pub fn slots_this_step(self, reach: KvSlotSpan, own_tokens: usize, writing: usize) -> usize {
         (self.get() as usize + writing)
@@ -552,8 +552,8 @@ mod step_reach_proofs {
         );
     }
 
-    /// A TOKEN-ADDRESSED BACKEND IS UNTOUCHED. cuda and metal report no pool reach, so they pass
-    /// [`KvSlotSpan::NONE`] and must get byte-identical arithmetic to what they had before the reach existed.
+    /// A TOKEN-ADDRESSED BACKEND IS UNTOUCHED. metal reports no pool reach, so it passes
+    /// [`KvSlotSpan::NONE`] and must get byte-identical arithmetic to what it had before the reach existed.
     #[kani::proof]
     fn no_reach_is_the_arithmetic_that_was_there_before() {
         let (span, _reach, _block, own, writing) = inputs();

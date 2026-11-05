@@ -103,34 +103,3 @@ fn every_gemma2_config_was_compiled() {
     let _: usize = gemma2_9b::NUM_TILES;
     let _: usize = gemma2_27b::NUM_TILES;
 }
-
-// `every_workload_bucket_solved_for_gemma2_2b` and
-// `gemma2_predicted_us_is_finite_and_monotonic_in_m` used to read
-// per-bucket `m_<N>::PREDICTED_US`. The cost-monotonicity invariant
-// (prefill ≫ decode) lives in `solver::tests::
-// prefill_cost_dwarfs_decode_cost`, which calls `solve()` directly
-// for `llama-3.2-1b` — gemma2 shares the same cost model, so the
-// llama-side check is a sufficient regression guard for the silent-
-// drop-to-zero bug class. The per-bucket `m_X[_sk_Y]` stub modules
-// are no longer emitted (~9k lines saved workspace-wide).
-
-#[test]
-fn arch_level_weights_enum_and_dispatch_exist_for_gemma2() {
-    // The compiler emitted the arch-level `Weights` enum, its
-    // per-model variants, and the dispatching `forward` fn.
-    #[cfg(feature = "cuda")]
-    {
-        fn _probe_2b(w: gemma2_2b::Weights) -> Weights {
-            Weights::Gemma2_2b(w)
-        }
-        fn _probe_9b(w: gemma2_9b::Weights) -> Weights {
-            Weights::Gemma2_9b(w)
-        }
-        fn _probe_27b(w: gemma2_27b::Weights) -> Weights {
-            Weights::Gemma2_27b(w)
-        }
-        let _: fn(gemma2_2b::Weights) -> Weights = _probe_2b;
-        let _: fn(gemma2_9b::Weights) -> Weights = _probe_9b;
-        let _: fn(gemma2_27b::Weights) -> Weights = _probe_27b;
-    }
-}

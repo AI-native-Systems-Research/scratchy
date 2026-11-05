@@ -9,11 +9,10 @@
 //! The generated forward fns and the metal worker name
 //! `::scratchy_target_metal::ForwardCtx` directly.
 //!
-//! This is the metal sibling of the cuda `ForwardCtx`: the vision fields are
-//! unconditional (metal is the only configuration here), the rows a forward
-//! samples are its `sampled_rows` (a verify step's every row too, so it needs no
-//! speculative flag), and the cuda-only nccl `tp_group` field is absent (metal
-//! is single-device).
+//! The vision fields are unconditional (metal is the only configuration
+//! here), the rows a forward samples are its `sampled_rows` (a verify step's
+//! every row too, so it needs no speculative flag), and there is no `tp_group`
+//! field (metal is single-device).
 
 use crate::TensorView;
 use crate::gdn_state::GdnStatePool;

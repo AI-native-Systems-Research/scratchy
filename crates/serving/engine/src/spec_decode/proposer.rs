@@ -89,7 +89,7 @@ pub struct DraftSeedInputs {
     ///
     /// Both vectors are indexed parallel to `req_ids` /
     /// `cu_seqlens_q`. Empty when the backend hasn't wired
-    /// speculative chain (CUDA, the in-proposer pre-Phase-9 path).
+    /// speculative chain (the in-proposer pre-Phase-9 path).
     pub speculative_seeds: Vec<u32>,
     pub speculative_chain_drafts: Vec<Vec<u32>>,
 }
@@ -464,7 +464,7 @@ impl DraftModelProposer {
         // ── 3. Phase 6 fast path: one CB drives K forward + argmax +
         //       chain_advance dispatches. Falls back to the iter-loop
         //       when the backend hasn't implemented the chain
-        //       primitive yet (CUDA, etc.).
+        //       primitive yet.
         {
             let iter0_req = ForwardArgmaxRequest {
                 input_ids: &current_tokens,
@@ -516,8 +516,8 @@ impl DraftModelProposer {
         }
 
         // ── 3b. Loop fallback. K host-driven forward+argmax calls,
-        //       one commit + wait each. Used by backends (CUDA today)
-        //       that haven't wired the chain primitive.
+        //       one commit + wait each. Used by backends that haven't
+        //       wired the chain primitive.
         let mut step_positions = iter0_positions;
         let mut step_slot_mapping = iter0_slot;
         let mut step_seqused_k = iter0_seqused_k;

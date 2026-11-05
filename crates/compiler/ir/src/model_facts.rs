@@ -700,7 +700,7 @@ impl ModelFacts {
 }
 
 /// ⭐ THE RAW SPELLINGS: the facts as `CanonicalParams`' numeric consts spell them, for the readers that
-/// still take numbers (the runtime, cuda's interpreter): `0` (or `-1`, `0.0`, `false`) where the model
+/// still take numbers (the runtime): `0` (or `-1`, `0.0`, `false`) where the model
 /// lacks the group. The one place these spellings are derived; `CanonicalParams`' defaults call them.
 ///
 /// A vision-only body's text consts are its tower's (the fill's long-standing rule): its head dim,

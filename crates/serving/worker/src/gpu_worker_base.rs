@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Shared GPU worker utilities.
 //!
-//! Common logic used by all GPU-based `Worker` implementations (MetalWorker, CudaWorker,
-//! TkWorkerAdapter, etc.): memory estimation. Hand-written CUDA model forwards
-//! were removed; scratchy-forward-compiler owns model construction now, including its
-//! own HF-config parsing.
+//! Common logic used by the GPU-based `Worker` implementations (MetalWorker):
+//! memory estimation. scratchy-forward-compiler owns model construction,
+//! including its own HF-config parsing.
 //!
 //! Mirrors Python vLLM's `Worker` class which handles shared GPU plumbing
 //! while delegating model-specific execution to `GPUModelRunner`.

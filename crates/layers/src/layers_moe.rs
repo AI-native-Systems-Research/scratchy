@@ -3,14 +3,14 @@
 //!
 //! Weights are stored as `GpuTensor` (raw GPU pointers / metadata only). The
 //! struct/enum definitions and the pure `MoeRouting` borrow-bundle + the pure
-//! `select_moe_block_m` heuristic live here so both `targets/{cuda,metal}` can
-//! name them without a circular dependency. The kernel-calling `forward` passes
-//! and the `GpuWeights`-bound `load_*` constructors live in `targets/cuda` as
-//! per-type `*Ops` extension traits — this crate names no backend.
+//! `select_moe_block_m` heuristic live here so both `targets/{metal,spyre}` can
+//! name them without a circular dependency. The `GpuWeights`-bound `load_*`
+//! constructors live in the target crates as per-type `*Ops` extension traits —
+//! this crate names no backend.
 
 use scratchy_tensors::GpuTensor;
 
-use crate::{Fp8BlockLinear, GgmlLinear, Linear, LinearLayer};
+use crate::{Fp8BlockLinear, GgmlLinear, Linear};
 use scratchy_quantizations::ggml_quant::GgmlStorage;
 
 /// Dynamic BLOCK_M selection for fused MoE GEMM tiling.
@@ -31,8 +31,8 @@ pub fn select_moe_block_m(num_tokens: usize, top_k: usize, num_experts: usize) -
     }
 }
 
-/// Routing-stage configuration shared by every fused-MoE layer (BF16, FP8 scalar,
-/// FP8 block, Marlin, GGML). The four families differ only in how they consume
+/// Routing-stage configuration shared by every fused-MoE layer (BF16, FP8
+/// FP8 block, GGML). The families differ only in how they consume
 /// the resulting `(topk_weights, topk_ids)` — the *selection* logic is uniform.
 ///
 /// The three branches mirror Python vLLM's expert-selection paths:
@@ -47,40 +47,6 @@ pub struct MoeRouting<'a> {
     pub e_score_correction_bias: Option<&'a GpuTensor>,
     pub n_expert_group: usize,
     pub topk_group: usize,
-    pub routed_scaling_factor: f64,
-}
-
-// ---------------------------------------------------------------------------
-// DenseFusedMoELayer (cuda Dense MoE: Mixtral / Qwen2-MoE / Qwen3-MoE BF16)
-// ---------------------------------------------------------------------------
-
-/// Cuda-side Dense Mixture of Experts layer. The variant of the public
-/// [`FusedMoELayer`] enum that holds stacked BF16/F16 expert weights
-/// fed through `kernels::fused_moe_gemm`.
-///
-/// Weights are stored as stacked `[num_experts, dim, hidden]` tensors.
-/// Forward matches Python vLLM's `fused_experts_impl` exactly.
-pub struct DenseFusedMoELayer {
-    /// Gate projection: `[hidden_size, num_experts]`.
-    pub gate: Linear,
-    /// Stacked gate+up weights: `[num_experts, 2*intermediate_size, hidden_size]`.
-    pub w1: GpuTensor,
-    /// Stacked down weights: `[num_experts, hidden_size, intermediate_size]`.
-    pub w2: GpuTensor,
-    pub num_experts: usize,
-    pub top_k: usize,
-    pub intermediate_size: usize,
-    pub hidden_size: usize,
-    pub renormalize: bool,
-    /// `[num_experts]` F32 e_score_correction_bias for sigmoid routing (DeepSeek V3 / Kimi K2).
-    /// When `Some`, uses sigmoid top-k with bias instead of softmax top-k.
-    pub e_score_correction_bias: Option<GpuTensor>,
-    /// Number of expert groups for `noaux_tc` grouped routing (DeepSeek V3).
-    /// 0 = no group selection (flat top-k).
-    pub n_expert_group: usize,
-    /// Number of groups to select in grouped routing. 0 = disabled.
-    pub topk_group: usize,
-    /// Scaling factor applied to routing weights (default 1.0).
     pub routed_scaling_factor: f64,
 }
 
@@ -229,14 +195,8 @@ pub struct SwitchGluExpertsLayer {
     pub group_size: u32,
     pub bits: u32,
 
-    /// Native INT4 (Marlin) expert path — the cuda `gemma_moe_forward` uses
-    /// these instead of the dequant'd bf16 `expert_*_w` stacks when present
-    /// (cyankiwi `gemma-4-26B-A4B-it-AWQ-4bit`, compressed-tensors INT4). Keeps
-    /// experts INT4 in VRAM (~0.4 GiB) instead of bf16 (~43 GiB). `w1` is the
-    /// fused gate+up stacked Marlin weight `[E, hidden*2*moe_inter/8]`; `w2` is
-    /// down `[E, moe_inter*hidden/8]`; scales are `[E, num_groups, N]`; the
-    /// workspace is the Marlin barrier-lock buffer. `None` on the bf16 / MLX /
-    /// metal paths. `marlin_b_type_id` = 0 (kU4B8, compressed-tensors sym).
+    /// Native INT4 (Marlin) expert storage. No in-tree forward reads these;
+    /// every loader sets them to `None` / `0`.
     pub marlin_w1: Option<GpuTensor>,
     pub marlin_w2: Option<GpuTensor>,
     pub marlin_w1_scales: Option<GpuTensor>,
@@ -307,49 +267,20 @@ pub struct GptOssMoELayer {
 }
 
 // ---------------------------------------------------------------------------
-// FusedMoELayer (enum: Dense for cuda, Affine for metal)
+// FusedMoELayer (enum: Affine for metal)
 // ---------------------------------------------------------------------------
 
 /// Unified fused-MoE layer. Mirrors the [`crate::LinearLayer`]
 /// precedent: one public enum that holds the per-backend storage. The
 /// macro-emitted `WeightAccessors::fused_moe_at` returns a reference
 /// to this type, and the per-target Impls match on the variant they
-/// expect (the cuda `FusedMoeRefImpl` only fires on Dense MoE
-/// checkpoints; the Metal `MetalFusedMoeImpl` only fires on
-/// MLX-affine int4 checkpoints).
+/// expect (the Metal `MetalFusedMoeImpl` fires on MLX-affine int4
+/// checkpoints).
 pub enum FusedMoELayer {
-    /// Cuda Dense BF16/F16 MoE — Mixtral / Qwen-MoE / DeepSeek-MoE
-    /// reference path. Stacked `[E, 2*inter, hidden]` gate+up plus
-    /// `[E, hidden, inter]` down, fed through
-    /// `kernels::fused_moe_gemm`.
-    Dense(Box<DenseFusedMoELayer>),
     /// MLX-affine int4 MoE (Metal-only). Per-expert (W, scales,
     /// biases) triples + dense fp router; lowered to a 10-step ICB
     /// decomposition by `lower_moe_step`.
     Affine(Box<AffineFusedMoELayer>),
-}
-
-// ---------------------------------------------------------------------------
-// DenseSharedFusedMoELayer (cuda BF16 Qwen2/3 MoE with shared expert)
-// ---------------------------------------------------------------------------
-
-/// Cuda-side Dense MoE layer with optional shared expert (Qwen2 MoE,
-/// Qwen3 MoE). The variant of the public [`SharedFusedMoELayer`] enum
-/// holding the stacked dense expert weights + dense shared expert.
-///
-/// The shared expert runs in parallel with the MoE routing:
-/// ```text
-/// output = moe(hidden_states) + shared_expert_gate(hidden_states).sigmoid() * shared_expert(hidden_states)
-/// ```
-pub struct DenseSharedFusedMoELayer {
-    pub moe: FusedMoELayer,
-    /// Shared expert: fused gate+up projection `[2*intermediate, hidden]`.
-    pub shared_gate_up: Option<Linear>,
-    /// Shared expert: down projection `[hidden, intermediate]`.
-    pub shared_down: Option<Linear>,
-    /// Shared expert gate: `[1, hidden]` — sigmoid gate for shared expert output.
-    pub shared_expert_gate: Option<Linear>,
-    pub intermediate_size: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -403,11 +334,10 @@ pub struct AffineSharedFusedMoELayer {
 }
 
 // ---------------------------------------------------------------------------
-// SharedFusedMoELayer (enum: Dense for cuda, Affine for metal)
+// SharedFusedMoELayer (enum: Affine for metal)
 // ---------------------------------------------------------------------------
 
 pub enum SharedFusedMoELayer {
-    Dense(Box<DenseSharedFusedMoELayer>),
     Affine(Box<AffineSharedFusedMoELayer>),
 }
 
@@ -452,54 +382,12 @@ pub struct DeepSeekV2Fp8BlockMoELayer {
 }
 
 // ---------------------------------------------------------------------------
-// Fp8FusedMoELayer (FP8 E4M3 quantized MoE)
-// ---------------------------------------------------------------------------
-
-/// Fused Mixture of Experts layer with FP8 E4M3 quantized weights.
-///
-/// Forward pass matches Python vLLM's `fused_experts_impl` with `use_fp8_w8a8=True`:
-/// 1. Gate → router logits (dense BF16)
-/// 2. topk_softmax → topk weights + ids
-/// 3. scaled_fp8_quant_dynamic(hidden) → FP8 input + per-token scales
-/// 4. moe_align_block_size
-/// 5. fused_moe_fp8_gemm (GEMM 1: gate+up)
-/// 6. silu_and_mul activation
-/// 7. scaled_fp8_quant_dynamic(activated) → FP8 act + per-token scales
-/// 8. fused_moe_fp8_gemm (GEMM 2: down, with routing weight)
-/// 9. moe_sum → reduced output
-pub struct Fp8FusedMoELayer {
-    /// Gate projection: `[hidden_size, num_experts]` — always dense BF16.
-    pub gate: Linear,
-    /// Stacked gate+up weights: `[num_experts, 2*intermediate_size, hidden_size]` FP8 E4M3.
-    pub w1: GpuTensor,
-    /// Stacked down weights: `[num_experts, hidden_size, intermediate_size]` FP8 E4M3.
-    pub w2: GpuTensor,
-    /// Per-expert w1 scales: `[num_experts]` f32.
-    pub w1_scale: GpuTensor,
-    /// Per-expert w2 scales: `[num_experts]` f32.
-    pub w2_scale: GpuTensor,
-    pub num_experts: usize,
-    pub top_k: usize,
-    pub intermediate_size: usize,
-    pub hidden_size: usize,
-    pub renormalize: bool,
-    /// `[num_experts]` F32 e_score_correction_bias for sigmoid routing (DeepSeek V3 / Kimi K2).
-    /// `None` ⇒ softmax routing (Mixtral / Qwen MoE).
-    pub e_score_correction_bias: Option<GpuTensor>,
-    /// 0 ⇒ flat top-k. >0 with `topk_group` >0 ⇒ noaux_tc grouped routing.
-    pub n_expert_group: usize,
-    pub topk_group: usize,
-    pub routed_scaling_factor: f64,
-}
-
-// ---------------------------------------------------------------------------
 // Fp8BlockFusedMoELayer (FP8 block-quantized MoE)
 // ---------------------------------------------------------------------------
 
 /// Fused MoE layer with FP8 E4M3 block-quantized weights.
 ///
-/// Same pipeline as `Fp8FusedMoELayer` but uses per-block weight scales
-/// applied during the FP8→BF16 dequant step in the CUDA kernel.
+/// Stacked FP8 E4M3 routed experts with per-block weight scales.
 pub struct Fp8BlockFusedMoELayer {
     pub gate: Linear,
     /// Stacked gate+up weights: `[E, 2*inter, hidden]` FP8 E4M3.
@@ -517,27 +405,12 @@ pub struct Fp8BlockFusedMoELayer {
     pub intermediate_size: usize,
     pub hidden_size: usize,
     pub renormalize: bool,
-    /// See [`Fp8FusedMoELayer::e_score_correction_bias`].
+    /// `[num_experts]` F32 e_score_correction_bias for sigmoid routing
+    /// (DeepSeek V3 / Kimi K2). `None` ⇒ softmax routing.
     pub e_score_correction_bias: Option<GpuTensor>,
     pub n_expert_group: usize,
     pub topk_group: usize,
     pub routed_scaling_factor: f64,
-}
-
-// ---------------------------------------------------------------------------
-// Fp8SharedFusedMoELayer (Qwen2/3 MoE with FP8 experts)
-// ---------------------------------------------------------------------------
-
-/// FP8 MoE layer with optional shared expert.
-pub struct Fp8SharedFusedMoELayer {
-    pub moe: Fp8FusedMoELayer,
-    /// Shared expert: fused gate+up projection.
-    pub shared_gate_up: Option<Linear>,
-    /// Shared expert: down projection.
-    pub shared_down: Option<Linear>,
-    /// Shared expert gate: `[1, hidden]` — sigmoid gate for shared expert output.
-    pub shared_expert_gate: Option<Linear>,
-    pub intermediate_size: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +450,8 @@ pub struct GgmlFusedMoELayer {
     pub intermediate_size: usize,
     pub hidden_size: usize,
     pub renormalize: bool,
-    /// See [`Fp8FusedMoELayer::e_score_correction_bias`].
+    /// `[num_experts]` F32 e_score_correction_bias for sigmoid routing
+    /// (DeepSeek V3 / Kimi K2). `None` ⇒ softmax routing.
     pub e_score_correction_bias: Option<GpuTensor>,
     pub n_expert_group: usize,
     pub topk_group: usize,
@@ -603,63 +477,4 @@ pub struct DeepSeekV2GgmlMoELayer {
     pub shared_down: GgmlLinear,
     pub shared_intermediate_size: usize,
     pub routed_scaling_factor: f32,
-}
-
-// ---------------------------------------------------------------------------
-// MarlinFusedMoELayer (AWQ/GPTQ INT4 quantized MoE)
-// ---------------------------------------------------------------------------
-
-/// Fused Mixture of Experts layer using Marlin INT4 quantized weights.
-///
-/// Uses the `marlin_moe_gemm` kernel which fuses expert routing + Marlin
-/// INT4 GEMM + topk weight multiply into a single kernel per pass.
-///
-/// Forward matches Python vLLM's `_fused_marlin_moe` two-pass pattern.
-pub struct MarlinFusedMoELayer {
-    /// Gate projection: `[hidden_size, num_experts]` — always dense.
-    pub gate: Linear,
-    /// Stacked gate+up weights: `[E, K/tile, 2N*tile]` Marlin-packed.
-    pub w1: GpuTensor,
-    /// Stacked down weights: `[E, N/tile, K*tile]` Marlin-packed.
-    pub w2: GpuTensor,
-    /// Scales for w1: `[E, num_groups_w1, 2*intermediate_size]`.
-    pub w1_scales: GpuTensor,
-    /// Scales for w2: `[E, num_groups_w2, hidden_size]`.
-    pub w2_scales: GpuTensor,
-    /// Zero points for w1 (AWQ only): `[E, num_groups_w1, 2*intermediate/8]`.
-    pub w1_zeros: Option<GpuTensor>,
-    /// Zero points for w2 (AWQ only): `[E, num_groups_w2, hidden/8]`.
-    pub w2_zeros: Option<GpuTensor>,
-    /// Workspace for barrier synchronization: `[sms * 4]` i32.
-    pub workspace: GpuTensor,
-    pub num_experts: usize,
-    pub top_k: usize,
-    pub intermediate_size: usize,
-    pub hidden_size: usize,
-    pub group_size: usize,
-    pub has_zp: bool,
-    /// 1 = kU4 (AWQ), 0 = kU4B8 (GPTQ).
-    pub b_type_id: i32,
-    pub renormalize: bool,
-    /// See [`Fp8FusedMoELayer::e_score_correction_bias`].
-    pub e_score_correction_bias: Option<GpuTensor>,
-    pub n_expert_group: usize,
-    pub topk_group: usize,
-    pub routed_scaling_factor: f64,
-}
-
-// ---------------------------------------------------------------------------
-// MarlinSharedFusedMoELayer
-// ---------------------------------------------------------------------------
-
-/// MoE layer with optional shared expert, using Marlin quantized weights.
-pub struct MarlinSharedFusedMoELayer {
-    pub moe: MarlinFusedMoELayer,
-    /// Shared expert: fused gate+up (Marlin-quantized or dense Linear).
-    pub shared_gate_up: Option<LinearLayer>,
-    /// Shared expert: down projection.
-    pub shared_down: Option<LinearLayer>,
-    /// Shared expert gate: `[1, hidden]` — sigmoid gate for shared expert output.
-    pub shared_expert_gate: Option<Linear>,
-    pub intermediate_size: usize,
 }

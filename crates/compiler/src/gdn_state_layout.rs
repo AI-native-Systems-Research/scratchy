@@ -5,8 +5,7 @@
 //! Unlike the paged KV cache (one block-paged buffer shared by all attention
 //! layers), a GDN layer keeps **two** non-paged state buffers, sized **one
 //! slot per active sequence** (`num_slots = max_num_seqs`), NOT by token
-//! blocks. This mirrors the surviving CUDA kernels (`gdn_conv1d_*`,
-//! `gdn_recurrent_fwd`) whose state args are:
+//! blocks. The `gdn_*` kernels' state args are:
 //!
 //! ```text
 //!   conv_state : [num_slots, conv_dim, conv_state_len]   (conv_state_len = conv_kernel - 1)
@@ -43,7 +42,7 @@ pub struct GdnStateLayout {
 }
 
 /// Runtime GDN config a hybrid arch reports to the worker so it can size and
-/// allocate the `scratchy_target_cuda::gdn_state::GdnStatePool`. Backend-neutral:
+/// allocate the `scratchy_layers::gdn_state::GdnStatePool`. Backend-neutral:
 /// carries the per-layer dims + the per-global-layer linear-attention mask. The
 /// `num_slots` (= `max_num_seqs`) is supplied by the worker, not the model.
 ///

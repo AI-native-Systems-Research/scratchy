@@ -11,7 +11,6 @@ use std::time::Instant;
 
 use anyhow::Result;
 use scratchy_core_common::telemetry;
-use scratchy_core_config::{CudaGraphConfig, CudaGraphMode};
 use scratchy_serving_api::llm::{LLM, LLMBuilder, Prompt, SamplingParams};
 
 use crate::args::BenchThroughputArgs;
@@ -26,8 +25,7 @@ fn create_llm(args: &BenchThroughputArgs, model: &str) -> Result<LLM> {
         .max_num_seqs(args.max_num_seqs)
         .block_size(args.block_size)
         .tensor_parallel_size(args.tensor_parallel_size)
-        .enable_prefix_caching(!args.no_prefix_caching)
-        .enforce_eager(args.enforce_eager);
+        .enable_prefix_caching(!args.no_prefix_caching);
 
     if let Some(n) = args.max_num_batched_tokens {
         builder = builder.max_num_batched_tokens(n);
@@ -40,18 +38,6 @@ fn create_llm(args: &BenchThroughputArgs, model: &str) -> Result<LLM> {
     }
     if let Some(ref gguf) = args.gguf_file {
         builder = builder.gguf_file(gguf);
-    }
-
-    if !args.enforce_eager {
-        let sizes = CudaGraphConfig::parse_sizes(&args.cuda_graph_sizes);
-        if !sizes.is_empty() {
-            builder = builder.cuda_graph_config(CudaGraphConfig {
-                enabled: true,
-                mode: CudaGraphMode::default(),
-                capture_sizes: sizes,
-                num_warmups: 3,
-            });
-        }
     }
 
     builder.build()
