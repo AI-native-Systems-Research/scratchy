@@ -1482,7 +1482,7 @@ pub enum RuntimeBindingKind {
     /// with identity positions (`positions[t] = t`) it lets the unmodified
     /// 1D `rope_append_*`/fused-qkv-rope kernels read the correct row
     /// without an in-kernel band-split (option (b)). The lowering binds it in
-    /// place of the static cos/sin source when `MetalModelConsts::mrope`; the macro
+    /// place of the static cos/sin source when the attention has an MRoPE section (`Attention::mrope`); the macro
     /// forward builds + writes it per forward via `ForwardInputs`. 16-byte
     /// placeholder on 1D-rope arches (never bound).
     MropeCosSin,
@@ -2609,10 +2609,37 @@ impl PlayLive {
     }
 }
 
+/// The group of a model's facts ([`scratchy_ir::model_facts::ModelFacts`]) a step reads and the
+/// model lacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lacked {
+    /// A decoder's attention.
+    Attention,
+    /// The sliding layers' window.
+    SlidingWindow,
+    /// A vision tower.
+    Vision,
+    /// Gated-DeltaNet layers.
+    Gdn,
+    /// A DFlash2 drafter's geometry.
+    Drafter,
+    /// A feed-forward's inner width.
+    Intermediate,
+    /// An lm_head's vocabulary.
+    Vocab,
+    /// The final logits' soft cap.
+    FinalSoftcap,
+    /// The target a head reads.
+    Target,
+}
+
 /// Errors produced by the lowering pass. Every step kind lowers (the
 /// match over `MetalStep` is exhaustive), so these are malformed tapes.
 #[derive(Debug)]
 pub enum LoweringError {
+    /// A step reads a group of facts its model lacks: the tape and the model's facts disagree
+    /// about what the model is.
+    ModelLacks(Lacked),
     /// A `StepRow::Loop` whose body overran the step tape: the body
     /// extended past the end of the slice.
     /// Indicates malformed codegen — every tape the macro produces
@@ -2703,6 +2730,10 @@ pub enum RungScratch {
 impl std::fmt::Display for LoweringError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ModelLacks(lacked) => write!(
+                f,
+                "a step reads the model's {lacked:?}, and the model's facts state none"
+            ),
             Self::MalformedLoop {
                 index,
                 count,

@@ -2202,6 +2202,14 @@ mod tests {
         );
     }
 
+    /// This test process's own peak RSS, in the units `rss_to_mib` reads.
+    fn self_peak_rss_mib() -> f64 {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `ru` is an initialized local that getrusage only writes.
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) }, 0);
+        rss_to_mib(ru.ru_maxrss)
+    }
+
     /// A real child, reaped with wait4, must report ITS OWN usage.
     ///
     /// This is the regression guard for the bug a Metal run exposed: with
@@ -2233,11 +2241,18 @@ mod tests {
             big.peak_rss_mib,
             small.peak_rss_mib
         );
-        // The earlier, larger child must not leak into the later one.
+        // The earlier, larger child must not leak into the later one. Linux's
+        // exec records the old address space's high-water RSS into the child's
+        // ru_maxrss, and std spawns with a vfork-style posix_spawn that shares
+        // this process's, so /bin/echo's floor is this test process's own peak
+        // (which grows with the binary), not a fixed figure. The 64 MiB child
+        // leaking in would put it 64 MiB above that floor.
+        let own = self_peak_rss_mib();
         assert!(
-            small.peak_rss_mib < 32.0,
-            "/bin/echo reported {:.1} MiB",
-            small.peak_rss_mib
+            small.peak_rss_mib < own + 16.0,
+            "/bin/echo reported {:.1} MiB against this process's own {:.1} MiB",
+            small.peak_rss_mib,
+            own
         );
         // Per-child counters can be zero, never negative — a negative value is
         // the signature of subtracting two running totals.

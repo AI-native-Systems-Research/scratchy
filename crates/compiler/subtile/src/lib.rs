@@ -28,10 +28,9 @@ pub mod lower;
 /// work-divided SuperDSC (SDSC) bundle DeepTools' `dxp_standalone --bundle`
 /// compiles — the perf path that OWNS the 32-core work-division. (The old
 /// `lower_subtile_tape_to_sengraph` peer was DELETED — sengraph is a dead end.)
-/// The model's head geometry as types, and the two value→const doors whose arms the build script
-/// generated from `crates/models/arch/*/configs/*.json`. Always compiled: the tape carries a
-/// [`model_geometry::ModelAttnGeometry`] on every attention node, whatever the target. Except the
-/// attention-geometry door, whose body takes the SuperDSC emitter's witness: it is `spyre`-only.
+/// The model's head geometry as types, and the head-dim value→const door whose arms the build
+/// script generated from `crates/models/arch/*/configs/*.json`. Always compiled: the tape carries a
+/// [`model_geometry::ModelAttnGeometry`] on every attention node, whatever the target.
 pub mod model_geometry;
 pub mod subtile_ir;
 // ⭐ THE SuperDSC DEVICE FACTS, FROM THE `ktir-superdsc` LEAF CRATE: the typed SuperDSC IR
@@ -39,8 +38,7 @@ pub mod subtile_ir;
 // interpreter that PROVES the emitted SDSC attention computes the SubtileIR math
 // (`softmax(q·kᵀ·scale+mask)·v`) over the real device addresses, so a translation bug is a
 // `cargo build` panic rather than an on-card discovery. Re-exported so the Spyre lowering and
-// worker name them as `scratchy_subtile::sdsc_abstract::…` and `model_geometry`'s attention door
-// names `AttnGeometry` through `crate::sdsc_abstract`.
+// worker name them as `scratchy_subtile::sdsc_abstract::…`.
 //
 // ⛔ GATED ON `spyre`, WITH THE DEPENDENCY. Nothing a metal or cuda build compiles names these, so
 // those builds leave the whole `ktir-superdsc`/`ktir-core` graph out.

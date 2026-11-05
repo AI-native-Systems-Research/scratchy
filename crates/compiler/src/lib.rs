@@ -54,7 +54,7 @@ pub use scratchy_ir::{pack_moe_expert_bits, unpack_moe_expert_bits};
 // `scratchy_tensors::{MetalDtype, ScaleDtype}` enums), so the
 // re-exports are unconditional and the macro path
 // `::scratchy_forward_compiler::CanonicalParams` keeps resolving.
-pub use scratchy_ir::{CanonicalParams, KvCodec, TqBits, WeightAccessors};
+pub use scratchy_ir::{CanonicalParams, KvCodec, TqBits, WeightAccessors, model_facts};
 // Device-runtime code that names the concrete `GpuWeights` / `GpuDevice`
 // lives in the target crates, never here: re-exporting it would make the
 // compiler depend UP on a target, the edge this crate's contract inverts.

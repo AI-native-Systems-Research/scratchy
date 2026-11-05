@@ -52,6 +52,8 @@ pub struct StepRefusal {
 /// What about an op (or the canonical) metal's step records cannot express.
 #[derive(Debug)]
 pub enum Refused {
+    /// A gated feed-forward on a model whose facts state no feed-forward width.
+    NoIntermediate,
     NoFirstNorm,
     NoTapeStep,
     NoColour,
@@ -446,7 +448,8 @@ pub struct Recording<'a> {
     pub folds: &'a TapeFolds<MetalFusion>,
     pub facts: &'a MetalStepFacts<'a>,
     pub hidden: W,
-    pub intermediate: Inter,
+    /// The feed-forward's inner width, for a model with one.
+    pub intermediate: Option<Inter>,
     /// The canonical's rows: its codec guards' realization.
     pub bucket_m: u32,
 }
@@ -1791,7 +1794,10 @@ impl Recording<'_> {
                 Ok(em(step, &[gate_slot, up_slot], &[out], Vec::new()))
             }
             _ => {
-                let step = MetalStep::SiluMul(gate_slot, up_slot, out, self.intermediate);
+                let inter = self
+                    .intermediate
+                    .ok_or_else(|| self.no(i, Refused::NoIntermediate))?;
+                let step = MetalStep::SiluMul(gate_slot, up_slot, out, inter);
                 Ok(em(step, &[gate_slot, up_slot], &[out], Vec::new()))
             }
         }
@@ -2956,7 +2962,7 @@ mod tests {
     /// A construct's rows fence as ONE: the first on every member's accesses, the rest always.
     #[test]
     fn a_constructs_rows_fence_as_one() {
-        use Fence::{Coherent, None as No, Ordered};
+        use Fence::{Coherent, None as No};
         // Alone, row 1 has nothing pending to fence on; row 2 reads row 0's write.
         let alone = [
             sig(&[], &[1], None),

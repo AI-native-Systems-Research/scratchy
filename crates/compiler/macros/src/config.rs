@@ -977,25 +977,6 @@ fn model_configs(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     Ok(configs)
 }
 
-/// Every arch dir under `configs/`.
-/// Arches whose emit compiles only under cuda (no metal surface).
-const CUDA_ONLY_ARCHES: &[&str] = &[
-    "deepseek-v2",
-    "deepseek-v3",
-    "deepseek-v3-flat",
-    "gemma3-mm",
-];
-/// Arches whose emit compiles only under metal: no cuda ISel claims for their ops, so under a cuda
-/// build the solver would find tile claims missing and panic.
-const METAL_ONLY_ARCHES: &[&str] = &[
-    "dflash2",
-    "gemma4-assistant",
-    "glm4-moe",
-    "gpt-oss",
-    "nemotron-h",
-    "nemotron-h-latent",
-    "nemotron-h-mtp",
-];
 /// Arches that also compile for spyre (KTIR). Must agree with the arches `scratchy-models`'
 /// `spyre` feature enables.
 const SPYRE_CAPABLE_ARCHES: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
@@ -1014,19 +995,12 @@ pub fn arch_compiled(arch: &str) -> bool {
 
 /// [`arch_compiled`] under the features `on` reports.
 fn arch_compiled_with(arch: &str, on: impl Fn(&str) -> bool) -> bool {
-    let (cuda, metal, spyre) = (on("cuda"), on("metal"), on("spyre"));
-    let backend = if CUDA_ONLY_ARCHES.contains(&arch) {
-        cuda
-    } else if METAL_ONLY_ARCHES.contains(&arch) {
-        metal
-    } else if SPYRE_CAPABLE_ARCHES.contains(&arch) {
-        cuda || metal || spyre
-    } else {
-        cuda || metal
-    };
+    let spyre = SPYRE_CAPABLE_ARCHES.contains(&arch) && on("spyre");
+    let backend = on("metal") || spyre;
     on(&format!("arch-{arch}")) && backend
 }
 
+/// Every arch dir under `configs/`.
 fn arch_dirs(configs_root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     let io = |source| ConfigError::Io {
         path: configs_root.to_path_buf(),
@@ -3582,25 +3556,15 @@ mod tests {
     #[test]
     fn an_arch_compiles_with_its_feature_and_a_backend_of_its_own() {
         let build = |features: &'static [&'static str]| move |f: &str| features.contains(&f);
-        let cuda = build(&[
-            "cuda",
-            "arch-dflash2",
-            "arch-qwen3-5-moe",
-            "arch-deepseek-v3",
-        ]);
-        assert!(!arch_compiled_with("dflash2", cuda));
-        assert!(arch_compiled_with("qwen3-5-moe", cuda));
-        assert!(arch_compiled_with("deepseek-v3", cuda));
-        let metal = build(&[
-            "metal",
-            "arch-dflash2",
-            "arch-qwen3-5-moe",
-            "arch-deepseek-v3",
-        ]);
+        let metal = build(&["metal", "arch-dflash2", "arch-qwen3-5-moe", "arch-llama"]);
         assert!(arch_compiled_with("dflash2", metal));
         assert!(arch_compiled_with("qwen3-5-moe", metal));
-        assert!(!arch_compiled_with("deepseek-v3", metal));
-        let spyre = build(&["spyre", "arch-llama", "arch-qwen3"]);
+        assert!(arch_compiled_with("llama", metal));
+        let spyre = build(&["spyre", "arch-dflash2", "arch-llama", "arch-qwen3"]);
+        assert!(
+            !arch_compiled_with("dflash2", spyre),
+            "a metal-only arch does not compile under spyre"
+        );
         assert!(arch_compiled_with("llama", spyre));
         assert!(!arch_compiled_with("qwen3", spyre));
         assert!(
