@@ -2116,6 +2116,97 @@ fn rebind(
 /// descriptor per operand plus the output), the constexprs (the node's facts as
 /// `tl.constexpr`s, the monomorphisation key), all in the case-table's own shape
 /// (`cases::spec`).
+/// The `rope_fwd` door's contract, stated from the node's own facts — the one body both rope
+/// ops' arms in `kernel_spec` run, each reading its head dim off its own fields: the rotate's
+/// own, the append's rope class off its attention.
+fn rope_fwd<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    signature: &mut HashMap<String, ArgSpec>,
+    constexprs: &mut HashMap<String, Val>,
+    hd: u32,
+) -> Result<(), String> {
+    // total = the output's declared width (`heads * hd`), heads = total / hd, mq = the
+    // output's rows — the same derivation `KtirFunc::rope`'s views state. The builder's own
+    // refusal (`total` not a whole number of `hd`-wide heads) is mirrored here as an
+    // `Err`: the node is malformed, and no kernel can state it.
+    let out = &node.output;
+    let total = out.region.cols.len;
+    if !total.is_multiple_of(hd) {
+        return Err(format!(
+            "triton splice: rope t{}: {total} cols is not a whole number of \
+             {hd}-wide heads",
+            out.tensor.index()
+        ));
+    }
+    let heads = total / hd;
+    for p in ["desc_x", "desc_cos", "desc_sin", "desc_o"] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    // ⭐ THE ROW WINDOW, THE PER-ROW ROPE LAW. The real front end's
+    // per-position decomposition mints rope nodes whose regions are ONE
+    // row's slice of the shared q plane — a row slice expressed by the
+    // ACCESS TILE's row corner (`R_START`), never by a taller view. The
+    // kernel therefore states `Y_TOTAL` (the x TENSOR's full re-tiled
+    // height `rows·H`, so the tile corners stay in bounds) and `R_START`
+    // (the window's row corner `ri·H`, baked into every load/store row);
+    // `MQ` is then the REGION's row count. A whole-region node states
+    // `R_START = 0`, `Y_TOTAL = MQ·H` — byte-identical to the one form
+    // this kernel used to state. ⛔ THE WINDOWING LAW, stated here because
+    // only this body reads the facts: all four regions share ONE row
+    // window, take WHOLE columns of `total`, and sit over tensors of ONE
+    // height (the single `Y_TOTAL` names all four views, and the
+    // head-replicated cos/sin reinterpretation is same-bytes only at that
+    // width).
+    let x = &node.inputs[0];
+    let window = (x.region.rows.start, x.region.rows.len);
+    let y_rows = ir.tensors[x.tensor.index()].rows;
+    for (tr, role) in [
+        (x, "the `x` view"),
+        (&node.inputs[1], "the `cos` view"),
+        (&node.inputs[2], "the `sin` view"),
+        (out, "the `out` view"),
+    ] {
+        let t_rows = ir.tensors[tr.tensor.index()].rows;
+        let shared = (tr.region.rows.start, tr.region.rows.len) == window;
+        let cols_whole = tr.region.cols.start == 0 && tr.region.cols.len == total;
+        if !shared || !cols_whole || t_rows != y_rows {
+            return Err(format!(
+                "triton splice: rope t{}: {role} states rows [{}, {}] × cols [{}, \
+                 {}] of a [{t_rows}, {}] tensor, but `x` states rows [{}, {}] over a \
+                 [{y_rows}, {total}] one — a rope's four regions must share ONE row \
+                 window and whole `total` columns over tensors of one height (the \
+                 single `Y_TOTAL` names all four views)",
+                out.tensor.index(),
+                tr.region.rows.start,
+                tr.region.rows.len,
+                tr.region.cols.start,
+                tr.region.cols.len,
+                ir.tensors[tr.tensor.index()].cols,
+                window.0,
+                window.1,
+            ));
+        }
+    }
+    let (r_start, mq_rows) = (window.0 * heads, window.1);
+    let y_total = y_rows * heads;
+    ce("H", Val::Int(i128::from(heads)))?;
+    ce("MQ", Val::Int(i128::from(mq_rows)))?;
+    ce("HEAD_DIM", Val::Int(i128::from(hd)))?;
+    ce("HALF", Val::Int(i128::from(hd / 2)))?;
+    ce("Y_TOTAL", Val::Int(i128::from(y_total)))?;
+    ce("R_START", Val::Int(i128::from(r_start)))?;
+    Ok(())
+}
+
 fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -2438,91 +2529,22 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // agreement by construction.
             ce("SCALE", Val::Float(f64::from(*scale)))?;
         }
-        (SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. }, "rope_fwd") => {
-            // The door's contract, stated from the node's own facts: total = the output's
-            // declared width (`heads * hd`), heads = total / hd, mq = the output's rows —
-            // the same derivation `KtirFunc::rope`'s views state. The builder's own
-            // refusal (`total` not a whole number of `hd`-wide heads) is mirrored here
-            // as an `Err`: the node is malformed, and no kernel can state it. The rotate
-            // states its dim; the append's is its rope class's own, off its attention.
-            let hd = node
-                .op
-                .rope_head_dim()
-                .expect("the arm's pattern binds one of the two rope kinds")
-                .get();
-            let total = c;
-            if total % hd != 0 {
-                return Err(format!(
-                    "triton splice: rope t{}: {total} cols is not a whole number of \
-                     {hd}-wide heads",
-                    node.output.tensor.index()
-                ));
-            }
-            let heads = total / hd;
-            for p in ["desc_x", "desc_cos", "desc_sin", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            // ⭐ THE ROW WINDOW, THE PER-ROW ROPE LAW. The real front end's
-            // per-position decomposition mints rope nodes whose regions are ONE
-            // row's slice of the shared q plane — a row slice expressed by the
-            // ACCESS TILE's row corner (`R_START`), never by a taller view. The
-            // kernel therefore states `Y_TOTAL` (the x TENSOR's full re-tiled
-            // height `rows·H`, so the tile corners stay in bounds) and `R_START`
-            // (the window's row corner `ri·H`, baked into every load/store row);
-            // `MQ` is then the REGION's row count. A whole-region node states
-            // `R_START = 0`, `Y_TOTAL = MQ·H` — byte-identical to the one form
-            // this kernel used to state. ⛔ THE WINDOWING LAW, stated here because
-            // only this arm reads the facts: all four regions share ONE row
-            // window, take WHOLE columns of `total`, and sit over tensors of ONE
-            // height (the single `Y_TOTAL` names all four views, and the
-            // head-replicated cos/sin reinterpretation is same-bytes only at that
-            // width).
-            let x = &node.inputs[0];
-            let window = (x.region.rows.start, x.region.rows.len);
-            let y_rows = ir.tensors[x.tensor.index()].rows;
-            for (tr, role) in [
-                (x, "the `x` view"),
-                (&node.inputs[1], "the `cos` view"),
-                (&node.inputs[2], "the `sin` view"),
-                (out, "the `out` view"),
-            ] {
-                let t_rows = ir.tensors[tr.tensor.index()].rows;
-                let shared = (tr.region.rows.start, tr.region.rows.len) == window;
-                let cols_whole = tr.region.cols.start == 0 && tr.region.cols.len == total;
-                if !shared || !cols_whole || t_rows != y_rows {
-                    return Err(format!(
-                        "triton splice: rope t{}: {role} states rows [{}, {}] × cols [{}, \
-                         {}] of a [{t_rows}, {}] tensor, but `x` states rows [{}, {}] over a \
-                         [{y_rows}, {total}] one — a rope's four regions must share ONE row \
-                         window and whole `total` columns over tensors of one height (the \
-                         single `Y_TOTAL` names all four views)",
-                        node.output.tensor.index(),
-                        tr.region.rows.start,
-                        tr.region.rows.len,
-                        tr.region.cols.start,
-                        tr.region.cols.len,
-                        ir.tensors[tr.tensor.index()].cols,
-                        window.0,
-                        window.1,
-                    ));
-                }
-            }
-            let (r_start, mq_rows) = (window.0 * heads, window.1);
-            let y_total = y_rows * heads;
-            ce("H", Val::Int(i128::from(heads)))?;
-            ce("MQ", Val::Int(i128::from(mq_rows)))?;
-            ce("HEAD_DIM", Val::Int(i128::from(hd)))?;
-            ce("HALF", Val::Int(i128::from(hd / 2)))?;
-            ce("Y_TOTAL", Val::Int(i128::from(y_total)))?;
-            ce("R_START", Val::Int(i128::from(r_start)))?;
+        (SubOp::RopeRotate { head_dim, .. }, "rope_fwd") => {
+            rope_fwd(node, ir, &mut signature, &mut constexprs, head_dim.get())?;
+        }
+        (
+            SubOp::RopeAppend {
+                attention, rope, ..
+            },
+            "rope_fwd",
+        ) => {
+            rope_fwd(
+                node,
+                ir,
+                &mut signature,
+                &mut constexprs,
+                rope.head_dim(*attention).get(),
+            )?;
         }
         (SubOp::TanhSoftCap { cap }, "tanhsoftcap_fwd") => {
             // The kernel's own parameter spellings: desc_x, desc_o, then the constexprs
