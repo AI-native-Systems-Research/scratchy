@@ -85,12 +85,37 @@ impl SourceManifest {
         RotaryTables { global, sliding }
     }
 
-    /// The model's `ModelSources` impl: one arm per family, `ix => bundle at layer`.
-    pub fn resolver(&self) -> Result<TokenStream, UnboundKind> {
+    /// The model's `ModelSources` impl: one arm per family, `ix => bundle at layer`. A family
+    /// whose field holds a typed handle (`handle`: its type, by field base) is a source slot
+    /// ([`slot`]): its arm reaches the field through the slot.
+    pub fn resolver(
+        &self,
+        handle: &dyn Fn(&str) -> Option<TokenStream>,
+    ) -> Result<Resolver, UnboundKind> {
         let r = quote!(::scratchy_target_metal::tape::lowered::SourceRef);
         let ids = quote!(::scratchy_target_metal::tape::ids);
-        let arms = (0u32..).zip(&self.families).map(|(ix, f)| {
-            let (ix, base) = (Literal::u32_unsuffixed(ix), format_ident!("{}", f.base));
+        let (mut slots, mut typed) = (Vec::new(), std::collections::HashSet::new());
+        let arms = (0u32..).zip(&self.families).map(|(n, f)| {
+            let (ix, base) = (Literal::u32_unsuffixed(n), format_ident!("{}", f.base));
+            let field = match handle(&f.base) {
+                Some(ty) => {
+                    let s = slot(SourceIx(n));
+                    typed.insert(SourceIx(n));
+                    slots.push(quote! {
+                        pub enum #s {}
+                        impl ::scratchy_target_metal::tape::typed::Source for #s {
+                            type Model = Weights;
+                            type Handle = #ty;
+                            const IX: #ids::SourceIx = #ids::SourceIx(#ix);
+                            fn at(w: &Weights, layer: #ids::LayerId) -> &#ty {
+                                w.#base(layer.get())
+                            }
+                        }
+                    });
+                    quote!(<#s as ::scratchy_target_metal::tape::typed::Source>::at(self, layer))
+                }
+                None => quote!(self.#base(layer.get())),
+            };
             use WeightKind as K;
             let bundle = match f.kind {
                 // Unbound until the pool builds the table (`Weights::build_rope_tables`).
@@ -111,10 +136,10 @@ impl SourceManifest {
                 // carries the `Copy` GpuTensor handle by value (same
                 // deref as the `weight_at` arm in codegen.rs).
                 K::AttnSinks => {
-                    return Ok(quote!(#ix => Some(#r::AttnSinks(*self.#base(layer.get()))),));
+                    return Ok(quote!(#ix => Some(#r::AttnSinks(*#field)),));
                 }
                 K::Tensor => {
-                    return Ok(quote!(#ix => Some(#r::Tensor(*self.#base(layer.get()))),));
+                    return Ok(quote!(#ix => Some(#r::Tensor(*#field)),));
                 }
                 K::GptOssMoe => quote!(GptOssMoe),
                 K::Marlin
@@ -127,7 +152,7 @@ impl SourceManifest {
                     return Err(UnboundKind { source, kind });
                 }
             };
-            Ok(quote!(#ix => Some(#r::#bundle(self.#base(layer.get()))),))
+            Ok(quote!(#ix => Some(#r::#bundle(#field)),))
         });
         let arms = arms.collect::<Result<Vec<_>, _>>()?;
         let names = self.families.iter().map(|f| f.base.as_str());
@@ -149,15 +174,28 @@ impl SourceManifest {
             };
             (quote!(ix), body)
         };
-        Ok(quote! {
+        let tokens = quote! {
+            #(#slots)*
             impl ::scratchy_target_metal::tape::lowered::ModelSources for Weights {
                 const SOURCES: &'static [&'static str] = &[#(#names),*];
                 fn source(&self, #ix: #ids::SourceIx, #layer: #ids::LayerId) -> Option<#r<'_>> {
                     #body
                 }
             }
-        })
+        };
+        Ok(Resolver { tokens, typed })
     }
+}
+
+/// A model's resolver, and the families it declared a source slot ([`slot`]) for.
+pub struct Resolver {
+    pub tokens: TokenStream,
+    pub typed: std::collections::HashSet<SourceIx>,
+}
+
+/// The source slot marker of family `ix`, beside the model's `Weights`.
+pub fn slot(ix: SourceIx) -> proc_macro2::Ident {
+    format_ident!("__Source{}", ix.0)
 }
 
 /// How a preset binds a gated MLP's gate and up projections.

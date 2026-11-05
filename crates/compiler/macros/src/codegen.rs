@@ -3076,6 +3076,8 @@ fn emit_weights_struct(
     // for this variant — a shim, or metal's first pass before the
     // front-end swap) emits a `Weights` with no accessor fields.
     tape_accessors: Option<&[WeightAccessor]>,
+    // The fields' typed handles (none for a shim, whose `Weights` is its canonical's).
+    dims: &ModelDims,
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
     mode: WeightsEmitMode<'_>,
@@ -3237,7 +3239,7 @@ fn emit_weights_struct(
     let fields: Vec<TokenStream> = groups
         .iter()
         .flat_map(|g| {
-            let ty = &g.rust_type;
+            let ty = dims.handle(&g.base).map_or(&g.rust_type, |h| &h.ty);
             match g.kind {
                 AccessorGroupKind::Unindexed => {
                     let name = syn::Ident::new(&g.base, proc_macro2::Span::call_site());
@@ -3547,6 +3549,12 @@ fn emit_weights_struct(
     // ident (the base name); sparse-layered groups contribute one
     // ident per per-layer accessor (matching the per-layer fields
     // in the struct + the per-layer let bindings in the body).
+    // Each field from its load's `let`; a typed field rebound through the load mint right after
+    // its load, which checks the loaded layer's extents against its type's numbers. The mint is a
+    // statement beside its load, not an operand of the struct literal: its `?` then exits with
+    // the locals the next load's does and shares that drop path, where a `?` among the literal's
+    // operands (or every mint after every load) took a drop path of its own each — the qwen3.6
+    // `load` 12-22x larger.
     let field_shorthand: Vec<syn::Ident> = groups
         .iter()
         .flat_map(|g| match g.kind {
@@ -3557,6 +3565,29 @@ fn emit_weights_struct(
                 g.entries.iter().map(|(_, acc)| acc.name.clone()).collect()
             }
         })
+        .collect();
+    let mints = groups.iter().map(|g| {
+        let Some(h) = dims.handle(&g.base) else {
+            return TokenStream::new();
+        };
+        let (tensor, handle) = (&h.tensor, &h.ty);
+        let mint = |name: &syn::Ident, ty: TokenStream| {
+            quote! { let #name: #ty = ::scratchy_tensors::typed::Mint::mint(#name, #tensor)?; }
+        };
+        let base = syn::Ident::new(&g.base, proc_macro2::Span::call_site());
+        let minted: Vec<TokenStream> = match g.kind {
+            AccessorGroupKind::Unindexed => vec![mint(&base, quote!(#handle))],
+            AccessorGroupKind::LayeredContiguous => {
+                vec![mint(&base, quote!(::std::vec::Vec<#handle>))]
+            }
+            AccessorGroupKind::LayeredSparse => (g.entries.iter())
+                .map(|(_, acc)| mint(&acc.name, quote!(#handle)))
+                .collect(),
+        };
+        quote!(#(#minted)*)
+    });
+    let lets: Vec<TokenStream> = (lets.iter().zip(mints))
+        .map(|(load, mint)| quote!(#load #mint))
         .collect();
     // Vision encoders skip the fingerprint emission entirely — they
     // route through the hand-written `ScratchyMmRegistration` instead
@@ -4028,7 +4059,7 @@ fn emit_weights_struct(
     // for every target — `crate::__gpu` resolves the field types per backend
     // (metal/spyre target crate, or `scratchy-layers` with no backend), so
     // the same accessors compile everywhere. No backend is special-cased.
-    let accessor_methods = emit_weights_accessor_methods(&accessors);
+    let accessor_methods = emit_weights_accessor_methods(&accessors, dims);
 
     // Rotary cos_sin accessors for the host-interpreter path. Both
     // `wm.rotary` and `wm.rotary_local` are conditionally-emitted
@@ -4134,6 +4165,13 @@ fn emit_weights_struct(
         WeightsEmitMode::Canonical => quote! { Weights },
         WeightsEmitMode::Shim { canonical } => quote! { super::#canonical::Weights },
     };
+    let dims_module = match dims.module(model) {
+        Ok(module) => module,
+        Err(e) => {
+            let msg = format!("model `{}`: its dims: {e}", model.source_stem);
+            return (quote! { compile_error!(#msg); }, Vec::new());
+        }
+    };
 
     // Canonical emits the full `load_with(marlin_storage)` body +
     // a thin `load()` wrapper that passes this variant's Marlin
@@ -4146,6 +4184,8 @@ fn emit_weights_struct(
     let tokens = match &mode {
         WeightsEmitMode::Canonical => quote! {
             #weights_def
+
+            #dims_module
 
             #accessor_methods
 
@@ -4368,6 +4408,191 @@ pub(crate) enum AccessorGroupKind {
     /// emitted; accessor method is a `match layer { L => &self.<base>_<L>, … }`.
     /// Load body emits one `let <base>_<L> = …;` per entry.
     LayeredSparse,
+}
+
+/// The typed handles of a model's `Weights`: per field base, the handle its field holds (the
+/// group's weight at its declared shape, spelled in the model's dim markers), and the bounds the
+/// handles name, which [`ModelDims::module`] declares with the model's numbers.
+#[derive(Default)]
+pub(crate) struct ModelDims {
+    handles: BTreeMap<String, TypedHandle>,
+    bounds: std::collections::BTreeSet<String>,
+}
+
+/// One field's typed handle: its path (`__handles::<Field>`, what the field, its accessor and
+/// its source slot spell), its name there and the type it names, and the tensor the load mint
+/// names on a mismatch.
+pub(crate) struct TypedHandle {
+    pub ty: TokenStream,
+    name: Ident,
+    def: TokenStream,
+    pub tensor: String,
+}
+
+impl ModelDims {
+    /// The handles of `groups`' fields: each group whose every layer is the same weight (or the
+    /// same packed pair of weights) of a kind whose device layer states its declared extents, at
+    /// the shape the arch's trace gives it. A packed pair is its two weights side by side along
+    /// `N`, which only weights of one `K` are (`PackedN`).
+    pub(crate) fn of(
+        groups: &[AccessorGroup<'_>],
+        program: &Program,
+        inferred: &crate::shape::Inferred,
+    ) -> Result<Self, String> {
+        use crate::weight_vocab::WeightKind;
+        let mut dims = Self::default();
+        let w = quote!(::scratchy_tensors::typed);
+        for g in groups {
+            let sources = |acc: &WeightAccessor| -> Vec<WeightId> {
+                acc.source_weights.iter().map(|(id, _)| *id).collect()
+            };
+            let Some((_, first)) = g.entries.first() else {
+                continue;
+            };
+            let ids = sources(first);
+            if !g.entries.iter().all(|(_, acc)| sources(acc) == ids)
+                || !matches!(
+                    first.kind,
+                    WeightKind::Linear | WeightKind::Embedding | WeightKind::RmsNorm
+                )
+            {
+                continue;
+            }
+            let Some(shapes) = (ids.iter())
+                .map(|id| inferred.weights.get(id))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let layer = &g.rust_type;
+            let mut ty = |shape: &[crate::dim::Dim]| -> Result<Option<TokenStream>, String> {
+                let mut dim = |d| dim_tokens(d, &mut dims.bounds);
+                Ok(match shape {
+                    [d] => {
+                        let d = dim(d)?;
+                        Some(quote!(#w::W1<#d, #layer>))
+                    }
+                    [k, n] => {
+                        let (k, n) = (dim(k)?, dim(n)?);
+                        Some(quote!(#w::W2<#k, #n, #layer>))
+                    }
+                    _ => None,
+                })
+            };
+            let handle = match &shapes[..] {
+                [one] => ty(one)?,
+                [gate, up] if first.kind == WeightKind::Linear => match (ty(gate)?, ty(up)?) {
+                    (Some(gate), Some(up)) => Some(quote!(<(#gate, #up) as #w::PackedN>::Out)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(def) = handle else {
+                continue;
+            };
+            let tensor = (ids.iter())
+                .map(|id| program.weights.path(*id).join("."))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            let name = format_ident!(
+                "{}",
+                scratchy_forward_compiler_frontend::typed_emit::marker(&g.base)
+            );
+            let ty = quote!(__handles::#name);
+            let handle = TypedHandle {
+                ty,
+                name,
+                def,
+                tensor,
+            };
+            dims.handles.insert(g.base.clone(), handle);
+        }
+        Ok(dims)
+    }
+
+    pub(crate) fn handle(&self, base: &str) -> Option<&TypedHandle> {
+        self.handles.get(base)
+    }
+
+    /// `__dims`: one marker per bound the handles name, carrying `model`'s number for it.
+    pub(crate) fn module(&self, model: &ModelParams) -> Result<TokenStream, String> {
+        let markers = (self.bounds.iter())
+            .map(|b| {
+                let n = model.bounds.get(b).ok_or_else(|| {
+                    format!("a weight's shape names `{b}`, which the model's config does not state")
+                })?;
+                let n = u32::try_from(*n).map_err(|_| format!("`{b}` = {n} exceeds u32"))?;
+                let marker = format_ident!(
+                    "{}",
+                    scratchy_forward_compiler_frontend::typed_emit::marker(b)
+                );
+                Ok(quote! {
+                    pub enum #marker {}
+                    impl ::scratchy_tensors::typed::Dim for #marker {
+                        const N: u32 = #n;
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let handles = (self.handles.values())
+            .map(|TypedHandle { name, def, .. }| quote!(pub type #name = #def;));
+        let handles = (!self.handles.is_empty()).then(|| {
+            quote! {
+                /// The handle each typed field of `Weights` holds, by the field's name.
+                pub mod __handles {
+                    use super::__dims;
+                    #(#handles)*
+                }
+            }
+        });
+        Ok(quote! {
+            /// The model's dims, as types: each bound its weights' shapes name, with its number.
+            pub mod __dims {
+                #(#markers)*
+            }
+            #handles
+        })
+    }
+}
+
+/// `dim` as a type in the model's `__dims`, each bound it names into `bounds`.
+fn dim_tokens(
+    dim: &crate::dim::Dim,
+    bounds: &mut std::collections::BTreeSet<String>,
+) -> Result<TokenStream, String> {
+    use crate::dim::Dim;
+    let w = quote!(::scratchy_tensors::typed);
+    match dim {
+        Dim::Bound(name) => {
+            bounds.insert(name.clone());
+            let marker = format_ident!(
+                "{}",
+                scratchy_forward_compiler_frontend::typed_emit::marker(name)
+            );
+            Ok(quote!(__dims::#marker))
+        }
+        Dim::Lit(n) => {
+            let n = u32::try_from(*n).map_err(|_| format!("literal dim {n} exceeds u32"))?;
+            Ok(quote!(#w::Lit<#n>))
+        }
+        Dim::Mul(parts) | Dim::Add(parts) => {
+            let op = match dim {
+                Dim::Mul(_) => quote!(Mul),
+                _ => quote!(Add),
+            };
+            let types = (parts.iter())
+                .map(|p| dim_tokens(p, bounds))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (last, rest) = types
+                .split_last()
+                .ok_or_else(|| format!("an empty {op} in a weight's shape"))?;
+            Ok((rest.iter().rev()).fold(last.clone(), |acc, t| quote!(#w::#op<#t, #acc>)))
+        }
+        Dim::Div(n, d) => {
+            let (n, d) = (dim_tokens(n, bounds)?, dim_tokens(d, bounds)?);
+            Ok(quote!(#w::Div<#n, #d>))
+        }
+    }
 }
 
 /// Group `accessors` by their `(base, layer)` split.
@@ -6389,7 +6614,7 @@ fn emit_layered_load_body(
 ///
 /// Returns an `impl Weights { ... }` block. Empty (zero accessors)
 /// is fine — the impl block is then elided entirely.
-fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
+fn emit_weights_accessor_methods(accessors: &[WeightAccessor], dims: &ModelDims) -> TokenStream {
     let groups = group_accessors_by_base(accessors);
     if groups.is_empty() {
         return TokenStream::new();
@@ -6404,7 +6629,7 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
         .iter()
         .map(|g| {
             let base_ident = syn::Ident::new(&g.base, proc_macro2::Span::call_site());
-            let ty = &g.rust_type;
+            let ty = dims.handle(&g.base).map_or(&g.rust_type, |h| &h.ty);
             match g.kind {
                 AccessorGroupKind::LayeredContiguous => quote! {
                     pub fn #base_ident(&self, layer: u32) -> &#ty {
@@ -13827,11 +14052,12 @@ pub fn emit_model(
     // tape's. Returns the emitted tokens alongside the affine rows its
     // fingerprint gate carries (the tape call's rows are what survive
     // — `weights_affine_rows` is overwritten alongside `weights`).
-    let emit_struct = |tape_accs: Option<&[WeightAccessor]>| {
+    let emit_struct = |tape_accs: Option<&[WeightAccessor]>, dims: &ModelDims| {
         emit_weights_struct(
             program,
             fuf,
             tape_accs,
+            dims,
             model,
             manifest,
             WeightsEmitMode::Canonical,
@@ -13842,8 +14068,17 @@ pub fn emit_model(
     };
     #[cfg(feature = "metal")]
     let mut tape_accessors_for_struct: Option<Vec<WeightAccessor>> = None;
+    // The fields' typed handles, from the tape's accessor set: the struct holds them, and the
+    // metal resolver reaches each through its source slot.
+    let model_dims = |accs: Option<&[WeightAccessor]>| {
+        accs.map_or_else(ModelDims::default, |accs| {
+            ModelDims::of(&group_accessors_by_base(accs), program, inferred).unwrap_or_else(|e| {
+                panic!("[weights] {}: its weights' types: {e}", model.source_stem)
+            })
+        })
+    };
     #[cfg(feature = "metal")]
-    let (mut weights, mut weights_affine_rows) = emit_struct(None);
+    let (mut weights, mut weights_affine_rows) = emit_struct(None, &ModelDims::default());
     // ⭐ THE MODEL'S FACTS (#1083), computed ONCE here and threaded to every consumer below:
     // the bridge calls (the spyre weight struct, metal's tape fingerprint, metal's canonical
     // lowering) and the per-canonical `CanonicalParams` impl. Every fact is a field of this
@@ -13921,8 +14156,9 @@ pub fn emit_model(
             model.source_stem,
             tw.as_ref().map(|t| t.accessors.len()).unwrap_or(0),
         );
+        let dims = model_dims(tw.as_ref().map(|t| t.accessors.as_slice()));
         let (struct_tokens, struct_affine_rows) =
-            emit_struct(tw.as_ref().map(|t| t.accessors.as_slice()));
+            emit_struct(tw.as_ref().map(|t| t.accessors.as_slice()), &dims);
         // The id → FIELD binding, emitted INTO THE SAME MODULE as the struct so
         // its arms can name `w.self_attn_q_proj[3]` directly. This is what the
         // worker's `"{disk}.weight"` lookup is replaced by; only generated code
@@ -14401,11 +14637,14 @@ pub fn emit_model(
     let weight_accessors_impl =
         emit_weight_accessors_impl(&canonical_lowered, model.source_stem.as_str());
     #[cfg(feature = "metal")]
+    let dims = model_dims(tape_accessors_for_struct.as_deref());
+    #[cfg(feature = "metal")]
+    let resolver = metal_sources
+        .resolver(&|base| dims.handle(base).map(|h| h.ty.clone()))
+        .unwrap_or_else(|e| panic!("[metal sources] {}: {e:?}", model.source_stem));
+    #[cfg(feature = "metal")]
     let weight_accessors_impl = {
-        let stem = &model.source_stem;
-        let resolver = metal_sources
-            .resolver()
-            .unwrap_or_else(|e| panic!("[metal sources] {stem}: {e:?}"));
+        let resolver = &resolver.tokens;
         quote! {
             #weight_accessors_impl
             #[cfg(feature = "metal")]
@@ -14417,7 +14656,7 @@ pub fn emit_model(
     // front-end swap has lowered the canonical.
     #[cfg(feature = "metal")]
     if let Some(tape_accs) = tape_accessors_for_struct.as_ref() {
-        let (w, r) = emit_struct(Some(tape_accs));
+        let (w, r) = emit_struct(Some(tape_accs), &dims);
         weights = w;
         weights_affine_rows = r;
     }
@@ -15147,12 +15386,14 @@ pub fn emit_model(
     };
 
     #[cfg(feature = "metal")]
-    metal_arena_bytes_statics.push(metal_tape_cmds.into_tokens().unwrap_or_else(|e| {
-        panic!(
-            "[metal static tape] {}: command table: {e}",
-            model.source_stem
-        )
-    }));
+    metal_arena_bytes_statics.push(metal_tape_cmds.into_tokens(&resolver.typed).unwrap_or_else(
+        |e| {
+            panic!(
+                "[metal static tape] {}: command table: {e}",
+                model.source_stem
+            )
+        },
+    ));
     #[cfg(feature = "metal")]
     {
         let mc = &model_facts;
@@ -16437,6 +16678,7 @@ fn emit_shim_model(
         program,
         fuf,
         None,
+        &ModelDims::default(),
         model,
         manifest,
         WeightsEmitMode::Shim { canonical },
@@ -16899,10 +17141,11 @@ mod tests {
             .map(|n| WeightAccessor {
                 name: format_ident!("input_layernorm_{}", n),
                 rust_type: ty.clone(),
+                kind: crate::weight_vocab::WeightKind::RmsNorm,
                 source_weights: vec![],
             })
             .collect::<Vec<_>>();
-        let ts = emit_weights_accessor_methods(&accessors).to_string();
+        let ts = emit_weights_accessor_methods(&accessors, &ModelDims::default()).to_string();
         assert!(ts.contains("impl Weights"));
         assert!(ts.contains("fn input_layernorm"));
         assert!(ts.contains("layer : u32"));
@@ -16931,9 +17174,10 @@ mod tests {
         let accessors = vec![WeightAccessor {
             name: format_ident!("embed_tokens"),
             rust_type: quote! { crate::__gpu::layers::Embedding },
+            kind: crate::weight_vocab::WeightKind::Embedding,
             source_weights: vec![],
         }];
-        let ts = emit_weights_accessor_methods(&accessors).to_string();
+        let ts = emit_weights_accessor_methods(&accessors, &ModelDims::default()).to_string();
         assert!(ts.contains("fn embed_tokens"));
         // Unindexed accessor's layer arg is `_: u32` — the underscore
         // prefix on `_layer` was unnecessary chars, dropped along
@@ -16958,15 +17202,17 @@ mod tests {
             WeightAccessor {
                 name: format_ident!("norm"),
                 rust_type: ty.clone(),
+                kind: crate::weight_vocab::WeightKind::RmsNorm,
                 source_weights: vec![],
             },
             WeightAccessor {
                 name: format_ident!("norm_0"),
                 rust_type: ty.clone(),
+                kind: crate::weight_vocab::WeightKind::RmsNorm,
                 source_weights: vec![],
             },
         ];
-        let _ = emit_weights_accessor_methods(&accessors);
+        let _ = emit_weights_accessor_methods(&accessors, &ModelDims::default());
     }
 
     #[test]
@@ -16978,22 +17224,24 @@ mod tests {
             WeightAccessor {
                 name: format_ident!("input_layernorm_0"),
                 rust_type: quote! { crate::__gpu::layers::RmsNorm },
+                kind: crate::weight_vocab::WeightKind::RmsNorm,
                 source_weights: vec![],
             },
             WeightAccessor {
                 name: format_ident!("input_layernorm_1"),
                 rust_type: quote! { crate::__gpu::layers::LinearLayer },
+                kind: crate::weight_vocab::WeightKind::Linear,
                 source_weights: vec![],
             },
         ];
-        let _ = emit_weights_accessor_methods(&accessors);
+        let _ = emit_weights_accessor_methods(&accessors, &ModelDims::default());
     }
 
     #[test]
     fn accessor_methods_empty_input_yields_empty_tokens() {
         // No accessors → no impl block. (Empty `impl Weights {}`
         // would be valid Rust but pointless; the codegen elides it.)
-        let ts = emit_weights_accessor_methods(&[]).to_string();
+        let ts = emit_weights_accessor_methods(&[], &ModelDims::default()).to_string();
         assert!(ts.is_empty());
     }
 
@@ -17007,6 +17255,7 @@ mod tests {
         WeightAccessor {
             name,
             rust_type: quote! { crate::__gpu::layers::RmsNorm },
+            kind: crate::weight_vocab::WeightKind::RmsNorm,
             source_weights: vec![],
         }
     }
@@ -17037,6 +17286,7 @@ mod tests {
         let accs = vec![WeightAccessor {
             name: format_ident!("embed_tokens"),
             rust_type: quote! { crate::__gpu::layers::Embedding },
+            kind: crate::weight_vocab::WeightKind::Embedding,
             source_weights: vec![],
         }];
         let groups = group_accessors_by_base(&accs);
@@ -17058,11 +17308,13 @@ mod tests {
             WeightAccessor {
                 name: format_ident!("lm_head"),
                 rust_type: quote! { crate::__gpu::layers::LinearLayer },
+                kind: crate::weight_vocab::WeightKind::Linear,
                 source_weights: vec![],
             },
             WeightAccessor {
                 name: format_ident!("embed_tokens"),
                 rust_type: quote! { crate::__gpu::layers::Embedding },
+                kind: crate::weight_vocab::WeightKind::Embedding,
                 source_weights: vec![],
             },
             ln_acc(Some(0)),
@@ -17087,11 +17339,13 @@ mod tests {
             WeightAccessor {
                 name: format_ident!("input_layernorm_0"),
                 rust_type: quote! { crate::__gpu::layers::RmsNorm },
+                kind: crate::weight_vocab::WeightKind::RmsNorm,
                 source_weights: vec![],
             },
             WeightAccessor {
                 name: format_ident!("input_layernorm_1"),
                 rust_type: quote! { crate::__gpu::layers::LinearLayer },
+                kind: crate::weight_vocab::WeightKind::Linear,
                 source_weights: vec![],
             },
         ];
@@ -17143,11 +17397,13 @@ mod tests {
             WeightAccessor {
                 name: format_ident!("moe_1"),
                 rust_type: quote! { crate::__gpu::layers_moe::DeepSeekV2MoELayer },
+                kind: crate::weight_vocab::WeightKind::DeepSeekMoe,
                 source_weights: vec![],
             },
             WeightAccessor {
                 name: format_ident!("moe_2"),
                 rust_type: quote! { crate::__gpu::layers_moe::DeepSeekV2MoELayer },
+                kind: crate::weight_vocab::WeightKind::DeepSeekMoe,
                 source_weights: vec![],
             },
         ];

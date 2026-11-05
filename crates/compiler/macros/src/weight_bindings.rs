@@ -611,24 +611,26 @@ pub(crate) fn from_tape(
                 };
                 let name = fused_field_name(program, id, up_id, index);
                 let owned = field_type(&kind)?;
-                kind_of_field.insert(name.to_string(), kind);
+                kind_of_field.insert(name.to_string(), kind.clone());
                 by_field
                     .entry(name.to_string())
                     .or_insert_with(|| WeightAccessor {
                         name,
                         rust_type: owned,
+                        kind,
                         source_weights: vec![(id, index), (up_id, up_index)],
                     });
                 continue;
             }
             let name = crate::emit::weight_field_name(program, id, index);
             let owned = field_type(&kind)?;
-            kind_of_field.insert(name.to_string(), kind);
+            kind_of_field.insert(name.to_string(), kind.clone());
             by_field
                 .entry(name.to_string())
                 .or_insert_with(|| WeightAccessor {
                     name,
                     rust_type: owned,
+                    kind,
                     source_weights: vec![(id, index)],
                 });
         }
@@ -654,12 +656,13 @@ pub(crate) fn from_tape(
         };
         let name = crate::emit::weight_field_name(program, id, None);
         let owned = field_type(&kind)?;
-        kind_of_field.insert(name.to_string(), kind);
+        kind_of_field.insert(name.to_string(), kind.clone());
         by_field
             .entry(name.to_string())
             .or_insert_with(|| WeightAccessor {
                 name,
                 rust_type: owned,
+                kind,
                 source_weights: vec![(id, None)],
             });
     }

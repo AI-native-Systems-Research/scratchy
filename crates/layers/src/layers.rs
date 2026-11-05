@@ -424,6 +424,26 @@ impl LinearLayer {
     }
 }
 
+/// A linear's declared shape is `[in, out]` (the DSL's `W2<K, N>`), whatever its storage.
+impl scratchy_tensors::typed::Extents<2> for LinearLayer {
+    fn extents(&self) -> [usize; 2] {
+        [self.in_features(), self.out_features()]
+    }
+}
+
+/// An embedding's declared shape is its table's, `[vocab, hidden]`.
+impl scratchy_tensors::typed::Extents<2> for Embedding {
+    fn extents(&self) -> [usize; 2] {
+        [self.vocab_size(), self.hidden_size()]
+    }
+}
+
+impl scratchy_tensors::typed::Extents<1> for RmsNorm {
+    fn extents(&self) -> [usize; 1] {
+        [self.hidden_size()]
+    }
+}
+
 impl From<Linear> for LinearLayer {
     fn from(l: Linear) -> Self {
         Self::Dense(l)
