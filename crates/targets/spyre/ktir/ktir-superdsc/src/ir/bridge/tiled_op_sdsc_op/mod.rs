@@ -41,8 +41,8 @@ pub use matmul::{
 };
 pub use pointwise::{
     ExpandedBlocks, GatheredWords, IndexSelectPage, PageGatherRows, ScatterCopySpec, StickPermute,
-    StickPermuteSpec, StickRuns, assemble_expand_blocks, assemble_gather_copy, assemble_index_select,
-    assemble_page_gather_copy, assemble_pointwise_broadcast_off_from_tile,
+    StickPermuteSpec, StickRuns, assemble_expand_blocks, assemble_gather_copy,
+    assemble_index_select, assemble_page_gather_copy, assemble_pointwise_broadcast_off_from_tile,
     assemble_pointwise_seeded_from_tile, assemble_scatter_copy, assemble_stick_permute,
     assemble_stick_runs_copy, gather_copy_opspec, index_select_opspec, page_gather_copy_opspec,
     pointwise_broadcast_opspec_from_tile, pointwise_opspec_from_tile, scatter_copy_opspec,

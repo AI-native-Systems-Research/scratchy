@@ -287,14 +287,25 @@ fn several_multi_stick_entries_land_row_major_and_one_permute_restickifies() {
     // per-block landing is not the frame's one stick column.
     let k = program(4, 128, 8);
     let ops = emitted(&k).unwrap_or_else(|e| panic!("the rank-2 read lowers: {e}"));
-    let gathers: Vec<_> = ops.iter().filter(|e| e.op_name.starts_with("gather")).collect();
-    assert_eq!(gathers.len(), 1, "one gather op: {:?}", ops.iter().map(|e| &e.op_name).collect::<Vec<_>>());
+    let gathers: Vec<_> = ops
+        .iter()
+        .filter(|e| e.op_name.starts_with("gather"))
+        .collect();
+    assert_eq!(
+        gathers.len(),
+        1,
+        "one gather op: {:?}",
+        ops.iter().map(|e| &e.op_name).collect::<Vec<_>>()
+    );
     assert_eq!(
         gather_n(gathers[0]),
         serde_json::json!({"name_": "n", "mb_": 4, "y_": 64, "x_": 1, "out_": 128}),
         "the entries land as ONE-ROW blocks — `slab / w` of them an entry, each a row's own bytes"
     );
-    let permutes: Vec<_> = ops.iter().filter(|e| e.op_name.starts_with("permute")).collect();
+    let permutes: Vec<_> = ops
+        .iter()
+        .filter(|e| e.op_name.starts_with("permute"))
+        .collect();
     assert_eq!(
         permutes.len(),
         1,
@@ -328,16 +339,24 @@ fn one_entry_lands_its_whole_plane_with_no_permute() {
     let k = program(1, 128, 8);
     let ops = emitted(&k).unwrap_or_else(|e| panic!("the one-entry read lowers: {e}"));
     assert_eq!(
-        ops.iter().filter(|e| e.op_name.starts_with("gather")).count(),
+        ops.iter()
+            .filter(|e| e.op_name.starts_with("gather"))
+            .count(),
         1
     );
     assert_eq!(
-        gather_n(ops.iter().find(|e| e.op_name.starts_with("gather")).unwrap()),
+        gather_n(
+            ops.iter()
+                .find(|e| e.op_name.starts_with("gather"))
+                .unwrap()
+        ),
         serde_json::json!({"name_": "n", "mb_": 1, "y_": 1, "x_": 64, "out_": 128}),
         "the one entry's whole plane is one `[slab / w, w]` block"
     );
     assert_eq!(
-        ops.iter().filter(|e| e.op_name.starts_with("permute")).count(),
+        ops.iter()
+            .filter(|e| e.op_name.starts_with("permute"))
+            .count(),
         0,
         "one block: the landing is already the frame — no restickify"
     );
@@ -350,16 +369,24 @@ fn one_stick_wide_entries_land_flat_with_no_permute() {
     let k = program(4, 64, 8);
     let ops = emitted(&k).unwrap_or_else(|e| panic!("the one-stick read lowers: {e}"));
     assert_eq!(
-        ops.iter().filter(|e| e.op_name.starts_with("gather")).count(),
+        ops.iter()
+            .filter(|e| e.op_name.starts_with("gather"))
+            .count(),
         1
     );
     assert_eq!(
-        gather_n(ops.iter().find(|e| e.op_name.starts_with("gather")).unwrap()),
+        gather_n(
+            ops.iter()
+                .find(|e| e.op_name.starts_with("gather"))
+                .unwrap()
+        ),
         serde_json::json!({"name_": "n", "mb_": 4, "y_": 1, "x_": 128, "out_": 64}),
         "each entry's plane is one `[slab / w, w]` block, one stick wide"
     );
     assert_eq!(
-        ops.iter().filter(|e| e.op_name.starts_with("permute")).count(),
+        ops.iter()
+            .filter(|e| e.op_name.starts_with("permute"))
+            .count(),
         0,
         "one stick: the landing is already the frame — no restickify"
     );

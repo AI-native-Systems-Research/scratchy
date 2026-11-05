@@ -786,10 +786,7 @@ impl IndexSelectPage {
         let one = NonZeroU32::new(1).expect("one is nonzero");
         match frame {
             LandingFrame::Blocks {
-                blocks,
-                rows,
-                w,
-                ..
+                blocks, rows, w, ..
             } => IndexSelectPage {
                 entries: run,
                 blocks,
@@ -924,12 +921,13 @@ pub fn index_select_opspec(
         indirect: None,
         coordinate_mask: None,
     };
-    op.attach_gather_index(gather.gather_index(), 0).ok_or_else(|| {
-        format!(
-            "index_select_opspec('{src}' -> '{dst}'): the index declaration does not fit this \
+    op.attach_gather_index(gather.gather_index(), 0)
+        .ok_or_else(|| {
+            format!(
+                "index_select_opspec('{src}' -> '{dst}'): the index declaration does not fit this \
              op — its dims are [mb, y, x, out], so the paged axis must be `mb`"
-        )
-    })?;
+            )
+        })?;
     if page_dst.get() > 0
         && let Some(o) = op.args.last_mut()
     {
@@ -2378,12 +2376,18 @@ mod index_select_tests {
                 .offset_elems
         };
         assert_eq!(
-            dst_offset(8, crate::superdsc_opspec::LandingOffset::after(0, 128 * 128)),
+            dst_offset(
+                8,
+                crate::superdsc_opspec::LandingOffset::after(0, 128 * 128)
+            ),
             0,
             "the first chunk lands at the base"
         );
         assert_eq!(
-            dst_offset(1, crate::superdsc_opspec::LandingOffset::after(7, 128 * 128)),
+            dst_offset(
+                1,
+                crate::superdsc_opspec::LandingOffset::after(7, 128 * 128)
+            ),
             7 * 128 * 128,
             "the last chunk lands seven blocks of entries in, inside the same landing"
         );

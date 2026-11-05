@@ -3029,12 +3029,11 @@ impl LandingFrame {
                     frame: to.to_vec(),
                 });
             }
-            let t_rows = nz(total / width)
-                .ok_or_else(|| FrameError::CrossesEntry {
-                    entries: entries.get(),
-                    slab,
-                    frame: to.to_vec(),
-                })?;
+            let t_rows = nz(total / width).ok_or_else(|| FrameError::CrossesEntry {
+                entries: entries.get(),
+                slab,
+                frame: to.to_vec(),
+            })?;
             if entries.get() == 1 || width == stick {
                 let rows = nz(slab / width).ok_or_else(|| FrameError::CrossesEntry {
                     entries: entries.get(),
@@ -3122,7 +3121,9 @@ impl LandingFrame {
     /// one-row blocks) — the unit the chunk legs step the landing offset by.
     pub fn elems_per_entry(self) -> u32 {
         match self {
-            LandingFrame::Blocks { blocks, rows, w, .. } => blocks.get() * rows.get() * w.elems(),
+            LandingFrame::Blocks {
+                blocks, rows, w, ..
+            } => blocks.get() * rows.get() * w.elems(),
             LandingFrame::Flat { rows, w, .. } => rows.get() * w.elems(),
             LandingFrame::Restickify { rows, w, .. } => rows.get() * w.elems(),
         }
@@ -3142,7 +3143,9 @@ impl LandingFrame {
     /// The frame's width — the landing's column extent in elements.
     pub fn width(self) -> StickExtent<Fp16> {
         match self {
-            LandingFrame::Blocks { w, .. } | LandingFrame::Flat { w, .. } | LandingFrame::Restickify { w, .. } => w,
+            LandingFrame::Blocks { w, .. }
+            | LandingFrame::Flat { w, .. }
+            | LandingFrame::Restickify { w, .. } => w,
         }
     }
 
@@ -3218,7 +3221,11 @@ pub enum FrameError {
     /// The frame does not tile each gathered entry's plane into whole `[rows, w]` blocks —
     /// `index_select` keeps the entry axis whole, so each entry's plane must be a whole
     /// number of the frame's blocks.
-    CrossesEntry { entries: u32, slab: u64, frame: Vec<i64> },
+    CrossesEntry {
+        entries: u32,
+        slab: u64,
+        frame: Vec<i64>,
+    },
 }
 
 impl core::fmt::Display for FrameError {
@@ -3236,7 +3243,11 @@ impl core::fmt::Display for FrameError {
                  frame not a whole number of {stick}-element sticks wide is outside this \
                  gather's domain"
             ),
-            FrameError::CrossesEntry { entries, slab, frame } => write!(
+            FrameError::CrossesEntry {
+                entries,
+                slab,
+                frame,
+            } => write!(
                 f,
                 "re-frames {entries} gathered planes of {slab} elements as {frame:?} — the \
                  frame crosses a gathered entry: `index_select` keeps the entry axis whole \
@@ -3246,9 +3257,6 @@ impl core::fmt::Display for FrameError {
         }
     }
 }
-
-
-
 
 ///
 /// ⛔ THE RUN IS NAMED IN STICKS, AND THAT IS THE WHOLE TYPE. The index tensor reaches the L3LU IBR

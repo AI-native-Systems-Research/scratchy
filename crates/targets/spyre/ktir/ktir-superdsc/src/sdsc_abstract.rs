@@ -7883,7 +7883,6 @@ impl CopyDims {
     pub const ENTRIES_PER_OP: u32 =
         <crate::superdsc_opspec::SenUint32 as crate::superdsc_opspec::DataFormat>::ELEMS_PER_STICK;
 
-
     /// The copy's `mb` extent — one-stick sub-rows of THIS op's run of the pass.
     pub const fn mb(self) -> u32 {
         self.mb

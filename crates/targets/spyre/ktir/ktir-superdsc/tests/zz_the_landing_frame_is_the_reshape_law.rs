@@ -19,7 +19,7 @@
 //!   (`Restickify`).
 
 use ktir_superdsc::superdsc_opspec::{
-    FrameError, LandingFrame, PagePlane, StickExtent, Fp16, GatherEntries,
+    Fp16, FrameError, GatherEntries, LandingFrame, PagePlane, StickExtent,
 };
 use std::num::NonZeroU32;
 
@@ -114,7 +114,12 @@ fn the_landing_frame_is_the_reshape_law_over_the_domain_grid() {
                             }),
                         ) => {
                             assert_eq!(b.get(), blocks, "{to:?} sticks {sticks} entries {entries}");
-                            assert_eq!(r.get(), rows, "{to:?} sticks {stick_} entries {entries}", stick_ = sticks);
+                            assert_eq!(
+                                r.get(),
+                                rows,
+                                "{to:?} sticks {stick_} entries {entries}",
+                                stick_ = sticks
+                            );
                             assert_eq!(gw.elems(), w as u32);
                         }
                         (
@@ -126,7 +131,12 @@ fn the_landing_frame_is_the_reshape_law_over_the_domain_grid() {
                         }
                         (
                             Expected::Restickify { t_rows },
-                            Ok(LandingFrame::Restickify { t_rows: t, rows: per_entry, w: gw, .. }),
+                            Ok(LandingFrame::Restickify {
+                                t_rows: t,
+                                rows: per_entry,
+                                w: gw,
+                                ..
+                            }),
                         ) => {
                             assert_eq!(t.get(), t_rows, "{to:?} sticks {sticks} entries {entries}");
                             // the stored per-entry rows are the division the law guarantees exact
@@ -152,7 +162,10 @@ fn the_landing_frame_is_the_reshape_law_over_the_domain_grid() {
 #[test]
 fn a_dim_no_landing_holds_refuses_by_name() {
     let err = LandingFrame::of(&[-4, 128], plane(2), nz(4)).expect_err("-4 rows");
-    assert!(matches!(err, FrameError::NotStatable { dim: -4 }), "{err:?}");
+    assert!(
+        matches!(err, FrameError::NotStatable { dim: -4 }),
+        "{err:?}"
+    );
     let huge = i64::MAX;
     let err = LandingFrame::of(&[huge, huge, 128], plane(2), nz(2))
         .expect_err("a product that overflows");
@@ -165,11 +178,20 @@ fn a_dim_no_landing_holds_refuses_by_name() {
 fn a_sub_stick_width_refuses_by_name() {
     let err = LandingFrame::of(&[4, 96], plane(2), nz(4)).expect_err("96 is not whole sticks");
     assert!(
-        matches!(err, FrameError::NotWholeSticks { width: 96, stick: 64 }),
+        matches!(
+            err,
+            FrameError::NotWholeSticks {
+                width: 96,
+                stick: 64
+            }
+        ),
         "{err:?}"
     );
     let err = LandingFrame::of(&[2, 3, 130], plane(2), nz(2)).expect_err("130 is not whole sticks");
-    assert!(matches!(err, FrameError::NotWholeSticks { width: 130, .. }), "{err:?}");
+    assert!(
+        matches!(err, FrameError::NotWholeSticks { width: 130, .. }),
+        "{err:?}"
+    );
 }
 
 /// A frame whose blocks cross a gathered entry refuses by name: `index_select`
@@ -179,7 +201,8 @@ fn a_sub_stick_width_refuses_by_name() {
 fn a_frame_that_crosses_an_entry_refuses_by_name() {
     // rank 2: a 3-stick plane (192 elements) read 256 wide — 256 does not
     // divide 192, so the frame crosses the entry.
-    let err = LandingFrame::of(&[3, 256], plane(3), nz(4)).expect_err("256 does not divide the 192-element plane");
+    let err = LandingFrame::of(&[3, 256], plane(3), nz(4))
+        .expect_err("256 does not divide the 192-element plane");
     assert!(matches!(err, FrameError::CrossesEntry { .. }), "{err:?}");
     // rank 3: rows that do not tile the plane
     let err = LandingFrame::of(&[4, 5, 64], plane(2), nz(4)).expect_err("5 rows do not tile 8192");
@@ -224,5 +247,8 @@ fn the_extents_are_whole_by_construction() {
         1,
         "the existing StickExtent is the width type"
     );
-    assert!(StickExtent::<Fp16>::new(65).is_err(), "sub-stick widths do not exist");
+    assert!(
+        StickExtent::<Fp16>::new(65).is_err(),
+        "sub-stick widths do not exist"
+    );
 }

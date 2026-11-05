@@ -70,8 +70,8 @@ use ktir_core::dtypes::DType;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::irtype::IrType;
 use ktir_core::opkind::OpKind;
-use ktir_superdsc::emit::whole_function::lower_function;
 use ktir_superdsc::emit::EmittedOp;
+use ktir_superdsc::emit::whole_function::lower_function;
 use ktir_superdsc::ktir_node::{BufferId, KtirNode, Program};
 use ktir_superdsc::place::{PlaceId, act_name};
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
@@ -97,11 +97,9 @@ impl Frame {
     fn to(self, entries: u64, slab: u64) -> Vec<i64> {
         match self {
             Frame::Blocks { rows, cols } => vec![entries as i64, rows as i64, cols as i64],
-            Frame::Blocked {
-                blocks,
-                rows,
-                cols,
-            } => vec![entries as i64, blocks as i64, rows as i64, cols as i64],
+            Frame::Blocked { blocks, rows, cols } => {
+                vec![entries as i64, blocks as i64, rows as i64, cols as i64]
+            }
             Frame::Flat { w } => vec![(entries * slab / w) as i64, w as i64],
         }
     }
@@ -117,11 +115,7 @@ impl Frame {
     fn rows_cols(self, entries: u64, slab: u64) -> (u64, u64) {
         match self {
             Frame::Blocks { rows, cols } => (entries * rows, cols),
-            Frame::Blocked {
-                blocks,
-                rows,
-                cols,
-            } => (entries * blocks * rows, cols),
+            Frame::Blocked { blocks, rows, cols } => (entries * blocks * rows, cols),
             Frame::Flat { w } => (entries * slab / w, w),
         }
     }
@@ -210,10 +204,31 @@ fn dump_page_gather_sweep() {
         cells.push((Frame::Blocks { rows, cols }, 2u64, rows * cols));
     }
     // The one-entry control at the proof size: one block, the landing IS the frame.
-    cells.push((Frame::Blocks { rows: 128, cols: 512 }, 1, 128 * 512));
+    cells.push((
+        Frame::Blocks {
+            rows: 128,
+            cols: 512,
+        },
+        1,
+        128 * 512,
+    ));
     // ── New territory: entries past the 32-entry index stick (the chunk axis) ──
-    cells.push((Frame::Blocks { rows: 128, cols: 128 }, 33, 128 * 128));
-    cells.push((Frame::Blocks { rows: 128, cols: 128 }, 64, 128 * 128));
+    cells.push((
+        Frame::Blocks {
+            rows: 128,
+            cols: 128,
+        },
+        33,
+        128 * 128,
+    ));
+    cells.push((
+        Frame::Blocks {
+            rows: 128,
+            cols: 128,
+        },
+        64,
+        128 * 128,
+    ));
     cells.push((Frame::Blocks { rows: 64, cols: 64 }, 96, 64 * 64));
     // ── New territory: the rank-2 flats (`w` one stick — the landing IS the frame) ──
     cells.push((Frame::Flat { w: 64 }, 4, 8192));
@@ -253,7 +268,10 @@ fn dump_page_gather_sweep() {
         }
     }
     eprintln!("page-gather sweep: {emitted} bundles, {missing} missing-lowering cells");
-    assert_eq!(missing, 0, "every stated cell must lower — the walk refuses none");
+    assert_eq!(
+        missing, 0,
+        "every stated cell must lower — the walk refuses none"
+    );
 }
 
 fn dump_cell(frame: Frame, entries: u64, slab: u64, root: &std::path::Path, sha: &str) -> Cell {
@@ -333,7 +351,11 @@ fn dump_cell(frame: Frame, entries: u64, slab: u64, root: &std::path::Path, sha:
     };
 
     let cell = Cell {
-        frame: frame.to(entries, slab).into_iter().map(|d| d as u32).collect(),
+        frame: frame
+            .to(entries, slab)
+            .into_iter()
+            .map(|d| d as u32)
+            .collect(),
         form: frame.tag(entries).into(),
         entries: entries as u32,
         slab: slab as u32,
@@ -386,8 +408,15 @@ fn paged_program(frame: Frame, entries: u64, slab: u64, pages: u64) -> KtirNode 
     };
     let (p_pool, p_idx, p_a, p_b) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
     let (zero, v_pool, v_idx, ind, src, res) = (Ssa(4), Ssa(5), Ssa(6), Ssa(7), Ssa(8), Ssa(9));
-    let (v_a, t_a, val_a, v_b, t_b, val_b, sum) =
-        (Ssa(10), Ssa(11), Ssa(12), Ssa(13), Ssa(14), Ssa(15), Ssa(16));
+    let (v_a, t_a, val_a, v_b, t_b, val_b, sum) = (
+        Ssa(10),
+        Ssa(11),
+        Ssa(12),
+        Ssa(13),
+        Ssa(14),
+        Ssa(15),
+        Ssa(16),
+    );
     // The indirect dim's subscript — `Sym(0) + Dim(0)`, the one form `gather_subscripts` builds
     // and the one `gathers_of` folds into an entry base.
     let sub0 = a.expr(AffineExpr::Add(
@@ -476,7 +505,12 @@ fn paged_program(frame: Frame, entries: u64, slab: u64, pages: u64) -> KtirNode 
             &to,
         ),
         shape(
-            Operation::new(a, Some(t_a), OpKind::KtdpConstructAccessTile, &[v_a, zero, zero]),
+            Operation::new(
+                a,
+                Some(t_a),
+                OpKind::KtdpConstructAccessTile,
+                &[v_a, zero, zero],
+            ),
             &to,
         ),
         {
@@ -492,7 +526,12 @@ fn paged_program(frame: Frame, entries: u64, slab: u64, pages: u64) -> KtirNode 
             &to,
         ),
         shape(
-            Operation::new(a, Some(t_b), OpKind::KtdpConstructAccessTile, &[v_b, zero, zero]),
+            Operation::new(
+                a,
+                Some(t_b),
+                OpKind::KtdpConstructAccessTile,
+                &[v_b, zero, zero],
+            ),
             &to,
         ),
         {
@@ -544,12 +583,7 @@ fn paged_program(frame: Frame, entries: u64, slab: u64, pages: u64) -> KtirNode 
 /// Read the walk's chosen arm off its OWN emission — the gather ops' names and iteration spaces,
 /// and the restickify's one permute — never re-derived from the predicates. A landing that does
 /// not match the cell's stated frame FAILS the dump. Returns the tid the runner reads back.
-fn classify(
-    ops: &[EmittedOp],
-    frame: Frame,
-    entries: u64,
-    slab: u64,
-) -> Result<u32, String> {
+fn classify(ops: &[EmittedOp], frame: Frame, entries: u64, slab: u64) -> Result<u32, String> {
     // The gather ops: `gather_o{tid}` (one op) or `gather{n}_o{tid}` (chunk n, entries past the
     // index stick). The head-major staging front's `gather{c}_{i}_o{tid}` copies are NOT this
     // arm's (an underscored chunk AND run index) and no cell here states one.
@@ -615,11 +649,7 @@ fn classify(
             }
             Ok(tid)
         }
-        Frame::Blocked {
-            blocks,
-            rows,
-            cols,
-        } => {
+        Frame::Blocked { blocks, rows, cols } => {
             let mut seen = 0u64;
             for g in &gathers {
                 let d = g.dsc();
@@ -755,7 +785,11 @@ fn write_cell(dir: &std::path::Path, l: &BundleLayout, ops: Option<&Vec<EmittedO
             "    {{\"tid\": {}, \"role\": \"{}\", \"segment\": {}, \"bank\": 0, \"offset\": {}, \
              \"size\": {}}}",
             tid,
-            if tid == cell.readback_tid { "Logits" } else { "Activation" },
+            if tid == cell.readback_tid {
+                "Logits"
+            } else {
+                "Activation"
+            },
             intermediate,
             off,
             synth.sizes.get(name).copied().unwrap_or(0),

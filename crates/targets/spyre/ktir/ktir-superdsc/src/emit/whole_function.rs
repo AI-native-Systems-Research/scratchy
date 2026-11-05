@@ -5015,15 +5015,10 @@ fn lower_function_folded(
                     // refusal) are chunked one op a run by the frame's own leg iterator, each
                     // at its own entry base and landing offset: no entry count or size is
                     // refused.
-                    let frame =
-                        crate::superdsc_opspec::LandingFrame::of(&to, plane, entries).map_err(
-                            |e| Error {
-                                message: format!(
-                                    "{}: `{:?}` {}",
-                                    f.name, op.op_type, e
-                                ),
-                            },
-                        )?;
+                    let frame = crate::superdsc_opspec::LandingFrame::of(&to, plane, entries)
+                        .map_err(|e| Error {
+                            message: format!("{}: `{:?}` {}", f.name, op.op_type, e),
+                        })?;
                     // ⭐ THE CHUNK LEGS EVERY FRAME SHARES — one op a run of one index stick
                     // (the frame's own [`LandingFrame::legs`]: each run at its own entry base,
                     // the gather's own first entry plus the run's start, both whole sticks, and
@@ -5091,7 +5086,10 @@ fn lower_function_folded(
                             // away.
                             let land_tid =
                                 mint_scratch(k, layout, floor, res, Scratch::GatherLanding);
-                            layout.synth(crate::place::PlaceId::Act(land_tid), &[t_rows.get(), w.elems()]);
+                            layout.synth(
+                                crate::place::PlaceId::Act(land_tid),
+                                &[t_rows.get(), w.elems()],
+                            );
                             let land = Region {
                                 tid: land_tid,
                                 v_rows: t_rows.get(),
@@ -5113,7 +5111,8 @@ fn lower_function_folded(
                                 )
                             })?;
                             let tid = mint_inter(k, layout, floor, res);
-                            let dst = stick_major_region(tid, t_rows.get(), w.stick_count(), layout);
+                            let dst =
+                                stick_major_region(tid, t_rows.get(), w.stick_count(), layout);
                             out.push(permute(
                                 f.name,
                                 &Region {
@@ -5143,7 +5142,8 @@ fn lower_function_folded(
                             let w = frame.width();
                             let landing_rows = frame.landing_rows();
                             let tid = mint_inter(k, layout, floor, res);
-                            let dst = stick_major_region(tid, landing_rows, w.stick_count(), layout);
+                            let dst =
+                                stick_major_region(tid, landing_rows, w.stick_count(), layout);
                             let land_name = dst.name();
                             chunk_legs(frame, tid, &land_name, &|run, offset| {
                                 crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage::of_run(
@@ -5154,10 +5154,8 @@ fn lower_function_folded(
                             // a rank-2 frame stated none, and its landing — one stick column,
                             // per-entry one-stick blocks, or the restickified column above — is
                             // the flat frame's own bytes.
-                            if matches!(
-                                frame,
-                                crate::superdsc_opspec::LandingFrame::Blocks { .. }
-                            ) && let Some(c) = block_landing_cols(w.elems(), stick)
+                            if matches!(frame, crate::superdsc_opspec::LandingFrame::Blocks { .. })
+                                && let Some(c) = block_landing_cols(w.elems(), stick)
                             {
                                 batch_blocks.insert(tid, c);
                             }
@@ -7764,7 +7762,14 @@ fn same_card_bytes(from: &[i64], to: &[i64]) -> bool {
 fn page_gather_of(
     f: &IRFunction<'static>,
     g: Gather,
-) -> Result<(Gather, std::num::NonZeroU32, crate::superdsc_opspec::PagePlane), Error> {
+) -> Result<
+    (
+        Gather,
+        std::num::NonZeroU32,
+        crate::superdsc_opspec::PagePlane,
+    ),
+    Error,
+> {
     let Some(tile) = f.operations.iter().find(|o| o.result == Some(g.tile)) else {
         return err(format!(
             "{}: the gather's tile states no defining op",
@@ -7793,14 +7798,12 @@ fn page_gather_of(
     let entries = u32::try_from(dims[d])
         .ok()
         .and_then(std::num::NonZeroU32::new)
-        .ok_or_else(|| {
-            Error {
-                message: format!(
-                    "{}: the gather's tile states {} entries — a gather of no entries has no \
+        .ok_or_else(|| Error {
+            message: format!(
+                "{}: the gather's tile states {} entries — a gather of no entries has no \
                      plane to re-frame",
-                    f.name, dims[d]
-                ),
-            }
+                f.name, dims[d]
+            ),
         })?;
     let slab: i64 = dims
         .iter()
@@ -7816,15 +7819,13 @@ fn page_gather_of(
             f.name
         ));
     }
-    let sticks = std::num::NonZeroU32::new(
-        u32::try_from(slab / stick).map_err(|_| Error {
-            message: format!(
-                "{}: the gather's tile states a plane of {} sticks — no u32 plane holds it",
-                f.name,
-                slab / stick
-            ),
-        })?,
-    )
+    let sticks = std::num::NonZeroU32::new(u32::try_from(slab / stick).map_err(|_| Error {
+        message: format!(
+            "{}: the gather's tile states a plane of {} sticks — no u32 plane holds it",
+            f.name,
+            slab / stick
+        ),
+    })?)
     .expect("a positive stick count is nonzero");
     Ok((
         Gather {
