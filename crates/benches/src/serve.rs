@@ -932,8 +932,25 @@ fn add_detailed_json(obj: &mut serde_json::Map<String, serde_json::Value>, run: 
     );
 }
 
-/// Write the results JSON where `--output-json` and `--save-result` say.
+/// When a result's measured requests ran, as Unix seconds: from its `duration` back to `ended`,
+/// the moment it is written, which is the moment they finished. So a cell can be placed in a log
+/// kept by wall clock, the matrix's power log among them, to the millisecond.
+fn stamp_window(json: &mut serde_json::Value, ended: f64) {
+    let Some(duration) = json["duration"].as_f64() else {
+        return;
+    };
+    let round = |t: f64| (t * 1000.0).round() / 1000.0;
+    json["started_unix_s"] = serde_json::json!(round(ended - duration));
+    json["ended_unix_s"] = serde_json::json!(round(ended));
+}
+
+/// Write the results JSON where `--output-json` and `--save-result` say, stamped with the wall
+/// clock its requests ran over ([`stamp_window`]).
 fn write_results(args: &BenchServeArgs, model: &str, json: &serde_json::Value) -> Result<()> {
+    let mut stamped = json.clone();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    stamp_window(&mut stamped, now.map_or(0.0, |d| d.as_secs_f64()));
+    let json = &stamped;
     // --output-json: explicit path.
     if let Some(ref path) = args.output_json {
         std::fs::write(path, serde_json::to_string_pretty(json)?)?;
@@ -2525,6 +2542,19 @@ mod tests {
         );
         assert_eq!(j["capped_answers"], 1, "the cell counts it the same way");
         assert_eq!(j["accuracy"], 0.0, "and scores it wrong");
+    }
+
+    /// A result is stamped with the wall clock its requests ran over: from its duration back to
+    /// when it was written; one with no duration is left as it is.
+    #[test]
+    fn a_result_says_when_its_requests_ran() {
+        let mut j = serde_json::json!({"duration": 12.5});
+        stamp_window(&mut j, 1_700_000_100.25);
+        assert_eq!(j["started_unix_s"], 1_700_000_087.75);
+        assert_eq!(j["ended_unix_s"], 1_700_000_100.25);
+        let mut none = serde_json::json!({});
+        stamp_window(&mut none, 1.0);
+        assert!(none.get("started_unix_s").is_none());
     }
 
     /// A dataset workload's metrics: accuracy over every task sent, a failed request or a capped

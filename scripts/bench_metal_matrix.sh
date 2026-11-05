@@ -21,7 +21,9 @@
 #   peak RSS, major faults             scr bench startup --exec (per child, wait4)
 #   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve (warm, conc 1)
 #   energy: J per rail, Wh + avg/peak W scratchy-power-sampler (CLPC counters,
-#                                        1 Hz, whole run, all engines)
+#                                        1 Hz, whole run, all engines); and each
+#                                        cell's J, J/request, J/output token and,
+#                                        scored, J per right answer (cell_energy.py)
 #   prompt x answer x users grid       scr bench serve (1, 2, 4 users;
 #     (heat maps, every curve)           128 to 8192 in;
 #                                        64 out, --full adds 512 and 2048 at 1)
@@ -876,7 +878,8 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-# Whole-run energy, one number. The workspace's own zero-dependency sampler
+# Whole-run energy, one number, and each cell's (cell_energy.py, over the wall clock bench serve
+# stamps its requests with, read as each model is recorded). The workspace's own zero-dependency sampler
 # reads Apple's CLPC cpu/gpu/ane energy counters (IOReport, no root) once a
 # second into RAW; fold_power sums them into the run JSON at the end. It runs
 # from before the first build to after the last server is down, so the number
@@ -1906,11 +1909,37 @@ PY
 
     ENGINE_KEYS="$(for row in "${ENGINE_ROWS[@]}"; do echo "${row%%|*}"; done)"; export ENGINE_KEYS
     OFFLINE="${OFFLINE}" BASE_CONC="${BASE_CONC}" CONC_LIST="${CONC_LIST}" GRID_CONC_LIST="${GRID_CONC_LIST}" PARITY="${PARITY}" \
+    POWER_LOG="${POWER_LOG}" HERE="${HERE}" \
     python3 - "${JSON}" "${RAW}" "${stem}" "${id}" "${quant}" "${feats}" "${built}" \
               "${build_secs}" "${bytes}" "${parity_ok}" "${MLX_PYTHON}" <<'PY'
 import glob, json, os, re, sys
 js, raw, stem, mid, quant, feats, built, secs, size, parity_ok, mlx_python = sys.argv[1:12]
 env = os.environ
+# Each cell's energy, from the power log over the wall clock its requests ran (cell_energy.py).
+# Read once a model is done: the sampler has written every second of its cells by then.
+sys.path.insert(0, env["HERE"])
+import cell_energy
+power_rows = cell_energy.read(env["POWER_LOG"]) if os.path.exists(env["POWER_LOG"]) else []
+def energy(reps):
+    """A cell's energy over all its repeats: the joules and windows of each, summed, then per
+    request, token and right answer over the cell's whole. None where any repeat has none."""
+    parts = []
+    for j in reps:
+        if j.get("started_unix_s") is None or j.get("ended_unix_s") is None:
+            return None
+        e = cell_energy.window(power_rows, float(j["started_unix_s"]), float(j["ended_unix_s"]))
+        if e is None:
+            return None
+        parts.append(e)
+    if not parts:
+        return None
+    total = {k: round(sum(p[k] for p in parts), 2) for k in ("cpu_j", "gpu_j", "ane_j", "soc_j")}
+    total |= {"window_s": round(sum(p["window_s"] for p in parts), 3),
+              "samples": sum(p["samples"] for p in parts)}
+    whole = {k: sum(j.get(k) or 0 for j in reps) for k in ("completed", "failed", "total_output_tokens")}
+    if reps[0].get("accuracy") is not None:
+        whole |= {"accuracy": reps[0]["accuracy"], "num_tasks": reps[0].get("num_tasks")}
+    return cell_energy.per(whole, total)
 # Per-token speed is TPOT, from the server's token count, never ITL: ITL is
 # the gap between stream chunks, and once an engine streams several tokens a
 # chunk (multi-token prediction, speculative decoding) one gap spans several.
@@ -2003,6 +2032,8 @@ def scaling(engine):
         while len(reps) < int(env["SCALE_REPEATS"]) and (r := load(os.path.basename(p)[:-5] + f".r{len(reps)}.json")):
             reps.append(r)
         cell = {"axis": axis, **where, **pooled(reps), "repeats": len(reps)}
+        if (e := energy(reps)) is not None:
+            cell["energy"] = e
         if all("errors" in r for r in reps):
             cell["requests"] = requests(reps)
         cells.append(cell)
@@ -2029,8 +2060,11 @@ def tasks(engine):
         step = 0 if key == "base" else int(key)
         kind = ("base" if key == "base" else
                 "rate" if env["OPEN_LOOP"] == "1" and workload != "rag-accuracy" else "users")
-        cells.append({"workload": workload, "conc": step, "load": kind,
-                      **{k: v for k, v in j.items() if k in TASK_KEEP or PCT.fullmatch(k)}})
+        cell = {"workload": workload, "conc": step, "load": kind,
+                **{k: v for k, v in j.items() if k in TASK_KEEP or PCT.fullmatch(k)}}
+        if (e := energy([j])) is not None:
+            cell["energy"] = e
+        cells.append(cell)
     return cells or None
 def parity_ties():
     """From the gate's log: {prompt: [gap, ...]} for each prompt that passed as a near-tie."""
