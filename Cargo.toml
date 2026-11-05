@@ -46,6 +46,7 @@ members = [
     "crates/models/spec",
     "crates/compiler",
     "crates/compiler/macros",
+    "crates/compiler/frontend",
     "crates/compiler/subtile",
     "crates/targets/metal",
     "crates/targets/metal/compiler",

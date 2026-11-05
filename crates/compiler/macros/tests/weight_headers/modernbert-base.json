@@ -1,0 +1,23 @@
+{
+  "repo": "answerdotai/ModernBERT-base",
+  "configs": ["modernbert/modernbert-base"],
+  "tensors": {
+    "decoder.bias": [50368],
+    "head.dense.weight": [768, 768],
+    "head.norm.weight": [768],
+    "model.embeddings.norm.weight": [768],
+    "model.embeddings.tok_embeddings.weight": [50368, 768],
+    "model.final_norm.weight": [768],
+    "model.layers.0.attn.Wo.weight": [768, 768],
+    "model.layers.0.attn.Wqkv.weight": [2304, 768],
+    "model.layers.0.mlp.Wi.weight": [2304, 768],
+    "model.layers.0.mlp.Wo.weight": [768, 1152],
+    "model.layers.0.mlp_norm.weight": [768],
+    "model.layers.1.attn.Wo.weight": [768, 768],
+    "model.layers.1.attn.Wqkv.weight": [2304, 768],
+    "model.layers.1.attn_norm.weight": [768],
+    "model.layers.1.mlp.Wi.weight": [2304, 768],
+    "model.layers.1.mlp.Wo.weight": [768, 1152],
+    "model.layers.1.mlp_norm.weight": [768]
+  }
+}

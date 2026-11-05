@@ -63,8 +63,8 @@ pub enum BridgeError {
     /// FUF op kind outside the coarse Llama-3.2 decode set.
     UnsupportedOp { tile: TileId, op: OpKind },
     /// A tile's (or an upstream tile's) output didn't close to a
-    /// concrete shape under `bounds` — shape inference left a `Var`, or
-    /// a dim referenced a missing config bound.
+    /// concrete shape under `bounds`: a dim referenced a missing config
+    /// bound.
     UnresolvedShape { tile: TileId, what: &'static str },
     /// A tile referenced a `(TileId, slot)` the walk hadn't produced —
     /// FUF not in ascending-id topological order, or a bad slot.
@@ -275,18 +275,6 @@ struct Builder<'a> {
     /// The construct being expanded, while its ops are pushed.
     expanding: Option<ExpansionId>,
     expansions: u32,
-}
-
-/// Which config key names the routed experts, and which routing math orders the top-k — the
-/// discriminator `moe_block`'s expansion reads off the model bounds (Mixtral / Qwen / GLM-4).
-enum RouterFlavor {
-    /// `num_local_experts` — top-k then softmax over the chosen (Mixtral).
-    Mixtral,
-    /// `num_experts` — softmax over every expert, then top-k (Qwen; renorm per config).
-    QwenShared,
-    /// `n_routed_experts` — sigmoid + e_score_correction_bias keys pick the top-k, the unbiased
-    /// sigmoids gathered as scores (GLM-4 / DeepSeek-V3 `noaux_tc` at `n_group = 1`).
-    GlmSigmoid,
 }
 
 /// The expert half of a MoE block, which every router shares.
@@ -808,6 +796,7 @@ pub fn lower_decode_to_wavefront(
             // the splice's output slot so downstream tiles read the
             // same `EmbeddedHidden` source. No op is emitted
             // — this op is structurally absent from the megakernel.
+            #[cfg(feature = "metal")]
             OpKind::MmEmbedSplice => {
                 let upstream = bx.input_at(tile, 0)?;
                 let producer = match upstream {
@@ -1321,8 +1310,11 @@ pub fn lower_decode_to_wavefront(
                     .filter(|n| n.op == OpKind::CaptureHidden)
                     .map(|n| n.id)
                     .collect();
-                let declared = (bx.model.layer_sets.get(crate::config::DRAFT_CAPTURE_LAYERS))
-                    .map_or(0, |s| s.members().len());
+                let declared = (bx
+                    .model
+                    .layer_sets
+                    .get(crate::draft_capture::DRAFT_CAPTURE_LAYERS))
+                .map_or(0, |s| s.members().len());
                 if captures.len() != declared {
                     return Err(BridgeError::MalformedOp {
                         tile,
@@ -1483,33 +1475,25 @@ pub fn lower_decode_to_wavefront(
                         detail: "moe_block without a weight input",
                     })?;
                 let b = &bx.bounds;
-                // Variant discriminators mirror the metal impls'
-                // applies_to: Mixtral = num_local_experts; Qwen-shared =
-                // num_experts; GLM-4 = n_routed_experts with Qwen-style
-                // on-disk naming (switch_mlp + shared_experts), routed
-                // sigmoid+bias (DeepSeek's noaux_tc at n_group=1).
-                let (router_flavor, num_experts) = if let Some(&n) = b.get("num_local_experts") {
-                    (RouterFlavor::Mixtral, n as u32)
-                } else if let Some(&n) = b.get("n_routed_experts") {
-                    (RouterFlavor::GlmSigmoid, n as u32)
-                } else if let Some(&n) = b.get("num_experts") {
-                    (RouterFlavor::QwenShared, n as u32)
-                } else {
-                    return Err(BridgeError::MissingBound { key: "num_experts" });
-                };
+                // The routing is the one the config's spelling of its expert count names, and
+                // the expert width the key that sizes it: the same derivation the bundle's roles
+                // and loader read (`bundles::routed_experts` / `expert_width`). GLM-4 keeps
+                // Qwen-style on-disk naming (switch_mlp + shared_experts).
+                use crate::bundles::Routing;
+                let (count_key, router_flavor) = crate::bundles::routed_experts(b)
+                    .ok_or(BridgeError::MissingBound { key: "num_experts" })?;
+                let num_experts = b[count_key] as u32;
                 let top_k =
                     b.get("num_experts_per_tok")
                         .copied()
                         .ok_or(BridgeError::MissingBound {
                             key: "num_experts_per_tok",
                         })? as u32;
-                let moe_inter = b
-                    .get("moe_intermediate_size")
-                    .or_else(|| b.get("intermediate_size"))
-                    .copied()
-                    .ok_or(BridgeError::MissingBound {
+                let moe_inter = (crate::bundles::expert_width(b)).map(|k| b[k]).ok_or(
+                    BridgeError::MissingBound {
                         key: "moe_intermediate_size",
-                    })? as u32;
+                    },
+                )? as u32;
                 let shared_inter = b
                     .get("shared_expert_intermediate_size")
                     .copied()
@@ -1517,10 +1501,11 @@ pub fn lower_decode_to_wavefront(
                 let norm_topk = b.get("norm_topk_prob").copied().unwrap_or(0) != 0;
                 // The experts' body is the config's declared activation's: never a default the
                 // checkpoint did not state (a relu² bank read as gated SiLU computes garbage).
-                let body = bx.model.expert_activation.body().map_err(|act| {
-                    let act = act.to_string();
-                    BridgeError::UnrealizedExpertActivation { tile, act }
-                })?;
+                let body =
+                    crate::config::expert_body(&bx.model.expert_activation).map_err(|act| {
+                        let act = act.to_string();
+                        BridgeError::UnrealizedExpertActivation { tile, act }
+                    })?;
                 // noaux_tc's `routed_scaling_factor` multiplies the renormalized scores last
                 // (mlx `group_expert_select`); 1.0 (GLM-4.5) is the identity and emits nothing.
                 let routed_scale = bx
@@ -1547,29 +1532,29 @@ pub fn lower_decode_to_wavefront(
                 // Nemotron-H: sigmoid+bias keys pick the top-k, the UNBIASED sigmoids gathered,
                 // renormalised and scaled by the routed scaling factor.
                 let (router, bundle) = match router_flavor {
-                    RouterFlavor::QwenShared | RouterFlavor::GlmSigmoid => {
+                    Routing::SoftmaxThenTopK | Routing::CorrectedSigmoid => {
                         (RouterBundle::SharedFused, ExpertBundle::SharedFused)
                     }
-                    RouterFlavor::Mixtral => (RouterBundle::Fused, ExpertBundle::Fused),
+                    Routing::TopKThenSoftmax => (RouterBundle::Fused, ExpertBundle::Fused),
                 };
                 bx.expand();
                 let lg = bx.push_op(SubOp::RouterLogits { experts, router }, vec![x, w]);
                 let shared = std::num::NonZeroU32::new(shared_inter)
-                    .filter(|_| !matches!(router_flavor, RouterFlavor::Mixtral));
+                    .filter(|_| !matches!(router_flavor, Routing::TopKThenSoftmax));
                 let lg = match router_flavor {
-                    RouterFlavor::QwenShared => bx.push(SubOp::RouteSoftmax, &[lg]),
-                    RouterFlavor::GlmSigmoid => bx.push_op(
+                    Routing::SoftmaxThenTopK => bx.push(SubOp::RouteSoftmax, &[lg]),
+                    Routing::CorrectedSigmoid => bx.push_op(
                         SubOp::RouteSigmoidBias { router },
                         vec![InputRef::Op(lg), w],
                     ),
-                    RouterFlavor::Mixtral => lg,
+                    Routing::TopKThenSoftmax => lg,
                 };
                 let indices = bx.route_top_k(lg, k);
                 let scores = bx.push(SubOp::RouteGatherScores, &[lg, indices]);
                 let scores = match (router_flavor, norm_topk) {
-                    (RouterFlavor::QwenShared, true) => bx.push(SubOp::RouteRenorm, &[scores]),
-                    (RouterFlavor::QwenShared, false) => scores,
-                    (RouterFlavor::GlmSigmoid, norm) => {
+                    (Routing::SoftmaxThenTopK, true) => bx.push(SubOp::RouteRenorm, &[scores]),
+                    (Routing::SoftmaxThenTopK, false) => scores,
+                    (Routing::CorrectedSigmoid, norm) => {
                         let scores = match norm {
                             true => bx.push(SubOp::RouteRenorm, &[scores]),
                             false => scores,
@@ -1579,7 +1564,7 @@ pub fn lower_decode_to_wavefront(
                             None => scores,
                         }
                     }
-                    (RouterFlavor::Mixtral, _) => bx.push(SubOp::RouteSoftmax, &[scores]),
+                    (Routing::TopKThenSoftmax, _) => bx.push(SubOp::RouteSoftmax, &[scores]),
                 };
                 let hidden = bx.out_cols(tile, 0, "moe_block output")?;
                 let experts = Experts {

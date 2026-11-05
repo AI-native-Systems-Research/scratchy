@@ -279,7 +279,7 @@ struct SizeProbe {
 ///
 /// GEMM-layout normalisation: HF stores projection weights as
 /// `[out_features, in_features]`; the scratchy-forward-compiler compiler's
-/// `sig_gemm` models them as `[K, N] = [in_features, out_features]`.
+/// typed `gemm` signature models them as `[K, N] = [in_features, out_features]`.
 /// We swap the two dims of every 2-D weight so the manifest is in
 /// the compiler's order. `embed_tokens` is the exception — it's
 /// consumed by `sig_embed`, whose signature treats the tensor as

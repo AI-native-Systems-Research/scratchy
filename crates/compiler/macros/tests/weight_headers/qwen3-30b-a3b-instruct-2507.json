@@ -1,0 +1,18 @@
+{
+  "repo": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+  "configs": ["qwen3-moe/qwen3-30b-a3b-instruct-2507"],
+  "tensors": {
+    "lm_head.weight": [151936, 2048],
+    "model.embed_tokens.weight": [151936, 2048],
+    "model.layers.0.input_layernorm.weight": [2048],
+    "model.layers.0.mlp.gate.weight": [128, 2048],
+    "model.layers.0.post_attention_layernorm.weight": [2048],
+    "model.layers.0.self_attn.k_norm.weight": [128],
+    "model.layers.0.self_attn.k_proj.weight": [512, 2048],
+    "model.layers.0.self_attn.o_proj.weight": [2048, 4096],
+    "model.layers.0.self_attn.q_norm.weight": [128],
+    "model.layers.0.self_attn.q_proj.weight": [4096, 2048],
+    "model.layers.0.self_attn.v_proj.weight": [512, 2048],
+    "model.norm.weight": [2048]
+  }
+}

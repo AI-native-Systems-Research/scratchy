@@ -16,6 +16,7 @@ use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
+use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
 use scratchy_target_metal::targets::is_nax_capable;
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
@@ -451,8 +452,8 @@ fn staged_tiles_on_a_chip_emulated_by_width() {
             kernel,
             DequantDtype::Bf16,
             ScaleDtype::Bf16,
-            4,
-            GROUP as u32,
+            AffineBits::new(4).unwrap(),
+            AffineGroupSize::new(GROUP as u32).unwrap(),
         );
         let constants: Vec<ConstantValue> = AffineQmvWideConstants {
             k: KDimI32(k as i32),
@@ -1078,8 +1079,8 @@ fn register_tile_on_a_chip_emulated_by_width() {
             kernel,
             DequantDtype::Bf16,
             ScaleDtype::Bf16,
-            4,
-            GROUP as u32,
+            AffineBits::new(4).unwrap(),
+            AffineGroupSize::new(GROUP as u32).unwrap(),
         );
         let mn = (KDimI32(k as i32), NDimI32(n as i32), MDimI32(bucket as i32));
         let wide_constants: Vec<ConstantValue> = AffineQmvWideConstants {

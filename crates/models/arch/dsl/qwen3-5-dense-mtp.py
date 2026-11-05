@@ -1,5 +1,5 @@
 # The Qwen3.5/3.6/3.8 dense targets' multi-token-prediction head, in torch-idiom Python. Parsed
-# by scratchy (compiler/macros/src/parse_python.rs), never executed by the compiler.
+# by scratchy (compiler/frontend/src/parse_python.rs), never executed by the compiler.
 #
 # Drafts the token after next: row t reads the target model's final (post-norm) hidden state
 # `target_hidden[t]` and the embedding of the token that follows it, normalizes each, fuses them
@@ -28,9 +28,13 @@ def qwen3_5_dense_mtp():
         # RMSNorm; partial RoPE.
         qg = gemm(normed, self_attn.q_proj[layer])
         (q, gate) = gate_split(qg)
-        q = rmsnorm(q, self_attn.q_norm[layer])
+        q_heads = reshape(q, [num_tokens * num_attention_heads, head_dim])
+        q_heads = rmsnorm(q_heads, self_attn.q_norm[layer])
+        q = reshape(q_heads, [num_tokens, num_attention_heads * head_dim])
         k = gemm(normed, self_attn.k_proj[layer])
-        k = rmsnorm(k, self_attn.k_norm[layer])
+        k_heads = reshape(k, [num_tokens * num_key_value_heads, head_dim])
+        k_heads = rmsnorm(k_heads, self_attn.k_norm[layer])
+        k = reshape(k_heads, [num_tokens, num_key_value_heads * head_dim])
         v = gemm(normed, self_attn.v_proj[layer])
         (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer])
         attn = attention(q, k, v, kv_cache[layer], block_table)
@@ -46,5 +50,8 @@ def qwen3_5_dense_mtp():
         )
         hidden_states = add(mlp_out, hidden_states)
     normed = rmsnorm(hidden_states, norm)
-    logits = gemm(normed, lm_head)
+    # The target lends its lm_head, at the target's width: the head's rows are read at it, which
+    # is its own width (a model compiles here only where the two are equal).
+    lent = as_dim(normed, backbone_hidden_size)
+    logits = gemm(lent, lm_head)
     return logits

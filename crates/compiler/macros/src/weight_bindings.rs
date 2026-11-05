@@ -645,9 +645,8 @@ pub(crate) fn from_tape(
     // resolves its own `embed_base`: by name against the program's weight
     // table. Omitting it emits a `Weights` whose `load` body references an
     // `embed_tokens` field that was never declared.
-    let embed = (0..program.weights.len())
-        .map(|i| WeightId(i as u32))
-        .find(|id| program.weights.path(*id).join("_").contains("embed"));
+    let embed =
+        (program.weights.ids()).find(|id| program.weights.path(*id).join("_").contains("embed"));
     if let Some(id) = embed {
         let kind = match abi.embed {
             EmbedStorage::AffineQuant => WeightKind::AffineQuantEmbedding,
@@ -691,6 +690,7 @@ mod tests {
             locals: Default::default(),
             weights,
             reshape_targets: Default::default(),
+            dim_casts: Default::default(),
             prelude: Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),

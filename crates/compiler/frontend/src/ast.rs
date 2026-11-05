@@ -18,9 +18,19 @@ pub struct Ast {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     /// `name = expr`
-    Assign { target: Ident, value: Expr },
+    Assign {
+        target: Ident,
+        value: Expr,
+        /// The statement's line in its carrier file; `None` for one a compiler pass inserted.
+        line: Option<u32>,
+    },
     /// `(a, b, c) = expr` — tuple destructuring assignment.
-    AssignTuple { targets: Vec<Ident>, value: Expr },
+    AssignTuple {
+        targets: Vec<Ident>,
+        value: Expr,
+        /// As [`Stmt::Assign`]'s.
+        line: Option<u32>,
+    },
     /// `for ivar in range(<bound>):` — symbolic trip count.
     For {
         ivar: Ident,
@@ -72,7 +82,7 @@ pub enum InSet {
     /// A closed list of integer literals written in the DSL.
     Lit(Vec<u64>),
     /// A layer set the model's config derives
-    /// ([`crate::config::ModelParams::layer_sets`]), resolved per model.
+    /// (the macro crate's `config::ModelParams::layer_sets`), resolved per model.
     Named(Ident),
 }
 
@@ -125,9 +135,7 @@ pub enum Expr {
     /// for `classify` to thread into [`Program::reshape_targets`]
     /// keyed by the producing `LocalId`; the classified form drops
     /// the target list and becomes
-    /// `Expr::Call { op: OpKind::Reshape, args: [source] }`,
-    /// matching the synthesized-reshape shape from
-    /// `shape::apply_reshape_hints`.
+    /// `Expr::Call { op: OpKind::Reshape, args: [source] }`.
     ///
     /// G.5.c surface admitted literals and bare bound names. G.5.f.a
     /// extended each [`DimSpec`] to a binary tree over `*` and `/`

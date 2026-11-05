@@ -1,0 +1,85 @@
+{
+ "repo": "mlx-community/gemma-4-26b-a4b-it-4bit",
+ "configs": [
+  "gemma4-moe/gemma-4-26b-a4b-it"
+ ],
+ "head": false,
+ "bundles": {
+  "router": "language_model.model.layers.0.router",
+  "experts.switch_glu": "language_model.model.layers.0.experts.switch_glu"
+ },
+ "quantization": {
+  "group_size": 64,
+  "bits": 4,
+  "mode": "affine",
+  "language_model.model.layers.0.router.proj": {
+   "group_size": 64,
+   "bits": 8
+  }
+ },
+ "tensors": {
+  "language_model.model.layers.0.experts.switch_glu.down_proj.biases": [
+   128,
+   2816,
+   11
+  ],
+  "language_model.model.layers.0.experts.switch_glu.down_proj.scales": [
+   128,
+   2816,
+   11
+  ],
+  "language_model.model.layers.0.experts.switch_glu.down_proj.weight": [
+   128,
+   2816,
+   88
+  ],
+  "language_model.model.layers.0.experts.switch_glu.gate_proj.biases": [
+   128,
+   704,
+   44
+  ],
+  "language_model.model.layers.0.experts.switch_glu.gate_proj.scales": [
+   128,
+   704,
+   44
+  ],
+  "language_model.model.layers.0.experts.switch_glu.gate_proj.weight": [
+   128,
+   704,
+   352
+  ],
+  "language_model.model.layers.0.experts.switch_glu.up_proj.biases": [
+   128,
+   704,
+   44
+  ],
+  "language_model.model.layers.0.experts.switch_glu.up_proj.scales": [
+   128,
+   704,
+   44
+  ],
+  "language_model.model.layers.0.experts.switch_glu.up_proj.weight": [
+   128,
+   704,
+   352
+  ],
+  "language_model.model.layers.0.router.per_expert_scale": [
+   128
+  ],
+  "language_model.model.layers.0.router.proj.biases": [
+   128,
+   44
+  ],
+  "language_model.model.layers.0.router.proj.scales": [
+   128,
+   44
+  ],
+  "language_model.model.layers.0.router.proj.weight": [
+   128,
+   704
+  ],
+  "language_model.model.layers.0.router.scale": [
+   2816
+  ]
+ }
+}

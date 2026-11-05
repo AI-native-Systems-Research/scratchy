@@ -1,5 +1,5 @@
 # The Nemotron-3 Super multi-token-prediction head, in torch-idiom Python. Parsed by scratchy
-# (compiler/macros/src/parse_python.rs), never executed by the compiler.
+# (compiler/frontend/src/parse_python.rs), never executed by the compiler.
 #
 # DeepSeek-V3-style MTP (`num_nextn_predict_layers: 1`): drafts the token after next. Row t
 # reads the target model's final (post-norm) hidden state `target_hidden[t]` and the embedding
@@ -59,5 +59,8 @@ def nemotron_h_mtp():
                     )
         hidden_states = add(mixer_out, hidden_states)
     normed = rmsnorm(hidden_states, final_layernorm)
-    logits = gemm(normed, lm_head)
+    # The target lends its lm_head, at the target's width: the head's rows are read at it, which
+    # is its own width (a model compiles here only where the two are equal).
+    lent = as_dim(normed, backbone_hidden_size)
+    logits = gemm(lent, lm_head)
     return logits

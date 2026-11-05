@@ -4,7 +4,7 @@
 //! A DFlash2 drafter (Splash's, ~/git/splash runtime/model/QwenTarget.cpp `addCapture`) reads the
 //! output of each target layer in its `target_layer_ids`, side by side. Which layers is the drafter's
 //! fact, which the target's config carries as its `draft_capture_layers` layer set when a drafter is
-//! compiled beside it ([`crate::config`]'s head facts; empty otherwise). The rows it reads are the
+//! compiled beside it (the macro crate's `config` head facts; empty otherwise). The rows it reads are the
 //! layer loop's residual stream at the end of each of those layers: what the loop carries into its
 //! next iteration and hands the code after it.
 //!
@@ -28,7 +28,11 @@ use std::collections::BTreeSet;
 use proc_macro2::{Ident, Span};
 
 use crate::ast::{Ast, BoolExpr, BoundExpr, Expr, InSet, Stmt};
-use crate::config::DRAFT_CAPTURE_LAYERS;
+
+/// The layer set of a target's layers whose outputs a head compiled beside it reads, which the
+/// target captures (`capture_hidden`): the head's `target_capture_layers`, written into the
+/// target's config before it parses. Every model has the set, empty unless a head reads some.
+pub const DRAFT_CAPTURE_LAYERS: &str = "draft_capture_layers";
 
 /// The loop bound a decoder layer loop runs to.
 const LAYER_COUNT: &str = "num_hidden_layers";
@@ -88,10 +92,12 @@ fn capture(ivar: &Ident, carried: &str) -> Stmt {
                 op: ident(CAPTURE_OP),
                 args: vec![carried.clone()],
             },
+            line: None,
         }],
         else_body: vec![Stmt::Assign {
             target: ident(CAPTURE_LOCAL),
             value: carried,
+            line: None,
         }],
     }
 }
@@ -154,100 +160,5 @@ fn reads(e: &Expr, names: &mut BTreeSet<String>) {
         }
         Expr::Reshape { source, .. } => reads(source, names),
         Expr::Path(_) | Expr::ScalarLit(_) | Expr::SqrtBound(_) | Expr::ConfigScalar { .. } => {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cfg::build_cfg;
-    use crate::classified::OpKind;
-    use crate::classify::classify;
-    use crate::config::{self, LayerSet, ModelParams};
-    use crate::fuf::{Fuf, FufInput, unroll};
-    use crate::parse_python::parse_body;
-    use crate::shape::infer;
-    use std::path::PathBuf;
-
-    /// A decoder: an embedding, a layer loop carrying `hidden_states`, the final norm and head.
-    const DECODER: &str = "
-        hidden_states = embed(input_ids, embed_tokens)
-        for layer in range(num_hidden_layers):
-            normed = rmsnorm(hidden_states, input_layernorm[layer])
-            hidden_states = add(normed, hidden_states)
-        normed = rmsnorm(hidden_states, norm)
-        logits = gemm(normed, lm_head)
-        ";
-
-    fn llama(captured: &[u64]) -> ModelParams {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../models/arch/configs/llama/llama-3.2-1b.json");
-        let mut params = config::load_file(&path).expect("load config");
-        let set = LayerSet::of(captured.iter().copied());
-        params
-            .layer_sets
-            .insert(DRAFT_CAPTURE_LAYERS.to_string(), set);
-        params
-    }
-
-    fn unroll_ast(ast: &Ast, params: &ModelParams) -> Fuf {
-        let program = classify(ast).expect("classify");
-        let manifest = crate::weights_manifest::WeightsManifest::llama_test_conventions();
-        let inferred = infer(&program, &manifest, &Default::default()).expect("infer");
-        let cfg = build_cfg(&program, params).expect("build cfg");
-        unroll(&cfg, &inferred).expect("unroll")
-    }
-
-    fn ops(fuf: &Fuf) -> Vec<OpKind> {
-        fuf.nodes.iter().map(|n| n.op).collect()
-    }
-
-    /// A target with no drafter beside it (an empty `draft_capture_layers`) unrolls to exactly the
-    /// tiles it did before the capture was inserted: every layer takes the alias arm.
-    #[test]
-    fn a_target_with_no_drafter_unrolls_as_before() {
-        let ast = parse_body(DECODER).expect("parse");
-        let params = llama(&[]);
-        let (before, after) = (
-            unroll_ast(&ast, &params),
-            unroll_ast(&insert(&ast), &params),
-        );
-        assert_eq!(ops(&before), ops(&after));
-    }
-
-    /// With a drafter reading layers 1 and 3, the target captures the residual stream each of them
-    /// carries out — the add that ends the layer — and nothing else.
-    #[test]
-    fn a_target_captures_the_layers_its_drafter_reads() {
-        let ast = parse_body(DECODER).expect("parse");
-        let fuf = unroll_ast(&insert(&ast), &llama(&[1, 3]));
-        let adds: Vec<u32> = (fuf.nodes.iter())
-            .filter(|n| n.op == OpKind::Add)
-            .map(|n| n.id.0)
-            .collect();
-        let captured: Vec<u32> = (fuf.nodes.iter())
-            .filter(|n| n.op == OpKind::CaptureHidden)
-            .map(|n| match n.inputs[0] {
-                FufInput::Tile { id, .. } => id.0,
-                ref other => panic!("a capture of {other:?}"),
-            })
-            .collect();
-        assert_eq!(captured, [adds[1], adds[3]]);
-    }
-
-    /// A layer loop whose writes nothing after it reads carries nothing out: no capture.
-    #[test]
-    fn a_loop_carrying_nothing_out_gets_no_capture() {
-        let src = "
-            hidden_states = embed(input_ids, embed_tokens)
-            for layer in range(num_hidden_layers):
-                scratch = rmsnorm(hidden_states, input_layernorm[layer])
-            logits = gemm(hidden_states, lm_head)
-            ";
-        let ast = parse_body(src).expect("parse");
-        let Stmt::For { body, .. } = &insert(&ast).statements[1] else {
-            panic!("the loop moved");
-        };
-        assert_eq!(body.len(), 1);
     }
 }

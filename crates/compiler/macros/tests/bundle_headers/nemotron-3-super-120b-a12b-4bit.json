@@ -1,0 +1,147 @@
+{
+ "repo": "mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-4bit",
+ "configs": [
+  "nemotron-h-latent/nemotron-3-super-120b-a12b"
+ ],
+ "head": false,
+ "bundles": {
+  "mamba": "backbone.layers.0.mixer",
+  "moe": "backbone.layers.1.mixer"
+ },
+ "quantization": {
+  "group_size": 64,
+  "bits": 4,
+  "mode": "affine"
+ },
+ "tensors": {
+  "backbone.layers.0.mixer.A_log": [
+   128
+  ],
+  "backbone.layers.0.mixer.D": [
+   128
+  ],
+  "backbone.layers.0.mixer.conv1d.bias": [
+   10240
+  ],
+  "backbone.layers.0.mixer.conv1d.weight": [
+   10240,
+   4,
+   1
+  ],
+  "backbone.layers.0.mixer.dt_bias": [
+   128
+  ],
+  "backbone.layers.0.mixer.in_proj.biases": [
+   18560,
+   64
+  ],
+  "backbone.layers.0.mixer.in_proj.scales": [
+   18560,
+   64
+  ],
+  "backbone.layers.0.mixer.in_proj.weight": [
+   18560,
+   512
+  ],
+  "backbone.layers.0.mixer.norm.weight": [
+   8192
+  ],
+  "backbone.layers.0.mixer.out_proj.biases": [
+   4096,
+   128
+  ],
+  "backbone.layers.0.mixer.out_proj.scales": [
+   4096,
+   128
+  ],
+  "backbone.layers.0.mixer.out_proj.weight": [
+   4096,
+   1024
+  ],
+  "backbone.layers.1.mixer.fc1_latent_proj.biases": [
+   1024,
+   64
+  ],
+  "backbone.layers.1.mixer.fc1_latent_proj.scales": [
+   1024,
+   64
+  ],
+  "backbone.layers.1.mixer.fc1_latent_proj.weight": [
+   1024,
+   512
+  ],
+  "backbone.layers.1.mixer.fc2_latent_proj.biases": [
+   4096,
+   16
+  ],
+  "backbone.layers.1.mixer.fc2_latent_proj.scales": [
+   4096,
+   16
+  ],
+  "backbone.layers.1.mixer.fc2_latent_proj.weight": [
+   4096,
+   128
+  ],
+  "backbone.layers.1.mixer.gate.e_score_correction_bias": [
+   512
+  ],
+  "backbone.layers.1.mixer.gate.weight": [
+   512,
+   4096
+  ],
+  "backbone.layers.1.mixer.shared_experts.down_proj.biases": [
+   4096,
+   84
+  ],
+  "backbone.layers.1.mixer.shared_experts.down_proj.scales": [
+   4096,
+   84
+  ],
+  "backbone.layers.1.mixer.shared_experts.down_proj.weight": [
+   4096,
+   672
+  ],
+  "backbone.layers.1.mixer.shared_experts.up_proj.biases": [
+   5376,
+   64
+  ],
+  "backbone.layers.1.mixer.shared_experts.up_proj.scales": [
+   5376,
+   64
+  ],
+  "backbone.layers.1.mixer.shared_experts.up_proj.weight": [
+   5376,
+   512
+  ],
+  "backbone.layers.1.mixer.switch_mlp.fc1.biases": [
+   512,
+   2688,
+   16
+  ],
+  "backbone.layers.1.mixer.switch_mlp.fc1.scales": [
+   512,
+   2688,
+   16
+  ],
+  "backbone.layers.1.mixer.switch_mlp.fc1.weight": [
+   512,
+   2688,
+   128
+  ],
+  "backbone.layers.1.mixer.switch_mlp.fc2.biases": [
+   512,
+   1024,
+   42
+  ],
+  "backbone.layers.1.mixer.switch_mlp.fc2.scales": [
+   512,
+   1024,
+   42
+  ],
+  "backbone.layers.1.mixer.switch_mlp.fc2.weight": [
+   512,
+   1024,
+   336
+  ]
+ }
+}

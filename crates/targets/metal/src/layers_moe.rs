@@ -18,6 +18,26 @@ pub use scratchy_layers::layers_moe::*;
 // metal weight-load extension trait; `take` / `take_keep_dtype` / `contains`
 // / `tensor_info` / `target_dtype` are inherent on the neutral `GpuWeights`.
 use crate::weights_metal::MetalWeightsExt;
+// Every bundle tensor's name is the bundle table's: these loaders spell none of their own.
+pub use scratchy_tensors::bundle_roles::ExpertNaming;
+use scratchy_tensors::bundle_roles::{
+    BundleRole as R, PER_EXPERT_INFIX, SHARED_GATE_UP_FUSED, const_leaf,
+};
+
+const ROUTER: &str = const_leaf(R::Router);
+const GPT_OSS_ROUTER: &str = const_leaf(R::GptOssRouter);
+const ROUTER_BIAS: &str = const_leaf(R::RouterBias);
+const CORRECTION: &str = const_leaf(R::Correction);
+const SHARED_GATE: &str = const_leaf(R::SharedGate);
+const SHARED_UP: &str = const_leaf(R::SharedUp);
+const SHARED_DOWN: &str = const_leaf(R::SharedDown);
+const SHARED_SCALE: &str = const_leaf(R::SharedScale);
+const PROJ: &str = const_leaf(R::Proj);
+const SCALE: &str = const_leaf(R::Scale);
+const PER_EXPERT_SCALE: &str = const_leaf(R::PerExpertScale);
+const GATE_BIAS: &str = const_leaf(R::GateBias);
+const UP_BIAS: &str = const_leaf(R::UpBias);
+const DOWN_BIAS: &str = const_leaf(R::DownBias);
 
 // ---------------------------------------------------------------------------
 // AffineFusedMoELayer (metal: MLX-affine experts + dense BF16 router)
@@ -48,7 +68,7 @@ pub trait AffineFusedMoEOps {
         group_size: u32,
         bits: ExpertBits,
         gate_bits: u32,
-        naming: MoeExpertNaming,
+        naming: ExpertNaming,
         renormalize: bool,
     ) -> anyhow::Result<Self>
     where
@@ -88,7 +108,7 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
             group_size,
             bits,
             gate_bits,
-            MoeExpertNaming::Mixtral,
+            ExpertNaming::Mixtral,
             true,
         )
     }
@@ -118,7 +138,7 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
         group_size: u32,
         bits: ExpertBits,
         gate_bits: u32,
-        naming: MoeExpertNaming,
+        naming: ExpertNaming,
         renormalize: bool,
     ) -> anyhow::Result<Self> {
         use crate::dtype::DType;
@@ -142,34 +162,35 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
             matches!(router_dtype, DType::BF16 | DType::F16),
             "AffineFusedMoELayer: router dequant target must be BF16 or F16, got {router_dtype}"
         );
-        let router_is_dense = !gw.contains(&format!("{prefix}.gate.scales"));
+        let router_is_dense = !gw.contains(&format!("{prefix}.{ROUTER}.scales"));
         let router_gate = if router_is_dense {
-            gw.take(&format!("{prefix}.gate.weight"))?
+            gw.take(&format!("{prefix}.{ROUTER}.weight"))?
         } else {
             gw.take_affine_dequant_b4(
-                &format!("{prefix}.gate"),
+                &format!("{prefix}.{ROUTER}"),
                 group_size,
                 gate_bits,
                 router_dtype,
             )?
         };
 
-        let (gate, up, down) = match bits {
-            ExpertBits::Gated { .. } => naming.proj_names(),
-            ExpertBits::Ungated { .. } => ("", "fc1", "fc2"),
+        // An un-gated bank is named as mlx's `SwitchMLP` names it, whatever the gated naming.
+        let naming = match bits {
+            ExpertBits::Gated { .. } => naming,
+            ExpertBits::Ungated { .. } => ExpertNaming::Ungated,
         };
-        let (infix, n) = (Some("switch_mlp"), num_experts);
+        let n = num_experts;
         let (inter, hidden) = (intermediate_size, hidden_size);
-        let in_proj = |gw: &mut crate::weights::GpuWeights, proj, bits| {
-            load_expert_projection(gw, prefix, infix, proj, n, inter, hidden, group_size, bits)
+        let in_proj = |gw: &mut crate::weights::GpuWeights, role, bits| {
+            load_expert_projection(gw, prefix, naming, role, n, inter, hidden, group_size, bits)
         };
-        let gate = bits.gate().map(|b| in_proj(gw, gate, b)).transpose()?;
-        let [up_w, up_s, up_b] = in_proj(gw, up, bits.up())?;
+        let gate = bits.gate().map(|b| in_proj(gw, R::Gate, b)).transpose()?;
+        let [up_w, up_s, up_b] = in_proj(gw, R::Up, bits.up())?;
         let [down_w, down_s, down_b] = load_expert_projection(
             gw,
             prefix,
-            infix,
-            down,
+            naming,
+            R::Down,
             n,
             hidden,
             inter,
@@ -200,46 +221,23 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
     }
 }
 
-/// Per-expert tensor naming convention of a GATED bank. Mixtral safetensors keep the
-/// pre-Llama-2 `w1/w2/w3` names while every other HF MoE checkpoint
-/// (Qwen2-MoE, Qwen3-MoE, DeepSeek-MoE) uses `gate_proj/up_proj/down_proj`.
-#[derive(Clone, Copy, Debug)]
-pub enum MoeExpertNaming {
-    /// `w1` = gate, `w3` = up, `w2` = down.
-    Mixtral,
-    /// `gate_proj`, `up_proj`, `down_proj`.
-    Qwen,
-    /// Gemma-4 SwitchGLU experts: pre-stacked `[E, out, in]` tensors live
-    /// directly under `{prefix}.gate_proj/.up_proj/.down_proj` (no
-    /// `switch_mlp` / `switch_glu` infix in the leaf name — the
-    /// `experts.switch_glu` infix is already part of the bundle prefix).
-    SwitchGlu,
-}
-
-impl MoeExpertNaming {
-    fn proj_names(self) -> (&'static str, &'static str, &'static str) {
-        match self {
-            Self::Mixtral => ("w1", "w3", "w2"),
-            Self::Qwen | Self::SwitchGlu => ("gate_proj", "up_proj", "down_proj"),
-        }
-    }
-}
-
 /// One routed-expert projection's MLX-affine `[weight, scales, biases]`, expert-major
 /// `[E, n_out, k_in / div]` with the weight packed `bits` wide (the ceil(k·bits/32) law, exact:
 /// `k_in` is a multiple of the group size).
 ///
-/// The pre-stacked tensors `{prefix}[.{infix}].{proj}.*` are taken zero-copy, their shapes
-/// verified by [`restack_expert_tensor`] (which also views gpt-oss's 2-D `[(E·N), K/div]` export
-/// as the 3-D stack); without them, each expert's own `{prefix}.experts.{e}.{proj}.*` is stacked
-/// into one buffer per tensor. Experts are WEIGHTS: they go to the weight pool, not the wired
-/// activation arena (`alloc_uninit` once pinned mixtral's 23.62 GiB of experts as "scratch").
+/// The projection `role` of a bank named `naming` (the bundle table's
+/// [`scratchy_tensors::bundle_roles::Layout::ExpertProj`]): its pre-stacked
+/// `{prefix}[.{infix}].{proj}.*` tensors are taken zero-copy, their shapes verified by
+/// [`restack_expert_tensor`] (which also views gpt-oss's 2-D `[(E·N), K/div]` export as the 3-D
+/// stack); without them, each expert's own `{prefix}.experts.{e}.{proj}.*` is stacked into one
+/// buffer per tensor. Experts are WEIGHTS: they go to the weight pool, not the wired activation
+/// arena (`alloc_uninit` once pinned mixtral's 23.62 GiB of experts as "scratch").
 #[allow(clippy::too_many_arguments)]
 fn load_expert_projection(
     gw: &mut crate::weights::GpuWeights,
     prefix: &str,
-    stacked_infix: Option<&str>,
-    proj: &str,
+    naming: ExpertNaming,
+    role: R,
     num_experts: usize,
     n_out: usize,
     k_in: usize,
@@ -247,6 +245,10 @@ fn load_expert_projection(
     bits: u32,
 ) -> anyhow::Result<[crate::tensor::GpuTensor; 3]> {
     use crate::dtype::DType;
+    let proj = naming.proj(role).ok_or_else(|| {
+        anyhow::anyhow!("affine MoE `{prefix}`: a {naming:?} bank holds no {role:?} projection")
+    })?;
+    let stacked_infix = naming.stacked_infix();
     anyhow::ensure!(
         matches!(bits, 2 | 3 | 4 | 8),
         "affine MoE `{prefix}` {proj}: only bits ∈ {{2, 3, 4, 8}} supported (got {bits})"
@@ -274,16 +276,13 @@ fn load_expert_projection(
     // per-expert names spells them `up_proj`/`down_proj` (Nemotron-3 Super's OptiQ MTP sidecar —
     // its main shards' pre-stacked `switch_mlp.*` tensors use fc1/fc2, and the two layouts never
     // mix in one file). Probe expert 0 for whichever this store holds.
-    let proj = if gw.contains(&format!("{prefix}.experts.0.{proj}.scales")) {
-        proj
-    } else {
-        match proj {
-            "fc1" => "up_proj",
-            "fc2" => "down_proj",
-            _ => proj,
+    let proj = match naming.per_expert(role) {
+        Some(other) if !gw.contains(&format!("{prefix}.{PER_EXPERT_INFIX}.0.{proj}.scales")) => {
+            other
         }
+        _ => proj,
     };
-    let name = |e: usize, kind: &str| format!("{prefix}.experts.{e}.{proj}.{kind}");
+    let name = |e: usize, kind: &str| format!("{prefix}.{PER_EXPERT_INFIX}.{e}.{proj}.{kind}");
     let (_, scales_dtype) = gw
         .tensor_info(&name(0, "scales"))
         .ok_or_else(|| anyhow::anyhow!("affine MoE: weight not found: {}", name(0, "scales")))?;
@@ -362,7 +361,7 @@ impl Gemma4RouterOps for GemmaRouterLayer {
             // disagree (#202). Dequant at load so the routing GEMM stays on
             // the dense path.
             Some((group_size, bits)) => gw.take_affine_dequant_b4(
-                &format!("{prefix}.proj"),
+                &format!("{prefix}.{PROJ}"),
                 group_size,
                 bits,
                 router_dtype,
@@ -373,19 +372,19 @@ impl Gemma4RouterOps for GemmaRouterLayer {
             // Shape asserted so an affine-packed weight misconfigured as
             // dense refuses here instead of reaching the GEMM as garbage.
             None => {
-                let gate = gw.take_as_dtype(&format!("{prefix}.proj.weight"), router_dtype)?;
+                let gate = gw.take_as_dtype(&format!("{prefix}.{PROJ}.weight"), router_dtype)?;
                 let shape = gate.shape();
                 anyhow::ensure!(
                     shape == [num_experts as u32, hidden_size as u32],
-                    "GemmaRouterLayer: {prefix}.proj.weight is {shape:?}, expected \
+                    "GemmaRouterLayer: {prefix}.{PROJ}.weight is {shape:?}, expected \
                      [{num_experts}, {hidden_size}] — the checkpoint and the config \
                      disagree"
                 );
                 gate
             }
         };
-        let per_expert_scale = gw.take_keep_dtype(&format!("{prefix}.per_expert_scale"))?;
-        let scale = gw.take_keep_dtype(&format!("{prefix}.scale"))?;
+        let per_expert_scale = gw.take_keep_dtype(&format!("{prefix}.{PER_EXPERT_SCALE}"))?;
+        let scale = gw.take_keep_dtype(&format!("{prefix}.{SCALE}"))?;
         Ok(GemmaRouterLayer {
             gate,
             per_expert_scale,
@@ -433,14 +432,15 @@ impl SwitchGluExpertsOps for SwitchGluExpertsLayer {
             "SwitchGluExpertsLayer: only bits ∈ {{4, 8}} supported (got {bits})"
         );
         let (n, inter, hidden) = (num_experts, moe_intermediate_size, hidden_size);
-        let proj = |gw: &mut crate::weights::GpuWeights, name, n_out, k_in| {
-            load_expert_projection(gw, prefix, None, name, n, n_out, k_in, group_size, bits)
+        let naming = ExpertNaming::SwitchGlu;
+        let proj = |gw: &mut crate::weights::GpuWeights, role, n_out, k_in| {
+            load_expert_projection(gw, prefix, naming, role, n, n_out, k_in, group_size, bits)
         };
         let [expert_gate_w, expert_gate_scales, expert_gate_biases] =
-            proj(gw, "gate_proj", inter, hidden)?;
-        let [expert_up_w, expert_up_scales, expert_up_biases] = proj(gw, "up_proj", inter, hidden)?;
+            proj(gw, R::Gate, inter, hidden)?;
+        let [expert_up_w, expert_up_scales, expert_up_biases] = proj(gw, R::Up, inter, hidden)?;
         let [expert_down_w, expert_down_scales, expert_down_biases] =
-            proj(gw, "down_proj", hidden, inter)?;
+            proj(gw, R::Down, hidden, inter)?;
         Ok(SwitchGluExpertsLayer {
             expert_gate_w,
             expert_gate_scales,
@@ -609,7 +609,7 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             group_size,
             bits,
             gate_bits,
-            MoeExpertNaming::Qwen,
+            ExpertNaming::Qwen,
             true,
         )?;
 
@@ -638,13 +638,13 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             // `[2*shared_inter, ceil(hidden*bits/32)]` triple, so we
             // stack split-on-disk variants by allocating and copying
             // gate then up into adjacent halves.
-            let has_fused = gw.contains(&format!("{prefix}.shared_expert.gate_up_proj.weight"));
+            let has_fused = gw.contains(&format!("{prefix}.{SHARED_GATE_UP_FUSED}.weight"));
 
             // Sample scales dtype the same way as the routed path.
             let probe_name = if has_fused {
-                format!("{prefix}.shared_expert.gate_up_proj.scales")
+                format!("{prefix}.{SHARED_GATE_UP_FUSED}.scales")
             } else {
-                format!("{prefix}.shared_expert.gate_proj.scales")
+                format!("{prefix}.{SHARED_GATE}.scales")
             };
             let (_, scales_dtype) = gw.tensor_info(&probe_name).ok_or_else(|| {
                 anyhow::anyhow!("affine MoE shared: weight not found: {probe_name}")
@@ -681,15 +681,15 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             if has_fused {
                 unsafe {
                     let _ = gw.take_into_metal(
-                        &format!("{prefix}.shared_expert.gate_up_proj.weight"),
+                        &format!("{prefix}.{SHARED_GATE_UP_FUSED}.weight"),
                         gu_w_ptr,
                     )?;
                     let _ = gw.take_into_metal(
-                        &format!("{prefix}.shared_expert.gate_up_proj.scales"),
+                        &format!("{prefix}.{SHARED_GATE_UP_FUSED}.scales"),
                         gu_s_ptr,
                     )?;
                     let _ = gw.take_into_metal(
-                        &format!("{prefix}.shared_expert.gate_up_proj.biases"),
+                        &format!("{prefix}.{SHARED_GATE_UP_FUSED}.biases"),
                         gu_b_ptr,
                     )?;
                 }
@@ -698,46 +698,34 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
                 let half_w_bytes = shared_inter * packed_hidden * elem_w;
                 let half_sb_bytes = shared_inter * (hidden_size / gs) * elem_sb;
                 unsafe {
+                    let _ =
+                        gw.take_into_metal(&format!("{prefix}.{SHARED_GATE}.weight"), gu_w_ptr)?;
                     let _ = gw.take_into_metal(
-                        &format!("{prefix}.shared_expert.gate_proj.weight"),
-                        gu_w_ptr,
-                    )?;
-                    let _ = gw.take_into_metal(
-                        &format!("{prefix}.shared_expert.up_proj.weight"),
+                        &format!("{prefix}.{SHARED_UP}.weight"),
                         gu_w_ptr.add(half_w_bytes),
                     )?;
+                    let _ =
+                        gw.take_into_metal(&format!("{prefix}.{SHARED_GATE}.scales"), gu_s_ptr)?;
                     let _ = gw.take_into_metal(
-                        &format!("{prefix}.shared_expert.gate_proj.scales"),
-                        gu_s_ptr,
-                    )?;
-                    let _ = gw.take_into_metal(
-                        &format!("{prefix}.shared_expert.up_proj.scales"),
+                        &format!("{prefix}.{SHARED_UP}.scales"),
                         gu_s_ptr.add(half_sb_bytes),
                     )?;
+                    let _ =
+                        gw.take_into_metal(&format!("{prefix}.{SHARED_GATE}.biases"), gu_b_ptr)?;
                     let _ = gw.take_into_metal(
-                        &format!("{prefix}.shared_expert.gate_proj.biases"),
-                        gu_b_ptr,
-                    )?;
-                    let _ = gw.take_into_metal(
-                        &format!("{prefix}.shared_expert.up_proj.biases"),
+                        &format!("{prefix}.{SHARED_UP}.biases"),
                         gu_b_ptr.add(half_sb_bytes),
                     )?;
                 }
             }
 
             unsafe {
-                let _ = gw.take_into_metal(
-                    &format!("{prefix}.shared_expert.down_proj.weight"),
-                    down_w_ptr,
-                )?;
-                let _ = gw.take_into_metal(
-                    &format!("{prefix}.shared_expert.down_proj.scales"),
-                    down_s_ptr,
-                )?;
-                let _ = gw.take_into_metal(
-                    &format!("{prefix}.shared_expert.down_proj.biases"),
-                    down_b_ptr,
-                )?;
+                let _ =
+                    gw.take_into_metal(&format!("{prefix}.{SHARED_DOWN}.weight"), down_w_ptr)?;
+                let _ =
+                    gw.take_into_metal(&format!("{prefix}.{SHARED_DOWN}.scales"), down_s_ptr)?;
+                let _ =
+                    gw.take_into_metal(&format!("{prefix}.{SHARED_DOWN}.biases"), down_b_ptr)?;
             }
 
             let gu_w = unsafe { GpuTensor::new(gu_w_ptr, &[two_si, packed_hidden], DType::U32) };
@@ -754,7 +742,7 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             let d_b = unsafe {
                 GpuTensor::new(down_b_ptr, &[hidden_size, shared_inter / gs], scales_dtype)
             };
-            let sgate = gw.take(&format!("{prefix}.shared_expert_gate.weight"))?;
+            let sgate = gw.take(&format!("{prefix}.{SHARED_SCALE}.weight"))?;
 
             (
                 Some(gu_w),
@@ -778,10 +766,8 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
         // reassemble half-pairs as F32 garbage. The cuda loader casts this tensor to F32 for
         // the same reason (`weights_quant.rs`: "vLLM always casts this to F32 before the
         // routing kernel; we match"); every noaux_tc checkpoint ships it F32 on disk.
-        let e_score_correction_bias = match gw
-            .contains(&format!("{prefix}.gate.e_score_correction_bias"))
-        {
-            true => Some(gw.take_keep_dtype(&format!("{prefix}.gate.e_score_correction_bias"))?),
+        let e_score_correction_bias = match gw.contains(&format!("{prefix}.{CORRECTION}")) {
+            true => Some(gw.take_keep_dtype(&format!("{prefix}.{CORRECTION}"))?),
             false => None,
         };
 
@@ -917,12 +903,12 @@ impl GptOssMoEOps for GptOssMoELayer {
             matches!(router_dtype, DType::BF16 | DType::F16),
             "GptOssMoELayer: router dequant target must be BF16 or F16, got {router_dtype}"
         );
-        let router_is_dense = !gw.contains(&format!("{prefix}.router.scales"));
+        let router_is_dense = !gw.contains(&format!("{prefix}.{GPT_OSS_ROUTER}.scales"));
         let router_gate = if router_is_dense {
-            gw.take(&format!("{prefix}.router.weight"))?
+            gw.take(&format!("{prefix}.{GPT_OSS_ROUTER}.weight"))?
         } else {
             gw.take_affine_dequant_b4(
-                &format!("{prefix}.router"),
+                &format!("{prefix}.{GPT_OSS_ROUTER}"),
                 group_size,
                 gate_bits,
                 router_dtype,
@@ -934,10 +920,10 @@ impl GptOssMoEOps for GptOssMoELayer {
         // on-disk float width, and `alloc_packed_from_host` re-uploads as
         // F32. The kernels' `const device float*` ABI is unchanged from
         // GLM's (see the e_score_correction_bias note above).
-        let router_bias_f32 = gw.take_to_cpu_f32(&format!("{prefix}.router.bias"))?;
+        let router_bias_f32 = gw.take_to_cpu_f32(&format!("{prefix}.{ROUTER_BIAS}"))?;
         anyhow::ensure!(
             router_bias_f32.len() == num_experts,
-            "GptOssMoELayer: `{prefix}.router.bias` holds {} elements (expected {num_experts})",
+            "GptOssMoELayer: `{prefix}.{ROUTER_BIAS}` holds {} elements (expected {num_experts})",
             router_bias_f32.len(),
         );
         let mut router_bias_bytes = Vec::with_capacity(num_experts * 4);
@@ -950,31 +936,22 @@ impl GptOssMoEOps for GptOssMoELayer {
         // Experts: the pre-stacked layout under the `experts` infix with
         // Qwen proj names — exactly `mlp.experts.{gate,up,down}_proj.*`.
         let (n, inter, hidden) = (num_experts, intermediate_size, hidden_size);
-        let proj = |gw: &mut crate::weights::GpuWeights, name, n_out, k_in| {
-            load_expert_projection(
-                gw,
-                prefix,
-                Some("experts"),
-                name,
-                n,
-                n_out,
-                k_in,
-                group_size,
-                bits,
-            )
+        let naming = ExpertNaming::GptOss;
+        let proj = |gw: &mut crate::weights::GpuWeights, role, n_out, k_in| {
+            load_expert_projection(gw, prefix, naming, role, n, n_out, k_in, group_size, bits)
         };
         let [expert_gate_w, expert_gate_scales, expert_gate_biases] =
-            proj(gw, "gate_proj", inter, hidden)?;
-        let [expert_up_w, expert_up_scales, expert_up_biases] = proj(gw, "up_proj", inter, hidden)?;
+            proj(gw, R::Gate, inter, hidden)?;
+        let [expert_up_w, expert_up_scales, expert_up_biases] = proj(gw, R::Up, inter, hidden)?;
         let [expert_down_w, expert_down_scales, expert_down_biases] =
-            proj(gw, "down_proj", hidden, inter)?;
+            proj(gw, R::Down, hidden, inter)?;
 
         // Per-expert gate/up LINEAR biases → one `[E, 2·inter]` buffer,
         // expert e's gate rows then its up rows. `take_cpu` hands back
         // target-dtype bytes (floats only are cast), so the 2-byte element
         // interleave is dtype-agnostic between F16 and BF16.
-        let (g_bytes, g_shape, g_dt) = gw.take_cpu(&format!("{prefix}.experts.gate_proj.bias"))?;
-        let (u_bytes, u_shape, u_dt) = gw.take_cpu(&format!("{prefix}.experts.up_proj.bias"))?;
+        let (g_bytes, g_shape, g_dt) = gw.take_cpu(&format!("{prefix}.{GATE_BIAS}"))?;
+        let (u_bytes, u_shape, u_dt) = gw.take_cpu(&format!("{prefix}.{UP_BIAS}"))?;
         anyhow::ensure!(
             g_dt == u_dt && matches!(g_dt, DType::F16 | DType::BF16),
             "GptOssMoELayer: expert linear biases must be F16/BF16 (got gate {g_dt}, up {u_dt})"
@@ -982,13 +959,13 @@ impl GptOssMoEOps for GptOssMoELayer {
         let elems = |shape: &[usize]| shape.iter().product::<usize>();
         anyhow::ensure!(
             elems(&g_shape) == num_experts * intermediate_size,
-            "GptOssMoELayer: `{prefix}.experts.gate_proj.bias` holds {} elements (expected \
+            "GptOssMoELayer: `{prefix}.{GATE_BIAS}` holds {} elements (expected \
              {num_experts}·{intermediate_size})",
             elems(&g_shape),
         );
         anyhow::ensure!(
             elems(&u_shape) == num_experts * intermediate_size,
-            "GptOssMoELayer: `{prefix}.experts.up_proj.bias` holds {} elements (expected \
+            "GptOssMoELayer: `{prefix}.{UP_BIAS}` holds {} elements (expected \
              {num_experts}·{intermediate_size})",
             elems(&u_shape),
         );
@@ -1004,14 +981,14 @@ impl GptOssMoEOps for GptOssMoELayer {
             gw.alloc_packed_from_host(&gate_up_bytes, &[num_experts, 2 * intermediate_size], g_dt)?;
 
         // Down-proj LINEAR bias → `[E, hidden]`, same bytes expert-major.
-        let (d_bytes, d_shape, d_dt) = gw.take_cpu(&format!("{prefix}.experts.down_proj.bias"))?;
+        let (d_bytes, d_shape, d_dt) = gw.take_cpu(&format!("{prefix}.{DOWN_BIAS}"))?;
         anyhow::ensure!(
             d_dt == g_dt,
             "GptOssMoELayer: down bias dtype {d_dt} differs from gate/up {g_dt}"
         );
         anyhow::ensure!(
             elems(&d_shape) == num_experts * hidden_size,
-            "GptOssMoELayer: `{prefix}.experts.down_proj.bias` holds {} elements (expected \
+            "GptOssMoELayer: `{prefix}.{DOWN_BIAS}` holds {} elements (expected \
              {num_experts}·{hidden_size})",
             elems(&d_shape),
         );

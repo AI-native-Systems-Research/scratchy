@@ -22,6 +22,7 @@ use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, shared_slice, shar
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
+use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
 use scratchy_target_metal::tape::ids::{KDimI32, LayerId, MDimI32, NDimI32};
 use scratchy_target_metal::tape::kernel_constants::{
     AffineCodes, AffineQmmTConstants, AffineQmvConstants, AffineQmvWideConstants,
@@ -124,8 +125,8 @@ fn qmv_rows_plain_and_normalizing_on_load() {
                     kernel,
                     DequantDtype::Bf16,
                     ScaleDtype::Bf16,
-                    s.bits,
-                    GROUP,
+                    AffineBits::new(s.bits).unwrap(),
+                    AffineGroupSize::new(GROUP).unwrap(),
                 );
                 let (k_dim, n_dim) = (KDimI32(s.k as i32), NDimI32(s.n as i32));
                 let codes = AffineCodes::AsWritten;
@@ -240,8 +241,13 @@ fn qmv_wide_against_small_m_twin_by_bucket() {
         for bucket in [4u32, 8] {
             let m = MDimI32(bucket as i32);
             let kernel = pick_qmv_kernel_wide(s.n, s.k, s.bits, bucket, true);
-            let wide_name =
-                qmv_kernel_static_name(kernel, DequantDtype::Bf16, ScaleDtype::Bf16, s.bits, GROUP);
+            let wide_name = qmv_kernel_static_name(
+                kernel,
+                DequantDtype::Bf16,
+                ScaleDtype::Bf16,
+                AffineBits::new(s.bits).unwrap(),
+                AffineGroupSize::new(GROUP).unwrap(),
+            );
             let wide_constants: Vec<ConstantValue> = AffineQmvWideConstants {
                 k: k_dim,
                 n: n_dim,
@@ -401,8 +407,13 @@ fn norm_folded_into_its_readers_on_a_chip_emulated_by_width() {
                 .collect();
             let matvec = |n: u32, ends: QmvEnds| {
                 let kernel = pick_qmv_kernel_wide(n, hidden, 4, rows, true);
-                let name =
-                    qmv_kernel_static_name(kernel, DequantDtype::Bf16, ScaleDtype::Bf16, 4, GROUP);
+                let name = qmv_kernel_static_name(
+                    kernel,
+                    DequantDtype::Bf16,
+                    ScaleDtype::Bf16,
+                    AffineBits::new(4).unwrap(),
+                    AffineGroupSize::new(GROUP).unwrap(),
+                );
                 let mut constants: Vec<ConstantValue> = AffineQmvWideConstants {
                     k: KDimI32(hidden as i32),
                     n: NDimI32(n as i32),
@@ -555,8 +566,8 @@ fn narrow_projection_at_verify_buckets() {
                 nax,
                 DequantDtype::Bf16,
                 ScaleDtype::Bf16,
-                4,
-                GROUP,
+                AffineBits::new(4).unwrap(),
+                AffineGroupSize::new(GROUP).unwrap(),
                 n.is_multiple_of(64),
             );
             let c: Vec<ConstantValue> = AffineQmmTConstants {
@@ -593,8 +604,13 @@ fn narrow_projection_at_verify_buckets() {
                 ));
             }
             for kernel in [pick_qmv_kernel_wide(n, k, 4, m, true), QmvKernel::Fast] {
-                let name =
-                    qmv_kernel_static_name(kernel, DequantDtype::Bf16, ScaleDtype::Bf16, 4, GROUP);
+                let name = qmv_kernel_static_name(
+                    kernel,
+                    DequantDtype::Bf16,
+                    ScaleDtype::Bf16,
+                    AffineBits::new(4).unwrap(),
+                    AffineGroupSize::new(GROUP).unwrap(),
+                );
                 let c: Vec<ConstantValue> = match kernel {
                     QmvKernel::Wide { .. } => AffineQmvWideConstants {
                         k: k_dim,

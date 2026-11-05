@@ -1,5 +1,5 @@
 # The qwen2 forward, in torch-idiom Python. Parsed by scratchy
-# (compiler/macros/src/parse_python.rs), never executed by the
+# (compiler/frontend/src/parse_python.rs), never executed by the
 # compiler. Executed under torch only by the CI oracle, where the SAME
 # text is the reference implementation and the spec at once.
 import torch

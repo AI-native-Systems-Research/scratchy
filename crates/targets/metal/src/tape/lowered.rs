@@ -2715,6 +2715,12 @@ pub enum LoweringError {
     },
     /// The tape lists more distinct commands than a [`CommandIx`] can index.
     TooManyCommands(TooManyCommands),
+    /// A normed rope append of a head wider than `RopeAppendNormed`'s threadgroup staging holds
+    /// ([`crate::tape::ids::StagedHeadDim`]).
+    UnstagedHeadDim { head_dim: u32 },
+    /// A GDN conv whose `kernel` taps or `drafts` drafted tokens a step its kernel's token block
+    /// ([`crate::tape::ids::GdnConvBlock`]) does not cover.
+    GdnConvBlockShort { kernel: u32, drafts: u32 },
 }
 
 /// A scratch buffer whose size scales with the KV cap rung: of the [`ScratchKind`]s, the ones a
@@ -2730,6 +2736,19 @@ pub enum RungScratch {
 impl std::fmt::Display for LoweringError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnstagedHeadDim { head_dim } => write!(
+                f,
+                "RopeAppendNormed's threadgroup staging holds a head of at most {} (got {head_dim})",
+                crate::tape::ids::StagedHeadDim::MAX
+            ),
+            Self::GdnConvBlockShort { kernel, drafts } => write!(
+                f,
+                "the GDN conv's {}-token block must cover the seed window (kernel - 1 = {}) and a \
+                 verify step's rows (drafts + 1 = {})",
+                crate::tape::ids::GdnConvBlock::TOKENS,
+                kernel.saturating_sub(1),
+                drafts + 1
+            ),
             Self::ModelLacks(lacked) => write!(
                 f,
                 "a step reads the model's {lacked:?}, and the model's facts state none"

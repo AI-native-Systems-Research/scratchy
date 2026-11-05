@@ -1,5 +1,5 @@
 # Splash's DFlash2 block drafter (`DFlash2DraftModel`, incoai), in torch-idiom Python. Parsed by
-# scratchy (compiler/macros/src/parse_python.rs), never executed by the compiler.
+# scratchy (compiler/frontend/src/parse_python.rs), never executed by the compiler.
 #
 # Splash's two draft graphs (runtime/model/DFlashDraft.cpp), one tape: its plays run them apart.
 #

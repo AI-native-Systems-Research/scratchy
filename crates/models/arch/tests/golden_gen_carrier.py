@@ -175,12 +175,52 @@ def merge_overrides(cfg, arch, stem):
         deep_merge(cfg, json.loads(path.read_text()))
 
 
+def head_carried(aj, cfg):
+    """config.rs `carries_head`: the head replaces `num_hidden_layers` from a
+    config path, and the config states a positive count there."""
+    for entry in aj.get("params") or []:
+        if entry.get("name") == "num_hidden_layers" and entry.get("replaces") and "from" in entry:
+            n = json_path(normalize_config(cfg, aj), entry["from"])
+            return isinstance(n, int) and n > 0
+    return False
+
+
+def normalize_config(cfg, aj):
+    """config.rs `normalize_hf_config` for `carries_head`'s lookup: text_config
+    and rope_parameters hoisted (explicit top level wins), then the arch's
+    config_aliases."""
+    flat = dict(cfg)
+    for nested in ("text_config", "rope_parameters"):
+        for k, v in (cfg.get(nested) or {}).items():
+            flat.setdefault(k, v)
+    for std, alt in (aj.get("config_aliases") or {}).items():
+        if std not in flat and (v := json_path(flat, alt)) is not None:
+            flat[std] = v
+    return flat
+
+
+def config_path(arch, stem):
+    """Where `stem`'s config lives: the arch's own, or — for a head that ships
+    inside its targets' checkpoints (`checkpoint_of`), which has none — the
+    target config that carries it (config.rs `load_dir` / `load_head_file`)."""
+    own = ARCH_DIR / arch / f"{stem}.json"
+    if own.exists():
+        return own
+    aj_path = ARCH_DIR / arch / "arch.json"
+    aj = json.loads(aj_path.read_text()) if aj_path.exists() else {}
+    for target in aj.get("checkpoint_of") or []:
+        path = ARCH_DIR / target / f"{stem}.json"
+        if path.exists() and head_carried(aj, json.loads(path.read_text())):
+            return path
+    raise FileNotFoundError(f"{arch}: no config {stem!r} of its own or of a target it ships in")
+
+
 def load_config(arch, stem, preset=None):
     """The config a build compiles for `stem` (or, under `preset`, for the
     synthesized `<stem>-<preset>` variant), merged in config.rs's order: the
     checked-in base, its `<stem>.overrides.json`, then (`merge_variant_config`)
     the preset fragment and the `<stem>-<preset>.overrides.json` drift."""
-    cfg = json.loads((ARCH_DIR / arch / f"{stem}.json").read_text())
+    cfg = json.loads(config_path(arch, stem).read_text())
     merge_overrides(cfg, arch, stem)
     if preset is not None:
         deep_merge(cfg, json.loads((PRESET_DIR / f"{preset}.json").read_text()))
@@ -261,6 +301,10 @@ def derive_bounds(cfg):
     if not has("gdn_conv_dim") and has("linear_num_key_heads") and has("linear_key_head_dim") and has("gdn_value_dim"):
         put("gdn_conv_dim", 2 * b["linear_num_key_heads"] * b["linear_key_head_dim"] + b["gdn_value_dim"])
     # apply_generic_bound_defaults
+    # apply_generic_bound_defaults: a head reading its target's rows reads them at
+    # its target's width; a head of its target's width omits it.
+    if not has("backbone_hidden_size") and has("hidden_size"):
+        put("backbone_hidden_size", b["hidden_size"])
     if not has("global_head_dim") and has("head_dim"):
         put("global_head_dim", b["head_dim"])
     if not has("num_global_key_value_heads") and has("num_key_value_heads"):
@@ -798,8 +842,8 @@ def embed(ids, table):
 
 
 def gemm(x, w):
-    """DSL gemm: w is in the manifest's [K, N] orientation (shape.rs
-    `sig_gemm` unifies x's last dim with w[0]). The [out, in] HF layout
+    """DSL gemm: w is in the manifest's [K, N] orientation (the typed
+    signature `gemm(x: [T, K], w: [K, N])`). The [out, in] HF layout
     is a load-time transpose the Rust side owns — the synthetic
     checkpoint writer mirrors it there, not here."""
     return x @ w
@@ -904,6 +948,16 @@ def scalar_weight_mul(x, w):
 
 def recip_scalar(v):
     return 1.0 / v
+
+
+def as_dim(x, *_bound):
+    """`as_dim(x, <bound>)`: `x`'s width stated as another bound — the same rows."""
+    return x
+
+
+def concat(a, b):
+    """Two row sets side by side (shape.rs `sig_concat`: [T, D] ⧺ [T, D])."""
+    return torch.cat([a, b], dim=-1)
 
 
 def reshape(x, shape):
@@ -2407,10 +2461,15 @@ def write_vision_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, carrier
     return ckpt_dir
 
 
-def forward(fn):
+def forward(fn=None, *, workloads=None, sk_buckets=None):
     """`@forward` under torch is the identity — the decorator carries
-    compile-time metadata only."""
-    return fn
+    compile-time metadata only: bare, or called with the bake's bucket
+    ladder (`workloads`, `sk_buckets`), which shapes no math."""
+    if fn is not None:
+        return fn
+    def deco(f):
+        return f
+    return deco
 
 
 def vision_forward(*, workloads=None, sk_buckets=None, processor=None, pixel_pack=None):
@@ -2597,7 +2656,9 @@ def main():
         # never recomputes an explicit key, so pinning a derived bound
         # changes downstream op classification (gemma3's m=2 tape lost
         # its global-rope ops while the accessor kept `self.rotary`).
-        for k in REDERIVABLE:
+        # Sorted: a set's iteration order varies with each process's string hashing, and this
+        # order is the emitted config.json's.
+        for k in sorted(REDERIVABLE):
             if k in TINY_BOUNDS and k in shrunk:
                 cfg[k] = shrunk[k]
         # gemma4's dual-class geometry: the global q/kv projection widths
@@ -2802,6 +2863,10 @@ def main():
         "input_ids": STATE["input_ids"],
         "positions": STATE["positions"],
         "num_tokens": n,
+        **({"target_hidden": torch.randn(
+            n, bounds["backbone_hidden_size"],
+            generator=torch.Generator().manual_seed(SEED + 1)).float()}
+           if re.search(r"\btarget_hidden\b", carrier) else {}),
         "block_table": STATE["block_table"],
         "kv_cache": STATE["kv_cache"],
         **{name: obj for name, obj in rot_objs.items()},

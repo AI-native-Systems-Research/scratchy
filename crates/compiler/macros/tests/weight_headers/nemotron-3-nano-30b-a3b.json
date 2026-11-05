@@ -1,0 +1,28 @@
+{
+  "repo": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+  "configs": ["nemotron-h/nemotron-3-nano-30b-a3b"],
+  "tensors": {
+    "backbone.embeddings.weight": [131072, 2688],
+    "backbone.layers.0.mixer.A_log": [64],
+    "backbone.layers.0.mixer.D": [64],
+    "backbone.layers.0.mixer.conv1d.bias": [6144],
+    "backbone.layers.0.mixer.conv1d.weight": [6144, 1, 4],
+    "backbone.layers.0.mixer.dt_bias": [64],
+    "backbone.layers.0.mixer.in_proj.weight": [10304, 2688],
+    "backbone.layers.0.mixer.norm.weight": [4096],
+    "backbone.layers.0.mixer.out_proj.weight": [2688, 4096],
+    "backbone.layers.0.norm.weight": [2688],
+    "backbone.layers.1.mixer.gate.e_score_correction_bias": [128],
+    "backbone.layers.1.mixer.gate.weight": [128, 2688],
+    "backbone.layers.1.mixer.shared_experts.down_proj.weight": [2688, 3712],
+    "backbone.layers.1.mixer.shared_experts.up_proj.weight": [3712, 2688],
+    "backbone.layers.1.norm.weight": [2688],
+    "backbone.layers.5.mixer.k_proj.weight": [256, 2688],
+    "backbone.layers.5.mixer.o_proj.weight": [2688, 4096],
+    "backbone.layers.5.mixer.q_proj.weight": [4096, 2688],
+    "backbone.layers.5.mixer.v_proj.weight": [256, 2688],
+    "backbone.layers.5.norm.weight": [2688],
+    "backbone.norm_f.weight": [2688],
+    "lm_head.weight": [131072, 2688]
+  }
+}

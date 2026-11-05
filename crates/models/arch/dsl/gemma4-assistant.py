@@ -1,5 +1,5 @@
 # The Gemma 4 assistant drafter (`Gemma4AssistantForCausalLM`), in torch-idiom Python. Parsed by
-# scratchy (compiler/macros/src/parse_python.rs), never executed by the compiler.
+# scratchy (compiler/frontend/src/parse_python.rs), never executed by the compiler.
 #
 # Drafts the token after next from a FIXED position: row t reads its target's final (post-norm)
 # hidden state `target_hidden[t]` — or, past the first draft, the drafter's own projected one — and
@@ -22,14 +22,20 @@ def gemma4_assistant():
         # Branch-local names per class, as the target's: the two classes' query widths differ
         # (sliding 16x256, global 16x512); they converge at `oproj`.
         if layer % sliding_window_pattern == sliding_window_global_remainder:
+            # The q norm is per head: it normalizes the per-head view (`heads` rows of
+            # `global_head_dim`), then the rows go back to one per token.
             qg = gemm(pre_attn_normed, self_attn.q_proj_global[layer])
-            qg = rmsnorm(qg, self_attn.q_norm_global[layer])
+            qg_heads = reshape(qg, [num_tokens * num_attention_heads, global_head_dim])
+            qg_heads = rmsnorm(qg_heads, self_attn.q_norm_global[layer])
+            qg = reshape(qg_heads, [num_tokens, num_attention_heads * global_head_dim])
             qg = rope_query(qg, positions, rotary)
             attng = shared_attention(qg, kv_cache[layer], block_table)
             oproj = gemm(attng, self_attn.o_proj_global[layer])
         else:
             qs = gemm(pre_attn_normed, self_attn.q_proj[layer])
-            qs = rmsnorm(qs, self_attn.q_norm[layer])
+            qs_heads = reshape(qs, [num_tokens * num_attention_heads, head_dim])
+            qs_heads = rmsnorm(qs_heads, self_attn.q_norm[layer])
+            qs = reshape(qs_heads, [num_tokens, num_attention_heads * head_dim])
             qs = rope_query(qs, positions, rotary_local)
             attns = shared_sliding_attention(qs, kv_cache[layer], block_table)
             oproj = gemm(attns, self_attn.o_proj[layer])

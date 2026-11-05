@@ -16,13 +16,13 @@ use crate::classified::{
     BoolPred, Bound, Expr, ExternKind, LocalId, LocalTable, OpKind, Prelude, Program, Stmt,
     WeightTable,
 };
-use crate::shape::{Dim, canonical_mul};
+use crate::dim::{Dim, canonical_mul};
 
 pub type ClassifyResult<T> = Result<T, syn::Error>;
 
 /// Convert a parser-produced [`ast::DimSpec`] into a [`Dim`]. `Lit` /
 /// `Bound` map directly; `Mul` flattens into [`Dim::Mul`] via
-/// `canonical_mul` (matching the form `apply_reshape_hints` produces);
+/// `canonical_mul` (the order the typed `Mul` is written in);
 /// `Div` becomes [`Dim::Div`] — kept symbolic until codegen folds the
 /// numerator + closes the denominator against the per-model `bounds`.
 fn dimspec_to_dim(s: &ast::DimSpec) -> Dim {
@@ -44,6 +44,20 @@ pub fn classify(ast: &ast::Ast) -> ClassifyResult<Program> {
     classify_with(ast, Prelude::Decoder)
 }
 
+/// The program a carrier compiles to: a decoder's with the compiler's drafter capture
+/// (`draft_capture`), classified under the carrier's prelude. The ONE construction of it: the build
+/// script types this program and the bake lowers it, and the bake reads each local's shape from the
+/// typed program's trace by its `LocalId`, so both must hold the same program.
+pub fn carrier_program(carrier: &crate::parse_python::PythonCarrier) -> ClassifyResult<Program> {
+    match carrier.vision {
+        true => classify_with(&carrier.ast, Prelude::Vision),
+        false => classify_with(
+            &crate::draft_capture::insert(&carrier.ast),
+            Prelude::Decoder,
+        ),
+    }
+}
+
 /// Classify the AST against a specific prelude. The prelude selects
 /// which extern names are recognized — decoder bodies use
 /// `input_ids`/`positions`/etc., vision bodies use
@@ -60,6 +74,7 @@ pub fn classify_with(ast: &ast::Ast, prelude: Prelude) -> ClassifyResult<Program
         locals: cx.locals,
         weights: cx.weights,
         reshape_targets: cx.reshape_targets,
+        dim_casts: cx.dim_casts,
         prelude,
         decoder_safetensors_prefix: None,
         weight_leaf_renames: Vec::new(),
@@ -75,12 +90,13 @@ struct Ctx {
     /// For-loops push their induction variable and pop it on exit.
     scope: HashMap<String, Vec<LocalId>>,
     prelude: Prelude,
-    /// DSL-authored reshape targets accumulated during classify.
-    /// Identical surface to `shape::apply_reshape_hints`'s synthesized
-    /// reshapes — both flow into `Program::reshape_targets` keyed by
-    /// the producing `LocalId`. See [`Ctx::classify_stmt`] for the
+    /// DSL-authored reshape targets accumulated during classify; they
+    /// flow into `Program::reshape_targets` keyed by the producing
+    /// `LocalId`. See [`Ctx::classify_stmt`] for the
     /// `ast::Expr::Reshape` Assign-arm intercept.
     reshape_targets: HashMap<LocalId, Vec<Dim>>,
+    /// `x = as_dim(y, <bound>)`s accumulated during classify (`Program::dim_casts`).
+    dim_casts: HashMap<LocalId, Dim>,
 }
 
 impl Ctx {
@@ -90,25 +106,27 @@ impl Ctx {
 
     fn classify_stmt(&mut self, stmt: &ast::Stmt) -> ClassifyResult<Stmt> {
         match stmt {
-            ast::Stmt::Assign { target, value } => {
+            ast::Stmt::Assign {
+                target,
+                value,
+                line,
+            } => {
                 // `out = reshape(source, [d0, d1, ...])` is the only
                 // place an `ast::Expr::Reshape` is admitted. We
                 // intercept here (before `classify_expr`) so the
                 // target shape can be threaded into
                 // `program.reshape_targets` keyed by the freshly
                 // bound `LocalId`. The classified Stmt drops the
-                // explicit shape and becomes a Reshape OpKind call —
-                // identical surface to the synthesized form from
-                // `shape::apply_reshape_hints`, so every downstream
-                // pass (CFG / FUF / shape::infer / solver / codegen)
-                // already knows how to handle it.
+                // explicit shape and becomes a Reshape OpKind call,
+                // which every downstream pass (typed emit / CFG / FUF /
+                // codegen) handles.
                 if let ast::Expr::Reshape {
                     source,
                     target_shape,
                 } = value
                 {
                     let source = self.classify_expr(source)?;
-                    let id = self.bind(target.clone());
+                    let id = self.bind(target.clone(), *line);
                     let dims: Vec<Dim> = target_shape.iter().map(dimspec_to_dim).collect();
                     self.reshape_targets.insert(id, dims);
                     return Ok(Stmt::Assign {
@@ -119,15 +137,47 @@ impl Ctx {
                         },
                     });
                 }
+                // `x = as_dim(y, <bound>)`: an alias of the local `y`, its width stated as the
+                // bound (`Program::dim_casts`). Admitted only as an assignment's whole RHS.
+                if let ast::Expr::Call { op, args } = value
+                    && op == "as_dim"
+                {
+                    let [source, ast::Expr::Var(bound)] = args.as_slice() else {
+                        return Err(syn::Error::new(
+                            proc_macro2::Span::call_site(),
+                            "`as_dim(x, <bound>)` takes a local and a config bound",
+                        ));
+                    };
+                    let source = self.classify_expr(source)?;
+                    if !matches!(source, Expr::Local(_)) {
+                        return Err(syn::Error::new(
+                            proc_macro2::Span::call_site(),
+                            "`as_dim(x, <bound>)` casts a local",
+                        ));
+                    }
+                    let id = self.bind(target.clone(), *line);
+                    self.dim_casts.insert(id, Dim::Bound(bound.to_string()));
+                    return Ok(Stmt::Assign {
+                        target: id,
+                        value: source,
+                    });
+                }
                 // Classify RHS first so that `x = f(x)` reads the
                 // previous binding of `x`, not the new one.
                 let value = self.classify_expr(value)?;
-                let id = self.bind(target.clone());
+                let id = self.bind(target.clone(), *line);
                 Ok(Stmt::Assign { target: id, value })
             }
-            ast::Stmt::AssignTuple { targets, value } => {
+            ast::Stmt::AssignTuple {
+                targets,
+                value,
+                line,
+            } => {
                 let value = self.classify_expr(value)?;
-                let ids = targets.iter().map(|t| self.bind(t.clone())).collect();
+                let ids = targets
+                    .iter()
+                    .map(|t| self.bind(t.clone(), *line))
+                    .collect();
                 Ok(Stmt::AssignTuple {
                     targets: ids,
                     value,
@@ -279,7 +329,7 @@ impl Ctx {
             // binding of this name. Use `bind` so reads after the
             // If resolve to this merge id.
             let ident = syn::Ident::new(name, proc_macro2::Span::call_site());
-            let merge_id = self.bind(ident);
+            let merge_id = self.bind(ident, None);
             merge_carry.push((merge_id, then_final, else_final));
         }
 
@@ -497,9 +547,9 @@ impl Ctx {
     /// Introduce a fresh local binding shadowing any previous
     /// binding of the same name. Used by assignment statements —
     /// the new binding outlives the statement.
-    fn bind(&mut self, ident: Ident) -> LocalId {
+    fn bind(&mut self, ident: Ident, line: Option<u32>) -> LocalId {
         let name = ident.to_string();
-        let id = self.locals.push(ident);
+        let id = self.locals.push_at(ident, line);
         // Replace the top of the stack so shadowing is observable
         // to subsequent reads at this scope depth.
         let stack = self.scope.entry(name).or_default();
@@ -975,7 +1025,7 @@ mod tests {
         //   input_layernorm, post_attention_layernorm = 2
         //   embed_tokens, norm, lm_head = 3
         //   TOTAL = 12.
-        assert_eq!(p.weights.len(), 12, "unique weights interned");
+        assert_eq!(p.weights.ids().count(), 12, "unique weights interned");
     }
 
     // ── Vision prelude routing (G.3) ─────────────────────────────
@@ -1059,8 +1109,7 @@ mod tests {
     #[test]
     fn dsl_authored_reshape_records_target_shape() {
         // `reshape(x, [num_tokens, vision_embed_dim])` — the G.5.c
-        // "literal-or-bound" surface. The classified Stmt must match
-        // the shape of `apply_reshape_hints`'s synthesized form: a
+        // "literal-or-bound" surface. The classified Stmt is a
         // Reshape OpKind call with the source as its only arg, plus
         // an entry in `program.reshape_targets` keyed by the new
         // local. Bound names round-trip as `Dim::Bound(name)`,

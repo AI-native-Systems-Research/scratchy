@@ -12,14 +12,12 @@
   "self_attn.q_norm": ["head_dim"],
   "self_attn.k_norm": ["head_dim"],
 
-  "linear_attn": ["hidden_size"],
   "linear_attn.in_proj_qkv": ["hidden_size", "gdn_conv_dim"],
   "linear_attn.in_proj_z": ["hidden_size", "gdn_value_dim"],
   "linear_attn.in_proj_a": ["hidden_size", "linear_num_value_heads"],
   "linear_attn.in_proj_b": ["hidden_size", "linear_num_value_heads"],
   "linear_attn.out_proj": ["linear_num_value_heads * linear_value_head_dim", "hidden_size"],
 
-  "mlp": ["hidden_size"],
   "mlp.shared_expert.gate_proj": ["hidden_size", "shared_expert_intermediate_size"],
   "mlp.shared_expert.up_proj": ["hidden_size", "shared_expert_intermediate_size"],
   "mlp.shared_expert.down_proj": ["shared_expert_intermediate_size", "hidden_size"],

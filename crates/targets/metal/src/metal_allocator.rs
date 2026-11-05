@@ -862,8 +862,8 @@ impl MetalAllocator {
 
     /// How this device's kernels read `bits`-bit MLX-affine codes: what a command binding them
     /// by [`Self::bind_affine_codes`] reads them as.
-    pub fn affine_codes(&self, bits: u32) -> AffineCodes {
-        self.affine_codes_target().for_bits(bits)
+    pub fn affine_codes(&self, bits: crate::tape::ids::AffineBits) -> AffineCodes {
+        self.affine_codes_target().for_bits(bits.get())
     }
 
     /// After a pool has bound every codes range its tapes read (`ptrs`, through

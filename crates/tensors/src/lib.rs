@@ -9,6 +9,8 @@
 //! traits — no device calls — so it compiles everywhere and gives the
 //! `targets/{metal,spyre}` crates a shared home that cannot name a backend.
 
+pub mod bundle_roles;
+pub mod compiler_ids;
 pub mod device_allocator;
 pub mod dtype;
 pub mod lowering_dtype;

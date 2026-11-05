@@ -20,6 +20,7 @@ use scratchy_target_metal::quantized::{
     qmm_t_dispatch_shape, qmm_t_kernel_name, qmv_dispatch_shape, qmv_kernel_name,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{ComputePipelineState, ConstantValue};
+use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
 
 /// `(w, h, d)` triple from a dispatch-shape helper → `MTLSize`.
 fn mtl_size(t: (u32, u32, u32)) -> MTLSize {
@@ -169,7 +170,8 @@ fn run_case_bf16(op: Op, m: usize, n: usize, k: usize, group_size: usize, seed: 
                 n as u32,
                 k as u32,
                 1,
-                group_size as u32,
+                AffineGroupSize::new(group_size as u32).unwrap(),
+                AffineBits::new(8).unwrap(),
                 false,
             ) {
                 QmmTKernel::SplitK { .. } => QmmTKernel::Standard,

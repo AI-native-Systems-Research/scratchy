@@ -4,21 +4,34 @@
   },
 
   "patch_embed.proj": ["vision_in_features", "vision_embed_dim"],
+  "patch_embed.proj.bias": ["vision_embed_dim"],
 
   "norm0": ["vision_embed_dim"],
+  "norm0.bias": ["vision_embed_dim"],
   "norm1": ["vision_embed_dim"],
+  "norm1.bias": ["vision_embed_dim"],
 
   "attn.q": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.q.bias": ["vision_embed_dim"],
   "attn.k": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.k.bias": ["vision_embed_dim"],
   "attn.v": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.v.bias": ["vision_embed_dim"],
   "attn.wo": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.wo.bias": ["vision_embed_dim"],
 
   "mlp.fc0": ["vision_embed_dim", "vision_mlp_hidden"],
+  "mlp.fc0.bias": ["vision_mlp_hidden"],
   "mlp.fc1": ["vision_mlp_hidden", "vision_embed_dim"],
+  "mlp.fc1.bias": ["vision_embed_dim"],
 
   "final_layernorm": ["vision_embed_dim"],
+  "final_layernorm.bias": ["vision_embed_dim"],
 
   "mm.layer_norm": ["vision_merge_hidden"],
+  "mm.layer_norm.bias": ["vision_merge_hidden"],
   "mm.proj_in": ["vision_merge_hidden", "d_model"],
-  "mm.proj_out": ["d_model", "d_model"]
+  "mm.proj_in.bias": ["d_model"],
+  "mm.proj_out": ["d_model", "d_model"],
+  "mm.proj_out.bias": ["d_model"]
 }

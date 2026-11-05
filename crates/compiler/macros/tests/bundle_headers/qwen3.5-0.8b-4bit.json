@@ -1,0 +1,91 @@
+{
+ "repo": "mlx-community/Qwen3.5-0.8B-4bit",
+ "configs": [
+  "qwen3-5/qwen3.5-0.8b"
+ ],
+ "head": false,
+ "bundles": {
+  "linear_attn": "language_model.model.layers.0.linear_attn"
+ },
+ "quantization": {
+  "group_size": 64,
+  "bits": 4,
+  "mode": "affine"
+ },
+ "tensors": {
+  "language_model.model.layers.0.linear_attn.A_log": [
+   16
+  ],
+  "language_model.model.layers.0.linear_attn.conv1d.weight": [
+   6144,
+   4,
+   1
+  ],
+  "language_model.model.layers.0.linear_attn.dt_bias": [
+   16
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_a.biases": [
+   16,
+   16
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_a.scales": [
+   16,
+   16
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_a.weight": [
+   16,
+   128
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_b.biases": [
+   16,
+   16
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_b.scales": [
+   16,
+   16
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_b.weight": [
+   16,
+   128
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_qkv.biases": [
+   6144,
+   16
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_qkv.scales": [
+   6144,
+   16
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_qkv.weight": [
+   6144,
+   128
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_z.biases": [
+   2048,
+   16
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_z.scales": [
+   2048,
+   16
+  ],
+  "language_model.model.layers.0.linear_attn.in_proj_z.weight": [
+   2048,
+   128
+  ],
+  "language_model.model.layers.0.linear_attn.norm.weight": [
+   128
+  ],
+  "language_model.model.layers.0.linear_attn.out_proj.biases": [
+   1024,
+   32
+  ],
+  "language_model.model.layers.0.linear_attn.out_proj.scales": [
+   1024,
+   32
+  ],
+  "language_model.model.layers.0.linear_attn.out_proj.weight": [
+   1024,
+   256
+  ]
+ }
+}

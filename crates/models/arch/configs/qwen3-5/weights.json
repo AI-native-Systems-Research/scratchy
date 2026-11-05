@@ -12,7 +12,6 @@
   "self_attn.q_norm": ["head_dim"],
   "self_attn.k_norm": ["head_dim"],
 
-  "linear_attn": ["hidden_size"],
   "linear_attn.in_proj_qkv": ["hidden_size", "gdn_conv_dim"],
   "linear_attn.in_proj_z": ["hidden_size", "gdn_value_dim"],
   "linear_attn.in_proj_a": ["hidden_size", "linear_num_value_heads"],

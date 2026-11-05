@@ -74,7 +74,6 @@
   "vision_merge_hidden": 256,
   "vision_rope_half_dim": 8,
   "vision_intermediate_size": 128,
-  "vision_intermediate_size_padded": 135,
   "vision_window_size": 56,
   "d_model": 128
 }

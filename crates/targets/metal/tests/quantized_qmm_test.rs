@@ -16,6 +16,7 @@
 //     sum-reduce in CPU (mirroring `quantized.cpp:861
 //     strided_reduce_general_dispatch`).
 
+use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
@@ -323,8 +324,15 @@ fn affine_qmm_t_aligned_b4_bf16_matches_cpu_reference() {
     let k = 512;
     let group_size = 64;
 
-    let expected_kernel =
-        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel = pick_qmm_t_kernel(
+        m as u32,
+        n as u32,
+        k as u32,
+        1,
+        AffineGroupSize::new(group_size as u32).unwrap(),
+        AffineBits::new(4).unwrap(),
+        false,
+    );
     assert_eq!(
         expected_kernel,
         QmmTKernel::Standard,
@@ -372,8 +380,15 @@ fn affine_qmm_t_unaligned_b4_bf16_matches_cpu_reference() {
     let k = 64;
     let group_size = 64;
 
-    let expected_kernel =
-        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel = pick_qmm_t_kernel(
+        m as u32,
+        n as u32,
+        k as u32,
+        1,
+        AffineGroupSize::new(group_size as u32).unwrap(),
+        AffineBits::new(4).unwrap(),
+        false,
+    );
     assert_eq!(
         expected_kernel,
         QmmTKernel::Standard,
@@ -422,8 +437,15 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_q_proj_prefill_shape() {
     let k = 2048;
     let group_size = 64;
 
-    let expected_kernel =
-        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel = pick_qmm_t_kernel(
+        m as u32,
+        n as u32,
+        k as u32,
+        1,
+        AffineGroupSize::new(group_size as u32).unwrap(),
+        AffineBits::new(4).unwrap(),
+        false,
+    );
     assert!(
         matches!(expected_kernel, QmmTKernel::SplitK { split_k: 4, .. }),
         "Llama-1B q_proj prefill shape should route to SplitK(4), got {:?}",
@@ -465,8 +487,15 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_kv_proj_prefill_shape() {
     let k = 2048;
     let group_size = 64;
 
-    let expected_kernel =
-        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel = pick_qmm_t_kernel(
+        m as u32,
+        n as u32,
+        k as u32,
+        1,
+        AffineGroupSize::new(group_size as u32).unwrap(),
+        AffineBits::new(4).unwrap(),
+        false,
+    );
     assert!(
         matches!(expected_kernel, QmmTKernel::SplitK { split_k: 16, .. }),
         "Llama-1B kv_proj prefill shape should route to SplitK(16), got {:?}",
@@ -508,8 +537,15 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_gate_up_prefill_shape() {
     let k = 2048;
     let group_size = 64;
 
-    let expected_kernel =
-        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel = pick_qmm_t_kernel(
+        m as u32,
+        n as u32,
+        k as u32,
+        1,
+        AffineGroupSize::new(group_size as u32).unwrap(),
+        AffineBits::new(4).unwrap(),
+        false,
+    );
     assert_eq!(
         expected_kernel,
         QmmTKernel::Standard,
@@ -550,8 +586,15 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_down_proj_prefill_shape() {
     let k = 8192;
     let group_size = 64;
 
-    let expected_kernel =
-        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel = pick_qmm_t_kernel(
+        m as u32,
+        n as u32,
+        k as u32,
+        1,
+        AffineGroupSize::new(group_size as u32).unwrap(),
+        AffineBits::new(4).unwrap(),
+        false,
+    );
     assert!(
         matches!(expected_kernel, QmmTKernel::SplitK { split_k: 4, .. }),
         "Llama-1B down_proj prefill shape should route to SplitK(4), got {:?}",
@@ -597,8 +640,15 @@ fn affine_qmm_t_splitk_b4_bf16_matches_cpu_reference() {
     let k = 2048;
     let group_size = 64;
 
-    let expected_kernel =
-        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel = pick_qmm_t_kernel(
+        m as u32,
+        n as u32,
+        k as u32,
+        1,
+        AffineGroupSize::new(group_size as u32).unwrap(),
+        AffineBits::new(4).unwrap(),
+        false,
+    );
     assert!(
         matches!(expected_kernel, QmmTKernel::SplitK { .. }),
         "test shape should route to SplitK, got {:?}",
@@ -828,7 +878,15 @@ fn affine_qmm_t_b4_offset8_codes_match_cpu_reference() {
     let (m, n, k, gs) = (64, 64, 2048, 64);
     let mut kernels = vec![
         QmmTKernel::Standard,
-        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, gs, false),
+        pick_qmm_t_kernel(
+            m as u32,
+            n as u32,
+            k as u32,
+            1,
+            AffineGroupSize::new(gs).unwrap(),
+            AffineBits::new(4).unwrap(),
+            false,
+        ),
     ];
     if scratchy_target_metal::targets::is_nax_capable(dev.profile.generation) {
         kernels.extend(NaxDequant::ALL.map(QmmTKernel::Nax));

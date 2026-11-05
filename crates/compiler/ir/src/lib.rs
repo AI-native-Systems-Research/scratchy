@@ -864,24 +864,7 @@ impl Clone for Instruction {
     }
 }
 
-/// A runtime tensor of `[num_tokens, width]` rows a forward reads as an input, delivered by the
-/// host before the forward runs — what [`Instruction::LoadRows`] copies into a tile.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RowsExtern {
-    /// Vision patches, `[num_tokens, vision_in_features]`.
-    Pixels,
-    /// Qwen3.5-VL's learned positional embedding, interpolated on the host,
-    /// `[num_tokens, vision_embed_dim]`.
-    PosEmbeds,
-    /// Another forward's final hidden states, `[num_tokens, hidden_size]` — what a
-    /// multi-token-prediction head reads from its target model.
-    TargetHidden,
-}
-
-impl RowsExtern {
-    /// Every source, in the order a forward materializes the ones it reads.
-    pub const ALL: [Self; 3] = [Self::Pixels, Self::PosEmbeds, Self::TargetHidden];
-}
+pub use scratchy_tensors::compiler_ids::RowsExtern;
 
 /// How a projection's learned bias is stored — which accessor reads it: a
 /// dense `LinearLayer`'s `.bias`, or an MLX-affine layer's `linear_bias`.
