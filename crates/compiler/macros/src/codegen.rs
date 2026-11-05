@@ -48,7 +48,7 @@ use crate::workload::{WorkloadPoint, WorkloadPoints};
 /// Architectures that diverge (e.g. some models wrap lm_head in a
 /// `model.` prefix) can override via a future per-arch conventions
 /// mechanism; this covers Llama, Qwen2, Mistral, Gemma2.
-fn safetensors_prefix(
+pub(crate) fn safetensors_prefix(
     naming: crate::classified::WeightNaming<'_>,
     arch: &crate::arch_spec::DeclaredArchSpec,
     id: WeightId,

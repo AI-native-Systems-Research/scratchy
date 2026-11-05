@@ -1,0 +1,19 @@
+{
+  "repo": "unsloth/gemma-2-2b",
+  "configs": ["gemma2/gemma2-2b"],
+  "tensors": {
+    "model.embed_tokens.weight": [256000, 2304],
+    "model.layers.0.input_layernorm.weight": [2304],
+    "model.layers.0.mlp.down_proj.weight": [2304, 9216],
+    "model.layers.0.mlp.gate_proj.weight": [9216, 2304],
+    "model.layers.0.mlp.up_proj.weight": [9216, 2304],
+    "model.layers.0.post_attention_layernorm.weight": [2304],
+    "model.layers.0.post_feedforward_layernorm.weight": [2304],
+    "model.layers.0.pre_feedforward_layernorm.weight": [2304],
+    "model.layers.0.self_attn.k_proj.weight": [1024, 2304],
+    "model.layers.0.self_attn.o_proj.weight": [2304, 2048],
+    "model.layers.0.self_attn.q_proj.weight": [2048, 2304],
+    "model.layers.0.self_attn.v_proj.weight": [1024, 2304],
+    "model.norm.weight": [2304]
+  }
+}

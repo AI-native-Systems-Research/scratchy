@@ -1,6 +1,5 @@
 {
   "target_embed_tokens": ["vocab_size", "backbone_hidden_size"],
-  "embed_tokens": ["vocab_size", "hidden_size"],
   "lm_head": ["hidden_size", "vocab_size"],
   "pre_projection": ["2 * backbone_hidden_size", "hidden_size"],
   "post_projection": ["hidden_size", "backbone_hidden_size"],

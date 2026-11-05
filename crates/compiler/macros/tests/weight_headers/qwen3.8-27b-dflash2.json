@@ -1,0 +1,31 @@
+{
+  "repo": "incoai/Qwen3.8-27B-DFlash2",
+  "configs": ["dflash2/qwen3.8-27b-dflash2"],
+  "names": [["embed_tokens", "model.language_model.embed_tokens.weight"], ["lm_head", "lm_head.weight"]],
+  "borrowed_from": "Qwen/Qwen3.8-27B",
+  "tensors": {
+    "candidate_selector.hidden_projection.weight": [256, 5120],
+    "candidate_selector.predecessor_codebook": [248320, 256],
+    "candidate_selector.successor_codebook": [248320, 256],
+    "fc.weight": [5120, 25600],
+    "hidden_norm.weight": [5120],
+    "layers.0.attention_conv.base_kernel": [2, 2, 5120],
+    "layers.0.attention_conv.kernel_projection.weight": [1280, 5120],
+    "layers.0.input_layernorm.weight": [5120],
+    "layers.0.mlp.down_proj.weight": [5120, 17408],
+    "layers.0.mlp.gate_proj.weight": [17408, 5120],
+    "layers.0.mlp.up_proj.weight": [17408, 5120],
+    "layers.0.mlp_conv.base_kernel": [2, 2, 5120],
+    "layers.0.mlp_conv.kernel_projection.weight": [1280, 5120],
+    "layers.0.post_attention_layernorm.weight": [5120],
+    "layers.0.self_attn.k_norm.weight": [128],
+    "layers.0.self_attn.k_proj.weight": [1024, 5120],
+    "layers.0.self_attn.o_proj.weight": [5120, 4096],
+    "layers.0.self_attn.q_norm.weight": [128],
+    "layers.0.self_attn.q_proj.weight": [4096, 5120],
+    "layers.0.self_attn.v_proj.weight": [1024, 5120],
+    "lm_head.weight": [248320, 5120],
+    "model.language_model.embed_tokens.weight": [248320, 5120],
+    "norm.weight": [5120]
+  }
+}

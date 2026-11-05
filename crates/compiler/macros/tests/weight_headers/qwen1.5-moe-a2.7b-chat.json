@@ -1,0 +1,23 @@
+{
+  "repo": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+  "configs": ["qwen2-moe/slimed-qwen-3"],
+  "tensors": {
+    "lm_head.weight": [151936, 2048],
+    "model.embed_tokens.weight": [151936, 2048],
+    "model.layers.0.input_layernorm.weight": [2048],
+    "model.layers.0.mlp.gate.weight": [60, 2048],
+    "model.layers.0.mlp.shared_expert.down_proj.weight": [2048, 5632],
+    "model.layers.0.mlp.shared_expert.gate_proj.weight": [5632, 2048],
+    "model.layers.0.mlp.shared_expert.up_proj.weight": [5632, 2048],
+    "model.layers.0.mlp.shared_expert_gate.weight": [1, 2048],
+    "model.layers.0.post_attention_layernorm.weight": [2048],
+    "model.layers.0.self_attn.k_proj.bias": [2048],
+    "model.layers.0.self_attn.k_proj.weight": [2048, 2048],
+    "model.layers.0.self_attn.o_proj.weight": [2048, 2048],
+    "model.layers.0.self_attn.q_proj.bias": [2048],
+    "model.layers.0.self_attn.q_proj.weight": [2048, 2048],
+    "model.layers.0.self_attn.v_proj.bias": [2048],
+    "model.layers.0.self_attn.v_proj.weight": [2048, 2048],
+    "model.norm.weight": [2048]
+  }
+}

@@ -63,6 +63,8 @@ pub use render::render_tokens;
 pub use scratchy_target_metal_compiler::static_tape::bake_module as metal_bake_module;
 #[cfg(test)]
 mod frontend_tests;
+#[cfg(test)]
+mod checkpoint_tests;
 mod rows_lowering;
 mod shape;
 mod to_wavefront;
