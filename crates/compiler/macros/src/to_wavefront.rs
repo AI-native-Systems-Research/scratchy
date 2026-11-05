@@ -338,8 +338,8 @@ impl<'a> Builder<'a> {
     /// summed by `scores`. Closes the expansion; returns the sum.
     ///
     /// `bank` resolves one projection's WEIGHT and SCALE sources — the two are separate
-    /// launch tensors (a bundle holds both), so an affine bank's matmul binds them as operands 2
-    /// and 3. A dense bank has no scale: its matmul binds the weight alone, as operand 2.
+    /// launch tensors (a bundle holds both), so an affine or fp8 bank's matmul binds them as
+    /// operands 2 and 3. A dense bank has no scale: its matmul binds the weight alone, as operand 2.
     fn experts(
         &mut self,
         x: InputRef,
@@ -363,7 +363,9 @@ impl<'a> Builder<'a> {
         };
         let pairs = self.push_op(sort, vec![x, InputRef::Op(indices)]);
         let rows = |r: usize, w: InputRef, s: InputRef| match weight {
-            ExpertWeight::Affine(_) => vec![InputRef::Op(r), InputRef::Op(pairs), w, s],
+            ExpertWeight::Affine(_) | ExpertWeight::Fp8Dynamic => {
+                vec![InputRef::Op(r), InputRef::Op(pairs), w, s]
+            }
             ExpertWeight::Dense => vec![InputRef::Op(r), InputRef::Op(pairs), w],
         };
         let act = match e.body {
@@ -608,7 +610,8 @@ pub struct PrefixCapacity(std::num::NonZeroU32);
 /// [`ExpertWeight::Dense`] expert matmuls only under [`Self::Lower`]; under [`Self::Refuse`] the
 /// bridge refuses it ([`BridgeError::NoMetalRealization`]), as it always has. The `moe_block` and
 /// `gemma_moe` banks read this: under [`Self::Refuse`] a Gemma bank with no affine storage keeps
-/// its `(64, 4)` affine fallback. The gpt-oss bank is affine-only either way.
+/// its `(64, 4)` affine fallback. An fp8 bank lowers to [`ExpertWeight::Fp8Dynamic`] under
+/// [`Self::Lower`] and as before under [`Self::Refuse`]. The gpt-oss bank is affine-only either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenseExperts {
     /// The caller's target has no dense expert kernels: refuse a dense bank.
@@ -1560,6 +1563,10 @@ pub fn lower_decode_to_wavefront(
                     (Some(crate::quantization::StorageFormat::Affine { group_size, bits }), _) => {
                         ExpertWeight::Affine(ExpertQuant::declared(*group_size, *bits))
                     }
+                    // Read as dense, an fp8 bank's bytes would be taken for bf16.
+                    (Some(crate::quantization::StorageFormat::Fp8 { .. }), DenseExperts::Lower) => {
+                        ExpertWeight::Fp8Dynamic
+                    }
                     (_, DenseExperts::Lower) => ExpertWeight::Dense,
                     (_, DenseExperts::Refuse) => {
                         return Err(BridgeError::NoMetalRealization {
@@ -1620,9 +1627,9 @@ pub fn lower_decode_to_wavefront(
                     body,
                     shared: SharedExpertBound(shared),
                 };
-                // The fused MoE bundle is ONE source (its affine scales resolve by tensor
-                // role at the target, not as separate operands), so both of a projection's
-                // weight operands bind it.
+                // The fused MoE bundle is ONE source (its affine or fp8 scales resolve by
+                // tensor role at the target, not as separate operands), so both of a
+                // projection's weight operands bind it.
                 let bank = &|_proj: ExpertProj| (w, w);
                 let idx = bx.experts(expert_x, indices, scores, bank, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
@@ -1774,7 +1781,11 @@ pub fn lower_decode_to_wavefront(
                 // `DenseExperts::Lower`, with no per-channel scale sources (each `ExpertMatmul`
                 // then reads rows, pairs and its weight, as `moe_block`'s dense bank does). Under
                 // `Refuse` it keeps the affine fallback above.
+                // An fp8 bank under `Lower` binds its per-channel scales as an affine bank does.
+                let fp8 = matches!(ew.2, crate::quantization::StorageFormat::Fp8 { .. })
+                    && bx.dense_experts == DenseExperts::Lower;
                 let dense = !matches!(ew.2, crate::quantization::StorageFormat::Affine { .. })
+                    && !fp8
                     && bx.dense_experts == DenseExperts::Lower;
                 // Routes off its own pre-norm of `router_in`: logits → top-k → scores at a
                 // `hidden^-0.5` temperature → softmax → × per-expert scale. GeGLU experts over
@@ -1835,9 +1846,12 @@ pub fn lower_decode_to_wavefront(
                     k,
                     inter: moe_inter,
                     hidden,
-                    weight: match dense {
-                        true => ExpertWeight::Dense,
-                        false => ExpertWeight::Affine(ExpertQuant::declared(group_size, bits)),
+                    weight: match (dense, fp8) {
+                        (true, _) => ExpertWeight::Dense,
+                        (false, true) => ExpertWeight::Fp8Dynamic,
+                        (false, false) => {
+                            ExpertWeight::Affine(ExpertQuant::declared(group_size, bits))
+                        }
                     },
                     bundle: ExpertBundle::SwitchGlu,
                     body: ExpertBody::Gated(GatedAct::Gelu),

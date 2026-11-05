@@ -83,6 +83,19 @@ pub const BUNDLE_TENSOR_LEAVES: &[(BundleTensor, &str)] = &[
     (BundleTensor::ExpertDownW, "down_proj"),
 ];
 
+/// Each expert tensor's leaf in a checkpoint that stores every expert apart (the compressed-tensors
+/// fp8 ones: Qwen3.6's `mlp.experts`, Gemma 4's `experts`), after the bank's prefix and the
+/// expert's index: `<bank>.{e}.<leaf>`. A per-channel fp8 projection is its e4m3 `weight` and its
+/// `weight_scale` (`[out, 1]`).
+pub const PER_EXPERT_TENSOR_LEAVES: &[(BundleTensor, &str)] = &[
+    (BundleTensor::ExpertGateW, "gate_proj.weight"),
+    (BundleTensor::ExpertGateS, "gate_proj.weight_scale"),
+    (BundleTensor::ExpertUpW, "up_proj.weight"),
+    (BundleTensor::ExpertUpS, "up_proj.weight_scale"),
+    (BundleTensor::ExpertDownW, "down_proj.weight"),
+    (BundleTensor::ExpertDownS, "down_proj.weight_scale"),
+];
+
 /// Whole-segment suffix rewrites of a bundle's checkpoint prefix, before its tensor's leaf
 /// ([`BUNDLE_TENSOR_LEAVES`]): the DSL's `experts.switch_glu` is MLX's layout, and the HF
 /// checkpoint keeps the experts at `experts`. Read only by the bundle-tensor names of the

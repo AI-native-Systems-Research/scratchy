@@ -2,6 +2,7 @@
   "quantizations": [
     "mlx-affine-b4-g64",
     "mlx-affine-b4-g64-qembed",
-    "mlx-affine-b3-g64-qembed"
+    "mlx-affine-b3-g64-qembed",
+    "fp8-dynamic-per-channel"
   ]
 }

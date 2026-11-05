@@ -985,6 +985,9 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                     (proj, n, k, quant.group().get(), quant.bits().get(), bundle).hash(h)
                 }
                 crate::lower::ExpertWeight::Dense => (proj, n, k, bundle).hash(h),
+                crate::lower::ExpertWeight::Fp8Dynamic => {
+                    (proj, n, k, bundle, std::mem::discriminant(weight)).hash(h)
+                }
             },
             SubOp::ExpertGatedAct { act } => act.hash(h),
             SubOp::ExpertAct { act } => act.hash(h),

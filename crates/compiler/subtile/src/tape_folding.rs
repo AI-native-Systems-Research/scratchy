@@ -211,8 +211,8 @@ pub enum FoldPattern<K: 'static> {
         writers: &'static [K],
         kernel: K,
     },
-    /// Up to `max` free dense `matmul`s reading the same operand 0 — the q, k and v projections
-    /// off one norm — whose output widths fall in the same one of `bands`, fold into the first on
+    /// Up to `max` free `matmul`s reading the same operand 0 — the q, k and v projections off one
+    /// norm — all dense or all fp8, whose output widths fall in the same one of `bands`, fold into the first on
     /// the tape: one command over several weights that shares the input. Each other matmul is the
     /// command's epilogue, so every output keeps its own buffer. A matmul a step of `gated` kinds
     /// reads is left to the gated folds, which take it whole; one in no band never folds.
@@ -1056,9 +1056,17 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
                         .any(|a| matches!(a, Arg::Op(q) if *q == j))
             })
         };
+        // A group's members share the driver's weights: all dense, or all fp8 (each its own scale).
+        let weights = match ops.op(i) {
+            SubOp::MatmulTile { weight, .. } => weight.kind(),
+            _ => return,
+        };
+        if !matches!(weights, GemmWeightKind::Dense | GemmWeightKind::Fp8Dynamic) {
+            return;
+        }
         let free = |j: usize| {
             ops.kind(j) == matmul
-                && self.is_matvec(j, GemmWeightKind::Dense)
+                && self.is_matvec(j, weights)
                 && self.absorbed[j].is_none()
                 && self.epilogue[j].is_none()
                 && self.fusions[j].is_empty()
@@ -2207,6 +2215,45 @@ mod tests {
         // Another input; a matmul the activation reads.
         assert_eq!(f.role(s[7]), StepRole::Kept);
         assert_eq!(f.role(s[8]), StepRole::Kept);
+    }
+
+    /// A sibling group's members share their weights' scheme: two fp8 matmuls off one norm group
+    /// together, each binding its own scale, and two dense ones apart from them, never one group
+    /// of both.
+    #[test]
+    fn sibling_matmuls_group_only_with_their_own_weights() {
+        let fp8 = |inputs| {
+            let weight = GemmWeight::Fp8Dynamic;
+            op(SubOp::MatmulTile { n: 256, weight }, 1, inputs)
+        };
+        let ops = vec![
+            norm(vec![Ext(0), Ext(1)]),
+            fp8(vec![Op(0), Ext(2), Ext(3)]),
+            gemm(256, vec![Op(0), Ext(4)]),
+            fp8(vec![Op(0), Ext(5), Ext(6)]),
+            gemm(256, vec![Op(0), Ext(7)]),
+            op(ADD, 1, vec![Op(1), Op(2)]),
+            op(ADD, 1, vec![Op(5), Op(3)]),
+            op(ADD, 1, vec![Op(6), Op(4)]),
+        ];
+        let (w, scale) = ((64, 256), (1, 256));
+        let src = [(1, 64), (1, 64), w, scale, w, w, scale, w];
+        let mut bindings = weights(src.len());
+        for id in [3, 6] {
+            bindings[id] = SourceBinding::WeightScale {
+                id: id as u32 - 1,
+                index: None,
+            };
+        }
+        let (s, f) = fold(&src, bindings, ops, &[], &SIBLINGS, SPLIT);
+        let siblings = |slots: [Option<SlotId>; SIBLING_MATMULS]| Fusion {
+            kernel: Kern::Siblings,
+            shape: FusedShape::SiblingMatmuls { slots },
+        };
+        assert_eq!(f.driven(s[1]), [siblings([Some(s[3]), None, None])]);
+        assert_eq!(f.role(s[3]), StepRole::Epilogue { of: s[1] });
+        assert_eq!(f.driven(s[2]), [siblings([Some(s[4]), None, None])]);
+        assert_eq!(f.role(s[4]), StepRole::Epilogue { of: s[2] });
     }
 
     #[test]

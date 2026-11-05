@@ -1,0 +1,16 @@
+{
+  "_comment": "Per-(stem, preset) drift: `RedHatAI/Qwen3.6-35B-A3B-FP8-dynamic` @ 6496d54f quantizes every Linear fp8-per-channel except what its own `quantization_config.ignore` lists. That list has 342 entries: 110 are the vision tower's (`model.visual.*`), which never enter the text build; the other 232 are full per-layer paths, folded here into the suffixes they repeat, which name the same modules (`linear_attn.*` exists only on the GDN layers it lists, and `mlp.gate` / `mlp.shared_expert_gate` on every layer). `lm_head` and the MTP head (`re:^mtp.*`, a compressed-tensors regex) are its own entries, verbatim. So the GDN projections, the router and the shared-expert gate stay bf16, and the attention projections, the routed and shared experts are fp8. `mlp.gate` suffix-matches neither `mlp.shared_expert.gate_proj` nor `mlp.shared_expert_gate`.",
+  "quantization_config": {
+    "ignore": [
+      "lm_head",
+      "linear_attn.in_proj_qkv",
+      "linear_attn.in_proj_z",
+      "linear_attn.in_proj_a",
+      "linear_attn.in_proj_b",
+      "linear_attn.out_proj",
+      "mlp.gate",
+      "mlp.shared_expert_gate",
+      "re:^mtp.*"
+    ]
+  }
+}
