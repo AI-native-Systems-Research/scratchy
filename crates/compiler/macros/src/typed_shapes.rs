@@ -366,8 +366,6 @@ pub struct Inputs<T, Px, Rh, Bh, Ve> {
     /// Its window permutation and that permutation's inverse, one index per grouped row.
     pub window_index: RowIndex,
     pub reverse_indices: RowIndex,
-    /// A SigLIP tower's positional-embedding index per row.
-    pub position_ids: Tokens<T>,
     /// A host-interpolated positional embedding (Qwen3.5-VL), one row per patch at the residual
     /// width.
     pub pos_embeds: Act<T, Ve>,
@@ -395,7 +393,6 @@ impl<T, Px, Rh, Bh, Ve> Inputs<T, Px, Rh, Bh, Ve> {
             max_seqlen_window: MaxSeqlen,
             window_index: RowIndex,
             reverse_indices: RowIndex,
-            position_ids: Tokens(PhantomData),
             pos_embeds: Act(PhantomData),
         }
     }
@@ -403,11 +400,9 @@ impl<T, Px, Rh, Bh, Ve> Inputs<T, Px, Rh, Bh, Ve> {
 
 /// The op signatures, each named as its `OpKind` is in a carrier.
 pub mod ops {
+    use super::HiddenSize;
     use super::{Act, Add, BlockTable, CuSeqlens, Div, KvCache, Lit, MaxSeqlen, Mul, PhantomData};
     use super::{ExpertBank, ExpertBiases, Experts, GdnMixer, LatentExperts, MambaMixer};
-    use super::{
-        HiddenSize, KvLoraRank, NumAttentionHeads, QkNopeHeadDim, QkRopeHeadDim, VHeadDim,
-    };
     use super::{Rotary, RowIndex, Scalar, Tokens, W1, W2, W3};
     use super::{RoutedAt, ScaledRouter, Swiglu};
 
@@ -820,41 +815,6 @@ pub mod ops {
         _zxbcdt: Act<T, Add<C, Add<Di, Nh>>>,
         _mamba: MambaMixer<C, Di, Nh>,
     ) -> Act<T, Di> {
-        Act(PhantomData)
-    }
-
-    /// `mla_split(kv_a: [T, kv_lora_rank + qk_rope_head_dim]) -> (kv_latent, k_pe)`: the
-    /// compressed KV, then the one shared rope key.
-    pub fn mla_split<T>(
-        _kv_a: Act<T, Add<KvLoraRank, QkRopeHeadDim>>,
-    ) -> (Act<T, KvLoraRank>, Act<T, QkRopeHeadDim>) {
-        (Act(PhantomData), Act(PhantomData))
-    }
-
-    /// `mla_attention(q, kv_b, k_pe, positions, rotary, kv_cache, block_table) -> [T, heads ·
-    /// v_head_dim]`: multi-head latent attention. Per head, `q` is a query's no-rope and rope
-    /// parts, `kv_b` a key's no-rope part and a value; `k_pe` is the shared rope key.
-    pub fn mla_attention<T>(
-        _q: Act<T, Mul<NumAttentionHeads, Add<QkNopeHeadDim, QkRopeHeadDim>>>,
-        _kv_b: Act<T, Mul<NumAttentionHeads, Add<QkNopeHeadDim, VHeadDim>>>,
-        _k_pe: Act<T, QkRopeHeadDim>,
-        _positions: Tokens<T>,
-        _rotary: Rotary,
-        _kv_cache: KvCache,
-        _block_table: BlockTable,
-    ) -> Act<T, Mul<NumAttentionHeads, VHeadDim>> {
-        Act(PhantomData)
-    }
-
-    /// `pos_embed(position_ids: [T], table: [P, E]) -> [T, E]`: a vision tower's learned
-    /// positional rows.
-    pub fn pos_embed<T, P, E>(_ids: Tokens<T>, _table: W2<P, E>) -> Act<T, E> {
-        Act(PhantomData)
-    }
-
-    /// `avg_pool_2d(x: [T, E]) -> [T / P, E]`: each `P` (`vision_pool_factor`) patch rows pooled
-    /// into one. `P` is the carrier's, passed by the emit pass: the input does not name it.
-    pub fn avg_pool_2d<P, T, E>(_x: Act<T, E>) -> Act<Div<T, P>, E> {
         Act(PhantomData)
     }
 

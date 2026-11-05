@@ -30,19 +30,15 @@ use crate::weights_manifest::WeightsManifest;
 
 /// The bounds the op signatures in `typed_shapes` name themselves, beside those a `weights.json`
 /// declares. Config vocabulary, shared by every arch.
-pub const SIGNATURE_BOUNDS: [&str; 15] = [
+pub const SIGNATURE_BOUNDS: [&str; 11] = [
     "backbone_hidden_size",
     "global_head_dim",
     "head_dim",
     "hidden_size",
-    "kv_lora_rank",
     "num_attention_heads",
     "num_global_key_value_heads",
     "num_key_value_heads",
     "num_tokens",
-    "qk_nope_head_dim",
-    "qk_rope_head_dim",
-    "v_head_dim",
     "vision_embed_dim",
     "vision_in_features",
     "vision_rope_half_dim",
@@ -375,14 +371,6 @@ const ARITY_FORMS: [(OpKind, usize, &str); 3] = [
     (OpKind::DraftConv, 4, "draft_conv_residual"),
 ];
 
-/// The widths an op's output names that its inputs do not, so rustc cannot infer them: `(op, the
-/// widths, how many type parameters follow them)`. The emit pass passes each width from the
-/// carrier's scope as the signature's leading type parameters, in order; the rest are inferred.
-const STATED_WIDTHS: [(OpKind, &[&str], usize); 1] = [
-    // A pool's rows are the patch rows over `vision_pool_factor`.
-    (OpKind::AvgPool2d, &["vision_pool_factor"], 2),
-];
-
 /// A weight's type at its declared shape: `W1<D>`, `W2<K, N>`, or an expert bank's `W3<E, K, N>`.
 fn weight_type(
     declared: &crate::dim::Shape,
@@ -477,13 +465,7 @@ impl Cx<'_, '_> {
                 self.reads.insert(*id);
                 self.named.insert(*id);
             }
-            Expr::Call { op, args } => {
-                // A width the op's output names that its inputs do not: the carrier states it.
-                for (_, widths, _) in STATED_WIDTHS.iter().filter(|(o, ..)| o == op) {
-                    self.bounds.extend(widths.iter().map(|w| w.to_string()));
-                }
-                args.iter().for_each(|a| self.scan_expr(a))
-            }
+            Expr::Call { args, .. } => args.iter().for_each(|a| self.scan_expr(a)),
             Expr::Mul { lhs, rhs } => {
                 self.scan_expr(lhs);
                 self.scan_expr(rhs);
@@ -762,15 +744,7 @@ impl Cx<'_, '_> {
                 let name = (ARITY_FORMS.iter())
                     .find(|(o, arity, _)| o == op && *arity == args.len())
                     .map_or(op.as_str(), |(_, _, name)| name);
-                let stated = (STATED_WIDTHS.iter()).find(|(o, ..)| o == op).map_or(
-                    String::new(),
-                    |(_, widths, inferred)| {
-                        let types = (widths.iter().map(|w| marker(w)))
-                            .chain(std::iter::repeat_n("_".to_string(), *inferred));
-                        format!("::<{}>", types.collect::<Vec<_>>().join(", "))
-                    },
-                );
-                format!("ops::{name}{stated}({})", args.join(", "))
+                format!("ops::{name}({})", args.join(", "))
             }
             // A product with a scalar operand scales the tensor; two tensors multiply elementwise.
             Expr::Mul { lhs, rhs } => match (is_scalar(lhs), is_scalar(rhs)) {
