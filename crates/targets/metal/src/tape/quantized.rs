@@ -51,6 +51,8 @@ impl DequantDtype {
 /// `interpreter::metal::mod` re-export) keep resolving via this path.
 pub use scratchy_tensors::ScaleDtype;
 
+use crate::tape::ids::{AffineBits, AffineGroupSize, Int4Bits};
+
 // ─────────────────────────────────────────────────────────────────
 // Decode-bucket qmv dispatcher — port of `quantized.cpp:1365
 // dispatch_qmv` + `:177 qmv_quad` + `:235 qmv` (which itself picks
@@ -318,13 +320,10 @@ pub fn qmv_kernel_static_name(
     kernel: QmvKernel,
     dtype: DequantDtype,
     scale_dtype: ScaleDtype,
-    bits: u32,
-    group_size: u32,
+    bits: AffineBits,
+    group_size: AffineGroupSize,
 ) -> &'static str {
-    debug_assert!(
-        matches!(bits, 2 | 3 | 4 | 8),
-        "qmv_kernel_static_name: only bits 2, 3, 4 and 8 are wired (got {bits})"
-    );
+    let (bits, group_size) = (bits.get(), group_size.get());
     let key = (kernel, dtype, scale_dtype, group_size, bits);
     use std::collections::HashMap;
     use std::sync::OnceLock;
@@ -335,13 +334,6 @@ pub fn qmv_kernel_static_name(
     let mut guard = cache.lock().expect("qmv_kernel_static_name cache poisoned");
     if let Some(&v) = guard.get(&key) {
         return v;
-    }
-    let supported_gs = matches!(group_size, 32 | 64 | 128);
-    if !supported_gs {
-        panic!(
-            "qmv_kernel_static_name: unsupported group_size={group_size} \
-             — only 32, 64, 128 instantiated"
-        );
     }
     let dtype_s = dtype.symbol_infix();
     let scale_s = scale_dtype.symbol_infix();
@@ -513,7 +505,13 @@ pub enum QmmTKernel {
     /// when `B == 1` and a non-trivial split_k is feasible (the
     /// `qmm_splitk` heuristic at `quantized.cpp:788-805` targets
     /// ~512 threadgroups; falls back to `Standard` if split_k ≤ 1).
-    SplitK { split_k: u32, k_partition_size: u32 },
+    ///
+    /// Instantiated for int4 codes alone: it carries the [`Int4Bits`] it was picked for.
+    SplitK {
+        split_k: u32,
+        k_partition_size: u32,
+        bits: Int4Bits,
+    },
     /// `affine_qmm_t_nax_*_alN_<bool>_batch_0` — NAX (Apple9 / M4+)
     /// MMA path using `MetalPerformancePrimitives matmul2d`. Only
     /// selected when `is_nax == true` AND `K % 64 == 0`.
@@ -567,9 +565,11 @@ pub fn pick_qmm_t_kernel(
     n: u32,
     k: u32,
     b: u32,
-    group_size: u32,
+    group: AffineGroupSize,
+    bits: AffineBits,
     is_nax: bool,
 ) -> QmmTKernel {
+    let group_size = group.get();
     // NAX's 64×64 tiling wastes work and yields too few threadgroups at
     // tiny M: it regresses to ~0.8× vs SplitK at M=16 but wins (≥1.7×)
     // from M=32 up (see `nax_vs_standard_qmm_t_bench`). Gate it to
@@ -577,15 +577,17 @@ pub fn pick_qmm_t_kernel(
     // (Belt-and-suspenders: the production qmm_t buckets start at 64,
     // so this threshold isn't normally reached.)
     const NAX_MIN_M: u32 = 32;
-    if is_nax && m >= NAX_MIN_M && k.is_multiple_of(64) && group_size != 32 {
+    if is_nax && m >= NAX_MIN_M && k.is_multiple_of(64) && group.nax().is_some() {
         return QmmTKernel::Nax(NaxDequant::for_shape(m, n, k));
     }
-    if b == 1 {
+    // Split-K is instantiated for int4 codes alone: any other width takes the standard kernel.
+    if let (1, Some(bits)) = (b, bits.int4()) {
         let split_k = pick_qmm_t_split_k(m, n, k, group_size);
         if split_k > 1 {
             return QmmTKernel::SplitK {
                 split_k,
                 k_partition_size: k / split_k,
+                bits,
             };
         }
     }
@@ -661,19 +663,16 @@ pub fn qmm_t_kernel_static_name(
     kernel: QmmTKernel,
     dtype: DequantDtype,
     scale_dtype: ScaleDtype,
-    bits: u32,
-    group_size: u32,
+    bits: AffineBits,
+    group: AffineGroupSize,
     aligned_n: bool,
 ) -> &'static str {
-    debug_assert!(
-        matches!(bits, 2 | 3 | 4 | 8),
-        "qmm_t_kernel_static_name: only bits 2, 3, 4 and 8 are wired (got {bits})"
-    );
-    debug_assert!(
-        !(matches!(bits, 2 | 3 | 8) && matches!(kernel, QmmTKernel::SplitK { .. })),
-        "qmm_t_kernel_static_name: SplitK only instantiates bits=4 — \
-         the lowering arm must route 2-bit, 3-bit and 8-bit weights to Standard or Nax"
-    );
+    // A split-K kernel names the int4 width it was picked for.
+    let bits = match kernel {
+        QmmTKernel::SplitK { bits, .. } => bits.affine(),
+        _ => bits,
+    };
+    let (bits, group_size) = (bits.get(), group.get());
     let nax = match kernel {
         QmmTKernel::Nax(dequant) => Some(dequant),
         _ => None,
@@ -706,13 +705,7 @@ pub fn qmm_t_kernel_static_name(
     if let Some(&v) = guard.get(&key) {
         return v;
     }
-    if !matches!(group_size, 32 | 64 | 128) {
-        panic!(
-            "qmm_t_kernel_static_name: unsupported group_size={group_size} \
-             — only 32, 64, 128 instantiated"
-        );
-    }
-    if matches!(kernel, QmmTKernel::Nax(_)) && group_size == 32 {
+    if matches!(kernel, QmmTKernel::Nax(_)) && group.nax().is_none() {
         panic!(
             "qmm_t_kernel_static_name: NAX dispatched with gs=32 — \
              `pick_qmm_t_kernel` should have routed to Standard"
@@ -1243,8 +1236,8 @@ pub fn qmm_t_kernel_static_name_with_compute(
     act_dtype: DequantDtype,
     compute_dtype: DequantDtype,
     scale_dtype: ScaleDtype,
-    bits: u32,
-    group_size: u32,
+    bits: AffineBits,
+    group_size: AffineGroupSize,
     aligned_n: bool,
 ) -> &'static str {
     if compute_dtype == act_dtype {
@@ -1265,7 +1258,7 @@ pub fn qmm_t_kernel_static_name_with_compute(
     // request a compute-flip for bits!=4 (see the `bits_v == 4` gate on the
     // M1 f16 flip in lowering). This makes the mis-dispatch structurally
     // impossible rather than a release-elided debug_assert.
-    if bits != 4 {
+    if bits != AffineBits::B4 {
         return qmm_t_kernel_static_name(
             kernel,
             act_dtype,
@@ -1282,7 +1275,7 @@ pub fn qmm_t_kernel_static_name_with_compute(
         act_dtype,
         compute_dtype,
         scale_dtype,
-        group_size,
+        group_size.get(),
         aligned_n,
     ) {
         // ── qmm_t Standard, bf16-act + f16-compute ───────────────
@@ -1368,8 +1361,9 @@ pub fn qmm_t_kernel_static_name_with_compute(
         ),
         _ => panic!(
             "qmm_t_kernel_static_name_with_compute: unsupported (act={act_dtype:?}, \
-             compute={compute_dtype:?}, scale={scale_dtype:?}, gs={group_size}) — only \
-             (Bf16, F16, F16) is instantiated for the M1 fast-path"
+             compute={compute_dtype:?}, scale={scale_dtype:?}, gs={}) — only \
+             (Bf16, F16, F16) is instantiated for the M1 fast-path",
+            group_size.get()
         ),
     }
 }
@@ -1416,38 +1410,6 @@ pub fn qmm_n_kernel_name(
     let dtype = dtype.symbol_infix();
     let sdt = scale_dtype.symbol_infix();
     format!("affine_qmm_n_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_0")
-}
-
-/// `&'static str` view of [`qmm_n_kernel_name`] for the lowering pass.
-pub fn qmm_n_kernel_static_name(
-    dtype: DequantDtype,
-    scale_dtype: ScaleDtype,
-    bits: u32,
-    group_size: u32,
-) -> &'static str {
-    debug_assert_eq!(bits, 4, "qmm_n_kernel_static_name: only bits=4 is wired");
-    if !matches!(group_size, 32 | 64 | 128) {
-        panic!(
-            "qmm_n_kernel_static_name: unsupported group_size={group_size} \
-             — only 32, 64, 128 instantiated"
-        );
-    }
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
-    type Key = (DequantDtype, ScaleDtype, u32);
-    static CACHE: OnceLock<std::sync::Mutex<HashMap<Key, &'static str>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = cache
-        .lock()
-        .expect("qmm_n_kernel_static_name cache poisoned");
-    let key = (dtype, scale_dtype, group_size);
-    if let Some(&v) = guard.get(&key) {
-        return v;
-    }
-    let owned = qmm_n_kernel_name(dtype, scale_dtype, group_size, 4);
-    let leaked: &'static str = Box::leak(owned.into_boxed_str());
-    guard.insert(key, leaked);
-    leaked
 }
 
 /// Threadgroup grid + threads-per-group for qmm_n. Matches MLX
@@ -1553,47 +1515,6 @@ pub fn qvm_kernel_name(
             format!("affine_qvm_split_k_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}")
         }
     }
-}
-
-/// `&'static str` view of [`qvm_kernel_name`] for the lowering pass.
-pub fn qvm_kernel_static_name(
-    kernel: QvmKernel,
-    dtype: DequantDtype,
-    scale_dtype: ScaleDtype,
-    bits: u32,
-    group_size: u32,
-) -> &'static str {
-    debug_assert_eq!(bits, 4, "qvm_kernel_static_name: only bits=4 is wired");
-    if !matches!(group_size, 32 | 64 | 128) {
-        panic!(
-            "qvm_kernel_static_name: unsupported group_size={group_size} \
-             — only 32, 64, 128 instantiated"
-        );
-    }
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
-    type Key = (
-        std::mem::Discriminant<QvmKernel>,
-        DequantDtype,
-        ScaleDtype,
-        u32,
-    );
-    static CACHE: OnceLock<std::sync::Mutex<HashMap<Key, &'static str>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().expect("qvm_kernel_static_name cache poisoned");
-    let key = (
-        std::mem::discriminant(&kernel),
-        dtype,
-        scale_dtype,
-        group_size,
-    );
-    if let Some(&v) = guard.get(&key) {
-        return v;
-    }
-    let owned = qvm_kernel_name(kernel, dtype, scale_dtype, group_size, 4);
-    let leaked: &'static str = Box::leak(owned.into_boxed_str());
-    guard.insert(key, leaked);
-    leaked
 }
 
 #[cfg(test)]
@@ -1816,15 +1737,39 @@ mod tests {
     fn qmm_t_kernel_pick_routes_splitk_only_for_b_eq_1() {
         // B == 1, decent splitk → SplitK. is_nax=false: this test pins the
         // non-NAX SplitK/Standard routing.
-        let k = pick_qmm_t_kernel(64, 2048, 2048, 1, 64, false);
+        let k = pick_qmm_t_kernel(
+            64,
+            2048,
+            2048,
+            1,
+            AffineGroupSize::new(64).unwrap(),
+            AffineBits::new(4).unwrap(),
+            false,
+        );
         assert!(matches!(k, QmmTKernel::SplitK { split_k: 4, .. }));
 
         // B > 1 → always Standard
-        let k = pick_qmm_t_kernel(64, 2048, 2048, 2, 64, false);
+        let k = pick_qmm_t_kernel(
+            64,
+            2048,
+            2048,
+            2,
+            AffineGroupSize::new(64).unwrap(),
+            AffineBits::new(4).unwrap(),
+            false,
+        );
         assert_eq!(k, QmmTKernel::Standard);
 
         // B == 1, splitk collapses to 1 → Standard
-        let k = pick_qmm_t_kernel(512, 2048, 2048, 1, 64, false);
+        let k = pick_qmm_t_kernel(
+            512,
+            2048,
+            2048,
+            1,
+            AffineGroupSize::new(64).unwrap(),
+            AffineBits::new(4).unwrap(),
+            false,
+        );
         assert_eq!(k, QmmTKernel::Standard);
     }
 
@@ -1856,7 +1801,8 @@ mod tests {
             qmm_t_kernel_name(
                 QmmTKernel::SplitK {
                     split_k: 4,
-                    k_partition_size: 512
+                    k_partition_size: 512,
+                    bits: Int4Bits::of(4),
                 },
                 DequantDtype::Bf16,
                 ScaleDtype::F16,
@@ -1880,6 +1826,7 @@ mod tests {
             QmmTKernel::SplitK {
                 split_k: 4,
                 k_partition_size: 512,
+                bits: Int4Bits::of(4),
             },
             64,
             2048,
@@ -1916,12 +1863,28 @@ mod tests {
         assert_eq!(NaxDequant::for_shape(m, n - 64, k), NaxDequant::Loader);
         assert_eq!(NaxDequant::for_shape(m, n, k - 64), NaxDequant::Loader);
         assert_eq!(
-            pick_qmm_t_kernel(m, n, k, 1, 64, true),
+            pick_qmm_t_kernel(
+                m,
+                n,
+                k,
+                1,
+                AffineGroupSize::new(64).unwrap(),
+                AffineBits::new(4).unwrap(),
+                true
+            ),
             QmmTKernel::Nax(NaxDequant::Producer)
         );
         // Gemma 4's router (128 outputs) stays on the loader at any length.
         assert_eq!(
-            pick_qmm_t_kernel(8192, 128, 2816, 1, 64, true),
+            pick_qmm_t_kernel(
+                8192,
+                128,
+                2816,
+                1,
+                AffineGroupSize::new(64).unwrap(),
+                AffineBits::new(4).unwrap(),
+                true
+            ),
             QmmTKernel::Nax(NaxDequant::Loader)
         );
     }

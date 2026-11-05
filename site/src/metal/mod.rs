@@ -211,8 +211,13 @@ fn borrow_earlier(runs: &mut [Run]) {
             // and users count, so with the same cap and count they are the same tasks; a full
             // run's cell at 4 users sends 16 where a quick run's sends 8. Only engines this run
             // did not time at all are filled, so a run's own measurements are never mixed with
-            // another's.
+            // another's. Only stacked cells are lent and borrowed: an open-loop cell
+            // (`--open-loop`) is keyed by its rate step, which is another rate in a quick run and
+            // a full one (0.5× against 0.25× at step 1), and its rates are fractions of its own
+            // run's scratchy base. So a run with open-loop cells borrows no rival.
             let cap = run_task_cap(&run.config);
+            let stacked = |c: &data::TaskCell| matches!(c.load.as_deref(), None | Some("users"));
+            let open_loop = !(Engine::Scratchy.tasks(m).iter()).all(stacked);
             let sizing = (run.config.scaling.as_ref()).and_then(data::Scaling::task_sizing);
             for e in Engine::RIVALS {
                 let Some(slot) = e.tasks_mut(m) else { continue };
@@ -222,13 +227,19 @@ fn borrow_earlier(runs: &mut [Run]) {
                         // Kept tagged with when, for a later run that borrows them; this run's
                         // own cells stay untagged.
                         let lent: Vec<data::TaskCell> = (cells.iter())
+                            .filter(|c| stacked(c))
                             .map(|c| data::TaskCell {
                                 borrowed_from: Some(when.clone()),
                                 ..c.clone()
                             })
                             .collect();
-                        task_cells.insert(key, (lent, cap, sizing));
+                        // A run with only open-loop cells lends none, and leaves an earlier
+                        // stacked run's cells to lend.
+                        if !lent.is_empty() {
+                            task_cells.insert(key, (lent, cap, sizing));
+                        }
                     }
+                    None if open_loop => {}
                     None => {
                         let Some((cells, _, theirs)) =
                             task_cells.get(&key).filter(|(_, c, _)| *c == cap)
@@ -4490,6 +4501,71 @@ mod tests {
         let mut runs = vec![load(&quick), load(&unsized_run)];
         super::borrow_earlier(&mut runs);
         assert!(Engine::OmlxTq.tasks(&runs[0].models[0]).is_empty());
+    }
+
+    /// Open-loop cells (`--open-loop`) are neither lent nor borrowed. Their key is a rate step, and
+    /// a step is another rate in a quick run and a full one (0.5× against 0.25× at step 1), set
+    /// from its own run's scratchy base: a quick open-loop run borrows no rival, and a stacked run
+    /// still borrows from the stacked run before an open-loop one.
+    #[test]
+    fn open_loop_cells_are_neither_lent_nor_borrowed() {
+        use super::data::Run;
+        use super::numbers::Engine;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
+        );
+        let text = std::fs::read_to_string(path).expect("the dataset quick run");
+        let stacked: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // The same cells, as an open-loop run records them: each a rate step.
+        let open = |v: &serde_json::Value, when: &str| {
+            let mut v = v.clone();
+            v["generated_utc"] = when.into();
+            for c in v["models"][0]["tasks"].as_array_mut().unwrap() {
+                c["load"] = "rate".into();
+                c["request_rate"] = 0.2.into();
+            }
+            v
+        };
+        let with_rival = |v: &serde_json::Value, when: &str| {
+            let mut v = v.clone();
+            v["generated_utc"] = when.into();
+            let ours = v["models"][0]["tasks"].clone();
+            v["models"][0]["tasks_omlx_tq"] = ours;
+            v
+        };
+        let load = |v: &serde_json::Value| -> Run { serde_json::from_value(v.clone()).unwrap() };
+
+        let full_open = with_rival(
+            &open(&stacked, "2026-10-24T12:00:00Z"),
+            "2026-10-24T12:00:00Z",
+        );
+        let quick_open = open(&stacked, "2026-10-25T12:00:00Z");
+        let mut runs = vec![load(&quick_open), load(&full_open)];
+        super::borrow_earlier(&mut runs);
+        assert!(
+            Engine::OmlxTq.tasks(&runs[0].models[0]).is_empty(),
+            "an open-loop run borrows no rival"
+        );
+
+        // A stacked full run, then an open-loop full run: a later stacked quick run borrows the
+        // stacked one's cells, past the open-loop run's.
+        let full_stacked = with_rival(&stacked, "2026-10-23T12:00:00Z");
+        let quick_stacked = {
+            let mut v = stacked.clone();
+            v["generated_utc"] = "2026-10-25T12:00:00Z".into();
+            v
+        };
+        let mut runs = vec![load(&quick_stacked), load(&full_open), load(&full_stacked)];
+        super::borrow_earlier(&mut runs);
+        let lent = Engine::OmlxTq.tasks(&runs[0].models[0]);
+        assert!(!lent.is_empty(), "the stacked run's cells are lent");
+        assert!(
+            lent.iter()
+                .all(|c| c.load.is_none()
+                    && c.borrowed_from.as_ref().unwrap().month_day() == "10-23"),
+            "from the stacked run, not the open-loop one"
+        );
     }
 
     /// A cell's task count, as the matrix sizes it: users × rounds, at least the fewest; a quarter

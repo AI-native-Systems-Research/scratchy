@@ -39,7 +39,7 @@ use std::fmt;
 /// safetensors layout, rope style, decoder prefix, bound defaults, the
 /// `Params` bound schema — are data about the checkpoints, so they
 /// live with them, in `configs/<arch>/arch.json` (read by
-/// [`crate::config::load_arch_json`]).
+/// the macro crate's `config::load_arch_json`).
 pub struct PythonCarrier {
     /// The parsed DSL body.
     pub ast: Ast,
@@ -91,8 +91,8 @@ pub fn parse_python_file(text: &str) -> Result<PythonCarrier, String> {
 
 /// Test helper: parse a bare DSL body (any common indentation) as the
 /// body of a `@forward` carrier.
-#[cfg(test)]
-pub(crate) fn parse_body(body: &str) -> Result<Ast, String> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn parse_body(body: &str) -> Result<Ast, String> {
     let indent = body
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -726,11 +726,12 @@ impl Parser {
         }
         let value = lower_expr(&value, self.span)?;
         match lhs {
-            PyExpr::Name(n, _) => Ok(Some(Stmt::Assign {
+            PyExpr::Name(n, at) => Ok(Some(Stmt::Assign {
                 target: ident(&n, self.span),
                 value,
+                line: Some(at.line),
             })),
-            PyExpr::Tuple(elts, _) => {
+            PyExpr::Tuple(elts, at) => {
                 let targets = elts
                     .iter()
                     .map(|el| match el {
@@ -741,7 +742,11 @@ impl Parser {
                         )),
                     })
                     .collect::<Result<_, _>>()?;
-                Ok(Some(Stmt::AssignTuple { targets, value }))
+                Ok(Some(Stmt::AssignTuple {
+                    targets,
+                    value,
+                    line: Some(at.line),
+                }))
             }
             other => Err(err(
                 other.at(),
@@ -1491,6 +1496,7 @@ mod tests {
             Stmt::Assign {
                 target,
                 value: Expr::Call { op, args },
+                ..
             } => {
                 assert_eq!(target.to_string(), "x");
                 assert_eq!(op.to_string(), "foo");
@@ -1504,7 +1510,7 @@ mod tests {
     fn assign_tuple() {
         let ast = body("(q, k, v) = rope(q, k, v, pos)");
         match &ast.statements[0] {
-            Stmt::AssignTuple { targets, value } => {
+            Stmt::AssignTuple { targets, value, .. } => {
                 let names: Vec<String> = targets.iter().map(|i| i.to_string()).collect();
                 assert_eq!(names, vec!["q", "k", "v"]);
                 assert!(matches!(value, Expr::Call { .. }));
@@ -1942,7 +1948,7 @@ mod tests {
         let ast = parse("@forward\ndef f():\n    x = gemm(a, w.p[layer])\n    return x\n");
         assert_eq!(ast.statements.len(), 1);
         match &ast.statements[0] {
-            Stmt::Assign { target, value } => {
+            Stmt::Assign { target, value, .. } => {
                 assert_eq!(target.to_string(), "x");
                 assert!(matches!(value, Expr::Call { .. }));
             }
@@ -2056,62 +2062,5 @@ mod tests {
         // (`return logits` is the torch costume's output marker; it
         // does not become a statement).
         assert_eq!(ast.statements.len(), 4);
-    }
-
-    /// `qwen3.py` drives the full parse → classify → shape → CFG →
-    /// unroll → schedule → codegen chain to a NON-EMPTY, complete
-    /// emission, without pinning bytes. Numerical equivalence of the
-    /// emission is covered by the scratchy-models `qwen3_py_parity`
-    /// e2e gate.
-    #[test]
-    fn python_costume_emits_the_qwen3_tape() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../..")
-            .canonicalize()
-            .unwrap();
-        let arch = "qwen3";
-        let configs_dir = root.join("crates/models/arch/configs").join(arch);
-
-        let py_text =
-            std::fs::read_to_string(root.join("crates/models/arch/dsl/qwen3.py")).unwrap();
-        let py_carrier = parse_python_file(&py_text).expect("python parse");
-        let py_tokens =
-            crate::compile_carrier(py_carrier, &configs_dir).expect("python-costume pipeline");
-
-        let mut py_rendered = String::with_capacity(1 << 20);
-        crate::render_tokens(py_tokens, &mut py_rendered);
-
-        // Non-vacuity guard: model selection reads `CARGO_FEATURE_*`
-        // ambient env vars (they belong to the scratchy-models crate,
-        // so they are only set when the test is invoked as
-        // `env 'CARGO_FEATURE_QWEN3_0.6B=1' cargo test ...`). Without
-        // this check, an unscoped run emits an EMPTY token stream and
-        // the test passes having verified nothing.
-        assert!(
-            py_rendered.len() > 100_000,
-            "qwen3 emission is {} bytes — model selection filtered everything out. \
-             Run with `env 'CARGO_FEATURE_QWEN3_0.6B=1' cargo test -p \
-             scratchy-forward-compiler-macro --features metal --lib parse_python`",
-            py_rendered.len(),
-        );
-
-        // The emission must be COMPLETE, not just big: the flip pinned
-        // per-bucket tape symbols + the load/forward entry points. Check
-        // the shape, not the bytes — byte-pinning every codegen change
-        // would force regenerating a ~67k-line fixture with no extra
-        // correctness signal over the numeric e2e gate.
-        for marker in [
-            "FORWARD_TABLE",
-            "fn load",
-            "fn forward",
-            "q_proj",
-            "rope",
-            "lm_head",
-        ] {
-            assert!(
-                py_rendered.contains(marker),
-                "qwen3 emission lacks `{marker}` — the pipeline emitted an incomplete tape"
-            );
-        }
     }
 }

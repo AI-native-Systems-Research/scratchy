@@ -15,15 +15,22 @@
   "norm2": ["vision_embed_dim"],
 
   "attn.q": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.q.bias": ["vision_embed_dim"],
   "attn.k": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.k.bias": ["vision_embed_dim"],
   "attn.v": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.v.bias": ["vision_embed_dim"],
   "attn.proj": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.proj.bias": ["vision_embed_dim"],
 
   "mlp.gate_proj": ["vision_embed_dim", "vision_intermediate_size_padded"],
   "mlp.up_proj": ["vision_embed_dim", "vision_intermediate_size_padded"],
   "mlp.down_proj": ["vision_intermediate_size_padded", "vision_embed_dim"],
+  "mlp.down_proj.bias": ["vision_embed_dim"],
 
   "merger.ln_q": ["vision_embed_dim"],
   "merger.mlp_0": ["vision_merge_hidden", "vision_merge_hidden"],
-  "merger.mlp_2": ["vision_merge_hidden", "d_model"]
+  "merger.mlp_0.bias": ["vision_merge_hidden"],
+  "merger.mlp_2": ["vision_merge_hidden", "d_model"],
+  "merger.mlp_2.bias": ["d_model"]
 }

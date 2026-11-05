@@ -18,6 +18,7 @@ use scratchy_target_metal::off_tape::VocabSuffix;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
+use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
 use scratchy_target_metal::tape::ids::{KDimI32, MDimI32, NDimI32};
 use scratchy_target_metal::tape::kernel_constants::{
     AffineCodes, AffineQmvConstants, AffineQmvWideConstants,
@@ -49,7 +50,13 @@ fn qmv_key(n: u32, m: u32) -> (PipelineKey, QmvKernel) {
         1 => pick_qmv_kernel(n, H, 4),
         _ => pick_qmv_kernel_wide(n, H, 4, m, true),
     };
-    let name = qmv_kernel_static_name(kernel, DequantDtype::Bf16, ScaleDtype::Bf16, 4, 64);
+    let name = qmv_kernel_static_name(
+        kernel,
+        DequantDtype::Bf16,
+        ScaleDtype::Bf16,
+        AffineBits::new(4).unwrap(),
+        AffineGroupSize::new(64).unwrap(),
+    );
     let (k, n_dim) = (KDimI32(H as i32), NDimI32(n as i32));
     let codes = AffineCodes::AsWritten;
     let constants: Vec<ConstantValue> = match kernel {
@@ -79,8 +86,8 @@ fn a_wide_pass_whole_vocabulary_vs_prefix_and_suffix() {
         prefix: P,
         rows: V - P,
         hidden: H,
-        bits: 4,
-        group: 64,
+        bits: AffineBits::new(4).unwrap(),
+        group: AffineGroupSize::new(64).unwrap(),
         scale: ScaleDtype::Bf16,
         verify_rows: 8,
         window: 4,

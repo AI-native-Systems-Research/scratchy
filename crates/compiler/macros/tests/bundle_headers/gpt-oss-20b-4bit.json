@@ -1,0 +1,88 @@
+{
+ "repo": "scratchery/gpt-oss-20b-4bit",
+ "configs": [
+  "gpt-oss/gpt-oss-20b"
+ ],
+ "head": false,
+ "bundles": {
+  "mlp": "model.layers.0.mlp"
+ },
+ "quantization": {
+  "group_size": 64,
+  "bits": 4
+ },
+ "tensors": {
+  "model.layers.0.mlp.experts.down_proj.bias": [
+   32,
+   2880
+  ],
+  "model.layers.0.mlp.experts.down_proj.biases": [
+   32,
+   2880,
+   45
+  ],
+  "model.layers.0.mlp.experts.down_proj.scales": [
+   32,
+   2880,
+   45
+  ],
+  "model.layers.0.mlp.experts.down_proj.weight": [
+   32,
+   2880,
+   360
+  ],
+  "model.layers.0.mlp.experts.gate_proj.bias": [
+   32,
+   2880
+  ],
+  "model.layers.0.mlp.experts.gate_proj.biases": [
+   32,
+   2880,
+   45
+  ],
+  "model.layers.0.mlp.experts.gate_proj.scales": [
+   32,
+   2880,
+   45
+  ],
+  "model.layers.0.mlp.experts.gate_proj.weight": [
+   32,
+   2880,
+   360
+  ],
+  "model.layers.0.mlp.experts.up_proj.bias": [
+   32,
+   2880
+  ],
+  "model.layers.0.mlp.experts.up_proj.biases": [
+   32,
+   2880,
+   45
+  ],
+  "model.layers.0.mlp.experts.up_proj.scales": [
+   32,
+   2880,
+   45
+  ],
+  "model.layers.0.mlp.experts.up_proj.weight": [
+   32,
+   2880,
+   360
+  ],
+  "model.layers.0.mlp.router.bias": [
+   32
+  ],
+  "model.layers.0.mlp.router.biases": [
+   32,
+   45
+  ],
+  "model.layers.0.mlp.router.scales": [
+   32,
+   45
+  ],
+  "model.layers.0.mlp.router.weight": [
+   32,
+   360
+  ]
+ }
+}

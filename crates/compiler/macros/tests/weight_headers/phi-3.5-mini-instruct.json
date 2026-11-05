@@ -1,0 +1,15 @@
+{
+  "repo": "microsoft/Phi-3.5-mini-instruct",
+  "configs": ["phi3/phi-3-5-mini-instruct"],
+  "tensors": {
+    "lm_head.weight": [32064, 3072],
+    "model.embed_tokens.weight": [32064, 3072],
+    "model.layers.0.input_layernorm.weight": [3072],
+    "model.layers.0.mlp.down_proj.weight": [3072, 8192],
+    "model.layers.0.mlp.gate_up_proj.weight": [16384, 3072],
+    "model.layers.0.post_attention_layernorm.weight": [3072],
+    "model.layers.0.self_attn.o_proj.weight": [3072, 3072],
+    "model.layers.0.self_attn.qkv_proj.weight": [9216, 3072],
+    "model.norm.weight": [3072]
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "repo": "unsloth/mistral-7b-instruct-v0.3",
+  "configs": ["mistral/mistral-7b-instruct-v0.3"],
+  "tensors": {
+    "lm_head.weight": [32768, 4096],
+    "model.embed_tokens.weight": [32768, 4096],
+    "model.layers.0.input_layernorm.weight": [4096],
+    "model.layers.0.mlp.down_proj.weight": [4096, 14336],
+    "model.layers.0.mlp.gate_proj.weight": [14336, 4096],
+    "model.layers.0.mlp.up_proj.weight": [14336, 4096],
+    "model.layers.0.post_attention_layernorm.weight": [4096],
+    "model.layers.0.self_attn.k_proj.weight": [1024, 4096],
+    "model.layers.0.self_attn.o_proj.weight": [4096, 4096],
+    "model.layers.0.self_attn.q_proj.weight": [4096, 4096],
+    "model.layers.0.self_attn.v_proj.weight": [1024, 4096],
+    "model.norm.weight": [4096]
+  }
+}

@@ -38,10 +38,11 @@ crates/models/arch/
   verbatim — don't edit by hand. Different model sizes under the same
   architecture get one file each.
 
-- **`weights.json`** — shape of every weight that the compiler's
-  dataflow-driven shape inference cannot pin (or would pin
-  incorrectly). Expressed as products of bound names from the
-  config.json vocabulary. Example for Qwen3, where `q_norm` / `k_norm`
+- **`weights.json`** — the exact shape of every weight the DSL reads.
+  The typed-Rust emit pass types each weight by it, and rustc checks
+  every use of the weight in the DSL against that type when the compiler
+  builds. Shapes are expressed as products and sums of bound names from
+  the config.json vocabulary. Example for Qwen3, where `q_norm` / `k_norm`
   are per-head RMS norms of shape `[head_dim]`:
 
   ```json
@@ -55,6 +56,18 @@ crates/models/arch/
   `<size>.json` bounds belong here. For most Llama / Qwen2 / Granite
   entries, dataflow pins everything and `weights.json` is empty or
   absent.
+
+  A weight the DSL passes whole to one op (`moe_block(x, mlp[layer])`,
+  `gated_delta_net(.., linear_attn[layer])`, `mamba2(.., mamba[layer])`)
+  is a bundle, and is never declared here: the op names its kind and the
+  config's own keys its roles' shapes (`bundles::derive` — the routed
+  expert count as `num_local_experts`, `n_routed_experts` or
+  `num_experts` spells it, the expert width, a shared expert the DSL does
+  not state as ops of its own, the experts' activation). The emit pass
+  passes the roles to the kind's constructor, whose signature relates
+  them to each other and to the op's activations; the bake sizes the
+  bundle's loader by the same derivation, and a test holds it to real
+  checkpoints (`tests/bundle_headers/`).
 
 - **`arch.json`** (optional) — the arch's own declarations: everything
   about it that is **not** derivable from a verbatim `config.json` plus
@@ -364,7 +377,7 @@ def <arch>():
 `@forward` takes optional `workloads=[...]` / `sk_buckets=[...]` overrides of
 the default bucket ladders. The file is a strict subset of Python: the
 compiler parses it and never runs it, and anything outside the dialect
-(documented in `crates/compiler/macros/src/parse_python.rs`) is a build
+(documented in `crates/compiler/frontend/src/parse_python.rs`) is a build
 error with a `line:col`.
 
 The DSL body expresses the forward pass as pure math — `embed`,
@@ -407,7 +420,7 @@ aliases.
   latent projections, etc.) — every entry is a claim that dataflow
   can't derive this one.
 - **Don't** put cross-arch weight shapes in
-  `crates/compiler/macros/src/weights_manifest.rs`. It's reserved for
+  `crates/compiler/frontend/src/weights_manifest.rs`. It's reserved for
   truly universal conventions (e.g. `embed_tokens`, `lm_head`) —
   everything arch-specific lives in the arch's `weights.json`.
 - **Don't** edit `scratchy-serving-worker/src/gpu_worker.rs` for a new arch.

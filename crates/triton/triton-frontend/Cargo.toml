@@ -13,7 +13,7 @@ publish = false
 [features]
 # THE PARSER IS OWNED AND UNCONDITIONAL. `src/py/parser.rs` is a hand-rolled lexer and
 # recursive-descent parser for the Python subset the census bounds -- the same approach
-# as the torch carriers' `crates/compiler/macros/src/parse_python.rs`, with no
+# as the torch carriers' `crates/compiler/frontend/src/parse_python.rs`, with no
 # dependencies, so every build (including the offline pod) parses real `.py` source.
 # It REPLACED `ruff_python_parser`, which pulled 44 lockfile versions for a parse step
 # whose grammar the census bounds anyway: a parser that accepts exactly the census

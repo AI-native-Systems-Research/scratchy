@@ -1,0 +1,122 @@
+{
+ "repo": "mlx-community/Qwen3.6-35B-A3B-MTP-4bit",
+ "configs": [
+  "qwen3-5-mtp/qwen3-5-moe/qwen3.6-35b-a3b"
+ ],
+ "head": true,
+ "bundles": {
+  "mlp": "layers.0.mlp"
+ },
+ "quantization": {
+  "group_size": 64,
+  "bits": 4,
+  "mode": "affine"
+ },
+ "tensors": {
+  "layers.0.mlp.gate.biases": [
+   256,
+   32
+  ],
+  "layers.0.mlp.gate.scales": [
+   256,
+   32
+  ],
+  "layers.0.mlp.gate.weight": [
+   256,
+   256
+  ],
+  "layers.0.mlp.shared_expert.down_proj.biases": [
+   2048,
+   8
+  ],
+  "layers.0.mlp.shared_expert.down_proj.scales": [
+   2048,
+   8
+  ],
+  "layers.0.mlp.shared_expert.down_proj.weight": [
+   2048,
+   64
+  ],
+  "layers.0.mlp.shared_expert.gate_proj.biases": [
+   512,
+   32
+  ],
+  "layers.0.mlp.shared_expert.gate_proj.scales": [
+   512,
+   32
+  ],
+  "layers.0.mlp.shared_expert.gate_proj.weight": [
+   512,
+   256
+  ],
+  "layers.0.mlp.shared_expert.up_proj.biases": [
+   512,
+   32
+  ],
+  "layers.0.mlp.shared_expert.up_proj.scales": [
+   512,
+   32
+  ],
+  "layers.0.mlp.shared_expert.up_proj.weight": [
+   512,
+   256
+  ],
+  "layers.0.mlp.shared_expert_gate.biases": [
+   1,
+   32
+  ],
+  "layers.0.mlp.shared_expert_gate.scales": [
+   1,
+   32
+  ],
+  "layers.0.mlp.shared_expert_gate.weight": [
+   1,
+   256
+  ],
+  "layers.0.mlp.switch_mlp.down_proj.biases": [
+   256,
+   2048,
+   8
+  ],
+  "layers.0.mlp.switch_mlp.down_proj.scales": [
+   256,
+   2048,
+   8
+  ],
+  "layers.0.mlp.switch_mlp.down_proj.weight": [
+   256,
+   2048,
+   64
+  ],
+  "layers.0.mlp.switch_mlp.gate_proj.biases": [
+   256,
+   512,
+   32
+  ],
+  "layers.0.mlp.switch_mlp.gate_proj.scales": [
+   256,
+   512,
+   32
+  ],
+  "layers.0.mlp.switch_mlp.gate_proj.weight": [
+   256,
+   512,
+   256
+  ],
+  "layers.0.mlp.switch_mlp.up_proj.biases": [
+   256,
+   512,
+   32
+  ],
+  "layers.0.mlp.switch_mlp.up_proj.scales": [
+   256,
+   512,
+   32
+  ],
+  "layers.0.mlp.switch_mlp.up_proj.weight": [
+   256,
+   512,
+   256
+  ]
+ }
+}

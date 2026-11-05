@@ -24,6 +24,7 @@ use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, shared_slice, shar
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
+use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
 use scratchy_target_metal::tape::ids::{KDimI32, MDimI32, NDimI32};
 use scratchy_target_metal::tape::kernel_constants::{AffineCodes, AffineQmvWideConstants};
 use scratchy_target_metal::tape::quantized::{
@@ -169,7 +170,13 @@ fn small_m_steps_in_the_eight_row_bucket_at_qwen38_27b_shapes() {
                 Run::Rows {
                     pso: pso(
                         "quantized_qmv",
-                        qmv_kernel_static_name(wide, act, scale, 4, GROUP),
+                        qmv_kernel_static_name(
+                            wide,
+                            act,
+                            scale,
+                            AffineBits::new(4).unwrap(),
+                            AffineGroupSize::new(GROUP).unwrap(),
+                        ),
                         wide_constants,
                     ),
                     grid: (gx, gy),

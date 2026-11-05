@@ -24,6 +24,7 @@ use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
+use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
 use scratchy_target_metal::tape::ids::{BucketM, KDimI32, LayerId, NDimI32, QSize, RmsNormEps};
 use scratchy_target_metal::tape::kernel_constants::{
     AffineCodes, AffineGatedQmvConstants, AffineQmvConstants, RmsNormConstants, norm_threads,
@@ -230,8 +231,8 @@ fn rig(c: &Case) -> Option<Rig> {
         c.kernel(),
         c.dtype.dequant(),
         c.dtype.scale(),
-        4,
-        c.group_size as u32,
+        AffineBits::new(4).unwrap(),
+        AffineGroupSize::new(c.group_size as u32).unwrap(),
     );
     let qmv = |e: QmvEnds| {
         let mut v: Vec<ConstantValue> = AffineQmvConstants {
@@ -461,7 +462,13 @@ fn a_normalizing_wide_matvec_is_as_close_to_the_exact_normed_product_on_every_ro
                 continue;
             }
             let gs = c.group_size as u32;
-            let name = qmv_kernel_static_name(kernel, c.dtype.dequant(), c.dtype.scale(), 4, gs);
+            let name = qmv_kernel_static_name(
+                kernel,
+                c.dtype.dequant(),
+                c.dtype.scale(),
+                AffineBits::new(4).unwrap(),
+                AffineGroupSize::new(gs).unwrap(),
+            );
             let pso = |e: QmvEnds| {
                 let mut v: Vec<ConstantValue> = AffineQmvWideConstants {
                     k: KDimI32(c.k as i32),
@@ -696,8 +703,8 @@ fn a_b3_normed_biased_matvec_matches_the_reference_at_glm_decode_shapes() {
             c.kernel(),
             c.dtype.dequant(),
             c.dtype.scale(),
-            bits,
-            group_size as u32,
+            AffineBits::new(bits).unwrap(),
+            AffineGroupSize::new(group_size as u32).unwrap(),
         );
         assert!(
             name.contains("affine_qmv_fast") && name.contains("b_3"),
@@ -824,8 +831,8 @@ fn a_b3_normed_residual_matvec_matches_the_reference_at_glm_o_proj_shape() {
         c.kernel(),
         c.dtype.dequant(),
         c.dtype.scale(),
-        bits,
-        group_size as u32,
+        AffineBits::new(bits).unwrap(),
+        AffineGroupSize::new(group_size as u32).unwrap(),
     );
     assert!(
         name.contains("affine_qmv_fast") && name.contains("b_3"),

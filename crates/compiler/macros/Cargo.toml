@@ -22,6 +22,7 @@ default = []
 # visible to the macro's match arms — they're gated
 # `#[cfg(feature = "metal")]` in `scratchy-forward-compiler::instr`.
 metal = ["scratchy-ir/metal",
+    "scratchy-forward-compiler-frontend/metal",
     "dep:scratchy-target-metal",
     "dep:scratchy-target-metal-compiler",
     "scratchy-forward-compiler/metal",
@@ -65,6 +66,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The model facts (`scratchy_ir::model_facts`) the fill builds on every target.
 scratchy-ir = { path = "../ir" }
+scratchy-tensors = { path = "../../tensors" }
 # PD-wavefront (task T2b): the subtile-wavefront IR + lowering +
 # scheduler + host tape player live in this normal (Mac-testable) lib
 # crate. `to_wavefront.rs` here translates the solved FUF + `Assignment`
@@ -86,6 +88,9 @@ rayon = { workspace = true }
 # scope. scratchy-forward-compiler must NOT depend on scratchy-forward-compiler-macro
 # back (the re-export of the proc-macro was dropped to break the cycle).
 scratchy-forward-compiler = { path = ".." }
+# The front end (parser, classifier, dims, config rules, weights manifest, typed-Rust emit pass): its
+# own crate so the build script below and this crate share one compile of it.
+scratchy-forward-compiler-frontend = { path = "../frontend" }
 
 # Backend-specific dependencies (enabled by features)
 scratchy-target-metal = { path = "../../targets/metal", optional = true }
@@ -104,3 +109,13 @@ scratchy-target-spyre = { path = "../../targets/spyre", default-features = false
 # The IR types the baked program is CONSTRUCTED from — this crate renders them as const tokens, so
 # it names the same types the lowering built. Dependency-free.
 ktir-core = { path = "../../targets/spyre/ktir/ktir-core", optional = true }
+
+# The build script runs the front end's typed-Rust emit pass (`build.rs`) over the carriers: the same
+# front-end crate this crate depends on, the same host build of it.
+[build-dependencies]
+scratchy-forward-compiler-frontend = { path = "../frontend" }
+serde_json = { workspace = true }
+
+# The front end's test fixtures, for this crate's tests.
+[dev-dependencies]
+scratchy-forward-compiler-frontend = { path = "../frontend", features = ["test-support"] }

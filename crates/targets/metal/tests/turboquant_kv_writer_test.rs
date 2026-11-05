@@ -17,7 +17,7 @@ use scratchy_target_metal::specialized_pipeline_cache::{
 };
 use scratchy_target_metal::tape::ids::{
     BlockSize, BlocksPerChunk, HeadDim, NumKvHeads, NumQHeads, RmsNormEps, RopePairOff, RotDim,
-    TqCodeBits,
+    StagedHeadDim, TqCodeBits,
 };
 use scratchy_target_metal::tape::kernel_constants::{
     RopeAppendConstants, RopeAppendNormedConstants, RopeTqConstants, TqCompressConstants, TqOffset,
@@ -210,7 +210,7 @@ fn run(c: &Case, fused: bool) -> Option<Written> {
         Writer::Normed => (
             format!("rope_append_normed_{}_s_f16_specialized", c.dtype.tag()),
             RopeAppendNormedConstants {
-                head_dim,
+                head_dim: StagedHeadDim::new(head_dim.get()).expect("a staged head"),
                 num_q_heads,
                 num_kv_heads,
                 rot_dim,

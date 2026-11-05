@@ -254,6 +254,143 @@ macro_rules! f32_newtype {
     )*}
 }
 
+/// Whether `table` holds `v`: a kernel's instantiation table as a `const fn` law.
+const fn instantiated(table: &[u32], v: u32) -> bool {
+    let mut i = 0;
+    while i < table.len() {
+        if table[i] == v {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// A value an instantiated kernel takes, refined by the table of the values it is instantiated
+/// for: the table is the type's constructor, so no command is built with a value its kernel
+/// lacks, and nothing downstream re-checks it.
+macro_rules! refined_u32 {
+    ($($(#[$m:meta])* $name:ident: $table:ident = [$($v:literal),+ $(,)?];)*) => {$(
+        $(#[$m])*
+        #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, serde::Serialize)]
+        pub struct $name(u32);
+        #[doc = concat!("Every value a [`", stringify!($name), "`] may be: its kernels' instantiations.")]
+        pub const $table: &[u32] = &[$($v),+];
+        impl $name {
+            #[doc = concat!("`v` as a [`", stringify!($name), "`]; `None` for a value no kernel is instantiated for.")]
+            pub const fn new(v: u32) -> Option<Self> {
+                match instantiated($table, v) {
+                    true => Some(Self(v)),
+                    false => None,
+                }
+            }
+            pub const fn get(self) -> u32 {
+                self.0
+            }
+            #[doc = concat!("`v` as a [`", stringify!($name), "`], for a const context: a value no kernel is instantiated for fails the build there.")]
+            pub const fn of(v: u32) -> Self {
+                match Self::new(v) {
+                    Some(x) => x,
+                    None => panic!(concat!("no kernel is instantiated for this ", stringify!($name))),
+                }
+            }
+        }
+    )*};
+}
+
+refined_u32! {
+    /// MLX-affine bits per quantized weight: the widths the affine kernels are instantiated for
+    /// (`_b_{2,3,4,8}` in `quantized*.metal`; the packing stride is `32 / bits` elements a word).
+    AffineBits: AFFINE_BITS = [2, 3, 4, 8];
+    /// MLX-affine quantization group size: the groups the affine kernels are instantiated for
+    /// (`_gs_{32,64,128}`).
+    AffineGroupSize: AFFINE_GROUP_SIZES = [32, 64, 128];
+    /// The group size of an MLX-affine kernel on the matrix unit (`quantized_qmm_nax`: the W4A8
+    /// GEMMs, the NAX gather GEMM, a planes layout): those are instantiated for 64 and 128 only.
+    NaxGroupSize: NAX_GROUP_SIZES = [64, 128];
+    /// The width of an MLX-affine kernel instantiated for int4 codes alone (`qmm_t_splitk`, `qmm_n`,
+    /// `qvm`): 4.
+    Int4Bits: INT4_BITS = [4];
+}
+
+impl AffineBits {
+    /// Four bits a weight: the width the int4-only kernels (the small-M tiles, W4A8, split-K) take.
+    pub const B4: Self = Self(4);
+
+    /// The width as the int4-only kernels take it; `None` for any other.
+    pub const fn int4(self) -> Option<Int4Bits> {
+        Int4Bits::new(self.0)
+    }
+}
+
+impl Int4Bits {
+    /// The width as every affine kernel takes it.
+    pub const fn affine(self) -> AffineBits {
+        AffineBits(self.0)
+    }
+}
+
+impl AffineGroupSize {
+    /// The group as the matrix-unit kernels take it; `None` for a group they lack.
+    pub const fn nax(self) -> Option<NaxGroupSize> {
+        NaxGroupSize::new(self.0)
+    }
+}
+
+/// A head width `RopeAppendNormed` stages whole in threadgroup memory: at most
+/// [`Self::MAX`], the staging its kernel is sized for.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, serde::Serialize)]
+pub struct StagedHeadDim(u32);
+
+impl StagedHeadDim {
+    /// The widest head the kernel's threadgroup staging holds.
+    pub const MAX: u32 = 512;
+
+    /// `head_dim` as a staged width; `None` past [`Self::MAX`] (or zero).
+    pub const fn new(head_dim: u32) -> Option<Self> {
+        match head_dim > 0 && head_dim <= Self::MAX {
+            true => Some(Self(head_dim)),
+            false => None,
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// The width as the kernels' head-dim constant.
+    pub const fn head_dim(self) -> HeadDim {
+        HeadDim(self.0)
+    }
+}
+
+/// The token block a GDN conv thread owns (`gdn_conv1d_varlen`'s baked constant slot 6): the
+/// grid's Z is the step's rows over it, each thread walking its block with the causal window in
+/// registers. Minted against the model it runs: it covers the seed window (`kernel - 1` entries)
+/// and a verify step's rows (`drafts + 1`), so block 0 is the one thread that reads the seed ring
+/// and the one that writes the new ring, blocks past a sequence's head seed from `x` alone, and
+/// only block 0 touches the draft lanes.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, serde::Serialize)]
+pub struct GdnConvBlock(u32);
+
+impl GdnConvBlock {
+    /// The tokens a thread owns: the kernel's one instantiation.
+    pub const TOKENS: u32 = 32;
+
+    /// The block for a conv of `kernel` taps under `drafts` drafted tokens a step; `None` when
+    /// the block covers either too few.
+    pub const fn covering(kernel: u32, drafts: u32) -> Option<Self> {
+        match kernel <= Self::TOKENS + 1 && drafts < Self::TOKENS {
+            true => Some(Self(Self::TOKENS)),
+            false => None,
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 u32_newtype!(
     /// A model tensor family (a `(WeightKind, accessor)` bundle, every layer) in the model's
     /// source manifest — what a `Binding::Source` names; the macro's generated resolver maps it.
@@ -304,10 +441,6 @@ u32_newtype!(
     NDim,
     /// Split-K partition count (for `affine_qmm_t_splitk`).
     SplitK,
-    /// MLX-affine quantization group size.
-    AffineGroupSize,
-    /// MLX-affine bits per quantized weight.
-    AffineBits,
     /// An MLX-affine GEMM's matvec/matmul boundary (`get_qmv_batch_limit`).
     QmvBatchLimit,
     /// Routed experts of a MoE layer.
@@ -434,3 +567,120 @@ f32_newtype!(
     /// RMSNorm epsilon (`W::RMS_NORM_EPS`).
     RmsNormEps,
 );
+
+#[cfg(test)]
+mod refined_tests {
+    use super::*;
+
+    /// Every `u32` a refined constructor could be handed, in the kernels' range and past it: each
+    /// value up to twice the widest instantiation, and the type's edges.
+    fn candidates(widest: u32) -> impl Iterator<Item = u32> {
+        (0..=2 * widest + 1).chain([u32::MAX - 1, u32::MAX])
+    }
+
+    /// The values a constructor accepts among `candidates`.
+    fn accepted(widest: u32, new: impl Fn(u32) -> Option<u32>) -> Vec<u32> {
+        candidates(widest).filter(|&v| new(v).is_some()).collect()
+    }
+
+    /// `AffineBits` is minted for exactly the widths the affine kernels are instantiated for, and
+    /// refuses every other.
+    #[test]
+    fn affine_bits_refuses_each_width_no_kernel_is_instantiated_for() {
+        assert_eq!(AFFINE_BITS, &[2, 3, 4, 8]);
+        assert_eq!(
+            accepted(8, |v| AffineBits::new(v).map(AffineBits::get)),
+            AFFINE_BITS
+        );
+        assert_eq!(AffineBits::B4.get(), 4);
+    }
+
+    /// `Int4Bits` takes 4 alone: every other affine width is one the int4-only kernels lack,
+    /// refused by the constructor and by [`AffineBits::int4`].
+    #[test]
+    fn int4_bits_refuses_each_width_the_int4_kernels_lack() {
+        assert_eq!(INT4_BITS, &[4]);
+        assert_eq!(
+            accepted(8, |v| Int4Bits::new(v).map(Int4Bits::get)),
+            INT4_BITS
+        );
+        for &bits in AFFINE_BITS {
+            let int4 = AffineBits::new(bits).and_then(AffineBits::int4);
+            assert_eq!(
+                int4.map(Int4Bits::get),
+                (bits == 4).then_some(4),
+                "{bits} bits"
+            );
+        }
+        assert_eq!(Int4Bits::of(4).affine(), AffineBits::B4);
+    }
+
+    /// `of`, the const-context constructor, mints what `new` does and refuses what it refuses.
+    #[test]
+    fn of_mints_what_new_mints_and_refuses_the_rest() {
+        assert_eq!(AffineBits::of(8), AffineBits::new(8).unwrap());
+        assert!(std::panic::catch_unwind(|| AffineBits::of(5)).is_err());
+        assert!(std::panic::catch_unwind(|| AffineGroupSize::of(16)).is_err());
+    }
+
+    /// `AffineGroupSize` is minted for exactly the groups the affine kernels are instantiated for.
+    #[test]
+    fn affine_group_size_refuses_each_group_no_kernel_is_instantiated_for() {
+        assert_eq!(AFFINE_GROUP_SIZES, &[32, 64, 128]);
+        assert_eq!(
+            accepted(128, |v| AffineGroupSize::new(v).map(AffineGroupSize::get)),
+            AFFINE_GROUP_SIZES
+        );
+    }
+
+    /// `NaxGroupSize` takes 64 and 128 alone: a group of 32 is an affine group the matrix-unit
+    /// kernels lack, refused by the constructor and by [`AffineGroupSize::nax`].
+    #[test]
+    fn nax_group_size_refuses_each_group_the_matrix_unit_kernels_lack() {
+        assert_eq!(NAX_GROUP_SIZES, &[64, 128]);
+        assert_eq!(
+            accepted(128, |v| NaxGroupSize::new(v).map(NaxGroupSize::get)),
+            NAX_GROUP_SIZES
+        );
+        let nax = |g| AffineGroupSize::new(g).and_then(AffineGroupSize::nax);
+        assert_eq!(nax(32), None);
+        assert_eq!(nax(64).map(NaxGroupSize::get), Some(64));
+        assert_eq!(nax(128).map(NaxGroupSize::get), Some(128));
+    }
+
+    /// `StagedHeadDim` holds every head width up to the staging's 512 and refuses each wider one
+    /// (and a zero-wide head).
+    #[test]
+    fn staged_head_dim_refuses_each_width_past_the_staging() {
+        let held = accepted(StagedHeadDim::MAX, |v| {
+            StagedHeadDim::new(v).map(StagedHeadDim::get)
+        });
+        assert_eq!(held, (1..=512).collect::<Vec<_>>());
+        assert_eq!(
+            StagedHeadDim::new(256).map(|h| h.head_dim()),
+            Some(HeadDim(256))
+        );
+    }
+
+    /// `GdnConvBlock` covers a conv of up to 33 taps (its 32-token block holds the 32-entry seed
+    /// window) and up to 31 drafted tokens a step (32 verify rows), and refuses each conv or
+    /// draft count past either.
+    #[test]
+    fn gdn_conv_block_refuses_each_conv_or_draft_count_it_does_not_cover() {
+        let block = GdnConvBlock::TOKENS;
+        for kernel in candidates(block + 1) {
+            for drafts in candidates(block) {
+                let covers = kernel <= block + 1 && drafts < block;
+                assert_eq!(
+                    GdnConvBlock::covering(kernel, drafts).is_some(),
+                    covers,
+                    "kernel {kernel}, drafts {drafts}"
+                );
+            }
+        }
+        assert_eq!(
+            GdnConvBlock::covering(4, 3).map(GdnConvBlock::get),
+            Some(32)
+        );
+    }
+}

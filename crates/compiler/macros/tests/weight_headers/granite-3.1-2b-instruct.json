@@ -1,0 +1,17 @@
+{
+  "repo": "ibm-granite/granite-3.1-2b-instruct",
+  "configs": ["granite/granite-3.1-2b-instruct"],
+  "tensors": {
+    "model.embed_tokens.weight": [49155, 2048],
+    "model.layers.0.input_layernorm.weight": [2048],
+    "model.layers.0.mlp.down_proj.weight": [2048, 8192],
+    "model.layers.0.mlp.gate_proj.weight": [8192, 2048],
+    "model.layers.0.mlp.up_proj.weight": [8192, 2048],
+    "model.layers.0.post_attention_layernorm.weight": [2048],
+    "model.layers.0.self_attn.k_proj.weight": [512, 2048],
+    "model.layers.0.self_attn.o_proj.weight": [2048, 2048],
+    "model.layers.0.self_attn.q_proj.weight": [2048, 2048],
+    "model.layers.0.self_attn.v_proj.weight": [512, 2048],
+    "model.norm.weight": [2048]
+  }
+}

@@ -1,5 +1,5 @@
 # The gemma3 forward, in torch-idiom Python. Parsed by scratchy
-# (compiler/macros/src/parse_python.rs), never executed by the
+# (compiler/frontend/src/parse_python.rs), never executed by the
 # compiler. Executed under torch only by the CI oracle, where the SAME
 # text is the reference implementation and the spec at once.
 import torch
@@ -13,9 +13,13 @@ def gemma3():
         pre_attn_normed = rmsnorm(hidden_states, input_layernorm[layer] + 1.0)
 
         q = gemm(pre_attn_normed, self_attn.q_proj[layer])
-        q = rmsnorm(q, self_attn.q_norm[layer] + 1.0)
+        q_heads = reshape(q, [num_tokens * num_attention_heads, head_dim])
+        q_heads = rmsnorm(q_heads, self_attn.q_norm[layer] + 1.0)
+        q = reshape(q_heads, [num_tokens, num_attention_heads * head_dim])
         k = gemm(pre_attn_normed, self_attn.k_proj[layer])
-        k = rmsnorm(k, self_attn.k_norm[layer] + 1.0)
+        k_heads = reshape(k, [num_tokens * num_key_value_heads, head_dim])
+        k_heads = rmsnorm(k_heads, self_attn.k_norm[layer] + 1.0)
+        k = reshape(k_heads, [num_tokens, num_key_value_heads * head_dim])
         v = gemm(pre_attn_normed, self_attn.v_proj[layer])
 
         if layer % sliding_window_pattern == sliding_window_global_remainder:

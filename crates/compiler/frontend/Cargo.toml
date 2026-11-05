@@ -1,0 +1,25 @@
+[package]
+name = "scratchy-forward-compiler-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The forward compiler's front end: the Python-costume parser, the classifier and the program it
+# builds, the shape dims, the config rules and the weights manifest, and the typed-Rust emit pass
+# over them. Two consumers, one compile: `scratchy-forward-compiler-macro` (the pipeline) and that
+# crate's build script (the typed-Rust emit pass, whose output the macro crate's own compile
+# type-checks).
+[features]
+# The backend whose lowering constructs the lowering-only op kinds (`OpKind::MmEmbedSplice`): the
+# macro crate forwards it here, so the op exists exactly where it did.
+metal = []
+# The fixtures the macro crate's tests build programs from (`parse_python::parse_body`, the
+# literal and llama-convention weights manifests): on in that crate's dev-dependency edge only.
+test-support = []
+
+[dependencies]
+syn = "3"
+proc-macro2 = "1"
+serde_json = { workspace = true }
+# The compiler ids the front end shares with the rest of the compiler.
+scratchy-tensors = { path = "../../tensors" }

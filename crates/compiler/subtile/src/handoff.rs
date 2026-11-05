@@ -18,21 +18,7 @@
 use crate::lower::LoweringInput;
 use std::collections::BTreeMap;
 
-/// A weight tensor's identity in the model's weight table. The same id spans every layer;
-/// [`UnrollIndex`] picks which one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct WeightId(pub u32);
-
-/// The unrolled (former loop-variable) position of a weight reference. `Some(UnrollIndex(n))`
-/// names the `n`th per-layer instance of a layered weight; `None` a global tensor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct UnrollIndex(pub u64);
-
-impl std::fmt::Display for UnrollIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+pub use scratchy_tensors::compiler_ids::{UnrollIndex, WeightId};
 
 /// Dense tile index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -1,0 +1,123 @@
+{
+ "repo": "mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-4bit",
+ "configs": [
+  "nemotron-h/nemotron-3-nano-30b-a3b"
+ ],
+ "head": false,
+ "bundles": {
+  "mamba": "backbone.layers.0.mixer",
+  "moe": "backbone.layers.1.mixer"
+ },
+ "quantization": {
+  "group_size": 64,
+  "bits": 4,
+  "mode": "affine"
+ },
+ "tensors": {
+  "backbone.layers.0.mixer.A_log": [
+   64
+  ],
+  "backbone.layers.0.mixer.D": [
+   64
+  ],
+  "backbone.layers.0.mixer.conv1d.bias": [
+   6144
+  ],
+  "backbone.layers.0.mixer.conv1d.weight": [
+   6144,
+   4,
+   1
+  ],
+  "backbone.layers.0.mixer.dt_bias": [
+   64
+  ],
+  "backbone.layers.0.mixer.in_proj.biases": [
+   10304,
+   42
+  ],
+  "backbone.layers.0.mixer.in_proj.scales": [
+   10304,
+   42
+  ],
+  "backbone.layers.0.mixer.in_proj.weight": [
+   10304,
+   336
+  ],
+  "backbone.layers.0.mixer.norm.weight": [
+   4096
+  ],
+  "backbone.layers.0.mixer.out_proj.biases": [
+   2688,
+   64
+  ],
+  "backbone.layers.0.mixer.out_proj.scales": [
+   2688,
+   64
+  ],
+  "backbone.layers.0.mixer.out_proj.weight": [
+   2688,
+   512
+  ],
+  "backbone.layers.1.mixer.gate.e_score_correction_bias": [
+   128
+  ],
+  "backbone.layers.1.mixer.gate.weight": [
+   128,
+   2688
+  ],
+  "backbone.layers.1.mixer.shared_experts.down_proj.biases": [
+   2688,
+   58
+  ],
+  "backbone.layers.1.mixer.shared_experts.down_proj.scales": [
+   2688,
+   58
+  ],
+  "backbone.layers.1.mixer.shared_experts.down_proj.weight": [
+   2688,
+   464
+  ],
+  "backbone.layers.1.mixer.shared_experts.up_proj.biases": [
+   3712,
+   42
+  ],
+  "backbone.layers.1.mixer.shared_experts.up_proj.scales": [
+   3712,
+   42
+  ],
+  "backbone.layers.1.mixer.shared_experts.up_proj.weight": [
+   3712,
+   336
+  ],
+  "backbone.layers.1.mixer.switch_mlp.fc1.biases": [
+   128,
+   1856,
+   42
+  ],
+  "backbone.layers.1.mixer.switch_mlp.fc1.scales": [
+   128,
+   1856,
+   42
+  ],
+  "backbone.layers.1.mixer.switch_mlp.fc1.weight": [
+   128,
+   1856,
+   336
+  ],
+  "backbone.layers.1.mixer.switch_mlp.fc2.biases": [
+   128,
+   2688,
+   29
+  ],
+  "backbone.layers.1.mixer.switch_mlp.fc2.scales": [
+   128,
+   2688,
+   29
+  ],
+  "backbone.layers.1.mixer.switch_mlp.fc2.weight": [
+   128,
+   2688,
+   232
+  ]
+ }
+}

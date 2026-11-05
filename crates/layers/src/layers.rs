@@ -809,28 +809,36 @@ pub fn layer_norm_load<A: DeviceAllocator>(
 /// state. Older fp32-A_log repacks (e.g. the uniform 4bit checkpoint)
 /// round-trip through f32 unchanged. `dt_bias` and the conv weight/bias keep
 /// their on-disk dtype — their kernel params are model-dtype `T*`. The conv
-/// bias and `D` are present on a Mamba-2 mixer only.
+/// bias and `D` are present on a Mamba-2 mixer only. Every tensor's name is
+/// the bundle table's (`scratchy_tensors::bundle_roles`).
 pub fn gated_delta_net_load<A: DeviceAllocator>(
     weights: &mut GpuWeights<A>,
     prefix: &str,
 ) -> Result<GatedDeltaNetLayer> {
-    let conv_bias = format!("{prefix}.conv1d.bias");
-    let d = format!("{prefix}.D");
+    use scratchy_tensors::bundle_roles::{BundleRole as R, const_leaf};
+    const CONV: &str = const_leaf(R::Conv);
+    const CONV_BIAS: &str = const_leaf(R::ConvBias);
+    const A_LOG: &str = const_leaf(R::ALog);
+    const D: &str = const_leaf(R::D);
+    const DT_BIAS: &str = const_leaf(R::DtBias);
+    const NORM: &str = const_leaf(R::Norm);
+    let conv_bias = format!("{prefix}.{CONV_BIAS}");
+    let d = format!("{prefix}.{D}");
     Ok(GatedDeltaNetLayer {
-        conv1d: weights.take_keep_dtype(&format!("{prefix}.conv1d.weight"))?,
+        conv1d: weights.take_keep_dtype(&format!("{prefix}.{CONV}.weight"))?,
         conv_bias: if weights.contains(&conv_bias) {
             Some(weights.take_keep_dtype(&conv_bias)?)
         } else {
             None
         },
-        a_log: weights.take_as_f32(&format!("{prefix}.A_log"))?,
-        dt_bias: weights.take_keep_dtype(&format!("{prefix}.dt_bias"))?,
+        a_log: weights.take_as_f32(&format!("{prefix}.{A_LOG}"))?,
+        dt_bias: weights.take_keep_dtype(&format!("{prefix}.{DT_BIAS}"))?,
         d: if weights.contains(&d) {
             Some(weights.take_as_f32(&d)?)
         } else {
             None
         },
-        norm: weights.take_as_f32(&format!("{prefix}.norm.weight"))?,
+        norm: weights.take_as_f32(&format!("{prefix}.{NORM}"))?,
     })
 }
 

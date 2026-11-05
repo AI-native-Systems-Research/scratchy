@@ -1,0 +1,77 @@
+{
+ "repo": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+ "configs": [
+  "qwen3-moe/qwen3-30b-a3b-instruct-2507"
+ ],
+ "head": false,
+ "bundles": {
+  "mlp": "model.layers.0.mlp"
+ },
+ "quantization": {
+  "group_size": 64,
+  "bits": 4,
+  "model.layers.0.mlp.gate": {
+   "group_size": 64,
+   "bits": 8
+  }
+ },
+ "tensors": {
+  "model.layers.0.mlp.gate.biases": [
+   128,
+   32
+  ],
+  "model.layers.0.mlp.gate.scales": [
+   128,
+   32
+  ],
+  "model.layers.0.mlp.gate.weight": [
+   128,
+   512
+  ],
+  "model.layers.0.mlp.switch_mlp.down_proj.biases": [
+   128,
+   2048,
+   12
+  ],
+  "model.layers.0.mlp.switch_mlp.down_proj.scales": [
+   128,
+   2048,
+   12
+  ],
+  "model.layers.0.mlp.switch_mlp.down_proj.weight": [
+   128,
+   2048,
+   96
+  ],
+  "model.layers.0.mlp.switch_mlp.gate_proj.biases": [
+   128,
+   768,
+   32
+  ],
+  "model.layers.0.mlp.switch_mlp.gate_proj.scales": [
+   128,
+   768,
+   32
+  ],
+  "model.layers.0.mlp.switch_mlp.gate_proj.weight": [
+   128,
+   768,
+   256
+  ],
+  "model.layers.0.mlp.switch_mlp.up_proj.biases": [
+   128,
+   768,
+   32
+  ],
+  "model.layers.0.mlp.switch_mlp.up_proj.scales": [
+   128,
+   768,
+   32
+  ],
+  "model.layers.0.mlp.switch_mlp.up_proj.weight": [
+   128,
+   768,
+   256
+  ]
+ }
+}

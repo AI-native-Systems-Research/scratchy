@@ -54,6 +54,12 @@ pub struct StepRefusal {
 pub enum Refused {
     /// A gated feed-forward on a model whose facts state no feed-forward width.
     NoIntermediate,
+    /// An MLX-affine weight of a width or group no affine kernel is instantiated for
+    /// (`ids::AffineBits`, `ids::AffineGroupSize`).
+    UninstantiatedAffine {
+        bits: u32,
+        group_size: u32,
+    },
     NoFirstNorm,
     NoTapeStep,
     NoColour,
@@ -493,6 +499,13 @@ impl Recording<'_> {
         st::ActivationWidth::of_cols(self.graph.shape(self.graph.op_output[i]).cols)
     }
 
+    /// Op `i`'s MLX-affine group and width, as the kernels take them; refused when no kernel is
+    /// instantiated for either.
+    fn affine(&self, i: usize, group_size: u32, bits: u32) -> Result<(Gs, Bits), StepRefusal> {
+        (Gs::new(group_size).zip(Bits::new(bits)))
+            .ok_or_else(|| self.no(i, Refused::UninstantiatedAffine { bits, group_size }))
+    }
+
     fn no(&self, i: usize, why: Refused) -> StepRefusal {
         StepRefusal {
             op: Some((i, self.op(i).name())),
@@ -749,7 +762,8 @@ impl Recording<'_> {
                         ExpertProj::Gate => gate = width,
                         ExpertProj::Up => {
                             (inter, bundle) = (Some(Inter(n)), Some(b));
-                            (group_size, up) = (Some(Gs(q.group().get())), width);
+                            let (group, _) = self.affine(j, q.group().get(), q.bits().get())?;
+                            (group_size, up) = (Some(group), width);
                         }
                         ExpertProj::Down => down = width,
                     }
@@ -938,8 +952,8 @@ impl Recording<'_> {
             return Err(self.no(j, Refused::DenseExperts));
         };
         let ((rows, reads, norm), e) = (self.moe_rows(j, 0)?, self.source_arg(j, 2)?);
-        let (layer, group_size) = (self.layer(e), Gs(quant.group().get()));
-        let op_bits = Bits(quant.bits().get());
+        let (group_size, op_bits) = self.affine(j, quant.group().get(), quant.bits().get())?;
+        let layer = self.layer(e);
         let at = |width| st::ExpertMatmul {
             rows,
             layer,
@@ -1908,17 +1922,21 @@ impl Recording<'_> {
             }
             GemmWeight::Dense => return Err(self.no(mm, Refused::FusionShape)),
             GemmWeight::Fp8Dynamic => return Err(self.no(mm, Refused::Fp8Gemm)),
-            GemmWeight::Affine { affine } => MetalStep::AffineQmm(st::AffineMatmul {
-                input,
-                output: out,
-                layer,
-                n: nd,
-                k: kd,
-                group_size: Gs(affine.group().get()),
-                bits: Bits(affine.bits().get()),
-                vector_limit: st::QmvBatchLimit(affine_qmm_vector_limit(k, n)),
-                ends,
-            }),
+            GemmWeight::Affine { affine } => {
+                let (group_size, bits) =
+                    self.affine(mm, affine.group().get(), affine.bits().get())?;
+                MetalStep::AffineQmm(st::AffineMatmul {
+                    input,
+                    output: out,
+                    layer,
+                    n: nd,
+                    k: kd,
+                    group_size,
+                    bits,
+                    vector_limit: st::QmvBatchLimit(affine_qmm_vector_limit(k, n)),
+                    ends,
+                })
+            }
         };
         let Some(step) = step else {
             return Ok(em(plain, &reads, &[out], site));
