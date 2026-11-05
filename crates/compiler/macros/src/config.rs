@@ -284,6 +284,17 @@ pub enum ConfigError {
         path: PathBuf,
         limit: serde_json::Value,
     },
+    /// A config's quant spec carries per-module (mixed-bit, OptiQ/DWQ) affine
+    /// overrides that this backend cannot lower (only metal reads the
+    /// per-tensor widths back: `unpack_moe_expert_bits` /
+    /// `affine_gather_qmv_symbol`). Raised at the ONE place the quant spec is
+    /// decided — `parse_quantization` — naming the config and WHICH tensors
+    /// are mixed-bit. The build refuses; it never silently emits nothing and
+    /// lets a later "no models selected" panic stand in for the fact.
+    MixedBitAffine {
+        stem: String,
+        tensors: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -315,6 +326,13 @@ impl std::fmt::Display for ConfigError {
                 "{}: time_step_limit {limit} clips Mamba-2's dt, which no kernel realizes \
                  (only the unclipped default, absent or `[0.0, null]`, is supported)",
                 path.display()
+            ),
+            Self::MixedBitAffine { stem, tensors } => write!(
+                f,
+                "{stem}: ships a mixed-bit (OptiQ) affine quantization — per-tensor width \
+                 overrides only metal lowers; this backend cannot compile it. Mixed-bit \
+                 tensors: {}",
+                tensors.join(", ")
             ),
         }
     }
@@ -791,10 +809,7 @@ fn load_dir_mode(
         // needs to stay in `base_raw` so a matching quant variant can be
         // synthesized from it below. `arch_has_active_quant` gates it too:
         // a selected quant preset replaces dense, it doesn't add to it.
-        if stem_matches_build_filter(&stem)
-            && !arch_has_active_quant
-            && (cfg!(feature = "metal") || !ships_mixed_bit_affine(&json))
-        {
+        if stem_matches_build_filter(&stem) && !arch_has_active_quant {
             tracing::info!("[COMPILING] base {}", stem);
             let model = model_params_from_json_mode(&json, &stem, p, tracked, mode, spec)?;
             out.push(model);
@@ -1151,25 +1166,6 @@ pub fn load_head_file(
 /// Read + parse a JSON file, returning the raw string (for
 /// diagnostics) and the parsed `Value`. Centralized so
 /// `ConfigError::{Io, Json}` always carry the right path.
-/// Whether a base config ships its own MIXED-BIT affine quantization — an
-/// OptiQ checkpoint: a `quantization_config` carrying PER-TENSOR overrides
-/// (`"...embed_tokens": { "bits": 8, .. }`) on top of the scalar
-/// `group_size`/`bits`/`mode`, rather than one width for the whole model.
-///
-/// Only metal lowers those today: the per-projection widths are read back by
-/// `unpack_moe_expert_bits` / `affine_gather_qmv_symbol`.
-///
-/// So `all` is BACKEND-RELATIVE for these, exactly as it already is for
-/// synthesized quant variants via `quant_preset_active` above: the same
-/// feature names every checked-in config, and each backend emits the subset
-/// it can actually lower. Derived from the config's own contents, not a stem
-/// list, so a new OptiQ checkpoint is covered the day it lands.
-fn ships_mixed_bit_affine(json: &serde_json::Value) -> bool {
-    json.get("quantization_config")
-        .and_then(|q| q.as_object())
-        .is_some_and(|q| q.values().any(|v| v.is_object()))
-}
-
 fn read_json_file(path: &Path) -> Result<(String, serde_json::Value), ConfigError> {
     let contents = fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
@@ -1523,12 +1519,30 @@ fn parse_architectures(json: &serde_json::Value) -> Vec<String> {
 
 fn parse_quantization(
     json: &serde_json::Value,
+    stem: &str,
     source_path: &Path,
 ) -> Result<Option<crate::quantization::QuantizationConfig>, ConfigError> {
-    crate::quantization::QuantizationConfig::parse(json).map_err(|e| ConfigError::Quantization {
-        path: source_path.to_path_buf(),
-        source: e,
-    })
+    let parsed = crate::quantization::QuantizationConfig::parse(json).map_err(|e| {
+        ConfigError::Quantization {
+            path: source_path.to_path_buf(),
+            source: e,
+        }
+    })?;
+    // THE one place mixed-bit-ness is decided: the quant spec itself. A
+    // per-module (OptiQ/DWQ) override map is a fact of the checkpoint; a
+    // backend that cannot lower it refuses here, by name, listing the
+    // tensors — no second, downstream re-derivation from the raw JSON.
+    if let Some(cfg) = &parsed
+        && let crate::quantization::QuantMethod::Affine { per_module, .. } = &cfg.method
+        && !per_module.is_empty()
+        && !cfg!(feature = "metal")
+    {
+        return Err(ConfigError::MixedBitAffine {
+            stem: stem.to_string(),
+            tensors: per_module.iter().map(|(k, _)| k.clone()).collect(),
+        });
+    }
+    Ok(parsed)
 }
 
 /// `None` (field absent) lets `apply_arch_semantic_defaults` supply
@@ -1700,7 +1714,7 @@ fn model_params_from_json(
     for (k, v) in &spec.scalar_defaults {
         scalars.entry(k.clone()).or_insert(*v);
     }
-    let quantization = parse_quantization(json, source_path)?;
+    let quantization = parse_quantization(json, source_stem, source_path)?;
     // An in-checkpoint head reads its target's config, whose `tie_word_embeddings` says where the
     // TARGET keeps its lm_head (Qwen3.5-0.8B: in its embedding table). The head's lm_head is a
     // slot of its own the target lends either way (`target.lent_weight_prefix`), never its embedding.
@@ -1824,7 +1838,7 @@ fn vision_params_from_json(
     let tie_word_embeddings = parse_tie_word_embeddings(json)
         .or(spec.tie_default)
         .unwrap_or(false);
-    let quantization = parse_quantization(json, source_path)?;
+    let quantization = parse_quantization(json, source_stem, source_path)?;
     let arch = resolve_arch_spec(spec, json, source_stem);
 
     // A vision arch MUST declare its on-disk structure — there is no

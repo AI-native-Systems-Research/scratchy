@@ -578,12 +578,24 @@ pub fn compile_carrier(
         _ => config::load_dir(models_dir, &spec),
     }
     .map_err(|e| {
-        syn::Error::new(
-            name_span,
-            format!("models_dir `{}`: {e}", models_dir.display()),
-        )
-    })
-    .map_err(CarrierError::Arch)?;
+        // A refusal that belongs to ONE config rides the per-stem arm —
+        // never the arch's, which would name the wrong thing. The reason
+        // text is the error's own Display, stated once.
+        let per_config_stem = match &e {
+            config::ConfigError::MixedBitAffine { stem, .. } => Some(stem.clone()),
+            _ => None,
+        };
+        match per_config_stem {
+            Some(stem) => CarrierError::Config {
+                stem,
+                source: syn::Error::new(name_span, e.to_string()),
+            },
+            None => CarrierError::Arch(syn::Error::new(
+                name_span,
+                format!("models_dir `{}`: {e}", models_dir.display()),
+            )),
+        }
+    })?;
     if models.is_empty() {
         // A `<stem>`/`quant-*`/arch selection filtering out every model in
         // this dir is OK — emit an empty crate so a build scoped to (say)
