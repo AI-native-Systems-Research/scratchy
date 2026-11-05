@@ -42,6 +42,10 @@ positive! {
     HeadDim(u32),
     /// The leading lanes of a head that rotary rotates.
     RotDim(u32),
+    /// Query heads per kv head — the GQA group size, minted once by
+    /// [`HeadGeometry::new`](HeadGeometry::new) beside its divisibility law, so no reader
+    /// re-derives the division.
+    Gqa(u32),
     /// Positions per paged-KV block.
     BlockSize(u32),
     /// The residual stream's width.
@@ -172,6 +176,7 @@ pub struct HeadGeometry {
     head_dim: HeadDim,
     rot_dim: RotDim,
     page: BlockSize,
+    gqa: Gqa,
 }
 
 impl HeadGeometry {
@@ -198,6 +203,7 @@ impl HeadGeometry {
             head_dim,
             rot_dim,
             page,
+            gqa: Gqa::new(q_heads.get() / kv_heads.get()),
         }
     }
     /// The query heads.
@@ -220,9 +226,10 @@ impl HeadGeometry {
     pub const fn page(self) -> BlockSize {
         self.page
     }
-    /// Query heads per kv head, exact by the constructor's law.
-    pub const fn gqa(self) -> u32 {
-        self.q_heads.get() / self.kv_heads.get()
+    /// Query heads per kv head — the group minted once at construction, exact by the
+    /// constructor's law, so no reader re-derives the division.
+    pub const fn gqa(self) -> Gqa {
+        self.gqa
     }
     /// `q_heads · head_dim`.
     pub const fn q_width(self) -> usize {
@@ -1124,7 +1131,7 @@ mod tests {
     #[test]
     fn a_dividing_kv_head_count_has_its_group() {
         let g = geometry(28, 4, 128, 128);
-        assert_eq!((g.gqa(), g.q_width()), (7, 28 * 128));
+        assert_eq!((g.gqa().get(), g.q_width()), (7, 28 * 128));
     }
 
     /// 29 query heads over 4 kv heads have no GQA grouping.

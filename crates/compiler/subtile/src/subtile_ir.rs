@@ -3645,7 +3645,7 @@ pub fn eval_node<F: RopeForm>(
             let geom = attention.base();
             let scale = attention.scale().get();
             let hd = geom.head_dim().get() as usize;
-            let gqa = geom.gqa() as usize;
+            let gqa = geom.gqa().get() as usize;
             let (q, qr, qc) = gather(&node.inputs[0], graph, bufs);
             let (k, kr, kc) = gather(&node.inputs[1], graph, bufs);
             let (v, _vr, _vc) = gather(&node.inputs[2], graph, bufs);
@@ -3787,7 +3787,7 @@ pub fn eval_node<F: RopeForm>(
             // weight-folded node evaluates at 1.0 exactly where the lowered program does.
             let scale = scale_site.scale(attention);
             let hd = geom.head_dim().get() as usize;
-            let gqa = geom.gqa() as usize;
+            let gqa = geom.gqa().get() as usize;
             let (q, qr, qc) = gather(&node.inputs[0], graph, bufs);
             let mq = qr as usize;
             let qh_count = qc as usize / hd; // q-heads in this block
