@@ -715,6 +715,14 @@ pub enum Scratch {
     /// A walk's carried value, copied once after the last trip for a reader that slices it across
     /// cores, so the carried buffer itself stays core-local (`emit::whole_function`, #1026).
     CarriedHandback,
+    /// ⭐ THE RANK-2 PAGE GATHER'S ROW-MAJOR LANDING — the `[T, w]` frame's entries gathered as
+    /// one-row blocks before the one whole stick permute restickifies them
+    /// (`emit::whole_function`'s rank-2 gather arm). Its OWN variant, not a fifth
+    /// [`Scratch::RelayoutMid`] sharer: `BundleLayout::synth` is first-one-wins, so a site that
+    /// shares a variant with the relayout middles would be handed one of THEIR shapes when both
+    /// see one value — the exact silent-aliasing shape this enum exists to close. No existing key
+    /// changes: this variant is minted by one site that had no key of its own.
+    GatherLanding,
 }
 
 impl Clone for KtirNode {

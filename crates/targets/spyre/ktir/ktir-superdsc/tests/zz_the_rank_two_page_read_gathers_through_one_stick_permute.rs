@@ -17,6 +17,10 @@
 //! Every program here is built from the op kinds the walk really reads, over a cache allocated
 //! row-outermost exactly as the splice allocates the paged KV (`allocate_row_outermost`), so the
 //! door sees a real program and not a stub.
+//!
+//! The `zz_` prefix keeps this door at the END of the crate's test list, after the splice's
+//! golden legs — the same convention the other whole-function doors carry — so a failure here
+//! reads as "the door" and not as the first thing anyone runs.
 
 use ktir_core::affine::{AffineExpr, AffineMap};
 use ktir_core::arena::Arena;
@@ -230,7 +234,7 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
     for (i, b) in k.bindings.iter().enumerate() {
         let tid = b.get();
         l.ids.borrow_mut().insert(act_name(tid), PlaceId::Act(tid));
-        // Bytes: A [M, T] f16 (T ≤ 16), cache [8, 256] f16, ids [entries] i32, OUT [M, w] f16.
+        // Bytes: A [M, T] f16, cache [8, SLAB] f16, ids [entries] i32, OUT [M, w] f16.
         let bytes: u64 = match i {
             0 => 8 * 512 * 2,
             1 => 8 * SLAB as u64 * 2,
@@ -309,7 +313,6 @@ fn several_multi_stick_entries_land_row_major_and_one_permute_restickifies() {
     let mm = ops
         .iter()
         .find(|e| e.op_name.starts_with("matmul") || e.op_name.starts_with("mm"))
-        .or_else(|| ops.iter().find(|e| e.arg_bindings.len() == 3))
         .expect("the contraction lowers");
     assert!(
         mm.arg_bindings.iter().any(|a| a.buffer == permute_dst),

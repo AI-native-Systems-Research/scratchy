@@ -5077,7 +5077,7 @@ fn lower_function_folded(
                         let t_rows = u32_of(total / w, "landing rows")?;
                         let sticks = u32_of(w / stick as u64, "landing sticks")?;
                         let land_tid =
-                            mint_scratch(k, layout, floor, res, Scratch::RelayoutMid);
+                            mint_scratch(k, layout, floor, res, Scratch::GatherLanding);
                         layout.synth(crate::place::PlaceId::Act(land_tid), &[t_rows, w32]);
                         let land = Region {
                             tid: land_tid,
