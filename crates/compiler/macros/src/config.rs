@@ -1117,6 +1117,34 @@ pub fn load_file_declared(config_path: &Path) -> Result<ModelParams, ConfigError
     load_file_declared_mode(config_path, ConfigMode::Decoder)
 }
 
+/// The load-OR-refuse law, stated once for tests: a config either loads, or —
+/// under a backend that cannot lower its mixed-bit (OptiQ) affine
+/// quantization — the loader refuses NAMING the config and its mixed-bit
+/// tensors. A well-formed refusal is asserted here and returned as `None`
+/// (the caller skips the config); any other error still fails the test
+/// loudly. Under a backend that lowers mixed-bit affine this never refuses.
+#[cfg(test)]
+pub(crate) fn assert_load_or_refuse_by_name(
+    stem: &str,
+    result: Result<ModelParams, ConfigError>,
+) -> Option<ModelParams> {
+    match result {
+        Ok(model) => Some(model),
+        Err(ConfigError::MixedBitAffine {
+            stem: refused,
+            tensors,
+        }) => {
+            assert_eq!(refused, stem, "the refusal names its config");
+            assert!(
+                !tensors.is_empty(),
+                "{stem}: the refusal names its mixed-bit tensors"
+            );
+            None
+        }
+        Err(e) => panic!("{stem}: {e}"),
+    }
+}
+
 /// [`load_file_declared`] for a `@vision_forward` carrier's config: its `vision_*` bounds derived
 /// as [`load_dir_vision`] derives them.
 #[cfg(test)]
@@ -3506,7 +3534,14 @@ mod tests {
             let path = dir.join(format!("{stem}.json"));
             let json: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
-            let mp = model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse");
+            // Load-or-refuse: the parity-tiny ships a mixed-bit affine quantization,
+            // so under a backend that can't lower it the refusal is the outcome.
+            let Some(mp) = assert_load_or_refuse_by_name(
+                stem,
+                model_params_from_json(&json, stem, &path, Vec::new(), &spec),
+            ) else {
+                continue;
+            };
             let b = |k: &str| mp.bounds[k];
             let set = |name: &str| mp.layer_sets[name].members().to_vec();
             for kind in ["mamba_layers", "attention_layers", "moe_layers"] {
@@ -3546,14 +3581,20 @@ mod tests {
     #[test]
     fn recurrent_state_dims_come_from_either_mixer() {
         use crate::codegen::RecurrentDims;
-        let dims = |arch: &str, stem: &str| {
+        // Load-or-refuse: the parity-tiny ships a mixed-bit affine quantization,
+        // so under a backend that can't lower it the refusal is the outcome
+        // (`None`); a dense config loads on every backend.
+        let dims = |arch: &str, stem: &str| -> Option<RecurrentDims> {
             let dir = repo_model_archs(arch);
             let spec = load_arch_json(&dir).expect("arch.json");
             let path = dir.join(format!("{stem}.json"));
             let json: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
-            let mp = model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse");
-            RecurrentDims::of(&mp).expect("a recurrent mixer")
+            let mp = assert_load_or_refuse_by_name(
+                stem,
+                model_params_from_json(&json, stem, &path, Vec::new(), &spec),
+            )?;
+            Some(RecurrentDims::of(&mp).expect("a recurrent mixer"))
         };
         let mamba = |groups, heads, head_dim| RecurrentDims {
             num_k_heads: groups,
@@ -3565,22 +3606,23 @@ mod tests {
         };
         assert_eq!(
             dims("nemotron-h", "nemotron-3-nano-30b-a3b"),
-            mamba(8, 64, 64)
+            Some(mamba(8, 64, 64))
         );
         let super_dims = dims("nemotron-h-latent", "nemotron-3-super-120b-a12b");
-        assert_eq!(super_dims, mamba(8, 128, 64));
-        assert_eq!(super_dims.conv_dim, 10240);
-        let tiny = dims("nemotron-h", "nemotron-3-nano-30b-a3b-parity-tiny");
-        assert_eq!(
-            (
-                tiny.num_k_heads,
-                tiny.num_v_heads,
-                tiny.head_k_dim,
-                tiny.head_v_dim
-            ),
-            (2, 8, 16, 16)
-        );
-        let gdn = dims("qwen3-5", "qwen3.5-0.8b");
+        assert_eq!(super_dims, Some(mamba(8, 128, 64)));
+        assert_eq!(super_dims.expect("dense config loads").conv_dim, 10240);
+        if let Some(tiny) = dims("nemotron-h", "nemotron-3-nano-30b-a3b-parity-tiny") {
+            assert_eq!(
+                (
+                    tiny.num_k_heads,
+                    tiny.num_v_heads,
+                    tiny.head_k_dim,
+                    tiny.head_v_dim
+                ),
+                (2, 8, 16, 16)
+            );
+        }
+        let gdn = dims("qwen3-5", "qwen3.5-0.8b").expect("dense config loads");
         assert_eq!(
             (
                 gdn.num_k_heads,
