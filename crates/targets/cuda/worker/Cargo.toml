@@ -42,3 +42,5 @@ scratchy-layers = { path = "../../../layers" }
 inventory = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# The checkpoint's `quantization_config`, read as the raw JSON `HfModelConfig` keeps (`plan`).
+serde_json = { workspace = true }

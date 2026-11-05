@@ -38,8 +38,8 @@ use scratchy_target_cuda::weights::{check, open_checkpoint};
 use tracing::info;
 
 use crate::plan::{
-    block_table_u32, check_sampling, choose_bucket, emits_token, fill_inputs, gdn_fresh,
-    greedy_token, kv_block_bytes, logits_row, scheduled_request,
+    block_table_u32, check_quantization_config, check_sampling, choose_bucket, emits_token,
+    fill_inputs, gdn_fresh, greedy_token, kv_block_bytes, logits_row, scheduled_request,
 };
 
 /// The GDN slots, and the sequences running at once: one.
@@ -307,6 +307,12 @@ impl Worker for CudaServingWorker {
             )));
         }
         let hf_config = HfModelConfig::from_dir(&dir).map_err(init)?;
+        // A quantized checkpoint's scheme, before any table is checked against its header: block
+        // scaling, static or per-tensor activations and a KV scheme are refused by field.
+        let quant = serde_json::json!({
+            "quantization_config": hf_config.extra.get("quantization_config"),
+        });
+        check_quantization_config(&quant).map_err(init)?;
         let stems: Vec<&str> = registry::entries().map(|e| e.stem).collect();
         info!("CUDA model registry: {} stems {stems:?}", stems.len());
         if stems.is_empty() {

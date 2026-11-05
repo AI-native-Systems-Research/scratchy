@@ -305,3 +305,89 @@ pub fn gdn_fresh(code: u32, start: u32) -> Result<bool, PlanError> {
     }
     Ok(fresh)
 }
+
+/// Why a checkpoint's `quantization_config` is not one CUDA's FP8 tapes read: per-channel e4m3
+/// weights (`weights.strategy: "channel"`, no block structure), dynamic per-token activations
+/// (`input_activations.strategy: "token"`, `dynamic: true`), and no KV-cache scheme. `field` is
+/// the config's path to the value, `found` the value as the checkpoint states it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuantRefusal {
+    pub field: String,
+    pub found: String,
+    pub want: &'static str,
+}
+
+impl fmt::Display for QuantRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { field, found, want } = self;
+        write!(
+            f,
+            "the checkpoint's quantization_config.{field} is {found}; the CUDA backend's FP8 \
+             tapes need {want} (per-channel e4m3 weights, dynamic per-token activations, no KV \
+             scheme)"
+        )
+    }
+}
+
+impl std::error::Error for QuantRefusal {}
+
+/// Refuse a checkpoint `config.json` (`config`, the whole file) whose `quantization_config` CUDA's
+/// FP8 path does not read; one with none (a bf16 checkpoint) passes, its weight table's dtype
+/// check deciding the rest. Each refusal names its field.
+///
+/// Block scaling (`weight_block_size`, or a group's `weights.block_structure`, e.g. 128×128
+/// blocks) is refused here and nowhere else; when an `Fp8Block` weight kind and its kernels land
+/// (`steps_from_tape::gemm`'s weight-kind match), this is where the refusal lifts.
+pub fn check_quantization_config(config: &serde_json::Value) -> Result<(), QuantRefusal> {
+    use serde_json::Value;
+    let Some(q) = config.get("quantization_config").filter(|q| !q.is_null()) else {
+        return Ok(());
+    };
+    let refuse = |field: String, found: Option<&Value>, want| QuantRefusal {
+        field,
+        found: found.map_or_else(|| "absent".to_string(), Value::to_string),
+        want,
+    };
+    if let Some(v) = q.get("weight_block_size").filter(|v| !v.is_null()) {
+        return Err(refuse("weight_block_size".into(), Some(v), "none"));
+    }
+    if let Some(v) = q.get("kv_cache_scheme").filter(|v| !v.is_null()) {
+        return Err(refuse("kv_cache_scheme".into(), Some(v), "null"));
+    }
+    let groups = q.get("config_groups").and_then(Value::as_object);
+    let Some(groups) = groups.filter(|g| !g.is_empty()) else {
+        return Err(refuse(
+            "config_groups".into(),
+            q.get("config_groups"),
+            "a group",
+        ));
+    };
+    for (name, g) in groups {
+        let at = |path: &str| format!("config_groups.{name}.{path}");
+        let w = g.get("weights");
+        if let Some(v) = w
+            .and_then(|w| w.get("block_structure"))
+            .filter(|v| !v.is_null())
+        {
+            return Err(refuse(at("weights.block_structure"), Some(v), "null"));
+        }
+        let strategy = w.and_then(|w| w.get("strategy"));
+        if strategy.and_then(Value::as_str) != Some("channel") {
+            return Err(refuse(at("weights.strategy"), strategy, "\"channel\""));
+        }
+        let a = g.get("input_activations");
+        let strategy = a.and_then(|a| a.get("strategy"));
+        if strategy.and_then(Value::as_str) != Some("token") {
+            return Err(refuse(
+                at("input_activations.strategy"),
+                strategy,
+                "\"token\"",
+            ));
+        }
+        let dynamic = a.and_then(|a| a.get("dynamic"));
+        if dynamic.and_then(Value::as_bool) != Some(true) {
+            return Err(refuse(at("input_activations.dynamic"), dynamic, "true"));
+        }
+    }
+    Ok(())
+}

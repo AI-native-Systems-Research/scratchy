@@ -10,8 +10,9 @@ use scratchy_forward_compiler::gdn_slot_allocator::{GdnRow, GdnSlotAllocator};
 use scratchy_serving_engine::worker_factory::WorkerFactory;
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, KvClass, KvTape};
 use scratchy_target_cuda_worker::plan::{
-    PlanError, block_table_u32, check_sampling, choose_bucket, emits_token, fill_inputs, gdn_fresh,
-    greedy_token, kv_block_bytes, logits_row, scheduled_request,
+    PlanError, QuantRefusal, block_table_u32, check_quantization_config, check_sampling,
+    choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_token, kv_block_bytes, logits_row,
+    scheduled_request,
 };
 use scratchy_target_cuda_worker::{CudaWorkerFactory, NO_NVCC};
 
@@ -418,4 +419,89 @@ fn the_factory_is_registered() {
         .into_iter()
         .any(|f| f.matches("cuda"));
     assert!(found, "no registered factory claims --device cuda");
+}
+
+// ── The checkpoint's quantization_config (FP8 S2) ──────────────────
+
+/// A real FP8 dynamic per-channel config (`tests/fixtures/`), the one every case edits.
+fn fp8_config() -> serde_json::Value {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/fp8_dynamic_per_channel_config.json"
+    );
+    serde_json::from_str(&std::fs::read_to_string(path).expect("the fixture")).expect("JSON")
+}
+
+/// `fp8_config` with `edit` applied, refused naming `field`.
+fn quant_refused(edit: impl FnOnce(&mut serde_json::Value), field: &str) -> QuantRefusal {
+    let mut c = fp8_config();
+    edit(&mut c["quantization_config"]);
+    let e = check_quantization_config(&c).expect_err("refused");
+    assert_eq!(e.field, field, "{e}");
+    assert!(e.to_string().contains(field), "{e}");
+    e
+}
+
+/// The checkpoints' own config passes, and so does a bf16 one, with none.
+#[test]
+fn a_per_channel_dynamic_config_and_none_pass() {
+    check_quantization_config(&fp8_config()).expect("the RedHatAI FP8 config");
+    check_quantization_config(&serde_json::json!({ "hidden_size": 8 })).expect("no config");
+    check_quantization_config(&serde_json::json!({ "quantization_config": null })).expect("null");
+}
+
+/// Block scaling, either spelling: the per-channel path never loads it.
+#[test]
+fn a_block_scaled_config_is_refused() {
+    let e = quant_refused(
+        |q| q["weight_block_size"] = serde_json::json!([128, 128]),
+        "weight_block_size",
+    );
+    assert_eq!(e.found, "[128,128]");
+    quant_refused(
+        |q| q["config_groups"]["group_0"]["weights"]["block_structure"] = "128x128".into(),
+        "config_groups.group_0.weights.block_structure",
+    );
+}
+
+#[test]
+fn a_weight_strategy_other_than_channel_is_refused() {
+    let e = quant_refused(
+        |q| q["config_groups"]["group_0"]["weights"]["strategy"] = "tensor".into(),
+        "config_groups.group_0.weights.strategy",
+    );
+    assert_eq!(e.found, "\"tensor\"");
+}
+
+#[test]
+fn static_or_per_tensor_activations_are_refused() {
+    quant_refused(
+        |q| q["config_groups"]["group_0"]["input_activations"]["strategy"] = "tensor".into(),
+        "config_groups.group_0.input_activations.strategy",
+    );
+    quant_refused(
+        |q| q["config_groups"]["group_0"]["input_activations"]["dynamic"] = false.into(),
+        "config_groups.group_0.input_activations.dynamic",
+    );
+    let e = quant_refused(
+        |q| q["config_groups"]["group_0"]["input_activations"] = serde_json::Value::Null,
+        "config_groups.group_0.input_activations.strategy",
+    );
+    assert_eq!(e.found, "absent");
+}
+
+#[test]
+fn a_kv_cache_scheme_is_refused() {
+    quant_refused(
+        |q| q["kv_cache_scheme"] = serde_json::json!({ "num_bits": 8, "type": "float" }),
+        "kv_cache_scheme",
+    );
+}
+
+#[test]
+fn a_config_with_no_group_is_refused() {
+    quant_refused(
+        |q| q["config_groups"] = serde_json::json!({}),
+        "config_groups",
+    );
 }
