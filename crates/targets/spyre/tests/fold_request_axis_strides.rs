@@ -5,10 +5,10 @@
 //! ## What this file used to assert, greenly, for five tests
 //! *"Collapsing the prefix fold from `pages × requests` launches to `pages` needs the score and value
 //! KERNELS to step one request per unit of the batch axis, i.e. a per-`y` step of exactly
-//! `PagedKvPool::request_stride` = `hd * PAGE_SLOTS`."*
+//! `PagedKvPool::request_stride` = `hd * POOL_PAGE_SLOTS`."*
 //!
 //! It measured that step off the emitted per-core addresses and found it exact — and it was exact,
-//! because the test **defined `req = HD * PAGE_SLOTS` itself** and then checked the emitter reproduced
+//! because the test **defined `req = HD * POOL_PAGE_SLOTS` itself** and then checked the emitter reproduced
 //! the number the `device_extent` override had just told it to use. A spot-check against its own
 //! parameters (`a-spot-check-against-its-own-parameters-verifies-nothing`). It never compared that
 //! number against the pool's own address law, which is the only oracle here.
@@ -24,7 +24,7 @@
 //!
 //! ⛔ IT IS **EXACTLY** THE KV-HEAD STRIDE, AND A NEAR-MISS READING OF THAT IS REFUTED BELOW. The
 //! distance to the next kv head is `plane_block_elems() = hd * PLANE_SLOTS` — PHYSICAL slots — while
-//! `hd * PAGE_SLOTS` is the ADDRESSABLE count, so the natural guess is that the baked constant falls
+//! `hd * POOL_PAGE_SLOTS` is the ADDRESSABLE count, so the natural guess is that the baked constant falls
 //! SHORT of kv head 1 by `hd * WRITE_SLACK`. It does not: `WRITE_SLACK` is 0 today, both quantities are
 //! 16384, and the first test here records that assertion failing. The step is not approximately the
 //! wrong axis, it is precisely the wrong one — see
@@ -66,28 +66,28 @@ const NKVH: usize = 8;
 /// ⛔ I FIRST WROTE THIS TEST ASSERTING THE CONSTANT WAS *SHORT* of the kv-head stride by
 /// `hd * WRITE_SLACK`, reasoning from the addressable-vs-physical split that really did put a padded
 /// chunk write on the next head's keys. **The assertion failed: both are 16384.** `WRITE_SLACK` is `0`
-/// today (`sdsc_abstract.rs:5195`, and `:90` says so outright), so `PLANE_SLOTS == PAGE_SLOTS` and the
+/// today (`sdsc_abstract.rs:5195`, and `:90` says so outright), so `PLANE_SLOTS == POOL_PAGE_SLOTS` and the
 /// two readings coincide. The hypothesis is recorded as refuted because the near-miss story it tells is
 /// more forgiving than the truth: the step is not approximately the wrong axis, it is EXACTLY the
 /// wrong axis.
 ///
 /// ⚠️ AND THE IDENTITY IS A COINCIDENCE WITH AN EXPIRY. `sdsc_abstract.rs:113` records that a non-zero
-/// `WRITE_SLACK` "arrived, and broke head_dim 128". Whenever it is non-zero again, `hd * PAGE_SLOTS`
+/// `WRITE_SLACK` "arrived, and broke head_dim 128". Whenever it is non-zero again, `hd * POOL_PAGE_SLOTS`
 /// stops being any axis at all — so this test pins the equality rather than the constant, and fails
 /// loudly the day the two split.
 #[test]
 fn the_pinned_request_stride_is_exactly_the_kv_head_stride() {
     let pool = PagedKvPool::new(NKVH, HD);
-    let pinned = HD * PagedKvPool::PAGE_SLOTS;
+    let pinned = HD * PagedKvPool::POOL_PAGE_SLOTS.as_usize();
     assert_eq!(
         pool.plane_block_elems(),
         HD * PagedKvPool::PLANE_SLOTS,
-        "the pool's kv-head distance is PHYSICAL slots, whatever PAGE_SLOTS says"
+        "the pool's kv-head distance is PHYSICAL slots, whatever POOL_PAGE_SLOTS says"
     );
     assert_eq!(
         pinned,
         pool.plane_block_elems(),
-        "`hd * PAGE_SLOTS` — the constant three request-axis attempts baked as the deleted \
+        "`hd * POOL_PAGE_SLOTS` — the constant three request-axis attempts baked as the deleted \
          `PagedKvPool::request_stride` — is the KV-HEAD stride. A `y` step of one advances one kv \
          head. If this ever stops holding (WRITE_SLACK != 0) the constant becomes no axis at all, \
          which is worse, not better."
@@ -95,7 +95,7 @@ fn the_pinned_request_stride_is_exactly_the_kv_head_stride() {
     assert_eq!(
         PagedKvPool::WRITE_SLACK,
         0,
-        "the equality above holds only while WRITE_SLACK is 0 — when it is not, `hd * PAGE_SLOTS` \
+        "the equality above holds only while WRITE_SLACK is 0 — when it is not, `hd * POOL_PAGE_SLOTS` \
          names nothing in the law and this file's second test is the one that still holds"
     );
 }
@@ -142,7 +142,7 @@ fn the_only_axis_the_pinned_constant_matches_is_the_kv_head_one() {
     )) - base;
     let slot = pool.addr(KvCoord::block(KvPlane::Kt, kvh0).at_slot(KvSlot::new(1))) - base;
     let feat = pool.addr(KvCoord::block(KvPlane::Kt, kvh0).at_feat(FeatIdx::of_slab(1))) - base;
-    let pinned = (HD * PagedKvPool::PAGE_SLOTS) as u32;
+    let pinned = (HD * PagedKvPool::POOL_PAGE_SLOTS.as_usize()) as u32;
     // The KV-HEAD axis is the one it matches, and matching it is the defect: the batch axis was
     // aliased onto the head axis, so request `r` scored against kv head `r`'s keys. With nkvh=8 and a
     // batch of 8 the alias is total — every row reads real, well-formed keys from the wrong head.

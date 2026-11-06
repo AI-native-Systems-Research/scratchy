@@ -81,7 +81,7 @@ fn a_kt_window_is_one_contiguous_stick_block_at_every_head_dim() {
             "hd={hd}: the stick block is `hd * POOL_STICK` by definition"
         );
         for kvh in 0..NKVH as u32 {
-            for b in 0..(PagedKvPool::PAGE_SLOTS as u32 / POOL_STICK) {
+            for b in 0..(PagedKvPool::POOL_PAGE_SLOTS.get() / POOL_STICK) {
                 let base = corner(&pool, KvPlane::Kt, kvh, b, 0);
                 // CONTIGUOUS: every (feature, slot) of the window lands inside `[base, base + unit)`,
                 // and the window's elements are exactly that range — checked by walking the law.
@@ -139,7 +139,7 @@ fn the_v_window_stride_is_one_slab_window_and_refutes_a_stick_block_entry_at_hd_
         let nslab = hd as u32 / POOL_STICK;
         let unit = pool.stick_block_elems() as u32;
         let head_block = pool.plane_block_elems() as u32;
-        let blocks_per_page = PagedKvPool::PAGE_SLOTS as u32 / POOL_STICK;
+        let blocks_per_page = PagedKvPool::POOL_PAGE_SLOTS.get() / POOL_STICK;
 
         // The slab stride, measured: `PLANE_SLOTS * POOL_STICK`.
         if nslab > 1 {
@@ -225,7 +225,7 @@ fn the_two_planes_block_numbering_coincides_exactly_at_one_slab() {
     for hd in [HD_2B, HD_8B] {
         let pool = PagedKvPool::new(NKVH, hd);
         let nslab = hd as u32 / POOL_STICK;
-        let blocks_per_page = PagedKvPool::PAGE_SLOTS as u32 / POOL_STICK;
+        let blocks_per_page = PagedKvPool::POOL_PAGE_SLOTS.get() / POOL_STICK;
         let mut agree = true;
         for kvh in 0..NKVH as u32 {
             let mut kt_numbers = vec![];
@@ -280,7 +280,7 @@ fn the_shipped_entry_unit_at_hd_64_is_already_one_slab_window() {
     assert_eq!(pool.stick_block_elems() as u32, SLAB_WINDOW_ELEMS);
     let scratch = GatherScratch::of_fold_pass(
         pool,
-        SlotWindow::count_in(SlotCount::new(PagedKvPool::PAGE_SLOTS as u32)),
+        SlotWindow::count_in(SlotCount::new(PagedKvPool::POOL_PAGE_SLOTS.get())),
         QueryRowCount::of_mq(8),
     )
     .expect("hd=64 admits the flat copy");
@@ -296,7 +296,7 @@ fn the_shipped_entry_unit_at_hd_64_is_already_one_slab_window() {
     );
     // `block_in_page` is the shipped law, and it is both planes' law at one slab.
     for kvh in 0..NKVH as u32 {
-        for b in 0..(PagedKvPool::PAGE_SLOTS as u32 / POOL_STICK) {
+        for b in 0..(PagedKvPool::POOL_PAGE_SLOTS.get() / POOL_STICK) {
             let want = corner(&pool, KvPlane::Kt, kvh, b, 0) / SLAB_WINDOW_ELEMS;
             assert_eq!(
                 scratch.block_in_page(kvh, b),

@@ -27,8 +27,8 @@ fn kvh(i: u32) -> KvHead {
 
 /// THE THREE PLANES DISAGREE ONLY IN THEIR INTRA-BLOCK ORDER, and that is the whole reason Kᵀ exists.
 ///
-/// Kᵀ is `[hd, PAGE_SLOTS]` sticked on the SLOT axis, so one slot costs one lane and one feature costs a
-/// whole stick. Natural K and V are `[PAGE_SLOTS, hd]` sticked on the FEATURE axis, so it is exactly the
+/// Kᵀ is `[hd, POOL_PAGE_SLOTS]` sticked on the SLOT axis, so one slot costs one lane and one feature costs a
+/// whole stick. Natural K and V are `[POOL_PAGE_SLOTS, hd]` sticked on the FEATURE axis, so it is exactly the
 /// other way round. Pinned at every head dim, because this is the transposition the score leg depends on.
 #[test]
 fn a_slot_costs_a_lane_on_kt_and_a_stick_on_v() {
@@ -76,11 +76,11 @@ fn a_slot_costs_a_lane_on_kt_and_a_stick_on_v() {
 /// request gone the same fact is a statement about the SLOT axis: how far is a full page of slots, versus
 /// the plane's own footprint?
 ///
-/// Kᵀ sticks on the slot axis, so `PAGE_SLOTS` slots is `(PAGE_SLOTS/64)*(hd*64)` = `hd*PAGE_SLOTS` —
+/// Kᵀ sticks on the slot axis, so `POOL_PAGE_SLOTS` slots is `(POOL_PAGE_SLOTS/64)*(hd*64)` = `hd*POOL_PAGE_SLOTS` —
 /// the plane's entire footprint, at ANY head dim. The score leg's kernel is therefore one contiguous
 /// run whatever the model.
 ///
-/// Natural K and V stick on the FEATURE axis, so `PAGE_SLOTS` slots is `PAGE_SLOTS*64`, INDEPENDENT of
+/// Natural K and V stick on the FEATURE axis, so `POOL_PAGE_SLOTS` slots is `POOL_PAGE_SLOTS*64`, INDEPENDENT of
 /// head_dim, while the footprint grows with it. ⭐ At hd == 64 those two coincide by arithmetic accident
 /// — which is exactly why hd=64 could never see this — and at hd == 128 the footprint is twice a page of
 /// slots. The value leg cannot simply sweep wider.
@@ -91,8 +91,9 @@ fn only_kt_spans_its_whole_plane_with_slots_at_any_head_dim() {
         let footprint = p.plane_block_elems() as u32;
         for plane in [KvPlane::Kt, KvPlane::V, KvPlane::Knat] {
             let base = KvCoord::block(plane, kvh(0));
-            let a_page_of_slots =
-                p.addr(base.at_slot(KvSlot::new(PagedKvPool::PAGE_SLOTS as u32))) - p.addr(base);
+            let a_page_of_slots = p
+                .addr(base.at_slot(KvSlot::new(PagedKvPool::POOL_PAGE_SLOTS.get())))
+                - p.addr(base);
             let spans = a_page_of_slots == footprint;
             match (hd, plane) {
                 // The slot axis carries the stick, so it holds at every head dim.

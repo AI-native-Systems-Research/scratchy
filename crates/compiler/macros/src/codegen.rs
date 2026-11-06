@@ -10552,18 +10552,22 @@ const DFLASH2_BLOCK_LANES: u64 = scratchy_forward_compiler::DFLASH2_BLOCK_LANES 
 // core's 2 MiB LX. This constant is now only the COLLISION-FREE CEILING
 // on that derivation — the largest width the emu will ever bake.
 //
-// CRITICAL: the prefill tape width is symbolized to `s0` BY VALUE
-// (`symbolicize_seq` flips every concrete dim == prefill_m → s0), so it MUST
-// NOT equal any structural model dim, else a non-seq dim is wrongly
-// symbolized (e.g. m=32 collides with head_dim/2=32 → the RoPE rotate-half
-// StridedSlice output `[rows, heads, 32]` becomes `[s0, heads, s0]`, which
-// flex rejects at graphOptimizer.cpp:2865). 31 is prime + ≤32 (LX-safe) +
-// collides with no common dim (head_dim 64/128, half 32/64, n_heads, hidden,
-// intermediate, block_size 64). `symbolicize_seq` guards the collision and
-// names the fix; `KTIR_PREFILL_LEN` overrides (must also be collision-free).
-// Referenced only inside dump_wavefront_mega's `#[cfg(feature = "spyre")]`
-// block and by the pinned test below — dead in a non-spyre LIB build (the
-// `not(test)` leg keeps the expectation satisfied exactly where it's true).
+// CRITICAL: a by-value symbolization consumer (every concrete dim ==
+// prefill_m → `s0`) must not see the width equal any structural model dim,
+// else a non-seq dim is wrongly symbolized (the measured refusal was the
+// m=32 == head_dim/2 collision: the RoPE rotate-half StridedSlice output
+// `[rows, heads, 32]` became `[s0, heads, s0]`, which flex rejected at
+// graphOptimizer.cpp:2865). That consumer is HISTORICAL — it lived in the
+// deleted sengraph/offline_decoder path; in this tree `seq_sym`'s value
+// half is constructed and never destructured, so the emu's KTIR tape is
+// fully CONCRETE and PREFILL_LX_SAFE stands as the collision-free ceiling
+// for whichever symbolic consumer returns. 31 is prime + ≤32 (LX-safe) +
+// collides with no common dim (head_dim 64/128, half 32/64, n_heads,
+// hidden, intermediate, block_size 64). `KTIR_PREFILL_LEN` overrides (must
+// also be collision-free). Referenced only inside dump_wavefront_mega's
+// `#[cfg(feature = "spyre")]` block and by the pinned test below — dead in
+// a non-spyre LIB build (the `not(test)` leg keeps the expectation
+// satisfied exactly where it's true).
 #[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
 const PREFILL_LX_SAFE: u32 = 31;
 /// SuperDSC PREFILL WIDTH LADDER, ASCENDING. Each rung is baked as its own prefill bundle and
@@ -10572,10 +10576,10 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// m=31 → 69 ms ⇒ ~42 ms + ~0.7 ms/row), so one width is wrong both ways — too narrow re-pays
 /// the fixed term on every extra chunk, too wide computes padding rows that carry no tokens.
 ///
-/// `2^k − 1` by construction: `symbolicize_seq` rewrites every concrete dim equal to the tape
-/// width into `s0`, so a width equal to a structural dim would symbolize a NON-seq dim (see
-/// [`PREFILL_LX_SAFE`]'s note on m=32 == head_dim/2). These values collide with none of the
-/// power-of-two dims (head_dim, block_size, cap, hidden, intermediate).
+/// `2^k − 1` by construction: a by-value symbolization of the tape width would wrongly
+/// symbolize an equal NON-seq dim (see [`PREFILL_LX_SAFE`]'s note on m=32 == head_dim/2).
+/// These values collide with none of the power-of-two dims (head_dim, block_size, cap,
+/// hidden, intermediate).
 ///
 /// The 63-row ceiling is GONE (2026-07-29): the new-token block is now folded as `mq_pad/64`
 /// stick-wide sub-blocks, so a chunk may span more than one stick. 96 is HARDWARE-PROVEN.
@@ -10586,8 +10590,8 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// 80 sits between 63 and 96 to halve the worst-case padding in that gap.
 ///
 /// `2^k − 1` is no longer required: this ladder is the SuperDSC bake's alone, and that prefill
-/// tape is CONCRETE (`seq_sym` is forced to `None` below), so `symbolicize_seq` never runs on
-/// it. That is why 128 may equal granite-8b's head_dim here.
+/// tape is CONCRETE (`seq_sym` is forced to `None` below), so nothing symbolizes it by value.
+/// That is why 128 may equal granite-8b's head_dim here.
 ///
 /// Rungs that fail to lower for a given model FAIL THE BUILD, so this list is a promise:
 /// every admitted rung bakes or nothing does.
@@ -10645,6 +10649,9 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// aimed at its own page through the block table — `EmittedOp::kv_slot_offset`), which is what
 /// lets a chunk outgrow the page: the weights are re-streamed once per chunk, so a 10k prompt's
 /// 40 chunks of 256 become 20 of 512.
+// Spyre-only, as every reader is: the spyre bake's ladder, `emu_prefill_lx_width`, and the
+// shape asserts below.
+#[cfg(feature = "spyre")]
 const PREFILL_RUNGS: [u32; 27] = [
     7, 11, 15, 17, 19, 21, 23, 25, 27, 29, 31, 35, 39, 43, 47, 55, 63, 71, 80, 88, 96, 112, 128,
     192, 256, 384, 512,
@@ -10670,14 +10677,51 @@ const _: () = assert!(
      WRITE_SLACK is derived from it, and a padded chunk write that overruns by more than the \
      slack corrupts the next kv head's keys"
 );
+// ⛔ THE LADDER'S OWN SHAPE LAWS (the table is POLICY — measured cost-law discretization,
+// see the rung notes above — so what is checked is its structure, not its values):
+// strictly ascending (the bake and the worker's rung choice both walk it in order); the
+// top rung is the pool's whole-page window (PREFILL_WINDOW_PAGES · POOL_PAGE_SLOTS, itself
+// PREFILL_CHUNK_SLOTS); the TOP THREE rungs are whole-page or half-page spans (a chunk
+// at them starts at a page or half-page boundary, so no padded write straddles a page);
+// every rung positive.
+#[cfg(feature = "spyre")]
+const _: () = assert!(
+    {
+        use scratchy_subtile::sdsc_abstract::PagedKvPool;
+        let page = PagedKvPool::POOL_PAGE_SLOTS.get();
+        let mut ok = true;
+        let mut i = 0;
+        while i < PREFILL_RUNGS.len() {
+            if PREFILL_RUNGS[i] == 0 || (i > 0 && PREFILL_RUNGS[i - 1] >= PREFILL_RUNGS[i]) {
+                ok = false;
+            }
+            i += 1;
+        }
+        let n = PREFILL_RUNGS.len();
+        let top = PREFILL_RUNGS[n - 1];
+        let half_page = page / 2;
+        ok && top as usize
+            == PagedKvPool::PREFILL_WINDOW_PAGES * PagedKvPool::POOL_PAGE_SLOTS.as_usize()
+            && top as usize == PagedKvPool::PREFILL_CHUNK_SLOTS
+            && PREFILL_RUNGS[n - 1].is_multiple_of(half_page)
+            && PREFILL_RUNGS[n - 2].is_multiple_of(half_page)
+            && PREFILL_RUNGS[n - 3].is_multiple_of(half_page)
+    },
+    "PREFILL_RUNGS must be strictly ascending, positive, topped at the pool's whole-page \
+     window (PREFILL_WINDOW_PAGES · POOL_PAGE_SLOTS == PREFILL_CHUNK_SLOTS), with its top three \
+     rungs whole-page or half-page spans"
+);
 
 // ── THE EMU'S ONE BAKED PREFILL WIDTH, DERIVED FROM THE MODEL'S OWN fp8 GEMMS ──
 //
 // ktir-emulator runs each fused segment on ONE core against a real 2 MiB LX,
-// and an fp8-dynamic gemm's minted program holds, at its epilogue peak, THREE
-// `[m, N]` f16 tiles — the dot result `p`, the broadcast's shape-defining
-// `tensor.empty`, and the broadcast replica of the per-channel scale row —
-// plus the collapsed `[N]` scale row itself. MEASURED (isolated single-node
+// and an fp8-dynamic gemm's minted program holds, at its epilogue peak,
+// `FP8_EPILOGUE_LIVE_TILES` `[m, N]` f16 tiles — the dot result `p`, the
+// broadcast's shape-defining `tensor.empty`, and the broadcast replica of the
+// per-channel scale row — plus the collapsed `[N]` scale row itself; the
+// count and the peak-bytes formula are the SPLICE'S OWN (minted beside the
+// program they describe, `scratchy_triton_splice::fp8_epilogue_peak_bytes`).
+// MEASURED (isolated single-node
 // probe through the production session entry, K=3840/N=15360): the refusal
 // `1935360 + 952320 > 2097152` is exactly p + empty + scale-row + the
 // charging broadcast; the zero-init splat is freed by the resident
@@ -10695,9 +10739,12 @@ const _: () = assert!(
 // large (measured at m=71, N=15360 — clean), and its un-blocked arm only
 // fires when `m·N ≤ 90_000` elements, whose whole tile is ~180 KB.
 //
-// The budget mirrors `ktir-emulator`'s `LX_FUSION_BUDGET_BYTES` (7/8 of the
-// 2 MiB LX — headroom for the planner's model-vs-mechanism gap, which is
-// exactly what the old constant lacked). Gemms whose rows are a concrete
+// The budget is the ONE const, read from ktir-superdsc beside the LX capacity
+// it derives from (`LX_FUSION_BUDGET_BYTES` = 7/8 of the 2 MiB LX — headroom
+// for the planner's model-vs-mechanism gap, which is exactly what the old
+// constant lacked); the tile count and the peak-bytes formula are the
+// SPLICE'S OWN, minted beside the fp8-dynamic program they describe
+// (`FP8_EPILOGUE_LIVE_TILES`, `fp8_epilogue_peak_bytes`). Gemms whose rows are a concrete
 // bound (not the seq dim) don't scale with the baked width and are skipped;
 // the lm_head is skipped because the prefill fold runs it at m=1 (its
 // `[1, vocab]` peak is the decode path's own, already proven) — identified by
@@ -10707,17 +10754,10 @@ const _: () = assert!(
 // 12b (N=15360) → 19; 31b (N=21504) → 11; granite fp8 (N=8192) → 31 (the
 // collision-free cap binds first); dense-only models → 31 (no fp8 gemm
 // constrains). Pinned by `emu_prefill_lx_width_pins_the_gemma4_rungs`.
-/// The fp8 gemm's intra-node `[m, N]` f16 tiles at its epilogue peak: the
-/// dot result, the broadcast's shape-defining `tensor.empty`, and the
-/// broadcast replica of the per-channel scale row.
-#[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
-const FP8_MATMUL_LIVE_TILES: u128 = 3;
-/// The same budget `ktir-emulator`'s `LX_FUSION_BUDGET_BYTES` states: 7/8 of
-/// the 2 MiB per-core LX.
-#[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
-const EMU_LX_FUSION_BUDGET_BYTES: u128 = (2 * 1024 * 1024) * 7 / 8;
 
-#[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
+// Gated on `spyre`, with the one-home budget it reads: `scratchy_subtile::superdsc_opspec`
+// is re-exported only under `spyre`, and the fn's one caller is the spyre bake block.
+#[cfg(feature = "spyre")]
 fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 {
     use crate::shape::eval_closed_dim;
     // The result tail: the LAST tile nothing consumes — the bridge's own law
@@ -10787,8 +10827,8 @@ fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 
         }
         let w = prefix_len.min(r);
         if fp8_ns.iter().all(|&n| {
-            FP8_MATMUL_LIVE_TILES * u128::from(w) * u128::from(n) * 2 + u128::from(n) * 2
-                <= EMU_LX_FUSION_BUDGET_BYTES
+            scratchy_triton_splice::fp8_epilogue_peak_bytes(w, n)
+                <= u128::from(scratchy_subtile::superdsc_opspec::LX_FUSION_BUDGET_BYTES)
         }) {
             return w;
         }
@@ -10799,13 +10839,14 @@ fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 
     let n = fp8_ns.iter().copied().max().unwrap_or(0);
     panic!(
         "[wavefront] {}: no emu prefill width fits a core's LX — the widest fp8 gemm \
-         (N={n}) needs {} B of intra-node tiles at m={} against the {} B budget (3 live \
+         (N={n}) needs {} B of intra-node tiles at m={} against the {} B budget ({} live \
          [m, N] f16 tiles + the [N] scale row); the fp8 kernel cannot be N-blocked \
          (verify_canonical_fp8_matmul_kernel refuses BLOCK_N < N)",
         model.source_stem,
-        FP8_MATMUL_LIVE_TILES * u128::from(w) * u128::from(n) * 2 + u128::from(n) * 2,
+        scratchy_triton_splice::fp8_epilogue_peak_bytes(w, n),
         w,
-        EMU_LX_FUSION_BUDGET_BYTES,
+        u128::from(scratchy_subtile::superdsc_opspec::LX_FUSION_BUDGET_BYTES),
+        scratchy_triton_splice::FP8_EPILOGUE_LIVE_TILES,
     );
 }
 
@@ -10922,11 +10963,11 @@ fn dump_wavefront_mega(
     // before every `lower_decode_to_wavefront` call so decode + prefill can never
     // be baked at diverging capacities.
     //
-    // The page is the one the forward's attention walks (`paged_step::PAGE_SLOTS`, compiled only
+    // The page is the one the forward's attention walks (`paged_step::SchedulerBlockTokens::REFERENCE.get()`, compiled only
     // under `spyre`); a build without that target has no pool to round to, and never calls this
     // function (its one call is gated on `cfg!(feature = "spyre")`).
     #[cfg(feature = "spyre")]
-    let page_slots = scratchy_target_spyre::paged_step::PAGE_SLOTS;
+    let page_slots = scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
     #[cfg(not(feature = "spyre"))]
     let page_slots = 1u32;
     let prefix_len: std::num::NonZeroU32 = model
@@ -11144,7 +11185,7 @@ fn dump_wavefront_mega(
         // an assumed list. The one-request rung is the bundle already stamped into `superdsc_fp`, so
         // every path that predates the ladder is unchanged; wider rungs only ever add entries.
         // (seqs, active_cap, body_fp, OWN load_consts) — the swept extent rides along so the worker
-        // can tighten its mask-coverage guard from `PAGE_SLOTS * pages` to the real
+        // can tighten its mask-coverage guard from `POOL_PAGE_SLOTS * pages` to the real
         // `active_cap * pages`, and the consts are THIS RUNG'S OWN KINDS (staged at the rung's own
         // `rows` — the ten uniform `[rows, 1]` tables' stick heads are per-width, Finding 1's
         // compounding half: the single-request wiring's rows=1 kinds staged into a rows=N rung
@@ -11800,7 +11841,7 @@ fn dump_wavefront_mega(
                                             // is a rung, so each step walks the fewest pages that
                                             // reach its context.
                                             let pool_pages =
-                                                cap / scratchy_target_spyre::paged_step::PAGE_SLOTS;
+                                                cap / scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
                                             let ceiling_walk =
                                                 scratchy_target_spyre::paged_step::walk_pages(
                                                     pool_pages,
@@ -11815,7 +11856,7 @@ fn dump_wavefront_mega(
                                                 // `select_body` compares the live context against.
                                                 // A page walk's rung is the slots its walk reaches.
                                                 active_cap: superdsc::bundle::SweptCols::new(
-                                                    ceiling_walk * scratchy_target_spyre::paged_step::PAGE_SLOTS,
+                                                    ceiling_walk * scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get(),
                                                 ),
                                                 bodies: rung_fps(&body_fps),
                                                 bodies_fused: std::borrow::Cow::Owned(
@@ -11869,7 +11910,7 @@ fn dump_wavefront_mega(
                                                     }
                                                 })
                                                 .map(|b| {
-                                                    let slots = b * scratchy_target_spyre::paged_step::PAGE_SLOTS;
+                                                    let slots = b * scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
                                                     (
                                                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::new(slots),
                                                         slots,
@@ -13176,10 +13217,33 @@ fn dump_wavefront_mega(
         // bake decode graphs at several mq ∈ MQ_DEM_SAFE and have the worker pick the
         // smallest that holds the live batch (C=1 → mq=2, large batch → mq=96). Until that
         // lands, change `DECODE_MQ` below for an 8-way concurrent server.
-        const DECODE_MQ: u32 = 2; // PAGED prefill+decode mq = CB batch axis default (chat-optimal; see note)
         // DEM/DSM-safe mq values, on-card verified (dd2 SENTIENT, nblk=4). MUST stay
         // sorted; every entry has been observed to CompileGraph + Predict coherently.
         const MQ_DEM_SAFE: [u32; 4] = [2, 4, 8, 96];
+        // The smallest DEM-safe mq that holds `min_rows` rows: the law DECODE_MQ
+        // FOLLOWS from, and the same answer the dynamic-mq path gives the live
+        // batch (worker picks the smallest safe mq ≥ the live request count).
+        // Reads MQ_DEM_SAFE ascending, so the table's sorted-order law is its
+        // precondition (asserted below).
+        const fn smallest_dem_safe_mq(min_rows: u32) -> u32 {
+            let mut i = 0;
+            while i < MQ_DEM_SAFE.len() {
+                if MQ_DEM_SAFE[i] >= min_rows {
+                    return MQ_DEM_SAFE[i];
+                }
+                i += 1;
+            }
+            panic!("MQ_DEM_SAFE holds no mq >= the minimal decode row count");
+        }
+        // Incremental decode carries ONE new token per sequence, and the device
+        // already build-refuses mq=1 (unit-axis Reshape vs symbolic-batch
+        // collision, graphOptimizer.cpp:5422 — see the guard note above), so the
+        // minimal lawful decode row count is 2: 1 real token + 1 pad.
+        const MINIMAL_DECODE_ROWS: u32 = 2;
+        // PAGED prefill+decode mq = CB batch axis default (chat-optimal; see note).
+        // DERIVED, not picked: the smallest DEM-safe mq ≥ the minimal decode row
+        // count — identical for every model (min{mq ∈ {2,4,8,96} : mq ≥ 2} = 2).
+        const DECODE_MQ: u32 = smallest_dem_safe_mq(MINIMAL_DECODE_ROWS);
         const fn mq_is_dem_safe(mq: u32) -> bool {
             // const-fn linear scan (arrays aren't const-iterable on stable).
             let mut i = 0;
@@ -13201,10 +13265,23 @@ fn dump_wavefront_mega(
         );
         const _: () = assert!(
             mq_is_dem_safe(DECODE_MQ),
-            "DECODE_MQ is not a DEM/DSM-safe static-paged mq. Only {{2,4,8,96}} are on-card PROVEN \
-             (dd2). DECODE_MQ=2 is the minimal incremental-decode width (1 real token + 1 pad) and \
-             the proven decode roofline lever (~10.7× over mq=96). To use another value, pick from \
-             MQ_DEM_SAFE; a SMALLER decode mq is faster (decode COMPUTE scales ~linearly in mq)."
+            "DECODE_MQ (smallest DEM-safe mq ≥ MINIMAL_DECODE_ROWS) is not in MQ_DEM_SAFE — \
+             the derivation and the table have drifted apart."
+        );
+        // smallest_dem_safe_mq reads MQ_DEM_SAFE ascending; pin that ordering.
+        const _: () = assert!(
+            {
+                let mut i = 1;
+                let mut sorted = true;
+                while i < MQ_DEM_SAFE.len() {
+                    if MQ_DEM_SAFE[i - 1] >= MQ_DEM_SAFE[i] {
+                        sorted = false;
+                    }
+                    i += 1;
+                }
+                sorted
+            },
+            "MQ_DEM_SAFE must stay strictly ascending: smallest_dem_safe_mq scans it in order."
         );
         // Batched-prefill bundle: the worker runs the prompt through it (one m=N
         // forward per chunk), keeping the m=1 decode bundle for the generation
@@ -18072,6 +18149,7 @@ mod fingerprint_tests {
     /// (N=262144 on the 12b) refuses EVERY rung, so a broken row-local tail
     /// walk panics the derivation here instead of failing an emu build.
     #[test]
+    #[cfg(feature = "spyre")]
     fn emu_prefill_lx_width_pins_the_gemma4_rungs() {
         for (arch, stem, preset, want) in [
             ("gemma4", "gemma-4-12b-it", "fp8-dynamic-per-channel", 19),

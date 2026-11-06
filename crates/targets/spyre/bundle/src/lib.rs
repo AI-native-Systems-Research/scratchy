@@ -74,7 +74,7 @@ impl RungSeqs {
 
 /// ⭐⭐⭐⭐⭐ THE COLUMNS ONE FOLD PASS SWEEPS in the body a rung actually runs — its `active_cap`.
 ///
-/// The fold covers `swept * pages` columns, NOT `PAGE_SLOTS * pages`. The emitter bakes bodies at 64,
+/// The fold covers `swept * pages` columns, NOT `POOL_PAGE_SLOTS * pages`. The emitter bakes bodies at 64,
 /// 128 and 256; at 128 with 6 pages the covered window is 768 slots, so a batch whose shared write
 /// slot is 1441 leaves the DEEPEST row's tail described by no swept column — a wrong answer with no
 /// fault.

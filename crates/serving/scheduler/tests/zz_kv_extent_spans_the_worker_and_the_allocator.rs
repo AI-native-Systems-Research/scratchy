@@ -226,7 +226,7 @@ fn an_extent_one_step_in_flight_is_allocated_for_the_slot_the_launch_will_write(
     req.num_output_placeholders = STEPS_IN_FLIGHT;
 
     // ⭐ AND THE EXPECTED PAGE COUNT IS THE WORKER'S OWN RULE, NOT A CONSTANT THIS TEST PICKED:
-    // `RowPages::holding(batch_slot + 1)` is `ceil((end + 1) / PAGE_SLOTS)`.
+    // `RowPages::holding(batch_slot + 1)` is `ceil((end + 1) / POOL_PAGE_SLOTS)`.
     let current_end = (REPORTED_SLOTS + STEPS_IN_FLIGHT) as usize;
     let launch_needs = (current_end + 1).div_ceil(BLOCK);
     assert_eq!(
