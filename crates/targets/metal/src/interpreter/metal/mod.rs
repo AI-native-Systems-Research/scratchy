@@ -51,7 +51,7 @@ pub use pool::{
 pub use runtime::{DraftRuntimeBuffers, RuntimeBindings};
 pub use worker::{
     Activation, ArenaLayout, ArenaRanks, ArenaRole, ArenaShare, BoundBuffer, BucketBaking,
-    BucketStep, ByRank, GuestArena, HostArena, HostPart, Hosting, MetalWorker, Rank,
+    BucketStep, ByRank, GuestArena, HostArena, HostPart, Hosting, MetalWorker, Rank, RankedSlots,
     ResolvedSources, Slot, SourceMiss, SparsePlan, TerminalReads, WorkerError,
 };
 

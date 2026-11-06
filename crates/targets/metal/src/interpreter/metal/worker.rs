@@ -207,7 +207,79 @@ impl ArenaRanks {
         );
         Self { all, hosting }
     }
+}
 
+/// ⭐ A MODEL'S ARENA RANKS, READ OFF ITS BUCKETS: each slot of `0..N` (`N` the most slots a
+/// bucket has) by its bytes at its largest bucket — the bytes its colours host there — largest
+/// first, ties by slot; the hosting ranks the same less every bucket's final hidden states. Held
+/// in a `static`, which [`Self::ranks`] lends to the model's [`ArenaRanks`].
+pub struct RankedSlots<const N: usize> {
+    all: [u32; N],
+    hosting: [u32; N],
+    hosting_len: usize,
+}
+
+impl<const N: usize> RankedSlots<N> {
+    pub const fn of(buckets: &[super::pool::MetalBucketSpec]) -> Self {
+        let mut bytes = [0u64; N];
+        let mut b = 0;
+        while b < buckets.len() {
+            let arena = buckets[b].arena_bytes;
+            let mut s = 0;
+            while s < arena.len() {
+                if arena[s] > bytes[s] {
+                    bytes[s] = arena[s];
+                }
+                s += 1;
+            }
+            b += 1;
+        }
+        // Each rank's slot: the largest left, the lowest slot among equals.
+        let (mut all, mut taken) = ([0u32; N], [false; N]);
+        let mut r = 0;
+        while r < N {
+            let mut best = N;
+            let mut s = 0;
+            while s < N {
+                if !taken[s] && (best == N || bytes[s] > bytes[best]) {
+                    best = s;
+                }
+                s += 1;
+            }
+            taken[best] = true;
+            all[r] = best as u32;
+            r += 1;
+        }
+        let (mut hosting, mut hosting_len) = ([0u32; N], 0);
+        let mut a = 0;
+        while a < N {
+            let mut is_hidden = false;
+            let mut k = 0;
+            while k < buckets.len() {
+                is_hidden |= buckets[k].backbone_slot == all[a];
+                k += 1;
+            }
+            if !is_hidden {
+                hosting[hosting_len] = all[a];
+                hosting_len += 1;
+            }
+            a += 1;
+        }
+        Self {
+            all,
+            hosting,
+            hosting_len,
+        }
+    }
+
+    /// The ranks, of the model whose buckets are `buckets` (the ones they were read off).
+    pub const fn ranks(&'static self, buckets: &[super::pool::MetalBucketSpec]) -> ArenaRanks {
+        let (hosting, _) = self.hosting.split_at(self.hosting_len);
+        ArenaRanks::new(&self.all, hosting, buckets)
+    }
+}
+
+impl ArenaRanks {
     /// The slots of an arena of `len` slots, in the order of `ranks`.
     fn within(ranks: &[u32], len: usize) -> impl Iterator<Item = Slot> + '_ {
         (ranks.iter().map(|&s| Slot(s as usize))).filter(move |s| s.0 < len)

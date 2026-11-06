@@ -50,6 +50,23 @@ pub fn unsigned_path(n: u64) -> String {
     })
 }
 
+/// `n` as the path of its [`typenum`] type, by the name `typenum` gives it where it gives one (every
+/// number to 1024, and every power of two): a bucket's rows, spelled wherever its arena is.
+///
+/// ```
+/// # use scratchy_tensors::typed::{DimN, unsigned_alias_path};
+/// # use scratchy_tensors::typed::typenum::{U4096, U768};
+/// assert_eq!(unsigned_alias_path(4096), "::scratchy_tensors::typed::typenum::U4096");
+/// assert_eq!(unsigned_alias_path(1536).matches("UInt").count(), 11);
+/// assert_eq!((<U4096 as DimN>::N, <U768 as DimN>::N), (4096, 768));
+/// ```
+pub fn unsigned_alias_path(n: u64) -> String {
+    match n <= 1024 || n.is_power_of_two() {
+        true => format!("::scratchy_tensors::typed::typenum::U{n}"),
+        false => unsigned_path(n),
+    }
+}
+
 /// The product `A · B`.
 pub struct Mul<A, B>(PhantomData<(A, B)>);
 
@@ -754,6 +771,30 @@ impl<T: Shaped<L>, L> Mint<Vec<L>> for Vec<T> {
         Ok(layers.into_iter().map(|l| T::wrap(Checked(l))).collect())
     }
 }
+
+/// An activation: `T` rows of `D` elements each, as an arena buffer holds it.
+pub struct Act<T, D>(PhantomData<fn() -> (T, D)>);
+
+/// What an arena buffer holding a value of this type must fit: its element count.
+pub trait Extent {
+    const ELEMS: u64;
+}
+
+impl<T: Dim, D: Dim> Extent for Act<T, D> {
+    const ELEMS: u64 = <T as DimN>::N as u64 * <D as DimN>::N as u64;
+}
+
+/// An extent of a model's arena, as a marker type of its own: the extent it is at a bucket's rows
+/// `M` (its `sk_bucket` `S`). A marker, not the extent's type, is what a colour hosts: two
+/// extents whose types agree at some bucket's rows (`[M, D]` and `[1, D]`, where `M` is 1) are
+/// still two markers, so their hosts never overlap.
+pub trait ExtentAt<M, S> {
+    type At: Extent;
+}
+
+/// An arena colour that holds extent `E` (an [`ExtentAt`] marker) at some point of its tape: what
+/// the colouring assigned it. A buffer read or written as `E` must be a colour that hosts `E`.
+pub trait Hosts<E> {}
 
 #[cfg(test)]
 mod tests {

@@ -188,10 +188,34 @@ pub fn lower_subtile_tape_to_metal(
     p: &ModelFacts,
     at: BakePoint<'_>,
 ) -> Result<LoweredMetalTape, LoweringError> {
+    lower_with_rows(steps, p, at).map(|(tape, _)| tape)
+}
+
+/// The half of a step tape a row is a row of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TapeHalf {
+    Backbone,
+    LmHead,
+}
+
+/// Which step rows a lowered command was lowered from: its own row, and each row whose command
+/// folded into it (a W4A8 pre-pass into its norm, or reused; a paired GEMM), all of one half.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandRows {
+    pub half: TapeHalf,
+    pub rows: Vec<u32>,
+}
+
+/// [`lower_subtile_tape_to_metal`], with each command's [`CommandRows`], in command order.
+pub fn lower_with_rows(
+    steps: &MetalStepTape,
+    p: &ModelFacts,
+    at: BakePoint<'_>,
+) -> Result<(LoweredMetalTape, Vec<CommandRows>), LoweringError> {
     let half = |rows, barriers, sources, live, planes| {
         lower(p, rows, barriers, sources, live, &at, planes)
     };
-    let (bb, bb_logits) = half(
+    let (bb, bb_logits, bb_rows) = half(
         &steps.backbone,
         &steps.backbone_barriers,
         &steps.backbone_sources,
@@ -200,7 +224,7 @@ pub fn lower_subtile_tape_to_metal(
     )?;
     // The lm_head is what a drafter borrows of its target (`LentWeight::LmHead`), read the
     // device's way there: the tail keeps it so here too.
-    let (lh, lh_logits) = half(
+    let (lh, lh_logits, lh_rows) = half(
         &steps.lm_head,
         &steps.lm_head_barriers,
         &steps.lm_head_sources,
@@ -225,7 +249,12 @@ pub fn lower_subtile_tape_to_metal(
         return Err(LoweringError::TurboQuantCompressesNothing);
     }
     let commands = bb.commands.iter().chain(lh.commands.iter());
-    Ok(LoweredMetalTape {
+    let of =
+        |half, rows: Vec<Vec<u32>>| rows.into_iter().map(move |rows| CommandRows { half, rows });
+    let command_rows = (of(TapeHalf::Backbone, bb_rows))
+        .chain(of(TapeHalf::LmHead, lh_rows))
+        .collect();
+    let tape = LoweredMetalTape {
         bucket_m: at.bucket_m,
         num_arena_slots: at.num_arena_slots,
         live: baked([bb.live, lh.live].concat()),
@@ -244,7 +273,8 @@ pub fn lower_subtile_tape_to_metal(
         // A tape without the sampled rows (a one-row bucket, an encoder) writes the logits — or
         // its terminal rows — at every row.
         logits_rows: writes_logits(bb_logits, lh_logits).unwrap_or(LogitsRows::Bucket),
-    })
+    };
+    Ok((tape, command_rows))
 }
 
 /// Whether `c` is a KV writer — a rope append, or a coded attention running its writer too
@@ -1958,7 +1988,7 @@ fn lower(
     live_rows: &[PlayLive],
     at: &BakePoint<'_>,
     half_planes: Planes,
-) -> Result<(LoweredMetalTape, Option<LogitsRows>), LoweringError> {
+) -> Result<(LoweredMetalTape, Option<LogitsRows>, Vec<Vec<u32>>), LoweringError> {
     let BakePoint {
         chunked,
         bucket_m,
@@ -1973,6 +2003,8 @@ fn lower(
     // Per command, the plays short of the whole forward that run it: its row's (a row past the
     // walk's runs in every play), and a pre-pass runs in every play a row reusing it runs in.
     let mut live_cmds: Vec<PlayLive> = Vec::with_capacity(rows.len());
+    // Per command, the rows it was lowered from: its own, and each whose command folded into it.
+    let mut rows_cmds: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
     let mut quantized_at: Option<usize> = None;
     // The layer loop, if this tape has one. Set by the `StepRow::Loop` arm below,
     // which records the body instead of unrolling it.
@@ -2150,6 +2182,7 @@ fn lower(
                     cmds.remove(0);
                     if let Some(at) = quantized_at {
                         live_cmds[at] = live_cmds[at].or(live);
+                        rows_cmds[at].push(i as u32);
                     }
                 } else if !cmds.is_empty() {
                     // The 8-row bucket's own wide matvec, and the 16-row bucket's simdgroup GEMM
@@ -2180,6 +2213,7 @@ fn lower(
                     if let Some((at, norm)) = folded {
                         commands[at] = norm;
                         live_cmds[at] = live_cmds[at].or(live);
+                        rows_cmds[at].push(i as u32);
                         // The norm now writes the scratch: it waits for the previous reader.
                         barrier_before[at] = barrier_before[at].max(Fence::Ordered);
                         quantized_at = Some(at);
@@ -2189,6 +2223,7 @@ fn lower(
                 }
                 let n_cmds = cmds.len();
                 live_cmds.extend(std::iter::repeat_n(live, n_cmds));
+                rows_cmds.extend(std::iter::repeat_n(vec![i as u32], n_cmds));
                 // The hazard fences track arena slots, not the shared scratch: a command that
                 // writes it (a W4A8 pre-pass, a split-K partial) must wait for the previous reader.
                 let writes_scratch = if !reuses
@@ -2249,6 +2284,7 @@ fn lower(
         &mut commands,
         &mut barrier_before,
         &mut live_cmds,
+        &mut rows_cmds,
         &mut loops,
         class,
     );
@@ -2258,6 +2294,7 @@ fn lower(
     loops.sort_by_key(|l| (l.start, std::cmp::Reverse(l.period)));
     debug_assert_eq!(commands.len(), barrier_before.len());
     debug_assert_eq!(commands.len(), live_cmds.len());
+    debug_assert_eq!(commands.len(), rows_cmds.len());
     let tape = LoweredMetalTape {
         bucket_m,
         num_arena_slots,
@@ -2272,7 +2309,7 @@ fn lower(
         attn_unfused_scratch_bytes,
         logits_rows: logits_rows.unwrap_or(LogitsRows::Bucket),
     };
-    Ok((tape, logits_rows))
+    Ok((tape, logits_rows, rows_cmds))
 }
 
 /// Two consecutive split-K W4A8 GEMMs of one activation (the same pre-pass scratch, kernel, rows,
@@ -2285,6 +2322,7 @@ fn pair_w4a8_gemms(
     commands: &mut Vec<GatedCommand>,
     barrier_before: &mut Vec<Fence>,
     live_cmds: &mut Vec<PlayLive>,
+    rows_cmds: &mut Vec<Vec<u32>>,
     loops: &mut [super::lowered::TapeLoop],
     class: crate::tape::lowered::GenClass,
 ) {
@@ -2391,6 +2429,8 @@ fn pair_w4a8_gemms(
                 if let Some(fused) = pairs(&commands[i], &commands[j]) {
                     commands[i] = fused;
                     live_cmds[i] = live_cmds[i].or(live_cmds[j]);
+                    let paired = std::mem::take(&mut rows_cmds[j]);
+                    rows_cmds[i].extend(paired);
                     keep[j] = false;
                     break;
                 }
@@ -2420,6 +2460,9 @@ fn pair_w4a8_gemms(
     barrier_before.retain(|_| *k.next().expect("one keep a fence"));
     let mut k = keep.iter();
     live_cmds.retain(|_| *k.next().expect("one keep a live set"));
+    *rows_cmds = (std::mem::take(rows_cmds).into_iter().zip(&keep))
+        .filter_map(|(rows, &kept)| kept.then_some(rows))
+        .collect();
 }
 
 /// Abstract-interpret the row count across the step stream so the

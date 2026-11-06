@@ -4637,6 +4637,33 @@ impl ModelDims {
         self.handles.get(base)
     }
 
+    /// Declare, beside the handles', every bound a tile output of `fuf` names that `model`
+    /// states: the arena's extents (`arena_extent`) are spelled in `__dims` too, so a model has
+    /// one marker per bound. A bucket's own bounds (`num_tokens`, `sk_bucket`: its rows, which
+    /// [`arena_extent`] spells as types of their own) are no model's.
+    pub(crate) fn declare_tile_bounds(&mut self, fuf: &crate::fuf::Fuf, model: &ModelParams) {
+        fn named(dim: &crate::dim::Dim, out: &mut dyn FnMut(&str)) {
+            use crate::dim::Dim;
+            match dim {
+                Dim::Bound(name) => out(name),
+                Dim::Lit(_) => {}
+                Dim::Mul(parts) | Dim::Add(parts) => parts.iter().for_each(|p| named(p, out)),
+                Dim::Div(n, d) | Dim::FloorDiv(n, d) => {
+                    named(n, out);
+                    named(d, out);
+                }
+            }
+        }
+        let shapes = fuf.nodes.iter().flat_map(|n| n.outputs.iter().flatten());
+        for dim in shapes {
+            named(dim, &mut |name| {
+                if model.bounds.contains_key(name) {
+                    self.bounds.insert(name.to_string());
+                }
+            });
+        }
+    }
+
     /// `__dims`: one marker per bound the handles name, carrying `model`'s number for it. A bound
     /// the loader derived (`ModelParams::derived`) is spelled as its derivation over the bounds it
     /// reads, each a marker too, so the derivation's law is the type's: `head_dim` derived as
@@ -4719,17 +4746,193 @@ fn dim_tokens(
     dim: &crate::dim::Dim,
     bounds: &mut std::collections::BTreeSet<String>,
 ) -> Result<TokenStream, String> {
+    dim_type(dim, &mut |name| {
+        bounds.insert(name.to_string());
+        let marker = bound_marker(name);
+        Ok(quote!(__dims::#marker))
+    })
+}
+
+/// ⭐ A MODEL'S ARENA TYPES, EACH DECLARED ONCE: every extent its buckets' tile outputs are, spelled
+/// at a bucket's rows' parameters, as one marker (`E<n>`); every colour its buckets' colourings
+/// make — a slot and the extents it hosts — as one colour type (`K<n>`); and every colouring as one
+/// arena of them (`S<n>`). Buckets whose colourings agree share all three, at their own rows
+/// (`S0<U8, U128>`, their numbers as `typenum` types).
+#[derive(Default)]
+struct ArenaTypes {
+    /// Each extent's marker, by its spelling.
+    extents: BTreeMap<String, String>,
+    /// Each arena value's extent's marker: what the bake names a binding of it by.
+    values: scratchy_subtile::handoff::ArenaExtents,
+    extent_defs: Vec<TokenStream>,
+    /// The extents that compute over a bucket's rows ([`computes_over_rows`]).
+    computed_defs: Vec<TokenStream>,
+    colours: BTreeMap<String, String>,
+    colour_defs: Vec<TokenStream>,
+    arenas: BTreeMap<Vec<String>, String>,
+    arena_defs: Vec<TokenStream>,
+}
+
+impl ArenaTypes {
+    /// The marker of extent `at` (spelled at the rows' parameters).
+    /// `computed`: whether it computes over the rows ([`computes_over_rows`]).
+    fn extent(&mut self, (at, computed): &(TokenStream, bool)) -> Ident {
+        let n = self.extents.len();
+        let defs = match computed {
+            true => &mut self.computed_defs,
+            false => &mut self.extent_defs,
+        };
+        let name = (self.extents.entry(at.to_string())).or_insert_with(|| {
+            let name = format_ident!("E{n}");
+            defs.push(quote!(#name = #at;));
+            name.to_string()
+        });
+        format_ident!("{name}")
+    }
+
+    /// Note arena value `value`'s extent, `at`: its marker is the one a binding of it names.
+    fn value(&mut self, value: scratchy_subtile::handoff::ArenaValue, at: &(TokenStream, bool)) {
+        let marker = self.extent(at).to_string();
+        self.values.insert(value, marker);
+    }
+
+    /// The colour type of slot `slot` hosting the extents `sized` (counted in its bytes) and
+    /// `unsized_`.
+    fn colour(&mut self, slot: u32, sized: &[Ident], unsized_: &[Ident]) -> Ident {
+        let def = quote!(= #slot [#(#sized),*] [#(#unsized_),*]);
+        let n = self.colours.len();
+        let defs = &mut self.colour_defs;
+        let name = (self.colours.entry(def.to_string())).or_insert_with(|| {
+            let name = format_ident!("K{n}");
+            defs.push(quote!(#name #def));
+            name.to_string()
+        });
+        format_ident!("{name}")
+    }
+
+    /// The arena whose slot `k` is `colours[k]`.
+    fn arena(&mut self, colours: &[Ident]) -> Ident {
+        let n = self.arenas.len();
+        let defs = &mut self.arena_defs;
+        let key = colours.iter().map(Ident::to_string).collect();
+        let name = (self.arenas.entry(key)).or_insert_with(|| {
+            let name = format_ident!("S{n}");
+            defs.push(quote!(#name [#(#colours),*]));
+            name.to_string()
+        });
+        format_ident!("{name}")
+    }
+
+    /// The declarations, in the model's `__arena`.
+    fn tokens(&self) -> TokenStream {
+        let (extents, computed) = (&self.extent_defs, &self.computed_defs);
+        let (colours, arenas) = (&self.colour_defs, &self.arena_defs);
+        quote! {
+            ::scratchy_target_metal::arena_extents! { <M, S> [#(#extents)*] [#(#computed)*] }
+            ::scratchy_target_metal::arena_colours! { <M, S> #(#colours)* }
+            ::scratchy_target_metal::arena_schemas! { <M, S> #(#arenas)* }
+        }
+    }
+}
+
+/// Whether an extent of `shape` computes over a bucket's rows: names `num_tokens` or `sk_bucket`
+/// anywhere but as its rows themselves (`Act<M, D>`), so it is an extent only where its dims' laws
+/// hold at the bucket's rows.
+fn computes_over_rows(shape: &[crate::dim::Dim]) -> bool {
+    use crate::dim::Dim;
+    fn names_rows(dim: &Dim) -> bool {
+        match dim {
+            Dim::Bound(name) => name == "num_tokens" || name == "sk_bucket",
+            Dim::Lit(_) => false,
+            Dim::Mul(parts) | Dim::Add(parts) => parts.iter().any(names_rows),
+            Dim::Div(n, d) | Dim::FloorDiv(n, d) => names_rows(n) || names_rows(d),
+        }
+    }
+    match shape {
+        [] => false,
+        [d] => names_rows(d),
+        [rows, rest @ ..] => {
+            let plain_rows = matches!(rows, Dim::Bound(name) if name == "num_tokens");
+            (!plain_rows && names_rows(rows)) || rest.iter().any(names_rows)
+        }
+    }
+}
+
+/// A tile output of `shape` as the arena extent a colour hosts, `Act<rows, columns>`: its first
+/// dim its rows, the product of the rest its columns (a rank-1 value is one row). A bucket's own
+/// bounds are the bucket's rows' types, `num_tokens` as `m` and `sk_bucket` as `sk` (a colour
+/// type's parameters, or one bucket's numbers); any other is the model's `__dims`' marker
+/// ([`ModelDims::declare_tile_bounds`]).
+fn arena_extent(
+    shape: &[crate::dim::Dim],
+    m: &TokenStream,
+    sk: &TokenStream,
+) -> Result<TokenStream, String> {
+    use crate::dim::Dim;
+    let mut bound = |name: &str| -> Result<TokenStream, String> {
+        match name {
+            "num_tokens" => Ok(m.clone()),
+            "sk_bucket" => Ok(sk.clone()),
+            _ => {
+                let marker = bound_marker(name);
+                Ok(quote!(__dims::#marker))
+            }
+        }
+    };
+    let (rows, cols) = match shape {
+        [] => (Dim::Lit(1), Dim::Lit(1)),
+        [d] => (Dim::Lit(1), d.clone()),
+        [r, c] => (r.clone(), c.clone()),
+        [r, rest @ ..] => (r.clone(), Dim::Mul(rest.to_vec())),
+    };
+    let (rows, cols) = (dim_type(&rows, &mut bound)?, dim_type(&cols, &mut bound)?);
+    // `Act` is in scope wherever an extent is spelled (`scratchy_tensors::typed::Act`).
+    Ok(quote!(Act<#rows, #cols>))
+}
+
+/// The shape an arena value of `fuf` has: a tile output's, or — the one graph source a step
+/// names in the arena, the embedded hidden — its `Embed` tile's.
+fn arena_value_shape(
+    fuf: &crate::fuf::Fuf,
+    value: scratchy_subtile::handoff::ArenaValue,
+) -> Result<&crate::dim::Shape, String> {
+    use scratchy_subtile::handoff::ArenaValue;
+    let output = |tile: u32, out: u8| {
+        let node = fuf.nodes.get(tile as usize);
+        node.and_then(|n| n.outputs.get(out as usize))
+            .ok_or_else(|| format!("arena value of tile {tile} output {out}, which has none"))
+    };
+    match value {
+        ArenaValue::Tile { tile, out } => output(tile, out),
+        ArenaValue::Source(_) => {
+            let embed = |n: &&crate::fuf::FufNode| n.op == crate::classified::OpKind::Embed;
+            let mut embeds = fuf.nodes.iter().filter(embed);
+            match (embeds.next(), embeds.next()) {
+                (Some(embed), None) => output(embed.id.0, 0),
+                _ => Err("the embedded hidden is not one `Embed` tile's output".to_string()),
+            }
+        }
+    }
+}
+
+/// A config bound's marker type's name.
+fn bound_marker(name: &str) -> Ident {
+    format_ident!(
+        "{}",
+        scratchy_forward_compiler_frontend::typed_emit::marker(name)
+    )
+}
+
+/// `dim` as a type, each bound it names spelled by `bound`: a product, sum or quotient over the
+/// shared `scratchy_tensors::typed` operators, in the order the dim states it.
+fn dim_type<F: FnMut(&str) -> Result<TokenStream, String>>(
+    dim: &crate::dim::Dim,
+    bound: &mut F,
+) -> Result<TokenStream, String> {
     use crate::dim::Dim;
     let w = quote!(::scratchy_tensors::typed);
     match dim {
-        Dim::Bound(name) => {
-            bounds.insert(name.clone());
-            let marker = format_ident!(
-                "{}",
-                scratchy_forward_compiler_frontend::typed_emit::marker(name)
-            );
-            Ok(quote!(__dims::#marker))
-        }
+        Dim::Bound(name) => bound(name),
         Dim::Lit(n) => {
             u32::try_from(*n).map_err(|_| format!("literal dim {n} exceeds u32"))?;
             Ok(unsigned_tokens(*n))
@@ -4740,19 +4943,19 @@ fn dim_tokens(
                 _ => quote!(Add),
             };
             let types = (parts.iter())
-                .map(|p| dim_tokens(p, bounds))
+                .map(|p| dim_type(p, bound))
                 .collect::<Result<Vec<_>, _>>()?;
             let (last, rest) = types
                 .split_last()
-                .ok_or_else(|| format!("an empty {op} in a weight's shape"))?;
+                .ok_or_else(|| format!("an empty {op} in a shape"))?;
             Ok((rest.iter().rev()).fold(last.clone(), |acc, t| quote!(#w::#op<#t, #acc>)))
         }
         Dim::Div(n, d) => {
-            let (n, d) = (dim_tokens(n, bounds)?, dim_tokens(d, bounds)?);
+            let (n, d) = (dim_type(n, bound)?, dim_type(d, bound)?);
             Ok(quote!(#w::Div<#n, #d>))
         }
         Dim::FloorDiv(n, d) => {
-            let (n, d) = (dim_tokens(n, bounds)?, dim_tokens(d, bounds)?);
+            let (n, d) = (dim_type(n, bound)?, dim_type(d, bound)?);
             Ok(quote!(#w::FloorDiv<#n, #d>))
         }
     }
@@ -14305,8 +14508,9 @@ pub fn emit_model(
     let mut tape_accessors_for_struct: Option<Vec<WeightAccessor>> = None;
     // The fields' typed handles, from the tape's accessor set: the struct holds them, and the
     // metal resolver reaches each through its source slot.
+    // Its `__dims` declares every bound its tile outputs name too: the arena's extents' markers.
     let model_dims = |accs: Option<&[WeightAccessor]>| {
-        accs.map_or_else(ModelDims::default, |accs| {
+        let mut dims = accs.map_or_else(ModelDims::default, |accs| {
             // Each field's codes as its load plan keeps them: the very plan its load is emitted
             // from.
             let embed_affine = embed_is_affine_repr(accs);
@@ -14325,10 +14529,12 @@ pub fn emit_model(
             ModelDims::of(&groups, program, inferred, &codes, &bundles).unwrap_or_else(|e| {
                 panic!("[weights] {}: its weights' types: {e}", model.source_stem)
             })
-        })
+        });
+        dims.declare_tile_bounds(fuf, model);
+        dims
     };
     #[cfg(feature = "metal")]
-    let (mut weights, mut weights_affine_rows) = emit_struct(None, &ModelDims::default());
+    let (mut weights, mut weights_affine_rows) = emit_struct(None, &model_dims(None));
     // ⭐ THE MODEL'S FACTS (#1083), computed ONCE here and threaded to every consumer below:
     // the bridge calls (the spyre weight struct, metal's tape fingerprint, metal's canonical
     // lowering) and the per-canonical `CanonicalParams` impl. Every fact is a field of this
@@ -15056,10 +15262,10 @@ pub fn emit_model(
     let mut metal_arena_bytes_statics: Vec<TokenStream> = Vec::new();
     #[cfg(feature = "metal")]
     let mut metal_tape_cmds = scratchy_target_metal_compiler::static_tape::CommandPool::default();
-    // Each slot's bytes at its largest bucket, and the slots holding a bucket's final hidden
-    // states: what the model's arena ranks are baked from (`ArenaRanks`).
-    let mut metal_ladder_arena: Vec<u64> = Vec::new();
-    let mut metal_hidden_slots: std::collections::BTreeSet<u32> = Default::default();
+    // The most arena slots a bucket has: how many the model's arena ranks rank (`RankedSlots`).
+    let mut metal_arena_slots: u32 = 0;
+    // Every colour and arena the buckets' colourings make, in the model's `__arena`.
+    let mut metal_arena_types = ArenaTypes::default();
     // Whether the model's tapes read a paged KV pool. One that reads none (Splash's DFlash2
     // drafter, whose rings are its KV) holds any pool's block count at its ladder's floor.
     let pool_block_cap = match KvCacheLayers::of(fuf).any() {
@@ -15183,7 +15389,7 @@ pub fn emit_model(
                               terminal_slot: u32,
                               backbone_slot: u32,
                               slots: &crate::weight_vocab::SlotMap|
-         -> (u32, u32, u32, Vec<u64>, u64) {
+         -> (u32, u32, u32, u64, (Ident, Vec<String>)) {
             let in_terminal = |id: TileId, slot: u8| {
                 (slots.iter()).any(|(at, colour)| at == (id, slot) && colour == terminal_slot)
             };
@@ -15206,47 +15412,73 @@ pub fn emit_model(
                 }
                 BackboneLayout::Decoder | BackboneLayout::Encoder => Vec::new(),
             };
-            let mut bucket_arena_bytes: Vec<u64> = vec![0u64; num_slots as usize];
             let mut logits_row_bytes: u64 = 0;
+            // The extents each colour hosts, each once (by its spelling, at the rows' parameters):
+            // those its `Colour::BYTES` is the largest of, and those another size covers — the
+            // logits rows (`logits_row_bytes`), the tiles a bucket that plays no result never
+            // commits, the embedded hidden colour 0 is (`arena_colours!`).
+            let no_slots =
+                || vec![BTreeMap::<String, (TokenStream, bool)>::new(); num_slots as usize];
+            let (mut sized, mut unsized_) = (no_slots(), no_slots());
+            let extent = |shape: &crate::dim::Shape| {
+                let at = arena_extent(shape, &quote!(M), &quote!(S))
+                    .unwrap_or_else(|e| panic!("[metal arena] {}: m={m}: {e}", model.source_stem));
+                (at, computes_over_rows(shape))
+            };
             for ((tile_id, out_slot), color) in slots.iter() {
-                if !plays_result && !commit_tiles.contains(&tile_id) {
-                    continue;
-                }
                 let node = fuf.get(tile_id);
                 let shape = &node.outputs[out_slot as usize];
-                let dims = crate::weight_vocab::eval_shape_with(shape, &bp_bounds)
-                    .expect("a tile output names a bound the model lacks — codegen invariant");
-                // f16 = 2 bytes/element; metal kernels are f16-only.
-                if logits_tiles.contains(&(tile_id, out_slot)) {
+                let e = extent(shape);
+                let value = scratchy_subtile::handoff::ArenaValue::Tile {
+                    tile: tile_id.0,
+                    out: out_slot,
+                };
+                metal_arena_types.value(value, &e);
+                if !plays_result && !commit_tiles.contains(&tile_id) {
+                    unsized_[color as usize].insert(e.0.to_string(), e);
+                } else if logits_tiles.contains(&(tile_id, out_slot)) {
+                    // f16 = 2 bytes/element; metal kernels are f16-only.
+                    let dims = crate::weight_vocab::eval_shape_with(shape, &bp_bounds)
+                        .expect("a tile output names a bound the model lacks — codegen invariant");
                     let row: u64 = dims.iter().skip(1).product();
                     logits_row_bytes = logits_row_bytes.max(row.saturating_mul(2));
-                    continue;
-                }
-                let bytes = dims.into_iter().product::<u64>().saturating_mul(2);
-                let slot_idx = color as usize;
-                if bytes > bucket_arena_bytes[slot_idx] {
-                    bucket_arena_bytes[slot_idx] = bytes;
+                    unsized_[color as usize].insert(e.0.to_string(), e);
+                } else {
+                    sized[color as usize].insert(e.0.to_string(), e);
                 }
             }
-            // Every color must have at least one (tile, slot) pair; if
-            for b in &mut bucket_arena_bytes {
-                if *b == 0 {
-                    *b = 1;
-                }
+            let embedded = scratchy_subtile::handoff::ArenaValue::Source(0);
+            if let (Ok(shape), Some(zero)) =
+                (arena_value_shape(fuf, embedded), unsized_.first_mut())
+            {
+                let e = extent(shape);
+                metal_arena_types.value(embedded, &e);
+                zero.insert(e.0.to_string(), e);
             }
-            if metal_ladder_arena.len() < bucket_arena_bytes.len() {
-                metal_ladder_arena.resize(bucket_arena_bytes.len(), 0);
+            for (sized, unsized_) in sized.iter().zip(&mut unsized_) {
+                unsized_.retain(|e, _| !sized.contains_key(e));
             }
-            for (ladder, &bytes) in metal_ladder_arena.iter_mut().zip(&bucket_arena_bytes) {
-                *ladder = (*ladder).max(bytes);
-            }
-            metal_hidden_slots.insert(backbone_slot);
+            metal_arena_slots = metal_arena_slots.max(num_slots);
+            // The bucket's arena: each slot's colour type, and the arena of them.
+            let colours: Vec<Ident> = (sized.iter().zip(&unsized_).enumerate())
+                .map(|(slot, (sized, unsized_))| {
+                    let mut markers = |extents: &BTreeMap<String, (TokenStream, bool)>| {
+                        let at = extents.values();
+                        at.map(|at| metal_arena_types.extent(at))
+                            .collect::<Vec<_>>()
+                    };
+                    let (sized, unsized_) = (markers(sized), markers(unsized_));
+                    metal_arena_types.colour(slot as u32, &sized, &unsized_)
+                })
+                .collect();
+            let arena = metal_arena_types.arena(&colours);
+            let colours = colours.iter().map(Ident::to_string).collect::<Vec<_>>();
             (
                 num_slots,
                 terminal_slot,
                 backbone_slot,
-                bucket_arena_bytes,
                 logits_row_bytes,
+                (arena, colours),
             )
         };
         // The narrow band's facts: the shared tuple the metal front-end swap wrote (which the
@@ -15255,18 +15487,18 @@ pub fn emit_model(
         // The wide band's: its own canonical's when the bands fold differently at this bucket,
         // the narrow's twin when they fold the same (no routing ops, or the fold refused) —
         // either way the pool picks one row per bucket by its device's band.
+        // `None`: the narrow's twin, whose arena it shares.
         #[cfg(feature = "metal")]
-        let wide = match metal_steps.get(&canonical).and_then(|c| c.wide.as_ref()) {
-            Some(wide) => band_facts(
+        let wide = (metal_steps.get(&canonical).and_then(|c| c.wide.as_ref())).map(|wide| {
+            band_facts(
                 wide.colours.get(),
                 wide.result.index(),
                 wide.hidden.0,
                 &wide.arena,
-            ),
-            None => narrow.clone(),
-        };
+            )
+        });
         #[cfg(not(feature = "metal"))]
-        let wide = narrow.clone();
+        let wide = None;
         // Bake this bucket's tape rungs at expansion — one per device
         // generation, addressing, KV cap and TurboQuant decode heads —
         // every fact baked; the pool picks one. See static_tape.rs.
@@ -15287,18 +15519,37 @@ pub fn emit_model(
                     quote! { &[] }
                 }
                 Some(classed) => {
+                    use scratchy_target_metal_compiler::static_tape::{BandArena, BucketRows};
+                    // Each band's colour types by slot, at the bucket's rows; a wide band that
+                    // folds as the narrow one does is its twin.
+                    let rows = BucketRows::At {
+                        m: m as u32,
+                        sk: wp.sk_bucket as u32,
+                    };
+                    let band_arena = |(_, colours): &(Ident, Vec<String>)| BandArena {
+                        colours: colours.clone(),
+                        rows,
+                    };
+                    let narrow_arena = band_arena(&narrow.4);
+                    let wide_arena = band_arena(&wide.as_ref().unwrap_or(&narrow).4);
                     let input = scratchy_target_metal_compiler::static_tape::BucketLowerInput {
                         steps: &classed.narrow.steps,
                         wide_band: classed.wide.as_ref().map(|wide| {
                             scratchy_target_metal_compiler::static_tape::WideBand {
                                 steps: &wide.steps,
                                 num_arena_slots: wide.colours.get(),
+                                operands: &wide.operands,
+                                arena: &wide_arena,
                             }
                         }),
                         bucket_m: m as u32,
                         num_arena_slots: *num_slots_b,
                         rotary: metal_rotary,
                         cap_ladder: &metal_cap_ladder,
+                        operands: &classed.narrow.operands,
+                        arena: &narrow_arena,
+                        // What each value its steps name is, as its colour hosts it.
+                        extents: &metal_arena_types.values,
                     };
                     scratchy_target_metal_compiler::static_tape::bake_bucket_tapes(
                         mc,
@@ -15346,28 +15597,30 @@ pub fn emit_model(
         };
         // One row per fold band — the wide band's statics under its own names, the tapes and
         // kernels shared: the pick keeps the row whose band the device's class lowers.
+        // A wide band that folds as the narrow one does is its twin.
         let band_rows = [
-            ("Narrow", "METAL_ARENA_BYTES_M", &narrow),
-            ("Wide", "METAL_ARENA_BYTES_WIDE_M", &wide),
+            ("Narrow", &narrow),
+            ("Wide", wide.as_ref().unwrap_or(&narrow)),
         ];
-        for (
-            band,
-            arena_prefix,
-            (num_slots, terminal_slot, backbone_slot, arena_bytes, logits_row_bytes),
-        ) in band_rows
+        for (band, (num_slots, terminal_slot, backbone_slot, logits_row_bytes, (arena, _))) in
+            band_rows
         {
             let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots);
             let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot);
             let backbone_slot_lit = proc_macro2::Literal::u32_unsuffixed(*backbone_slot);
             let logits_row_bytes_lit = proc_macro2::Literal::u64_unsuffixed(*logits_row_bytes);
-            let arena_static_ident = bucket_static_ident(arena_prefix, wp);
-            let arena_bytes_lits = arena_bytes
-                .iter()
-                .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
-            metal_arena_bytes_statics.push(quote! {
-                #[cfg(feature = "metal")]
-                static #arena_static_ident: &[u64] = &[ #(#arena_bytes_lits),* ];
-            });
+            // The band row's arena at the bucket's rows: each slot's bytes are its colour's.
+            let rows = |n: u64| {
+                let path = scratchy_tensors::typed::unsigned_alias_path(n);
+                (path.parse::<TokenStream>()).unwrap_or_else(|e| {
+                    panic!("[metal arena] {}: rows `{path}`: {e}", model.source_stem)
+                })
+            };
+            let (m_rows, sk_rows) = (rows(m), rows(wp.sk_bucket));
+            let arena_bytes = quote! {
+                <__arena::#arena<#m_rows, #sk_rows> as ::scratchy_target_metal::tape::typed::Arena>
+                    ::BYTES
+            };
             let band_ident = proc_macro2::Ident::new(band, proc_macro2::Span::call_site());
             metal_bucket_entries.push(quote! {
                 ::scratchy_target_metal::interpreter::metal::MetalBucketSpec {
@@ -15376,7 +15629,7 @@ pub fn emit_model(
                     num_arena_slots: #num_slots_lit,
                     terminal_slot: #terminal_slot_lit,
                     backbone_slot: #backbone_slot_lit,
-                    arena_bytes: #arena_static_ident,
+                    arena_bytes: #arena_bytes,
                     logits_row_bytes: #logits_row_bytes_lit,
                     backbone: #bb_static,
                     lm_head: #lm_static,
@@ -15394,21 +15647,24 @@ pub fn emit_model(
     // THE ARENA RANKS: the slots by size at their largest bucket, largest first, ties by slot —
     // the order in which another model whose forwards never overlap this one's shares its arena
     // (`ArenaRanks`): every slot as a guest, all but the buckets' final hidden states as a host.
-    // `ArenaRanks::new` checks both against `METAL_BUCKETS` in the `static` they land in.
-    let (metal_ranks_all, metal_ranks_hosting) = {
-        let mut all: Vec<u32> = (0..metal_ladder_arena.len() as u32).collect();
-        all.sort_by_key(|&slot| (std::cmp::Reverse(metal_ladder_arena[slot as usize]), slot));
-        let hosting: Vec<u32> = (all.iter().copied())
-            .filter(|slot| !metal_hidden_slots.contains(slot))
-            .collect();
-        let lits = |slots: Vec<u32>| -> Vec<proc_macro2::Literal> {
-            slots
-                .into_iter()
-                .map(proc_macro2::Literal::u32_unsuffixed)
-                .collect()
-        };
-        (lits(all), lits(hosting))
-    };
+    // Read off `METAL_BUCKETS` as their `static` compiles (`RankedSlots`): each slot's bytes are
+    // its colours'.
+    let metal_ranked_slots = proc_macro2::Literal::usize_unsuffixed(metal_arena_slots as usize);
+    let metal_arena_types = metal_arena_types.tokens();
+    metal_arena_bytes_statics.push(quote! {
+        /// The model's arena: the colours and arenas its buckets' colourings make, and its slots
+        /// ranked by their bytes.
+        #[cfg(feature = "metal")]
+        mod __arena {
+            use super::__dims;
+            use ::scratchy_tensors::typed::Act;
+            #metal_arena_types
+            /// [`super::METAL_BUCKETS`]' arena slots, ranked by the bytes their colours host.
+            pub(super) static RANKED: ::scratchy_target_metal::interpreter::metal::RankedSlots<
+                #metal_ranked_slots,
+            > = ::scratchy_target_metal::interpreter::metal::RankedSlots::of(super::METAL_BUCKETS);
+        }
+    });
 
     // Largest `num_tokens` across all buckets — drives runtime
     // buffer sizing in the metal forward body's `RuntimeFactory`.
@@ -15689,11 +15945,7 @@ pub fn emit_model(
                 ),
                 // Checked against the buckets as this static compiles: every slot of every bucket
                 // ranked once, and no bucket's final hidden states among the hosting ranks.
-                ranks: ::scratchy_target_metal::interpreter::metal::ArenaRanks::new(
-                    &[#(#metal_ranks_all),*],
-                    &[#(#metal_ranks_hosting),*],
-                    METAL_BUCKETS,
-                ),
+                ranks: __arena::RANKED.ranks(METAL_BUCKETS),
             };
 
         /// Largest `num_tokens` tape_index across [`METAL_BUCKETS`]. The
