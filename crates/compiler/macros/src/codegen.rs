@@ -13503,12 +13503,19 @@ fn dump_wavefront_mega(
             default_decode_groups.push((0u32, 0u32, 0u32, String::new()));
         }
 
-        let prefill_head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
+        // ⭐ THE HEAD WIDTH IS MINTED AS A TYPE at the bake's one door: whole sticks or a BUILD
+        // ERROR that names the model and its head_dim. A model with no attention (no head_dim
+        // bound) keeps the sub-blocked ceiling — there is no head to type.
+        let prefill_head_width = model.bounds.get("head_dim").map(|&hd| {
+            scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(hd, &model.name)
+        });
         // The rungs THIS model bakes, by the same law the emitter forms the causal block with.
         let rung_admitted = |r: u32| {
             r <= SUB_BLOCKED_PREFILL_CEILING
-                || scratchy_subtile::sdsc_abstract::NewBlockForm::of(r, prefill_head_dim, false)
-                    == scratchy_subtile::sdsc_abstract::NewBlockForm::Chunk
+                || prefill_head_width.is_some_and(|hd| {
+                    scratchy_subtile::sdsc_abstract::NewBlockForm::of(r, hd, false)
+                        == scratchy_subtile::sdsc_abstract::NewBlockForm::Chunk
+                })
         };
         let admitted_ceiling = PREFILL_RUNGS
             .into_iter()

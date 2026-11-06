@@ -1112,7 +1112,7 @@ pub fn lower_decode_to_wavefront(
                     sliding_window_bound(tile, bx.model, node.op)?
                 } else {
                     // Causal: unused below; a placeholder value that never escapes.
-                    std::num::NonZeroU32::new(1).expect("1 is nonzero")
+                    std::num::NonZeroU32::MIN
                 };
                 let mask = match node.op {
                     OpKind::SlidingAttention | OpKind::SinkSlidingAttention => {
@@ -1184,7 +1184,7 @@ pub fn lower_decode_to_wavefront(
                     sliding_window_bound(tile, bx.model, node.op)?
                 } else {
                     // Causal: unused below; a placeholder value that never escapes.
-                    std::num::NonZeroU32::new(1).expect("1 is nonzero")
+                    std::num::NonZeroU32::MIN
                 };
                 let mask = match node.op {
                     OpKind::SharedSlidingAttention => AttnMask::SlidingWindow { window },

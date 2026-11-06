@@ -35,6 +35,18 @@
 //! These tests pin that identity against the REAL `page_base_bytes`, so if either side's arithmetic
 //! is ever changed the correspondence fails here rather than on the card.
 
+/// The test pool: head count and width as the raw fixture numbers, minted through the pool's
+/// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
+fn pool(nkvh: usize, hd: usize) -> scratchy_subtile::sdsc_abstract::PagedKvPool {
+    scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+        std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
+            .expect("a fixture pool has heads"),
+        scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks(
+            u32::try_from(hd).expect("a fixture head width fits a u32"),
+        ),
+    )
+}
+
 use scratchy_target_spyre::fold_plan::{
     Bytes, PageSlots, RowCursors, RowIdx, RowPage, SessionKv, page_base_bytes,
 };
@@ -268,13 +280,13 @@ fn page_addresses_are_uniformly_spaced_however_scrambled_the_table_is() {
 /// over a deliberately churned table, at both baked head widths.
 #[test]
 fn the_entry_factor_makes_the_two_addressings_the_same_byte() {
-    use scratchy_subtile::sdsc_abstract::{PagedKvPool, gather_entries_per_page};
+    use scratchy_subtile::sdsc_abstract::gather_entries_per_page;
 
     // BOTH baked head widths: the factor carries `hd` (a stick block is `hd * 64`), so a test at one
     // width would pass on a hardcoded 4096 — which is exactly what every doc comment in the tree says.
     for (nkvh, hd) in [(8usize, 64usize), (8, 128)] {
-        let pool = PagedKvPool::new(nkvh, hd);
-        let layer_page_bytes = pool.layer_stride() as u64 * 2;
+        let pool = pool(nkvh, hd);
+        let layer_page_bytes = pool.layer_stride() * 2;
         let page_stride = ITERS as u64 * layer_page_bytes;
 
         let s = SessionKv {
@@ -336,8 +348,8 @@ fn the_entry_factor_makes_the_two_addressings_the_same_byte() {
 /// first, uniformly, silently. There is no safe default, so there is a `None`.
 #[test]
 fn a_page_that_is_not_whole_entries_has_no_index_at_all() {
-    use scratchy_subtile::sdsc_abstract::{PagedKvPool, gather_entries_per_page};
-    let pool = PagedKvPool::new(8, 64);
+    use scratchy_subtile::sdsc_abstract::gather_entries_per_page;
+    let pool = pool(8, 64);
     assert!(
         gather_entries_per_page(pool.stick_block_bytes() + 1, pool).is_none(),
         "a page one byte past a whole entry cannot be named by any integer index"
@@ -371,12 +383,12 @@ fn a_page_that_is_not_whole_entries_has_no_index_at_all() {
 #[test]
 fn the_index_is_flat_over_the_scratch_rows_one_block_per_pass() {
     use scratchy_subtile::sdsc_abstract::{
-        GatherScratch, PAGE_MASK_COLS, POOL_STICK, PagedKvPool, PrefixMaskShape, QueryRowCount,
-        SlotCount, SlotWindow, gather_entries_per_page, gather_index_table,
+        GatherScratch, PAGE_MASK_COLS, POOL_STICK, PrefixMaskShape, QueryRowCount, SlotCount,
+        SlotWindow, gather_entries_per_page, gather_index_table,
     };
     // Two kv heads and one 64-slot window keeps the arithmetic readable; the request axis is what the
     // order is about, so it is the axis with two values.
-    let pool = PagedKvPool::new(2, 64);
+    let pool = pool(2, 64);
     let scratch = GatherScratch::of_fold_pass(
         pool,
         SlotWindow::count_in(SlotCount::new(64)),
@@ -494,7 +506,7 @@ fn the_row_of_a_coordinate_does_not_depend_on_how_many_windows_the_scratch_holds
         GatherScratch, PAGE_MASK_COLS, POOL_STICK, PagedKvPool, PrefixMaskShape, QueryRowCount,
         SlotCount, SlotWindow, gather_entries_per_page, gather_index_table,
     };
-    let pool = PagedKvPool::new(8, 64);
+    let pool = pool(8, 64);
     let mq = QueryRowCount::of_mq(2);
     // THE HOST's scratch — the rung's CEILING sweep, which is what `DecodeRung::swept` carries.
     let ceiling = GatherScratch::of_fold_pass(
@@ -522,7 +534,7 @@ fn the_row_of_a_coordinate_does_not_depend_on_how_many_windows_the_scratch_holds
             body.windows(),
             ceiling.windows()
         );
-        for kvh in 0..body.nkvh() {
+        for kvh in 0..body.nkvh().get() {
             for w in 0..body.windows() {
                 for r in 0..body.mq() {
                     assert_eq!(
@@ -551,7 +563,7 @@ fn the_row_of_a_coordinate_does_not_depend_on_how_many_windows_the_scratch_holds
         for p in 0..2usize {
             for r in 0..body.mq() {
                 let phys = tables[r as usize][p];
-                for kvh in 0..body.nkvh() {
+                for kvh in 0..body.nkvh().get() {
                     for w in 0..body.windows() {
                         let i = body.row_of(kvh, w, r).expect("in range") as usize;
                         let want = phys * per_page.get()

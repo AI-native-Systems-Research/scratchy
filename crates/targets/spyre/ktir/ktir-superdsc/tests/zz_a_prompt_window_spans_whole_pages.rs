@@ -362,7 +362,11 @@ fn a_short_last_chunk_maps_no_page_past_its_real_rows() {
 /// the window passes, and so does a sub-blocked model's own shorter ladder.
 #[test]
 fn a_chunk_form_ladder_baked_short_of_the_window_refuses() {
-    let chunk_form = NewBlockForm::of(WINDOW, 64, false) == NewBlockForm::Chunk;
+    let chunk_form = NewBlockForm::of(
+        WINDOW,
+        ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(64),
+        false,
+    ) == NewBlockForm::Chunk;
     assert!(
         chunk_form,
         "granite-2b's causal block is chunk-formed at the window"

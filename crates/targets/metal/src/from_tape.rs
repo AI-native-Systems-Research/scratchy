@@ -112,7 +112,7 @@ pub enum TapeItem {
 /// spyre's substrate wants 128-column pages; metal's kernels take a whole RmsNorm and a whole
 /// rope. Same builder, same tape, different `nb`.
 pub fn graph_for_metal(input: &scratchy_subtile::lower::LoweringInput) -> SubtileIR {
-    let nb = std::num::NonZeroU32::new(u32::MAX).expect("u32::MAX != 0");
+    let nb = std::num::NonZeroU32::MAX;
     scratchy_subtile::subtile_ir::lower_region(input, nb)
 }
 

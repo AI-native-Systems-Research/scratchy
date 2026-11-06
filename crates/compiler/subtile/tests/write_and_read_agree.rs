@@ -14,8 +14,20 @@
 //! Checked at hd=64 AND hd=128, because a stick width standing in for a head width is the other way this
 //! family of bugs shows up, and those two are equal only at 64.
 
-use scratchy_subtile::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot, PagedKvPool};
+use scratchy_subtile::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot};
 use std::num::NonZeroU32;
+
+/// The test pool: head count and width as the raw fixture numbers, minted through the pool's
+/// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
+fn pool(nkvh: usize, hd: usize) -> scratchy_subtile::sdsc_abstract::PagedKvPool {
+    scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+        std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
+            .expect("a fixture pool has heads"),
+        scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks(
+            u32::try_from(hd).expect("a fixture head width fits a u32"),
+        ),
+    )
+}
 
 fn head(i: u32, nkvh: u32) -> KvHead {
     KvHead::new(i, NonZeroU32::new(nkvh).unwrap()).expect("head in range")
@@ -24,7 +36,7 @@ fn head(i: u32, nkvh: u32) -> KvHead {
 #[test]
 fn the_kt_write_offset_is_the_same_address_the_fold_reads() {
     for (nkvh, hd) in [(8usize, 64usize), (8, 128), (4, 128)] {
-        let p = PagedKvPool::new(nkvh, hd);
+        let p = pool(nkvh, hd);
         for kvh in 0..nkvh {
             // Slots spanning several prefill chunks (96 rows each) and several 64-slot fold blocks.
             for slot in [0usize, 1, 63, 64, 95, 96, 128, 191, 192, 255] {
@@ -49,7 +61,7 @@ fn the_kt_write_offset_is_the_same_address_the_fold_reads() {
 #[test]
 fn the_v_write_offset_is_the_same_address_the_fold_reads() {
     for (nkvh, hd) in [(8usize, 64usize), (8, 128), (4, 128)] {
-        let p = PagedKvPool::new(nkvh, hd);
+        let p = pool(nkvh, hd);
         for kvh in 0..nkvh {
             for slot in [0usize, 1, 63, 64, 95, 96, 128, 191, 192, 255] {
                 for d in [0usize, 1, 63, hd - 1] {

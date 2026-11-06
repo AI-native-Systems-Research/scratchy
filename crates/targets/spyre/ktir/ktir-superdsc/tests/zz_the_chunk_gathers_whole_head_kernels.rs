@@ -6,6 +6,18 @@
 
 use ktir_superdsc::sdsc_abstract::{ChunkScratch, PagedKvPool};
 
+/// The test pool: head count and width as the raw fixture numbers, minted through the pool's
+/// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
+fn pool(nkvh: usize, hd: usize) -> ktir_superdsc::sdsc_abstract::PagedKvPool {
+    ktir_superdsc::sdsc_abstract::PagedKvPool::new(
+        std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
+            .expect("a fixture pool has heads"),
+        ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(
+            u32::try_from(hd).expect("a fixture head width fits a u32"),
+        ),
+    )
+}
+
 const NKVH: usize = 8;
 const STICK: u64 = 64;
 const POOL_PAGE_SLOTS: u64 = PagedKvPool::POOL_PAGE_SLOTS.get() as u64;
@@ -33,7 +45,7 @@ fn source_of(
 #[test]
 fn each_kv_head_gathers_whole_chunk_kernels_at_every_admitted_head_dim() {
     for hd in [64u64, 128, 256] {
-        let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, hd as usize), 2)
+        let chunk = ChunkScratch::of_chunk(pool(NKVH, usize::try_from(hd).unwrap()), 2)
             .unwrap_or_else(|| panic!("hd {hd}: a two-page chunk is admitted"));
         let slots = chunk.slots() as u64;
         let hbe = chunk.plane().head_block_elems();
@@ -69,7 +81,7 @@ fn each_kv_head_gathers_whole_chunk_kernels_at_every_admitted_head_dim() {
 /// one-slab form; above it V reads its own run after K's, and the host stages both.
 #[test]
 fn v_reads_its_own_index_run_only_above_one_slab() {
-    let at = |hd: usize| ChunkScratch::of_chunk(PagedKvPool::new(NKVH, hd), 4).unwrap();
+    let at = |hd: usize| ChunkScratch::of_chunk(pool(NKVH, hd), 4).unwrap();
     let one = at(64);
     assert_eq!(one.value_index_base(), 0);
     assert_eq!(one.table_sticks(), one.index_sticks());
@@ -88,5 +100,5 @@ fn v_reads_its_own_index_run_only_above_one_slab() {
 /// the model keeps the per-page fold, as a build-time fact.
 #[test]
 fn a_head_dim_past_the_page_is_refused() {
-    assert!(ChunkScratch::of_chunk(PagedKvPool::new(NKVH, 512), 2).is_none());
+    assert!(ChunkScratch::of_chunk(pool(NKVH, 512), 2).is_none());
 }

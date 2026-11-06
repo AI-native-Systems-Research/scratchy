@@ -4787,8 +4787,11 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         layout,
         rows_are_requests,
     } = a;
-    let hd = HD;
-    if hd == 0 || !total.is_multiple_of(hd) {
+    // ⭐ THE HEAD WIDTH IS A TYPE — nonzero and a whole number of sticks by construction, so the
+    // old `hd == 0` and part-stick cases cannot be written here at all.
+    let hdw = crate::sdsc_abstract::HeadWidth::of_whole_sticks(HD);
+    let hd = hdw.get();
+    if !total.is_multiple_of(hd) {
         return err(format!(
             "RopeRotate t{t}: output cols {total} not a multiple of head_dim {hd}"
         ));
@@ -4808,13 +4811,12 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
     // (rot slab s = ±x slab s±n_slabs/2), which needs half=hd/2 to be a whole number of sticks, i.e.
     // n_slabs even (hd a multiple of 2·stick) — true for every real hd>64 (128/256/512). Guard only the
     // odd-n_slabs case (never a real head_dim) as a build error (not an on-card crash).
-    if hd > Fp16::ELEMS_PER_STICK && !(hd / Fp16::ELEMS_PER_STICK).is_multiple_of(2) {
+    if hdw.sticks() > 1 && !hdw.sticks().is_multiple_of(2) {
         return err(format!(
-            "RoPE prefill (t{t}, mq={mq}): head_dim {hd} > stick {stk} with an ODD stick count \
-             ({ns}); the rotate-half slab-swap needs half=hd/2 to be a whole number of sticks (hd a \
-             multiple of 2·stick). Real head_dims (128/256/512) satisfy this.",
-            stk = Fp16::ELEMS_PER_STICK,
-            ns = hd / Fp16::ELEMS_PER_STICK,
+            "RoPE prefill (t{t}, mq={mq}): head_dim {hd} spans an ODD stick count ({ns}); the \
+             rotate-half slab-swap needs half=hd/2 to be a whole number of sticks (an even stick \
+             count). Real head_dims (128/256/512) satisfy this.",
+            ns = hdw.sticks(),
         ));
     }
     // ⭐ THE CLASS TID, NOT THE BARE SENTINEL — the ONE P this rope's head dim class reads. A uniform
@@ -4924,8 +4926,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         ops.push(assemble_matmul_off(
             &format!("rope_rot_o{t}"),
             crate::sdsc_abstract::MatM::of_head_major_rows(rows),
-            crate::sdsc_abstract::MatN::of_head_dim(hd),
-            crate::sdsc_abstract::MatK::of_head_dim(hd),
+            crate::sdsc_abstract::MatN::of_head_dim(hdw),
+            crate::sdsc_abstract::MatK::of_head_dim(hdw),
             crate::sdsc_abstract::MatY::unbatched(),
             crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                 bmm_site::TapeLoweringSite::witness(),
@@ -4955,7 +4957,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         // The collapse's typed extents: `rows` is the head-major-collapsed view's row extent
         // (`heads*mq`, where `heads` may be nqh or nkvh), swept head-dim wide.
         let hm_rows = crate::sdsc_abstract::RowCount::of_head_major_rows(rows);
-        let hd_cols = crate::sdsc_abstract::BlockCols::of_head_dim(hd);
+        let hd_cols = crate::sdsc_abstract::BlockCols::of_head_dim(hdw);
         ops.push(pw2(
             &format!("rope_xc_o{t}"),
             "multiply",
@@ -5009,7 +5011,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
     //
     // The body is already row-batched over `mq`, so `mq == 1` is one row and needs no special case.
     // head_dim 64 never reaches here (`hd > stick` is false), so granite-3.1-2b is untouched.
-    if hd > Fp16::ELEMS_PER_STICK {
+    if hdw.sticks() > 1 {
         let stk = Fp16::ELEMS_PER_STICK;
         let (hd_u, stk_u) = (hd as usize, stk as usize);
         let n_slabs = hd_u / stk_u;
@@ -5123,7 +5125,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             let a_place = crate::sdsc_abstract::OperandPlacement::of_token_stream_by_slab(
                 crate::sdsc_abstract::QueryRowCount::of_mq(mq),
                 heads,
-                hd,
+                hdw,
                 0,
                 0,
                 p_in as u32,
@@ -5132,7 +5134,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             let o_place = crate::sdsc_abstract::OperandPlacement::of_token_stream_by_slab(
                 crate::sdsc_abstract::QueryRowCount::of_mq(mq),
                 heads,
-                hd,
+                hdw,
                 0,
                 0,
                 s as u32,
@@ -5173,8 +5175,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 crate::sdsc_abstract::MatM::of_query_rows(
                     crate::sdsc_abstract::QueryRowCount::of_mq(mq),
                 ),
-                crate::sdsc_abstract::MatN::of_head_dim(hd),
-                crate::sdsc_abstract::MatK::of_head_dim(hd),
+                crate::sdsc_abstract::MatN::of_head_dim(hdw),
+                crate::sdsc_abstract::MatK::of_head_dim(hdw),
                 crate::sdsc_abstract::MatY::unbatched(),
                 crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                     bmm_site::TapeLoweringSite::witness(),
@@ -5339,8 +5341,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         ops.push(assemble_matmul_off(
             &format!("rope_rot_o{t}"),
             crate::sdsc_abstract::MatM::of_token_rows(heads * mq),
-            crate::sdsc_abstract::MatN::of_head_dim(hd),
-            crate::sdsc_abstract::MatK::of_head_dim(hd),
+            crate::sdsc_abstract::MatN::of_head_dim(hdw),
+            crate::sdsc_abstract::MatK::of_head_dim(hdw),
             crate::sdsc_abstract::MatY::unbatched(),
             crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                 bmm_site::TapeLoweringSite::witness(),
@@ -5429,8 +5431,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             ops.push(assemble_matmul_off(
                 &format!("rope_rot_r{r}_h{h}_o{t}"),
                 crate::sdsc_abstract::MatM::single_row(),
-                crate::sdsc_abstract::MatN::of_head_dim(hd),
-                crate::sdsc_abstract::MatK::of_head_dim(hd),
+                crate::sdsc_abstract::MatN::of_head_dim(hdw),
+                crate::sdsc_abstract::MatK::of_head_dim(hdw),
                 crate::sdsc_abstract::MatY::unbatched(),
                 crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                     bmm_site::TapeLoweringSite::witness(),

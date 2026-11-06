@@ -94,7 +94,6 @@ fn head_base_comes_from_the_nest_at_both_head_dims() {
 /// reason, so nothing connected it to the format's lane count.
 #[test]
 fn head_major_collapse_is_valid_exactly_at_one_stick_per_head() {
-    type S = Shape<0, 0, 0, 0>;
     assert!((64 == Df::Fp16.elems_per_stick()), "one fp16 stick");
     assert!(
         !(128 == Df::Fp16.elems_per_stick()),

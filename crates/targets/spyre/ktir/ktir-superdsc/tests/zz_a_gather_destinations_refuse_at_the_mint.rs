@@ -32,9 +32,20 @@ use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_gather_copy, gather_copy_opspec};
 use ktir_superdsc::place::{PlaceId, SynthRole};
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
+
+/// The test pool: head count and width as the raw fixture numbers, minted through the pool's
+/// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
+fn pool(nkvh: usize, hd: usize) -> ktir_superdsc::sdsc_abstract::PagedKvPool {
+    ktir_superdsc::sdsc_abstract::PagedKvPool::new(
+        std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
+            .expect("a fixture pool has heads"),
+        ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(
+            u32::try_from(hd).expect("a fixture head width fits a u32"),
+        ),
+    )
+}
 use ktir_superdsc::sdsc_abstract::{
-    ChunkLx, ChunkRowKind, ChunkScratch, GatherCopy, GatherDest, LxDest, PageScratch, PagedKvPool,
-    QueryRowCount,
+    ChunkLx, ChunkRowKind, ChunkScratch, GatherCopy, GatherDest, LxDest, PageScratch, QueryRowCount,
 };
 use ktir_superdsc::superdsc_opspec::{
     DestEntry, Df, EntryBase, GatherIndex, GatherRun, KernelAxis, OpSpec, PageExtent,
@@ -219,7 +230,7 @@ fn declare_gather_rig(layout: &BundleLayout, cp: GatherCopy) -> (String, String)
 /// control is the placement the copy's own law states: it builds.
 #[test]
 fn a_destination_past_its_placement_refuses() {
-    let pool = PagedKvPool::new(8, 64);
+    let pool = pool(8, 64);
     let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(8))
         .expect("granite's geometry admits the page copy");
     let cp = scratch
@@ -265,7 +276,7 @@ fn a_destination_past_its_placement_refuses() {
 /// The first ladder width whose value leg stays in LX, with one of its core-local copies — the
 /// shipped chunk form past 8 pages, minted by the same `lx_form` the emission calls.
 fn an_lx_form() -> (ChunkLx, GatherCopy) {
-    let pool = PagedKvPool::new(8, 64);
+    let pool = pool(8, 64);
     for &pages in &ChunkScratch::LADDER {
         let Some(lx) = ChunkScratch::of_chunk(pool, pages)
             .and_then(|c| c.lx_form(ChunkRowKind::OneRequest, 0, 0))
