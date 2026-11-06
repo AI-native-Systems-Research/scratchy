@@ -27,7 +27,8 @@ def block():
 def size(mem_gb, full, asked=""):
     """(tasks, limit seconds, exit code) the block sets on a Mac of mem_gb, as asked."""
     preamble = (
-        "LARGE_GB=64; ACCURACY_ALL=2417; ACCURACY_SMALL=400; ACCURACY_TIMEOUT_S=0; "
+        "LARGE_GB=64; ACCURACY_ALL=2417; ACCURACY_SMALL=400; ACCURACY_QUICK=100; "
+        "ACCURACY_TIMEOUT_S=0; "
         f"MEM_GB={mem_gb}; FULL={int(full)}; ACCURACY_TASKS='{asked}'\n"
     )
     out = subprocess.run(
@@ -49,13 +50,16 @@ class AccuracySize(unittest.TestCase):
         self.assertEqual(size(36, True), (400, 7200, 0), "the M3 Pro")
         self.assertEqual(size(32, True)[0], 400, "the base M5")
 
-    def test_a_quick_run_has_no_accuracy_cell(self):
-        self.assertEqual(size(64, False), (0, 2400, 0))
+    def test_a_quick_run_asks_100_on_any_mac(self):
+        self.assertEqual(size(64, False), (100, 2400, 0))
+        self.assertEqual(size(36, False), (100, 2400, 0))
+        self.assertEqual(size(32, False)[0], 100)
 
     def test_a_count_or_all_overrides_the_machine(self):
         self.assertEqual(size(36, True, "100"), (100, 2400, 0), "at least 2400 s")
         self.assertEqual(size(36, False, "all")[0], 2417)
         self.assertEqual(size(64, True, "0")[0], 0)
+        self.assertEqual(size(36, False, "0")[0], 0, "none at all")
 
     def test_anything_else_is_refused(self):
         self.assertEqual(size(36, True, "lots")[2], 2)

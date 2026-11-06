@@ -301,25 +301,26 @@ UNPINNED=0
 SCALING=1
 # The default sweep is real dataset tasks (the tasks axis); --random runs the random-token grid.
 SCALE_AXES="tasks"
-# The dataset workloads, by run kind: a quick run's small set, a full run's five.
-# Each runs at every --scale-grid-conc users count. rag-spans, scratchy's own passage reuse,
-# runs on scratchy only, next to rag.
-WORKLOADS="sharegpt,rag,sharegpt-multi-turn"
-# LongBench is not among them: its shortest prompts run to 32k tokens, past the grid's 8k
-# (#939), so not one of its tasks fits. `--workloads longbench --scale-grid-input ...,32768`
-# still runs it.
-(( FULL )) && WORKLOADS="sharegpt,rag,sharegpt-multi-turn,shared-prefix,shared-prefix-control"
-WORKLOADS_SCRATCHY="rag-spans"
-# --full: one more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count,
-# drawn from all of MuSiQue's dev set in its mix of 2-, 3- and 4-hop questions (bench serve
-# stratifies by hops), as every RAG cell's are. Its timing is not compared. On a Mac of LARGE_GB
-# or more, the whole dev set: every one of its 2,417 questions, about 2.5 to 3 hours an engine a
-# model. On a smaller Mac, 400 of them, about 25 to 40 minutes, within about 5 points either way
-# at 60% right. --accuracy-tasks N asks for N instead, 0 for none; all asks for the whole set.
-# Set once the Mac's memory is read (below).
+# The dataset workloads: MuSiQue alone (rag), on a quick run and a full run alike, at every
+# --scale-grid-conc users count; a full run adds its accuracy cell (below). The others are run
+# only by name: --workloads sharegpt,sharegpt-multi-turn for chat and conversations,
+# shared-prefix,shared-prefix-control for prefix reuse, longbench for long documents (its
+# shortest prompts run to 32k tokens, past the grid's 8k, so with --scale-grid-input ...,32768),
+# and --workloads-scratchy rag-spans for scratchy's own passage reuse.
+WORKLOADS="rag"
+WORKLOADS_SCRATCHY=""
+# One more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count, drawn
+# from all of MuSiQue's dev set in its mix of 2-, 3- and 4-hop questions (bench serve stratifies
+# by hops), as every RAG cell's are. Its timing is not compared. A quick run's is 100 tasks, about
+# 6 to 10 minutes a model, within about 10 points either way at 60% right: enough to see scratchy
+# lose accuracy. A full run's, on a Mac of LARGE_GB or more, is the whole dev set, every one of
+# its 2,417 questions, about 2.5 to 3 hours an engine a model; on a smaller Mac, 400 of them,
+# about 25 to 40 minutes, within about 5 points. --accuracy-tasks N asks for N instead, 0 for
+# none; all asks for the whole set. Set once the Mac's memory is read (below).
 ACCURACY_TASKS=""
 ACCURACY_ALL=2417
 ACCURACY_SMALL=400
+ACCURACY_QUICK=100
 # Its limit: 18 s a task, at least 2400 s, so a slow model is not cut off (gpt-oss-20b took about
 # 6 s a task at 4 users on the M3 Pro, its answers reasoning to their cap). Still a limit, for a
 # hung server. --accuracy-timeout-s S sets it.
@@ -417,6 +418,7 @@ while [[ $# -gt 0 ]]; do
         --scale-axes)        SCALE_AXES="$2"; shift 2 ;;
         --random)            SCALE_AXES="grid"; shift ;;   # the random-token grid, not datasets
         --workloads)         WORKLOADS="$2"; shift 2 ;;
+        --workloads-scratchy) WORKLOADS_SCRATCHY="$2"; shift 2 ;;
         --scale-conc)        SCALE_CONC="$2"; shift 2 ;;
         --scale-input)       SCALE_INPUT="$2"; shift 2 ;;
         --scale-output)      SCALE_OUTPUT="$2"; shift 2 ;;
@@ -449,11 +451,11 @@ done
 # Every Mac runs the small set; its memory picks only the grid's prompts (below).
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 # The accuracy cell's size: as asked, else on --full the whole dev set on a large Mac and 400
-# on a smaller one, else none.
+# on a smaller one, else a quick run's 100.
 if [[ "${ACCURACY_TASKS}" == all ]]; then
     ACCURACY_TASKS="${ACCURACY_ALL}"
 elif [[ -z "${ACCURACY_TASKS}" ]]; then
-    ACCURACY_TASKS=0
+    ACCURACY_TASKS="${ACCURACY_QUICK}"
     if (( FULL )); then
         if (( MEM_GB >= LARGE_GB )); then ACCURACY_TASKS="${ACCURACY_ALL}"; else ACCURACY_TASKS="${ACCURACY_SMALL}"; fi
     fi
@@ -1440,7 +1442,7 @@ run_scale_cells() { # prefix restart-function full-length [axes]
     local -a xs os
     if [[ "${axes}" == *",tasks,"* ]]; then
         local w c; local -a ws cs
-        IFS=',' read -r -a ws <<<"${WORKLOADS}${cell_scratchy:+,${WORKLOADS_SCRATCHY}}"
+        IFS=',' read -r -a ws <<<"${WORKLOADS}${cell_scratchy:+${WORKLOADS_SCRATCHY:+,${WORKLOADS_SCRATCHY}}}"
         IFS=',' read -r -a cs <<<"${GRID_CONC_LIST}"
         if (( OPEN_LOOP )); then
             local -a steps; IFS=',' read -r -a steps <<<"${TASK_RATE_STEPS}"
@@ -1460,7 +1462,7 @@ run_scale_cells() { # prefix restart-function full-length [axes]
             # hand before a larger users count can run a server out of memory.
             for c in "${cs[@]}"; do for w in "${ws[@]}"; do run_task_cell "${prefix}" "${w}" "${c}"; done; done
         fi
-        # --full's accuracy cell, at the largest users count: the fewest seconds for its tasks.
+        # The accuracy cell, at the largest users count: the fewest seconds for its tasks.
         if (( ACCURACY_TASKS > 0 )); then run_task_cell "${prefix}" rag-accuracy "${cs[${#cs[@]}-1]}"; fi
     fi
     if [[ "${axes}" == *",conc,"* ]]; then
