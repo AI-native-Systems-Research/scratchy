@@ -784,9 +784,17 @@ impl<T: Dim, D: Dim> Extent for Act<T, D> {
     const ELEMS: u64 = <T as DimN>::N as u64 * <D as DimN>::N as u64;
 }
 
-/// An arena colour that holds extent `A` at some point of its tape: what the colouring assigned
-/// it. A buffer read or written as `A` must be a colour that hosts `A`.
-pub trait Hosts<A: Extent> {}
+/// An extent of a model's arena, as a marker type of its own: the extent it is at a bucket's rows
+/// `M` (its `sk_bucket` `S`). A marker, not the extent's type, is what a colour hosts: two
+/// extents whose types agree at some bucket's rows (`[M, D]` and `[1, D]`, where `M` is 1) are
+/// still two markers, so their hosts never overlap.
+pub trait ExtentAt<M, S> {
+    type At: Extent;
+}
+
+/// An arena colour that holds extent `E` (an [`ExtentAt`] marker) at some point of its tape: what
+/// the colouring assigned it. A buffer read or written as `E` must be a colour that hosts `E`.
+pub trait Hosts<E> {}
 
 #[cfg(test)]
 mod tests {

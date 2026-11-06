@@ -4753,31 +4753,47 @@ fn dim_tokens(
     })
 }
 
-/// ⭐ A MODEL'S ARENA TYPES, EACH DECLARED ONCE: every colour its buckets' colourings make — a slot
-/// and the extents it hosts, spelled at a bucket's rows' parameters — as one colour type
-/// (`K<n>`), and every colouring as one arena of them (`S<n>`). Buckets whose colourings agree
-/// share both, at their own rows (`S0<U8, U128>`, their numbers as `typenum` types).
+/// ⭐ A MODEL'S ARENA TYPES, EACH DECLARED ONCE: every extent its buckets' tile outputs are, spelled
+/// at a bucket's rows' parameters, as one marker (`E<n>`); every colour its buckets' colourings
+/// make — a slot and the extents it hosts — as one colour type (`K<n>`); and every colouring as one
+/// arena of them (`S<n>`). Buckets whose colourings agree share all three, at their own rows
+/// (`S0<U8, U128>`, their numbers as `typenum` types).
 #[derive(Default)]
 struct ArenaTypes {
-    colours: BTreeMap<String, Ident>,
+    /// Each extent's marker, by its spelling.
+    extents: BTreeMap<String, String>,
+    extent_defs: Vec<TokenStream>,
+    colours: BTreeMap<String, String>,
     colour_defs: Vec<TokenStream>,
-    arenas: BTreeMap<Vec<String>, Ident>,
+    arenas: BTreeMap<Vec<String>, String>,
     arena_defs: Vec<TokenStream>,
 }
 
 impl ArenaTypes {
-    /// The colour type of slot `slot` hosting `sized` (counted in its bytes) and `unsized_`.
-    fn colour(&mut self, slot: u32, sized: &[TokenStream], unsized_: &[TokenStream]) -> Ident {
+    /// The marker of extent `at` (spelled at the rows' parameters).
+    fn extent(&mut self, at: &TokenStream) -> Ident {
+        let n = self.extents.len();
+        let defs = &mut self.extent_defs;
+        let name = (self.extents.entry(at.to_string())).or_insert_with(|| {
+            let name = format_ident!("E{n}");
+            defs.push(quote!(#name = #at;));
+            name.to_string()
+        });
+        format_ident!("{name}")
+    }
+
+    /// The colour type of slot `slot` hosting the extents `sized` (counted in its bytes) and
+    /// `unsized_`.
+    fn colour(&mut self, slot: u32, sized: &[Ident], unsized_: &[Ident]) -> Ident {
         let def = quote!(= #slot [#(#sized),*] [#(#unsized_),*]);
         let n = self.colours.len();
         let defs = &mut self.colour_defs;
-        (self.colours.entry(def.to_string()))
-            .or_insert_with(|| {
-                let name = format_ident!("K{n}");
-                defs.push(quote!(#name #def));
-                name
-            })
-            .clone()
+        let name = (self.colours.entry(def.to_string())).or_insert_with(|| {
+            let name = format_ident!("K{n}");
+            defs.push(quote!(#name #def));
+            name.to_string()
+        });
+        format_ident!("{name}")
     }
 
     /// The arena whose slot `k` is `colours[k]`.
@@ -4785,23 +4801,35 @@ impl ArenaTypes {
         let n = self.arenas.len();
         let defs = &mut self.arena_defs;
         let key = colours.iter().map(Ident::to_string).collect();
-        (self.arenas.entry(key))
-            .or_insert_with(|| {
-                let name = format_ident!("S{n}");
-                defs.push(quote!(#name [#(#colours),*]));
-                name
-            })
-            .clone()
+        let name = (self.arenas.entry(key)).or_insert_with(|| {
+            let name = format_ident!("S{n}");
+            defs.push(quote!(#name [#(#colours),*]));
+            name.to_string()
+        });
+        format_ident!("{name}")
     }
 
     /// The declarations, in the model's `__arena`.
     fn tokens(&self) -> TokenStream {
-        let (colours, arenas) = (&self.colour_defs, &self.arena_defs);
+        let (extents, colours, arenas) = (&self.extent_defs, &self.colour_defs, &self.arena_defs);
         quote! {
+            ::scratchy_target_metal::arena_extents! { <M, S> #(#extents)* }
             ::scratchy_target_metal::arena_colours! { <M, S> #(#colours)* }
             ::scratchy_target_metal::arena_schemas! { <M, S> #(#arenas)* }
         }
     }
+}
+
+/// The marker of the extent arena value `value` of `fuf` is, among `extents` (an [`ArenaTypes`]'
+/// markers by spelling): what its colour hosts.
+fn arena_value_extent(
+    fuf: &crate::fuf::Fuf,
+    extents: &BTreeMap<String, String>,
+    value: scratchy_subtile::handoff::ArenaValue,
+) -> Result<String, String> {
+    let at = arena_extent(arena_value_shape(fuf, value)?, &quote!(M), &quote!(S))?;
+    (extents.get(&at.to_string()).cloned())
+        .ok_or_else(|| format!("arena value {value:?} ({at}) is hosted by no colour"))
 }
 
 /// A tile output of `shape` as the arena extent a colour hosts, `Act<rows, columns>`: its first
@@ -15207,15 +15235,7 @@ pub fn emit_model(
     let mut metal_bucket_entries: Vec<TokenStream> = Vec::new();
     let mut metal_arena_bytes_statics: Vec<TokenStream> = Vec::new();
     #[cfg(feature = "metal")]
-    // The model's command table, and each arena value's extent at a bucket's rows: what its
-    // colours host and its arena operands bind.
-    let (mut metal_tape_cmds, metal_extent) = (
-        scratchy_target_metal_compiler::static_tape::CommandPool::default(),
-        |v, rows: scratchy_target_metal_compiler::static_tape::BucketRows| {
-            let (m, sk) = rows.types()?;
-            arena_extent(arena_value_shape(fuf, v)?, &m, &sk)
-        },
-    );
+    let mut metal_tape_cmds = scratchy_target_metal_compiler::static_tape::CommandPool::default();
     // The most arena slots a bucket has: how many the model's arena ranks rank (`RankedSlots`).
     let mut metal_arena_slots: u32 = 0;
     // Every colour and arena the buckets' colourings make, in the model's `__arena`.
@@ -15408,10 +15428,11 @@ pub fn emit_model(
             // The bucket's arena: each slot's colour type, and the arena of them.
             let colours: Vec<Ident> = (sized.iter().zip(&unsized_).enumerate())
                 .map(|(slot, (sized, unsized_))| {
-                    let (sized, unsized_): (Vec<_>, Vec<_>) = (
-                        sized.values().cloned().collect(),
-                        unsized_.values().cloned().collect(),
-                    );
+                    let mut markers = |extents: &BTreeMap<String, TokenStream>| -> Vec<Ident> {
+                        let at = extents.values();
+                        at.map(|at| metal_arena_types.extent(at)).collect()
+                    };
+                    let (sized, unsized_) = (markers(sized), markers(unsized_));
                     metal_arena_types.colour(slot as u32, &sized, &unsized_)
                 })
                 .collect();
@@ -15492,7 +15513,8 @@ pub fn emit_model(
                         cap_ladder: &metal_cap_ladder,
                         operands: &classed.narrow.operands,
                         arena: &narrow_arena,
-                        extent: &metal_extent,
+                        // What each value its steps name is, as its colour hosts it.
+                        extent: &|v| arena_value_extent(fuf, &metal_arena_types.extents, v),
                     };
                     scratchy_target_metal_compiler::static_tape::bake_bucket_tapes(
                         mc,
@@ -15837,7 +15859,7 @@ pub fn emit_model(
     #[cfg(feature = "metal")]
     {
         let table = metal_tape_cmds
-            .into_tokens(&resolver.typed, &metal_extent)
+            .into_tokens(&resolver.typed)
             .unwrap_or_else(|e| {
                 panic!(
                     "[metal static tape] {}: command table: {e}",
