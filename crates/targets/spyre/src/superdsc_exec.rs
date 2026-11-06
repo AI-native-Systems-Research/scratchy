@@ -4612,10 +4612,25 @@ impl Executor {
     /// `logits` says what the caller does with this forward's logits ([`Logits`]): a prompt chunk
     /// whose logits nobody reads skips the suffix and the read-back both.
     pub fn predict(&mut self, n_new: NewTokens, seq_pos: SeqPos, logits: Logits<'_>) -> Result<()> {
-        let (suffix, out_logits) = match logits {
-            Logits::Discarded => (SuffixLaunch::Skipped, None),
-            Logits::ReadBack(out) => (SuffixLaunch::Launched, Some(out)),
-            Logits::LeftOnDevice => (SuffixLaunch::Launched, None),
+        let want = LogitsRead::of(&logits);
+        let submitted = self.predict_submit(n_new, seq_pos, want)?;
+        self.predict_finish(submitted, logits)
+    }
+
+    /// ⭐ THE SUBMIT HALF OF [`Self::predict`]: the forward and, when its logits are read back, the
+    /// logits D2H behind it on the compute pipeline — enqueued, nothing waited on. A forward that
+    /// spans several cards (a sharded world's ranks, whose collectives wait on each other's sends)
+    /// submits on EVERY card before it waits on any, so no card's wait can stall a peer's send;
+    /// [`Self::predict_finish`] is the wait. One card is the same two halves back to back.
+    pub fn predict_submit(
+        &mut self,
+        n_new: NewTokens,
+        seq_pos: SeqPos,
+        want: LogitsRead,
+    ) -> Result<PredictSubmitted> {
+        let suffix = match want {
+            LogitsRead::Discarded => SuffixLaunch::Skipped,
+            LogitsRead::ReadBack | LogitsRead::LeftOnDevice => SuffixLaunch::Launched,
         };
         let d = Diag::get();
         let n_new = NewTokens(n_new.0.max(1));
@@ -4635,7 +4650,7 @@ impl Executor {
             .cloned()
             .ok_or_else(|| anyhow!("logits tensor {} has no placement", self.logits_id))?;
         let (mut d2h_seg, mut d2h_bytes) = (-1i64, 0u64);
-        if out_logits.is_some() {
+        if want == LogitsRead::ReadBack {
             let seg = SegIdx::checked(lp.segment as i64)
                 .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
             d2h_seg = lp.segment as i64;
@@ -4697,20 +4712,63 @@ impl Executor {
                 .d2h_on_compute(host, src)
                 .map_err(|e| anyhow!("logits D2H: {e}"))?;
         }
-        let t2b = Instant::now();
+        Ok(PredictSubmitted {
+            half,
+            want,
+            n_new,
+            d2h_seg,
+            d2h_bytes,
+            t2b: Instant::now(),
+        })
+    }
+
+    /// Wait out every op this card's stream holds — a sharded step's non-lead ranks, whose pick
+    /// the lead rank's read already returned, drained so the step is done on every card before the
+    /// next one stages over their shadows.
+    pub fn drain_stream(&mut self) -> Result<()> {
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("drain: sync: {e}"))
+    }
+
+    /// ⭐ THE WAIT HALF OF [`Self::predict`]: drain this card's stream, then convert the logits row
+    /// into `logits` when the submit read it back. `logits` must be the read the submit was asked
+    /// for — a mismatch is refused, never a silent skip.
+    pub fn predict_finish(&mut self, s: PredictSubmitted, logits: Logits<'_>) -> Result<()> {
+        if LogitsRead::of(&logits) != s.want {
+            bail!(
+                "predict_finish: the forward was submitted for {:?} and finished for {:?}",
+                s.want,
+                LogitsRead::of(&logits)
+            );
+        }
+        let d = Diag::get();
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("predict: sync: {e}"))?;
 
         if d.phase_time {
             let t3 = Instant::now();
-            Self::print_step_phase(&half, "logits", d2h_seg, d2h_bytes, t2b, t3, n_new.0);
+            Self::print_step_phase(
+                &s.half,
+                "logits",
+                s.d2h_seg,
+                s.d2h_bytes,
+                s.t2b,
+                t3,
+                s.n_new.0,
+            );
             let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
-            report_phase_timers(ms(half.t1, half.t2));
+            report_phase_timers(ms(s.half.t1, s.half.t2));
         }
 
-        if let Some(out) = out_logits {
-            let seg = SegIdx::checked(lp.segment as i64).unwrap();
+        if let Logits::ReadBack(out) = logits {
+            let lp = self
+                .places
+                .get(&self.logits_id)
+                .ok_or_else(|| anyhow!("logits tensor {} has no placement", self.logits_id))?;
+            let seg = SegIdx::checked(lp.segment as i64)
+                .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
             let elems = self.vocab.0.min(out.len() / 2);
             let src = &self.seg_host[seg.get()][lp.offset as usize..];
             sen_convert::sen_to_ieee_bytes(&src[..elems * 2], &mut out[..elems * 2]);
@@ -6223,6 +6281,37 @@ pub enum Logits<'a> {
     /// Nobody reads this forward's logits — every prompt chunk but the last — so the suffix (final
     /// norm → lm-head → logits scaling) is not launched at all.
     Discarded,
+}
+
+/// What a forward's submit half reads back — [`Logits`] without the buffer, which only the wait
+/// half ([`Executor::predict_finish`]) holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LogitsRead {
+    ReadBack,
+    LeftOnDevice,
+    Discarded,
+}
+
+impl LogitsRead {
+    /// The read `logits` asks for.
+    pub fn of(logits: &Logits<'_>) -> Self {
+        match logits {
+            Logits::ReadBack(_) => Self::ReadBack,
+            Logits::LeftOnDevice => Self::LeftOnDevice,
+            Logits::Discarded => Self::Discarded,
+        }
+    }
+}
+
+/// One forward submitted by [`Executor::predict_submit`] and not yet waited on — the token
+/// [`Executor::predict_finish`] consumes. Not `Clone`: a submission is finished once.
+pub struct PredictSubmitted {
+    half: ForwardHalf,
+    want: LogitsRead,
+    n_new: NewTokens,
+    d2h_seg: i64,
+    d2h_bytes: u64,
+    t2b: Instant,
 }
 
 /// Whether [`Executor::launch_forward`] launches the suffix — read off [`Logits`] in one place.

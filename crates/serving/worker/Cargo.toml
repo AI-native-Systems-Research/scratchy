@@ -29,6 +29,10 @@ spyre-hw = ["spyre", "dep:scratchy-builder-spyre", "scratchy-builder-spyre/spyre
 # differs is the device underneath. Forwards into the models crate so the macro's bake-time
 # numeric gate runs on every emu build (see the macro crate's `spyre-emu`).
 spyre-emu = ["spyre", "scratchy-target-spyre/spyre-emu", "scratchy-models/spyre-emu"]
+# A TWO-RANK TENSOR-PARALLEL WORLD: the bake shards every model two ways (scratchy-models/tp-2) and
+# this worker runs both ranks in one process, one card each, linked by device p2p RDMA. A build that
+# names no world serves one card. Reached from the CLI as `tp/2`.
+tp-2 = ["spyre-hw", "scratchy-models/tp-2"]
 guided-decoding = ["scratchy-serving-engine/guided-decoding"]
 
 [dependencies]
