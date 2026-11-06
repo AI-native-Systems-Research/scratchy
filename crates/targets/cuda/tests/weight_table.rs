@@ -8,13 +8,16 @@
 //! Checks: every `LoadError` arm, found before anything is staged; a bf16 tensor staged byte for
 //! byte; a GDN bundle staged region by region from bf16 and f32 pieces, bf16 widened to f32
 //! exactly and every gap between regions `+0.0`; and the stub allocator refusing an upload.
+//! The FP8 arms: an fp8 projection, Qwen's fp8 MoE bundle and Gemma's fp8 expert bank (its
+//! `router.proj` kept bf16) staged exactly, and a dtype the entry does not take refused naming the
+//! tensor and both dtypes.
 
 use std::path::Path;
 
 use half::bf16;
 use safetensors::tensor::{Dtype, TensorView};
 use scratchy_target_cuda::step::expert_bank;
-use scratchy_target_cuda::step::{gdn_bundle, moe_bundle};
+use scratchy_target_cuda::step::{fp8_moe_layout, fp8_weight, gdn_bundle, moe_bundle};
 use scratchy_target_cuda::tape::{ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, TapeInput};
 use scratchy_target_cuda::weights::{
     CudaWeight, HostStaging, LoadError, check, open_checkpoint, stage,
@@ -737,6 +740,378 @@ fn a_gemma_expert_bank_of_another_shape_is_refused() {
                 ix: 0,
                 tensor: "language_model.model.layers.0.experts.gate_up_proj",
                 ..
+            }
+        ),
+        "{e}"
+    );
+}
+
+// ── FP8 per-channel weights (FP8 S2) ────────────────────────────────
+
+/// Distinct e4m3 bytes: every pattern but the two NaNs (`0x7F`, `0xFF`), so a misplaced byte
+/// shows and none is a value the kernel would refuse.
+fn e4m3s(n: usize, seed: u8) -> Vec<u8> {
+    (0..n)
+        .map(|k| match seed.wrapping_add(k as u8) {
+            0x7F | 0xFF => 0x01,
+            b => b,
+        })
+        .collect()
+}
+
+/// `n` bf16 scales `[n, 1]`, each a power of two times a small odd number, so widening to f32 is
+/// checked exactly.
+fn scales(n: usize, seed: f32) -> Vec<u8> {
+    (0..n)
+        .flat_map(|k| bf16::from_f32(seed * (1 + 2 * (k % 7)) as f32 / 64.0).to_le_bytes())
+        .collect()
+}
+
+/// The FP8 checkpoint under `{root}.layers.0`, as (name after the root, dtype, shape, bytes): one
+/// fp8 projection `[N, K]` with its scale; Qwen's MoE layer, its bf16 router and its experts' own
+/// fp8 tensors; Gemma's bf16 `router.proj` and its experts' own fp8 tensors.
+const FP8_N: u32 = 8;
+const FP8_K: u32 = 64;
+fn fp8_tensors() -> Vec<(String, Dtype, Vec<usize>, Vec<u8>)> {
+    let (n, k) = (FP8_N as usize, FP8_K as usize);
+    let (e, h, i) = (MOE_E as usize, MOE_H as usize, MOE_I as usize);
+    let bf16s = |len: usize, seed: u16| -> Vec<u8> {
+        (0..len)
+            .flat_map(|j| (seed.wrapping_add(j as u16) & 0x3FFF | 0x0400).to_le_bytes())
+            .collect()
+    };
+    let mut all = vec![
+        (
+            "layers.0.mlp.up_proj.weight".to_string(),
+            Dtype::F8_E4M3,
+            vec![n, k],
+            e4m3s(n * k, 3),
+        ),
+        (
+            "layers.0.mlp.up_proj.weight_scale".to_string(),
+            Dtype::BF16,
+            vec![n, 1],
+            scales(n, 1.0),
+        ),
+        (
+            "layers.0.mlp.gate.weight".to_string(),
+            Dtype::BF16,
+            vec![e, h],
+            bf16s(e * h, 0x1000),
+        ),
+        (
+            "layers.0.router.proj.weight".to_string(),
+            Dtype::BF16,
+            vec![e, h],
+            bf16s(e * h, 0x1100),
+        ),
+    ];
+    for (at, seed) in [("layers.0.mlp.experts", 0x20u8), ("layers.0.experts", 0x90)] {
+        for x in 0..e {
+            let s = seed.wrapping_add(x as u8 * 11);
+            for (leaf, out, inp, sd) in [
+                ("gate_proj", i, h, s),
+                ("up_proj", i, h, s.wrapping_add(5)),
+                ("down_proj", h, i, s.wrapping_add(9)),
+            ] {
+                all.push((
+                    format!("{at}.{x}.{leaf}.weight"),
+                    Dtype::F8_E4M3,
+                    vec![out, inp],
+                    e4m3s(out * inp, sd),
+                ));
+                all.push((
+                    format!("{at}.{x}.{leaf}.weight_scale"),
+                    Dtype::BF16,
+                    vec![out, 1],
+                    scales(out, f32::from(sd) / 16.0),
+                ));
+            }
+        }
+    }
+    all
+}
+
+/// The FP8 checkpoint in a fresh `dir`, every tensor under `root`.
+fn fp8_checkpoint_dir(name: &str, root: &str) -> std::path::PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("weight_table_{name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make the checkpoint dir");
+    let all = fp8_tensors();
+    let views: Vec<(String, TensorView<'_>)> = (all.iter())
+        .map(|(name, dtype, shape, bytes)| {
+            let view = TensorView::new(*dtype, shape.clone(), bytes).expect("a tensor view");
+            (format!("{root}.{name}"), view)
+        })
+        .collect();
+    let bytes = safetensors::serialize(views, None).expect("serialize the checkpoint");
+    std::fs::write(dir.join("model.safetensors"), bytes).expect("write the checkpoint");
+    dir
+}
+
+/// One FP8 tensor's bytes, by its name after the root.
+fn fp8_bytes(name: &str) -> Vec<u8> {
+    (fp8_tensors().into_iter())
+        .find(|(n, ..)| n == name)
+        .unwrap_or_else(|| panic!("no tensor {name}"))
+        .3
+}
+
+/// `bytes` of bf16 widened to f32, little-endian.
+fn widened(bytes: &[u8]) -> Vec<u8> {
+    (bytes.as_chunks::<2>().0.iter())
+        .flat_map(|&p| bf16::from_le_bytes(p).to_f32().to_le_bytes())
+        .collect()
+}
+
+const FP8_PROJ: CudaWeight = CudaWeight::Fp8 {
+    weight: "language_model.model.layers.0.mlp.up_proj.weight",
+    scale: "language_model.model.layers.0.mlp.up_proj.weight_scale",
+    shape: &[FP8_N as u64, FP8_K as u64],
+};
+const FP8_MOE: CudaWeight = CudaWeight::Fp8MoeBundle {
+    router: "language_model.model.layers.0.mlp.gate.weight",
+    experts_at: "language_model.model.layers.0.mlp.experts",
+    experts: MOE_E,
+    hidden: MOE_H,
+    inter: MOE_I,
+};
+/// Gemma's layer: its `router.proj` a bf16 entry of its own, its experts an fp8 bank.
+const FP8_GEMMA: [CudaWeight; 2] = [
+    CudaWeight::Bf16 {
+        tensor: "language_model.model.layers.0.router.proj.weight",
+        shape: &[MOE_E as u64, MOE_H as u64],
+    },
+    CudaWeight::Fp8ExpertBank {
+        experts_at: "language_model.model.layers.0.experts",
+        experts: MOE_E,
+        hidden: MOE_H,
+        inter: MOE_I,
+    },
+];
+
+/// An fp8 projection is its e4m3 bytes verbatim, zero to the next 256 bytes, then its `[n, 1]`
+/// bf16 scales widened to `[n]` f32 exactly, at `fp8_weight`'s offsets, in both orderings.
+#[test]
+fn an_fp8_projection_is_packed_exactly() {
+    let layout = fp8_weight(FP8_N, FP8_K).expect("the weight fits");
+    assert_eq!(
+        (layout.scale, layout.bytes),
+        (512, 512 + 4 * u64::from(FP8_N)),
+        "the synthetic projection's regions"
+    );
+    assert_eq!(FP8_PROJ.packed_bytes(), Some(layout.bytes));
+    assert_eq!(
+        FP8_PROJ.lead(),
+        "language_model.model.layers.0.mlp.up_proj.weight"
+    );
+    let mut want = fp8_bytes("layers.0.mlp.up_proj.weight");
+    want.resize(layout.scale as usize, 0);
+    want.extend(widened(&fp8_bytes("layers.0.mlp.up_proj.weight_scale")));
+    for root in ORDERINGS {
+        let dir = fp8_checkpoint_dir(&format!("fp8_proj_{root}"), root);
+        let mut w = open_checkpoint(&dir).expect("open");
+        let staged = stage(0, &FP8_PROJ, &mut w).unwrap_or_else(|e| panic!("{root}: {e}"));
+        assert!(staged == want, "{root}: the projection's bytes");
+        let bytes: &'static [u64] = Box::leak(Box::new([layout.bytes]));
+        let w = open_checkpoint(&dir).expect("open");
+        check(&[Some(FP8_PROJ)], &[tape(bytes)], &w).unwrap_or_else(|e| panic!("{root}: {e}"));
+    }
+}
+
+/// The bytes `fp8_moe_layout` puts in an fp8 bank of the synthetic geometry under `at`: the bf16
+/// router at 0 when `router` names one, then per expert its gate rows and up rows, its down rows,
+/// its gate and up scales and its down scales, each region at its offset.
+fn fp8_bank_want(router: Option<&str>, at: &str) -> Vec<u8> {
+    let layout = fp8_moe_layout(MOE_E, MOE_H, MOE_I, router.is_some()).expect("the bank fits");
+    let (h, i) = (MOE_H as usize, MOE_I as usize);
+    let mut want = vec![0u8; layout.experts.bytes as usize];
+    if let Some(r) = router {
+        let b = fp8_bytes(r);
+        want[..b.len()].copy_from_slice(&b);
+    }
+    let mut put = |base: u64, off: usize, b: Vec<u8>| {
+        let s = base as usize + off;
+        want[s..s + b.len()].copy_from_slice(&b);
+    };
+    for x in 0..MOE_E as usize {
+        let t = |leaf: &str| fp8_bytes(&format!("{at}.{x}.{leaf}"));
+        put(layout.experts.gate_up, x * 2 * i * h, t("gate_proj.weight"));
+        put(
+            layout.experts.gate_up,
+            x * 2 * i * h + i * h,
+            t("up_proj.weight"),
+        );
+        put(layout.experts.down, x * h * i, t("down_proj.weight"));
+        put(
+            layout.gate_up_scale,
+            x * 2 * i * 4,
+            widened(&t("gate_proj.weight_scale")),
+        );
+        put(
+            layout.gate_up_scale,
+            x * 2 * i * 4 + i * 4,
+            widened(&t("up_proj.weight_scale")),
+        );
+        put(
+            layout.down_scale,
+            x * h * 4,
+            widened(&t("down_proj.weight_scale")),
+        );
+    }
+    want
+}
+
+/// Qwen's fp8 MoE layer (E = 4, H = 64, I = 32) packs to one buffer: the bf16 router byte for
+/// byte at 0, then each expert's own e4m3 tensors and widened scales at `fp8_moe_layout`'s
+/// offsets, in both orderings; every region starts on a 256-byte boundary.
+#[test]
+fn an_fp8_moe_bundle_is_packed_exactly() {
+    let layout = fp8_moe_layout(MOE_E, MOE_H, MOE_I, true).expect("the bundle fits");
+    let (e, h, i) = (u64::from(MOE_E), u64::from(MOE_H), u64::from(MOE_I));
+    assert_eq!(layout.experts.gate_up, e * h * 2, "the router's bf16 bytes");
+    for at in [
+        layout.experts.gate_up,
+        layout.experts.down,
+        layout.gate_up_scale,
+        layout.down_scale,
+    ] {
+        assert!(at.is_multiple_of(256), "region at {at}");
+    }
+    assert_eq!(layout.down_scale + e * h * 4, layout.experts.bytes);
+    assert_eq!(layout.experts.down - layout.experts.gate_up, e * 2 * i * h);
+    assert_eq!(FP8_MOE.packed_bytes(), Some(layout.experts.bytes));
+    assert_eq!(
+        FP8_MOE.lead(),
+        "language_model.model.layers.0.mlp.gate.weight"
+    );
+    let want = fp8_bank_want(Some("layers.0.mlp.gate.weight"), "layers.0.mlp.experts");
+    for root in ORDERINGS {
+        let dir = fp8_checkpoint_dir(&format!("fp8_moe_{root}"), root);
+        let mut w = open_checkpoint(&dir).expect("open");
+        let staged = stage(0, &FP8_MOE, &mut w).unwrap_or_else(|e| panic!("{root}: {e}"));
+        assert!(staged == want, "{root}: the bundle's bytes");
+        let bytes: &'static [u64] = Box::leak(Box::new([layout.experts.bytes]));
+        let w = open_checkpoint(&dir).expect("open");
+        check(&[Some(FP8_MOE)], &[tape(bytes)], &w).unwrap_or_else(|e| panic!("{root}: {e}"));
+    }
+}
+
+/// Gemma's fp8 layer: `router.proj` stays bf16, staged byte for byte as an entry of its own (the
+/// checkpoint's ignore list leaves it unquantized), and the bank holds no router, only the
+/// experts' e4m3 tensors and widened scales, in both orderings.
+#[test]
+fn a_gemma_fp8_bank_keeps_its_router_bf16() {
+    let layout = fp8_moe_layout(MOE_E, MOE_H, MOE_I, false).expect("the bank fits");
+    assert_eq!(layout.experts.gate_up, 0, "no router in Gemma's bank");
+    assert_eq!(FP8_GEMMA[1].packed_bytes(), Some(layout.experts.bytes));
+    let want = [
+        fp8_bytes("layers.0.router.proj.weight"),
+        fp8_bank_want(None, "layers.0.experts"),
+    ];
+    for root in ORDERINGS {
+        let dir = fp8_checkpoint_dir(&format!("fp8_gemma_{root}"), root);
+        for (ix, entry) in FP8_GEMMA.iter().enumerate() {
+            let mut w = open_checkpoint(&dir).expect("open");
+            let staged = stage(ix, entry, &mut w).unwrap_or_else(|e| panic!("{root}: {e}"));
+            assert!(staged == want[ix], "{root}: weight {ix}'s bytes");
+        }
+        let bytes: Vec<u64> = (FP8_GEMMA.iter())
+            .map(|w| w.packed_bytes().expect("fits"))
+            .collect();
+        let bytes: &'static [u64] = Box::leak(bytes.into_boxed_slice());
+        let w = open_checkpoint(&dir).expect("open");
+        check(&FP8_GEMMA.map(Some), &[tape(bytes)], &w).unwrap_or_else(|e| panic!("{root}: {e}"));
+    }
+    // The router read as fp8, as a preset quantizing it would: refused naming it and both dtypes.
+    let quantized = CudaWeight::Fp8 {
+        weight: "language_model.model.layers.0.router.proj.weight",
+        scale: "language_model.model.layers.0.router.proj.weight_scale",
+        shape: &[MOE_E as u64, MOE_H as u64],
+    };
+    let dir = fp8_checkpoint_dir("fp8_gemma_router", ROOT);
+    let w = open_checkpoint(&dir).expect("open");
+    let e = check(&[Some(quantized)], &[tape(&[0])], &w).expect_err("a bf16 router read as fp8");
+    let msg = e.to_string();
+    for name in ["layers.0.router.proj.weight", "bf16", "fp8_e4m3"] {
+        assert!(msg.contains(name), "{msg:?} does not name {name:?}");
+    }
+    assert!(
+        matches!(
+            e,
+            LoadError::Dtype {
+                ix: 0,
+                tensor: "language_model.model.layers.0.router.proj.weight",
+                got: DType::BF16,
+                accepted: [DType::Fp8E4m3],
+            }
+        ),
+        "{e}"
+    );
+}
+
+/// A preset that disagrees with the checkpoint fails at load, naming the tensor and both dtypes:
+/// an e4m3 tensor read as bf16, and an expert's e4m3 weight read where the bank wants a bf16
+/// scale (an fp8 bank over a checkpoint whose expert scales are e4m3 is the same check).
+#[test]
+fn an_fp8_dtype_mismatch_is_refused_naming_the_tensor_and_both_dtypes() {
+    let dir = fp8_checkpoint_dir("fp8_dtype", ROOT);
+    let w = open_checkpoint(&dir).expect("open");
+    let dense = CudaWeight::Bf16 {
+        tensor: "language_model.model.layers.0.mlp.up_proj.weight",
+        shape: &[FP8_N as u64, FP8_K as u64],
+    };
+    let e = check(&[Some(dense)], &[tape(&[0])], &w).expect_err("an e4m3 tensor read as bf16");
+    let msg = e.to_string();
+    for name in ["layers.0.mlp.up_proj.weight", "fp8_e4m3", "bf16"] {
+        assert!(msg.contains(name), "{msg:?} does not name {name:?}");
+    }
+    assert!(
+        matches!(
+            e,
+            LoadError::Dtype {
+                ix: 0,
+                tensor: "language_model.model.layers.0.mlp.up_proj.weight",
+                got: DType::Fp8E4m3,
+                accepted: [DType::BF16],
+            }
+        ),
+        "{e}"
+    );
+    // A scale stored as e4m3 (its name pointed at the weight): the scale's dtype is refused.
+    let swapped = CudaWeight::Fp8 {
+        weight: "language_model.model.layers.0.mlp.up_proj.weight",
+        scale: "language_model.model.layers.0.mlp.experts.0.gate_proj.weight",
+        shape: &[FP8_N as u64, FP8_K as u64],
+    };
+    let e = check(&[Some(swapped)], &[tape(&[0])], &w).expect_err("an e4m3 scale");
+    assert!(
+        matches!(
+            e,
+            LoadError::Dtype {
+                ix: 0,
+                tensor: "language_model.model.layers.0.mlp.experts.0.gate_proj.weight",
+                got: DType::Fp8E4m3,
+                accepted: [DType::BF16],
+            }
+        ),
+        "{e}"
+    );
+    // An expert of the bank missing (a bank with no router, so no router shape is checked
+    // first): refused naming the per-expert tensor it built.
+    let wider = CudaWeight::Fp8ExpertBank {
+        experts_at: "language_model.model.layers.0.experts",
+        experts: MOE_E + 1,
+        hidden: MOE_H,
+        inter: MOE_I,
+    };
+    let e = check(&[Some(wider)], &[tape(&[0])], &w).expect_err("a fifth expert");
+    assert!(
+        matches!(
+            e,
+            LoadError::Missing {
+                ix: 0,
+                tensor: "language_model.model.layers.0.experts.4.gate_proj.weight",
             }
         ),
         "{e}"
