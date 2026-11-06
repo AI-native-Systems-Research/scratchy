@@ -17,3 +17,4 @@ pub mod lowering;
 pub mod quantized;
 pub mod step;
 pub mod targets;
+pub mod typed;

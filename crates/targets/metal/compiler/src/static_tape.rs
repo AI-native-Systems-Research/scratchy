@@ -16,11 +16,12 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_target_metal::tape::ids::{
-    BlockSize, HeadDim, MaxBlocksPerSeq, MaxPositions, NumKvHeads, NumQHeads, TqDecodeHeads,
+    BlockSize, HeadDim, MaxBlocksPerSeq, MaxPositions, NumKvHeads, NumQHeads, SourceIx,
+    TqDecodeHeads,
 };
 use scratchy_target_metal::tape::lowered::{
-    CommandTableBuilder, GatedCommand, GenClass, KernelId, KvAddressing, LoweredMetalTape,
-    LoweringError, MetalDtype, TapeCommands,
+    CommandTableBuilder, CommandTableParts, GatedCommand, GenClass, KernelId, KvAddressing,
+    LoweredMetalTape, LoweringError, MetalDtype, TapeCommands,
 };
 
 /// ⭐ EVERY DISTINCT COMMAND OF ONE MODEL'S BAKED TAPES, SPELLED ONCE.
@@ -88,8 +89,14 @@ impl CommandPool {
     }
 
     /// The `__tape_cmds` module the model's tape statics reference, and `METAL_KERNELS`, the
-    /// model's baked kernels its buckets name. Emit it once, beside them.
-    pub fn into_tokens(self) -> Result<TokenStream, BakeDefect> {
+    /// model's baked kernels its buckets name. Emit it once, beside them. Each dense GEMM over a
+    /// weight family of `typed` (the families the model's resolver declared a source slot for)
+    /// takes its dims from its slot's type, and each binding of a typed family's weight its
+    /// index ([`TypedGemms`]).
+    pub fn into_tokens(
+        self,
+        typed: &std::collections::HashSet<SourceIx>,
+    ) -> Result<TokenStream, BakeDefect> {
         // A model metal lowers no tape for (a dense MoE has no metal realization) names nothing.
         if self.table.is_empty() && self.kernels.is_empty() {
             return Ok(quote! {
@@ -98,6 +105,7 @@ impl CommandPool {
             });
         }
         let parts = self.table.finish();
+        let gemms = TypedGemms::of(&parts, typed);
         let aliases = crate::const_tokens::alias_preamble();
         let array = |name: &str, values: Vec<TokenStream>, ty: TokenStream| {
             let (id, len) = (
@@ -117,12 +125,29 @@ impl CommandPool {
         let symbols = (parts.symbols.iter())
             .map(|(library, function)| quote! { (#library, #function) })
             .collect();
+        let commands = each(&parts.commands)?;
+        let bindings = (parts.bindings.iter())
+            .map(|list| gemms.binding_list(list))
+            .collect::<Result<Vec<_>, BakeDefect>>()?;
+        let gemm_entries = (parts.gemm_entries.iter())
+            .map(|g| match gemms.record(*g) {
+                Some(record) => Ok(record),
+                None => crate::const_tokens::const_tokens(g)
+                    .map_err(|e| BakeDefect(format!("serialize command table: {e}"))),
+            })
+            .collect::<Result<Vec<_>, BakeDefect>>()?;
+        let gemm_ats = (parts.gemms.iter())
+            .map(|g| match g {
+                Some(at) => {
+                    let (entry, layer) = (at.entry.0, at.layer.0);
+                    quote!(gemm_at(#entry, #layer))
+                }
+                None => quote!(None),
+            })
+            .collect();
+        let markers = gemms.markers();
         let statics = [
-            array(
-                "COMMANDS",
-                each(&parts.commands)?,
-                quote!(__tl::PackedCommand),
-            ),
+            array("COMMANDS", commands, quote!(__tl::PackedCommand)),
             array("SYMBOLS", symbols, quote!((&str, &str))),
             array(
                 "CONSTANTS",
@@ -134,12 +159,9 @@ impl CommandPool {
                 each(&parts.dispatches)?,
                 quote!(__tl::DispatchShape),
             ),
-            array("BINDINGS", each(&parts.bindings)?, quote!(&[__tl::Binding])),
-            array(
-                "GEMM_DIMS",
-                each(&parts.gemm_dims)?,
-                quote!(Option<__tl::GemmDims>),
-            ),
+            array("BINDINGS", bindings, quote!(&[__tl::Binding])),
+            array("GEMMS", gemm_ats, quote!(Option<__tl::GemmAt>)),
+            array("GEMM_ENTRIES", gemm_entries, quote!(__tl::GemmEntry)),
             array(
                 "GATES",
                 each(&parts.gates)?,
@@ -152,6 +174,15 @@ impl CommandPool {
             #[cfg(feature = "metal")]
             mod __tape_cmds {
                 #aliases
+                #markers
+                /// The table's GEMM of entry `entry` at layer `layer`: a GEMM of every layer is
+                /// one, so each is written as this call, not a literal of its two newtypes.
+                const fn gemm_at(entry: u16, layer: u16) -> Option<__tl::GemmAt> {
+                    Some(__tl::GemmAt {
+                        entry: __ti::PartIx(entry),
+                        layer: __tl::PackedLayer(layer),
+                    })
+                }
                 #(#statics)*
                 pub(super) static TABLE: __tl::CommandTable = __tl::CommandTable {
                     commands: &COMMANDS,
@@ -159,7 +190,8 @@ impl CommandPool {
                     constants: &CONSTANTS,
                     dispatches: &DISPATCHES,
                     bindings: &BINDINGS,
-                    gemm_dims: &GEMM_DIMS,
+                    gemms: &GEMMS,
+                    gemm_entries: &GEMM_ENTRIES,
                     gates: &GATES,
                 };
                 pub(super) static KERNELS: [__tl::BakedKernel; #kernels_len] = [ #(#kernels),* ];
@@ -168,6 +200,130 @@ impl CommandPool {
             static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] =
                 &__tape_cmds::KERNELS;
         })
+    }
+}
+
+/// ⭐ A MODEL'S DENSE GEMMS, TYPED BY THEIR WEIGHTS.
+///
+/// A dense GEMM's record (`Gemm`: its dims and the weight it reads, which nothing else of the
+/// command names) over a typed family's weight takes that weight's index and dims from ONE const
+/// of its slot, `__GEMM<slot>` (`GemmSlot::WEIGHT`, read off the slot's handle) — its rows and
+/// layer are its own. And each binding of a typed family's tensor names its slot's index
+/// (`__SOURCE<slot>`). Every other record and binding keeps its value; the commands resolve to
+/// the same values either way.
+///
+/// Each typed value is one `const` per slot: the weight's index and dims depend on the slot
+/// alone, so a record that named a type of its own would only re-check it.
+struct TypedGemms {
+    /// The typed families.
+    typed: std::collections::HashSet<SourceIx>,
+    /// The typed families the GEMM records read, ascending.
+    read: std::collections::BTreeSet<u32>,
+    /// The typed families the binding lists bind, ascending.
+    bound: std::collections::BTreeSet<u32>,
+}
+
+impl TypedGemms {
+    /// The typed GEMM records and bindings of `parts`, over the families of `typed`.
+    fn of(parts: &CommandTableParts, typed: &std::collections::HashSet<SourceIx>) -> Self {
+        use scratchy_target_metal::tape::lowered::Binding;
+        let read = (parts.gemm_entries.iter())
+            .filter(|g| Self::typed_weight(typed, g))
+            .map(|g| g.ix.0)
+            .collect();
+        let bound = (parts.bindings.iter().copied().flatten())
+            .filter_map(|b| match b {
+                Binding::Source { ix, .. } if typed.contains(ix) => Some(ix.0),
+                _ => None,
+            })
+            .collect();
+        Self {
+            typed: typed.clone(),
+            read,
+            bound,
+        }
+    }
+
+    /// Whether `g` reads a typed family's weight (a router's gate is a bundle tensor, untyped).
+    fn typed_weight(
+        typed: &std::collections::HashSet<SourceIx>,
+        g: &scratchy_target_metal::tape::lowered::GemmEntry,
+    ) -> bool {
+        use scratchy_target_metal::tape::lowered::WeightTensor;
+        typed.contains(&g.ix) && g.which == WeightTensor::Weight
+    }
+
+    fn gemm(slot: SourceIx) -> proc_macro2::Ident {
+        quote::format_ident!("__GEMM{}", slot.0)
+    }
+
+    fn source(slot: SourceIx) -> proc_macro2::Ident {
+        quote::format_ident!("__SOURCE{}", slot.0)
+    }
+
+    /// GEMM entry `g`'s tokens, for one over a typed weight: its slot's index and dims, and its
+    /// rows (its layer is each command's).
+    fn record(&self, g: scratchy_target_metal::tape::lowered::GemmEntry) -> Option<TokenStream> {
+        if !Self::typed_weight(&self.typed, &g) {
+            return None;
+        }
+        let (w, m) = (Self::gemm(g.ix), g.dims.m);
+        Some(quote!(__tl::GemmEntry {
+            dims: __tl::GemmDims { m: #m, n: #w.n, k: #w.k },
+            ix: #w.ix,
+            which: __tl::WeightTensor::Weight,
+        }))
+    }
+
+    /// `list`, each weight of a typed family named through its slot's index.
+    fn binding_list(
+        &self,
+        list: &[scratchy_target_metal::tape::lowered::Binding],
+    ) -> Result<TokenStream, BakeDefect> {
+        use scratchy_target_metal::tape::lowered::Binding;
+        fn tokens<T: serde::Serialize>(v: &T) -> Result<TokenStream, BakeDefect> {
+            crate::const_tokens::const_tokens(v)
+                .map_err(|e| BakeDefect(format!("serialize command table: {e}")))
+        }
+        let items = (list.iter())
+            .map(|b| match b {
+                Binding::Source {
+                    ix,
+                    which,
+                    layer,
+                    binding_index,
+                } if self.typed.contains(ix) => {
+                    let s = Self::source(*ix);
+                    let (which, layer) = (tokens(which)?, tokens(layer)?);
+                    let bi = proc_macro2::Literal::u8_suffixed(*binding_index);
+                    Ok(quote!(__tl::Binding::Source {
+                        ix: #s,
+                        which: #which,
+                        layer: #layer,
+                        binding_index: #bi,
+                    }))
+                }
+                other => tokens(other),
+            })
+            .collect::<Result<Vec<_>, BakeDefect>>()?;
+        Ok(quote!(&[#(#items),*]))
+    }
+
+    /// The per-slot consts the table names: each read slot's weight (`GemmSlot::WEIGHT`: its
+    /// index and dims, read off its handle), and each bound slot's index (`Source::IX`).
+    fn markers(&self) -> TokenStream {
+        let tt = quote!(::scratchy_target_metal::tape::typed);
+        let weights = self.read.iter().map(|&ix| {
+            let ix = SourceIx(ix);
+            let (c, s) = (Self::gemm(ix), crate::canonical::slot(ix));
+            quote!(const #c: #tt::GemmSlotWeight = <super::#s as #tt::GemmSlot>::WEIGHT;)
+        });
+        let sources = self.bound.iter().map(|&ix| {
+            let ix = SourceIx(ix);
+            let (c, s) = (Self::source(ix), crate::canonical::slot(ix));
+            quote!(const #c: __ti::SourceIx = <super::#s as #tt::Source>::IX;)
+        });
+        quote!(#(#weights)* #(#sources)*)
     }
 }
 

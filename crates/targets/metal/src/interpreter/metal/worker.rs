@@ -26,7 +26,9 @@ use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;
 
 use super::ids::LayerId;
-use super::lowered::{Binding, Fence, KernelId, LoweredCommand, LoweredMetalTape, WeightTensor};
+use super::lowered::{
+    Binding, Fence, Gemm, GemmWeight, KernelId, LoweredCommand, LoweredMetalTape, WeightTensor,
+};
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
 use crate::MetalAllocator;
@@ -401,7 +403,7 @@ pub enum WorkerError {
         arena_len: usize,
     },
     /// `KernelId::Gemm` reached the bake step but its
-    /// `LoweredCommand::gemm_dims` was `None`. Indicates a lowering
+    /// `LoweredCommand::gemm` was `None`. Indicates a lowering
     /// bug — the lowering pass owns populating those for `Gemm`
     /// commands.
     MissingGemmDims {
@@ -492,7 +494,7 @@ impl std::fmt::Display for WorkerError {
             } => write!(
                 f,
                 "MetalWorker: bucket {bucket_index} command {command_index}: \
-                 KernelId::Gemm has no gemm_dims (lowering bug)"
+                 KernelId::Gemm has no gemm (lowering bug)"
             ),
             Self::GemmBindingsMalformed {
                 bucket_index,
@@ -1587,7 +1589,7 @@ fn bake_bucket<W: CanonicalParams>(
     for (cmd_idx, gated) in expanded_commands.iter().enumerate() {
         let cmd = &gated.command;
         if matches!(cmd.kernel, KernelId::Gemm) {
-            let dims = cmd.gemm_dims.ok_or(WorkerError::MissingGemmDims {
+            let Gemm { dims, weight } = cmd.gemm.ok_or(WorkerError::MissingGemmDims {
                 bucket_index,
                 command_index: cmd_idx,
             })?;
@@ -1595,6 +1597,7 @@ fn bake_bucket<W: CanonicalParams>(
                 bucket_index,
                 cmd_idx,
                 cmd,
+                weight,
                 arena,
                 moe_scratch,
                 sources,
@@ -1776,6 +1779,7 @@ fn resolve_gemm_buffers(
     bucket_index: usize,
     command_index: usize,
     cmd: &LoweredCommand,
+    weight: GemmWeight,
     arena: &[Buffer],
     moe_scratch: Option<&Buffer>,
     sources: &ResolvedSources,
@@ -1799,21 +1803,14 @@ fn resolve_gemm_buffers(
         sources,
         runtime,
     )?;
-    if bound.len() != 3 {
-        return Err(WorkerError::GemmBindingsMalformed {
-            bucket_index,
-            command_index,
-            reason: "expected exactly 3 bindings (out, in, weight)",
-        });
-    }
-    // Bindings are produced in the order the lowering pass listed
-    // them; their `binding_index` field carries the encoder slot but
-    // we only care about positional ordering. The lowering pass uses
-    // 0 = out, 1 = in, 2 = weight.
-    let mut iter = bound.into_iter();
-    let out = iter.next().expect("bound[0]");
-    let inp = iter.next().expect("bound[1]");
-    let wt = iter.next().expect("bound[2]");
+    // The lowering lists a GEMM's activations, 0 = out and 1 = in; its weight is its gemm
+    // record's.
+    let [out, inp] = <[_; 2]>::try_from(bound).map_err(|_| WorkerError::GemmBindingsMalformed {
+        bucket_index,
+        command_index,
+        reason: "expected exactly 2 bindings (out, in)",
+    })?;
+    let wt = sources.get(weight.ix, weight.which, weight.layer)?;
     Ok((
         BoundBuffer {
             buffer: inp.0,
@@ -1846,13 +1843,15 @@ impl ResolvedSources {
         let mut table = HashMap::new();
         let mut codes_bound = Vec::new();
         for c in tapes.iter().flat_map(LoweredMetalTape::commands_expanded) {
-            for b in c.command.bindings {
-                let &Binding::Source {
+            // Every weight the command reads: its source bindings, and its GEMM's weight.
+            let gemm = (c.command.gemm).map(|g| (g.weight.ix, g.weight.which, g.weight.layer));
+            let bound = c.command.bindings.iter().filter_map(|b| match *b {
+                Binding::Source {
                     ix, which, layer, ..
-                } = b
-                else {
-                    continue;
-                };
+                } => Some((ix, which, layer)),
+                _ => None,
+            });
+            for (ix, which, layer) in bound.chain(gemm) {
                 let miss = |why| WorkerError::SourceUnresolved {
                     ix,
                     source: W::SOURCES.get(ix.get() as usize).copied().unwrap_or("?"),
@@ -2205,7 +2204,7 @@ mod tests {
                 m_scaling: None,
             },
             bindings: crate::interpreter::metal::lowered::baked(Vec::new()),
-            gemm_dims: None,
+            gemm: None,
         };
         let (tq, fp16) = (
             command(KernelId::AttentionViaCacheTq),
@@ -2661,7 +2660,7 @@ mod tests {
                     binding_index: 2,
                 },
             ]),
-            gemm_dims: None,
+            gemm: None,
         };
         let fused_add_rmsnorm = LoweredCommand {
             kernel: KernelId::FusedAddRmsNorm,
@@ -2689,7 +2688,7 @@ mod tests {
                     binding_index: 2,
                 },
             ]),
-            gemm_dims: None,
+            gemm: None,
         };
         // Two RmsNorm commands then two FusedAddRmsNorm commands —
         // exercises both kernels and the coalescer's same-pipeline
@@ -3109,7 +3108,7 @@ mod tests {
                     binding_index: 5,
                 },
             ]),
-            gemm_dims: None,
+            gemm: None,
         };
         let tape = LoweredMetalTape {
             bucket_m: 1,
@@ -3181,14 +3180,15 @@ mod tests {
                     slot: 1,
                     binding_index: 1,
                 },
-                Binding::Source {
+            ]),
+            gemm: Some(crate::interpreter::metal::lowered::Gemm {
+                dims: crate::interpreter::metal::lowered::GemmDims { m: bucket_m, n, k },
+                weight: crate::interpreter::metal::lowered::GemmWeight {
                     ix: LINEAR,
                     which: WeightTensor::Weight,
                     layer: LayerId(0),
-                    binding_index: 2,
                 },
-            ]),
-            gemm_dims: Some(crate::interpreter::metal::lowered::GemmDims { m: bucket_m, n, k }),
+            }),
         }
     }
 
@@ -3298,7 +3298,7 @@ mod tests {
                     binding_index: 2,
                 },
             ]),
-            gemm_dims: None,
+            gemm: None,
         };
         let rmsnorm_post = LoweredCommand {
             kernel: KernelId::RmsNorm,
@@ -3332,7 +3332,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .into_baked(),
-            gemm_dims: None,
+            gemm: None,
         };
 
         let tape = LoweredMetalTape {

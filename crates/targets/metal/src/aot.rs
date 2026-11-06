@@ -23,7 +23,7 @@ use crate::specialized_pipeline_cache::{
 use crate::stream::MetalStreamError;
 use crate::tape::constants::{TapeVariant, UnboundConstant};
 use crate::tape::lowered::{
-    BakedDictionary, BakedKernel, BakedMetallib, KernelId, LoweredCommand, LoweredMetalTape,
+    BakedDictionary, BakedKernel, BakedMetallib, Gemm, KernelId, LoweredCommand, LoweredMetalTape,
     MetalDtype, baked,
 };
 
@@ -143,8 +143,8 @@ pub fn bake_keys(
     dtype: MetalDtype,
     variant: TapeVariant,
 ) -> Result<Vec<PipelineKey>, UnboundConstant> {
-    let mut keys = match (cmd.kernel, cmd.gemm_dims) {
-        (KernelId::Gemm, Some(dims)) => GemmBody::ALL
+    let mut keys = match (cmd.kernel, cmd.gemm) {
+        (KernelId::Gemm, Some(Gemm { dims, .. })) => GemmBody::ALL
             .into_iter()
             .filter_map(|body| gemm_pipeline(dtype, dims, body).ok())
             .map(|(key, _)| key)

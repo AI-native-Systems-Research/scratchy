@@ -49,6 +49,8 @@ pub struct WeightAccessor {
     /// Return type, as emitted Rust tokens (e.g.
     /// `crate::__gpu::layers::LinearLayer`).
     pub rust_type: TokenStream,
+    /// The kind of weight it holds: what its typed handle wraps.
+    pub kind: WeightKind,
     /// DSL weights that feed this accessor. One pair for a simple
     /// accessor, multiple for a fused one. Used for dedup and
     /// documentation; the user is responsible for providing a

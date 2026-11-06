@@ -1572,12 +1572,36 @@ pub struct PackedCommand {
     pub constants: PartIx,
     pub dispatch: PartIx,
     pub bindings: PartIx,
-    pub gemm_dims: PartIx,
+    /// Its GEMM in [`CommandTable::gemms`]: the GEMM's entry and its weight's layer.
+    pub gemm: PartIx,
     pub gate: PartIx,
 }
 
 // A distinct command costs its table fourteen bytes, where the [`GatedCommand`] it packs is 144.
 const _: [(); 14] = [(); std::mem::size_of::<PackedCommand>()];
+
+/// A GEMM as a command table holds it: its entry in [`CommandTable::gemm_entries`] (its dims and
+/// the weight family it reads, which a GEMM of every layer shares) and its weight's layer.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize)]
+pub struct GemmAt {
+    pub entry: PartIx,
+    pub layer: PackedLayer,
+}
+
+/// A GEMM weight's layer, as a command table holds it: two bytes, which every model's layer
+/// count fits (a model of more refuses its table).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize)]
+pub struct PackedLayer(pub u16);
+
+impl PackedLayer {
+    pub fn of(layer: LayerId) -> Option<Self> {
+        u16::try_from(layer.0).ok().map(Self)
+    }
+
+    pub fn layer(self) -> LayerId {
+        LayerId(u32::from(self.0))
+    }
+}
 
 /// Each distinct command of a model's baked tapes once ([`PackedCommand`]), beside each distinct
 /// value of its bulky fields once. A tape lists [`CommandIx`]es into it ([`TapeCommands`]).
@@ -1588,7 +1612,8 @@ pub struct CommandTable {
     pub constants: &'static [&'static [ConstantValue]],
     pub dispatches: &'static [DispatchShape],
     pub bindings: &'static [&'static [Binding]],
-    pub gemm_dims: &'static [Option<GemmDims>],
+    pub gemms: &'static [Option<GemmAt>],
+    pub gemm_entries: &'static [GemmEntry],
     pub gates: &'static [Option<RuntimeGate>],
 }
 
@@ -1600,7 +1625,8 @@ impl CommandTable {
         constants: &[],
         dispatches: &[],
         bindings: &[],
-        gemm_dims: &[],
+        gemms: &[],
+        gemm_entries: &[],
         gates: &[],
     };
 
@@ -1616,7 +1642,8 @@ impl CommandTable {
                 constants: self.constants[p.constants.get()],
                 dispatch: self.dispatches[p.dispatch.get()],
                 bindings: self.bindings[p.bindings.get()],
-                gemm_dims: self.gemm_dims[p.gemm_dims.get()],
+                gemm: (self.gemms[p.gemm.get()])
+                    .map(|g| self.gemm_entries[g.entry.get()].at(g.layer.layer())),
             },
             gate: self.gates[p.gate.get()],
         }
@@ -1661,7 +1688,8 @@ pub struct CommandTableBuilder {
     constants: Parts<&'static [ConstantValue]>,
     dispatches: Parts<DispatchShape>,
     bindings: Parts<&'static [Binding]>,
-    gemm_dims: Parts<Option<GemmDims>>,
+    gemms: Parts<Option<GemmAt>>,
+    gemm_entries: Parts<GemmEntry>,
     gates: Parts<Option<RuntimeGate>>,
 }
 
@@ -1672,7 +1700,8 @@ pub struct CommandTableParts {
     pub constants: Vec<&'static [ConstantValue]>,
     pub dispatches: Vec<DispatchShape>,
     pub bindings: Vec<&'static [Binding]>,
-    pub gemm_dims: Vec<Option<GemmDims>>,
+    pub gemms: Vec<Option<GemmAt>>,
+    pub gemm_entries: Vec<GemmEntry>,
     pub gates: Vec<Option<RuntimeGate>>,
 }
 
@@ -1696,7 +1725,16 @@ impl CommandTableBuilder {
             constants: self.constants.intern(c.constants).ok_or(too_many)?,
             dispatch: self.dispatches.intern(c.dispatch).ok_or(too_many)?,
             bindings: self.bindings.intern(c.bindings).ok_or(too_many)?,
-            gemm_dims: self.gemm_dims.intern(c.gemm_dims).ok_or(too_many)?,
+            gemm: {
+                let at = match c.gemm {
+                    Some(g) => Some(GemmAt {
+                        entry: self.gemm_entries.intern(g.entry()).ok_or(too_many)?,
+                        layer: PackedLayer::of(g.weight.layer).ok_or(too_many)?,
+                    }),
+                    None => None,
+                };
+                self.gemms.intern(at).ok_or(too_many)?
+            },
             gate: self.gates.intern(gate).ok_or(too_many)?,
         };
         self.commands.push(packed);
@@ -1715,7 +1753,8 @@ impl CommandTableBuilder {
             constants: self.constants.values,
             dispatches: self.dispatches.values,
             bindings: self.bindings.values,
-            gemm_dims: self.gemm_dims.values,
+            gemms: self.gemms.values,
+            gemm_entries: self.gemm_entries.values,
             gates: self.gates.values,
         }
     }
@@ -1730,7 +1769,8 @@ impl CommandTableParts {
             constants: baked(self.constants),
             dispatches: baked(self.dispatches),
             bindings: baked(self.bindings),
-            gemm_dims: baked(self.gemm_dims),
+            gemms: baked(self.gemms),
+            gemm_entries: baked(self.gemm_entries),
             gates: baked(self.gates),
         }))
     }
@@ -1841,13 +1881,11 @@ pub struct LoweredCommand {
     pub constants: &'static [ConstantValue],
     pub dispatch: DispatchShape,
     pub bindings: &'static [Binding],
-    /// Dense-GEMM dimensions when `kernel == KernelId::Gemm`; `None`
-    /// for every other kernel. The worker reads `(m, n, k)` from
-    /// here when encoding the MPS dispatch (5.C.5 routing).
-    /// Carried on the lowered command rather than baked into
-    /// `DispatchShape` because MPS does not consume threadgroup
-    /// counts — the dimensions are the actual API parameters.
-    pub gemm_dims: Option<GemmDims>,
+    /// The dense GEMM when `kernel == KernelId::Gemm`; `None` for every other kernel: its
+    /// dimensions, which the worker picks and bakes the kernel from, and its weight, which it
+    /// binds at [`GEMM_WEIGHT_BINDING`]. The weight is named here and nowhere else — `bindings`
+    /// holds the GEMM's activations — so its dims and the weight it reads are one record.
+    pub gemm: Option<Gemm>,
 }
 
 impl LoweredCommand {
@@ -1873,7 +1911,7 @@ impl LoweredCommand {
             constants: baked(constants.into()),
             dispatch,
             bindings: baked(bindings.into()),
-            gemm_dims: None,
+            gemm: None,
         }
     }
 
@@ -1918,6 +1956,7 @@ impl GatedCommand {
                 .map(|b| b.bump_layer(by))
                 .collect::<Vec<_>>(),
         );
+        c.command.gemm = c.command.gemm.map(|g| g.bump_layer(by));
         c
     }
 
@@ -1941,6 +1980,70 @@ impl GatedCommand {
 impl From<LoweredCommand> for GatedCommand {
     fn from(command: LoweredCommand) -> Self {
         Self::ungated(command)
+    }
+}
+
+/// A dense GEMM (`KernelId::Gemm`): its dims and the weight it reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct Gemm {
+    pub dims: GemmDims,
+    pub weight: GemmWeight,
+}
+
+/// A GEMM's weight: `which` tensor of source family `ix` at `layer`, as a
+/// [`Binding::Source`] would name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct GemmWeight {
+    pub ix: SourceIx,
+    pub which: WeightTensor,
+    pub layer: LayerId,
+}
+
+/// Where a GEMM kernel takes its weight (`out` at 0, `in` at 1).
+pub const GEMM_WEIGHT_BINDING: u8 = 2;
+
+/// A [`Gemm`] as a command table holds it: its dims and the weight family it reads, at no layer
+/// (each GEMM's [`GemmAt`] holds the layer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct GemmEntry {
+    pub dims: GemmDims,
+    pub ix: SourceIx,
+    pub which: WeightTensor,
+}
+
+impl GemmEntry {
+    /// The GEMM of this entry's weight at `layer`.
+    pub fn at(self, layer: LayerId) -> Gemm {
+        let Self { dims, ix, which } = self;
+        Gemm {
+            dims,
+            weight: GemmWeight { ix, which, layer },
+        }
+    }
+}
+
+impl Gemm {
+    /// This GEMM in loop iteration `by`: its weight's layer advanced.
+    pub fn bump_layer(self, by: u32) -> Self {
+        let GemmWeight { ix, which, layer } = self.weight;
+        Self {
+            dims: self.dims,
+            weight: GemmWeight {
+                ix,
+                which,
+                layer: layer.advance(by),
+            },
+        }
+    }
+
+    /// Its table entry: everything but its weight's layer.
+    pub fn entry(self) -> GemmEntry {
+        let GemmWeight { ix, which, .. } = self.weight;
+        GemmEntry {
+            dims: self.dims,
+            ix,
+            which,
+        }
     }
 }
 
