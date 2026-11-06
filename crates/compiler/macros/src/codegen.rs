@@ -16838,9 +16838,6 @@ pub fn emit_model(
                         // The caller's rows of the final hidden states (an MTP head's next input),
                         // before the worker goes back to the pool and its arena is reused.
                         if let Some(h) = ctx.hidden_out {
-                            // The forward's rows: its bucket's proof's, at most the bucket's rows.
-                            let n = ::scratchy_target_metal::interpreter::metal::Buckets::tokens(bucket)
-                                .get() as usize;
                             let row_bytes =
                                 <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.hidden().get() * 2;
                             let hidden = worker.arena[spec.backbone_slot as usize].contents();
