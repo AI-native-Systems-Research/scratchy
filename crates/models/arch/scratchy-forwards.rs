@@ -221,18 +221,20 @@ const SPYRE_CAPABLE: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
 /// Arches the cuda backend lowers: every op of their prefill canonicals has a CUDA kernel. Each
 /// model of one emits its per-bucket `static` CUDA tapes (`CUDA_TAPES`).
 ///
-/// Listed per arch, built per stem: not every config of a listed arch lowers. qwen3-5's
-/// `qwen3.5-0.8b-parity-tiny` has GEMMs of n = 128, off the bf16 GEMM's 256-column tile, so the
-/// arch-wide `model/qwen3-5` panics at build time naming that refusal; build `model/qwen3.5-0.8b`
-/// (CLAUDE.md asks for a per-stem build anyway). qwen3-5-moe's `qwen3.5-35b-a3b-parity-tiny`
-/// (hidden 128, head_dim 32) is refused the same way, so the arch-wide `model/qwen3-5-moe`
-/// panics too; build `model/qwen3.6-35b-a3b`. gemma4-moe's tiny configs (`-class-tiny`,
-/// `-parity-tiny*`: GEMMs off the tiles, head dims 64 and 128) are refused the same way, so the
-/// arch-wide `model/gemma4-moe` panics; build `model/gemma-4-26b-a4b-it`.
+/// Listed per arch, built per stem, and under `fp8-dynamic-per-channel` only ([`CUDA_PRESETS`]):
+/// CUDA serves FP8 models only (#978). Not every config of a listed arch lowers (a tiny parity
+/// config's GEMMs sit off the tiles), so the arch-wide `model/<arch>` panics at build time naming
+/// that refusal. Build one FP8 checkpoint's stem with the preset: `model/qwen3.8-27b-text-only`
+/// (the bare stem selects the vision arch), `model/qwen3.6-35b-a3b` or `model/gemma-4-26b-a4b-it`,
+/// each with `quant/fp8-dynamic-per-channel`.
 ///
 /// Must agree with src/lib.rs gates; an arch selected under `cuda` but not listed here is refused
 /// by name below rather than silently dropped.
 const CUDA_CAPABLE: &[&str] = &["qwen3-5", "qwen3-5-moe", "gemma4-moe"];
+/// The quant presets the cuda backend builds, and the only ones: CUDA serves FP8 models only
+/// (#978), so a cuda build that would compile a model dense, or under a preset CUDA has no
+/// kernels for, is refused below.
+const CUDA_PRESETS: &[&str] = &["fp8-dynamic-per-channel"];
 
 /// A checkpoint config's identity for matching: its architecture and shape (hidden size, layers,
 /// vocab size; the text decoder's when `text_config` nests it).
@@ -458,6 +460,20 @@ fn main() {
         .flat_map(|(_, _, cfg)| enabled_quants(&cfg.join("quantizations.json"), &enabled_presets))
         .collect();
     let quants = quant_union.iter().cloned().collect::<Vec<_>>().join(",");
+    // CUDA builds FP8 models only (#978): every selected CUDA arch compiles under exactly
+    // `CUDA_PRESETS`, never dense (no preset) and never under a preset with no CUDA kernels.
+    // Refused here, before any expansion.
+    if cuda {
+        for (_, mod_name, cfg) in &targets {
+            let q = enabled_quants(&cfg.join("quantizations.json"), &enabled_presets);
+            if q.is_empty() || q.iter().any(|p| !CUDA_PRESETS.contains(&p.as_str())) {
+                panic!(
+                    "CUDA builds FP8 models only: add quant/fp8-dynamic-per-channel and no other \
+                     quant preset (arch `{mod_name}` would compile with presets {q:?})"
+                );
+            }
+        }
+    }
     // SAFETY: set once here, before the rayon fan-out reads it; no other thread
     // mutates the environment. `set_var` is unsafe on 2024.
     unsafe {

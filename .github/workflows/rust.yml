@@ -100,25 +100,24 @@ jobs:
           --all-targets -- -D warnings
 
       # The CUDA scaffold: no nvcc, no GPU. Lints the target crates and the
-      # macro under `cuda`, runs the lowering tests, and expands qwen3.5-0.8b
-      # and qwen3.5-9b (`qwen3.5-9b-text-only`: the bare stem selects the
-      # vision arch), Qwen3.6-35B-A3B (the MoE block, #841) and Gemma 4
-      # 26B-A4B (two attention classes, #885) to their static CUDA tapes,
-      # checked against what CUDA's compiler lowers.
+      # macro under `cuda`, runs the lowering tests, and expands the three FP8
+      # checkpoints' models, Qwen3.8-27B (`qwen3.8-27b-text-only`: the bare
+      # stem selects the vision arch), Qwen3.6-35B-A3B and Gemma 4 26B-A4B,
+      # under `fp8-dynamic-per-channel`, the only preset CUDA builds, to their
+      # static CUDA tapes, checked against what CUDA's compiler lowers and
+      # against each checkpoint's safetensors headers.
       - name: CUDA scaffold (no toolchain)
         run: |
           cargo clippy -p scratchy-target-cuda -p scratchy-target-cuda-compiler --all-targets -- -D warnings
           cargo clippy -p scratchy-forward-compiler-macro --features cuda -- -D warnings
-          cargo clippy -p scratchy-models --features cuda,qwen3.5-0.8b --all-targets -- -D warnings
-          cargo clippy -p scratchy-models --features cuda,qwen3.5-9b-text-only --all-targets -- -D warnings
-          cargo clippy -p scratchy-models --features cuda,qwen3.6-35b-a3b --all-targets -- -D warnings
-          cargo clippy -p scratchy-models --features cuda,gemma-4-26b-a4b-it --all-targets -- -D warnings
+          cargo clippy -p scratchy-models --features cuda,qwen3.8-27b-text-only,scratchy-quantizations/fp8-dynamic-per-channel --all-targets -- -D warnings
+          cargo clippy -p scratchy-models --features cuda,qwen3.6-35b-a3b,scratchy-quantizations/fp8-dynamic-per-channel --all-targets -- -D warnings
+          cargo clippy -p scratchy-models --features cuda,gemma-4-26b-a4b-it,scratchy-quantizations/fp8-dynamic-per-channel --all-targets -- -D warnings
           cargo test -p scratchy-target-cuda -p scratchy-target-cuda-compiler
           cargo test -p scratchy-target-cuda --test kernels_use_thunderkittens
-          cargo test -p scratchy-models --features cuda,qwen3.5-0.8b --test cuda_tapes
-          cargo test -p scratchy-models --features cuda,qwen3.5-9b-text-only --test cuda_tapes_9b
-          cargo test -p scratchy-models --features cuda,qwen3.6-35b-a3b --test cuda_tapes_35b
-          cargo test -p scratchy-models --features cuda,gemma-4-26b-a4b-it --test cuda_tapes_gemma4
+          cargo test -p scratchy-models --features cuda,qwen3.8-27b-text-only,scratchy-quantizations/fp8-dynamic-per-channel --test cuda_tapes_27b_fp8
+          cargo test -p scratchy-models --features cuda,qwen3.6-35b-a3b,scratchy-quantizations/fp8-dynamic-per-channel --test cuda_tapes_35b_fp8
+          cargo test -p scratchy-models --features cuda,gemma-4-26b-a4b-it,scratchy-quantizations/fp8-dynamic-per-channel --test cuda_tapes_gemma4_fp8
 
       # The multi-node control plane, the rank rendezvous and the channel
       # that carries `ControlMessage` to followers, is plain TCP + serde: no

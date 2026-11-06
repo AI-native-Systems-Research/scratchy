@@ -59,8 +59,10 @@ cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
   `-Fquant/<preset>` only if the change is quant-specific. Never build
   `model/<arch>` or `model/all` just to test one thing — that forward-expands
   every config in scope (minutes-to-hours, OOM risk on a laptop).
-- `cuda`, `metal` and `spyre` are mutually exclusive. `cuda` builds no model
-  yet: `scratchy-models`' build script refuses every arch until one lowers.
+- `cuda`, `metal` and `spyre` are mutually exclusive. `cuda` builds FP8 models
+  only: name `quant/fp8-dynamic-per-channel` with one of
+  `model/qwen3.8-27b-text-only`, `model/qwen3.6-35b-a3b` or
+  `model/gemma-4-26b-a4b-it`; any other `cuda` build panics at build time.
 - `scratchy-target-cuda`'s `nvcc` feature compiles `kernels/*.cu`
   (ThunderKittens vendored at `kernels/thunderkittens/`) for `sm_90a` and links
   them. It needs CUDA 12.8+ `nvcc` on `PATH`, and its tests need an H100. CI
@@ -83,8 +85,9 @@ compiler crate via its own edge to scratchy-target-metal — and `--workspace`
 builds every member as a root regardless of `--features`, so excluding only
 one of the two still drags `objc2` onto Linux). Its "CUDA scaffold" step then
 lints `scratchy-target-cuda`/`scratchy-target-cuda-compiler` (`--all-targets`)
-and the macro under `--features cuda`, and runs the two CUDA crates' tests — no
-nvcc, no GPU. The **macOS** job
+and the macro under `--features cuda`, runs the two CUDA crates' tests, and
+expands the three FP8 models to their tapes (`cuda_tapes_*_fp8`) — no nvcc, no
+GPU. The **macOS** job
 runs `cargo clippy -p scratchy-models --features metal,all,mtp,turboquant -- -D warnings`
 + kernel tests (`mtp` adds the multi-token-prediction head of every model whose
 checkpoint carries one: heads have no configs of their own, so `all` alone

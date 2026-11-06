@@ -708,7 +708,8 @@ metal = [
 ]
 # NVIDIA CUDA. Builds the arches `CUDA_CAPABLE` in scratchy-forwards.rs lists, each model with its
 # per-bucket `static` CUDA prefill tapes (`CUDA_TAPES`); the build script refuses any other arch by
-# name. Toolchain-free: no nvcc, no GPU.
+# name, and any model not under `fp8-dynamic-per-channel` (CUDA serves FP8 models only).
+# Toolchain-free: no nvcc, no GPU.
 cuda = [
     "scratchy-forward-compiler-macro/cuda",
     "scratchy-forward-compiler/cuda",
@@ -791,16 +792,16 @@ rayon = { workspace = true }
 ureq = { workspace = true, optional = true }
 
 [dev-dependencies]
-# tests/cuda_tapes.rs and tests/cuda_prefill.rs: the canonicals `#[forward]` hands the
-# target-emitter seam (`target_model_inputs`), recaptured to check the emitted tapes against what
-# CUDA's compiler lowers from them, and the cuda target's own test helpers (`#[path]`, not a copy:
-# `chains.rs`, `numerics.rs`), which name these crates.
+# tests/cuda_tapes_*_fp8.rs: the canonicals `#[forward]` hands the target-emitter seam
+# (`target_model_inputs`), recaptured to check the emitted tapes against what CUDA's compiler
+# lowers from them, and the cuda target's own test helper (`#[path]`, not a copy: `chains.rs`),
+# which names these crates.
 scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
 scratchy-subtile = { path = "../../compiler/subtile" }
 scratchy-target-cuda-compiler = { path = "../../targets/cuda/compiler" }
 half = { workspace = true }
-# tests/cuda_hf_parity.rs reads the HF reference's `meta.json` and `greedy_<p>.json` goldens. It
-# runs on Linux (the H100), so not under the macOS-only section below.
+# The FP8 tape tests read `tests/fixtures/fp8_headers_*.json`. They run on Linux CI too, so not
+# under the macOS-only section below.
 serde_json = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
@@ -838,48 +839,10 @@ required-features = ["metal", "qwen3-0.6b"]
 name = "carrier_parity"
 required-features = ["metal"]
 
-# qwen3.5-0.8b's emitted CUDA tapes against what CUDA's compiler lowers, and the issue's numbers.
-# No toolchain needed.
-[[test]]
-name = "cuda_tapes"
-required-features = ["cuda", "qwen3.5-0.8b"]
-
-# One whole-model prefill forward of qwen3.5-0.8b's emitted tapes on the GPU, synthetic weights.
-# Needs nvcc to build and an H100 to run.
-[[test]]
-name = "cuda_prefill"
-required-features = ["nvcc", "qwen3.5-0.8b"]
-
-# qwen3.5-0.8b's prefill from the real checkpoint against HF transformers' logits
-# (tests/cuda_hf_reference.py's goldens). Needs nvcc to build, and an H100, the checkpoint and the
-# goldens to run.
-[[test]]
-name = "cuda_hf_parity"
-required-features = ["nvcc", "qwen3.5-0.8b"]
-
-# The same three for qwen3.5-9b, sharing their bodies with the 0.8b's (tests/common/). The 9b is
-# `qwen3.5-9b-text-only`: the bare `qwen3.5-9b` feature selects the vision arch `qwen3-5-vl`.
-[[test]]
-name = "cuda_tapes_9b"
-required-features = ["cuda", "qwen3.5-9b-text-only"]
-
-# Qwen3.6-35B-A3B's emitted CUDA tapes (#841): the MoE block's steps, MoE scratch and bundles,
-# checked with no toolchain. The model's MoE steps have no kernels yet (#857).
-[[test]]
-name = "cuda_tapes_35b"
-required-features = ["cuda", "qwen3.6-35b-a3b"]
-
-# Gemma 4 26B-A4B's emitted CUDA tapes (#885): its two attention classes, two rotary tables,
-# Gemma routing, 64-column GEMMs and weight table, checked with no toolchain. Its new steps have
-# no kernels yet (#885's 13b and 13c).
-[[test]]
-name = "cuda_tapes_gemma4"
-required-features = ["cuda", "gemma-4-26b-a4b-it"]
-
 # The three FP8 checkpoints' emitted CUDA tapes under `fp8-dynamic-per-channel` (FP8 S2): the fp8
 # steps per bucket, the quant writes and the quant scratch's liveness, the weight table, and
 # `check` against each checkpoint's real safetensors headers (`tests/fixtures/fp8_headers_*`), with
-# no toolchain. The fp8 steps have no kernels yet (S3, S4).
+# no toolchain. CUDA builds FP8 models only (#978); the decode fp8 GEMVs are S4's.
 [[test]]
 name = "cuda_tapes_27b_fp8"
 required-features = ["cuda", "qwen3.8-27b-text-only", "scratchy-quantizations/fp8-dynamic-per-channel"]
@@ -891,48 +854,3 @@ required-features = ["cuda", "qwen3.6-35b-a3b", "scratchy-quantizations/fp8-dyna
 [[test]]
 name = "cuda_tapes_gemma4_fp8"
 required-features = ["cuda", "gemma-4-26b-a4b-it", "scratchy-quantizations/fp8-dynamic-per-channel"]
-
-# Gemma 4 26B-A4B's whole-model synthetic-weight forward on the H100 (#925): the qwen checks (a)-(o)
-# where they apply, plus the sliding window's (p)-(r), in its own body
-# (tests/common/cuda_prefill_gemma4_body.rs). Needs nvcc to build, and an H100 and about 51 GB of
-# host RAM to run.
-[[test]]
-name = "cuda_prefill_gemma4"
-required-features = ["nvcc", "gemma-4-26b-a4b-it"]
-
-[[test]]
-name = "cuda_prefill_9b"
-required-features = ["nvcc", "qwen3.5-9b-text-only"]
-
-[[test]]
-name = "cuda_hf_parity_9b"
-required-features = ["nvcc", "qwen3.5-9b-text-only"]
-
-# Qwen3.6-35B-A3B on the H100 from its real checkpoint (#859): the memory gate and P1-P8 against
-# HF transformers (the 9b's body, tests/common/), P9 the expert picks against HF's routing dump,
-# and the synthetic-weight whole-model body. Need nvcc to build, and an H100, the 26-shard
-# checkpoint and the goldens to run.
-[[test]]
-name = "cuda_hf_parity_35b"
-required-features = ["nvcc", "qwen3.6-35b-a3b"]
-
-[[test]]
-name = "cuda_route_parity_35b"
-required-features = ["nvcc", "qwen3.6-35b-a3b"]
-
-[[test]]
-name = "cuda_prefill_35b"
-required-features = ["nvcc", "qwen3.6-35b-a3b"]
-
-# Gemma 4 26B-A4B on the H100 from its real checkpoint (#933): the memory gate and P1-P8 against
-# HF transformers (the shared body, tests/common/), plus the decode checks (k), (n) and (r) on real
-# weights; and P9, the expert picks against HF's routing dump (the 35B's body, shared). Need nvcc
-# to build, and an H100, the 2-shard checkpoint and the goldens to run.
-[[test]]
-name = "cuda_hf_parity_gemma4"
-required-features = ["nvcc", "gemma-4-26b-a4b-it"]
-
-[[test]]
-name = "cuda_route_parity_gemma4"
-required-features = ["nvcc", "gemma-4-26b-a4b-it"]
-

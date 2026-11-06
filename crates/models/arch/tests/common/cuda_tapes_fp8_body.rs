@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // The model-independent body of the FP8 `cuda_tapes_*_fp8` tests (FP8 S2), shared by the 27B, the
 // 35B and Gemma 4 26B-A4B under `fp8-dynamic-per-channel`. Included with `include!` at the
-// binary's root, as `cuda_tapes_body.rs` is, so every test keeps its name. The including binary
+// binary's root, so every test keeps its name. The including binary
 // supplies the model: its `CUDA_TAPES`, `CUDA_UNLOWERED` and `CUDA_WEIGHTS`, the `chains` module
 // (`targets/cuda/tests/common/chains.rs`), and the constants these tests read: `STEM`, `FEATURE`,
 // `ARCH`, `DECODE_STEPS`, `PREFILL_STEPS`, `QUANTS`, `QUANT_READERS`, `QUANT_COLS`,
