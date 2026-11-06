@@ -10753,7 +10753,65 @@ fn launch_tokens(
         gathered,
         fold_rows,
         walk,
+        tp,
     } = kv;
+    // A collective's consume: its kind, the operand it sends, and the fragment — re-minted through
+    // `Fragment::baked`, a `const fn`, so the static this lands in re-proves the fragment's law.
+    let tp = match tp {
+        None => quote! { ::core::option::Option::None },
+        Some(c) => {
+            use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::collective::CollectiveKind as K;
+            let kind = match c.kind {
+                K::AllReduce => {
+                    quote! { ::scratchy_target_spyre::bundle_code::collective::CollectiveKind::AllReduce }
+                }
+                K::AllGather => {
+                    quote! { ::scratchy_target_spyre::bundle_code::collective::CollectiveKind::AllGather }
+                }
+            };
+            let operand = place_id_tokens(&c.operand);
+            let [first, sticks, rows] = [
+                c.fragment.first_stick(),
+                c.fragment.sticks(),
+                c.fragment.rows(),
+            ]
+            .map(proc_macro2::Literal::u32_unsuffixed);
+            // A rank-selected consume's rank, re-minted against its world through the const fn that
+            // refuses a rank the world does not have.
+            let plays_at = match c.plays_at {
+                None => quote! { ::core::option::Option::None },
+                Some(p) => {
+                    let id = p.rank();
+                    let (w, r) = (
+                        proc_macro2::Literal::u32_unsuffixed(id.world().get()),
+                        proc_macro2::Literal::u32_unsuffixed(id.rank()),
+                    );
+                    quote! {
+                        ::core::option::Option::Some(
+                            ::scratchy_target_spyre::bundle_code::collective::PlaysAt::baked(
+                                ::scratchy_target_spyre::bundle_code::collective::TpWorld::of::<#w>(),
+                                #r,
+                            )
+                        )
+                    }
+                }
+            };
+            // The window cut, re-minted through the const fn that refuses a cut the window
+            // does not have.
+            let cut = proc_macro2::Literal::u32_unsuffixed(c.cut.index() as u32);
+            quote! {
+                ::core::option::Option::Some(::scratchy_target_spyre::bundle_code::collective::TpConsume {
+                    kind: #kind,
+                    operand: #operand,
+                    fragment: ::scratchy_target_spyre::bundle_code::collective::Fragment::baked(
+                        #first, #sticks, #rows,
+                    ),
+                    plays_at: #plays_at,
+                    cut: ::scratchy_target_spyre::bundle_code::collective::WindowCut::baked(#cut),
+                })
+            }
+        }
+    };
     let walk = match walk {
         Some(scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::Walk {
             trips,
@@ -10816,6 +10874,7 @@ fn launch_tokens(
                 gathered: #gathered,
                 fold_rows: #fold_rows,
                 walk: #walk,
+                tp: #tp,
             },
             programs: ::std::borrow::Cow::Borrowed(&[#(#progs),*]),
             init_binary: #image,
@@ -11637,6 +11696,55 @@ fn dump_wavefront_mega(
             std::cell::RefCell::new((None, None));
         let weight_seg_ledger: std::cell::RefCell<Vec<(String, u64, Vec<u64>)>> =
             std::cell::RefCell::new(Vec::new());
+        // ⭐ THE STATE ONE TENSOR-PARALLEL WORLD'S BAKES COMMIT INTO. Every cell above is the
+        // one-rank world's; a sharded world bakes its own forward (rank-local weights, its own
+        // fingerprints, its own wiring) and commits into cells of its own — its weight segment is
+        // not the one-rank world's, so the parity law judges its ledger apart, and its wiring must
+        // not overwrite the one-rank decode slot. ONE commit (`commit_bake`) serves every world;
+        // the world is which cells it is handed.
+        struct WorldBake<'w> {
+            fp: &'w std::cell::RefCell<Option<String>>,
+            prefill_fp: &'w std::cell::RefCell<Option<String>>,
+            prefill_rungs: &'w std::cell::RefCell<Vec<(u32, String)>>,
+            prefill_prefix_rungs: &'w std::cell::RefCell<Vec<(u32, String)>>,
+            decode_rungs: &'w std::cell::RefCell<Vec<DecodeRungEntry>>,
+            wiring: &'w std::cell::RefCell<WiringPair>,
+            fold_census: &'w std::cell::RefCell<WeightFoldCensus>,
+            weight_seg_ledger: &'w std::cell::RefCell<Vec<(String, u64, Vec<u64>)>>,
+        }
+        type WiringPair = (
+            Option<proc_macro2::TokenStream>,
+            Option<proc_macro2::TokenStream>,
+        );
+        let one_rank = WorldBake {
+            fp: &superdsc_fp,
+            prefill_fp: &superdsc_prefill_fp,
+            prefill_rungs: &superdsc_prefill_rungs,
+            prefill_prefix_rungs: &superdsc_prefill_prefix_rungs,
+            decode_rungs: &superdsc_decode_rungs,
+            wiring: &wiring_tokens,
+            fold_census: &weight_fold_census,
+            weight_seg_ledger: &weight_seg_ledger,
+        };
+        // The two-rank world's cells (`SPYRE_TP_WORLDS = [1, 2]`; see the sharded bake below).
+        let tp2_fp = std::cell::RefCell::new(None);
+        let tp2_prefill_fp = std::cell::RefCell::new(None);
+        let tp2_prefill_rungs = std::cell::RefCell::new(Vec::new());
+        let tp2_prefill_prefix_rungs = std::cell::RefCell::new(Vec::new());
+        let tp2_decode_rungs = std::cell::RefCell::new(Vec::new());
+        let tp2_wiring: std::cell::RefCell<WiringPair> = std::cell::RefCell::new((None, None));
+        let tp2_fold_census = std::cell::RefCell::new(None);
+        let tp2_weight_seg_ledger = std::cell::RefCell::new(Vec::new());
+        let two_ranks = WorldBake {
+            fp: &tp2_fp,
+            prefill_fp: &tp2_prefill_fp,
+            prefill_rungs: &tp2_prefill_rungs,
+            prefill_prefix_rungs: &tp2_prefill_prefix_rungs,
+            decode_rungs: &tp2_decode_rungs,
+            wiring: &tp2_wiring,
+            fold_census: &tp2_fold_census,
+            weight_seg_ledger: &tp2_weight_seg_ledger,
+        };
         // ⭐ WHAT ONE BAKE DOES TO THE EXPANSION'S SHARED STATE, recorded in the order it happens and
         // applied by `commit_bake` — so the heavy part of a bake (`emit_bundle_deferred`) touches no
         // shared state at all, and can run on any thread, while the expansion still sees exactly the
@@ -11719,8 +11827,14 @@ fn dump_wavefront_mega(
              // The row count THIS bundle is baked at. Not `primary_m`: a batch-ladder
              // rung is a wider bake of the same tape, and reading the env knob here
              // would tell every rung it was one row.
-             decode_rows: u32|
+             decode_rows: u32,
+             // The slice law of every source when `lwd` is one rank of a sharded world — the
+             // numeric gate runs such a bundle on both ranks at once. `None` for a world of one.
+             shards: Option<&[scratchy_subtile::tensor_parallel::SourceShard]>|
              -> (BakeOut, Vec<BakeEffect>) {
+                // Only the emulator's numeric gate reads the slice laws.
+                #[cfg(not(feature = "spyre-emu"))]
+                let _ = shards;
                 let mut fx: Vec<BakeEffect> = Vec::new();
                 let is_prefill = prefill_mq.is_some();
                 // A prefill chunk's rows are one prompt's positions; a decode bundle's are one token
@@ -12804,6 +12918,7 @@ fn dump_wavefront_mega(
                                                     fp: &bfp,
                                                     cap,
                                                     active_cap,
+                                                    shards,
                                                 };
                                                 // ⭐ THE SHIPPED BUNDLE'S OWN PIN WINDOW — read
                                                 // from its emitted layout, so the twin's minted
@@ -13359,7 +13474,7 @@ fn dump_wavefront_mega(
                         man,
                     } => {
                         let w = emit_superdsc_wiring(&gk, lwd, model, decode_position, &man);
-                        let mut s = wiring_tokens.borrow_mut();
+                        let mut s = world.wiring.borrow_mut();
                         let mut bound = registry_bound.borrow_mut();
                         match slot {
                             Some(WiringSlot::Prefill) => {
@@ -13376,7 +13491,10 @@ fn dump_wavefront_mega(
                     // ⭐ ONE LEDGER ENTRY per baked bundle — the parity law judges the
                     // whole ledger once, after the last bake.
                     BakeEffect::WeightSeg { base, bank0, banks } => {
-                        weight_seg_ledger.borrow_mut().push((base, bank0, banks));
+                        world
+                            .weight_seg_ledger
+                            .borrow_mut()
+                            .push((base, bank0, banks));
                     }
                     BakeEffect::Registry {
                         prefill,
@@ -14124,6 +14242,13 @@ fn dump_wavefront_mega(
             &weight_seg_ledger.borrow(),
         ) {
             panic!("[spyre-superdsc] {stem}: {e}");
+        }
+        // AND EACH SHARDED WORLD'S, APART: a rank packs its own shard of the weights, one resident
+        // segment per rank, which no one-rank bundle shares.
+        if let Err(e) = scratchy_target_spyre::lower_subtile_tape_to_superdsc::weight_segment_parity(
+            &two_ranks.weight_seg_ledger.borrow(),
+        ) {
+            panic!("[spyre-superdsc] {stem} (tp=2): {e}");
         }
         // ⛔⛔ AND EVERY BUNDLE OF A PHASE PLACES THE REGISTRY ITS PHASE'S WIRING BINDS — the emulator
         // worker stages one wiring's scales for every bundle of a phase. (A card launch binds its own

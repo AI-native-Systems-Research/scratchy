@@ -4020,6 +4020,10 @@ pub struct GateRung<'a> {
     /// The rung's sweep — its paged walk ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]),
     /// so the gate stages the step against the reach the bundle was baked with.
     pub active_cap: ActiveCap,
+    /// The slice law of every source, when the rung was baked for a sharded world (the analysis's
+    /// `ShardedForward::sources`) — `None` for a world of one. A sharded rung is gated on both
+    /// ranks at once ([`numeric_gate_two_rank`]).
+    pub shards: Option<&'a [scratchy_subtile::tensor_parallel::SourceShard]>,
 }
 
 #[cfg(feature = "spyre-emu")]
