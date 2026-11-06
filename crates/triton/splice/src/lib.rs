@@ -3030,7 +3030,7 @@ fn matmul_out_width<F: scratchy_subtile::subtile_ir::RopeForm>(
                     | SubOp::RmsNorm { .. }
                     | SubOp::Elementwise(_)
                     | SubOp::SiluMul
-                    | SubOp::AllReduce
+                    | SubOp::AllReduce { .. }
                     | SubOp::AllGather { .. }
             )
         });

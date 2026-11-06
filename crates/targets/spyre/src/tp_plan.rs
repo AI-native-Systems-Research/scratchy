@@ -164,7 +164,7 @@ mod tests {
         let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
         let mut ops = Vec::new();
         let mut operands = Vec::new();
-        for node in ir.nodes.iter().filter(|n| matches!(n.op, SubOp::AllReduce)) {
+        for node in ir.nodes.iter().filter(|n| matches!(n.op, SubOp::AllReduce { .. })) {
             operands.push(PlaceId::Act(node.inputs[0].tensor.index() as u32));
             match lower_one_node(node, &ir, ActiveCap::FULL, false) {
                 NodeLowering::Ops(v) => ops.extend(v),
@@ -394,7 +394,7 @@ mod tests {
         let partial = ir
             .nodes
             .iter()
-            .find(|n| matches!(n.op, SubOp::AllReduce))
+            .find(|n| matches!(n.op, SubOp::AllReduce { .. }))
             .unwrap()
             .inputs[0]
             .tensor

@@ -12,48 +12,67 @@ pub use ktir_superdsc::collective::*;
 /// One control block of a bundle's pipeline, in the order the compute FIFO runs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CbStep {
-    /// The F-send in front of consume group `group`: this rank's fragment of the consume's operand,
-    /// from its own placement into the peer's receive window, on this card's DMA engine — device p2p
-    /// RDMA (flex-rs `scheduler::build_rdma_send_cb`), one F-send per message. Each message's
-    /// landing increments the peer's write-done counter on this rank's sid for its landing slot.
-    Send { group: usize, consume: TpConsume },
-    /// Wait for the peer's fragment to land in this rank's window (consumes one write-done per
-    /// message on the peer's sid for its slot; flex-rs `ControlBlockWire::p2p_rdma_wait`).
-    Wait { group: usize, consume: TpConsume },
+    /// The F-send in front of consume group `group` to peer `to`: this rank's fragment of the
+    /// consume's operand, from its own placement into this rank's block of `to`'s receive window,
+    /// on this card's DMA engine — device p2p RDMA (flex-rs `scheduler::build_rdma_send_cb`), one
+    /// F-send per message. Each message's landing increments `to`'s write-done counter on this
+    /// rank's sid for its landing slot.
+    Send {
+        group: usize,
+        consume: TpConsume,
+        to: TpIdentity,
+    },
+    /// Wait for peer `from`'s fragment to land in `from`'s block of this rank's window (consumes
+    /// one write-done per message on `from`'s sid for its slot; flex-rs
+    /// `ControlBlockWire::p2p_rdma_wait`).
+    Wait {
+        group: usize,
+        consume: TpConsume,
+        from: TpIdentity,
+    },
     /// Launch group `group`'s programs.
     Launch { group: usize },
 }
 
 /// Whether the session running as `session` plays a group carrying `tp` at all.
 ///
-/// ⭐ RANK-SELECTED CONSUMES PLAY ON THEIR RANK ALONE. An all-gather bakes one consume per rank
+/// ⭐ A CONSUME PLAYS ON ITS RANK ALONE. A consume reads its own share from its own operand and
+/// every peer's from the window, so the bake carries one consume per rank
 /// ([`TpConsume::plays_at`]); every other group plays everywhere. The one law the CB pipeline and a
 /// loader's launch list both read, so the steps a bundle names and the launches a session binds
 /// cannot disagree.
 pub fn plays_on(tp: Option<TpConsume>, session: TpIdentity) -> bool {
-    tp.and_then(|c| c.plays_at)
-        .is_none_or(|p| p.launches_on(session))
+    tp.is_none_or(|c| c.plays_at.launches_on(session))
 }
 
-/// One group's control blocks, in order: a consume group is `send, wait, launch`, every other group
-/// one launch. A collective's send is never a group of its own: the consume names everything the
-/// send moves, so every consume has exactly one send in front of it and a wait never queues ahead
-/// of its own rank's send (the symmetric deadlock: both ranks waiting, neither sending).
+/// One group's control blocks, in order: a consume group is `send to every peer, wait for every
+/// peer, launch`, every other group one launch. A collective's sends are never a group of their
+/// own: the consume names everything they move, so every consume has its sends in front of it and
+/// a wait never queues ahead of its own rank's sends (the symmetric deadlock: every rank waiting,
+/// none sending).
 pub fn group_steps(group: usize, tp: Option<TpConsume>) -> impl Iterator<Item = CbStep> {
     let steps: Vec<CbStep> = match tp {
-        Some(consume) => vec![
-            CbStep::Send { group, consume },
-            CbStep::Wait { group, consume },
-            CbStep::Launch { group },
-        ],
+        Some(consume) => {
+            let me = consume.plays_at.rank();
+            me.peers()
+                .map(|to| CbStep::Send { group, consume, to })
+                .chain(me.peers().map(|from| CbStep::Wait {
+                    group,
+                    consume,
+                    from,
+                }))
+                .chain(std::iter::once(CbStep::Launch { group }))
+                .collect()
+        }
         None => vec![CbStep::Launch { group }],
     };
     steps.into_iter()
 }
 
 /// THE CB PIPELINE OF A BUNDLE — the groups `session` plays ([`plays_on`]), each as its
-/// [`group_steps`], in launch order. Each rank sends once and waits once per collective, and the
-/// write-done counter returns to where it started after every replay of the bundle.
+/// [`group_steps`], in launch order. Each rank sends once to and waits once on every peer per
+/// collective, and the write-done counter returns to where it started after every replay of the
+/// bundle.
 pub fn cb_pipeline<'g>(
     groups: &'g [crate::LaunchGroup<'_>],
     session: TpIdentity,
@@ -65,18 +84,19 @@ pub fn cb_pipeline<'g>(
         .flat_map(|(group, g)| group_steps(group, g.kv.tp))
 }
 
-/// WHERE A CONSUME'S SEND READS AND LANDS — segment-relative, as the bundle baked it. The source is
-/// the consume's fragment inside the operand's placement; the landing is this card's own receive
-/// window (the layout is card-symmetric, so the peer's window is at the same place). Only the
-/// segment BASES are bound at load: the launch the send is aimed from supplies them, exactly as it
-/// supplies them to the consume's own program.
+/// WHERE A CONSUME'S SENDS READ AND LAND — segment-relative, as the bundle baked it. The source is
+/// the consume's fragment inside the operand's placement; the landing is the SENDING rank's block of
+/// the window cut, on every peer (the layout is card-symmetric, so every peer's window is at the
+/// same place, and the sender's block is the same block on every one). Only the segment BASES are
+/// bound at load: the launch the sends are aimed from supplies them, exactly as it supplies them to
+/// the consume's own program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TpSend {
     /// The program segment the operand lives in.
     pub source_segment: u8,
     /// The fragment's first byte inside that segment.
     pub source_offset: u64,
-    /// The window cut's offset inside [`RecvWindow::SEGMENT`].
+    /// The sending rank's block of the window cut, inside [`RecvWindow::SEGMENT`].
     pub window_offset: u64,
     pub bytes: CutPayload,
     /// The cut it lands in — message `m` lands in slot `(cut, m)`, signalling that slot's sid.
@@ -96,7 +116,7 @@ pub enum SendUnplaced {
     WindowMisplaced { segment: u32, bank: u32 },
     /// The window's cuts are not equal, adjacent and in order — not one window.
     WindowCutsApart { cut: usize, offset: u64, size: u64 },
-    /// The fragment is wider than one window cut.
+    /// The fragment is wider than one block of the window.
     WindowTooSmall { window: u64, bytes: u64 },
     /// The operand lives in the weight segment, which a consume launch pins to layer 0's bank-0
     /// copy — a layer-shifted operand would be read at the wrong layer.
@@ -118,7 +138,10 @@ pub enum SendUnplaced {
 /// # Errors
 /// A cut missing or misplaced, cuts that are not one window, or an address that is not whole
 /// flits — by name.
-pub fn baked_window(layout: &crate::BundleLayout<'_>) -> Result<Option<RecvWindow>, SendUnplaced> {
+pub fn baked_window(
+    layout: &crate::BundleLayout<'_>,
+    world: TpWorld,
+) -> Result<Option<RecvWindow>, SendUnplaced> {
     let cuts = ktir_superdsc::reserved_tids::TP_RECV_CUT_TIDS;
     let Some(first) = layout.place(crate::PlaceId::Act(cuts[0])) else {
         return Ok(None);
@@ -141,8 +164,11 @@ pub fn baked_window(layout: &crate::BundleLayout<'_>) -> Result<Option<RecvWindo
             });
         }
     }
-    Payload::new(first.size)
-        .and_then(|cut| RecvWindow::new(first.offset, cut))
+    // A cut is one block per rank of the world.
+    (first.size.is_multiple_of(u64::from(world.get())))
+        .then(|| Payload::new(first.size / u64::from(world.get())))
+        .flatten()
+        .and_then(|block| RecvWindow::new(world, first.offset, block))
         .map(Some)
         .ok_or(SendUnplaced::Misaligned {
             offset: first.offset,
@@ -158,15 +184,16 @@ impl TpSend {
         layout: &crate::BundleLayout<'_>,
         consume: TpConsume,
     ) -> Result<Self, SendUnplaced> {
-        let window = baked_window(layout)?.ok_or(SendUnplaced::Window)?;
+        let me = consume.plays_at.rank();
+        let window = baked_window(layout, me.world())?.ok_or(SendUnplaced::Window)?;
         let bytes = consume.fragment.bytes();
-        if bytes.get() > window.cut().get() {
+        if bytes.get() > window.block().get() {
             return Err(SendUnplaced::WindowTooSmall {
-                window: window.cut().get(),
+                window: window.block().get(),
                 bytes: bytes.get(),
             });
         }
-        let landing = window.cut_offset(consume.cut);
+        let landing = window.block_offset(consume.cut, me);
         let operand = layout
             .place(consume.operand)
             .ok_or(SendUnplaced::Operand(consume.operand))?;
@@ -192,9 +219,9 @@ impl TpSend {
             source_segment: operand.segment as u8,
             source_offset,
             window_offset: landing,
-            // A fragment within one cut is within the cut's slots (`RecvWindow::new`).
-            bytes: CutPayload::new(bytes).ok_or(SendUnplaced::WindowTooSmall {
-                window: window.cut().get(),
+            // A fragment within one block is within the block's slots (`RecvWindow::new`).
+            bytes: CutPayload::new(me.world(), bytes).ok_or(SendUnplaced::WindowTooSmall {
+                window: window.block().get(),
                 bytes: bytes.get(),
             })?,
             cut: consume.cut,
@@ -211,7 +238,7 @@ pub struct TpMessage {
     /// The send section's own protocol bits: this message's place in the run.
     pub first: bool,
     pub last: bool,
-    /// Where it lands — and so the sid it signals on and the peer waits on.
+    /// Where it lands — and so the sid it signals on and every peer waits on.
     pub slot: LandingSlot,
 }
 
@@ -219,8 +246,8 @@ impl TpSend {
     /// ⭐ THE CUT: the send as the vendor's windowed P2P loop issues it — one F-send per message
     /// ([`Payload::messages`]), each advancing the source and the landing together, and each in a
     /// landing slot of its own ([`CutPayload::landings`]). Every one increments its slot's
-    /// write-done counter on the peer once, so a send of N messages is waited for N times, once
-    /// per slot (a wait consumes exactly one count): the pipeline issues N waits for it.
+    /// write-done counter on the peer it lands on once, so a send of N messages is waited for N
+    /// times on that peer, once per slot (a wait consumes exactly one count).
     pub fn messages(self) -> impl Iterator<Item = TpMessage> {
         self.bytes
             .landings(self.cut)
@@ -270,7 +297,7 @@ pub fn sends(
         .collect()
 }
 
-/// The write-done ledger over a pipeline: +1 per send landing on the peer, −1 per wait.
+/// The write-done ledger over one rank's pipeline: +1 per send landing on a peer, −1 per wait.
 pub fn wdone_balance(steps: impl Iterator<Item = CbStep>) -> i64 {
     steps
         .map(|s| match s {
@@ -299,74 +326,57 @@ mod tests {
         }
     }
 
-    /// The pipeline law: a consume group sends, waits, then launches; an ordinary group launches;
-    /// order is group order; the write-done ledger closes.
-    #[test]
-    fn a_collective_is_send_then_wait_then_consume_in_group_order() {
-        let consume = TpConsume {
-            kind: CollectiveKind::AllReduce,
+    fn consume_at(kind: CollectiveKind, me: TpIdentity, cut: usize) -> TpConsume {
+        TpConsume {
+            kind,
             operand: crate::PlaceId::Act(7),
             fragment: frag(),
-            plays_at: None,
-            cut: WindowCut::of_collective(0),
-        };
-        let groups = [
-            crate::LaunchGroup::default(),
-            consume_group(consume),
-            crate::LaunchGroup::default(),
-        ];
-        let rank0 = TpWorld::of::<2>().ranks().next().unwrap();
-        let steps: Vec<CbStep> = cb_pipeline(&groups, rank0).collect();
-        assert_eq!(
-            steps,
-            [
-                CbStep::Launch { group: 0 },
-                CbStep::Send { group: 1, consume },
-                CbStep::Wait { group: 1, consume },
-                CbStep::Launch { group: 1 },
-                CbStep::Launch { group: 2 },
-            ]
-        );
-        assert_eq!(wdone_balance(cb_pipeline(&groups, rank0)), 0);
+            plays_at: PlaysAt::of(me),
+            cut: WindowCut::of_collective(cut),
+        }
     }
 
-    /// An all-gather bakes one consume per rank; each rank sends, waits for and launches its own
-    /// consume and skips the other rank's whole — one send and one wait per rank.
+    /// The pipeline law, at every world width: a rank plays its own consume group — a send to
+    /// every peer, then a wait on every peer, then the launch — and skips every other rank's;
+    /// ordinary groups launch; order is group order; the write-done ledger closes.
     #[test]
-    fn each_rank_plays_its_own_gather_consume() {
-        let ranks: Vec<TpIdentity> = TpWorld::of::<2>().ranks().collect();
-        let consume_at = |r: TpIdentity| TpConsume {
-            kind: CollectiveKind::AllGather,
-            operand: crate::PlaceId::Act(9),
-            fragment: frag(),
-            plays_at: Some(PlaysAt::of(r)),
-            cut: WindowCut::of_collective(0),
-        };
-        let groups = [
-            consume_group(consume_at(ranks[0])),
-            consume_group(consume_at(ranks[1])),
-            crate::LaunchGroup::default(),
-        ];
-        for (mine, id) in ranks.iter().enumerate() {
-            let steps: Vec<CbStep> = cb_pipeline(&groups, *id).collect();
-            let consume = consume_at(*id);
-            assert_eq!(
-                steps,
-                [
-                    CbStep::Send {
-                        group: mine,
-                        consume
-                    },
-                    CbStep::Wait {
-                        group: mine,
-                        consume
-                    },
-                    CbStep::Launch { group: mine },
-                    CbStep::Launch { group: 2 },
-                ]
+    fn a_collective_is_sends_then_waits_then_consume_in_group_order() {
+        fn check<const W: u32>() {
+            let ranks: Vec<TpIdentity> = TpWorld::of::<W>().ranks().collect();
+            let mut groups = vec![crate::LaunchGroup::default()];
+            groups.extend(
+                ranks
+                    .iter()
+                    .map(|&r| consume_group(consume_at(CollectiveKind::AllReduce, r, 0))),
             );
-            assert_eq!(wdone_balance(cb_pipeline(&groups, *id)), 0);
+            groups.push(crate::LaunchGroup::default());
+            let last = groups.len() - 1;
+            for (i, &me) in ranks.iter().enumerate() {
+                let mine = 1 + i;
+                let consume = consume_at(CollectiveKind::AllReduce, me, 0);
+                let mut want = vec![CbStep::Launch { group: 0 }];
+                want.extend(me.peers().map(|to| CbStep::Send {
+                    group: mine,
+                    consume,
+                    to,
+                }));
+                want.extend(me.peers().map(|from| CbStep::Wait {
+                    group: mine,
+                    consume,
+                    from,
+                }));
+                want.push(CbStep::Launch { group: mine });
+                want.push(CbStep::Launch { group: last });
+                let steps: Vec<CbStep> = cb_pipeline(&groups, me).collect();
+                assert_eq!(steps, want, "rank {} of {W}", me.rank());
+                assert_eq!(wdone_balance(cb_pipeline(&groups, me)), 0);
+            }
         }
+        check::<1>();
+        check::<2>();
+        check::<3>();
+        check::<4>();
+        check::<8>();
     }
 
     /// A consume names the window absolutely — shift 0, bank 0 — whatever layer or bank the launch
@@ -374,14 +384,8 @@ mod tests {
     #[test]
     fn a_consume_reads_the_window_unshifted_and_unbanked() {
         let plain = crate::KvShifts::default();
-        let consuming = consume_group(TpConsume {
-            kind: CollectiveKind::AllReduce,
-            operand: crate::PlaceId::Act(7),
-            fragment: frag(),
-            plays_at: None,
-            cut: WindowCut::of_collective(0),
-        })
-        .kv;
+        let me = TpWorld::of::<4>().rank(1).unwrap();
+        let consuming = consume_group(consume_at(CollectiveKind::AllReduce, me, 0)).kv;
         assert_eq!(plain.weight_slot(4096, 2), (4096, 2));
         assert_eq!(consuming.weight_slot(4096, 2), (0, 0));
     }
@@ -397,8 +401,10 @@ mod tests {
         }
     }
 
-    /// The window as the bake places it: `WINDOW_CUTS` adjacent cuts of `cut` bytes at 1 MiB.
-    fn window_of(cut: u64) -> Vec<crate::Placement> {
+    /// The window as the bake places it for `world`: `WINDOW_CUTS` adjacent cuts at 1 MiB, each
+    /// one `block`-byte block per rank.
+    fn window_of(world: TpWorld, block: u64) -> Vec<crate::Placement> {
+        let cut = u64::from(world.get()) * block;
         ktir_superdsc::reserved_tids::TP_RECV_CUT_TIDS
             .iter()
             .enumerate()
@@ -411,10 +417,6 @@ mod tests {
                 )
             })
             .collect()
-    }
-
-    fn window() -> Vec<crate::Placement> {
-        window_of(WireBytes::CAP.get())
     }
 
     fn with(mut window: Vec<crate::Placement>, more: crate::Placement) -> Vec<crate::Placement> {
@@ -430,72 +432,80 @@ mod tests {
     }
 
     /// The send reads the consume's fragment at the operand's own placement — its segment, its
-    /// offset plus the fragment's — and lands at its cut's offset in the window.
+    /// offset plus the fragment's — and lands at the SENDER'S block of its cut, at every rank of
+    /// every world.
     #[test]
-    fn a_send_reads_its_fragment_at_the_operands_placement() {
-        let fragment = fragments(4, 256, Payload::new(1024).unwrap()).unwrap()[1];
-        let consume = TpConsume {
-            kind: CollectiveKind::AllReduce,
-            operand: crate::PlaceId::Act(7),
-            fragment,
-            plays_at: None,
-            cut: WindowCut::of_collective(0),
-        };
-        let operand = placed(crate::PlaceId::Act(7), 0, 8192, 4 * 256 * 2);
-        let places = layout(with(window(), operand));
-        for k in 0..WINDOW_CUTS {
-            let cut = WindowCut::of_collective(k);
-            assert_eq!(
-                TpSend::resolve(&places, TpConsume { cut, ..consume }).unwrap(),
-                TpSend {
-                    source_segment: 0,
-                    source_offset: 8192 + fragment.byte_offset(),
-                    window_offset: (1 << 20) + k as u64 * WireBytes::CAP.get(),
-                    bytes: CutPayload::new(fragment.bytes()).unwrap(),
-                    cut,
+    fn a_send_lands_in_its_senders_block_of_its_cut() {
+        fn check<const W: u32>() {
+            let world = TpWorld::of::<W>();
+            let fragment = fragments(4, 256, Payload::new(1024).unwrap()).unwrap()[1];
+            let block = WireBytes::CAP.get();
+            let operand = placed(crate::PlaceId::Act(7), 0, 8192, 4 * 256 * 2);
+            let places = layout(with(window_of(world, block), operand));
+            for me in world.ranks() {
+                for k in 0..WINDOW_CUTS {
+                    let cut = WindowCut::of_collective(k);
+                    let consume = TpConsume {
+                        fragment,
+                        ..consume_at(CollectiveKind::AllReduce, me, k)
+                    };
+                    assert_eq!(
+                        TpSend::resolve(&places, consume).unwrap(),
+                        TpSend {
+                            source_segment: 0,
+                            source_offset: 8192 + fragment.byte_offset(),
+                            window_offset: (1 << 20)
+                                + k as u64 * u64::from(W) * block
+                                + u64::from(me.rank()) * block,
+                            bytes: CutPayload::new(world, fragment.bytes()).unwrap(),
+                            cut,
+                        }
+                    );
                 }
-            );
+            }
         }
-        assert_ne!(fragment.byte_offset(), 0);
+        check::<2>();
+        check::<3>();
+        check::<4>();
+        check::<8>();
     }
 
-    /// The window reads back off the bake as the one window its cuts tile, and a bundle with no
-    /// cut placed has none.
+    /// The window reads back off the bake as the one window its cuts tile — a block per rank of
+    /// its world — and a bundle with no cut placed has none.
     #[test]
     fn the_baked_window_is_its_cuts_read_back() {
-        let window = baked_window(&layout(window())).unwrap().unwrap();
+        let world = TpWorld::of::<4>();
+        let window = baked_window(&layout(window_of(world, WireBytes::CAP.get())), world)
+            .unwrap()
+            .unwrap();
         assert_eq!(window.offset(), 1 << 20);
-        assert_eq!(window.cut(), Payload::from(WireBytes::CAP));
-        assert_eq!(window.size(), WINDOW_CUTS as u64 * WireBytes::CAP.get());
-        assert_eq!(baked_window(&layout(vec![])), Ok(None));
+        assert_eq!(window.block(), Payload::from(WireBytes::CAP));
+        assert_eq!(window.size(), WINDOW_CUTS as u64 * 4 * WireBytes::CAP.get());
+        assert_eq!(baked_window(&layout(vec![]), world), Ok(None));
     }
 
     /// Consecutive collectives alternate cuts, and each one's send lands in its own; the forward's
     /// third collective is back in the first's cut.
     #[test]
     fn consecutive_collectives_send_into_alternate_cuts() {
-        let consume = |k| TpConsume {
-            kind: CollectiveKind::AllReduce,
-            operand: crate::PlaceId::Act(7),
-            fragment: frag(),
-            plays_at: None,
-            cut: WindowCut::of_collective(k),
-        };
+        let world = TpWorld::of::<4>();
+        let me = world.rank(0).unwrap();
+        let block = WireBytes::CAP.get();
         let operand = placed(crate::PlaceId::Act(7), 0, 0, frag().bytes().get());
-        let places = layout(with(window(), operand));
+        let places = layout(with(window_of(world, block), operand));
         let groups = [
-            consume_group(consume(0)),
+            consume_group(consume_at(CollectiveKind::AllReduce, me, 0)),
             crate::LaunchGroup::default(),
-            consume_group(consume(1)),
-            consume_group(consume(2)),
+            consume_group(consume_at(CollectiveKind::AllReduce, me, 1)),
+            consume_group(consume_at(CollectiveKind::AllReduce, me, 2)),
         ];
         let landed: Vec<(usize, u64)> = sends(&places, &groups)
             .unwrap()
             .into_iter()
             .map(|s| (s.group, s.send.window_offset))
             .collect();
-        let cap = WireBytes::CAP.get();
-        assert_eq!(landed, [(0, 1 << 20), (2, (1 << 20) + cap), (3, 1 << 20)]);
+        let cut = 4 * block;
+        assert_eq!(landed, [(0, 1 << 20), (2, (1 << 20) + cut), (3, 1 << 20)]);
         assert_eq!(WindowCut::baked(1), WindowCut::of_collective(1));
         assert_eq!(
             WindowCut::of_collective(1).tid(),
@@ -505,16 +515,17 @@ mod tests {
 
     /// A send wider than one message is the vendor loop's run: each message reads and lands at
     /// the same offset into the payload, in a slot of its own, the run tiles it, and only its ends
-    /// carry first / last.
+    /// carry first / last; a payload past the world's slots per cut is no send.
     #[test]
     fn a_wide_send_is_a_run_of_messages_at_matching_offsets() {
+        let world = TpWorld::of::<2>();
         let cap = WireBytes::CAP.get();
         let cut = WindowCut::of_collective(1);
         let send = TpSend {
             source_segment: 0,
             source_offset: 8192,
             window_offset: 1 << 30,
-            bytes: CutPayload::new(Payload::new(2 * cap + 256).unwrap()).unwrap(),
+            bytes: CutPayload::new(world, Payload::new(2 * cap + 256).unwrap()).unwrap(),
             cut,
         };
         let m: Vec<TpMessage> = send.messages().collect();
@@ -526,32 +537,30 @@ mod tests {
                 (8192 + at, (1 << 30) + at)
             );
             assert_eq!((x.first, x.last), (k == 0, k == 2));
-            assert_eq!(x.slot, LandingSlot::of(cut, k as u32).unwrap());
+            assert_eq!(x.slot, LandingSlot::of(world, cut, k as u32).unwrap());
         }
         assert_eq!(m[2].bytes.get(), 256);
         assert_eq!(
             m.iter().map(|x| x.bytes.get()).sum::<u64>(),
             send.bytes.get().get()
         );
-        let past = Payload::new(u64::from(MAX_CUT_MESSAGES) * cap + FLIT_BYTES).unwrap();
-        assert_eq!(
-            CutPayload::new(past),
-            None,
-            "more messages than a cut has slots"
-        );
+        for w in [TpWorld::of::<2>(), TpWorld::of::<4>(), TpWorld::of::<8>()] {
+            let past = Payload::new(u64::from(w.messages_per_cut()) * cap + FLIT_BYTES).unwrap();
+            assert_eq!(
+                CutPayload::new(w, past),
+                None,
+                "more messages than a block has slots"
+            );
+        }
     }
 
     /// Every way a send can name no baked bytes refuses by name.
     #[test]
     fn an_unplaced_send_refuses_by_name() {
-        let consume = TpConsume {
-            kind: CollectiveKind::AllReduce,
-            operand: crate::PlaceId::Act(7),
-            fragment: frag(),
-            plays_at: None,
-            cut: WindowCut::of_collective(0),
-        };
+        let world = TpWorld::of::<2>();
+        let consume = consume_at(CollectiveKind::AllReduce, world.rank(0).unwrap(), 0);
         let whole = frag().bytes().get();
+        let window = || window_of(world, WireBytes::CAP.get());
         let operand = || placed(crate::PlaceId::Act(7), 0, 0, whole);
         let refusal = |places| TpSend::resolve(&layout(places), consume).unwrap_err();
         assert_eq!(refusal(vec![operand()]), SendUnplaced::Window);
@@ -582,7 +591,7 @@ mod tests {
             }
         );
         assert_eq!(
-            refusal(with(window_of(whole - FLIT_BYTES), operand())),
+            refusal(with(window_of(world, whole - FLIT_BYTES), operand())),
             SendUnplaced::WindowTooSmall {
                 window: whole - FLIT_BYTES,
                 bytes: whole

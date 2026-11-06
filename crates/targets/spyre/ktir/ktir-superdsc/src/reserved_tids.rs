@@ -503,18 +503,18 @@ pub const RESERVED_REGIONS: [TidRegion; 9] = [
         base: PAGED_STEP_BASE,
         slots: 9,
     },
-    // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW'S CUTS — see [`TP_RECV_CUT_TIDS`]. Below
+    // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW'S BLOCKS — see [`tp_recv_block_tid`]. Below
     // `paged_step`'s floor, in tids no artifact has ever carried.
     TidRegion {
         name: "tp_recv",
         base: TP_RECV_TID,
-        slots: TP_RECV_CUT_TIDS.len() as u32,
+        slots: TP_WINDOW_CUTS * TP_MAX_WORLD,
     },
 ];
 
-/// ⭐ RESERVED tid for the TENSOR-PARALLEL RECEIVE WINDOW — its first cut
-/// ([`TP_RECV_CUT_TIDS`]), and the base of the one `(segment, offset, size)` triple per card
-/// (`scratchy_spyre_bundle::collective::RecvWindow`) whose cuts every collective's consume reads.
+/// ⭐ RESERVED tid for the TENSOR-PARALLEL RECEIVE WINDOW — its first block
+/// ([`tp_recv_block_tid`]), and the base of the one `(segment, offset, size)` triple per card
+/// (`scratchy_spyre_bundle::collective::RecvWindow`) whose blocks every collective's consume reads.
 ///
 /// ⛔ NOT IN THE ROUTER-CONST HOLE (MAX-137 .. MAX-146) — those slots are BURNED (see the note
 /// above the region table): a stale artifact still naming one would alias the window. It takes the
@@ -522,12 +522,26 @@ pub const RESERVED_REGIONS: [TidRegion; 9] = [
 /// `RESERVED_REGIONS_ARE_DISJOINT` holds the two apart.
 pub const TP_RECV_TID: u32 = PAGED_STEP_BASE - 9;
 
-/// ⭐ THE RECEIVE WINDOW'S CUTS — one tid per disjoint cut of the ONE window, cut `i` placed
-/// `i` cut-widths above the window's base (`compute_bundle_layout`). The forward's `k`-th
-/// collective uses cut `k % 2` (`collective::WindowCut`), so a peer's send for collective `k + 1`
-/// never lands where this rank still reads `k`. Both cuts are placements OF the one window, never
-/// a second window that could disagree with it.
-pub const TP_RECV_CUT_TIDS: [u32; 2] = [TP_RECV_TID, TP_RECV_TID - 1];
+/// How many disjoint cuts the receive window is. The forward's `k`-th collective uses cut
+/// `k % TP_WINDOW_CUTS` (`collective::WindowCut`), so a peer's send for collective `k + 1` never
+/// lands where this rank still reads `k`.
+pub const TP_WINDOW_CUTS: u32 = 2;
+
+/// The widest world the window's tids are reserved for — the card's 64 write-done sids over the
+/// cuts, one landing slot per (sender, cut) at the least (`collective::MAX_WORLD`, which pins
+/// itself equal).
+pub const TP_MAX_WORLD: u32 = 64 / TP_WINDOW_CUTS;
+
+/// ⭐ THE RECEIVE WINDOW'S BLOCKS — one tid per (cut, sending rank) of the ONE window: rank `s`'s
+/// block of cut `c`, placed at the cut's base plus `s` block-widths (`compute_bundle_layout`). A
+/// consume reads sender `s`'s fragment as this tensor from its first byte, so every sender's block
+/// is addressed the same way at every world width. Every block is a placement OF the one window,
+/// never a second window that could disagree with it.
+pub const fn tp_recv_block_tid(cut: u32, sender: u32) -> u32 {
+    assert!(cut < TP_WINDOW_CUTS, "the window has TP_WINDOW_CUTS cuts");
+    assert!(sender < TP_MAX_WORLD, "a sender past the widest reserved world");
+    TP_RECV_TID - (cut * TP_MAX_WORLD + sender)
+}
 
 /// Is `tid` one of the reserved synthetics — a sentinel, a slot of any region, or `LAST_HIDDEN_TID`
 /// (which sits at `u32::MAX`, one ABOVE the sentinels region's base, so a region scan alone misses

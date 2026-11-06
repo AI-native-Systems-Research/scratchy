@@ -315,11 +315,15 @@ impl Weave<'_> {
         };
         let (kind, op) = match self.place[j] {
             Placement::Whole => return Ok(InputRef::Op(self.op_map[j])),
-            Placement::Partial => (CollectiveKind::AllReduce, SubOp::AllReduce),
+            Placement::Partial => (
+                CollectiveKind::AllReduce,
+                SubOp::AllReduce { world: self.world },
+            ),
             Placement::Split(Axis::Cols) => (
                 CollectiveKind::AllGather,
                 SubOp::AllGather {
                     cols: self.shape[j].1,
+                    world: self.world,
                 },
             ),
             Placement::Split(Axis::HeadRows { .. }) => {
@@ -1010,7 +1014,7 @@ pub fn eval_collective<F: RopeForm>(
 ) -> Vec<f32> {
     use crate::subtile_ir::gather;
     match node.op {
-        SubOp::AllReduce => {
+        SubOp::AllReduce { .. } => {
             let parts: Vec<Vec<f32>> = ranks
                 .iter()
                 .map(|b| gather(&node.inputs[0], graph, b).0)
@@ -1073,7 +1077,7 @@ pub fn eval_ranks<F: RopeForm>(
     for node in &graph.nodes {
         let shape: TensorShape = graph.shape(node.output.tensor);
         let outs: Vec<Vec<f32>> = match node.op {
-            SubOp::AllReduce | SubOp::AllGather { .. } => {
+            SubOp::AllReduce { .. } | SubOp::AllGather { .. } => {
                 let ranks: Vec<&[Vec<f32>]> = bufs.iter().map(|b| b.as_slice()).collect();
                 vec![eval_collective(node, graph, &ranks); w]
             }
@@ -1302,7 +1306,9 @@ mod tests {
         let mut input = one_layer_input();
         let last = input.ops.len() - 1;
         input.ops.push(OpDesc {
-            op: SubOp::AllReduce,
+            op: SubOp::AllReduce {
+                world: WorldSize::of::<2>(),
+            },
             m: 1,
             inputs: vec![InputRef::Op(last)],
         });
