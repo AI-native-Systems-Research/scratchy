@@ -438,7 +438,7 @@ pub const PAGED_CHUNK_MASKS_TID: u32 = reserved_region("paged_step").at(7);
 pub const PAGED_INT32_ZERO_TID: u32 = reserved_region("paged_step").at(8);
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 8] = [
+pub const RESERVED_REGIONS: [TidRegion; 9] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -503,7 +503,31 @@ pub const RESERVED_REGIONS: [TidRegion; 8] = [
         base: PAGED_STEP_BASE,
         slots: 9,
     },
+    // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW'S CUTS — see [`TP_RECV_CUT_TIDS`]. Below
+    // `paged_step`'s floor, in tids no artifact has ever carried.
+    TidRegion {
+        name: "tp_recv",
+        base: TP_RECV_TID,
+        slots: TP_RECV_CUT_TIDS.len() as u32,
+    },
 ];
+
+/// ⭐ RESERVED tid for the TENSOR-PARALLEL RECEIVE WINDOW — its first cut
+/// ([`TP_RECV_CUT_TIDS`]), and the base of the one `(segment, offset, size)` triple per card
+/// (`scratchy_spyre_bundle::collective::RecvWindow`) whose cuts every collective's consume reads.
+///
+/// ⛔ NOT IN THE ROUTER-CONST HOLE (MAX-137 .. MAX-146) — those slots are BURNED (see the note
+/// above the region table): a stale artifact still naming one would alias the window. It takes the
+/// first tids below `paged_step`'s floor instead, which nothing has been baked against;
+/// `RESERVED_REGIONS_ARE_DISJOINT` holds the two apart.
+pub const TP_RECV_TID: u32 = PAGED_STEP_BASE - 9;
+
+/// ⭐ THE RECEIVE WINDOW'S CUTS — one tid per disjoint cut of the ONE window, cut `i` placed
+/// `i` cut-widths above the window's base (`compute_bundle_layout`). The forward's `k`-th
+/// collective uses cut `k % 2` (`collective::WindowCut`), so a peer's send for collective `k + 1`
+/// never lands where this rank still reads `k`. Both cuts are placements OF the one window, never
+/// a second window that could disagree with it.
+pub const TP_RECV_CUT_TIDS: [u32; 2] = [TP_RECV_TID, TP_RECV_TID - 1];
 
 /// Is `tid` one of the reserved synthetics — a sentinel, a slot of any region, or `LAST_HIDDEN_TID`
 /// (which sits at `u32::MAX`, one ABOVE the sentinels region's base, so a region scan alone misses

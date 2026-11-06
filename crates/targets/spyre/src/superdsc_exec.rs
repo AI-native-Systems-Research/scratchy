@@ -146,13 +146,13 @@ pub(crate) struct LaunchWhere {
 }
 
 /// One rung launch staged for the rung's single doorbell. `launch_ops_inner` collects these across
-/// its whole (op, rep) loop and flushes once at the end ([`crate::runtime::Stream::compute_batch`]
+/// its whole (op, rep) loop and flushes once at the end ([`crate::runtime::Stream::submit_batch`]
 /// — the vendor's multi-CB branch). The site context rides alongside the item because the per-op
 /// `fault` closure dumps from loop locals (`ta`/`off`/the fold rep), which are gone by flush time:
 /// a refused flush rebuilds the offending entry's dump from these, and the flex-rs error names the
 /// entry index it refused.
 struct PendingLaunch {
-    item: BatchedCompute,
+    item: BatchedCb,
     /// Which op of the rung (`oi`) and which fold rep produced this entry.
     op_index: usize,
     rep: i64,
@@ -561,6 +561,9 @@ pub(crate) struct OpProg {
     pub(crate) addr: Option<DevAddr>,
     /// The KV facts `fold_plan` reads: whose KV, which pass shape, which strides.
     pub(crate) kv: OpKv,
+    /// When this group is a collective's consume: the send its baked placements name and the
+    /// session's route — bound once, at [`bind_ops`].
+    pub(crate) collective: Option<cb_plan::BoundCollective>,
 }
 
 /// ⛔⛔⛔ A SESSION-LIFETIME DEVICE HANDLE IS FORGOTTEN AT DROP ON PURPOSE. Per-step windows
@@ -603,13 +606,19 @@ impl OpProg {
     ///
     /// `slot_write`/`slab_write` stay DERIVED from their strides ("> 0", as the C++ had them) so a
     /// stride and its flag cannot disagree.
-    fn new(code: &'static bundle::LaunchGroup<'static>, fp: &'static str, index: usize) -> OpProg {
+    fn new(
+        code: &'static bundle::LaunchGroup<'static>,
+        fp: &'static str,
+        index: usize,
+        collective: Option<cb_plan::BoundCollective>,
+    ) -> OpProg {
         let kv = &code.kv;
         OpProg {
             code,
             fp,
             index,
             addr: None,
+            collective,
             kv: OpKv {
                 request: kv.request as u64,
                 slot_offset: kv.slot_offset as u64,
@@ -631,6 +640,15 @@ impl OpProg {
     /// How the timing modes name this program: its bundle's fingerprint and its launch order.
     pub(crate) fn label(&self) -> String {
         format!("{}/group_{}", self.fp, self.index)
+    }
+
+    /// What [`cb_plan::site_cbs`] needs to stage this group's control blocks.
+    pub(crate) fn site_tp(&self) -> cb_plan::SiteTp {
+        cb_plan::SiteTp {
+            index: self.index,
+            consume: self.code.kv.tp,
+            bound: self.collective,
+        }
     }
 }
 
@@ -972,6 +990,11 @@ pub struct Executor {
     /// one; every batched or instrumented step takes the walk instead, so
     /// nothing here is consulted (or populated) off the player's own path.
     step_images: StepImageCache,
+    /// ⭐ THE PEER THIS SESSION SENDS TO, when it runs one rank of a sharded world — `None` for a
+    /// world of one. Bound once, at load ([`Executor::load`] reads the process's link); every
+    /// collective's send and wait names its route, and every consume group this session binds was
+    /// chosen by its identity.
+    link: Option<&'static PeerLink>,
 }
 
 /// Per-session state for the card-side tensordump — see [`Diag::tensordump`].
@@ -1096,6 +1119,107 @@ struct ForwardHalf {
     h2d_bytes: u64,
 }
 
+/// WHICH RANK A SESSION RUNS AS — the bundle's world and the process's link, agreed at load.
+#[derive(Clone, Copy, Debug)]
+pub enum RankSeat {
+    /// A world of one: the bundle places no receive window and the process linked no peer.
+    Alone,
+    /// One rank of a sharded world: the bundle's window is the one whose slots the process's
+    /// link pointed its `XSEG` entries at.
+    Linked(&'static PeerLink),
+}
+
+/// Why a bundle cannot run in this process's world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeatRefusal {
+    /// The bundle was baked for a sharded world, and this process linked no peer to send to.
+    Unlinked,
+    /// The process runs one rank of a sharded world, and the bundle was baked for a world of one.
+    UnshardedBundle,
+    /// The bundle's window is not the one the process's link programmed — the peer's sends would
+    /// land where this bundle's consumes do not read.
+    WindowMoved {
+        baked: bundle::collective::RecvWindow,
+        linked: bundle::collective::RecvWindow,
+    },
+    /// The bundle's window cuts are not one flit-aligned window in bank 0 of the weight segment.
+    Misplaced(bundle::collective::SendUnplaced),
+}
+
+impl std::fmt::Display for SeatRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unlinked => write!(
+                f,
+                "baked for a sharded world, but this process linked no peer (`runtime::link_peer`) \
+                 — a world-of-one session cannot run it"
+            ),
+            Self::UnshardedBundle => write!(
+                f,
+                "baked for a world of one, but this process runs one rank of a sharded world"
+            ),
+            Self::WindowMoved { baked, linked } => write!(
+                f,
+                "its receive window {baked:?} is not the {linked:?} this card's XSEG entries \
+                 point at — every bundle a rank runs must bake the same window"
+            ),
+            Self::Misplaced(why) => write!(
+                f,
+                "its receive window's cuts are not one flit-aligned window: {why:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SeatRefusal {}
+
+impl RankSeat {
+    /// The seat a session over `code` takes in a process holding `link`.
+    ///
+    /// # Errors
+    /// [`SeatRefusal`], by name.
+    pub fn of(
+        code: &bundle::BundleCode<'_>,
+        link: Option<&'static PeerLink>,
+    ) -> Result<Self, SeatRefusal> {
+        Self::agree(Self::baked_window(code)?, link.map(PeerLink::window))?;
+        Ok(link.map_or(Self::Alone, Self::Linked))
+    }
+
+    /// The receive window `code` bakes — `None` for a bundle baked for a world of one. What a
+    /// rank's [`crate::runtime::link_peer`] programs, read off the bundle that will run.
+    ///
+    /// # Errors
+    /// [`SeatRefusal::Misplaced`] when the cuts are not one flit-aligned window
+    /// ([`bundle::collective::baked_window`]).
+    pub fn baked_window(
+        code: &bundle::BundleCode<'_>,
+    ) -> Result<Option<bundle::collective::RecvWindow>, SeatRefusal> {
+        bundle::collective::baked_window(&code.layout).map_err(SeatRefusal::Misplaced)
+    }
+
+    /// The seat law over the two windows: the bundle's and the link's, each present or not.
+    fn agree(
+        baked: Option<bundle::collective::RecvWindow>,
+        linked: Option<bundle::collective::RecvWindow>,
+    ) -> Result<(), SeatRefusal> {
+        match (baked, linked) {
+            (None, None) => Ok(()),
+            (Some(_), None) => Err(SeatRefusal::Unlinked),
+            (None, Some(_)) => Err(SeatRefusal::UnshardedBundle),
+            (Some(baked), Some(linked)) if baked == linked => Ok(()),
+            (Some(baked), Some(linked)) => Err(SeatRefusal::WindowMoved { baked, linked }),
+        }
+    }
+
+    fn link(self) -> Option<&'static PeerLink> {
+        match self {
+            Self::Alone => None,
+            Self::Linked(link) => Some(link),
+        }
+    }
+}
+
 impl Executor {
     // ──────────────────────────────────────────────────────────────────────────────────────────
     //  Create
@@ -1205,6 +1329,7 @@ impl Executor {
             n_weights_staged: 0,
             dump: None,
             step_images: StepImageCache::default(),
+            link,
         };
 
         // ── RE-ROLLED mode: a re-roll meta ⇒ this bundle is the BODY (one layer); the prefix (embed)
@@ -1238,7 +1363,7 @@ impl Executor {
     /// ⛔ A SIBLING IS A FINGERPRINT THE REGISTRY RESOLVES. A rung this binary does not carry is a hard
     /// load error naming it and listing what IS carried — the alternative, treating it as absent, runs
     /// the batch on a bundle the ladder said was there.
-    fn sibling_ops(what: &str, fp: &bundle::SiblingFp<'static>) -> Result<Ops> {
+    fn sibling_ops(&self, what: &str, fp: &bundle::SiblingFp<'static>) -> Result<Ops> {
         let code = bundle::sibling(fp).ok_or_else(|| {
             anyhow!(
                 "{what} {} is not compiled into this binary — the emit either produced no such \
@@ -1247,7 +1372,19 @@ impl Executor {
                 bundle::registered_fps(),
             )
         })?;
-        Ok(bind_ops(code))
+        bind_ops(code, self.session())
+    }
+
+    /// An OPTIONAL sibling's launch groups — a fold-fused twin, which a bundle may not carry.
+    fn optional_sibling_ops(&self, fp: &bundle::SiblingFp<'static>) -> Result<Option<Ops>> {
+        bundle::sibling(fp)
+            .map(|code| bind_ops(code, self.session()))
+            .transpose()
+    }
+
+    /// The rank this session runs as, when it runs one rank of a sharded world.
+    fn session(&self) -> Option<bundle::collective::TpIdentity> {
+        self.link.map(PeerLink::identity)
     }
 
     fn load_rolled(&mut self, m: &'static bundle::RerollMeta<'static>) -> Result<()> {
@@ -1306,8 +1443,8 @@ impl Executor {
             prefix_weight_bank: m.prefix_weight_bank as usize,
             suffix_weight_bank: m.suffix_weight_bank as usize,
         });
-        self.prefix_ops = Self::sibling_ops("rolled prefix", &m.prefix)?;
-        self.suffix_ops = Self::sibling_ops("rolled suffix", &m.suffix)?;
+        self.prefix_ops = self.sibling_ops("rolled prefix", &m.prefix)?;
+        self.suffix_ops = self.sibling_ops("rolled suffix", &m.suffix)?;
         debug!(
             "[sdsc-superdsc] load: RE-ROLLED — {} body class(es) + prefix({}) + suffix({}); {} \
              launch(es), page_stride={} B",
@@ -2648,7 +2785,7 @@ impl Executor {
     /// ⭐ #603 PR2 STAGE 2a — THE PREPARE-TIME CB PARITY GATE. Every allocated launch list is
     /// rendered TWO ways — the submit walk's own enumeration (`cb_plan::walk_items`) and the data
     /// twin (`cb_plan::build_cb_plan` + `CbPlan::render`) — through ONE render door
-    /// (`Stream::render_compute_batch`, the same `build_compute_cb` the submit path runs), and a
+    /// (`Stream::render_batch`, the same `build_compute_cb` the submit path runs), and a
     /// differing byte REFUSES THE LOAD. This is the gate that will let 2c's player replay
     /// pre-rendered images: it proves, at prepare, that the plan's data twin of the walk is
     /// byte-identical, so no step ever needs to re-derive (or re-check) what it replays.
@@ -3545,6 +3682,10 @@ impl Executor {
                     timers().rb_seq.push(((ops.len(), oi), op.label()));
                 }
 
+                // ⭐ THIS SITE'S CONTROL BLOCKS — the launch, and in front of a collective's consume
+                // its send and its wait — staged by `cb_plan::site_cbs`, the one function the
+                // parity twin stages through too.
+                let cbs = cb_plan::site_cbs(op.site_tp(), site.batched_compute())?;
                 if collect {
                     // STAGE, DON'T SUBMIT — the rung pays one doorbell at its end. The item OWNS
                     // its handles because the shifted bases and `ta` borrows above are rep-local.
@@ -3552,12 +3693,12 @@ impl Executor {
                     // `cb_plan::walk_items` stages through too — so the item the real walk
                     // submits and the item the parity gate renders cannot drift apart in shape.
                     let st0 = Instant::now();
-                    pending.push(PendingLaunch {
-                        item: site.batched_compute(),
+                    pending.extend(cbs.into_iter().map(|item| PendingLaunch {
+                        item,
                         op_index: oi,
                         rep,
                         off,
-                    });
+                    }));
                     batch_barrier |= barrier;
                     if d.submit_time {
                         // Prep is still per-op; the enqueue it feeds is now the rung's single
@@ -3565,6 +3706,10 @@ impl Executor {
                         let mut t = timers();
                         t.prep_ms += (st0 - gt0).as_secs_f64() * 1e3;
                     }
+                } else if op.collective.is_some() {
+                    // A COLLECTIVE IS ONE SUBMISSION even off the batched path: its send, wait and
+                    // consume ride one doorbell, in order, so no diag mode can split them.
+                    stream.submit_batch(&cbs, barrier).map_err(fault)?;
                 } else if d.submit_time {
                     // `submit` is the enqueue alone: no synchronize on purpose — a drain would make
                     // this measure the very pipeline it is trying to leave undisturbed.
@@ -3647,7 +3792,7 @@ impl Executor {
             // the doorbell takes, the context is what a refusal dumps.
             let mut sites: Vec<(usize, i64, [u64; NUM_SEGMENTS])> =
                 Vec::with_capacity(pending.len());
-            let items: Vec<BatchedCompute> = pending
+            let items: Vec<BatchedCb> = pending
                 .drain(..)
                 .map(|p| {
                     sites.push((p.op_index, p.rep, p.off));
@@ -3656,7 +3801,7 @@ impl Executor {
                 .collect();
             let stream = self.stream_ref()?;
             let st0 = Instant::now();
-            let r = stream.compute_batch(&items, batch_barrier);
+            let r = stream.submit_batch(&items, batch_barrier);
             let st1 = Instant::now();
             if let Err(e) = r {
                 // ⛔ EVERY FAULTING LAUNCH NAMES ITS OWN AIM — the flush's refusal must too.
@@ -3667,7 +3812,6 @@ impl Executor {
                 if let HwError::Stream(RuntimeStreamError::BatchElement { index, .. }) = &e
                     && let Some(&(oi, rep, off)) = sites.get(*index)
                 {
-                    let ta: Vec<&DevAddr> = items[*index].tensor_allocs.iter().collect();
                     // ⛔ ONE WRITE — same single-`format!` discipline as `[progverify]`.
                     let one = format!(
                         "[flush] refused at batch entry {index} (op {oi}, rep {rep}) of {} \
@@ -3675,14 +3819,19 @@ impl Executor {
                         items.len()
                     );
                     eprint!("{one}");
-                    self.dump_launch_site(
-                        "FAULT(batch-flush)",
-                        &ta,
-                        &ops[oi],
-                        &items[*index].prog,
-                        items[*index].bootstrap_offset,
-                        &off,
-                    );
+                    // A launch dumps its aim; a send or wait has no program to dump, and its op's
+                    // launch sits two entries on.
+                    if let BatchedCb::Compute(l) | BatchedCb::Consume(l) = &items[*index] {
+                        let ta: Vec<&DevAddr> = l.tensor_allocs.iter().collect();
+                        self.dump_launch_site(
+                            "FAULT(batch-flush)",
+                            &ta,
+                            &ops[oi],
+                            &l.prog,
+                            l.bootstrap_offset,
+                            &off,
+                        );
+                    }
                 }
                 let sweep = self.prog_images_sweep("FAULT", ops);
                 eprint!("{sweep}");
@@ -6147,16 +6296,71 @@ impl StepBody {
     }
 }
 
-/// This bundle's launches, in launch order.
+/// This bundle's launches that the session running as `session` plays, in launch order — every
+/// group of a world of one; a sharded rank's minus the rank-selected consumes of the other rank
+/// ([`bundle::collective::plays_on`], the law the bundle's CB pipeline reads too). Each consume
+/// carries its send, read off the bundle's baked placements.
 ///
-/// Infallible: a launch IS its program ([`bundle::LaunchGroup`]), so there is no index that could name
-/// a program the bundle does not carry.
-fn bind_ops(code: &'static bundle::BundleCode<'static>) -> Ops {
-    code.groups
-        .iter()
-        .enumerate()
-        .map(|(i, g)| OpProg::new(g, &code.fp, i))
-        .collect()
+/// A launch IS its program ([`bundle::LaunchGroup`]), so there is no index that could name a
+/// program the bundle does not carry. What can fail is the WORLD: a consume bound by a session of
+/// a world of one, or a rank-selected consume baked for another world, is a bundle the session was
+/// never meant to run.
+fn bind_ops(
+    code: &'static bundle::BundleCode<'static>,
+    session: Option<bundle::collective::TpIdentity>,
+) -> Result<Ops> {
+    let sends: BTreeMap<usize, bundle::collective::TpSend> =
+        bundle::collective::sends(&code.layout, &code.groups)
+            .map_err(|u| {
+                anyhow!(
+                    "bundle {}: group {}'s collective send names no baked bytes: {:?}",
+                    code.fp,
+                    u.group,
+                    u.why
+                )
+            })?
+            .into_iter()
+            .map(|s| (s.group, s.send))
+            .collect();
+    let mut ops = Vec::with_capacity(code.groups.len());
+    for (i, g) in code.groups.iter().enumerate() {
+        let mut collective = None;
+        if let Some(consume) = g.kv.tp {
+            let Some((me, route)) = session.and_then(|me| PeerRoute::of(me).map(|r| (me, r)))
+            else {
+                bail!(
+                    "bundle {} group {i} is a collective's consume, so the bundle was baked for a \
+                     sharded world — a world-of-one session cannot run it (link the process's \
+                     peer before loading: `runtime::link_peer`)",
+                    code.fp
+                );
+            };
+            if let Some(at) = consume.plays_at
+                && at.rank().world() != me.world()
+            {
+                bail!(
+                    "bundle {} group {i} was baked for a {}-rank world, but this session is rank \
+                     {} of a {}-rank world",
+                    code.fp,
+                    at.rank().world().get(),
+                    me.rank(),
+                    me.world().get()
+                );
+            }
+            if !bundle::collective::plays_on(Some(consume), me) {
+                continue;
+            }
+            let Some(&send) = sends.get(&i) else {
+                bail!(
+                    "bundle {} group {i}: a consume `sends` did not resolve",
+                    code.fp
+                );
+            };
+            collective = Some(cb_plan::BoundCollective { send, route });
+        }
+        ops.push(OpProg::new(g, &code.fp, i, collective));
+    }
+    Ok(ops)
 }
 
 fn launch_err(e: HwError) -> anyhow::Error {
@@ -6416,6 +6620,34 @@ fn report_phase_timers(compute_ms: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The seat law: a bundle runs in a process only when both agree on the world — no window and
+    /// no link, or the link's window exactly — and every disagreement refuses by name.
+    #[test]
+    fn a_bundle_runs_only_where_the_process_linked_its_window() {
+        use bundle::collective::{Payload, RecvWindow, WireBytes};
+        let at = |offset| RecvWindow::new(offset, Payload::from(WireBytes::CAP)).unwrap();
+        assert_eq!(RankSeat::agree(None, None), Ok(()));
+        assert_eq!(
+            RankSeat::agree(Some(at(1 << 20)), Some(at(1 << 20))),
+            Ok(())
+        );
+        assert_eq!(
+            RankSeat::agree(Some(at(1 << 20)), None),
+            Err(SeatRefusal::Unlinked)
+        );
+        assert_eq!(
+            RankSeat::agree(None, Some(at(1 << 20))),
+            Err(SeatRefusal::UnshardedBundle)
+        );
+        assert_eq!(
+            RankSeat::agree(Some(at(2 << 20)), Some(at(1 << 20))),
+            Err(SeatRefusal::WindowMoved {
+                baked: at(2 << 20),
+                linked: at(1 << 20)
+            })
+        );
+    }
 
     /// A compile-time-named segment cannot be out of range, and a runtime one is checked.
     #[test]

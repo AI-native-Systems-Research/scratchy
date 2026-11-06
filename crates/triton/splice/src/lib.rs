@@ -348,6 +348,14 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::ExpertMatmul { .. } => TritonKernelRow::Refused(
             "the MoE lowers only from kernels/moe.py through KTIR — no per-op MoE row exists",
         ),
+        // ⛔ A COLLECTIVE IS NOT ONE KERNEL. It is a control-block sequence in the compute
+        // stream — p2p sends to the peers' receive windows, a write-done wait, then the
+        // consume — and its only kernel (the consume's add) is the `Add` row's. The spyre
+        // emitter's collective arm owns it; no Triton program states a card-to-card transfer.
+        SubOp::AllReduce | SubOp::AllGather { .. } => TritonKernelRow::Refused(
+            "a collective lowers as a CB sequence by the spyre emitter's collective arm, \
+             never as one spliced kernel",
+        ),
         SubOp::TanhSoftCap { .. } => TritonKernelRow::Spliced {
             src: include_str!("../../../targets/spyre/kernels/tanhsoftcap.py"),
             file: "tanhsoftcap.py",
@@ -2382,7 +2390,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // stays LOGICAL: its door arm returns early through
             // `matmul_fp8_descriptors(m, k, n)` and is not pad-idempotent.
             let (m_total, _a_total) = matmul_window_of(node, ir)?;
-            let n_dev = ktir_superdsc::work::DeviceWidth::for_matmul(m, *n, k, false).get();
+            let n_dev = matmul_out_width(node, ir, m, *n, k);
             ce("M", Val::Int(i128::from(m)))?;
             ce("K", Val::Int(i128::from(k)))?;
             ce("N", Val::Int(i128::from(n_dev)))?;
@@ -2871,7 +2879,14 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     // The operands must window the SAME slice of the SAME storage — the builder's
     // own law (`load_region` per operand, one chunk per node).
     for tr in &node.inputs {
-        let in_total = ir.tensors[tr.tensor.index()].cols;
+        // A SYNTHETIC BEYOND THE GRAPH (the tensor-parallel receive window) has no storage in the
+        // graph: its storage IS its region, from its first byte — `matmul_window_of`'s law for the
+        // LAST_HIDDEN staging. So it joins the node's one storage window only when that region is
+        // exactly the window the output states; anything else is the disagreement refused below.
+        let in_total = ir
+            .tensors
+            .get(tr.tensor.index())
+            .map_or(tr.region.cols.len, |s| s.cols);
         if tr.region.rows.start != r || tr.region.cols.start != c_start || in_total != n_total {
             return Err(format!(
                 "triton splice: t{}'s operands disagree about the window (output [{r}, \
@@ -2898,6 +2913,60 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// spells one. The fold's m=1 tail is row 0 of the `[mq, vocab]` logits storage, so
 /// it passes; any other row-windowed matmul is a shape to spell with a kernel, not to
 /// silently mis-address.
+/// ⭐ THE WIDTH A DENSE MATMUL'S PROGRAM STATES FOR ITS OUTPUT — the width its READERS address.
+///
+/// The door's device width (`DeviceWidth::for_matmul`) may pad the output's stick count to fill
+/// the util floor, and the layout reserves the padded width. The program's output view must name
+/// what its readers read, because the program's views are row-major (the emulator runs them as
+/// stated): a reader that states the LOGICAL width over a buffer written at the padded one reads
+/// every row past the first at the wrong stride. So:
+/// - when EVERY reader is a family whose kernel states the logical width — RoPE, the attention,
+///   the norms, the elementwise and gated-activation families, a collective — the output is the
+///   logical width, stick-rounded;
+/// - otherwise the padded width stands: a pad-aware reader (the ScalarMul family, whose window IS
+///   `DeviceWidth::for_pointwise` — the logits scale over the padded lm head) or one this law does
+///   not name (the sampler's widened row) reads the storage the door pads.
+///
+/// The card is unchanged either way: the door re-derives its padded write from the stated width
+/// (`for_matmul` is idempotent at a padded width and pads the logical one alike), and a card
+/// activation is stick-major, so the leading sticks of a padded write are the logical tensor's
+/// bytes. MEASURED (the emulator gates): smollm2's one-rank prefill k/v (`[31, 192]`, 3 sticks)
+/// and granite's two-rank prefill k/v (`[31, 256]`, 4 sticks) were written at 512 and read at
+/// their logical widths — row 0 right, every later row at the wrong stride.
+fn matmul_out_width<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &scratchy_subtile::subtile_ir::SubtileIR<F>,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> u32 {
+    let out = node.output.tensor;
+    let mut readers = ir
+        .nodes
+        .iter()
+        .filter(|r| r.inputs.iter().any(|i| i.tensor == out))
+        .peekable();
+    let logical_readers = readers.peek().is_some()
+        && readers.all(|r| {
+            matches!(
+                r.op,
+                SubOp::RopeRotate { .. }
+                    | SubOp::RopeAppend { .. }
+                    | SubOp::AttnDecode { .. }
+                    | SubOp::RmsNorm { .. }
+                    | SubOp::Elementwise(_)
+                    | SubOp::SiluMul
+                    | SubOp::AllReduce
+                    | SubOp::AllGather { .. }
+            )
+        });
+    if logical_readers {
+        n.next_multiple_of(ktir_superdsc::work::FP16_ELEMS_PER_STICK)
+    } else {
+        ktir_superdsc::work::DeviceWidth::for_matmul(m, n, k, false).get()
+    }
+}
+
 fn matmul_window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -3420,6 +3489,7 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::TanhSoftCap => "tanhsoftcap",
         Program::ScalarWeightMul => "scalarwmul",
         Program::Reshape => "reshape",
+        Program::BlockCopy => "blockcopy",
         // ⭐ THE SAMPLER'S OWN STEM — #813's argmax law: a spliced whole-function kernel
         // keeps its own name (`argmax_s{id}`), never the generic `triton`, so a bake log
         // names the draw's descriptors for what they are.

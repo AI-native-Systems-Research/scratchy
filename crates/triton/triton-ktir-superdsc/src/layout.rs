@@ -884,6 +884,7 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         | Program::Elementwise(_)
         | Program::SiluMul
         | Program::LmLast
+        | Program::BlockCopy
         | Program::Transpose
         | Program::Matmul
         // The sampler's tables (and its per-row noise and temperature operands) ride as
@@ -1183,6 +1184,7 @@ fn scales_for(
         Program::Elementwise(_)
         | Program::SiluMul
         | Program::LmLast
+        | Program::BlockCopy
         | Program::Transpose
         | Program::Matmul
         | Program::Rope

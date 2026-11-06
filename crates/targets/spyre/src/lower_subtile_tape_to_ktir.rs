@@ -612,6 +612,214 @@ fn ktir_only(k: ktir_superdsc::ktir_node::KtirNode) -> EmittedOp {
     e
 }
 
+/// ⭐ WHAT A COLLECTIVE'S SEND MOVES — this rank's operand `x` as ONE fragment. The send itself is
+/// not a program: it is an F-send control block (device p2p RDMA, flex-rs
+/// `scheduler::build_rdma_send_cb`) the CB pipeline issues ahead of the consume's wait,
+/// moving the fragment from `x`'s own placement into the peer's receive window on this card's DMA
+/// engine. The consume names the operand and this fragment ([`TpConsume`]), which is all the send
+/// needs.
+///
+/// ⛔ ONE FRAGMENT: the window holds one fragment — `WINDOW_ROWS` rows of the operand
+/// (`RecvWindow::bytes_for`), more than any bundle hands a collective — so every operand is one,
+/// and its send is a run of messages when it passes the cap. An operand with more rows than the
+/// window is refused by name.
+///
+/// [`TpConsume`]: ktir_superdsc::collective::TpConsume
+fn send_fragment<F: RopeForm>(
+    node: &SubtileNode<F>,
+    kind: ktir_superdsc::collective::CollectiveKind,
+) -> Result<ktir_superdsc::collective::Fragment, NodeLowering> {
+    let x = node.inputs[0];
+    let (rows, cols) = (x.region.rows.len, x.region.cols.len);
+    match crate::tp_plan::consume_fragments(rows, cols).as_deref() {
+        Ok([f]) => Ok(*f),
+        Ok(more) => Err(NodeLowering::Unhandled(format!(
+            "the {kind:?} operand [{rows}, {cols}] is {} p2p fragments — more rows than the \
+             receive window holds, and two fragments of one collective cannot share it",
+            more.len()
+        ))),
+        Err(why) => Err(NodeLowering::Unhandled(format!(
+            "the {kind:?} operand [{rows}, {cols}] cannot be cut into p2p fragments: {why:?}"
+        ))),
+    }
+}
+
+/// ⭐ THE WINDOW CUT `node`'S COLLECTIVE USES — [`WindowCut::of_collective`] its index in the
+/// forward's own order (how many collectives precede it in `ir`), so consecutive collectives land
+/// in alternate cuts. The same index on every rank and in every bundle that carries the node.
+///
+/// [`WindowCut::of_collective`]: ktir_superdsc::collective::WindowCut::of_collective
+fn window_cut<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> ktir_superdsc::collective::WindowCut {
+    let k = ir
+        .nodes
+        .iter()
+        .take_while(|n| n.id != node.id)
+        .filter(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
+        .count();
+    ktir_superdsc::collective::WindowCut::of_collective(k)
+}
+
+/// The all-reduce's consume launches: per stick-column fragment of the operand
+/// ([`crate::tp_plan::consume_fragments`], the same cut the window is sized over), the `Add` splice
+/// over this rank's fragment and the receive window, each marked with the [`TpConsume`] its launch
+/// group carries into the CB pipeline.
+///
+/// A window cut holds ONE fragment at a time, laid out from its first byte as the `[rows, cols]`
+/// tensor that fragment is — a run of whole stick columns is byte-identical to such a tensor — so
+/// every fragment's window view is columns `[0, cols)` of the collective's cut
+/// ([`window_cut_tid`]).
+///
+/// [`TpConsume`]: ktir_superdsc::collective::TpConsume
+fn all_reduce_consumes<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    rows_are_requests: bool,
+) -> NodeLowering {
+    use ktir_superdsc::collective::{CollectiveKind, TpConsume};
+    use scratchy_subtile::subtile_ir::{EwKind, Range, Region, TensorRegion};
+    let x = node.inputs[0];
+    let rows = x.region.rows.len;
+    // The consume names the send — this rank's partial into the peer's window — which the CB
+    // pipeline issues ahead of the consume's wait.
+    let frags = match send_fragment(node, CollectiveKind::AllReduce) {
+        Ok(f) => [f],
+        Err(refusal) => return refusal,
+    };
+    let cut = window_cut(node, ir);
+    let window = TensorId::from_index(cut.tid() as usize);
+    let mut ops = Vec::with_capacity(frags.len());
+    for (k, f) in frags.into_iter().enumerate() {
+        let cols_at = |start: u32| Range::new(start + f.first_col(), f.cols());
+        let consume = SubtileNode {
+            id: node.id,
+            op: SubOp::Elementwise(EwKind::Add),
+            inputs: vec![
+                TensorRegion {
+                    tensor: x.tensor,
+                    region: Region {
+                        rows: x.region.rows,
+                        cols: cols_at(x.region.cols.start),
+                    },
+                },
+                TensorRegion {
+                    tensor: window,
+                    region: Region {
+                        rows: Range::new(0, rows),
+                        cols: Range::new(0, f.cols()),
+                    },
+                },
+            ],
+            output: TensorRegion {
+                tensor: node.output.tensor,
+                region: Region {
+                    rows: node.output.region.rows,
+                    cols: cols_at(node.output.region.cols.start),
+                },
+            },
+        };
+        let mut e = match scratchy_triton_splice::lower(&consume, ir, rows_are_requests) {
+            Ok(e) => e,
+            Err(reason) => return NodeLowering::Unhandled(reason),
+        };
+        // One name per fragment: the fragments share the node's id, and a launch's name is its
+        // program's identity.
+        let name = format!("tpconsume_s{}_f{k}", node.id.index());
+        if let Some(kt) = e.ktir.as_mut() {
+            kt.func.name = ktir_core::arena::Arena::global().str(name.clone());
+        }
+        e.op_name = name;
+        e.tp_consume = Some(TpConsume {
+            kind: CollectiveKind::AllReduce,
+            operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
+            fragment: f,
+            plays_at: None,
+            cut,
+        });
+        ops.push(e);
+    }
+    NodeLowering::Ops(ops)
+}
+
+/// The all-gather's consumes: per rank `r` of the two-rank world, two block copies
+/// (`scratchy_triton_splice::lower_block_copy`) — this rank's `[rows, lc]` block to columns
+/// `r · lc` of the gathered output, and the peer's block, out of the receive window, to columns
+/// `peer · lc` — both marked with ONE [`TpConsume`] that plays at `r`, so they fuse into that rank's
+/// consume group and every other rank skips it whole.
+///
+/// ⛔ ONE FRAGMENT. A block copy moves a WHOLE source, and the window holds one fragment at a
+/// time — `WINDOW_ROWS` rows of the block, which every block a bundle hands a gather fits.
+///
+/// [`TpConsume`]: ktir_superdsc::collective::TpConsume
+fn all_gather_consumes<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    cols: u32,
+) -> NodeLowering {
+    use ktir_superdsc::collective::{CollectiveKind, PlaysAt, TpConsume, TpWorld};
+    use scratchy_subtile::subtile_ir::{Range, Region, TensorRegion};
+    let x = node.inputs[0];
+    let (rows, lc) = (x.region.rows.len, x.region.cols.len);
+    // Spyre's one sharded world (`SPYRE_TP_WORLDS = [1, 2]`); a gather in any forward is its.
+    let world = TpWorld::of::<2>();
+    if cols != world.get() * lc {
+        return NodeLowering::Unhandled(format!(
+            "the all-gather restores {cols} columns from a {lc}-column block — not {} blocks",
+            world.get()
+        ));
+    }
+    // Every rank's consume names the send — this rank's block into the peer's window — and each
+    // rank plays only its own consume, so each rank sends once.
+    let fragment = match send_fragment(node, CollectiveKind::AllGather) {
+        Ok(f) => f,
+        Err(refusal) => return refusal,
+    };
+    let cut = window_cut(node, ir);
+    let window = TensorRegion {
+        tensor: TensorId::from_index(cut.tid() as usize),
+        region: Region {
+            rows: Range::new(0, rows),
+            cols: Range::new(0, lc),
+        },
+    };
+    let block_at = |rank: u32| TensorRegion {
+        tensor: node.output.tensor,
+        region: Region {
+            rows: node.output.region.rows,
+            cols: Range::new(node.output.region.cols.start + rank * lc, lc),
+        },
+    };
+    let mut ops = Vec::with_capacity(2 * world.get() as usize);
+    for id in world.ranks() {
+        let Some(peer) = id.peer() else {
+            return NodeLowering::Unhandled("a two-rank world's rank has no peer".to_string());
+        };
+        let consume = TpConsume {
+            kind: CollectiveKind::AllGather,
+            operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
+            fragment,
+            plays_at: Some(PlaysAt::of(id)),
+            cut,
+        };
+        for (src, dst, leg) in [
+            (x, block_at(id.rank()), "own"),
+            (window, block_at(peer.rank()), "peer"),
+        ] {
+            let name = format!("tpgather_s{}_r{}_{leg}", node.id.index(), id.rank());
+            match scratchy_triton_splice::lower_block_copy(node, src, dst, cols, &name) {
+                Ok(mut e) => {
+                    e.tp_consume = Some(consume);
+                    ops.push(e);
+                }
+                Err(reason) => return NodeLowering::Unhandled(reason),
+            }
+        }
+    }
+    NodeLowering::Ops(ops)
+}
+
 /// Lower ONE [`SubtileNode`] to its SuperDSC op(s) — the single source of the the
 /// per-`SubOp` match. `ir` is needed only for `AttnDecode`'s cache-capacity lookup.
 /// ⭐⭐⭐ ONE NODE, ONE PROGRAM.
@@ -687,6 +895,18 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::KvAppend { .. }
         | SubOp::ExpertAct { .. }
         | SubOp::Mean => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
+        // ⭐ THE ALL-REDUCE'S CONSUME. The exchange itself is not a program — the bundle's CB
+        // pipeline sends this rank's operand fragment into the peer's window and waits for the
+        // peer's before the consume launches (`bundle::collective::cb_pipeline`). What IS a program
+        // is the sum: per fragment, the ordinary `Add` splice over (this rank's fragment, the
+        // window), writing the output's same columns. Two operands, because spyre bakes worlds of
+        // one and two (`SPYRE_TP_WORLDS`) and a world of one has no collective; fp16 addition is
+        // commutative, so both ranks compute bit-identical sums.
+        SubOp::AllReduce => all_reduce_consumes(node, ir, rows_are_requests),
+        // ⭐ THE ALL-GATHER'S CONSUME IS RANK-SELECTED: this rank's block and the peer's land at
+        // columns that depend on which rank is which, so the bake carries one consume per rank
+        // and each session plays its own (`bundle::collective::cb_pipeline`).
+        SubOp::AllGather { cols } => all_gather_consumes(node, ir, *cols),
         // ⛔ THE 2b EXPANSION KINDS, named here instead of `expansion_ops!()`: the 2a
         // routing below made the macro's patterns for THOSE kinds unreachable
         // (`unreachable_patterns` is `-D warnings`), and the remaining members are a
