@@ -305,6 +305,51 @@ __device__ inline float2 zero_to_one::op<float2>(const float2& x) {
     return float2{zero_to_one::op<float>(x.x), zero_to_one::op<float>(x.y)};
 }
 
+// The per-token e4m3 scale of one row (FP8 S3, `quant_rows_fp8.cu`): `max(amax / 448, 1 / (448 ·
+// 512))`, vLLM v0.31.0's `dynamic_per_token_scaled_fp8_quant_kernel_strided` (`csrc/libtorch_stable/
+// quantization/w8a8/fp8/common.cu`, its `token_scale`, with `min_scaling_factor` from `csrc/
+// quantization/utils.cuh`). vLLM's division is IEEE; under `--use_fast_math` `/` is not, so it is
+// `__fdiv_rn`. The floor is a constant of the type, rounded once at compile time, as vLLM's
+// `1.0f / (448.0f * 512.0f)` is. `amax` is never NaN (TK's `max` is `fmaxf`'s, which drops one).
+struct fp8_scale {
+    static constexpr float E4M3_MAX = 448.0f;
+    static constexpr float MIN_SCALE = 1.0f / (448.0f * 512.0f);
+    template <typename T>
+    static __device__ inline T op(const T& amax) {
+        return fmaxf(__fdiv_rn(amax, E4M3_MAX), MIN_SCALE);
+    }
+};
+template <>
+__device__ inline float fp8_scale::op<float>(const float& amax) {
+    return fmaxf(__fdiv_rn(amax, E4M3_MAX), MIN_SCALE);
+}
+template <>
+__device__ inline float2 fp8_scale::op<float2>(const float2& amax) {
+    return float2{fp8_scale::op<float>(amax.x), fp8_scale::op<float>(amax.y)};
+}
+
+// One element before its e4m3 cast (FP8 S3): `clamp(x / scale, −448, 448)`, vLLM v0.31.0's
+// `scaled_fp8_conversion<false>` (`csrc/quantization/w8a8/fp8/common.cuh`): the per-token kernel
+// DIVIDES by the scale (`is_scale_inverted = false`), it does not multiply by a reciprocal. The
+// division is `__fdiv_rn` (see `fp8_scale`); the clamp is vLLM's `fmaxf(−max, fminf(x, max))`, so
+// a NaN quotient becomes +448, as in vLLM. TK's `warp::copy` to an fp8 tile then rounds once to
+// nearest even (`__nv_fp8x4_e4m3`, saturating to finite), as vLLM's `__nv_cvt_float_to_fp8`.
+// The `float2` form serves a row-layout tile's packed pairs (`warp::row_map`).
+struct fp8_quant_pre {
+    template <typename T>
+    static __device__ inline T op(const T& x, const T& scale) {
+        return fmaxf(-fp8_scale::E4M3_MAX, fminf(__fdiv_rn(x, scale), fp8_scale::E4M3_MAX));
+    }
+};
+template <>
+__device__ inline float fp8_quant_pre::op<float>(const float& x, const float& scale) {
+    return fmaxf(-fp8_scale::E4M3_MAX, fminf(__fdiv_rn(x, scale), fp8_scale::E4M3_MAX));
+}
+template <>
+__device__ inline float2 fp8_quant_pre::op<float2>(const float2& x, const float2& scale) {
+    return float2{fp8_quant_pre::op<float>(x.x, scale.x), fp8_quant_pre::op<float>(x.y, scale.y)};
+}
+
 // The MoE sort's run length: an expert's pair count rounded up to whole 128-row tiles of the
 // grouped GEMM (`op_abi::CUDA_EXPERT_TILE_ROWS`), so a tile belongs to one expert. Integer, exact.
 struct tile_pad {

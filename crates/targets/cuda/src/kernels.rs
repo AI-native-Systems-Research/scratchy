@@ -44,6 +44,96 @@ unsafe extern "C" {
         vocab: u32,
         stream: *mut c_void,
     ) -> i32;
+    // FP8 S3: the per-token quantization and the prefill fp8 GEMM family.
+    fn scratchy_cuda_quant_rows_fp8_prepare() -> i32;
+    fn scratchy_cuda_quant_rows_fp8(
+        x: *const c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        rows: u32,
+        cols: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemm_fp8_prepare() -> i32;
+    fn scratchy_cuda_gemm_fp8_abt(
+        a: *const c_void,
+        a_scale: *const c_void,
+        b: *const c_void,
+        b_scale: *const c_void,
+        c: *mut c_void,
+        m: u32,
+        n: u32,
+        k: u32,
+        col64: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemm_group_fp8_abt(
+        a: *const c_void,
+        a_scale: *const c_void,
+        b: *const *const c_void,
+        b_scale: *const *const c_void,
+        c: *const *mut c_void,
+        n: *const u32,
+        m: u32,
+        k: u32,
+        count: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gate_up_gemm_fp8(
+        a: *const c_void,
+        a_scale: *const c_void,
+        gate: *const c_void,
+        gate_scale: *const c_void,
+        up: *const c_void,
+        up_scale: *const c_void,
+        c: *mut c_void,
+        m: u32,
+        n: u32,
+        k: u32,
+        act: u32,
+        col64: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_expert_gemm_fp8(
+        a: *const c_void,
+        a_scale: *const c_void,
+        b: *const c_void,
+        b_scale: *const c_void,
+        offsets: *const c_void,
+        tile_expert: *const c_void,
+        c: *mut c_void,
+        max_tiles: u32,
+        n: u32,
+        k: u32,
+        experts: u32,
+        expert_rows: u32,
+        n_tile: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemm_narrow_fp8_prepare() -> i32;
+    fn scratchy_cuda_gemm_narrow_fp8_abt(
+        a: *const c_void,
+        a_scale: *const c_void,
+        b: *const c_void,
+        b_scale: *const c_void,
+        c: *mut c_void,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemm_narrow_group_fp8_abt(
+        a: *const c_void,
+        a_scale: *const c_void,
+        b: *const *const c_void,
+        b_scale: *const *const c_void,
+        c: *const *mut c_void,
+        n: *const u32,
+        m: u32,
+        k: u32,
+        count: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemm_bf16_abt_prepare() -> i32;
     fn scratchy_cuda_gemm_bf16_abt(
         a: *const c_void,
@@ -886,6 +976,10 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     // #1049's one-launch GDN decode: static shared memory only, so a load of every instance.
     ("gdn_decode", scratchy_cuda_gdn_decode_prepare),
     ("gate_up_gemm_bf16", scratchy_cuda_gate_up_gemm_bf16_prepare),
+    // FP8 S3: the attribute on every instance of each file, which loads each.
+    ("quant_rows_fp8", scratchy_cuda_quant_rows_fp8_prepare),
+    ("gemm_fp8", scratchy_cuda_gemm_fp8_prepare),
+    ("gemm_narrow_fp8", scratchy_cuda_gemm_narrow_fp8_prepare),
     // Load-only (#1048): these set no attribute, but a worker captures its tapes into CUDA Graphs
     // at construction, and a kernel the runtime has not loaded must not first load during a
     // capture. Every kernel a tape can launch is loaded here, when the device opens.
@@ -2840,4 +2934,267 @@ pub unsafe fn expert_gemv_split_bf16(
             dims: [m, top_k, n, k],
         },
     )
+}
+
+// FP8 S3: THE PER-TOKEN QUANTIZATION AND THE PREFILL FP8 GEMMS. An fp8 operand is a pair, its e4m3
+// bytes and its f32 scales: the activation's `[m, k]` rows and `[m]` per-token scales
+// (`quant_rows_fp8`'s output, in the quant scratch), and the weight's `[n, k]` bytes and `[n]`
+// per-channel scales (`step::fp8_weight`'s one buffer). Every output is bf16, rounded once from
+// `(A · Bᵀ) · w_scale[n] · a_scale[m]` in f32.
+
+/// One fp8 operand: its e4m3 bytes and its f32 scales.
+pub type Fp8Operand = (*const c_void, *const c_void);
+
+/// Launch the per-token dynamic e4m3 quantization (`kernels/quant_rows_fp8.cu`, FP8 S3): for every
+/// row `r` of `x [rows, cols]` bf16, `scale[r] = max(amax_r / 448, 1 / (448·512))` and `q[r, c] =
+/// e4m3_satfinite(clamp(x[r, c] / scale[r], ±448))`, vLLM v0.31.0's per-token formula with its
+/// division. Asynchronous.
+///
+/// Refused with [`KernelError::RowShape`], before any pointer is touched, unless `rows` is a
+/// non-zero multiple of 16, `cols` of 64 (`step::GEMM_FP8_K_MULTIPLE`) and `rows · cols` at most
+/// `i32::MAX`.
+///
+/// # Safety
+///
+/// [`prepare_all`] must have succeeded on the current device. `x` must be a 16-byte-aligned device
+/// pointer to `rows·cols` bf16, `q` to `rows·cols` bytes and `scale` to `rows` f32 (4-byte
+/// aligned), valid for the whole kernel, the outputs overlapping neither `x` nor each other.
+/// `stream` must be a live `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn quant_rows_fp8(
+    x: *const c_void,
+    (q, scale): (*mut c_void, *mut c_void),
+    (rows, cols): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code = unsafe { scratchy_cuda_quant_rows_fp8(x, q, scale, rows, cols, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the fp8 GEMM (`kernels/gemm_fp8.cu`): `c [m, n] = bf16((a · bᵀ) · b_scale[n] ·
+/// a_scale[m])`, accumulated in f32. At `col64` false on [`gemm_bf16_abt`]'s tile grid (`m`, `n`,
+/// `k` non-zero multiples of 128, 256 and 64), at `col64` true on [`gemm_col64_bf16_abt`]'s (128,
+/// 64, 64); none above `i32::MAX`. On an `n` both take, each element is the same bits.
+/// Asynchronous; refused with [`KernelError::Shape`] before any pointer is touched.
+///
+/// # Safety
+///
+/// [`prepare_all`] must have succeeded on the current device. `a` (`m·k` bytes), `b` (`n·k`) and
+/// `c` (`m·n` bf16) must be 16-byte-aligned device pointers and the scales (`m` and `n` f32)
+/// 8-byte-aligned, valid for the whole kernel, `c` overlapping no input. `stream` as
+/// [`gemm_bf16_abt`]'s.
+pub unsafe fn gemm_fp8_abt(
+    a: Fp8Operand,
+    b: Fp8Operand,
+    c: *mut c_void,
+    (m, n, k): (u32, u32, u32),
+    col64: bool,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_gemm_fp8_abt(a.0, a.1, b.0, b.1, c, m, n, k, u32::from(col64), stream)
+    };
+    check(code, KernelError::Shape { m, n, k })
+}
+
+/// One grouped fp8 member: its weight (bytes and scales), its output and its `n`.
+pub type Fp8GroupOperands<'g> = &'g [(Fp8Operand, *mut c_void, u32)];
+
+/// The member arrays of `members` as the grouped launchers read them, and their refusal.
+fn fp8_group_parts(
+    kernel: &'static str,
+    members: Fp8GroupOperands<'_>,
+    (m, k): (u32, u32),
+) -> (
+    [[*const c_void; 3]; 2],
+    [*mut c_void; 3],
+    [u32; 3],
+    KernelError,
+) {
+    let mut w = [[std::ptr::null(); 3]; 2];
+    let (mut c, mut n) = ([std::ptr::null_mut(); 3], [0u32; 3]);
+    for (i, &((b, s), ci, ni)) in members.iter().take(3).enumerate() {
+        (w[0][i], w[1][i], c[i], n[i]) = (b, s, ci, ni);
+    }
+    (w, c, n, KernelError::GroupShape { kernel, m, k, n })
+}
+
+/// [`gemm_fp8_abt`] at `col64` false of every member of `members` off one `a` in one launch: each
+/// member's output is the bits of its own [`gemm_fp8_abt`]. Asynchronous; refused with
+/// [`KernelError::GroupShape`] before any pointer is touched unless there are 2 or 3 members, each
+/// under that GEMM's rule with the shared `m` and `k`.
+///
+/// # Safety
+///
+/// As [`gemm_fp8_abt`]'s, for `a` and every member; no member's output overlaps another's.
+pub unsafe fn gemm_group_fp8_abt(
+    a: Fp8Operand,
+    members: Fp8GroupOperands<'_>,
+    (m, k): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let ([b, s], c, n, refused) = fp8_group_parts("gemm_group_fp8_abt", members, (m, k));
+    let count = members.len() as u32;
+    // SAFETY: as above; the arrays are three long and the launcher checks the count and every
+    // member's shape before it reads a pointer.
+    let code = unsafe {
+        scratchy_cuda_gemm_group_fp8_abt(
+            a.0,
+            a.1,
+            b.as_ptr(),
+            s.as_ptr(),
+            c.as_ptr(),
+            n.as_ptr(),
+            m,
+            k,
+            count,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// The fp8 gate/up GEMM: `c [m, n] = bf16(act(g, u))`, `g` and `u` each [`gemm_fp8_abt`]'s value
+/// before its rounding (scaled by its own weight's scales and by `a`'s), `act` 0 for SwiGLU's
+/// `silu_mul` and 1 for GeGLU's `gelu_tanh_mul`, in f32, rounded once. Under [`gemm_fp8_abt`]'s
+/// rule at the same `col64`. Asynchronous; refused with [`KernelError::GateUpShape`] before any
+/// pointer is touched.
+///
+/// # Safety
+///
+/// As [`gemm_fp8_abt`]'s for `a`, `gate`, `up` (each `[n, k]`) and `c`.
+pub unsafe fn gate_up_gemm_fp8(
+    (a, gate, up): (Fp8Operand, Fp8Operand, Fp8Operand),
+    c: *mut c_void,
+    (m, n, k): (u32, u32, u32),
+    (act, col64): (u32, bool),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape and codes before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_gate_up_gemm_fp8(
+            a.0,
+            a.1,
+            gate.0,
+            gate.1,
+            up.0,
+            up.1,
+            c,
+            m,
+            n,
+            k,
+            act,
+            u32::from(col64),
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GateUpShape {
+            kernel: "gate_up_gemm_fp8",
+            dims: [m, n, k, 1],
+        },
+    )
+}
+
+/// The grouped expert GEMM over an fp8 bank (`kernels/gemm_fp8.cu`): [`expert_gemm_tiled_bf16`]'s
+/// task walk, index regions and shape rule, with `a` the pair rows' e4m3 bytes and per-row scales
+/// and `b` expert 0's `[expert_rows, k]` e4m3 block and its `[expert_rows]` f32 scale row (of
+/// `[experts, expert_rows]`). Every live tile's rows are the bits [`gemm_fp8_abt`] gives on the
+/// same rows and expert slice. Asynchronous; refused with [`KernelError::MoeShape`] `{ kernel:
+/// "expert_gemm_fp8", .. }` before any pointer is touched.
+///
+/// # Safety
+///
+/// As [`expert_gemm_tiled_bf16`]'s, with `a` `max_tiles · 128 · k` bytes and its scales as many
+/// f32, `b` `experts · expert_rows · k` bytes and its scales `experts · expert_rows` f32.
+pub unsafe fn expert_gemm_fp8(
+    (a, b): (Fp8Operand, Fp8Operand),
+    (offsets, tile_expert): (*const c_void, *const c_void),
+    c: *mut c_void,
+    (max_tiles, n, k, experts, expert_rows): (u32, u32, u32, u32, u32),
+    n_tile: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above.
+    let code = unsafe {
+        scratchy_cuda_expert_gemm_fp8(
+            a.0,
+            a.1,
+            b.0,
+            b.1,
+            offsets,
+            tile_expert,
+            c,
+            max_tiles,
+            n,
+            k,
+            experts,
+            expert_rows,
+            n_tile,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MoeShape {
+            kernel: "expert_gemm_fp8",
+            dims: [max_tiles, n, k, expert_rows],
+        },
+    )
+}
+
+/// The narrow fp8 GEMM (`kernels/gemm_narrow_fp8.cu`), for `n` of at most 64: [`gemm_fp8_abt`]'s
+/// operands and value, `m` a non-zero multiple of 16, `n` of 8 at most 64 and `k` of 64, `m` and
+/// `k` at most `i32::MAX`. Asynchronous; refused with [`KernelError::NarrowShape`] before any
+/// pointer is touched.
+///
+/// # Safety
+///
+/// As [`gemm_fp8_abt`]'s, with every pointer 16-byte aligned.
+pub unsafe fn gemm_narrow_fp8_abt(
+    a: Fp8Operand,
+    b: Fp8Operand,
+    c: *mut c_void,
+    (m, n, k): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above.
+    let code = unsafe { scratchy_cuda_gemm_narrow_fp8_abt(a.0, a.1, b.0, b.1, c, m, n, k, stream) };
+    check(code, KernelError::NarrowShape { m, n, k })
+}
+
+/// [`gemm_narrow_fp8_abt`] of every member of `members` off one `a` in one launch, each the bits
+/// of its own [`gemm_narrow_fp8_abt`]. Asynchronous; refused with [`KernelError::GroupShape`]
+/// before any pointer is touched unless there are 2 or 3 members, each under the narrow rule.
+///
+/// # Safety
+///
+/// As [`gemm_narrow_fp8_abt`]'s, for `a` and every member; no member's output overlaps another's.
+pub unsafe fn gemm_narrow_group_fp8_abt(
+    a: Fp8Operand,
+    members: Fp8GroupOperands<'_>,
+    (m, k): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let ([b, s], c, n, refused) = fp8_group_parts("gemm_narrow_group_fp8_abt", members, (m, k));
+    let count = members.len() as u32;
+    // SAFETY: as `gemm_group_fp8_abt`'s.
+    let code = unsafe {
+        scratchy_cuda_gemm_narrow_group_fp8_abt(
+            a.0,
+            a.1,
+            b.as_ptr(),
+            s.as_ptr(),
+            c.as_ptr(),
+            n.as_ptr(),
+            m,
+            k,
+            count,
+            stream,
+        )
+    };
+    check(code, refused)
 }

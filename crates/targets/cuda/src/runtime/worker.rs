@@ -42,9 +42,9 @@ use crate::step::{
     AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGemmBf16,
     ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
     GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16,
-    MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, RmsNormBf16,
-    RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16,
-    SiluMulBf16, SoftCapBf16, gemv_splits,
+    MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, QuantRowsFp8,
+    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
+    ScaleBf16, SiluMulBf16, SoftCapBf16, fp8_weight, gemv_splits,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
@@ -620,31 +620,19 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
 }
 
 /// The name of `s` when no kernel launches it: the Qwen routing at another count than
-/// [`MOE_ROUTE_EXPERTS`], and every fp8 step (FP8 S2: the quantization and the fp8 GEMMs are S3's
-/// kernels, the fp8 GEMVs S4's, the fp8 expert projections both). The routing kernel's Qwen
-/// program is instantiated at 256 only (its launcher refuses any other count), so such a tape is
-/// refused before anything is enqueued, rather than at its routing step. `None` for every other
-/// step.
+/// [`MOE_ROUTE_EXPERTS`], every fp8 GEMV (FP8 S4's kernels), and every step over an fp8 expert
+/// bank (its pair rows are not quantized on the tape yet, so the S3 expert GEMM has no input). The
+/// routing kernel's Qwen program is instantiated at 256 only (its launcher refuses any other
+/// count), so such a tape is refused before anything is enqueued, rather than at its routing step.
+/// `None` for every other step.
 fn not_launched(s: &CudaStep) -> Option<&'static str> {
-    const S3: &str = "an fp8 step, whose S3 kernel is not built yet";
-    const S4: &str = "an fp8 GEMV, whose S4 kernel is not built yet";
     match *s {
-        CudaStep::QuantRowsFp8(_)
-        | CudaStep::GemmFp8(_)
-        | CudaStep::GemmCol64Fp8(_)
-        | CudaStep::GemmNarrowFp8(_)
-        | CudaStep::GemmGroupFp8(_)
-        | CudaStep::GemmNarrowGroupFp8(_)
-        | CudaStep::GateUpAct(GateUpActBf16 {
-            kernel: GateUpKernel::GemmFp8 | GateUpKernel::GemmCol64Fp8,
-            ..
-        }) => return Some(S3),
         CudaStep::GemvFp8(_)
         | CudaStep::GemvGroupFp8(_)
         | CudaStep::GateUpAct(GateUpActBf16 {
             kernel: GateUpKernel::GemvFp8,
             ..
-        }) => return Some(S4),
+        }) => return Some("an fp8 GEMV, whose S4 kernel is not built yet"),
         CudaStep::RouterLogits(RouterLogitsBf16 { weight, .. })
         | CudaStep::ExpertGemm(ExpertGemmBf16 { weight, .. })
         | CudaStep::ExpertGemv(ExpertGemvBf16 { weight, .. })
@@ -652,7 +640,7 @@ fn not_launched(s: &CudaStep) -> Option<&'static str> {
             gate: ExpertGemvBf16 { weight, .. },
             ..
         }) if matches!(weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own) => {
-            return Some("an fp8 expert step, whose S3/S4 kernel is not built yet");
+            return Some("an fp8 expert step, whose pair rows the tape does not quantize yet");
         }
         _ => {}
     }
@@ -1410,15 +1398,57 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         for (step, s) in tape.steps.iter().enumerate() {
             let launched = match *s {
                 // Refused before any capture or forward (`not_launched`): no kernel yet.
-                CudaStep::QuantRowsFp8(_)
-                | CudaStep::GemmFp8(_)
-                | CudaStep::GemmCol64Fp8(_)
-                | CudaStep::GemmNarrowFp8(_)
-                | CudaStep::GemvFp8(_)
-                | CudaStep::GemmGroupFp8(_)
-                | CudaStep::GemmNarrowGroupFp8(_)
-                | CudaStep::GemvGroupFp8(_) => {
-                    unreachable!("`not_launched` refuses every fp8 step before a launch")
+                CudaStep::GemvFp8(_) | CudaStep::GemvGroupFp8(_) => {
+                    unreachable!("`not_launched` refuses every fp8 GEMV before a launch")
+                }
+                CudaStep::QuantRowsFp8(QuantRowsFp8 { x, q, rows, cols }) => {
+                    let (q, scale) = Self::fp8_rows(slot, q, rows, cols);
+                    // SAFETY: as above, for `x` (`rows*cols` bf16) and the quant scratch, which
+                    // holds `rows*cols` bytes then `rows` f32 at `scale_at` (`validate`).
+                    unsafe {
+                        kernels::quant_rows_fp8(
+                            slot(x),
+                            (q.cast_mut(), scale.cast_mut()),
+                            (rows, cols),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::GemmFp8(GemmBf16 { a, b, c, m, n, k })
+                | CudaStep::GemmCol64Fp8(GemmBf16 { a, b, c, m, n, k }) => {
+                    let col64 = matches!(s, CudaStep::GemmCol64Fp8(_));
+                    let (a, b) = (
+                        Self::fp8_rows(slot, a, m, k),
+                        Self::fp8_weight(weights, b, n, k),
+                    );
+                    // SAFETY: as above, for the quantized rows and their scales, the fp8 weight
+                    // (`n*k` bytes then `n` f32, `step::fp8_weight`) and `c` (`m*n`).
+                    unsafe { kernels::gemm_fp8_abt(a, b, slot(c), (m, n, k), col64, stream.0) }
+                }
+                CudaStep::GemmNarrowFp8(GemmBf16 { a, b, c, m, n, k }) => {
+                    let (a, b) = (
+                        Self::fp8_rows(slot, a, m, k),
+                        Self::fp8_weight(weights, b, n, k),
+                    );
+                    // SAFETY: as the `GemmFp8` arm's.
+                    unsafe { kernels::gemm_narrow_fp8_abt(a, b, slot(c), (m, n, k), stream.0) }
+                }
+                CudaStep::GemmGroupFp8(g) | CudaStep::GemmNarrowGroupFp8(g) => {
+                    let members: Vec<(kernels::Fp8Operand, *mut c_void, u32)> =
+                        (g.members().iter())
+                            .flatten()
+                            .map(|m| (Self::fp8_weight(weights, m.b, m.n, g.k), slot(m.c), m.n))
+                            .collect();
+                    let a = Self::fp8_rows(slot, g.a, g.m, g.k);
+                    // SAFETY: as the `GemmFp8` arm's, for every member, whose outputs overlap
+                    // neither the input nor each other (`validate`).
+                    unsafe {
+                        if matches!(s, CudaStep::GemmGroupFp8(_)) {
+                            kernels::gemm_group_fp8_abt(a, &members, (g.m, g.k), stream.0)
+                        } else {
+                            kernels::gemm_narrow_group_fp8_abt(a, &members, (g.m, g.k), stream.0)
+                        }
+                    }
                 }
                 CudaStep::GemmCol64(GemmBf16 { a, b, c, m, n, k }) => {
                     let b = weights[b.0 as usize].ptr();
@@ -1731,10 +1761,21 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 act,
                                 stream.0,
                             ),
-                            GateUpKernel::GemmFp8
-                            | GateUpKernel::GemmCol64Fp8
-                            | GateUpKernel::GemvFp8 => {
-                                unreachable!("`not_launched` refuses every fp8 step")
+                            GateUpKernel::GemvFp8 => {
+                                unreachable!("`not_launched` refuses every fp8 GEMV")
+                            }
+                            GateUpKernel::GemmFp8 | GateUpKernel::GemmCol64Fp8 => {
+                                kernels::gate_up_gemm_fp8(
+                                    (
+                                        Self::fp8_rows(slot, a, m, k),
+                                        Self::fp8_weight(weights, g.gate.b, n, k),
+                                        Self::fp8_weight(weights, g.up.b, n, k),
+                                    ),
+                                    slot(g.out),
+                                    (m, n, k),
+                                    (act, g.kernel == GateUpKernel::GemmCol64Fp8),
+                                    stream.0,
+                                )
                             }
                             GateUpKernel::Gemm | GateUpKernel::GemmCol64 => {
                                 kernels::gate_up_gemm_bf16(
@@ -2585,6 +2626,39 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     }
 
     /// [`Self::slot`] of `arena`, for [`Self::enqueue`], which borrows the worker by its parts.
+    /// The quantized rows at `q` in the quant scratch, `[rows, cols]` e4m3, and their `[rows]` f32
+    /// scales after them (`QuantRowsFp8::scale_at`).
+    fn fp8_rows(
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        q: ArenaOffset,
+        rows: u32,
+        cols: u32,
+    ) -> kernels::Fp8Operand {
+        let at = QuantRowsFp8 {
+            x: q,
+            q,
+            rows,
+            cols,
+        }
+        .scale_at()
+        .expect("`validate` checked the quant scratch's extent");
+        (
+            slot(q).cast_const(),
+            slot(ArenaOffset(q.0 + at)).cast_const(),
+        )
+    }
+
+    /// Weight `b`'s fp8 buffer as an operand: its `[n, k]` e4m3 bytes, then its `[n]` f32 scales
+    /// (`step::fp8_weight`).
+    fn fp8_weight(weights: &[DeviceBuffer], b: WeightIx, n: u32, k: u32) -> kernels::Fp8Operand {
+        let w = weights[b.0 as usize].ptr();
+        let at = fp8_weight(n, k).expect("`validate` checked the weight's extent");
+        (
+            w.cast_const(),
+            w.wrapping_byte_add(at.scale as usize).cast_const(),
+        )
+    }
+
     fn slot_of(arena: &DeviceBuffer, offset: ArenaOffset) -> *mut c_void {
         let offset = usize::try_from(offset.0).expect("an arena offset fits the host's usize");
         arena.ptr().wrapping_byte_add(offset)
