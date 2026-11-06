@@ -35,6 +35,18 @@
 //! These tests pin that identity against the REAL `page_base_bytes`, so if either side's arithmetic
 //! is ever changed the correspondence fails here rather than on the card.
 
+/// The test pool: head count and width as the raw fixture numbers, minted through the pool's
+/// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
+fn pool(nkvh: usize, hd: usize) -> scratchy_subtile::sdsc_abstract::PagedKvPool {
+    scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+        std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
+            .expect("a fixture pool has heads"),
+        scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks(
+            u32::try_from(hd).expect("a fixture head width fits a u32"),
+        ),
+    )
+}
+
 use scratchy_target_spyre::fold_plan::{
     Bytes, PageSlots, RowCursors, RowIdx, RowPage, SessionKv, page_base_bytes,
 };
@@ -273,7 +285,7 @@ fn the_entry_factor_makes_the_two_addressings_the_same_byte() {
     // BOTH baked head widths: the factor carries `hd` (a stick block is `hd * 64`), so a test at one
     // width would pass on a hardcoded 4096 — which is exactly what every doc comment in the tree says.
     for (nkvh, hd) in [(8usize, 64usize), (8, 128)] {
-        let pool = PagedKvPool::new(nkvh, hd);
+        let pool = pool(nkvh, hd);
         let layer_page_bytes = pool.layer_stride() as u64 * 2;
         let page_stride = ITERS as u64 * layer_page_bytes;
 
@@ -337,7 +349,7 @@ fn the_entry_factor_makes_the_two_addressings_the_same_byte() {
 #[test]
 fn a_page_that_is_not_whole_entries_has_no_index_at_all() {
     use scratchy_subtile::sdsc_abstract::{PagedKvPool, gather_entries_per_page};
-    let pool = PagedKvPool::new(8, 64);
+    let pool = pool(8, 64);
     assert!(
         gather_entries_per_page(pool.stick_block_bytes() + 1, pool).is_none(),
         "a page one byte past a whole entry cannot be named by any integer index"
@@ -376,7 +388,7 @@ fn the_index_is_flat_over_the_scratch_rows_one_block_per_pass() {
     };
     // Two kv heads and one 64-slot window keeps the arithmetic readable; the request axis is what the
     // order is about, so it is the axis with two values.
-    let pool = PagedKvPool::new(2, 64);
+    let pool = pool(2, 64);
     let scratch = GatherScratch::of_fold_pass(
         pool,
         SlotWindow::count_in(SlotCount::new(64)),
@@ -494,7 +506,7 @@ fn the_row_of_a_coordinate_does_not_depend_on_how_many_windows_the_scratch_holds
         GatherScratch, PAGE_MASK_COLS, POOL_STICK, PagedKvPool, PrefixMaskShape, QueryRowCount,
         SlotCount, SlotWindow, gather_entries_per_page, gather_index_table,
     };
-    let pool = PagedKvPool::new(8, 64);
+    let pool = pool(8, 64);
     let mq = QueryRowCount::of_mq(2);
     // THE HOST's scratch — the rung's CEILING sweep, which is what `DecodeRung::swept` carries.
     let ceiling = GatherScratch::of_fold_pass(

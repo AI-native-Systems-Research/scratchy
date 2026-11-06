@@ -13304,10 +13304,7 @@ fn dump_wavefront_mega(
         // ERROR that names the model and its head_dim. A model with no attention (no head_dim
         // bound) keeps the sub-blocked ceiling — there is no head to type.
         let prefill_head_width = model.bounds.get("head_dim").map(|&hd| {
-            scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(
-                hd as u32,
-                &model.name,
-            )
+            scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(hd, &model.name)
         });
         // The rungs THIS model bakes, by the same law the emitter forms the causal block with.
         let rung_admitted = |r: u32| {

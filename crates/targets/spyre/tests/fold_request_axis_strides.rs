@@ -58,6 +58,18 @@
 
 use ktir_superdsc::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot, PagedKvPool};
 
+/// The test pool: head count and width as the raw fixture numbers, minted through the pool's
+/// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
+fn pool(nkvh: usize, hd: usize) -> scratchy_subtile::sdsc_abstract::PagedKvPool {
+    scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+        std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
+            .expect("a fixture pool has heads"),
+        scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks(
+            u32::try_from(hd).expect("a fixture head width fits a u32"),
+        ),
+    )
+}
+
 const HD: usize = 64;
 const NKVH: usize = 8;
 
@@ -77,15 +89,15 @@ const NKVH: usize = 8;
 /// loudly the day the two split.
 #[test]
 fn the_pinned_request_stride_is_exactly_the_kv_head_stride() {
-    let pool = PagedKvPool::new(NKVH, HD);
+    let pool = pool(NKVH, HD);
     let pinned = HD * PagedKvPool::POOL_PAGE_SLOTS.as_usize();
     assert_eq!(
         pool.plane_block_elems(),
-        HD * PagedKvPool::PLANE_SLOTS,
+        (HD * PagedKvPool::PLANE_SLOTS) as u64,
         "the pool's kv-head distance is PHYSICAL slots, whatever POOL_PAGE_SLOTS says"
     );
     assert_eq!(
-        pinned,
+        pinned as u64,
         pool.plane_block_elems(),
         "`hd * POOL_PAGE_SLOTS` — the constant three request-axis attempts baked as the deleted \
          `PagedKvPool::request_stride` — is the KV-HEAD stride. A `y` step of one advances one kv \
@@ -107,14 +119,14 @@ fn the_pinned_request_stride_is_exactly_the_kv_head_stride() {
 /// `r`'s keys. Every row gets real, well-formed keys belonging to the wrong head of the wrong request.
 #[test]
 fn stepping_the_batch_axis_by_the_pinned_constant_walks_the_kv_head_axis() {
-    let pool = PagedKvPool::new(NKVH, HD);
+    let pool = pool(NKVH, HD);
     let nkvh_nz = std::num::NonZeroU32::new(NKVH as u32).expect("nkvh > 0");
     let head0 = KvHead::new(0, nkvh_nz).expect("kv head 0");
     let head1 = KvHead::new(1, nkvh_nz).expect("kv head 1");
     let step = pool.addr(KvCoord::block(KvPlane::Kt, head1))
         - pool.addr(KvCoord::block(KvPlane::Kt, head0));
     assert_eq!(
-        step as usize,
+        step as u64,
         pool.plane_block_elems(),
         "one unit of the kv-head axis IS `plane_block_elems` — the axis the pinned constant \
          approximates. There is no other axis of that magnitude in the law."
@@ -130,7 +142,7 @@ fn stepping_the_batch_axis_by_the_pinned_constant_walks_the_kv_head_axis() {
 /// gave it, and the device never computes with that.
 #[test]
 fn the_only_axis_the_pinned_constant_matches_is_the_kv_head_one() {
-    let pool = PagedKvPool::new(NKVH, HD);
+    let pool = pool(NKVH, HD);
     let nkvh_nz = std::num::NonZeroU32::new(NKVH as u32).expect("nkvh > 0");
     let kvh0 = KvHead::new(0, nkvh_nz).expect("kv head 0");
     let base = pool.addr(KvCoord::block(KvPlane::Kt, kvh0));

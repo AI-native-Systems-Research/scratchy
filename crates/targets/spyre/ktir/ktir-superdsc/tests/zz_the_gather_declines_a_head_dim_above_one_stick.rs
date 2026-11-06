@@ -67,6 +67,18 @@
 //!   stick. A section base inside one table derived from the live window COUNT is the
 //!   emitter/host disagreement already recorded on [`GatherScratch::row_of`].
 
+/// The test pool: head count and width as the raw fixture numbers, minted through the pool's
+/// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
+fn pool(nkvh: usize, hd: usize) -> ktir_superdsc::sdsc_abstract::PagedKvPool {
+    ktir_superdsc::sdsc_abstract::PagedKvPool::new(
+        std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
+            .expect("a fixture pool has heads"),
+        ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(
+            u32::try_from(hd).expect("a fixture head width fits a u32"),
+        ),
+    )
+}
+
 use ktir_superdsc::sdsc_abstract::{
     CopyDims, GatherScratch, POOL_STICK, PageScratch, PagedKvPool, QueryRowCount, SlotCount,
     SlotWindow,
@@ -82,7 +94,7 @@ const NKVH: usize = 8;
 
 fn scratch_at(hd: usize, cap: u32, mq: u32) -> Option<GatherScratch> {
     GatherScratch::of_fold_pass(
-        PagedKvPool::new(NKVH, hd),
+        pool(NKVH, hd),
         SlotWindow::count_in(SlotCount::new(cap)),
         QueryRowCount::of_mq(mq),
     )
@@ -121,8 +133,7 @@ fn a_head_dim_above_one_stick_gets_no_gather_at_any_rung_or_width() {
             // refuses two slabs on CARD EVIDENCE (its own note carries the table and the `origin/main`
             // control). A widening must move THIS assertion, not the dead one.
             assert!(
-                PageScratch::of_pass(PagedKvPool::new(NKVH, HD_2B), QueryRowCount::of_mq(mq))
-                    .is_some(),
+                PageScratch::of_pass(pool(NKVH, HD_2B), QueryRowCount::of_mq(mq)).is_some(),
                 "hd={HD_2B} mq={mq}: the live page-granular door must admit one slab — every card \
                  measurement of a correct gather comes from this geometry"
             );
@@ -136,8 +147,7 @@ fn a_head_dim_above_one_stick_gets_no_gather_at_any_rung_or_width() {
             // `ScoreArm::choose` records as measured-twice incoherent inside dxp. Both are `nslab` loops
             // now, mirroring the ungathered arms.
             assert!(
-                PageScratch::of_pass(PagedKvPool::new(NKVH, HD_8B), QueryRowCount::of_mq(mq))
-                    .is_some(),
+                PageScratch::of_pass(pool(NKVH, HD_8B), QueryRowCount::of_mq(mq)).is_some(),
                 "hd={HD_8B} mq={mq}: the live page-granular door must admit TWO slabs — a refusal here \
                  is a bundle that silently emits the ungathered form, which is how an 8b build passed \
                  its gate while gathering nothing. The head-dim obstacles were all in the FOLD's legs"
@@ -178,8 +188,7 @@ fn a_head_dim_above_one_stick_gets_no_gather_at_any_rung_or_width() {
 fn the_bundle_level_door_is_the_per_pass_door_at_every_window_count() {
     for hd in [HD_2B, HD_8B, 96, 192, 256] {
         for mq in [1u32, 2, 4, 8, 16, 32] {
-            let admits =
-                GatherScratch::admits(PagedKvPool::new(NKVH, hd), QueryRowCount::of_mq(mq));
+            let admits = GatherScratch::admits(pool(NKVH, hd), QueryRowCount::of_mq(mq));
             // ⛔ EVERY `active_cap` A LADDER RUNG CAN BE, not just the ceiling: the bundle-level
             // question is asked once and must be the answer for every body the bundle holds.
             for cap in [64u32, 128, 256] {
@@ -196,13 +205,12 @@ fn the_bundle_level_door_is_the_per_pass_door_at_every_window_count() {
     }
     // And a degenerate width is refused by the same door, so the placement cannot reserve for one.
     assert!(
-        !GatherScratch::admits(PagedKvPool::new(NKVH, HD_2B), QueryRowCount::of_mq(0)),
+        !GatherScratch::admits(pool(NKVH, HD_2B), QueryRowCount::of_mq(0)),
         "a zero-row batch admits no gather"
     );
-    assert!(
-        !GatherScratch::admits(PagedKvPool::new(0, HD_2B), QueryRowCount::of_mq(8)),
-        "a pool with no kv heads admits no gather"
-    );
+    // A POOL WITH NO KV HEADS is no longer an `admits` refusal — it is unrepresentable: the
+    // pool's own head-count type is nonzero, so the old `PagedKvPool::new(0, ..)` cannot be
+    // written. The fixture helper below panics on zero for exactly that reason.
 }
 
 /// ⭐⭐⭐ THE CARRY-OVER PREDICTIONS HOLD, AND HOLDING IS NOT THE GATHER HOLDING.
@@ -254,16 +262,16 @@ fn the_row_width_is_the_pools_stick_block_at_both_head_dims() {
         (HD_2B, 4096u32, 64 * PagedKvPool::PLANE_SLOTS),
         (HD_8B, 8192u32, 128 * PagedKvPool::PLANE_SLOTS),
     ] {
-        let pool = PagedKvPool::new(NKVH, hd);
+        let pool = pool(NKVH, hd);
         assert_eq!(
             pool.stick_block_elems(),
-            row as usize,
+            u64::from(row),
             "hd={hd}: one 64-slot Kᵗ block is `hd * POOL_STICK` elements, and that is the unit one \
              index entry names"
         );
         assert_eq!(
             pool.plane_block_elems(),
-            plane,
+            plane as u64,
             "hd={hd}: the KV-HEAD stride is `hd * PLANE_SLOTS`, which is NOT the entry unit"
         );
     }
@@ -272,7 +280,7 @@ fn the_row_width_is_the_pools_stick_block_at_both_head_dims() {
     let s = scratch_at(HD_2B, 256, 8).expect("one stick admits a scratch");
     assert_eq!(
         s.cols(),
-        PagedKvPool::new(NKVH, HD_2B).stick_block_elems() as u32,
+        u32::try_from(pool(NKVH, HD_2B).stick_block_elems()).unwrap(),
         "the gathered row width and the pool's stick block are ONE number — `addr = idx * \
          skip_addr + base` is exact only while they are"
     );
