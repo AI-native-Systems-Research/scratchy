@@ -963,3 +963,344 @@ pub fn assemble_reduce_off_divided<D: KindTag, A: KindTag>(
         .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"))
 }
 
+/// ⭐⭐⭐⭐⭐ THE LONG-REDUCE SPLIT — the ONE law for a seeded row reduce too long for one
+/// on-core LX pass.
+///
+/// A seeded reduce `[rows, N] → [rows, 1]` whose per-core LX residency overruns the budget
+/// time-tiles: the tiler answers `time > 1` with the reduced axis unsplit across cores, and
+/// every trip of a time-tiled seeded reduce would write the SAME one-stick accum (the `RedStick`
+/// scale is stride-exempt in `rewrite_op_for_time_tile`) — the #50 `tiled_trips_alias` alias.
+/// The split is the remedy `reduce.rs` has always named, stated ONCE here for every seeded row
+/// reduce in the tree (the rmsnorm means, the per-head windowed mean, and the bare-reduce door):
+///
+/// * THE TILER DECIDES — the probe builds the SAME opspec the caller's own single-shot emission
+///   builds (same op, rows, cols, df, division; the operand names and offsets cannot move the
+///   tiler's answer) and reads `time` and the reduced axis's core split. `time == 1`, or a
+///   [`ReduceDivision::ReducedAxis`] reduce whose template rings the cores' partials itself,
+///   returns `Ok(None)` and the caller emits its single descriptor UNCHANGED — byte-identical
+///   for every reduce that fits, which is every shipped bundle.
+/// * THE SPLIT: `time` SINGLE-SHOT seeded reduces, each over one `[rows, N/time]` column slice
+///   of the data (a whole-stick run — the TimeTile invariant — at `col_of`'s whole-block shift of
+///   the op's own slab, the fp8 amax-partial precedent). Slice 0 seeds the CALLER's accum
+///   (attn's bmax→run_m law: no copy op for the only-ever-first slot); slices 1..time each land
+///   in their OWN `[rows, stick]` synth under the reduce's place
+///   ([`crate::place::SynthRole::ReducePartial`]), so no two reduces share an output byte — the
+///   alias is unrepresentable, not avoided. Each slice is single-shot BY CONSTRUCTION: its
+///   residency is exactly the per-trip residency the tiler validated when it chose `time`.
+/// * THE COMBINE, ONE PER REDUCE KIND, never per shape or model: `max` takes the maximum —
+///   exactly reassociable, the same bits in any order — and every sum-class kind (sum, mean,
+///   exx2) ADDS its partials: each slice's scaling const is the SAME 1/N, so the running add of
+///   the partials is the single-shot result (a split sum re-associates its adds at the reduce's
+///   own precision; the alternative is no lowering at all, and the card gate arbitrates the
+///   numerics). Running, in place on the caller's accum, through the SAME pointwise door every
+///   other combine in the tree takes.
+///
+/// The fp8 `quantscalepertokenfp8` partials in `emit/ktir_matmul_fp8.rs` are NOT this body: that
+/// is the FUSED unseeded op, whose combine folds SCALES not amaxes (a monotone-commutation
+/// proof of its own). Two op classes, two combine laws, one slice mechanics.
+pub struct ReduceSplit<'a, D: KindTag, A: KindTag> {
+    /// The op-name prefix the slice and combine ops take (`{op_name}_p{j}_op`, `{op_name}_c{j}_op`).
+    pub op_name: &'a str,
+    pub op: OpFunc,
+    pub rows: u32,
+    /// The reduced extent N — the window's LOGICAL width, not the parent's.
+    pub cols: u32,
+    pub df: Df,
+    /// The data's PARENT handle, declared at the parent's own full `[rows, parent_cols]`
+    /// extents — the stick-major nest `col_of` addresses the slices within.
+    pub data: &'a Stk<D>,
+    /// The reduce window's base column in the parent (0 for a whole buffer) — a whole stick,
+    /// a whole-block shift of the op's own `[rows, cols]` slab.
+    pub data_col: u32,
+    /// The result handle: `[rows, one stick]` at the reduce's own df.
+    pub accum: &'a Stk<A>,
+    pub accum_off: DevOff,
+    /// The place the partial synthetics mint under — the reduce's own place, whatever the
+    /// caller holds for it.
+    pub parent: crate::place::PlaceId,
+    /// The caller's OWN core division — the probe must ask the tiler the question the caller's
+    /// single-shot emission asks.
+    pub division: ReduceDivision,
+}
+
+/// ⭐ THE PROBE-AND-SPLIT BODY. `Ok(None)` = the reduce fits (or the cores split the reduced
+/// axis): the caller emits its own single descriptor unchanged. `Ok(Some(ops))` = the split —
+/// the caller extends with these INSTEAD of its single-shot reduce. A win-mint `Err` is a
+/// defect in this body's own window law and propagates; an opspec-build `Err` on the probe
+/// (an unmaskable pad, an fp32 exx2) is swallowed to `Ok(None)` so the caller's own single-shot
+/// path states its own named refusal for the same fact.
+pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
+    s: ReduceSplit<'_, D, A>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Option<Vec<EmittedOp>>, String> {
+    let rows_t = crate::sdsc_abstract::RowCount::of_token_rows(s.rows);
+    // The parent's full column extent, read off the handle — the nest every slice corner is
+    // addressed within, the one law the caller cannot restate differently.
+    let parent_cols = u32::try_from(s.data.layout().cols).unwrap_or(u32::MAX);
+    let probe_data = win_reduce_data(
+        layout,
+        s.data,
+        crate::addr::col_of(s.rows, parent_cols, s.data_col, s.df),
+        rows_t,
+        crate::sdsc_abstract::BlockCols::of_feature_cols(s.cols),
+        s.df,
+        &format!("{}: the long-reduce probe's data window", s.op_name),
+    )?;
+    let probe_accum = win_reduce_accum(
+        layout,
+        s.accum,
+        s.accum_off,
+        rows_t,
+        s.df,
+        &format!("{}: the long-reduce probe's accum window", s.op_name),
+    )?;
+    let probe = match reduce_opspec_off_divided(ReduceOffSpec {
+        op: s.op,
+        rows: s.rows,
+        cols: s.cols,
+        data: probe_data,
+        accum: probe_accum,
+        df: s.df,
+        division: s.division,
+    }) {
+        Ok(op) => op,
+        // The probe cannot state the op at all — the caller's own single-shot builder refuses
+        // the same fact by its own name; nothing here can split what cannot be stated.
+        Err(_) => return Ok(None),
+    };
+    let time = probe.time();
+    if time <= 1 || probe.iter.split_of("out") > 1 {
+        return Ok(None);
+    }
+    let stick = s.df.elems_per_stick();
+    // A whole stick per slice by the TimeTile invariant — the tiler splits the stick dim, so
+    // `cols / time` is a whole stick of the op's own format. Stated as a law, not trusted.
+    let slice_cols = s.cols / time;
+    if slice_cols == 0 || !slice_cols.is_multiple_of(stick) || slice_cols * time != s.cols {
+        return Err(format!(
+            "{}: the tiler split the reduce {time}-ways but the reduced width {} does not \
+             divide into {time} whole {}-element sticks — the TimeTile invariant is broken and \
+             no slice corner is addressable",
+            s.op_name, s.cols, stick
+        ));
+    }
+    // The partials: `time - 1` synthetics under the reduce's own place, one stick per row each,
+    // so no two slice reduces share an output byte. Slice 0 seeds the CALLER's accum.
+    use crate::place::SynthRole as R;
+    let partial_ids: Vec<crate::place::PlaceId> =
+        (1..time).map(|j| s.parent.synth(R::ReducePartial(j))).collect();
+    let partial_names: Vec<String> = partial_ids
+        .iter()
+        .map(|id| crate::placement::syn(layout, *id))
+        .collect();
+    if let Some(l) = layout {
+        for id in &partial_ids {
+            l.synth(*id, &[s.rows, stick]);
+        }
+    }
+    let partials: Vec<Stk<A>> = partial_names
+        .iter()
+        .map(|n| partial_accum_handle(n, s.rows, stick, s.df))
+        .collect::<Result<_, _>>()?;
+    let mut ops: Vec<EmittedOp> = Vec::new();
+    for j in 0..time {
+        let corner =
+            crate::addr::col_of(s.rows, parent_cols, s.data_col + j * slice_cols, s.df);
+        let op_name = format!("{}_p{j}_op", s.op_name);
+        let data_win = win_reduce_data(
+            layout,
+            s.data,
+            corner,
+            rows_t,
+            crate::sdsc_abstract::BlockCols::of_feature_cols(slice_cols),
+            s.df,
+            &format!("{op_name}: the slice's data window"),
+        )?;
+        let accum_win = if j == 0 {
+            win_reduce_accum(
+                layout,
+                s.accum,
+                s.accum_off,
+                rows_t,
+                s.df,
+                &format!("{op_name}: the slice's accum window (the caller's own)"),
+            )?
+        } else {
+            let p = &partials[(j - 1) as usize];
+            win_reduce_accum(
+                layout,
+                p,
+                DevOff::ZERO,
+                rows_t,
+                s.df,
+                &format!("{op_name}: the slice's accum window (its own partial)"),
+            )?
+        };
+        let spec = reduce_opspec_off(s.op, s.rows, slice_cols, data_win, accum_win, s.df)?;
+        let folds = SdscFoldSet::new(spec.iter.cores_used());
+        ops.push(
+            crate::emit::emit_sdsc_tiled(&op_name, &spec, &folds, sym_id_base, layout)
+                .map_err(|e| e.0)?,
+        );
+    }
+    // THE COMBINE, one per reduce kind: accum = accum ∘ partial_j, running, in place on the
+    // caller's accum, through the same pointwise door every other combine takes. The width is
+    // the accum handle's own declared stick — one law, read once.
+    let combine_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(
+        u32::try_from(s.accum.layout().cols).unwrap_or(stick),
+    );
+    let combine = combine_op_func_of(s.op);
+    for (i, p) in partials.iter().enumerate() {
+        let op_name = format!("{}_c{}_op", s.op_name, i + 1);
+        ops.push(crate::emit::assemble_pointwise_broadcast_off(
+            &op_name,
+            combine,
+            rows_t,
+            combine_cols,
+            &[
+                crate::emit::In::sliced(s.accum, s.accum_off).ew(),
+                crate::emit::In::full(p).ew(),
+            ],
+            s.accum,
+            s.accum_off,
+            sym_id_base,
+            layout,
+        ));
+    }
+    Ok(Some(ops))
+}
+
+/// The COMBINE op of a reduce kind — ONE table, stated per kind, never per shape: `max` is
+/// exactly reassociable so the partials take their maximum; every sum-class kind adds (each
+/// slice carries the same scaling const, so the running add is the single-shot result).
+fn combine_op_func_of(op: OpFunc) -> &'static str {
+    match op {
+        OpFunc::Max => "maximum",
+        _ => "add",
+    }
+}
+
+/// A long-reduce partial's handle — the accum's OWN kind and df, `[rows, one stick]`, minted
+/// from the partial's synthetic name. A `Kernel` accum is not a seeded reduce's and is refused
+/// by name rather than re-tagged.
+fn partial_accum_handle<A: KindTag>(
+    name: &str,
+    rows: u32,
+    stick: u32,
+    df: Df,
+) -> Result<Stk<A>, String> {
+    let layout = match A::kind() {
+        StickKind::RowBlocked => {
+            crate::sdsc_abstract::StickLayout::row_blocked_df(rows as usize, stick as usize, df)
+        }
+        StickKind::Flat => {
+            crate::sdsc_abstract::StickLayout::flat_df(rows as usize, stick as usize, df)
+        }
+        other => {
+            return Err(format!(
+                "{name}: a long-reduce partial is a row-blocked or flat one-stick-per-row \
+                 buffer, not a {other:?} tensor — the partial carries the accum's own kind"
+            ));
+        }
+    };
+    Stk::new(name, layout).map_err(|e| {
+        format!(
+            "{name}: a long-reduce partial handle at the accum's own kind: {:?}",
+            e
+        )
+    })
+}
+
+#[cfg(test)]
+mod long_reduce_split {
+    use super::*;
+
+    /// A handle for the tests: a row-blocked `[rows, cols]` data parent and a `[rows, stick]`
+    /// accum, over plain names (no layout — the mints' no-authority bound is the handle's own
+    /// declared shape, the same absence every unit test of this family runs under).
+    fn handles(
+        rows: u32,
+        cols: u32,
+    ) -> (
+        Stk<crate::sdsc_abstract::RowBlockedTag>,
+        Stk<crate::sdsc_abstract::RowBlockedTag>,
+    ) {
+        let data = Stk::new("w", crate::sdsc_abstract::StickLayout::row_blocked(rows as usize, cols as usize))
+            .expect("the data handle mints");
+        let stick = <Fp16 as DataFormat>::ELEMS_PER_STICK;
+        let accum = Stk::new(
+            "j",
+            crate::sdsc_abstract::StickLayout::row_blocked(rows as usize, stick as usize),
+        )
+        .expect("the accum handle mints");
+        (data, accum)
+    }
+
+    /// ⭐ THE SHAPE THAT USED TO REFUSE NOW SPLITS: the gemma-4 argmax max32 geometry (fp32,
+    /// one row, 524288 wide) billed past the usable LX, the tiler answered time=2, and the
+    /// emission refused "not in the partials form". The ONE split body lowers it: `time`
+    /// single-shot slice reduces — slice 0 into the caller's own accum, the rest into their
+    /// own partial synthetics — then `time - 1` running `maximum` combines into the accum.
+    #[test]
+    fn the_past_the_budget_max_splits_into_single_shot_slices_and_combines() {
+        let data = Stk::<crate::sdsc_abstract::FlatTag>::new(
+            "w",
+            crate::sdsc_abstract::StickLayout::flat_df(1, 524_288, Df::Fp32),
+        )
+        .expect("the fp32 flat data handle mints");
+        let accum = Stk::<crate::sdsc_abstract::FlatTag>::new(
+            "j",
+            crate::sdsc_abstract::StickLayout::flat_df(1, <Fp32 as DataFormat>::ELEMS_PER_STICK as usize, Df::Fp32),
+        )
+        .expect("the fp32 flat accum handle mints");
+        let split = assemble_reduce_split(
+            ReduceSplit {
+                op_name: "max32",
+                op: OpFunc::Max,
+                rows: 1,
+                cols: 524_288,
+                df: Df::Fp32,
+                data: &data,
+                data_col: 0,
+                accum: &accum,
+                accum_off: DevOff::ZERO,
+                parent: crate::place::PlaceId::Act(1),
+                division: ReduceDivision::Rows,
+            },
+            &mut 0i64,
+            None,
+        )
+        .expect("the split body runs")
+        .expect("the past-the-budget row genuinely splits");
+        // time=2: two slice reduces + one combine.
+        assert_eq!(split.len(), 2 + 1, "two slices and their combine");
+    }
+
+    /// ⭐ A REDUCE THAT FITS IS NOT SPLIT — the single-trip row returns `Ok(None)` and the
+    /// caller emits its own single descriptor, byte-identical. (The residency of one 4096-wide
+    /// fp16 row is 8 KiB against the 1,677,721-B budget.)
+    #[test]
+    fn a_fitting_reduce_is_left_to_the_callers_single_shot() {
+        let (data, accum) = handles(1, 4096);
+        let split = assemble_reduce_split(
+            ReduceSplit {
+                op_name: "sum16",
+                op: OpFunc::Sum,
+                rows: 1,
+                cols: 4096,
+                df: Df::Fp16,
+                data: &data,
+                data_col: 0,
+                accum: &accum,
+                accum_off: DevOff::ZERO,
+                parent: crate::place::PlaceId::Act(1),
+                division: ReduceDivision::Rows,
+            },
+            &mut 0i64,
+            None,
+        )
+        .expect("the split body runs");
+        assert!(split.is_none(), "a fitting reduce is the caller's own single shot");
+    }
+}
