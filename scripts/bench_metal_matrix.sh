@@ -309,13 +309,17 @@ WORKLOADS="sharegpt,rag,sharegpt-multi-turn"
 # still runs it.
 (( FULL )) && WORKLOADS="sharegpt,rag,sharegpt-multi-turn,shared-prefix,shared-prefix-control"
 WORKLOADS_SCRATCHY="rag-spans"
-# --full: one more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count,
-# where a task is 1 point of accuracy rather than a quick cell's 12.5. Its timing is not compared.
+# --full: one more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count.
+# Its timing is not compared. Drawn from all of MuSiQue's dev set, in its mix of 2-, 3- and 4-hop
+# questions (bench serve stratifies by hops), as every RAG cell's are, and 400 of them, so at about
+# 60% right the figure is within about 5 points (95%): 100 gave about 10, too wide to tell engines
+# apart. --accuracy-tasks N asks for N instead, 0 for none.
 ACCURACY_TASKS=0
-(( FULL )) && ACCURACY_TASKS=100
-# Its limit: 100 RAG tasks take about 25 minutes at 1 user on an 8B model, and minutes at the
-# largest users count, so --cell-timeout-s's 10 would cut it short. Still a limit, for a hung server.
-ACCURACY_TIMEOUT_S=2400
+(( FULL )) && ACCURACY_TASKS=400
+# Its limit, at about 18 s a task and at least 2400 s: on the M3 Pro at 4 users, 400 took from
+# 1512 s (nemotron-3-nano-30b-a3b on scratchy) to 3192 s (gpt-oss-20b on oMLX), so the flat 2400 s
+# that held 100 would cut the slowest short. Still a limit, for a hung server.
+ACCURACY_TIMEOUT_S=0
 # A task cell's sample: this many rounds of its users count, and at least TASK_MIN_PROMPTS (a
 # conversation of sharegpt-multi-turn is four of them).
 TASK_MIN_PROMPTS=8
@@ -396,6 +400,7 @@ while [[ $# -gt 0 ]]; do
         --settle-s)          SETTLE_S="$2"; shift 2 ;;
         --ready-timeout-s)   READY_TIMEOUT_S="$2"; shift 2 ;;
         --cell-timeout-s)    CELL_TIMEOUT_S="$2"; shift 2 ;;
+        --accuracy-tasks)    ACCURACY_TASKS="$2"; shift 2 ;;
         --cell-hang-tok-s)   CELL_HANG_TOK_S="$2"; shift 2 ;;
         --serve-args)        SERVE_ARGS="$2"; shift 2 ;;
         --seed)              SEED="$2"; shift 2 ;;
@@ -436,6 +441,8 @@ while [[ $# -gt 0 ]]; do
         *)                   echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
+[[ "${ACCURACY_TASKS}" =~ ^[0-9]+$ ]] || { echo "--accuracy-tasks takes a count, not ${ACCURACY_TASKS}" >&2; exit 2; }
+(( ACCURACY_TIMEOUT_S )) || ACCURACY_TIMEOUT_S=$(( ACCURACY_TASKS * 18 > 2400 ? ACCURACY_TASKS * 18 : 2400 ))
 # Every Mac runs the small set; its memory picks only the grid's prompts (below).
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 MODELS_DEFAULT="${MODELS_SMALL}"   # the large set runs by name (--models large)
@@ -796,6 +803,10 @@ json.dump({
                  "grid_dataset": e["GRID_DATASET"],
                  "grid_load": float(e["GRID_LOAD"]) if e["OPEN_LOOP"] == "1" else None,
                  "accuracy_tasks": int(e["ACCURACY_TASKS"]) or None,
+                 # How a RAG cell's tasks were drawn: from all of MuSiQue's dev set, stratified by
+                 # hops. Earlier runs drew from its first 200, all 2-hop, so their accuracy is of
+                 # easier questions and their tasks are not these.
+                 "task_sample": "musique-dev-by-hops",
                  "sharegpt": e["SHAREGPT_URL"],
                  "concurrency_is": "offered (--max-concurrency), not the effective decode batch"},
              "comparison": {row.split("|")[0]: row.split("|")[2] == "1"
@@ -1999,7 +2010,10 @@ def scaling(engine):
 # What a dataset cell keeps: the serving metrics, then what a task measures.
 TASK_KEEP = KEEP + ["dataset", "task_seed", "num_tasks", "request_rate", "timed_answers",
                     "start_times", "ttfts_ms", "e2els_ms", "mean_output_tokens", "mean_prompt_tokens", "mean_cached_tokens",
-                    "accuracy", "empty_answers", "thinking_answers", "capped_answers"]
+                    "accuracy", "empty_answers", "thinking_answers", "capped_answers",
+                    # Task by task, where the dataset names its tasks: so engines can be compared
+                    # on the same tasks, and accuracy read by MuSiQue's hops.
+                    "task_ids", "task_groups", "task_right", "accuracy_by_group"]
 TASK_CELL = re.compile(r"\.tasks-([a-z0-9-]+)@(\d+|base)\.json$")
 def tasks(engine):
     cells = []
