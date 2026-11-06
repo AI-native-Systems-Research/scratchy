@@ -13556,7 +13556,13 @@ fn dump_wavefront_mega(
                 && scratchy_target_spyre::bundle_code::collective::SPYRE_TP_WORLDS[1] == 2,
             "SPYRE_TP_WORLDS gained a world the spyre bake does not shard for"
         );
-        let tp2_sources: Option<Vec<scratchy_subtile::tensor_parallel::SourceShard>> = {
+        // ⭐ BAKED ONLY WHEN THE BUILD NAMES IT (`tp/2` → this crate's `tp-2`): a build that names
+        // no world bakes none, and ships an empty `SUPERDSC_TP`.
+        let tp2_sources: Option<Vec<scratchy_subtile::tensor_parallel::SourceShard>> = if !cfg!(
+            feature = "tp-2"
+        ) {
+            None
+        } else {
             let world = scratchy_target_spyre::tp_plan::SpyreWorld::of::<2>();
             let (tp_lwd, sf) = scratchy_subtile::tensor_parallel::shard_lowered(
                 &lowered,
