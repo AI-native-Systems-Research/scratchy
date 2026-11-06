@@ -103,7 +103,10 @@
       };
     }
     var chart = new charts[spec.kind](el, { data: spec.data, options: themed(spec.options, t) });
-    var scale = el.dataset.scale && document.getElementById(el.dataset.scale);
+    // Its own block's scale first: a page of several glances has one scale each, under one id.
+    var block = el.closest('[data-glance]');
+    var scale = el.dataset.scale &&
+      ((block && block.querySelector('[id^="' + el.dataset.scale + '"]')) || document.getElementById(el.dataset.scale));
     if (scale) highlightSteps(chart, spec, scale);
     if (spec.kind === 'combo') {
       var dashed = spec.dashed || [];

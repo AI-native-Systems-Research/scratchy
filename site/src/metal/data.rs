@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer};
 
-use super::numbers::{Engine, median};
+use super::numbers::{Engine, below_weights, median};
 
 #[derive(Deserialize)]
 pub struct Run {
@@ -94,14 +94,12 @@ impl Run {
     /// the run loads, so every chart and table drops the number at once ([`Cell::mem_below_weights`]).
     pub fn mark_mem_below_weights(&mut self) {
         for m in &mut self.models {
-            let weights = m.weights();
-            for e in Engine::ALL
-                .into_iter()
-                .filter(|e| e.serves_mlx_checkpoint())
-            {
-                for c in e.cells_mut(m) {
-                    c.mem_below_weights = (c.server_mem_peak_mib)
-                        .is_some_and(|mib| weights.is_some_and(|w| mib < w.mib()));
+            for e in Engine::ALL {
+                let below: Vec<bool> = (e.cells(m).iter())
+                    .map(|c| (c.server_mem_peak_mib).is_some_and(|mib| below_weights(m, e, mib)))
+                    .collect();
+                for (c, b) in e.cells_mut(m).iter_mut().zip(below) {
+                    c.mem_below_weights = b;
                 }
             }
         }
@@ -543,7 +541,6 @@ pub struct Rep {
     pub ttft_from_send_s: Option<f64>,
     /// Launch until the first token: ready, then the first request.
     pub ttft_exec_s: Option<f64>,
-    pub peak_rss_mib: Option<f64>,
 }
 
 /// One dataset workload at one users count, as `scr bench serve --dataset-name <workload>`
@@ -569,6 +566,12 @@ pub struct TaskCell {
     pub median_ttft_ms: Option<f64>,
     #[serde(default)]
     pub median_e2el_ms: Option<f64>,
+    /// The median request's time per output token, and the cell's output tokens a second: its
+    /// users curves. None in runs from before the run file kept them.
+    #[serde(default)]
+    pub median_tpot_ms: Option<f64>,
+    #[serde(default)]
+    pub output_throughput: Option<f64>,
     /// Answer tokens a task took, on average.
     #[serde(default)]
     pub mean_output_tokens: Option<f64>,
@@ -595,6 +598,25 @@ pub struct TaskCell {
     pub num_tasks: Option<u32>,
     #[serde(default)]
     pub timed_out: bool,
+    /// Each request's time to first token and end-to-end time, in the order they were sent; None
+    /// for a request that failed. None for a cell that
+    /// kept none: runs from before the run file kept them, and the sharegpt workload, which
+    /// `bench serve` times as completions.
+    #[serde(default)]
+    pub ttfts_ms: Option<Vec<Option<f64>>>,
+    #[serde(default)]
+    pub e2els_ms: Option<Vec<Option<f64>>>,
+    /// Each request's prompt tokens, as the server counted them, and its time per output token,
+    /// in the order sent: so a cell can be read by prompt length ([`super::buckets`]). None for a
+    /// request that failed, sent no count, or answered one token; None for a cell from before.
+    #[serde(default)]
+    pub prompt_tokens: Option<Vec<Option<u32>>>,
+    /// Accuracy by the group its dataset labels its tasks with (MuSiQue's hop count, as a key:
+    /// "2", "3", "4"), each over its tasks sent. None in runs from before it was recorded.
+    #[serde(default)]
+    pub accuracy_by_group: Option<BTreeMap<String, Option<f64>>>,
+    #[serde(default)]
+    pub tpots_ms: Option<Vec<Option<f64>>>,
     /// When the run this cell was borrowed from was made: a quick run's rival numbers, from the
     /// newest earlier run that measured the same workload at the same users count and task cap.
     /// None for a cell this run measured itself.
