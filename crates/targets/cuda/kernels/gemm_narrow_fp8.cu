@@ -25,6 +25,8 @@
 // Shared memory: `STAGES` × (two A tiles and one B tile, 4 KiB each), the two plain C tiles (8 KiB
 // each), three 256-byte scale vectors, plus 1,024 bytes of alignment slack, set once by
 // `scratchy_cuda_gemm_narrow_fp8_prepare` (in `PREPARE`). The semaphores are static shared memory.
+// `tma_swizzle_allocator` aligns every allocation to 1,024 bytes by default, and the slack covers
+// only the first: `b_scale`, after `a_scale`'s 512 bytes, is allocated at 128-byte alignment.
 
 #include "kittens.cuh"
 
@@ -186,7 +188,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gemm_narrow_fp8_ker(
     st_bf<TILE, TILE, false>(&c_smem)[CONSUMER_WARPGROUPS] =
         al.allocate<out_tile, CONSUMER_WARPGROUPS>();
     sv_fl<TILE>(&a_scale)[CONSUMER_WARPGROUPS] = al.allocate<scale_vec, CONSUMER_WARPGROUPS>();
-    sv_fl<TILE>& b_scale = al.allocate<scale_vec>();
+    // TMA's 128-byte alignment, not the allocator's default 1024, so it packs after `a_scale`.
+    sv_fl<TILE>& b_scale = al.allocate<128, scale_vec>();
     const narrow_smem sm{a_smem, b_smem, c_smem, a_scale, b_scale};
     narrow_cta(g, sm, blockIdx.x);
 }
@@ -210,7 +213,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gemm_narrow_group_fp8_ker(
     st_bf<TILE, TILE, false>(&c_smem)[CONSUMER_WARPGROUPS] =
         al.allocate<out_tile, CONSUMER_WARPGROUPS>();
     sv_fl<TILE>(&a_scale)[CONSUMER_WARPGROUPS] = al.allocate<scale_vec, CONSUMER_WARPGROUPS>();
-    sv_fl<TILE>& b_scale = al.allocate<scale_vec>();
+    // TMA's 128-byte alignment, not the allocator's default 1024, so it packs after `a_scale`.
+    sv_fl<TILE>& b_scale = al.allocate<128, scale_vec>();
     const narrow_smem sm{a_smem, b_smem, c_smem, a_scale, b_scale};
     const narrow_globals& m = blockIdx.y == 2 ? g.m2 : blockIdx.y == 1 ? g.m1 : g.m0;
     narrow_cta(m, sm, blockIdx.x);
