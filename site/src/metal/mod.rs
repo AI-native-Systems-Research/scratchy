@@ -249,16 +249,22 @@ fn borrow_earlier(runs: &mut [Run]) {
                     }
                     None if open_loop => {}
                     None => {
-                        let Some((cells, _, theirs, _)) = (task_cells.get(&key))
-                            .filter(|(_, c, _, d)| *c == cap && *d == drawn)
+                        let Some((cells, _, theirs, lent_drawn)) =
+                            task_cells.get(&key).filter(|(_, c, _, _)| *c == cap)
                         else {
                             continue;
                         };
-                        let same_tasks = |c: &data::TaskCell| match (sizing, *theirs) {
-                            (Some(a), Some(b)) => {
-                                a.count(&c.workload, c.conc) == b.count(&c.workload, c.conc)
-                            }
-                            _ => false,
+                        // A MuSiQue cell only from a run that drew its tasks the same way; every
+                        // other workload's tasks are as they were.
+                        let same_tasks = |c: &data::TaskCell| {
+                            (!sampled_from_musique(&c.workload) || *lent_drawn == drawn)
+                                && match (sizing, *theirs) {
+                                    (Some(a), Some(b)) => {
+                                        a.count(&c.workload, c.conc)
+                                            == b.count(&c.workload, c.conc)
+                                    }
+                                    _ => false,
+                                }
                         };
                         let kept: Vec<data::TaskCell> =
                             cells.iter().filter(|c| same_tasks(c)).cloned().collect();
@@ -293,6 +299,12 @@ fn run_task_cap(config: &data::Config) -> Option<u32> {
 /// it was recorded, which drew from MuSiQue's first 200.
 fn task_sample(config: &data::Config) -> Option<String> {
     config.scaling.as_ref().and_then(|s| s.task_sample.clone())
+}
+
+/// Whether a workload's tasks are MuSiQue's, the only ones [`task_sample`] says how were drawn:
+/// a change of sampling is a change of their questions, and of no other workload's.
+fn sampled_from_musique(workload: &str) -> bool {
+    matches!(workload, "rag" | "rag-spans" | "rag-accuracy")
 }
 
 /// A dataset map's axes before there is anything to show: a place of the right shape.
@@ -2675,13 +2687,14 @@ fn task_timelines(entries: &[Entry]) -> Vec<(&'static str, Element)> {
             .find(|c| c.workload == w && c.conc == 1 && c.measured() && c.borrowed_from.is_none())
             .and_then(|c| c.median_ttft_ms)
     };
-    // Since its tasks were last drawn differently: a change of questions is no regression.
+    // A MuSiQue line since its tasks were last drawn differently: a change of questions is no
+    // regression. Every other workload's tasks are as they were, so its line runs on.
     let newest = entries.last().map(|e| task_sample(&e.run.config));
     let mut charts = Vec::new();
     for (w, value) in TASK_TIMELINES {
         let kept: Vec<&Entry> = (entries.iter())
             .filter(|e| own(e, Engine::Scratchy, w).is_some())
-            .filter(|e| Some(task_sample(&e.run.config)) == newest)
+            .filter(|e| !sampled_from_musique(w) || Some(task_sample(&e.run.config)) == newest)
             .collect();
         if kept.len() < 2 {
             continue;
@@ -4451,9 +4464,9 @@ mod tests {
     /// A quick run after a full run borrows the full run's engines: the quick run's 64-token
     /// answers are the full run's users × prompt map, and the full run's 512- and 2048-token
     /// answers ran at 1 user only, so they are not cells the quick run compares.
-    /// A rival's dataset cells are borrowed only from a run that drew its tasks the same way: a
-    /// run that samples all of MuSiQue's hops does not take an older run's 2-hop cells as its
-    /// rival's.
+    /// A rival's MuSiQue cells are borrowed only from a run that drew its tasks the same way: a
+    /// run that samples all of MuSiQue's hops does not take an older run's 2-hop RAG cells as its
+    /// rival's. Its other workloads' tasks did not change, so their cells are still borrowed.
     #[test]
     fn a_rival_is_not_borrowed_across_a_change_in_sampling() {
         use super::data::Run;
@@ -4468,18 +4481,33 @@ mod tests {
         let ours = full["models"][0]["tasks"].clone();
         full["models"][0]["tasks_omlx_tq"] = ours;
         let load = |v: &serde_json::Value| -> Run { serde_json::from_value(v.clone()).unwrap() };
-        for (sample, borrowed) in [(None, true), (Some("musique-dev-by-hops"), false)] {
+        let lent = |sample: Option<&str>| -> std::collections::BTreeSet<String> {
             let mut quick: serde_json::Value = serde_json::from_str(&text).unwrap();
             quick["config"]["scaling"]["task_sample"] = serde_json::json!(sample);
             let mut runs = vec![load(&quick), load(&full)];
             super::borrow_earlier(&mut runs);
-            let lent = !Engine::OmlxTq.tasks(&runs[0].models[0]).is_empty();
-            assert_eq!(lent, borrowed, "sampled {sample:?}");
-        }
+            (Engine::OmlxTq.tasks(&runs[0].models[0]).iter())
+                .map(|c| c.workload.clone())
+                .collect()
+        };
+        let same = lent(None);
+        assert!(
+            same.contains("rag") && same.contains("sharegpt"),
+            "{same:?}"
+        );
+        let changed = lent(Some("musique-dev-by-hops"));
+        assert!(
+            !changed.iter().any(|w| super::sampled_from_musique(w)),
+            "no 2-hop RAG cell as the rival's: {changed:?}"
+        );
+        assert!(
+            changed.contains("sharegpt") && changed.contains("sharegpt-multi-turn"),
+            "ShareGPT's tasks did not change: {changed:?}"
+        );
     }
 
-    /// A dataset's timeline does not join runs that drew their tasks differently: a change of
-    /// questions is not a regression.
+    /// A MuSiQue timeline does not join runs that drew its tasks differently: a change of questions
+    /// is not a regression. The ShareGPT line's tasks did not change, so it joins them.
     #[test]
     fn a_timeline_starts_again_where_the_sampling_changed() {
         use super::data::Run;
@@ -4501,8 +4529,22 @@ mod tests {
                 .collect();
             super::task_timelines(&entries).into_iter().map(|(t, _)| t).collect()
         };
-        assert!(!titles(&two(None)).is_empty(), "one sampling, one line");
-        assert!(titles(&two(Some("musique-dev-by-hops"))).is_empty(), "one run since");
+        let rag = "RAG TTFT ms, 1 user";
+        let sharegpt = "ShareGPT TTFT ms, 1 user";
+        let same = titles(&two(None));
+        assert!(
+            same.contains(&rag) && same.contains(&sharegpt),
+            "one sampling: {same:?}"
+        );
+        let changed = titles(&two(Some("musique-dev-by-hops")));
+        assert!(
+            !changed.contains(&rag),
+            "the RAG line starts again: {changed:?}"
+        );
+        assert!(
+            changed.contains(&sharegpt),
+            "the ShareGPT line runs on: {changed:?}"
+        );
     }
 
     #[test]

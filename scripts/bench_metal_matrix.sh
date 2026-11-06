@@ -309,15 +309,17 @@ WORKLOADS="sharegpt,rag,sharegpt-multi-turn"
 # still runs it.
 (( FULL )) && WORKLOADS="sharegpt,rag,sharegpt-multi-turn,shared-prefix,shared-prefix-control"
 WORKLOADS_SCRATCHY="rag-spans"
-# --full: one more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count,
-# drawn from all of MuSiQue's dev set in its mix of 2-, 3- and 4-hop questions (bench serve
-# stratifies by hops), as every RAG cell's are,
-# where a task is 1 point of accuracy rather than a quick cell's 12.5. Its timing is not compared.
+# --full: one more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count.
+# Its timing is not compared. Drawn from all of MuSiQue's dev set, in its mix of 2-, 3- and 4-hop
+# questions (bench serve stratifies by hops), as every RAG cell's are, and 400 of them, so at about
+# 60% right the figure is within about 5 points (95%): 100 gave about 10, too wide to tell engines
+# apart. --accuracy-tasks N asks for N instead, 0 for none.
 ACCURACY_TASKS=0
-(( FULL )) && ACCURACY_TASKS=100
-# Its limit: 100 RAG tasks take about 25 minutes at 1 user on an 8B model, and minutes at the
-# largest users count, so --cell-timeout-s's 10 would cut it short. Still a limit, for a hung server.
-ACCURACY_TIMEOUT_S=2400
+(( FULL )) && ACCURACY_TASKS=400
+# Its limit, at about 18 s a task and at least 2400 s: on the M3 Pro at 4 users, 400 took from
+# 1512 s (nemotron-3-nano-30b-a3b on scratchy) to 3192 s (gpt-oss-20b on oMLX), so the flat 2400 s
+# that held 100 would cut the slowest short. Still a limit, for a hung server.
+ACCURACY_TIMEOUT_S=0
 # A task cell's sample: this many rounds of its users count, and at least TASK_MIN_PROMPTS (a
 # conversation of sharegpt-multi-turn is four of them).
 TASK_MIN_PROMPTS=8
@@ -398,6 +400,7 @@ while [[ $# -gt 0 ]]; do
         --settle-s)          SETTLE_S="$2"; shift 2 ;;
         --ready-timeout-s)   READY_TIMEOUT_S="$2"; shift 2 ;;
         --cell-timeout-s)    CELL_TIMEOUT_S="$2"; shift 2 ;;
+        --accuracy-tasks)    ACCURACY_TASKS="$2"; shift 2 ;;
         --cell-hang-tok-s)   CELL_HANG_TOK_S="$2"; shift 2 ;;
         --serve-args)        SERVE_ARGS="$2"; shift 2 ;;
         --seed)              SEED="$2"; shift 2 ;;
@@ -438,6 +441,8 @@ while [[ $# -gt 0 ]]; do
         *)                   echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
+[[ "${ACCURACY_TASKS}" =~ ^[0-9]+$ ]] || { echo "--accuracy-tasks takes a count, not ${ACCURACY_TASKS}" >&2; exit 2; }
+(( ACCURACY_TIMEOUT_S )) || ACCURACY_TIMEOUT_S=$(( ACCURACY_TASKS * 18 > 2400 ? ACCURACY_TASKS * 18 : 2400 ))
 # Every Mac runs the small set; its memory picks only the grid's prompts (below).
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 MODELS_DEFAULT="${MODELS_SMALL}"   # the large set runs by name (--models large)
