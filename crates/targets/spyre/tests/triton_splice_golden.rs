@@ -743,7 +743,11 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
         EwKind::Gelu => a
             .iter()
             .map(|&x| {
-                let u = 0.797_884_560_802_865_4 * (x + 0.044_715 * x * x * x);
+                // √(2/π) = (2/√π)·(1/√2), the std constants' own derivation, cast once to the
+                // reference's float type — not a 16-digit literal clippy must audit against
+                // f32's precision.
+                let k = (std::f64::consts::FRAC_2_SQRT_PI * std::f64::consts::FRAC_1_SQRT_2) as f32;
+                let u = k * (x + 0.044_715 * x * x * x);
                 0.5 * x * (1.0 + u.tanh())
             })
             .collect(),
