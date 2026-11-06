@@ -125,7 +125,23 @@ impl CommandPool {
         let symbols = (parts.symbols.iter())
             .map(|(library, function)| quote! { (#library, #function) })
             .collect();
-        let commands = each(&parts.commands)?;
+        // Each command as a call of `command` below: six part indices and its kernel's name, where
+        // its literal spells every newtype of seven fields.
+        let commands = (parts.commands.iter())
+            .map(|p| {
+                let kernel = quote::format_ident!("{}", format!("{:?}", p.kernel));
+                let [symbol, constants, dispatch, bindings, gemm, gate] = [
+                    p.symbol,
+                    p.constants,
+                    p.dispatch,
+                    p.bindings,
+                    p.gemm,
+                    p.gate,
+                ]
+                .map(|i| proc_macro2::Literal::u16_unsuffixed(i.0));
+                quote!(command(K::#kernel, #symbol, #constants, #dispatch, #bindings, #gemm, #gate))
+            })
+            .collect();
         let bindings = (parts.bindings.iter())
             .map(|list| gemms.binding_list(list))
             .collect::<Result<Vec<_>, BakeDefect>>()?;
@@ -182,6 +198,28 @@ impl CommandPool {
                         entry: __ti::PartIx(entry),
                         layer: __tl::PackedLayer(layer),
                     })
+                }
+                use __tl::KernelId as K;
+                /// The table's command of kernel `kernel` and these part indices: a command is
+                /// written as this call, not a literal of its seven fields' newtypes.
+                const fn command(
+                    kernel: K,
+                    symbol: u16,
+                    constants: u16,
+                    dispatch: u16,
+                    bindings: u16,
+                    gemm: u16,
+                    gate: u16,
+                ) -> __tl::PackedCommand {
+                    __tl::PackedCommand {
+                        kernel,
+                        symbol: __ti::PartIx(symbol),
+                        constants: __ti::PartIx(constants),
+                        dispatch: __ti::PartIx(dispatch),
+                        bindings: __ti::PartIx(bindings),
+                        gemm: __ti::PartIx(gemm),
+                        gate: __ti::PartIx(gate),
+                    }
                 }
                 #(#statics)*
                 pub(super) static TABLE: __tl::CommandTable = __tl::CommandTable {
