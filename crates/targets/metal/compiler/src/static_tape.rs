@@ -21,7 +21,7 @@ use scratchy_target_metal::tape::ids::{
 };
 use scratchy_target_metal::tape::lowered::{
     CommandTableBuilder, CommandTableParts, GatedCommand, GenClass, KernelId, KvAddressing,
-    LoweredMetalTape, LoweringError, MetalDtype, TapeCommands,
+    LoweredMetalTape, LoweringError, MetalDtype, PackedKind, TapeCommands,
 };
 
 /// ⭐ EVERY DISTINCT COMMAND OF ONE MODEL'S BAKED TAPES, SPELLED ONCE.
@@ -125,21 +125,31 @@ impl CommandPool {
         let symbols = (parts.symbols.iter())
             .map(|(library, function)| quote! { (#library, #function) })
             .collect();
-        // Each command as a call of `command` below: six part indices and its kernel's name, where
-        // its literal spells every newtype of seven fields.
+        // Each command as a call of `gemm` or `command` below: its part indices and a dispatch's
+        // kernel's name, where its literal spells every newtype of its fields.
+        let ix =
+            |i: scratchy_target_metal::tape::ids::PartIx| proc_macro2::Literal::u16_unsuffixed(i.0);
         let commands = (parts.commands.iter())
             .map(|p| {
-                let kernel = quote::format_ident!("{}", format!("{:?}", p.kernel));
-                let [symbol, constants, dispatch, bindings, gemm, gate] = [
-                    p.symbol,
-                    p.constants,
-                    p.dispatch,
-                    p.bindings,
-                    p.gemm,
-                    p.gate,
-                ]
-                .map(|i| proc_macro2::Literal::u16_unsuffixed(i.0));
-                quote!(command(K::#kernel, #symbol, #constants, #dispatch, #bindings, #gemm, #gate))
+                let gate = ix(p.gate);
+                match p.kind {
+                    PackedKind::Gemm(g) => {
+                        let g = ix(g);
+                        quote!(gemm(#g, #gate))
+                    }
+                    PackedKind::Dispatch {
+                        kernel,
+                        symbol,
+                        constants,
+                        dispatch,
+                        bindings,
+                    } => {
+                        let kernel = quote::format_ident!("{}", format!("{kernel:?}"));
+                        let [symbol, constants, dispatch, bindings] =
+                            [symbol, constants, dispatch, bindings].map(ix);
+                        quote!(command(K::#kernel, #symbol, #constants, #dispatch, #bindings, #gate))
+                    }
+                }
             })
             .collect();
         let bindings = (parts.bindings.iter())
@@ -153,12 +163,9 @@ impl CommandPool {
             })
             .collect::<Result<Vec<_>, BakeDefect>>()?;
         let gemm_ats = (parts.gemms.iter())
-            .map(|g| match g {
-                Some(at) => {
-                    let (entry, layer) = (at.entry.0, at.layer.0);
-                    quote!(gemm_at(#entry, #layer))
-                }
-                None => quote!(None),
+            .map(|at| {
+                let (entry, layer, operands) = (at.entry.0, at.layer.0, at.operands.0);
+                quote!(gemm_at(#entry, #layer, #operands))
             })
             .collect();
         let markers = gemms.markers();
@@ -176,8 +183,13 @@ impl CommandPool {
                 quote!(__tl::DispatchShape),
             ),
             array("BINDINGS", bindings, quote!(&[__tl::Binding])),
-            array("GEMMS", gemm_ats, quote!(Option<__tl::GemmAt>)),
+            array("GEMMS", gemm_ats, quote!(__tl::GemmAt)),
             array("GEMM_ENTRIES", gemm_entries, quote!(__tl::GemmEntry)),
+            array(
+                "GEMM_OPERANDS",
+                each(&parts.gemm_operands)?,
+                quote!(__tl::GemmOperands),
+            ),
             array(
                 "GATES",
                 each(&parts.gates)?,
@@ -191,33 +203,42 @@ impl CommandPool {
             mod __tape_cmds {
                 #aliases
                 #markers
-                /// The table's GEMM of entry `entry` at layer `layer`: a GEMM of every layer is
-                /// one, so each is written as this call, not a literal of its two newtypes.
-                const fn gemm_at(entry: u16, layer: u16) -> Option<__tl::GemmAt> {
-                    Some(__tl::GemmAt {
+                /// The table's GEMM of entry `entry` at layer `layer` over operands `operands`: a
+                /// GEMM of every layer is one, so each is written as this call, not a literal of
+                /// its three newtypes.
+                const fn gemm_at(entry: u16, layer: u16, operands: u16) -> __tl::GemmAt {
+                    __tl::GemmAt {
                         entry: __ti::PartIx(entry),
                         layer: __tl::PackedLayer(layer),
-                    })
+                        operands: __ti::PartIx(operands),
+                    }
+                }
+                /// The table's GEMM `gemm` of [`GEMMS`] under gate `gate`.
+                const fn gemm(gemm: u16, gate: u16) -> __tl::PackedCommand {
+                    __tl::PackedCommand {
+                        kind: __tl::PackedKind::Gemm(__ti::PartIx(gemm)),
+                        gate: __ti::PartIx(gate),
+                    }
                 }
                 use __tl::KernelId as K;
-                /// The table's command of kernel `kernel` and these part indices: a command is
-                /// written as this call, not a literal of its seven fields' newtypes.
+                /// The table's dispatch of kernel `kernel` and these part indices: a command is
+                /// written as this call, not a literal of its six fields' newtypes.
                 const fn command(
                     kernel: K,
                     symbol: u16,
                     constants: u16,
                     dispatch: u16,
                     bindings: u16,
-                    gemm: u16,
                     gate: u16,
                 ) -> __tl::PackedCommand {
                     __tl::PackedCommand {
-                        kernel,
-                        symbol: __ti::PartIx(symbol),
-                        constants: __ti::PartIx(constants),
-                        dispatch: __ti::PartIx(dispatch),
-                        bindings: __ti::PartIx(bindings),
-                        gemm: __ti::PartIx(gemm),
+                        kind: __tl::PackedKind::Dispatch {
+                            kernel,
+                            symbol: __ti::PartIx(symbol),
+                            constants: __ti::PartIx(constants),
+                            dispatch: __ti::PartIx(dispatch),
+                            bindings: __ti::PartIx(bindings),
+                        },
                         gate: __ti::PartIx(gate),
                     }
                 }
@@ -230,6 +251,7 @@ impl CommandPool {
                     bindings: &BINDINGS,
                     gemms: &GEMMS,
                     gemm_entries: &GEMM_ENTRIES,
+                    gemm_operands: &GEMM_OPERANDS,
                     gates: &GATES,
                 };
                 pub(super) static KERNELS: [__tl::BakedKernel; #kernels_len] = [ #(#kernels),* ];
@@ -733,8 +755,8 @@ pub fn bake_bucket_tapes(
             }
         };
         let ident = quote::format_ident!("__TAPE_BODY_{uniq}_{body_ix}");
-        let serves_tq =
-            (tape.commands.iter()).any(|c| c.command.kernel == KernelId::AttentionViaCacheTq);
+        let serves_tq = (tape.commands.iter())
+            .any(|c| c.command.kernel() == Some(KernelId::AttentionViaCacheTq));
         let heads: Vec<Option<TqDecodeHeads>> = match serves_tq {
             true => candidates.iter().copied().map(Some).collect(),
             false => vec![None],

@@ -23,8 +23,8 @@ use crate::specialized_pipeline_cache::{
 use crate::stream::MetalStreamError;
 use crate::tape::constants::{TapeVariant, UnboundConstant};
 use crate::tape::lowered::{
-    BakedDictionary, BakedKernel, BakedMetallib, Gemm, KernelId, LoweredCommand, LoweredMetalTape,
-    MetalDtype, baked,
+    BakedDictionary, BakedKernel, BakedMetallib, Gemm, LoweredMetalTape, MetalDtype, TapeCommand,
+    baked,
 };
 
 /// A library whose kernels compile only in the bake ([`bake`]).
@@ -139,17 +139,17 @@ pub fn baked_library(library: &str) -> Option<&'static BakedLibrary> {
 /// every body ([`GemmBody::ALL`]): the device picks one at load
 /// ([`gemm_body`](crate::interpreter::metal::pipelines::gemm_body)).
 pub fn bake_keys(
-    cmd: &LoweredCommand,
+    cmd: &TapeCommand,
     dtype: MetalDtype,
     variant: TapeVariant,
 ) -> Result<Vec<PipelineKey>, UnboundConstant> {
-    let mut keys = match (cmd.kernel, cmd.gemm) {
-        (KernelId::Gemm, Some(Gemm { dims, .. })) => GemmBody::ALL
+    let mut keys = match cmd {
+        TapeCommand::Gemm(Gemm { dims, .. }) => GemmBody::ALL
             .into_iter()
-            .filter_map(|body| gemm_pipeline(dtype, dims, body).ok())
+            .filter_map(|body| gemm_pipeline(dtype, *dims, body).ok())
             .map(|(key, _)| key)
             .collect(),
-        _ => {
+        TapeCommand::Dispatch(cmd) => {
             let constants = cmd.constants.iter().map(|c| c.resolve(variant));
             let constants = constants.collect::<Result<Vec<_>, _>>()?;
             vec![PipelineKey::new(cmd.library, cmd.function, constants)]

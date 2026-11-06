@@ -37,7 +37,7 @@ pub struct Mtl4Step {
     /// Kernel id of this step's dispatches (one kernel per Dispatch step;
     /// coalescing requires same pipeline = same kernel). Used for
     /// the per-dispatch timing print label.
-    pub kernel: super::lowered::KernelId,
+    pub kernel: super::lowered::StepKernel,
     pub pipeline: ComputePipelineState,
     pub tables: Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>,
     pub dispatches: Vec<(MTLSize, MTLSize)>,
@@ -106,7 +106,7 @@ pub struct KernelTimeHeap {
     /// dispatches (pushing entries) on one thread while another command
     /// buffer's wait prints this heap — a `RefCell` there is a data race
     /// that panics ("already borrowed", measured mid-run).
-    entries: std::sync::Mutex<Vec<(super::lowered::KernelId, String, bool)>>,
+    entries: std::sync::Mutex<Vec<(super::lowered::StepKernel, String, bool)>>,
     /// Registration label ("heap 0", "heap 1", ...), so a print names which
     /// worker's — and so which model's — tape it is.
     label: String,
@@ -161,7 +161,7 @@ impl KernelTimeHeap {
     pub fn write_timestamp(
         &self,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
-        kernel: super::lowered::KernelId,
+        kernel: super::lowered::StepKernel,
         grid: MTLSize,
         threads: MTLSize,
         fence: super::lowered::Fence,
@@ -245,7 +245,7 @@ impl KernelTimeHeap {
         let mut agg: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
         // Slowest single dispatches, for the grid-shape question: (ticks,
         // kernel, grid string), printed top-first.
-        let mut slowest: Vec<(u64, super::lowered::KernelId, String)> = Vec::new();
+        let mut slowest: Vec<(u64, super::lowered::StepKernel, String)> = Vec::new();
         // Per (kernel, grid@threadgroup) aggregates, for the occupancy question: (count, ticks).
         let mut shapes: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
         // The window's dispatches in order, `|` where a barrier precedes one

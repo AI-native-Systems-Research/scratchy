@@ -19,7 +19,7 @@ fn a_block_draft_and_its_commit_play_apart() {
             let (commands, live) = (tape.commands_expanded(), tape.live_expanded());
             let plays = |kernel: K, reads: ForwardReads| -> Vec<bool> {
                 (commands.iter().zip(&live))
-                    .filter(|(c, _)| c.command.kernel == kernel)
+                    .filter(|(c, _)| c.command.kernel() == Some(kernel))
                     .map(|(_, l)| l.plays(reads))
                     .collect()
             };
@@ -57,10 +57,11 @@ fn a_block_draft_and_its_commit_play_apart() {
                 [true],
                 "m={at}"
             );
-            let load = (commands.iter()).position(|c| c.command.kernel == K::DraftWindowLoad);
+            let load =
+                (commands.iter()).position(|c| c.command.kernel() == Some(K::DraftWindowLoad));
             let before = (commands.iter().zip(&live)).take(load.expect("a window load"));
             for (c, l) in before {
-                let kernel = c.command.kernel;
+                let kernel = c.command.step_kernel();
                 assert!(
                     !l.plays(ForwardReads::Rebuild),
                     "m={at}: {kernel:?} before the load"

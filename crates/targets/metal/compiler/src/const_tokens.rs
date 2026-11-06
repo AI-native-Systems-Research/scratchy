@@ -49,11 +49,12 @@ pub(crate) fn alias_preamble() -> TokenStream {
 fn module_of(ty: &str) -> Result<TokenStream, Error> {
     let m = match ty {
         "KernelId" | "Binding" | "DispatchShape" | "MScaling" | "MScaleAxis" | "RuntimeGate"
-        | "LoweredCommand" | "GatedCommand" | "PackedCommand" | "CommandTable" | "GemmDims"
-        | "Gemm" | "GemmWeight" | "GemmEntry" | "GemmAt" | "PackedLayer" | "WeightTensor"
-        | "RuntimeBindingKind" | "ActivationWidth" | "LoweredMetalTape" | "ClassedTape"
-        | "GenClass" | "KvAddressing" | "TapeLoop" | "TapeCommands" | "Fence" | "SetAxis"
-        | "LogitsRows" | "RowTile" | "DecodePartials" | "SplitSteps" | "PlayLive" => {
+        | "LoweredCommand" | "TapeCommand" | "GatedCommand" | "PackedCommand" | "PackedKind"
+        | "CommandTable" | "GemmDims" | "Gemm" | "GemmWeight" | "GemmEntry" | "GemmAt"
+        | "GemmOperands" | "Activation" | "PackedLayer" | "WeightTensor" | "RuntimeBindingKind"
+        | "ActivationWidth" | "LoweredMetalTape" | "ClassedTape" | "GenClass" | "KvAddressing"
+        | "TapeLoop" | "TapeCommands" | "Fence" | "SetAxis" | "LogitsRows" | "RowTile"
+        | "DecodePartials" | "SplitSteps" | "PlayLive" => {
             quote!(__tl)
         }
         "ConstantValue" | "ConstantType" | "ConstSlot" => {
@@ -360,14 +361,15 @@ mod tests {
     use scratchy_target_metal::tape::constants::{ConstantType, ConstantValue};
     use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
     use scratchy_target_metal::tape::lowered::{
-        Binding, DispatchShape, GatedCommand, KernelId, LoweredCommand, RuntimeGate, WeightTensor,
+        Binding, DispatchShape, GatedCommand, KernelId, LoweredCommand, RuntimeGate, TapeCommand,
+        WeightTensor,
     };
 
     /// A command exercising every emission form: unit variant, struct
     /// variant, newtype, tuple, slice, option, str, mixed int widths.
     fn sample() -> GatedCommand {
         GatedCommand {
-            command: LoweredCommand {
+            command: TapeCommand::Dispatch(LoweredCommand {
                 kernel: KernelId::Embed,
                 library: "default_lib",
                 function: "metal_embed_f16",
@@ -393,8 +395,7 @@ mod tests {
                         binding_index: 1,
                     },
                 ]),
-                gemm: None,
-            },
+            }),
             gate: Some(RuntimeGate::OnlyIfDecodeStep),
         }
     }

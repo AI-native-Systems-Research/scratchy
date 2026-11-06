@@ -174,24 +174,14 @@ impl SpecializedPipelines {
     /// directly. The lowering pass already baked `library` /
     /// `function` / `constants` from `W` + `bucket_m` + `dtype`, so
     /// this layer is a thin pass-through to
-    /// [`SpecializedPipelineCache::get_or_build`].
-    ///
-    /// Returns [`PipelineLookupError::OpaqueKernel`] for
-    /// `KernelId::Gemm`: that kernel is opaque to this picker — both
-    /// dtypes have their own dims-keyed builders
-    /// ([`Self::pipeline_for_gemm_f16`] / [`Self::pipeline_for_gemm_bf16`]).
-    /// The worker special-cases GEMM upfront and never reaches this
-    /// method for those commands; the explicit error guards against
-    /// a future caller that forgets.
+    /// [`SpecializedPipelineCache::get_or_build`]. A GEMM is no [`LoweredCommand`]: its kernel
+    /// is [`Self::pipeline_for_gemm`]'s pick from its dims.
     ///
     /// [`SpecializedPipelineCache::get_or_build`]: crate::specialized_pipeline_cache::SpecializedPipelineCache::get_or_build
     pub fn pipeline_for_command<W: CanonicalParams>(
         &self,
         cmd: &LoweredCommand,
     ) -> Result<ComputePipelineState, PipelineLookupError> {
-        if matches!(cmd.kernel, KernelId::Gemm) {
-            return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm));
-        }
         let constants = (cmd.constants.iter())
             .map(|c| c.resolve(self.variant))
             .collect::<Result<Vec<_>, _>>()
@@ -226,7 +216,7 @@ impl SpecializedPipelines {
 }
 
 /// A dense GEMM's pipeline key at `dtype` and `dims` for `body`, keyed on its `(M, N, K)` (the
-/// simdgroup bodies' constants 0 / 1 / 2; the lowering has them on `LoweredCommand.gemm`).
+/// simdgroup bodies' constants 0 / 1 / 2; the lowering has them on its `Gemm`'s `dims`).
 /// Up to [`GEMV_MAX_ROWS`] rows of at least [`GEMV_ROWS`] outputs are matrix-vector products:
 /// MLX's GEMV per row (`gemv_{f16,bf16}_specialized`), a threadgroup of 256 threads per
 /// [`GEMV_ROWS`] outputs of every row, each weight slice loaded once for all of them.
@@ -278,10 +268,7 @@ pub fn gemm_pipeline(
         (MetalDtype::F16, true, _) => ("gemv_f16_specialized", GEMV_ROWS, 256),
         (MetalDtype::Bf16, true, _) => ("gemv_bf16_specialized", GEMV_ROWS, 256),
         (MetalDtype::Int4, ..) => {
-            return Err(PipelineLookupError::DtypeNotYetWired(
-                KernelId::Gemm,
-                MetalDtype::Int4,
-            ));
+            return Err(PipelineLookupError::GemmDtypeNotYetWired(MetalDtype::Int4));
         }
     };
     let dispatch = DispatchShape {
@@ -307,9 +294,6 @@ pub fn gemm_pipeline(
 
 #[derive(Debug)]
 pub enum PipelineLookupError {
-    /// `KernelId::Gemm` is intentionally opaque (dims-keyed builders).
-    /// Callers must route it through the GEMM wrapper, not this cache.
-    OpaqueKernel(KernelId),
     /// `KernelId::Reshape` is metadata-only. Callers should drop it
     /// before reaching this layer; the lowering pass already does so.
     MetadataOnly(KernelId),
@@ -318,6 +302,8 @@ pub enum PipelineLookupError {
     /// path needs different binding shapes (packed u32 + group scales)
     /// so a single symbol picker can't transparently model it.
     DtypeNotYetWired(KernelId, MetalDtype),
+    /// A dense GEMM at a dtype no GEMM kernel takes.
+    GemmDtypeNotYetWired(MetalDtype),
     /// Cache build error (shader compile, function constant mismatch,
     /// pipeline state construction). The wrapped variant carries the
     /// underlying message verbatim.
@@ -329,10 +315,6 @@ pub enum PipelineLookupError {
 impl std::fmt::Display for PipelineLookupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::OpaqueKernel(k) => write!(
-                f,
-                "specialized pipeline lookup: {k:?} is opaque (route through MPS GEMM wrapper)"
-            ),
             Self::MetadataOnly(k) => write!(
                 f,
                 "specialized pipeline lookup: {k:?} is a metadata-only op (lowering should drop it)"
@@ -341,6 +323,12 @@ impl std::fmt::Display for PipelineLookupError {
                 f,
                 "specialized pipeline lookup: kernel {k:?} dtype {d:?} not yet wired"
             ),
+            Self::GemmDtypeNotYetWired(d) => {
+                write!(
+                    f,
+                    "specialized pipeline lookup: dense GEMM dtype {d:?} not yet wired"
+                )
+            }
             Self::Build(e) => write!(f, "specialized pipeline build: {e}"),
             Self::Unbound(e) => write!(f, "specialized pipeline lookup: {e}"),
         }
@@ -554,8 +542,6 @@ mod tests {
             (KernelId::ScalarMul, MetalDtype::Bf16) => {
                 ("elementwise", "scalar_mul_bf16_specialized")
             }
-            (KernelId::Gemm, MetalDtype::F16) => ("gemm", "gemm_f16_specialized"),
-            (KernelId::Gemm, MetalDtype::Bf16) => ("gemm", "gemm_bf16_specialized"),
             (KernelId::Reshape, _) => {
                 return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape));
             }
@@ -776,7 +762,6 @@ mod tests {
                 v
             }
             KernelId::Add | KernelId::ScalarMul => Vec::new(),
-            KernelId::Gemm => return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm)),
             KernelId::Reshape => return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape)),
             KernelId::AffineQmvQuad
             | KernelId::AffineQmvFast
@@ -1071,12 +1056,6 @@ mod tests {
         assert_eq!(bag[0], ConstantValue::uint(3, 1));
         assert_eq!(bag[1], ConstantValue::uint(4, 5632));
         assert_eq!(bag[2], ConstantValue::uint(5, 2048));
-    }
-
-    #[test]
-    fn gemm_is_rejected_as_opaque() {
-        let err = constants_for::<TinyLlamaProbe>(KernelId::Gemm, 1).unwrap_err();
-        assert!(matches!(err, PipelineLookupError::OpaqueKernel(_)));
     }
 
     #[test]
