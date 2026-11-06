@@ -18210,7 +18210,8 @@ mod fingerprint_tests {
             ("qwen3-5-moe", "qwen3.6-35b-a3b"),
             ("gemma4-moe", "gemma-4-26b-a4b-it"),
         ] {
-            let model = variant_of(arch, stem, "fp8-dynamic-per-channel");
+            let model = variant_of(arch, stem, "fp8-dynamic-per-channel")
+                .unwrap_or_else(|| panic!("{stem}: the declared fp8 preset was refused"));
             let ignore = &model.quantization.as_ref().unwrap().modules_to_not_convert;
             let (program, fuf) = fuf_of(arch, &model);
             // Each layer-0/3 weight's checkpoint prefix (a bundle's as its tensors sit on disk).
@@ -18403,7 +18404,8 @@ mod fingerprint_tests {
             ("qwen3-5-moe", "qwen3.6-35b-a3b"),
             ("gemma4-moe", "gemma-4-26b-a4b-it"),
         ] {
-            let model = variant_of(arch, stem, "fp8-dynamic-per-channel");
+            let model = variant_of(arch, stem, "fp8-dynamic-per-channel")
+                .unwrap_or_else(|| panic!("{stem}: the declared fp8 preset was refused"));
             let ast = crate::draft_capture::insert(&dsl_of(arch));
             let (_, fuf, inferred) = inferred_fuf_of_ast(arch, &model, &ast);
             let lower = |experts| {
@@ -18412,7 +18414,14 @@ mod fingerprint_tests {
                     sk_bucket: 256,
                 };
                 let bounds = bounds_for_wp(&model, wp, 1);
-                lower_decode_to_wavefront(&fuf, &inferred, &bounds, &model, prefix, 1, experts)
+                // #1093: the bridge takes the config params and the typed facts together.
+                let facts =
+                    fill_canonical_params(&model, 1, false, &KvCacheLayers::of(&fuf), None).0;
+                let bridge = crate::to_wavefront::BridgeModel {
+                    params: &model,
+                    facts: &facts,
+                };
+                lower_decode_to_wavefront(&fuf, &inferred, &bounds, &bridge, prefix, 1, experts)
             };
             let lowered = lower(DenseExperts::Lower).expect("the fp8 model lowers");
             let banks: Vec<_> = (lowered.input.ops.iter())
