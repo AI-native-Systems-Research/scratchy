@@ -9,40 +9,109 @@
 
 use std::marker::PhantomData;
 
-/// A dim as a type: its number for the model whose module declares it.
+/// The type-level unsigned integers a dim's number is: `typenum`, re-exported so the code the bake
+/// emits names it through this crate.
+pub use typenum;
+
+use typenum::{Unsigned, UInt, UTerm};
+
+/// A dim as a type: its number, as a type (`Num`, a [`typenum`] unsigned), for the model whose
+/// module declares it. A law between dims is a bound on their numbers, which rustc checks.
 pub trait Dim {
+    type Num: Unsigned;
+}
+
+/// A dim's number, as a value: derived from its [`Dim::Num`], the one impl every dim has.
+pub trait DimN {
     const N: u32;
+}
+
+impl<D: Dim> DimN for D {
+    const N: u32 = <D::Num as Unsigned>::U32;
+}
+
+/// A number is its own dim: a literal in a shape is spelled as the number itself.
+impl Dim for UTerm {
+    type Num = Self;
+}
+
+impl<U: Unsigned, B: typenum::Bit> Dim for UInt<U, B> {
+    type Num = Self;
+}
+
+/// `n` as the path of its [`typenum`] type, through this crate's re-export: what the bake emits for
+/// a number it states as a type.
+pub fn unsigned_path(n: u64) -> String {
+    let t = "::scratchy_tensors::typed::typenum";
+    let width = u64::BITS - n.leading_zeros();
+    (0..width).rev().fold(format!("{t}::UTerm"), |acc, bit| {
+        let b = if (n >> bit) & 1 == 1 { "B1" } else { "B0" };
+        format!("{t}::UInt<{acc}, {t}::{b}>")
+    })
 }
 
 /// The product `A · B`.
 pub struct Mul<A, B>(PhantomData<(A, B)>);
 
-impl<A: Dim, B: Dim> Dim for Mul<A, B> {
-    const N: u32 = A::N * B::N;
+impl<A: Dim, B: Dim> Dim for Mul<A, B>
+where
+    A::Num: core::ops::Mul<B::Num, Output: Unsigned>,
+{
+    type Num = typenum::Prod<A::Num, B::Num>;
 }
 
 /// The sum `A + B`: a packed projection's parts side by side.
 pub struct Add<A, B>(PhantomData<(A, B)>);
 
-impl<A: Dim, B: Dim> Dim for Add<A, B> {
-    const N: u32 = A::N + B::N;
+impl<A: Dim, B: Dim> Dim for Add<A, B>
+where
+    A::Num: core::ops::Add<B::Num, Output: Unsigned>,
+{
+    type Num = typenum::Sum<A::Num, B::Num>;
 }
 
-/// The quotient `A / B`, rounded down as the carrier's `/` is: a carrier's round-up is spelled
-/// `(A + (B - 1)) / B` (qwen2.5-vl's vision MLP is `8 · ((intermediate + 7) / 8)` wide), so a
-/// quotient with a remainder is meant, not an error. Phase F's type-level quotient keeps this
-/// floor.
+/// A number that is zero: the remainder of a division that is exact.
+#[diagnostic::on_unimplemented(
+    message = "a remainder of `{Self}` is not zero: the division is not exact",
+    label = "the divisor does not divide the dividend"
+)]
+pub trait Zero {}
+
+impl Zero for UTerm {}
+
+/// `Self` divides `A` exactly: the quotient, which only a zero remainder has.
+///
+/// ```
+/// # use scratchy_tensors::typed::{Div, DimN};
+/// # use scratchy_tensors::typed::typenum::{U4, U32};
+/// assert_eq!(<Div<U32, U4> as DimN>::N, 8);
+/// ```
+///
+/// ```compile_fail,E0277
+/// # use scratchy_tensors::typed::{Div, DimN};
+/// # use scratchy_tensors::typed::typenum::{U5, U32};
+/// let _ = <Div<U32, U5> as DimN>::N;
+/// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not divide `{A}` exactly",
+    label = "a quotient needs a divisor that divides its dividend"
+)]
+pub trait Divides<A: Dim>: Dim {
+    type Quot: Unsigned;
+}
+
+impl<A: Dim, B: Dim> Divides<A> for B
+where
+    A::Num: core::ops::Rem<B::Num, Output: Zero> + core::ops::Div<B::Num, Output: Unsigned>,
+{
+    type Quot = typenum::Quot<A::Num, B::Num>;
+}
+
+/// The quotient `A / B`, exact: a `B` that does not divide `A` has none (E0277).
 pub struct Div<A, B>(PhantomData<(A, B)>);
 
-impl<A: Dim, B: Dim> Dim for Div<A, B> {
-    const N: u32 = A::N / B::N;
-}
-
-/// A literal dim.
-pub enum Lit<const V: u32> {}
-
-impl<const V: u32> Dim for Lit<V> {
-    const N: u32 = V;
+impl<A: Dim, B: Divides<A>> Dim for Div<A, B> {
+    type Num = B::Quot;
 }
 
 /// A device layer's extents, in the order its weight's declared shape states them.
@@ -90,9 +159,9 @@ pub struct W2<K, N, L> {
 /// ```
 /// # use scratchy_tensors::typed::{Add, Dim, PackedN, W2};
 /// # enum Hidden {}
-/// # impl Dim for Hidden { const N: u32 = 2048; }
+/// # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 /// # enum Inter {}
-/// # impl Dim for Inter { const N: u32 = 8192; }
+/// # impl Dim for Inter { type Num = scratchy_tensors::typed::typenum::U8192; }
 /// let _: Option<<(W2<Hidden, Inter, ()>, W2<Hidden, Inter, ()>) as PackedN>::Out> =
 ///     None::<W2<Hidden, Add<Inter, Inter>, ()>>;
 /// ```
@@ -100,9 +169,9 @@ pub struct W2<K, N, L> {
 /// ```compile_fail,E0277
 /// # use scratchy_tensors::typed::{Add, Dim, PackedN, W2};
 /// # enum Hidden {}
-/// # impl Dim for Hidden { const N: u32 = 2048; }
+/// # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 /// # enum Inter {}
-/// # impl Dim for Inter { const N: u32 = 8192; }
+/// # impl Dim for Inter { type Num = scratchy_tensors::typed::typenum::U8192; }
 /// let _: Option<<(W2<Hidden, Inter, ()>, W2<Inter, Inter, ()>) as PackedN>::Out> =
 ///     None::<W2<Hidden, Add<Inter, Inter>, ()>>;
 /// ```
@@ -125,36 +194,58 @@ impl<K: Dim, N: Dim, L> Shape2 for W2<K, N, L> {
     type N = N;
 }
 
-/// An MLX-affine weight's code width, as a type: `B` bits a weight.
-pub trait Bits {
-    const N: u32;
-}
+/// An MLX-affine weight's code width, as a type: `B` bits a weight, its number its [`Dim`]'s.
+pub trait Bits: Dim {}
 
-/// An MLX-affine weight's quantization group, as a type: `G` weights a scale and bias.
-pub trait Group {
-    const N: u32;
-}
+/// An MLX-affine weight's quantization group, as a type: `G` weights a scale and bias, its number
+/// its [`Dim`]'s.
+pub trait Group: Dim {}
 
 macro_rules! markers {
-    ($trait:ident: $($name:ident = $n:literal),+ $(,)?) => {$(
+    ($trait:ident: $($name:ident = $n:ident),+ $(,)?) => {$(
         #[doc = concat!("`", stringify!($n), "`, as a [`", stringify!($trait), "`].")]
         pub enum $name {}
-        impl $trait for $name {
-            const N: u32 = $n;
+        impl Dim for $name {
+            type Num = typenum::$n;
         }
+        impl $trait for $name {}
     )+};
 }
 
 // Every width and group MLX's affine format writes; which of them a target's kernels take is that
 // target's set of these.
-markers!(Bits: B2 = 2, B3 = 3, B4 = 4, B5 = 5, B6 = 6, B8 = 8);
-markers!(Group: G32 = 32, G64 = 64, G128 = 128);
+markers!(Bits: B2 = U2, B3 = U3, B4 = U4, B5 = U5, B6 = U6, B8 = U8);
+markers!(Group: G32 = U32, G64 = U64, G128 = U128);
+
+/// `G` divides `K`: a matrix quantized in groups of `G` along its inner dim `K` holds whole groups.
+#[diagnostic::on_unimplemented(
+    message = "a group of `{Self}` does not divide the inner dim `{K}`",
+    label = "an MLX-affine weight's groups tile its inner dim"
+)]
+pub trait Tiles<K: Dim>: Group {}
+
+impl<K: Dim, G: Group + Divides<K>> Tiles<K> for G {}
 
 /// A rank-2 MLX-affine weight `[K, N]`, its codes `B` bits wide in groups of `G`, held as `L`.
 /// Not a [`Shape2`]: a quantized weight is read by the kernels of its codes alone, never as a
-/// dense one.
+/// dense one. Its groups tile its inner dim ([`Tiles`]): there is no `Q2` whose `G` does not
+/// divide its `K`.
+///
+/// ```
+/// # use scratchy_tensors::typed::{B4, DimN, G64, Q2, QShape2};
+/// # use scratchy_tensors::typed::typenum::{U1024, U2048};
+/// type W = Q2<U2048, U1024, B4, G64, ()>;
+/// assert_eq!(<<W as QShape2>::K as DimN>::N / <<W as QShape2>::Group as DimN>::N, 32);
+/// ```
+///
+/// ```compile_fail,E0277
+/// # use scratchy_tensors::typed::{B4, DimN, G64, Q2, QShape2};
+/// # use scratchy_tensors::typed::typenum::{U1000, U1024};
+/// type W = Q2<U1000, U1024, B4, G64, ()>;
+/// let _ = <<W as QShape2>::K as DimN>::N;
+/// ```
 #[repr(transparent)]
-pub struct Q2<K, N, B, G, L> {
+pub struct Q2<K: Dim, N, B, G: Tiles<K>, L> {
     layer: L,
     shape: PhantomData<fn() -> (K, N)>,
     codes: PhantomData<fn() -> (B, G)>,
@@ -168,14 +259,14 @@ pub trait QShape2 {
     type Group: Group;
 }
 
-impl<K: Dim, N: Dim, B: Bits, G: Group, L> QShape2 for Q2<K, N, B, G, L> {
+impl<K: Dim, N: Dim, B: Bits, G: Tiles<K>, L> QShape2 for Q2<K, N, B, G, L> {
     type K = K;
     type N = N;
     type Bits = B;
     type Group = G;
 }
 
-impl<K, N, B, G, L> std::ops::Deref for Q2<K, N, B, G, L> {
+impl<K: Dim, N, B, G: Tiles<K>, L> std::ops::Deref for Q2<K, N, B, G, L> {
     type Target = L;
     fn deref(&self) -> &L {
         &self.layer
@@ -437,7 +528,7 @@ fn check_roles<L: RoleExtents>(
 /// ```
 /// # use scratchy_tensors::typed::{Dim, Extents, Mint, W2};
 /// # enum Hidden {}
-/// # impl Dim for Hidden { const N: u32 = 2048; }
+/// # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 /// # struct Layer;
 /// # impl Extents<2> for Layer { fn extents(&self) -> [usize; 2] { [2048, 2048] } }
 /// let w = W2::<Hidden, Hidden, Layer>::mint(Layer, "o_proj");
@@ -449,7 +540,7 @@ fn check_roles<L: RoleExtents>(
 /// ```compile_fail,E0423
 /// # use scratchy_tensors::typed::{Checked, Dim, Extents, Shaped, W2};
 /// # enum Hidden {}
-/// # impl Dim for Hidden { const N: u32 = 2048; }
+/// # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 /// # struct Layer;
 /// # impl Extents<2> for Layer { fn extents(&self) -> [usize; 2] { [4, 4] } }
 /// let w = W2::<Hidden, Hidden, Layer>::wrap(Checked(Layer));
@@ -547,7 +638,7 @@ impl<K: Dim, N: Dim, L: Extents<2>> Shaped<L> for W2<K, N, L> {
     }
 }
 
-impl<K: Dim, N: Dim, B: Bits, G: Group, L: Extents<2> + AffineCodes> Shaped<L>
+impl<K: Dim, N: Dim, B: Bits, G: Tiles<K>, L: Extents<2> + AffineCodes> Shaped<L>
     for Q2<K, N, B, G, L>
 {
     fn check(layers: &[L], tensor: &str, layered: bool) -> anyhow::Result<()> {
@@ -564,7 +655,9 @@ impl<K: Dim, N: Dim, B: Bits, G: Group, L: Extents<2> + AffineCodes> Shaped<L>
     }
 }
 
-impl<K: Dim, N: Dim, B: Bits, G: Group, L: Extents<2> + AffineCodes> Mint<L> for Q2<K, N, B, G, L> {
+impl<K: Dim, N: Dim, B: Bits, G: Tiles<K>, L: Extents<2> + AffineCodes> Mint<L>
+    for Q2<K, N, B, G, L>
+{
     fn mint(layer: L, tensor: &str) -> anyhow::Result<Self> {
         Self::check(std::slice::from_ref(&layer), tensor, false)?;
         Ok(Self::wrap(Checked(layer)))
@@ -619,11 +712,11 @@ mod tests {
 
     enum Hidden {}
     impl Dim for Hidden {
-        const N: u32 = 2048;
+        type Num = typenum::U2048;
     }
     enum Vocab {}
     impl Dim for Vocab {
-        const N: u32 = 128256;
+        type Num = typenum::Prod<typenum::U1002, typenum::U128>;
     }
 
     /// A layer of the extents it states.

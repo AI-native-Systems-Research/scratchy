@@ -28,6 +28,9 @@ description = "Metal's compile-time lowering: SubtileTape -> metal step tape + s
 scratchy-subtile = { path = "../../../compiler/subtile" }
 scratchy-target-metal = { path = ".." }
 scratchy-ir = { path = "../../../compiler/ir", features = ["metal"] }
+# `typed::unsigned_path`: the bake states a GEMM's numbers as types. Already in the graph (through
+# scratchy-target-metal).
+scratchy-tensors = { path = "../../../tensors" }
 
 syn = { version = "3", features = ["full"] }
 quote = "1"

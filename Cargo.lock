@@ -3699,6 +3699,7 @@ dependencies = [
  "scratchy-ir",
  "scratchy-subtile",
  "scratchy-target-metal",
+ "scratchy-tensors",
  "serde",
  "syn 3.0.9",
 ]
@@ -3736,6 +3737,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "memmap2",
+ "typenum",
 ]
 
 [[package]]

@@ -4624,10 +4624,11 @@ impl ModelDims {
                     "{}",
                     scratchy_forward_compiler_frontend::typed_emit::marker(b)
                 );
+                let n = unsigned_tokens(u64::from(n));
                 Ok(quote! {
                     pub enum #marker {}
                     impl ::scratchy_tensors::typed::Dim for #marker {
-                        const N: u32 = #n;
+                        type Num = #n;
                     }
                 })
             })
@@ -4653,6 +4654,12 @@ impl ModelDims {
     }
 }
 
+/// `n` as its type-level number: a literal dim is the number itself
+/// (`scratchy_tensors::typed::unsigned_path`).
+fn unsigned_tokens(n: u64) -> TokenStream {
+    (scratchy_tensors::typed::unsigned_path(n).parse()).expect("a typenum path is Rust tokens")
+}
+
 /// `dim` as a type in the model's `__dims`, each bound it names into `bounds`.
 fn dim_tokens(
     dim: &crate::dim::Dim,
@@ -4670,8 +4677,8 @@ fn dim_tokens(
             Ok(quote!(__dims::#marker))
         }
         Dim::Lit(n) => {
-            let n = u32::try_from(*n).map_err(|_| format!("literal dim {n} exceeds u32"))?;
-            Ok(quote!(#w::Lit<#n>))
+            u32::try_from(*n).map_err(|_| format!("literal dim {n} exceeds u32"))?;
+            Ok(unsigned_tokens(*n))
         }
         Dim::Mul(parts) | Dim::Add(parts) => {
             let op = match dim {

@@ -19,9 +19,9 @@
 //! # use scratchy_target_metal::tape::typed::{GemmSlot, Source};
 //! # use scratchy_tensors::typed::{Dim, W1, W2};
 //! # enum Hidden {}
-//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 //! # enum Vocab {}
-//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # impl Dim for Vocab { type Num = scratchy_tensors::typed::typenum::Prod<scratchy_tensors::typed::typenum::U1002, scratchy_tensors::typed::typenum::U128>; }
 //! # struct Layer;
 //! # struct Weights { lm_head: W2<Hidden, Vocab, Layer>, norm: W1<Hidden, Layer> }
 //! # enum Norm {}
@@ -47,9 +47,9 @@
 //! # use scratchy_target_metal::tape::typed::{GemmSlot, Source};
 //! # use scratchy_tensors::typed::{Dim, W1, W2};
 //! # enum Hidden {}
-//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 //! # enum Vocab {}
-//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # impl Dim for Vocab { type Num = scratchy_tensors::typed::typenum::Prod<scratchy_tensors::typed::typenum::U1002, scratchy_tensors::typed::typenum::U128>; }
 //! # struct Layer;
 //! # struct Weights { lm_head: W2<Hidden, Vocab, Layer>, norm: W1<Hidden, Layer> }
 //! # enum Norm {}
@@ -70,9 +70,9 @@
 //! # use scratchy_target_metal::tape::typed::{GemmSlot, Source};
 //! # use scratchy_tensors::typed::{Dim, W1, W2};
 //! # enum Hidden {}
-//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 //! # enum Vocab {}
-//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # impl Dim for Vocab { type Num = scratchy_tensors::typed::typenum::Prod<scratchy_tensors::typed::typenum::U1002, scratchy_tensors::typed::typenum::U128>; }
 //! # struct Layer;
 //! # struct Weights { lm_head: W2<Hidden, Vocab, Layer>, norm: W1<Hidden, Layer> }
 //! # enum Norm {}
@@ -96,9 +96,9 @@
 //! # use scratchy_target_metal::tape::typed::{GemmSlot, Source};
 //! # use scratchy_tensors::typed::{Dim, W1, W2};
 //! # enum Hidden {}
-//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 //! # enum Vocab {}
-//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # impl Dim for Vocab { type Num = scratchy_tensors::typed::typenum::Prod<scratchy_tensors::typed::typenum::U1002, scratchy_tensors::typed::typenum::U128>; }
 //! # struct Layer;
 //! # struct Weights { lm_head: W2<Hidden, Vocab, Layer>, norm: W1<Hidden, Layer> }
 //! # enum Norm {}
@@ -125,9 +125,9 @@
 //! # use scratchy_target_metal::tape::typed::{AffineSlot, Source};
 //! # use scratchy_tensors::typed::{B4, Dim, G64, Q2};
 //! # enum Hidden {}
-//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 //! # enum Vocab {}
-//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # impl Dim for Vocab { type Num = scratchy_tensors::typed::typenum::Prod<scratchy_tensors::typed::typenum::U1002, scratchy_tensors::typed::typenum::U128>; }
 //! # struct Layer;
 //! # type Head = Q2<Hidden, Vocab, B4, G64, Layer>;
 //! # struct Weights { lm_head: Head }
@@ -149,9 +149,9 @@
 //! # use scratchy_target_metal::tape::typed::{GemmSlot, Source};
 //! # use scratchy_tensors::typed::{B4, Dim, G64, Q2};
 //! # enum Hidden {}
-//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 //! # enum Vocab {}
-//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # impl Dim for Vocab { type Num = scratchy_tensors::typed::typenum::Prod<scratchy_tensors::typed::typenum::U1002, scratchy_tensors::typed::typenum::U128>; }
 //! # struct Layer;
 //! # type Head = Q2<Hidden, Vocab, B4, G64, Layer>;
 //! # struct Weights { lm_head: Head }
@@ -173,9 +173,9 @@
 //! # use scratchy_target_metal::tape::typed::{AffineSlot, Source};
 //! # use scratchy_tensors::typed::{B5, Dim, G64, Q2};
 //! # enum Hidden {}
-//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 //! # enum Vocab {}
-//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # impl Dim for Vocab { type Num = scratchy_tensors::typed::typenum::Prod<scratchy_tensors::typed::typenum::U1002, scratchy_tensors::typed::typenum::U128>; }
 //! # struct Layer;
 //! # type Head = Q2<Hidden, Vocab, B5, G64, Layer>;
 //! # struct Weights { lm_head: Head }
@@ -194,12 +194,13 @@
 //!
 //! ```
 //! # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
-//! # use scratchy_target_metal::tape::typed::{AffineSlot, Source, affine_codes_agree, nax_group};
+//! # use scratchy_target_metal::tape::typed::{Source, affine_codes_agree, affine_dims_agree, nax_group};
+//! # use scratchy_tensors::typed::typenum::{Prod, U128, U1002, U2048};
 //! # use scratchy_tensors::typed::{B4, Dim, G64, Q2};
 //! # enum Hidden {}
-//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 //! # enum Vocab {}
-//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # impl Dim for Vocab { type Num = scratchy_tensors::typed::typenum::Prod<scratchy_tensors::typed::typenum::U1002, scratchy_tensors::typed::typenum::U128>; }
 //! # struct Layer;
 //! # type Head = Q2<Hidden, Vocab, B4, G64, Layer>;
 //! # struct Weights { lm_head: Head }
@@ -211,7 +212,7 @@
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
 //! const _: () = affine_codes_agree::<LmHead, scratchy_tensors::typed::B4, G64>();
-//! const _: () = <LmHead as AffineSlot>::WEIGHT.agrees(128256, 2048);
+//! const _: () = affine_dims_agree::<LmHead, Prod<U1002, U128>, U2048>();
 //! const _: () = nax_group::<LmHead>();
 //! ```
 //!
@@ -220,9 +221,9 @@
 //! # use scratchy_target_metal::tape::typed::{Source, affine_codes_agree};
 //! # use scratchy_tensors::typed::{B4, Dim, G64, Q2};
 //! # enum Hidden {}
-//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 //! # enum Vocab {}
-//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # impl Dim for Vocab { type Num = scratchy_tensors::typed::typenum::Prod<scratchy_tensors::typed::typenum::U1002, scratchy_tensors::typed::typenum::U128>; }
 //! # struct Layer;
 //! # type Head = Q2<Hidden, Vocab, B4, G64, Layer>;
 //! # struct Weights { lm_head: Head }
@@ -236,16 +237,18 @@
 //! const _: () = affine_codes_agree::<LmHead, scratchy_tensors::typed::B8, G64>();
 //! ```
 //!
-//! — its n and k by a `const` evaluation (E0080), until Phase F makes a dim a type —
+//! — its n and k by type equality: the numbers the bake baked, as types, must be the handle's
+//! dims' (E0271; a dense GEMM's the same, `gemm_dims_agree`) —
 //!
-//! ```compile_fail,E0080
+//! ```compile_fail,E0271
 //! # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
-//! # use scratchy_target_metal::tape::typed::{AffineSlot, Source};
+//! # use scratchy_target_metal::tape::typed::{Source, affine_dims_agree};
+//! # use scratchy_tensors::typed::typenum::{Prod, U128, U1000, U2048};
 //! # use scratchy_tensors::typed::{B4, Dim, G64, Q2};
 //! # enum Hidden {}
-//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 //! # enum Vocab {}
-//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # impl Dim for Vocab { type Num = scratchy_tensors::typed::typenum::Prod<scratchy_tensors::typed::typenum::U1002, scratchy_tensors::typed::typenum::U128>; }
 //! # struct Layer;
 //! # type Head = Q2<Hidden, Vocab, B4, G64, Layer>;
 //! # struct Weights { lm_head: Head }
@@ -256,7 +259,7 @@
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
-//! const _: () = <LmHead as AffineSlot>::WEIGHT.agrees(128000, 2048);
+//! const _: () = affine_dims_agree::<LmHead, Prod<U1000, U128>, U2048>();
 //! ```
 //!
 //! — and a matrix-unit kernel's group by its bound (E0277): those take no group of 32.
@@ -266,9 +269,9 @@
 //! # use scratchy_target_metal::tape::typed::{Source, nax_group};
 //! # use scratchy_tensors::typed::{B4, Dim, G32, Q2};
 //! # enum Hidden {}
-//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
 //! # enum Vocab {}
-//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # impl Dim for Vocab { type Num = scratchy_tensors::typed::typenum::Prod<scratchy_tensors::typed::typenum::U1002, scratchy_tensors::typed::typenum::U128>; }
 //! # struct Layer;
 //! # type Head = Q2<Hidden, Vocab, B4, G32, Layer>;
 //! # struct Weights { lm_head: Head }
@@ -282,7 +285,9 @@
 //! const _: () = nax_group::<LmHead>();
 //! ```
 
-use scratchy_tensors::typed::{B2, B3, B4, B8, Bits, Dim, G32, G64, G128, Group, QShape2, Shape2};
+use scratchy_tensors::typed::{
+    B2, B3, B4, B8, Bits, Dim, DimN, G32, G64, G128, Group, QShape2, Shape2,
+};
 
 use super::ids::{AffineBits, AffineGroupSize, LayerId, SourceIx};
 
@@ -310,7 +315,7 @@ macro_rules! kernel_set {
     ($(#[$m:meta])* $table:ident: $carrier:ident, $set:ident { $($marker:ident),+ }
         $(=> $assoc:ident: $value:ident)?) => {
         $(#[$m])*
-        pub const $table: &[u32] = &[$(<$marker as $carrier>::N),+];
+        pub const $table: &[u32] = &[$(<$marker as DimN>::N),+];
         kernel_set!(@impls $set [$($assoc $value)?] $carrier $($marker)+);
     };
     (@impls $set:ident [] $carrier:ident $($marker:ident)+) => {
@@ -318,7 +323,7 @@ macro_rules! kernel_set {
     };
     (@impls $set:ident [$assoc:ident $value:ident] $carrier:ident $($marker:ident)+) => {
         $(impl $set for $marker {
-            const $assoc: $value = $value::of(<$marker as $carrier>::N);
+            const $assoc: $value = $value::of(<$marker as DimN>::N);
         })+
     };
 }
@@ -366,24 +371,19 @@ pub trait GemmSlot {
 impl<S: Source<Handle: Shape2>> GemmSlot for S {
     const WEIGHT: GemmSlotWeight = GemmSlotWeight {
         ix: S::IX,
-        n: <<S::Handle as Shape2>::N as Dim>::N,
-        k: <<S::Handle as Shape2>::K as Dim>::N,
+        n: <<S::Handle as Shape2>::N as DimN>::N,
+        k: <<S::Handle as Shape2>::K as DimN>::N,
     };
 }
 
-/// Whether `(n, k)` are a weight's `(n, k)`: a `const` evaluation that fails the build (E0080)
-/// where the bake's numbers are not the slot's. The ratchet: n/k become type equality in Phase F,
-/// when a dim is a type the bake names.
-const fn dims_agree(n: u32, k: u32, slot_n: u32, slot_k: u32) {
-    assert!(n == slot_n, "the bake's n is not its slot's");
-    assert!(k == slot_k, "the bake's k is not its slot's");
-}
-
-impl GemmSlotWeight {
-    /// Fails the build (E0080) unless the GEMM the bake baked at `(n, k)` is this slot's.
-    pub const fn agrees(self, n: u32, k: u32) {
-        dims_agree(n, k, self.n, self.k)
-    }
+/// The bake's `(N, K)` are slot `S`'s: `N` and `K` the numbers the bake baked its GEMM at, as types,
+/// which must be the numbers of the slot's handle's dims (E0271 where they are not).
+pub const fn gemm_dims_agree<S, N, K>()
+where
+    S: Source<Handle: Shape2>,
+    <S::Handle as Shape2>::N: Dim<Num = N>,
+    <S::Handle as Shape2>::K: Dim<Num = K>,
+{
 }
 
 /// An MLX-affine matmul's weight, as its slot states it: the slot's index, the handle's dims and
@@ -395,14 +395,6 @@ pub struct AffineSlotWeight {
     pub k: u32,
     pub bits: AffineBits,
     pub group: AffineGroupSize,
-}
-
-impl AffineSlotWeight {
-    /// Fails the build (E0080) unless the affine kernels the bake baked at `(n, k)` read this
-    /// slot's weight. Its codes are its markers', tied by [`affine_codes_agree`].
-    pub const fn agrees(self, n: u32, k: u32) {
-        dims_agree(n, k, self.n, self.k)
-    }
 }
 
 /// A slot an MLX-affine matmul reads: only a slot whose handle is a quantized rank-2 weight of
@@ -423,8 +415,8 @@ where
     type Group = <S::Handle as QShape2>::Group;
     const WEIGHT: AffineSlotWeight = AffineSlotWeight {
         ix: S::IX,
-        n: <<S::Handle as QShape2>::N as Dim>::N,
-        k: <<S::Handle as QShape2>::K as Dim>::N,
+        n: <<S::Handle as QShape2>::N as DimN>::N,
+        k: <<S::Handle as QShape2>::K as DimN>::N,
         bits: <Self::Bits as AffineBitsOf>::BITS,
         group: <Self::Group as AffineGroupOf>::GROUP,
     };
@@ -433,6 +425,17 @@ where
 /// The bake's codes for slot `S` are `S`'s: `B` and `G` the markers the bake minted, which must
 /// be the slot's handle's (E0271 where they are not).
 pub const fn affine_codes_agree<S: AffineSlot<Bits = B, Group = G>, B, G>() {}
+
+/// The bake's `(N, K)` for slot `S`'s affine matmuls are `S`'s: `N` and `K` the numbers it baked
+/// the kernels at, as types, which must be the numbers of the slot's handle's dims (E0271 where
+/// they are not).
+pub const fn affine_dims_agree<S, N, K>()
+where
+    S: AffineSlot + Source<Handle: QShape2>,
+    <S::Handle as QShape2>::N: Dim<Num = N>,
+    <S::Handle as QShape2>::K: Dim<Num = K>,
+{
+}
 
 /// Slot `S` is read by an int4-only kernel: its codes must be 4 bits (E0277 where not).
 pub const fn int4_codes<S: AffineSlot<Bits: Int4>>() {}

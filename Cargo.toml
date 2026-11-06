@@ -66,6 +66,9 @@ license = "Apache-2.0"
 repository = "https://github.com/vllm-project/vllm"
 
 [workspace.dependencies]
+# Type-level unsigned integers: a dim's number as a type, so a law between dims is a bound rustc
+# checks (`scratchy_tensors::typed`).
+typenum = "1.20"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
