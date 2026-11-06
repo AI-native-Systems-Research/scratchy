@@ -1201,6 +1201,7 @@ mod place_id_tests {
             FqMm,
             FqRaw,
             FqAmaxP(0),
+            ReducePartial(0),
             Sq16,
             Mean,
             Meps,
