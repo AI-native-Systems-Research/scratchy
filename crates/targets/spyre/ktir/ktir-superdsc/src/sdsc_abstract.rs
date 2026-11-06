@@ -4813,12 +4813,23 @@ impl PoolPageSlots {
     /// ⭐ THE ONLY CONSTRUCTOR: `k` whole scheduler blocks. This function IS the law "a pool
     /// page is a whole number of scheduler blocks" — a page built any other way is
     /// unrepresentable, so the block→page mapping the write and the walk rely on stays whole
-    /// by construction and no separate assert exists. `k` is a MEASURED POLICY choice.
-    pub const fn of_scheduler_blocks(blocks: SchedulerBlockTokens, k: u32) -> Self {
-        assert!(k > 0, "a pool page spans at least one scheduler block");
-        match std::num::NonZeroU32::new(blocks.get() * k) {
-            Some(v) => Self(v),
-            None => panic!("k whole nonzero blocks are a nonzero page"),
+    /// by construction and no separate assert exists. `k` is a MEASURED POLICY choice, and
+    /// NONZERO BY TYPE: "a pool page spans at least one scheduler block" is `k`'s type, not
+    /// a check.
+    pub const fn of_scheduler_blocks(
+        blocks: SchedulerBlockTokens,
+        k: std::num::NonZeroU32,
+    ) -> Self {
+        match blocks.get().checked_mul(k.get()) {
+            Some(slots) => match std::num::NonZeroU32::new(slots) {
+                Some(v) => Self(v),
+                None => panic!("unreachable: a product of nonzero values is nonzero"),
+            },
+            None => panic!(
+                "a pool page of k blocks of {} tokens overflows u32: \
+                 k whole scheduler blocks must fit a u32 slot count",
+                blocks.get()
+            ),
         }
     }
 
@@ -4875,8 +4886,13 @@ impl PagedKvPool {
     /// a pool page is a WHOLE NUMBER of scheduler blocks, and k=2 is the policy this
     /// const states through [`PoolPageSlots::of_scheduler_blocks`] — the type's ONLY
     /// constructor, so the relation is law, not assert.
-    pub const POOL_PAGE_SLOTS: PoolPageSlots =
-        PoolPageSlots::of_scheduler_blocks(SchedulerBlockTokens::REFERENCE, 2);
+    pub const POOL_PAGE_SLOTS: PoolPageSlots = PoolPageSlots::of_scheduler_blocks(
+        SchedulerBlockTokens::REFERENCE,
+        match std::num::NonZeroU32::new(2) {
+            Some(v) => v,
+            None => panic!("2 is nonzero"),
+        },
+    );
 
     /// ⭐ THE WIDEST PREFILL CHUNK — the baked row count of the prefix-capable prefill bundle, and
     /// therefore the number of slots ONE continuation chunk's cache write actually touches.
