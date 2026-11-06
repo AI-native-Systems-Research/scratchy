@@ -3304,6 +3304,7 @@ dependencies = [
  "scratchy-serving-api",
  "scratchy-spec",
  "scratchy-target-spyre",
+ "scratchy-tp",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3738,6 +3739,13 @@ dependencies = [
  "anyhow",
  "memmap2",
  "typenum",
+]
+
+[[package]]
+name = "scratchy-tp"
+version = "0.1.0"
+dependencies = [
+ "scratchy-models",
 ]
 
 [[package]]
