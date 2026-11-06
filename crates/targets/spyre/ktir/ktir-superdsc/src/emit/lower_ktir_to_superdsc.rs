@@ -9752,11 +9752,11 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
-    use crate::ir::bridge::tiled_op_sdsc_op::{
-        ReduceDivision, ReduceSplit, assemble_reduce_off, assemble_reduce_split,
-        win_reduce_accum, win_reduce_data,
-    };
     use crate::emit::op_func_from_str;
+    use crate::ir::bridge::tiled_op_sdsc_op::{
+        ReduceDivision, ReduceSplit, assemble_reduce_off, assemble_reduce_split, win_reduce_accum,
+        win_reduce_data,
+    };
     let unit = matches!(
         k.program,
         crate::ktir_node::Program::WindowedRmsNorm { unit: true }
@@ -9926,19 +9926,20 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
         //    descriptor unchanged.
         let rmmean_op = format!("rmmean_{prefix}");
         let split = assemble_reduce_split(
-            ReduceSplit {
-                op_name: &rmmean_op,
-                op: op_func_from_str("mean"),
-                rows: t_rows.get(),
-                cols: d,
-                df: crate::superdsc_opspec::Df::Fp16,
-                data: &sq16_h,
-                data_col: h * d,
-                accum: &mean_h,
-                accum_off: crate::addr::DevOff::ZERO,
-                parent: out_id,
-                division: ReduceDivision::Rows,
-            },
+            ReduceSplit::new(
+                &rmmean_op,
+                op_func_from_str("mean"),
+                t_rows.get(),
+                d,
+                &sq16_h,
+                h * d,
+                &mean_h,
+                crate::addr::DevOff::ZERO,
+                out_id,
+                ReduceDivision::Rows,
+                crate::superdsc_opspec::Df::Fp16,
+            )
+            .map_err(|e| Error { message: e })?,
             sym_id_base,
             layout,
         )
