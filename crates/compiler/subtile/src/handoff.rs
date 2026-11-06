@@ -285,6 +285,36 @@ pub enum ArenaValue {
     Source(u32),
 }
 
+/// The extent each arena value is, by its marker's name: a tile output's from its shape, the
+/// embedded hidden's (the one graph source a step names in the arena) likewise. What a target
+/// names a binding of the value by.
+#[derive(Clone, Debug, Default)]
+pub struct ArenaExtents {
+    tiles: std::collections::HashMap<(u32, u8), String>,
+    embedded: Option<String>,
+}
+
+impl ArenaExtents {
+    /// Note `value`'s extent's marker.
+    pub fn insert(&mut self, value: ArenaValue, marker: String) {
+        match value {
+            ArenaValue::Tile { tile, out } => {
+                self.tiles.insert((tile, out), marker);
+            }
+            ArenaValue::Source(_) => self.embedded = Some(marker),
+        }
+    }
+
+    /// `value`'s extent's marker, when it has been noted.
+    pub fn of(&self, value: ArenaValue) -> Option<&str> {
+        match value {
+            ArenaValue::Tile { tile, out } => self.tiles.get(&(tile, out)),
+            ArenaValue::Source(_) => self.embedded.as_ref(),
+        }
+        .map(String::as_str)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LoweredDecode {
     pub input: LoweringInput,

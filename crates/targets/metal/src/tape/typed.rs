@@ -480,19 +480,31 @@ pub trait Arena {
     const BYTES: &'static [u64];
 }
 
-/// A model's arena extents, each a marker ([`ExtentAt`]): `<M, S> E3 = Act<M, D>;` declares `E3`,
-/// the extent `Act<M, D>` at a bucket's rows `M` (its `sk_bucket` `S`).
+/// A model's arena extents, each a marker ([`ExtentAt`]): `<M, S> [E3 = Act<M, D>; …] [E7 = …;
+/// …]` declares `E3`, the extent `Act<M, D>` at a bucket's rows `M` (its `sk_bucket` `S`). The
+/// first list's are extents at any rows; the second's compute over the rows (`Act<Mul<M, K>, D>`),
+/// so each is an extent where its dims' laws hold at the bucket's rows.
 #[macro_export]
 macro_rules! arena_extents {
-    (<$m:ident, $s:ident> $($extent:ident = $at:ty;)*) => {$(
-        pub enum $extent {}
-        impl<$m, $s> $crate::tape::typed::ExtentAt<$m, $s> for $extent
-        where
-            $at: $crate::tape::typed::Extent,
-        {
-            type At = $at;
-        }
-    )*};
+    (<$m:ident, $s:ident> [$($extent:ident = $at:ty;)*] [$($computed:ident = $cat:ty;)*]) => {
+        $(
+            pub enum $extent {}
+            impl<$m: ::scratchy_tensors::typed::Dim, $s> $crate::tape::typed::ExtentAt<$m, $s>
+                for $extent
+            {
+                type At = $at;
+            }
+        )*
+        $(
+            pub enum $computed {}
+            impl<$m, $s> $crate::tape::typed::ExtentAt<$m, $s> for $computed
+            where
+                $cat: $crate::tape::typed::Extent,
+            {
+                type At = $cat;
+            }
+        )*
+    };
 }
 
 /// ⭐ A MODEL'S ARENA COLOURS, EACH FROM ONE LIST, GENERIC OVER A BUCKET'S ROWS:
@@ -509,7 +521,7 @@ macro_rules! arena_extents {
 /// # use scratchy_target_metal::tape::typed::{Act, Arena, slot};
 /// # use scratchy_tensors::typed::typenum::{U0, U1, U8, U2048, U4096, U8192};
 /// scratchy_target_metal::arena_extents! { <M, S>
-///     E0 = Act<M, U2048>; E1 = Act<M, U8192>; E2 = Act<U1, U4096>;
+///     [E0 = Act<M, U2048>; E1 = Act<M, U8192>; E2 = Act<U1, U4096>;] []
 /// }
 /// scratchy_target_metal::arena_colours! { <M, S> K0 = 0 [E0, E1] [E2] K1 = 1 [] [] }
 /// scratchy_target_metal::arena_schemas! { <M, S> S0 [K0, K1] }
@@ -522,7 +534,7 @@ macro_rules! arena_extents {
 /// ```compile_fail,E0277
 /// # use scratchy_target_metal::tape::typed::{Act, slot};
 /// # use scratchy_tensors::typed::typenum::{U0, U8, U2048, U8192};
-/// scratchy_target_metal::arena_extents! { <M, S> E0 = Act<M, U2048>; E1 = Act<M, U8192>; }
+/// scratchy_target_metal::arena_extents! { <M, S> [E0 = Act<M, U2048>; E1 = Act<M, U8192>;] [] }
 /// scratchy_target_metal::arena_colours! { <M, S> K0 = 0 [E0] [] }
 /// let _ = slot::<K0<U8, U0>, E1>();
 /// ```

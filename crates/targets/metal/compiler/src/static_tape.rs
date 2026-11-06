@@ -22,12 +22,12 @@ use scratchy_target_metal::tape::ids::{
 use scratchy_target_metal::tape::lowered::{
     Activation, Binding, CommandTableBuilder, CommandTableParts, GatedCommand, Gemm, GenClass,
     KernelId, KvAddressing, LoweredCommand, LoweredMetalTape, LoweringError, MetalDtype,
-    PackedKind, TapeCommand, TapeCommands, baked, baked_commands,
+    PackedKind, TapeCommand, TapeCommands, baked,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::canonical::StepOperands;
-use crate::steps_from_tape::ArenaValue;
+use scratchy_subtile::handoff::ArenaExtents;
 
 /// ⭐ EVERY DISTINCT COMMAND OF ONE MODEL'S BAKED TAPES, SPELLED ONCE.
 ///
@@ -890,10 +890,6 @@ pub struct WideBand<'a> {
     pub arena: &'a BandArena,
 }
 
-/// An arena value's extent, by its marker in the model's `__arena` (`arena_extents!`): what a
-/// colour hosting it hosts.
-pub type ExtentOf<'a> = dyn Fn(ArenaValue) -> Result<String, String> + Sync + 'a;
-
 /// One bucket's lowering input: its step tape and the model's KV cap ladder.
 pub struct BucketLowerInput<'a> {
     pub steps: &'a MetalStepTape,
@@ -910,8 +906,8 @@ pub struct BucketLowerInput<'a> {
     /// `steps`' rows' arena operands, and its arena.
     pub operands: &'a StepOperands,
     pub arena: &'a BandArena,
-    /// Each arena value's extent ([`ExtentOf`]).
-    pub extent: &'a ExtentOf<'a>,
+    /// Each arena value's extent, by its marker in the model's `__arena` (`arena_extents!`).
+    pub extents: &'a ArenaExtents,
 }
 
 /// ⭐ THE KV CAP LADDER: the block-table capacities (blocks per sequence) a model's tapes bake,
@@ -997,7 +993,7 @@ fn run_lower(
     tl::lower_with_rows(rung.steps, mc, at)
 }
 
-/// `tape` with each arena operand of its commands named by its model-wide operand
+/// `tape`'s commands with each arena operand named by its model-wide operand
 /// ([`ArenaOperands`]): the slot it binds, held as the extents the rows the command was lowered
 /// from (`rows`) hold there, in `band`'s colouring. A command binding a slot none of its rows
 /// names refuses the bake.
@@ -1005,17 +1001,22 @@ fn name_operands(
     tape: &LoweredMetalTape,
     rows: &[tl::CommandRows],
     band: (&StepOperands, &BandArena),
-    extent: &ExtentOf<'_>,
+    extents: &ArenaExtents,
     operands: &mut ArenaOperands,
-) -> Result<LoweredMetalTape, BakeDefect> {
+) -> Result<Vec<GatedCommand>, BakeDefect> {
     let (step_operands, arena) = band;
-    let commands = (tape.commands.iter().zip(rows).enumerate())
+    (tape.commands.iter().zip(rows).enumerate())
         .map(|(c, (cmd, rows))| {
             let mut named = |slot: u32| -> Result<u32, BakeDefect> {
                 let held = (rows.rows.iter())
                     .flat_map(|&r| step_operands.row(rows.half, r))
                     .filter(|o| o.slot.get() == slot)
-                    .map(|o| extent(o.value).map_err(BakeDefect))
+                    .map(|o| {
+                        let marker = extents.of(o.value).ok_or_else(|| {
+                            BakeDefect(format!("arena value {:?} is hosted by no colour", o.value))
+                        })?;
+                        Ok(marker.to_string())
+                    })
                     .collect::<Result<BTreeSet<_>, BakeDefect>>()?;
                 if held.is_empty() {
                     return Err(BakeDefect(format!(
@@ -1057,14 +1058,7 @@ fn name_operands(
             };
             Ok(GatedCommand { command, ..cmd })
         })
-        .collect::<Result<Vec<_>, BakeDefect>>()?;
-    let commands = baked_commands(commands).map_err(|e| {
-        BakeDefect(format!(
-            "more than {} distinct commands: a command index cannot address them",
-            e.distinct - 1
-        ))
-    })?;
-    Ok(LoweredMetalTape { commands, ..*tape })
+        .collect()
 }
 
 /// Bake every `(gen class × KV addressing × KV cap × TurboQuant decode heads)` variant of one
@@ -1109,7 +1103,8 @@ pub fn bake_bucket_tapes(
     //
     // Keyed on the LOWERED VALUES, not on their rendered token text: the tape is megabytes of
     // tokens, so hashing the values beats stringifying every body.
-    let mut seen: std::collections::HashMap<LoweredMetalTape, usize> = Default::default();
+    // Keyed by the band too: a body's arena operands are named under its band's colouring.
+    let mut seen: std::collections::HashMap<(bool, LoweredMetalTape), usize> = Default::default();
     let uniq = format!("M{}", input.bucket_m);
     let tok = |what: &str, r: Result<TokenStream, crate::const_tokens::Error>| {
         r.map_err(|e| BakeDefect(format!("serialize {what}: {e}")))
@@ -1156,24 +1151,25 @@ pub fn bake_bucket_tapes(
             ended = Some((class, addressing));
             continue;
         };
-        // Its commands as the table holds them: each arena operand named by its typed operand,
-        // under the colouring of the band the rung lowered under.
-        let band = match (class, input.wide_band.as_ref()) {
-            (GenClass::M5Wide, Some(wide)) => (wide.operands, wide.arena),
-            _ => (input.operands, input.arena),
+        // The band the rung lowered under, whose colouring its arena operands are named in.
+        let (wide, band) = match (class, input.wide_band.as_ref()) {
+            (GenClass::M5Wide, Some(wide)) => (true, (wide.operands, wide.arena)),
+            _ => (false, (input.operands, input.arena)),
         };
-        let named = name_operands(&tape, &rows, band, input.extent, &mut pool.operands)?;
         // The cap-sized scratch is the variant's; the rest of the tape is the body.
         let (roped_k, attn_unfused) = (tape.roped_k_scratch_bytes, tape.attn_unfused_scratch_bytes);
         let body = LoweredMetalTape {
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
-            ..named
+            ..tape
         };
-        let body_ix = match seen.get(&body).copied() {
+        let body_ix = match seen.get(&(wide, body)).copied() {
             Some(ix) => ix,
             None => {
-                let cmd_refs = (body.commands.iter())
+                // Its commands as the table holds them: each arena operand named by its typed
+                // operand.
+                let named = name_operands(&body, &rows, band, input.extents, &mut pool.operands)?;
+                let cmd_refs = (named.into_iter())
                     .map(|c| pool.intern(c))
                     .collect::<Result<Vec<_>, _>>()?;
                 let rest = LoweredMetalTape {
@@ -1194,7 +1190,7 @@ pub fn bake_bucket_tapes(
                         ..#rest_toks
                     };
                 });
-                seen.insert(body, ix);
+                seen.insert((wide, body), ix);
                 ix
             }
         };

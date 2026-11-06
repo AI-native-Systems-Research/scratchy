@@ -4762,7 +4762,11 @@ fn dim_tokens(
 struct ArenaTypes {
     /// Each extent's marker, by its spelling.
     extents: BTreeMap<String, String>,
+    /// Each arena value's extent's marker: what the bake names a binding of it by.
+    values: scratchy_subtile::handoff::ArenaExtents,
     extent_defs: Vec<TokenStream>,
+    /// The extents that compute over a bucket's rows ([`computes_over_rows`]).
+    computed_defs: Vec<TokenStream>,
     colours: BTreeMap<String, String>,
     colour_defs: Vec<TokenStream>,
     arenas: BTreeMap<Vec<String>, String>,
@@ -4771,15 +4775,25 @@ struct ArenaTypes {
 
 impl ArenaTypes {
     /// The marker of extent `at` (spelled at the rows' parameters).
-    fn extent(&mut self, at: &TokenStream) -> Ident {
+    /// `computed`: whether it computes over the rows ([`computes_over_rows`]).
+    fn extent(&mut self, (at, computed): &(TokenStream, bool)) -> Ident {
         let n = self.extents.len();
-        let defs = &mut self.extent_defs;
+        let defs = match computed {
+            true => &mut self.computed_defs,
+            false => &mut self.extent_defs,
+        };
         let name = (self.extents.entry(at.to_string())).or_insert_with(|| {
             let name = format_ident!("E{n}");
             defs.push(quote!(#name = #at;));
             name.to_string()
         });
         format_ident!("{name}")
+    }
+
+    /// Note arena value `value`'s extent, `at`: its marker is the one a binding of it names.
+    fn value(&mut self, value: scratchy_subtile::handoff::ArenaValue, at: &(TokenStream, bool)) {
+        let marker = self.extent(at).to_string();
+        self.values.insert(value, marker);
     }
 
     /// The colour type of slot `slot` hosting the extents `sized` (counted in its bytes) and
@@ -4811,25 +4825,37 @@ impl ArenaTypes {
 
     /// The declarations, in the model's `__arena`.
     fn tokens(&self) -> TokenStream {
-        let (extents, colours, arenas) = (&self.extent_defs, &self.colour_defs, &self.arena_defs);
+        let (extents, computed) = (&self.extent_defs, &self.computed_defs);
+        let (colours, arenas) = (&self.colour_defs, &self.arena_defs);
         quote! {
-            ::scratchy_target_metal::arena_extents! { <M, S> #(#extents)* }
+            ::scratchy_target_metal::arena_extents! { <M, S> [#(#extents)*] [#(#computed)*] }
             ::scratchy_target_metal::arena_colours! { <M, S> #(#colours)* }
             ::scratchy_target_metal::arena_schemas! { <M, S> #(#arenas)* }
         }
     }
 }
 
-/// The marker of the extent arena value `value` of `fuf` is, among `extents` (an [`ArenaTypes`]'
-/// markers by spelling): what its colour hosts.
-fn arena_value_extent(
-    fuf: &crate::fuf::Fuf,
-    extents: &BTreeMap<String, String>,
-    value: scratchy_subtile::handoff::ArenaValue,
-) -> Result<String, String> {
-    let at = arena_extent(arena_value_shape(fuf, value)?, &quote!(M), &quote!(S))?;
-    (extents.get(&at.to_string()).cloned())
-        .ok_or_else(|| format!("arena value {value:?} ({at}) is hosted by no colour"))
+/// Whether an extent of `shape` computes over a bucket's rows: names `num_tokens` or `sk_bucket`
+/// anywhere but as its rows themselves (`Act<M, D>`), so it is an extent only where its dims' laws
+/// hold at the bucket's rows.
+fn computes_over_rows(shape: &[crate::dim::Dim]) -> bool {
+    use crate::dim::Dim;
+    fn names_rows(dim: &Dim) -> bool {
+        match dim {
+            Dim::Bound(name) => name == "num_tokens" || name == "sk_bucket",
+            Dim::Lit(_) => false,
+            Dim::Mul(parts) | Dim::Add(parts) => parts.iter().any(names_rows),
+            Dim::Div(n, d) | Dim::FloorDiv(n, d) => names_rows(n) || names_rows(d),
+        }
+    }
+    match shape {
+        [] => false,
+        [d] => names_rows(d),
+        [rows, rest @ ..] => {
+            let plain_rows = matches!(rows, Dim::Bound(name) if name == "num_tokens");
+            (!plain_rows && names_rows(rows)) || rest.iter().any(names_rows)
+        }
+    }
 }
 
 /// A tile output of `shape` as the arena extent a colour hosts, `Act<rows, columns>`: its first
@@ -15391,27 +15417,34 @@ pub fn emit_model(
             // those its `Colour::BYTES` is the largest of, and those another size covers — the
             // logits rows (`logits_row_bytes`), the tiles a bucket that plays no result never
             // commits, the embedded hidden colour 0 is (`arena_colours!`).
-            let no_slots = || vec![BTreeMap::<String, TokenStream>::new(); num_slots as usize];
+            let no_slots =
+                || vec![BTreeMap::<String, (TokenStream, bool)>::new(); num_slots as usize];
             let (mut sized, mut unsized_) = (no_slots(), no_slots());
             let extent = |shape: &crate::dim::Shape| {
-                arena_extent(shape, &quote!(M), &quote!(S))
-                    .unwrap_or_else(|e| panic!("[metal arena] {}: m={m}: {e}", model.source_stem))
+                let at = arena_extent(shape, &quote!(M), &quote!(S))
+                    .unwrap_or_else(|e| panic!("[metal arena] {}: m={m}: {e}", model.source_stem));
+                (at, computes_over_rows(shape))
             };
             for ((tile_id, out_slot), color) in slots.iter() {
                 let node = fuf.get(tile_id);
                 let shape = &node.outputs[out_slot as usize];
                 let e = extent(shape);
+                let value = scratchy_subtile::handoff::ArenaValue::Tile {
+                    tile: tile_id.0,
+                    out: out_slot,
+                };
+                metal_arena_types.value(value, &e);
                 if !plays_result && !commit_tiles.contains(&tile_id) {
-                    unsized_[color as usize].insert(e.to_string(), e);
+                    unsized_[color as usize].insert(e.0.to_string(), e);
                 } else if logits_tiles.contains(&(tile_id, out_slot)) {
                     // f16 = 2 bytes/element; metal kernels are f16-only.
                     let dims = crate::weight_vocab::eval_shape_with(shape, &bp_bounds)
                         .expect("a tile output names a bound the model lacks — codegen invariant");
                     let row: u64 = dims.iter().skip(1).product();
                     logits_row_bytes = logits_row_bytes.max(row.saturating_mul(2));
-                    unsized_[color as usize].insert(e.to_string(), e);
+                    unsized_[color as usize].insert(e.0.to_string(), e);
                 } else {
-                    sized[color as usize].insert(e.to_string(), e);
+                    sized[color as usize].insert(e.0.to_string(), e);
                 }
             }
             let embedded = scratchy_subtile::handoff::ArenaValue::Source(0);
@@ -15419,7 +15452,8 @@ pub fn emit_model(
                 (arena_value_shape(fuf, embedded), unsized_.first_mut())
             {
                 let e = extent(shape);
-                zero.insert(e.to_string(), e);
+                metal_arena_types.value(embedded, &e);
+                zero.insert(e.0.to_string(), e);
             }
             for (sized, unsized_) in sized.iter().zip(&mut unsized_) {
                 unsized_.retain(|e, _| !sized.contains_key(e));
@@ -15428,9 +15462,10 @@ pub fn emit_model(
             // The bucket's arena: each slot's colour type, and the arena of them.
             let colours: Vec<Ident> = (sized.iter().zip(&unsized_).enumerate())
                 .map(|(slot, (sized, unsized_))| {
-                    let mut markers = |extents: &BTreeMap<String, TokenStream>| -> Vec<Ident> {
+                    let mut markers = |extents: &BTreeMap<String, (TokenStream, bool)>| {
                         let at = extents.values();
-                        at.map(|at| metal_arena_types.extent(at)).collect()
+                        at.map(|at| metal_arena_types.extent(at))
+                            .collect::<Vec<_>>()
                     };
                     let (sized, unsized_) = (markers(sized), markers(unsized_));
                     metal_arena_types.colour(slot as u32, &sized, &unsized_)
@@ -15514,7 +15549,7 @@ pub fn emit_model(
                         operands: &classed.narrow.operands,
                         arena: &narrow_arena,
                         // What each value its steps name is, as its colour hosts it.
-                        extent: &|v| arena_value_extent(fuf, &metal_arena_types.extents, v),
+                        extents: &metal_arena_types.values,
                     };
                     scratchy_target_metal_compiler::static_tape::bake_bucket_tapes(
                         mc,
