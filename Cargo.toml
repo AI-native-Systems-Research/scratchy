@@ -4,6 +4,7 @@ default-members = ["crates/cli/scr"]
 members = [
     "crates/core/common",
     "crates/core/config",
+    "crates/core/tp-world",
     "crates/serving/scheduler",
     "crates/serving/engine",
     "crates/serving/api",

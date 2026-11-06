@@ -938,13 +938,10 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | SubOp::RouteGatherScores
             | SubOp::RouteRenorm
             | SubOp::ExpertUnsort => {}
-            // The world is class: two worlds are two exchanges.
-            SubOp::AllReduce { world } => world.get().hash(h),
-            // The whole width a gather restores is class too: two widths are two exchanges.
-            SubOp::AllGather { cols, world } => {
-                cols.hash(h);
-                world.get().hash(h);
-            }
+            // The world is the forward's type, not the op's: one forward, one world.
+            SubOp::AllReduce => {}
+            // The whole width a gather restores is class: two widths are two exchanges.
+            SubOp::AllGather { cols } => cols.hash(h),
             // The vocab and the row count are class: two vocab widths are
             // different programs (every staged table and the whole row's tile
             // shape key off it), and so are two batch widths (the grid and
@@ -1501,19 +1498,14 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     // one. Their operand is a value in rank-local shape; every rank runs the same op.
     /// The sum over every rank of a PARTIAL value: `out = Σ_r x_r`, summed in ABSOLUTE RANK
     /// ORDER (`((x_0 + x_1) + x_2) + …`) on every rank, so the replicated result is
-    /// bit-identical across ranks. `inputs` = `[x]`; output the shape of `x`. `world` is how many
-    /// ranks contribute — the analysis's world, stated on the op so a target lowers it without
-    /// a second source for the number.
-    AllReduce {
-        world: crate::tensor_parallel::WorldSize,
-    },
+    /// bit-identical across ranks. `inputs` = `[x]`; output the shape of `x`. Every rank of the
+    /// forward's world contributes — the world is the forward's TYPE (`tensor_parallel::World`),
+    /// never a number the op carries.
+    AllReduce,
     /// The concatenation over every rank of a column-SPLIT value: rank `r`'s `[rows, cols / W]`
     /// block lands at columns `[r · cols / W, (r + 1) · cols / W)`. `inputs` = `[x]`; `cols` is the
-    /// WHOLE width the gather restores; `world` is `W`.
-    AllGather {
-        cols: u32,
-        world: crate::tensor_parallel::WorldSize,
-    },
+    /// WHOLE width the gather restores. `W` is the forward's world type.
+    AllGather { cols: u32 },
 
     // ── A MoE block, op by op (see `NumExperts`) ──────────────────
     /// The router's own pre-norm: `rmsnorm(x, router.scale)`. `inputs` = `[x, router]`.
@@ -4442,8 +4434,8 @@ pub fn lower_region(
             SubOp::GatedDeltaNet => SubOp::GatedDeltaNet,
             SubOp::Mamba2 { inner } => SubOp::Mamba2 { inner },
             SubOp::Mean => SubOp::Mean,
-            SubOp::AllReduce { world } => SubOp::AllReduce { world },
-            SubOp::AllGather { cols, world } => SubOp::AllGather { cols, world },
+            SubOp::AllReduce => SubOp::AllReduce,
+            SubOp::AllGather { cols } => SubOp::AllGather { cols },
             SubOp::RouterNorm { eps, router } => SubOp::RouterNorm { eps, router },
             SubOp::RouterLogits { experts, router } => SubOp::RouterLogits { experts, router },
             SubOp::RouteSoftmax => SubOp::RouteSoftmax,

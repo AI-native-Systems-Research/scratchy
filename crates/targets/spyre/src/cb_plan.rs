@@ -399,7 +399,7 @@ pub(crate) fn site_cbs(tp: SiteTp, launch: BatchedCompute) -> Result<Vec<Batched
                         dest_tid: base_addr_entry(to),
                         bytes: m.bytes,
                         source: end(l, send.source_segment, m.source_offset)?,
-                        window: end(l, RecvWindow::SEGMENT as u8, m.window_offset)?,
+                        window: end(l, WINDOW_SEGMENT as u8, m.window_offset)?,
                         place: RunPlace {
                             first: m.first,
                             last: m.last,

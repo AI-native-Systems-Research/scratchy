@@ -1,0 +1,15 @@
+[package]
+name = "scratchy-tp-world"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The tensor-parallel world as a type: `TpWorld<N>` and its ranks. No dependencies, no features."
+
+[lib]
+
+# ⛔ A LEAF WITH NO DEPENDENCIES AND NO FEATURES. The shared sharding analysis (`scratchy-subtile`,
+# every target) and the spyre collective protocol (`ktir-superdsc`, which has no scratchy
+# dependency) both name the world, so it lives below both: one type, never a number handed between
+# them. A target's own limits on a world (the card's sids) are that target's, stated as a trait
+# over this one in its own crate.
+[dependencies]

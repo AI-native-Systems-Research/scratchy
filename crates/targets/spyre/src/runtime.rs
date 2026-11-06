@@ -1444,7 +1444,7 @@ pub fn link_peers(cards: &[Arc<CardRuntime>], window: RecvWindow) -> Result<(), 
         {
             let va = flex_rs::control_block_wire::Flits(
                 flex_rs::control_block_wire::VirtualAddressSbf::new(
-                    RecvWindow::SEGMENT as u8,
+                    WINDOW_SEGMENT as u8,
                     flex_rs::control_block_wire::Flits::from_bytes(at),
                 )
                 .value(),

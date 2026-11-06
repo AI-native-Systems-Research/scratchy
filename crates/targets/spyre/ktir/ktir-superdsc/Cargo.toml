@@ -48,6 +48,10 @@ half = { workspace = true }
 # (and CI's `--workspace` linux-cuda job, which builds every member as a root) on a Mac-only
 # dependency. The lowering needs the IR types, never a device.
 ktir-core = { path = "../ktir-core" }
+# ⭐ THE WORLD TYPE. The collective protocol is generic over the build's one tensor-parallel world;
+# the type lives in a dependency-free leaf the shared sharding analysis names too, so both state the
+# same world. No scratchy dependency of its own, so this crate stays a leaf.
+scratchy-tp-world = { path = "../../../../core/tp-world" }
 
 # ⛔⛔⛔ THE KANI HARNESSES IN `sdsc_abstract.rs` CAME WITH IT, AND THEY NEED THIS DECLARATION.
 # They compile only under the model checker, so `cfg(kani)` is a real name a normal build never

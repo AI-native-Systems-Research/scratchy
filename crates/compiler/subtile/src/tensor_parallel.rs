@@ -45,54 +45,10 @@ use std::num::NonZeroU32;
 use crate::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use crate::subtile_ir::{RopeForm, RowScale, SourceShape, SubOp, SubtileIR, TensorShape};
 
-/// The most ranks a group can name: the width of the rank bitmask the card runtime tracks a
-/// group's members in (`flex_rs::multi_device::BitmaskHelper`, 64 bits).
-pub const MAX_RANKS: u32 = 64;
-
-/// The number of ranks in a tensor-parallel group.
-///
-/// ⛔ MINTED FROM A CONST GENERIC, NEVER A RUNTIME INTEGER. A world size is a property of the
-/// compiled forward (the shapes the bake lowered are `1/W` of the model's), so it is a type, and
-/// a group too big for the runtime's rank mask is a build failure rather than a launch failure.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct WorldSize(NonZeroU32);
-
-impl WorldSize {
-    /// The world of `W` ranks. `W = 0` and `W > MAX_RANKS` do not compile.
-    pub const fn of<const W: u32>() -> Self {
-        const {
-            assert!(W >= 1, "a tensor-parallel world has at least one rank");
-            assert!(
-                W <= MAX_RANKS,
-                "a world wider than the runtime's 64-bit rank mask"
-            );
-        }
-        match NonZeroU32::new(W) {
-            Some(w) => Self(w),
-            None => unreachable!(),
-        }
-    }
-
-    pub const fn get(self) -> u32 {
-        self.0.get()
-    }
-
-    /// Every rank of this world, in absolute order.
-    pub fn ranks(self) -> impl Iterator<Item = RankIndex> {
-        (0..self.get()).map(RankIndex)
-    }
-}
-
-/// A rank of some [`WorldSize`] — minted only by [`WorldSize::ranks`], so it is in range by
-/// construction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RankIndex(u32);
-
-impl RankIndex {
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
+/// ⭐ THE WORLD IS A TYPE — the one `tp/N` the build names ([`TpWorld<N>`]). Every function here
+/// that a world shapes is generic over it: [`shard`]'s per-rank forward, [`slice_source`]'s slice
+/// law, [`eval_ranks`]' lockstep reference. Nothing stores a world size, and no op carries one.
+pub use scratchy_tp_world::{Rank, TpWorld, World, ranks};
 
 /// The smallest column block a target can split a tensor at — a TARGET FACT the shared pass takes
 /// as input (spyre: one 64-element stick; a target with no layout granule: 1). A split whose
@@ -178,8 +134,8 @@ impl SourceShard {
     }
 
     /// The source's per-rank shape.
-    pub fn local_shape(self, s: SourceShape, w: WorldSize) -> SourceShape {
-        let w = w.get();
+    pub fn local_shape<T: World>(self, s: SourceShape) -> SourceShape {
+        let w = T::RANKS;
         match self {
             Self::Whole => s,
             Self::Rows | Self::HeadRows { .. } => SourceShape {
@@ -225,8 +181,7 @@ pub enum ShardRefusal {
 
 /// The forward every rank runs, and how each rank loads its sources.
 #[derive(Clone, Debug)]
-pub struct ShardedForward {
-    pub world: WorldSize,
+pub struct ShardedForward<T: World> {
     /// The rank-local forward. Identical on every rank.
     pub local: LoweringInput,
     /// Per source of the input forward (same indices): its slice law.
@@ -237,13 +192,14 @@ pub struct ShardedForward {
     pub collectives: Vec<CollectiveSite>,
     /// Per op of the input forward: the placement its local op produces.
     pub placements: Vec<Placement>,
+    /// The world every rank of which runs [`Self::local`].
+    pub world: core::marker::PhantomData<T>,
 }
 
 /// The analysis's working state. Everything it decides is written exactly once.
 struct Weave<'a> {
     input: &'a LoweringInput,
     w: u32,
-    world: WorldSize,
     granule: u32,
     /// Global `(rows, cols)` of every input op's output.
     shape: Vec<(u32, u32)>,
@@ -315,15 +271,11 @@ impl Weave<'_> {
         };
         let (kind, op) = match self.place[j] {
             Placement::Whole => return Ok(InputRef::Op(self.op_map[j])),
-            Placement::Partial => (
-                CollectiveKind::AllReduce,
-                SubOp::AllReduce { world: self.world },
-            ),
+            Placement::Partial => (CollectiveKind::AllReduce, SubOp::AllReduce),
             Placement::Split(Axis::Cols) => (
                 CollectiveKind::AllGather,
                 SubOp::AllGather {
                     cols: self.shape[j].1,
-                    world: self.world,
                 },
             ),
             Placement::Split(Axis::HeadRows { .. }) => {
@@ -632,97 +584,96 @@ impl Weave<'_> {
                 })
                 .collect()
         };
-        let (split, hd, op, sinks): (Vec<usize>, u32, _, Option<(usize, SourceShard)>) = match desc
-            .op
-        {
-            SubOp::RopeRotate { head_dim, .. } => {
-                let mut split = vec![0];
-                split.extend(tables_as_wide(self));
-                (split, head_dim.get(), desc.op, None)
-            }
-            // `[K, cos, sin, V, K_cache, V_cache]` (a legacy fixture may stop at V). The op carries
-            // the model's attention facts, so the rank-local op carries the rank's share of them.
-            SubOp::RopeAppend {
-                attention,
-                rope,
-                layer,
-                attn,
-                pairing,
-                layout,
-                _form,
-            } => {
-                let Some(local) = attention.rank_local(self.w) else {
-                    return self.replicate(i);
-                };
-                let mut split: Vec<usize> = [0, 3, 4, 5]
-                    .into_iter()
-                    .filter(|k| *k < desc.inputs.len())
-                    .collect();
-                split.extend(tables_as_wide(self));
-                let op = SubOp::RopeAppend {
-                    attention: local,
+        let (split, hd, op, sinks): (Vec<usize>, u32, _, Option<(usize, SourceShard)>) =
+            match desc.op {
+                SubOp::RopeRotate { head_dim, .. } => {
+                    let mut split = vec![0];
+                    split.extend(tables_as_wide(self));
+                    (split, head_dim.get(), desc.op, None)
+                }
+                // `[K, cos, sin, V, K_cache, V_cache]` (a legacy fixture may stop at V). The op carries
+                // the model's attention facts, so the rank-local op carries the rank's share of them.
+                SubOp::RopeAppend {
+                    attention,
                     rope,
                     layer,
                     attn,
                     pairing,
                     layout,
                     _form,
-                };
-                (split, rope.head_dim(attention).get(), op, None)
-            }
-            // `[K, V, K_cache, V_cache]`.
-            SubOp::KvAppend {
-                attention,
-                head_dim,
-                layer,
-                attn,
-                layout,
-            } => {
-                let Some(local) = attention.rank_local(self.w) else {
-                    return self.replicate(i);
-                };
-                let op = SubOp::KvAppend {
-                    attention: local,
+                } => {
+                    let Some(local) = attention.rank_local(self.w) else {
+                        return self.replicate(i);
+                    };
+                    let mut split: Vec<usize> = [0, 3, 4, 5]
+                        .into_iter()
+                        .filter(|k| *k < desc.inputs.len())
+                        .collect();
+                    split.extend(tables_as_wide(self));
+                    let op = SubOp::RopeAppend {
+                        attention: local,
+                        rope,
+                        layer,
+                        attn,
+                        pairing,
+                        layout,
+                        _form,
+                    };
+                    (split, rope.head_dim(attention).get(), op, None)
+                }
+                // `[K, V, K_cache, V_cache]`.
+                SubOp::KvAppend {
+                    attention,
                     head_dim,
                     layer,
                     attn,
                     layout,
-                };
-                (vec![0, 1, 2, 3], head_dim.get(), op, None)
-            }
-            SubOp::AttnDecode {
-                attention,
-                valid_len,
-                mask,
-                ..
-            } => {
-                let geom = attention.class(mask.class());
-                let nq = geom.q_heads().get();
-                let Some(local) = attention.rank_local(self.w) else {
-                    return self.replicate(i);
-                };
-                // `[q, (k, v)…]`, or `[q, pk, pv, nk, nv, sinks]`.
-                let n = desc.inputs.len();
-                let sinks = if n == 6 {
-                    let InputRef::Ext(se) = desc.inputs[5] else {
+                } => {
+                    let Some(local) = attention.rank_local(self.w) else {
                         return self.replicate(i);
                     };
-                    let (sr, sc) = self.src_shape(se);
-                    let shard = match (sr == nq, sc == nq) {
-                        (_, true) => SourceShard::Cols,
-                        (true, false) => SourceShard::Rows,
-                        (false, false) => return self.replicate(i),
+                    let op = SubOp::KvAppend {
+                        attention: local,
+                        head_dim,
+                        layer,
+                        attn,
+                        layout,
                     };
-                    Some((se, shard))
-                } else {
-                    None
-                };
-                let segs = if sinks.is_some() { 5 } else { n };
-                let op = SubOp::attn_decode(local, valid_len, mask);
-                ((0..segs).collect(), geom.head_dim().get(), op, sinks)
-            }
-            _ => return self.replicate(i),
-        };
+                    (vec![0, 1, 2, 3], head_dim.get(), op, None)
+                }
+                SubOp::AttnDecode {
+                    attention,
+                    valid_len,
+                    mask,
+                    ..
+                } => {
+                    let geom = attention.class(mask.class());
+                    let nq = geom.q_heads().get();
+                    let Some(local) = attention.rank_local(self.w) else {
+                        return self.replicate(i);
+                    };
+                    // `[q, (k, v)…]`, or `[q, pk, pv, nk, nv, sinks]`.
+                    let n = desc.inputs.len();
+                    let sinks = if n == 6 {
+                        let InputRef::Ext(se) = desc.inputs[5] else {
+                            return self.replicate(i);
+                        };
+                        let (sr, sc) = self.src_shape(se);
+                        let shard = match (sr == nq, sc == nq) {
+                            (_, true) => SourceShard::Cols,
+                            (true, false) => SourceShard::Rows,
+                            (false, false) => return self.replicate(i),
+                        };
+                        Some((se, shard))
+                    } else {
+                        None
+                    };
+                    let segs = if sinks.is_some() { 5 } else { n };
+                    let op = SubOp::attn_decode(local, valid_len, mask);
+                    ((0..segs).collect(), geom.head_dim().get(), op, sinks)
+                }
+                _ => return self.replicate(i),
+            };
         let head_split = |me: &Self, r: InputRef| -> bool {
             match r {
                 InputRef::Op(j) => {
@@ -823,19 +774,18 @@ pub fn op_shapes(input: &LoweringInput) -> Vec<(u32, u32)> {
     shape
 }
 
-/// Weave tensor parallelism into `input`: the forward every rank of `world` runs, each source's
+/// Weave tensor parallelism into `input`: the forward every rank of world `T` runs, each source's
 /// slice law, and every collective the dataflow demands. See the module docs.
-pub fn shard(
+pub fn shard<T: World>(
     input: &LoweringInput,
-    world: WorldSize,
     granule: SplitGranule,
-) -> Result<ShardedForward, ShardRefusal> {
+) -> Result<ShardedForward<T>, ShardRefusal> {
+    let () = T::NONEMPTY;
     let n = input.ops.len();
     let shape = op_shapes(input);
     let mut wv = Weave {
         input,
-        w: world.get(),
-        world,
+        w: T::RANKS,
         granule: granule.get(),
         shape,
         place: Vec::with_capacity(n),
@@ -846,7 +796,7 @@ pub fn shard(
         collectives: Vec::new(),
     };
     for i in 0..n {
-        let d = if wv.w == 1 {
+        let d = if !T::SHARDED {
             // ⭐ THE IDENTITY AT W = 1, by construction rather than by every rule happening to
             // agree: a one-rank world has nothing to split and nothing to collect.
             if input.ops[i].op.tp_rule() == TpRule::Collective {
@@ -898,10 +848,9 @@ pub fn shard(
         .sources
         .iter()
         .zip(&sources)
-        .map(|(s, sh)| sh.local_shape(*s, world))
+        .map(|(s, sh)| sh.local_shape::<T>(*s))
         .collect();
     Ok(ShardedForward {
-        world: wv.world,
         local: LoweringInput {
             sources: local_sources,
             ops: wv.ops,
@@ -912,6 +861,7 @@ pub fn shard(
         op_map: wv.op_map,
         collectives: wv.collectives,
         placements: wv.place,
+        world: core::marker::PhantomData,
     })
 }
 
@@ -921,12 +871,11 @@ pub fn shard(
 ///
 /// Sources keep their indices (only their per-rank shapes change), so the source bindings carry over
 /// unchanged; how each one is sliced is [`ShardedForward::sources`].
-pub fn shard_lowered(
+pub fn shard_lowered<T: World>(
     lowered: &crate::handoff::LoweredDecode,
-    world: WorldSize,
     granule: SplitGranule,
-) -> Result<(crate::handoff::LoweredDecode, ShardedForward), ShardRefusal> {
-    let sharded = shard(&lowered.input, world, granule)?;
+) -> Result<(crate::handoff::LoweredDecode, ShardedForward<T>), ShardRefusal> {
+    let sharded = shard::<T>(&lowered.input, granule)?;
     let n_local = sharded.local.ops.len();
     let at = |i: usize| sharded.op_map[i];
     let mut op_tiles = vec![None; n_local];
@@ -961,15 +910,14 @@ pub fn shard_lowered(
 
 /// THE SLICE LAW: rank `rank`'s share of a source of `shape` under `shard`. One function, read
 /// by the loader that stages a rank's weights and by [`eval_ranks`]' reference alike.
-pub fn slice_source<T: Copy>(
-    full: &[T],
+pub fn slice_source<E: Copy, T: World>(
+    full: &[E],
     shape: SourceShape,
     shard: SourceShard,
-    rank: RankIndex,
-    world: WorldSize,
-) -> Vec<T> {
+    rank: Rank<T>,
+) -> Vec<E> {
     let (rows, cols) = (shape.rows as usize, shape.cols as usize);
-    let (w, r) = (world.get() as usize, rank.get() as usize);
+    let (w, r) = (T::RANKS as usize, rank.get() as usize);
     debug_assert_eq!(full.len(), rows * cols, "source buffer vs its shape");
     match shard {
         SourceShard::Whole => full.to_vec(),
@@ -1046,23 +994,21 @@ pub fn eval_collective<F: RopeForm>(
 }
 
 /// Evaluate a sharded forward's local graph on every rank IN LOCKSTEP — the host reference for
-/// what the collectives mean. `sources[r]` is rank `r`'s source buffers (already sliced). Every
+/// what the collectives mean. `sources(r)` is rank `r`'s source buffers (already sliced). Every
 /// non-collective node runs per rank through [`crate::subtile_ir::eval_node`]; an
 /// [`SubOp::AllReduce`] sums its operand over ranks in ABSOLUTE RANK ORDER and an
 /// [`SubOp::AllGather`] concatenates column blocks in rank order, and both write the same bytes
-/// to every rank. Returns every rank's buffers.
-pub fn eval_ranks<F: RopeForm>(
+/// to every rank. Returns every rank's buffers, `[rank]`.
+pub fn eval_ranks<F: RopeForm, T: World>(
     graph: &SubtileIR<F>,
-    world: WorldSize,
     scale_site: crate::subtile_ir::AttnScaleSite,
-    sources: &[Vec<Vec<f32>>],
+    sources: impl Fn(Rank<T>) -> Vec<Vec<f32>>,
 ) -> Vec<Vec<Vec<f32>>> {
     use crate::subtile_ir::{eval_node, scatter};
-    let w = world.get() as usize;
-    assert_eq!(sources.len(), w, "one source set per rank");
-    let mut bufs: Vec<Vec<Vec<f32>>> = sources
-        .iter()
-        .map(|srcs| {
+    let w = T::RANKS as usize;
+    let mut bufs: Vec<Vec<Vec<f32>>> = ranks::<T>()
+        .map(|r| {
+            let srcs = sources(r);
             let mut b: Vec<Vec<f32>> = graph
                 .tensors
                 .iter()
@@ -1121,7 +1067,7 @@ mod tests {
             .collect()
     }
 
-    fn kinds(sf: &ShardedForward) -> Vec<CollectiveKind> {
+    fn kinds<T: World>(sf: &ShardedForward<T>) -> Vec<CollectiveKind> {
         sf.collectives.iter().map(|c| c.kind).collect()
     }
 
@@ -1130,7 +1076,7 @@ mod tests {
     #[test]
     fn one_rank_is_the_identity() {
         let input = one_layer_input();
-        let sf = shard(&input, WorldSize::of::<1>(), SplitGranule::of::<64>()).unwrap();
+        let sf = shard::<TpWorld<1>>(&input, SplitGranule::of::<64>()).unwrap();
         assert!(sf.collectives.is_empty());
         assert!(sf.sources.iter().all(|s| *s == SourceShard::Whole));
         assert_eq!(sf.local.ops.len(), input.ops.len());
@@ -1144,7 +1090,7 @@ mod tests {
     #[test]
     fn a_decode_layer_shards_as_megatron_from_the_dataflow_alone() {
         let input = one_layer_input();
-        let sf = shard(&input, WorldSize::of::<4>(), SplitGranule::of::<64>()).unwrap();
+        let sf = shard::<TpWorld<4>>(&input, SplitGranule::of::<64>()).unwrap();
         use SourceShard::*;
         // Sources: x, rms0, q, k, v, cos, sin, kc, vc, o, rms1, gate, up, down.
         assert_eq!(
@@ -1177,7 +1123,7 @@ mod tests {
     /// A tensor-parallel forward computes the same function: every rank's result equals the
     /// unsharded forward's, to f32 reassociation — and every rank's result is BIT-IDENTICAL to
     /// every other's, because the all-reduce sums in absolute rank order everywhere.
-    fn sharded_equals_unsharded(w: WorldSize) {
+    fn sharded_equals_unsharded<T: World>() {
         let input = one_layer_input();
         let full = sources_of(&input);
         let reference = {
@@ -1186,19 +1132,17 @@ mod tests {
             let bufs = eval_dag(&g, &refs);
             bufs[g.result.index()].clone()
         };
-        let sf = shard(&input, w, SplitGranule::of::<64>()).unwrap();
+        let sf = shard::<T>(&input, SplitGranule::of::<64>()).unwrap();
         let g = lower_region(&sf.local, NB);
-        let per_rank: Vec<Vec<Vec<f32>>> = w
-            .ranks()
-            .map(|r| {
-                full.iter()
-                    .zip(&input.sources)
-                    .zip(&sf.sources)
-                    .map(|((buf, shape), shard)| slice_source(buf, *shape, *shard, r, w))
-                    .collect()
-            })
-            .collect();
-        let bufs = eval_ranks(&g, w, crate::subtile_ir::AttnScaleSite::InKernel, &per_rank);
+        let per_rank = |r: Rank<T>| -> Vec<Vec<f32>> {
+            full.iter()
+                .zip(&input.sources)
+                .zip(&sf.sources)
+                .map(|((buf, shape), shard)| slice_source(buf, *shape, *shard, r))
+                .collect()
+        };
+        let bufs = eval_ranks(&g, crate::subtile_ir::AttnScaleSite::InKernel, per_rank);
+        assert_eq!(bufs.len() as u32, T::RANKS);
         let first = &bufs[0][g.result.index()];
         assert_eq!(first.len(), reference.len());
         for (r, b) in bufs.iter().enumerate() {
@@ -1218,18 +1162,18 @@ mod tests {
 
     #[test]
     fn two_ranks_compute_the_unsharded_forward() {
-        sharded_equals_unsharded(WorldSize::of::<2>());
+        sharded_equals_unsharded::<TpWorld<2>>();
     }
 
     #[test]
     fn four_ranks_compute_the_unsharded_forward() {
-        sharded_equals_unsharded(WorldSize::of::<4>());
+        sharded_equals_unsharded::<TpWorld<4>>();
     }
 
     /// Eight ranks: 32 query heads / 8 kv heads still split, one kv head per rank.
     #[test]
     fn eight_ranks_compute_the_unsharded_forward() {
-        sharded_equals_unsharded(WorldSize::of::<8>());
+        sharded_equals_unsharded::<TpWorld<8>>();
     }
 
     /// Sixteen ranks cannot split 8 kv heads: attention is replicated instead (its q/k/v
@@ -1238,29 +1182,27 @@ mod tests {
     #[test]
     fn an_unsplittable_attention_is_replicated_not_refused() {
         let input = one_layer_input();
-        let sf = shard(&input, WorldSize::of::<16>(), SplitGranule::of::<1>()).unwrap();
+        let sf = shard::<TpWorld<16>>(&input, SplitGranule::of::<1>()).unwrap();
         assert!(kinds(&sf).contains(&CollectiveKind::AllGather));
-        sharded_equals_unsharded_at(&input, WorldSize::of::<16>(), SplitGranule::of::<1>());
+        sharded_equals_unsharded_at::<TpWorld<16>>(&input, SplitGranule::of::<1>());
     }
 
-    fn sharded_equals_unsharded_at(input: &LoweringInput, w: WorldSize, g: SplitGranule) {
+    fn sharded_equals_unsharded_at<T: World>(input: &LoweringInput, g: SplitGranule) {
         let full = sources_of(input);
         let gr = lower_region(input, NB);
         let refs: Vec<&[f32]> = full.iter().map(|v| v.as_slice()).collect();
         let reference = eval_dag(&gr, &refs)[gr.result.index()].clone();
-        let sf = shard(input, w, g).unwrap();
+        let sf = shard::<T>(input, g).unwrap();
         let gl = lower_region(&sf.local, NB);
-        let per_rank: Vec<Vec<Vec<f32>>> = w
-            .ranks()
-            .map(|r| {
-                full.iter()
-                    .zip(&input.sources)
-                    .zip(&sf.sources)
-                    .map(|((buf, shape), shard)| slice_source(buf, *shape, *shard, r, w))
-                    .collect()
-            })
-            .collect();
-        let got = &eval_ranks(&gl, w, crate::subtile_ir::AttnScaleSite::InKernel, &per_rank)[0][gl.result.index()];
+        let per_rank = |r: Rank<T>| -> Vec<Vec<f32>> {
+            full.iter()
+                .zip(&input.sources)
+                .zip(&sf.sources)
+                .map(|((buf, shape), shard)| slice_source(buf, *shape, *shard, r))
+                .collect()
+        };
+        let got = &eval_ranks(&gl, crate::subtile_ir::AttnScaleSite::InKernel, per_rank)[0]
+            [gl.result.index()];
         let worst = got
             .iter()
             .zip(&reference)
@@ -1276,12 +1218,10 @@ mod tests {
     fn the_handoff_facts_follow_their_ops() {
         use crate::fixtures::front_end_lowered;
         let lowered = front_end_lowered(one_layer_input());
-        let (one, _) =
-            shard_lowered(&lowered, WorldSize::of::<1>(), SplitGranule::of::<64>()).unwrap();
+        let (one, _) = shard_lowered::<TpWorld<1>>(&lowered, SplitGranule::of::<64>()).unwrap();
         assert_eq!(format!("{one:?}"), format!("{lowered:?}"));
 
-        let (two, sf) =
-            shard_lowered(&lowered, WorldSize::of::<2>(), SplitGranule::of::<64>()).unwrap();
+        let (two, sf) = shard_lowered::<TpWorld<2>>(&lowered, SplitGranule::of::<64>()).unwrap();
         assert_eq!(two.op_tiles.len(), two.input.ops.len());
         assert_eq!(two.op_expansion.len(), two.input.ops.len());
         for (i, &k) in sf.op_map.iter().enumerate() {
@@ -1306,15 +1246,13 @@ mod tests {
         let mut input = one_layer_input();
         let last = input.ops.len() - 1;
         input.ops.push(OpDesc {
-            op: SubOp::AllReduce {
-                world: WorldSize::of::<2>(),
-            },
+            op: SubOp::AllReduce,
             m: 1,
             inputs: vec![InputRef::Op(last)],
         });
         input.result = last + 1;
         assert!(matches!(
-            shard(&input, WorldSize::of::<2>(), SplitGranule::of::<64>()),
+            shard::<TpWorld<2>>(&input, SplitGranule::of::<64>()),
             Err(ShardRefusal::StatedCollective { .. })
         ));
     }

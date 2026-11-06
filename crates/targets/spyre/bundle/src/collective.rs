@@ -597,7 +597,7 @@ mod tests {
             }
         );
         // The first block of cut 1 — sender 0's — moved off the window.
-        let cut1 = <W2 as Tp>::RANKS as usize;
+        let cut1 = <W2 as World>::RANKS as usize;
         let mut apart = window();
         apart[cut1].offset += FLIT_BYTES;
         assert_eq!(
