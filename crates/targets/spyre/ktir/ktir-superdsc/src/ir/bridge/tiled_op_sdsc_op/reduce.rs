@@ -46,7 +46,7 @@ fn reduce_tile_kind(op: OpFunc) -> TileOpKind {
 /// This is the vendor's own shape — `_get_padded_iteration_space` (codegen/superdsc.py:477-507)
 /// pads every iteration space to stick alignment, and their `[mb=32, 514]` max fixture walks
 /// `out_ = 576` with `coordinateMasking_: {"out": [[514, 62]]}` (sdsc_max.json).
-fn reduce_stick_elems(cols: u32, df: Df) -> Result<u32, String> {
+pub(crate) fn reduce_stick_elems(cols: u32, df: Df) -> Result<u32, String> {
     if cols == 0 {
         return Err(
             "reduce width 0: a reduce needs at least one element along its reduced axis"
@@ -1323,10 +1323,13 @@ fn combine_op_func_of(op: OpFunc) -> &'static str {
     }
 }
 
-/// A long-reduce partial's handle — the accum's OWN kind and df, `[rows, one stick]`, minted
-/// from the partial's synthetic name. A `Kernel` accum is not a seeded reduce's and is refused
-/// by name rather than re-tagged.
-fn partial_accum_handle<A: KindTag>(
+/// A reduce ACCUM handle at the buffer's TRUE device shape — the accum's own kind and df,
+/// `[rows, one stick]` ([`win_reduce_accum`]'s own contract: the seeded convention writes one
+/// stick per row whatever the trip, and the placement reserves exactly that through
+/// `row_footprint_bytes`). Minted for a long-reduce partial's synthetic name AND for a door's
+/// reduce-output buffer alike — one law, one mint. A `Kernel` accum is not a seeded reduce's
+/// and is refused by name rather than re-tagged.
+pub(crate) fn partial_accum_handle<A: KindTag>(
     name: &str,
     rows: u32,
     stick: u32,
@@ -1349,6 +1352,41 @@ fn partial_accum_handle<A: KindTag>(
     Stk::new(name, layout).map_err(|e| {
         format!(
             "{name}: a long-reduce partial handle at the accum's own kind: {:?}",
+            e
+        )
+    })
+}
+
+/// A reduce DOOR's DATA handle — the buffer's TRUE device shape: the stick-padded width
+/// ([`reduce_stick_elems`], the same pad-up the single-shot descriptor's iteration domain
+/// states, and the same whole sticks the placement reserves through `row_footprint_bytes`),
+/// at the door's own kind and df. The probe's data window is `rows × padded` — minting the
+/// handle at the logical `cols` would under-declare the very sweep the descriptor bills.
+pub(crate) fn reduce_data_handle<D: KindTag>(
+    name: &str,
+    rows: u32,
+    cols: u32,
+    df: Df,
+) -> Result<Stk<D>, String> {
+    let padded = reduce_stick_elems(cols, df)?;
+    let layout = match D::kind() {
+        StickKind::RowBlocked => {
+            crate::sdsc_abstract::StickLayout::row_blocked_df(rows as usize, padded as usize, df)
+        }
+        StickKind::Flat => {
+            crate::sdsc_abstract::StickLayout::flat_df(rows as usize, padded as usize, df)
+        }
+        other => {
+            return Err(format!(
+                "{name}: a reduce door's data operand is a row-blocked or flat activation, \
+                 not a {other:?} tensor — the kind the single shot states is the kind the \
+                 probe asks its question at"
+            ));
+        }
+    };
+    Stk::new(name, layout).map_err(|e| {
+        format!(
+            "{name}: a reduce door's data handle at the buffer's true device shape: {:?}",
             e
         )
     })
@@ -1548,6 +1586,32 @@ mod long_reduce_split {
         assert_eq!(
             d0["constantInfo_"]["0"], d1["constantInfo_"]["0"],
             "both slices carry the WHOLE reduce's 1/N, so the partials add to the single-shot mean"
+        );
+        // ...and that shared const IS the whole-row mean's divisor, at the program's own
+        // precision (the SEN169 fp16 word `reduce_op_info` encodes): 1/1,048,545, NEVER the
+        // slice-local 1/524,288. A slice-local divisor is the numerics bug the split's
+        // binding order caught — each partial would be a mean of its own half-width and the
+        // running add would land at `time` × the true mean. With the SAME 1/N on every slice
+        // and an `add` combine, the two partial means sum to the whole-row mean (re-associated
+        // at fp16; the card gate arbitrates the numerics).
+        let whole = (sen169_bits(1.0f32 / cols as f32) as u32).to_string();
+        let slice_local = (sen169_bits(1.0f32 / 524_288f32) as u32).to_string();
+        assert_ne!(
+            whole, slice_local,
+            "the fixture's two candidate divisors must differ, or the pin is vacuous"
+        );
+        for (d, which) in [(&d0, "slice 0"), (&d1, "slice 1")] {
+            assert_eq!(
+                d["constantInfo_"]["0"]["data_"]["data_"]["[0, 0, 0]"][0],
+                whole.as_str(),
+                "{which}'s scaling const is the WHOLE reduce's 1/N at the program's precision"
+            );
+        }
+        // The combine is the sum-class law: an `add`, running, in place on the caller's accum.
+        let c = dsc(&split[2], "mean16_c1_op");
+        assert_eq!(
+            c["computeOp_"][0]["opFuncName"], "add",
+            "the mean's combine"
         );
     }
 }
