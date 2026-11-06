@@ -142,7 +142,7 @@ fn indirect_anchor_var(tile: &Operation<'_>) -> Option<usize> {
 /// row and mask tile are the only tensors a body reads there), and the walk relaunched `trips / u`
 /// times at `u` steps a launch. `u` is the largest power of two that divides the trip count and keeps
 /// the unrolled body within `max_descriptors` (a launch group's bound).
-pub fn unroll_walk(ops: Vec<super::EmittedOp>, max_descriptors: usize) -> Vec<super::EmittedOp> {
+pub fn unroll_walk<T: crate::collective::Tp>(ops: Vec<super::EmittedOp<T>>, max_descriptors: usize) -> Vec<super::EmittedOp<T>> {
     let (Some(first), Some(last)) = (
         ops.iter().position(|e| e.walk.is_some()),
         ops.iter().rposition(|e| e.walk.is_some()),

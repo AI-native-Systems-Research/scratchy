@@ -74,10 +74,10 @@ type OpUses<'a> = (bool, Vec<(&'a str, bool)>);
 /// pinned tensors still planned here) lowers under that plan again, with the tensors it minted: a card
 /// bake lowers each program twice into one layout (the pass that declares the bundle's synthetics,
 /// then the real one), and planning the second time would plan around the first time's own pins.
-pub(crate) fn plan(
+pub(crate) fn plan<T: crate::collective::Tp>(
     node: &KtirNode,
     layout: &BundleLayout,
-    probe: impl Fn(&BundleLayout) -> Result<Vec<EmittedOp>, Error>,
+    probe: impl Fn(&BundleLayout) -> Result<Vec<EmittedOp<T>>, Error>,
 ) -> Result<(), Error> {
     let done = node
         .lx_plan

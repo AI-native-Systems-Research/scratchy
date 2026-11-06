@@ -14,7 +14,7 @@ use crate::superdsc_opspec::{DataFormat, Fp16, SdscFoldSet};
 /// build time before `assemble_matmul` is reached, so a panic here is a true
 /// internal-consistency bug, not reachable from model input.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul(
+pub fn assemble_matmul<T: crate::collective::Tp>(
     op_name: &str,
     m: u32,
     n: u32,
@@ -24,7 +24,7 @@ pub fn assemble_matmul(
     w: &Stk<crate::sdsc_abstract::KernelTag>,
     o: &Stk<crate::sdsc_abstract::RowBlockedTag>,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let mut sym_id_base: i64 = 0;
     assemble_matmul_seeded(op_name, m, n, k, batch, a, w, o, &mut sym_id_base, layout)
 }
@@ -32,7 +32,7 @@ pub fn assemble_matmul(
 /// [`assemble_matmul`] with an explicit running symbol-id counter so multiple
 /// tiled ops in one bundle get globally-unique negative ids (design risk #1).
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_seeded(
+pub fn assemble_matmul_seeded<T: crate::collective::Tp>(
     op_name: &str,
     m: u32,
     n: u32,
@@ -43,7 +43,7 @@ pub fn assemble_matmul_seeded(
     o: &Stk<crate::sdsc_abstract::RowBlockedTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     try_assemble_matmul_seeded(op_name, m, n, k, batch, a, w, o, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"))
 }
@@ -64,7 +64,7 @@ pub fn assemble_matmul_seeded(
 /// The panicking form keeps its signature and its panic for every existing caller, and now delegates
 /// here so there is ONE emission path rather than two that could drift.
 #[allow(clippy::too_many_arguments)]
-pub fn try_assemble_matmul_seeded(
+pub fn try_assemble_matmul_seeded<T: crate::collective::Tp>(
     op_name: &str,
     m: u32,
     n: u32,
@@ -75,7 +75,7 @@ pub fn try_assemble_matmul_seeded(
     o: &Stk<crate::sdsc_abstract::RowBlockedTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     // ⛔ THE OCCUPANCY PAD IS ONLY REAL IF SOMETHING RESERVED IT — see
     // [`out_width_the_weight_holds`]. A no-op for every caller whose layout reserves the padded
     // weight; it drops the pad for a producer whose weight is the CALLER'S OWN tensor.
@@ -157,7 +157,7 @@ fn out_width_the_weight_holds(
 /// ABI emit (`matmul_opspec_split` → `emit_sdsc_tiled`). Returns `Result` (no panic) so the tower keeps its
 /// `Result`-based error flow; a bad shape is an `Err`, surfaced by the caller.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_split(
+pub fn assemble_matmul_split<T: crate::collective::Tp>(
     op_name: &str,
     m: u32,
     n: u32,
@@ -172,7 +172,7 @@ pub fn assemble_matmul_split(
         &[crate::superdsc_opspec::ItDim],
         u32,
     ) -> std::collections::BTreeMap<&'static str, u32>,
-) -> Result<EmittedOp, crate::superdsc_error::SuperDscError> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let op = matmul_opspec_split::<Fp16, _>(
         m,
         n,
@@ -203,7 +203,7 @@ pub fn assemble_matmul_split(
 /// KERNEL carries the batch dim (`y`) so each head reads its OWN K/V, fixing the
 /// confirmed shared-K bug (vs `assemble_matmul_seeded`, whose 2-D kernel is shared).
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_batched_seeded(
+pub fn assemble_matmul_batched_seeded<T: crate::collective::Tp>(
     op_name: &str,
     m: u32,
     n: u32,
@@ -214,7 +214,7 @@ pub fn assemble_matmul_batched_seeded(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let op = matmul_opspec_batched(m, n, k, batch, a_name, w_name, o_name)
         .unwrap_or_else(|e| panic!("assemble_matmul_batched {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -226,7 +226,7 @@ pub fn assemble_matmul_batched_seeded(
 /// attention bmm (the batchmatmul KERNEL is shared across the batch, so one bmm per
 /// kv-head group with `batch=gqa` gives each group its OWN K/V via the offsets).
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_off<O: crate::sdsc_abstract::KindTag>(
+pub fn assemble_matmul_off<T: crate::collective::Tp, O: crate::sdsc_abstract::KindTag>(
     op_name: &str,
     m: MatM,
     n: MatN,
@@ -243,7 +243,7 @@ pub fn assemble_matmul_off<O: crate::sdsc_abstract::KindTag>(
     o_off: crate::addr::DevOff,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let a_off = a_off.into_raw_elems();
     let w_off = w_off.into_raw_elems();
     let o_off = o_off.into_raw_elems();
@@ -287,7 +287,7 @@ pub fn assemble_matmul_off<O: crate::sdsc_abstract::KindTag>(
 /// and the handle extents the opspec derives are the tensor's own. Only the kernel's `in` axis —
 /// the one this tiling splits — needs the declaration.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_windowed(
+pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
     op_name: &str,
     m: MatM,
     n: MatN,
@@ -301,7 +301,7 @@ pub fn assemble_matmul_windowed(
     o_off: crate::addr::DevOff,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let (a_name, w_name, o_name) = (a.name(), w.name(), o.name());
     let mut op = matmul_opspec_off::<Fp16>(
         m,
@@ -390,7 +390,7 @@ pub fn assemble_matmul_windowed(
 /// computing one row. There is no standalone pitch slot: offset and pitch are both answers of the
 /// row law that placed the operand, so the score leg's packing cannot be handed to the value leg.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_off_phys_m<O: crate::sdsc_abstract::KindTag>(
+pub fn assemble_matmul_off_phys_m<T: crate::collective::Tp, O: crate::sdsc_abstract::KindTag>(
     op_name: &str,
     m: MatM,
     n: MatN,
@@ -405,7 +405,7 @@ pub fn assemble_matmul_off_phys_m<O: crate::sdsc_abstract::KindTag>(
     o_off: crate::addr::DevOff,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let (a_off, w_off, o_off) = (
         a_place.off().into_raw_elems(),
         w_off.into_raw_elems(),
@@ -440,7 +440,7 @@ pub fn assemble_matmul_off_phys_m<O: crate::sdsc_abstract::KindTag>(
 /// [`crate::sdsc_abstract::MatY`]'s batch strides, exactly as `a_place`'s does; this entry point is
 /// what stops the OFFSET half being taken from somewhere else.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_placed<O: crate::sdsc_abstract::KindTag>(
+pub fn assemble_matmul_placed<T: crate::collective::Tp, O: crate::sdsc_abstract::KindTag>(
     op_name: &str,
     m: MatM,
     n: MatN,
@@ -455,7 +455,7 @@ pub fn assemble_matmul_placed<O: crate::sdsc_abstract::KindTag>(
     o_place: OperandPlacement,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     assemble_matmul_off_phys_m(
         op_name,
         m,
@@ -500,7 +500,7 @@ pub struct RowsShape {
 /// `[k, n]` block. A row slice of a stick-major tensor is addressed at element base `r0 · stick` with
 /// the TENSOR's row count as the `mb` device extent — its stick-group stride is `rows · stick`, not the
 /// op's `m · stick` (`matmul_opspec_split`'s `phys_mb`, on both the activation and the output).
-pub fn assemble_matmul_rows(
+pub fn assemble_matmul_rows<T: crate::collective::Tp>(
     op_name: &str,
     shape: RowsShape,
     a: RowsOperand<'_, crate::sdsc_abstract::RowBlockedTag>,
@@ -508,7 +508,7 @@ pub fn assemble_matmul_rows(
     o: RowsOperand<'_, crate::sdsc_abstract::RowBlockedTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let form = SharedKernelBmmForm::batch_inner_proven(super::walk::MatmulWrapperSite::witness());
     let mut op = matmul_opspec_split::<Fp16, _>(
         shape.m.get(),
@@ -537,12 +537,12 @@ pub fn assemble_matmul_rows(
 
 /// Shared tail: work-division folds + emit. Identical for both entry points, so a change to how an
 /// OpSpec becomes an EmittedOp cannot apply to one and not the other.
-fn assemble_from_opspec(
+fn assemble_from_opspec<T: crate::collective::Tp>(
     op_name: &str,
     mut op: crate::superdsc_opspec::OpSpec,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     // ⭐ A KERNEL MAY LIVE IN LX — the split-KV chunk's gathered Kᵗ and V (`ChunkScratch::lx_form`), read by
     // the core that gathered it. The residency is the tensor's (decided where its name is pinned), so the
     // matmul door consults it by name exactly as the pointwise door does; `emit`'s core-local read law
@@ -565,7 +565,7 @@ fn assemble_from_opspec(
 /// silently address only the first trip. A future tiled target needs that machinery extended first,
 /// not this guard removed.
 #[allow(clippy::too_many_arguments)]
-fn assemble_from_opspec_with_epilogue<E: crate::sdsc_abstract::KindTag>(
+fn assemble_from_opspec_with_epilogue<T: crate::collective::Tp, E: crate::sdsc_abstract::KindTag>(
     op_name: &str,
     mut op: crate::superdsc_opspec::OpSpec,
     epi: &Stk<E>,
@@ -575,7 +575,7 @@ fn assemble_from_opspec_with_epilogue<E: crate::sdsc_abstract::KindTag>(
     broadcast_batch: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     assert_eq!(
         op.time(),
         1,
@@ -604,7 +604,7 @@ fn assemble_from_opspec_with_epilogue<E: crate::sdsc_abstract::KindTag>(
 /// precisely how a block that should fold gets emitted as one that seeds (which DISCARDS every page
 /// folded before it, silently and fluently), because the two lists drift independently.
 #[allow(clippy::too_many_arguments)]
-fn assemble_from_opspec_maybe_epilogue<E: crate::sdsc_abstract::KindTag>(
+fn assemble_from_opspec_maybe_epilogue<T: crate::collective::Tp, E: crate::sdsc_abstract::KindTag>(
     op_name: &str,
     op: crate::superdsc_opspec::OpSpec,
     epi: Option<(&Stk<E>, crate::addr::DevOff)>,
@@ -613,7 +613,7 @@ fn assemble_from_opspec_maybe_epilogue<E: crate::sdsc_abstract::KindTag>(
     broadcast_batch: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     match epi {
         Some((e, off)) => assemble_from_opspec_with_epilogue(
             op_name,
@@ -633,7 +633,7 @@ fn assemble_from_opspec_maybe_epilogue<E: crate::sdsc_abstract::KindTag>(
 /// [`assemble_matmul_off`] with an OPTIONAL fused pointwise epilogue — see
 /// [`assemble_from_opspec_maybe_epilogue`] for why the epilogue is an `Option` and not two callers.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_off_maybe_epilogue<
+pub fn assemble_matmul_off_maybe_epilogue<T: crate::collective::Tp, 
     O: crate::sdsc_abstract::KindTag,
     E: crate::sdsc_abstract::KindTag,
 >(
@@ -655,7 +655,7 @@ pub fn assemble_matmul_off_maybe_epilogue<
     broadcast_batch: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let (a_off_raw, w_off_raw, o_off_raw) = (
         a_off.into_raw_elems(),
         w_off.into_raw_elems(),
@@ -681,7 +681,7 @@ pub fn assemble_matmul_off_maybe_epilogue<
 /// [`assemble_matmul_off_phys_m`] with an OPTIONAL fused pointwise epilogue — see
 /// [`assemble_from_opspec_maybe_epilogue`].
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_off_phys_m_maybe_epilogue<
+pub fn assemble_matmul_off_phys_m_maybe_epilogue<T: crate::collective::Tp, 
     O: crate::sdsc_abstract::KindTag,
     E: crate::sdsc_abstract::KindTag,
 >(
@@ -703,7 +703,7 @@ pub fn assemble_matmul_off_phys_m_maybe_epilogue<
     broadcast_batch: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let (a_off_raw, w_off_raw, o_off_raw) = (
         a_place.off().into_raw_elems(),
         w_off.into_raw_elems(),
@@ -740,7 +740,7 @@ pub fn assemble_matmul_off_phys_m_maybe_epilogue<
 
 /// [`assemble_matmul_off`] with a fused pointwise epilogue — see [`assemble_from_opspec_with_epilogue`].
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_off_with_epilogue<
+pub fn assemble_matmul_off_with_epilogue<T: crate::collective::Tp, 
     O: crate::sdsc_abstract::KindTag,
     E: crate::sdsc_abstract::KindTag,
 >(
@@ -763,7 +763,7 @@ pub fn assemble_matmul_off_with_epilogue<
     broadcast_batch: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let (a_off_raw, w_off_raw, o_off_raw) = (
         a_off.into_raw_elems(),
         w_off.into_raw_elems(),
@@ -790,7 +790,7 @@ pub fn assemble_matmul_off_with_epilogue<
 /// [`assemble_matmul_off_phys_m`] with a fused pointwise epilogue — see
 /// [`assemble_from_opspec_with_epilogue`].
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_off_phys_m_with_epilogue<
+pub fn assemble_matmul_off_phys_m_with_epilogue<T: crate::collective::Tp, 
     O: crate::sdsc_abstract::KindTag,
     E: crate::sdsc_abstract::KindTag,
 >(
@@ -813,7 +813,7 @@ pub fn assemble_matmul_off_phys_m_with_epilogue<
     broadcast_batch: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let (a_off_raw, w_off_raw, o_off_raw) = (
         a_place.off().into_raw_elems(),
         w_off.into_raw_elems(),
@@ -875,7 +875,7 @@ pub fn assemble_matmul_off_phys_m_with_epilogue<
 /// `None` emits byte-for-byte what the ungathered assembler does — the indirect fields are absent from
 /// the descriptor when undeclared, which the gather-free test asserts rather than assumes.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_off_phys_m_with_epilogue_gathered<
+pub fn assemble_matmul_off_phys_m_with_epilogue_gathered<T: crate::collective::Tp, 
     O: crate::sdsc_abstract::KindTag,
     E: crate::sdsc_abstract::KindTag,
 >(
@@ -899,7 +899,7 @@ pub fn assemble_matmul_off_phys_m_with_epilogue_gathered<
     gather: Option<crate::superdsc_opspec::GatherIndex>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> crate::emit::EmittedOp {
+) -> crate::emit::EmittedOp<T> {
     // Same three offsets, from the same places, as the ungathered sibling — the activation's comes from
     // its PLACEMENT, so this entry point cannot pair a law's pitch with a hand-added offset.
     let (a_off_raw, w_off_raw, o_off_raw) = (
@@ -947,7 +947,7 @@ pub fn assemble_matmul_off_phys_m_with_epilogue_gathered<
 /// Same typed-operand discipline as [`assemble_matmul_off`] — activation is `RowBlocked`, the
 /// K/V cache is a `Kernel`, so addressing the cache as a non-Kernel does not type-check.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_batched_off<O: crate::sdsc_abstract::KindTag>(
+pub fn assemble_matmul_batched_off<T: crate::collective::Tp, O: crate::sdsc_abstract::KindTag>(
     op_name: &str,
     m: MatM,
     n: MatN,
@@ -962,7 +962,7 @@ pub fn assemble_matmul_batched_off<O: crate::sdsc_abstract::KindTag>(
     o_off: u32,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let (a_name, w_name, o_name) = (a.name(), w.name(), o.name());
     let op = super::opspec::matmul_opspec_batched_off(
         m,

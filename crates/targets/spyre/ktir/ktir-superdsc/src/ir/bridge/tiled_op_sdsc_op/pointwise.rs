@@ -365,7 +365,7 @@ fn gather_copy_cores(
 
 /// [`gather_copy_opspec`] + `emit_sdsc_tiled` — the ONE assembler for the gather's copy, so the op the
 /// fold launches and the descriptor the tests read are the same construction.
-pub fn assemble_gather_copy(
+pub fn assemble_gather_copy<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
@@ -378,7 +378,7 @@ pub fn assemble_gather_copy(
     index: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     // ⛔ ALL THREE EXTENTS FROM THE SCRATCH, AS ONE VALUE, NOT THREE REACHES. `mb` is the copy's own
     // extent, the index's live entry count and the scratch's row count; `out` is the pool's stick; the
     // `page` the walk pins is the `page` the index declares. They were three separate calls here
@@ -715,7 +715,7 @@ pub struct PageGatherRows<'a> {
 }
 
 /// [`page_gather_copy_opspec`] + `emit_sdsc_tiled`.
-pub fn assemble_page_gather_copy(
+pub fn assemble_page_gather_copy<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
@@ -728,7 +728,7 @@ pub fn assemble_page_gather_copy(
     }: PageGatherRows<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let gathered = match words {
         GatheredWords::Fp16 => 0,
         GatheredWords::SenUint32 { .. } => 1,
@@ -937,7 +937,7 @@ pub fn index_select_opspec(
 }
 
 /// [`index_select_opspec`] + `emit_sdsc_tiled`.
-pub fn assemble_index_select(
+pub fn assemble_index_select<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
@@ -945,7 +945,7 @@ pub fn assemble_index_select(
     page: IndexSelectPage,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let op = index_select_opspec(src, dst, gather, page)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -1055,14 +1055,14 @@ pub fn expand_blocks_opspec(
 }
 
 /// [`expand_blocks_opspec`] + `emit_sdsc_tiled`.
-pub fn assemble_expand_blocks(
+pub fn assemble_expand_blocks<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
     blocks: ExpandedBlocks,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let op = expand_blocks_opspec(src, dst, blocks)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -1169,7 +1169,7 @@ pub struct StickPermuteSpec {
 }
 
 /// [`stick_permute_opspec`] + `emit_sdsc_tiled`.
-pub fn assemble_stick_permute(
+pub fn assemble_stick_permute<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
@@ -1183,7 +1183,7 @@ pub fn assemble_stick_permute(
     }: StickPermuteSpec,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let mut op = stick_permute_opspec(src, dst, rows, sticks, df, direction)?;
     if src_elems > 0 {
         op.args[0].set_offset_elems(src_elems);
@@ -1285,14 +1285,14 @@ pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<O
 }
 
 /// [`stick_runs_copy_opspec`] + `emit_sdsc_tiled`.
-pub fn assemble_stick_runs_copy(
+pub fn assemble_stick_runs_copy<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
     runs: StickRuns,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let op = stick_runs_copy_opspec(src, dst, runs)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -1312,7 +1312,7 @@ pub struct ScatterCopySpec {
 }
 
 /// [`scatter_copy_opspec`] + `emit_sdsc_tiled` — the one assembler for a scattered copy.
-pub fn assemble_scatter_copy(
+pub fn assemble_scatter_copy<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
@@ -1320,7 +1320,7 @@ pub fn assemble_scatter_copy(
     spec: ScatterCopySpec,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let op = scatter_copy_opspec(src, dst, scatter, spec)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -1821,7 +1821,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
 /// [`pointwise_broadcast_opspec_from_tile`]'s doc for why they are not re-derived from
 /// `tile_op.dims`).
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_pointwise_broadcast_off_from_tile<O: KindTag>(
+pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: KindTag>(
     op_name: &str,
     tile_op: &TileOp,
     op_func: &'static str,
@@ -1832,7 +1832,7 @@ pub fn assemble_pointwise_broadcast_off_from_tile<O: KindTag>(
     out_offset: impl Into<OutCorner>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let out_offset = out_offset.into();
     let o_name = o.name();
     let head_major = O::kind() == StickKind::Flat;
@@ -1888,7 +1888,7 @@ pub fn assemble_pointwise_broadcast_off_from_tile<O: KindTag>(
 /// `assemble_pointwise_seeded` TAKING AN ALREADY-LOWERED `TileOp` instead of raw `rows`/`cols` — the
 /// TileIR→SdscOp entry point for a caller that already built its `TileOp` (no re-derivation of
 /// shape) hands it here instead of unpacking it back into `rows`/`cols` first.
-pub fn assemble_pointwise_seeded_from_tile(
+pub fn assemble_pointwise_seeded_from_tile<T: crate::collective::Tp>(
     op_name: &str,
     tile_op: &TileOp,
     op_func: &'static str,
@@ -1896,7 +1896,7 @@ pub fn assemble_pointwise_seeded_from_tile(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let op = pointwise_opspec_from_tile(
         tile_op,
         op_func_from_str(op_func),

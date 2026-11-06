@@ -120,7 +120,7 @@ impl QuantizedActivations {
 /// inn_pad ≠ inn`: at an aligned `inn` the padded layout IS the logical one and the whole-tensor
 /// convert stands (byte-identical to the pre-pair emission), and at `pairs == 1` this is the
 /// dense law verbatim (`cl_reach = k_pad = fp8_k_pad(k)`, one tail window, one convert).
-pub(crate) fn fp8_quantize_descriptors(
+pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
     facts: &Fp8Facts,
     m: u32,
     k: u32,
@@ -128,7 +128,7 @@ pub(crate) fn fp8_quantize_descriptors(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     quantized: &mut QuantizedActivations,
-) -> Result<Vec<EmittedOp>, SuperDscError> {
+) -> Result<Vec<EmittedOp<T>>, SuperDscError> {
     // fp8 W8A8 PREFILL (m>1). torch-spyre's `quantize_fp8_with_scale`
     // (decompositions.py:966) takes `scale` as an input computed by the CALLER via native `torch.abs` +
     // `torch.ops.aten.amax` (confirmed via grep — no L2-norm substitute anywhere in torch-spyre); the
@@ -224,7 +224,7 @@ pub(crate) fn fp8_quantize_descriptors(
         let pos448 = rbo(&crate::place::act_name(FP8_POS448_TID));
         let neg448 = rbo(&crate::place::act_name(FP8_NEG448_TID));
         let inv448 = rbo(&crate::place::act_name(FP8_INV448_TID));
-        let mut ops: Vec<EmittedOp> = Vec::new();
+        let mut ops: Vec<EmittedOp<T>> = Vec::new();
         // SHARE the activation quantize across matmuls that read the SAME activation. `first` says
         // whether this activation (`facts.a_tid`, at this geometry) still needs its chain, or was
         // quantized earlier in the bundle with nothing written to it since ([`QuantizedActivations`]):
@@ -590,7 +590,7 @@ pub(crate) fn fp8_quantize_descriptors(
 /// [`fp8_quantize_descriptors`] at `pairs == 1`, the dense law verbatim) plus the dense
 /// body: `matmulfp8` binding the WHOLE packed weight as one `[k_pad, n]` view, then the
 /// two dequant legs. The signature is the pre-split one — every caller and test stands.
-pub(crate) fn matmul_fp8_descriptors(
+pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
     facts: &Fp8Facts,
     m: u32,
     k: u32,
@@ -598,7 +598,7 @@ pub(crate) fn matmul_fp8_descriptors(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     quantized: &mut QuantizedActivations,
-) -> Result<Vec<EmittedOp>, SuperDscError> {
+) -> Result<Vec<EmittedOp<T>>, SuperDscError> {
     let mut ops = fp8_quantize_descriptors(facts, m, k, 1, sym_id_base, layout, quantized)?;
     let stk = Fp16::ELEMS_PER_STICK; // 64
     // ⭐ THE 26b K-PAD (dense form) — the contraction width the packed weight was staged at.
@@ -766,15 +766,15 @@ mod tests {
     /// quantizes the new bytes; a reuse at another row count is refused rather than reading a
     /// quantize sized for the first.
     #[test]
-    fn a_held_quantize_is_shared_until_its_activation_is_written() {
+    fn a_held_quantize_is_shared_until_its_activation_is_written<T: crate::collective::Tp>() {
         let (m, k, n) = (1u32, 256, 128);
         let l = fp8_layout(m, k, n);
-        let chain = |ops: &[EmittedOp]| {
+        let chain = |ops: &[EmittedOp<T>]| {
             ops.iter()
                 .filter(|o| o.op_name.ends_with("fq_qspt_op") || o.op_name.ends_with("fq_afp8_op"))
                 .count()
         };
-        let mms = |ops: &[EmittedOp]| ops.iter().filter(|o| o.op_name.ends_with("fq_mm")).count();
+        let mms = |ops: &[EmittedOp<T>]| ops.iter().filter(|o| o.op_name.ends_with("fq_mm")).count();
         let mut q = QuantizedActivations::default();
         let first = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut q)
             .expect("the first matmul emits");
@@ -1040,7 +1040,7 @@ mod tests {
     /// matches `needle`), in BYTES — `resolve_seg_base` folds each arg's `offset_elems` into the
     /// segment base, so the DELTAS between ops reading the same buffer at different offsets are
     /// the offsets themselves. The per-pair tail's laws read those deltas.
-    fn operand_start_bytes(op: &EmittedOp, needle: &str, want_input: bool) -> u64 {
+    fn operand_start_bytes<T: crate::collective::Tp>(op: &EmittedOp<T>, needle: &str, want_input: bool) -> u64 {
         let dsc = op.dsc();
         for dsc_map in dsc.dscs_.iter() {
             for dsc in dsc_map.values() {
@@ -1232,7 +1232,7 @@ mod tests {
     /// zero-fill still aims one fp16 group past the logical width at the m=2 corner, and the
     /// reservations widen to the m-generic `[m, cl_reach]`/`[m, k_pad]`.
     #[test]
-    fn the_per_pair_tail_refuses_a_non_whole_lane_count_and_pads_per_slot_at_prefill() {
+    fn the_per_pair_tail_refuses_a_non_whole_lane_count_and_pads_per_slot_at_prefill<T: crate::collective::Tp>() {
         let l = fp8_layout(1, 9, 128);
         let mut quantized = QuantizedActivations::default();
         let e = fp8_quantize_descriptors(&facts(), 1, 9, 2, &mut 0, Some(&l), &mut quantized);
@@ -1269,7 +1269,7 @@ mod tests {
             (pairs - 1) as usize,
             "slots 1.. carry fq_afp8_p{{s}}_op"
         );
-        let arms: Vec<&EmittedOp> = ops2
+        let arms: Vec<&EmittedOp<T>> = ops2
             .iter()
             .filter(|o| o.op_name.ends_with("fq_afp8_op") || o.op_name.contains("fq_afp8_p"))
             .collect();
