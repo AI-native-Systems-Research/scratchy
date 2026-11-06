@@ -12,9 +12,12 @@ description = "Tensor-parallel build scope: which sharded worlds `#[forward]` ba
 # it (scratchy-models, whose build script runs the `#[forward]` expansion) and serves it
 # (scratchy-serving-worker, which runs every rank in one process, one card each).
 #
-# A world is baked only when the build names it — none by default:
-# `--features spyre-hw,model/granite-3.1-2b-instruct,tp/2`.
+# A world is baked only when the build names it — none by default — and a build names at most
+# one (two is a build error, `scratchy-forward-compiler-macro`'s `TP_WORLD`):
+# `--features spyre-hw,model/granite-3.1-2b-instruct,tp/4`.
 "2" = ["scratchy-models/tp-2", "scratchy-serving-worker/tp-2"]
+"4" = ["scratchy-models/tp-4", "scratchy-serving-worker/tp-4"]
+"8" = ["scratchy-models/tp-8", "scratchy-serving-worker/tp-8"]
 
 [dependencies]
 scratchy-models = { path = "../arch", default-features = false }

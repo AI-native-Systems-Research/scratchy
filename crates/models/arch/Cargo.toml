@@ -716,10 +716,12 @@ spyre-emu = ["spyre", "scratchy-forward-compiler-macro/spyre-emu"]
 # takes (see scratchy-forward-compiler-macro's `turboquant`); no effect on the
 # other backends. Off here like every other scope; `scratchy-cli`'s `metal` turns it on.
 turboquant = ["scratchy-forward-compiler-macro/turboquant"]
-# A TWO-RANK TENSOR-PARALLEL WORLD baked beside every selected model's one-rank forward (see
-# scratchy-forward-compiler-macro's `tp-2`). Off here like every other scope; reached from the CLI
-# as `tp/2` through scratchy-tp.
+# A W-RANK TENSOR-PARALLEL WORLD baked beside every selected model's one-rank forward (see
+# scratchy-forward-compiler-macro's `tp-<W>`). Off here like every other scope; reached from the
+# CLI as `tp/<W>` through scratchy-tp.
 tp-2 = ["scratchy-forward-compiler-macro/tp-2"]
+tp-4 = ["scratchy-forward-compiler-macro/tp-4"]
+tp-8 = ["scratchy-forward-compiler-macro/tp-8"]
 spyre = [
     "scratchy-forward-compiler-macro/spyre",
     "scratchy-forward-compiler/spyre",

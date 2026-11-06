@@ -1062,9 +1062,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
     };
     // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW — placed iff the forward carries a collective, in the
     // weight segment's base region (bank 0) directly above the packed weights: `WINDOW_CUTS`
-    // adjacent cuts of `RecvWindow::cut_bytes_for` the forward's widest collective operand, one
-    // placement per cut's tid (`WindowCut::tid`) — collective `k` lands in cut
-    // `WindowCut::of_collective(k)`.
+    // adjacent cuts, each one block per sending rank of the forward's world, each block
+    // `RecvWindow::block_bytes_for` its widest collective operand, one placement per block's tid
+    // (`WindowCut::block_tid`) — collective `k` lands in cut `WindowCut::of_collective(k)`.
     //
     // ⛔ UNIFORM BY CONSTRUCTION, NOT BY COORDINATION. Every bundle of a forward (prefix, rolled
     // body, suffix) is baked over THIS one layout, and `weight_segment_parity` holds every layout
@@ -1076,19 +1076,23 @@ pub fn compute_bundle_layout<F: RopeForm>(
     let widest_cols = ir
         .nodes
         .iter()
-        .filter(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
+        .filter(|n| matches!(n.op, SubOp::AllReduce { .. } | SubOp::AllGather { .. }))
         .map(|n| n.inputs[0].region.cols.len)
         .max();
-    if let Some(widest_cols) = widest_cols {
+    let world = crate::tp_plan::forward_world(ir).map_err(SuperDscError)?;
+    if let (Some(widest_cols), Some(world)) = (widest_cols, world) {
         let w = SegRole::Weight.segment();
-        let cut =
-            ktir_superdsc::collective::RecvWindow::cut_bytes_for(widest_cols).ok_or_else(|| {
+        let block = ktir_superdsc::collective::RecvWindow::block_bytes_for(world, widest_cols)
+            .ok_or_else(|| {
                 SuperDscError(format!(
-                    "a collective's operand has {widest_cols} columns — no receive window holds it"
+                    "a collective's operand has {widest_cols} columns — no receive window of a \
+                     {}-rank world holds it",
+                    world.get()
                 ))
             })?;
-        let window = ktir_superdsc::collective::RecvWindow::new(align128(seg_bytes[w]), cut)
-            .ok_or_else(|| SuperDscError("an align128 offset is flit-aligned".to_string()))?;
+        let window =
+            ktir_superdsc::collective::RecvWindow::new(world, align128(seg_bytes[w]), block)
+                .ok_or_else(|| SuperDscError("an align128 offset is flit-aligned".to_string()))?;
         if window.end() > bundle::MAX_SEGMENT_BYTES {
             return Err(SuperDscError(format!(
                 "the tensor-parallel receive window [{}, {}) does not fit the weight segment's \
@@ -1098,24 +1102,29 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 bundle::MAX_SEGMENT_BYTES,
             )));
         }
+        // One placement per (cut, sending rank): rank `s`'s block of cut `c`, where `s`'s sends
+        // into `c` land on every card and where every consume reads `s`'s share.
         for cut in (0..ktir_superdsc::collective::WINDOW_CUTS)
             .map(ktir_superdsc::collective::WindowCut::of_collective)
         {
-            let tid = cut.tid();
-            placements.insert(
-                tid,
-                TensorPlacement {
+            for from in world.ranks() {
+                let tid = cut.block_tid(from);
+                placements.insert(
                     tid,
-                    role: SegRole::Weight,
-                    segment: w,
-                    bank: 0,
-                    offset: window.cut_offset(cut),
-                    size: window.cut().get(),
-                },
-            );
+                    TensorPlacement {
+                        tid,
+                        role: SegRole::Weight,
+                        segment: w,
+                        bank: 0,
+                        offset: window.block_offset(cut, from),
+                        size: window.block().get(),
+                    },
+                );
+            }
         }
         seg_bytes[w] = window.end();
     }
+    let tp_world = world.filter(|w| w.is_sharded()).map_or(0, |w| w.get());
     // ── ROPE permutation matrix P [hd,hd] (task: in-bundle RoPE) ── If the tape has
     // any RopeRotate/RopeAppend, main's `lower_rope_node` emits `rot = matmul(x, P)` (the
     // rotate-half as a 64-stick-aligned matmul, avoiding the 32-half sub-stick). P is
@@ -1635,6 +1644,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         // ids past its own graph that its resident list happens to excuse. Each bundle states
         // its own, the `SegRole::Logits` law: the runtime reads the facts off the bundle it
         // actually runs, never off another graph's wiring.
+        tp_world,
         num_sources: ir.num_sources,
         resident_source_tids: {
             // Prefix-KV (the set the wiring's `layers` derives its prefix_k/prefix_v from — the
@@ -2574,7 +2584,7 @@ fn stage_synth_weights<F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     only: Option<&std::collections::HashSet<u64>>,
     // Each weight's synth stream (`dbg_synth_val`'s first argument) — its own tid, except where a
-    // two-rank gate gives a rank's slice of a sharded weight a stream of its own.
+    // sharded gate gives a rank's slice of a sharded weight a stream of its own.
     seed: &dyn Fn(u32) -> usize,
 ) -> StagedWeights {
     use scratchy_subtile::lower::GemmWeight;
@@ -2752,7 +2762,7 @@ fn stage_synth_weights<F: RopeForm>(
 /// Pre-attention tids (rmsnorm/qkv/rope) depend only on hidden+weights, so the
 /// comparison needs NO mask/cache alignment — the bug localizes to one op.
 /// A gated run's readback, as the teacher-forced walk restarts from it: the run's own tensors, and —
-/// for one rank of a two-rank gate — the peer whose emulated operands its collectives read.
+/// for one rank of a sharded gate — the world whose emulated operands its collectives read.
 #[cfg(feature = "spyre-emu")]
 #[derive(Clone, Copy)]
 struct EmuReadback<'a> {
@@ -2762,18 +2772,18 @@ struct EmuReadback<'a> {
 
 /// Whether `op` reads across ranks — the nodes a rank's reference evaluates against its peer.
 fn is_collective<F: RopeForm>(op: &SubOp<F>) -> bool {
-    matches!(op, SubOp::AllReduce | SubOp::AllGather { .. })
+    matches!(op, SubOp::AllReduce { .. } | SubOp::AllGather { .. })
 }
 
-/// THE OTHER RANK of a two-rank gate, as one rank's reference reads it: which rank THIS one is (the
-/// collective's operands combine in absolute rank order — `eval_collective`'s law) and the peer's
-/// buffers, indexed by tid like the rank's own, that its collectives read the peer's operand from.
-/// Empty buffers stand for a peer not yet evaluated — the first pass of the lockstep golden, whose
-/// collectives the later passes correct.
+/// THE WORLD of a sharded gate, as one rank's reference reads it: which rank THIS one is and every
+/// rank's buffers, indexed by rank then tid like the rank's own, that its collectives read every
+/// operand from (in absolute rank order — `eval_collective`'s law). An empty rank's buffers stand
+/// for a rank not yet evaluated — the first pass of the lockstep golden, whose collectives the
+/// later passes correct — and read as this rank's own.
 #[derive(Clone, Copy)]
 pub(crate) struct GatePeer<'a> {
     pub rank: u32,
-    pub bufs: &'a [Vec<f32>],
+    pub ranks: &'a [Vec<Vec<f32>>],
 }
 
 impl GatePeer<'_> {
@@ -2783,12 +2793,18 @@ impl GatePeer<'_> {
         ir: &SubtileIR<F>,
         own: &[Vec<f32>],
     ) -> Vec<f32> {
-        let theirs = if self.bufs.is_empty() { own } else { self.bufs };
-        let ranks: [&[Vec<f32>]; 2] = if self.rank == 0 {
-            [own, theirs]
-        } else {
-            [theirs, own]
-        };
+        let ranks: Vec<&[Vec<f32>]> = self
+            .ranks
+            .iter()
+            .enumerate()
+            .map(|(r, b)| {
+                if r as u32 == self.rank || b.is_empty() {
+                    own
+                } else {
+                    b.as_slice()
+                }
+            })
+            .collect();
         scratchy_subtile::tensor_parallel::eval_collective(node, ir, &ranks)
     }
 }
@@ -3701,7 +3717,7 @@ pub fn write_eval_golden<F: RopeForm>(
 /// synth weights (the session's resident bytes, and the clone the reference view decodes), the
 /// load-time constants, the seat, and every probe source (synth at the IR shape, scales as ones,
 /// the rope rows, the compile-time scalars, the length mask). ONE staging for every gate: the
-/// one-rank gate stages it once; the two-rank gate once per rank, with `seed` naming each source's
+/// one-rank gate stages it once; the sharded gate once per rank, with `seed` naming each source's
 /// synth stream — a rank's slice of a sharded source is its own, a replicated source the same on
 /// every rank.
 #[cfg(feature = "spyre-emu")]
@@ -3722,6 +3738,7 @@ fn stage_gate_probe<F: RopeForm>(
     covering: Option<&std::collections::HashSet<u64>>,
     prefill: Option<&PrefillGate>,
     cap: u32,
+    active_cap: ActiveCap,
     seed: &dyn Fn(u32) -> usize,
 ) -> Result<GateProbe, String> {
     // ── The fold list the scales manifest's skip set states ──
@@ -3821,6 +3838,78 @@ fn stage_gate_probe<F: RopeForm>(
         Some(pg) => staged_rope_rows(ir, &pg.rotary_cos, &pg.rotary_sin)?,
         None => Default::default(),
     };
+    // ⭐ THE PAGED STEP, STAGED BY THE WORKER'S OWN LAW (`crate::paged_step`). The gate's one step
+    // is the reference's own: at decode, the rope-append prefix's rows cached and the new token at
+    // the next position; at a first prompt chunk, nothing cached and `mq` rows from position 0. The
+    // request's blocks run the pool's pages in REVERSE, so the walk reads every page through the
+    // table rather than at its block's own index. The reference attends the cache's token-major
+    // rows; the pools the paged walk reads are those SAME values laid into their pages
+    // (`pool_of_rows`), so the two read one set of keys.
+    // One request's step: the gate runs in an emulator bake, whose decode rungs are one request
+    // wide (the batch rungs, `PagedKvPool::BATCH_RUNGS`, bake for the card alone) — a decode
+    // bundle's one row is that request's, read by the batched kernel at one sequence, and a prompt
+    // chunk's rows are one sequence's (the bake's `rows_are_requests`).
+    let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
+        ir,
+        active_cap,
+        scratchy_triton_splice::PagedRows::of_requests(prefill.is_none()),
+    )
+    .map_err(|e| e.0)?;
+    let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
+        SubOp::AttnDecode {
+            mask, attention, ..
+        } => Some(attention.class(mask.class()).head_dim().get() as usize),
+        _ => None,
+    });
+    let pool_tids: std::collections::HashSet<u32> = ir
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            SubOp::AttnDecode { .. } if n.inputs.len() >= 3 => Some([
+                n.inputs[1].tensor.index() as u32,
+                n.inputs[2].tensor.index() as u32,
+            ]),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let step_rows = match (prefill, paged) {
+        (Some(pg), _) => crate::paged_step::StepRows {
+            start: 0,
+            real: pg.mq as usize,
+        },
+        (None, Some(p)) => {
+            let cached = ir
+                .nodes
+                .iter()
+                .filter_map(|n| match &n.op {
+                    SubOp::AttnDecode { .. } if n.inputs.len() >= 5 => {
+                        Some(n.inputs[1].region.rows.len as usize)
+                    }
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            crate::paged_step::StepRows {
+                start: cached.min(p.capacity().saturating_sub(1)),
+                real: 1,
+            }
+        }
+        (None, None) => crate::paged_step::StepRows { start: 0, real: 1 },
+    };
+    // The request's blocks name the pages ONE ON — block `i` is page `i + 1` — so the walk reads
+    // every page through the table rather than at its block's own index, and the pages the step
+    // touches stay at the pool's start (the staging below writes only that prefix).
+    let blocks: Vec<u32> = paged
+        .map(|p| {
+            let need = step_rows.end().div_ceil(p.page_slots as usize) as u32;
+            if need < p.pages {
+                (1..=need).collect()
+            } else {
+                (0..need).collect()
+            }
+        })
+        .unwrap_or_default();
     let mut sources: Vec<(u64, Vec<f32>, Vec<usize>)> = Vec::new();
     for tid in 0..ir.num_sources {
         // The covering slice: a source only the dropped launches read is not
@@ -3835,17 +3924,35 @@ fn stage_gate_probe<F: RopeForm>(
             continue;
         }
         let t = ir.tensors[tid as usize];
-        let n = (t.rows as usize) * (t.cols as usize);
+        // A pool's stimulus is its cached rows alone: the rows past them are no step's, and the
+        // session's own allocation holds them at zero.
+        let n = if pool_tids.contains(&tid) {
+            step_rows.start * t.cols as usize
+        } else {
+            (t.rows as usize) * (t.cols as usize)
+        };
         let vals = if scale_rows.contains(&tid) {
             vec![1.0; n]
         } else if let Some(v) = staged_rope.get(&tid) {
             v.clone()
         } else if let Some(&half) = rope_table_half.get(&tid) {
-            (0..n).map(|j| dbg_synth_val(seed(tid), j % half)).collect()
+            (0..n)
+                .map(|j| dbg_synth_val(tid as usize, j % half))
+                .collect()
         } else {
             (0..n).map(|j| dbg_synth_val(seed(tid), j)).collect()
         };
-        sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize]));
+        match (paged, paged_hd) {
+            (Some(p), Some(hd)) if pool_tids.contains(&tid) => {
+                let pool = crate::paged_step::pool_of_rows(&p, hd, &blocks, &vals, step_rows.start)
+                    .map_err(|e| format!("the gate's pool t{tid}: {e}"))?;
+                if !pool.is_empty() {
+                    let rows = pool.len() / t.cols as usize;
+                    sources.push((tid as u64, pool, vec![rows, t.cols as usize]));
+                }
+            }
+            _ => sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize])),
+        }
     }
     // The compile-time scalars, at their reserved tids — the reader-side law
     // `scalarmul_scales.json` states (same first-seen non-folded walk).
@@ -3863,62 +3970,17 @@ fn stage_gate_probe<F: RopeForm>(
     for (i, v) in sm.iter().enumerate() {
         sources.push((u64::from(scalarmul_scale_tid(i)), vec![*v], vec![1, 1]));
     }
-    // The length mask: the synthetic one-past-the-graph tid (`BundleWiring`'s
-    // own placement law). ⭐ NOT ALL-VALID — the append slot must stay masked.
-    // A rope-append prefix's IR region is sliced to `valid_len - 1` rows (the
-    // keys BEFORE this token) while the spliced program sweeps the rung and
-    // lets THIS mask bound it; all-valid unmasks the append slot itself and
-    // hands the program one extra key the reference does not attend (its
-    // v-cache row is never written — the fresh v rides the new-v segment —
-    // measured: granite decode diverged at every AttnDecode output by exactly
-    // one synth row's v-mix term at weight 1/257). The reference's own key set
-    // is the region, so the mask keeps exactly its rows valid. Pre-populated
-    // prefixes read their region directly (the mask parameter is truncated
-    // away for them), so a tape with no rope-append prefix keeps the
-    // all-valid default — the bind is then simply unused.
-    if let Some(pg) = prefill {
-        // ⭐ THE PREFILL MASK, BY THE RUNTIME'S OWN LAW: the forward's emu
-        // staging binds a `[mq, mq]` clamped causal triangle — the same two
-        // calls the worker's `forward_chunk` composes (`ChunkRows::row_logical_pos`
-        // over `prefill_causal_col_valid`, the SSOT the one-pass kernel's own
-        // `[MQ, MQ]` mask descriptor states) — at a FULL chunk: every row
-        // real, so the clamp is the identity and the golden, which has no
-        // pad-row law, sees exactly the rows the program reads. ⛔ NOT
-        // `CausalKey::mask`: that is the card's `[mq, mq_pad]` stick-padded
-        // layout — a different tensor than the one-pass kernel consumes.
-        let mq = pg.mq as usize;
-        let chunk = scratchy_subtile::sdsc_abstract::ChunkRows::chunk(
-            std::num::NonZeroU32::new(pg.mq).expect("a prefill rung bakes mq > 1"),
-        );
-        let mut m = vec![0.0f32; mq * mq];
-        for r in 0..mq {
-            let pos = chunk.row_logical_pos(r, mq);
-            for c in 0..mq {
-                if !scratchy_subtile::sdsc_abstract::prefill_causal_col_valid(c, pos) {
-                    m[r * mq + c] = -1.0e38;
-                }
-            }
+    // The paged step's three sources, by the worker's law: the mask stack an f16 source like any
+    // other, the page table and the write rows int32 words on the typed channel (the f16 source
+    // channel would encode them into half the bytes their views span).
+    if let Some(p) = paged {
+        let srcs = crate::paged_step::request_sources(&p, &blocks, &step_rows)
+            .map_err(|e| format!("the gate's paged step: {e}"))?;
+        for (tid, bytes, shape) in srcs.int32 {
+            emu_weights.push((tid as usize, bytes, scratchy_tensors::DType::I32, shape));
         }
-        sources.push((u64::from(ir.tensors.len() as u32), m, vec![mq, mq]));
-    } else {
-        let valid_prefix = ir
-            .nodes
-            .iter()
-            .filter_map(|n| match &n.op {
-                SubOp::AttnDecode {
-                    producer:
-                        scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
-                    ..
-                } if n.inputs.len() >= 5 => Some(n.inputs[1].region.rows.len as usize),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(cap as usize);
-        sources.push((
-            u64::from(ir.tensors.len() as u32),
-            crate::manifest::attn_mask_fill(cap as usize, valid_prefix),
-            vec![1, cap as usize],
-        ));
+        let (mask_tid, mask, mask_shape) = srcs.mask;
+        sources.push((u64::from(mask_tid), mask, mask_shape));
     }
     Ok(GateProbe {
         emu_weights,
@@ -4022,7 +4084,7 @@ pub struct GateRung<'a> {
     pub active_cap: ActiveCap,
     /// The slice law of every source, when the rung was baked for a sharded world (the analysis's
     /// `ShardedForward::sources`) — `None` for a world of one. A sharded rung is gated on both
-    /// ranks at once ([`numeric_gate_two_rank`]).
+    /// ranks at once ([`numeric_gate_sharded`]).
     pub shards: Option<&'a [scratchy_subtile::tensor_parallel::SourceShard]>,
 }
 
@@ -4045,7 +4107,7 @@ pub fn numeric_gate<F: RopeForm>(
     // decode mask stages `cap` — both off the ONE param that carried them in.
     let (fp, cap) = (rung.fp, rung.cap);
     // ⛔ A SHARDED FORWARD HAS NO ONE-RANK RUN. Its consumes read the receive window the peer's
-    // send fills, and its collectives have no one-rank reference, so it is gated on both ranks at
+    // send fills, and its collectives have no one-rank reference, so it is gated on every rank at
     // once — below, once the covering slice is known. A sharded rung with no slice laws to stage
     // its ranks by is a bake defect, refused by name.
     let two_rank = match (ir.nodes.iter().find(|n| is_collective(&n.op)), rung.shards) {
@@ -4257,7 +4319,7 @@ pub fn numeric_gate<F: RopeForm>(
         keep
     });
     let covering: Option<&std::collections::HashSet<u64>> = covering_owned.as_ref();
-    // ⭐ A SHARDED RUNG IS GATED ON BOTH RANKS AT ONCE — see [`numeric_gate_two_rank`]: its
+    // ⭐ A SHARDED RUNG IS GATED ON BOTH RANKS AT ONCE — see [`numeric_gate_sharded`]: its
     // consumes read the window the peer's send fills, so the ranks step collective by collective.
     if let Some(shards) = two_rank {
         let mut scope = String::new();
@@ -4270,7 +4332,7 @@ pub fn numeric_gate<F: RopeForm>(
                 t.layers.0, t.layers.1
             ));
         }
-        return numeric_gate_two_rank(TwoRankGate {
+        return numeric_gate_sharded(ShardedGate {
             groups,
             ir,
             weight_ids,
@@ -4279,255 +4341,36 @@ pub fn numeric_gate<F: RopeForm>(
             prefill,
             fp,
             cap,
+            active_cap: rung.active_cap,
             shards,
             scope,
         });
     }
-    // ── Synth weights: staged ONCE for both legs — the emulator's resident
-    //    bytes (moved into the session's HBM below) and the reference legs'
-    //    per-node materialization (the clone the view borrows: `new_multi`
-    //    moves the staging's own bytes, and the golden and the walk both
-    //    outlive the session). The covering filter stages just the weights
-    //    the kept launches read (measured shape: the 12b's full staging is
-    //    ~12 GB of codes, its 7-of-48 covering slice ~1.75 GB); the clone is
-    //    the one transient double, and the slice keeps both sides small. ──
-    let StagedWeights {
-        bytes: mut emu_weights,
+    // ── The probe: ONE staging for every gate (`stage_gate_probe`) — the one-rank gate's sources
+    //    each draw their own tid's synth stream. ──
+    let GateProbe {
+        mut emu_weights,
+        view_bytes,
         gemm,
         scale_rows,
-    } = stage_synth_weights(ir, weight_ids, covering);
-    // ⭐ THE LOAD-TIME CONSTANTS — resident bytes at their TRUE dtypes, staged
-    // into the session exactly as the worker stages them at load: each entry's
-    // kind names the ONE builder (`LoadConst::build`) both legs call, so a
-    // staging defect cannot hide on one leg only. A source the list names is
-    // minted below the `LoweredDecode` binding layer (no `SourceBinding`,
-    // absent from `weight_ids`), so the source loop below would otherwise hand
-    // it to `run_step`'s f16-only source channel — and an fp32 table would
-    // encode into half the bytes its f32 view spans. ⛔ THE REFERENCE LEGS TAKE
-    // THEM THROUGH THE VIEW'S OWN `stage_load_consts`, NOT `bytes`: the clone
-    // crosses BEFORE the entries join the session's staging, because
-    // `materialize` substitutes at every READ (a weight's bytes are its value)
-    // and an OUTPUT-tid entry reaching it would replace the computed product
-    // with its own initial bytes at every consumer (measured: the argmax
-    // mint's widened row read back as its staged zeros, golden idx 0 against
-    // a true argmax of 12358 on both legs).
-    // The ARRANGEMENT FACTS the worker's staging carries — the gate-side twin of the wiring's
-    // merged map (see `staggered_of_ir`'s doc for why lowering the Sample node alone states
-    // it), so the bytes this gate stages into the emulator are the worker's bytes: a table the
-    // propagation marked is staged ALREADY PERMUTED by the same builder both legs call.
-    let staggered = crate::lower_subtile_tape_to_ktir::staggered_of_ir(ir).map_err(|e| e.0)?;
-    let load_consts =
-        crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir, &staggered).map_err(|e| e.0)?;
-    let load_const_tids: std::collections::HashSet<u32> =
-        load_consts.iter().map(|&(tid, _)| tid).collect();
-    let weights_ref = emu_weights.clone();
+        load_consts,
+        staged_rope,
+        mut sources,
+    } = stage_gate_probe(
+        ir,
+        weight_ids,
+        covering,
+        prefill,
+        cap,
+        rung.active_cap,
+        &|tid| tid as usize,
+    )?;
     let view = StagedWeightView {
-        bytes: &weights_ref,
+        bytes: &view_bytes,
         gemm: &gemm,
         scale_rows: &scale_rows,
         load_consts: &load_consts,
     };
-    for &(tid, kind) in &load_consts {
-        let (bytes, dt, shape) = kind.build();
-        emu_weights.push((tid as usize, bytes, dt, shape.to_vec()));
-    }
-    // ⭐ THE SEAT'S OWN STAGING, TYPED — the same greedy law the golden
-    // states (`eval_golden_buffers`' seat block), staged into the session at
-    // the operands' TRUE dtypes so neither rides `run_step`'s f16-only
-    // source channel: the four seed word tables as i32 LE words (each view
-    // is si32, so `set_source_bytes` lands them verbatim through
-    // `weight_arg`'s I32 arm), the inv_t as f32 bytes at [rows, 1] (verbatim
-    // at its own view — the f16 channel would encode it into half the bytes
-    // its f32 view spans, the load-consts comment's own failure mode, and
-    // the gate would compare a golden against a channel-mangled operand).
-    // The emulator is memref-faithful, so each word table stages PACKED at
-    // [rows, 1] — not at the card seat's reservation stride (the worker's
-    // own law, `seed_row_words`).
-    let sample_seat = crate::lower_subtile_tape_to_ktir::sample_seat_of_ir(ir).map_err(|e| e.0)?;
-    if let Some(seat) = &sample_seat {
-        // The greedy law's quadruple `(0, 0, 7, 0)` — one word per table,
-        // in the quadruple's own order (the GATE table's 0 IS the law); the
-        // row word is gone from the key (the P3 localization ruling).
-        const GREEDY_QUAD: [i32; 4] = [0, 0, 7, 0];
-        for (k, &tid) in seat.seed_words.iter().enumerate() {
-            let word_bytes: Vec<u8> = (0..seat.rows)
-                .map(|_| GREEDY_QUAD[k])
-                .flat_map(i32::to_le_bytes)
-                .collect();
-            emu_weights.push((
-                tid as usize,
-                word_bytes,
-                scratchy_tensors::DType::I32,
-                vec![seat.rows as usize, 1],
-            ));
-        }
-        let invt_bytes: Vec<u8> = (0..seat.rows).flat_map(|_| 1.0f32.to_le_bytes()).collect();
-        emu_weights.push((
-            seat.invt as usize,
-            invt_bytes,
-            scratchy_tensors::DType::F32,
-            vec![seat.rows as usize, 1],
-        ));
-    }
-    // ── The probe sources: synth at the IR shape, scales as ones, the mask
-    //    keeping the prefix region's rows valid (the reference's own key set) ──
-    // The rope cos/sin sources stage at their runtime contract — period-`half`,
-    // per [`rope_table_periods`] — not as flat noise.
-    let rope_table_half = rope_table_periods(ir);
-    // ⭐ THE PREFILL ROPE ROWS — ONE LAW, BOTH LEGS (`staged_rope_rows`'s doc):
-    // this product feeds the emulator's probe binds below AND the golden's
-    // source buffers (`eval_golden_buffers`), so a staging defect cannot hide
-    // on one side only. Decode stages nothing here and keeps the period-half
-    // synth below — its tables are one row, where the periodic pattern and
-    // the run-time staging agree by construction.
-    let staged_rope: std::collections::HashMap<u32, Vec<f32>> = match prefill {
-        Some(pg) => staged_rope_rows(ir, &pg.rotary_cos, &pg.rotary_sin)?,
-        None => Default::default(),
-    };
-    // ⭐ THE PAGED STEP, STAGED BY THE WORKER'S OWN LAW (`crate::paged_step`). The gate's one step
-    // is the reference's own: at decode, the rope-append prefix's rows cached and the new token at
-    // the next position; at a first prompt chunk, nothing cached and `mq` rows from position 0. The
-    // request's blocks run the pool's pages in REVERSE, so the walk reads every page through the
-    // table rather than at its block's own index. The reference attends the cache's token-major
-    // rows; the pools the paged walk reads are those SAME values laid into their pages
-    // (`pool_of_rows`), so the two read one set of keys.
-    // One request's step: the gate runs in an emulator bake, whose decode rungs are one request
-    // wide (the batch rungs, `PagedKvPool::BATCH_RUNGS`, bake for the card alone) — a decode
-    // bundle's one row is that request's, read by the batched kernel at one sequence, and a prompt
-    // chunk's rows are one sequence's (the bake's `rows_are_requests`).
-    let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
-        ir,
-        rung.active_cap,
-        scratchy_triton_splice::PagedRows::of_requests(prefill.is_none()),
-    )
-    .map_err(|e| e.0)?;
-    let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
-        SubOp::AttnDecode {
-            mask, attention, ..
-        } => Some(attention.class(mask.class()).head_dim().get() as usize),
-        _ => None,
-    });
-    let pool_tids: std::collections::HashSet<u32> = ir
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.op {
-            SubOp::AttnDecode { .. } if n.inputs.len() >= 3 => Some([
-                n.inputs[1].tensor.index() as u32,
-                n.inputs[2].tensor.index() as u32,
-            ]),
-            _ => None,
-        })
-        .flatten()
-        .collect();
-    let step_rows = match (prefill, paged) {
-        (Some(pg), _) => crate::paged_step::StepRows {
-            start: 0,
-            real: pg.mq as usize,
-        },
-        (None, Some(p)) => {
-            let cached = ir
-                .nodes
-                .iter()
-                .filter_map(|n| match &n.op {
-                    SubOp::AttnDecode { .. } if n.inputs.len() >= 5 => {
-                        Some(n.inputs[1].region.rows.len as usize)
-                    }
-                    _ => None,
-                })
-                .max()
-                .unwrap_or(0);
-            crate::paged_step::StepRows {
-                start: cached.min(p.capacity().saturating_sub(1)),
-                real: 1,
-            }
-        }
-        (None, None) => crate::paged_step::StepRows { start: 0, real: 1 },
-    };
-    // The request's blocks name the pages ONE ON — block `i` is page `i + 1` — so the walk reads
-    // every page through the table rather than at its block's own index, and the pages the step
-    // touches stay at the pool's start (the staging below writes only that prefix).
-    let blocks: Vec<u32> = paged
-        .map(|p| {
-            let need = step_rows.end().div_ceil(p.page_slots as usize) as u32;
-            if need < p.pages {
-                (1..=need).collect()
-            } else {
-                (0..need).collect()
-            }
-        })
-        .unwrap_or_default();
-    let mut sources: Vec<(u64, Vec<f32>, Vec<usize>)> = Vec::new();
-    for tid in 0..ir.num_sources {
-        // The covering slice: a source only the dropped launches read is not
-        // part of the graph under test. The reserved-tid sources appended
-        // below (the scalars, the mask) stay UNfiltered — the twin's programs
-        // bind them exactly as the full bundle does.
-        if weight_ids.contains(&tid)
-            || load_const_tids.contains(&tid)
-            || sample_seat.is_some_and(|s| s.seed_words.contains(&tid) || s.invt == tid)
-            || covering.is_some_and(|c| !c.contains(&(tid as u64)))
-        {
-            continue;
-        }
-        let t = ir.tensors[tid as usize];
-        // A pool's stimulus is its cached rows alone: the rows past them are no step's, and the
-        // session's own allocation holds them at zero.
-        let n = if pool_tids.contains(&tid) {
-            step_rows.start * t.cols as usize
-        } else {
-            (t.rows as usize) * (t.cols as usize)
-        };
-        let vals = if scale_rows.contains(&tid) {
-            vec![1.0; n]
-        } else if let Some(v) = staged_rope.get(&tid) {
-            v.clone()
-        } else if let Some(&half) = rope_table_half.get(&tid) {
-            (0..n)
-                .map(|j| dbg_synth_val(tid as usize, j % half))
-                .collect()
-        } else {
-            (0..n).map(|j| dbg_synth_val(tid as usize, j)).collect()
-        };
-        match (paged, paged_hd) {
-            (Some(p), Some(hd)) if pool_tids.contains(&tid) => {
-                let pool = crate::paged_step::pool_of_rows(&p, hd, &blocks, &vals, step_rows.start)
-                    .map_err(|e| format!("the gate's pool t{tid}: {e}"))?;
-                if !pool.is_empty() {
-                    let rows = pool.len() / t.cols as usize;
-                    sources.push((tid as u64, pool, vec![rows, t.cols as usize]));
-                }
-            }
-            _ => sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize])),
-        }
-    }
-    // The compile-time scalars, at their reserved tids — the reader-side law
-    // `scalarmul_scales.json` states (same first-seen non-folded walk).
-    let folded =
-        |id: scratchy_subtile::subtile_ir::SubtileId| sm_folds.iter().any(|(fid, _, _)| *fid == id);
-    let mut sm: Vec<f32> = Vec::new();
-    for node in &ir.nodes {
-        if let SubOp::ScalarMul { scale } = &node.op
-            && !folded(node.id)
-            && !sm.iter().any(|s| s.to_bits() == scale.to_bits())
-        {
-            sm.push(*scale);
-        }
-    }
-    for (i, v) in sm.iter().enumerate() {
-        sources.push((u64::from(scalarmul_scale_tid(i)), vec![*v], vec![1, 1]));
-    }
-    // The paged step's three sources, by the worker's law: the mask stack an f16 source like any
-    // other, the page table and the write rows int32 words on the typed channel (the f16 source
-    // channel would encode them into half the bytes their views span).
-    if let Some(p) = paged {
-        let srcs = crate::paged_step::request_sources(&p, &blocks, &step_rows)
-            .map_err(|e| format!("the gate's paged step: {e}"))?;
-        for (tid, bytes, shape) in srcs.int32 {
-            emu_weights.push((tid as usize, bytes, scratchy_tensors::DType::I32, shape));
-        }
-        let (mask_tid, mask, mask_shape) = srcs.mask;
-        sources.push((u64::from(mask_tid), mask, mask_shape));
-    }
     // ── Run the bundle on the emulator ──
     // The golden tids, in the writer's own first-seen order — each with the
     // registry name of the op that first produces it (`SubOp::name`, so no
@@ -4668,7 +4511,7 @@ pub fn numeric_gate<F: RopeForm>(
 }
 
 /// One gated run, judged: its readback against its reference — the run's own inputs. One rank's
-/// run of a two-rank gate carries its `peer`, whose buffers the reference's collectives read.
+/// run of a sharded gate carries its world, whose buffers the reference's collectives read.
 #[cfg(feature = "spyre-emu")]
 struct GateRun<'a, F: RopeForm> {
     ir: &'a SubtileIR<F>,
@@ -4697,7 +4540,7 @@ struct GateWorst {
 
 /// ⭐ THE GATE'S VERDICT ON ONE RUN — every compared tensor at its floor, judged on its producing
 /// op's own execution (the teacher-forced walk), the refusal carrying its evidence. The one-rank
-/// gate judges its one run here; the two-rank gate each rank's.
+/// gate judges its one run here; the sharded gate each rank's.
 #[cfg(feature = "spyre-emu")]
 fn judge_gate_run<F: RopeForm>(
     run: GateRun<'_, F>,
@@ -5119,10 +4962,10 @@ impl GoldenIndex {
     }
 }
 
-/// A sharded rung under the two-rank gate — what [`numeric_gate`] hands [`numeric_gate_two_rank`]
+/// A sharded rung under the sharded gate — what [`numeric_gate`] hands [`numeric_gate_sharded`]
 /// once its covering slice and taint map are known.
 #[cfg(feature = "spyre-emu")]
-struct TwoRankGate<'a, F: RopeForm> {
+struct ShardedGate<'a, F: RopeForm> {
     groups: &'a [bundle::LaunchGroup<'static>],
     ir: &'a SubtileIR<F>,
     weight_ids: &'a std::collections::HashSet<u32>,
@@ -5131,12 +4974,13 @@ struct TwoRankGate<'a, F: RopeForm> {
     prefill: Option<&'a PrefillGate>,
     fp: &'a str,
     cap: u32,
+    active_cap: ActiveCap,
     shards: &'a [scratchy_subtile::tensor_parallel::SourceShard],
     scope: String,
 }
 
-/// ⭐⭐ THE TWO-RANK GATE — a sharded rung, run on BOTH ranks at once and judged against the
-/// two-rank reference. The review's law (#1009, item 3): the bundle's own consumes read the window
+/// ⭐⭐ THE SHARDED GATE — a sharded rung, run on EVERY rank at once and judged against the
+/// sharded reference. The review's law (#1009, item 3): the bundle's own consumes read the window
 /// the peer's send filled, so the gate steps the ranks' emulator sessions collective by collective,
 /// exactly as the cards step: each rank runs up to its next consume, the PEER's operand fragment —
 /// what the peer's F-send would land — is staged into this rank's receive window, and the consume
@@ -5146,17 +4990,17 @@ struct TwoRankGate<'a, F: RopeForm> {
 ///   verdict) — the rank's graph evaluated with its collectives read across ranks
 ///   ([`GatePeer`], `tensor_parallel::eval_collective`'s law), the lockstep golden settled to a
 ///   fixed point (each pass resolves one more collective);
-/// - every value the reference holds bit-identical on both ranks — a REPLICATED value — must come
-///   back bit-identical from both emulated ranks (the canonical reduction order's promise).
+/// - every value the reference holds bit-identical on every rank — a REPLICATED value — must come
+///   back bit-identical from every emulated rank (the canonical reduction order's promise).
 ///
 /// A rank's slice of a sharded source draws its own synth stream, so the ranks' partials differ
 /// and a consume that read its own operand twice, or the window at the wrong offset, diverges;
-/// replicated sources are the same on both ranks, as they are on the cards.
+/// replicated sources are the same on every rank, as they are on the cards.
 #[cfg(feature = "spyre-emu")]
-fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), String> {
-    use crate::bundle_code::collective::{TpIdentity, TpWorld, plays_on};
+fn numeric_gate_sharded<F: RopeForm>(gate: ShardedGate<'_, F>) -> Result<(), String> {
+    use crate::bundle_code::collective::{TpIdentity, plays_on};
     use scratchy_subtile::tensor_parallel::SourceShard;
-    let TwoRankGate {
+    let ShardedGate {
         groups,
         ir,
         weight_ids,
@@ -5165,10 +5009,14 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
         prefill,
         fp,
         cap,
+        active_cap,
         shards,
         scope,
     } = gate;
-    let ranks: Vec<TpIdentity> = TpWorld::of::<2>().ranks().collect();
+    // The world the bake sharded the rung for, read off its own collectives.
+    let world = crate::tp_plan::forward_world(ir)?
+        .ok_or_else(|| "a sharded rung with no collective".to_string())?;
+    let ranks: Vec<TpIdentity> = world.ranks().collect();
     // ── Each rank's probe: its slices of the sharded sources on a stream of their own (ONE seed,
     //    read by the session's staging and by the reference alike) ──
     const RANK_STREAM: usize = 1 << 28;
@@ -5186,6 +5034,7 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
             covering,
             prefill,
             cap,
+            active_cap,
             &seed(me.rank() as usize),
         )?);
     }
@@ -5252,8 +5101,9 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
         observables.push((0..nseg).map(|k| session.observable_tids(k)).collect());
         sessions.push(session);
     }
-    // ── The lockstep run: segment k on both ranks, then the window cut each rank's next consume
-    //    reads gets the peer's fragment of the operand it names — what the peer's F-send lands ──
+    // ── The lockstep run: segment k on every rank, then every peer's block of the window cut each
+    //    rank's next consume reads gets that peer's fragment of the operand it names — what the
+    //    peer's F-send lands ──
     // ⛔ THE OPERAND IS THE IR NODE'S, NOT THE BAKED CONSUME'S. A rolled body bakes ONE consume per
     // class and replays it per layer; its `TpConsume::operand` names the class's tid, and the card's
     // send reaches layer `l`'s copy through the launch's layer shift. The gate has no shift to
@@ -5277,18 +5127,23 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
     }
     let mut outs: Vec<std::collections::HashMap<u64, Vec<f32>>> =
         vec![std::collections::HashMap::new(); ranks.len()];
-    // A staged window: `run_step`'s source — the cut's tid, its values, their shape.
+    // A staged window block: `run_step`'s source — the block's tid, its values, their shape.
     type StagedWindow = (u64, Vec<f32>, Vec<usize>);
-    let mut windows: Vec<Option<StagedWindow>> = vec![None; ranks.len()];
+    let mut windows: Vec<Vec<StagedWindow>> = vec![Vec::new(); ranks.len()];
     for k in 0..nseg {
         for (r, session) in sessions.iter_mut().enumerate() {
             let sources = if k == 0 {
                 std::mem::take(&mut probes[r].sources)
             } else {
-                let staged = windows[r]
-                    .take()
-                    .ok_or_else(|| format!("rank {r} reached segment {k} with no window staged"))?;
-                vec![staged]
+                let staged = std::mem::take(&mut windows[r]);
+                if staged.len() + 1 != ranks.len() {
+                    return Err(format!(
+                        "rank {r} reached segment {k} with {} of its {} peers' blocks staged",
+                        staged.len(),
+                        ranks.len() - 1
+                    ));
+                }
+                staged
             };
             let mut want: Vec<(u64, usize)> = golden_index
                 .tids
@@ -5311,38 +5166,6 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
             break;
         }
         for (r, window) in windows.iter_mut().enumerate() {
-            let peer = 1 - r;
-            let Some(c) = segs[peer][k + 1].first().and_then(|g| g.kv.tp) else {
-                return Err(format!(
-                    "rank {peer}'s segment {} does not open with a consume",
-                    k + 1
-                ));
-            };
-            let x = collective_nodes[k].inputs[0];
-            let tid = x.tensor.index();
-            let t = ir.tensors[tid];
-            let (rows, cols) = (t.rows as usize, t.cols as usize);
-            let v = outs[peer].get(&(tid as u64)).ok_or_else(|| {
-                format!(
-                    "rank {peer}'s operand t{tid} for consume {} was not read back",
-                    k + 1
-                )
-            })?;
-            // The fragment's columns are the operand REGION's (`send_fragment` cuts the region).
-            let f = c.fragment;
-            let (r0, fr) = (x.region.rows.start as usize, f.rows() as usize);
-            let (c0, fc) = (
-                (x.region.cols.start + f.first_col()) as usize,
-                f.cols() as usize,
-            );
-            if r0 + fr > rows || c0 + fc > cols || v.len() < rows * cols {
-                return Err(format!(
-                    "rank {peer}'s operand t{tid} [{rows}, {cols}] ({} read back) cannot hold \
-                     the fragment rows {fr} cols [{c0}, {})",
-                    v.len(),
-                    c0 + fc
-                ));
-            }
             // The cut is the RECEIVER's consume's — the one its programs read.
             let Some(mine) = segs[r][k + 1].first().and_then(|g| g.kv.tp) else {
                 return Err(format!(
@@ -5350,11 +5173,45 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
                     k + 1
                 ));
             };
-            let mut win = Vec::with_capacity(fr * fc);
-            for i in r0..r0 + fr {
-                win.extend_from_slice(&v[i * cols + c0..i * cols + c0 + fc]);
+            for peer in ranks[r].peers() {
+                let p = peer.rank() as usize;
+                let Some(c) = segs[p][k + 1].first().and_then(|g| g.kv.tp) else {
+                    return Err(format!(
+                        "rank {p}'s segment {} does not open with a consume",
+                        k + 1
+                    ));
+                };
+                let x = collective_nodes[k].inputs[0];
+                let tid = x.tensor.index();
+                let t = ir.tensors[tid];
+                let (rows, cols) = (t.rows as usize, t.cols as usize);
+                let v = outs[p].get(&(tid as u64)).ok_or_else(|| {
+                    format!(
+                        "rank {p}'s operand t{tid} for consume {} was not read back",
+                        k + 1
+                    )
+                })?;
+                // The fragment's columns are the operand REGION's (`send_fragment` cuts the region).
+                let f = c.fragment;
+                let (r0, fr) = (x.region.rows.start as usize, f.rows() as usize);
+                let (c0, fc) = (
+                    (x.region.cols.start + f.first_col()) as usize,
+                    f.cols() as usize,
+                );
+                if r0 + fr > rows || c0 + fc > cols || v.len() < rows * cols {
+                    return Err(format!(
+                        "rank {p}'s operand t{tid} [{rows}, {cols}] ({} read back) cannot hold \
+                         the fragment rows {fr} cols [{c0}, {})",
+                        v.len(),
+                        c0 + fc
+                    ));
+                }
+                let mut win = Vec::with_capacity(fr * fc);
+                for i in r0..r0 + fr {
+                    win.extend_from_slice(&v[i * cols + c0..i * cols + c0 + fc]);
+                }
+                window.push((u64::from(mine.cut.block_tid(peer)), win, vec![fr, fc]));
             }
-            *window = Some((u64::from(mine.cut.tid()), win, vec![fr, fc]));
         }
     }
     // ── The lockstep reference, to its fixed point ──
@@ -5382,7 +5239,7 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
                     covering,
                     Some(GatePeer {
                         rank: me.rank(),
-                        bufs: &golden[1 - r],
+                        ranks: &golden,
                     }),
                     &seed(r),
                 )
@@ -5396,7 +5253,8 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
     }
     if !settled {
         return Err(format!(
-            "the two-rank reference did not settle in {} passes over {collectives} collective(s)",
+            "the {}-rank reference did not settle in {} passes over {collectives} collective(s)",
+            ranks.len(),
             collectives + 2
         ));
     }
@@ -5411,12 +5269,18 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
             .map(|t| (*t, 0))
             .collect();
         compared += compare.len();
-        let mut peer_bufs: Vec<Vec<f32>> = vec![Vec::new(); ir.tensors.len()];
-        for (t, v) in &outs[1 - r] {
-            if let Some(slot) = peer_bufs.get_mut(*t as usize) {
-                slot.clone_from(v);
-            }
-        }
+        let rank_bufs: Vec<Vec<Vec<f32>>> = outs
+            .iter()
+            .map(|o| {
+                let mut b: Vec<Vec<f32>> = vec![Vec::new(); ir.tensors.len()];
+                for (t, v) in o {
+                    if let Some(slot) = b.get_mut(*t as usize) {
+                        slot.clone_from(v);
+                    }
+                }
+                b
+            })
+            .collect();
         worst.push(
             judge_gate_run(
                 GateRun {
@@ -5433,7 +5297,7 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
                     cap,
                     peer: Some(GatePeer {
                         rank: me.rank(),
-                        bufs: &peer_bufs,
+                        ranks: &rank_bufs,
                     }),
                 },
                 golden[r].clone(),
@@ -5441,20 +5305,21 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
             .map_err(|e| format!("rank {r}: {e}"))?,
         );
     }
-    // ── Replicated values: bit-identical on both emulated ranks ──
+    // ── Replicated values: bit-identical on every emulated rank ──
     let same = |a: &[f32], b: &[f32]| {
         a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
     };
     let mut replicated = 0;
     let mut split: Vec<String> = Vec::new();
     for &t in &golden_index.tids {
-        let (g0, g1) = (&golden[0][t as usize], &golden[1][t as usize]);
-        if g0.is_empty() || !same(g0, g1) {
+        let g0 = &golden[0][t as usize];
+        if g0.is_empty() || !golden.iter().all(|g| same(g0, &g[t as usize])) {
             continue;
         }
-        if let (Some(e0), Some(e1)) = (outs[0].get(&t), outs[1].get(&t)) {
+        let emitted: Option<Vec<&Vec<f32>>> = outs.iter().map(|o| o.get(&t)).collect();
+        if let Some(emitted) = emitted {
             replicated += 1;
-            if !same(e0, e1) {
+            if !emitted.iter().all(|e| same(emitted[0], e)) {
                 split.push(format!(
                     "t{t} ({})",
                     golden_index.op.get(&t).copied().unwrap_or("?")
@@ -5477,11 +5342,12 @@ fn numeric_gate_two_rank<F: RopeForm>(gate: TwoRankGate<'_, F>) -> Result<(), St
         .unwrap_or((0, 0));
     let w = |f: fn(&GateWorst) -> f32| worst.iter().map(f).fold(0f32, f32::max);
     eprintln!(
-        "[spyre-superdsc] NUMERIC GATE PASS {fp} (two ranks, {} gated collective(s) of \
+        "[spyre-superdsc] NUMERIC GATE PASS {fp} ({} ranks, {} gated collective(s) of \
          {collectives}): {compared} rank-tensors at the floor, {replicated} replicated tensors \
          bit-identical across ranks (worst local clean {:.4}, worst local fp8-chained {:.4}; \
          worst total clean {:.4}, worst total fp8-chained {:.4}; LX peak {lx_peak} of {lx_cap} \
          bytes){scope}",
+        ranks.len(),
         collective_nodes.len(),
         w(|g| g.local_clean),
         w(|g| g.local_fp8),
@@ -7048,6 +6914,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // on this bundle reads them off the bundle (never off another graph's wiring).
         num_sources,
         resident_source_tids,
+        tp_world,
         // EMIT-ONLY: a tensor's own frame is what the lowering relays out from; the baked
         // placements carry everything the runtime addresses.
         frames: _,
@@ -7203,6 +7070,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // The graph's own wiring facts — see the destructure above.
         num_sources: *num_sources,
         resident_source_tids: std::borrow::Cow::Owned(resident_source_tids.clone()),
+        tp_world: *tp_world,
     }
 }
 
@@ -10869,64 +10737,85 @@ mod tests {
         );
     }
 
-    /// A sharded bundle's send, as the loader reads it off the BAKED layout, is the partial at its
-    /// own placement into the window at its own — the very bytes the consume reads — and a layout
-    /// that lost the window refuses by name, the bake's gate.
+    /// A sharded bundle's sends, as the loader reads them off the BAKED layout, at every world: each
+    /// rank's consume sends the partial at its own placement into THAT RANK'S block of the window —
+    /// the very bytes every peer's consume reads for it — and a layout that lost the window refuses
+    /// by name, the bake's gate.
     #[test]
-    fn a_baked_send_reads_the_partial_into_the_window() {
+    fn a_baked_send_reads_the_partial_into_its_senders_block() {
         use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
         use crate::tp_plan::{SpyreWorld, tp_bake};
         use ktir_superdsc::ktir_node::ActiveCap;
         use scratchy_subtile::fixtures::mlp_sublayer;
         use scratchy_subtile::subtile_ir::lower_region;
 
-        let b = tp_bake(&mlp_sublayer(2048, 8192), SpyreWorld::of::<2>()).unwrap();
-        let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
-        let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
-        let (ops, layout) =
-            lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
-        // The card path's groups: one per `launch_index` entry, as `into_code` assembles them.
-        let groups: Vec<bundle::LaunchGroup<'static>> = launch_index(&ops, FoldGrouping::Split)
-            .into_iter()
-            .map(|kv| bundle::LaunchGroup {
-                kv,
-                ..Default::default()
-            })
-            .collect();
-        let baked = bake_layout(&layout);
-        let sends = bundle::collective::sends(&baked, &groups).unwrap();
-        assert_eq!(sends.len(), 1, "one all-reduce, one send");
-        let consume = groups[sends[0].group].kv.tp.unwrap();
-        let partial = layout.placements[&consume.operand.tid()];
-        let window = layout.placements[&consume.cut.tid()];
-        assert_eq!(consume.cut, bundle::collective::WindowCut::of_collective(0));
-        assert_eq!(
-            sends[0].send,
-            bundle::collective::TpSend {
-                source_segment: partial.segment as u8,
-                source_offset: partial.offset,
-                window_offset: window.offset,
-                bytes: bundle::collective::CutPayload::new(consume.fragment.bytes()).unwrap(),
-                cut: consume.cut,
+        fn check(w: SpyreWorld) {
+            let world = w.plan();
+            let b = tp_bake(&mlp_sublayer(2048, 8192), w).unwrap();
+            let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
+            let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
+            let (ops, layout) =
+                lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            // The card path's groups: one per `launch_index` entry, as `into_code` assembles them.
+            let groups: Vec<bundle::LaunchGroup<'static>> = launch_index(&ops, FoldGrouping::Split)
+                .into_iter()
+                .map(|kv| bundle::LaunchGroup {
+                    kv,
+                    ..Default::default()
+                })
+                .collect();
+            let baked = bake_layout(&layout);
+            assert_eq!(baked.world(), Some(world), "the bundle carries its world");
+            let sends = bundle::collective::sends(&baked, &groups).unwrap();
+            assert_eq!(
+                sends.len(),
+                world.get() as usize,
+                "one all-reduce, one consume (and its sends) per rank"
+            );
+            for s in &sends {
+                let consume = groups[s.group].kv.tp.unwrap();
+                let me = consume.plays_at.rank();
+                let partial = layout.placements[&consume.operand.tid()];
+                let block = layout.placements[&consume.cut.block_tid(me)];
+                assert_eq!(consume.cut, bundle::collective::WindowCut::of_collective(0));
+                assert_eq!(
+                    s.send,
+                    bundle::collective::TpSend {
+                        source_segment: partial.segment as u8,
+                        source_offset: partial.offset,
+                        window_offset: block.offset,
+                        bytes: bundle::collective::CutPayload::new(
+                            world,
+                            consume.fragment.bytes()
+                        )
+                        .unwrap(),
+                        cut: consume.cut,
+                    }
+                );
             }
-        );
-        let windowless = bundle::BundleLayout {
-            places: baked
-                .places
-                .iter()
-                .filter(|p| p.id != bundle::PlaceId::Act(consume.cut.tid()))
-                .cloned()
-                .collect::<Vec<_>>()
-                .into(),
-            ..baked.clone()
-        };
-        assert_eq!(
-            bundle::collective::sends(&windowless, &groups),
-            Err(bundle::collective::UnplacedGroup {
-                group: sends[0].group,
-                why: bundle::collective::SendUnplaced::Window
-            })
-        );
+            let first = groups[sends[0].group].kv.tp.unwrap();
+            let rank0 = world.rank(0).unwrap();
+            let windowless = bundle::BundleLayout {
+                places: baked
+                    .places
+                    .iter()
+                    .filter(|p| p.id != bundle::PlaceId::Act(first.cut.block_tid(rank0)))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into(),
+                ..baked.clone()
+            };
+            assert_eq!(
+                bundle::collective::sends(&windowless, &groups),
+                Err(bundle::collective::UnplacedGroup {
+                    group: sends[0].group,
+                    why: bundle::collective::SendUnplaced::Window
+                })
+            );
+        }
+        check(SpyreWorld::of::<2>());
+        check(SpyreWorld::of::<4>());
+        check(SpyreWorld::of::<8>());
     }
 
     /// ⛔ THE REFUSAL ITSELF: a layout whose synthetics collide with a real placement is a BUILD

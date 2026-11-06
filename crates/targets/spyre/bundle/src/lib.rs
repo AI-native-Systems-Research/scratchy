@@ -280,9 +280,23 @@ pub struct BundleLayout<'a> {
     /// THIS graph (`< num_sources`). The worker chains the spilled weight tail on at load (a
     /// copy decision the layout cannot make for it) and hands the union to the session.
     pub resident_source_tids: Cow<'a, [u32]>,
+    /// ⭐ THE TENSOR-PARALLEL WORLD THE FORWARD WAS SHARDED FOR — `0` for a world of one, else its
+    /// rank count: the bake's own fact, read back as [`Self::world`]. The window [`Self::places`]
+    /// carries is one block per sender of THIS world, so the world travels with the bundle and a
+    /// card is never asked for it.
+    pub tp_world: u32,
 }
 
 impl<'a> BundleLayout<'a> {
+    /// The tensor-parallel world this bundle was baked for — `None` for a world of one. A count no
+    /// world can be (past the card's sids) is a bake defect the bake refuses before it is stamped,
+    /// so it reads as no world here only on a hand-built layout.
+    pub fn world(&self) -> Option<collective::TpWorld> {
+        (self.tp_world > 1)
+            .then(|| collective::TpWorld::of_analysis_ranks(self.tp_world))
+            .flatten()
+    }
+
     /// The placement of `id`, if this bundle placed it.
     ///
     /// ⛔ BY IDENTITY, NOT BY A FORMATTED NAME. The reserved ids are `u32` consts

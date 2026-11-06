@@ -34,7 +34,7 @@ const _: () = {
     );
 };
 
-use crate::bundle_code::collective::{LandingSlot, RecvWindow, Sid, TpIdentity};
+use crate::bundle_code::collective::{RecvWindow, Sid, TpIdentity};
 
 use flex_rs::address::{Chunk, CompositeAddress, LogicalAddress, RegionId};
 use flex_rs::allocator::{
@@ -1297,44 +1297,6 @@ impl DevAddr {
 //  The p2p link — tensor parallelism's one load-time fact
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// The ids a rank's collective control blocks name: per landing slot, its own sid (its message
-/// into that slot signals on it) and the peer's (its wait for the peer's message into that slot
-/// counts on it, and this card's `XSEG` entry for it points at the slot); and the peer's BAT index
-/// (where its sends land).
-///
-/// The BAT index is the peer's RANK — the vendor's `dest_rank`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PeerRoute {
-    me: TpIdentity,
-    peer: TpIdentity,
-}
-
-impl PeerRoute {
-    /// The route between `me` and its peer. `None` in a world of one.
-    pub fn of(me: TpIdentity) -> Option<Self> {
-        Some(Self {
-            me,
-            peer: me.peer()?,
-        })
-    }
-
-    /// The sid this rank's message into `slot` signals on.
-    pub fn send_sid(self, slot: LandingSlot) -> u8 {
-        Sid::of(self.me, slot).get()
-    }
-
-    /// The sid this rank waits on for the peer's message into `slot` — and the `XSEG` entry this
-    /// card points at the slot.
-    pub fn wait_sid(self, slot: LandingSlot) -> u8 {
-        Sid::of(self.peer, slot).get()
-    }
-
-    /// The peer's BAT index: its rank, which `TpWorld::of` bounds far below a byte.
-    pub fn dest_tid(self) -> u8 {
-        self.peer.rank() as u8
-    }
-}
-
 /// Why a sharded world's cards could not be linked. Each is a load refusal: a topology without
 /// device p2p RDMA is refused, never served over the host.
 #[derive(Debug)]
@@ -1401,7 +1363,6 @@ impl std::error::Error for AttachRefusal {}
 #[derive(Debug)]
 pub struct PeerLink {
     me: TpIdentity,
-    route: PeerRoute,
     window: RecvWindow,
 }
 
@@ -1411,30 +1372,22 @@ impl PeerLink {
         self.me
     }
 
-    /// The ids this card's sends and waits name.
-    pub fn route(&self) -> PeerRoute {
-        self.route
-    }
-
-    /// Where the peer's sends land on this card.
+    /// Where every peer's sends land on this card.
     pub fn window(&self) -> RecvWindow {
         self.window
     }
 }
 
-/// Link a sharded world's cards — `cards[r]` runs rank `r` of `world` — for sends landing in
-/// `window` on every card. One process, every card: each card's base-address table gets every
-/// peer's region-2 address (entry `tid = peer rank`), and its `XSEG` entry for every peer landing
-/// slot points at that slot of its own window. Linking a card again as the same rank for the same
-/// window keeps the link it has.
+/// Link a sharded world's cards — `cards[r]` runs rank `r` of `window.world()` — for sends landing
+/// in `window` on every card. One process, every card: each card's base-address table gets every
+/// peer's region-2 address (entry `tid = peer rank`), and for every peer `s` its `XSEG` entry for
+/// each of `s`'s landing slots (`Sid::of(s, slot)`) points at that slot of `s`'s block of its own
+/// window. Linking a card again as the same rank for the same window keeps the link it has.
 ///
 /// # Errors
 /// [`AttachRefusal`], by name.
-pub fn link_peers(
-    world: crate::bundle_code::collective::TpWorld,
-    cards: &[Arc<CardRuntime>],
-    window: RecvWindow,
-) -> Result<(), AttachRefusal> {
+pub fn link_peers(cards: &[Arc<CardRuntime>], window: RecvWindow) -> Result<(), AttachRefusal> {
+    let world = window.world();
     let ranks: Vec<TpIdentity> = world.ranks().collect();
     if ranks.len() != cards.len() {
         return Err(AttachRefusal::WorldSize {
@@ -1465,29 +1418,30 @@ pub fn link_peers(
                 asked: (me, window),
             });
         }
-        let Some(route) = PeerRoute::of(me) else {
-            // A world of one links nothing: it has no peer.
-            continue;
-        };
         // ⭐ THE SYMMETRIC BAT, AS THE tp37 CELL INSTALLS IT (#1008): entry `tid` — a peer's rank,
-        // the destination every send names — holds that peer card's region-2 PCI address, from
-        // senlib's own region-address door (the vendor's `initialize_p2p_address_table` value
-        // source), for the card the address names, never an enumeration order.
+        // the destination every send names (`cb_plan::base_addr_entry`) — holds that peer card's
+        // region-2 PCI address, from senlib's own region-address door (the vendor's
+        // `initialize_p2p_address_table` value source), for the card the address names, never an
+        // enumeration order.
         for (peer, &addr) in ranks.iter().zip(&region2) {
             if peer.rank() == me.rank() {
                 continue;
             }
-            let tid = peer.rank() as u8;
+            let tid = crate::cb_plan::base_addr_entry(*peer);
             c.card
                 .set_base_addr_table(tid, addr)
                 .map_err(|why| AttachRefusal::Bat { tid, why })?;
         }
-        // ⭐ ONE XSEG ENTRY PER LANDING SLOT, EACH PROGRAMMED ONCE, AS THE tp37 CELL PROGRAMS ITS
-        // ONE: an F-send lands where its sid's entry points and nowhere else (#1009, E8a), so the
-        // peer's message into slot `s` signals `wait_sid(s)` and this card points that entry at the
-        // slot — `hal_sbf::rdma_xseg` of the slot's flat VA plus the one-flit L4 compensation, the
-        // same compensated destination `scheduler::build_rdma_send_cb` hands the send door.
-        for (slot, at) in window.slots() {
+        // ⭐ ONE XSEG ENTRY PER (PEER, LANDING SLOT), EACH PROGRAMMED ONCE, AS THE tp37 CELL
+        // PROGRAMS ITS ONE: an F-send lands where its sid's entry points and nowhere else (#1009,
+        // E8a), so peer `from`'s message into slot `s` signals `Sid::of(from, s)` and this card
+        // points that entry at the slot of `from`'s block — `hal_sbf::rdma_xseg` of the slot's flat
+        // VA plus the one-flit L4 compensation, the same compensated destination
+        // `scheduler::build_rdma_send_cb` hands the send door.
+        for (from, (slot, at)) in me
+            .peers()
+            .flat_map(|from| window.slots_from(from).map(move |sa| (from, sa)))
+        {
             let va = flex_rs::control_block_wire::Flits(
                 flex_rs::control_block_wire::VirtualAddressSbf::new(
                     RecvWindow::SEGMENT as u8,
@@ -1499,11 +1453,11 @@ pub fn link_peers(
             let word = flex_rs::hal_sbf::rdma_xseg(va + flex_rs::control_block_wire::Flits::BYTES)
                 .map_err(AttachRefusal::Xseg)?;
             c.card
-                .write_xseg(route.wait_sid(slot), word)
+                .write_xseg(Sid::of(from, slot).get(), word)
                 .map_err(AttachRefusal::Xseg)?;
         }
         // Set only here, after the card is fully programmed; `get` above saw none.
-        let _ = c.link.set(PeerLink { me, route, window });
+        let _ = c.link.set(PeerLink { me, window });
     }
     Ok(())
 }
@@ -1560,28 +1514,6 @@ mod tests {
             got.iter().map(|w| w.2).sum::<u64>(),
             addr.total_size().as_u64()
         );
-    }
-
-    /// Per landing slot, each rank of a two-rank world signals on its own sid and waits on the
-    /// sid its peer signals for that slot, and lands on the peer's BAT index; a world of one has
-    /// no route.
-    #[test]
-    fn a_route_names_each_slots_sids_and_the_peers_index() {
-        use crate::bundle_code::collective::{TpWorld, WindowCut};
-        let ranks: Vec<TpIdentity> = TpWorld::of::<2>().ranks().collect();
-        let routes = [ranks[0], ranks[1]].map(|r| PeerRoute::of(r).unwrap());
-        assert_eq!(routes.map(|r| r.dest_tid()), [1, 0]);
-        for k in 0..2 {
-            for m in 0..2 {
-                let slot = LandingSlot::of(WindowCut::of_collective(k), m).unwrap();
-                // The two ends of one landing: what rank 0 sends on is what rank 1 waits on.
-                assert_eq!(routes[0].send_sid(slot), routes[1].wait_sid(slot));
-                assert_eq!(routes[1].send_sid(slot), routes[0].wait_sid(slot));
-                assert_ne!(routes[0].send_sid(slot), routes[1].send_sid(slot));
-            }
-        }
-        let alone = TpWorld::of::<1>().ranks().next().unwrap();
-        assert_eq!(PeerRoute::of(alone), None);
     }
 
     /// The Bind shape — the only one `alloc` makes today — walks exactly as `zero_seg`'s old

@@ -407,22 +407,39 @@ fn apply_weight_scale_folds(
     Ok(())
 }
 
-/// ⭐ THE WORLD THIS BUILD SERVES — the one `tp/<W>` names, one card without one. A build-time
-/// fact: nothing at run time selects it.
-#[cfg(feature = "tp-2")]
+/// ⭐ THE WORLD THIS BUILD SERVES — the one `tp/<W>` names, one card without one: the same feature
+/// the bake read for the forwards it emitted, so the worker's `W` and the baked
+/// `TpForward<W>` are one number. A build-time fact; nothing at run time selects it, and naming two
+/// worlds is a build error.
+pub(crate) const TP_WORLD: u32 = {
+    let named = [cfg!(feature = "tp-2"), cfg!(feature = "tp-4"), cfg!(feature = "tp-8")];
+    let worlds = [2, 4, 8];
+    let mut world = 1;
+    let mut i = 0;
+    while i < named.len() {
+        if named[i] {
+            assert!(world == 1, "a build serves one tensor-parallel world: name one `tp/<W>`");
+            world = worlds[i];
+        }
+        i += 1;
+    }
+    world
+};
+
+/// The plan's world for [`TP_WORLD`].
 pub(crate) const WORLD: scratchy_target_spyre::bundle_code::collective::TpWorld =
-    scratchy_target_spyre::bundle_code::collective::TpWorld::of::<2>();
-#[cfg(not(feature = "tp-2"))]
-pub(crate) const WORLD: scratchy_target_spyre::bundle_code::collective::TpWorld =
-    scratchy_target_spyre::bundle_code::collective::TpWorld::of::<1>();
+    scratchy_target_spyre::bundle_code::collective::TpWorld::of::<TP_WORLD>();
+
+/// The sharded forward a `TP_WORLD` build serves — the type the bake emitted `SUPERDSC_TP` as.
+type WorldForward = scratchy_target_spyre::wiring::TpForward<TP_WORLD>;
 
 /// ⭐ ONE RANK'S SHARE OF THE CHECKPOINT. The generated loader binds every weight whole; a rank of
 /// a sharded world stages only its slice of each, by the law the analysis derived for that source
 /// ([`scratchy_target_spyre::wiring::TpForward::slice_source_bytes`]). `whole` is the one-rank
 /// wiring, whose shapes are the tensors' as they sit in the checkpoint.
 pub(crate) struct RankCut {
-    pub(crate) forward: &'static scratchy_target_spyre::wiring::TpForward,
-    pub(crate) me: scratchy_target_spyre::bundle_code::collective::TpIdentity,
+    pub(crate) forward: &'static WorldForward,
+    pub(crate) me: scratchy_target_spyre::wiring::TpRank<TP_WORLD>,
     pub(crate) whole: &'static scratchy_target_spyre::wiring::Wiring,
 }
 
@@ -431,12 +448,12 @@ impl RankCut {
         let &whole = self.whole.tensor_shapes.get(id as usize).ok_or_else(|| {
             werr(format!(
                 "source {id} has no one-rank shape to cut rank {}'s share from",
-                self.me.rank()
+                self.me.get()
             ))
         })?;
         self.forward
             .slice_source_bytes(self.me, id, bytes, elem, whole, is_gemm)
-            .map_err(|e| werr(format!("rank {}: {e}", self.me.rank())))
+            .map_err(|e| werr(format!("rank {}: {e}", self.me.get())))
     }
 }
 
@@ -447,7 +464,7 @@ impl RankCut {
 #[cfg(feature = "spyre-hw")]
 fn sharded_bundle(
     one_rank: &'static SengraphBundle,
-    f: &'static scratchy_target_spyre::wiring::TpForward,
+    f: &'static WorldForward,
 ) -> ExecutorResult<&'static SengraphBundle> {
     use scratchy_target_spyre::manifest::{SengraphBundleData, SengraphBundleGroup};
     let g0 = one_rank
@@ -918,32 +935,30 @@ impl SpyreWorker {
             .superdsc_wiring()
             .and_then(|w| w.downcast_ref::<scratchy_target_spyre::wiring::Wirings>())
             .ok_or_else(|| werr("the matched model exposes no launch wiring"))?;
-        // ⭐ THE WORLD'S FORWARD. A build that bakes a sharded world (`tp/2`) serves it: every rank
+        // ⭐ THE WORLD'S FORWARD. A build that bakes a sharded world (`tp/<W>`) serves it: every rank
         // runs the forward the bake sharded for that world — its own bundles, its own wiring, the
-        // slice law each source loads by — or the load refuses by name; never the one-rank forward,
-        // whose shapes are the whole model's. A one-card build runs the one-rank forward.
+        // slice law each source loads by; never the one-rank forward, whose shapes are the whole
+        // model's. The forward's type IS the world (`TpForward<TP_WORLD>`), so the bake's static and
+        // this read agree by type. A model whose bake skipped the world (its `[spyre-tp]` warning
+        // names why) ships none, and this binary cannot serve it.
         #[cfg(feature = "spyre-hw")]
-        let sharded: Option<&'static scratchy_target_spyre::wiring::TpForward> =
-            if WORLD.is_sharded() {
-                let baked = model
-                    .superdsc_tp()
-                    .and_then(|t| {
-                        t.downcast_ref::<&'static [scratchy_target_spyre::wiring::TpForward]>()
-                    })
-                    .copied()
-                    .ok_or_else(|| werr("the matched model exposes no sharded worlds"))?;
-                let rank0 = WORLD.rank(0).ok_or_else(|| werr("a world has a rank 0"))?;
-                match scratchy_target_spyre::wiring::forward_for(baked, rank0)
-                    .map_err(|e| werr(e.to_string()))?
-                {
-                    scratchy_target_spyre::wiring::WorldForward::Sharded(f) => Some(f),
-                    scratchy_target_spyre::wiring::WorldForward::OneRank => None,
-                }
-            } else {
-                None
-            };
+        let sharded: Option<&'static WorldForward> = if WORLD.is_sharded() {
+            let baked = model
+                .superdsc_tp()
+                .and_then(|t| t.downcast_ref::<&'static [WorldForward]>())
+                .copied()
+                .ok_or_else(|| werr("the matched model exposes no sharded worlds"))?;
+            Some(baked.first().ok_or_else(|| {
+                werr(format!(
+                    "this model baked no {TP_WORLD}-rank forward — its `[spyre-tp]` build warning \
+                     names why"
+                ))
+            })?)
+        } else {
+            None
+        };
         #[cfg(not(feature = "spyre-hw"))]
-        let sharded: Option<&'static scratchy_target_spyre::wiring::TpForward> = None;
+        let sharded: Option<&'static WorldForward> = None;
         let wirings: &'static scratchy_target_spyre::wiring::Wirings =
             sharded.map_or(one_rank, |f| &f.wirings);
         #[cfg(feature = "spyre-hw")]
@@ -990,7 +1005,7 @@ impl SpyreWorker {
         let weights: Vec<Vec<StagedWeight>> = match sharded {
             None => vec![stage_bound_weights(&bound, &wirings.decode, None, gw.allocator_mut())?],
             Some(forward) => {
-                let ranks: Vec<_> = forward.world.ranks().collect();
+                let ranks: Vec<_> = scratchy_target_spyre::wiring::TpRank::<TP_WORLD>::all().collect();
                 let mut sets = Vec::with_capacity(ranks.len());
                 for (i, me) in ranks.iter().enumerate() {
                     let cut = RankCut {
@@ -1343,6 +1358,26 @@ impl SpyreWorker {
                                 .map_err(|e| werr(format!("open Spyre card {r}: {e}")))
                         })
                         .collect::<ExecutorResult<_>>()?;
+                // ⭐ THE CARDS' P2P LINK, BEFORE THE FIRST SESSION LOADS. A sharded world's decode
+                // bundle bakes its receive window for that world; every card's base-address table
+                // gets every peer's card and its `XSEG` entries every peer's landing slots, so every
+                // session below loads against one link per card (`Executor::load` refuses a bundle
+                // whose window is elsewhere, and a sharded one on an unlinked card).
+                if let Some(window) = scratchy_target_spyre::superdsc_exec::RankSeat::baked_window(code)
+                    .map_err(|e| werr(format!("bundle {fp}: {e}")))?
+                {
+                    scratchy_target_spyre::runtime::link_peers(&cards, window)
+                        .map_err(|e| werr(e.to_string()))?;
+                    info!(
+                        "[spyre-worker] linked {} cards over device p2p RDMA, window {window:?}: {}",
+                        cards.len(),
+                        cards
+                            .iter()
+                            .map(|c| c.card().pci().to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
                 // Every rank's pool and segments are cut the same, so the smallest card bounds them.
                 let card_bytes = cards
                     .iter()

@@ -116,6 +116,17 @@ impl TpWorld {
         self.0
     }
 
+    /// The world of `ranks` ranks the shared analysis sharded a forward for (its typed
+    /// `WorldSize`, read off the collective ops at bake) — `None` past [`MAX_WORLD`], which the
+    /// bake refuses by name. The bake's one bridge from the analysis's world to the plan's.
+    pub const fn of_analysis_ranks(ranks: u32) -> Option<Self> {
+        if ranks >= 1 && ranks <= MAX_WORLD {
+            Some(Self(ranks))
+        } else {
+            None
+        }
+    }
+
     /// Rank `r` of this world, `None` past its last rank.
     pub const fn rank(self, r: u32) -> Option<TpIdentity> {
         if r < self.0 {

@@ -453,6 +453,8 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         // single-kernel bundle has no prefix-KV cache for the device to fill and no load-time
         // constant tables for an owner to bind.
         resident_source_tids: std::borrow::Cow::Owned(Vec::new()),
+        // A single-kernel bundle is one card's.
+        tp_world: 0,
     };
 
     println!("  parsed segment_bytes {:?}", segment_bytes);

@@ -356,6 +356,13 @@ pub struct BundleLayout {
     /// read of unfilled memory.
     #[serde(default)]
     pub resident_source_tids: Vec<u32>,
+    /// ⭐ THE TENSOR-PARALLEL WORLD THE FORWARD WAS SHARDED FOR — `0` for a world of one, else its
+    /// rank count, stamped where the receive window is placed (one block per sender, so the
+    /// window's shape IS the world). Every bundle of a forward carries the same number; the loader
+    /// and the CB plan read the window back for this world, never for one a card or a flag
+    /// supplies.
+    #[serde(default)]
+    pub tp_world: u32,
     /// ⭐ EACH GRAPH TENSOR'S OWN FRAME — `tid → [rows, cols]`, the shape its producer wrote it at,
     /// stick-major on the card. A program reads a parameter through a view it states itself, and a
     /// Triton descriptor may state a different frame of the same elements (the decode batch's folded

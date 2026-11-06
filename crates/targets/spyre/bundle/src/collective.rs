@@ -118,6 +118,8 @@ pub enum SendUnplaced {
     WindowCutsApart { cut: usize, offset: u64, size: u64 },
     /// The fragment is wider than one block of the window.
     WindowTooSmall { window: u64, bytes: u64 },
+    /// The window was baked for another world than the consume's rank.
+    WindowWorld { window: u32, consume: u32 },
     /// The operand lives in the weight segment, which a consume launch pins to layer 0's bank-0
     /// copy — a layer-shifted operand would be read at the wrong layer.
     OperandInWeightSegment(crate::PlaceId),
@@ -131,43 +133,47 @@ pub enum SendUnplaced {
     Misaligned { offset: u64 },
 }
 
-/// ⭐ THE WINDOW `layout` BAKES — its cuts' placements read back as the ONE window they are, or
-/// `None` for a bundle with no collective. The bake's send gate and the loader's link check read
-/// it here, so they cannot disagree about where the peer's sends land.
+/// ⭐ THE WINDOW `layout` BAKES FOR ITS WORLD ([`crate::BundleLayout::world`]) — its blocks' placements read back as the ONE window
+/// they tile (every cut, every sender's block of it, adjacent and equal, in order), or `None` for a
+/// bundle with no collective. The bake's send gate and the loader's link read it here, so they
+/// cannot disagree about where a peer's sends land.
 ///
 /// # Errors
-/// A cut missing or misplaced, cuts that are not one window, or an address that is not whole
+/// A block missing or misplaced, blocks that are not one window, or an address that is not whole
 /// flits — by name.
-pub fn baked_window(
-    layout: &crate::BundleLayout<'_>,
-    world: TpWorld,
-) -> Result<Option<RecvWindow>, SendUnplaced> {
-    let cuts = ktir_superdsc::reserved_tids::TP_RECV_CUT_TIDS;
-    let Some(first) = layout.place(crate::PlaceId::Act(cuts[0])) else {
+pub fn baked_window(layout: &crate::BundleLayout<'_>) -> Result<Option<RecvWindow>, SendUnplaced> {
+    let tid = |cut: usize, from: TpIdentity| WindowCut::of_collective(cut).block_tid(from);
+    let Some(world) = layout.world() else {
         return Ok(None);
     };
-    for (i, &tid) in cuts.iter().enumerate() {
-        let cut = layout
-            .place(crate::PlaceId::Act(tid))
+    let Some(rank0) = world.rank(0) else {
+        return Ok(None);
+    };
+    let Some(first) = layout.place(crate::PlaceId::Act(tid(0, rank0))) else {
+        return Ok(None);
+    };
+    for (i, (cut, from)) in (0..WINDOW_CUTS)
+        .flat_map(|c| world.ranks().map(move |r| (c, r)))
+        .enumerate()
+    {
+        let block = layout
+            .place(crate::PlaceId::Act(tid(cut, from)))
             .ok_or(SendUnplaced::Window)?;
-        if cut.segment != RecvWindow::SEGMENT || cut.bank != 0 {
+        if block.segment != RecvWindow::SEGMENT || block.bank != 0 {
             return Err(SendUnplaced::WindowMisplaced {
-                segment: cut.segment,
-                bank: cut.bank,
+                segment: block.segment,
+                bank: block.bank,
             });
         }
-        if cut.size != first.size || cut.offset != first.offset + i as u64 * first.size {
+        if block.size != first.size || block.offset != first.offset + i as u64 * first.size {
             return Err(SendUnplaced::WindowCutsApart {
-                cut: i,
-                offset: cut.offset,
-                size: cut.size,
+                cut,
+                offset: block.offset,
+                size: block.size,
             });
         }
     }
-    // A cut is one block per rank of the world.
-    (first.size.is_multiple_of(u64::from(world.get())))
-        .then(|| Payload::new(first.size / u64::from(world.get())))
-        .flatten()
+    Payload::new(first.size)
         .and_then(|block| RecvWindow::new(world, first.offset, block))
         .map(Some)
         .ok_or(SendUnplaced::Misaligned {
@@ -185,7 +191,13 @@ impl TpSend {
         consume: TpConsume,
     ) -> Result<Self, SendUnplaced> {
         let me = consume.plays_at.rank();
-        let window = baked_window(layout, me.world())?.ok_or(SendUnplaced::Window)?;
+        let window = baked_window(layout)?.ok_or(SendUnplaced::Window)?;
+        if window.world() != me.world() {
+            return Err(SendUnplaced::WindowWorld {
+                window: window.world().get(),
+                consume: me.world().get(),
+            });
+        }
         let bytes = consume.fragment.bytes();
         if bytes.get() > window.block().get() {
             return Err(SendUnplaced::WindowTooSmall {
@@ -402,18 +414,17 @@ mod tests {
     }
 
     /// The window as the bake places it for `world`: `WINDOW_CUTS` adjacent cuts at 1 MiB, each
-    /// one `block`-byte block per rank.
+    /// one `block`-byte placement per sending rank.
     fn window_of(world: TpWorld, block: u64) -> Vec<crate::Placement> {
-        let cut = u64::from(world.get()) * block;
-        ktir_superdsc::reserved_tids::TP_RECV_CUT_TIDS
-            .iter()
+        (0..WINDOW_CUTS)
+            .flat_map(|c| world.ranks().map(move |r| (c, r)))
             .enumerate()
-            .map(|(i, &tid)| {
+            .map(|(i, (c, r))| {
                 placed(
-                    crate::PlaceId::Act(tid),
+                    crate::PlaceId::Act(WindowCut::of_collective(c).block_tid(r)),
                     RecvWindow::SEGMENT,
-                    (1 << 20) + i as u64 * cut,
-                    cut,
+                    (1 << 20) + i as u64 * block,
+                    block,
                 )
             })
             .collect()
@@ -424,9 +435,10 @@ mod tests {
         window
     }
 
-    fn layout(places: Vec<crate::Placement>) -> crate::BundleLayout<'static> {
+    fn layout(world: TpWorld, places: Vec<crate::Placement>) -> crate::BundleLayout<'static> {
         crate::BundleLayout {
             places: places.into(),
+            tp_world: world.get(),
             ..Default::default()
         }
     }
@@ -441,7 +453,7 @@ mod tests {
             let fragment = fragments(4, 256, Payload::new(1024).unwrap()).unwrap()[1];
             let block = WireBytes::CAP.get();
             let operand = placed(crate::PlaceId::Act(7), 0, 8192, 4 * 256 * 2);
-            let places = layout(with(window_of(world, block), operand));
+            let places = layout(world, with(window_of(world, block), operand));
             for me in world.ranks() {
                 for k in 0..WINDOW_CUTS {
                     let cut = WindowCut::of_collective(k);
@@ -475,13 +487,13 @@ mod tests {
     #[test]
     fn the_baked_window_is_its_cuts_read_back() {
         let world = TpWorld::of::<4>();
-        let window = baked_window(&layout(window_of(world, WireBytes::CAP.get())), world)
+        let window = baked_window(&layout(world, window_of(world, WireBytes::CAP.get())))
             .unwrap()
             .unwrap();
         assert_eq!(window.offset(), 1 << 20);
         assert_eq!(window.block(), Payload::from(WireBytes::CAP));
         assert_eq!(window.size(), WINDOW_CUTS as u64 * 4 * WireBytes::CAP.get());
-        assert_eq!(baked_window(&layout(vec![]), world), Ok(None));
+        assert_eq!(baked_window(&layout(world, vec![])), Ok(None));
     }
 
     /// Consecutive collectives alternate cuts, and each one's send lands in its own; the forward's
@@ -492,7 +504,7 @@ mod tests {
         let me = world.rank(0).unwrap();
         let block = WireBytes::CAP.get();
         let operand = placed(crate::PlaceId::Act(7), 0, 0, frag().bytes().get());
-        let places = layout(with(window_of(world, block), operand));
+        let places = layout(world, with(window_of(world, block), operand));
         let groups = [
             consume_group(consume_at(CollectiveKind::AllReduce, me, 0)),
             crate::LaunchGroup::default(),
@@ -508,8 +520,8 @@ mod tests {
         assert_eq!(landed, [(0, 1 << 20), (2, (1 << 20) + cut), (3, 1 << 20)]);
         assert_eq!(WindowCut::baked(1), WindowCut::of_collective(1));
         assert_eq!(
-            WindowCut::of_collective(1).tid(),
-            ktir_superdsc::reserved_tids::TP_RECV_CUT_TIDS[1]
+            WindowCut::of_collective(1).block_tid(me),
+            ktir_superdsc::reserved_tids::tp_recv_block_tid(1, 0)
         );
     }
 
@@ -562,7 +574,7 @@ mod tests {
         let whole = frag().bytes().get();
         let window = || window_of(world, WireBytes::CAP.get());
         let operand = || placed(crate::PlaceId::Act(7), 0, 0, whole);
-        let refusal = |places| TpSend::resolve(&layout(places), consume).unwrap_err();
+        let refusal = |places| TpSend::resolve(&layout(world, places), consume).unwrap_err();
         assert_eq!(refusal(vec![operand()]), SendUnplaced::Window);
         assert_eq!(
             refusal(window()),

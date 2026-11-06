@@ -33,7 +33,7 @@ use crate::fold_plan::{
 };
 use crate::runtime::{
     BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
-    HwError, PeerLink, PeerRoute, Stream,
+    HwError, PeerLink, Stream,
 };
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
@@ -6390,7 +6390,7 @@ impl StepBody {
 }
 
 /// This bundle's launches that the session running as `session` plays, in launch order — every
-/// group of a world of one; a sharded rank's minus the rank-selected consumes of the other rank
+/// group of a world of one; a sharded rank's minus every other rank's consumes
 /// ([`bundle::collective::plays_on`], the law the bundle's CB pipeline reads too). Each consume
 /// carries its send, read off the bundle's baked placements.
 ///
@@ -6419,8 +6419,7 @@ fn bind_ops(
     for (i, g) in code.groups.iter().enumerate() {
         let mut collective = None;
         if let Some(consume) = g.kv.tp {
-            let Some((me, route)) = session.and_then(|me| PeerRoute::of(me).map(|r| (me, r)))
-            else {
+            let Some(me) = session.filter(|me| me.world().is_sharded()) else {
                 bail!(
                     "bundle {} group {i} is a collective's consume, so the bundle was baked for a \
                      sharded world — a world-of-one session cannot run it (link the world's \
@@ -6428,14 +6427,13 @@ fn bind_ops(
                     code.fp
                 );
             };
-            if let Some(at) = consume.plays_at
-                && at.rank().world() != me.world()
-            {
+            let at = consume.plays_at.rank();
+            if at.world() != me.world() {
                 bail!(
                     "bundle {} group {i} was baked for a {}-rank world, but this session is rank \
                      {} of a {}-rank world",
                     code.fp,
-                    at.rank().world().get(),
+                    at.world().get(),
                     me.rank(),
                     me.world().get()
                 );
@@ -6449,7 +6447,7 @@ fn bind_ops(
                     code.fp
                 );
             };
-            collective = Some(cb_plan::BoundCollective { send, route });
+            collective = Some(cb_plan::BoundCollective { send, me });
         }
         ops.push(OpProg::new(g, &code.fp, i, collective));
     }
@@ -6718,8 +6716,9 @@ mod tests {
     /// no link, or the link's window exactly — and every disagreement refuses by name.
     #[test]
     fn a_bundle_runs_only_where_the_process_linked_its_window() {
-        use bundle::collective::{Payload, RecvWindow, WireBytes};
-        let at = |offset| RecvWindow::new(offset, Payload::from(WireBytes::CAP)).unwrap();
+        use bundle::collective::{Payload, RecvWindow, TpWorld, WireBytes};
+        let w = TpWorld::of::<4>();
+        let at = |offset| RecvWindow::new(w, offset, Payload::from(WireBytes::CAP)).unwrap();
         assert_eq!(RankSeat::agree(None, None), Ok(()));
         assert_eq!(
             RankSeat::agree(Some(at(1 << 20)), Some(at(1 << 20))),
@@ -6740,6 +6739,10 @@ mod tests {
                 linked: at(1 << 20)
             })
         );
+        // A window baked for another world is another window, wherever it sits.
+        let other = RecvWindow::new(TpWorld::of::<2>(), 1 << 20, Payload::from(WireBytes::CAP))
+            .unwrap();
+        assert!(RankSeat::agree(Some(other), Some(at(1 << 20))).is_err());
     }
 
     /// A compile-time-named segment cannot be out of range, and a runtime one is checked.

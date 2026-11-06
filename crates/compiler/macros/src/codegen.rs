@@ -10625,6 +10625,25 @@ impl PlacesInterner {
 }
 
 /// The whole memory plan.
+/// ⭐ THE TENSOR-PARALLEL WORLD THIS BUILD BAKES — the one `tp-<W>` feature it names, `1` (no
+/// sharded world) when it names none. ONE fact for the whole expansion: every model is sharded for
+/// it, and the forward it emits is `TpForward<TP_WORLD>`. Two worlds named at once is a build error.
+#[cfg(feature = "spyre")]
+const TP_WORLD: u32 = {
+    let named = [cfg!(feature = "tp-2"), cfg!(feature = "tp-4"), cfg!(feature = "tp-8")];
+    let worlds = [2, 4, 8];
+    let mut world = 1;
+    let mut i = 0;
+    while i < named.len() {
+        if named[i] {
+            assert!(world == 1, "a build bakes one tensor-parallel world: name one `tp/<W>`");
+            world = worlds[i];
+        }
+        i += 1;
+    }
+    world
+};
+
 #[cfg(feature = "spyre")]
 fn layout_tokens(
     l: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BundleLayout<'_>,
@@ -10644,7 +10663,9 @@ fn layout_tokens(
         lx_pin_window_bytes,
         num_sources,
         resident_source_tids,
+        tp_world,
     } = l;
+    let tpw = proc_macro2::Literal::u32_unsuffixed(*tp_world);
     let segs = segment_bytes
         .iter()
         .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
@@ -10719,6 +10740,7 @@ fn layout_tokens(
             lx_pin_window_bytes: #lxpw,
             num_sources: #nsrc,
             resident_source_tids: ::std::borrow::Cow::Borrowed(&[#(#res),*]),
+            tp_world: #tpw,
         }
     }
 }
@@ -11726,24 +11748,24 @@ fn dump_wavefront_mega(
             fold_census: &weight_fold_census,
             weight_seg_ledger: &weight_seg_ledger,
         };
-        // The two-rank world's cells (`SPYRE_TP_WORLDS = [1, 2]`; see the sharded bake below).
-        let tp2_fp = std::cell::RefCell::new(None);
-        let tp2_prefill_fp = std::cell::RefCell::new(None);
-        let tp2_prefill_rungs = std::cell::RefCell::new(Vec::new());
-        let tp2_prefill_prefix_rungs = std::cell::RefCell::new(Vec::new());
-        let tp2_decode_rungs = std::cell::RefCell::new(Vec::new());
-        let tp2_wiring: std::cell::RefCell<WiringPair> = std::cell::RefCell::new((None, None));
-        let tp2_fold_census = std::cell::RefCell::new(None);
-        let tp2_weight_seg_ledger = std::cell::RefCell::new(Vec::new());
-        let two_ranks = WorldBake {
-            fp: &tp2_fp,
-            prefill_fp: &tp2_prefill_fp,
-            prefill_rungs: &tp2_prefill_rungs,
-            prefill_prefix_rungs: &tp2_prefill_prefix_rungs,
-            decode_rungs: &tp2_decode_rungs,
-            wiring: &tp2_wiring,
-            fold_census: &tp2_fold_census,
-            weight_seg_ledger: &tp2_weight_seg_ledger,
+        // The sharded world's cells (`TP_WORLD`; see the sharded bake below).
+        let tp_fp = std::cell::RefCell::new(None);
+        let tp_prefill_fp = std::cell::RefCell::new(None);
+        let tp_prefill_rungs = std::cell::RefCell::new(Vec::new());
+        let tp_prefill_prefix_rungs = std::cell::RefCell::new(Vec::new());
+        let tp_decode_rungs = std::cell::RefCell::new(Vec::new());
+        let tp_wiring: std::cell::RefCell<WiringPair> = std::cell::RefCell::new((None, None));
+        let tp_fold_census = std::cell::RefCell::new(None);
+        let tp_weight_seg_ledger = std::cell::RefCell::new(Vec::new());
+        let sharded_world = WorldBake {
+            fp: &tp_fp,
+            prefill_fp: &tp_prefill_fp,
+            prefill_rungs: &tp_prefill_rungs,
+            prefill_prefix_rungs: &tp_prefill_prefix_rungs,
+            decode_rungs: &tp_decode_rungs,
+            wiring: &tp_wiring,
+            fold_census: &tp_fold_census,
+            weight_seg_ledger: &tp_weight_seg_ledger,
         };
         // ⭐ WHAT ONE BAKE DOES TO THE EXPANSION'S SHARED STATE, recorded in the order it happens and
         // applied by `commit_bake` — so the heavy part of a bake (`emit_bundle_deferred`) touches no
@@ -13544,33 +13566,26 @@ fn dump_wavefront_mega(
                 primary_m,
             );
 
-        // ⭐ THE TWO-RANK WORLD — the same decode forward, sharded by the shared analysis and baked
-        // through the same pipeline into its own world's state. Every collective in it was placed
-        // by `tensor_parallel::shard` from the dataflow; the slice law each source is loaded by
-        // rides out with the wiring (`tp2_sources`).
+        // ⭐ THE SHARDED WORLD — the same decode forward, sharded `TP_WORLD` ways by the shared
+        // analysis and baked through the same pipeline into its own world's state. Every collective
+        // in it was placed by `tensor_parallel::shard` from the dataflow; the slice law each source
+        // is loaded by rides out with the wiring (`tp_sources`).
         //
-        // ⛔ THE ROW IS `[1, 2]`, AND THIS IS ITS ONE SHARDED WORLD. A world added to
-        // `SPYRE_TP_WORLDS` fails the build here until it is baked too.
-        const _: () = assert!(
-            scratchy_target_spyre::bundle_code::collective::SPYRE_TP_WORLDS.len() == 2
-                && scratchy_target_spyre::bundle_code::collective::SPYRE_TP_WORLDS[1] == 2,
-            "SPYRE_TP_WORLDS gained a world the spyre bake does not shard for"
-        );
-        // ⭐ BAKED ONLY WHEN THE BUILD NAMES IT (`tp/2` → this crate's `tp-2`): a build that names
-        // no world bakes none, and ships an empty `SUPERDSC_TP`.
-        let tp2_sources: Option<Vec<scratchy_subtile::tensor_parallel::SourceShard>> = if !cfg!(
-            feature = "tp-2"
-        ) {
+        // ⭐ BAKED ONLY WHEN THE BUILD NAMES IT (`tp/<W>` → this crate's `tp-<W>`, read once as
+        // `TP_WORLD`): a build that names no world bakes none, and ships an empty `SUPERDSC_TP`.
+        let tp_sources: Option<Vec<scratchy_subtile::tensor_parallel::SourceShard>> = if TP_WORLD
+            == 1
+        {
             None
         } else {
-            let world = scratchy_target_spyre::tp_plan::SpyreWorld::of::<2>();
+            let world = scratchy_target_spyre::tp_plan::SpyreWorld::of::<TP_WORLD>();
             let (tp_lwd, sf) = scratchy_subtile::tensor_parallel::shard_lowered(
                 &lowered,
                 world.analysis(),
                 scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
             )
             .unwrap_or_else(|e| {
-                panic!("[spyre-tp] {stem}: the two-rank forward is malformed — {e:?}")
+                panic!("[spyre-tp] {stem}: the {TP_WORLD}-rank forward is malformed — {e:?}")
             });
             let gathers = sf
                 .collectives
@@ -13578,7 +13593,7 @@ fn dump_wavefront_mega(
                 .filter(|c| c.kind == scratchy_subtile::tensor_parallel::CollectiveKind::AllGather)
                 .count();
             eprintln!(
-                "[spyre-tp] {stem}: tp=2 — {} ops, {} all-reduce(s), {gathers} all-gather(s)",
+                "[spyre-tp] {stem}: tp={TP_WORLD} — {} ops, {} all-reduce(s), {gathers} all-gather(s)",
                 tp_lwd.input.ops.len(),
                 sf.collectives.len() - gathers,
             );
@@ -13629,10 +13644,10 @@ fn dump_wavefront_mega(
                 // the drawn token's embedding row on device from the TIED table — the lm head's
                 // own staged weight — and here the analysis split that weight by vocabulary, so
                 // each rank holds half the rows a draw can name. The rank-aware chain (each rank
-                // gathers its half, a non-owner's row zero, the two summed) is not built yet, and
-                // the chain is the only decode path, so this model ships its one-rank world.
+                // gathers its share, a non-owner's row zero, the shares summed) is not built yet,
+                // and the chain is the only decode path, so this model ships its one-rank world.
                 println!(
-                    "cargo:warning=[spyre-tp] {stem}: no tp=2 bundle — its lm head splits by \
+                    "cargo:warning=[spyre-tp] {stem}: no tp={TP_WORLD} bundle — its lm head splits by \
                      vocabulary ({gathers} all-gather), and the decode chained head reads that \
                      tied table whole; the rank-aware chained head is not built yet"
                 );
@@ -13640,7 +13655,7 @@ fn dump_wavefront_mega(
             } else {
                 let (_, fx) = emit_bundle_deferred(
                     &tp_lwd,
-                    format!("ktir_decode_tp2_{stem_id}"),
+                    format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
                     prefix_len.get(),
                     None,
                     None,
@@ -13648,7 +13663,7 @@ fn dump_wavefront_mega(
                     primary_m,
                     Some(&sf.sources),
                 );
-                commit_bake(&two_ranks, &tp_lwd, fx);
+                commit_bake(&sharded_world, &tp_lwd, fx);
                 Some(sf.sources)
             }
         };
@@ -14016,7 +14031,7 @@ fn dump_wavefront_mega(
         // A rung that does not lower PANICS inside its own bake — every entry that reaches
         // the commit below is `Ok`, so the committed ladder is every rung asked for.
         // A rung's bake in each world: the one-rank lowering, its pick and effects, and — when the
-        // two-rank world baked its decode — the rung's two-rank lowering and effects.
+        // sharded world baked its decode — the rung's sharded lowering and effects.
         type RungBake = (
             to_wavefront::LoweredDecode,
             PrefillPick,
@@ -14093,18 +14108,18 @@ fn dump_wavefront_mega(
                     let (r, fx) = bake_rung(&lwd_p, format!("ktir_prefill_{stem_id}"), None);
                     // ⭐ AND THE RUNG IN THE TWO-RANK WORLD, iff that world baked its decode — a
                     // world ships whole or not at all.
-                    let tp2 = tp2_sources.is_some().then(|| {
+                    let tp2 = tp_sources.is_some().then(|| {
                         let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered(
                             &lwd_p,
-                            scratchy_target_spyre::tp_plan::SpyreWorld::of::<2>().analysis(),
+                            scratchy_target_spyre::tp_plan::SpyreWorld::of::<TP_WORLD>().analysis(),
                             scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
                         )
                         .unwrap_or_else(|e| {
-                            panic!("[spyre-tp] {stem}: the two-rank prefill m={pl} is malformed — {e:?}")
+                            panic!("[spyre-tp] {stem}: the {TP_WORLD}-rank prefill m={pl} is malformed — {e:?}")
                         });
                         let (_, fx) = bake_rung(
                             &tp_lwd,
-                            format!("ktir_prefill_tp2_{stem_id}"),
+                            format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
                             Some(&sf_p.sources),
                         );
                         (tp_lwd, fx)
@@ -14129,7 +14144,7 @@ fn dump_wavefront_mega(
                 Ok((lwd_p, r, fx, tp2)) => {
                     commit_bake(&one_rank, &lwd_p, fx);
                     if let Some((tp_lwd, fx)) = tp2 {
-                        commit_bake(&two_ranks, &tp_lwd, fx);
+                        commit_bake(&sharded_world, &tp_lwd, fx);
                     }
                     prefill = Some(r);
                 }
@@ -14252,9 +14267,9 @@ fn dump_wavefront_mega(
         // AND EACH SHARDED WORLD'S, APART: a rank packs its own shard of the weights, one resident
         // segment per rank, which no one-rank bundle shares.
         if let Err(e) = scratchy_target_spyre::lower_subtile_tape_to_superdsc::weight_segment_parity(
-            &two_ranks.weight_seg_ledger.borrow(),
+            &sharded_world.weight_seg_ledger.borrow(),
         ) {
-            panic!("[spyre-superdsc] {stem} (tp=2): {e}");
+            panic!("[spyre-superdsc] {stem} (tp={TP_WORLD}): {e}");
         }
         // ⛔⛔ AND EVERY BUNDLE OF A PHASE PLACES THE REGISTRY ITS PHASE'S WIRING BINDS — the emulator
         // worker stages one wiring's scales for every bundle of a phase. (A card launch binds its own
@@ -14759,17 +14774,18 @@ fn dump_wavefront_mega(
         // decode bundle and its wiring.
         {
             use scratchy_subtile::tensor_parallel::SourceShard as S;
+            let tp_world = proc_macro2::Literal::u32_unsuffixed(TP_WORLD);
             let tp_forwards: Vec<proc_macro2::TokenStream> = match (
-                tp2_fp.borrow().clone(),
-                tp2_wiring.borrow().clone(),
-                tp2_sources.as_ref(),
+                tp_fp.borrow().clone(),
+                tp_wiring.borrow().clone(),
+                tp_sources.as_ref(),
             ) {
                 (Some(fp), (Some(wiring), prefill_wiring), Some(sources)) => {
                     let fp = proc_macro2::Literal::string(&fp);
                     // The prefill bundle and its wiring ship together or not at all, as the
                     // one-rank world's do.
                     let (prefill, prefill_wiring) = match (
-                        tp2_prefill_fp.borrow().clone(),
+                        tp_prefill_fp.borrow().clone(),
                         prefill_wiring,
                     ) {
                         (Some(pfp), Some(pw)) => {
@@ -14803,8 +14819,7 @@ fn dump_wavefront_mega(
                         }
                     });
                     vec![quote! {
-                        ::scratchy_target_spyre::wiring::TpForward {
-                            world: ::scratchy_target_spyre::bundle_code::collective::TpWorld::of::<2>(),
+                        ::scratchy_target_spyre::wiring::TpForward::<#tp_world> {
                             decode: ::scratchy_target_spyre::manifest::KtirBundleData { fp: #fp },
                             prefill: #prefill,
                             wirings: ::scratchy_target_spyre::wiring::Wirings {
@@ -14820,7 +14835,7 @@ fn dump_wavefront_mega(
             ktir_bundle_out.extend(quote! {
                 /// This model's sharded worlds, emitted by `#[forward]` — see
                 /// `scratchy_target_spyre::wiring::TpForward`.
-                pub static SUPERDSC_TP: &[::scratchy_target_spyre::wiring::TpForward] =
+                pub static SUPERDSC_TP: &[::scratchy_target_spyre::wiring::TpForward<#tp_world>] =
                     &[#(#tp_forwards),*];
             });
         }
