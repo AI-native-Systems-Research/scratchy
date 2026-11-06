@@ -115,7 +115,9 @@ pub fn node_for(m: &triton_ktir::ir::Module, program: Program) -> Result<KtirNod
 /// [`emit_node_with`] is the same call with the layout stated explicitly; it exists so the
 /// no-layout arm stays MEASURABLE from the same binary, and so a caller that wants to INSPECT the
 /// plan can build it itself.
-pub fn emit_node(node: &KtirNode) -> Result<Vec<EmittedOp>, Error> {
+pub fn emit_node<T: ktir_superdsc::collective::Tp>(
+    node: &KtirNode,
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let regions = emit::lower_ktir_to_superdsc::regions(node).map_err(|e| Error {
         stage: "regions",
         message: format!("{e:?}"),
@@ -127,10 +129,10 @@ pub fn emit_node(node: &KtirNode) -> Result<Vec<EmittedOp>, Error> {
 /// [`emit_node`] with the layout stated by the caller — `None` selects `ktir-superdsc`'s unit-test
 /// arm (per-op `segment_base(arg_index)`, no scale registry). The DRIVER's `KTIR_NO_LAYOUT=1` path,
 /// kept so "did adding a layout change this verdict?" is a question one binary can answer.
-pub fn emit_node_with(
+pub fn emit_node_with<T: ktir_superdsc::collective::Tp>(
     node: &KtirNode,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let regions = emit::lower_ktir_to_superdsc::regions(node).map_err(|e| Error {
         stage: "regions",
         message: format!("{e:?}"),
@@ -138,11 +140,11 @@ pub fn emit_node_with(
     emit_regions(node, &regions, layout)
 }
 
-fn emit_regions(
+fn emit_regions<T: ktir_superdsc::collective::Tp>(
     node: &KtirNode,
     regions: &[emit::lower_ktir_to_superdsc::Region],
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let mut sym = 0i64;
     let name = node.func.name;
 
@@ -397,7 +399,7 @@ pub enum RopeRows {
 /// unknowns. They come from the fixture's `N_TOK` and `H · HEAD_DIM`, and are CROSS-CHECKED against
 /// the output view here so a geometry that does not belong to this program is a refusal, not an
 /// address.
-pub fn drive_rope(
+pub fn drive_rope<T: ktir_superdsc::collective::Tp>(
     node: &KtirNode,
     head_dim: u32,
     mq: u32,
@@ -405,7 +407,7 @@ pub fn drive_rope(
     rows: RopeRows,
     rows_are_requests: bool,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let name = node.func.name;
     let r = emit::lower_ktir_to_superdsc::regions(node).map_err(|e| Error {
         stage: "regions",
@@ -513,9 +515,9 @@ pub fn drive_rope(
     // monomorphisation nobody asked for; 64/128/256 are the head dims this tree's models state
     // (`rope.py`'s `HEAD_DIM = 128`, and the crate's own slab path exists for hd > 64).
     let out = match head_dim {
-        64 => emit::lower_ktir_to_superdsc::rope_at::<64>(a),
-        128 => emit::lower_ktir_to_superdsc::rope_at::<128>(a),
-        256 => emit::lower_ktir_to_superdsc::rope_at::<256>(a),
+        64 => emit::lower_ktir_to_superdsc::rope_at::<T, 64>(a),
+        128 => emit::lower_ktir_to_superdsc::rope_at::<T, 128>(a),
+        256 => emit::lower_ktir_to_superdsc::rope_at::<T, 256>(a),
         other => {
             return Err(Error {
                 stage: "geometry",
@@ -595,7 +597,10 @@ pub fn dump(node: &KtirNode) -> String {
 /// decoder layer. `emit::whole_function::lower_function` walks the ops instead, handing each body
 /// only its own operands' regions. It recognises nothing: an op with no 1:1 `Program` is refused by
 /// name rather than assigned a node kind on the producer's behalf.
-pub fn emit_whole(node: &KtirNode, layout: Option<&BundleLayout>) -> Result<Vec<EmittedOp>, Error> {
+pub fn emit_whole<T: ktir_superdsc::collective::Tp>(
+    node: &KtirNode,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let mut sym = 0i64;
     ktir_superdsc::emit::whole_function::lower_function(
         node,
@@ -893,7 +898,15 @@ mod rope_from_the_fixture {
         let node = rope_kv8();
         let l = layout::for_node(&node).expect("layout");
         // `EmittedOp` has no `Debug`, so the Ok arm says what it emitted rather than dumping it.
-        let e = match drive_rope(&node, 128, 256, 1024, RopeRows::HeadMajor, false, Some(&l)) {
+        let e = match drive_rope::<ktir_superdsc::collective::TpWorld<1>>(
+            &node,
+            128,
+            256,
+            1024,
+            RopeRows::HeadMajor,
+            false,
+            Some(&l),
+        ) {
             Err(e) => e,
             Ok(ops) => panic!(
                 "a head-major plane reached {} descriptor(s) instead of being refused",
@@ -987,7 +1000,15 @@ mod rope_from_the_fixture {
             x.size,
             cos.size
         );
-        let _ = drive_rope(&node, 128, 256, 1024, RopeRows::TokenMajor, false, Some(&l));
+        let _ = drive_rope::<ktir_superdsc::collective::TpWorld<1>>(
+            &node,
+            128,
+            256,
+            1024,
+            RopeRows::TokenMajor,
+            false,
+            Some(&l),
+        );
     }
 
     /// THE GEOMETRY CROSS-CHECK, from the other side: a geometry that does not belong to this
@@ -1000,7 +1021,15 @@ mod rope_from_the_fixture {
         let l = layout::for_node(&node).expect("layout");
         // H=4 instead of 8: `total` says 4 heads, so the view would have to be `[1024, 128]` and it
         // states `[2048, 128]`.
-        let e = match drive_rope(&node, 128, 256, 512, RopeRows::TokenMajor, false, Some(&l)) {
+        let e = match drive_rope::<ktir_superdsc::collective::TpWorld<1>>(
+            &node,
+            128,
+            256,
+            512,
+            RopeRows::TokenMajor,
+            false,
+            Some(&l),
+        ) {
             Err(e) => e,
             Ok(ops) => panic!(
                 "a 4-head geometry over an 8-head program reached {} descriptor(s)",

@@ -82,7 +82,9 @@ use crate::Error;
 
 /// The files `dxp_standalone -d <dir>` reads, as `(filename, contents)` — `sdsc_N.json` per trip
 /// then `bundle.mlir`, flat, in the order the bundle lists them.
-pub fn dxp_input(ops: &[EmittedOp]) -> Result<Vec<(String, String)>, Error> {
+pub fn dxp_input<T: ktir_superdsc::collective::Tp>(
+    ops: &[EmittedOp<T>],
+) -> Result<Vec<(String, String)>, Error> {
     // ⛔ REFUSE A KTIR-ONLY OP RATHER THAN REACH ITS DESCRIPTOR. `EmittedOp::op` is `None` for one
     // and `dsc()` PANICS on it ("a KTIR op has no SuperDSC descriptor"). Nothing our bodies emit is
     // KTIR-only today, and a bundle short a program is the failure to see, not to skip past.
@@ -127,7 +129,7 @@ pub fn dxp_input(ops: &[EmittedOp]) -> Result<Vec<(String, String)>, Error> {
             );
         }
     }
-    let flat: Vec<(&EmittedOp, SdscOp)> = ops
+    let flat: Vec<(&EmittedOp<T>, SdscOp)> = ops
         .iter()
         .flat_map(|e| trips(e).into_iter().map(move |t| (e, t)))
         .collect();
@@ -163,7 +165,10 @@ pub fn dxp_input(ops: &[EmittedOp]) -> Result<Vec<(String, String)>, Error> {
 
 /// Write [`dxp_input`] into `dir`, creating it. FLAT — the contract is two kinds of file and no
 /// subdirectory.
-pub fn write_dir(dir: &std::path::Path, ops: &[EmittedOp]) -> Result<Vec<String>, Error> {
+pub fn write_dir<T: ktir_superdsc::collective::Tp>(
+    dir: &std::path::Path,
+    ops: &[EmittedOp<T>],
+) -> Result<Vec<String>, Error> {
     let files = dxp_input(ops)?;
     std::fs::create_dir_all(dir).map_err(|e| Error {
         stage: "bake",
@@ -196,7 +201,7 @@ fn bundle_mlir(sdsc_filenames: &[String]) -> String {
 /// TILED tensor's start addresses bumped by `t · affine_strides[ti]["out"]` (the per-trip HBM
 /// advance) and every non-tiled tensor's left alone. Addresses stay concrete, which is what keeps
 /// the bundle free of the `scf.for` that would make dxp's `LoopUnroll` double-reserve symbols.
-fn trips(e: &EmittedOp) -> Vec<SdscOp> {
+fn trips<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> Vec<SdscOp> {
     if e.time <= 1 {
         return vec![e.dsc().clone()];
     }
