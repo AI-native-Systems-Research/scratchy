@@ -11,6 +11,7 @@
 //! fails the build in the constructor that states it.
 
 pub use crate::KvCodec;
+use scratchy_tensors::typed::{Dim, DimN, Divides, FitsIn};
 pub use scratchy_tensors::{MetalDtype, ScaleDtype};
 
 /// A positive count or extent: the constructor refuses zero.
@@ -193,8 +194,46 @@ pub struct HeadGeometry {
 }
 
 impl HeadGeometry {
-    /// The geometry, refused when the kv heads do not divide the query heads (an attention over it
-    /// would read another head's keys) or the rot window is wider than the head.
+    /// The geometry of a model's numbers, as types: its laws are its bounds. The kv heads divide
+    /// the query heads (`Kv: Divides<Q>`: an attention over a remainder would read another head's
+    /// keys), and the rot window fits its head (`Rot: FitsIn<Hd>`). A model's emitted `FACTS`
+    /// states each class through this, so rustc checks both laws for every model.
+    ///
+    /// ```
+    /// # use scratchy_ir::model_facts::{BlockSize, HeadGeometry};
+    /// # use scratchy_tensors::typed::typenum::{U4, U28, U128};
+    /// const G: HeadGeometry = HeadGeometry::of::<U28, U4, U128, U128>(BlockSize::new(16));
+    /// assert_eq!(G.gqa().get(), 7);
+    /// ```
+    ///
+    /// 29 query heads over 4 kv heads have no GQA grouping (E0277):
+    ///
+    /// ```compile_fail,E0277
+    /// # use scratchy_ir::model_facts::{BlockSize, HeadGeometry};
+    /// # use scratchy_tensors::typed::typenum::{U4, U29, U128};
+    /// const G: HeadGeometry = HeadGeometry::of::<U29, U4, U128, U128>(BlockSize::new(16));
+    /// ```
+    ///
+    /// and a rot window wider than its head rotates lanes the head lacks (E0277):
+    ///
+    /// ```compile_fail,E0277
+    /// # use scratchy_ir::model_facts::{BlockSize, HeadGeometry};
+    /// # use scratchy_tensors::typed::typenum::{U8, U32, U64, U128};
+    /// const G: HeadGeometry = HeadGeometry::of::<U32, U8, U64, U128>(BlockSize::new(16));
+    /// ```
+    pub const fn of<Q: Dim, Kv: Divides<Q>, Hd: Dim, Rot: FitsIn<Hd>>(page: BlockSize) -> Self {
+        Self::new(
+            QueryHeads::new(<Q as DimN>::N),
+            KvHeads::new(<Kv as DimN>::N),
+            HeadDim::new(<Hd as DimN>::N),
+            RotDim::new(<Rot as DimN>::N),
+            page,
+        )
+    }
+
+    /// The geometry of values the fill and the bake read, refused when the kv heads do not divide
+    /// the query heads or the rot window is wider than the head: [`HeadGeometry::of`]'s laws, a
+    /// panic here (a build error under const evaluation) where the numbers are values.
     pub const fn new(
         q_heads: QueryHeads,
         kv_heads: KvHeads,

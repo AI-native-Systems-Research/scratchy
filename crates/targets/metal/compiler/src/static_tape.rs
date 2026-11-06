@@ -319,11 +319,12 @@ impl CommandPool {
 /// - its codes by a bound: `affine_codes_agree::<slot, B, G>()`, `B` and `G` the markers of the
 ///   bits and group the bake minted, is E0271 where they are not the handle's;
 /// - an int4-only or matrix-unit kernel's codes by its bound (`int4_codes`, `nax_group`: E0277);
-/// - its n and k — and a dense GEMM's, `__GEMM<slot>.agrees` — by a `const` evaluation (E0080):
-///   a dim is a value until Phase F makes it a type, when n/k become type equality.
+/// - its n and k — and a dense GEMM's — by type equality: `affine_dims_agree::<slot, N, K>()`
+///   (`gemm_dims_agree`), `N` and `K` the numbers the bake baked, as types, is E0271 where they
+///   are not the numbers of the handle's dims.
 ///
 /// The kernels' K and N constants are values, each set once as on any table: a command whose K or
-/// N is not its slot's refuses the bake, so every one is the number the slot's assert ties to its
+/// N is not its slot's refuses the bake, so every one is the number the slot's bound ties to its
 /// handle.
 struct TypedGemms {
     /// The typed families.
@@ -536,8 +537,9 @@ impl TypedGemms {
             quote!(const #c: #tt::GemmSlotWeight = <super::#s as #tt::GemmSlot>::WEIGHT;)
         });
         let gemm_dims = self.gemm_dims.iter().map(|&(ix, n, k)| {
-            let c = Self::gemm(SourceIx(ix));
-            quote!(const _: () = #c.agrees(#n, #k);)
+            let s = crate::canonical::slot(SourceIx(ix));
+            let (n, k) = (unsigned(n), unsigned(k));
+            quote!(const _: () = #tt::gemm_dims_agree::<super::#s, #n, #k>();)
         });
         let sources = self.bound.iter().map(|&ix| {
             let ix = SourceIx(ix);
@@ -551,7 +553,7 @@ impl TypedGemms {
                 quote::format_ident!("B{}", r.bits),
                 quote::format_ident!("G{}", r.group),
             );
-            let (n, k) = (r.n, r.k);
+            let (n, k) = (unsigned(r.n), unsigned(r.k));
             let int4 = r
                 .int4
                 .then(|| quote!(const _: () = #tt::int4_codes::<super::#s>();));
@@ -560,7 +562,7 @@ impl TypedGemms {
                 .then(|| quote!(const _: () = #tt::nax_group::<super::#s>();));
             quote! {
                 const #c: #tt::AffineSlotWeight = <super::#s as #tt::AffineSlot>::WEIGHT;
-                const _: () = #c.agrees(#n, #k);
+                const _: () = #tt::affine_dims_agree::<super::#s, #n, #k>();
                 const _: () = #tt::affine_codes_agree::<super::#s, #w::#b, #w::#g>();
                 #int4
                 #nax
@@ -568,6 +570,12 @@ impl TypedGemms {
         });
         quote!(#(#weights)* #(#gemm_dims)* #(#sources)* #(#affine)*)
     }
+}
+
+/// `n` as its type-level number (`scratchy_tensors::typed::unsigned_path`).
+fn unsigned(n: u32) -> TokenStream {
+    (scratchy_tensors::typed::unsigned_path(u64::from(n)).parse())
+        .expect("a typenum path is Rust tokens")
 }
 
 /// ⭐ EVERY BAKED KERNEL THE BUILD'S MODELS NAME, BY NAME. A model names each of its kernels by

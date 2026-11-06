@@ -111,6 +111,8 @@ pub enum ParamExpr {
     Sub(Box<ParamExpr>, Box<ParamExpr>),
     Mul(Box<ParamExpr>, Box<ParamExpr>),
     Div(Box<ParamExpr>, Box<ParamExpr>),
+    /// `a // b`: the floor quotient, a remainder dropped (`/` is exact).
+    FloorDiv(Box<ParamExpr>, Box<ParamExpr>),
     Sqrt(Box<ParamExpr>),
 }
 
@@ -139,7 +141,7 @@ impl ParamExpr {
                     .ok_or_else(|| format!("{v} - {r} underflows"))?
             }
             Self::Mul(a, b) => a.eval(env)? * b.eval(env)?,
-            Self::Div(a, b) => {
+            Self::Div(a, b) | Self::FloorDiv(a, b) => {
                 let (v, r) = (a.eval(env)?, b.eval(env)?);
                 if r == 0 {
                     return Err(format!("{v} / 0"));
@@ -218,9 +220,12 @@ fn prod(toks: &[&str], pos: &mut usize) -> Result<ParamExpr, String> {
     let mut v = atom(toks, pos)?;
     while let Some(op @ ("*" | "/")) = toks.get(*pos).copied() {
         *pos += 1;
+        let floor = op == "/" && toks.get(*pos).copied() == Some("/");
+        *pos += usize::from(floor);
         let r = atom(toks, pos)?;
-        v = match op {
-            "*" => ParamExpr::Mul(Box::new(v), Box::new(r)),
+        v = match (op, floor) {
+            ("*", _) => ParamExpr::Mul(Box::new(v), Box::new(r)),
+            (_, true) => ParamExpr::FloorDiv(Box::new(v), Box::new(r)),
             _ => ParamExpr::Div(Box::new(v), Box::new(r)),
         };
     }

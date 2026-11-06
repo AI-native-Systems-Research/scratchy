@@ -95,6 +95,11 @@ pub fn dim_type(dim: &Dim, bounds: &mut BTreeSet<String>) -> Result<String, Stri
             dim_type(n, bounds)?,
             dim_type(d, bounds)?
         )),
+        Dim::FloorDiv(n, d) => Ok(format!(
+            "FloorDiv<{}, {}>",
+            dim_type(n, bounds)?,
+            dim_type(d, bounds)?
+        )),
     }
 }
 
@@ -322,6 +327,10 @@ fn expr_dim(c: &Carrier<'_>, name: &str, e: &ParamExpr) -> Result<Dim, String> {
         ParamExpr::Lit(n) => Dim::Lit(*n),
         ParamExpr::Mul(a, b) => canonical_mul(vec![expr_dim(c, name, a)?, expr_dim(c, name, b)?]),
         ParamExpr::Div(a, b) => Dim::Div(
+            Box::new(expr_dim(c, name, a)?),
+            Box::new(expr_dim(c, name, b)?),
+        ),
+        ParamExpr::FloorDiv(a, b) => Dim::FloorDiv(
             Box::new(expr_dim(c, name, a)?),
             Box::new(expr_dim(c, name, b)?),
         ),

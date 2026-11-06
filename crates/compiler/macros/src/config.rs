@@ -125,6 +125,12 @@ pub struct ModelParams {
     /// The activation a routed expert applies to its in-projection, as the config declares it
     /// — see [`ExpertActivation`].
     pub expert_activation: ExpertActivation,
+    /// Each bound the loader derived where the config states none, as the dim it derived it from
+    /// (`head_dim` as `hidden_size / num_attention_heads`, `attn_q_dim` as
+    /// `num_attention_heads * head_dim`, …): the model's dims as types spell each so where it still
+    /// evaluates to the bound's value, which makes its derivation's law (an exact quotient) a bound
+    /// rustc checks.
+    pub derived: BTreeMap<String, crate::dim::Dim>,
 }
 
 pub use crate::bundles::ExpertActivation;
@@ -1707,7 +1713,7 @@ fn model_params_from_json(
             bounds.insert(flag.to_string(), v);
         }
     }
-    derive_implicit_bounds(&mut bounds);
+    let mut derived = derive_implicit_bounds(&mut bounds);
     // Arch-declared bound defaults (zero-centered norms, sliding
     // cadence, router renorm, …): explicit config values always win.
     for (k, v) in &spec.bound_defaults {
@@ -1770,7 +1776,7 @@ fn model_params_from_json(
     let arch = resolve_arch_spec(spec, json, source_stem);
     let expert_activation = ExpertActivation::of(json);
 
-    apply_generic_bound_defaults(&mut bounds);
+    derived.extend(apply_generic_bound_defaults(&mut bounds));
 
     Ok(ModelParams {
         name,
@@ -1792,6 +1798,7 @@ fn model_params_from_json(
         mrope_section,
         arch,
         expert_activation,
+        derived,
     })
 }
 
@@ -1901,7 +1908,7 @@ fn vision_params_from_json(
     }
 
     let expert_activation = ExpertActivation::of(json);
-    apply_generic_bound_defaults(&mut bounds);
+    let derived = apply_generic_bound_defaults(&mut bounds);
 
     Ok(ModelParams {
         name,
@@ -1923,6 +1930,7 @@ fn vision_params_from_json(
         mrope_section: None,
         arch,
         expert_activation,
+        derived,
     })
 }
 
@@ -2672,7 +2680,11 @@ pub(crate) fn derive_layer_sets(
         .collect())
 }
 
-fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
+/// Returns each bound it derived, as the dim it derived it from.
+fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) -> BTreeMap<String, crate::dim::Dim> {
+    use crate::dim::Dim;
+    let mut derived = BTreeMap::new();
+    let bound = |name: &str| Dim::Bound(name.to_string());
     // MLA (DeepSeek family) head_dim — MUST run before the generic
     // hidden/heads rule: MLA's per-head Q/K width is
     // `qk_nope_head_dim + qk_rope_head_dim` (V2-Lite: 128+64=192),
@@ -2685,6 +2697,10 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
         )
     {
         bounds.insert("head_dim".to_string(), nope + rope);
+        derived.insert(
+            "head_dim".to_string(),
+            crate::dim::canonical_add(vec![bound("qk_nope_head_dim"), bound("qk_rope_head_dim")]),
+        );
     }
     if !bounds.contains_key("head_dim")
         && let (Some(&hidden), Some(&heads)) =
@@ -2693,11 +2709,22 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
         && hidden.is_multiple_of(heads)
     {
         bounds.insert("head_dim".to_string(), hidden / heads);
+        derived.insert(
+            "head_dim".to_string(),
+            Dim::Div(
+                Box::new(bound("hidden_size")),
+                Box::new(bound("num_attention_heads")),
+            ),
+        );
     }
     if !bounds.contains_key("num_key_value_heads")
         && let Some(&heads) = bounds.get("num_attention_heads")
     {
         bounds.insert("num_key_value_heads".to_string(), heads);
+        derived.insert(
+            "num_key_value_heads".to_string(),
+            bound("num_attention_heads"),
+        );
     }
     if !bounds.contains_key("sliding_window_global_remainder")
         && let Some(&p) = bounds.get("sliding_window_pattern")
@@ -2723,7 +2750,8 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
     // Geometry dims referenced by weights.json shape exprs — pure
     // arithmetic over checkpoint fields, derived here so the configs/
     // files stay verbatim HF copies. Explicit values always win.
-    crate::dim::derive_dims(bounds, crate::dim::DeriveStage::Implicit);
+    crate::dim::derive_dims(bounds, crate::dim::DeriveStage::Implicit, &mut derived);
+    derived
 }
 
 /// Arch-AGNOSTIC bound defaults applied to every parsed config
@@ -2731,13 +2759,21 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
 /// (zero-centered norms, sliding cadence, tie defaults, …) are NOT
 /// here — they are `bound_defaults` / `tie_default` declarations on
 /// the owning crate's `#[forward]` attribute (see [`crate::arch_spec`]).
-fn apply_generic_bound_defaults(bounds: &mut BTreeMap<String, u64>) {
+///
+/// Returns each bound it derived, as the dim it derived it from.
+fn apply_generic_bound_defaults(
+    bounds: &mut BTreeMap<String, u64>,
+) -> BTreeMap<String, crate::dim::Dim> {
+    use crate::dim::Dim;
+    let mut derived = BTreeMap::new();
+    let bound = |name: &str| Dim::Bound(name.to_string());
     // A drafter reading its target's hidden states and embedding reads them at its target's
     // residual width (Gemma 4's assistant declares it); a head of its target's width omits it.
     if !bounds.contains_key("backbone_hidden_size")
         && let Some(&h) = bounds.get("hidden_size")
     {
         bounds.insert("backbone_hidden_size".to_string(), h);
+        derived.insert("backbone_hidden_size".to_string(), bound("hidden_size"));
     }
     // Per-class attention geometry defaults: uniform-geometry arches
     // never declare global_* keys, but the shape sigs anchor the
@@ -2748,11 +2784,16 @@ fn apply_generic_bound_defaults(bounds: &mut BTreeMap<String, u64>) {
         && let Some(&hd) = bounds.get("head_dim")
     {
         bounds.insert("global_head_dim".to_string(), hd);
+        derived.insert("global_head_dim".to_string(), bound("head_dim"));
     }
     if !bounds.contains_key("num_global_key_value_heads")
         && let Some(&kv) = bounds.get("num_key_value_heads")
     {
         bounds.insert("num_global_key_value_heads".to_string(), kv);
+        derived.insert(
+            "num_global_key_value_heads".to_string(),
+            bound("num_key_value_heads"),
+        );
     }
     // Global-attention-class projection widths (Gemma-4's dual-class
     // attention: the global layers run a wider head with their own KV
@@ -2762,7 +2803,8 @@ fn apply_generic_bound_defaults(bounds: &mut BTreeMap<String, u64>) {
     // defaults above so uniform-geometry arches (where those fall back
     // to `head_dim` / `num_key_value_heads`) resolve these identically
     // to `attn_q_dim` / `kv_dim`. Explicit config values always win.
-    crate::dim::derive_dims(bounds, crate::dim::DeriveStage::AfterDefaults);
+    crate::dim::derive_dims(bounds, crate::dim::DeriveStage::AfterDefaults, &mut derived);
+    derived
 }
 
 /// Normalize a file stem into a valid Rust identifier:

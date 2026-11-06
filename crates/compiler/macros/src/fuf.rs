@@ -715,7 +715,8 @@ mod tests {
                         | Dim::Bound(_)
                         | Dim::Mul(_)
                         | Dim::Add(_)
-                        | Dim::Div(_, _) => {}
+                        | Dim::Div(_, _)
+                        | Dim::FloorDiv(_, _) => {}
                     }
                 }
             }
