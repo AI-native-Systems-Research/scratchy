@@ -506,12 +506,18 @@ fn every_model(carrier: &str) -> Vec<ModelParams> {
         let vision = crate::parse_python::parse_python_file(&source)
             .unwrap()
             .vision;
+        // Load-or-refuse: a config shipping a mixed-bit affine quantization
+        // refuses under a backend that can't lower it (asserted by name inside
+        // the helper) and is skipped; a loadable config always loads.
         return (own.iter())
-            .map(|p| match vision {
-                true => crate::config::load_file_declared_vision(p),
-                false => crate::config::load_file_declared(p),
+            .filter_map(|p| {
+                let stem = p.file_stem().unwrap().to_string_lossy().to_string();
+                let loaded = match vision {
+                    true => crate::config::load_file_declared_vision(p),
+                    false => crate::config::load_file_declared(p),
+                };
+                crate::config::assert_load_or_refuse_by_name(&stem, loaded)
             })
-            .map(|m| m.unwrap())
             .collect();
     }
     let spec = crate::config::load_arch_json(&dir).unwrap();
@@ -521,7 +527,13 @@ fn every_model(carrier: &str) -> Vec<ModelParams> {
             let json: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
             if crate::config::carries_head(&spec, &json) {
-                out.push(crate::config::load_head_file(&p, &dir).unwrap());
+                let stem = p.file_stem().unwrap().to_string_lossy().to_string();
+                if let Some(model) = crate::config::assert_load_or_refuse_by_name(
+                    &stem,
+                    crate::config::load_head_file(&p, &dir),
+                ) {
+                    out.push(model);
+                }
             }
         }
     }

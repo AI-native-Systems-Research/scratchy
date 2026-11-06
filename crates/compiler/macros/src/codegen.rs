@@ -16874,8 +16874,16 @@ mod tests {
         paths.sort();
         let mut stated = 0usize;
         for path in &paths {
-            let model = crate::config::load_file_declared(path)
-                .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+            // Load-or-refuse: a config shipping a mixed-bit affine quantization
+            // refuses under a backend that can't lower it (asserted by name
+            // inside the helper) and is skipped; otherwise it loads.
+            let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+            let Some(model) = crate::config::assert_load_or_refuse_by_name(
+                &stem,
+                crate::config::load_file_declared(path),
+            ) else {
+                continue;
+            };
             let facts = fill_canonical_params(&model, 1, false, &every_layer(&model), None).0;
             // A body with no decoder attention (a vision tower, a drafter head) states
             // no scale — the law is over the configs that do.
@@ -17786,14 +17794,21 @@ mod fingerprint_tests {
     /// merge `load_dir`'s overlay loop performs, for one pair. Same reason
     /// [`config_of`] bypasses `load_dir`: a proc-macro crate has no quant
     /// features, so the overlay loop synthesizes nothing here.
-    fn variant_of(arch: &str, stem: &str, preset: &str) -> crate::config::ModelParams {
+    /// Load one synthesized preset variant, under the load-OR-refuse law: a
+    /// variant whose merged config ships a mixed-bit affine quantization
+    /// refuses under a backend that can't lower it (asserted by name inside
+    /// the helper) and yields `None` — the caller skips it; any other error
+    /// still fails the test loudly.
+    fn variant_of(arch: &str, stem: &str, preset: &str) -> Option<crate::config::ModelParams> {
         let config = arch_configs(arch).join(format!("{stem}.json"));
         let preset_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../models/quantization/presets")
             .join(format!("{preset}.json"));
-        crate::config::load_file_with_preset(&config, &preset_path).unwrap_or_else(|e| {
-            panic!("load {} + {}: {e}", config.display(), preset_path.display())
-        })
+        crate::config::assert_load_or_refuse_by_name(
+            // The synthesized variant's own stem, as the merge names it.
+            &format!("{stem}-{preset}"),
+            crate::config::load_file_with_preset(&config, &preset_path),
+        )
     }
 
     /// The `rope_theta` literal a variant's fingerprint gates on, if any.
@@ -17899,8 +17914,12 @@ mod fingerprint_tests {
     /// both checkpoints and the loser dequantizes with the wrong stride.
     #[test]
     fn the_two_qwen3_5_moe_stems_resolve_different_gate_widths() {
-        let v3_5 = variant_of("qwen3-5-moe", "qwen3.5-35b-a3b", "mlx-affine-b4-g64-qembed");
-        let v3_6 = variant_of("qwen3-5-moe", "qwen3.6-35b-a3b", "mlx-affine-b4-g64-qembed");
+        let (Some(v3_5), Some(v3_6)) = (
+            variant_of("qwen3-5-moe", "qwen3.5-35b-a3b", "mlx-affine-b4-g64-qembed"),
+            variant_of("qwen3-5-moe", "qwen3.6-35b-a3b", "mlx-affine-b4-g64-qembed"),
+        ) else {
+            return;
+        };
 
         // The premise: nothing else can tell them apart.
         for key in [
@@ -17939,7 +17958,9 @@ mod fingerprint_tests {
     /// disagreeing with the tensor the loader reads.
     #[test]
     fn the_gemma4_moe_router_width_comes_from_the_declared_override() {
-        let v = variant_of("gemma4-moe", "gemma-4-26b-a4b-it", "mlx-affine-b4-g64");
+        let Some(v) = variant_of("gemma4-moe", "gemma-4-26b-a4b-it", "mlx-affine-b4-g64") else {
+            return;
+        };
         assert_eq!(
             resolved_role_bits(&v, "router.proj"),
             Some(8),
@@ -18066,7 +18087,12 @@ mod fingerprint_tests {
             let model = if preset.is_empty() {
                 config_of(arch, stem)
             } else {
-                variant_of(arch, stem, preset)
+                match variant_of(arch, stem, preset) {
+                    Some(model) => model,
+                    // Load-or-refuse: a mixed-bit variant skips under a
+                    // backend that can't lower it.
+                    None => continue,
+                }
             };
             let (_, fuf) = fuf_of(arch, &model);
             assert_eq!(
@@ -18116,7 +18142,9 @@ mod fingerprint_tests {
                 None,
             ),
         ] {
-            let model = variant_of(arch, stem, preset);
+            let Some(model) = variant_of(arch, stem, preset) else {
+                continue;
+            };
             let (_, fuf) = fuf_of(arch, &model);
             let kv = KvCacheLayers::of(&fuf);
             let attention: Vec<u32> = model.layer_sets["attention_layers"]
@@ -18164,8 +18192,8 @@ mod fingerprint_tests {
     #[test]
     fn the_latent_and_plain_nemotron_moe_probe_different_expert_input_widths() {
         let preset = "mlx-affine-b4-g64-qembed";
-        let probe = |arch: &str, stem: &str| {
-            let model = variant_of(arch, stem, preset);
+        let probe = |arch: &str, stem: &str| -> Option<_> {
+            let model = variant_of(arch, stem, preset)?;
             let (program, fuf) = fuf_of(arch, &model);
             let last_moe = *model.layer_sets["moe_layers"].members().last().unwrap();
             let probe = expert_input_probe(&program, &fuf, &model).expect("an ungated bank");
@@ -18178,13 +18206,17 @@ mod fingerprint_tests {
                 ],
                 "{stem}: probed at the last MoE layer, in the loaders' spelling order"
             );
-            (model.bounds["hidden_size"], probe.packed_cols)
+            Some((model.bounds["hidden_size"], probe.packed_cols))
         };
-        let (nano_h, nano) = probe("nemotron-h", "nemotron-3-nano-30b-a3b-parity-tiny");
-        let (super_h, sup) = probe(
-            "nemotron-h-latent",
-            "nemotron-3-super-120b-a12b-parity-tiny",
-        );
+        let (Some((nano_h, nano)), Some((super_h, sup))) = (
+            probe("nemotron-h", "nemotron-3-nano-30b-a3b-parity-tiny"),
+            probe(
+                "nemotron-h-latent",
+                "nemotron-3-super-120b-a12b-parity-tiny",
+            ),
+        ) else {
+            return;
+        };
         assert_eq!(
             nano_h, super_h,
             "premise: the tiny pair shares its hidden size"
@@ -18199,20 +18231,26 @@ mod fingerprint_tests {
         // The real checkpoints: Nano-4bit is uniform; Super's last MoE layer (87) is a 4/4 bundle
         // on the 1024-wide latent.
         assert_eq!(
-            probe("nemotron-h", "nemotron-3-nano-30b-a3b").1,
+            probe("nemotron-h", "nemotron-3-nano-30b-a3b")
+                .expect("uniform variant loads")
+                .1,
             2688 * 4 / 32
         );
-        assert_eq!(
-            probe("nemotron-h-latent", "nemotron-3-super-120b-a12b").1,
-            1024 * 4 / 32
-        );
+        // Super's own checkpoint is an OptiQ mixed-bit variant: it asserts
+        // under a backend that can lower it, and refuses (skipping) elsewhere.
+        if let Some((_, sup_real)) = probe("nemotron-h-latent", "nemotron-3-super-120b-a12b") {
+            assert_eq!(sup_real, 1024 * 4 / 32);
+        }
         assert!(
-            expert_input_probe(
-                &layout_test_program(&[]),
-                &Fuf { nodes: Vec::new() },
-                &variant_of("qwen3-5-moe", "qwen3.5-35b-a3b", preset)
-            )
-            .is_none(),
+            variant_of("qwen3-5-moe", "qwen3.5-35b-a3b", preset)
+                .map(|model| {
+                    expert_input_probe(
+                        &layout_test_program(&[]),
+                        &Fuf { nodes: Vec::new() },
+                        &model,
+                    )
+                })
+                .is_none_or(|probe| probe.is_none()),
             "a gated bank's leaf names live in the loaders; no probe is claimed for it",
         );
     }
@@ -18224,11 +18262,13 @@ mod fingerprint_tests {
     #[test]
     fn the_super_optiq_fingerprint_probes_tensors_the_checkpoint_has() {
         let arch = "nemotron-h-latent";
-        let model = variant_of(
+        let Some(model) = variant_of(
             arch,
             "nemotron-3-super-120b-a12b",
             "mlx-affine-b4-g64-qembed",
-        );
+        ) else {
+            return;
+        };
         let first_attn = *model.layer_sets["attention_layers"]
             .members()
             .first()
@@ -18338,11 +18378,13 @@ mod fingerprint_tests {
     #[test]
     fn an_experts_only_per_module_variant_sniffs_its_affine_tensors_positively() {
         let arch = "nemotron-h";
-        let model = variant_of(
+        let Some(model) = variant_of(
             arch,
             "nemotron-3-nano-30b-a3b-parity-tiny",
             "mlx-affine-b4-g64-qembed",
-        );
+        ) else {
+            return;
+        };
         let expert_rows = vec![(
             "backbone.layers.1.mixer.switch_mlp.fc1.weight".to_string(),
             4,
@@ -18631,12 +18673,16 @@ mod fingerprint_tests {
     /// wrong width if the shapes happened to agree).
     #[test]
     fn gpt_oss_attn4_preset_gates_the_embed_at_the_override_width() {
-        let proper = variant_of(
-            "gpt-oss",
-            "gpt-oss-120b",
-            "mlx-affine-b2-g64-attn4-router8-qembed",
-        );
-        let plain = variant_of("gpt-oss", "gpt-oss-120b", "mlx-affine-b2-g64-qembed");
+        let (Some(proper), Some(plain)) = (
+            variant_of(
+                "gpt-oss",
+                "gpt-oss-120b",
+                "mlx-affine-b2-g64-attn4-router8-qembed",
+            ),
+            variant_of("gpt-oss", "gpt-oss-120b", "mlx-affine-b2-g64-qembed"),
+        ) else {
+            return;
+        };
 
         // Premise: both variants are the same model at the same group size —
         // they differ ONLY in the per-role bit map.

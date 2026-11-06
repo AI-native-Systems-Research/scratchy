@@ -284,6 +284,17 @@ pub enum ConfigError {
         path: PathBuf,
         limit: serde_json::Value,
     },
+    /// A config's quant spec carries per-module (mixed-bit, OptiQ/DWQ) affine
+    /// overrides that this backend cannot lower (only metal reads the
+    /// per-tensor widths back: `unpack_moe_expert_bits` /
+    /// `affine_gather_qmv_symbol`). Raised at the ONE place the quant spec is
+    /// decided — `parse_quantization` — naming the config and WHICH tensors
+    /// are mixed-bit. The build refuses; it never silently emits nothing and
+    /// lets a later "no models selected" panic stand in for the fact.
+    MixedBitAffine {
+        stem: String,
+        tensors: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -315,6 +326,13 @@ impl std::fmt::Display for ConfigError {
                 "{}: time_step_limit {limit} clips Mamba-2's dt, which no kernel realizes \
                  (only the unclipped default, absent or `[0.0, null]`, is supported)",
                 path.display()
+            ),
+            Self::MixedBitAffine { stem, tensors } => write!(
+                f,
+                "{stem}: ships a mixed-bit (OptiQ) affine quantization — per-tensor width \
+                 overrides only metal lowers; this backend cannot compile it. Mixed-bit \
+                 tensors: {}",
+                tensors.join(", ")
             ),
         }
     }
@@ -791,10 +809,7 @@ fn load_dir_mode(
         // needs to stay in `base_raw` so a matching quant variant can be
         // synthesized from it below. `arch_has_active_quant` gates it too:
         // a selected quant preset replaces dense, it doesn't add to it.
-        if stem_matches_build_filter(&stem)
-            && !arch_has_active_quant
-            && (cfg!(feature = "metal") || !ships_mixed_bit_affine(&json))
-        {
+        if stem_matches_build_filter(&stem) && !arch_has_active_quant {
             tracing::info!("[COMPILING] base {}", stem);
             let model = model_params_from_json_mode(&json, &stem, p, tracked, mode, spec)?;
             out.push(model);
@@ -955,15 +970,12 @@ fn model_configs(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     Ok(configs)
 }
 
-/// Arches that also compile for spyre (KTIR). Must agree with the arches `scratchy-models`'
-/// `spyre` feature enables.
-const SPYRE_CAPABLE_ARCHES: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
-
-/// Whether `arch` compiles in this build: its `arch-<name>` feature is on, and so is a backend it
-/// compiles for. `scratchy-models`' build script runs an arch's pipeline only then (its
-/// `src/lib.rs` gates each arch's `pub mod` the same way), and a target bakes in the facts of the
-/// heads that compile beside it alone. Read from Cargo's `CARGO_FEATURE_*`, in the build script's
-/// process.
+/// Whether `arch` compiles in this build: its `arch-<name>` feature is on, and so is a
+/// backend. `scratchy-models`' build script runs an arch's pipeline only then (its
+/// `src/lib.rs` gates each arch's `pub mod` the same way), and a target bakes in the facts
+/// of the heads that compile beside it alone. Read from Cargo's `CARGO_FEATURE_*`, in the
+/// build script's process. Whether an arch ACTUALLY lowers is each lowering's verdict —
+/// an op with no spyre lowering is a build error naming it, not a silent skip here.
 pub fn arch_compiled(arch: &str) -> bool {
     arch_compiled_with(arch, |feature| {
         let var = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
@@ -973,9 +985,7 @@ pub fn arch_compiled(arch: &str) -> bool {
 
 /// [`arch_compiled`] under the features `on` reports.
 fn arch_compiled_with(arch: &str, on: impl Fn(&str) -> bool) -> bool {
-    let spyre = SPYRE_CAPABLE_ARCHES.contains(&arch) && on("spyre");
-    let backend = on("metal") || spyre;
-    on(&format!("arch-{arch}")) && backend
+    on(&format!("arch-{arch}")) && (on("metal") || on("spyre"))
 }
 
 /// Every arch dir under `configs/`.
@@ -1107,6 +1117,34 @@ pub fn load_file_declared(config_path: &Path) -> Result<ModelParams, ConfigError
     load_file_declared_mode(config_path, ConfigMode::Decoder)
 }
 
+/// The load-OR-refuse law, stated once for tests: a config either loads, or —
+/// under a backend that cannot lower its mixed-bit (OptiQ) affine
+/// quantization — the loader refuses NAMING the config and its mixed-bit
+/// tensors. A well-formed refusal is asserted here and returned as `None`
+/// (the caller skips the config); any other error still fails the test
+/// loudly. Under a backend that lowers mixed-bit affine this never refuses.
+#[cfg(test)]
+pub(crate) fn assert_load_or_refuse_by_name(
+    stem: &str,
+    result: Result<ModelParams, ConfigError>,
+) -> Option<ModelParams> {
+    match result {
+        Ok(model) => Some(model),
+        Err(ConfigError::MixedBitAffine {
+            stem: refused,
+            tensors,
+        }) => {
+            assert_eq!(refused, stem, "the refusal names its config");
+            assert!(
+                !tensors.is_empty(),
+                "{stem}: the refusal names its mixed-bit tensors"
+            );
+            None
+        }
+        Err(e) => panic!("{stem}: {e}"),
+    }
+}
+
 /// [`load_file_declared`] for a `@vision_forward` carrier's config: its `vision_*` bounds derived
 /// as [`load_dir_vision`] derives them.
 #[cfg(test)]
@@ -1156,25 +1194,6 @@ pub fn load_head_file(
 /// Read + parse a JSON file, returning the raw string (for
 /// diagnostics) and the parsed `Value`. Centralized so
 /// `ConfigError::{Io, Json}` always carry the right path.
-/// Whether a base config ships its own MIXED-BIT affine quantization — an
-/// OptiQ checkpoint: a `quantization_config` carrying PER-TENSOR overrides
-/// (`"...embed_tokens": { "bits": 8, .. }`) on top of the scalar
-/// `group_size`/`bits`/`mode`, rather than one width for the whole model.
-///
-/// Only metal lowers those today: the per-projection widths are read back by
-/// `unpack_moe_expert_bits` / `affine_gather_qmv_symbol`.
-///
-/// So `all` is BACKEND-RELATIVE for these, exactly as it already is for
-/// synthesized quant variants via `quant_preset_active` above: the same
-/// feature names every checked-in config, and each backend emits the subset
-/// it can actually lower. Derived from the config's own contents, not a stem
-/// list, so a new OptiQ checkpoint is covered the day it lands.
-fn ships_mixed_bit_affine(json: &serde_json::Value) -> bool {
-    json.get("quantization_config")
-        .and_then(|q| q.as_object())
-        .is_some_and(|q| q.values().any(|v| v.is_object()))
-}
-
 fn read_json_file(path: &Path) -> Result<(String, serde_json::Value), ConfigError> {
     let contents = fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
@@ -1528,12 +1547,30 @@ fn parse_architectures(json: &serde_json::Value) -> Vec<String> {
 
 fn parse_quantization(
     json: &serde_json::Value,
+    stem: &str,
     source_path: &Path,
 ) -> Result<Option<crate::quantization::QuantizationConfig>, ConfigError> {
-    crate::quantization::QuantizationConfig::parse(json).map_err(|e| ConfigError::Quantization {
-        path: source_path.to_path_buf(),
-        source: e,
-    })
+    let parsed = crate::quantization::QuantizationConfig::parse(json).map_err(|e| {
+        ConfigError::Quantization {
+            path: source_path.to_path_buf(),
+            source: e,
+        }
+    })?;
+    // THE one place mixed-bit-ness is decided: the quant spec itself. A
+    // per-module (OptiQ/DWQ) override map is a fact of the checkpoint; a
+    // backend that cannot lower it refuses here, by name, listing the
+    // tensors — no second, downstream re-derivation from the raw JSON.
+    if let Some(cfg) = &parsed
+        && let crate::quantization::QuantMethod::Affine { per_module, .. } = &cfg.method
+        && !per_module.is_empty()
+        && !cfg!(feature = "metal")
+    {
+        return Err(ConfigError::MixedBitAffine {
+            stem: stem.to_string(),
+            tensors: per_module.iter().map(|(k, _)| k.clone()).collect(),
+        });
+    }
+    Ok(parsed)
 }
 
 /// `None` (field absent) lets `apply_arch_semantic_defaults` supply
@@ -1705,7 +1742,7 @@ fn model_params_from_json(
     for (k, v) in &spec.scalar_defaults {
         scalars.entry(k.clone()).or_insert(*v);
     }
-    let quantization = parse_quantization(json, source_path)?;
+    let quantization = parse_quantization(json, source_stem, source_path)?;
     // An in-checkpoint head reads its target's config, whose `tie_word_embeddings` says where the
     // TARGET keeps its lm_head (Qwen3.5-0.8B: in its embedding table). The head's lm_head is a
     // slot of its own the target lends either way (`target.lent_weight_prefix`), never its embedding.
@@ -1829,7 +1866,7 @@ fn vision_params_from_json(
     let tie_word_embeddings = parse_tie_word_embeddings(json)
         .or(spec.tie_default)
         .unwrap_or(false);
-    let quantization = parse_quantization(json, source_path)?;
+    let quantization = parse_quantization(json, source_stem, source_path)?;
     let arch = resolve_arch_spec(spec, json, source_stem);
 
     // A vision arch MUST declare its on-disk structure — there is no
@@ -3254,27 +3291,60 @@ mod tests {
         assert_eq!(mp.bounds["mamba_in_proj_dim"], 18560);
     }
 
-    /// An arch compiles under its `arch-<name>` feature and a backend it compiles for — so the
-    /// metal-only DFlash2 drafter does not under cuda, and bakes no capture into its target there,
-    /// whatever `all` and `mtp` turn on.
+    /// An arch compiles under its `arch-<name>` feature and a backend — the ONE law, no
+    /// capability list. The arch name comes from `configs/` (the tree is the list), never
+    /// a literal, so the test cannot shadow it.
     #[test]
     fn an_arch_compiles_with_its_feature_and_a_backend_of_its_own() {
-        let build = |features: &'static [&'static str]| move |f: &str| features.contains(&f);
-        let metal = build(&["metal", "arch-dflash2", "arch-qwen3-5-moe", "arch-llama"]);
-        assert!(arch_compiled_with("dflash2", metal));
-        assert!(arch_compiled_with("qwen3-5-moe", metal));
-        assert!(arch_compiled_with("llama", metal));
-        let spyre = build(&["spyre", "arch-dflash2", "arch-llama", "arch-qwen3"]);
+        let configs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/arch/configs");
+        let arch = arch_dirs(&configs)
+            .expect("walk configs/")
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .expect("dir name")
+                    .to_string()
+            })
+            .next()
+            .expect("at least one arch dir");
+        let feature = format!("arch-{arch}");
+        let with = |backend: &'static str| {
+            let f = feature.clone();
+            move |feat: &str| feat == backend || feat == f
+        };
+        assert!(arch_compiled_with(&arch, with("metal")));
+        assert!(arch_compiled_with(&arch, with("spyre")));
+        // Both backends off: not compiled, whatever the arch feature.
+        let neither = {
+            let f = feature.clone();
+            move |feat: &str| feat == f
+        };
+        assert!(!arch_compiled_with(&arch, neither));
+        // Its arch feature off: not compiled, whatever the backend.
+        let no_arch_feature = |feat: &str| feat == "metal";
         assert!(
-            !arch_compiled_with("dflash2", spyre),
-            "a metal-only arch does not compile under spyre"
-        );
-        assert!(arch_compiled_with("llama", spyre));
-        assert!(!arch_compiled_with("qwen3", spyre));
-        assert!(
-            !arch_compiled_with("qwen3", build(&["metal"])),
+            !arch_compiled_with(&arch, no_arch_feature),
             "its arch feature is off"
         );
+    }
+
+    /// The tree law: EVERY arch dir under `configs/` compiles under `spyre` when its
+    /// `arch-<name>` feature is on — the build script's target filter admits it, and what
+    /// happens next (lowering or a named refusal) is the lowering's verdict. No name is
+    /// written here; the tree is the list.
+    #[test]
+    fn every_arch_in_the_tree_compiles_under_spyre_with_its_feature_on() {
+        let configs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/arch/configs");
+        for dir in arch_dirs(&configs).expect("walk configs/") {
+            let arch = dir.file_name().and_then(|s| s.to_str()).expect("dir name");
+            let feature = format!("arch-{arch}");
+            let spyre = move |feat: &str| feat == "spyre" || feat == feature;
+            assert!(
+                arch_compiled_with(arch, spyre),
+                "{arch} compiles under spyre with its feature on"
+            );
+        }
     }
 
     /// Qwen3.6's MTP head compiles on its target's config verbatim, whose block schedule names the
@@ -3437,7 +3507,14 @@ mod tests {
             let path = dir.join(format!("{stem}.json"));
             let json: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
-            let mp = model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse");
+            // Load-or-refuse: the parity-tiny ships a mixed-bit affine quantization,
+            // so under a backend that can't lower it the refusal is the outcome.
+            let Some(mp) = assert_load_or_refuse_by_name(
+                stem,
+                model_params_from_json(&json, stem, &path, Vec::new(), &spec),
+            ) else {
+                continue;
+            };
             let b = |k: &str| mp.bounds[k];
             let set = |name: &str| mp.layer_sets[name].members().to_vec();
             for kind in ["mamba_layers", "attention_layers", "moe_layers"] {
@@ -3477,14 +3554,20 @@ mod tests {
     #[test]
     fn recurrent_state_dims_come_from_either_mixer() {
         use crate::codegen::RecurrentDims;
-        let dims = |arch: &str, stem: &str| {
+        // Load-or-refuse: the parity-tiny ships a mixed-bit affine quantization,
+        // so under a backend that can't lower it the refusal is the outcome
+        // (`None`); a dense config loads on every backend.
+        let dims = |arch: &str, stem: &str| -> Option<RecurrentDims> {
             let dir = repo_model_archs(arch);
             let spec = load_arch_json(&dir).expect("arch.json");
             let path = dir.join(format!("{stem}.json"));
             let json: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
-            let mp = model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse");
-            RecurrentDims::of(&mp).expect("a recurrent mixer")
+            let mp = assert_load_or_refuse_by_name(
+                stem,
+                model_params_from_json(&json, stem, &path, Vec::new(), &spec),
+            )?;
+            Some(RecurrentDims::of(&mp).expect("a recurrent mixer"))
         };
         let mamba = |groups, heads, head_dim| RecurrentDims {
             num_k_heads: groups,
@@ -3496,22 +3579,23 @@ mod tests {
         };
         assert_eq!(
             dims("nemotron-h", "nemotron-3-nano-30b-a3b"),
-            mamba(8, 64, 64)
+            Some(mamba(8, 64, 64))
         );
         let super_dims = dims("nemotron-h-latent", "nemotron-3-super-120b-a12b");
-        assert_eq!(super_dims, mamba(8, 128, 64));
-        assert_eq!(super_dims.conv_dim, 10240);
-        let tiny = dims("nemotron-h", "nemotron-3-nano-30b-a3b-parity-tiny");
-        assert_eq!(
-            (
-                tiny.num_k_heads,
-                tiny.num_v_heads,
-                tiny.head_k_dim,
-                tiny.head_v_dim
-            ),
-            (2, 8, 16, 16)
-        );
-        let gdn = dims("qwen3-5", "qwen3.5-0.8b");
+        assert_eq!(super_dims, Some(mamba(8, 128, 64)));
+        assert_eq!(super_dims.expect("dense config loads").conv_dim, 10240);
+        if let Some(tiny) = dims("nemotron-h", "nemotron-3-nano-30b-a3b-parity-tiny") {
+            assert_eq!(
+                (
+                    tiny.num_k_heads,
+                    tiny.num_v_heads,
+                    tiny.head_k_dim,
+                    tiny.head_v_dim
+                ),
+                (2, 8, 16, 16)
+            );
+        }
+        let gdn = dims("qwen3-5", "qwen3.5-0.8b").expect("dense config loads");
         assert_eq!(
             (
                 gdn.num_k_heads,

@@ -246,13 +246,17 @@ fn carrier_models(
     let label = |p: &std::path::Path| p.file_stem().unwrap().to_str().unwrap().to_string();
     let own = model_configs(configs_dir.clone());
     if !own.is_empty() {
+        // Load-or-refuse: a config shipping a mixed-bit affine quantization
+        // refuses under a backend that can't lower it (asserted by name inside
+        // the helper) and is skipped; a loadable config always loads.
         return (own.into_iter())
-            .map(|p| {
+            .filter_map(|p| {
                 let model = match vision {
                     true => crate::config::load_file_declared_vision(&p),
                     false => crate::config::load_file_declared(&p),
                 };
-                (label(&p), p, model)
+                crate::config::assert_load_or_refuse_by_name(&label(&p), model)
+                    .map(|m| (label(&p), p, Ok(m)))
             })
             .collect();
     }
@@ -265,8 +269,13 @@ fn carrier_models(
             let json: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
             if crate::config::carries_head(&spec, &json) {
-                let model = crate::config::load_head_file(&p, &configs_dir);
-                models.push((format!("{target}/{}", label(&p)), p, model));
+                let tag = format!("{target}/{}", label(&p));
+                if let Some(model) = crate::config::assert_load_or_refuse_by_name(
+                    &label(&p),
+                    crate::config::load_head_file(&p, &configs_dir),
+                ) {
+                    models.push((tag, p, Ok(model)));
+                }
             }
         }
     }
@@ -755,24 +764,32 @@ fn bundle_header_fixtures() -> Vec<(
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         for config in fixture["configs"].as_array().unwrap() {
             let config = config.as_str().unwrap();
-            let (carrier, model) = match fixture["head"].as_bool().unwrap() {
+            // Load-or-refuse: a fixture config shipping a mixed-bit affine
+            // quantization refuses under a backend that can't lower it (asserted
+            // by name inside the helper) and is skipped; otherwise it loads.
+            let loaded = match fixture["head"].as_bool().unwrap() {
                 // A head's config is its target's: `<head>/<target carrier>/<target stem>`.
                 true => {
                     let (head, target) = config.split_once('/').unwrap();
+                    let target_stem = target.rsplit('/').next().unwrap_or(target).to_string();
                     let model = crate::config::load_head_file(
                         &arch.join(format!("{target}.json")),
                         &arch.join(head),
                     );
-                    (head.to_string(), model)
+                    (head.to_string(), target_stem, model)
                 }
                 false => {
                     let carrier = config.split('/').next().unwrap().to_string();
+                    let stem = config.rsplit('/').next().unwrap_or(config).to_string();
                     let model =
                         crate::config::load_file_declared(&arch.join(format!("{config}.json")));
-                    (carrier, model)
+                    (carrier, stem, model)
                 }
             };
-            let model = model.unwrap_or_else(|e| panic!("{config}: {e:?}"));
+            let (carrier, ref stem, model) = loaded;
+            let Some(model) = crate::config::assert_load_or_refuse_by_name(stem, model) else {
+                continue;
+            };
             let name = format!(
                 "{} under {config}",
                 path.file_name().unwrap().to_string_lossy()
