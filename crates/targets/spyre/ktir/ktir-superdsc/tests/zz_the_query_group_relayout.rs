@@ -23,7 +23,7 @@ use ktir_superdsc::addr::DevOff;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{SharedKernelBmmForm, assemble_matmul_placed};
 use ktir_superdsc::sdsc_abstract::{
-    KernelTag, Lanes, MatK, MatM, MatN, MatY, QGroupBlock, QueryRowCount, RowBlockedTag,
+    HeadWidth, KernelTag, Lanes, MatK, MatM, MatN, MatY, QGroupBlock, QueryRowCount, RowBlockedTag,
     StickLayout, Stk,
 };
 
@@ -41,7 +41,8 @@ fn rbh(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
 }
 
 fn qg() -> QGroupBlock {
-    QGroupBlock::of_decode(NKVH, GQA, HD, 1).expect("granite-8b's one-request decode re-lays")
+    QGroupBlock::of_decode(NKVH, GQA, HeadWidth::of_whole_sticks(HD), 1)
+        .expect("granite-8b's one-request decode re-lays")
 }
 
 /// The re-layout's ops, kv-head-major then slab — exactly what the chunk would emit.
@@ -346,17 +347,23 @@ fn the_relayout_is_the_cache_writes_descriptor_shape() {
 /// The witness admits exactly the one-request decode above one slab.
 #[test]
 fn the_group_block_is_minted_only_for_a_one_request_decode_above_one_slab() {
-    assert!(QGroupBlock::of_decode(NKVH, GQA, 128, 1).is_some());
+    assert!(QGroupBlock::of_decode(NKVH, GQA, HeadWidth::of_whole_sticks(128), 1).is_some());
     assert!(
-        QGroupBlock::of_decode(NKVH, GQA, 64, 1).is_none(),
+        QGroupBlock::of_decode(NKVH, GQA, HeadWidth::of_whole_sticks(64), 1).is_none(),
         "one slab: the stream has it"
     );
     assert!(
-        QGroupBlock::of_decode(NKVH, GQA, 128, 2).is_none(),
+        QGroupBlock::of_decode(NKVH, GQA, HeadWidth::of_whole_sticks(128), 2).is_none(),
         "a batch or prompt chunk"
     );
-    assert!(
-        QGroupBlock::of_decode(NKVH, GQA, 96, 1).is_none(),
-        "not whole sticks"
-    );
+}
+
+/// ⭐ A PART-STICK HEAD DIM IS NO LONGER A `None` — IT IS UNREPRESENTABLE. The old test asserted
+/// `of_decode(.., 96, ..).is_none()`; the same fact is now the constructor's own law, so this
+/// asserts the refusal where it lives (and it is a BUILD ERROR in any const context, which is
+/// strictly stronger than the `None` was).
+#[test]
+#[should_panic(expected = "whole number of fp16 sticks")]
+fn a_part_stick_head_width_cannot_be_minted() {
+    let _ = HeadWidth::of_whole_sticks(96);
 }

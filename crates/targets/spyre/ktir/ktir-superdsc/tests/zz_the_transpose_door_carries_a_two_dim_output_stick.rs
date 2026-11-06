@@ -237,7 +237,8 @@ fn the_restickify_door_carries_a_one_dim_output_stick_for_the_same_relayout() {
     use ktir_superdsc::sdsc_abstract::{KtTileFeats, KtTileSlots, WindowRows};
 
     let slots = KtTileSlots::of_row_window(WindowRows);
-    let feats = KtTileFeats::of_head_dim(64);
+    let feats =
+        KtTileFeats::of_head_dim(ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(64));
     assert_eq!(
         (slots.extent(), feats.extent()),
         (64, 64),

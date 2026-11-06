@@ -498,13 +498,16 @@ fn the_page_granular_door_admits_every_stick_multiple_head_dim() {
             );
         }
     }
-    // A head dim that is not a whole number of sticks has no stick-block entry at all, so it is the one
-    // geometry the plane law itself refuses.
-    assert_eq!(
-        PagePlaneExtent::of_pool(PagedKvPool::new(8, 96)),
-        None,
-        "hd=96: a part-stick head dim has no stick-block entry, so the PLANE refuses it"
-    );
+}
+
+/// ⭐ A PART-STICK HEAD DIM IS NO LONGER A `None` FROM `of_pool` — IT IS UNREPRESENTABLE. The old
+/// test asserted `of_pool(PagedKvPool::new(8, 96)) == None`; the same fact is now the width type's
+/// own law ([`HeadWidth::of_whole_sticks`]), which `of_pool` mints through — so the refusal is a
+/// BUILD ERROR in any const context, strictly stronger than the `None` was.
+#[test]
+#[should_panic(expected = "whole number of fp16 sticks")]
+fn a_part_stick_head_dim_is_unrepresentable() {
+    let _ = ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(96);
 }
 
 /// The `hd`-cancellation the entry law rests on, over the whole grid — and the ONE quantity that does not

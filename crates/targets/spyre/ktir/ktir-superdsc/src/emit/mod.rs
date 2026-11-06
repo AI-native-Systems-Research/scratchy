@@ -6469,7 +6469,9 @@ fn restickify_kt_opspec_2d(
     in_off: u32,
     out_off: u32,
 ) -> Result<OpSpec, String> {
-    // Both extents must be whole 64-sticks: cap is the OUTPUT stick, hd is the (padded) free dim.
+    // Both extents must be whole 64-sticks: cap is the OUTPUT stick, hd is the (padded) free dim —
+    // and the free dim is NOT necessarily a head width here (the transpose door passes an arbitrary
+    // producer-stated extent), so the check is the stick law, not the head law.
     let _cap_ext = StickExtent::<Fp16>::new(cap)?;
     let _hd_ext = StickExtent::<Fp16>::new(hd)?;
     // INPUT sticks on its LAST dim `hd` (dxp requires the stick on the last dim — a stick-on-dim0

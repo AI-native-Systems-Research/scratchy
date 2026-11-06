@@ -171,9 +171,9 @@ impl KtTileSlots {
 pub struct KtTileFeats(u32);
 
 impl KtTileFeats {
-    /// The whole head dim — the whole-page re-transpose spans it.
-    pub const fn of_head_dim(hd: u32) -> KtTileFeats {
-        KtTileFeats(hd)
+    /// The whole head dim — the whole-page re-transpose spans it. Takes the typed [`HeadWidth`].
+    pub const fn of_head_dim(hd: HeadWidth) -> KtTileFeats {
+        KtTileFeats(hd.get())
     }
 
     /// The feature-axis extent of the tile.
@@ -501,9 +501,10 @@ impl MatM {
 pub struct MatN(u32);
 
 impl MatN {
-    /// One head's feature width `hd` — the value matmul's and RoPE's output columns.
-    pub const fn of_head_dim(hd: u32) -> MatN {
-        MatN(hd)
+    /// One head's feature width — the value matmul's and RoPE's output columns. Takes the typed
+    /// [`HeadWidth`], so the width is whole sticks by construction and no reader re-derives it.
+    pub const fn of_head_dim(hd: HeadWidth) -> MatN {
+        MatN(hd.get())
     }
     /// The score block's kv window — the column count of one online-softmax block (one stick per
     /// fold sub-block by design). Takes the block's own typed width, so the score matmul's N and
@@ -532,9 +533,10 @@ impl MatN {
 pub struct MatK(u32);
 
 impl MatK {
-    /// One head's feature width `hd` — the score matmul contracts Q·Kᵀ over it.
-    pub const fn of_head_dim(hd: u32) -> MatK {
-        MatK(hd)
+    /// One head's feature width — the score matmul contracts Q·Kᵀ over it. Takes the typed
+    /// [`HeadWidth`], same reason as [`MatN::of_head_dim`].
+    pub const fn of_head_dim(hd: HeadWidth) -> MatK {
+        MatK(hd.get())
     }
     /// The score block's kv window — the value matmul contracts probabilities·V over it. Takes the
     /// block's own typed width, same reason as [`MatN::of_kv_window`].
@@ -736,13 +738,16 @@ impl OperandPlacement {
     pub fn of_token_stream(
         mq: QueryRowCount,
         heads: u32,
-        hd: u32,
+        hd: HeadWidth,
         h: u32,
         request: u32,
         s: u32,
     ) -> OperandPlacement {
-        let nest =
-            crate::addr::Nest::new(&["row", "head", "feat"], &[mq.get(), heads, hd], Df::Fp16);
+        let nest = crate::addr::Nest::new(
+            &["row", "head", "feat"],
+            &[mq.get(), heads, hd.get()],
+            Df::Fp16,
+        );
         let off = nest
             .view()
             .at(crate::addr::Idx::<crate::addr::Row>::n(request))
@@ -790,7 +795,7 @@ impl OperandPlacement {
     pub(crate) fn of_token_stream_by_slab(
         mq: QueryRowCount,
         heads: u32,
-        hd: u32,
+        hd: HeadWidth,
         h: u32,
         request: u32,
         s: u32,
@@ -799,7 +804,7 @@ impl OperandPlacement {
         let base = Self::of_token_stream(mq, heads, hd, h, request, s);
         // ASKED OF THE SHAPE, not written as `hd/64` — the same door `nests.slabs()` uses, so the
         // slab count in the pitch cannot disagree with the slab count the emitter loops over.
-        let nslab = crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd, df).get();
+        let nslab = crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd.get(), df).get();
         OperandPlacement {
             pitch: PhysM(mq.get() * nslab),
             ..base
@@ -922,6 +927,73 @@ const _: () = assert!(
      moves PrefixMaskShape's COLS, the emitter's `stick` locals, and the fp8-vs-fp16 slab count at head_dim 128, \
      where head_dim and the fp8 stick width are BOTH 128 and therefore indistinguishable."
 );
+
+/// ⭐⭐⭐⭐⭐ A HEAD'S WIDTH, STATED IN THE POOL'S OWN STICKS — never a bare `head_dim` number.
+///
+/// THE LAW: a head on this device is a WHOLE NUMBER of fp16 sticks — `head_dim = sticks · 64`,
+/// for any `sticks ≥ 1` (64, 128, 256, 512, …). The whole domain, stated once, in the only
+/// constructor ([`HeadWidth::of_whole_sticks`]); no arm per width, no upper bound, nothing shaped
+/// by which model happens to run.
+///
+/// ⛔ WHAT IT REPLACES: the raw `hd: u32` parameter, at every constructor and emitter site that
+/// then re-derived "is a head one stick here?" (`hd == 64`), "how many slabs?" (`hd / 64`), or
+/// nothing at all — the last being the hazard this file's newtypes exist for, because at
+/// head_dim 128 the width EQUALS the fp8 stick width (see [`POOL_STICK`]'s table) and a missing
+/// slab multiplier type-checks identically. With this type, `hd == 64` is [`Self::sticks`] `== 1`
+/// (a proven-emit predicate, askable by name), `hd / 64` IS [`Self::sticks`] (never re-derived),
+/// and a width that is not whole sticks is UNREPRESENTABLE rather than checked at the reader.
+///
+/// The model-facts `HeadDim` (scratchy-ir) stays positive-only — the stick law is a DEVICE lane
+/// fact, and this is the one door where it is minted.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+pub struct HeadWidth(NonZeroU32);
+
+impl HeadWidth {
+    /// The ONLY constructor: a head width, refused unless it is a whole number of the pool's
+    /// fp16 sticks — a head never straddles a stick boundary. `const`, so a const context
+    /// (the bake, a `static` tape) gets the refusal as a BUILD ERROR, which is the only time
+    /// this fact exists to be checked.
+    pub const fn of_whole_sticks(hd: u32) -> Self {
+        match NonZeroU32::new(hd) {
+            Some(nz) if hd % POOL_STICK == 0 => Self(nz),
+            _ => panic!(
+                "HeadWidth: a head is a whole number of fp16 sticks — a width that straddles a \
+                 stick boundary has no emit form"
+            ),
+        }
+    }
+
+    /// The bake-time door over the SAME law: [`Self::of_whole_sticks`] for a value that arrives
+    /// at expansion time, where the panic can NAME the width and the model it came from (a const
+    /// fn's panic is a literal — const fns cannot format). This is the one door the `#[forward]`
+    /// bake reads; a model whose head_dim is not whole sticks is a BUILD ERROR, not a runtime
+    /// refusal.
+    pub fn of_whole_sticks_at_bake(hd: u32, model: &str) -> Self {
+        assert!(
+            hd != 0 && hd % POOL_STICK == 0,
+            "{model}: head_dim {hd} is not a whole number of fp16 sticks ({POOL_STICK} lanes) — \
+             a head that straddles a stick boundary has no emit form"
+        );
+        Self(NonZeroU32::new(hd).expect("checked above"))
+    }
+
+    /// The width, in elements.
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The width as a non-zero — the storage already is one, so no caller re-proves it.
+    pub const fn nonzero(self) -> NonZeroU32 {
+        self.0
+    }
+
+    /// How many fp16 sticks one head spans — `hd / 64`, proven whole by construction. This is
+    /// the slab count every feature-axis stride multiplies by, and the `== 1` case is the
+    /// one-stick emit form's own predicate — askable by name instead of `hd == 64`.
+    pub const fn sticks(self) -> u32 {
+        self.0.get() / POOL_STICK
+    }
+}
 
 /// Device element offset (in elements) for logical multi-index `idx` of a tensor whose full
 /// shape is `dims` with the stick axis at `stick_idx` — mirroring [`DeviceTileLayout`]:
@@ -3625,9 +3697,10 @@ impl BlockCols {
     pub const fn of_one_stick(lanes: Lanes) -> BlockCols {
         BlockCols(lanes.n())
     }
-    /// A head-dim-wide sweep — the `[rows, hd]` output-accumulator buffers.
-    pub const fn of_head_dim(hd: u32) -> BlockCols {
-        BlockCols(hd)
+    /// A head-dim-wide sweep — the `[rows, hd]` output-accumulator buffers. Takes the typed
+    /// [`HeadWidth`], so the width is whole sticks by construction.
+    pub const fn of_head_dim(hd: HeadWidth) -> BlockCols {
+        BlockCols(hd.get())
     }
     /// A residual-stream feature extent (hidden/intermediate columns) — outside the attention
     /// row-and-width run.
@@ -5907,7 +5980,7 @@ pub fn page_gather_index_table(
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PagePlaneExtent {
     nkvh: u32,
-    hd: u32,
+    hd: HeadWidth,
 }
 
 const _: () = assert!(
@@ -5934,20 +6007,24 @@ const _: () = assert!(
 );
 
 impl PagePlaneExtent {
-    /// The extent of one `(request, page)` plane, or `None` on a degenerate geometry or an `hd` that is
-    /// not a whole number of sticks (a part-stick head dim has no stick-block entry at all).
+    /// The extent of one `(request, page)` plane, or `None` on a degenerate geometry. The head width
+    /// is minted through [`HeadWidth::of_whole_sticks`], so a part-stick head dim — which has no
+    /// stick-block entry at all — is refused by the constructor itself, not re-checked here.
     pub const fn of_pool(pool: PagedKvPool) -> Option<Self> {
         let (nkvh, hd) = (pool.nkvh as u32, pool.hd as u32);
-        if nkvh == 0 || hd == 0 || !hd.is_multiple_of(POOL_STICK) {
+        if nkvh == 0 || hd == 0 {
             return None;
         }
-        Some(PagePlaneExtent { nkvh, hd })
+        Some(PagePlaneExtent {
+            nkvh,
+            hd: HeadWidth::of_whole_sticks(hd),
+        })
     }
 
     /// Elements in one request's whole page plane — `nkvh * hd * POOL_PAGE_SLOTS`, the contiguous run one
     /// index entry names. This is `skip_addr`, so it is ALSO the unit the host's entry counts in.
     pub const fn elems(self) -> u64 {
-        self.nkvh as u64 * self.hd as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64
+        self.nkvh as u64 * self.hd.get() as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64
     }
 
     /// The plane's whole `mb` extent in one-stick sub-rows — `elems / POOL_STICK`. This is what ONE
@@ -5979,7 +6056,7 @@ impl PagePlaneExtent {
     /// sub-rows `[i * entry_sub_rows, +entry_sub_rows)` of that request's row — page granularity is a
     /// property of the ROW LAW, which is unchanged, not of the pin.
     pub const fn entry_elems(self) -> u64 {
-        self.hd as u64 * POOL_STICK as u64
+        self.hd.get() as u64 * POOL_STICK as u64
     }
 
     /// The pinned `mb` positions one entry covers — [`Self::entry_elems`] in one-stick sub-rows, which is
@@ -6047,7 +6124,7 @@ impl PagePlaneExtent {
     /// page. Heads abut (proven in `zz_a_whole_page_plane_is_contiguous_at_every_head_dim`), so this is
     /// both the head stride and the head extent.
     pub const fn head_block_elems(self) -> u64 {
-        self.hd as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64
+        self.hd.get() as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64
     }
 
     /// [`Self::elems`] in BYTES — `skip_addr` as the host's page arithmetic counts it. The word length is
@@ -6066,7 +6143,7 @@ impl PagePlaneExtent {
 
     /// The head dim one kv head's block carries.
     pub(crate) const fn hd(self) -> u32 {
-        self.hd
+        self.hd.get()
     }
 
     /// Offset of kv head `kvh`'s block within the plane, or `None` past the head count.
@@ -6089,7 +6166,7 @@ impl PagePlaneExtent {
     /// `s * blocks_per_page + b`, and those coincide for every coordinate **iff this is 1**. One table
     /// serves both legs at one slab by that coincidence.
     pub const fn slabs(self) -> u32 {
-        self.hd / POOL_STICK
+        self.hd.sticks()
     }
 }
 
@@ -6482,14 +6559,15 @@ impl NewBlockForm {
     /// on card. A wider head dim (the gemma bakes' 256 and 512) keeps the sub-blocks byte for byte.
     pub(crate) const CHUNK_MAX_SLABS: u32 = 2;
 
-    /// The form a launch of `mq` rows at head dim `hd` takes; `rows_are_requests` is a decode batch.
-    pub const fn of(mq: u32, hd: u32, rows_are_requests: bool) -> NewBlockForm {
+    /// The form a launch of `mq` rows at head width `hd` takes; `rows_are_requests` is a decode batch.
+    /// Takes the typed [`HeadWidth`], so the whole-stick law is by construction and the slab count
+    /// is [`HeadWidth::sticks`], never re-divided here.
+    pub const fn of(mq: u32, hd: HeadWidth, rows_are_requests: bool) -> NewBlockForm {
         if !rows_are_requests
             && mq >= POOL_STICK
             && mq.is_multiple_of(POOL_STICK)
-            && hd.is_multiple_of(POOL_STICK)
-            && hd / POOL_STICK >= 1
-            && hd / POOL_STICK <= Self::CHUNK_MAX_SLABS
+            && hd.sticks() >= 1
+            && hd.sticks() <= Self::CHUNK_MAX_SLABS
         {
             NewBlockForm::Chunk
         } else {
@@ -6504,10 +6582,10 @@ impl NewBlockForm {
     /// head's `gqa` at one slab, one query head above it), and dxp rebuilds a stick-blocked operand's group
     /// stride from the op's own row count — so that block must be laid out at ITS row count. Same total
     /// size either way, and byte-identical at one stick (`mq_pad == 64`), where the forms coincide.
-    pub const fn mask_heads_per_block(self, nqh: u32, nkvh: u32, hd: u32) -> u32 {
+    pub const fn mask_heads_per_block(self, nqh: u32, nkvh: u32, hd: HeadWidth) -> u32 {
         match self {
             NewBlockForm::SubBlocks => nqh,
-            NewBlockForm::Chunk => ChunkRowBlocks::heads_per_block(nqh / nkvh, hd / POOL_STICK),
+            NewBlockForm::Chunk => ChunkRowBlocks::heads_per_block(nqh / nkvh, hd.sticks()),
         }
     }
 }
@@ -7254,7 +7332,7 @@ impl ChunkRowBlocks {
 pub struct QGroupBlock {
     nkvh: u32,
     gqa: u32,
-    hd: u32,
+    hd: HeadWidth,
     /// Rows each query head carries: 1 for a one-request decode, the batch width for a decode batch.
     requests: u32,
 }
@@ -7262,7 +7340,7 @@ pub struct QGroupBlock {
 impl QGroupBlock {
     /// The group-major query block for a one-request decode, or `None` where the stream already has it
     /// (one slab) or a head has more than one row (a prompt chunk, a decode batch).
-    pub const fn of_decode(nkvh: u32, gqa: u32, hd: u32, mq: u32) -> Option<QGroupBlock> {
+    pub const fn of_decode(nkvh: u32, gqa: u32, hd: HeadWidth, mq: u32) -> Option<QGroupBlock> {
         if mq != 1 {
             return None;
         }
@@ -7271,20 +7349,20 @@ impl QGroupBlock {
 
     /// The group-major query block for a decode batch of `requests` rows per head (head-major `h·B + r`),
     /// or `None` at one slab or a degenerate geometry.
-    pub const fn of_batch(nkvh: u32, gqa: u32, hd: u32, requests: u32) -> Option<QGroupBlock> {
+    pub const fn of_batch(
+        nkvh: u32,
+        gqa: u32,
+        hd: HeadWidth,
+        requests: u32,
+    ) -> Option<QGroupBlock> {
         if requests < 2 {
             return None;
         }
         Self::of_rows(nkvh, gqa, hd, requests)
     }
 
-    const fn of_rows(nkvh: u32, gqa: u32, hd: u32, requests: u32) -> Option<QGroupBlock> {
-        if requests == 0
-            || nkvh == 0
-            || gqa == 0
-            || hd <= POOL_STICK
-            || !hd.is_multiple_of(POOL_STICK)
-        {
+    const fn of_rows(nkvh: u32, gqa: u32, hd: HeadWidth, requests: u32) -> Option<QGroupBlock> {
+        if requests == 0 || nkvh == 0 || gqa == 0 || hd.sticks() <= 1 {
             return None;
         }
         Some(QGroupBlock {
@@ -7308,7 +7386,7 @@ impl QGroupBlock {
     }
     /// Feature slabs of one head.
     pub const fn slabs(self) -> u32 {
-        self.hd / POOL_STICK
+        self.hd.sticks()
     }
     /// Query rows of one block — a whole GQA group, `requests` rows a head (`g·B + r`).
     pub const fn rows(self) -> u32 {
@@ -7317,7 +7395,7 @@ impl QGroupBlock {
 
     /// kv head `kvh`'s block, as the `[gqa·B, hd]` nest it is and the repeat index it sits at.
     pub(crate) fn block_nest(self) -> crate::addr::Nest {
-        crate::addr::Nest::new(&["row", "feat"], &[self.rows(), self.hd], Df::Fp16)
+        crate::addr::Nest::new(&["row", "feat"], &[self.rows(), self.hd.get()], Df::Fp16)
     }
 
     /// WHERE THE RE-LAYOUT COPY FOR (kv head `kvh`, slab `s`) WRITES: block `kvh`, slab `s`, `y` walking
@@ -7472,7 +7550,12 @@ impl BatchChunk {
         // class registry the re-layout copy reads. The emitter states its law from its OWN blocks
         // ([`Self::of_blocks`]) and the host stages from this one, so the bake's mask rows equal these
         // exactly where the bundle re-lays (a registry-less fixture keeps the per-head form).
-        let blocks = match QGroupBlock::of_batch(chunk.nkvh(), gqa, chunk.plane.hd(), requests) {
+        let blocks = match QGroupBlock::of_batch(
+            chunk.nkvh(),
+            gqa,
+            HeadWidth::of_whole_sticks(chunk.plane.hd()),
+            requests,
+        ) {
             Some(q) => ChunkRowBlocks::of_query_groups(q, chunk.slots()),
             None => chunk.row_blocks(gqa, requests),
         };
@@ -7702,7 +7785,7 @@ pub struct GatherScratch {
     /// The row law — see [`GatherRows`] for why the window count is not part of it.
     rows: GatherRows,
     windows: u32,
-    hd: u32,
+    hd: HeadWidth,
 }
 
 impl GatherScratch {
@@ -7716,8 +7799,11 @@ impl GatherScratch {
         windows: WindowCount,
         mq: QueryRowCount,
     ) -> Option<GatherScratch> {
-        let (nkvh, hd) = (pool.nkvh as u32, pool.hd() as u32);
-        if nkvh == 0 || hd == 0 || hd > POOL_STICK || windows.get() == 0 || mq.get() == 0 {
+        let (nkvh, hd) = (
+            pool.nkvh as u32,
+            HeadWidth::of_whole_sticks(pool.hd() as u32),
+        );
+        if nkvh == 0 || hd.sticks() > 1 || windows.get() == 0 || mq.get() == 0 {
             return None;
         }
         Some(GatherScratch {
@@ -7789,7 +7875,7 @@ impl GatherScratch {
     /// `mb` contributes 1 and `out` the whole row), the copy's `cols`, and the matmuls' `y` step, and
     /// those being one value is what makes the entry a plain global block number.
     pub const fn cols(self) -> u32 {
-        self.hd * POOL_STICK
+        self.hd.get() * POOL_STICK
     }
 
     /// The whole footprint, in elements — what the synthetic allocator reserves.
@@ -7937,7 +8023,7 @@ impl GatherScratch {
     /// `kvh*hd*PLANE_SLOTS + b*hd*64` and V's at `kvh*hd*PLANE_SLOTS + b*64*hd` — the same block, which
     /// is why one index serves both copies.
     pub fn block_in_page(self, kvh: u32, window: u32) -> Option<u32> {
-        let pool = PagedKvPool::new(self.nkvh() as usize, self.hd as usize);
+        let pool = PagedKvPool::new(self.nkvh() as usize, self.hd.get() as usize);
         let per_plane =
             u32::try_from(pool.plane_block_elems() / pool.stick_block_elems().max(1)).ok()?;
         (kvh < self.nkvh() && window < self.windows && window < per_plane)

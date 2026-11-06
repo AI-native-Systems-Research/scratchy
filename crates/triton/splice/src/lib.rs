@@ -1455,7 +1455,7 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// that one value. The pool's page ([`PagedKvPool::POOL_PAGE_SLOTS`], a
 /// [`PoolPageSlots`]) is a DIFFERENT quantity: before they were types, a plain integer
 /// accepted either. Integer boundaries call `.get()`.
-pub use ktir_superdsc::sdsc_abstract::{PoolPageSlots, SchedulerBlockTokens};
+pub use ktir_superdsc::sdsc_abstract::{HeadWidth, PoolPageSlots, SchedulerBlockTokens};
 
 /// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
 pub const INT32_STICK: u32 = 32;
@@ -1831,10 +1831,13 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // softmax scale at the site the weight fold decided: `InKernel` is the model's own scale,
     // `FoldedIntoWeights` the 1.0 the node runs at once √scale rides its W_q/W_k.
     let g = attention.class(mask.class());
-    let (nqh, nkvh, hd) = (g.q_heads().get(), g.kv_heads().get(), g.head_dim().get());
+    let (nqh, nkvh) = (g.q_heads().get(), g.kv_heads().get());
+    // ⭐ THE HEAD WIDTH IS A TYPE — whole sticks by construction, so the extents below spend a
+    // proven quantity and the one-stick/multi-stick question is `sticks()`, never a division.
+    let hd = HeadWidth::of_whole_sticks(g.head_dim().get());
     let scale = scale_site.scale(*attention);
     let mq = node.output.region.rows.len;
-    let kv_width = nkvh * hd;
+    let kv_width = nkvh * hd.get();
     let pages = pool_pages(ir, &node.inputs[1], kv_width, "K")?;
     if pool_pages(ir, &node.inputs[2], kv_width, "V")? != pages {
         return Err(format!(
@@ -1842,8 +1845,8 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             node.output.tensor.index()
         ));
     }
-    whole(ir, &node.inputs[0], mq, nqh * hd, "query")?;
-    whole(ir, &node.output, mq, nqh * hd, "attention output")?;
+    whole(ir, &node.inputs[0], mq, nqh * hd.get(), "query")?;
+    whole(ir, &node.output, mq, nqh * hd.get(), "attention output")?;
     let blocks = walk_pages(pages, mq, active_cap);
     let tids = PagedStepTids::RESERVED;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
@@ -2035,12 +2038,16 @@ pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
     // dim is the rope class's own, the head count the mask class's — never a division of
     // the region's width, which is CHECKED against them below.
     let g = attention.class(attn.class());
-    let (hd, nkvh) = (rope.head_dim(*attention).get(), g.kv_heads().get());
+    let (hd, nkvh) = (
+        HeadWidth::of_whole_sticks(rope.head_dim(*attention).get()),
+        g.kv_heads().get(),
+    );
     let (rows, kv_width) = (node.output.region.rows.len, node.output.region.cols.len);
-    if hd == 0 || kv_width != nkvh * hd {
+    if kv_width != nkvh * hd.get() {
         return Err(format!(
             "triton splice: RopeAppend t{}: its {kv_width}-column K is not the class's \
-             {nkvh} whole heads of {hd}",
+             {nkvh} whole heads of {hd_wide}",
+            hd_wide = hd.get(),
             node.output.tensor.index()
         ));
     }
@@ -2147,7 +2154,7 @@ fn rope_fwd<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     signature: &mut HashMap<String, ArgSpec>,
     constexprs: &mut HashMap<String, Val>,
-    hd: u32,
+    hd: HeadWidth,
 ) -> Result<(), String> {
     // total = the output's declared width (`heads * hd`), heads = total / hd, mq = the
     // output's rows — the same derivation `KtirFunc::rope`'s views state. The builder's own
@@ -2155,14 +2162,15 @@ fn rope_fwd<F: scratchy_subtile::subtile_ir::RopeForm>(
     // `Err`: the node is malformed, and no kernel can state it.
     let out = &node.output;
     let total = out.region.cols.len;
-    if !total.is_multiple_of(hd) {
+    if !total.is_multiple_of(hd.get()) {
         return Err(format!(
             "triton splice: rope t{}: {total} cols is not a whole number of \
              {hd}-wide heads",
+            hd = hd.get(),
             out.tensor.index()
         ));
     }
-    let heads = total / hd;
+    let heads = total / hd.get();
     for p in ["desc_x", "desc_cos", "desc_sin", "desc_o"] {
         signature.insert(
             p.to_string(),
@@ -2223,8 +2231,8 @@ fn rope_fwd<F: scratchy_subtile::subtile_ir::RopeForm>(
     let y_total = y_rows * heads;
     ce("H", Val::Int(i128::from(heads)))?;
     ce("MQ", Val::Int(i128::from(mq_rows)))?;
-    ce("HEAD_DIM", Val::Int(i128::from(hd)))?;
-    ce("HALF", Val::Int(i128::from(hd / 2)))?;
+    ce("HEAD_DIM", Val::Int(i128::from(hd.get())))?;
+    ce("HALF", Val::Int(i128::from(hd.get() / 2)))?;
     ce("Y_TOTAL", Val::Int(i128::from(y_total)))?;
     ce("R_START", Val::Int(i128::from(r_start)))?;
     Ok(())
@@ -2576,7 +2584,13 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("SCALE", Val::Float(f64::from(*scale)))?;
         }
         (SubOp::RopeRotate { head_dim, .. }, "rope_fwd") => {
-            rope_fwd(node, ir, &mut signature, &mut constexprs, head_dim.get())?;
+            rope_fwd(
+                node,
+                ir,
+                &mut signature,
+                &mut constexprs,
+                HeadWidth::of_whole_sticks(head_dim.get()),
+            )?;
         }
         (
             SubOp::RopeAppend {
@@ -2589,7 +2603,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 ir,
                 &mut signature,
                 &mut constexprs,
-                rope.head_dim(*attention).get(),
+                HeadWidth::of_whole_sticks(rope.head_dim(*attention).get()),
             )?;
         }
         (SubOp::TanhSoftCap { cap }, "tanhsoftcap_fwd") => {

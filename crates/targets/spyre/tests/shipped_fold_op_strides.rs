@@ -143,7 +143,9 @@ fn print_what_the_shipped_fold_score_op_addresses() {
         "sc_shipped",
         MatM::of_query_rows(QueryRowCount::of_mq(MQ)),
         MatN::of_kv_window(BlockCols::of_slot_window(SlotWindow::SLOTS)),
-        MatK::of_head_dim(HD),
+        MatK::of_head_dim(scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks(
+            HD,
+        )),
         // The batch axis carries both operands' head strides, so the head-outermost walk it derives
         // (`mb_dev * in` for the read, `mb_dev * out` for the write) is checked against where the heads
         // really are: `qs` is the token stream (`mq*hd` apart) and `sc` is head-major (`mq*stick`).
@@ -151,7 +153,14 @@ fn print_what_the_shipped_fold_score_op_addresses() {
             GQA,
             // HEAD 0, REQUEST 0: the shipped fold op sweeps a head's whole `mq` rows, so the request
             // rides inside the block rather than being a coordinate it names.
-            OperandPlacement::of_token_stream(QueryRowCount::of_mq(MQ), NQH, HD, 0, 0, 0),
+            OperandPlacement::of_token_stream(
+                QueryRowCount::of_mq(MQ),
+                NQH,
+                scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks(HD),
+                0,
+                0,
+                0,
+            ),
             OperandPlacement::of_head_major_rows(
                 0,
                 0,
