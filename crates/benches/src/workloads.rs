@@ -26,6 +26,17 @@ pub(crate) struct Task {
     /// The answer cap: the dataset benchmark's own.
     pub(crate) max_tokens: usize,
     pub(crate) score: Score,
+    /// Which of its dataset's records it is, where the dataset names them: so a cell's results
+    /// can be read task by task, and its sample stratified ([`stratified`]).
+    pub(crate) label: Option<TaskLabel>,
+}
+
+/// A dataset task's id in its source, and the group a stratified sample keeps the mix of
+/// (MuSiQue's hop count).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TaskLabel {
+    pub(crate) id: String,
+    pub(crate) group: u32,
 }
 
 /// How a task's answer is scored: a text comparison, so it costs no run time.
@@ -183,6 +194,7 @@ pub(crate) fn rag_task(
             aliases,
             rule,
         },
+        label: None,
     }
 }
 
@@ -255,6 +267,7 @@ pub(crate) fn chat_tasks(
             spans_input: None,
             max_tokens: reply_tokens(gpt).clamp(1, CHAT_MAX_TOKENS),
             score: Score::None,
+            label: None,
         });
         history.push(serde_json::json!({"role": "assistant", "content": gpt}));
     }
@@ -293,6 +306,7 @@ pub(crate) fn shared_prefix_tasks(
                 spans_input: None,
                 max_tokens: SHARED_PREFIX_MAX_TOKENS,
                 score: Score::None,
+                label: None,
             });
         }
     }
@@ -306,6 +320,46 @@ pub(crate) fn sample<T>(mut all: Vec<T>, n: usize, seed: u64) -> Vec<T> {
     all.shuffle(&mut rng);
     all.truncate(n);
     all
+}
+
+/// `n` units, seeded, each `group`'s share of them its share of `all`, by largest remainder (ties
+/// to the smaller group key), then shuffled together: a dataset ordered by group (MuSiQue's file
+/// is, by hops) keeps its mix however few are asked. Where any unit has no group, [`sample`].
+pub(crate) fn stratified<T>(
+    all: Vec<T>,
+    n: usize,
+    seed: u64,
+    group: impl Fn(&T) -> Option<u32>,
+) -> Vec<T> {
+    if n >= all.len() || all.iter().any(|t| group(t).is_none()) {
+        return sample(all, n, seed);
+    }
+    let mut by: std::collections::BTreeMap<u32, Vec<T>> = std::collections::BTreeMap::new();
+    let total = all.len();
+    for t in all {
+        by.entry(group(&t).unwrap_or_default()).or_default().push(t);
+    }
+    // Each group's whole share, then the rest one each to the largest remainders.
+    let exact: Vec<(u32, f64)> = (by.iter())
+        .map(|(&g, ts)| (g, ts.len() as f64 * n as f64 / total as f64))
+        .collect();
+    let mut take: std::collections::BTreeMap<u32, usize> = exact
+        .iter()
+        .map(|&(g, x)| (g, x.floor() as usize))
+        .collect();
+    let mut rest: Vec<(u32, f64)> = exact.iter().map(|&(g, x)| (g, x - x.floor())).collect();
+    rest.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let short = n - take.values().sum::<usize>();
+    for &(g, _) in rest.iter().take(short) {
+        *take.entry(g).or_default() += 1;
+    }
+    // Each group drawn by a seed of its own, so one group's size never moves another's draw.
+    let mut picked: Vec<T> = (by.into_iter())
+        .flat_map(|(g, ts)| sample(ts, take[&g], seed ^ (u64::from(g) << 32)))
+        .collect();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    picked.shuffle(&mut rng);
+    picked
 }
 
 #[cfg(test)]
@@ -518,6 +572,53 @@ mod tests {
         assert_eq!(tasks[1].max_tokens, 200);
         assert_eq!(tasks[3].max_tokens, CHAT_MAX_TOKENS, "bounded");
         assert!(!tasks[0].score.scored());
+    }
+
+    /// A stratified sample keeps each group's share of the whole, by largest remainder, and is the
+    /// same for the same seed; units with no group are sampled as [`sample`] samples them.
+    #[test]
+    fn a_stratified_sample_keeps_each_groups_share() {
+        // 60 of group 2, 30 of 3, 10 of 4, in that order, as MuSiQue's file is.
+        let all: Vec<(u32, usize)> = (0..100)
+            .map(|i| {
+                (
+                    if i < 60 {
+                        2
+                    } else if i < 90 {
+                        3
+                    } else {
+                        4
+                    },
+                    i,
+                )
+            })
+            .collect();
+        let picked = stratified(all.clone(), 20, 7, |&(g, _)| Some(g));
+        let count = |g: u32| picked.iter().filter(|&&(h, _)| h == g).count();
+        assert_eq!(
+            (count(2), count(3), count(4)),
+            (12, 6, 2),
+            "the whole's mix"
+        );
+        assert_eq!(
+            picked,
+            stratified(all.clone(), 20, 7, |&(g, _)| Some(g)),
+            "seeded"
+        );
+        assert_ne!(picked, stratified(all.clone(), 20, 8, |&(g, _)| Some(g)));
+        // Not one group after another: shuffled together.
+        assert!(picked[..6].iter().any(|&(g, _)| g != 2), "{picked:?}");
+        // Remainders: 7 of 60/30/10 is 4.2/2.1/0.7, so the 0.7 gets the seventh.
+        let seven = stratified(all.clone(), 7, 7, |&(g, _)| Some(g));
+        assert_eq!(seven.iter().filter(|&&(g, _)| g == 4).count(), 1);
+        assert_eq!(seven.len(), 7);
+        // More asked than there are: every one.
+        assert_eq!(
+            stratified(all.clone(), 500, 7, |&(g, _)| Some(g)).len(),
+            100
+        );
+        // No groups: the plain sample, task for task.
+        assert_eq!(stratified(all.clone(), 20, 7, |_| None), sample(all, 20, 7));
     }
 
     /// A group's questions share its system prompt; the control gives each its own.

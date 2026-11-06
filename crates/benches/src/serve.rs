@@ -1605,7 +1605,8 @@ fn load_tasks(args: &BenchServeArgs, tokenizer: &Tokenizer) -> Result<Loaded> {
         }
         _ => {}
     }
-    // Loaders read the first N records; take enough that the sample is drawn from many.
+    // The other loaders read the first N records; take enough that the sample is drawn from many.
+    #[cfg(feature = "datasets")]
     let pool = (args.num_prompts + args.num_warmups + 1).max(200);
     let (name, all) = match args.dataset_name {
         ServeDataset::Longbench => (
@@ -1613,7 +1614,8 @@ fn load_tasks(args: &BenchServeArgs, tokenizer: &Tokenizer) -> Result<Loaded> {
             crate::longbench::tasks(&args.longbench_length, args.output_len)?,
         ),
         _ => match args.rag_source {
-            RagSource::Musique => ("musique".to_string(), crate::musique::tasks(pool)?),
+            // Every record: the dev set is ordered by hops, its first 200 all 2-hop.
+            RagSource::Musique => ("musique".to_string(), crate::musique::tasks(usize::MAX)?),
             #[cfg(feature = "datasets")]
             RagSource::TwoWiki => ("2wikimqa".to_string(), crate::multihop::tasks(pool)?),
             #[cfg(feature = "datasets")]
@@ -1707,7 +1709,11 @@ fn run_tasks(
             .filter_map(|u| u.into_iter().next())
             .collect(),
     };
-    let units = crate::workloads::sample(pool, args.num_prompts, args.seed);
+    // Stratified by group where every task has one (MuSiQue's hops), so a sample of any size
+    // keeps the dataset's mix.
+    let units = crate::workloads::stratified(pool, args.num_prompts, args.seed, |u| {
+        u.first().and_then(|t| t.label.as_ref()).map(|l| l.group)
+    });
     let tasks: Vec<crate::workloads::Task> = units.iter().flatten().map(Clone::clone).collect();
     eprintln!(
         "{dataset}: {} units, {} requests (seed {}), {} warmups",
@@ -1817,6 +1823,30 @@ fn run_tasks(
     write_results(args, model, &json)
 }
 
+/// Whether an answer ran to its cap rather than ending on its own: the server's `length`, or where
+/// it sent no reason, its answer tokens ([`answer_tokens`]). One rule, for accuracy and
+/// `capped_answers` alike.
+fn ran_to_cap(
+    r: &RequestResult,
+    t: &crate::workloads::Task,
+    count_tokens: &dyn Fn(&str) -> usize,
+) -> bool {
+    match r.finish_reason.as_deref() {
+        Some(why) => why == "length",
+        None => answer_tokens(r, count_tokens) >= t.max_tokens,
+    }
+}
+
+/// An answer's tokens: the server's usage count, or counted from its text where it sent none (a
+/// span query's stream carries no usage).
+fn answer_tokens(r: &RequestResult, count_tokens: &dyn Fn(&str) -> usize) -> usize {
+    if r.output_tokens > 0 {
+        r.output_tokens
+    } else {
+        count_tokens(&r.generated_text)
+    }
+}
+
 /// One task's request body: a streamed chat request, or for `rag-spans` a span query.
 fn task_body(
     client: &Client,
@@ -1871,14 +1901,7 @@ fn task_metrics(
         v
     };
     let ms = |v: &[f64], p: f64| (!v.is_empty()).then(|| percentile(v, p) * 1000.0);
-    // A span query's stream carries no usage, so its answer tokens are counted here.
-    let answer_tokens = |r: &RequestResult| {
-        if r.output_tokens > 0 {
-            r.output_tokens
-        } else {
-            count_tokens(&r.generated_text)
-        }
-    };
+    let answer_tokens = |r: &RequestResult| answer_tokens(r, count_tokens);
     let ttft = sorted(ok.iter().map(|(r, _)| r.ttft).collect());
     let e2el = sorted(ok.iter().map(|(r, _)| r.e2el).collect());
     let tpot = sorted(
@@ -1890,26 +1913,23 @@ fn task_metrics(
     let out: Vec<usize> = ok.iter().map(|(r, _)| answer_tokens(r)).collect();
     let total_out: usize = out.iter().sum();
     let mean = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
-    // Answers that ran to their cap rather than ending on their own: the server's `length`, or
-    // where it sent no reason, the token count.
-    let capped = |r: &RequestResult, t: &crate::workloads::Task| match r.finish_reason.as_deref() {
-        Some(why) => why == "length",
-        None => answer_tokens(r) >= t.max_tokens,
-    };
+    let capped = |r: &RequestResult, t: &crate::workloads::Task| ran_to_cap(r, t, count_tokens);
     // Over every task sent that has a right answer (null for a workload with none: chat turns,
     // the shared-prefix questions). A request that failed scores wrong, as does an answer that ran
     // to its cap, whose text may hold the answer somewhere in a ramble that never gave it. Over
     // the answered only, an engine that failed the hard tasks would score higher.
+    let right = |r: &RequestResult, t: &crate::workloads::Task| {
+        t.score.scored().then(|| {
+            if r.success && !capped(r, t) {
+                t.score.score(&r.generated_text)
+            } else {
+                0.0
+            }
+        })
+    };
     let accuracy = mean(
         &(results.iter().zip(tasks))
-            .filter(|(_, t)| t.score.scored())
-            .map(|(r, t)| {
-                if r.success && !capped(r, t) {
-                    t.score.score(&r.generated_text)
-                } else {
-                    0.0
-                }
-            })
+            .filter_map(|(r, t)| right(r, t))
             .collect::<Vec<_>>(),
     );
     // Answers that open as a thought: a request whose `enable_thinking: false` did not reach the
@@ -1925,7 +1945,7 @@ fn task_metrics(
     let prompt: Vec<f64> = (ok.iter())
         .filter_map(|(r, _)| r.prompt_tokens.map(|c| c as f64))
         .collect();
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "dataset": dataset,
         "task_seed": seed,
         // Tasks sent, the denominator of accuracy: at 8 a task is 12.5 points of it.
@@ -1952,7 +1972,32 @@ fn task_metrics(
         "accuracy": accuracy,
         "thinking_answers": thought,
         "capped_answers": capped,
-    })
+    });
+    // Task by task, where the dataset names its tasks: which were sent, in order, their group,
+    // and whether each was right (null where it was not scored), so engines can be compared on
+    // the same tasks; and each group's accuracy over its tasks sent.
+    let labels: Option<Vec<&crate::workloads::TaskLabel>> =
+        tasks.iter().map(|t| t.label.as_ref()).collect();
+    if let Some(labels) = labels.filter(|l| !l.is_empty()) {
+        let rights: Vec<Option<bool>> = (results.iter().zip(tasks))
+            .map(|(r, t)| right(r, t).map(|v| v >= 1.0))
+            .collect();
+        let mut by: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
+        for (l, r) in labels.iter().zip(&rights) {
+            if let Some(r) = r {
+                (by.entry(l.group.to_string()).or_default()).push(f64::from(u8::from(*r)));
+            }
+        }
+        json["task_ids"] = serde_json::json!(labels.iter().map(|l| &l.id).collect::<Vec<_>>());
+        json["task_groups"] = serde_json::json!(labels.iter().map(|l| l.group).collect::<Vec<_>>());
+        json["task_right"] = serde_json::json!(rights);
+        json["accuracy_by_group"] = serde_json::json!(
+            (by.into_iter())
+                .map(|(g, v)| (g, mean(v.as_slice())))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        );
+    }
+    json
 }
 
 /// Every `--metric-percentiles` percentile of a dataset workload's TTFT, TPOT and end-to-end
@@ -1969,13 +2014,7 @@ fn add_task_percentiles(
         .filter(|(r, _)| r.success)
         .map(|(r, _)| r)
         .collect();
-    let answer_tokens = |r: &RequestResult| {
-        if r.output_tokens > 0 {
-            r.output_tokens
-        } else {
-            count_tokens(&r.generated_text)
-        }
-    };
+    let answer_tokens = |r: &RequestResult| answer_tokens(r, count_tokens);
     let sorted = |mut v: Vec<f64>| {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v
@@ -2408,6 +2447,84 @@ mod tests {
         let mut closed = serde_json::json!({});
         add_task_requests(&mut closed, &[], f64::INFINITY);
         assert!(closed["request_rate"].is_null(), "inf is a closed loop");
+    }
+
+    /// A labelled task's result is recorded task by task, in the order sent, with its id, its
+    /// group (MuSiQue's hops) and whether it was right, null where it was not scored; and the
+    /// accuracy of each group, over its tasks sent.
+    #[test]
+    fn a_labelled_tasks_result_is_recorded_task_by_task() {
+        let words = |t: &str| t.split_whitespace().count();
+        let answered = |text: &str| {
+            let mut r = req(2, 2, 0.1, 0.5);
+            r.generated_text = text.into();
+            r
+        };
+        let labelled = |id: &str, hops: u32| {
+            let mut t = rag("Paris");
+            t.label = Some(crate::workloads::TaskLabel {
+                id: id.into(),
+                group: hops,
+            });
+            t
+        };
+        let results = vec![
+            answered("Paris."),
+            answered("Lyon."),
+            RequestResult::failed(0.0, 1.0, "timed out".into()),
+            answered("Paris"),
+        ];
+        let tasks = vec![
+            labelled("a", 2),
+            labelled("b", 2),
+            labelled("c", 3),
+            labelled("d", 4),
+        ];
+        let j = task_metrics(&results, &tasks, &words, 1.0, "musique", 7);
+        assert_eq!(j["task_ids"], serde_json::json!(["a", "b", "c", "d"]));
+        assert_eq!(j["task_groups"], serde_json::json!([2, 2, 3, 4]));
+        assert_eq!(
+            j["task_right"],
+            serde_json::json!([true, false, false, true]),
+            "a failed request is wrong"
+        );
+        assert_eq!(
+            j["accuracy_by_group"],
+            serde_json::json!({"2": 0.5, "3": 0.0, "4": 1.0})
+        );
+        // An unlabelled workload records none of them.
+        let j = task_metrics(&results[..1], &[rag("Paris")], &words, 1.0, "musique", 7);
+        assert!(j.get("task_ids").is_none() && j.get("accuracy_by_group").is_none());
+    }
+
+    /// A server that sends neither usage nor a finish reason: an answer whose text runs to its cap
+    /// counts as capped, for accuracy and capped_answers alike, and one that ended short of its
+    /// cap is not.
+    #[test]
+    fn a_capped_answer_with_no_usage_is_capped_by_one_rule() {
+        let words = |t: &str| t.split_whitespace().count();
+        let task = rag("Paris");
+        let mut ramble = req(0, 1, 0.1, 0.5);
+        ramble.generated_text = format!("Paris {}", "and ".repeat(task.max_tokens));
+        let mut short = req(0, 1, 0.1, 0.5);
+        short.generated_text = "Paris".into();
+        assert!(ran_to_cap(&ramble, &task, &words), "counted from its text");
+        assert!(!ran_to_cap(&short, &task, &words));
+        assert_eq!(
+            answer_tokens(&short, &words),
+            1,
+            "counted where the server sent none"
+        );
+        let j = task_metrics(
+            &[ramble],
+            std::slice::from_ref(&task),
+            &words,
+            1.0,
+            "musique",
+            7,
+        );
+        assert_eq!(j["capped_answers"], 1, "the cell counts it the same way");
+        assert_eq!(j["accuracy"], 0.0, "and scores it wrong");
     }
 
     /// A dataset workload's metrics: accuracy over every task sent, a failed request or a capped

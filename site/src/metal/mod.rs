@@ -180,7 +180,12 @@ fn borrow_earlier(runs: &mut [Run]) {
     // Per (machine, model, engine): its dataset cells as last measured, each tagged with when,
     // with the task cap and the scaling they were measured under (whose rounds say how many tasks
     // each cell sent).
-    type Tasked = (Vec<data::TaskCell>, Option<u32>, Option<data::TaskSizing>);
+    type Tasked = (
+        Vec<data::TaskCell>,
+        Option<u32>,
+        Option<data::TaskSizing>,
+        Option<String>,
+    );
     let mut task_cells: BTreeMap<(String, String, &str), Tasked> = BTreeMap::new();
     for i in order {
         let run = &mut runs[i];
@@ -219,6 +224,9 @@ fn borrow_earlier(runs: &mut [Run]) {
             let stacked = |c: &data::TaskCell| matches!(c.load.as_deref(), None | Some("users"));
             let open_loop = !(Engine::Scratchy.tasks(m).iter()).all(stacked);
             let sizing = (run.config.scaling.as_ref()).and_then(data::Scaling::task_sizing);
+            // And drawn the same way: a run that samples all of MuSiQue's hops asks other tasks
+            // than one that took its first 200.
+            let drawn = task_sample(&run.config);
             for e in Engine::RIVALS {
                 let Some(slot) = e.tasks_mut(m) else { continue };
                 let key = (at.0.clone(), at.1.clone(), e.key());
@@ -236,13 +244,13 @@ fn borrow_earlier(runs: &mut [Run]) {
                         // A run with only open-loop cells lends none, and leaves an earlier
                         // stacked run's cells to lend.
                         if !lent.is_empty() {
-                            task_cells.insert(key, (lent, cap, sizing));
+                            task_cells.insert(key, (lent, cap, sizing, drawn.clone()));
                         }
                     }
                     None if open_loop => {}
                     None => {
-                        let Some((cells, _, theirs)) =
-                            task_cells.get(&key).filter(|(_, c, _)| *c == cap)
+                        let Some((cells, _, theirs, _)) = (task_cells.get(&key))
+                            .filter(|(_, c, _, d)| *c == cap && *d == drawn)
                         else {
                             continue;
                         };
@@ -279,6 +287,12 @@ fn borrow_earlier(runs: &mut [Run]) {
 /// the same tasks only under the same cap.
 fn run_task_cap(config: &data::Config) -> Option<u32> {
     config.scaling.as_ref().and_then(|s| s.task_max_prompt)
+}
+
+/// How a run drew its RAG cells' tasks ([`data::Scaling::task_sample`]): None in runs from before
+/// it was recorded, which drew from MuSiQue's first 200.
+fn task_sample(config: &data::Config) -> Option<String> {
+    config.scaling.as_ref().and_then(|s| s.task_sample.clone())
 }
 
 /// A dataset map's axes before there is anything to show: a place of the right shape.
@@ -2661,10 +2675,13 @@ fn task_timelines(entries: &[Entry]) -> Vec<(&'static str, Element)> {
             .find(|c| c.workload == w && c.conc == 1 && c.measured() && c.borrowed_from.is_none())
             .and_then(|c| c.median_ttft_ms)
     };
+    // Since its tasks were last drawn differently: a change of questions is no regression.
+    let newest = entries.last().map(|e| task_sample(&e.run.config));
     let mut charts = Vec::new();
     for (w, value) in TASK_TIMELINES {
         let kept: Vec<&Entry> = (entries.iter())
             .filter(|e| own(e, Engine::Scratchy, w).is_some())
+            .filter(|e| Some(task_sample(&e.run.config)) == newest)
             .collect();
         if kept.len() < 2 {
             continue;
@@ -4434,6 +4451,60 @@ mod tests {
     /// A quick run after a full run borrows the full run's engines: the quick run's 64-token
     /// answers are the full run's users × prompt map, and the full run's 512- and 2048-token
     /// answers ran at 1 user only, so they are not cells the quick run compares.
+    /// A rival's dataset cells are borrowed only from a run that drew its tasks the same way: a
+    /// run that samples all of MuSiQue's hops does not take an older run's 2-hop cells as its
+    /// rival's.
+    #[test]
+    fn a_rival_is_not_borrowed_across_a_change_in_sampling() {
+        use super::data::Run;
+        use super::numbers::Engine;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut full: serde_json::Value = serde_json::from_str(&text).unwrap();
+        full["generated_utc"] = "2026-10-24T12:00:00Z".into();
+        let ours = full["models"][0]["tasks"].clone();
+        full["models"][0]["tasks_omlx_tq"] = ours;
+        let load = |v: &serde_json::Value| -> Run { serde_json::from_value(v.clone()).unwrap() };
+        for (sample, borrowed) in [(None, true), (Some("musique-dev-by-hops"), false)] {
+            let mut quick: serde_json::Value = serde_json::from_str(&text).unwrap();
+            quick["config"]["scaling"]["task_sample"] = serde_json::json!(sample);
+            let mut runs = vec![load(&quick), load(&full)];
+            super::borrow_earlier(&mut runs);
+            let lent = !Engine::OmlxTq.tasks(&runs[0].models[0]).is_empty();
+            assert_eq!(lent, borrowed, "sampled {sample:?}");
+        }
+    }
+
+    /// A dataset's timeline does not join runs that drew their tasks differently: a change of
+    /// questions is not a regression.
+    #[test]
+    fn a_timeline_starts_again_where_the_sampling_changed() {
+        use super::data::Run;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let two = |sample: Option<&str>| -> Vec<Run> {
+            let mut old: serde_json::Value = serde_json::from_str(&text).unwrap();
+            old["generated_utc"] = "2026-10-24T12:00:00Z".into();
+            let mut new: serde_json::Value = serde_json::from_str(&text).unwrap();
+            new["config"]["scaling"]["task_sample"] = serde_json::json!(sample);
+            vec![serde_json::from_value(old).unwrap(), serde_json::from_value(new).unwrap()]
+        };
+        let titles = |runs: &[Run]| -> Vec<&'static str> {
+            let entries: Vec<super::Entry> = (runs.iter())
+                .map(|run| super::Entry { run, m: &run.models[0] })
+                .collect();
+            super::task_timelines(&entries).into_iter().map(|(t, _)| t).collect()
+        };
+        assert!(!titles(&two(None)).is_empty(), "one sampling, one line");
+        assert!(titles(&two(Some("musique-dev-by-hops"))).is_empty(), "one run since");
+    }
+
     #[test]
     fn a_quick_runs_dataset_cells_borrow_the_rival_under_the_same_task_cap() {
         use super::data::Run;

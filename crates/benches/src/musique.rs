@@ -42,6 +42,8 @@ struct Paragraph {
 
 /// A single query in the benchmark.
 struct Query {
+    /// Its id in the dev set: `2hop__460946_294723`.
+    id: String,
     question: String,
     answer: String,
     /// Alternative acceptable answers.
@@ -95,6 +97,7 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
         }
         let record: serde_json::Value = serde_json::from_str(&line)?;
 
+        let id = record["id"].as_str().unwrap_or("").to_string();
         let question = record["question"].as_str().unwrap_or("").to_string();
         let answer = record["answer"].as_str().unwrap_or("").to_string();
 
@@ -143,6 +146,7 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
             .collect();
 
         queries.push(Query {
+            id,
             question,
             answer,
             answer_aliases,
@@ -163,7 +167,9 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
 }
 
 /// The first `n` tasks of the dataset, as `scr bench serve` sends them over HTTP
-/// ([`crate::workloads`]): every paragraph, supporting and distractor, as a document.
+/// ([`crate::workloads`]): every paragraph, supporting and distractor, as a document; each
+/// labelled with its id and hop count, which `bench serve` stratifies its sample by. The dev
+/// file is ordered by hops, its first 1,179 all 2-hop, so a sample of the whole takes every one.
 pub(crate) fn tasks(n: usize) -> Result<Vec<crate::workloads::Task>> {
     Ok(fetch_dataset(n)?
         .queries
@@ -181,14 +187,19 @@ fn task(q: &Query, max_tokens: usize) -> crate::workloads::Task {
     let answers: Vec<String> = std::iter::once(q.answer.clone())
         .chain(q.answer_aliases.iter().cloned())
         .collect();
-    crate::workloads::rag_task(
+    let mut t = crate::workloads::rag_task(
         &crate::workloads::DOCUMENTS,
         &docs,
         &q.question,
         &answers,
         crate::workloads::Rule::AnyAnswer,
         max_tokens,
-    )
+    );
+    t.label = Some(crate::workloads::TaskLabel {
+        id: q.id.clone(),
+        group: q.num_hops as u32,
+    });
+    t
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +572,21 @@ pub(crate) fn run_bench_musique(args: BenchMusiqueArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::scoring::normalize_tokens;
+
+    /// The matrix's accuracy sample of the dev set, as `bench serve` draws it: every hop count in
+    /// its dev-set share, not the first records' 2-hop alone. Needs the dev set (downloaded once
+    /// to the cache): `cargo test -p scratchy-bench -- --ignored a_musique_sample`.
+    #[test]
+    #[ignore = "reads the MuSiQue dev set"]
+    fn a_musique_sample_asks_every_hop_count() {
+        let all = tasks(usize::MAX).expect("the dev set");
+        assert_eq!(all.len(), 2417);
+        let hops = |t: &crate::workloads::Task| t.label.as_ref().map(|l| l.group);
+        let picked = crate::workloads::stratified(all, 400, 12345, hops);
+        let count = |h: u32| picked.iter().filter(|t| hops(t) == Some(h)).count();
+        // 1,252, 760 and 405 of 2,417.
+        assert_eq!((count(2), count(3), count(4)), (207, 126, 67));
+    }
 
     #[test]
     fn evaluate_exact_substring() {

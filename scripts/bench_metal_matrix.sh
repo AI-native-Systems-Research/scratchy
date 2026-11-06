@@ -310,6 +310,8 @@ WORKLOADS="sharegpt,rag,sharegpt-multi-turn"
 (( FULL )) && WORKLOADS="sharegpt,rag,sharegpt-multi-turn,shared-prefix,shared-prefix-control"
 WORKLOADS_SCRATCHY="rag-spans"
 # --full: one more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count,
+# drawn from all of MuSiQue's dev set in its mix of 2-, 3- and 4-hop questions (bench serve
+# stratifies by hops), as every RAG cell's are,
 # where a task is 1 point of accuracy rather than a quick cell's 12.5. Its timing is not compared.
 ACCURACY_TASKS=0
 (( FULL )) && ACCURACY_TASKS=100
@@ -796,6 +798,10 @@ json.dump({
                  "grid_dataset": e["GRID_DATASET"],
                  "grid_load": float(e["GRID_LOAD"]) if e["OPEN_LOOP"] == "1" else None,
                  "accuracy_tasks": int(e["ACCURACY_TASKS"]) or None,
+                 # How a RAG cell's tasks were drawn: from all of MuSiQue's dev set, stratified by
+                 # hops. Earlier runs drew from its first 200, all 2-hop, so their accuracy is of
+                 # easier questions and their tasks are not these.
+                 "task_sample": "musique-dev-by-hops",
                  "sharegpt": e["SHAREGPT_URL"],
                  "concurrency_is": "offered (--max-concurrency), not the effective decode batch"},
              "comparison": {row.split("|")[0]: row.split("|")[2] == "1"
@@ -1999,7 +2005,10 @@ def scaling(engine):
 # What a dataset cell keeps: the serving metrics, then what a task measures.
 TASK_KEEP = KEEP + ["dataset", "task_seed", "num_tasks", "request_rate", "timed_answers",
                     "start_times", "ttfts_ms", "e2els_ms", "mean_output_tokens", "mean_prompt_tokens", "mean_cached_tokens",
-                    "accuracy", "empty_answers", "thinking_answers", "capped_answers"]
+                    "accuracy", "empty_answers", "thinking_answers", "capped_answers",
+                    # Task by task, where the dataset names its tasks: so engines can be compared
+                    # on the same tasks, and accuracy read by MuSiQue's hops.
+                    "task_ids", "task_groups", "task_right", "accuracy_by_group"]
 TASK_CELL = re.compile(r"\.tasks-([a-z0-9-]+)@(\d+|base)\.json$")
 def tasks(engine):
     cells = []
