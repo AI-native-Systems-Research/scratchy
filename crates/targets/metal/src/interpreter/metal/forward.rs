@@ -24,7 +24,7 @@ use scratchy_core_common::sampled_rows::{EmptySequence, SampledRows};
 
 /// One forward step's runtime inputs.
 ///
-/// The bucket selected by [`super::pool::MetalWorkerPool::pick_bucket`]
+/// The bucket chosen at the door ([`super::bucket::bucket`])
 /// determines which slices the active tape's commands consume. Buckets
 /// that don't reference a particular runtime buffer (e.g. a decode
 /// bucket has no `cu_seqlens_q`) accept `None` for that field — the

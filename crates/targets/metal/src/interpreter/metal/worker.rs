@@ -25,6 +25,7 @@ use crate::interpreter::metal::__re::{
 use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;
 
+use super::bucket::{BakedBuckets, Buckets, Picked};
 use super::ids::LayerId;
 use super::lowered::{
     Binding, Fence, KernelId, LoweredCommand, LoweredMetalTape, StepKernel, TapeCommand,
@@ -1179,9 +1180,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
     }
 
     /// Count total dispatches across all MTL4 steps in this bucket.
-    pub fn count_dispatches(&self, bucket: usize) -> usize {
+    pub fn count_dispatches(&self, bucket: &W::Bucket) -> usize
+    where
+        W: BakedBuckets,
+    {
         self.bucket_bakings
-            .get(bucket)
+            .get(bucket.picked().index())
             .and_then(|b| b.mtl4_steps.as_ref())
             .map(|steps| steps.iter().map(|s| s.dispatches.len()).sum())
             .unwrap_or(0)
@@ -1199,9 +1203,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// it; only the CB boundary does. The pool serializes such buckets
     /// via [`run_dump_segment`]-style chunked commits. Cheap to scan
     /// (handful of steps) and the result gates a once-per-image path.
-    pub fn bucket_has_avg_pool_2d(&self, bucket: usize) -> bool {
+    pub fn bucket_has_avg_pool_2d(&self, bucket: &W::Bucket) -> bool
+    where
+        W: BakedBuckets,
+    {
         self.bucket_bakings
-            .get(bucket)
+            .get(bucket.picked().index())
             .and_then(|b| b.mtl4_steps.as_ref())
             .map(|steps| {
                 steps
@@ -1218,16 +1225,20 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// residency wiring (`useResidencySet`), commit, and event-based
     /// wait. Returns an error if MTL4 was not baked for this bucket
     /// (e.g. a kernel exceeds the 31-binding argument-table cap).
+    /// The token count it plays is the bucket's proof's: at most its rows.
     pub fn run_bucket_mtl4(
         &self,
-        bucket: usize,
-        num_tokens: u32,
+        bucket: &W::Bucket,
         num_seqs: u32,
         sampled_rows: crate::tape::ids::SampledRowCount,
         reads: super::ForwardReads,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
-    ) -> Result<(), WorkerError> {
-        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, sampled_rows, reads, enc, None)
+    ) -> Result<(), WorkerError>
+    where
+        W: BakedBuckets,
+    {
+        let picked = bucket.picked();
+        self.run_bucket_mtl4_inner(picked, num_seqs, sampled_rows, reads, enc, None)
     }
 
     /// Activation-dump replay segment: encode only the flat dispatch
@@ -1238,16 +1249,17 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// segments with a host wait + arena readback between them.
     pub fn run_bucket_mtl4_range(
         &self,
-        bucket: usize,
-        num_tokens: u32,
+        bucket: &W::Bucket,
         num_seqs: u32,
         sampled_rows: crate::tape::ids::SampledRowCount,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         range: std::ops::Range<usize>,
-    ) -> Result<(), WorkerError> {
+    ) -> Result<(), WorkerError>
+    where
+        W: BakedBuckets,
+    {
         self.run_bucket_mtl4_inner(
-            bucket,
-            num_tokens,
+            bucket.picked(),
             num_seqs,
             sampled_rows,
             super::ForwardReads::Outputs,
@@ -1256,16 +1268,17 @@ impl<W: CanonicalParams> MetalWorker<W> {
         )
     }
 
+    /// The bucket `picked` proves the request fits, at the request's tokens.
     fn run_bucket_mtl4_inner(
         &self,
-        bucket: usize,
-        num_tokens: u32,
+        picked: &Picked,
         num_seqs: u32,
         sampled_rows: crate::tape::ids::SampledRowCount,
         reads: super::ForwardReads,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         range: Option<std::ops::Range<usize>>,
     ) -> Result<(), WorkerError> {
+        let (bucket, num_tokens) = (picked.index(), picked.tokens().get());
         use ::objc2_metal::{
             MTL4CommandEncoder, MTL4ComputeCommandEncoder as _, MTL4VisibilityOptions, MTLStages,
         };

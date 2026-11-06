@@ -15259,6 +15259,9 @@ pub fn emit_model(
     // mutually-exclusive cfg-gated, but the slice statics
     // themselves are backend-agnostic).
     let mut metal_bucket_entries: Vec<TokenStream> = Vec::new();
+    // Each row of `METAL_BUCKETS` as its bucket type, in row order: its rows, band and arena
+    // (`baked_buckets!`).
+    let mut metal_bucket_types: Vec<TokenStream> = Vec::new();
     let mut metal_arena_bytes_statics: Vec<TokenStream> = Vec::new();
     #[cfg(feature = "metal")]
     let mut metal_tape_cmds = scratchy_target_metal_compiler::static_tape::CommandPool::default();
@@ -15622,6 +15625,10 @@ pub fn emit_model(
                     ::BYTES
             };
             let band_ident = proc_macro2::Ident::new(band, proc_macro2::Span::call_site());
+            let bucket_type = format_ident!("B{}", metal_bucket_types.len());
+            metal_bucket_types.push(quote! {
+                #bucket_type = (#m_rows, #band_ident, super::__arena::#arena<#m_rows, #sk_rows>)
+            });
             metal_bucket_entries.push(quote! {
                 ::scratchy_target_metal::interpreter::metal::MetalBucketSpec {
                     bucket_m: #bucket_m_lit,
@@ -15663,6 +15670,20 @@ pub fn emit_model(
             pub(super) static RANKED: ::scratchy_target_metal::interpreter::metal::RankedSlots<
                 #metal_ranked_slots,
             > = ::scratchy_target_metal::interpreter::metal::RankedSlots::of(super::METAL_BUCKETS);
+        }
+
+        /// The model's buckets: each row of [`METAL_BUCKETS`] as a type, and the enum a forward's
+        /// bucket is, chosen at the door (`scratchy_target_metal::interpreter::metal::bucket`).
+        #[cfg(feature = "metal")]
+        mod __buckets {
+            ::scratchy_target_metal::baked_buckets! {
+                pub enum Bucket { #(#metal_bucket_types),* }
+            }
+        }
+
+        #[cfg(feature = "metal")]
+        impl ::scratchy_target_metal::interpreter::metal::BakedBuckets for Weights {
+            type Bucket = __buckets::Bucket;
         }
     });
 
@@ -15925,8 +15946,8 @@ pub fn emit_model(
         /// Per-canonical tape_index plan for the Metal pool. One row per
         /// `num_tokens` point per routed fold band (`FoldBand`), ordered ascending, a
         /// bucket's band rows adjacent. A pool keeps one band's rows (`pick_rung`), so its
-        /// bucket index is no index into this table: a forward's slots come from the pool's
-        /// own rows (`MetalWorkerPool::bucket_spec`).
+        /// bucket index is no index into this table: a forward's slots come from its bucket's row
+        /// (`Buckets::row`), the one the door chose.
         #[cfg(feature = "metal")]
         pub static METAL_BUCKETS:
             &[::scratchy_target_metal::interpreter::metal::MetalBucketSpec]
@@ -15946,6 +15967,7 @@ pub fn emit_model(
                 // Checked against the buckets as this static compiles: every slot of every bucket
                 // ranked once, and no bucket's final hidden states among the hosting ranks.
                 ranks: __arena::RANKED.ranks(METAL_BUCKETS),
+                door: ::scratchy_target_metal::interpreter::metal::bucket_row::<__buckets::Bucket>,
             };
 
         /// Largest `num_tokens` tape_index across [`METAL_BUCKETS`]. The
@@ -16761,7 +16783,6 @@ pub fn emit_model(
                 "a forward asked the host for hidden rows of a pool that runs in another's arena \
                  (an MTP head's)"
             );
-            let n = num_tokens as usize;
 
 
             // ── Run forward + copy logits out ─────────────────────
@@ -16778,7 +16799,7 @@ pub fn emit_model(
             // ownership of the worker's arena.
             with_forward_inputs(ctx, num_tokens, |inputs| {
                 let rows = #terminal_rows;
-                // Adapter: pool's tail receives `(encoder, worker, runtime, bucket_idx)`
+                // Adapter: pool's tail receives `(encoder, worker, runtime, bucket)`
                 // and returns `Result<(), ForwardError>`. The public hook
                 // is `(encoder, FollowupOutputs) -> Result<(), String>`.
                 // Resolve the outputs from the worker's arena, its runtime bindings and the
@@ -16789,12 +16810,12 @@ pub fn emit_model(
                           >,
                           worker: &::scratchy_target_metal::interpreter::metal::MetalWorker<Weights>,
                           #captured_runtime: &::scratchy_target_metal::interpreter::metal::RuntimeBindings,
-                          bucket_idx: usize|
+                          bucket: &__buckets::Bucket|
                           -> ::core::result::Result<
                         (),
                         ::scratchy_target_metal::interpreter::metal::ForwardError,
                     > {
-                        let spec = pool.bucket_spec(bucket_idx);
+                        let spec = ::scratchy_target_metal::interpreter::metal::Buckets::row(bucket);
                         let outputs = ::scratchy_forward_compiler::FollowupOutputs {
                             logits: &worker.arena[spec.terminal_slot as usize],
                             hidden: &worker.arena[spec.backbone_slot as usize],
@@ -16810,12 +16831,15 @@ pub fn emit_model(
                 });
                 pool.forward_with_tail(
                     inputs,
-                    |worker, bucket_idx| {
-                        let spec = pool.bucket_spec(bucket_idx);
+                    |worker, bucket| {
+                        let spec = ::scratchy_target_metal::interpreter::metal::Buckets::row(bucket);
                         use ::scratchy_target_metal::interpreter::metal::__re::MTLBuffer as _;
                         // The caller's rows of the final hidden states (an MTP head's next input),
                         // before the worker goes back to the pool and its arena is reused.
                         if let Some(h) = ctx.hidden_out {
+                            // The forward's rows: its bucket's proof's, at most the bucket's rows.
+                            let n = ::scratchy_target_metal::interpreter::metal::Buckets::tokens(bucket)
+                                .get() as usize;
                             let row_bytes =
                                 <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.hidden().get() * 2;
                             let hidden = worker.arena[spec.backbone_slot as usize].contents();
@@ -16913,7 +16937,8 @@ pub fn emit_model(
                 ) -> &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
                     dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
                 > {
-                    &self.0.worker().arena[self.0.bucket_spec().backbone_slot as usize]
+                    let row = ::scratchy_target_metal::interpreter::metal::Buckets::row(self.0.bucket());
+                    &self.0.worker().arena[row.backbone_slot as usize]
                 }
 
                 fn logits(
@@ -16921,7 +16946,8 @@ pub fn emit_model(
                 ) -> &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
                     dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
                 > {
-                    &self.0.worker().arena[self.0.bucket_spec().terminal_slot as usize]
+                    let row = ::scratchy_target_metal::interpreter::metal::Buckets::row(self.0.bucket());
+                    &self.0.worker().arena[row.terminal_slot as usize]
                 }
 
                 fn draft_selection(
@@ -16975,12 +17001,14 @@ pub fn emit_model(
         ) -> ::core::result::Result<(), ::std::string::String> {
             let pool = resident_metal_pool(wm, ctx, device);
             with_forward_inputs(ctx, num_tokens, |inputs| {
-                // Pre-pick the bucket from iter-0 num_tokens. The chain
-                // shape is constant across iters so this index is reused.
-                let bucket_idx = pool
-                    .pick_bucket_for(inputs)
-                    .map_err(|e| format!("MetalWorkerPool::pick_bucket_for: {e}"))?;
-                let terminal_slot = pool.bucket_spec(bucket_idx).terminal_slot as usize;
+                // The bucket of iter 0's tokens, at the door. The chain's shape is constant across
+                // iters, so every iter plays it, at its tokens.
+                let bucket = pool
+                    .bucket_for(inputs)
+                    .map_err(|e| format!("MetalWorkerPool::bucket_for: {e}"))?;
+                let terminal_slot =
+                    ::scratchy_target_metal::interpreter::metal::Buckets::row(&bucket).terminal_slot
+                        as usize;
                 let vocab = METAL_VOCAB_SIZE as u32;
 
                 pool.with_chain_encoder(
@@ -16988,16 +17016,19 @@ pub fn emit_model(
                     |worker, runtime, enc| {
                         // Concrete adapter that satisfies the non-generic
                         // `ChainStepHandle` trait. Holds the worker
-                        // borrow + the bucket_idx; calls
+                        // borrow + the bucket; calls
                         // `worker.run_bucket_mtl4` to encode one iter onto
                         // the encoder.
-                        struct Adapter<'a, W: ::scratchy_forward_compiler::CanonicalParams> {
+                        struct Adapter<'a, W: ::scratchy_forward_compiler::CanonicalParams
+                            + ::scratchy_target_metal::interpreter::metal::BakedBuckets>
+                        {
                             worker: &'a ::scratchy_target_metal::interpreter::metal::MetalWorker<W>,
-                            bucket_idx: usize,
+                            bucket: W::Bucket,
                             terminal_slot: usize,
                             vocab: u32,
                         }
-                        impl<W: ::scratchy_forward_compiler::CanonicalParams>
+                        impl<W: ::scratchy_forward_compiler::CanonicalParams
+                            + ::scratchy_target_metal::interpreter::metal::BakedBuckets>
                             ::scratchy_forward_compiler::ChainStepHandle for Adapter<'_, W>
                         {
                             fn run_forward_step(
@@ -17005,14 +17036,12 @@ pub fn emit_model(
                                 encoder: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
                                     dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
                                 >,
-                                num_tokens: u32,
                                 num_seqs: u32,
                                 sampled_rows: ::scratchy_forward_compiler::SampledRowCount,
                             ) -> ::core::result::Result<(), ::std::string::String> {
                                 self.worker
                                     .run_bucket_mtl4(
-                                        self.bucket_idx,
-                                        num_tokens,
+                                        &self.bucket,
                                         num_seqs,
                                         sampled_rows,
                                         ::scratchy_target_metal::interpreter::metal::ForwardReads::Outputs,
@@ -17033,7 +17062,7 @@ pub fn emit_model(
                         }
                         let adapter = Adapter {
                             worker,
-                            bucket_idx,
+                            bucket,
                             terminal_slot,
                             vocab,
                         };

@@ -1630,11 +1630,9 @@ impl MetalWorker {
         let weight_bytes = |m: &dyn scratchy_forward_compiler::ScratchyWeights| {
             let rungs = scratchy_target_metal::interpreter::metal::MetalRungs::of(m.metal_rungs())
                 .map_err(|e| init(&format!("its buckets: {e}")))?;
-            (rungs.buckets.iter())
-                .filter(|b| b.bucket_m >= rows)
-                .min_by_key(|b| b.bucket_m)
+            (rungs.bucket_row(rows))
                 .map(|b| b.weight_bytes)
-                .ok_or_else(|| init(&format!("no bucket holds {rows} verify rows")))
+                .map_err(|e| init(&format!("{rows} verify rows: {e}")))
         };
         let cost = scratchy_target_metal::dflash2::VerifyLine::of(
             weight_bytes(target)?,
@@ -3532,7 +3530,6 @@ fn metal_chain_dispatch(
     let argmax_arg_tables_for_closure = argmax_arg_tables.clone();
     let chain_arg_table_for_closure = chain_arg_table.clone();
 
-    let num_tokens_u32 = req.num_tokens as u32;
     let num_reqs_u32 = num_reqs as u32;
     let k_usize = k;
 
@@ -3572,7 +3569,7 @@ fn metal_chain_dispatch(
             for iter in 0..k_usize {
                 // A K-step decode samples each sequence's one row.
                 let sampled = ::scratchy_forward_compiler::SampledRowCount(num_reqs_u32);
-                handle.run_forward_step(enc, num_tokens_u32, num_reqs_u32, sampled)?;
+                handle.run_forward_step(enc, num_reqs_u32, sampled)?;
 
                 let table = &argmax_arg_tables_for_closure[iter];
                 let out_addr = argmax_bufs_for_closure[iter].gpuAddress();
