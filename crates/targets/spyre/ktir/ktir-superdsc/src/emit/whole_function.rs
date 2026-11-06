@@ -336,23 +336,37 @@ fn transposed_b_is_placeable(
 pub struct RmsNormChain {
     /// The normalised tensor — squared, reduced, and scaled.
     pub x: Ssa,
-    /// The learned gain the chain's last multiply applies (`n1` / `gamma`).
-    pub gamma: Ssa,
+    /// The chain's GAIN leg — the last factor of `x · rsqrt(mean(x²)+eps) · gain`. A norm's gain
+    /// is one of exactly two things: a learned row (reached through its own rank plumbing, with
+    /// its OnePlusScale offset), or the identity — the chain closes at the normalising multiply
+    /// and `gain = 1`. The gainless form is the SAME op with a different gain value, not a
+    /// different shape this door refuses.
+    pub gain: GainLeg,
     /// The final `arith.mulf`'s result: what the fused program produces.
     pub out: Ssa,
     /// The epsilon this chain's own `arith.addf` adds — read per chain, because
     /// `program_rmsnorm_eps` requires ONE root in the whole function and a decoder has two.
     pub eps: f32,
-    /// The OnePlusScale gain offset, when the chain's gain leg is `(1 + gamma)` rather than
-    /// `gamma`: ONE `arith.addf` over the loaded row with a splatted constant, consumed by the
+    /// Every intermediate the fused op never materialises, so `lower_function` lowers NOTHING for
+    /// them. The final multiply is not here: it is the op that BECOMES the fused program.
+    pub consumed: Vec<Ssa>,
+}
+
+/// A norm's gain — the two values the chain's last factor can be.
+#[derive(Clone, Debug)]
+pub enum GainLeg {
+    /// The learned gain row the chain's last multiply applies (`n1` / `gamma`), with the
+    /// OnePlusScale gain offset: `Some(1.0)` when the gain leg is `(1 + gamma)` rather than
+    /// `gamma` — ONE `arith.addf` over the loaded row with a splatted constant, consumed by the
     /// chain exactly as the rank plumbing is. `None` is the Scale convention (no addf); the only
     /// admitted value is 1.0 — `GainConvention::from_offset`'s own law, refused by name otherwise.
     /// Read per chain the way [`super::lower_ktir_to_superdsc::rmsnorm`]'s `program_gain_offset`
     /// reads it, so the two doors cannot state different formulas for one program.
-    pub ones: Option<f32>,
-    /// Every intermediate the fused op never materialises, so `lower_function` lowers NOTHING for
-    /// them. The final multiply is not here: it is the op that BECOMES the fused program.
-    pub consumed: Vec<Ssa>,
+    Row { gamma: Ssa, ones: Option<f32> },
+    /// The identity gain: `out = x · rsqrt(mean(x²)+eps)` with no gain multiply at all. The
+    /// normalising multiply is the chain's terminal and its result is the fused program's
+    /// output — the same device body the per-`Program` door `rmsnorm_unit` emits.
+    Identity,
 }
 
 /// Read EVERY rmsnorm chain off the program, or say why what is there is not one.
@@ -545,103 +559,121 @@ fn rmsnorm_chain_from(
             f.name
         ));
     };
-    consumed.push(scaled);
-    // `· gamma` — the learned gain, itself reached through its own rank plumbing.
-    let Some(gain_mul) = sole_reader(scaled) else {
-        return err(format!(
-            "{}: nothing reads `x · rsqrt(...)`. `Program::RmsNorm` applies a learned gain; a \
-             normalisation with none is not the shape this door lowers.",
-            f.name
-        ));
-    };
-    if gain_mul.op_type != OpKind::ArithMulf {
-        return err(format!(
-            "{}: `x · rsqrt(...)` is read by `{:?}` rather than by the gain multiply",
-            f.name, gain_mul.op_type
-        ));
-    }
-    let Some(gain_src) = gain_mul.operands.iter().copied().find(|&s| s != scaled) else {
-        return err(format!(
-            "{}: the rmsnorm's gain multiply squares its input",
-            f.name
-        ));
-    };
-    // Walk BACK through the gain's rank plumbing to the value a `Region` can be found for.
-    let mut gamma = gain_src;
-    for _ in 0..3 {
-        let Some(d) = def_of(gamma) else { break };
-        if !matches!(
-            d.op_type,
-            OpKind::TensorExpandShape | OpKind::TensorCollapseShape | OpKind::LinalgBroadcast
-        ) {
-            break;
-        }
-        consumed.push(gamma);
-        let Some(src) = d.operands.first().copied() else {
-            break;
+    // `· gain` — the chain's gain leg, and IDENTITY IS ONE OF ITS VALUES. The leg is claimed as a
+    // learned row ONLY when the normalising multiply's sole `arith.mulf` reader has, as its other
+    // operand, a ROW-BROADCAST gain — `gamma` or `1+gamma`, a `[1, cols]` row sprayed down the
+    // rows (`BcastAxis::Mb`, the one shape predicate, shared with the walk's own broadcast
+    // resolution through [`program_broadcast_chains`] rather than re-derived here; the multiply's
+    // own extent coherence pins the row's width to the norm's `cols`). ANY other reader of the
+    // normalised value — a store, a residual add, several readers, none at all, or a multiply by
+    // an activation, a scalar, or a dense `[rows, cols]` tensor — closes the leg as the IDENTITY:
+    // `out = x · rsqrt(mean(x²)+eps)` with `gain = 1`, the same norm the per-`Program` door's
+    // `rmsnorm_unit` lowers, and that multiply (when there is one) lowers op by op against the
+    // fused program's output. The normalising multiply is then the chain's TERMINAL and `scaled`
+    // its OUTPUT: not interior, so it may have any number of readers.
+    let (gain, out) = 'gain: {
+        let gain_mul = match sole_reader(scaled) {
+            Some(g) if g.op_type == OpKind::ArithMulf => g,
+            _ => break 'gain (GainLeg::Identity, scaled),
         };
-        gamma = src;
-    }
-    // ⭐ THE GAIN LEG'S OWN `(1 + w)` ADDF — the OnePlusScale convention (`rmsnorm.py`'s
-    // `rmsnorm_oneplus_fwd`), consumed by the chain the same way the rank plumbing is. The
-    // back-walk above stops AT the addf (it is not rank plumbing), and without this arm the addf
-    // would reach the walk as an `Elementwise(Add)` with a splat operand — a form the walk's own
-    // operand resolution refuses, so a oneplus program could not lower at all. ONE addf over the
-    // loaded row with a splatted constant: the constant must be the convention's own 1.0
-    // (`GainConvention::from_offset` admits 0.0 and 1.0 only, and 0.0 is stated as NO addf), and
-    // anything else is a producer bug refused by name — the same law the per-`Program` door's
-    // `program_gain_offset` arm states. An addf of another shape (no splat, two tensors) is not
-    // this convention and is left for the operand resolution to name, exactly as before this arm
-    // existed.
-    let mut ones = None;
-    if let Some(d) = def_of(gamma)
-        && d.op_type == OpKind::ArithAddf
-    {
-        let mut splat = None;
-        let mut row = None;
-        for &s in d.operands.iter() {
-            match splat_value(s) {
-                Some(v) => splat = Some(v),
-                None => row = Some(s),
+        let Some(gain_src) = gain_mul.operands.iter().copied().find(|&s| s != scaled) else {
+            // `x̂ · x̂` — the other operand is an activation, not a gain.
+            break 'gain (GainLeg::Identity, scaled);
+        };
+        // The leg's own consumed values, committed only if the row broadcast is proven — an
+        // unclaimed leg leaves every one of these ops to the walk.
+        let mut leg = vec![scaled];
+        // Walk BACK through the gain's rank plumbing to the value a `Region` can be found for.
+        let mut gamma = gain_src;
+        for _ in 0..3 {
+            let Some(d) = def_of(gamma) else { break };
+            if !matches!(
+                d.op_type,
+                OpKind::TensorExpandShape | OpKind::TensorCollapseShape | OpKind::LinalgBroadcast
+            ) {
+                break;
             }
+            leg.push(gamma);
+            let Some(src) = d.operands.first().copied() else {
+                break;
+            };
+            gamma = src;
         }
-        if let (Some(v), Some(r)) = (splat, row) {
-            if v != 1.0 {
-                return err(format!(
-                    "{}: the rmsnorm's gain leg adds {v}, not 1.0 — `GainConvention::from_offset` \
-                     admits 0.0 (Scale, no addf) and 1.0 (OnePlusScale) only, so a program \
-                     stating any other offset is a producer bug",
-                    f.name
-                ));
-            }
-            ones = Some(1.0);
-            consumed.push(gamma);
-            gamma = r;
-            // The row's own rank plumbing, if it states any — the same three-op walk as the
-            // gain's, run on the addf's other side.
-            for _ in 0..3 {
-                let Some(dd) = def_of(gamma) else { break };
-                if !matches!(
-                    dd.op_type,
-                    OpKind::TensorExpandShape
-                        | OpKind::TensorCollapseShape
-                        | OpKind::LinalgBroadcast
-                ) {
-                    break;
+        // ⭐ THE GAIN LEG'S OWN `(1 + w)` ADDF — the OnePlusScale convention (`rmsnorm.py`'s
+        // `rmsnorm_oneplus_fwd`), consumed by the chain the same way the rank plumbing is. The
+        // back-walk above stops AT the addf (it is not rank plumbing), and without this arm the
+        // addf would reach the walk as an `Elementwise(Add)` with a splat operand — a form the
+        // walk's own operand resolution refuses, so a oneplus program could not lower at all.
+        // ONE addf over the loaded row with a splatted constant: the constant must be the
+        // convention's own 1.0 (`GainConvention::from_offset` admits 0.0 and 1.0 only, and
+        // 0.0 is stated as NO addf), and anything else is a producer bug refused by name —
+        // the same law the per-`Program` door's `program_gain_offset` arm states. An addf of
+        // another shape (no splat, two tensors) is not this convention and is left for the
+        // operand resolution to name, exactly as before this arm existed.
+        let mut ones = None;
+        if let Some(d) = def_of(gamma)
+            && d.op_type == OpKind::ArithAddf
+        {
+            let mut splat = None;
+            let mut row = None;
+            for &s in d.operands.iter() {
+                match splat_value(s) {
+                    Some(v) => splat = Some(v),
+                    None => row = Some(s),
                 }
-                consumed.push(gamma);
-                let Some(src) = dd.operands.first().copied() else {
-                    break;
-                };
-                gamma = src;
+            }
+            if let (Some(v), Some(r)) = (splat, row) {
+                if v != 1.0 {
+                    return err(format!(
+                        "{}: the rmsnorm's gain leg adds {v}, not 1.0 — `GainConvention::from_offset` \
+                         admits 0.0 (Scale, no addf) and 1.0 (OnePlusScale) only, so a program \
+                         stating any other offset is a producer bug",
+                        f.name
+                    ));
+                }
+                ones = Some(1.0);
+                leg.push(gamma);
+                gamma = r;
+                // The row's own rank plumbing, if it states any — the same three-op walk as the
+                // gain's, run on the addf's other side.
+                for _ in 0..3 {
+                    let Some(dd) = def_of(gamma) else { break };
+                    if !matches!(
+                        dd.op_type,
+                        OpKind::TensorExpandShape
+                            | OpKind::TensorCollapseShape
+                            | OpKind::LinalgBroadcast
+                    ) {
+                        break;
+                    }
+                    leg.push(gamma);
+                    let Some(src) = dd.operands.first().copied() else {
+                        break;
+                    };
+                    gamma = src;
+                }
             }
         }
-    }
-    let Some(out) = gain_mul.result else {
-        return err(format!(
-            "{}: the rmsnorm's gain multiply has no result",
-            f.name
-        ));
+        // ⛔ THE ROW-BROADCAST CLAIM — the one shape predicate of the gain leg, shared with the
+        // walk's own broadcast resolution: some value on the leg IS an `Mb` broadcast result (a
+        // `[1, ·]` row sprayed down the rows), classified by [`program_broadcast_chains`] and not
+        // re-derived here. A leg with none — a splatted scalar, an activation, a dense
+        // `[rows, cols]` tensor — is not a gain, and the chain closes gainless above.
+        let (bcasts, _) = program_broadcast_chains(f)?;
+        if !leg
+            .iter()
+            .any(|v| bcasts.get(v).is_some_and(|b| b.axis == BcastAxis::Mb))
+        {
+            break 'gain (GainLeg::Identity, scaled);
+        }
+        let Some(out) = gain_mul.result else {
+            return err(format!(
+                "{}: the rmsnorm's gain multiply has no result",
+                f.name
+            ));
+        };
+        consumed.extend(leg);
+        (GainLeg::Row { gamma, ones }, out)
     };
 
     // ⛔ THE DIVISOR IS `1/cols` FOR THIS TILE, CHECKED NUMERICALLY. `mean` is `sum/N`; a multiplier
@@ -685,10 +717,9 @@ fn rmsnorm_chain_from(
 
     Ok(Some(RmsNormChain {
         x,
-        gamma,
+        gain,
         out,
         eps: eps as f32,
-        ones,
         consumed,
     }))
 }
@@ -1301,6 +1332,10 @@ enum Lowering {
     /// for the Scale convention. See [`program_rmsnorm_chains`] for why fusing it is the fix and
     /// filling the scale registry was not.
     RmsNorm(f32, Option<f32>),
+    /// A fused `x · rsqrt(mean(x²)+eps)` — the chain whose gain leg closed as the identity. The
+    /// same device body the per-`Program` door's `rmsnorm_unit` emits, reached by the walk the
+    /// same way the gained form is.
+    RmsNormUnit(f32),
     /// A dtype-CONVERT cast — `arith.extf` f16→f32 (`dl16tofp32`) or `arith.fptosi` f32→i32
     /// (`fp32toint32`) — the vendor's own convert `OpFunc`s, 1:1 in (op kind, element pair).
     /// Local rather than a `Program` variant for the same reason `Reduce` is: a bare convert is
@@ -3592,7 +3627,10 @@ pub fn staggered_sources(
                     Lowering::Node(Program::Elementwise(Elementwise::Silu))
                 }
             })
-            .or(rms.map(|c| Lowering::RmsNorm(c.eps, c.ones)))
+            .or(rms.map(|c| match c.gain {
+                GainLeg::Row { ones, .. } => Lowering::RmsNorm(c.eps, ones),
+                GainLeg::Identity => Lowering::RmsNormUnit(c.eps),
+            }))
             .or(reduce.map(Lowering::Reduce))
             .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
             .or(bound_scale.map(Lowering::BoundScalarMul))
@@ -3609,6 +3647,7 @@ pub fn staggered_sources(
             Lowering::Reduce(_) => 1,
             Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_) => 1,
             Lowering::RmsNorm(..) => 2,
+            Lowering::RmsNormUnit(_) => 1,
             Lowering::Convert(_) => 1,
             Lowering::Node(Program::Matmul) => 2,
             Lowering::Node(Program::Elementwise(e)) => {
@@ -3628,7 +3667,13 @@ pub fn staggered_sources(
         let raw_in: Vec<Ssa> = match (terminal, scalar, bound_scale) {
             _ if rms.is_some() => {
                 let c = rms.expect("just matched");
-                vec![c.x, c.gamma]
+                match c.gain {
+                    // The two tensors the recogniser proved, walked back through the rank
+                    // plumbing to values a `Region` exists for.
+                    GainLeg::Row { gamma, .. } => vec![c.x, gamma],
+                    // The identity gain is the constant 1 — not a parameter.
+                    GainLeg::Identity => vec![c.x],
+                }
             }
             _ if equal.is_some() => {
                 let (a, b) = equal.expect("just matched");
@@ -3695,6 +3740,7 @@ pub fn staggered_sources(
             | Lowering::ScalarMul(_)
             | Lowering::BoundScalarMul(_)
             | Lowering::RmsNorm(..)
+            | Lowering::RmsNormUnit(_)
             | Lowering::Node(Program::Elementwise(_)) => {
                 let mut out = ElementArrangement::Standard;
                 for v in &raw_in {
@@ -5823,7 +5869,10 @@ fn lower_function_folded(
                     Lowering::Node(Program::Elementwise(Elementwise::Silu))
                 }
             })
-            .or(rms.map(|c| Lowering::RmsNorm(c.eps, c.ones)))
+            .or(rms.map(|c| match c.gain {
+                GainLeg::Row { ones, .. } => Lowering::RmsNorm(c.eps, ones),
+                GainLeg::Identity => Lowering::RmsNormUnit(c.eps),
+            }))
             .or(reduce.map(Lowering::Reduce))
             .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
             .or(bound_scale.map(Lowering::BoundScalarMul))
@@ -5875,6 +5924,8 @@ fn lower_function_folded(
             Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_) => 1,
             // x and gamma; the epsilon, `1/cols` and the oneplus offset are the fused body's own.
             Lowering::RmsNorm(..) => 2,
+            // x alone; the identity gain is the constant 1, not a parameter.
+            Lowering::RmsNormUnit(_) => 1,
             // A dtype-convert reads ONE tensor; the formats ride the `OpFunc`
             // (`convert_dtypes`), never the operand list.
             Lowering::Convert(_) => 1,
@@ -5903,7 +5954,13 @@ fn lower_function_folded(
             // values a `Region` exists for.
             _ if rms.is_some() => {
                 let c = rms.expect("just matched");
-                vec![c.x, c.gamma]
+                match c.gain {
+                    // The two tensors the recogniser proved, walked back through the rank
+                    // plumbing to values a `Region` exists for.
+                    GainLeg::Row { gamma, .. } => vec![c.x, gamma],
+                    // The identity gain is the constant 1 — not a parameter.
+                    GainLeg::Identity => vec![c.x],
+                }
             }
             // THE EQUALITY MASK's inputs are the comparison's own two operands, not the retype's
             // (the retype reads the i1 the fold destroys). The broadcast resolution below then
@@ -7968,6 +8025,19 @@ fn emit_one(
                 layout,
             );
         }
+        // THE FUSED GAINLESS RMSNORM — the chain whose gain leg closed as the identity. `per_op`
+        // is `[x, out]`, `rmsnorm_unit_at`'s own `split_out(.., 1)` order; the body is the SAME
+        // `assemble_rmsnorm_unit` the per-`Program` door emits, so the two doors cannot state
+        // different formulas for one norm.
+        Lowering::RmsNormUnit(eps) => {
+            return super::lower_ktir_to_superdsc::rmsnorm_unit_at(
+                name,
+                eps,
+                per_op,
+                sym_id_base,
+                layout,
+            );
+        }
         // A DTYPE-CONVERT — one input, one output, both the RowBlocked token stream, the formats
         // riding the `OpFunc` through `convert_dtypes`. The same `assemble_convert` body the fp8
         // quantiser's tail and the KSPLIT pair's own device recipe use, so the doors cannot
@@ -9701,6 +9771,330 @@ mod block_landing_law_tests {
             block_landing_cols(64, stick),
             None,
             "a block one stick wide is the flat frame's own bytes, at any batch count"
+        );
+    }
+}
+
+/// ⭐ THE GAIN LEG'S OWN LAW — a norm's gain is a `GainLeg`, and identity is one of its values.
+///
+/// The chain reader used to refuse a normalisation with no gain multiply ("a normalisation with
+/// none is not the shape this door lowers"), which turned every gainless norm — the
+/// `rmsnormunit_s8` the gemma-4 head-norm sandwich spells — into a build error. The law is now
+/// ONE fact with three spellings: the gain leg is claimed as a learned row ONLY for a
+/// ROW-BROADCAST operand (`BcastAxis::Mb`), `1+gamma` included; ANY other reader of the
+/// normalised value closes the leg as the identity and the chain still fuses. This suite pins
+/// each value of that law: the two gained spellings, the gainless one, the three near-misses
+/// that must close gainless rather than claim the leg (an activation, a scalar, a dense
+/// `[rows, cols]` tensor), and the neighbour fold (`ScalarMul`) the gainless close must not
+/// steal from.
+#[cfg(test)]
+mod rmsnorm_gain_leg_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::ir::Operation;
+    use ktir_core::irtype::IrType;
+
+    /// What the gain multiply's OTHER operand is, when there is one.
+    #[derive(Clone, Copy, Debug)]
+    enum Gain {
+        /// `n1[None, :]` — a `[1, cols]` row sprayed down the rows: the learned gain.
+        Row,
+        /// `1 + n1[None, :]` — the OnePlusScale convention's own addf over the row.
+        OnePlusRow,
+        /// No gain multiply at all: the normalised value is stored direct.
+        None,
+        /// `x̂ · <another activation>` — a computed tile, not a gain.
+        Activation,
+        /// `x̂ · <splatted constant>` — a scalar, not a gain.
+        Scalar,
+        /// `x̂ · <a dense [rows, cols] argument>` — a full tile, not a gain.
+        Dense,
+    }
+
+    /// The chain the reader walks, at `[64, 128]` (cols a power of two, so `1/cols` is exact):
+    /// `sq = x·x`, `red = sum(sq)`, `ms = red · (1/128)`, `add = ms + eps`, `root = rsqrt(add)`,
+    /// `scaled = x · root`, then the gain leg `gain` selects. `%0` is `x`; the other SSA numbers
+    /// are assigned in emission order.
+    fn norm(gain: Gain) -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let x = Ssa(0);
+        let (c_eps, sp_eps, c_inv, sp_inv) = (Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let (sq, red, ms, add, root, scaled) = (Ssa(5), Ssa(6), Ssa(7), Ssa(8), Ssa(9), Ssa(10));
+        let mut ops = vec![
+            Operation::new(a, Some(c_eps), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1e-6),
+            ),
+            Operation::new(a, Some(sp_eps), OpKind::TensorSplat, &[c_eps]),
+            Operation::new(a, Some(c_inv), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1.0 / 128.0),
+            ),
+            Operation::new(a, Some(sp_inv), OpKind::TensorSplat, &[c_inv]),
+            Operation {
+                result_type: Some(IrType::Tensor {
+                    dims: &[64, 128],
+                    elem: DType::F16,
+                }),
+                ..Operation::new(a, Some(sq), OpKind::ArithMulf, &[x, x])
+            },
+            Operation::new(a, Some(red), OpKind::LinalgReduce, &[sq]).with_attr(
+                a,
+                AttrKey::ReduceFn,
+                Attr::Op(OpKind::ArithAddf),
+            ),
+            Operation::new(a, Some(ms), OpKind::ArithMulf, &[red, sp_inv]),
+            Operation::new(a, Some(add), OpKind::ArithAddf, &[ms, sp_eps]),
+            Operation::new(a, Some(root), OpKind::MathRsqrt, &[add]),
+            Operation::new(a, Some(scaled), OpKind::ArithMulf, &[x, root]),
+        ];
+        // The gain leg, and what finally reads the chain's output.
+        let mut extra_args = vec![];
+        match gain {
+            Gain::None => {
+                // The normalised value is stored direct — the gainless spelling.
+                ops.push(Operation::new(a, None, OpKind::KtdpStore, &[scaled]));
+            }
+            Gain::Activation => {
+                // `x̂ · (x·x)` — the other operand is computed, never broadcast: not a gain.
+                let act = Ssa(11);
+                ops.push(Operation::new(a, Some(act), OpKind::ArithMulf, &[x, x]));
+                ops.push(Operation::new(
+                    a,
+                    Some(Ssa(12)),
+                    OpKind::ArithMulf,
+                    &[scaled, act],
+                ));
+                ops.push(Operation::new(a, None, OpKind::KtdpStore, &[Ssa(12)]));
+            }
+            Gain::Scalar => {
+                // `x̂ · 2.0` — a splatted constant, the ScalarMul neighbour's own shape.
+                let (c, sp) = (Ssa(11), Ssa(12));
+                ops.push(
+                    Operation::new(a, Some(c), OpKind::ArithConstant, &[]).with_attr(
+                        a,
+                        AttrKey::Value,
+                        Attr::Float(2.0),
+                    ),
+                );
+                ops.push(Operation::new(a, Some(sp), OpKind::TensorSplat, &[c]));
+                ops.push(Operation::new(
+                    a,
+                    Some(Ssa(13)),
+                    OpKind::ArithMulf,
+                    &[scaled, sp],
+                ));
+                ops.push(Operation::new(a, None, OpKind::KtdpStore, &[Ssa(13)]));
+            }
+            Gain::Dense => {
+                // `x̂ · %d` — a dense [rows, cols] argument, read lane for lane: not a gain.
+                let d = Ssa(11);
+                extra_args.push((d, IrType::Index));
+                ops.push(Operation::new(
+                    a,
+                    Some(Ssa(12)),
+                    OpKind::ArithMulf,
+                    &[scaled, d],
+                ));
+                ops.push(Operation::new(a, None, OpKind::KtdpStore, &[Ssa(12)]));
+            }
+            Gain::Row | Gain::OnePlusRow => {
+                // `n1[None, :]` spelled the way the producer does: (the OnePlusScale addf over
+                // the loaded row, when the convention states one,) then expand to `[1, 128]`,
+                // collapse, and broadcast `Dimensions=[0]` down the rows.
+                extra_args.push((Ssa(15), IrType::Index));
+                let mut row = Ssa(15);
+                if let Gain::OnePlusRow = gain {
+                    // `w = load + 1.0` — the OnePlusScale addf over the row, BEFORE the spray.
+                    let (c1, sp1, w) = (Ssa(16), Ssa(17), Ssa(18));
+                    ops.push(
+                        Operation::new(a, Some(c1), OpKind::ArithConstant, &[]).with_attr(
+                            a,
+                            AttrKey::Value,
+                            Attr::Float(1.0),
+                        ),
+                    );
+                    ops.push(Operation::new(a, Some(sp1), OpKind::TensorSplat, &[c1]));
+                    ops.push(Operation::new(a, Some(w), OpKind::ArithAddf, &[row, sp1]));
+                    row = w;
+                }
+                let (exp, col, emp, bc) = (Ssa(11), Ssa(12), Ssa(13), Ssa(14));
+                ops.push(
+                    Operation::new(a, Some(exp), OpKind::TensorExpandShape, &[row]).with_attr(
+                        a,
+                        AttrKey::TargetShape,
+                        Attr::IntList(&[1, 128]),
+                    ),
+                );
+                ops.push(
+                    Operation::new(a, Some(col), OpKind::TensorCollapseShape, &[exp]).with_attr(
+                        a,
+                        AttrKey::TargetShape,
+                        Attr::IntList(&[128]),
+                    ),
+                );
+                ops.push(Operation::new(a, Some(emp), OpKind::TensorEmpty, &[]));
+                ops.push(
+                    Operation::new(a, Some(bc), OpKind::LinalgBroadcast, &[col, emp])
+                        .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[0]))
+                        .with_attr(a, AttrKey::Shape, Attr::IntList(&[64, 128])),
+                );
+                ops.push(Operation::new(
+                    a,
+                    Some(Ssa(19)),
+                    OpKind::ArithMulf,
+                    &[scaled, bc],
+                ));
+                ops.push(Operation::new(a, None, OpKind::KtdpStore, &[Ssa(19)]));
+            }
+        }
+        let mut args = vec![(x, IrType::Index)];
+        args.extend(extra_args);
+        IRFunction {
+            name: "rmsnorm_gain_probe",
+            arguments: a.args(args),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    fn chains(gain: Gain) -> Vec<RmsNormChain> {
+        program_rmsnorm_chains(&norm(gain)).unwrap_or_else(|e| {
+            panic!(
+                "the {gain:?} chain must recognise, not refuse: {}",
+                e.message
+            )
+        })
+    }
+
+    /// THE CONTROL (gained, Scale): `x̂ · gamma` with `gamma` a row broadcast claims the leg.
+    #[test]
+    fn a_row_broadcast_gain_is_claimed() {
+        let cs = chains(Gain::Row);
+        assert_eq!(cs.len(), 1, "one rsqrt heads one chain");
+        let c = &cs[0];
+        assert!(
+            matches!(c.gain, GainLeg::Row { ones: None, .. }),
+            "the row broadcast claims the leg, Scale convention"
+        );
+        assert_eq!(c.out, Ssa(19), "the gain multiply's result is the output");
+        assert!(
+            c.consumed.contains(&Ssa(10)),
+            "the normalised value is interior when a gain is claimed"
+        );
+    }
+
+    /// THE CONTROL (gained, OnePlusScale): `x̂ · (1 + gamma)` claims the leg with the offset.
+    #[test]
+    fn a_oneplus_row_gain_is_claimed_with_the_offset() {
+        let cs = chains(Gain::OnePlusRow);
+        assert_eq!(cs.len(), 1, "one rsqrt heads one chain");
+        let c = &cs[0];
+        assert!(
+            matches!(
+                c.gain,
+                GainLeg::Row {
+                    ones: Some(1.0),
+                    ..
+                }
+            ),
+            "the oneplus row claims the leg with offset 1.0"
+        );
+        assert_eq!(c.out, Ssa(19), "the gain multiply's result is the output");
+    }
+
+    /// THE MATCH (gainless): no gain multiply, the normalised value stored direct — the chain
+    /// closes as the identity and STILL fuses.
+    #[test]
+    fn a_norm_with_no_gain_closes_as_the_identity() {
+        let cs = chains(Gain::None);
+        assert_eq!(cs.len(), 1, "one rsqrt heads one chain");
+        let c = &cs[0];
+        assert!(
+            matches!(c.gain, GainLeg::Identity),
+            "the gainless spelling closes as the identity, not a refusal"
+        );
+        assert_eq!(
+            c.out,
+            Ssa(10),
+            "the normalising multiply is the terminal; its result is the output"
+        );
+        assert!(
+            !c.consumed.contains(&Ssa(10)),
+            "the output is not interior — the fused program produces it"
+        );
+    }
+
+    /// NEAR-MISS (activation): `x̂ · <a computed tile>` is not a gain — the leg closes as the
+    /// identity and the multiply is left to the walk.
+    #[test]
+    fn a_gain_multiply_by_an_activation_closes_gainless() {
+        let cs = chains(Gain::Activation);
+        assert_eq!(cs.len(), 1);
+        assert!(
+            matches!(cs[0].gain, GainLeg::Identity),
+            "an activation operand is not a gain"
+        );
+        assert_eq!(
+            cs[0].out,
+            Ssa(10),
+            "the chain's terminal is the normalising multiply"
+        );
+    }
+
+    /// NEAR-MISS (scalar): `x̂ · 2.0` is the ScalarMul neighbour's own shape — the leg closes as
+    /// the identity and the scalar multiply is left to the walk to lower as a `ScalarMul`, never
+    /// stolen as a gain.
+    #[test]
+    fn a_gain_multiply_by_a_scalar_closes_gainless() {
+        let cs = chains(Gain::Scalar);
+        assert_eq!(cs.len(), 1);
+        assert!(
+            matches!(cs[0].gain, GainLeg::Identity),
+            "a splatted scalar is not a gain — the ScalarMul neighbour keeps its op"
+        );
+    }
+
+    /// NEAR-MISS (dense): `x̂ · <a [rows, cols] argument>` reads lane for lane — not a gain.
+    #[test]
+    fn a_gain_multiply_by_a_dense_tile_closes_gainless() {
+        let cs = chains(Gain::Dense);
+        assert_eq!(cs.len(), 1);
+        assert!(
+            matches!(cs[0].gain, GainLeg::Identity),
+            "a dense operand is not a gain"
+        );
+    }
+
+    /// THE NEIGHBOUR FOLD: a plain `tile · splat` with no norm around it recognises NO chain —
+    /// the gainless close must not turn every scalar multiply into a fused rmsnorm.
+    #[test]
+    fn a_scalar_mul_with_no_norm_is_not_a_chain() {
+        let a: &'static Arena = Arena::global();
+        let (x, c, sp, m) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let ops = vec![
+            Operation::new(a, Some(c), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(2.0),
+            ),
+            Operation::new(a, Some(sp), OpKind::TensorSplat, &[c]),
+            Operation::new(a, Some(m), OpKind::ArithMulf, &[x, sp]),
+        ];
+        let f = IRFunction {
+            name: "scalarmul_probe",
+            arguments: a.args(vec![(x, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let cs = program_rmsnorm_chains(&f).expect("no rsqrt, no refusal");
+        assert!(
+            cs.is_empty(),
+            "a scalar multiply with no norm is not a chain"
         );
     }
 }

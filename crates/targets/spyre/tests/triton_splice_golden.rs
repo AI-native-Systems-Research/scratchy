@@ -3075,9 +3075,11 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
         }
     }
 
-    // The un-gained spelling: the door reads it through the per-op epsilon
-    // reader (one root, the addf carrying the eps splat), the emulator through
-    // the same scalar-chain walk — and the eps both see is the f16 image.
+    // The un-gained spelling: the door recognizes it as the SAME chain with the gain leg
+    // closed as the identity — one chain, `GainLeg::Identity`, its terminal the normalising
+    // multiply — and reads it through the per-op epsilon reader (one root, the addf carrying
+    // the eps splat), the emulator through the same scalar-chain walk — and the eps both see
+    // is the f16 image.
     for &(m, c) in SHAPES {
         let ir = rmsnormunit_ir(m, c);
         let node = &ir.nodes[0];
@@ -3088,6 +3090,16 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
             .as_ref()
             .expect("spliced op carries its program");
 
+        let chains = program_rmsnorm_chains(&f.func)
+            .unwrap_or_else(|e| panic!("door recognized the unit row m={m} c={c}: {}", e.message));
+        assert_eq!(chains.len(), 1, "one chain per unit program (m={m} c={c})");
+        assert!(
+            matches!(
+                chains[0].gain,
+                ktir_superdsc::emit::whole_function::GainLeg::Identity
+            ),
+            "the unit program's gain leg closes as the identity (m={m} c={c})"
+        );
         let eps = program_rmsnorm_eps(&f.func)
             .unwrap_or_else(|| panic!("door read the unit program's eps (m={m} c={c})"));
         assert_eq!(
@@ -3100,6 +3112,12 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
             sticks.len(),
             3,
             "the unit chain's three sticks (m={m} c={c})"
+        );
+        let consumed: HashSet<_> = chains[0].consumed.iter().copied().collect();
+        assert_eq!(
+            sticks.intersection(&consumed).count(),
+            3,
+            "the unit chain's sticks are its own interior (m={m} c={c})"
         );
     }
 
