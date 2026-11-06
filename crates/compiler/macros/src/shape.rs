@@ -94,7 +94,7 @@ pub(crate) fn eval_closed_dim(
         Dim::Add(terms) => terms
             .iter()
             .try_fold(0u64, |acc, t| eval_closed_dim(t, bounds).map(|v| acc + v)),
-        Dim::Div(num, den) => {
+        Dim::Div(num, den) | Dim::FloorDiv(num, den) => {
             let n = eval_closed_dim(num, bounds)?;
             let d = eval_closed_dim(den, bounds)?;
             // Caller's responsibility to keep the dividend exactly

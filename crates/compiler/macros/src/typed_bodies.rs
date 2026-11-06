@@ -166,6 +166,7 @@ fn dim(d: &dim::Dim) -> String {
         dim::Dim::Mul(v) => format!("*({})", list(v)),
         dim::Dim::Add(v) => format!("+({})", list(v)),
         dim::Dim::Div(a, b) => format!("/({},{})", dim(a), dim(b)),
+        dim::Dim::FloorDiv(a, b) => format!("//({},{})", dim(a), dim(b)),
     }
 }
 
@@ -250,6 +251,12 @@ fn parse_dim(s: &str) -> (Dim, &str) {
     } else if let Some(rest) = s.strip_prefix("+(") {
         let (v, rest) = list(rest);
         (Dim::Add(v), rest)
+    } else if let Some(rest) = s.strip_prefix("//(") {
+        let (mut v, rest) = list(rest);
+        assert_eq!(v.len(), 2, "a quotient has two dims");
+        let den = v.pop().expect("denominator");
+        let num = v.pop().expect("numerator");
+        (Dim::FloorDiv(Box::new(num), Box::new(den)), rest)
     } else if let Some(rest) = s.strip_prefix("/(") {
         let (mut v, rest) = list(rest);
         assert_eq!(v.len(), 2, "a quotient has two dims");

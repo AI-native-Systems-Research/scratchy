@@ -27,7 +27,7 @@ pub fn eval_dim_with(dim: &Dim, bounds: &BTreeMap<String, u64>) -> Option<u64> {
             .iter()
             .map(|t| eval_dim_with(t, bounds))
             .try_fold(0u64, |acc, v| v.map(|x| acc.saturating_add(x))),
-        Dim::Div(num, den) => {
+        Dim::Div(num, den) | Dim::FloorDiv(num, den) => {
             let n = eval_dim_with(num, bounds)?;
             let d = eval_dim_with(den, bounds)?;
             n.checked_div(d)

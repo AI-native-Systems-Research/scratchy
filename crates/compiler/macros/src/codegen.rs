@@ -4723,26 +4723,55 @@ impl ModelDims {
         self.handles.get(base)
     }
 
-    /// `__dims`: one marker per bound the handles name, carrying `model`'s number for it.
+    /// `__dims`: one marker per bound the handles name, carrying `model`'s number for it. A bound
+    /// the loader derived (`ModelParams::derived`) is spelled as its derivation over the bounds it
+    /// reads, each a marker too, so the derivation's law is the type's: `head_dim` derived as
+    /// `hidden_size / num_attention_heads` is that exact quotient, which rustc refuses where the
+    /// heads do not divide the width. A derivation the bound's value is no longer (a later step
+    /// restated it) is not the bound's, and its number is stated instead.
     pub(crate) fn module(&self, model: &ModelParams) -> Result<TokenStream, String> {
-        let markers = (self.bounds.iter())
-            .map(|b| {
-                let n = model.bounds.get(b).ok_or_else(|| {
-                    format!("a weight's shape names `{b}`, which the model's config does not state")
-                })?;
-                let n = u32::try_from(*n).map_err(|_| format!("`{b}` = {n} exceeds u32"))?;
-                let marker = format_ident!(
-                    "{}",
-                    scratchy_forward_compiler_frontend::typed_emit::marker(b)
-                );
-                Ok(quote! {
+        let mut named = self.bounds.clone();
+        let mut todo: Vec<String> = named.iter().cloned().collect();
+        let mut markers = std::collections::BTreeMap::new();
+        let mut spelled = false;
+        while let Some(b) = todo.pop() {
+            let n = *model.bounds.get(&b).ok_or_else(|| {
+                format!("a weight's shape names `{b}`, which the model's config does not state")
+            })?;
+            u32::try_from(n).map_err(|_| format!("`{b}` = {n} exceeds u32"))?;
+            let derived = (model.derived.get(&b))
+                .filter(|d| crate::shape::eval_closed_dim(d, &model.bounds) == Some(n));
+            let num = match derived {
+                Some(dim) => {
+                    let mut reads = std::collections::BTreeSet::new();
+                    let t = dim_tokens(dim, &mut reads)?;
+                    todo.extend(reads.into_iter().filter(|r| named.insert(r.clone())));
+                    spelled = true;
+                    quote!(<#t as ::scratchy_tensors::typed::Dim>::Num)
+                }
+                None => unsigned_tokens(n),
+            };
+            let marker = format_ident!(
+                "{}",
+                scratchy_forward_compiler_frontend::typed_emit::marker(&b)
+            );
+            markers.insert(
+                b,
+                quote! {
                     pub enum #marker {}
                     impl ::scratchy_tensors::typed::Dim for #marker {
-                        const N: u32 = #n;
+                        type Num = #num;
                     }
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+                },
+            );
+        }
+        let markers = markers.into_values();
+        // A derivation names its reads as `__dims::<marker>`, as a handle does.
+        let reads = spelled.then(|| {
+            quote!(
+                use super::__dims;
+            )
+        });
         let handles = (self.handles.values())
             .map(|TypedHandle { name, def, .. }| quote!(pub type #name = #def;));
         let handles = (!self.handles.is_empty()).then(|| {
@@ -4757,11 +4786,18 @@ impl ModelDims {
         Ok(quote! {
             /// The model's dims, as types: each bound its weights' shapes name, with its number.
             pub mod __dims {
+                #reads
                 #(#markers)*
             }
             #handles
         })
     }
+}
+
+/// `n` as its type-level number: a literal dim is the number itself
+/// (`scratchy_tensors::typed::unsigned_path`).
+fn unsigned_tokens(n: u64) -> TokenStream {
+    (scratchy_tensors::typed::unsigned_path(n).parse()).expect("a typenum path is Rust tokens")
 }
 
 /// `dim` as a type in the model's `__dims`, each bound it names into `bounds`.
@@ -4781,8 +4817,8 @@ fn dim_tokens(
             Ok(quote!(__dims::#marker))
         }
         Dim::Lit(n) => {
-            let n = u32::try_from(*n).map_err(|_| format!("literal dim {n} exceeds u32"))?;
-            Ok(quote!(#w::Lit<#n>))
+            u32::try_from(*n).map_err(|_| format!("literal dim {n} exceeds u32"))?;
+            Ok(unsigned_tokens(*n))
         }
         Dim::Mul(parts) | Dim::Add(parts) => {
             let op = match dim {
@@ -4800,6 +4836,10 @@ fn dim_tokens(
         Dim::Div(n, d) => {
             let (n, d) = (dim_tokens(n, bounds)?, dim_tokens(d, bounds)?);
             Ok(quote!(#w::Div<#n, #d>))
+        }
+        Dim::FloorDiv(n, d) => {
+            let (n, d) = (dim_tokens(n, bounds)?, dim_tokens(d, bounds)?);
+            Ok(quote!(#w::FloorDiv<#n, #d>))
         }
     }
 }
@@ -8081,7 +8121,8 @@ fn kv_codec_for(
 }
 
 /// A canonical's facts as the expression its generated `CanonicalParams::FACTS` states: every
-/// group through its own constructor, so the emitted const re-checks each law when rustc evaluates
+/// group through its own constructor (a head geometry through `HeadGeometry::of`, its laws bounds on
+/// its numbers as types), so the emitted const re-checks each law when rustc evaluates
 /// it. The one serializer of the value the fill built (and the metal bake read).
 fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     use scratchy_ir::model_facts::{
@@ -8101,21 +8142,16 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
         None => quote! { ::core::option::Option::None },
     };
     let geometry = |g: scratchy_ir::model_facts::HeadGeometry| {
+        let n = |v: u32| unsigned_tokens(u64::from(v));
         let (q, kv, hd, rot, page) = (
-            u32_(g.q_heads().get()),
-            u32_(g.kv_heads().get()),
-            u32_(g.head_dim().get()),
-            u32_(g.rot_dim().get()),
+            n(g.q_heads().get()),
+            n(g.kv_heads().get()),
+            n(g.head_dim().get()),
+            n(g.rot_dim().get()),
             u32_(g.page().get()),
         );
         quote! {
-            #m::HeadGeometry::new(
-                #m::QueryHeads::new(#q),
-                #m::KvHeads::new(#kv),
-                #m::HeadDim::new(#hd),
-                #m::RotDim::new(#rot),
-                #m::BlockSize::new(#page),
-            )
+            #m::HeadGeometry::of::<#q, #kv, #hd, #rot>(#m::BlockSize::new(#page))
         }
     };
     let attention = opt(f.attention().map(|a: Attention| {
@@ -17308,6 +17344,7 @@ mod tests {
             mrope_section: None,
             arch: Default::default(),
             expert_activation: crate::config::ExpertActivation::Silu,
+            derived: BTreeMap::new(),
         }
     }
 

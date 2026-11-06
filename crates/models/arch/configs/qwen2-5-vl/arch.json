@@ -29,7 +29,7 @@
     { "name": "vision_merge_hidden", "expr": "vision_embed_dim * vision_merge_factor" },
     { "name": "vision_rope_half_dim", "expr": "vision_head_dim / 2" },
     { "name": "vision_intermediate_size", "from": "vision_config.intermediate_size" },
-    { "name": "vision_intermediate_size_padded", "expr": "(vision_intermediate_size + 7) / 8 * 8" },
+    { "name": "vision_intermediate_size_padded", "expr": "(vision_intermediate_size + 7) // 8 * 8" },
     { "name": "vision_window_size", "from": "vision_config.window_size" },
     { "name": "d_model", "from": "vision_config.out_hidden_size" }
   ]
