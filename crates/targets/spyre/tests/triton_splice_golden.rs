@@ -3259,3 +3259,44 @@ fn the_fp8_epilogue_holds_three_live_mn_tiles_at_its_peak() {
         );
     }
 }
+
+/// ⭐⭐ THE TALL WIDE-HIDDEN RUNG — a prefill-width rmsnorm at hidden 16384 whose
+/// mean(x²) bills past the per-core LX budget (2048 rows × 32 KiB/row, spread over the
+/// cores, is past 1,677,721 B per core), so the chain's own reduce goes through the
+/// LONG-REDUCE SPLIT inside `assemble_rmsnorm`: `time` single-shot slice reduces plus
+/// `time − 1` running combines, in place on the chain's own mean. The door lowers the
+/// whole program — nothing refuses — and the split's slice marker (`_p1_op`, an op name
+/// only the split body mints) is present in the emission. The SHAPES sweep above is the
+/// byte-identity control: every fitting rung still lowers one-for-one.
+#[test]
+fn the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door() {
+    let (m, c) = (2048u32, 16384u32);
+    let ir = rmsnorm_ir(m, c, GainConvention::Scale);
+    let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
+    let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
+        .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
+    let node = &ir.nodes[0];
+    let spliced = scratchy_triton_splice::lower(node, &ir, false)
+        .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
+    assert_eq!(
+        spliced.op_name,
+        format!("rmsnorm_s{}", node.id.index()),
+        "op_name (m={m} c={c})"
+    );
+    let mut sym = 0i64;
+    let emitted = door_lower(
+        spliced
+            .ktir
+            .as_ref()
+            .expect("spliced op carries its program"),
+        &mut sym,
+        Some(&layout),
+        None,
+    )
+    .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
+    assert!(
+        emitted.iter().any(|e| e.op_name.contains("_p1_op")),
+        "the tall rung's mean(x²) splits: no `_p1_op` slice among {} emitted ops",
+        emitted.len()
+    );
+}
