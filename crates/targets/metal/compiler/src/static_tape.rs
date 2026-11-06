@@ -54,9 +54,28 @@ pub struct CommandPool {
     table: CommandTableBuilder,
     named_kernels: std::collections::HashSet<PipelineKey>,
     kernels: Vec<PipelineKey>,
+    /// Each weight family an MLX-affine matmul of any bucket reads, with every
+    /// `(n, k, bits, group)` the bake minted for it.
+    affine_reads: AffineReads,
 }
 
+/// Each weight family's MLX-affine matmul reads: the `(n, k, bits, group)` the bake minted for
+/// it, each once.
+type AffineReads =
+    std::collections::BTreeMap<u32, std::collections::BTreeSet<(u32, u32, u32, u32)>>;
+
 impl CommandPool {
+    /// Add the MLX-affine matmuls of `steps` to the families' reads.
+    fn read_affine(&mut self, steps: &MetalStepTape) -> Result<(), BakeDefect> {
+        let reads = scratchy_target_metal::tape::lowering::affine_matmul_reads(steps)
+            .map_err(|e| BakeDefect(format!("an affine matmul's weight: {e}")))?;
+        for (ix, g) in reads {
+            let read = (g.n.get(), g.k.get(), g.bits.get(), g.group_size.get());
+            self.affine_reads.entry(ix.0).or_default().insert(read);
+        }
+        Ok(())
+    }
+
     fn intern(&mut self, cmd: GatedCommand) -> Result<TokenStream, BakeDefect> {
         let ix = self.table.intern(cmd).map_err(|e| {
             BakeDefect(format!(
@@ -96,16 +115,17 @@ impl CommandPool {
     pub fn into_tokens(
         self,
         typed: &std::collections::HashSet<SourceIx>,
-    ) -> Result<TokenStream, BakeDefect> {
+    ) -> Result<(TokenStream, TableDoors), BakeDefect> {
         // A model metal lowers no tape for (a dense MoE has no metal realization) names nothing.
         if self.table.is_empty() && self.kernels.is_empty() {
-            return Ok(quote! {
+            let tokens = quote! {
                 #[cfg(feature = "metal")]
                 static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] = &[];
-            });
+            };
+            return Ok((tokens, TableDoors::default()));
         }
         let parts = self.table.finish();
-        let gemms = TypedGemms::of(&parts, typed);
+        let gemms = TypedGemms::of(&parts, typed, &self.affine_reads)?;
         let aliases = crate::const_tokens::alias_preamble();
         let array = |name: &str, values: Vec<TokenStream>, ty: TokenStream| {
             let (id, len) = (
@@ -127,8 +147,9 @@ impl CommandPool {
             .collect();
         // Each command as a call of `gemm` or `command` below: its part indices and a dispatch's
         // kernel's name, where its literal spells every newtype of its fields.
-        let ix =
-            |i: scratchy_target_metal::tape::ids::PartIx| proc_macro2::Literal::u16_unsuffixed(i.0);
+        fn ix<T>(i: scratchy_target_metal::tape::ids::PartIx<T>) -> proc_macro2::Literal {
+            proc_macro2::Literal::u16_unsuffixed(i.raw())
+        }
         let commands = (parts.commands.iter())
             .map(|p| {
                 let gate = ix(p.gate);
@@ -145,8 +166,8 @@ impl CommandPool {
                         bindings,
                     } => {
                         let kernel = quote::format_ident!("{}", format!("{kernel:?}"));
-                        let [symbol, constants, dispatch, bindings] =
-                            [symbol, constants, dispatch, bindings].map(ix);
+                        let (symbol, constants) = (ix(symbol), ix(constants));
+                        let (dispatch, bindings) = (ix(dispatch), ix(bindings));
                         quote!(command(K::#kernel, #symbol, #constants, #dispatch, #bindings, #gate))
                     }
                 }
@@ -164,7 +185,7 @@ impl CommandPool {
             .collect::<Result<Vec<_>, BakeDefect>>()?;
         let gemm_ats = (parts.gemms.iter())
             .map(|at| {
-                let (entry, layer, operands) = (at.entry.0, at.layer.0, at.operands.0);
+                let (entry, layer, operands) = (at.entry.raw(), at.layer.0, at.operands.raw());
                 quote!(gemm_at(#entry, #layer, #operands))
             })
             .collect();
@@ -198,28 +219,33 @@ impl CommandPool {
         ];
         let kernels: Vec<TokenStream> = self.kernels.iter().map(kernel_ref).collect();
         let kernels_len = proc_macro2::Literal::usize_unsuffixed(kernels.len());
-        Ok(quote! {
-            #[cfg(feature = "metal")]
-            mod __tape_cmds {
-                #aliases
-                #markers
+        // Each helper is written only for a table that calls it: a model of affine matmuls alone
+        // has no GEMM, so no `gemm_at` or `gemm`.
+        let gemm_helpers = (!parts.gemms.is_empty()).then(|| {
+            quote! {
                 /// The table's GEMM of entry `entry` at layer `layer` over operands `operands`: a
                 /// GEMM of every layer is one, so each is written as this call, not a literal of
                 /// its three newtypes.
                 const fn gemm_at(entry: u16, layer: u16, operands: u16) -> __tl::GemmAt {
                     __tl::GemmAt {
-                        entry: __ti::PartIx(entry),
+                        entry: __ti::PartIx::at(entry),
                         layer: __tl::PackedLayer(layer),
-                        operands: __ti::PartIx(operands),
+                        operands: __ti::PartIx::at(operands),
                     }
                 }
                 /// The table's GEMM `gemm` of [`GEMMS`] under gate `gate`.
                 const fn gemm(gemm: u16, gate: u16) -> __tl::PackedCommand {
                     __tl::PackedCommand {
-                        kind: __tl::PackedKind::Gemm(__ti::PartIx(gemm)),
-                        gate: __ti::PartIx(gate),
+                        kind: __tl::PackedKind::Gemm(__ti::PartIx::at(gemm)),
+                        gate: __ti::PartIx::at(gate),
                     }
                 }
+            }
+        });
+        let dispatches =
+            (parts.commands.iter()).any(|c| matches!(c.kind, PackedKind::Dispatch { .. }));
+        let command_helper = dispatches.then(|| {
+            quote! {
                 use __tl::KernelId as K;
                 /// The table's dispatch of kernel `kernel` and these part indices: a command is
                 /// written as this call, not a literal of its six fields' newtypes.
@@ -234,32 +260,46 @@ impl CommandPool {
                     __tl::PackedCommand {
                         kind: __tl::PackedKind::Dispatch {
                             kernel,
-                            symbol: __ti::PartIx(symbol),
-                            constants: __ti::PartIx(constants),
-                            dispatch: __ti::PartIx(dispatch),
-                            bindings: __ti::PartIx(bindings),
+                            symbol: __ti::PartIx::at(symbol),
+                            constants: __ti::PartIx::at(constants),
+                            dispatch: __ti::PartIx::at(dispatch),
+                            bindings: __ti::PartIx::at(bindings),
                         },
-                        gate: __ti::PartIx(gate),
+                        gate: __ti::PartIx::at(gate),
                     }
                 }
+            }
+        });
+        let doors = TableDoors {
+            untyped_affine_commands: gemms.untyped_affine,
+            dims_asserts: (gemms.gemm_dims.len() + gemms.affine.len()) as u32,
+        };
+        let tokens = quote! {
+            #[cfg(feature = "metal")]
+            mod __tape_cmds {
+                #aliases
+                #markers
+                #gemm_helpers
+                #command_helper
                 #(#statics)*
                 pub(super) static TABLE: __tl::CommandTable = __tl::CommandTable {
                     commands: &COMMANDS,
-                    symbols: &SYMBOLS,
-                    constants: &CONSTANTS,
-                    dispatches: &DISPATCHES,
-                    bindings: &BINDINGS,
-                    gemms: &GEMMS,
-                    gemm_entries: &GEMM_ENTRIES,
-                    gemm_operands: &GEMM_OPERANDS,
-                    gates: &GATES,
+                    symbols: __ti::PartArray(&SYMBOLS),
+                    constants: __ti::PartArray(&CONSTANTS),
+                    dispatches: __ti::PartArray(&DISPATCHES),
+                    bindings: __ti::PartArray(&BINDINGS),
+                    gemms: __ti::PartArray(&GEMMS),
+                    gemm_entries: __ti::PartArray(&GEMM_ENTRIES),
+                    gemm_operands: __ti::PartArray(&GEMM_OPERANDS),
+                    gates: __ti::PartArray(&GATES),
                 };
                 pub(super) static KERNELS: [__tl::BakedKernel; #kernels_len] = [ #(#kernels),* ];
             }
             #[cfg(feature = "metal")]
             static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] =
                 &__tape_cmds::KERNELS;
-        })
+        };
+        Ok((tokens, doors))
     }
 }
 
@@ -274,22 +314,74 @@ impl CommandPool {
 ///
 /// Each typed value is one `const` per slot: the weight's index and dims depend on the slot
 /// alone, so a record that named a type of its own would only re-check it.
+///
+/// ⭐ AND ITS MLX-AFFINE MATMULS, TYPED BY THEIRS. Each typed family an affine matmul reads is a
+/// slot whose handle is a quantized weight (`AffineSlot`, else E0277). The bake picked the
+/// kernels, named their symbols and compiled their pipelines from the numbers it minted, so each
+/// slot's numbers are tied to the bake's in the build:
+///
+/// - its codes by a bound: `affine_codes_agree::<slot, B, G>()`, `B` and `G` the markers of the
+///   bits and group the bake minted, is E0271 where they are not the handle's;
+/// - an int4-only or matrix-unit kernel's codes by its bound (`int4_codes`, `nax_group`: E0277);
+/// - its n and k — and a dense GEMM's, `__GEMM<slot>.agrees` — by a `const` evaluation (E0080):
+///   a dim is a value until Phase F makes it a type, when n/k become type equality.
+///
+/// The kernels' K and N constants are values, each set once as on any table: a command whose K or
+/// N is not its slot's refuses the bake, so every one is the number the slot's assert ties to its
+/// handle.
 struct TypedGemms {
     /// The typed families.
     typed: std::collections::HashSet<SourceIx>,
     /// The typed families the GEMM records read, ascending.
     read: std::collections::BTreeSet<u32>,
+    /// Each typed family's dense GEMM dims `(n, k)` as the bake baked them.
+    gemm_dims: std::collections::BTreeSet<(u32, u32, u32)>,
     /// The typed families the binding lists bind, ascending.
     bound: std::collections::BTreeSet<u32>,
+    /// Each typed family an affine matmul reads, with the numbers the bake minted for it.
+    affine: std::collections::BTreeMap<u32, AffineSlotRead>,
+    /// Its affine matmul commands whose weight is no typed slot's.
+    untyped_affine: u32,
+}
+
+/// The shape doors a model's command table leaves open (`scratchy_forward_compiler::ShapeDoors`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TableDoors {
+    /// Affine matmul commands whose weight is no typed slot's.
+    pub untyped_affine_commands: u32,
+    /// The n/k (and dense GEMM dims) `agrees` asserts the table emits, one per typed slot read.
+    pub dims_asserts: u32,
+}
+
+/// A typed family's MLX-affine matmul reads: the one `(n, k, bits, group)` the bake minted for
+/// it, and whether an int4-only or a matrix-unit kernel reads it.
+struct AffineSlotRead {
+    n: u32,
+    k: u32,
+    bits: u32,
+    group: u32,
+    int4: bool,
+    nax: bool,
 }
 
 impl TypedGemms {
-    /// The typed GEMM records and bindings of `parts`, over the families of `typed`.
-    fn of(parts: &CommandTableParts, typed: &std::collections::HashSet<SourceIx>) -> Self {
-        use scratchy_target_metal::tape::lowered::Binding;
-        let read = (parts.gemm_entries.iter())
-            .filter(|g| Self::typed_weight(typed, g))
-            .map(|g| g.ix.0)
+    /// The typed GEMM records, affine matmuls and bindings of `parts`, over the families of
+    /// `typed`, the affine ones read as `affine_reads`.
+    fn of(
+        parts: &CommandTableParts,
+        typed: &std::collections::HashSet<SourceIx>,
+        affine_reads: &AffineReads,
+    ) -> Result<Self, BakeDefect> {
+        use scratchy_target_metal::tape::kernel_constants::{
+            AFFINE_K, AFFINE_MATMUL_KERNELS, AFFINE_N, INT4_MATMUL_KERNELS, NAX_MATMUL_KERNELS,
+        };
+        use scratchy_target_metal::tape::lowered::{Binding, WeightTensor};
+        let typed_weight =
+            |g: &&scratchy_target_metal::tape::lowered::GemmEntry| Self::typed_weight(typed, g);
+        let read = parts.gemm_entries.iter().filter(typed_weight);
+        let read = read.map(|g| g.ix.0).collect();
+        let gemm_dims = (parts.gemm_entries.iter().filter(typed_weight))
+            .map(|g| (g.ix.0, g.dims.n, g.dims.k))
             .collect();
         let bound = (parts.bindings.iter().copied().flatten())
             .filter_map(|b| match b {
@@ -297,11 +389,87 @@ impl TypedGemms {
                 _ => None,
             })
             .collect();
-        Self {
+        // Each typed family's one affine read: two are no one slot's.
+        let mut affine = std::collections::BTreeMap::new();
+        for (&ix, reads) in affine_reads {
+            if !typed.contains(&SourceIx(ix)) {
+                continue;
+            }
+            let [(n, k, bits, group)] = reads.iter().copied().collect::<Vec<_>>()[..] else {
+                return Err(BakeDefect(format!(
+                    "typed weight family {ix} is read by affine matmuls of {reads:?}: its slot \
+                     states one"
+                )));
+            };
+            let read = AffineSlotRead {
+                n,
+                k,
+                bits,
+                group,
+                int4: false,
+                nax: false,
+            };
+            affine.insert(ix, read);
+        }
+        // Each affine matmul command over a typed family is baked at its slot's K and N.
+        let mut untyped_affine = 0;
+        for c in &parts.commands {
+            let PackedKind::Dispatch {
+                kernel,
+                constants: set,
+                bindings,
+                ..
+            } = c.kind
+            else {
+                continue;
+            };
+            let weight = (parts.bindings[bindings.get()].iter()).find_map(|b| match b {
+                Binding::Source {
+                    ix,
+                    which: WeightTensor::Weight,
+                    ..
+                } if typed.contains(ix) => Some(ix.0),
+                _ => None,
+            });
+            match weight {
+                Some(ix) if AFFINE_MATMUL_KERNELS.contains(&kernel) => {
+                    let Some(read) = affine.get_mut(&ix) else {
+                        return Err(BakeDefect(format!(
+                            "{kernel:?} reads typed weight family {ix}, which no affine matmul \
+                             reads"
+                        )));
+                    };
+                    let value = |at: u16| {
+                        (parts.constants[set.get()].iter())
+                            .find(|v| v.index == at)
+                            .map(|v| v.bits)
+                    };
+                    let (k, n) = (value(AFFINE_K.0), value(AFFINE_N.0));
+                    if (k, n) != (Some(read.k), Some(read.n)) {
+                        return Err(BakeDefect(format!(
+                            "{kernel:?} over typed weight family {ix} is baked at k {k:?}, n \
+                             {n:?}; its slot's are {}, {}",
+                            read.k, read.n
+                        )));
+                    }
+                    read.int4 |= INT4_MATMUL_KERNELS.contains(&kernel);
+                    read.nax |= NAX_MATMUL_KERNELS.contains(&kernel);
+                }
+                _ => untyped_affine += u32::from(AFFINE_MATMUL_KERNELS.contains(&kernel)),
+            }
+        }
+        Ok(Self {
             typed: typed.clone(),
             read,
+            gemm_dims,
             bound,
-        }
+            affine,
+            untyped_affine,
+        })
+    }
+
+    fn affine_slot(slot: u32) -> proc_macro2::Ident {
+        quote::format_ident!("__AFFINE{slot}")
     }
 
     /// Whether `g` reads a typed family's weight (a router's gate is a bundle tensor, untyped).
@@ -378,12 +546,38 @@ impl TypedGemms {
             let (c, s) = (Self::gemm(ix), crate::canonical::slot(ix));
             quote!(const #c: #tt::GemmSlotWeight = <super::#s as #tt::GemmSlot>::WEIGHT;)
         });
+        let gemm_dims = self.gemm_dims.iter().map(|&(ix, n, k)| {
+            let c = Self::gemm(SourceIx(ix));
+            quote!(const _: () = #c.agrees(#n, #k);)
+        });
         let sources = self.bound.iter().map(|&ix| {
             let ix = SourceIx(ix);
             let (c, s) = (Self::source(ix), crate::canonical::slot(ix));
             quote!(const #c: __ti::SourceIx = <super::#s as #tt::Source>::IX;)
         });
-        quote!(#(#weights)* #(#sources)*)
+        let affine = self.affine.iter().map(|(&ix, r)| {
+            let (c, s) = (Self::affine_slot(ix), crate::canonical::slot(SourceIx(ix)));
+            let w = quote!(::scratchy_tensors::typed);
+            let (b, g) = (
+                quote::format_ident!("B{}", r.bits),
+                quote::format_ident!("G{}", r.group),
+            );
+            let (n, k) = (r.n, r.k);
+            let int4 = r
+                .int4
+                .then(|| quote!(const _: () = #tt::int4_codes::<super::#s>();));
+            let nax = r
+                .nax
+                .then(|| quote!(const _: () = #tt::nax_group::<super::#s>();));
+            quote! {
+                const #c: #tt::AffineSlotWeight = <super::#s as #tt::AffineSlot>::WEIGHT;
+                const _: () = #c.agrees(#n, #k);
+                const _: () = #tt::affine_codes_agree::<super::#s, #w::#b, #w::#g>();
+                #int4
+                #nax
+            }
+        });
+        quote!(#(#weights)* #(#gemm_dims)* #(#sources)* #(#affine)*)
     }
 }
 
@@ -652,6 +846,10 @@ pub fn bake_bucket_tapes(
     input: &BucketLowerInput<'_>,
     pool: &mut CommandPool,
 ) -> Result<TokenStream, BakeDefect> {
+    pool.read_affine(input.steps)?;
+    if let Some(wide) = &input.wide_band {
+        pool.read_affine(wide.steps)?;
+    }
     let classes = [GenClass::M1, GenClass::Mid, GenClass::M5, GenClass::M5Wide];
     // The TurboQuant decode's head groups the global class admits; a model without attention
     // decodes no attention, so it bakes none.

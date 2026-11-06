@@ -16,7 +16,8 @@
 
 use crate::tape::constants::ConstantValue;
 use crate::tape::ids::{
-    BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, PartIx, SourceIx, TqDecodeHeads,
+    BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, PartArray, PartIx, SourceIx,
+    TqDecodeHeads,
 };
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
@@ -1562,21 +1563,21 @@ pub enum Fence {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize)]
 pub struct PackedCommand {
     pub kind: PackedKind,
-    pub gate: PartIx,
+    pub gate: PartIx<Option<RuntimeGate>>,
 }
 
 /// A [`TapeCommand`] as a command table holds it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize)]
 pub enum PackedKind {
     /// Its GEMM in [`CommandTable::gemms`].
-    Gemm(PartIx),
+    Gemm(PartIx<GemmAt>),
     Dispatch {
         kernel: KernelId,
         /// `(library, function)` in [`CommandTable::symbols`].
-        symbol: PartIx,
-        constants: PartIx,
-        dispatch: PartIx,
-        bindings: PartIx,
+        symbol: PartIx<(&'static str, &'static str)>,
+        constants: PartIx<&'static [ConstantValue]>,
+        dispatch: PartIx<DispatchShape>,
+        bindings: PartIx<&'static [Binding]>,
     },
 }
 
@@ -1588,9 +1589,9 @@ const _: [(); 12] = [(); std::mem::size_of::<PackedCommand>()];
 /// activations in [`CommandTable::gemm_operands`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize)]
 pub struct GemmAt {
-    pub entry: PartIx,
+    pub entry: PartIx<GemmEntry>,
     pub layer: PackedLayer,
-    pub operands: PartIx,
+    pub operands: PartIx<GemmOperands>,
 }
 
 /// A GEMM's activations, as [`CommandTable::gemm_operands`] holds them.
@@ -1620,28 +1621,28 @@ impl PackedLayer {
 #[derive(Clone, Copy, serde::Serialize)]
 pub struct CommandTable {
     pub commands: &'static [PackedCommand],
-    pub symbols: &'static [(&'static str, &'static str)],
-    pub constants: &'static [&'static [ConstantValue]],
-    pub dispatches: &'static [DispatchShape],
-    pub bindings: &'static [&'static [Binding]],
-    pub gemms: &'static [GemmAt],
-    pub gemm_entries: &'static [GemmEntry],
-    pub gemm_operands: &'static [GemmOperands],
-    pub gates: &'static [Option<RuntimeGate>],
+    pub symbols: PartArray<(&'static str, &'static str)>,
+    pub constants: PartArray<&'static [ConstantValue]>,
+    pub dispatches: PartArray<DispatchShape>,
+    pub bindings: PartArray<&'static [Binding]>,
+    pub gemms: PartArray<GemmAt>,
+    pub gemm_entries: PartArray<GemmEntry>,
+    pub gemm_operands: PartArray<GemmOperands>,
+    pub gates: PartArray<Option<RuntimeGate>>,
 }
 
 impl CommandTable {
     /// No commands.
     pub const EMPTY: Self = Self {
         commands: &[],
-        symbols: &[],
-        constants: &[],
-        dispatches: &[],
-        bindings: &[],
-        gemms: &[],
-        gemm_entries: &[],
-        gemm_operands: &[],
-        gates: &[],
+        symbols: PartArray::of(&[]),
+        constants: PartArray::of(&[]),
+        dispatches: PartArray::of(&[]),
+        bindings: PartArray::of(&[]),
+        gemms: PartArray::of(&[]),
+        gemm_entries: PartArray::of(&[]),
+        gemm_operands: PartArray::of(&[]),
+        gates: PartArray::of(&[]),
     };
 
     /// The command at `ix`, its fields read out of the part arrays.
@@ -1649,9 +1650,9 @@ impl CommandTable {
         let p = self.commands[ix.get()];
         let command = match p.kind {
             PackedKind::Gemm(g) => {
-                let g = self.gemms[g.get()];
-                let operands = self.gemm_operands[g.operands.get()];
-                TapeCommand::Gemm(self.gemm_entries[g.entry.get()].at(g.layer.layer(), operands))
+                let g = *self.gemms.get(g);
+                let operands = *self.gemm_operands.get(g.operands);
+                TapeCommand::Gemm(self.gemm_entries.get(g.entry).at(g.layer.layer(), operands))
             }
             PackedKind::Dispatch {
                 kernel,
@@ -1660,27 +1661,27 @@ impl CommandTable {
                 dispatch,
                 bindings,
             } => {
-                let (library, function) = self.symbols[symbol.get()];
+                let (library, function) = *self.symbols.get(symbol);
                 TapeCommand::Dispatch(LoweredCommand {
                     kernel,
                     library,
                     function,
-                    constants: self.constants[constants.get()],
-                    dispatch: self.dispatches[dispatch.get()],
-                    bindings: self.bindings[bindings.get()],
+                    constants: self.constants.get(constants),
+                    dispatch: *self.dispatches.get(dispatch),
+                    bindings: self.bindings.get(bindings),
                 })
             }
         };
         GatedCommand {
             command,
-            gate: self.gates[p.gate.get()],
+            gate: *self.gates.get(p.gate),
         }
     }
 }
 
 /// Each distinct value of one command field, in first-seen order.
 struct Parts<T> {
-    at: std::collections::HashMap<T, PartIx>,
+    at: std::collections::HashMap<T, PartIx<T>>,
     values: Vec<T>,
 }
 
@@ -1694,7 +1695,7 @@ impl<T> Default for Parts<T> {
 }
 
 impl<T: std::hash::Hash + Eq + Copy> Parts<T> {
-    fn intern(&mut self, value: T) -> Option<PartIx> {
+    fn intern(&mut self, value: T) -> Option<PartIx<T>> {
         if let Some(&ix) = self.at.get(&value) {
             return Some(ix);
         }
@@ -1799,14 +1800,14 @@ impl CommandTableParts {
     pub fn leak(self) -> &'static CommandTable {
         Box::leak(Box::new(CommandTable {
             commands: baked(self.commands),
-            symbols: baked(self.symbols),
-            constants: baked(self.constants),
-            dispatches: baked(self.dispatches),
-            bindings: baked(self.bindings),
-            gemms: baked(self.gemms),
-            gemm_entries: baked(self.gemm_entries),
-            gemm_operands: baked(self.gemm_operands),
-            gates: baked(self.gates),
+            symbols: PartArray::of(baked(self.symbols)),
+            constants: PartArray::of(baked(self.constants)),
+            dispatches: PartArray::of(baked(self.dispatches)),
+            bindings: PartArray::of(baked(self.bindings)),
+            gemms: PartArray::of(baked(self.gemms)),
+            gemm_entries: PartArray::of(baked(self.gemm_entries)),
+            gemm_operands: PartArray::of(baked(self.gemm_operands)),
+            gates: PartArray::of(baked(self.gates)),
         }))
     }
 }

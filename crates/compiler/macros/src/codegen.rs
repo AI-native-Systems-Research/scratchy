@@ -981,6 +981,43 @@ fn storage_requirement_error(
     )
 }
 
+/// Did the solver keep the `embed_tokens` of `accessors` as the packed `AffineQuantEmbedding`
+/// (metal's fused gather+dequant) or dequantize it to a dense `Embedding` (spyre/cuda host path)?
+/// A tied `lm_head` follows that representation.
+fn embed_is_affine_repr(accessors: &[WeightAccessor]) -> bool {
+    accessors.iter().any(|a| {
+        let n = a.name.to_string();
+        (n == "embed_tokens" || n.ends_with("_embed_tokens"))
+            && a.rust_type
+                .to_string()
+                .replace(' ', "")
+                .contains("AffineQuantEmbedding")
+    })
+}
+
+/// The MLX-affine codes, `(bits, group)`, a field loaded by `plan` keeps packed on device: a
+/// single-source or row-concatenated affine linear's, a tied head's over a packed embedding, and
+/// that packed embedding's. `None` for any other load — the affine sources fused at load are
+/// dequantized to one dense weight.
+fn packed_affine_codes(plan: &FieldLoad) -> Option<(u32, u32)> {
+    match *plan {
+        FieldLoad::LinearAffine {
+            group_size, bits, ..
+        }
+        | FieldLoad::LinearAffineRowConcat {
+            group_size, bits, ..
+        }
+        | FieldLoad::LinearTiedToEmbedding {
+            affine: Some((group_size, bits)),
+            ..
+        }
+        | FieldLoad::EmbeddingAffine {
+            group_size, bits, ..
+        } => Some((bits, group_size)),
+        _ => None,
+    }
+}
+
 /// Distill a `WeightAccessor` into its field-load plan. Uses the
 /// accessor's declared `rust_type` + `source_weights` and the
 /// model's config (for `rms_norm_eps` / `tie_word_embeddings`).
@@ -3274,17 +3311,7 @@ fn emit_weights_struct(
     // logic identical to the pre-grouping version. The prelude
     // bindings (`__marlin_ws`, `__bnb_code`, `__fp8_dtype`, …) are
     // captured by the layered closures via lexical scope.
-    // Did the solver keep the `embed_tokens` as the packed `AffineQuantEmbedding`
-    // (metal's fused gather+dequant) or dequantize it to a dense `Embedding`
-    // (spyre/cuda host path)? A tied `lm_head` follows that representation.
-    let embed_is_affine_repr = accessors.iter().any(|a| {
-        let n = a.name.to_string();
-        (n == "embed_tokens" || n.ends_with("_embed_tokens"))
-            && a.rust_type
-                .to_string()
-                .replace(' ', "")
-                .contains("AffineQuantEmbedding")
-    });
+    let embed_is_affine_repr = embed_is_affine_repr(&accessors);
     let plans: Vec<FieldLoad> = accessors
         .iter()
         .map(|a| plan_field_load(a, program, fuf, model, manifest, embed_is_affine_repr))
@@ -4417,6 +4444,9 @@ pub(crate) enum AccessorGroupKind {
 pub(crate) struct ModelDims {
     handles: BTreeMap<String, TypedHandle>,
     bounds: std::collections::BTreeSet<String>,
+    /// The weight families its fields hold, typed or not (metal's bake counts its doors).
+    #[cfg(feature = "metal")]
+    families: u32,
 }
 
 /// One field's typed handle: its path (`__handles::<Field>`, what the field, its accessor and
@@ -4434,15 +4464,28 @@ impl ModelDims {
     /// same packed pair of weights) of a kind whose device layer states its declared extents, at
     /// the shape the arch's trace gives it. A packed pair is its two weights side by side along
     /// `N`, which only weights of one `K` are (`PackedN`).
+    ///
+    /// A linear every layer of which keeps the same MLX-affine codes packed on device (`codes`,
+    /// `(bits, group)` from its load plan) is a quantized handle (`Q2`) of those codes; a group
+    /// whose layers' codes differ (an OptiQ per-module map) gets none.
+    ///
+    /// A field holding a bundle an op reads whole (`bundles`, derived: `bundles::derive`) is a
+    /// bundle handle (`Wb`) of its kind, each role at its derived shape.
     pub(crate) fn of(
         groups: &[AccessorGroup<'_>],
         program: &Program,
         inferred: &crate::shape::Inferred,
+        codes: &dyn Fn(&WeightAccessor) -> Option<(u32, u32)>,
+        bundles: &std::collections::BTreeMap<String, crate::bundles::Bundle>,
     ) -> Result<Self, String> {
         use crate::weight_vocab::WeightKind;
-        let mut dims = Self::default();
+        let mut dims = Self {
+            #[cfg(feature = "metal")]
+            families: u32::try_from(groups.len()).map_err(|_| "more weight families than a u32")?,
+            ..Self::default()
+        };
         let w = quote!(::scratchy_tensors::typed);
-        for g in groups {
+        'groups: for g in groups {
             let sources = |acc: &WeightAccessor| -> Vec<WeightId> {
                 acc.source_weights.iter().map(|(id, _)| *id).collect()
             };
@@ -4450,45 +4493,92 @@ impl ModelDims {
                 continue;
             };
             let ids = sources(first);
-            if !g.entries.iter().all(|(_, acc)| sources(acc) == ids)
-                || !matches!(
-                    first.kind,
-                    WeightKind::Linear | WeightKind::Embedding | WeightKind::RmsNorm
-                )
-            {
+            if !g.entries.iter().all(|(_, acc)| sources(acc) == ids) {
                 continue;
             }
-            let Some(shapes) = (ids.iter())
-                .map(|id| inferred.weights.get(id))
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
-            };
             let layer = &g.rust_type;
-            let mut ty = |shape: &[crate::dim::Dim]| -> Result<Option<TokenStream>, String> {
-                let mut dim = |d| dim_tokens(d, &mut dims.bounds);
-                Ok(match shape {
-                    [d] => {
-                        let d = dim(d)?;
-                        Some(quote!(#w::W1<#d, #layer>))
+            let def = 'def: {
+                // A bundle an op reads whole: its kind and each role at its derived shape.
+                let bundle = match ids[..] {
+                    [id] => bundles.get(&program.weights.path(id).join(".")),
+                    _ => None,
+                };
+                if let Some(bundle) = bundle {
+                    let mut roles = Vec::new();
+                    for shape in &bundle.roles {
+                        let ds = (shape.iter())
+                            .map(|d| dim_tokens(d, &mut dims.bounds))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        roles.push(match &ds[..] {
+                            [d] => quote!(#w::S1<#d>),
+                            [k, n] => quote!(#w::S2<#k, #n>),
+                            [e, k, n] => quote!(#w::S3<#e, #k, #n>),
+                            _ => return Err(format!("a bundle role of rank {}", ds.len())),
+                        });
                     }
-                    [k, n] => {
-                        let (k, n) = (dim(k)?, dim(n)?);
-                        Some(quote!(#w::W2<#k, #n, #layer>))
+                    let kind = format_ident!("{}", format!("K{:?}", bundle.kind));
+                    break 'def quote!(#w::Wb<#w::#kind, (#(#roles,)*), #layer>);
+                }
+                if !matches!(
+                    first.kind,
+                    WeightKind::Linear
+                        | WeightKind::Embedding
+                        | WeightKind::AffineQuantEmbedding
+                        | WeightKind::RmsNorm
+                        | WeightKind::Tensor
+                        | WeightKind::AttnSinks
+                ) {
+                    continue 'groups;
+                }
+                let Some(shapes) = (ids.iter())
+                    .map(|id| inferred.weights.get(id))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue 'groups;
+                };
+                // Every layer's codes, which must be one: a group of two is no one handle.
+                let layer_codes = codes(first);
+                if g.entries.iter().any(|(_, acc)| codes(acc) != layer_codes) {
+                    continue 'groups;
+                }
+                let mut ty = |shape: &[crate::dim::Dim],
+                              codes: Option<(u32, u32)>|
+                 -> Result<Option<TokenStream>, String> {
+                    let mut dim = |d| dim_tokens(d, &mut dims.bounds);
+                    Ok(match (shape, codes) {
+                        ([d], None) => {
+                            let d = dim(d)?;
+                            Some(quote!(#w::W1<#d, #layer>))
+                        }
+                        ([k, n], None) => {
+                            let (k, n) = (dim(k)?, dim(n)?);
+                            Some(quote!(#w::W2<#k, #n, #layer>))
+                        }
+                        ([k, n], Some((bits, group))) => {
+                            let (k, n) = (dim(k)?, dim(n)?);
+                            let (b, g) = (format_ident!("B{bits}"), format_ident!("G{group}"));
+                            Some(quote!(#w::Q2<#k, #n, #w::#b, #w::#g, #layer>))
+                        }
+                        _ => None,
+                    })
+                };
+                let handle = match &shapes[..] {
+                    [one] => ty(one, layer_codes)?,
+                    // A packed pair is dense: affine sources fused at load are dequantized.
+                    [gate, up] if first.kind == WeightKind::Linear && layer_codes.is_none() => {
+                        match (ty(gate, None)?, ty(up, None)?) {
+                            (Some(gate), Some(up)) => {
+                                Some(quote!(<(#gate, #up) as #w::PackedN>::Out))
+                            }
+                            _ => None,
+                        }
                     }
                     _ => None,
-                })
-            };
-            let handle = match &shapes[..] {
-                [one] => ty(one)?,
-                [gate, up] if first.kind == WeightKind::Linear => match (ty(gate)?, ty(up)?) {
-                    (Some(gate), Some(up)) => Some(quote!(<(#gate, #up) as #w::PackedN>::Out)),
-                    _ => None,
-                },
-                _ => None,
-            };
-            let Some(def) = handle else {
-                continue;
+                };
+                let Some(def) = handle else {
+                    continue 'groups;
+                };
+                def
             };
             let tensor = (ids.iter())
                 .map(|id| program.weights.path(*id).join("."))
@@ -4512,6 +4602,12 @@ impl ModelDims {
 
     pub(crate) fn handle(&self, base: &str) -> Option<&TypedHandle> {
         self.handles.get(base)
+    }
+
+    /// The weight families its fields hold with no typed handle.
+    #[cfg(feature = "metal")]
+    pub(crate) fn untyped(&self) -> u32 {
+        self.families - self.handles.len() as u32
     }
 
     /// `__dims`: one marker per bound the handles name, carrying `model`'s number for it.
@@ -14102,7 +14198,11 @@ pub fn emit_model(
     // delegated load reads the canonical's widths, so its fingerprint
     // gate must too. `None` for canonicals themselves.
     canonical_affine_rows: Option<&[(String, u32, u32)]>,
-) -> (TokenStream, Vec<(String, u32, u32)>) {
+) -> (
+    TokenStream,
+    Vec<(String, u32, u32)>,
+    Option<crate::shape_pins::Doors>,
+) {
     // A head reading its target's KV (`reads_target_kv`) binds its target's TurboQuant runtime.
     let reads_target_kv = model.arch.reads_target_kv;
     // Vision encoders have no terminal `gemm(<tile>, lm_head)`; the
@@ -14113,7 +14213,7 @@ pub fn emit_model(
     // separate vision flag needed.
 
     if let Some(canonical) = canonical_override {
-        return emit_shim_model(
+        let (tokens, rows) = emit_shim_model(
             program,
             fuf,
             model,
@@ -14123,6 +14223,8 @@ pub fn emit_model(
             emit_fingerprint,
             canonical_affine_rows,
         );
+        // A shim's weights and tapes are its canonical's: its doors are counted there.
+        return (tokens, rows, None);
     }
     // The struct emitter. Metal calls it twice: once with no accessors
     // and — after the front-end swap has produced them — once with the
@@ -14149,7 +14251,22 @@ pub fn emit_model(
     // metal resolver reaches each through its source slot.
     let model_dims = |accs: Option<&[WeightAccessor]>| {
         accs.map_or_else(ModelDims::default, |accs| {
-            ModelDims::of(&group_accessors_by_base(accs), program, inferred).unwrap_or_else(|e| {
+            // Each field's codes as its load plan keeps them: the very plan its load is emitted
+            // from.
+            let embed_affine = embed_is_affine_repr(accs);
+            let codes = |a: &WeightAccessor| {
+                let plan = plan_field_load(a, program, fuf, model, manifest, embed_affine);
+                packed_affine_codes(&plan)
+            };
+            // The bundles its ops read whole, as the bundle loaders' dims derive them.
+            let config = crate::bundles::BundleConfig {
+                bounds: &model.bounds,
+                activation: &model.expert_activation,
+            };
+            let bundles = crate::bundles::derive(program, &config)
+                .unwrap_or_else(|e| panic!("`{}`: its bundles: {e}", model.source_stem));
+            let groups = group_accessors_by_base(accs);
+            ModelDims::of(&groups, program, inferred, &codes, &bundles).unwrap_or_else(|e| {
                 panic!("[weights] {}: its weights' types: {e}", model.source_stem)
             })
         })
@@ -15462,15 +15579,28 @@ pub fn emit_model(
             };
     };
 
+    // The model's open shape doors, as this expansion counted them (#1094's ratchet, held to the
+    // model's pin by the caller): its untyped weight families, its affine matmul commands over an
+    // untyped weight and its dims asserts. Metal's bake counts them.
+    #[cfg(not(feature = "metal"))]
+    let shape_doors = None;
     #[cfg(feature = "metal")]
-    metal_arena_bytes_statics.push(metal_tape_cmds.into_tokens(&resolver.typed).unwrap_or_else(
-        |e| {
-            panic!(
-                "[metal static tape] {}: command table: {e}",
-                model.source_stem
-            )
-        },
-    ));
+    let shape_doors = {
+        let (table, doors) = metal_tape_cmds
+            .into_tokens(&resolver.typed)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[metal static tape] {}: command table: {e}",
+                    model.source_stem
+                )
+            });
+        metal_arena_bytes_statics.push(table);
+        Some(crate::shape_pins::Doors {
+            untyped_weight_families: dims.untyped(),
+            untyped_affine_commands: doors.untyped_affine_commands,
+            dims_asserts: doors.dims_asserts,
+        })
+    };
     #[cfg(feature = "metal")]
     {
         let mc = &model_facts;
@@ -16701,7 +16831,7 @@ pub fn emit_model(
                 .collect()
         }
     };
-    (tokens, weights_affine_rows)
+    (tokens, weights_affine_rows, shape_doors)
 }
 
 /// Unused — consumers used to reach this by name from tests.

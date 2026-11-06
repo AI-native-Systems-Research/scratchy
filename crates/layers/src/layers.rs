@@ -431,6 +431,62 @@ impl scratchy_tensors::typed::Extents<2> for LinearLayer {
     }
 }
 
+/// A linear's MLX-affine codes: an `AffineQuant` layer's bits and group, no other's.
+impl scratchy_tensors::typed::AffineCodes for LinearLayer {
+    fn affine_codes(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::AffineQuant(a) => Some((a.bits, a.group_size)),
+            Self::Dense(_)
+            | Self::Marlin(_)
+            | Self::Ggml(_)
+            | Self::GgmlConcat(_)
+            | Self::Bnb4bit(_)
+            | Self::Fp8(_)
+            | Self::Fp8Block(_)
+            | Self::Nvfp4(_) => None,
+        }
+    }
+}
+
+/// A recurrent mixer's roles' extents, read off its tensors: the conv's `[channels, taps]` (its
+/// on-disk singleton dim dropped, as the kernels drop it), and each vector's length. A role of a
+/// mixer kind it does not hold (a GDN's conv bias or `D`, any expert role) is `None`.
+impl scratchy_tensors::typed::RoleExtents for GatedDeltaNetLayer {
+    fn role_extents(&self, role: scratchy_tensors::bundle_roles::BundleRole) -> Option<Vec<usize>> {
+        use scratchy_tensors::bundle_roles::BundleRole as R;
+        let vector = |t: &GpuTensor| vec![t.numel()];
+        match role {
+            R::Conv => {
+                let shape = self.conv1d.shape();
+                let channels = *shape.first()? as usize;
+                Some(vec![channels, self.conv1d.numel() / channels.max(1)])
+            }
+            R::ConvBias => self.conv_bias.as_ref().map(vector),
+            R::ALog => Some(vector(&self.a_log)),
+            R::DtBias => Some(vector(&self.dt_bias)),
+            R::D => self.d.as_ref().map(vector),
+            R::Norm => Some(vector(&self.norm)),
+            R::Router
+            | R::GptOssRouter
+            | R::RouterBias
+            | R::Correction
+            | R::Gate
+            | R::Up
+            | R::Down
+            | R::GateBias
+            | R::UpBias
+            | R::DownBias
+            | R::SharedGate
+            | R::SharedUp
+            | R::SharedDown
+            | R::SharedScale
+            | R::Proj
+            | R::Scale
+            | R::PerExpertScale => None,
+        }
+    }
+}
+
 /// An embedding's declared shape is its table's, `[vocab, hidden]`.
 impl scratchy_tensors::typed::Extents<2> for Embedding {
     fn extents(&self) -> [usize; 2] {
