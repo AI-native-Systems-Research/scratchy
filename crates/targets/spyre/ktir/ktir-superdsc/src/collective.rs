@@ -18,9 +18,9 @@
 //! window's placement and no address is ever exchanged.
 //!
 //! The protocol is #1007 §3's, and every law there that a value can break is a type here:
-//! - a world fits the card's write-done sids or [`TpWorld::of`] does not compile;
-//! - a rank is minted by its world ([`TpWorld::ranks`]), so it is in range and carries the world
-//!   it belongs to ([`TpIdentity`] is one fact, never a rank and a world passed apart);
+//! - a world fits the card's write-done sids or [`Tp::CHECKED`] does not compile;
+//! - a rank is minted by its world ([`ranks`]), so it is in range, and its world is its
+//!   type ([`Rank<T>`]): a rank and a world are never passed apart;
 //! - a send moves a [`Payload`] (a whole number of flits) as a run of messages, each within the
 //!   RDMA message cap ([`WireBytes`], [`Payload::messages`]); an operand is cut at bake into runs
 //!   of whole stick columns — the only contiguous slices of a stick-major tensor ([`fragments`]);
@@ -31,7 +31,7 @@
 //!   decides nothing — measured, #1009 E8a), so every landing slot has its OWN sid per sending rank
 //!   ([`Sid::of`]), each entry programmed once at link: a bounded, static budget per rank, never
 //!   one per collective (a forward holds more collectives than the card has sids). A world of `W`
-//!   splits the card's sids `W` ways ([`TpWorld::messages_per_cut`]);
+//!   splits the card's sids `W` ways ([`Tp::MESSAGES_PER_CUT`]);
 //! - a bundle's control blocks are derived from its own launch groups by ONE function (the bundle
 //!   crate's `collective::cb_pipeline`, which needs the launch group and so lives above this leaf):
 //!   a consume group is `sends, waits, launch`, so a wait can never queue ahead of its own sends
@@ -79,111 +79,103 @@ const _: () = assert!(
     "the window's reserved block tids cover exactly the widest world the sids carry"
 );
 
-/// A tensor-parallel world a spyre bundle was baked for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TpWorld(u32);
+/// ⭐ THE TENSOR-PARALLEL WORLD, AS A TYPE — the one fact the build's `tp/N` fixes, named by a
+/// newtype so the ladder carries ONE type parameter (`T: Tp`) rather than a bare number. Nothing
+/// stores a world size or reads one back: every count that depends on it is an associated const or
+/// `const fn` of `T`, and a value of one world's types cannot be handed to another world's code.
+///
+/// Its one implementor is [`TpWorld<N>`]; a build selects exactly one.
+pub trait Tp: Copy + Clone + core::fmt::Debug + PartialEq + Eq + core::hash::Hash + Send + Sync + 'static {
+    /// The rank count.
+    const RANKS: u32;
+    /// The world's laws, proven at build: at least one rank, and no wider than the card's sids.
+    const CHECKED: () = {
+        assert!(Self::RANKS >= 1, "a tensor-parallel world has at least one rank");
+        assert!(
+            Self::RANKS <= MAX_WORLD,
+            "every rank's landing slots take a sid of their own: a world wider than the card's sids"
+        );
+    };
+    /// Whether this world exchanges anything at all.
+    const SHARDED: bool = Self::RANKS > 1;
+    /// ⭐ HOW MANY MESSAGES ONE RANK'S SEND INTO ONE CUT MAY BE — the card's sids split evenly over
+    /// every (sending rank, cut): each message lands through a sid of its own ([`Sid::of`]).
+    const MESSAGES_PER_CUT: u32 = {
+        let () = Self::CHECKED;
+        MAX_SIDS / (Self::RANKS * WINDOW_CUTS as u32)
+    };
+    /// How many landing slots one rank's sends take: every cut's messages.
+    const SLOTS_PER_RANK: u32 = WINDOW_CUTS as u32 * Self::MESSAGES_PER_CUT;
+}
 
-impl TpWorld {
-    /// The world of `W` ranks. `W = 0`, and a `W` whose ranks the card's sids cannot each give a
-    /// landing slot per cut, do not compile:
+/// ⭐ THE WORLD OF `N` RANKS — the newtype a build's `tp/N` names. `N = 0`, and an `N` whose ranks the
+/// card's write-done sids cannot each give a landing slot per cut, do not compile:
+///
+/// ```compile_fail
+/// use ktir_superdsc::collective::{Tp, TpWorld};
+/// let () = <TpWorld<0> as Tp>::CHECKED;
+/// ```
+///
+/// ```compile_fail
+/// use ktir_superdsc::collective::{MAX_WORLD, Tp, TpWorld};
+/// let () = <TpWorld<{ MAX_WORLD + 1 }> as Tp>::CHECKED;
+/// ```
+///
+/// ```
+/// use ktir_superdsc::collective::{Tp, TpWorld};
+/// assert_eq!(<TpWorld<8> as Tp>::MESSAGES_PER_CUT, 4);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TpWorld<const N: u32>;
+
+impl<const N: u32> Tp for TpWorld<N> {
+    const RANKS: u32 = N;
+}
+
+/// Every rank of world `T`, in rank order.
+pub fn ranks<T: Tp>() -> impl Iterator<Item = Rank<T>> {
+    let () = T::CHECKED;
+    (0..T::RANKS).map(|r| Rank(r, core::marker::PhantomData))
+}
+
+/// ⭐ RANK `r` OF WORLD `T` — its world is its type. Minted only by [`ranks`], [`Rank::of`] and
+/// [`Rank::baked`], so `r < T::RANKS` holds by construction and a rank of one world is not a rank of
+/// another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Rank<T: Tp>(u32, core::marker::PhantomData<T>);
+
+impl<T: Tp> Rank<T> {
+    /// Rank `R`, proven below the world at build.
     ///
     /// ```compile_fail
-    /// let _ = ktir_superdsc::collective::TpWorld::of::<0>();
+    /// use ktir_superdsc::collective::{Rank, TpWorld};
+    /// let _ = Rank::<TpWorld<4>>::of::<4>();
     /// ```
+    pub const fn of<const R: u32>() -> Self {
+        const { assert!(R < T::RANKS, "a rank is below its world") };
+        Self(R, core::marker::PhantomData)
+    }
+
+    /// Re-mint from the rank the `#[forward]` macro bakes into a `static` — a `const fn`, so a rank
+    /// past the world fails the BUILD of the crate that bakes it.
     ///
     /// ```compile_fail
-    /// use ktir_superdsc::collective::{MAX_WORLD, TpWorld};
-    /// let _ = TpWorld::of::<{ MAX_WORLD + 1 }>();
+    /// use ktir_superdsc::collective::{Rank, TpWorld};
+    /// const R: Rank<TpWorld<4>> = Rank::baked(4);
     /// ```
-    ///
-    /// ```
-    /// use ktir_superdsc::collective::TpWorld;
-    /// assert_eq!(TpWorld::of::<8>().get(), 8);
-    /// ```
-    pub const fn of<const W: u32>() -> Self {
-        const {
-            assert!(W >= 1, "a tensor-parallel world has at least one rank");
-            assert!(
-                W <= MAX_WORLD,
-                "every rank's landing slots take a sid of their own: a world wider than the \
-                 card's sids"
-            );
-        }
-        Self(W)
+    pub const fn baked(r: u32) -> Self {
+        assert!(r < T::RANKS, "a baked rank is below its world");
+        Self(r, core::marker::PhantomData)
     }
 
     pub const fn get(self) -> u32 {
         self.0
     }
 
-    /// The world of `ranks` ranks the shared analysis sharded a forward for (its typed
-    /// `WorldSize`, read off the collective ops at bake) — `None` past [`MAX_WORLD`], which the
-    /// bake refuses by name. The bake's one bridge from the analysis's world to the plan's.
-    pub const fn of_analysis_ranks(ranks: u32) -> Option<Self> {
-        if ranks >= 1 && ranks <= MAX_WORLD {
-            Some(Self(ranks))
-        } else {
-            None
-        }
-    }
-
-    /// Rank `r` of this world, `None` past its last rank.
-    pub const fn rank(self, r: u32) -> Option<TpIdentity> {
-        if r < self.0 {
-            Some(TpIdentity {
-                rank: r,
-                world: self,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Every rank of this world, each carrying the world it belongs to.
-    pub fn ranks(self) -> impl Iterator<Item = TpIdentity> {
-        (0..self.0).map(move |rank| TpIdentity { rank, world: self })
-    }
-
-    /// Whether this world exchanges anything at all.
-    pub const fn is_sharded(self) -> bool {
-        self.0 > 1
-    }
-
-    /// ⭐ HOW MANY MESSAGES ONE RANK'S SEND INTO ONE CUT MAY BE — the card's sids split evenly
-    /// over every (sending rank, cut): each message lands through a sid of its own
-    /// ([`Sid::of`]). A wider world leaves each send fewer, never fewer than one.
-    pub const fn messages_per_cut(self) -> u32 {
-        MAX_SIDS / (self.0 * WINDOW_CUTS as u32)
-    }
-
-    /// How many landing slots one rank's sends take: every cut's messages.
-    pub const fn slots_per_rank(self) -> u32 {
-        WINDOW_CUTS as u32 * self.messages_per_cut()
-    }
-}
-
-/// THE RANK, WITH ITS WORLD — one fact. Minted only by [`TpWorld::ranks`], so `rank < world`
-/// holds by construction, and a session constructed for one world cannot be handed a bundle baked
-/// for another without [`TpIdentity::world`] saying so.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TpIdentity {
-    rank: u32,
-    world: TpWorld,
-}
-
-impl TpIdentity {
-    pub const fn rank(self) -> u32 {
-        self.rank
-    }
-
-    pub const fn world(self) -> TpWorld {
-        self.world
-    }
-
     /// Every OTHER rank of the world — the peers this rank sends to and hears from, in rank order.
     /// Empty in a world of one.
-    pub fn peers(self) -> impl Iterator<Item = TpIdentity> {
-        self.world.ranks().filter(move |p| p.rank != self.rank)
+    pub fn peers(self) -> impl Iterator<Item = Rank<T>> {
+        ranks::<T>().filter(move |p| *p != self)
     }
 }
 
@@ -320,8 +312,8 @@ impl WindowCut {
 
     /// The tid sender `from`'s block of this cut carries — what a consume program binds to read
     /// `from`'s fragment, and what the layout places at [`RecvWindow::block_offset`].
-    pub const fn block_tid(self, from: TpIdentity) -> u32 {
-        crate::reserved_tids::tp_recv_block_tid(self.0, from.rank)
+    pub const fn block_tid<T: Tp>(self, from: Rank<T>) -> u32 {
+        crate::reserved_tids::tp_recv_block_tid(self.0, from.0)
     }
 }
 
@@ -337,22 +329,20 @@ impl WindowCut {
 /// address; every send and every wait names its slot's sid; nothing re-points a table entry at run
 /// time (the T-send's re-pointing fires an unpaired write-done count, #1009).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct LandingSlot {
+pub struct LandingSlot<T: Tp> {
     cut: WindowCut,
     message: u32,
-    /// The world's [`TpWorld::messages_per_cut`] — the slot's stride between cuts.
-    per_cut: u32,
+    world: core::marker::PhantomData<T>,
 }
 
-impl LandingSlot {
-    /// Message `message` of a send into `cut` in `world`; `None` past the world's
-    /// [`TpWorld::messages_per_cut`].
-    pub const fn of(world: TpWorld, cut: WindowCut, message: u32) -> Option<Self> {
-        if message < world.messages_per_cut() {
+impl<T: Tp> LandingSlot<T> {
+    /// Message `message` of a send into `cut`; `None` past [`Tp::MESSAGES_PER_CUT`].
+    pub const fn of(cut: WindowCut, message: u32) -> Option<Self> {
+        if message < T::MESSAGES_PER_CUT {
             Some(Self {
                 cut,
                 message,
-                per_cut: world.messages_per_cut(),
+                world: core::marker::PhantomData,
             })
         } else {
             None
@@ -367,50 +357,47 @@ impl LandingSlot {
         self.message
     }
 
-    /// The slot's place in a rank's budget, `< world.slots_per_rank()`.
+    /// The slot's place in a rank's budget, `< T::SLOTS_PER_RANK`.
     pub const fn index(self) -> u32 {
-        self.cut.0 * self.per_cut + self.message
+        self.cut.0 * T::MESSAGES_PER_CUT + self.message
     }
 }
 
-/// WHAT ONE COLLECTIVE'S SEND MOVES: a [`Payload`] of at most the world's
-/// [`TpWorld::messages_per_cut`] messages — one block's worth of slots, so every message it is
-/// cut into has a slot to land in.
+/// WHAT ONE COLLECTIVE'S SEND MOVES: a [`Payload`] of at most [`Tp::MESSAGES_PER_CUT`] messages
+/// — one block's worth of slots, so every message it is cut into has a slot to land in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct CutPayload {
-    bytes: Payload,
-    world: TpWorld,
-}
+pub struct CutPayload<T: Tp>(Payload, core::marker::PhantomData<T>);
 
-impl CutPayload {
-    /// `Some` iff `bytes` is at most `world`'s messages per cut.
-    pub const fn new(world: TpWorld, bytes: Payload) -> Option<Self> {
-        if bytes.message_count() <= world.messages_per_cut() {
-            Some(Self { bytes, world })
+impl<T: Tp> CutPayload<T> {
+    /// `Some` iff `bytes` is at most the world's messages per cut.
+    pub const fn new(bytes: Payload) -> Option<Self> {
+        if bytes.message_count() <= T::MESSAGES_PER_CUT {
+            Some(Self(bytes, core::marker::PhantomData))
         } else {
             None
         }
     }
 
     pub const fn get(self) -> Payload {
-        self.bytes
+        self.0
     }
 
     /// Its messages ([`Payload::messages`]), each with the slot of `cut` it lands in: message `m`
     /// in slot `(cut, m)`.
-    pub fn landings(self, cut: WindowCut) -> impl Iterator<Item = (LandingSlot, Message)> {
+    pub fn landings(self, cut: WindowCut) -> impl Iterator<Item = (LandingSlot<T>, Message)> {
         // `new` bounds the count by the world's messages per cut, so every index is a slot.
-        let per_cut = self.world.messages_per_cut();
-        (0..).zip(self.bytes.messages()).map(move |(message, m)| {
-            (
-                LandingSlot {
-                    cut,
-                    message,
-                    per_cut,
-                },
-                m,
-            )
-        })
+        (0..)
+            .zip(self.0.messages())
+            .map(move |(message, m)| {
+                (
+                    LandingSlot {
+                        cut,
+                        message,
+                        world: core::marker::PhantomData,
+                    },
+                    m,
+                )
+            })
     }
 }
 
@@ -426,37 +413,34 @@ impl CutPayload {
 /// the block's run of fixed landing slots ([`RecvWindow::slots_from`]), one `XSEG` entry per slot
 /// per peer, each pointing at its slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RecvWindow {
+pub struct RecvWindow<T: Tp> {
     offset: u64,
     block: Payload,
-    world: TpWorld,
+    world: core::marker::PhantomData<T>,
 }
 
-impl RecvWindow {
+impl<T: Tp> RecvWindow<T> {
     /// The weight segment (seg1).
     pub const SEGMENT: u32 = 1;
 
-    /// The window of `world` at `offset`, of [`WINDOW_CUTS`] cuts of one `block`-byte block per
-    /// rank. `Some` iff `offset` is flit-aligned and a block is at most the world's messages per
-    /// cut — a slot each.
-    pub const fn new(world: TpWorld, offset: u64, block: Payload) -> Option<Self> {
-        if !offset.is_multiple_of(FLIT_BYTES) || block.message_count() > world.messages_per_cut() {
+    /// The window at `offset`, of [`WINDOW_CUTS`] cuts of one `block`-byte block per rank. `Some`
+    /// iff `offset` is flit-aligned and a block is at most the world's messages per cut — a slot
+    /// each.
+    pub const fn new(offset: u64, block: Payload) -> Option<Self> {
+        if !offset.is_multiple_of(FLIT_BYTES)
+            || block.message_count() > T::MESSAGES_PER_CUT
+        {
             return None;
         }
         Some(Self {
             offset,
             block,
-            world,
+            world: core::marker::PhantomData,
         })
     }
 
     pub const fn offset(self) -> u64 {
         self.offset
-    }
-
-    /// The world whose ranks' blocks the window holds.
-    pub const fn world(self) -> TpWorld {
-        self.world
     }
 
     /// One sender's block: what one fragment may be.
@@ -466,7 +450,7 @@ impl RecvWindow {
 
     /// One cut's bytes — a block per rank.
     pub const fn cut_bytes(self) -> u64 {
-        self.world.0 as u64 * self.block.0
+        T::RANKS as u64 * self.block.0
     }
 
     /// Where `cut` starts in the segment.
@@ -476,25 +460,24 @@ impl RecvWindow {
 
     /// Where `from`'s block of `cut` starts in the segment — where rank `from`'s send into `cut`
     /// lands, on every card.
-    pub const fn block_offset(self, cut: WindowCut, from: TpIdentity) -> u64 {
-        self.cut_offset(cut) + from.rank as u64 * self.block.0
+    pub const fn block_offset(self, cut: WindowCut, from: Rank<T>) -> u64 {
+        self.cut_offset(cut) + from.0 as u64 * self.block.0
     }
 
     /// Where `slot` of `from`'s block starts in the segment: the block, plus the whole messages
     /// before it.
-    pub const fn slot_offset(self, from: TpIdentity, slot: LandingSlot) -> u64 {
+    pub const fn slot_offset(self, from: Rank<T>, slot: LandingSlot<T>) -> u64 {
         self.block_offset(slot.cut, from) + slot.message as u64 * RDMA_MESSAGE_CAP_BYTES
     }
 
     /// ⭐ EVERY SLOT `from`'S SENDS CAN LAND IN, with its offset in the segment — each cut's run
     /// of messages in `from`'s block. What a receiver programs for that sender, one `XSEG` entry
     /// per slot, at link.
-    pub fn slots_from(self, from: TpIdentity) -> impl Iterator<Item = (LandingSlot, u64)> {
+    pub fn slots_from(self, from: Rank<T>) -> impl Iterator<Item = (LandingSlot<T>, u64)> {
         (0..WINDOW_CUTS).flat_map(move |k| {
             let cut = WindowCut::of_collective(k);
             (0..self.block.message_count()).filter_map(move |m| {
-                LandingSlot::of(self.world, cut, m)
-                    .map(|slot| (slot, self.slot_offset(from, slot)))
+                LandingSlot::of(cut, m).map(|slot| (slot, self.slot_offset(from, slot)))
             })
         })
     }
@@ -515,12 +498,12 @@ impl RecvWindow {
     /// bundle of one forward places the same window, as the link's `XSEG` entries and the shared
     /// weight segment require. Any fragment of any collective of the forward fits a block whole, so
     /// a collective is ONE fragment and its send is a run of messages ([`Payload::messages`]),
-    /// each landing in a slot of its own. `None` for no columns, or for a block wider than
-    /// `world`'s messages per cut — more slots than a rank's sid budget holds.
-    pub const fn block_bytes_for(world: TpWorld, widest_cols: u32) -> Option<Payload> {
+    /// each landing in a slot of its own. `None` for no columns, or for a block wider than the
+    /// world's messages per cut — more slots than a rank's sid budget holds.
+    pub const fn block_bytes_for(widest_cols: u32) -> Option<Payload> {
         let cols = widest_cols.next_multiple_of(STICK_ELEMS) as u64;
         match Payload::new(cols * <Fp16 as DataFormat>::WORD_LENGTH as u64 * WINDOW_ROWS as u64) {
-            Some(block) if block.message_count() <= world.messages_per_cut() => Some(block),
+            Some(block) if block.message_count() <= T::MESSAGES_PER_CUT => Some(block),
             _ => None,
         }
     }
@@ -530,16 +513,15 @@ impl RecvWindow {
 /// LANDING SLOT): the receiver's counter for "this slot of that sender's landed" and the entry
 /// pointing at that slot of the sender's block, whatever the collective — so the count of
 /// collectives in a forward never meets the card's sid budget, and a world takes at most every sid
-/// (`TpWorld::messages_per_cut` divides them).
+/// ([`Tp::MESSAGES_PER_CUT`] divides them).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Sid(u8);
 
 impl Sid {
     /// The sid `sender`'s message into `slot` signals on.
-    pub const fn of(sender: TpIdentity, slot: LandingSlot) -> Self {
-        // `rank < world`, `slot.index() < world.slots_per_rank()`, and
-        // `world · slots_per_rank ≤ MAX_SIDS ≤ 256`.
-        Self((sender.rank * sender.world.slots_per_rank() + slot.index()) as u8)
+    pub const fn of<T: Tp>(sender: Rank<T>, slot: LandingSlot<T>) -> Self {
+        // `rank < RANKS`, `slot.index() < SLOTS_PER_RANK`, and `RANKS · SLOTS_PER_RANK ≤ MAX_SIDS`.
+        Self((sender.0 * T::SLOTS_PER_RANK + slot.index()) as u8)
     }
 
     pub const fn get(self) -> u8 {
@@ -684,7 +666,7 @@ pub fn fragments(rows: u32, cols: u32, width: Payload) -> Result<Vec<Fragment>, 
 /// of `operand`, from its own placement, into the peer's receive window. Everything it moves is
 /// named here, so a consume and its send cannot come apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TpConsume {
+pub struct TpConsume<T: Tp> {
     pub kind: CollectiveKind,
     /// The tensor this rank SENDS — the collective's operand, read from its own placement.
     pub operand: crate::place::PlaceId,
@@ -693,43 +675,15 @@ pub struct TpConsume {
     /// The one rank that launches this consume. A consume reads its own share from its own operand
     /// and every peer's from the window, so which operand is whose depends on the rank: the bake
     /// carries one consume per rank, and each session plays its own.
-    pub plays_at: PlaysAt,
-    /// The window cut the send lands in and the consume reads.
+    pub plays_at: Rank<T>,
+    /// The window cut the sends land in and the consume reads.
     pub cut: WindowCut,
 }
 
-/// The one rank that launches a rank-selected consume. Minted from a [`TpIdentity`], or re-minted
-/// from baked tokens through [`PlaysAt::baked`], which refuses at BUILD a rank its world does not
-/// have — a consume for a rank past the world would never launch, silently.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PlaysAt(TpIdentity);
-
-impl PlaysAt {
-    pub const fn of(rank: TpIdentity) -> Self {
-        Self(rank)
-    }
-
-    /// Re-mint from the parts the `#[forward]` macro bakes.
-    ///
-    /// ```compile_fail
-    /// use ktir_superdsc::collective::{PlaysAt, TpWorld};
-    /// const P: PlaysAt = PlaysAt::baked(TpWorld::of::<4>(), 4);
-    /// ```
-    pub const fn baked(world: TpWorld, rank: u32) -> Self {
-        assert!(
-            rank < world.0,
-            "a rank-selected consume names a rank its world does not have"
-        );
-        Self(TpIdentity { rank, world })
-    }
-
-    pub const fn rank(self) -> TpIdentity {
-        self.0
-    }
-
+impl<T: Tp> TpConsume<T> {
     /// Whether the session running as `session` launches this consume.
-    pub fn launches_on(self, session: TpIdentity) -> bool {
-        self.0 == session
+    pub fn launches_on(self, session: Rank<T>) -> bool {
+        self.plays_at == session
     }
 }
 
@@ -737,74 +691,68 @@ impl PlaysAt {
 mod tests {
     use super::*;
 
-    /// A rank is in range, carries its world, and its peers are every other rank of it.
+    /// A world's ranks are its own, in order, and each rank's peers are every other rank.
     #[test]
-    fn a_rank_carries_its_world_and_its_peers() {
-        fn check<const W: u32>() {
-            let w = TpWorld::of::<W>();
-            let ids: Vec<TpIdentity> = w.ranks().collect();
-            assert_eq!(ids.len() as u32, W);
-            assert_eq!(w.rank(W - 1), ids.last().copied());
-            assert_eq!(w.rank(W), None);
+    fn a_ranks_peers_are_every_other_rank() {
+        fn check<T: Tp>() {
+            let ids: Vec<Rank<T>> = ranks::<T>().collect();
+            assert_eq!(ids.len() as u32, T::RANKS);
+            assert_eq!(ids.last().map(|r| r.get()), Some(T::RANKS - 1));
             for id in &ids {
-                let peers: Vec<u32> = id.peers().map(TpIdentity::rank).collect();
-                let want: Vec<u32> = (0..W).filter(|&r| r != id.rank()).collect();
+                let peers: Vec<u32> = id.peers().map(Rank::get).collect();
+                let want: Vec<u32> = (0..T::RANKS).filter(|&r| r != id.get()).collect();
                 assert_eq!(peers, want);
             }
         }
-        check::<1>();
-        check::<2>();
-        check::<3>();
-        check::<4>();
-        check::<8>();
-        check::<MAX_WORLD>();
+        check::<TpWorld<1>>();
+        check::<TpWorld<2>>();
+        check::<TpWorld<3>>();
+        check::<TpWorld<4>>();
+        check::<TpWorld<8>>();
+        check::<TpWorld<MAX_WORLD>>();
     }
 
-    /// Every (rank, slot) of a world signals on a sid of its own, all within the card's — at
-    /// every world width.
+    /// Every (rank, slot) of a world signals on a sid of its own, all within the card's — at every
+    /// world width.
     #[test]
     fn every_rank_and_slot_has_its_own_sid() {
-        fn check<const W: u32>() {
-            let w = TpWorld::of::<W>();
-            assert!(w.messages_per_cut() >= 1);
-            let slots: Vec<LandingSlot> = (0..WINDOW_CUTS)
+        fn check<T: Tp>() {
+            assert!(T::MESSAGES_PER_CUT >= 1);
+            let slots: Vec<LandingSlot<T>> = (0..WINDOW_CUTS)
                 .flat_map(|k| {
-                    (0..w.messages_per_cut())
-                        .map(move |m| LandingSlot::of(w, WindowCut::of_collective(k), m).unwrap())
+                    (0..T::MESSAGES_PER_CUT)
+                        .map(move |m| LandingSlot::of(WindowCut::of_collective(k), m).unwrap())
                 })
                 .collect();
-            assert_eq!(slots.len() as u32, w.slots_per_rank());
-            let sids: std::collections::BTreeSet<u8> = w
-                .ranks()
+            assert_eq!(slots.len() as u32, T::SLOTS_PER_RANK);
+            let sids: std::collections::BTreeSet<u8> = ranks::<T>()
                 .flat_map(|r| slots.iter().map(move |&s| Sid::of(r, s).get()))
                 .collect();
-            assert_eq!(sids.len() as u32, W * w.slots_per_rank());
+            assert_eq!(sids.len() as u32, T::RANKS * T::SLOTS_PER_RANK);
             assert!(sids.iter().all(|&s| u32::from(s) < MAX_SIDS));
             assert_eq!(
-                LandingSlot::of(w, WindowCut::of_collective(0), w.messages_per_cut()),
+                LandingSlot::<T>::of(WindowCut::of_collective(0), T::MESSAGES_PER_CUT),
                 None
             );
         }
-        check::<1>();
-        check::<2>();
-        check::<3>();
-        check::<4>();
-        check::<8>();
-        check::<MAX_WORLD>();
+        check::<TpWorld<1>>();
+        check::<TpWorld<2>>();
+        check::<TpWorld<3>>();
+        check::<TpWorld<4>>();
+        check::<TpWorld<8>>();
+        check::<TpWorld<MAX_WORLD>>();
     }
 
-    /// A window's blocks sit at their sender's rank in every cut, its slots tile each block
-    /// message by message, and a block wider than the world's slot budget is no window at all.
+    /// A window's blocks sit at their sender's rank in every cut, its slots tile each block message
+    /// by message, and a block wider than the world's slot budget is no window at all.
     #[test]
     fn a_windows_blocks_and_slots_tile_its_cuts() {
-        let w = TpWorld::of::<4>();
         let block = Payload::new(2 * RDMA_MESSAGE_CAP_BYTES + FLIT_BYTES).unwrap();
-        let win = RecvWindow::new(w, 1 << 20, block).unwrap();
+        let win = RecvWindow::<TpWorld<4>>::new(1 << 20, block).unwrap();
         assert_eq!(win.cut_bytes(), 4 * block.get());
         assert_eq!(win.size(), WINDOW_CUTS as u64 * 4 * block.get());
-        let r2 = w.rank(2).unwrap();
         let slots: Vec<(u32, u32, u64)> = win
-            .slots_from(r2)
+            .slots_from(Rank::<TpWorld<4>>::of::<2>())
             .map(|(s, at)| (s.cut().index() as u32, s.message(), at))
             .collect();
         let at = |c: u64, m: u64| {
@@ -822,11 +770,12 @@ mod tests {
             ]
         );
         let widest =
-            Payload::new(u64::from(w.messages_per_cut()) * RDMA_MESSAGE_CAP_BYTES).unwrap();
-        assert!(RecvWindow::new(w, 0, widest).is_some());
+            Payload::new(u64::from(<TpWorld<4> as Tp>::MESSAGES_PER_CUT) * RDMA_MESSAGE_CAP_BYTES)
+                .unwrap();
+        assert!(RecvWindow::<TpWorld<4>>::new(0, widest).is_some());
         let past = Payload::new(widest.get() + FLIT_BYTES).unwrap();
-        assert!(RecvWindow::new(w, 0, past).is_none());
-        assert!(RecvWindow::block_bytes_for(w, 1 << 20).is_none());
+        assert!(RecvWindow::<TpWorld<4>>::new(0, past).is_none());
+        assert!(RecvWindow::<TpWorld<4>>::block_bytes_for(1 << 20).is_none());
     }
 
     #[test]
