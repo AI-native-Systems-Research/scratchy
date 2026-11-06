@@ -44,7 +44,7 @@ use crate::step::{
     GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16,
     MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, QuantRowsFp8,
     RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
-    ScaleBf16, SiluMulBf16, SoftCapBf16, fp8_weight, gemv_splits,
+    ScaleBf16, SiluMulBf16, SoftCapBf16, fp8_moe_layout, fp8_weight, gemv_splits,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
@@ -620,8 +620,8 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
 }
 
 /// The name of `s` when no kernel launches it: the Qwen routing at another count than
-/// [`MOE_ROUTE_EXPERTS`], every fp8 GEMV (FP8 S4's kernels), and every step over an fp8 expert
-/// bank (its pair rows are not quantized on the tape yet, so the S3 expert GEMM has no input). The
+/// [`MOE_ROUTE_EXPERTS`], every fp8 GEMV (FP8 S4's kernels), and every expert GEMV over an fp8
+/// bank (S4's too; the expert GEMM and the router over an fp8 bank launch). The
 /// routing kernel's Qwen program is instantiated at 256 only (its launcher refuses any other
 /// count), so such a tape is refused before anything is enqueued, rather than at its routing step.
 /// `None` for every other step.
@@ -633,14 +633,12 @@ fn not_launched(s: &CudaStep) -> Option<&'static str> {
             kernel: GateUpKernel::GemvFp8,
             ..
         }) => return Some("an fp8 GEMV, whose S4 kernel is not built yet"),
-        CudaStep::RouterLogits(RouterLogitsBf16 { weight, .. })
-        | CudaStep::ExpertGemm(ExpertGemmBf16 { weight, .. })
-        | CudaStep::ExpertGemv(ExpertGemvBf16 { weight, .. })
+        CudaStep::ExpertGemv(ExpertGemvBf16 { weight, .. })
         | CudaStep::ExpertGateUpAct(ExpertGateUpActBf16 {
             gate: ExpertGemvBf16 { weight, .. },
             ..
         }) if matches!(weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own) => {
-            return Some("an fp8 expert step, whose pair rows the tape does not quantize yet");
+            return Some("an fp8 expert GEMV, whose S4 kernel is not built yet");
         }
         _ => {}
     }
@@ -2490,6 +2488,34 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         Some((b.cast_const(), rows))
     }
 
+    /// Expert 0's e4m3 `[n, k]` of `g`'s projection in its fp8 bank and its scale row, and the
+    /// rows of each expert's block (`fp8_moe_layout`: the fused gate and up `2·inter`, the down
+    /// `hidden`), or `None` on overflow or a bf16 bank.
+    fn fp8_expert_slab(
+        weights: &[DeviceBuffer],
+        g: &ExpertGemmBf16,
+    ) -> Option<(kernels::Fp8Operand, u32)> {
+        let router = match g.weight {
+            MoeWeight::Fp8Bundle => true,
+            MoeWeight::Fp8Own => false,
+            MoeWeight::Bundle | MoeWeight::Own => return None,
+        };
+        let l = fp8_moe_layout(g.experts, g.hidden, g.inter, router)?;
+        let (h, i) = (u64::from(g.hidden), u64::from(g.inter));
+        let (part, scale, rows) = match g.proj {
+            ExpertProjection::Gate => (l.experts.gate_up, l.gate_up_scale, 2 * g.inter),
+            ExpertProjection::Up => (
+                l.experts.gate_up + i * h,
+                l.gate_up_scale + i * 4,
+                2 * g.inter,
+            ),
+            ExpertProjection::Down => (l.experts.down, l.down_scale, g.hidden),
+        };
+        let w = weights[g.bundle.0 as usize].ptr();
+        let at = |o: u64| Some(w.wrapping_byte_add(usize::try_from(o).ok()?).cast_const());
+        Some(((at(part)?, at(scale)?), rows))
+    }
+
     /// Enqueue the grouped expert GEMM (`kernels::expert_gemm_tiled_bf16`) over the sorted rows at
     /// the step's expert count and column tile, B at [`ExpertProjection::slab`]'s part of the
     /// bundle or bank.
@@ -2500,6 +2526,30 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         stream: &Stream,
     ) -> Result<(), KernelError> {
         let (n, k) = g.n_k();
+        if let Some((a, rows, k)) = CudaStep::ExpertGemm(*g).quantized_input() {
+            let Some((b, expert_rows)) = Self::fp8_expert_slab(weights, g) else {
+                return Err(KernelError::MoeShape {
+                    kernel: "expert_gemm_fp8",
+                    dims: [g.max_tiles, n, k, 0],
+                });
+            };
+            // SAFETY: as the bf16 arm's below, with `a` the quant scratch's `rows*k` e4m3 bytes
+            // and `rows` f32 (`validate`), and the bank `fp8_moe_layout`'s bytes, expert 0's
+            // e4m3 block and scale row inside it.
+            return unsafe {
+                kernels::expert_gemm_fp8(
+                    (Self::fp8_rows(&slot, a, rows, k), b),
+                    (
+                        slot(g.offsets).cast_const(),
+                        slot(g.tile_expert).cast_const(),
+                    ),
+                    slot(g.c),
+                    (g.max_tiles, n, k, g.experts, expert_rows),
+                    g.n_tile,
+                    stream.0,
+                )
+            };
+        }
         let Some((b, expert_rows)) = Self::expert_slab(
             weights,
             (g.bundle, g.weight),

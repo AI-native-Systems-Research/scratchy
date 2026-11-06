@@ -1868,11 +1868,27 @@ impl CudaStep {
         }
     }
 
-    /// The input an fp8 GEMM of more than one row (or a group, or a gate/up pair of them) reads
-    /// quantized, `(a, m, k)`: lowered, `a` is its bf16 input, which the lowering quantizes
-    /// before it; on a tape, `a` is the quant scratch the [`Self::QuantRowsFp8`] before it wrote,
-    /// which [`quant_chain`] checks. `None` for every other step, the one-row GEMV included.
+    /// The input an fp8 GEMM of more than one row (or a group, or a gate/up pair of them, or an
+    /// expert GEMM over an fp8 bank: its sorted or activation rows) reads quantized, `(a, m, k)`:
+    /// lowered, `a` is its bf16 input, which the lowering quantizes before it; on a tape, `a` is
+    /// the quant scratch the [`Self::QuantRowsFp8`] before it wrote, which [`quant_chain`] checks.
+    /// `None` for every other step, the one-row GEMV included.
     pub const fn quantized_input(&self) -> Option<(ArenaOffset, u32, u32)> {
+        if let Self::ExpertGemm(
+            g @ ExpertGemmBf16 {
+                weight: MoeWeight::Fp8Bundle | MoeWeight::Fp8Own,
+                ..
+            },
+        ) = *self
+        {
+            let rows = g
+                .max_tiles
+                .checked_mul(crate::op_abi::CUDA_EXPERT_TILE_ROWS);
+            return match rows {
+                Some(rows) => Some((g.a, rows, g.n_k().1)),
+                None => None,
+            };
+        }
         let g = match *self {
             Self::GemmFp8(g) | Self::GemmCol64Fp8(g) | Self::GemmNarrowFp8(g) => g,
             Self::GemmGroupFp8(g) | Self::GemmNarrowGroupFp8(g) => g.member(g.first),
@@ -2472,8 +2488,19 @@ impl CudaStep {
             Self::ExpertGemm(g) => {
                 let rows = g.max_tiles as u64 * crate::op_abi::CUDA_EXPERT_TILE_ROWS as u64;
                 let (n, k) = g.n_k();
+                // An fp8 bank's rows are the quantized ones, e4m3 then their scales.
+                let ab = match self.quantized_input() {
+                    Some((a, rows, cols)) => QuantRowsFp8 {
+                        x: a,
+                        q: a,
+                        rows,
+                        cols,
+                    }
+                    .bytes(),
+                    None => (rows * k as u64).checked_mul(CUDA_ACT_BYTES),
+                };
                 let (Some(ab), Some(cb), Some(bu)) = (
-                    (rows * k as u64).checked_mul(CUDA_ACT_BYTES),
+                    ab,
                     (rows * n as u64).checked_mul(CUDA_ACT_BYTES),
                     g.weight.experts(g.experts, g.hidden, g.inter),
                 ) else {

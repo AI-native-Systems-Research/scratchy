@@ -1964,6 +1964,18 @@ impl CudaTape {
         let Some(&span) = touched else {
             return Ok(());
         };
+        // The quant write before an fp8 expert GEMM reads that GEMM's input rows (inside the
+        // sorted or the activation rows) and writes the quant scratch; `check_moe_step` checks
+        // the rows are the GEMM's.
+        if let (CudaStep::QuantRowsFp8(_), Some(moe), Some(read)) = (s, self.moe, e.reads[0]) {
+            let rows = [moe.sort.map(|t| t.rows), Some(moe.act)];
+            let inside = |r: &Option<ArenaSpan>| {
+                r.is_some_and(|r| r.offset == read.offset && read.bytes <= r.bytes)
+            };
+            if rows.iter().any(inside) && !overlap(e.writes, scratch) {
+                return Ok(());
+            }
+        }
         if let (
             CudaStep::SiluMul(SiluMulBf16 { gate, up, out, .. })
             | CudaStep::GeluMul(SiluMulBf16 { gate, up, out, .. }),
@@ -2095,6 +2107,21 @@ impl CudaTape {
                 want(Region::MoeOffsets, offsets, sort.offsets)?;
                 want(Region::MoeTileExpert, tile_expert, sort.tile_expert)?;
                 let (input, output) = moe.projection_regions(g.proj, Some(sort.rows));
+                // An fp8 bank's GEMM reads the quant scratch (`quant_region`), which the last
+                // quant write before it filled from the projection's input rows.
+                let last = (self.steps[..step].iter().rev()).find_map(|p| match *p {
+                    CudaStep::QuantRowsFp8(q) => Some(q),
+                    _ => None,
+                });
+                let a = match (s.quantized_input(), last) {
+                    (None, _) => a,
+                    (Some(_), Some(q)) => q.x,
+                    (Some(_), None) => {
+                        return Err(TapeError::QuantChain {
+                            error: QuantChainError::Unquantized { step },
+                        });
+                    }
+                };
                 want(input.0, a, input.1)?;
                 want(output.0, c, output.1)
             }

@@ -1654,7 +1654,8 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
 }
 
 /// The fp8 GEMMs of more than one row, each reading its quantized input (FP8 S2, §1c): before each
-/// one (a grouped launch or a gate/up pair once), a [`QuantRowsFp8`] of its bf16 input into the
+/// one (a grouped launch, a gate/up pair once, or an expert GEMM over an fp8 bank, all its sorted
+/// or activation rows), a [`QuantRowsFp8`] of its bf16 input into the
 /// quant scratch, which the GEMM then reads in place of that input. The scratch is one region at
 /// the arena's end (`total`), the largest quant write's bytes; its liveness is checked
 /// ([`quant_chain`]). Returns the steps and the arena's new end; a tape with no such GEMM is as
@@ -1667,17 +1668,29 @@ fn quantize_fp8_inputs(
     let too_large = || CanonicalRefusal::Arena(ArenaRefusal::TooLarge);
     let mut out = Vec::with_capacity(steps.len());
     let mut most = 0u64;
+    let mut last: Option<QuantRowsFp8> = None;
     for mut s in steps {
         if let Some((x, rows, cols)) = s.quantized_input() {
             let quant = QuantRowsFp8 { x, q, rows, cols };
             most = most.max(quant.bytes().ok_or_else(too_large)?);
-            out.push(CudaStep::QuantRowsFp8(quant));
+            // An expert up GEMM reads the rows its gate GEMM, the step before, read quantized: the
+            // gate writes neither those rows nor the scratch, so one quant write serves both.
+            let shared = matches!(
+                (out.last(), last),
+                (Some(p @ CudaStep::ExpertGemm(_)), Some(l))
+                    if l == quant && p.quantized_input() == Some((q, rows, cols))
+            );
+            if !shared {
+                out.push(CudaStep::QuantRowsFp8(quant));
+            }
+            last = Some(quant);
             match &mut s {
                 CudaStep::GemmFp8(g) | CudaStep::GemmCol64Fp8(g) | CudaStep::GemmNarrowFp8(g) => {
                     g.a = q
                 }
                 CudaStep::GemmGroupFp8(g) | CudaStep::GemmNarrowGroupFp8(g) => g.a = q,
                 CudaStep::GateUpAct(g) => (g.gate.a, g.up.a) = (q, q),
+                CudaStep::ExpertGemm(g) => g.a = q,
                 _ => unreachable!("`quantized_input` names only the fp8 GEMMs it reads"),
             }
         }
