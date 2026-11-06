@@ -4519,17 +4519,42 @@ impl ModelDims {
                     let kind = format_ident!("{}", format!("K{:?}", bundle.kind));
                     break 'def quote!(#w::Wb<#w::#kind, (#(#roles,)*), #layer>);
                 }
-                if !matches!(
-                    first.kind,
+                // Every kind, by name: a new `WeightKind` is a compile error here, not a panic in
+                // someone's build.
+                match first.kind {
+                    // Held by the shape handles below (`W1`, `W2`, `Q2`).
                     WeightKind::Linear
-                        | WeightKind::Embedding
-                        | WeightKind::AffineQuantEmbedding
-                        | WeightKind::RmsNorm
-                        | WeightKind::LayerNorm
-                        | WeightKind::Tensor
-                        | WeightKind::AttnSinks
-                ) {
-                    return Err(untypable("no handle type holds its kind"));
+                    // An fp8 per-channel linear (`Fp8AnyLinear`): `[in, out]` with no affine codes,
+                    // so the dense rank-2 handle (`W2`) holds it.
+                    | WeightKind::Fp8
+                    | WeightKind::Embedding
+                    | WeightKind::AffineQuantEmbedding
+                    | WeightKind::RmsNorm
+                    | WeightKind::LayerNorm
+                    | WeightKind::Tensor
+                    | WeightKind::AttnSinks => {}
+                    // Read whole as bundles: the bundle arm above holds them. Reaching here means
+                    // the bundle table did not name this field.
+                    WeightKind::FusedMoe
+                    | WeightKind::SharedFusedMoe
+                    | WeightKind::GemmaRouter
+                    | WeightKind::GemmaSwitchGlu
+                    | WeightKind::GptOssMoe
+                    | WeightKind::GatedDeltaNet => {
+                        return Err(untypable("a bundle kind the bundle table did not name"));
+                    }
+                    // No tape produces these as a struct field today: the tape's kinds are
+                    // `weight_bindings::kind_of`'s, which names none of them (a gemm is Linear,
+                    // Fp8 or an affine Linear; the rotary is no field). A producer that starts to
+                    // emit one gives it a handle here first.
+                    WeightKind::Marlin
+                    | WeightKind::Bnb4
+                    | WeightKind::DeepSeekMoe
+                    | WeightKind::DeepSeekMoeFp8
+                    | WeightKind::DeepSeekMoeGgml
+                    | WeightKind::CosSin => {
+                        return Err(untypable("no tape produces this kind as a field yet"));
+                    }
                 }
                 let Some(shapes) = (ids.iter())
                     .map(|id| inferred.weights.get(id))
