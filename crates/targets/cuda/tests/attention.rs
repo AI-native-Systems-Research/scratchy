@@ -11,6 +11,7 @@
 // `pub`: each test binary uses a different part of `common`, and nothing in it is dead code.
 pub mod common {
     pub mod numerics;
+    pub mod watchdog;
 }
 
 use common::numerics::{
@@ -43,6 +44,7 @@ const SENTINEL: u16 = 0xFFFF;
 const POISON: u16 = 0x7FC1;
 
 fn h100() -> CudaDevice {
+    common::watchdog::arm();
     CudaDevice::open()
         .unwrap_or_else(|e| panic!("the `nvcc` feature's tests need an sm_90 GPU (H100): {e}"))
 }

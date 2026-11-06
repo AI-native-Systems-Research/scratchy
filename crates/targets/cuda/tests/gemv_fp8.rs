@@ -14,6 +14,7 @@
 pub mod common {
     pub mod fp8;
     pub mod numerics;
+    pub mod watchdog;
 }
 
 use std::ffi::c_void;
@@ -34,6 +35,7 @@ const SENTINEL: u16 = 0xFFFF;
 const TAIL: usize = 4096;
 
 fn h100() -> CudaDevice {
+    common::watchdog::arm();
     CudaDevice::open()
         .unwrap_or_else(|e| panic!("the `nvcc` feature's tests need an sm_90 GPU (H100): {e}"))
 }
