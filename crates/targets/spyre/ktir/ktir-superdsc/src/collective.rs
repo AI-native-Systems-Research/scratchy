@@ -86,7 +86,16 @@ const _: () = assert!(
 ///
 /// Its one implementor is [`TpWorld<N>`]; a build selects exactly one.
 pub trait Tp:
-    Copy + Clone + core::fmt::Debug + PartialEq + Eq + core::hash::Hash + Send + Sync + 'static
+    Copy
+    + Clone
+    + Default
+    + core::fmt::Debug
+    + PartialEq
+    + Eq
+    + core::hash::Hash
+    + Send
+    + Sync
+    + 'static
 {
     /// The rank count.
     const RANKS: u32;
@@ -130,7 +139,7 @@ pub trait Tp:
 /// use ktir_superdsc::collective::{Tp, TpWorld};
 /// assert_eq!(<TpWorld<8> as Tp>::MESSAGES_PER_CUT, 4);
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TpWorld<const N: u32>;
 
 impl<const N: u32> Tp for TpWorld<N> {
@@ -408,7 +417,7 @@ impl<T: Tp> CutPayload<T> {
 /// every bundle of a forward (prefill, decode, every rung), so a send baked into one bundle and the
 /// consume baked into another always name the same bytes.
 ///
-/// It lives in the weight segment ([`RecvWindow::SEGMENT`]), the one process-shared,
+/// It lives in the weight segment ([`WINDOW_SEGMENT`]), the one process-shared,
 /// placement-stable segment, above the packed weights: [`WINDOW_CUTS`] equal, adjacent cuts, each
 /// ONE BLOCK PER RANK of the world, each block [`RecvWindow::block_bytes_for`] the forward's widest
 /// collective operand — never one bundle's own need. Rank `s`'s fragment lands in block `s` on
@@ -422,10 +431,10 @@ pub struct RecvWindow<T: Tp> {
     world: core::marker::PhantomData<T>,
 }
 
-impl<T: Tp> RecvWindow<T> {
-    /// The weight segment (seg1).
-    pub const SEGMENT: u32 = 1;
+/// The segment every world's receive window lives in: the weight segment (seg1).
+pub const WINDOW_SEGMENT: u32 = 1;
 
+impl<T: Tp> RecvWindow<T> {
     /// The window at `offset`, of [`WINDOW_CUTS`] cuts of one `block`-byte block per rank. `Some`
     /// iff `offset` is flit-aligned and a block is at most the world's messages per cut — a slot
     /// each.
