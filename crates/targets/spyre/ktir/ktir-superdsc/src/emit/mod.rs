@@ -3047,51 +3047,26 @@ fn rewrite_op_for_time_tile(
     //     trip reads its own out-window of that row (pinned: the mb operand's trip-start
     //     advances; a strideless ranging operand is the 2b guard's build Err).
     for (ti, v) in views.iter().enumerate() {
-        // ── 2a. THE SEEDED REDUCE'S ACCUM — THE PARTIALS LAW (#603) ─────────────────
-        // A seeded reduce that time-tiles writes each trip's partial into its OWN stick
-        // of a multi-stick accum buffer, NEVER the same one-stick accum twice: the RedStick
-        // scale exempts the accum from the tiled predicate below (its collapsed one-stick
-        // coordinate is correct as written), so without a stride of its own both trips
-        // would write the SAME HBM byte — the silently-wrong alias the bake's
-        // `tiled_trips_alias` guard refuses, and the exact collision gemma-4's 262144-wide
-        // max32 produced under the old over-charge. No generic builder emits that form
-        // any more — the single-trip row is the only seeded form — so a time-tiled seeded
-        // reduce whose accum is a plain single stick is a build Err naming the law: the
-        // alternative is the alias, caught here at the emission rather than at the bake.
-        if op.is_reduction
-            && !v.allocation.is_lx()
-            && v.layout
-                .iter()
-                .position(|&d| d == tiled_dim)
-                .is_some_and(|si| matches!(v.scale.get(si), Some(Scale::RedStick)))
-        {
-            let si = v.layout.iter().position(|&d| d == tiled_dim).unwrap();
-            let one_stick = v.df.elems_per_stick() as i64;
-            let want_sticks = time as i64 * one_stick;
-            let phys = v.device_extent.get(si).copied().flatten();
-            if phys.map(|p| p as i64) != Some(want_sticks) {
-                return Err(SuperDscError(format!(
-                    "{op_name}: a SEEDED reduce time-tiled {time}× whose accum '{}' is not in \
-                     the partials form — its device extent along '{tiled_dim}' is {phys:?}, and \
-                     the law demands EXACTLY one stick per trip ({want_sticks} elems at {}). \
-                     Without it, every trip writes the SAME one-stick accum (the #50 \
-                     `tiled_trips_alias` alias). The single-trip row is the only seeded form \
-                     this emitter has: let the row fit a single trip (the true accum charge \
-                     bills the accum at one stick per row), or split the reduce yourself — \
-                     per-slice single-shot reduces plus a combine, the fp8 qspt path's own \
-                     pattern (emit/ktir_matmul_fp8.rs).",
-                    v.name,
-                    v.df.elems_per_stick(),
-                )));
-            }
-            // ONE-STICK per-trip advance, and the accum's coordinate stays the collapsed
-            // one-stick fold `build_coordinates` wrote — divide NOTHING (the code below is
-            // the tiled-DATA path; the accum is not a tiled data operand).
-            let mut sm = BTreeMap::new();
-            sm.insert(tiled_dim, one_stick * v.df.word_length() as i64);
-            affine_strides[ti] = sm;
-            continue;
-        }
+        // ── 2a. THE SEEDED REDUCE'S ACCUM — DELETED, AND THE WIRING THAT KILLED IT ─────
+        // This loop once opened with a partials-law arm: a seeded reduce that time-tiles
+        // must write each trip's partial into its OWN stick of a multi-stick accum, and a
+        // time-tiled seeded reduce whose accum was a plain single stick was a build `Err`
+        // here (the #50 `tiled_trips_alias` alias, caught at the emission). The arm is
+        // deleted because NO PRODUCTION PATH EMITS A TIME-TILED SEEDED REDUCE ANY MORE —
+        // every feeder now splits BEFORE the emitter, each with its own combine law:
+        //   * the KTIR doors (`lower_ktir_to_superdsc::reduce` / `reduce_df`) and the
+        //     rmsnorm chain (`assemble_rmsnorm`/`_unit`, the windowed `rmsnorm_at`) go
+        //     through `assemble_reduce_split` — `time` single-shot slice reduces plus
+        //     `time − 1` running combines, each slice single-trip by construction;
+        //   * the fp8 `quantscalepertokenfp8` site (emit/ktir_matmul_fp8.rs) asks the
+        //     tiler first and emits its OWN partials+`maximum` remedy when `time > 1`
+        //     (the monotone-commutation fold, that file's own proof), the single fused
+        //     reduce only at `time == 1` or a spatial split.
+        // The backstop stands: should a future builder hand this emitter a time-tiled
+        // seeded reduce anyway, the RedStick scale leaves its accum outside the tiled
+        // predicate below (no per-trip stride), both trips write the SAME one-stick accum,
+        // and the bake's `tiled_trips_alias` guard refuses it — one rung later, still a
+        // build-time refusal, never a silently-wrong descriptor on the card.
         let tiled = !v.allocation.is_lx()
             && v.layout
                 .iter()
