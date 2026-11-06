@@ -4522,6 +4522,9 @@ impl ModelDims {
                 if !matches!(
                     first.kind,
                     WeightKind::Linear
+                        // An fp8 per-channel linear (`Fp8AnyLinear`): `[in, out]` with no affine
+                        // codes, so the dense rank-2 handle (`W2`) holds it.
+                        | WeightKind::Fp8
                         | WeightKind::Embedding
                         | WeightKind::AffineQuantEmbedding
                         | WeightKind::RmsNorm

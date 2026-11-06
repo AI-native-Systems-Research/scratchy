@@ -594,6 +594,14 @@ pub enum Fp8AnyLinear {
     Block(Fp8BlockLinear),
 }
 
+/// An fp8 linear's declared shape is `[in, out]` (the DSL's `W2<K, N>`), whichever scale layout
+/// it holds: its handle is the dense rank-2 one, since it carries no MLX-affine codes.
+impl scratchy_tensors::typed::Extents<2> for Fp8AnyLinear {
+    fn extents(&self) -> [usize; 2] {
+        [self.in_features(), self.out_features()]
+    }
+}
+
 impl Fp8AnyLinear {
     pub fn out_features(&self) -> usize {
         match self {

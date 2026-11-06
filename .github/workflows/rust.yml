@@ -82,6 +82,12 @@ jobs:
           --exclude scratchy-target-metal-compiler
           -- -D warnings
 
+      # The same model under its fp8 preset (`fp8-dynamic-per-channel`): the weights
+      # struct's typed handles must cover an fp8 linear too, or every fp8 build panics
+      # at expansion. One model, the expansion only.
+      - name: Check the fp8 preset expands
+        run: cargo check -p scratchy-models --features spyre,granite-3.1-8b-instruct,scratchy-quantizations/fp8-dynamic-per-channel
+
       # e_otel.rs, which needs `otel` and runs on any backend, type-checked
       # and linted: the macOS e2e step builds without `otel`. Here rather than
       # on macOS, whose tests job is the longer one. Under spyre, the backend
