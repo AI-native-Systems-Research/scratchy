@@ -227,6 +227,7 @@ fn borrow_earlier(runs: &mut [Run]) {
             // And drawn the same way: a run that samples all of MuSiQue's hops asks other tasks
             // than one that took its first 200.
             let drawn = task_sample(&run.config);
+            let accuracy_tasks = (run.config.scaling.as_ref()).and_then(|s| s.accuracy_tasks);
             for e in Engine::RIVALS {
                 let Some(slot) = e.tasks_mut(m) else { continue };
                 let key = (at.0.clone(), at.1.clone(), e.key());
@@ -255,10 +256,15 @@ fn borrow_earlier(runs: &mut [Run]) {
                             continue;
                         };
                         // A MuSiQue cell only from a run that drew its tasks the same way; every
-                        // other workload's tasks are as they were.
+                        // other workload's tasks are as they were. The accuracy cell is sized
+                        // apart from the rounds: as many tasks as this run's asked, by the count
+                        // the lent cell recorded.
                         let same_tasks = |c: &data::TaskCell| {
                             (!sampled_from_musique(&c.workload) || *lent_drawn == drawn)
                                 && match (sizing, *theirs) {
+                                    _ if c.workload == "rag-accuracy" => {
+                                        c.num_tasks.is_some() && c.num_tasks == accuracy_tasks
+                                    }
                                     (Some(a), Some(b)) => {
                                         a.count(&c.workload, c.conc)
                                             == b.count(&c.workload, c.conc)
@@ -4566,6 +4572,39 @@ mod tests {
             changed.contains("sharegpt") && changed.contains("sharegpt-multi-turn"),
             "ShareGPT's tasks did not change: {changed:?}"
         );
+    }
+
+    /// An accuracy cell is borrowed only from a run that asked as many of its tasks: a quick
+    /// run's 100 are not a full run's 400, though both are sampled the same way. A run sizes it
+    /// apart from the others (`accuracy_tasks`), not by its rounds.
+    #[test]
+    fn an_accuracy_cell_is_borrowed_only_at_its_own_size() {
+        use super::data::Run;
+        use super::numbers::Engine;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let with_accuracy = |n: u32, when: &str, rival: bool| -> Run {
+            let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            v["generated_utc"] = when.into();
+            v["config"]["scaling"]["accuracy_tasks"] = n.into();
+            let cell = serde_json::json!({"workload": "rag-accuracy", "conc": 4, "completed": n,
+                "num_tasks": n, "accuracy": 0.5, "median_ttft_ms": 100.0});
+            v["models"][0]["tasks"] = serde_json::json!([cell.clone()]);
+            if rival {
+                v["models"][0]["tasks_omlx_tq"] = serde_json::json!([cell]);
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        for (quick, borrowed) in [(400, true), (100, false)] {
+            let full = with_accuracy(400, "2026-10-24T12:00:00Z", true);
+            let mut runs = vec![with_accuracy(quick, "2026-10-26T12:00:00Z", false), full];
+            super::borrow_earlier(&mut runs);
+            let lent = !Engine::OmlxTq.tasks(&runs[0].models[0]).is_empty();
+            assert_eq!(lent, borrowed, "a run of {quick} against one of 400");
+        }
     }
 
     /// A MuSiQue timeline does not join runs that drew its tasks differently: a change of questions

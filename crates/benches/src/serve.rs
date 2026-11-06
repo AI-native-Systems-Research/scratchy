@@ -1829,7 +1829,7 @@ fn run_tasks(
         .collect();
     let mut json = task_metrics(&results, &tasks, &count, total_time, &dataset, args.seed);
     add_task_percentiles(&mut json, &results, &tasks, &count, &pcts);
-    add_task_requests(&mut json, &results, args.request_rate);
+    add_task_requests(&mut json, &results, args.request_rate, &count);
     // Forced answers are no reading of accuracy, and every one ran to its length by design.
     json["timed_answers"] = serde_json::json!(args.timed_answers);
     if args.timed_answers {
@@ -2060,8 +2060,14 @@ fn add_task_percentiles(
 /// Each request's send time (seconds from the cell's start), TTFT and end-to-end time, in
 /// request order, ms rounded to 0.1; null where it failed. The send times tell an arrival's effect
 /// from the engine's: a closed loop's users fall into lockstep and arrive in bursts, an open
-/// loop's on its schedule. Also the cell's offered rate (null for `inf`, a closed loop).
-fn add_task_requests(json: &mut serde_json::Value, results: &[RequestResult], rate: f64) {
+/// loop's on its schedule. Each request's prompt tokens and time per output token too, so a cell
+/// can be read by prompt length. Also the cell's offered rate (null for `inf`, a closed loop).
+fn add_task_requests(
+    json: &mut serde_json::Value,
+    results: &[RequestResult],
+    rate: f64,
+    count_tokens: &dyn Fn(&str) -> usize,
+) {
     let ms = |v: f64| (v * 10_000.0).round() / 10.0;
     let ok = |r: &RequestResult, v: f64| r.success.then(|| ms(v));
     json["request_rate"] = serde_json::json!(rate.is_finite().then_some(rate));
@@ -2073,6 +2079,21 @@ fn add_task_requests(json: &mut serde_json::Value, results: &[RequestResult], ra
     );
     json["ttfts_ms"] = serde_json::json!(results.iter().map(|r| ok(r, r.ttft)).collect::<Vec<_>>());
     json["e2els_ms"] = serde_json::json!(results.iter().map(|r| ok(r, r.e2el)).collect::<Vec<_>>());
+    // Each request's prompt, as the server counted it, and its decode: so the cell can be read by
+    // prompt length. None where it failed, sent no count, or answered a single token.
+    json["prompt_tokens"] = serde_json::json!(
+        (results.iter())
+            .map(|r| r.prompt_tokens.filter(|_| r.success))
+            .collect::<Vec<_>>()
+    );
+    json["tpots_ms"] = serde_json::json!(
+        (results.iter())
+            .map(|r| {
+                let n = answer_tokens(r, count_tokens);
+                (r.success && n > 1).then(|| ms((r.e2el - r.ttft) / (n - 1) as f64))
+            })
+            .collect::<Vec<_>>()
+    );
 }
 
 /// Whether an answer opens as reasoning rather than the answer: a think tag, or the openings the
@@ -2456,14 +2477,37 @@ mod tests {
         ok.start_time = 0.25;
         let failed = RequestResult::failed(1.5, 2.0, "boom".into());
         let mut j = serde_json::json!({});
-        add_task_requests(&mut j, &[ok, failed], 2.0);
+        add_task_requests(&mut j, &[ok, failed], 2.0, &|_| 0);
         assert_eq!(j["request_rate"], 2.0);
         assert_eq!(j["start_times"], serde_json::json!([0.25, 1.5]));
         assert_eq!(j["ttfts_ms"], serde_json::json!([100.0, null]));
         assert_eq!(j["e2els_ms"], serde_json::json!([500.0, null]));
         let mut closed = serde_json::json!({});
-        add_task_requests(&mut closed, &[], f64::INFINITY);
+        add_task_requests(&mut closed, &[], f64::INFINITY, &|_| 0);
         assert!(closed["request_rate"].is_null(), "inf is a closed loop");
+    }
+
+    /// A cell keeps each request's prompt tokens, as the server counted them, and its time per
+    /// output token: so its requests can be read by prompt length, its prefill and decode alike.
+    /// None where a request failed, sent no count, or answered one token.
+    #[test]
+    fn a_cell_keeps_each_requests_prompt_length_and_decode() {
+        let words = |t: &str| t.split_whitespace().count();
+        // 5 tokens, 100 ms to the first, 500 ms in all: 100 ms each of the other 4.
+        let mut ok = req(5, 5, 0.1, 0.5);
+        ok.prompt_tokens = Some(1800);
+        // A span answer: no usage, so its 3 tokens come from its text.
+        let mut span = req(0, 1, 0.2, 0.4);
+        span.generated_text = "a b c".into();
+        let one = req(1, 1, 0.1, 0.1);
+        let failed = RequestResult::failed(1.5, 2.0, "boom".into());
+        let mut j = serde_json::json!({});
+        add_task_requests(&mut j, &[ok, span, one, failed], f64::INFINITY, &words);
+        assert_eq!(
+            j["prompt_tokens"],
+            serde_json::json!([1800, null, null, null])
+        );
+        assert_eq!(j["tpots_ms"], serde_json::json!([100.0, 100.0, null, null]));
     }
 
     /// A labelled task's result is recorded task by task, in the order sent, with its id, its

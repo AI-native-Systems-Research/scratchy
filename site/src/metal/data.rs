@@ -355,6 +355,10 @@ pub struct Scaling {
     /// questions, easier ones, so neither borrowed from nor joined to a run that samples the whole.
     #[serde(default)]
     pub task_sample: Option<String>,
+    /// How many tasks its accuracy cell (`rag-accuracy`) asked, sized apart from the others' rounds:
+    /// None in runs from before, and where it ran none.
+    #[serde(default)]
+    pub accuracy_tasks: Option<u32>,
 }
 
 impl Scaling {
