@@ -32,7 +32,7 @@ pub fn workload_label(w: &str) -> (&'static str, &'static str) {
         "shared-prefix-control" => ("Shared prompt, no reuse", "the same, every prompt its own"),
         "rag-accuracy" => (
             "RAG accuracy",
-            "a full run's RAG over more tasks, for its accuracy alone",
+            "RAG over more tasks, for its accuracy alone: 100 on a quick run, 400 or the whole dev set on a full one",
         ),
         _ => ("dataset", ""),
     }
