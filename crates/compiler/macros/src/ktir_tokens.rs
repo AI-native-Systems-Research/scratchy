@@ -522,6 +522,11 @@ fn synth_role_tokens(
             let j = proc_macro2::Literal::u32_unsuffixed(j);
             quote! { #path::FqAmaxP(#j) }
         }
+        // The long-reduce partial slot — indexed like the four above, same reason.
+        R::ReducePartial(j) => {
+            let j = proc_macro2::Literal::u32_unsuffixed(j);
+            quote! { #path::ReducePartial(#j) }
+        }
         R::GatherKtLx(i) => {
             let i = proc_macro2::Literal::u32_unsuffixed(i);
             quote! { #path::GatherKtLx(#i) }

@@ -1389,10 +1389,16 @@ impl StickLayout {
     }
     /// A FLAT row-major `[rows, cols]` tensor (stick NOT on the last re-tiled dim). fp16.
     pub fn flat(rows: usize, cols: usize) -> Self {
+        Self::flat_df(rows, cols, Df::Fp16)
+    }
+    /// [`flat`](Self::flat) with an EXPLICIT device format — the fp32 flat data/accum the
+    /// long-reduce split's partial handles declare (a partial carries the reduce's own df,
+    /// never the fp16 the un-parameterised door hardcodes).
+    pub(crate) fn flat_df(rows: usize, cols: usize, df: Df) -> Self {
         StickLayout {
             rows,
             cols,
-            df: Df::Fp16,
+            df,
             kind: StickKind::Flat,
         }
     }
