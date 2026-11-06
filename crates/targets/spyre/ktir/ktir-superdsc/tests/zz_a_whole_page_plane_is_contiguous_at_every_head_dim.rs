@@ -67,7 +67,7 @@ fn plane_addrs(pool: &PagedKvPool, plane: KvPlane) -> Vec<u32> {
     for h in 0..pool.nkvh as u32 {
         let kvh = KvHead::new(h, nkvh).expect("kv head in range");
         for slot in 0..PagedKvPool::POOL_PAGE_SLOTS.get() {
-            for feat in 0..pool.hd as u32 {
+            for feat in 0..pool.head_width().get() {
                 out.push(
                     pool.addr(
                         KvCoord::block(plane, kvh)

@@ -949,32 +949,41 @@ const _: () = assert!(
 pub struct HeadWidth(NonZeroU32);
 
 impl HeadWidth {
-    /// The ONLY constructor: a head width, refused unless it is a whole number of the pool's
-    /// fp16 sticks — a head never straddles a stick boundary. `const`, so a const context
-    /// (the bake, a `static` tape) gets the refusal as a BUILD ERROR, which is the only time
-    /// this fact exists to be checked.
+    /// ⭐ THE LAW, WRITTEN ONCE: a head width is admitted iff it is a whole number of the pool's
+    /// fp16 sticks — a head never straddles a stick boundary. Every door reads this fn and
+    /// none restates the check.
+    pub const fn try_whole_sticks(hd: u32) -> Option<Self> {
+        match (hd.is_multiple_of(POOL_STICK), NonZeroU32::new(hd)) {
+            (true, Some(nz)) => Some(Self(nz)),
+            _ => None,
+        }
+    }
+
+    /// The const door over [`Self::try_whole_sticks`]: the refusal is a literal panic (a const
+    /// fn cannot format), so a const context — the bake, a `static` tape — gets it as a BUILD
+    /// ERROR, which is the only time this fact exists to be checked.
     pub const fn of_whole_sticks(hd: u32) -> Self {
-        match NonZeroU32::new(hd) {
-            Some(nz) if hd % POOL_STICK == 0 => Self(nz),
-            _ => panic!(
+        match Self::try_whole_sticks(hd) {
+            Some(w) => w,
+            None => panic!(
                 "HeadWidth: a head is a whole number of fp16 sticks — a width that straddles a \
                  stick boundary has no emit form"
             ),
         }
     }
 
-    /// The bake-time door over the SAME law: [`Self::of_whole_sticks`] for a value that arrives
-    /// at expansion time, where the panic can NAME the width and the model it came from (a const
-    /// fn's panic is a literal — const fns cannot format). This is the one door the `#[forward]`
-    /// bake reads; a model whose head_dim is not whole sticks is a BUILD ERROR, not a runtime
-    /// refusal.
+    /// The bake-time door over [`Self::try_whole_sticks`]: for a value that arrives at expansion
+    /// time, where the panic can NAME the width and the model it came from. This is the one door
+    /// the `#[forward]` bake reads; a model whose head_dim is not whole sticks is a BUILD ERROR,
+    /// not a runtime refusal.
     pub fn of_whole_sticks_at_bake(hd: u32, model: &str) -> Self {
-        assert!(
-            hd != 0 && hd % POOL_STICK == 0,
-            "{model}: head_dim {hd} is not a whole number of fp16 sticks ({POOL_STICK} lanes) — \
-             a head that straddles a stick boundary has no emit form"
-        );
-        Self(NonZeroU32::new(hd).expect("checked above"))
+        match Self::try_whole_sticks(hd) {
+            Some(w) => w,
+            None => panic!(
+                "{model}: head_dim {hd} is not a whole number of fp16 sticks ({POOL_STICK} lanes) \
+                 — a head that straddles a stick boundary has no emit form"
+            ),
+        }
     }
 
     /// The width, in elements.
@@ -4674,7 +4683,10 @@ pub struct PhysPage(pub u32);
 pub struct PagedKvPool {
     /// DISTINCT kv heads — a query head reads its group's plane via [`gqa_kv_head`].
     pub nkvh: usize,
-    pub hd: usize,
+    /// ⭐ THE HEAD WIDTH, AS A TYPE — minted once, in this pool's own constructor: whole sticks
+    /// by construction, so no reader re-mints (or re-checks) it. [`Self::head_width`] is the
+    /// typed reader; [`Self::hd`] keeps the usize spelling for the host's byte arithmetic.
+    hd: HeadWidth,
 }
 
 // ⛔⛔⛔ THE LADDER MUST SERVE EVERY BATCH THE POOL WILL ADMIT — OR THE HOST SILENTLY DECODES GARBAGE.
@@ -5279,7 +5291,10 @@ impl PagedKvPool {
     // artifact-derived pmask ceiling, enforced per launch.
 
     pub fn new(nkvh: usize, hd: usize) -> PagedKvPool {
-        PagedKvPool { nkvh, hd }
+        PagedKvPool {
+            nkvh,
+            hd: HeadWidth::of_whole_sticks(hd as u32),
+        }
     }
 
     /// ELEMENTS BETWEEN TWO REQUESTS' KV, in any plane of any page+layer — the stride a batched
@@ -5314,7 +5329,7 @@ impl PagedKvPool {
         // `plane_extent()`, not `PLANE_SLOTS`: this is the PHYSICAL stride, and the addressable count is a
         // different quantity with the same value. The type is what stops the substitution.
         let (stk, pls) = (STK as u32, Self::plane_extent().get());
-        let hd = self.hd as u32;
+        let hd = self.hd.get();
         // ⚠️ PLANE-RELATIVE, deliberately. The emitter addresses each plane as its OWN NAMED TENSOR
         // (`kc`, `kct`, `vc`), so every offset a caller wants is WITHIN a plane — the plane base is
         // implicit in which tensor it names. An absolute address would be right only for a caller that
@@ -5439,7 +5454,7 @@ impl PagedKvPool {
         // that overrun on top of the next head's keys.
         // Physical, for the same reason: this is the distance to the NEXT KV HEAD, which is exactly what a padded
         // chunk write overruns.
-        self.hd * Self::plane_extent().get() as usize
+        self.hd() * Self::plane_extent().get() as usize
     }
 
     /// ⭐⭐⭐ THE GATHER'S QUANTUM — the ELEMENTS in one 64-slot Kᵗ block, `hd * POOL_STICK`.
@@ -5453,7 +5468,7 @@ impl PagedKvPool {
     /// gather stepping by it would skip three quarters of every head's keys and still bake.
     /// `the_pool_is_a_uniform_array_of_stick_blocks` holds the two apart.
     pub fn stick_block_elems(&self) -> usize {
-        self.hd * STK
+        self.hd() * STK
     }
 
     /// ⭐ THE ENTRY IN **BYTES** — what one index step advances the address by. `stick_block_elems`
@@ -5504,8 +5519,8 @@ impl PagedKvPool {
         // had run. At head_dim 128 block 0 was exact and every later block read one plane too far, so
         // attention was right over the first 64 cached slots and drifted from the 65th. The comment above
         // described this bug; it is now fixed rather than described.
-        (gqa_kv_head(qh, gqa) * Self::POOL_PAGE_SLOTS.as_usize() * self.hd) as u32
-            + b * STK as u32 * self.hd as u32
+        (gqa_kv_head(qh, gqa) * Self::POOL_PAGE_SLOTS.as_usize() * self.hd()) as u32
+            + b * STK as u32 * self.hd.get() as u32
     }
 
     /// Kᵀ WRITE offset of `K[slot][d]` within a page+layer — the consumer's own read model, so
@@ -5522,8 +5537,8 @@ impl PagedKvPool {
     /// ```
     pub fn kt_write_off(&self, kvh: usize, slot: usize, d: usize) -> usize {
         // The head's own block — no `ROWS` factor, because a page holds slots and not requests.
-        kvh * self.hd * Self::POOL_PAGE_SLOTS.as_usize()
-            + kcache_kt_write_offset(slot, d, self.hd, Self::POOL_PAGE_SLOTS.as_usize(), STK)
+        kvh * self.hd() * Self::POOL_PAGE_SLOTS.as_usize()
+            + kcache_kt_write_offset(slot, d, self.hd(), Self::POOL_PAGE_SLOTS.as_usize(), STK)
     }
 
     /// V WRITE offset of `V[slot][d]` within a page+layer. A `[1, hd]` row is CONTIGUOUS here, which
@@ -5538,13 +5553,19 @@ impl PagedKvPool {
     /// ```
     pub fn v_write_off(&self, kvh: usize, slot: usize, d: usize) -> usize {
         // The head's own block — no `ROWS` factor; a page holds slots, not requests.
-        kvh * Self::POOL_PAGE_SLOTS.as_usize() * self.hd
-            + vcache_write_offset(slot, d, self.hd, Self::POOL_PAGE_SLOTS.as_usize(), STK)
+        kvh * Self::POOL_PAGE_SLOTS.as_usize() * self.hd()
+            + vcache_write_offset(slot, d, self.hd(), Self::POOL_PAGE_SLOTS.as_usize(), STK)
     }
 
-    /// Head width this pool laid itself out for.
-    pub(crate) fn hd(&self) -> usize {
+    /// Head width this pool laid itself out for, AS THE TYPE — the one value every reader
+    /// takes; no use site re-mints it.
+    pub fn head_width(&self) -> HeadWidth {
         self.hd
+    }
+
+    /// Head width this pool laid itself out for, in elements — the host's byte arithmetic.
+    pub(crate) fn hd(&self) -> usize {
+        self.hd.get() as usize
     }
 }
 
@@ -6007,17 +6028,17 @@ const _: () = assert!(
 );
 
 impl PagePlaneExtent {
-    /// The extent of one `(request, page)` plane, or `None` on a degenerate geometry. The head width
-    /// is minted through [`HeadWidth::of_whole_sticks`], so a part-stick head dim — which has no
-    /// stick-block entry at all — is refused by the constructor itself, not re-checked here.
+    /// The extent of one `(request, page)` plane, or `None` on a degenerate head count. The
+    /// width arrives as the pool's own [`HeadWidth`] ([`PagedKvPool::head_width`]) — nonzero and
+    /// whole sticks by that type's law, so there is no width check here at all: a part-stick
+    /// head dim is refused at the pool's constructor, where the raw width first appears.
     pub const fn of_pool(pool: PagedKvPool) -> Option<Self> {
-        let (nkvh, hd) = (pool.nkvh as u32, pool.hd as u32);
-        if nkvh == 0 || hd == 0 {
+        if pool.nkvh == 0 {
             return None;
         }
         Some(PagePlaneExtent {
-            nkvh,
-            hd: HeadWidth::of_whole_sticks(hd),
+            nkvh: pool.nkvh as u32,
+            hd: pool.head_width(),
         })
     }
 
@@ -6141,9 +6162,10 @@ impl PagePlaneExtent {
         self.nkvh
     }
 
-    /// The head dim one kv head's block carries.
-    pub(crate) const fn hd(self) -> u32 {
-        self.hd.get()
+    /// The head dim one kv head's block carries, AS THE TYPE it already is — the reader that
+    /// needs a width takes this and never re-mints.
+    pub(crate) const fn head_width(self) -> HeadWidth {
+        self.hd
     }
 
     /// Offset of kv head `kvh`'s block within the plane, or `None` past the head count.
@@ -7550,15 +7572,11 @@ impl BatchChunk {
         // class registry the re-layout copy reads. The emitter states its law from its OWN blocks
         // ([`Self::of_blocks`]) and the host stages from this one, so the bake's mask rows equal these
         // exactly where the bundle re-lays (a registry-less fixture keeps the per-head form).
-        let blocks = match QGroupBlock::of_batch(
-            chunk.nkvh(),
-            gqa,
-            HeadWidth::of_whole_sticks(chunk.plane.hd()),
-            requests,
-        ) {
-            Some(q) => ChunkRowBlocks::of_query_groups(q, chunk.slots()),
-            None => chunk.row_blocks(gqa, requests),
-        };
+        let blocks =
+            match QGroupBlock::of_batch(chunk.nkvh(), gqa, chunk.plane.head_width(), requests) {
+                Some(q) => ChunkRowBlocks::of_query_groups(q, chunk.slots()),
+                None => chunk.row_blocks(gqa, requests),
+            };
         Self::of_blocks(chunk, requests, blocks)
     }
 
@@ -7799,10 +7817,7 @@ impl GatherScratch {
         windows: WindowCount,
         mq: QueryRowCount,
     ) -> Option<GatherScratch> {
-        let (nkvh, hd) = (
-            pool.nkvh as u32,
-            HeadWidth::of_whole_sticks(pool.hd() as u32),
-        );
+        let (nkvh, hd) = (pool.nkvh as u32, pool.head_width());
         if nkvh == 0 || hd.sticks() > 1 || windows.get() == 0 || mq.get() == 0 {
             return None;
         }
