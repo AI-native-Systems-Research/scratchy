@@ -5,12 +5,18 @@
 //!
 //! Built only under `nvcc` (`required-features`). No GPU fails rather than skips.
 //!
-//! The f64 bound is the GEMM's (`common::numerics`, the one the bf16 GEMV's f64 gate uses):
-//! `|gpu − ref| ≤ 2⁻⁷·|ref| + 2⁻¹⁴·S`, `S = Σₖ |a·w|·a_scale·w_scale`: one bf16 rounding of the
-//! output, and the f32 accumulation over `k`. Every worst ratio is printed. Hopper's fp8 WGMMA adds
-//! at reduced precision inside the tensor core (FP8 plan Risk A); this file measures it at every
-//! fp8 `k` of the three FP8 checkpoints, k = 17408 (the 27B's down projection) included, and does
-//! not widen the bound for it.
+//! The f64 bound is `|gpu − ref| ≤ 2⁻⁷·|ref| + 2⁻¹¹·S`, `S = Σₖ |a·w|·a_scale·w_scale`: one bf16
+//! rounding of the output, and the fp8 tensor core's accumulation over `k`. The bf16 GEMMs'
+//! `2⁻¹⁴·S` (`common::numerics`) assumes f32 accumulation; Hopper's fp8 WGMMA does not do that
+//! (FP8 plan Risk A). Per k32 add it aligns the addends to the largest, `M`, and keeps about 13
+//! bits below its leading bit, so each addend loses under `2⁻¹³·M ≤ 2⁻¹³·S_step`, truncated, its
+//! sign the term's; summed over the steps that is a few `2⁻¹³·S` at most, which `2⁻¹¹·S`
+//! (4 × 2⁻¹³) covers. On the H100 (user decision 2026-11-06): the single-dot probe in
+//! `the_fp8_wgmma_accumulation_is_recorded` keeps a 2⁻⁵ addend beside 2⁸ and drops it at 2⁻⁶ (13
+//! bits), and the same ~20 elements of the k = 64 tile fail `2⁻¹⁴·S` with every scale 1, at
+//! 0.47–0.48 of `2⁻¹¹·S`. A dropped or repeated 64-wide K step at k = 17408 still moves an
+//! element by about `2⁻⁸·S`, 8× this term. Every worst ratio is printed, at every fp8 `k` of the
+//! three FP8 checkpoints, k = 17408 (the 27B's down projection) included.
 
 // `pub`: each test binary uses a different part of `common`, and nothing in it is dead code.
 pub mod common {
@@ -137,13 +143,13 @@ fn fp8_reference(
     out
 }
 
-/// `gpu` (`[m, n]` bf16 bits) against `refs` under the GEMM bound `2⁻⁷·|ref| + 2⁻¹⁴·S`: the
+/// `gpu` (`[m, n]` bf16 bits) against `refs` under the fp8 GEMM bound `2⁻⁷·|ref| + 2⁻¹¹·S`: the
 /// out-of-bound count and the worst ratio. NaN or Inf fails.
 fn compare_fp8(gpu: &[u16], refs: &[(f64, f64)]) -> (usize, f64) {
     let (mut bad, mut worst) = (0usize, 0.0f64);
     for (&bits, &(r, s)) in gpu.iter().zip(refs) {
         let g = f64::from(bf16::from_bits(bits).to_f32());
-        let bound = r.abs() / 128.0 + s / 16384.0;
+        let bound = r.abs() / 128.0 + s / 2048.0;
         let ratio = if g.is_finite() {
             (g - r).abs() / bound.max(f64::MIN_POSITIVE)
         } else {
@@ -371,15 +377,15 @@ fn gemm_group_fp8_members_are_their_single_gemm() {
 // ── The gate/up GEMM ───────────────────────────────────────────────
 
 /// SwiGLU's `g / (1 + e^-g) · u` in f64, and its bound: the output's rounding (`2⁻⁸·|ref|`), each
-/// projection's f64 GEMM bound `δ = 2⁻⁷·|r| + 2⁻¹⁴·S` carried through the activation by the
+/// projection's fp8 GEMM bound `δ = 2⁻⁷·|r| + 2⁻¹¹·S` carried through the activation by the
 /// magnitude of its partial derivatives (`|∂/∂g| ≤ 1.1·|u|`, `|∂/∂u| = |silu(g)|`), and the
 /// activation's own f32 evaluation (`2⁻¹⁶·|ref|` and the row floor).
 fn silu_ref(g: (f64, f64), u: (f64, f64)) -> (f64, f64) {
     let (gr, ur) = (g.0, u.0);
     let silu = gr / (1.0 + (-gr).exp());
     let (dg, du) = (
-        gr.abs() / 128.0 + g.1 / 16384.0,
-        ur.abs() / 128.0 + u.1 / 16384.0,
+        gr.abs() / 128.0 + g.1 / 2048.0,
+        ur.abs() / 128.0 + u.1 / 2048.0,
     );
     let r = silu * ur;
     let bound = r.abs() / 256.0
@@ -398,8 +404,8 @@ fn gelu_ref(g: (f64, f64), u: (f64, f64)) -> (f64, f64) {
     let c = (2.0 / std::f64::consts::PI).sqrt();
     let gelu = 0.5 * gr * (1.0 + (c * (gr + 0.044715 * gr * gr * gr)).tanh());
     let (dg, du) = (
-        gr.abs() / 128.0 + g.1 / 16384.0,
-        ur.abs() / 128.0 + u.1 / 16384.0,
+        gr.abs() / 128.0 + g.1 / 2048.0,
+        ur.abs() / 128.0 + u.1 / 2048.0,
     );
     let r = gelu * ur;
     let bound = r.abs() / 256.0
