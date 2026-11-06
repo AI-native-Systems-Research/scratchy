@@ -5442,7 +5442,7 @@ impl PagedKvPool {
     /// let p = PagedKvPool::new(8, 64);
     /// for (slot, d) in [(0usize, 0usize), (1, 0), (63, 7), (64, 0), (255, 63)] {
     ///     assert_eq!(p.kt_write_off(0, slot, d),
-    ///                kcache_kt_write_offset(slot, d, 64, PagedKvPool::POOL_PAGE_SLOTS, 64));
+    ///                kcache_kt_write_offset(slot, d, 64, PagedKvPool::POOL_PAGE_SLOTS.as_usize(), 64));
     ///     // 256 slots = 4 sticks ⇒ stick-blocked: (s/64)*(hd*64) + d*64 + s%64.
     ///     assert_eq!(p.kt_write_off(0, slot, d), (slot / 64) * (64 * 64) + d * 64 + slot % 64);
     /// }
