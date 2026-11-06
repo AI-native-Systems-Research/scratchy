@@ -32,8 +32,8 @@ use crate::fold_plan::{
     self, Bytes, OpKv, PerClass, RowCursors, RowIdx, RowPage, SessionKv, SlotPos, fused_rungs,
 };
 use crate::runtime::{
-    BatchedCompute, ByteOffset, ByteSize, ComputeWireBatch, ControlBlockWire, DevAddr, HwError,
-    Stream,
+    BatchedCompute, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
+    HwError, Stream,
 };
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
@@ -570,9 +570,9 @@ pub(crate) struct OpProg {
 /// The forget is kept by choice, and it costs nothing: the device region a session-lifetime
 /// handle describes lives until process exit regardless (see the `DevAddr` doc), so a freeing
 /// drop could reclaim only a descriptor value, once, at shutdown. Nothing crashes without it
-/// today — the context in `runtime::runtime_cell` is a `static` that is never dropped, and
+/// today — every session holds its card's `CardRuntime` by `Arc`, so the context outlives it, and
 /// `DevAddr`'s drop cannot reach the allocator — but the law stays load-bearing anyway:
-/// `runtime_reset` (the leak probe) tears the context down MID-PROCESS, and a future
+/// `CardRuntime::reset` (the leak probe) tears the context down MID-PROCESS, and a future
 /// `DevAddr` drop that learns to free must not find session handles betting on drop order
 /// versus that.
 ///
@@ -794,6 +794,8 @@ pub struct Executor {
     /// THE BAKED BUNDLE — this session's program, memory plan and launch index, straight out of the
     /// binary.
     code: &'static bundle::BundleCode<'static>,
+    /// THE CARD THIS SESSION RUNS ON — every stream and allocation below is this card's.
+    card: std::sync::Arc<CardRuntime>,
 
     pub vocab: Vocab,
     pub kv_dim: KvDim,
@@ -1105,6 +1107,7 @@ impl Executor {
     ///
     /// Nothing is read from disk: `code` is `&'static` data in this binary.
     pub fn load(
+        card: std::sync::Arc<CardRuntime>,
         code: &'static bundle::BundleCode<'static>,
         vocab: Vocab,
         kv_dim: KvDim,
@@ -1149,6 +1152,7 @@ impl Executor {
 
         let mut ex = Executor {
             code,
+            card,
             vocab,
             kv_dim,
             num_blocks,
@@ -2309,8 +2313,6 @@ impl Executor {
             *from = Instant::now();
         };
 
-        crate::runtime::init_runtime().map_err(|e| anyhow!("flex runtime init failed: {e}"))?;
-        lap("runtime-init", &mut t0);
         // A DEDICATED created stream (not the default), and PERSISTENT for the session: the
         // scheduler retires each op's fence from its per-stream deque at completion
         // (SchedulerState::retire_fence), so the deques hold only in-flight fences instead of
@@ -2320,8 +2322,10 @@ impl Executor {
         // recreate-and-destroy workaround papered over exactly this; the PR1 gate run retired
         // 331,220 fences over 1,570 forwards with RSS flat to the kB). The resident
         // program/weight/KV allocations live on the runtime, not the stream.
-        self.stream =
-            Some(Stream::create().map_err(|e| anyhow!("prepare: could not create a stream: {e}"))?);
+        self.stream = Some(
+            Stream::create(&self.card)
+                .map_err(|e| anyhow!("prepare: could not create a stream: {e}"))?,
+        );
         lap("stream-create", &mut t0);
 
         // ── Programs. Each op's device binary gets its OWN Program-segment alloc + H2D ONCE; they
@@ -2394,7 +2398,7 @@ impl Executor {
                 bytes = bytes.max(pool);
             }
             self.seg_addr[i] = Some(
-                DevAddr::alloc(ByteSize(bytes), MemoryType::Tensor)
+                DevAddr::alloc(&self.card, ByteSize(bytes), MemoryType::Tensor)
                     .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
             );
         }
@@ -2410,7 +2414,7 @@ impl Executor {
                 self.weight_bank_bytes[b].max(128)
             };
             self.weight_bank_addr[b] = Some(
-                DevAddr::alloc(ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
+                DevAddr::alloc(&self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
                     anyhow!(
                         "prepare: weight bank {} alloc of {bytes} B failed: {e}",
                         b + 1
@@ -2954,14 +2958,18 @@ impl Executor {
                         )
                     })?;
                 let head = img.bootstrap();
-                let addr = DevAddr::alloc(ByteSize(img.alloc_bytes()), MemoryType::Program)
-                    .map_err(|e| {
-                        anyhow!(
-                            "program alloc of {} B ({head} B prologue + {} B image) failed: {e}",
-                            img.alloc_bytes(),
-                            img.image_bytes()
-                        )
-                    })?;
+                let addr = DevAddr::alloc(
+                    &self.card,
+                    ByteSize(img.alloc_bytes()),
+                    MemoryType::Program,
+                )
+                .map_err(|e| {
+                    anyhow!(
+                        "program alloc of {} B ({head} B prologue + {} B image) failed: {e}",
+                        img.alloc_bytes(),
+                        img.image_bytes()
+                    )
+                })?;
                 // ⛔⛔⛔ DMA A PROGRAM OUT OF ANONYMOUS MEMORY, NEVER OUT OF THE EXECUTABLE.
                 //
                 // A BAKED program is `Cow::Borrowed(&'static [u8])`, which lives in the executable's
@@ -4436,7 +4444,7 @@ impl Executor {
             if t.forwards == n {
                 let before = vmrss_kb();
                 self.stream = None;
-                let _ = crate::runtime::runtime_reset();
+                let _ = self.card.reset();
                 let after = vmrss_kb();
                 eprintln!(
                     "[sdsc-leak-probe] fwd={n} VmRSS {before} -> {after} kB (freed {} kB)",

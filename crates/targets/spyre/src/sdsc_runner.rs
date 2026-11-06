@@ -143,6 +143,18 @@ pub struct SuperDscSession {
     pub paged: bool,
 }
 
+/// What a session binds before prepare — the private bundle of [`SuperDscSession::new_inner`]'s
+/// staged inputs.
+struct Staged<'a> {
+    /// The resident weights, moved in by the OWNER (the decode session); empty for every
+    /// borrower, which reads the owner's bytes through the alias.
+    weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
+    /// The wiring's staged-constant list — bound once before prepare (see [`SuperDscSession::new`]).
+    load_consts: &'a [(u32, crate::wiring::LoadConst)],
+    /// The KV pool's own tables — bound once, verbatim, by each session whose kernels read them.
+    pool_statics: &'a [(u32, Vec<u8>)],
+}
+
 impl SuperDscSession {
     /// Load the bundle, bind the weights, and prepare (allocate + upload the resident program,
     /// weights and KV pool).
@@ -167,6 +179,7 @@ impl SuperDscSession {
     /// ([`crate::paged_step::card_statics`]) — staged VERBATIM once here by the session whose
     /// bundles read them (the one-request decode's).
     pub fn new(
+        card: std::sync::Arc<crate::runtime::CardRuntime>,
         code: &'static crate::bundle_code::BundleCode<'static>,
         dims: SessionDims,
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
@@ -175,11 +188,14 @@ impl SuperDscSession {
         spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
+            card,
             code,
             dims,
-            weights,
-            load_consts,
-            pool_statics,
+            Staged {
+                weights,
+                load_consts,
+                pool_statics,
+            },
             &[],
             spilled_tail,
         )
@@ -195,6 +211,7 @@ impl SuperDscSession {
     /// The CB parity gate also waits for that alias: it cannot render through a placeholder,
     /// so it runs at the [`alias_seg_from`](Self::alias_seg_from) that completes the borrowed set.
     pub fn new_borrowing(
+        card: std::sync::Arc<crate::runtime::CardRuntime>,
         code: &'static crate::bundle_code::BundleCode<'static>,
         vocab: usize,
         kv_dim: usize,
@@ -203,6 +220,7 @@ impl SuperDscSession {
         spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_borrowing_with_consts(
+            card,
             code,
             SessionDims {
                 vocab,
@@ -224,6 +242,7 @@ impl SuperDscSession {
     /// tables sit. Each rung stages its own copy — a few MB against the rung's programs, once
     /// at load — through the same load-time channel the owner uses.
     pub fn new_borrowing_with_consts(
+        card: std::sync::Arc<crate::runtime::CardRuntime>,
         code: &'static crate::bundle_code::BundleCode<'static>,
         dims: SessionDims,
         borrowed: &[i64],
@@ -239,11 +258,14 @@ impl SuperDscSession {
         spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
+            card,
             code,
             dims,
-            Vec::new(),
-            load_consts,
-            pool_statics,
+            Staged {
+                weights: Vec::new(),
+                load_consts,
+                pool_statics,
+            },
             borrowed,
             spilled_tail,
         )
@@ -262,40 +284,33 @@ impl SuperDscSession {
     /// sampler's nine tables in EVERY prefill rung too, and they sit in the session's own seg3
     /// (never aliased), so the anchor stages its own copy exactly as a borrowing rung does.
     pub fn new_reserving(
+        card: std::sync::Arc<crate::runtime::CardRuntime>,
         code: &'static crate::bundle_code::BundleCode<'static>,
-        vocab: usize,
-        kv_dim: usize,
-        num_blocks: usize,
+        dims: SessionDims,
         load_consts: &[(u32, crate::wiring::LoadConst)],
         // The pool's own tables, for the same reason the borrowing constructor takes them.
         pool_statics: &[(u32, Vec<u8>)],
         spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
+            card,
             code,
-            SessionDims {
-                vocab,
-                kv_dim,
-                num_blocks,
+            dims,
+            Staged {
+                weights: Vec::new(),
+                load_consts,
+                pool_statics,
             },
-            Vec::new(),
-            load_consts,
-            pool_statics,
             &[],
             spilled_tail,
         )
     }
 
     fn new_inner(
+        card: std::sync::Arc<crate::runtime::CardRuntime>,
         code: &'static crate::bundle_code::BundleCode<'static>,
         dims: SessionDims,
-        weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
-        // The wiring's staged-constant list — bound once before prepare by the
-        // OWNER only (see [`Self::new`]); borrowers pass none and read the
-        // owner's bytes through the alias.
-        load_consts: &[(u32, crate::wiring::LoadConst)],
-        // The KV pool's own tables — bound once, verbatim, by the session that owns the pool.
-        pool_statics: &[(u32, Vec<u8>)],
+        staged: Staged<'_>,
         borrowed: &[i64],
         // The spilled weight tail's tids — the ONE resident slice the layout cannot state: the
         // spill is a load-time copy decision (a weight whose slot also holds an m-dependent
@@ -310,8 +325,14 @@ impl SuperDscSession {
             kv_dim,
             num_blocks,
         } = dims;
+        let Staged {
+            weights,
+            load_consts,
+            pool_statics,
+        } = staged;
         ensure_deeptools_arch_config()?;
         let mut exec = Executor::load(
+            card,
             code,
             Vocab(vocab),
             KvDim(kv_dim),
@@ -404,12 +425,6 @@ impl SuperDscSession {
             paged: exec.is_paged(),
             exec,
         })
-    }
-
-    /// Kick the process-wide device bring-up (~5.7s) on a background thread so it overlaps host-side
-    /// weight load instead of sitting on the critical path inside prepare.
-    pub fn prewarm_runtime() {
-        crate::runtime::prewarm_runtime();
     }
 
     /// Whether this bundle's resident cache is PAGED.

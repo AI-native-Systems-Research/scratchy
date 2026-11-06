@@ -678,12 +678,19 @@ pub(crate) fn stage_bound_weights(
 impl SpyreWorker {
     /// Resolve the bundle + load all static weights + derive dims + wiring.
     pub(crate) fn load_inner(&self) -> ExecutorResult<Loaded> {
-        // Overlap the ~5.7s flex device bring-up (runtime-init inside prepare) with the
-        // host-side weight load below by kicking it off on a background thread NOW.
-        // std::call_once makes prepare's own init block only on the remainder — a pure
-        // latency win with no change to the bytes that reach the device.
+        // ⭐ THIS WORKER'S CARD — `local_rank`, the worker's own device index — opened on a
+        // background thread NOW, so its ~5.7 s bring-up overlaps the host-side weight load below.
+        // Joined where the first session needs it; every session of this worker runs on it.
         #[cfg(feature = "spyre-hw")]
-        SuperDscSession::prewarm_runtime();
+        let card_open = {
+            let index = u32::try_from(self.config.local_rank).map_err(|_| {
+                werr(format!(
+                    "local_rank {} is not a Spyre card index",
+                    self.config.local_rank
+                ))
+            })?;
+            std::thread::spawn(move || scratchy_target_spyre::runtime::CardRuntime::open(index))
+        };
 
         let model_dir = resolve_model_path(
             &self.model_path,
@@ -1185,19 +1192,14 @@ impl SpyreWorker {
                     (Some(tp), None) => Some(tp),
                     (None, _) => None,
                 };
-                //
-                // ⛔ `None` REFUSES, IT DOES NOT FALL BACK. A capacity query that fails and quietly returns
-                // to 8 GiB is the defect restored under a log line, and a *plausible* default is worse than
-                // none — it sizes a real allocation the card may not serve.
-                let card_bytes = scratchy_target_spyre::runtime::device_memory_bytes()
-                    .ok_or_else(|| {
-                        werr(
-                            "could not read the Spyre card's memory capacity \
-                             (flex_senlib_device_memory_size returned 0, i.e. no live device handle). The \
-                             KV pool is sized from the real card, so there is no safe default to assume \
-                             here. Check that the device is present and the flex runtime can start.",
-                        )
-                    })?;
+                // ⭐ THE CARD, JOINED. Its capacity was read from the card when it opened — a card
+                // that cannot report one does not open — so the KV pool below is sized from the real
+                // card, with no default to fall back to.
+                let card = card_open
+                    .join()
+                    .map_err(|_| werr("the Spyre card's bring-up thread panicked"))?
+                    .map_err(|e| werr(format!("open the Spyre card: {e}")))?;
+                let card_bytes = card.memory();
                 // WHAT THE BUNDLE ALREADY OWNS ON THE CARD, charged as `weights_and_overhead` — every
                 // segment except the KV one, whose bytes are what we are about to size. The segments are
                 // typed (`SEG_INTERMEDIATE`/`SEG_WEIGHT`/`SEG_KV`/`SEG_MASK`), so this reads the KV segment
@@ -1597,16 +1599,20 @@ impl SpyreWorker {
                         let anchor_pool = prefill_pool_statics(wirings)?;
                         let pss = if anchor_reserves {
                             SuperDscSession::new_reserving(
+                                card.clone(),
                                 pcode,
-                                vocab,
-                                kv_dim,
-                                num_blocks,
+                                scratchy_target_spyre::sdsc_runner::SessionDims {
+                                    vocab,
+                                    kv_dim,
+                                    num_blocks,
+                                },
                                 prefill_consts,
                                 &anchor_pool,
                                 &spill_tids,
                             )
                         } else {
                             SuperDscSession::new_borrowing_with_consts(
+                                card.clone(),
                                 pcode,
                                 scratchy_target_spyre::sdsc_runner::SessionDims {
                                     vocab,
@@ -1729,6 +1735,7 @@ impl SpyreWorker {
                     // These are PREFILL rungs (`rung_consts = prefill_consts`), so each stages the
                     // pool's tables for itself ([`prefill_pool_statics`]).
                     let ladder_pool = prefill_pool_statics(wirings)?;
+                    let ladder_card = card.clone();
                     std::thread::spawn(move || {
                         let workers: Vec<_> = chunks
                             .into_iter()
@@ -1736,10 +1743,12 @@ impl SpyreWorker {
                                 let rung_spill = ladder_spill.clone();
                                 let rung_consts = prefill_consts;
                                 let rung_pool = ladder_pool.clone();
+                                let rung_card = ladder_card.clone();
                                 std::thread::spawn(move || {
                                     part.into_iter()
                                         .map(|(rm, rcode)| {
                                             let r = SuperDscSession::new_borrowing_with_consts(
+                                                rung_card.clone(),
                                                 rcode,
                                                 scratchy_target_spyre::sdsc_runner::SessionDims {
                                                     vocab,
@@ -1774,6 +1783,7 @@ impl SpyreWorker {
                 let pool_statics = scratchy_target_spyre::paged_step::card_statics(&step)
                     .map_err(|e| werr(format!("the KV pool's statics: {e}")))?;
                 let mut ss = SuperDscSession::new(
+                    card.clone(),
                     code,
                     scratchy_target_spyre::sdsc_runner::SessionDims {
                         vocab,
@@ -1974,8 +1984,10 @@ impl SpyreWorker {
                                 // ([`prefill_pool_statics`]). Borrowed from outside the scope, as
                                 // `spill` is — a binding inside it would not outlive the spawn.
                                 let pool = &pool_for_prefix;
+                                let card = &card;
                                 scope.spawn(move || {
                                     SuperDscSession::new_borrowing_with_consts(
+                                        card.clone(),
                                         job.rcode,
                                         scratchy_target_spyre::sdsc_runner::SessionDims {
                                             vocab,
@@ -2187,8 +2199,10 @@ impl SpyreWorker {
                             .iter()
                             .map(|job| {
                                 let spill = &spill_tids;
+                                let card = &card;
                                 scope.spawn(move || {
                                     SuperDscSession::new_borrowing_with_consts(
+                                        card.clone(),
                                         job.rcode,
                                         scratchy_target_spyre::sdsc_runner::SessionDims {
                                             vocab,
