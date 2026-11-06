@@ -38,6 +38,9 @@ use super::{
     check_pointwise_cols, check_pointwise_cols_df, emit_sdsc_tiled, fl, op_func_from_str,
     pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
 };
+use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
+    ReduceDivision, ReduceSplit, assemble_reduce_split, partial_accum_handle, reduce_data_handle,
+};
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
 };
@@ -10711,19 +10714,124 @@ pub fn reduce<T: crate::collective::Tp>(
     // stays byte-identical; every other df is a build-time refusal by name, never a silent
     // nearest-format downgrade.
     match df {
-        Df::Fp16 => Ok(vec![
-            crate::ir::bridge::tiled_op_sdsc_op::reduce::assemble_reduce_seeded(
-                &op_name,
-                kind.op_func(),
+        Df::Fp16 => {
+            // ⭐ THE LONG-REDUCE SPLIT — the same probe-and-split body the rmsnorm chain's own
+            // reduces take, on this door's own facts: the probe states THIS op's single-shot
+            // opspec (the same op, rows, cols, df and the same core division the single shot
+            // below derives), so `Ok(None)` — the reduce fits one LX pass, or the cores split
+            // the reduced axis — falls through to the single shot BYTE-IDENTICAL: the handles
+            // state the buffers' TRUE device shapes (the data at its stick-padded width, the
+            // accum at one stick per row — what the placement already reserves), and the single
+            // shot reads only their names and kind tags. The placement itself is untouched —
+            // `compute_bundle_layout` sizes it from the tape, never from a door's handles.
+            let data_h = reduce_data_handle::<crate::sdsc_abstract::RowBlockedTag>(
+                &data.name(),
                 rows,
                 cols,
-                &rb(&data.name(), rows, cols),
-                &rb(&out.name(), rows, 1),
+                Df::Fp16,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?;
+            let accum_h = partial_accum_handle::<crate::sdsc_abstract::RowBlockedTag>(
+                &out.name(),
+                rows,
+                <Fp16 as DataFormat>::ELEMS_PER_STICK,
+                Df::Fp16,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?;
+            let split = assemble_reduce_split(
+                ReduceSplit::new(
+                    &op_name,
+                    op_func_from_str(kind.op_func()),
+                    rows,
+                    cols,
+                    &data_h,
+                    0,
+                    &accum_h,
+                    crate::addr::DevOff::ZERO,
+                    PlaceId::Act(out.tid),
+                    layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
+                    Df::Fp16,
+                )
+                .map_err(|e| Error {
+                    message: format!("{name}: {e}"),
+                })?,
                 sym_id_base,
                 layout,
-            ),
-        ]),
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?;
+            if let Some(ops) = split {
+                return Ok(ops);
+            }
+            Ok(vec![
+                crate::ir::bridge::tiled_op_sdsc_op::reduce::assemble_reduce_seeded(
+                    &op_name,
+                    kind.op_func(),
+                    rows,
+                    cols,
+                    &rb(&data.name(), rows, cols),
+                    &rb(&out.name(), rows, 1),
+                    sym_id_base,
+                    layout,
+                ),
+            ])
+        }
         Df::Fp32 => {
+            // ⭐ THE SAME SPLIT at fp32 — the probe asks the tiler the question this arm's
+            // single shot asks (`head_major = true`, the flat rank-3 form the card-proven fp32
+            // reduce states, so the data handle is Flat and the probe derives the same
+            // `head_major` from its kind). An fp32 reduced width that is not a whole 32-elem
+            // stick propagates the probe's `Err` — the same pad-mask refusal the single shot's
+            // own builder raises, stated once.
+            let data_h = reduce_data_handle::<crate::sdsc_abstract::FlatTag>(
+                &data.name(),
+                rows,
+                cols,
+                Df::Fp32,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?;
+            let accum_h = partial_accum_handle::<crate::sdsc_abstract::FlatTag>(
+                &out.name(),
+                rows,
+                <Fp32 as DataFormat>::ELEMS_PER_STICK,
+                Df::Fp32,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?;
+            let split = assemble_reduce_split(
+                ReduceSplit::new(
+                    &op_name,
+                    op_func_from_str(kind.op_func()),
+                    rows,
+                    cols,
+                    &data_h,
+                    0,
+                    &accum_h,
+                    crate::addr::DevOff::ZERO,
+                    PlaceId::Act(out.tid),
+                    ReduceDivision::Rows,
+                    Df::Fp32,
+                )
+                .map_err(|e| Error {
+                    message: format!("{name}: {e}"),
+                })?,
+                sym_id_base,
+                layout,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?;
+            if let Some(ops) = split {
+                return Ok(ops);
+            }
             // `head_major = true` — the flat rank-3 form the card-proven fp32 reduce
             // (`assemble_reduce_df`, torch-spyre's rmsnorm mean(x²)) already states.
             let op = crate::ir::bridge::tiled_op_sdsc_op::reduce::reduce_opspec_df(
@@ -10792,6 +10900,48 @@ pub fn reduce_df<T: crate::collective::Tp>(
         ));
     }
     let op_name = format!("{}_o{}", kind.op_func(), out.tid);
+    // ⭐ THE LONG-REDUCE SPLIT, the same probe-and-split body [`reduce`]'s arms take: the probe
+    // states this arm's own single-shot question ([`assemble_reduce_df`]'s flat head-major form,
+    // at the stated df), so `Ok(None)` falls through to the single shot byte-identical.
+    let data_h = reduce_data_handle::<crate::sdsc_abstract::FlatTag>(&data.name(), rows, cols, df)
+        .map_err(|e| Error {
+            message: format!("{name}: {e}"),
+        })?;
+    let accum_h = partial_accum_handle::<crate::sdsc_abstract::FlatTag>(
+        &out.name(),
+        rows,
+        df.elems_per_stick(),
+        df,
+    )
+    .map_err(|e| Error {
+        message: format!("{name}: {e}"),
+    })?;
+    let split = assemble_reduce_split(
+        ReduceSplit::new(
+            &op_name,
+            op_func_from_str(kind.op_func()),
+            rows,
+            cols,
+            &data_h,
+            0,
+            &accum_h,
+            crate::addr::DevOff::ZERO,
+            PlaceId::Act(out.tid),
+            ReduceDivision::Rows,
+            df,
+        )
+        .map_err(|e| Error {
+            message: format!("{name}: {e}"),
+        })?,
+        sym_id_base,
+        layout,
+    )
+    .map_err(|e| Error {
+        message: format!("{name}: {e}"),
+    })?;
+    if let Some(ops) = split {
+        return Ok(ops);
+    }
     Ok(vec![
         crate::ir::bridge::tiled_op_sdsc_op::reduce::assemble_reduce_df(
             &op_name,
