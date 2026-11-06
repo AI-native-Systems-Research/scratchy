@@ -28,7 +28,10 @@ impl<A: Dim, B: Dim> Dim for Add<A, B> {
     const N: u32 = A::N + B::N;
 }
 
-/// The quotient `A / B`.
+/// The quotient `A / B`, rounded down as the carrier's `/` is: a carrier's round-up is spelled
+/// `(A + (B - 1)) / B` (qwen2.5-vl's vision MLP is `8 · ((intermediate + 7) / 8)` wide), so a
+/// quotient with a remainder is meant, not an error. Phase F's type-level quotient keeps this
+/// floor.
 pub struct Div<A, B>(PhantomData<(A, B)>);
 
 impl<A: Dim, B: Dim> Dim for Div<A, B> {
@@ -148,6 +151,27 @@ impl std::error::Error for ShapeMismatch {}
 
 /// ⛔ THE ONE DOOR from a loaded layer to a typed handle: `layer`'s extents checked against the
 /// type's numbers, the mismatch naming `tensor`. A layered field mints each layer's.
+///
+/// ```
+/// # use scratchy_tensors::typed::{Dim, Extents, Mint, W2};
+/// # enum Hidden {}
+/// # impl Dim for Hidden { const N: u32 = 2048; }
+/// # struct Layer;
+/// # impl Extents<2> for Layer { fn extents(&self) -> [usize; 2] { [2048, 2048] } }
+/// let w = W2::<Hidden, Hidden, Layer>::mint(Layer, "o_proj");
+/// assert!(w.is_ok());
+/// ```
+///
+/// There is no other: a handle's wrap takes a [`Checked`] layer, which only this module makes.
+///
+/// ```compile_fail,E0423
+/// # use scratchy_tensors::typed::{Checked, Dim, Extents, Shaped, W2};
+/// # enum Hidden {}
+/// # impl Dim for Hidden { const N: u32 = 2048; }
+/// # struct Layer;
+/// # impl Extents<2> for Layer { fn extents(&self) -> [usize; 2] { [4, 4] } }
+/// let w = W2::<Hidden, Hidden, Layer>::wrap(Checked(Layer));
+/// ```
 pub trait Mint<L>: Sized {
     fn mint(layer: L, tensor: &str) -> anyhow::Result<Self>;
 }
@@ -178,11 +202,17 @@ fn check_layers<const R: usize, L: Extents<R>>(
     }))
 }
 
+/// A layer its handle type's mint checked: the one thing a handle's wrap takes. Its field is
+/// private, and nothing in this module builds one but the three mints below, each right after
+/// its `check` passed on that same layer (a layered field's mint: on those same layers), so a
+/// handle is reached through a mint alone.
+pub struct Checked<L>(L);
+
 /// A handle over layer type `L`: its check (its numbers handed to [`check_layers`]) and its
-/// wrap. Both mints read it.
+/// wrap of a layer a mint checked. Both mints read it.
 pub trait Shaped<L>: Sized {
     fn check(layers: &[L], tensor: &str, layered: bool) -> anyhow::Result<()>;
-    fn wrap(layer: L) -> Self;
+    fn wrap(layer: Checked<L>) -> Self;
 }
 
 impl<D: Dim, L: Extents<1>> Shaped<L> for W1<D, L> {
@@ -190,7 +220,7 @@ impl<D: Dim, L: Extents<1>> Shaped<L> for W1<D, L> {
         check_layers(layers, [D::N], tensor, layered)
     }
 
-    fn wrap(layer: L) -> Self {
+    fn wrap(Checked(layer): Checked<L>) -> Self {
         Self {
             layer,
             shape: PhantomData,
@@ -203,7 +233,7 @@ impl<K: Dim, N: Dim, L: Extents<2>> Shaped<L> for W2<K, N, L> {
         check_layers(layers, [K::N, N::N], tensor, layered)
     }
 
-    fn wrap(layer: L) -> Self {
+    fn wrap(Checked(layer): Checked<L>) -> Self {
         Self {
             layer,
             shape: PhantomData,
@@ -214,14 +244,14 @@ impl<K: Dim, N: Dim, L: Extents<2>> Shaped<L> for W2<K, N, L> {
 impl<D: Dim, L: Extents<1>> Mint<L> for W1<D, L> {
     fn mint(layer: L, tensor: &str) -> anyhow::Result<Self> {
         Self::check(std::slice::from_ref(&layer), tensor, false)?;
-        Ok(Self::wrap(layer))
+        Ok(Self::wrap(Checked(layer)))
     }
 }
 
 impl<K: Dim, N: Dim, L: Extents<2>> Mint<L> for W2<K, N, L> {
     fn mint(layer: L, tensor: &str) -> anyhow::Result<Self> {
         Self::check(std::slice::from_ref(&layer), tensor, false)?;
-        Ok(Self::wrap(layer))
+        Ok(Self::wrap(Checked(layer)))
     }
 }
 
@@ -229,7 +259,7 @@ impl<K: Dim, N: Dim, L: Extents<2>> Mint<L> for W2<K, N, L> {
 impl<T: Shaped<L>, L> Mint<Vec<L>> for Vec<T> {
     fn mint(layers: Vec<L>, tensor: &str) -> anyhow::Result<Self> {
         T::check(&layers, tensor, true)?;
-        Ok(layers.into_iter().map(T::wrap).collect())
+        Ok(layers.into_iter().map(|l| T::wrap(Checked(l))).collect())
     }
 }
 
