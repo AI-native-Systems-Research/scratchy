@@ -205,7 +205,7 @@ pub fn device_memory_bytes() -> Option<CardMemory> {
 ///
 /// The guard, as a build failure — the exact literal that was there, in the slot it was there in:
 ///
-/// ```compile_fail,E0423
+/// ```compile_fail,E0603
 /// // `POOL_BUDGET_BYTES = 8 GiB` cannot be reconstituted: the tuple field is private, so a
 /// // literal has no way into the type the budget arithmetic demands.
 /// let _budget = scratchy_target_spyre::runtime::CardMemory(8 * 1024 * 1024 * 1024);
