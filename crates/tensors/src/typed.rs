@@ -107,6 +107,38 @@ where
     type Quot = typenum::Quot<A::Num, B::Num>;
 }
 
+/// A number that is true: the outcome of a comparison that holds.
+#[diagnostic::on_unimplemented(
+    message = "the comparison does not hold",
+    label = "a dim that must fit in another is wider"
+)]
+pub trait Holds {}
+
+impl Holds for typenum::B1 {}
+
+/// `Self` fits in `A`: its number is at most `A`'s.
+///
+/// ```
+/// # use scratchy_tensors::typed::FitsIn;
+/// # use scratchy_tensors::typed::typenum::{U64, U128};
+/// fn fits<R: FitsIn<H>, H>() {}
+/// fits::<U64, U128>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// # use scratchy_tensors::typed::FitsIn;
+/// # use scratchy_tensors::typed::typenum::{U64, U128};
+/// fn fits<R: FitsIn<H>, H>() {}
+/// fits::<U128, U64>();
+/// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not fit in `{A}`",
+    label = "a dim that must fit in another is wider"
+)]
+pub trait FitsIn<A>: Dim {}
+
+impl<A: Dim, R: Dim> FitsIn<A> for R where R::Num: typenum::IsLessOrEqual<A::Num, Output: Holds> {}
+
 /// The quotient `A / B`, exact: a `B` that does not divide `A` has none (E0277).
 pub struct Div<A, B>(PhantomData<(A, B)>);
 

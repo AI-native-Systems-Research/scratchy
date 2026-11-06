@@ -125,6 +125,21 @@ impl DerivedRule {
         }
     }
 
+    /// The rule as the dim it derives, a gated rule's arm chosen by its flag in `bounds` (an absent
+    /// flag is zero).
+    pub fn dim(&self, bounds: &std::collections::BTreeMap<String, u64>) -> Dim {
+        match self {
+            Self::Bound(name) => Dim::Bound(name.to_string()),
+            Self::Lit(n) => Dim::Lit(*n),
+            Self::Mul(factors) => canonical_mul(factors.iter().map(|f| f.dim(bounds)).collect()),
+            Self::Add(terms) => canonical_add(terms.iter().map(|t| t.dim(bounds)).collect()),
+            Self::Gated { flag, on, off } => match bounds.get(*flag).copied().unwrap_or(0) {
+                0 => off.dim(bounds),
+                _ => on.dim(bounds),
+            },
+        }
+    }
+
     /// The rule's value under `bounds`, `None` when a bound it reads is absent.
     pub fn eval(&self, bounds: &std::collections::BTreeMap<String, u64>) -> Option<u64> {
         match self {
@@ -276,12 +291,18 @@ pub const DERIVED_DIMS: [DerivedDim; 11] = [
 ];
 
 /// Derive into `bounds` every [`DERIVED_DIMS`] entry of `stage` that no config states and whose
-/// inputs `bounds` has. Explicit values always win.
-pub fn derive_dims(bounds: &mut std::collections::BTreeMap<String, u64>, stage: DeriveStage) {
+/// inputs `bounds` has, each into `derived` as the dim its rule derives it from. Explicit values
+/// always win.
+pub fn derive_dims(
+    bounds: &mut std::collections::BTreeMap<String, u64>,
+    stage: DeriveStage,
+    derived: &mut std::collections::BTreeMap<String, Dim>,
+) {
     for d in DERIVED_DIMS.iter().filter(|d| d.stage == stage) {
         if !bounds.contains_key(d.name)
             && let Some(v) = d.rule.eval(bounds)
         {
+            derived.insert(d.name.to_string(), d.rule.dim(bounds));
             bounds.insert(d.name.to_string(), v);
         }
     }

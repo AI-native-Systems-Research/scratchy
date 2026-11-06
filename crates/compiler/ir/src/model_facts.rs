@@ -11,6 +11,7 @@
 //! fails the build in the constructor that states it.
 
 pub use crate::KvCodec;
+use scratchy_tensors::typed::{Dim, DimN, Divides, FitsIn};
 pub use scratchy_tensors::{MetalDtype, ScaleDtype};
 
 /// A positive count or extent: the constructor refuses zero.
@@ -41,8 +42,8 @@ positive! {
     /// The leading lanes of a head that rotary rotates.
     RotDim(u32),
     /// Query heads per kv head — the GQA group size, minted once by
-    /// [`HeadGeometry::new`](HeadGeometry::new) beside its divisibility law, so no reader
-    /// re-derives the division.
+    /// [`HeadGeometry::new`](HeadGeometry::new), its divisibility law [`HeadGeometry::of`]'s
+    /// bound, so no reader re-derives the division.
     Gqa(u32),
     /// Positions per paged-KV block.
     BlockSize(u32),
@@ -178,8 +179,8 @@ impl KvLayers {
     }
 }
 
-/// One attention class's head geometry. Its constructor divides the GQA group out once, after
-/// proving the division exact, so no reader re-checks it.
+/// One attention class's head geometry. Its GQA group is divided out once, the division exact by
+/// [`HeadGeometry::of`]'s bound, so no reader re-checks it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HeadGeometry {
     q_heads: QueryHeads,
@@ -193,8 +194,46 @@ pub struct HeadGeometry {
 }
 
 impl HeadGeometry {
-    /// The geometry, refused when the kv heads do not divide the query heads (an attention over it
-    /// would read another head's keys) or the rot window is wider than the head.
+    /// The geometry of a model's numbers, as types: its laws are its bounds. The kv heads divide
+    /// the query heads (`Kv: Divides<Q>`: an attention over a remainder would read another head's
+    /// keys), and the rot window fits its head (`Rot: FitsIn<Hd>`). A model's emitted `FACTS`
+    /// states each class through this, so rustc checks both laws for every model.
+    ///
+    /// ```
+    /// # use scratchy_ir::model_facts::{BlockSize, HeadGeometry};
+    /// # use scratchy_tensors::typed::typenum::{U4, U28, U128};
+    /// const G: HeadGeometry = HeadGeometry::of::<U28, U4, U128, U128>(BlockSize::new(16));
+    /// assert_eq!(G.gqa().get(), 7);
+    /// ```
+    ///
+    /// 29 query heads over 4 kv heads have no GQA grouping (E0277):
+    ///
+    /// ```compile_fail,E0277
+    /// # use scratchy_ir::model_facts::{BlockSize, HeadGeometry};
+    /// # use scratchy_tensors::typed::typenum::{U4, U29, U128};
+    /// const G: HeadGeometry = HeadGeometry::of::<U29, U4, U128, U128>(BlockSize::new(16));
+    /// ```
+    ///
+    /// and a rot window wider than its head rotates lanes the head lacks (E0277):
+    ///
+    /// ```compile_fail,E0277
+    /// # use scratchy_ir::model_facts::{BlockSize, HeadGeometry};
+    /// # use scratchy_tensors::typed::typenum::{U8, U32, U64, U128};
+    /// const G: HeadGeometry = HeadGeometry::of::<U32, U8, U64, U128>(BlockSize::new(16));
+    /// ```
+    pub const fn of<Q: Dim, Kv: Divides<Q>, Hd: Dim, Rot: FitsIn<Hd>>(page: BlockSize) -> Self {
+        Self::new(
+            QueryHeads::new(<Q as DimN>::N),
+            KvHeads::new(<Kv as DimN>::N),
+            HeadDim::new(<Hd as DimN>::N),
+            RotDim::new(<Rot as DimN>::N),
+            page,
+        )
+    }
+
+    /// The geometry of values the fill and the bake read. Its laws are [`HeadGeometry::of`]'s
+    /// bounds, which the model's emitted `FACTS` restates as types, so the build of a model whose
+    /// numbers break one fails there.
     pub const fn new(
         q_heads: QueryHeads,
         kv_heads: KvHeads,
@@ -202,14 +241,6 @@ impl HeadGeometry {
         rot_dim: RotDim,
         page: BlockSize,
     ) -> Self {
-        assert!(
-            q_heads.get().is_multiple_of(kv_heads.get()),
-            "HeadGeometry: the kv heads divide the query heads"
-        );
-        assert!(
-            rot_dim.get() <= head_dim.get(),
-            "HeadGeometry: the rot window fits its head"
-        );
         let q_width = q_heads
             .get()
             .checked_mul(head_dim.get())
@@ -1158,20 +1189,6 @@ mod tests {
     fn a_dividing_kv_head_count_has_its_group() {
         let g = geometry(28, 4, 128, 128);
         assert_eq!((g.gqa().get(), g.q_width()), (7, 28 * 128));
-    }
-
-    /// 29 query heads over 4 kv heads have no GQA grouping.
-    #[test]
-    #[should_panic(expected = "the kv heads divide the query heads")]
-    fn a_kv_head_count_that_does_not_divide_is_refused() {
-        geometry(29, 4, 128, 128);
-    }
-
-    /// A rot window wider than its head rotates lanes the head lacks.
-    #[test]
-    #[should_panic(expected = "the rot window fits its head")]
-    fn a_rot_window_wider_than_its_head_is_refused() {
-        geometry(32, 8, 64, 128);
     }
 
     #[test]
