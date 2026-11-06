@@ -449,7 +449,7 @@ pub fn with_baked_rung<C: OnBakedRung>(mq: u32, consumer: C) -> Option<C::Out> {
 /// THE ATTENTION EMITTER'S MASK-BLOCK WIDTH: one fold pass is one PAGE, so the emitter's
 /// prefix-mask shape is always blocked at the pool page's slot count — named, so the const-generic
 /// argument says WHICH width fills it (the same discipline as [`POOL_STICK`]).
-pub const PAGE_MASK_COLS: u32 = PagedKvPool::POOL_PAGE_SLOTS as u32;
+pub const PAGE_MASK_COLS: u32 = PagedKvPool::POOL_PAGE_SLOTS.get();
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  THE MATMUL ASSEMBLER'S DIMENSION RUN — one type per slot.
@@ -3080,7 +3080,7 @@ pub struct LogicalPage(u32);
 impl LogicalPage {
     /// The slots this page covers, `[first, past)`.
     pub(crate) fn slot_bounds(self) -> (KvSlot, KvSlot) {
-        let per = PagedKvPool::POOL_PAGE_SLOTS as u32;
+        let per = PagedKvPool::POOL_PAGE_SLOTS.get();
         (KvSlot::new(self.0 * per), KvSlot::new((self.0 + 1) * per))
     }
 
@@ -3112,7 +3112,7 @@ impl RowPages {
         RowPages(
             span.get()
                 .max(1)
-                .div_ceil(PagedKvPool::POOL_PAGE_SLOTS as u32),
+                .div_ceil(PagedKvPool::POOL_PAGE_SLOTS.get()),
         )
     }
 
@@ -3132,7 +3132,7 @@ impl RowPages {
 
     /// The slots these pages hold — for a message that wants to state the context in positions.
     pub fn slots(self) -> SlotCount {
-        SlotCount::new(self.0 * PagedKvPool::POOL_PAGE_SLOTS as u32)
+        SlotCount::new(self.0 * PagedKvPool::POOL_PAGE_SLOTS.get())
     }
 
     /// Every logical page of the map, ascending — what the map builder walks.
@@ -4720,8 +4720,8 @@ const _: () = {
 // `PREFILL_WINDOW_PAGES` pages starting at a page boundary is as safe as one page was. A window that is not
 // a whole number of pages would leave a part straddling a page, which no part can address.
 const _: () = assert!(
-    PagedKvPool::PREFILL_CHUNK_SLOTS <= PagedKvPool::POOL_PAGE_SLOTS
-        || PagedKvPool::PREFILL_CHUNK_SLOTS.is_multiple_of(PagedKvPool::POOL_PAGE_SLOTS),
+    PagedKvPool::PREFILL_CHUNK_SLOTS <= PagedKvPool::POOL_PAGE_SLOTS.as_usize()
+        || PagedKvPool::PREFILL_CHUNK_SLOTS.is_multiple_of(PagedKvPool::POOL_PAGE_SLOTS.as_usize()),
     "a prefill chunk's padded write must fit inside ONE page, or span a whole number of pages — \
      otherwise a write part straddles a page boundary and lands on the next kv head's plane"
 );
@@ -4757,7 +4757,85 @@ impl DxGroupCeiling {
     pub const MAX_DESCRIPTORS: usize = 4204;
 }
 
+// ── THE TWO PAGE QUANTITIES, AS TYPES ─────────────────────────────────────────────────────────
+//
+// Both live HERE, one crate below the splice, because the law that relates them — a pool page is
+// a whole number of scheduler blocks — needs both types in one scope, and the dependency edge
+// runs splice → ktir-superdsc (the splice lowers INTO SuperDSC), so this is the one home both
+// can see. The splice re-exports both types; the numbers are each stated exactly once.
+//
+// ⛔ THE TWO ARE DIFFERENT QUANTITIES THAT MUST NOT BE PASSED WHERE THE OTHER BELONGS: the
+// scheduler's block is the token count the serving step's allocator hands out (the walk's
+// BLOCK_SIZE, the write's row modulus); the pool's page is the addressable slot count of one
+// KV pool page (masks are blocked by it, the fold sweeps it). Before they were types, a plain
+// `u32`/`usize` accepted either — the mix-up rustc now refuses is the one B6 was filed on.
+
+/// ⭐ THE SCHEDULER'S KV BLOCK — the number of token slots in one block the serving step's
+/// scheduler allocates: the quantity the splice's page walk tiles (`BLOCK_SIZE`) and the KV
+/// write's rows step by. A TYPED REFERENCE INPUT, NOT A DERIVATION: the value is the block
+/// size of the serving step we port, minted ONCE at [`SchedulerBlockTokens::REFERENCE`]. The
+/// reference's own law for the value — a multiple of 64 (`_BLOCK_SIZE_MULTIPLE`, the
+/// 128-byte fp16 stick), measured-throughput argmax — is cited, not re-derived: we port the
+/// step, we do not redesign its block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchedulerBlockTokens(std::num::NonZeroU32);
+
+impl SchedulerBlockTokens {
+    /// spyre-inference's own block size, 128: `_DEFAULT_BLOCK_SIZE`
+    /// (`spyre_inference/platform.py:146`), which `_align_block_size` only ever aligns a
+    /// user's size up to, and which every torch-spyre serve runs (its compiled decode walk
+    /// steps the page table and mask by 128 a trip). Half the trips of a 64-slot block for
+    /// the same context. The ONE statement of the value.
+    pub const REFERENCE: Self = Self(match std::num::NonZeroU32::new(128) {
+        Some(v) => v,
+        None => panic!("128 is nonzero"),
+    });
+
+    /// The block's token count — the accessor every integer boundary calls.
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The block's token count as a `usize` — the accessor for the host-side
+    /// page/stride arithmetic that counts in `usize`.
+    pub const fn as_usize(self) -> usize {
+        self.0.get() as usize
+    }
+}
+
+/// ⭐ THE POOL'S ADDRESSABLE PAGE — how many slots one page of the KV pool holds: masks are
+/// blocked by it, the fold sweeps it, a `KvSlot` never exceeds it. A MEASURED POLICY, NOT A
+/// DERIVATION (see [`PagedKvPool::POOL_PAGE_SLOTS`]'s own rationale for the k it picks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolPageSlots(std::num::NonZeroU32);
+
+impl PoolPageSlots {
+    /// ⭐ THE ONLY CONSTRUCTOR: `k` whole scheduler blocks. This function IS the law "a pool
+    /// page is a whole number of scheduler blocks" — a page built any other way is
+    /// unrepresentable, so the block→page mapping the write and the walk rely on stays whole
+    /// by construction and no separate assert exists. `k` is a MEASURED POLICY choice.
+    pub const fn of_scheduler_blocks(blocks: SchedulerBlockTokens, k: u32) -> Self {
+        assert!(k > 0, "a pool page spans at least one scheduler block");
+        match std::num::NonZeroU32::new(blocks.get() * k) {
+            Some(v) => Self(v),
+            None => panic!("k whole nonzero blocks are a nonzero page"),
+        }
+    }
+
+    /// The page's slot count — the accessor every integer boundary calls.
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The page's slot count as a `usize` — the accessor for the host-side
+    /// page/stride arithmetic that counts in `usize`.
+    pub const fn as_usize(self) -> usize {
+        self.0.get() as usize
+    }
+}
+
 impl PagedKvPool {
+    ///
     /// Positions per page.
     ///
     /// WAS 256, on the stated reasoning that "the page is the swept extent, so anything larger is a
@@ -4793,10 +4871,12 @@ impl PagedKvPool {
     /// (64/128/256 slots cost 39.5/39.0/42.0 ms at eight requests; the 1024-slot page
     /// measured a genuine 3.25× on device compute, but its DEFAULT pool became 3.84 GB —
     /// larger than the weights — and was reverted). A DISTINCT QUANTITY from the
-    /// scheduler's block (the splice's `SCHEDULER_BLOCK_TOKENS`, the reference's own
-    /// 128): a pool page is a WHOLE NUMBER of scheduler blocks (k=2 today), a relation
-    /// asserted in the splice where both are in scope.
-    pub const POOL_PAGE_SLOTS: usize = 256;
+    /// scheduler's block ([`SchedulerBlockTokens::REFERENCE`], the reference's own 128):
+    /// a pool page is a WHOLE NUMBER of scheduler blocks, and k=2 is the policy this
+    /// const states through [`PoolPageSlots::of_scheduler_blocks`] — the type's ONLY
+    /// constructor, so the relation is law, not assert.
+    pub const POOL_PAGE_SLOTS: PoolPageSlots =
+        PoolPageSlots::of_scheduler_blocks(SchedulerBlockTokens::REFERENCE, 2);
 
     /// ⭐ THE WIDEST PREFILL CHUNK — the baked row count of the prefix-capable prefill bundle, and
     /// therefore the number of slots ONE continuation chunk's cache write actually touches.
@@ -4824,7 +4904,7 @@ impl PagedKvPool {
     /// one). A window starting at a page boundary may fill all of them; one starting mid-page stays
     /// inside that page (see [`chunk_room`](Self::chunk_room)).
     pub const PREFILL_WINDOW_PAGES: usize =
-        Self::PREFILL_CHUNK_SLOTS.div_ceil(Self::POOL_PAGE_SLOTS);
+        Self::PREFILL_CHUNK_SLOTS.div_ceil(Self::POOL_PAGE_SLOTS.as_usize());
 
     /// ⛔⛔⛔ A CHUNK-FORM MODEL'S **BAKED** PREFILL LADDER MUST REACH THE POOL'S WINDOW — the bake's proof,
     /// panicked on by the macro.
@@ -4887,7 +4967,7 @@ impl PagedKvPool {
     /// Empty when nothing baked; just the top when the top fits one page (every model whose causal block
     /// stays sub-blocked, so its bake is byte-for-byte unchanged).
     pub fn prefix_rungs(baked: &[u32]) -> Vec<u32> {
-        let page = Self::POOL_PAGE_SLOTS as u32;
+        let page = Self::POOL_PAGE_SLOTS.get();
         let Some(top) = baked.iter().copied().max() else {
             return Vec::new();
         };
@@ -5031,7 +5111,7 @@ impl PagedKvPool {
     /// [`WRITE_SLACK`](Self::WRITE_SLACK) slots exist only so a padded chunk write has somewhere harmless
     /// to land, and nothing ever reads them — keeping the two numbers separate is what lets the overrun
     /// be absorbed without widening anything the attention actually sweeps.
-    pub const PLANE_SLOTS: usize = Self::POOL_PAGE_SLOTS + Self::WRITE_SLACK;
+    pub const PLANE_SLOTS: usize = Self::POOL_PAGE_SLOTS.as_usize() + Self::WRITE_SLACK;
 
     // REQUESTS ONE PAGE HOLDS — the extent of the pool's request dimension, and the widest batch any
     // launch can express.
@@ -5196,7 +5276,7 @@ impl PagedKvPool {
     ///
     /// Total, not fallible: every slot is inside some page, so there is always at least one slot of room.
     pub fn chunk_room(start: KvSlot) -> SlotCount {
-        let page = Self::POOL_PAGE_SLOTS as u32;
+        let page = Self::POOL_PAGE_SLOTS.get();
         match start.get() % page {
             0 => SlotCount::new(Self::PREFILL_WINDOW_PAGES as u32 * page),
             off => SlotCount::new(page - off),
@@ -5242,7 +5322,7 @@ impl PagedKvPool {
     /// [`KvHistory::record_chunk`] can name. Handing back a bare `KvSlot` is what let the write step back
     /// while the record did not; see [`ChunkStart`] for the measurement.
     pub fn chunk_write_start(want: KvSlot, padded: SlotCount) -> ChunkStart {
-        let page = Self::POOL_PAGE_SLOTS as u32;
+        let page = Self::POOL_PAGE_SLOTS.get();
         let off = want.get() % page;
         if off + padded.get() <= page {
             return ChunkStart(want);
@@ -5332,7 +5412,7 @@ impl PagedKvPool {
         // had run. At head_dim 128 block 0 was exact and every later block read one plane too far, so
         // attention was right over the first 64 cached slots and drifted from the 65th. The comment above
         // described this bug; it is now fixed rather than described.
-        (gqa_kv_head(qh, gqa) * Self::POOL_PAGE_SLOTS * self.hd) as u32
+        (gqa_kv_head(qh, gqa) * Self::POOL_PAGE_SLOTS.as_usize() * self.hd) as u32
             + b * STK as u32 * self.hd as u32
     }
 
@@ -5350,8 +5430,8 @@ impl PagedKvPool {
     /// ```
     pub fn kt_write_off(&self, kvh: usize, slot: usize, d: usize) -> usize {
         // The head's own block — no `ROWS` factor, because a page holds slots and not requests.
-        kvh * self.hd * Self::POOL_PAGE_SLOTS
-            + kcache_kt_write_offset(slot, d, self.hd, Self::POOL_PAGE_SLOTS, STK)
+        kvh * self.hd * Self::POOL_PAGE_SLOTS.as_usize()
+            + kcache_kt_write_offset(slot, d, self.hd, Self::POOL_PAGE_SLOTS.as_usize(), STK)
     }
 
     /// V WRITE offset of `V[slot][d]` within a page+layer. A `[1, hd]` row is CONTIGUOUS here, which
@@ -5366,8 +5446,8 @@ impl PagedKvPool {
     /// ```
     pub fn v_write_off(&self, kvh: usize, slot: usize, d: usize) -> usize {
         // The head's own block — no `ROWS` factor; a page holds slots, not requests.
-        kvh * Self::POOL_PAGE_SLOTS * self.hd
-            + vcache_write_offset(slot, d, self.hd, Self::POOL_PAGE_SLOTS, STK)
+        kvh * Self::POOL_PAGE_SLOTS.as_usize() * self.hd
+            + vcache_write_offset(slot, d, self.hd, Self::POOL_PAGE_SLOTS.as_usize(), STK)
     }
 
     /// Head width this pool laid itself out for.
@@ -5848,7 +5928,7 @@ impl PagePlaneExtent {
     /// Elements in one request's whole page plane — `nkvh * hd * POOL_PAGE_SLOTS`, the contiguous run one
     /// index entry names. This is `skip_addr`, so it is ALSO the unit the host's entry counts in.
     pub const fn elems(self) -> u64 {
-        self.nkvh as u64 * self.hd as u64 * PagedKvPool::POOL_PAGE_SLOTS as u64
+        self.nkvh as u64 * self.hd as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64
     }
 
     /// The plane's whole `mb` extent in one-stick sub-rows — `elems / POOL_STICK`. This is what ONE
@@ -5948,7 +6028,7 @@ impl PagePlaneExtent {
     /// page. Heads abut (proven in `zz_a_whole_page_plane_is_contiguous_at_every_head_dim`), so this is
     /// both the head stride and the head extent.
     pub const fn head_block_elems(self) -> u64 {
-        self.hd as u64 * PagedKvPool::POOL_PAGE_SLOTS as u64
+        self.hd as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64
     }
 
     /// [`Self::elems`] in BYTES — `skip_addr` as the host's page arithmetic counts it. The word length is
@@ -6535,7 +6615,7 @@ impl ChunkScratch {
     /// Slots the chunk spans — `pages * POOL_PAGE_SLOTS`, the score width of the one score matmul and the
     /// contraction of the one value matmul.
     pub const fn slots(self) -> u32 {
-        self.pages * PagedKvPool::POOL_PAGE_SLOTS as u32
+        self.pages * PagedKvPool::POOL_PAGE_SLOTS.get()
     }
 
     /// Stick-block entries in ONE (page, kv head) block — `hd * POOL_PAGE_SLOTS / entry_elems`, i.e.
@@ -7419,7 +7499,7 @@ impl BatchChunk {
     /// The slots one request's run of the chunk spans — the extent the body selector compares the
     /// batch's live context against ([`ChunkScratch::swept_per_request`]).
     pub(crate) const fn slots_per_request(self) -> u32 {
-        self.pages_per_request() * PagedKvPool::POOL_PAGE_SLOTS as u32
+        self.pages_per_request() * PagedKvPool::POOL_PAGE_SLOTS.get()
     }
 
     /// Rows of the ONE mask block every row block reads — a row block's own rows.
@@ -7483,7 +7563,7 @@ impl ChunkScratch {
     /// for is the chunk the emitter baked. `None` when `swept` is not a whole number of pages, or the
     /// product is not a chunk this pool admits.
     pub const fn of_batch(pool: PagedKvPool, requests: u32, swept: u32) -> Option<ChunkScratch> {
-        let per = PagedKvPool::POOL_PAGE_SLOTS as u32;
+        let per = PagedKvPool::POOL_PAGE_SLOTS.get();
         if requests == 0 || !swept.is_multiple_of(per) {
             return None;
         }
@@ -9680,7 +9760,7 @@ mod pool_demand_proofs {
         // sized for it.
         let cap: u32 = kani::any();
         kani::assume(cap >= 1 && cap <= 1 << 16);
-        kani::assume(context >= 1 && context <= cap * PagedKvPool::POOL_PAGE_SLOTS as u32);
+        kani::assume(context >= 1 && context <= cap * PagedKvPool::POOL_PAGE_SLOTS.get());
         let rows_n: u32 = kani::any();
         kani::assume(rows_n >= 1 && rows_n <= PoolRows::WIDEST.get().get());
         let rows = PoolRows::for_admission(AdmittedRequests::new(rows_n as usize).unwrap());

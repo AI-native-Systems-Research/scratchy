@@ -10688,7 +10688,7 @@ const _: () = assert!(
 const _: () = assert!(
     {
         use scratchy_subtile::sdsc_abstract::PagedKvPool;
-        let page = PagedKvPool::POOL_PAGE_SLOTS as u32;
+        let page = PagedKvPool::POOL_PAGE_SLOTS.get();
         let mut ok = true;
         let mut i = 0;
         while i < PREFILL_RUNGS.len() {
@@ -10700,7 +10700,8 @@ const _: () = assert!(
         let n = PREFILL_RUNGS.len();
         let top = PREFILL_RUNGS[n - 1];
         let half_page = page / 2;
-        ok && top as usize == PagedKvPool::PREFILL_WINDOW_PAGES * PagedKvPool::POOL_PAGE_SLOTS
+        ok && top as usize
+            == PagedKvPool::PREFILL_WINDOW_PAGES * PagedKvPool::POOL_PAGE_SLOTS.as_usize()
             && top as usize == PagedKvPool::PREFILL_CHUNK_SLOTS
             && PREFILL_RUNGS[n - 1].is_multiple_of(half_page)
             && PREFILL_RUNGS[n - 2].is_multiple_of(half_page)
@@ -10962,11 +10963,11 @@ fn dump_wavefront_mega(
     // before every `lower_decode_to_wavefront` call so decode + prefill can never
     // be baked at diverging capacities.
     //
-    // The page is the one the forward's attention walks (`paged_step::SCHEDULER_BLOCK_TOKENS`, compiled only
+    // The page is the one the forward's attention walks (`paged_step::SchedulerBlockTokens::REFERENCE.get()`, compiled only
     // under `spyre`); a build without that target has no pool to round to, and never calls this
     // function (its one call is gated on `cfg!(feature = "spyre")`).
     #[cfg(feature = "spyre")]
-    let page_slots = scratchy_target_spyre::paged_step::SCHEDULER_BLOCK_TOKENS;
+    let page_slots = scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
     #[cfg(not(feature = "spyre"))]
     let page_slots = 1u32;
     let prefix_len: std::num::NonZeroU32 = model
@@ -11840,7 +11841,7 @@ fn dump_wavefront_mega(
                                             // is a rung, so each step walks the fewest pages that
                                             // reach its context.
                                             let pool_pages =
-                                                cap / scratchy_target_spyre::paged_step::SCHEDULER_BLOCK_TOKENS;
+                                                cap / scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
                                             let ceiling_walk =
                                                 scratchy_target_spyre::paged_step::walk_pages(
                                                     pool_pages,
@@ -11855,7 +11856,7 @@ fn dump_wavefront_mega(
                                                 // `select_body` compares the live context against.
                                                 // A page walk's rung is the slots its walk reaches.
                                                 active_cap: superdsc::bundle::SweptCols::new(
-                                                    ceiling_walk * scratchy_target_spyre::paged_step::SCHEDULER_BLOCK_TOKENS,
+                                                    ceiling_walk * scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get(),
                                                 ),
                                                 bodies: rung_fps(&body_fps),
                                                 bodies_fused: std::borrow::Cow::Owned(
@@ -11909,7 +11910,7 @@ fn dump_wavefront_mega(
                                                     }
                                                 })
                                                 .map(|b| {
-                                                    let slots = b * scratchy_target_spyre::paged_step::SCHEDULER_BLOCK_TOKENS;
+                                                    let slots = b * scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
                                                     (
                                                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::new(slots),
                                                         slots,

@@ -6,7 +6,7 @@
 //! honest about the PUBLIC surface: every law below is reached through `sdsc_abstract`'s exported
 //! types, so a lock cannot quietly come to depend on something the crate does not expose.
 
-const PER_PAGE: u32 = scratchy_subtile::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS as u32;
+const PER_PAGE: u32 = scratchy_subtile::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.get();
 
 use scratchy_subtile::sdsc_abstract::{
     BatchSlot, DeclaredFold, FoldPages, FoldWalker, HeadRequestRow, KvHistory, KvSlot,

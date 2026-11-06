@@ -168,7 +168,8 @@ fn skip_addr_must_equal_one_layer_page_so_the_operand_must_span_one() {
     // The pool geometry, in the terms the emitter has to satisfy.
     const NKVH: u64 = 8;
     const HD: u64 = 64;
-    const POOL_PAGE_SLOTS: u64 = 256;
+    const POOL_PAGE_SLOTS: u64 =
+        scratchy_subtile::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.get() as u64;
     const BYTES_PER_ELEM: u64 = 2; // fp16 KV
 
     // One layer's page, as the pool lays it out.
@@ -498,12 +499,12 @@ fn the_row_of_a_coordinate_does_not_depend_on_how_many_windows_the_scratch_holds
     // THE HOST's scratch — the rung's CEILING sweep, which is what `DecodeRung::swept` carries.
     let ceiling = GatherScratch::of_fold_pass(
         pool,
-        SlotWindow::count_in(SlotCount::new(PagedKvPool::POOL_PAGE_SLOTS as u32)),
+        SlotWindow::count_in(SlotCount::new(PagedKvPool::POOL_PAGE_SLOTS.get())),
         mq,
     )
     .expect("the ceiling sweep admits the flat copy");
     // THE LAUNCHED BODY's scratch, at each interior ladder rung a short context selects.
-    for cap in [64u32, 128, PagedKvPool::POOL_PAGE_SLOTS as u32] {
+    for cap in [64u32, 128, PagedKvPool::POOL_PAGE_SLOTS.get()] {
         let body = GatherScratch::of_fold_pass(pool, SlotWindow::count_in(SlotCount::new(cap)), mq)
             .expect("an interior rung admits the flat copy");
         assert!(

@@ -24,7 +24,8 @@ use ktir_superdsc::superdsc_opspec::{KernelAxis, PageExtent, SdscFoldSet};
 /// Granite-3.1-2b's KV geometry, the bundle this work targets.
 const NKVH: i64 = 8;
 const HD: i64 = 64;
-const POOL_PAGE_SLOTS: i64 = 256;
+const POOL_PAGE_SLOTS: i64 =
+    ktir_superdsc::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.get() as i64;
 
 /// One layer's page in ELEMENTS — what one index step must advance by.
 const LAYER_PAGE_ELEMS: i64 = NKVH * HD * POOL_PAGE_SLOTS;

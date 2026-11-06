@@ -8,7 +8,7 @@ use ktir_superdsc::sdsc_abstract::{ChunkScratch, PagedKvPool};
 
 const NKVH: usize = 8;
 const STICK: u64 = 64;
-const POOL_PAGE_SLOTS: u64 = PagedKvPool::POOL_PAGE_SLOTS as u64;
+const POOL_PAGE_SLOTS: u64 = PagedKvPool::POOL_PAGE_SLOTS.get() as u64;
 
 /// For destination element `(kvh, dest_in_head)` of a gather whose entry order is `coord`, the
 /// `(page, element in that page's plane)` it is copied from: the entry it falls in names its source

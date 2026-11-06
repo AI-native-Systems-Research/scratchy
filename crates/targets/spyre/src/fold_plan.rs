@@ -1544,7 +1544,7 @@ mod tests {
             use scratchy_subtile::sdsc_abstract::{
                 POOL_STICK, PagedKvPool, PrefixMaskShape, RungWidth,
             };
-            const PER_PAGE: u32 = PagedKvPool::POOL_PAGE_SLOTS as u32;
+            const PER_PAGE: u32 = PagedKvPool::POOL_PAGE_SLOTS.get();
             PrefixMaskShape::<POOL_STICK, PER_PAGE>::new(
                 32,
                 RungWidth::of_baked_rows(2).expect("two rows"),

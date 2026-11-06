@@ -2392,7 +2392,8 @@ impl SpyreWorker {
         let (decode, prefill) = {
             drop(dparsed_all);
             drop(pparsed);
-            let page_slots = scratchy_target_spyre::paged_step::SCHEDULER_BLOCK_TOKENS as usize;
+            let page_slots =
+                scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.as_usize();
             let at_walk = |mut meta: BundleMeta, reach: Option<usize>| {
                 if let (Some(r), Some(p)) = (reach, meta.paged.as_mut()) {
                     p.walk = (r / page_slots) as u32;

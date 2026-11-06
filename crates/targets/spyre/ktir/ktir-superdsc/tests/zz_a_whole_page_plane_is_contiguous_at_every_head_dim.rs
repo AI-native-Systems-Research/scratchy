@@ -66,7 +66,7 @@ fn plane_addrs(pool: &PagedKvPool, plane: KvPlane) -> Vec<u32> {
     let mut out = Vec::new();
     for h in 0..pool.nkvh as u32 {
         let kvh = KvHead::new(h, nkvh).expect("kv head in range");
-        for slot in 0..PagedKvPool::POOL_PAGE_SLOTS as u32 {
+        for slot in 0..PagedKvPool::POOL_PAGE_SLOTS.get() {
             for feat in 0..pool.hd as u32 {
                 out.push(
                     pool.addr(
@@ -86,7 +86,7 @@ fn plane_addrs(pool: &PagedKvPool, plane: KvPlane) -> Vec<u32> {
 fn a_whole_page_plane_is_a_hole_free_bijection_for_every_plane_at_both_head_dims() {
     for hd in [64usize, 128] {
         let pool = PagedKvPool::new(8, hd);
-        let want = 8u64 * hd as u64 * PagedKvPool::POOL_PAGE_SLOTS as u64;
+        let want = 8u64 * hd as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64;
 
         let extent = PagePlaneExtent::of_pool(pool).expect("a stick-multiple head dim is admitted");
         assert_eq!(
@@ -192,7 +192,7 @@ fn the_four_coinciding_thirty_twos_are_four_different_quantities() {
             // `blocks` moves with `nkvh` ONLY — `hd` cancels.
             assert_eq!(
                 plane.blocks(),
-                nkvh as u64 * PagedKvPool::POOL_PAGE_SLOTS as u64 / POOL_STICK as u64,
+                nkvh as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64 / POOL_STICK as u64,
                 "nkvh={nkvh} hd={hd}: a request's entry count is nkvh * POOL_PAGE_SLOTS / stick"
             );
             assert_eq!(
@@ -282,7 +282,7 @@ fn the_scratch_head_corner_is_the_pools_own_addr_for_every_plane_and_head_dim() 
             let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(8)).expect("admitted");
             assert_eq!(
                 scratch.cols(),
-                nkvh_n as u64 * hd as u64 * PagedKvPool::POOL_PAGE_SLOTS as u64
+                nkvh_n as u64 * hd as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64
             );
 
             for plane in [KvPlane::Knat, KvPlane::V, KvPlane::Kt] {
@@ -517,7 +517,7 @@ fn the_entry_count_cancels_the_head_dim_but_the_entry_size_does_not() {
                 PagePlaneExtent::of_pool(PagedKvPool::new(nkvh, hd)).expect("stick multiple");
             assert_eq!(
                 plane.blocks(),
-                nkvh as u64 * PagedKvPool::POOL_PAGE_SLOTS as u64 / POOL_STICK as u64,
+                nkvh as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64 / POOL_STICK as u64,
                 "nkvh={nkvh} hd={hd}: a request's entry count is nkvh * POOL_PAGE_SLOTS / stick — `hd` CANCELS"
             );
             assert_eq!(
@@ -609,7 +609,7 @@ fn a_plane_unit_entry_would_reach_only_one_thirty_second_of_the_pool() {
         let ratio = plane.blocks();
         assert_eq!(
             ratio,
-            8 * PagedKvPool::POOL_PAGE_SLOTS as u64 / POOL_STICK as u64,
+            8 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64 / POOL_STICK as u64,
             "hd={hd}: the ratio is nkvh*POOL_PAGE_SLOTS/POOL_STICK, and `hd` cancels out of it"
         );
         assert_eq!(

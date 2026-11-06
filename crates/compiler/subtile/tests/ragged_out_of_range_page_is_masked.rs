@@ -47,7 +47,7 @@ fn declare(grid: MaskPassGrid) -> DeclaredFold {
 
 #[test]
 fn a_pass_past_a_rows_own_pages_has_no_valid_column() {
-    const PER_PAGE: u32 = PagedKvPool::POOL_PAGE_SLOTS as u32;
+    const PER_PAGE: u32 = PagedKvPool::POOL_PAGE_SLOTS.get();
     let pages_each = [1usize, 3, 6, 8];
     // One history per BOUND row — the modelled bundle's rung width.
     let rung =
@@ -58,7 +58,7 @@ fn a_pass_past_a_rows_own_pages_has_no_valid_column() {
     // The ragged batch as it stands before any decode step: each row a contiguous prefix of its own length.
     let hists: Vec<KvHistory> = pages_each
         .iter()
-        .map(|p| KvHistory::contiguous(p * PagedKvPool::POOL_PAGE_SLOTS))
+        .map(|p| KvHistory::contiguous(p * PagedKvPool::POOL_PAGE_SLOTS.as_usize()))
         .collect();
 
     let shape = PrefixMaskShape::<{ scratchy_subtile::sdsc_abstract::POOL_STICK }, PER_PAGE>::new(
@@ -115,7 +115,7 @@ fn a_pass_past_a_rows_own_pages_has_no_valid_column() {
 /// the two-run rows alike. A disagreement between the two shapes at that column is the bug.
 #[test]
 fn the_boundary_column_agrees_for_holed_and_hole_free_rows() {
-    const PER_PAGE: u32 = PagedKvPool::POOL_PAGE_SLOTS as u32;
+    const PER_PAGE: u32 = PagedKvPool::POOL_PAGE_SLOTS.get();
     let lens = [225usize, 710, 1282, 1986]; // the ragged profile the card fails on
     // One history per BOUND row — the modelled bundle's rung width.
     let rung = RungWidth::of_baked_rows(lens.len() as u32).expect("a modelled bundle has rows");
@@ -142,7 +142,7 @@ fn the_boundary_column_agrees_for_holed_and_hole_free_rows() {
     let max_pages = grid.pages().get();
     assert_eq!(
         max_pages as usize,
-        (shared + 1).div_ceil(PagedKvPool::POOL_PAGE_SLOTS),
+        (shared + 1).div_ceil(PagedKvPool::POOL_PAGE_SLOTS.as_usize()),
         "FoldPages must reproduce the shim's ceiling exactly — that equality is the lock"
     );
     assert_eq!(
@@ -165,8 +165,8 @@ fn the_boundary_column_agrees_for_holed_and_hole_free_rows() {
     );
 
     let bytes = decode_batch_prefix_mask_f16::<PER_PAGE>(shape, declare(grid), &hists, -30000.0);
-    let page = (shared / PagedKvPool::POOL_PAGE_SLOTS) as u32;
-    let col = (shared % PagedKvPool::POOL_PAGE_SLOTS) as u32;
+    let page = (shared / PagedKvPool::POOL_PAGE_SLOTS.as_usize()) as u32;
+    let col = (shared % PagedKvPool::POOL_PAGE_SLOTS.as_usize()) as u32;
 
     // THE BOUNDARY COLUMN: the slot every row just wrote. It must read VALID for EVERY row — the
     // hole-free one and the holed ones alike.

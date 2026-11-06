@@ -33,7 +33,7 @@ use crate::wiring::PagedStep;
 /// The page walk's laws, where the bake and the worker that state a bundle's walk reach them: the
 /// page size, a rung's walk ([`walk_pages`]) and the rungs a pool is walked by ([`walk_buckets`]).
 pub use scratchy_triton_splice::{
-    BatchChunking, PagedRows, SCHEDULER_BLOCK_TOKENS, walk_buckets, walk_pages,
+    BatchChunking, PagedRows, SchedulerBlockTokens, walk_buckets, walk_pages,
 };
 
 /// `finfo(float16).min` — spyre-inference's masked additive value: finite, so a fully-masked tile's
@@ -114,8 +114,9 @@ pub fn prove_ladder_walks(
 /// 104832 positions, 819 pages. `None` when not one page fits.
 pub fn pool_slots(context_slots: u32, kv_slot_bytes: u64) -> Option<std::num::NonZeroU32> {
     let fit = scratchy_spyre_bundle::MAX_SEGMENT_BYTES / kv_slot_bytes.max(1);
-    let fit_pages = u32::try_from(fit / u64::from(SCHEDULER_BLOCK_TOKENS)).unwrap_or(u32::MAX);
-    let slots = context_slots.min(fit_pages.saturating_mul(SCHEDULER_BLOCK_TOKENS));
+    let fit_pages =
+        u32::try_from(fit / u64::from(SchedulerBlockTokens::REFERENCE.get())).unwrap_or(u32::MAX);
+    let slots = context_slots.min(fit_pages.saturating_mul(SchedulerBlockTokens::REFERENCE.get()));
     std::num::NonZeroU32::new(slots)
 }
 
@@ -866,12 +867,13 @@ mod tests {
         let p = pool_slots(ctx, slot(40, 8, 128)).expect("a page fits");
         assert_eq!(p.get(), 104_832);
         assert!(
-            p.get().is_multiple_of(SCHEDULER_BLOCK_TOKENS),
+            p.get()
+                .is_multiple_of(SchedulerBlockTokens::REFERENCE.get()),
             "whole pages"
         );
         assert!(u64::from(p.get()) * slot(40, 8, 128) <= scratchy_spyre_bundle::MAX_SEGMENT_BYTES);
         assert!(
-            u64::from(p.get() + SCHEDULER_BLOCK_TOKENS) * slot(40, 8, 128)
+            u64::from(p.get() + SchedulerBlockTokens::REFERENCE.get()) * slot(40, 8, 128)
                 > scratchy_spyre_bundle::MAX_SEGMENT_BYTES
         );
         // A context shorter than the pool would hold is the pool.

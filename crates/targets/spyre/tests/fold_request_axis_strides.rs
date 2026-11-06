@@ -78,7 +78,7 @@ const NKVH: usize = 8;
 #[test]
 fn the_pinned_request_stride_is_exactly_the_kv_head_stride() {
     let pool = PagedKvPool::new(NKVH, HD);
-    let pinned = HD * PagedKvPool::POOL_PAGE_SLOTS;
+    let pinned = HD * PagedKvPool::POOL_PAGE_SLOTS.as_usize();
     assert_eq!(
         pool.plane_block_elems(),
         HD * PagedKvPool::PLANE_SLOTS,
@@ -142,7 +142,7 @@ fn the_only_axis_the_pinned_constant_matches_is_the_kv_head_one() {
     )) - base;
     let slot = pool.addr(KvCoord::block(KvPlane::Kt, kvh0).at_slot(KvSlot::new(1))) - base;
     let feat = pool.addr(KvCoord::block(KvPlane::Kt, kvh0).at_feat(FeatIdx::of_slab(1))) - base;
-    let pinned = (HD * PagedKvPool::POOL_PAGE_SLOTS) as u32;
+    let pinned = (HD * PagedKvPool::POOL_PAGE_SLOTS.as_usize()) as u32;
     // The KV-HEAD axis is the one it matches, and matching it is the defect: the batch axis was
     // aliased onto the head axis, so request `r` scored against kv head `r`'s keys. With nkvh=8 and a
     // batch of 8 the alias is total — every row reads real, well-formed keys from the wrong head.

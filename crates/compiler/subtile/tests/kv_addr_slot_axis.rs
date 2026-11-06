@@ -92,7 +92,7 @@ fn only_kt_spans_its_whole_plane_with_slots_at_any_head_dim() {
         for plane in [KvPlane::Kt, KvPlane::V, KvPlane::Knat] {
             let base = KvCoord::block(plane, kvh(0));
             let a_page_of_slots = p
-                .addr(base.at_slot(KvSlot::new(PagedKvPool::POOL_PAGE_SLOTS as u32)))
+                .addr(base.at_slot(KvSlot::new(PagedKvPool::POOL_PAGE_SLOTS.get())))
                 - p.addr(base);
             let spans = a_page_of_slots == footprint;
             match (hd, plane) {

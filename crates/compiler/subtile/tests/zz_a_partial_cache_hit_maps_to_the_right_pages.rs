@@ -20,7 +20,7 @@ use scratchy_subtile::sdsc_abstract::{
     PoolRows, RowPages, SlotCount,
 };
 
-const PAGE: u32 = PagedKvPool::POOL_PAGE_SLOTS as u32;
+const PAGE: u32 = PagedKvPool::POOL_PAGE_SLOTS.get();
 
 fn partition() -> PoolPartition {
     // The measured pool: 136 pages, 32 launch rows → 71 host blocks, page 71 the scratch, 72.. the holes.
