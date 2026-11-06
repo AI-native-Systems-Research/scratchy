@@ -875,6 +875,22 @@ required-features = ["cuda", "qwen3.6-35b-a3b"]
 name = "cuda_tapes_gemma4"
 required-features = ["cuda", "gemma-4-26b-a4b-it"]
 
+# The three FP8 checkpoints' emitted CUDA tapes under `fp8-dynamic-per-channel` (FP8 S2): the fp8
+# steps per bucket, the quant writes and the quant scratch's liveness, the weight table, and
+# `check` against each checkpoint's real safetensors headers (`tests/fixtures/fp8_headers_*`), with
+# no toolchain. The fp8 steps have no kernels yet (S3, S4).
+[[test]]
+name = "cuda_tapes_27b_fp8"
+required-features = ["cuda", "qwen3.8-27b-text-only", "scratchy-quantizations/fp8-dynamic-per-channel"]
+
+[[test]]
+name = "cuda_tapes_35b_fp8"
+required-features = ["cuda", "qwen3.6-35b-a3b", "scratchy-quantizations/fp8-dynamic-per-channel"]
+
+[[test]]
+name = "cuda_tapes_gemma4_fp8"
+required-features = ["cuda", "gemma-4-26b-a4b-it", "scratchy-quantizations/fp8-dynamic-per-channel"]
+
 # Gemma 4 26B-A4B's whole-model synthetic-weight forward on the H100 (#925): the qwen checks (a)-(o)
 # where they apply, plus the sliding window's (p)-(r), in its own body
 # (tests/common/cuda_prefill_gemma4_body.rs). Needs nvcc to build, and an H100 and about 51 GB of
