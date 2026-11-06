@@ -9,7 +9,7 @@
 //! odd vocab (49155) does not split into whole sticks, so the lm head stays whole and no
 //! all-gather is needed.
 
-#![cfg(all(feature = "spyre", feature = "granite-3.1-2b-instruct"))]
+#![cfg(all(feature = "spyre", feature = "tp-2", feature = "granite-3.1-2b-instruct"))]
 
 use scratchy_target_spyre::wiring::SourceShard;
 
