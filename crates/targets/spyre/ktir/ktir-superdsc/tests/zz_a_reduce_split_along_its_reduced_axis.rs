@@ -72,6 +72,7 @@ fn spec(op: OpFunc, division: ReduceDivision) -> Result<OpSpec, String> {
         accum,
         df: Df::Fp16,
         division,
+        scaling_cols: COLS,
     })
 }
 

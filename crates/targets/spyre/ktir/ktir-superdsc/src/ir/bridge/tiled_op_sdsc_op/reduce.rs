@@ -623,6 +623,7 @@ pub fn reduce_opspec_off<D: KindTag, A: KindTag>(
         accum,
         df,
         division: ReduceDivision::Rows,
+        scaling_cols: cols,
     })
 }
 
@@ -662,6 +663,12 @@ pub struct ReduceOffSpec<'a, D: KindTag, A: KindTag> {
     pub df: Df,
     /// How the cores are spent. [`ReduceDivision::Rows`] is [`reduce_opspec_off`] byte for byte.
     pub division: ReduceDivision,
+    /// The extent the scaling const divides by (mean/exx2's 1/N): the reduce's LOGICAL reduced
+    /// extent. Equals `cols` for every whole reduce; a long-reduce SLICE states the WHOLE
+    /// reduce's extent here while `cols` carries the slice's own geometry, so the slices'
+    /// partials ADD to the single-shot result — each slice's pad lanes are masked to the
+    /// reduce's identity and contribute nothing.
+    pub scaling_cols: u32,
 }
 
 /// [`reduce_opspec_off`] under a STATED [`ReduceDivision`]. A [`ReduceDivision::ReducedAxis`] reduce
@@ -678,6 +685,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
         accum,
         df,
         division,
+        scaling_cols,
     } = r;
     // TYPED: `head_major` is DERIVED from the DATA operand's kind (see `ReduceOffSpec`'s doc) —
     // the Win carries the handle, so the kind crosses into this layer by type.
@@ -866,7 +874,9 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
         ));
     }
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    let op_info = reduce_op_info(op, cols, df, accum_name)?;
+    // The scaling const divides by the reduce's LOGICAL extent (`scaling_cols`), never by
+    // this emission's slice geometry — see `ReduceOffSpec::scaling_cols`.
+    let op_info = reduce_op_info(op, scaling_cols, df, accum_name)?;
     Ok(OpSpec {
         op,
         is_reduction: true,
@@ -951,6 +961,7 @@ pub fn assemble_reduce_off_divided<T: crate::collective::Tp, D: KindTag, A: Kind
         accum,
         df,
         division,
+        scaling_cols: cols.get(),
     })
     .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -970,18 +981,23 @@ pub fn assemble_reduce_off_divided<T: crate::collective::Tp, D: KindTag, A: Kind
 ///
 /// * THE TILER DECIDES — the probe builds the SAME opspec the caller's own single-shot emission
 ///   builds (same op, rows, cols, df, division; the operand names and offsets cannot move the
-///   tiler's answer) and reads `time` and the reduced axis's core split. `time == 1`, or a
-///   [`ReduceDivision::ReducedAxis`] reduce whose template rings the cores' partials itself,
-///   returns `Ok(None)` and the caller emits its single descriptor UNCHANGED — byte-identical
-///   for every reduce that fits, which is every shipped bundle.
-/// * THE SPLIT: `time` SINGLE-SHOT seeded reduces, each over one `[rows, N/time]` column slice
-///   of the data (a whole-stick run — the TimeTile invariant — at `col_of`'s whole-block shift of
-///   the op's own slab, the fp8 amax-partial precedent). Slice 0 seeds the CALLER's accum
+///   tiler's answer) and reads its typed time-tile answer ([`DividedSticks`] — trips that
+///   divide the reduced dim's own stick count, proven inside the tiler's divisor search) and
+///   the reduced axis's core split. One trip, or a [`ReduceDivision::ReducedAxis`] reduce whose
+///   template rings the cores' partials itself, returns `Ok(None)` and the caller emits its
+///   single descriptor UNCHANGED — byte-identical for every reduce that fits, which is every
+///   shipped bundle.
+/// * THE SPLIT: `time` SINGLE-SHOT seeded reduces, each over one column slice of the data at
+///   `col_of`'s whole-block shift of the op's own slab (the fp8 amax-partial precedent). The
+///   tiler divided the reduced dim's PADDED stick count, so every slice but the last is a
+///   whole-stick run at the full per-trip width, and a sub-stick width's tail pad rides the
+///   LAST slice as its raw remainder — masked by the reduce's own coordinate mask, the same law
+///   the single-shot padded reduce lives by. Slice 0 seeds the CALLER's accum
 ///   (attn's bmax→run_m law: no copy op for the only-ever-first slot); slices 1..time each land
 ///   in their OWN `[rows, stick]` synth under the reduce's place
 ///   ([`crate::place::SynthRole::ReducePartial`]), so no two reduces share an output byte — the
 ///   alias is unrepresentable, not avoided. Each slice is single-shot BY CONSTRUCTION: its
-///   residency is exactly the per-trip residency the tiler validated when it chose `time`.
+///   residency is at most the per-trip residency the tiler validated when it chose `time`.
 /// * THE COMBINE, ONE PER REDUCE KIND, never per shape or model: `max` takes the maximum —
 ///   exactly reassociable, the same bits in any order — and every sum-class kind (sum, mean,
 ///   exx2) ADDS its partials: each slice's scaling const is the SAME 1/N, so the running add of
@@ -1004,8 +1020,7 @@ pub struct ReduceSplit<'a, D: KindTag, A: KindTag> {
     /// a whole stick and masks the pad lanes ([`reduce_stick_elems`] — the vendor's own
     /// `[32, 514]` max fixture), so a fitted sub-stick reduce is a legal single shot. The
     /// whole-stick law is a law OF THE SPLIT, and it lives where the split is decided: the
-    /// [`ReduceSlices`] type below cannot exist for a width that does not divide into
-    /// whole-stick slices.
+    /// [`ReduceSlices`] type below, minted from the tiler's own [`DividedSticks`] witness.
     cols: u32,
     df: Df,
     /// The data's PARENT handle, declared at the parent's own full `[rows, parent_cols]`
@@ -1064,33 +1079,47 @@ impl<'a, D: KindTag, A: KindTag> ReduceSplit<'a, D, A> {
     }
 }
 
-/// ⭐ THE SLICE COUNT of a split long reduce — a divisor of the reduced width that yields
-/// WHOLE-STICK slices. Minted only from the tiler's own `time` answer, so the TimeTile
-/// invariant ("every slice is a whole-stick run of every row") is the TYPE's law: a
-/// `ReduceSlices` cannot exist for a width that does not so divide, and the slice's element
-/// width is carried by the type, never re-derived at a use site.
+/// ⭐ THE SLICES of a split long reduce. Minted only from the tiler's own typed answer
+/// ([`DividedSticks`] — trips that divide the stick count of the dim the tiler tiled, proven
+/// inside `time_tile_for_lx`'s divisor search, superdsc_opspec.rs), so the TimeTile invariant
+/// ("every slice is a whole-stick run of every row") is the TYPE's law and no divisibility is
+/// ever re-checked here.
+///
+/// The sticks the tiler divided are the reduced dim's PADDED extent (`reduce_dims_kind` states
+/// the "out" dim at [`reduce_stick_elems`]'s pad-up), and a sub-stick reduced width pads its
+/// tail into the LAST slice: every slice but the last is a whole-stick run at the full slice
+/// width, and the last slice carries the RAW remainder, whose own pad lanes are masked by the
+/// reduce's own coordinate mask — the same [`reduce_coordinate_mask`] law the single-shot
+/// padded reduce lives by, stated per slice because each slice IS an ordinary reduce at its
+/// own width. No width is refused: the split is the LOWERING, and the masked tail is
+/// numerically inert in the combine (the mask word is the reduce's identity).
 struct ReduceSlices {
     time: u32,
     slice_cols: u32,
+    last_cols: u32,
 }
 
 impl ReduceSlices {
-    /// `Ok(None)` — the tiler answered one trip: the reduce fits, and the caller's own single
-    /// shot stands. `Err` — the tiler split a width that does not divide into whole-stick
-    /// slices: the TimeTile invariant is broken and no slice corner is addressable.
-    fn of(op_name: &str, time: u32, cols: u32, stick: u32) -> Result<Option<ReduceSlices>, String> {
-        if time <= 1 {
-            return Ok(None);
+    /// The slices of `cols` under the tiler's own divided sticks. The raw width always reaches
+    /// into the last slice (`padded < cols + stick`, and one slice is at least a whole stick),
+    /// so the remainder below is at least one element and at most one slice.
+    fn of(divided: crate::superdsc_opspec::DividedSticks, cols: u32, stick: u32) -> ReduceSlices {
+        let time = divided.trips();
+        let slice_cols = divided.sticks_per_trip() * stick;
+        ReduceSlices {
+            time,
+            slice_cols,
+            last_cols: cols - (time - 1) * slice_cols,
         }
-        let slice_cols = cols / time;
-        if slice_cols == 0 || !slice_cols.is_multiple_of(stick) || slice_cols * time != cols {
-            return Err(format!(
-                "{op_name}: the tiler split the reduce {time}-ways but the reduced width {cols} \
-                 does not divide into {time} whole {stick}-element sticks — the TimeTile invariant \
-                 is broken and no slice corner is addressable"
-            ));
+    }
+
+    /// Slice `j`'s raw element width — the full whole-stick run, or the last slice's remainder.
+    fn cols_of(&self, j: u32) -> u32 {
+        if j + 1 == self.time {
+            self.last_cols
+        } else {
+            self.slice_cols
         }
-        Ok(Some(ReduceSlices { time, slice_cols }))
     }
 }
 
@@ -1138,17 +1167,20 @@ pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
         accum: probe_accum,
         df: s.df,
         division: s.division,
+        scaling_cols: s.cols,
     })
     .map_err(|e| format!("{}: {e}", s.op_name))?;
     if probe.iter.split_of("out") > 1 {
         return Ok(None);
     }
-    let stick = s.df.elems_per_stick();
-    let Some(slices) = ReduceSlices::of(s.op_name, probe.time(), s.cols, stick)? else {
+    // The tiler's own typed answer: `None` is one trip (the reduce fits — the caller's single
+    // shot), `Some` is trips that divide the reduced dim's stick count by the search's own law.
+    let Some(divided) = probe.time_divided() else {
         return Ok(None);
     };
+    let stick = s.df.elems_per_stick();
+    let slices = ReduceSlices::of(divided, s.cols, stick);
     let time = slices.time;
-    let slice_cols = slices.slice_cols;
     // The partials: `time - 1` synthetics under the reduce's own place, one stick per row each,
     // so no two slice reduces share an output byte. Slice 0 seeds the CALLER's accum.
     use crate::place::SynthRole as R;
@@ -1170,10 +1202,11 @@ pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
         .collect::<Result<_, _>>()?;
     let mut ops: Vec<EmittedOp> = Vec::new();
     for j in 0..time {
+        let slice_cols = slices.cols_of(j);
         let corner = crate::addr::col_of(
             rows,
             parent_cols,
-            s.data_col.column() + j * slice_cols,
+            s.data_col.column() + j * slices.slice_cols,
             s.df,
         );
         let op_name = format!("{}_p{j}_op", s.op_name);
@@ -1206,7 +1239,18 @@ pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
                 &format!("{op_name}: the slice's accum window (its own partial)"),
             )?
         };
-        let spec = reduce_opspec_off(s.op, rows, slice_cols, data_win, accum_win, s.df)?;
+        // The slice's own geometry (`cols` = the slice's width, its pad lanes masked) with the
+        // WHOLE reduce's scaling extent — the partials must add to the single-shot result.
+        let spec = reduce_opspec_off_divided(ReduceOffSpec {
+            op: s.op,
+            rows,
+            cols: slice_cols,
+            data: data_win,
+            accum: accum_win,
+            df: s.df,
+            division: ReduceDivision::Rows,
+            scaling_cols: s.cols,
+        })?;
         let folds = SdscFoldSet::new(spec.iter.cores_used());
         ops.push(
             crate::emit::emit_sdsc_tiled(&op_name, &spec, &folds, sym_id_base, layout)
@@ -1215,27 +1259,56 @@ pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
     }
     // THE COMBINE, one per reduce kind: accum = accum ∘ partial_j, running, in place on the
     // caller's accum, through the same pointwise door every other combine takes. The width is
-    // the accum handle's own declared stick — one law, read once.
+    // the accum handle's own declared stick — one law, read once. fp16 rides the shipped offset
+    // door; every other df rides the SAME one builder that door wraps
+    // (`pointwise_broadcast_opspec_df`), stated at the reduce's own df — an fp32 accum is 32
+    // lanes wide, a width the fp16-stick door cannot even spell (and an fp16 add over fp32
+    // lanes would mis-read every value).
     let combine_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(
         u32::try_from(s.accum.layout().cols).unwrap_or(stick),
     );
     let combine = combine_op_func_of(s.op);
     for (i, p) in partials.iter().enumerate() {
         let op_name = format!("{}_c{}_op", s.op_name, i + 1);
-        ops.push(crate::emit::assemble_pointwise_broadcast_off(
-            &op_name,
-            combine,
-            rows_t,
-            combine_cols,
-            &[
-                crate::emit::In::sliced(s.accum, s.accum_off).ew(),
-                crate::emit::In::full(p).ew(),
-            ],
-            s.accum,
-            s.accum_off,
-            sym_id_base,
-            layout,
-        ));
+        if matches!(s.df, Df::Fp16) {
+            ops.push(crate::emit::assemble_pointwise_broadcast_off(
+                &op_name,
+                combine,
+                rows_t,
+                combine_cols,
+                &[
+                    crate::emit::In::sliced(s.accum, s.accum_off).ew(),
+                    crate::emit::In::full(p).ew(),
+                ],
+                s.accum,
+                s.accum_off,
+                sym_id_base,
+                layout,
+            ));
+        } else {
+            let mut op = crate::emit::pointwise_broadcast_opspec_df(
+                op_func_from_str(combine),
+                rows,
+                stick,
+                &[
+                    crate::emit::In::sliced(s.accum, s.accum_off).ew(),
+                    crate::emit::In::full(p).ew(),
+                ],
+                s.accum.name(),
+                crate::addr::OutCorner::At(s.accum_off),
+                A::kind() == StickKind::Flat,
+                s.df,
+                layout,
+                crate::work::EwDivision::Law,
+            )
+            .map_err(|e| format!("{op_name}: {e}"))?;
+            crate::emit::apply_lx_residency(&mut op, layout);
+            let folds = SdscFoldSet::new(op.iter.cores_used());
+            ops.push(
+                crate::emit::emit_sdsc_tiled(&op_name, &op, &folds, sym_id_base, layout)
+                    .map_err(|e| e.0)?,
+            );
+        }
     }
     Ok(Some(ops))
 }
@@ -1382,6 +1455,99 @@ mod long_reduce_split {
         assert!(
             split.is_none(),
             "a fitting reduce is the caller's own single shot"
+        );
+    }
+
+    /// The op's one `dscs_` entry, keyed by its emitted name — where the DSC-level fields live.
+    fn dsc(e: &EmittedOp, name: &str) -> serde_json::Value {
+        serde_json::to_value(&e.op).unwrap()["dscs_"][0][name].clone()
+    }
+
+    /// ⭐ A SUB-STICK REDUCED WIDTH SPLITS TOO, and the split is the LOWERING the old refusal
+    /// never owed: the tiler divided the PADDED stick count (16,384 sticks of 64), so the 31
+    /// pad lanes ride the LAST slice as its raw remainder, masked by the reduce's own
+    /// coordinate mask — the same law the single-shot padded reduce lives by. And EVERY slice
+    /// carries the WHOLE reduce's 1/N scaling const (`ReduceOffSpec::scaling_cols`), the fact
+    /// that makes the running add of the partials the single-shot mean: a slice-local 1/cols
+    /// would add to `time` × it.
+    ///
+    /// (fp16, one row, 1,048,545 wide — 31 lanes past the stick-aligned 1,048,576; full-width
+    /// residency 2,097,280 B bills past the 1,677,721-B budget, and half of it fits, so the
+    /// tiler answers time=2.)
+    #[test]
+    fn a_sub_stick_width_splits_with_its_pad_masked_on_the_last_slice() {
+        let cols = 1_048_545u32;
+        // The data handle declares the caller's PADDED extent (the stick-granular buffer the
+        // allocator hands out) — the same contract every caller of the win mints states, and
+        // the mint's own bound.
+        let data = Stk::<crate::sdsc_abstract::FlatTag>::new(
+            "w",
+            crate::sdsc_abstract::StickLayout::flat_df(1, 1_048_576, Df::Fp16),
+        )
+        .expect("the fp16 flat data handle mints");
+        let accum = Stk::<crate::sdsc_abstract::FlatTag>::new(
+            "j",
+            crate::sdsc_abstract::StickLayout::flat_df(
+                1,
+                <Fp16 as DataFormat>::ELEMS_PER_STICK as usize,
+                Df::Fp16,
+            ),
+        )
+        .expect("the fp16 flat accum handle mints");
+        let split = assemble_reduce_split(
+            ReduceSplit::new(
+                "mean16",
+                OpFunc::Mean,
+                1,
+                cols,
+                &data,
+                0,
+                &accum,
+                DevOff::ZERO,
+                crate::place::PlaceId::Act(1),
+                ReduceDivision::Rows,
+                Df::Fp16,
+            )
+            .expect("the split request mints"),
+            &mut 0i64,
+            None,
+        )
+        .expect("the split body runs")
+        .expect("the past-the-budget row genuinely splits");
+        // time=2: two slice reduces + one combine.
+        assert_eq!(split.len(), 2 + 1, "two slices and their combine");
+        let d0 = dsc(&split[0], "mean16_p0_op");
+        let d1 = dsc(&split[1], "mean16_p1_op");
+        // Both slices walk their own padded extent (524,288 = 8,192 sticks)...
+        assert_eq!(
+            d0["N_"]["out_"].as_u64(),
+            Some(524_288),
+            "slice 0's padded out"
+        );
+        assert_eq!(
+            d1["N_"]["out_"].as_u64(),
+            Some(524_288),
+            "slice 1's padded out"
+        );
+        // ...but only the LAST slice masks: its raw remainder is 524,257, 31 lanes short.
+        assert_eq!(
+            d0["coordinateMasking_"].to_string(),
+            "{}",
+            "slice 0 is stick-aligned"
+        );
+        assert_eq!(
+            d1["coordinateMasking_"].to_string(),
+            r#"{"out":[[524257,31]]}"#,
+            "the tail pad rides the last slice, masked"
+        );
+        // Every slice's scaling const is the SAME whole-reduce 1/N — never its own slice width.
+        assert_eq!(
+            d0["constantInfo_"]["0"]["name_"], "scaling_factor",
+            "the mean's scaling const"
+        );
+        assert_eq!(
+            d0["constantInfo_"]["0"], d1["constantInfo_"]["0"],
+            "both slices carry the WHOLE reduce's 1/N, so the partials add to the single-shot mean"
         );
     }
 }
