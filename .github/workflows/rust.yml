@@ -69,11 +69,13 @@ jobs:
       # depends unconditionally on `scratchy-target-metal`, so `objc2` came
       # back in through the side door.
       #
-      # One model, not `scratchy-models/all`: under `spyre` the build script
-      # bakes a card bundle for every selected config, and some spyre-capable
-      # configs (llama-2-13b, a gemma-4 MoE) don't lower to the card yet, so
-      # `all` panics at bake. Every arch's forward is linted by the macOS job;
-      # granite is the one the card builds use.
+      # One model, not `scratchy-models/all`: under `spyre` the build script bakes a
+      # card bundle for every selected config, and an arch whose ops have no spyre
+      # lowering fails the build AT THE FIRST SUCH OP, by name — the law working,
+      # and the error is the worklist. The one-model scope stays for bake time and
+      # RAM (every selected config's full expansion), per the CLAUDE.md rule: never
+      # build `model/all` to test one thing. Every arch's forward is linted by the
+      # macOS job; granite is the one the card builds use.
       - name: Clippy
         run: cargo clippy --workspace --features spyre,scratchy-models/granite-3.1-8b-instruct
           --exclude scratchy-target-metal

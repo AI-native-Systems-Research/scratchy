@@ -13,7 +13,9 @@
 //! (metal/spyre/…) is forwarded onto it so the emit matches what we then compile.
 use proc_macro2::{Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 use rayon::prelude::*;
-use scratchy_forward_compiler_macro::{compile_carrier, parse_python_file, render_tokens};
+use scratchy_forward_compiler_macro::{
+    CarrierError, compile_carrier, parse_python_file, render_tokens,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -162,8 +164,14 @@ fn emit_arch(dsl_path: &Path, configs_dir: &Path, out_dir: &Path, mod_name: &str
         .unwrap_or_else(|e| panic!("read {}: {e}", dsl_path.display()));
     let carrier =
         parse_python_file(&dsl).unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
-    let tokens = compile_carrier(carrier, configs_dir)
-        .unwrap_or_else(|e| panic!("forward pipeline ({mod_name}): {e}"));
+    // The stem arrives as a FIELD of the typed error (compile_carrier is called once per
+    // arch, so the per-config stem can only enter there) — printed, never parsed.
+    let tokens = compile_carrier(carrier, configs_dir).unwrap_or_else(|e| match e {
+        CarrierError::Config { stem, source } => {
+            panic!("forward pipeline ({mod_name}/{stem}): {source}")
+        }
+        CarrierError::Arch(source) => panic!("forward pipeline ({mod_name}): {source}"),
+    });
     // Re-root the emit under `pub mod <mod>` (see reroot_crate).
     let tokens = reroot_crate(tokens, mod_name);
 
@@ -359,6 +367,18 @@ fn main() {
     let cuda = std::env::var("CARGO_FEATURE_CUDA").is_ok();
     // Every arch whose `arch-<name>` feature is on, whether or not a selected backend emits it.
     let mut selected: Vec<String> = Vec::new();
+
+    // The backend law, stated once: `src/lib.rs`'s arch gates read `scratchy_backend`,
+    // which this script sets exactly when a backend feature is on — so an arch compiles
+    // under a backend iff its `arch-<name>` feature and that backend are on, with no
+    // per-arch spelling left to drift.
+    println!("cargo::rustc-check-cfg=cfg(scratchy_backend)");
+    if std::env::var_os("CARGO_FEATURE_METAL").is_some()
+        || std::env::var_os("CARGO_FEATURE_SPYRE").is_some()
+        || std::env::var_os("CARGO_FEATURE_CUDA").is_some()
+    {
+        println!("cargo::rustc-cfg=scratchy_backend");
+    }
 
     // Each arch is a `dsl/<arch>.py` DSL carrier paired with a
     // `configs/<arch>/` dir; emit the ones whose `arch-<name>` feature is on AND
