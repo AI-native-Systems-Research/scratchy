@@ -1835,14 +1835,14 @@ pub struct Wirings {
 /// `scratchy_subtile::tensor_parallel::slice_source`, the one implementation of it.
 pub use scratchy_subtile::tensor_parallel::SourceShard;
 
-/// ⭐ ONE SHARDED WORLD'S FORWARD, AS `#[forward]` BAKED IT — what a session spanning the `W` cards
-/// of that world loads instead of the one-rank wiring.
+/// ⭐ ONE SHARDED WORLD'S FORWARD, AS `#[forward]` BAKED IT — what a session spanning the cards of
+/// world `T` loads instead of the one-rank wiring.
 ///
-/// ⛔ THE WORLD IS THE TYPE. `W` is a const generic, fixed by the build's `tp/W` feature: a session
-/// for one world cannot be handed another world's forward, because the two are different types —
-/// the shapes it stages, the window its consumes read and the peers it sends to are all `W`'s. No
-/// value selects a world at load.
-pub struct TpForward<const W: u32> {
+/// ⛔ THE WORLD IS THE TYPE. `T` is the build's one `tp/N` world: a session for one world cannot be
+/// handed another world's forward, because the two are different types — the shapes it stages, the
+/// window its consumes read and the peers it sends to are all `T`'s. No value selects a world at
+/// load.
+pub struct TpForward<T: crate::bundle_code::collective::World> {
     /// The rank-local decode bundle — the same on every rank (one bake serves the world).
     pub decode: crate::manifest::KtirBundleData,
     /// The rank-local batched-prefill bundle, when the model bakes one.
@@ -1851,46 +1851,13 @@ pub struct TpForward<const W: u32> {
     pub wirings: Wirings,
     /// Per source of the one-rank forward (same indices): the slice each rank loads.
     pub sources: &'static [SourceShard],
-}
-
-impl<const W: u32> TpForward<W> {
-    /// The plan's world — the same `W` as the analysis's ([`Self::ANALYSIS`]), minted together.
-    pub const WORLD: crate::bundle_code::collective::TpWorld =
-        crate::bundle_code::collective::TpWorld::of::<W>();
-    /// The shared analysis's world — the one the bake sharded the forward for.
-    pub const ANALYSIS: scratchy_subtile::tensor_parallel::WorldSize =
-        scratchy_subtile::tensor_parallel::WorldSize::of::<W>();
-}
-
-/// ⭐ RANK `r` OF A `W`-RANK WORLD — a rank whose world is its type. Minted only by
-/// [`TpRank::all`], so `r < W` by construction, and a rank of one world is not a rank of another.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TpRank<const W: u32>(u32);
-
-impl<const W: u32> TpRank<W> {
-    /// Every rank of the world, in rank order.
-    pub fn all() -> impl Iterator<Item = Self> {
-        (0..W).map(Self)
-    }
-
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-
-    /// The plan's identity for this rank.
-    pub fn identity(self) -> crate::bundle_code::collective::TpIdentity {
-        TpForward::<W>::WORLD
-            .rank(self.0)
-            .expect("a TpRank is below its world")
-    }
+    /// The world every rank of which runs this forward.
+    pub world: core::marker::PhantomData<T>,
 }
 
 /// Why rank `me`'s share of a source could not be cut from its checkpoint bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SliceRefusal {
-    /// The analysis's world has no such rank — unreachable from a [`TpRank`], named rather than
-    /// unwrapped.
-    NotARank { rank: u32 },
     /// The sharded forward states no slice law for this source.
     NotASource { id: u32, sources: usize },
     /// The whole tensor's bytes are not its one-rank shape's.
@@ -1934,14 +1901,13 @@ impl std::fmt::Display for SliceRefusal {
             Self::HeadSplitGemm { id } => {
                 write!(f, "source {id} is a gemm weight with a head-block split")
             }
-            Self::NotARank { rank } => write!(f, "rank {rank} is past the analysis's world"),
         }
     }
 }
 
 impl std::error::Error for SliceRefusal {}
 
-impl<const W: u32> TpForward<W> {
+impl<T: crate::bundle_code::collective::World> TpForward<T> {
     /// ⭐ THE BYTES RANK `me` STAGES FOR SOURCE `id`: its share of the whole checkpoint tensor
     /// `full`, cut by the slice law the analysis derived for that source ([`Self::sources`]) —
     /// `scratchy_subtile::tensor_parallel::slice_source`, the one implementation of it.
@@ -1954,7 +1920,7 @@ impl<const W: u32> TpForward<W> {
     /// [`SliceRefusal`], by name.
     pub fn slice_source_bytes(
         &self,
-        me: TpRank<W>,
+        me: crate::bundle_code::collective::Rank<T>,
         id: u32,
         full: Vec<u8>,
         elem: usize,
@@ -1968,14 +1934,14 @@ impl<const W: u32> TpForward<W> {
                 id,
                 sources: self.sources.len(),
             })?;
-        cut_source_bytes::<W>(shard, me, id, full, elem, whole, is_gemm)
+        cut_source_bytes::<T>(shard, me, id, full, elem, whole, is_gemm)
     }
 }
 
 /// [`TpForward::slice_source_bytes`] once the source's law is known.
-fn cut_source_bytes<const W: u32>(
+fn cut_source_bytes<T: crate::bundle_code::collective::World>(
     shard: SourceShard,
-    me: TpRank<W>,
+    me: crate::bundle_code::collective::Rank<T>,
     id: u32,
     full: Vec<u8>,
     elem: usize,
@@ -1996,7 +1962,7 @@ fn cut_source_bytes<const W: u32>(
             want,
         });
     }
-    let w = W;
+    let w = T::RANKS;
     let divides = match shard {
         SourceShard::Whole => true,
         SourceShard::Rows => rows.is_multiple_of(w),
@@ -2028,25 +1994,19 @@ fn cut_source_bytes<const W: u32>(
     } else {
         (SourceShape { rows, cols }, shard)
     };
-    let world = TpForward::<W>::ANALYSIS;
-    let rank = world
-        .ranks()
-        .nth(me.get() as usize)
-        .ok_or(SliceRefusal::NotARank { rank: me.get() })?;
-    fn cut<const N: usize>(
+    fn cut<const N: usize, T: crate::bundle_code::collective::World>(
         full: &[u8],
         shape: SourceShape,
         shard: SourceShard,
-        rank: scratchy_subtile::tensor_parallel::RankIndex,
-        world: scratchy_subtile::tensor_parallel::WorldSize,
+        rank: crate::bundle_code::collective::Rank<T>,
     ) -> Vec<u8> {
         let (elems, _) = full.as_chunks::<N>();
-        slice_source(elems, shape, shard, rank, world).into_flattened()
+        slice_source(elems, shape, shard, rank).into_flattened()
     }
     match elem {
-        1 => Ok(cut::<1>(&full, shape, shard, rank, world)),
-        2 => Ok(cut::<2>(&full, shape, shard, rank, world)),
-        4 => Ok(cut::<4>(&full, shape, shard, rank, world)),
+        1 => Ok(cut::<1, T>(&full, shape, shard, me)),
+        2 => Ok(cut::<2, T>(&full, shape, shard, me)),
+        4 => Ok(cut::<4, T>(&full, shape, shard, me)),
         bytes => Err(SliceRefusal::Element { id, bytes }),
     }
 }
@@ -2771,19 +2731,21 @@ mod constant_tape_tests {
 #[cfg(test)]
 mod tp_slice_tests {
     use super::*;
+    use crate::bundle_code::collective::{Rank, TpWorld, ranks};
+    type W2 = TpWorld<2>;
+    type W4 = TpWorld<4>;
 
     /// A gemm weight's bytes sit on disk as `[n, k]`: its K-split (`Rows`) takes a column block of
     /// those bytes and its N-split (`Cols`) a row block, each rank its own, and a `Whole` source
     /// passes through untouched — a multi-byte element moving as one.
     #[test]
     fn a_rank_stages_its_block_of_the_disk_bytes() {
-        let r: Vec<TpRank<2>> = TpRank::all().collect();
-        let (r0, r1) = (r[0], r[1]);
+        let (r0, r1) = (Rank::<W2>::of::<0>(), Rank::<W2>::of::<1>());
         // Logical [k=2, n=4]; on disk [n=4, k=2], element (n, k) = 10·n + k.
         let disk: Vec<u8> = (0..4u8)
             .flat_map(|n| (0..2u8).map(move |k| 10 * n + k))
             .collect();
-        let cut = |shard, me| cut_source_bytes::<2>(shard, me, 7, disk.clone(), 1, (2, 4), true);
+        let cut = |shard, me| cut_source_bytes::<W2>(shard, me, 7, disk.clone(), 1, (2, 4), true);
         assert_eq!(cut(SourceShard::Rows, r0), Ok(vec![0, 10, 20, 30]));
         assert_eq!(cut(SourceShard::Rows, r1), Ok(vec![1, 11, 21, 31]));
         assert_eq!(cut(SourceShard::Cols, r0), Ok(vec![0, 1, 10, 11]));
@@ -2792,7 +2754,7 @@ mod tp_slice_tests {
         // A two-byte element moves as one: a norm row [1, 4] split by columns.
         let row: Vec<u8> = (0..8).collect();
         assert_eq!(
-            cut_source_bytes::<2>(SourceShard::Cols, r1, 3, row, 2, (1, 4), false),
+            cut_source_bytes::<W2>(SourceShard::Cols, r1, 3, row, 2, (1, 4), false),
             Ok(vec![4, 5, 6, 7])
         );
     }
@@ -2800,9 +2762,9 @@ mod tp_slice_tests {
     /// Every cut it cannot make byte-exactly is refused by name.
     #[test]
     fn a_cut_it_cannot_make_is_refused() {
-        let r0 = TpRank::<2>::all().next().unwrap();
+        let r0 = Rank::<W2>::of::<0>();
         assert_eq!(
-            cut_source_bytes::<2>(SourceShard::Cols, r0, 1, vec![0; 6], 1, (2, 4), false),
+            cut_source_bytes::<W2>(SourceShard::Cols, r0, 1, vec![0; 6], 1, (2, 4), false),
             Err(SliceRefusal::Size {
                 id: 1,
                 bytes: 6,
@@ -2810,7 +2772,7 @@ mod tp_slice_tests {
             })
         );
         assert_eq!(
-            cut_source_bytes::<2>(SourceShard::Cols, r0, 1, vec![0; 3], 1, (1, 3), false),
+            cut_source_bytes::<W2>(SourceShard::Cols, r0, 1, vec![0; 3], 1, (1, 3), false),
             Err(SliceRefusal::Indivisible {
                 id: 1,
                 shard: SourceShard::Cols,
@@ -2819,14 +2781,14 @@ mod tp_slice_tests {
             })
         );
         assert_eq!(
-            cut_source_bytes::<2>(SourceShard::Rows, r0, 1, vec![0; 24], 3, (2, 4), true),
+            cut_source_bytes::<W2>(SourceShard::Rows, r0, 1, vec![0; 24], 3, (2, 4), true),
             Err(SliceRefusal::Element { id: 1, bytes: 3 })
         );
         let heads = SourceShard::HeadRows {
             heads: std::num::NonZeroU32::new(2).unwrap(),
         };
         assert_eq!(
-            cut_source_bytes::<2>(heads, r0, 1, vec![0; 8], 1, (2, 4), true),
+            cut_source_bytes::<W2>(heads, r0, 1, vec![0; 8], 1, (2, 4), true),
             Err(SliceRefusal::HeadSplitGemm { id: 1 })
         );
     }
@@ -2836,8 +2798,11 @@ mod tp_slice_tests {
     #[test]
     fn four_ranks_each_stage_their_block() {
         let row: Vec<u8> = (0..16).collect();
-        let got: Vec<Vec<u8>> = TpRank::<4>::all()
-            .map(|r| cut_source_bytes::<4>(SourceShard::Cols, r, 3, row.clone(), 1, (2, 8), false).unwrap())
+        let got: Vec<Vec<u8>> = ranks::<W4>()
+            .map(|r| {
+                cut_source_bytes::<W4>(SourceShard::Cols, r, 3, row.clone(), 1, (2, 8), false)
+                    .unwrap()
+            })
             .collect();
         assert_eq!(
             got,
@@ -2848,9 +2813,9 @@ mod tp_slice_tests {
                 vec![6, 7, 14, 15]
             ]
         );
-        let r0 = TpRank::<4>::all().next().unwrap();
+        let r0 = Rank::<W4>::of::<0>();
         assert!(matches!(
-            cut_source_bytes::<4>(SourceShard::Cols, r0, 3, vec![0; 12], 1, (2, 6), false),
+            cut_source_bytes::<W4>(SourceShard::Cols, r0, 3, vec![0; 12], 1, (2, 6), false),
             Err(SliceRefusal::Indivisible { .. })
         ));
     }

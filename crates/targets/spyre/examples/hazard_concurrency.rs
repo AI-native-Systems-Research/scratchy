@@ -48,7 +48,10 @@
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
-use scratchy_target_spyre::runtime::{CardRuntime, DevAddr, HwError, Stream};
+use scratchy_target_spyre::runtime::{CardRuntime as AnyCard, DevAddr, HwError, Stream};
+
+/// A one-card probe: the card's runtime is a world of one's.
+type CardRuntime = AnyCard<scratchy_target_spyre::bundle_code::collective::TpWorld<1>>;
 
 /// 512 MiB — see the module doc: the park B pays is bounded by the DmaBufPool's
 /// in-flight cap and varies run to run with the staging-vs-drain race, so the size

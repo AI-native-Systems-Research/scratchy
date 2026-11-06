@@ -10,6 +10,8 @@
 //! There is nothing special about any `N`: a world of one is the same law over one rank.
 #![no_std]
 
+extern crate alloc;
+
 use core::marker::PhantomData;
 
 /// A tensor-parallel world. Its one implementor is [`TpWorld<N>`]; a target states its own limits
@@ -104,6 +106,88 @@ impl<T: World> Rank<T> {
     }
 }
 
+/// ⭐ ONE `X` PER RANK OF WORLD `T` — minted only by [`PerRank::from_fn`] (or its fallible twin)
+/// over [`ranks`], so it holds exactly `T::RANKS` values by construction and indexing it by a
+/// [`Rank<T>`] is always in bounds. A list of cards, sessions or weight sets per rank is one of
+/// these: no length to check, no index to refuse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PerRank<T: World, X> {
+    items: alloc::boxed::Box<[X]>,
+    world: PhantomData<T>,
+}
+
+impl<T: World, X> PerRank<T, X> {
+    /// `f(r)` for every rank, in rank order.
+    pub fn from_fn(f: impl FnMut(Rank<T>) -> X) -> Self {
+        Self {
+            items: ranks::<T>().map(f).collect(),
+            world: PhantomData,
+        }
+    }
+
+    /// `f(r)` for every rank, in rank order; the first error stops it.
+    ///
+    /// # Errors
+    /// The first rank's error.
+    pub fn try_from_fn<E>(f: impl FnMut(Rank<T>) -> Result<X, E>) -> Result<Self, E> {
+        Ok(Self {
+            items: ranks::<T>().map(f).collect::<Result<_, E>>()?,
+            world: PhantomData,
+        })
+    }
+
+    /// Rank `r`'s value.
+    pub fn get(&self, r: Rank<T>) -> &X {
+        // `r < T::RANKS == self.items.len()` by both types' construction.
+        &self.items[r.get() as usize]
+    }
+
+    /// Rank `r`'s value, mutably.
+    pub fn get_mut(&mut self, r: Rank<T>) -> &mut X {
+        &mut self.items[r.get() as usize]
+    }
+
+    /// Every rank with its value, in rank order.
+    pub fn iter(&self) -> impl Iterator<Item = (Rank<T>, &X)> {
+        ranks::<T>().zip(self.items.iter())
+    }
+
+    /// Every rank with its value, mutably, in rank order.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Rank<T>, &mut X)> {
+        ranks::<T>().zip(self.items.iter_mut())
+    }
+
+    /// Every value, in rank order.
+    pub fn values(&self) -> impl Iterator<Item = &X> {
+        self.items.iter()
+    }
+
+    /// Every value, mutably, in rank order.
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut X> {
+        self.items.iter_mut()
+    }
+
+    /// Every value, by value, in rank order.
+    pub fn into_values(self) -> impl Iterator<Item = X> {
+        alloc::vec::Vec::from(self.items).into_iter()
+    }
+
+    /// Rank 0's value, mutably.
+    pub fn first_mut(&mut self) -> &mut X {
+        &mut self.items[0]
+    }
+
+    /// Rank 0's value — every world has one.
+    pub fn first(&self) -> &X {
+        &self.items[0]
+    }
+
+    /// `f` of every rank's value, as the same world's.
+    pub fn map<Y>(&self, mut f: impl FnMut(Rank<T>, &X) -> Y) -> PerRank<T, Y> {
+        PerRank::from_fn(|r| f(r, self.get(r)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +210,32 @@ mod tests {
         check::<TpWorld<2>>();
         check::<TpWorld<3>>();
         check::<TpWorld<4>>();
+        check::<TpWorld<8>>();
+        check::<TpWorld<32>>();
+    }
+
+    /// A per-rank list holds one value per rank, indexed by the rank itself.
+    #[test]
+    fn a_per_rank_list_is_one_value_per_rank() {
+        fn check<T: World>() {
+            let v = PerRank::<T, u32>::from_fn(|r| r.get() * 10);
+            assert_eq!(v.values().count() as u32, T::RANKS);
+            for r in ranks::<T>() {
+                assert_eq!(*v.get(r), r.get() * 10);
+            }
+            assert_eq!(*v.first(), 0);
+            let e: Result<PerRank<T, u32>, u32> = PerRank::try_from_fn(|r| {
+                if r.get() + 1 == T::RANKS {
+                    Err(r.get())
+                } else {
+                    Ok(0)
+                }
+            });
+            assert_eq!(e, Err(T::RANKS - 1));
+        }
+        check::<TpWorld<1>>();
+        check::<TpWorld<2>>();
+        check::<TpWorld<3>>();
         check::<TpWorld<8>>();
         check::<TpWorld<32>>();
     }

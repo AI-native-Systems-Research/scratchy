@@ -55,7 +55,8 @@ fn pattern_bytes(len: usize) -> Vec<u8> {
 }
 
 fn main() -> Result<()> {
-    let card = CardRuntime::open(0).context("open card 0")?;
+    let card =
+        CardRuntime::<ktir_superdsc::collective::TpWorld<1>>::open(0).context("open card 0")?;
     let stream = Stream::create(&card).context("stream create")?;
     let total = WINDOW + TAIL;
     let dev = DevAddr::alloc(&card, ByteSize(total), MemoryType::Tensor)

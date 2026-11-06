@@ -31,12 +31,15 @@ fn mm_w(name: &str, k: u32, n: u32) -> Stk<KernelTag> {
     Stk::<KernelTag>::kernel(k as usize, n as usize, name)
 }
 
-fn dsc(op: &emit::EmittedOp, name: &str) -> serde_json::Value {
+fn dsc(
+    op: &emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+    name: &str,
+) -> serde_json::Value {
     serde_json::to_value(&op.op).unwrap()["dscs_"][0][name].clone()
 }
 
 /// The `[31, 2048]` fp16 multiply, assembled through the shipped door under `division`.
-fn pw_31x2048(division: EwDivision) -> emit::EmittedOp {
+fn pw_31x2048(division: EwDivision) -> emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     let (rows, cols) = (31u32, 2048u32);
     let mut sid = 0i64;
     let (x, scale, out) = (
@@ -62,7 +65,7 @@ fn pw_31x2048(division: EwDivision) -> emit::EmittedOp {
 }
 
 /// The last schedule node (the OUTPUT's) of the `pw` op.
-fn pw_out_node(op: &emit::EmittedOp) -> serde_json::Value {
+fn pw_out_node(op: &emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>) -> serde_json::Value {
     dsc(op, "pw")["scheduleTree_"]
         .as_array()
         .unwrap()
@@ -313,7 +316,7 @@ fn stage_2d_is_the_worker_emitter_layout_firewall() {
 }
 
 /// The shipped door's work split of the `pw` op: `(mb, out)` slices, read off `numWkSlicesPerDim_`.
-fn split_of(op: &emit::EmittedOp) -> (i64, i64) {
+fn split_of(op: &emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>) -> (i64, i64) {
     let v = serde_json::to_value(&op.op).unwrap();
     let s = &v["numWkSlicesPerDim_"];
     (

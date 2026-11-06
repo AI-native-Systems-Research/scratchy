@@ -40,7 +40,11 @@ use flex_rs::scheduler::{
 };
 use flex_rs::senlib_ffi::pci_addr_for_region;
 use flex_rs::stream::{RuntimeStream, RuntimeStreamMode, RuntimeStreamPriority};
-use scratchy_target_spyre::runtime::CardRuntime;
+use scratchy_target_spyre::runtime::CardRuntime as AnyCard;
+
+/// A raw flex-level probe: the cards are driven below the world-typed p2p link, so they are opened
+/// as one card's runtime each.
+type CardRuntime = AnyCard<scratchy_target_spyre::bundle_code::collective::TpWorld<1>>;
 
 /// One slot: one card's message.
 const SLOT_BYTES: u64 = 64 * 1024;

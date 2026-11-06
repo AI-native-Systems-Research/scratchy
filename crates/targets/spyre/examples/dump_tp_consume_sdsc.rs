@@ -2,7 +2,7 @@
 //! Write the dxp input of a tensor-parallel forward's collective CONSUMES, for compiling by hand
 //! with `dxp_standalone`.
 //!
-//! A two-rank MLP sublayer (`scratchy_subtile::fixtures::mlp_sublayer`, sharded by the shared
+//! An MLP sublayer, sharded for the world `W` below (`scratchy_subtile::fixtures::mlp_sublayer`, sharded by the shared
 //! analysis, which column-splits gate/up, row-splits down and weaves ONE all-reduce between down and
 //! the residual add) is lowered through the producer and the SuperDSC door exactly as a bake lowers
 //! it, and only the launch groups that consume a collective are written: one `group_{gi}/` per
@@ -20,22 +20,27 @@ use std::num::NonZeroU32;
 use ktir_superdsc::ktir_node::ActiveCap;
 use scratchy_subtile::fixtures::mlp_sublayer;
 use scratchy_subtile::subtile_ir::lower_region;
+use scratchy_target_spyre::bundle_code::collective::{Rank, TpWorld};
 use scratchy_target_spyre::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{FoldGrouping, write_dxp_input};
-use scratchy_target_spyre::tp_plan::{SpyreWorld, tp_bake};
+use scratchy_target_spyre::tp_plan::tp_bake;
+
+/// The world the consumes are dumped for — any `TpWorld<N>`: the protocol is the same law at every
+/// width.
+type W = TpWorld<2>;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::args_os()
         .nth(1)
         .map(std::path::PathBuf::from)
         .ok_or("usage: dump_tp_consume_sdsc <output dir>")?;
-    let bake = tp_bake(&mlp_sublayer(2048, 8192), SpyreWorld::of::<2>())
-        .map_err(|e| format!("the two-rank sublayer does not shard: {e:?}"))?;
+    let bake = tp_bake::<W>(&mlp_sublayer(2048, 8192))
+        .map_err(|e| format!("the sharded sublayer does not shard: {e:?}"))?;
     let ir = lower_region(&bake.sharded.local, NonZeroU32::new(128).ok_or("128 != 0")?);
     // The sublayer's gemm weights: gate, up, down.
     let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
-    let (ops, layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
-        .map_err(|e| format!("the two-rank sublayer does not lower: {e:?}"))?;
+    let (ops, layout) = lower_graph_to_superdsc::<W, _>(&ir, &weight_ids, ActiveCap::FULL, false)
+        .map_err(|e| format!("the sharded sublayer does not lower: {e:?}"))?;
     let consumes: Vec<_> = ops
         .iter()
         .filter(|e| e.tp_consume.is_some())
@@ -44,11 +49,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cut = consumes
         .first()
         .and_then(|e| e.tp_consume)
-        .ok_or("the two-rank sublayer bakes no consume")?
+        .ok_or("the sharded sublayer bakes no consume")?
         .cut;
     let window = layout
         .placements
-        .get(&cut.tid())
+        .get(&cut.block_tid(Rank::<W>::of::<0>()))
         .ok_or("the sharded layout carries no receive window cut")?;
     eprintln!(
         "{} op(s), {} consume op(s); window cut {} seg{} @ {} ({} B)",
@@ -65,19 +70,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dir.display()
     );
 
-    // And the ALL-GATHER's consumes — one group per rank, from a two-rank vocabulary projection.
-    let gather = tp_bake(
-        &scratchy_subtile::fixtures::vocab_projection(2048, 8192),
-        SpyreWorld::of::<2>(),
-    )
-    .map_err(|e| format!("the two-rank projection does not shard: {e:?}"))?;
+    // And the ALL-GATHER's consumes — one group per rank, from a sharded vocabulary projection.
+    let gather = tp_bake::<W>(&scratchy_subtile::fixtures::vocab_projection(2048, 8192))
+        .map_err(|e| format!("the sharded projection does not shard: {e:?}"))?;
     let ir = lower_region(
         &gather.sharded.local,
         NonZeroU32::new(128).ok_or("128 != 0")?,
     );
     let weight_ids: std::collections::HashSet<u32> = [2u32].into_iter().collect();
-    let (ops, _) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
-        .map_err(|e| format!("the two-rank projection does not lower: {e:?}"))?;
+    let (ops, _) = lower_graph_to_superdsc::<W, _>(&ir, &weight_ids, ActiveCap::FULL, false)
+        .map_err(|e| format!("the sharded projection does not lower: {e:?}"))?;
     let consumes: Vec<_> = ops
         .iter()
         .filter(|e| e.tp_consume.is_some())

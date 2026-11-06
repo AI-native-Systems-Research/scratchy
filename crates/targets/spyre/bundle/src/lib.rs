@@ -812,46 +812,34 @@ impl<'a, T: ktir_superdsc::collective::Tp> BundleCode<'a, T> {
     }
 }
 
-/// ⭐ A WORLD WHOSE BUNDLES THIS BINARY REGISTERS — every `TpWorld<N>` the card's sids admit
-/// (`1 ≤ N ≤ MAX_WORLD`), each with its own `inventory` list. A bundle's world is its type, so a
-/// lookup names its world and a bundle baked for one world is never found by a session of another:
-/// there is no world field to compare, and no lookup to refuse.
-pub trait Registered: collective::Tp {
-    /// Every bundle of this world the binary carries.
-    fn registered() -> impl Iterator<Item = &'static BundleCode<'static, Self>>;
+/// ⭐ ONE REGISTERED BUNDLE, OF ITS OWN WORLD. A bundle's world is its type, so the registry holds
+/// each one type-erased and a lookup names its world: [`bundle::<T>`] finds only the bundles that
+/// are `BundleCode<'static, T>`, so a bundle baked for one world is never found by a session of
+/// another — there is no world field to compare, and no lookup to refuse.
+///
+/// `#[forward]` submits `RegisteredBundle { code: &BundleCode::<'static, W> { … } }` for its one
+/// world `W`.
+pub struct RegisteredBundle {
+    pub code: &'static (dyn core::any::Any + Send + Sync),
 }
 
-macro_rules! register_every_world {
-    ($($n:literal)*) => {
-        $(
-            inventory::collect!(BundleCode<'static, collective::TpWorld<$n>>);
-            impl Registered for collective::TpWorld<$n> {
-                fn registered() -> impl Iterator<Item = &'static BundleCode<'static, Self>> {
-                    inventory::iter::<BundleCode<'static, Self>>.into_iter()
-                }
-            }
-        )*
-        const _: () = {
-            let worlds = [$($n),*];
-            assert!(worlds.len() as u32 == collective::MAX_WORLD, "every admitted world registers");
-            let mut i = 0;
-            while i < worlds.len() {
-                assert!(worlds[i] == i as u32 + 1, "the worlds are 1..=MAX_WORLD, in order");
-                i += 1;
-            }
-        };
-    };
+inventory::collect!(RegisteredBundle);
+
+/// Every bundle of world `T` the binary carries.
+fn registered<T: collective::Tp>() -> impl Iterator<Item = &'static BundleCode<'static, T>> {
+    inventory::iter::<RegisteredBundle>
+        .into_iter()
+        .filter_map(|r| r.code.downcast_ref::<BundleCode<'static, T>>())
 }
-register_every_world!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32);
 
 /// The bundle of world `T` registered under `fp`, if this binary carries it.
-pub fn bundle<T: Registered>(fp: &str) -> Option<&'static BundleCode<'static, T>> {
-    T::registered().find(|b| b.fp == fp)
+pub fn bundle<T: collective::Tp>(fp: &str) -> Option<&'static BundleCode<'static, T>> {
+    registered::<T>().find(|b| b.fp == fp)
 }
 
 /// The bundle a [`SiblingFp`] names — the whole of "resolve a sibling". A sibling is of its
 /// bundle's world.
-pub fn sibling<T: Registered>(fp: &SiblingFp<'_>) -> Option<&'static BundleCode<'static, T>> {
+pub fn sibling<T: collective::Tp>(fp: &SiblingFp<'_>) -> Option<&'static BundleCode<'static, T>> {
     if fp.is_none() {
         return None;
     }
@@ -860,8 +848,8 @@ pub fn sibling<T: Registered>(fp: &SiblingFp<'_>) -> Option<&'static BundleCode<
 
 /// Is any dxp-compiled device code of world `T` in this binary? False for every cardless build,
 /// where the emit had no `dxp_standalone` to run.
-pub fn have_device_code<T: Registered>() -> bool {
-    T::registered().any(|b| !b.groups.is_empty())
+pub fn have_device_code<T: collective::Tp>() -> bool {
+    registered::<T>().any(|b| !b.groups.is_empty())
 }
 
 /// Where the NUMERIC-BISECTION GOLDEN for `fp` lives — written by the emit under
@@ -884,8 +872,8 @@ pub fn dbg_golden_dir(fp: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Every registered fingerprint, for diagnostics that need to say what IS here.
-pub fn registered_fps<T: Registered>() -> Vec<&'static str> {
-    let mut v: Vec<&str> = T::registered().map(|b| b.fp.as_ref()).collect();
+pub fn registered_fps<T: collective::Tp>() -> Vec<&'static str> {
+    let mut v: Vec<&str> = registered::<T>().map(|b| b.fp.as_ref()).collect();
     v.sort_unstable();
     v
 }
@@ -1264,5 +1252,43 @@ mod place_id_tests {
             let a = PlaceId::Act(tid).to_string();
             assert!(!a.contains('_'), "an act's spelling has no role part: {a}");
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use collective::TpWorld;
+
+    fn find<T: collective::Tp>(fp: &str, among: &[RegisteredBundle]) -> bool {
+        among
+            .iter()
+            .filter_map(|r| r.code.downcast_ref::<BundleCode<'static, T>>())
+            .any(|b| b.fp == fp)
+    }
+
+    fn leaked<T: collective::Tp>(fp: &'static str) -> RegisteredBundle {
+        RegisteredBundle {
+            code: Box::leak(Box::new(BundleCode::<'static, T> {
+                fp: Cow::Borrowed(fp),
+                layout: BundleLayout::default(),
+                groups: Cow::Borrowed(&[]),
+                reroll: None,
+            })),
+        }
+    }
+
+    /// A lookup finds a bundle only in its own world: the world is the bundle's type, read by the
+    /// same downcast [`bundle`] reads the registry through.
+    #[test]
+    fn a_bundle_is_found_only_in_its_own_world() {
+        let among = [leaked::<TpWorld<1>>("one"), leaked::<TpWorld<4>>("four")];
+        assert!(find::<TpWorld<1>>("one", &among));
+        assert!(find::<TpWorld<4>>("four", &among));
+        assert!(!find::<TpWorld<4>>("one", &among));
+        assert!(!find::<TpWorld<1>>("four", &among));
+        assert!(!find::<TpWorld<2>>("four", &among));
+        // Nothing is registered under a test binary's inventory for these fingerprints.
+        assert!(bundle::<TpWorld<4>>("four").is_none());
     }
 }

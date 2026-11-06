@@ -80,7 +80,8 @@ fn arc_from_dev(dev: &DevAddr) -> Result<Arc<CompositeAddress>> {
 
 fn main() -> Result<()> {
     // Real bring-up: card open, card-derived topology/allocator, scheduler, `RuntimeContext`.
-    let card = CardRuntime::open(0).context("open card 0")?;
+    let card =
+        CardRuntime::<ktir_superdsc::collective::TpWorld<1>>::open(0).context("open card 0")?;
     let rt = card.context().clone();
     let stream_id = rt
         .create_stream(

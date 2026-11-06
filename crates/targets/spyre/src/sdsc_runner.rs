@@ -24,6 +24,7 @@ use tracing::debug;
 use crate::manifest::bytes_to_f32;
 
 use crate::sen_convert::f32_to_f16_le;
+use ktir_superdsc::collective::PerRank;
 
 /// What a step's caller does with its logits — the session-level spelling of [`Logits`], minus the
 /// buffer the session owns. See [`Logits`] for why this is three states and not a `bool`.
@@ -121,7 +122,7 @@ impl IntRepStride {
 /// through the flex runtime. Weights pack into resident device segments and the KV grows in a
 /// resident pool; `run_step` appends `n_new` NEW positions at `[seq_pos..seq_pos+n_new)` and returns
 /// the last new position's logits.
-pub struct SuperDscSession {
+pub struct SuperDscSession<T: ktir_superdsc::collective::Tp> {
     /// ⭐ ONE EXECUTOR PER CARD THE FORWARD SPANS, in rank order — one for a world of one, `W` for a
     /// sharded world's ranks, all driven by THIS session in one process. Every step is submitted on
     /// every card before any card is waited on (a rank's collective waits on its peers' sends, so a
@@ -129,7 +130,7 @@ pub struct SuperDscSession {
     /// host-staged input is staged on every card (the forward is SPMD: each rank stages the same
     /// activations, its weights are its own shard). The token comes back from rank 0's suffix — the
     /// ranks' replicated values are bit-identical, the canonical reduction order's promise.
-    ranks: Vec<Executor>,
+    ranks: PerRank<T, Executor<T>>,
     /// Logits column count.
     pub vocab: usize,
     /// Resident capacity in slots (= the longest context THIS request can hold).
@@ -153,24 +154,25 @@ pub struct SuperDscSession {
 /// One card's resident weights, `(source id, device bytes, dtype, shape)` each.
 pub type CardWeights = Vec<(usize, Vec<u8>, SDType, Vec<usize>)>;
 
-/// The resident weights of every card a session spans, in rank order — one entry for a world of
-/// one. The OWNER session's only; a borrower binds none.
-pub type RankWeights = Vec<CardWeights>;
+/// The resident weights of every card a session spans — one set per rank, rank `r`'s its own shard.
+/// The OWNER session's only; a borrower binds none (`None`), so "one set per card" is a type, never a
+/// count to check.
+pub type RankWeights<T> = Option<PerRank<T, CardWeights>>;
 
 /// What a session binds before prepare — the private bundle of [`SuperDscSession::new_inner`]'s
 /// staged inputs.
-struct Staged<'a> {
+struct Staged<'a, T: ktir_superdsc::collective::Tp> {
     /// The resident weights, moved in by the OWNER (the decode session) — one set per card, rank
     /// `r`'s its own shard — and empty for every borrower, which reads the owner's bytes through the
     /// alias.
-    weights: RankWeights,
+    weights: RankWeights<T>,
     /// The wiring's staged-constant list — bound once before prepare (see [`SuperDscSession::new`]).
     load_consts: &'a [(u32, crate::wiring::LoadConst)],
     /// The KV pool's own tables — bound once, verbatim, by each session whose kernels read them.
     pool_statics: &'a [(u32, Vec<u8>)],
 }
 
-impl SuperDscSession {
+impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
     /// Load the bundle, bind the weights, and prepare (allocate + upload the resident program,
     /// weights and KV pool).
     ///
@@ -194,10 +196,10 @@ impl SuperDscSession {
     /// ([`crate::paged_step::card_statics`]) — staged VERBATIM once here by the session whose
     /// bundles read them (the one-request decode's).
     pub fn new(
-        cards: &[std::sync::Arc<crate::runtime::CardRuntime>],
-        code: &'static crate::bundle_code::BundleCode<'static>,
+        cards: &PerRank<T, std::sync::Arc<crate::runtime::CardRuntime<T>>>,
+        code: &'static crate::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
-        weights: RankWeights,
+        weights: RankWeights<T>,
         load_consts: &[(u32, crate::wiring::LoadConst)],
         pool_statics: &[(u32, Vec<u8>)],
         spilled_tail: &[u32],
@@ -226,8 +228,8 @@ impl SuperDscSession {
     /// The CB parity gate also waits for that alias: it cannot render through a placeholder,
     /// so it runs at the [`alias_seg_from`](Self::alias_seg_from) that completes the borrowed set.
     pub fn new_borrowing(
-        cards: &[std::sync::Arc<crate::runtime::CardRuntime>],
-        code: &'static crate::bundle_code::BundleCode<'static>,
+        cards: &PerRank<T, std::sync::Arc<crate::runtime::CardRuntime<T>>>,
+        code: &'static crate::bundle_code::BundleCode<'static, T>,
         vocab: usize,
         kv_dim: usize,
         num_blocks: usize,
@@ -257,8 +259,8 @@ impl SuperDscSession {
     /// tables sit. Each rung stages its own copy — a few MB against the rung's programs, once
     /// at load — through the same load-time channel the owner uses.
     pub fn new_borrowing_with_consts(
-        cards: &[std::sync::Arc<crate::runtime::CardRuntime>],
-        code: &'static crate::bundle_code::BundleCode<'static>,
+        cards: &PerRank<T, std::sync::Arc<crate::runtime::CardRuntime<T>>>,
+        code: &'static crate::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         borrowed: &[i64],
         load_consts: &[(u32, crate::wiring::LoadConst)],
@@ -277,7 +279,7 @@ impl SuperDscSession {
             code,
             dims,
             Staged {
-                weights: RankWeights::new(),
+                weights: None,
                 load_consts,
                 pool_statics,
             },
@@ -299,8 +301,8 @@ impl SuperDscSession {
     /// sampler's nine tables in EVERY prefill rung too, and they sit in the session's own seg3
     /// (never aliased), so the anchor stages its own copy exactly as a borrowing rung does.
     pub fn new_reserving(
-        cards: &[std::sync::Arc<crate::runtime::CardRuntime>],
-        code: &'static crate::bundle_code::BundleCode<'static>,
+        cards: &PerRank<T, std::sync::Arc<crate::runtime::CardRuntime<T>>>,
+        code: &'static crate::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         load_consts: &[(u32, crate::wiring::LoadConst)],
         // The pool's own tables, for the same reason the borrowing constructor takes them.
@@ -312,7 +314,7 @@ impl SuperDscSession {
             code,
             dims,
             Staged {
-                weights: RankWeights::new(),
+                weights: None,
                 load_consts,
                 pool_statics,
             },
@@ -322,10 +324,10 @@ impl SuperDscSession {
     }
 
     fn new_inner(
-        cards: &[std::sync::Arc<crate::runtime::CardRuntime>],
-        code: &'static crate::bundle_code::BundleCode<'static>,
+        cards: &PerRank<T, std::sync::Arc<crate::runtime::CardRuntime<T>>>,
+        code: &'static crate::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
-        staged: Staged<'_>,
+        staged: Staged<'_, T>,
         borrowed: &[i64],
         // The spilled weight tail's tids — the ONE resident slice the layout cannot state: the
         // spill is a load-time copy decision (a weight whose slot also holds an m-dependent
@@ -346,21 +348,14 @@ impl SuperDscSession {
             pool_statics,
         } = staged;
         ensure_deeptools_arch_config()?;
-        if cards.is_empty() {
-            bail!("a session runs on at least one card");
-        }
-        // The owner binds one weight set per card; a borrower binds none on any.
-        if !weights.is_empty() && weights.len() != cards.len() {
-            bail!(
-                "{} weight set(s) for {} card(s) — the owner binds one per card (rank r's shard)",
-                weights.len(),
-                cards.len()
-            );
-        }
-        let mut weights = weights.into_iter();
-        let mut ranks: Vec<Executor> = Vec::with_capacity(cards.len());
-        for card in cards {
-            let card_weights: CardWeights = weights.next().unwrap_or_default();
+        // The owner binds rank r's weight set on card r; a borrower binds none on any.
+        let mut weights: PerRank<T, CardWeights> = match weights {
+            Some(w) => w,
+            None => PerRank::from_fn(|_| CardWeights::new()),
+        };
+        let ranks: PerRank<T, Executor<T>> = PerRank::try_from_fn(|r| -> Result<Executor<T>> {
+            let card = cards.get(r);
+            let card_weights: CardWeights = std::mem::take(weights.get_mut(r));
             let mut exec = Executor::load(
                 card.clone(),
                 code,
@@ -445,9 +440,9 @@ impl SuperDscSession {
             }
 
             exec.prepare()?;
-            ranks.push(exec);
-        }
-        let exec = &ranks[0];
+            Ok(exec)
+        })?;
+        let exec = ranks.first();
         Ok(Self {
             vocab: exec.vocab.0,
             cap: exec.cap() as usize,
@@ -464,17 +459,25 @@ impl SuperDscSession {
     /// reads (the picked token, the logits row) is replicated across the ranks — the forward ends in
     /// the whole hidden state on every rank, so each rank's suffix computes the same row — so one
     /// rank answers for all.
-    fn lead(&mut self) -> &mut Executor {
-        &mut self.ranks[0]
+    fn lead(&mut self) -> &mut Executor<T> {
+        self.ranks.first_mut()
     }
 
-    /// Apply `f` on EVERY card, rank order, stopping at the first refusal (named by its rank).
-    fn each<T>(&mut self, mut f: impl FnMut(&mut Executor) -> Result<T>) -> Result<Vec<T>> {
-        let n = self.ranks.len();
+    /// Apply `f` on EVERY card, rank order, stopping at the first refusal (named by its rank in a
+    /// sharded world).
+    fn each<R>(&mut self, mut f: impl FnMut(&mut Executor<T>) -> Result<R>) -> Result<Vec<R>> {
+        use ktir_superdsc::collective::World;
         self.ranks
             .iter_mut()
-            .enumerate()
-            .map(|(r, e)| f(e).map_err(|err| if n > 1 { err.context(format!("rank {r}")) } else { err }))
+            .map(|(r, e)| {
+                f(e).map_err(|err| {
+                    if <T as World>::SHARDED {
+                        err.context(format!("rank {}", r.get()))
+                    } else {
+                        err
+                    }
+                })
+            })
             .collect()
     }
 
@@ -497,7 +500,7 @@ impl SuperDscSession {
     /// the fold does not walk.
     fn set_mask_blocks(&mut self, blocks: MaskBlocks) -> Result<()> {
         let b = blocks.get() as u64;
-        for e in &mut self.ranks {
+        for e in self.ranks.values_mut() {
             e.set_mask_blocks(b);
         }
         Ok(())
@@ -510,7 +513,7 @@ impl SuperDscSession {
     /// PRIVATE for the same reason as [`Self::set_mask_blocks`]: see [`FoldWalker::declare_fold`].
     fn set_fold_pages(&mut self, pages: FoldPages) -> Result<()> {
         let p = pages.get().get() as u64;
-        for e in &mut self.ranks {
+        for e in self.ranks.values_mut() {
             e.set_fold_pages(p);
         }
         Ok(())
@@ -520,7 +523,7 @@ impl SuperDscSession {
     /// `[nqh*mq, page]` block per (request, page) pass; only the worker, which stages it, knows how
     /// deep a block is.
     pub fn set_mask_stride(&mut self, stride: MaskRepStride) -> Result<()> {
-        for e in &mut self.ranks {
+        for e in self.ranks.values_mut() {
             e.set_mask_stride(stride.0);
         }
         Ok(())
@@ -528,7 +531,7 @@ impl SuperDscSession {
 
     /// Declare the per-request row-block stride in the intermediate segment.
     pub fn set_int_stride(&mut self, stride: IntRepStride) -> Result<()> {
-        for e in &mut self.ranks {
+        for e in self.ranks.values_mut() {
             e.set_int_stride(stride.0);
         }
         Ok(())
@@ -562,7 +565,7 @@ impl SuperDscSession {
         pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
     ) -> Option<scratchy_subtile::sdsc_abstract::EntriesPerPage> {
         scratchy_subtile::sdsc_abstract::gather_entries_per_page(
-            self.ranks[0].kv_page_stride_bytes(),
+            self.ranks.first().kv_page_stride_bytes(),
             pool,
         )
     }
@@ -587,7 +590,7 @@ impl SuperDscSession {
     /// one-request decode's does not, so a launch bound through another bundle's facts read that
     /// slot unbound.
     pub fn bake_facts(&self) -> crate::wiring::BakeFacts {
-        crate::wiring::BakeFacts::of(&self.ranks[0].code().layout)
+        crate::wiring::BakeFacts::of(&self.ranks.first().code().layout)
     }
 
     pub fn step_body(&mut self, start: usize) -> Result<crate::superdsc_exec::StepBody> {
@@ -623,14 +626,14 @@ impl SuperDscSession {
             )
         })
         .map(|_| ())
-            .map_err(|e| {
-                anyhow!(
-                    "{e} (request slot {} at {pos} with {} page(s); pool has {})",
-                    slot.get(),
-                    pages.len(),
-                    pool_pages
-                )
-            })
+        .map_err(|e| {
+            anyhow!(
+                "{e} (request slot {} at {pos} with {} page(s); pool has {})",
+                slot.get(),
+                pages.len(),
+                pool_pages
+            )
+        })
     }
 
     /// Run ONE INCREMENTAL forward over `n_new` NEW positions at `[seq_pos..seq_pos+n_new)`.
@@ -749,7 +752,7 @@ impl SuperDscSession {
         &self,
         id: crate::bundle_code::PlaceId,
     ) -> Option<scratchy_subtile::sdsc_abstract::CausalKey> {
-        self.ranks[0].keyed_holds(id)
+        self.ranks.first().keyed_holds(id)
     }
 
     /// ⭐ #32 (A) — ONE PIPELINED STEP'S SUBMIT HALF: the same private forward
@@ -798,8 +801,10 @@ impl SuperDscSession {
         // Rank 0's read lands behind its step; every other rank's step is drained here too, so a
         // step is finished on every card when its pick is back.
         let bytes = self.lead().finish_deferred_read_raw(read)?;
-        for e in &mut self.ranks[1..] {
-            e.drain_stream()?;
+        for (r, e) in self.ranks.iter_mut() {
+            if r.get() != 0 {
+                e.drain_stream()?;
+            }
         }
         Ok(bytes)
     }
@@ -820,7 +825,10 @@ impl SuperDscSession {
     /// Fault the activation segment's host shadow in now, at load, so a request's first bind does
     /// not (see `Executor::materialize_activation_shadow`). Returns the shadow's bytes.
     pub fn materialize_activation_shadow(&mut self) -> Result<u64> {
-        Ok(self.each(Executor::materialize_activation_shadow)?.into_iter().sum())
+        Ok(self
+            .each(Executor::materialize_activation_shadow)?
+            .into_iter()
+            .sum())
     }
 
     /// [`Self::bind_keyed`], uploaded NOW rather than by the next step — a session's load-time
@@ -843,7 +851,7 @@ impl SuperDscSession {
     /// ChainStage writes. Ends the refill's re-send of a previous `Host` launch's seed bind
     /// (see `Executor::hand_to_card`); a churned seating's re-bind re-inserts it.
     pub fn hand_to_card(&mut self, id: crate::bundle_code::PlaceId) {
-        for e in &mut self.ranks {
+        for e in self.ranks.values_mut() {
             e.hand_to_card(id);
         }
     }
@@ -882,7 +890,7 @@ impl SuperDscSession {
         let mut bind_f16_bytes = 0usize;
         for (id, bytes) in activations_f16 {
             bind_f16_bytes += bytes.len();
-            for e in &mut self.ranks {
+            for e in self.ranks.values_mut() {
                 e.bind_input(*id, bytes.clone());
             }
         }
@@ -896,8 +904,8 @@ impl SuperDscSession {
         // address) — are one refusal at one door instead of a check here, a `bail!` in the refill loop
         // and a `continue` nobody could see.
         for (id, bytes) in activations_i32 {
-            for e in &mut self.ranks {
-            let bind = e.place_raw(*id, bytes.clone()).ok_or_else(|| {
+            for e in self.ranks.values_mut() {
+                let bind = e.place_raw(*id, bytes.clone()).ok_or_else(|| {
                 anyhow!(
                     "bind: raw tensor '{id}' ({} B) has no placement in this bundle, does not fit \
                      the one it has, or is not a whole number of int32 entries — a partial trailing \
@@ -907,7 +915,7 @@ impl SuperDscSession {
                     bytes.len()
                 )
             })?;
-            e.bind_input_raw(bind);
+                e.bind_input_raw(bind);
             }
         }
         if std::env::var_os("SCRATCHY_SDSC_PHASE_TIME").is_some() {
@@ -945,11 +953,11 @@ impl SuperDscSession {
         // peers' sends, so the forward is in flight on all of them before the host drains one.
         let submitted = self.each(|e| e.predict_submit(n_new, seq_pos, want))?;
         let mut row = vec![0u8; self.vocab * 2];
-        for (r, (e, s)) in self.ranks.iter_mut().zip(submitted).enumerate() {
+        for ((r, e), s) in self.ranks.iter_mut().zip(submitted) {
             // Rank 0 reads the row back; every other rank's forward is drained, its read the same
             // replicated row, left on its card.
             let l = match want {
-                LogitsRead::ReadBack if r == 0 => Logits::ReadBack(&mut row[..]),
+                LogitsRead::ReadBack if r.get() == 0 => Logits::ReadBack(&mut row[..]),
                 LogitsRead::ReadBack | LogitsRead::LeftOnDevice => Logits::LeftOnDevice,
                 LogitsRead::Discarded => Logits::Discarded,
             };
@@ -963,7 +971,7 @@ impl SuperDscSession {
     /// Bind an activation source (f32 → f16) before a prefix run.
     pub fn bind(&mut self, id: crate::bundle_code::PlaceId, vals: &[f32]) -> Result<()> {
         let bytes = f32_to_f16_le(vals);
-        for e in &mut self.ranks {
+        for e in self.ranks.values_mut() {
             e.bind_input(id, bytes.clone());
         }
         Ok(())
@@ -1013,34 +1021,24 @@ impl SuperDscSession {
 
     /// D2H the whole tensor segment as raw sen-fp16 bytes (the prefill→decode KV handoff: read the
     /// PREFILL session's seg2, then hand it to the decode session's alias door).
-    pub fn read_seg(&mut self, seg: i64) -> Result<Vec<u8>> {
+    pub fn read_seg(&mut self, seg: i64) -> Result<PerRank<T, Vec<u8>>> {
         let s =
             SegIdx::checked(seg).ok_or_else(|| anyhow!("read_seg: segment {seg} out of range"))?;
-        // A segment image is a rank's own (its weight shard, its KV heads): only a world of one
-        // has one image to return.
-        if self.ranks.len() != 1 {
-            bail!(
-                "read_seg(seg{seg}): a {}-card session holds one image per card — read them per rank",
-                self.ranks.len()
-            );
-        }
-        self.lead().read_seg(s)
+        // A segment image is a rank's own (its weight shard, its KV heads): one per rank.
+        PerRank::try_from_fn(|r| self.ranks.get_mut(r).read_seg(s))
     }
 
-    /// Overwrite the FIRST `bytes.len()` bytes of a tensor segment + H2D exactly that window — the
+    /// Overwrite the FIRST `images.get(r).len()` bytes of rank `r`'s tensor segment + H2D exactly that window — the
     /// spilled-weight-tail copy, whose source is one bundle's segment and whose destination is
     /// another's of a DIFFERENT extent. See [`Executor::write_seg_prefix`].
-    pub fn write_seg_prefix(&mut self, seg: i64, bytes: &[u8]) -> Result<()> {
+    pub fn write_seg_prefix(&mut self, seg: i64, images: &PerRank<T, Vec<u8>>) -> Result<()> {
         let s = SegIdx::checked(seg)
             .ok_or_else(|| anyhow!("write_seg_prefix: segment {seg} out of range"))?;
-        if self.ranks.len() != 1 {
-            bail!(
-                "write_seg_prefix(seg{seg}): a {}-card session holds one image per card — write \
-                 them per rank",
-                self.ranks.len()
-            );
+        // Rank r's image onto card r: a segment image is that rank's own.
+        for (r, e) in self.ranks.iter_mut() {
+            e.write_seg_prefix(s, images.get(r))?;
         }
-        self.lead().write_seg_prefix(s, bytes)
+        Ok(())
     }
 
     /// Point THIS session's segment at `owner`'s device region, so the two SHARE it and no copy is
@@ -1055,19 +1053,12 @@ impl SuperDscSession {
     ///
     /// MUST be called after BOTH sessions have been prepared — prepare zero-inits and H2Ds every
     /// segment, so aliasing earlier would let the owner's prepare wipe the now-shared region.
-    pub fn alias_seg_from(&mut self, owner: &SuperDscSession, seg: i64) -> Result<()> {
+    pub fn alias_seg_from(&mut self, owner: &SuperDscSession<T>, seg: i64) -> Result<()> {
         let s =
             SegIdx::checked(seg).ok_or_else(|| anyhow!("alias_seg: segment {seg} out of range"))?;
-        // Rank r aliases the owner's rank r: the two sessions span the same cards in the same order.
-        if self.ranks.len() != owner.ranks.len() {
-            bail!(
-                "alias_seg(seg{seg}): this session spans {} card(s), its owner {}",
-                self.ranks.len(),
-                owner.ranks.len()
-            );
-        }
-        for (e, o) in self.ranks.iter_mut().zip(&owner.ranks) {
-            e.alias_seg_from(o, s)?;
+        // Rank r aliases the owner's rank r: both sessions are one executor per rank of `T`.
+        for (r, e) in self.ranks.iter_mut() {
+            e.alias_seg_from(owner.ranks.get(r), s)?;
         }
         Ok(())
     }
@@ -1077,7 +1068,7 @@ impl SuperDscSession {
 /// to — and the [`DeclaredFold`](scratchy_subtile::sdsc_abstract::DeclaredFold) it hands back is what the
 /// prefix-mask staging is blocked by. One call, both numbers, so the count the shim's `fold_plan::reps`
 /// checks itself against and the count the mask is sized by are the same declaration.
-impl FoldWalker for SuperDscSession {
+impl<T: ktir_superdsc::collective::Tp> FoldWalker for SuperDscSession<T> {
     type Error = anyhow::Error;
 
     fn declare_fold(&mut self, pages: FoldPages, blocks: MaskBlocks) -> Result<()> {

@@ -549,9 +549,9 @@ fn timers() -> std::sync::MutexGuard<'static, Timers> {
 /// orphaned the matmul in the fused bundle). A group that carries an address shift — a KV slot write,
 /// a Kᵀ slab restickify, a page fold — is a singleton at ANY group size, because the shift is applied
 /// once to the whole group.
-pub(crate) struct OpProg {
+pub(crate) struct OpProg<T: ktir_superdsc::collective::Tp> {
     /// The launch: its address shifts and the compiled program they apply to.
-    pub(crate) code: &'static bundle::LaunchGroup<'static>,
+    pub(crate) code: &'static bundle::LaunchGroup<'static, T>,
     /// The bundle this launch belongs to, and its position in that bundle's launch order — together,
     /// the whole of "which program is this".
     fp: &'static str,
@@ -563,7 +563,7 @@ pub(crate) struct OpProg {
     pub(crate) kv: OpKv,
     /// When this group is a collective's consume: the send its baked placements name and the
     /// session's route — bound once, at [`bind_ops`].
-    pub(crate) collective: Option<cb_plan::BoundCollective>,
+    pub(crate) collective: Option<cb_plan::BoundCollective<T>>,
 }
 
 /// ⛔⛔⛔ A SESSION-LIFETIME DEVICE HANDLE IS FORGOTTEN AT DROP ON PURPOSE. Per-step windows
@@ -587,13 +587,13 @@ pub(crate) struct OpProg {
 /// ⛔ DO NOT "SIMPLIFY" THIS BY FREEING THE SESSION-LIFETIME HANDLES AT DROP. The per-step
 /// windows (`shifted`, built per layer per launch) must keep dying as owned values — at ~120
 /// per forward a leaked descriptor each grows without bound.
-impl Drop for OpProg {
+impl<T: ktir_superdsc::collective::Tp> Drop for OpProg<T> {
     fn drop(&mut self) {
         std::mem::forget(self.addr.take());
     }
 }
 
-impl Drop for Executor {
+impl<T: ktir_superdsc::collective::Tp> Drop for Executor<T> {
     fn drop(&mut self) {
         for a in &mut self.seg_addr {
             std::mem::forget(a.take());
@@ -601,17 +601,17 @@ impl Drop for Executor {
     }
 }
 
-impl OpProg {
+impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
     /// Pair one launch-index entry with the program it names.
     ///
     /// `slot_write`/`slab_write` stay DERIVED from their strides ("> 0", as the C++ had them) so a
     /// stride and its flag cannot disagree.
     fn new(
-        code: &'static bundle::LaunchGroup<'static>,
+        code: &'static bundle::LaunchGroup<'static, T>,
         fp: &'static str,
         index: usize,
-        collective: Option<cb_plan::BoundCollective>,
-    ) -> OpProg {
+        collective: Option<cb_plan::BoundCollective<T>>,
+    ) -> Self {
         let kv = &code.kv;
         OpProg {
             code,
@@ -643,7 +643,7 @@ impl OpProg {
     }
 
     /// What [`cb_plan::site_cbs`] needs to stage this group's control blocks.
-    pub(crate) fn site_tp(&self) -> cb_plan::SiteTp {
+    pub(crate) fn site_tp(&self) -> cb_plan::SiteTp<T> {
         cb_plan::SiteTp {
             index: self.index,
             consume: self.code.kv.tp,
@@ -653,7 +653,7 @@ impl OpProg {
 }
 
 /// A launch sequence — a body rung, the prefix, the suffix, or a fold-fused twin.
-pub(crate) type Ops = Vec<OpProg>;
+pub(crate) type Ops<T> = Vec<OpProg<T>>;
 
 /// The host-shadow slice covering the WHOLE of `addr` — the H2D source for a segment.
 ///
@@ -808,12 +808,12 @@ struct KvGeometry {
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// One resident SuperDSC session: program + weights + KV resident on-card.
-pub struct Executor {
+pub struct Executor<T: ktir_superdsc::collective::Tp> {
     /// THE BAKED BUNDLE — this session's program, memory plan and launch index, straight out of the
     /// binary.
-    code: &'static bundle::BundleCode<'static>,
+    code: &'static bundle::BundleCode<'static, T>,
     /// THE CARD THIS SESSION RUNS ON — every stream and allocation below is this card's.
-    card: std::sync::Arc<CardRuntime>,
+    card: std::sync::Arc<CardRuntime<T>>,
 
     pub vocab: Vocab,
     pub kv_dim: KvDim,
@@ -850,21 +850,21 @@ pub struct Executor {
 
     // ── Programs ──
     rolled: Option<Rolled>,
-    prefix_ops: Ops,
+    prefix_ops: Ops<T>,
     /// ONE LIST PER ATTENTION CLASS — `body_ops[c]` is class `c`'s body. A single-class model
     /// (every model but the hybrid-attention ones) has exactly one.
-    body_ops: Vec<Ops>,
-    suffix_ops: Ops,
+    body_ops: Vec<Ops<T>>,
+    suffix_ops: Ops<T>,
     /// Each class's body with the per-page fold fused back in — one fewer launch per layer. Used
     /// whenever the context fits ONE page, which is the case that must cost what unpaged cost.
     /// `None` unless EVERY class has its twin ([`PerClass`]).
-    body_fused: Option<PerClass<Ops>>,
+    body_fused: Option<PerClass<Ops<T>>>,
     /// sk_bucket LADDER (decode): `(active_cap, one ops list per class)` ascending; the top rung
     /// is the full cap.
-    body_rungs: Vec<(SweptCols, Vec<Ops>)>,
+    body_rungs: Vec<(SweptCols, Vec<Ops<T>>)>,
     /// The rungs whose EVERY class has a fold-fused twin, ascending, each with its twins in class
     /// order ([`fused_rungs`]). A rung with any class sitting out is absent, so it runs split.
-    body_rungs_fused: Vec<(SweptCols, PerClass<Ops>)>,
+    body_rungs_fused: Vec<(SweptCols, PerClass<Ops<T>>)>,
     /// PAGED: the SPLIT bodies are only reachable once a context outgrows one page, so their
     /// Program memory is allocated on first selection.
     split_bodies_ready: bool,
@@ -993,7 +993,7 @@ pub struct Executor {
     /// ⭐ THE RANK THIS SESSION RUNS AS — [`RankSeat::Alone`] for a world of one. Bound once, at
     /// load ([`Executor::load`] reads its card's link); every collective's send and wait names its
     /// route, and every consume group this session binds was chosen by its identity.
-    seat: RankSeat,
+    seat: RankSeat<T>,
 }
 
 /// Per-session state for the card-side tensordump — see [`Diag::tensordump`].
@@ -1022,7 +1022,7 @@ fn dump_prog_index(fp: &str) -> usize {
 
 // Driven single-threaded by the worker thread (the session moves between forwards, as the C++
 // session pointer did).
-unsafe impl Send for Executor {}
+unsafe impl<T: ktir_superdsc::collective::Tp> Send for Executor<T> {}
 
 /// ⭐⭐⭐⭐⭐ A RAW (device-format) PAYLOAD **AND THE PLACEMENT IT FITS**, as one value — the only thing
 /// [`Executor::bind_input_raw`] accepts, and the reason a raw bind can no longer overrun its tensor.
@@ -1120,17 +1120,17 @@ struct ForwardHalf {
 
 /// WHICH RANK A SESSION RUNS AS — the bundle's world and its card's link, agreed at load.
 #[derive(Clone, Copy, Debug)]
-pub enum RankSeat {
+pub enum RankSeat<T: ktir_superdsc::collective::Tp> {
     /// A world of one: the bundle places no receive window and the card linked no peer.
     Alone,
     /// One rank of a sharded world: the bundle's window is the one whose slots the card's link
     /// pointed its `XSEG` entries at.
-    Linked { me: bundle::collective::TpIdentity },
+    Linked { me: bundle::collective::Rank<T> },
 }
 
 /// Why a bundle cannot run in this process's world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SeatRefusal {
+pub enum SeatRefusal<T: ktir_superdsc::collective::Tp> {
     /// The bundle was baked for a sharded world, and its card linked no peer to send to.
     Unlinked,
     /// The card runs one rank of a sharded world, and the bundle was baked for a world of one.
@@ -1138,14 +1138,14 @@ pub enum SeatRefusal {
     /// The bundle's window is not the one the card's link programmed — the peer's sends would
     /// land where this bundle's consumes do not read.
     WindowMoved {
-        baked: bundle::collective::RecvWindow,
-        linked: bundle::collective::RecvWindow,
+        baked: bundle::collective::RecvWindow<T>,
+        linked: bundle::collective::RecvWindow<T>,
     },
     /// The bundle's window cuts are not one flit-aligned window in bank 0 of the weight segment.
     Misplaced(bundle::collective::SendUnplaced),
 }
 
-impl std::fmt::Display for SeatRefusal {
+impl<T: ktir_superdsc::collective::Tp> std::fmt::Display for SeatRefusal<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unlinked => write!(
@@ -1170,14 +1170,17 @@ impl std::fmt::Display for SeatRefusal {
     }
 }
 
-impl std::error::Error for SeatRefusal {}
+impl<T: ktir_superdsc::collective::Tp> std::error::Error for SeatRefusal<T> {}
 
-impl RankSeat {
+impl<T: ktir_superdsc::collective::Tp> RankSeat<T> {
     /// The seat a session over `code` takes on a card holding `link`.
     ///
     /// # Errors
     /// [`SeatRefusal`], by name.
-    pub fn of(code: &bundle::BundleCode<'_>, link: Option<&PeerLink>) -> Result<Self, SeatRefusal> {
+    pub fn of(
+        code: &bundle::BundleCode<'_, T>,
+        link: Option<&PeerLink<T>>,
+    ) -> Result<Self, SeatRefusal<T>> {
         Self::agree(Self::baked_window(code)?, link.map(PeerLink::window))?;
         Ok(link.map_or(Self::Alone, |l| Self::Linked { me: l.identity() }))
     }
@@ -1189,16 +1192,16 @@ impl RankSeat {
     /// [`SeatRefusal::Misplaced`] when the cuts are not one flit-aligned window
     /// ([`bundle::collective::baked_window`]).
     pub fn baked_window(
-        code: &bundle::BundleCode<'_>,
-    ) -> Result<Option<bundle::collective::RecvWindow>, SeatRefusal> {
-        bundle::collective::baked_window(&code.layout).map_err(SeatRefusal::Misplaced)
+        code: &bundle::BundleCode<'_, T>,
+    ) -> Result<Option<bundle::collective::RecvWindow<T>>, SeatRefusal<T>> {
+        bundle::collective::baked_window::<T>(&code.layout).map_err(SeatRefusal::Misplaced)
     }
 
     /// The seat law over the two windows: the bundle's and the link's, each present or not.
     fn agree(
-        baked: Option<bundle::collective::RecvWindow>,
-        linked: Option<bundle::collective::RecvWindow>,
-    ) -> Result<(), SeatRefusal> {
+        baked: Option<bundle::collective::RecvWindow<T>>,
+        linked: Option<bundle::collective::RecvWindow<T>>,
+    ) -> Result<(), SeatRefusal<T>> {
         match (baked, linked) {
             (None, None) => Ok(()),
             (Some(_), None) => Err(SeatRefusal::Unlinked),
@@ -1209,16 +1212,15 @@ impl RankSeat {
     }
 
     /// The rank this seat runs as — `None` alone.
-    fn identity(self) -> Option<bundle::collective::TpIdentity> {
+    fn identity(self) -> Option<bundle::collective::Rank<T>> {
         match self {
             Self::Alone => None,
             Self::Linked { me } => Some(me),
         }
     }
-
 }
 
-impl Executor {
+impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     // ──────────────────────────────────────────────────────────────────────────────────────────
     //  Create
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -1229,17 +1231,18 @@ impl Executor {
     ///
     /// Nothing is read from disk: `code` is `&'static` data in this binary.
     pub fn load(
-        card: std::sync::Arc<CardRuntime>,
-        code: &'static bundle::BundleCode<'static>,
+        card: std::sync::Arc<CardRuntime<T>>,
+        code: &'static bundle::BundleCode<'static, T>,
         vocab: Vocab,
         kv_dim: KvDim,
         num_blocks: PoolPages,
-    ) -> Result<Executor> {
+    ) -> Result<Executor<T>> {
         // ⭐ ONE LOAD FOR EVERY WORLD. The bundle says whether it was baked sharded (it places a
         // receive window); the card says which rank it runs as (its [`CardRuntime::link`]). The
         // two must agree — see [`RankSeat::of`] — and a sharded session then binds only the launch
         // groups its rank plays.
-        let seat = RankSeat::of(code, card.link()).map_err(|e| anyhow!("bundle {}: {e}", code.fp))?;
+        let seat =
+            RankSeat::of(code, card.link()).map_err(|e| anyhow!("bundle {}: {e}", code.fp))?;
         let places: BTreeMap<bundle::PlaceId, &'static Placement> =
             code.layout.places.iter().map(|p| (p.id, p)).collect();
         // ⛔⛔⛔ THE MAP MUST NOT HAVE LOST A PLACEMENT. This was keyed by `p.name` (a String) and
@@ -1366,27 +1369,27 @@ impl Executor {
     /// ⛔ A SIBLING IS A FINGERPRINT THE REGISTRY RESOLVES. A rung this binary does not carry is a hard
     /// load error naming it and listing what IS carried — the alternative, treating it as absent, runs
     /// the batch on a bundle the ladder said was there.
-    fn sibling_ops(&self, what: &str, fp: &bundle::SiblingFp<'static>) -> Result<Ops> {
+    fn sibling_ops(&self, what: &str, fp: &bundle::SiblingFp<'static>) -> Result<Ops<T>> {
         let code = bundle::sibling(fp).ok_or_else(|| {
             anyhow!(
                 "{what} {} is not compiled into this binary — the emit either produced no such \
                  bundle or ran for a different model. Registered: {:?}",
                 fp.as_str(),
-                bundle::registered_fps(),
+                bundle::registered_fps::<T>(),
             )
         })?;
         bind_ops(code, self.session())
     }
 
     /// An OPTIONAL sibling's launch groups — a fold-fused twin, which a bundle may not carry.
-    fn optional_sibling_ops(&self, fp: &bundle::SiblingFp<'static>) -> Result<Option<Ops>> {
+    fn optional_sibling_ops(&self, fp: &bundle::SiblingFp<'static>) -> Result<Option<Ops<T>>> {
         bundle::sibling(fp)
             .map(|code| bind_ops(code, self.session()))
             .transpose()
     }
 
     /// The rank this session runs as, when it runs one rank of a sharded world.
-    fn session(&self) -> Option<bundle::collective::TpIdentity> {
+    fn session(&self) -> Option<bundle::collective::Rank<T>> {
         self.seat.identity()
     }
 
@@ -1615,7 +1618,7 @@ impl Executor {
         );
     }
 
-    fn lists(&self) -> Vec<&Ops> {
+    fn lists(&self) -> Vec<&Ops<T>> {
         vec![&self.prefix_ops]
             .into_iter()
             .chain(self.body_ops.iter())
@@ -3174,7 +3177,7 @@ impl Executor {
         r
     }
 
-    fn list_mut(&mut self, sel: ListSel) -> &mut Ops {
+    fn list_mut(&mut self, sel: ListSel) -> &mut Ops<T> {
         match sel {
             ListSel::Prefix => &mut self.prefix_ops,
             ListSel::Body(c) => &mut self.body_ops[c],
@@ -3191,7 +3194,7 @@ impl Executor {
 
     /// The same list, read-only — for the per-body facts [`StepBody`] carries, which are read off the
     /// body's own OPS.
-    fn list(&self, sel: ListSel) -> &Ops {
+    fn list(&self, sel: ListSel) -> &Ops<T> {
         match sel {
             ListSel::Prefix => &self.prefix_ops,
             ListSel::Body(c) => &self.body_ops[c],
@@ -3224,7 +3227,7 @@ impl Executor {
     /// only value that answers either question is minted here, by the selector, from the selector's own
     /// answer.
     /// The baked bundle this executor runs.
-    pub fn code(&self) -> &'static bundle::BundleCode<'static> {
+    pub fn code(&self) -> &'static bundle::BundleCode<'static, T> {
         self.code
     }
 
@@ -3490,7 +3493,7 @@ impl Executor {
         r
     }
 
-    fn launch_ops_inner(&mut self, ops: &Ops, where_: LaunchWhere, d: &Diag) -> Result<()> {
+    fn launch_ops_inner(&mut self, ops: &Ops<T>, where_: LaunchWhere, d: &Diag) -> Result<()> {
         // `slot_pos`/`kv_page_base`/`weight_bank` are read only inside
         // `cb_plan::launch_site`, through `where_` — nothing else in the walk uses them.
         let LaunchWhere {
@@ -3865,7 +3868,7 @@ impl Executor {
     fn dump_seg_addrs(
         &self,
         ta: &[&DevAddr],
-        op: &OpProg,
+        op: &OpProg<T>,
         prog: &DevAddr,
         bootstrap: u64,
         off: &[u64; NUM_SEGMENTS],
@@ -3892,7 +3895,7 @@ impl Executor {
         &self,
         who: &str,
         ta: &[&DevAddr],
-        op: &OpProg,
+        op: &OpProg<T>,
         prog: &DevAddr,
         bootstrap: u64,
         off: &[u64; NUM_SEGMENTS],
@@ -3963,7 +3966,7 @@ impl Executor {
     /// faulted. Sweeping the whole list sidesteps the question entirely: if any program's device copy
     /// differs from its baked bytes, this finds it without having to know which one the hardware was
     /// running.
-    fn prog_images_sweep(&self, who: &str, ops: &Ops) -> String {
+    fn prog_images_sweep(&self, who: &str, ops: &Ops<T>) -> String {
         use std::fmt::Write as _;
         let mut same = 0usize;
         let mut unread = 0usize;
@@ -4019,7 +4022,7 @@ impl Executor {
     /// translation for segment 7 than the one this address describes, the bytes here are the correct
     /// ones and the fault is in the mapping, not the image. That is the shape "identical" leaves
     /// standing, and it is worth naming because it is the only one left after this.
-    fn prog_image_report(&self, op: &OpProg, prog: &DevAddr) -> String {
+    fn prog_image_report(&self, op: &OpProg<T>, prog: &DevAddr) -> String {
         use std::fmt::Write as _;
         let baked: &[u8] = &op.code.init_binary;
         let stick = usize::try_from(crate::lower_subtile_tape_to_superdsc::STICK_BYTES)
@@ -4193,7 +4196,7 @@ impl Executor {
     /// emulator never dumps those (host-bound sources), so they simply have no reference file.
     /// Bank ≥ 1 weights and placements past a clamped shadow window are skipped (unreadable), each
     /// with one `skip.txt` line so the gap is visible rather than silent.
-    fn tensordump(&mut self, oi: usize, op: &OpProg) -> Result<()> {
+    fn tensordump(&mut self, oi: usize, op: &OpProg<T>) -> Result<()> {
         let Some(dir) = Diag::get().tensordump.clone() else {
             return Ok(());
         };
@@ -5991,7 +5994,7 @@ impl Executor {
     /// Only THIS session's descriptor is replaced; `owner` is untouched, so aliasing prefill onto
     /// decode leaves the decode session bit-for-bit unchanged. MUST be called AFTER both sessions'
     /// prepare (which zero-inits and H2Ds every segment).
-    pub fn alias_seg_from(&mut self, owner: &Executor, seg: SegIdx) -> Result<()> {
+    pub fn alias_seg_from(&mut self, owner: &Executor<T>, seg: SegIdx) -> Result<()> {
         let i = seg.get();
         let (Some(dst), Some(src)) = (self.seg_addr[i].as_ref(), owner.seg_addr[i].as_ref()) else {
             bail!("alias_seg(seg{i}): a session has no region for it");
@@ -6398,11 +6401,11 @@ impl StepBody {
 /// program the bundle does not carry. What can fail is the WORLD: a consume bound by a session of
 /// a world of one, or a rank-selected consume baked for another world, is a bundle the session was
 /// never meant to run.
-fn bind_ops(
-    code: &'static bundle::BundleCode<'static>,
-    session: Option<bundle::collective::TpIdentity>,
-) -> Result<Ops> {
-    let sends: BTreeMap<usize, bundle::collective::TpSend> =
+fn bind_ops<T: ktir_superdsc::collective::Tp>(
+    code: &'static bundle::BundleCode<'static, T>,
+    session: Option<bundle::collective::Rank<T>>,
+) -> Result<Ops<T>> {
+    let sends: BTreeMap<usize, bundle::collective::TpSend<T>> =
         bundle::collective::sends(&code.layout, &code.groups)
             .map_err(|u| {
                 anyhow!(
@@ -6419,7 +6422,7 @@ fn bind_ops(
     for (i, g) in code.groups.iter().enumerate() {
         let mut collective = None;
         if let Some(consume) = g.kv.tp {
-            let Some(me) = session.filter(|me| me.world().is_sharded()) else {
+            let Some(me) = session else {
                 bail!(
                     "bundle {} group {i} is a collective's consume, so the bundle was baked for a \
                      sharded world — a world-of-one session cannot run it (link the world's \
@@ -6427,17 +6430,6 @@ fn bind_ops(
                     code.fp
                 );
             };
-            let at = consume.plays_at.rank();
-            if at.world() != me.world() {
-                bail!(
-                    "bundle {} group {i} was baked for a {}-rank world, but this session is rank \
-                     {} of a {}-rank world",
-                    code.fp,
-                    at.world().get(),
-                    me.rank(),
-                    me.world().get()
-                );
-            }
             if !bundle::collective::plays_on(Some(consume), me) {
                 continue;
             }
@@ -6717,9 +6709,9 @@ mod tests {
     #[test]
     fn a_bundle_runs_only_where_the_process_linked_its_window() {
         use bundle::collective::{Payload, RecvWindow, TpWorld, WireBytes};
-        let w = TpWorld::of::<4>();
-        let at = |offset| RecvWindow::new(w, offset, Payload::from(WireBytes::CAP)).unwrap();
-        assert_eq!(RankSeat::agree(None, None), Ok(()));
+        type W4 = TpWorld<4>;
+        let at = |offset| RecvWindow::<W4>::new(offset, Payload::from(WireBytes::CAP)).unwrap();
+        assert_eq!(RankSeat::<W4>::agree(None, None), Ok(()));
         assert_eq!(
             RankSeat::agree(Some(at(1 << 20)), Some(at(1 << 20))),
             Ok(())
@@ -6739,10 +6731,6 @@ mod tests {
                 linked: at(1 << 20)
             })
         );
-        // A window baked for another world is another window, wherever it sits.
-        let other = RecvWindow::new(TpWorld::of::<2>(), 1 << 20, Payload::from(WireBytes::CAP))
-            .unwrap();
-        assert!(RankSeat::agree(Some(other), Some(at(1 << 20))).is_err());
     }
 
     /// A compile-time-named segment cannot be out of range, and a runtime one is checked.

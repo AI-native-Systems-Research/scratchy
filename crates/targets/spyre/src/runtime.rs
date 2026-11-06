@@ -34,7 +34,7 @@ const _: () = {
     );
 };
 
-use crate::bundle_code::collective::{RecvWindow, Sid, TpIdentity};
+use crate::bundle_code::collective::{PerRank, Rank, RecvWindow, Sid, WINDOW_SEGMENT};
 
 use flex_rs::address::{Chunk, CompositeAddress, LogicalAddress, RegionId};
 use flex_rs::allocator::{
@@ -73,17 +73,17 @@ use flex_rs::topology::populate_domain_topology;
 /// its capacity read from the card, then a real `RuntimeContext` over a `Pf` backend and a real
 /// `FlexAllocator` whose address resolution is `FlexAllocatorAddressResolver` (production — see the
 /// `flex_rs::scheduler` module doc).
-pub struct CardRuntime {
+pub struct CardRuntime<T: ktir_superdsc::collective::Tp> {
     card: Arc<flex_rs::senlib_ffi::Card>,
     memory: CardMemory,
     rt: Arc<RuntimeContext>,
     /// This card's p2p link, when it runs one rank of a sharded world — set once, by
     /// [`link_peers`]. A card's `XSEG` entries point at one window's slots, so the card holds at
     /// most one link for its life.
-    link: std::sync::OnceLock<PeerLink>,
+    link: std::sync::OnceLock<PeerLink<T>>,
 }
 
-impl fmt::Debug for CardRuntime {
+impl<T: ktir_superdsc::collective::Tp> fmt::Debug for CardRuntime<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CardRuntime")
             .field("pci", &self.card.pci())
@@ -92,7 +92,7 @@ impl fmt::Debug for CardRuntime {
     }
 }
 
-impl CardRuntime {
+impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
     /// Open card `index` of the cards senlib enumerates (its PCI address resolved by senlib, then
     /// opened BY THAT ADDRESS, so the card opened is the card named) and bring its runtime up
     /// (~5.7 s cold).
@@ -162,7 +162,7 @@ impl CardRuntime {
     }
 
     /// This card's p2p link, when it runs one rank of a sharded world ([`link_peers`]).
-    pub fn link(&self) -> Option<&PeerLink> {
+    pub fn link(&self) -> Option<&PeerLink<T>> {
         self.link.get()
     }
 
@@ -545,7 +545,9 @@ impl Stream {
     /// are user-owned and order through their own submissions; the hazard tracker's conservative
     /// Compute address sets would cross-edge concurrent sessions sharing resident weights into
     /// full serialization. Delegates to [`Self::create_with`].
-    pub fn create(card: &CardRuntime) -> Result<Stream, HwError> {
+    pub fn create<T: ktir_superdsc::collective::Tp>(
+        card: &CardRuntime<T>,
+    ) -> Result<Stream, HwError> {
         Self::create_with(
             card,
             RuntimeStreamPriority::Normal,
@@ -562,8 +564,8 @@ impl Stream {
     /// direction). This is the shape for concurrent pipelines over shared device memory —
     /// `OP_ORDERING` streams whose cross-stream ordering the tracker carries instead of a
     /// host-side lock; see `examples/hazard_concurrency.rs`, the #546 concurrency leg.
-    pub fn create_with(
-        card: &CardRuntime,
+    pub fn create_with<T: ktir_superdsc::collective::Tp>(
+        card: &CardRuntime<T>,
         priority: RuntimeStreamPriority,
         mode: RuntimeStreamMode,
         track_hazards: bool,
@@ -1192,8 +1194,8 @@ pub struct DevAddr(Arc<CompositeAddress>);
 impl DevAddr {
     /// Allocate `nbytes` of device memory of the given [`MemoryType`]. The region is never freed
     /// (see the struct doc); this handle describes it.
-    pub fn alloc(
-        card: &CardRuntime,
+    pub fn alloc<T: ktir_superdsc::collective::Tp>(
+        card: &CardRuntime<T>,
         nbytes: ByteSize,
         kind: MemoryType,
     ) -> Result<DevAddr, HwError> {
@@ -1300,16 +1302,14 @@ impl DevAddr {
 /// Why a sharded world's cards could not be linked. Each is a load refusal: a topology without
 /// device p2p RDMA is refused, never served over the host.
 #[derive(Debug)]
-pub enum AttachRefusal {
-    /// The cards handed over are not one per rank of the world.
-    WorldSize { world: u32, cards: usize },
+pub enum AttachRefusal<T: ktir_superdsc::collective::Tp> {
     /// Two ranks were handed the same card.
     SameCard { card: String },
     /// A card is already linked, as another rank or for another window.
     AlreadyLinked {
         card: String,
-        linked: (TpIdentity, RecvWindow),
-        asked: (TpIdentity, RecvWindow),
+        linked: (Rank<T>, RecvWindow<T>),
+        asked: (Rank<T>, RecvWindow<T>),
     },
     /// A peer card's region-2 bus address could not be read.
     PeerRegion(String),
@@ -1319,13 +1319,9 @@ pub enum AttachRefusal {
     Xseg(String),
 }
 
-impl fmt::Display for AttachRefusal {
+impl<T: ktir_superdsc::collective::Tp> fmt::Display for AttachRefusal<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::WorldSize { world, cards } => write!(
-                f,
-                "a {world}-rank world needs one card per rank, and {cards} card(s) were handed over"
-            ),
             Self::SameCard { card } => write!(
                 f,
                 "two ranks were handed the same card ({card}) — a rank cannot send to itself"
@@ -1347,7 +1343,7 @@ impl fmt::Display for AttachRefusal {
     }
 }
 
-impl std::error::Error for AttachRefusal {}
+impl<T: ktir_superdsc::collective::Tp> std::error::Error for AttachRefusal<T> {}
 
 /// ⭐ ONE CARD'S P2P LINK — tensor parallelism's one load-time fact per card: which rank the card
 /// runs as and where its peer's sends land. Minted only by [`link_peers`], which installs every
@@ -1361,24 +1357,24 @@ impl std::error::Error for AttachRefusal {}
 /// window the link programmed — [`crate::superdsc_exec::Executor::load`] refuses a bundle whose
 /// window is elsewhere.
 #[derive(Debug)]
-pub struct PeerLink {
-    me: TpIdentity,
-    window: RecvWindow,
+pub struct PeerLink<T: ktir_superdsc::collective::Tp> {
+    me: Rank<T>,
+    window: RecvWindow<T>,
 }
 
-impl PeerLink {
+impl<T: ktir_superdsc::collective::Tp> PeerLink<T> {
     /// The rank this card runs as.
-    pub fn identity(&self) -> TpIdentity {
+    pub fn identity(&self) -> Rank<T> {
         self.me
     }
 
     /// Where every peer's sends land on this card.
-    pub fn window(&self) -> RecvWindow {
+    pub fn window(&self) -> RecvWindow<T> {
         self.window
     }
 }
 
-/// Link a sharded world's cards — `cards[r]` runs rank `r` of `window.world()` — for sends landing
+/// Link a sharded world's cards — `cards.get(r)` runs rank `r` of world `T` — for sends landing
 /// in `window` on every card. One process, every card: each card's base-address table gets every
 /// peer's region-2 address (entry `tid = peer rank`), and for every peer `s` its `XSEG` entry for
 /// each of `s`'s landing slots (`Sid::of(s, slot)`) points at that slot of `s`'s block of its own
@@ -1386,28 +1382,25 @@ impl PeerLink {
 ///
 /// # Errors
 /// [`AttachRefusal`], by name.
-pub fn link_peers(cards: &[Arc<CardRuntime>], window: RecvWindow) -> Result<(), AttachRefusal> {
-    let world = window.world();
-    let ranks: Vec<TpIdentity> = world.ranks().collect();
-    if ranks.len() != cards.len() {
-        return Err(AttachRefusal::WorldSize {
-            world: world.get(),
-            cards: cards.len(),
-        });
-    }
-    for (i, a) in cards.iter().enumerate() {
-        if cards[..i].iter().any(|b| b.card.pci() == a.card.pci()) {
+pub fn link_peers<T: ktir_superdsc::collective::Tp>(
+    cards: &PerRank<T, Arc<CardRuntime<T>>>,
+    window: RecvWindow<T>,
+) -> Result<(), AttachRefusal<T>> {
+    for (r, a) in cards.iter() {
+        if cards
+            .iter()
+            .any(|(p, b)| p.get() < r.get() && b.card.pci() == a.card.pci())
+        {
             return Err(AttachRefusal::SameCard {
                 card: a.card.pci().to_string(),
             });
         }
     }
-    let region2: Vec<u64> = cards
-        .iter()
-        .map(|c| flex_rs::senlib_ffi::pci_addr_for_region(c.card.pci(), 2))
-        .collect::<Result<_, _>>()
-        .map_err(AttachRefusal::PeerRegion)?;
-    for (&me, c) in ranks.iter().zip(cards) {
+    let region2: PerRank<T, u64> = PerRank::try_from_fn(|r| {
+        flex_rs::senlib_ffi::pci_addr_for_region(cards.get(r).card.pci(), 2)
+    })
+    .map_err(AttachRefusal::PeerRegion)?;
+    for (me, c) in cards.iter() {
         if let Some(link) = c.link.get() {
             if (link.me, link.window) == (me, window) {
                 continue;
@@ -1423,11 +1416,9 @@ pub fn link_peers(cards: &[Arc<CardRuntime>], window: RecvWindow) -> Result<(), 
         // region-2 PCI address, from senlib's own region-address door (the vendor's
         // `initialize_p2p_address_table` value source), for the card the address names, never an
         // enumeration order.
-        for (peer, &addr) in ranks.iter().zip(&region2) {
-            if peer.rank() == me.rank() {
-                continue;
-            }
-            let tid = crate::cb_plan::base_addr_entry(*peer);
+        for peer in me.peers() {
+            let addr = *region2.get(peer);
+            let tid = crate::cb_plan::base_addr_entry(peer);
             c.card
                 .set_base_addr_table(tid, addr)
                 .map_err(|why| AttachRefusal::Bat { tid, why })?;

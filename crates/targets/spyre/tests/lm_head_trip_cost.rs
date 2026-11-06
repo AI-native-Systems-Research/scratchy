@@ -14,7 +14,7 @@ use scratchy_target_spyre::lower_subtile_tape_to_superdsc::concrete_trips;
 fn lm_head_trips(m: u32) -> usize {
     let (n, k) = (51200u32, 2048u32);
     let mut sym = 0i64;
-    let e = assemble_matmul_off(
+    let e = assemble_matmul_off::<ktir_superdsc::collective::TpWorld<1>, _>(
         "lmhead",
         MatM::of_token_rows(m),
         MatN::of_out_features(n),

@@ -56,7 +56,7 @@ use flex_rs::scheduler::RunPlace;
 
 use crate::bundle_code::NUM_SEGMENTS;
 use crate::bundle_code::collective::{
-    CbStep, RecvWindow, Sid, TpConsume, TpIdentity, TpSend, group_steps,
+    CbStep, Rank, Sid, TpConsume, TpSend, WINDOW_SEGMENT, group_steps,
 };
 use crate::fold_plan::{self, OpKv, SessionKv, SlotPos, UniformPages};
 use crate::runtime::{
@@ -181,8 +181,8 @@ impl LaunchSite {
 /// (#620). Its rows are never read, and the only base left to aim it at is the cursor's own
 /// page, which is part 0's keys. Every caller — the submit walk, `walk_items`, the render —
 /// skips the entry, so the plan twin and the walk can never disagree about the enumeration.
-pub(crate) fn launch_site(
-    ops: &Ops,
+pub(crate) fn launch_site<T: ktir_superdsc::collective::Tp>(
+    ops: &Ops<T>,
     oi: usize,
     rep: i64,
     fold: &SessionKv,
@@ -332,18 +332,18 @@ pub(crate) fn launch_site(
 /// that plays it. Minted only at bind (`superdsc_exec::bind_ops`), for the consumes the session
 /// plays.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct BoundCollective {
-    pub(crate) send: TpSend,
-    pub(crate) me: TpIdentity,
+pub(crate) struct BoundCollective<T: ktir_superdsc::collective::Tp> {
+    pub(crate) send: TpSend<T>,
+    pub(crate) me: Rank<T>,
 }
 
 /// What [`site_cbs`] reads off a group: its launch order, its consume (the bundle's), and the
 /// session's binding of it.
 #[derive(Clone, Copy)]
-pub(crate) struct SiteTp {
+pub(crate) struct SiteTp<T: ktir_superdsc::collective::Tp> {
     pub(crate) index: usize,
-    pub(crate) consume: Option<TpConsume>,
-    pub(crate) bound: Option<BoundCollective>,
+    pub(crate) consume: Option<TpConsume<T>>,
+    pub(crate) bound: Option<BoundCollective<T>>,
 }
 
 /// ⭐ ONE (op, PASS)'S CONTROL BLOCKS — its launch, and in front of a collective's consume a send to
@@ -357,7 +357,10 @@ pub(crate) struct SiteTp {
 /// end is this rank's block, which is the same block on every peer (the layout is card-symmetric),
 /// so one landing address serves every send; the destination is the peer's base-address-table
 /// entry, its rank.
-pub(crate) fn site_cbs(tp: SiteTp, launch: BatchedCompute) -> Result<Vec<BatchedCb>> {
+pub(crate) fn site_cbs<T: ktir_superdsc::collective::Tp>(
+    tp: SiteTp<T>,
+    launch: BatchedCompute,
+) -> Result<Vec<BatchedCb>> {
     let SiteTp {
         index,
         consume,
@@ -439,9 +442,9 @@ pub(crate) fn site_cbs(tp: SiteTp, launch: BatchedCompute) -> Result<Vec<Batched
 
 /// The base-address-table entry a send to `to` names: the peer's rank, the entry
 /// `runtime::link_peers` installs that card's region-2 address at on every other card.
-pub(crate) fn base_addr_entry(to: TpIdentity) -> u8 {
+pub(crate) fn base_addr_entry<T: ktir_superdsc::collective::Tp>(to: Rank<T>) -> u8 {
     // A rank is below `collective::MAX_WORLD`, far below a byte.
-    to.rank() as u8
+    to.get() as u8
 }
 
 /// The walk's staged batch for one launch call — the OLD way, built from the
@@ -450,8 +453,8 @@ pub(crate) fn base_addr_entry(to: TpIdentity) -> u8 {
 /// interleave with the arithmetic), which is exactly why the gate exists: if
 /// the two loops ever disagree in enumeration or addressing, the rendered CBs
 /// differ and prepare refuses. Returns the items and the walk's host-fence OR.
-pub(crate) fn walk_items(
-    ops: &Ops,
+pub(crate) fn walk_items<T: ktir_superdsc::collective::Tp>(
+    ops: &Ops<T>,
     fold: &SessionKv,
     seg: &[Option<DevAddr>; NUM_SEGMENTS],
     banks: &[Option<DevAddr>],
@@ -478,7 +481,7 @@ pub(crate) fn walk_items(
 /// data. Everything here is a constant of the (list, launch row, fold shape)
 /// the plan was built for; the per-step scalars enter only at
 /// [`CbPlan::render`].
-pub(crate) struct CbPlanEntry {
+pub(crate) struct CbPlanEntry<T: ktir_superdsc::collective::Tp> {
     /// Diagnostic identity — the label the walk's own traces print plus the
     /// pass — so a parity refusal names its CB.
     label: String,
@@ -502,16 +505,16 @@ pub(crate) struct CbPlanEntry {
     /// differently at the region's end).
     bases: Vec<(DevAddr, u64)>,
     /// The collective CBs in front of this entry, staged by the walk's own [`site_cbs`].
-    tp: SiteTp,
+    tp: SiteTp<T>,
 }
 
 /// One launch's CB constructor list — the walk's sequence as data, keyed by
 /// (list, launch row, fold shape) at build time.
-pub(crate) struct CbPlan {
-    entries: Vec<CbPlanEntry>,
+pub(crate) struct CbPlan<T: ktir_superdsc::collective::Tp> {
+    entries: Vec<CbPlanEntry<T>>,
 }
 
-impl CbPlan {
+impl<T: ktir_superdsc::collective::Tp> CbPlan<T> {
     /// The staged batch the plan renders to, with the walk's host-fence OR.
     ///
     /// The fold state arrives per RENDER, not per plan — it is the per-step
@@ -602,13 +605,13 @@ impl CbPlan {
 /// every per-CB input that does not vary with the step's scalars. Built from
 /// the same `op_reps` the walk calls; the bases come from the same
 /// `segment_base` resolution the walk's `launch_site` performs.
-pub(crate) fn build_cb_plan(
-    ops: &Ops,
+pub(crate) fn build_cb_plan<T: ktir_superdsc::collective::Tp>(
+    ops: &Ops<T>,
     fold: &SessionKv,
     seg: &[Option<DevAddr>; NUM_SEGMENTS],
     banks: &[Option<DevAddr>],
     where_: &LaunchWhere,
-) -> Result<CbPlan> {
+) -> Result<CbPlan<T>> {
     // The sweep witness, once, for the barrier probe below — the same
     // `UniformPages::sweeping` the walk's `launch_site` mints per pass; a fold
     // that cannot sweep refuses here exactly as the walk would refuse there.
@@ -695,8 +698,8 @@ pub(crate) fn build_cb_plan(
 /// allocation): a mismatch means the plan's data twin of the walk is wrong,
 /// and the player that will replay these images must not load. Returns the
 /// number of CBs proven byte-identical.
-pub(crate) fn parity_check(
-    ops: &Ops,
+pub(crate) fn parity_check<T: ktir_superdsc::collective::Tp>(
+    ops: &Ops<T>,
     fold: &SessionKv,
     seg: &[Option<DevAddr>; NUM_SEGMENTS],
     banks: &[Option<DevAddr>],
@@ -924,8 +927,8 @@ fn word_at(image: &[ControlBlockWire], cb: usize, dst: usize) -> u64 {
 ///
 /// Returns the canvas image and its patch plan: what 2c's player copies and
 /// patches per step.
-pub(crate) fn build_patch_plan(
-    ops: &Ops,
+pub(crate) fn build_patch_plan<T: ktir_superdsc::collective::Tp>(
+    ops: &Ops<T>,
     fold: &SessionKv,
     seg: &[Option<DevAddr>; NUM_SEGMENTS],
     banks: &[Option<DevAddr>],
@@ -1064,8 +1067,8 @@ pub(crate) struct RowImage {
 /// structurally different allocation, and the solve refused). Parity
 /// at the constant `where_` is the row's whole correctness statement; the
 /// player copies this canvas verbatim and never consults the empty plan.
-pub(crate) fn render_row(
-    ops: &Ops,
+pub(crate) fn render_row<T: ktir_superdsc::collective::Tp>(
+    ops: &Ops<T>,
     fold: &SessionKv,
     seg: &[Option<DevAddr>; NUM_SEGMENTS],
     banks: &[Option<DevAddr>],
@@ -1105,8 +1108,8 @@ pub(crate) fn render_row(
 /// rather than caught at a boundary probe.
 /// Returns the number of patch sites verified and the
 /// verified image itself.
-pub(crate) fn patch_check(
-    ops: &Ops,
+pub(crate) fn patch_check<T: ktir_superdsc::collective::Tp>(
+    ops: &Ops<T>,
     fold: &SessionKv,
     seg: &[Option<DevAddr>; NUM_SEGMENTS],
     banks: &[Option<DevAddr>],
@@ -1205,8 +1208,8 @@ pub(crate) fn patch_check(
 mod tests {
     use super::*;
     use crate::bundle_code::collective::{
-        CollectiveKind, CutPayload, LandingSlot, Payload, PlaysAt, TpWorld, WindowCut, WireBytes,
-        fragments,
+        CollectiveKind, CutPayload, LandingSlot, Payload, Rank, Tp, TpWorld, WindowCut, WireBytes,
+        World, fragments, ranks,
     };
     use crate::runtime::Chunk0;
     use flex_rs::address::{ByteOffset, RegionId};
@@ -1229,12 +1232,12 @@ mod tests {
         }
     }
 
-    fn consume(me: TpIdentity) -> TpConsume {
+    fn consume<T: Tp>(me: Rank<T>) -> TpConsume<T> {
         TpConsume {
             kind: CollectiveKind::AllReduce,
             operand: crate::bundle_code::PlaceId::Act(7),
             fragment: fragments(1, 2048, Payload::from(WireBytes::CAP)).unwrap()[0],
-            plays_at: PlaysAt::of(me),
+            plays_at: me,
             cut: WindowCut::of_collective(0),
         }
     }
@@ -1249,18 +1252,17 @@ mod tests {
     /// wait on every peer's sid, then the barriered consume.
     #[test]
     fn a_consume_site_sends_to_and_waits_on_every_peer() {
-        fn check<const W: u32>() {
-            let world = TpWorld::of::<W>();
+        fn check<T: Tp>() {
             let cut = WindowCut::of_collective(1);
-            for me in world.ranks() {
+            for me in ranks::<T>() {
                 let send = TpSend {
                     source_segment: 3,
                     source_offset: 4096,
                     window_offset: 1 << 20,
-                    bytes: CutPayload::new(world, Payload::new(4096).unwrap()).unwrap(),
+                    bytes: CutPayload::new(Payload::new(4096).unwrap()).unwrap(),
                     cut,
                 };
-                let slot = LandingSlot::of(world, cut, 0).unwrap();
+                let slot = LandingSlot::of(cut, 0).unwrap();
                 let cbs = site_cbs(
                     SiteTp {
                         index: 5,
@@ -1270,16 +1272,16 @@ mod tests {
                     launch(),
                 )
                 .unwrap();
-                let peers: Vec<TpIdentity> = me.peers().collect();
+                let peers: Vec<Rank<T>> = me.peers().collect();
                 let n = peers.len();
-                assert_eq!(cbs.len(), 2 * n + 1, "world {W}");
+                assert_eq!(cbs.len(), 2 * n + 1, "world {}", <T as World>::RANKS);
                 for (i, to) in peers.iter().enumerate() {
                     let BatchedCb::Send(s) = &cbs[i] else {
                         panic!("the sends lead");
                     };
                     assert_eq!(
                         (s.sid, s.dest_tid, s.bytes.get()),
-                        (Sid::of(me, slot).get(), to.rank() as u8, 4096)
+                        (Sid::of(me, slot).get(), to.get() as u8, 4096)
                     );
                     assert_eq!(s.place, RunPlace::ALONE);
                     assert_eq!(
@@ -1298,10 +1300,10 @@ mod tests {
                 assert!(matches!(cbs[2 * n], BatchedCb::Consume(_)));
             }
         }
-        check::<2>();
-        check::<3>();
-        check::<4>();
-        check::<8>();
+        check::<TpWorld<2>>();
+        check::<TpWorld<3>>();
+        check::<TpWorld<4>>();
+        check::<TpWorld<8>>();
     }
 
     /// A send wider than one message stages as its run — every message an F-send at the matching
@@ -1310,18 +1312,18 @@ mod tests {
     /// raises are exactly the counts this rank's waits on it take, slot by slot.
     #[test]
     fn a_wide_send_stages_its_messages_then_as_many_waits() {
-        let world = TpWorld::of::<4>();
-        let me = world.rank(0).unwrap();
+        type W4 = TpWorld<4>;
+        let me = Rank::<W4>::of::<0>();
         let cap = WireBytes::CAP.get();
         let cut = WindowCut::of_collective(0);
         let send = TpSend {
             source_segment: 0,
             source_offset: 0,
             window_offset: 1 << 20,
-            bytes: CutPayload::new(world, Payload::new(cap + 4096).unwrap()).unwrap(),
+            bytes: CutPayload::new(Payload::new(cap + 4096).unwrap()).unwrap(),
             cut,
         };
-        let slot = |m| LandingSlot::of(world, cut, m).unwrap();
+        let slot = |m| LandingSlot::<W4>::of(cut, m).unwrap();
         let cbs = site_cbs(
             SiteTp {
                 index: 1,
@@ -1331,7 +1333,7 @@ mod tests {
             launch(),
         )
         .unwrap();
-        let peers: Vec<TpIdentity> = me.peers().collect();
+        let peers: Vec<Rank<W4>> = me.peers().collect();
         assert_eq!(cbs.len(), peers.len() * 4 + 1);
         for (p, to) in peers.iter().enumerate() {
             let sends: Vec<&RdmaSend> = cbs[2 * p..2 * p + 2]
@@ -1347,8 +1349,8 @@ mod tests {
                     .map(|s| (s.source.offset, s.window.offset, s.bytes.get(), s.dest_tid))
                     .collect::<Vec<_>>(),
                 [
-                    (0, 1 << 20, cap, to.rank() as u8),
-                    (cap, (1 << 20) + cap, 4096, to.rank() as u8)
+                    (0, 1 << 20, cap, to.get() as u8),
+                    (cap, (1 << 20) + cap, 4096, to.get() as u8)
                 ]
             );
             assert_eq!(
@@ -1373,7 +1375,9 @@ mod tests {
         for (p, from) in peers.iter().enumerate() {
             for m in 0..2 {
                 let want = Sid::of(*from, slot(m)).get();
-                assert!(matches!(waits[2 * p + m as usize], BatchedCb::Wait { sid } if sid == want));
+                assert!(
+                    matches!(waits[2 * p + m as usize], BatchedCb::Wait { sid } if sid == want)
+                );
             }
         }
         assert!(matches!(cbs.last(), Some(BatchedCb::Consume(_))));
@@ -1384,7 +1388,7 @@ mod tests {
     #[test]
     fn a_plain_site_is_one_launch_and_an_unbound_consume_refuses() {
         let plain = site_cbs(
-            SiteTp {
+            SiteTp::<TpWorld<1>> {
                 index: 0,
                 consume: None,
                 bound: None,
@@ -1396,7 +1400,7 @@ mod tests {
         let why = site_cbs(
             SiteTp {
                 index: 2,
-                consume: Some(consume(TpWorld::of::<2>().rank(0).unwrap())),
+                consume: Some(consume(Rank::<TpWorld<2>>::of::<0>())),
                 bound: None,
             },
             launch(),
