@@ -781,9 +781,9 @@ impl IndexSelectPage {
     ) -> Self {
         use crate::superdsc_opspec::LandingFrame;
         use std::num::NonZeroU32;
-        // The ONE block the flat and restickify landings state — bound to a name that says
-        // one, not the type's minimum (which is the same 1).
-        let one = NonZeroU32::new(1).expect("one is nonzero");
+        // The ONE block the flat and restickify landings state — the type's own minimum,
+        // which is that one.
+        let one = NonZeroU32::MIN;
         match frame {
             LandingFrame::Blocks {
                 blocks, rows, w, ..

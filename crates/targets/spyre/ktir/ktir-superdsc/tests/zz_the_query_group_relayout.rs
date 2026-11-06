@@ -29,8 +29,9 @@ use ktir_superdsc::sdsc_abstract::{
 
 /// granite-3.1-8b's attention geometry.
 const NQH: u32 = 32;
-const NKVH: u32 = 8;
-const GQA: u32 = NQH / NKVH;
+/// The fixture head count, as the nonzero the constructor takes.
+const NKVH: std::num::NonZeroU32 = std::num::NonZeroU32::new(8).unwrap();
+const GQA: u32 = NQH / 8;
 const HD: u32 = 128;
 const STICK: u32 = 64;
 const NSLAB: u32 = HD / STICK;
@@ -58,7 +59,7 @@ fn ops_with(
     let q = qg();
     let mut sym = 0i64;
     let mut ops = Vec::new();
-    for kvh in 0..NKVH {
+    for kvh in 0..NKVH.get() {
         for s in 0..NSLAB {
             let src = q.copy_src(kvh, s).expect("in range");
             let dst = dest(kvh, s);
@@ -74,7 +75,7 @@ fn ops_with(
                 // I[64,64] at offset 0 of the class's `[hd, hd]` identity — the cache write's kernel.
                 &Stk::<KernelTag>::kernel(STICK as usize, STICK as usize, "t_ident"),
                 DevOff::ZERO,
-                &rbh("t_qg", NKVH * GQA, HD),
+                &rbh("t_qg", NKVH.get() * GQA, HD),
                 dst,
                 &mut sym,
                 None,
@@ -202,7 +203,11 @@ fn the_relayout_keeps_the_stick_axis_so_no_restickify_can_express_it() {
 #[test]
 fn the_relayout_is_a_permutation_of_every_query_element_onto_its_group_block() {
     let ops = relayout_ops();
-    assert_eq!(ops.len() as u32, NKVH * NSLAB, "one op per (kv head, slab)");
+    assert_eq!(
+        ops.len() as u32,
+        NKVH.get() * NSLAB,
+        "one op per (kv head, slab)"
+    );
     check_permutation(&ops).unwrap_or_else(|e| panic!("{e}"));
 }
 
@@ -231,7 +236,7 @@ fn the_permutation_check_refuses_a_slab_swap_and_a_copy_that_does_not_relayout()
 /// `(row h%gqa, feat f)` of block `h/gqa`, and every block element is written.
 fn check_permutation(ops: &[EmittedOp]) -> Result<(), String> {
     let block_elems = (GQA * HD) as u64;
-    let mut landed = vec![None::<(u32, u32)>; (NKVH * GQA * HD) as usize];
+    let mut landed = vec![None::<(u32, u32)>; (NKVH.get() * GQA * HD) as usize];
     for e in ops {
         let (v, b) = body(e);
         let n_ = &b["N_"];

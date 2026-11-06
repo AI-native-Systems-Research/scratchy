@@ -72,9 +72,9 @@ fn pool(nkvh: usize, hd: usize) -> ktir_superdsc::sdsc_abstract::PagedKvPool {
 
 /// Every address of one page's plane, over every kv head, slot and feature.
 fn plane_addrs(pool: &PagedKvPool, plane: KvPlane) -> Vec<u32> {
-    let nkvh = NonZeroU32::new(pool.nkvh()).expect("the pool's head count is nonzero by type");
+    let nkvh = pool.nkvh();
     let mut out = Vec::new();
-    for h in 0..pool.nkvh() {
+    for h in 0..pool.nkvh().get() {
         let kvh = KvHead::new(h, nkvh).expect("kv head in range");
         for slot in 0..PagedKvPool::POOL_PAGE_SLOTS.get() {
             for feat in 0..pool.head_width().get() {

@@ -4523,10 +4523,7 @@ impl BatchRows {
     /// one row: this row is an independent sequence at its own position. `mq == 1` erased that
     /// distinction, which is why a passing `bs=1` run was never evidence about the batched kind.
     pub const fn solo() -> BatchRows {
-        QueryRows::new(match NonZeroU32::new(1) {
-            Some(n) => n,
-            None => unreachable_nonzero(),
-        })
+        QueryRows::new(NonZeroU32::MIN)
     }
 }
 
@@ -4566,14 +4563,6 @@ impl ChunkRows {
     /// `prefill_pad_row_holds_last_real_token`.
     pub fn row_logical_pos(self, row: usize, real: usize) -> usize {
         row.min(real - 1)
-    }
-}
-
-/// `NonZeroU32::new(1).unwrap()` is not const; this is the const-context stand-in.
-const fn unreachable_nonzero() -> NonZeroU32 {
-    match NonZeroU32::new(1) {
-        Some(n) => n,
-        None => panic!("1 is nonzero"),
     }
 }
 
@@ -5253,9 +5242,10 @@ impl PagedKvPool {
         PagedKvPool { nkvh, hd }
     }
 
-    /// DISTINCT kv heads, as a count.
-    pub const fn nkvh(&self) -> u32 {
-        self.nkvh.get()
+    /// DISTINCT kv heads, as the nonzero count the pool's own field already is — the reader that
+    /// needs the integer calls `.get()` at its boundary and never re-proves it nonzero.
+    pub const fn nkvh(&self) -> NonZeroU32 {
+        self.nkvh
     }
 
     /// ELEMENTS BETWEEN TWO REQUESTS' KV, in any plane of any page+layer — the stride a batched
@@ -5728,7 +5718,7 @@ pub fn gather_index_table(
             // VALID. A row with NO pages has nothing to repeat, which is why that one refuses.
             let last = *table.last()?;
             let phys = *table.get(p).unwrap_or(&last);
-            for kvh in 0..scratch.nkvh() {
+            for kvh in 0..scratch.nkvh().get() {
                 for b in 0..scratch.windows() {
                     // ⭐ ONE COMPOSITION, INSIDE THE TYPE. The `phys * per_page + block` arithmetic that
                     // used to be spelled here — and whose three terms all have plausible wrong siblings
@@ -5968,7 +5958,7 @@ pub fn page_gather_index_table(
 /// const — see `GroupSize` in the target crate for the measurement).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PagePlaneExtent {
-    nkvh: u32,
+    nkvh: NonZeroU32,
     hd: HeadWidth,
 }
 
@@ -6009,7 +5999,7 @@ impl PagePlaneExtent {
     /// Elements in one request's whole page plane — `nkvh * hd * POOL_PAGE_SLOTS`, the contiguous run one
     /// index entry names. This is `skip_addr`, so it is ALSO the unit the host's entry counts in.
     pub const fn elems(self) -> u64 {
-        self.nkvh as u64 * self.hd.get() as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64
+        self.nkvh.get() as u64 * self.hd.get() as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64
     }
 
     /// The plane's whole `mb` extent in one-stick sub-rows — `elems / POOL_STICK`. This is what ONE
@@ -6121,8 +6111,8 @@ impl PagePlaneExtent {
                 as u64
     }
 
-    /// DISTINCT kv heads the plane spans.
-    pub const fn nkvh(self) -> u32 {
+    /// DISTINCT kv heads the plane spans — nonzero by the pool's own type.
+    pub const fn nkvh(self) -> NonZeroU32 {
         self.nkvh
     }
 
@@ -6134,7 +6124,7 @@ impl PagePlaneExtent {
 
     /// Offset of kv head `kvh`'s block within the plane, or `None` past the head count.
     pub const fn head_off(self, kvh: u32) -> Option<u64> {
-        if kvh >= self.nkvh {
+        if kvh >= self.nkvh.get() {
             return None;
         }
         Some(kvh as u64 * self.head_block_elems())
@@ -6303,7 +6293,7 @@ impl PageScratch {
     }
     /// DISTINCT kv heads the scratch carries per row — the pool's own count, so the kernel base an op
     /// takes and the entry the host filled cannot come from two numbers.
-    pub const fn nkvh(self) -> u32 {
+    pub const fn nkvh(self) -> NonZeroU32 {
         self.plane.nkvh()
     }
 
@@ -6566,10 +6556,10 @@ impl NewBlockForm {
     /// head's `gqa` at one slab, one query head above it), and dxp rebuilds a stick-blocked operand's group
     /// stride from the op's own row count — so that block must be laid out at ITS row count. Same total
     /// size either way, and byte-identical at one stick (`mq_pad == 64`), where the forms coincide.
-    pub const fn mask_heads_per_block(self, nqh: u32, nkvh: u32, hd: HeadWidth) -> u32 {
+    pub const fn mask_heads_per_block(self, nqh: u32, nkvh: NonZeroU32, hd: HeadWidth) -> u32 {
         match self {
             NewBlockForm::SubBlocks => nqh,
-            NewBlockForm::Chunk => ChunkRowBlocks::heads_per_block(nqh / nkvh, hd.sticks()),
+            NewBlockForm::Chunk => ChunkRowBlocks::heads_per_block(nqh / nkvh.get(), hd.sticks()),
         }
     }
 }
@@ -6688,7 +6678,7 @@ impl ChunkScratch {
     pub const fn pages(self) -> u32 {
         self.pages
     }
-    pub const fn nkvh(self) -> u32 {
+    pub const fn nkvh(self) -> NonZeroU32 {
         self.plane.nkvh()
     }
     /// Slots the chunk spans — `pages * POOL_PAGE_SLOTS`, the score width of the one score matmul and the
@@ -6711,7 +6701,7 @@ impl ChunkScratch {
     /// Every entry of the chunk, all kv heads end to end — the destination's flat entry space, in which
     /// kv head `kvh`'s row occupies `[kvh * entries_per_row, (kvh+1) * entries_per_row)`.
     pub const fn entries(self) -> u32 {
-        self.nkvh() * self.entries_per_row()
+        self.nkvh().get() * self.entries_per_row()
     }
 
     /// Copy ops — one per full index stick of [`Self::entries`]. Also the index STICKS the host stages:
@@ -6736,7 +6726,7 @@ impl ChunkScratch {
     /// Element offset of kv head `kvh`'s whole-chunk block — the kernel base both legs take. `None` past
     /// the head count.
     pub const fn head_off(self, kvh: u32) -> Option<u64> {
-        if kvh >= self.nkvh() {
+        if kvh >= self.nkvh().get() {
             return None;
         }
         Some(kvh as u64 * self.head_chunk_elems())
@@ -6744,13 +6734,13 @@ impl ChunkScratch {
 
     /// The scratch's whole `mb` extent in one-stick sub-rows.
     pub const fn sub_rows(self) -> u64 {
-        self.nkvh() as u64 * self.head_chunk_elems() / POOL_STICK as u64
+        self.nkvh().get() as u64 * self.head_chunk_elems() / POOL_STICK as u64
     }
 
     /// The SOURCE block inside one page plane that entry `q` of kv head `kvh`'s block names — heads abut,
     /// so it is `kvh * entries_per_head_page + q`. `None` outside the head or the block.
     pub const fn source_block(self, kvh: u32, q: u32) -> Option<u32> {
-        if kvh >= self.nkvh() || q >= self.entries_per_head_page() {
+        if kvh >= self.nkvh().get() || q >= self.entries_per_head_page() {
             return None;
         }
         Some(kvh * self.entries_per_head_page() + q)
@@ -6774,7 +6764,7 @@ impl ChunkScratch {
             // The destination's own law — the whole-chunk scratch's `[nkvh, head_chunk_elems]`,
             // the pair its synth declared.
             dest: GatherDest::Scratch {
-                rows: self.nkvh(),
+                rows: self.nkvh().get(),
                 cols: self.head_chunk_elems() as u32,
             },
             dims: CopyDims {
@@ -6891,7 +6881,7 @@ impl ChunkScratch {
         // tail, i.e. main's HBM V leg exactly (one part, the flat slab-major run). Neither leg in LX is
         // the existing form, so that is `None`.
         if (self.pages < lx.part_pages() && lx.keys().is_none())
-            || !(self.nkvh() * lx.tail_pages() * eph).is_multiple_of(one_stick)
+            || !(self.nkvh().get() * lx.tail_pages() * eph).is_multiple_of(one_stick)
             || !crate::placement::lx_window_fits(
                 lx.pinned_bytes_per_core() + prob_pin_bytes,
                 op_local_bytes,
@@ -6969,7 +6959,7 @@ impl ChunkKeysLx {
 
     /// Kᵗ's core-local tensors, one per (part, kv head).
     pub(crate) const fn tensors(self) -> u32 {
-        self.parts() * self.lx.chunk.nkvh()
+        self.parts() * self.lx.chunk.nkvh().get()
     }
 
     /// ⭐ Kᵗ's RUN ORDER — `(kv head, page, block)` for entry `e`. Stick `p * nkvh + h` is kv head `h`'s
@@ -6981,7 +6971,10 @@ impl ChunkKeysLx {
             self.lx.chunk.entries_per_head_page(),
         );
         let (op, c) = (e / stick, e % stick);
-        let (part, kvh) = (op / self.lx.chunk.nkvh(), op % self.lx.chunk.nkvh());
+        let (part, kvh) = (
+            op / self.lx.chunk.nkvh().get(),
+            op % self.lx.chunk.nkvh().get(),
+        );
         (kvh, part * self.part_pages() + c / eph, c % eph)
     }
 }
@@ -7036,7 +7029,7 @@ impl ChunkLx {
 
     /// V's core-local tensors, one per (part, kv head, slab).
     pub(crate) const fn lx_tensors(self) -> u32 {
-        self.lx_parts() * self.chunk.nkvh() * self.chunk.plane.slabs()
+        self.lx_parts() * self.chunk.nkvh().get() * self.chunk.plane.slabs()
     }
 
     /// One core's slice of one LX tensor of either leg. That is one entry, which is also the KERNEL
@@ -7073,7 +7066,7 @@ impl ChunkLx {
     /// the full scratch's head blocks.
     pub(crate) const fn tail_footprint_dims(self) -> [u32; 2] {
         [
-            self.chunk.nkvh(),
+            self.chunk.nkvh().get(),
             (self.tail_pages() as u64 * self.chunk.plane.head_block_elems()) as u32,
         ]
     }
@@ -7142,7 +7135,10 @@ impl ChunkLx {
         if e < lx_entries {
             let (op, c) = (e / stick, e % stick);
             let (head_part, slab) = (op / slabs, op % slabs);
-            let (part, kvh) = (head_part / self.chunk.nkvh(), head_part % self.chunk.nkvh());
+            let (part, kvh) = (
+                head_part / self.chunk.nkvh().get(),
+                head_part % self.chunk.nkvh().get(),
+            );
             (
                 kvh,
                 part * self.part_pages() + c / runs,
@@ -7247,7 +7243,7 @@ impl ChunkRowBlocks {
     /// The row blocks of `nkvh` GQA groups of `gqa` query heads, `mq` rows a head, at `slabs` feature
     /// slabs, each block `slots` columns wide.
     pub(crate) const fn of_group(
-        nkvh: u32,
+        nkvh: NonZeroU32,
         gqa: u32,
         mq: u32,
         slabs: u32,
@@ -7255,7 +7251,7 @@ impl ChunkRowBlocks {
     ) -> ChunkRowBlocks {
         let heads = Self::heads_per_block(gqa, slabs);
         ChunkRowBlocks {
-            blocks: nkvh * gqa / heads,
+            blocks: nkvh.get() * gqa / heads,
             rows: heads * mq,
             heads,
             gqa,
@@ -7272,7 +7268,7 @@ impl ChunkRowBlocks {
     /// block per kv head of its `gqa` rows, each block `slots` columns wide.
     pub(crate) const fn of_query_groups(q: QGroupBlock, slots: u32) -> ChunkRowBlocks {
         ChunkRowBlocks {
-            blocks: q.nkvh(),
+            blocks: q.nkvh().get(),
             rows: q.rows(),
             heads: q.gqa(),
             gqa: q.gqa(),
@@ -7312,7 +7308,7 @@ impl ChunkRowBlocks {
 /// per-head form, and at one slab a group's rows are contiguous in the stream already.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct QGroupBlock {
-    nkvh: u32,
+    nkvh: NonZeroU32,
     gqa: u32,
     hd: HeadWidth,
     /// Rows each query head carries: 1 for a one-request decode, the batch width for a decode batch.
@@ -7322,7 +7318,12 @@ pub struct QGroupBlock {
 impl QGroupBlock {
     /// The group-major query block for a one-request decode, or `None` where the stream already has it
     /// (one slab) or a head has more than one row (a prompt chunk, a decode batch).
-    pub const fn of_decode(nkvh: u32, gqa: u32, hd: HeadWidth, mq: u32) -> Option<QGroupBlock> {
+    pub const fn of_decode(
+        nkvh: NonZeroU32,
+        gqa: u32,
+        hd: HeadWidth,
+        mq: u32,
+    ) -> Option<QGroupBlock> {
         if mq != 1 {
             return None;
         }
@@ -7332,7 +7333,7 @@ impl QGroupBlock {
     /// The group-major query block for a decode batch of `requests` rows per head (head-major `h·B + r`),
     /// or `None` at one slab or a degenerate geometry.
     pub const fn of_batch(
-        nkvh: u32,
+        nkvh: NonZeroU32,
         gqa: u32,
         hd: HeadWidth,
         requests: u32,
@@ -7343,8 +7344,14 @@ impl QGroupBlock {
         Self::of_rows(nkvh, gqa, hd, requests)
     }
 
-    const fn of_rows(nkvh: u32, gqa: u32, hd: HeadWidth, requests: u32) -> Option<QGroupBlock> {
-        if requests == 0 || nkvh == 0 || gqa == 0 || hd.sticks() <= 1 {
+    const fn of_rows(
+        nkvh: NonZeroU32,
+        gqa: u32,
+        hd: HeadWidth,
+        requests: u32,
+    ) -> Option<QGroupBlock> {
+        // `nkvh == 0` is not a refusal here — it is unrepresentable by the count's own type.
+        if requests == 0 || gqa == 0 || hd.sticks() <= 1 {
             return None;
         }
         Some(QGroupBlock {
@@ -7360,7 +7367,7 @@ impl QGroupBlock {
         self.requests
     }
 
-    pub const fn nkvh(self) -> u32 {
+    pub const fn nkvh(self) -> NonZeroU32 {
         self.nkvh
     }
     pub(crate) const fn gqa(self) -> u32 {
@@ -7385,7 +7392,7 @@ impl QGroupBlock {
     /// one row apart inside each head. At one request it is the solo copy exactly: `y` one row apart.
     /// `None` past the head or slab count.
     pub fn copy_dest(self, kvh: u32, s: u32) -> Option<OperandPlacement> {
-        if kvh >= self.nkvh || s >= self.slabs() {
+        if kvh >= self.nkvh.get() || s >= self.slabs() {
             return None;
         }
         let nest = self.block_nest();
@@ -7403,12 +7410,12 @@ impl QGroupBlock {
     /// first query head, slab `s`, `y` walking the group's heads `nslab` planes apart, each plane holding
     /// the head's `B` request rows.
     pub fn copy_src(self, kvh: u32, s: u32) -> Option<OperandPlacement> {
-        if kvh >= self.nkvh || s >= self.slabs() {
+        if kvh >= self.nkvh.get() || s >= self.slabs() {
             return None;
         }
         Some(OperandPlacement::of_token_stream_by_slab(
             QueryRowCount::of_mq(self.requests),
-            self.nkvh * self.gqa,
+            self.nkvh.get() * self.gqa,
             self.hd,
             kvh * self.gqa,
             0,
@@ -7782,10 +7789,7 @@ impl GatherScratch {
             return None;
         }
         Some(GatherScratch {
-            rows: GatherRows {
-                nkvh: NonZeroU32::new(nkvh).expect("the pool's head count is nonzero by type"),
-                mq: mq.get(),
-            },
+            rows: GatherRows { nkvh, mq: mq.get() },
             windows: windows.get(),
             hd,
         })
@@ -7828,8 +7832,8 @@ impl GatherScratch {
         Self::of_fold_pass(pool, SlotWindow::count_in(SlotCount::new(POOL_STICK)), mq).is_some()
     }
 
-    pub const fn nkvh(self) -> u32 {
-        self.rows.nkvh.get()
+    pub const fn nkvh(self) -> NonZeroU32 {
+        self.rows.nkvh
     }
     /// 64-slot windows ONE fold pass sweeps — `nb`. An EXTENT and nothing more: it sizes the
     /// reservation and bounds [`Self::row_of`], and it is deliberately absent from the row law
@@ -8004,7 +8008,7 @@ impl GatherScratch {
         let pool = PagedKvPool::new(self.rows.nkvh, self.hd);
         let per_plane =
             u32::try_from(pool.plane_block_elems() / pool.stick_block_elems().max(1)).ok()?;
-        (kvh < self.nkvh() && window < self.windows && window < per_plane)
+        (kvh < self.nkvh().get() && window < self.windows && window < per_plane)
             .then_some(kvh * per_plane + window)
     }
 }

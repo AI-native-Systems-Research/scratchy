@@ -534,7 +534,7 @@ fn the_row_of_a_coordinate_does_not_depend_on_how_many_windows_the_scratch_holds
             body.windows(),
             ceiling.windows()
         );
-        for kvh in 0..body.nkvh() {
+        for kvh in 0..body.nkvh().get() {
             for w in 0..body.windows() {
                 for r in 0..body.mq() {
                     assert_eq!(
@@ -563,7 +563,7 @@ fn the_row_of_a_coordinate_does_not_depend_on_how_many_windows_the_scratch_holds
         for p in 0..2usize {
             for r in 0..body.mq() {
                 let phys = tables[r as usize][p];
-                for kvh in 0..body.nkvh() {
+                for kvh in 0..body.nkvh().get() {
                     for w in 0..body.windows() {
                         let i = body.row_of(kvh, w, r).expect("in range") as usize;
                         let want = phys * per_page.get()
