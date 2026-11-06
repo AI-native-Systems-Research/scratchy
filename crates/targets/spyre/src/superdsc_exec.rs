@@ -32,8 +32,8 @@ use crate::fold_plan::{
     self, Bytes, OpKv, PerClass, RowCursors, RowIdx, RowPage, SessionKv, SlotPos, fused_rungs,
 };
 use crate::runtime::{
-    BatchedCompute, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
-    HwError, Stream,
+    BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
+    HwError, PeerLink, PeerRoute, Stream,
 };
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
@@ -990,11 +990,10 @@ pub struct Executor {
     /// one; every batched or instrumented step takes the walk instead, so
     /// nothing here is consulted (or populated) off the player's own path.
     step_images: StepImageCache,
-    /// ⭐ THE PEER THIS SESSION SENDS TO, when it runs one rank of a sharded world — `None` for a
-    /// world of one. Bound once, at load ([`Executor::load`] reads the process's link); every
-    /// collective's send and wait names its route, and every consume group this session binds was
-    /// chosen by its identity.
-    link: Option<&'static PeerLink>,
+    /// ⭐ THE RANK THIS SESSION RUNS AS — [`RankSeat::Alone`] for a world of one. Bound once, at
+    /// load ([`Executor::load`] reads its card's link); every collective's send and wait names its
+    /// route, and every consume group this session binds was chosen by its identity.
+    seat: RankSeat,
 }
 
 /// Per-session state for the card-side tensordump — see [`Diag::tensordump`].
@@ -1119,24 +1118,24 @@ struct ForwardHalf {
     h2d_bytes: u64,
 }
 
-/// WHICH RANK A SESSION RUNS AS — the bundle's world and the process's link, agreed at load.
+/// WHICH RANK A SESSION RUNS AS — the bundle's world and its card's link, agreed at load.
 #[derive(Clone, Copy, Debug)]
 pub enum RankSeat {
-    /// A world of one: the bundle places no receive window and the process linked no peer.
+    /// A world of one: the bundle places no receive window and the card linked no peer.
     Alone,
-    /// One rank of a sharded world: the bundle's window is the one whose slots the process's
-    /// link pointed its `XSEG` entries at.
-    Linked(&'static PeerLink),
+    /// One rank of a sharded world: the bundle's window is the one whose slots the card's link
+    /// pointed its `XSEG` entries at.
+    Linked { me: bundle::collective::TpIdentity },
 }
 
 /// Why a bundle cannot run in this process's world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeatRefusal {
-    /// The bundle was baked for a sharded world, and this process linked no peer to send to.
+    /// The bundle was baked for a sharded world, and its card linked no peer to send to.
     Unlinked,
-    /// The process runs one rank of a sharded world, and the bundle was baked for a world of one.
+    /// The card runs one rank of a sharded world, and the bundle was baked for a world of one.
     UnshardedBundle,
-    /// The bundle's window is not the one the process's link programmed — the peer's sends would
+    /// The bundle's window is not the one the card's link programmed — the peer's sends would
     /// land where this bundle's consumes do not read.
     WindowMoved {
         baked: bundle::collective::RecvWindow,
@@ -1151,12 +1150,12 @@ impl std::fmt::Display for SeatRefusal {
         match self {
             Self::Unlinked => write!(
                 f,
-                "baked for a sharded world, but this process linked no peer (`runtime::link_peer`) \
-                 — a world-of-one session cannot run it"
+                "baked for a sharded world, but its card linked no peer (`runtime::link_peers`) — \
+                 a world-of-one session cannot run it"
             ),
             Self::UnshardedBundle => write!(
                 f,
-                "baked for a world of one, but this process runs one rank of a sharded world"
+                "baked for a world of one, but its card runs one rank of a sharded world"
             ),
             Self::WindowMoved { baked, linked } => write!(
                 f,
@@ -1174,20 +1173,17 @@ impl std::fmt::Display for SeatRefusal {
 impl std::error::Error for SeatRefusal {}
 
 impl RankSeat {
-    /// The seat a session over `code` takes in a process holding `link`.
+    /// The seat a session over `code` takes on a card holding `link`.
     ///
     /// # Errors
     /// [`SeatRefusal`], by name.
-    pub fn of(
-        code: &bundle::BundleCode<'_>,
-        link: Option<&'static PeerLink>,
-    ) -> Result<Self, SeatRefusal> {
+    pub fn of(code: &bundle::BundleCode<'_>, link: Option<&PeerLink>) -> Result<Self, SeatRefusal> {
         Self::agree(Self::baked_window(code)?, link.map(PeerLink::window))?;
-        Ok(link.map_or(Self::Alone, Self::Linked))
+        Ok(link.map_or(Self::Alone, |l| Self::Linked { me: l.identity() }))
     }
 
     /// The receive window `code` bakes — `None` for a bundle baked for a world of one. What a
-    /// rank's [`crate::runtime::link_peer`] programs, read off the bundle that will run.
+    /// world's [`crate::runtime::link_peers`] programs, read off the bundle that will run.
     ///
     /// # Errors
     /// [`SeatRefusal::Misplaced`] when the cuts are not one flit-aligned window
@@ -1212,12 +1208,14 @@ impl RankSeat {
         }
     }
 
-    fn link(self) -> Option<&'static PeerLink> {
+    /// The rank this seat runs as — `None` alone.
+    fn identity(self) -> Option<bundle::collective::TpIdentity> {
         match self {
             Self::Alone => None,
-            Self::Linked(link) => Some(link),
+            Self::Linked { me } => Some(me),
         }
     }
+
 }
 
 impl Executor {
@@ -1237,6 +1235,11 @@ impl Executor {
         kv_dim: KvDim,
         num_blocks: PoolPages,
     ) -> Result<Executor> {
+        // ⭐ ONE LOAD FOR EVERY WORLD. The bundle says whether it was baked sharded (it places a
+        // receive window); the card says which rank it runs as (its [`CardRuntime::link`]). The
+        // two must agree — see [`RankSeat::of`] — and a sharded session then binds only the launch
+        // groups its rank plays.
+        let seat = RankSeat::of(code, card.link()).map_err(|e| anyhow!("bundle {}: {e}", code.fp))?;
         let places: BTreeMap<bundle::PlaceId, &'static Placement> =
             code.layout.places.iter().map(|p| (p.id, p)).collect();
         // ⛔⛔⛔ THE MAP MUST NOT HAVE LOST A PLACEMENT. This was keyed by `p.name` (a String) and
@@ -1329,7 +1332,7 @@ impl Executor {
             n_weights_staged: 0,
             dump: None,
             step_images: StepImageCache::default(),
-            link,
+            seat,
         };
 
         // ── RE-ROLLED mode: a re-roll meta ⇒ this bundle is the BODY (one layer); the prefix (embed)
@@ -1384,7 +1387,7 @@ impl Executor {
 
     /// The rank this session runs as, when it runs one rank of a sharded world.
     fn session(&self) -> Option<bundle::collective::TpIdentity> {
-        self.link.map(PeerLink::identity)
+        self.seat.identity()
     }
 
     fn load_rolled(&mut self, m: &'static bundle::RerollMeta<'static>) -> Result<()> {
@@ -1481,31 +1484,32 @@ impl Executor {
         };
         // An UNROLLED bundle is its one body; a rolled one is its ladder, and runs only its rungs.
         if rungs.is_empty() {
-            self.body_ops = vec![bind_ops(self.code)];
+            self.body_ops = vec![bind_ops(self.code, self.session())?];
         }
         // The ladder came ASCENDING by `active_cap` from the emit, so it stays so. Each rung's
         // class 0 body IS this bundle's rung sibling — the registry resolves like any other.
         for r in rungs {
-            self.body_rungs.push((
-                r.active_cap,
-                r.bodies
-                    .iter()
-                    .map(|fp| Self::sibling_ops("decode rung", fp))
-                    .collect::<Result<Vec<_>>>()?,
-            ));
+            let bodies = r
+                .bodies
+                .iter()
+                .map(|fp| self.sibling_ops("decode rung", fp))
+                .collect::<Result<Vec<_>>>()?;
+            self.body_rungs.push((r.active_cap, bodies));
         }
         // A rung's fold-fused twins are optional: a rung where any class sits out runs its split
         // bodies — correct, one launch per layer dearer. See [`fused_rungs`] for why it is per rung.
-        self.body_rungs_fused = fused_rungs(rungs.iter().map(|r| {
-            (
+        let mut twins = Vec::with_capacity(rungs.len());
+        for r in rungs {
+            twins.push((
                 r.active_cap,
                 r.bodies.len(),
                 r.bodies_fused
                     .iter()
-                    .map(|fp| bundle::sibling(fp).map(bind_ops))
-                    .collect::<Vec<_>>(),
-            )
-        }));
+                    .map(|fp| self.optional_sibling_ops(fp))
+                    .collect::<Result<Vec<_>>>()?,
+            ));
+        }
+        self.body_rungs_fused = fused_rungs(twins);
         // ⛔⛔⛔ THE PROGRAM COUNT IS NOT A DEBUG DETAIL — IT IS WHETHER THIS MODEL COMPUTES.
         //
         // A bundle carries a memory PLAN and a set of device PROGRAMS. The plan is what every session
@@ -6330,8 +6334,8 @@ fn bind_ops(
             else {
                 bail!(
                     "bundle {} group {i} is a collective's consume, so the bundle was baked for a \
-                     sharded world — a world-of-one session cannot run it (link the process's \
-                     peer before loading: `runtime::link_peer`)",
+                     sharded world — a world-of-one session cannot run it (link the world's \
+                     cards before loading: `runtime::link_peers`)",
                     code.fp
                 );
             };

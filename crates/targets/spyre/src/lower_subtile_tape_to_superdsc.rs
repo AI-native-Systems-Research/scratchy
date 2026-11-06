@@ -2934,8 +2934,10 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
                 let rows = read_rows.get(&id).copied().unwrap_or(t.rows).min(t.rows);
                 let n = (rows as usize) * (t.cols as usize);
                 match rope_table_half.get(&(id as u32)) {
-                    Some(&half) => (0..n).map(|j| dbg_synth_val(id, j % half)).collect(),
-                    None => (0..n).map(|j| dbg_synth_val(id, j)).collect(),
+                    Some(&half) => (0..n)
+                        .map(|j| dbg_synth_val(seed(id as u32), j % half))
+                        .collect(),
+                    None => (0..n).map(|j| dbg_synth_val(seed(id as u32), j)).collect(),
                 }
             }
         })
@@ -3110,7 +3112,10 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
                 (node, scratchy_subtile::subtile_ir::AttnScaleSite::InKernel)
             }
         };
-        let mut out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, scale_site, &bufs);
+        let mut out = match peer {
+            Some(p) if is_collective(&node_ref.op) => p.collective(node_ref, ir, &bufs),
+            _ => scratchy_subtile::subtile_ir::eval_node(node_ref, ir, scale_site, &bufs),
+        };
         // The fp8 matmul's quant model (see the closures above): the ideal product over
         // the ROUND-TRIPPED payload, then the ws mulf — fold included — on the result.
         // The payload swap is temporary and per node: `eval_node` reads `inputs[1]` and
@@ -3442,7 +3447,10 @@ fn teacher_forced_walk<F: RopeForm>(
                 tf[w] = vals;
             }
         }
-        let mut tf_out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, scale_site, &tf);
+        let mut tf_out = match peer {
+            Some(p) if is_collective(&node_ref.op) => p.collective(node_ref, ir, &tf),
+            _ => scratchy_subtile::subtile_ir::eval_node(node_ref, ir, scale_site, &tf),
+        };
         if let SubOp::MatmulTile {
             weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
             ..
@@ -4245,6 +4253,32 @@ pub fn numeric_gate<F: RopeForm>(
         keep
     });
     let covering: Option<&std::collections::HashSet<u64>> = covering_owned.as_ref();
+    // ⭐ A SHARDED RUNG IS GATED ON BOTH RANKS AT ONCE — see [`numeric_gate_two_rank`]: its
+    // consumes read the window the peer's send fills, so the ranks step collective by collective.
+    if let Some(shards) = two_rank {
+        let mut scope = String::new();
+        if let Some(p) = prefill {
+            scope.push_str(&format!(" [prefill mq={}]", p.mq));
+        }
+        if let Some(t) = trunc {
+            scope.push_str(&format!(
+                " [class-covering {}/{} layers]",
+                t.layers.0, t.layers.1
+            ));
+        }
+        return numeric_gate_two_rank(TwoRankGate {
+            groups,
+            ir,
+            weight_ids,
+            covering,
+            tainted: &tainted,
+            prefill,
+            fp,
+            cap,
+            shards,
+            scope,
+        });
+    }
     // ── Synth weights: staged ONCE for both legs — the emulator's resident
     //    bytes (moved into the session's HBM below) and the reference legs'
     //    per-node materialization (the clone the view borrows: `new_multi`
@@ -6573,6 +6607,11 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
                 trips: w.trips,
                 step_bytes: w.step_bytes,
             }),
+            // A consume group holds exactly one consume's trips, so its kind names it.
+            tp: match kinds[r.start].kind {
+                GroupKind::TpConsume(consume) => Some(consume),
+                _ => None,
+            },
         });
     }
     shifts
@@ -8344,16 +8383,17 @@ fn ktir_groups_via_superdsc(
                 e.op_name
             )));
         }
-        let k = e.ktir.as_ref().ok_or_else(|| {
-            SuperDscError(format!(
+        if e.ktir.is_none() {
+            return Err(SuperDscError(format!(
                 "{}: no KTIR program — the node lowering declined this op, and a bundle short a \
                  program computes something else",
                 e.op_name
-            ))
-        })?;
+            )));
+        }
         let _pc_cls = crate::pc::Pc::start(crate::pc::mint_class(&e.op_name));
-        let lowered = crate::ktir_superdsc_door::lower(
-            k,
+        // ⭐ `lower_op`: a collective's consume carries its `tp_consume` onto every op it lowers to.
+        let lowered = crate::ktir_superdsc_door::lower_op(
+            e,
             &mut sym_id_base,
             layout,
             attn_params,

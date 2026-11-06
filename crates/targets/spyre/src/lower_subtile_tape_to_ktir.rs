@@ -1248,16 +1248,18 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
     let mut fp8_quantized = ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default();
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(programs.len());
     for e in &programs {
-        let k = e.ktir.as_ref().ok_or_else(|| {
-            SuperDscError(format!(
+        if e.ktir.is_none() {
+            return Err(SuperDscError(format!(
                 "{}: no KTIR program — the node lowering declined this op, and a bundle short a \
                  program computes something else",
                 e.op_name
-            ))
-        })?;
+            )));
+        }
+        // ⭐ `lower_op`, not `lower`: a collective's consume carries its `tp_consume` from the
+        // emitted op onto every SuperDSC op its program lowers to.
         ops.extend(
-            crate::ktir_superdsc_door::lower(
-                k,
+            crate::ktir_superdsc_door::lower_op(
+                e,
                 &mut sym_id_base,
                 Some(&bundle_layout),
                 attn_params,

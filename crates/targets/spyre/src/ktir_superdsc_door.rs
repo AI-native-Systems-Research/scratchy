@@ -253,11 +253,12 @@ pub fn lower_op(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     attn_params: Option<BundleAttnParams>,
+    quantized: &mut QuantizedActivations,
 ) -> Result<Vec<EmittedOp>, Error> {
     let k = e.ktir.as_ref().ok_or_else(|| Error {
         message: format!("{}: no KTIR program to lower", e.op_name),
     })?;
-    let mut ops = lower(k, sym_id_base, layout, attn_params)?;
+    let mut ops = lower(k, sym_id_base, layout, attn_params, quantized)?;
     for o in &mut ops {
         o.tp_consume = e.tp_consume;
     }
