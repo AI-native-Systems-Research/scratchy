@@ -179,7 +179,7 @@ pub trait WorkerFactory: Sync {
     /// ⛔ ASKED HERE BECAUSE THE ANSWER IS A BAKED CONSTANT OF THE POOL, and the engine cannot hold a
     /// copy of it. `effective_block_size` used to answer with a literal `64` under
     /// `#[cfg(feature = "spyre")]`, describing a pool (`[nblk, 64, nkv, hd]`) that has since been
-    /// replaced by one whose page is `PagedKvPool::PAGE_SLOTS` — two spellings of one quantity, four
+    /// replaced by one whose page is `PagedKvPool::POOL_PAGE_SLOTS` — two spellings of one quantity, four
     /// crates apart, with a comment as the only thing claiming they agreed. The scheduler computes
     /// `slot = block_id * block_size + offset` and the worker resolves `block_id` to a pool page, so a
     /// disagreement is not a policy difference: it is the scheduler and the worker naming different

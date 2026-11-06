@@ -28,7 +28,7 @@ use ktir_superdsc::sdsc_abstract::{
 
 /// Pages a request needs to reach `tokens`, at the pool's own page size.
 fn pages_for(tokens: u32) -> u32 {
-    tokens.div_ceil(PagedKvPool::PAGE_SLOTS as u32)
+    tokens.div_ceil(PagedKvPool::POOL_PAGE_SLOTS.get())
 }
 
 /// ⭐⭐⭐ THE POOL WITHHOLDS ONE PAGE, WHATEVER THE WIDTH — the property that says the per-request reserve is

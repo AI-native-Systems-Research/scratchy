@@ -42,7 +42,7 @@ target-emitter = ["dep:target-emitter"]
 # at build time and the spyre worker runs it. Forwards into the compiler's
 # `spyre` gate (registry + IR); NEVER target-cuda — spyre rides the
 # compiler-owned registry, not the cuda crate.
-spyre = ["scratchy-forward-compiler/spyre", "scratchy-subtile/spyre", "dep:scratchy-target-spyre", "dep:ktir-core"]
+spyre = ["scratchy-forward-compiler/spyre", "scratchy-subtile/spyre", "dep:scratchy-target-spyre", "dep:ktir-core", "dep:scratchy-triton-splice"]
 
 # A CARD. The device image is compiled from the KTIR at bake time, so this build has a device
 # compiler to drain; the emulator build has nothing to compile and nothing to wait for.
@@ -108,6 +108,12 @@ target-emitter = { package = "scratchy-target-cuda-compiler", path = "../../targ
 # emission belongs to its target, and the macro bakes the bundle at
 # expansion, so it consumes the emitter from there.
 scratchy-target-spyre = { path = "../../targets/spyre", default-features = false, optional = true }
+# The splice's own fp8-epilogue facts (`FP8_EPILOGUE_LIVE_TILES`,
+# `fp8_epilogue_peak_bytes`) — the emu prefill-width derivation reads the
+# count from beside the program it describes. Already in the graph:
+# scratchy-target-spyre depends on it unconditionally, so this edge adds
+# no crate to any build.
+scratchy-triton-splice = { path = "../../triton/splice", optional = true }
 # The IR types the baked program is CONSTRUCTED from — this crate renders them as const tokens, so
 # it names the same types the lowering built. Dependency-free.
 ktir-core = { path = "../../targets/spyre/ktir/ktir-core", optional = true }

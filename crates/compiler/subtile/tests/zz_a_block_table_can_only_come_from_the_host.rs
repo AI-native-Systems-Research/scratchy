@@ -18,7 +18,7 @@ use scratchy_subtile::sdsc_abstract::{
     SlotCount,
 };
 
-const PAGE: u32 = PagedKvPool::PAGE_SLOTS as u32;
+const PAGE: u32 = PagedKvPool::POOL_PAGE_SLOTS.get();
 
 fn part(pool: usize) -> PoolPartition {
     PoolPartition::of_pool(PoolPages::of_pool(pool).expect("pages"), PoolRows::WIDEST)

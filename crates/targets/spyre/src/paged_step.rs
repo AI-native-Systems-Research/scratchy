@@ -32,7 +32,9 @@ use crate::wiring::PagedStep;
 
 /// The page walk's laws, where the bake and the worker that state a bundle's walk reach them: the
 /// page size, a rung's walk ([`walk_pages`]) and the rungs a pool is walked by ([`walk_buckets`]).
-pub use scratchy_triton_splice::{BatchChunking, PAGE_SLOTS, PagedRows, walk_buckets, walk_pages};
+pub use scratchy_triton_splice::{
+    BatchChunking, PagedRows, SchedulerBlockTokens, walk_buckets, walk_pages,
+};
 
 /// `finfo(float16).min` — spyre-inference's masked additive value: finite, so a fully-masked tile's
 /// row maximum stays finite and its weights vanish under the running maximum.
@@ -112,8 +114,9 @@ pub fn prove_ladder_walks(
 /// 104832 positions, 819 pages. `None` when not one page fits.
 pub fn pool_slots(context_slots: u32, kv_slot_bytes: u64) -> Option<std::num::NonZeroU32> {
     let fit = scratchy_spyre_bundle::MAX_SEGMENT_BYTES / kv_slot_bytes.max(1);
-    let fit_pages = u32::try_from(fit / u64::from(PAGE_SLOTS)).unwrap_or(u32::MAX);
-    let slots = context_slots.min(fit_pages.saturating_mul(PAGE_SLOTS));
+    let fit_pages =
+        u32::try_from(fit / u64::from(SchedulerBlockTokens::REFERENCE.get())).unwrap_or(u32::MAX);
+    let slots = context_slots.min(fit_pages.saturating_mul(SchedulerBlockTokens::REFERENCE.get()));
     std::num::NonZeroU32::new(slots)
 }
 
@@ -863,10 +866,14 @@ mod tests {
         // whole pages (819 of 128 slots).
         let p = pool_slots(ctx, slot(40, 8, 128)).expect("a page fits");
         assert_eq!(p.get(), 104_832);
-        assert!(p.get().is_multiple_of(PAGE_SLOTS), "whole pages");
+        assert!(
+            p.get()
+                .is_multiple_of(SchedulerBlockTokens::REFERENCE.get()),
+            "whole pages"
+        );
         assert!(u64::from(p.get()) * slot(40, 8, 128) <= scratchy_spyre_bundle::MAX_SEGMENT_BYTES);
         assert!(
-            u64::from(p.get() + PAGE_SLOTS) * slot(40, 8, 128)
+            u64::from(p.get() + SchedulerBlockTokens::REFERENCE.get()) * slot(40, 8, 128)
                 > scratchy_spyre_bundle::MAX_SEGMENT_BYTES
         );
         // A context shorter than the pool would hold is the pool.

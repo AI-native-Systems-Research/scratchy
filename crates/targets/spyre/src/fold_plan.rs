@@ -616,7 +616,7 @@ pub fn page_base_bytes(s: &SessionKv, rp: RowPage) -> Bytes {
 /// through the host's page map), never a coordinate the device computes with."*
 ///
 /// So the affinity this type checks is a property of the HOST's `page_base_bytes` — a launch-time fact
-/// — and NOT of any stride a matmul could bake. `hd * PAGE_SLOTS`, the number three request-axis
+/// — and NOT of any stride a matmul could bake. `hd * POOL_PAGE_SLOTS`, the number three request-axis
 /// attempts baked believing it was `request_stride`, is MEASURED
 /// (`tests/fold_request_axis_strides.rs`) to be exactly the KV-HEAD stride: a `y` step of one advances
 /// one kv head, so request `r` scored against kv head `r`'s keys — real, well-formed, wrong.
@@ -757,7 +757,7 @@ pub fn fold_requests(s: &SessionKv) -> i64 {
 /// none does. `folds[i]` says whether ladder rung `i` (ascending) carries a page-fold group.
 ///
 /// A folding body re-launches once per resident page, so it serves any length the pool holds. A
-/// split-KV chunk body does not fold: it attends exactly its `pages * PAGE_SLOTS`, and the one-request
+/// split-KV chunk body does not fold: it attends exactly its `pages * POOL_PAGE_SLOTS`, and the one-request
 /// ladder's TOP is its widest chunk. Taking the top past it handed a 21,945-token granite-2b decode the
 /// 64-page chunk, and the worker refused the step ("the chunk ladder's top rung (64 pages) is below
 /// this context") where the per-page fold had served it. Every ladder without a chunk folds on every
@@ -878,7 +878,7 @@ pub fn reps(op: &OpKv, s: &SessionKv, n_fold_pages: i64) -> i64 {
         return 1;
     }
     // ⛔ THE HOST DECIDED THIS NUMBER; the shim's own ceiling must agree or nothing may fold.
-    // `FoldPages::covering(BatchSlot, PAGE_SLOTS)` on the Rust side and
+    // `FoldPages::covering(BatchSlot, POOL_PAGE_SLOTS)` on the Rust side and
     // `(seq_pos + kv_page_slots - 1) / kv_page_slots` in the shim are two derivations of one quantity, in
     // two languages, agreeing only via `ensure_pages` — so the disagreement is checked HERE, where the
     // number is about to be turned into passes, instead of being discovered as a wrong answer. Refusing
@@ -1544,7 +1544,7 @@ mod tests {
             use scratchy_subtile::sdsc_abstract::{
                 POOL_STICK, PagedKvPool, PrefixMaskShape, RungWidth,
             };
-            const PER_PAGE: u32 = PagedKvPool::PAGE_SLOTS as u32;
+            const PER_PAGE: u32 = PagedKvPool::POOL_PAGE_SLOTS.get();
             PrefixMaskShape::<POOL_STICK, PER_PAGE>::new(
                 32,
                 RungWidth::of_baked_rows(2).expect("two rows"),

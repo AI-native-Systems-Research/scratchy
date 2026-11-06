@@ -2643,7 +2643,7 @@ pub struct EmittedOp {
     ///
     /// One launch resolves ONE page per op from the request's block table, at the page holding the op's
     /// cursor. A window of `PREFILL_WINDOW_PAGES` pages therefore cannot be one write: the emitter cuts
-    /// each `(kv head, slab)` copy into parts of `PAGE_SLOTS` rows, and part `p` carries `p·PAGE_SLOTS`
+    /// each `(kv head, slab)` copy into parts of `POOL_PAGE_SLOTS` rows, and part `p` carries `p·POOL_PAGE_SLOTS`
     /// here, so the runtime resolves ITS page at `cursor + offset` (`fold_plan::op_slot_pos`). A part
     /// whose page the request does not hold (a short last chunk's padding) is SKIPPED, never aimed at
     /// part 0's page. Ops with different offsets never share a group: one group is one page shift.

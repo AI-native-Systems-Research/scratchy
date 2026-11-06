@@ -13,7 +13,7 @@ use ktir_superdsc::sdsc_abstract::{
     PoolPartition, PoolRows, SlotCount,
 };
 
-const PAGE: u32 = PagedKvPool::PAGE_SLOTS as u32;
+const PAGE: u32 = PagedKvPool::POOL_PAGE_SLOTS.get();
 const WINDOW: u32 = PagedKvPool::PREFILL_CHUNK_SLOTS as u32;
 
 /// THE MULTI-PAGE LAW ITSELF: the widest window is a whole number of pages, and that number is
@@ -23,7 +23,7 @@ fn the_widest_window_is_a_whole_number_of_pages() {
     assert_eq!(PagedKvPool::PREFILL_CHUNK_SLOTS, 512);
     assert_eq!(PagedKvPool::PREFILL_WINDOW_PAGES, 2);
     assert_eq!(
-        PagedKvPool::PREFILL_WINDOW_PAGES * PagedKvPool::PAGE_SLOTS,
+        PagedKvPool::PREFILL_WINDOW_PAGES * PagedKvPool::POOL_PAGE_SLOTS.as_usize(),
         PagedKvPool::PREFILL_CHUNK_SLOTS,
         "a window wider than a page is a whole number of pages"
     );

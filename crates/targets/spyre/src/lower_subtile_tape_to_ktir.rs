@@ -1302,7 +1302,7 @@ pub(crate) fn tensor_shapes_of_ir<F: RopeForm>(
 }
 
 /// ⭐ THE PAGED STEP THIS GRAPH's ATTENTION READS — off its own `AttnDecode` nodes: the pool every
-/// layer's cache tensor is (`rows / PAGE_SLOTS` pages), the forward's query rows, and the KV heads
+/// layer's cache tensor is (`rows / SchedulerBlockTokens::REFERENCE` pages), the forward's query rows, and the KV heads
 /// one write row per (token, head) is minted for. One step serves every layer — one page table, one
 /// mask stack, one write-row table — so the layers must agree; a graph whose attentions differ in
 /// pool, rows or kv heads is refused rather than served one layer's tables.
@@ -1316,7 +1316,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
     paged_rows: scratchy_triton_splice::PagedRows,
 ) -> Result<Option<crate::wiring::PagedStep>, SuperDscError> {
     let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
-    let slots = scratchy_triton_splice::PAGE_SLOTS;
+    let slots = scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get();
     let mut out: Option<crate::wiring::PagedStep> = None;
     for n in &ir.nodes {
         let SubOp::AttnDecode {

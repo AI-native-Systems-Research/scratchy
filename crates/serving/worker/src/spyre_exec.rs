@@ -158,7 +158,7 @@ impl Worker for SpyreWorker {
     /// The corruption is structural, not subtle:
     /// * Page-size unification (`compute_hybrid_kv_layout`) scales the FULL group's block size
     ///   4× (1024 tokens/block for gemma-4-12b: sliding 8×256 vs global 1×512) while the spyre
-    ///   pool's page is `PagedKvPool::PAGE_SLOTS` = 256 slots and the worker maps each block id
+    ///   pool's page is `PagedKvPool::POOL_PAGE_SLOTS` = 256 slots and the worker maps each block id
     ///   to ONE page — so from token 256 on, a request's full-attention KV lands on pages its
     ///   truncated table never names, and it attends another request's (or stale) keys: fluent
     ///   multilingual gibberish at full speed, exactly the observed 8.3 tok/s symptom.
@@ -216,12 +216,13 @@ impl Worker for SpyreWorker {
     /// emulator.
     ///
     /// ⛔ A BLOCK IS A PAGE, CHECKED HERE. The scheduler's `slot = block · block_size + offset` and
-    /// the worker's page map address the same cells only at `block_size == PAGE_SLOTS`, which
+    /// the worker's page map address the same cells only at `block_size == SchedulerBlockTokens::REFERENCE`, which
     /// [`required_block_size`](scratchy_serving_engine::worker_factory::WorkerFactory::required_block_size)
     /// demands at init. A pool sized from any other block would hold the wrong page count, so a
     /// mismatched caller is a panic naming both, not a prorated byte count.
     fn kv_block_bytes(&self, block_size: usize) -> Option<usize> {
-        let page_slots = scratchy_target_spyre::paged_step::PAGE_SLOTS as usize;
+        let page_slots =
+            scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.as_usize();
         assert_eq!(
             block_size, page_slots,
             "spyre: the scheduler's KV block is {block_size} token(s); the pool's page is \
