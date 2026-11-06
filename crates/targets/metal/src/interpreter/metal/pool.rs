@@ -2644,7 +2644,6 @@ mod tests {
                     binding_index: 2,
                 },
             ]),
-            gemm_dims: None,
         };
         LoweredMetalTape {
             bucket_m,

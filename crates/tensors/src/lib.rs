@@ -17,6 +17,7 @@ pub mod lowering_dtype;
 pub mod owned_tensor;
 pub mod raw_mem;
 pub mod tensor;
+pub mod typed;
 pub mod weight_path;
 pub mod weight_source;
 

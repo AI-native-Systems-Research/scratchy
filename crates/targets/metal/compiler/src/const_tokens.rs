@@ -37,10 +37,19 @@ pub const METAL_MODULES: ModuleTable = ModuleTable {
                 "MScaleAxis",
                 "RuntimeGate",
                 "LoweredCommand",
+                "TapeCommand",
                 "GatedCommand",
                 "PackedCommand",
+                "PackedKind",
                 "CommandTable",
                 "GemmDims",
+                "Gemm",
+                "GemmWeight",
+                "GemmEntry",
+                "GemmAt",
+                "GemmOperands",
+                "Activation",
+                "PackedLayer",
                 "WeightTensor",
                 "RuntimeBindingKind",
                 "ActivationWidth",
@@ -133,14 +142,15 @@ mod tests {
     use scratchy_target_metal::tape::constants::{ConstantType, ConstantValue};
     use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
     use scratchy_target_metal::tape::lowered::{
-        Binding, DispatchShape, GatedCommand, KernelId, LoweredCommand, RuntimeGate, WeightTensor,
+        Binding, DispatchShape, GatedCommand, KernelId, LoweredCommand, RuntimeGate, TapeCommand,
+        WeightTensor,
     };
 
     /// A command exercising every emission form: unit variant, struct
     /// variant, newtype, tuple, slice, option, str, mixed int widths.
     fn sample() -> GatedCommand {
         GatedCommand {
-            command: LoweredCommand {
+            command: TapeCommand::Dispatch(LoweredCommand {
                 kernel: KernelId::Embed,
                 library: "default_lib",
                 function: "metal_embed_f16",
@@ -166,8 +176,7 @@ mod tests {
                         binding_index: 1,
                     },
                 ]),
-                gemm_dims: None,
-            },
+            }),
             gate: Some(RuntimeGate::OnlyIfDecodeStep),
         }
     }

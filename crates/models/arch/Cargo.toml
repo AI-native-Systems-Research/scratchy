@@ -747,6 +747,8 @@ spyre = [
 hf-completions = ["dep:ureq"]
 [dependencies]
 scratchy-layers = { path = "../../layers" }
+# The dim markers and typed weight handles each model's emitted `Weights` holds.
+scratchy-tensors = { path = "../../tensors" }
 scratchy-quantizations = { path = "../quantization" }
 scratchy-forward-compiler = { path = "../../compiler" }
 scratchy-target-metal = { path = "../../targets/metal", optional = true }
@@ -812,7 +814,6 @@ half = { workspace = true }
 # worker) builds gemma4-style hybrid KV pools in the same gate.
 scratchy-core-config = { workspace = true }
 serde_json = { workspace = true }
-scratchy-tensors = { path = "../../tensors" }
 # tests/metal_o2_logits.rs (the runtime logits oracle): local Hub-cache lookup, the tokenizer,
 # and the row hash (config parse and the hybrid KV layout: scratchy-core-config above).
 hf-hub-downloader = { workspace = true }
