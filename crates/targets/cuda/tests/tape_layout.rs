@@ -47,7 +47,7 @@ use scratchy_target_cuda_compiler::canonical::{
     ArenaRefusal, AttnShapeRule, CanonicalAt, CanonicalRefusal, CudaGdnFacts, CudaModelFacts,
     GateShapeRule, GdnRegions, GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal,
     OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule, ViewRefusal, lower_canonical,
-    plan_canonical,
+    lower_plan, plan_canonical,
 };
 use scratchy_target_cuda_compiler::emit::static_tape;
 use scratchy_target_cuda_compiler::steps_from_tape::{StepCx, TapeStep, lower_step};
@@ -1845,21 +1845,30 @@ fn a_narrow_gemm_takes_any_rows() {
     ));
 }
 
-/// A GEMM with an operand after its weight (the old `[act, wt, ..]` match took it silently). The
-/// shared graph keeps a third `MatmulTile` input only for an fp8 weight's per-channel scale, so
-/// that is the canonical: the operand count is refused before the weight's kind.
+/// A GEMM with an operand after its weight (the old `[act, wt, ..]` match took it silently). No
+/// canonical reaches it: a third `MatmulTile` input is an fp8 weight's per-channel scale, which
+/// lowers since FP8 S2. So the plan of a dense GEMM gets a third input on its graph node, and CUDA's
+/// lowering of that plan (`lower_plan`) still refuses it (user decision 2026-11-06).
 #[test]
 fn a_gemm_with_an_extra_operand_is_refused() {
-    let mut l = two_gemm(256);
-    l.input.sources.push(shape(1, 1024));
-    l.bindings
-        .push(SourceBinding::WeightScale { id: 1, index: None });
-    l.input.ops[0].op = SubOp::MatmulTile {
-        n: 1024,
-        weight: GemmWeight::Fp8Dynamic,
+    let l = two_gemm(256);
+    let at = CanonicalAt {
+        stem: "fixture",
+        m: 256,
     };
-    l.input.ops[0].inputs.push(InputRef::Ext(3));
-    let e = refused(&l, &["MatmulTile", "operand 2", "past the operands"]);
+    let mut p = plan_canonical(&l, QWEN3_5_FACTS, at).expect("the GEMMs plan");
+    let gemm = (p.tape.instrs().iter())
+        .find_map(|i| match i {
+            Instr::Compute { node, .. } => Some(node.index()),
+            _ => None,
+        })
+        .expect("a compute");
+    let weight = p.graph.nodes[gemm].inputs[1];
+    p.graph.nodes[gemm].inputs.push(weight);
+    let e = lower_plan(p).expect_err("an extra operand");
+    for name in ["MatmulTile", "operand 2", "past the operands"] {
+        assert!(e.to_string().contains(name), "{e} does not name {name:?}");
+    }
     assert!(matches!(
         e,
         CanonicalRefusal::Operand {
