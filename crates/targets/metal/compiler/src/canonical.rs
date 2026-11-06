@@ -87,7 +87,7 @@ impl SourceManifest {
 
     /// The model's `ModelSources` impl: one arm per family, `ix => bundle at layer`. A family
     /// whose field holds a typed handle (`handle`: its type, by field base) is a source slot
-    /// ([`slot`]): its arm reaches the field through the slot.
+    /// ([`slot`]): its arm matches the slot's `IX` and reaches the field through the slot.
     pub fn resolver(
         &self,
         handle: &dyn Fn(&str) -> Option<TokenStream>,
@@ -97,7 +97,7 @@ impl SourceManifest {
         let (mut slots, mut typed) = (Vec::new(), std::collections::HashSet::new());
         let arms = (0u32..).zip(&self.families).map(|(n, f)| {
             let (ix, base) = (Literal::u32_unsuffixed(n), format_ident!("{}", f.base));
-            let field = match handle(&f.base) {
+            let (field, pat) = match handle(&f.base) {
                 Some(ty) => {
                     let s = slot(SourceIx(n));
                     typed.insert(SourceIx(n));
@@ -112,15 +112,16 @@ impl SourceManifest {
                             }
                         }
                     });
-                    quote!(<#s as ::scratchy_target_metal::tape::typed::Source>::at(self, layer))
+                    let source = quote!(<#s as ::scratchy_target_metal::tape::typed::Source>);
+                    (quote!(#source::at(self, layer)), quote!(#source::IX))
                 }
-                None => quote!(self.#base(layer.get())),
+                None => (quote!(self.#base(layer.get())), quote!(#ids::SourceIx(#ix))),
             };
             use WeightKind as K;
             let bundle = match f.kind {
                 // Unbound until the pool builds the table (`Weights::build_rope_tables`).
                 K::CosSin => {
-                    return Ok(quote!(#ix => Some(#r::CosSin(self.#base.get()?.cos_sin_cache)),));
+                    return Ok(quote!(#pat => Some(#r::CosSin(self.#base.get()?.cos_sin_cache)),));
                 }
                 K::Embedding => quote!(Embedding),
                 K::AffineQuantEmbedding => quote!(AffineQuantEmbedding),
@@ -136,10 +137,10 @@ impl SourceManifest {
                 // carries the `Copy` GpuTensor handle by value (same
                 // deref as the `weight_at` arm in codegen.rs).
                 K::AttnSinks => {
-                    return Ok(quote!(#ix => Some(#r::AttnSinks(*#field)),));
+                    return Ok(quote!(#pat => Some(#r::AttnSinks(*#field)),));
                 }
                 K::Tensor => {
-                    return Ok(quote!(#ix => Some(#r::Tensor(*#field)),));
+                    return Ok(quote!(#pat => Some(#r::Tensor(*#field)),));
                 }
                 K::GptOssMoe => quote!(GptOssMoe),
                 K::Marlin
@@ -152,7 +153,7 @@ impl SourceManifest {
                     return Err(UnboundKind { source, kind });
                 }
             };
-            Ok(quote!(#ix => Some(#r::#bundle(#field)),))
+            Ok(quote!(#pat => Some(#r::#bundle(#field)),))
         });
         let arms = arms.collect::<Result<Vec<_>, _>>()?;
         let names = self.families.iter().map(|f| f.base.as_str());
@@ -167,7 +168,7 @@ impl SourceManifest {
             (quote!(_ix), quote!(None))
         } else {
             let body = quote! {
-                match ix.get() {
+                match ix {
                     #(#arms)*
                     _ => None,
                 }
