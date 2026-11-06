@@ -27,11 +27,11 @@
 //! moments are computed in, E[x] simply unread), taking the chain from 6 descriptors to 5.
 //! See [`OpFunc::Exx2`]'s doc for the full wire contract.
 
-use super::reduce::assemble_reduce_seeded;
-use crate::emit::{EmittedOp, In, pw1, pw2, rb};
+use super::reduce::{ReduceDivision, ReduceSplit, assemble_reduce_seeded, assemble_reduce_split};
+use crate::emit::{EmittedOp, In, op_func_from_str, pw1, pw2, rb};
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{BlockCols, Lanes, RowCount};
-use crate::superdsc_opspec::{DataFormat, Fp16};
+use crate::superdsc_opspec::{DataFormat, Df, Fp16};
 
 /// Assemble torch-spyre's `spyre_rms_norm` decomposition for one node: `x[rows,cols]`,
 /// `gamma[1,cols]`, `eps_const` a bound `[1,stick]` config constant → `out[rows,cols]`.
@@ -137,16 +137,43 @@ pub fn assemble_rmsnorm(
     //    `exx2scale` const (same channel the mean reduce's `scaling_factor` used), and
     //    `useZeroMean` stays the RAW 0 — the vendor's production spelling (the =1 rewrite names
     //    an op the runtime smc table cannot resolve) — see OpInfo::Exx2Scale.
-    ops.push(assemble_reduce_seeded(
-        &format!("rmmean_{prefix}"),
-        "exx2",
-        rows,
-        cols,
-        &x,
-        &mean,
+    // THE ONE PROBE-AND-SPLIT BODY owns the long form: a hidden width too wide for one LX pass
+    // splits into single-shot slices and their running combine; a fitting one (every shipped
+    // row count) is this family's own single descriptor below, unchanged.
+    let rmmean_op = format!("rmmean_{prefix}");
+    let split = assemble_reduce_split(
+        ReduceSplit::new(
+            &rmmean_op,
+            op_func_from_str("exx2"),
+            rows,
+            cols,
+            &x,
+            0,
+            &mean,
+            crate::addr::DevOff::ZERO,
+            out_id,
+            layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
+            Df::Fp16,
+        )
+        .unwrap_or_else(|e| panic!("{rmmean_op}: {e}")),
         sym_id_base,
         layout,
-    ));
+    )
+    .unwrap_or_else(|e| panic!("{rmmean_op}: {e}"));
+    if let Some(split) = split {
+        ops.extend(split);
+    } else {
+        ops.push(assemble_reduce_seeded(
+            &rmmean_op,
+            "exx2",
+            rows,
+            cols,
+            &x,
+            &mean,
+            sym_id_base,
+            layout,
+        ));
+    }
     // 2. E[x²] + eps  (the `+ eps` inside torch.rsqrt). `mean` holds both half-stick values, so
     //    elements [0..8) compute E[x]+eps and the pad elements compute over stale bytes — both
     //    unread (the tail reads element 8 only), the same computed-but-unread padding class the
@@ -302,16 +329,42 @@ pub fn assemble_rmsnorm_unit(
         sym_id_base,
         layout,
     )); // sq16 = x²
-    ops.push(assemble_reduce_seeded(
-        &format!("rmmean_{prefix}"),
-        "mean",
-        rows,
-        cols,
-        &sq16,
-        &mean,
+    // THE ONE PROBE-AND-SPLIT BODY owns the long form here too — the same body, the same
+    // question, never a second spelling of the split law.
+    let rmmean_op = format!("rmmean_{prefix}");
+    let split = assemble_reduce_split(
+        ReduceSplit::new(
+            &rmmean_op,
+            op_func_from_str("mean"),
+            rows,
+            cols,
+            &sq16,
+            0,
+            &mean,
+            crate::addr::DevOff::ZERO,
+            out_id,
+            layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
+            Df::Fp16,
+        )
+        .unwrap_or_else(|e| panic!("{rmmean_op}: {e}")),
         sym_id_base,
         layout,
-    ));
+    )
+    .unwrap_or_else(|e| panic!("{rmmean_op}: {e}"));
+    if let Some(split) = split {
+        ops.extend(split);
+    } else {
+        ops.push(assemble_reduce_seeded(
+            &rmmean_op,
+            "mean",
+            rows,
+            cols,
+            &sq16,
+            &mean,
+            sym_id_base,
+            layout,
+        ));
+    }
     ops.push(pw2(
         &format!("rmeps_{prefix}"),
         "add",
