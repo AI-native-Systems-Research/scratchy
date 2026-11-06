@@ -20,6 +20,10 @@ pub enum Dim {
     /// reshape's `total_l / spatial_merge_size**2` is always
     /// exact).
     Div(Box<Dim>, Box<Dim>),
+    /// Floor quotient: `numerator // denominator`, a remainder dropped — an arch.json `//`
+    /// (qwen2.5-vl pads its vision MLP to `(vision_intermediate_size + 7) // 8 * 8`). A [`Dim::Div`]
+    /// is exact; this one is the only quotient that may have a remainder.
+    FloorDiv(Box<Dim>, Box<Dim>),
     /// Sum of terms: a packed projection's width, its parts side by side (`gdn_conv_dim`, a
     /// Mamba-2 `in_proj`'s). Canonically flattened like `Mul`: no nested `Add`.
     Add(Vec<Dim>),
@@ -79,6 +83,7 @@ fn dim_cmp(a: &Dim, b: &Dim) -> std::cmp::Ordering {
             Dim::Mul(_) => 2,
             Dim::Add(_) => 3,
             Dim::Div(_, _) => 4,
+            Dim::FloorDiv(_, _) => 5,
         }
     }
     match rank(a).cmp(&rank(b)) {
@@ -88,7 +93,9 @@ fn dim_cmp(a: &Dim, b: &Dim) -> std::cmp::Ordering {
             (Dim::Mul(x), Dim::Mul(y)) | (Dim::Add(x), Dim::Add(y)) => x.len().cmp(&y.len()),
             // Div ordering is opaque (no internal order needed for
             // canonicalization; only one Div per merger reshape today).
-            (Dim::Div(_, _), Dim::Div(_, _)) => Ordering::Equal,
+            (Dim::Div(_, _), Dim::Div(_, _)) | (Dim::FloorDiv(_, _), Dim::FloorDiv(_, _)) => {
+                Ordering::Equal
+            }
             _ => unreachable!(),
         },
         other => other,

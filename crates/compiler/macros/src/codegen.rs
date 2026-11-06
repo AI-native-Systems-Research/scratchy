@@ -4726,6 +4726,10 @@ fn dim_tokens(
             let (n, d) = (dim_tokens(n, bounds)?, dim_tokens(d, bounds)?);
             Ok(quote!(#w::Div<#n, #d>))
         }
+        Dim::FloorDiv(n, d) => {
+            let (n, d) = (dim_tokens(n, bounds)?, dim_tokens(d, bounds)?);
+            Ok(quote!(#w::FloorDiv<#n, #d>))
+        }
     }
 }
 

@@ -71,6 +71,15 @@ impl<A: DimType, B: DimType> DimType for Div<A, B> {
     }
 }
 
+/// The floor quotient `A // B`: a remainder dropped (an arch.json `//`).
+pub struct FloorDiv<A, B>(PhantomData<(A, B)>);
+
+impl<A: DimType, B: DimType> DimType for FloorDiv<A, B> {
+    fn dim() -> Dim {
+        Dim::FloorDiv(Box::new(A::dim()), Box::new(B::dim()))
+    }
+}
+
 /// The sum `A + B`: a packed projection's width, its parts side by side. Sums are written in
 /// [`canonical_add`]'s order, so equal sums are equal types.
 pub struct Add<A, B>(PhantomData<(A, B)>);

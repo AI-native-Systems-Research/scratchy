@@ -146,6 +146,23 @@ impl<A: Dim, B: Divides<A>> Dim for Div<A, B> {
     type Num = B::Quot;
 }
 
+/// The floor quotient `A // B`, a remainder dropped: the one quotient that may have one, as an
+/// arch spells a round-up (`(A + 7) // 8 * 8`).
+///
+/// ```
+/// # use scratchy_tensors::typed::{DimN, FloorDiv};
+/// # use scratchy_tensors::typed::typenum::{U5, U32};
+/// assert_eq!(<FloorDiv<U32, U5> as DimN>::N, 6);
+/// ```
+pub struct FloorDiv<A, B>(PhantomData<(A, B)>);
+
+impl<A: Dim, B: Dim> Dim for FloorDiv<A, B>
+where
+    A::Num: core::ops::Div<B::Num, Output: Unsigned>,
+{
+    type Num = typenum::Quot<A::Num, B::Num>;
+}
+
 /// A device layer's extents, in the order its weight's declared shape states them.
 pub trait Extents<const R: usize> {
     fn extents(&self) -> [usize; R];
