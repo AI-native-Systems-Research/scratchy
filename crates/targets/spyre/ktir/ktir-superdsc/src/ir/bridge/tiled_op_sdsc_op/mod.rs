@@ -49,8 +49,8 @@ pub use pointwise::{
     stick_permute_opspec,
 };
 pub use reduce::{
-    ReduceDivided, ReduceDivision, ReduceOffSpec, ReduceSplit, assemble_reduce, assemble_reduce_df,
-    assemble_reduce_off, assemble_reduce_off_divided, assemble_reduce_seeded,
+    ReduceDivided, ReduceDivision, ReduceOffSpec, ReduceSplit, ScalingExtent, assemble_reduce,
+    assemble_reduce_df, assemble_reduce_off, assemble_reduce_off_divided, assemble_reduce_seeded,
     assemble_reduce_split, reduce_opspec, reduce_opspec_df, reduce_opspec_off,
     reduce_opspec_off_divided, win_reduce_accum, win_reduce_data,
 };
