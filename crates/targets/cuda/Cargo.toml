@@ -124,6 +124,13 @@ required-features = ["nvcc"]
 name = "embed"
 required-features = ["nvcc"]
 
+# FP8 S3: the per-token quantization bit for bit against the host quantizer, and the prefill fp8
+# GEMMs against an f64 reference on the same e4m3 inputs and scales, on the GPU. Not built without
+# `nvcc`.
+[[test]]
+name = "gemm_fp8"
+required-features = ["nvcc"]
+
 # The tape player on the GPU: GEMM chains through the arena against a CPU reference.
 [[test]]
 name = "tape_player"
