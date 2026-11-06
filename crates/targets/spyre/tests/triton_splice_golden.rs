@@ -374,16 +374,21 @@ fn a_column_chunked_silumul_splices_through_the_door() {
 /// (M, N).
 const EW_SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096), (96, 4096)];
 
-/// Every `EwKind` the splice has a row for. The kinds the door refuses
-/// (Gelu/QuickGelu/GeluErf) and the kind the splice itself refuses (Relu2 —
-/// an arch using it fails the build at that row, by name) are absent: they
-/// have no descriptor chain, so a door comparison would pin nothing.
+/// Every `EwKind` the splice has a row for. The kinds the DDL has no primitive for
+/// (QuickGelu/GeluErf — the consumer's own `elementwise_op_func` refuses them by name) and
+/// the kind the splice itself refuses (Relu2 — an arch using it fails the build at that row,
+/// by name) are absent: they have no descriptor chain, so a door comparison would pin
+/// nothing. `Gelu` IS here: its kernel spells the tanh-form longhand, which the walk's gelu
+/// recogniser folds into the one `"gelu"` primitive — before that fold existed, the longhand
+/// reached the SILU recogniser's shared exp-island head and was refused there, which is why
+/// this list once excluded it.
 const EW_KINDS: &[EwKind] = &[
     EwKind::Add,
     EwKind::BiasAdd,
     EwKind::Mul,
     EwKind::Sub,
     EwKind::Silu,
+    EwKind::Gelu,
 ];
 
 /// The stem law the op_name carries (`add_s{id}`, `mul_s{id}`, ...; BiasAdd is
@@ -732,13 +737,23 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
         EwKind::Mul => a.iter().zip(&b).map(|(x, y)| x * y).collect(),
         EwKind::Sub => a.iter().zip(&b).map(|(x, y)| x - y).collect(),
         EwKind::Silu => a.iter().map(|&x| x / (1.0 + (-x).exp())).collect(),
+        // The TANH form — the function `OpFunc::Gelu`'s polynomial and the longhand's sigmoid
+        // identity both state — over the same f16-scale values (the fixture's ±0.06 window keeps
+        // the whole run inside one f16 ulp of the reference either way).
+        EwKind::Gelu => a
+            .iter()
+            .map(|&x| {
+                let u = 0.797_884_560_802_865_4 * (x + 0.044_715 * x * x * x);
+                0.5 * x * (1.0 + u.tanh())
+            })
+            .collect(),
         other => unreachable!("exec fixture for {other:?}"),
     };
 
     let mut session =
         scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
             .expect("build the one-program session");
-    let sources = if matches!(kind, EwKind::Silu) {
+    let sources = if matches!(kind, EwKind::Silu | EwKind::Gelu) {
         vec![(0u64, a, vec![m as usize, c as usize])]
     } else {
         vec![
