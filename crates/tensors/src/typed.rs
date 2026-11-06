@@ -13,7 +13,7 @@ use std::marker::PhantomData;
 /// emits names it through this crate.
 pub use typenum;
 
-use typenum::{Unsigned, UInt, UTerm};
+use typenum::{UInt, UTerm, Unsigned};
 
 /// A dim as a type: its number, as a type (`Num`, a [`typenum`] unsigned), for the model whose
 /// module declares it. A law between dims is a bound on their numbers, which rustc checks.
