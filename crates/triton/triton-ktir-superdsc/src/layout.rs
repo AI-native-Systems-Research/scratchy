@@ -1067,7 +1067,7 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
     // (1) the epsilons and gain offsets, one pair per chain.
     for c in &chains {
         push(c.eps, &mut out);
-        if let Some(ones) = c.ones {
+        if let Some(ones) = c.gain_offset() {
             push(ones, &mut out);
         }
     }
@@ -1145,7 +1145,7 @@ fn scales_for(
     // chains the emitter dispatches on, deduped by bits like every push above.
     let mut ones: Vec<f32> = Vec::new();
     for c in chains {
-        if let Some(v) = c.ones
+        if let Some(v) = c.gain_offset()
             && !ones.iter().any(|x| x.to_bits() == v.to_bits())
         {
             ones.push(v);

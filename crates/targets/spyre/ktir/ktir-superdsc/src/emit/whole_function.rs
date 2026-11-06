@@ -352,6 +352,20 @@ pub struct RmsNormChain {
     pub consumed: Vec<Ssa>,
 }
 
+impl RmsNormChain {
+    /// The OnePlusScale gain offset — `Some(1.0)` where the gain leg is `1 + gamma`, `None` for
+    /// the Scale convention and for the identity gain. The ONE place the leg is matched for its
+    /// offset: the walk's classification, the emission's `Lowering::RmsNorm` arm and
+    /// `triton-ktir-superdsc`'s registry planner all read it from here, so no reader can state a
+    /// different formula for one program.
+    pub fn gain_offset(&self) -> Option<f32> {
+        match self.gain {
+            GainLeg::Row { ones, .. } => ones,
+            GainLeg::Identity => None,
+        }
+    }
+}
+
 /// A norm's gain — the two values the chain's last factor can be.
 #[derive(Clone, Debug)]
 pub enum GainLeg {
@@ -3628,7 +3642,7 @@ pub fn staggered_sources(
                 }
             })
             .or(rms.map(|c| match c.gain {
-                GainLeg::Row { ones, .. } => Lowering::RmsNorm(c.eps, ones),
+                GainLeg::Row { .. } => Lowering::RmsNorm(c.eps, c.gain_offset()),
                 GainLeg::Identity => Lowering::RmsNormUnit(c.eps),
             }))
             .or(reduce.map(Lowering::Reduce))
@@ -5870,7 +5884,7 @@ fn lower_function_folded(
                 }
             })
             .or(rms.map(|c| match c.gain {
-                GainLeg::Row { ones, .. } => Lowering::RmsNorm(c.eps, ones),
+                GainLeg::Row { .. } => Lowering::RmsNorm(c.eps, c.gain_offset()),
                 GainLeg::Identity => Lowering::RmsNormUnit(c.eps),
             }))
             .or(reduce.map(Lowering::Reduce))
