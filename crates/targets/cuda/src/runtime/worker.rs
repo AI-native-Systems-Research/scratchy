@@ -620,28 +620,10 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
 }
 
 /// The name of `s` when no kernel launches it: the Qwen routing at another count than
-/// [`MOE_ROUTE_EXPERTS`], every fp8 GEMV (FP8 S4's kernels), and every expert GEMV over an fp8
-/// bank (S4's too; the expert GEMM and the router over an fp8 bank launch). The
-/// routing kernel's Qwen program is instantiated at 256 only (its launcher refuses any other
-/// count), so such a tape is refused before anything is enqueued, rather than at its routing step.
-/// `None` for every other step.
+/// [`MOE_ROUTE_EXPERTS`]. The routing kernel's Qwen program is instantiated at 256 only (its
+/// launcher refuses any other count), so such a tape is refused before anything is enqueued,
+/// rather than at its routing step. `None` for every other step.
 fn not_launched(s: &CudaStep) -> Option<&'static str> {
-    match *s {
-        CudaStep::GemvFp8(_)
-        | CudaStep::GemvGroupFp8(_)
-        | CudaStep::GateUpAct(GateUpActBf16 {
-            kernel: GateUpKernel::GemvFp8,
-            ..
-        }) => return Some("an fp8 GEMV, whose S4 kernel is not built yet"),
-        CudaStep::ExpertGemv(ExpertGemvBf16 { weight, .. })
-        | CudaStep::ExpertGateUpAct(ExpertGateUpActBf16 {
-            gate: ExpertGemvBf16 { weight, .. },
-            ..
-        }) if matches!(weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own) => {
-            return Some("an fp8 expert GEMV, whose S4 kernel is not built yet");
-        }
-        _ => {}
-    }
     if let CudaStep::MoeRoute(MoeRouteBf16 {
         program: RouteProgram::QwenSoftmax,
         experts,
@@ -1395,9 +1377,50 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // `forward` checked is inside the pool.
         for (step, s) in tape.steps.iter().enumerate() {
             let launched = match *s {
-                // Refused before any capture or forward (`not_launched`): no kernel yet.
-                CudaStep::GemvFp8(_) | CudaStep::GemvGroupFp8(_) => {
-                    unreachable!("`not_launched` refuses every fp8 GEMV before a launch")
+                CudaStep::GemvFp8(GemmBf16 { a, b, c, n, k, .. }) => {
+                    let b = Self::fp8_weight(weights, b, n, k);
+                    // SAFETY: as the `Gemv` arm's, for `a` (`k` bf16, which the kernel quantizes
+                    // in its prologue), the fp8 weight (`n*k` bytes then `n` f32,
+                    // `step::fp8_weight`) and `c` (`n`).
+                    unsafe {
+                        kernels::gemv_fp8_abt(
+                            (slot(a).cast_const(), b, slot(c)),
+                            partials,
+                            (n, k, gemv_splits(n, k, 1)),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::GemvGroupFp8(g) => {
+                    let present: Vec<(usize, GroupMember)> = (g.members().iter().enumerate())
+                        .filter_map(|(i, m)| m.map(|m| (i, m)))
+                        .collect();
+                    let members: Vec<(kernels::Fp8Operand, *mut c_void, u32)> = (present.iter())
+                        .map(|(_, m)| (Self::fp8_weight(weights, m.b, m.n, g.k), slot(m.c), m.n))
+                        .collect();
+                    let splits: Vec<u32> = (present.iter())
+                        .map(|(_, m)| gemv_splits(m.n, g.k, 1))
+                        .collect();
+                    // Member `i`'s partials follow the members' before it, as the bf16 group's.
+                    let parts: Vec<*mut c_void> = (present.iter().zip(&splits))
+                        .map(|(&(i, _), &sp)| {
+                            (g.gemv_scratch_before(i))
+                                .filter(|_| sp > 1 && !partials.is_null())
+                                .map_or(std::ptr::null_mut(), |before| {
+                                    partials.cast::<u8>().wrapping_add(before as usize).cast()
+                                })
+                        })
+                        .collect();
+                    // SAFETY: as the `GemvGroup` arm's, each member's weight an fp8 buffer.
+                    unsafe {
+                        kernels::gemv_group_fp8_abt(
+                            slot(g.a),
+                            &members,
+                            &parts,
+                            (g.k, &splits),
+                            stream.0,
+                        )
+                    }
                 }
                 CudaStep::QuantRowsFp8(QuantRowsFp8 { x, q, rows, cols }) => {
                     let (q, scale) = Self::fp8_rows(slot, q, rows, cols);
@@ -1759,9 +1782,17 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 act,
                                 stream.0,
                             ),
-                            GateUpKernel::GemvFp8 => {
-                                unreachable!("`not_launched` refuses every fp8 GEMV")
-                            }
+                            GateUpKernel::GemvFp8 => kernels::gate_up_gemv_fp8(
+                                (
+                                    slot(a).cast_const(),
+                                    Self::fp8_weight(weights, g.gate.b, n, k),
+                                    Self::fp8_weight(weights, g.up.b, n, k),
+                                ),
+                                (slot(g.out), partials),
+                                (n, k, gemv_splits(n, k, 1)),
+                                act,
+                                stream.0,
+                            ),
                             GateUpKernel::GemmFp8 | GateUpKernel::GemmCol64Fp8 => {
                                 kernels::gate_up_gemm_fp8(
                                     (
@@ -2488,30 +2519,32 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         Some((b.cast_const(), rows))
     }
 
-    /// Expert 0's e4m3 `[n, k]` of `g`'s projection in its fp8 bank and its scale row, and the
+    /// Expert 0's e4m3 `[n, k]` of `proj` in the fp8 bank `bundle` and its scale row, and the
     /// rows of each expert's block (`fp8_moe_layout`: the fused gate and up `2·inter`, the down
     /// `hidden`), or `None` on overflow or a bf16 bank.
     fn fp8_expert_slab(
         weights: &[DeviceBuffer],
-        g: &ExpertGemmBf16,
+        (bundle, weight): (WeightIx, MoeWeight),
+        proj: ExpertProjection,
+        (experts, hidden, inter): (u32, u32, u32),
     ) -> Option<(kernels::Fp8Operand, u32)> {
-        let router = match g.weight {
+        let router = match weight {
             MoeWeight::Fp8Bundle => true,
             MoeWeight::Fp8Own => false,
             MoeWeight::Bundle | MoeWeight::Own => return None,
         };
-        let l = fp8_moe_layout(g.experts, g.hidden, g.inter, router)?;
-        let (h, i) = (u64::from(g.hidden), u64::from(g.inter));
-        let (part, scale, rows) = match g.proj {
-            ExpertProjection::Gate => (l.experts.gate_up, l.gate_up_scale, 2 * g.inter),
+        let l = fp8_moe_layout(experts, hidden, inter, router)?;
+        let (h, i) = (u64::from(hidden), u64::from(inter));
+        let (part, scale, rows) = match proj {
+            ExpertProjection::Gate => (l.experts.gate_up, l.gate_up_scale, 2 * inter),
             ExpertProjection::Up => (
                 l.experts.gate_up + i * h,
                 l.gate_up_scale + i * 4,
-                2 * g.inter,
+                2 * inter,
             ),
-            ExpertProjection::Down => (l.experts.down, l.down_scale, g.hidden),
+            ExpertProjection::Down => (l.experts.down, l.down_scale, hidden),
         };
-        let w = weights[g.bundle.0 as usize].ptr();
+        let w = weights[bundle.0 as usize].ptr();
         let at = |o: u64| Some(w.wrapping_byte_add(usize::try_from(o).ok()?).cast_const());
         Some(((at(part)?, at(scale)?), rows))
     }
@@ -2527,7 +2560,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     ) -> Result<(), KernelError> {
         let (n, k) = g.n_k();
         if let Some((a, rows, k)) = CudaStep::ExpertGemm(*g).quantized_input() {
-            let Some((b, expert_rows)) = Self::fp8_expert_slab(weights, g) else {
+            let Some((b, expert_rows)) = Self::fp8_expert_slab(
+                weights,
+                (g.bundle, g.weight),
+                g.proj,
+                (g.experts, g.hidden, g.inter),
+            ) else {
                 return Err(KernelError::MoeShape {
                     kernel: "expert_gemm_fp8",
                     dims: [g.max_tiles, n, k, 0],
@@ -2591,6 +2629,32 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         stream: &Stream,
     ) -> Result<(), KernelError> {
         let (n, k) = g.n_k();
+        let splits = gemv_splits(n, k, g.m.saturating_mul(g.top_k));
+        if matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own) {
+            let Some((b, expert_rows)) = Self::fp8_expert_slab(
+                weights,
+                (g.bundle, g.weight),
+                g.proj,
+                (g.experts, g.hidden, g.inter),
+            ) else {
+                return Err(KernelError::MoeShape {
+                    kernel: "expert_gemv_fp8",
+                    dims: [g.m, g.top_k, n, k],
+                });
+            };
+            // SAFETY: as the bf16 launch's below, with the bank `fp8_moe_layout`'s bytes, expert
+            // 0's e4m3 block and scale row inside it; `a` is bf16, quantized in the prologue.
+            return unsafe {
+                kernels::expert_gemv_fp8(
+                    (slot(g.a).cast_const(), b, slot(g.topk_idx).cast_const()),
+                    (slot(g.c), partials),
+                    (g.m, g.top_k, n, k),
+                    (g.experts, expert_rows),
+                    (g.rows == PairRows::Pair, splits),
+                    stream.0,
+                )
+            };
+        }
         let Some((b, expert_rows)) = Self::expert_slab(
             weights,
             (g.bundle, g.weight),
@@ -2602,7 +2666,6 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 dims: [g.m, g.top_k, n, k],
             });
         };
-        let splits = gemv_splits(n, k, g.m.saturating_mul(g.top_k));
         // SAFETY: as `enqueue`'s, for `a` (its `PairRows` rows of `k`), `topk_idx` (`m*top_k`),
         // `c` (`m*top_k*n`), the bundle (`moe_bundle`'s bytes, which `new` checked the buffer
         // holds; every expert's `[n, k]` lies inside its part) and the scratch (the tape's GEMV
@@ -2634,6 +2697,40 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             kernel: "expert_gate_up_gemv_bf16",
             dims: [pairs, n, k, 0],
         };
+        let splits = gemv_splits(n, k, pairs);
+        if matches!(g.gate.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own) {
+            let slab = |e: &ExpertGemvBf16| {
+                Self::fp8_expert_slab(
+                    weights,
+                    (e.bundle, e.weight),
+                    e.proj,
+                    (e.experts, e.hidden, e.inter),
+                )
+            };
+            let (Some((gate, rows)), Some((up, up_rows))) = (slab(&g.gate), slab(&g.up)) else {
+                return Err(refused);
+            };
+            if rows != up_rows {
+                return Err(refused);
+            }
+            // SAFETY: as the bf16 launch's below, for both fp8 slabs and their scale rows, each
+            // inside the bank's gate/up part (`fp8_moe_layout`).
+            return unsafe {
+                kernels::expert_gate_up_gemv_fp8(
+                    (
+                        slot(g.gate.a).cast_const(),
+                        gate,
+                        up,
+                        slot(g.gate.topk_idx).cast_const(),
+                    ),
+                    (slot(g.out), partials),
+                    (g.gate.m, g.gate.top_k, n, k),
+                    (g.gate.experts, rows, splits),
+                    g.act.code(),
+                    stream.0,
+                )
+            };
+        }
         let slab = |e: &ExpertGemvBf16| {
             Self::expert_slab(
                 weights,
@@ -2648,7 +2745,6 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         if rows != up_rows {
             return Err(refused);
         }
-        let splits = gemv_splits(n, k, pairs);
         // SAFETY: as `expert_gemv`'s, for both slabs (each inside the bundle's gate/up part) and
         // the scratch (both projections' partials, `ExpertGateUpActBf16::gemv_scratch`, which
         // `validate` checked).
