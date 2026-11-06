@@ -226,7 +226,6 @@ pub enum Startup {
     FirstToken,
     /// Launch until the first token: Ready, then FirstToken.
     Launch,
-    PeakRss,
 }
 
 impl Startup {
@@ -235,7 +234,6 @@ impl Startup {
             Startup::Ready => r.t_ready_s,
             Startup::FirstToken => r.ttft_from_send_s,
             Startup::Launch => r.ttft_exec_s,
-            Startup::PeakRss => r.peak_rss_mib,
         }
     }
 }
@@ -339,9 +337,6 @@ pub const PARTIAL: &str = "†";
 pub const FAILED: &str = "‡";
 /// Marks any number from a cell whose answers came back short of the tokens asked for.
 pub const SHORT: &str = "§";
-/// Stands in for a peak RSS below the model's own weights ([`peak_rss`]).
-pub const BELOW_WEIGHTS: &str = "below weights";
-
 pub fn fmt(v: Option<f64>, decimals: usize) -> String {
     v.map_or_else(|| DASH.to_string(), |v| thousands_f(v, decimals))
 }
@@ -362,51 +357,9 @@ pub fn lfmt(
     fmt(v.map(|v| v * scale), decimals)
 }
 
-/// A memory reading of an engine serving a model: its MiB, below the model's own weights (so it
-/// can't be all the process holds), or not measured.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Memory {
-    Reading(f64),
-    BelowWeights,
-    NotMeasured,
-}
-
-impl Memory {
-    /// `mib` as read for engine `e` serving `m`: below its weights, for an engine that loads the
-    /// checkpoint they measure ([`Engine::serves_mlx_checkpoint`]), is not a reading.
-    pub fn of(m: &Model, e: Engine, mib: Option<f64>) -> Self {
-        match mib {
-            None => Memory::NotMeasured,
-            Some(mib) if below_weights(m, e, mib) => Memory::BelowWeights,
-            Some(mib) => Memory::Reading(mib),
-        }
-    }
-
-    /// The MiB, where it is a reading.
-    pub fn mib(self) -> Option<f64> {
-        match self {
-            Memory::Reading(mib) => Some(mib),
-            Memory::BelowWeights | Memory::NotMeasured => None,
-        }
-    }
-}
-
 /// Whether `mib` reads below `m`'s weights for an engine that loads them.
 pub fn below_weights(m: &Model, e: Engine, mib: f64) -> bool {
     e.serves_mlx_checkpoint() && m.weights().is_some_and(|w| mib < w.mib())
-}
-
-/// An engine's median peak RSS over a model's launches of one scenario (#414).
-pub fn peak_rss(m: &Model, e: Engine, scenario: Scenario) -> Memory {
-    Memory::of(m, e, med(e.ladder(m), scenario, Startup::PeakRss))
-}
-
-/// [`peak_rss`] as text: says it reads below the weights rather than show the number.
-pub fn rss_fmt(m: &Model, e: Engine, scenario: Scenario) -> String {
-    match peak_rss(m, e, scenario) {
-        Memory::BelowWeights => BELOW_WEIGHTS.to_string(),
-        r => fmt(r.mib(), 0),
-    }
 }
 
 /// Whether scratchy produced any number for this model.
@@ -536,10 +489,6 @@ pub fn cfmt(c: Option<&Cell>, metric: Metric) -> String {
     }
     fmt(timing(c, metric), metric.decimals()) + &marks(c, metric)
 }
-
-/// Run-to-run spread on one machine at one commit: two M1 Max runs of af009bf1
-/// agreed within about 2%, so a smaller change is noise, not a result.
-pub const NOISE: f64 = 0.03;
 
 #[cfg(test)]
 mod tests {

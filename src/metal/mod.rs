@@ -5,11 +5,14 @@
 //! <machine>-<YYYY-MM-DD>-<sha8>.json). The page reads them at site-build
 //! time, so it cannot drift from what the runner measured.
 //!
-//! Per machine, each model shows its newest run; older runs of the same model
-//! stay visible in that model's history table, so a re-run after a Metal
-//! change reads as a before/after.
+//! The page is a section a dataset the runs measured, the random-token grid
+//! one of them. Under each, a machine and model's newest run, with what its
+//! numbers came from; a model's older runs here stay in its runs table, and its
+//! previous run's line behind its curves, so a re-run reads as a before/after.
 
+mod buckets;
 mod data;
+mod datasets;
 mod numbers;
 mod tasks;
 
@@ -21,21 +24,21 @@ use dioxus::prelude::*;
 use crate::Site;
 use crate::carbon::{
     Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Definition, Fold, Heading,
-    Layer, Section, Stack, TabItem, Table, TableCell, TableRow, Tabs, TabsKind, Tag, TagKind,
-    Tile, TipHeading, Toggletip,
+    Section, Stack, TabItem, Table, TableCell, TableRow, Tabs, TabsKind, Tile, TipHeading,
+    Toggletip,
 };
 use crate::charts::{
     Axes, Axis, AxisDomain, BarPoint, Better, Bounds, BubblePoint, Bubbles, Chart, ChartOptions,
     ColorLegend, Colour, ComboLayer, Enabled, Gradient, HeatPoint, HeatmapOptions, Hover,
-    LineOptions, Locale, RATIO_RANGE, RATIO_STEPS, Ramp, ScaleFit, SparkAxes, SparkPoint, Step,
-    RatioSquare, TableAxes, chart, colour, glance_maps, glance_mini, highlight, log2_ratio,
+    LineOptions, Locale, RATIO_RANGE, RATIO_STEPS, Ramp, RatioSquare, ScaleFit, SparkAxes,
+    SparkPoint, Step, TableAxes, chart, colour, glance_maps, glance_mini, highlight, log2_ratio,
     mini_heatmap, ratio_scale, ratio_step, sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
 use data::{At, Bytes, Cell, Model, RequestTiming, Run, Scenario};
 use numbers::{
-    BELOW_WEIGHTS, DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, SHORT, Startup, cfmt,
-    failed_note, fmt, lfmt, marks, marks_note, med, peak_rss, rss_fmt, served, timing,
+    DASH, Engine, FAILED, Metric, NO_STREAM, SHORT, Startup, cfmt, failed_note, fmt, lfmt, marks,
+    marks_note, med, served, timing,
 };
 
 /// The run files, relative to site/; copied to the same place under _site/,
@@ -314,14 +317,243 @@ fn sampled_from_musique(workload: &str) -> bool {
 }
 
 /// A dataset map's axes before there is anything to show: a place of the right shape.
-fn empty_task_axes() -> TableAxes<'static> {
+pub(super) fn empty_task_axes() -> TableAxes<'static> {
     TableAxes {
         across: ("workload", vec![]),
         down: ("users at once", vec![]),
     }
 }
 
-fn slug(text: &str) -> String {
+/// The comparison engines' releases as the runner recorded them: every engine
+/// from `config.engines`, else the mlx-lm/ollama pair older runs kept.
+fn engine_versions(run: &Run) -> String {
+    let c = &run.config;
+    let parts: Vec<String> = match &c.engines {
+        Some(es) => es
+            .iter()
+            .filter(|e| e.key != "scratchy" && e.installed == Some(true))
+            .filter_map(|e| {
+                Some(format!(
+                    "{} {}",
+                    e.label,
+                    e.version.as_deref().filter(|v| !v.is_empty())?
+                ))
+            })
+            .collect(),
+        None => c
+            .engine_versions
+            .iter()
+            .flatten()
+            .filter_map(|(k, v)| {
+                let label = Engine::ALL.into_iter().find(|e| e.key() == k)?.label();
+                Some(format!("{label} {}", v.as_deref()?))
+            })
+            .collect(),
+    };
+    if parts.is_empty() {
+        "not recorded".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// Whether the run was an agreed, fully pinned one.
+fn pinned(run: &Run) -> String {
+    match run.config.pinned {
+        None => "not recorded".to_string(),
+        Some(true) => "yes".to_string(),
+        Some(false) => match run.config.pin_problems.as_deref() {
+            Some(ps) if !ps.is_empty() => format!("no: {}", ps.join("; ")),
+            _ => "no".to_string(),
+        },
+    }
+}
+
+fn commit(run: &Run) -> Element {
+    rsx! { a { href: "{REPO}/commit/{run.repo.sha}", code { "{run.repo.sha8()}" } } }
+}
+
+pub(super) fn runs_table(runs: &[&Run]) -> Element {
+    rsx! {
+        Fold { title: "Runs on this machine ({runs.len()})",
+            Table {
+                headers: headers(["when", "scratchy", "steps", "cold priming launches", "scratchy KV cache", "scratchy serve flags", "engine versions", "pinned", "data"]),
+                for run in runs.iter().rev() {
+                    {
+                        let [(_, flags), (_, kv)] = settings(run);
+                        let file = run.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        rsx! {
+                            TableRow {
+                                TableCell { "{run.generated_utc.minute()} UTC" }
+                                TableCell { {commit(run)} }
+                                TableCell { "{run.config.scenarios.join(\", \")}" }
+                                TableCell { {run.config.cold_priming_launches.map_or("not recorded".to_string(), |n| n.to_string())} }
+                                TableCell { "{kv}" }
+                                TableCell { code { "{flags}" } }
+                                TableCell { "{engine_versions(run)}" }
+                                TableCell { "{pinned(run)}" }
+                                TableCell { a { href: "{DATA}/{file}", "json" } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What an engine served for this model, for its row: the ollama tag or GGUF
+/// file it loaded, with its quantization when it reported one. Runs from
+/// before `engine_models` kept only ollama's.
+pub(super) fn served_as(m: &Model, e: Engine) -> Option<String> {
+    let (model, quant) = match m.engine_models.as_ref().and_then(|em| em.get(e.key())) {
+        Some(s) => (s.model.clone(), s.quantization.clone()),
+        None if e == Engine::Ollama => {
+            let o = m.ollama.as_ref()?;
+            (o.tag.clone(), o.quantization.clone())
+        }
+        None => return None,
+    };
+    // The MLX engines serve scratchy's own checkpoint (`Engine::serves_mlx_checkpoint`): nothing to
+    // add. The others serve their own build, named here.
+    let model = match e {
+        _ if e.serves_mlx_checkpoint() => None,
+        Engine::Ollama => model,
+        _ => model.map(|m| m.rsplit(':').next().unwrap_or_default().to_string()),
+    };
+    let parts: Vec<String> = [model, quant]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// Everything else that can move a run-to-run number besides scratchy's own
+/// code: the base shape, the other engines' releases, whether the run was
+/// pinned, macOS, and the model files. Unrecorded on either side never counts
+/// as a change, so runs from before a field existed do not all warn.
+fn conditions(run: &Run, m: &Model) -> [(&'static str, String); 5] {
+    let (i, o, c) = base_of(run, m);
+    let shape = if run.config.base().is_some() {
+        format!("{}/{}/{}", opt(i), opt(o), opt(c))
+    } else {
+        "not recorded".to_string()
+    };
+    let files = m
+        .model_files
+        .as_ref()
+        .and_then(|f| f.revision.as_deref())
+        .map_or("not recorded".to_string(), |r| {
+            r[..r.len().min(8)].to_string()
+        });
+    let pin = pinned(run);
+    [
+        ("base shape (in/out/users)", shape),
+        ("engine versions", engine_versions(run)),
+        (
+            "pinned",
+            pin.split(':').next().unwrap_or_default().to_string(),
+        ),
+        ("macOS", run.machine.macos.to_string()),
+        ("model files", files),
+    ]
+}
+
+fn conditions_changed(run: &Run, m: &Model, prev: Entry) -> String {
+    conditions(run, m)
+        .into_iter()
+        .zip(conditions(prev.run, prev.m))
+        .filter(|((_, now), (_, then))| {
+            now != then && now != "not recorded" && then != "not recorded"
+        })
+        .map(|((k, now), (_, then))| format!("{k} {then} then, {now} now"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+pub(super) fn history(entries: &[Entry]) -> Element {
+    if entries.len() < 2 {
+        return rsx! {};
+    }
+    rsx! {
+        Fold { title: "Runs of this model ({entries.len()})",
+            Table {
+                headers: headers(["run", "scratchy", "quant", "tok/s, 1 user", "tok/s, most users", "TPOT ms, most users"]),
+                for Entry { run, m } in entries.iter().rev() {
+                    TableRow {
+                        TableCell { "{run.generated_utc.date()}" }
+                        TableCell { {commit(run)} }
+                        TableCell { "{m.quant.as_deref().unwrap_or_default()}" }
+                        if served(m) {
+                            {
+                                let us = by_users(m, run, Engine::Scratchy);
+                                let one = us.get(&1).copied();
+                                let many = us.keys().max().filter(|&&n| n != 0).and_then(|n| us.get(n).copied());
+                                let vals = [
+                                    // Every cell's number through cfmt, so a dead or failed
+                                    // one carries its mark like the TPOT beside it.
+                                    cfmt(one, Metric::Throughput),
+                                    cfmt(many, Metric::Throughput),
+                                    cfmt(many, Metric::Tpot),
+                                ];
+                                rsx! { for v in vals { TableCell { "{v}" } } }
+                            }
+                        } else {
+                            TableCell { colspan: 3, "no numbers" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What differs from a model's previous run here, besides scratchy's own code: its settings and
+/// its conditions. Empty with no previous run, or none that scratchy served.
+pub(super) fn previous_run(seen: &[Entry]) -> Option<Element> {
+    let Entry { run, m } = *seen.last()?;
+    let prev = seen[..seen.len() - 1]
+        .iter()
+        .rev()
+        .find(|e| served(e.m))
+        .copied()?;
+    let changed = settings_changed(run, prev.run);
+    let around = conditions_changed(run, m, prev);
+    Some(rsx! {
+        p { style: "font-size: 0.875rem",
+            "Previous run here: {prev.run.generated_utc.date()}, "
+            code { "{prev.run.repo.sha8()}" }
+            ", its scratchy line drawn faint behind this one's."
+            if !changed.is_empty() {
+                " " strong { "Settings differ from that run" } " ({changed}), so a change is not the code alone."
+            }
+            if !around.is_empty() {
+                " " strong { "Also different" } ": {around}."
+            }
+        }
+    })
+}
+
+/// What the marks on a grid number mean: an answer that arrived in one piece, one that some did,
+/// a cell where requests failed, answers short of what was asked.
+pub(super) fn marks_key() -> Element {
+    info(
+        "",
+        rsx! {
+            strong { "no stream" } ": the answer arrived in one piece, so TTFT and TPOT could not be timed. "
+            strong { "†" } ": some answers did; the timing comes from the rest (the table views say how many). "
+            strong { "{FAILED}" } ": some requests failed (an error or a timeout, usually the engine running out of \
+                       memory), so every number in that cell covers only the rest. "
+            strong { "{SHORT}" } ": the answers came back short of the tokens asked for. Every request asks the \
+                       engine to ignore EOS and answer to length; ollama, oMLX before 0.7.3 and sometimes mlx-lm \
+                       stop at EOS anyway, so the cell measured less decode than its label says, which flatters \
+                       tok/s (the table views say what share)."
+        },
+    )
+}
+
+pub(super) fn slug(text: &str) -> String {
     let lower = text.to_lowercase();
     let parts: Vec<&str> = lower
         .split(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit())
@@ -334,20 +566,20 @@ fn slug(text: &str) -> String {
 
 /// One model's result within one run.
 #[derive(Clone, Copy)]
-struct Entry<'a> {
-    run: &'a Run,
-    m: &'a Model,
+pub(super) struct Entry<'a> {
+    pub(super) run: &'a Run,
+    pub(super) m: &'a Model,
 }
 
 /// One machine's runs, oldest first, and per model (in order of first
 /// appearance) every entry, oldest first: the last is the one shown.
-struct MachineRuns<'a> {
-    runs: Vec<&'a Run>,
-    models: Vec<(&'a str, Vec<Entry<'a>>)>,
+pub(super) struct MachineRuns<'a> {
+    pub(super) runs: Vec<&'a Run>,
+    pub(super) models: Vec<(&'a str, Vec<Entry<'a>>)>,
 }
 
 impl<'a> MachineRuns<'a> {
-    fn latest(&self, stem: &str) -> Option<Entry<'a>> {
+    pub(super) fn latest(&self, stem: &str) -> Option<Entry<'a>> {
         self.models
             .iter()
             .find(|(s, _)| *s == stem)
@@ -405,7 +637,7 @@ fn index(runs: &[Run]) -> BTreeMap<&str, MachineRuns<'_>> {
 
 /// The machines in page order: smallest memory first, then by chip name, so a row reads up from
 /// the small set's Macs to the large set's.
-fn in_order<'a>(machines: &BTreeMap<&'a str, MachineRuns<'a>>) -> Vec<&'a str> {
+pub(super) fn in_order<'a>(machines: &BTreeMap<&'a str, MachineRuns<'a>>) -> Vec<&'a str> {
     let memory = |chip: &str| {
         machines[chip].runs[machines[chip].runs.len() - 1]
             .machine
@@ -417,52 +649,6 @@ fn in_order<'a>(machines: &BTreeMap<&'a str, MachineRuns<'a>>) -> Vec<&'a str> {
 }
 
 // ------------------------------------------------------------------- render
-
-/// A grey tag on a number an earlier run measured, saying when ([`Model::borrowed`]).
-fn from_run(when: &data::Utc) -> Element {
-    let day = when.month_day();
-    rsx! { Tag { kind: TagKind::Gray, title: "measured by an earlier run, on {day}: this run did not measure it", "from {day}" } }
-}
-
-/// A change badge against the previous run: a Carbon tag, green better, red
-/// worse, grey inside the noise band. The arrow and the tag's title say it
-/// too, so colour is never the only signal; nothing when either side is
-/// missing.
-fn delta(new: Option<f64>, old: Option<f64>, higher_better: bool) -> Element {
-    let (Some(new), Some(old)) = (new, old.filter(|o| *o != 0.0)) else {
-        return rsx! {};
-    };
-    let ch = (new - old) / old;
-    if ch.abs() < NOISE {
-        return rsx! { Tag { kind: TagKind::Gray, title: "within 3% of the previous run", "≈" } };
-    }
-    let better = (ch > 0.0) == higher_better;
-    let (kind, word) = if better {
-        (TagKind::Green, "better")
-    } else {
-        (TagKind::Red, "worse")
-    };
-    let arrow = if ch > 0.0 { "▲" } else { "▼" };
-    let pct = format!("{:.0}", ch.abs() * 100.0);
-    rsx! { Tag { kind, title: "{word} than the previous run", "{arrow} {pct}%" } }
-}
-
-/// The summary row's numbers, unformatted, for comparing two runs, each with
-/// whether higher is better (only tok/s is; every time and memory is lower).
-fn summary_raw(m: &Model, run: &Run) -> [(Option<f64>, bool); 8] {
-    let ladder = Engine::Scratchy.ladder(m);
-    let one = by_users(m, run, Engine::Scratchy).get(&1).copied();
-    [
-        (med(ladder, Scenario::Frozen, Startup::Ready), false),
-        (med(ladder, Scenario::Cold, Startup::Ready), false),
-        (med(ladder, Scenario::Cold, Startup::FirstToken), false),
-        (med(ladder, Scenario::Warm, Startup::FirstToken), false),
-        (timing(one, Metric::Ttft), false),
-        (timing(one, Metric::Tpot), false),
-        (timing(one, Metric::Throughput), true),
-        (peak_rss(m, Engine::Scratchy, Scenario::Cold).mib(), false),
-    ]
-}
 
 /// The run settings that change scratchy's numbers on their own: its serve
 /// flags and KV cache setting, as the runner recorded them.
@@ -566,125 +752,10 @@ fn users_shape(m: &Model, run: &Run) -> (Option<u32>, Option<u32>) {
     }
 }
 
-/// The comparison engines' releases as the runner recorded them: every engine
-/// from `config.engines`, else the mlx-lm/ollama pair older runs kept.
-fn engine_versions(run: &Run) -> String {
-    let c = &run.config;
-    let parts: Vec<String> = match &c.engines {
-        Some(es) => es
-            .iter()
-            .filter(|e| e.key != "scratchy" && e.installed == Some(true))
-            .filter_map(|e| {
-                Some(format!(
-                    "{} {}",
-                    e.label,
-                    e.version.as_deref().filter(|v| !v.is_empty())?
-                ))
-            })
-            .collect(),
-        None => c
-            .engine_versions
-            .iter()
-            .flatten()
-            .filter_map(|(k, v)| {
-                let label = Engine::ALL.into_iter().find(|e| e.key() == k)?.label();
-                Some(format!("{label} {}", v.as_deref()?))
-            })
-            .collect(),
-    };
-    if parts.is_empty() {
-        "not recorded".to_string()
-    } else {
-        parts.join(" · ")
-    }
-}
-
-/// Whether the run was an agreed, fully pinned one.
-fn pinned(run: &Run) -> String {
-    match run.config.pinned {
-        None => "not recorded".to_string(),
-        Some(true) => "yes".to_string(),
-        Some(false) => match run.config.pin_problems.as_deref() {
-            Some(ps) if !ps.is_empty() => format!("no: {}", ps.join("; ")),
-            _ => "no".to_string(),
-        },
-    }
-}
-
-/// Everything else that can move a run-to-run number besides scratchy's own
-/// code: the base shape, the other engines' releases, whether the run was
-/// pinned, macOS, and the model files. Unrecorded on either side never counts
-/// as a change, so runs from before a field existed do not all warn.
-fn conditions(run: &Run, m: &Model) -> [(&'static str, String); 5] {
-    let (i, o, c) = base_of(run, m);
-    let shape = if run.config.base().is_some() {
-        format!("{}/{}/{}", opt(i), opt(o), opt(c))
-    } else {
-        "not recorded".to_string()
-    };
-    let files = m
-        .model_files
-        .as_ref()
-        .and_then(|f| f.revision.as_deref())
-        .map_or("not recorded".to_string(), |r| {
-            r[..r.len().min(8)].to_string()
-        });
-    let pin = pinned(run);
-    [
-        ("base shape (in/out/users)", shape),
-        ("engine versions", engine_versions(run)),
-        (
-            "pinned",
-            pin.split(':').next().unwrap_or_default().to_string(),
-        ),
-        ("macOS", run.machine.macos.to_string()),
-        ("model files", files),
-    ]
-}
-
-fn conditions_changed(run: &Run, m: &Model, prev: Entry) -> String {
-    conditions(run, m)
-        .into_iter()
-        .zip(conditions(prev.run, prev.m))
-        .filter(|((_, now), (_, then))| {
-            now != then && now != "not recorded" && then != "not recorded"
-        })
-        .map(|((k, now), (_, then))| format!("{k} {then} then, {now} now"))
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-/// What an engine served for this model, for its row: the ollama tag or GGUF
-/// file it loaded, with its quantization when it reported one. Runs from
-/// before `engine_models` kept only ollama's.
-fn served_as(m: &Model, e: Engine) -> Option<String> {
-    let (model, quant) = match m.engine_models.as_ref().and_then(|em| em.get(e.key())) {
-        Some(s) => (s.model.clone(), s.quantization.clone()),
-        None if e == Engine::Ollama => {
-            let o = m.ollama.as_ref()?;
-            (o.tag.clone(), o.quantization.clone())
-        }
-        None => return None,
-    };
-    // The MLX engines serve scratchy's own checkpoint (`Engine::serves_mlx_checkpoint`): nothing to
-    // add. The others serve their own build, named here.
-    let model = match e {
-        _ if e.serves_mlx_checkpoint() => None,
-        Engine::Ollama => model,
-        _ => model.map(|m| m.rsplit(':').next().unwrap_or_default().to_string()),
-    };
-    let parts: Vec<String> = [model, quant]
-        .into_iter()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .collect();
-    (!parts.is_empty()).then(|| parts.join(", "))
-}
-
 /// The parity gate's verdict for the model line: scratchy and mlx-lm must
 /// give the same greedy answers before anything is timed. None for runs from
 /// before the gate.
-fn parity(m: &Model) -> Option<String> {
+pub(super) fn parity(m: &Model) -> Option<String> {
     m.parity_mlx_lm.map(|p| match (p, &m.parity_skipped) {
         (None, Some(why)) => format!("output not checked against mlx-lm: {why}"),
         (Some(true), _) => match &m.parity_ties {
@@ -704,7 +775,7 @@ fn parity(m: &Model) -> Option<String> {
     })
 }
 
-fn parity_info() -> Element {
+pub(super) fn parity_info() -> Element {
     info(
         "",
         rsx! {
@@ -721,47 +792,6 @@ fn info(label: &str, body: Element) -> Element {
     rsx! { Toggletip { label, alignment: Alignment::Bottom, {body} } }
 }
 
-fn startup_info() -> Element {
-    info(
-        "",
-        rsx! {
-            strong { "frozen" } ": first launch after memory and scratchy's weights cache are cleared. "
-            strong { "cold" } ": a normal relaunch. Both run until the server is ready, no request included. "
-            strong { "1st req" } ": the cold server's first request, send to first token. "
-            strong { "warm" } ": the median over many requests once it is running. ollama reports ready before \
-                          loading the model, so its load time lands in 1st req."
-        },
-    )
-}
-
-fn timing_info() -> Element {
-    info(
-        "",
-        rsx! {
-            strong { "no stream" } ": the answer arrived in one piece, so TTFT and TPOT could not be timed. "
-            strong { "†" } ": some answers did; the timing comes from the rest (the table views say how many). "
-            strong { "{FAILED}" } ": some requests failed (an error or a timeout, usually the engine running out of \
-                       memory), so every number in that cell covers only the rest. "
-            strong { "{SHORT}" } ": the answers came back short of the tokens asked for. Every request asks the \
-                       engine to ignore EOS and answer to length; oMLX, ollama and sometimes mlx-lm stop at EOS \
-                       anyway, so the cell measured less decode than its label says, which flatters tok/s (the \
-                       table views say what share)."
-        },
-    )
-}
-
-fn rss_info() -> Element {
-    info(
-        "",
-        rsx! {
-            "The server process at its peak. For ollama, " code { "ollama serve" } " only; its runner process is not counted. "
-            strong { "{BELOW_WEIGHTS}" } ": less than the model's own weights. A process serving the model holds at \
-                       least those, so the reading can't be all of its memory, and is left out (#414). The same rule \
-                       leaves out a peak-memory reading on the prompt-length chart."
-        },
-    )
-}
-
 fn users_info() -> Element {
     info(
         "",
@@ -773,13 +803,14 @@ fn about() -> Element {
     info(
         "About these numbers",
         rsx! {
-            "Prompts are made up, a fixed size, and unique per request so no cache can answer them (warmups use \
-             prompts of their own), with greedy decoding (temperature 0) on every engine. oMLX (as shipped, and \
-             with 4-bit TurboQuant KV), mlx-lm, vllm-metal and Splash run the same MLX checkpoint as scratchy \
-             (Splash on the Qwen models only, with the draft model it ships); ollama, llama.cpp and mistral.rs run \
-             their own quantizations, named on their rows. Engine versions, and \
-             whether a run was pinned, are in each machine's runs table. scratchy's build time is shown per model \
-             and is never part of startup. The (i) buttons next to a column explain it."
+            "A dataset's tasks are the same to every engine, sampled by a seed of model, dataset and users \
+             count. The random-token grid's prompts are made up, a fixed size, and unique per request so no cache \
+             can answer them (warmups use prompts of their own). Greedy decoding (temperature 0) on every engine. \
+             oMLX (as shipped, and with 4-bit TurboQuant KV), mlx-lm, vllm-metal and Splash run the same MLX \
+             checkpoint as scratchy (Splash on the Qwen models only, with the draft model it ships); ollama, \
+             llama.cpp and mistral.rs run their own quantizations, named as what each served. Under every machine \
+             and model: its runs table, with engine versions and whether a run was pinned, and scratchy's build \
+             time for the model."
         },
     )
 }
@@ -805,114 +836,17 @@ fn part(heading: &str, intro: Element, body: Element) -> Element {
     }
 }
 
-fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
-    let (si, so) = users_shape(m, run);
-    let shape = (si.is_some() || so.is_some()).then(|| format!("{} in / {} out", opt(si), opt(so)));
-    // Badges only against a run whose one-user numbers are at the same shape:
-    // a change of shape is not a speedup.
-    let same_shape = prev.is_some_and(|p| users_shape(p.m, p.run) == (si, so));
-    let rows = Engine::ALL.into_iter().filter_map(|e| {
-        let (ladder, one) = (e.ladder(m), by_users(m, run, e).get(&1).copied());
-        if e == Engine::Scratchy && !served(m) {
-            let why = if !m.built {
-                "build failed"
-            } else if m.parity_mlx_lm == Some(Some(false)) {
-                "its answers did not match mlx-lm's, so no engine was timed"
-            } else {
-                "the server never served"
-            };
-            return Some(rsx! {
-                TableRow {
-                    TableCell { "{e.label()}" }
-                    TableCell { colspan: 8, "No numbers: {why}. See the run's raw logs." }
-                }
-            });
-        }
-        if e != Engine::Scratchy && !e.ran(m) {
-            return None; // that engine was not part of this run
-        }
-        let vals = [
-            lfmt(ladder, Scenario::Frozen, Startup::Ready, 2, 1.0),
-            lfmt(ladder, Scenario::Cold, Startup::Ready, 2, 1.0),
-            lfmt(ladder, Scenario::Cold, Startup::FirstToken, 2, 1.0),
-            lfmt(ladder, Scenario::Warm, Startup::FirstToken, 0, 1000.0),
-            cfmt(one, Metric::Ttft),
-            cfmt(one, Metric::Tpot),
-            cfmt(one, Metric::Throughput),
-            rss_fmt(m, e, Scenario::Cold),
-        ];
-        let now = summary_raw(m, run);
-        let then = prev
-            .filter(|_| e == Engine::Scratchy && same_shape)
-            .map(|p| summary_raw(p.m, p.run));
-        // An engine with its own quantization says which on its row.
-        let name = match served_as(m, e) {
-            None => e.label().to_string(),
-            Some(s) => format!("{} ({s})", e.label()),
-        };
-        // Numbers an earlier run measured say when; a borrowed value has no change to show.
-        let from = m.borrowed.get(e.key());
-        let frozen_from = (e == Engine::Scratchy)
-            .then(|| m.borrowed.get(data::BORROWED_FROZEN))
-            .flatten();
-        Some(rsx! {
-            TableRow {
-                TableCell { "{name}" if let Some(w) = from { " " {from_run(w)} } }
-                for (i, v) in vals.iter().enumerate() {
-                    TableCell { "{v} "
-                        if i == 0 && let Some(w) = frozen_from {
-                            {from_run(w)}
-                        } else if let Some(then) = then {
-                            {delta(now[i].0, then[i].0, now[i].1)}
-                        }
-                    }
-                }
-            }
-        })
-    });
-    let changed = prev
-        .map(|p| settings_changed(run, p.run))
-        .unwrap_or_default();
-    let around = prev
-        .map(|p| conditions_changed(run, m, p))
-        .unwrap_or_default();
-    part(
-        "Startup and single-user speed",
-        rsx! {
-            "One row per engine. Startup in seconds (warm in ms); one user at {shape.as_deref().unwrap_or(\"the base shape\")}."
-            if let Some(p) = prev {
-                " Under scratchy: change since its previous run here ({p.run.generated_utc.date()}, "
-                code { "{p.run.repo.sha8()}" }
-                "); ≈ is within 3%."
-                if !changed.is_empty() {
-                    " " strong { "Settings differ from that run" } " ({changed}), so a change is not the code alone."
-                }
-                if !around.is_empty() {
-                    " " strong { "Also different" } ": {around}."
-                }
-            }
-            " What the columns mean: startup " {startup_info()} " one user " {timing_info()} " peak RSS " {rss_info()}
-        },
-        rsx! {
-            Table {
-                headers: headers(["engine", "frozen s", "cold s", "1st req s", "warm ms", "TTFT ms", "TPOT ms", "tok/s", "peak RSS MiB"]),
-                {rows}
-            }
-        },
-    )
-}
-
 /// One line of a chart: its label, series colour, and (x, value) points; a
 /// point present but None was not measured.
-struct Series {
-    label: String,
-    class: &'static str,
-    pts: Vec<(u32, Option<f64>)>,
+pub(super) struct Series {
+    pub(super) label: String,
+    pub(super) class: &'static str,
+    pub(super) pts: Vec<(u32, Option<f64>)>,
 }
 
 /// What a sweep's charts put on x.
 #[derive(Clone, Copy, PartialEq)]
-enum Sweep {
+pub(super) enum Sweep {
     /// Offered concurrent users, at the base shape (or the grid's middle cell).
     Users,
     /// Prompt tokens, at the base answer size and users.
@@ -964,7 +898,7 @@ impl Sweep {
 
 /// One bar chart: the sweep's points on x, each a category in the order
 /// measured, a bar per series at each.
-fn bar_chart(
+pub(super) fn bar_chart(
     series: &[Series],
     xs: &[u32],
     (title, ylabel): (&str, &str),
@@ -1104,7 +1038,12 @@ fn sweep_cells(cells: &[Cell], sweep: Sweep) -> BTreeMap<u32, &Cell> {
 /// is compared with, each scratchy (blue) against that one engine (orange)
 /// with scratchy's previous run in grey behind, so however many engines a run
 /// has, no chart holds more than three lines.
-fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep) -> Element {
+pub(super) fn sweep_part<'a>(
+    m: &'a Model,
+    run: &Run,
+    prev: Option<Entry<'a>>,
+    sweep: Sweep,
+) -> Element {
     let map_of = |mm: &'a Model, rr: &Run, e: Engine| -> BTreeMap<u32, &'a Cell> {
         match sweep {
             Sweep::Users => by_users(mm, rr, e),
@@ -1271,10 +1210,7 @@ fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep
     let mut table_headers = vec![sweep.xlabel().to_string()];
     table_headers.extend(xs.iter().map(u32::to_string));
     let table_metrics: &[(Metric, &str)] = match sweep {
-        Sweep::Users => &[
-            (Metric::Throughput, "tok/s"),
-            (Metric::E2el, "E2EL ms"),
-        ],
+        Sweep::Users => &[(Metric::Throughput, "tok/s"), (Metric::E2el, "E2EL ms")],
         Sweep::Prompt => &[
             (Metric::Ttft, "TTFT ms"),
             (Metric::Throughput, "tok/s"),
@@ -1884,7 +1820,7 @@ fn versus_mini(g: &ShapeGrid, metric: Metric, e: Engine, label: &str) -> Element
     }
 }
 
-fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
+pub(super) fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
     let grids: Vec<(u32, ShapeGrid)> = grid_answers(run)
         .into_iter()
         .filter_map(|a| Some((a, ShapeGrid::of(m, run, Slice::Answer(a))?)))
@@ -2131,158 +2067,7 @@ impl Latency<'_> {
                 (!vs.is_empty()).then_some((e, vs))
             })
             .collect();
-        // Centred on the engines' medians (their geometric mean), so the factor between them sits
-        // in the middle; a request past either edge is drawn at it.
-        let medians: Vec<f64> = curves.iter().filter_map(|(_, vs)| quantile(vs, 50.0)).collect();
-        if medians.is_empty() {
-            return rsx! {};
-        }
-        let centre = (medians.iter().map(|m| m.ln()).sum::<f64>() / medians.len() as f64).exp();
-        let half = ECDF_SPAN.sqrt();
-        let (start, end) = (centre / half, centre * half);
-        // Plotted as log10(ms) on a linear axis: Carbon rounds a log axis out to whole decades,
-        // which would undo the common span.
-        let point = |group, key: f64, value: f64| SparkPoint {
-            group,
-            key: key.clamp(start, end).log10(),
-            value: Some(value),
-            upper: None,
-            lower: None,
-            factor: None,
-        };
-        let mut data: Vec<SparkPoint> = (curves.iter())
-            .flat_map(|(e, vs)| {
-                let n = vs.len() as f64;
-                std::iter::once(point(e.label(), vs[0], 0.0))
-                    .chain(
-                        (vs.iter().enumerate())
-                            .map(move |(i, &v)| point(e.label(), v, (i + 1) as f64 / n)),
-                    )
-                    .chain(std::iter::once(point(e.label(), end, 1.0)))
-            })
-            .collect();
-        let mut lines: Vec<&'static str> = curves.iter().map(|(e, _)| e.label()).collect();
-        let mut dashed: Vec<&'static str> = Vec::new();
-        if let [(_, mine), (_, theirs)] = curves.as_slice() {
-            // Each curve's share done by `x`, at every step either takes: the fills' bounds.
-            let share =
-                |vs: &[f64], x: f64| vs.partition_point(|&v| v <= x) as f64 / vs.len() as f64;
-            let mut xs: Vec<f64> = mine.iter().chain(theirs).copied().chain([end]).collect();
-            xs.sort_by(f64::total_cmp);
-            xs.dedup();
-            for x in xs {
-                let (a, b) = (share(mine, x), share(theirs, x));
-                // Each fill spans the curves where its side is ahead, and nothing elsewhere.
-                for (group, shown) in [(ECDF_AHEAD, a > b), (ECDF_BEHIND, a < b)] {
-                    let (low, high) = if shown { (a.min(b), a.max(b)) } else { (a, a) };
-                    data.push(SparkPoint {
-                        upper: Some(high),
-                        lower: Some(low),
-                        ..point(group, x, high)
-                    });
-                }
-            }
-            // Both are times, lower better: how many times sooner scratchy's median is.
-            if let (Some(m), Some(r)) = (quantile(mine, 50.0), quantile(theirs, 50.0)) {
-                let factor = r / m;
-                let group = if factor >= 1.0 {
-                    ECDF_SOONER
-                } else {
-                    ECDF_LATER
-                };
-                // The factor sits a little over the line, at its middle on the log axis.
-                let over = 0.5 + 0.12;
-                data.extend([
-                    point(group, m, 0.5),
-                    SparkPoint {
-                        upper: Some(over),
-                        lower: Some(over),
-                        factor: Some(factor),
-                        ..point(group, (m * r).sqrt(), 0.5)
-                    },
-                    point(group, r, 0.5),
-                ]);
-                lines.push(group);
-                dashed.push(group);
-            }
-        }
-        let axis = |maps_to, title, scale_type, domain| Axis {
-            maps_to,
-            // Kept on the hidden axes: Carbon's tooltip names each value by it.
-            title,
-            scale_type,
-            ticks: None,
-            include_zero: Some(false),
-            visible: Some(false),
-            domain: Some(AxisDomain::Values(domain)),
-        };
-        let fills = curves.len() == 2;
-        let spec = Chart::Combo {
-            data,
-            dashed,
-            options: ChartOptions {
-                title: String::new(),
-                axes: Axes {
-                    bottom: axis("key", "log10 ms", None, [start.log10(), end.log10()]),
-                    left: axis("value", "share of requests", None, [0.0, 1.0]),
-                },
-                color: Some(Colour::Scale {
-                    scale: (self.engines.iter().zip(["s1", "s2"]))
-                        .map(|(&e, class)| (e.label(), colour(class)))
-                        .chain([
-                            // The heat maps' cyan and red: 50 to fill, 70 for the median line.
-                            (ECDF_AHEAD, Ramp::Cyan.at::<50>()),
-                            (ECDF_BEHIND, Ramp::Red.at::<50>()),
-                            (ECDF_SOONER, Ramp::Cyan.at::<70>()),
-                            (ECDF_LATER, Ramp::Red.at::<70>()),
-                        ])
-                        .collect(),
-                }),
-                heatmap: None,
-                // Its box decides, as the mini heat maps' does: as wide as its column, as tall as
-                // ECDF_ASPECT makes it.
-                height: "100%".to_string(),
-                width: Some("100%".to_string()),
-                legend: Some(Enabled { enabled: false }),
-                locale: None,
-                // Carbon draws an area's bounds only when the layer holds one series.
-                combo: Some(
-                    (fills
-                        .then_some([ECDF_AHEAD, ECDF_BEHIND])
-                        .into_iter()
-                        .flatten())
-                    .map(|fill| ComboLayer {
-                        kind: "area",
-                        corresponding_datasets: vec![fill],
-                    })
-                    .chain([ComboLayer {
-                        kind: "line",
-                        corresponding_datasets: lines,
-                    }])
-                    .collect(),
-                ),
-                bounds: Some(Bounds {
-                    upper_bound_maps_to: "upper",
-                    lower_bound_maps_to: "lower",
-                }),
-                bubble: None,
-                line: Some(LineOptions {
-                    curve: "curveStepAfter",
-                    points: Enabled { enabled: false },
-                }),
-                // A step per request, each curve its own: no one step lists every series.
-                hover: Some(Hover::NONE),
-                toolbar: Enabled { enabled: false },
-            },
-        };
-        rsx! {
-            div { style: "position: relative; width: 100%",
-                {chart(&spec, label, &format!("width: 100%; aspect-ratio: {ECDF_ASPECT}"), None)}
-                div { style: "position: absolute; top: 0; left: 0; padding: 2px 4px; font-size: 0.625rem; font-weight: 600; pointer-events: none",
-                    for line in tag { div { "{line}" } }
-                }
-            }
-        }
+        ecdf_chart(&curves, &self.engines, tag, label)
     }
 
     /// Every cell at answer length `o` as a small multiple, users at once down and prompt size
@@ -2331,8 +2116,175 @@ impl Latency<'_> {
     }
 }
 
+/// The share of each engine's requests done within each time: one curve an engine, its times
+/// sorted, on a log axis [`ECDF_SPAN`] wide centred on their medians. With two curves, the gap
+/// between them filled the colour of whichever side is ahead, and the factor between their
+/// medians labelled. `engines` sets the colours, in the order the page keys them. Nothing when no
+/// curve has a time.
+pub(super) fn ecdf_chart(
+    curves: &[(Engine, Vec<f64>)],
+    engines: &[Engine],
+    tag: &[&str],
+    label: &str,
+) -> Element {
+    // Centred on the engines' medians (their geometric mean), so the factor between them sits
+    // in the middle; a request past either edge is drawn at it.
+    let medians: Vec<f64> = curves
+        .iter()
+        .filter_map(|(_, vs)| quantile(vs, 50.0))
+        .collect();
+    if medians.is_empty() {
+        return rsx! {};
+    }
+    let centre = (medians.iter().map(|m| m.ln()).sum::<f64>() / medians.len() as f64).exp();
+    let half = ECDF_SPAN.sqrt();
+    let (start, end) = (centre / half, centre * half);
+    // Plotted as log10(ms) on a linear axis: Carbon rounds a log axis out to whole decades,
+    // which would undo the common span.
+    let point = |group, key: f64, value: f64| SparkPoint {
+        group,
+        key: key.clamp(start, end).log10(),
+        value: Some(value),
+        upper: None,
+        lower: None,
+        factor: None,
+    };
+    let mut data: Vec<SparkPoint> = (curves.iter())
+        .flat_map(|(e, vs)| {
+            let n = vs.len() as f64;
+            std::iter::once(point(e.label(), vs[0], 0.0))
+                .chain(
+                    (vs.iter().enumerate())
+                        .map(move |(i, &v)| point(e.label(), v, (i + 1) as f64 / n)),
+                )
+                .chain(std::iter::once(point(e.label(), end, 1.0)))
+        })
+        .collect();
+    let mut lines: Vec<&'static str> = curves.iter().map(|(e, _)| e.label()).collect();
+    let mut dashed: Vec<&'static str> = Vec::new();
+    if let [(_, mine), (_, theirs)] = curves {
+        // Each curve's share done by `x`, at every step either takes: the fills' bounds.
+        let share = |vs: &[f64], x: f64| vs.partition_point(|&v| v <= x) as f64 / vs.len() as f64;
+        let mut xs: Vec<f64> = mine.iter().chain(theirs).copied().chain([end]).collect();
+        xs.sort_by(f64::total_cmp);
+        xs.dedup();
+        for x in xs {
+            let (a, b) = (share(mine, x), share(theirs, x));
+            // Each fill spans the curves where its side is ahead, and nothing elsewhere.
+            for (group, shown) in [(ECDF_AHEAD, a > b), (ECDF_BEHIND, a < b)] {
+                let (low, high) = if shown { (a.min(b), a.max(b)) } else { (a, a) };
+                data.push(SparkPoint {
+                    upper: Some(high),
+                    lower: Some(low),
+                    ..point(group, x, high)
+                });
+            }
+        }
+        // Both are times, lower better: how many times sooner scratchy's median is.
+        if let (Some(m), Some(r)) = (quantile(mine, 50.0), quantile(theirs, 50.0)) {
+            let factor = r / m;
+            let group = if factor >= 1.0 {
+                ECDF_SOONER
+            } else {
+                ECDF_LATER
+            };
+            // The factor sits a little over the line, at its middle on the log axis.
+            let over = 0.5 + 0.12;
+            data.extend([
+                point(group, m, 0.5),
+                SparkPoint {
+                    upper: Some(over),
+                    lower: Some(over),
+                    factor: Some(factor),
+                    ..point(group, (m * r).sqrt(), 0.5)
+                },
+                point(group, r, 0.5),
+            ]);
+            lines.push(group);
+            dashed.push(group);
+        }
+    }
+    let axis = |maps_to, title, scale_type, domain| Axis {
+        maps_to,
+        // Kept on the hidden axes: Carbon's tooltip names each value by it.
+        title,
+        scale_type,
+        ticks: None,
+        include_zero: Some(false),
+        visible: Some(false),
+        domain: Some(AxisDomain::Values(domain)),
+    };
+    let fills = curves.len() == 2;
+    let spec = Chart::Combo {
+        data,
+        dashed,
+        options: ChartOptions {
+            title: String::new(),
+            axes: Axes {
+                bottom: axis("key", "log10 ms", None, [start.log10(), end.log10()]),
+                left: axis("value", "share of requests", None, [0.0, 1.0]),
+            },
+            color: Some(Colour::Scale {
+                scale: (engines.iter().zip(["s1", "s2"]))
+                    .map(|(&e, class)| (e.label(), colour(class)))
+                    .chain([
+                        // The heat maps' cyan and red: 50 to fill, 70 for the median line.
+                        (ECDF_AHEAD, Ramp::Cyan.at::<50>()),
+                        (ECDF_BEHIND, Ramp::Red.at::<50>()),
+                        (ECDF_SOONER, Ramp::Cyan.at::<70>()),
+                        (ECDF_LATER, Ramp::Red.at::<70>()),
+                    ])
+                    .collect(),
+            }),
+            heatmap: None,
+            // Its box decides, as the mini heat maps' does: as wide as its column, as tall as
+            // ECDF_ASPECT makes it.
+            height: "100%".to_string(),
+            width: Some("100%".to_string()),
+            legend: Some(Enabled { enabled: false }),
+            locale: None,
+            // Carbon draws an area's bounds only when the layer holds one series.
+            combo: Some(
+                (fills
+                    .then_some([ECDF_AHEAD, ECDF_BEHIND])
+                    .into_iter()
+                    .flatten())
+                .map(|fill| ComboLayer {
+                    kind: "area",
+                    corresponding_datasets: vec![fill],
+                })
+                .chain([ComboLayer {
+                    kind: "line",
+                    corresponding_datasets: lines,
+                }])
+                .collect(),
+            ),
+            bounds: Some(Bounds {
+                upper_bound_maps_to: "upper",
+                lower_bound_maps_to: "lower",
+            }),
+            bubble: None,
+            line: Some(LineOptions {
+                curve: "curveStepAfter",
+                points: Enabled { enabled: false },
+            }),
+            // A step per request, each curve its own: no one step lists every series.
+            hover: Some(Hover::NONE),
+            toolbar: Enabled { enabled: false },
+        },
+    };
+    rsx! {
+        div { style: "position: relative; width: 100%",
+            {chart(&spec, label, &format!("width: 100%; aspect-ratio: {ECDF_ASPECT}"), None)}
+            div { style: "position: absolute; top: 0; left: 0; padding: 2px 4px; font-size: 0.625rem; font-weight: 600; pointer-events: none",
+                for line in tag { div { "{line}" } }
+            }
+        }
+    }
+}
+
 /// A users count with its unit: "1 user", "4 users".
-fn users_at(u: u32) -> String {
+pub(super) fn users_at(u: u32) -> String {
     if u == 1 {
         "1 user".to_string()
     } else {
@@ -2357,7 +2309,7 @@ const ECDF_ASPECT: &str = "9 / 5";
 
 /// The latency tab's prompt columns: at least wide enough that at [`ECDF_ASPECT`] each of a
 /// cell's 50 requests is some 3px up its share axis; the tab's tile widens to hold them.
-const ECDF_COLUMN: &str = "minmax(16rem, 1fr)";
+pub(super) const ECDF_COLUMN: &str = "minmax(16rem, 1fr)";
 
 /// The ratio every latency ECDF spans edge to edge, so a ratio is one width on all of them
 /// ([`Latency::ecdf`]): ×1.8 a little over half. Over the runs published by 2026-10-30, it holds
@@ -2452,7 +2404,7 @@ fn latency_legend(engines: &[Engine]) -> Element {
 
 /// An engine's name after a dot of its series colour `class`: one entry of a legend, or a key in
 /// running text.
-fn engine_key(e: Engine, class: &str) -> Element {
+pub(super) fn engine_key(e: Engine, class: &str) -> Element {
     rsx! {
         span { style: "display: inline-flex; gap: 0.4rem; align-items: center",
             span { style: "width: 10px; height: 10px; border-radius: 50%; background: {colour(class)}" }
@@ -2485,7 +2437,7 @@ impl Axes2 {
 /// Every request of every grid cell, time to first token against time per output token, a dot
 /// each, scratchy against its rival: per answer length a small multiple, users at once down,
 /// prompt size across, each panel on its own axes or every one on the same (a switch).
-fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
+pub(super) fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
     let Some(l) = Latency::of(m, run) else {
         return rsx! {};
     };
@@ -2510,8 +2462,9 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
             UsersNamed::Beside,
             |(u, o, i)| match Load::of(u) {
                 Load::Alone => {
-                    let about =
-                        format!("TTFT against TPOT, every request, {i} in {o} out {u} at once, {mid}");
+                    let about = format!(
+                        "TTFT against TPOT, every request, {i} in {o} out {u} at once, {mid}"
+                    );
                     l.chart((u, o, i), span, axes, PANEL_SIDE, &about)
                 }
                 Load::Shared => {
@@ -2599,10 +2552,6 @@ fn quantile(sorted: &[f64], p: f64) -> Option<f64> {
     let k = last as f64 * p / 100.0;
     let (f, c) = (k.floor() as usize, (k.ceil() as usize).min(last));
     Some(sorted[f] + (sorted[c] - sorted[f]) * (k - k.floor()))
-}
-
-fn commit(run: &Run) -> Element {
-    rsx! { a { href: "{REPO}/commit/{run.repo.sha}", code { "{run.repo.sha8()}" } } }
 }
 
 /// The numbers a model's timeline follows across its runs on a machine: its one-user throughput
@@ -2699,75 +2648,71 @@ fn model_timelines(entries: &[Entry]) -> Vec<(&'static str, Element)> {
         .collect()
 }
 
-/// The dataset workloads a model's timeline follows, each at 1 user: speed on chat, and on a
-/// retrieval question over its passages.
-const TASK_TIMELINES: [(&str, &str); 2] = [
-    ("sharegpt", "ShareGPT TTFT ms, 1 user"),
-    ("rag", "RAG TTFT ms, 1 user"),
-];
-
-/// A model's dataset timelines over its runs on a machine, oldest first: for each of
-/// [`TASK_TIMELINES`], the runs that ran that workload at 1 user, scratchy's time to its first token
-/// and the first rival any of them measured, each a run's own (a borrowed cell is no point of its
-/// own, and its line goes dotted there, as the grid's does). Labelled at the first run with both
-/// and the newest, as [`model_timelines`] is. Empty with fewer than two such runs.
-fn task_timelines(entries: &[Entry]) -> Vec<(&'static str, Element)> {
-    let own = |e: &Entry, engine: Engine, w: &str| -> Option<f64> {
+/// One dataset's timeline over a model's runs on a machine, oldest first: the runs that ran it at
+/// 1 user, scratchy's time to its first token and the first rival any of them measured, each a
+/// run's own (a borrowed cell is no point of its own, and its line goes dotted there, as the
+/// grid's does). Labelled at the first run with both and the newest, as [`model_timelines`] is.
+/// None with fewer than two such runs.
+pub(super) fn task_timeline(entries: &[Entry], dataset: &str) -> Option<Element> {
+    let own = |e: &Entry, engine: Engine| -> Option<f64> {
         (engine.tasks(e.m).iter())
-            .find(|c| c.workload == w && c.conc == 1 && c.measured() && c.borrowed_from.is_none())
+            .find(|c| {
+                c.workload == dataset && c.conc == 1 && c.measured() && c.borrowed_from.is_none()
+            })
             .and_then(|c| c.median_ttft_ms)
     };
     // A MuSiQue line since its tasks were last drawn differently: a change of questions is no
     // regression. Every other workload's tasks are as they were, so its line runs on.
     let newest = entries.last().map(|e| task_sample(&e.run.config));
-    let mut charts = Vec::new();
-    for (w, value) in TASK_TIMELINES {
-        let kept: Vec<&Entry> = (entries.iter())
-            .filter(|e| own(e, Engine::Scratchy, w).is_some())
-            .filter(|e| !sampled_from_musique(w) || Some(task_sample(&e.run.config)) == newest)
-            .collect();
-        if kept.len() < 2 {
-            continue;
-        }
-        let rival = Engine::RIVALS
-            .into_iter()
-            .find(|&r| kept.iter().any(|e| own(e, r, w).is_some()));
-        let mut steps: Vec<Step> = (kept.iter().enumerate())
-            .map(|(i, e)| Step {
-                x: 2f64.powi(i as i32),
-                scratchy: own(e, Engine::Scratchy, w),
-                rival: rival.and_then(|r| own(e, r, w)),
-                highlight: false,
-            })
-            .collect();
-        timeline_highlights(&mut steps);
-        let names: Vec<String> = (kept.iter())
-            .map(|e| e.run.generated_utc.month_day().to_string())
-            .collect();
-        let against = rival.map_or("alone".to_string(), |r| format!("against {}", r.label()));
-        let chart = sparkline(
-            &steps,
-            SparkAxes {
-                better: Metric::Ttft.better(),
-                along: "run",
-                value,
-                carry: true,
-            },
-            Engine::Scratchy.side(),
-            rival.unwrap_or(Engine::Scratchy).side(),
-            Some(names),
-            "5rem",
-            &format!("{value} over its runs, scratchy {against}"),
-        );
-        charts.push((value, chart));
+    let kept: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| own(e, Engine::Scratchy).is_some())
+        .filter(|e| !sampled_from_musique(dataset) || Some(task_sample(&e.run.config)) == newest)
+        .collect();
+    if kept.len() < 2 {
+        return None;
     }
-    charts
+    let rival = Engine::RIVALS
+        .into_iter()
+        .find(|&r| kept.iter().any(|e| own(e, r).is_some()));
+    let mut steps: Vec<Step> = (kept.iter().enumerate())
+        .map(|(i, e)| Step {
+            x: 2f64.powi(i as i32),
+            scratchy: own(e, Engine::Scratchy),
+            rival: rival.and_then(|r| own(e, r)),
+            highlight: false,
+        })
+        .collect();
+    timeline_highlights(&mut steps);
+    let names: Vec<String> = kept
+        .iter()
+        .map(|e| e.run.generated_utc.month_day().to_string())
+        .collect();
+    let against = rival.map_or("alone".to_string(), |r| format!("against {}", r.label()));
+    let stem = &kept[0].m.stem;
+    Some(sparkline(
+        &steps,
+        SparkAxes {
+            better: Metric::Ttft.better(),
+            along: "run",
+            value: "TTFT ms, 1 user",
+            carry: true,
+        },
+        Engine::Scratchy.side(),
+        rival.unwrap_or(Engine::Scratchy).side(),
+        Some(names),
+        "5rem",
+        &format!("{stem}: TTFT at 1 user over its runs, scratchy {against}"),
+    ))
 }
 
-/// The Over time section's charts, titled: none until some model of the current lineup has two
-/// runs of one shape on one machine. Only the current lineup, as in the overview ([`lineup`]): a
-/// model an older round ran keeps its runs in its machine's own section.
-fn over_time_charts(machines: &BTreeMap<&str, MachineRuns>, chip: &str) -> Vec<(String, Element)> {
+/// One machine's random-token timelines, titled by model and measure: none until some model of
+/// the current lineup has two runs of one shape there. The dataset timelines are each dataset's
+/// own section's ([`datasets`]).
+pub(super) fn over_time_charts(
+    machines: &BTreeMap<&str, MachineRuns>,
+    chip: &str,
+) -> Vec<(String, Element)> {
     let classes = lineup(machines).map_or(&[][..], |l| l.classes);
     let current = |stem: &str| classes.iter().any(|c| c.small == stem || c.large == stem);
     let mut charts = Vec::new();
@@ -2775,130 +2720,11 @@ fn over_time_charts(machines: &BTreeMap<&str, MachineRuns>, chip: &str) -> Vec<(
         return charts;
     };
     for (stem, entries) in mr.models.iter().filter(|(s, _)| current(s)) {
-        for (value, chart) in model_timelines(entries)
-            .into_iter()
-            .chain(task_timelines(entries))
-        {
+        for (value, chart) in model_timelines(entries) {
             charts.push((format!("{stem} · {value}"), chart));
         }
     }
     charts
-}
-
-/// The Over time section, one block a Mac: each current model's one-user throughput and time to
-/// first token against its rival, over every run the Mac has published (history/ included) of the
-/// model's newest shape. Nothing where no model has two such runs.
-fn over_time(machines: &BTreeMap<&str, MachineRuns>) -> Option<Element> {
-    let blocks: Vec<(&str, Vec<(String, Element)>)> = (in_order(machines).into_iter())
-        .map(|chip| (chip, over_time_charts(machines, chip)))
-        .filter(|(_, charts)| !charts.is_empty())
-        .collect();
-    if blocks.is_empty() {
-        return None;
-    }
-    let grid = "display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); \
-                column-gap: 1.5rem; row-gap: 1.25rem; align-items: start";
-    Some(rsx! {
-        Section { id: "over-time", level: 2,
-            Stack { gap: 4,
-                Heading { "Over time" }
-                p {
-                    "Each model's one-user throughput and time to first token at its base cell, a \
-                     point a run on its Mac, oldest first, over every run the Mac has published \
-                     (the older ones are kept in "
-                    code { "site/data/metal/history/" }
-                    "), scratchy against the first engine any run there measured. A run of \
-                     scratchy alone (a quick run) takes the other engine's line dotted, carried from \
-                     the last run that measured it, and the fill between the lines follows it. The \
-                     fill is labelled with its ×-factor at the first run and the newest: where \
-                     scratchy started, and where it stands now."
-                }
-                for (chip, charts) in blocks {
-                    Stack { gap: 3,
-                        strong { "{chip}" }
-                        div { style: "{grid}",
-                            for (title, chart) in charts {
-                                div {
-                                    p { style: "font-size: 0.875rem; margin: 0 0 0.25rem", "{title}" }
-                                    {chart}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    })
-}
-
-fn history(entries: &[Entry]) -> Element {
-    if entries.len() < 2 {
-        return rsx! {};
-    }
-    rsx! {
-        Fold { title: "Runs of this model ({entries.len()})",
-            Table {
-                headers: headers(["run", "scratchy", "quant", "cold s", "1st req s", "warm ms", "tok/s, 1 user", "tok/s, most users", "TPOT ms, most users"]),
-                for Entry { run, m } in entries.iter().rev() {
-                    TableRow {
-                        TableCell { "{run.generated_utc.date()}" }
-                        TableCell { {commit(run)} }
-                        TableCell { "{m.quant.as_deref().unwrap_or_default()}" }
-                        if served(m) {
-                            {
-                                let ladder = Engine::Scratchy.ladder(m);
-                                let us = by_users(m, run, Engine::Scratchy);
-                                let one = us.get(&1).copied();
-                                let many = us.keys().max().filter(|&&n| n != 0).and_then(|n| us.get(n).copied());
-                                let vals = [
-                                    fmt(med(ladder, Scenario::Cold, Startup::Ready), 2),
-                                    fmt(med(ladder, Scenario::Cold, Startup::FirstToken), 2),
-                                    fmt(med(ladder, Scenario::Warm, Startup::FirstToken).map(|v| v * 1000.0), 0),
-                                    // Every cell's number through cfmt, so a dead or failed
-                                    // one carries its mark like the TPOT beside it.
-                                    cfmt(one, Metric::Throughput),
-                                    cfmt(many, Metric::Throughput),
-                                    cfmt(many, Metric::Tpot),
-                                ];
-                                rsx! { for v in vals { TableCell { "{v}" } } }
-                            }
-                        } else {
-                            TableCell { colspan: 6, "no numbers" }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn runs_table(runs: &[&Run]) -> Element {
-    rsx! {
-        Fold { title: "Runs on this machine ({runs.len()})",
-            Table {
-                headers: headers(["when", "scratchy", "steps", "cold priming launches", "scratchy KV cache", "scratchy serve flags", "engine versions", "pinned", "data"]),
-                for run in runs.iter().rev() {
-                    {
-                        let [(_, flags), (_, kv)] = settings(run);
-                        let file = run.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        rsx! {
-                            TableRow {
-                                TableCell { "{run.generated_utc.minute()} UTC" }
-                                TableCell { {commit(run)} }
-                                TableCell { "{run.config.scenarios.join(\", \")}" }
-                                TableCell { {run.config.cold_priming_launches.map_or("not recorded".to_string(), |n| n.to_string())} }
-                                TableCell { "{kv}" }
-                                TableCell { code { "{flags}" } }
-                                TableCell { "{engine_versions(run)}" }
-                                TableCell { "{pinned(run)}" }
-                                TableCell { a { href: "{DATA}/{file}", "json" } }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// How many of the overview's heat map squares have their factor written in
@@ -2943,10 +2769,7 @@ impl GlanceGrid {
             .flat_map(|&u| prompts.iter().map(move |&i| (u, i)))
             .map(|(u, i)| (u, i, g.versus(metric, (u, i), rival).0))
             .collect();
-        Ok(GlanceGrid {
-            rival,
-            cells,
-        })
+        Ok(GlanceGrid { rival, cells })
     }
 }
 
@@ -2981,7 +2804,11 @@ enum Load {
 
 impl Load {
     fn of(users: u32) -> Load {
-        if users == 1 { Load::Alone } else { Load::Shared }
+        if users == 1 {
+            Load::Alone
+        } else {
+            Load::Shared
+        }
     }
 
     fn users(self, all: &[u32]) -> Vec<u32> {
@@ -3015,8 +2842,8 @@ impl Shape {
 /// `small_everywhere`) or, in a lineup from before that, its large one from `large_from_gb`, and
 /// each [`Set`] its own map shape. A square its run did not measure (a run of an older shape, or a prompt the Mac's memory
 /// did not hold) is blank.
-struct Lineup<'a> {
-    classes: &'a [data::Class],
+pub(super) struct Lineup<'a> {
+    pub(super) classes: &'a [data::Class],
     large_from_gb: u32,
     /// Every Mac runs the small set ([`data::Config::default_set`]), so a column is one model on
     /// every chip; false for a lineup from before it, which ran the large set from 64 GB.
@@ -3025,7 +2852,7 @@ struct Lineup<'a> {
 }
 
 impl Lineup<'_> {
-    fn model(&self, class: &str, memory_gb: u32) -> Option<&str> {
+    pub(super) fn model(&self, class: &str, memory_gb: u32) -> Option<&str> {
         (self.classes.iter())
             .find(|c| c.class == class)
             .map(|c| c.model(memory_gb, self.large_from_gb, self.small_everywhere))
@@ -3040,7 +2867,7 @@ impl Lineup<'_> {
 /// per set the grid of the set's newest run that records a lineup too, else of its newest run with
 /// a grid at all, so a `--no-scaling` run does not empty the set's maps. None before any run
 /// records a lineup.
-fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<Lineup<'a>> {
+pub(super) fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<Lineup<'a>> {
     let mut runs: Vec<&Run> = (machines.values())
         .flat_map(|mr| mr.runs.iter().copied())
         .collect();
@@ -3073,10 +2900,13 @@ fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<Lineup<'a>> 
     })
 }
 
-/// Every model's users-by-prompt grid on every machine as small multiples,
-/// one table per metric: a machine per row, a model per column, each cell that
-/// model's grid as a tiny heatmap coloured like the full ones.
-fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
+/// The random-token grid's summary map and latency distributions, the Random tokens section's top
+/// half: [`glance`]'s heat map and latency panel, without its section, tabs or dataset maps.
+pub(super) fn grid_glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
+    glance_of(machines, true)
+}
+
+fn glance_of(machines: &BTreeMap<&str, MachineRuns>, grid_only: bool) -> Element {
     // A column per architecture class ([`Lineup`]); each machine's row shows the class's model:
     // the small one on every Mac where the lineup's newest default run took the small set
     // everywhere, else the small set below the lineup's `large_from_gb` and the large one from it,
@@ -3242,7 +3072,10 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             Prompts,
             Measure(&'a str, GridMetric, u32),
         }
-        let most = (lineup.shapes.values()).map(|s| s.prompts.len()).max().unwrap_or(0);
+        let most = (lineup.shapes.values())
+            .map(|s| s.prompts.len())
+            .max()
+            .unwrap_or(0);
         let col = |k: usize, p: usize| 3 + k * most + p;
         let mut lines: Vec<Line> = vec![Line::Classes, Line::Models, Line::Prompts];
         // Each machine's label spans its rows: (machine, first line, last line).
@@ -3251,7 +3084,12 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             let start = lines.len();
             let users = &shape(chip).users;
             for &gm in &GRID_METRICS {
-                lines.extend(gm.load.users(users).into_iter().map(|u| Line::Measure(chip, gm, u)));
+                lines.extend(
+                    gm.load
+                        .users(users)
+                        .into_iter()
+                        .map(|u| Line::Measure(chip, gm, u)),
+                );
             }
             spans.push((chip, start, lines.len() - 1));
         }
@@ -3265,8 +3103,10 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             }
             names.join(" / ")
         };
-        let template_columns =
-            format!("max-content max-content repeat({}, 2.25rem)", classes.len() * most);
+        let template_columns = format!(
+            "max-content max-content repeat({}, 2.25rem)",
+            classes.len() * most
+        );
         let k_prompt = |i: u32| {
             if i >= 1024 && i.is_multiple_of(1024) {
                 format!("{}k", i / 1024)
@@ -3285,13 +3125,21 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                     sizes.push(i);
                 }
             }
-            sizes.into_iter().map(k_prompt).collect::<Vec<_>>().join("/")
+            sizes
+                .into_iter()
+                .map(k_prompt)
+                .collect::<Vec<_>>()
+                .join("/")
         };
         // A row's slowest and fastest ratio, over every model and prompt size in it, printed at
         // its right.
         let range = |chip: &str, gm: GridMetric, u: u32| -> Option<(f64, f64)> {
             (classes.iter())
-                .filter_map(|class| grids[&(chip, model_of(chip, class)?, gm.name)].as_ref().ok())
+                .filter_map(|class| {
+                    grids[&(chip, model_of(chip, class)?, gm.name)]
+                        .as_ref()
+                        .ok()
+                })
                 .flat_map(|g| g.cells.iter().filter(|c| c.0 == u).filter_map(|c| c.2))
                 .fold(None, |acc, r| match acc {
                     None => Some((r, r)),
@@ -3307,7 +3155,14 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
         // Each square with Carbon's tooltip: the square is its trigger, focusable so a keyboard
         // opens it too; the tooltip gives the ratio (or why there is none), the model on its
         // machine, and the measure, prompt size and users.
-        let square = |chip: &str, stem: &str, gm: GridMetric, u: u32, i: u32, align: &str, place: String| -> Element {
+        let square = |chip: &str,
+                      stem: &str,
+                      gm: GridMetric,
+                      u: u32,
+                      i: u32,
+                      align: &str,
+                      place: String|
+         -> Element {
             let ratio = match &grids[&(chip, stem, gm.name)] {
                 Ok(g) => match g.cells.iter().find(|&&(cu, ci, _)| (cu, ci) == (u, i)) {
                     Some(&(_, _, Some(r))) => Ok((r, g.rival)),
@@ -3318,7 +3173,13 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             let (fill, label, verdict) = match ratio {
                 Ok((r, rival)) => {
                     let step = ratio_step(r);
-                    let shown = highlights.contains(&Square { chip, stem, metric: gm.name, users: u, prompt: i });
+                    let shown = highlights.contains(&Square {
+                        chip,
+                        stem,
+                        metric: gm.name,
+                        users: u,
+                        prompt: i,
+                    });
                     // The steps far from ×1 are dark in light mode and light in dark mode.
                     let ink = if step.abs_diff(RATIO_STEPS.len() / 2) >= 6 {
                         "light-dark(#ffffff, #161616)"
@@ -3499,6 +3360,24 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     } else {
         slug(ONE_MAP)
     };
+    if grid_only {
+        // The Summary tab's body: the tab names it, and the latency has a tab of its own.
+        return rsx! {
+            div { style: "width: fit-content; max-width: 100%",
+                Stack { gap: 4,
+                    p { style: "contain: inline-size",
+                        "Every Mac, model and measure in one map at {answers}-token answers: a column per \
+                         prompt size under each model, shortest first, and under each Mac, with 1 user, P its \
+                         prefill (time to first token) and D its decode (time per output token), then 2u and 4u \
+                         its end-to-end time with 2 and 4 users. Colour is how many times faster scratchy is \
+                         than the run's first rival, in the order {rivals}: blue faster, red slower, grey within \
+                         noise; right of each row, its slowest and fastest. Hover a square for its ratio and engine."
+                    }
+                    {one_map}
+                }
+            }
+        };
+    }
     rsx! {
         Section { id: "glance", level: 2,
             Stack { gap: 4,
@@ -3658,22 +3537,34 @@ fn latency_panel<'l>(
         let about = format!("{stem} on {chip}");
         // A 1-user cell its TTFT's and TPOT's distributions, one over the other; a cell under load
         // its end-to-end time's ([`Load`]). Each chart names its own users count, under its timing.
-        l.multiple(o, ECDF_COLUMN, &format!("{stem} · {o}-token answers"), UsersNamed::InCells, |(u, o, i)| {
-            let label = |t: RequestTiming| format!("{} of every request, {i} in {o} out {u} at once, {about}", t.title());
-            let users = users_at(u);
-            let ecdf = |t: RequestTiming, tag: &str| l.ecdf((u, o, i), t, &[tag, &users], &label(t));
-            rsx! {
-                Stack { gap: 1,
-                    match Load::of(u) {
-                        Load::Alone => rsx! {
-                            {ecdf(RequestTiming::Ttft, "TTFT")}
-                            {ecdf(RequestTiming::Tpot, "TPOT")}
-                        },
-                        Load::Shared => ecdf(RequestTiming::E2el, "E2EL"),
+        l.multiple(
+            o,
+            ECDF_COLUMN,
+            &format!("{stem} · {o}-token answers"),
+            UsersNamed::InCells,
+            |(u, o, i)| {
+                let label = |t: RequestTiming| {
+                    format!(
+                        "{} of every request, {i} in {o} out {u} at once, {about}",
+                        t.title()
+                    )
+                };
+                let users = users_at(u);
+                let ecdf =
+                    |t: RequestTiming, tag: &str| l.ecdf((u, o, i), t, &[tag, &users], &label(t));
+                rsx! {
+                    Stack { gap: 1,
+                        match Load::of(u) {
+                            Load::Alone => rsx! {
+                                {ecdf(RequestTiming::Ttft, "TTFT")}
+                                {ecdf(RequestTiming::Tpot, "TPOT")}
+                            },
+                            Load::Shared => ecdf(RequestTiming::E2el, "E2EL"),
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
     };
     let (first_chip, first_class) = (
         rows.first().copied().unwrap_or_default(),
@@ -4123,106 +4014,6 @@ const SCALING: [(&str, &str, [Trend; 2]); 2] = [
     ),
 ];
 
-fn machine_section(chip: &str, mr: &MachineRuns) -> Element {
-    let mslug = slug(chip);
-    let mc = &mr.runs[mr.runs.len() - 1].machine;
-    let cores = match mc.cores_performance.filter(|&p| p != 0) {
-        Some(p) => format!(
-            "{} cores ({p}P + {}E)",
-            mc.cores_total,
-            mc.cores_efficiency.unwrap_or(0)
-        ),
-        None => format!("{} cores", mc.cores_total),
-    };
-    rsx! {
-        Section { id: "{mslug}", level: 2,
-            Stack { gap: 4,
-                Heading { "{chip}" }
-                p { "{cores} · {mc.memory_gb} GB unified memory · macOS {mc.macos}" }
-                Tile {
-                  Layer { level: 1,
-                    Stack { gap: 5,
-                {runs_table(&mr.runs)}
-                {
-                    // Models the newest run left out here, and why: memory, so far.
-                    let newest = mr.runs[mr.runs.len() - 1];
-                    let skipped: Vec<String> = newest.skipped_models.iter().flatten()
-                        .filter(|x| mr.latest(&x.stem).is_none())
-                        .map(|x| format!("{} ({})", x.stem, x.reason.as_deref().unwrap_or("skipped")))
-                        .collect();
-                    rsx! { if !skipped.is_empty() { p { "Not run on this machine: {skipped.join(\"; \")}." } } }
-                }
-                for (stem, seen) in &mr.models {
-                    {
-                        let Entry { run, m } = seen[seen.len() - 1];
-                        // Before/after: the newest earlier run of this model, here, that scratchy served.
-                        let prev = seen[..seen.len() - 1].iter().rev().find(|e| served(e.m)).copied();
-                        let mid = format!("{mslug}-{}", slug(stem));
-                        let f = m.footprint.as_ref();
-                        let build = match f.and_then(|f| f.build_seconds) {
-                            None => String::new(),
-                            Some(s) => {
-                                let binary = f.and_then(|f| f.binary_bytes).filter(|&b| b != 0)
-                                    .map_or(String::new(), |b| format!(", {} MiB binary", (b as f64 / 1_048_576.0).round_ties_even()));
-                                format!(" · scratchy build {s} s{binary}")
-                            }
-                        };
-                        rsx! {
-                            Tile { id: mid.clone(),
-                              Section { level: 3,
-                              Layer { level: 2,
-                                Stack { gap: 6,
-                                    Stack { gap: 2,
-                                        Heading { "{stem} on {chip}" }
-                                        p {
-                                            a { href: "https://huggingface.co/{m.model_id}", "{m.model_id}" }
-                                            " · {m.quant.as_deref().unwrap_or(\"default\")}"
-                                            if let Some(rev) = m.model_files.as_ref().and_then(|f| f.revision.as_deref()) {
-                                                " · files "
-                                                a { href: "https://huggingface.co/{m.model_id}/tree/{rev}", code { "{&rev[..rev.len().min(8)]}" } }
-                                            }
-                                            "{build} · run {run.generated_utc.date()}, "
-                                            code { "{run.repo.sha8()}" }
-                                            if let Some(verdict) = parity(m) {
-                                                " · {verdict} " {parity_info()}
-                                            }
-                                        }
-                                    }
-                                    {
-                                        // An engine whose own memory guard refused the model
-                                        // outright: its columns are dashes because it never
-                                        // served. This says why, in the engine's words.
-                                        let declined: Vec<String> = Engine::ALL.iter()
-                                            .filter_map(|e| m.engine_declined.as_ref()
-                                                .and_then(|d| d.get(e.key()))
-                                                .map(|r| format!("{} — {}", e.label(), r.as_str())))
-                                            .collect();
-                                        rsx! { if !declined.is_empty() {
-                                            p { "Declined before serving: {declined.join(\"; \")}." }
-                                        } }
-                                    }
-                                    {summary_table(m, run, prev)}
-                                    {tasks::tasks_table(m)}
-                                    {sweep_part(m, run, prev, Sweep::Users)}
-                                    {grid_maps(m, &mid, run)}
-                                    {request_plots(m, &mid, run)}
-                                    {sweep_part(m, run, prev, Sweep::Prompt)}
-                                    {history(seen)}
-                                }
-                              }
-                              }
-                            }
-                        }
-                    }
-                }
-                    }
-                  }
-                }
-            }
-        }
-    }
-}
-
 /// The engines the page compares scratchy with, in [`Engine::RIVALS`] order: those any machine's
 /// shown models measured (oMLX TurboQuant under oMLX), written as a list, or None for none.
 fn rivals_named(machines: &BTreeMap<&str, MachineRuns>) -> Option<String> {
@@ -4248,6 +4039,7 @@ fn rivals_named(machines: &BTreeMap<&str, MachineRuns>) -> Option<String> {
 }
 
 pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
+    crate::charts::new_page();
     let runs = load(site)?;
     // Over time reads every published run, the ones a newer run replaced too; the rest of the
     // page shows each Mac's two newest.
@@ -4263,18 +4055,11 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
             }
         }
     } else {
-        sections.push(("glance".to_string(), "At a glance".to_string()));
-        // No link to a section that is not there.
-        let over = over_time(&all_machines);
-        if over.is_some() {
-            sections.push(("over-time".to_string(), "Over time".to_string()));
-        }
-        let order = in_order(&machines);
-        sections.extend(order.iter().map(|chip| (slug(chip), chip.to_string())));
+        // A section a dataset the shown runs measured, and a link to each: nothing else.
+        let shown = datasets::shown(&machines);
+        sections.extend(shown.iter().map(|d| (slug(d), datasets::title(d))));
         rsx! {
-            {glance(&machines)}
-            if let Some(over) = over { {over} }
-            for chip in &order { {machine_section(chip, &machines[chip])} }
+            for d in &shown { {datasets::section(d, &machines, &all_machines)} }
         }
     };
     let (count, n_machines) = (runs.len(), machines.len());
@@ -4290,8 +4075,8 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
                     Heading { "Metal performance" }
                     p {
                         "{against} on Apple \
-                         silicon: how long each takes to start, how fast it answers one user, and how it holds up as \
-                         prompts, answers and users grow. \
+                         silicon, a section a dataset: real tasks, the same to every engine, and the random-token \
+                         grid of fixed prompt and answer sizes, as users grow. \
                          {count} runs on {n_machines} machines, every number measured by "
                         a { href: "{REPO}/blob/main/scripts/bench_metal_matrix.sh", code { "scripts/bench_metal_matrix.sh" } }
                         "."
@@ -4336,6 +4121,614 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use dioxus::prelude::Element;
+
+    /// The named runs of `site/tests/fixtures/metal`, parsed.
+    fn fixtures(names: &[&str]) -> Vec<Run> {
+        (names.iter())
+            .map(|name| {
+                let p = format!("{}/tests/fixtures/metal/{name}", env!("CARGO_MANIFEST_DIR"));
+                serde_json::from_str(&std::fs::read_to_string(&p).expect(name)).expect(name)
+            })
+            .collect()
+    }
+
+    /// An element's HTML.
+    fn render(e: Element) -> String {
+        dioxus_ssr::render_element(e)
+    }
+
+    #[test]
+    fn the_page_shows_each_dataset_a_run_measured_in_their_order() {
+        let runs = fixtures(&["apple-m3-pro-2026-10-26T043309Z-2a9661c3.json"]);
+        let machines = super::index(&runs);
+        assert_eq!(
+            super::datasets::shown(&machines),
+            ["sharegpt", "rag", "rag-spans", "sharegpt-multi-turn"]
+        );
+    }
+
+    #[test]
+    fn random_tokens_is_a_dataset_where_a_run_has_grid_cells() {
+        let runs = fixtures(&["apple-m3-pro-2026-10-27T031941Z-f9739363.json"]);
+        let machines = super::index(&runs);
+        assert_eq!(super::datasets::shown(&machines), [super::datasets::RANDOM]);
+        assert_eq!(
+            super::datasets::title(super::datasets::RANDOM),
+            "Random tokens"
+        );
+    }
+
+    /// A run that kept each dataset request's timings, cut to gpt-oss-20b's sharegpt, rag and
+    /// conversation cells on scratchy and oMLX. Kept in a folder of its own: the tests that read
+    /// every fixture count runs, and it is not one of theirs.
+    const REQUESTS_FIXTURE: &str = "requests/apple-m3-pro-2026-11-02T230545Z-f9dc285a.json";
+
+    /// The scratchy cell of `workload` at `users` in a run's first model.
+    fn task_cell<'r>(run: &'r Run, workload: &str, users: u32) -> &'r super::data::TaskCell {
+        (run.models[0].tasks.iter().flatten())
+            .find(|c| c.workload == workload && c.conc == users)
+            .unwrap_or_else(|| panic!("no {workload} cell at {users} users"))
+    }
+
+    #[test]
+    fn a_dataset_cells_requests_read_from_its_run_file() {
+        use super::data::RequestTiming;
+        let runs = fixtures(&[REQUESTS_FIXTURE]);
+        let c = task_cell(&runs[0], "rag", 2);
+        let ttft = super::tasks::request_ms(c, RequestTiming::Ttft);
+        assert_eq!(ttft.len() as u32, c.completed.unwrap());
+        assert!(ttft.iter().all(|&ms| ms > 0.0));
+        let e2el = super::tasks::request_ms(c, RequestTiming::E2el);
+        assert_eq!(e2el.len(), ttft.len());
+        // A cell keeps no time per output token for each request.
+        assert!(super::tasks::request_ms(c, RequestTiming::Tpot).is_empty());
+    }
+
+    #[test]
+    fn a_dataset_cell_that_kept_no_requests_has_none() {
+        use super::data::RequestTiming;
+        let runs = fixtures(&[REQUESTS_FIXTURE]);
+        // bench serve's sharegpt workload is the completions path, which keeps no request timings.
+        let c = task_cell(&runs[0], "sharegpt", 2);
+        assert!(super::tasks::request_ms(c, RequestTiming::Ttft).is_empty());
+        let mut old = task_cell(&runs[0], "rag", 2).clone();
+        old.ttfts_ms = None;
+        assert!(super::tasks::request_ms(&old, RequestTiming::Ttft).is_empty());
+    }
+
+    #[test]
+    fn a_datasets_section_has_its_parts_in_order() {
+        let runs = fixtures(&[REQUESTS_FIXTURE]);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        let at = |s: &str| html.find(s).unwrap_or_else(|| panic!("no {s}"));
+        assert!(at("multi-document QA, MuSiQue") < at("target=\"rag-summary\""));
+        // One run is no timeline: the Over time tab says so.
+        assert!(html.contains("A timeline starts with a model"));
+        // The buttons: the machines, then the lineup's classes.
+        assert!(at("rag-latency-machine-apple-m3-pro") < at("rag-latency-model-sliding-window"));
+        // A pair a machine and class, in each of the latency tab and the detail: the lineup's
+        // four classes, gpt-oss-20b the only one this machine ran.
+        assert_eq!(html.matches("<div id=\"rag-latency-apple-m3-pro-").count(), 4);
+        assert_eq!(html.matches("<div id=\"rag-detail-apple-m3-pro-").count(), 4);
+        assert!(html.contains("Mamba-2 on Apple M3 Pro: not run yet."));
+    }
+
+    #[test]
+    fn a_machine_that_did_not_run_a_dataset_has_a_button_saying_so() {
+        // The M3 Pro ran rag; the grid-only M5 Max ran no dataset, and still has its buttons.
+        let runs = fixtures(&[
+            REQUESTS_FIXTURE,
+            "apple-m5-max-2026-10-14T111352Z-987b06a2.json",
+        ]);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("value=\"rag-latency-machine-apple-m3-pro\""));
+        assert!(html.contains("value=\"rag-latency-machine-apple-m5-max\""));
+        assert!(html.contains("on Apple M5 Max: not run yet."));
+    }
+
+    #[test]
+    fn a_dataset_cell_without_requests_says_so_in_its_latency() {
+        let runs = fixtures(&[REQUESTS_FIXTURE]);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("sharegpt", &machines, &machines));
+        assert!(html.contains("this run did not keep its requests."));
+        // The rest of the pair still draws: its table and users curves.
+        assert!(html.contains("gpt-oss-20b on Apple M3 Pro"));
+        assert!(html.contains("Users"));
+    }
+
+    /// A site whose published runs are the named fixtures alone: a fresh folder under the system's
+    /// temp dir, its data/metal holding copies of them, as over_time_takes_every_run_it_is_given
+    /// builds its Site.
+    fn site_with(names: &[&str]) -> crate::Site {
+        let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
+        let root = std::env::temp_dir().join(format!(
+            "metal-site-{}-{}",
+            std::process::id(),
+            names.len() + names.iter().map(|n| n.len()).sum::<usize>()
+        ));
+        let data = root.join(super::DATA);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(root.join("_site")).unwrap();
+        for name in names {
+            let file = std::path::Path::new(name).file_name().unwrap();
+            std::fs::copy(fixtures.join(name), data.join(file)).unwrap();
+        }
+        crate::Site {
+            repo: root.clone(),
+            out: root.join("_site"),
+            root,
+        }
+    }
+
+    #[test]
+    fn the_left_nav_lists_the_datasets_and_nothing_else() {
+        let site = site_with(&[
+            REQUESTS_FIXTURE,
+            "apple-m3-pro-2026-10-27T031941Z-f9739363.json",
+        ]);
+        let assets = crate::chrome::Published {
+            styles: String::new(),
+            favicon: String::new(),
+        };
+        super::build(&site, &assets).unwrap();
+        let html = std::fs::read_to_string(site.out.join("metal.html")).unwrap();
+        let start = html.find("<cds-side-nav").expect("a side nav");
+        let end = start + html[start..].find("</cds-side-nav>").expect("its end");
+        let nav = &html[start..end];
+        for s in ["ShareGPT chat", "MuSiQue", "Random tokens"] {
+            assert!(nav.contains(s), "no {s}");
+        }
+        for s in ["At a glance", "Over time", "Apple M3 Pro", "RAG accuracy"] {
+            assert!(!nav.contains(s), "{s} still there");
+        }
+    }
+
+    /// Every number keeps what it came from: each pair names its machine, its model's files and
+    /// build, and every run of that machine, with its commit, steps, engine versions and pins.
+    #[test]
+    fn a_pair_says_what_its_numbers_came_from() {
+        let runs = fixtures(&[REQUESTS_FIXTURE]);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        // The machine.
+        assert!(html.contains("12 cores (6P + 6E)"), "its cores");
+        assert!(html.contains("36 GB unified memory"), "its memory");
+        assert!(html.contains("macOS 26.6.2"), "its macOS");
+        // The model's files and build.
+        assert!(html.contains("2782be51"), "its files revision");
+        assert!(html.contains("scratchy build 17 s"), "its build time");
+        assert!(html.contains("53 MiB binary"), "its binary size");
+        // The runs on this machine.
+        assert!(html.contains("Runs on this machine"));
+        assert!(html.contains("f9dc285a"), "its commit");
+        assert!(html.contains("oMLX 9de79bc3"), "the rival's version");
+        assert!(
+            html.contains("cold, warm") || html.contains("frozen, cold, warm"),
+            "its steps"
+        );
+    }
+
+    /// Every model a machine ran stays on the page, not only its lineup class's current one: the
+    /// M4 Max's large set (10-28) and its small set (10-29), both published, both drawn.
+    #[test]
+    fn every_model_a_machine_ran_is_drawn() {
+        let read = |name: &str| -> Run {
+            let p = format!("{}/{}/{name}", env!("CARGO_MANIFEST_DIR"), super::DATA);
+            serde_json::from_str(&std::fs::read_to_string(&p).expect(name)).expect(name)
+        };
+        let runs = vec![
+            read("apple-m4-max-2026-10-28T041936Z-dbe48cd2.json"),
+            read("apple-m4-max-2026-10-29T013115Z-8385aba7.json"),
+        ];
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section(
+            super::datasets::RANDOM,
+            &machines,
+            &machines,
+        ));
+        for stem in [
+            "gpt-oss-120b-3bit",
+            "qwen3.5-122b-a10b",
+            "granite-4.2-30b",
+            "gpt-oss-20b",
+            "granite-4.2-3b",
+        ] {
+            assert!(
+                html.contains(&format!("{stem} on Apple M4 Max")),
+                "{stem} is not drawn"
+            );
+        }
+    }
+
+    /// The random-token section's Over time draws the grid's timelines only, each under its
+    /// machine; a dataset's timelines are its own section's. Two runs of one model on one Mac, each
+    /// with grid and dataset cells, so both kinds of timeline exist for one to leak.
+    #[test]
+    fn the_grid_section_draws_no_dataset_timeline() {
+        let grid = fixtures(&["apple-m3-pro-2026-10-27T031941Z-f9739363.json"]);
+        let both = |mut run: Run, at: &str| -> Run {
+            let gpt = grid[0]
+                .models
+                .iter()
+                .find(|m| m.stem == "gpt-oss-20b")
+                .unwrap();
+            run.models[0].scaling = gpt.scaling.clone();
+            run.generated_utc = serde_json::from_value(serde_json::json!(at)).unwrap();
+            run
+        };
+        let mut two = fixtures(&[REQUESTS_FIXTURE, REQUESTS_FIXTURE]).into_iter();
+        let runs = vec![
+            both(two.next().unwrap(), "2026-11-01T00:00:00Z"),
+            both(two.next().unwrap(), "2026-11-02T00:00:00Z"),
+        ];
+        let machines = super::index(&runs);
+        let random = render(super::datasets::section(
+            super::datasets::RANDOM,
+            &machines,
+            &machines,
+        ));
+        let rag = render(super::datasets::section("rag", &machines, &machines));
+        assert!(
+            rag.contains("Over time"),
+            "the dataset section has its timeline"
+        );
+        assert!(random.contains("Over time"), "the grid section has its own");
+        // A dataset timeline is labelled by task_timeline as its model's TTFT at 1 user over its
+        // runs; the grid's are not.
+        let dataset_chart = "TTFT at 1 user over its runs";
+        assert!(rag.contains(dataset_chart), "the dataset section draws it");
+        assert!(
+            !random.contains(dataset_chart),
+            "a dataset timeline leaked into the grid's"
+        );
+    }
+
+    /// A borrowed rival says where it came from wherever it is drawn: in the summary's label, and
+    /// beside the pair's charts and curves, not in the detail table alone.
+    #[test]
+    fn a_borrowed_rival_says_which_run_it_came_from() {
+        let mut two = fixtures(&[REQUESTS_FIXTURE, REQUESTS_FIXTURE]).into_iter();
+        let mut full = two.next().unwrap();
+        full.generated_utc =
+            serde_json::from_value(serde_json::json!("2026-10-29T00:00:00Z")).unwrap();
+        let mut quick = two.next().unwrap();
+        quick.generated_utc =
+            serde_json::from_value(serde_json::json!("2026-11-02T00:00:00Z")).unwrap();
+        // The quick run measured scratchy alone: its oMLX cells are the full run's, lent.
+        quick.models[0].tasks_omlx = None;
+        let mut runs = vec![full, quick];
+        super::borrow_earlier(&mut runs);
+        let lent =
+            (runs[1].models[0].tasks_omlx.iter().flatten()).any(|c| c.borrowed_from.is_some());
+        assert!(lent, "the quick run borrowed the full run's oMLX cells");
+        // Prompt counts on both runs' RAG cells, so the summary has buckets to draw.
+        for m in runs.iter_mut().map(|r| &mut r.models[0]) {
+            for cells in [m.tasks.as_mut(), m.tasks_omlx.as_mut()].into_iter().flatten() {
+                for c in cells.iter_mut().filter(|c| c.workload == "rag") {
+                    let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+                    c.prompt_tokens = Some(vec![Some(3200); n]);
+                }
+            }
+        }
+        let machines = super::index(&runs[1..]);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(
+            html.contains("vs oMLX (from 10-29)</strong>"),
+            "the summary names the run"
+        );
+        // The page escapes the apostrophe.
+        assert!(
+            html.contains("oMLX&#39;s numbers here are from its 10-29 run"),
+            "the pair says it"
+        );
+    }
+
+    /// A model run more than once on a machine keeps its before and after: the previous run's line
+    /// behind the curves, a table of its runs, and what differs from the previous run besides the
+    /// code. The M3 Pro's two published grid runs of gpt-oss-20b, 10-29 and 11-03.
+    #[test]
+    fn a_model_run_twice_shows_its_before_and_after() {
+        let read = |name: &str| -> Run {
+            let p = format!("{}/{}/{name}", env!("CARGO_MANIFEST_DIR"), super::DATA);
+            serde_json::from_str(&std::fs::read_to_string(&p).expect(name)).expect(name)
+        };
+        let runs = vec![
+            read("apple-m3-pro-2026-10-29T002524Z-8385aba7.json"),
+            read("apple-m3-pro-2026-11-03T081127Z-11091c9a.json"),
+        ];
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section(
+            super::datasets::RANDOM,
+            &machines,
+            &machines,
+        ));
+        assert!(
+            html.contains("Runs of this model (2)"),
+            "the model's runs table"
+        );
+        assert!(
+            html.contains("Previous run here"),
+            "the previous run is named"
+        );
+        // The previous run's faint line behind scratchy's, on the users curves.
+        assert!(html.contains("prev"), "the previous run's line");
+    }
+
+    /// A workload the page does not know yet keeps its own section and nav link, under its own
+    /// name: two of them never collapse into one.
+    #[test]
+    fn a_workload_the_page_does_not_know_keeps_its_own_section() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        for (cells, to) in [(
+            runs[0].models[0].tasks.as_mut().unwrap(),
+            ["new-one", "new-two"],
+        )] {
+            for c in cells.iter_mut() {
+                if c.workload == "rag" {
+                    c.workload = to[0].into();
+                } else if c.workload == "sharegpt" {
+                    c.workload = to[1].into();
+                }
+            }
+        }
+        let machines = super::index(&runs);
+        let shown = super::datasets::shown(&machines);
+        assert!(
+            shown.contains(&"new-one") && shown.contains(&"new-two"),
+            "{shown:?}"
+        );
+        let html = render(super::datasets::section("new-two", &machines, &machines));
+        assert!(html.contains("id=\"new-two\""), "its own section");
+    }
+
+    /// A dataset's summary is set against the engine its pair is, the first that measured that
+    /// dataset: not one that measured only another.
+    #[test]
+    fn a_datasets_summary_uses_the_pairs_rival() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        // oMLX TurboQuant, ahead of oMLX among the rivals, measured sharegpt only.
+        let m = &mut runs[0].models[0];
+        let sharegpt: Vec<_> = (m.tasks_omlx.iter().flatten())
+            .filter(|c| c.workload == "sharegpt")
+            .cloned()
+            .collect();
+        m.tasks_omlx_tq = Some(sharegpt);
+        let m = &runs[0].models[0];
+        let pair = super::tasks::rival_of(m, "rag").expect("a rag rival");
+        assert_eq!(pair.label(), "oMLX", "not TurboQuant, which ran no rag");
+    }
+
+    /// A dataset's summary is the random-token map's look: per machine a row each for prefill
+    /// and decode at 1 user and end-to-end time at each users count above it (P, D, 2u, 4u), per
+    /// model a column each for its prompt-length buckets, each square scratchy's median against
+    /// the rival's over that bucket's requests. Read where the run kept its prompt counts.
+    #[test]
+    fn a_datasets_summary_is_the_grid_maps_look_by_prompt_length() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        // The fixture is from before cells kept prompt counts: give its RAG cells some, two
+        // requests in the 2.5 to 3k bucket and the rest in 3 to 3.5k.
+        let m = &mut runs[0].models[0];
+        for cells in [m.tasks.as_mut(), m.tasks_omlx.as_mut()].into_iter().flatten() {
+            for c in cells.iter_mut().filter(|c| c.workload == "rag") {
+                let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+                c.prompt_tokens = Some((0..n).map(|i| Some(if i < 2 { 2700 } else { 3200 })).collect());
+                c.tpots_ms = Some(vec![Some(20.0); n]);
+            }
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("id=\"rag-summary-scale\""), "its own ratio scale");
+        // The rows the random-token map has, for this machine's users counts.
+        for row in [">P<", ">D<", ">2u<", ">4u<"] {
+            assert!(html.contains(row), "no {row} row");
+        }
+        // A column a bucket under its model's class.
+        // The page escapes the less-than sign.
+        for b in super::buckets::BUCKETS {
+            let label = b.0.replace('<', "&#60;");
+            assert!(html.contains(&format!(">{label}<")), "no {} column", b.0);
+        }
+        assert!(html.contains(">Sliding window<"), "the class over its model's buckets");
+        // Squares of the grid's size: 4 rows by 5 buckets for its one model.
+        let squares = html.matches("width: 2.25rem; height: 2.25rem").count();
+        assert_eq!(squares, 4 * 5);
+        // A bucket with requests on both engines has a ratio, named with its rival and bucket.
+        assert!(html.contains("vs oMLX</strong>"), "a ratio against its rival");
+        assert!(html.contains("3–3.5k prompt tokens"), "its bucket in its tooltip");
+        // One with none says so.
+        assert!(html.contains("no requests this long"));
+    }
+
+    /// A run from before cells kept prompt counts has no buckets to draw: its summary says so,
+    /// rather than drawing a map of empty squares.
+    #[test]
+    fn a_summary_of_runs_without_prompt_counts_says_so() {
+        let runs = fixtures(&[REQUESTS_FIXTURE]);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("by prompt length from runs that kept each request"));
+        assert_eq!(html.matches("width: 2.25rem; height: 2.25rem").count(), 0);
+    }
+
+    /// A dataset's accuracy cell is no dataset of its own: the page lists no section for it. Its
+    /// result is a row of MuSiQue's detail table, not a line under the summary map too.
+    #[test]
+    fn the_accuracy_cell_is_musiques_not_a_section() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let m = &mut runs[0].models[0];
+        let cell = |acc: f64| -> super::data::TaskCell {
+            serde_json::from_value(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
+                "completed": 400, "num_tasks": 400, "accuracy": acc, "thinking_answers": 0,
+                "capped_answers": 0, "median_ttft_ms": 4000.0}))
+            .unwrap()
+        };
+        m.tasks.as_mut().unwrap().push(cell(0.48));
+        m.tasks_omlx.as_mut().unwrap().push(cell(0.45));
+        let machines = super::index(&runs);
+        let shown = super::datasets::shown(&machines);
+        assert!(!shown.contains(&"rag-accuracy"), "{shown:?}");
+        assert!(shown.contains(&"rag"));
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(
+            !html.contains("Accuracy, 400 tasks at 4 users"),
+            "no accuracy line under the map"
+        );
+        assert!(html.contains(">MuSiQue accuracy<"), "its row in the table");
+        assert!(html.contains("48% of 400"));
+    }
+
+    /// MuSiQue's detail table has its accuracy cell as a row of its own, beside the cells at each
+    /// users count: its accuracy over its tasks, by hop count, as every other row's.
+    #[test]
+    fn musiques_accuracy_cell_is_a_row_of_its_table() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let cell: super::data::TaskCell = serde_json::from_value(serde_json::json!({
+            "workload": "rag-accuracy", "conc": 4, "completed": 400, "num_tasks": 400,
+            "accuracy": 0.48, "thinking_answers": 0, "capped_answers": 0,
+            "median_ttft_ms": 4000.0, "median_e2el_ms": 7500.0, "mean_output_tokens": 23.0,
+            "accuracy_by_group": {"2": 0.53, "3": 0.46, "4": 0.38},
+        }))
+        .unwrap();
+        runs[0].models[0].tasks.as_mut().unwrap().push(cell);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains(">MuSiQue accuracy<"), "its own row");
+        assert!(html.contains("48% of 400 (2-hop 53%, 3-hop 46%, 4-hop 38%)"));
+        // Its columns say what they are: accuracy, and energy a right answer.
+        assert!(html.contains(">accuracy<"), "the accuracy column");
+        assert!(html.contains(">J/right answer<"), "energy a right answer");
+        assert!(!html.contains(">right<"), "a column read as a direction");
+    }
+
+    /// A dataset's section is three tabs (Summary, Latency distributions, Over time), each its own
+    /// panel, under the machine and model strips; the detail of the chosen pair is below the tabs,
+    /// always shown, not a tab of its own.
+    #[test]
+    fn a_datasets_section_is_three_tabs_and_the_detail_below() {
+        let runs = fixtures(&[REQUESTS_FIXTURE]);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        let at = |s: &str| html.find(s).unwrap_or_else(|| panic!("no {s}"));
+        let tab = |t: &str| at(&format!("target=\"rag-{}\"", super::slug(t)));
+        assert!(tab("Summary") < tab("Latency distributions"));
+        assert!(tab("Latency distributions") < tab("Over time"));
+        assert!(!html.contains("target=\"rag-detail\""), "the detail is no tab");
+        // The latency tab chooses its own machine and model, inside it, as main's does.
+        let latency = at("id=\"rag-latency-distributions\" data-panel");
+        let over_time = at("id=\"rag-over-time\" data-panel");
+        let picker = at("id=\"rag-latency-machines\"");
+        assert!(latency < picker && picker < over_time, "the latency tab's own buttons");
+        assert!(at("id=\"rag-latency-models\"") < over_time);
+        assert!(latency < at(" versus ") && at(" versus ") < over_time);
+        // The detail below the tabs, its own buttons over it.
+        let detail = at("id=\"rag-detail-machines\"");
+        assert!(over_time < detail && detail < at("data-pair=\"rag-detail\""));
+    }
+
+    /// Every machine and model class of the lineup gets a button, in both the latency tab and the
+    /// detail, as main's latency tab has them: one with nothing measured yet says so.
+    #[test]
+    fn every_machine_and_class_has_a_button_though_it_ran_nothing() {
+        let runs = fixtures(&[
+            REQUESTS_FIXTURE,
+            "apple-m4-max-2026-10-13T221900Z-2683d8c3.json",
+            "apple-m5-max-2026-10-14T111352Z-987b06a2.json",
+        ]);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        for which in ["latency", "detail"] {
+            for chip in ["apple-m3-pro", "apple-m4-max", "apple-m5-max"] {
+                assert!(
+                    html.contains(&format!("value=\"rag-{which}-machine-{chip}\"")),
+                    "no {chip} in the {which} buttons"
+                );
+            }
+            for class in ["sliding-window", "mamba-2", "gated-deltanet", "dense"] {
+                assert!(
+                    html.contains(&format!("value=\"rag-{which}-model-{class}\"")),
+                    "no {class} in the {which} buttons"
+                );
+            }
+        }
+        // The M4 Max ran no MuSiQue: its pair says so.
+        assert!(html.contains("not run yet"));
+        // Each button names the model it shows, not its class: gpt-oss-20b, not Sliding window.
+        assert!(html.contains(">gpt-oss-20b</cds-tab>"), "a button named for its model");
+        assert!(!html.contains(">Sliding window</cds-tab>"), "a class name on a button");
+        // The script finds the pairs it hides and shows: every pair carries the attribute it
+        // looks for, so choosing a button shows the pair it names and no other.
+        for which in ["latency", "detail"] {
+            // The script's selector, as the page writes it inside its script tag.
+            let selector = format!("[data-pair=\"rag-{which}\"]");
+            assert!(html.contains(&selector), "the {which} script looks for {selector}");
+            let attribute = format!("\" data-pair=\"rag-{which}\"");
+            assert_eq!(html.matches(&attribute).count(), 3 * 4, "every {which} pair carries it");
+        }
+        assert!(!html.contains("data-{which}"), "an attribute name left unformatted");
+    }
+
+    #[test]
+    fn a_page_of_random_token_runs_only_still_draws() {
+        let runs = fixtures(&["apple-m3-pro-2026-10-27T031941Z-f9739363.json"]);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section(
+            super::datasets::RANDOM,
+            &machines,
+            &machines,
+        ));
+        let at = |s: &str| html.find(s).unwrap_or_else(|| panic!("no {s}"));
+        assert!(at("Random tokens") < at("Summary"));
+        assert!(at("Summary") < at("Latency distributions"));
+        assert!(html.contains("Apple M3 Pro"));
+        // The model detail: the grid's maps and the users curves, per model.
+        assert!(html.contains("gpt-oss-20b on Apple M3 Pro"));
+    }
+
+    #[test]
+    fn a_run_with_grid_and_dataset_cells_draws_each_from_its_own() {
+        // One run with both kinds: no fixture has both, so the grid-only run's gpt-oss-20b
+        // scaling joins REQUESTS_FIXTURE's gpt-oss-20b here.
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let grid = fixtures(&["apple-m3-pro-2026-10-27T031941Z-f9739363.json"]);
+        let from = (grid[0].models.iter())
+            .find(|m| m.stem == "gpt-oss-20b")
+            .expect("gpt-oss in the grid run");
+        runs[0].models[0].scaling = from.scaling.clone();
+        let machines = super::index(&runs);
+        assert_eq!(
+            super::datasets::shown(&machines).last(),
+            Some(&super::datasets::RANDOM)
+        );
+        let random = render(super::datasets::section(
+            super::datasets::RANDOM,
+            &machines,
+            &machines,
+        ));
+        let rag = render(super::datasets::section("rag", &machines, &machines));
+        // Each section drew, from its own cells.
+        assert!(
+            random.contains("Random tokens") && random.contains("4096"),
+            "the grid's section drew"
+        );
+        assert!(
+            rag.contains("multi-document QA, MuSiQue"),
+            "the dataset's section drew"
+        );
+        assert!(
+            !random.contains("MuSiQue"),
+            "the grid's section reads no dataset"
+        );
+        assert!(
+            !rag.contains("4096"),
+            "a dataset's section reads no grid shape"
+        );
+    }
+
     #[test]
     fn a_cells_requests_read_per_repeat_and_untimed_ones_drop_out() {
         use super::data::{Cell, RequestTiming};
@@ -4624,28 +5017,16 @@ mod tests {
             new["config"]["scaling"]["task_sample"] = serde_json::json!(sample);
             vec![serde_json::from_value(old).unwrap(), serde_json::from_value(new).unwrap()]
         };
-        let titles = |runs: &[Run]| -> Vec<&'static str> {
+        let line = |runs: &[Run], dataset: &str| -> bool {
             let entries: Vec<super::Entry> = (runs.iter())
                 .map(|run| super::Entry { run, m: &run.models[0] })
                 .collect();
-            super::task_timelines(&entries).into_iter().map(|(t, _)| t).collect()
+            super::task_timeline(&entries, dataset).is_some()
         };
-        let rag = "RAG TTFT ms, 1 user";
-        let sharegpt = "ShareGPT TTFT ms, 1 user";
-        let same = titles(&two(None));
-        assert!(
-            same.contains(&rag) && same.contains(&sharegpt),
-            "one sampling: {same:?}"
-        );
-        let changed = titles(&two(Some("musique-dev-by-hops")));
-        assert!(
-            !changed.contains(&rag),
-            "the RAG line starts again: {changed:?}"
-        );
-        assert!(
-            changed.contains(&sharegpt),
-            "the ShareGPT line runs on: {changed:?}"
-        );
+        assert!(line(&two(None), "rag"), "one sampling, one line");
+        assert!(!line(&two(Some("musique-dev-by-hops")), "rag"), "one run since");
+        // ShareGPT's tasks did not change, so its line runs on.
+        assert!(line(&two(Some("musique-dev-by-hops")), "sharegpt"));
     }
 
     #[test]
@@ -4818,13 +5199,12 @@ mod tests {
         let (_, entries) = (machines["Apple M3 Pro"].models.iter())
             .find(|(s, _)| *s == "granite-4.2-8b")
             .expect("granite ran");
-        let titles: Vec<&str> = super::task_timelines(entries)
-            .into_iter()
-            .map(|(t, _)| t)
-            .collect();
-        assert_eq!(titles, ["ShareGPT TTFT ms, 1 user", "RAG TTFT ms, 1 user"]);
+        // Both runs ran sharegpt and rag: a timeline each; a workload neither ran, none.
+        assert!(super::task_timeline(entries, "sharegpt").is_some());
+        assert!(super::task_timeline(entries, "rag").is_some());
+        assert!(super::task_timeline(entries, "longbench").is_none());
         assert!(
-            super::task_timelines(&entries[..1]).is_empty(),
+            super::task_timeline(&entries[..1], "sharegpt").is_none(),
             "one run is no line"
         );
     }
@@ -4987,7 +5367,8 @@ mod tests {
             .find(|(s, _)| *s == "gpt-oss-20b")
             .map(|(_, es)| es.len());
         assert_eq!(gpt, Some(2), "gpt-oss-20b runs on the M3 Pro");
-        assert!(super::over_time(&machines).is_some());
+        // The random-token section's Over time charts draw from them.
+        assert!(!super::over_time_charts(&machines, "Apple M3 Pro").is_empty());
     }
 
     /// Machines read up from the smallest: a 32 GB base M5 before the 36 GB M3 Pro, the 64 GB
@@ -5361,36 +5742,6 @@ mod tests {
         let mut run: Run = serde_json::from_value(json).expect("a run");
         run.mark_mem_below_weights();
         (run, at)
-    }
-
-    /// A memory reading below the model's own weights is left out, and one at or above them is
-    /// kept: the comparison and its MiB-to-bytes conversion, on either side of the line (#414).
-    #[test]
-    fn a_memory_reading_below_the_weights_is_left_out_and_one_above_is_kept() {
-        use super::Scenario;
-        use super::numbers::{Engine, Memory, Metric, peak_rss};
-        let w = {
-            let (run, at) = with_memory(0.0, 0.0);
-            run.models[at].weights().expect("qwen's weights").mib()
-        };
-        for (mib, below) in [(w - 1.0, true), (w + 1.0, false)] {
-            let (run, at) = with_memory(mib, mib);
-            let m = &run.models[at];
-            let rss = peak_rss(m, Engine::Scratchy, Scenario::Cold);
-            assert_eq!(
-                rss == Memory::BelowWeights,
-                below,
-                "peak RSS {mib} MiB, weights {w}: {rss:?}"
-            );
-            for c in m.scaling.iter().flatten() {
-                let shown = super::numbers::timing(Some(c), Metric::PeakMem);
-                assert_eq!(
-                    shown.is_none(),
-                    below,
-                    "peak memory {mib} MiB, weights {w}: {shown:?}"
-                );
-            }
-        }
     }
 
     /// Only an engine that serves the MLX checkpoint is judged against its weights: ollama,

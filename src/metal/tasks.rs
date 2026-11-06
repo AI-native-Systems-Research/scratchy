@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 
 use crate::carbon::{Table, TableCell, TableRow};
 
-use super::data::{Model, TaskCell};
+use super::data::{Model, RequestTiming, TaskCell};
 use super::numbers::Engine;
 
 /// A workload's name on the page, and what it measures.
@@ -13,7 +13,7 @@ pub fn workload_label(w: &str) -> (&'static str, &'static str) {
     match w {
         "sharegpt" => ("ShareGPT chat", "real chat prompts, one turn each"),
         "rag" => (
-            "RAG",
+            "MuSiQue",
             "multi-document QA, MuSiQue: a question over its passages",
         ),
         "rag-spans" => (
@@ -31,7 +31,7 @@ pub fn workload_label(w: &str) -> (&'static str, &'static str) {
         ),
         "shared-prefix-control" => ("Shared prompt, no reuse", "the same, every prompt its own"),
         "rag-accuracy" => (
-            "RAG accuracy",
+            "MuSiQue accuracy",
             "RAG over more tasks, for its accuracy alone: 100 on a quick run, 400 or the whole dev set on a full one",
         ),
         _ => ("dataset", ""),
@@ -49,6 +49,31 @@ const ORDER: [&str; 8] = [
     "shared-prefix-control",
     "rag-accuracy",
 ];
+
+/// The engine a model's `dataset` cells are set against: the first rival that measured any of
+/// them. None for scratchy alone.
+pub fn rival_of(m: &Model, dataset: &str) -> Option<Engine> {
+    Engine::RIVALS
+        .into_iter()
+        .find(|&e| (e.tasks(m).iter()).any(|c| c.workload == dataset && c.measured()))
+}
+
+/// A cell's requests' times to first token or end-to-end times, failed ones left out. Empty for
+/// the time per output token, which a dataset cell keeps for none of its requests, and for a cell
+/// that kept no requests.
+pub fn request_ms(c: &TaskCell, t: RequestTiming) -> Vec<f64> {
+    let kept = match t {
+        RequestTiming::Ttft => c.ttfts_ms.as_deref(),
+        RequestTiming::E2el => c.e2els_ms.as_deref(),
+        RequestTiming::Tpot => None,
+    };
+    kept.unwrap_or_default().iter().flatten().copied().collect()
+}
+
+/// A workload's place in the page's order; one the page does not know goes last.
+pub fn order(w: &str) -> usize {
+    ORDER.iter().position(|o| *o == w).unwrap_or(ORDER.len())
+}
 
 /// Fewer tasks than this and a cell's accuracy is indicative: at 8 a task is 12.5 points of it.
 const FIRM_ACCURACY_TASKS: u32 = 100;
@@ -181,11 +206,30 @@ fn right(c: &TaskCell) -> String {
     let Some(a) = accuracy(c) else {
         return "—".to_string();
     };
-    match c.num_tasks {
+    let whole = match c.num_tasks {
         Some(n) if n >= FIRM_ACCURACY_TASKS => format!("{} of {n}", pct(Some(a))),
         Some(n) => format!("~{} of {n}", pct(Some(a))),
         None => format!("~{}", pct(Some(a))),
+    };
+    match by_hops(c) {
+        Some(hops) => format!("{whole} ({hops})"),
+        None => whole,
     }
+}
+
+/// A MuSiQue cell's accuracy by hop count, where it recorded one: "2-hop 52%, 3-hop 43%, 4-hop 38%".
+fn by_hops(c: &TaskCell) -> Option<String> {
+    let by = c.accuracy_by_group.as_ref().filter(|b| !b.is_empty())?;
+    let mut hops: Vec<(u32, Option<f64>)> = (by.iter())
+        .filter_map(|(g, &a)| Some((g.parse().ok()?, a)))
+        .collect();
+    hops.sort_unstable_by_key(|&(h, _)| h);
+    Some(
+        (hops.into_iter())
+            .map(|(h, a)| format!("{h}-hop {}", pct(a)))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// How many times better scratchy is: `rival / scratchy` for a time (lower is better), `scratchy
@@ -199,24 +243,35 @@ fn x(v: Option<f64>) -> String {
     v.map_or_else(String::new, |v| format!("×{v:.2}"))
 }
 
-/// A model's real-task table, one row a workload and users count: scratchy's numbers, then the
-/// rival's, and how many times faster scratchy is to its first token and to its whole answer.
-/// Nothing for a run without dataset workloads.
-pub fn tasks_table(m: &Model) -> Element {
-    let ours = Engine::Scratchy.tasks(m);
+/// [`tasks_table`]'s rows of one workload: its detail in a dataset's section. Nothing for a model
+/// that did not run it.
+pub fn detail_table(m: &Model, dataset: &str) -> Element {
+    table(m, Some(dataset))
+}
+
+/// Whether a cell belongs in `dataset`'s table: its own, and for MuSiQue its accuracy cell too,
+/// MuSiQue over more tasks.
+fn of_dataset(c: &TaskCell, dataset: &str) -> bool {
+    c.workload == dataset || (dataset == "rag" && c.workload == "rag-accuracy")
+}
+
+fn table(m: &Model, only: Option<&str>) -> Element {
+    let ours: Vec<&TaskCell> = (Engine::Scratchy.tasks(m).iter())
+        .filter(|c| only.is_none_or(|w| of_dataset(c, w)))
+        .collect();
     if ours.is_empty() {
         return rsx! {};
     }
-    let mut cells: Vec<&TaskCell> = ours.iter().collect();
+    let mut cells = ours;
     let rank = |w: &str| ORDER.iter().position(|o| *o == w).unwrap_or(ORDER.len());
     cells.sort_by_key(|c| (rank(&c.workload), c.conc));
     // The open-loop note, only where the run timed its cells open loop (`--open-loop`).
-    let open_loop = ours.iter().any(|c| c.load.as_deref() == Some("rate"));
+    let open_loop = cells.iter().any(|c| c.load.as_deref() == Some("rate"));
     rsx! {
         Table {
             headers: [
-                "workload", "load", "TTFT", "total", "answer tok", "cached tok", "right",
-                "J/request", "J/token", "J/right", "vs", "TTFT", "total", "J/request",
+                "workload", "load", "TTFT", "total", "answer tok", "cached tok", "accuracy",
+                "J/request", "J/token", "J/right answer", "vs", "TTFT", "total", "J/request",
             ]
             .map(String::from)
             .to_vec(),
@@ -263,14 +318,15 @@ pub fn tasks_table(m: &Model) -> Element {
             }
         }
         p { style: "font-size: 0.875rem",
-            "Right: the share of tasks answered right, a failed request or an answer that ran to its \
-             cap counted wrong; left out where most answers ran to their cap. ~ marks one over fewer \
+            "Accuracy: the share of tasks answered right, a failed request or an answer that ran to \
+             its cap counted wrong; none on a cell whose answers are forced to one length, so its \
+             times compare across engines, as every cell at a users count is; left out where most answers ran to their cap. ~ marks one over fewer \
              than {FIRM_ACCURACY_TASKS} tasks, where one task moves it by 100/n points, so it is \
              indicative only. The second total ratio is shown only where both engines' answers were \
              about one length."
         }
-        p { style: "font-size: 0.875rem", {ENERGY_NOTE} " J/right: over the right answers, where \
-             the cell is scored. Its ratio is how many times less energy scratchy spent a request, \
+        p { style: "font-size: 0.875rem", {ENERGY_NOTE} " J/right answer: over the right answers, \
+             where the cell is scored. Its ratio is how many times less energy scratchy spent a request, \
              shown only where both engines' answers were about one length, an engine that stops \
              early spending less for answering less."
         }
@@ -332,14 +388,28 @@ fn compared(c: &TaskCell) -> bool {
 /// rival it is set against (the first that ran any of these cells). The map is shown only with a
 /// rival: scratchy alone has nothing to be faster than.
 pub fn glance_squares(m: &Model) -> Option<(Engine, Vec<GlanceSquare>)> {
+    squares(m, None)
+}
+
+fn squares(m: &Model, only: Option<&str>) -> Option<(Engine, Vec<GlanceSquare>)> {
     let ours = Engine::Scratchy.tasks(m);
-    let ws = workloads(m);
-    let mut users: Vec<u32> = ours.iter().filter(|c| compared(c)).map(|c| c.conc).collect();
+    let ws: Vec<&str> = (workloads(m).into_iter())
+        .filter(|w| only.is_none_or(|o| o == *w))
+        .collect();
+    let mut users: Vec<u32> = (ours.iter())
+        .filter(|c| compared(c) && only.is_none_or(|o| c.workload == o))
+        .map(|c| c.conc)
+        .collect();
     users.sort_unstable();
     users.dedup();
-    let rival = Engine::RIVALS
-        .into_iter()
-        .find(|&e| e.tasks(m).iter().any(TaskCell::measured))?;
+    // One dataset's squares are set against its own rival, as its pair is ([`rival_of`]); the
+    // whole map against the first that measured any.
+    let rival = match only {
+        Some(dataset) => rival_of(m, dataset)?,
+        None => Engine::RIVALS
+            .into_iter()
+            .find(|&e| e.tasks(m).iter().any(TaskCell::measured))?,
+    };
     let squares = (users.iter())
         .flat_map(|&u| ws.iter().map(move |&w| (u, w)))
         .map(|(u, w)| {
@@ -411,6 +481,21 @@ mod tests {
         assert_eq!(joules(per_request(&old)), "—");
     }
 
+    /// A MuSiQue cell that recorded its accuracy by hop count shows each beside the whole, in hop
+    /// order; one from before shows the whole alone.
+    #[test]
+    fn a_cells_accuracy_shows_by_hops() {
+        let mut c: TaskCell = serde_json::from_value(serde_json::json!({
+            "workload": "rag-accuracy", "conc": 4, "completed": 400, "accuracy": 0.47,
+            "thinking_answers": 0, "capped_answers": 0, "num_tasks": 400,
+            "accuracy_by_group": {"4": 0.38, "2": 0.52, "3": 0.43},
+        }))
+        .unwrap();
+        assert_eq!(right(&c), "47% of 400 (2-hop 52%, 3-hop 43%, 4-hop 38%)");
+        c.accuracy_by_group = None;
+        assert_eq!(right(&c), "47% of 400");
+    }
+
     /// The whole answer's time is set against the rival's only at about the same answer length,
     /// and neither mostly capped; the first token's always is.
     #[test]
@@ -432,6 +517,13 @@ mod tests {
             load: None,
             request_rate: None,
             timed_out: false,
+            median_tpot_ms: None,
+            output_throughput: None,
+            ttfts_ms: None,
+            e2els_ms: None,
+            prompt_tokens: None,
+            tpots_ms: None,
+            accuracy_by_group: None,
             borrowed_from: None,
             energy: None,
         };
@@ -531,6 +623,13 @@ mod tests {
             load: None,
             request_rate: None,
             timed_out: false,
+            median_tpot_ms: None,
+            output_throughput: None,
+            ttfts_ms: None,
+            e2els_ms: None,
+            prompt_tokens: None,
+            tpots_ms: None,
+            accuracy_by_group: None,
             borrowed_from: None,
             energy: None,
         };
