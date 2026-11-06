@@ -4796,6 +4796,13 @@ impl SchedulerBlockTokens {
         self.0.get()
     }
 
+    /// The block's token count as its `NonZeroU32` — for the checked nonzero
+    /// arithmetic ([`PoolPageSlots::of_scheduler_blocks`]) that keeps the law in std's
+    /// own types.
+    pub const fn nz(self) -> std::num::NonZeroU32 {
+        self.0
+    }
+
     /// The block's token count as a `usize` — the accessor for the host-side
     /// page/stride arithmetic that counts in `usize`.
     pub const fn as_usize(self) -> usize {
@@ -4820,11 +4827,8 @@ impl PoolPageSlots {
         blocks: SchedulerBlockTokens,
         k: std::num::NonZeroU32,
     ) -> Self {
-        match blocks.get().checked_mul(k.get()) {
-            Some(slots) => match std::num::NonZeroU32::new(slots) {
-                Some(v) => Self(v),
-                None => panic!("unreachable: a product of nonzero values is nonzero"),
-            },
+        match blocks.nz().checked_mul(k) {
+            Some(slots) => Self(slots),
             None => panic!(
                 "a pool page of k whole scheduler blocks overflows u32: \
                  the blocks-per-page policy must fit a u32 slot count"
