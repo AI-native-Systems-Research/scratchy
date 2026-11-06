@@ -19,7 +19,7 @@ use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
 use ktir_superdsc::place::PlaceId;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
 use ktir_superdsc::sdsc_abstract::{BlockCols, RowBlockedTag, RowCount, StickLayout, Stk};
-use ktir_superdsc::superdsc_opspec::OpFunc;
+use ktir_superdsc::superdsc_opspec::{Df, OpFunc};
 
 const ROWS: u32 = 8;
 
@@ -43,6 +43,7 @@ fn the_data_mint_pads_to_the_swept_stick_width_and_refuses_past_the_handle() {
         DevOff::ZERO,
         rows(ROWS),
         cols(128),
+        Df::Fp16,
         "test: whole",
     )
     .expect("the whole block");
@@ -55,6 +56,7 @@ fn the_data_mint_pads_to_the_swept_stick_width_and_refuses_past_the_handle() {
         DevOff::ZERO,
         rows(ROWS),
         cols(192),
+        Df::Fp16,
         "test: past end",
     )
     .expect_err("the window outruns its handle");
@@ -71,6 +73,7 @@ fn the_data_mint_pads_to_the_swept_stick_width_and_refuses_past_the_handle() {
         DevOff::ZERO,
         rows(ROWS),
         cols(130),
+        Df::Fp16,
         "test: pad lanes",
     )
     .expect_err("the padded extent outruns the handle");
@@ -82,11 +85,18 @@ fn the_data_mint_pads_to_the_swept_stick_width_and_refuses_past_the_handle() {
 fn the_accum_mint_is_one_stick_per_row_whatever_the_swept_width() {
     let stk =
         Stk::<RowBlockedTag>::new("t13", StickLayout::row_blocked(8, 64)).expect("RowBlocked");
-    let ok = win_reduce_accum(None, &stk, DevOff::ZERO, rows(ROWS), "test: accum")
+    let ok = win_reduce_accum(None, &stk, DevOff::ZERO, rows(ROWS), Df::Fp16, "test: accum")
         .expect("one stick per row");
     assert_eq!((ok.rows(), ok.cols()), (ROWS, 64));
     // A row count past the buffer's rows — the row law and the handle disagree.
-    let err = win_reduce_accum(None, &stk, DevOff::ZERO, rows(ROWS + 1), "test: rows past")
+    let err = win_reduce_accum(
+        None,
+        &stk,
+        DevOff::ZERO,
+        rows(ROWS + 1),
+        Df::Fp16,
+        "test: rows past",
+    )
         .expect_err("the accum outruns its rows");
     assert!(err.contains("test: rows past"), "{err}");
     assert!(
@@ -109,12 +119,21 @@ fn the_opspec_refuses_a_win_whose_extents_disagree_with_the_ops_own_dims() {
         DevOff::ZERO,
         rows(ROWS),
         cols(512),
+        Df::Fp16,
         "test: mismatch",
     )
     .expect("the window itself is in bounds");
     let accum =
-        win_reduce_accum(None, &accum_stk, DevOff::ZERO, rows(ROWS), "test: mismatch").unwrap();
-    let err = reduce_opspec_off(OpFunc::Max, ROWS, 256, data, accum)
+        win_reduce_accum(
+        None,
+        &accum_stk,
+        DevOff::ZERO,
+        rows(ROWS),
+        Df::Fp16,
+        "test: mismatch",
+    )
+    .unwrap();
+    let err = reduce_opspec_off(OpFunc::Max, ROWS, 256, data, accum, Df::Fp16)
         .expect_err("the window and the iteration dims disagree");
     assert!(
         err.contains("the data operand's window is 8×512 but the op sweeps 8×256"),
@@ -128,6 +147,7 @@ fn the_opspec_refuses_a_win_whose_extents_disagree_with_the_ops_own_dims() {
         DevOff::ZERO,
         rows(ROWS),
         cols(256),
+        Df::Fp16,
         "test: accum law",
     )
     .unwrap();
@@ -139,10 +159,11 @@ fn the_opspec_refuses_a_win_whose_extents_disagree_with_the_ops_own_dims() {
         DevOff::ZERO,
         rows(ROWS),
         cols(128),
+        Df::Fp16,
         "test: accum law",
     )
     .expect("in bounds, but the wrong shape for an accum");
-    let err = reduce_opspec_off(OpFunc::Max, ROWS, 256, data2, wide_accum)
+    let err = reduce_opspec_off(OpFunc::Max, ROWS, 256, data2, wide_accum, Df::Fp16)
         .expect_err("an accum window of two sticks per row is not the seeded convention");
     assert!(err.contains("ONE stick"), "{err}");
     assert!(err.contains("win_reduce_accum"), "names the remedy: {err}");
@@ -177,6 +198,7 @@ fn a_layout_in_hand_consults_the_placement_footprint() {
         DevOff::ZERO,
         rows(ROWS),
         cols(2048),
+        Df::Fp16,
         "test: past placement",
     )
     .expect_err("the placement cannot hold the swept block");

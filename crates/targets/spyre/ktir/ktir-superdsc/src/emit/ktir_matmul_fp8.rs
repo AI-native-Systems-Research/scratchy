@@ -375,6 +375,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                             crate::addr::col_of(m, k, j * k_part, Df::Fp16),
                             m_rows,
                             crate::sdsc_abstract::BlockCols::of_feature_cols(k_part),
+                            Df::Fp16,
                             &format!("{op_name}: activation"),
                         )
                         .map_err(SuperDscError)?,
@@ -383,9 +384,11 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                             &accum_h,
                             crate::addr::DevOff::ZERO,
                             m_rows,
+                            Df::Fp16,
                             &format!("{op_name}: scale"),
                         )
                         .map_err(SuperDscError)?,
+                        Df::Fp16,
                         sym_id_base,
                         layout,
                     ));

@@ -9933,6 +9933,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
                 win,
                 t_rows,
                 f_cols,
+                crate::superdsc_opspec::Df::Fp16,
                 &format!("{rmmean_op}: squares"),
             )
             .map_err(|e| Error { message: e })?,
@@ -9941,9 +9942,11 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
                 &mean_h,
                 crate::addr::DevOff::ZERO,
                 t_rows,
+                crate::superdsc_opspec::Df::Fp16,
                 &format!("{rmmean_op}: mean"),
             )
             .map_err(|e| Error { message: e })?,
+            crate::superdsc_opspec::Df::Fp16,
             sym_id_base,
             layout,
         ));
