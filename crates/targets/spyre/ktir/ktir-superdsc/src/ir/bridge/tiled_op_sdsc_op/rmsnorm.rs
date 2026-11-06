@@ -55,7 +55,7 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     ones_const: Option<&str>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Vec<EmittedOp<T>> {
+) -> Result<Vec<EmittedOp<T>>, String> {
     use crate::place::SynthRole as R;
     let stk = Fp16::ELEMS_PER_STICK; // 64 — the per-row reduce/scalar lane (one fp16 stick)
     let mut ops: Vec<EmittedOp<T>> = Vec::new();
@@ -154,12 +154,10 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
             out_id,
             layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
             Df::Fp16,
-        )
-        .unwrap_or_else(|e| panic!("{rmmean_op}: {e}")),
+        )?,
         sym_id_base,
         layout,
-    )
-    .unwrap_or_else(|e| panic!("{rmmean_op}: {e}"));
+    )?;
     if let Some(split) = split {
         ops.extend(split);
     } else {
@@ -257,7 +255,7 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
         sym_id_base,
         layout,
     ));
-    ops
+    Ok(ops)
 }
 
 /// Assemble the GAINLESS rmsnorm — `x[rows,cols]`, `eps_const` a bound `[1,stick]`
@@ -283,7 +281,7 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
     eps_const: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Vec<EmittedOp<T>> {
+) -> Result<Vec<EmittedOp<T>>, String> {
     use crate::place::SynthRole as R;
     let stk = Fp16::ELEMS_PER_STICK; // 64 — the per-row reduce/scalar lane (one fp16 stick)
     let mut ops: Vec<EmittedOp<T>> = Vec::new();
@@ -345,12 +343,10 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
             out_id,
             layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
             Df::Fp16,
-        )
-        .unwrap_or_else(|e| panic!("{rmmean_op}: {e}")),
+        )?,
         sym_id_base,
         layout,
-    )
-    .unwrap_or_else(|e| panic!("{rmmean_op}: {e}"));
+    )?;
     if let Some(split) = split {
         ops.extend(split);
     } else {
@@ -400,7 +396,7 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
         sym_id_base,
         layout,
     ));
-    ops
+    Ok(ops)
 }
 
 /// Assemble the tanh soft cap — `x[rows,cols]`, `cap_const` a bound `[1,1]`

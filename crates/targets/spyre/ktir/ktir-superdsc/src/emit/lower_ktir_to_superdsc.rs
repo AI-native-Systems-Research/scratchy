@@ -3903,7 +3903,7 @@ pub fn rmsnorm<T: crate::collective::Tp>(
     let x = tensors[0].name();
     let gamma = tensors[1].name();
     let t = out.tid;
-    Ok(assemble_rmsnorm(
+    assemble_rmsnorm(
         &format!("o{t}"),
         rows,
         cols,
@@ -3914,7 +3914,8 @@ pub fn rmsnorm<T: crate::collective::Tp>(
         ones_const.as_deref(),
         sym_id_base,
         layout,
-    ))
+    )
+    .map_err(|e| Error { message: e })
 }
 
 /// THE POINTWISE DEVICE-WIDTH PAD, CAPPED AT THE WIDTH THE OUTPUT'S PLACEMENT ACTUALLY HOLDS.
@@ -9635,7 +9636,7 @@ pub fn rmsnorm_at<T: crate::collective::Tp>(
     let x = tensors[0].name();
     let gamma = tensors[1].name();
     let t = out.tid;
-    Ok(assemble_rmsnorm(
+    assemble_rmsnorm(
         &format!("o{t}"),
         rows,
         cols,
@@ -9646,7 +9647,8 @@ pub fn rmsnorm_at<T: crate::collective::Tp>(
         ones_const.as_deref(),
         sym_id_base,
         layout,
-    ))
+    )
+    .map_err(|e| Error { message: e })
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::RmsNormUnit`] —
@@ -9702,7 +9704,7 @@ pub fn rmsnorm_unit_at<T: crate::collective::Tp>(
     let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
     let x = tensors[0].name();
     let t = out.tid;
-    Ok(assemble_rmsnorm_unit(
+    assemble_rmsnorm_unit(
         &format!("o{t}"),
         rows,
         cols,
@@ -9711,7 +9713,8 @@ pub fn rmsnorm_unit_at<T: crate::collective::Tp>(
         &eps_const,
         sym_id_base,
         layout,
-    ))
+    )
+    .map_err(|e| Error { message: e })
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::WindowedRmsNorm`] — the
