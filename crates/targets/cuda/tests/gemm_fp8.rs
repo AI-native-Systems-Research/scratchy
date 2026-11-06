@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! FP8 S3 on the H100: the per-token quantization (`kernels/quant_rows_fp8.cu`) against the host
-//! quantizer bit for bit, and the prefill fp8 GEMMs (`kernels/gemm_fp8.cu`,
-//! `kernels/gemm_narrow_fp8.cu`) against an f64 reference on the same e4m3 inputs and scales.
+//! FP8 S3 on the H100: the prefill fp8 GEMMs (`kernels/gemm_fp8.cu`, `kernels/gemm_narrow_fp8.cu`)
+//! against an f64 reference on the same e4m3 inputs and scales. The per-token quantization's tests
+//! are `tests/quant_rows_fp8.rs`.
 //!
 //! Built only under `nvcc` (`required-features`). No GPU fails rather than skips.
 //!
@@ -14,11 +14,13 @@
 
 // `pub`: each test binary uses a different part of `common`, and nothing in it is dead code.
 pub mod common {
+    pub mod fp8;
     pub mod numerics;
 }
 
 use std::ffi::c_void;
 
+use common::fp8::{e4m3_value, quantize_rows};
 use common::numerics::{bf16_inputs, mismatched_bits};
 use half::bf16;
 use scratchy_target_cuda::kernels::{
@@ -31,10 +33,6 @@ use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 const SENTINEL: u16 = 0xFFFF;
 /// Extra output elements past `m·n`, which a kernel must leave untouched.
 const TAIL: usize = 4096;
-/// e4m3's largest finite magnitude.
-const E4M3_MAX: f32 = 448.0;
-/// vLLM's `min_scaling_factor` for e4m3: `1 / (448 · 512)`.
-const MIN_SCALE: f32 = 1.0 / (448.0 * 512.0);
 
 fn h100() -> CudaDevice {
     CudaDevice::open()
@@ -43,89 +41,6 @@ fn h100() -> CudaDevice {
 
 fn verdict(pass: bool) -> &'static str {
     if pass { "PASS" } else { "FAIL" }
-}
-
-// ── The host e4m3 and the host quantizer ───────────────────────────
-
-/// `x` to e4m3 (`fn`, bias 7, no infinity, `0x7F`/`0xFF` NaN), round-to-nearest-even, saturating
-/// to ±448: CUDA's `__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3)`, which TK's `warp::copy`
-/// to an fp8 tile calls through `__nv_fp8x4_e4m3`. NaN is `0x7F`.
-fn e4m3_satfinite(x: f32) -> u8 {
-    if x.is_nan() {
-        return 0x7F;
-    }
-    let sign = if x.is_sign_negative() { 0x80u8 } else { 0 };
-    let a = f64::from(x.abs());
-    if a >= f64::from(E4M3_MAX) {
-        return sign | 0x7E;
-    }
-    // The spacing of e4m3 at `a`: 2^(e − 3) for a normal of exponent e ≥ −6, else 2^-9.
-    let e = if a < 2f64.powi(-6) {
-        -6
-    } else {
-        a.log2().floor() as i32
-    };
-    let ulp = 2f64.powi(e - 3);
-    let q = a / ulp;
-    let (fl, frac) = (q.floor(), q - q.floor());
-    let n = if frac > 0.5 || (frac == 0.5 && fl % 2.0 == 1.0) {
-        fl + 1.0
-    } else {
-        fl
-    };
-    let v = n * ulp;
-    if v >= f64::from(E4M3_MAX) {
-        return sign | 0x7E;
-    }
-    sign | encode_e4m3(v)
-}
-
-/// The e4m3 bits of a non-negative value `v` that e4m3 holds exactly, below 448.
-fn encode_e4m3(v: f64) -> u8 {
-    if v == 0.0 {
-        return 0;
-    }
-    if v < 2f64.powi(-6) {
-        return (v / 2f64.powi(-9)) as u8;
-    }
-    let e = v.log2().floor() as i32;
-    let mant = (v / 2f64.powi(e) - 1.0) * 8.0;
-    (((e + 7) as u8) << 3) | mant as u8
-}
-
-/// The value of e4m3 bits `b` (`0x7F`/`0xFF` NaN).
-fn e4m3_value(b: u8) -> f64 {
-    let (s, e, m) = ((b >> 7) & 1, (b >> 3) & 0xF, b & 7);
-    if e == 0xF && m == 7 {
-        return f64::NAN;
-    }
-    let mag = if e == 0 {
-        f64::from(m) * 2f64.powi(-9)
-    } else {
-        (1.0 + f64::from(m) / 8.0) * 2f64.powi(i32::from(e) - 7)
-    };
-    if s == 1 { -mag } else { mag }
-}
-
-/// vLLM v0.31.0's per-token quantization of `x [rows, cols]` bf16, in f32 as its kernel computes:
-/// `scale = max(amax / 448, 1 / (448·512))` and `q = e4m3_satfinite(clamp(x / scale, ±448))`, the
-/// division IEEE (`scaled_fp8_conversion<false>`), its clamp NaN-dropping as `fminf`/`fmaxf`.
-/// Returns `(q, scale)`.
-fn quantize_rows(x: &[u16], rows: usize, cols: usize) -> (Vec<u8>, Vec<f32>) {
-    let mut q = Vec::with_capacity(rows * cols);
-    let mut scales = Vec::with_capacity(rows);
-    for r in 0..rows {
-        let row = &x[r * cols..][..cols];
-        let amax = (row.iter()).fold(0.0f32, |m, &b| m.max(bf16::from_bits(b).to_f32().abs()));
-        let scale = (amax / E4M3_MAX).max(MIN_SCALE);
-        scales.push(scale);
-        q.extend(row.iter().map(|&b| {
-            // vLLM's `fmaxf(-max, fminf(x, max))`: a NaN quotient becomes +448.
-            let v = bf16::from_bits(b).to_f32() / scale;
-            e4m3_satfinite((-E4M3_MAX).max(v.min(E4M3_MAX)))
-        }));
-    }
-    (q, scales)
 }
 
 /// splitmix64 e4m3 weight bytes, every finite value but the largest magnitudes' tails: bits
@@ -159,23 +74,6 @@ fn weight_scales(n: usize, seed: u64) -> Vec<f32> {
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-
-fn down_bytes(b: &DeviceBuffer) -> Vec<u8> {
-    b.download()
-        .expect("download")
-        .iter()
-        .flat_map(|h| h.to_le_bytes())
-        .collect()
-}
-
-fn down_f32(b: &DeviceBuffer) -> Vec<f32> {
-    down_bytes(b)
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&c| f32::from_le_bytes(c))
-        .collect()
 }
 
 /// An e4m3 operand on the device: its bytes and its f32 scales, each in its own allocation.
@@ -281,141 +179,6 @@ fn run_out(
     let out = c.download().expect("download C");
     let tail = out[len..].iter().all(|&x| x == SENTINEL);
     Ok((out[..len].to_vec(), tail))
-}
-
-// ── QuantRowsFp8 ───────────────────────────────────────────────────
-
-/// Quantize `x [rows, cols]` on the device; returns `(q, scale)`.
-fn device_quant(device: &CudaDevice, x: &[u16], rows: usize, cols: usize) -> (Vec<u8>, Vec<f32>) {
-    let xb = DeviceBuffer::upload(device, x).expect("upload x");
-    let q = DeviceBuffer::upload_bytes(device, &vec![0xA5; rows * cols + 256]).expect("q");
-    let s = DeviceBuffer::upload_bytes(device, &vec![0xA5; rows * 4 + 256]).expect("scale");
-    // SAFETY: `x` holds rows·cols bf16, `q` rows·cols bytes and `scale` rows f32, all cudaMalloc'd
-    // (256-byte aligned) and disjoint; the download waits for the default stream.
-    unsafe {
-        quant_rows_fp8(
-            xb.ptr(),
-            (q.ptr(), s.ptr()),
-            (rows as u32, cols as u32),
-            std::ptr::null_mut(),
-        )
-    }
-    .expect("quant_rows_fp8 launch");
-    let (qd, sd) = (down_bytes(&q), down_f32(&s));
-    let q_tail = qd[rows * cols..].iter().all(|&b| b == 0xA5);
-    let s_tail = down_bytes(&s)[rows * 4..].iter().all(|&b| b == 0xA5);
-    assert!(
-        q_tail && s_tail,
-        "rows={rows} cols={cols}: wrote past q or scale"
-    );
-    (qd[..rows * cols].to_vec(), sd[..rows].to_vec())
-}
-
-/// Every `k` of the three FP8 checkpoints' fp8 GEMMs (FP8 plan §1a), and a partial last 256-column
-/// tile (320): bytes and scales bit-identical to the host quantizer at 16 and 4096 rows, one row
-/// at each scale extreme (all zeros: the floor; one at ±448 times a large value).
-#[test]
-fn quant_rows_fp8_is_the_host_quantizer_bit_for_bit() {
-    let device = h100();
-    let mut pass = true;
-    for cols in [
-        320usize, 512, 704, 2048, 2112, 2816, 4096, 5120, 6144, 8192, 17408,
-    ] {
-        for rows in [16usize, 4096] {
-            let mut x = bf16_inputs(rows * cols, 0xF8_0000 ^ cols as u64 ^ ((rows as u64) << 32));
-            // Row 0 all zeros (the scale floor), row 1 scaled up past e4m3's range.
-            x[..cols].fill(0);
-            for v in &mut x[cols..2 * cols] {
-                *v = bf16::from_f32(bf16::from_bits(*v).to_f32() * 3.0e4).to_bits();
-            }
-            let (hq, hs) = quantize_rows(&x, rows, cols);
-            let (dq, ds) = device_quant(&device, &x, rows, cols);
-            let q_bad = dq.iter().zip(&hq).filter(|(a, b)| a != b).count();
-            let s_bad = (ds.iter().zip(&hs))
-                .filter(|(a, b)| a.to_bits() != b.to_bits())
-                .count();
-            let ok = q_bad == 0 && s_bad == 0;
-            eprintln!(
-                "quant_rows_fp8 rows={rows} cols={cols}: mismatched_bytes={q_bad} \
-                 mismatched_scales={s_bad} {}",
-                verdict(ok)
-            );
-            pass &= ok;
-        }
-    }
-    assert!(
-        pass,
-        "a quantization differs from the host's: see the lines above"
-    );
-}
-
-/// All 65,536 bf16 inputs through the device conversion: row `v` is `[v, 448, 0, …]` (64 columns),
-/// so its scale is exactly 1 for every `|v| ≤ 448` and the device's byte for `v` is
-/// `e4m3_satfinite(clamp(v / 1))`; above 448 (and ±inf, NaN) the scale is the row's own, and the
-/// bytes still the host quantizer's. Bytes and scales bit-identical.
-#[test]
-fn quant_rows_fp8_converts_every_bf16_as_the_host_does() {
-    let device = h100();
-    let (rows, cols) = (65_536usize, 64usize);
-    let mut x = vec![0u16; rows * cols];
-    for v in 0..rows {
-        x[v * cols] = v as u16;
-        x[v * cols + 1] = bf16::from_f32(E4M3_MAX).to_bits();
-    }
-    let (hq, hs) = quantize_rows(&x, rows, cols);
-    let (dq, ds) = device_quant(&device, &x, rows, cols);
-    let mut first = None;
-    let mut q_bad = 0usize;
-    for v in 0..rows {
-        if dq[v * cols..][..cols] != hq[v * cols..][..cols] {
-            q_bad += 1;
-            first.get_or_insert(v);
-        }
-    }
-    let s_bad = (ds.iter().zip(&hs))
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count();
-    let ok = q_bad == 0 && s_bad == 0;
-    eprintln!(
-        "quant_rows_fp8 every bf16: mismatched_rows={q_bad} first={first:?} \
-         mismatched_scales={s_bad} {}",
-        verdict(ok)
-    );
-    assert!(ok, "the device conversion differs from the host's");
-}
-
-#[test]
-fn quant_rows_fp8_refuses_shapes_it_does_not_take() {
-    let device = h100();
-    let x = DeviceBuffer::upload(&device, &[0u16; 4096]).expect("x");
-    let q = DeviceBuffer::upload_bytes(&device, &[0xA5u8; 4096]).expect("q");
-    let mut pass = true;
-    for (rows, cols) in [
-        (0u32, 64u32),
-        (8, 64),
-        (17, 64),
-        (16, 0),
-        (16, 32),
-        (16, 100),
-    ] {
-        // SAFETY: the launcher refuses each shape before it touches a pointer.
-        let got = unsafe {
-            quant_rows_fp8(
-                x.ptr(),
-                (q.ptr(), q.ptr()),
-                (rows, cols),
-                std::ptr::null_mut(),
-            )
-        };
-        let kept = down_bytes(&q).iter().all(|&b| b == 0xA5);
-        let ok = got == Err(KernelError::RowShape { rows, cols }) && kept;
-        eprintln!(
-            "quant_rows_fp8 refusal rows={rows} cols={cols}: {got:?} {}",
-            verdict(ok)
-        );
-        pass &= ok;
-    }
-    assert!(pass, "a shape was not refused");
 }
 
 // ── The fp8 GEMM, plain and 64-column ──────────────────────────────
@@ -935,6 +698,93 @@ fn expert_gemm_fp8_is_the_dense_fp8_gemm_per_expert_tile() {
     assert!(pass, "an expert tile differs from the dense fp8 GEMM");
 }
 
+// ── The fp8 WGMMA's accumulation, recorded and not asserted ────────
+
+/// One tile, one K step (128 × 256 × 64), under four scale cases: all scales 1, `a_scale` 1 with
+/// the weight's scales, `w_scale` 1 with the activation's, and both as the GEMM test's. A wrong
+/// scale index fails only the cases whose scales vary; the tensor core's own accumulation fails
+/// all four alike. Each line gives the out-of-bound count under the GEMM bound, the worst element
+/// with its scales, and its ratio against `2⁻⁷·|ref| + 2⁻¹¹·S` too (a bound for the tensor core's
+/// own accumulation, not this file's). Then a single-dot probe, all scales 1: row `[16, 16, 1 × 30, 0 …]` against column
+/// `[16, −16, 2⁻ˢ × 30, 0 …]`, exact sum `30·2⁻ˢ` after the two ±256 products cancel, for
+/// s = 1..9: the first s whose device value falls short is where the tensor core stops keeping
+/// bits below 256. Recorded, not asserted.
+#[test]
+fn the_fp8_wgmma_accumulation_is_recorded() {
+    let device = h100();
+    let (m, n, k) = (128usize, 256usize, 64usize);
+    let (_, aq, a_rand) = activation(m, k, 0xF8A0 ^ k as u64);
+    let (bq, b_rand) = weight(n, k, 0xF8B0 ^ ((n as u64) << 20) ^ k as u64);
+    let (a_one, b_one) = (vec![1.0f32; m], vec![1.0f32; n]);
+    for (what, a_s, b_s) in [
+        ("all scales 1", &a_one, &b_one),
+        ("a_scale 1, w_scale random", &a_one, &b_rand),
+        ("w_scale 1, a_scale random", &a_rand, &b_one),
+        ("both random", &a_rand, &b_rand),
+    ] {
+        let (a, b) = (
+            Fp8Buf::new(&device, &aq, a_s),
+            Fp8Buf::new(&device, &bq, b_s),
+        );
+        let (out, _) =
+            run_gemm(&device, (&a, &b), (m as u32, n as u32, k as u32), false).expect("launch");
+        let refs = fp8_reference((&aq, a_s), (&bq, b_s), (m, n, k));
+        let (bad, _) = compare_fp8(&out, &refs);
+        let (mut worst, mut at, mut wide) = (0.0f64, 0usize, 0.0f64);
+        for (e, (&bits, &(r, sum))) in out.iter().zip(&refs).enumerate() {
+            let err = (f64::from(bf16::from_bits(bits).to_f32()) - r).abs();
+            let ratio = err / (r.abs() / 128.0 + sum / 16384.0).max(f64::MIN_POSITIVE);
+            if ratio > worst {
+                (worst, at) = (ratio, e);
+            }
+            wide = wide.max(err / (r.abs() / 128.0 + sum / 2048.0).max(f64::MIN_POSITIVE));
+        }
+        let (i, j) = (at / n, at % n);
+        eprintln!(
+            "fp8 wgmma {what}: out_of_bound={bad} worst=({i},{j}) gpu={} ref={} a_scale={} \
+             w_scale={} ratio={worst:.4} ratio_at_2^-11_S={wide:.4} (recorded, not asserted)",
+            bf16::from_bits(out[at]).to_f32(),
+            refs[at].0,
+            a_s[i],
+            b_s[j],
+        );
+    }
+    // e4m3 16 is 0x58, 1 is 0x38, −16 is 0xD8, and 2⁻ˢ is 0x38 − 8s (normal) or the subnormal
+    // 2⁻ˢ = 2⁻⁹ · 2^(9 − s), bits 1 << (9 − s), for s ≥ 7.
+    let small = |s: usize| {
+        if s < 7 {
+            0x38 - 8 * s as u8
+        } else {
+            1u8 << (9 - s)
+        }
+    };
+    let mut a_row = vec![0u8; k];
+    a_row[..2].fill(0x58);
+    a_row[2..32].fill(0x38);
+    let aq: Vec<u8> = a_row.repeat(m);
+    let bq: Vec<u8> = (0..n)
+        .flat_map(|j| {
+            let mut col = vec![0u8; k];
+            (col[0], col[1]) = (0x58, 0xD8);
+            col[2..32].fill(small(1 + j % 9));
+            col
+        })
+        .collect();
+    let (a, b) = (
+        Fp8Buf::new(&device, &aq, &a_one),
+        Fp8Buf::new(&device, &bq, &b_one),
+    );
+    let (out, _) =
+        run_gemm(&device, (&a, &b), (m as u32, n as u32, k as u32), false).expect("launch");
+    for s in 1..=9 {
+        eprintln!(
+            "fp8 wgmma probe s={s}: exact={} gpu={} (recorded, not asserted)",
+            30.0 * 2f64.powi(-(s as i32)),
+            bf16::from_bits(out[s - 1]).to_f32(),
+        );
+    }
+}
+
 // ── Timing, recorded and not asserted ──────────────────────────────
 
 /// `cudaEvent_t`, declared here for the timing lines only (the runtime declares no event call).
@@ -1049,35 +899,4 @@ fn the_fp8_kernel_times_are_recorded() {
          x, one write of q; recorded, not asserted)",
         bytes / us / 1e6
     );
-}
-
-// The host e4m3 itself, with no GPU: spot values of CUDA's satfinite conversion.
-#[test]
-fn the_host_e4m3_is_cudas_satfinite_conversion() {
-    for (x, b) in [
-        (0.0f32, 0x00u8),
-        (-0.0, 0x80),
-        (1.0, 0x38),
-        (448.0, 0x7E),
-        (500.0, 0x7E),
-        (-1e9, 0xFE),
-        (f32::INFINITY, 0x7E),
-        (f32::NEG_INFINITY, 0xFE),
-        (2f32.powi(-9), 0x01),
-        (2f32.powi(-10), 0x00),
-        (2f32.powi(-10) * 1.0001, 0x01),
-        (1.0625, 0x38),
-        (1.1875, 0x3A),
-        (464.0, 0x7E),
-    ] {
-        assert_eq!(e4m3_satfinite(x), b, "{x}");
-    }
-    assert_eq!(e4m3_satfinite(f32::NAN), 0x7F);
-    for b in 0u8..=0xFF {
-        let v = e4m3_value(b);
-        if v.is_nan() {
-            continue;
-        }
-        assert_eq!(e4m3_satfinite(v as f32), b, "round trip of {b:#04x}");
-    }
 }
