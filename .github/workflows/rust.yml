@@ -402,9 +402,11 @@ jobs:
       #
       # `serve` is required, not optional: without it `anthropic` and `server`
       # are not compiled, so their tests cannot run.
+      # `--test tape_hashes`: each baked model's resolved tape held to its pinned hash
+      # (crates/models/arch/tape_hashes.txt), at this step's scope and on its build.
       - name: Serving-layer unit tests
         run: cargo test -p scratchy-serving-api -p scratchy-models
-          --features metal,serve,scratchy-models/smollm2-135m --lib
+          --features metal,serve,scratchy-models/smollm2-135m --lib --test tape_hashes
 
       # The quarantined per-tool-spans path (#193) is off by default, so
       # nothing above compiles it. Type-check it and run its gated tests so it
