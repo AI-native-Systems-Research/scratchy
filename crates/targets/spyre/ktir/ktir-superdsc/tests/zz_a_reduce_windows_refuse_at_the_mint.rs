@@ -85,8 +85,15 @@ fn the_data_mint_pads_to_the_swept_stick_width_and_refuses_past_the_handle() {
 fn the_accum_mint_is_one_stick_per_row_whatever_the_swept_width() {
     let stk =
         Stk::<RowBlockedTag>::new("t13", StickLayout::row_blocked(8, 64)).expect("RowBlocked");
-    let ok = win_reduce_accum(None, &stk, DevOff::ZERO, rows(ROWS), Df::Fp16, "test: accum")
-        .expect("one stick per row");
+    let ok = win_reduce_accum(
+        None,
+        &stk,
+        DevOff::ZERO,
+        rows(ROWS),
+        Df::Fp16,
+        "test: accum",
+    )
+    .expect("one stick per row");
     assert_eq!((ok.rows(), ok.cols()), (ROWS, 64));
     // A row count past the buffer's rows — the row law and the handle disagree.
     let err = win_reduce_accum(
@@ -97,7 +104,7 @@ fn the_accum_mint_is_one_stick_per_row_whatever_the_swept_width() {
         Df::Fp16,
         "test: rows past",
     )
-        .expect_err("the accum outruns its rows");
+    .expect_err("the accum outruns its rows");
     assert!(err.contains("test: rows past"), "{err}");
     assert!(
         err.contains("runs past the end its handle declares"),
@@ -123,8 +130,7 @@ fn the_opspec_refuses_a_win_whose_extents_disagree_with_the_ops_own_dims() {
         "test: mismatch",
     )
     .expect("the window itself is in bounds");
-    let accum =
-        win_reduce_accum(
+    let accum = win_reduce_accum(
         None,
         &accum_stk,
         DevOff::ZERO,

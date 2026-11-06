@@ -247,12 +247,7 @@ fn mint_reduce_win<'a, K: KindTag>(
 /// `encode_constant(value, data_format)`, compute_ops.py:127): the fp32 reduce (mq>1 rmsnorm
 /// mean(x²)) needs an IEEE_FP32 const (raw f32 bits), else a SEN169_FP16 const feeding an fp32 op
 /// is a MIXED [fp16,fp32] op → DD2 "Unsupported result precision conversion".
-fn reduce_op_info(
-    op: OpFunc,
-    cols: u32,
-    df: Df,
-    accum_name: &str,
-) -> Result<OpInfo, String> {
+fn reduce_op_info(op: OpFunc, cols: u32, df: Df, accum_name: &str) -> Result<OpInfo, String> {
     let scale = match op {
         OpFunc::Mean | OpFunc::Exx2 => 1.0f32 / cols as f32,
         _ => 1.0f32, // sum / max: identity scaling
@@ -1000,48 +995,128 @@ pub fn assemble_reduce_off_divided<D: KindTag, A: KindTag>(
 /// proof of its own). Two op classes, two combine laws, one slice mechanics.
 pub struct ReduceSplit<'a, D: KindTag, A: KindTag> {
     /// The op-name prefix the slice and combine ops take (`{op_name}_p{j}_op`, `{op_name}_c{j}_op`).
-    pub op_name: &'a str,
-    pub op: OpFunc,
-    pub rows: u32,
-    /// The reduced extent N — the window's LOGICAL width, not the parent's.
-    pub cols: u32,
-    pub df: Df,
+    op_name: &'a str,
+    op: OpFunc,
+    /// At least one row — a zero-row reduce has no output byte to combine into.
+    rows: std::num::NonZeroU32,
+    /// The reduced extent N — the window's LOGICAL width, not the parent's. NOT a
+    /// [`crate::superdsc_opspec::StickExtent`]: the reduce family PADS a sub-stick width up to
+    /// a whole stick and masks the pad lanes ([`reduce_stick_elems`] — the vendor's own
+    /// `[32, 514]` max fixture), so a fitted sub-stick reduce is a legal single shot. The
+    /// whole-stick law is a law OF THE SPLIT, and it lives where the split is decided: the
+    /// [`ReduceSlices`] type below cannot exist for a width that does not divide into
+    /// whole-stick slices.
+    cols: u32,
+    df: Df,
     /// The data's PARENT handle, declared at the parent's own full `[rows, parent_cols]`
     /// extents — the stick-major nest `col_of` addresses the slices within.
-    pub data: &'a Stk<D>,
-    /// The reduce window's base column in the parent (0 for a whole buffer) — a whole stick,
-    /// a whole-block shift of the op's own `[rows, cols]` slab.
-    pub data_col: u32,
+    data: &'a Stk<D>,
+    /// The reduce window's base column in the parent (0 for a whole buffer) — typed as the
+    /// whole-stick column window it must be: a sub-stick base sits mid-plane, so no slice
+    /// corner of it is a stick-major tensor of its own.
+    data_col: crate::addr::ColWindow,
     /// The result handle: `[rows, one stick]` at the reduce's own df.
-    pub accum: &'a Stk<A>,
-    pub accum_off: DevOff,
+    accum: &'a Stk<A>,
+    accum_off: DevOff,
     /// The place the partial synthetics mint under — the reduce's own place, whatever the
     /// caller holds for it.
-    pub parent: crate::place::PlaceId,
+    parent: crate::place::PlaceId,
     /// The caller's OWN core division — the probe must ask the tiler the question the caller's
     /// single-shot emission asks.
-    pub division: ReduceDivision,
+    division: ReduceDivision,
+}
+
+impl<'a, D: KindTag, A: KindTag> ReduceSplit<'a, D, A> {
+    /// THE ONE CONSTRUCTOR: the raw extents the caller holds, typed at the mint. `Err` names
+    /// the fact that made the type unmintable — a zero row count, or a column base that is not
+    /// a whole stick of the data's own parent — so the body below cannot spell an untyped
+    /// extent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        op_name: &'a str,
+        op: OpFunc,
+        rows: u32,
+        cols: u32,
+        data: &'a Stk<D>,
+        data_col: u32,
+        accum: &'a Stk<A>,
+        accum_off: DevOff,
+        parent: crate::place::PlaceId,
+        division: ReduceDivision,
+        df: Df,
+    ) -> Result<Self, String> {
+        let full = u32::try_from(data.layout().cols).unwrap_or(u32::MAX);
+        Ok(Self {
+            op_name,
+            op,
+            rows: std::num::NonZeroU32::new(rows)
+                .ok_or_else(|| format!("{op_name}: a long reduce needs at least one row"))?,
+            cols,
+            df,
+            data,
+            data_col: crate::addr::col_window_of(rows, full, data_col, df)
+                .map_err(|e| format!("{op_name}: {e}"))?,
+            accum,
+            accum_off,
+            parent,
+            division,
+        })
+    }
+}
+
+/// ⭐ THE SLICE COUNT of a split long reduce — a divisor of the reduced width that yields
+/// WHOLE-STICK slices. Minted only from the tiler's own `time` answer, so the TimeTile
+/// invariant ("every slice is a whole-stick run of every row") is the TYPE's law: a
+/// `ReduceSlices` cannot exist for a width that does not so divide, and the slice's element
+/// width is carried by the type, never re-derived at a use site.
+struct ReduceSlices {
+    time: u32,
+    slice_cols: u32,
+}
+
+impl ReduceSlices {
+    /// `Ok(None)` — the tiler answered one trip: the reduce fits, and the caller's own single
+    /// shot stands. `Err` — the tiler split a width that does not divide into whole-stick
+    /// slices: the TimeTile invariant is broken and no slice corner is addressable.
+    fn of(op_name: &str, time: u32, cols: u32, stick: u32) -> Result<Option<ReduceSlices>, String> {
+        if time <= 1 {
+            return Ok(None);
+        }
+        let slice_cols = cols / time;
+        if slice_cols == 0 || !slice_cols.is_multiple_of(stick) || slice_cols * time != cols {
+            return Err(format!(
+                "{op_name}: the tiler split the reduce {time}-ways but the reduced width {cols} \
+                 does not divide into {time} whole {stick}-element sticks — the TimeTile invariant \
+                 is broken and no slice corner is addressable"
+            ));
+        }
+        Ok(Some(ReduceSlices { time, slice_cols }))
+    }
 }
 
 /// ⭐ THE PROBE-AND-SPLIT BODY. `Ok(None)` = the reduce fits (or the cores split the reduced
 /// axis): the caller emits its own single descriptor unchanged. `Ok(Some(ops))` = the split —
-/// the caller extends with these INSTEAD of its single-shot reduce. A win-mint `Err` is a
-/// defect in this body's own window law and propagates; an opspec-build `Err` on the probe
-/// (an unmaskable pad, an fp32 exx2) is swallowed to `Ok(None)` so the caller's own single-shot
-/// path states its own named refusal for the same fact.
+/// the caller extends with these INSTEAD of its single-shot reduce. Every `Err` PROPAGATES:
+/// the probe states the caller's own single-shot opspec (the same op, rows, cols, df and
+/// division, its windows the caller's own extents against the caller's own handles), so an
+/// `Err` here is the same fact the caller's own single-shot builder refuses — stated once,
+/// here, with this body's op name. Swallowing it instead would turn a past-the-budget reduce
+/// into a silently-unsplit wrong program, which is the one thing this body exists to make
+/// impossible.
 pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
     s: ReduceSplit<'_, D, A>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Option<Vec<EmittedOp>>, String> {
-    let rows_t = crate::sdsc_abstract::RowCount::of_token_rows(s.rows);
+    let rows = s.rows.get();
+    let rows_t = crate::sdsc_abstract::RowCount::of_token_rows(rows);
     // The parent's full column extent, read off the handle — the nest every slice corner is
     // addressed within, the one law the caller cannot restate differently.
     let parent_cols = u32::try_from(s.data.layout().cols).unwrap_or(u32::MAX);
     let probe_data = win_reduce_data(
         layout,
         s.data,
-        crate::addr::col_of(s.rows, parent_cols, s.data_col, s.df),
+        s.data_col.dev(),
         rows_t,
         crate::sdsc_abstract::BlockCols::of_feature_cols(s.cols),
         s.df,
@@ -1055,58 +1130,52 @@ pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
         s.df,
         &format!("{}: the long-reduce probe's accum window", s.op_name),
     )?;
-    let probe = match reduce_opspec_off_divided(ReduceOffSpec {
+    let probe = reduce_opspec_off_divided(ReduceOffSpec {
         op: s.op,
-        rows: s.rows,
+        rows,
         cols: s.cols,
         data: probe_data,
         accum: probe_accum,
         df: s.df,
         division: s.division,
-    }) {
-        Ok(op) => op,
-        // The probe cannot state the op at all — the caller's own single-shot builder refuses
-        // the same fact by its own name; nothing here can split what cannot be stated.
-        Err(_) => return Ok(None),
-    };
-    let time = probe.time();
-    if time <= 1 || probe.iter.split_of("out") > 1 {
+    })
+    .map_err(|e| format!("{}: {e}", s.op_name))?;
+    if probe.iter.split_of("out") > 1 {
         return Ok(None);
     }
     let stick = s.df.elems_per_stick();
-    // A whole stick per slice by the TimeTile invariant — the tiler splits the stick dim, so
-    // `cols / time` is a whole stick of the op's own format. Stated as a law, not trusted.
-    let slice_cols = s.cols / time;
-    if slice_cols == 0 || !slice_cols.is_multiple_of(stick) || slice_cols * time != s.cols {
-        return Err(format!(
-            "{}: the tiler split the reduce {time}-ways but the reduced width {} does not \
-             divide into {time} whole {}-element sticks — the TimeTile invariant is broken and \
-             no slice corner is addressable",
-            s.op_name, s.cols, stick
-        ));
-    }
+    let Some(slices) = ReduceSlices::of(s.op_name, probe.time(), s.cols, stick)? else {
+        return Ok(None);
+    };
+    let time = slices.time;
+    let slice_cols = slices.slice_cols;
     // The partials: `time - 1` synthetics under the reduce's own place, one stick per row each,
     // so no two slice reduces share an output byte. Slice 0 seeds the CALLER's accum.
     use crate::place::SynthRole as R;
-    let partial_ids: Vec<crate::place::PlaceId> =
-        (1..time).map(|j| s.parent.synth(R::ReducePartial(j))).collect();
+    let partial_ids: Vec<crate::place::PlaceId> = (1..time)
+        .map(|j| s.parent.synth(R::ReducePartial(j)))
+        .collect();
     let partial_names: Vec<String> = partial_ids
         .iter()
         .map(|id| crate::placement::syn(layout, *id))
         .collect();
     if let Some(l) = layout {
         for id in &partial_ids {
-            l.synth(*id, &[s.rows, stick]);
+            l.synth(*id, &[rows, stick]);
         }
     }
     let partials: Vec<Stk<A>> = partial_names
         .iter()
-        .map(|n| partial_accum_handle(n, s.rows, stick, s.df))
+        .map(|n| partial_accum_handle(n, rows, stick, s.df))
         .collect::<Result<_, _>>()?;
     let mut ops: Vec<EmittedOp> = Vec::new();
     for j in 0..time {
-        let corner =
-            crate::addr::col_of(s.rows, parent_cols, s.data_col + j * slice_cols, s.df);
+        let corner = crate::addr::col_of(
+            rows,
+            parent_cols,
+            s.data_col.column() + j * slice_cols,
+            s.df,
+        );
         let op_name = format!("{}_p{j}_op", s.op_name);
         let data_win = win_reduce_data(
             layout,
@@ -1137,7 +1206,7 @@ pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
                 &format!("{op_name}: the slice's accum window (its own partial)"),
             )?
         };
-        let spec = reduce_opspec_off(s.op, s.rows, slice_cols, data_win, accum_win, s.df)?;
+        let spec = reduce_opspec_off(s.op, rows, slice_cols, data_win, accum_win, s.df)?;
         let folds = SdscFoldSet::new(spec.iter.cores_used());
         ops.push(
             crate::emit::emit_sdsc_tiled(&op_name, &spec, &folds, sym_id_base, layout)
@@ -1226,8 +1295,11 @@ mod long_reduce_split {
         Stk<crate::sdsc_abstract::RowBlockedTag>,
         Stk<crate::sdsc_abstract::RowBlockedTag>,
     ) {
-        let data = Stk::new("w", crate::sdsc_abstract::StickLayout::row_blocked(rows as usize, cols as usize))
-            .expect("the data handle mints");
+        let data = Stk::new(
+            "w",
+            crate::sdsc_abstract::StickLayout::row_blocked(rows as usize, cols as usize),
+        )
+        .expect("the data handle mints");
         let stick = <Fp16 as DataFormat>::ELEMS_PER_STICK;
         let accum = Stk::new(
             "j",
@@ -1251,23 +1323,28 @@ mod long_reduce_split {
         .expect("the fp32 flat data handle mints");
         let accum = Stk::<crate::sdsc_abstract::FlatTag>::new(
             "j",
-            crate::sdsc_abstract::StickLayout::flat_df(1, <Fp32 as DataFormat>::ELEMS_PER_STICK as usize, Df::Fp32),
+            crate::sdsc_abstract::StickLayout::flat_df(
+                1,
+                <Fp32 as DataFormat>::ELEMS_PER_STICK as usize,
+                Df::Fp32,
+            ),
         )
         .expect("the fp32 flat accum handle mints");
         let split = assemble_reduce_split(
-            ReduceSplit {
-                op_name: "max32",
-                op: OpFunc::Max,
-                rows: 1,
-                cols: 524_288,
-                df: Df::Fp32,
-                data: &data,
-                data_col: 0,
-                accum: &accum,
-                accum_off: DevOff::ZERO,
-                parent: crate::place::PlaceId::Act(1),
-                division: ReduceDivision::Rows,
-            },
+            ReduceSplit::new(
+                "max32",
+                OpFunc::Max,
+                1,
+                524_288,
+                &data,
+                0,
+                &accum,
+                DevOff::ZERO,
+                crate::place::PlaceId::Act(1),
+                ReduceDivision::Rows,
+                Df::Fp32,
+            )
+            .expect("the split request mints"),
             &mut 0i64,
             None,
         )
@@ -1284,23 +1361,27 @@ mod long_reduce_split {
     fn a_fitting_reduce_is_left_to_the_callers_single_shot() {
         let (data, accum) = handles(1, 4096);
         let split = assemble_reduce_split(
-            ReduceSplit {
-                op_name: "sum16",
-                op: OpFunc::Sum,
-                rows: 1,
-                cols: 4096,
-                df: Df::Fp16,
-                data: &data,
-                data_col: 0,
-                accum: &accum,
-                accum_off: DevOff::ZERO,
-                parent: crate::place::PlaceId::Act(1),
-                division: ReduceDivision::Rows,
-            },
+            ReduceSplit::new(
+                "sum16",
+                OpFunc::Sum,
+                1,
+                4096,
+                &data,
+                0,
+                &accum,
+                DevOff::ZERO,
+                crate::place::PlaceId::Act(1),
+                ReduceDivision::Rows,
+                Df::Fp16,
+            )
+            .expect("the split request mints"),
             &mut 0i64,
             None,
         )
         .expect("the split body runs");
-        assert!(split.is_none(), "a fitting reduce is the caller's own single shot");
+        assert!(
+            split.is_none(),
+            "a fitting reduce is the caller's own single shot"
+        );
     }
 }
