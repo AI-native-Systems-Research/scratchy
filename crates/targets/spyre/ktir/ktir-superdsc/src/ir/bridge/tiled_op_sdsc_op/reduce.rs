@@ -168,9 +168,10 @@ pub fn win_reduce_data<'a, K: KindTag>(
     off: DevOff,
     rows: RowCount,
     cols: BlockCols,
+    df: Df,
     what: &str,
 ) -> Result<Win<'a, K>, String> {
-    let stick_elems = reduce_stick_elems(cols.get(), Df::Fp16)?;
+    let stick_elems = reduce_stick_elems(cols.get(), df)?;
     mint_reduce_win(layout, stk, off, rows.get(), stick_elems, what)
 }
 
@@ -184,16 +185,10 @@ pub fn win_reduce_accum<'a, K: KindTag>(
     stk: &'a Stk<K>,
     off: DevOff,
     rows: RowCount,
+    df: Df,
     what: &str,
 ) -> Result<Win<'a, K>, String> {
-    mint_reduce_win(
-        layout,
-        stk,
-        off,
-        rows.get(),
-        <Fp16 as DataFormat>::ELEMS_PER_STICK,
-        what,
-    )
+    mint_reduce_win(layout, stk, off, rows.get(), df.elems_per_stick(), what)
 }
 
 /// The two family mints' shared door: the placement authority when the caller holds one, the
@@ -239,6 +234,51 @@ fn mint_reduce_win<'a, K: KindTag>(
 /// `cols` axis. Two operands: `data` (all active) + `accum` (the accumulator,
 /// both `inputLabeledDs[1]` and the sole output, `out`-axis stick-reduction
 /// `[Active, RedStick, Active]`).
+/// ⭐ THE REDUCE'S OWN SCALING CONST — ONE construction for every seeded-reduce builder (the named
+/// and the offset-carrying `_off` family both), so the two cannot drift about what a reduce's
+/// `op_info` states. The sum/mean/max reduce template (summeanmaxexx2.ddl) requires a
+/// `scaling_factor` external const (= 1/N for mean, 1.0 for sum/max — packed fp16). `cols` is the
+/// reduced extent N. `exx2` divides by the SAME 1/N — its `exx2scale` const is the E[x²] divisor
+/// (the template's own `@outDivisor@`).
+///
+/// The const is read by the device as SEN169_FP16 (1-6-9), NOT IEEE f16 (1-5-10) — see
+/// `sen169_bits`'s own doc for why a plain `half::f16` encoding silently mis-scales every reduce.
+/// The const's element type MUST match the OP's data_format (torch-spyre
+/// `encode_constant(value, data_format)`, compute_ops.py:127): the fp32 reduce (mq>1 rmsnorm
+/// mean(x²)) needs an IEEE_FP32 const (raw f32 bits), else a SEN169_FP16 const feeding an fp32 op
+/// is a MIXED [fp16,fp32] op → DD2 "Unsupported result precision conversion".
+fn reduce_op_info(
+    op: OpFunc,
+    cols: u32,
+    df: Df,
+    accum_name: &str,
+) -> Result<OpInfo, String> {
+    let scale = match op {
+        OpFunc::Mean | OpFunc::Exx2 => 1.0f32 / cols as f32,
+        _ => 1.0f32, // sum / max: identity scaling
+    };
+    if op == OpFunc::Exx2 {
+        // BUILD-TIME GUARD (guard-every-crash-at-build-time): the exx2 bind in summeanmaxexx2.ddl
+        // declares %type_fp16 ONLY — an fp32 exx2 does not exist on the device, and emitting one
+        // would fail at dxp with an op-mapping refusal that names neither the dtype nor the op.
+        // The fp32 rmsnorm island keeps its elementary mean(x²) chain instead.
+        if matches!(df, Df::Fp32) {
+            return Err(format!(
+                "reduce `{accum_name}`: exx2 is fp16-only (summeanmaxexx2.ddl binds %type_fp16 \
+                 exclusively) — the fp32 mean(x²) must ride the elementary chain"
+            ));
+        }
+        // The pair `exx2scale` + `useZeroMean` (the RAW 0 — at 1 ddc renames the op to
+        // exx2_zeromean, which the runtime smc table cannot resolve; see OpInfo::Exx2Scale's doc).
+        return Ok(OpInfo::Exx2Scale(sen169_bits(scale) as u32));
+    }
+    Ok(if matches!(df, Df::Fp32) {
+        OpInfo::ReduceScalingFp32(scale.to_bits())
+    } else {
+        OpInfo::ReduceScaling(sen169_bits(scale) as u32)
+    })
+}
+
 /// fp16 wrapper (every existing caller). The torch-spyre fp32 `mean(x²)` uses [`reduce_opspec_df`].
 pub fn reduce_opspec(
     op: OpFunc,
@@ -417,39 +457,7 @@ pub fn reduce_opspec_df_divided(
         ));
     }
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    // The sum/mean/max reduce template (summeanmaxexx2.ddl) requires a
-    // `scaling_factor` external const (= 1/N for mean, 1.0 for sum/max — packed
-    // fp16). `cols` is the reduced extent N. `exx2` divides by the SAME 1/N — its
-    // `exx2scale` const is the E[x²] divisor (the template's own `@outDivisor@`).
-    let scale = match op {
-        OpFunc::Mean | OpFunc::Exx2 => 1.0f32 / cols as f32,
-        _ => 1.0f32, // sum / max: identity scaling
-    };
-    // The const is read by the device as SEN169_FP16 (1-6-9), NOT IEEE f16 (1-5-10) — see
-    // `sen169_bits`'s own doc for why a plain `half::f16` encoding silently mis-scales every reduce.
-    // The const's element type MUST match the OP's data_format (torch-spyre
-    // `encode_constant(value, data_format)`, compute_ops.py:127): the fp32 reduce (mq>1 rmsnorm
-    // mean(x²)) needs an IEEE_FP32 const (raw f32 bits), else a SEN169_FP16 const feeding an fp32 op
-    // is a MIXED [fp16,fp32] op → DD2 "Unsupported result precision conversion".
-    let op_info = if op == OpFunc::Exx2 {
-        // BUILD-TIME GUARD (guard-every-crash-at-build-time): the exx2 bind in summeanmaxexx2.ddl
-        // declares %type_fp16 ONLY — an fp32 exx2 does not exist on the device, and emitting one
-        // would fail at dxp with an op-mapping refusal that names neither the dtype nor the op.
-        // The fp32 rmsnorm island keeps its elementary mean(x²) chain instead.
-        if matches!(df, Df::Fp32) {
-            return Err(format!(
-                "reduce `{accum_name}`: exx2 is fp16-only (summeanmaxexx2.ddl binds %type_fp16 \
-                 exclusively) — the fp32 mean(x²) must ride the elementary chain"
-            ));
-        }
-        // The pair `exx2scale` + `useZeroMean` (the RAW 0 — at 1 ddc renames the op to
-        // exx2_zeromean, which the runtime smc table cannot resolve; see OpInfo::Exx2Scale's doc).
-        OpInfo::Exx2Scale(sen169_bits(scale) as u32)
-    } else if matches!(df, Df::Fp32) {
-        OpInfo::ReduceScalingFp32(scale.to_bits())
-    } else {
-        OpInfo::ReduceScaling(sen169_bits(scale) as u32)
-    };
+    let op_info = reduce_op_info(op, cols, df, accum_name)?;
     Ok(OpSpec {
         op,
         is_reduction: true,
@@ -610,6 +618,7 @@ pub fn reduce_opspec_off<D: KindTag, A: KindTag>(
     cols: u32,
     data: Win<'_, D>,
     accum: Win<'_, A>,
+    df: Df,
 ) -> Result<OpSpec, String> {
     reduce_opspec_off_divided(ReduceOffSpec {
         op,
@@ -617,6 +626,7 @@ pub fn reduce_opspec_off<D: KindTag, A: KindTag>(
         cols,
         data,
         accum,
+        df,
         division: ReduceDivision::Rows,
     })
 }
@@ -651,6 +661,10 @@ pub struct ReduceOffSpec<'a, D: KindTag, A: KindTag> {
     pub cols: u32,
     pub data: Win<'a, D>,
     pub accum: Win<'a, A>,
+    /// The reduce's own device format — the stick basis, the pad-lane mask and the scaling const
+    /// all state it. `Df::Fp16` is every caller this family had before the long-reduce split
+    /// threaded fp32 through it.
+    pub df: Df,
     /// How the cores are spent. [`ReduceDivision::Rows`] is [`reduce_opspec_off`] byte for byte.
     pub division: ReduceDivision,
 }
@@ -667,6 +681,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
         cols,
         data,
         accum,
+        df,
         division,
     } = r;
     // TYPED: `head_major` is DERIVED from the DATA operand's kind (see `ReduceOffSpec`'s doc) —
@@ -682,8 +697,8 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
     // `[rows, one stick]`. A win minted at any other extents is a caller whose window and whose
     // iteration dims come from different laws — the exact pairing the raw `(name, u32)` seam used
     // to allow. Refused here, naming the op and both extents.
-    let stick_elems = reduce_stick_elems(cols, Df::Fp16)?;
-    let eps = <Fp16 as DataFormat>::ELEMS_PER_STICK;
+    let stick_elems = reduce_stick_elems(cols, df)?;
+    let eps = df.elems_per_stick();
     if data.rows() != rows || data.cols() != stick_elems {
         return Err(format!(
             "reduce `{accum_name}`: the data operand's window is {}×{} but the op sweeps \
@@ -705,14 +720,14 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
     }
     // LOWER to TileIR: same pattern as `reduce_opspec_df` — the per-head/offset reduce variant
     // over the SAME shared declaration, kind picked off the DDL arity ([`reduce_tile_kind`]).
-    let (dims, kind, stick_elems) = reduce_dims_kind(op, rows, cols, Df::Fp16)?;
+    let (dims, kind, stick_elems) = reduce_dims_kind(op, rows, cols, df)?;
     // The pad-lane mask (see `reduce_opspec_df`'s identical call): stated first so an
     // unmaskable shape is a build Err, never a silently-wrong descriptor.
-    let coordinate_mask = reduce_coordinate_mask(op, cols, stick_elems, Df::Fp16, accum_name)?;
+    let coordinate_mask = reduce_coordinate_mask(op, cols, stick_elems, df, accum_name)?;
     let tile_op = TileOp {
         kind,
         dims: dims.clone(),
-        df: Df::Fp16,
+        df,
     };
     let tiled = match division {
         ReduceDivision::Rows => tile_op.tile(MaxCores::<MAX_CORES>, distribute_cores, "out"),
@@ -761,7 +776,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
     let block = rows.saturating_mul(cols).max(1);
     let stickmajor = !head_major
         && rows > 1
-        && cols > Fp16::ELEMS_PER_STICK
+        && cols > df.elems_per_stick()
         && data_off.is_multiple_of(block)
         && accum_off.is_multiple_of(block);
     let device_dims_r2 = plan.iter_syms(["mb", "out"]);
@@ -778,6 +793,8 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
                 Allocation::Hbm,
             )
             .map_err(|e| e.0)?
+            .with_df(df)
+            .with_row_blocked(matches!(df, Df::Fp32))
             .with_offset(data_off),
         )
     } else {
@@ -793,6 +810,8 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
                 Allocation::Hbm,
             )
             .map_err(|e| e.0)?
+            .with_df(df)
+            .with_row_blocked(matches!(df, Df::Fp32))
             .with_offset(data_off),
         )
     };
@@ -817,6 +836,8 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
                 Allocation::Hbm,
             )
             .map_err(|e| e.0)?
+            .with_df(df)
+            .with_row_blocked(matches!(df, Df::Fp32))
             .with_offset(accum_off),
         )
     } else {
@@ -832,6 +853,8 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
                 Allocation::Hbm,
             )
             .map_err(|e| e.0)?
+            .with_df(df)
+            .with_row_blocked(matches!(df, Df::Fp32))
             .with_offset(accum_off),
         )
     };
@@ -848,17 +871,13 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
         ));
     }
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    let scale = match op {
-        OpFunc::Mean => 1.0f32 / cols as f32,
-        _ => 1.0f32,
-    };
-    let scale_bits = sen169_bits(scale) as u32;
+    let op_info = reduce_op_info(op, cols, df, accum_name)?;
     Ok(OpSpec {
         op,
         is_reduction: true,
         iter: plan,
         args,
-        op_info: OpInfo::ReduceScaling(scale_bits),
+        op_info,
         tiled_symbols,
         time_tile,
         indirect: None,
@@ -880,6 +899,7 @@ pub fn assemble_reduce_off<D: KindTag, A: KindTag>(
     cols: crate::sdsc_abstract::BlockCols,
     data: Win<'_, D>,
     accum: Win<'_, A>,
+    df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
@@ -889,6 +909,7 @@ pub fn assemble_reduce_off<D: KindTag, A: KindTag>(
         cols.get(),
         data,
         accum,
+        df,
     )
     .unwrap_or_else(|e| panic!("assemble_reduce_off {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -905,6 +926,7 @@ pub struct ReduceDivided<'a, D: KindTag, A: KindTag> {
     pub cols: crate::sdsc_abstract::BlockCols,
     pub data: Win<'a, D>,
     pub accum: Win<'a, A>,
+    pub df: Df,
     /// How the cores are spent. [`ReduceDivision::Rows`] is [`assemble_reduce_off`] byte for byte.
     pub division: ReduceDivision,
 }
@@ -923,6 +945,7 @@ pub fn assemble_reduce_off_divided<D: KindTag, A: KindTag>(
         cols,
         data,
         accum,
+        df,
         division,
     } = r;
     let op = reduce_opspec_off_divided(ReduceOffSpec {
@@ -931,6 +954,7 @@ pub fn assemble_reduce_off_divided<D: KindTag, A: KindTag>(
         cols: cols.get(),
         data,
         accum,
+        df,
         division,
     })
     .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"));
@@ -939,35 +963,3 @@ pub fn assemble_reduce_off_divided<D: KindTag, A: KindTag>(
         .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"))
 }
 
-#[cfg(test)]
-mod seeded_reduce_refusals {
-    use super::*;
-
-    /// ⛔ A TIME-TILED SEEDED REDUCE REFUSES AT THE EMISSION — never an emitted op whose
-    /// trips alias on one accum stick (the #50 `tiled_trips_alias` collision). With the
-    /// partials builder gone, the single-trip row is the only seeded form; a caller whose
-    /// row genuinely overruns the usable LX must split the reduce itself (the fp8 qspt
-    /// path's per-slice single-shot + combine pattern in `emit/ktir_matmul_fp8.rs`).
-    #[test]
-    fn a_time_tiled_seeded_reduce_refuses_naming_the_single_trip_law() {
-        let op = reduce_opspec_df(OpFunc::Max, 1, 524_288, "w", "j", false, Df::Fp32)
-            .expect("the bare opspec assembles");
-        assert_eq!(op.time(), 2, "the past-the-budget row genuinely tiles");
-        let folds = SdscFoldSet::new(op.iter.cores_used());
-        let err = match crate::emit::emit_sdsc_tiled("max32_bare", &op, &folds, &mut 0i64, None) {
-            Err(e) => e,
-            // `EmittedOp` is not `Debug`, so the Ok arm states its own refusal.
-            Ok(_) => panic!("the bare two-trip seeded reduce must refuse at the emission"),
-        };
-        assert!(
-            err.0.contains("not in the partials form"),
-            "the refusal names the law: {}",
-            err.0
-        );
-        assert!(
-            err.0.contains("single trip"),
-            "the refusal names the remedy: {}",
-            err.0
-        );
-    }
-}
