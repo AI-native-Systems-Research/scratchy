@@ -646,14 +646,14 @@ pub enum ReduceDivision {
 }
 
 /// ⭐ THE EXTENT A SEEDED REDUCE'S SCALING CONST DIVIDES BY (mean/exx2's 1/N): the reduce's
-/// LOGICAL reduced extent. Private field, TWO mints and no others —
-/// [`Self::whole`] (the scaling extent IS the reduce's own width, every whole reduce) and
-/// [`Self::parent`] (a long-reduce SLICE stating its parent reduce's extent, with the slice's
-/// own width handed in so the mint can refuse a parent smaller than the slice it supposedly
-/// contains). No caller can therefore state a scaling extent smaller than the width it
-/// sweeps: the law `scaling ≥ cols` is the type's own, and the partials-add-to-the-
-/// single-shot law (every slice carries the SAME 1/N, never its own slice width) holds by
-/// construction.
+/// LOGICAL reduced extent. Private field, TWO mints and no others — [`Self::whole`] (the
+/// scaling extent IS the reduce's own width, every whole reduce) and [`ReduceSlices`]'s own
+/// (`scaling_of`, a long-reduce SLICE stating the parent extent the slices were minted FROM
+/// — infallible, because slice j's width ≤ the parent's extent is `ReduceSlices`'s own
+/// construction law). No caller can therefore state a scaling extent smaller than the width
+/// it sweeps: the law `scaling ≥ cols` is the type's own, and the
+/// partials-add-to-the-single-shot law (every slice carries the SAME 1/N, never its own
+/// slice width) holds by construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScalingExtent {
     cols: u32,
@@ -664,22 +664,6 @@ impl ScalingExtent {
     /// plain constructor ([`reduce_opspec_off`]) states.
     pub fn whole(cols: u32) -> Self {
         Self { cols }
-    }
-
-    /// A long-reduce SLICE: the PARENT reduce's extent, taken beside the slice's own width.
-    /// `Err` is the ONE mint of the containment law — a parent smaller than the slice it
-    /// claims to contain is a caller whose split arithmetic is wrong, refused by name rather
-    /// than silently scaled.
-    pub fn parent(slice_cols: u32, parent_cols: u32) -> Result<Self, String> {
-        if parent_cols < slice_cols {
-            return Err(format!(
-                "a long-reduce slice {slice_cols} wide cannot state a scaling extent of \
-                 {parent_cols} — the parent reduce is smaller than the slice it must contain. \
-                 The slice's scaling const divides by its PARENT's extent; a parent below the \
-                 slice's own width is a defect in the split that built it."
-            ));
-        }
-        Ok(Self { cols: parent_cols })
     }
 
     /// The extent itself — private to this module, read once where the scaling const is built.
@@ -1084,40 +1068,99 @@ pub struct ReduceSplit<'a, D: KindTag, A: KindTag> {
     division: ReduceDivision,
 }
 
-impl<'a, D: KindTag, A: KindTag> ReduceSplit<'a, D, A> {
-    /// THE ONE CONSTRUCTOR: the raw extents the caller holds, typed at the mint. `Err` names
-    /// the fact that made the type unmintable — a zero row count, or a column base that is not
-    /// a whole stick of the data's own parent — so the body below cannot spell an untyped
-    /// extent.
-    #[allow(clippy::too_many_arguments)]
+/// ⭐ THE SPLIT'S GEOMETRY — the reduce's own facts as ONE value: the op, the row count,
+/// the reduced extent, the device format, and the caller's core division. `rows` enters
+/// RAW here and nowhere else — the one mint of the row count a split can state.
+#[derive(Clone, Copy, Debug)]
+pub struct ReduceGeometry {
+    op: OpFunc,
+    rows: std::num::NonZeroU32,
+    cols: u32,
+    df: Df,
+    division: ReduceDivision,
+}
+
+impl ReduceGeometry {
+    /// THE ONE MINT of the row count: a zero-row reduce has no output byte to combine
+    /// into, so the raw `u32` a program states is non-zero or the build refuses here.
     pub fn new(
-        op_name: &'a str,
         op: OpFunc,
         rows: u32,
         cols: u32,
-        data: &'a Stk<D>,
-        data_col: u32,
-        accum: &'a Stk<A>,
-        accum_off: DevOff,
-        parent: crate::place::PlaceId,
-        division: ReduceDivision,
         df: Df,
+        division: ReduceDivision,
     ) -> Result<Self, String> {
-        let full = u32::try_from(data.layout().cols).unwrap_or(u32::MAX);
         Ok(Self {
-            op_name,
             op,
             rows: std::num::NonZeroU32::new(rows)
-                .ok_or_else(|| format!("{op_name}: a long reduce needs at least one row"))?,
+                .ok_or_else(|| "a long reduce needs at least one row".to_string())?,
             cols,
             df,
-            data,
-            data_col: crate::addr::col_window_of(rows, full, data_col, df)
-                .map_err(|e| format!("{op_name}: {e}"))?,
-            accum,
-            accum_off,
-            parent,
             division,
+        })
+    }
+}
+
+/// The split's DATA leg — the PARENT handle and its base column in the parent, ONE value.
+/// The column is minted to a whole-stick [`ColWindow`] by [`ReduceSplit::new`], against the
+/// geometry's own row count and the handle's own full width, so a sub-stick base (a corner
+/// that sits mid-plane) is refused at that one mint.
+pub struct ReduceDataLeg<'a, D: KindTag> {
+    stk: &'a Stk<D>,
+    col: u32,
+}
+
+impl<'a, D: KindTag> ReduceDataLeg<'a, D> {
+    /// The leg at the parent's own column 0 — every whole-buffer caller.
+    pub fn whole(stk: &'a Stk<D>) -> Self {
+        Self { stk, col: 0 }
+    }
+
+    /// The leg at a stated base column — a per-head window's offset in the parent.
+    pub fn at_column(stk: &'a Stk<D>, col: u32) -> Self {
+        Self { stk, col }
+    }
+}
+
+/// The split's ACCUM leg — the result handle and its device offset, ONE value. Both facts
+/// are already typed ([`Stk`], [`DevOff`]); the leg is the grouping, not a new law.
+pub struct ReduceAccumLeg<'a, A: KindTag> {
+    stk: &'a Stk<A>,
+    off: DevOff,
+}
+
+impl<'a, A: KindTag> ReduceAccumLeg<'a, A> {
+    pub fn new(stk: &'a Stk<A>, off: DevOff) -> Self {
+        Self { stk, off }
+    }
+}
+
+impl<'a, D: KindTag, A: KindTag> ReduceSplit<'a, D, A> {
+    /// THE ONE CONSTRUCTOR: the grouped facts the caller holds, typed at the mint. The one
+    /// `Err` is the data leg's column mint ([`col_window_of`] — a base column that is not a
+    /// whole stick of the data's own parent); the row count's mint lives on
+    /// [`ReduceGeometry::new`], so the body below cannot spell an untyped extent.
+    pub fn new(
+        op_name: &'a str,
+        geometry: ReduceGeometry,
+        data: ReduceDataLeg<'a, D>,
+        accum: ReduceAccumLeg<'a, A>,
+        parent: crate::place::PlaceId,
+    ) -> Result<Self, String> {
+        let full = u32::try_from(data.stk.layout().cols).unwrap_or(u32::MAX);
+        Ok(Self {
+            op_name,
+            op: geometry.op,
+            rows: geometry.rows,
+            cols: geometry.cols,
+            df: geometry.df,
+            data: data.stk,
+            data_col: crate::addr::col_window_of(geometry.rows.get(), full, data.col, geometry.df)
+                .map_err(|e| format!("{op_name}: {e}"))?,
+            accum: accum.stk,
+            accum_off: accum.off,
+            parent,
+            division: geometry.division,
         })
     }
 }
@@ -1140,6 +1183,8 @@ struct ReduceSlices {
     time: u32,
     slice_cols: u32,
     last_cols: u32,
+    /// The PARENT reduce's logical extent — the width every slice's scaling const divides by.
+    whole_cols: u32,
 }
 
 impl ReduceSlices {
@@ -1153,6 +1198,7 @@ impl ReduceSlices {
             time,
             slice_cols,
             last_cols: cols - (time - 1) * slice_cols,
+            whole_cols: cols,
         }
     }
 
@@ -1162,6 +1208,18 @@ impl ReduceSlices {
             self.last_cols
         } else {
             self.slice_cols
+        }
+    }
+
+    /// Slice `j`'s SCALING extent — the parent's, which the slices were minted from.
+    /// INFALLIBLE by this type's own construction law: every slice's width (whole-stick runs
+    /// of `cols`' padded sticks, the last one its raw remainder) is at most `whole_cols`, so
+    /// no slice can state a scaling extent smaller than the width it sweeps. This is the
+    /// slice's ONLY mint of a [`ScalingExtent`] — the fact the split already knows, stated
+    /// where it is known, never re-derived or re-checked by the caller.
+    fn scaling_of(&self, _j: u32) -> ScalingExtent {
+        ScalingExtent {
+            cols: self.whole_cols,
         }
     }
 }
@@ -1292,7 +1350,7 @@ pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
             accum: accum_win,
             df: s.df,
             division: ReduceDivision::Rows,
-            scaling: ScalingExtent::parent(slice_cols, s.cols)?,
+            scaling: slices.scaling_of(j),
         })?;
         let folds = SdscFoldSet::new(spec.iter.cores_used());
         ops.push(
@@ -1487,16 +1545,11 @@ mod long_reduce_split {
         let split = assemble_reduce_split(
             ReduceSplit::new(
                 "max32",
-                OpFunc::Max,
-                1,
-                524_288,
-                &data,
-                0,
-                &accum,
-                DevOff::ZERO,
+                ReduceGeometry::new(OpFunc::Max, 1, 524_288, Df::Fp32, ReduceDivision::Rows)
+                    .expect("the split's geometry mints"),
+                ReduceDataLeg::whole(&data),
+                ReduceAccumLeg::new(&accum, DevOff::ZERO),
                 crate::place::PlaceId::Act(1),
-                ReduceDivision::Rows,
-                Df::Fp32,
             )
             .expect("the split request mints"),
             &mut 0i64,
@@ -1517,16 +1570,11 @@ mod long_reduce_split {
         let split = assemble_reduce_split(
             ReduceSplit::new(
                 "sum16",
-                OpFunc::Sum,
-                1,
-                4096,
-                &data,
-                0,
-                &accum,
-                DevOff::ZERO,
+                ReduceGeometry::new(OpFunc::Sum, 1, 4096, Df::Fp16, ReduceDivision::Rows)
+                    .expect("the split's geometry mints"),
+                ReduceDataLeg::whole(&data),
+                ReduceAccumLeg::new(&accum, DevOff::ZERO),
                 crate::place::PlaceId::Act(1),
-                ReduceDivision::Rows,
-                Df::Fp16,
             )
             .expect("the split request mints"),
             &mut 0i64,
@@ -1578,16 +1626,11 @@ mod long_reduce_split {
         let split = assemble_reduce_split(
             ReduceSplit::new(
                 "mean16",
-                OpFunc::Mean,
-                1,
-                cols,
-                &data,
-                0,
-                &accum,
-                DevOff::ZERO,
+                ReduceGeometry::new(OpFunc::Mean, 1, cols, Df::Fp16, ReduceDivision::Rows)
+                    .expect("the split's geometry mints"),
+                ReduceDataLeg::whole(&data),
+                ReduceAccumLeg::new(&accum, DevOff::ZERO),
                 crate::place::PlaceId::Act(1),
-                ReduceDivision::Rows,
-                Df::Fp16,
             )
             .expect("the split request mints"),
             &mut 0i64,

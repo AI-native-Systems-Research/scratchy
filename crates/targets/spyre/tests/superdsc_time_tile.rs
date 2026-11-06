@@ -255,7 +255,8 @@ fn reduce_and_multiop_invariants() {
         None,
         &mut sym,
         None,
-    );
+    )
+    .expect("the rmsnorm chain lowers — its long-reduce split, when it fires, is the same law");
     assert_eq!(ops.len(), 5, "the exx2 head fuses rmsq+rmmean: 6 ops → 5");
     assert!(
         ops.iter().all(|o| o.op_name != "rmsq_g"),
@@ -401,6 +402,7 @@ fn rmsnorm_rinv_is_pinned_lx() {
             &mut sym,
             Some(&l),
         )
+        .expect("the rmsnorm chain lowers at every rung — a refusal is a broken rung, not a skip")
     };
     let json_of = |op: &emit::EmittedOp| -> (String, serde_json::Value) {
         (
@@ -574,6 +576,7 @@ fn norm(
         sym,
         Some(l),
     )
+    .expect("the interleave fixture's norm lowers — the LX slot laws it pins need the ops")
 }
 
 #[test]
@@ -1454,7 +1457,8 @@ fn dump_gate_bundles() {
         None,
         &mut sym,
         None,
-    );
+    )
+    .expect("the card gate's rmsnorm chain lowers — there is nothing to bake otherwise");
     eprintln!("→ BAKING rmsnorm gate: {} ops", rms.len());
     superdsc::write_dxp_input(&root.join("rmsnorm"), &rms, superdsc::FoldGrouping::Split).unwrap();
     // (E) SLICE gate: add(x[:,0:64], x[:,64:128]) — the RoPE slice-operand probe.

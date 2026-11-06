@@ -39,7 +39,8 @@ use super::{
     pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
-    ReduceDivision, ReduceSplit, assemble_reduce_split, partial_accum_handle, reduce_data_handle,
+    ReduceAccumLeg, ReduceDataLeg, ReduceDivision, ReduceGeometry, ReduceSplit,
+    assemble_reduce_split, partial_accum_handle, reduce_data_handle,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
@@ -9753,16 +9754,17 @@ pub fn windowed_rmsnorm(
         let split = assemble_reduce_split(
             ReduceSplit::new(
                 &rmmean_op,
-                op_func_from_str("mean"),
-                t_rows.get(),
-                d,
-                &sq16_h,
-                h * d,
-                &mean_h,
-                crate::addr::DevOff::ZERO,
+                ReduceGeometry::new(
+                    op_func_from_str("mean"),
+                    t_rows.get(),
+                    d,
+                    crate::superdsc_opspec::Df::Fp16,
+                    ReduceDivision::Rows,
+                )
+                .map_err(|e| Error { message: e })?,
+                ReduceDataLeg::at_column(&sq16_h, h * d),
+                ReduceAccumLeg::new(&mean_h, crate::addr::DevOff::ZERO),
                 out_id,
-                ReduceDivision::Rows,
-                crate::superdsc_opspec::Df::Fp16,
             )
             .map_err(|e| Error { message: e })?,
             sym_id_base,
@@ -10564,16 +10566,19 @@ pub fn reduce(
             let split = assemble_reduce_split(
                 ReduceSplit::new(
                     &op_name,
-                    op_func_from_str(kind.op_func()),
-                    rows,
-                    cols,
-                    &data_h,
-                    0,
-                    &accum_h,
-                    crate::addr::DevOff::ZERO,
+                    ReduceGeometry::new(
+                        op_func_from_str(kind.op_func()),
+                        rows,
+                        cols,
+                        Df::Fp16,
+                        layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
+                    )
+                    .map_err(|e| Error {
+                        message: format!("{name}: {e}"),
+                    })?,
+                    ReduceDataLeg::whole(&data_h),
+                    ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
                     PlaceId::Act(out.tid),
-                    layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
-                    Df::Fp16,
                 )
                 .map_err(|e| Error {
                     message: format!("{name}: {e}"),
@@ -10628,16 +10633,19 @@ pub fn reduce(
             let split = assemble_reduce_split(
                 ReduceSplit::new(
                     &op_name,
-                    op_func_from_str(kind.op_func()),
-                    rows,
-                    cols,
-                    &data_h,
-                    0,
-                    &accum_h,
-                    crate::addr::DevOff::ZERO,
+                    ReduceGeometry::new(
+                        op_func_from_str(kind.op_func()),
+                        rows,
+                        cols,
+                        Df::Fp32,
+                        ReduceDivision::Rows,
+                    )
+                    .map_err(|e| Error {
+                        message: format!("{name}: {e}"),
+                    })?,
+                    ReduceDataLeg::whole(&data_h),
+                    ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
                     PlaceId::Act(out.tid),
-                    ReduceDivision::Rows,
-                    Df::Fp32,
                 )
                 .map_err(|e| Error {
                     message: format!("{name}: {e}"),
@@ -10738,16 +10746,19 @@ pub fn reduce_df(
     let split = assemble_reduce_split(
         ReduceSplit::new(
             &op_name,
-            op_func_from_str(kind.op_func()),
-            rows,
-            cols,
-            &data_h,
-            0,
-            &accum_h,
-            crate::addr::DevOff::ZERO,
+            ReduceGeometry::new(
+                op_func_from_str(kind.op_func()),
+                rows,
+                cols,
+                df,
+                ReduceDivision::Rows,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?,
+            ReduceDataLeg::whole(&data_h),
+            ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
             PlaceId::Act(out.tid),
-            ReduceDivision::Rows,
-            df,
         )
         .map_err(|e| Error {
             message: format!("{name}: {e}"),

@@ -27,7 +27,10 @@
 //! moments are computed in, E[x] simply unread), taking the chain from 6 descriptors to 5.
 //! See [`OpFunc::Exx2`]'s doc for the full wire contract.
 
-use super::reduce::{ReduceDivision, ReduceSplit, assemble_reduce_seeded, assemble_reduce_split};
+use super::reduce::{
+    ReduceAccumLeg, ReduceDataLeg, ReduceDivision, ReduceGeometry, ReduceSplit,
+    assemble_reduce_seeded, assemble_reduce_split,
+};
 use crate::emit::{EmittedOp, In, op_func_from_str, pw1, pw2, rb};
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{BlockCols, Lanes, RowCount};
@@ -144,16 +147,16 @@ pub fn assemble_rmsnorm(
     let split = assemble_reduce_split(
         ReduceSplit::new(
             &rmmean_op,
-            op_func_from_str("exx2"),
-            rows,
-            cols,
-            &x,
-            0,
-            &mean,
-            crate::addr::DevOff::ZERO,
+            ReduceGeometry::new(
+                op_func_from_str("exx2"),
+                rows,
+                cols,
+                Df::Fp16,
+                layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
+            )?,
+            ReduceDataLeg::whole(&x),
+            ReduceAccumLeg::new(&mean, crate::addr::DevOff::ZERO),
             out_id,
-            layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
-            Df::Fp16,
         )?,
         sym_id_base,
         layout,
@@ -333,16 +336,16 @@ pub fn assemble_rmsnorm_unit(
     let split = assemble_reduce_split(
         ReduceSplit::new(
             &rmmean_op,
-            op_func_from_str("mean"),
-            rows,
-            cols,
-            &sq16,
-            0,
-            &mean,
-            crate::addr::DevOff::ZERO,
+            ReduceGeometry::new(
+                op_func_from_str("mean"),
+                rows,
+                cols,
+                Df::Fp16,
+                layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
+            )?,
+            ReduceDataLeg::whole(&sq16),
+            ReduceAccumLeg::new(&mean, crate::addr::DevOff::ZERO),
             out_id,
-            layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
-            Df::Fp16,
         )?,
         sym_id_base,
         layout,
