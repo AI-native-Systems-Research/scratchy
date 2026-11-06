@@ -3047,6 +3047,24 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
                 1,
                 "one chain per gained program (m={m} c={c})"
             );
+            // ⛔ THE GAIN LEG IS CLAIMED ON THE REAL SPLICED PROGRAM, at every row count — the
+            // one-row tile included, where the row's spray is extent-1, the producer folds the
+            // broadcast away, and only the leg's own `[1, cols]` shape states the row. A close
+            // as the identity here would flip every decode-bucket norm to the unit form and
+            // move the gained bundles (the g2bfp8 gate's measured diff).
+            assert!(
+                match gain {
+                    GainConvention::Scale => matches!(
+                        chains[0].gain,
+                        ktir_superdsc::emit::whole_function::GainLeg::Scale(_)
+                    ),
+                    GainConvention::OnePlusScale => matches!(
+                        chains[0].gain,
+                        ktir_superdsc::emit::whole_function::GainLeg::OnePlusScale(_)
+                    ),
+                },
+                "the real spliced {gain:?} program claims its gain row (m={m} c={c})"
+            );
             let sticks = rmsnorm_scalar_sticks(f.func.operations);
             assert_eq!(
                 sticks.len(),

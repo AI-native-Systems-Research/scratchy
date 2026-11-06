@@ -357,26 +357,35 @@ impl RmsNormChain {
     /// the Scale convention and for the identity gain. The ONE place the leg is matched for its
     /// offset: the walk's classification, the emission's `Lowering::RmsNorm` arm and
     /// `triton-ktir-superdsc`'s registry planner all read it from here, so no reader can state a
-    /// different formula for one program.
+    /// different formula for one program. The offset carries no field of its own — the `+1` IS
+    /// [`GainLeg::OnePlusScale`]'s meaning, and this match is the one site that states the
+    /// constant the registry stage needs.
     pub fn gain_offset(&self) -> Option<f32> {
         match self.gain {
-            GainLeg::Row { ones, .. } => ones,
-            GainLeg::Identity => None,
+            GainLeg::OnePlusScale(_) => Some(1.0),
+            GainLeg::Scale(_) | GainLeg::Identity => None,
         }
     }
 }
 
-/// A norm's gain — the two values the chain's last factor can be.
+/// A norm's gain — the values the chain's last factor can be. The two learned forms are two
+/// VARIANTS, not one variant with an offset field: the `(1 + w)` convention's `+1` is stated by
+/// which variant the leg closed as, never by an `f32` the reader must check — a value other
+/// than the convention's own 1.0 is a producer bug the recogniser refuses BY NAME, not a value
+/// this type carries for a reader to re-validate.
 #[derive(Clone, Debug)]
 pub enum GainLeg {
-    /// The learned gain row the chain's last multiply applies (`n1` / `gamma`), with the
-    /// OnePlusScale gain offset: `Some(1.0)` when the gain leg is `(1 + gamma)` rather than
-    /// `gamma` — ONE `arith.addf` over the loaded row with a splatted constant, consumed by the
-    /// chain exactly as the rank plumbing is. `None` is the Scale convention (no addf); the only
-    /// admitted value is 1.0 — `GainConvention::from_offset`'s own law, refused by name otherwise.
-    /// Read per chain the way [`super::lower_ktir_to_superdsc::rmsnorm`]'s `program_gain_offset`
-    /// reads it, so the two doors cannot state different formulas for one program.
-    Row { gamma: Ssa, ones: Option<f32> },
+    /// The learned gain row the chain's last multiply applies (`n1` / `gamma`), HF's plain
+    /// `weight` convention — no offset addf on the leg. Read per chain the way
+    /// [`super::lower_ktir_to_superdsc::rmsnorm`]'s `program_gain_offset` reads it, so the two
+    /// doors cannot state different formulas for one program.
+    Scale(Ssa),
+    /// The `(1 + gamma)` gain row — ONE `arith.addf` over the loaded row with a splatted 1.0
+    /// (the OnePlusScale convention, `rmsnorm.py`'s `rmsnorm_oneplus_fwd`), consumed by the
+    /// chain exactly as the rank plumbing is. The offset is this variant's MEANING, not a
+    /// field: the emission adds the constant where it needs it, never a value read back off
+    /// the leg.
+    OnePlusScale(Ssa),
     /// The identity gain: `out = x · rsqrt(mean(x²)+eps)` with no gain multiply at all. The
     /// normalising multiply is the chain's terminal and its result is the fused program's
     /// output — the same device body the per-`Program` door `rmsnorm_unit` emits.
@@ -575,9 +584,8 @@ fn rmsnorm_chain_from(
     };
     // `· gain` — the chain's gain leg, and IDENTITY IS ONE OF ITS VALUES. The leg is claimed as a
     // learned row ONLY when the normalising multiply's sole `arith.mulf` reader has, as its other
-    // operand, a ROW-BROADCAST gain — `gamma` or `1+gamma`, a `[1, cols]` row sprayed down the
-    // rows (`BcastAxis::Mb`, the one shape predicate, shared with the walk's own broadcast
-    // resolution through [`program_broadcast_chains`] rather than re-derived here; the multiply's
+    // operand, a ROW gain — `gamma` or `1+gamma`, ONE `[1, cols]` row read down the rows (the one
+    // shape predicate, stated over the leg's own shapes — see the row claim below; the multiply's
     // own extent coherence pins the row's width to the norm's `cols`). ANY other reader of the
     // normalised value — a store, a residual add, several readers, none at all, or a multiply by
     // an activation, a scalar, or a dense `[rows, cols]` tensor — closes the leg as the IDENTITY:
@@ -624,7 +632,7 @@ fn rmsnorm_chain_from(
         // the same law the per-`Program` door's `program_gain_offset` arm states. An addf of
         // another shape (no splat, two tensors) is not this convention and is left for the
         // operand resolution to name, exactly as before this arm existed.
-        let mut ones = None;
+        let mut oneplus = false;
         if let Some(d) = def_of(gamma)
             && d.op_type == OpKind::ArithAddf
         {
@@ -645,7 +653,7 @@ fn rmsnorm_chain_from(
                         f.name
                     ));
                 }
-                ones = Some(1.0);
+                oneplus = true;
                 leg.push(gamma);
                 gamma = r;
                 // The row's own rank plumbing, if it states any — the same three-op walk as the
@@ -668,15 +676,45 @@ fn rmsnorm_chain_from(
                 }
             }
         }
-        // ⛔ THE ROW-BROADCAST CLAIM — the one shape predicate of the gain leg, shared with the
-        // walk's own broadcast resolution: some value on the leg IS an `Mb` broadcast result (a
-        // `[1, ·]` row sprayed down the rows), classified by [`program_broadcast_chains`] and not
-        // re-derived here. A leg with none — a splatted scalar, an activation, a dense
-        // `[rows, cols]` tensor — is not a gain, and the chain closes gainless above.
+        // ⛔ THE ROW CLAIM — stated over the leg's OWN shapes, never over how the spray is
+        // spelled. A gain row is a `[1, cols]` row: rank 2, degenerate leading dim, read by the
+        // multiply lane for lane down the rows. The spray reaches that read one of two ways,
+        // BOTH of which the leg states by shape:
+        //
+        // * EXPLICIT, any row count: a `linalg.broadcast` on the leg classified `Mb` by
+        //   [`program_broadcast_chains`] — the row sprayed down the rows (the classification is
+        //   shared with the walk's own broadcast resolution, never re-derived here).
+        // * DEGENERATE, the one-row tile: at `rows == 1` the spray's extent IS 1, so the
+        //   broadcast is the identity function and the producer FOLDS it (`to_ktir` refuses a
+        //   no-op broadcast by name). The row is still a row — the `tensor.expand_shape` that
+        //   raised the loaded `[cols]` to `[1, cols]` is on the leg, and its degenerate
+        //   leading dim IS the row-ness the explicit form's broadcast states.
+        //
+        // The disjunction is one law, not a shape special-case: "the multiply's other operand
+        // is one `[1, cols]` row", proved by whichever form the program states. A leg with
+        // neither — a splatted scalar, an activation, a dense `[rows, cols]` tensor — is not a
+        // gain, and the chain closes gainless above.
         let (bcasts, _) = program_broadcast_chains(f)?;
-        if !leg
-            .iter()
-            .any(|v| bcasts.get(v).is_some_and(|b| b.axis == BcastAxis::Mb))
+        // `leg[0]` is `scaled` — the normalised `[rows, cols]` tile, itself `[1, cols]` on the
+        // one-row tile — so the row check reads the gain's OWN values, `leg[1..]`. The shape is
+        // read wherever the producer states it: the op's result type, or the `expand_shape`'s
+        // own `TargetShape` when the type is unstated.
+        let row = |v: Ssa| {
+            def_of(v).is_some_and(|d| {
+                let dims: Option<&[i64]> = match &d.result_type {
+                    Some(ktir_core::irtype::IrType::Tensor { dims, .. }) => Some(*dims),
+                    _ => d.attributes.iter().find_map(|(k, val)| match (k, val) {
+                        (AttrKey::TargetShape, Attr::IntList(t)) => Some(*t),
+                        _ => None,
+                    }),
+                };
+                matches!(dims, Some([1, _]))
+            })
+        };
+        if !leg.iter().skip(1).any(|&v| row(v))
+            && !leg
+                .iter()
+                .any(|v| bcasts.get(v).is_some_and(|b| b.axis == BcastAxis::Mb))
         {
             break 'gain (GainLeg::Identity, scaled);
         }
@@ -687,7 +725,17 @@ fn rmsnorm_chain_from(
             ));
         };
         consumed.extend(leg);
-        (GainLeg::Row { gamma, ones }, out)
+        // The convention is WHICH VARIANT the leg closed as — the `(1 + w)` addf is
+        // [`GainLeg::OnePlusScale`]'s own meaning, and its absence is [`GainLeg::Scale`]; the
+        // offset constant itself is never a field a reader re-validates.
+        (
+            if oneplus {
+                GainLeg::OnePlusScale(gamma)
+            } else {
+                GainLeg::Scale(gamma)
+            },
+            out,
+        )
     };
 
     // ⛔ THE DIVISOR IS `1/cols` FOR THIS TILE, CHECKED NUMERICALLY. `mean` is `sum/N`; a multiplier
@@ -3642,7 +3690,9 @@ pub fn staggered_sources(
                 }
             })
             .or(rms.map(|c| match c.gain {
-                GainLeg::Row { .. } => Lowering::RmsNorm(c.eps, c.gain_offset()),
+                GainLeg::Scale(_) | GainLeg::OnePlusScale(_) => {
+                    Lowering::RmsNorm(c.eps, c.gain_offset())
+                }
                 GainLeg::Identity => Lowering::RmsNormUnit(c.eps),
             }))
             .or(reduce.map(Lowering::Reduce))
@@ -3684,7 +3734,7 @@ pub fn staggered_sources(
                 match c.gain {
                     // The two tensors the recogniser proved, walked back through the rank
                     // plumbing to values a `Region` exists for.
-                    GainLeg::Row { gamma, .. } => vec![c.x, gamma],
+                    GainLeg::Scale(gamma) | GainLeg::OnePlusScale(gamma) => vec![c.x, gamma],
                     // The identity gain is the constant 1 — not a parameter.
                     GainLeg::Identity => vec![c.x],
                 }
@@ -5884,7 +5934,9 @@ fn lower_function_folded(
                 }
             })
             .or(rms.map(|c| match c.gain {
-                GainLeg::Row { .. } => Lowering::RmsNorm(c.eps, c.gain_offset()),
+                GainLeg::Scale(_) | GainLeg::OnePlusScale(_) => {
+                    Lowering::RmsNorm(c.eps, c.gain_offset())
+                }
                 GainLeg::Identity => Lowering::RmsNormUnit(c.eps),
             }))
             .or(reduce.map(Lowering::Reduce))
@@ -5971,7 +6023,7 @@ fn lower_function_folded(
                 match c.gain {
                     // The two tensors the recogniser proved, walked back through the rank
                     // plumbing to values a `Region` exists for.
-                    GainLeg::Row { gamma, .. } => vec![c.x, gamma],
+                    GainLeg::Scale(gamma) | GainLeg::OnePlusScale(gamma) => vec![c.x, gamma],
                     // The identity gain is the constant 1 — not a parameter.
                     GainLeg::Identity => vec![c.x],
                 }
@@ -9991,7 +10043,7 @@ mod rmsnorm_gain_leg_tests {
         assert_eq!(cs.len(), 1, "one rsqrt heads one chain");
         let c = &cs[0];
         assert!(
-            matches!(c.gain, GainLeg::Row { ones: None, .. }),
+            matches!(c.gain, GainLeg::Scale(_)),
             "the row broadcast claims the leg, Scale convention"
         );
         assert_eq!(c.out, Ssa(19), "the gain multiply's result is the output");
@@ -10008,14 +10060,8 @@ mod rmsnorm_gain_leg_tests {
         assert_eq!(cs.len(), 1, "one rsqrt heads one chain");
         let c = &cs[0];
         assert!(
-            matches!(
-                c.gain,
-                GainLeg::Row {
-                    ones: Some(1.0),
-                    ..
-                }
-            ),
-            "the oneplus row claims the leg with offset 1.0"
+            matches!(c.gain, GainLeg::OnePlusScale(_)),
+            "the oneplus row claims the leg as OnePlusScale — the offset is the variant's meaning"
         );
         assert_eq!(c.out, Ssa(19), "the gain multiply's result is the output");
     }
@@ -10109,6 +10155,144 @@ mod rmsnorm_gain_leg_tests {
         assert!(
             cs.is_empty(),
             "a scalar multiply with no norm is not a chain"
+        );
+    }
+
+    /// ⭐ THE DEGENERATE SPRAY (the one-row tile, the decode form): at `rows == 1` the row's
+    /// broadcast is the identity function, the producer FOLDS it, and the leg is the loaded row
+    /// plus its `expand_shape` to `[1, cols]` — NO `linalg.broadcast` anywhere. The row claim
+    /// must hold on the expand's own `[1, cols]` shape, or every decode-bucket norm flips to
+    /// the unit form and the gained bundles move (the g2bfp8 gate's measured diff).
+    #[test]
+    fn a_one_row_tile_gain_without_a_broadcast_is_claimed() {
+        let a: &'static Arena = Arena::global();
+        let x = Ssa(0);
+        let (c_eps, sp_eps, c_inv, sp_inv) = (Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let (sq, red, ms, add, root, scaled) = (Ssa(5), Ssa(6), Ssa(7), Ssa(8), Ssa(9), Ssa(10));
+        let (row, exp, out) = (Ssa(15), Ssa(16), Ssa(17));
+        let ops = vec![
+            Operation::new(a, Some(c_eps), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1e-6),
+            ),
+            Operation::new(a, Some(sp_eps), OpKind::TensorSplat, &[c_eps]),
+            Operation::new(a, Some(c_inv), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1.0 / 128.0),
+            ),
+            Operation::new(a, Some(sp_inv), OpKind::TensorSplat, &[c_inv]),
+            Operation {
+                result_type: Some(IrType::Tensor {
+                    dims: &[1, 128],
+                    elem: DType::F16,
+                }),
+                ..Operation::new(a, Some(sq), OpKind::ArithMulf, &[x, x])
+            },
+            Operation::new(a, Some(red), OpKind::LinalgReduce, &[sq]).with_attr(
+                a,
+                AttrKey::ReduceFn,
+                Attr::Op(OpKind::ArithAddf),
+            ),
+            Operation::new(a, Some(ms), OpKind::ArithMulf, &[red, sp_inv]),
+            Operation::new(a, Some(add), OpKind::ArithAddf, &[ms, sp_eps]),
+            Operation::new(a, Some(root), OpKind::MathRsqrt, &[add]),
+            Operation::new(a, Some(scaled), OpKind::ArithMulf, &[x, root]),
+            // `w[None, :]` on a one-row tile: the expand to `[1, 128]` and NOTHING else — the
+            // extent-1 spray is a no-op the producer folds, so no broadcast op exists.
+            Operation::new(a, Some(exp), OpKind::TensorExpandShape, &[row]).with_attr(
+                a,
+                AttrKey::TargetShape,
+                Attr::IntList(&[1, 128]),
+            ),
+            Operation::new(a, Some(out), OpKind::ArithMulf, &[scaled, exp]),
+            Operation::new(a, None, OpKind::KtdpStore, &[out]),
+        ];
+        let f = IRFunction {
+            name: "rmsnorm_one_row_probe",
+            arguments: a.args(vec![(x, IrType::Index), (row, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let cs = program_rmsnorm_chains(&f)
+            .unwrap_or_else(|e| panic!("the one-row chain must recognise: {}", e.message));
+        assert_eq!(cs.len(), 1, "one rsqrt heads one chain");
+        assert!(
+            matches!(cs[0].gain, GainLeg::Scale(_)),
+            "the `[1, cols]` expand states the row on its own shape — no broadcast needed"
+        );
+        assert_eq!(cs[0].out, out, "the gain multiply's result is the output");
+    }
+
+    /// NEAR-MISS on the SAME one-row tile: `x̂ · <a splatted [1, cols] constant>` — the splat is
+    /// not rank plumbing, so the leg carries no `[1, cols]` value of the row's own and the
+    /// chain closes gainless, never stealing the ScalarMul neighbour's op.
+    #[test]
+    fn a_one_row_tile_splat_closes_gainless() {
+        let a: &'static Arena = Arena::global();
+        let x = Ssa(0);
+        let (c_eps, sp_eps, c_inv, sp_inv) = (Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let (sq, red, ms, add, root, scaled) = (Ssa(5), Ssa(6), Ssa(7), Ssa(8), Ssa(9), Ssa(10));
+        let (c2, sp2, out) = (Ssa(11), Ssa(12), Ssa(13));
+        let ops = vec![
+            Operation::new(a, Some(c_eps), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1e-6),
+            ),
+            Operation::new(a, Some(sp_eps), OpKind::TensorSplat, &[c_eps]),
+            Operation::new(a, Some(c_inv), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1.0 / 128.0),
+            ),
+            Operation::new(a, Some(sp_inv), OpKind::TensorSplat, &[c_inv]),
+            Operation {
+                result_type: Some(IrType::Tensor {
+                    dims: &[1, 128],
+                    elem: DType::F16,
+                }),
+                ..Operation::new(a, Some(sq), OpKind::ArithMulf, &[x, x])
+            },
+            Operation::new(a, Some(red), OpKind::LinalgReduce, &[sq]).with_attr(
+                a,
+                AttrKey::ReduceFn,
+                Attr::Op(OpKind::ArithAddf),
+            ),
+            Operation::new(a, Some(ms), OpKind::ArithMulf, &[red, sp_inv]),
+            Operation::new(a, Some(add), OpKind::ArithAddf, &[ms, sp_eps]),
+            Operation::new(a, Some(root), OpKind::MathRsqrt, &[add]),
+            Operation::new(a, Some(scaled), OpKind::ArithMulf, &[x, root]),
+            Operation::new(a, Some(c2), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(2.0),
+            ),
+            Operation {
+                result_type: Some(IrType::Tensor {
+                    dims: &[1, 128],
+                    elem: DType::F16,
+                }),
+                ..Operation::new(a, Some(sp2), OpKind::TensorSplat, &[c2])
+            },
+            Operation::new(a, Some(out), OpKind::ArithMulf, &[scaled, sp2]),
+            Operation::new(a, None, OpKind::KtdpStore, &[out]),
+        ];
+        let f = IRFunction {
+            name: "rmsnorm_one_row_splat_probe",
+            arguments: a.args(vec![(x, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let cs = program_rmsnorm_chains(&f)
+            .unwrap_or_else(|e| panic!("the one-row splat chain must recognise: {}", e.message));
+        assert_eq!(cs.len(), 1);
+        assert!(
+            matches!(cs[0].gain, GainLeg::Identity),
+            "a splatted constant is not a gain even on the one-row tile"
         );
     }
 }
