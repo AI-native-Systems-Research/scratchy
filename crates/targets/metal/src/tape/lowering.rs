@@ -154,6 +154,35 @@ impl<'a> RowSources<'a> {
 /// boundary the caller needs to manage. Loop bodies never span the two
 /// halves; if one ever did, the malformed-loop check fires inside the
 /// offending half and surfaces the per-half index.
+/// Each MLX-affine matmul of `steps` with the weight family its commands bind — its row's first
+/// linear source, as the lowering binds it ([`RowSources::of`]).
+pub fn affine_matmul_reads(
+    steps: &MetalStepTape,
+) -> Result<Vec<(SourceIx, AffineMatmul)>, LoweringError> {
+    let halves = [
+        (&steps.backbone, &steps.backbone_sources),
+        (&steps.lm_head, &steps.lm_head_sources),
+    ];
+    let mut reads = Vec::new();
+    for (rows, sites) in halves {
+        for (index, row) in rows.iter().enumerate() {
+            let (StepRow::Step(MetalStep::AffineQmm(g), _)
+            | StepRow::Step(MetalStep::SampleRows(SampledMatmul::Affine(g), _), _)) = row
+            else {
+                continue;
+            };
+            let site = sites.get(index).map_or(&[][..], Vec::as_slice);
+            let w = RowSources {
+                index,
+                site,
+                rotary: None,
+            };
+            reads.push((w.of(WeightKind::Linear, 0)?, *g));
+        }
+    }
+    Ok(reads)
+}
+
 pub fn lower_subtile_tape_to_metal(
     steps: &MetalStepTape,
     p: &ModelFacts,

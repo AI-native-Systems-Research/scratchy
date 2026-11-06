@@ -97,7 +97,8 @@ impl SourceManifest {
         let (mut slots, mut typed) = (Vec::new(), std::collections::HashSet::new());
         let arms = (0u32..).zip(&self.families).map(|(n, f)| {
             let (ix, base) = (Literal::u32_unsuffixed(n), format_ident!("{}", f.base));
-            let (field, pat) = match handle(&f.base) {
+            // `device`: the field's device layer, copied out — a typed field's through its handle.
+            let (field, device, pat) = match handle(&f.base) {
                 Some(ty) => {
                     let s = slot(SourceIx(n));
                     typed.insert(SourceIx(n));
@@ -113,9 +114,13 @@ impl SourceManifest {
                         }
                     });
                     let source = quote!(<#s as ::scratchy_target_metal::tape::typed::Source>);
-                    (quote!(#source::at(self, layer)), quote!(#source::IX))
+                    let field = quote!(#source::at(self, layer));
+                    (field.clone(), quote!(**#field), quote!(#source::IX))
                 }
-                None => (quote!(self.#base(layer.get())), quote!(#ids::SourceIx(#ix))),
+                None => {
+                    let field = quote!(self.#base(layer.get()));
+                    (field.clone(), quote!(*#field), quote!(#ids::SourceIx(#ix)))
+                }
             };
             use WeightKind as K;
             let bundle = match f.kind {
@@ -137,10 +142,10 @@ impl SourceManifest {
                 // carries the `Copy` GpuTensor handle by value (same
                 // deref as the `weight_at` arm in codegen.rs).
                 K::AttnSinks => {
-                    return Ok(quote!(#pat => Some(#r::AttnSinks(*#field)),));
+                    return Ok(quote!(#pat => Some(#r::AttnSinks(#device)),));
                 }
                 K::Tensor => {
-                    return Ok(quote!(#pat => Some(#r::Tensor(*#field)),));
+                    return Ok(quote!(#pat => Some(#r::Tensor(#device)),));
                 }
                 K::GptOssMoe => quote!(GptOssMoe),
                 K::Marlin

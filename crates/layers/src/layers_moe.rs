@@ -478,3 +478,131 @@ pub struct DeepSeekV2GgmlMoELayer {
     pub shared_intermediate_size: usize,
     pub routed_scaling_factor: f32,
 }
+
+// ---------------------------------------------------------------------------
+// Each bundle's roles' extents, read off its tensors (`scratchy_tensors::typed::Wb`'s mint)
+// ---------------------------------------------------------------------------
+
+use scratchy_tensors::bundle_roles::BundleRole;
+
+/// An MLX-affine expert bank's `[experts, in, out]`, read off its scales `[experts, out, in /
+/// group]`.
+fn affine_bank(scales: &GpuTensor, group_size: u32) -> Option<Vec<usize>> {
+    match *scales.shape() {
+        [e, out, groups] => Some(vec![
+            e as usize,
+            groups as usize * group_size as usize,
+            out as usize,
+        ]),
+        _ => None,
+    }
+}
+
+/// A dense `[out, in]` projection's `[in, out]`.
+fn transposed(t: &GpuTensor) -> Option<Vec<usize>> {
+    match *t.shape() {
+        [out, input] => Some(vec![input as usize, out as usize]),
+        _ => None,
+    }
+}
+
+impl AffineFusedMoELayer {
+    /// A routed bank's role: its dense router's, its gate's (`None` for an ungated bank), up's
+    /// and down's.
+    fn routed_role(&self, role: BundleRole) -> Option<Option<Vec<usize>>> {
+        let gs = self.group_size;
+        Some(match role {
+            BundleRole::Router => transposed(&self.router_gate),
+            BundleRole::Gate => self
+                .expert_gate_scales
+                .as_ref()
+                .and_then(|s| affine_bank(s, gs)),
+            BundleRole::Up => affine_bank(&self.expert_up_scales, gs),
+            BundleRole::Down => affine_bank(&self.expert_down_scales, gs),
+            _ => return None,
+        })
+    }
+}
+
+/// A routed MoE's roles: its router and bank, and a corrected router's score correction.
+impl scratchy_tensors::typed::RoleExtents for FusedMoELayer {
+    fn role_extents(&self, role: BundleRole) -> Option<Vec<usize>> {
+        let Self::Affine(l) = self;
+        l.routed_role(role).flatten()
+    }
+}
+
+/// A routed MoE beside a shared expert: the routed bank's roles, the score correction, and the
+/// shared expert's gate and up (its fused gate+up's halves), down and sigmoid gate.
+impl scratchy_tensors::typed::RoleExtents for SharedFusedMoELayer {
+    fn role_extents(&self, role: BundleRole) -> Option<Vec<usize>> {
+        let Self::Affine(l) = self;
+        if let Some(routed) = l.routed.routed_role(role) {
+            return routed;
+        }
+        let gs = l.routed.group_size as usize;
+        let matrix = |scales: &Option<GpuTensor>| match scales.as_ref().map(GpuTensor::shape) {
+            Some(&[out, groups]) => Some((groups as usize * gs, out as usize)),
+            _ => None,
+        };
+        match role {
+            BundleRole::Correction => l.e_score_correction_bias.map(|t| vec![t.numel()]),
+            BundleRole::SharedGate | BundleRole::SharedUp => {
+                matrix(&l.shared_gate_up_scales).map(|(input, out)| vec![input, out / 2])
+            }
+            BundleRole::SharedDown => {
+                matrix(&l.shared_down_scales).map(|(input, out)| vec![input, out])
+            }
+            BundleRole::SharedScale => l.shared_expert_gate.as_ref().and_then(transposed),
+            _ => None,
+        }
+    }
+}
+
+/// gpt-oss's roles: its biased router, its SwiGLU bank and the bank's per-expert biases (the
+/// gate's and up's halves of their fused `[experts, 2·inner]`).
+impl scratchy_tensors::typed::RoleExtents for GptOssMoELayer {
+    fn role_extents(&self, role: BundleRole) -> Option<Vec<usize>> {
+        let gs = self.group_size;
+        let fused = match *self.gate_up_linear_bias.shape() {
+            [e, two_inner] => Some(vec![e as usize, two_inner as usize / 2]),
+            _ => None,
+        };
+        let shape = |t: &GpuTensor| t.shape().iter().map(|&d| d as usize).collect();
+        match role {
+            BundleRole::GptOssRouter => transposed(&self.router_gate),
+            BundleRole::RouterBias => Some(vec![self.router_bias.numel()]),
+            BundleRole::Gate => affine_bank(&self.expert_gate_scales, gs),
+            BundleRole::Up => affine_bank(&self.expert_up_scales, gs),
+            BundleRole::Down => affine_bank(&self.expert_down_scales, gs),
+            BundleRole::GateBias | BundleRole::UpBias => fused,
+            BundleRole::DownBias => Some(shape(&self.down_linear_bias)),
+            _ => None,
+        }
+    }
+}
+
+/// Gemma 4's router: its dense projection, the input's scale and the per-expert scale.
+impl scratchy_tensors::typed::RoleExtents for GemmaRouterLayer {
+    fn role_extents(&self, role: BundleRole) -> Option<Vec<usize>> {
+        match role {
+            BundleRole::Proj => transposed(&self.gate),
+            BundleRole::Scale => Some(vec![self.scale.numel()]),
+            BundleRole::PerExpertScale => Some(vec![self.per_expert_scale.numel()]),
+            _ => None,
+        }
+    }
+}
+
+/// Gemma 4's router-less SwitchGLU bank.
+impl scratchy_tensors::typed::RoleExtents for SwitchGluExpertsLayer {
+    fn role_extents(&self, role: BundleRole) -> Option<Vec<usize>> {
+        let gs = self.group_size;
+        match role {
+            BundleRole::Gate => affine_bank(&self.expert_gate_scales, gs),
+            BundleRole::Up => affine_bank(&self.expert_up_scales, gs),
+            BundleRole::Down => affine_bank(&self.expert_down_scales, gs),
+            _ => None,
+        }
+    }
+}

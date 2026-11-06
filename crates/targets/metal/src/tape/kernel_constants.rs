@@ -793,6 +793,36 @@ impl AffineCodesTarget {
     }
 }
 
+// ── MLX-affine matmul ABI ─────────────────────────────────────────
+
+use crate::tape::lowered::KernelId;
+
+/// Where every MLX-affine matmul kernel ([`AFFINE_MATMUL_KERNELS`]) takes its weight's K.
+pub const AFFINE_K: ConstSlot = ConstSlot(0);
+/// Where every MLX-affine matmul kernel takes its weight's N.
+pub const AFFINE_N: ConstSlot = ConstSlot(1);
+
+/// The kernels an MLX-affine matmul (`AffineMatmul`) lowers to that read its weight: each takes
+/// the weight's K and N at [`AFFINE_K`] and [`AFFINE_N`], signed.
+pub const AFFINE_MATMUL_KERNELS: &[KernelId] = &[
+    KernelId::AffineQmvQuad,
+    KernelId::AffineQmvFast,
+    KernelId::AffineQmv,
+    KernelId::AffineQmvTiny,
+    KernelId::AffineQmvWide,
+    KernelId::AffineQmmT,
+    KernelId::AffineQmmTNax,
+    KernelId::AffineQmmTSplitK,
+    KernelId::AffineQmmW4a8,
+];
+
+/// Of [`AFFINE_MATMUL_KERNELS`], those instantiated for int4 codes alone.
+pub const INT4_MATMUL_KERNELS: &[KernelId] = &[KernelId::AffineQmmTSplitK, KernelId::AffineQmmW4a8];
+
+/// Of [`AFFINE_MATMUL_KERNELS`], those on the matrix unit (`quantized_qmm_nax`), instantiated for
+/// its groups alone.
+pub const NAX_MATMUL_KERNELS: &[KernelId] = &[KernelId::AffineQmmTNax, KernelId::AffineQmmW4a8];
+
 // ── MLX-affine QMV (decode matvec) ────────────────────────────────
 
 /// `KernelId::AffineQmvQuad` / `AffineQmvFast` / `AffineQmv`
@@ -806,8 +836,8 @@ pub struct AffineQmvConstants {
 impl From<AffineQmvConstants> for Vec<ConstantValue> {
     fn from(c: AffineQmvConstants) -> Self {
         let mut v = vec![
-            ConstantValue::int(ConstSlot(0), c.k.get()),
-            ConstantValue::int(ConstSlot(1), c.n.get()),
+            ConstantValue::int(AFFINE_K, c.k.get()),
+            ConstantValue::int(AFFINE_N, c.n.get()),
         ];
         v.extend(c.codes.constants());
         v
@@ -1064,8 +1094,8 @@ pub struct AffineQmvWideConstants {
 impl From<AffineQmvWideConstants> for Vec<ConstantValue> {
     fn from(c: AffineQmvWideConstants) -> Self {
         let mut v = vec![
-            ConstantValue::int(ConstSlot(0), c.k.get()),
-            ConstantValue::int(ConstSlot(1), c.n.get()),
+            ConstantValue::int(AFFINE_K, c.k.get()),
+            ConstantValue::int(AFFINE_N, c.n.get()),
             ConstantValue::int(ConstSlot(7), c.m.get()),
         ];
         v.extend(c.codes.constants());
@@ -1233,8 +1263,8 @@ pub struct AffineQmmTConstants {
 impl From<AffineQmmTConstants> for Vec<ConstantValue> {
     fn from(c: AffineQmmTConstants) -> Self {
         let mut v = vec![
-            ConstantValue::int(ConstSlot(0), c.k.get()),
-            ConstantValue::int(ConstSlot(1), c.n.get()),
+            ConstantValue::int(AFFINE_K, c.k.get()),
+            ConstantValue::int(AFFINE_N, c.n.get()),
             ConstantValue::int(ConstSlot(2), c.m.get()),
         ];
         v.extend(c.codes.constants());
@@ -1259,8 +1289,8 @@ pub struct AffineQmmTSplitKConstants {
 impl From<AffineQmmTSplitKConstants> for Vec<ConstantValue> {
     fn from(c: AffineQmmTSplitKConstants) -> Self {
         let mut v = vec![
-            ConstantValue::int(ConstSlot(0), c.k.get()),
-            ConstantValue::int(ConstSlot(1), c.n.get()),
+            ConstantValue::int(AFFINE_K, c.k.get()),
+            ConstantValue::int(AFFINE_N, c.n.get()),
             ConstantValue::int(ConstSlot(2), c.m.get()),
             ConstantValue::int(ConstSlot(3), c.k_partition_size.get()),
         ];
