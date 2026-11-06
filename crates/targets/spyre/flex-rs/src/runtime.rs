@@ -1,5 +1,5 @@
-//! Port of `flex::RuntimeContext`'s OWN state machine — singleton lifecycle,
-//! stream table, and default-stream bookkeeping. Source:
+//! Port of `flex::RuntimeContext`'s OWN state machine — lifecycle, stream
+//! table, and default-stream bookkeeping. Source:
 //! `flex/include/flex/runtime_stream/runtime_context.hpp` +
 //! `flex/src/runtime_stream/runtime_context.cpp`.
 //!
@@ -12,7 +12,15 @@
 //! C++ builds all three internally; here they are supplied by the caller
 //! (Assembly wires the concrete scheduler/device/allocator together), which
 //! keeps this file's job exactly what the task brief asks for: the
-//! singleton/stream-table bookkeeping, not the subsystems it wires up.
+//! stream-table bookkeeping, not the subsystems it wires up.
+//!
+//! ⭐ ONE CONTEXT PER CARD, NEVER A PROCESS SINGLETON. The C++ keeps one
+//! `RuntimeContext` per process, because flex's `DeviceHandleFactory` holds
+//! one device per process. This port drives several cards from one process
+//! (each card its own senlib `PfWrapper`, measured: 8 cards held open in one
+//! process on nickm5, 2026-11-06), so a context is a value its owner builds,
+//! one per card, and drops. A one-card process holds one context; the code
+//! is the same.
 //!
 //! `RuntimeContext` does, however, port `getAllocator()`
 //! (`runtime_context.cpp`'s `RuntimeContextImpl::getAllocator` /
@@ -32,15 +40,8 @@ use crate::stream::{
 
 #[derive(Debug)]
 pub enum RuntimeContextError {
-    /// Port of `RAS::RUNTIMECONTEXT::ContextAlreadyCreated`: `create()` was
-    /// called with a specific device id while a context for a *different*
-    /// device id already exists.
-    AlreadyCreatedForDifferentDevice {
-        existing: DeviceId,
-        requested: DeviceId,
-    },
     /// Port of `RAS::RUNTIMECONTEXT::ContextNotCreated`: any accessor called
-    /// before `create()`, or after `reset()`.
+    /// on a context after `reset()`.
     NotCreated,
     /// Port of the `destroyStream` null-handle / default-stream guards.
     DestroyStreamError(&'static str),
@@ -49,13 +50,6 @@ pub enum RuntimeContextError {
 impl std::fmt::Display for RuntimeContextError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AlreadyCreatedForDifferentDevice {
-                existing,
-                requested,
-            } => write!(
-                f,
-                "RuntimeContext already created for device {existing:?}, cannot recreate for {requested:?}"
-            ),
             Self::NotCreated => write!(f, "RuntimeContext has not been created, or has been reset"),
             Self::DestroyStreamError(msg) => write!(f, "destroyStream: {msg}"),
         }
@@ -236,37 +230,16 @@ pub fn get_num_devices() -> Result<i64, GetNumDevicesError> {
 /// since lookups go back through the context rather than through a raw
 /// pointer).
 pub struct RuntimeContext {
-    /// Port of `RuntimeContextImpl::device_id_`: the raw value supplied to
-    /// `create()` (-1 if the caller let flex pick the device, matching the
-    /// C++ default `device_id = -1`). Used, as in the C++, only for
-    /// constructing new `RuntimeStream`s (`createStream`,
-    /// `runtime_context.cpp:446`) — NOT for the already-created-for-a-
-    /// different-device check, which the real C++ compares against the
-    /// hardware-resolved id instead (see `resolved_device_id`).
+    /// The device this context drives, as its streams name it (the C++
+    /// `RuntimeContextImpl::device_id_`, which `createStream` hands every new
+    /// `RuntimeStream`, `runtime_context.cpp:446`).
     device_id: DeviceId,
-    /// Port of what `RuntimeContextImpl::getDevice()->getDeviceID()`
-    /// (`runtime_context.cpp:373-379`) resolves to once the real
-    /// `DeviceInterface` has bound to a concrete device: this is the value
-    /// `create()`'s already-created-for-a-different-device check
-    /// (`runtime_context.cpp:396-416`) and `getDeviceID()`
-    /// (`runtime_context.cpp:373-379`) actually use — NOT the raw
-    /// constructor argument. This crate has no `DeviceInterfaceFactory`/
-    /// `DeviceInterface` (out of scope, see module doc), so there is no real
-    /// hardware to query: when the caller requests a specific device id,
-    /// resolution is exact (`Some(id) => id`, mirroring
-    /// `DeviceInterfaceFactory::createDevice(device_id)` opening exactly
-    /// that device); when the caller leaves it unspecified (`None`/-1,
-    /// "flex sets the device index itself"), this stands in with
-    /// `DeviceId(0)` — the lowest-numbered/default device — since genuine
-    /// auto-selection would require the unported `DeviceInterfaceFactory`.
-    resolved_device_id: DeviceId,
     /// Port of the "has this `RuntimeContext*` been `reset()`" check every
     /// real C++ accessor performs (`prtc_impl_ == nullptr` ->
     /// `RAS::RUNTIMECONTEXT::ContextNotCreated().Throw()`,
-    /// `runtime_context.cpp:330-334,342-346,447-452`, etc). Rust's `reset()`
-    /// clears the global singleton slot, but a caller may still be holding
-    /// an `Arc<RuntimeContext>` clone from before the reset; without this
-    /// flag such a stale handle would silently keep working forever.
+    /// `runtime_context.cpp:330-334,342-346,447-452`, etc). A caller may still
+    /// hold an `Arc<RuntimeContext>` clone after `reset()`; without this flag
+    /// such a stale handle would silently keep working forever.
     active: AtomicBool,
     scheduler: Arc<dyn SchedulerHandle>,
     /// Port of `RuntimeContextImpl::flex_allocator_`. Shared (rather than
@@ -279,16 +252,17 @@ pub struct RuntimeContext {
     default_stream_id: StreamId,
 }
 
-static INSTANCE: OnceLock<Mutex<Option<Arc<RuntimeContext>>>> = OnceLock::new();
-
-fn instance_slot() -> &'static Mutex<Option<Arc<RuntimeContext>>> {
-    INSTANCE.get_or_init(|| Mutex::new(None))
-}
-
 impl RuntimeContext {
-    fn build(
+    /// Port of `RuntimeContext::create(device_id, alloc_init)`, minus the
+    /// singleton: builds a context for `device_id` over the caller's scheduler
+    /// and allocator (both the card's own), with its default stream. Unlike the
+    /// C++ (which builds the `FlexAllocator` internally from `alloc_init`), the
+    /// allocator is supplied by the caller — see the module doc on why
+    /// `FlexAllocator` construction stays out of scope here — and stored exactly
+    /// as `RuntimeContextImpl` stores `flex_allocator_`, reachable afterward via
+    /// `get_allocator()`.
+    pub fn create(
         device_id: DeviceId,
-        resolved_device_id: DeviceId,
         scheduler: Arc<dyn SchedulerHandle>,
         allocator: Arc<Mutex<FlexAllocator>>,
     ) -> Arc<Self> {
@@ -308,58 +282,6 @@ impl RuntimeContext {
         let default_stream_id = default_stream.stream_id();
         let mut streams = HashMap::new();
         streams.insert(default_stream_id, default_stream);
-
-        Arc::new(Self {
-            device_id,
-            resolved_device_id,
-            active: AtomicBool::new(true),
-            scheduler,
-            allocator,
-            streams: Mutex::new(streams),
-            default_stream_id,
-        })
-    }
-
-    /// Port of `RuntimeContext::create(device_id, alloc_init)`. Unlike the
-    /// real C++ (which builds the `FlexAllocator` internally from
-    /// `alloc_init`), the already-constructed allocator is supplied by the
-    /// caller — see the module doc comment on why `FlexAllocator`
-    /// construction itself stays out of scope here — but it is stored on the
-    /// context exactly as `RuntimeContextImpl` stores `flex_allocator_`,
-    /// reachable afterward via `get_allocator()`.
-    /// `device_id = None` mirrors the C++ default `device_id = -1`
-    /// ("flex sets the device index itself").
-    ///
-    /// Idempotent like the C++: if a context already exists for the same (or
-    /// unspecified) device id, returns the existing singleton rather than
-    /// rebuilding it (the supplied `allocator` is ignored in that case, same
-    /// as the C++ discarding a redundant `alloc_init`).
-    pub fn create(
-        device_id: Option<DeviceId>,
-        scheduler: Arc<dyn SchedulerHandle>,
-        allocator: Arc<Mutex<FlexAllocator>>,
-    ) -> Result<Arc<Self>, RuntimeContextError> {
-        let mut slot = instance_slot().lock().unwrap();
-        if let Some(existing) = slot.as_ref() {
-            // Port of `runtime_context.cpp:396-398`'s
-            // `device_id != -1 && device_id != rtc->prtc_impl_->getDevice()->getDeviceID()`:
-            // compares the requested id against the hardware-*resolved* id,
-            // not the raw construction-time argument (which would stay -1
-            // forever for a default-created context and spuriously reject
-            // every later `create(Some(id))` call).
-            if let Some(requested) = device_id
-                && requested != existing.resolved_device_id
-            {
-                return Err(RuntimeContextError::AlreadyCreatedForDifferentDevice {
-                    existing: existing.resolved_device_id,
-                    requested,
-                });
-            }
-            return Ok(existing.clone());
-        }
-        let raw_device_id = device_id.unwrap_or(DeviceId(-1));
-        let resolved_device_id = device_id.unwrap_or(DeviceId(0));
-        let ctx = Self::build(raw_device_id, resolved_device_id, scheduler, allocator);
         // Port of `runtime_context.cpp:407-409`'s `LOG_INFO << "Logical Device ID: "`.
         // The same C++ block also touches `aiupti::GlobalProfiler()` for its side
         // effect only — forcing that singleton onto the creating thread rather
@@ -368,28 +290,28 @@ impl RuntimeContext {
         // library this crate does not reimplement, so there is no singleton here
         // to force. If libaiupti is ever bound over FFI, this is where its
         // eager-construction call belongs.
-        tracing::info!("Logical Device ID: {raw_device_id:?}");
-        *slot = Some(ctx.clone());
-        Ok(ctx)
+        tracing::info!("Logical Device ID: {device_id:?}");
+        Arc::new(Self {
+            device_id,
+            active: AtomicBool::new(true),
+            scheduler,
+            allocator,
+            streams: Mutex::new(streams),
+            default_stream_id,
+        })
     }
 
-    /// Port of `RuntimeContext::getInstance`.
-    pub fn get_instance() -> Result<Arc<Self>, RuntimeContextError> {
-        instance_slot()
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(RuntimeContextError::NotCreated)
-    }
-
-    /// Port of `RuntimeContext::reset`. Note the C++ comment's deadlock
-    /// warning is preserved structurally: this must never be called from
-    /// within another `RuntimeContext` method.
-    pub fn reset() -> Result<(), RuntimeContextError> {
-        let mut slot = instance_slot().lock().unwrap();
-        let Some(ctx) = slot.take() else {
+    /// Port of `RuntimeContext::reset`: drains every stream and marks this
+    /// context inactive. Note the C++ comment's deadlock warning is preserved
+    /// structurally: this must never be called from within another
+    /// `RuntimeContext` method.
+    ///
+    /// # Errors
+    /// `NotCreated` if this context was already reset.
+    pub fn reset(&self) -> Result<(), RuntimeContextError> {
+        if !self.active.swap(false, Ordering::SeqCst) {
             return Err(RuntimeContextError::NotCreated);
-        };
+        }
         // Port of `RuntimeContextImpl::~RuntimeContextImpl`'s per-stream
         // teardown drain before the stream map is cleared
         // (`runtime_context.cpp:207-210`): every registered stream is
@@ -398,24 +320,14 @@ impl RuntimeContext {
         // waits out the operations it already submitted — with any
         // deferred error logged and swallowed, never propagated out of
         // `reset()` (#609).
-        {
-            let streams = ctx.streams.lock().unwrap();
-            for (id, stream) in streams.iter() {
-                if let Err(e) = stream.drain_for_teardown() {
-                    tracing::error!(
-                        "RuntimeContext::reset: deferred error suppressed while draining stream {id:?} during teardown: {e}"
-                    );
-                }
+        let streams = self.streams.lock().unwrap();
+        for (id, stream) in streams.iter() {
+            if let Err(e) = stream.drain_for_teardown() {
+                tracing::error!(
+                    "RuntimeContext::reset: deferred error suppressed while draining stream {id:?} during teardown: {e}"
+                );
             }
         }
-        // Mark this instance inactive so any `Arc<RuntimeContext>` clone a
-        // caller is still holding past this point observes the reset
-        // (port of every accessor's `prtc_impl_ == nullptr` check —
-        // `runtime_context.cpp:330-334` etc — which must keep tripping even
-        // though Rust drops `prtc_impl_`'s equivalent state by clearing the
-        // singleton slot rather than mutating the shared object in place).
-        ctx.active.store(false, Ordering::SeqCst);
-        drop(slot);
         Ok(())
     }
 
@@ -431,11 +343,10 @@ impl RuntimeContext {
     }
 
     /// Port of `RuntimeContext::getDeviceID` (`runtime_context.cpp:373-379`):
-    /// returns the hardware-resolved device id, not the raw constructor
-    /// argument — see the `resolved_device_id` field doc comment.
+    /// the device this context drives.
     pub fn device_id(&self) -> Result<DeviceId, RuntimeContextError> {
         self.check_active()?;
-        Ok(self.resolved_device_id)
+        Ok(self.device_id)
     }
 
     /// Port of `RuntimeContext::getAllocator`. Returns a shared handle to the
@@ -581,7 +492,6 @@ impl RuntimeContext {
 ///   `SchedulerHandle`.
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicBool;
 
     use super::*;
@@ -589,13 +499,6 @@ mod tests {
     use crate::device_memory_allocator::DeviceMemoryAllocator;
     use crate::stream::{CompletionCallback, SchedulerError, SubmittedOperation};
     use crate::topology::DeviceTopology;
-
-    /// Serializes every test below against the process-wide `RuntimeContext`
-    /// singleton (`INSTANCE`), which — unlike gtest's serial-by-default
-    /// `TEST_F` execution — is not safe under Rust's parallel-by-default test
-    /// runner: two tests racing `create`/`reset` concurrently would flake in
-    /// ways the real C++ suite never has to guard against.
-    static SINGLETON_GUARD: StdMutex<()> = StdMutex::new(());
 
     /// Trivial `SchedulerHandle` double: good enough for every test below,
     /// none of which inspect scheduling behavior itself (that's
@@ -653,121 +556,41 @@ mod tests {
         )))
     }
 
-    /// Runs `body` with the `RuntimeContext` singleton guaranteed empty
-    /// beforehand and cleaned up afterward, holding `SINGLETON_GUARD` for the
-    /// duration — the Rust analogue of the C++ fixtures'
-    /// `SetUp`/`TearDown` pair (`TearDown` swallows `reset()`'s
-    /// "not created" error exactly like the C++ `catch(std::runtime_error&)`).
-    fn with_clean_context<F: FnOnce()>(body: F) {
-        let _guard = SINGLETON_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = RuntimeContext::reset();
-        body();
-        let _ = RuntimeContext::reset();
+    // Port of `RuntimeContextUnittest.UserSpecifiedDevice`: a context reports
+    // the device it was created for.
+    #[test]
+    fn a_context_reports_the_device_it_drives() {
+        let ctx = RuntimeContext::create(DeviceId(3), test_scheduler(), test_allocator());
+        assert_eq!(ctx.device_id().unwrap(), DeviceId(3));
     }
 
-    // Port of `RuntimeContextUnittest.NoDevice`.
+    // One context per card: two contexts in one process are independent, each
+    // with its own device and its own default stream. (The C++ singleton's
+    // `ReallocateDevice` test, which refused a second device, has no
+    // counterpart: a second card is a second context, by design.)
     #[test]
-    fn get_instance_before_create_errors() {
-        with_clean_context(|| {
-            assert!(matches!(
-                RuntimeContext::get_instance(),
-                Err(RuntimeContextError::NotCreated)
-            ));
-        });
+    fn two_contexts_in_one_process_are_independent() {
+        let a = RuntimeContext::create(DeviceId(0), test_scheduler(), test_allocator());
+        let b = RuntimeContext::create(DeviceId(1), test_scheduler(), test_allocator());
+        assert_eq!(a.device_id().unwrap(), DeviceId(0));
+        assert_eq!(b.device_id().unwrap(), DeviceId(1));
+        assert_ne!(a.default_stream_id().unwrap(), b.default_stream_id().unwrap());
+        a.reset().unwrap();
+        assert!(matches!(a.device_id(), Err(RuntimeContextError::NotCreated)));
+        assert_eq!(
+            b.device_id().unwrap(),
+            DeviceId(1),
+            "resetting one card's context must leave another card's untouched"
+        );
     }
 
-    // Port of `RuntimeContextUnittest.DefaultDevice`: the real test just
-    // checks `create()`+`getDevice()` don't throw; this checks the resulting
-    // context's `getDeviceID()`-equivalent reports the hardware-resolved
-    // device id — this crate has no real `DeviceInterfaceFactory` to resolve
-    // against, so a default-created context (`None`/-1, "flex sets the
-    // device index itself") resolves to the stand-in default `DeviceId(0)`
-    // rather than staying at the -1 sentinel forever (see
-    // `resolved_device_id`'s field doc comment).
+    // Port of `RuntimeContextUnittest.ResetContext`: a second reset of the same
+    // context is refused.
     #[test]
-    fn create_default_device_succeeds() {
-        with_clean_context(|| {
-            let ctx = RuntimeContext::create(None, test_scheduler(), test_allocator()).unwrap();
-            assert_eq!(ctx.device_id().unwrap(), DeviceId(0));
-        });
-    }
-
-    // Port of `RuntimeContextUnittest.UserSpecifiedDevice`.
-    #[test]
-    fn create_with_user_specified_device_succeeds() {
-        with_clean_context(|| {
-            let ctx = RuntimeContext::create(Some(DeviceId(0)), test_scheduler(), test_allocator())
-                .unwrap();
-            assert_eq!(ctx.device_id().unwrap(), DeviceId(0));
-        });
-    }
-
-    // Port of `RuntimeContextUnittest.ReallocateDevice`.
-    #[test]
-    fn reallocate_same_device_returns_existing_reallocate_different_device_errors() {
-        with_clean_context(|| {
-            let ctx1 =
-                RuntimeContext::create(Some(DeviceId(0)), test_scheduler(), test_allocator())
-                    .unwrap();
-            let ctx2 =
-                RuntimeContext::create(Some(DeviceId(0)), test_scheduler(), test_allocator())
-                    .unwrap();
-            assert!(
-                Arc::ptr_eq(&ctx1, &ctx2),
-                "create() with the same device id must return the existing context"
-            );
-
-            let _ = RuntimeContext::get_instance().unwrap();
-
-            match RuntimeContext::create(Some(DeviceId(1)), test_scheduler(), test_allocator()) {
-                Err(RuntimeContextError::AlreadyCreatedForDifferentDevice {
-                    existing,
-                    requested,
-                }) => {
-                    assert_eq!(existing, DeviceId(0));
-                    assert_eq!(requested, DeviceId(1));
-                }
-                Ok(_) => panic!("expected AlreadyCreatedForDifferentDevice, got Ok"),
-                Err(other) => panic!("expected AlreadyCreatedForDifferentDevice, got {other:?}"),
-            }
-        });
-    }
-
-    // Regression test for the bug where `create(None)` followed by
-    // `create(Some(DeviceId(0)))` always raised
-    // `AlreadyCreatedForDifferentDevice`: the mismatch check must compare
-    // against the *resolved* device id (which a `None`-created context
-    // resolves to `DeviceId(0)`, see `resolved_device_id`), not the raw -1
-    // sentinel stored for stream construction.
-    #[test]
-    fn create_default_then_matching_explicit_device_succeeds() {
-        with_clean_context(|| {
-            let ctx1 = RuntimeContext::create(None, test_scheduler(), test_allocator()).unwrap();
-            let ctx2 =
-                RuntimeContext::create(Some(DeviceId(0)), test_scheduler(), test_allocator())
-                    .unwrap();
-            assert!(
-                Arc::ptr_eq(&ctx1, &ctx2),
-                "create(Some(0)) after create(None) must return the existing context, not error"
-            );
-        });
-    }
-
-    // Port of `RuntimeContextUnittest.ResetContext`.
-    #[test]
-    fn reset_removes_context_and_double_reset_errors() {
-        with_clean_context(|| {
-            RuntimeContext::create(Some(DeviceId(0)), test_scheduler(), test_allocator()).unwrap();
-            RuntimeContext::reset().unwrap();
-            assert!(matches!(
-                RuntimeContext::get_instance(),
-                Err(RuntimeContextError::NotCreated)
-            ));
-            assert!(matches!(
-                RuntimeContext::reset(),
-                Err(RuntimeContextError::NotCreated)
-            ));
-        });
+    fn double_reset_errors() {
+        let ctx = RuntimeContext::create(DeviceId(0), test_scheduler(), test_allocator());
+        ctx.reset().unwrap();
+        assert!(matches!(ctx.reset(), Err(RuntimeContextError::NotCreated)));
     }
 
     // Regression test: every real C++ accessor throws `ContextNotCreated`
@@ -776,11 +599,10 @@ mod tests {
     // `Arc<RuntimeContext>` must observe this too, not silently keep working.
     #[test]
     fn stale_handle_errors_after_reset() {
-        with_clean_context(|| {
-            let ctx = RuntimeContext::create(Some(DeviceId(0)), test_scheduler(), test_allocator())
-                .unwrap();
+        {
+            let ctx = RuntimeContext::create(DeviceId(0), test_scheduler(), test_allocator());
             let default_id = ctx.default_stream_id().unwrap();
-            RuntimeContext::reset().unwrap();
+            ctx.reset().unwrap();
 
             assert!(matches!(
                 ctx.device_id(),
@@ -814,7 +636,7 @@ mod tests {
                 ctx.has_stream_error(),
                 Err(RuntimeContextError::NotCreated)
             ));
-        });
+        }
     }
 
     // Adapted from `RuntimeContextUnittest.GetAllocatorDefaultInit`: the real
@@ -825,54 +647,25 @@ mod tests {
     // instance from `get_allocator()` — is what's ported here.
     #[test]
     fn get_allocator_returns_the_instance_supplied_at_create() {
-        with_clean_context(|| {
-            let allocator = test_allocator();
-            let ctx =
-                RuntimeContext::create(Some(DeviceId(0)), test_scheduler(), allocator.clone())
-                    .unwrap();
-            assert!(Arc::ptr_eq(&ctx.get_allocator().unwrap(), &allocator));
-        });
-    }
-
-    // Adapted from `RuntimeContextUnittest.GetAllocatorUserInit`: the real
-    // test constructs the `FlexAllocator` from a user-supplied
-    // `FlexAllocatorInit` (that construction itself is `FlexAllocator`'s own
-    // concern, not `RuntimeContext`'s — see the module doc comment on why
-    // `FlexAllocator` construction is out of `RuntimeContext`'s scope here).
-    // What remains genuinely `RuntimeContext`'s: `create()` on an
-    // already-existing context discards a redundant caller-supplied
-    // allocator rather than swapping it in, matching the C++ "idempotent
-    // create ignores a redundant alloc_init" contract.
-    #[test]
-    fn create_ignores_a_redundant_allocator_on_idempotent_create() {
-        with_clean_context(|| {
-            let first = test_allocator();
-            let ctx1 =
-                RuntimeContext::create(Some(DeviceId(0)), test_scheduler(), first.clone()).unwrap();
-            let second = test_allocator();
-            let ctx2 = RuntimeContext::create(Some(DeviceId(0)), test_scheduler(), second).unwrap();
-            assert!(Arc::ptr_eq(&ctx1, &ctx2));
-            assert!(
-                Arc::ptr_eq(&ctx1.get_allocator().unwrap(), &first),
-                "the redundant second allocator must be discarded"
-            );
-        });
+        let allocator = test_allocator();
+        let ctx = RuntimeContext::create(DeviceId(0), test_scheduler(), allocator.clone());
+        assert!(Arc::ptr_eq(&ctx.get_allocator().unwrap(), &allocator));
     }
 
     // Port of `StreamErrorIsolationTest.CleanContextReportsNoError`.
     #[test]
     fn clean_context_reports_no_stream_error() {
-        with_clean_context(|| {
-            let ctx = RuntimeContext::create(None, test_scheduler(), test_allocator()).unwrap();
+        {
+            let ctx = RuntimeContext::create(DeviceId(0), test_scheduler(), test_allocator());
             assert!(!ctx.has_stream_error().unwrap());
-        });
+        }
     }
 
     // Port of `StreamErrorIsolationTest.NewStreamReportsNoError`.
     #[test]
     fn new_stream_reports_no_error() {
-        with_clean_context(|| {
-            let ctx = RuntimeContext::create(None, test_scheduler(), test_allocator()).unwrap();
+        {
+            let ctx = RuntimeContext::create(DeviceId(0), test_scheduler(), test_allocator());
             let id = ctx
                 .create_stream(
                     RuntimeStreamPriority::default(),
@@ -883,14 +676,14 @@ mod tests {
             let stream = ctx.get_stream(id).unwrap().unwrap();
             assert!(!ctx.has_stream_error().unwrap());
             assert!(!stream.needs_shutdown());
-        });
+        }
     }
 
     // Port of `StreamErrorIsolationTest.ErrorStateDetectedAfterSetShutdown`.
     #[test]
     fn error_state_detected_after_set_shutdown() {
-        with_clean_context(|| {
-            let ctx = RuntimeContext::create(None, test_scheduler(), test_allocator()).unwrap();
+        {
+            let ctx = RuntimeContext::create(DeviceId(0), test_scheduler(), test_allocator());
             let id = ctx
                 .create_stream(
                     RuntimeStreamPriority::default(),
@@ -905,14 +698,14 @@ mod tests {
 
             assert!(ctx.has_stream_error().unwrap());
             assert!(stream.needs_shutdown());
-        });
+        }
     }
 
     // Port of `StreamErrorIsolationTest.ErrorClearsAfterBrokenStreamDestroyed`.
     #[test]
     fn error_clears_after_broken_stream_destroyed() {
-        with_clean_context(|| {
-            let ctx = RuntimeContext::create(None, test_scheduler(), test_allocator()).unwrap();
+        {
+            let ctx = RuntimeContext::create(DeviceId(0), test_scheduler(), test_allocator());
             let id = ctx
                 .create_stream(
                     RuntimeStreamPriority::default(),
@@ -927,14 +720,14 @@ mod tests {
             ctx.destroy_stream(id).unwrap();
 
             assert!(!ctx.has_stream_error().unwrap());
-        });
+        }
     }
 
     // Port of `StreamErrorIsolationTest.CreateStreamSucceedsAfterPriorStreamError`.
     #[test]
     fn create_stream_succeeds_after_prior_stream_error() {
-        with_clean_context(|| {
-            let ctx = RuntimeContext::create(None, test_scheduler(), test_allocator()).unwrap();
+        {
+            let ctx = RuntimeContext::create(DeviceId(0), test_scheduler(), test_allocator());
             let broken_id = ctx
                 .create_stream(
                     RuntimeStreamPriority::default(),
@@ -956,14 +749,14 @@ mod tests {
             let fresh = ctx.get_stream(fresh_id).unwrap().unwrap();
             assert!(!fresh.needs_shutdown());
             assert!(!ctx.has_stream_error().unwrap());
-        });
+        }
     }
 
     // Port of `StreamErrorIsolationTest.SynchronizeRethrowsDeferredException`.
     #[test]
     fn synchronize_rethrows_deferred_error() {
-        with_clean_context(|| {
-            let ctx = RuntimeContext::create(None, test_scheduler(), test_allocator()).unwrap();
+        {
+            let ctx = RuntimeContext::create(DeviceId(0), test_scheduler(), test_allocator());
             let id = ctx
                 .create_stream(
                     RuntimeStreamPriority::default(),
@@ -990,14 +783,14 @@ mod tests {
                     panic!("expected synchronize() to rethrow the deferred error, got {other:?}")
                 }
             }
-        });
+        }
     }
 
     // Port of `StreamErrorIsolationTest.DefaultStreamErrorDetectedByHasStreamError`.
     #[test]
     fn default_stream_error_detected_by_has_stream_error() {
-        with_clean_context(|| {
-            let ctx = RuntimeContext::create(None, test_scheduler(), test_allocator()).unwrap();
+        {
+            let ctx = RuntimeContext::create(DeviceId(0), test_scheduler(), test_allocator());
             let default_stream = ctx
                 .get_stream(ctx.default_stream_id().unwrap())
                 .unwrap()
@@ -1008,6 +801,6 @@ mod tests {
             assert!(ctx.has_stream_error().unwrap());
 
             default_stream.set_shutdown(false);
-        });
+        }
     }
 }

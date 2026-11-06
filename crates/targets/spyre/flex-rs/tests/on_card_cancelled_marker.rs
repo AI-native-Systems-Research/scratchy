@@ -33,7 +33,7 @@ use flex_rs::scheduler::{
     SenlibHardwareSubmit, SenlibQueueCapacity, create_scheduler,
 };
 use flex_rs::senlib_ffi::{Card, pcie_address_for_card, sen_pci_card_count};
-use flex_rs::stream::{RuntimeStreamMode, RuntimeStreamPriority};
+use flex_rs::stream::{DeviceId, RuntimeStreamMode, RuntimeStreamPriority};
 use flex_rs::topology::populate_domain_topology;
 
 /// Drain budget. The vendor waits 5 s on its own shutdown marker
@@ -114,8 +114,7 @@ fn cancelled_marker_on_card() {
         SchedulerBackendConfig::Real(hw.clone(), capacity, addr_resolver, iommu_mapper),
     )
     .expect("create_scheduler(Real) must succeed on a real card");
-    let context = RuntimeContext::create(None, scheduler, allocator)
-        .expect("RuntimeContext::create must succeed on a real card");
+    let context = RuntimeContext::create(DeviceId(0), scheduler, allocator);
     let _stream_id = context
         .create_stream(
             RuntimeStreamPriority::Normal,
