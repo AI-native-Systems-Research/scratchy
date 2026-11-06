@@ -9753,8 +9753,10 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     use crate::ir::bridge::tiled_op_sdsc_op::{
-        assemble_reduce_off, win_reduce_accum, win_reduce_data,
+        ReduceDivision, ReduceSplit, assemble_reduce_off, assemble_reduce_split,
+        win_reduce_accum, win_reduce_data,
     };
+    use crate::emit::op_func_from_str;
     let unit = matches!(
         k.program,
         crate::ktir_node::Program::WindowedRmsNorm { unit: true }
@@ -9918,38 +9920,63 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             layout,
         ));
         // 2. mean(x²) — the per-head reduce: data at the window (block-aligned), accum at
-        //    its own head's buffer at ZERO (the fp8 amax-partial shape).
+        //    its own head's buffer at ZERO (the fp8 amax-partial shape). THE ONE PROBE-AND-SPLIT
+        //    BODY owns the long form: a head window too wide for one LX pass splits into
+        //    single-shot slices and their running combine, and a fitting one is this single
+        //    descriptor unchanged.
         let rmmean_op = format!("rmmean_{prefix}");
-        ops.push(assemble_reduce_off(
-            &rmmean_op,
-            "mean",
-            t_rows,
-            f_cols,
-            // The data window is head `h`'s `[m, d]` slab of the `[m, full]` square — `col_of`'s
-            // whole-block shift, minted against the buffer's own handle.
-            win_reduce_data(
-                layout,
-                &sq16_h,
-                win,
-                t_rows,
-                f_cols,
-                crate::superdsc_opspec::Df::Fp16,
-                &format!("{rmmean_op}: squares"),
-            )
-            .map_err(|e| Error { message: e })?,
-            win_reduce_accum(
-                layout,
-                &mean_h,
-                crate::addr::DevOff::ZERO,
-                t_rows,
-                crate::superdsc_opspec::Df::Fp16,
-                &format!("{rmmean_op}: mean"),
-            )
-            .map_err(|e| Error { message: e })?,
-            crate::superdsc_opspec::Df::Fp16,
+        let split = assemble_reduce_split(
+            ReduceSplit {
+                op_name: &rmmean_op,
+                op: op_func_from_str("mean"),
+                rows: t_rows.get(),
+                cols: d,
+                df: crate::superdsc_opspec::Df::Fp16,
+                data: &sq16_h,
+                data_col: h * d,
+                accum: &mean_h,
+                accum_off: crate::addr::DevOff::ZERO,
+                parent: out_id,
+                division: ReduceDivision::Rows,
+            },
             sym_id_base,
             layout,
-        ));
+        )
+        .map_err(|e| Error { message: e })?;
+        if let Some(split) = split {
+            ops.extend(split);
+        } else {
+            ops.push(assemble_reduce_off(
+                &rmmean_op,
+                "mean",
+                t_rows,
+                f_cols,
+                // The data window is head `h`'s `[m, d]` slab of the `[m, full]` square — `col_of`'s
+                // whole-block shift, minted against the buffer's own handle.
+                win_reduce_data(
+                    layout,
+                    &sq16_h,
+                    win,
+                    t_rows,
+                    f_cols,
+                    crate::superdsc_opspec::Df::Fp16,
+                    &format!("{rmmean_op}: squares"),
+                )
+                .map_err(|e| Error { message: e })?,
+                win_reduce_accum(
+                    layout,
+                    &mean_h,
+                    crate::addr::DevOff::ZERO,
+                    t_rows,
+                    crate::superdsc_opspec::Df::Fp16,
+                    &format!("{rmmean_op}: mean"),
+                )
+                .map_err(|e| Error { message: e })?,
+                crate::superdsc_opspec::Df::Fp16,
+                sym_id_base,
+                layout,
+            ));
+        }
         // 3. mean + eps.
         ops.push(pw2(
             &format!("rmeps_{prefix}"),
