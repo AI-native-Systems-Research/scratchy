@@ -11,9 +11,13 @@ use crate::handoff::{LoweredDecode, SourceBinding};
 use crate::kv_codec::CodecGuard::{Codec, CodecDecode, CodecNotDecode, UnlessCodecDecode};
 use crate::kv_codec::{After, Before, CodecAround, CodecHeadDims, Guarded, KvCodecFacts};
 use crate::lower::{InputRef, LoweringInput, OpDesc};
-use crate::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 use crate::subtile_ir::{
-    AttnMask, EwKind, GainConvention, KvOperand, RopeFormTag, SourceShape, SubOp,
+    AttnMask, EwKind, GainConvention, KvOperand, RopeClass, RopeFormTag, SourceShape, SubOp,
+};
+use scratchy_ir::model_facts::HeadDim;
+use scratchy_ir::model_facts::{
+    Attention, AttnScale, BlockSize, HeadGeometry, KvHeads, KvRope, QueryHeads, Rope, RopePairing,
+    RotDim,
 };
 
 /// Minimal one-layer Llama-3.2-1B-style decode forward.
@@ -55,13 +59,7 @@ pub fn one_layer_input() -> LoweringInput {
 /// mlp) be exercised at a second head_dim (e.g. hd=128) with no bespoke
 /// fixture — the per-layer composition test for model-generality.
 pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput {
-    let scale = 1.0f32 / (hd as f32).sqrt();
     let head_dim = HeadDim::new(hd);
-    // The fixture's geometry, through the same mint the real config path uses: a `(h, kv, hd)` trio
-    // whose kv-head count does not divide its query-head count is not a model, and the fixture
-    // cannot name one.
-    let geom = ModelAttnGeometry::mint(QueryHeads::new(h / hd), KvHeads::new(kv / hd), head_dim)
-        .expect("one_layer_input_shaped: h/hd must be a multiple of kv/hd");
     LoweringInput {
         exported: None,
         sources: vec![
@@ -140,7 +138,15 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             // 5: k' = rope_append(k, cos, sin, v, prefix_k, prefix_v)
             //    (rotate K + write rotated K / un-roped V to layer 0 cache)
             OpDesc {
-                op: SubOp::rope_append(head_dim, 0, AttnMask::Causal, RopeFormTag::NeoX),
+                op: SubOp::rope_append(
+                    one_layer_attention(h, kv, hd),
+                    // A uniform fixture: both classes state the same head dim, so the
+                    // rope class is the base either way.
+                    RopeClass::Base,
+                    0,
+                    AttnMask::Causal,
+                    RopeFormTag::NeoX,
+                ),
                 m: 1,
                 inputs: vec![
                     InputRef::Op(2),
@@ -157,7 +163,7 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
                 // Llama-3.2-1B GQA: 32 q-heads, 8 kv-heads. valid_len 2: decode_position=1 →
                 // 1 prefix row + 1 new = 2 valid positions. Decoupled from the cache TENSOR
                 // capacity (sources 7,8 may be sized larger).
-                op: SubOp::attn_decode(geom, scale, 2, AttnMask::Causal),
+                op: SubOp::attn_decode(one_layer_attention(h, kv, hd), 2, AttnMask::Causal),
                 m: 1,
                 inputs: vec![
                     InputRef::Op(4),
@@ -233,6 +239,75 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
         ],
         result: 14,
     }
+}
+
+/// One class's head geometry for a `one_layer_input_shaped(h, kv, i, hd)` layer: query heads
+/// `h/hd`, kv heads `kv/hd`, the full head as its rot window, the default KV page. The
+/// constructor's GQA law refuses a `(h, kv, hd)` trio whose kv-head count does not divide its
+/// query-head count — the fixture cannot name a non-model.
+pub fn fixture_head_geometry(h: u32, kv: u32, hd: u32) -> HeadGeometry {
+    HeadGeometry::new(
+        QueryHeads::new(h / hd),
+        KvHeads::new(kv / hd),
+        scratchy_ir::model_facts::HeadDim::new(hd),
+        RotDim::new(hd),
+        BlockSize::new(16),
+    )
+}
+
+/// The attention facts a `one_layer_input_shaped(h, kv, i, hd)` layer runs under: a uniform
+/// model (base == global) whose softmax scale is `1/sqrt(hd)`, keys rotated at the write, NeoX
+/// lane pairing. Every consumer that takes the fixture's `Attention` reads the same numbers the
+/// per-op `geom`/`scale` fields used to carry.
+/// A fixture `Attention` for calls on graphs that hold no attention node: the value is
+/// unread there, but the shared walks take the model's facts as one value.
+pub fn fixture_attention() -> Attention {
+    one_layer_attention(2048, 512, 64)
+}
+
+/// The fixture `Attention` for a hand-built `(hq, hkv, hd)` attention at `scale`: a uniform
+/// model whose classes both state the fixture's trio.
+pub fn attention_at(hq: u32, hkv: u32, hd: u32, scale: f32) -> Attention {
+    let group = fixture_head_geometry(hq * hd, hkv * hd, hd);
+    Attention::new(
+        group,
+        group,
+        scratchy_ir::model_facts::AttnScale::new(scale),
+        None,
+        None,
+        scratchy_ir::model_facts::Rope::new(
+            scratchy_ir::model_facts::RopePairing::Standard,
+            scratchy_ir::model_facts::KvRope::AtWrite,
+            None,
+        ),
+    )
+}
+
+pub fn one_layer_attention(h: u32, kv: u32, hd: u32) -> Attention {
+    let group = fixture_head_geometry(h, kv, hd);
+    Attention::new(
+        group,
+        group,
+        AttnScale::new(1.0 / (hd as f32).sqrt()),
+        None,
+        None,
+        Rope::new(RopePairing::Standard, KvRope::AtWrite, None),
+    )
+}
+
+/// The fixture `Attention` for a hybrid model: the same heads in both classes (the facts'
+/// own law — only the kv side may differ), the base class at `base_hd` and the global at
+/// `global_hd` (gemma-4's shape — two rotary classes, so a rope op's
+/// [`RopeClass`](crate::subtile_ir::RopeClass) selects a real dim).
+pub fn hybrid_attention(base_hd: u32, global_hd: u32) -> Attention {
+    Attention::new(
+        fixture_head_geometry(8 * base_hd, 2 * base_hd, base_hd),
+        fixture_head_geometry(8 * global_hd, 2 * global_hd, global_hd),
+        AttnScale::new(1.0 / (base_hd as f32).sqrt()),
+        None,
+        None,
+        Rope::new(RopePairing::Standard, KvRope::AtWrite, None),
+    )
 }
 
 /// A minimal NON-ATTENTION chain: `n` layers of `RmsNorm -> Gemm ->

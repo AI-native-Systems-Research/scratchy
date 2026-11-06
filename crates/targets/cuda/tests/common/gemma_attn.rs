@@ -32,9 +32,11 @@
 
 use std::num::NonZeroU32;
 
+use scratchy_ir::model_facts::{AttnScale, HeadDim, KvRope, Rope};
+use scratchy_subtile::fixtures::fixture_head_geometry;
 use scratchy_subtile::handoff::{LoweredDecode, RopePairing, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
-use scratchy_subtile::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
+use scratchy_subtile::subtile_ir::RopeClass;
 use scratchy_subtile::subtile_ir::{
     AttnMask, GainConvention, RopeFormTag, RowScale, SourceShape, SubOp,
 };
@@ -102,6 +104,25 @@ pub const GEMMA_ATTN_FACTS: CudaModelFacts = CudaModelFacts {
 };
 
 /// The layer's ops at `m` rows (the module's table), over the module's sources.
+/// Gemma 4's attention facts as one value (#1093: the ops carry the model's `Attention`): the
+/// sliding class (16 query heads over 8 kv heads at 256) as the base, the global class (16 over 2
+/// at 512) as the global, the softmax scale 1. A sliding layer reads `class(Sliding)` = the base,
+/// a global (causal) layer `class(Full)` = the global, as on the real model.
+fn gemma_attention() -> scratchy_ir::model_facts::Attention {
+    scratchy_ir::model_facts::Attention::new(
+        fixture_head_geometry(HEADS * HD, KV_HEADS * HD, HD),
+        fixture_head_geometry(HEADS * HD_GLOBAL, KV_HEADS_GLOBAL * HD_GLOBAL, HD_GLOBAL),
+        AttnScale::new(SCALE),
+        None,
+        None,
+        Rope::new(
+            scratchy_ir::model_facts::RopePairing::Standard,
+            KvRope::AtWrite,
+            None,
+        ),
+    )
+}
+
 pub fn gemma_attn_input(m: u32) -> LoweringInput {
     use InputRef::{Ext, Op};
     let norm = SubOp::RmsNorm {
@@ -118,12 +139,7 @@ pub fn gemma_attn_input(m: u32) -> LoweringInput {
         rows: RowScale::Times(NonZeroU32::new(heads).expect("a non-zero head count")),
         cols,
     };
-    let geom = ModelAttnGeometry::mint(
-        QueryHeads::new(HEADS),
-        KvHeads::new(KV_HEADS),
-        HeadDim::new(HD),
-    )
-    .expect("16 query heads over 8 kv heads");
+    let attention = gemma_attention();
     let mask = AttnMask::SlidingWindow {
         window: NonZeroU32::new(WINDOW).expect("a window"),
     };
@@ -176,12 +192,12 @@ pub fn gemma_attn_input(m: u32) -> LoweringInput {
             ),
             // 12: kr = RopeAppend(kf, cos_k, sin_k, vn, pk, pv)
             op(
-                SubOp::rope_append(HeadDim::new(HD), LAYER, mask, RopeFormTag::NeoX),
+                SubOp::rope_append(attention, RopeClass::Base, LAYER, mask, RopeFormTag::NeoX),
                 vec![Op(8), Ext(9), Ext(10), Op(10), Ext(11), Ext(12)],
             ),
             // 13: attn = AttnDecode(qr, pk, pv, kr, vn), windowed
             op(
-                SubOp::attn_decode(geom, SCALE, PREFIX_CAPACITY, mask),
+                SubOp::attn_decode(attention, PREFIX_CAPACITY, mask),
                 vec![Op(11), Ext(11), Ext(12), Op(12), Op(10)],
             ),
             // 14: o = attn · Wo, the result
@@ -264,12 +280,7 @@ fn global_layer(m: u32, x: InputRef, src: usize, op0: usize) -> (Vec<SourceShape
         rows: RowScale::Times(NonZeroU32::new(heads).expect("a non-zero head count")),
         cols,
     };
-    let geom = ModelAttnGeometry::mint(
-        QueryHeads::new(HEADS),
-        KvHeads::new(KV_HEADS_GLOBAL),
-        HeadDim::new(HD_GLOBAL),
-    )
-    .expect("16 query heads over 2 kv heads");
+    let attention = gemma_attention();
     let (e, o) = (|i: usize| Ext(src + i), |i: usize| Op(op0 + i));
     let sources = vec![
         shape(1, H),
@@ -303,7 +314,8 @@ fn global_layer(m: u32, x: InputRef, src: usize, op0: usize) -> (Vec<SourceShape
         ),
         op(
             SubOp::rope_append(
-                HeadDim::new(HD_GLOBAL),
+                attention,
+                RopeClass::Global,
                 LAYER_GLOBAL,
                 AttnMask::Causal,
                 RopeFormTag::NeoX,
@@ -311,7 +323,7 @@ fn global_layer(m: u32, x: InputRef, src: usize, op0: usize) -> (Vec<SourceShape
             vec![o(8), e(7), e(8), o(9), e(9), e(10)],
         ),
         op(
-            SubOp::attn_decode(geom, SCALE, PREFIX_CAPACITY, AttnMask::Causal),
+            SubOp::attn_decode(attention, PREFIX_CAPACITY, AttnMask::Causal),
             vec![o(10), e(9), e(10), o(11), o(9)],
         ),
         op(matmul(H), vec![o(12), e(11)]),

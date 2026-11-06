@@ -27,6 +27,8 @@ use common::chains::{
 };
 use common::gdn_layer::{BUNDLE_BYTES, GDN_LAYER_M128, GDN_LAYER_M256, gdn_layer};
 use common::mlp::{EPS, H, I, MLP_M128, MLP_M256, mlp};
+use scratchy_ir::model_facts::{Attention, HeadDim, HeadGeometry};
+use scratchy_subtile::fixtures::attention_at;
 use scratchy_subtile::fixtures::{
     front_end_lowered, gemm_m1_only_input, one_layer_input, silu_mul_only_input,
 };
@@ -34,7 +36,7 @@ use scratchy_subtile::handoff::{LoweredDecode, SourceBinding, UnrollIndex};
 use scratchy_subtile::lower::{
     AffineInt4, ArchOp, GemmWeight, GemmWeightKind, InputRef, LoweringInput, OpDesc,
 };
-use scratchy_subtile::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
+use scratchy_subtile::subtile_ir::RopeClass;
 use scratchy_subtile::subtile_ir::{
     AttnMask, EwKind, GainConvention, RopeFormTag, RowScale, SourceShape, SubOp,
 };
@@ -1109,14 +1111,16 @@ fn attn_layer_with(ix: usize, op: ArchOp) -> LoweredDecode {
     l
 }
 
-/// qwen3.5-0.8b's attention geometry, or another one.
-fn geom(q: u32, kv: u32, hd: u32) -> ModelAttnGeometry {
-    ModelAttnGeometry::mint(QueryHeads::new(q), KvHeads::new(kv), HeadDim::new(hd))
-        .expect("a valid geometry")
+/// qwen3.5-0.8b's attention facts at scale 1/16, or another geometry (#1093: the ops carry the
+/// model's `Attention`; a uniform model, so every class reads this trio).
+fn geom(q: u32, kv: u32, hd: u32) -> Attention {
+    attention_at(q, kv, hd, 0.0625)
 }
 
-const fn rope_append_op(head_dim: u32, layer: u32, attn: AttnMask, pairing: RopeFormTag) -> ArchOp {
-    SubOp::rope_append(HeadDim::new(head_dim), layer, attn, pairing)
+/// A `RopeAppend` whose rope head dim is `head_dim`: the attention facts of an 8-over-2 model at
+/// that head dim, so the op's `rope.head_dim(attention)` is exactly `head_dim`.
+fn rope_append_op(head_dim: u32, layer: u32, attn: AttnMask, pairing: RopeFormTag) -> ArchOp {
+    SubOp::rope_append(geom(8, 2, head_dim), RopeClass::Base, layer, attn, pairing)
 }
 
 const WINDOW: AttnMask = AttnMask::SlidingWindow {
@@ -1398,7 +1402,8 @@ fn a_kv_layer_above_u32_is_refused() {
 
 /// `AttnDecode(q, pk, pv, k, v)` alone over sources at `m` rows of `geom`: refused by its shape
 /// before any operand is read.
-fn attn_only(m: u32, g: ModelAttnGeometry) -> LoweredDecode {
+fn attn_only(m: u32, a: Attention) -> LoweredDecode {
+    let g: HeadGeometry = a.base();
     let mut l = with_hidden(LoweringInput {
         exported: None,
         sources: vec![
@@ -1409,7 +1414,7 @@ fn attn_only(m: u32, g: ModelAttnGeometry) -> LoweredDecode {
             shape(m, g.kv_width()),
         ],
         ops: vec![OpDesc {
-            op: SubOp::attn_decode(g, 0.0625, PREFIX_CAPACITY, AttnMask::Causal),
+            op: SubOp::attn_decode(a, PREFIX_CAPACITY, AttnMask::Causal),
             m,
             inputs: (0..5).map(InputRef::Ext).collect(),
         }],
@@ -1544,7 +1549,7 @@ fn an_attention_of_another_head_dim_is_refused() {
 fn a_sliding_window_attention_is_refused() {
     let l = attn_layer_with(
         13,
-        SubOp::attn_decode(geom(8, 2, 256), 0.0625, PREFIX_CAPACITY, WINDOW),
+        SubOp::attn_decode(geom(8, 2, 256), PREFIX_CAPACITY, WINDOW),
     );
     let e = refused(&l, &["AttnDecode", "sliding-window"]);
     assert!(matches!(
@@ -1650,7 +1655,7 @@ fn an_attention_whose_prefix_operand_is_not_its_layers_is_refused() {
 fn an_attention_of_another_kv_geometry_is_refused() {
     let l = attn_layer_with(
         13,
-        SubOp::attn_decode(geom(8, 1, 256), 0.0625, PREFIX_CAPACITY, AttnMask::Causal),
+        SubOp::attn_decode(geom(8, 1, 256), PREFIX_CAPACITY, AttnMask::Causal),
     );
     let e = refused(&l, &["AttnDecode", "1 kv heads"]);
     assert!(matches!(
@@ -2572,7 +2577,7 @@ fn sliding_layer(m: u32, window: u32) -> LoweredDecode {
         window: NonZeroU32::new(window).expect("a window"),
     };
     l.input.ops[12].op = rope_append_op(256, LAYER, mask, RopeFormTag::NeoX);
-    l.input.ops[13].op = SubOp::attn_decode(geom(8, 2, 256), 0.0625, PREFIX_CAPACITY, mask);
+    l.input.ops[13].op = SubOp::attn_decode(geom(8, 2, 256), PREFIX_CAPACITY, mask);
     l
 }
 

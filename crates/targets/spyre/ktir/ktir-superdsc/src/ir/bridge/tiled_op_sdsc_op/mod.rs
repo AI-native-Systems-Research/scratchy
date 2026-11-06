@@ -40,12 +40,11 @@ pub use matmul::{
     matmul_opspec_off, matmul_opspec_off_operands, matmul_opspec_split, try_assemble_matmul_seeded,
 };
 pub use pointwise::{
-    ExpandedBlocks, GatheredWords, PageGatherBlocks, PageGatherRows, PageOfBlocks, ScatterCopySpec,
-    StickPermute, StickPermuteSpec, StickRuns, assemble_expand_blocks, assemble_gather_copy,
-    assemble_page_gather_blocks, assemble_page_gather_copy, assemble_page_gather_page,
-    assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
-    assemble_scatter_copy, assemble_stick_permute, assemble_stick_runs_copy, gather_copy_opspec,
-    page_gather_blocks_opspec, page_gather_copy_opspec, page_gather_page_opspec,
+    ExpandedBlocks, GatheredWords, IndexSelectPage, PageGatherRows, ScatterCopySpec, StickPermute,
+    StickPermuteSpec, StickRuns, assemble_expand_blocks, assemble_gather_copy,
+    assemble_index_select, assemble_page_gather_copy, assemble_pointwise_broadcast_off_from_tile,
+    assemble_pointwise_seeded_from_tile, assemble_scatter_copy, assemble_stick_permute,
+    assemble_stick_runs_copy, gather_copy_opspec, index_select_opspec, page_gather_copy_opspec,
     pointwise_broadcast_opspec_from_tile, pointwise_opspec_from_tile, scatter_copy_opspec,
     stick_permute_opspec,
 };

@@ -417,8 +417,8 @@ pub const CUDA_COLUMN_BLOCK: NonZeroU32 = NonZeroU32::MAX;
 mod tests {
     use super::*;
 
+    use scratchy_ir::model_facts::HeadDim;
     use scratchy_subtile::lower::GemmWeight;
-    use scratchy_subtile::model_geometry::HeadDim;
     use scratchy_subtile::subtile_ir::{GainConvention, RowScale};
     use scratchy_subtile::tape_colouring::{Outputs, Reads, Residency};
 

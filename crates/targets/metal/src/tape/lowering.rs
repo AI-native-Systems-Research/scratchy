@@ -1633,7 +1633,7 @@ fn decode_attention_per_kv_head(
     };
     let takes = |c: &LoweredCommand| c.kernel == KernelId::AttentionViaCacheTq && lane_stride(c);
     // The query heads a KV head serves, exact by `HeadGeometry`'s law.
-    let group = global.gqa();
+    let group = global.gqa().get();
     let keys = at.block_cap.saturating_mul(global.page().get());
     let splits = keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS);
     // A row's partials are `[num_q_heads, splits, 2 + D]` f32s. Every row's, a wide prefill
@@ -2504,7 +2504,7 @@ fn verify_lane_attention(
     use crate::tape::lowered::{MScaleAxis, MScaling, SetAxis};
     // The class's query heads per KV head, exact by `HeadGeometry`'s law.
     let (q_heads, num_kv_heads) = (s.class.q_heads().get(), s.class.kv_heads().get());
-    let gqa = s.class.gqa();
+    let gqa = s.class.gqa().get();
     let scale = p.attention()?.scale().get();
     let (split_sym, pack_sym) = match (s.dtype_tag, s.class.head_dim().get(), s.class.page().get())
     {
@@ -3977,7 +3977,7 @@ fn lower_one(
             let dtype = dequant_dtype_for(p);
             // out is [M, num_heads * head_dim]; one thread per element,
             // m_scaling rescales the X axis to the runtime token count.
-            let n = bucket_m * (base(p)?.q_width() as u32);
+            let n = bucket_m * base(p)?.q_width();
             LoweredCommand {
                 kernel: KernelId::GateApply,
                 library: "gate_apply",
@@ -4502,7 +4502,7 @@ fn lower_one(
             let dtype = dequant_dtype_for(p);
             // Each output is [M, num_heads * head_dim]; one thread per
             // output element writes both the query and gate halves.
-            let n = bucket_m * (base(p)?.q_width() as u32);
+            let n = bucket_m * base(p)?.q_width();
             LoweredCommand {
                 kernel: KernelId::GateSplit,
                 library: "gate_split",

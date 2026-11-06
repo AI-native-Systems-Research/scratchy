@@ -3682,6 +3682,7 @@ dependencies = [
  "half",
  "inventory",
  "safetensors",
+ "scratchy-ir",
  "scratchy-layers",
  "scratchy-subtile",
  "scratchy-target-cuda-compiler",
@@ -3696,6 +3697,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "scratchy-const-tokens",
+ "scratchy-ir",
  "scratchy-subtile",
  "scratchy-target-cuda",
 ]
@@ -3774,6 +3776,7 @@ dependencies = [
  "ktir-superdsc",
  "libc",
  "rayon",
+ "scratchy-ir",
  "scratchy-layers",
  "scratchy-quantizations",
  "scratchy-spyre-bundle",
@@ -3802,6 +3805,7 @@ version = "0.1.0"
 dependencies = [
  "ktir-core",
  "ktir-superdsc",
+ "scratchy-ir",
  "scratchy-subtile",
  "serde_json",
  "triton-frontend",

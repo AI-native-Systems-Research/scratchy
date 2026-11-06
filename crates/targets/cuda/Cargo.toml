@@ -47,6 +47,8 @@ inventory = { workspace = true }
 # compiler, which depends on this crate: a dev-only cycle Cargo allows. The integration tests link
 # one copy of this library, the one the compiler links too.
 scratchy-subtile = { path = "../../compiler/subtile" }
+# The model facts the attention fixtures build (#1093: the attention ops carry `Attention`).
+scratchy-ir = { path = "../../compiler/ir" }
 scratchy-target-cuda-compiler = { path = "compiler" }
 # `weight_table` writes a tiny synthetic checkpoint with `safetensors::serialize`.
 safetensors = { workspace = true }

@@ -34,9 +34,11 @@
 
 use std::num::NonZeroU32;
 
+use scratchy_ir::model_facts::HeadDim;
+use scratchy_subtile::fixtures::attention_at;
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
-use scratchy_subtile::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
+use scratchy_subtile::subtile_ir::RopeClass;
 use scratchy_subtile::subtile_ir::{
     AttnMask, EwKind, GainConvention, RopeFormTag, RowScale, SourceShape, SubOp,
 };
@@ -94,12 +96,8 @@ pub fn attn_layer_input(m: u32) -> LoweringInput {
         rows: RowScale::Times(NonZeroU32::new(heads).expect("a non-zero head count")),
         cols,
     };
-    let geom = ModelAttnGeometry::mint(
-        QueryHeads::new(HEADS),
-        KvHeads::new(KV_HEADS),
-        HeadDim::new(HD),
-    )
-    .expect("8 query heads over 2 kv heads");
+    // 8 query heads over 2 kv heads, one class (#1093: the ops carry the model's `Attention`).
+    let attention = attention_at(HEADS, KV_HEADS, HD, SCALE);
     LoweringInput {
         exported: None,
         sources: vec![
@@ -148,12 +146,18 @@ pub fn attn_layer_input(m: u32) -> LoweringInput {
             ),
             // 12: kr = RopeAppend(kf, cos_k, sin_k, v, pk, pv)
             op(
-                SubOp::rope_append(HeadDim::new(HD), LAYER, AttnMask::Causal, RopeFormTag::NeoX),
+                SubOp::rope_append(
+                    attention,
+                    RopeClass::Base,
+                    LAYER,
+                    AttnMask::Causal,
+                    RopeFormTag::NeoX,
+                ),
                 vec![Op(9), Ext(9), Ext(10), Op(10), Ext(11), Ext(12)],
             ),
             // 13: attn = AttnDecode(qr, pk, pv, kr, v)
             op(
-                SubOp::attn_decode(geom, SCALE, PREFIX_CAPACITY, AttnMask::Causal),
+                SubOp::attn_decode(attention, PREFIX_CAPACITY, AttnMask::Causal),
                 vec![Op(11), Ext(11), Ext(12), Op(12), Op(10)],
             ),
             // 14: ga = GateApply(attn, gate): operand 1 names op 2 and means its second output

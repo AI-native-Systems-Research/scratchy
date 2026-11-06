@@ -52,10 +52,10 @@ counts! {
     Slabs => "Head-dim slabs at some data format — `head_dim / lanes`, never a literal.",
     Gqa => "Query heads per kv head — the group size every KV address is built from: \
             [`Shape::gqa`] divides it out of the shape's head counts, and `sdsc_abstract`'s \
-            `KvHead::of_query`/`group_first_query` take one. The address-side twin of the tape's \
-            `scratchy_subtile::model_geometry::Gqa`, which is divided out once at \
-            `ModelAttnGeometry::mint`; this crate takes no scratchy dependency, so it cannot name \
-            that one.",
+            `KvHead::of_query`/`group_first_query` take one. The address-side twin of the \
+            model facts' GQA group (`scratchy_ir::model_facts::HeadGeometry::gqa`), divided \
+            out once at the facts' constructor; this crate takes no scratchy dependency, so \
+            it cannot name that one.",
 }
 
 /// One model's attention geometry, as types. `HD` is head_dim, `NQH`/`NKVH` the query and key/value

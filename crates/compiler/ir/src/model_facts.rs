@@ -38,10 +38,12 @@ positive! {
     QueryHeads(u32),
     /// Key/value heads (`num_key_value_heads`, sharded).
     KvHeads(u32),
-    /// One head's width.
-    HeadDim(u32),
     /// The leading lanes of a head that rotary rotates.
     RotDim(u32),
+    /// Query heads per kv head — the GQA group size, minted once by
+    /// [`HeadGeometry::new`](HeadGeometry::new) beside its divisibility law, so no reader
+    /// re-derives the division.
+    Gqa(u32),
     /// Positions per paged-KV block.
     BlockSize(u32),
     /// The residual stream's width.
@@ -74,6 +76,30 @@ positive! {
     PoolKernel(u32),
     /// The input width of a vision tower's patch embedding.
     InFeatures(usize),
+}
+
+/// One head's width. Deliberately outside `positive!`: its storage IS the non-zero its
+/// law states, so [`HeadDim::nonzero`](HeadDim::nonzero) is a field read, not a
+/// re-proven conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HeadDim(std::num::NonZeroU32);
+impl HeadDim {
+    /// The width, refused at zero.
+    pub const fn new(v: u32) -> Self {
+        match std::num::NonZeroU32::new(v) {
+            Some(nz) => Self(nz),
+            None => panic!("HeadDim is a positive quantity"),
+        }
+    }
+    /// The width as a number.
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+    /// The width as a non-zero — the storage already is one, so no caller re-proves
+    /// the law this type states.
+    pub const fn nonzero(self) -> std::num::NonZeroU32 {
+        self.0
+    }
 }
 
 /// A finite `f32`: the constructor refuses NaN and infinity, and, where `$positive`, a value not
@@ -161,6 +187,9 @@ pub struct HeadGeometry {
     head_dim: HeadDim,
     rot_dim: RotDim,
     page: BlockSize,
+    gqa: Gqa,
+    q_width: u32,
+    kv_width: u32,
 }
 
 impl HeadGeometry {
@@ -181,12 +210,23 @@ impl HeadGeometry {
             rot_dim.get() <= head_dim.get(),
             "HeadGeometry: the rot window fits its head"
         );
+        let q_width = q_heads
+            .get()
+            .checked_mul(head_dim.get())
+            .expect("HeadGeometry: the query width fits u32");
+        let kv_width = kv_heads
+            .get()
+            .checked_mul(head_dim.get())
+            .expect("HeadGeometry: the kv width fits u32");
         Self {
             q_heads,
             kv_heads,
             head_dim,
             rot_dim,
             page,
+            gqa: Gqa::new(q_heads.get() / kv_heads.get()),
+            q_width,
+            kv_width,
         }
     }
     /// The query heads.
@@ -209,13 +249,22 @@ impl HeadGeometry {
     pub const fn page(self) -> BlockSize {
         self.page
     }
-    /// Query heads per kv head, exact by the constructor's law.
-    pub const fn gqa(self) -> u32 {
-        self.q_heads.get() / self.kv_heads.get()
+    /// Query heads per kv head — the group minted once at construction, exact by the
+    /// constructor's law, so no reader re-derives the division.
+    pub const fn gqa(self) -> Gqa {
+        self.gqa
     }
-    /// `q_heads · head_dim`.
-    pub const fn q_width(self) -> usize {
-        self.q_heads.get() as usize * self.head_dim.get() as usize
+    /// `q_heads · head_dim`, proven to fit at the constructor. A `u32` — the width every
+    /// tape and kernel constant reads — widened to `usize` only by the `raw::` consts,
+    /// where the cast is lossless.
+    pub const fn q_width(self) -> u32 {
+        self.q_width
+    }
+    /// `kv_heads · head_dim`, proven to fit at the constructor — one K or V projection's
+    /// column count, narrower than [`q_width`](Self::q_width) by exactly the GQA group
+    /// size.
+    pub const fn kv_width(self) -> u32 {
+        self.kv_width
     }
 }
 
@@ -775,7 +824,7 @@ pub mod raw {
     /// `Q_SIZE`: the decoder's query width, else the tower's.
     pub const fn q_size(f: ModelFacts) -> usize {
         match (f.0.attention, f.0.vision) {
-            (Some(a), _) => a.base.q_width(),
+            (Some(a), _) => a.base.q_width() as usize,
             (None, Some(v)) => v.q_width(),
             (None, None) => 0,
         }
@@ -783,7 +832,7 @@ pub mod raw {
     /// `KV_SIZE`: one K or V projection's width, the base class's.
     pub const fn kv_size(f: ModelFacts) -> usize {
         match f.0.attention {
-            Some(a) => a.base.kv_heads.get() as usize * a.base.head_dim.get() as usize,
+            Some(a) => a.base.kv_width() as usize,
             None => 0,
         }
     }
@@ -1047,7 +1096,7 @@ pub mod raw {
     /// `GLOBAL_Q_SIZE`: the global class's query width, else `Q_SIZE`.
     pub const fn global_q_size(f: ModelFacts) -> usize {
         match f.0.attention {
-            Some(a) => a.global.q_width(),
+            Some(a) => a.global.q_width() as usize,
             None => q_size(f),
         }
     }
@@ -1108,7 +1157,7 @@ mod tests {
     #[test]
     fn a_dividing_kv_head_count_has_its_group() {
         let g = geometry(28, 4, 128, 128);
-        assert_eq!((g.gqa(), g.q_width()), (7, 28 * 128));
+        assert_eq!((g.gqa().get(), g.q_width()), (7, 28 * 128));
     }
 
     /// 29 query heads over 4 kv heads have no GQA grouping.

@@ -14,6 +14,7 @@ publish = false
 
 [dependencies]
 scratchy-subtile = { path = "../../compiler/subtile", features = ["spyre"] }
+scratchy-ir = { path = "../../compiler/ir" }
 ktir-core = { path = "../../targets/spyre/ktir/ktir-core" }
 ktir-superdsc = { path = "../../targets/spyre/ktir/ktir-superdsc" }
 # ⭐ THE RUST LADDER, from this workspace's own re-host. `codegen::compile` parses `.py`

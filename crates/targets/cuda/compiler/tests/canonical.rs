@@ -10,11 +10,11 @@ use scratchy_subtile::fixtures::{
 };
 use std::num::NonZeroU32;
 
+use scratchy_ir::model_facts::HeadDim;
 use scratchy_subtile::handoff::{
     LoweredDecode, SourceBinding, TargetBucket, TargetModelFacts, TargetModelInput, TargetPoint,
 };
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
-use scratchy_subtile::model_geometry::HeadDim;
 use scratchy_subtile::subtile_ir::{
     EwKind, GainConvention, RowScale, SourceShape, SubOp, SubtileIR,
 };

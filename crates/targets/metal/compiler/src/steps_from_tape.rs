@@ -2386,7 +2386,7 @@ impl Recording<'_> {
                 e.sig.kv_r = Some(layer);
                 e
             }
-            L::DraftContextKv { layer } => {
+            L::DraftContextKv { layer, .. } => {
                 let (kv, layer) = (self.read(i, 0)?, LayerId(layer));
                 let mut sites = self.site(i, WeightKind::RmsNorm, self.source_arg(i, 1)?)?;
                 sites.push(self.rotary(i));

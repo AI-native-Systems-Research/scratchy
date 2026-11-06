@@ -38,7 +38,7 @@
 
 #![allow(dead_code)]
 
-use crate::model_geometry::{HeadDim, ModelAttnGeometry};
+use scratchy_ir::model_facts::{Attention, HeadDim};
 use std::marker::PhantomData;
 
 // ── Identifiers & geometry ─────────────────────────────────────────
@@ -288,11 +288,12 @@ pub enum RopeFormTag {
 // ── KvCacheLayout ────────────────────────────────────────────────────
 //
 // The per-model K/V cache dims (`num_kv_heads`, `head_dim`, …) are NOT
-// duplicated here: they already live on the lowered IR ops
-// (`SubOp::AttnDecode { num_kv_heads, head_dim, … }`,
-// `SubOp::RopeAppend { head_dim, … }`), stamped from `model.bounds` in
-// `to_wavefront`. The lowering consumes those op fields directly.
-// `KvCacheLayout` is just the sealed pair of cache TensorIds the
+// duplicated here: the attention-reading ops carry the model's attention
+// facts (`SubOp::AttnDecode { attention, .. }`,
+// `SubOp::RopeAppend { attention, rope, .. }`) — ONE `Attention` value minted
+// at the bridge off `ModelFacts`, with the rope's head dim the rope class's
+// own off those facts. The lowering reads the class geometry off the op's own
+// value. `KvCacheLayout` is just the sealed pair of cache TensorIds the
 // producer (`RopeAppend`) writes and the consumer (`AttnDecode`) reads.
 
 /// **`KvCacheLayout`** — sealed witness naming the K-cache (or V-cache)
@@ -624,6 +625,60 @@ impl AttnMask {
     }
 }
 
+/// Which rotary class a rope op binds — the rotary extern the graph names for its layer:
+/// `rotary_local` (the BASE class) or plain `rotary` (the GLOBAL one).
+///
+/// ⛔ NOT A SECOND `HeadDim`. The rope's head dim is the class's own, and the class this op
+/// binds is selected at the bridge by the extern the graph names — a fact INDEPENDENT of the
+/// layer's [`AttnMask`] (a graph may name `rotary_local` on a full layer; the bridge's two
+/// selections mirror each other on every shipped model but no law ties them). So the op
+/// carries the CLASS, and the dim reads off its own [`Attention`] — never a bare second copy
+/// of a number the facts already hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RopeClass {
+    /// The base class (`rotary_local`).
+    Base,
+    /// The global class (plain `rotary`).
+    Global,
+}
+
+impl RopeClass {
+    /// The class's head dim, read off the op's own attention facts.
+    pub fn head_dim(self, attention: Attention) -> HeadDim {
+        match self {
+            RopeClass::Base => attention.base().head_dim(),
+            RopeClass::Global => attention.global().head_dim(),
+        }
+    }
+}
+
+/// Where a decode attention's softmax scale is applied — the typed site of the weight fold.
+///
+/// The attention's scale used to ride the `AttnDecode` op, and the fold collector
+/// (`attn_scale_weight_folds`) rewrote the node to `1.0` where it folded the `√scale` into the
+/// query and key projections' staged bytes. With the scale a FACT (`Attention::scale`), no
+/// per-node `f32` exists to rewrite: the fold's decision travels as THIS value, decided where
+/// the fold collector decides it, and every scale reader — the splice's `SCALE` constexpr, the
+/// scalar registry — states `attention.scale()` for [`InKernel`] and exactly `1.0` for
+/// [`FoldedIntoWeights`], so the emitted bytes cannot move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttnScaleSite {
+    /// The kernel multiplies the scores by the scale (`SCALE = attention.scale()`).
+    InKernel,
+    /// The fold carried `√scale` into the staged W_q/W_k bytes (`SCALE = 1.0`).
+    FoldedIntoWeights,
+}
+
+impl AttnScaleSite {
+    /// The scale this site states, as the splice's `SCALE` constexpr and the registry read it.
+    pub fn scale(self, attention: Attention) -> f32 {
+        match self {
+            AttnScaleSite::InKernel => attention.scale().get(),
+            AttnScaleSite::FoldedIntoWeights => 1.0,
+        }
+    }
+}
+
 // ── The mixture-of-experts vocabulary ──────────────────────────────
 //
 // A MoE block is its math, stated as ops: router logits → top-k → score transforms → the chosen
@@ -801,7 +856,22 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             SubOp::RopeAppend { layer, .. }
             | SubOp::KvAppend { layer, .. }
             | SubOp::DraftAttention { layer, .. }
-            | SubOp::DraftContextKv { layer } => Some(*layer),
+            | SubOp::DraftContextKv { layer, .. } => Some(*layer),
+            _ => None,
+        }
+    }
+
+    /// The rope head dim this op runs at — `RopeRotate`'s own field, `RopeAppend`'s rope class
+    /// off the op's own attention facts. `None` for every non-rope op.
+    ///
+    /// ONE reader for every consumer of that fact (the KV codec, the head tiler, the splices,
+    /// the class registries): no site re-matches the two rope kinds to re-derive it.
+    pub fn rope_head_dim(&self) -> Option<HeadDim> {
+        match self {
+            SubOp::RopeRotate { head_dim, .. } => Some(*head_dim),
+            SubOp::RopeAppend {
+                attention, rope, ..
+            } => Some(rope.head_dim(*attention)),
             _ => None,
         }
     }
@@ -917,6 +987,8 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
         }
     }
 
+    /// The attention ops carry their own attention facts, minted at the bridge — their arms
+    /// read their class's numbers off the op itself, and no other arm touches them.
     pub fn reroll_class_key(&self, h: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
         std::mem::discriminant(self).hash(h);
@@ -1013,14 +1085,17 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             SubOp::RmsNormReduce { eps, .. } | SubOp::RmsNormUnit { eps } => eps.to_bits().hash(h),
             SubOp::RmsNormApply { gain, .. } => std::mem::discriminant(gain).hash(h),
             SubOp::RopeRotate { head_dim, .. } => head_dim.get().hash(h),
-            // `layer` and `layout`'s cache tensors are per-layer IDENTITY, not class.
+            // `layer` and `layout`'s cache tensors are per-layer IDENTITY, not class. The
+            // rope's head dim hashes as the NUMBER the class states — the same input the
+            // bare field hashed, so the re-roll tables are unchanged.
             SubOp::RopeAppend {
-                head_dim,
+                attention,
+                rope,
                 attn,
                 pairing,
                 ..
             } => {
-                head_dim.get().hash(h);
+                rope.head_dim(*attention).get().hash(h);
                 std::mem::discriminant(attn).hash(h);
                 pairing.hash(h);
             }
@@ -1031,19 +1106,22 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             // `layout`, `producer`'s node index and `softmax_state` are per-layer identity;
             // `mask` is the class (sliding-window vs full) and is exactly what gemma-3 needs —
             // and the WINDOW is a model constant, so it hashes with the class rather than
-            // splitting one model's layers across hash buckets.
+            // splitting one model's layers across hash buckets. The geometry and the scale are
+            // the CLASS's own numbers, read off the attention facts in the SAME order the op
+            // used to carry them, so the hash input is unchanged byte for byte.
             SubOp::AttnDecode {
-                geom,
-                scale,
                 valid_len,
                 producer,
                 mask,
+                attention,
                 ..
             } => {
-                geom.nqh().get().hash(h);
-                geom.nkvh().get().hash(h);
-                geom.hd().get().hash(h);
-                scale.to_bits().hash(h);
+                let a = *attention;
+                let g = a.class(mask.class());
+                g.q_heads().get().hash(h);
+                g.kv_heads().get().hash(h);
+                g.head_dim().get().hash(h);
+                a.scale().get().to_bits().hash(h);
                 valid_len.hash(h);
                 std::mem::discriminant(producer).hash(h);
                 std::mem::discriminant(mask).hash(h);
@@ -1069,11 +1147,13 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             }
             SubOp::EmbeddingGather { indices_kind } => indices_kind.hash(h),
             SubOp::VarlenAttention { cu_kind } => cu_kind.hash(h),
-            SubOp::EncoderAttn { geom, scale } => {
-                geom.nqh().get().hash(h);
-                geom.nkvh().get().hash(h);
-                geom.hd().get().hash(h);
-                scale.to_bits().hash(h);
+            SubOp::EncoderAttn { attention } => {
+                let a = *attention;
+                let g = a.base();
+                g.q_heads().get().hash(h);
+                g.kv_heads().get().hash(h);
+                g.head_dim().get().hash(h);
+                a.scale().get().to_bits().hash(h);
             }
         }
     }
@@ -1154,14 +1234,18 @@ impl<F: RopeForm> SubOp<F, Arch> {
     }
 
     /// `RopeAppend` for `layer`: the cache tensors it writes are bound by [`lower_region`].
+    /// `attention` is the model's attention facts, minted at the bridge — the op carries them,
+    /// and the rope's head dim is `rope`'s class off those facts.
     pub const fn rope_append(
-        head_dim: HeadDim,
+        attention: Attention,
+        rope: RopeClass,
         layer: u32,
         attn: AttnMask,
         pairing: RopeFormTag,
     ) -> Self {
         SubOp::RopeAppend {
-            head_dim,
+            attention,
+            rope,
             layer,
             attn,
             pairing,
@@ -1171,8 +1255,15 @@ impl<F: RopeForm> SubOp<F, Arch> {
     }
 
     /// `KvAppend` for `layer`: the cache tensors it writes are bound by [`lower_region`].
-    pub const fn kv_append(head_dim: HeadDim, layer: u32, attn: AttnMask) -> Self {
+    /// `attention` is the model's attention facts, minted at the bridge — the op carries them.
+    pub const fn kv_append(
+        attention: Attention,
+        head_dim: HeadDim,
+        layer: u32,
+        attn: AttnMask,
+    ) -> Self {
         SubOp::KvAppend {
+            attention,
             head_dim,
             layer,
             attn,
@@ -1181,21 +1272,17 @@ impl<F: RopeForm> SubOp<F, Arch> {
     }
 
     /// `AttnDecode`: its cache, that cache's producer and its softmax accumulator are bound by
-    /// [`lower_region`].
-    pub const fn attn_decode(
-        geom: ModelAttnGeometry,
-        scale: f32,
-        valid_len: u32,
-        mask: AttnMask,
-    ) -> Self {
+    /// [`lower_region`]. The op carries its CLASS (`mask`) and the model's attention facts
+    /// (`attention`), minted at the bridge — every consumer reads
+    /// `attention.class(mask.class())` off the op itself.
+    pub const fn attn_decode(attention: Attention, valid_len: u32, mask: AttnMask) -> Self {
         SubOp::AttnDecode {
-            geom,
-            scale,
             valid_len,
             layout: Unbound,
             producer: Unbound,
             softmax_state: Unbound,
             mask,
+            attention,
         }
     }
 }
@@ -1325,7 +1412,12 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// **rotation only** (identical to [`SubOp::RopeRotate`]); V and the
     /// cache write are GPU-only. `inputs` = `[K, cos, sin, V, K_cache, V_cache]`.
     RopeAppend {
-        head_dim: HeadDim,
+        attention: Attention,
+        /// The rotary class this layer's rope binds — the extern the graph names for it
+        /// (`rotary_local` = [`RopeClass::Base`], plain `rotary` = [`RopeClass::Global`]).
+        /// The head dim it runs at is this class's own, read off `attention` — never a
+        /// second bare dim on the op.
+        rope: RopeClass,
         layer: u32,
         /// The class of the layer whose K/V this appends — the value its attention's `mask`
         /// carries. On a hybrid sliding/global arch it selects the rotary table and head
@@ -1345,6 +1437,7 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// identity on K; the cache write is GPU-only.
     /// `inputs` = `[K, V, K_cache, V_cache]`.
     KvAppend {
+        attention: Attention,
         head_dim: HeadDim,
         layer: u32,
         /// The class of the layer whose K/V this appends — the value its
@@ -1352,19 +1445,15 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
         attn: AttnMask,
         layout: S::KvLayout,
     },
-    /// Decode attention. `inputs[0]` = Q `[Mq, geom.q_width()]`;
+    /// Decode attention. `inputs[0]` = Q `[Mq, class(mask).q_width()]`;
     /// the remaining inputs are alternating `(K_seg, V_seg)` pairs.
     /// `layout` names the K-cache (single source of truth shared with
     /// the producing `RopeAppend`); `producer` names how that cache got
     /// populated; `softmax_state` is the per-AttnDecode online-softmax
-    /// accumulator id.
+    /// accumulator id. The op carries its class (`mask`) and the model's
+    /// attention facts (`attention`), minted once at the bridge: every
+    /// consumer reads `attention.class(mask.class())` off the op itself.
     AttnDecode {
-        /// The model's head geometry, minted once from its `config.json` and carried whole. Three
-        /// `u32` fields here is how a query-head count and a kv-head count came to be swappable at
-        /// a struct literal, and how the GQA group size came to be re-divided (with a `max(1)`) by
-        /// every consumer that wanted it.
-        geom: ModelAttnGeometry,
-        scale: f32,
         /// Logical valid sequence length = `decode_position + 1`. The
         /// number of cache positions that hold real (prefix ++ new) K/V;
         /// the cache TENSOR may be larger (capacity > valid_len). For a
@@ -1378,6 +1467,9 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
         producer: S::KvProducer,
         softmax_state: S::SoftmaxState,
         mask: AttnMask,
+        /// The model's attention facts, minted once at the bridge — the class's
+        /// geometry and the softmax scale read off `attention.class(mask.class())`.
+        attention: Attention,
     },
 
     // ── The rest of the arch vocabulary ────────────────────────────
@@ -1425,12 +1517,16 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// `_bf16_reduce`, `_reorder`): each block row's query, normed and roped, over the layer's
     /// ring and the block's own rows, every one of which it sees. `inputs` =
     /// `[qkv, q_norm, k_norm, cos, sin]`; output `width` columns.
-    DraftAttention { layer: u32, width: u32 },
+    DraftAttention {
+        attention: Attention,
+        layer: u32,
+        width: u32,
+    },
     /// A DFlash2 drafter's context commit at `layer` (Splash `draft_context_kv_commit`,
     /// `prefill_draft_context_kv`): each row's keys, normed and roped, and its values, written into
     /// the layer's ring at the row's position. `inputs` = `[kv, k_norm, cos, sin]`; the output is
     /// `kv`.
-    DraftContextKv { layer: u32 },
+    DraftContextKv { attention: Attention, layer: u32 },
     /// A DFlash2 drafter's commit of its context rows into the lane's context window at their
     /// positions, 4-bit (Splash `DFlashContextWindow`, `addWindowStore`). `inputs` = `[context]`;
     /// the output is `context`.
@@ -1460,8 +1556,13 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// cu_seqlens/max_seqlen extern set (0 default / 1 full / 2 window).
     VarlenAttention { cu_kind: u8 },
     /// Bidirectional encoder attention, no KV cache: contiguous Q/K/V from upstream slots,
-    /// non-causal. `inputs` = `[q, k, v]`.
-    EncoderAttn { geom: ModelAttnGeometry, scale: f32 },
+    /// non-causal. `inputs` = `[q, k, v]`. Carries NO class field: an encoder is bidirectional
+    /// over the model's BASE class, so its consumers read the model's attention facts off the
+    /// op itself (`attention.base()`), minted once at the bridge.
+    EncoderAttn {
+        /// The model's attention facts, minted once at the bridge.
+        attention: Attention,
+    },
     /// Gated-DeltaNet linear attention (Qwen3.5 / Qwen3-Next).
     /// `inputs` = `[qkv, z, a, b, weight_bundle]`; the conv/ssm state is runtime-ambient per
     /// layer, which is why there is no host reference.
@@ -2996,7 +3097,9 @@ pub fn scatter(
 
 /// Evaluate the SubtileIR on the host. `sources[s]` is the row-major
 /// buffer for source tensor `s` (`s < num_sources`), matching
-/// `graph.tensors[s]`. Returns the backing buffer of every tensor
+/// `graph.tensors[s]`. `attention` is the model's attention facts — the
+/// head geometry and softmax scale of every attention op on the graph.
+/// Returns the backing buffer of every tensor
 /// (indexed by [`TensorId`]); the logits are `bufs[graph.result]`.
 pub fn eval_dag<F: RopeForm>(graph: &SubtileIR<F>, sources: &[&[f32]]) -> Vec<Vec<f32>> {
     // Host-evaluator source-count check; debug-only since the
@@ -3016,7 +3119,10 @@ pub fn eval_dag<F: RopeForm>(graph: &SubtileIR<F>, sources: &[&[f32]]) -> Vec<Ve
         bufs[s].copy_from_slice(src);
     }
     for node in &graph.nodes {
-        let out = eval_node(node, graph, &bufs);
+        // The op's own stated semantics: the scale is the op's, in-kernel.
+        // The lowering's weight fold is a lowering fact — `eval_golden_buffers`
+        // states the site per node where it tracks the lowered program.
+        let out = eval_node(node, graph, AttnScaleSite::InKernel, &bufs);
         let shape = graph.shape(node.output.tensor);
         scatter(
             &mut bufs,
@@ -3030,10 +3136,91 @@ pub fn eval_dag<F: RopeForm>(graph: &SubtileIR<F>, sources: &[&[f32]]) -> Vec<Ve
 }
 
 /// Compute one node's dense `[out_rows, out_cols]` output. Per-op
-/// arithmetic mirrors `cpu_golden`.
+/// arithmetic mirrors `cpu_golden`. `attention` is the model's attention
+/// facts — the head geometry of the attention ops — and `scale_site` is
+/// WHERE this node's softmax scale lives (the same typed site the splice's
+/// SCALE constexpr and the scalar registry read): a weight-folded
+/// `AttnDecode` evaluates at `FoldedIntoWeights`, whose √scale rides the
+/// staged W_q/W_k, everything else at `InKernel`.
+/// The shared host eval of a rotation — `RopeRotate` and `RopeAppend`'s rotation-only
+/// golden (the append's V input + paged-cache write are GPU-only). `hd` is the op's head
+/// dim: the rotate's own field, the append's rope class off its attention facts.
+fn rope_eval<F: RopeForm>(
+    node: &SubtileNode<F>,
+    graph: &SubtileIR<F>,
+    bufs: &[Vec<f32>],
+    head_dim: u32,
+) -> Vec<f32> {
+    let out_rows = node.output.region.rows.len;
+    let out_cols = node.output.region.cols.len;
+    let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
+    let (cos, cr, cc) = gather(&node.inputs[1], graph, bufs);
+    let (sin, sr, sc) = gather(&node.inputs[2], graph, bufs);
+    debug_assert_eq!((xr, xc), (out_rows, out_cols), "rope shape");
+    let hd = head_dim as usize;
+    let half = hd / 2;
+    let (rows, cols) = (xr as usize, xc as usize);
+    debug_assert_eq!(cols % hd, 0, "rope cols not a multiple of head_dim");
+    debug_assert!(cc as usize >= hd && sc as usize >= hd, "rope cos/sin width");
+    let heads = cols / hd;
+    // ⭐ ROW- AND HEAD-ALIGNED TABLE READS, BY THE SOURCE'S OWN SHAPE. A real
+    // tape's cos/sin source is `[m, cols]` — one row per query row, each the
+    // row's own position's table tiled across heads to the rope's full width
+    // (`to_wavefront`'s `cos_sin` pushes exactly that shape, and both runtimes
+    // stage it: `rope_cos_sin_kind(position[row])` then `tile_rotary_row`) — so
+    // row `r`'s rotation reads row `r`'s table at the head's own slice. The old
+    // `cos[d]`-for-every-row form is right only at m == 1 (one row, and the
+    // period-half probe synth makes even a wrong read agree); at m > 1 it
+    // rotates every row by ROW 0's angles. A `[1, hd]` source (the fixtures'
+    // single head table) stays broadcast across rows and heads. Any other
+    // width has no staging law — panic rather than silently misread.
+    let table_row = |tr: usize, r: usize| if tr == 1 { 0 } else { r };
+    let table_base = |tc: usize, h: usize| {
+        if tc == cols {
+            h * hd
+        } else if tc == hd {
+            0
+        } else {
+            panic!(
+                "rope cos/sin source width {tc} is neither the rope's own width \
+                 ({cols}) nor one head_dim ({hd}) — no staging law to read it by"
+            )
+        }
+    };
+    let mut out = x.clone();
+    for r in 0..rows {
+        let (crow, srow) = (table_row(cr as usize, r), table_row(sr as usize, r));
+        for h in 0..heads {
+            let base = r * cols + h * hd;
+            let (coff, soff) = (
+                crow * cc as usize + table_base(cc as usize, h),
+                srow * sc as usize + table_base(sc as usize, h),
+            );
+            for d in 0..half {
+                let x0 = x[base + d];
+                let x1 = x[base + half + d];
+                // Apply the cos/sin table ELEMENT-WISE (cos[base + d] for the first
+                // half, cos[base + half + d] for the second), matching the SuperDSC
+                // on-card RoPE (`out = x*cos + rotate_half(x)*sin`, where the pointwise
+                // mul reads the full [hd] table per element). For REAL rope_cos_sin
+                // tables the two halves are duplicated (cos[d+half]==cos[d]), so this
+                // is a NO-OP for every real run; it only matters when cos/sin are NOT
+                // duplicated (the selftest's synthetic sources), where the old
+                // `cos[d]`-for-both form made the eval_dag golden diverge from the
+                // faithful on-card lowering (the spurious t341 RopeRotate cos≈0.45
+                // selftest artifact).
+                out[base + d] = x0 * cos[coff + d] - x1 * sin[soff + d];
+                out[base + half + d] = x0 * sin[soff + half + d] + x1 * cos[coff + half + d];
+            }
+        }
+    }
+    out
+}
+
 pub fn eval_node<F: RopeForm>(
     node: &SubtileNode<F>,
     graph: &SubtileIR<F>,
+    scale_site: AttnScaleSite,
     bufs: &[Vec<f32>],
 ) -> Vec<f32> {
     let out_rows = node.output.region.rows.len;
@@ -3462,71 +3649,10 @@ pub fn eval_node<F: RopeForm>(
         SubOp::KvAppend { .. } => gather(&node.inputs[0], graph, bufs).0,
         // RopeAppend's host eval is rotation only (identical to RopeRotate);
         // its V input + the paged-cache write are GPU-only.
-        SubOp::RopeRotate { head_dim, _form: _ } | SubOp::RopeAppend { head_dim, .. } => {
-            let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
-            let (cos, cr, cc) = gather(&node.inputs[1], graph, bufs);
-            let (sin, sr, sc) = gather(&node.inputs[2], graph, bufs);
-            debug_assert_eq!((xr, xc), (out_rows, out_cols), "rope shape");
-            let hd = head_dim.get() as usize;
-            let half = hd / 2;
-            let (rows, cols) = (xr as usize, xc as usize);
-            debug_assert_eq!(cols % hd, 0, "rope cols not a multiple of head_dim");
-            debug_assert!(cc as usize >= hd && sc as usize >= hd, "rope cos/sin width");
-            let heads = cols / hd;
-            // ⭐ ROW- AND HEAD-ALIGNED TABLE READS, BY THE SOURCE'S OWN SHAPE. A real
-            // tape's cos/sin source is `[m, cols]` — one row per query row, each the
-            // row's own position's table tiled across heads to the rope's full width
-            // (`to_wavefront`'s `cos_sin` pushes exactly that shape, and both runtimes
-            // stage it: `rope_cos_sin_kind(position[row])` then `tile_rotary_row`) — so
-            // row `r`'s rotation reads row `r`'s table at the head's own slice. The old
-            // `cos[d]`-for-every-row form is right only at m == 1 (one row, and the
-            // period-half probe synth makes even a wrong read agree); at m > 1 it
-            // rotates every row by ROW 0's angles. A `[1, hd]` source (the fixtures'
-            // single head table) stays broadcast across rows and heads. Any other
-            // width has no staging law — panic rather than silently misread.
-            let table_row = |tr: usize, r: usize| if tr == 1 { 0 } else { r };
-            let table_base = |tc: usize, h: usize| {
-                if tc == cols {
-                    h * hd
-                } else if tc == hd {
-                    0
-                } else {
-                    panic!(
-                        "rope cos/sin source width {tc} is neither the rope's own width \
-                         ({cols}) nor one head_dim ({hd}) — no staging law to read it by"
-                    )
-                }
-            };
-            let mut out = x.clone();
-            for r in 0..rows {
-                let (crow, srow) = (table_row(cr as usize, r), table_row(sr as usize, r));
-                for h in 0..heads {
-                    let base = r * cols + h * hd;
-                    let (coff, soff) = (
-                        crow * cc as usize + table_base(cc as usize, h),
-                        srow * sc as usize + table_base(sc as usize, h),
-                    );
-                    for d in 0..half {
-                        let x0 = x[base + d];
-                        let x1 = x[base + half + d];
-                        // Apply the cos/sin table ELEMENT-WISE (cos[base + d] for the first
-                        // half, cos[base + half + d] for the second), matching the SuperDSC
-                        // on-card RoPE (`out = x*cos + rotate_half(x)*sin`, where the pointwise
-                        // mul reads the full [hd] table per element). For REAL rope_cos_sin
-                        // tables the two halves are duplicated (cos[d+half]==cos[d]), so this
-                        // is a NO-OP for every real run; it only matters when cos/sin are NOT
-                        // duplicated (the selftest's synthetic sources), where the old
-                        // `cos[d]`-for-both form made the eval_dag golden diverge from the
-                        // faithful on-card lowering (the spurious t341 RopeRotate cos≈0.45
-                        // selftest artifact).
-                        out[base + d] = x0 * cos[coff + d] - x1 * sin[soff + d];
-                        out[base + half + d] =
-                            x0 * sin[soff + half + d] + x1 * cos[coff + half + d];
-                    }
-                }
-            }
-            out
-        }
+        SubOp::RopeRotate { head_dim, .. } => rope_eval(node, graph, bufs, head_dim.get()),
+        SubOp::RopeAppend {
+            attention, rope, ..
+        } => rope_eval(node, graph, bufs, rope.head_dim(attention).get()),
         SubOp::Mean => {
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
             debug_assert_eq!(out_cols, 1, "mean output must be [m, 1]");
@@ -3598,11 +3724,13 @@ pub fn eval_node<F: RopeForm>(
                 })
                 .collect()
         }
-        SubOp::EncoderAttn { geom, scale } => {
+        SubOp::EncoderAttn { attention } => {
             // Bidirectional: no causal bound and no cache. Q/K/V are whole
             // contiguous slots from upstream, so this is AttnDecode's inner loop
-            // with the mask removed.
-            let hd = geom.hd().get() as usize;
+            // with the mask removed. An encoder reads the model's BASE class.
+            let geom = attention.base();
+            let scale = attention.scale().get();
+            let hd = geom.head_dim().get() as usize;
             let gqa = geom.gqa().get() as usize;
             let (q, qr, qc) = gather(&node.inputs[0], graph, bufs);
             let (k, kr, kc) = gather(&node.inputs[1], graph, bufs);
@@ -3723,7 +3851,7 @@ pub fn eval_node<F: RopeForm>(
         ),
 
         SubOp::AttnDecode {
-            geom, scale, mask, ..
+            mask, attention, ..
         } => {
             // ⭐ THE WINDOW IS ON THE TAPE, so a sliding-window layer HAS a host
             // reference: the window bound is `window` positions back from the
@@ -3735,10 +3863,16 @@ pub fn eval_node<F: RopeForm>(
             // Head-block aware: this node computes a contiguous q-head range,
             // derived from the OUTPUT region (its column slice), and reads the
             // matching kv-head range — derived from the K input region. The
-            // SubOp keeps the GLOBAL head geometry so the GQA ratio is exact; the
-            // block's own counts come from the slice widths. Each q-head's
-            // attention is independent ⇒ bit-exact vs the whole op.
-            let hd = geom.hd().get() as usize;
+            // class's own geometry (off the attention facts, by the node's mask)
+            // keeps the GQA ratio exact; the block's own counts come from the
+            // slice widths. Each q-head's attention is independent ⇒ bit-exact vs
+            // the whole op.
+            let geom = attention.class(mask.class());
+            // ⭐ THE SCALE AT ITS STATED SITE — the one function (`AttnScaleSite::scale`)
+            // the splice's SCALE constexpr and the scalar registry also read, so a
+            // weight-folded node evaluates at 1.0 exactly where the lowered program does.
+            let scale = scale_site.scale(attention);
+            let hd = geom.head_dim().get() as usize;
             let gqa = geom.gqa().get() as usize;
             let (q, qr, qc) = gather(&node.inputs[0], graph, bufs);
             let mq = qr as usize;
@@ -4222,7 +4356,8 @@ pub fn lower_region(
             SubOp::RmsNorm { eps, gain } => SubOp::RmsNorm { eps, gain },
             SubOp::RopeRotate { head_dim, _form } => SubOp::RopeRotate { head_dim, _form },
             SubOp::RopeAppend {
-                head_dim,
+                attention,
+                rope,
                 layer,
                 attn,
                 pairing,
@@ -4260,7 +4395,8 @@ pub fn lower_region(
                 let layout = KvCacheLayout::for_cache_tensors(k_cache_t, v_cache_t);
                 k_cache_producer_node.insert(k_cache_t, nodes.len() as u32);
                 SubOp::RopeAppend {
-                    head_dim,
+                    attention,
+                    rope,
                     layer,
                     attn,
                     pairing,
@@ -4269,6 +4405,7 @@ pub fn lower_region(
                 }
             }
             SubOp::KvAppend {
+                attention,
                 head_dim,
                 layer,
                 attn,
@@ -4280,6 +4417,7 @@ pub fn lower_region(
                 let layout = KvCacheLayout::for_cache_tensors(k_cache_t, v_cache_t);
                 k_cache_producer_node.insert(k_cache_t, nodes.len() as u32);
                 SubOp::KvAppend {
+                    attention,
                     head_dim,
                     layer,
                     attn,
@@ -4287,10 +4425,9 @@ pub fn lower_region(
                 }
             }
             SubOp::AttnDecode {
-                geom,
-                scale,
                 valid_len,
                 mask,
+                attention,
                 ..
             } => {
                 let (prefix_k_t, _, _) = resolve(desc.inputs[1], &op_tensor, &op_cols, &tensors);
@@ -4301,8 +4438,8 @@ pub fn lower_region(
                 // full-tape interp diff). Inputs = [q, prefix_k,
                 // prefix_v, new_k, new_v].
                 let (prefix_v_t, _, _) = resolve(desc.inputs[2], &op_tensor, &op_cols, &tensors);
-                // The head geometry rides on the AttnDecode op (minted from `model.bounds`);
-                // the layout witness is just the cache-tensor identity pair.
+                // The layout witness is the cache-tensor identity pair; the head
+                // geometry is the op's own attention (minted at the bridge).
                 let layout = KvCacheLayout::for_cache_tensors(prefix_k_t, prefix_v_t);
                 let producer = match k_cache_producer_node.get(&prefix_k_t) {
                     Some(&node_idx) => KvCacheProducer::from_rope_append(node_idx),
@@ -4311,13 +4448,12 @@ pub fn lower_region(
                 let softmax_state = SoftmaxStateId::new(next_softmax_state);
                 next_softmax_state += 1;
                 SubOp::AttnDecode {
-                    geom,
-                    scale,
                     valid_len,
                     layout,
                     producer,
                     softmax_state,
                     mask,
+                    attention,
                 }
             }
             SubOp::TanhSoftCap { cap } => SubOp::TanhSoftCap { cap },
@@ -4329,8 +4465,18 @@ pub fn lower_region(
             SubOp::GateScale => SubOp::GateScale,
             SubOp::CaptureHidden { slot, slots } => SubOp::CaptureHidden { slot, slots },
             SubOp::DraftConv { stage } => SubOp::DraftConv { stage },
-            SubOp::DraftAttention { layer, width } => SubOp::DraftAttention { layer, width },
-            SubOp::DraftContextKv { layer } => SubOp::DraftContextKv { layer },
+            SubOp::DraftAttention {
+                attention,
+                layer,
+                width,
+            } => SubOp::DraftAttention {
+                attention,
+                layer,
+                width,
+            },
+            SubOp::DraftContextKv { attention, layer } => {
+                SubOp::DraftContextKv { attention, layer }
+            }
             SubOp::DraftWindowStore => SubOp::DraftWindowStore,
             SubOp::DraftWindowLoad => SubOp::DraftWindowLoad,
             SubOp::DraftSelect => SubOp::DraftSelect,
@@ -4338,7 +4484,7 @@ pub fn lower_region(
             SubOp::EmbeddingGather { indices_kind } => SubOp::EmbeddingGather { indices_kind },
             SubOp::VisionRope => SubOp::VisionRope,
             SubOp::VarlenAttention { cu_kind } => SubOp::VarlenAttention { cu_kind },
-            SubOp::EncoderAttn { geom, scale } => SubOp::EncoderAttn { geom, scale },
+            SubOp::EncoderAttn { attention } => SubOp::EncoderAttn { attention },
             SubOp::GatedDeltaNet => SubOp::GatedDeltaNet,
             SubOp::Mamba2 { inner } => SubOp::Mamba2 { inner },
             SubOp::Mean => SubOp::Mean,
@@ -4679,13 +4825,12 @@ pub fn decompose_rmsnorm<F: RopeForm>(
                 }
             }
             SubOp::AttnDecode {
-                geom,
-                scale,
                 valid_len,
                 layout,
                 producer,
                 softmax_state,
                 mask,
+                attention,
             } => {
                 // Remap the KvCacheProducer's stored producer node id
                 // so an upstream RopeAppend's new SubtileId stays
@@ -4701,13 +4846,12 @@ pub fn decompose_rmsnorm<F: RopeForm>(
                 nodes.push(SubtileNode {
                     id: SubtileId(nodes.len() as u32),
                     op: SubOp::AttnDecode {
-                        geom,
-                        scale,
                         valid_len,
                         layout,
                         mask,
                         producer: new_producer,
                         softmax_state,
+                        attention,
                     },
                     inputs: node.inputs.clone(),
                     output: node.output,
@@ -4766,11 +4910,16 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
     for node in &graph.nodes {
         new_id_for_old.push(next_new_id);
         match node.op {
-            SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
+            SubOp::RopeRotate { head_dim, .. } => {
                 let total_cols = node.output.region.cols.len;
-                let head_dim_nz = std::num::NonZeroU32::new(head_dim.get())
-                    .expect("head_tile_rope: head_dim must be non-zero");
-                next_new_id += head_blocks(total_cols, nb, head_dim_nz).len() as u32;
+                next_new_id += head_blocks(total_cols, nb, head_dim.nonzero()).len() as u32;
+            }
+            SubOp::RopeAppend {
+                attention, rope, ..
+            } => {
+                let total_cols = node.output.region.cols.len;
+                next_new_id +=
+                    head_blocks(total_cols, nb, rope.head_dim(attention).nonzero()).len() as u32;
             }
             _ => next_new_id += 1,
         }
@@ -4786,8 +4935,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 let cos_in = node.inputs[1];
                 let sin_in = node.inputs[2];
                 let total_cols = node.output.region.cols.len;
-                let head_dim_nz = std::num::NonZeroU32::new(head_dim.get())
-                    .expect("head_tile_rope: head_dim must be non-zero");
+                let head_dim_nz = head_dim.nonzero();
                 let q_col_start = q_in.region.cols.start;
                 let out_col_start = node.output.region.cols.start;
                 for blk in head_blocks(total_cols, nb, head_dim_nz) {
@@ -4819,7 +4967,8 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 }
             }
             SubOp::RopeAppend {
-                head_dim,
+                attention,
+                rope,
                 layer,
                 attn,
                 pairing,
@@ -4836,8 +4985,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 let kcache_in = node.inputs[4];
                 let vcache_in = node.inputs[5];
                 let total_cols = node.output.region.cols.len;
-                let head_dim_nz = std::num::NonZeroU32::new(head_dim.get())
-                    .expect("head_tile_rope: head_dim must be non-zero");
+                let head_dim_nz = rope.head_dim(attention).nonzero();
                 let k_col_start = k_in.region.cols.start;
                 let v_col_start = v_in.region.cols.start;
                 let out_col_start = node.output.region.cols.start;
@@ -4845,7 +4993,8 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                     nodes.push(SubtileNode {
                         id: SubtileId(nodes.len() as u32),
                         op: SubOp::RopeAppend {
-                            head_dim,
+                            attention,
+                            rope,
                             layer,
                             attn,
                             pairing,
@@ -4883,13 +5032,12 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 }
             }
             SubOp::AttnDecode {
-                geom,
-                scale,
                 valid_len,
                 layout,
                 producer,
                 softmax_state,
                 mask,
+                attention,
             } => {
                 // AttnDecode stays whole — head tiling for it rides on
                 // a KvCachePageShape redesign that has not landed.
@@ -4907,13 +5055,12 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 nodes.push(SubtileNode {
                     id: SubtileId(nodes.len() as u32),
                     op: SubOp::AttnDecode {
-                        geom,
-                        scale,
                         valid_len,
                         layout,
                         mask,
                         producer: new_producer,
                         softmax_state,
+                        attention,
                     },
                     inputs: node.inputs.clone(),
                     output: node.output,
@@ -4945,6 +5092,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::attention_at;
 
     /// The LOGICAL half of Reshape's contract: it preserves the element
     /// sequence and changes only the extents. `eval_dag` is the oracle the
@@ -5123,7 +5271,6 @@ mod tests {
         );
     }
     use crate::lower::{InputRef, OpDesc};
-    use crate::model_geometry::{KvHeads, QueryHeads};
 
     /// Patch 1 producer-side milestone + fixture-orientation guard.
     ///
@@ -5429,8 +5576,8 @@ mod tests {
         // Smallest fixture that exercises a RopeAppend → AttnDecode
         // chain. Uses 1 KV head, head_dim 4.
         let (m, hq, hkv, hd, l) = (1u32, 1u32, 1u32, 4u32, 3u32);
+        let attention = attention_at(hq, hkv, hd, 0.125);
         let kvdim = hkv * hd; // = qdim (hq * hd) = 4
-        let scale = 0.5f32;
         let input = crate::lower::LoweringInput {
             exported: None,
             sources: vec![
@@ -5457,7 +5604,9 @@ mod tests {
             ops: vec![
                 OpDesc {
                     op: SubOp::rope_append(
-                        HeadDim::new(hd),
+                        attention,
+                        // A uniform fixture: the base class states the same head dim.
+                        RopeClass::Base,
                         0,
                         AttnMask::Causal,
                         RopeFormTag::NeoX,
@@ -5474,17 +5623,7 @@ mod tests {
                 },
                 OpDesc {
                     // l prefix rows (fully valid) ++ 1 new = l+1 valid positions.
-                    op: SubOp::attn_decode(
-                        ModelAttnGeometry::mint(
-                            QueryHeads::new(hq),
-                            KvHeads::new(hkv),
-                            HeadDim::new(hd),
-                        )
-                        .expect("the fixture's kv heads divide its query heads"),
-                        scale,
-                        l + 1,
-                        AttnMask::Causal,
-                    ),
+                    op: SubOp::attn_decode(attention, l + 1, AttnMask::Causal),
                     m,
                     inputs: vec![
                         InputRef::Ext(0),
@@ -5533,6 +5672,7 @@ mod tests {
     #[test]
     fn kv_append_is_the_producer_of_the_cache_its_attention_reads() {
         let (m, hq, hkv, hd, l, layer) = (1u32, 2u32, 1u32, 4u32, 3u32, 5u32);
+        let attention = attention_at(hq, hkv, hd, 0.5);
         let (qdim, kvdim) = (hq * hd, hkv * hd);
         let source = |rows, cols| SourceShape { rows, cols };
         let input = crate::lower::LoweringInput {
@@ -5546,7 +5686,7 @@ mod tests {
             ],
             ops: vec![
                 OpDesc {
-                    op: SubOp::kv_append(HeadDim::new(hd), layer, AttnMask::Causal),
+                    op: SubOp::kv_append(attention, HeadDim::new(hd), layer, AttnMask::Causal),
                     m,
                     inputs: vec![
                         InputRef::Ext(1),
@@ -5556,17 +5696,7 @@ mod tests {
                     ],
                 },
                 OpDesc {
-                    op: SubOp::attn_decode(
-                        ModelAttnGeometry::mint(
-                            QueryHeads::new(hq),
-                            KvHeads::new(hkv),
-                            HeadDim::new(hd),
-                        )
-                        .expect("the fixture's kv heads divide its query heads"),
-                        0.5,
-                        l + 1,
-                        AttnMask::Causal,
-                    ),
+                    op: SubOp::attn_decode(attention, l + 1, AttnMask::Causal),
                     m,
                     inputs: vec![
                         InputRef::Ext(0),
@@ -6184,5 +6314,125 @@ mod tests {
         // entry and a valid lane).
         assert!(std::panic::catch_unwind(|| chain_s_seed(k, &[], 1)).is_err());
         assert!(std::panic::catch_unwind(|| chain_l_seed(&[], hidden, 1)).is_err());
+    }
+
+    // ── S1: the attention facts as the one value the ops' consumers read ──────────
+
+    /// A hybrid model's two attention classes hash APART (the re-roll must not weld a
+    /// sliding layer's body onto a global layer's), and two layers of ONE class hash
+    /// EQUAL (the re-roll must still weld them) — the class key read off the facts.
+    #[test]
+    fn hybrid_classes_hash_apart_and_one_class_hashes_equal() {
+        let hybrid = || {
+            Attention::new(
+                crate::fixtures::fixture_head_geometry(512, 128, 128),
+                crate::fixtures::fixture_head_geometry(256, 64, 64),
+                scratchy_ir::model_facts::AttnScale::new(0.125),
+                None,
+                None,
+                scratchy_ir::model_facts::Rope::new(
+                    scratchy_ir::model_facts::RopePairing::Standard,
+                    scratchy_ir::model_facts::KvRope::AtWrite,
+                    None,
+                ),
+            )
+        };
+        let window = || AttnMask::SlidingWindow {
+            window: std::num::NonZeroU32::new(1024).expect("1024 is nonzero"),
+        };
+        let key = |op: &SubOp<NeoX, Arch>| -> u64 {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            op.reroll_class_key(&mut h);
+            std::hash::Hasher::finish(&h)
+        };
+        let a = hybrid();
+        let sliding = SubOp::attn_decode(a, 33, window());
+        let global = SubOp::attn_decode(a, 33, AttnMask::Causal);
+        // The two classes of one hybrid model hash apart...
+        assert_ne!(
+            key(&sliding),
+            key(&global),
+            "a sliding layer and a global layer are different programs"
+        );
+        // ...and two layers of one class hash equal (`valid_len` is the model's one
+        // prefix capacity, shared by every layer — not per-layer identity).
+        let sliding_b = SubOp::attn_decode(a, 33, window());
+        assert_eq!(
+            key(&sliding),
+            key(&sliding_b),
+            "two sliding layers of one hybrid model are one program"
+        );
+        // The same ops over a UNIFORM model (both classes the global geometry) also hash
+        // apart by mask — the window is class, not per-layer identity.
+        let uniform = attention_at(4, 1, 64, 0.125);
+        let sliding_u = SubOp::attn_decode(uniform, 33, window());
+        let global_u = SubOp::attn_decode(uniform, 33, AttnMask::Causal);
+        assert_ne!(key(&sliding_u), key(&global_u));
+    }
+
+    /// An encoder over HYBRID facts reads the BASE pair: its output is bit-identical to
+    /// the same encoder over a uniform model whose classes both state the base geometry —
+    /// the global class (a different head dim here) never leaks into a mask-less encoder.
+    #[test]
+    fn an_encoder_over_hybrid_facts_reads_the_base_pair() {
+        let hybrid = || {
+            Attention::new(
+                crate::fixtures::fixture_head_geometry(512, 128, 128),
+                crate::fixtures::fixture_head_geometry(256, 64, 64),
+                scratchy_ir::model_facts::AttnScale::new(0.125),
+                None,
+                None,
+                scratchy_ir::model_facts::Rope::new(
+                    scratchy_ir::model_facts::RopePairing::Standard,
+                    scratchy_ir::model_facts::KvRope::AtWrite,
+                    None,
+                ),
+            )
+        };
+        // base: 4 q-heads / 1 kv-head / hd 128 ⇒ q width 512, kv width 128.
+        let (t, s) = (2u32, 5u32);
+        let graph = |attention: Attention| {
+            let shape = |rows: u32, cols: u32| TensorShape { rows, cols };
+            let tensors = vec![
+                shape(t, 512), // 0: q
+                shape(s, 128), // 1: k
+                shape(s, 128), // 2: v
+                shape(t, 512), // 3: out
+            ];
+            let whole = |i: u32, ts: &[TensorShape]| TensorRegion {
+                tensor: TensorId(i),
+                region: ts[i as usize].whole(),
+            };
+            let regions = vec![whole(0, &tensors), whole(1, &tensors), whole(2, &tensors)];
+            let out = whole(3, &tensors);
+            SubtileIR {
+                tensors,
+                num_sources: 3,
+                nodes: vec![SubtileNode::<NeoX> {
+                    id: SubtileId(0),
+                    op: SubOp::EncoderAttn { attention },
+                    inputs: regions,
+                    output: out,
+                }],
+                result: TensorId(3),
+                op_output: Vec::new(),
+            }
+        };
+        let q: Vec<f32> = (0..t * 512).map(|i| (i % 17) as f32 / 17.0 - 0.5).collect();
+        let k: Vec<f32> = (0..s * 128).map(|i| (i % 13) as f32 / 13.0 - 0.5).collect();
+        let v: Vec<f32> = (0..s * 128).map(|i| (i % 11) as f32 / 11.0 - 0.5).collect();
+        let hybrid_out = eval_dag(&graph(hybrid()), &[&q, &k, &v]);
+        // The uniform twin: both classes the BASE geometry, the same scale.
+        let base = attention_at(4, 1, 128, 0.125);
+        let base_out = eval_dag(&graph(base), &[&q, &k, &v]);
+        assert_eq!(
+            hybrid_out[3], base_out[3],
+            "the encoder reads the base pair off hybrid facts, bit for bit"
+        );
+        assert_eq!(
+            hybrid_out[3].len(),
+            (t * 512) as usize,
+            "the output is the BASE class's query width"
+        );
     }
 }

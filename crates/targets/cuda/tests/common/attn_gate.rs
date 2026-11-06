@@ -20,9 +20,9 @@
 
 use std::num::NonZeroU32;
 
+use scratchy_ir::model_facts::HeadDim;
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
-use scratchy_subtile::model_geometry::HeadDim;
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, RowScale, SourceShape, SubOp};
 use scratchy_target_cuda::step::{
     AddBf16, CudaStep, GateApplyBf16, GateSplitBf16, GemmBf16, RmsNormBf16, RopeBf16, RopePairing,

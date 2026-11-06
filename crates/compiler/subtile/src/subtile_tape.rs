@@ -2693,7 +2693,7 @@ pub fn play_skeleton(tape: &SubtileTape) -> Vec<PlayStep> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
+    use crate::fixtures::fixture_attention;
     use crate::subtile_ir::{
         EwKind, KvCacheLayout, KvCacheProducer, NeoX, Range, Region, SoftmaxStateId, SubOp,
         SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape,
@@ -3088,14 +3088,12 @@ pub(crate) mod tests {
         let attn: SubtileNode<NeoX> = SubtileNode {
             id: SubtileId(0),
             op: SubOp::AttnDecode {
-                geom: ModelAttnGeometry::mint(QueryHeads::new(1), KvHeads::new(1), HeadDim::new(4))
-                    .expect("1 kv head divides 1 query head"),
-                scale: 0.5,
                 valid_len: 4,
                 layout: KvCacheLayout::for_cache_tensors(TensorId(1), TensorId(1)),
                 producer: KvCacheProducer::pre_populated_ext(),
                 softmax_state: SoftmaxStateId::new(0),
                 mask: crate::subtile_ir::AttnMask::Causal,
+                attention: fixture_attention(),
             },
             inputs: vec![
                 TensorRegion {
@@ -3378,6 +3376,37 @@ pub(crate) mod tests {
         assert_eq!(cell_layer_lengths(&[1, 2, 3, 4]), vec![4]);
     }
 
+    /// ⭐ A TOWER-ONLY GRAPH NEEDS NO ATTENTION FACTS (S1). The vision-tower shape: no op in
+    /// the graph reads attention facts, so no `Attention` value exists anywhere in scope (the
+    /// bridge states `attention: None` for such a canonical and mints nothing). Every shared
+    /// pass — validate → tape → re-roll → host eval — runs over the graph with no attention
+    /// value at all; this is the proof the old `attention().unwrap_or_else(panic)` sites are
+    /// gone: there is nothing left for a tower canonical to be missing.
+    #[test]
+    fn tower_only_graph_lowers_through_every_shared_pass() {
+        let g = per_layer_weight_chain();
+        let valid = crate::subtile_ir::ValidatedGraph::new(&g).expect("tower-only graph validates");
+        let tape = lower_dag_to_tape(&valid);
+        let rerolled = reroll_subtile_tape(&tape, &g);
+        assert!(
+            !rerolled.instrs().is_empty(),
+            "the tower-only tape re-rolls to a non-empty tape"
+        );
+        // Host eval over the same graph: the chain is silu(x)·W_0·W_1·W_2 (the fixture's
+        // leading embed is a silu), from x=1, W=[2,3,4].
+        let src = vec![1.0f32; 4];
+        let w0 = vec![2.0f32; 4];
+        let w1 = vec![3.0f32; 4];
+        let w2 = vec![4.0f32; 4];
+        let bufs = crate::subtile_ir::eval_dag(&g, &[&src, &w0, &w1, &w2]);
+        let out = crate::subtile_ir::result_buffer(&g, &bufs);
+        let expected = 1.0f32 / (1.0 + (-1.0f32).exp()) * 2.0 * 3.0 * 4.0;
+        assert!(
+            out.iter().all(|v| (*v - expected).abs() < 1e-6),
+            "tower-only eval must run with no attention facts in scope: {out:?}"
+        );
+    }
+
     /// THE GATHER PROOF (un-riggable): after re-roll, the single loop
     /// body's External weight read carries the per-iteration table
     /// `[W_0, W_1, W_2] = [2, 3, 4]` — NOT just W_0 baked in. This is the
@@ -3519,14 +3548,24 @@ pub(crate) mod tests {
     // ── Re-roll by class ──────────────────────────────────────────
     //
     // A hybrid-attention-shaped fixture: 2 cells of [S, S, G] (6 layers), each layer
-    // `r_{k+1} = mul(rope_append(r_k, layer=k, hd=class), W_k)` — the RopeAppend names the
-    // layer (its `layer` field is what `layer_slices` reads) and its head dim is the CLASS
-    // (256 for S, 512 for G, exactly gemma-4's two attention geometries). Every layer also
+    // `r_{k+1} = mul(rope_append(r_k, layer=k, class), W_k)` — the RopeAppend names the
+    // layer (its `layer` field is what `layer_slices` reads) and its rope class selects
+    // the CLASS's head dim off the hybrid facts (256 for S, 512 for G, exactly gemma-4's
+    // two attention geometries). Every layer also
     // reads its own external weight W_k, and a trailing suffix consumes r_6.
     fn hybrid_class_chain() -> SubtileIR<NeoX> {
         use crate::subtile_ir::KvCacheLayout;
-        // Pattern S S G | S S G — layer → class head dim.
-        let hd_of = |layer: u32| if layer % 3 == 2 { 512 } else { 256 };
+        // Pattern S S G | S S G — layer → class head dim (256 for S, 512 for G, stated
+        // by the hybrid facts' two classes). The hybrid facts the classes read off,
+        // and the rope class each layer binds:
+        let attention = crate::fixtures::hybrid_attention(256, 512);
+        let rope_of = |layer: u32| {
+            if layer % 3 == 2 {
+                crate::subtile_ir::RopeClass::Global
+            } else {
+                crate::subtile_ir::RopeClass::Base
+            }
+        };
         // sources, contiguous at the front (num_sources covers all of them):
         // 0 = x; 1..7 = W_0..W_5; 7 = cos; 8 = sin; 9..15 = pk_0..pk_5; 15..21 = pv_0..pv_5.
         // (The rope's operand list is [k, cos, sin, v, prefix_k, prefix_v] — the cache
@@ -3562,7 +3601,8 @@ pub(crate) mod tests {
             nodes.push(SubtileNode {
                 id: SubtileId(1 + 2 * layer),
                 op: SubOp::RopeAppend {
-                    head_dim: HeadDim::new(hd_of(layer)),
+                    attention,
+                    rope: rope_of(layer),
                     layer,
                     attn: crate::subtile_ir::AttnMask::Causal,
                     pairing: crate::subtile_ir::RopeFormTag::NeoX,
@@ -3706,9 +3746,12 @@ pub(crate) mod tests {
             "the two tables together cover every layer exactly once"
         );
         // And each table's layers are same-class: their rope head dims agree.
-        let hd = |n: u32| match &g.nodes[n as usize].op {
-            SubOp::RopeAppend { head_dim, .. } => head_dim.get(),
-            _ => panic!("not a rope node"),
+        let hd = |n: u32| {
+            g.nodes[n as usize]
+                .op
+                .rope_head_dim()
+                .expect("not a rope node")
+                .get()
         };
         for t in [&t0, &t1] {
             let hds: Vec<u32> = t.iter().map(|&n| hd(n)).collect();

@@ -11,9 +11,9 @@
 
 use std::num::NonZeroU32;
 
+use scratchy_ir::model_facts::HeadGeometry;
 use scratchy_subtile::handoff::{SourceBinding, UnrollIndex};
 use scratchy_subtile::lower::{ExpertWeight, GemmWeight};
-use scratchy_subtile::model_geometry::ModelAttnGeometry;
 use scratchy_subtile::subtile_ir::{
     AttnMask, EwKind, ExpertBundle, ExpertProj, GainConvention, GatedAct, RopeFormTag,
     RouterBundle, SubOp, SubtileIR, SubtileNode,
@@ -106,15 +106,31 @@ pub fn lower_step(
         L::GateSplit { half_cols } => gate_split(cx, s, *half_cols).map(CudaStep::GateSplit),
         L::GateApply => gate_apply(cx, s, computes).map(CudaStep::GateApply),
         L::RopeAppend {
-            head_dim,
+            attention,
+            rope,
             layer,
             attn,
             pairing,
             ..
-        } => rope_append(cx, s, head_dim.get(), *layer, *attn, *pairing).map(CudaStep::RopeAppend),
+        } => rope_append(
+            cx,
+            s,
+            rope.head_dim(*attention).get(),
+            *layer,
+            *attn,
+            *pairing,
+        )
+        .map(CudaStep::RopeAppend),
         L::AttnDecode {
-            geom, scale, mask, ..
-        } => attention(cx, s, *geom, *scale, *mask, computes),
+            attention, mask, ..
+        } => attention_step(
+            cx,
+            s,
+            attention.class(mask.class()),
+            attention.scale().get(),
+            *mask,
+            computes,
+        ),
         // A one-row bucket's GDN step is one launch (#1049, `kernels/gdn_decode.cu`) when the
         // decode kernel takes its geometry; else, and at every prefill bucket, the four.
         L::GatedDeltaNet => gated_delta_net(cx, s).map(|g| match cx.tokens {
@@ -1046,10 +1062,10 @@ fn window_rule(
 /// `PrefixK` and `PrefixV`; operand 3 that layer's `RopeAppend` and operand 4 the V it read. Both
 /// kernels read K and V from the cache the `RopeAppend` wrote, not from operands 3 and 4, which
 /// stay live up to here because the IR says the attention reads them.
-fn attention(
+fn attention_step(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
-    geom: ModelAttnGeometry,
+    geom: HeadGeometry,
     scale: f32,
     mask: AttnMask,
     computes: &[TapeStep<'_>],
@@ -1057,7 +1073,7 @@ fn attention(
     let (step, node) = (s.step, s.node);
     let op = node.op.name();
     let rows = cx.graph.shape(node.output.tensor).rows;
-    let head_dim = geom.hd().get();
+    let head_dim = geom.head_dim().get();
     let kernel: fn(AttnPrefillBf16) -> CudaStep = match rows {
         1 => CudaStep::AttnDecode,
         _ => CudaStep::AttnPrefill,
@@ -1138,7 +1154,7 @@ fn attention(
     }
     prefix_operands(s, cx, 1, u64::from(layer))?;
     let (pool, regions, index) = kv_pool(cx, layer)?;
-    let (q_heads, kv_heads) = (geom.nqh().get(), geom.nkvh().get());
+    let (q_heads, kv_heads) = (geom.q_heads().get(), geom.kv_heads().get());
     let cache = pool.class_of(index).expect("every pool layer has a class");
     if kv_heads != cache.kv_heads || head_dim != cache.head_dim {
         return Err(CanonicalRefusal::KvGeometry {
