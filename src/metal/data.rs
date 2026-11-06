@@ -350,6 +350,11 @@ pub struct Scaling {
     pub min_rounds_per_cell: Option<u32>,
     #[serde(default)]
     pub task_min_prompts: Option<u32>,
+    /// How its RAG cells drew their tasks: `musique-dev-by-hops`, from all of MuSiQue's dev set in
+    /// its mix of hops. None in runs from before, which drew from its first 200, all 2-hop: other
+    /// questions, easier ones, so neither borrowed from nor joined to a run that samples the whole.
+    #[serde(default)]
+    pub task_sample: Option<String>,
 }
 
 impl Scaling {
