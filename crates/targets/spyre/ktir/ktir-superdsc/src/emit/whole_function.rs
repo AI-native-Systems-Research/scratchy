@@ -4075,7 +4075,9 @@ pub fn staggered_sources(
             Lowering::BatchTranspose { .. } => 1,
             Lowering::Node(_) => op.operands.len(),
         };
-        let raw_in: Vec<Ssa> = match (terminal, scalar, bound_scale) {
+        // The gelu rides the scrutinee so its arm BINDS the chain — a guard plus an `expect`
+        // below would re-state the match's own fact as a runtime check.
+        let raw_in: Vec<Ssa> = match (terminal, scalar, bound_scale, gelu) {
             _ if rms.is_some() => {
                 let c = rms.expect("just matched");
                 match c.gain {
@@ -4092,14 +4094,14 @@ pub fn staggered_sources(
             }
             // The gelu's one input is the chain's own `x` — the value the cubic's base and the
             // divide's numerator both are — never the divide's own operands.
-            _ if gelu.is_some() => vec![gelu.expect("just matched").x],
-            (Some(c), _, _) => match c.up {
+            (_, _, _, Some(g)) => vec![g.x],
+            (Some(c), _, _, _) => match c.up {
                 Some(up) => vec![c.gate, up],
                 None => vec![c.gate],
             },
-            (None, Some((_, tensor)), _) => vec![tensor],
-            (None, None, Some(b)) => vec![b.tensor],
-            (None, None, None) => op.operands.iter().copied().take(n_in).collect(),
+            (None, Some((_, tensor)), _, _) => vec![tensor],
+            (None, None, Some(b), _) => vec![b.tensor],
+            (None, None, None, None) => op.operands.iter().copied().take(n_in).collect(),
         };
         // One input's (SOURCE, ORDER-FREENESS). The ruling's semantics are a SHAPE fact, not a
         // spelling fact: an operand that supplies ONE SCALAR PER OUTPUT ROW is order-free — a
@@ -6383,7 +6385,9 @@ fn lower_function_folded(
         };
 
         // A fused chain's inputs are the ones the RECOGNISER proved, not the terminal op's operands.
-        let in_values: Vec<Ssa> = match (terminal, scalar, bound_scale) {
+        // The gelu rides the scrutinee so its arm BINDS the chain — a guard plus an `expect` below
+        // would re-state the match's own fact as a runtime check.
+        let in_values: Vec<Ssa> = match (terminal, scalar, bound_scale, gelu) {
             // The two tensors the rmsnorm recogniser proved, walked back through the rank plumbing to
             // values a `Region` exists for.
             _ if rms.is_some() => {
@@ -6405,8 +6409,8 @@ fn lower_function_folded(
             }
             // The gelu's one input is the chain's own `x` — the value the cubic's base and the
             // divide's numerator both are — never the divide's own operands.
-            _ if gelu.is_some() => vec![gelu.expect("just matched").x],
-            (Some(c), _, _) => match c.up {
+            (_, _, _, Some(g)) => vec![g.x],
+            (Some(c), _, _, _) => match c.up {
                 Some(up) => vec![c.gate, up],
                 // The bare form's one input is the gate; the divide's other operand is the
                 // chain-interior `1 + e^-x`, which the fused op never materialises.
@@ -6414,15 +6418,15 @@ fn lower_function_folded(
             },
             // The TENSOR operand the recogniser proved, not operand 0 — the splat sits on either side
             // (`ms * INV_D` has it second, and nothing obliges a producer to put it there).
-            (None, Some((_, tensor)), _) => vec![tensor],
+            (None, Some((_, tensor)), _, _) => vec![tensor],
             // RUNG 3: same rule, the splat's other side. The bound scale is a `[1,1]` parameter, not
             // an operand of the descriptor.
-            (None, None, Some(b)) => vec![b.tensor],
+            (None, None, Some(b), _) => vec![b.tensor],
             // A splatted-constant binary's tensor side, wherever the splat sits.
-            (None, None, None) if scalar_binary.is_some() => {
+            (None, None, None, _) if scalar_binary.is_some() => {
                 vec![scalar_binary.expect("just matched").2]
             }
-            (None, None, None) => op.operands.iter().copied().take(n_in).collect(),
+            (None, None, None, None) => op.operands.iter().copied().take(n_in).collect(),
         };
 
         // A BROADCAST OPERAND READS ITS SOURCE. The chain minted no buffer (it emitted no op), so the
