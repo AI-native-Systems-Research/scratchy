@@ -116,10 +116,10 @@ THE DELTA against the HF block, and the justification for each item
    they decide is which of the W REGION's two extents is K. The DEVICE statement really is the
    same for both forms, and it is `[k, n]`: `matmul` declares the kernel operand
    `StickLayout::kernel(k_in, n_out)`, whose address law is `dev_off_stk`'s rank-2 stick-blocked
-   form with `dims[0] = in = K` as the ROW count. `sdsc_abstract::vcache_write_offset` states it
+   form with `dims[0] = in = K` as the ROW count. `sdsc_abstract::PagedKvPool::v_write_off` states it
    for the hardware-proven attention -- "the V cache ... the VALUE bmm reads as a `[cap, hd]`
    KERNEL sticked on `hd` (`out`) ... the kernel is `[k=cap, n=hd]`" -- and its twin
-   `kcache_kt_write_offset` says the score leg's kernel is `[hd, cap]`, in-rows again, which is
+   `PagedKvPool::kt_write_off` says the score leg's kernel is `[hd, cap]`, in-rows again, which is
    WHY the K cache is written already-transposed. So the PLAIN form is the one the slot reads
    directly, and a transpose-B weight is the one whose bytes somebody has to place in that order.
 
@@ -140,7 +140,7 @@ THE DELTA against the HF block, and the justification for each item
        A transpose-B B is `[n, k]` bytes read by a slot that addresses `[k, n]`, so the
        transposition is spent OUTSIDE the descriptor: for a presented weight, once, by the host
        stage (`stage_2d(&StickLayout::kernel(k, n), ..)`); for a CACHE, by the device writing it
-       already transposed (`kcache_kt_write_offset`). `k1r`/`k2r` are NEITHER -- they are
+       already transposed (`PagedKvPool::kt_write_off`). `k1r`/`k2r` are NEITHER -- they are
        in-register values with no host and no cache write -- and nothing in `ktir-superdsc` reads
        an access tile's `CoordinateOrder`, so a LABEL has nowhere to be spent here.
 
