@@ -446,6 +446,15 @@ impl<K, R, L> std::ops::Deref for Wb<K, R, L> {
     }
 }
 
+/// The DSL weights a `Weights` field holds hold `W`, a DSL weight's marker: a field of one weight
+/// holds that weight, a packed pair each of its two. The bake emits each impl, concretely, beside
+/// the model's markers (`__weights`): what a field holds is a fact of the field, not of the tape.
+#[diagnostic::on_unimplemented(
+    message = "the field `{Self}` holds does not hold the weight `{W}`",
+    label = "a tape step's weight slot names another weight than the op reads"
+)]
+pub trait HoldsWeight<W> {}
+
 /// A rank-1 weight's dim, as a type.
 pub trait Shape1 {
     type D: Dim;

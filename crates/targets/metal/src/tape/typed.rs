@@ -28,6 +28,7 @@
 //! # impl Source for Norm {
 //! #     type Model = Weights;
 //! #     type Handle = W1<Hidden, Layer>;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(1);
 //! #     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.norm }
 //! # }
@@ -35,6 +36,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = W2<Hidden, Vocab, Layer>;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.lm_head }
 //! # }
@@ -56,6 +58,7 @@
 //! # impl Source for Norm {
 //! #     type Model = Weights;
 //! #     type Handle = W1<Hidden, Layer>;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(1);
 //! #     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.norm }
 //! # }
@@ -79,6 +82,7 @@
 //! # impl Source for Norm {
 //! #     type Model = Weights;
 //! #     type Handle = W1<Hidden, Layer>;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(1);
 //! #     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.norm }
 //! # }
@@ -86,6 +90,7 @@
 //! impl Source for LmHead {
 //!     type Model = Weights;
 //!     type Handle = W2<Hidden, Vocab, Layer>;
+//!     type Weights = ();
 //!     const IX: SourceIx = SourceIx(0);
 //!     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.lm_head }
 //! }
@@ -105,6 +110,7 @@
 //! # impl Source for Norm {
 //! #     type Model = Weights;
 //! #     type Handle = W1<Hidden, Layer>;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(1);
 //! #     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.norm }
 //! # }
@@ -112,6 +118,7 @@
 //! impl Source for LmHead {
 //!     type Model = Weights;
 //!     type Handle = W2<Vocab, Hidden, Layer>;
+//!     type Weights = ();
 //!     const IX: SourceIx = SourceIx(0);
 //!     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.lm_head }
 //! }
@@ -135,6 +142,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -159,6 +167,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -183,6 +192,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -208,6 +218,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -231,6 +242,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -256,6 +268,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -279,6 +292,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -345,13 +359,78 @@ kernel_set! {
     NAX_GROUP_SIZES: Group, NaxGroup { G64, G128 }
 }
 
-/// A weight family of model `Model`: its index in the model's source manifest, and the typed
-/// handle its field holds.
+/// A weight family of model `Model`: its index in the model's source manifest, the typed handle its
+/// field holds, and the DSL weights that field stands in for (`Weights`, a marker that
+/// [`HoldsWeight`](scratchy_tensors::typed::HoldsWeight) each).
 pub trait Source {
     type Model;
     type Handle;
+    type Weights;
     const IX: SourceIx;
     fn at(model: &Self::Model, layer: LayerId) -> &Self::Handle;
+}
+
+/// Slot `S`'s GEMM weight, as a GEMM of DSL weight `W` reads it: only a slot whose field holds `W`
+/// has one for it. `W` is the weight the GEMM's op reads, recorded from the op's own operand, so a
+/// GEMM whose slot names another weight does not compile, whatever their shapes.
+///
+/// ```
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::typed::{Source, gemm_slot};
+/// # use scratchy_tensors::typed::{HoldsWeight, W2};
+/// # use scratchy_tensors::typed::typenum::{U256, U2048};
+/// # struct Layer;
+/// # struct Weights { k_proj: W2<U2048, U256, Layer>, v_proj: W2<U2048, U256, Layer> }
+/// enum KProj {}
+/// enum VProj {}
+/// impl HoldsWeight<KProj> for KProj {}
+/// impl HoldsWeight<VProj> for VProj {}
+/// enum VSlot {}
+/// impl Source for VSlot {
+///     type Model = Weights;
+///     type Handle = W2<U2048, U256, Layer>;
+///     type Weights = VProj;
+///     const IX: SourceIx = SourceIx(1);
+///     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.v_proj }
+/// }
+/// assert_eq!(gemm_slot::<VSlot, VProj>().ix, SourceIx(1));
+/// ```
+///
+/// The same slot read by a GEMM of the K projection, of the very same shape, is refused:
+///
+/// ```compile_fail,E0277
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::typed::{Source, gemm_slot};
+/// # use scratchy_tensors::typed::{HoldsWeight, W2};
+/// # use scratchy_tensors::typed::typenum::{U256, U2048};
+/// # struct Layer;
+/// # struct Weights { k_proj: W2<U2048, U256, Layer>, v_proj: W2<U2048, U256, Layer> }
+/// enum KProj {}
+/// enum VProj {}
+/// impl HoldsWeight<KProj> for KProj {}
+/// impl HoldsWeight<VProj> for VProj {}
+/// enum VSlot {}
+/// impl Source for VSlot {
+///     type Model = Weights;
+///     type Handle = W2<U2048, U256, Layer>;
+///     type Weights = VProj;
+///     const IX: SourceIx = SourceIx(1);
+///     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.v_proj }
+/// }
+/// let _ = gemm_slot::<VSlot, KProj>();
+/// ```
+pub const fn gemm_slot<S, W>() -> GemmSlotWeight
+where
+    S: GemmSlot + Source<Weights: scratchy_tensors::typed::HoldsWeight<W>>,
+{
+    S::WEIGHT
+}
+
+/// That slot `S`'s field holds DSL weight `W` too: a GEMM of two weights' slot (a packed pair).
+pub const fn holds<S, W>()
+where
+    S: Source<Weights: scratchy_tensors::typed::HoldsWeight<W>>,
+{
 }
 
 /// A GEMM's weight, as its slot states it: the slot's index and the handle's dims, `n` (output

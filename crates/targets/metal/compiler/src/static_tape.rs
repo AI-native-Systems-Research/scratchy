@@ -63,6 +63,9 @@ pub struct CommandPool {
     /// `(n, k, bits, group)` the bake minted for it.
     affine_reads: AffineReads,
     operands: ArenaOperands,
+    /// Each weight family a dense GEMM reads, with the DSL weights the GEMM's ops read (their own
+    /// operands', `Recording::read`): what its slot's field must hold.
+    gemm_weights: BTreeMap<u32, BTreeSet<u32>>,
 }
 
 /// ⭐ A MODEL'S ARENA OPERANDS, EACH TYPED ONCE: every `(slot, extents)` its commands bind an arena
@@ -256,9 +259,14 @@ impl CommandPool {
     ///
     /// Each arena operand its commands bind is a const of the module, `O<n>` ([`ArenaOperands`]),
     /// its extents spelled by `extent`: the binding lists and GEMM operands name it.
+    ///
+    /// `weight_markers`: each DSL weight a typed field holds, by `WeightId`, its marker in the
+    /// model's `__weights`; each typed GEMM slot is read as its GEMMs' ops' weights
+    /// ([`gemm_slot`](scratchy_target_metal::tape::typed::gemm_slot)).
     pub fn into_tokens(
         self,
         typed: &std::collections::HashSet<SourceIx>,
+        weight_markers: &BTreeMap<u32, String>,
     ) -> Result<TokenStream, BakeDefect> {
         // A model metal lowers no tape for (a dense MoE has no metal realization) names nothing.
         if self.table.is_empty() && self.kernels.is_empty() {
@@ -269,7 +277,13 @@ impl CommandPool {
             return Ok(tokens);
         }
         let parts = self.table.finish();
-        let gemms = TypedGemms::of(&parts, typed, &self.affine_reads)?;
+        let gemms = TypedGemms::of(
+            &parts,
+            typed,
+            &self.affine_reads,
+            &self.gemm_weights,
+            weight_markers,
+        )?;
         let aliases = crate::const_tokens::alias_preamble();
         let array = |name: &str, values: Vec<TokenStream>, ty: TokenStream| {
             let (id, len) = (
@@ -481,14 +495,15 @@ impl CommandPool {
 struct TypedGemms {
     /// The typed families.
     typed: std::collections::HashSet<SourceIx>,
-    /// The typed families the GEMM records read, ascending.
-    read: std::collections::BTreeSet<u32>,
     /// Each typed family's dense GEMM dims `(n, k)` as the bake baked them.
     gemm_dims: std::collections::BTreeSet<(u32, u32, u32)>,
     /// The typed families the binding lists bind, ascending.
     bound: std::collections::BTreeSet<u32>,
     /// Each typed family an affine matmul reads, with the numbers the bake minted for it.
     affine: std::collections::BTreeMap<u32, AffineSlotRead>,
+    /// Each typed family a dense GEMM reads, with the markers of the DSL weights its GEMMs' ops
+    /// read (`__weights::<Marker>`).
+    gemm_weights: std::collections::BTreeMap<u32, (proc_macro2::Ident, Vec<proc_macro2::Ident>)>,
 }
 
 /// A typed family's MLX-affine matmul reads: the one `(n, k, bits, group)` the bake minted for
@@ -509,6 +524,8 @@ impl TypedGemms {
         parts: &CommandTableParts,
         typed: &std::collections::HashSet<SourceIx>,
         affine_reads: &AffineReads,
+        gemm_weights: &BTreeMap<u32, BTreeSet<u32>>,
+        weight_markers: &BTreeMap<u32, String>,
     ) -> Result<Self, BakeDefect> {
         use scratchy_target_metal::tape::kernel_constants::{
             AFFINE_K, AFFINE_MATMUL_KERNELS, AFFINE_N, INT4_MATMUL_KERNELS, NAX_MATMUL_KERNELS,
@@ -516,8 +533,37 @@ impl TypedGemms {
         use scratchy_target_metal::tape::lowered::{Binding, WeightTensor};
         let typed_weight =
             |g: &&scratchy_target_metal::tape::lowered::GemmEntry| Self::typed_weight(typed, g);
-        let read = parts.gemm_entries.iter().filter(typed_weight);
-        let read = read.map(|g| g.ix.0).collect();
+        let read: std::collections::BTreeSet<u32> =
+            (parts.gemm_entries.iter().filter(typed_weight))
+                .map(|g| g.ix.0)
+                .collect();
+        // Each read slot's GEMMs' DSL weights, by marker: a slot no GEMM's op names a weight of
+        // refuses the bake.
+        let gemm_weights = (read.iter())
+            .map(|&ix| {
+                let ids = gemm_weights.get(&ix).filter(|ids| !ids.is_empty()).ok_or_else(|| {
+                    BakeDefect(format!(
+                        "typed weight family {ix} is read by GEMMs whose ops read no linear weight"
+                    ))
+                })?;
+                let mut markers = (ids.iter())
+                    .map(|id| {
+                        let marker = weight_markers.get(id).ok_or_else(|| {
+                            BakeDefect(format!(
+                                "typed weight family {ix}'s GEMM reads DSL weight {id}, which no \
+                                 typed field holds"
+                            ))
+                        })?;
+                        Ok(quote::format_ident!("{marker}"))
+                    })
+                    .collect::<Result<Vec<_>, BakeDefect>>()?
+                    .into_iter();
+                let first = markers.next().ok_or_else(|| {
+                    BakeDefect(format!("typed weight family {ix} has no GEMM weight"))
+                })?;
+                Ok((ix, (first, markers.collect())))
+            })
+            .collect::<Result<_, BakeDefect>>()?;
         let gemm_dims = (parts.gemm_entries.iter().filter(typed_weight))
             .map(|g| (g.ix.0, g.dims.n, g.dims.k))
             .collect();
@@ -603,10 +649,10 @@ impl TypedGemms {
         }
         Ok(Self {
             typed: typed.clone(),
-            read,
             gemm_dims,
             bound,
             affine,
+            gemm_weights,
         })
     }
 
@@ -691,10 +737,17 @@ impl TypedGemms {
     /// index and dims, read off its handle), and each bound slot's index (`Source::IX`).
     fn markers(&self) -> TokenStream {
         let tt = quote!(::scratchy_target_metal::tape::typed);
-        let weights = self.read.iter().map(|&ix| {
-            let ix = SourceIx(ix);
-            let (c, s) = (Self::gemm(ix), crate::canonical::slot(ix));
-            quote!(const #c: #tt::GemmSlotWeight = <super::#s as #tt::GemmSlot>::WEIGHT;)
+        // Each read slot's weight, as its GEMMs' ops' DSL weights read it: only a slot whose field
+        // holds each of them has one (`gemm_slot`, `holds`).
+        let weights = self.gemm_weights.iter().map(|(&ix, (first, rest))| {
+            let (c, s) = (
+                Self::gemm(SourceIx(ix)),
+                crate::canonical::slot(SourceIx(ix)),
+            );
+            quote!(const #c: #tt::GemmSlotWeight = {
+                #(#tt::holds::<super::#s, super::__weights::#rest>();)*
+                #tt::gemm_slot::<super::#s, super::__weights::#first>()
+            };)
         });
         let gemm_dims = self.gemm_dims.iter().map(|&(ix, n, k)| {
             let s = crate::canonical::slot(SourceIx(ix));
@@ -1003,6 +1056,7 @@ fn name_operands(
     band: (&StepOperands, &BandArena),
     extents: &ArenaExtents,
     operands: &mut ArenaOperands,
+    gemm_weights: &mut BTreeMap<u32, BTreeSet<u32>>,
 ) -> Result<Vec<GatedCommand>, BakeDefect> {
     let (step_operands, arena) = band;
     (tape.commands.iter().zip(rows).enumerate())
@@ -1031,6 +1085,16 @@ fn name_operands(
                 Activation::Arena { slot } => Ok(Activation::Arena { slot: named(slot)? }),
                 other => Ok(other),
             };
+            // A dense GEMM's weight: the linears its rows' ops read.
+            if let TapeCommand::Gemm(g) = cmd.command
+                && g.weight.which == scratchy_target_metal::tape::lowered::WeightTensor::Weight
+            {
+                let read = (rows.rows.iter())
+                    .flat_map(|&r| step_operands.weights(rows.half, r))
+                    .filter(|(kind, _)| *kind == scratchy_subtile::handoff::WeightKind::Linear)
+                    .map(|&(_, id)| id);
+                gemm_weights.entry(g.weight.ix.0).or_default().extend(read);
+            }
             let command = match cmd.command {
                 TapeCommand::Gemm(g) => TapeCommand::Gemm(Gemm {
                     out: activation(g.out)?,
@@ -1168,7 +1232,14 @@ pub fn bake_bucket_tapes(
             None => {
                 // Its commands as the table holds them: each arena operand named by its typed
                 // operand.
-                let named = name_operands(&body, &rows, band, input.extents, &mut pool.operands)?;
+                let named = name_operands(
+                    &body,
+                    &rows,
+                    band,
+                    input.extents,
+                    &mut pool.operands,
+                    &mut pool.gemm_weights,
+                )?;
                 let cmd_refs = (named.into_iter())
                     .map(|c| pool.intern(c))
                     .collect::<Result<Vec<_>, _>>()?;

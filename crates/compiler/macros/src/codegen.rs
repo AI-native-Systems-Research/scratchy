@@ -4443,6 +4443,8 @@ pub(crate) enum AccessorGroupKind {
 pub(crate) struct ModelDims {
     handles: BTreeMap<String, TypedHandle>,
     bounds: std::collections::BTreeSet<String>,
+    /// Each DSL weight a typed field holds, by `WeightId`: its marker in `__weights`.
+    pub(crate) weight_markers: BTreeMap<u32, String>,
 }
 
 /// One field's typed handle: its path (`__handles::<Field>`, what the field, its accessor and
@@ -4450,6 +4452,11 @@ pub(crate) struct ModelDims {
 /// names on a mismatch.
 pub(crate) struct TypedHandle {
     pub ty: TokenStream,
+    /// The marker of the DSL weights the field stands in for (`__weights::<Marker>`): a field of
+    /// one weight is that weight's marker, a packed pair's or a bundle's the field's own.
+    pub weights: Ident,
+    /// The markers of the DSL weights it holds.
+    held: std::collections::BTreeSet<String>,
     name: Ident,
     def: TokenStream,
     pub tensor: String,
@@ -4622,8 +4629,25 @@ impl ModelDims {
                 scratchy_forward_compiler_frontend::typed_emit::marker(&g.base)
             );
             let ty = quote!(__handles::#name);
+            // The DSL weights the field stands in for, each by its path's marker; a field of more
+            // than one (a packed pair, a bundle) has its own marker holding each.
+            let weight_marker = |id: &WeightId| {
+                scratchy_forward_compiler_frontend::typed_emit::marker(
+                    &program.weights.path(*id).join("_"),
+                )
+            };
+            let held: std::collections::BTreeSet<String> = ids.iter().map(weight_marker).collect();
+            for id in &ids {
+                dims.weight_markers.insert(id.0, weight_marker(id));
+            }
+            let family = match held.iter().collect::<Vec<_>>().as_slice() {
+                [one] => one.to_string(),
+                _ => name.to_string(),
+            };
             let handle = TypedHandle {
                 ty,
+                weights: format_ident!("{family}"),
+                held,
                 name,
                 def,
                 tensor,
@@ -4635,6 +4659,35 @@ impl ModelDims {
 
     pub(crate) fn handle(&self, base: &str) -> Option<&TypedHandle> {
         self.handles.get(base)
+    }
+
+    /// `__weights`: a marker per DSL weight a typed field holds and per field of more than one,
+    /// and what each field's holds (`HoldsWeight`), one concrete impl a weight.
+    fn weights_module(&self) -> Option<TokenStream> {
+        if self.handles.is_empty() {
+            return None;
+        }
+        // Each DSL weight's marker, and each field's of more than one; each impl once (two
+        // fields may hold one weight: a tied head and its embedding).
+        let names: std::collections::BTreeSet<String> = (self.weight_markers.values().cloned())
+            .chain(self.handles.values().map(|h| h.weights.to_string()))
+            .collect();
+        let markers = names.iter().map(|n| format_ident!("{n}"));
+        let held: std::collections::BTreeSet<(String, &String)> = (self.handles.values())
+            .flat_map(|h| h.held.iter().map(move |w| (h.weights.to_string(), w)))
+            .collect();
+        let holds = held.iter().map(|(field, w)| {
+            let (field, w) = (format_ident!("{field}"), format_ident!("{w}"));
+            quote!(impl ::scratchy_tensors::typed::HoldsWeight<#w> for #field {})
+        });
+        Some(quote! {
+            /// The DSL weights the typed fields of `Weights` stand in for, as types, and what each
+            /// field holds.
+            pub mod __weights {
+                #(pub enum #markers {})*
+                #(#holds)*
+            }
+        })
     }
 
     /// Declare, beside the handles', every bound a tile output of `fuf` names that `model`
@@ -4724,6 +4777,7 @@ impl ModelDims {
                 }
             }
         });
+        let weights = self.weights_module();
         Ok(quote! {
             /// The model's dims, as types: each bound its weights' shapes name, with its number.
             pub mod __dims {
@@ -4731,6 +4785,7 @@ impl ModelDims {
                 #(#markers)*
             }
             #handles
+            #weights
         })
     }
 }
@@ -15096,7 +15151,12 @@ pub fn emit_model(
     let dims = model_dims(tape_accessors_for_struct.as_deref());
     #[cfg(feature = "metal")]
     let resolver = metal_sources
-        .resolver(&|base| dims.handle(base).map(|h| h.ty.clone()))
+        .resolver(&|base| {
+            dims.handle(base).map(|h| {
+                let weights = &h.weights;
+                (h.ty.clone(), quote!(__weights::#weights))
+            })
+        })
         .unwrap_or_else(|e| panic!("[metal sources] {}: {e:?}", model.source_stem));
     #[cfg(feature = "metal")]
     let weight_accessors_impl = {
@@ -15894,7 +15954,7 @@ pub fn emit_model(
     #[cfg(feature = "metal")]
     {
         let table = metal_tape_cmds
-            .into_tokens(&resolver.typed)
+            .into_tokens(&resolver.typed, &dims.weight_markers)
             .unwrap_or_else(|e| {
                 panic!(
                     "[metal static tape] {}: command table: {e}",
