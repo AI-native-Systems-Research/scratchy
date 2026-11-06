@@ -5520,7 +5520,7 @@ impl PagedKvPool {
         // attention was right over the first 64 cached slots and drifted from the 65th. The comment above
         // described this bug; it is now fixed rather than described.
         (gqa_kv_head(qh, gqa) * Self::POOL_PAGE_SLOTS.as_usize() * self.hd()) as u32
-            + b * STK as u32 * self.hd.get() as u32
+            + b * STK as u32 * self.hd.get()
     }
 
     /// Kᵀ WRITE offset of `K[slot][d]` within a page+layer — the consumer's own read model, so
@@ -5559,7 +5559,7 @@ impl PagedKvPool {
 
     /// Head width this pool laid itself out for, AS THE TYPE — the one value every reader
     /// takes; no use site re-mints it.
-    pub fn head_width(&self) -> HeadWidth {
+    pub const fn head_width(&self) -> HeadWidth {
         self.hd
     }
 

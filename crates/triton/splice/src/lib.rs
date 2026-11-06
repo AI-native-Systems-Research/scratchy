@@ -1895,7 +1895,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             ("NUM_KV_HEADS", nkvh),
             ("NUM_QUERIES_PER_KV", nqh / nkvh),
             ("BLOCK_SIZE", SchedulerBlockTokens::REFERENCE.get()),
-            ("HEAD_SIZE", hd),
+            ("HEAD_SIZE", hd.get()),
             ("NUM_PAGES", pages),
             ("ROWS_PER_PAGE", chunking.rows_per_page),
         ] {
@@ -1952,7 +1952,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         ("NUM_TOKENS", mq),
         ("NUM_HEADS", nqh),
         ("NUM_KV_HEADS", nkvh),
-        ("HEAD_SIZE", hd),
+        ("HEAD_SIZE", hd.get()),
         ("BLOCK_SIZE", SchedulerBlockTokens::REFERENCE.get()),
         ("NUM_PAGES", pages),
         ("NUM_BLOCKS", blocks),
@@ -2047,8 +2047,8 @@ pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
         return Err(format!(
             "triton splice: RopeAppend t{}: its {kv_width}-column K is not the class's \
              {nkvh} whole heads of {hd_wide}",
-            hd_wide = hd.get(),
-            node.output.tensor.index()
+            node.output.tensor.index(),
+            hd_wide = hd.get()
         ));
     }
     whole(ir, &node.output, rows, kv_width, "rotated K")?;
@@ -2077,7 +2077,7 @@ pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
     for (k, v) in [
         ("T", rows),
         ("NUM_KV_HEADS", nkvh),
-        ("HEAD_SIZE", hd),
+        ("HEAD_SIZE", hd.get()),
         (
             "NUM_ROWS",
             pages * nkvh * SchedulerBlockTokens::REFERENCE.get(),
@@ -2166,8 +2166,8 @@ fn rope_fwd<F: scratchy_subtile::subtile_ir::RopeForm>(
         return Err(format!(
             "triton splice: rope t{}: {total} cols is not a whole number of \
              {hd}-wide heads",
-            hd = hd.get(),
-            out.tensor.index()
+            out.tensor.index(),
+            hd = hd.get()
         ));
     }
     let heads = total / hd.get();
