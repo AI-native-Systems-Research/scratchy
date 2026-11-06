@@ -56,6 +56,8 @@ const PREFILL_STEPS: [(&str, usize); 15] = [
     ("RopeAppend", 16),
 ];
 const QUANTS: usize = 304;
+/// The quant writes' readers: one per write (no experts).
+const QUANT_READERS: usize = 304;
 /// The `k`s quantized: the hidden (5120), GDN's and attention's out (6144), the MLP's down
 /// (17408).
 const QUANT_COLS: [u32; 3] = [5120, 6144, 17408];

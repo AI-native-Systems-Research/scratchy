@@ -4,8 +4,8 @@
 // binary's root, as `cuda_tapes_body.rs` is, so every test keeps its name. The including binary
 // supplies the model: its `CUDA_TAPES`, `CUDA_UNLOWERED` and `CUDA_WEIGHTS`, the `chains` module
 // (`targets/cuda/tests/common/chains.rs`), and the constants these tests read: `STEM`, `FEATURE`,
-// `ARCH`, `DECODE_STEPS`, `PREFILL_STEPS`, `QUANTS`, `QUANT_COLS`, `QUANT_SCRATCH`,
-// `EXPERT_WEIGHT`, `WEIGHT_KINDS`, `TABLE_LEN` and `HEADERS`.
+// `ARCH`, `DECODE_STEPS`, `PREFILL_STEPS`, `QUANTS`, `QUANT_READERS`, `QUANT_COLS`,
+// `QUANT_SCRATCH`, `EXPERT_WEIGHT`, `WEIGHT_KINDS`, `TABLE_LEN` and `HEADERS`.
 //
 // No toolchain and no GPU: the tapes are checked as emitted, and the weight table against the
 // checkpoint's real safetensors headers (a fixture of names, dtypes and shapes, written out as a
@@ -176,7 +176,7 @@ fn every_tape_has_the_fp8_steps() {
         let quantized = (tape.steps.iter())
             .filter(|s| s.quantized_input().is_some())
             .count();
-        assert_eq!(quantized, if m == 1 { 0 } else { QUANTS }, "m={m}");
+        assert_eq!(quantized, if m == 1 { 0 } else { QUANT_READERS }, "m={m}");
         for (i, s) in tape.steps.iter().enumerate() {
             // Every gate/up pair of these checkpoints is quantized.
             if let CudaStep::GateUpAct(GateUpActBf16 { kernel, .. }) = *s {
@@ -202,10 +202,11 @@ fn every_tape_has_the_fp8_steps() {
     }
 }
 
-/// The quant writes of every prefill tape: each sits right before the one fp8 GEMM that reads it,
-/// quantizes all `m` rows of that GEMM's `k` columns from a bf16 colour, and writes the one quant
-/// scratch, the arena's last region: every write starts at its offset, the largest is its size,
-/// and it ends the arena.
+/// The quant writes of every prefill tape: each sits right before the fp8 GEMM that reads it,
+/// quantizes all `m` rows of that GEMM's `k` columns (an expert GEMM's: all `max_tiles·128`) from a
+/// bf16 colour or the MoE scratch's rows, and writes the one quant scratch, the arena's last
+/// region: every write starts at its offset, the largest is its size, and it ends the arena. A
+/// reader with no write right before it is an fp8 expert GEMM after one reading the same rows.
 #[test]
 fn every_quant_write_sits_before_its_fp8_gemm() {
     assert!(quants(tape_of(1)).is_empty(), "m=1: no quant write");
@@ -222,14 +223,35 @@ fn every_quant_write_sits_before_its_fp8_gemm() {
                 Some((q.q, q.rows, q.cols)),
                 "m={m} step {i}: the next step reads what it wrote"
             );
-            assert_eq!((q.q.0, q.rows), (at, m), "m={m} step {i}: its region, rows");
+            let rows = match tape.steps.get(i + 1) {
+                Some(CudaStep::ExpertGemm(g)) => g.max_tiles * 128,
+                _ => m,
+            };
+            assert_eq!((q.q.0, q.rows), (at, rows), "m={m} step {i}: its region, rows");
             assert!(
                 q.x.0 < at && q.x.0.is_multiple_of(CUDA_ARENA_ALIGN),
-                "m={m} step {i}: x {} is an aligned colour before the scratch",
+                "m={m} step {i}: x {} is an aligned colour or the MoE scratch's rows before the \
+                 scratch",
                 q.x.0
             );
             cols.insert(q.cols);
             most = most.max(q.bytes().expect("fits"));
+        }
+        for (i, s) in tape.steps.iter().enumerate().skip(1) {
+            let prev = &tape.steps[i - 1];
+            let Some(read) = s.quantized_input() else {
+                continue;
+            };
+            if matches!(prev, CudaStep::QuantRowsFp8(_)) {
+                continue;
+            }
+            assert!(
+                matches!(s, CudaStep::ExpertGemm(ExpertGemmBf16 { weight, .. })
+                    if Some(*weight) == EXPERT_WEIGHT)
+                    && matches!(prev, CudaStep::ExpertGemm(_))
+                    && prev.quantized_input() == Some(read),
+                "m={m} step {i}: a reader with no write before it"
+            );
         }
         assert_eq!(cols.into_iter().collect::<Vec<_>>(), QUANT_COLS, "m={m}");
         assert_eq!(most, bytes, "m={m}: the scratch is the largest write");
