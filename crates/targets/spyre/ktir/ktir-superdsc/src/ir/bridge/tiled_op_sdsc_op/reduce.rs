@@ -1053,6 +1053,11 @@ pub struct ReduceSplit<'a, D: KindTag, A: KindTag> {
     /// The data's PARENT handle, declared at the parent's own full `[rows, parent_cols]`
     /// extents — the stick-major nest `col_of` addresses the slices within.
     data: &'a Stk<D>,
+    /// The parent's full column extent, read ONCE at the mint (u32, or the build refuses —
+    /// an overflowing width is a real error, never a silent `u32::MAX` the addressing
+    /// would fold into every slice corner). The body and the column-window mint read this
+    /// stored value; neither re-derives it off the handle.
+    parent_cols: u32,
     /// The reduce window's base column in the parent (0 for a whole buffer) — typed as the
     /// whole-stick column window it must be: a sub-stick base sits mid-plane, so no slice
     /// corner of it is a stick-major tensor of its own.
@@ -1147,7 +1152,14 @@ impl<'a, D: KindTag, A: KindTag> ReduceSplit<'a, D, A> {
         accum: ReduceAccumLeg<'a, A>,
         parent: crate::place::PlaceId,
     ) -> Result<Self, String> {
-        let full = u32::try_from(data.stk.layout().cols).unwrap_or(u32::MAX);
+        let parent_cols = u32::try_from(data.stk.layout().cols).map_err(|_| {
+            format!(
+                "{op_name}: the data handle's width {} overflows u32 — the parent's own \
+                 extent is the nest every slice corner is addressed within, so a width the \
+                 address law cannot state cannot split",
+                data.stk.layout().cols
+            )
+        })?;
         Ok(Self {
             op_name,
             op: geometry.op,
@@ -1155,8 +1167,14 @@ impl<'a, D: KindTag, A: KindTag> ReduceSplit<'a, D, A> {
             cols: geometry.cols,
             df: geometry.df,
             data: data.stk,
-            data_col: crate::addr::col_window_of(geometry.rows.get(), full, data.col, geometry.df)
-                .map_err(|e| format!("{op_name}: {e}"))?,
+            parent_cols,
+            data_col: crate::addr::col_window_of(
+                geometry.rows.get(),
+                parent_cols,
+                data.col,
+                geometry.df,
+            )
+            .map_err(|e| format!("{op_name}: {e}"))?,
             accum: accum.stk,
             accum_off: accum.off,
             parent,
@@ -1242,7 +1260,6 @@ pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
     let rows_t = crate::sdsc_abstract::RowCount::of_token_rows(rows);
     // The parent's full column extent, read off the handle — the nest every slice corner is
     // addressed within, the one law the caller cannot restate differently.
-    let parent_cols = u32::try_from(s.data.layout().cols).unwrap_or(u32::MAX);
     let probe_data = win_reduce_data(
         layout,
         s.data,
@@ -1306,7 +1323,7 @@ pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
         let slice_cols = slices.cols_of(j);
         let corner = crate::addr::col_of(
             rows,
-            parent_cols,
+            s.parent_cols,
             s.data_col.column() + j * slices.slice_cols,
             s.df,
         );
