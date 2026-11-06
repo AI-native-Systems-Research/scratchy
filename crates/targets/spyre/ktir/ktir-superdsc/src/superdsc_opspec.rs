@@ -69,6 +69,15 @@ pub const ACTIVE_CORELETS: u32 = 1;
 /// and `sentient_dd2_sysconfig.json`.
 pub const LX_CAPACITY_BYTES: u64 = 2 * 1024 * 1024;
 
+/// LX live-set budget for fused-segment planning: SEVEN EIGHTHS of the per-core
+/// LX ([`LX_CAPACITY_BYTES`]) — the 7/8 leaves headroom for a node's transient
+/// temporaries and the planner's model-vs-mechanism gap. ONE source for every
+/// consumer: the emulator's fusion planner reads it (`lx_fusion_budget`), and
+/// the emu prefill-width derivation in the forward macro reads it through this
+/// crate. Its provenance is the measured fused-MLP overflow without it (llama
+/// m=32: a whole transformer MLP fused into one segment and overflowed LX).
+pub const LX_FUSION_BUDGET_BYTES: u64 = LX_CAPACITY_BYTES * 7 / 8;
+
 /// The DXP-reserved fraction of the LX scratchpad (torch-spyre
 /// `config.py:41 dxp_lx_frac_avail = 0.2`). The frontend may only PLAN against
 /// `1 - DXP_LX_FRAC_AVAIL` of the pad; the rest is the toolchain's working set.

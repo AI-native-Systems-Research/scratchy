@@ -2207,6 +2207,29 @@ fn rope_fwd<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok(())
 }
 
+/// ⭐ THE fp8-DYNAMIC EPILOGUE'S LIVE `[m, N]` f16 TILES AT ITS PEAK — a fact of
+/// the program the `SubOp::MatmulTile { weight: GemmWeight::Fp8Dynamic }` arm of
+/// [`kernel_spec`] mints (`matmul_fp8_fwd`): the dot result `p`, the broadcast's
+/// shape-defining `tensor.empty`, and the broadcast replica of the per-channel
+/// scale row. MEASURED by the isolated single-node probe through the production
+/// session entry (K=3840/N=15360): the refusal `1935360 + 952320 > 2097152`
+/// decomposes exactly into p + empty + scale-row + the charging broadcast; the
+/// zero-init splat is freed by the resident scheduler's dies-at reclaim right
+/// after the dot, and the activation/weight loads are uncharged views. The fp8
+/// form CANNOT be N-blocked down to fit (`verify_canonical_fp8_matmul_kernel`
+/// refuses `BLOCK_N < N` by name), so the only lever that shrinks the epilogue
+/// is the baked WIDTH — which is why the emu's prefill-width derivation reads
+/// this. Pinned by the live-tile count over the minted program
+/// (`the_fp8_epilogue_holds_three_live_mn_tiles_at_its_peak`).
+pub const FP8_EPILOGUE_LIVE_TILES: u128 = 3;
+
+/// The fp8-dynamic epilogue's intra-node LX footprint at its peak: the
+/// [`FP8_EPILOGUE_LIVE_TILES`] live `[m, N]` f16 tiles plus the collapsed `[N]`
+/// scale row. Plain arithmetic on the op's stated extents.
+pub const fn fp8_epilogue_peak_bytes(m: u32, n: u64) -> u128 {
+    FP8_EPILOGUE_LIVE_TILES * m as u128 * n as u128 * 2 + n as u128 * 2
+}
+
 fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,

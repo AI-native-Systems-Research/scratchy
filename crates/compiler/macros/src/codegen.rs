@@ -10711,10 +10711,13 @@ const _: () = assert!(
 // ── THE EMU'S ONE BAKED PREFILL WIDTH, DERIVED FROM THE MODEL'S OWN fp8 GEMMS ──
 //
 // ktir-emulator runs each fused segment on ONE core against a real 2 MiB LX,
-// and an fp8-dynamic gemm's minted program holds, at its epilogue peak, THREE
-// `[m, N]` f16 tiles — the dot result `p`, the broadcast's shape-defining
-// `tensor.empty`, and the broadcast replica of the per-channel scale row —
-// plus the collapsed `[N]` scale row itself. MEASURED (isolated single-node
+// and an fp8-dynamic gemm's minted program holds, at its epilogue peak,
+// `FP8_EPILOGUE_LIVE_TILES` `[m, N]` f16 tiles — the dot result `p`, the
+// broadcast's shape-defining `tensor.empty`, and the broadcast replica of the
+// per-channel scale row — plus the collapsed `[N]` scale row itself; the
+// count and the peak-bytes formula are the SPLICE'S OWN (minted beside the
+// program they describe, `scratchy_triton_splice::fp8_epilogue_peak_bytes`).
+// MEASURED (isolated single-node
 // probe through the production session entry, K=3840/N=15360): the refusal
 // `1935360 + 952320 > 2097152` is exactly p + empty + scale-row + the
 // charging broadcast; the zero-init splat is freed by the resident
@@ -10732,9 +10735,12 @@ const _: () = assert!(
 // large (measured at m=71, N=15360 — clean), and its un-blocked arm only
 // fires when `m·N ≤ 90_000` elements, whose whole tile is ~180 KB.
 //
-// The budget mirrors `ktir-emulator`'s `LX_FUSION_BUDGET_BYTES` (7/8 of the
-// 2 MiB LX — headroom for the planner's model-vs-mechanism gap, which is
-// exactly what the old constant lacked). Gemms whose rows are a concrete
+// The budget is the ONE const, read from ktir-superdsc beside the LX capacity
+// it derives from (`LX_FUSION_BUDGET_BYTES` = 7/8 of the 2 MiB LX — headroom
+// for the planner's model-vs-mechanism gap, which is exactly what the old
+// constant lacked); the tile count and the peak-bytes formula are the
+// SPLICE'S OWN, minted beside the fp8-dynamic program they describe
+// (`FP8_EPILOGUE_LIVE_TILES`, `fp8_epilogue_peak_bytes`). Gemms whose rows are a concrete
 // bound (not the seq dim) don't scale with the baked width and are skipped;
 // the lm_head is skipped because the prefill fold runs it at m=1 (its
 // `[1, vocab]` peak is the decode path's own, already proven) — identified by
@@ -10744,15 +10750,6 @@ const _: () = assert!(
 // 12b (N=15360) → 19; 31b (N=21504) → 11; granite fp8 (N=8192) → 31 (the
 // collision-free cap binds first); dense-only models → 31 (no fp8 gemm
 // constrains). Pinned by `emu_prefill_lx_width_pins_the_gemma4_rungs`.
-/// The fp8 gemm's intra-node `[m, N]` f16 tiles at its epilogue peak: the
-/// dot result, the broadcast's shape-defining `tensor.empty`, and the
-/// broadcast replica of the per-channel scale row.
-#[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
-const FP8_MATMUL_LIVE_TILES: u128 = 3;
-/// The same budget `ktir-emulator`'s `LX_FUSION_BUDGET_BYTES` states: 7/8 of
-/// the 2 MiB per-core LX.
-#[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
-const EMU_LX_FUSION_BUDGET_BYTES: u128 = (2 * 1024 * 1024) * 7 / 8;
 
 #[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
 fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 {
@@ -10824,9 +10821,10 @@ fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 
         }
         let w = prefix_len.min(r);
         if fp8_ns.iter().all(|&n| {
-            FP8_MATMUL_LIVE_TILES * u128::from(w) * u128::from(n) * 2 + u128::from(n) * 2
-                <= EMU_LX_FUSION_BUDGET_BYTES
-        }) {
+            scratchy_triton_splice::fp8_epilogue_peak_bytes(w, n)
+                <= u128::from(scratchy_subtile::superdsc_opspec::LX_FUSION_BUDGET_BYTES)
+        })
+        {
             return w;
         }
     }
@@ -10836,13 +10834,14 @@ fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 
     let n = fp8_ns.iter().copied().max().unwrap_or(0);
     panic!(
         "[wavefront] {}: no emu prefill width fits a core's LX — the widest fp8 gemm \
-         (N={n}) needs {} B of intra-node tiles at m={} against the {} B budget (3 live \
+         (N={n}) needs {} B of intra-node tiles at m={} against the {} B budget ({} live \
          [m, N] f16 tiles + the [N] scale row); the fp8 kernel cannot be N-blocked \
          (verify_canonical_fp8_matmul_kernel refuses BLOCK_N < N)",
         model.source_stem,
-        FP8_MATMUL_LIVE_TILES * u128::from(w) * u128::from(n) * 2 + u128::from(n) * 2,
+        scratchy_triton_splice::fp8_epilogue_peak_bytes(w, n),
         w,
-        EMU_LX_FUSION_BUDGET_BYTES,
+        u128::from(scratchy_subtile::superdsc_opspec::LX_FUSION_BUDGET_BYTES),
+        scratchy_triton_splice::FP8_EPILOGUE_LIVE_TILES,
     );
 }
 

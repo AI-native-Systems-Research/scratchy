@@ -3188,3 +3188,78 @@ fn a_paged_walks_program_does_not_grow_with_its_rows() {
         "8x the rows grew the program: 31 rows {small} ops, 256 rows {wide} ops"
     );
 }
+
+
+/// ⭐ THE fp8-DYNAMIC EPILOGUE'S LIVE-TILE COUNT, COUNTED FROM THE MINTED
+/// PROGRAM — the pin for `scratchy_triton_splice::FP8_EPILOGUE_LIVE_TILES`,
+/// which the emu prefill-width derivation reads as the epilogue's LX cost (the
+/// count is not restated here; it is measured off the KTIR the splice emits).
+/// Mints the fp8 matmul's program, walks it in program order, and counts the
+/// f16 `[m, N]` tensor values live at the peak — a value is live from its def
+/// to its last use. At the peak (right after the scale-row broadcast) that is
+/// the dot result `p`, the broadcast's shape-defining `tensor.empty`, and the
+/// broadcast replica; the `arith.mulf` then consumes `p` and the replica, so
+/// nothing else reaches the count. The collapsed `[N]` scale row is an `[N]`
+/// tensor, not `[m, N]` — it is the peak-bytes formula's `+ N·2` term.
+#[test]
+fn the_fp8_epilogue_holds_three_live_mn_tiles_at_its_peak() {
+    // a granite-scale fp8 gemm width and a small shape: the count is
+    // structural in the emitted program, not a function of the extents.
+    for (m, k, n) in [(8u32, 128u32, 256u32), (35u32, 2048u32, 8192u32)] {
+        let ir = matmul_fp8_ir(m, k, n);
+        let node = &ir.nodes[0];
+        let spliced = scratchy_triton_splice::lower(node, &ir, true)
+            .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
+        let prog = spliced
+            .ktir
+            .as_ref()
+            .expect("the spliced op carries its program");
+        let ops = prog.func.ops_deep();
+        let is_mn_f16 = |v: ktir_core::ir::Ssa| {
+            ops.iter()
+                .any(|op| {
+                    op.result == Some(v)
+                        && matches!(
+                            op.result_type,
+                            Some(ktir_core::irtype::IrType::Tensor {
+                                dims,
+                                elem: ktir_core::dtypes::DType::F16,
+                            }) if dims == [i64::from(m), i64::from(n)]
+                        )
+                })
+        };
+        // Def point and last use of every value, in program order.
+        use std::collections::HashMap;
+        let mut def: HashMap<ktir_core::ir::Ssa, usize> = HashMap::new();
+        let mut last_use: HashMap<ktir_core::ir::Ssa, usize> = HashMap::new();
+        for (i, op) in ops.iter().enumerate() {
+            if let Some(v) = op.result {
+                def.insert(v, i);
+            }
+            for &u in op.operands {
+                last_use.insert(u, i);
+            }
+        }
+        // Live `[m, N]` f16 tensors at each program point; the peak is the max.
+        let mut peak = 0usize;
+        for t in 0..ops.len() {
+            let live = def
+                .keys()
+                .filter(|&&v| {
+                    is_mn_f16(v)
+                        && def[&v] <= t
+                        && last_use.get(&v).is_some_and(|&u| u >= t)
+                })
+                .count();
+            peak = peak.max(live);
+        }
+        assert_eq!(
+            peak,
+            usize::try_from(scratchy_triton_splice::FP8_EPILOGUE_LIVE_TILES)
+                .expect("the live-tile const fits a usize"),
+            "m={m} k={k} n={n}: the fp8 epilogue's live [m, N] f16 tile count at its \
+             peak must equal FP8_EPILOGUE_LIVE_TILES — the emu prefill-width derivation \
+             charges this count against the LX budget"
+        );
+    }
+}

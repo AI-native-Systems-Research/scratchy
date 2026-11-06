@@ -3422,6 +3422,7 @@ dependencies = [
  "scratchy-target-metal-compiler",
  "scratchy-target-spyre",
  "scratchy-tensors",
+ "scratchy-triton-splice",
  "serde_json",
  "syn 3.0.9",
  "tracing",
