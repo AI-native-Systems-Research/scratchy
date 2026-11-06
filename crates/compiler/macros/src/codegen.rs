@@ -10649,6 +10649,9 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// aimed at its own page through the block table — `EmittedOp::kv_slot_offset`), which is what
 /// lets a chunk outgrow the page: the weights are re-streamed once per chunk, so a 10k prompt's
 /// 40 chunks of 256 become 20 of 512.
+// Spyre-only, as every reader is: the spyre bake's ladder, `emu_prefill_lx_width`, and the
+// shape asserts below.
+#[cfg(feature = "spyre")]
 const PREFILL_RUNGS: [u32; 27] = [
     7, 11, 15, 17, 19, 21, 23, 25, 27, 29, 31, 35, 39, 43, 47, 55, 63, 71, 80, 88, 96, 112, 128,
     192, 256, 384, 512,
@@ -10755,7 +10758,9 @@ const _: () = assert!(
 // collision-free cap binds first); dense-only models → 31 (no fp8 gemm
 // constrains). Pinned by `emu_prefill_lx_width_pins_the_gemma4_rungs`.
 
-#[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
+// Gated on `spyre`, with the one-home budget it reads: `scratchy_subtile::superdsc_opspec`
+// is re-exported only under `spyre`, and the fn's one caller is the spyre bake block.
+#[cfg(feature = "spyre")]
 fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 {
     use crate::shape::eval_closed_dim;
     // The result tail: the LAST tile nothing consumes — the bridge's own law
@@ -18127,6 +18132,7 @@ mod fingerprint_tests {
     /// (N=262144 on the 12b) refuses EVERY rung, so a broken row-local tail
     /// walk panics the derivation here instead of failing an emu build.
     #[test]
+    #[cfg(feature = "spyre")]
     fn emu_prefill_lx_width_pins_the_gemma4_rungs() {
         for (arch, stem, preset, want) in [
             ("gemma4", "gemma-4-12b-it", "fp8-dynamic-per-channel", 19),
